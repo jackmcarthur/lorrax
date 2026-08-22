@@ -3,10 +3,11 @@
 STAGING LOCATION; the minimax-service design decides the final home.
 ``DESIGN_minimax.md`` R4 point 3 says this object "belongs in the
 service" because it is pure algebra on floats -- no jax, no physics, no
-bands -- and this module honours that: it imports ``numpy`` and
-``gw.mpa.sampling`` and nothing else.  It sits under ``gw/mpa`` only
-because that is where the rest of the MPA staging lives; moving it is a
-file move.
+bands -- and this module honours that: it imports ``numpy``,
+``gw.mpa.sampling`` and the ``minimax`` door (whose declared table the
+character dispatch reads) and nothing else.  It sits under ``gw/mpa``
+only because that is where the rest of the MPA staging lives; moving it
+is a file move.
 
 WHAT THIS IS
 ------------
@@ -87,73 +88,54 @@ silently reclassify it.
 
 import numpy as np
 
+from minimax import CHARACTERS as _SERVICE_CHARACTERS
+from minimax import families_for_character as _families_for_character
+
 from gw.mpa import sampling
 
 #: ``K_z(Delta) = KERNEL_FACTOR * target_of_the_cell(Delta)``.  The
 #: three shipped families all approximate the target WITHOUT this
 #: factor -- it lives in the chi0 builders today -- so every route
-#: adapter in ``gw.mpa.evaluator`` applies it once, in one place.
+#: adapter applies it once, in one place.
 KERNEL_FACTOR = -2.0
 
 #: R4's 2x2, as data.  ``cell`` is ``(omega_is_zero, varpi_is_zero)``.
-#: ``shipped_tables`` is the catalog census of ``DESIGN_minimax.md`` R4
-#: -- carried here because it is the difference between a lookup and a
-#: runtime solve, and the bottom-left zero is R1's structural hole.
+#: Catalog metadata (builders, domains, shipped-table census) lives on
+#: the minimax service's declared table, not here.
 FAMILIES = {
     "exponential_sum": {
         "character": "static",
         "cell": (True, True),
         "target": "1/Delta",
         "route": "existing-kernel",
-        "builder": "gw.minimax_screening.solve_laplace_minimax_interval",
-        "domain": "interval",
-        "shipped_tables": 26,
-        "precondition": None,
     },
     "exponential_sum_imag": {
         "character": "imag",
         "cell": (True, False),
         "target": "Delta/(Delta**2 + varpi**2)",
         "route": "existing-kernel",
-        "builder":
-            "gw.minimax_screening.solve_laplace_minimax_imag_interval",
-        "domain": "interval",
-        # R1's hole: the family solves at runtime on every call.
-        "shipped_tables": 0,
-        "precondition": None,
     },
     "sine_sum": {
         "character": "real",
         "cell": (False, True),
         "target": "Delta/(Delta**2 - omega**2)",
         "route": "existing-kernel",
-        "builder": "gw.minimax_screening.build_real_quadrature",
-        "domain": "interval",
-        "shipped_tables": 5,
-        # The shipped route decomposes into two 1/y minimaxes on
-        # [omega-Delta_max, omega-Delta_min] and [omega+Delta_min,
-        # omega+Delta_max], which requires omega above every
-        # transition.  Inside the band the target has a real pole and
-        # there is no quadrature of it at all.
-        "precondition": "omega > Delta_max",
     },
     "damped_line": {
         "character": "strip",
         "cell": (False, False),
         "target": "Delta/(Delta**2 - z**2)",
         "route": "damped-tau",
-        "builder": "gw.mpa.evaluator.damped_line_rule",
-        "domain": "bandwidth",
-        "shipped_tables": 0,
-        "precondition": None,
     },
 }
 
-#: character -> family name.  The inverse of the ``character`` column,
-#: built once so ``family_for`` is a lookup and the two can never
-#: disagree.
+#: character -> family name, read off the minimax service's declared R4
+#: table.  Several service families can serve one character (the "imag"
+#: cell), but they share one mathematical route name -- that shared route
+#: is the one-to-one map this module dispatches on.
 _FAMILY_BY_CHARACTER = {
-    spec["character"]: name for name, spec in FAMILIES.items()}
+    character: {spec.route for spec in _families_for_character(character)}.pop()
+    for character in _SERVICE_CHARACTERS}
 
 
 def sample_character(z):
@@ -199,20 +181,6 @@ def family_for(z):
     return _FAMILY_BY_CHARACTER[sample_character(z)]
 
 
-def route_for(z):
-    """Return ``'existing-kernel'`` or ``'damped-tau'`` for ``z``.
-
-    The ROUTE is deliberately a separate column from the FAMILY:
-    theory-plan section B routes the special pure-imaginary samples --
-    ``z = 0`` for insulators, ``z = i*1e-5 Ha`` for metals, and the far
-    line's ``omega = 0`` point at ``i*varpi_2`` -- to "the existing
-    static and imaginary-axis kernels", and everything with a nonzero
-    real part to the damped-tau sweep.  That is this column, verbatim.
-    """
-
-    return FAMILIES[family_for(z)]["route"]
-
-
 def sample_point(z, role, *, index=0):
     """One sample point, as a dict: the atom the plan is built from."""
 
@@ -230,31 +198,14 @@ def sample_point(z, role, *, index=0):
     }
 
 
-def line_points(varpi, omegas, role_prefix, *, start_index=0):
-    """The points of one horizontal line, ascending in ``Re z``.
-
-    A "line" in the double-parallel protocol is a fixed ``varpi`` and a
-    tuple of ``omega`` -- the object the damped-tau sweep shares nodes
-    across.  It is returned as a plain tuple of points, not as a
-    wrapper, because everything downstream wants the points and
-    ``plan_routes`` recovers the grouping from ``varpi`` anyway.
-    """
-
-    v = float(varpi)
-    return tuple(
-        sample_point(complex(float(om), v), f"{role_prefix}_{k:02d}",
-                     index=start_index + k)
-        for k, om in enumerate(omegas))
-
-
 def sampling_plan(points, *, label):
     """Freeze an ordered tuple of points into a plan dict.
 
     Reindexes the points so ``point['index']`` is its position in the
     plan -- the index the fit's diagnostics quote and the index into
-    the value array ``gw.mpa.evaluator.evaluate_samples`` returns.
-    Refuses duplicate roles, because a role is what Sigma looks a W up
-    by and a repeated one silently loses a sample.
+    the evaluated sample-value array.  Refuses duplicate roles, because
+    a role is what Sigma looks a W up by and a repeated one silently
+    loses a sample.
     """
 
     pts = tuple(points)
@@ -366,36 +317,8 @@ def describe_plan(plan):
 
 
 # ---------------------------------------------------------------------------
-# The three plans the pipeline actually asks for
+# The plan the pipeline actually asks for
 # ---------------------------------------------------------------------------
-
-def static_plan():
-    """Today's COHSEX request, as a plan.
-
-    ``screening.screening_requests_for(ComputeMode.COHSEX, ...)``
-    returns exactly this ``(omega_ry, role)`` pair; the test asserts
-    the identity rather than trusting the comment.
-    """
-
-    return sampling_plan(
-        (sample_point(0.0 + 0.0j, "static"),), label="cohsex-static")
-
-
-def gn_ppm_plan(omega_p_ry):
-    """Today's GN-PPM request, as a plan: static plus one imag probe."""
-
-    wp = float(omega_p_ry)
-    if not (wp > 0.0) or not np.isfinite(wp):
-        raise ValueError(
-            f"GATE gn_probe_positive: omega_p={omega_p_ry!r} is not a "
-            "finite positive plasmon frequency. FALSE case: "
-            "float(omega_p) > 0 -- the GN probe is on the imaginary "
-            "axis at i*omega_p.")
-    return sampling_plan(
-        (sample_point(0.0 + 0.0j, "static"),
-         sample_point(1j * wp, "probe")),
-        label="gn-ppm")
-
 
 def mpa_plan(
     n_p,
@@ -406,7 +329,6 @@ def mpa_plan(
     varpi_near=None,
     varpi_far=None,
     energy_unit="Ha",
-    ladder_floor_octaves=3,
 ):
     """The double-parallel MPA protocol, as a plan.
 
@@ -432,8 +354,7 @@ def mpa_plan(
     grid = sampling.double_parallel_grid(
         n_p, omega_m, material_class=material_class, alpha=alpha,
         varpi_near=varpi_near, varpi_far=varpi_far,
-        energy_unit=energy_unit,
-        ladder_floor_octaves=ladder_floor_octaves)
+        energy_unit=energy_unit)
     n = int(n_p)
     pts = tuple(
         sample_point(z, f"{'near' if k < n else 'far'}_{k % n:02d}",

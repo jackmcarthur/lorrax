@@ -269,18 +269,22 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_sc_defaults(tmp_path):
+    # ``accelerator`` left this record when ``sc_accelerator`` was retired
+    # (2026-08-14); rCROP is the only accelerator.  See test_staged_sc.py
+    # for the retirement's own cells.
     sc = _config(tmp_path).sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (20, 1.0e-4, "rcrop", 5, 1.0, None)
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (20, 1.0e-4, 5, 1.0, None)
+    assert not hasattr(sc, "accelerator")
 
 
 def test_sc_input_keys(tmp_path):
     sc = _config(
         tmp_path,
-        "sc_max_iter = 7\nsc_tol_ev = 1e-6\nsc_accelerator = linear\n"
+        "sc_max_iter = 7\nsc_tol_ev = 1e-6\n"
         "sc_history_depth = 3\nsc_mixing = 0.5\nsc_dump_dir = sc_hist\n").sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (7, 1.0e-6, "linear", 3, 0.5, "sc_hist")
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (7, 1.0e-6, 3, 0.5, "sc_hist")
 
 
 def test_the_sc_env_twins_no_longer_outrank_the_deck(tmp_path, monkeypatch):
@@ -290,6 +294,11 @@ def test_the_sc_env_twins_no_longer_outrank_the_deck(tmp_path, monkeypatch):
     unreproducible from its own input file.  Checked for the FAILURE
     signature — every twin exported at once, and the DECK's values must
     come out — rather than for the absence of a helper.
+
+    ``sc_accelerator`` is in the deck below on purpose: the KEY was
+    retired by the staged-SC merge (warn-and-ignore, rCROP is the only
+    accelerator) and the ENV twin was deleted here, so the deck line must
+    neither steer anything nor stop the parse.
     """
     for name, val in (("LORRAX_SC_MAX_ITER", "3"),
                       ("LORRAX_SC_TOL_EV", "1e-10"),
@@ -302,12 +311,17 @@ def test_the_sc_env_twins_no_longer_outrank_the_deck(tmp_path, monkeypatch):
     path = tmp_path / "cohsex_env.in"
     path.write_text(_with_compute_mode(
         BASE_INPUT + "sc_max_iter = 99\nsc_accelerator = rcrop\n"))
-    sc = LorraxConfig.from_input_file(
-        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
-    ).sc
-    assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (99, 1.0e-4, "rcrop", 5, 1.0, None)
+    with pytest.warns(DeprecationWarning, match="sc_accelerator"):
+        sc = LorraxConfig.from_input_file(
+            str(path),
+            print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))),
+        ).sc
+    assert (sc.max_iter, sc.tol_ev, sc.history_depth,
+            sc.mixing, sc.dump_dir) == (99, 1.0e-4, 5, 1.0, None)
     assert not any("deprecated env override" in l for l in lines)
+    # The env twin must not even be ANNOUNCED: it is not read, and a
+    # line about it would be a reader by another name.
+    assert not any("LORRAX_SC_ACCEL" in l for l in lines)
 
 
 def test_the_sc_env_shim_is_gone_from_the_source():
@@ -326,11 +340,6 @@ def test_the_sc_env_shim_is_gone_from_the_source():
     for name in ("LORRAX_SC_MAX_ITER", "LORRAX_SC_TOL_EV", "LORRAX_SC_ACCEL",
                  "LORRAX_SC_DEPTH", "LORRAX_SC_MIXING", "LORRAX_SC_DUMP_DIR"):
         assert name not in strings
-
-
-def test_sc_bad_accelerator_rejected(tmp_path):
-    with pytest.raises(ValueError, match="sc_accelerator"):
-        _config(tmp_path, "sc_accelerator = bogus\n")
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +803,46 @@ def test_legacy_keys_keep_their_dedicated_messages(tmp_path, capsys):
     q.write_text(BASE_INPUT + "use_shipped_minimax_tables = true\n")
     with pytest.raises(ValueError, match="regenerate_minimax_tables"):
         read_lorrax_input(str(q))
+
+
+@pytest.mark.parametrize("key, line", [
+    ("sc_accelerator", "sc_accelerator = rcrop"),
+    ("sigma_omega_batch_size", "sigma_omega_batch_size = 8"),
+])
+def test_the_staged_sc_merge_retirements_warn_rather_than_vanish(
+        tmp_path, key, line):
+    """Two keys the staged-SC merge deleted from ``_DEFAULTS``.
+
+    A ``_LEGACY_DECK_KEYS`` row alone is NOT enough: the row only exempts
+    the key from the unknown-key check, so a key with a row and no branch
+    is dropped in SILENCE — which under ``strict_keys = true`` is strictly
+    worse than the refusal it replaced.  Each therefore needs a branch,
+    and this cell is the failure signature for its absence.
+    """
+    from gw.gw_config import read_lorrax_input, _LEGACY_DECK_KEYS
+
+    assert key in _LEGACY_DECK_KEYS, (
+        f"{key} was deleted from _DEFAULTS; without a legacy row it "
+        f"REFUSES under the 0.1.0 strict_keys default")
+    p = tmp_path / f"deck_{key}.in"
+    p.write_text(BASE_INPUT + line + "\n")
+    with pytest.warns(DeprecationWarning, match=key):
+        read_lorrax_input(str(p))
+
+
+def test_sc_accelerator_linear_refuses_by_name(tmp_path):
+    """The asymmetry is the point: ``rcrop`` warns, ``linear`` refuses.
+
+    ``linear`` named a DIFFERENT fixed-point iteration, so running rCROP
+    under that name would be a mode substitution — the same class as the
+    ``screening_method = ctsp`` spelling that silently ran minimax.
+    """
+    from gw.gw_config import read_lorrax_input
+
+    p = tmp_path / "deck_accel_linear.in"
+    p.write_text(BASE_INPUT + "sc_accelerator = linear\n")
+    with pytest.raises(ValueError, match="sc_accelerator"):
+        read_lorrax_input(str(p))
 
 
 def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):

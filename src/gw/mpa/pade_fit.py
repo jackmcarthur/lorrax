@@ -231,8 +231,10 @@ SOLVE_MODES = ("loewner", "pade")
 #: eigensolver, and both modes above feed both backends here.
 #:
 #: ``"lapack"``
-#:     ``jnp.linalg.eigvals``.  DEFAULT, because it is what every store
-#:     on disk was made with.  On GPU it reaches ``cusolver_geev_ffi``,
+#:     ``jnp.linalg.eigvals``.  DEFAULT for direct calls; the disk fit
+#:     driver stamps ``eig="jax_qr"`` (``fit_driver._FIT_EIG``), which is
+#:     what the accepted Si store was made with.  On GPU this backend
+#:     reaches ``cusolver_geev_ffi``,
 #:     which does not batch: measured on this tree at ``n_p = 8``, the
 #:     per-element cost is 1012 us at 1024 elements and 1045 us at 4096,
 #:     i.e. flat in the batch, which is the signature of a per-matrix
@@ -784,8 +786,9 @@ def fit_mpa_poles(
         pathology is exhibited.
     eig
         Which eigensolver finds the roots of whichever matrix ``solve``
-        chose; one of :data:`EIG_MODES`.  ``"lapack"`` is the default and
-        is what every store on disk was made with.  ``"jax_qr"`` stays
+        chose; one of :data:`EIG_MODES`.  ``"lapack"`` is the default
+        here; the disk driver stamps ``eig="jax_qr"``, which made the
+        accepted Si store.  ``"jax_qr"`` stays
         inside XLA and is the only one of the two that batches, but it
         does NOT reproduce the other bit for bit -- see
         :data:`EIG_MODES`.

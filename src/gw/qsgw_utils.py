@@ -768,11 +768,45 @@ def plot_qp_energy_comparison(
     return output_png
 
 
+# ---------------------------------------------------------------------------
+# Managed-file cleanup — shared by the SC loop's disk-bounded artifacts
+# ---------------------------------------------------------------------------
+
+def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
+    """Rank-0 scan-and-unlink of managed files, then a collective barrier.
+
+    Removes every entry of ``dir_path`` whose NAME fullmatches ``pattern``
+    and whose full path is not in ``keep``, on rank 0 only; all ranks then
+    meet at ``barrier_tag`` so the directory looks the same everywhere on
+    return.  Returns the removed names (empty off rank 0).  Shared by
+    ``sc_iteration._clear_sc_eqp_snapshots`` and
+    ``gw.mpa.model.retain_iteration_artifacts``; each caller owns its own
+    regex, keep-set and report line.
+    """
+    import os
+    import re
+    from common.collectives import barrier, process_rank
+
+    managed = re.compile(pattern)
+    keep = set(keep)
+    root = os.path.abspath(os.fspath(dir_path))
+    removed = []
+    if process_rank() == 0 and os.path.isdir(root):
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if managed.fullmatch(name) and path not in keep:
+                os.remove(path)
+                removed.append(name)
+    barrier(barrier_tag, print_fn=print_fn)
+    return removed
+
+
 __all__ = [
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
     "interp_along_omega",
     "plot_qp_energy_comparison",
+    "remove_managed",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
 ]

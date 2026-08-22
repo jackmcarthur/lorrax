@@ -109,8 +109,7 @@ page has to read it from.
 | `sigma_omega_step_ev` | `0.25` | Sigma(omega) grid step (eV). |
 | `sigma_regularization_ev` | `0.25` | Retarded broadening of Sigma(omega) in eV. In MPA this is a literal external `eta`, applied once in addition to each fitted pole width; it is not a pole-fit width or an HGL scale. Must be finite and positive. |
 | `sigma_window_edge_factor` | `1.5` | MPA core/sector partition margin in `T = max(abs(omega_min),abs(omega_max)) + factor*eta`. It moves work between exact quadrature families and does not add a second broadening. |
-| `sigma_omega_batch_size` | `4` | Omega points evaluated per batch in the Sigma^c(omega) loop. |
-| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. |
+| `sigma_omega_layout` | `"replicated"` | Sigma_c(omega,k,m,n) cube layout: replicated (default) | sharded (stays mesh-tiled end-to-end; works for every qp_solver; refuses an indivisible window or h5py_allgather at P>1). Production-size MPA runs should select sharded explicitly. Two neighbouring keys were retired for 0.1.0 and warn-and-ignore: `sigma_omega_accumulation` (host-tile accumulation is the only mode; the removed `kij_stream` VALUE keeps a dedicated refusal) and `sigma_omega_batch_size` (threaded into `_run_sigma_branch` and read by no branch). |
 | `sigma_at_dft_extrapolate` | false | Extrapolate Sigma to E_DFT outside the omega grid instead of clamping. |
 | `sigma_freq_debug_file` | `""` | Path of the per-branch Sigma(omega) debug dump; EMPTY (the default) = off. The `sigma_freq_debug_output` bool was folded into this key for 0.1.0 and now REFUSES, naming the line to write. |
 
@@ -140,11 +139,20 @@ page has to read it from.
 | `sc_on_ibz` | false | Run the SC loop's H/E/U and carried state on the IBZ, broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton. |
 | `qp_solver` | `"one_shot_dft"` | QP extraction: one_shot_dft (G0W0 at E_DFT; the default) | fixed_point (on-shell) | self_consistent (QSGW loop). The `auto` value and the `self_consistent` BOOLEAN it read were deleted for 0.1.0; that spelling now REFUSES naming this key. `self_consistent` also refuses together with `bispinor = true` (the SC path drops Sigma^B). |
 | `do_G0` | true | Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run. |
-| `sc_max_iter` | `20` | Self-consistency iteration cap. |
-| `sc_tol_ev` | `0.0001` | Self-consistency convergence tolerance (eV). |
-| `sc_accelerator` | `"rcrop"` | SC mixing accelerator: rcrop | linear. |
+| `sc_max_iter` | `20` | PER-STAGE self-consistency iteration ceiling (see `sc_stage_N_max_iter`), so a slow first stage cannot starve the stage after it. |
+| `sc_tol_ev` | `0.0001` | Legacy whole-loop RMS-dE tolerance (eV), retained for the one-shot snapshot path; the staged loop converges on the STAGE cutoffs below. |
+| `sc_stage_1_type` | `""` | Self-energy ansatz for ladder stage 1: `none` \| `cohsex` \| `gnppm` \| `mpa`. Empty = no stage stated here; `none` is a HOLE, not a terminator, so `1=gnppm, 2=none, 3=mpa` is a valid two-stage ladder. A deck naming NO stage type takes the default ladder (mpa deck -> GN-PPM to 5 meV then MPA to 2 meV; anything else -> one stage of the deck's own `compute_mode` to 2 meV). An unknown type refuses BY NAME. |
+| `sc_stage_1_cutoff` | `0.0` | Stage-1 convergence cutoff (eV): max\|dE\| over the non-scissored bands, L-infinity and not RMS. `0.0` = unset -> the resolved ladder's cutoff (5 meV for a stated stage). |
+| `sc_stage_1_max_iter` | `0` | Stage-1 iteration ceiling. `0` = unset -> `sc_max_iter`. |
+| `sc_stage_2_type` | `""` | Ladder stage 2; same vocabulary and sentinels as `sc_stage_1_type`. |
+| `sc_stage_2_cutoff` | `0.0` | Stage-2 cutoff (eV); same sentinel as stage 1. |
+| `sc_stage_2_max_iter` | `0` | Stage-2 ceiling; same sentinel as stage 1. |
+| `sc_stage_3_type` | `""` | Ladder stage 3; same vocabulary and sentinels as `sc_stage_1_type`. |
+| `sc_stage_3_cutoff` | `0.0` | Stage-3 cutoff (eV); same sentinel as stage 1. |
+| `sc_stage_3_max_iter` | `0` | Stage-3 ceiling; same sentinel as stage 1. |
+| `self_energy_eval_type` | `""` | How QP energies are extracted from a built Sigma, orthogonal to which ansatz built it: `linearized` (BGW-style eqp0 + Z-linearized eqp1 at E_DFT) \| `hermitianized` (rediagonalize H = kin_ion + (Sigma + Sigma^dag)/2 + V_H; the eigenvalue IS the answer, no eqp1 twin). Empty = unset, resolved from `qp_solver` (self_consistent -> hermitianized, everything else -> linearized), so no existing deck changes meaning. An EXPLICIT `linearized` under `qp_solver = self_consistent` REFUSES rather than being coerced. |
 | `sc_history_depth` | `5` | rCROP history depth. |
-| `sc_mixing` | `1.0` | Linear-mixing alpha (accelerator = linear only). |
+| `sc_mixing` | `1.0` | Linear-mixing alpha. Latent: rCROP is the only accelerator, and only `sc_iteration._run_linear_mixing` (a direct-call diagnostic entry point) reads this. The `sc_accelerator` key that used to select between the two was retired for 0.1.0: `rcrop` warn-and-ignores (it names what the run already does), `linear` REFUSES (it named a different fixed-point iteration, and running rCROP under that name would be a mode substitution). Its `LORRAX_SC_ACCEL` env twin was deleted with the other five `LORRAX_SC_*` twins and is not read at all. |
 | `sc_dump_dir` | `""` | Directory for per-iteration E-history npy dumps; empty = off. |
 | `sc_eigh` | `"auto"` | Eigh for the per-iteration (nk, nb, nb) carry: native = k-sharded batch, one whole (nb, nb) tile per device; distributed = one tile spread over the mesh; auto = distributed once a tile exceeds a fraction of `memory_per_device_gb` and the mesh divides nb, else native. Layout only — the eigenvalues agree and the physics does not change. |
 | `distributed_cholesky` | `"auto"` | Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate. |

@@ -66,10 +66,14 @@ def test_actual_windows_match_all_four_causal_denominators():
         [[[0.4 - 0.5j, -0.2 + 0.6j],
           [0.9 + 0.3j, -0.1 - 0.4j]]],
     ])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, branches,
+        regularization_width_ry=0.2, edge_factor=1.5)
     plan, geometry = SW.build_shared_sigma_windows(
-        tuple(Omega), branches, B_poles=tuple(B),
+        summaries, branches,
         regularization_width_ry=0.2,
-        edge_factor=1.5, target_error=1.0e-6, max_rank=96)
+        edge_factor=1.5, target_error=1.0e-6, max_rank=96,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     assert [(row.window.name, row.window.prefactor,
              row.window.omega_sign) for row in plan] == [
         ("single", -1.0, -1), ("single", 1.0, -1),
@@ -126,10 +130,14 @@ def test_actual_stripe_and_slab_match_direct_complex_denominators():
         [[[1.3 - 0.35j]]],   # deep: slab for both electronic energies
     ])
     B = jnp.asarray([[[[0.7 + 0.2j]]], [[[-0.3 + 0.6j]]]])
+    summaries = SW.summarize_sigma_poles(
+        Omega, B, [branch],
+        regularization_width_ry=0.2, edge_factor=1.5)
     plan, geometry = SW.build_shared_sigma_windows(
-        tuple(Omega), [branch], B_poles=tuple(B),
+        summaries, [branch],
         regularization_width_ry=0.2, edge_factor=1.5,
-        target_error=1.0e-6, max_rank=96)
+        target_error=1.0e-6, max_rank=96,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     assert [row.window.name for row in plan] == [
         "b_slab", "a_stripe", "core"]
 
@@ -188,12 +196,6 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
     monkeypatch.setattr(SW.minimax, "fit_damped_reciprocal", fake_fit)
     monkeypatch.setattr(SW, "damped_rectangle_positive_rule", fake_damped)
 
-    plan, report = SW.build_shared_sigma_windows(
-        _poles(), _branches(),
-        B_poles=tuple(jnp.ones_like(pole) for pole in _poles()),
-        regularization_width_ry=0.2,
-        edge_factor=1.5, target_error=6.5e-4,
-        crossing_target_error=2.0e-3)
     summaries = []
     for p, pole in enumerate(_poles()):
         summaries.extend(SW.summarize_sigma_poles(
@@ -205,15 +207,11 @@ def test_window_plan_partitions_widths_and_shares_rules(monkeypatch):
         regularization_width_ry=0.2,
         edge_factor=1.5)
     assert batched == tuple(summaries)
-    streamed, streamed_report = SW.build_shared_sigma_windows(
-        None, _branches(), regularization_width_ry=0.2,
-        edge_factor=1.5, pole_summaries=summaries,
-        target_error=6.5e-4, crossing_target_error=2.0e-3)
-    assert streamed_report == report
-    assert [(r.window.name, r.pole_indices.tolist(), r.bounds.tolist())
-            for r in streamed] == [
-                (r.window.name, r.pole_indices.tolist(), r.bounds.tolist())
-                for r in plan]
+    plan, report = SW.build_shared_sigma_windows(
+        summaries, _branches(), regularization_width_ry=0.2,
+        edge_factor=1.5,
+        target_error=6.5e-4, crossing_target_error=2.0e-3,
+        max_rank=96, crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     names = [row.window.name for row in plan]
     assert names.count("single") == 2
     assert names.count("b_slab") == 2
@@ -251,11 +249,16 @@ def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
     branches = _branches()
     # On pos_val, E_A=-0.02 and a=0.01 make E_A+a negative.  The method must
     # not hide that by flooring the lower bound to a small positive number.
-    bad = (jnp.asarray([[[0.01 - 0.1j]]]),)
+    bad = jnp.asarray([[[[0.01 - 0.1j]]]])
+    summaries = SW.summarize_sigma_poles(
+        bad, jnp.ones_like(bad), branches,
+        regularization_width_ry=0.2, edge_factor=1.5)
     try:
         SW.build_shared_sigma_windows(
-            bad, branches, B_poles=(jnp.ones_like(bad[0]),),
-            regularization_width_ry=0.2, edge_factor=1.5)
+            summaries, branches,
+            regularization_width_ry=0.2, edge_factor=1.5,
+            target_error=1.0e-4, max_rank=96,
+            crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     except ValueError as exc:
         assert "crosses zero" in str(exc)
     else:
@@ -263,10 +266,10 @@ def test_a_truly_crossing_sign_definite_cell_refuses(monkeypatch):
 
 
 def test_live_negative_real_pole_refuses():
-    poles = (jnp.asarray([[[-0.2 - 0.1j]]]),)
+    poles = jnp.asarray([[[[-0.2 - 0.1j]]]])
     try:
-        SW.build_shared_sigma_windows(
-            poles, _branches(), B_poles=(jnp.ones_like(poles[0]),),
+        SW.summarize_sigma_poles(
+            poles, jnp.ones_like(poles), _branches(),
             regularization_width_ry=0.2,
             edge_factor=1.5)
     except ValueError as exc:
@@ -293,13 +296,23 @@ def test_exact_zero_residue_pole_does_not_change_geometry(monkeypatch):
     live = _poles()[0]
     residue = jnp.ones_like(live)
     base, base_report = SW.build_shared_sigma_windows(
-        (live,), _branches(), B_poles=(residue,),
-        regularization_width_ry=0.2, edge_factor=1.5)
+        SW.summarize_sigma_poles(
+            live[None, ...], residue[None, ...], _branches(),
+            regularization_width_ry=0.2, edge_factor=1.5),
+        _branches(),
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-4, max_rank=96,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     dead = jnp.full_like(live, 1.0e4 - 1.0e4j)
     extended, extended_report = SW.build_shared_sigma_windows(
-        (live, dead), _branches(),
-        B_poles=(residue, jnp.zeros_like(dead)),
-        regularization_width_ry=0.2, edge_factor=1.5)
+        SW.summarize_sigma_poles(
+            jnp.stack((live, dead)),
+            jnp.stack((residue, jnp.zeros_like(dead))), _branches(),
+            regularization_width_ry=0.2, edge_factor=1.5),
+        _branches(),
+        regularization_width_ry=0.2, edge_factor=1.5,
+        target_error=1.0e-4, max_rank=96,
+        crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
     assert extended_report == base_report
     assert [(row.window.name, row.window.n_tau,
              row.pole_indices.tolist(), row.bounds.tolist())
@@ -310,13 +323,16 @@ def test_exact_zero_residue_pole_does_not_change_geometry(monkeypatch):
 
 
 def test_nonpositive_eta_refuses():
+    summaries = SW.summarize_sigma_poles(
+        jnp.stack(_poles()), jnp.ones_like(jnp.stack(_poles())), _branches(),
+        regularization_width_ry=0.2, edge_factor=1.5)
     for eta in (0.0, -0.2, np.nan):
         try:
             SW.build_shared_sigma_windows(
-                _poles(), _branches(),
-                B_poles=tuple(jnp.ones_like(pole) for pole in _poles()),
+                summaries, _branches(),
                 regularization_width_ry=eta,
-                edge_factor=1.5)
+                edge_factor=1.5, target_error=1.0e-4, max_rank=96,
+                crossing_max_nodes=SW.CROSSING_NODE_FLOOR)
         except ValueError as exc:
             assert "eta must be finite and positive" in str(exc)
         else:

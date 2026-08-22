@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -34,21 +33,13 @@ def retain_iteration_artifacts(run_dir, label, *, print_fn=print):
     failure preserves the last usable generation.  Scanning rather than
     deleting only ``N-1`` also removes stale later maps from a shorter rerun.
     """
-    from common.collectives import barrier, process_rank
+    from gw.qsgw_utils import remove_managed
 
-    root = os.path.abspath(os.fspath(run_dir))
-    keep = set(iteration_artifact_paths(root, label))
-    managed = re.compile(r"mpa_(?:samples|fit)_sc_[0-9]{4}\.h5\Z")
-    removed = []
-    is_root = process_rank() == 0
-    if is_root and os.path.isdir(root):
-        for name in os.listdir(root):
-            path = os.path.join(root, name)
-            if managed.fullmatch(name) and path not in keep:
-                os.remove(path)
-                removed.append(name)
-    barrier(f"mpa.model.retain.{label}", print_fn=print_fn)
-    if is_root and removed:
+    removed = remove_managed(
+        run_dir, r"mpa_(?:samples|fit)_sc_[0-9]{4}\.h5\Z",
+        keep=iteration_artifact_paths(run_dir, label),
+        barrier_tag=f"mpa.model.retain.{label}", print_fn=print_fn)
+    if removed:
         print_fn(f"  MPA scratch: retained {label}; discarded: "
                  + ", ".join(removed))
 

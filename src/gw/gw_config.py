@@ -579,6 +579,277 @@ class QPSolver(str, enum.Enum):
     SELF_CONSISTENT = "self_consistent"
 
 
+def resolve_compute_mode(raw) -> ComputeMode:
+    """Resolve the ``compute_mode`` axis from its raw deck value.
+
+    THE resolution owner for this axis, for the same reason as
+    :func:`resolve_qp_solver`: ``LorraxConfig.compute_mode`` is a
+    property, and the staged-SC ladder has to know the mode while
+    :class:`SCConfig` is being built, which is before any
+    ``LorraxConfig`` exists.
+
+    REQUIRED — there is no default and no ``auto``.  Both were deleted
+    for 0.1.0 along with the three legacy flags (``do_screened`` /
+    ``use_ppm_sigma`` / ``ppm_model``) that ``auto`` inferred from, so
+    this function takes ONE argument: the eight combinations of three
+    flags that used to name four modes are gone, and with them the two
+    cross-flag refusals this used to carry.
+
+    RESOLVING IS NOT PERMITTING — this answers "which mode did the deck
+    ask for" for every member of the enum, including ones whose Σ stage
+    has not landed; :func:`refuse_unimplemented_compute_mode` is the
+    refusal.
+    """
+    text = (raw or "").strip().lower()
+    if not text:
+        raise ValueError(
+            f"compute_mode is REQUIRED and this config carries none.  "
+            f"Write one of: "
+            f"{', '.join(m.value for m in ComputeMode)}.  It used to "
+            f"default to 'auto', which inferred the self-energy ansatz "
+            f"from three legacy flags; a deck naming none of them ran "
+            f"COHSEX by accident of the defaults.")
+    return coerce_compute_mode(text)
+
+
+def resolve_qp_solver(raw) -> QPSolver:
+    """Resolve the ``qp_solver`` axis from its raw deck value.
+
+    THE resolution owner for this axis.  ``LorraxConfig.qp_solver`` calls
+    it and then applies the cross-axis validation that needs
+    ``compute_mode``; ``from_input_file`` calls it while building
+    :class:`SCConfig`, which is BEFORE a ``LorraxConfig`` exists and so
+    cannot reach the property.  Restating the two-line rule in the second
+    caller is exactly how the two would drift apart.
+
+    Unlike ``compute_mode`` this axis keeps a DEFAULT (``one_shot_dft``);
+    what it lost in 0.1.0 is ``auto``, which existed only to read the
+    deprecated ``self_consistent`` BOOLEAN — hence no flag argument here.
+    """
+    text = (raw or "one_shot_dft").strip().lower()
+    try:
+        return QPSolver(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"qp_solver={text!r} invalid; expected one of: "
+            f"{', '.join(s.value for s in QPSolver)}.  ('auto' was "
+            f"deleted in 0.1.0 with the ``self_consistent`` boolean it "
+            f"read; the default is one_shot_dft.)"
+        ) from exc
+
+
+class SelfEnergyEvalType(str, enum.Enum):
+    """How QP energies are extracted from a built Σ, for REPORTING.
+
+    A third axis, orthogonal to both ``compute_mode`` (which Σ ansatz)
+    and ``qp_solver`` (whether Σ is rebuilt):
+
+    - ``LINEARIZED`` — BerkeleyGW-style.  Σ is evaluated on the diagonal
+      at E_DFT and the QP energy follows from the Newton step plus the
+      Z-linearization, i.e. the run reports ``eqp0`` AND ``eqp1``.
+    - ``HERMITIANIZED`` — build the static QSGW Hamiltonian
+      ``H = kin_ion + ½(Σ + Σ†) + V_H`` on the active subspace and report
+      the energies AFTER rediagonalization.  Off-diagonal Σ moves the
+      bands, so there is no ``eqp1`` twin: the eigenvalue IS the answer.
+
+    SELF-CONSISTENCY REQUIRES ``HERMITIANIZED``, and the pairing is
+    refused rather than coerced (:func:`resolve_self_energy_eval_type`).
+    The reason is not taste: the SC carry IS the Hermitianized H, every
+    iterate is its eigendecomposition, and a converged loop reported
+    through the linearized formula would print at-DFT Newton numbers
+    under a self-consistent label — a narrow verification reported as a
+    general one, which is the failure mode the refusal contract exists
+    to prevent.
+    """
+
+    LINEARIZED = "linearized"
+    HERMITIANIZED = "hermitianized"
+
+
+def coerce_self_energy_eval_type(value) -> SelfEnergyEvalType:
+    """``"linearized"`` / ``"hermitianized"`` (or the enum) → enum."""
+    if isinstance(value, SelfEnergyEvalType):
+        return value
+    text = str(value).strip().lower()
+    try:
+        return SelfEnergyEvalType(text)
+    except ValueError:
+        raise ValueError(
+            f"self_energy_eval_type must be one of "
+            f"{sorted(m.value for m in SelfEnergyEvalType)}; "
+            f"got {value!r}.") from None
+
+
+def resolve_self_energy_eval_type(raw, qp_solver) -> SelfEnergyEvalType:
+    """Resolve ``self_energy_eval_type``, refusing the one bad pairing.
+
+    ``raw`` is the deck string; ``""`` means UNSET and resolves from
+    ``qp_solver`` so that no existing deck changes meaning:
+    ``SELF_CONSISTENT`` → hermitianized, everything else → linearized.
+
+    An EXPLICIT ``linearized`` under self-consistency raises — see
+    :class:`SelfEnergyEvalType`.  Nothing is silently coerced in either
+    direction.
+    """
+    text = "" if raw is None else str(raw).strip().lower()
+    if text == "":
+        return (SelfEnergyEvalType.HERMITIANIZED
+                if qp_solver is QPSolver.SELF_CONSISTENT
+                else SelfEnergyEvalType.LINEARIZED)
+    resolved = coerce_self_energy_eval_type(text)
+    if (qp_solver is QPSolver.SELF_CONSISTENT
+            and resolved is SelfEnergyEvalType.LINEARIZED):
+        raise ValueError(
+            "self_energy_eval_type = linearized is incompatible with "
+            "qp_solver = self_consistent.  The self-consistent carry IS "
+            "the Hermitianized QSGW Hamiltonian and every iterate is its "
+            "rediagonalization, so there is no linearized quantity to "
+            "converge; reporting eqp0/eqp1 at DFT energies under a "
+            "self-consistent label would describe the run as something "
+            "it is not.  Set 'self_energy_eval_type = hermitianized' "
+            "(or drop the key -- self-consistency resolves to it), or "
+            "use 'qp_solver = one_shot_dft' for linearized eqp0/eqp1.")
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Staged self-consistency
+# ---------------------------------------------------------------------------
+
+#: Deck spelling → the Σ ansatz that stage runs.  ``none`` is the absence
+#: of a stage, not a mode.  These are exactly the four values the deck may
+#: name; anything else is refused BY NAME rather than resolved to a
+#: neighbour (the ``screening_method = ctsp`` ruling).  Note the deck
+#: spelling is ``gnppm`` while the enum value is ``gn_ppm`` — the stage
+#: vocabulary is the owner's, and this table is the single place the two
+#: are related.
+SC_STAGE_TYPES: dict[str, "ComputeMode | None"] = {
+    "none": None,
+    "cohsex": ComputeMode.COHSEX,
+    "gnppm": ComputeMode.GN_PPM,
+    "mpa": ComputeMode.MPA,
+}
+
+#: Number of configurable stages (``sc_stage_1_*`` … ``sc_stage_3_*``).
+SC_N_STAGES = 3
+
+#: The converged target of the LAST stage of the default ladder, eV.
+SC_DEFAULT_CUTOFF_EV = 2.0e-3
+
+#: What a stage hands off at when a more expensive stage follows it, eV.
+#: Also the default for a stage the deck names without giving a cutoff.
+SC_DEFAULT_HANDOFF_CUTOFF_EV = 5.0e-3
+
+
+@dataclass(frozen=True)
+class SCStage:
+    """One stage of the self-consistency ladder.
+
+    ``mode`` is the Σ ansatz this stage iterates; ``cutoff_ev`` is the
+    MAX-ABS ΔE over the PROTECTED bands (L-infinity, not RMS) below which
+    the stage is converged and hands off; ``max_iter`` is this stage's
+    OWN iteration ceiling, so a slow first stage cannot consume the whole
+    allowance and starve the stage after it.
+    """
+
+    mode: ComputeMode
+    cutoff_ev: float
+    max_iter: int
+
+    def __post_init__(self):
+        if self.cutoff_ev <= 0.0:
+            raise ValueError(
+                f"sc_stage cutoff must be > 0 eV; got {self.cutoff_ev!r}.")
+        if self.max_iter < 1:
+            raise ValueError(
+                f"sc_stage max_iter must be >= 1; got {self.max_iter!r}.")
+
+
+def default_sc_ladder(compute_mode) -> tuple[tuple["ComputeMode", float], ...]:
+    """The ladder used when a deck states no ``sc_stage_*_type`` at all.
+
+    ─────────────────────────────────────────────────────────────────────
+    THE ONE DECISION POINT, AND IT IS ASSUMED RATHER THAN SPECIFIED.
+    The owner described the two-stage row as "self-consistency + some
+    kind of qsgw flag", then separately ruled that self-consistency
+    REQUIRES ``hermitianized`` — which removes the flag that would have
+    distinguished the rows.  This keys the choice off ``compute_mode``
+    instead: ``mpa`` selects the two-stage ladder, anything else runs a
+    single stage of the deck's OWN mode.  Change the predicate on the
+    next line and nothing else moves.
+    ─────────────────────────────────────────────────────────────────────
+
+    Note the non-MPA arm runs ``compute_mode`` rather than a hard-wired
+    GN-PPM.  For the common ``compute_mode = gn_ppm`` deck the two read
+    identically, which is the owner's stated row; hard-wiring GN-PPM
+    would instead make a ``compute_mode = cohsex`` deck silently run a
+    different self-energy than the one it named.
+    """
+    mode = coerce_compute_mode(compute_mode)
+    if mode is ComputeMode.MPA:                       # <- the decision
+        return ((ComputeMode.GN_PPM, SC_DEFAULT_HANDOFF_CUTOFF_EV),
+                (ComputeMode.MPA, SC_DEFAULT_CUTOFF_EV))
+    return ((mode, SC_DEFAULT_CUTOFF_EV),)
+
+
+def resolve_sc_stages(get, compute_mode, *, sc_max_iter: int,
+                      ) -> tuple[SCStage, ...]:
+    """Build the stage ladder from the deck, or fall back to the default.
+
+    ``get(key)`` returns the deck value for one key (``_DEFAULTS`` already
+    applied) — passed as a callable so this stays free of the parser's
+    local scope and is unit-testable on a plain dict.
+
+    Semantics, in the order they are decided:
+
+    1. If NO ``sc_stage_N_type`` is stated, the ladder is
+       :func:`default_sc_ladder`, and each stage takes ``sc_max_iter``.
+    2. Otherwise the stated stages are used IN ORDER.  ``none`` is a hole,
+       not a terminator, so ``1=gnppm, 2=none, 3=mpa`` is a valid
+       two-stage ladder and does not silently drop the mpa stage.
+    3. A stage that names a type but no cutoff gets
+       ``SC_DEFAULT_HANDOFF_CUTOFF_EV`` (5 meV).
+    4. A stage that names no ``max_iter`` gets ``sc_max_iter`` — which is
+       therefore a PER-STAGE ceiling now, not a global budget.
+    """
+    stated: list[tuple[int, str]] = []
+    for i in range(1, SC_N_STAGES + 1):
+        raw = get(f"sc_stage_{i}_type")
+        text = "" if raw is None else str(raw).strip().lower()
+        if text:
+            stated.append((i, text))
+
+    def _max_iter_for(i: int) -> int:
+        raw = int(get(f"sc_stage_{i}_max_iter") or 0)
+        return raw if raw > 0 else int(sc_max_iter)
+
+    if not stated:
+        return tuple(
+            SCStage(mode=mode, cutoff_ev=cut, max_iter=int(sc_max_iter))
+            for mode, cut in default_sc_ladder(compute_mode))
+
+    stages: list[SCStage] = []
+    for i, text in stated:
+        if text not in SC_STAGE_TYPES:
+            raise ValueError(
+                f"sc_stage_{i}_type = {text!r} is not a known stage type; "
+                f"expected one of {sorted(SC_STAGE_TYPES)}.")
+        mode = SC_STAGE_TYPES[text]
+        if mode is None:                      # 'none' -- no stage here
+            continue
+        cutoff = float(get(f"sc_stage_{i}_cutoff") or 0.0)
+        if cutoff <= 0.0:
+            cutoff = SC_DEFAULT_HANDOFF_CUTOFF_EV
+        stages.append(SCStage(mode=mode, cutoff_ev=cutoff,
+                              max_iter=_max_iter_for(i)))
+    if not stages:
+        raise ValueError(
+            "every sc_stage_N_type is 'none', so self-consistency has no "
+            "scheme to iterate.  State at least one of "
+            f"{sorted(k for k in SC_STAGE_TYPES if k != 'none')}, or drop "
+            "the sc_stage_* keys to take the default ladder.")
+    return tuple(stages)
+
 
 class GspaceIO(str, enum.Enum):
     """How ψ(G) is moved into the ISDF r-chunk loop.
@@ -980,13 +1251,45 @@ _DEFAULTS = {
     # twins were DELETED in 0.1.0 — the deck is the only source.
     "sc_max_iter": 20,
     "sc_tol_ev": 1.0e-4,
-    "sc_accelerator": "rcrop",   # rcrop | linear
+    # ``sc_accelerator`` RETIRED 2026-08-14 -- see _LEGACY_DECK_KEYS.  rCROP
+    # is the only accelerator; the key is parsed, reported and ignored, and
+    # the removed ``linear`` VALUE keeps a dedicated refusal.
     "sc_history_depth": 5,       # rCROP history depth
-    "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
+    "sc_mixing": 1.0,            # linear-mixing α (_run_linear_mixing only)
     "sc_dump_dir": "",           # E-history npy dump dir ("" = off)
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
+    # ── STAGED SELF-CONSISTENCY (2026-08-14) ────────────────────────────
+    # Up to three schemes run in order, each iterated to its OWN cutoff
+    # before the next begins, so a cheap scheme reaches the fixed point
+    # before an expensive one starts.  Types are STRINGS, matching the
+    # ``compute_mode = mpa`` / ``screening_method = minimax`` convention:
+    # ``none | cohsex | gnppm | mpa``.
+    #
+    # Every sentinel below means "unset, resolve it" rather than a value:
+    #   type     ""   -> no stage stated here
+    #   cutoff   0.0  -> the resolved ladder's cutoff for this stage
+    #   max_iter 0    -> ``sc_max_iter`` (which is now a PER-STAGE ceiling)
+    # A deck that states NO stage type at all gets the default ladder in
+    # ``default_sc_ladder`` / ``resolve_sc_stages``.
+    "sc_stage_1_type": "",
+    "sc_stage_1_cutoff": 0.0,    # eV
+    "sc_stage_1_max_iter": 0,
+    "sc_stage_2_type": "",
+    "sc_stage_2_cutoff": 0.0,    # eV
+    "sc_stage_2_max_iter": 0,
+    "sc_stage_3_type": "",
+    "sc_stage_3_cutoff": 0.0,    # eV
+    "sc_stage_3_max_iter": 0,
+    # How QP energies are EVALUATED and reported, orthogonal to which Σ
+    # ansatz built them.  "" resolves from ``qp_solver`` (self-consistent
+    # -> hermitianized, everything else -> linearized), so no existing
+    # deck changes meaning.  Self-consistency REFUSES an explicit
+    # ``linearized`` rather than coercing it -- reporting linearized
+    # numbers under a self-consistent label is the defect the refusal
+    # exists to prevent.
+    "self_energy_eval_type": "",  # linearized | hermitianized
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
     # true`` disables it and emits the raw QE-basis-dependent diagonals.
@@ -1321,7 +1624,8 @@ _DEFAULTS = {
     "sigma_omega_step_ev": 0.25,
     "sigma_regularization_ev": 0.25,
     "sigma_window_edge_factor": 1.5,
-    "sigma_omega_batch_size": 4,
+    # ``sigma_omega_batch_size`` RETIRED 0.1.0 -- see ``_LEGACY_DECK_KEYS``.
+    # It was threaded into ``_run_sigma_branch`` and read by no branch.
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
     #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
     #       tiles are gathered into the FULL cube on EVERY rank
@@ -1496,6 +1800,22 @@ _LEGACY_DECK_KEYS = frozenset({
     "r_chunk_size",                 # warn-and-ignore -> LORRAX_R_CHUNK
     "gflat_chunk_size",             # warn-and-ignore -> LORRAX_GFLAT_CHUNK
     "vq_g_chunk_size",              # warn-and-ignore -> LORRAX_VQ_G_CHUNK
+    # 0.1.0 (staged-SC merge): rCROP is the only accelerator, so the key
+    # steered nothing.  The two VALUES are NOT symmetric and must not draw
+    # the same message -- ``rcrop`` names what the run already does, so it
+    # warn-and-ignores, while ``linear`` named a DIFFERENT fixed-point
+    # iteration, and honouring it silently as rCROP would be a mode
+    # substitution of the ``screening_method = ctsp`` class.  Refuse that
+    # one.  Its ``LORRAX_SC_ACCEL`` env twin was DELETED with the other
+    # five LORRAX_SC_* twins and is not read, announced or referenced.
+    "sc_accelerator",               # refuse on linear, else ignore
+    # 0.1.0 (staged-SC merge): PARSED-NEVER-READ -- threaded through
+    # ``ppm_sigma._run_sigma_branch`` as a parameter no branch consumed.
+    # Warn-and-ignore on the ``slab_io`` rule: it never changed a number.
+    # It needs a row here (and not only a deletion from ``_DEFAULTS``)
+    # because ``strict_keys`` defaults to TRUE for 0.1.0 -- without one an
+    # old deck naming it would REFUSE rather than be told what it lost.
+    "sigma_omega_batch_size",       # warn-and-ignore (was inert)
 })
 
 #: The demoted chunk overrides: ``{deck key: env var}``.  One table so
@@ -1543,8 +1863,9 @@ _ALIASES: dict[str, str] = {}
 _NORMALIZE_STR = {
     "compute_mode",
     "qp_solver",
-    "sc_accelerator",
     "sc_eigh",
+    "sc_stage_1_type", "sc_stage_2_type", "sc_stage_3_type",
+    "self_energy_eval_type",
     "wcoul0_source", "screening_method",
     "sigma_omega_layout",
     "w_dyson_solver",
@@ -1761,6 +2082,34 @@ def read_lorrax_input(filename: str) -> dict:
                     "IGNORED — one sharded-slab transport, not deck-selectable "
                     "(it never changed a number, only which library moved "
                     "the bytes)"))
+        # ``sc_accelerator`` was RETIRED (2026-08-14): rCROP is the only
+        # accelerator.  The two values are NOT symmetric and must not draw
+        # the same message -- ``rcrop`` names what the run already does, so
+        # it warn-and-ignores; ``linear`` named a DIFFERENT fixed-point
+        # iteration (plain α-mixing, which on QSGW's typically ≲ −3
+        # cycle-direction Jacobian only shrinks the 2-cycle rather than
+        # killing it), so honouring it silently as rCROP would be a mode
+        # substitution of the ``screening_method = ctsp`` class.  Refuse it.
+        _accel = section.get("sc_accelerator", fallback=None)
+        if _accel is not None:
+            _accel_v = _accel.strip().strip('"\'').lower()
+            if _accel_v == "linear":
+                raise ValueError(
+                    "sc_accelerator = linear was REMOVED; rCROP is the only "
+                    "self-consistency accelerator.  Plain α-mixing is not a "
+                    "silent substitute for it, so this refuses rather than "
+                    "running rCROP under the name 'linear'.  Remove "
+                    "'sc_accelerator' from your input file.")
+            import warnings
+            warnings.warn(
+                "Input key 'sc_accelerator' is no longer supported and will "
+                "be ignored (rCROP is the only accelerator).  Remove it from "
+                "your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sc_accelerator",
+                "IGNORED — rCROP is the only self-consistency accelerator"))
         # Deprecated qp_solver aliases (still honored via auto-resolution;
         # see ``LorraxConfig.qp_solver``).
         # ``sigma_omega_accumulation``: the key is gone, but the REMOVED
@@ -1910,6 +2259,21 @@ def read_lorrax_input(filename: str) -> dict:
                 "sigma_at_dft_energies",
                 "IGNORED — it was parsed and never read; its meaning is "
                 "'qp_solver = one_shot_dft', the default"))
+
+        if section.get("sigma_omega_batch_size", fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                "Input key 'sigma_omega_batch_size' is no longer supported "
+                "and will be ignored.  It was threaded into "
+                "gw.ppm_sigma._run_sigma_branch as a parameter no branch "
+                "ever read, so it never changed a number or a schedule.  "
+                "Remove it from your input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                "sigma_omega_batch_size",
+                "IGNORED — threaded into _run_sigma_branch and read by no "
+                "branch; it never sized anything"))
 
         if retired:
             _print_deck_report(
@@ -2192,7 +2556,6 @@ class DynamicSigmaConfig:
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
-    omega_batch_size: int
     omega_layout: str
     sigma_at_dft_extrapolate: bool
 
@@ -2204,8 +2567,6 @@ class DynamicSigmaConfig:
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
-        if self.omega_batch_size < 1:
-            raise ValueError("sigma_omega_batch_size must be >= 1.")
 
 
 @dataclass(frozen=True)
@@ -2263,6 +2624,8 @@ class MPAConfig:
     sigma_crossing_target_error: float
     sigma_max_nodes: int
 
+    # pole_batch_size and the two Sigma target errors are validated at their
+    # consumers (gw.mpa.sigma / gw.mpa.sigma_windows) — single owner.
     def __post_init__(self):
         if not 1 <= self.n_poles <= 16:
             raise ValueError("mpa_n_poles must be in [1, 16]")
@@ -2275,11 +2638,6 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        if not 1 <= self.pole_batch_size <= 4:
-            raise ValueError("mpa_pole_batch_size must be in [1, 4]")
-        if not (0.0 < self.sigma_sector_target_error < 1.0
-                and 0.0 < self.sigma_crossing_target_error < 1.0):
-            raise ValueError("MPA Sigma target errors must lie in (0, 1)")
         if self.sigma_max_nodes < 2:
             raise ValueError("mpa_sigma_max_nodes must be at least two")
 
@@ -2311,13 +2669,21 @@ class SCConfig:
     the deck on a physics knob makes a run unreproducible from its own
     input file.  This group is deck-only.
 
-    - ``max_iter`` / ``tol_ev``: loop length and RMS-ΔE convergence (eV).
-    - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
-      required for QSGW's typical 2-cycle Jacobian) or ``"linear"``
-      (plain α-mixing, diagnostic).  rCROP makes TWO ``gw_iteration_map``
-      calls per accelerator iteration (trial + residual).
+    - ``max_iter``: PER-STAGE iteration ceiling (see ``stages``).
+    - ``tol_ev``: legacy whole-loop RMS-ΔE tolerance (eV).  Retained for
+      the one-shot snapshot path and for decks predating ``stages``; the
+      STAGE cutoffs are what the staged loop converges on.
+    - ``stages``: the staged ladder — a tuple of :class:`SCStage`, run in
+      order, each iterated to its own cutoff before the next begins.
+    - ``eval_type``: :class:`SelfEnergyEvalType`; always
+      ``HERMITIANIZED`` here, because ``resolve_self_energy_eval_type``
+      refuses the linearized pairing before this record is built.
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
-    - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
+    - ``mixing``: linear-mixing α.  **Latent**: with ``sc_accelerator``
+      retired (2026-08-14) rCROP is the only accelerator and nothing
+      consumes this on the staged path; it is kept because
+      ``_run_linear_mixing`` is still reachable as a diagnostic entry
+      point in ``sc_iteration``.
     - ``dump_dir``: per-iteration E-history .npy dump dir (None = off).
     - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
       iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
@@ -2329,21 +2695,18 @@ class SCConfig:
     """
     max_iter: int
     tol_ev: float
-    accelerator: str      # "rcrop" | "linear"
     history_depth: int
     mixing: float
     dump_dir: str | None
     eigh: str = "auto"    # "auto" | "native" | "distributed"
+    stages: tuple[SCStage, ...] = ()
+    eval_type: SelfEnergyEvalType = SelfEnergyEvalType.HERMITIANIZED
 
     def __post_init__(self):
         if self.max_iter < 1:
             raise ValueError("sc_max_iter must be >= 1.")
         if self.tol_ev <= 0.0:
             raise ValueError("sc_tol_ev must be > 0.")
-        if self.accelerator not in ("rcrop", "linear"):
-            raise ValueError(
-                f"sc_accelerator must be 'rcrop' or 'linear'; "
-                f"got {self.accelerator!r}.")
         if self.history_depth < 1:
             raise ValueError("sc_history_depth must be >= 1.")
         if not (0.0 < self.mixing <= 1.0):
@@ -2352,6 +2715,14 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
+
+    def describe_stages(self) -> str:
+        """One-line ladder summary for the run log."""
+        if not self.stages:
+            return "(no staged ladder)"
+        return " -> ".join(
+            f"{s.mode.value}(<{s.cutoff_ev * 1e3:g} meV, "
+            f"<={s.max_iter} iter)" for s in self.stages)
 
 
 @dataclass(frozen=True)
@@ -2540,16 +2911,7 @@ class LorraxConfig:
         tests, an operator reading a config back) can name the mode
         without tripping over it.
         """
-        raw = (self.compute_mode_raw or "").strip().lower()
-        if not raw:
-            raise ValueError(
-                f"compute_mode is REQUIRED and this config carries none.  "
-                f"Write one of: "
-                f"{', '.join(m.value for m in ComputeMode)}.  It used to "
-                f"default to 'auto', which inferred the self-energy ansatz "
-                f"from three legacy flags; a deck naming none of them ran "
-                f"COHSEX by accident of the defaults.")
-        return coerce_compute_mode(raw)
+        return resolve_compute_mode(self.compute_mode_raw)
 
     @property
     def qp_solver(self) -> QPSolver:
@@ -2568,16 +2930,7 @@ class LorraxConfig:
         - ``self_consistent`` × ``bispinor`` → error (the SC path drops
           Σ^B; see the refusal below).
         """
-        raw = (self.qp_solver_raw or "one_shot_dft").strip().lower()
-        try:
-            solver = QPSolver(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"qp_solver={raw!r} invalid; expected one of: "
-                f"{', '.join(s.value for s in QPSolver)}.  ('auto' was "
-                f"deleted in 0.1.0 with the ``self_consistent`` boolean it "
-                f"read; the default is one_shot_dft.)"
-            ) from exc
+        solver = resolve_qp_solver(self.qp_solver_raw)
         mode = self.compute_mode
         if solver is QPSolver.FIXED_POINT and not mode.is_dynamic:
             # The list of dynamic modes is read off the enum, not typed
@@ -2783,7 +3136,6 @@ class LorraxConfig:
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
-            omega_batch_size=int(_g("sigma_omega_batch_size")),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
         )
@@ -2792,11 +3144,57 @@ class LorraxConfig:
         # env var that outranks the deck on a physics knob makes a run
         # unreproducible from its own input file, and these six had
         # already been deprecated since the keys landed (2026-07-08).
-        # ``sc_eigh`` never had one, for exactly this reason.
+        # ``sc_eigh`` never had one, for exactly this reason, and neither
+        # do the staged-ladder keys below.
+        #
+        # ``LORRAX_SC_ACCEL`` is NOT read here and NOT announced either.
+        # The staged-SC branch kept an announce-only read of it when
+        # ``sc_accelerator`` was retired; the deletion wins, because a
+        # print is still a read of a variable that must not exist —
+        # ``tests/test_qp_solver_config.py`` pins the whole family's
+        # absence from this module's string constants.  The DECK key
+        # ``sc_accelerator`` keeps its retirement branch in
+        # ``read_lorrax_input`` (``linear`` refuses, ``rcrop`` warns).
+        _sc_max_iter = int(_g("sc_max_iter"))
+        # RESOLVING IS NOT PERMITTING, AND PARSING IS NOT RESOLVING.
+        # ``LorraxConfig.qp_solver`` is a property on purpose: a
+        # config-only consumer (the deck echo, the layering tests, an
+        # operator reading a config back) must be able to build a
+        # LorraxConfig over a deck with a bad ``qp_solver`` and get the
+        # ValueError when it READS that axis.  Resolving eagerly here to
+        # pick the SC ladder would move that refusal to construction and
+        # break the contract -- measured on the staged-SC branch: it
+        # turned ``test_unknown_value_raises`` from "the property raises"
+        # into "from_input_file raises".
+        #
+        # So both axes are resolved BEST-EFFORT for the ladder and a bad
+        # value is left to be reported properly.  Nothing is swallowed:
+        # ``qp_solver`` fails again, with the same message, the moment
+        # anything reads it, and ``compute_mode`` -- REQUIRED since 0.1.0
+        # -- is refused BY NAME further down this same function, before
+        # any LorraxConfig is returned.  The COHSEX fallback therefore
+        # never reaches a caller; it only keeps the ladder buildable long
+        # enough for that refusal to be the one an operator sees.
+        try:
+            _qp_solver = resolve_qp_solver(_g("qp_solver"))
+        except ValueError:
+            _qp_solver = QPSolver.ONE_SHOT_DFT
+        try:
+            _mode = resolve_compute_mode(_g("compute_mode"))
+        except ValueError:
+            _mode = ComputeMode.COHSEX
+        # These two DO refuse here: they are the staged-SC feature's own
+        # keys, they are not behind a property, and a staged run that
+        # discovered its ladder was unbuildable only at iteration 1 would
+        # have paid for a full Sigma first.
+        _eval_type = resolve_self_energy_eval_type(
+            _g("self_energy_eval_type"), _qp_solver)
+        _stages = resolve_sc_stages(_g, _mode, sc_max_iter=_sc_max_iter)
         sc = SCConfig(
-            max_iter=int(_g("sc_max_iter")),
+            max_iter=_sc_max_iter,
             tol_ev=float(_g("sc_tol_ev")),
-            accelerator=str(_g("sc_accelerator")).strip().lower(),
+            stages=_stages,
+            eval_type=_eval_type,
             history_depth=int(_g("sc_history_depth")),
             mixing=float(_g("sc_mixing")),
             dump_dir=str(_g("sc_dump_dir") or "") or None,

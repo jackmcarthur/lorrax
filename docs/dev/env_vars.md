@@ -147,7 +147,12 @@ and its six twins — `LORRAX_SC_MAX_ITER` / `_TOL_EV` / `_ACCEL` /
 with the shim that read them.  An env var that outranks the deck on a
 physics knob makes a run unreproducible from its own input file, and
 these had been deprecated since the `sc_*` keys landed (2026-07-08).
-`sc_eigh` never had one. The `sc_*` deck keys are unchanged.
+`sc_eigh` never had one, and neither do the `sc_stage_*` ladder keys the
+staged-SC merge added. The `sc_*` deck keys otherwise survive the
+deletion, with one exception: `sc_accelerator` was retired with
+`LORRAX_SC_ACCEL` (rCROP is the only accelerator) — the deck key
+warn-and-ignores on `rcrop` and REFUSES on `linear`, and the env twin is
+not read, announced or otherwise referenced.
 
 | env twin (deprecated) | input key | default | effect |
 |---|---|---|---|

@@ -602,6 +602,7 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
     floor.  A bar on the absolute error is a bar on whose machine it ran.
     """
 
+    import _mpa_evaluator_harness as harness              # noqa: PLC0415
     from gw.mpa import evaluator, pade_fit, sample_plan   # noqa: PLC0415
 
     n_p, tol = 8, 1.0e-12
@@ -610,7 +611,7 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
     weight = 0.2 + 0.6 * rng.random((n_p, 3))
     plan = sample_plan.mpa_plan(n_p, float(delta.max()), energy_unit="Ry")
     z = sample_plan.plan_z(plan)
-    original = evaluator.existing_kernel_rule
+    original = harness.existing_kernel_rule
     built = {}
 
     def from_table(point, *, delta_min, delta_max, target_error,
@@ -633,12 +634,12 @@ def test_the_fit_stage_floor_is_no_longer_a_quadrature():
                 "delta_min": float(delta_min),
                 "delta_max": float(delta_max), "target_error": tol}
 
-    evaluator.existing_kernel_rule = from_table
+    harness.existing_kernel_rule = from_table
     try:
-        values, cost = evaluator.evaluate_samples(
+        values, cost = harness.evaluate_samples(
             plan, delta, weight, rel_tol=tol, kernel_target_error=tol)
     finally:
-        evaluator.existing_kernel_rule = original
+        harness.existing_kernel_rule = original
 
     values = np.asarray(values)
     k = evaluator.damped_kernel(np.asarray(z)[:, None], delta)
@@ -700,6 +701,7 @@ def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
     # reached off the DOOR, which is the production import edge.
     import minimax as _mm                               # noqa: PLC0415
     bs = _mm.beta_selector
+    import _mpa_evaluator_harness as harness             # noqa: PLC0415
     from gw.mpa import evaluator, pade_fit, sample_plan  # noqa: PLC0415
 
     n_p, tol = 8, gen.FIT_STAGE_ERROR_BOUND
@@ -708,7 +710,7 @@ def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
     weight = 0.2 + 0.6 * rng.random((n_p, 3))
     plan = sample_plan.mpa_plan(n_p, float(delta.max()), energy_unit="Ry")
     z = sample_plan.plan_z(plan)
-    original = evaluator.existing_kernel_rule
+    original = harness.existing_kernel_rule
     picked = {}
 
     def from_catalog(point, *, delta_min, delta_max, target_error,
@@ -734,12 +736,12 @@ def test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door():
                 "delta_min": float(delta_min),
                 "delta_max": float(delta_max), "target_error": tol}
 
-    evaluator.existing_kernel_rule = from_catalog
+    harness.existing_kernel_rule = from_catalog
     try:
-        values, _cost = evaluator.evaluate_samples(
+        values, _cost = harness.evaluate_samples(
             plan, delta, weight, rel_tol=tol, kernel_target_error=tol)
     finally:
-        evaluator.existing_kernel_rule = original
+        harness.existing_kernel_rule = original
 
     values = np.asarray(values)
     k = evaluator.damped_kernel(np.asarray(z)[:, None], delta)
