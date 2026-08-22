@@ -160,9 +160,21 @@ def write_bgw_eqp(
 	# refuses to pretend a NaN-bearing array is a result, and re-reads
 	# what it wrote to confirm the file it produced parses to exactly the
 	# expected number of finite floats.
+	# REFUSAL, not a warning.  The 2026-08-15 bcc-Fe run wrote 7176 of 7176
+	# E_QP entries as NaN through this very call and exited rc=0; the warning
+	# it emitted is the only thing that noticed, and a warning does not reach
+	# an exit code (JID 57051742, CLAIMS 204).  A file whose QP column is not
+	# a number is not a result, and the reader downstream cannot tell the
+	# difference from the line count.  ``LORRAX_ALLOW_NONFINITE_RESULT=1``
+	# writes it anyway, for the forensic case, and says so.
 	from common import sanity
-	sanity.check_finite(f"{os.path.basename(path)} E_DFT column", e_dft)
-	sanity.check_finite(f"{os.path.basename(path)} E_QP column", e_qp)
+	sanity.refuse_nonfinite(
+		f"{os.path.basename(path)} E_DFT column", e_dft,
+		detail="the mean-field spectrum this file reports beside the QP one.")
+	sanity.refuse_nonfinite(
+		f"{os.path.basename(path)} E_QP column", e_qp,
+		detail="%15.9f renders a NaN as the token 'nan', so the file would "
+		       "look complete while its numbers were not.")
 
 	abs_path = os.path.abspath(path)
 	if os.path.dirname(abs_path):

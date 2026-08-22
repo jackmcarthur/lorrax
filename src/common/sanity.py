@@ -66,10 +66,12 @@ import numpy as np
 
 __all__ = [
     "SanityError",
+    "NonFiniteResultError",
     "sanity_enabled",
     "sanity_strict",
     "warn",
     "check_finite",
+    "refuse_nonfinite",
     "check_hermitian",
     "report_hermitian_residual",
     "neg_q_index",
@@ -93,6 +95,17 @@ _STRICT_VALUES = {"strict", "2", "raise", "fatal"}
 
 class SanityError(RuntimeError):
     """A stage-boundary invariant failed under ``LORRAX_SANITY=strict``."""
+
+
+class NonFiniteResultError(SanityError):
+    """A SHIPPED result is not a number.  Raised regardless of ``LORRAX_SANITY``."""
+
+
+#: Announced escape for :func:`refuse_nonfinite`.  Named rather than silent,
+#: and deliberately NOT ``LORRAX_SANITY=0``: that switch exists to buy back
+#: the COST of the reductions, and it must not double as permission to write
+#: a NaN result.
+_ALLOW_NONFINITE_ENV = "LORRAX_ALLOW_NONFINITE_RESULT"
 
 
 def _level() -> str:
@@ -284,6 +297,70 @@ def check_finite(
         )
         ok = False
     return ok
+
+
+def refuse_nonfinite(
+    name: str,
+    array: Any,
+    *,
+    print_fn: Callable[..., Any] = print,
+    detail: str = "",
+) -> None:
+    """REFUSE a non-finite entry in an object the run is about to ship.
+
+    :func:`check_finite` warns; this raises.  The difference is the whole
+    point, and it is the 2026-08-15 bcc-Fe finding stated as code:
+    ``sigma_mnk.h5:sigma_c_kij_ev`` came back **27,067,872 NaN of
+    27,067,872** from a fit whose poles were entirely finite and whose
+    conditioning was clean, ``ScissorFit(val: alpha=nan, ...)`` degenerated,
+    ``Final E_F (fixed-N mu, eV): nan``, all **7176 of 7176** E_QP entries
+    in ``eqp0.dat`` / ``eqp1.dat`` were NaN — and the driver exited **rc=0**
+    in 883 s (JID 57051742, `runs/Fe/01_metal_mpa_qsgw/f3_np8_p4_260816-012434.log`).
+    The one thing that noticed was this module's own warning, and a warning
+    does not reach an exit code.
+
+    The self-consistent path DOES catch it, on its second map call:
+    ``sc_iteration._solve_head_occupations`` -> ``efermi.OccupationState``
+    refuses ``f_kn`` that is not finite.  A ONE-SHOT run never reaches a
+    second map call, so it never reaches that guard.  This is the guard the
+    one-shot path skips, placed where both paths pass.
+
+    WHY IT IGNORES ``LORRAX_SANITY``.  That switch is documented as a COST
+    escape hatch, and the reductions here are one memory sweep against
+    stage costs of minutes.  There is no cost to escape and an invariant a
+    stray environment variable can silence is not an invariant — the same
+    argument :func:`report_hermitian_residual`'s ``always=True`` already
+    makes.  ``LORRAX_ALLOW_NONFINITE_RESULT=1`` downgrades it to the loud
+    warning, for the forensic case where you WANT the NaN artifact on disk;
+    it is named so that continuing leaves a trace.
+
+    Raises :class:`NonFiniteResultError`.  Returns ``None`` on a clean
+    array — there is no boolean to ignore, on purpose.
+    """
+    n_bad, n_nan, max_abs, size = _finite_stats(array)
+    if size == 0 or n_bad == 0:
+        return
+    suffix = f"  {detail}" if detail else ""
+    message = (
+        f"{name} contains {n_bad} non-finite entries of {size} "
+        f"({n_nan} NaN, {n_bad - n_nan} Inf); largest finite magnitude "
+        f"{max_abs:.6e}.  This object is a RESULT, so the run is refused "
+        f"rather than written: everything downstream is garbage and the "
+        f"exit code is the only thing that would have said otherwise."
+        f"{suffix}")
+    if os.environ.get(_ALLOW_NONFINITE_ENV, "").strip() in ("1", "true",
+                                                            "yes", "on"):
+        warn(message + f"  Continuing anyway: {_ALLOW_NONFINITE_ENV} is set.",
+             print_fn=print_fn)
+        return
+    text = f"  *** LORRAX SANITY FAILURE: {message} ***"
+    try:
+        print_fn(text)
+    except Exception:      # a broken print_fn must not mask the failure
+        print(text, flush=True)
+    raise NonFiniteResultError(
+        message + f"  Set {_ALLOW_NONFINITE_ENV}=1 to write it anyway for "
+        f"forensics.")
 
 
 _HERM_STATS_CACHE: dict = {}

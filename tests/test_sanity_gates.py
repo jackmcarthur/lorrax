@@ -112,6 +112,20 @@ def _with_level(level, fn):
             os.environ["LORRAX_SANITY"] = prev
 
 
+def _with_allow_nonfinite(fn):
+    """Run ``fn`` with the NAMED forensic escape for ``refuse_nonfinite`` on."""
+    key = "LORRAX_ALLOW_NONFINITE_RESULT"
+    prev = os.environ.get(key)
+    os.environ[key] = "1"
+    try:
+        return fn()
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
+
+
 # ---------------------------------------------------------------------------
 # Level switch
 # ---------------------------------------------------------------------------
@@ -305,10 +319,14 @@ def test_eqp_verifier_catches_nan_column():
     e_qp[1, 2] = np.nan
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "eqp1.dat")
-        # Write with checking OFF so we get the corrupt file on disk,
-        # then verify it with checking ON — mirrors "the run already
-        # finished; is its output trustworthy?".
-        _with_level("0", lambda: _write_eqp(p, e_dft, e_qp, kpts))
+        # Write through the NAMED forensic escape so we get the corrupt
+        # file on disk, then verify it with checking ON — mirrors "the run
+        # already finished; is its output trustworthy?".  ``LORRAX_SANITY=0``
+        # no longer buys this: that switch is a COST escape and since
+        # 2026-08-22 the writer's finiteness gate is a refusal that ignores
+        # it (``sanity.refuse_nonfinite``), because rc=0 on a 7176-of-7176
+        # NaN E_QP column is the defect, not a tuning preference.
+        _with_allow_nonfinite(lambda: _write_eqp(p, e_dft, e_qp, kpts))
         log = _Log()
         ok = _with_level("1", lambda: verify_eqp_file(
             p, nk=nk, nb=nb, print_fn=log))
@@ -338,7 +356,14 @@ def test_eqp_verifier_catches_truncated_file():
 
 
 def test_eqp_writer_gate_fires_on_nan_input():
-    """The writer itself must complain before the file is even useful."""
+    """The writer must REFUSE a non-finite QP column at EVERY sanity level.
+
+    Not merely under ``LORRAX_SANITY=strict``.  The bcc-Fe run of
+    2026-08-15 wrote 7176 of 7176 NaN E_QP entries through this call and
+    exited **rc=0** in 883 s at the default level (JID 57051742, CLAIMS
+    204); a warning does not reach an exit code, and ``LORRAX_SANITY=0``
+    is a COST escape, not permission to ship a NaN.
+    """
     nk, nb = 2, 3
     kpts = np.zeros((nk, 3))
     e = np.ones((nk, nb))
@@ -350,10 +375,22 @@ def test_eqp_writer_gate_fires_on_nan_input():
         def run():
             try:
                 _write_eqp(p, e, bad, kpts)
-            except sanity.SanityError:
+            except sanity.NonFiniteResultError:
                 return True
             return False
-        assert _with_level("strict", run) is True
+
+        for level in ("strict", "1", "0", None):
+            assert _with_level(level, run) is True, level
+
+        # NOT VOID: the same writer accepts the same shapes when they are
+        # finite, so the refusal above is about the values and not about
+        # the call.
+        assert _with_level(None, lambda: _write_eqp(p, e, e, kpts))
+
+        # And the NAMED escape is the only thing that lets it through.
+        assert _with_level(
+            None, lambda: _with_allow_nonfinite(
+                lambda: _write_eqp(p, e, bad, kpts)))
 
 
 # ---------------------------------------------------------------------------
@@ -489,3 +526,62 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+
+# ---------------------------------------------------------------------------
+# refuse_nonfinite — the guard the ONE-SHOT path skips
+# ---------------------------------------------------------------------------
+#
+# The SC path already refuses a non-finite spectrum, on its second map call,
+# through ``sc_iteration._solve_head_occupations -> efermi.OccupationState``.
+# A one-shot run never reaches a second map call, so on bcc Fe every element
+# of ``sigma_c_kij_ev`` (27,067,872 of 27,067,872) and every one of 7176 E_QP
+# entries came back NaN behind rc=0.  These cells pin the refusal that closes
+# that path, and — as important — pin that it does NOT fire on health.
+
+def test_refuse_nonfinite_is_silent_on_a_clean_array():
+    log = _Log()
+    sanity.refuse_nonfinite("V", np.arange(12.0).reshape(3, 4), print_fn=log)
+    sanity.refuse_nonfinite("empty", np.zeros((0, 3)), print_fn=log)
+    assert log.lines == [], log.text
+
+
+def test_refuse_nonfinite_raises_regardless_of_the_sanity_level():
+    """``LORRAX_SANITY`` buys back the COST of a reduction, never a NaN."""
+    a = np.ones((3, 4))
+    a[1, 2] = np.nan
+
+    def run():
+        try:
+            sanity.refuse_nonfinite("Sigma_c", a, print_fn=_Log())
+        except sanity.NonFiniteResultError:
+            return True
+        return False
+
+    for level in ("strict", "1", "0", "off", None):
+        assert _with_level(level, run) is True, level
+
+
+def test_refuse_nonfinite_counts_nan_and_inf_separately():
+    a = np.ones((2, 3), dtype=np.complex128)
+    a[0, 0] = np.nan
+    a[0, 1] = np.inf
+    a[1, 1] = 1.0 + 1j * np.nan          # an imaginary-part NaN counts too
+    log = _Log()
+    try:
+        sanity.refuse_nonfinite("W", a, print_fn=log)
+    except sanity.NonFiniteResultError as exc:
+        assert "3 non-finite entries of 6" in str(exc), str(exc)
+        assert "2 NaN, 1 Inf" in str(exc), str(exc)
+    else:
+        raise AssertionError("a NaN-bearing result was accepted")
+    assert any("LORRAX SANITY FAILURE" in ln for ln in log.lines), log.text
+
+
+def test_the_named_escape_downgrades_it_to_the_loud_warning():
+    a = np.array([np.nan, 1.0])
+    log = _Log()
+    _with_allow_nonfinite(
+        lambda: sanity.refuse_nonfinite("E_qp", a, print_fn=log))
+    assert any("LORRAX SANITY FAILURE" in ln for ln in log.lines), log.text
+    assert any("LORRAX_ALLOW_NONFINITE_RESULT" in ln for ln in log.lines)

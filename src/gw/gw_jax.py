@@ -834,9 +834,25 @@ def main(argv=None):
 	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
 	# comes off disk (kin_ion.h5), so this doubles as the content check on
 	# that interface.
+	# REFUSALS, not warnings, and that distinction is the 2026-08-15 bcc-Fe
+	# finding: an all-NaN Σ_c produced an all-NaN E_QP column, a NaN E_F and
+	# a NaN scissor fit, and the run exited rc=0 in 883 s with only a warning
+	# line to show for it (JID 57051742, CLAIMS 204).  The SC path catches
+	# that on its SECOND map call, through
+	# ``_solve_head_occupations -> OccupationState`` finiteness; a one-shot
+	# run has no second map call, so this seam -- which both paths cross -- is
+	# where the guard has to be.  ``LORRAX_ALLOW_NONFINITE_RESULT=1`` is the
+	# named escape for forensics.
 	from common import sanity
-	sanity.check_finite("kin_ion (from kin_ion.h5)", kin_ion, print_fn=print0)
-	sanity.check_finite("Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0)
+	sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
+	                        print_fn=print0,
+	                        detail="kin_ion.h5 is the mean-field side of H0; "
+	                               "regenerate it from THIS run's input file.")
+	sanity.refuse_nonfinite(
+		"Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0,
+		detail="A finite, well-conditioned pole set producing a non-finite "
+		       "Σ is a defect in the contraction or in what was handed to "
+		       "it, not a convergence problem.")
 
 	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
 	# one statement and normally seconds, but it is O(nk·nb³) and it is the
@@ -846,7 +862,11 @@ def main(argv=None):
 		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
 		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
 		_sec_eigh.watch(E_full, U_full)
-	sanity.check_finite("E_qp (eigh of H_QP)", E_full, print_fn=print0)
+	sanity.refuse_nonfinite(
+		"E_qp (eigh of H_QP)", E_full, print_fn=print0,
+		detail="LAPACK returns without complaining on a NaN-bearing matrix, "
+		       "so this is the last place a NaN spectrum can be stopped "
+		       "before eqp0/eqp1/WFN_qp.h5.")
 	_t_out = time.perf_counter()
 
 	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
