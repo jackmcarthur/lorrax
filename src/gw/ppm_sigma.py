@@ -169,6 +169,98 @@ class _SigmaPhysicsState(NamedTuple):
     n_invalid: jax.Array       # scalar int64
 
 
+#: Env escape hatch for :func:`assert_gapped_occupations_for_ppm`.  It is an
+#: ENV knob and not a deck key for the same reason ``LORRAX_BAND_DEGENERACY``
+#: is: it is a debugging escape for a deck you are looking at, not a property
+#: of a calculation anyone would want recorded in an input file.
+#: ``AGENT_PREAMBLE``: never set it to make a gate pass.
+_PPM_METAL_ENV = "LORRAX_PPM_ALLOW_CROSSING_BANDS"
+
+
+def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
+    """Refuse a GN/HL-PPM Σ whose occupation table has a Fermi-crossing band.
+
+    Returns the number of crossing bands (always 0 on the accepted path), so
+    a caller or a test reads a NUMBER rather than the absence of an
+    exception.
+
+    WHAT IS MEASURED, AND WHY THE DECK KEY CANNOT ANSWER IT.
+    ``gw_config._validate_metal_compute_mode`` already refuses
+    ``mpa_material_class = metal`` outside ``compute_mode = mpa``.  But
+    ``insulator`` is the DEFAULT, so a metallic system run without the key
+    reaches this driver with nothing objecting — and the deck key is a
+    DECLARATION, while this is a property of the spectrum.  So the
+    measurement is on the occupation table:
+
+        band n crosses E_F  <=>  occ[:, n] > 0.5 is not constant over k.
+
+    ``wavefunction_bundle._build_occ`` fills ``occ`` as ``(enk <= efermi)``,
+    exactly 0.0/1.0, so on a gapped system every band is uniformly occupied
+    or uniformly empty and this is exactly zero.  A crossing band is the one
+    thing that makes it nonzero, and it needs no tolerance: the predicate is
+    over an integer table.
+
+    WHAT GOES WRONG IF IT RUNS ANYWAY, which is why this refuses rather than
+    warns.  ``_prepare_sigma_state`` builds ``vbm = max(enk | occupied)`` and
+    ``cbm = min(enk | empty)``; with a crossing band ``vbm > cbm``, so the
+    "midgap" ``0.5*(vbm+cbm)`` is not in any gap and the ``fermi_reference``
+    the deck chose is meaningless.  It then clips
+    ``E_cond = max(enk - efermi, 0)`` and ``H_val = max(efermi - enk, 0)``, so
+    a band on the wrong side of that pseudo-Fermi level cannot even be
+    REPRESENTED — its dynamic denominator collapses to the ω = 0 edge.  Every
+    array keeps its shape and the run completes.  Measured on Na bcc SOC 48b
+    (`reports/occupation_threshold_all_paths_2026-08-16/evidence/probe_na.log`,
+    JID 57138992): MP1 gives f in [-0.002194, +1.031587] with 150
+    negative-lobe and 12 over-one (k,n) entries, and the step split assigns
+    every one of them fully to one branch with weight 1.
+
+    This is the SCOPE LIMIT the module has documented in prose since the
+    ``TODO(metal-greens)`` at ``_prepare_sigma_state`` was written, enforced.
+    The port itself — feeding the iteration's ``OccupationState`` into
+    ``branches_for_omega_grid`` as ``cond_weight = 1-f`` / ``val_weight = f``
+    — remains open work; a documented limitation that nothing enforces is a
+    limitation only the reader has.
+    """
+    occ = np.asarray(jax.device_get(occ_full))
+    if occ.ndim != 2:
+        raise ValueError(
+            f"assert_gapped_occupations_for_ppm: expected (nk, nb) "
+            f"occupations, got shape {occ.shape}")
+    filled = occ > 0.5
+    crossing = np.flatnonzero(filled.any(axis=0) & ~filled.all(axis=0))
+    if crossing.size == 0:
+        return 0
+    if os.environ.get(_PPM_METAL_ENV, "").strip().lower() in ("1", "true", "on"):
+        print_fn(
+            f"  *** {_PPM_METAL_ENV} is set: running GN/HL-PPM Sigma on a "
+            f"spectrum with {crossing.size} Fermi-crossing band(s) "
+            f"{crossing.tolist()[:12]}.  The band split below is a 0/1 step "
+            f"at a pseudo-Fermi level that is not in any gap, and E_cond/H_val "
+            f"are clipped at zero, so wrong-side states are unrepresentable. "
+            f"This is a debugging override, not a supported configuration. ***")
+        return int(crossing.size)
+    raise ValueError(
+        f"GATE ppm_sigma_gapped_occupations: this spectrum has "
+        f"{crossing.size} Fermi-crossing band(s) — occupied at some k and "
+        f"empty at others — at band index/indices "
+        f"{crossing.tolist()[:12]}"
+        + (" (first 12 shown)" if crossing.size > 12 else "") + ".\n"
+        f"  got:  a metallic occupation table on the GN/HL plasmon-pole "
+        f"Sigma driver, whose band split is a hard occ > 0.5 step\n"
+        f"  want: a gapped spectrum, i.e. every band uniformly occupied or "
+        f"uniformly empty over k\n"
+        f"  fix:  run this system with compute_mode = mpa and "
+        f"mpa_material_class = metal, which carries the iteration's fixed-N "
+        f"MP1 occupation state; or narrow the band window so no band "
+        f"crosses E_F\n"
+        f"  why:  with a crossing band, vbm > cbm, so the 'midgap' Fermi "
+        f"reference this driver derives is not in any gap, and E_cond/H_val "
+        f"are clipped at zero so a wrong-side band cannot be represented.  "
+        f"Nothing about that changes an array shape or the exit code.\n"
+        f"  override: {_PPM_METAL_ENV}=1 (debugging only)\n"
+        f"  doc:  docs/theory/metallic-mpa-screening.md")
+
+
 @jax.jit
 def _prepare_sigma_state(
     enk_full: jax.Array,
@@ -1037,6 +1129,13 @@ def compute_sigma_c_ppm_omega_grid(
             f"ppm_invalid_mode must be zero/skip/2ry/static_limit/infinity; got {invalid_mode!r}")
     keep_invalid = invalid_mode == "2ry"
     invalid_static = invalid_mode in ("static_limit", "infinity")
+
+    # THE OCCUPATION SPLIT THIS DRIVER CAN HONOUR IS A GAPPED ONE.  Measured
+    # here, on the spectrum, because the deck key cannot see it: config's
+    # ``_validate_metal_compute_mode`` refuses ``mpa_material_class = metal``
+    # outside MPA, but ``insulator`` is the DEFAULT, so a metallic system run
+    # without the key reaches this driver and nothing objects.
+    assert_gapped_occupations_for_ppm(occ_full, print_fn=print_fn)
 
     # Derive Fermi level, energy/band masks, and PPM pole masks in one fused trace.
     # valid_mask_q=None → all-true mask at the caller so the jit sees a real array.
