@@ -169,12 +169,24 @@ def _factor_mesh(pp: int) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
-                      p_x, p_y) -> dict:
+                      p_x, p_y, low_mem_bands: bool = False) -> dict:
     """The un-chunkable floor resident across the whole r-chunk loop.
 
-    ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family); the four ψ centroid
-    copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the corrected
-    centroid term (design §5 bug #4: NOT ÷p_xy).
+    ``L_q`` and ``gflat_acc`` are ÷P (μ²/μ-family).
+
+    ``psi_copies`` prices the RESOLVED ``Wavefunctions`` layout
+    (``gw.wavefunction_bundle``, report
+    ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §verdict/§7):
+
+      ``low_mem_bands=False`` (``layout="legacy"``, the default): the four
+      ψ centroid copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the
+      corrected centroid term (design §5 bug #4: NOT ÷p_xy).
+      ``2·S/Px + 2·S/Py`` where ``S = psi_one``.
+
+      ``low_mem_bands=True`` (``layout="face"``): exactly TWO copies, both
+      2-D sharded on the FULL (x, y) mesh (``psi_nmu``, ``psi_mun``).
+      ``2·S/(Px·Py)`` — the ``2·√P`` reduction on a square mesh the
+      feature exists for.
 
     ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
     sparse-G→FFT-box index + the τ-phase row), retained for the loader's
@@ -183,10 +195,14 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     corrections behind the G-flat terms" #1."""
     P_ = p_x * p_y
     psi_one = _c128(nk, ns, mu, nb)
+    if low_mem_bands:
+        psi_copies = 2.0 * psi_one / P_
+    else:
+        psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
     return {
         "L_q":         _c128(nq, mu, mu, shard=P_),
         "gflat_acc":   _c128(nq_disk, mu, ngkmax, shard=P_),
-        "psi_copies":  2 * psi_one / p_x + 2 * psi_one / p_y,
+        "psi_copies":  psi_copies,
         "loader_tables": 4.0 * nk * n_rtot + _C128 * nk * ngkmax,
     }
 
@@ -283,12 +299,23 @@ class GFlatChunkPlan:
     p_min: int                    # rank floor
     budget_bytes: float
     target_utilization: float
+    #: "legacy" | "face" — the ``Wavefunctions`` layout this plan was
+    #: priced under (``low_mem_bands`` deck key).  Disclosed on the
+    #: startup banner so a run cannot believe it selected the low-memory
+    #: path when the planner priced the other one (report §7).
+    psi_layout: str = "legacy"
+    #: Per-rank bytes of the ψ centroid term (``_persistent_bytes``'s
+    #: ``"psi_copies"``) AT THE RESOLVED LAYOUT — the number the banner
+    #: prints next to ``psi_layout``.
+    psi_layout_bytes: float = 0.0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
         hwm = self.hwm_bytes / 1e9
         lines = [
             "  ISDF memory model — chunk plan + HWM estimate",
+            f"    psi layout    = {self.psi_layout} "
+            f"({self.psi_layout_bytes / 1e9:.3f} GB/dev, ψ centroid copies)",
             f"    band_chunk    = {self.band_chunk}",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
@@ -346,6 +373,7 @@ def plan_gflat_chunks(
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
     distributed_zeta_solve: str = "auto",
+    low_mem_bands: bool = False,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, r_chunk, q_chunk, gflat_chunk_size)`` so the
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
@@ -366,6 +394,13 @@ def plan_gflat_chunks(
     ``distributed_zeta_solve`` controls the solve-memory inventory.  ``auto``
     is conservatively priced as ``replicated``; the live resolver may choose
     ``per_q`` at execution time, but that cannot make this plan optimistic.
+
+    ``low_mem_bands`` (the deck key of the same name; default ``False``)
+    selects which ``Wavefunctions`` layout ``_persistent_bytes`` and the
+    Stage-E base price the ψ centroid inventory as — see
+    :func:`_persistent_bytes`.  It changes only that one term; every other
+    stage transient is unaffected because none of them consume ψ off the
+    band-flat inventory this dial resizes.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -397,7 +432,7 @@ def plan_gflat_chunks(
     target = budget * target_utilization
 
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu, nb=nb,
-               ngkmax=ngkmax, n_rtot=n_rtot)
+               ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands))
 
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
@@ -664,11 +699,27 @@ def plan_gflat_chunks(
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
     C_t = max(C_fit_t, solve_t + _zq_live)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
-    # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit;
-    # only ~2 ψ centroid copies are retained.  Transient = V_acc + the ζ
-    # slabs read from disk (+ their single-axis resharded copies).
+    # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit.
+    # Transient = V_acc + the ζ slabs read from disk (+ their single-axis
+    # resharded copies).  The RESIDENT ψ term prices the resolved layout
+    # (report §7), same split as ``_persistent_bytes``:
+    #
+    #   low_mem_bands=False (legacy): only ~2 of the 4 centroid copies are
+    #   still live at this point (fit_zeta's own psi_rmu_Y/psi_rmuT_X
+    #   fit-input copies — the caller has not yet built the four-copy
+    #   bundle, which happens after V_q) — HALF of the fit-loop persistent
+    #   term: S/Px + S/Py.
+    #
+    #   low_mem_bands=True (face): the fresh path converts to the two
+    #   face copies and DELETES the fit-input copies before V begins (see
+    #   gw.gw_init.prepare_isdf_and_wavefunctions), so the SAME 2S/(Px·Py)
+    #   that is live for the rest of the run is already what is resident
+    #   here — there is no separate "post-fit narrowing" step to price.
     psi_one = _c128(nk, ns, mu, nb)
-    E_base = psi_one / p_x + psi_one / p_y
+    if low_mem_bands:
+        E_base = 2.0 * psi_one / p_xy
+    else:
+        E_base = psi_one / p_x + psi_one / p_y
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
     E_t = (_c128(n_q_ibz, mu, mu, shard=p_xy)          # V_acc
            + zeta_slab                                  # ζ_L_all
@@ -715,4 +766,6 @@ def plan_gflat_chunks(
         p_min=int(p_min),
         budget_bytes=float(budget),
         target_utilization=float(target_utilization),
+        psi_layout=("face" if low_mem_bands else "legacy"),
+        psi_layout_bytes=float(persistent["psi_copies"]),
     )
