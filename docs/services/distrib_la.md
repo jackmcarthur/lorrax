@@ -21,7 +21,8 @@ python -m pytest tests/test_distrib_la_shape_algebra.py \
   tests/test_distrib_la_emulated_mesh.py \
   tests/test_distrib_la_import_isolation.py \
   tests/test_distrib_la_batch_reshard.py \
-  tests/test_distrib_la_matmul.py
+  tests/test_distrib_la_matmul.py \
+  tests/test_distrib_la_matmul_plan.py
 ```
 
 An installed consumer imports only `distrib_la`'s top-level names. It does
@@ -198,6 +199,7 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='auto')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='auto')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. Unlike `plan`, `backend='auto'` selects a distributed provider. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='auto') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
+| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe: safe inside a caller's own `jax.jit`/`lax.scan`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
@@ -409,6 +411,81 @@ rank-divergent `INVALID_VALUE` and deadlock. Both are refused before the
 provider call; pretranspose into the ordinary face layout, select PBLAS/SLATE,
 or use the staged route.
 
+## Planned GEMM — a trace-safe cuBLASMp N,N call for hot loops
+
+`matmul()` resolves its provider and probes capability at every call. That
+is correct for an eager call site, but a caller that runs G construction
+or a per-tau Sigma projection inside its own `jax.jit`/`lax.scan` needs the
+same two-phase split `Plan`/`PolarPlan` already give the solver ops: an
+EAGER phase (dlopen, probe, mesh geometry, cuBLASMp communicator) that runs
+ONCE, and a closure built from its result that touches none of that.
+`gemm_plan`/`GemmPlan` (`distrib_la.matmul_plan`) is that split for GEMM,
+modelled directly on `plan_polar_factor`/`PolarPlan` — the one existing
+precedent for driving an FFI call from inside a composed, jitted kernel.
+
+```python
+plan = distrib_la.gemm_plan(
+    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend='auto')
+# ... hoisted out of the k/tau loop; by here the cuBLASMp communicator
+# exists and both kernel variants have already run once on dummy data ...
+D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
+```
+
+Deliberately narrower than `matmul()`:
+
+* **N,N only** — there is no `transa`/`transb` anywhere in the module.
+  Multi-rank cuBLASMp's transpose modes are the ones `matmul()` itself
+  refuses (§ "Distributed matrix multiplication" above); a caller with a
+  transposed operand pretransposes into the complementary face layout
+  once, which is exactly what a two-face `psi_nmu`/`psi_mun` bundle does.
+* **One replicated leading batch, fixed at construction** — `A` is
+  `(nq,m,k)`, `B` is `(nq,k,n)`, `C`/`D` are `(nq,m,n)`, all
+  `P(None,'x','y')`. `nq` holds k-points; a spinor axis is not a second
+  batch — flatten it into m/k/n, or call the SAME plan `ns` times in a
+  small, statically unrolled Python loop. `nq=1` is a legal,
+  zero-overhead rank-2-equivalent plan.
+* **cuBLASMp only, today** — `lorrax_scalapack_batched_gemm` and
+  `lorrax_slate_batched_gemm` are claimed by `distrib_la.loader`'s target
+  table but have no C++ definition anywhere in this tree
+  (`KNOWN_LORRAX_ISSUES.md`, "services/distrib_la loader vs src/ffi" row;
+  confirmed again by `nm -D` on the pinned CUDA library, which exports
+  only `CublasMpBatchedGemmFfi`). A request that `resolve_matmul_backend`
+  would send to either provider refuses at `gemm_plan()` construction, by
+  name, using the same capability probe `matmul()` uses.
+* **Provider route only** — `backend='off'` refuses by name.
+  `batch_reshard` materializes complete A, B, C and D on every device; the
+  reason to reach for a *planned* GEMM at all is a G/Sigma-sized operand
+  that must never be that, so this surface never selects it.
+
+**Output liveness.** A plan built with `beta=0` (the default, and what
+every G/T/Sigma GEMM in the `low_mem_bands` audit needs) additionally
+compiles a kernel that builds its zero addend with `jnp.zeros` INSIDE the
+same compiled program as the GEMM FFI call, so a repeated call never pays
+`matmul()`'s separate top-level `jax.jit` dispatch for a missing `C`
+(`matmul.py:433-437`) — one compiled program, not two. Passing an existing
+buffer as `out=` skips the internal zero-fill entirely and donates that
+buffer's storage to the provider instead, for a caller threading a scratch
+accumulator through a `lax.scan` carry. Neither path removes cuBLASMp's own
+requirement of a live `C` argument: the FFI handler binds it unconditionally
+(`src/ffi/cpp/cublasmp/batched_gemm_ffi.cc`, `.Arg<AnyBuffer>() // C`), so
+there is no provider-level "no C at all" mode — what this surface removes
+is the extra Python-level allocation and compiled program, not the C++
+argument. State that distinction when reporting the memory win.
+
+**Verified**, `services/distrib_la/tests/test_distrib_la_matmul_plan.py`
+(emulated CPU mesh — the eager refusal ladder only: `backend='off'`, a
+resolved non-cuBLASMp provider, mesh topology, dtype, malformed shapes;
+real execution cannot be reached without a CUDA mesh) and
+`test_distrib_la_multiproc.py`'s `gemm_plan_cublasmp` CLI cell, on
+Perlmutter, `lx run -G 4 -n 4 ... --mesh 2x2 --only gemm_plan`: numerics
+against `A @ B` (complex128 and float64, relative ~1e-16), called eagerly,
+inside a `jax.jit`, inside a `lax.scan` (the actual per-tau/per-k hot-loop
+shape), through the `beta!=0` accumulate path, through the donated `out=`
+path, and across five repeated calls with fresh operands. `matmul_cublasmp`
+in the same suite (the pre-existing `matmul()` path, unchanged by this
+work) passed on the same real 2x2 mesh in the same run, confirming no
+regression.
+
 ## Tests
 
 test_distrib_la_polar.py is the synthetic complex/real polar tier.  It covers
@@ -430,6 +507,7 @@ measures that the marks arrived).
 | L-b emulated multi-device | `test_distrib_la_emulated_mesh.py` | `XLA_FLAGS` set by the SERVICE conftest; **skips**, never asserts, below 4 devices |
 | route-c staged movement | `test_distrib_la_batch_reshard.py` | four emulated CPU devices; all three local kernels, ragged batches, inverse round trip + wrong-order red twin |
 | GEMM provider + staged contract | `test_distrib_la_matmul.py` | four emulated CPU devices; backend vocabulary, rank-2 and ragged rank-3 GEMM, transpose codes, and exact x/y + y/x schedule |
+| planned GEMM eager refusal ladder | `test_distrib_la_matmul_plan.py` | nothing but jax; `gemm_plan()`'s pure helpers plus its `backend='off'`/non-cuBLASMp/topology/dtype/shape refusals on an emulated CPU mesh — real cuBLASMp execution is CUDA-only and is leg L-c's `gemm_plan_cublasmp` cell |
 | L-c real multi-process | `test_distrib_la_multiproc.py` | `srun -n 4`; shared `check_*(mesh, …)` bodies + a `__main__` CLI (`_CLI_CELLS`) — same functions, no duplicated logic |
 | contract + wiring | `test_distrib_la_contract.py` | the `.so` pins; every refusal constructibly fires |
 | C++ / ELF acceptance | `test_so_acceptance.py` | binutils + a pinned `.so`; reads the ELF, never dlopens |
