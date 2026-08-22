@@ -101,6 +101,26 @@ QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
 #: before.
 QP_ROT_FULL_BZ_DATASETS = ("kpoints_crys", "kirr_to_kfull")
 
+#: Root attribute :func:`write_qp_wfn_h5` stamps on its output, and the ONLY
+#: content-based way to tell a QP WFN.h5 from a mean-field one.  A QP WFN's ψ
+#: and E are a matched pair — the rotated orbitals carry the eigenvalues that
+#: produced the rotation — and a consumer that then applies a second,
+#: DFT-band-labelled ``eqp1.dat`` ladder discards the canonical ones and
+#: relabels rotated orbitals with someone else's band ordering (measured on
+#: the MoS2 run-82 parent smoke, JID 57269074 step .128; deck
+#: ``exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the wrapper passes
+#: ``--eqp eqp1.dat``).  Until this stamp existed the only discriminator was
+#: the FILENAME, which is not a fact about the contents.
+#:
+#: ABSENT MEANS UNVERIFIABLE, NOT MEAN-FIELD — the same reading the
+#: ``k_storage`` stamps above take.  Every WFN.h5 written before this stamp,
+#: and every one written by BerkeleyGW or ``pw2bgw``, carries nothing here.
+QP_WFN_ATTR = "qp_wfn_scheme"
+
+#: Versioned so a future change of what "rotated" means is a different word
+#: rather than the same word meaning something else.
+QP_WFN_SCHEME = "lorrax-qp-wfn-v1"
+
 
 def _wedge_reduction(payload, kirr_to_kfull, star_tables):
     """``(reduced_payload, worst_by_name)`` — the round trip, MEASURED.
@@ -499,3 +519,61 @@ def write_qp_wfn_h5(
                 "mn,msg->nsg", U_kmn[ik], c_active_dft, optimize=True)
             w.write_k(ik, enk_full_ry[ik], c_all_dft)
 
+    # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
+    # rotated orbitals carry the QP eigenvalues that produced the rotation,
+    # and applying a second, DFT-band-labelled QP ladder on top of them
+    # (``exciton_bands --eqp``) silently discards the canonical ones and
+    # relabels the rotated orbitals with someone else's ordering.  Nothing on
+    # disk could tell a consumer that this WFN.h5 is not mean-field, so the
+    # only discriminator available was the filename.  Stamped here, in the one
+    # writer, using the same "an absent attr means the old thing" reading the
+    # k_storage stamps above use.
+    with h5py.File(str(output_path), "a") as h5:
+        h5.attrs[QP_WFN_ATTR] = QP_WFN_SCHEME
+        h5.attrs["qp_wfn_band_start"] = int(band_start)
+        h5.attrs["qp_wfn_band_stop"] = int(band_stop)
+        h5.attrs["qp_wfn_source"] = str(getattr(wfn, "path", "") or "")
+
+
+
+def read_qp_wfn_stamp(path) -> dict | None:
+    """Is ``path`` a LORRAX QP WFN?  ``None`` when the file does not say.
+
+    Returns the stamp written by :func:`write_qp_wfn_h5` — ``scheme``,
+    ``band_start``, ``band_stop``, ``source`` — or ``None``.
+
+    THREE OUTCOMES, AND ONLY ONE OF THEM IS "NO".  A missing file, an
+    unreadable one, and one with no stamp all return ``None``, which means
+    **unverifiable**: BerkeleyGW's ``pw2bgw`` output, every WFN.h5 written
+    before this stamp, and a QP WFN produced by some other tool are
+    indistinguishable here, and a consumer must not read ``None`` as proof
+    that the file is mean-field.  A consumer may only use a POSITIVE answer
+    to refuse; the absence licenses nothing (``TASTE.md``: an absence is a
+    claim about what was searched).
+
+    An unrecognised scheme string is returned as-is rather than mapped onto
+    the current one — a caller comparing it against
+    :data:`QP_WFN_SCHEME` can then say "this file was written by a different
+    version" instead of silently accepting it.
+    """
+    try:
+        with h5py.File(str(path), "r") as h5:
+            raw = h5.attrs.get(QP_WFN_ATTR)
+            if raw is None:
+                return None
+            scheme = raw.decode() if isinstance(raw, bytes) else str(raw)
+            def _get(name, default=None):
+                v = h5.attrs.get(name, default)
+                if isinstance(v, bytes):
+                    return v.decode()
+                return v
+            return {
+                "scheme": scheme,
+                "band_start": (None if _get("qp_wfn_band_start") is None
+                               else int(_get("qp_wfn_band_start"))),
+                "band_stop": (None if _get("qp_wfn_band_stop") is None
+                              else int(_get("qp_wfn_band_stop"))),
+                "source": _get("qp_wfn_source", "") or "",
+            }
+    except (OSError, KeyError):
+        return None
