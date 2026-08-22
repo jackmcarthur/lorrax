@@ -268,6 +268,56 @@ def test_fractions_are_of_the_total_band_count_not_the_conduction_count():
         "fractions must be of N_max, not of n_cond"
 
 
+def test_the_conduction_coordinate_is_a_named_spelling_of_the_same_fractions():
+    """The owner's 2026-08-18 coordinate, reachable ONLY by name.
+
+    Same fixture as the cell above (40 % occupied, so the two rules differ by
+    24 bands): ``conduction_fractions`` must produce exactly the counts that
+    cell asserts the DEFAULT must not produce.  Two cells, one fixture,
+    opposite assertions — which is what makes either of them evidence.
+    """
+    nk, nb = 4, 200
+    n_occ = 80
+    e = np.tile(np.linspace(1.0, 20.0, nb), (nk, 1))
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=n_occ, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.90), bracket_scheme="conduction_fractions")
+    assert plan.counts == (176, 188, 200), plan.counts
+    assert plan.bracket_scheme == "conduction_fractions"
+
+
+def test_both_coordinates_come_from_one_conversion_with_no_default():
+    """``bracket_counts_from_fractions`` is the only place either rule lives.
+
+    ``coordinate`` is keyword-only with NO default: at a call site "0.80" in
+    the two coordinates is the same three characters and a different band.
+    """
+    import inspect
+
+    from gw.band_extrapolation import bracket_counts_from_fractions as conv
+
+    sig = inspect.signature(conv)
+    assert sig.parameters["coordinate"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["coordinate"].default is inspect.Parameter.empty, (
+        "a defaulted coordinate is an inferred coordinate")
+    assert conv((0.80, 0.90), 80, 200, coordinate="total_fractions") == (
+        160, 180)
+    assert conv((0.80, 0.90), 80, 200,
+                coordinate="conduction_fractions") == (176, 188)
+    # A scheme that consumes no fractions must not be answerable here.
+    with pytest.raises(ValueError, match="consumes no fractions"):
+        conv((0.80,), 80, 200, coordinate="conduction_energy_midpoint")
+
+
+def test_an_unknown_bracket_scheme_refuses_by_name():
+    """No fallback: this key selects which three band sums are COMPUTED."""
+    e = _si_like_spectrum()
+    with pytest.raises(ValueError, match="not known"):
+        plan_band_brackets(
+            enabled=True, enk_ry=e, n_occ=2, nb_logical=e.shape[1],
+            nb_padded=e.shape[1], bracket_scheme="conduction_maybe")
+
+
 def test_conduction_energy_midpoint_is_conduction_relative_and_rectangular():
     """The opt-in geometry is exactly the measured proposal.
 

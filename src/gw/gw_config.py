@@ -1850,9 +1850,20 @@ _DEFAULTS = {
     "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     # WHICH three compile-time band brackets feed the estimator.  Preserve
     # the incumbent total-band 80/90/100 geometry unless a deck explicitly
-    # selects the conduction-coordinate experiment.  This is a COMPUTE
+    # selects a conduction-coordinate experiment.  This is a COMPUTE
     # choice, unlike band_extrapolation_estimator: changing it recompiles and
     # re-runs Sigma.
+    #
+    # THE COORDINATE THE FRACTIONS ARE IN IS PART OF THIS KEY.
+    # ``total_fractions`` reads 0.80 as round(0.80*N_max);
+    # ``conduction_fractions`` reads it as n_occ + round(0.80*(N_max-n_occ)),
+    # which is the coordinate the owner named on 2026-08-18.  The two are one
+    # band apart on Si (n_occ=8) and tens of bands apart on a CrI3-scale
+    # occupied manifold, so the reading cannot be left implicit -- but it is
+    # also not a numerical ruling: reinterpreting 80/90 as conduction
+    # fractions WORSENED the dense-Si control's N=180..396 indirect-gap
+    # spread/max from 29.79/17.29 to 38.12/25.63 meV (JID 57267197).  Hence a
+    # named spelling with the incumbent as the default, never an inference.
     "band_extrapolation_bracket_scheme": BRACKET_SCHEME_DEFAULT,
     "fermi_reference": "midgap",
     # DFT occupation smearing of the starting point.  REQUIRED as a pair
@@ -3023,7 +3034,9 @@ class DynamicSigmaConfig:
     band_extrapolation_estimator: str = BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT
     #: WHICH compile-time cuts produce the three sums.  The legacy
     #: ``total_fractions`` geometry remains the default; the explicit
-    #: ``conduction_energy_midpoint`` arm places N1 at half the included
+    #: ``conduction_fractions`` arm reads the SAME fractions in the
+    #: conduction coordinate (``n_occ + f*(N_max - n_occ)``), and
+    #: ``conduction_energy_midpoint`` places N1 at half the included
     #: conduction manifold and N2 at the k-mean DFT-energy midpoint.
     band_extrapolation_bracket_scheme: str = BRACKET_SCHEME_DEFAULT
     #: Did the deck name the scheme?  An explicitly named compute control may

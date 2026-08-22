@@ -105,7 +105,9 @@ in a low window shares.  **No residual, R² or scatter statistic can see it**
 — which is also why ``Δ_model`` alone is not a sufficient diagnostic and why
 :class:`ExtrapolationFit` carries the two SIGNED numbers below beside it.
 
-DEFAULT FRACTIONS ARE OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION COUNT.
+THE DEFAULT FRACTIONS ARE OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION
+COUNT — and since 2026-08-22 that is a NAMED default
+(``bracket_scheme = total_fractions``) rather than the only reading.
 The incumbent model is written in ``N_eff``, and the free-electron counting
 law that makes 1/N the right variable is written in the total count measured
 from the bottom of the band manifold.  Measured on the Si 4×4×4 SOC deck's
@@ -121,13 +123,36 @@ differ by ~2 % and nothing distinguishes them; on one with a large occupied
 manifold ``n_occ + 0.8·n_cond`` sits far below ``0.8·N_max`` and they diverge
 badly.
 
-AN EXPLICIT CONDUCTION-COORDINATE GEOMETRY IS ALSO AVAILABLE.  The named
-``conduction_energy_midpoint`` scheme places N1 at half of the conduction
-bands included in the Sigma sum, snaps it to a multiplet-clean boundary, then
-places N2 at the clean rectangular boundary nearest halfway between N1 and N3
-in ``mean_k E[k,N-1]``.  It does NOT apply a global E_ck mask: every k keeps
-the same static band count.  This changes only cut placement; both estimators
+THE COORDINATE IS A NAMED SPELLING, NOT AN INFERENCE.  Two conduction-
+coordinate geometries are available by name, and neither is reachable by
+accident:
+
+``conduction_fractions`` reads the SAME fractions in the coordinate the owner
+named on 2026-08-18 — ``N_i = n_occ + round(f_i * (N_max - n_occ))``.  It
+exists because the two readings are indistinguishable on a small occupied
+manifold and far apart on a large one: on Si (``n_occ = 8``) 0.80 of 396 is
+317 against 318, while on a CrI3-scale occupied manifold every shell boundary
+moves by tens of bands.  Both readings live in exactly one function,
+:func:`bracket_counts_from_fractions`, whose ``coordinate`` argument is
+keyword-only with NO default — at a call site the difference is invisible, so
+it has to be said out loud.
+
+``conduction_energy_midpoint`` places N1 at half of the conduction bands
+included in the Sigma sum, snaps it to a multiplet-clean boundary, then places
+N2 at the clean rectangular boundary nearest halfway between N1 and N3 in
+``mean_k E[k,N-1]``.  It does NOT apply a global E_ck mask: every k keeps the
+same static band count.  This changes only cut placement; both estimators
 still use absolute band indices and the full DFT energy ladder.
+
+Neither is the default, and that is measured rather than cautious.  On the
+dense Si GN-PPM control, merely reinterpreting 80/90 as conduction fractions
+WORSENED the ``N=180..396`` indirect-gap spread/max from 29.79/17.29 meV to
+38.12/25.63 meV (Perlmutter JID 57267197,
+``runs/Si/69_conduction_fraction_geometry_20260818/``).  The owner's stated
+intent fixes what the coordinate MEANS; it does not by itself rule which one
+converges better, and one material does not establish a universal
+cut-placement law.  So existing decks keep their numerical meaning and a
+production study names the coordinate it wants.
 
 It is deliberately NOT the default.  On the measured Si GN-PPM curve its
 indirect-gap spread was 12.29 meV over N3=180..396 and 4.18 meV over
@@ -466,14 +491,70 @@ BRACKET_FRACTIONS: tuple[float, float] = (0.80, 0.90)
 
 #: Named geometries for the three cumulative band sums.  The incumbent stays
 #: the default: changing the meaning of existing decks would invalidate their
-#: convergence history, and the conduction-coordinate arm has only been
-#: measured on one Si curve.  ``conduction_energy_midpoint`` is therefore an
-#: explicit production option, not an inferred replacement.
-BRACKET_SCHEMES: tuple[str, str] = (
+#: convergence history, and the conduction-coordinate arms have only been
+#: measured on one Si curve.  They are therefore explicit production options,
+#: never inferred replacements.
+#:
+#: ``conduction_fractions`` is the SAME fractions in the conduction
+#: coordinate the owner named on 2026-08-18 —
+#: ``N_i = n_occ + round(f_i * (N_max - n_occ))`` — and it exists because the
+#: two coordinates are indistinguishable on a small occupied manifold and far
+#: apart on a large one.  On Si (``n_occ = 8``) 0.80 of 396 is 317 and the
+#: conduction reading is 8 + 0.80*388 = 318; on a CrI3-scale occupied
+#: manifold they diverge by tens of bands and every shell boundary moves.
+#:
+#: IT IS NOT THE DEFAULT, and the reason is measured rather than
+#: conservative: on the dense Si GN-PPM control, merely reinterpreting 80/90
+#: as conduction fractions WORSENED the N=180..396 indirect-gap
+#: spread/max from 29.79/17.29 meV to 38.12/25.63 meV (Perlmutter JID
+#: 57267197, ``runs/Si/69_conduction_fraction_geometry_20260818/``).  Intent
+#: alone is not a numerical-default ruling — one material does not establish
+#: a universal cut-placement law — so the coordinate is a spelling a deck
+#: chooses, and existing decks keep their numerical meaning.
+BRACKET_SCHEMES: tuple[str, str, str] = (
     "total_fractions",
+    "conduction_fractions",
     "conduction_energy_midpoint",
 )
 BRACKET_SCHEME_DEFAULT: str = "total_fractions"
+
+#: The two schemes that CONSUME ``band_extrapolation_fractions``.  The third
+#: derives its cuts from energy and refuses the key.
+BRACKET_FRACTION_SCHEMES: tuple[str, str] = (
+    "total_fractions",
+    "conduction_fractions",
+)
+
+
+def bracket_counts_from_fractions(fractions, n_occ: int, nb_logical: int,
+                                  *, coordinate: str) -> tuple[int, ...]:
+    """Turn sampling fractions into requested band counts — ONE conversion.
+
+    **THE COORDINATE IS NAMED, NEVER INFERRED.**  ``coordinate`` is
+    keyword-only and has no default: the two readings of "0.80" differ by
+    ``n_occ`` bands and nothing at a call site makes the choice visible.
+    This function is the only place either arithmetic lives, so a third
+    consumer cannot grow a fourth reading.
+
+    * ``total_fractions``      -> ``round(f * N_max)``
+    * ``conduction_fractions`` -> ``n_occ + round(f * (N_max - n_occ))``
+
+    Both return counts measured from band 0 — absolute band indices, which is
+    what every downstream consumer (the snapper, the partial sums, the fit)
+    reads.  The coordinate changes WHERE the cuts are, not what a cut means.
+    """
+    coordinate = str(coordinate).strip().lower()
+    n_occ = int(n_occ)
+    nb_logical = int(nb_logical)
+    if coordinate == "total_fractions":
+        return tuple(int(round(float(f) * nb_logical)) for f in fractions)
+    if coordinate == "conduction_fractions":
+        n_cond = nb_logical - n_occ
+        return tuple(n_occ + int(round(float(f) * n_cond)) for f in fractions)
+    raise ValueError(
+        f"bracket_counts_from_fractions: coordinate {coordinate!r} consumes "
+        f"no fractions; the fraction-consuming schemes are "
+        f"{BRACKET_FRACTION_SCHEMES}.")
 
 #: First point of the conduction-coordinate geometry.  The middle point is
 #: not another fraction: it is chosen halfway in k-mean DFT energy between
@@ -715,13 +796,16 @@ def plan_band_brackets(
         raise ValueError(
             f"band_extrapolation_bracket_scheme = {bracket_scheme!r} is "
             f"not known; choose one of {BRACKET_SCHEMES}.")
-    if (bracket_scheme == "conduction_energy_midpoint"
+    if (bracket_scheme not in BRACKET_FRACTION_SCHEMES
             and tuple(fractions) != BRACKET_FRACTIONS):
         raise ValueError(
-            "plan_band_brackets: fractions and "
-            "bracket_scheme='conduction_energy_midpoint' cannot be combined; "
-            "that named scheme fixes N1 at half the conduction manifold and "
-            "derives N2 from energy, so fractions would be ignored.")
+            f"plan_band_brackets: fractions and "
+            f"bracket_scheme={bracket_scheme!r} cannot be combined; that "
+            f"named scheme fixes N1 at half the conduction manifold and "
+            f"derives N2 from energy, so fractions would be ignored.  The "
+            f"fraction-consuming schemes are {BRACKET_FRACTION_SCHEMES} — "
+            f"'conduction_fractions' is the one that reads these same "
+            f"fractions in the conduction coordinate.")
 
     if not enabled:
         return trivial_plan(nb_padded, n_occ, nb_logical)
@@ -767,15 +851,20 @@ def plan_band_brackets(
             f"plan_band_brackets: expected (nk, >={nb_logical}) energies, "
             f"got shape {np.shape(enk_ry)}")
 
-    # ``total_fractions`` is the incumbent geometry.  Keep this expression
-    # exactly as it was: it is the compatibility arm and its counts must not
-    # move.  The alternate geometry is resolved below because its N2 depends
-    # on the *snapped* N1, not on the raw conduction-half request.
-    requested = tuple(int(round(f * nb_logical)) for f in fractions)
+    # ONE conversion, and the coordinate is named at the call.  The two
+    # readings of "0.80" differ by n_occ bands; on Si (n_occ = 8) that is one
+    # band and on a CrI3-scale occupied manifold it moves every shell
+    # boundary.  ``total_fractions`` is the incumbent arm and its counts do
+    # not move.  ``conduction_energy_midpoint`` is resolved separately because
+    # its N2 depends on the *snapped* N1, not on the raw conduction-half
+    # request.
     if bracket_scheme == "conduction_energy_midpoint":
-        requested = (
-            n_occ + int(round(CONDUCTION_HALF_FRACTION * n_cond)),
-        )
+        requested = bracket_counts_from_fractions(
+            (CONDUCTION_HALF_FRACTION,), n_occ, nb_logical,
+            coordinate="conduction_fractions")
+    else:
+        requested = bracket_counts_from_fractions(
+            fractions, n_occ, nb_logical, coordinate=bracket_scheme)
 
     # ── SNAPPING THE INTERIOR CUTS IS A PREFERENCE, NOT A CONSTRAINT ────
     # The interior cuts are SAMPLING POINTS ON A PARTIAL-SUM CURVE, not
@@ -2464,6 +2553,10 @@ def _bracket_geometry_text(plan: BandBracketPlan) -> str:
     if plan.bracket_scheme == "total_fractions":
         return (f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
                 f"{plan.counts[-1]}")
+    if plan.bracket_scheme == "conduction_fractions":
+        return (f"fractions = {BRACKET_FRACTIONS} of the CONDUCTION manifold "
+                f"(N_i = n_occ + f*(N_max - n_occ)); n_occ = {plan.n_occ}, "
+                f"n_cond = {plan.n_cond}, N_max = {plan.counts[-1]}")
     if plan.bracket_scheme == "conduction_energy_midpoint":
         return (
             "bracket scheme = conduction_energy_midpoint "
