@@ -285,6 +285,55 @@ class ComputeMode(str, enum.Enum):
         }.get(self)
 
 
+#: The LEGACY spellings of the self-energy axis, and the canonical key that
+#: replaces each.  ``compute_mode`` / ``qp_solver`` are the load-bearing axes
+#: (see :meth:`LorraxConfig.compute_mode` / :meth:`LorraxConfig.qp_solver`);
+#: these five booleans/strings are the vocabulary that predates them and that
+#: every deck in the tree still writes.
+#:
+#: They are still parsed and still honored -- a deck that names one keeps
+#: running -- but naming one now prints a deprecation note saying what to
+#: write instead.  A key honored in silence beside a canonical twin is how a
+#: tree ends up with two vocabularies for one axis and no way to tell which
+#: one a given run resolved through.
+#:
+#: RETIREMENT IS A SEPARATE DECISION and has not been taken; this row is the
+#: warning stage of it.  The migration shape is the tree's own
+#: (``nband`` -> ``number_bands``, ``sigma_band_extrapolation`` ->
+#: ``use_band_extrapolation``): note first, remove later.
+LEGACY_SIGMA_AXIS_KEYS: dict[str, str] = {
+    "do_screened": "compute_mode = x_only | cohsex | gn_ppm | hl_ppm | mpa",
+    "use_ppm_sigma": "compute_mode = gn_ppm | hl_ppm",
+    "ppm_model": "compute_mode = gn_ppm | hl_ppm",
+    "self_consistent": "qp_solver = self_consistent",
+    "sigma_at_dft_energies": "qp_solver = one_shot_dft (now the default)",
+}
+
+
+def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
+                                    *, print_fn=print) -> tuple[str, ...]:
+    """Print one deprecation note per LEGACY self-energy-axis key the deck named.
+
+    Returns the keys announced, so a caller (or a test) can assert on them
+    rather than scraping the log.  Nothing is refused and nothing resolves
+    differently: this is the warning stage of the migration described on
+    :data:`LEGACY_SIGMA_AXIS_KEYS`.
+    """
+    named = frozenset(str(k).strip().lower() for k in (named_keys or ()))
+    hit = tuple(k for k in LEGACY_SIGMA_AXIS_KEYS if k in named)
+    if not hit:
+        return ()
+    mode = getattr(resolved_mode, "value", resolved_mode)
+    solver = getattr(resolved_solver, "value", resolved_solver)
+    print_fn(
+        f"  [config provenance] this deck names {len(hit)} LEGACY "
+        f"self-energy-axis key(s); they are honored, and the canonical axes "
+        f"resolved to compute_mode = {mode}, qp_solver = {solver}.")
+    for key in hit:
+        print_fn(f"    {key} -> write {LEGACY_SIGMA_AXIS_KEYS[key]} instead")
+    return hit
+
+
 class SigmaChannel(str, enum.Enum):
     """One term of Σ that a compute mode either builds or does not.
 
@@ -1739,6 +1788,22 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
+    # Effective-xi FLOOR, in eV.  "auto" (default) = the ansatz's own
+    # conditioning floor: for the HGL plasmon-pole crossing quadrature that
+    # is `ppm_windows.crossing_regularization_floor` = 2*omega_max/(24 -
+    # 2*edge), which is why a GN-PPM run on a +/-5 eV grid at edge 1.5
+    # silently ran at 0.4762 eV where the deck said 0.25; for MPA it is 0,
+    # because MPA's crossing family is a positive real-time rule with its
+    # own node ceiling and the HGL bandwidth derivation says nothing about
+    # it.  A FLOAT is an explicit floor applied to EVERY ansatz -- the knob
+    # that equalises xi across a cross-ansatz comparison, which is otherwise
+    # confounded (1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
+    # window).  0 is legal and means "do not raise"; on an HGL ansatz that
+    # re-opens the ill-conditioned regime the floor exists for, so it is
+    # spellable on purpose and stamped so it cannot happen by accident.
+    # Resolved ONCE by `ppm_windows.resolve_sigma_regularization` and
+    # stamped into sigma_mnk.h5 beside the requested value.
+    "sigma_regularization_floor_ev": "auto",
     "sigma_window_edge_factor": 1.5,
     # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
     #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
@@ -3005,6 +3070,12 @@ class DynamicSigmaConfig:
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
+    #: ``sigma_regularization_floor_ev``: "auto" or a float in eV.  See
+    #: :func:`gw.ppm_windows.resolve_sigma_regularization`, which is the
+    #: ONLY place this is interpreted -- the drivers and the sigma_mnk.h5
+    #: writer all call it, so the stamped xi and the xi the kernel ran at
+    #: cannot disagree.
+    regularization_floor_ev: str | float = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  This
@@ -3057,6 +3128,22 @@ class DynamicSigmaConfig:
         if self.omega_layout not in ("replicated", "sharded"):
             raise ValueError(
                 "sigma_omega_layout must be 'replicated' or 'sharded'.")
+        # 'auto' or a non-negative float in eV.  A TYPO must refuse here,
+        # not resolve to 'auto' -- a floor key that silently defaults is the
+        # confound the key was added to remove.
+        _floor = self.regularization_floor_ev
+        if not (isinstance(_floor, str)
+                and _floor.strip().lower() == "auto"):
+            try:
+                _floor_f = float(_floor)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"sigma_regularization_floor_ev must be 'auto' or a "
+                    f"number of eV; got {_floor!r}.") from None
+            if not (_floor_f >= 0.0):
+                raise ValueError(
+                    f"sigma_regularization_floor_ev must be >= 0; got "
+                    f"{_floor_f!r}.")
         # REFUSE an unrecognised estimator, naming both, rather than falling
         # back to the default.  A misspelling that silently ran the default
         # would be an A/B measuring nothing -- the same rule
@@ -4132,6 +4219,7 @@ class LorraxConfig:
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
+            regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
             sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
             omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
@@ -4541,4 +4629,13 @@ class LorraxConfig:
         # returns from this call before either property is touched.
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
+        # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
+        # the other one.  Same position and same reason as the two refusals
+        # above: the announcement quotes the RESOLVED axes, which only the
+        # record can answer.  Honoring a legacy key in silence beside a
+        # canonical twin is how a tree ends up with two vocabularies for one
+        # axis and no way to tell which one a run went through.
+        announce_legacy_sigma_axis_keys(
+            _named_keys, resolved.compute_mode, resolved.qp_solver,
+            print_fn=print_fn)
         return resolved

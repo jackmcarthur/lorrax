@@ -10,6 +10,59 @@ separate question and is stated per entry — an approved ruling that has not
 landed is marked so, with the branch that carries it, because documenting an
 unlanded change as live is how a tuning table becomes a lie.
 
+## 2026-08-22 — One mesh-divisibility pad helper, and it returns a NAMED result
+
+`runtime.padding.pad_axis(A, divisor, *, axis, fill=0.0)` is the single
+implementation of the mesh-divisibility pad. It returns
+`PadAxisResult(array, logical, padded)` and a caller reads the extent it
+wants **by name**.
+
+**What this replaces, and why the obvious repair was the wrong one.** The
+tree carried two helpers whose second tuple element was the *opposite*
+extent from the same slot: `runtime.padding.pad_axis_to` returned the
+LOGICAL extent, `bse/bse_window._pad_axis_to_multiple` returned the PADDED
+one. Both were spelled `A, n = helper(...)`. A call site copied from the
+wrong neighbour compiles, runs, and is wrong **only when the extent was
+not already a mesh multiple** — invisible on every mesh-divisible
+validated run, and the BSE helper's own comment recorded a wrong answer
+that had already come from exactly this. Unifying by *picking a
+convention* — silently swapping one helper's single return — reintroduces
+that bug rather than fixing it, which is why the register row filed under
+`bse/common` says in as many words: "Do not swap a single-value return."
+
+So the consolidation does two things at once. The arithmetic is
+single-sourced, and the ambiguity is removed: neither extent can be taken
+by accident because neither is positional any more. `fill` stays
+keyword-only for the same class of reason — the BSE ε axis is the diagonal
+of a diagonalisation and pads with a signed sentinel
+(`bse_window.PAD_EPS_GUARD_RY`), and a positionally-supplied fill lets a
+call site sign the guard by accident, putting pad transitions *below* the
+optical onset.
+
+Behaviour-preserving by construction: `pad_axis` is the old
+`_pad_axis_to_multiple` body (`jnp.pad(..., constant_values=fill)`, same
+`round_up`, same same-object return at zero pad), and every migrated call
+site binds the extent the helper it replaced returned. Pinned by
+`tests/test_pad_parity_gates.py::test_pad_axis_fill_is_keyword_only_and_signed`
+(both extents differ on a non-divisible case, so the old single-value
+return could not have expressed it) and by a source gate that fails if a
+second helper reappears under either name.
+
+**This partially satisfies the precondition** the 2026-08-06
+`LORRAX_EXTRA_BAND_PAD` entry below set out. That entry declined the knob
+because "the band pad has no single source" and named `bse_io`'s
+hand-rolled helper as one of the three reasons. That reason is now gone —
+one helper, one arithmetic, `fill` explicit. The other two stand: the five
+`spec_divisor` sites still each do their own round-up, and
+`gw/ppm_sigma.pad_sigma_window` still pads m and n independently, so a
+knob honoured inside `pad_axis` would still not reach the Σ window. The
+knob remains declined until those are routed through a
+`padded_band_extent()` as that entry specifies.
+
+Licenses deleting: `runtime.padding.pad_axis_to`,
+`bse.bse_window._pad_axis_to_multiple` and its `bse_io` re-export, and any
+prose describing the band pad as having two conventions.
+
 ## 2026-08-10 — `bse/bse_io.py` is split into four modules; the old name is a facade
 
 `bse_io.py` had become the BSE's single choke point: restart discovery and
@@ -54,7 +107,9 @@ against this map: the pad helpers, `resolve_n_occ` and
 in `bse_loading`. In particular the 2026-08-06 `LORRAX_EXTRA_BAND_PAD` entry
 below names `bse/bse_io.py` as the home of the hand-rolled
 `_pad_axis_to_multiple`; that ruling stands unchanged and its precondition now
-reads `bse_window`.
+reads `bse_window` — and, since 2026-08-22, no longer names a hand-rolled
+helper at all: that half of the precondition is closed by the one-`pad_axis`
+entry above.
 
 Behaviour-preserving by construction: every function and class moved verbatim,
 only module headers are new, and the structural gates that had been pinned to
@@ -137,6 +192,10 @@ round-up; `bse/bse_io.py` hand-rolls `_pad_axis_to_multiple` entirely
 (and returns the PADDED extent where `pad_axis_to` returns the LOGICAL
 one, from the same slot); `gw/ppm_sigma.pad_sigma_window` pads m and n
 independently.
+
+*(The second of those three was closed on 2026-08-22 — one `pad_axis`
+with a named result; see that entry above. The other two stand and the
+knob stays declined.)*
 
 A knob honoured inside `pad_axis_to` would therefore reach **neither the
 BSE band axis nor the Σ window** while reporting a green pad-flip run for

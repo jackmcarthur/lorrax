@@ -148,7 +148,8 @@ def _compute_analytic_head_diag(
     reports/sigma_ppm_tighten_2026-07-04).  Injection is deliberately left
     to the ansatz-neutral dynamic-Sigma finalizer.
     """
-    from .head_correction import compute_ppm_head_sigma_diag
+    from .head_correction import (compute_ppm_head_sigma_diag,
+                                  on_shell_occupied_head_sigma_ry)
 
     occupations = None
     if iteration_head is None:
@@ -191,11 +192,17 @@ def _compute_analytic_head_diag(
     # max|dense| == max|diag| (off-diagonals are exact zeros; |diag| >= 0),
     # so the diagnostic is unchanged on every path.
     head_max_ev = float(np.max(np.abs(head_sigma_diag_ry))) * RYD_TO_EV
-    on_shell_occ = (
-        -head_gn.R_h
-        / (head_gn.omega_h * meta.cell_volume * meta.nk_tot)
-        * RYD_TO_EV
-    )
+    # Derived from the SAME kernel that built the tensor above, not from a
+    # second spelling of its closed form: the hand-written ``-R_h/(...)``
+    # that used to live here had drifted in sign against both the kernel
+    # and the named ``sig_c_head(Edft).Re`` output column (register row
+    # `ppm_pipeline.py:193-201`; JID 57243214 measured log -0.8071 eV vs
+    # tensor +0.807048 eV on the same occupied state).
+    on_shell_occ = on_shell_occupied_head_sigma_ry(
+        head_gn,
+        cell_volume=float(meta.cell_volume),
+        nk_tot=int(meta.nk_tot),
+    ) * RYD_TO_EV
     print_fn(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
@@ -600,6 +607,7 @@ def compute_ppm_sigma_pipeline(
                 sigma_cfg=config.sigma,
                 quad=config.sigma_quadrature_config,
                 omega_grid_ry=config.omega_grid_ry,
+                ansatz=config.compute_mode,
                 occupation_state=occupation_state,
                 plan=plan,
                 print_fn=print_fn,

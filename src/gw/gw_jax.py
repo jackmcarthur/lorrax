@@ -339,17 +339,25 @@ def main(argv=None):
 	# Σ stage would waste the whole ζ fit (pattern #6: the resolve-time check
 	# must test what will execute).  The Σ driver re-checks divisibility at
 	# its own seam as the last-line guard.
-	if mode.is_dynamic and config.sigma.omega_layout == "sharded":
+	# THE SAME precondition the Σ drivers enforce, asked EARLY.  It is one
+	# function (``ppm_sigma.assert_sharded_sigma_window_divides_mesh``); this
+	# used to be a third hand-written copy of the modulus test, alongside the
+	# PPM branch's and — absent entirely — the MPA executor's.
+	#
+	# ``compute_mode = mpa`` reaches it whatever the deck says about the
+	# layout, because the MPA executor emits the sharded cube unconditionally
+	# (the dispatch refuses ``replicated`` by name for that reason).
+	_wants_sharded_cube = (
+		config.sigma.omega_layout == "sharded"
+		or getattr(mode, "value", str(mode)) == "mpa")
+	if mode.is_dynamic and _wants_sharded_cube:
+		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
 		_p_x = int(mesh_xy.devices.shape[0])
 		_p_y = int(mesh_xy.devices.shape[1])
 		_nbs = int(meta.nb_sigma)
-		if _nbs % _p_x != 0 or _nbs % _p_y != 0:
-			raise ValueError(
-				f"sigma_omega_layout=sharded (round 1) requires the σ band "
-				f"window (nval+ncond={_nbs}) to divide the mesh on both axes "
-				f"({_p_x}x{_p_y}): the mesh-pad block cannot ride the sharded "
-				f"consumer path yet.  Use a divisible window or "
-				f"sigma_omega_layout=replicated.")
+		assert_sharded_sigma_window_divides_mesh(
+			_nbs, mesh_xy,
+			ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
 		# The second refusal that used to live here -- sharded layout with
 		# slab_io=h5py_allgather at P>1, which would have re-introduced the
 		# full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone

@@ -1192,6 +1192,91 @@ def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
                                      _REPLICATED_FACTOR_MAX_BATCH_BYTES)
 
 
+#: Per-channel tail of :func:`_rank_truncate_capacity_error` — the deck keys
+#: that actually exist on each channel.  The arithmetic and the ceiling are
+#: identical because THE BUFFER IS THE SAME BUFFER (one replicated
+#: ``(q_batch, mu, mu)`` c128 eigh operand); only the escape routes differ.
+_RANK_TRUNCATE_CHANNEL_ADVICE = {
+    'charge': (
+        "For large n_mu use distributed_zeta_solve='distributed' instead "
+        "(ScaLAPACK pzheevd, 236 s at the same size), or "
+        "charge_zeta_solve='cholesky' to accept the distributed factor "
+        "(NOT rank-conditioned — verify V_q)."),
+    'transverse': (
+        "For large n_mu_T use distributed_zeta_solve='distributed' instead "
+        "(its plan runs pzheevd at the PADDED extent with exactly-inert pad "
+        "modes, so any count fits any square mesh), or "
+        "transverse_zeta_solve='ridge' to accept the LU+ridge family (NOT "
+        "rank-conditioned — the transverse CCT is indefinite and near-null, "
+        "so verify the fit residual)."),
+}
+
+
+def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
+    """THE refusal for a replicated rank-truncating eigh that will not fit.
+
+    ONE message for both channels.  The charge branch
+    (``charge_zeta_solve='rank_truncate'``) and the transverse branch
+    (``transverse_zeta_solve='rank_truncate'``) allocate the *same* object
+    — one replicated ``(q_batch, n_mu, n_mu)`` complex128 eigh operand — so
+    they have the same ceiling and must report it the same way.  Before
+    2026-08-22 only the charge branch checked it at all; the transverse
+    resolver returned ``'transverse_rank_truncate'`` unconditionally and
+    the run died on an allocation, hours in, above ``n_mu_T ~ 16k``
+    (register: "transverse resolver lacks the charge branch's capacity
+    gate; OOMs late above mu_T~16k").
+
+    REPORT THE QUANTITY THAT ACTUALLY FAILED (DLM campaign 2026-07-29,
+    jobs 7879700 / 7879689).  Two gates test DIFFERENT things:
+
+        _replicate_charge_ok           whole stack   nq * mu^2 * 16
+        _replicate_rank_truncate_ok    one q-batch   batch * mu^2 * 16
+
+    The second is the weaker one, so IT is what binds, and the cap that
+    would clear it is the per-batch figure — not the stack.  The message
+    this replaced quoted the stack and advised the stack-sized cap (61 /
+    94 GiB at the two sizes measured), overstating the fix by ~10x: 6 / 10
+    GiB is what those runs actually needed.
+    """
+    stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
+             if nq and n_rmu else 0.0)
+    batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
+             if nq and n_rmu else 1)
+    need = (batch * int(n_rmu) ** 2 * 16 / 1024**3
+            if nq and n_rmu else 0.0)
+    # The exact mu ceiling this route carries, from the two 4 GiB caps:
+    # batch collapses to 1 once one (mu, mu) c128 matrix exceeds
+    # _REPLICATED_FACTOR_MAX_BATCH_BYTES, so the criterion reduces to
+    # mu <= sqrt(max(cap, factor_cap) / 16).
+    cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
+              _REPLICATED_FACTOR_MAX_BATCH_BYTES)
+    mu_max = int(math.isqrt(cap // 16))
+    key = ('charge_zeta_solve' if channel == 'charge'
+           else 'transverse_zeta_solve')
+    mu_name = 'n_mu' if channel == 'charge' else 'n_mu_T'
+    try:
+        advice = _RANK_TRUNCATE_CHANNEL_ADVICE[channel]
+    except KeyError:  # pragma: no cover - programming error
+        raise AssertionError(f"unknown channel {channel!r}") from None
+    return ValueError(
+        f"{key}='rank_truncate' needs the replicated factor, and the "
+        f"binding limit is ONE q-batch, not the stack: batch={batch} x "
+        f"({mu_name}={n_rmu})^2 x 16 B = {need:.2f} GiB > the "
+        f"{cap / 1024**3:.2f} GiB per-batch cap.  "
+        f"(The whole CCT stack, nq={nq}, is {stack:.2f} GiB -- context "
+        f"only; it is NOT what failed.)  On this route the replicated "
+        f"factor is allocated one q-batch at a time, so the ceiling is "
+        f"{mu_name} <= {mu_max}.  "
+        f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
+        f"clear it if the device budget allows -- but note the factor "
+        f"is a dense whole-tile eigh per q (q-parallel over devices "
+        f"above the fold threshold, so per-rank ceil(nq/P)*{mu_name}^3; "
+        f"the ALL-RANKS execution measured 4712 s at n_mu=10015 on "
+        f"64 ranks, so ~20 h at n_mu=24933 before the fold and still "
+        f"hours-per-q after it): raising the "
+        f"cap makes this RESOLVE, not finish.  {advice}")
+
+
 def _resolve_channel_ladder(
     mesh_xy: Mesh,
     override: str,
@@ -1351,50 +1436,7 @@ def _resolve_solver_kind_charge(
             # buffer.  Return the nominal kind and let the caller override.
             return 'replicated_rank_truncate'
         if charge_zeta_solve == 'rank_truncate':
-            # REPORT THE QUANTITY THAT ACTUALLY FAILED (DLM campaign
-            # 2026-07-29, jobs 7879700 / 7879689).  Reaching here means BOTH
-            # gates above said no, and they test DIFFERENT things:
-            #   _replicate_charge_ok      whole stack   nq * mu^2 * 16
-            #   _replicate_rank_truncate_ok  one q-batch  batch * mu^2 * 16
-            # The second is the weaker one, so IT is what binds, and the cap
-            # that would clear it is the per-batch figure -- not the stack.
-            # The old message quoted the stack and advised the stack-sized cap
-            # (61 / 94 GiB at the two sizes measured), which over-states the
-            # fix by ~10x: 6 / 10 GiB is what those runs actually needed.
-            stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
-                     if nq and n_rmu else 0.0)
-            batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
-                     if nq and n_rmu else 1)
-            need = (batch * int(n_rmu) ** 2 * 16 / 1024**3
-                    if nq and n_rmu else 0.0)
-            # The exact mu ceiling this route carries, from the two 4 GiB caps:
-            # batch collapses to 1 once one (mu, mu) c128 matrix exceeds
-            # _REPLICATED_FACTOR_MAX_BATCH_BYTES, so the criterion reduces to
-            # mu <= sqrt(max(cap, factor_cap) / 16).
-            _cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
-                       _REPLICATED_FACTOR_MAX_BATCH_BYTES)
-            mu_max = int(math.isqrt(_cap // 16))
-            raise ValueError(
-                f"charge_zeta_solve='rank_truncate' needs the replicated "
-                f"factor, and the binding limit is ONE q-batch, not the "
-                f"stack: batch={batch} x (n_mu={n_rmu})^2 x 16 B = "
-                f"{need:.2f} GiB > the {_cap / 1024**3:.2f} GiB per-batch cap.  "
-                f"(The whole CCT stack, nq={nq}, is {stack:.2f} GiB -- context "
-                f"only; it is NOT what failed.)  On this route the replicated "
-                f"factor is allocated one q-batch at a time, so the ceiling is "
-                f"n_mu <= {mu_max}.  "
-                f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
-                f"clear it if the device budget allows -- but note the factor "
-                f"is a dense whole-tile eigh per q (q-parallel over devices "
-                f"above the fold threshold, so per-rank ceil(nq/P)*n_mu^3; "
-                f"the ALL-RANKS execution measured 4712 s at n_mu=10015 on "
-                f"64 ranks, so ~20 h at n_mu=24933 before the fold and still "
-                f"hours-per-q after it): raising the "
-                f"cap makes this RESOLVE, not finish.  For large n_mu use "
-                f"distributed_zeta_solve='distributed' instead (ScaLAPACK "
-                f"pzheevd, 236 s at the same size), or "
-                f"charge_zeta_solve='cholesky' to accept the distributed "
-                f"factor (NOT rank-conditioned — verify V_q).")
+            raise _rank_truncate_capacity_error(nq, n_rmu, channel='charge')
         return None
 
     return _resolve_channel_ladder(
@@ -1409,6 +1451,8 @@ def _resolve_solver_kind_charge(
 def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                                     n_rmu_logical: int | None = None,
                                     transverse_zeta_solve: str = "ridge",
+                                    nq: int | None = None,
+                                    replicated_factor_used: bool = True,
                                     ) -> str:
     """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
     getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
@@ -1431,7 +1475,12 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
       tier.  ``distributed_lu`` names an LU backend this family does not
       run, so an EXPLICIT ``distributed_lu`` request combined with
       ``rank_truncate`` REFUSES here (promise contract) instead of
-      silently ignoring one of the two keys.
+      silently ignoring one of the two keys.  Since 2026-08-22 the LOCAL
+      plan carries the CHARGE branch's capacity gate
+      (:func:`_replicate_rank_truncate_ok` →
+      :func:`_rank_truncate_capacity_error`), because it allocates the
+      same replicated ``(q_batch, μ, μ)`` c128 eigh operand: pass ``nq``
+      and ``replicated_factor_used`` to arm it.
 
     The rest of this docstring documents the RIDGE (LU) family.
 
@@ -1492,6 +1541,32 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                 f"backend the family does not run.  Leave distributed_lu "
                 f"at 'auto'/'off', or set transverse_zeta_solve='ridge' "
                 f"to use the LU family.")
+        # SAME CAPACITY GATE AS THE CHARGE BRANCH (2026-08-22).  This route
+        # is the LOCAL plan: a replicated whole-tile eigh over one
+        # ``(q_batch, mu_T, mu_T)`` c128 operand, which is bit-for-bit the
+        # same buffer ``_replicate_rank_truncate_ok`` was written for.  It
+        # was ungated here, so a transverse fit above mu_T ~ 16k resolved
+        # cleanly and then died on the allocation, AFTER the charge fit had
+        # been paid for.  Two conditions, both mirroring the charge branch:
+        #
+        #   nq is None   -> the caller does not know the q-batch (the
+        #                   gw_init pre-flight, which has only the centroid
+        #                   file).  Keep the legacy policy; the ζ-fit call
+        #                   site re-resolves with nq and refuses there.
+        #   replicated_factor_used is False -> distributed_zeta_solve =
+        #                   'distributed' REPLACES this factor with pzheevd
+        #                   and the caller overrides the kind to
+        #                   'distributed_transverse_rank_truncate' on the
+        #                   next statement, so the buffer is never
+        #                   allocated.  Enforcing capacity here would refuse
+        #                   a run on the size of a buffer it does not use --
+        #                   the exact defect the charge branch's own
+        #                   ``replicated_factor_used`` escape was added for.
+        if (nq is not None and n_rmu_logical is not None
+                and replicated_factor_used
+                and not _replicate_rank_truncate_ok(nq, n_rmu_logical)):
+            raise _rank_truncate_capacity_error(
+                nq, n_rmu_logical, channel='transverse')
         return 'transverse_rank_truncate'
     if fam != 'ridge':
         raise ValueError(
@@ -1577,7 +1652,10 @@ def _resolve_solver_kind(
 
     ``n_rmu`` (logical centroid count) and ``nq`` (per-q factor batch =
     ``C_q.shape[0]``) let the charge resolver pick the mesh-invariant
-    replicated dense factor for fit-size stacks; ``charge_zeta_solve``
+    replicated dense factor for fit-size stacks — and, since 2026-08-22,
+    let the TRANSVERSE resolver apply the same replicated-eigh capacity
+    gate (``_rank_truncate_capacity_error``) instead of OOMing late;
+    ``charge_zeta_solve``
     (``'rank_truncate'`` | ``'cholesky'``) then picks the rank-revealing
     eigh pseudo-inverse vs Cholesky on that route.  The ζ-fit caller passes
     all three (``isdf_fitting.fit_zeta_to_h5``).  A concrete ``solver_kind``
@@ -1589,7 +1667,8 @@ def _resolve_solver_kind(
     if int(vertex_mu_L) != 0:
         return _resolve_solver_kind_transverse(
             mesh_xy, distributed_lu, n_rmu_logical=n_rmu,
-            transverse_zeta_solve=transverse_zeta_solve)
+            transverse_zeta_solve=transverse_zeta_solve,
+            nq=nq, replicated_factor_used=replicated_factor_used)
     return _resolve_solver_kind_charge(
         mesh_xy, distributed_cholesky, n_rmu=n_rmu, nq=nq,
         charge_zeta_solve=charge_zeta_solve,
@@ -3986,7 +4065,8 @@ def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
     ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.
     """
     Py = int(mesh_xy.shape['y'])
-    Z_pad, n_cols = pad_last_axis_to(Z_q, Py)
+    _zpad = pad_last_axis_to(Z_q, Py)
+    Z_pad, n_cols = _zpad.array, _zpad.logical   # LOGICAL, by name
     zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(run(Z_pad), mesh_xy)
     if int(Z_pad.shape[-1]) != n_cols:
         return zeta_out[:, :, :n_cols]

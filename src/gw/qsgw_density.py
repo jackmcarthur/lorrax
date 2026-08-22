@@ -95,7 +95,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
-from runtime.padding import pad_axis_to, spec_divisor
+from runtime.padding import pad_axis, spec_divisor
 
 
 __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
@@ -370,7 +370,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    psi, nb_logical = pad_axis_to(psi, p_prod, axis=1)
+    _pad = pad_axis(psi, p_prod, axis=1)
+    psi, nb_logical = _pad.array, _pad.logical   # LOGICAL, by name
     nb_pad = int(psi.shape[1])
     ngkmax = int(psi.shape[3])
 
@@ -551,7 +552,7 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
     """
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    psi, _ = pad_axis_to(psi, p_prod, axis=1)
+    psi = pad_axis(psi, p_prod, axis=1).array
     nb_pad = int(psi.shape[1])
     U = jnp.asarray(U_qp, dtype=jnp.complex128)
     if U.shape[1] != nb_pad or U.shape[2] != nb_pad:
@@ -664,8 +665,8 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     H_j = jnp.asarray(H)
     nb = int(H_j.shape[1])
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    H_j, _ = pad_axis_to(H_j, p_prod, axis=1)
-    H_j, _ = pad_axis_to(H_j, p_prod, axis=2)
+    H_j = pad_axis(H_j, p_prod, axis=1).array
+    H_j = pad_axis(H_j, p_prod, axis=2).array
     nb_pad = int(H_j.shape[1])
     H_j = jax.lax.with_sharding_constraint(
         H_j, NamedSharding(mesh, band_rotation_spec()))
@@ -673,7 +674,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     # interpreted rather than refused.  Hermitise here.
     H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
     if nb_pad != nb:
-        # SENTINEL pad, then drop BY COUNT.  ``pad_axis_to`` zero-fills, so
+        # SENTINEL pad, then drop BY COUNT.  ``pad_axis`` zero-fills, so
         # the pad block is [H 0; 0 0] and the pad eigenvalues are exactly
         # 0.0 — which sort into the MIDDLE of a Ry spectrum whose occupied
         # states are negative.  Two things then go wrong, and only the

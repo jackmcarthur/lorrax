@@ -59,7 +59,7 @@ from .bse_loading import (_BARE_V_FALLBACK_WARNING, _MunuSlabPlan,
                           load_bse_data_from_restart_sharded,
                           restart_munu_full_bz)
 from .bse_window import (PAD_EPS_GUARD_RY, _generate_kpts_grid, _log0,
-                         _pad_axis_to_multiple, _parse_wfn_path,
+                         _parse_wfn_path,
                          apply_eqp_and_reslice_bands, apply_eqp_corrections,
                          n_pad_transitions, pad_zone_mask, pad_zone_mask_np,
                          read_bgw_eqp, resolve_n_occ,

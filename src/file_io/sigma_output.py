@@ -69,11 +69,27 @@ OMEGA_DATASET = "omega_ev"
 OMEGA_REFERENCE_ATTR = "omega_reference_ev"
 OMEGA_REFERENCE_PROVENANCE_ATTR = "omega_reference_provenance"
 
-#: The provenance values the driver stamps.  ``fixed-N mu`` is the metal
-#: path's chemical potential from the fixed-N MP1 solve; ``midgap`` is the
-#: insulating loader convention (``wfn.efermi``, ½(VBM+CBM)).
+#: The EFFECTIVE Sigma broadening the run used, and the value the deck
+#: asked for.  Stamped on the same axis as the reference above and for the
+#: same reason: the deck key `sigma_regularization_ev` is a REQUEST, an
+#: ansatz may raise it to a conditioning floor, and until this stamp
+#: existed the resolved value lived only in a print -- so a cross-ansatz
+#: comparison could not assert that two runs shared xi, only assume it.
+SIGMA_REGULARIZATION_ATTR = "sigma_regularization_ev"
+SIGMA_REGULARIZATION_REQUESTED_ATTR = "sigma_regularization_requested_ev"
+SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR = "sigma_regularization_floor_policy"
+
+#: The provenance values the driver stamps — ONE per ``fermi_reference``
+#: value, and they are produced by ``gw.efermi.resolve_sigma_efermi_ry``
+#: rather than inferred here.  ``fixed-N mu`` is the metal path's chemical
+#: potential from the fixed-N MP1 solve; ``midgap`` is the insulating
+#: loader convention (``wfn.efermi``, ½(VBM+CBM)); ``vbm`` is
+#: ``fermi_reference = vbm``, which used to be indistinguishable from
+#: ``midgap`` in this file because the stamp was derived from "did the
+#: caller pass an explicit reference" rather than from the deck key.
 OMEGA_REFERENCE_FIXED_N_MU = "fixed-N mu"
 OMEGA_REFERENCE_MIDGAP = "midgap"
+OMEGA_REFERENCE_VBM = "vbm"
 
 #: The datasets :func:`write_sigma_omega_h5` creates the file with.  Every
 #: run that writes ``sigma_mnk.h5`` at all writes these, so the appender
@@ -988,6 +1004,7 @@ def write_sigma_omega_h5(
 	star=None,
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
+	sigma_regularization=None,
 	band_extrapolation=None,
 	print_fn=None,
 ):
@@ -1110,6 +1127,19 @@ def write_sigma_omega_h5(
 				OMEGA_REFERENCE_ATTR: float(omega_reference_ev),
 				OMEGA_REFERENCE_PROVENANCE_ATTR: str(
 					omega_reference_provenance or "unstated"),
+			})
+		if sigma_regularization is not None:
+			# The EFFECTIVE broadening, from the same resolver the kernel
+			# ran at (``gw.ppm_windows.resolve_sigma_regularization``) --
+			# re-derived from the config here, not threaded, so the two
+			# cannot disagree by construction.
+			io.stamp_dataset_attrs(OMEGA_DATASET, {
+				SIGMA_REGULARIZATION_ATTR:
+					float(sigma_regularization.resolved_ev),
+				SIGMA_REGULARIZATION_REQUESTED_ATTR:
+					float(sigma_regularization.requested_ev),
+				SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR:
+					str(sigma_regularization.floor_policy),
 			})
 		if star is not None:
 			# The tables live in the same file as the arrays they describe.

@@ -39,6 +39,7 @@ import numpy as np
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
                                     check_band_window)
 from common.collectives import gather_to_host
+from runtime.padding import pad_axis
 
 
 def _log0(*a, **k):
@@ -387,41 +388,6 @@ def write_eigenvectors_stream(
           + ("" if use_tda else " (+ coupling Y)"))
 
 
-def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int,
-                          *, fill: float = 0.0) -> tuple[jax.Array, int]:
-    """Pad ``axis`` up to a multiple of ``multiple``; return (padded, PADDED extent).
-
-    ``fill`` is the value written into the pad zone and it is NOT a
-    detail: ψ must be padded with 0.0 (bilinear ⇒ inert) and ε with
-    ±:data:`PAD_EPS_GUARD_RY` (diagonal of a diagonalisation ⇒ a zero pad
-    is a wrong number).  See the module-level note on the sentinel.  It is
-    keyword-only so that no call site can pick the fill positionally by
-    accident — a mis-signed ε guard puts pad transitions BELOW the onset,
-    which is the failure this parameter exists to make unspellable.
-    """
-    size = x.shape[axis]
-    pad = (-size) % multiple
-    if pad == 0:
-        return x, size
-    pad_width = [(0, 0)] * x.ndim
-    pad_width[axis] = (0, pad)
-    # Return the PADDED extent (size + pad), not the pre-pad size: every
-    # consumer binds this to n_val_pad/n_cond_pad and relies on it being the
-    # mesh-rounded value (e.g. bse_ring_comm's `n_cond_pad % px == 0` guard).
-    # The two differ only when the band count is not already a mesh multiple,
-    # so getting it wrong is invisible on every mesh-divisible deck.
-    #
-    # NOTE the opposite convention to ``runtime.padding.pad_axis_to``,
-    # which returns the LOGICAL extent (n_orig) from the same position.
-    # Two helpers returning different extents from the same slot is how
-    # the bug above happened; do not "unify" them by silently swapping
-    # one — the bundle carries BOTH (``n_val``/``n_cond`` logical,
-    # ``n_val_pad``/``n_cond_pad`` padded) and consumers must name which
-    # they want.  ``tests/test_pad_parity_gates.py`` pins this.
-    return jnp.pad(x, pad_width, mode="constant",
-                   constant_values=fill), size + pad
-
-
 def read_bgw_eqp(eqp_file: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Read a BerkeleyGW ``eqp{0,1}.dat`` — see :func:`gw.eqp_bgw.read_bgw_eqp`.
 
@@ -704,8 +670,6 @@ def apply_eqp_and_reslice_bands(
     eps_c = jnp.asarray(enk_full_np[:, cond_idx])
     # Signed sentinel, as at the loader seam — this REPLACES data['eps_*'],
     # so a zero pad here would re-open the wrong-number path after --eqp.
-    eps_v, _ = _pad_axis_to_multiple(eps_v, axis=1, multiple=grid_y,
-                                     fill=-PAD_EPS_GUARD_RY)
-    eps_c, _ = _pad_axis_to_multiple(eps_c, axis=1, multiple=grid_x,
-                                     fill=PAD_EPS_GUARD_RY)
+    eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
+    eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
     return eps_v, eps_c, n_occ_eff
