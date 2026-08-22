@@ -1653,6 +1653,18 @@ _DEFAULTS = {
     #        ladder kernel's W_R.  Refused against x_only / hl_ppm /
     #        qp_solver = self_consistent / mc_average_placement != off.
     "screening_diagrams": "w_rpa",
+    # w_bse only: probe columns of the mu^2 ladder tile solved per block.
+    # 0 (default) = the whole padded centroid basis in one block — the
+    # historical behaviour, bit-identical for every existing deck.  A
+    # positive value bounds the per-block solve memory; the facade rounds
+    # it up to the mesh 'y'-axis multiple the reduce-scatter snapshot
+    # tiles by.  This is DISPATCH GRANULARITY, not physics: chunking
+    # changes when columns are solved, never their values.  Measured
+    # motivation: with the knob unreachable, the fully relativistic LiF
+    # 666-centroid lift solve attempted one 77.83-GiB block allocation
+    # (JID 57288835), while the same deck at probe_chunk=64 passed every
+    # production-W gate (JID 57280453).
+    "ladder_probe_chunk": 0,
     # BerkeleyGW-compatible first-order Methfessel-Paxton width, in eV.
     # Zero preserves the historical step-occupation path.  The first
     # consumer is the per-iteration QSGW parallel-transport head; the same
@@ -2917,10 +2929,21 @@ class ScreeningConfig:
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
+    # w_bse only — ``bse.w_ladder.compute_wc_qwedge``'s public
+    # ``probe_chunk`` memory knob, threaded through the facade
+    # (``gw.screening_bse._ladder_wedge``).  0 = whole padded basis in
+    # one block (historical).  Deck key: ``ladder_probe_chunk``.
+    ladder_probe_chunk: int = 0
 
     def __post_init__(self):
         if self.occ_broadening_ev < 0.0:
             raise ValueError("occ_broadening must be >= 0 eV.")
+        if int(self.ladder_probe_chunk) < 0:
+            raise ValueError(
+                f"ladder_probe_chunk = {self.ladder_probe_chunk} must be "
+                f">= 0 (0 = the whole padded centroid basis in one probe "
+                f"block; a positive value bounds the per-block ladder "
+                f"solve memory).")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from
         # the pre-minimax era) was accepted here for months and always ran
@@ -4053,6 +4076,7 @@ class LorraxConfig:
             regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
             minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
             diagrams=coerce_screening_diagrams(_g("screening_diagrams")),
+            ladder_probe_chunk=int(_g("ladder_probe_chunk")),
         )
         ppm = PPMConfig(
             model=str(_g("ppm_model")).strip().lower(),

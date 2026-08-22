@@ -610,6 +610,30 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     z = np.asarray(z_list_ry, dtype=np.complex128)
     tol = _GMRES_TOL if gmres_tol is None else float(gmres_tol)
     ceiling = _residual_ceiling(tol)
+    # THREAD THE FACADE'S BOUNDED-MEMORY CONTROL.  ``compute_wc_qwedge``
+    # has always taken a public ``probe_chunk``, but until 2026-08-22 this
+    # facade never passed it, so every production run solved the whole
+    # padded mu^2 tile in one block — a 77.83-GiB single allocation on the
+    # fully relativistic LiF 666-centroid deck (JID 57288835), against a
+    # measured gate-preserving probe_chunk=64 discriminator on the same
+    # deck (JID 57280453).  The deck key is ``ladder_probe_chunk``
+    # (ScreeningConfig); 0 keeps the whole-basis block, bit-identical.
+    # The kernel's contract requires a multiple of the mesh 'y' extent
+    # (the reduce-scatter snapshot tiles the probe axis over 'y'), so a
+    # positive deck value is ROUNDED UP here — a placement change, never a
+    # value change — and announced with its per-block granularity.
+    probe_chunk = None
+    _pc_deck = int(getattr(getattr(config, "screening", None),
+                           "ladder_probe_chunk", 0) or 0)
+    if _pc_deck > 0:
+        _py = int(mesh_xy.devices.shape[1])
+        probe_chunk = ((_pc_deck + _py - 1) // _py) * _py
+        print_fn(
+            f"  w_bse: ladder_probe_chunk={_pc_deck}"
+            + (f" rounded up to {probe_chunk} (mesh 'y'={_py} multiple)"
+               if probe_chunk != _pc_deck else "")
+            + f" — probe columns solved {probe_chunk} per block instead "
+              f"of the whole padded basis in one allocation")
     with timing.section("gw_jax.w_ladder", announce=True,
                         label=f"W ladder resolvent ({z.size} z, "
                               f"include_w={include_w})"):
@@ -634,6 +658,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
         wedge = compute_wc_qwedge(
             tensors_filename, z, mesh_xy, include_w=include_w,
             gmres_tol=tol, gmres_max_iter=_GMRES_MAX_ITER,
+            probe_chunk=probe_chunk,
             input_file=input_file, **head_kwargs)
     resid = _wedge_field(wedge, _RESIDUAL_FIELDS, np.float64)
     iters = _wedge_field(wedge, _ITERATION_FIELDS, np.int64)
