@@ -353,27 +353,48 @@ def _check_dipole_coverage(
 
 
 def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
-    """``(nval, ncond, nband)`` the way ``psp.get_dipole_mtxels`` derives it.
+    """``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal.
 
-    Mirrors the writer's own derivation (``get_dipole_mtxels.main``:
-    ``nval``/``ncond`` default 5, ``nband`` defaults to
-    ``max(wfn.nbands, nelec + ncond)`` and honours an explicit ``nband``),
-    because the provenance stamp records exactly those three numbers and
-    the check is only meaningful if the reader reconstructs them the same
-    way.  Kept as a named helper so the mirroring is visible and greppable
-    rather than inlined into the head path.
+    THE THREE NUMBERS ARE READ, NEVER INVENTED.  This helper used to default
+    ``nval``/``ncond`` to 5 and ``nband`` to ``max(wfn.nbands, nelec+ncond)``,
+    on the stated grounds that it "mirrors the writer".  The writer resolves
+    those defaults against the DECK; this side only ever saw
+    ``config.head`` — a six-key dict with no band window in it — so the
+    defaults were not a mirror, they were the only thing the comparison ever
+    used.  Measured on the MoS2 production deck (JID 57269074): a dipole.h5
+    generated from the very same WFN and deck reported
+    ``file=26/26/600`` against an invented ``run=5/5/610``, and under
+    ``LORRAX_SANITY=strict`` that false warning is an unconditional refusal
+    of a correct file.
+
+    So an ABSENT field is a refusal, not a guess.  A provenance check whose
+    reference is fabricated cannot fail for the reason it claims and cannot
+    pass for one either — it is the class of check
+    ``TASTE.md``/"a check that cannot fail is not evidence" is about.  The
+    one supported caller (:class:`HeadResolver`) carries the resolved
+    ``config.nval``/``config.ncond``/``config.nband``; a direct caller must
+    do the same.
+
+    ``wfn`` is retained for the refusal message only — it is what makes the
+    "which numbers were missing, and what would they have been" line
+    actionable — and is deliberately NOT consulted for a value.
     """
-    nval = int(params.get("nval", 5))
-    ncond = int(params.get("ncond", 5))
-    try:
-        nband_param = params.get("nband", None)
-        if nband_param is None:
-            nband = max(int(wfn.nbands), int(wfn.nelec) + ncond)
-        else:
-            nband = int(nband_param)
-    except Exception:
-        nband = max(int(wfn.nbands), int(wfn.nelec) + ncond)
-    return nval, ncond, nband
+    missing = [k for k in ("nval", "ncond", "nband")
+               if params.get(k) is None]
+    if missing:
+        raise ValueError(
+            f"dipole provenance: the run's band window is missing "
+            f"{', '.join(missing)} — the checker was handed a params dict "
+            f"that carries no band window (got keys "
+            f"{sorted(str(k) for k in params)}).  These three numbers are "
+            f"the reference the file's prov_nval/prov_ncond/prov_nband "
+            f"stamps are compared against; defaulting them to 5/5/"
+            f"max(wfn.nbands={int(getattr(wfn, 'nbands', 0) or 0)}, ...) "
+            f"made the comparison invent its own reference and accuse every "
+            f"correctly-stamped file whose deck is not 5/5.  Pass the "
+            f"resolved config window (gw.head_correction.HeadResolver does "
+            f"this from config.nval/config.ncond/config.nband).")
+    return (int(params["nval"]), int(params["ncond"]), int(params["nband"]))
 
 
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
@@ -396,6 +417,11 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     ``LORRAX_SANITY=strict`` — and is gated on ``sanity_enabled()`` like
     its sibling.  An UNSTAMPED file (written before the guard) reports as
     unverifiable and does not fail the run.
+
+    A caller that supplies no band window is refused outright by
+    :func:`_dipole_window_from_params` (a code defect, not a deck error):
+    an invented reference makes this check accuse correct files and vouch
+    for nothing.
     """
     from common import sanity
 
