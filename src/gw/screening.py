@@ -37,7 +37,7 @@ import numpy as np
 import jax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common import jax_profile
+from common import collectives, jax_profile
 import common.timing as timing
 from .gw_config import (
     ComputeMode, ScreeningDiagrams, coerce_screening_diagrams, env_bool,
@@ -555,6 +555,29 @@ def compute_screening(
 
     Caller is responsible for matching roles to its Σ build's
     expectations; an unrequested role lookup is a KeyError.
+
+    LIVE-SET BOUND ACROSS ROLES.  Each role's χ₀ build (the
+    ``minimax_tau_integrate_chi`` τ-scan in ``gw.w_isdf``) needs an
+    ``O(nq·μ²/P)`` scratch arena that is legitimately unchunked over q —
+    the flat-k FFT it runs needs the whole q/k axis local on every rank —
+    and is therefore the same size for every role regardless of τ-node
+    count (a `lax.scan`'s compiled buffer graph is trip-count-independent).
+    An EARLIER role's completed W must not still be a live on-device array
+    while a LATER role pays that cost: measured on the production 9x9x1
+    deck, the static role's chi0 build/Dyson solve completed and the
+    probe role's IDENTICAL build then OOM'd with the static role's W still
+    resident (KNOWN_LORRAX_ISSUES.md, "GN-PPM probe chi0 has no bounded
+    two-role live-set plan at 81 q", 2026-08-20; exact repeated request
+    27,262,284,032 B on two independent jobs).  So every role's W but the
+    LAST is spilled to host RAM (:func:`common.collectives.spill_to_host`)
+    the moment its own gate passes, and restored
+    (:func:`~common.collectives.restore_from_host`) only after every
+    requested role has been built — a role-serialized schedule, not a
+    q-chunked χ₀ kernel (which the FFT constraint above rules out short of
+    redesigning the flat-k FFT service).  Bit-exact: a host round trip
+    moves bits, it does not touch them.  A single-role scheme (e.g.
+    COHSEX) never spills — the loop only ever holds ONE role at a time
+    regardless.
     """
     from .minimax_screening import (
         build_imag_quadrature,
@@ -624,7 +647,21 @@ def compute_screening(
     bar = LoopProgress(
         len(requests), print_fn,
         title="screening (chi0 -> W)", item_name="W role").start()
-    for req in requests:
+    n_requests = len(requests)
+
+    def _store_role(role: str, idx: int, W: jax.Array) -> None:
+        """Bound the cross-role live set (see the docstring's LIVE-SET
+        BOUND note): every role's gated W but the LAST is immediately
+        spilled to host RAM, freeing its device buffer before the NEXT
+        role's chi0/W build can compete with it for HBM.  Restored
+        uniformly, after the whole loop, right before this function
+        returns."""
+        if idx == n_requests - 1:
+            W_by_role[role] = W
+        else:
+            W_by_role[role] = collectives.spill_to_host(W)
+
+    for idx, req in enumerate(requests):
         _w = f"W[{req.role}]"
         if req.role == "static":
             if fused_plan is not None:
@@ -649,7 +686,7 @@ def compute_screening(
             with timing.section("W.gate"):
                 _gate_w(W_static, req, print_fn=print_fn,
                         kgrid=tuple(meta.kgrid))
-            W_by_role[req.role] = W_static
+            _store_role(req.role, idx, W_static)
             bar.step()
             continue
         # Pick imag or real axis by which component of ω is non-zero.
@@ -675,7 +712,7 @@ def compute_screening(
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate"):
                 _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
-            W_by_role[req.role] = W
+            _store_role(req.role, idx, W)
             bar.step()
             continue
         if on_imag:
@@ -707,10 +744,18 @@ def compute_screening(
             head_channel=head_channel)
         with timing.section("W.gate"):
             _gate_w(W, req, print_fn=print_fn)
-        W_by_role[req.role] = W
+        _store_role(req.role, idx, W)
         bar.step()
 
     bar.finish()
+    # Restore anything spilled during the loop.  Every entry is spilled at
+    # most once (the last role's W never was), so this is at most
+    # ``n_requests - 1`` host round trips — negligible beside the χ₀/W
+    # compute they guard, and zero for a single-role scheme.
+    with timing.section("W.restore_spilled_roles"):
+        for role, val in W_by_role.items():
+            if isinstance(val, collectives.HostSpill):
+                W_by_role[role] = collectives.restore_from_host(val)
     return W_by_role
 
 
