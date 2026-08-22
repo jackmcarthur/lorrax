@@ -71,7 +71,7 @@ from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver, ScreeningDiagrams,
 	refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
-                      check_band_sum_degeneracy)
+                      check_band_sum_degeneracy, resolve_zeta_fit_edge)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import (
@@ -316,7 +316,14 @@ def main(argv=None):
 	# split deck and an unsplit one at the larger count print the same
 	# number.  Printed here, above the ζ fit, because this is where the
 	# window it is about is decided.
-	print0(f"  {config.bands.describe()}")
+	# RESOLVED, not requested: ``config.zeta_nband`` is a logical deck count
+	# and the edge the fit gets is measured against the PADDED ``b4``.  This
+	# banner used to print "sized for 700 bands" on a deck whose resolver and
+	# memory planner were both acting on 160 (gw_init.resolve_zeta_fit_edge is
+	# the one place that comparison is made).
+	zeta_fit_edge = resolve_zeta_fit_edge(
+		band_slices, getattr(config, "zeta_nband", None))
+	print0(f"  {config.bands.describe(zeta_fit_edge)}")
 	if config.bands.split:
 		print0(f"    chi0/W sums bands [{band_slices.b0}, "
 		       f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "

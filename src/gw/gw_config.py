@@ -2093,21 +2093,40 @@ class BandCounts:
         """True when the two consumers were given DIFFERENT counts."""
         return self.chi != self.sigma
 
-    def describe(self) -> str:
+    def describe(self, zeta_fit_edge: int | None = None) -> str:
         """The one line a run logs so the ``max`` is never silent.
 
         Named in the brief that asked for the split: "log which count won the
         ``max`` and what the fit was built for.  A silent ``max`` is the kind
         of thing that gets mis-debugged for a day."
+
+        ``zeta_fit_edge`` IS THE RESOLVED EDGE, NOT THE DECK KEY.  Pass
+        ``gw.gw_init.resolve_zeta_fit_edge(band_slices, config.zeta_nband)``
+        — the same value the fit, the window gates and the memory planner
+        act on.  ``None`` means "nothing narrows it", i.e. the fit really is
+        sized by :attr:`isdf`.
+
+        A BANNER PRINTS RESOLVED VALUES ONLY.  With ``nband=700`` and
+        ``zeta_nband=160`` this line used to say "ISDF zeta fit sized for 700
+        bands ... the fit spans both" while the resolver and the memory
+        planner were both acting on 160 (the CrI3 rank floor fell 180 -> 84
+        on that key).  A startup-only run was then left with a materially
+        false provenance line and no way to tell.  Perlmutter smoke step
+        57236676.2,
+        ``runs/CrI3/00_fm_331_991_700b_qsgw_gnppm_20260818/00_lorrax_smoke_p4/``.
         """
+        if zeta_fit_edge is not None and int(zeta_fit_edge) != int(self.isdf):
+            fit = (f"ISDF zeta fit sized for {int(zeta_fit_edge)} bands, "
+                   f"NARROWED from {self.isdf} by deck key zeta_nband")
+        else:
+            fit = f"ISDF zeta fit sized for {self.isdf} bands"
         if not self.split:
-            return (f"band counts: chi = sigma = {self.chi}; ISDF zeta fit "
-                    f"sized for {self.isdf} bands (the two counts are TIED, "
-                    f"so the fit spans both)")
-        return (f"band counts: chi = {self.chi}, sigma = {self.sigma}; ISDF "
-                f"zeta fit sized for {self.isdf} bands, SET BY "
-                f"number_bands_{self.isdf_source} (the larger); the smaller "
-                f"count ({min(self.chi, self.sigma)}) does NOT size the fit")
+            return (f"band counts: chi = sigma = {self.chi}; {fit} (the two "
+                    f"counts are TIED, so the band sums are the same window)")
+        return (f"band counts: chi = {self.chi}, sigma = {self.sigma}; {fit}"
+                f" — the max is SET BY number_bands_{self.isdf_source} (the "
+                f"larger); the smaller count ({min(self.chi, self.sigma)}) "
+                f"does NOT size the fit")
 
 
 #: The umbrella key and its transitional alias, canonical spelling first.
@@ -4409,13 +4428,25 @@ class LorraxConfig:
         if not isinstance(_bands, BandCounts):
             _bands = resolve_band_counts(params)
 
-        # ζ-fit window top.  Empty / unset / equal-to-the-ISDF-top all collapse
-        # to None — "follow the loaded window" — so the decoupled branch in
-        # ``gw.gw_init.fit_zeta`` is not entered at all and the fit is
-        # bit-identical (b4 is the PADDED edge; a redundant zeta_nband=nband
-        # must not silently un-pad it).  The bound is ``bands.isdf``, i.e.
-        # max(chi, sigma): that is the window the ψ is loaded over and so the
-        # only window there is anything to fit inside.
+        # ζ-fit window top.  Empty / unset collapse to None — "follow the
+        # loaded window".  An EXPLICIT value is stored verbatim, INCLUDING one
+        # that equals ``bands.isdf``.
+        #
+        # WHY IT IS NO LONGER ERASED HERE (2026-08-22).  This used to rewrite
+        # ``zeta_nband == bands.isdf`` to None, reasoning that a redundant
+        # restatement of the default must take the default path "pad and all".
+        # It is not redundant, because ``bands.isdf`` is the LOGICAL count and
+        # the edge the fit actually gets is ``BandSlices.b4`` — that count
+        # ROUNDED UP to the world size.  On P=4 a scalar-Si deck with
+        # ``nband = zeta_nband = 14`` silently fitted [0,16) and then refused,
+        # correctly, because band 16 cuts a multiplet; the deck had asked for
+        # 14 and no banner ever said otherwise (JID 57152792,
+        # runs/Si_scalar/11_scalar_v_rootcause_20260817/).
+        #
+        # The collapse still exists — it just happens where the padded edge is
+        # known, in ``gw.gw_init.resolve_zeta_fit_edge``, which is also the one
+        # place the banner and the three fit-window consumers read.  A deck
+        # whose ``nband`` already divides the world size is unchanged.
         _zeta_nband_raw = _g("zeta_nband")
         if _zeta_nband_raw in (None, ""):
             _zeta_nband = None
@@ -4433,8 +4464,6 @@ class LorraxConfig:
                     f"number_bands (or whichever of number_bands_chi / "
                     f"number_bands_sigma is the larger) if you want more "
                     f"bands in the fit AND in the band sum that owns them.")
-            if _zeta_nband == _bands.isdf:
-                _zeta_nband = None
 
         resolved = cls(
             # Top-level: system + mode flags
