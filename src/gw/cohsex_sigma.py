@@ -14,6 +14,22 @@ The driver entry :func:`compute_cohsex_sigma` builds all three
 contributions from a wavefunction bundle and flat-q V / W and returns
 them as a dict.  Static head correction (q→0 band-diagonal terms) is
 optional and applied to SX/COH (and to the bare-X pass separately).
+
+Two-face carrier (``low_mem_bands = true``, ``wfns.layout == "face"``):
+:func:`_make_cohsex_kernels` dispatches to
+:func:`_make_cohsex_kernels_legacy` (the exact pre-existing body,
+untouched) or :func:`_make_cohsex_kernels_face`, which builds G via
+``greens_function_kernel.build_G(layout="face")``, projects via
+``common.contract_bands.contract_bands_block_reshard(layout="face")``
+(through ``wavefunction_bundle.project``), and gives Hartree its OWN
+dedicated planned GEMM (V_H is diagonal-in-μ, not a general (μ,ν)
+operator).  Face kernels return the FULL nb_full×nb_full matrix — a
+legal face band axis cannot be sliced to the σ window (report §3) — so
+:func:`compute_cohsex_sigma`/:func:`compute_v_h_sigma_x` gather to
+replicated FIRST and window to nb_sigma second, the opposite order from
+legacy's own (window-then-gather) sequence; see the guide,
+``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``, and
+``claims/0428.md`` for the real-CUDA parity gate.
 """
 from __future__ import annotations
 
@@ -142,24 +158,62 @@ def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
 # PPM sigma use the same factory pattern.
 # ---------------------------------------------------------------------------
 
+def _face_kwargs(wfns) -> dict:
+    """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
+    ``face_shape`` kwargs :func:`_make_cohsex_kernels` needs under
+    ``layout='face'`` — read off ``psi_mun``'s own shape rather than
+    threaded in by every call site, since the bundle already carries it.
+    """
+    if wfns.layout != "face":
+        return {}
+    nk, s, mu, n = wfns.psi_mun.shape
+    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, s)}
+
+
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 
 
-def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int):
+def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+                         nk_tot: int, *, layout: str = "legacy",
+                         face_shape=None):
     """Cached factory: returns (sigma_sx, sigma_coh, hartree) jit'd kernels.
 
-    Keyed on (id(mesh_xy), kgrid, ffi_dial_key()) — same shape the chi0 /
-    ppm_sigma kernel caches use.  The ``ffi_dial_key()`` component is
-    load-bearing: the ``make_flat_k_*`` factories below read
-    ``LORRAX_FFT_FFI`` at FACTORY time, so without the dials in the key a
-    mid-process flag flip would serve a kernel built for the stale backend
-    (the flat-k FFT service contract, ``docs/dev/flat_k_fft_service.md``).
-    ``nk_tot`` = prod(kgrid) and is redundant for cache-lookup purposes; it
-    stays as a positional arg because the Hartree kernel closes over it as
-    a compile-time constant.
+    Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
+    same shape the chi0 / ppm_sigma kernel caches use, extended with the
+    two-face carrier's static layout tag (report §5: a static tag
+    SPECIALIZES a kernel build rather than branching a compiled one).
+    The ``ffi_dial_key()`` component is load-bearing: the
+    ``make_flat_k_*`` factories below read ``LORRAX_FFT_FFI`` at FACTORY
+    time, so without the dials in the key a mid-process flag flip would
+    serve a kernel built for the stale backend (the flat-k FFT service
+    contract, ``docs/dev/flat_k_fft_service.md``).  ``nk_tot`` =
+    prod(kgrid) and is redundant for cache-lookup purposes; it stays as a
+    positional arg because the Hartree kernel closes over it as a
+    compile-time constant.
+
+    ``layout='face'`` requires ``face_shape=(nk, nb_full, n_rmu,
+    nspinor)`` — the two ``distrib_la.gemm_plan``s this branch builds
+    (one for G, one dedicated to Hartree's diagonal-weight contraction,
+    plus the two inside the shared projector) need their shapes fixed
+    EAGERLY, here, once — never inside ``sigma_sx``/``sigma_coh``/
+    ``hartree``'s own ``@jax.jit`` bodies, which is exactly what caching
+    this whole factory buys.
     """
+    if layout not in ("legacy", "face"):
+        raise ValueError(
+            f"_make_cohsex_kernels: layout must be 'legacy' or 'face', "
+            f"got {layout!r}")
+    if layout == "face" and face_shape is None:
+        raise ValueError(
+            "_make_cohsex_kernels(layout='face') requires "
+            "face_shape=(nk, nb_full, n_rmu, nspinor)")
+    # Both checked BEFORE any FFT/FFI setup below — a bad layout argument
+    # or a missing face_shape fails fast and cleanly rather than surfacing
+    # as an unrelated FFI probe error from work that was about to be
+    # thrown away anyway.
     from ffi import ffi_dial_key
-    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key())
+    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
+                layout, face_shape)
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
@@ -176,6 +230,21 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
         G_R = _G_ifftn(G_k)
         V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
         return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+
+    if layout == "legacy":
+        kernels = _make_cohsex_kernels_legacy(_convolve, nk_tot)
+    else:
+        kernels = _make_cohsex_kernels_face(
+            mesh_xy, nk_tot, face_shape, _convolve)
+
+    _cohsex_kernel_cache[cache_key] = kernels
+    return kernels
+
+
+def _make_cohsex_kernels_legacy(_convolve, nk_tot):
+    """The exact pre-``low_mem_bands`` kernel bodies.  UNTOUCHED — moved
+    verbatim out of :func:`_make_cohsex_kernels` so that function could
+    gain a layout dispatch without disturbing this branch at all."""
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q):
@@ -230,7 +299,142 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
             'kmsx,x,knsx->kmn',
             jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
 
-    _cohsex_kernel_cache[cache_key] = (sigma_sx, sigma_coh, hartree)
+    return sigma_sx, sigma_coh, hartree
+
+
+def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
+                              _convolve):
+    """Face-layout kernel bodies.
+
+    G and Σ-projection route through the two owning modules'
+    ``layout='face'`` branches (``greens_function_kernel.build_G``,
+    ``common.contract_bands.contract_bands_block_reshard`` via
+    ``wavefunction_bundle.project``); Hartree gets its OWN dedicated
+    planned GEMM (below) because ``V_H`` is diagonal-in-μ, not a general
+    (μ,ν) operator — routing it through the general two-GEMM projector
+    would materialise a needless dense diag(Vρ) operand.  Every
+    ``distrib_la.gemm_plan`` used by any of the three kernels below is
+    built HERE, once, eagerly — see :func:`_make_cohsex_kernels`'s
+    docstring.
+
+    None of the three kernels windows its OWN output to the σ band count:
+    ``psi_nmu``/``psi_mun`` cover the full loaded extent, and slicing a
+    2-D-sharded band axis to an arbitrary (non-mesh-divisible) window is
+    exactly the illegal operation report §3 names.  Each returns the FULL
+    (nk, nb_full, nb_full) matrix, still ``P(None,'x','y')``; the caller
+    (:func:`compute_cohsex_sigma` / :func:`compute_v_h_sigma_x`) gathers
+    it to replicated FIRST (legal at any size — the same gather legacy
+    already pays for its smaller ``nb_sigma``-windowed result) and only
+    THEN takes the ``[:nb_sigma, :nb_sigma]`` sub-block, a plain slice of
+    a replicated array with no divisibility constraint at all.  This is
+    the bring-up path's named cost (report §3): every face Σ call does
+    the FULL nb_full×nb_full GEMM work, not the windowed nb_sigma one.
+    """
+    from distrib_la import gemm_plan
+    from common.contract_bands import (contract_bands_block_reshard,
+                                       merge_spin_centroid)
+
+    nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    mu_s = n_rmu * ns
+
+    g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
+                       dtype=jnp.complex128)
+    proj_fn = contract_bands_block_reshard(
+        mesh_xy, layout="face", face_shape=face_shape)
+    hartree_plan = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
+                             dtype=jnp.complex128)
+
+    def _occ_diag_full(Gij, nb_sigma):
+        """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
+        nb_full) COMPLEX weight vector, zero-padded outside [0,
+        nb_sigma).  Every production Gij (integer or diag(f),
+        :func:`build_Gij`) is diagonal by construction — obstacle #4's
+        "carry the occupation vector as the common path".  This reads
+        that diagonal rather than doing the O(nb_sigma^2) contraction the
+        face path exists to avoid; it does not detect a genuinely dense
+        (off-diagonal) Gij, which :func:`greens_function_kernel.build_G`
+        already refuses by name for face layout before this is reached
+        (``sigma_sx``/``hartree`` below never pass a dense Gij to it —
+        they consume only this diagonal)."""
+        if nb_sigma > nb_full:
+            raise ValueError(
+                f"_make_cohsex_kernels_face: nb_sigma={nb_sigma} exceeds "
+                f"nb_full={nb_full}")
+        diag = jnp.diagonal(Gij, axis1=1, axis2=2)   # (nk, nb_sigma)
+        return jnp.pad(diag, ((0, 0), (0, nb_full - nb_sigma)))
+
+    @jax.jit
+    def sigma_sx(wfns, Gij, W_q):
+        s = wfns.slices
+        phases = _occ_diag_full(Gij, s.nb_sigma)
+        G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
+                        layout="face", gemm=g_plan)
+        return _project(wfns.psi_nmu, wfns.psi_mun,
+                        _convolve(G_occ, W_q, 1.0),
+                        layout="face", face_project_fn=proj_fn)
+
+    @partial(jax.jit, static_argnames=("ri_bands",))
+    def sigma_coh(wfns, W_q, V_q, *, ri_bands=None):
+        s = wfns.slices
+        bands = (s.sigma_sum if ri_bands is None
+                 else slice(int(ri_bands[0]), int(ri_bands[1])))
+        mask = wfns.band_mask(bands).astype(jnp.complex128)
+        G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
+                       layout="face", gemm=g_plan)
+        return _project(wfns.psi_nmu, wfns.psi_mun,
+                        _convolve(G_ri, W_q - V_q, -0.5),
+                        layout="face", face_project_fn=proj_fn)
+
+    @jax.jit
+    def hartree(wfns, Gij, V_q):
+        """Local band-weighted density + psum over the band mesh axis,
+        a distributed V-ρ matvec, then the canonical face projection —
+        specialised to a diagonal-in-μ weight rather than a full O
+        operator (see this function's docstring)."""
+        s = wfns.slices
+        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma)).astype(jnp.float64)
+        psi_mun, psi_nmu = wfns.psi_mun, wfns.psi_nmu
+
+        # Local band-weighted density: |psi_mun|^2 * occ, summed over k
+        # (replicated) and s (replicated) locally, and over n — which
+        # sits on the 'y' mesh axis, so this last reduction is a genuine
+        # cross-rank psum (XLA inserts it automatically for a jnp.sum
+        # over a sharded axis, exactly as legacy's own einsum already
+        # relies on for its μ-axis contractions elsewhere in this file).
+        dens = jnp.sum(jnp.abs(psi_mun) ** 2 * occ[:, None, None, :],
+                       axis=(0, 1, 3))
+        rho = dens / jnp.asarray(nk_tot, dtype=jnp.float64)
+        rho = jax.lax.with_sharding_constraint(
+            rho, NamedSharding(mesh_xy, P("x")))
+
+        # Distributed V-rho matvec.  rho is only known on its OWN 'x'
+        # shard; V0's second index needs it 'y'-sharded, which is a
+        # cross-rank layout change (gather to replicated, then a free
+        # local re-slice) — genuinely two collectives, named rather than
+        # hidden, the "distributed" half of "distributed V-rho matvec".
+        rho_rep = jax.lax.with_sharding_constraint(
+            rho, NamedSharding(mesh_xy, P(None)))
+        rho_y = jax.lax.with_sharding_constraint(
+            rho_rep, NamedSharding(mesh_xy, P("y")))
+        V0 = V_q[0]
+        Vrho = jnp.einsum("xy,y->x", V0, rho_y.astype(V0.dtype),
+                          optimize=True)
+        Vrho = jax.lax.with_sharding_constraint(
+            Vrho, NamedSharding(mesh_xy, P("x")))
+
+        # Vrho is needed on 'y' to weight psi_nmu's own mu axis (native
+        # 'y') — the SAME gather-then-reslice pattern as rho above.
+        Vrho_rep = jax.lax.with_sharding_constraint(
+            Vrho, NamedSharding(mesh_xy, P(None)))
+        Vrho_y = jax.lax.with_sharding_constraint(
+            Vrho_rep, NamedSharding(mesh_xy, P("y")))
+
+        weighted = (jnp.conj(psi_nmu)
+                   * Vrho_y.astype(psi_nmu.dtype)[None, None, None, :])
+        A = merge_spin_centroid(weighted, 2, 3)   # (nk, n, mu*s)
+        B = merge_spin_centroid(psi_mun, 1, 2)    # (nk, mu*s, n)
+        return hartree_plan(A, B)                  # (nk, n, n) == Sigma_H
+
     return sigma_sx, sigma_coh, hartree
 
 
@@ -349,7 +553,7 @@ def compute_cohsex_sigma(
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
     sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
-        mesh_xy, kgrid, nk_tot)
+        mesh_xy, kgrid, nk_tot, **_face_kwargs(wfns))
 
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
@@ -357,13 +561,36 @@ def compute_cohsex_sigma(
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
         sig_coh = sigma_coh_k(wfns, W_q, V_q)
         sig_h   = hartree_k(wfns, Gij, V_q)
-        sig_sx, sig_coh = _add_static_head(
-            sig_sx, sig_coh,
-            static_head_terms=static_head_terms,
-            meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
-        sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
-        sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
-        sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
+        if wfns.layout == "legacy":
+            # UNCHANGED — add the head to the kernel's own nb_sigma-sized
+            # result, THEN gather.  Do not reorder this branch.
+            sig_sx, sig_coh = _add_static_head(
+                sig_sx, sig_coh,
+                static_head_terms=static_head_terms,
+                meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
+            sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
+            sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
+            sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
+        else:
+            # Face kernels return the FULL nb_full x nb_full matrix, still
+            # 2-D sharded (_make_cohsex_kernels_face's docstring): gather
+            # to replicated FIRST (legal at any size), THEN window to
+            # nb_sigma (a plain slice of a replicated array — no
+            # divisibility constraint), THEN add the (nb_sigma-shaped)
+            # head.  Reversing legacy's order is required here, not a
+            # stylistic choice: adding an nb_sigma head to an nb_full
+            # array would be a shape error.
+            nb_sigma = wfns.slices.nb_sigma
+            sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
+            sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
+            sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
+            sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
+            sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
+            sig_h   = sig_h[:, :nb_sigma, :nb_sigma]
+            sig_sx, sig_coh = _add_static_head(
+                sig_sx, sig_coh,
+                static_head_terms=static_head_terms,
+                meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
         sig_sx.block_until_ready()
         sig_coh.block_until_ready()
         sig_h.block_until_ready()
@@ -372,6 +599,11 @@ def compute_cohsex_sigma(
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
+        if wfns.layout == "face":
+            # Gather + window BEFORE the (nb_sigma-shaped) head — see the
+            # same reasoning in the sig_sx/sig_coh block above.
+            sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+            sig_x = sig_x[:, : wfns.slices.nb_sigma, : wfns.slices.nb_sigma]
         if static_head_terms is not None:
             x_head, _ = static_head_terms_to_kij(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
@@ -387,6 +619,15 @@ def compute_cohsex_sigma(
         # or ``bispinor_v_q_path`` is missing.  See
         # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and bispinor_v_q_path is not None:
+            if wfns.layout == "face":
+                raise NotImplementedError(
+                    "compute_cohsex_sigma: bispinor transverse exchange is "
+                    "not ported for layout='face' (envelope: "
+                    "bispinor=true refuses — gw.sigma_x_bispinor hard-codes "
+                    "the legacy psi_xn/psi_yr accessors).  This should "
+                    "already be unreachable via gw_init's own bispinor + "
+                    "low_mem_bands guard; refusing here too as a defensive "
+                    "backstop for a direct caller.")
             from .sigma_x_bispinor import compute_sigma_x_bispinor
             with mesh_xy:
                 sig_x_b = compute_sigma_x_bispinor(
@@ -444,7 +685,7 @@ def compute_v_h_sigma_x(
     """
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot))
+        mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
     with mesh_xy:
@@ -452,6 +693,13 @@ def compute_v_h_sigma_x(
         sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_h = jax.lax.with_sharding_constraint(sig_h, rep)
         sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        if wfns.layout == "face":
+            # Full nb_full x nb_full -> nb_sigma window, legal now that
+            # both are replicated — see compute_cohsex_sigma's identical
+            # reasoning.
+            nb_sigma = wfns.slices.nb_sigma
+            sig_h = sig_h[:, :nb_sigma, :nb_sigma]
+            sig_x = sig_x[:, :nb_sigma, :nb_sigma]
         sig_h.block_until_ready()
         sig_x.block_until_ready()
 
@@ -466,6 +714,11 @@ def compute_v_h_sigma_x(
         sig_x.block_until_ready()
 
     if wfns_transverse is not None and bispinor_v_q_path is not None:
+        if wfns.layout == "face":
+            raise NotImplementedError(
+                "compute_v_h_sigma_x: bispinor transverse exchange is not "
+                "ported for layout='face' — see compute_cohsex_sigma's "
+                "identical refusal.")
         from .sigma_x_bispinor import compute_sigma_x_bispinor
         with mesh_xy:
             sig_x_b = compute_sigma_x_bispinor(
