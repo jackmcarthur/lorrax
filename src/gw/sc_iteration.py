@@ -3964,8 +3964,13 @@ def dump_sigma_omega_h5_final(
         # re-centred eqp1's linearization at E_DFT, which is a different
         # calculation.  Relative to this cube's own omega reference, one
         # subtraction, the same one the finalize made.
+        # Both halves or neither: the relative spectrum is meaningless
+        # without the reference it is relative to, and a half-stamped file
+        # would be worse than an unstamped one -- a reader cannot tell that
+        # the zero is missing.
         eval_energies_rel_ev=(
-            None if sigma_result.e_eval_ev is None
+            None if (sigma_result.e_eval_ev is None
+                     or sigma_result.efermi_dft_ev is None)
             else np.asarray(sigma_result.e_eval_ev, dtype=np.float64)
             - float(sigma_result.efermi_dft_ev)),
         eval_energies_provenance="self_consistent_qp",
