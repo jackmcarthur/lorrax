@@ -46,11 +46,34 @@ def _haar(rng, n):
     return q * (phase / np.abs(phase))[None, :]
 
 
-def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatch):
-    """Rank-0 metadata must not be sent through SlabIO's slab API."""
+def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
+    """The stamps come through ONE handle, and it is not a second HDF5 stack.
+
+    THIS TEST HAS BEEN WRONG TWICE, in opposite directions, and both
+    spellings are worth naming because the property is easy to state and
+    easy to pin badly.
+
+    * It first asserted the stamps do NOT go through ``SlabIO.read_slab``.
+      True, and for a reason the assertion could not see: a scalar HDF5
+      dataspace has no hyperslab, so ``read_slab(shape=())`` refuses at
+      ``_normalize_slab_request`` before a byte moves — which is why this
+      loader could not read ANY ``parallel_transport.h5``.
+    * It then pinned the repair of the day, a short-lived serial-h5py
+      owner opened and closed ahead of SlabIO, by faking ``sys.modules
+      ["h5py"]``.  Correct about ordering, and still a SECOND HDF5 library
+      instance on a file the FFI wrote — the cohabitation class audit A1
+      exists to retire, and the route the PHDF5-only ruling forbids.
+
+    What it pins now is the property rather than either implementation:
+    every stamp arrives through ``SlabIO.read_small`` on the SAME
+    read-only handle the payload uses, ``read_slab`` is never handed an
+    empty shape, and ``h5py`` is never opened at all.  The fixture makes
+    the last one checkable by installing an h5py whose ``File`` raises.
+    """
     import sys
 
     from common import parallel_transport as pt_common
+    import file_io.slab_io as slab_io_mod
     from file_io.parallel_transport import SCHEMA_VERSION
 
     fingerprint = "a" * 64
@@ -60,6 +83,9 @@ def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatc
             "schema_version": SCHEMA_VERSION,
             "connection_complete": 1,
             "velocity_validation_complete": 1,
+            # The refusal this fixture drives: validation did not pass, so
+            # the loader must raise BEFORE reading the (3, nk, nb, nb)
+            # payload.  That ordering is the second thing under test.
             "velocity_validation_passed": 0,
             "band_start": 0,
             "band_stop": 8,
@@ -91,34 +117,65 @@ def test_pt_loader_reads_rank_zero_metadata_before_validation_refusal(monkeypatc
         }
     )
 
-    class _Dataset:
-        def __init__(self, value):
-            self.value = value
+    opens = []
+    small_reads = []
 
-        def __getitem__(self, key):
-            assert key == ()
-            return self.value
-
-    class _File:
-        def __init__(self, path, mode):
+    class _FakeSlabIO:
+        def __init__(self, path, *, mode="w", mesh=None):
             assert path == "parallel_transport.h5"
-            assert mode == "r"
+            assert mode == "r", (
+                "the head loader must open the artifact READ-ONLY; a "
+                "writable handle is what made the introspect refuse")
+            assert mesh is not None
+            opens.append((path, mode))
 
         def __enter__(self):
-            return {name: _Dataset(value) for name, value in raw.items()}
+            return self
 
-        def __exit__(self, exc_type, exc, traceback):
+        def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setitem(sys.modules, "h5py", SimpleNamespace(File=_File))
+        def read_small(self, name, *, dtype=None):
+            small_reads.append(name)
+            value = raw[name]
+            return value if dtype is None else np.asarray(value, dtype=dtype)
 
+        def read_slab(self, name, *, shape=None, **kw):
+            raise AssertionError(
+                f"read_slab({name!r}, shape={shape!r}) reached the payload "
+                f"path, but this fixture refuses on velocity_validation_"
+                f"passed=0 and must do so BEFORE any O(nk*nb^2) read")
+
+    class _RefusingH5py:
+        @staticmethod
+        def File(*a, **k):                       # noqa: N802 - h5py's name
+            raise AssertionError(
+                "gw.qsgw_head opened h5py.  parallel_transport.h5 is written "
+                "by the phdf5 transport; a second HDF5 library instance on "
+                "it is audit A1's hazard and the PHDF5-only ruling forbids "
+                "it.  Stamps go through SlabIO.read_small.")
+
+    monkeypatch.setattr(slab_io_mod, "SlabIO", _FakeSlabIO)
+    monkeypatch.setitem(sys.modules, "h5py", SimpleNamespace(File=_RefusingH5py.File))
     monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
+
     wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
     meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
     with pytest.raises(ValueError, match="mandatory finite-link DFT head"):
         load_parallel_transport_head(
             "parallel_transport.h5", mesh=_mesh(), wfn=wfn, meta=meta
         )
+
+    assert opens == [("parallel_transport.h5", "r")], (
+        f"expected exactly ONE read-only SlabIO open; got {opens}.  Two "
+        f"opens means the stamps and the payload are on different handles, "
+        f"which is the shape the h5py-then-SlabIO version had.")
+    # Every stamp the refusal list needs, and the uint8 provenance stamp,
+    # came through the scalar door.
+    for name in ("schema_version", "band_stop", "kgrid",
+                 "reciprocal_lattice_cart", "wfn_fingerprint_utf8",
+                 "velocity_validation_max_abs"):
+        assert name in small_reads, f"{name} was not read through read_small"
 
 
 def test_reduced_covector_conversion_uses_row_basis_convention():
