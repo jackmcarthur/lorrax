@@ -2251,12 +2251,25 @@ def prepare_isdf_and_wavefunctions(
 					   f"{mesh_xy.devices.size} ranks in this mesh — no "
 					   f"chunk choice can shrink the persistent ÷P floor"
 					   if _floor_broken else "")
-					+ ".  Add ranks, raise memory_per_device_gb, or set an "
-					  "explicit r_chunk_size (the register-documented "
-					  "workaround, which bypasses this gate).")
+					+ ".  Add ranks or raise memory_per_device_gb"
+					# NAME ONLY THE REMEDIES THAT ACTUALLY APPLY.  An
+					# explicit ``r_chunk_size`` bypasses this gate for a
+					# budget overrun and does NOTHING for a broken rank
+					# floor (the floor is the persistent ÷P term, which no
+					# chunk choice touches) — and the operator who is
+					# already running with one would be told to set the
+					# thing they set.  A refusal that names an inapplicable
+					# fix is a dead end wearing a remedy's clothes.
+					+ ("" if (_floor_broken or mem.r_chunk_override > 0)
+					   else ", or set an explicit r_chunk_size — the "
+					        "register-documented run-level workaround, "
+					        "which bypasses this gate")
+					+ ".")
 				if mem.r_chunk_override > 0 and not _floor_broken:
 					print0(f"  {_msg}  Proceeding under the explicit "
-					       f"r_chunk_size={int(mem.r_chunk_override)}.")
+					       f"r_chunk_size={int(mem.r_chunk_override)} the "
+					       f"operator asserted; the plan is still priced "
+					       f"over budget.")
 				else:
 					raise ValueError(_msg)
 			chunks = {

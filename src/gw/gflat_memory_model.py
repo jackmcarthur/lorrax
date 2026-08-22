@@ -499,6 +499,20 @@ def plan_gflat_chunks(
     # separately because it carries a PLACEMENT bound on top of the sum
     # (see ``_ARENA_PLACEMENT_FRAC``).
     arena_slope = slots * _c128(nk, ns, ns, mu, shard=p_xy)
+    # WHY THE SEAM IS *NOT* IN THIS DIAL, stated because it looks like it
+    # should be.  ``C_t`` below is ``max(C_fit_t, solve_t + zq_live)`` and
+    # the r-LINEAR part of that second member is ``3·(nq, μ, cr)/P``,
+    # against a ``C_slope`` whose pair-carry term alone is
+    # ``slots·nk·ns²·μ/P`` and which carries its own ``(nq, μ)/P`` Z_q term
+    # besides.  For ``nq ≤ nk`` — every real deck, since q runs over the
+    # same mesh as k — and ``slots = 3`` the fit slope is strictly larger,
+    # so a seam-derived r cap can never bind.  MEASURED on both geometries
+    # this model's Stage-C note cites (JID 57405800 step
+    # lx-Xg1-030359-905761): seam/fit = 0.199 at MoS2 8x8 and 0.590 at 9x9.
+    # An r cap taken from the seam would be a no-op dressed as a guard.
+    #
+    # What the seam DOES bind through is the r-INDEPENDENT
+    # ``q_chunk·(μ,μ)`` replicated factor — see ``_factor_headroom``.
     headroom_C = max(target - persistent_total, 0.0)
     if r_chunk_override and r_chunk_override > 0:
         # The register-documented run-level workaround: an explicit
@@ -566,6 +580,10 @@ def plan_gflat_chunks(
             "distributed_zeta_solve must be auto, replicated, per_q, or "
             f"distributed; got {distributed_zeta_solve!r}")
     _rhs_stacks = 2 * _c128(nq, mu, r_chunk, shard=p_xy)
+    # The full-BZ Z_q the solve is handed as a live input.  Defined HERE
+    # rather than beside ``C_t`` because ``q_chunk``'s own headroom has to
+    # subtract it: see ``_factor_headroom``.
+    _zq_live = _c128(nq, mu, r_chunk, shard=p_xy)
     if _solve_route_requested == "distributed":
         q_chunk = 1                    # ignored by the distributed route
         solve_t = _rhs_stacks
@@ -579,8 +597,24 @@ def plan_gflat_chunks(
         _solve_memory_route = "per_q (one replicated factor)"
     else:
         _factor_per_q = _c128(mu, mu)
+        # SUBTRACT THE LIVE Z_q TOO.  ``C_t`` charges ``solve_t + Z_q``
+        # (the reshard cannot alias, so they coexist), but this headroom
+        # subtracted only the RHS stacks — so the planner sized q_chunk
+        # against a budget it then priced itself over.  MEASURED at the
+        # naturally-unreduced MoS2 9x9 geometry (JID 57405800 step
+        # lx-Xg1-030359-905761): q_chunk = 70 -> a 31.41 GB replicated
+        # factor term, C_t = 55.30 GB against 40.51 GB of C_fit_t, and a
+        # plan HWM of 65.12 GB against its own 64.00 GB budget.  Since
+        # 77ab293c's sibling made ``gw_init`` REFUSE an infeasible plan,
+        # that arithmetic is now a hard stop on a deck the model could
+        # have planned by choosing a smaller q_chunk.  This is the ONE
+        # knob that shrinks the term the seam charge made binding; the
+        # r-chunk dial cannot (the factor is r-independent) and neither
+        # can adding ranks (the factor is REPLICATED -- p-independent by
+        # construction), which is why the refusal's own advice would not
+        # have helped here.
         _factor_headroom = max(
-            target - persistent_total - _rhs_stacks, 0.0)
+            target - persistent_total - _rhs_stacks - _zq_live, 0.0)
         q_chunk = max(
             1, min(nq, int(_factor_headroom / _factor_per_q)))
         solve_t = _rhs_stacks + q_chunk * _factor_per_q
@@ -603,8 +637,7 @@ def plan_gflat_chunks(
     # Z_q is built at the full BZ (z_q_from_psi_sm's contract) — the two
     # measured escapes this seam-charge closes are JID 57269074 step
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
-    zq_live = _c128(nq, mu, r_chunk, shard=p_xy)
-    C_t = max(C_fit_t, solve_t + zq_live)
+    C_t = max(C_fit_t, solve_t + _zq_live)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
     # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit;
     # only ~2 ψ centroid copies are retained.  Transient = V_acc + the ζ
