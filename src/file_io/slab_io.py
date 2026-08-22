@@ -408,11 +408,15 @@ class SlabIO:
         ``partition_spec`` on ``mesh``, or a host ``np.ndarray`` under
         ``as_numpy=True``.
 
-        Reading a dataset THIS handle did not create costs one serial
-        h5py introspect of the file (cached per name) to learn its shape
-        and dtype.  That is a legal cross-stack read-only touch and the
-        registry counts it; it is the reason a read on a handle opened
-        for writing is a different risk from a read on one opened ``"r"``.
+        Reading a dataset THIS handle did not create costs one geometry
+        query (cached per name) to learn its shape and dtype.  Since
+        2026-08-22 that query goes through the FFI — the same library
+        instance that holds the file — so it is no longer a cross-stack
+        touch and no longer makes a read on a WRITABLE handle a different
+        risk from a read on one opened ``"r"``.  On a library predating
+        the entry point the old serial-h5py introspect is taken instead,
+        announced once, and refused on a writable handle
+        (``docs/architecture/slab_io.md#one-owner``).
 
         THE EASY CALL IS THE CORRECT CALL.  Omit ``shape`` and SlabIO
         returns the dataset rounded UP to the mesh-divisible extent under
@@ -458,6 +462,39 @@ class SlabIO:
         if as_numpy and not isinstance(arr, np.ndarray):
             arr = np.asarray(jax.device_get(arr))
         return arr
+
+    # ------------------------------------------------------------------
+    def read_small(self, name: str, *, dtype=None) -> np.ndarray:
+        """Read a WHOLE small dataset into a host ``np.ndarray``, every rank.
+
+        THE RANK-0 / SCALAR DOOR, and the reason it is a separate method
+        rather than a ``shape=()`` case of :meth:`read_slab`: a scalar
+        HDF5 dataspace has NO hyperslab, so the sharded read handler
+        cannot express the request at all.  ``read_slab`` refused it with
+        *"slab shape must be non-empty"* before a byte moved, which is why
+        ``gw.qsgw_head.load_parallel_transport_head`` could never read
+        ``parallel_transport.h5`` — it died on the FIRST scalar, ahead of
+        every diagnostic it was written to emit.
+
+        Every stamp :meth:`write_attr` publishes is such a dataset.  This
+        is the matching reader, and it goes through the SAME HDF5 library
+        instance that holds the file — not a second one.
+
+        COLLECTIVE in the same sense as :meth:`read_slab`: every rank
+        calls it with the same name and gets the whole payload.  That is
+        the contract, and it is why the method is named ``small``: the
+        payload must be O(1) in the design envelope (a schema version, a
+        band count, a k-grid triple).  Bulk data is a hyperslab and
+        belongs in :meth:`read_slab`.
+
+        ``dtype`` requests a conversion (HDF5 does it); omitted, the
+        dataset's own dtype is returned.  The returned array has the
+        dataset's own shape — ``()`` for a scalar, so ``int(arr)`` and
+        ``arr[()]`` both work the way an h5py reader would expect.
+        """
+        with _journal.op_scope("read", self.path, stack=_STACK, ds=name,
+                               mode=self.mode, handle=self._handle()):
+            return self._backend.read_whole(name, dtype=dtype)
 
     # ------------------------------------------------------------------
     def read_slabs(

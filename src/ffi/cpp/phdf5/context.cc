@@ -1002,6 +1002,150 @@ hid_t open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name) {
     return dset;
 }
 
+// -----------------------------------------------------------------
+//  dataset_geometry / read_whole — the METADATA half of the transport.
+//
+//  These two exist so that nothing in LORRAX has to open a phdf5-written
+//  file with a SECOND HDF5 library to learn a dataset's shape or to pull
+//  a handful of scalars out of it.  Before them, ``_FfiBackend.
+//  _introspect_dataset`` opened the path with serial h5py WHILE the
+//  collective handle was live — legal only while both sides are
+//  read-only, and correctly refused by ``file_io.hdf5_owner`` the moment
+//  the live FFI handle could write (the measured
+//  ``--parallel-transport-out`` refusal).  With these entry points the
+//  introspect is the SAME library instance that holds the file, so the
+//  cohabitation question does not arise.
+//
+//  Both route through ``open_dataset_ro`` so they inherit its collective
+//  H5Dopen and its per-ctx hid_t cache: every rank calls them with the
+//  same name, exactly as every rank already calls ``open_dataset_ro``.
+//  Everything after that open is a local metadata query or an
+//  INDEPENDENT H5Dread — a scalar or a handful of elements that every
+//  rank wants in full, so there is nothing to aggregate.
+// -----------------------------------------------------------------
+
+// Native HDF5 type -> the dtype tag ``phdf5_interface.h`` speaks, or -1.
+static int tag_for_h5_type(hid_t t) {
+    if (t < 0) return -1;
+    const int tags[] = {dt::kF32, dt::kF64, dt::kS32, dt::kS64,
+                        dt::kC64, dt::kC128};
+    for (int tag : tags) {
+        hid_t native = dt::h5_native_for_tag(tag);
+        if (native < 0) continue;
+        htri_t eq = H5Tequal(t, native);
+        if (eq > 0) return tag;
+    }
+    return -1;
+}
+
+// ``shape_out`` receives ``*ndim_out`` extents.  A SCALAR dataset reports
+// ``ndim = 0`` and writes nothing — that is a legal answer, not an error,
+// and it is the one ``load_parallel_transport_head`` needs.
+void dataset_geometry(PhdfCtx* ctx, const std::string& ds_name,
+                      int64_t* shape_out, int cap_ndim,
+                      int* ndim_out, int* dtype_tag_out) {
+    if (!ctx) throw std::runtime_error("phdf5 dataset_geometry: null ctx");
+    hid_t dset = open_dataset_ro(ctx, ds_name);
+    hid_t space = H5Dget_space(dset);
+    if (space < 0) {
+        throw std::runtime_error(
+            "phdf5 dataset_geometry: H5Dget_space failed for '" + ds_name + "'");
+    }
+    const int ndim = H5Sget_simple_extent_ndims(space);
+    if (ndim < 0) {
+        H5Sclose(space);
+        throw std::runtime_error(
+            "phdf5 dataset_geometry: H5Sget_simple_extent_ndims failed for '"
+            + ds_name + "'");
+    }
+    if (ndim > cap_ndim) {
+        H5Sclose(space);
+        throw std::runtime_error(
+            "phdf5 dataset_geometry: dataset '" + ds_name + "' has rank "
+            + std::to_string(ndim) + ", above the caller's buffer capacity "
+            + std::to_string(cap_ndim));
+    }
+    if (ndim > 0) {
+        std::vector<hsize_t> dims((size_t)ndim, 0);
+        if (H5Sget_simple_extent_dims(space, dims.data(), nullptr) < 0) {
+            H5Sclose(space);
+            throw std::runtime_error(
+                "phdf5 dataset_geometry: H5Sget_simple_extent_dims failed for '"
+                + ds_name + "'");
+        }
+        for (int d = 0; d < ndim; ++d) shape_out[d] = (int64_t)dims[(size_t)d];
+    }
+    H5Sclose(space);
+
+    hid_t dtype = H5Dget_type(dset);
+    if (dtype < 0) {
+        throw std::runtime_error(
+            "phdf5 dataset_geometry: H5Dget_type failed for '" + ds_name + "'");
+    }
+    hid_t native = H5Tget_native_type(dtype, H5T_DIR_DEFAULT);
+    int tag = tag_for_h5_type(native >= 0 ? native : dtype);
+    if (native >= 0) H5Tclose(native);
+    // The compound complex types are not "native" in HDF5's sense, so the
+    // native conversion above can miss them; compare the stored type too.
+    if (tag < 0) tag = tag_for_h5_type(dtype);
+    H5Tclose(dtype);
+    if (tag < 0) {
+        throw std::runtime_error(
+            "phdf5 dataset_geometry: dataset '" + ds_name + "' has a datatype "
+            "this transport does not speak (supported: f32 f64 i32 i64 c64 "
+            "c128).  A string or opaque dataset must be read as an attribute "
+            "by its owning module, not through SlabIO.");
+    }
+    *ndim_out = ndim;
+    *dtype_tag_out = tag;
+}
+
+// Read the WHOLE dataset into ``out`` on every rank.  ``out_nelem`` is the
+// caller's element capacity and is CHECKED against the dataset's own
+// element count, so a caller that mis-sized its buffer gets a refusal
+// rather than a heap overrun.  Independent transfer: this is a scalar or a
+// small replicated vector that every rank needs entire.
+void read_whole(PhdfCtx* ctx, const std::string& ds_name, int dtype_tag,
+                void* out, int64_t out_nelem) {
+    if (!ctx) throw std::runtime_error("phdf5 read_whole: null ctx");
+    if (!out) throw std::runtime_error("phdf5 read_whole: null output buffer");
+    hid_t native = dt::h5_native_for_tag(dtype_tag);
+    if (native < 0) {
+        throw std::runtime_error("phdf5 read_whole: unsupported dtype_tag "
+                                 + std::to_string(dtype_tag));
+    }
+    hid_t dset = open_dataset_ro(ctx, ds_name);
+    hid_t space = H5Dget_space(dset);
+    if (space < 0) {
+        throw std::runtime_error(
+            "phdf5 read_whole: H5Dget_space failed for '" + ds_name + "'");
+    }
+    const hssize_t npoints = H5Sget_simple_extent_npoints(space);
+    H5Sclose(space);
+    if (npoints < 0) {
+        throw std::runtime_error(
+            "phdf5 read_whole: H5Sget_simple_extent_npoints failed for '"
+            + ds_name + "'");
+    }
+    if ((int64_t)npoints != out_nelem) {
+        throw std::runtime_error(
+            "phdf5 read_whole: dataset '" + ds_name + "' holds "
+            + std::to_string((long long)npoints) + " elements but the caller "
+            "sized its buffer for " + std::to_string((long long)out_nelem)
+            + ".  read_whole is for scalars and small replicated vectors read "
+              "ENTIRE; a partial read is a hyperslab and belongs in "
+              "SlabIO.read_slab.");
+    }
+    // H5S_ALL on both sides: no hyperslab, so a rank-0 (scalar) dataspace
+    // is served by exactly the same call as a 1-D one.  That is the whole
+    // reason this entry point exists — the sharded read handler needs a
+    // hyperslab and a scalar dataspace has none.
+    if (H5Dread(dset, native, H5S_ALL, H5S_ALL, ctx->dxpl_indep, out) < 0) {
+        throw std::runtime_error(
+            "phdf5 read_whole: H5Dread failed for '" + ds_name + "'");
+    }
+}
+
 void close_ctx(PhdfCtx* ctx) {
     if (!ctx) return;
 
