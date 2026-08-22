@@ -59,11 +59,17 @@ The body head's ``{δq} = {−δq}`` closure (2026-08-08) is NOT one of the
 divergences: it is a correctness requirement of the argmin injection —
 see :func:`build_miniBZ_dq_cart`.
 
-A fourth copy of the draw GEOMETRY lives in ``bse.vq_interp``
-(rank-parallel ``fold_in`` PRNG, correct spelling); rewiring it onto
-:func:`minibz_frac_to_cart` is registered alongside the estimator
-question rather than done here — its numbers feed BSE fixtures this
-phase must not move.
+THE FOURTH COPY OF THE DRAW GEOMETRY IS GONE (verified 2026-08-22).
+``bse.vq_interp``'s rank-parallel ``fold_in`` draw used to spell the
+frac→Cartesian map, the Voronoi wrap and the mini-BZ affine locally; it
+now calls :func:`minibz_frac_to_cart`, :func:`wrap_points_to_voronoi` and
+:func:`minibz_cell_affine` through the door (``vq_interp.py`` ~:1738).
+Its own comment records the measurement that licensed the swap —
+bit-identical to the local spellings over 200 random cells, both helpers
+exactly equal in float64 — so the BSE fixtures did not move.  What is
+still ITS own is the PRNG (``jax.random.fold_in``, rank-parallel by
+construction) and the ``nmax=3`` choice, and both are deliberate.  *(This
+paragraph previously said the rewiring was registered rather than done.)*
 
 SCIPY IS QUARANTINED HERE.  It is the service's one optional dependency,
 and the only thing it provides is the scrambled-Sobol generator.  See

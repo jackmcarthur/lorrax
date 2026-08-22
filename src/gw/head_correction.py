@@ -589,7 +589,12 @@ def fold_cartesian_head_wings_sharded(
     r"""Fold dynamic body screening into the Cartesian q² head tensor.
 
     This is the Cartesian-leading-axis generalization of the production-tested
-    sharded ``Y W Z`` reduction in ``gw.experimental.head_wing_schur``:
+    sharded ``Y W Z`` reduction in ``gw.experimental.head_wing_schur``.  The
+    two are NOT interchangeable and the relationship is adjudicated at the
+    top of that module: this one returns a Cartesian ``(..., 3, 3)`` with a
+    ``1/V_cell``, that one returns a per-q scalar plus the two
+    half-contracted wings the rank-1 W rebuild needs.  What is shared is the
+    triple contraction below, and only its LOWERING differs.
 
     .. math::
 

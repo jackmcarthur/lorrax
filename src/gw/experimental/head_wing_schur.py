@@ -30,6 +30,34 @@ no all-gather.
 * ``schur_reductions_sharded`` — assemble (χ_head_eff, A_wing, A_wing').
 * ``assemble_W_sharded`` — W = W_body0 + (g0_x* + A_wing_x) · W_head ·
   (g0_y + A_wing'_y).
+
+NOT A TWIN OF ``head_correction.fold_cartesian_head_wings_sharded``
+(adjudicated 2026-08-22, register row "Two YWZ head-wing folds coexist in
+different layers").  The row's premise no longer holds at this HEAD and
+the two functions compute different objects:
+
+* ``head_channel.py``'s consumer reaches ``extract_V_body_sharded`` — the
+  rank-1 *subtract*, step 1 — not any YWZ fold.
+* ``fold_cartesian_head_wings_sharded`` is no longer test-only: it has
+  three production call sites in ``gw/qsgw_head.py``.  It returns a
+  CARTESIAN ``(..., 3, 3)`` tensor with a ``1/V_cell`` factor.
+* ``schur_reductions_sharded`` returns a per-q SCALAR *and* the two
+  half-contracted wings ``A_wing_x`` / ``A_wingp_y``, which the rank-1 W
+  rebuild needs and which no Cartesian fold exposes.
+
+What they DO share is the ``Y W Z`` triple contraction, and they lower it
+differently: this module uses a global ``jnp.einsum`` plus a
+``with_sharding_constraint``, while the Cartesian fold uses ``shard_map``
+with a local einsum and an explicit ``psum`` — whose own docstring gives
+the reason ("leaving this as a global einsum lets XLA select a
+full-matrix temporary at large n_mu even though the public result is
+3x3", i.e. QUALITY_PATTERNS #4: make the constraint structural rather
+than fight the partitioner).  Collapsing this module's scalar correction
+onto the shard_map kernel is the remaining, NARROW consolidation.  It is
+deliberately not done here: it changes the summation order of a
+production static-COHSEX head path, so its parity class is value-level
+and not bit-exact (TASTE 15), and it needs an A/B on a real head channel
+before it can land.
 """
 from __future__ import annotations
 
