@@ -19,6 +19,8 @@ that seam:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 import jax
@@ -32,13 +34,79 @@ from common.units import RYD_TO_EV
 # Vectorised per-(k, n) ω-axis linear interpolation — shared helper
 # ---------------------------------------------------------------------------
 
+#: What :func:`interp_along_omega` does with an evaluation point outside the
+#: represented ω range.  THERE IS NO DEFAULT and every call site says which
+#: it wants, per the owner's 2026-08-17 "arbitrary choice under degeneracy"
+#: ruling: endpoint clamping is a legitimate policy for an ITERATE and an
+#: illegitimate one for an OUTPUT, and a shared default cannot be both.
+OUT_OF_RANGE_POLICIES = ("clamp", "mask", "refuse")
+
+#: Announced override for the policy the Σ(ω)→at-DFT OUTPUT path resolves.
+#: See :func:`resolve_out_of_range_policy`.
+_OUT_OF_RANGE_ENV = "LORRAX_OMEGA_OUT_OF_RANGE"
+
+
+def omega_coverage(omega_grid: np.ndarray,
+                   eval_kn: np.ndarray) -> tuple[np.ndarray, int, float]:
+    """``(covered_mask, n_uncovered, fraction_uncovered)`` for an ω request.
+
+    ``covered_mask[k, n]`` is True where ``eval_kn[k, n]`` lies inside
+    ``[ω_min, ω_max]``, i.e. where Σ(ω) was actually SAMPLED and the linear
+    interpolation is an interpolation rather than an edge value.  Interior
+    holes in a patched grid are a different question and are owned by
+    :func:`assert_omega_grid_covers`; this answers the outer one.
+    """
+    omega = np.asarray(omega_grid, dtype=np.float64)
+    arr = np.asarray(eval_kn, dtype=np.float64)
+    covered = (arr >= float(omega[0])) & (arr <= float(omega[-1]))
+    n_out = int(np.count_nonzero(~covered))
+    frac = float(n_out) / float(arr.size) if arr.size else 0.0
+    return covered, n_out, frac
+
+
+def resolve_out_of_range_policy(default: str = "clamp") -> str:
+    """The out-of-range policy for the Σ(ω) OUTPUT path, from the env.
+
+    ``LORRAX_OMEGA_OUT_OF_RANGE`` selects ``clamp`` / ``mask`` / ``refuse``;
+    an unrecognised token REFUSES naming the variable rather than resolving
+    to the default (rule 13: off-dials may refuse, typos never do).
+
+    WHY THE DEFAULT IS STILL ``clamp``, AND WHY THAT IS NOT AN ENDORSEMENT.
+    The committed ``gnppm_debug`` regression fixture measures **132 of 414**
+    (31.9 %) sigma-window (k, n) cells outside its ``[-10, +10] eV`` grid,
+    and the exact-origin Na run reported ``QSGW: 10142 clipped (41.3%)``.
+    Refusing by default would red the anchor fixtures and change frozen
+    references on the same commit that added the instrument, which is the
+    one thing the band-degeneracy grandfather clause exists to avoid.  So
+    the default keeps the historical arithmetic and stops being SILENT
+    about it — the count, the fraction and the grid range are reported and
+    stamped — and ``refuse`` is one named variable away for anyone
+    producing a deliverable that must be covered.
+    """
+    raw = os.environ.get(_OUT_OF_RANGE_ENV, "").strip().lower()
+    if not raw:
+        return default
+    if raw not in OUT_OF_RANGE_POLICIES:
+        raise ValueError(
+            f"{_OUT_OF_RANGE_ENV}={raw!r} is not one of "
+            f"{OUT_OF_RANGE_POLICIES}.  This decides what Sigma(omega) "
+            f"returns for a state whose energy was never sampled; an "
+            f"unrecognised value is refused rather than resolved to the "
+            f"endpoint clamp.")
+    return raw
+
+
 def interp_along_omega(
     values_w_kn: np.ndarray,
     omega_grid: np.ndarray,
     eval_kn: np.ndarray,
+    *,
+    out_of_range: str,
+    context: str = "",
+    print_fn=None,
 ) -> np.ndarray:
     """Linearly interpolate ``values_w_kn[ω, k, n]`` along the ω-axis at
-    per-(k, n) points ``eval_kn[k, n]`` (with edge clamping).
+    per-(k, n) points ``eval_kn[k, n]``.
 
     Vectorised over (k, n) — one ``np.searchsorted`` + two fancy-index
     gathers, no Python loops.  Used by the diag-Σ(E) fixed point, the
@@ -50,14 +118,82 @@ def interp_along_omega(
     values_w_kn : (nω, nk, nb), real or complex
     omega_grid : (nω,), monotonically increasing
     eval_kn : (nk, nb), the per-(k, n) ω-evaluation points
+    out_of_range : REQUIRED, one of :data:`OUT_OF_RANGE_POLICIES`
+
+        ``"clamp"``
+            Evaluate at the nearest grid endpoint.  The historical
+            behaviour, bit-for-bit, and correct for an ITERATE whose
+            out-of-grid bands the caller reroutes afterwards.
+        ``"mask"``
+            Return ``nan`` where the state was never sampled, so an
+            uncovered cell cannot be mistaken for a measured one.
+        ``"refuse"``
+            Raise, naming the count, the fraction, the worst energy and
+            the grid range.
+
+    context, print_fn
+        When ``print_fn`` is given and any cell is out of range, ONE
+        counted line is emitted naming ``context``.  Not optional
+        decoration: an unreported clamp is the defect this parameter
+        exists for.
+
+    WHY THIS ARGUMENT HAS NO DEFAULT.  ``np.clip`` was applied here
+    unconditionally, so the at-DFT ``eqp0.dat`` / ``eqp1.dat`` writer wrote
+    finite endpoint values for every uncovered state with nothing said.
+    MEASURED on the exact-origin Na bandstructure run
+    (``runs/Na/02_soc48b_qsgw_mpa/49_origin_exact_fresh_np_ladder_20260818/
+    01_np10_nested_batch8/logs/...:5078-5113``): the deck requests only
+    ``[-5, +26] eV`` relative to fixed-N mu while bands 5--8 lie near
+    -25.07 eV, the log reports ``QSGW: 10142 clipped (41.3%)``, and at
+    Gamma band 5's stored ``sigC = 2.791702837+0.013253924i`` is
+    bit-for-shown-digits the ``omega = -5 eV`` ENDPOINT of ``sigma_mnk.h5``,
+    not Σ at its DFT energy.  The wide-window control moves that band from
+    -32.511754 to -28.524225 eV (+3.987528 eV), leaving -0.156302 eV
+    against BGW's Eqp0 = -28.367923 eV.  The clamp is a ~4 eV error wearing
+    a plausible number's clothes, and the SC Hamiltonian path already
+    counts and reroutes these cells while the output path did not.
 
     Returns
     -------
-    out : (nk, nb), same dtype as ``values_w_kn``
+    out : (nk, nb), same dtype as ``values_w_kn`` (``mask`` promotes an
+    integer/real input to float so ``nan`` is representable).
     """
+    if out_of_range not in OUT_OF_RANGE_POLICIES:
+        raise ValueError(
+            f"interp_along_omega: out_of_range must be one of "
+            f"{OUT_OF_RANGE_POLICIES}, got {out_of_range!r}.  It has no "
+            f"default on purpose: endpoint clamping is right for an iterate "
+            f"and wrong for an output, and one default cannot be both.")
     omega = np.asarray(omega_grid, dtype=np.float64)
     eval_arr = np.asarray(eval_kn, dtype=np.float64)
     n_omega = omega.size
+    covered, n_out, frac = omega_coverage(omega, eval_arr)
+    where = f" [{context}]" if context else ""
+    if n_out and print_fn is not None:
+        worst = float(eval_arr[~covered].flat[
+            int(np.argmax(np.abs(eval_arr[~covered])))])
+        print_fn(
+            f"  omega coverage{where}: {n_out} of {eval_arr.size} "
+            f"({100.0 * frac:.1f}%) evaluation energies lie OUTSIDE the "
+            f"sampled grid [{float(omega[0]):.3f}, {float(omega[-1]):.3f}] "
+            f"eV (worst {worst:+.3f} eV); policy={out_of_range}.")
+    if n_out and out_of_range == "refuse":
+        worst = float(eval_arr[~covered].flat[
+            int(np.argmax(np.abs(eval_arr[~covered])))])
+        raise ValueError(
+            f"interp_along_omega{where}: {n_out} of {eval_arr.size} "
+            f"({100.0 * frac:.1f}%) evaluation energies lie outside the "
+            f"sampled omega grid [{float(omega[0]):.3f}, "
+            f"{float(omega[-1]):.3f}] eV; the worst is {worst:+.3f} eV.\n"
+            f"  got  : an endpoint value for every one of them, which is a "
+            f"finite number that is not Sigma at that energy (measured 4 eV "
+            f"on the Na semicore deck).\n"
+            f"  want : an omega grid covering the states you are asking "
+            f"about.  Widen sigma_omega_min_ev / sigma_omega_max_ev, or add "
+            f"a sigma_omega_patches_ev patch over the uncovered band.\n"
+            f"  fix  : {_OUT_OF_RANGE_ENV}=clamp restores the historical "
+            f"endpoint clamp (reported, never silent); "
+            f"{_OUT_OF_RANGE_ENV}=mask writes non-finite there instead.")
     eval_clamped = np.clip(eval_arr, float(omega[0]), float(omega[-1]))
     idx_hi = np.clip(
         np.searchsorted(omega, eval_clamped, side="left"), 1, n_omega - 1)
@@ -70,7 +206,14 @@ def interp_along_omega(
     nk, nb = eval_arr.shape
     k_idx = np.arange(nk)[:, None]
     n_idx = np.arange(nb)[None, :]
-    return w_lo * values_w_kn[idx_lo, k_idx, n_idx] + w_hi * values_w_kn[idx_hi, k_idx, n_idx]
+    out = (w_lo * values_w_kn[idx_lo, k_idx, n_idx]
+           + w_hi * values_w_kn[idx_hi, k_idx, n_idx])
+    if n_out and out_of_range == "mask":
+        out = np.asarray(out)
+        if not np.issubdtype(out.dtype, np.inexact):
+            out = out.astype(np.float64)
+        out = np.where(covered, out, np.asarray(np.nan, dtype=out.dtype))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +313,15 @@ def solve_diagonal_sigma_fixed_point(
     mix = float(np.clip(mixing, 0.0, 1.0))
 
     for it in range(max_iter):
-        sig_at_E = interp_along_omega(sigma_w, omega, E)
+        # ``clamp`` is the right policy for an ITERATE: this is a fixed-point
+        # search whose out-of-grid bands the caller patches through the
+        # scissor afterwards (see the Returns section), and a refusal here
+        # would kill the solve on a band the caller was going to replace
+        # anyway.  Unreported on purpose — it runs up to ``max_iter`` times
+        # and one line per iteration is noise, not evidence; the OUTPUT path
+        # is where the count matters and it is reported there.
+        sig_at_E = interp_along_omega(sigma_w, omega, E,
+                                      out_of_range="clamp")
         E_new = h0 + np.real(sig_at_E)
         E_next = (1.0 - mix) * E + mix * E_new
         diff = np.abs(E_next - E)
@@ -850,6 +1001,9 @@ __all__ = [
     "build_qsgw_sigma_xc",
     "extract_sigma_diag_replicated",
     "interp_along_omega",
+    "omega_coverage",
+    "resolve_out_of_range_policy",
+    "OUT_OF_RANGE_POLICIES",
     "plot_qp_energy_comparison",
     "remove_managed",
     "solve_diagonal_sigma_fixed_point",

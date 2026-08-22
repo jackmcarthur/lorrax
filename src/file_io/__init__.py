@@ -68,6 +68,7 @@ from .sigma_output import (
     compact_star_tables,
     extract_and_stamp_k_irr,
     k_irr_rows_for,
+    read_eval_energies,
     sigma_star_spread_stats,
     star_select_k_irr,
     write_sigma_to_file,

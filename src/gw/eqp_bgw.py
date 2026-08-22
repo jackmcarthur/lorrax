@@ -391,13 +391,26 @@ def compute_z_factor_from_omega_grid(
 			f"({omega_rel_ev.size}, {nk}, {nb})"
 		)
 
+	# ``clamp``, named rather than inherited.  The +/- dE_ev probes are
+	# DESIGNED to leave the grid at its two outermost samples -- a central
+	# difference at the edge has nowhere else to stand -- so a refusal here
+	# would fire on every healthy deck.  What the clamp costs is worth
+	# stating: where BOTH probes clamp to the same endpoint the numerator
+	# is exactly zero, dRe[sigma_c]/domega comes back 0 and Z comes back
+	# exactly 1, i.e. eqp1 degenerates to eqp0 for that state.  That is a
+	# recognisable signature rather than a plausible wrong number, which is
+	# why it is tolerable here and is not at the OUTPUT path
+	# (dynamic_sigma.eval_sigma_c_at_dft_energies, which reports its count).
 	from .qsgw_utils import interp_along_omega
 	sigma_c_at_dft = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev)
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev,
+		out_of_range="clamp")
 	sigma_c_plus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev)
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev + dE_ev,
+		out_of_range="clamp")
 	sigma_c_minus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev)
+		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev - dE_ev,
+		out_of_range="clamp")
 
 	# Central-difference dRe[Σ_c]/dω at the centre
 	dsigma_dE = (np.real(sigma_c_plus) - np.real(sigma_c_minus)) / (2.0 * dE_ev)
@@ -1032,18 +1045,25 @@ def make_eqp_bgw(
 	All file paths default to standard names inside ``run_dir``.  Returns
 	``(eqp0_path, eqp1_path)``.
 
-	``eval_energies_path`` — WHERE eqp1 IS LINEARIZED, and OPT-IN by
-	design.  ``sigma_mnk.h5`` stamps the ω reference its axis is relative
-	to but does not record which spectrum the run evaluated Σ at, and the
-	two candidates on disk are not interchangeable: for a SELF-CONSISTENT
-	run ``WFN_qp.h5`` / ``qp_wfn_rotations.h5`` hold exactly the converged
+	``eval_energies_path`` — WHERE eqp1 IS LINEARIZED — is the explicit
+	OVERRIDE, and it is no longer the only way to get this right.  The two
+	candidates on disk are not interchangeable: for a SELF-CONSISTENT run
+	``WFN_qp.h5`` / ``qp_wfn_rotations.h5`` hold exactly the converged
 	energies Σ was built from and are the right answer, while for a
-	ONE-SHOT run those same files hold ``eigh(H₀+Σ)`` — an OUTPUT of the
-	Σ that was built at E_DFT, and centring the linearization there would
-	be a different, wrong calculation.  Nothing in the files distinguishes
-	the two cases, so this function will not guess: absent this argument
-	it linearizes at E_DFT, which is correct for one-shot and is what
-	every historical call did.  See :func:`compute_eqp_diag`.
+	ONE-SHOT run those same files hold ``eigh(H₀+Σ)`` — an OUTPUT of the Σ
+	that was built at E_DFT, and centring the linearization there would be
+	a different, wrong calculation.
+
+	Since 2026-08-22 ``sigma_mnk.h5`` STAMPS which of the two its cube is
+	(``file_io.sigma_output.read_eval_energies``), so absent this argument
+	this function reads the stamp instead of guessing.  Three outcomes, and
+	they are deliberately distinguishable: a stamp saying ``at_e_dft``
+	keeps the historical E_DFT centring and says so; a stamp saying
+	``self_consistent_qp`` supplies the converged spectrum; and an
+	UNSTAMPED file — a cube written before the stamp existed — falls back
+	to E_DFT with a printed line saying that is what happened and why it
+	may be wrong.  "No stamp" and "stamped at E_DFT" used to look
+	identical, and that is the whole defect.  See :func:`compute_eqp_diag`.
 	"""
 	wfn_path = wfn_path or os.path.join(run_dir, "WFN.h5")
 	kin_ion_path = kin_ion_path or os.path.join(run_dir, "kin_ion.h5")
@@ -1221,6 +1241,55 @@ def make_eqp_bgw(
 	sigma_x_diag = np.diagonal(sigma_x_irr, axis1=1, axis2=2)
 	hartree_diag = np.diagonal(hartree_irr, axis1=1, axis2=2)
 	sigma_c_omega_diag = np.diagonal(sigma_c_irr, axis1=2, axis2=3)  # (n_omega, nk, nb)
+
+	# ── THE LINEARIZATION POINT, FROM THE FILE'S OWN STAMP ────────────
+	# ``eval_energies_path`` (above) is the explicit override and still
+	# wins; this is the case where nobody passed one.  Before the stamp
+	# existed this function could not tell a one-shot cube from a
+	# self-consistent one and defaulted to E_DFT: correct for the first,
+	# a DIFFERENT CALCULATION for the second, and silent either way.  Now
+	# an unstamped file and a file that says "at_e_dft" are distinguishable
+	# — the first is an absence and says so out loud, the second is a fact.
+	#
+	# The stored rows are the FILE's k rows (the star wedge when it carries
+	# one), so they go through the SAME ``k_rows`` remap as the Σ cubes
+	# rather than a second index table of this function's own.
+	from file_io.sigma_output import (SIGMA_EVAL_AT_E_DFT,
+	                                  read_eval_energies)
+	if e_eval_rel_ev is None:
+		_eval_rel_full, _eval_prov, _eval_cov = read_eval_energies(
+			sigma_mnk_path)
+		if _eval_rel_full is None:
+			print(f"  eqp1 linearization: {os.path.basename(sigma_mnk_path)} "
+			      f"carries NO evaluation-energy stamp (a file written before "
+			      f"2026-08-22).  Falling back to E_DFT, which is correct for "
+			      f"a one-shot cube and WRONG for a self-consistent one — "
+			      f"pass --eval-energies, or regenerate the cube with a "
+			      f"driver that stamps it.")
+		elif str(_eval_prov) == SIGMA_EVAL_AT_E_DFT:
+			print(f"  eqp1 linearization: stamped {_eval_prov!r} — E_DFT, "
+			      f"which is what the historical default did.")
+		else:
+			_sub = np.asarray(_eval_rel_full)[k_rows][:,
+			                                          band_start:band_stop]
+			if _sub.shape != e_dft_rel_ev.shape:
+				raise ValueError(
+					f"{os.path.basename(sigma_mnk_path)}'s evaluation-energy "
+					f"stamp has IBZ/window shape {_sub.shape} against E_DFT "
+					f"{e_dft_rel_ev.shape}; the stamp and the cube disagree "
+					f"about the k set or the band window.")
+			e_eval_rel_ev = _sub
+			e_eval_ev = _sub + efermi_ev
+			print(f"  eqp1 linearization: stamped {_eval_prov!r} "
+			      f"(max |E_eval − E_DFT| = "
+			      f"{float(np.max(np.abs(e_eval_ev - e_dft_ev))):.4f} eV)")
+		if _eval_cov and int(_eval_cov["n_uncovered"]):
+			print(f"  omega coverage (stamped): "
+			      f"{_eval_cov['n_uncovered']} evaluation energies "
+			      f"({100.0 * _eval_cov['fraction_uncovered']:.1f}%) lie "
+			      f"outside the sampled grid; policy="
+			      f"{_eval_cov['policy']}.  Those states' sigC is an "
+			      f"endpoint value, not Sigma at their own energy.")
 
 	# ── The V_H seam's ONE extra input on this path ───────────────────
 	# ``gw.sigma_dispatch`` applies the source rule at the single point

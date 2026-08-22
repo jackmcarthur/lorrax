@@ -712,10 +712,16 @@ def write_freq_debug(
                         / RYD_TO_EV)
             _cols.append((
                 "sig_c_head(Edft)",
+                # ``clamp``, named: this is a DEBUG decomposition column and
+                # it must use the same recipe as ``sig_c(Edft)`` beside it or
+                # a column-by-column cancellation analysis stops working.
+                # Its coverage is the coverage already reported at the
+                # output path -- same grid, same eval energies.
                 interp_along_omega(
                     head_sigma_diag_w_kn_ry,
                     omega_grid_ry,
                     _eval_ry,
+                    out_of_range="clamp",
                 ) * RYD_TO_EV,
             ))
     else:

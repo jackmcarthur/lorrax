@@ -3957,6 +3957,19 @@ def dump_sigma_omega_h5_final(
         # conventions differ by a measured 2.79 eV (audit A2).
         omega_reference_ev=sigma_result.efermi_dft_ev,
         omega_reference_provenance=sigma_result.omega_reference_provenance,
+        # AND THE SPECTRUM IT WAS EVALUATED AT, carried on the same result
+        # for the same reason.  Under self-consistency this is the converged
+        # QP spectrum, NOT E_DFT, and the file used to say nothing -- so a
+        # from-disk `eqp_bgw.make_eqp_bgw` reassembly of an SC run silently
+        # re-centred eqp1's linearization at E_DFT, which is a different
+        # calculation.  Relative to this cube's own omega reference, one
+        # subtraction, the same one the finalize made.
+        eval_energies_rel_ev=(
+            None if sigma_result.e_eval_ev is None
+            else np.asarray(sigma_result.e_eval_ev, dtype=np.float64)
+            - float(sigma_result.efermi_dft_ev)),
+        eval_energies_provenance="self_consistent_qp",
+        omega_coverage=sigma_result.omega_coverage,
         sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")
