@@ -18,6 +18,25 @@ W Dyson solve — exactly TWO plans (input key ``w_dyson_solver``):
     materialises a full (μ, μ) tile — the memory ceiling that matters at
     thousands of low-memory processes.  W lands natively in
     ``P(None,'x','y')`` (no relayout).
+
+Two-face carrier (``low_mem_bands = true``, ``wfns.layout == "face"``):
+:func:`_get_chi_minimax_kernel` dispatches to
+:func:`_get_chi_minimax_kernel_legacy` (untouched) or
+:func:`_get_chi_minimax_kernel_face`, which builds G via a single planned
+``distrib_la.gemm_plan`` shared by Gv/Gc (the val/cond split becomes a
+band-identity mask over the FULL loaded extent, not two differently-sized
+slices — report §3) and reuses the legacy FFT/contraction stages
+unchanged (G's output shape/sharding does not depend on layout).
+:func:`_chi_layout_operands`/:func:`_chi_face_kwargs` are the one place
+:func:`compute_chi0`/:func:`_chi0_multi_kernel_args`/
+:func:`_chi0_contour_kernel_args` turn a bundle into kernel operands, so
+those callers no longer extract legacy views (``.xn()``/``.yr()``)
+themselves.  NOT ported: ``_get_chi_fractional_contour_kernel`` /
+:func:`compute_chi0_contour_fractional` (a separate factory that does not
+share ``_build_Gv_Gc``) — under face layout its own ``wfns.xn()``/
+``wfns.yr()`` calls refuse by name (the legacy accessors' own guard), so
+it fails cleanly rather than silently.  See
+``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.
 """
 import os
 from functools import partial
@@ -60,7 +79,8 @@ _STATIC_FRACTIONAL_PAIR_TILE = 8
 
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             n_out: int = 1, *,
-                            complex_contour: bool = False):
+                            complex_contour: bool = False,
+                            layout: str = "legacy", face_shape=None):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
     ``n_out`` (static): number of χ outputs accumulated over the SAME τ
@@ -73,9 +93,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     ``complex_contour=True`` carries complex time through the same spatial
     contraction.  The cache key keeps that convention separate from the
     bit-locked real-time static path.
-    """
-    from common.fft_helpers import make_flat_k_fftn
 
+    ``layout`` (static): ``'legacy'`` (default) is the exact kernel this
+    module has always built — see :func:`_get_chi_minimax_kernel_legacy`.
+    ``'face'`` builds the two-face carrier's G-construction instead (one
+    planned ``distrib_la.gemm_plan`` per kernel, shared by Gv/Gc since
+    face G no longer slices a band window — see report §3); requires
+    ``face_shape=(nk, nb_full, n_rmu, nspinor)``.  Every OTHER stage
+    (FFT to R, the χ contraction, FFT back to q) is byte-identical either
+    way — G's output shape/sharding does not depend on layout — so only
+    the G-build half of this factory forks; see
+    :func:`_get_chi_minimax_kernel_face`.
+    """
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
     n_out = int(n_out)
@@ -85,10 +114,35 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
     complex_contour = bool(complex_contour)
+    if layout not in ("legacy", "face"):
+        raise ValueError(
+            f"_get_chi_minimax_kernel: layout must be 'legacy' or 'face', "
+            f"got {layout!r}")
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
-                 complex_contour)
+                 complex_contour, layout, face_shape)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
+
+    if layout == "legacy":
+        kernel = _get_chi_minimax_kernel_legacy(
+            mesh_xy, kgrid, nk, n_out, complex_contour)
+    else:
+        if face_shape is None:
+            raise ValueError(
+                "_get_chi_minimax_kernel(layout='face') requires "
+                "face_shape=(nk, nb_full, n_rmu, nspinor)")
+        kernel = _get_chi_minimax_kernel_face(
+            mesh_xy, kgrid, nk, n_out, complex_contour, face_shape)
+    _chi_minimax_kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
+    """The exact pre-``low_mem_bands`` kernel body, moved verbatim out of
+    :func:`_get_chi_minimax_kernel` so that dispatcher could gain a
+    layout branch without touching this one at all.  Caching is now the
+    dispatcher's job — this function only builds."""
+    from common.fft_helpers import make_flat_k_fftn
 
     # Flat-k FFT helpers — callers see only (nk, *trail) arrays.
     #
@@ -219,7 +273,6 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                 _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
             return tuple(_chi_fftn_local(f) for f in final_R)
 
-        _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi_multi
         return minimax_tau_integrate_chi_multi
 
     @partial(jax.jit,
@@ -286,7 +339,164 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
     # Minimax quadrature always delivers ≥1 node — the compiled scan
     # handles any n≥1 without a short-circuit wrapper.
-    _chi_minimax_kernel_cache[cache_key] = minimax_tau_integrate_chi
+    return minimax_tau_integrate_chi
+
+
+def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
+                                 face_shape):
+    """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
+
+    G construction is the only part that forks (module-level docstring):
+    ``psi_mun``/``psi_nmu`` cover the FULL [b0,b4) band range (obstacle
+    #3 — a legal face matrix cannot be sliced to val/cond), so the
+    val/cond split that legacy expresses as two DIFFERENTLY-SIZED band
+    slices becomes two full-extent G builds gated by a band-IDENTITY
+    ``mask`` (``Wavefunctions.band_mask`` — this is exactly
+    ``build_G_tau``'s own pre-existing ``mask`` parameter, designed for
+    Σ's val/cond selector; chi0 simply becomes its second user).  ONE
+    ``distrib_la.gemm_plan`` serves BOTH Gv and Gc, since both now share
+    the same (mu*ns, nb_full, mu*ns) shape — the legacy kernel needed two
+    only because its val/cond slices differ in size.  FFT/contraction
+    stages below are copied from the legacy body UNCHANGED (same specs,
+    same einsum) because G's output shape/sharding is layout-independent.
+    """
+    from common.fft_helpers import make_flat_k_fftn
+    from distrib_la import gemm_plan
+    from .wavefunction_bundle import (
+        G_FFT7D_SPEC as _G_spec,
+        G_FLATK_SPEC as _G_out_flatk,
+        CHI_Q_SPEC as _chi_spec,
+        CHI_R_SPEC as _chi_R_spec,
+        PSI_MUN_SPEC as _psi_mun_spec,
+        PSI_NMU_SPEC as _psi_nmu_spec,
+    )
+    from .greens_function_kernel import build_G_tau
+
+    nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    if nk_shape != nk:
+        raise ValueError(
+            f"_get_chi_minimax_kernel_face: face_shape nk={nk_shape} does "
+            f"not match kgrid's prod={nk}")
+
+    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
+    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
+    _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
+
+    _rep0 = P()
+    _rep1 = P(None)
+    _rep2 = P(None, None)
+    _G_k_shard = NamedSharding(mesh_xy, _G_out_flatk)
+    _chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
+    _psi_mun_shard = NamedSharding(mesh_xy, _psi_mun_spec)
+    _psi_nmu_shard = NamedSharding(mesh_xy, _psi_nmu_spec)
+
+    # ONE planned GEMM, built here (eagerly, once) and shared by every Gv
+    # and Gc build this kernel ever does — see distrib_la.gemm_plan's own
+    # "hoist this call out of every per-k/per-tau loop" instruction.
+    g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
+                       nq=nk, dtype=jnp.complex128)
+
+    @partial(jax.jit,
+             in_shardings=(_psi_mun_shard, _psi_nmu_shard,
+                            NamedSharding(mesh_xy, _rep2),   # mask_v
+                            NamedSharding(mesh_xy, _rep2),   # mask_c
+                            NamedSharding(mesh_xy, _rep2),   # enk_full
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0)),
+             out_shardings=(_G_k_shard, _G_k_shard))
+    def _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c, enk_full,
+                    tau_scalar, vmax, cmin):
+        t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
+        Gv_k = jax.lax.with_sharding_constraint(
+            build_G_tau(psi_mun, psi_nmu, enk_full, -tau_scalar, e_ref=vmax,
+                       mask=mask_v, layout="face", gemm=g_plan),
+            _G_k_shard)
+        Gc_k = jax.lax.with_sharding_constraint(
+            build_G_tau(psi_mun, psi_nmu, enk_full, t_c, e_ref=cmin,
+                       mask=mask_c, layout="face", gemm=g_plan),
+            _G_k_shard)
+        return jnp.conj(Gv_k), jnp.conj(Gc_k)
+
+    _nodes_shard = MinimaxNodes(
+        t=NamedSharding(mesh_xy, _rep1),
+        alpha=NamedSharding(mesh_xy, _rep1 if n_out == 1 else P()),
+    )
+
+    if n_out >= 2:
+        _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
+
+        @partial(jax.jit,
+                 in_shardings=(_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
+                                NamedSharding(mesh_xy, _rep2),
+                                NamedSharding(mesh_xy, _rep2),
+                                NamedSharding(mesh_xy, _rep2),
+                                NamedSharding(mesh_xy, _rep0),
+                                NamedSharding(mesh_xy, _rep0)),
+                 out_shardings=_chi_R_out,
+                 static_argnums=())
+        def minimax_tau_integrate_chi_multi(
+            nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
+        ):
+            zero = jax.lax.with_sharding_constraint(
+                jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128),
+                _chi_R_shard)
+            acc0 = tuple(zero for _ in range(n_out))
+
+            def _body(accs, xs):
+                t_scalar, alpha_col = xs
+                tau_kernel = (t_scalar if complex_contour else
+                              jnp.real(t_scalar).astype(jnp.float64))
+                Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
+                                          enk_full, tau_kernel, vmax, cmin)
+                Gv_R = _Gv_fftn(Gv_k)
+                Gc_R = _Gc_fftn(Gc_k)
+                chi_tau = jax.lax.with_sharding_constraint(
+                    jnp.einsum('Rambn,Rambn->Rmn',
+                               Gc_R, jnp.conj(Gv_R), optimize=True),
+                    _chi_R_shard)
+                return tuple(a + alpha_col[i] * chi_tau
+                             for i, a in enumerate(accs)), None
+
+            final_R, _ = jax.lax.scan(
+                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
+            return tuple(_chi_fftn_local(f) for f in final_R)
+
+        return minimax_tau_integrate_chi_multi
+
+    @partial(jax.jit,
+             in_shardings=(_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
+                            NamedSharding(mesh_xy, _rep2),
+                            NamedSharding(mesh_xy, _rep2),
+                            NamedSharding(mesh_xy, _rep2),
+                            NamedSharding(mesh_xy, _rep0),
+                            NamedSharding(mesh_xy, _rep0)),
+             out_shardings=_chi_R_shard,
+             static_argnums=())
+    def minimax_tau_integrate_chi(
+        nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
+    ):
+        chi_R_zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
+
+        def _body(chi_R_acc, xs):
+            t_scalar, alpha_scalar = xs
+            tau_kernel = (t_scalar if complex_contour else
+                          jnp.real(t_scalar).astype(jnp.float64))
+            Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
+                                      enk_full, tau_kernel, vmax, cmin)
+            Gv_R = _Gv_fftn(Gv_k)
+            Gc_R = _Gc_fftn(Gc_k)
+            chi_tau = jax.lax.with_sharding_constraint(
+                jnp.einsum('Rambn,Rambn->Rmn',
+                           Gc_R, jnp.conj(Gv_R), optimize=True),
+                _chi_R_shard)
+            return chi_R_acc + alpha_scalar * chi_tau, None
+
+        final_R, _ = jax.lax.scan(
+            _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
+        return _chi_fftn_local(final_R)
+
     return minimax_tau_integrate_chi
 
 
@@ -889,6 +1099,49 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
         return solve_fn(V_q, chi0_q, pref)
 
 
+def _chi_face_kwargs(wfns) -> dict:
+    """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
+    ``face_shape`` kwargs :func:`_get_chi_minimax_kernel` needs otherwise
+    — read off ``psi_mun``'s own shape rather than threaded in by every
+    caller, since the bundle already carries it (mirrors
+    ``cohsex_sigma._face_kwargs``, the same pattern for the COHSEX
+    factory)."""
+    if wfns.layout != "face":
+        return {}
+    nk, ns, mu, nb_full = wfns.psi_mun.shape
+    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, ns)}
+
+
+def _chi_layout_operands(wfns, eref):
+    """The ψ/energy operand tuple :func:`_get_chi_minimax_kernel`'s
+    returned kernel expects AFTER ``nodes``, dispatched on ``wfns.layout``
+    — the one place :func:`compute_chi0`, :func:`_chi0_multi_kernel_args`
+    and :func:`_chi0_contour_kernel_args` turn a bundle into kernel
+    operands, so those three callers stop extracting legacy views
+    (``.xn()``/``.yr()``) themselves.  Pair with :func:`_chi_face_kwargs`
+    at the SAME call site to build the matching kernel — the two tuples
+    differ in length (legacy's four windowed ψ views vs face's two
+    full-extent ψ copies plus two band masks) because the two kernel
+    bodies' own signatures do
+    (``_get_chi_minimax_kernel_legacy``/``_face``), not because this
+    function special-cases anything beyond that.  ``vmax``/``cmin`` are
+    NOT included — every caller appends those itself, since their host-
+    side reduction is layout-independent and already computed before this
+    is called.
+    """
+    s = wfns.slices
+    eref_j = jnp.asarray(eref, dtype=wfns.enk.dtype)
+    if wfns.layout == "legacy":
+        enk_v = wfns.enk[:, s.val] - eref_j
+        enk_c = wfns.enk[:, s.cond] - eref_j
+        return (wfns.xn(s.val), wfns.yr(s.val),
+               wfns.yr(s.cond), wfns.xn(s.cond), enk_v, enk_c)
+    mask_v = wfns.band_mask(s.val)
+    mask_c = wfns.band_mask(s.cond)
+    enk_full = wfns.enk - eref_j
+    return (wfns.psi_mun, wfns.psi_nmu, mask_v, mask_c, enk_full)
+
+
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
 
@@ -928,13 +1181,9 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
     return kernel(
-        nodes,
-        wfns.xn(s.val), wfns.yr(s.val),
-        wfns.yr(s.cond), wfns.xn(s.cond),
-        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
-        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
@@ -973,11 +1222,7 @@ def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
     args = (
-        nodes,
-        wfns.xn(s.val), wfns.yr(s.val),
-        wfns.yr(s.cond), wfns.xn(s.cond),
-        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
-        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
@@ -993,7 +1238,8 @@ def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
+                                     **_chi_face_kwargs(wfns))
     return kernel(*args)
 
 
@@ -1007,7 +1253,8 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
         return
     args, n_out = _chi0_multi_kernel_args(
         wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
+                                     **_chi_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
 
@@ -1057,11 +1304,7 @@ def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
             dtype=jnp.complex128),
     )
     args = (
-        nodes,
-        wfns.xn(s.val), wfns.yr(s.val),
-        wfns.yr(s.cond), wfns.xn(s.cond),
-        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
-        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
@@ -1081,7 +1324,8 @@ def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
     args, n_out = _chi0_contour_kernel_args(
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=n_out, complex_contour=True)
+        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
+        **_chi_face_kwargs(wfns))
     return kernel(*args)
 
 
@@ -1096,7 +1340,8 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
     args, n_out = _chi0_contour_kernel_args(
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=n_out, complex_contour=True)
+        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
+        **_chi_face_kwargs(wfns))
     kernel.lower(*args).compile()
 
 
@@ -1675,13 +1920,9 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid)
+    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, **_chi_face_kwargs(wfns))
     kernel.lower(
-        nodes,
-        wfns.xn(s.val), wfns.yr(s.val),
-        wfns.yr(s.cond), wfns.xn(s.cond),
-        enk_v - jnp.asarray(eref, dtype=enk_v.dtype),
-        enk_c - jnp.asarray(eref, dtype=enk_c.dtype),
+        nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     ).compile()
