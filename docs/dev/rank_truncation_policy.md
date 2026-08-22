@@ -99,6 +99,38 @@ count and the deck key that fixes it.  One named override,
 and leaves a trace in the log — the shape `TASTE.md` prescribes for a guard
 whose hard refusal would break an existing deck.
 
+### When the κ arm is arithmetically INERT, and why that is said out loud
+
+`select_rank` retains exactly `σ_i > σ_max·rtol`, so `σ_min_kept > σ_max·rtol`
+and therefore **`κ_eff < 1/rtol = κ_cap`, always, by construction**.  Finding 1
+compares `κ_eff` against `κ_certified`; whenever `κ_cap ≤ κ_certified` that
+comparison *cannot be true*, and the gate returns clean from a path that
+tested nothing.
+
+That is the case at **every default in this tree today** — `zeta_rcond = 1e-8`
+and htransform's `rtol = 1e-8` both give `κ_cap = 1e8 = KAPPA_CERTIFIED_GRAM`.
+The arm becomes live exactly when an operator loosens the dial below the
+certified plateau, which is where both registered catastrophes sat
+(rcond 1e-10 → −206.83 eV, 1e-12 → −5049.59 eV; Si 4×4×4 at κ_eff 9.7e9).
+So the design is right and the *reporting* was not: `certify()` used to return
+`[]` and `describe()` used to print "certified ceiling 1e8; achieved 9.9e7
+(0.99× of it)", which reads exactly like a measured pass.
+
+`certify_numbers` now takes the criterion's own `κ_cap` and **announces the
+inert case**, and `RankReport.describe()` says the same on its ceiling line:
+*this arm's silence is arithmetic, not a measurement.*  Same rule the
+`κ_certified is None` branch already followed — an absence is not a pass, and
+neither is an impossibility (`TASTE.md` 2026-08-06, "a check that cannot fail
+is not evidence", and rule 18's corollary).
+
+The **discarded-weight arm is independent of `rtol`** and stays live on every
+default, so the gate as a whole is never wholly inert.
+
+KNOWN GAP: the device-face gate in `isdf/core._certify_the_cut` prints only
+when it FIRES, so on an inert-κ run it is silent for two indistinguishable
+reasons.  Its `rcond` argument is the same `κ_cap`, so the statement is
+derivable there too; it is not yet emitted.
+
 ### What was REFUTED as a gate, and must not be re-proposed
 
 **Drop fraction.**  The obvious gate — "refuse when n_keep/n_total falls below

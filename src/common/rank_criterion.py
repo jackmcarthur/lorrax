@@ -455,6 +455,15 @@ class RankReport(object):
                      "null-space round-off, not rank)"
                      % (self.rank_unclamped,))))
         if self.kappa_certified is not None and self.kappa_eff is not None:
+            # WHY THE REACHABILITY CLAUSE IS HERE.  select_rank retains
+            # sigma_i > sigma_max*rtol, so kappa_eff < 1/rtol = kappa_cap
+            # ALWAYS.  When kappa_cap <= kappa_certified the certify() arm
+            # that compares them is arithmetically incapable of firing, and
+            # "achieved 9.9e7 (0.99x of the ceiling)" reads exactly like a
+            # measured pass.  Say which it is — same rule the None branch
+            # below already follows.
+            _inert = (self.kappa_cap is not None
+                      and self.kappa_cap <= self.kappa_certified * (1.0 + 1e-12))
             lines.append(
                 "%s[rank]   certified kappa ceiling %.3e for this site; "
                 "achieved %.3e (%.2gx of it)%s"
@@ -462,7 +471,13 @@ class RankReport(object):
                    self.kappa_eff / self.kappa_certified,
                    ("" if self.n_dropped_criterion else
                     " — but the cap bound NOTHING, so the gate does not "
-                    "apply (see certify())")))
+                    "apply (see certify())")
+                   + ("" if not _inert else
+                      " — and at rtol=%.1e the criterion's own cap %.3e is "
+                      "AT OR BELOW that ceiling, so kappa_eff cannot exceed "
+                      "it by construction: this arm's silence is arithmetic, "
+                      "not a measurement"
+                      % (self.rtol, self.kappa_cap))))
         elif self.kappa_certified is None:
             lines.append(
                 "%s[rank]   certified kappa ceiling: NONE for this site — "
@@ -694,12 +709,16 @@ def certify(report, *, site, mode=None, cause="", fix="", log=None):
         kappa_eff=report.kappa_eff, n_dropped=report.n_dropped_criterion,
         n_total=report.n_total, discarded_weight=report.discarded_weight,
         kappa_certified=report.kappa_certified, quantity=report.quantity,
+        # The criterion's OWN cap, so the gate can tell a measured pass
+        # from an arithmetically impossible finding.  See
+        # :func:`certify_numbers`.
+        kappa_cap=report.kappa_cap,
         site=site, mode=mode, cause=cause, fix=fix, log=log)
 
 
 def certify_numbers(*, kappa_eff, n_dropped, n_total, discarded_weight,
                     kappa_certified, quantity="directions", site,
-                    mode=None, cause="", fix="", log=None):
+                    kappa_cap=None, mode=None, cause="", fix="", log=None):
     """:func:`certify` for a site that already holds the numbers.
 
     The array-shaped host sites (``common/zeta_projection``, which reduces
@@ -711,10 +730,49 @@ def certify_numbers(*, kappa_eff, n_dropped, n_total, discarded_weight,
     ``kappa_eff`` / ``n_dropped`` / ``discarded_weight`` must be the WORST
     over whatever the site reduced (largest κ, largest drop, largest
     weight): a gate reported on an average is a gate that cannot fire.
+
+    ``kappa_cap`` IS THE CRITERION'S OWN CAP (``1/rtol``), AND WITHOUT IT
+    THIS GATE CANNOT TELL A PASS FROM A TAUTOLOGY.  :func:`select_rank`
+    retains exactly ``σ_i > σ_max·rtol``, so ``σ_min_kept > σ_max·rtol``
+    and therefore ``kappa_eff < 1/rtol = kappa_cap`` — ALWAYS, by
+    construction.  Finding 1 compares ``kappa_eff`` against
+    ``kappa_certified``; when ``kappa_cap ≤ kappa_certified`` that
+    comparison is arithmetically incapable of being true and the gate
+    returns clean from a path that tested nothing.  That is the case at
+    EVERY default in this tree today: ``zeta_rcond = 1e-8`` and
+    htransform's ``rtol = 1e-8`` both give ``kappa_cap = 1e8 =
+    KAPPA_CERTIFIED_GRAM``.  The arm becomes live exactly when an operator
+    loosens the dial below the certified plateau — which is the registered
+    catastrophe (rcond 1e-10 / 1e-12, κ_eff 9.7e9 … 1e12) and is what the
+    gate is FOR.
+
+    So the inert case is ANNOUNCED rather than reported as a pass, the same
+    way ``kappa_certified is None`` already is: "an absence is not a pass",
+    and neither is an impossibility.  ``TASTE.md`` 2026-08-06,
+    "a check that cannot fail is not evidence", and rule 18's corollary —
+    a gate reporting nothing looks identical whether it found nothing or
+    checked nothing, so state which.  The discarded-weight arm is
+    independent of ``rtol`` and stays live either way.
     """
     m = resolve_policy_mode(mode)
     findings = []
     bound = int(n_dropped) > 0
+    _kappa_arm_inert = (
+        bound and kappa_certified is not None and kappa_cap is not None
+        and float(kappa_cap) <= float(kappa_certified) * (1.0 + 1e-12))
+    if _kappa_arm_inert and m != "off":
+        emit = log if log is not None else print
+        emit(
+            "  [rank-policy] %s: the kappa arm is STRUCTURALLY INERT at this "
+            "rtol — the criterion's own cap 1/rtol=%.3e is at or below the "
+            "certified ceiling %.3e, so kappa_eff < the ceiling by "
+            "construction and this arm cannot fire.  Its silence is "
+            "arithmetic, not a measurement.  It becomes live only below "
+            "rtol=%.1e, which is where both registered catastrophes sat.  "
+            "The discarded-weight arm (ceiling %.1e) is rtol-independent "
+            "and IS live."
+            % (site, float(kappa_cap), float(kappa_certified),
+               1.0 / float(kappa_certified), DISCARDED_WEIGHT_MAX))
     if bound and kappa_certified is not None and kappa_eff is not None \
             and float(kappa_eff) > float(kappa_certified):
         findings.append(
