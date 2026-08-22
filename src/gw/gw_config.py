@@ -2923,6 +2923,172 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         "bgw_metal_q0_treatment.")
 
 
+#: WHICH COMBINATIONS OF ``low_mem_bands = true`` v1 REFUSES, and why.
+#:
+#: Same shape as ``_W_BSE_REFUSALS`` above: ``rule_id -> (predicate, got,
+#: want, fix, doc)``, assembled into one five-part message so a rule cannot
+#: be added without answering all five.  Predicates take the resolved
+#: :class:`LorraxConfig` and check only their OWN axis — the caller,
+#: :func:`refuse_unsupported_low_mem_bands`, has already established
+#: ``low_mem_bands = true`` before the loop runs.
+#:
+#: SUPPORTED, deliberately absent from this table (guide
+#: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §6):
+#: scalar/spinor, one-shot insulator (``qp_solver`` = ``one_shot_dft`` or
+#: ``fixed_point``), ``head_correction`` = ``off`` | ``no_local_fields``,
+#: standard chi0, COHSEX / GN-PPM / HL-PPM / insulating MPA, restart
+#: read/write.
+#:
+#: A FIFTH combination the guide names — an explicit dense ``Gij`` operand
+#: — has no deck key (every shipped driver call site leaves it at its
+#: ``None`` default; see ``cohsex_sigma._resolve_Gij``), so it cannot be a
+#: row in a config-resolution table keyed on parsed values.  It is guarded
+#: separately by :func:`refuse_explicit_gij_under_low_mem_bands`, called
+#: from ``compute_sigma_xc`` at the one seam that ever sees both operands
+#: together.
+_LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
+    (
+        # LIFT CONDITION: a face-layout port of the full q->0 head/body
+        # wing kernel (``gw/qsgw_head.py:850-1234``, gated on
+        # ``HeadCorrection.FULL`` at ``gw_jax.py:469,573``) is being built
+        # in parallel on ``feat/head-wings-face-port-2026-08-22``.  That
+        # branch lifts this refusal with A SINGLE PREDICATE CHANGE: delete
+        # this row (the same "removing a row is the landing gesture"
+        # convention ``UNIMPLEMENTED_MODES`` uses above) once
+        # ``head_wings_sharded`` / ``static_head_wings_sharded`` read
+        # ``wfns.psi_nmu`` / ``wfns.psi_mun`` instead of the legacy
+        # accessors.
+        "low_mem_bands_head_correction_full_unported",
+        lambda cfg: cfg.head.correction is HeadCorrection.FULL,
+        lambda cfg: f"head_correction = {cfg.head.correction.value}",
+        "head_correction = off or no_local_fields",
+        "set head_correction = off or no_local_fields, or low_mem_bands = "
+        "false",
+        "the full q->0 head/body wing kernel reads wfns.psi_xn/psi_yn "
+        "directly and has no face-layout port yet (census row 'Full q->0 "
+        "head/body wings').  head_correction=full is the shipping default, "
+        "so this is the FIRST refusal an unqualified low_mem_bands=true "
+        "deck hits",
+    ),
+    (
+        "low_mem_bands_self_consistent_unported",
+        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
+        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
+        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "run low_mem_bands=true single-shot; drop qp_solver or set it to "
+        "one_shot_dft/fixed_point, or set low_mem_bands = false for a QSGW "
+        "loop",
+        "every QSGW SC map rotates the wavefunction bundle "
+        "(wavefunction_bundle.py:543-706, sc_iteration.py:1753); a face "
+        "bundle needs two distributed rotations (U^T @ psi_nmu, psi_mun @ "
+        "U) that are not built (census row 'QSGW orbital rotation')",
+    ),
+    (
+        "low_mem_bands_metal_material_class_unported",
+        lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
+                     .strip().lower() == "metal"),
+        lambda cfg: f"mpa_material_class = {cfg.mpa.material_class}",
+        "mpa_material_class = insulator (the default)",
+        "set mpa_material_class = insulator (or drop the key), or set "
+        "low_mem_bands = false for a metallic run",
+        "the exact finite-occupation response (w_isdf.py:1259-1620) "
+        "assumes every rank owns all bands and only mu is sharded; its "
+        "divided-difference weight depends jointly on both band "
+        "energies/occupations, so it cannot be replaced by the one-"
+        "particle G GEMM and needs its own 2-D band-pair ring/tile "
+        "algorithm (census row 'Exact finite-occupation response')",
+    ),
+    (
+        "low_mem_bands_bispinor_unported",
+        lambda cfg: bool(cfg.bispinor),
+        lambda cfg: f"bispinor = {cfg.bispinor}",
+        "bispinor = false",
+        "set bispinor = false, or low_mem_bands = false for a 4-spinor run",
+        "the transverse exchange vertex insertion hard-codes psi_xn/psi_yr "
+        "and clones the dataclass (sigma_x_bispinor.py:63-100,160-180); the "
+        "face carrier has no transverse-centroid bundle yet (census row "
+        "'Bispinor transverse exchange')",
+    ),
+)
+
+
+def refuse_unsupported_low_mem_bands(config) -> None:
+    """Refuse the ``low_mem_bands = true`` combinations v1 does not serve.
+
+    BEFORE ALLOCATION.  Called from :meth:`LorraxConfig.from_input_file`
+    once the resolved record exists (predicates read ``compute_mode`` /
+    ``qp_solver``, which fold in the legacy flags — the same reason
+    :func:`refuse_unsupported_screening_diagrams` is called there and not
+    re-derived), so a doomed deck refuses in the first second of a run
+    rather than after the chi0 build or the ISDF fit that would otherwise
+    silently rebuild a one-axis replica to serve it.  Also called from
+    ``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry, mirroring
+    :func:`refuse_unimplemented_compute_mode`'s two call sites: the parser
+    call is what saves the operator's allocation on the production path,
+    the driver-entry call is what makes a hand-built config (a test
+    harness, a future direct caller) safe without having to remember the
+    parser check.
+
+    NO-OP FOR ``low_mem_bands = false`` (the default), evaluated first and
+    returning before any predicate is touched: a default deck must not
+    acquire a new parse-time resolution — and hence a new possible
+    refusal — from this feature existing.
+    """
+    if not bool(config.memory.low_mem_bands):
+        return
+    for rule_id, predicate, got, want, fix, doc in _LOW_MEM_BANDS_REFUSALS:
+        if not predicate(config):
+            continue
+        raise ValueError(
+            f"GATE {rule_id}: low_mem_bands = true is refused with "
+            f"{got(config)}.\n"
+            f"  got:  low_mem_bands = true, {got(config)}\n"
+            f"  want: {want}\n"
+            f"  fix:  {fix}\n"
+            f"  why:  {doc}.\n"
+            f"  doc:  docs/input_reference.md '## ISDF / zeta', "
+            f"low_mem_bands.")
+
+
+def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
+    """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
+
+    THE ONE ROW ``_LOW_MEM_BANDS_REFUSALS`` CANNOT HOLD.  Every other
+    combination in the envelope is a deck key readable at parse time; an
+    explicit ``Gij`` is a keyword-only Python parameter of
+    ``compute_sigma_xc`` / ``compute_cohsex_sigma`` that every shipped
+    driver call site (``gw_jax.py``, ``sc_iteration.py``) leaves at its
+    ``None`` default — ``cohsex_sigma._resolve_Gij``'s docstring names the
+    caller this guards, the SC-COHSEX loop iterating on its own projector.
+    No deck-resolution point ever sees the value, so this is called from
+    ``compute_sigma_xc`` at entry instead, before any Gij-dependent
+    allocation (``build_Gij`` / the dense band-matrix contract) — the one
+    seam that ever sees both ``low_mem_bands`` and a live ``Gij`` operand
+    together.
+
+    NO-OP for ``Gij is None`` (every production call today) or
+    ``low_mem_bands = false``, so this feature existing changes nothing for
+    the vastly more common calls that never touch either axis.
+    """
+    if not bool(config.memory.low_mem_bands) or Gij is None:
+        return
+    raise ValueError(
+        "GATE low_mem_bands_explicit_gij_unported: "
+        "low_mem_bands = true is refused with an explicit Gij operand.\n"
+        "  got:  low_mem_bands = true, Gij is not None (explicit dense "
+        "band-space occupation projector)\n"
+        "  want: Gij = None (the standard occupation_state path)\n"
+        "  fix:  do not pass an explicit Gij under low_mem_bands = true — "
+        "the occupation_state argument already builds one — or set "
+        "low_mem_bands = false\n"
+        "  why:  cohsex_sigma.build_Gij returns a fully replicated dense "
+        "(nk, nb_sigma, nb_sigma) array; under face psi, G and the "
+        "Hartree/exchange projection need a face-sharded band-matrix "
+        "contract that has not been ported (obstacle #4, 'treat production "
+        "Gij as diagonal data')\n"
+        "  doc:  docs/input_reference.md '## ISDF / zeta', low_mem_bands.")
+
+
 def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
     """Parse one reduced-coordinate q0 vector without guessing its units."""
     raw = str(value or "").replace(",", " ").split()
@@ -4643,6 +4809,14 @@ class LorraxConfig:
         # returns from this call before either property is touched.
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
+        # Same position/reason as the two calls above: low_mem_bands=false
+        # (the default) returns before any predicate is touched, so this
+        # adds no new resolution to a default deck.  See
+        # refuse_unsupported_low_mem_bands's docstring for why this call
+        # (parser altitude) and the mirrored call in
+        # gw.gw_init.prepare_isdf_and_wavefunctions (driver-entry altitude,
+        # for hand-built configs) both exist.
+        refuse_unsupported_low_mem_bands(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the
