@@ -578,22 +578,34 @@ def _compute_V_q_g_flat_one_tile(
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
         unfold_sym = full_to_irr_sym
         if timing_label == "CC":
-            from .qgrid_symmetry import (
-                trs_pair_coherent_unfold_sym_idx,
-                trs_project_self_negative_q_rows,
-            )
-            unfold_sym = trs_pair_coherent_unfold_sym_idx(
-                full_to_irr_idx, full_to_irr_sym, kgrid=tuple(kgrid),
+            # TIME REVERSAL IS MEASURED, NEVER ASSUMED.  This block used to
+            # compose q with −q through Θ and project the self-negative
+            # rows unconditionally; on a ferromagnet that fabricates a
+            # symmetry the density says is absent.  The policy object reads
+            # ``sym.trs_allowed`` (the load-time spin-density verdict) and
+            # this site no longer contains a TRS branch of its own.
+            from .qgrid_symmetry import qgrid_trs_policy_for
+            policy = qgrid_trs_policy_for(
+                sym=sym, irr_idx_q=full_to_irr_idx,
+                sym_idx_q=full_to_irr_sym, kgrid=tuple(kgrid),
+                n_sym_spatial=n_sym_spatial, context="V_q [CC]")
+            unfold_sym = policy.unfold_sym_idx
+            # The point-group covariance the unfold below ASSUMES of the
+            # finite ζ basis, measured on the stored parents while they are
+            # still the pre-unfold wedge.  The q↔−q gate downstream is
+            # structurally blind to it at a self-negative q (there it
+            # degenerates to "V_q is real"); this is not.
+            cov = policy.measure_covariance(
+                V_acc, q_irr_frac=q_irr_frac,
                 q_irr_full_idx=sym.q_irr_full_idx,
-                n_sym_spatial=n_sym_spatial)
-            V_acc = trs_project_self_negative_q_rows(
-                V_acc, sym.q_irr_full_idx, kgrid=tuple(kgrid))
-            if verbose and jax.process_index() == 0:
-                n_rewired = int(np.count_nonzero(
-                    np.asarray(unfold_sym) != np.asarray(full_to_irr_sym)))
-                print(f"  V_q g-flat [CC] unfold: {n_rewired} q rows use "
-                      "a TRS-composed partner so q/-q share one spatial "
-                      "realization.", flush=True)
+                sym_mats_k=sym.sym_mats_k, sym_perm=sym_perm,
+                L_table=L_table)
+            V_acc, removed = policy.project_fixed_q(
+                V_acc, sym.q_irr_full_idx)
+            if jax.process_index() == 0:
+                from common import sanity
+                sanity.report_parent_covariance(
+                    "V_q[CC] IBZ parents", cov, removed=removed)
         # THE PRE-UNFOLD BLOCK, OFFERED TO WHOEVER IS WRITING THE RESTART.
         # This is the array the q_irr format persists — the design's
         # load-bearing decision, because ``unfold(stored)`` is then the

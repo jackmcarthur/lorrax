@@ -2118,13 +2118,35 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# TOLERANCE from the MEASURED floor, not from eps: these tiles span
 	# |A| in [2.6, 4.7e6] and the residual is set by cancellation among
 	# large intermediates, not by eps*max|A| (= 1.0e-9 here).  The
-	# empirical floor is the orbit-closed IBZ arm, where the unfold
-	# builds V_{-q} from V_q by symmetry so reciprocity holds BY
-	# CONSTRUCTION: MEASURED 1.16e-7 (armB_orbit504, 2026-08-07), with
-	# the per-element relative residual falling as |A| rises, which is
-	# the round-off signature.  The DIRECT arm instead sits at 1.5e-3
-	# per-element relative and FLAT in |A| -- systematic, not round-off.
-	# 1e-5 is ~90x above the floor and ~400x below that break.
+	# empirical floor is the orbit-closed IBZ arm: MEASURED 1.16e-7
+	# (armB_orbit504, 2026-08-07), with the per-element relative residual
+	# falling as |A| rises, which is the round-off signature.  The DIRECT
+	# arm instead sits at 1.5e-3 per-element relative and FLAT in |A| --
+	# systematic, not round-off.  1e-5 is ~90x above the floor and ~400x
+	# below that break.
+	#
+	# WHAT THAT FLOOR IS *NOT*.  This comment used to say that on the
+	# orbit-closed IBZ arm "the unfold builds V_{-q} from V_q by symmetry
+	# so reciprocity holds BY CONSTRUCTION", and read the 1.16e-7 as an
+	# arithmetic floor.  Both halves are false.  The unfold applies a
+	# SPATIAL operation; reciprocity is a statement about complex
+	# conjugation.  They coincide only if the finite ISDF zeta basis is
+	# point-group covariant -- an unstated assumption, and MEASURED FALSE
+	# by 1.240e-02 at Gamma on the Na 8x8x8 SOC c464 deck.  So 1.16e-7 is
+	# a measurement of zeta covariance on ONE deck, not a floor any deck
+	# inherits.
+	#
+	# AND THIS GATE IS BLIND WHERE THAT DEFECT IS LARGEST.  At a q with
+	# q == -q (Gamma, and every TRIM of an even mesh) the condition
+	# collapses to "V_q is real", which the analytic assembly satisfies at
+	# machine epsilon whatever the covariance does: 3.9e-17 at Gamma and
+	# 6.4e-17 at H on the deck whose covariance residual there is 1.2e-02
+	# and 2.4e-02.  The discriminating statistic is the little-group
+	# covariance of the IBZ PARENTS, measured at the unfold sites in
+	# ``v_q_g_flat``/``screening``/``screening_bse`` through
+	# ``QgridTrsPolicy.measure_covariance`` and reported by
+	# ``sanity.report_parent_covariance``.  Do NOT tighten the rtol here
+	# to compensate; this statistic is measuring a projection.
 	sanity.check_q_conjugate_reciprocity(
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)

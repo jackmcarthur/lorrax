@@ -802,10 +802,7 @@ def _assert_mu_width(tile, mu_target, *, where):
     return tile
 
 
-from .qgrid_symmetry import (
-    trs_pair_coherent_unfold_sym_idx as _trs_pair_coherent_unfold_sym_idx,
-    trs_project_self_negative_q_rows,
-)
+from .qgrid_symmetry import qgrid_trs_policy_for
 
 
 def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
@@ -814,10 +811,12 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
 
     ``+ v`` first (the facade returns ``W - v`` bodies), then the SAME
     ``unfold_isdf_operator`` service call ``compute_static_w`` makes, with
-    the SAME geometry tables from ``_resolve_ibz_q_list``.  The ladder-only
-    symmetry-row view is made q/-q pair-coherent below because this v1
-    operator establishes only a TRS gauge, not arbitrary spatial-gauge
-    covariance.  This is not a second unfold: one service, one set of
+    the SAME geometry tables from ``_resolve_ibz_q_list``.  The q-axis
+    time-reversal decision — pair coherence and the fixed-q projector — is
+    the SHARED policy object (``gw.qgrid_symmetry.qgrid_trs_policy_for``),
+    because bare V, RPA W and ladder W must use one q-grid realization and
+    because the decision is taken from the MEASURED density verdict, not
+    assumed here.  This is not a second unfold: one service, one set of
     centroid/phase tables, and one convention for the umklapp phase and TRS
     conjugation.
     """
@@ -846,18 +845,20 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
     V_wedge = slice_q_full_to_ibz(V_q, sym.q_irr_full_idx, out_sharding=_nat)
     W_wedge = _assert_mu_width(
         wc_wedge, mu_target, where=f"W[{label}] wedge -> full BZ") + V_wedge
-    W_wedge = trs_project_self_negative_q_rows(
-        W_wedge, sym.q_irr_full_idx, kgrid=tuple(meta.kgrid))
     n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-    ladder_unfold_sym = _trs_pair_coherent_unfold_sym_idx(
-        full_to_irr_idx, full_to_irr_sym, kgrid=tuple(meta.kgrid),
-        q_irr_full_idx=sym.q_irr_full_idx,
-        n_sym_spatial=n_sym_spatial)
-    n_rewired = int(np.count_nonzero(
-        ladder_unfold_sym != np.asarray(full_to_irr_sym)))
-    print_fn(
-        f"  W[{label}] ladder unfold: {n_rewired} q rows use a "
-        "TRS-composed partner to preserve one gauge per q/-q pair.")
+    policy = qgrid_trs_policy_for(
+        sym=sym, irr_idx_q=full_to_irr_idx, sym_idx_q=full_to_irr_sym,
+        kgrid=tuple(meta.kgrid), n_sym_spatial=n_sym_spatial,
+        context=f"W[{label}] ladder")
+    ladder_unfold_sym = policy.unfold_sym_idx
+    cov = policy.measure_covariance(
+        W_wedge, q_irr_frac=q_irr_frac, q_irr_full_idx=sym.q_irr_full_idx,
+        sym_mats_k=sym.sym_mats_k, sym_perm=sym_perm, L_table=L_table)
+    W_wedge, removed = policy.project_fixed_q(W_wedge, sym.q_irr_full_idx)
+    from common import sanity
+    sanity.report_parent_covariance(
+        f"W[{label}] ladder IBZ parents", cov, removed=removed,
+        print_fn=print_fn)
     with timing.section("W.unfold_to_full_bz", announce=True,
                         label=f"W[{label}] ladder IBZ -> full-BZ unfold "
                               f"({int(W_wedge.shape[0])} q -> "

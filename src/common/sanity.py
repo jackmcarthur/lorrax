@@ -75,6 +75,7 @@ __all__ = [
     "neg_q_index",
     "check_q_conjugate_reciprocity",
     "report_q_conjugate_residual",
+    "report_parent_covariance",
     "check_positive",
     "check_in_range",
     "check_sign",
@@ -531,6 +532,26 @@ def check_q_conjugate_reciprocity(
     gate is therefore over the WHOLE flat-q axis, which is also the only
     cost that matters (one reduction, no μ-tile movement).
 
+    WHAT THIS GATE STILL CANNOT SEE, and the reason it is not the whole
+    story.  The degeneracy above is not confined to ``q=0``: it applies at
+    EVERY self-negative q — every point with ``2q ≡ 0``, i.e. all eight
+    TRIM of an even mesh.  There the statistic is "``A_q`` is real" and
+    nothing more.  On the Na 8×8×8 SOC c464 deck those eight points are
+    the only q this gate passes (3.915e-17 at Γ, 6.436e-17 at H) while the
+    point-group covariance the IBZ→full-BZ unfold assumes of the stored
+    parent tile is violated there by 1.240e-02 and 2.411e-02 — its two
+    largest values.  The printed residual is therefore a LOWER BOUND on the
+    defect, not a measure of it.  :func:`report_parent_covariance` carries
+    the statistic that discriminates at exactly those q.
+
+    TRS SCOPE.  This is not a time-reversal statement about the
+    wavefunctions and is not gated on the measured Θ verdict.
+    ``A_{−q} = conj(A_q)`` for the charge-channel ISDF operator follows
+    from the conjugation-equivariance of the fit and from ``v(|q+G|)``
+    being real and even; it holds on a ferromagnet.  What a magnet changes
+    is that the unfold no longer *imposes* it (q and −q are independent
+    parents), so the gate becomes an independent measurement.
+
     Residual is measured relative to the tensor's own scale:
     ``max|A_q − conj(A_{−q})| / max|A|``.
     """
@@ -591,6 +612,84 @@ def report_q_conjugate_residual(
             print_fn=print_fn,
         )
         return False
+    return True
+
+
+def report_parent_covariance(
+    name: str,
+    cov: dict,
+    *,
+    removed: float | None = None,
+    print_fn: Callable[..., Any] = print,
+    rtol: float = 1e-5,
+) -> bool:
+    """Verdict + message for ``symmetry_maps.little_group_covariance_residual``.
+
+    THE STATISTIC THAT IS NOT BLIND AT A SELF-NEGATIVE q.  The q↔−q
+    reciprocity gate above degenerates to "``A_q`` is real" wherever
+    ``q ≡ −q``, because ``−0 == 0`` and the same is true of every TRIM
+    point of an even mesh.  On the Na 8×8×8 SOC c464 deck those eight
+    points are the ONLY q the reciprocity gate passes — 3.915e-17 at Γ and
+    6.436e-17 at H — while the point-group covariance the IBZ→full-BZ
+    unfold assumes of the stored parent tile is violated there by
+    **1.240e-02** and **2.411e-02**, its two largest values.  The two
+    numbers are not in tension: they are different questions, and the
+    printed reciprocity residual is a lower bound on the defect rather
+    than a measure of it.
+
+    So this gate is the discriminator.  It asks the unfold's own formula,
+    with an op that maps the parent q to itself, whether the tile comes
+    back — see the service function for the derivation and for the
+    sensitivity statement (it sees the stored PARENTS only).
+
+    ``removed`` is the relative anti-Θ component the fixed-q projector
+    deleted, when one ran.  It is printed beside the covariance because a
+    projector that quietly absorbs a 1e-2 defect and a projector that
+    removes 1e-16 of round-off are the same line of code and must not read
+    the same in a log.
+
+    ``max_rel = nan`` means the question was UNANSWERABLE on this deck —
+    no non-identity little-group op at any measured parent — and is
+    reported as such rather than as a pass.  That is the same rule
+    ``boundary_min_gaps`` follows for a truncated window.
+    """
+    if not sanity_enabled():
+        return True
+    rel = float(cov.get("max_rel", float("nan")))
+    detail = ""
+    if removed is not None:
+        detail = (f"  fixed-q TRS projector removed "
+                  f"{float(removed):.3e} (relative).")
+    if not np.isfinite(rel):
+        print_fn(
+            f"  sanity[{name}]: parent point-group covariance NOT MEASURABLE "
+            f"on this deck ({int(cov.get('n_parents', 0))} parent(s) "
+            f"measured, no non-identity little-group op).  The IBZ->full-BZ "
+            f"unfold's covariance assumption is UNTESTED here, not "
+            f"verified.{detail}")
+        return True
+    coverage = (f"{int(cov.get('n_ops_sampled', 0))}/"
+                f"{int(cov.get('n_ops_available', 0))} little-group ops over "
+                f"{int(cov.get('n_parents', 0))} parent(s)")
+    if rel > float(rtol):
+        warn(
+            f"{name} parent tiles are NOT point-group covariant: "
+            f"max|S·V_p·S^-1 - V_p|/max|V| = {rel:.3e} > {float(rtol):.1e} "
+            f"(abs {float(cov.get('max_abs', float('nan'))):.3e} on scale "
+            f"{float(cov.get('scale', float('nan'))):.3e}, worst at IBZ "
+            f"parent {int(cov.get('worst_parent', -1))} under sym row "
+            f"{int(cov.get('worst_sym', -1))}; {coverage}).  The "
+            f"IBZ->full-BZ unfold reconstructs V_{{-q}} from V_q by a "
+            f"SPATIAL operation, so the stored V_{{-q}} depends on WHICH op "
+            f"was picked by exactly this residual, and an ordinary "
+            f"finite-fit covariance error is thereby converted into a "
+            f"q<->-q reciprocity error.  Diagnose the zeta solve "
+            f"(conditioning of zeta at this q), not the unfold.{detail}",
+            print_fn=print_fn,
+        )
+        return False
+    print_fn(f"  sanity[{name}]: parent point-group covariance = {rel:.3e} "
+             f"({coverage}).{detail}")
     return True
 
 

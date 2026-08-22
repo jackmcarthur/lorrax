@@ -1,11 +1,19 @@
-"""The q-grid symmetry decision, taken once and said out loud.
+"""The q-grid symmetry decisions, taken once and said out loud.
 
-WHAT THIS MODULE IS.  One function.  It asks
-``symmetry_maps.resolve_qgrid_symmetry`` whether this deck's centroid set
-admits the IBZ q reduction, and — when it does not — emits ONE rank-0
-announcement per run naming the failed closure and its consequence.  Every
-producer of the q-axis tables in ``gw/`` goes through here; nothing else
-in the monorepo calls ``centroid_source_map_and_wrap``, and
+WHAT THIS MODULE IS.  Two functions, one per decision, and both are
+announcing adapters over ``symmetry_maps``:
+
+* :func:`resolve_qgrid_symmetry_tables` — does this deck's centroid set
+  admit the IBZ q reduction at all?
+* :func:`qgrid_trs_policy_for` — what is TIME REVERSAL allowed to do to
+  the q axis of this deck?  The answer comes from the load-time density
+  MEASUREMENT (``SymMaps.trs_allowed``), never from an assumption, and it
+  arrives as one object the driver consumes rather than a branch the
+  driver takes.
+
+Every producer of the q-axis tables in ``gw/`` goes through here; nothing
+else in the monorepo calls ``centroid_source_map_and_wrap``, composes q
+with −q through Θ, or applies the fixed-q Θ projector, and
 ``tests/test_qgrid_symmetry_resolution.py`` is the ratchet that says so.
 
 WHY IT EXISTS.  Before the consolidation, the closure question was asked
@@ -125,122 +133,64 @@ def resolve_qgrid_symmetry_tables(
     return res
 
 
-def trs_pair_coherent_unfold_sym_idx(
-    irr_idx, sym_idx, *, kgrid, q_irr_full_idx, n_sym_spatial,
+def qgrid_trs_policy_for(
+    *,
+    sym,
+    irr_idx_q,
+    sym_idx_q,
+    kgrid,
+    n_sym_spatial,
+    context: str,
+    announce: bool = True,
 ):
-    """Choose one spatial realization for every non-TRIM q/-q pair.
+    """The q-axis time-reversal policy for this deck, announced once.
 
-    A centrosymmetric crystal can map both q and -q from one irreducible
-    parent using two unrelated *spatial* rows.  That is mathematically
-    equivalent only when the operator stored in the finite ISDF basis is
-    exactly point-group covariant.  The scalar-Si production discriminator
-    showed why an unfold must not rely on that stronger condition: its
-    closed 50-band wavefunction subspace is covariant at 2.19e-9, while the
-    648-centroid fitted operator is not covariant closely enough to survive
-    the ill-conditioned zeta solve.
+    THE ONLY DOOR.  ``symmetry_maps.qgrid_trs`` holds the policy (it holds
+    the tables and the arithmetic); this adapter holds rank 0, the
+    once-per-run memory, and — the whole point — the MEASURED verdict.
 
-    Keep one member's selected spatial row and make the other member use the
-    same row composed with time reversal.  ``unfold_isdf_operator`` then
-    applies its derived conjugation rule, so q/-q reciprocity depends only on
-    TRS and not on an unrelated spatial gauge.  When every full-BZ q row was
-    solved independently there is no unfold relation to choose: return the
-    original rows unchanged.  Irreducible representatives and self-negative
-    q rows are unchanged; no value is averaged or projected.
+    ``trs_measured`` is read off ``SymMaps.trs_allowed``, which
+    ``SymMaps.__init__`` takes from ``WfnLoader.trs_holds``, which
+    ``density_symmetry_check`` obtained by building the spin-resolved
+    density from the raw IBZ wavefunctions.  No caller of this function
+    passes a verdict of its own, and the policy constructor has no default
+    for it, so there is no path by which a driver can assume time reversal.
 
-    This policy was first shipped for ladder W in ``screening_bse``.  It is
-    owned here because bare V, RPA W, and ladder W must use the same q-grid
-    realization.
+    THE DEFECT THIS CLOSES.  ``v_q_g_flat``, ``screening`` and
+    ``screening_bse`` each composed q with −q through Θ and projected the
+    self-negative rows *unconditionally*.  On ferromagnetic CrI3
+    (Perlmutter JID 57271494) q and −q are independent irreducible
+    parents, so the composition refused — after the 685.96-GB ζ fit had
+    completed.  Where the parents had coincided it would have silently
+    replaced one independently solved row by the conjugate of the other.
+
+    Returns
+    -------
+    symmetry_maps.QgridTrsPolicy
+        ``.unfold_sym_idx`` is the row map to hand
+        ``unfold_isdf_operator``; ``.project_fixed_q(op, q_full_idx)``
+        returns ``(op, removed_rel)``; ``.measure_covariance(V_ibz, ...)``
+        measures the point-group assumption the unfold makes.
     """
-    grid = tuple(int(v) for v in kgrid)
-    n_full = int(np.prod(grid))
-    irr = np.asarray(irr_idx, dtype=np.int32)
-    original = np.asarray(sym_idx, dtype=np.int32)
-    n_spatial = int(n_sym_spatial)
-    if irr.shape != (n_full,) or original.shape != (n_full,):
-        raise ValueError(
-            "GATE trs_pair_unfold_map: irr_idx and sym_idx must each have "
-            f"the full k-grid extent {n_full}; got {irr.shape} and "
-            f"{original.shape} for kgrid={grid}.")
-    if (n_spatial <= 0 or np.any(original < 0)
-            or np.any(original >= 2 * n_spatial)):
-        lo = int(original.min()) if original.size else 0
-        hi = int(original.max()) if original.size else -1
-        raise ValueError(
-            "GATE trs_pair_unfold_map: symmetry rows must lie in "
-            f"[0, 2*n_sym_spatial) with n_sym_spatial={n_spatial}; got "
-            f"range [{lo}, {hi}].")
+    from ffi import _services
+    _services.ensure_on_path()
+    from ffi.gate import announce_once
+    from symmetry_maps import build_qgrid_trs_policy
 
-    reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
-    out = original.copy()
-    # An orbit-closed centroid set can still have no q reduction, for example
-    # when the WFN exposes only the identity spatial operation.  Every q is
-    # then a solved source row.  Rewiring q/-q would discard one independent
-    # result and the guard below correctly rejects their distinct parents;
-    # the owning policy is instead the identity map.
-    if len(reps) == n_full:
-        return out
-    coords = np.stack(np.unravel_index(np.arange(n_full), grid), axis=1)
-    neg = np.ravel_multi_index(
-        tuple(((-coords) % np.asarray(grid, dtype=np.int64)).T), grid)
-    for iq, jq_value in enumerate(neg):
-        jq = int(jq_value)
-        if iq >= jq:
-            continue
-        if int(irr[iq]) != int(irr[jq]):
-            raise ValueError(
-                "GATE trs_pair_unfold_map: q and -q do not share an "
-                f"irreducible parent ({iq}->{int(irr[iq])}, "
-                f"{jq}->{int(irr[jq])}).  A TRS composition is valid only "
-                "for one solved wedge row; do not fabricate reciprocity "
-                "across two independently solved rows.")
-
-        if iq in reps:
-            source = iq
-        elif jq in reps:
-            source = jq
-        elif (original[iq] < n_spatial) != (original[jq] < n_spatial):
-            source = iq if original[iq] < n_spatial else jq
-        else:
-            source = iq
-        partner = jq if source == iq else iq
-        source_row = int(original[source])
-        out[partner] = (source_row + n_spatial
-                        if source_row < n_spatial
-                        else source_row - n_spatial)
-    return out
-
-
-def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
-    """Apply the one-element TRS group projector at q == -q.
-
-    Pair-coherent unfold handles every two-element q/-q orbit without
-    changing a solved value.  A TRIM row is a one-element orbit, so there is
-    no partner row from which to reconstruct it: the exact constraint is
-    ``A_q = conj(A_q)`` in the restart convention.  A finite band sum or an
-    ill-conditioned ISDF backsolve can leave a small anti-TRS component even
-    when the non-TRIM pairs are exact.  Remove only that component with the
-    unique group average ``(A + conj(A))/2``.
-
-    ``operator`` remains distributed exactly as supplied; this is an
-    elementwise operation and performs no host gather.  ``q_full_idx`` names
-    the full-grid point represented by each leading-axis row, so the helper
-    works on either an irreducible wedge or the full BZ.
-    """
-    import jax.numpy as jnp
-
-    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
-    qidx = np.asarray(q_full_idx, dtype=np.int64).reshape(-1)
-    n_full = int(np.prod(grid))
-    if np.any(qidx < 0) or np.any(qidx >= n_full):
-        raise ValueError(
-            "GATE trs_fixed_q_projector: q_full_idx lies outside the "
-            f"full k-grid extent {n_full}: {qidx.tolist()}.")
-    if int(operator.shape[0]) != int(qidx.size):
-        raise ValueError(
-            "GATE trs_fixed_q_projector: operator q extent does not match "
-            f"q_full_idx ({int(operator.shape[0])} != {int(qidx.size)}).")
-    coords = np.stack(np.unravel_index(qidx, tuple(grid)), axis=1)
-    fixed = np.all((2 * coords) % grid[None, :] == 0, axis=1)
-    mask = jnp.asarray(fixed).reshape((qidx.size,) + (1,) * (operator.ndim - 1))
-    projected = 0.5 * (operator + jnp.conj(operator))
-    return jnp.where(mask, projected, operator)
+    policy = build_qgrid_trs_policy(
+        trs_measured=bool(sym.trs_allowed),
+        irr_idx_q=irr_idx_q,
+        sym_idx_q=sym_idx_q,
+        q_irr_full_idx=sym.q_irr_full_idx,
+        kgrid=tuple(kgrid),
+        n_sym_spatial=int(n_sym_spatial),
+        context=str(context),
+    )
+    if announce:
+        # Rank-invariant (the verdict and the tables are the same on every
+        # rank), so scope="rank0"; keyed on the verdict + grid + context so
+        # repeat resolves along a self-consistency loop are silent while a
+        # genuinely different channel still gets its own line.
+        announce_once(policy.announce_key, policy.announcement(),
+                      scope="rank0")
+    return policy
