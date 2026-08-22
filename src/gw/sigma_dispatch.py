@@ -920,16 +920,46 @@ def compute_sigma_xc(
         # precisely to elide the P-independent full-cube gather, so
         # "replicated" would be an allgather sold as a fallback
         # (decisions.md 2026-08-05).
-        if str(config.sigma.omega_layout) != "sharded":
-            raise ValueError(
-                f"compute_mode = mpa requires sigma_omega_layout = sharded "
-                f"(got {config.sigma.omega_layout!r}).  The MPA Sigma "
-                f"executor accumulates Sigma_c(w,k,m,n) directly at "
-                f"P(None,None,'x','y') on the existing mesh and has no "
-                f"replicated plan; honoring 'replicated' would mean "
-                f"gathering the full cube on every rank, which is the "
-                f"P-independent collective the sharded layout exists to "
-                f"elide.  Set sigma_omega_layout = sharded.")
+        #
+        # BUT REFUSE ONLY A DECK THAT SAID IT.  ``sigma_omega_layout``'s
+        # DEFAULT is ``replicated``, so a bare refusal on the resolved
+        # value fires on every insulating MPA deck that never mentioned
+        # the key -- a flag day for decks that are not wrong about
+        # anything.  TASTE 13 draws exactly this line: an off-dial may
+        # refuse, a typo never does, and a value nobody typed is not a
+        # request.  The parser records the raw keys it saw
+        # (``GWConfig.raw_input_keys``), so the question is asked of that
+        # -- the same idiom ``restart_q_storage.deck_named_the_key`` uses,
+        # including its conservative answer when the record is absent.
+        # A deck that DID name ``replicated`` still refuses: honouring it
+        # would mean gathering the full cube on every rank, which is the
+        # P-independent collective the sharded layout exists to elide
+        # (decisions.md 2026-08-05, refuse rather than gather).
+        _layout = str(config.sigma.omega_layout)
+        if _layout != "sharded":
+            _seen = getattr(config, "raw_input_keys", None)
+            try:
+                _named = _seen is not None and "sigma_omega_layout" in _seen
+            except TypeError:                            # pragma: no cover
+                _named = False
+            if _named:
+                raise ValueError(
+                    f"compute_mode = mpa requires sigma_omega_layout = "
+                    f"sharded, and this deck NAMES {_layout!r}.  The MPA "
+                    f"Sigma executor accumulates Sigma_c(w,k,m,n) directly "
+                    f"at P(None,None,'x','y') on the existing mesh and has "
+                    f"no replicated plan; honoring 'replicated' would mean "
+                    f"gathering the full cube on every rank, which is the "
+                    f"P-independent collective the sharded layout exists "
+                    f"to elide.  Set sigma_omega_layout = sharded, or drop "
+                    f"the key (its default resolves to sharded under mpa).")
+            print_fn(
+                f"  sigma_omega_layout: resolved to 'sharded' for "
+                f"compute_mode = mpa (deck did not name the key; its "
+                f"default {_layout!r} has no MPA plan -- the executor's "
+                f"accumulator is born P(None,None,'x','y')).  A deck that "
+                f"NAMES 'replicated' under mpa is refused rather than "
+                f"gathered.")
         # The effective Sigma broadening, from the SAME resolver the PPM
         # driver uses.  MPA used to take ``regularization_ev`` raw while
         # GN-PPM silently raised it to a window-dependent conditioning
