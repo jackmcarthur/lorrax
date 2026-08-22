@@ -1625,6 +1625,18 @@ _DEFAULTS = {
     # all three forms at the logical zeta window.
     "band_chunk_size": 16,
     "r_chunk_size": 0,
+    # Two-face 2-D-sharded ψ carrier (gw.wavefunction_bundle
+    # layout="face") in place of the legacy four single-axis copies:
+    # 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py.
+    # Default false = layout="legacy", the exact existing construction
+    # path, bit-identical.  NOT an env var (decisions.md: physics- and
+    # routing-relevant choices are declared inputs, not environment).
+    # Narrow envelope while G/Sigma/head/rotation/exact-response
+    # consumers are ported one at a time (see
+    # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md §6); an
+    # unsupported combination refuses by name rather than silently
+    # falling back to legacy.
+    "low_mem_bands": False,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -3543,6 +3555,7 @@ class MemoryConfig:
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
+    low_mem_bands: bool           # gw.wavefunction_bundle layout="face"
 
 
 @dataclass(frozen=True)
@@ -4439,6 +4452,7 @@ class LorraxConfig:
             r_chunk_override=int(_g("r_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
+            low_mem_bands=bool(_g("low_mem_bands")),
         )
         # SlabIO routing + auto-route GPU FFIs off on the CPU backend.
         # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both

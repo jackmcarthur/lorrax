@@ -69,6 +69,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "band_chunk_size": ("ISDF / zeta", "Bands per chunk in the band-chunked FFT/pair-density loops."),
     "r_chunk_size": ("ISDF / zeta", "Real-space columns per zeta-fit chunk; 0 = auto from the memory model."),
     "memory_per_device_gb": ("ISDF / zeta", "Per-device memory budget for the chunk planners; 0 = auto-detect."),
+    "low_mem_bands": ("ISDF / zeta", "Two-face 2-D-sharded psi carrier (gw.wavefunction_bundle layout=\"face\": psi_nmu/psi_mun, both P(None,'x','y') at the (s,mu) GEMM seam) in place of the legacy four single-axis copies. 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py. Default false = layout=\"legacy\", bit-identical to every deck written before this key existed. Narrow envelope while consumers are ported one at a time; an unsupported combination (head_correction=full, qp_solver=self_consistent, mpa_material_class=metal, bispinor=true, explicit dense Gij) refuses by name rather than silently falling back to legacy."),
     # ---- Screening ----
     "do_screened": ("Screening", "Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it."),
     "screening_method": ("Screening", "chi0 frequency treatment (minimax quadrature is the only production method)."),
