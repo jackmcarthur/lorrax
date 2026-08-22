@@ -348,8 +348,14 @@ def _report_band_extrapolation(
         # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
         # it, so the reported numbers are in the same unit as every other Σ
         # line in the log and the formatter needs no scale of its own.
+        # ``clamp``, named.  These three points are a band-count FIT input,
+        # and the fit's own trust verdict is what judges them; masking an
+        # uncovered state to nan here would poison the fit for the covered
+        # ones through the same least squares.  The count is reported once
+        # at the output path, on the same grid and the same eval energies.
         points.append(interp_along_omega(
-            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
+            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev,
+            out_of_range="clamp"))
     s_at_counts = np.stack(points)
 
     # ── WHICH ESTIMATOR ─────────────────────────────────────────────────

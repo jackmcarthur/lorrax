@@ -445,13 +445,19 @@ def _to_host_np(a, dtype=np.complex128, *, tiled: bool = False):
     # is unchanged.
     if not getattr(a, "is_fully_addressable", True):
         tiled = True
-    try:
-        return np.asarray(
-            jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
-            dtype=dtype,
-        )
-    except Exception:
-        return np.asarray(jax.device_get(a), dtype=dtype)
+    # NO FALLBACK, AND THAT IS THE FIX.  This used to catch bare ``Exception``
+    # and retry with ``jax.device_get``, which is the SECOND gather of the
+    # same array and cannot succeed where the first failed on a globally
+    # sharded operand -- the comment above records both deaths.  What the
+    # fallback bought was not recovery but a WORSE error message: the run
+    # died one frame later inside device_get, reporting "Fetching value for a
+    # jax.Array that spans non-addressable devices" instead of whatever
+    # process_allgather actually objected to.  A gather that cannot gather is
+    # a failure; it is allowed to say so.
+    return np.asarray(
+        jax.experimental.multihost_utils.process_allgather(a, tiled=tiled),
+        dtype=dtype,
+    )
 
 
 def _to_host_scalar(a, dtype=float):

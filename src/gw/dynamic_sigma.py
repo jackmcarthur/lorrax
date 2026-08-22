@@ -9,6 +9,7 @@ lives here exactly once.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,41 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
+
+
+@dataclass(frozen=True)
+class OmegaCoverage:
+    """WHICH (k, n) the Sigma(omega) grid actually sampled, and what was done.
+
+    Returned beside the at-DFT Sigma_c so that every artifact written from
+    it can say which of its cells are measurements and which are endpoint
+    values.  Before this existed the two were indistinguishable on disk: the
+    exact-origin Na run wrote finite semicore EQP values whose stored
+    ``sigC`` is bit-for-shown-digits the ``omega = -5 eV`` endpoint of
+    ``sigma_mnk.h5`` rather than Sigma at the state's DFT energy, and the
+    only trace was a ``QSGW: 10142 clipped (41.3%)`` line in the log.
+
+    ``mask_kn`` is True where the state WAS sampled.  ``policy`` is the
+    resolved :data:`gw.qsgw_utils.OUT_OF_RANGE_POLICIES` value, so a reader
+    knows whether the uncovered cells hold an endpoint value (``clamp``) or
+    a non-finite marker (``mask``); ``refuse`` never reaches a consumer.
+    """
+
+    mask_kn: np.ndarray
+    n_uncovered: int
+    fraction_uncovered: float
+    omega_min_ev: float
+    omega_max_ev: float
+    policy: str
+
+    def summary(self) -> str:
+        """One line, suitable for an artifact comment or a log."""
+        return (f"omega_coverage: {self.n_uncovered} of "
+                f"{int(np.asarray(self.mask_kn).size)} "
+                f"({100.0 * self.fraction_uncovered:.2f}%) evaluation "
+                f"energies outside the sampled grid "
+                f"[{self.omega_min_ev:.4f}, {self.omega_max_ev:.4f}] eV; "
+                f"out_of_range_policy={self.policy}")
 
 
 def add_head_sigma_diag(
@@ -79,9 +115,13 @@ def eval_sigma_c_at_dft_energies(
     would be stamped as a metal's chemical potential.  Pass it.
 
     Returns ``(sigma_c_at_dft_ev, omega_dft_rel_ev, efermi_dft_ev,
-    provenance)``.  THE PROVENANCE IS RETURNED, not re-derived by the
-    caller: the writer that stamps the answer into ``sigma_mnk.h5`` must
-    record the same one it interpolated with, not a second opinion.
+    provenance, coverage)``.  THE PROVENANCE IS RETURNED, not re-derived by
+    the caller: this function owns the ``efermi_ry is None`` decision, and
+    the writer that stamps the answer into ``sigma_mnk.h5`` must record the
+    same one it interpolated with, not a second opinion about it.  The
+    :class:`OmegaCoverage` rides beside it for exactly the same reason — the
+    at-DFT array cannot say by itself which of its cells were sampled and
+    which are grid endpoints.
     """
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
@@ -104,19 +144,38 @@ def eval_sigma_c_at_dft_energies(
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
-    from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
+    from .qsgw_utils import (extract_sigma_diag_replicated,
+                             interp_along_omega, omega_coverage,
+                             resolve_out_of_range_policy)
     sig_c_diag = (
         np.asarray(extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
         * RYD_TO_EV)
+    grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    # THE OUTPUT PATH, so the policy is named and the count is REPORTED.
+    # Until 2026-08-22 this call clamped every uncovered state to the grid
+    # endpoint and said nothing, and the eqp0/eqp1 writer downstream wrote
+    # those endpoint values as if they were Sigma at the state's own energy
+    # (measured ~4 eV on the Na semicore deck; 41.3% of cells).  The SC
+    # Hamiltonian path has always counted and rerouted these cells; this is
+    # the output path catching up.
+    policy = resolve_out_of_range_policy()
+    covered, n_uncovered, frac_uncovered = omega_coverage(
+        grid_ev, omega_dft_rel_ev)
     sigma_c_at_dft_ev = interp_along_omega(
-        sig_c_diag, np.asarray(config.omega_grid_ev, dtype=np.float64),
-        omega_dft_rel_ev)
+        sig_c_diag, grid_ev, omega_dft_rel_ev,
+        out_of_range=policy, context="Sigma_c at E_DFT (eqp0/eqp1)",
+        print_fn=print_fn)
 
     return (
         sigma_c_at_dft_ev,
         omega_dft_rel_ev,
         efermi_dft_ev,
         provenance,
+        OmegaCoverage(mask_kn=covered, n_uncovered=n_uncovered,
+                      fraction_uncovered=frac_uncovered,
+                      omega_min_ev=float(grid_ev[0]),
+                      omega_max_ev=float(grid_ev[-1]),
+                      policy=policy),
     )
 
 
@@ -138,6 +197,9 @@ def write_sigma_omega(
     mesh_xy,
     omega_reference_ev,
     omega_reference_provenance,
+    eval_energies_rel_ev,
+    eval_energies_provenance,
+    omega_coverage=None,
     sym=None,
     band_extrapolation=None,
     print_fn=None,
@@ -150,6 +212,24 @@ def write_sigma_omega(
     relative to produces the unstamped file audit A2 is about.  Both come
     straight from :func:`eval_sigma_c_at_dft_energies`, which owns the
     choice.
+
+    ``eval_energies_rel_ev`` / ``eval_energies_provenance`` are REQUIRED for
+    the same reason, one question further along.  The ω reference says what
+    the AXIS is measured from; these say WHERE THIS Σ WAS EVALUATED, which
+    is a different fact and was the one the file did not carry.  A from-disk
+    reassembly (``eqp_bgw.make_eqp_bgw``) therefore could not distinguish a
+    one-shot cube (evaluated at E_DFT, so centring eqp1's linearization
+    there is correct) from a self-consistent one (evaluated at the converged
+    QP spectrum, where centring at E_DFT is a different and wrong
+    calculation).  Its docstring says so plainly — "Nothing in the files
+    distinguishes the two cases, so this function will not guess" — and the
+    guess it then made silently was E_DFT.  ``eval_energies_provenance`` is
+    ``"at_e_dft"`` or ``"self_consistent_qp"``, MEASURED by the caller as an
+    array comparison rather than inferred from a config key.
+
+    ``omega_coverage`` is the optional :class:`OmegaCoverage` for the at-DFT
+    interpolation; given it, the file states how many of its evaluation
+    energies were never sampled and what was done about them.
 
     ``band_extrapolation`` is the optional
     ``{"arrays": {...}, "attrs": {...}}`` the Σ_c band-convergence fit
@@ -198,6 +278,9 @@ def write_sigma_omega(
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
             sigma_regularization=sigma_regularization,
+            eval_energies_rel_ev=eval_energies_rel_ev,
+            eval_energies_provenance=eval_energies_provenance,
+            omega_coverage=omega_coverage,
             band_extrapolation=band_extrapolation,
             print_fn=print_fn,
         )
@@ -212,6 +295,9 @@ def write_sigma_omega(
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,
         sigma_regularization=sigma_regularization,
+        eval_energies_rel_ev=eval_energies_rel_ev,
+        eval_energies_provenance=eval_energies_provenance,
+        omega_coverage=omega_coverage,
         band_extrapolation=band_extrapolation,
         print_fn=print_fn,
     )
@@ -219,6 +305,7 @@ def write_sigma_omega(
 
 
 __all__ = [
+    "OmegaCoverage",
     "add_head_sigma_diag",
     "eval_sigma_c_at_dft_energies",
     "sigma_omega_output_path",

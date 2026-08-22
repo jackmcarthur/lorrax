@@ -89,6 +89,55 @@ def _mesh_device_coords(mesh: Mesh) -> dict:
     return coords
 
 
+def assert_band_chunks_divisible(band_chunk_ranges, world_size: int) -> None:
+    """Refuse a band chunk whose width the per-rank tile would floor-divide.
+
+    THE FLOOR DIVISION IS THE DEFECT SITE, so this is the refusal site.
+    :class:`PsiGStore` splits each chunk's bands across all ``P`` ranks as
+    ``(b_hi - b_lo) // P``; a width that is not a multiple of ``P`` loses
+    ``width % P`` bands right there, in the store's own band accounting,
+    and every consumer downstream then works on a store that is short
+    those bands with the right shape, the right dtype and no other
+    symptom.
+
+    MEASURED (JID 57187694,
+    ``reports/zeta_residue_2026-08-17/evidence/baseline_p4.log``): on the
+    80 Ry scalar-Si deck the P=4 baseline's logical 50-band window split
+    16+16+16+2; the last chunk gives ``bpd = 2 // 4 = 0`` and its two
+    bands contributed nothing to ``z_q`` — at rc=0.
+
+    ``gw.isdf_fitting`` fixed the PRODUCTION path on 2026-08-17 by padding
+    the transport range up to a ``P`` multiple (``_bfe_transport``), and
+    ``isdf.core.z_q_from_psi_sm`` carries an equivalent consumer-side
+    check.  Neither makes this one redundant: a guard living in ONE
+    consumer is a guard the next consumer does not have, and the padding
+    lives in ONE producer.  This function is on the object that performs
+    the division, which is the only place every caller must pass through.
+
+    ``ValueError`` and not ``assert``: the fix is a user input key
+    (``band_chunk_size``), and an assert vanishes under ``python -O``,
+    re-arming exactly the silent band-dropping it guards.
+    """
+    p = int(world_size)
+    if p <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size!r}")
+    bad = [(i, int(b_lo), int(b_hi))
+           for i, (b_lo, b_hi) in enumerate(band_chunk_ranges)
+           if (int(b_hi) - int(b_lo)) % p]
+    if not bad:
+        return
+    detail = "; ".join(
+        f"chunk {i} = [{lo}, {hi}) is {hi - lo} bands, which floor-divides "
+        f"to {(hi - lo) // p} per rank and drops {(hi - lo) % p}"
+        for i, lo, hi in bad)
+    raise ValueError(
+        f"PsiGStore: band-chunk width is not divisible by the world size "
+        f"{p}, so the per-rank band tile would silently drop the "
+        f"remainder.  {detail}.  Set band_chunk_size to a multiple of {p}, "
+        f"or pad the transport range up to one the way gw.isdf_fitting "
+        f"does (`_bfe_transport`) and zero the non-physical tail bands.")
+
+
 class PsiGStore:
     """Host-resident ψ(G-flat) staging for ``build_psi_r_cache_sm``.
 
@@ -130,6 +179,7 @@ class PsiGStore:
         # compute the per-rank tile's band-axis offsets (bc-stacked
         # ordering); the per-rank tile's full band axis is contiguous
         # across all bcs and lives at ``self._per_rank_shape[1]``.
+        assert_band_chunks_divisible(self.band_chunk_ranges, p)
         bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
         self._bpd_per_bc = tuple(bpd_per_bc)
         # Padded uniform per-bc local band count — used by

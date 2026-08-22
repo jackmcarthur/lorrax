@@ -52,11 +52,16 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
         assert got_body is body and got_head is head
         return post_head
 
+    coverage = SimpleNamespace(
+        mask_kn=np.ones((1, 2), dtype=bool), n_uncovered=0,
+        fraction_uncovered=0.0, omega_min_ev=-1.0, omega_max_ev=1.0,
+        policy="clamp")
+
     def evaluate(got_sigma, **kwargs):
         calls.append("interp")
         assert got_sigma is post_head
         return (np.full((1, 2), 4.0), np.full((1, 2), 6.0), 7.0,
-                "fixed-N mu")
+                "fixed-N mu", coverage)
 
     def write(got_sigma, **kwargs):
         calls.append("write")
@@ -66,6 +71,15 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
         # the reference the interpolation above actually used.
         assert kwargs["omega_reference_ev"] == 7.0
         assert kwargs["omega_reference_provenance"] == "fixed-N mu"
+        # AND THE SECOND REFERENCE, added 2026-08-22: where this Sigma was
+        # EVALUATED.  ``e_qp_ev`` here is [[2, 3]] while E_DFT - E_F is
+        # [[6, 6]], so the two are NOT equal and the writer must be told
+        # ``self_consistent_qp`` -- a fact the finalize MEASURES with an
+        # array comparison rather than inferring from a config key.
+        np.testing.assert_array_equal(
+            kwargs["eval_energies_rel_ev"], np.asarray([[2.0, 3.0]]) - 7.0)
+        assert kwargs["eval_energies_provenance"] == "self_consistent_qp"
+        assert kwargs["omega_coverage"] is coverage
         return "/tmp/sigma_mnk.h5"
 
     def build(got_sigma, got_x, omega, energy, got_mesh):
@@ -113,6 +127,9 @@ def test_finalizer_owns_the_dynamic_tail_and_returns_sigma_result(monkeypatch):
     # absolute eV, because that is where eqp1 has to be linearized and the
     # writer cannot re-derive them (``eqp_bgw.compute_eqp_diag``).
     np.testing.assert_array_equal(result.e_eval_ev, [[2.0, 3.0]])
+    # And the coverage of the at-DFT interpolation rides out with it, so a
+    # writer downstream can say which of its cells are measurements.
+    assert result.omega_coverage is coverage
 
 
 def test_the_sc_driver_does_not_overwrite_the_finalize_omega_reference():

@@ -2403,6 +2403,60 @@ def _scissor_E_qp_for_outofrange(
     return jnp.asarray(out_ev / RYD_TO_EV), fit
 
 
+def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
+                             call_index: int, role: str) -> None:
+    """Refuse a map-output column that is identically zero, or not a number.
+
+    THE COLUMN THIS FILE DOCUMENTS IS ``eigvalsh(F(H_in))``.  A Hermitian
+    QP Hamiltonian on a real deck has no all-zero spectrum: every band
+    energy would have to be exactly 0 Ry at every k.  So an all-zero column
+    is not a small answer, it is an ABSENT one — and it is indistinguishable
+    on disk from a converged one.
+
+    MEASURED 2026-08-15 on the sodium 48b one-shot metallic arms
+    (`runs/Na/02_soc48b_qsgw_mpa/01_lorrax_metal_mpa/r4_np*/eqp0_iter0000.dat`,
+    4 arms x 1392 rows, all four byte-identical apart from the timestamp):
+    the column was written as zeros and the writer's own header diagnostic
+    came out as `map_output_RMS_dE_prev_output = 2.467681671e+01 eV`, which
+    is simply RMS|E_DFT| — the signature of subtracting zero.  The campaign's
+    `r6_residual.py` computes `d = e_qp - prev` from exactly these files, so
+    it would have read a zero residual and reported a FALSE converged from
+    call 1 onward, and `r4_grid_floor.py` returned a `0.000000000e+00`
+    "floor" from the same source.
+
+    Non-finite is refused here too, and for the same reason as
+    ``sanity.refuse_nonfinite``: an eqp snapshot is a shipped artifact.  The
+    writer below (`eqp_bgw.write_bgw_eqp`) also refuses non-finite columns;
+    this fires first so the message names the MAP CALL rather than the file.
+    """
+    arr = np.asarray(e_output_kn_ev, dtype=np.float64)
+    where = f"SC map {int(call_index):04d} (role={role})"
+    if arr.size == 0:
+        raise ValueError(
+            f"{where}: the map-output spectrum is EMPTY. "
+            f"eqp0_iter{int(call_index):04d}.dat documents its second column "
+            f"as eigvalsh(F(H_in)); there is nothing to write, and an empty "
+            f"snapshot is read downstream as a zero residual.")
+    if not np.all(np.isfinite(arr)):
+        n_bad = int(np.count_nonzero(~np.isfinite(arr)))
+        raise ValueError(
+            f"{where}: the map-output spectrum has {n_bad} non-finite "
+            f"entries of {arr.size}.  Refusing to write "
+            f"eqp0_iter{int(call_index):04d}.dat: a residual script reading "
+            f"it cannot distinguish NaN from converged, and the exit code "
+            f"will not tell you either.")
+    if not np.any(arr):
+        raise ValueError(
+            f"{where}: the map-output spectrum is identically ZERO over all "
+            f"{arr.shape} entries.  That is not a spectrum — eigvalsh of a "
+            f"real QP Hamiltonian is not all-zero — so the map produced no "
+            f"output and the snapshot is refused rather than written.  "
+            f"MEASURED signature: the header's "
+            f"map_output_RMS_dE_prev_output then comes back as RMS|E_DFT| "
+            f"(24.68 eV on the sodium 48b one-shot metallic arm), and every "
+            f"downstream residual reads zero, i.e. FALSE converged.")
+
+
 def _write_sc_eqp_snapshot(
     inputs: SCInputs,
     state_out: SCState,
@@ -2412,6 +2466,8 @@ def _write_sc_eqp_snapshot(
     role: str,
     rms_ev: float,
     rms2_ev: float,
+    prev_output_role: str,
+    verdict: ConvergenceVerdict,
 ) -> str | None:
     """Write one small BGW-shaped record of a completed SC map call.
 
@@ -2421,6 +2477,28 @@ def _write_sc_eqp_snapshot(
     rCROP trial outputs are useful diagnostics but are not accepted iterates.
     This is not a second implementation of BGW's final ``eqp0`` / ``eqp1``
     equations; those remain solely in :mod:`gw.eqp_bgw`.
+
+    WHICH NUMBER IS THE RESIDUAL, AND WHICH IS NOT.  ``verdict`` is
+    :func:`protected_band_convergence` on THIS call's output against THIS
+    call's own input, over the non-scissored set — the fixed-point residual
+    the driver actually stops on.  It is stamped, labelled as the criterion,
+    with its max-abs beside its RMS.
+
+    ``rms_ev`` / ``rms2_ev`` are the historical output-vs-previous-output
+    diagnostics and they are stamped as such, now WITH the previous call's
+    role.  That role is the whole reason the old stamp misled: under rCROP
+    the preceding call alternates trial / accepted, and a trial step sits
+    near its accepted neighbour by construction, so the number understates
+    the accepted-iterate residual.  MEASURED 2026-08-14 by re-analysing an
+    accepted MPA QSGW run's retained snapshots
+    (`mpa_si_output_lifecycle_0814/run/qp_convergence/eqp0_iter0000..0004.dat`):
+    the ledger figure **2.6571 meV** is a trial-to-accepted all-band RMS,
+    while the last accepted-to-accepted step (0002 -> 0004) moved
+    max|dE| = **50.87 meV** over the protected bands — a factor ~19, made of
+    2.6x (RMS to max-abs) and 5.5x (trial pair to accepted pair).  That run
+    was NOT converged at 2 meV, and the file said it was.  Both numbers are
+    kept because both are real; only one of them is the criterion, and now
+    the file says which.
 
     THE TWO WEDGES MEET HERE, and they are not the same size.  This writer
     is a ``.dat`` writer, so its rows are the **file wedge** —
@@ -2444,6 +2522,31 @@ def _write_sc_eqp_snapshot(
 
     from .eqp_bgw import write_bgw_eqp
 
+    # BEFORE the rank gate, on purpose.  ``e_output_kn_ev`` is a replicated
+    # host array, so the check is bit-identical on every rank and costs a
+    # reduction over (nk, nb); running it here makes the refusal COLLECTIVE
+    # instead of a rank-0 exception that leaves P-1 peers in the next
+    # collective.
+    e_output = np.asarray(e_output_kn_ev, dtype=np.float64)
+    _refuse_empty_map_output(e_output, call_index=call_index, role=role)
+    # AND THE NON-FINITE REFUSAL, HERE, FOR THE SAME REASON.  8c59cb3d put
+    # ``sanity.refuse_nonfinite`` inside ``write_bgw_eqp``, which this
+    # function calls BELOW the rank gate three lines down -- so on a NaN
+    # spectrum rank 0 would raise while P-1 peers walked into the next SC
+    # collective, turning a clean refusal into a hang.  That is exactly the
+    # hazard the paragraph above avoids for the empty-column check, and the
+    # cost argument is the same: ``e_output`` is a replicated host array, so
+    # the verdict is bit-identical on every rank.  The in-writer refusal
+    # stays as defence in depth for the terminal writers (``gw_output`` at
+    # end of run, where a rank-0 raise has no collective left to desert),
+    # but in the SC loop it can no longer be the first to fire.
+    from common import sanity
+    sanity.refuse_nonfinite(
+        f"SC map output E (call {int(call_index)}, role {role})", e_output,
+        print_fn=inputs.print_fn,
+        detail="this is the column the eqp snapshot reports as the map "
+               "output, and its RMS stamp is the convergence criterion.")
+
     if process_rank() != 0:
         return None
 
@@ -2458,7 +2561,6 @@ def _write_sc_eqp_snapshot(
         np.asarray(sym.unfolded_kpts, dtype=np.float64))
     e_dft = _to_file_wedge(
         np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
-    e_output = np.asarray(e_output_kn_ev, dtype=np.float64)
     if getattr(inputs, "kstar", None) is None:
         e_output = _to_file_wedge(e_output)          # loop ran full-BZ
     else:
@@ -2480,9 +2582,23 @@ def _write_sc_eqp_snapshot(
         f"SC map={int(call_index):04d} role={role}; columns are "
         "E_DFT reference and eigvalsh(F(H_in)) map output; rCROP trial "
         "outputs are not accepted iterates",
-        f"map_output_RMS_dE_prev_output={float(rms_ev):.9e} eV; "
+        # THE CRITERION, FIRST, AND NAMED AS SUCH.  Output against this
+        # call's OWN input, over the non-scissored set: the pair the driver
+        # stops on.  It is stamped max-abs-first because max-abs is the
+        # test and the RMS is 2.6x smaller on a real run.
+        f"map_fixedpoint_max_abs_dE_protected_ev="
+        f"{float(verdict.max_abs_ev):.9e}; "
+        f"map_fixedpoint_RMS_dE_protected_ev="
+        f"{float(verdict.rms_protected_ev):.9e}; "
+        f"n_protected={int(verdict.n_protected)} of {int(verdict.n_total)}; "
+        f"cutoff_ev={float(verdict.cutoff_ev):.9e}; "
+        f"converged={bool(verdict.converged)} "
+        "(THIS is the convergence criterion: F(H_in) against H_in)",
+        f"map_output_RMS_dE_prev_output={float(rms_ev):.9e} eV "
+        f"(prev call role={prev_output_role}); "
         f"map_output_RMS_dE_two_calls={float(rms2_ev):.9e} eV; "
-        "these are map-call diagnostics, not accepted-iterate residuals",
+        "these are map-call diagnostics over ALL active bands, not "
+        "accepted-iterate residuals — a trial neighbour understates them",
         f"active_scissored_bands_1based={active_labels}",
         ("active_scissor=none (all active bands lie on the Sigma grid)"
          if active_fit is None else
@@ -2583,6 +2699,17 @@ def run_self_consistency(
             inputs, state_new, e_new_ev,
             call_index=0, role="one_shot", rms_ev=rms,
             rms2_ev=float("nan"),
+            # There is no previous map call; the "previous output" the RMS
+            # is against is the DFT seed spectrum, and saying so is what
+            # stops it being read as a convergence residual.
+            prev_output_role="dft_seed",
+            verdict=protected_band_convergence(
+                e_new_ev, e_initial_ev,
+                np.asarray(inputs.partition.protected_mask,
+                           dtype=bool).reshape(-1),
+                np.asarray(inputs.partition.in_range_mask,
+                           dtype=bool).reshape(-1),
+                tol_ev),
         )
         return state_new, []
 
@@ -2625,6 +2752,11 @@ def _run_linear_mixing(
     rms_history: list[float] = []
     E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
     _e_history: list[np.ndarray] = [E_prev_ev.copy()]
+    #: Map OUTPUTS (pre-mix candidates), which is what the eqp snapshots
+    #: hold.  Separate from ``_e_history`` (accepted MIXED iterates) because
+    #: under ``mixing != 1`` those are two different sequences and the file
+    #: was stamped from the wrong one.
+    _out_history: list[np.ndarray] = [E_prev_ev.copy()]
     _protected = np.asarray(
         inputs.partition.protected_mask, dtype=bool).reshape(-1)
     _in_range = np.asarray(
@@ -2685,10 +2817,6 @@ def _run_linear_mixing(
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
-        _write_sc_eqp_snapshot(
-            inputs, state_map, E_candidate_ev,
-            call_index=it, role="linear", rms_ev=rms, rms2_ev=rms2,
-        )
         # SAME CRITERION AS rCROP.  ``E_candidate_ev`` is the UNMIXED map
         # output F(H); ``E_prev_ev`` is that call's input.  This used to
         # break on ``rms < tol_ev`` -- an RMS over ALL active bands
@@ -2697,6 +2825,26 @@ def _run_linear_mixing(
         verdict = protected_band_convergence(
             E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
         print_fn(f"    SC convergence: {verdict.summary()}")
+        # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
+        # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
+        # a stamp computed from ``E_new_ev`` (post-mix) described a
+        # different array than the file holds — wrong exactly when mixing is
+        # on, which is exactly when someone is watching it.  ``_out_history``
+        # holds map OUTPUTS, so ``map_output_RMS_dE_prev_output`` now means
+        # what its name says on both accelerators.
+        cand_rms = float(np.sqrt(np.mean(
+            (E_candidate_ev - _out_history[-1]) ** 2)))
+        _out_history.append(E_candidate_ev.copy())
+        cand_rms2 = (
+            float(np.sqrt(np.mean((E_candidate_ev - _out_history[-3]) ** 2)))
+            if len(_out_history) >= 3 else float("nan"))
+        _write_sc_eqp_snapshot(
+            inputs, state_map, E_candidate_ev,
+            call_index=it, role="linear",
+            rms_ev=cand_rms, rms2_ev=cand_rms2,
+            prev_output_role=("dft_seed" if it == 0 else "linear"),
+            verdict=verdict,
+        )
         if verdict.converged:
             state = last_evaluated
             break
@@ -2942,11 +3090,25 @@ def _run_rcrop(
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
         call_index = _iter_idx[0]
-        role = ("initial" if call_index == 0 else
-                "trial" if call_index % 2 else "accepted_input_map")
+
+        def _role_of(idx):
+            return ("initial" if idx == 0 else
+                    "trial" if idx % 2 else "accepted_input_map")
+
+        role = _role_of(call_index)
         _write_sc_eqp_snapshot(
             inputs, state_out, E_new,
             call_index=call_index, role=role, rms_ev=rms, rms2_ev=rms2,
+            # NAMING THE PREVIOUS CALL'S ROLE IS THE FIX.  ``rms`` is
+            # measured against ``_e_history[-1]``, i.e. the immediately
+            # preceding MAP CALL, which under rCROP alternates trial and
+            # accepted.  A trial step sits near its accepted neighbour by
+            # construction, so this pair understates the accepted-iterate
+            # residual (measured ~19x on the 2026-08-14 MPA QSGW run).  The
+            # criterion is stamped beside it from ``_verdict``.
+            prev_output_role=("dft_seed" if call_index == 0
+                              else _role_of(call_index - 1)),
+            verdict=_verdict,
         )
         print_fn(f"    SC convergence: {_verdict.summary()}")
         _iter_idx[0] += 1
@@ -3812,6 +3974,24 @@ def dump_sigma_omega_h5_final(
         # conventions differ by a measured 2.79 eV (audit A2).
         omega_reference_ev=sigma_result.efermi_dft_ev,
         omega_reference_provenance=sigma_result.omega_reference_provenance,
+        # AND THE SPECTRUM IT WAS EVALUATED AT, carried on the same result
+        # for the same reason.  Under self-consistency this is the converged
+        # QP spectrum, NOT E_DFT, and the file used to say nothing -- so a
+        # from-disk `eqp_bgw.make_eqp_bgw` reassembly of an SC run silently
+        # re-centred eqp1's linearization at E_DFT, which is a different
+        # calculation.  Relative to this cube's own omega reference, one
+        # subtraction, the same one the finalize made.
+        # Both halves or neither: the relative spectrum is meaningless
+        # without the reference it is relative to, and a half-stamped file
+        # would be worse than an unstamped one -- a reader cannot tell that
+        # the zero is missing.
+        eval_energies_rel_ev=(
+            None if (sigma_result.e_eval_ev is None
+                     or sigma_result.efermi_dft_ev is None)
+            else np.asarray(sigma_result.e_eval_ev, dtype=np.float64)
+            - float(sigma_result.efermi_dft_ev)),
+        eval_energies_provenance="self_consistent_qp",
+        omega_coverage=sigma_result.omega_coverage,
         sym=sym, print_fn=print_fn,
     )
     print_fn(f"  Σ_c(ω) tensor: {path}")

@@ -55,16 +55,34 @@ def _mesh_1x1():
 
 
 def _skip_if_no_fft_handler(exc: Exception):
-    """Skip ONLY on the named FFI-absence signature; re-raise anything else.
+    """Skip on ABSENCE.  FAIL on a library that is built and will not load.
 
     The τ kernel is FFI-required (decisions.md 2026-08-01), so a platform
     whose ``liblorrax_ffi*.so`` has no flat-k / gw_conv handler cannot run
     this gate at all.  That is an ABSENCE, not a measurement — and it must be
     reported as the named absence rather than swallowed into a green run.
+
+    ABSENT AND BROKEN ARE NOT THE SAME SKIP.  ``FfiLibraryUnusable`` used to
+    be in the skip list beside ``FfiLibraryNotBuilt``, which collapsed "no
+    build on this machine" (a legitimate gate) and "the build is present and
+    the dynamic linker refused it" (a defect) into one green-looking result.
+    That is the shape that hid 19 real failures in the linalg contract suite
+    on 2026-08-06; ``ffi_loader`` has raised the two types separately since
+    ``8352bcb`` and ``services/distrib_la/tests`` already branches on them.
+    A skip here reads as "not applicable on this machine", which for a
+    present-but-unloadable library is false, and a false not-applicable is
+    worse than a failure because it stops anyone looking.
     """
     txt = f"{type(exc).__name__}: {exc}"
-    for sig in ("FfiLibraryNotBuilt", "FfiLibraryUnusable",
-                "LORRAX_FFT_FFI", "handler"):
+    if "FfiLibraryUnusable" in txt or "FfiAbiMismatch" in txt:
+        raise AssertionError(
+            f"the FFI library IS BUILT and will not load: {txt}\n"
+            f"This is a DEFECT, not an unavailable platform, and it is "
+            f"reported as a failure on purpose.  Most likely a DT_NEEDED "
+            f"that cannot be resolved in this environment — check "
+            f"`readelf -d <so> | grep NEEDED` against `ldd <so> | grep "
+            f"'not found'` IN THE ENVIRONMENT THAT FAILED.") from exc
+    for sig in ("FfiLibraryNotBuilt", "LORRAX_FFT_FFI", "handler"):
         if sig in txt:
             pytest.skip(f"no FFT FFI handler on this platform — {txt}")
     raise exc

@@ -217,6 +217,8 @@ def _facts(**over):
         "device_kind": "cpu",
         "jax_platforms_env": "cpu",
         "x64": True,
+        "matmul_precision": "highest",
+        "matmul_precision_env": None,
         "jax_version": "0.9.1",
         "mesh_shape": (4, 4),
         "mesh_axes": ("x", "y"),
@@ -1018,3 +1020,111 @@ def test_the_public_surface_is_the_entry_point():
                  "collect_startup_facts", "format_startup_report"):
         assert name in runtime.__all__
         assert hasattr(runtime, name)
+
+
+# ---------------------------------------------------------------------------
+# Matmul precision — the TF32 pin, and the report line that proves it fired
+# ---------------------------------------------------------------------------
+#
+# The failure this guards is silent and large: XLA:GPU lowers f32 dots at
+# DEFAULT precision to TensorFloat32, and a complex64 dot decomposes into f32
+# dots, so the advertised c64 BSE-GMRES path carried a measured 1.902e-04
+# forward error against 3.215e-07 pinned (JID 57109889, gnppm_debug ladder
+# matvec).  Nothing in the tree pinned it, and nothing on screen said so.
+
+def test_the_report_states_the_resolved_matmul_precision():
+    text = _text(_facts())
+    assert "matmul precision" in text
+    assert "'highest'" in text
+
+
+def test_an_unpinned_matmul_precision_is_a_warning_not_silence():
+    """The NOT-VOID control: the pinned rendering must not also warn, or the
+    warning below would be unconditional and could not distinguish anything.
+    """
+    pinned = _text(_facts())
+    assert "TensorFloat32" not in pinned or "rather than TensorFloat32" in pinned
+    assert "WARNING: jax_default_matmul_precision" not in pinned
+
+    for bad in (None, "default", "high", "bfloat16"):
+        text = _text(_facts(matmul_precision=bad))
+        assert "WARNING: jax_default_matmul_precision" in text, (
+            f"precision {bad!r} rendered no warning — 'high' is a 3-pass tf32 "
+            f"decomposition on XLA:GPU, not fp32, and None is XLA's TF32 "
+            f"default")
+        assert "TensorFloat32" in text
+
+
+def test_bootstrap_pins_the_matmul_precision():
+    """The pin must be IN ``bootstrap``: a helper nobody calls is not a pin.
+
+    AST rather than a live ``bootstrap()`` call so this cell runs on a login
+    node without touching a backend.
+    """
+    src = open(os.path.join(_SRC, "runtime", "__init__.py")).read()
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "bootstrap")
+    called = {getattr(c.func, "id", None) for c in ast.walk(fn)
+              if isinstance(c, ast.Call)}
+    assert "pin_matmul_precision" in called, (
+        "runtime.bootstrap() does not pin jax_default_matmul_precision; every "
+        "f32/c64 dot then runs at TF32 on XLA:GPU")
+
+
+def test_an_unrecognised_precision_token_refuses():
+    """A typo in a precision knob must not resolve to TF32 by falling through.
+
+    ``high`` is refused ON PURPOSE and is the case worth naming: it looks
+    like the strongest of the three JAX spellings and on XLA:GPU it is a
+    3-pass tf32 decomposition, short of fp32.
+    """
+    saved = os.environ.get("LORRAX_MATMUL_PRECISION")
+    try:
+        for bad in ("high", "tf32", "bfloat16_3x", "HIGEST"):
+            os.environ["LORRAX_MATMUL_PRECISION"] = bad
+            with pytest.raises(ValueError, match="LORRAX_MATMUL_PRECISION"):
+                runtime.pin_matmul_precision()
+    finally:
+        if saved is None:
+            os.environ.pop("LORRAX_MATMUL_PRECISION", None)
+        else:
+            os.environ["LORRAX_MATMUL_PRECISION"] = saved
+
+
+def test_pin_matmul_precision_sets_the_live_config():
+    """And the pin actually lands on ``jax.config`` — the value the lowering
+    reads, not merely a string this module remembers."""
+    jax = pytest.importorskip("jax")
+    saved_env = os.environ.get("LORRAX_MATMUL_PRECISION")
+    # ATTRIBUTE, NOT ``jax.config.read``.  ``read`` refuses any flag that has
+    # a contextmanager, and this is one — measured on jax 0.5.3.dev20260822
+    # in the deployed image, where ``read`` raises AttributeError naming the
+    # flag.  ``runtime.read_matmul_precision`` is the one reader.
+    saved = getattr(jax.config, "jax_default_matmul_precision", None)
+    try:
+        os.environ.pop("LORRAX_MATMUL_PRECISION", None)
+        assert runtime.pin_matmul_precision() == "highest"
+        assert runtime.read_matmul_precision() in ("highest", "float32")
+        os.environ["LORRAX_MATMUL_PRECISION"] = "float32"
+        assert runtime.pin_matmul_precision() == "float32"
+        assert runtime.read_matmul_precision() == "float32"
+    finally:
+        jax.config.update("jax_default_matmul_precision", saved)
+        if saved_env is None:
+            os.environ.pop("LORRAX_MATMUL_PRECISION", None)
+        else:
+            os.environ["LORRAX_MATMUL_PRECISION"] = saved_env
+
+
+def test_the_startup_facts_can_actually_measure_the_precision():
+    """The field must be MEASURABLE, not merely present.
+
+    A reader that throws would leave ``matmul_precision`` permanently
+    unknown and the report permanently warning — which looks like a
+    finding and is a broken instrument.  This is the not-void half of the
+    warning cell above.
+    """
+    pytest.importorskip("jax")
+    runtime.pin_matmul_precision()
+    assert runtime.read_matmul_precision() in ("highest", "float32")

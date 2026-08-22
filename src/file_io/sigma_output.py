@@ -57,6 +57,13 @@ SIGMA_K_AXIS = {
 	# names rather than one reused name, so a file says which estimator made
 	# it even to a reader who never looks at the attributes.
 	"sigma_c_extrap_beta_kn": 0,
+	# The energies THIS Sigma was evaluated at, omega-relative, band
+	# diagonal (nk, nb) -> k is axis 0.  Registered here rather than merely
+	# written, so it rides the same star extraction and the same star-spread
+	# instrument as the cubes it describes: an evaluation spectrum that is
+	# not star-covariant would mean the cube's rows and its stamp disagree
+	# about which k they are.
+	"sigma_eval_rel_ev": 0,
 }
 
 #: The ω axis, and the two attrs on it that say what it is measured FROM.
@@ -90,6 +97,27 @@ SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR = "sigma_regularization_floor_policy"
 OMEGA_REFERENCE_FIXED_N_MU = "fixed-N mu"
 OMEGA_REFERENCE_MIDGAP = "midgap"
 OMEGA_REFERENCE_VBM = "vbm"
+
+#: WHERE this Sigma was evaluated, stamped on :data:`SIGMA_EVAL_DATASET`.
+#: A DIFFERENT fact from the omega reference above: that says what the axis
+#: is measured FROM, this says which spectrum the cube was built AT.  Until
+#: 2026-08-22 the file carried the first and not the second, so
+#: ``gw.eqp_bgw.make_eqp_bgw`` had no way to tell a one-shot cube from a
+#: self-consistent one and silently reverted to the at-E_DFT linearization
+#: -- correct for one-shot, a different calculation for SC.
+SIGMA_EVAL_DATASET = "sigma_eval_rel_ev"
+SIGMA_EVAL_PROVENANCE_ATTR = "sigma_eval_provenance"
+SIGMA_EVAL_AT_E_DFT = "at_e_dft"
+SIGMA_EVAL_SELF_CONSISTENT = "self_consistent_qp"
+
+#: How much of the evaluation spectrum the omega grid actually SAMPLED, and
+#: what was done with the rest.  Stamped beside the eval energies because a
+#: consumer that centres on them needs to know which of them the cube can
+#: answer for: the Na semicore run wrote 41.3 % endpoint values as if they
+#: were Sigma at the state's own energy.
+OMEGA_COVERAGE_N_ATTR = "omega_uncovered_count"
+OMEGA_COVERAGE_FRAC_ATTR = "omega_uncovered_fraction"
+OMEGA_COVERAGE_POLICY_ATTR = "omega_out_of_range_policy"
 
 #: The datasets :func:`write_sigma_omega_h5` creates the file with.  Every
 #: run that writes ``sigma_mnk.h5`` at all writes these, so the appender
@@ -1005,6 +1033,9 @@ def write_sigma_omega_h5(
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
 	sigma_regularization=None,
+	eval_energies_rel_ev=None,
+	eval_energies_provenance=None,
+	omega_coverage=None,
 	band_extrapolation=None,
 	print_fn=None,
 ):
@@ -1060,6 +1091,26 @@ def write_sigma_omega_h5(
 	    measured 2.79 eV mis-sampling of Σ_c(ω) on the sodium metal deck
 	    (audit A2).  Optional only so a pre-stamp file still writes; a
 	    metallic consumer REFUSES an unstamped file rather than assume.
+
+	``eval_energies_rel_ev`` / ``eval_energies_provenance``
+	    THE SPECTRUM THIS Σ WAS EVALUATED AT, on the same relative axis as
+	    ``omega_ev``, and which of the two candidates it is
+	    (:data:`SIGMA_EVAL_AT_E_DFT` / :data:`SIGMA_EVAL_SELF_CONSISTENT`).
+	    A DIFFERENT question from the ω reference, and the one the file did
+	    not answer: ``gw.eqp_bgw.make_eqp_bgw``'s own docstring says
+	    "Nothing in the files distinguishes the two cases, so this function
+	    will not guess", and absent this stamp it then linearizes at E_DFT —
+	    right for a one-shot cube, a different and wrong calculation for a
+	    self-consistent one.  Optional only so a pre-stamp file still
+	    writes; it rides the SAME star extraction as the cubes, so the eval
+	    spectrum and the Σ rows cannot disagree about which k they are.
+
+	``omega_coverage``
+	    A ``gw.dynamic_sigma.OmegaCoverage`` (duck-typed: ``n_uncovered``,
+	    ``fraction_uncovered``, ``policy``).  Stamped on the eval dataset so
+	    a consumer centring on those energies learns how many of them the
+	    cube cannot actually answer for — the Na semicore run wrote 41.3 %
+	    endpoint values as if they were Σ at the state's own energy.
 	"""
 	from .slab_io import SlabIO
 
@@ -1099,6 +1150,13 @@ def write_sigma_omega_h5(
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
 	}
+	# INTO THE SAME PAYLOAD as the cubes: the eval spectrum labels the same
+	# (k, n) the cube's band diagonal does, so it must be extracted to the
+	# same rows by the same table.  Extracting it separately — or not at
+	# all — is how a stamp comes to describe rows the file no longer holds.
+	if eval_energies_rel_ev is not None:
+		payload[SIGMA_EVAL_DATASET] = np.asarray(
+			eval_energies_rel_ev, dtype=np.float64)
 	extrap_arrays = dict((band_extrapolation or {}).get("arrays", {}))
 	extrap_attrs = dict((band_extrapolation or {}).get("attrs", {}))
 	# Into the SAME payload, so the extraction, the stamp and the spread
@@ -1113,6 +1171,7 @@ def write_sigma_omega_h5(
 		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
 		shape_ref = (n_omega, nk, nb, nb2)
 
+	eval_rel_extracted = payload.pop(SIGMA_EVAL_DATASET, None)
 	total = payload["sigma_total_kij_ev"]
 	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
@@ -1171,6 +1230,25 @@ def write_sigma_omega_h5(
 				dtype=np.complex128,
 				attrs=_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		if eval_rel_extracted is not None:
+			# The two facts that make this array usable ride ON it: which
+			# spectrum it is, and how much of it the ω grid could answer
+			# for.  A number without either is what the file already had.
+			at = dict(_attrs(SIGMA_EVAL_DATASET) or {})
+			at[SIGMA_EVAL_PROVENANCE_ATTR] = str(
+				eval_energies_provenance or "unstated")
+			if omega_coverage is not None:
+				at[OMEGA_COVERAGE_N_ATTR] = int(
+					getattr(omega_coverage, "n_uncovered", 0))
+				at[OMEGA_COVERAGE_FRAC_ATTR] = float(
+					getattr(omega_coverage, "fraction_uncovered", 0.0))
+				at[OMEGA_COVERAGE_POLICY_ATTR] = str(
+					getattr(omega_coverage, "policy", "unstated"))
+			io.create_dataset(SIGMA_EVAL_DATASET,
+				shape=tuple(np.shape(eval_rel_extracted)),
+				dtype=np.float64, attrs=at)
+			io.write_slab(SIGMA_EVAL_DATASET,
+				np.asarray(eval_rel_extracted, dtype=np.float64))
 		for name in extrap_arrays:
 			arr = payload[name]
 			if arr is None:
@@ -1210,6 +1288,44 @@ def read_omega_reference(filepath):
 	if isinstance(prov, bytes):
 		prov = prov.decode("utf-8")
 	return ref, str(prov)
+
+
+def read_eval_energies(filepath):
+	"""``(eval_rel_ev, provenance, coverage)`` off a ``sigma_mnk.h5``.
+
+	``(None, None, None)`` means the file predates the stamp — NOT that the
+	cube was evaluated at E_DFT.  A consumer must treat the two differently:
+	the second is a fact it can act on, the first is an absence, and
+	collapsing them is exactly how ``make_eqp_bgw`` came to linearize a
+	self-consistent cube at E_DFT without saying so.
+
+	``coverage`` is ``{"n_uncovered", "fraction_uncovered", "policy"}`` when
+	the writer stamped it, else ``None``.
+
+	The array comes back on the file's OWN k rows (the star wedge when the
+	file carries one), like every other dataset here; the caller remaps
+	through the same ``k_irr_rows_for`` it uses for the cubes.
+	"""
+	abs_path = os.path.abspath(filepath)
+	with h5py.File(abs_path, "r") as h5:
+		if SIGMA_EVAL_DATASET not in h5:
+			return None, None, None
+		ds = h5[SIGMA_EVAL_DATASET]
+		arr = np.asarray(ds[()], dtype=np.float64)
+		prov = ds.attrs.get(SIGMA_EVAL_PROVENANCE_ATTR, "unstated")
+		cov = None
+		if OMEGA_COVERAGE_N_ATTR in ds.attrs:
+			pol = ds.attrs.get(OMEGA_COVERAGE_POLICY_ATTR, "unstated")
+			cov = {
+				"n_uncovered": int(ds.attrs[OMEGA_COVERAGE_N_ATTR]),
+				"fraction_uncovered": float(
+					ds.attrs.get(OMEGA_COVERAGE_FRAC_ATTR, 0.0)),
+				"policy": (pol.decode("utf-8")
+				           if isinstance(pol, bytes) else str(pol)),
+			}
+	if isinstance(prov, bytes):
+		prov = prov.decode("utf-8")
+	return arr, str(prov), cov
 
 
 # ===========================================================================

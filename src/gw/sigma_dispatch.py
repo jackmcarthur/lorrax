@@ -127,6 +127,13 @@ class SigmaResult:
     #: answer the finalize interpolated with (audit A2), instead of
     #: re-deriving it from a config key one layer further from the choice.
     omega_reference_provenance: str | None = None
+    #: :class:`gw.dynamic_sigma.OmegaCoverage` for the at-DFT interpolation
+    #: — WHICH (k, n) the ω grid actually sampled, and what was done with the
+    #: rest.  Carried on the result rather than recomputed by each writer
+    #: because ``sigma_c_at_dft_diag_ev`` cannot say by itself which of its
+    #: cells are measurements and which are grid endpoints, and the Na
+    #: semicore run shipped 41.3 % endpoints as if they were Σ.
+    omega_coverage: object | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +200,9 @@ SIGMA_BASIS_FIELDS = (
 #: function — labels them by the QP index.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
+    # Its ``mask_kn`` is derived from ``omega_dft_rel_ev`` in the same
+    # function, so it carries the same band labelling and the same trap.
+    "omega_coverage",
 )
 
 #: No band index; basis-independent.
@@ -416,7 +426,8 @@ def finalize_dynamic_sigma(
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
          efermi_dft_ev,
-         omega_reference_provenance) = eval_sigma_c_at_dft_energies(
+         omega_reference_provenance,
+         omega_coverage) = eval_sigma_c_at_dft_energies(
             sigma_c_omega,
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
@@ -424,6 +435,14 @@ def finalize_dynamic_sigma(
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
+
+        # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
+        # reference the interpolation above used — one omega reference per
+        # finalize, or the two reads sample different grid positions.
+        # Formed BEFORE the write because the write stamps it: see below.
+        omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        e_qp_rel_ev = (
+            np.asarray(e_qp_ev, dtype=np.float64) - efermi_dft_ev)
 
         if write_sigma_omega_h5:
             sigma_omega_h5_path = write_sigma_omega(
@@ -433,18 +452,30 @@ def finalize_dynamic_sigma(
                 meta=meta, mesh_xy=mesh_xy,
                 omega_reference_ev=efermi_dft_ev,
                 omega_reference_provenance=omega_reference_provenance,
+                # THE ENERGIES THIS SPECTRUM WAS EVALUATED AT, stamped.
+                # Until 2026-08-22 the file recorded the omega REFERENCE but
+                # not the evaluation point, so a from-disk reassembly
+                # (`eqp_bgw.make_eqp_bgw`) could not tell a one-shot cube
+                # from a self-consistent one and silently reverted to the
+                # at-E_DFT linearization -- which is right for one-shot and
+                # a different, wrong calculation for SC.
+                eval_energies_rel_ev=e_qp_rel_ev,
+                # MEASURED, not assumed: the two candidates differ exactly
+                # when the evaluation spectrum is not E_DFT, and that is an
+                # array comparison this function can make and a downstream
+                # reader cannot.
+                eval_energies_provenance=(
+                    "at_e_dft"
+                    if np.array_equal(e_qp_rel_ev,
+                                      np.asarray(omega_dft_rel_ev,
+                                                 dtype=np.float64))
+                    else "self_consistent_qp"),
+                omega_coverage=omega_coverage,
                 sym=sym, band_extrapolation=band_extrapolation,
                 print_fn=print_fn,
             )
         else:
             sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
-
-        # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
-        # reference the interpolation above used — one omega reference per
-        # finalize, or the two reads sample different grid positions.
-        omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-        e_qp_rel_ev = (
-            np.asarray(e_qp_ev, dtype=np.float64) - efermi_dft_ev)
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
@@ -500,6 +531,7 @@ def finalize_dynamic_sigma(
         sigma_omega_h5_path=sigma_omega_h5_path,
         efermi_dft_ev=efermi_dft_ev,
         omega_reference_provenance=omega_reference_provenance,
+        omega_coverage=omega_coverage,
     )
 
 

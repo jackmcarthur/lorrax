@@ -73,6 +73,13 @@ into a 4-round one.  **Any caller of this module must set
 first trace.**  c128 is untouched either way — f64 dots have no TF32 path — so
 this knob moves only the low-precision arm.
 
+Since 2026-08-22 ``runtime.pin_matmul_precision`` (called by
+``runtime.bootstrap``, which this module calls at import) applies that pin for
+the whole process, so the refusal below is a LOCAL guard on a global
+precondition rather than the only thing holding it.  Both are kept: the pin is
+what makes the default right, the refusal is what makes a caller that bypassed
+``bootstrap`` fail at the door instead of three orders of magnitude later.
+
 WHAT THE c64 SOLVE CAN AND CANNOT REACH.  The floor of a single c64 GMRES on
 this operator is a TRUE relative residual of 3.5e-05 and a tile error of
 4.9e-05 (measured; tightening the inner tolerance from 1e-05 to 1e-07 buys 4
