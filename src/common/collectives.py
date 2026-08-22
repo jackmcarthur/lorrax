@@ -11,7 +11,10 @@ In the order a driver meets it: **topology** (:func:`process_rank_world`,
 :func:`device_count`); **the mesh and its warm-up** (:func:`prepare_mesh`,
 :func:`resolve_mesh`, :func:`single_device_mesh`); **staging onto a mesh
 without a collective** (:func:`device_put_process_local`,
-:func:`replicate_to_mesh`, :func:`shard_over_k`); **reductions and gathers**
+:func:`replicate_to_mesh`, :func:`shard_over_k`); **vacating a mesh without
+a collective** (:func:`spill_to_host`, :func:`restore_from_host` — the
+same anti-collective idiom run in the other direction, for bounding a
+multi-stage driver's live set rather than for placement); **reductions and gathers**
 (:func:`psum_replicate`, :func:`all_gather_processes`,
 :func:`gather_to_host`, :func:`gather_indexed_blocks`,
 :func:`psum_scatter_checked`); **the k-partitioned sweep**
@@ -64,10 +67,18 @@ does differently from the code it replaces.
 The module's second job — :func:`device_put_process_local` — is the
 mirror image: a cross-process placement that must NOT become a
 collective.  See its docstring for the JAX behaviour it works around.
+
+Its third job — :func:`spill_to_host` / :func:`restore_from_host` — runs
+that mirror image in the OTHER direction: moving an already-sharded
+``jax.Array`` off-device and back, touching only shards a process already
+owns, so a driver holding several large sharded results across stages
+(``gw.screening.compute_screening``'s per-role W is the motivating
+caller) can bound how many are resident on-device at once without a
+second chi0/W implementation or a disk round-trip.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 
 __all__ = [
@@ -540,6 +551,75 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         for dev, idx in idx_map.items()
     ]
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+
+class HostSpill(NamedTuple):
+    """A ``jax.Array``'s LOCAL shards, moved to host RAM by
+    :func:`spill_to_host`.  Opaque outside this module — hand it straight
+    to :func:`restore_from_host`.  A caller juggling several of these
+    beside real arrays (e.g. a ``{role: W_q}`` dict where every role but
+    the one about to be used stays spilled) only ever needs
+    ``isinstance(v, HostSpill)`` to tell the two apart.
+    """
+    shape: tuple[int, ...]
+    sharding: Any
+    shards: list          # [(device, numpy shard), ...], one per local shard
+
+
+def spill_to_host(arr) -> "HostSpill":
+    """Pull every LOCAL shard of ``arr`` to host RAM and DELETE ``arr``.
+
+    The anti-collective's other direction (see :func:`device_put_process_local`
+    above, and the module docstring): each process touches only shards it
+    already owns (``arr.addressable_shards``), so nothing crosses a process
+    boundary — restoring is the ``jax.make_array_from_single_device_arrays``
+    idiom this module already uses in three other places, run on data that
+    came from THIS process's own shards rather than a host table every
+    process already agrees on.
+
+    ``arr`` is explicitly ``.delete()``-d before return, so the device HBM
+    it held is freed at THIS statement — not whenever Python's refcounter
+    happens to run, which is the property that makes this usable as a
+    bounded-live-set tool rather than a hint to the allocator.  A driver
+    computing several large sharded results in sequence (the motivating
+    caller is ``gw.screening.compute_screening``'s per-role W: the
+    completed STATIC role's W was staying resident, on Python-dict
+    reference alone, across the PROBE role's own chi0/W build — see
+    KNOWN_LORRAX_ISSUES.md, "GN-PPM probe chi0 has no bounded two-role
+    live-set plan at 81 q", 2026-08-20) can spill every result but the one
+    about to be consumed, so at most one such result is resident at a
+    time, and restore the rest with :func:`restore_from_host` once every
+    stage that could contend for headroom has run.  Do NOT touch ``arr``
+    after this call — the same discipline as a donated buffer.
+
+    Round-trips bit-exactly: a device→host→device copy moves bits, it does
+    not touch them.
+    """
+    import jax
+    import numpy as np
+
+    shards = [(shard.device, np.asarray(jax.device_get(shard.data)))
+              for shard in arr.addressable_shards]
+    spill = HostSpill(shape=tuple(int(s) for s in arr.shape),
+                       sharding=arr.sharding, shards=shards)
+    arr.delete()
+    return spill
+
+
+def restore_from_host(spill: "HostSpill"):
+    """Reconstruct the ``jax.Array`` :func:`spill_to_host` took apart.
+
+    Zero collectives, mirroring ``spill_to_host``: each process re-places
+    only the shards it contributed, on the same devices, via the same
+    ``jax.make_array_from_single_device_arrays`` idiom
+    :func:`device_put_process_local` uses above.
+    """
+    import jax
+
+    arrays = [jax.device_put(host_np, device)
+              for device, host_np in spill.shards]
+    return jax.make_array_from_single_device_arrays(
+        spill.shape, spill.sharding, arrays)
 
 
 def replicate_to_mesh(host_array, mesh):

@@ -50,6 +50,31 @@ transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
 never the binder.  The model carries the spinor factor ``ns² = nspinor²``
 in the pair density and does not size the transverse channels separately.
 
+SCOPE, STATED SO IT IS NOT ASSUMED: this model prices Stages A-F — the
+ISDF ζ fit through the V_q tensor write — and NOTHING PAST IT.  The
+screening stage that follows (``gw.screening.compute_static_w`` ->
+``gw.w_isdf.compute_chi0`` / ``minimax_tau_integrate_chi`` -> ``solve_w``)
+has no entry here: no persistent term, no transient, no HWM contribution.
+That is not an oversight being deferred — it is a real gap this planner
+cannot see, and it OOM'd in production exactly where the gap says it
+would (``compute_static_w -> chi0_q.block_until_ready()``, screening.py,
+27,262,284,032 B requested against a 63.82 GB pool at MoS2 9x9x1/P16,
+KNOWN_LORRAX_ISSUES.md "GN-PPM probe chi0 has no bounded two-role
+live-set plan at 81 q", 2026-08-20).  The chi0 τ-scan's scratch arena is
+``O(nq·μ²/P)`` and legitimately unchunked over q — the flat-k FFT it runs
+needs the whole q/k axis local on every rank, so it cannot be capped by a
+knob this model owns the way Stage C's r-chunk is.  The mitigation
+shipped instead bounds the ONE thing that WAS schedulable — an earlier
+screening role's completed W must not sit resident on-device while a
+later role pays that same fixed cost — via
+``gw.screening.compute_screening``'s role-serialized spill/restore
+(``common.collectives.spill_to_host`` / ``restore_from_host``); see that
+function's docstring for the measured numbers.  Pricing the chi0/W stage
+itself — so a planner could refuse or shrink it before dispatch the way
+Phase 1/2 below do for Stages A-F — remains open and is NOT this file's
+job today; do not read the absence of a screening-stage row here as "it
+fits", only as "unmeasured".
+
 Most terms above are closed-form shape algebra.  Stage A compiles the
 production FFT helper at the real shape/mesh and queries XLA's buffer peak
 plus cuFFT plan workspace through
