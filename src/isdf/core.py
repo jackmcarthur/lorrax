@@ -1928,6 +1928,17 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
     seam (``gw_init``, immediately after the fit and before ζ is consumed) —
     the same division of labour :func:`_close_the_cut` already documents.
 
+    THAT CALLBACK NEEDS A CPU DEVICE IN THE BACKEND, and so does the
+    ``jax.debug.print`` above it.  Measured on jax 0.9.1 / CUDA: with a
+    GPU-only backend, ``jax.debug.print``, ``jax.debug.callback`` AND
+    ``io_callback`` all raise "failed to find a local CPU device to place the
+    inputs on".  A LORRAX run never sees that — ``runtime.
+    initialize_communicator_stack`` sets ``JAX_PLATFORMS="cuda,cpu"`` — but a
+    bare process that imports this module without booting the runtime does,
+    which is why the reachability probe in ``tests/test_charge_zeta_route``
+    runs under ``JAX_PLATFORMS=cpu``.  If that ever changes, this gate and
+    the existing ζ telemetry lose their host seam together.
+
     COST.  One reduction pass over the spectrum axis per q: three sums and a
     min over ``n_log`` values against the ``eigh``'s O(n³).  Unmeasurable,
     and it is the only affordable certification at this seam — the honest
