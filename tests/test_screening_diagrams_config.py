@@ -974,128 +974,15 @@ def test_the_mpa_fit_store_carries_the_tag_and_the_consumer_asserts_it():
 
 
 # ---------------------------------------------------------------------------
-# 8. Ladder q/-q unfold gauge
+# 8. Ladder q/-q unfold gauge -- MOVED
 # ---------------------------------------------------------------------------
-
-def test_ladder_unfold_uses_one_spatial_gauge_for_each_q_pair():
-    """Representatives stay fixed; every partner is the same row plus TRS.
-
-    Pair 1/3 contains an irreducible representative.  Pair 4/12 belongs to
-    the same four-fold rotation orbit, whose representative is row 1, so
-    neither member is solved; its already-spatial member 12 is the
-    deterministic source.  The four TRIM rows on this even grid stay fixed.
-    """
-    import numpy as np
-    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
-
-    grid = (4, 4, 1)
-    # Orbit 0 is {(0,+1), (0,-1), (+1,0), (-1,0)}.  The remaining
-    # non-TRIM pairs each have their lower flat index as representative.
-    irr = np.asarray(
-        [5, 0, 6, 0, 0, 1, 2, 3, 7, 4, 8, 4, 0, 3, 2, 1],
-        dtype=np.int32)
-    sym = np.asarray(
-        [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3],
-        dtype=np.int32)
-    reps = np.asarray([0, 1, 2, 5, 6, 7, 8, 9, 10], dtype=np.int32)
-    got = _trs_pair_coherent_unfold_sym_idx(
-        irr, sym, kgrid=grid, q_irr_full_idx=reps, n_sym_spatial=3)
-
-    # Solved representatives and every self-negative q are value-untouched.
-    assert np.array_equal(got[reps], sym[reps])
-    assert np.array_equal(got[[0, 2, 8, 10]], sym[[0, 2, 8, 10]])
-    # q=1 is the representative, so q=3 becomes TRS composed with row 0.
-    assert got[1] == 0
-    assert got[3] == 3
-    # Neither q=4 nor q=12 is the representative; preserve spatial row 1 at 12.
-    assert got[12] == 1
-    assert got[4] == 4
-    # The helper never mutates the generic symmetry service's table.
-    assert np.array_equal(
-        sym, [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3])
-
-
-def test_ladder_unfold_keeps_a_fully_solved_q_table_unchanged():
-    """A full-BZ solve has no missing partner to reconstruct through TRS."""
-    import numpy as np
-    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
-
-    selected = np.asarray([0, 0, 0])
-    got = _trs_pair_coherent_unfold_sym_idx(
-        np.asarray([0, 1, 2]), selected,
-        kgrid=(3, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2]),
-        n_sym_spatial=1)
-    assert np.array_equal(got, selected)
-
-
-def test_ladder_unfold_refuses_distinct_parents_in_a_partial_wedge():
-    """A partial wedge cannot fabricate a q/-q relation across parents."""
-    import numpy as np
-    import pytest
-    from gw.screening_bse import _trs_pair_coherent_unfold_sym_idx
-
-    with pytest.raises(ValueError, match="do not fabricate reciprocity"):
-        _trs_pair_coherent_unfold_sym_idx(
-            np.asarray([0, 1, 2, 2, 4]), np.asarray([0, 0, 0, 0, 0]),
-            kgrid=(5, 1, 1), q_irr_full_idx=np.asarray([0, 1, 2, 4]),
-            n_sym_spatial=1)
-
-
-def test_pair_coherent_rows_restore_reciprocity_without_spatial_covariance():
-    """The row policy must not assume a finite fitted parent is PG-covariant."""
-    import numpy as np
-    from gw.qgrid_symmetry import trs_pair_coherent_unfold_sym_idx
-
-    grid = (4, 4, 1)
-    irr = np.asarray(
-        [5, 0, 6, 0, 0, 1, 2, 3, 7, 4, 8, 4, 0, 3, 2, 1],
-        dtype=np.int32)
-    selected = np.asarray(
-        [0, 0, 0, 2, 5, 0, 1, 2, 0, 1, 0, 4, 1, 5, 4, 3],
-        dtype=np.int32)
-    reps = np.asarray([0, 1, 2, 5, 6, 7, 8, 9, 10], dtype=np.int32)
-    coherent = trs_pair_coherent_unfold_sym_idx(
-        irr, selected, kgrid=grid, q_irr_full_idx=reps,
-        n_sym_spatial=3)
-
-    # Rows 0..2 are spatial, 3..5 their TRS-composed copies.  The parent
-    # deliberately does not commute with row 2's centroid permutation.
-    perms = np.asarray([[0, 1], [0, 1], [1, 0],
-                        [0, 1], [0, 1], [1, 0]], dtype=np.int32)
-    parent = np.asarray([[1 + 2j, 3 + 4j], [5 + 6j, 7 + 8j]])
-
-    def image(row):
-        p = perms[row]
-        out = parent[np.ix_(p, p)]
-        return np.conj(out) if row >= 3 else out
-
-    # q rows 1 and 3 are negatives with one wedge parent.  The generic
-    # first-match choices (0,2) ask parent to be spatially covariant and fail.
-    assert not np.allclose(image(selected[1]), np.conj(image(selected[3])))
-    # The coherent choices (0,3) use one spatial realization plus TRS.
-    assert np.array_equal(image(coherent[1]),
-                          np.conj(image(coherent[3])))
-
-
-def test_trs_fixed_q_projector_changes_only_self_negative_rows():
-    import jax.numpy as jnp
-    import numpy as np
-    from gw.qgrid_symmetry import trs_project_self_negative_q_rows
-
-    grid = (4, 1, 1)
-    rows = jnp.asarray([
-        [[1 + 2j]],
-        [[3 + 4j]],
-        [[5 + 6j]],
-        [[7 + 8j]],
-    ])
-    got = np.asarray(trs_project_self_negative_q_rows(
-        rows, np.arange(4), kgrid=grid))
-    # q=0 and q=2 are their own negatives; q=1 and q=3 are a pair and are
-    # handled by the row-map policy, not by this fixed-point projector.
-    assert np.all(got[[0, 2]].imag == 0.0)
-    assert np.array_equal(got[[0, 2]].real, np.asarray(rows)[[0, 2]].real)
-    assert np.array_equal(got[[1, 3]], np.asarray(rows)[[1, 3]])
+# The q-axis time-reversal policy (pair-coherent rows, the fixed-q Theta
+# projector, and the MEASURED verdict that gates both) is owned by
+# ``symmetry_maps.qgrid_trs`` and consumed by bare V, RPA W and ladder W
+# alike through ``gw.qgrid_symmetry.qgrid_trs_policy_for``.  Its cells --
+# including the magnetic, nonmagnetic-scalar and spinor/Kramers red twins --
+# live with the owner, in ``tests/test_qgrid_trs_policy.py``.  They were here
+# only because the ladder shipped the policy first.
 
 
 # ---------------------------------------------------------------------------

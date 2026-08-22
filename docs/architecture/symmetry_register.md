@@ -172,6 +172,65 @@ the branch at all; and it **cannot pass on `cohsex_debug`**, whose noise floor
 1.2e-15. Both legs fail those two checks identically, before and after the fix.
 Use a TRS-bearing deck for TRS coverage, and do not read that red as new.
 
+### The q axis: TRS is MEASURED, and the branch is gone (2026-08-22)
+
+`density_symmetry_check` has measured whether time reversal is a symmetry of
+*these* wavefunctions since 2026-07, and publishes it as
+`WfnLoader.trs_holds` → `SymMaps.trs_allowed`. **The q axis did not read it.**
+`gw/v_q_g_flat.py`, `gw/screening.py` and `gw/screening_bse.py` each composed
+q with −q through Θ and projected every self-negative q row onto its
+Θ-invariant part, unconditionally, in three separate spellings.
+
+On ferromagnetic CrI3 the q solve is the full 81-point BZ with q and −q as
+**independent** irreducible parents, so there was no relation to compose and
+the guard refused — after the 685.96-GB ζ fit had already closed (Perlmutter
+JID 57271494, `GATE trs_pair_unfold_map` naming parents `(1→1, 8→8)`). Where
+the parents had happened to coincide it would instead have silently replaced
+one independently solved row with the conjugate of the other.
+
+The fix is a policy object, not a guard: `symmetry_maps.QgridTrsPolicy`, built
+through the one announcing door `gw.qgrid_symmetry.qgrid_trs_policy_for`, with
+`trs_measured` keyword-only and **no default** (the house style the
+`trs_reference` predicate already uses across 13 explicit call sites). On a
+magnetic deck the policy contains no time-reversal operation at all — identity
+row map, no projector — so there is no TRS code path left to guard. It also
+refuses a table that names a Θ row beside a magnetic verdict, which can only
+mean the tables and the verdict came from different objects.
+
+**What is NOT gated on the verdict, and must not be.** `V_{−q} = conj(V_q)`
+is not a statement about time reversal of the wavefunctions: the pair
+densities fitted at −q are the conjugates of those at +q with bra and ket
+relabelled, for any mean field, and `v(|q+G|)` is real and even. The
+reciprocity gate stays armed on a ferromagnet — and there it is *more*
+informative than on a nonmagnetic deck, because q and −q were solved
+independently, so the gate is a measurement rather than an identity of the
+unfold.
+
+### `check_q_conjugate_reciprocity` is blind at every TRIM, not only at Γ
+
+The docstring already said a `q=0`-only check is worthless because `−0 == 0`.
+The same degeneracy holds at **every** self-negative q — all eight TRIM of an
+even mesh — and there the statistic is "`A_q` is real" and nothing else. On Na
+8×8×8 SOC c464 those eight are the only q the gate passes (3.915e-17 at Γ,
+6.436e-17 at H) while the point-group covariance the unfold assumes of the
+stored parent tile is violated there by **1.240e-02** and **2.411e-02**, its
+two largest values. The printed residual is a lower bound on the defect.
+
+Two comments justified that gate's tolerance with "the unfold builds `V_{−q}`
+from `V_q` by symmetry so reciprocity holds BY CONSTRUCTION". It does not: the
+unfold applies a **spatial** operation and reciprocity is a **conjugation**
+statement, and the two coincide only if the finite ISDF ζ basis is point-group
+covariant. Both comments are corrected in place, and the quoted `1.16e-7`
+"empirical floor" is relabelled as what it is — one deck's ζ covariance, not
+an arithmetic floor any deck inherits.
+
+The discriminating statistic is `symmetry_maps.little_group_covariance_residual`
+(reported by `common.sanity.report_parent_covariance`), which applies the
+unfold's OWN formula with an op that maps the parent q to itself and asks
+whether the tile comes back. It needs no second convention, costs one
+permutation per op with no extra tile movement, and returns `nan` — not a
+pass — when no non-identity little-group op exists.
+
 ### What can and cannot see a wrong predicate — MEASURED, and the surprise
 
 | check | sees it? |
@@ -639,6 +698,44 @@ transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
 rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
 TRANSPOSE of this matrix", and the scorecard above records it as *named but
 unused*. The TRS sign was not written down anywhere.
+
+#### …and the SAME sign applies to the QSGW velocity — derived 2026-08-22
+
+The row above measured the parity of the **bare** term. The head lane
+differentiates that velocity and adds two more terms,
+`v^Q = v^DFT + d_k Σ − i[A, Σ]`, whose parity was documented nowhere — and a
+wrong sign there is silent on a TRS-broken deck, where the identity does not
+hold anyway. Derivation, and the convention, now live in the
+`src/gw/qsgw_head.py` module docstring (eq. 1–2). In the LORRAX full-BZ gauge
+`u_n(−k) = Θ u_n(k)`, antiunitarity gives `O_mn(−k) = s·conj(O_mn(k))`
+elementwise with no transpose, for any operator with `Θ O Θ⁻¹ = s O`. Then:
+
+| term | parity | why |
+|---|---|---|
+| `H`, `Σ`, `kin_ion`, `V_H` | **even** | scalar operators, `s = +1` |
+| `d_k Σ`, `d_k H` | **odd** | differentiation flips it: `(d_i M)(−k) = −conj((d_i M)(k))` for even `M` |
+| `A_i` (Berry connection) | **even** | the explicit `i` in `A = i⟨u|∂u⟩` cancels the derivative's flip |
+| `−i[A_i, Σ]` | **odd** | conjugating the commutator of two even objects, with the leading `−i` |
+
+**All three terms of `v^Q` therefore carry the same odd parity, so
+`v^Q_i(−k) = −conj(v^Q_i(k))`** — the correction never flips the sign, which
+is what makes a sign error in it visible rather than absorbed.
+
+`gw.qsgw_head.trs_velocity_parity_residual` measures it, and
+`report_trs_velocity_parity` is the verdict. **The verdict statistic is the
+band TRACE**, because `tr v_i(k)` is invariant under any unitary mixing inside
+the retained window and therefore survives both of the two ways the
+elementwise form breaks: (a) `k` and `−k` reached from their IBZ parent by
+unrelated spatial rows sit in gauges related by a little-group rotation — the
+same "one consistent row per orbit" question the q axis settles; (b) with
+`Θ² = −1` the partner of band `n` at `−k` is its **Kramers** partner and the
+label inside a degenerate doublet is gauge-arbitrary. The elementwise number
+is returned beside it as a strictly stronger diagnostic, never as the verdict.
+Its stated blindness: a trace cannot see a parity error whose band matrix is
+traceless, including a sign flip confined to the off-diagonal transition
+sector. The gate takes no verdict at all when the density measurement says
+time reversal is broken, or when no measurement is available — an unmeasured
+system is not a TRS system.
 
 `psi_full_y` was measured on a real run's `isdf_tensors_144.h5`
 (`si_cohsex_debug` fast deck, 64 k → 8): a plain gather gives
