@@ -163,6 +163,7 @@ __all__ = [
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
     "install_failfast_excepthook",
+    "pin_matmul_precision",
 ]
 
 
@@ -224,6 +225,79 @@ def bootstrap(*, platform: str = "gpu") -> None:
     init_jax_distributed()
     fallback_to_cpu_if_no_gpu_backend()
     install_failfast_excepthook()
+    pin_matmul_precision()
+
+
+#: The f32 dot precisions that really are fp32 on XLA:GPU.  ``"high"`` is
+#: NOT among them: it selects a 3-pass tf32 decomposition — better than
+#: plain tf32 and still short of fp32.  Same tuple, same reasoning, as
+#: ``bse.w_ladder_mixedprec._PINNED``; that module's refusal is the local
+#: guard and this is the global pin, and they must agree about what counts
+#: as pinned.
+_MATMUL_PINNED = ("highest", "float32")
+
+#: Announced escape for A/B measurement of the precision itself.  Named
+#: rather than silent, per the "the required layer never demotes silently"
+#: rule the FFI gate states.  Any value other than one of
+#: :data:`_MATMUL_PINNED` REFUSES: a typo in a precision knob must not
+#: resolve to TF32 by falling through.
+_MATMUL_PRECISION_ENV = "LORRAX_MATMUL_PRECISION"
+
+
+def pin_matmul_precision() -> str:
+    """Pin ``jax_default_matmul_precision`` so f32/c64 dots are not TF32.
+
+    THE FAILURE THIS CLOSES IS SILENT AND THREE ORDERS OF MAGNITUDE.
+    XLA:GPU lowers ``float32`` ``dot_general`` at DEFAULT precision to
+    TensorFloat32 — a 10-bit mantissa, ``eps ~ 4.9e-04`` — and a complex64
+    dot decomposes into real f32 dots, so a c64 program inherits it
+    wholesale.  MEASURED 2026-08-16 (JID 57109889, one A100) on the ladder
+    screening matvec ``bse_ring_comm.build_bse_ring_matvec_full(
+    include_W=True, screening=True)`` at the ``gnppm_debug`` fixture,
+    ``||A_64 x - A_128 x|| / ||A_128 x||`` on the physical probe rhs:
+
+    ==========================================  ==========
+    XLA default precision (TF32)                 1.902e-04
+    ``jax_default_matmul_precision='highest'``   3.215e-07
+    operand REPRESENTATION floor (c64 operands,
+    arithmetic kept in c128)                     4.652e-08
+    ==========================================  ==========
+
+    The term-norm cancellation ratio is 1.11x, so cancellation accounts for
+    a 1.3e-07 floor and NOT the 1.9e-04 — the gap is entirely TF32.
+    ``contract_bands._ffi_dtypes_ok`` advertises the c64 path as served by
+    the vendor GEMM handler, so a future caller inherits the loss without
+    ever choosing it.
+
+    PINNING IS FREE AT THE PRODUCTION BLOCK WIDTH: the same matvec is
+    3.425 ms at DEFAULT and 3.406 ms at ``highest`` for ``nb=1`` (it costs
+    8 % at nb=2 and 46 % at nb=4, which matters only if a blocked
+    matrix-RHS Arnoldi ever lands — that caller can set
+    ``LORRAX_MATMUL_PRECISION`` and take the measurement with it).
+
+    ``float64`` is untouched either way: f64 dots have no TF32 path, so
+    this moves only the low-precision arm and no existing f64/c128 result
+    can change.
+
+    Returns the precision that is now in force.  Idempotent; safe to call
+    before or after the caller's own ``import jax``, and it must run before
+    the first TRACE rather than before the first import (the config is read
+    at lowering time).
+    """
+    requested = os.environ.get(_MATMUL_PRECISION_ENV, "").strip().lower()
+    if requested and requested not in _MATMUL_PINNED:
+        raise ValueError(
+            f"{_MATMUL_PRECISION_ENV}={requested!r} is not one of "
+            f"{_MATMUL_PINNED}.  This knob decides whether f32/c64 dots run "
+            f"at fp32 or at TensorFloat32 (a measured 1.9e-04 vs 3.2e-07 "
+            f"forward error on the BSE ladder matvec), so an unrecognised "
+            f"value is refused rather than silently left at XLA's TF32 "
+            f"default.  'high' is deliberately NOT accepted: on XLA:GPU it "
+            f"is a 3-pass tf32 decomposition, not fp32.")
+    precision = requested or "highest"
+    jax = _import_jax()
+    jax.config.update("jax_default_matmul_precision", precision)
+    return precision
 
 
 def install_failfast_excepthook() -> None:
@@ -1872,6 +1946,16 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         f["x64"] = bool(jax.config.read("jax_enable_x64"))
     except Exception:                                         # noqa: BLE001
         f["x64"] = bool(getattr(jax.config, "jax_enable_x64", False))
+    # Read the RESOLVED value for the same reason x64 is read resolved: an
+    # unpinned f32/c64 dot runs at TensorFloat32 on XLA:GPU and loses three
+    # orders of magnitude with nothing on screen (see pin_matmul_precision).
+    try:
+        _prec = jax.config.read("jax_default_matmul_precision")
+    except Exception:                                         # noqa: BLE001
+        _prec = getattr(jax.config, "jax_default_matmul_precision", None)
+    f["matmul_precision"] = (None if _prec is None
+                             else str(_prec).lower().split(".")[-1])
+    f["matmul_precision_env"] = os.environ.get(_MATMUL_PRECISION_ENV)
     f["jax_version"] = getattr(jax, "__version__", "unknown")
 
     f["backend"] = jax.default_backend()
@@ -2003,6 +2087,25 @@ def format_startup_report(f: dict) -> list:
         f"{f.get('jax_platforms_env')!r}, under jax "
         f"{f.get('jax_version')} with 64-bit values "
         f"{'enabled' if f.get('x64') else 'DISABLED'}.")
+    # The precision line is UNCONDITIONAL, including when it is fine: an
+    # unpinned f32/c64 dot is TF32 on XLA:GPU (1.9e-04 against 3.2e-07
+    # measured) and "no news" must not look like "a good number".
+    _mp = f.get("matmul_precision")
+    if _mp in _MATMUL_PINNED:
+        add(f"  Default matmul precision is pinned to {_mp!r}, so f32 and "
+            f"complex64 dots run at fp32 rather than TensorFloat32"
+            + (f" (LORRAX_MATMUL_PRECISION={f.get('matmul_precision_env')!r})."
+               if f.get("matmul_precision_env") else "; f64/c128 is "
+               "unaffected either way."))
+    else:
+        add(f"  WARNING: jax_default_matmul_precision resolved to {_mp!r}, "
+            f"which is NOT one of {_MATMUL_PINNED}.  On XLA:GPU every f32 "
+            f"dot — and therefore every complex64 dot, which decomposes into "
+            f"f32 dots — lowers to TensorFloat32 (10-bit mantissa): a "
+            f"measured 1.902e-04 forward error against 3.215e-07 when "
+            f"pinned, on the BSE ladder matvec.  runtime.bootstrap() pins "
+            f"it; a process that reaches this line unpinned did not go "
+            f"through bootstrap.")
     gx, gy = (list(f.get("mesh_shape", (1, 1))) + [1, 1])[:2]
     add(f"  The run's device mesh is {gx}x{gy} over axes "
         f"{tuple(f.get('mesh_axes', ()))}, and its communicator cliques were "
