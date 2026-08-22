@@ -147,6 +147,15 @@ The surface
 ``cached_density_symmetry_check`` / ``trs_check_mode``
     The measurement, its cached front door, and the ``LORRAX_TRS_CHECK``
     switch.
+``QgridTrsPolicy`` / ``build_qgrid_trs_policy`` /
+``little_group_covariance_residual``
+    What the MEASURED verdict is allowed to do to the q axis, in one
+    object every charge-channel producer consumes: the pair-coherent row
+    map, the one-element Θ projector (with the anti-Θ residual it removed,
+    returned rather than swallowed), and the point-group covariance of the
+    stored parent tiles that the IBZ→full-BZ unfold assumes and which
+    ``check_q_conjugate_reciprocity`` is structurally blind to at a
+    self-negative q.  ``trs_measured`` is keyword-only with NO DEFAULT.
 
 Op-selection policy: REGISTERED, NOT TOUCHED
 --------------------------------------------
@@ -246,6 +255,14 @@ from symmetry_maps.orbit_syms import (        # noqa: F401  (compat surface)
     compute_centroid_sym_perm,
     compute_rgrid_sym_perm,
 )
+from symmetry_maps.qgrid_trs import (
+    QgridTrsPolicy,
+    build_qgrid_trs_policy,
+    little_group_covariance_residual,
+    self_negative_q_mask,
+    trs_pair_coherent_unfold_sym_idx,
+    trs_project_self_negative_q_rows,
+)
 from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
@@ -298,6 +315,11 @@ __all__ = [
     # the TRS measurement
     "DensitySymmetryReport", "check_density_symmetries",
     "cached_density_symmetry_check", "trs_check_mode",
+    # the q-axis TRS POLICY that consumes that measurement, and the
+    # covariance statistic the unfold's own contract rests on
+    "QgridTrsPolicy", "build_qgrid_trs_policy",
+    "little_group_covariance_residual", "self_negative_q_mask",
+    "trs_pair_coherent_unfold_sym_idx", "trs_project_self_negative_q_rows",
     # ---------------------------------------------------------------
     # PRE-SWEEP SPELLINGS.  Aliases, not definitions — see
     # ``symmetry_maps._compat`` for the map and the retirement gate

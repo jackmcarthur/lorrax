@@ -54,6 +54,9 @@ so reaching *past* the door is the thing that still flags.
 | `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `common_uniform_grid_indices`, `find_irreducible_bz_points` | The pure-numpy primitives. `common_uniform_grid_indices` returns aligned C-order rows at the exact integer-grid intersection (for example 16 shared points for 8×8×1 and 12×12×1), without nearest-neighbour matching. `find_irreducible_bz_points`' anchored branch reproduces `find_symmetry_ops_simple`'s op-selection policy bit-for-bit — deliberately (see Contract). |
 | `compute_centroid_sym_perm`, `compute_rgrid_sym_perm`, `build_real_space_syms`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `recover_symmorphic_density_point_group` | Real-space orbit machinery. `compute_centroid_sym_perm(validate=True)` REFUSES a non-orbit-closed centroid set and names the regeneration fix. |
 | `check_density_symmetries`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `trs_check_mode` | The TRS measurement — the only MEASUREMENT, as opposed to inference, in the symmetry stack. Quadrature is injectable (`valence_density_fn`, `spin_degeneracy_fn`); `None` preserves the lazy `psp.get_DFT_mtxels` import verbatim for in-tree callers. |
+| `build_qgrid_trs_policy(*, trs_measured, irr_idx_q, sym_idx_q, q_irr_full_idx, kgrid, n_sym_spatial)` → `QgridTrsPolicy` | **The q-axis consumer of that measurement, and the only one.** `trs_measured` is keyword-only with NO DEFAULT. True: pair-coherent row map (`unfold_sym_idx`) plus the one-element Θ projector at `q ≡ −q`, which returns the anti-Θ residual it removed rather than swallowing it. False: the identity row map, no projector, and a REFUSAL if the tables select a Θ row beside a magnetic verdict. |
+| `QgridTrsPolicy.measure_covariance(V_ibz, ...)` / `little_group_covariance_residual(...)` | The point-group covariance the IBZ→full-BZ unfold ASSUMES of the stored parent tiles, measured in the unfold's own arithmetic: for `s` in the little group of `q_p`, does `phase·V_p[α_s μ, α_s ν]` come back as `V_p`? **This is the statistic `check_q_conjugate_reciprocity` is structurally blind to** at a self-negative q, where it degenerates to "`V_q` is real" (measured on Na 8×8×8 SOC c464: reciprocity 3.9e-17 at Γ against a covariance residual of 1.2e-02). Returns `nan` when no non-identity little-group op exists — unanswerable, not a pass. |
+| `self_negative_q_mask(q_full_idx, *, kgrid)` | The one-element orbits of `q → −q`: every TRIM of an even mesh, Γ alone on an odd one. The rows a pair composition can never touch and the only rows the projector may act on. |
 
 `SymMaps.validate_kgrid_unfolding` is public surface on the class and is
 kept rather than deleted, with the case where it returns FALSE constructed
@@ -104,6 +107,34 @@ kept rather than deleted, with the case where it returns FALSE constructed
   no `SymMaps`, no `U_spinor`, no τ: it compares two real-space densities.
   A bug in the τ phase, in `U_spinor`, or in the umklapp vector cannot move
   its verdict. That is what makes it a measurement.
+* **The q axis CONSUMES that verdict; it never re-derives or assumes it.**
+  `QgridTrsPolicy` is the whole of the q-axis time-reversal contract, and
+  `trs_measured` is keyword-only with no default so a caller who has not
+  consulted the density gets a `TypeError`. Before this, `gw/v_q_g_flat`,
+  `gw/screening` and `gw/screening_bse` each composed q with −q through Θ
+  and projected every self-negative row *unconditionally*; on ferromagnetic
+  CrI3 (Perlmutter JID 57271494) q and −q are independent irreducible
+  parents, and the composition refused only after a 685.96-GB ζ fit had
+  closed. The magnetic arm contains no time-reversal operation at all —
+  the branch is removed rather than guarded.
+* **`V_{−q} = conj(V_q)` is NOT a TRS statement and is not gated on the
+  verdict.** The pair densities fitted at −q are the conjugates of those
+  fitted at +q with bra and ket relabelled, for any mean field; `v(|q+G|)`
+  is real and even. So the reciprocity gate stays armed on a ferromagnet.
+  What a magnet changes is only that the relation stops being *imposed* by
+  the unfold — q and −q are independently solved — so the gate becomes an
+  independent measurement instead of an identity.
+* **Point-group covariance of the ζ basis is an ASSUMPTION of the unfold,
+  and it is now measured.** `unfold_isdf_operator` is faithful to its
+  contract (re-implemented offline it reproduces every stored tile to
+  2.030e-16), but that contract presumes the stored parent tile is
+  invariant under its own little group — exact for the continuum operator,
+  approximate for a finite and possibly ill-conditioned ISDF fit, and
+  false by 1.240e-02 at Γ on Na 8×8×8 SOC c464 (47 of 48 ops). Where that
+  holds only approximately, choosing two unrelated spatial coset rows for
+  q and −q converts an ordinary fit error into a forbidden reciprocity
+  error — which is what the pair-coherent row map removes, and what
+  `measure_covariance` reports so the fit, not the unfold, gets diagnosed.
 * Env surface: `LORRAX_TRS_CHECK` (`1` | `0` | `strict`), `LORRAX_TRS_TOL`,
   `LORRAX_TRS_SPATIAL_TOL`, `LORRAX_TRS_MAX_K` — all in
   `docs/dev/env_vars.md`. Env grants and tunes the measurement; it never
