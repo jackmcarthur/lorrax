@@ -309,6 +309,59 @@ def _register_and_open_dataset(fh: int, ds_name: str,
 # =============================================================================
 # Low-level padding contract: out_struct is the physical equal-block
 # shard; valid_shape is the logical file prefix that C++ reads.
+#: The ONE dtype every phdf5 control operand is marshalled as.  The C++
+#: handlers decode them as ``ffi::Buffer<ffi::DataType::S64>``; anything
+#: else is a signature mismatch, and the interesting case is the SILENT
+#: one below.
+_CONTROL_DTYPE = jnp.int64
+
+
+def require_control_i64(what: str, arr, *, ndim: int | None = None,
+                        length: int | None = None):
+    """Refuse a phdf5 control operand that is not exactly int64.
+
+    ``offset_base``, ``valid_shape``, the ``(2,)`` handle vector and the
+    k-chunk offset/count tables are the DESCRIPTORS: eight-byte signed
+    integers on both sides of the FFI boundary.  This is the Python half of
+    that contract, stated once and called at every dispatch site.
+
+    THE FAILURE IT CATCHES, and it is silent by construction: with
+    ``jax_enable_x64`` OFF, ``jnp.asarray(..., dtype=jnp.int64)`` yields
+    **int32**.  JAX canonicalises, it does not raise.  A 64-bit ``PhdfCtx*``
+    address then truncates to its low 32 bits and the handler
+    ``reinterpret_cast``s a garbage pointer.  ``runtime.bootstrap()`` sets
+    x64, so production is fine — but a harness, a bare ``import``, or a
+    test that builds a mesh without the bootstrap is not, and nothing
+    anywhere said so.
+
+    IT DOES NOT VALIDATE VALUES.  These arrays are traced inside the
+    ``shard_map``, so only ``dtype`` and ``shape`` are readable here.  The
+    value contract (non-negative, in bounds) is enforced at the two
+    concrete construction sites and, finally, in C++ — where a refusal is
+    computed from replicated operands and therefore fires on every rank.
+    """
+    dtype = jnp.dtype(getattr(arr, "dtype", None))
+    if dtype != jnp.dtype(_CONTROL_DTYPE):
+        raise TypeError(
+            f"phdf5 {what}: control operand must be int64, got {dtype}.  The "
+            f"C++ handler decodes it as ffi::Buffer<S64>.  The usual cause is "
+            f"jax_enable_x64 being OFF, under which jnp.int64 CANONICALISES "
+            f"to int32 without a word — which truncates a 64-bit ctx handle "
+            f"to its low half.  Call runtime.bootstrap() (or "
+            f"jax.config.update('jax_enable_x64', True)) before opening a "
+            f"SlabIO handle.")
+    shape = tuple(getattr(arr, "shape", ()))
+    if ndim is not None and len(shape) != int(ndim):
+        raise ValueError(
+            f"phdf5 {what}: control operand must be {ndim}-D, got shape "
+            f"{shape}")
+    if length is not None and (not shape or int(shape[0]) != int(length)):
+        raise ValueError(
+            f"phdf5 {what}: control operand must have leading extent "
+            f"{length}, got shape {shape}")
+    return arr
+
+
 def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
     """The ``(2,)`` int64 ``[ctx_handle, ds_id]`` buffer the FFI expects.
 
@@ -325,7 +378,16 @@ def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
     ``device_put_process_local`` for exactly that reason.
     """
     del mesh
-    return jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+    if int(ctx_handle) == 0:
+        raise ValueError(
+            "phdf5 handle_vector: ctx_handle is 0.  That is a closed or "
+            "never-opened SlabIO handle, and the C++ dispatch would refuse it "
+            "as a null ctx after the operands had already been marshalled.")
+    out = jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+    # The one concrete construction site for the handle pair, so the width
+    # contract is checkable HERE, where a truncated pointer is still
+    # recognisable as one.  See :func:`require_control_i64`.
+    return require_control_i64("handle_vector", out, ndim=1, length=2)
 
 
 def ffi_read_call(
@@ -347,6 +409,9 @@ def ffi_read_call(
     files and processes.  See :func:`ffi_write_call` for the measurement
     that moved ctx_handle/ds_id out of the Attrs.
     """
+    require_control_i64("read handle", handle, ndim=1, length=2)
+    require_control_i64("read offset_base", offset_base, ndim=1)
+    require_control_i64("read valid_shape", valid_shape, ndim=1)
     return jax.ffi.ffi_call(_TARGET_READ, out_struct)(
         handle,
         offset_base,
@@ -377,6 +442,8 @@ def ffi_read_kchunk_call(
     pair, and a binding is how anyone reaches or debugs one; it goes out
     WITH the handler, which is registered to the owner.
     """
+    require_control_i64("read_kchunk handle", handle, ndim=1, length=2)
+    require_control_i64("read_kchunk offset_base", offset_base, ndim=2)
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK, out_struct)(
         handle,
         offset_base,
@@ -406,6 +473,9 @@ def ffi_read_kchunk_union_call(
     iteration order matches filespace iteration order — see
     ``read_kchunk_union_sharded`` docstring).
     """
+    require_control_i64("read_kchunk_union handle", handle, ndim=1, length=2)
+    require_control_i64("read_kchunk_union offset_base", offset_base, ndim=2)
+    require_control_i64("read_kchunk_union count_base", count_base, ndim=2)
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION, out_struct)(
         handle,
         offset_base,
@@ -741,6 +811,9 @@ def ffi_write_call(
 
     Use inside a ``shard_map`` body.
     """
+    require_control_i64("write handle", handle, ndim=1, length=2)
+    require_control_i64("write offset_base", offset_base, ndim=1)
+    require_control_i64("write valid_shape", valid_shape, ndim=1)
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,

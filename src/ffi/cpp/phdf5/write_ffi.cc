@@ -571,7 +571,10 @@ static ffi::Future WriteDispatch(
             std::ostringstream os;
             os << "phdf5 write: negative offset/valid_shape at dim " << d
                << " offset=" << offset_host[d]
-               << " valid_shape=" << valid_shape_host[d];
+               << " valid_shape=" << valid_shape_host[d] << "\n"
+               << descriptor_forensics(
+                      offset_host[d] < 0 ? offset_host[d]
+                                         : valid_shape_host[d]);
             return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
         if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {

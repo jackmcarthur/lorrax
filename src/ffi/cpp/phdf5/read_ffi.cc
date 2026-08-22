@@ -218,6 +218,18 @@ static ffi::Error ReadImpl(
                << " valid_shape=" << vec_to_string(valid_shape)
                << " rank=" << ctx->rank
                << " -- refused identically on every rank";
+            // The FIRST out-of-range operand is the one worth decoding.  A
+            // value that reads back as a small double is a stale allocation,
+            // not arithmetic — see descriptor_forensics.
+            for (int d2 = 0; d2 < rank; ++d2) {
+                if ((hsize_t)(offset_base[(size_t)d2]
+                              + valid_shape[(size_t)d2]) > extent[(size_t)d2]) {
+                    os << "\n" << descriptor_forensics(
+                        offset_base[(size_t)d2] != 0 ? offset_base[(size_t)d2]
+                                                     : valid_shape[(size_t)d2]);
+                    break;
+                }
+            }
             H5Sclose(memspace);
             H5Sclose(filespace);
             return fail_read(ffi::ErrorCode::kInvalidArgument, os.str());
@@ -397,7 +409,10 @@ static ffi::Error ReadDispatch(
             std::ostringstream os;
             os << "phdf5 read: negative offset/valid_shape at dim " << d
                << " offset=" << offset_host[d]
-               << " valid_shape=" << valid_shape_host[d];
+               << " valid_shape=" << valid_shape_host[d] << "\n"
+               << descriptor_forensics(
+                      offset_host[d] < 0 ? offset_host[d]
+                                         : valid_shape_host[d]);
             return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
         if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {
