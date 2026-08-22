@@ -709,6 +709,65 @@ def test_trim_conjugation_gate_still_refuses_a_missing_partner():
         _realize_trim_block(cut)
 
 
+@pytest.mark.parametrize("amp", [1.0, 1e-4, 1e-7, 1e-12])
+def test_trim_probe_acceptance_is_scale_free(amp):
+    """The SAME block at four magnitudes must canonicalize identically.
+
+    THE DEFECT THIS PINS (register 2026-08-20).  The probe-acceptance test
+    used a hard-coded ABSOLUTE ``norm > 1e-6`` on a coefficient vector whose
+    scale is ``|psi|`` at ONE sample point — which falls like ``1/sqrt(N_mu)``.
+    That makes the refusal a function of SYSTEM SIZE: a valid fully
+    relativistic LiF WFN, having passed the independent density-symmetry
+    audit and the Theta-closure gate, was refused with ``Kramers probes
+    spanned 0/2 of a TRIM block``.
+
+    Measured here, same block scaled: at ``|psi|_max = 6.3e-09`` the old
+    absolute floor spans **0 of 2** while the relative test spans 2 of 2 with
+    ``max|VᴴV − I| = 4.2e-15``.  A conj-closed block is a conj-closed block
+    at any amplitude, so anything that changes with ``amp`` is the bug.
+    """
+    from bse.bse_w_exact import (_realize_trim_block,
+                                 _TRIM_ROTATION_UNITARITY_BAR)
+    from common import rank_criterion
+
+    rng = np.random.default_rng(3)
+    q, _ = np.linalg.qr(rng.standard_normal((256, 2))
+                        + 1j * rng.standard_normal((256, 2)))
+    block = q + np.conj(q)                       # conj-closed by construction
+    block = block / np.linalg.norm(block, axis=0)
+    Psi = block * amp
+
+    out = _realize_trim_block(Psi, where=f"synthetic block at amp={amp:g}")
+    assert out.shape == Psi.shape
+    # The output spans the SAME subspace — the property the rotation's
+    # unitarity certificate exists to protect.
+    s_in = np.linalg.svd(Psi, compute_uv=False)
+    s_out = np.linalg.svd(out, compute_uv=False)
+    assert np.allclose(s_in, s_out, rtol=1e-10), (
+        f"amp={amp:g}: the canonicalization changed the block's singular "
+        f"values {s_in} -> {s_out}, so it is not a rotation")
+    # ...and the columns really are real functions, at every amplitude.
+    assert float(np.abs(out.imag).max()) <= 1e-10 * float(np.abs(out).max())
+
+    # THE RED TWIN, and it is the OLD RULE, not a synthetic one: the absolute
+    # floor this replaced rejects every probe once the block is small enough.
+    n_abs = 0
+    C = np.linalg.lstsq(Psi, np.conj(Psi), rcond=None)[0]
+    C = 0.5 * (C + C.T)
+    probes = np.conj(Psi.T)
+    R_all = probes + C @ np.conj(probes)
+    for j in range(R_all.shape[1]):
+        if float(np.linalg.norm(R_all[:, j])) > 1e-6:
+            n_abs += 1
+    if amp <= 1e-7:
+        assert n_abs == 0, (
+            f"amp={amp:g} no longer reproduces the absolute floor's failure "
+            f"({n_abs} probes would have been accepted) — this cell would "
+            f"then be testing nothing")
+    assert rank_criterion.PROBE_RTOL < 1e-6
+    assert _TRIM_ROTATION_UNITARITY_BAR > 0.0
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_w_ladder_matches_dense_oracle_on_a_mesh(px, py):

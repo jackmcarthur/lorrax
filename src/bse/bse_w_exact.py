@@ -68,6 +68,7 @@ from .bse_ring_comm import (
 )
 from .bse_serial import compute_pair_amplitude
 from common.collectives import device_put_process_local, gather_to_host
+from common import rank_criterion
 import common.timing as timing
 
 jax.config.update("jax_enable_x64", True)
@@ -391,7 +392,44 @@ _TRS_WFN_CONSTRUCTION_RTOL = 1.0e-8
 _TRS_BLOCK_CONJ_RTOL = 2.0 * _TRS_WFN_CONSTRUCTION_RTOL
 
 
-def _realize_trim_block(Psi):
+#: Bar on ``max|VᴴV − I|`` for a canonical TRIM-block rotation.  The rotation
+#: is built by a small fixed-order Gram–Schmidt in f64, so a healthy block
+#: lands at ~1e-14; 1e-8 holds six decades of margin.
+#:
+#: WHY IT EXISTS.  Relaxing the probe-acceptance floor from an absolute 1e-6
+#: to a RELATIVE test (``rank_criterion.probe_is_independent``, floor
+#: sqrt(eps)) is the repair for a valid deck being refused — but a relative
+#: floor is also more permissive, and a probe accepted at the floor is a
+#: direction built out of round-off.  This is the certification that makes
+#: the relaxation safe, and it is affordable because m is a degenerate-block
+#: size (2, 4, 6): an ``m x m`` product, priced before enabling.
+#:
+#: WHAT IT CERTIFIES, exactly: that the rotation is unitary, hence that the
+#: canonicalized block SPANS THE SAME SUBSPACE as the input.  It does NOT
+#: certify that the block is Kramers- or conj-closed — the exact gates above
+#: do that, and nothing here weakens them.
+_TRIM_ROTATION_UNITARITY_BAR = 1.0e-8
+
+
+def _refuse_unless_rotation_is_unitary(V, *, where, kind):
+    """Refuse a canonical TRIM rotation that is not numerically unitary."""
+    G = V.conj().T @ V
+    err = float(np.abs(G - np.eye(G.shape[0])).max())
+    if err <= _TRIM_ROTATION_UNITARITY_BAR:
+        return
+    raise ValueError(
+        f"GATE trs_gauge_canonical_rotation_not_unitary: the {kind} rotation "
+        f"for {where} has max|VᴴV − I| = {err:.6e}, above the "
+        f"{_TRIM_ROTATION_UNITARITY_BAR:.1e} bar.  A non-unitary rotation "
+        f"does not preserve the block's span, so the canonicalized states "
+        f"are not the eigenstates they replace.  The usual cause is a probe "
+        f"accepted at the relative independence floor "
+        f"({rank_criterion.PROBE_RTOL:.3e}) — i.e. a direction built out of "
+        f"round-off, which means the block genuinely does not span. "
+        "doc: bse_w_exact.enforce_trs_pair_gauge")
+
+
+def _realize_trim_block(Psi, *, where="a TRIM block"):
     """Deterministic REAL basis of a conj-closed scalar block at a TRIM point.
 
     ``Psi`` is (mu, m) columns.  ``conj(Psi) = Psi C`` (C unitary
@@ -400,7 +438,15 @@ def _realize_trim_block(Psi):
     involution: ``C conj(r) = r`` using ``C conj(C) = 1``) from FIXED-ORDER
     coordinate probes, Gram-Schmidt in fixed order, sign-fixed by the
     largest element — span-anchored and decomposition-free, per the
-    determinism contract (same WFN -> same canonical gauge)."""
+    determinism contract (same WFN -> same canonical gauge).
+
+    ``where`` names the k point and band block in any refusal — a gate that
+    says a block was deficient without saying WHICH block is a dead end for
+    the operator.
+
+    THE ACCEPTANCE TEST IS RELATIVE, not an absolute norm floor.  See
+    :func:`_kramers_canonicalize_trim_block`, which had the measured failure,
+    and ``common/rank_criterion.probe_is_independent``."""
     C, _, _, _ = np.linalg.lstsq(Psi, np.conj(Psi), rcond=None)
     misclose = float(np.abs(np.conj(Psi) - Psi @ C).max())
     scale = float(np.abs(Psi).max())
@@ -419,22 +465,39 @@ def _realize_trim_block(Psi):
     m = C.shape[0]
     cols = []
     probes = np.conj(Psi.T)              # (m, mu): probes[:, j] = Psi^dag e_j
+    # Every probe's PRE-deflation norm, so the acceptance test below is
+    # relative to a scale the block itself supplies.
+    R_all = probes + C @ np.conj(probes)             # (m, mu)
+    n0_all = np.linalg.norm(R_all, axis=0)
+    probe_scale = float(n0_all.max()) if n0_all.size else 0.0
+    n_rej_max = 0.0
+    rel_rej_max = 0.0
     for j in range(Psi.shape[0]):
-        c = probes[:, j]
-        r = c + C @ np.conj(c)
+        r = R_all[:, j].copy()
         for u in cols:
             r = r - u * np.vdot(u, r)
         n = float(np.linalg.norm(r))
-        if n > 1e-6:
+        if rank_criterion.probe_is_independent(
+                n, float(n0_all[j]), probe_scale):
             cols.append(r / n)
             if len(cols) == m:
                 break
-    if len(cols) != m:                   # pragma: no cover
+        else:
+            n_rej_max = max(n_rej_max, n)
+            rel_rej_max = max(rel_rej_max,
+                              n / max(float(n0_all[j]), probe_scale, 1e-300))
+    if len(cols) != m:
         raise ValueError(
             "GATE trs_gauge_canonical_basis_deficient: real-structure probes "
-            f"spanned {len(cols)}/{m} of a TRIM block. "
+            f"spanned {len(cols)}/{m} of {where}.  Largest REJECTED residual "
+            f"norm {n_rej_max:.6e} (relative {rel_rej_max:.3e}); probe scale "
+            f"{probe_scale:.6e}; relative floor "
+            f"{rank_criterion.PROBE_RTOL:.3e}.  The test is RELATIVE (see "
+            "common/rank_criterion.probe_is_independent), so this is a "
+            "statement about the block, not about the system size. "
             "doc: bse_w_exact.enforce_trs_pair_gauge")
     V = np.stack(cols, axis=1)
+    _refuse_unless_rotation_is_unitary(V, where=where, kind="real-structure")
     out = Psi @ V                        # columns are real functions
     for r in range(m):
         col = out[:, r]
@@ -444,14 +507,36 @@ def _realize_trim_block(Psi):
     return out
 
 
-def _kramers_canonicalize_trim_block(Psi, R):
+def _kramers_canonicalize_trim_block(Psi, R, *, where="a TRIM block"):
     """Deterministic Kramers-canonical pairing at a spinor TRIM point.
 
     ``Psi`` is (m, ns, mu), m EVEN.  ``phi_{2j+1} = Theta phi_{2j}``, with
     phi_{2j} chosen from FIXED-ORDER coordinate probes projected into the
     remaining subspace, canonical-phased — span-anchored, decomposition-free
     (determinism contract; the previous argmax-pivot greedy realized GPU
-    input jitter as a different gauge per run)."""
+    input jitter as a different gauge per run).
+
+    THE ACCEPTANCE FLOOR IS RELATIVE, AND THAT IS THE FIX.  Until 2026-08-22
+    a probe was accepted on ``norm > 1e-6`` — an ABSOLUTE floor on a
+    coefficient vector whose scale is ``|psi|`` at ONE sample point, i.e.
+    falling like ``1/sqrt(N_mu)``.  That is a system-size-dependent refusal
+    wearing a numerical constant's clothes: it passes on a fixture and
+    refuses on the production deck.  MEASURED (register 2026-08-20): a
+    regenerated 4x4x4 LiF spinor WFN that passes the independent
+    density-symmetry audit (TRS=HOLDS, magnetization residual 1.42e-13, all
+    48/48 spatial operations at max residual 6.31e-12), has a clean 70-band
+    edge (1.406 meV) and clears the Theta-closure gate above, was refused
+    here with ``Kramers probes spanned 0/2 of a TRIM block`` — every
+    fixed-order projected probe discarded by that floor, and the message
+    named neither the k point, nor the band block, nor the rejected norm.
+
+    Both are repaired: the test routes through
+    ``common/rank_criterion.probe_is_independent`` (relative to the probe's
+    own norm and to the largest probe norm in the family), and ``where``
+    carries the k point and band block into the refusal.  The exact
+    Kramers/Theta gates above are UNCHANGED — this is a numerical-rank
+    decision, not a physics one, and nothing here bypasses a physics gate.
+    """
     m = Psi.shape[0]
     if m % 2:
         raise ValueError(
@@ -472,14 +557,27 @@ def _kramers_canonicalize_trim_block(Psi, R):
             "the band window. doc: bse_w_exact.enforce_trs_pair_gauge")
     cols = []
     L = F.shape[0]
+    # The probe family's own scale: every probe is one row of F, so the
+    # largest row norm is the natural reference and it tracks |psi| at the
+    # sample points rather than an absolute constant.
+    n0_all = np.linalg.norm(F, axis=1)
+    probe_scale = float(n0_all.max()) if n0_all.size else 0.0
+    n_rej_max = 0.0
+    rel_rej_max = 0.0
     jprobe = 0
     while len(cols) < m and jprobe < L:
+        j_here = jprobe
         c1 = np.conj(F[jprobe, :])                  # probe e_j's coefficients
         jprobe += 1
         for u in cols:
             c1 = c1 - u * np.vdot(u, c1)
         n = float(np.linalg.norm(c1))
-        if n <= 1e-6:
+        if not rank_criterion.probe_is_independent(
+                n, float(n0_all[j_here]), probe_scale):
+            n_rej_max = max(n_rej_max, n)
+            rel_rej_max = max(
+                rel_rej_max,
+                n / max(float(n0_all[j_here]), probe_scale, 1e-300))
             continue
         c1 = c1 / n
         # canonical phase from the resulting FUNCTION's largest sample
@@ -490,12 +588,29 @@ def _kramers_canonicalize_trim_block(Psi, R):
         c2 = c2 - c1 * np.vdot(c1, c2)
         c2 = c2 / np.linalg.norm(c2)
         cols += [c1, c2]
-    if len(cols) != m:                   # pragma: no cover
+    if len(cols) != m:
         raise ValueError(
             "GATE trs_gauge_canonical_basis_deficient: Kramers probes "
-            f"spanned {len(cols)}/{m} of a TRIM block. "
-            "doc: bse_w_exact.enforce_trs_pair_gauge")
+            f"spanned {len(cols)}/{m} of {where} after exhausting all {L} "
+            f"fixed-order coordinate probes.\n"
+            f"  largest REJECTED residual norm {n_rej_max:.6e} "
+            f"(relative {rel_rej_max:.3e} against the probe's own norm / "
+            f"the family scale {probe_scale:.6e}); relative floor "
+            f"{rank_criterion.PROBE_RTOL:.3e}.\n"
+            f"  This test is RELATIVE (common/rank_criterion."
+            f"probe_is_independent), so a small ABSOLUTE norm is not by "
+            f"itself a reason to be here: an absolute floor is a "
+            f"system-size-dependent refusal, and the one that used to live "
+            f"here (1e-6) discarded every probe on a VALID fully "
+            f"relativistic LiF WFN.\n"
+            f"  If this fires now, the block genuinely does not span: the "
+            f"Theta-closure gate above passed, so suspect a Kramers partner "
+            f"outside the band window or a degeneracy grouping tolerance "
+            f"that merged two blocks.\n"
+            "  doc: bse_w_exact.enforce_trs_pair_gauge, "
+            "docs/dev/rank_truncation_policy.md §3")
     V = np.stack(cols, axis=1)
+    _refuse_unless_rotation_is_unitary(V, where=where, kind="Kramers")
     return np.tensordot(V.T, Psi, axes=(1, 0))
 
 
@@ -579,12 +694,19 @@ def _trs_fix_band_array(psi, eps, grid, *, label):
                 b1 = b0 + 1
                 while b1 < e.size and e[b1] - e[b1 - 1] < 1e-8:
                     b1 += 1
+                # Name the k point and the band block in any refusal: the
+                # registered LiF failure reported "0/2 of a TRIM block" and
+                # an operator had no way to find which one.
+                _where = (f"the {label}-manifold TRIM block at k={k} "
+                          f"(grid index), bands [{b0}, {b1}) of "
+                          f"{int(e.size)}")
                 if ns == 1:
                     blk = psi[k, b0:b1, 0, :].T      # (mu, m)
-                    psi[k, b0:b1, 0, :] = _realize_trim_block(blk).T
+                    psi[k, b0:b1, 0, :] = _realize_trim_block(
+                        blk, where=_where).T
                 else:
                     psi[k, b0:b1] = _kramers_canonicalize_trim_block(
-                        psi[k, b0:b1], R)
+                        psi[k, b0:b1], R, where=_where)
                 b0 = b1
     return psi, eps
 
