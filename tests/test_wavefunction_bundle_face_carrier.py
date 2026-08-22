@@ -52,6 +52,7 @@ from gw.wavefunction_bundle import (  # noqa: E402
     Wavefunctions,
     build_wavefunctions,
     build_wavefunctions_face,
+    project,
 )
 
 _C128 = 16
@@ -296,3 +297,99 @@ def test_face_carrier_addressable_bytes_match_2s_over_p():
             # device on the real multi-rank launch this emulates).
             assert got == pytest.approx(s / p), (
                 f"face shard bytes {got} != expected s/p={s / p}")
+
+
+# ---------------------------------------------------------------------------
+# 6. band_mask — the report §3 band-window bring-up helper.
+# ---------------------------------------------------------------------------
+
+def test_band_mask_matches_manual_boolean_slice():
+    """band_mask(bands) == a hand-built (nk, nb_full) boolean, True exactly
+    inside ``bands`` — on BOTH layouts, since the helper reads only
+    ``self.enk.shape`` and does not depend on which psi fields are
+    populated."""
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(7)
+    nk, nb, ns, nmu = 3, 10, 2, 12
+    psi_rmu_Y, psi_rmuT_X = _host_inputs(rng, nk, nb, ns, nmu)
+    enk = np.sort(rng.standard_normal((nk, nb)), axis=1)
+    slices = BandSlices.from_band_edges(0, 0, 3, nb, nb)
+    y_in = _put(psi_rmu_Y, mesh, P(None, None, None, "y"))
+    x_in = _put(psi_rmuT_X, mesh, P(None, "x", None, None))
+    enk_in = _put(enk, mesh, P(None, None))
+
+    legacy = build_wavefunctions(
+        y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
+    face = build_wavefunctions_face(
+        y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
+
+    for bands, label in ((slices.val, "val"), (slices.cond, "cond"),
+                        (slice(2, 7), "arbitrary")):
+        lo = bands.start or 0
+        hi = bands.stop
+        want = np.zeros((nk, nb), dtype=bool)
+        want[:, lo:hi] = True
+        for wfns, tag in ((legacy, "legacy"), (face, "face")):
+            got = np.asarray(wfns.band_mask(bands))
+            assert got.dtype == np.bool_
+            assert np.array_equal(got, want), (
+                f"band_mask({label}) mismatch under layout={tag!r}")
+
+
+def test_band_mask_covers_the_full_extent_with_no_stop():
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(8)
+    nk, nb, ns, nmu = 2, 6, 1, 8
+    psi_rmu_Y, psi_rmuT_X = _host_inputs(rng, nk, nb, ns, nmu)
+    enk = np.sort(rng.standard_normal((nk, nb)), axis=1)
+    slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
+    y_in = _put(psi_rmu_Y, mesh, P(None, None, None, "y"))
+    x_in = _put(psi_rmuT_X, mesh, P(None, "x", None, None))
+    enk_in = _put(enk, mesh, P(None, None))
+    face = build_wavefunctions_face(
+        y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
+
+    got = np.asarray(face.band_mask(slice(3, None)))
+    want = np.zeros((nk, nb), dtype=bool)
+    want[:, 3:] = True
+    assert np.array_equal(got, want)
+
+
+# ---------------------------------------------------------------------------
+# 7. project() layout dispatch — the "older COHSEX facade" now routes
+# through common.contract_bands for face layout (report §5).  The face
+# NUMERIC path needs a real distrib_la.GemmPlan (cuBLASMp, CUDA-only
+# today); what's certified here, with no mesh/gemm at all, is that the
+# legacy body is untouched by the parameter's addition and the face
+# branch refuses cleanly before ever reaching contract_bands.
+# ---------------------------------------------------------------------------
+
+def test_project_legacy_default_matches_pre_layout_body():
+    rng = np.random.default_rng(9)
+    nk, m, s, mu, n = 2, 3, 1, 4, 5
+    psi_xr = jnp.asarray(rng.standard_normal((nk, m, s, mu))
+                         + 1j * rng.standard_normal((nk, m, s, mu)))
+    sigma_k = jnp.asarray(rng.standard_normal((nk, s, mu, s, mu))
+                          + 1j * rng.standard_normal((nk, s, mu, s, mu)))
+    psi_yn = jnp.asarray(rng.standard_normal((nk, s, mu, n))
+                         + 1j * rng.standard_normal((nk, s, mu, n)))
+    got = project(psi_xr, psi_yn, sigma_k)
+    left = jnp.einsum('kmsx,ksxty->kmty', jnp.conj(psi_xr), sigma_k,
+                      optimize=True)
+    want = jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+    assert np.array_equal(np.asarray(got), np.asarray(want))
+    assert np.array_equal(
+        np.asarray(project(psi_xr, psi_yn, sigma_k, layout="legacy")),
+        np.asarray(want))
+
+
+def test_project_rejects_unknown_layout():
+    with pytest.raises(ValueError, match="layout"):
+        project(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
+               jnp.zeros((1, 1, 1, 1, 1)), layout="bogus")
+
+
+def test_project_face_requires_mesh_or_prebuilt_projector():
+    with pytest.raises(ValueError, match="face_project_fn|mesh_xy"):
+        project(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
+               jnp.zeros((1, 1, 1, 1, 1)), layout="face")
