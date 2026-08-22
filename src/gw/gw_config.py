@@ -3026,6 +3026,49 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "face carrier has no transverse-centroid bundle yet (census row "
         "'Bispinor transverse exchange')",
     ),
+    (
+        # DISCOVERED on real 4-rank CUDA (tests/multi_device/
+        # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
+        # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
+        # supported-table's own claimed envelope) ran ISDF fit + chi0/W
+        # construction to completion under layout='face', then died in
+        # ``ppm_tau_kernel.precompile_sigma`` at the FIRST legacy accessor
+        # call (``wfns.xn(s.full)``) with the carrier's own named
+        # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
+        # The two-point plasmon-pole Sigma_c(omega) pipeline
+        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``,
+        # ppm_sigma.py's per-branch sigma builders, and mpa/sigma.py's
+        # equivalent for insulating MPA) reads ``wfns.xn``/``.xr``/``.yr``/
+        # ``.yn`` directly and calls ``greens_function_kernel.build_G``/
+        # ``build_G_tau`` with no ``layout=`` dispatch.  Only the STATIC
+        # channels (x_only bare exchange; COHSEX's sigma_sx/sigma_coh/
+        # hartree in cohsex_sigma.py) were ported
+        # (feat/face-g-projection-hartree-2026-08-22) -- the docs table this
+        # row's own doc string corrects had claimed GN-PPM/HL-PPM/insulating
+        # MPA were part of the supported envelope; that claim was written
+        # from the guide's landing-order text, not verified against what
+        # that branch actually shipped, and this row is the correction.
+        # ``ComputeMode.is_dynamic`` is exactly GN_PPM | HL_PPM | MPA (see
+        # its own docstring); by the time this row is reached in table
+        # order, a metal MPA deck has already been refused by the row
+        # above, so this predicate only ever fires for GN_PPM, HL_PPM, or
+        # INSULATING MPA -- ``qp_solver = fixed_point`` requires a dynamic
+        # compute_mode (gw_config.py:4130) and therefore always trips this
+        # row too; there is no static-mode escape for it under
+        # low_mem_bands=true today.
+        "low_mem_bands_dynamic_ppm_unported",
+        lambda cfg: cfg.compute_mode.is_dynamic,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "compute_mode = x_only or cohsex (the ported static Sigma "
+        "channels)",
+        "set compute_mode = cohsex (or x_only), or low_mem_bands = false "
+        "for a GN-PPM/HL-PPM/MPA run",
+        "the dynamic two-point-PPM / MPA Sigma_c(omega) pipeline "
+        "(ppm_tau_kernel.py, ppm_sigma.py, mpa/sigma.py) reads "
+        "wfns.xn/xr/yr/yn directly with no face-layout port yet; only the "
+        "static Sigma channels (x_only, COHSEX's sigma_sx/sigma_coh/"
+        "hartree) were ported to layout='face'",
+    ),
 )
 
 
