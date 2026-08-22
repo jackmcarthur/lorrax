@@ -289,3 +289,61 @@ def test_nonreplicated_solve_routes_do_not_advertise_a_fake_q_batch():
     assert distributed.zeta_solve_memory_route.startswith("distributed")
     assert (per_q.peak_breakdown["C_fit_one_rchunk"]
             >= distributed.peak_breakdown["C_fit_one_rchunk"])
+
+
+# ---------------------------------------------------------------------------
+# The floor division itself REFUSES a non-divisible chunk
+# ---------------------------------------------------------------------------
+#
+# The planner above is the producer-side fix; this is the guard on the object
+# that actually performs the division.  MEASURED (JID 57187694,
+# reports/zeta_residue_2026-08-17/evidence/baseline_p4.log): on the 80 Ry
+# scalar-Si deck the P=4 baseline's logical 50-band window split 16+16+16+2,
+# the last chunk floor-divided to 0 bands per rank, and its two bands
+# contributed nothing to z_q -- at rc=0.
+
+def test_a_non_divisible_band_chunk_is_refused():
+    import pytest
+    from common.psi_G_store import assert_band_chunks_divisible
+
+    # The exact measured split: 50 logical bands, chunk 16, P=4.
+    ranges = [(0, 16), (16, 32), (32, 48), (48, 50)]
+    with pytest.raises(ValueError) as exc:
+        assert_band_chunks_divisible(ranges, 4)
+    text = str(exc.value)
+    assert "[48, 50)" in text and "drops 2" in text
+    assert "band_chunk_size" in text
+
+
+def test_a_divisible_split_is_accepted():
+    """NOT-VOID control.  Without it the refusal above could be
+    unconditional, which is how a guard stops being a guard."""
+    from common.psi_G_store import assert_band_chunks_divisible
+
+    # What gw.isdf_fitting's `_bfe_transport` padding actually produces for
+    # the same window: the tail is rounded up to the mesh multiple.
+    assert_band_chunks_divisible(
+        [(0, 16), (16, 32), (32, 48), (48, 52)], 4)
+    assert_band_chunks_divisible([(0, 16), (16, 32)], 16)
+    assert_band_chunks_divisible([], 4)
+    # A zero-width chunk is divisible and must not trip the guard: it is
+    # masked downstream, and refusing it would be a different rule.
+    assert_band_chunks_divisible([(0, 16), (16, 16)], 4)
+    # P=1 divides everything.
+    assert_band_chunks_divisible([(0, 50)], 1)
+
+
+def test_the_store_calls_the_guard_before_it_divides():
+    """AST: the check must run BEFORE `bpd_per_bc` is formed, or it is
+    describing a division that already happened."""
+    import ast as _ast
+    import inspect
+    from common import psi_G_store as _pgs
+
+    src = inspect.getsource(_pgs.PsiGStore.__init__)
+    assert "assert_band_chunks_divisible" in src
+    assert src.index("assert_band_chunks_divisible") < src.index(
+        "bpd_per_bc = ["), (
+        "PsiGStore forms bpd_per_bc before checking divisibility, so the "
+        "bands are already gone by the time the guard speaks")
+    _ast.parse(inspect.getsource(_pgs))

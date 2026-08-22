@@ -1118,12 +1118,31 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 			log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
 			    f"CHECKED.) ***")
 		elif mode == "snap":
-			log(f"    *** {detail}  Continuing: "
-			    + (f"{_BAND_DEGENERACY_ENV}={override} was set."
-			       if override else
-			       f"this edge arrived through the umbrella `number_bands`, "
-			       f"which is grandfathered to a warning.  Set `{key}` "
-			       f"explicitly to have it enforced.") + " ***")
+			# THROUGH ``sanity.warn``, not a bare log line.  This branch is
+			# the one that measures a defect and PROCEEDS, and until now its
+			# output carried none of the markers the rest of the tree's
+			# failure signatures use: a log grep for `*** LORRAX SANITY
+			# FAILURE` -- the token every other gate emits and every log
+			# triage grep looks for -- came back clean on a run whose band
+			# sum was measurably sliced.  MEASURED consequence on the Si
+			# 4x4x4 SOC anchor: within-star Sigma spread 1.957 meV at
+			# nband=60 against exactly 0.0000 meV at the degeneracy-clean
+			# nband=40 and 36, same centroids and same zeta_rcond, only the
+			# edge moving.  ``LORRAX_SANITY=strict`` now stops the run here,
+			# which is what a regression gate wants; the default still
+			# continues, because flipping the umbrella grandfather clause to
+			# a refusal would refuse decks that have been producing frozen
+			# references for months and is the OWNER's call, not this
+			# guard's.
+			from common import sanity
+			sanity.warn(
+				f"{detail}  Continuing: "
+				+ (f"{_BAND_DEGENERACY_ENV}={override} was set."
+				   if override else
+				   f"this edge arrived through the umbrella `number_bands`, "
+				   f"which is grandfathered to a warning.  Set `{key}` "
+				   f"explicitly to have it enforced."),
+				print_fn=log)
 		else:
 			raise _bd.BandWindowDegeneracyError(
 				f"{detail}  This edge was requested BY NAME (`{key}` = "
