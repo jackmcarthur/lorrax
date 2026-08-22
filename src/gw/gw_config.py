@@ -989,6 +989,24 @@ def resolve_eigh_backend(params, *, override: str | None = None) -> str:
 #: argument would have cost a 5000 eV error) and did not change here.
 ZETA_RCOND_DEFAULT: float = 1e-8
 
+#: The production TRANSVERSE ζ rank-truncation cutoff τ (relative to
+#: ``|λ|_max``, per q).  Same one-copy rule as :data:`ZETA_RCOND_DEFAULT`
+#: above, and for the same reason: until 2026-08-22 this number lived THREE
+#: times — here in ``_DEFAULTS`` and as the signature default of
+#: ``gw/isdf_fitting.fit_zeta_to_h5`` and ``isdf/core.factor_c_q`` — so a
+#: producer-side caller that omitted the argument silently picked up a
+#: literal nobody would have thought to change.  The two signature sites now
+#: import THIS name.  The measured rationale is at the
+#: ``"transverse_zeta_rcond"`` deck entry below.
+#:
+#: NOTE what this value implies under the truncation policy: κ_cap = 1e10,
+#: which is ABOVE the 1e8 certified for a PSD overlap Gram.  That is not an
+#: oversight — the transverse channel is a different (indefinite) operator
+#: with no production-deck measurement behind it, so its site is
+#: UNCERTIFIED and warns rather than refusing
+#: (``docs/dev/rank_truncation_policy.md`` §6, §9).
+TRANSVERSE_ZETA_RCOND_DEFAULT: float = 1e-10
+
 _DEFAULTS = {
     # System geometry
     "nval": 5,
@@ -1516,8 +1534,9 @@ _DEFAULTS = {
     # 2026-08 MoS2 4×4 bispinor calibration ladder (eqp drift vs the
     # ridge control monotone in τ and within the 1e-4 eV gauge tolerance
     # across transverse set sizes).  No env twin (scorecard AV: policy
-    # knobs live in the deck).
-    "transverse_zeta_rcond": 1e-10,
+    # knobs live in the deck).  TRANSVERSE_ZETA_RCOND_DEFAULT (defined above
+    # _DEFAULTS) — one copy, no mirrors.
+    "transverse_zeta_rcond": TRANSVERSE_ZETA_RCOND_DEFAULT,
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.

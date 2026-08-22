@@ -23,6 +23,7 @@ from common.shard_map import shard_map
 from jax.experimental import io_callback as _io_callback
 
 from common import Meta
+from common import rank_criterion
 from common import spectral_closure
 from common import timing
 from runtime.padding import pad_last_axis_to, round_up, solve_at_logical
@@ -1660,7 +1661,8 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 # deliberately jax-free and imports nothing from ``isdf``.
 # (P1.3 grammar unification, 2026-07-31; the drift gate is
 # ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
-from gw.gw_config import ZETA_RCOND_DEFAULT, env_bool
+from gw.gw_config import (ZETA_RCOND_DEFAULT,
+                          TRANSVERSE_ZETA_RCOND_DEFAULT, env_bool)
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
@@ -1888,6 +1890,114 @@ def _close_the_cut(spectrum, keep, *, where: str):
     return keep_new if mode == "snap" else keep
 
 
+def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
+                     rcond: float, exclude=None) -> None:
+    """GATE the ζ rank cut against the certified regime.  Device face.
+
+    The sibling of :func:`_close_the_cut`, and the reason this function
+    exists at all: that one decides WHERE the cut may land, this one decides
+    whether the cut was allowed to happen at this conditioning.  Until
+    2026-08-22 the ζ truncation printed ``n_keep/q`` and ``kappa/q`` and
+    GATED ON NEITHER — announced-but-ungated truncation, the pattern
+    ``TASTE.md`` (2026-08-15) names as an instrument that measures a defect
+    and proceeds.
+
+    MEASURED, and it is why the threshold is an ABSOLUTE achieved
+    amplification rather than a drop fraction (register 2026-08-15): Si
+    4×4×4 SYM/SOC 128-band, ``zeta_rcond = 1e-10``, 1776 centroids on a deck
+    with ngkmax = 588 — ``n_keep/q = 1469…1472 of 1776`` at
+    ``kappa/q ≈ 9.7–10.0e9``, i.e. sitting on the rcond floor.  Σ_c MAE
+    **54.4 eV**, max 100.3 eV, **exit 0, no SANITY banner, no refusal**.  The
+    same deck at 600 centroids does not truncate and gives 0.90 eV.
+
+    THE DROP FRACTION IS NOT THE GATE, and must not be re-proposed: MoS2
+    production discards 33 % of the RANK at the certified rcond and is
+    right, this deck discards 17 % and is wrong by 54 eV, and Si 960 at
+    rcond 1e-6 discards 34 % and moves the σ-star spread by 0.005 meV.  The
+    derivation and the full site register are in
+    ``docs/dev/rank_truncation_policy.md``; the criterion itself, the
+    ceiling constant and the message live in ``common/rank_criterion``.
+
+    ``kappa_certified`` is ``None`` for a site no measurement covers (the
+    transverse channel today).  Then only the discarded-weight finding can
+    fire, and the log says the ceiling is absent rather than reporting a
+    clean bill — an absence is not a pass.
+
+    A jitted kernel cannot raise, so a firing is recorded through a host
+    callback and ``rank_criterion.raise_if_pending`` refuses at the next host
+    seam (``gw_init``, immediately after the fit and before ζ is consumed) —
+    the same division of labour :func:`_close_the_cut` already documents.
+
+    COST.  One reduction pass over the spectrum axis per q: three sums and a
+    min over ``n_log`` values against the ``eigh``'s O(n³).  Unmeasurable,
+    and it is the only affordable certification at this seam — the honest
+    one (refit and measure Σ) is the run itself.
+
+    THE MODE IS RESOLVED AT TRACE TIME, and the factor jits are cached on a
+    key that does not include it — the same property :func:`_close_the_cut`
+    has for ``LORRAX_SPECTRAL_CLOSURE``.  So changing the dial part-way
+    through ONE process does not retrace an already-compiled factor.  That
+    is correct for a per-run dial and is stated here rather than discovered:
+    a test that flips the variable between two calls in one process must
+    flip it around the FIRST call that compiles the shape.
+    """
+    # The DRIVER reads the dial and passes it — same rule as _close_the_cut.
+    mode = rank_criterion.resolve_policy_mode(
+        os.environ.get(rank_criterion.POLICY_MODE_ENV))
+    if mode == "off":
+        return
+    mag = jnp.abs(spectrum)
+    # ``exclude`` marks positions that are not physics at all — the
+    # distributed tier's identity pad.  They are removed from EVERY
+    # reduction rather than being called kept or dropped, because either
+    # label makes a finding a function of the device count.
+    phys = jnp.ones(mag.shape, dtype=bool) if exclude is None else ~exclude
+    mag = jnp.where(phys, mag, 0.0)
+    keep = keep & phys
+    mag_max = jnp.max(mag, axis=-1)
+    mag_min_kept = jnp.min(jnp.where(keep, mag, jnp.inf), axis=-1)
+    kappa = mag_max / mag_min_kept
+    n_drop = jnp.sum(phys & ~keep, axis=-1)
+    tot = jnp.sum(mag, axis=-1)
+    dropped_w = jnp.sum(jnp.where(keep, 0.0, mag), axis=-1) / jnp.where(
+        tot > 0.0, tot, 1.0)
+    bound = n_drop > 0
+    over_w = bound & (dropped_w > rank_criterion.DISCARDED_WEIGHT_MAX)
+    if kappa_certified is None:
+        over_k = jnp.zeros_like(bound)
+    else:
+        over_k = bound & (kappa > float(kappa_certified))
+    fired = jnp.any(over_k | over_w)
+    _kcert = ("uncertified" if kappa_certified is None
+              else f"{float(kappa_certified):.3e}")
+
+    def _say(_):
+        jax.debug.print(
+            "*** [rank-policy] " + where + ": the rank cut BOUND and left "
+            "the certified regime on at least one q.  rcond="
+            + f"{float(rcond):.1e}" + " (cap 1/rcond="
+            + f"{1.0 / float(rcond):.3e}" + "), certified kappa ceiling "
+            + _kcert + ".  n_drop/q={d} kappa/q={k} discarded_weight/q={w} "
+            "(ceiling " + f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}" + "). "
+            "A cut that binds at kappa >= ~1e10 is measured wrong by "
+            "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
+            "Sigma_c MAE 54.4 eV at exit 0).  Mode=" + mode + ". ***",
+            d=n_drop, k=kappa, w=dropped_w, ordered=False)
+        jax.debug.callback(
+            lambda k, d, w: rank_criterion.note_device_finding(
+                where,
+                "the cut bound (max %d directions dropped on one q) at "
+                "kappa_eff up to %.3e against a certified ceiling of %s, "
+                "discarding up to %.3e of tr|C|.  Reduce the centroid "
+                "budget, or raise zeta_rcond back onto the certified "
+                "plateau (1e-8 .. 1e-4)."
+                % (int(d.max()), float(k.max()), _kcert, float(w.max()))),
+            kappa, n_drop, dropped_w)
+        return 0
+
+    jax.lax.cond(fired, _say, lambda _: 0, 0)
+
+
 def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
     """:func:`_close_the_cut` for the distributed tier's PADDED spectrum.
 
@@ -1920,11 +2030,28 @@ def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
     n_extra = int(n_pad) - int(n_log)
     if n_extra <= 0:
         return _close_the_cut(lam, keep, where=where)
-    is_one = (lam == 1.0)
-    pad = is_one & (jnp.cumsum(is_one.astype(jnp.int32), axis=-1) <= n_extra)
-    spec_phys = jnp.where(pad, 0.0, lam)
+    spec_phys, pad = _withdraw_identity_pad(lam, n_log=n_log, n_pad=n_pad)
     keep_phys = _close_the_cut(spec_phys, keep & ~pad, where=where)
     return keep_phys | (keep & pad)
+
+
+def _withdraw_identity_pad(lam, *, n_log: int, n_pad: int):
+    """``(spectrum with the identity pad demoted to 0, pad mask)``.
+
+    ONE implementation of the pad withdrawal both padded-spectrum guards
+    need — :func:`_close_the_cut_padded` (so a block walk cannot sweep the
+    exactly-degenerate pad and make the retained rank a function of the
+    device count) and :func:`_certify_the_cut` at the distributed charge
+    site (so the pad is not counted as discarded weight or as dropped
+    directions).  The mechanism is the one that function's docstring
+    argues; it lives here so the two cannot drift apart.
+    """
+    n_extra = int(n_pad) - int(n_log)
+    if n_extra <= 0:
+        return lam, jnp.zeros(lam.shape, dtype=bool)
+    is_one = (lam == 1.0)
+    pad = is_one & (jnp.cumsum(is_one.astype(jnp.int32), axis=-1) <= n_extra)
+    return jnp.where(pad, 0.0, lam), pad
 
 
 def _charge_factor_math(C_log, *, mode: str, n_log: int,
@@ -1963,6 +2090,13 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         sig_max = jnp.max(sig, axis=-1, keepdims=True)
         keep = sig > (rcond * sig_max)
         keep = _close_the_cut(lam, keep, where="zeta transverse rank_truncate")
+        # THE GATE.  ``kappa_certified=None``: no production-deck measurement
+        # of the truncated TRANSVERSE route exists, so its ceiling is absent
+        # and only the discarded-weight finding can fire.  That is stated in
+        # the log rather than left to look like a clean bill
+        # (docs/dev/rank_truncation_policy.md §6, §9).
+        _certify_the_cut(lam, keep, where="zeta transverse rank_truncate",
+                         kappa_certified=None, rcond=rcond)
         inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
         if rank_log:
             # Same conditioning signal as the charge route: n_keep/q is
@@ -2008,6 +2142,16 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         # carried a non-constant n_keep, MEASURED after the fact, enforced by
         # nothing.  This is the enforcement.
         keep = _close_the_cut(lam, keep, where="zeta rank_truncate")
+        # …and a cut that lands in a gap can still be a cut nobody has
+        # certified.  THE GATE: when the criterion BINDS, the achieved
+        # amplification must not exceed the ceiling any measurement supports
+        # for a PSD overlap Gram (1e8 — R19's rcond ladder and the Si 4×4×4
+        # 1776-centroid run, both in ``common/rank_criterion``).  Until
+        # 2026-08-22 the ``rank_log`` block below announced exactly these
+        # numbers and gated on neither.
+        _certify_the_cut(lam, keep, where="zeta rank_truncate",
+                         kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
+                         rcond=rcond)
         # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
         # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
         inv_sqrt = jnp.where(
@@ -2588,11 +2732,111 @@ def _transverse_lu_math(C_log: jax.Array, n_log: int):
     ridge uses ``jnp.trace`` on the replicated tile — the same
     expression (same reduction order, same bits) the fused
     ``_ridge_indef_solve`` used.
+
+    WHAT THE RIDGE IS AND IS NOT — the docstring claim that was REFUTED.
+    The transverse CCT is Hermitian **INDEFINITE**: both signs of λ are
+    physical (TRS in a non-magnetic ground state puts near-null
+    transverse-current modes at both signs).  ``C + εI`` shifts EVERY
+    eigenvalue the same way, so it pushes the NEGATIVE ones toward zero.
+    A positive ridge is therefore not a regularizer here, and above
+    κ ~ 1e12 it is measured actively harmful (register ``bispinor``, job
+    7885987).  It is retained as the default only because flipping a
+    production default is a physics ruling with a measurement attached,
+    and no production-deck measurement of the truncated route
+    (``transverse_zeta_solve = rank_truncate``, which cuts on ``|λ|`` and
+    is the correct scheme for an indefinite operator) exists yet.
+
+    What it may NOT be is uninstrumented.  :func:`_certify_transverse_ridge`
+    reads a κ LOWER BOUND off ``|diag U|`` of this factor — O(n) after a
+    factorization that already happened — and refuses above
+    ``rank_criterion.KAPPA_INDEFINITE_MAX``.  A lower bound is the right
+    direction for a gate that fires when the number is LARGE.  See
+    ``docs/dev/rank_truncation_policy.md`` §4.
     """
     ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(jnp.trace(C_log)) / n_log
     C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
     lu, piv, _perm = jax.lax.linalg.lu(C_reg)
     return lu, piv.astype(jnp.int32)
+
+
+def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
+                              where: str) -> None:
+    """CONDITIONING INSTRUMENT for the default (ridge) transverse path.
+
+    THE DEFECT THIS CLOSES.  The ridge family is the default transverse
+    factor and it had **no conditioning instrument at all** — the
+    ``rank_truncate`` family prints ``n_keep/q`` and ``kappa/q``, the ridge
+    family printed nothing, so on the default path there was no number to
+    read and no number to gate.  Registered three times (``bispinor``: the
+    refuted docstring mechanism, the harmful positive ridge above κ~1e12,
+    and the missing instrument).
+
+    WHAT IS MEASURED, and what it is worth.  ``|diag U|`` of the pivoted LU
+    gives ``kappa_lb = max|u_ii| / min|u_ii|``, which is the standard cheap
+    conditioning proxy and is a **LOWER bound** in practice, not a
+    certificate.  That asymmetry is exactly right for a gate that fires when
+    the number is large: exceeding the ceiling PROVES κ exceeds it, so the
+    refusal is sound.  Failing to exceed it proves nothing, and the log says
+    so instead of reporting a clean bill — an absence is not a pass
+    (``TASTE.md``, "a check that cannot fail is not evidence").
+
+    COST.  One diagonal extraction and two reductions over an array the
+    factor already materialised: ``O(nq · n_log)`` against the LU's
+    ``O(nq · n_log³)``, plus ONE host sync per channel (this runs once per
+    channel, not per r-chunk).  Priced before enabling, per the owner's
+    truncation directive.
+
+    NOT REACHABLE on the ScaLAPACK transverse plan: its factor is an opaque
+    ``FactorToken`` with no public buffer, by design.  The caller says so
+    rather than silently skipping.
+    """
+    mode = rank_criterion.resolve_policy_mode(
+        os.environ.get(rank_criterion.POLICY_MODE_ENV))
+    if mode == "off":
+        return
+    n = int(n_log)
+
+    @jax.jit
+    def _kappa_lb(LU):
+        u = jnp.abs(jnp.diagonal(LU[:, :n, :n], axis1=-2, axis2=-1))
+        return jnp.max(u, axis=-1), jnp.min(u, axis=-1)
+
+    hi, lo = jax.device_get(_kappa_lb(LU_q))
+    hi = np.asarray(hi, dtype=float)
+    lo = np.asarray(lo, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kap = np.where(lo > 0.0, hi / np.where(lo > 0.0, lo, 1.0), np.inf)
+    k_max = float(np.max(kap)) if kap.size else 0.0
+    q_at = int(np.argmax(kap)) if kap.size else -1
+    ceiling = rank_criterion.KAPPA_INDEFINITE_MAX
+    if jax.process_index() == 0:
+        print(f"  [{where}] conditioning: kappa_lb = max|u_ii|/min|u_ii| of "
+              f"the pivoted LU, worst over q = {k_max:.3e} at q={q_at} "
+              f"(ridge {_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
+              f"{ceiling:.1e}).  This is a LOWER BOUND on kappa — above the "
+              f"ceiling it refuses, below it certifies NOTHING.", flush=True)
+    if not (k_max > ceiling):
+        return
+    msg = (
+        f"[rank-policy] {where}: kappa_lb = {k_max:.3e} at q={q_at} exceeds "
+        f"the indefinite ceiling {ceiling:.1e}, and this is a LOWER bound so "
+        f"the true condition number is at least that.\n"
+        f"  cause : the transverse CCT is Hermitian INDEFINITE and a POSITIVE "
+        f"ridge is not a regularizer for it — C + eps*I moves negative "
+        f"eigenvalues TOWARD zero.  Above kappa ~ 1e12 the ridge is measured "
+        f"actively harmful (register bispinor, job 7885987), and the ridge's "
+        f"own docstring mechanism claim was refuted by that measurement.\n"
+        f"  fix   : set transverse_zeta_solve = rank_truncate, which cuts on "
+        f"|lambda| and returns the explicit truncated pseudo-inverse — the "
+        f"correct scheme for an indefinite operator, and the one whose "
+        f"conditioning is bounded by construction (kappa_eff <= "
+        f"1/transverse_zeta_rcond).\n"
+        f"  override: {rank_criterion.POLICY_MODE_ENV}=warn continues and "
+        f"leaves a trace; =off disarms the gate.")
+    if mode == "refuse":
+        raise rank_criterion.RankPolicyError(msg)
+    for line in msg.splitlines():
+        print("*** " + line, flush=True)
 
 
 def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
@@ -3160,6 +3404,13 @@ def _factor_c_q_distributed_rank_truncate(
                 keep = _close_the_cut(
                     lam, keep,
                     where="zeta transverse rank_truncate/distributed")
+                # Pad modes are exactly 0 here (zero-padded input), so they
+                # carry no weight and cannot move either finding; no pad
+                # withdrawal is needed on this branch.
+                _certify_the_cut(
+                    lam, keep,
+                    where="zeta transverse rank_truncate/distributed",
+                    kappa_certified=None, rcond=rcond)
                 inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
                 if rank_log:
                     sig_keep_min = jnp.min(
@@ -3191,6 +3442,18 @@ def _factor_c_q_distributed_rank_truncate(
             keep = _close_the_cut_padded(
                 lam, keep, n_log=n_log, n_pad=n_pad,
                 where="zeta rank_truncate/distributed")
+            # THE GATE, on the PHYSICAL spectrum: the identity pad is
+            # withdrawn first (shared helper), or its (n_pad − n_log)
+            # exactly-1.0 modes would be counted as discarded directions and
+            # the finding would become a function of the DEVICE COUNT — the
+            # very defect this route's ``lam_max`` note exists to prevent.
+            _spec_phys, _pad_mask = _withdraw_identity_pad(
+                lam, n_log=n_log, n_pad=n_pad)
+            _certify_the_cut(
+                _spec_phys, keep,
+                where="zeta rank_truncate/distributed",
+                kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
+                rcond=rcond, exclude=_pad_mask)
             inv = jnp.where(keep, 1.0 / jnp.where(keep, lam, 1.0), 0.0)
             if rank_log:
                 # Same conditioning signal the replicated route prints —
@@ -3355,7 +3618,7 @@ def factor_c_q(
     solver_kind: str = 'auto',
     zeta_ridge: float = 0.0,
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
-    transverse_zeta_rcond: float = 1e-10,
+    transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "auto",
 ) -> jax.Array:
     """
@@ -3508,18 +3771,41 @@ def factor_c_q(
                 indefinite=True,
                 distrib_la_batched_route=distrib_la_batched_route), None
         if t_kind == 'scalapack_lu':
+            # The factor is an opaque FactorToken with no public buffer, so
+            # the |diag U| instrument cannot reach it.  Say that rather than
+            # skipping silently: an unmeasured path and a clean one must not
+            # look alike in a log.
+            if jax.process_index() == 0:
+                print("  [zeta transverse ridge (scalapack_lu)] conditioning "
+                      "NOT MEASURED: the block-cyclic pXgetrf factor is "
+                      "inside a FactorToken with no public buffer, so the "
+                      "|diag U| kappa bound is unreachable here.  That is an "
+                      "absence, not a pass — use transverse_zeta_solve = "
+                      "rank_truncate for a route whose conditioning is "
+                      "bounded by construction.", flush=True)
             return _factor_c_q_transverse_scalapack(
                 C_q, mesh_xy, n_rmu_logical), None
         if t_kind == 'cusolvermp_lu':
             if jax.process_index() == 0:
                 print("  [zeta transverse factor] cusolvermp_lu keeps the "
                       "fused per-r-chunk getrf+getrs (factor hoist not yet "
-                      "ported to the CUDA backend)", flush=True)
+                      "ported to the CUDA backend); its conditioning is "
+                      "likewise NOT MEASURED — the factor never reaches this "
+                      "seam.  An absence, not a pass.", flush=True)
             return C_q, None
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
-        return _factor_c_q_transverse_lu(C_q, mesh_xy, n_rmu_logical)
+        _lu_out = _factor_c_q_transverse_lu(C_q, mesh_xy, n_rmu_logical)
+        # THE DEFAULT TRANSVERSE PATH'S ONLY CONDITIONING NUMBER.  See
+        # _certify_transverse_ridge for what it measures, what it costs and
+        # why a LOWER bound is the right instrument for this gate.
+        _certify_transverse_ridge(
+            _lu_out[0],
+            n_log=int(n_rmu_logical if n_rmu_logical is not None
+                      else C_q.shape[-1]),
+            where="zeta transverse ridge (LU)")
+        return _lu_out
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L=0, solver_kind=solver_kind)
 
