@@ -153,7 +153,10 @@ def test_square_q_shards_matches_the_fitter_arithmetic():
 # The multi-device transition twin (4 forced CPU devices, subprocess)
 # ---------------------------------------------------------------------------
 
-def _worker_transition() -> int:
+def _twin_body() -> dict:
+    """The transition twin proper — shared by the in-process (4 real
+    devices, the lx-test GPU leg) and subprocess (4 forced host devices)
+    arms, so both drive the SAME production kernels."""
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -164,8 +167,7 @@ def _worker_transition() -> int:
 
     devs = jax.devices()
     if len(devs) < _NDEV:
-        print(json.dumps({"skip": f"only {len(devs)} devices"}))
-        return 0
+        return {"skip": f"only {len(devs)} devices"}
     mesh = Mesh(np.asarray(devs[:_NDEV]).reshape(2, 2), ("x", "y"))
 
     rank, nk, w, ns, n_rtot = 8, 3, 4, 2, 16     # n_rtot % 4 == 0
@@ -212,24 +214,43 @@ def _worker_transition() -> int:
     G = fold(Q, G)
     G_ref = Q_ref @ Q_ref.conj().T
 
-    q_err = 0.0  # Q was donated into the fold; compare G only.
     g = np.asarray(jax.device_get(G))
     g_err = float(np.max(np.abs(g - G_ref)) / np.max(np.abs(G_ref)))
-    print(json.dumps({"g_rel_err": g_err, "q_rel_err": q_err,
-                      "psi_layout_ok": bool(layout_ok),
-                      "q_layout_ok": bool(q_layout_ok),
-                      "q_entry": str(q_entry),
-                      "q_shards": shard_factor(mesh, q_entry)}))
+    return {"g_rel_err": g_err,
+            "psi_layout_ok": bool(layout_ok),
+            "q_layout_ok": bool(q_layout_ok),
+            "q_entry": str(q_entry),
+            "q_shards": shard_factor(mesh, q_entry)}
+
+
+def _worker_transition() -> int:
+    print(json.dumps(_twin_body()))
     return 0
 
 
 def _run_worker(tag: str, timeout: int = 900):
     env = dict(os.environ)
-    env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
-    env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
-                        + f" --xla_force_host_platform_device_count={_NDEV}"
-                        ).strip()
+    # The production process model pins ONE GPU per process (runtime's
+    # one-process-per-GPU rule), so the pytest interpreter never sees 4
+    # devices.  The subprocess drops the pin: on a GPU node it takes the
+    # node's 4 cards (tiny arrays — no preallocation, so the parent's
+    # pool is undisturbed); elsewhere it forces 4 host CPU devices,
+    # which needs the host FFI build and skips cleanly without it.
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    env.pop("LORRAX_GPU_DEVICE", None)
+    try:
+        import jax
+        _gpu = jax.default_backend() in ("gpu", "cuda")
+    except Exception:
+        _gpu = False
+    if _gpu:
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    else:
+        env["JAX_PLATFORMS"] = "cpu"
+        env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
+                            + f" --xla_force_host_platform_device_count="
+                              f"{_NDEV}").strip()
     res = subprocess.run(
         [sys.executable, os.path.abspath(__file__), tag],
         env=env, capture_output=True, text=True, timeout=timeout)
@@ -247,11 +268,16 @@ def _run_worker(tag: str, timeout: int = 900):
 def test_band_to_r_transition_matches_reference_at_p4():
     """The explicit band->r all-to-all + pinned-layout accumulation
     reproduce the flattened reference sum, land psi in Q's exact fitted
-    layout, and keep Q in that layout.  Scope: 4 forced CPU devices, one
-    process; the production multi-process GPU leg is the lx-test/lx-run
-    P=4 gate."""
-    _import_ht()   # skip early if FFI is absent in THIS interpreter too
-    out = _run_worker("worker_transition")
+    layout, and keep Q in that layout.  Scope: one process over 4
+    devices — REAL GPUs when this interpreter already has >= 4 (the lx
+    test leg), else 4 forced host CPU devices in a subprocess.  The
+    multi-PROCESS P=4 leg is a driver run, not this cell."""
+    _import_ht()   # skip early if FFI is absent in THIS interpreter
+    import jax
+    if len(jax.devices()) >= _NDEV:
+        out = _twin_body()
+    else:
+        out = _run_worker("worker_transition")
     if "skip" in out:
         pytest.skip(out["skip"])
     assert out["psi_layout_ok"], "transition did not land psi in Q's layout"
