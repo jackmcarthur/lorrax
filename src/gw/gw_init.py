@@ -2346,6 +2346,7 @@ def prepare_isdf_and_wavefunctions(
 				                           if mem.gflat_chunk_size > 0 else None),
 				distributed_zeta_solve=str(
 					cfg.backend.distributed_zeta_solve),
+				low_mem_bands=bool(mem.low_mem_bands),
 				# Stage F writes per-rank hyperslabs; the planner therefore
 				# charges only the local sharded tile.
 			)
@@ -2451,6 +2452,54 @@ def prepare_isdf_and_wavefunctions(
 					print("*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***",
 					      file=_sys.stderr, flush=True)
 				raise SystemExit(0)
+
+			# ``low_mem_bands = true`` (layout="face"): convert the fit's
+			# two single-axis ψ copies to the two face layouts NOW, before
+			# V begins, and DROP the single-axis arrays.  The face copies
+			# (2*S/(Px*Py) total) then stay resident through V/W/Σ
+			# unchanged — there is no later "narrow four copies to two"
+			# step the way the legacy path has.  This lowers the V/W/Σ
+			# baseline; it does NOT lower the ζ-fit's own peak (that needs
+			# a lower-memory fit input contract of its own — audit report
+			# census row "Fresh centroid load/liveness").
+			#
+			# ``low_mem_bands = false`` (layout="legacy", the default) is
+			# UNTOUCHED below: psi_rmu_Y/psi_rmuT_X stay alive exactly as
+			# before, and the four-copy bundle is still built AFTER
+			# compute_V_q, at its original call site.
+			wfns = None
+			wfns_transverse = None
+			if cfg.memory.low_mem_bands:
+				if transverse_wfn_data is not None:
+					raise ValueError(
+						"low_mem_bands = true does not support bispinor "
+						"(bispinor = true): the face carrier has no "
+						"transverse-centroid bundle yet (audit report §6, "
+						"'refuse until ported').  Set bispinor = false, or "
+						"low_mem_bands = false.")
+				from .wavefunction_bundle import build_wavefunctions_face
+				from common.wfn_transforms import (
+					get_enk_bandrange as _get_enk_bandrange_early)
+				_enk_full_face, _ = _get_enk_bandrange_early(
+					wfn, sym, band_slices.full_range,
+					(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
+				with timing.section("gw_jax.wavefunction_setup"):
+					wfns = build_wavefunctions_face(
+						psi_rmu_Y, psi_rmuT_X, enk_full=_enk_full_face,
+						slices=band_slices, mesh_xy=mesh_xy)
+				print0(f"  Wavefunctions built (b0:b4={band_slices.nb_full} "
+				       f"bands, face layout: psi_nmu/psi_mun; "
+				       f"low_mem_bands=true) — before V_q, single-axis "
+				       f"fit copies released")
+				# THE DELETION.  ``psi_rmu_Y``/``psi_rmuT_X`` are the
+				# fit's own single-axis copies; the face bundle above
+				# already holds everything downstream needs.  Dropping
+				# the reference here (CPython refcounts immediately —
+				# no GC cycle needed to free the device buffers) is what
+				# keeps V_q's baseline at the face floor rather than
+				# face-plus-fit-input.
+				del psi_rmu_Y, psi_rmuT_X
+
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
 			# peak stacks on top of.  Same env gate as the ζ-fit probes
@@ -2533,27 +2582,33 @@ def prepare_isdf_and_wavefunctions(
 						take_pre_unfold("V_qmunu")),
 				)
 
-			with timing.section("gw_jax.wavefunction_setup"):
-				wfns = build_wavefunction_bundle(
-					wfn, sym, meta, band_slices, mesh_xy,
-					psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
-					enk_full=enk_full, print_fn=print0)
-
-				# Bispinor: build a second Wfns bundle on the
-				# transverse centroid set so Σ^B can sample ψ at
-				# r_{μ_T} without re-reading WFN.h5.
-				wfns_transverse = None
-				if transverse_wfn_data is not None:
-					wfns_transverse = build_wavefunction_bundle(
-						wfn, sym,
-						transverse_wfn_data['meta'],
-						band_slices, mesh_xy,
-						psi_rmu_Y=transverse_wfn_data['psi_rmu_Y'],
-						psi_rmuT_X=transverse_wfn_data['psi_rmuT_X'],
+			# ``low_mem_bands = true``: ``wfns`` was already built (face
+			# layout) right after fit_zeta, before V_q — see above.  The
+			# legacy path is UNTOUCHED: build the four-copy bundle here,
+			# at its original call site, exactly as before this key
+			# existed.
+			if not cfg.memory.low_mem_bands:
+				with timing.section("gw_jax.wavefunction_setup"):
+					wfns = build_wavefunction_bundle(
+						wfn, sym, meta, band_slices, mesh_xy,
+						psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 						enk_full=enk_full, print_fn=print0)
-					print0(f"  [bispinor] σ^B-side Wfns built on "
-					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
-					       f"transverse centroids")
+
+					# Bispinor: build a second Wfns bundle on the
+					# transverse centroid set so Σ^B can sample ψ at
+					# r_{μ_T} without re-reading WFN.h5.
+					wfns_transverse = None
+					if transverse_wfn_data is not None:
+						wfns_transverse = build_wavefunction_bundle(
+							wfn, sym,
+							transverse_wfn_data['meta'],
+							band_slices, mesh_xy,
+							psi_rmu_Y=transverse_wfn_data['psi_rmu_Y'],
+							psi_rmuT_X=transverse_wfn_data['psi_rmuT_X'],
+							enk_full=enk_full, print_fn=print0)
+						print0(f"  [bispinor] σ^B-side Wfns built on "
+						       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
+						       f"transverse centroids")
 
 			# Append ψ to the now-open restart file.  Bispinor: also the
 			# σ^B-side transverse-centroid ψ (per-channel second dataset),
@@ -2561,19 +2616,42 @@ def prepare_isdf_and_wavefunctions(
 			# bispinor restart round-trip (the loader re-pads and
 			# ``prepare_isdf_and_wavefunctions`` rebuilds the second
 			# bundle from it; without it Σ^B would be silently dropped).
+			#
+			# FACE LAYOUT writes the SAME "psi_full_y" dataset (same
+			# name, same (nk, nb, ns, mu) shape/axis order the BSE/
+			# downfold readers expect — ``wfns.psi_nmu``'s axis order
+			# (nk, n, s, mu) already matches it byte for byte) plus one
+			# ADDITIVE "psi_full_y_mun" dataset carrying the second face
+			# — SlabIO's ``write_slab`` sources bytes from whatever
+			# sharding the array already has (no reshard, no gather), so
+			# writing from a 2-D-sharded face array costs the writer
+			# nothing beyond the extra dataset.  On restart, this trades
+			# 2x ψ bytes on disk for ZERO reshard collectives on read
+			# (two direct hyperslab reads instead of one read plus an
+			# x<->y mesh-axis transpose) — see
+			# ``load_restart_state_from_h5``.
 			if _write_restart:
-				write_restart_state_to_h5(
-					tensors_filename,
-					n_rmu_logical=int(meta.n_rmu),
-					psi_full_y=wfns.psi_yr, mesh=mesh_xy,
-					mode="a",
-					psi_full_y_transverse=(
-						wfns_transverse.psi_yr
-						if wfns_transverse is not None else None),
-					n_rmu_transverse_logical=(
-						int(transverse_wfn_data['meta'].n_rmu)
-						if transverse_wfn_data is not None else None),
-				)
+				if cfg.memory.low_mem_bands:
+					write_restart_state_to_h5(
+						tensors_filename,
+						n_rmu_logical=int(meta.n_rmu),
+						psi_full_y=wfns.psi_nmu,
+						psi_full_y_mun=wfns.psi_mun,
+						mesh=mesh_xy, mode="a",
+					)
+				else:
+					write_restart_state_to_h5(
+						tensors_filename,
+						n_rmu_logical=int(meta.n_rmu),
+						psi_full_y=wfns.psi_yr, mesh=mesh_xy,
+						mode="a",
+						psi_full_y_transverse=(
+							wfns_transverse.psi_yr
+							if wfns_transverse is not None else None),
+						n_rmu_transverse_logical=(
+							int(transverse_wfn_data['meta'].n_rmu)
+							if transverse_wfn_data is not None else None),
+					)
 				# Stamp the centroid tables' CONTENT hashes so a restart
 				# can verify the quadrature points, not just their counts
 				# (see ``_centroid_table_md5``; audit fix/zq 2026-07-28).
@@ -2612,11 +2690,19 @@ def prepare_isdf_and_wavefunctions(
 				"are not available.  Rerun with restart = false (the placement "
 				"changes W, so an inherited W0 would be the wrong object "
 				"anyway).")
+		if cfg.memory.low_mem_bands and cfg.bispinor:
+			raise ValueError(
+				"low_mem_bands = true does not support bispinor "
+				"(bispinor = true) on restart either: the face carrier "
+				"has no transverse-centroid bundle yet (audit report §6, "
+				"'refuse until ported').  Set bispinor = false, or "
+				"low_mem_bands = false.")
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
-				n_rmu_logical=int(meta.n_rmu))
+				n_rmu_logical=int(meta.n_rmu),
+				low_mem_bands=bool(cfg.memory.low_mem_bands))
 			V_qmunu = rs.V_qmunu
 			print0("  Loaded restart tensors from H5.")
 			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
@@ -2640,8 +2726,14 @@ def prepare_isdf_and_wavefunctions(
 			sanity.check_positive(
 				"restart V_q[q=0] trace",
 				float(jnp.trace(V_qmunu[0]).real), print_fn=print0)
-			sanity.check_finite("restart ψ (psi_full_y)", rs.psi_rmu_Y,
-			                    print_fn=print0)
+			if cfg.memory.low_mem_bands:
+				sanity.check_finite("restart ψ (psi_full_y -> psi_nmu)",
+				                    rs.psi_nmu, print_fn=print0)
+				sanity.check_finite("restart ψ (psi_full_y_mun)",
+				                    rs.psi_mun, print_fn=print0)
+			else:
+				sanity.check_finite("restart ψ (psi_full_y)", rs.psi_rmu_Y,
+				                    print_fn=print0)
 			sanity.check_finite("restart E_nk", rs.enk_full, print_fn=print0)
 			# Centroid-table CONTENT guard (pattern #10; audit fix/zq
 			# 2026-07-28).  The band-window/n_rmu attrs pin the SHAPES of
@@ -2680,10 +2772,23 @@ def prepare_isdf_and_wavefunctions(
 					f"different points ⇒ ψ/V_q sampled at the wrong r_μ "
 					f"(silently wrong physics).  Set restart = false, or "
 					f"restore the original centroid file.")
-			wfns = build_wavefunction_bundle(
-				wfn, sym, meta, band_slices, mesh_xy,
-				psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
-				enk_full=rs.enk_full, print_fn=print0)
+			if cfg.memory.low_mem_bands:
+				# Both faces were already read at their OWN specs
+				# (P(None,'x',None,'y') / P(None,None,'x','y')) directly
+				# off disk by ``load_restart_state_from_h5`` — no
+				# transpose collective, no y-only full-band replica
+				# staged in between.
+				from .wavefunction_bundle import wavefunctions_face_from_restart
+				wfns = wavefunctions_face_from_restart(
+					rs.psi_nmu, rs.psi_mun, enk_full=rs.enk_full,
+					slices=band_slices, mesh_xy=mesh_xy)
+				print0(f"  Wavefunctions loaded from restart (face layout: "
+				       f"psi_nmu/psi_mun; low_mem_bands=true)")
+			else:
+				wfns = build_wavefunction_bundle(
+					wfn, sym, meta, band_slices, mesh_xy,
+					psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
+					enk_full=rs.enk_full, print_fn=print0)
 			if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
 				zeta_path = os.path.join(tmp_dir, "zeta_q.h5")
 				bvec = CoulombGeometry.from_wfn(wfn).bvec
