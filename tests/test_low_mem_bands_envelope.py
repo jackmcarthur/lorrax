@@ -2,16 +2,32 @@
 
 WHAT IS BEING PINNED.  Guide: ``reports/gwjax_low_mem_bands_audit_2026-08-22/
 report.md`` §6, "Unsupported combinations must refuse before allocation".
-Four of the five unsupported combinations are deck keys and refuse AT PARSE
+Five of the six unsupported combinations are deck keys and refuse AT PARSE
 TIME through ``gw_config.refuse_unsupported_low_mem_bands``, called from
 ``LorraxConfig.from_input_file`` (and again, for a hand-built config, from
-``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry).  The fifth — an
+``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry).  The sixth — an
 explicit dense ``Gij`` operand — has no deck key (it is a keyword-only
 Python parameter every shipped driver call site leaves at its ``None``
 default), so it is guarded separately by
 ``gw_config.refuse_explicit_gij_under_low_mem_bands``, called from
 ``compute_sigma_xc`` at entry, the one seam that ever sees both operands
 together.
+
+THE ``low_mem_bands_dynamic_ppm_unported`` ROW (added 2026-08-22, after the
+other five) is a CORRECTION, not part of the original guide text: the guide's
+own §6 envelope listed ``compute_mode = gn_ppm`` as an example of a
+*supported* combination, and the sibling wave that ported G/projection/
+Hartree only ported the STATIC Σ channels (x_only, COHSEX's sigma_sx/
+sigma_coh/hartree) — the dynamic two-point-PPM/MPA Σ_c(ω) pipeline
+(``ppm_tau_kernel.py``, ``ppm_sigma.py``, ``mpa/sigma.py``) still reads the
+legacy ``wfns.xn/xr/yr/yn`` accessors directly.  This was discovered on real
+4-rank CUDA (`tests/multi_device/
+low_mem_bands_one_shot_insulating_envelope_gate.py`, ``claims/0429.md``): a
+``compute_mode = gn_ppm`` deck ran the ISDF fit and chi0/W screening to
+completion under ``layout='face'`` and then died inside
+``ppm_tau_kernel.precompile_sigma`` with the carrier's own named
+``_require_legacy`` ``ValueError`` — a real crash, not a clean parse-time
+refusal.  This row closes that gap.
 
 Same shape as ``tests/test_screening_diagrams_config.py``'s w_bse refusal
 matrix: a RED TWIN per rule (it actually fires, names its rule id, carries
@@ -80,6 +96,14 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
      "head_correction = off\n" + _METAL_KEYS),
     ("low_mem_bands_bispinor_unported",
      "head_correction = off\nbispinor = true\n"),
+    ("low_mem_bands_dynamic_ppm_unported",
+     "head_correction = off\ncompute_mode = gn_ppm\n"),
+    ("low_mem_bands_dynamic_ppm_unported",
+     "head_correction = off\ncompute_mode = hl_ppm\n"),
+    ("low_mem_bands_dynamic_ppm_unported",
+     "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA
+    ("low_mem_bands_dynamic_ppm_unported",
+     "head_correction = off\nqp_solver = fixed_point\ncompute_mode = gn_ppm\n"),
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -116,21 +140,25 @@ def test_the_head_correction_row_fires_on_the_bare_default():
     "head_correction = off\n",
     "head_correction = no_local_fields\n",
     "head_correction = off\nqp_solver = one_shot_dft\n",
-    "head_correction = off\nqp_solver = fixed_point\ncompute_mode = gn_ppm\n",
+    "head_correction = off\ncompute_mode = x_only\n",
     "head_correction = off\ncompute_mode = cohsex\n",
-    "head_correction = off\ncompute_mode = gn_ppm\n",
-    "head_correction = off\ncompute_mode = hl_ppm\n",
-    "head_correction = off\ncompute_mode = mpa\n",   # insulating MPA
     "head_correction = off\nbispinor = false\n",
     "head_correction = off\nrestart = true\n",
 ])
 def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     """The other half of a refusal matrix: what it does NOT refuse.
 
-    scalar/spinor, one-shot insulator, head_correction=off|no_local_fields,
-    standard chi0, COHSEX/GN-PPM/HL-PPM/insulating MPA, restart — none of
-    these should trip a rule the moment low_mem_bands=true is added beside
-    them.
+    scalar/spinor, one-shot insulator (qp_solver=one_shot_dft only —
+    fixed_point structurally requires a dynamic compute_mode, which the
+    low_mem_bands_dynamic_ppm_unported row now refuses), head_correction=
+    off|no_local_fields, standard chi0, the STATIC Sigma channels only
+    (x_only, COHSEX), restart — none of these should trip a rule the
+    moment low_mem_bands=true is added beside them.
+
+    GN-PPM/HL-PPM/insulating MPA and qp_solver=fixed_point used to be
+    listed here.  A real 4-rank CUDA gate found compute_mode=gn_ppm
+    crashing mid-run (claims/0429.md); those cases moved to the red-twin
+    matrix above under low_mem_bands_dynamic_ppm_unported.
     """
     config = _config(tmp_path, "low_mem_bands = true\n" + extra)
     assert config.memory.low_mem_bands is True
@@ -177,7 +205,7 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 4, (
+    assert len(ids) == 5, (
         "the table grew or shrank -- update this test AND the docs "
         "envelope table in docs/input_reference.md together")
     for row in _LOW_MEM_BANDS_REFUSALS:
