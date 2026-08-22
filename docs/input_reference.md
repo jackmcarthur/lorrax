@@ -65,6 +65,7 @@ page has to read it from.
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
 | `band_chunk_size` | `16` | Bands per chunk in the band-chunked FFT/pair-density loops. The owner-selected default is mesh-rounded and capped at the logical ζ window; it is not a universal performance claim (the final AOT Si 80 Ry P=4 A/B favored full-window 21 ms versus bc16 31 ms). Explicit `0` opts into the planner's full-window-first memory ladder; explicit > 0 remains an override. |
 | `r_chunk_size` | `0` | Real-space columns per zeta-fit chunk; 0 = auto from the memory model. |
+| `low_mem_bands` | `false` | Two-face 2-D-sharded psi carrier (`gw.wavefunction_bundle` `layout="face"`: `psi_nmu`/`psi_mun`, both `P(None,'x','y')` at the (s,mu) GEMM seam) in place of the legacy four single-axis copies. `2*S/(Px*Py)` per-rank psi residency instead of `2*S/Px + 2*S/Py`. Default `false` = `layout="legacy"`, bit-identical to every deck written before this key existed. Narrow envelope while consumers are ported one at a time (`reports/gwjax_low_mem_bands_audit_2026-08-22/report.md` landing order); an unsupported combination (`head_correction=full`, `qp_solver=self_consistent`, `mpa_material_class=metal`, `bispinor=true`, explicit dense `Gij`) refuses by name rather than silently falling back to legacy. Not an environment variable. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
 ## Screening
