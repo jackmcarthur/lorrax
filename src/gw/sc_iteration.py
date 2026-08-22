@@ -2529,6 +2529,23 @@ def _write_sc_eqp_snapshot(
     # collective.
     e_output = np.asarray(e_output_kn_ev, dtype=np.float64)
     _refuse_empty_map_output(e_output, call_index=call_index, role=role)
+    # AND THE NON-FINITE REFUSAL, HERE, FOR THE SAME REASON.  8c59cb3d put
+    # ``sanity.refuse_nonfinite`` inside ``write_bgw_eqp``, which this
+    # function calls BELOW the rank gate three lines down -- so on a NaN
+    # spectrum rank 0 would raise while P-1 peers walked into the next SC
+    # collective, turning a clean refusal into a hang.  That is exactly the
+    # hazard the paragraph above avoids for the empty-column check, and the
+    # cost argument is the same: ``e_output`` is a replicated host array, so
+    # the verdict is bit-identical on every rank.  The in-writer refusal
+    # stays as defence in depth for the terminal writers (``gw_output`` at
+    # end of run, where a rank-0 raise has no collective left to desert),
+    # but in the SC loop it can no longer be the first to fire.
+    from common import sanity
+    sanity.refuse_nonfinite(
+        f"SC map output E (call {int(call_index)}, role {role})", e_output,
+        print_fn=inputs.print_fn,
+        detail="this is the column the eqp snapshot reports as the map "
+               "output, and its RMS stamp is the convergence criterion.")
 
     if process_rank() != 0:
         return None
