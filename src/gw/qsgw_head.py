@@ -23,6 +23,66 @@ used only by the retained spectral/reference derivative; the production
 finite-link stencil differentiates on the reduced-coordinate kappa grid and
 ``B^{-1}`` converts that covector to Cartesian k.  There is no extra hbar
 conversion in LORRAX's Ry/bohr velocity convention.
+
+TIME-REVERSAL PARITY OF THE QSGW VELOCITY — the convention, derived
+--------------------------------------------------------------------
+Written out here because a head-correction lane depends on it, a wrong
+sign in it is SILENT on a TRS-broken deck, and until now only the bare
+term's parity was recorded anywhere (``docs/architecture/symmetry_register.md``
+§"The three rows that are NOT one operation": ``dipole_cart`` needs a −1
+on the antiunitary rows, measured as ``rel 2.000`` without it).
+
+Let ``Theta`` be the antiunitary, and take the full-BZ gauge LORRAX
+generates, ``u_n(−k) = Theta u_n(k)`` — which is exactly what
+``symmetry_maps.unfold_psi`` builds on a Theta row (``i sigma_y . conj``
+for a spinor, plain ``conj`` for a scalar).  Antiunitarity gives
+``<Theta a|Theta b> = conj(<a|b>)``, so for any operator with
+``Theta O Theta^-1 = s O`` (``s = ±1``) the band matrix obeys, ELEMENTWISE
+and with no transpose,
+
+    O_mn(−k) = s * conj(O_mn(k)).                                    (1)
+
+Apply (1) to the three terms of ``v^Q = v^DFT + d_k Sigma − i[A, Sigma]``:
+
+* ``H``, ``Sigma``, ``kin_ion``, ``V_H`` are EVEN (``s = +1``).
+* Differentiation flips the parity.  With ``M(−k) = conj(M(k))``, write
+  ``g(k) = M(−k)``; then ``d_i g = conj(d_i M)`` and also
+  ``d_i g = −(d_i M)(−k)``, hence ``(d_i M)(−k) = −conj((d_i M)(k))``.
+  So ``d_k Sigma`` and ``d_k H`` are ODD.
+* The Berry connection is EVEN.  ``A_i = i <u_m|d_i u_n>``; the same two
+  routes give ``<u_m(−k)|(d_i u_n)(−k)> = −conj(<u_m|d_i u_n>(k))``, and
+  the explicit ``i`` turns that into ``A_i(−k) = +conj(A_i(k))``.
+* Therefore ``−i[A_i, Sigma](−k) = −i conj([A_i, Sigma](k)) =
+  −conj(−i[A_i, Sigma](k))``: the commutator term is ODD too.
+
+**All three terms carry the SAME parity, so the QSGW velocity obeys the
+same relation the bare one does:**
+
+    v^Q_i(−k) = − conj( v^Q_i(k) )     [and each term separately].   (2)
+
+Nothing about the correction flips the sign, which is the useful half of
+the result: a sign error in ``d_k Sigma`` or in the commutator shows up as
+a parity violation of the assembled ``v^Q`` rather than cancelling.
+
+SCOPE, and the two ways (2) stops being an elementwise statement.
+(a) It is a statement about the gauge in which ``u_n(−k) = Theta u_n(k)``.
+A full-BZ row reached from its IBZ parent by an unrelated SPATIAL
+operation is in a gauge related to that one by a little-group rotation, so
+the elementwise form holds only up to that band-space unitary — the same
+"one consistent row per orbit" question ``symmetry_maps.qgrid_trs`` settles
+on the q axis.
+(b) With ``Theta^2 = −1`` (spinor / SOC) the partner of band ``n`` at
+``−k`` is its KRAMERS partner, and within a degenerate doublet the label
+is gauge-arbitrary.
+:func:`trs_velocity_parity_residual` therefore reports the band-TRACE
+statistic as its verdict — ``tr v_i`` is invariant under any unitary
+mixing inside the retained window, so it survives both (a) and (b) — and
+the elementwise number only as a diagnostic.
+
+AND IT IS AN IDENTITY ONLY WHERE TIME REVERSAL HOLDS.  On a ferromagnet
+``Theta`` is not a symmetry, ``tr v_i(−k) != −tr v_i(k)`` in general (that
+asymmetry is the anomalous-velocity physics, not a bug), and the residual
+must not be gated.  The measured verdict is ``WfnLoader.trs_holds``.
 """
 
 from __future__ import annotations
@@ -62,9 +122,26 @@ __all__ = [
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
+    "report_trs_velocity_parity",
     "spectral_cartesian_derivative",
+    "trs_velocity_parity_residual",
     "validate_dft_velocity_identity",
 ]
+
+# The band-trace parity residual above which the assembled velocity is
+# taken to have an INVERTED time-reversal parity rather than a gauge or
+# window artefact.  Calibrated from the failure's own magnitude, not from
+# a value that wants to pass: a flipped sign makes
+# ``|v(−k) + conj(v(k))| = 2|v|``, i.e. residual 2.0 (the register
+# measured exactly ``rel 2.000`` for the same class of error on
+# ``dipole_cart``), while a straddled degenerate multiplet at the window
+# edge perturbs a trace by the multiplet's own share of it.  1.0 —
+# "strictly more than the entire signal" — is the only bar between the two
+# that no gauge or truncation artefact can reach.  Anything above the
+# ROUNDOFF floor and below this is warned, not refused, because no deck
+# has yet measured that floor.
+_TRS_VELOCITY_PARITY_BREAK = 1.0
+_TRS_VELOCITY_PARITY_FLOOR = 1.0e-6
 
 
 # Factory results are keyed by the mesh identity and static shape facts.  The
@@ -290,6 +367,23 @@ def load_parallel_transport_head(
             f"{forward_neighbors.shape}, expected prefix "
             f"{expected_prefix} and at least {expected_nb} bands."
         )
+    # TIME-REVERSAL PARITY, MEASURED HERE AND NOT ASSUMED DOWNSTREAM.  The
+    # head lane differentiates this velocity and adds ``d_k Sigma`` and
+    # ``-i[A, Sigma]`` to it, all three terms carrying the SAME odd parity
+    # (module docstring, eq. 2) — so a sign error anywhere in that sum is
+    # visible in exactly this statistic and invisible in every other gate
+    # the artifact carries.  The verdict comes off the WFN rather than the
+    # artifact because time reversal is a property of the DFT solution,
+    # and the fingerprint check above has already established that these
+    # are the same solution.  ``None`` (no measurement on this object) is
+    # reported as no-verdict, never as a pass.
+    trs_measured = getattr(wfn, "trs_holds", None)
+    report_trs_velocity_parity(
+        f"{path}: v^DFT", trs_velocity_parity_residual(
+            velocity[..., :expected_nb, :expected_nb],
+            kgrid=tuple(int(n) for n in expected_kgrid),
+            trs_measured=trs_measured),
+        trs_measured=trs_measured)
     return ParallelTransportHeadData(
         forward_links=links,
         forward_neighbors=forward_neighbors,
@@ -1991,6 +2085,170 @@ def build_iteration_head_samples(
     )
     return finalize_iteration_head_samples(
         response, wfn=wfn, meta=meta, config=config, mesh=mesh)
+
+
+def trs_velocity_parity_residual(
+    velocity_cart,
+    *,
+    kgrid: tuple[int, int, int],
+    trs_measured: bool | None,
+) -> dict[str, float]:
+    """Measure ``v_i(−k) = −conj(v_i(k))`` — the module docstring's eq. (2).
+
+    APPLIES EQUALLY to ``v^DFT`` and to the assembled ``v^Q`` — the whole
+    content of the derivation above is that the QSGW corrections do not
+    change the parity, so this one statistic gates both and a sign error
+    in ``d_k Sigma`` or in the ``−i[A, Sigma]`` commutator cannot hide in
+    the sum.
+
+    ``trs_measured`` is REQUIRED and has no default.  Pass
+    ``WfnLoader.trs_holds`` (the spin-density measurement).  ``None`` means
+    the verdict is unavailable, and the statistic is then returned with
+    ``verdict = nan`` rather than being read as a pass — an unmeasured
+    system is not a TRS system.
+
+    THE VERDICT STATISTIC IS THE BAND TRACE, and the reason is in the
+    module docstring's SCOPE paragraph: ``tr v_i(k)`` is invariant under
+    any unitary mixing inside the retained band window, so it survives
+    both a little-group gauge difference between ``k`` and ``−k`` and the
+    Kramers-partner ambiguity of a spinor deck.  Its SENSITIVITY, stated
+    because a null on it must not be quoted as coverage it does not have:
+    a trace is blind to any parity error whose band matrix is traceless,
+    which includes a sign flip confined to the strictly off-diagonal
+    transition sector.  ``elementwise_rel`` is returned beside it as a
+    STRICTLY STRONGER diagnostic that is only meaningful when the full-BZ
+    gauge is known to be pair-coherent, and it is never the verdict.
+
+    Returns
+    -------
+    dict
+        ``trace_rel`` (the verdict statistic), ``trace_abs``,
+        ``trace_scale``, ``elementwise_rel`` (diagnostic),
+        ``verdict`` — ``1.0`` pass, ``0.0`` fail, ``nan`` not applicable
+        (TRS broken or unmeasured, where eq. (2) is not an identity).
+    """
+    from common.sanity import neg_q_index
+
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    grid = tuple(int(n) for n in kgrid)
+    nk = int(np.prod(grid))
+    if v.ndim != 4 or int(v.shape[0]) != 3 or int(v.shape[1]) != nk:
+        raise ValueError(
+            "trs_velocity_parity_residual expects (3, nk, nb, nb) with "
+            f"nk={nk} for kgrid={grid}; got {tuple(v.shape)}.")
+    neg = jnp.asarray(neg_q_index(grid))
+
+    @jax.jit
+    def _stats(a):
+        mirror = jnp.take(a, neg, axis=1)
+        # Band trace: gauge-invariant under any unitary inside the window.
+        tr = jnp.trace(a, axis1=-2, axis2=-1)
+        tr_mirror = jnp.trace(mirror, axis1=-2, axis2=-1)
+        tr_dev = jnp.max(jnp.abs(tr_mirror + jnp.conj(tr)))
+        tr_scale = jnp.max(jnp.abs(tr))
+        el_dev = jnp.max(jnp.abs(mirror + jnp.conj(a)))
+        el_scale = jnp.max(jnp.abs(a))
+        return jnp.stack([
+            tr_dev.astype(jnp.float64), tr_scale.astype(jnp.float64),
+            el_dev.astype(jnp.float64), el_scale.astype(jnp.float64),
+        ])
+
+    tr_dev, tr_scale, el_dev, el_scale = (
+        float(x) for x in np.asarray(jax.device_get(_stats(v))))
+    trace_rel = (tr_dev / tr_scale) if tr_scale > 0.0 else tr_dev
+    el_rel = (el_dev / el_scale) if el_scale > 0.0 else el_dev
+    verdict = float("nan")
+    if trs_measured is not None and bool(trs_measured):
+        verdict = 1.0 if trace_rel <= _TRS_VELOCITY_PARITY_BREAK else 0.0
+    return {
+        "trace_rel": trace_rel,
+        "trace_abs": tr_dev,
+        "trace_scale": tr_scale,
+        "elementwise_rel": el_rel,
+        "verdict": verdict,
+    }
+
+
+def report_trs_velocity_parity(
+    name: str,
+    metrics: dict[str, float],
+    *,
+    trs_measured: bool | None,
+    print_fn=print,
+) -> bool:
+    """Print the parity verdict; refuse only on an INVERTED parity.
+
+    Three outcomes, and they are deliberately different lines:
+
+    * ``trs_measured`` false or ``None`` — eq. (2) is not an identity for
+      this mean field (or nobody measured whether it is), so the number is
+      printed as a DIAGNOSTIC with no verdict.  A ferromagnet is expected
+      to violate it; that asymmetry is anomalous-velocity physics.
+    * measured TRS, residual above ``_TRS_VELOCITY_PARITY_BREAK`` — the
+      parity is INVERTED, which is the failure a wrong sign in ``d_k
+      Sigma`` or in ``−i[A, Sigma]`` produces, and it refuses through the
+      standard :class:`common.sanity.SanityError` route unless the named
+      override is set.
+    * measured TRS, residual between the roundoff floor and that bar — a
+      loud WARNING, not a refusal, because no deck has yet measured this
+      statistic's floor and a ceiling derived from nothing is the trap
+      ``TASTE.md`` calls calibrating from the value that wants to pass.
+    """
+    from common import sanity
+
+    # The documented global escape hatch applies here as to every other
+    # stage-boundary gate: ``LORRAX_SANITY=0`` skips it entirely.  The
+    # NAMED override below is the narrower knob, for an operator who wants
+    # this one refusal lifted and every other gate kept.
+    if not sanity.sanity_enabled():
+        return True
+    rel = float(metrics["trace_rel"])
+    el = float(metrics["elementwise_rel"])
+    detail = (f"tr-parity max|tr v(-k) + conj(tr v(k))|/max|tr v| = "
+              f"{rel:.3e} (elementwise diagnostic {el:.3e})")
+    if trs_measured is None:
+        print_fn(f"  sanity[{name}]: {detail} — time reversal was NOT "
+                 f"MEASURED for this WFN, so no verdict is taken (an "
+                 f"unmeasured system is not a TRS system).")
+        return True
+    if not bool(trs_measured):
+        print_fn(f"  sanity[{name}]: {detail} — the measured spin density "
+                 f"says TIME REVERSAL IS BROKEN, so v(-k) = -conj(v(k)) is "
+                 f"NOT an identity here and this number is a diagnostic "
+                 f"only.")
+        return True
+    if rel > _TRS_VELOCITY_PARITY_BREAK:
+        sanity.warn(
+            f"{name} has an INVERTED time-reversal parity: {detail}, above "
+            f"{_TRS_VELOCITY_PARITY_BREAK:.1f} — strictly more than the "
+            f"whole signal, which no gauge or band-window artefact can "
+            f"reach.  The velocity operator is ODD under time reversal and "
+            f"every term of v^Q = v^DFT + d_k Sigma - i[A, Sigma] carries "
+            f"that same parity (gw/qsgw_head.py module docstring, eq. 2), "
+            f"so this is a sign, not a convention.  Set "
+            f"LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK=1 to proceed anyway "
+            f"and leave a trace.",
+            print_fn=print_fn)
+        from .gw_config import env_bool
+        if not env_bool("LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK", False,
+                        print_fn=print_fn):
+            raise sanity.SanityError(
+                f"{name}: time-reversal parity is inverted ({rel:.3e}); "
+                f"see gw/qsgw_head.py eq. (2).  Override with "
+                f"LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK=1.")
+        return False
+    if rel > _TRS_VELOCITY_PARITY_FLOOR:
+        sanity.warn(
+            f"{name} time-reversal parity residual is above the roundoff "
+            f"floor: {detail} > {_TRS_VELOCITY_PARITY_FLOOR:.1e}.  This "
+            f"statistic has NO CALIBRATED CEILING yet — no deck has "
+            f"measured its floor — so it warns rather than refuses.  A "
+            f"degenerate multiplet straddling the band-window edge is the "
+            f"benign explanation; check the window before the physics.",
+            print_fn=print_fn)
+        return False
+    print_fn(f"  sanity[{name}]: {detail} — parity holds.")
+    return True
 
 
 def validate_dft_velocity_identity(
