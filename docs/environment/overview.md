@@ -130,7 +130,7 @@ the first stage line. Captured **2026-08-06 on Perlmutter, job 56393848**,
     is no longer evidence of anything. Read the version and cache lines in it
     as history; §2 below states what runs now.
 
-### The four lines to read first
+### The five lines to read first
 
 **1. Platform and JAX generation.** `The JAX platform resolved to 'gpu' …
 under jax 0.5.3.dev20260806`. This is the line that tells you which JAX you
@@ -193,6 +193,26 @@ a launcher that put a *different checkout* on `PYTHONPATH` than the one you
 are editing — the run above loaded from `lorrax_P` while being launched from
 a different worktree, which the path makes obvious and nothing else would.
 `LORRAX_FFI_SO` overrides it.
+
+**5. The default matmul precision — added 2026-08-22, so it is NOT in the
+captured block above.** Every run now prints one of
+
+```text
+  Default matmul precision is pinned to 'highest', so f32 and complex64 dots run at fp32
+  rather than TensorFloat32; f64/c128 is unaffected either way.
+  WARNING: jax_default_matmul_precision resolved to None, which is NOT one of ('highest', 'float32') …
+```
+
+XLA:GPU lowers `float32` `dot_general` at DEFAULT precision to TensorFloat32
+(10-bit mantissa), and a complex64 dot decomposes into real f32 dots, so a c64
+program inherits it wholesale. MEASURED 2026-08-16, JID 57109889, on the BSE
+ladder screening matvec at the `gnppm_debug` fixture: relative forward error
+**1.902e-04 unpinned against 3.215e-07 pinned**, over a 4.652e-08
+operand-representation floor. `runtime.bootstrap()` pins it;
+`LORRAX_MATMUL_PRECISION` overrides it and refuses anything but `highest` /
+`float32` — `high` included, because on XLA:GPU that is a 3-pass tf32
+decomposition rather than fp32. The line is unconditional, including when it
+is fine, so "pinned" and "nobody looked" do not read alike.
 
 > **Read the block, not the env, and not this page.** Where the block and any
 > documented default disagree, the block is what ran.

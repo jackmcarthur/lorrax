@@ -43,6 +43,14 @@ able to kill a 40-node job, and a real positive is loud enough to see in
 any log tail.  Set ``LORRAX_SANITY=strict`` in CI / regression gates,
 where an early hard failure is exactly what you want.
 
+**One check does not obey that switch at all**: :func:`refuse_nonfinite`
+raises whatever ``LORRAX_SANITY`` says, because the switch buys back the
+COST of a reduction and there is no cost to buy back on an object the run
+is about to ship.  Its own named escape is
+``LORRAX_ALLOW_NONFINITE_RESULT=1``.  The distinction is not academic: on
+bcc Fe every one of 7176 E_QP entries came back NaN and the driver exited
+**rc=0** in 883 s with only a warning line to show for it (JID 57051742).
+
 Usage
 -----
 ::

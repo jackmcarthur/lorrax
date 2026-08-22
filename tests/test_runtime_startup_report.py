@@ -1097,17 +1097,34 @@ def test_pin_matmul_precision_sets_the_live_config():
     reads, not merely a string this module remembers."""
     jax = pytest.importorskip("jax")
     saved_env = os.environ.get("LORRAX_MATMUL_PRECISION")
-    saved = jax.config.read("jax_default_matmul_precision")
+    # ATTRIBUTE, NOT ``jax.config.read``.  ``read`` refuses any flag that has
+    # a contextmanager, and this is one — measured on jax 0.5.3.dev20260822
+    # in the deployed image, where ``read`` raises AttributeError naming the
+    # flag.  ``runtime.read_matmul_precision`` is the one reader.
+    saved = getattr(jax.config, "jax_default_matmul_precision", None)
     try:
         os.environ.pop("LORRAX_MATMUL_PRECISION", None)
         assert runtime.pin_matmul_precision() == "highest"
-        got = jax.config.read("jax_default_matmul_precision")
-        assert str(got).lower().split(".")[-1] in ("highest", "float32"), got
+        assert runtime.read_matmul_precision() in ("highest", "float32")
         os.environ["LORRAX_MATMUL_PRECISION"] = "float32"
         assert runtime.pin_matmul_precision() == "float32"
+        assert runtime.read_matmul_precision() == "float32"
     finally:
         jax.config.update("jax_default_matmul_precision", saved)
         if saved_env is None:
             os.environ.pop("LORRAX_MATMUL_PRECISION", None)
         else:
             os.environ["LORRAX_MATMUL_PRECISION"] = saved_env
+
+
+def test_the_startup_facts_can_actually_measure_the_precision():
+    """The field must be MEASURABLE, not merely present.
+
+    A reader that throws would leave ``matmul_precision`` permanently
+    unknown and the report permanently warning — which looks like a
+    finding and is a broken instrument.  This is the not-void half of the
+    warning cell above.
+    """
+    pytest.importorskip("jax")
+    runtime.pin_matmul_precision()
+    assert runtime.read_matmul_precision() in ("highest", "float32")

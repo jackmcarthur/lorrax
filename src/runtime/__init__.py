@@ -164,6 +164,7 @@ __all__ = [
     "fallback_to_cpu_if_no_gpu_backend",
     "install_failfast_excepthook",
     "pin_matmul_precision",
+    "read_matmul_precision",
 ]
 
 
@@ -242,6 +243,26 @@ _MATMUL_PINNED = ("highest", "float32")
 #: :data:`_MATMUL_PINNED` REFUSES: a typo in a precision knob must not
 #: resolve to TF32 by falling through.
 _MATMUL_PRECISION_ENV = "LORRAX_MATMUL_PRECISION"
+
+
+def read_matmul_precision():
+    """The RESOLVED ``jax_default_matmul_precision``, normalised to a token.
+
+    ``None`` means jax has no opinion recorded, which on XLA:GPU is the
+    TF32 default -- so ``None`` is a WARNING state, not an absence of
+    information.  Read through the attribute rather than
+    ``jax.config.read``: that helper refuses any flag with a
+    contextmanager, and this is one ("For flags with a corresponding
+    contextmanager, read their value via e.g. config.<name>", measured on
+    jax 0.5.3.dev20260822).
+    """
+    jax = _import_jax()
+    prec = getattr(jax.config, "jax_default_matmul_precision", None)
+    if prec is None:
+        return None
+    # jax stores it as a ``Precision`` enum or a string depending on how it
+    # was set; both spell the same token after this.
+    return str(getattr(prec, "name", prec)).lower().split(".")[-1]
 
 
 def pin_matmul_precision() -> str:
@@ -1949,12 +1970,13 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     # Read the RESOLVED value for the same reason x64 is read resolved: an
     # unpinned f32/c64 dot runs at TensorFloat32 on XLA:GPU and loses three
     # orders of magnitude with nothing on screen (see pin_matmul_precision).
-    try:
-        _prec = jax.config.read("jax_default_matmul_precision")
-    except Exception:                                         # noqa: BLE001
-        _prec = getattr(jax.config, "jax_default_matmul_precision", None)
-    f["matmul_precision"] = (None if _prec is None
-                             else str(_prec).lower().split(".")[-1])
+    # ATTRIBUTE, NOT ``config.read``: this flag has a contextmanager, and
+    # ``read`` refuses those by name ("For flags with a corresponding
+    # contextmanager, read their value via e.g. config.<name>") -- measured
+    # on jax 0.5.3.dev20260822 in the deployed image.  ``read`` would
+    # therefore have thrown on every call and this field would have been
+    # silently unmeasurable.
+    f["matmul_precision"] = read_matmul_precision()
     f["matmul_precision_env"] = os.environ.get(_MATMUL_PRECISION_ENV)
     f["jax_version"] = getattr(jax, "__version__", "unknown")
 
