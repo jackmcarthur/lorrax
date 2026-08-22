@@ -218,17 +218,42 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
     axes legal for ``P('x', 'y')`` without inventing physical states. A
     common multiple is intentional because the wing ring uses one band
     storage extent on both processor axes.
+
+    ``v`` is COMMITTED here to the exact ``P(None, None, 'x', 'y')`` layout
+    every caller's kernel declares (``_s_tensor_kernel``,
+    ``_head_wing_kernel``, ``_drude_tensor_kernel``).  Every caller builds
+    ``v`` via a bare ``jnp.asarray(velocity_cart)`` on a freshly host-read
+    dipole array, which JAX places as an UNCOMMITTED, single-device
+    ``SingleDeviceSharding`` -- never the mesh at all.  Feeding that
+    foreign sharding straight into a ``shard_map``-wrapped ``jax.jit``
+    whose OTHER operands (the centroid ψ copies) already carry proper
+    ``NamedSharding`` on this same mesh forces GSPMD's auto-reshard
+    prologue to reconcile one genuinely off-mesh operand against several
+    on-mesh ones -- and on the production MoS2 9x9x1/626-band/mu=5288
+    shape (P=16) that reconciliation was measured requesting a single
+    81.74 GiB allocation at the ``block_until_ready`` in
+    ``build_dft_head_response``, ~10x one full ``(nk,ns,mu,nb)`` ψ copy,
+    against a compile-only peak of 5.98 GiB for the SAME kernels when
+    every input is ALREADY correctly sharded (2026-08-22 restart-path OOM
+    investigation, branch fix/head-fold-streamed-2026-08-22).  This
+    reproduces byte-for-byte identically whether ``wfns`` came from a
+    fresh zeta fit or a restart load -- the restart loader's ψ contract is
+    not at fault; the fresh path only avoids it because the ISDF zeta fit
+    upstream OOMs first at production scale, on a different binder, so it
+    never reaches this call.  ``jax.device_put`` here places ``v`` on the
+    mesh directly from its single source device, before it ever reaches a
+    kernel, so no jit call in this module dispatches a foreign sharding.
     """
     nb = int(v.shape[-1])
     alignment = lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
     nb_padded = ((nb + alignment - 1) // alignment) * alignment
-    if nb_padded == nb:
-        return v, e, f, surface
-    pad = nb_padded - nb
-    v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
-    e = jnp.pad(e, ((0, 0), (0, pad)))
-    f = jnp.pad(f, ((0, 0), (0, pad)))
-    surface = jnp.pad(surface, ((0, 0), (0, pad)))
+    if nb_padded != nb:
+        pad = nb_padded - nb
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
+        e = jnp.pad(e, ((0, 0), (0, pad)))
+        f = jnp.pad(f, ((0, 0), (0, pad)))
+        surface = jnp.pad(surface, ((0, 0), (0, pad)))
+    v = jax.device_put(v, NamedSharding(mesh, P(None, None, "x", "y")))
     return v, e, f, surface
 
 
