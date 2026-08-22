@@ -635,6 +635,123 @@ def check_distributed_matmul(mesh, dtype="complex128", *,
     return {"nn_residual": rel, "conj_transpose_residual": rel_t}
 
 
+def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
+                             m=None, k=None, n=None):
+    """``distrib_la.gemm_plan``/``GemmPlan``: numerics, nested ``jit``,
+    ``lax.scan`` reuse, the donated ``out=`` path, the ``beta!=0``
+    accumulate path, and the internal-zero-``C`` path -- all against an
+    ``A @ B`` numpy reference.  This is the ONLY tier that can certify any
+    of it: the plan refuses off-CUDA and off-cuBLASMp by construction (see
+    ``test_distrib_la_matmul_plan.py``), so an emulated mesh never reaches
+    the code this checks.
+
+    ``m, k, n`` default from the mesh so the plan's own tiling checks
+    (``m % px``, ``k % px``, ``k % py``, ``n % py``) are exercised on
+    whatever square mesh this runs on, not hard-coded to 2x2.
+    """
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py, f"gemm_plan needs a square mesh; got {px}x{py}"
+    m = m if m is not None else 2 * px
+    k = k if k is not None else 3 * px
+    n = n if n is not None else 2 * px
+    rng = np.random.default_rng(20260822)
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, "x", "y"))
+    B = _put(B_np, mesh, (None, "x", "y"))
+    want = A_np @ B_np
+
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                       backend="cublasmp")
+    assert plan.backend == "cublasmp"
+    assert plan.describe(), "describe() must produce a non-empty banner line"
+    out = {}
+
+    # 1. eager call, no C -- the internal-zero-C kernel folded into one
+    # compiled program (module docstring, "Output liveness").
+    D_eager_j = plan(A, B)
+    assert D_eager_j.sharding.spec == P(None, "x", "y")
+    D_eager = _gather(D_eager_j)
+    out["eager_no_c"] = _rel(D_eager, want)
+    assert out["eager_no_c"] < RTOL, out["eager_no_c"]
+
+    # 2. inside a jax.jit -- proves the closure composes under an outer
+    # trace with no eager resolve/probe/dlopen inside it: gemm_plan()
+    # already ran and warmed all of that before this function was called.
+    @jax.jit
+    def _once(a, b):
+        return plan(a, b)
+    D_jit = _gather(_once(A, B))
+    out["jit_no_c"] = _rel(D_jit, want)
+    assert out["jit_no_c"] < RTOL, out["jit_no_c"]
+
+    # 3. inside lax.scan -- the actual per-tau/per-k hot-loop shape this
+    # plan exists for (ppm_tau_kernel.py:311-317,438-490).  The scan body
+    # traces ONCE; if the plan secretly needed eager work per call this
+    # would either fail to trace or, on P>1, hang inside a mid-trace NCCL
+    # collective instead of raising.
+    nsteps = 3
+    A_stack_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_stack_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A_stack = _put(A_stack_np, mesh, (None, None, "x", "y"))
+    B_stack = _put(B_stack_np, mesh, (None, None, "x", "y"))
+
+    @jax.jit
+    def _scanned(a_stack, b_stack):
+        def body(carry, ab):
+            a, b = ab
+            return carry, plan(a, b)
+        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack))
+        return out_stack
+
+    D_scan = _gather(_scanned(A_stack, B_stack))
+    want_scan = A_stack_np @ B_stack_np
+    out["scan_no_c"] = _rel(D_scan, want_scan)
+    assert out["scan_no_c"] < RTOL, out["scan_no_c"]
+
+    # 4. explicit C, beta != 0 -- the donated-C kernel's accumulate form,
+    # and its own refusal when a beta!=0 plan is called with no C.
+    plan_beta = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                            backend="cublasmp", beta=-0.5)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    C = _put(C_np, mesh, (None, "x", "y"))
+    D_c = _gather(plan_beta(A, B, C))
+    want_c = A_np @ B_np + (-0.5) * C_np
+    out["beta_accumulate"] = _rel(D_c, want_c)
+    assert out["beta_accumulate"] < RTOL, out["beta_accumulate"]
+    with _raises(ValueError, "C is required"):
+        plan_beta(A, B)
+
+    # 5. out= -- a caller-owned buffer donated purely for its storage
+    # (beta=0, content ignored).  Correctness matches case 1; this proves
+    # the call succeeds through the donated-C kernel with a real live
+    # buffer in that slot, not only ever the plan's internal zeros.
+    scratch_np = _rng_mat(rng, (nq, m, n), dtype)
+    D_out = _gather(
+        plan(A, B, out=_put(scratch_np, mesh, (None, "x", "y"))))
+    out["out_donated"] = _rel(D_out, want)
+    assert out["out_donated"] < RTOL, out["out_donated"]
+    with _raises(ValueError, "not both"):
+        plan(A, B, C, out=C)
+
+    # 6. repeated calls on the SAME warmed plan with fresh operands each
+    # time -- a real-mesh reuse signal (no per-call resolve/dlopen/probe,
+    # no drift in the answer).  A dedicated allocator/HLO memory-telemetry
+    # leg is the deeper capacity claim; this is correctness under reuse.
+    for i in range(5):
+        Ai = _rng_mat(rng, (nq, m, k), dtype)
+        Bi = _rng_mat(rng, (nq, k, n), dtype)
+        Di = _gather(plan(_put(Ai, mesh, (None, "x", "y")),
+                          _put(Bi, mesh, (None, "x", "y"))))
+        r = _rel(Di, Ai @ Bi)
+        assert r < RTOL, f"repeated call {i}: rel {r:.3e}"
+    out["repeated_calls"] = 5
+    return out
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -731,6 +848,27 @@ def test_batch_reshard_local_ops_smoke():
     check_batch_reshard_local_ops(_mesh_1x1("cpu"), nq=5, n=16, nrhs=8)
 
 
+def test_gemm_plan_cublasmp_smoke():
+    """Single-GPU smoke of the planned surface; real 2x2 numerics, nested
+    jit/scan and the donated paths are leg L-c's ``gemm_plan_cublasmp``
+    cell -- ``gemm_plan`` itself refuses a 1x1-only irrelevant geometry
+    nowhere, so this cell is real coverage, not a placeholder."""
+    import jax
+    try:
+        jax.devices("gpu")
+    except Exception as exc:                                     # noqa: BLE001
+        pytest.skip(f"no CUDA backend here ({exc}); covered by leg L-c")
+    mesh = _mesh_1x1("gpu")
+    try:
+        D.resolve_matmul_backend("cublasmp", mesh)
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(
+            f"cublasmp not usable on a 1x1 CUDA mesh: {exc}  Covered by "
+            f"leg L-c (lx run -n 4 ... --mesh 2x2) where the library is "
+            f"pinned and there are four ranks")
+    check_gemm_plan_cublasmp(mesh, nq=2, m=2, k=3, n=2)
+
+
 def test_batch_reshard_matmul_smoke():
     """The real staged movement is the P=4 CLI cell of the same body."""
     check_distributed_matmul(
@@ -803,6 +941,8 @@ _CLI_CELLS = [
     ("matmul_slate", "",
      lambda mesh, dt: check_distributed_matmul(
          mesh, dt, backend="slate", batched_route="auto", nq=4)),
+    ("gemm_plan_cublasmp", "CUDA",
+     lambda mesh, dt: check_gemm_plan_cublasmp(mesh, dt)),
 ]
 
 
