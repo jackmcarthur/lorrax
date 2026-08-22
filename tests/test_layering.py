@@ -105,6 +105,15 @@ _L3_MODULES = frozenset({
     # of ``runtime``, not something above it.
     "runtime", "runtime.aot_memory", "runtime.padding", "runtime.xla_memory",
     "runtime.jax_support", "runtime.pjrt_log_filter",
+    # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
+    # whole reason it is here rather than in ``gw.gw_config``.  The parsers
+    # that still swallowed an unrecognised token silently
+    # (``file_io._slab_io_ffi._env_flag``, ``runtime._env_falsy``) are L3
+    # and may not import an L1 module, so a grammar owned at L1 is a
+    # grammar the substrate re-invents -- which is exactly what those two
+    # were.  It knows about ``os.environ`` and nothing else: no jax, no
+    # config, no physics.
+    "runtime.env_flags",
     # the cross-process service and its one policy client
     "common.collectives", "centroid.distribution",
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``

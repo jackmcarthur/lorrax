@@ -101,19 +101,16 @@ _DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 # what a shell leaves behind for an unset variable expansion
 # (``export X=$UNDEFINED``), so under the old rule a harness typo in the
 # variable *name* silently turned the knob off.
-_FALSY_TOKENS = ("0", "false", "no", "off")
-
-
-def _env_falsy(name: str, default: str = "1") -> bool:
-    """True when env knob ``name`` parses as falsy (0, false, no, off).
-
-    Unset OR blank/whitespace falls back to ``default`` — the same reading
-    of blank as every other LORRAX boolean parser (see ``_FALSY_TOKENS``).
-    """
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        raw = default
-    return raw.strip().lower() in _FALSY_TOKENS
+# ONE PARSER (2026-08-22).  This used to be a second grammar with a third
+# behaviour: an UNRECOGNISED token resolved to "not falsy", i.e. it left a
+# default-on knob silently ON while `gw_config.env_bool` and
+# `_slab_io_ffi._env_flag` both resolved the same token to OFF, and none of
+# the three said anything.  `runtime.env_flags` now owns the table and the
+# announcement; this is one negation over it, kept because the call sites
+# here read naturally as "is this turned off" and inverting at each site is
+# how a reader loses which way the default points.
+from .env_flags import ENV_FALSE as _FALSY_TOKENS   # noqa: F401
+from .env_flags import env_falsy as _env_falsy      # noqa: F401
 
 
 #: Seconds spent inside the process's FIRST ``import jax``, measured where it

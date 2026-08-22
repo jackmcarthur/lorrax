@@ -504,32 +504,77 @@ def test_blank_is_unset_in_every_vocabulary_including_runtime():
 def test_defect3_vocabulary_has_not_drifted():
     """DEFECT 3 — one recognised token set, checked against every live copy.
 
-    Three named vocabularies remain in the tree and must stay set-equal:
+    TWO vocabularies remain in the tree and must stay set-equal:
+      * ``runtime/env_flags.py::ENV_TRUE``/``ENV_FALSE`` — THE grammar
+        since 2026-08-22.  ``gw_config._ENV_TRUE/_ENV_FALSE``,
+        ``runtime.__init__._FALSY_TOKENS`` and
+        ``file_io/_slab_io_ffi.py::_TRUE/_FALSE`` are now RE-EXPORTS of
+        it, so the drift they used to be able to have is gone by
+        construction rather than by this assertion;
       * ``ffi/gate.py::MODE_SPELLINGS``  (two-valued since 2026-08-06 —
-        the ``auto`` token was deleted with the auto tier it named; the
-        resolvers stay separate, the tokens agree);
-      * ``runtime.__init__._FALSY_TOKENS``     (the falsy set exactly — the
-        ``""`` it used to carry was the blank-token divergence, now fixed);
-      * ``file_io/_slab_io_ffi.py::_TRUE`` (read from source: imports
-        jax at package scope).  Was ``_slab_io_mpi_host.py`` until that
-        backend was deleted 2026-08-06; the tuple moved to the surviving
-        phdf5 writer, which already spelled it inline three times.
+        the ``auto`` token was deleted with the auto tier it named).  The
+        gate keeps its own resolver because it is three-VALUED in intent
+        (a gate may DEMOTE and say so); only its on/off token sets are
+        the same vocabulary, and those still have to be checked.
 
-    ``isdf/core.py::_ENV_TRUE`` — the fourth copy this test used to pin —
-    was RETIRED by P1.3: the module imports ``gw_config.env_bool``
-    instead.  The companion check below asserts the copy stays dead.
+    ``isdf/core.py::_ENV_TRUE`` — a copy this test used to pin — was
+    RETIRED by P1.3: the module imports ``gw_config.env_bool`` instead.
+    ``file_io/_slab_io_ffi.py``'s literal tuples went the same way on
+    2026-08-22, and the companion checks below assert both stay dead.
     """
+    from runtime import env_flags
     assert set(gw_config._ENV_TRUE) == set(gate.MODE_SPELLINGS["on"])
     assert set(gw_config._ENV_FALSE) == set(gate.MODE_SPELLINGS["off"])
     assert set(_runtime._FALSY_TOKENS) == set(gw_config._ENV_FALSE)
-    assert set(gw_config._ENV_TRUE) == set(
-        _literal_tuple_from_source("file_io/_slab_io_ffi.py", "_TRUE"))
+    # Identity, not equality: a re-export cannot drift, and asserting the
+    # OBJECT is the same is what makes that claim rather than restating a
+    # coincidence.
+    assert gw_config._ENV_TRUE is env_flags.ENV_TRUE
+    assert gw_config._ENV_FALSE is env_flags.ENV_FALSE
+    assert _runtime._FALSY_TOKENS is env_flags.ENV_FALSE
     # ``auto`` must stay out of the two-valued sets.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
     # ...and out of the gate vocabulary: a token with no resolver branch in
     # enabled()/resolve()/enforce() would accept ``=auto`` and run as ``on``
     # in silence (deleted 2026-08-06; decisions.md 2026-08-01 killed the tier).
     assert "auto" not in gate.MODE_SPELLINGS and "auto" not in gate.MODE_HELP
+
+
+def test_the_substrate_parsers_import_the_grammar_rather_than_copying_it():
+    """The 2026-08-22 ratchet: no L3 module may re-grow a boolean parser.
+
+    ``file_io._slab_io_ffi._env_flag`` and ``runtime._env_falsy`` were both
+    local copies, and both SWALLOWED — an unrecognised token resolved with
+    nothing printed, in OPPOSITE directions (``_env_flag`` -> off,
+    ``_env_falsy`` -> on).  They could not simply call
+    ``gw_config.env_bool``: that is L1 and they are L3.  Moving the grammar
+    down to ``runtime.env_flags`` is what removed the excuse, so this test
+    pins that the excuse stays removed.
+
+    Parsed, not imported (``file_io`` pulls jax at package scope).
+    """
+    for relpath, names in (
+        ("file_io/_slab_io_ffi.py", ("_TRUE", "_FALSE")),
+        ("runtime/__init__.py", ("_FALSY_TOKENS",)),
+    ):
+        src = _read(relpath)
+        tree = ast.parse(src, relpath)
+        for node in tree.body:
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target] if isinstance(node, ast.AnnAssign)
+                       else [])
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id in names:
+                    raise AssertionError(
+                        f"{relpath} defines a module-level literal {t.id} "
+                        f"again.  The boolean grammar lives in "
+                        f"runtime/env_flags.py; import it.  A second copy "
+                        f"is a second parse, and the last two both "
+                        f"swallowed an unrecognised token in silence — in "
+                        f"opposite directions.")
+        assert "runtime.env_flags" in src or "from .env_flags" in src, (
+            f"{relpath} neither defines nor imports the grammar; where is "
+            f"it getting its tokens?")
 
 
 def test_isdf_core_grammar_copy_stays_dead():

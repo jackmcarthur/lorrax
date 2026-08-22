@@ -139,16 +139,16 @@ _STRIPE_UNIT_MAX = 4 << 20
 #: of the phdf5 writer stay one grammar. This file once spelled the same
 #: tuple inline three times; keeping one local copy avoids an uphill
 #: L3 -> L1 import.
-_TRUE = ("1", "true", "yes", "on")
-_FALSE = ("0", "false", "no", "off")
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    """``name`` as a boolean, ``default`` when unset or empty."""
-    v = os.environ.get(name)
-    if v is None or not v.strip():
-        return default
-    return v.strip().lower() in _TRUE
+# ONE PARSER (2026-08-22).  These three used to be a local copy of the
+# grammar, and the copy SWALLOWED: an unrecognised token resolved to False
+# with nothing printed, so a typo in a knob name's VALUE turned a
+# default-on knob off in silence.  ``runtime.env_flags`` (L3, no jax) owns
+# the table and the once-per-value announcement now; the local tuples were
+# a deliberate duplicate to avoid an uphill L3 -> L1 import into
+# ``gw_config``, and moving the grammar down removes the reason for it.
+from runtime.env_flags import ENV_FALSE as _FALSE   # noqa: F401
+from runtime.env_flags import ENV_TRUE as _TRUE     # noqa: F401
+from runtime.env_flags import env_bool as _env_flag  # noqa: F401
 
 
 #: Paths already announced as taking the legacy serial-h5py introspect.
