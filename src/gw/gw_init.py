@@ -40,6 +40,7 @@ from .gw_config import (
 	env_bool,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
+	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
 )
 
@@ -2304,6 +2305,20 @@ def prepare_isdf_and_wavefunctions(
 	from .restart_q_storage import (resolve_restart_q_storage_for_run,
 	                                take_pre_unfold)
 
+	# THE DRIVER-ENTRY MIRROR of the parse-time low_mem_bands envelope
+	# check (``LorraxConfig.from_input_file`` already ran this on the
+	# production path — ``gw_jax.main`` never reaches this function without
+	# it).  No-op there, so this costs nothing on the path it duplicates;
+	# what it buys is a hand-built ``cfg`` (a test harness, a future direct
+	# caller) refusing HERE, before the chunk planner / ISDF fit / restart
+	# tensor read below, rather than reaching a bare AttributeError deep in
+	# an unported consumer.  Same two-call-site shape as
+	# ``refuse_unimplemented_compute_mode`` (parser + ``compute_sigma_xc``)
+	# for the same reason.  Replaces the two bispinor-only ad hoc guards
+	# this function used to carry on its own fresh/restart branches: this
+	# single call covers all four table rows, earlier, on both branches.
+	refuse_unsupported_low_mem_bands(cfg)
+
 	if not cfg.restart:
 		from common.wfn_transforms import get_enk_bandrange
 
@@ -2472,13 +2487,10 @@ def prepare_isdf_and_wavefunctions(
 			wfns = None
 			wfns_transverse = None
 			if cfg.memory.low_mem_bands:
-				if transverse_wfn_data is not None:
-					raise ValueError(
-						"low_mem_bands = true does not support bispinor "
-						"(bispinor = true): the face carrier has no "
-						"transverse-centroid bundle yet (audit report §6, "
-						"'refuse until ported').  Set bispinor = false, or "
-						"low_mem_bands = false.")
+				# bispinor + low_mem_bands already refused at this
+				# function's entry (refuse_unsupported_low_mem_bands),
+				# before the chunk planner even ran -- so
+				# transverse_wfn_data cannot be non-None here.
 				from .wavefunction_bundle import build_wavefunctions_face
 				from common.wfn_transforms import (
 					get_enk_bandrange as _get_enk_bandrange_early)
@@ -2692,13 +2704,10 @@ def prepare_isdf_and_wavefunctions(
 				"are not available.  Rerun with restart = false (the placement "
 				"changes W, so an inherited W0 would be the wrong object "
 				"anyway).")
-		if cfg.memory.low_mem_bands and cfg.bispinor:
-			raise ValueError(
-				"low_mem_bands = true does not support bispinor "
-				"(bispinor = true) on restart either: the face carrier "
-				"has no transverse-centroid bundle yet (audit report §6, "
-				"'refuse until ported').  Set bispinor = false, or "
-				"low_mem_bands = false.")
+		# bispinor + low_mem_bands (and the other three envelope rows)
+		# already refused at this function's entry
+		# (refuse_unsupported_low_mem_bands), before either restart branch
+		# above ran.
 		from file_io import load_restart_state_from_h5
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
