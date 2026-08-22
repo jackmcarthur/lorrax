@@ -11,7 +11,9 @@ from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.ppm_accumulators import DeviceOmegaAccumulator
-from gw.ppm_sigma import SigmaOmegaResult, pad_sigma_window, strip_sigma_window
+from gw.ppm_sigma import (SigmaOmegaResult,
+                          assert_sharded_sigma_window_divides_mesh,
+                          pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 
@@ -63,6 +65,15 @@ def _integrate_sigma_batches(
     # wired for consistency and has never executed under a split.
     psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
     psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
+    # THE SAME precondition the PPM sharded branch owns.  This executor
+    # accumulates into a P(None,None,'x','y') array and then strips the pad
+    # block off both trailing axes, which on an indivisible window leaves a
+    # sharded array whose declared spec no longer divides its own shape.
+    # Before 2026-08-22 there was no divisibility check anywhere in this
+    # module while ppm_sigma refused the same case by name -- two contracts
+    # at one seam.
+    assert_sharded_sigma_window_divides_mesh(
+        int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
     psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
         psi_proj_xr, psi_proj_yn, mesh_xy)
     shape = (omega.size, int(psi_proj_xr.shape[0]),

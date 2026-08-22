@@ -380,6 +380,7 @@ def finalize_dynamic_sigma(
     sigma_c_body_omega_unextrap: jax.Array | None = None,
     print_fn: Callable = print,
     efermi_ry=None,
+    efermi_provenance=None,
 ) -> SigmaResult:
     """Finalize one dynamic Sigma ansatz without knowing its pole model.
 
@@ -421,6 +422,7 @@ def finalize_dynamic_sigma(
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
             efermi_ry=efermi_ry,
+            efermi_provenance=efermi_provenance,
         )
 
         if write_sigma_omega_h5:
@@ -893,11 +895,54 @@ def compute_sigma_xc(
         from .head_correction import compute_complex_pole_head_sigma_diag
         from .mpa.sigma import compute_sigma_c_mpa_omega_grid
         from .mpa.sigma_windows import CROSSING_NODE_FLOOR
+        from .efermi import resolve_sigma_efermi_ry
+        from .ppm_windows import sigma_regularization_for_config
 
         try:
             fit_path = W_by_role["mpa_fit"]
         except KeyError as exc:
             raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+        # ── DECK KEYS THIS BRANCH HONORS, NAMED ─────────────────────────
+        # Both keys below are parsed and validated by gw_config and were
+        # then IGNORED here: MPA hard-coded ``wfn.efermi`` and always
+        # emitted the sharded cube, while the PPM branch honored both.  A
+        # parsed-but-ignored key is a defect (TASTE 13), and it became a
+        # live one the moment UNIMPLEMENTED_MODES stopped holding MPA back.
+        #
+        # sigma_omega_layout: the MPA executor's accumulator is born
+        # P(None,None,'x','y') and there is no replicated plan for it --
+        # which is what the metal-only refusal in
+        # gw_config._validate_occupation_smearing already SAYS ("the MPA
+        # Sigma emits the mesh-sharded omega cube only").  That is a fact
+        # about MPA, not about metals, so the refusal is generalised here
+        # rather than left to fire on one material class.  Refusing (not
+        # gathering) is the standing ruling: the sharded layout exists
+        # precisely to elide the P-independent full-cube gather, so
+        # "replicated" would be an allgather sold as a fallback
+        # (decisions.md 2026-08-05).
+        if str(config.sigma.omega_layout) != "sharded":
+            raise ValueError(
+                f"compute_mode = mpa requires sigma_omega_layout = sharded "
+                f"(got {config.sigma.omega_layout!r}).  The MPA Sigma "
+                f"executor accumulates Sigma_c(w,k,m,n) directly at "
+                f"P(None,None,'x','y') on the existing mesh and has no "
+                f"replicated plan; honoring 'replicated' would mean "
+                f"gathering the full cube on every rank, which is the "
+                f"P-independent collective the sharded layout exists to "
+                f"elide.  Set sigma_omega_layout = sharded.")
+        # fermi_reference: resolved by the one owned resolver, which also
+        # returns the provenance string the sigma_mnk.h5 stamp needs.
+        sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
+            config.sigma.fermi_reference,
+            occupation_state=occupation_state, wfn=wfn)
+        # The effective Sigma broadening, from the SAME resolver the PPM
+        # driver uses.  MPA used to take ``regularization_ev`` raw while
+        # GN-PPM silently raised it to a window-dependent conditioning
+        # floor -- 1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
+        # window -- so every cross-ansatz comparison was confounded and
+        # neither output said what xi it ran at.
+        _xi = sigma_regularization_for_config(config)
+        print_fn(_xi.describe())
         if config.mpa.material_class == "metal":
             # Metal deck-key consistency is refused at config parse
             # (_validate_occupation_smearing); here the run-level facts:
@@ -915,18 +960,12 @@ def compute_sigma_xc(
             # would claim to guard (claim 0194: the assert here was
             # unsatisfiable while no writer path carried the state).
             # assert_occupation_stamps remains the cross-run reuse gate.
-        # One chemical potential per iteration: the metal reference is the
-        # state's fixed-N mu, never the loader's midgap/VBM efermi.
-        sigma_efermi_ry = (float(occupation_state.mu_ry)
-                           if occupation_state is not None
-                           else float(wfn.efermi))
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy,
             omega_grid_ry=config.omega_grid_ry,
             efermi_ry=sigma_efermi_ry,
             occupation_state=occupation_state,
-            regularization_width_ry=(
-                float(config.sigma.regularization_ev) / RYD_TO_EV),
+            regularization_width_ry=_xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
             target_error=float(config.mpa.sigma_sector_target_error),
             crossing_target_error=float(
@@ -975,10 +1014,14 @@ def compute_sigma_xc(
             input_dir=input_dir,
             write_sigma_omega_h5=write_sigma_omega_h5,
             print_fn=print_fn,
-            # The MPA grid was built against this mu (one chemical
-            # potential per iteration); the finalizer must read it back
-            # against the same reference.
-            efermi_ry=sigma_efermi_ry)
+            # The MPA grid was built against this reference (one per
+            # iteration); the finalizer must read it back against the same
+            # one, and STAMP which one it was -- the `efermi_ry is None`
+            # proxy the finalizer falls back to would label every explicit
+            # reference "fixed-N mu", so a midgap MPA run would be written
+            # into sigma_mnk.h5 as a metal's chemical potential.
+            efermi_ry=sigma_efermi_ry,
+            efermi_provenance=sigma_efermi_provenance)
 
     # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
     # What follows is the two-point plasmon-pole pipeline, and until this

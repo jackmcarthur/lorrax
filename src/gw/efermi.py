@@ -86,8 +86,73 @@ __all__ = [
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "mp1_negative_derivative", "mp1_occupations",
     "occupation_clamp_tol", "occupation_weight_floor",
-    "occupied_band_count", "solve_mp1_occupations", "step_occupations",
+    "occupied_band_count", "resolve_sigma_efermi_ry",
+    "solve_mp1_occupations", "step_occupations",
 ]
+
+
+#: The three legal ``fermi_reference`` values and what each NAMES.  Kept
+#: beside the resolver so the vocabulary and its interpretation cannot
+#: drift apart (``gw_config.DynamicSigmaConfig.__post_init__`` validates
+#: membership; this decides what membership MEANS).
+SIGMA_FERMI_REFERENCES = ("vbm", "midgap", "mp1_fixed_n")
+
+
+def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
+    """THE energy the Sigma omega axis is measured from, and where it came from.
+
+    Returns ``(efermi_ry, provenance)`` -- the second value is the string
+    ``file_io.write_sigma_omega_h5`` stamps as
+    ``omega_reference_provenance``, so a post-hoc consumer never has to
+    guess (audit A2 measured a 2.79 eV mis-sampling of Sigma_c(omega) on
+    the sodium metal deck from exactly that guess).
+
+    WHY THIS IS A FUNCTION AND NOT THREE INLINE BRANCHES.  The MPA Sigma
+    branch used to read ``occupation_state.mu_ry or wfn.efermi`` directly
+    and never look at ``fermi_reference`` at all, while the PPM branch
+    honored it.  ``wfn.efermi`` happens to BE the midgap
+    (``wfn_loader.loader`` sets ``0.5*(vbm + cbm)``), so the default
+    ``midgap`` agreed by coincidence and only ``vbm`` was silently wrong --
+    which is the worst shape for a defect to have, because the one deck
+    that would expose it is the one nobody runs by default.
+
+      ``mp1_fixed_n``  the fixed-N MP1 chemical potential of THIS
+                       iteration.  Requires an ``occupation_state``; a
+                       metal has one and ``gw_config`` refuses the
+                       combination without it.
+      ``midgap``       ``0.5*(vbm + cbm)`` -- the loader's ``efermi``.
+      ``vbm``          the valence-band maximum, ``wfn.vbm``.
+
+    An ``occupation_state`` present with a gap-derived reference is a
+    contradiction, not a preference: the state exists because the deck
+    solved a fixed-N chemical potential, and measuring Sigma against a
+    different reference than the occupations were built at is the
+    confound this refusal exists to make unspellable.
+    """
+    name = str(fermi_reference).strip().lower()
+    if name not in SIGMA_FERMI_REFERENCES:
+        raise ValueError(
+            f"fermi_reference must be one of {SIGMA_FERMI_REFERENCES}; "
+            f"got {fermi_reference!r}.")
+    if name == "mp1_fixed_n":
+        if occupation_state is None:
+            raise ValueError(
+                "fermi_reference = mp1_fixed_n names the fixed-N MP1 "
+                "chemical potential, but no occupation_state reached the "
+                "Sigma dispatch.  The QSGW driver passes one; a direct "
+                "caller must construct it from the current spectrum.")
+        return float(occupation_state.mu_ry), "fixed-N mu"
+    if occupation_state is not None:
+        raise ValueError(
+            f"fermi_reference = {name!r} is a gap-derived reference, but "
+            f"this iteration carries a fixed-N occupation_state (mu = "
+            f"{float(occupation_state.mu_ry):.6f} Ry).  Measuring Sigma "
+            f"against a different reference than the occupations were "
+            f"solved at is a confound, not a choice: set fermi_reference "
+            f"= mp1_fixed_n.")
+    if name == "midgap":
+        return float(wfn.efermi), "midgap"
+    return float(wfn.vbm), "vbm"
 
 
 # ---------------------------------------------------------------------------

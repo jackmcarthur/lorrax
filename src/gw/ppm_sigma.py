@@ -71,6 +71,7 @@ from .ppm_windows import (
     _to_host_np,
     _CROSSING_A_MAX,
     crossing_regularization_floor,
+    resolve_sigma_regularization,
 )
 from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
 from .ppm_accumulators import (
@@ -591,6 +592,57 @@ def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
     return xr_p, yn_p, nb_real
 
 
+def assert_sharded_sigma_window_divides_mesh(nb_proj: int, mesh_xy, *,
+                                             ansatz: str):
+    """THE precondition for a mesh-SHARDED ``Sigma_c(w,k,m,n)`` cube.
+
+    ONE owner for a contract two ansaetze reach at the same seam.  Before
+    2026-08-22 the GN/HL-PPM branch refused an indivisible sigma band
+    window by name here while the MPA executor
+    (``gw.mpa.sigma._integrate_sigma_batches``) padded with
+    :func:`pad_sigma_window`, accumulated into a
+    ``P(None,None,'x','y')`` array and stripped it again -- silently, and
+    with no divisibility check anywhere in that module.  Two contracts at
+    one seam is one contract too many: either pad+strip is safe on the
+    sharded consumer path, in which case the PPM refusal should cite the
+    proof and go, or it is not, in which case MPA must refuse too.  It is
+    not, and the reason is in :func:`strip_sigma_window`.
+
+    WHY PAD+STRIP IS NOT SAFE ON A SHARDED CUBE.  ``pad_sigma_window`` is
+    exact -- every ``Sigma[k,m,n]`` is an independent contraction, so the
+    pad block is exactly zero and stripping it loses nothing.  That
+    argument is about VALUES and it holds here too.  What does not hold is
+    the LAYOUT: the accumulator is born at ``P(None,None,'x','y')`` on the
+    PADDED extents (``m_pad % p_x == 0`` by construction), and
+    ``strip_sigma_window`` then slices it back to ``nb_real`` on both
+    trailing axes.  When ``nb_real`` does not divide the mesh the result is
+    an array whose declared sharding no longer divides its own shape, and
+    every downstream consumer that reads the layout off the array
+    (``qsgw_utils.is_band_sharded_sigma_omega``, the QSGW Hermitize, the
+    SlabIO write) inherits that.  The PPM refusal already names the
+    Hermitize; this makes the same statement once, for both.
+
+    Raises ``ValueError`` naming the window, the mesh and the fix.  No-op
+    when both axes divide.
+    """
+    p_x = int(mesh_xy.shape['x'])
+    p_y = int(mesh_xy.shape['y'])
+    nb = int(nb_proj)
+    if nb % p_x == 0 and nb % p_y == 0:
+        return
+    raise ValueError(
+        f"{ansatz}: a mesh-sharded Sigma_c(w,k,m,n) cube requires the "
+        f"sigma band window to divide the mesh on BOTH axes: nb={nb}, "
+        f"mesh {p_x}x{p_y} (nb%p_x={nb % p_x}, nb%p_y={nb % p_y}).  The "
+        f"pad/strip pair is exact in VALUE but leaves a sharded array "
+        f"whose declared P(None,None,'x','y') no longer divides its own "
+        f"shape, and the QSGW Hermitize needs a square unpadded extent.  "
+        f"Choose nval+ncond divisible by both mesh extents"
+        + (", or use sigma_omega_layout = replicated."
+           if ansatz.endswith("ppm") else
+           " (compute_mode = mpa has no replicated cube plan)."))
+
+
 def strip_sigma_window(sigma_kij, nb_real: int):
     """Drop the :func:`pad_sigma_window` pad block from a (..., m, n) Sigma.
 
@@ -994,20 +1046,38 @@ def compute_sigma_c_ppm_omega_grid(
     # object contributes only its invalid-pole policy.
     regularization_width_ry = float(sigma_cfg.regularization_ev) / RYD_TO_EV
     edge_factor = float(sigma_cfg.window_edge_factor)
+    # The ansatz NAME, so the shared resolver decides `auto` the same way
+    # here and at the HDF5 writer (which reads `config.compute_mode`).
+    ansatz_name = f"{str(ppm_cfg.model).strip().lower()}_ppm"
+    regularization_floor_ev = getattr(
+        sigma_cfg, "regularization_floor_ev", None)
 
     # Crossing-quadrature conditioning floor: raise ξ if the Σ_c ω-grid is wide
     # enough that the HGL core window would be ill-conditioned (Σ|α| ~ 1e5,
     # amplifying the mesh-sensitive per-τ operand → device-dependent Σ_c blow-up
-    # + O(1e3) eV Im).  See ppm_windows.crossing_regularization_floor.
-    omega_max_ry = float(np.max(np.abs(np.asarray(omega_values_ry, dtype=np.float64))))
-    xi_floor = crossing_regularization_floor(omega_max_ry, edge_factor)
-    if regularization_width_ry < xi_floor:
+    # + O(1e3) eV Im).
+    #
+    # RESOLVED BY THE SHARED RESOLVER, not here.  ``ppm_windows.
+    # resolve_sigma_regularization`` is the one place any ansatz decides its
+    # effective ξ, and it is a pure function of (requested ξ, ω grid, edge
+    # factor, ansatz, floor policy) — so the Σ_c(ω) HDF5 writer re-derives the
+    # SAME number from the same config and stamps it, instead of the resolved
+    # value living only in this local and a print.  Before 2026-08-22 MPA
+    # passed ``regularization_ev`` straight through while this raised it
+    # silently: 1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV window.
+    _xi = resolve_sigma_regularization(
+        requested_ry=regularization_width_ry,
+        omega_grid_ry=np.asarray(omega_values_ry, dtype=np.float64),
+        edge_factor=edge_factor,
+        ansatz=ansatz_name,
+        floor_ev=regularization_floor_ev,
+    )
+    print_fn(_xi.describe())
+    if _xi.raised:
         print_fn(
-            f"  Σc crossing conditioning: ξ raised "
-            f"{regularization_width_ry * RYD_TO_EV:.3f} → {xi_floor * RYD_TO_EV:.3f} eV "
-            f"(A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ would make the "
-            f"HGL crossing quadrature ill-conditioned)")
-        regularization_width_ry = xi_floor
+            f"    (A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ "
+            f"would make the HGL crossing quadrature ill-conditioned)")
+    regularization_width_ry = _xi.resolved_ry
     fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -1127,19 +1197,11 @@ def compute_sigma_c_ppm_omega_grid(
     # (A/B gated).  Announced here per doctrine 3.
     sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
     if sharded_layout:
-        p_x = int(mesh_xy.shape['x'])
-        p_y = int(mesh_xy.shape['y'])
-        if nb_proj % p_x != 0 or nb_proj % p_y != 0:
-            # Round-1 scope: the mesh-pad block (pad_sigma_window) cannot
-            # ride the sharded consumer path yet — the QSGW Hermitize needs
-            # a square unpadded extent.  Refuse with the fix named rather
-            # than fall back silently (doctrine 3 / pattern #6).
-            raise ValueError(
-                f"sigma_omega_layout=sharded (round 1) requires the σ band "
-                f"window to divide the mesh on both axes: nb={nb_proj}, "
-                f"mesh {p_x}x{p_y} (nb%p_x={nb_proj % p_x}, "
-                f"nb%p_y={nb_proj % p_y}).  Choose nval+ncond divisible by "
-                f"both mesh extents, or use sigma_omega_layout=replicated.")
+        # ONE owner for this precondition; the MPA executor calls the same
+        # function (doctrine 3 / pattern #6 -- refuse with the fix named,
+        # never fall back silently).
+        assert_sharded_sigma_window_divides_mesh(
+            nb_proj, mesh_xy, ansatz=ansatz_name)
         print_fn(
             "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
             "the existing mesh; the end-of-stage full-cube replication "

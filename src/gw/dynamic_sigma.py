@@ -59,6 +59,7 @@ def eval_sigma_c_at_dft_energies(
     band_slices, wfn, sym, meta, mesh_xy,
     print_fn,
     efermi_ry=None,
+    efermi_provenance=None,
 ):
     """Interpolate diag(Sigma_c)(omega) at every DFT band energy.
 
@@ -69,11 +70,18 @@ def eval_sigma_c_at_dft_energies(
     (mu - efermi_midgap) — measured +2.79 eV on the sodium deck, showing
     up as a spurious ~+2.4 eV near-E_F QP correction.
 
+    ``efermi_provenance`` is what ``gw.efermi.resolve_sigma_efermi_ry``
+    said the reference WAS.  Given, it is stamped verbatim.  Omitted, the
+    provenance falls back to the ``efermi_ry is None`` proxy below, which
+    is right for every caller that has not been routed through the
+    resolver yet and WRONG for one that has: the proxy labels any explicit
+    reference "fixed-N mu", so an MPA run at ``fermi_reference = midgap``
+    would be stamped as a metal's chemical potential.  Pass it.
+
     Returns ``(sigma_c_at_dft_ev, omega_dft_rel_ev, efermi_dft_ev,
     provenance)``.  THE PROVENANCE IS RETURNED, not re-derived by the
-    caller: this function owns the ``efermi_ry is None`` decision, and the
-    writer that stamps the answer into ``sigma_mnk.h5`` must record the
-    same one it interpolated with, not a second opinion about it.
+    caller: the writer that stamps the answer into ``sigma_mnk.h5`` must
+    record the same one it interpolated with, not a second opinion.
     """
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range,
@@ -86,12 +94,14 @@ def eval_sigma_c_at_dft_energies(
     omega_dft_rel_ev = enk_dft_ev - efermi_dft_ev
     from file_io.sigma_output import (OMEGA_REFERENCE_FIXED_N_MU,
                                       OMEGA_REFERENCE_MIDGAP)
-    provenance = (OMEGA_REFERENCE_MIDGAP if efermi_ry is None
-                  else OMEGA_REFERENCE_FIXED_N_MU)
+    if efermi_provenance is not None:
+        provenance = str(efermi_provenance)
+    else:
+        provenance = (OMEGA_REFERENCE_MIDGAP if efermi_ry is None
+                      else OMEGA_REFERENCE_FIXED_N_MU)
     print_fn(
         f"  omega reference = {efermi_dft_ev:.6f} eV "
-        f"({'wfn.efermi midgap/VBM' if efermi_ry is None else 'fixed-N mu'};"
-        f" VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
+        f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
     from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
@@ -148,8 +158,15 @@ def write_sigma_omega(
     that was written before the feature existed.
     """
     from file_io import write_sigma_omega_h5
+    from .ppm_windows import sigma_regularization_for_config
 
     out_path = sigma_omega_output_path(config, input_dir)
+    # RE-DERIVED, not threaded.  ``resolve_sigma_regularization`` is a pure
+    # function of the config the driver already ran against, so calling it
+    # here stamps exactly the xi the kernel used -- and a threaded value
+    # would be a second thing to keep in step, which is the whole class of
+    # defect this seam was consolidated to remove.
+    sigma_regularization = sigma_regularization_for_config(config)
 
     # One derivation of the star tables keeps the producer and consumer of
     # the antiunitary conjugation convention together.
@@ -180,6 +197,7 @@ def write_sigma_omega(
             mesh=mesh_xy, star=star,
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
+            sigma_regularization=sigma_regularization,
             band_extrapolation=band_extrapolation,
             print_fn=print_fn,
         )
@@ -193,6 +211,7 @@ def write_sigma_omega(
         mesh=mesh_xy, star=star,
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,
+        sigma_regularization=sigma_regularization,
         band_extrapolation=band_extrapolation,
         print_fn=print_fn,
     )
