@@ -144,6 +144,29 @@ class DftVelocityHeadData:
     validation: None = None
 
 
+def _ascii_stamp(io, path: str, name: str) -> str:
+    """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
+
+    ``write_attr`` publishes these as ``uint8`` datasets.  The phdf5
+    transport's dtype table has no unsigned type, so the read asks for
+    ``int32`` and HDF5 widens — the same route
+    ``file_io.parallel_transport._decode_i32_text`` already takes for the
+    W-av stamps, and the reason it takes it.
+    """
+    raw = np.asarray(io.read_small(name, dtype=np.int32), dtype=np.int32)
+    if raw.ndim != 1 or np.any(raw < 0) or np.any(raw > 255):
+        raise ValueError(
+            f"{path}: {name} is not a 1-D byte-valued stamp dataset; "
+            "regenerate with get_dipole_mtxels")
+    try:
+        return bytes(raw.astype(np.uint8).tolist()).decode("ascii")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(
+            f"{path}: {name} is not an ASCII SHA-256 stamp; regenerate with "
+            "get_dipole_mtxels"
+        ) from exc
+
+
 def load_parallel_transport_head(
     path: str,
     *,
@@ -157,12 +180,22 @@ def load_parallel_transport_head(
     dataset is read.  The stored links are manifold-dependent, so a
     strict subset or superset is rejected rather than sliced.
 
-    The metadata are rank-0/small datasets, which ``SlabIO.read_slab`` does
-    not support.  Read them with a short-lived serial h5py owner, close that
-    owner, and only then open SlabIO for the large distributed payloads.
-    """
-    import h5py
+    THE METADATA ARE RANK-0 / SMALL DATASETS, and they are read through
+    ``SlabIO.read_small`` — the same HDF5 library instance that reads the
+    payloads, in the SAME read-only handle.  Two earlier spellings are
+    worth naming because both were defects:
 
+    * ``read_slab(name, shape=())`` — refused before a byte moved ("slab
+      shape must be non-empty"): a scalar dataspace has no hyperslab, so
+      this loader died on the FIRST scalar and could never reach its own
+      refusal list, whatever the artifact contained;
+    * a short-lived serial-h5py owner opened and closed ahead of SlabIO —
+      correct about ORDERING and still a second HDF5 library instance on a
+      file the FFI wrote, which is the cohabitation class audit A1 exists
+      to retire (``docs/architecture/slab_io.md#one-owner``).
+
+    One handle, one library, one open.
+    """
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
@@ -194,74 +227,79 @@ def load_parallel_transport_head(
         "head_response_relative_frobenius",
         "head_response_trace_ratio",
     )
-    with h5py.File(path, "r") as raw:
-        ints = {name: int(raw[name][()]) for name in int_names}
-        kgrid = np.asarray(raw["kgrid"][()], dtype=np.int32)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        ints = {name: int(io.read_small(name, dtype=np.int64))
+                for name in int_names}
+        kgrid = np.asarray(io.read_small("kgrid", dtype=np.int32),
+                           dtype=np.int32)
         reciprocal = np.asarray(
-            raw["reciprocal_lattice_cart"][()], dtype=np.float64
+            io.read_small("reciprocal_lattice_cart", dtype=np.float64),
+            dtype=np.float64,
         )
-        fingerprint_raw = np.asarray(
-            raw["wfn_fingerprint_utf8"][()], dtype=np.uint8
-        )
+        fingerprint = _ascii_stamp(
+            io, path, "wfn_fingerprint_utf8")
         validation = {
-            key: float(raw[f"velocity_validation_{key}"][()])
+            key: float(io.read_small(f"velocity_validation_{key}",
+                                     dtype=np.float64))
             for key in validation_names
         }
 
-    try:
-        fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise ValueError(
-            f"{path}: wfn_fingerprint_utf8 is not a 64-byte ASCII SHA-256 "
-            "dataset; regenerate with get_dipole_mtxels"
-        ) from exc
+        expected_nb = int(meta.b_id_4_user)
+        expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
+        expected_reciprocal = (
+            np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+        refusals = []
+        if ints["schema_version"] != int(SCHEMA_VERSION):
+            refusals.append(
+                f"schema_version={ints['schema_version']}, "
+                f"expected {int(SCHEMA_VERSION)}"
+            )
+        if ints["connection_complete"] != 1:
+            refusals.append("connection_complete is not 1")
+        if (
+            ints["velocity_validation_complete"] != 1
+            or ints["velocity_validation_passed"] != 1
+        ):
+            refusals.append(
+                "mandatory finite-link DFT head validation is not "
+                "complete/passing"
+            )
+        if ints["band_start"] != 0 or ints["band_stop"] != expected_nb:
+            refusals.append(
+                f"band manifold [{ints['band_start']},{ints['band_stop']}) != "
+                f"current full head manifold [0,{expected_nb})"
+            )
+        if ints["effective_nspinor"] != int(meta.nspinor):
+            refusals.append(
+                f"effective_nspinor={ints['effective_nspinor']} != current "
+                f"{int(meta.nspinor)}"
+            )
+        if bool(ints["bispinor"]) != bool(int(meta.nspinor) == 4):
+            refusals.append("bispinor convention differs from current run")
+        if not np.array_equal(kgrid, expected_kgrid):
+            refusals.append(
+                f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
+        if not np.allclose(reciprocal, expected_reciprocal,
+                           rtol=0.0, atol=1.0e-13):
+            refusals.append(
+                "Cartesian reciprocal lattice differs from the current WFN")
+        expected_fingerprint = wfn_fingerprint(wfn)
+        if fingerprint != expected_fingerprint:
+            refusals.append(
+                "WFN fingerprint differs (parallel-transport data are stale "
+                "or were generated from another DFT solution)"
+            )
+        # REFUSE BEFORE THE O(nk*nb^2) READS, still inside the handle.  Every
+        # operand above is replicated (a stamp, or this run's own config), so
+        # this raises on every rank or on none — and each rank's ``__exit__``
+        # then closes the collective handle, which is the ordering
+        # ``SlabIO.close`` requires.
+        if refusals:
+            raise ValueError(
+                f"{path}: refusing QSGW parallel-transport head:\n  - "
+                + "\n  - ".join(refusals)
+            )
 
-    expected_nb = int(meta.b_id_4_user)
-    expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
-    expected_reciprocal = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
-    refusals = []
-    if ints["schema_version"] != int(SCHEMA_VERSION):
-        refusals.append(
-            f"schema_version={ints['schema_version']}, expected {int(SCHEMA_VERSION)}"
-        )
-    if ints["connection_complete"] != 1:
-        refusals.append("connection_complete is not 1")
-    if (
-        ints["velocity_validation_complete"] != 1
-        or ints["velocity_validation_passed"] != 1
-    ):
-        refusals.append(
-            "mandatory finite-link DFT head validation is not complete/passing"
-        )
-    if ints["band_start"] != 0 or ints["band_stop"] != expected_nb:
-        refusals.append(
-            f"band manifold [{ints['band_start']},{ints['band_stop']}) != current "
-            f"full head manifold [0,{expected_nb})"
-        )
-    if ints["effective_nspinor"] != int(meta.nspinor):
-        refusals.append(
-            f"effective_nspinor={ints['effective_nspinor']} != current "
-            f"{int(meta.nspinor)}"
-        )
-    if bool(ints["bispinor"]) != bool(int(meta.nspinor) == 4):
-        refusals.append("bispinor convention differs from current run")
-    if not np.array_equal(kgrid, expected_kgrid):
-        refusals.append(f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
-    if not np.allclose(reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13):
-        refusals.append("Cartesian reciprocal lattice differs from the current WFN")
-    expected_fingerprint = wfn_fingerprint(wfn)
-    if fingerprint != expected_fingerprint:
-        refusals.append(
-            "WFN fingerprint differs (parallel-transport data are stale or "
-            "were generated from another DFT solution)"
-        )
-    if refusals:
-        raise ValueError(
-            f"{path}: refusing QSGW parallel-transport head:\n  - "
-            + "\n  - ".join(refusals)
-        )
-
-    with SlabIO(path, mode="r", mesh=mesh) as io:
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
         large_shape = (3, int(meta.nk_tot), nb_storage, nb_storage)
@@ -323,9 +361,11 @@ def load_dft_velocity_head(
       covariant correction this mode does not take.
     Every other provenance refusal the PT loader emits is kept verbatim:
     schema, band manifold, k grid, reciprocal lattice, WFN fingerprint.
-    """
-    import h5py
 
+    Like the PT loader, the stamps come through ``SlabIO.read_small`` in
+    the same read-only handle as the payload — one HDF5 library instance
+    per file (``docs/architecture/slab_io.md#one-owner``).
+    """
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
     from file_io.parallel_transport import (
         SCHEMA_VERSION,
@@ -334,47 +374,48 @@ def load_dft_velocity_head(
     from file_io.slab_io import SlabIO
 
     nb = int(meta.b_id_4_user)
-    with h5py.File(path, "r") as raw:
-        schema = int(raw["schema_version"][()])
-        band_start = int(raw["band_start"][()])
-        band_stop = int(raw["band_stop"][()])
-        kgrid = np.asarray(raw["kgrid"][()], dtype=np.int32)
-        reciprocal = np.asarray(
-            raw["reciprocal_lattice_cart"][()], dtype=np.float64
-        )
-        fingerprint_raw = np.asarray(
-            raw["wfn_fingerprint_utf8"][()], dtype=np.uint8
-        )
-    fingerprint = bytes(fingerprint_raw.tolist()).decode("ascii")
-    expected_reciprocal = (
-        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
-    )
-    refusals = []
-    # Schema 3 changes only the link-consumer validation contract.  The DFT
-    # velocity payload and all provenance fields are byte-for-byte schema-2
-    # compatible, and this mode deliberately consumes no links.
-    if schema not in (2, int(SCHEMA_VERSION)):
-        refusals.append(
-            f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
-    if (band_start, band_stop) != (0, nb):
-        refusals.append(
-            f"band manifold [{band_start},{band_stop}) != [0,{nb})"
-        )
-    if not np.array_equal(kgrid, np.asarray(wfn.kgrid, dtype=np.int32)):
-        refusals.append("k grid differs from the current WFN")
-    if not np.allclose(
-        reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13
-    ):
-        refusals.append("reciprocal lattice differs from the current WFN")
-    if fingerprint != wfn_fingerprint(wfn):
-        refusals.append("WFN fingerprint differs from the velocity artifact")
-    if refusals:
-        raise ValueError(
-            f"{path}: refusing DFT velocity stage:\n  - "
-            + "\n  - ".join(refusals)
-        )
     nb_storage = band_storage_extent(mesh, nb)
     with SlabIO(path, mode="r", mesh=mesh) as io:
+        schema = int(io.read_small("schema_version", dtype=np.int64))
+        band_start = int(io.read_small("band_start", dtype=np.int64))
+        band_stop = int(io.read_small("band_stop", dtype=np.int64))
+        kgrid = np.asarray(io.read_small("kgrid", dtype=np.int32),
+                           dtype=np.int32)
+        reciprocal = np.asarray(
+            io.read_small("reciprocal_lattice_cart", dtype=np.float64),
+            dtype=np.float64,
+        )
+        fingerprint = _ascii_stamp(io, path, "wfn_fingerprint_utf8")
+        expected_reciprocal = (
+            np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+        )
+        refusals = []
+        # Schema 3 changes only the link-consumer validation contract.  The
+        # DFT velocity payload and all provenance fields are byte-for-byte
+        # schema-2 compatible, and this mode deliberately consumes no links.
+        if schema not in (2, int(SCHEMA_VERSION)):
+            refusals.append(
+                f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
+        if (band_start, band_stop) != (0, nb):
+            refusals.append(
+                f"band manifold [{band_start},{band_stop}) != [0,{nb})"
+            )
+        if not np.array_equal(kgrid, np.asarray(wfn.kgrid, dtype=np.int32)):
+            refusals.append("k grid differs from the current WFN")
+        if not np.allclose(
+            reciprocal, expected_reciprocal, rtol=0.0, atol=1.0e-13
+        ):
+            refusals.append("reciprocal lattice differs from the current WFN")
+        if fingerprint != wfn_fingerprint(wfn):
+            refusals.append(
+                "WFN fingerprint differs from the velocity artifact")
+        # Rank-invariant operands, so this refuses everywhere or nowhere —
+        # before the (3, nk, nb, nb) read, still inside the handle.
+        if refusals:
+            raise ValueError(
+                f"{path}: refusing DFT velocity stage:\n  - "
+                + "\n  - ".join(refusals)
+            )
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET,
             shape=(3, int(meta.nk_tot), nb_storage, nb_storage),

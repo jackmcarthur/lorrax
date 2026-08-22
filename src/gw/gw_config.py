@@ -85,64 +85,24 @@ from .band_extrapolation import (
 # split the grammar between converted and unconverted readers of the same
 # knob; adding telemetry does not.
 
-_ENV_TRUE = ("1", "on", "true", "yes")
-_ENV_FALSE = ("0", "off", "false", "no")
-
-#: (name, raw value) pairs already announced, so a knob read once per
-#: r-chunk cannot spam a multi-hour log.
-_ENV_ANNOUNCED: set = set()
-
-
-def reset_env_announce_state() -> None:
-    """Forget which grammar errors have been announced (tests only)."""
-    _ENV_ANNOUNCED.clear()
-
-
-def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
-    """Canonical boolean env parse for the GW init/config layer.
-
-    Parameters
-    ----------
-    name : str
-        Environment variable, e.g. ``"LORRAX_MEM_DEBUG"``.
-    default : bool
-        Value when the variable is unset or blank.  This is the knob's
-        DOCUMENTED default, not a guess — ``docs/dev/env_vars.md`` is the
-        table it has to agree with.
-
-    Notes
-    -----
-    The three bugs this replaces, all in the four files this layer owns:
-
-    * ``if os.environ.get("LORRAX_EXIT_AFTER_ZETA"):`` — a bare presence
-      test, so ``=0`` ended a production run with ``SystemExit(0)``;
-    * ``not in ("0", "off", "false")`` — case-SENSITIVE, so
-      ``LORRAX_MALLOC_TRIM=OFF`` left the trim hook on while the
-      documented sibling ``LORRAX_MALLOC_TUNE=OFF`` correctly turned off;
-    * ``bool(os.environ.get(...))`` — same presence-test class.
-
-    An unrecognised token resolves False (see the module comment) but is
-    ANNOUNCED, once per (name, value), with the project's grep-able
-    ``*** LORRAX SANITY`` marker.  Silently resolving a typo in either
-    direction is the failure mode this whole helper exists to remove.
-    """
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    tok = raw.strip().lower()
-    if tok in _ENV_TRUE:
-        return True
-    if tok in _ENV_FALSE:
-        return False
-    key = (name, raw)
-    if key not in _ENV_ANNOUNCED:
-        _ENV_ANNOUNCED.add(key)
-        print_fn(
-            f"  *** LORRAX SANITY: {name}={raw!r} is not a recognised "
-            f"boolean.  Accepted: {'/'.join(_ENV_TRUE)} (on), "
-            f"{'/'.join(_ENV_FALSE)} (off), unset/blank (default="
-            f"{'on' if default else 'off'}).  Treating it as OFF. ***")
-    return False
+# ONE GRAMMAR, AND IT NO LONGER LIVES HERE (2026-08-22).  The table, the
+# announcement and the memo moved DOWN to ``runtime.env_flags`` — L3, no
+# jax, no config — because the parsers that still swallowed an
+# unrecognised token silently were in ``file_io`` and ``runtime``, which
+# are L3 and may not import this module.  A grammar only the top layer can
+# reach is a grammar the layers below re-invent, which is exactly what
+# ``_slab_io_ffi._env_flag`` and ``runtime._env_falsy`` had done.
+#
+# The names below are re-exports, kept because this module's four owned
+# files, ``isdf.core`` and ``tests/test_env_grammar.py`` all reach for
+# ``gw_config.env_bool`` by name.  Behaviour is unchanged in every token.
+from runtime.env_flags import (  # noqa: E402
+    ANNOUNCED as _ENV_ANNOUNCED,
+    ENV_FALSE as _ENV_FALSE,
+    ENV_TRUE as _ENV_TRUE,
+    env_bool,
+    reset_env_announce_state,
+)
 
 
 def env_float(name: str, default: float, *, print_fn=print,

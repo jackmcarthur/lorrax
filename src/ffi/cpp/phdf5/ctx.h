@@ -111,7 +111,15 @@ struct LORRAX_PHDF_CTX_TYPE {
     hid_t    fcpl_id         = H5I_INVALID_HID;
     hid_t    dxpl_coll       = H5I_INVALID_HID;  // H5FD_MPIO_COLLECTIVE
     hid_t    dxpl_indep      = H5I_INVALID_HID;  // H5FD_MPIO_INDEPENDENT
-    hid_t    dcpl_id         = H5I_INVALID_HID;  // fill=NEVER, alloc=EARLY, chunked layout
+    // fill=NEVER, alloc=EARLY, CONTIGUOUS layout.  There is no
+    // ``H5Pset_chunk`` call anywhere in this subpackage (``git grep
+    // H5Pset_chunk`` is empty), so every dataset ``ensure_dataset``
+    // creates with this DCPL takes HDF5's contiguous default.  The
+    // comment used to say "chunked layout", which contradicted the
+    // implementation, ``SlabIO.create_dataset``'s public docstring and
+    // the runtime warning alike.  Chunking here would need per-dataset
+    // chunk dimensions, not a context-wide property list.
+    hid_t    dcpl_id         = H5I_INVALID_HID;
 
     // Cache of open datasets, keyed by HDF5 path ("ds_name" or
     // "/group/ds_name").  H5Dcreate on first write, H5Dopen on re-open.

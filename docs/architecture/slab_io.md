@@ -80,6 +80,7 @@ contract — every row is something a caller has actually got wrong.
 | ...that | because |
 |---|---|
 | it can hold an h5py handle and a `SlabIO` handle on the same file at once | **REFUSED by name.** Two HDF5 library instances are mapped in this process; either side being a writer is undefined. See [One HDF5 library per file](#one-owner) |
+| a scalar (rank-0) dataset can be read with `read_slab` | it cannot, structurally: a scalar dataspace has **no hyperslab**, and the request refuses at `_normalize_slab_request` before HDF5 sees it. `read_small` is the door — see [The API](#api) |
 | program order at the Python call site serializes two HDF5 calls | the FFI writer is **asynchronous**. Two handles on the same ranks need `SlabIO.sync_writes()` between them, or the second enters HDF5 while the first is still draining |
 | a `create_dataset(attrs=…)` or `stamp_dataset_attrs` stamp is readable before `close()` | attrs are **deferred** to one rank-0 h5py reopen after `H5Fclose` — the transport cannot stamp while collective MPI-IO holds the file |
 | `close()` is a local operation | it drains pending writes on every rank, then rank 0 reopens the file serially. `close()` is where three of this page's failure modes surface |
@@ -132,10 +133,19 @@ whole mechanism. Three consequences, in increasing order of nastiness:
    not durable yet (job 7888644).
 2. **Concurrent, both read-only → safe.** Two libraries reading a file
    nobody is mutating cannot diverge. `wfn_loader` holds an h5py handle
-   and a SlabIO handle on `WFN.h5` read-only for the whole run, and
-   `_FfiBackend._introspect_dataset` opens h5py `"r"` on a live collective
-   handle to learn a dataset's geometry. Both are legal *and both are
-   counted*.
+   and a SlabIO handle on `WFN.h5` read-only for the whole run. It is
+   legal *and it is counted*.
+
+   `_FfiBackend._introspect_dataset` used to be the second example here,
+   and **it no longer is** (2026-08-22). It asks the FFI for a dataset's
+   geometry (`lrx_phdf5_dataset_geometry`), i.e. the library that already
+   holds the file, so there is no second instance to count. That mattered
+   for more than tidiness: on a handle opened `'a'` the h5py introspect is
+   not merely counted, it is **refused** — correctly — and a real caller
+   walked into it (`--parallel-transport-out`, [below](#pt-introspect)).
+   A library built before that date exports no geometry entry point; the
+   old route is then taken on a read-only handle, **announced once per
+   path on rank 0**, and refused by name on a writable one.
 3. **Sequential alternation with a write → survives, mostly.** Every close
    flushes, so open/close/open/close through different libraries usually
    works. It is still two caches taking turns on one file, it is the
@@ -296,8 +306,9 @@ dumps the crash ring.
 FFI in a single stream, whichever library is opening);
 `SlabIO.__init__/close/create_dataset/write_slab/read_slab/read_slabs/
 write_attr/stamp_dataset_attrs`; and `_slab_io_ffi`'s lifecycle calls plus
-its two serial-h5py touches on an FFI-driven path
-(`_introspect_dataset`'s metadata read, `close`'s deferred-attr reopen).
+and its ONE remaining serial-h5py touch on an FFI-driven path
+(`close`'s deferred-attr reopen; `_introspect_dataset`'s metadata read
+left that list on 2026-08-22 and is journaled `stack=ffi` now).
 Journaling is Python-side only — every FFI op transits `_slab_io_ffi.py` —
 and the journal never journals itself.
 
@@ -343,6 +354,7 @@ logical shapes**. A caller does *not*:
 | the mesh-divisible extent | omit `shape` and `read_slab` rounds up for you (below) |
 | whether the deployment can do parallel I/O | `assert_available()` runs at open and refuses naming the probe |
 | an HDF5 chunk layout | SlabIO's native collective create is contiguous and exposes no no-op `chunks=` argument; use a format-specific serial writer only where chunking is load-bearing |
+| a second HDF5 library, to learn a shape or read a stamp | `read_slab` with no `shape`, and `read_small`, both answer from the FFI (`lrx_phdf5_dataset_geometry` / `lrx_phdf5_read_whole`, 2026-08-22) |
 
 **Padding is SlabIO's business, not the caller's** (decisions.md
 2026-08-04):
@@ -350,6 +362,19 @@ logical shapes**. A caller does *not*:
 - `write_slab(name, A, offset=...)` accepts any `A`. What reaches the file
   is `min(A.shape, dataset - offset)` per dim, derived from the dataset —
   a buffer padded for mesh divisibility needs no argument at all.
+- `read_small(name)` reads a WHOLE small dataset into a host
+  `np.ndarray` on **every** rank, through `lrx_phdf5_read_whole`. It is a
+  separate method rather than a `shape=()` case of `read_slab` because a
+  scalar dataspace has no hyperslab to select: `read_slab` refuses such a
+  request before a byte moves. Every stamp `write_attr` publishes is a
+  scalar or a short vector, and this is their reader. The payload must be
+  O(1) in the design envelope — every rank materialises all of it.
+  On a `.so` built before 2026-08-22 the entry point does not exist; on a
+  **read-only** handle it then takes the announced serial-h5py fallback —
+  the same one `_introspect_dataset` takes, counted by the same registry,
+  and the one cross-stack overlap `hdf5_owner` allows — and on a
+  **writable** handle it refuses by name and points at the rebuild, because
+  two HDF5 instances over one file with a writer among them is audit A1.
 - `read_slab(name, partition_spec=spec)` **with no `shape`** returns the
   dataset rounded UP to the mesh-divisible extent under `spec`,
   zero-filled past the dataset. That is the padded consumer buffer.
@@ -1162,6 +1187,32 @@ locking problem (`HDF5_USE_FILE_LOCKING=FALSE` was set on the passing
 single-node run too). It is registered in `KNOWN_LORRAX_ISSUES` and
 **every accepted sodium number on this campaign was produced at 4 ranks
 on one node.**
+
+### The `--parallel-transport-out` self-refusal — fixed by removing the second stack {#pt-introspect}
+
+*Measured 2026-08-15 on `integ/metal-mpa-qsgw-2026-08-15` @ `814278cd`,
+P=4, sodium 48-band SOC deck, reproducible on both smearing rungs.*
+
+*Looked like:* every rank dying on the one-owner refusal, naming
+`h5py open(mode='r') from _FfiBackend._introspect_dataset('links_ibz')`
+while the FFI held the same path `mode='a'`. **The guard was right and
+the caller was wrong**, and the price was paid at the worst moment: the
+refusal fires on the velocity-validation stamping, i.e. AFTER the
+expensive PT tensor is complete and BEFORE `dipole.h5` is written, so the
+next stage failed with `head_correction.py:341`
+("Failed to resolve q=0 Coulomb head"), naming neither file.
+
+*Fix, 2026-08-22:* `_introspect_dataset` asks the FFI. There is no second
+HDF5 instance to refuse. The two caller-side mitigations already in the
+tree stay and are still the right shape for anyone on an older library:
+pre-register the geometry with `create_dataset` (idempotent for an
+identical existing dataset — `file_io/parallel_transport.py`'s connection
+stage does exactly this), and never straddle an h5py open with a live
+writable FFI handle.
+
+*Related, same commit:* `gw.qsgw_head`'s two head loaders no longer open
+`parallel_transport.h5` with h5py at all. Their stamps come through
+`read_small` in the same read-only handle as the payload.
 
 ### The pre-ODR-fix host `.so` — a loaded gun for any host-leg run {#odr-host-so}
 

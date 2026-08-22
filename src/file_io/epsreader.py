@@ -1,3 +1,38 @@
+"""BerkeleyGW ``epsmat.h5`` / ``eps0mat.h5`` reader.
+
+WHAT IT DOES NOT DO, and this is the point of the class: it does not copy
+``mats/matrix`` into host memory.  Until 2026-08-22 the constructor read
+``mats/matrix``, ``mats/matrix-diagonal`` and the three optional subspace
+matrices with ``[:]``, i.e. every q and every frequency, ON EVERY RANK,
+before the caller had asked for anything.  The only in-tree consumer
+(``gw.head_correction.resolve_head_sample``) then used **six numbers** out
+of it — ``matrix[0,0,0,0,0,{0,1}]``, the q->0 head.  At a production
+``epsmat.h5`` that is tens of GB per rank for a complex scalar.
+
+The datasets are now held as **h5py dataset handles** and sliced in the
+accessors, which is what the accessors were already written to do
+(``self.matrix[iq, imatrix, ifreq, :nmtx, :nmtx, 0]`` is a hyperslab
+request when ``self.matrix`` is a handle and a no-op view when it is a
+copy).  So the change is a lifetime change, not an interface one — with
+one consequence a caller must know:
+
+**OWNERSHIP.**  The handles are only valid while the file is open.  Use
+the context manager, or call :meth:`close` when done::
+
+    with EPSReader(path) as eps:
+        head = eps.epshead
+
+``__del__`` still closes, so existing call sites that drop the object keep
+working; what changes is that a slice taken AFTER an explicit ``close()``
+raises instead of returning stale memory.
+
+THIS FILE IS BerkeleyGW'S, NOT SlabIO'S.  ``epsmat.h5`` is written by
+BerkeleyGW and never by the phdf5 transport, so no ``file_io.hdf5_owner``
+cohabitation arises here and serial h5py is the right reader.  The defect
+this docstring records was per-rank REPLICATION, and that is what is
+fixed; a q/frequency-sharded reader is a separate piece of work and would
+need SlabIO plus a shape contract the BGW format does not currently state.
+"""
 import h5py
 import numpy as np
 
@@ -63,27 +98,58 @@ class EPSReader:
             self.neig_max = subspace['neig_max'][()]
             self.neig = subspace['neig'][:]
         
-        # Matrix elements
-        self.matrix = self._file['mats/matrix'][:]
-        self.matrix_diagonal = self._file['mats/matrix-diagonal'][:]
+        # Matrix elements — HANDLES, not copies.  See the module docstring:
+        # `[:]` here was tens of GB per rank at a production epsmat.h5, read
+        # before the caller had asked for anything, for a consumer that wants
+        # six numbers.  Every accessor below already slices, so a handle
+        # turns each of them into an HDF5 hyperslab read of exactly the block
+        # asked for.
+        self.matrix = self._file['mats/matrix']
+        self.matrix_diagonal = self._file['mats/matrix-diagonal']
 
         # you should only really want this for eps0. TODO: frequency dep.
-        self.epshead = self.matrix[0,0,0,0,0,0] + 1j * self.matrix[0,0,0,0,0,1]
-        
+        # Two scalar reads, not a whole-array indexing of a resident copy.
+        self.epshead = complex(
+            self.matrix[0, 0, 0, 0, 0, 0]) + 1j * complex(
+            self.matrix[0, 0, 0, 0, 0, 1])
+
         # Optional matrix elements if using subspace approximation
         if self.subspace:
             if 'matrix_subspace' in self._file['mats']:
-                self.matrix_subspace = self._file['mats/matrix_subspace'][:]
+                self.matrix_subspace = self._file['mats/matrix_subspace']
             if 'matrix_eigenvec' in self._file['mats']:
-                self.matrix_eigenvec = self._file['mats/matrix_eigenvec'][:]
+                self.matrix_eigenvec = self._file['mats/matrix_eigenvec']
             if 'matrix_fulleps0' in self._file['mats']:
-                self.matrix_fulleps0 = self._file['mats/matrix_fulleps0'][:]
+                self.matrix_fulleps0 = self._file['mats/matrix_fulleps0']
+
+    # ------------------------------------------------------------------
+    # Lifetime.  The matrix attributes are h5py handles now, so the file
+    # has to outlive them and the caller has to be able to say when.
+    # ------------------------------------------------------------------
+    def close(self):
+        """Close the file.  Idempotent; slices taken after it raise."""
+        f = getattr(self, '_file', None)
+        if f is not None:
+            self._file = None
+            f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     def __del__(self):
         """Clean up by closing the file when the object is destroyed."""
-        if hasattr(self, '_file') and self._file is not None:
-            self._file.close()
-            
+        # Kept so call sites that just drop the object still release the
+        # file; `close()` is what a caller uses when the moment matters.
+        try:
+            self.close()
+        except Exception:              # interpreter teardown, h5py gone
+            pass
+
+
     def get_eps_matrix(self, iq, ifreq=0, imatrix=0):
         """Get the epsilon matrix for a specific q-point and frequency.
         
@@ -95,9 +161,13 @@ class EPSReader:
         Returns:
             np.ndarray: Complex epsilon matrix of shape (nmtx[iq], nmtx[iq])
         """
-        nmtx_q = self.nmtx[iq]
-        mat = self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,0] + 1j * self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,1]
-        return mat
+        # int() because these indices now reach h5py's selection parser
+        # rather than numpy's: a numpy scalar bound is accepted by numpy
+        # everywhere and by h5py only in some versions.
+        iq, imatrix, ifreq = int(iq), int(imatrix), int(ifreq)
+        nmtx_q = int(self.nmtx[iq])
+        block = self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q, :]
+        return block[..., 0] + 1j * block[..., 1]
     
     def get_eps_minus_delta_matrix(self, iq, ifreq=0, imatrix=0):
         """Get the epsilon matrix for a specific q-point and frequency.
@@ -110,8 +180,8 @@ class EPSReader:
         Returns:
             np.ndarray: Complex epsilon matrix of shape (nmtx[iq], nmtx[iq])
         """
-        nmtx_q = self.nmtx[iq]
-        mat = self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,0] + 1j * self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q,1]
+        nmtx_q = int(self.nmtx[int(iq)])
+        mat = self.get_eps_matrix(iq, ifreq=ifreq, imatrix=imatrix)
         mat.flat[::nmtx_q+1] -= 1.0  # Subtracts 1 from diagonal elements in-place
         return mat
     
@@ -149,7 +219,8 @@ class EPSReader:
         Returns:
             np.ndarray: Complex diagonal elements
         """
-        diag = self.matrix_diagonal[:, :self.nmtx[iq], iq]
+        iq = int(iq)
+        diag = self.matrix_diagonal[:, :int(self.nmtx[iq]), iq]
         return diag[0] + 1j * diag[1]
 
 if __name__ == "__main__":

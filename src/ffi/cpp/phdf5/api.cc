@@ -36,6 +36,11 @@ namespace lorrax_ffi::phdf5 {
     hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
                             const int64_t* shape, int ndim, int dtype_tag);
     hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
+    void     dataset_geometry(PhdfCtx* ctx, const std::string& ds_name,
+                              int64_t* shape_out, int cap_ndim,
+                              int* ndim_out, int* dtype_tag_out);
+    void     read_whole(PhdfCtx* ctx, const std::string& ds_name,
+                        int dtype_tag, void* out, int64_t out_nelem);
     void     ensure_mpi_initialized();
 }
 
@@ -115,6 +120,67 @@ int LRX_C_ENTRY(lrx_phdf5_open_dataset_ro)(
             reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
             std::string(ds_name));
         *ds_id_out = (int64_t)ds;
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  The METADATA half of the transport — added 2026-08-22 so that no LORRAX
+//  path has to reach for a SECOND HDF5 library to learn a dataset's shape
+//  or to read a scalar back out of a phdf5-written file.
+//
+//  Both are "collective in the same sense as lrx_phdf5_open_dataset_ro":
+//  every rank calls them with the same name, they route through that same
+//  cached collective H5Dopen, and everything after it is a local metadata
+//  query or an INDEPENDENT read of data every rank wants entire.
+//
+//  A library built before this date does not export them.  The Python
+//  loader declares them under a hasattr guard and
+//  ``file_io._slab_io_ffi`` announces the degraded route rather than
+//  crashing — the ratchet belongs on the artifact, not on every worktree
+//  pinned to an older .so.
+// ---------------------------------------------------------------------------
+
+// Shape/dtype of an existing dataset.  ``shape_out`` receives ``*ndim_out``
+// extents (a SCALAR dataset reports ndim 0 and writes none).  dtype_tag
+// follows the same 1..6 table lrx_phdf5_ensure_dataset takes.
+int LRX_C_ENTRY(lrx_phdf5_dataset_geometry)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int64_t* shape_out, int cap_ndim,
+    int* ndim_out, int* dtype_tag_out,
+    char* err_out, int err_cap)
+{
+    try {
+        lorrax_ffi::phdf5::dataset_geometry(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name), shape_out, cap_ndim,
+            ndim_out, dtype_tag_out);
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// Read a WHOLE small dataset into a host buffer on every rank.  Serves
+// rank-0 (scalar) datasets, which the sharded read handler cannot: a
+// scalar dataspace has no hyperslab to select.  ``out_nelem`` is checked
+// against the dataset's own element count.
+int LRX_C_ENTRY(lrx_phdf5_read_whole)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int dtype_tag,
+    void* out, int64_t out_nelem,
+    char* err_out, int err_cap)
+{
+    try {
+        lorrax_ffi::phdf5::read_whole(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name), dtype_tag, out, out_nelem);
         return 0;
     } catch (const std::exception& e) {
         if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());

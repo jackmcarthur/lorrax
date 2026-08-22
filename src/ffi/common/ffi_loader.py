@@ -434,6 +434,12 @@ _SHARED_C_ENTRY_POINTS = (
     "lrx_phdf5_init_mpi",
     "lrx_phdf5_ensure_dataset",
     "lrx_phdf5_open_dataset_ro",
+    # The metadata half (2026-08-22).  Absent from any library built before
+    # that date; both this binder and ``_declare_phdf5`` are hasattr-guarded,
+    # so an older .so simply does not acquire the names and
+    # ``file_io._slab_io_ffi`` announces the degraded introspect route.
+    "lrx_phdf5_dataset_geometry",
+    "lrx_phdf5_read_whole",
     "lrx_slate_context_create",
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
@@ -566,6 +572,32 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
         ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
     ]
     lib.lrx_phdf5_open_dataset_ro.restype = ctypes.c_int
+
+    # The metadata half.  hasattr-guarded INDIVIDUALLY, not folded into the
+    # ``lrx_phdf5_open`` guard above: a library predating 2026-08-22 exports
+    # the lifecycle names and not these two, so one guard for the whole
+    # group would refuse to bind anything on an otherwise-fine .so.
+    if hasattr(lib, "lrx_phdf5_dataset_geometry"):
+        lib.lrx_phdf5_dataset_geometry.argtypes = [
+            ctypes.c_int64,                      # ctx_handle
+            ctypes.c_char_p,                     # ds_name
+            ctypes.POINTER(ctypes.c_int64),      # shape_out[cap_ndim]
+            ctypes.c_int,                        # cap_ndim
+            ctypes.POINTER(ctypes.c_int),        # ndim_out
+            ctypes.POINTER(ctypes.c_int),        # dtype_tag_out
+            ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
+        ]
+        lib.lrx_phdf5_dataset_geometry.restype = ctypes.c_int
+    if hasattr(lib, "lrx_phdf5_read_whole"):
+        lib.lrx_phdf5_read_whole.argtypes = [
+            ctypes.c_int64,                      # ctx_handle
+            ctypes.c_char_p,                     # ds_name
+            ctypes.c_int,                        # dtype_tag
+            ctypes.c_void_p,                     # out
+            ctypes.c_int64,                      # out_nelem
+            ctypes.c_char_p, ctypes.c_int,       # err_out, err_cap
+        ]
+        lib.lrx_phdf5_read_whole.restype = ctypes.c_int
 
 
 def _declare_slate(lib: ctypes.CDLL) -> None:
@@ -1229,6 +1261,122 @@ def phdf5_open_dataset_ro(ctx_handle: int, ds_name: str,
     )
     _check_err(rc, err)
     return int(ds_id_out.value)
+
+
+#: dtype tag -> numpy dtype name.  The inverse of ``_DTYPE_TAG``; kept
+#: beside it so the two cannot drift.
+_TAG_DTYPE = {tag: name for name, tag in _DTYPE_TAG.items()}
+
+
+def has_phdf5_metadata_api(platform: Optional[str] = None) -> bool:
+    """Does the loaded library export the metadata half of the transport?
+
+    ``lrx_phdf5_dataset_geometry`` / ``lrx_phdf5_read_whole`` landed
+    2026-08-22.  A library built before then exports neither, and the
+    callers (``file_io._slab_io_ffi``) need to know WHICH route they are on
+    so they can say so rather than silently taking the serial-h5py one.
+    Both names are checked: a half-built library is not a capability.
+    """
+    try:
+        lib = get_lib(platform)
+    except Exception:
+        return False
+    return (hasattr(lib, "lrx_phdf5_dataset_geometry")
+            and hasattr(lib, "lrx_phdf5_read_whole"))
+
+
+#: The rank ceiling ``phdf5_dataset_geometry`` will report.  Nothing in this
+#: tree stores above 6-D (the WFN coefficient dataset is 4-D, Sigma cubes are
+#: 5-D); a higher-rank dataset REFUSES in C++ rather than truncating.
+_GEOM_MAX_NDIM = 8
+
+
+def phdf5_dataset_geometry(ctx_handle: int, ds_name: str,
+                           platform: Optional[str] = None
+                           ) -> tuple[tuple, str]:
+    """``(shape, dtype_name)`` of an existing dataset, through the FFI.
+
+    The replacement for opening the same path a second time with serial
+    h5py just to learn a geometry — that read is legal only while BOTH
+    stacks are read-only and is refused by ``file_io.hdf5_owner`` whenever
+    the live FFI handle can write, which is the measured
+    ``--parallel-transport-out`` failure.  Here the answer comes from the
+    library that already holds the file open.
+
+    Collective in the same sense as :func:`phdf5_open_dataset_ro` (it
+    routes through that same cached H5Dopen): every rank calls it with the
+    same name.  A SCALAR dataset returns ``shape == ()``.
+    """
+    lib = get_lib(platform)
+    if not hasattr(lib, "lrx_phdf5_dataset_geometry"):
+        raise RuntimeError(
+            "phdf5_dataset_geometry: the loaded FFI library does not export "
+            "lrx_phdf5_dataset_geometry.  It predates 2026-08-22; rebuild it "
+            "(src/ffi/cpp/build.sh for the CUDA leg, "
+            "config/perlmutter/build_ffi_host.sh for the host leg).")
+    ShapeArr = ctypes.c_int64 * _GEOM_MAX_NDIM
+    shape_buf = ShapeArr()
+    ndim_out = ctypes.c_int(0)
+    tag_out = ctypes.c_int(0)
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_phdf5_dataset_geometry(
+        int(ctx_handle),
+        ds_name.encode("utf-8"),
+        shape_buf, int(_GEOM_MAX_NDIM),
+        ctypes.byref(ndim_out), ctypes.byref(tag_out),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    ndim = int(ndim_out.value)
+    tag = int(tag_out.value)
+    if tag not in _TAG_DTYPE:
+        raise RuntimeError(
+            f"phdf5_dataset_geometry({ds_name!r}): the library returned "
+            f"dtype tag {tag}, which this build of the Python side does not "
+            f"know ({sorted(_TAG_DTYPE)}).  The two sides of the tag table "
+            f"have drifted — rebuild the .so from this tree.")
+    return tuple(int(shape_buf[i]) for i in range(ndim)), _TAG_DTYPE[tag]
+
+
+def phdf5_read_whole(ctx_handle: int, ds_name: str, *, shape, dtype_name: str,
+                     platform: Optional[str] = None):
+    """Read a WHOLE small dataset into a fresh host ``np.ndarray``.
+
+    Serves the case the sharded read handler structurally cannot: a
+    rank-0 (scalar) dataset has no hyperslab to select, so
+    ``read_slab`` refuses it before it reaches HDF5 at all
+    (``_normalize_slab_request``: "slab shape must be non-empty").  Every
+    scalar stamp ``SlabIO.write_attr`` publishes is such a dataset.
+
+    FOR SCALARS AND SMALL REPLICATED VECTORS ONLY.  Every rank gets the
+    whole thing, so the payload must be O(1) in the design envelope —
+    schema stamps, band counts, a k-grid triple.  Bulk data is a
+    hyperslab and belongs in ``SlabIO.read_slab``; the C++ side checks the
+    element count against the dataset's own so a mis-sized buffer refuses
+    instead of overrunning, but it cannot check that you meant it.
+    """
+    import numpy as _np
+    lib = get_lib(platform)
+    if not hasattr(lib, "lrx_phdf5_read_whole"):
+        raise RuntimeError(
+            "phdf5_read_whole: the loaded FFI library does not export "
+            "lrx_phdf5_read_whole.  It predates 2026-08-22; rebuild it "
+            "(src/ffi/cpp/build.sh for the CUDA leg, "
+            "config/perlmutter/build_ffi_host.sh for the host leg).")
+    if dtype_name not in _DTYPE_TAG:
+        raise ValueError(f"phdf5_read_whole: unsupported dtype {dtype_name}")
+    out = _np.zeros(tuple(int(s) for s in shape), dtype=_np.dtype(dtype_name))
+    err = ctypes.create_string_buffer(_ERR_CAP)
+    rc = lib.lrx_phdf5_read_whole(
+        int(ctx_handle),
+        ds_name.encode("utf-8"),
+        _DTYPE_TAG[dtype_name],
+        out.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int64(int(out.size)),
+        err, _ERR_CAP,
+    )
+    _check_err(rc, err)
+    return out
 
 
 # ---- slate ----------------------------------------------------------------

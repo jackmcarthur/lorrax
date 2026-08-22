@@ -139,16 +139,48 @@ _STRIPE_UNIT_MAX = 4 << 20
 #: of the phdf5 writer stay one grammar. This file once spelled the same
 #: tuple inline three times; keeping one local copy avoids an uphill
 #: L3 -> L1 import.
-_TRUE = ("1", "true", "yes", "on")
-_FALSE = ("0", "false", "no", "off")
+# ONE PARSER (2026-08-22).  These three used to be a local copy of the
+# grammar, and the copy SWALLOWED: an unrecognised token resolved to False
+# with nothing printed, so a typo in a knob name's VALUE turned a
+# default-on knob off in silence.  ``runtime.env_flags`` (L3, no jax) owns
+# the table and the once-per-value announcement now; the local tuples were
+# a deliberate duplicate to avoid an uphill L3 -> L1 import into
+# ``gw_config``, and moving the grammar down removes the reason for it.
+from runtime.env_flags import ENV_FALSE as _FALSE   # noqa: F401
+from runtime.env_flags import ENV_TRUE as _TRUE     # noqa: F401
+from runtime.env_flags import env_bool as _env_flag  # noqa: F401
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    """``name`` as a boolean, ``default`` when unset or empty."""
-    v = os.environ.get(name)
-    if v is None or not v.strip():
-        return default
-    return v.strip().lower() in _TRUE
+#: Paths already announced as taking the legacy serial-h5py introspect.
+#: One line per path per process, not one per dataset: the fact being
+#: reported is a property of the DEPLOYED LIBRARY, and repeating it per
+#: dataset would bury it under itself.
+_LEGACY_INTROSPECT_ANNOUNCED: set = set()
+
+
+def _announce_legacy_introspect(path: str) -> None:
+    """Say, once, that this file's geometry came from the OTHER HDF5 stack.
+
+    The FFI has owned dataset introspection since 2026-08-22
+    (``lrx_phdf5_dataset_geometry``).  A library built before that exports
+    no such entry point, so a read-only handle still falls back to a
+    serial-h5py open of the same path — legal, counted by
+    ``file_io.hdf5_owner``, and exactly the cohabitation the metadata
+    entry points exist to retire.  Announce-or-refuse: the run does not
+    get to take the old route silently.
+    """
+    if path in _LEGACY_INTROSPECT_ANNOUNCED:
+        return
+    _LEGACY_INTROSPECT_ANNOUNCED.add(path)
+    if not _rank0():
+        return
+    print(f"  [SlabIO] {os.path.basename(path)}: dataset geometry read "
+          f"through SERIAL h5py — the loaded FFI library predates "
+          f"lrx_phdf5_dataset_geometry (2026-08-22), so two HDF5 library "
+          f"instances touch this path.  Read-only on both sides, so it is "
+          f"allowed and counted; a handle that could WRITE would refuse "
+          f"here.  Rebuild to retire it: src/ffi/cpp/build.sh (CUDA leg), "
+          f"config/perlmutter/build_ffi_host.sh (host leg).", flush=True)
 
 
 def _close_log_level() -> int:
@@ -1050,6 +1082,12 @@ def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     # all-gather (scorecard AA.1) — a per-call blocking collective on a
     # control buffer that is identical on every rank by construction.
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+    #
+    # THE WIDTH CONTRACT IS NOT CHECKED HERE, deliberately: this array is
+    # handed straight to the cached ``shard_map``, whose body calls
+    # ``ffi.io.{ffi_read_call,ffi_write_call}``, and those refuse a
+    # non-int64 control operand by name (``require_control_i64``).  Checking
+    # it twice would be two places to keep in step with one C++ signature.
     return device_put_process_local(
         np.asarray(tuple(int(v) for v in values), dtype=np.int64),
         NamedSharding(mesh, P()),
@@ -1859,13 +1897,30 @@ class _FfiBackend(_DatasetGeometry):
     def _introspect_dataset(self, name: str) -> tuple[tuple[int, ...], "np.dtype"]:
         """Return ``(shape, dtype)`` of an existing dataset.
 
-        Uses h5py for the metadata read (cheap, parallel-safe with
-        ``HDF5_USE_FILE_LOCKING=FALSE`` already set process-wide).
-        Cached so repeated lookups for the same name are free.
+        THROUGH THE FFI — the same library instance that already holds
+        this file open (``ffi_loader.phdf5_dataset_geometry``).  Cached so
+        repeated lookups for the same name are free.
 
-        Symmetry with the allgather backend: callers don't have to
-        pre-compute shape just because the FFI write thunk needs it
-        as an FFI attr — we look it up here.
+        WHY THIS IS NOT h5py ANY MORE (2026-08-22).  It used to open
+        ``self.path`` a second time with serial h5py while the collective
+        handle was live.  That is legal only while BOTH stacks are
+        read-only, and ``file_io.hdf5_owner`` refuses it by name — as it
+        must — the moment the live FFI handle can write.  A real caller
+        walked into exactly that: ``get_dipole_mtxels
+        --parallel-transport-out`` held ``parallel_transport.h5``
+        ``mode='a'`` and then introspected ``links_ibz``, so every rank
+        died on the one-owner refusal AFTER the expensive PT tensor was
+        already on disk and BEFORE ``dipole.h5`` was written.  The guard
+        was right and the caller was wrong; the repair is to stop needing
+        a second library at all.
+
+        OLDER LIBRARIES.  A ``.so`` built before 2026-08-22 exports no
+        geometry entry point.  On a read-only handle the h5py introspect
+        is still legal, so it is taken, announced ONCE per process and
+        counted by the registry.  On a handle that can write there is
+        nothing legal to fall back to, so this refuses by name and points
+        at the rebuild — which is the same failure as before, with a
+        message that names its repair.
         """
         cache = getattr(self, "_introspect_cache", None)
         if cache is None:
@@ -1873,15 +1928,52 @@ class _FfiBackend(_DatasetGeometry):
             self._introspect_cache = cache
         if name in cache:
             return cache[name]
+
+        if self._loader.has_phdf5_metadata_api(self._platform()):
+            # DRAIN FIRST.  This route is a COLLECTIVE HDF5 operation — it
+            # routes through the same cached ``H5Dopen`` ``_ds_id`` uses —
+            # where the h5py route below was a local POSIX read.  So it
+            # inherits ``_ds_id``'s hazard verbatim: entering HDF5/MPI-IO
+            # on this file handle while the asynchronous writer thread is
+            # still inside it interleaves MPI's datatype-cache state, and
+            # a rank that opens while a peer writes mismatches the
+            # collective order.  ``read_slab`` / ``read_slabs`` /
+            # ``padded_shape_for`` already drain before reaching here;
+            # ``read_whole`` reaches it directly, which is why the drain
+            # belongs at THIS choke point rather than at each caller.
+            self._drain_pending()
+            with _journal.op_scope("attr_r", self.path, stack=_J_FFI,
+                                   ds=name, mode=self.mode, handle=self.fh):
+                shape, dtype_name = self._loader.phdf5_dataset_geometry(
+                    self.fh, name, platform=self._platform())
+            got = (tuple(int(s) for s in shape), np.dtype(dtype_name))
+            cache[name] = got
+            return got
+
+        if self.mode != "r":
+            raise RuntimeError(
+                f"SlabIO({os.path.basename(self.path)}, mode={self.mode!r}): "
+                f"learning the geometry of dataset {name!r} needs either the "
+                f"FFI metadata entry points (lrx_phdf5_dataset_geometry, "
+                f"added 2026-08-22) or a serial-h5py open of a file this "
+                f"handle can WRITE — and the second is refused by "
+                f"file_io.hdf5_owner, correctly (audit A1; two HDF5 library "
+                f"instances, one file, one of them a writer).\n"
+                f"  fix= rebuild the FFI library from this tree "
+                f"(src/ffi/cpp/build.sh for the CUDA leg, "
+                f"config/perlmutter/build_ffi_host.sh for the host leg), or "
+                f"pre-register the geometry on this handle with "
+                f"create_dataset({name!r}, shape=..., dtype=...) — which is "
+                f"idempotent for an identical existing dataset and is the "
+                f"ordering file_io/parallel_transport.py already uses.")
+
+        _announce_legacy_introspect(self.path)
         import h5py
 
         from .hdf5_owner import STACK_H5PY, open_scope
-        # This is the serial-h5py read that happens WHILE this backend's
-        # collective handle is live.  It is legal only because both sides
-        # are read-only here; ``hdf5_owner`` refuses it by name the moment
-        # the live FFI handle can write, which is exactly the case
-        # :meth:`_dataset_geom`'s docstring records as measured-fatal
-        # (job 7888644, "file signature not found").
+        # Read-only on both sides, which is the one cross-stack overlap the
+        # registry allows.  It is still counted, and it is still the route
+        # this method exists to retire.
         with open_scope(self.path, STACK_H5PY, "r",
                         where=f"_FfiBackend._introspect_dataset({name!r})"), \
                 _journal.op_scope("attr_r", self.path, stack=_J_H5PY,
@@ -1892,6 +1984,85 @@ class _FfiBackend(_DatasetGeometry):
                 dtype = np.dtype(ds.dtype)
         cache[name] = (shape, dtype)
         return shape, dtype
+
+    def _platform(self) -> str | None:
+        """Which FFI library owns this handle ("CUDA"/"cpu"), or None.
+
+        Every lifecycle call on a ``PhdfCtx*`` must go through the library
+        that allocated it (``ffi.io.platform_for_handle``); the two new
+        metadata calls are lifecycle calls like any other.
+        """
+        from ffi.io import platform_for_handle
+        return platform_for_handle(self.fh)
+
+    def read_whole(self, name: str, *, dtype=None):
+        """Read a WHOLE small dataset into a host ``np.ndarray``, every rank.
+
+        The rank-0 / scalar door.  ``read_slab`` cannot serve a scalar: a
+        rank-0 dataspace has no hyperslab to select, and the request is
+        refused before it reaches HDF5 ("slab shape must be non-empty").
+        Every stamp ``write_attr`` publishes is such a dataset, which is
+        why ``gw.qsgw_head.load_parallel_transport_head`` could never read
+        its own artifact.
+
+        FOR SCALARS AND SMALL REPLICATED VECTORS.  See
+        ``ffi_loader.phdf5_read_whole``; the payload must be O(1) in the
+        design envelope because every rank materialises all of it.
+
+        COLLECTIVE in the same sense as :meth:`read_slab`: the geometry
+        query behind it is a collective ``H5Dopen``, so every rank calls
+        this with the same name, in the same order.  It drains queued
+        writes first for the reasons :meth:`read_slab` lists — nothing
+        here may enter HDF5 while the writer thread is inside it.
+        """
+        self._drain_pending()
+        shape, ds_dtype = self._dataset_geom(name)
+        want = np.dtype(dtype) if dtype is not None else np.dtype(ds_dtype)
+        if not self._loader.has_phdf5_metadata_api(self._platform()):
+            # SAME LEGACY ROUTE AS ``_introspect_dataset``, and for the same
+            # reason it has one: on a READ-ONLY handle a serial-h5py open is
+            # the one cross-stack overlap ``hdf5_owner`` allows, and it is
+            # what ``gw.qsgw_head`` was doing on origin/main -- through its
+            # own short-lived owner -- when this method did not exist.
+            # Refusing here instead would take a path that WORKS today on
+            # every deployed .so and break it until a rebuild lands, on the
+            # metallic-head route (`sc_head_update = dft_velocity`) every
+            # accepted sodium number came through.  A ratchet belongs on the
+            # artifact, not on a caller who has no way to satisfy it.
+            #
+            # On a WRITABLE handle there is still nothing legal to fall back
+            # to (two HDF5 instances, one file, one of them a writer -- audit
+            # A1), so that arm keeps the refusal and names the rebuild.
+            if self.mode != "r":
+                raise RuntimeError(
+                    f"SlabIO.read_small({name!r}) on "
+                    f"SlabIO({os.path.basename(self.path)}, "
+                    f"mode={self.mode!r}): the loaded FFI library predates "
+                    f"the metadata entry points (lrx_phdf5_read_whole, "
+                    f"2026-08-22), and the serial-h5py fallback is legal "
+                    f"only while BOTH stacks are read-only -- this handle "
+                    f"can write, so file_io.hdf5_owner refuses it, "
+                    f"correctly.\n"
+                    f"  fix= rebuild the FFI library from this tree "
+                    f"(src/ffi/cpp/build.sh for the CUDA leg, "
+                    f"config/perlmutter/build_ffi_host.sh for the host leg), "
+                    f"or reopen this file mode='r' for the stamp read.")
+            _announce_legacy_introspect(self.path)
+            import h5py
+
+            from .hdf5_owner import STACK_H5PY, open_scope
+            with open_scope(self.path, STACK_H5PY, "r",
+                            where=f"_FfiBackend.read_whole({name!r})"), \
+                    _journal.op_scope("read", self.path, stack=_J_H5PY,
+                                      ds=name, mode="r", handle=self.fh):
+                with h5py.File(self.path, "r") as f:
+                    out = np.asarray(f[name][()])
+            return out.astype(want, copy=False) if dtype is not None else out
+        # Journaled by ``SlabIO.read_small``, the public door — one line
+        # per op, as for every other method here.
+        return self._loader.phdf5_read_whole(
+            self.fh, name, shape=shape, dtype_name=str(want.name),
+            platform=self._platform())
 
     def _ds_id(self, name: str, readonly: bool = False) -> int:
         if name in self._ds_ids:

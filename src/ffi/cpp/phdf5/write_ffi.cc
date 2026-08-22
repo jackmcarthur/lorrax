@@ -132,10 +132,17 @@ namespace ffi = ::xla::ffi;
 // ``checked_buffer_bytes`` / ``announce_error`` are in shard_index.h, shared
 // verbatim with read_ffi.cc so the two TUs cannot drift.
 
+// THE SHARED GRAMMAR, not a third one (2026-08-22).  This was
+// ``env && env[0] && strcmp(env, "0")`` — non-empty and not exactly "0" —
+// under which ``=false``, ``=off`` and ``=no`` all turned the debug banner
+// ON, while its two neighbours in this subpackage
+// (``LORRAX_PHDF5_TIME``, ``LORRAX_PHDF5_DUMP_HINTS``) had already been
+// converted to ``ctx.h::env_flag``.  Three knobs, one prefix, three
+// answers to ``=false`` is the defect class ``env_flag`` exists to end;
+// the Python twin is ``runtime.env_flags.env_bool``.
 static bool write_debug_enabled()
 {
-    const char* env = std::getenv("LORRAX_PHDF5_WRITE_DEBUG");
-    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    return env_flag("LORRAX_PHDF5_WRITE_DEBUG", false);
 }
 
 static std::string h5_object_name(hid_t id)
@@ -571,7 +578,10 @@ static ffi::Future WriteDispatch(
             std::ostringstream os;
             os << "phdf5 write: negative offset/valid_shape at dim " << d
                << " offset=" << offset_host[d]
-               << " valid_shape=" << valid_shape_host[d];
+               << " valid_shape=" << valid_shape_host[d] << "\n"
+               << descriptor_forensics(
+                      offset_host[d] < 0 ? offset_host[d]
+                                         : valid_shape_host[d]);
             return fail(ffi::ErrorCode::kInvalidArgument, os.str());
         }
         if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {

@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -86,6 +87,67 @@ std::string vec_to_string(const std::vector<T>& v)
         os << v[i];
     }
     os << "]";
+    return os.str();
+}
+
+// ─── What an impossible descriptor value ACTUALLY IS ─────────────────────
+//
+// The refusals below print a nonsense ``offset`` or ``valid_shape`` and stop.
+// That is honest and useless: the operator sees `offset=-4642951212449158796`
+// and has no way to tell a marshalling-width defect from a stale allocation
+// from a caller bug.  Every such value measured on this project so far has
+// had the SAME answer, and it is recoverable from the bit pattern in one
+// line of arithmetic:
+//
+//   offset_base=4462667732332943029     -> f64  2.225039e-10   (2026-08-15, S3)
+//   valid_shape=-9223372036854775808    -> f64 -0.000000e+00   (2026-08-17)
+//   offset=-4642951212449158796         -> f64 -1.652707e-02   (2026-08-17)
+//   offset_base=[0,0,0,4596944070643295330] -> f64 1.9e-01     (KNOWN_FAILURES L1)
+//
+// Four sightings, four small-magnitude IEEE-754 doubles.  An int64 index that
+// decodes as a plausible float64 is not an arithmetic mistake and not an
+// int32 field widened wrongly (a widened int32 leaves the top half zero or
+// all-ones, i.e. an ABSURD double: an infinity, a NaN or ~1e-300).  It is
+// PHYSICS DATA: the descriptor buffer was read while it still held whatever
+// the allocator had left there, which has exactly two known causes on this
+// stack, both fixed IN SOURCE and both invisible to a run pinned to an older
+// library:
+//
+//   * the control-operand stream race (SLAB_IO_ROOT_CAUSE_AUDIT §A, fix B1) —
+//     ``copy_index_to_host`` read the operand allocation before the XLA
+//     stream wrote it;
+//   * the cross-.so ``PhdfCtx`` ODR collision (KNOWN_FAILURES L1) — the
+//     handler decoded the other build's struct at the wrong field offsets.
+//
+// So the classifier is worth its ten lines: it turns "impossible descriptor"
+// into a named hypothesis with a repair, at the one moment the operator is
+// looking.  It states its own uncertainty rather than asserting the cause.
+[[maybe_unused]] std::string descriptor_forensics(int64_t v)
+{
+    double as_f64 = 0.0;
+    std::memcpy(&as_f64, &v, sizeof(double));
+    const double mag = as_f64 < 0 ? -as_f64 : as_f64;
+    const bool plausible_float =
+        (as_f64 == 0.0) || (mag > 1e-30 && mag < 1e30);
+    std::ostringstream os;
+    os << "  [descriptor forensics] raw=0x" << std::hex << (uint64_t)v
+       << std::dec << " reinterpreted as f64 = " << as_f64;
+    if (plausible_float) {
+        os << " -- a SMALL-MAGNITUDE DOUBLE, i.e. this descriptor slot most "
+              "likely held PHYSICS DATA and was read before its producer "
+              "wrote it.  Both known causes are fixed in source and neither "
+              "is in a library built before 2026-08-15: the control-operand "
+              "stream race (fix B1) and the cross-.so PhdfCtx ODR collision "
+              "(KNOWN_FAILURES L1).  CHECK THE LIBRARY FIRST: "
+              "`strings -a \"$LORRAX_FFI_SO\" | grep -q 'stale or foreign "
+              "ctx handle'` must succeed, and `nm -D` on the CUDA and host "
+              "legs must share no lrx_/lorrax_ffi name.";
+    } else {
+        os << " -- NOT a plausible double, so the stale-allocation "
+              "explanation does not fit this one.  Suspect the marshalling "
+              "instead: dump the boundary with LORRAX_PHDF5_DEBUG_DESCRIPTOR"
+              "=1 and check that the Python side handed over int64.";
+    }
     return os.str();
 }
 

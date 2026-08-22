@@ -191,6 +191,13 @@ def close_file(path_or_handle) -> None:
                 platform = _FILE_CTXS[k][1]
                 _FILE_CTXS.pop(k, None)
         if ctx is not None and ctx != 0:
+            # Drop this ctx's memoised dataset ids FIRST.  H5Fclose
+            # invalidates every hid_t opened against the file, and the
+            # ctx address is about to become reusable — a memo entry that
+            # outlives the close is a stale ``ds_id`` waiting for the next
+            # ``open_file`` that lands on the same address
+            # (:func:`_forget_datasets_for_ctx`).
+            _forget_datasets_for_ctx(int(ctx))
             # platform=None (unknown handle) follows the JAX default
             # backend inside ffi_loader — hardcoding "CUDA" would fail on
             # a CPU node where only the host lib exists.
@@ -204,10 +211,12 @@ def _atexit_close_all() -> None:
     with _LOCK:
         for path, (ctx, platform, _mode) in list(_FILE_CTXS.items()):
             try:
+                _forget_datasets_for_ctx(int(ctx))
                 ffi_loader.phdf5_close(int(ctx), platform=platform)
             except Exception:
                 pass
         _FILE_CTXS.clear()
+        _DS_ID_MEMO.clear()
 
 
 atexit.register(_atexit_close_all)
@@ -300,6 +309,59 @@ def _register_and_open_dataset(fh: int, ds_name: str,
 # =============================================================================
 # Low-level padding contract: out_struct is the physical equal-block
 # shard; valid_shape is the logical file prefix that C++ reads.
+#: The ONE dtype every phdf5 control operand is marshalled as.  The C++
+#: handlers decode them as ``ffi::Buffer<ffi::DataType::S64>``; anything
+#: else is a signature mismatch, and the interesting case is the SILENT
+#: one below.
+_CONTROL_DTYPE = jnp.int64
+
+
+def require_control_i64(what: str, arr, *, ndim: int | None = None,
+                        length: int | None = None):
+    """Refuse a phdf5 control operand that is not exactly int64.
+
+    ``offset_base``, ``valid_shape``, the ``(2,)`` handle vector and the
+    k-chunk offset/count tables are the DESCRIPTORS: eight-byte signed
+    integers on both sides of the FFI boundary.  This is the Python half of
+    that contract, stated once and called at every dispatch site.
+
+    THE FAILURE IT CATCHES, and it is silent by construction: with
+    ``jax_enable_x64`` OFF, ``jnp.asarray(..., dtype=jnp.int64)`` yields
+    **int32**.  JAX canonicalises, it does not raise.  A 64-bit ``PhdfCtx*``
+    address then truncates to its low 32 bits and the handler
+    ``reinterpret_cast``s a garbage pointer.  ``runtime.bootstrap()`` sets
+    x64, so production is fine — but a harness, a bare ``import``, or a
+    test that builds a mesh without the bootstrap is not, and nothing
+    anywhere said so.
+
+    IT DOES NOT VALIDATE VALUES.  These arrays are traced inside the
+    ``shard_map``, so only ``dtype`` and ``shape`` are readable here.  The
+    value contract (non-negative, in bounds) is enforced at the two
+    concrete construction sites and, finally, in C++ — where a refusal is
+    computed from replicated operands and therefore fires on every rank.
+    """
+    dtype = jnp.dtype(getattr(arr, "dtype", None))
+    if dtype != jnp.dtype(_CONTROL_DTYPE):
+        raise TypeError(
+            f"phdf5 {what}: control operand must be int64, got {dtype}.  The "
+            f"C++ handler decodes it as ffi::Buffer<S64>.  The usual cause is "
+            f"jax_enable_x64 being OFF, under which jnp.int64 CANONICALISES "
+            f"to int32 without a word — which truncates a 64-bit ctx handle "
+            f"to its low half.  Call runtime.bootstrap() (or "
+            f"jax.config.update('jax_enable_x64', True)) before opening a "
+            f"SlabIO handle.")
+    shape = tuple(getattr(arr, "shape", ()))
+    if ndim is not None and len(shape) != int(ndim):
+        raise ValueError(
+            f"phdf5 {what}: control operand must be {ndim}-D, got shape "
+            f"{shape}")
+    if length is not None and (not shape or int(shape[0]) != int(length)):
+        raise ValueError(
+            f"phdf5 {what}: control operand must have leading extent "
+            f"{length}, got shape {shape}")
+    return arr
+
+
 def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
     """The ``(2,)`` int64 ``[ctx_handle, ds_id]`` buffer the FFI expects.
 
@@ -316,7 +378,16 @@ def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
     ``device_put_process_local`` for exactly that reason.
     """
     del mesh
-    return jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+    if int(ctx_handle) == 0:
+        raise ValueError(
+            "phdf5 handle_vector: ctx_handle is 0.  That is a closed or "
+            "never-opened SlabIO handle, and the C++ dispatch would refuse it "
+            "as a null ctx after the operands had already been marshalled.")
+    out = jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+    # The one concrete construction site for the handle pair, so the width
+    # contract is checkable HERE, where a truncated pointer is still
+    # recognisable as one.  See :func:`require_control_i64`.
+    return require_control_i64("handle_vector", out, ndim=1, length=2)
 
 
 def ffi_read_call(
@@ -338,6 +409,9 @@ def ffi_read_call(
     files and processes.  See :func:`ffi_write_call` for the measurement
     that moved ctx_handle/ds_id out of the Attrs.
     """
+    require_control_i64("read handle", handle, ndim=1, length=2)
+    require_control_i64("read offset_base", offset_base, ndim=1)
+    require_control_i64("read valid_shape", valid_shape, ndim=1)
     return jax.ffi.ffi_call(_TARGET_READ, out_struct)(
         handle,
         offset_base,
@@ -368,6 +442,8 @@ def ffi_read_kchunk_call(
     pair, and a binding is how anyone reaches or debugs one; it goes out
     WITH the handler, which is registered to the owner.
     """
+    require_control_i64("read_kchunk handle", handle, ndim=1, length=2)
+    require_control_i64("read_kchunk offset_base", offset_base, ndim=2)
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK, out_struct)(
         handle,
         offset_base,
@@ -397,6 +473,9 @@ def ffi_read_kchunk_union_call(
     iteration order matches filespace iteration order — see
     ``read_kchunk_union_sharded`` docstring).
     """
+    require_control_i64("read_kchunk_union handle", handle, ndim=1, length=2)
+    require_control_i64("read_kchunk_union offset_base", offset_base, ndim=2)
+    require_control_i64("read_kchunk_union count_base", count_base, ndim=2)
     return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION, out_struct)(
         handle,
         offset_base,
@@ -509,9 +588,43 @@ def read_kchunk_union_sharded(
     return _reader
 
 
-@functools.lru_cache(maxsize=None)
+#: ``(ctx_handle, ds_name, mesh) -> hid_t`` for the k-chunk union reader.
+#: A PLAIN DICT, cleared by :func:`_forget_datasets_for_ctx` at every
+#: ``close_file``.  It used to be an ``lru_cache`` and that is a defect,
+#: not a style: see :func:`_open_dataset_memo`.
+_DS_ID_MEMO: Dict[Tuple[int, str, Mesh], int] = {}
+
+
+def _forget_datasets_for_ctx(ctx: int) -> None:
+    """Drop every memoised ``ds_id`` belonging to ``ctx``.
+
+    THE CTX HANDLE IS A HEAP ADDRESS, AND HEAP ADDRESSES ARE REUSED.
+    ``open_file`` returns ``reinterpret_cast<int64_t>(ctx)``; ``close_ctx``
+    ``delete``s that object.  A second ``open_file`` of the same path in
+    the same process — same allocation size, freed moments earlier —
+    very often gets the SAME address back from the allocator.  Every
+    ``hid_t`` minted against the first context was invalidated by its
+    ``H5Fclose``, so a cache keyed on the address alone hands the second
+    context the first one's dead dataset ids and the read handler refuses
+    with ``phdf5 read_kchunk_union: ds_id is invalid``.
+
+    MEASURED, and this is the failure it explains: JID 57269074, a second
+    ``bandstructure.htransform.streaming_galerkin_solve`` in one exciton
+    process, rank 3 raising exactly that message after the first 24x24
+    load had completed and closed; an identical FRESH-PROCESS retry passed
+    the same site.  Fresh process, fresh allocator, no address reuse — so
+    the "intermittent" in that register row is the allocator's freedom to
+    hand back a different address, not a race.
+
+    Called from ``close_file`` (and the atexit sweep), which is the only
+    place a ctx dies, so the memo cannot outlive the handle it describes.
+    """
+    for key in [k for k in _DS_ID_MEMO if k[0] == int(ctx)]:
+        _DS_ID_MEMO.pop(key, None)
+
+
 def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
-    """Memoised collective ``H5Dopen``.
+    """Memoised collective ``H5Dopen``, keyed to a LIVE ctx.
 
     Split out of :func:`_read_kchunk_union_sharded_cached` when
     ``fh``/``ds_name`` left that function's key.  It is kept as its own
@@ -520,8 +633,25 @@ def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
     and the dataset, a compiled module depends on the geometry.  Keeping
     it here holds the collective H5Dopen count at exactly one per
     ``(fh, ds_name, mesh)``, which is what the un-split code did.
+
+    IT IS NOT AN ``lru_cache``, deliberately.  An ``lru_cache`` has no
+    invalidation hook, and the key's first component is a reused heap
+    address — see :func:`_forget_datasets_for_ctx` for the measured
+    failure that combination produces.  The entry is dropped when the ctx
+    it belongs to is closed, so a stale id is unreachable rather than
+    merely unlikely.
     """
-    return _register_and_open_dataset(fh, ds_name, mesh)
+    # ``mesh`` is part of the key exactly as it was under ``lru_cache``:
+    # ``Mesh`` is hashable, and the collective open is routed by the mesh's
+    # platform.  Keep the OBJECT, not ``id(mesh)`` — an id is a reused
+    # address too, which is the bug this function is about.
+    key = (int(fh), str(ds_name), mesh)
+    got = _DS_ID_MEMO.get(key)
+    if got is not None:
+        return got
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
+    _DS_ID_MEMO[key] = int(ds_id)
+    return int(ds_id)
 
 
 @functools.lru_cache(maxsize=None)
@@ -681,6 +811,9 @@ def ffi_write_call(
 
     Use inside a ``shard_map`` body.
     """
+    require_control_i64("write handle", handle, ndim=1, length=2)
+    require_control_i64("write offset_base", offset_base, ndim=1)
+    require_control_i64("write valid_shape", valid_shape, ndim=1)
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     return jax.ffi.ffi_call(_FFI_TARGET, token_spec, has_side_effect=True)(
         A_local,

@@ -469,15 +469,102 @@ def _h5(target, mode, *, where=None):
     token = (None if path is None
              else note_open(path, STACK_H5PY, reg_mode, where=where))
     try:
-        with _qs().QirrDest(target, mode) as grp:
+        dest = _qs().QirrDest(target, mode)
+        # ``QirrDest.__enter__`` is where ``h5py.File`` runs, so the
+        # status_flags OSError surfaces THERE, not in the constructor.
+        # Entering explicitly is what lets the diagnosis wrap it while the
+        # ``finally`` below still releases the registry claim.
+        try:
+            grp = dest.__enter__()
+        except OSError as exc:
+            raise _superblock_flag_diagnosis(exc, path, mode, where) from exc
+        try:
             try:
                 yield grp
             finally:
                 if owned and is_write_mode(mode):
                     grp.file.flush()
+        finally:
+            dest.__exit__(None, None, None)
     finally:
         if token is not None:
             note_close(path, token)
+
+
+#: The exact HDF5 phrase.  It is the SUPERBLOCK's ``status_flags``
+#: write-open bit, not a POSIX lock, which is why
+#: ``HDF5_USE_FILE_LOCKING=FALSE`` does not touch it and why the runs that
+#: die this way have it set.
+_STATUS_FLAGS_PHRASE = "file is already open for write"
+
+
+def _superblock_flag_diagnosis(exc, path, mode, where):
+    """Turn HDF5's status_flags OSError into a message that names its cause.
+
+    THE FAILURE.  At 16 ranks on 4 nodes, the twelve ranks NOT on rank 0's
+    node die here — every one of them, at the same line, after all of an
+    iteration's fit blocks are on disk — with
+
+        OSError: Unable to synchronously open file (file is already open
+        for write (may use <h5clear file> to clear file consistency flags))
+
+    and the single-node arm of the same deck completes three SC iterations
+    clean.  It is intermittent at 4 ranks on ONE node too, so "single-node
+    is safe" is a frequency statement, not an invariant.
+
+    WHAT IT IS NOT.  Not a POSIX lock: ``HDF5_USE_FILE_LOCKING=FALSE`` is
+    injected into every ``lx`` step and was FALSE for the passing runs too.
+    Not this door's bookkeeping: ``file_io.hdf5_owner`` is per-process by
+    construction and at the failing open no FFI handle is live in THAT
+    rank's process.  Not caused by the A1 work: a detached worktree at
+    ``bf57701b`` — before ``hdf5_owner``, ``_h5`` and ``PoleReader``
+    existed — fails identically, same twelve ranks, same message.
+
+    WHAT IT IS.  h5py's libhdf5 reading the SUPERBLOCK's ``status_flags``
+    and finding the write-open bit set.  The FFI's cray libhdf5_parallel
+    cleared that bit at ``H5Fclose``; the clear has to become visible to
+    three other Lustre clients, and on these runs it had not.  Two HDF5
+    library instances, one file — audit A1's hazard escalated across
+    nodes.
+
+    So this raises the same class with the diagnosis attached.  It does
+    NOT repair anything: the repair is to stop reading a phdf5-written
+    store with a second HDF5 library, which needs an FFI attribute reader
+    (the ledger is attribute-heavy) or a rank-0 read plus a broadcast.
+    Until then, a message that names the mechanism is what stops the next
+    session re-deriving it from twelve identical tracebacks.
+    """
+    if _STATUS_FLAGS_PHRASE not in str(exc):
+        return exc
+    from common.collectives import process_rank, process_count
+    try:
+        rank, world = int(process_rank()), int(process_count())
+    except Exception:                                       # pragma: no cover
+        rank, world = -1, -1
+    return OSError(
+        f"{exc}\n"
+        f"  LORRAX diagnosis: this is the HDF5 SUPERBLOCK status_flags "
+        f"write-open bit, read by h5py's libhdf5 on a store the FFI's cray "
+        f"libhdf5_parallel wrote and closed.  Two HDF5 library instances, "
+        f"one file (audit A1; docs/architecture/slab_io.md#one-owner).\n"
+        f"  file  : {path}\n"
+        f"  open  : mode={mode!r} from {where}, rank {rank}/{world}\n"
+        f"  NOT   : a POSIX lock — HDF5_USE_FILE_LOCKING is already FALSE "
+        f"on every lx step and was FALSE on the passing single-node runs;\n"
+        f"  NOT   : file_io.hdf5_owner — it is per-process and no FFI "
+        f"handle is live in THIS process at this open;\n"
+        f"  NOT   : a regression from the A1 work — an A/B at bf57701b, "
+        f"before this door existed, fails identically.\n"
+        f"  what  : the FFI cleared that bit at H5Fclose and the clear had "
+        f"not become visible to this Lustre client.  Off-node ranks lose "
+        f"this race far more often, which is why 12 of 16 ranks on 4 nodes "
+        f"die here and a 4-rank single-node arm usually does not.\n"
+        f"  fix   : do not read a phdf5-written store through a second "
+        f"HDF5 library.  The ledger is attribute-heavy, so that needs an "
+        f"FFI attribute reader beside lrx_phdf5_read_whole, or a rank-0 "
+        f"read plus a broadcast.  Interim: run this stage at 4 ranks on "
+        f"one node, or set LORRAX_HDF5_ONE_OWNER=strict to enumerate every "
+        f"alternation site in one run.")
 
 
 # ---------------------------------------------------------------------------
