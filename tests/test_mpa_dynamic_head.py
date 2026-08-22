@@ -24,6 +24,7 @@ from gw.head_correction import (
 from gw.qsgw_head import (
     _HEAD_WING_FREQUENCY_BLOCK,
     _fold_static_kappa2,
+    _pad_head_band_manifold,
     _s_tensor_kernel,
 )
 
@@ -322,3 +323,64 @@ def test_s_tensor_kernel_temp_size_is_bounded_past_one_frequency_block():
         "KNOWN_LORRAX_ISSUES.md 'the bounded full-head fold still needs a "
         "fresh-fit lifetime boundary'."
     )
+
+
+def test_pad_head_band_manifold_commits_v_to_the_declared_mesh_sharding():
+    """Red twin: every ``_pad_head_band_manifold`` caller
+    (``head_s_tensor_sharded``, ``head_wings_sharded``,
+    ``head_drude_tensor_sharded``) builds ``v`` from ``velocity_cart`` via
+    a bare ``jnp.asarray(...)`` on a freshly host-read dipole array --
+    never sharded, never committed.  Before this fix that uncommitted,
+    single-device array flowed straight into a ``shard_map``-wrapped
+    ``jax.jit`` declaring ``P(None, None, 'x', 'y')`` for it, on every
+    call, fresh fit or restart alike.  On the production MoS2
+    9x9x1/626-band/mu=5288 shape (P=16) that dispatch-time reshard was
+    measured requesting a single 81.74 GiB allocation at the
+    ``block_until_ready`` in ``build_dft_head_response`` -- ~10x one full
+    ``(nk,ns,mu,nb)`` psi copy, against a compile-only peak of 5.98 GiB
+    for the same two kernels when every input already carries the
+    declared sharding.  A P=4 fresh-vs-restart A/B on this branch (2026-
+    08-22, ``runs/MoS2/86_bgw_lorrax_scaling_20260819/points/k6_c600/
+    lorrax/attempts/head_restart_diag_20260822/``) showed the restart
+    loader delivers ψ in the identical contract the fresh path does --
+    restart is not at fault; it is simply the only path that survives far
+    enough at production scale to reach this call, since the fresh zeta
+    fit OOMs earlier on an unrelated binder.  This test would have failed
+    before the fix (``v`` stayed a ``SingleDeviceSharding``,
+    ``committed=False``) and passes after it (``v`` is
+    ``jax.device_put`` onto the mesh before any kernel sees it).
+    """
+    if len(jax.devices()) < 4:
+        import pytest
+        pytest.skip("requires four CPU test devices")
+
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    rng = np.random.default_rng(2026_08_22)
+    nk, nb = 5, 6
+    v_np = _complex(rng, (3, nk, nb, nb), 1.0)
+    e_np = np.sort(rng.standard_normal((nk, nb)), axis=-1)
+    f_np = np.broadcast_to(
+        np.where(np.arange(nb) < nb // 2, 1.0, 0.0), (nk, nb)).copy()
+
+    # Exactly how every caller builds these today: bare jnp.asarray on a
+    # host numpy array, with no sharding placement at all.
+    v = jnp.asarray(v_np, dtype=jnp.complex128)
+    e = jnp.asarray(e_np, dtype=jnp.float64)
+    f = jnp.asarray(f_np, dtype=jnp.float64)
+    surface = jnp.zeros_like(e)
+    assert not v.committed, (
+        "test setup drifted: v must start life uncommitted/single-device "
+        "to exercise the reshard-on-dispatch path this test guards.")
+
+    v_out, _e_out, _f_out, _surf_out = _pad_head_band_manifold(
+        v, e, f, surface, mesh=mesh)
+
+    want = NamedSharding(mesh, P(None, None, "x", "y"))
+    assert v_out.committed, (
+        "_pad_head_band_manifold returned v uncommitted -- the kernels "
+        "it feeds will dispatch a foreign single-device sharding again.")
+    assert v_out.sharding == want, (
+        f"_pad_head_band_manifold returned v sharded {v_out.sharding!r}, "
+        f"want {want!r}.")
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(v_out))[:, :, :nb, :nb], v_np, rtol=0, atol=0)
