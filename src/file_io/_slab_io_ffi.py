@@ -2019,12 +2019,45 @@ class _FfiBackend(_DatasetGeometry):
         shape, ds_dtype = self._dataset_geom(name)
         want = np.dtype(dtype) if dtype is not None else np.dtype(ds_dtype)
         if not self._loader.has_phdf5_metadata_api(self._platform()):
-            raise RuntimeError(
-                f"SlabIO.read_small({name!r}): the loaded FFI library "
-                f"predates the metadata entry points (lrx_phdf5_read_whole, "
-                f"2026-08-22) and there is no second transport to fall back "
-                f"to.  Rebuild it: src/ffi/cpp/build.sh (CUDA leg) or "
-                f"config/perlmutter/build_ffi_host.sh (host leg).")
+            # SAME LEGACY ROUTE AS ``_introspect_dataset``, and for the same
+            # reason it has one: on a READ-ONLY handle a serial-h5py open is
+            # the one cross-stack overlap ``hdf5_owner`` allows, and it is
+            # what ``gw.qsgw_head`` was doing on origin/main -- through its
+            # own short-lived owner -- when this method did not exist.
+            # Refusing here instead would take a path that WORKS today on
+            # every deployed .so and break it until a rebuild lands, on the
+            # metallic-head route (`sc_head_update = dft_velocity`) every
+            # accepted sodium number came through.  A ratchet belongs on the
+            # artifact, not on a caller who has no way to satisfy it.
+            #
+            # On a WRITABLE handle there is still nothing legal to fall back
+            # to (two HDF5 instances, one file, one of them a writer -- audit
+            # A1), so that arm keeps the refusal and names the rebuild.
+            if self.mode != "r":
+                raise RuntimeError(
+                    f"SlabIO.read_small({name!r}) on "
+                    f"SlabIO({os.path.basename(self.path)}, "
+                    f"mode={self.mode!r}): the loaded FFI library predates "
+                    f"the metadata entry points (lrx_phdf5_read_whole, "
+                    f"2026-08-22), and the serial-h5py fallback is legal "
+                    f"only while BOTH stacks are read-only -- this handle "
+                    f"can write, so file_io.hdf5_owner refuses it, "
+                    f"correctly.\n"
+                    f"  fix= rebuild the FFI library from this tree "
+                    f"(src/ffi/cpp/build.sh for the CUDA leg, "
+                    f"config/perlmutter/build_ffi_host.sh for the host leg), "
+                    f"or reopen this file mode='r' for the stamp read.")
+            _announce_legacy_introspect(self.path)
+            import h5py
+
+            from .hdf5_owner import STACK_H5PY, open_scope
+            with open_scope(self.path, STACK_H5PY, "r",
+                            where=f"_FfiBackend.read_whole({name!r})"), \
+                    _journal.op_scope("read", self.path, stack=_J_H5PY,
+                                      ds=name, mode="r", handle=self.fh):
+                with h5py.File(self.path, "r") as f:
+                    out = np.asarray(f[name][()])
+            return out.astype(want, copy=False) if dtype is not None else out
         # Journaled by ``SlabIO.read_small``, the public door — one line
         # per op, as for every other method here.
         return self._loader.phdf5_read_whole(

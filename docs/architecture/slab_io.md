@@ -369,6 +369,12 @@ logical shapes**. A caller does *not*:
   request before a byte moves. Every stamp `write_attr` publishes is a
   scalar or a short vector, and this is their reader. The payload must be
   O(1) in the design envelope — every rank materialises all of it.
+  On a `.so` built before 2026-08-22 the entry point does not exist; on a
+  **read-only** handle it then takes the announced serial-h5py fallback —
+  the same one `_introspect_dataset` takes, counted by the same registry,
+  and the one cross-stack overlap `hdf5_owner` allows — and on a
+  **writable** handle it refuses by name and points at the rebuild, because
+  two HDF5 instances over one file with a writer among them is audit A1.
 - `read_slab(name, partition_spec=spec)` **with no `shape`** returns the
   dataset rounded UP to the mesh-divisible extent under `spec`,
   zero-filled past the dataset. That is the padded consumer buffer.
