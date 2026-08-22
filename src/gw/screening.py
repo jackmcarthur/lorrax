@@ -461,26 +461,29 @@ def compute_static_w(
                 with timing.section("W.unfold_to_full_bz"):
                     n_sym_spatial = int(
                         np.asarray(sym_perm).shape[0]) // 2
-                    from .qgrid_symmetry import (
-                        trs_pair_coherent_unfold_sym_idx,
-                        trs_project_self_negative_q_rows,
-                    )
-                    unfold_sym = trs_pair_coherent_unfold_sym_idx(
-                        full_to_irr_idx, full_to_irr_sym,
+                    # TIME REVERSAL IS MEASURED, NEVER ASSUMED — one
+                    # policy object, shared with bare V and ladder W, and
+                    # no TRS branch at this site.  See
+                    # ``gw.qgrid_symmetry.qgrid_trs_policy_for``.
+                    from .qgrid_symmetry import qgrid_trs_policy_for
+                    policy = qgrid_trs_policy_for(
+                        sym=sym, irr_idx_q=full_to_irr_idx,
+                        sym_idx_q=full_to_irr_sym,
                         kgrid=tuple(meta.kgrid),
+                        n_sym_spatial=n_sym_spatial,
+                        context=f"W[{_w}] RPA")
+                    unfold_sym = policy.unfold_sym_idx
+                    cov = policy.measure_covariance(
+                        W_q_solve, q_irr_frac=q_irr_frac,
                         q_irr_full_idx=sym.q_irr_full_idx,
-                        n_sym_spatial=n_sym_spatial)
-                    W_q_solve = trs_project_self_negative_q_rows(
-                        W_q_solve, sym.q_irr_full_idx,
-                        kgrid=tuple(meta.kgrid))
+                        sym_mats_k=sym.sym_mats_k, sym_perm=sym_perm,
+                        L_table=L_table)
+                    W_q_solve, removed = policy.project_fixed_q(
+                        W_q_solve, sym.q_irr_full_idx)
                     if jax.process_index() == 0:
-                        n_rewired = int(np.count_nonzero(
-                            np.asarray(unfold_sym)
-                            != np.asarray(full_to_irr_sym)))
-                        print(
-                            f"  W[{_w}] unfold: {n_rewired} q rows use a "
-                            "TRS-composed partner so q/-q share one spatial "
-                            "realization.")
+                        from common import sanity
+                        sanity.report_parent_covariance(
+                            f"W[{_w}] IBZ parents", cov, removed=removed)
                     # W's PRE-UNFOLD BLOCK, offered to whoever is writing
                     # the restart — same contract, same reason, same
                     # no-op-outside-a-scope as the V site in v_q_g_flat.
@@ -908,15 +911,40 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
         # These tiles span |A| ∈ [1.4, 3.8e6] (dyn. range ~50x on the median,
         # max/min ~2.7e6), so an ‖·‖-relative floor is NOT eps: the residual
         # is set by cancellation among large intermediates.  The empirical
-        # floor is the orbit-closed IBZ arm, where the unfold builds W_{−q}
-        # from W_q by symmetry and reciprocity therefore holds BY
-        # CONSTRUCTION — whatever residual it shows is pure arithmetic.
-        # MEASURED there (armB_orbit504, 2026-08-07): 1.13e-7 on this exact
-        # statistic.  Its magnitude signature confirms round-off — the
-        # per-element relative residual FALLS with |A| (4.9e-7 at <p10 to
-        # 3.1e-8 at >p99) while the absolute residual rises.
-        # 1e-5 is ~90x above that floor and ~400x below the smallest real
-        # break measured (7.8e-4), so it can neither cry wolf nor miss one.
+        # floor is the orbit-closed IBZ arm, MEASURED there (armB_orbit504,
+        # 2026-08-07): 1.13e-7 on this exact statistic.  Its magnitude
+        # signature confirms round-off — the per-element relative residual
+        # FALLS with |A| (4.9e-7 at <p10 to 3.1e-8 at >p99) while the
+        # absolute residual rises.  1e-5 is ~90x above that floor and ~400x
+        # below the smallest real break measured (7.8e-4), so it can neither
+        # cry wolf nor miss one.
+        #
+        # THE FLOOR IS A MEASUREMENT, NOT AN IDENTITY.  This comment used to
+        # justify itself with "the unfold builds W_{−q} from W_q by symmetry
+        # and reciprocity therefore holds BY CONSTRUCTION".  It does not.
+        # The unfold applies a SPATIAL operation and reciprocity is a
+        # conjugation statement; the two coincide only if the finite ISDF ζ
+        # basis is point-group covariant, which is measured FALSE by 1.2e-02
+        # on the Na 8×8×8 SOC c464 deck.  1.13e-7 is that deck's covariance,
+        # not an arithmetic floor.
+        #
+        # AND THIS GATE IS BLIND AT q == −q, where the condition collapses to
+        # "W_q is real" and reads ~1e-17 regardless.  The discriminating
+        # statistic is the little-group covariance of the IBZ parents,
+        # measured at the unfold site above via
+        # ``QgridTrsPolicy.measure_covariance`` and reported by
+        # ``sanity.report_parent_covariance``.  Do not tighten this rtol to
+        # compensate: it is measuring a projection.
+        #
+        # TRS SCOPE.  This statistic is NOT gated on the measured
+        # time-reversal verdict and must not be: W_{−q} = conj(W_q) follows
+        # from the conjugation-equivariance of the ISDF fit (the pair
+        # densities at −q are the conjugates of those at +q with bra and ket
+        # relabelled) and from v(|q+G|) being real, neither of which needs Θ.
+        # On a magnet the relation simply stops being imposed by the unfold —
+        # q and −q are independently solved — so this gate becomes an
+        # independent measurement rather than an identity, which is strictly
+        # more informative.
         if kgrid is not None:
             sanity.check_q_conjugate_reciprocity(
                 f"{label}[all q]", W, kgrid, rtol=1e-5, print_fn=print_fn)
