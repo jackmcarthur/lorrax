@@ -922,6 +922,337 @@ def _rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_pad: int):
         lambda: _make_rotate_bundle(mesh, a_lo, nb_active, nb_pad))
 
 
+#: Cache for the face-layout rotation kernel — keyed like ``_rotate_kernel``
+#: (mesh, active window) plus the face carrier's own static extents
+#: (nb_full, n_rmu, ns, nk).  Holds the jit'd ``fn`` AND the two
+#: ``distrib_la.GemmPlan``s it closes over, so both are built/warmed once
+#: per (mesh, shape) and reused across every SC iteration.
+_FACE_ROTATE_CACHE: dict = {}
+
+
+def _place_U_face(U, mesh_xy: Mesh):
+    """Face-layout counterpart of :func:`_place_U`'s array-kind dispatch —
+    called OUTSIDE any ``jax.jit`` (Python-level, same call site shape as
+    legacy's own ``U = _place_U(...)`` before ``rotate(...)``), for the
+    SAME reason: distinguishing a genuine host-numpy ``U`` from an
+    already-placed ``jax.Array`` is only meaningful before a jit
+    boundary — every argument reaching an already-traced body is a
+    tracer regardless of what it started as, so this dispatch would be
+    dead code if performed inside :func:`_face_rotate_kernel`'s jit'd
+    ``fn`` (a real defect class TASTE rule 3 names: an implicit
+    multi-process ``device_put`` at the jit argument list).
+
+    Differs from :func:`_place_U` in ONE respect: a host array is placed
+    fully REPLICATED (``P(None,None,None)``), not at
+    ``qsgw_density.band_rotation_spec()``.  ``_place_U``'s target assumes
+    its caller has already rounded the active window to a mesh-divisible
+    ``nb_pad``; here ``nb_active`` is a raw σ-window size with no such
+    guarantee (see :func:`_face_embed_active_U`), so replicated is the
+    only ALWAYS-legal placement — free to reshard afterward regardless
+    (a local slice from a replicated input, per ``_place_U``'s own
+    comment for that case).
+
+    BYTE FIGURE, stated per TASTE.md rule 1 ("replication whose extent is
+    set by a bounded dimension — N_b at the sigma window — is a judgment
+    call and must carry its byte figure at the site"): this replicates
+    ``nk·nb_active²`` complex128, i.e. ``nk·nb_active²·16`` bytes PER
+    RANK — an N_b-class object (the active σ-window, bounded by the
+    deck's own band count), never an N_μ-class one.  At nb_active=640,
+    nk=144 this is 900.0 MiB/rank (144·640²·16 bytes — corrected
+    2026-08-23 audit round; an earlier draft of this comment stated
+    9.44 MiB, off by ~95x). In production this branch is rarely taken at
+    all: ``sc_iteration.py``'s own eigensolves (``distributed_eigh_bands``/
+    ``eigh_kshard``) always hand ``rotate_wavefunctions`` an
+    ALREADY-PLACED ``jax.Array`` U, which takes the no-op
+    ``isinstance`` branch below and never reaches this replicated
+    ``device_put`` at all — the host-numpy path this figure prices is a
+    test/harness-only fallback. Still bounded and worth contrasting with
+    the μ-class objects this layout exists to keep off any single rank
+    (G/W/V at ``O(N_μ²/P)`` per rank, reaching multi-GB at production
+    μ). This is the SAME bound legacy's own replicated-U path already
+    accepted (see
+    :func:`rotate_wavefunctions`'s docstring, "U IS NEVER REPLICATED"
+    section — legacy's IS, in this one host-array corner case; only the
+    SHARDED-U path that section describes avoids it, and this function's
+    caller reshards immediately afterward inside
+    :func:`_face_embed_active_U`).
+    """
+    if isinstance(U, jax.Array):
+        return U
+    from common.collectives import device_put_process_local
+    U_np = np.asarray(U, dtype=np.complex128)
+    return device_put_process_local(
+        U_np, NamedSharding(mesh_xy, P(None, None, None)))
+
+
+def _face_embed_active_U(U_active, *, nb_full: int, a_lo: int, mesh_xy: Mesh):
+    """``(nk, nb_active, nb_active) -> (nk, nb_full, nb_full)``: identity
+    outside ``[a_lo, a_lo+nb_active)``, ``U_active`` inside — i.e.
+    ``blockdiag(U_active, I)`` at the active window's own offset.
+    ``U_active`` must already be a placed ``jax.Array`` (see
+    :func:`_place_U_face`, called by the caller before this — this
+    function itself always runs traced, inside :func:`_face_rotate_kernel`
+    's jit'd body).
+
+    Mirrors the embedding idiom ``gw.qsgw_head._assemble_kernel`` already
+    uses for the velocity/head manifold (``blockdiag(delta, 0)`` /
+    ``blockdiag(U, I)``), for the SAME reason stated there, applied here
+    to ψ instead of velocity: a face ψ copy's band axis is MESH-SHARDED
+    (``PSI_NMU_SPEC`` on 'x', ``PSI_MUN_SPEC`` on 'y') and cannot be
+    sliced to an arbitrary logical window — report obstacle #3,
+    :meth:`Wavefunctions.band_mask`'s own "weight, don't window" doctrine.
+    Embedding the identity into U instead of windowing ψ lets ONE GEMM,
+    run over ψ's full ``[b0,b4)`` extent, reproduce legacy's
+    slice-rotate-writeback EXACTLY: a rotation by a block-diagonal unitary
+    is itself block-diagonal, so entries outside the active block are
+    ``δ_mn`` (pass-through — "bands outside the window always keep their
+    DFT ψ") and no active/inactive cross term is ever nonzero.
+
+    Costs the FULL ``nb_full`` GEMM rather than a windowed one — the same
+    named cost ``band_mask``'s own docstring states for its masked calls.
+    """
+    U_active = jnp.asarray(U_active, dtype=jnp.complex128)
+    nk = int(U_active.shape[0])
+    eye = jnp.broadcast_to(
+        jnp.eye(nb_full, dtype=jnp.complex128)[None, :, :],
+        (nk, nb_full, nb_full))
+    U_full = jax.lax.dynamic_update_slice(eye, U_active, (0, a_lo, a_lo))
+    return jax.lax.with_sharding_constraint(
+        U_full, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
+                        n_rmu: int, ns: int, nk: int):
+    """One built kernel per ``(mesh, active window, face shape)`` — mirrors
+    :func:`_rotate_kernel`'s cache shape, but for the two-face carrier.
+
+    Builds the TWO ``distrib_la.gemm_plan`` N,N GEMMs ONCE (their shapes —
+    ``nb_full``/``n_rmu*ns``/``nk`` — are fixed for the whole run; only
+    the embedding step varies per call, inside the same compiled program)
+    and returns a jit'd ``fn(psi_nmu, psi_mun, U_active) -> (psi_nmu',
+    psi_mun')``.
+
+    THE TWO ROTATIONS, matching ``reports/gwjax_low_mem_bands_audit_2026-
+    08-22/report.md``'s own census entry ("U^T @ psi_nmu, psi_mun @ U ...
+    two face orientations of U"):
+
+      psi_nmu' = U^T @ psi_nmu   (contract psi_nmu's OWN band axis, which
+                 is already on 'x' — psi_nmu plugs in as gemm_plan's B
+                 operand with NO reshard; U needs the "new band on x, old
+                 band on y" orientation, which is the TRANSPOSE of U's
+                 native ``band_rotation_spec`` — a genuine, but bounded
+                 nb_full²-scale, resharding transpose, not a bitcast)
+      psi_mun' = psi_mun @ U     (psi_mun plugs in as gemm_plan's A
+                 operand with NO reshard; U plugs in as B DIRECTLY, at
+                 its native ``band_rotation_spec`` orientation — FREE,
+                 no reshard at all)
+
+    So of the two orientations, only ONE (``psi_nmu``'s) needs the
+    resharding transpose; the other is exactly what
+    :func:`_face_embed_active_U` already returns.  Both merges use
+    :func:`common.contract_bands.merge_spin_centroid`/
+    :func:`split_spin_centroid` — the SAME (s,μ) GEMM-seam convention
+    ``greens_function_kernel._face_build_G``/``contract_bands.
+    _face_project_kernel`` already use; this function adds no third
+    convention.
+
+    Everything (embed, both merges, both planned GEMMs, both splits) runs
+    inside ONE outer ``@jax.jit`` — the zeta-fit CCT port's own measured
+    reason (``docs/architecture/zeta_fit_face_psi_cct.md``, "Folding BOTH
+    gemm(...) calls ... into ONE outer @jax.jit fixed [an OOM] outright"):
+    two separate top-level jit dispatches cannot share buffer assignment
+    the way one fused program can.
+    """
+    from distrib_la import gemm_plan
+    from common.contract_bands import merge_spin_centroid, split_spin_centroid
+
+    key = (id(mesh), a_lo, nb_active, nb_full, n_rmu, ns, nk)
+    hit = _FACE_ROTATE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    mu_s = n_rmu * ns
+    plan_nmu = gemm_plan(mesh, m=nb_full, k=nb_full, n=mu_s, nq=nk,
+                        dtype=jnp.complex128)
+    plan_mun = gemm_plan(mesh, m=mu_s, k=nb_full, n=nb_full, nq=nk,
+                        dtype=jnp.complex128)
+
+    @jax.jit
+    def fn(psi_nmu_full, psi_mun_full, U_active):
+        U_full = _face_embed_active_U(
+            U_active, nb_full=nb_full, a_lo=a_lo, mesh_xy=mesh)
+
+        B_nmu = merge_spin_centroid(psi_nmu_full, 2, 3)   # (nk,nb_full,mu_s) P(_,'x','y')
+        A_nmu = jax.lax.with_sharding_constraint(          # U^T: new-on-x, old-on-y
+            jnp.swapaxes(U_full, 1, 2), NamedSharding(mesh, P(None, 'x', 'y')))
+        D_nmu = plan_nmu(A_nmu, B_nmu)                     # (nk,nb_full,mu_s) P(_,'x','y')
+        psi_nmu_out = split_spin_centroid(D_nmu, 2, ns, n_rmu)
+
+        A_mun = merge_spin_centroid(psi_mun_full, 1, 2)    # (nk,mu_s,nb_full) P(_,'x','y')
+        D_mun = plan_mun(A_mun, U_full)                    # (nk,mu_s,nb_full) P(_,'x','y')
+        psi_mun_out = split_spin_centroid(D_mun, 1, ns, n_rmu)
+        return psi_nmu_out, psi_mun_out
+
+    _FACE_ROTATE_CACHE[key] = fn
+    return fn
+
+
+def _rotate_wavefunctions_legacy(
+    wfns_dft: Wavefunctions,
+    U_dft_to_qp_active: jax.Array,
+    *,
+    enk_active_new: jax.Array,
+    enk_base: jax.Array | None = None,
+    efermi: float | None,
+    mesh_xy: Mesh,
+    active_slice: slice | None = None,
+) -> Wavefunctions:
+    """The exact pre-``low_mem_bands`` body of ``rotate_wavefunctions``.
+    UNTOUCHED (byte-for-byte, diff against a pre-face-rotation ref) — do
+    not edit this function to add face-layout behaviour; add a sibling
+    instead.  See :func:`rotate_wavefunctions` for the full docstring
+    (COLUMN CONVENTION, U sharding, active/inactive partition) — kept on
+    the public dispatcher rather than duplicated here, mirroring
+    ``greens_function_kernel._legacy_build_G``'s own precedent.
+    """
+    sigma_slice = wfns_dft.slices.sigma
+    if active_slice is None:
+        active_slice = sigma_slice
+    a_lo = int(active_slice.start or 0)
+    a_hi = int(active_slice.stop)
+    s_lo = int(sigma_slice.start or 0)
+    s_hi = int(sigma_slice.stop)
+    if a_lo < s_lo or a_hi > s_hi:
+        raise ValueError(
+            f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
+            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
+            f"information for bands beyond the protected window.")
+    nb_active = a_hi - a_lo
+    if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
+        raise ValueError(
+            f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
+            f"inconsistent with active block size {nb_active}.")
+
+    # THE CONTRACTED BAND EXTENT MUST DIVIDE THE MESH.  ``nb_active`` is a
+    # band WINDOW (b3 - b0), not the loader's mesh-divisible ψ extent, so it
+    # need not divide px or py; ``with_sharding_constraint`` refuses an
+    # indivisible axis outright rather than degrading (runtime.padding).
+    # The divisors come from the spec, not from mesh.shape, so a
+    # band_mix_spec that ever became a product axis stays covered.
+    pad_div = 1
+    for _field, spec, _band_axis in _PSI_LAYOUTS:
+        pad_div = math.lcm(pad_div, spec_divisor(
+            mesh_xy, band_mix_spec(_contract_axis(mesh_xy, spec)), 1))
+    nb_pad = round_up(nb_active, pad_div)
+
+    U = _place_U(U_dft_to_qp_active, mesh_xy, nb_pad)
+
+    # Slice the active block, rotate it against the sharded U, and
+    # dynamic-update-slice it back into a copy of the full ψ — one jit for
+    # all four copies, so there is a single lowering and no eager pjit per
+    # accessor call.  Bands outside the active block stay DFT.
+    with mesh_xy:
+        rotate = _rotate_kernel(mesh_xy, a_lo, nb_active, nb_pad)
+        psi_xn, psi_xr, psi_yr, psi_yn = rotate(
+            wfns_dft.psi_xn, wfns_dft.psi_xr, wfns_dft.psi_yr,
+            wfns_dft.psi_yn, U)
+
+        # enk: the default branch is the exact historical expression.  The
+        # optional base changes inactive ENERGIES only; the active block is
+        # overwritten below and the four ψ arrays above always started from
+        # wfns_dft.
+        if enk_base is None:
+            enk_full = wfns_dft.enk.at[:, active_slice].set(
+                jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        else:
+            if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
+                raise ValueError(
+                    f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
+                    f"does not match full DFT energies "
+                    f"{wfns_dft.enk.shape}.")
+            enk_full = jnp.asarray(
+                enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
+                    jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        rep2 = NamedSharding(mesh_xy, P(None, None))
+        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+        occ_full = jax.lax.with_sharding_constraint(
+            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
+
+    return Wavefunctions(
+        psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
+        enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
+    )
+
+
+def _rotate_wavefunctions_face(
+    wfns_dft: Wavefunctions,
+    U_dft_to_qp_active: jax.Array,
+    *,
+    enk_active_new: jax.Array,
+    enk_base: jax.Array | None = None,
+    efermi: float | None,
+    mesh_xy: Mesh,
+    active_slice: slice | None = None,
+) -> Wavefunctions:
+    """``layout='face'`` sibling of :func:`_rotate_wavefunctions_legacy` —
+    same validation and the same ``enk``/``occ`` rebuild, but the ψ
+    rotation itself routes through :func:`_face_rotate_kernel` (two
+    planned N,N GEMMs against a block-embedded U) instead of
+    :func:`_rotate_kernel` (slice + replicated-U contraction + writeback).
+    See :func:`rotate_wavefunctions` for the shared docstring.
+    """
+    sigma_slice = wfns_dft.slices.sigma
+    if active_slice is None:
+        active_slice = sigma_slice
+    a_lo = int(active_slice.start or 0)
+    a_hi = int(active_slice.stop)
+    s_lo = int(sigma_slice.start or 0)
+    s_hi = int(sigma_slice.stop)
+    if a_lo < s_lo or a_hi > s_hi:
+        raise ValueError(
+            f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
+            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
+            f"information for bands beyond the protected window.")
+    nb_active = a_hi - a_lo
+    if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
+        raise ValueError(
+            f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
+            f"inconsistent with active block size {nb_active}.")
+
+    with mesh_xy:
+        fk = face_kernel_kwargs(wfns_dft)
+        nk_face, nb_full, n_rmu, ns = fk['face_shape']
+        U = _place_U_face(U_dft_to_qp_active, mesh_xy)
+        rotate = _face_rotate_kernel(
+            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
+        psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+
+        # enk/occ: SAME expression as the legacy sibling (layout-independent
+        # — enk/occ are always P(None,None) replicated regardless of ψ
+        # layout, see Wavefunctions.enk's own field comment).
+        if enk_base is None:
+            enk_full = wfns_dft.enk.at[:, active_slice].set(
+                jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        else:
+            if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
+                raise ValueError(
+                    f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
+                    f"does not match full DFT energies "
+                    f"{wfns_dft.enk.shape}.")
+            enk_full = jnp.asarray(
+                enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
+                    jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+        rep2 = NamedSharding(mesh_xy, P(None, None))
+        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+        occ_full = jax.lax.with_sharding_constraint(
+            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
+
+    return Wavefunctions(
+        psi_nmu=psi_nmu, psi_mun=psi_mun,
+        enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
+    )
+
+
 def rotate_wavefunctions(
     wfns_dft: Wavefunctions,
     U_dft_to_qp_active: jax.Array,
@@ -934,6 +1265,18 @@ def rotate_wavefunctions(
 ) -> Wavefunctions:
     """Return a new ``Wavefunctions`` bundle with the **active subspace**
     rotated by ``U_dft_to_qp_active[k, m, n] = ⟨DFT_m | QP_n⟩``.
+
+    Dispatches on ``wfns_dft.layout`` — no separate ``layout=`` parameter:
+    the bundle already carries the tag, so it is the single owner of the
+    choice, not each call site (``sc_iteration.py:1753`` needs no change
+    to pick up the face path).  ``layout='legacy'`` routes to
+    :func:`_rotate_wavefunctions_legacy`, the exact pre-``low_mem_bands``
+    body.  ``layout='face'`` routes to :func:`_rotate_wavefunctions_face`
+    — two planned ``distrib_la.gemm_plan`` N,N GEMMs
+    (:func:`_face_rotate_kernel`) against a block-embedded U
+    (:func:`_face_embed_active_U`) rather than a sliced-ψ contraction,
+    because a face ψ copy's band axis is mesh-sharded and cannot be
+    windowed (report census row "QSGW orbital rotation").
 
     COLUMN CONVENTION.  ``U[k, m, n]`` is component m of QP band n, so
     ψ̃_n = Σ_m U[m,n] ψ_m — ``jnp.linalg.eigh``'s convention, ScaLAPACK's,
@@ -1019,73 +1362,18 @@ def rotate_wavefunctions(
     active_slice
         Contiguous active band block.  Defaults to ``wfns_dft.slices.sigma``.
     """
-    sigma_slice = wfns_dft.slices.sigma
-    if active_slice is None:
-        active_slice = sigma_slice
-    a_lo = int(active_slice.start or 0)
-    a_hi = int(active_slice.stop)
-    s_lo = int(sigma_slice.start or 0)
-    s_hi = int(sigma_slice.stop)
-    if a_lo < s_lo or a_hi > s_hi:
+    if wfns_dft.layout == 'legacy':
+        impl = _rotate_wavefunctions_legacy
+    elif wfns_dft.layout == 'face':
+        impl = _rotate_wavefunctions_face
+    else:
         raise ValueError(
-            f"rotate_wavefunctions: active_slice [{a_lo}, {a_hi}) leaks "
-            f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
-            f"information for bands beyond the protected window.")
-    nb_active = a_hi - a_lo
-    if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
-        raise ValueError(
-            f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
-            f"inconsistent with active block size {nb_active}.")
-
-    # THE CONTRACTED BAND EXTENT MUST DIVIDE THE MESH.  ``nb_active`` is a
-    # band WINDOW (b3 - b0), not the loader's mesh-divisible ψ extent, so it
-    # need not divide px or py; ``with_sharding_constraint`` refuses an
-    # indivisible axis outright rather than degrading (runtime.padding).
-    # The divisors come from the spec, not from mesh.shape, so a
-    # band_mix_spec that ever became a product axis stays covered.
-    pad_div = 1
-    for _field, spec, _band_axis in _PSI_LAYOUTS:
-        pad_div = math.lcm(pad_div, spec_divisor(
-            mesh_xy, band_mix_spec(_contract_axis(mesh_xy, spec)), 1))
-    nb_pad = round_up(nb_active, pad_div)
-
-    U = _place_U(U_dft_to_qp_active, mesh_xy, nb_pad)
-
-    # Slice the active block, rotate it against the sharded U, and
-    # dynamic-update-slice it back into a copy of the full ψ — one jit for
-    # all four copies, so there is a single lowering and no eager pjit per
-    # accessor call.  Bands outside the active block stay DFT.
-    with mesh_xy:
-        rotate = _rotate_kernel(mesh_xy, a_lo, nb_active, nb_pad)
-        psi_xn, psi_xr, psi_yr, psi_yn = rotate(
-            wfns_dft.psi_xn, wfns_dft.psi_xr, wfns_dft.psi_yr,
-            wfns_dft.psi_yn, U)
-
-        # enk: the default branch is the exact historical expression.  The
-        # optional base changes inactive ENERGIES only; the active block is
-        # overwritten below and the four ψ arrays above always started from
-        # wfns_dft.
-        if enk_base is None:
-            enk_full = wfns_dft.enk.at[:, active_slice].set(
-                jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
-        else:
-            if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
-                raise ValueError(
-                    f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
-                    f"does not match full DFT energies "
-                    f"{wfns_dft.enk.shape}.")
-            enk_full = jnp.asarray(
-                enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
-                    jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(
-            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
-
-    return Wavefunctions(
-        psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
-        enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
-    )
+            f"rotate_wavefunctions: wfns_dft.layout={wfns_dft.layout!r} "
+            f"not in ('legacy', 'face').")
+    return impl(
+        wfns_dft, U_dft_to_qp_active, enk_active_new=enk_active_new,
+        enk_base=enk_base, efermi=efermi, mesh_xy=mesh_xy,
+        active_slice=active_slice)
 
 
 # ---------------------------------------------------------------------------
