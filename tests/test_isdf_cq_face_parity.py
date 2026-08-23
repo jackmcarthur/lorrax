@@ -11,12 +11,12 @@ below only ever runs under the CLI multi-rank invocation; this mirrors
 ONE-SET-OF-CHECK-BODIES-TWO-CALLERS convention rather than inventing a
 second one.
 
-    lx run -N 1 -G 4 -n 4 bash tmp/lm_fitfaces_run_wrap.sh \\
+    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
         tests/test_isdf_cq_face_parity.py --mesh 2x2
 
-(``tmp/lm_fitfaces_run_wrap.sh`` -- or any wrapper that pins PYTHONPATH to
-this checkout and LORRAX_FFI_SO -- is required; see AGENTS.md's `lx run`
-section.)  Real 4-rank result, 2026-08-22 (this file's introducing commit):
+(``<wrapper.sh>`` -- any script that pins PYTHONPATH to this checkout and
+LORRAX_FFI_SO before ``exec python3 -u "$@"`` -- is required; see AGENTS.md's
+`lx run` section.)  Real 4-rank result, 2026-08-22 (this file's introducing commit):
 3/3 cases PASS, max relative diff 2.1e-15 (float64 noise from a different
 summation order -- SUMMA-distributed cuBLASMp GEMM vs a rank-local
 ``jnp.einsum`` -- not a discrepancy), covering ns=1, ns=2 (the GEMM-seam

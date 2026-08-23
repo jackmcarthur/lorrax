@@ -84,7 +84,7 @@ from .wavefunction_bundle import face_kernel_kwargs
 
 def _face_g_plan(mesh_xy: Mesh, face_shape):
     """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
-    ``greens_function_kernel._face_build_G`` requires — mirrors
+    ``greens_function_kernel._build_G_face`` requires — mirrors
     ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
     (single source of truth: same GEMM shape, same convention, both
     named as "built ONCE by the caller" in ``build_G``'s own docstring).
