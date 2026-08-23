@@ -16,6 +16,7 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
+from gw.wavefunction_bundle import face_kernel_kwargs
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             build_shared_sigma_windows,
@@ -59,31 +60,73 @@ def _integrate_sigma_batches(
         raise ValueError("omega_grid_ry must be a nonempty vector")
 
     s = wfns.slices
-    # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded extent.
-    # Identical on an unsplit deck.  UNVERIFIED on a split one: the public
-    # MPA Σ still refuses to run (gw_config.ComputeMode), so this line is
-    # wired for consistency and has never executed under a split.
-    psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
-    psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
-    # THE SAME precondition the PPM sharded branch owns.  This executor
-    # accumulates into a P(None,None,'x','y') array and then strips the pad
-    # block off both trailing axes, which on an indivisible window leaves a
-    # sharded array whose declared spec no longer divides its own shape.
-    # Before 2026-08-22 there was no divisibility check anywhere in this
-    # module while ppm_sigma refused the same case by name -- two contracts
-    # at one seam.
-    assert_sharded_sigma_window_divides_mesh(
-        int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
-    psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
-        psi_proj_xr, psi_proj_yn, mesh_xy)
-    shape = (omega.size, int(psi_proj_xr.shape[0]),
-             int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+    face_kwargs = face_kernel_kwargs(wfns)
+    if wfns.layout == "legacy":
+        # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
+        # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
+        # one: the public MPA Σ still refuses to run (gw_config.
+        # ComputeMode), so this line is wired for consistency and has
+        # never executed under a split.
+        psi_coh_xn, psi_coh_yr = wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum)
+        psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
+        # THE SAME precondition the PPM sharded branch owns.  This executor
+        # accumulates into a P(None,None,'x','y') array and then strips the pad
+        # block off both trailing axes, which on an indivisible window leaves a
+        # sharded array whose declared spec no longer divides its own shape.
+        # Before 2026-08-22 there was no divisibility check anywhere in this
+        # module while ppm_sigma refused the same case by name -- two contracts
+        # at one seam.
+        assert_sharded_sigma_window_divides_mesh(
+            int(psi_proj_xr.shape[1]), mesh_xy, ansatz="compute_mode = mpa")
+        psi_proj_xr, psi_proj_yn, nb_real = pad_sigma_window(
+            psi_proj_xr, psi_proj_yn, mesh_xy)
+        shape = (omega.size, int(psi_proj_xr.shape[0]),
+                 int(psi_proj_xr.shape[1]), int(psi_proj_yn.shape[3]))
+    else:
+        # Face carrier (2026-08-22, mechanical port sharing
+        # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
+        # branch's identically-shaped docstring): psi_mun/psi_nmu are used
+        # UNSLICED for both roles; the accumulator runs at the mesh-
+        # divisible nb_full extent and the caller strips to nb_sigma at
+        # the end (any extent is a valid host slice).  MPA's own
+        # sharded-output tail (unlike GN-PPM's replicated default) is NOT
+        # ported for this layout — see ppm_sigma.compute_sigma_c_ppm_
+        # omega_grid's identical refusal; this executor always publishes
+        # a sharded P(None,None,'x','y') array, so a face caller here
+        # would need that same tail fixed first.  Reachability today: this
+        # whole function refuses at the deck-config seam
+        # (low_mem_bands_dynamic_ppm_unported), so this arm is exercised
+        # only by a direct unit-level caller, not by any production path.
+        if int(s.nb_sigma) != int(s.nb_full):
+            # This executor's output is ALWAYS a device-sharded array
+            # (DeviceOmegaAccumulator.finalize(), never gathered to
+            # host/replicated the way ppm_sigma's default replicated
+            # layout is) — stripping a genuinely sharded array to a
+            # sub-extent that does not divide the mesh breaks its own
+            # declared sharding (the exact defect
+            # assert_sharded_sigma_window_divides_mesh exists to name).
+            # Unreachable today (low_mem_bands_dynamic_ppm_unported still
+            # refuses every compute_mode this function serves); refused
+            # explicitly here too rather than left to surface as a
+            # confusing downstream sharding error if that changes.
+            raise NotImplementedError(
+                "_integrate_sigma_batches(layout='face'): the Σ window "
+                f"(nb_sigma={int(s.nb_sigma)}) is narrower than the loaded "
+                f"extent (nb_full={int(s.nb_full)}) — MPA's sharded-output "
+                "final strip is not ported for that case under "
+                "low_mem_bands = true.  Unsplit decks (nb_sigma == "
+                "nb_full) are unaffected.")
+        psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
+        nb_real = int(s.nb_sigma)
+        shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
     output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
         omega, shape=shape, sharding=output_sharding)
     tau_kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy,
-        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)))
+        kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0

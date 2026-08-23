@@ -103,8 +103,19 @@ def _fft_ffi_fused_enabled() -> bool:
 
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
+    layout: str = "legacy", face_shape=None,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
+
+    ``layout='face'`` (2026-08-22, the dynamic PPM/MPA Σ_c(τ) face port):
+    routes through ``common.contract_bands.contract_bands_block_reshard(
+    layout='face', channels=...)`` instead of the shard_map body below —
+    the SAME channel-plan dispatch (``merged_x`` -> ``channels='none'``
+    single complex chain, else ``channels='split_reim'`` two-channel
+    plan), just the face mechanism (two planned GEMMs) rather than the
+    shard_map/psum_scatter chain.  Requires ``face_shape``.  See
+    :func:`common.contract_bands._face_project_kernel`'s own docstring
+    for the algebra.
 
     Drop-in replacement for ``wavefunction_bundle.project_ri`` at the tail of
     ``_sigma_kij_kernel``.  Preserves the math exactly:
@@ -209,6 +220,8 @@ def _make_project_ri_reduce_scatter(
     return contract_bands_block_reshard(
         mesh_xy,
         channels=("none" if merged_x else "split_reim"),
+        layout=layout,
+        face_shape=face_shape,
         divisibility_hint=(
             "Both existing sigma call sites pad via pad_sigma_window; "
             "meta.py rounds b_id_4 to world_size but NOT the sigma band "
@@ -246,8 +259,21 @@ def get_sigma_spatial_kernel(
     mesh_xy: Mesh,
     kgrid: tuple[int, int, int],
     merged_x: bool = False,
+    layout: str = "legacy",
+    face_shape=None,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
+
+    ``layout``/``face_shape`` (2026-08-22): forwarded ONLY to the
+    projection tail (:func:`_make_project_ri_reduce_scatter`).  The FFT
+    convolution above it (``ifftn``/``fftn``/the fused ``gw_conv`` FFI
+    call) is layout-AGNOSTIC and unchanged either way: ``build_G``/
+    ``build_G_tau`` already return the SAME ``(nk, s, μ_X, s, μ_Y)``
+    G-tile shape/sharding under both layouts (``greens_function_kernel``'s
+    own module docstring), so the spatial convolution never sees a psi
+    operand at all — it is exactly the "convolution stays put" precedent
+    ``cohsex_sigma._make_cohsex_kernels`` already set for its own
+    ``_convolve`` closure, reused here rather than re-derived.
 
     This is the extension seam for alternate propagators and screened
     interactions.  GN-PPM and MPA construct their own ``G_k`` and ``W_q``;
@@ -277,7 +303,7 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x))
+           bool(merged_x), layout, face_shape)
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -299,7 +325,8 @@ def get_sigma_spatial_kernel(
         _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, _G_spec, norm='ortho')
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
-    project = _make_project_ri_reduce_scatter(mesh_xy, merged_x=merged_x)
+    project = _make_project_ri_reduce_scatter(
+        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape)
 
     @jax.jit
     def prep_w(W_q):
@@ -403,6 +430,7 @@ def _stack_channels(outs, mesh_xy: Mesh):
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
+    layout: str = "legacy", face_shape=None,
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
 
@@ -413,14 +441,15 @@ def _get_sigma_kij_kernel(
         length 1 by default): one G(τ) PER BRACKET, each contracted against
         the SAME ``prep_w(W_q)``, stacked on a new LEADING axis.
 
-    THE BRACKETS ARE STATIC SLICES, NOT MASKS.  A boolean mask would leave
-    every bracket's ``build_G_tau`` einsum contracting over all ``nb`` bands
-    with two thirds of them multiplied by zero — the band-side GEMM would
-    cost 3× with nothing to show for it.  Slicing makes the partition real:
-    each band's orbital outer product is formed exactly once across the
-    three brackets, so the G-build work is the same total as one full-band
-    run.  The bounds are Python ints baked into the trace, so this is still
-    ONE compiled program and ONE dispatch per τ.
+    THE BRACKETS ARE STATIC SLICES, NOT MASKS — under ``layout='legacy'``.
+    A boolean mask would leave every bracket's ``build_G_tau`` einsum
+    contracting over all ``nb`` bands with two thirds of them multiplied by
+    zero — the band-side GEMM would cost 3× with nothing to show for it.
+    Slicing makes the partition real: each band's orbital outer product is
+    formed exactly once across the three brackets, so the G-build work is
+    the same total as one full-band run.  The bounds are Python ints baked
+    into the trace, so this is still ONE compiled program and ONE dispatch
+    per τ.
 
     WHAT DOES NOT PARTITION, and why the feature is not free: ``G_k`` lives
     in the ISDF centroid basis, whose extent is ``N_μ`` — independent of how
@@ -429,15 +458,52 @@ def _get_sigma_kij_kernel(
     and three brackets pay them three times.  That 3× on the dominant term
     is the accepted price of the feature; see :class:`SpatialKernel` for the
     one part of it (``ifftn(W)``) that can be hoisted, and where it cannot.
+
+    ``layout='face'`` (2026-08-22): the two-face carrier's ``psi_mun``/
+    ``psi_nmu`` span the FULL [b0,b4) loaded extent and cannot legally be
+    SLICED to an arbitrary band sub-range — a legal face matrix must stay
+    mesh-divisible on both axes, and an arbitrary bracket edge is not
+    (report obstacle #3).  :func:`_bracketed_face` is the sibling bracket
+    loop for this layout: it never slices ψ — every bracket pays the FULL
+    nb_full G-build and the partition is expressed as a band-range MASK
+    intersected into ``mask_A`` instead ("weight, don't window", the same
+    fix ``build_G_tau``'s own ``mask``/``phases`` seam and
+    ``Wavefunctions.band_mask`` already use for this exact problem).  This
+    is a NAMED extra cost over legacy's disjoint-slice partition (bracket
+    count × the full G-build instead of one full-band G-build split into
+    disjoint pieces); the production ``head=full``/``gn_ppm`` deck this
+    port targets runs the trivial single-bracket plan, where the two loops
+    do the identical amount of work (one G-build covering every band
+    either way).  Also builds this layout's own ``distrib_la.gemm_plan``
+    for the G-build ONCE, here, at kernel-factory time — mirroring
+    ``cohsex_sigma._make_cohsex_kernels_face``'s identical G-plan
+    construction, never resolved inside the per-τ ``lax.scan``.
     """
+    if layout not in ("legacy", "face"):
+        raise ValueError(
+            f"_get_sigma_kij_kernel: layout must be 'legacy' or 'face', "
+            f"got {layout!r}")
+    if layout == "face" and face_shape is None:
+        raise ValueError(
+            "_get_sigma_kij_kernel(layout='face') requires "
+            "face_shape=(nk, nb_full, n_rmu, nspinor)")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
-           ffi_dial_key(), bool(merged_x), brackets)
+           ffi_dial_key(), bool(merged_x), brackets, layout, face_shape)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x)
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
+        layout=layout, face_shape=face_shape)
+
+    g_plan = None
+    if layout == "face":
+        from distrib_la import gemm_plan
+        nk_f, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
+        mu_s_f = n_rmu_f * ns_f
+        g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
+                           nq=nk_f, dtype=jnp.complex128)
 
     def _g_from_selector(xn, yr, E, sel, ref, t):
         # The A-side selector operand is dtype-dispatched (static at trace
@@ -456,8 +522,39 @@ def _get_sigma_kij_kernel(
         # about the other, so this dispatch stays dtype-only and the bracket
         # loop stays occupation-agnostic.
         if sel.dtype == jnp.bool_:
-            return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel)
-        return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel)
+            return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
+                               layout=layout, gemm=g_plan)
+        return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
+                           layout=layout, gemm=g_plan)
+
+    def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                        E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):
+        """Face sibling of :func:`_bracketed` — see this factory's own
+        docstring's ``layout='face'`` section.  ψ is never sliced; each
+        bracket narrows ``mask_A`` by a band-range predicate instead.
+        ``mask_A``'s LAST axis is always the band axis (both the ``(nk,
+        nb)`` and ``(1, nk, nb)`` shapes the legacy sibling's own comment
+        documents), so broadcasting a ``(nb_full,)`` predicate against it
+        is correct at either rank with no reshape."""
+        nb_full = int(mask_A.shape[-1])
+        idx = jnp.arange(nb_full)
+        outs = []
+        prev = None
+        for lo, hi in brackets:
+            if prev is not None:
+                (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                 E_A, mask_A, W_prep, prev) = jax.lax.optimization_barrier(
+                    (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                     E_A, mask_A, W_prep, prev))
+            hi_ = nb_full if hi is None else hi
+            in_range = (idx >= lo) & (idx < hi_)
+            mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
+                           else mask_A * in_range.astype(mask_A.dtype))
+            G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
+                         E_ref_A, t_node)
+            prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+            outs.append(prev)
+        return _stack_channels(outs, mesh_xy)
 
     def _bracketed(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                    E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):
@@ -522,13 +619,21 @@ def _get_sigma_kij_kernel(
                                E_ref_A, t_node)
                 return spatial.conv_project(
                     psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            return _bracketed(
+            bracket_loop = _bracketed_face if layout == "face" else _bracketed
+            return bracket_loop(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_prep,
                 _build_g, spatial.conv_project)
 
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
+
+    if layout == "face":
+        raise NotImplementedError(
+            "_get_sigma_kij_kernel(layout='face'): LORRAX_SIGMA_TAU_TIMING "
+            "stage-split diagnostic is not ported for the face carrier — "
+            "an opt-in profiling knob, not the production path; set "
+            "LORRAX_SIGMA_TAU_TIMING=0 (the default) under low_mem_bands.")
 
     build_g = jax.jit(_g_from_selector)
 
@@ -578,6 +683,8 @@ def _get_sigma_tau_kernel(
     kgrid: tuple[int, int, int],
     merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] = ((0, None),),
+    layout: str = "legacy",
+    face_shape=None,
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs.
 
@@ -596,6 +703,12 @@ def _get_sigma_tau_kernel(
     is built ONCE per τ above the bracket loop and shared by every bracket;
     that is the whole design and it is why this argument lives on the kernel
     rather than on its caller.
+
+    ``layout``/``face_shape`` (2026-08-22): forwarded verbatim to
+    :func:`_get_sigma_kij_kernel` — this wrapper's own body (the B-side
+    W(τ) synthesis, ``_build_W_t_q``) touches no ψ operand and needs no
+    layout dispatch of its own; B_q/Omega_q/mask_B are q-space PPM-pole
+    operators, unrelated to the psi carrier.
     """
 
     kgrid = tuple(int(x) for x in kgrid)
@@ -605,7 +718,7 @@ def _get_sigma_tau_kernel(
     # must match _get_sigma_kij_kernel's pipeline_key components exactly.
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
-                 ffi_dial_key(), bool(merged_x), brackets)
+                 ffi_dial_key(), bool(merged_x), brackets, layout, face_shape)
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -613,7 +726,9 @@ def _get_sigma_tau_kernel(
     q_mu_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     sigma_kij_kernel = _get_sigma_kij_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
                                              merged_x=merged_x,
-                                             brackets=brackets)
+                                             brackets=brackets,
+                                             layout=layout,
+                                             face_shape=face_shape)
 
     @jax.jit
     def _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi, E_ref_B, t_node):
@@ -732,6 +847,7 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
+    layout: str = "legacy", face_shape=None,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -741,18 +857,26 @@ def get_shared_sigma_tau_kernel(
     tile before that unchanged convolution.  It always uses the single
     complex projection carrier; HGL's missing sine arm is completed once by
     :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
+
+    This is the entry point ``gw.mpa.sigma`` calls (insulating MPA shares
+    this exact kernel with GN-PPM's merged Laplace plan — no bracket plan,
+    the MPA/shared-multipole ``brackets=None`` shape); ``layout``/
+    ``face_shape`` (2026-08-22) forward to :func:`_get_sigma_kij_kernel`
+    unchanged.
     """
     kgrid = tuple(int(x) for x in kgrid)
     from ffi import ffi_dial_key
 
-    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key())
+    key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
+           layout, face_shape)
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     sigma_kij = _get_sigma_kij_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
+        layout=layout, face_shape=face_shape)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,
@@ -823,27 +947,43 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
     # G builds and the output's leading extent), so it MUST be the same tuple
     # the runtime path passes or the AOT lowering warms a program the τ loop
     # never calls.
+    from .wavefunction_bundle import face_kernel_kwargs
+    face_kwargs = face_kernel_kwargs(wfns)
     tau_kernels = [
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
-                              brackets=brackets),
+                              brackets=brackets, **face_kwargs),
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
-                              brackets=brackets),
+                              brackets=brackets, **face_kwargs),
     ]
 
     s = wfns.slices
-    psi_coh_xn  = wfns.xn(s.full)
-    psi_coh_yr  = wfns.yr(s.full)
-    psi_proj_xr = wfns.xr(s.sigma)
-    psi_proj_yn = wfns.yn(s.sigma)
-    # Mesh-pad the QP band window EXACTLY as ``ppm_sigma._run_sigma_branch``
-    # does at runtime.  This is load-bearing twice over: the reduce-scatter
-    # projector asserts m % p_x == 0 / n % p_y == 0 (so an unpadded AOT
-    # lowering fires the guard here, which is where 7874338 died), and the AOT
-    # signature must match the runtime one shape-for-shape or pjit silently
-    # re-traces and the precompile buys nothing.
-    from .ppm_sigma import pad_sigma_window
-    psi_proj_xr, psi_proj_yn, _nb_real = pad_sigma_window(
-        psi_proj_xr, psi_proj_yn, mesh_xy)
+    if wfns.layout == "legacy":
+        psi_coh_xn  = wfns.xn(s.full)
+        psi_coh_yr  = wfns.yr(s.full)
+        psi_proj_xr = wfns.xr(s.sigma)
+        psi_proj_yn = wfns.yn(s.sigma)
+        # Mesh-pad the QP band window EXACTLY as
+        # ``ppm_sigma._run_sigma_branch`` does at runtime.  This is
+        # load-bearing twice over: the reduce-scatter projector asserts
+        # m % p_x == 0 / n % p_y == 0 (so an unpadded AOT lowering fires
+        # the guard here, which is where 7874338 died), and the AOT
+        # signature must match the runtime one shape-for-shape or pjit
+        # silently re-traces and the precompile buys nothing.
+        from .ppm_sigma import pad_sigma_window
+        psi_proj_xr, psi_proj_yn, _nb_real = pad_sigma_window(
+            psi_proj_xr, psi_proj_yn, mesh_xy)
+    else:
+        # Face carrier: psi_mun/psi_nmu span the FULL [b0,b4) extent and
+        # are used UNSLICED for both the "coh" (G-build) and "proj"
+        # (projection) roles under this layout — same operand identity
+        # ``ppm_sigma``'s own runtime path uses (see its module-level
+        # dispatch), and no ``pad_sigma_window`` call: nb_full is already
+        # mesh-divisible (BandSlices.b4's own invariant), unlike the
+        # legacy Σ window (b3-b0), so there is nothing to pad.
+        psi_coh_xn  = wfns.psi_mun
+        psi_coh_yr  = wfns.psi_nmu
+        psi_proj_xr = wfns.psi_nmu
+        psi_proj_yn = wfns.psi_mun
 
     # Representative non-ψ inputs — values don't matter for AOT, only
     # the full `(shape, dtype, sharding, committed-ness)` tuple must
