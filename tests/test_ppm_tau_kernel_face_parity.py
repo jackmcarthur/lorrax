@@ -11,7 +11,7 @@ Same reason for real multi-process CUDA -- ``layout='face'`` needs a real
 ``jax.process_count() < mesh.devices.size``) -- and the same CLI-vs-pytest
 dual entry point.
 
-    lx run -N 1 -G 4 -n 4 bash tmp/lm_dynsigma_run_wrap.sh \\
+    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
         tests/test_ppm_tau_kernel_face_parity.py --mesh 2x2
 
 Under plain pytest (one process) every case SKIPS rather than failing --
