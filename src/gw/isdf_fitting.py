@@ -307,15 +307,33 @@ def fit_zeta_to_h5(
 
         # Pseudobands: clamp weights to ``max(1, w_n)`` and apply them to
         # the centroid copies used for CCT.  When band_norms is None the
-        # slices are jnp.ones → the *_fit aliases are identical to the
+        # slices are jnp.ones → the *_fit values are identical to the
         # *_rmu_Y / *_rmuT_X copies.  See _band_norms_slice for the why.
         norms_l_jax = _band_norms_slice(band_norms, band_range_left, nb_left)
         norms_r_jax = _band_norms_slice(band_norms, band_range_right, nb_right)
         # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
-        psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l_jax[None, :, None, None]
-        psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l_jax[None, None, :, None]
-        psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r_jax[None, :, None, None]
-        psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r_jax[None, None, :, None]
+        #
+        # band_norms is None (no pseudobands -- the common/default case):
+        # dividing by an all-ones array is bit-identical to the dividend
+        # (IEEE754 x/1.0 == x), so the *_fit computation used to allocate a
+        # second, fully-redundant single-axis buffer beside its own source
+        # for no numerical benefit -- one of the four "ψ centroid copies"
+        # gflat_memory_model.py's psi_copies term prices, doubled again.
+        # ALIAS instead of computing: no new device buffer, and the
+        # `del ..._fit` cleanup below still frees the shared object once
+        # both names' refcounts drop (fresh-fit low-mem psi contract; see
+        # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md census row
+        # "Fresh centroid load/liveness").
+        if band_norms is None:
+            psi_l_rmu_Y_fit = psi_l_rmu_Y
+            psi_l_rmuT_X_fit = psi_l_rmuT_X
+            psi_r_rmu_Y_fit = psi_r_rmu_Y
+            psi_r_rmuT_X_fit = psi_r_rmuT_X
+        else:
+            psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l_jax[None, :, None, None]
+            psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l_jax[None, None, :, None]
+            psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r_jax[None, :, None, None]
+            psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r_jax[None, None, :, None]
         if band_norms is not None:
             n_weighted = int(np.sum(band_norms > 1.01))
             n_zero = int(np.sum(band_norms < 1e-10))
@@ -445,6 +463,27 @@ def fit_zeta_to_h5(
             from symmetry_maps import slice_q_full_to_ibz
             C_q_flat = slice_q_full_to_ibz(
                 C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+
+    # Fresh-fit low-mem psi contract (low_mem_bands census row "Fresh
+    # centroid load/liveness"; report gwjax_low_mem_bands_audit_2026-08-22).
+    # The Y-form centroid copies (mu on 'y', single-axis-sharded, bands
+    # replicated -- psi_{l,r}_rmu_Y[_fit]) were consumed ONLY by the CCT
+    # contraction just above.  Neither Cholesky (STEP 3, reads C_q_flat,
+    # not psi) nor the r-chunk loop (STEP 6, fit_one_rchunk reads only
+    # psi_{l,r}_rmuT_X_fit) touches them again.  Left alive, they used to
+    # sit as dead Python references for the whole Stage-C r-chunk loop --
+    # gflat_memory_model._persistent_bytes's "psi_copies" term prices
+    # exactly this (2 Y-form + 2 X-form single-axis copies) as resident
+    # for every stage, Stage C included.  Free them HERE, before that loop
+    # opens, dropping Stage C's own psi floor to the two X-forms alone.
+    # The base (pre-normalization) X arrays are ALSO superseded once
+    # *_fit exists (band_norms is not None: a real second copy; band_norms
+    # is None: an alias of the same object per STEP 1 above, so this
+    # second `del` is a no-op refcount drop, not a second free) --
+    # deleting both names is what actually reaches zero refcount.
+    del psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmu_Y_fit, psi_r_rmu_Y_fit
+    del psi_l_rmuT_X, psi_r_rmuT_X
+    gc.collect()
 
     # ========== STEP 3: Compute L_q from CCT ==========
     # μ_L=0 (charge): C_q is PSD → 2D-blocked Cholesky factor L_q.
