@@ -123,13 +123,11 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
 @pytest.mark.parametrize("rule_id, extra", [
     ("low_mem_bands_metal_material_class_unported",
      "head_correction = off\n" + _METAL_KEYS),
-    ("low_mem_bands_bispinor_unported",
-     "head_correction = off\nbispinor = true\n"),
     ("low_mem_bands_dynamic_ppm_unported",
      "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA;
     # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22;
-    # qp_solver=self_consistent LIFTED 2026-08-23 -- see the positive-twin
-    # matrix below.
+    # qp_solver=self_consistent LIFTED 2026-08-23; bispinor LIFTED (row
+    # DELETED) 2026-08-23 -- see the positive-twin matrix below.
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -184,6 +182,17 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "head_correction = off\ncompute_mode = cohsex\n",
     "head_correction = off\nbispinor = false\n",
     "head_correction = off\nrestart = true\n",
+    # bispinor, LIFTED 2026-08-23 (feat/transverse-zeta-face-2026-08-23,
+    # row DELETED per the same "delete, don't narrow" precedent as
+    # qp_solver=self_consistent's own lift): isdf.core.c_q_from_psi_sm/
+    # z_q_from_psi_sm(layout='face') now accept non-identity gamma_L/
+    # gamma_R via psi-endpoint application, gated on real 4-rank CUDA
+    # with all 15 non-identity Lorentz-index pairs at ns=4 (tests/
+    # test_isdf_cq_face_parity.py, tests/test_isdf_zq_face_parity.py),
+    # plus a real end-to-end MoS2 3x3 bispinor GN-PPM leg vs the
+    # low_mem_bands=false reference -- see gw_config._LOW_MEM_BANDS_
+    # REFUSALS' own history comment.
+    "head_correction = off\nbispinor = true\n",
     # GN-PPM/HL-PPM, LIFTED 2026-08-22 (feat/dynamic-sigma-face-port-
     # 2026-08-22) -- gated end to end on real 4-rank CUDA (algebra parity
     # + a real MoS2 k6_c50 leg vs the legacy gn_ppm reference; a larger
@@ -267,7 +276,7 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 3, (
+    assert len(ids) == 2, (
         "the table grew or shrank -- update this test AND the docs "
         "envelope table in docs/input_reference.md together")
     for row in _LOW_MEM_BANDS_REFUSALS:
