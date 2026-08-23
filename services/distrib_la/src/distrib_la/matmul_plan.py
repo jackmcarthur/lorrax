@@ -87,6 +87,67 @@ one) measured within noise of two separate calls at both scales — this
 surface's own ``jnp.transpose`` bridging to cuBLASMp's column-major FFI
 compiles to a bitcast (free), so neither is a layout problem to chase
 here.
+
+Composition inside a MANUAL-mode ``shard_map``
+------------------------------------------------
+:meth:`GemmPlan.__call__` cannot be invoked from inside somebody else's
+manual-mode ``shard_map`` body.  It is not a missing feature of cuBLASMp —
+it is a shape/contract mismatch, investigated and confirmed 2026-08-22
+(the ζ-fit r-chunk port, ``isdf.core._z_q_face``,
+``docs/architecture/zeta_fit_face_psi_cct.md``'s r-chunk section):
+``__call__`` (via ``_build_kernel``) is itself a top-level ``jax.jit``
+wrapping its OWN ``shard_map(mesh=..., in_specs=P(None,'x','y'))`` — it
+expects GLOBALLY-sharded ``jax.Array`` operands carrying a declared
+``NamedSharding`` and performs its own manual-mode entry.  A caller who is
+ALREADY inside a manual-mode ``shard_map`` over the SAME mesh axes (e.g. a
+streaming ``lax.scan`` kernel doing its own ``all_to_all``/``all_gather``)
+holds bare, un-annotated LOCAL tiles with no global shape — re-entering
+``shard_map`` over axes that are already manual there is not expressible
+in JAX's shard_map model, and even if it were, ``__call__``'s shape check
+would refuse the local tile's shape as not matching the declared global
+one.
+
+The FFI call itself has no such restriction.  Every wrapper this package
+has for a distributed FFI operation (``_cusolvermp.py``,
+``matmul_plan.py``'s own ``_build_kernel``) already follows the same
+two-part shape: a ``shard_map`` that does nothing but hand the body its
+LOCAL per-rank tile, and a body — the transpose/``ffi_call``/transpose
+sequence below — that is pure local computation plus one collective FFI
+custom-call (the cuBLASMp handler does its OWN NCCL communication across
+the mesh via ``ctx_handle``, entirely inside the C++ layer; no JAX-level
+collective wraps it).  That body needs nothing from ``shard_map`` except
+being handed the right-shaped local array — which is exactly what a
+caller's OWN manual-mode body already has in hand.  So the obstacle is the
+WRAPPER, exactly as hypothesized: :meth:`GemmPlan.local_call` is the same
+body, exposed directly, with no nested ``shard_map`` and no separate
+``jax.jit`` of its own — call it inline from inside your own manual
+``shard_map``/``lax.scan``.  Proven on real 4-rank CUDA inside a manual
+``shard_map`` + ``lax.scan``: ``check_gemm_plan_manual_shard_map`` in
+``services/distrib_la/tests/test_distrib_la_multiproc.py``.
+
+Descriptor/workspace lifetime (the owner's stated concern) is a non-issue
+for this route: ``batched_gemm_ffi.cc`` builds and destroys its
+``cublasMpMatrixDescriptor``/``cublasMpMatmulDescriptor`` handles FRESH on
+every FFI invocation (``BatchedGemmImpl``, read 2026-08-22) — the only
+state persisting across calls is ``ctx`` itself (the NCCL communicator +
+growable workspace buffer), addressed by the SAME ``ctx_handle`` integer
+:func:`gemm_plan` already resolved once, baked as a static attr into
+whichever call issues it.  A ``local_call`` invocation and an ``__call__``
+invocation of the same plan therefore share the identical warmed
+communicator; there is nothing further to warm for the manual route.
+
+This does NOT make every manual-mode local contraction a GEMM
+opportunity.  ``local_call`` produces a genuinely 2-D-distributed output —
+``D`` at ``P(None,'x','y')``, sharded on BOTH mesh axes, matching its
+inputs — because that is what SUMMA computes.  A manual kernel that needs
+a mesh-axis-REPLICATED result instead (every rank holding the full
+answer, not its own tile) is asking for a different communication
+primitive — an all-gather/broadcast, which ``jax.lax.psum``/
+``all_gather`` already provide at their own, typically lower, cost — and
+wrapping a broadcast in extra GEMM FLOPs would not help it.
+``isdf.core._z_q_face``'s masked-``psum('y')`` X-operand reconstruction is
+exactly this second case: see that function's own docstring for the
+shape mismatch that keeps it on ``psum``, not GEMM.
 """
 from __future__ import annotations
 
@@ -143,27 +204,13 @@ def _same_layout(have, want: NamedSharding) -> bool:
             and getattr(have, "mesh", None) == want.mesh)
 
 
-def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
-                  ctx_handle, with_c: bool) -> Callable:
-    """The uncompiled shard_map+ffi_call N,N GEMM body for one exact shape.
-
-    Mirrors ``distrib_la.matmul._cublasmp``'s column-major-transpose /
-    ``ctx_handle`` / attrs convention — the only cuBLASMp GEMM FFI wrapper
-    in this package — specialised to N,N and to this module's
-    eager-warm-then-call lifecycle instead of ``matmul()``'s per-call
-    resolve-and-cache.  The two are cross-checked numerically on real
-    multi-rank CUDA (``test_distrib_la_matmul_plan_multiproc.py``) rather
-    than sharing code, because ``_cublasmp`` also has to carry transa/
-    transb generality this module deliberately does not.
-
-    ``with_c=True``: ``fn(a, b, c) -> d``, ``c`` DONATED as the FFI output
-    buffer (matches ``matmul()``'s own ``donate_argnums=(2,)``).
-    ``with_c=False``: ``fn(a, b) -> d``, beta forced to 0 and the zero-C
-    addend is built with ``jnp.zeros`` INSIDE this same traced function —
-    one compiled program, not two.  See the module docstring "Output
-    liveness".
-    """
-    attrs = dict(
+def _gemm_attrs(*, px, py, nq, m, k, n, alpha, beta, ctx_handle,
+                with_c: bool) -> dict:
+    """The FFI attrs dict for one exact N,N shape — the SINGLE place this
+    package computes it, shared by the auto-mode (``_build_kernel``) and
+    manual-mode (``GemmPlan.local_call``) entry points so the two routes
+    cannot drift apart on block sizes or leading dimensions."""
+    return dict(
         nq=nq, m=m, n=n, k=k,
         mb_a=m // px, nb_a=k // py, mb_b=k // px, nb_b=n // py,
         mb_c=m // px, nb_c=n // py,
@@ -173,29 +220,91 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
         beta_re=float(beta.real) if with_c else 0.0,
         beta_im=float(beta.imag) if with_c else 0.0,
         ctx_handle=int(ctx_handle))
+
+
+def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool):
+    """The bare transpose/``ffi_call``/transpose body — LOCAL per-rank
+    tiles in, LOCAL per-rank tile out, no ``shard_map`` and no ``jax.jit``
+    of its own.  This is the whole GEMM: everything above it (a
+    ``shard_map`` in ``_build_kernel``, or nothing at all in
+    :meth:`GemmPlan.local_call`) exists only to get the caller a
+    correctly-shaped local tile to pass in, not to make this body correct.
+    Safe to call directly from inside an ALREADY-manual ``shard_map``
+    trace — see the module docstring, "Composition inside a MANUAL-mode
+    shard_map".
+    """
+    at, bt = (jnp.transpose(x, (0, 2, 1)) for x in (a, b))
+    ct = (jnp.transpose(c, (0, 2, 1)) if with_c
+          else jnp.zeros(out_t.shape, dtype=out_t.dtype))
+    dt = jax.ffi.ffi_call(
+        _TARGETS["cublasmp"], out_t,
+        input_output_aliases={2: 0})(at, bt, ct, **attrs)
+    return jnp.transpose(dt, (0, 2, 1))
+
+
+def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
+                  ctx_handle, with_c: bool) -> Callable:
+    """The uncompiled shard_map+ffi_call N,N GEMM body for one exact shape
+    — the AUTO-mode entry point (``GemmPlan.__call__``): the caller hands
+    in GLOBALLY-sharded operands, this ``shard_map`` extracts the local
+    tile, and :func:`_local_gemm_call` does the actual work.
+
+    Mirrors ``distrib_la.matmul._cublasmp``'s column-major-transpose /
+    ``ctx_handle`` / attrs convention — the only other cuBLASMp GEMM FFI
+    wrapper in this package — specialised to N,N and to this module's
+    eager-warm-then-call lifecycle instead of ``matmul()``'s per-call
+    resolve-and-cache.  The two are cross-checked numerically on real
+    multi-rank CUDA (``check_gemm_plan_cublasmp`` in
+    ``test_distrib_la_multiproc.py``) rather than sharing code, because
+    ``_cublasmp`` also has to carry transa/transb generality this module
+    deliberately does not.
+
+    ``with_c=True``: ``fn(a, b, c) -> d``, ``c`` DONATED as the FFI output
+    buffer (matches ``matmul()``'s own ``donate_argnums=(2,)``).
+    ``with_c=False``: ``fn(a, b) -> d``, beta forced to 0 and the zero-C
+    addend is built with ``jnp.zeros`` INSIDE this same traced function —
+    one compiled program, not two.  See the module docstring "Output
+    liveness".
+    """
+    attrs = _gemm_attrs(px=px, py=py, nq=nq, m=m, k=k, n=n, alpha=alpha,
+                        beta=beta, ctx_handle=ctx_handle, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), dtype)
 
     if with_c:
         @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
                  out_specs=P(None, "x", "y"), check_vma=False)
         def _local(a, b, c):
-            at, bt, ct = (jnp.transpose(x, (0, 2, 1)) for x in (a, b, c))
-            dt = jax.ffi.ffi_call(
-                _TARGETS["cublasmp"], out_t,
-                input_output_aliases={2: 0})(at, bt, ct, **attrs)
-            return jnp.transpose(dt, (0, 2, 1))
+            return _local_gemm_call(a, b, c, attrs=attrs, out_t=out_t,
+                                    with_c=True)
         return _local
 
     @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 2,
              out_specs=P(None, "x", "y"), check_vma=False)
     def _local(a, b):
-        at, bt = (jnp.transpose(x, (0, 2, 1)) for x in (a, b))
-        c0 = jnp.zeros(out_t.shape, dtype=out_t.dtype)
-        dt = jax.ffi.ffi_call(
-            _TARGETS["cublasmp"], out_t,
-            input_output_aliases={2: 0})(at, bt, c0, **attrs)
-        return jnp.transpose(dt, (0, 2, 1))
+        return _local_gemm_call(a, b, None, attrs=attrs, out_t=out_t,
+                                with_c=False)
     return _local
+
+
+def _check_local_operand(plan: "GemmPlan", label: str, x,
+                         shape: tuple[int, int, int]) -> None:
+    """Shape/dtype check for :meth:`GemmPlan.local_call`'s bare LOCAL
+    tiles.  No sharding check: a manual-mode local value carries no
+    meaningful global ``NamedSharding`` to compare against — the mesh
+    itself is the caller's responsibility (see ``local_call``'s
+    docstring)."""
+    xshape = getattr(x, "shape", None)
+    if xshape is None or tuple(int(s) for s in xshape) != shape:
+        raise ValueError(
+            f"gemm_plan.local_call {label}: expected LOCAL tile shape "
+            f"{shape} (this plan's (nq, extent/px_or_py) split — see "
+            f"local_call's docstring, not the global (nq,m,k)-class "
+            f"shape __call__ takes); got "
+            f"{None if xshape is None else tuple(xshape)}")
+    if jnp.dtype(x.dtype) != plan.dtype:
+        raise TypeError(
+            f"gemm_plan.local_call {label}: expected dtype {plan.dtype}; "
+            f"got {x.dtype}")
 
 
 def _check_operand(plan: "GemmPlan", label: str, x, shape: tuple[int, int, int],
@@ -248,6 +357,7 @@ class GemmPlan:
     in_sharding_a: NamedSharding
     in_sharding_b: NamedSharding
     out_sharding: NamedSharding
+    ctx_handle: int
     _fn_with_c: Callable
     _fn_no_c: Callable | None
 
@@ -307,6 +417,72 @@ class GemmPlan:
         _check_operand(self, "C/out", c_or_out, (self.nq, self.m, self.n),
                       self.out_sharding)
         return self._fn_with_c(A, B, c_or_out)
+
+    def local_call(self, A, B, C=None, *, out=None):
+        """The SAME planned N,N GEMM as :meth:`__call__`, callable from
+        INSIDE a manual-mode ``shard_map`` — the composition ``__call__``
+        cannot do (module docstring, "Composition inside a MANUAL-mode
+        shard_map").
+
+        Precondition, entirely on the caller: this must be invoked from
+        the body of a ``shard_map(mesh=plan.mesh, ...)`` whose manual axes
+        include ``'x'`` and ``'y'`` — the exact mesh this plan was built
+        on.  ``A``/``B``/``C``/``out`` are then the BARE LOCAL tiles that
+        body already holds, not global ``jax.Array``s:
+
+            A : (nq, m // px, k // py)
+            B : (nq, k // px, n // py)
+            C, out : (nq, m // px, n // py)
+
+        (``px, py = plan.mesh.shape['x'], plan.mesh.shape['y']``.)  No
+        ``NamedSharding``/global-shape check is possible or attempted on
+        these — only shape and dtype, against the LOCAL split derived from
+        the plan.  Getting the ambient mesh wrong (a different mesh
+        object, a transposed axis order, more or fewer manual axes) is not
+        detectable here; it was already the caller's own manual
+        ``shard_map`` contract before this method existed.
+
+        No ``jax.jit`` and no ``shard_map`` of its own: this traces as
+        ordinary ops inside whatever outer ``jax.jit``/``lax.scan`` is
+        already tracing the caller, exactly like every other primitive
+        (``jnp.take``, ``lax.psum``, an ``io_callback``) a manual kernel
+        body already calls directly.  Same C/out mutual exclusion, same
+        beta-gated ``out=`` refusal, same donated-buffer semantics as
+        :meth:`__call__` — see that method's docstring for the shared
+        contract; only the operand SHAPES differ (local tile vs. global
+        array).
+        """
+        if C is not None and out is not None:
+            raise ValueError("gemm_plan.local_call: pass C or out, not both")
+        if out is not None and self.beta != 0:
+            raise ValueError(
+                "gemm_plan.local_call: out= is only a content-ignored "
+                f"donation on a beta==0 plan (this plan's beta={self.beta})"
+                ".  Pass C= instead, where the accumulate is explicit at "
+                "the call site.")
+        px, py = _mesh_shape(self.mesh)
+        _check_local_operand(self, "A", A, (self.nq, self.m // px, self.k // py))
+        _check_local_operand(self, "B", B, (self.nq, self.k // px, self.n // py))
+        c_or_out = C if C is not None else out
+        out_t = jax.ShapeDtypeStruct(
+            (self.nq, self.n // py, self.m // px), self.dtype)
+        if c_or_out is None:
+            if self.beta != 0:
+                raise ValueError(
+                    "gemm_plan.local_call: C is required when beta != 0 "
+                    f"(this plan's beta={self.beta})")
+            attrs = _gemm_attrs(px=px, py=py, nq=self.nq, m=self.m, k=self.k,
+                                n=self.n, alpha=self.alpha, beta=self.beta,
+                                ctx_handle=self.ctx_handle, with_c=False)
+            return _local_gemm_call(A, B, None, attrs=attrs, out_t=out_t,
+                                    with_c=False)
+        _check_local_operand(self, "C/out", c_or_out,
+                             (self.nq, self.m // px, self.n // py))
+        attrs = _gemm_attrs(px=px, py=py, nq=self.nq, m=self.m, k=self.k,
+                            n=self.n, alpha=self.alpha, beta=self.beta,
+                            ctx_handle=self.ctx_handle, with_c=True)
+        return _local_gemm_call(A, B, c_or_out, attrs=attrs, out_t=out_t,
+                                with_c=True)
 
 
 def gemm_plan(
@@ -447,4 +623,5 @@ def gemm_plan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
         alpha=alpha_c, beta=beta_c,
         in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
-        out_sharding=out_sharding, _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
+        out_sharding=out_sharding, ctx_handle=int(ctx_handle),
+        _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
