@@ -1011,14 +1011,78 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    key = ("head_s", id(mesh), int(nb_logical))
+def _interband_degenerate_weight(
+    dE, f_diff, z, s_avg, prefactor, near_degenerate, *, include_surface: bool,
+):
+    r"""Adler-Wiser interband weight, continuous through ``dE -> 0``.
+
+    ``prefactor * f_diff / (dE * (z**2 - dE**2))`` has a removable
+    singularity at ``dE = 0`` for FIXED, nonzero ``z``: by l'Hopital on the
+    numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
+    ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
+    caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
+    mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
+    limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
+    ``_fractional_pair_scan`` already takes for its own ``z=0`` diagonal
+    limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
+    is ``+`` rather than ``-`` because this module's ``f_diff`` is built
+    ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical
+    limit, opposite index convention).  The ``z``-dependence keeps its
+    finite-``z`` form throughout: only ``dE`` is taken to a limit, never
+    ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
+    different singularity and is untouched by this branch.
+
+    ``s_avg`` (``0.5*(s_bra+s_ket)``) and ``near_degenerate`` (the
+    resolution-scaled ``|dE|`` test) are precomputed by the caller,
+    already broadcast to ``dE``'s shape: neither depends on ``omega``, so
+    hoisting them out of the inner per-frequency closure avoids
+    recomputing a comparison already fixed by the band-pair tile alone.
+
+    ``include_surface`` is a plain Python ``bool``, closed over at trace
+    time by the caller (its kernel factory already keys its compilation
+    cache on it): when ``False`` -- no ``-f'`` data, i.e. every insulating
+    or fixed-occupation deck -- this compiles to EXACTLY the pre-fix
+    ``jnp.where(|denom|>1e-16, regular, 0)`` body; the degenerate branch
+    is never lowered into that HLO graph and ``s_avg``/``near_degenerate``
+    are unused (may be ``None``).
+
+    SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
+    is ``_s_tensor_kernel``'s ONLY; the wing kernels
+    (``_head_wing_kernel_legacy``/``_face``) build a structurally
+    DIFFERENT ``F_ij = pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
+    power of ``dE`` (documented explicitly in ``head_wings_sharded``'s own
+    docstring), because a wing pairs one velocity leg with one
+    dimension-1-in-energy density vertex where the head pairs two
+    velocity legs.  At fixed nonzero ``z``, THAT formula is already
+    continuous as ``dE -> 0`` (``f_diff -> 0`` at the same order as the
+    numerator, no compensating ``dE`` in the denominator to cancel), so
+    its own ``|denom|>1e-16`` clip is not this same defect -- it guards a
+    ``z ~= dE`` resonance, a different singularity this helper does not
+    address.  Do not reuse this helper there without rederiving the limit.
+    """
+    denom = dE * (z * z - dE * dE)
+    zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
+    regular = prefactor * f_diff / denom
+    clipped = jnp.where(jnp.abs(denom) > 1.0e-16, regular, zero)
+    if not include_surface:
+        return clipped
+    z_ok = jnp.abs(z) > 1.0e-15
+    degenerate = prefactor * s_avg / (z * z)
+    return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+
+
+def _s_tensor_kernel(
+    mesh: Mesh, *, nb_logical: int, include_surface: bool = False,
+) -> Callable:
+    key = ("head_s", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta):
+    def _local(
+        v_local, e_bra, e_ket, f_bra, f_ket, s_bra, s_ket, omegas, prefactor, eta,
+    ):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -1031,13 +1095,26 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         # occupation difference.  The historical 0/1 path is unchanged
         # because its energy-ordered nonzero differences are positive.
         transition = logical & (dE > 0.0)
+        if include_surface:
+            scale = jnp.maximum(
+                1.0,
+                jnp.maximum(jnp.abs(e_bra)[:, :, None], jnp.abs(e_ket)[:, None, :]),
+            )
+            near_degenerate = (
+                jnp.abs(dE) <= 64.0 * jnp.finfo(jnp.float64).eps * scale)
+            s_avg = 0.5 * (s_bra[:, :, None] + s_ket[:, None, :])
+        else:
+            near_degenerate = None
+            s_avg = None
 
         def _one(omega):
             z = omega + 1j * eta
-            denom = dE * (z * z - dE * dE)
             weight = jnp.where(
-                transition & (jnp.abs(denom) > 1.0e-16),
-                prefactor * f_diff / denom,
+                transition,
+                _interband_degenerate_weight(
+                    dE, f_diff, z, s_avg, prefactor, near_degenerate,
+                    include_surface=include_surface,
+                ),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
             local = jnp.einsum(
@@ -1079,6 +1156,8 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         mesh=mesh,
         in_specs=(
             P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
             P(None, "x"),
             P(None, "y"),
             P(None, "x"),
@@ -2191,12 +2270,16 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    interband = _s_tensor_kernel(
+        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
+    )(
         v,
         e,
         e,
         f,
         f,
+        surface,
+        surface,
         omega,
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
