@@ -86,39 +86,41 @@ def _integrate_sigma_batches(
         # Face carrier (2026-08-22, mechanical port sharing
         # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
         # branch's identically-shaped docstring): psi_mun/psi_nmu are used
-        # UNSLICED for both roles; the accumulator runs at the mesh-
-        # divisible nb_full extent and the caller strips to nb_sigma at
-        # the end (any extent is a valid host slice).  MPA's own
-        # sharded-output tail (unlike GN-PPM's replicated default) is NOT
-        # ported for this layout — see ppm_sigma.compute_sigma_c_ppm_
-        # omega_grid's identical refusal; this executor always publishes
-        # a sharded P(None,None,'x','y') array, so a face caller here
-        # would need that same tail fixed first.  Reachability today: this
-        # whole function refuses at the deck-config seam
-        # (low_mem_bands_dynamic_ppm_unported), so this arm is exercised
-        # only by a direct unit-level caller, not by any production path.
-        if int(s.nb_sigma) != int(s.nb_full):
-            # This executor's output is ALWAYS a device-sharded array
-            # (DeviceOmegaAccumulator.finalize(), never gathered to
-            # host/replicated the way ppm_sigma's default replicated
-            # layout is) — stripping a genuinely sharded array to a
-            # sub-extent that does not divide the mesh breaks its own
-            # declared sharding (the exact defect
-            # assert_sharded_sigma_window_divides_mesh exists to name).
-            # Unreachable today (low_mem_bands_dynamic_ppm_unported still
-            # refuses every compute_mode this function serves); refused
-            # explicitly here too rather than left to surface as a
-            # confusing downstream sharding error if that changes.
-            raise NotImplementedError(
-                "_integrate_sigma_batches(layout='face'): the Σ window "
-                f"(nb_sigma={int(s.nb_sigma)}) is narrower than the loaded "
-                f"extent (nb_full={int(s.nb_full)}) — MPA's sharded-output "
-                "final strip is not ported for that case under "
-                "low_mem_bands = true.  Unsplit decks (nb_sigma == "
-                "nb_full) are unaffected.")
+        # UNSLICED for both roles — the accumulator BUILDS at the mesh-
+        # divisible nb_full extent regardless of nb_sigma, and always
+        # will: contract_bands.contract_bands_block_reshard's face arm
+        # (_face_project_kernel) builds its two distrib_la.gemm_plans
+        # EAGERLY at the fixed face_shape width (nb_full), shared with
+        # this same kernel's "coh"/G-build plan, so narrowing psi_proj's
+        # INPUT width would desync it from a plan compiled for nb_full —
+        # not this executor's call to make without reopening
+        # contract_bands.py's shared GEMM-plan contract (report §5: "do
+        # not fork ... a second Sigma projector").
+        #
+        # THE FIX (2026-08-23): the part that genuinely must land at
+        # nb_sigma is the OUTPUT — Sigma_c(omega,k,m,n)'s own (m,n) axes
+        # — not the input.  strip_sigma_window's device-array arm now
+        # applies wavefunction_bundle.pack_band_window's OWN mechanism
+        # (jax.lax.slice_in_dim + jax.lax.with_sharding_constraint) to
+        # those trailing axes in place of the numpy-style slice that is
+        # illegal on a mesh-sharded axis — the output-side analog of that
+        # primitive's input-side repack, reusing its idiom rather than
+        # inventing a second one.  That mechanism is legal ONLY when the
+        # target extent already divides the mesh (with_sharding_
+        # constraint requires it); an indivisible Σ window is the
+        # genuinely impossible sub-case and is refused by name, by the
+        # SAME shared owner the legacy branch above calls
+        # (assert_sharded_sigma_window_divides_mesh — "ONE owner for a
+        # contract two ansaetze reach at the same seam").  Reachability:
+        # low_mem_bands_dynamic_ppm_unported still refuses every
+        # compute_mode this function serves pending its own end-to-end
+        # gate (gw_config.py), so this arm is exercised by the parity
+        # tests and that gate, not yet by a general production path.
+        nb_real = int(s.nb_sigma)
+        assert_sharded_sigma_window_divides_mesh(
+            nb_real, mesh_xy, ansatz="compute_mode = mpa")
         psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
         psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        nb_real = int(s.nb_sigma)
         shape = (omega.size, int(meta.nk_tot), int(s.nb_full), int(s.nb_full))
     output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     accumulator = DeviceOmegaAccumulator(
@@ -171,7 +173,8 @@ def _integrate_sigma_batches(
             n_sweeps += 1
         del B, Omega
 
-    sigma = strip_sigma_window(accumulator.finalize(), nb_real)
+    sigma = strip_sigma_window(
+        accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
     print_fn(f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
              f"({n_poles} poles, batches of {batch_size})")
     return SigmaOmegaResult(

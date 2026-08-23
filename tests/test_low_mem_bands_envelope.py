@@ -42,9 +42,31 @@ for job ids.  A larger k6_c600 (mu=5282) confirmation of the same
 combination hit a pre-existing, unrelated ``qsgw_head.py`` OOM
 (``claims/0436.md``) before reaching this port's own code; production-
 scale confirmation remains open follow-up work.  ``mpa/sigma.py``
-(insulating MPA) was mechanically ported the same session but is NOT
-end-to-end gated, so the row STAYS for ``compute_mode = mpa`` — see that
-module's own comment.
+(insulating MPA) was mechanically ported the same session but was NOT
+end-to-end gated then, so the row STAYED for ``compute_mode = mpa``.
+
+**The row is now DELETED (2026-08-23, feat/mpa-executor-face-gate-
+2026-08-23, ``claims/0443.md``), not narrowed further**: ``mpa/sigma.
+_integrate_sigma_batches``' own named gap (a split Σ window, ``nb_sigma
+!= nb_full``) is fixed — ``strip_sigma_window`` gained a device-array arm
+reusing ``wavefunction_bundle.pack_band_window``'s slice+reshard
+mechanism on Σ_c's own trailing axes — and gated end to end (real 4-rank
+CUDA mesh-aware parity, ``tests/test_mpa_sigma_split_window_strip.py``,
+5/5 bit-exact; a real fresh one-shot insulating MPA leg with a genuine
+split window, eqp0/eqp1 max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face).
+Insulating ``compute_mode = mpa`` moves to the positive-twin matrix
+below.  ``mpa_material_class = metal`` remains refused, but by
+``low_mem_bands_metal_material_class_unported`` ALONE — a metal-only-
+narrowed dynamic_ppm row was drafted and then deleted rather than kept,
+because a metal deck's predicate is a strict subset of (and, given
+``_validate_metal_compute_mode``'s standing invariant, logically
+equivalent to) the metal row's own predicate, which appears earlier in
+the table and always fires first: a second row with an unreachable
+predicate is exactly the "gate that cannot fail" shape ``TASTE.md``
+warns against, so it was not shipped.  See ``gw_config.py``'s own comment
+at the deletion site, and the metal row's own updated comment for why
+metal MPA itself stays refused (three named infra obstacles this
+session, none of them in ``gw.mpa.sigma``'s own code).
 
 ``low_mem_bands_self_consistent_unported`` — LIFTED 2026-08-23 (feat/qsgw-
 face-rotations-2026-08-23), same shape as the ``head_correction=full`` lift
@@ -123,8 +145,14 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
 @pytest.mark.parametrize("rule_id, extra", [
     ("low_mem_bands_metal_material_class_unported",
      "head_correction = off\n" + _METAL_KEYS),
-    ("low_mem_bands_dynamic_ppm_unported",
-     "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA;
+    # low_mem_bands_dynamic_ppm_unported DELETED 2026-08-23 (feat/
+    # mpa-executor-face-gate-2026-08-23): insulating compute_mode = mpa
+    # is now supported (positive-twin matrix below); metal MPA is caught
+    # by the row above ALONE, since mpa_material_class == 'metal'
+    # implies compute_mode == mpa (_validate_metal_compute_mode) and so
+    # is a strict subset of that row's own predicate -- a second,
+    # metal-only-narrowed dynamic_ppm row would never be reached (see
+    # gw_config.py's own comment at the deletion site).
     # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22;
     # qp_solver=self_consistent LIFTED 2026-08-23; bispinor LIFTED (row
     # DELETED) 2026-08-23 -- see the positive-twin matrix below.
@@ -150,12 +178,14 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     wfns.psi_nmu/psi_mun, so the former
     low_mem_bands_head_correction_full_unported row is deleted per its own
     recorded lift condition.  A bare ``low_mem_bands = true`` deck with a
-    STATIC Sigma channel must resolve with no head refusal.  GN-PPM at the
-    bare default (head_correction=full) is ALSO now the fully-supported
-    shipping-default deck under low_mem_bands (feat/dynamic-sigma-face-
-    port-2026-08-22 -- gated end to end, see this file's module
-    docstring); a genuinely unported dynamic mode (MPA) still refuses, via
-    the DYNAMIC row, not a head row."""
+    STATIC Sigma channel must resolve with no head refusal.  GN-PPM and
+    insulating MPA at the bare default (head_correction=full) are BOTH now
+    fully-supported shipping-default decks under low_mem_bands
+    (feat/dynamic-sigma-face-port-2026-08-22 and feat/mpa-executor-
+    face-gate-2026-08-23 -- both gated end to end, see this file's module
+    docstring); only mpa_material_class = metal still refuses, via the
+    METAL row, not a head or dynamic-mode row (that row was deleted --
+    see gw_config.py's own comment at the deletion site)."""
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = cohsex\n")
@@ -164,10 +194,12 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
         cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = gn_ppm\n")
         assert cfg.head.correction.value == "full"
     with tempfile.TemporaryDirectory() as d:
-        with pytest.raises(ValueError, match="low_mem_bands_dynamic_ppm_unported"):
-            _config(pathlib.Path(d),
-                   "low_mem_bands = true\nhead_correction = off\n"
-                   "compute_mode = mpa\n")
+        cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = mpa\n")
+        assert cfg.head.correction.value == "full"
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(
+                ValueError, match="low_mem_bands_metal_material_class_unported"):
+            _config(pathlib.Path(d), "low_mem_bands = true\n" + _METAL_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +247,21 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     # session's CLAIMS.md row.  Same shape as the fixed_point row above,
     # covering the bare shipping default (head_correction left at 'full').
     "compute_mode = gn_ppm\nqp_solver = self_consistent\n",
+    # Insulating compute_mode = mpa, LIFTED 2026-08-23 (feat/mpa-executor-
+    # face-gate-2026-08-23, low_mem_bands_dynamic_ppm_unported DELETED):
+    # gw.mpa.sigma._integrate_sigma_batches' named split-Sigma-window gap
+    # (nb_sigma != nb_full, the ordinary case) is fixed --
+    # strip_sigma_window's new mesh-aware device-array arm reuses
+    # wavefunction_bundle.pack_band_window's own slice+reshard mechanism
+    # on Sigma_c's own trailing axes.  Gated on real 4-rank CUDA (mesh-
+    # aware strip_sigma_window parity, tests/
+    # test_mpa_sigma_split_window_strip.py, 5/5 bit-exact) and a real
+    # end-to-end fresh one-shot Si_scalar MPA leg with a genuine split
+    # window (nb_sigma=8 < nb_full=20): eqp0.dat max|dE_QP|=6.510e-05 eV,
+    # eqp1.dat max|dE_QP|=8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy
+    # vs face (claims/0443.md).  head_correction left at its bare default
+    # (full) here deliberately, same reasoning as the gn_ppm row above.
+    "compute_mode = mpa\n",
 ])
 def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     """The other half of a refusal matrix: what it does NOT refuse.
@@ -222,14 +269,15 @@ def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     scalar/spinor, one-shot insulator (qp_solver=one_shot_dft) OR
     qp_solver=fixed_point with a dynamic compute_mode, head_correction=
     off|no_local_fields|full (the bare default), standard chi0, EVERY
-    Sigma channel except MPA (x_only, COHSEX, GN-PPM, HL-PPM), restart —
-    none of these should trip a rule the moment low_mem_bands=true is
-    added beside them.
+    Sigma channel including insulating MPA (x_only, COHSEX, GN-PPM,
+    HL-PPM, MPA), restart — none of these should trip a rule the moment
+    low_mem_bands=true is added beside them.
 
-    Insulating MPA is still refused (compute_mode = mpa's own
-    mechanical face port has no end-to-end gate yet — see gw.mpa.sigma's
-    own comment); it stays in the red-twin matrix above under
-    low_mem_bands_dynamic_ppm_unported.
+    Metal MPA is still refused (mpa_material_class = metal's own
+    self-consistent-driver prerequisite hit three named infra obstacles
+    this session — see gw.mpa.sigma's own comment and gw_config.py's
+    metal row); it stays in the red-twin matrix above under
+    low_mem_bands_metal_material_class_unported.
     """
     config = _config(tmp_path, "low_mem_bands = true\n" + extra)
     assert config.memory.low_mem_bands is True
@@ -276,9 +324,14 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 2, (
+    assert len(ids) == 1, (
         "the table grew or shrank -- update this test AND the docs "
-        "envelope table in docs/input_reference.md together")
+        "envelope table in docs/input_reference.md together. "
+        "(2026-08-23: low_mem_bands_dynamic_ppm_unported DELETED -- "
+        "insulating MPA lifted, and metal MPA's predicate is a strict "
+        "subset of low_mem_bands_metal_material_class_unported's own, "
+        "which fires first, so a metal-narrowed dynamic_ppm row would "
+        "be unreachable; see gw_config.py's own comment.)")
     for row in _LOW_MEM_BANDS_REFUSALS:
         rule_id, predicate, got, want, fix, doc = row
         assert callable(predicate) and callable(got)
