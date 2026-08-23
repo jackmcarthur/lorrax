@@ -152,7 +152,7 @@ def fit_zeta_to_h5(
     chunk_r: int,
     output_file: str,
     psi_rmu_Y: jax.Array,
-    psi_rmuT_X: jax.Array,
+    psi_rmuT_X: jax.Array | None,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
     bispinor: bool = True,
@@ -215,30 +215,36 @@ def fit_zeta_to_h5(
                     :func:`common.wfn_transforms.load_centroids_band_chunked`.
         psi_rmuT_X: Same centroid data transposed/sharded for the pair-density
                     kernel, shape (nk, n_rmu, nb_full, ns),
-                    P(None, 'x', None, None), conjugated ψ*.
+                    P(None, 'x', None, None), conjugated ψ*.  Required when
+                    ``low_mem_bands=False``; MUST be None when
+                    ``low_mem_bands=True`` (STEP 6 reads psi_nmu_fresh/
+                    psi_mun_fresh instead -- see the ``low_mem_bands``
+                    entry below).
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
         bispinor: Whether to use bispinor wavefunctions
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
         low_mem_bands: When True (``low_mem_bands`` deck key), the CCT Gram
-                    (STEP 2) is built from ``psi_nmu_fresh``/``psi_mun_fresh``
-                    -- the two-face, all-P-sharded carrier -- via a
-                    distributed SUMMA GEMM, instead of from single-axis
-                    slices of ``psi_rmu_Y``.  ``psi_rmu_Y`` MUST be None in
-                    this mode (its only consumer, the CCT Y-forms, is
-                    replaced by the face path; the caller drops it before
-                    even calling this function -- see
+                    (STEP 2) AND the r-chunk loop's band contraction
+                    (STEP 6) are both built from ``psi_nmu_fresh``/
+                    ``psi_mun_fresh`` -- the two-face, all-P-sharded
+                    carrier -- instead of from any single-axis ψ copy.
+                    STEP 2 uses one distributed SUMMA GEMM
+                    (``isdf.core._c_q_face``); STEP 6 reads a
+                    ``band_chunk_size``-bounded slab per band-chunk,
+                    per r-chunk, out of ``psi_mun_fresh`` via a masked
+                    gather + ``psum('y')`` (``isdf.core._z_q_face`` --
+                    see docs/architecture/zeta_fit_face_psi_cct.md's
+                    r-chunk section for why this, not a second SUMMA GEMM,
+                    is the design).  Both ``psi_rmu_Y`` AND ``psi_rmuT_X``
+                    MUST be None in this mode (neither single-axis form is
+                    ever built or held; the caller drops both before even
+                    calling this function -- see
                     ``gw.gw_init.prepare_isdf_and_wavefunctions``).
-                    ``psi_rmuT_X`` is unaffected and stays single-axis: the
-                    r-chunk loop (STEP 6) still reads its X-form slices --
-                    that half of the all-P psi contract is NOT ported this
-                    session (KNOWN_LORRAX_ISSUES.md,
-                    "zeta-fit r-chunk all-P psi" row); see
-                    docs/architecture/zeta_fit_face_psi_cct.md.  Requires
-                    ``vertex_mu_L == 0`` and ``band_norms is None`` --
-                    refuses by name otherwise.  Default False: bit-identical
-                    to the pre-existing path (``psi_nmu_fresh``/
+                    Requires ``vertex_mu_L == 0`` and ``band_norms is
+                    None`` -- refuses by name otherwise.  Default False:
+                    bit-identical to the pre-existing path (``psi_nmu_fresh``/
                     ``psi_mun_fresh`` are ignored).
         psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
                     ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
@@ -288,10 +294,29 @@ def fit_zeta_to_h5(
                 "psi_rmu_Y here means the caller kept a single-axis copy "
                 "alive the redesign exists to avoid; fix the caller rather "
                 "than silently ignoring it.")
-    elif psi_rmu_Y is None:
-        raise ValueError(
-            "fit_zeta_to_h5: psi_rmu_Y is required when low_mem_bands=False"
-            " (the legacy CCT path reads it in STEP 1).")
+        if psi_rmuT_X is not None:
+            raise ValueError(
+                "fit_zeta_to_h5: low_mem_bands=True expects psi_rmuT_X="
+                "None -- the r-chunk loop (STEP 6) now reads its band-"
+                "contraction operand out of psi_mun_fresh (the persistent "
+                "face carrier), never a resident single-axis X-form (see "
+                "docs/architecture/zeta_fit_face_psi_cct.md's r-chunk "
+                "section).  A non-None psi_rmuT_X here means the caller "
+                "kept the single-axis X-form alive past the point where "
+                "psi_mun_fresh/psi_nmu_fresh were built -- fix the caller "
+                "(gw.gw_init.prepare_isdf_and_wavefunctions) rather than "
+                "silently ignoring it.")
+    else:
+        if psi_rmu_Y is None:
+            raise ValueError(
+                "fit_zeta_to_h5: psi_rmu_Y is required when "
+                "low_mem_bands=False (the legacy CCT path reads it in "
+                "STEP 1).")
+        if psi_rmuT_X is None:
+            raise ValueError(
+                "fit_zeta_to_h5: psi_rmuT_X is required when "
+                "low_mem_bands=False (the legacy r-chunk loop reads it in "
+                "STEP 1/STEP 6).")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -351,15 +376,15 @@ def fit_zeta_to_h5(
         r_band_start = band_range_right[0] - band_range_full[0]
         r_band_end = r_band_start + nb_right
 
-        # Cheap views — the caller keeps the full arrays alive for the
-        # post-fit wfn bundle build, so we don't need independent copies.
-        # The X-forms are built UNCONDITIONALLY: the r-chunk loop (STEP 6)
-        # reads them in both layouts -- porting IT to the face carrier is
-        # explicitly out of scope this session (see this function's
-        # ``low_mem_bands`` docstring and KNOWN_LORRAX_ISSUES.md).
-        psi_l_rmuT_X = psi_rmuT_X[:, :, l_band_start:l_band_end, :]
-        psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
-
+        # The X-forms are built ONLY when low_mem_bands=False.  Under
+        # low_mem_bands=True, psi_rmuT_X is None (validated above) — STEP
+        # 6 now reads its band-contraction operand directly out of
+        # psi_mun_fresh (the persistent face carrier, already resident
+        # for the whole fit) via a bounded per-band-chunk gather, never
+        # a resident single-axis X-form slice (see this function's
+        # ``low_mem_bands`` docstring and
+        # docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section).
+        #
         # The Y-forms are the CCT Gram's ONLY consumer.  Under
         # low_mem_bands, psi_rmu_Y is None (validated above) -- STEP 2
         # reads the face carrier (psi_nmu_fresh/psi_mun_fresh) instead, so
@@ -367,10 +392,11 @@ def fit_zeta_to_h5(
         # the point of the redesign (no single-axis Y-form is EVER
         # resident under low_mem_bands=True, not even transiently).
         if low_mem_bands:
+            psi_l_rmuT_X = psi_r_rmuT_X = None
             psi_l_rmu_Y = psi_r_rmu_Y = None
-            print(f"  X-forms: left {psi_l_rmuT_X.shape}, right "
-                  f"{psi_r_rmuT_X.shape}  (low_mem_bands: Y-forms never "
-                  f"built -- CCT reads the face carrier, STEP 2 below)")
+            print(f"  X-forms: never built (low_mem_bands: STEP 6 reads "
+                  f"psi_mun_fresh directly, one band-chunk at a time; "
+                  f"CCT reads the face carrier, STEP 2 below)")
             if env_bool("LORRAX_MEM_DEBUG", False) and jax.process_index() == 0:
                 # PER-RANK BYTES, not global shape (KNOWN_LORRAX_ISSUES.md's
                 # mem_probe row: two arrays with the same GLOBAL shape print
@@ -388,6 +414,11 @@ def fit_zeta_to_h5(
                       f"{_nmu_b/1e9:.4f} GB  psi_mun_fresh={_mun_b/1e9:.4f} "
                       f"GB  (2*S/(Px*Py) expected)")
         else:
+            # Cheap views — the caller keeps the full arrays alive for the
+            # post-fit wfn bundle build, so we don't need independent
+            # copies.
+            psi_l_rmuT_X = psi_rmuT_X[:, :, l_band_start:l_band_end, :]
+            psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
             psi_l_rmu_Y = psi_rmu_Y[:, l_band_start:l_band_end, :, :]
             psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
             print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
@@ -641,20 +672,25 @@ def fit_zeta_to_h5(
     # second `del` is a no-op refcount drop, not a second free) --
     # deleting both names is what actually reaches zero refcount.
     #
-    # low_mem_bands=True: psi_l_rmu_Y/psi_r_rmu_Y/*_fit are already None
-    # (STEP 1 never built them -- CCT read the face carrier instead), so
-    # these two ``del``s are no-op name drops for that half; the face
-    # GEMM plan and its band weights ARE real per-call objects and are
-    # the ones actually worth freeing here (the plan holds a cuBLASMp
-    # communicator + two compiled executables; CCT runs once per fit, so
-    # nothing downstream reuses it).  psi_mun_fresh/psi_nmu_fresh are
-    # NOT touched: they are the caller's own permanent face bundle
+    # low_mem_bands=True: psi_l_rmu_Y/psi_r_rmu_Y/*_fit AND
+    # psi_l_rmuT_X/psi_r_rmuT_X are already None (STEP 1 never built
+    # them -- CCT read the face carrier instead, and STEP 6 below reads
+    # psi_mun_fresh directly), so these two ``del``s are no-op name
+    # drops for that half.  The face GEMM PLAN is a real per-call object
+    # worth freeing here (it holds a cuBLASMp communicator + two
+    # compiled executables; CCT runs once per fit, so nothing downstream
+    # reuses it) -- but ``weight_l_face``/``weight_r_face`` are NOT
+    # freed: STEP 6's per-band-chunk gather (``isdf.core._z_q_face``)
+    # reuses them unchanged (same L/R window, same band_range_full
+    # indexing), and they are two tiny (nb_face,) float64 vectors, not
+    # worth rebuilding.  psi_mun_fresh/psi_nmu_fresh are NOT touched:
+    # they are the caller's own permanent face bundle
     # (Wavefunctions.psi_mun/psi_nmu after this call returns), not a
     # fit-local intermediate.
     del psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmu_Y_fit, psi_r_rmu_Y_fit
     del psi_l_rmuT_X, psi_r_rmuT_X
     if low_mem_bands:
-        del _face_gemm, weight_l_face, weight_r_face
+        del _face_gemm
     gc.collect()
 
     # ========== STEP 3: Compute L_q from CCT ==========
@@ -1326,6 +1362,10 @@ def fit_zeta_to_h5(
                     zeta_gather=_resolved_zeta_gather,
                     lu_piv=lu_piv,
                     distrib_la_batched_route=distrib_la_batched_route,
+                    layout=('face' if low_mem_bands else 'legacy'),
+                    psi_mun=(psi_mun_fresh if low_mem_bands else None),
+                    weight_l=(weight_l_face if low_mem_bands else None),
+                    weight_r=(weight_r_face if low_mem_bands else None),
                 )
                 zeta_chunk.block_until_ready()
             _t_fit = time.perf_counter() - t0
