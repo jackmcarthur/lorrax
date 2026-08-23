@@ -36,9 +36,54 @@ __all__ = [
     "make_cross_k_overlap",
     "make_distributed_band_matmul",
     "make_cross_k_link",
+    "MIN_STENCIL_POINTS",
+    "undersampled_link_axes",
     "WFN_FINGERPRINT_SCHEME",
     "wfn_fingerprint",
 ]
+
+#: Minimum distinct mesh points a Cartesian direction needs to support the
+#: advertised fourth-order +/-2 link stencil (``fourth_order_connection`` /
+#: ``fourth_order_covariant_derivative``).  THE ONE PLACE THIS THRESHOLD IS
+#: DECIDED -- both the artifact producer
+#: (``file_io.parallel_transport.write_parallel_transport_artifact``) and the
+#: driver-entry preflight (``gw.sc_iteration.load_head_velocity_source``) read
+#: this name rather than each carrying its own literal ``5``, which is
+#: exactly the shadow-accounting failure class this tree's
+#: ``docs/dev/QUALITY_PATTERNS.md`` #3 names.
+MIN_STENCIL_POINTS: int = 5
+
+
+def undersampled_link_axes(kgrid) -> list[str]:
+    """Cartesian directions whose mesh cannot support the link stencil.
+
+    Applies PER AXIS, and ONLY to the stages that differentiate along k --
+    the nearest-neighbour link build and the fourth-order connection/
+    covariant-derivative stencil it feeds.  It does NOT apply to the
+    unconditional, gauge-free exact-DFT-velocity write
+    (``v = p + i[r,V_NL]`` needs no neighbouring k at all), which is why
+    that write is no longer gated on this check (KNOWN_LORRAX_ISSUES.md row
+    at ``file_io/parallel_transport.py:407-415`` / ``get_dipole_mtxels.py:
+    1309-1317``, 2026-08-19).
+
+    A genuinely collapsed direction (``kgrid[i] == 1``, e.g. the z axis of a
+    9x9x1 slab deck) is reported exactly like an undersampled periodic one
+    (``1 < kgrid[i] < 5``) -- NOT stamped as an analytic zero.  The fix note
+    on that same register row is explicit: "Do not fabricate a z derivative
+    for the separate covariant parallel-transport mode."  A 2D deck that
+    wants only the velocity reaches the links-free producer/consumer path
+    instead of asking this function anything; a 2D deck that asks for the
+    full ``parallel_transport`` link stage is refused, by name, on every
+    caller of this function.
+
+    Returns
+    -------
+    list[str]
+        The undersampled axis names, a subset of ``["x", "y", "z"]``, in
+        that fixed order.  Empty iff every direction supports the stencil.
+    """
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    return [axis for axis, n in zip("xyz", grid) if n < MIN_STENCIL_POINTS]
 
 _BAND_MATMUL_CACHE = {}
 
