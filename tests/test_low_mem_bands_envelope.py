@@ -46,6 +46,23 @@ scale confirmation remains open follow-up work.  ``mpa/sigma.py``
 end-to-end gated, so the row STAYS for ``compute_mode = mpa`` — see that
 module's own comment.
 
+``low_mem_bands_self_consistent_unported`` — LIFTED 2026-08-23 (feat/qsgw-
+face-rotations-2026-08-23), same shape as the ``head_correction=full`` lift
+above: ``wavefunction_bundle.rotate_wavefunctions`` now dispatches on
+``wfns_dft.layout`` and routes ``layout='face'`` through
+``_rotate_wavefunctions_face`` — two planned ``distrib_la.gemm_plan`` N,N
+GEMMs (``U^T @ psi_nmu``, ``psi_mun @ U``) against a block-embedded U
+rather than a sliced ψ.  ``sc_iteration.py:1753`` needed no change.  Gated
+on real 4-rank CUDA algebra parity (``tests/test_qsgw_rotate_face_parity.py``
+— U from a REAL small eigh, ns=1/ns=2, default AND offset active windows,
+3/3 PASS, max relative diff ~1e-16..2e-16) and a real end-to-end MoS2 k6_c50
+``compute_mode=gn_ppm head_correction=full`` leg (3 SC iterations) vs the
+``low_mem_bands=false`` reference — see ``gw_config._LOW_MEM_BANDS_
+REFUSALS``' own history comment and this session's CLAIMS.md row for the
+job id and measured tolerances.  The row is DELETED (not narrowed), same
+as the ``head_correction=full`` row's own precedent: every SC combination
+this project supports today is covered.
+
 Same shape as ``tests/test_screening_diagrams_config.py``'s w_bse refusal
 matrix: a RED TWIN per rule (it actually fires, names its rule id, carries
 all five message parts) plus a POSITIVE TWIN (the supported envelope does
@@ -104,19 +121,15 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("rule_id, extra", [
-    # head_correction defaults to "full", so this row needs no companion
-    # key: it is "the first refusal an unqualified deck hits".
-    ("low_mem_bands_head_correction_full_unported", ""),
-    ("low_mem_bands_self_consistent_unported",
-     "head_correction = off\nqp_solver = self_consistent\n"),
     ("low_mem_bands_metal_material_class_unported",
      "head_correction = off\n" + _METAL_KEYS),
     ("low_mem_bands_bispinor_unported",
      "head_correction = off\nbispinor = true\n"),
     ("low_mem_bands_dynamic_ppm_unported",
      "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA;
-    # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22 -- see
-    # the positive-twin matrix below.
+    # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22;
+    # qp_solver=self_consistent LIFTED 2026-08-23 -- see the positive-twin
+    # matrix below.
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -182,6 +195,17 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "compute_mode = gn_ppm\n",
     "compute_mode = hl_ppm\n",
     "compute_mode = gn_ppm\nqp_solver = fixed_point\n",
+    # qp_solver=self_consistent, LIFTED 2026-08-23 (feat/qsgw-face-
+    # rotations-2026-08-23): rotate_wavefunctions now dispatches on
+    # wfns_dft.layout (wavefunction_bundle._rotate_wavefunctions_face) --
+    # gated on real 4-rank CUDA algebra parity (tests/
+    # test_qsgw_rotate_face_parity.py) and a real end-to-end MoS2 k6_c50
+    # compute_mode=gn_ppm head_correction=full qp_solver=self_consistent
+    # (3 SC iterations) leg vs the low_mem_bands=false reference; see
+    # gw_config._LOW_MEM_BANDS_REFUSALS' own history comment and this
+    # session's CLAIMS.md row.  Same shape as the fixed_point row above,
+    # covering the bare shipping default (head_correction left at 'full').
+    "compute_mode = gn_ppm\nqp_solver = self_consistent\n",
 ])
 def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     """The other half of a refusal matrix: what it does NOT refuse.
@@ -243,7 +267,7 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 5, (
+    assert len(ids) == 3, (
         "the table grew or shrank -- update this test AND the docs "
         "envelope table in docs/input_reference.md together")
     for row in _LOW_MEM_BANDS_REFUSALS:
