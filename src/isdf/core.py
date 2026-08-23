@@ -589,7 +589,7 @@ def _c_q_face(
 	The GEMM seam (``common.contract_bands.merge_spin_centroid`` /
 	``split_spin_centroid``) and the weighted-band convention
 	(``gemm(A * weight, B)``) are EXACTLY ``gw.greens_function_kernel.
-	_face_build_G``'s pattern, reused rather than re-derived — same
+	_build_G_face``'s pattern, reused rather than re-derived — same
 	merge positions (1,2) and (2,3), same "conjugate the μ/row operand,
 	leave the ν/col operand un-conjugated" convention as
 	:func:`pair_density`'s own docstring (the X-form is pre-conjugated by
