@@ -1101,15 +1101,12 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
 
 def _chi_face_kwargs(wfns) -> dict:
     """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
-    ``face_shape`` kwargs :func:`_get_chi_minimax_kernel` needs otherwise
-    — read off ``psi_mun``'s own shape rather than threaded in by every
-    caller, since the bundle already carries it (mirrors
-    ``cohsex_sigma._face_kwargs``, the same pattern for the COHSEX
-    factory)."""
-    if wfns.layout != "face":
-        return {}
-    nk, ns, mu, nb_full = wfns.psi_mun.shape
-    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, ns)}
+    ``face_shape`` kwargs :func:`_get_chi_minimax_kernel` needs otherwise.
+    Thin alias for :func:`gw.wavefunction_bundle.face_kernel_kwargs`, the
+    shared owner (mirrors ``cohsex_sigma._face_kwargs``) — kept under this
+    name so this module's own call sites did not need to change."""
+    from .wavefunction_bundle import face_kernel_kwargs
+    return face_kernel_kwargs(wfns)
 
 
 def _chi_layout_operands(wfns, eref):
