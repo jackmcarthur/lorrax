@@ -75,6 +75,18 @@ signature change, which is out of this module's scope.  What this module
 removes is the extra Python-level allocation and the extra compiled
 program, not the C++ argument — state that distinction when reporting the
 memory win, rather than claiming a C-less FFI call.
+
+Communication, not layout, is this surface's dominant cost per call at
+multi-node scale — measured 2026-08-22 (``gw.greens_function_kernel``'s
+module docstring carries the full writeup and numbers;
+``reports/face_gemm_contiguity_2026-08-22/report.md``).  A context-free
+:func:`gemm_plan` call at G-build's own shape got 4.4x SLOWER moving one
+node (P4) to four nodes (P16) despite the per-rank operand shrinking 32x,
+and a `nq`-widening batch experiment (folding two same-shape calls into
+one) measured within noise of two separate calls at both scales — this
+surface's own ``jnp.transpose`` bridging to cuBLASMp's column-major FFI
+compiles to a bitcast (free), so neither is a layout problem to chase
+here.
 """
 from __future__ import annotations
 

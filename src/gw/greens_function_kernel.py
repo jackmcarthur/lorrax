@@ -49,6 +49,69 @@ identical fix on both O's spin pairs).  ns ∈ {1, 2} in every deck this
 module has been run against; the merge (not a per-spin loop) keeps the
 GENERAL spin-OFF-DIAGONAL G a spinor calculation needs — see the module's
 own einsum below, which does NOT contract s against t.
+
+Face's measured +27.8s/+21.4s screening/Σ overhead is NOT a psi-layout
+problem (owner investigation, 2026-08-22, ``perf/face-gemm-contiguity-
+2026-08-22``; full writeup ``reports/face_gemm_contiguity_2026-08-22/
+report.md``)
+------------------------------------------------------------------------
+Measured on real 4-rank (P4, 2x2) and real 16-rank (P16, 4x4, 4-node) CUDA
+at MoS2 k6/c600-proportioned shapes (nk=36, nb_full=640): an ISOLATED,
+context-free ``distrib_la.gemm_plan`` call at this G-build's own shape
+already costs 0.0413 s/call at P4 (local m=n=1328) and 0.1827 s/call at
+P16 (local m=n=332 — i.e. 32x LESS local work, yet 4.4x MORE wall time).
+22 such calls (11 tau nodes x {Gv,Gc}) alone cost 0.93s at P4 and 4.0s at
+P16 — the SAME 22-call sequence inside the real compiled chi0 kernel
+costs 1.034s/0.567s (face/legacy) at P4, i.e. the bare GEMMs ALREADY
+explain ~90% of face's wall time at that scale.  HLO inspection
+(``tools/hlo/analyze_hlo_dump.py``, dumps under
+``runs/MoS2/87_face_gemm_contiguity_20260822/xla_dump_before_big/``)
+confirms the per-tau while-body is otherwise LEAN: the two internal
+``jnp.transpose(x,(0,2,1))`` calls ``distrib_la.matmul_plan._build_kernel``
+issues around every cuBLASMp FFI call compile to bitcasts (zero cost, both
+here and in the Σ two-GEMM projector), and ``merge_spin_centroid``/
+``split_spin_centroid`` do not appear as materialised ops at ns=1 (the
+production spin count) — both fully consistent with their own "free local
+reshape" claims above.  The conclusion: legacy's G build is a REPLICATED-
+band-axis, embarrassingly-parallel LOCAL ``__cublas$gemm`` (zero
+cross-rank communication, by construction — that is exactly what the
+4-copy replicated storage buys); face's G build MUST cross ranks for the
+SAME contraction, because ``psi_mun``/``psi_nmu`` shard the band
+(contraction) axis across BOTH mesh axes (obstacle report, memory
+result).  cuBLASMp's SUMMA-style distributed GEMM is the correct,
+intended mechanism for that — it is communication-bound by nature, and
+that communication gets markedly more expensive once the mesh's 'x' axis
+(the report's own policy-1 language: replica groups are node-local only
+on 'y') crosses physical nodes, exactly the P4-vs-P16 gap measured above.
+This is the ~90%+ term; it is the cost of the 2*sqrt(P) memory win, not a
+contiguity bug, and per the owner's own standing instruction on this
+investigation ("only [chase Greens-function-kernel speedups] if simple
+without new 2-D-linalg plumbing"), recovering it is out of this module's
+scope.
+
+Two candidate contiguity fixes WERE tried and MEASURED, so a future
+session does not re-attempt them without cause:
+  * Widening the planned GEMM's leading batch to fold Gv+Gc into one
+    ``nq=2*nk`` call (the report's own "plausible shape" #2): measured
+    NO benefit — 0.0813s vs 2x0.0413s=0.0825s at P4 (~1.5% faster, noise
+    level), 0.3708s vs 2x0.1827s=0.3654s at P16 (~1.5% SLOWER).  Cost is
+    linear in work, not dominated by a fixed per-dispatch floor a wider
+    batch would amortise.  NOT applied.
+  * There IS one genuinely avoidable transpose beyond gemm_plan's own
+    (bitcast) internal one: the ``jnp.conj`` this module's ``build_G_tau``
+    callers apply to face's raw GEMM output compiles (unlike legacy's
+    equivalent conj, which is transpose-free) to a REAL fused
+    ``real/imag/negate/complex`` + ``transpose(dimensions={0,2,1})`` on
+    the full (nk, μ, μ) G tile, once per G build, because cuBLASMp's FFI
+    contract hands back a column-major-native buffer that
+    ``lorrax_mklfft_flat_k``'s OWN fixed ``operand_layout_constraints``
+    then forces back to standard row-major — bridging two FFI contracts
+    with incompatible native layouts.  Measured at <5% of the per-call
+    cost (a ~1-2 GB/rank fused op vs. the GEMM's own communication), and
+    genuinely removing it needs the SAME kind of axis-convention/FFI-
+    contract surgery the "no new 2-D-linalg plumbing" instruction rules
+    out for this pass — registered, not fixed,
+    ``KNOWN_LORRAX_ISSUES.md`` (2026-08-22 face G-build transpose row).
 """
 import jax.numpy as jnp
 
