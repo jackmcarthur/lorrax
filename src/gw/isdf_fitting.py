@@ -569,7 +569,7 @@ def fit_zeta_to_h5(
             # sidesteps the sigma-window edge's (band_range_left[1],
             # generally not mesh-divisible) own pad requirement.  ONE
             # plan serves both P_l and P_r (mirrors greens_function_
-            # kernel._face_build_G's g_plan reuse across Gv/Gc).
+            # kernel._build_G_face's g_plan reuse across Gv/Gc).
             with timing.section("zeta_fit.CCT.face_gemm_plan"):
                 from distrib_la import gemm_plan as _gemm_plan
                 _ns_face = int(psi_mun_fresh.shape[1])

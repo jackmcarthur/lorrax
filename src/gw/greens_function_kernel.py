@@ -118,7 +118,7 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
 
-def _legacy_build_G(psi_xn, psi_yr, *, Gij=None, phases=None):
+def _build_G_legacy(psi_xn, psi_yr, *, Gij=None, phases=None):
     """The exact pre-``low_mem_bands`` body.  UNTOUCHED — do not edit this
     function to add face-layout behaviour; add a sibling instead."""
     if Gij is not None and phases is not None:
@@ -136,7 +136,7 @@ def _legacy_build_G(psi_xn, psi_yr, *, Gij=None, phases=None):
         psi_xn, jnp.conj(psi_yr), optimize=True)
 
 
-def _face_build_G(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
+def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
     """Face-layout G via one planned N,N GEMM.  See module docstring.
 
     psi_mun: (nk, s, μ, n)  P(None, None, 'x', 'y') — un-conjugated, direct.
@@ -183,7 +183,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
 
     ``layout='legacy'`` (default): returns (nk, s, μ_X, s, μ_Y) flat-k,
     exactly as before — ``psi_xn``/``psi_yr`` are the legacy 4-copy bundle
-    fields, ``Gij``/``phases`` as documented on :func:`_legacy_build_G`.
+    fields, ``Gij``/``phases`` as documented on :func:`_build_G_legacy`.
 
     ``layout='face'``: ``psi_xn``/``psi_yr`` are actually ``psi_mun``/
     ``psi_nmu`` (the argument NAMES stay the SAME two slots — first operand
@@ -191,10 +191,10 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
     so a caller's call shape does not change shape when it switches
     layout).  ``gemm`` (a ``distrib_la.GemmPlan``) is then required.  See
     the module docstring for the GEMM-seam design and
-    :func:`_face_build_G` for the operand contract.
+    :func:`_build_G_face` for the operand contract.
     """
     if layout == 'legacy':
-        return _legacy_build_G(psi_xn, psi_yr, Gij=Gij, phases=phases)
+        return _build_G_legacy(psi_xn, psi_yr, Gij=Gij, phases=phases)
     if layout != 'face':
         raise ValueError(f"build_G: layout must be 'legacy' or 'face', got {layout!r}")
     if gemm is None:
@@ -202,7 +202,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='legacy',
             "build_G(layout='face') requires gemm=<distrib_la.GemmPlan>, "
             "built ONCE outside this call (see distrib_la.gemm_plan and "
             "this module's docstring) — never resolved here.")
-    return _face_build_G(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
+    return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
