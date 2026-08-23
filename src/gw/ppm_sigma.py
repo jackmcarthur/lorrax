@@ -797,6 +797,7 @@ def _run_sigma_branch(
     log_tag: str = "",
     print_fn=print,
     use_shipped_minimax_tables: bool = True,
+    packed_coh: tuple[tuple, tuple] | None = None,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -808,12 +809,23 @@ def _run_sigma_branch(
     carrying the mesh pad — the driver sums branches on host and performs
     the single end-of-stage gather + strip (comms fix 2026-07-28, see
     _SigmaBranchTiles).  Empty branches return ``None``.
+
+    ``packed_coh`` (2026-08-23): ``(psi_coh_xn_tuple, psi_coh_yr_tuple)``
+    -- the PACKED per-bracket carrier pairs (``wavefunction_bundle.
+    pack_band_window``), built ONCE by ``compute_sigma_c_ppm_omega_grid``
+    before the branch loop and passed to EVERY branch unchanged (every
+    branch integrates the SAME psi window; only ``E_A``/``base_mask_A``
+    differ by branch).  ``None`` (the default) keeps the mask-bracket /
+    legacy behaviour exactly as before this parameter existed -- see
+    ``_get_sigma_tau_kernel``'s own ``pack_brackets`` docstring for when
+    the caller should supply this.
     """
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
 
     s = wfns.slices
     face_kwargs = face_kernel_kwargs(wfns)
+    pack_brackets = packed_coh is not None
     if wfns.layout == "legacy":
         psi_coh_xn = wfns.xn(s.full)
         psi_coh_yr = wfns.yr(s.full)
@@ -845,8 +857,15 @@ def _run_sigma_branch(
         # extent (a plain host slice, not a sharding-divisibility
         # constraint) — see ``compute_sigma_c_ppm_omega_grid``'s
         # ``assert tile_meta.nb_real == nb_proj``.
-        psi_coh_xn = wfns.psi_mun
-        psi_coh_yr = wfns.psi_nmu
+        #
+        # ``packed_coh`` (2026-08-23): when the caller pre-packed the
+        # bracket carriers (multi-bracket plans), THOSE tuples are the
+        # "coh" operand instead of the bare resident psi_mun/psi_nmu --
+        # the only thing that changes for the packed route; the
+        # projection ("proj") operand is unaffected (bracket-invariant,
+        # always the full Sigma window's own psi).
+        psi_coh_xn = wfns.psi_mun if packed_coh is None else packed_coh[0]
+        psi_coh_yr = wfns.psi_nmu if packed_coh is None else packed_coh[1]
         psi_proj_xr = wfns.psi_nmu
         psi_proj_yn = wfns.psi_mun
         nk_proj = int(meta.nk_tot)
@@ -877,6 +896,7 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         brackets=brackets,
+        pack_brackets=pack_brackets,
         **face_kwargs,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
@@ -887,6 +907,7 @@ def _run_sigma_branch(
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         merged_x=True,
         brackets=brackets,
+        pack_brackets=pack_brackets,
         **face_kwargs,
     )
 
@@ -1202,6 +1223,26 @@ def compute_sigma_c_ppm_omega_grid(
         plan, s, meta=meta, where="ppm_sigma bracket partition")
     brackets = plan.bounds
     n_brk = plan.n_brackets
+    # SIGMA-PROCEDURE START: build each bracket's packed carrier pair ONCE
+    # here, before the branch loop below, and reuse it across every
+    # branch's own tau-node/omega-window integration (owner directive,
+    # 2026-08-23 -- "materialize the band slices as their own array
+    # copies at the start of the sigma procedure").  Only engaged for a
+    # GENUINE multi-bracket plan (band extrapolation): the trivial
+    # single-bracket plan's own packed pair would be the resident carrier
+    # unchanged (wavefunction_bundle.pack_band_window's own fast path),
+    # so there is nothing to gain from a second code path there -- see
+    # ppm_tau_kernel._get_sigma_kij_kernel's own docstring for the same
+    # scoping decision on the kernel side.
+    packed_coh = None
+    if wfns.layout == "face" and n_brk > 1:
+        from .wavefunction_bundle import pack_band_window
+        with timing.section("sigma.pack_brackets") as sec:
+            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
+                     for lo, hi in brackets]
+            packed_coh = (tuple(p[0] for p in packed),
+                          tuple(p[1] for p in packed))
+            sec.watch(packed_coh)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
@@ -1453,6 +1494,7 @@ def compute_sigma_c_ppm_omega_grid(
         print_fn=print_fn,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         brackets=brackets,
+        packed_coh=packed_coh,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
