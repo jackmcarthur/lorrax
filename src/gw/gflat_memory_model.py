@@ -188,6 +188,23 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
       ``2·S/(Px·Py)`` — the ``2·√P`` reduction on a square mesh the
       feature exists for.
 
+      As of the zeta-fit face-CCT redesign (feat/zeta-fit-face-psi,
+      2026-08-22), this term is now GENUINELY accurate for Stages A and B
+      (centroid load, CCT/Cholesky): ``gw.gw_init.prepare_isdf_and_
+      wavefunctions`` builds ``psi_nmu``/``psi_mun`` immediately after the
+      fresh load and drops the single-axis ψ_Y copy BEFORE the fit runs,
+      and ``gw.isdf_fitting.fit_zeta_to_h5``'s CCT step (STEP 2) reads
+      them directly (``isdf.core.c_q_from_psi_sm(layout='face')``, a
+      distributed SUMMA GEMM) instead of single-axis Y-forms.  It remains
+      an UNDER-estimate for Stages C and D (the r-chunk loop): those
+      still read single-axis X-form slices of ψ_rmuT_X
+      (``2·psi_one/p_x``, ``GFlatChunkPlan.stage_cd_psi_bytes`` below,
+      informational only) — porting that half is refused by name this
+      session (KNOWN_LORRAX_ISSUES.md, "zeta-fit r-chunk all-P psi" row);
+      the shared ``persistent_total`` this function returns still folds
+      the SAME (now Stage-A/B-correct, Stage-C/D-optimistic) term into
+      all four peaks, per the pre-existing row on the same ledger.
+
     ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
     sparse-G→FFT-box index + the τ-phase row), retained for the loader's
     lifetime and **P-INDEPENDENT** — adding nodes never shrinks it, so it

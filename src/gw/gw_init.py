@@ -1195,7 +1195,8 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print):
+             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
+             psi_nmu_fresh=None, psi_mun_fresh=None):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
 	The caller supplies (a) the full-range centroid wavefunctions
@@ -1203,6 +1204,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	``load_centroids_band_chunked``) and (b) the chunk plan dict from
 	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  Returns
 	``(zeta_h5_path, mem_est, transverse_wfn_data)``.
+
+	``psi_nmu_fresh``/``psi_mun_fresh``: the two-face carrier, required
+	(and ``psi_rmu_Y`` expected ``None``) when ``cfg.memory.low_mem_bands``
+	— see ``prepare_isdf_and_wavefunctions``, which builds them right
+	after the fresh load and drops ``psi_rmu_Y`` before calling here.
+	Forwarded ONLY to the charge-channel ``fit_zeta_to_h5`` call below;
+	the bispinor transverse-channel call is unreachable under
+	``low_mem_bands`` (refused upstream) and does not take them.
 	"""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
@@ -1492,6 +1501,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
+			low_mem_bands=bool(cfg.memory.low_mem_bands),
+			psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh,
 		)
 
 	# ── THE ζ RANK CUT'S CLOSURE VERDICT, refused HERE if it must be ──────
@@ -2437,10 +2448,49 @@ def prepare_isdf_and_wavefunctions(
 					band_chunk_size=chunks['band_chunk'],
 				)
 
+			# ``low_mem_bands = true``: convert to the two-face carrier
+			# RIGHT AWAY and drop the single-axis ψ_Y copy before the ζ
+			# fit even starts — its only consumer anywhere in the fit is
+			# the CCT Gram build (STEP 2 of fit_zeta_to_h5), which now
+			# reads psi_nmu_fresh/psi_mun_fresh instead (a distributed
+			# SUMMA GEMM; docs/architecture/zeta_fit_face_psi_cct.md).
+			# ``psi_rmuT_X`` (the X-form) is UNCHANGED — the r-chunk loop
+			# (fit_one_rchunk/z_q_from_psi_sm) still reads its single-axis
+			# slices; porting that half collides with the kernel's own
+			# ``all_to_all('y')`` band gather and is refused by name this
+			# session (KNOWN_LORRAX_ISSUES.md, "zeta-fit r-chunk all-P
+			# psi" row).  Both faces are FREE resharding constraints (no
+			# transpose collective, no gather — see
+			# wavefunction_bundle.build_wavefunctions_face's docstring,
+			# whose derivation this mirrors exactly, just earlier and
+			# reused across the fit AND the post-fit bundle instead of
+			# rebuilt for each).  bispinor + low_mem_bands is already
+			# refused above (refuse_unsupported_low_mem_bands), so this
+			# never collides with the bispinor loader branch below.
+			psi_nmu_fresh = None
+			psi_mun_fresh = None
+			if cfg.memory.low_mem_bands:
+				from jax.sharding import NamedSharding
+				from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+				with mesh_xy:
+					psi_nmu_fresh = jax.lax.with_sharding_constraint(
+						psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+					psi_mun_fresh = jax.lax.with_sharding_constraint(
+						jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),
+						NamedSharding(mesh_xy, PSI_MUN_SPEC))
+				del psi_rmu_Y
+				psi_rmu_Y = None
+				print0("  ψ face conversion (low_mem_bands): psi_nmu/"
+				       "psi_mun built from the fresh load; single-axis "
+				       "psi_rmu_Y dropped before the ζ fit (psi_rmuT_X "
+				       "stays single-axis for the r-chunk loop — see "
+				       "KNOWN_LORRAX_ISSUES.md).")
+
 			zeta_path, mem_est, transverse_wfn_data = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
-				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
+				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0,
+				psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh)
 			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
 			# the pipeline right after ζ-fit, before the expensive V_q
 			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_RCHUNK_DEBUG=1
@@ -2491,28 +2541,37 @@ def prepare_isdf_and_wavefunctions(
 				# function's entry (refuse_unsupported_low_mem_bands),
 				# before the chunk planner even ran -- so
 				# transverse_wfn_data cannot be non-None here.
-				from .wavefunction_bundle import build_wavefunctions_face
+				#
+				# psi_nmu_fresh/psi_mun_fresh were already built (and
+				# psi_rmu_Y already dropped) BEFORE the ζ fit, above --
+				# they are not re-derived here.  wavefunctions_face_from_
+				# restart wraps them into the bundle directly (no
+				# resharding constraint, no transpose collective: mirrors
+				# build_wavefunctions_face's own construction, just with
+				# the faces already built).
+				from .wavefunction_bundle import wavefunctions_face_from_restart
 				from common.wfn_transforms import (
 					get_enk_bandrange as _get_enk_bandrange_early)
 				_enk_full_face, _ = _get_enk_bandrange_early(
 					wfn, sym, band_slices.full_range,
 					(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 				with timing.section("gw_jax.wavefunction_setup"):
-					wfns = build_wavefunctions_face(
-						psi_rmu_Y, psi_rmuT_X, enk_full=_enk_full_face,
+					wfns = wavefunctions_face_from_restart(
+						psi_nmu_fresh, psi_mun_fresh, enk_full=_enk_full_face,
 						slices=band_slices, mesh_xy=mesh_xy)
 				print0(f"  Wavefunctions built (b0:b4={band_slices.nb_full} "
 				       f"bands, face layout: psi_nmu/psi_mun; "
 				       f"low_mem_bands=true) — before V_q, single-axis "
 				       f"fit copies released")
-				# THE DELETION.  ``psi_rmu_Y``/``psi_rmuT_X`` are the
-				# fit's own single-axis copies; the face bundle above
-				# already holds everything downstream needs.  Dropping
-				# the reference here (CPython refcounts immediately —
-				# no GC cycle needed to free the device buffers) is what
-				# keeps V_q's baseline at the face floor rather than
+				# THE DELETION.  ``psi_rmuT_X`` was the r-chunk loop's own
+				# single-axis X-form copy (psi_rmu_Y was already dropped
+				# before the fit).  The face bundle above already holds
+				# everything downstream needs.  Dropping the reference
+				# here (CPython refcounts immediately — no GC cycle
+				# needed to free the device buffers) is what keeps V_q's
+				# baseline at the face floor rather than
 				# face-plus-fit-input.
-				del psi_rmu_Y, psi_rmuT_X
+				del psi_rmuT_X
 
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
