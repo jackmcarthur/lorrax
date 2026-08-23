@@ -802,6 +802,21 @@ def main(argv=None):
 		     "W_av_*_neighbors input flags; skip dipole and PT preprocessing.",
 	)
 	parser.add_argument(
+		"--parallel-transport-velocity-only",
+		action="store_true",
+		help="Write ONLY the exact DFT p-matrix velocity stage of the "
+		     "--parallel-transport-out artifact (v = p + i[r,V_NL]); skip "
+		     "the nearest-neighbour link stream, the fourth-order "
+		     "connection and the mandatory velocity-identity validation "
+		     "entirely, so this producer runs on decks whose mesh cannot "
+		     "support the link stencil on every axis (a collapsed 2D slab "
+		     "kgrid, or an undersampled one).  Matches the consumer "
+		     "contract of sc_head_update=dft_velocity "
+		     "(gw.qsgw_head.load_dft_velocity_head), which reads this same "
+		     "dataset and requires neither links nor a completed "
+		     "validation.  Requires --parallel-transport-out.",
+	)
+	parser.add_argument(
 		"--parallel-transport-rcond",
 		type=float,
 		default=1.0e-10,
@@ -845,6 +860,11 @@ def main(argv=None):
 	)
 	args = parser.parse_args(argv)
 
+	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
+		parser.error(
+			"--parallel-transport-velocity-only requires "
+			"--parallel-transport-out: it names the file to write the "
+			"velocity-only artifact to")
 	if args.parallel_transport_out is not None:
 		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
 			parser.error(
@@ -885,6 +905,15 @@ def main(argv=None):
 			w_av_first_neighbors or w_av_second_neighbors):
 		parser.error(
 			"--w-av-only requires an enabled W_av_*_neighbors input flag")
+	if args.parallel_transport_velocity_only and (
+			w_av_first_neighbors or w_av_second_neighbors):
+		parser.error(
+			"--parallel-transport-velocity-only cannot be combined with an "
+			"enabled W_av_*_neighbors input flag: the W-av finite-q stencil "
+			"is written by the SAME link/connection remainder this mode "
+			"skips (write_parallel_transport_artifact), so the combination "
+			"would silently produce a velocity-only artifact and no W-av "
+			"stencil despite the deck asking for one")
 
 	# The relative sign of i[r, V_NL] in the assembled velocity, resolved
 	# ONCE here so that the two producer routes below -- the analytic
@@ -1349,7 +1378,25 @@ def main(argv=None):
 			# runs in chunks so a peer's transient is one chunk.
 			dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
 		del H_v, psi_G
-		if pt_path is not None:
+		if pt_path is not None and args.parallel_transport_velocity_only:
+			# D2 (reports/metal_head_pt_pipelines_2026-08-23/PLAN.md): the
+			# link stream, the fourth-order connection and the mandatory
+			# velocity-identity validation are ALL skipped -- none of them
+			# is a stencil this deck's mesh may even support (a collapsed
+			# 2D slab kgrid, or an undersampled one), and NONE of them is
+			# read by the sc_head_update=dft_velocity consumer this mode
+			# targets (gw.qsgw_head.load_dft_velocity_head).  The velocity
+			# transaction above already wrote and closed
+			# velocity_dft_cart, band manifold, kgrid, reciprocal lattice
+			# and the WFN fingerprint -- every provenance field that
+			# loader checks.
+			print(
+				"  DFT velocity-only parallel-transport artifact: no "
+				"links, no connection, no validation (--parallel-transport"
+				"-velocity-only).")
+			print(f"\nWrote DFT-velocity-only parallel-transport data to "
+			      f"{pt_path}")
+		elif pt_path is not None:
 			# The SlabIO velocity transaction above is closed and durable,
 			# and the all-k psi/H_v device arrays are now dead.  The link
 			# stream therefore holds only one central and one neighbour WFN
