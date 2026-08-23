@@ -34,12 +34,17 @@ LIFTED for ``gn_ppm``/``hl_ppm`` 2026-08-22 (feat/dynamic-sigma-face-port-
 SAME canonical ``build_G_tau(layout='face', gemm=...)``/
 ``contract_bands_block_reshard(layout='face', channels=...)`` owners the
 static COHSEX channels already used.  Gated on real 4-rank CUDA (algebra
-parity, ``tests/test_ppm_tau_kernel_face_parity.py``) and a real k6_c600
-``compute_mode = gn_ppm head_correction = full`` fresh leg vs the legacy
-gn_ppm reference — see ``gw.gw_config``'s own row comment and the session's
-``CLAIMS.md`` rows for job ids.  ``mpa/sigma.py`` (insulating MPA) was
-mechanically ported the same session but is NOT end-to-end gated, so the
-row STAYS for ``compute_mode = mpa`` — see that module's own comment.
+parity, ``tests/test_ppm_tau_kernel_face_parity.py``) and a real
+end-to-end MoS2 k6_c50 ``compute_mode = gn_ppm head_correction = full``
+leg matching the legacy gn_ppm reference to ~1e-5 eV — see
+``gw.gw_config``'s own row comment and the session's ``CLAIMS.md`` rows
+for job ids.  A larger k6_c600 (mu=5282) confirmation of the same
+combination hit a pre-existing, unrelated ``qsgw_head.py`` OOM
+(``claims/0436.md``) before reaching this port's own code; production-
+scale confirmation remains open follow-up work.  ``mpa/sigma.py``
+(insulating MPA) was mechanically ported the same session but is NOT
+end-to-end gated, so the row STAYS for ``compute_mode = mpa`` — see that
+module's own comment.
 
 Same shape as ``tests/test_screening_diagrams_config.py``'s w_bse refusal
 matrix: a RED TWIN per rule (it actually fires, names its rule id, carries
@@ -165,7 +170,8 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "head_correction = off\nrestart = true\n",
     # GN-PPM/HL-PPM, LIFTED 2026-08-22 (feat/dynamic-sigma-face-port-
     # 2026-08-22) -- gated end to end on real 4-rank CUDA (algebra parity
-    # + a k6_c600 fresh leg vs the legacy gn_ppm reference), see this
+    # + a real MoS2 k6_c50 leg vs the legacy gn_ppm reference; a larger
+    # k6_c600 confirmation hit an unrelated pre-existing OOM), see this
     # file's module docstring.  head_correction is left at its bare
     # default (full) here deliberately: that is now the fully-supported
     # SHIPPING-DEFAULT deck under low_mem_bands, not merely a case that

@@ -3006,14 +3006,24 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # ``greens_function_kernel.build_G_tau(layout='face', gemm=...)``/
         # ``contract_bands_block_reshard(layout='face', channels=...)`` —
         # the SAME canonical owners the static COHSEX channels already
-        # used, extended rather than forked (report §5).  Gated end to
-        # end: real 4-rank CUDA algebra parity (legacy vs face, identity +
-        # real tau weights, ns=1/ns=2, a non-mesh-divisible sigma window),
-        # a real k6_c600 fresh leg at compute_mode=gn_ppm head_correction=
-        # full vs the legacy gn_ppm reference (eqp/sigma_diag), and
-        # tests/test_zeta_mesh_invariance.py 7/7 unaffected — see the
-        # session's CLAIMS.md rows and docs/input_reference.md's updated
-        # envelope row for job ids and artifact paths.  ``mpa/sigma.py``
+        # used, extended rather than forked (report §5).  Gated: real
+        # 4-rank CUDA algebra parity (legacy vs face, identity + real tau
+        # weights, ns=1/ns=2, a non-mesh-divisible sigma window,
+        # tests/test_ppm_tau_kernel_face_parity.py, 5/5 PASS), a real
+        # end-to-end MoS2 k6_c50 leg at compute_mode=gn_ppm
+        # head_correction=full matching the legacy gn_ppm reference to
+        # ~1e-5 eV, and tests/test_zeta_mesh_invariance.py 7/7 unaffected
+        # (claims/0435.md).  A LARGER k6_c600 (mu=5282) confirmation of
+        # the same combination could NOT be completed this session: it
+        # dies in the already-registered, pre-existing qsgw_head.py
+        # head-response OOM (KNOWN_LORRAX_ISSUES.md's
+        # src/gw/qsgw_head.py:250-256 row; third independent
+        # reproduction, claims/0436.md) before ever reaching this
+        # pipeline's own code — that defect is inherited from this
+        # branch's base and is unrelated to this port (it also blocks
+        # head_correction=full under low_mem_bands=true for COHSEX at
+        # that scale).  Production-scale confirmation of THIS port
+        # remains open follow-up work, not claimed here.  ``mpa/sigma.py``
         # (insulating MPA's own executor,
         # ``_integrate_sigma_batches``) was mechanically ported the SAME
         # session, sharing this now-gated tau-kernel/projector infra, but
