@@ -226,8 +226,8 @@ run. See that branch's commits for the exact diff each check landed with.
   2x2`, JID 57438326, step `lx-Xg4-205215-1914834-7751`, exit 0): builds
   the SAME synthetic ψ, feeds it to `c_q_from_psi_sm(layout='legacy')`
   and `layout='face'`, diffs `C_q`. 3/3 cases PASS — `ns=1` with an
-  asymmetric upper edge (5296→... the L/R-window-not-mesh-divisible
-  case), `ns=2` (the GEMM-seam spin-merge order), and `ns=1` with an
+  asymmetric, non-mesh-divisible upper edge (the L/R-band-window "weight,
+  don't window" case), `ns=2` (the GEMM-seam spin-merge order), and `ns=1` with an
   asymmetric LOWER edge (`band_range_left[0] != band_range_full[0]`,
   the case a window-offset bug would show up in first). Max relative
   diff 3.8e-16 to 2.1e-15 across the three — float64 noise from a
@@ -237,6 +237,37 @@ run. See that branch's commits for the exact diff each check landed with.
   package's own `test_distrib_la_multiproc.py` uses for the identical
   reason. This test is gated at a 1e-10 relative bar, two orders of
   margin over what was measured.
+* **`zeta_q.h5` on-disk parity, production scale — value-level, NOT
+  bit-exact, and the gap is explained, not merely bounded.** Same k6_c600
+  deck, incumbent single-axis fit (`.../face_headoff/tmp/zeta_q.h5`) vs.
+  this session's face-CCT fit (`.../face_headoff_zetafit_facecct_2026-
+  08-22/tmp/zeta_q.h5`): identical dataset names/shapes/dtypes
+  (`g0_mu` (36,5282) c128, `zeta_q_G` (36,5282,3012) c128). Numerically,
+  `g0_mu` max\|diff\|=1.85e-5 (max rel 2.9e-5); `zeta_q_G`, sampled at
+  q∈{0,12,24,35}, max\|diff\|=1.73e-5, **max rel diff=6.4e-4** — three to
+  four orders of magnitude ABOVE the CCT Gram's own 1e-15-relative parity
+  measured above. This is the SAME mechanism `TASTE.md`'s "Arbitrary
+  choice under degeneracy" entry documents for this exact fit family ("a
+  finite ISDF basis is... fitted, truncated or ill-conditioned... a solve
+  can be conditioned badly enough that the difference decides the
+  answer," with its own worked example of one ULP flipping a pivoted-
+  Cholesky pivot order): `zeta_q_G` is not `C_q` itself but the OUTPUT of
+  STEP 3's rank-truncated Cholesky solve against `C_q`, and that solve is
+  the amplifier — a ~1e-15-relative perturbation in the Gram entering an
+  ill-conditioned factorization is expected to surface as a much larger
+  relative change in the solved coefficients, all while the underlying
+  physics is unchanged. The number that actually matters for whether this
+  redesign is safe to gate is the END-TO-END observable it feeds
+  (below): **eqp0 agrees to 7.0e-9 eV**, not the ~1e-9 eV a summation-
+  order change alone would predict on a WELL-conditioned quantity, but
+  still five orders of magnitude below any physically meaningful QP
+  energy scale. Per `TASTE.md` rule 15 (declare the parity class before
+  gating), this redesign's `zeta_q.h5` parity is **value-level / gauge
+  κ·ε**, not bit-exact — the CCT Gram itself (the actual output this
+  session's code changes) IS bit-exact-class (1e-15 relative); the
+  amplification happens downstream, in unmodified STEP 3 code, and would
+  reproduce on ANY two Gram matrices differing at float64 noise level,
+  face-vs-legacy or otherwise.
 * **End-to-end, real 16-rank CUDA, production scale**: MoS2 6×6×1, 626
   bands, μ≈5282, P=16 (4×4), `compute_mode=cohsex`, fresh fit,
   `low_mem_bands=true`, `head=off` — the same `86_bgw_lorrax_scaling`
