@@ -19,14 +19,23 @@ the bispinor bare exchange splits into two pieces:
 This module computes Σ^B by reusing the existing scalar
 ``sigma_sx`` kernel.  The trick:
 
-* **γ̃^i insertion at the LEFT vertex** = left-multiply ``psi_xn`` (the
-  "internal-band" wavefunction) on its spin axis by γ̃^i.
-* **γ̃^j insertion at the RIGHT vertex** = left-multiply ``psi_yr`` on
-  its spin axis by γ̃^j.
+* **γ̃^i insertion at the LEFT (G-build direct) vertex** and
+* **γ̃^j insertion at the RIGHT (G-build conjugated) vertex**
 
-After those two ψ rewrites, the existing kernel chain
+are both performed by :func:`gw.wavefunction_bundle.with_lorentz_vertices`
+— a REPRESENTATION-AWARE bundle operation (not this module's own code,
+since 2026-08-23): it folds γ̃^i/γ̃^j into whichever pair of fields plays
+the G-build's direct/conjugated role for ``wfns_transverse.layout``
+(``psi_xn``/``psi_yr`` under the legacy four-copy carrier,
+``psi_mun``/``psi_nmu`` under the two-face carrier — see that function's
+own docstring for the field/axis table).  That is what lets this module
+call ``_make_cohsex_kernels`` with the SAME layout dispatch every other
+static Σ channel already uses (``gw.cohsex_sigma``), rather than only
+ever working on a legacy bundle.
+
+After the vertex rewrite, the existing kernel chain
 ``build_G → _convolve → project`` evaluates the formula above
-verbatim — no changes to the kernel itself.
+verbatim — no changes to the kernel itself, in either layout.
 
 The 9 (i, j) tiles in the sum decompose as 6 unique kernel calls
 (3 diagonal + 3 upper-triangular) + 3 Hermitian-conjugate fills
@@ -42,14 +51,18 @@ Public surface
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .v_q_bispinor import BispinorVqReader
+from .wavefunction_bundle import (
+    bundle_bytes_per_rank,
+    face_kernel_kwargs,
+    with_lorentz_vertices,
+)
 
 
 # Lorentz indices that contribute to Σ^B (transverse only).  The 6
@@ -59,45 +72,19 @@ from .v_q_bispinor import BispinorVqReader
 _TRANSVERSE_INDICES = (1, 2, 3)
 
 
-def _wfns_with_lorentz_vertices(wfns, mu_L: int, nu_L: int):
-    """Return a Wavefunctions clone with γ̃^{μ_L} folded into psi_xn
-    (left vertex axis 1) and γ̃^{ν_L} folded into psi_yr (right vertex
-    axis 2) via :func:`common.gamma_matrices.gamma_apply` — a gather
-    + per-element phase multiply, no 4×4 matmul (every γ̃^μ is a
-    monomial matrix with values ∈ {±1, ±i}).
-
-    For (μ_L, ν_L) = (0, 0) γ̃^0 = I_4 (perm = identity, phase = 1)
-    so ``gamma_apply`` is a no-op — but we still short-circuit to
-    return the same array objects (avoids unnecessary copies on the
-    PSD scalar path).
-
-    psi_xr / psi_yn pass through unchanged; the γ̃ vertex sits on the
-    build_G side of the kernel chain — see the module docstring.
-
-    Note: ``build_G`` internally applies ``jnp.conj(psi_yr)`` before
-    contracting on the spin axis.  Folding γ̃^ν (Hermitian) into
-    psi_yr here yields ``conj(γ̃^ν ψ) = (γ̃^ν)* ψ* = (γ̃^ν)^T ψ*``,
-    which contracts with ``psi_yn`` to give the correct
-    ``ψ†_{yr} γ̃^ν ψ_{yn}`` Hermitian sandwich.  Required: γ̃^ν
-    Hermitian — γ̃^0 = I_4 and γ̃^i = α^i both qualify.
-    """
-    from common.gamma_matrices import gamma_perm_phase, gamma_apply
-
-    if mu_L == 0:
-        psi_xn_new = wfns.psi_xn
-    else:
-        perm, phase = gamma_perm_phase(mu_L)
-        # psi_xn shape (nk, s, μ_X, n); spin axis = 1.
-        psi_xn_new = gamma_apply(wfns.psi_xn, perm, phase, axis=1)
-
-    if nu_L == 0:
-        psi_yr_new = wfns.psi_yr
-    else:
-        perm, phase = gamma_perm_phase(nu_L)
-        # psi_yr shape (nk, n, s, μ_Y); spin axis = 2.
-        psi_yr_new = gamma_apply(wfns.psi_yr, perm, phase, axis=2)
-
-    return dataclasses.replace(wfns, psi_xn=psi_xn_new, psi_yr=psi_yr_new)
+def _n_rmu_padded(wfns) -> int:
+    """PADDED μ (centroid) extent of a transverse bundle, whichever field
+    it lives on for ``wfns.layout`` — the extent :func:`_pad_V_to_padded`
+    below pads the on-disk V tile up to.  ``psi_yr``'s trailing axis
+    under legacy, ``psi_mun``'s μ axis (index 2) under face — both are
+    the SAME logical quantity (``load_centroids_band_chunked``'s padded
+    n_rmu), just carried by a different field per layout (module
+    docstring of ``gw.wavefunction_bundle``)."""
+    if wfns.layout == "legacy":
+        return int(wfns.psi_yr.shape[-1])
+    if wfns.layout == "face":
+        return int(wfns.psi_mun.shape[2])
+    raise ValueError(f"_n_rmu_padded: unknown layout {wfns.layout!r}")
 
 
 def compute_sigma_x_bispinor(
@@ -147,17 +134,53 @@ def compute_sigma_x_bispinor(
     Returns
     -------
     jax.Array
-        Σ^B[k, m, n] on the same sharding as the scalar Σ_X.
+        Σ^B[k, m, n] REPLICATED, windowed to ``(nk, nb_sigma, nb_sigma)`` —
+        the same shape/sharding as the scalar Σ_X, in EITHER layout.
+        Under ``layout='legacy'`` this is what ``sigma_sx_k`` already
+        returns (its accessors window internally); under ``layout=
+        'face'`` this function gathers-then-windows its own summed
+        ``(nk, nb_full, nb_full)`` result itself, mirroring
+        ``compute_cohsex_sigma``'s identical gather-then-window sequence
+        for its OTHER static channels — so a caller can add this
+        function's return value to ``sig_x`` unconditionally, without a
+        per-layout shape special-case of its own.
     """
     from .cohsex_sigma import _make_cohsex_kernels
     nk_tot = int(meta.nk_tot)
-    sigma_sx_k, _, _ = _make_cohsex_kernels(mesh_xy, meta.kgrid, nk_tot)
+    # layout dispatch: face_kernel_kwargs(wfns_transverse) is {} under
+    # layout='legacy' (dead-code-eliminated at trace time, byte-identical
+    # to the pre-2026-08-23 unconditional call) and {"layout": "face",
+    # "face_shape": ...} under layout='face' — the SAME kwargs helper
+    # every other static Sigma channel uses (gw.cohsex_sigma._face_kwargs
+    # is a thin alias of this same function).  This is what makes
+    # sigma_sx_k route through greens_function_kernel.build_G(layout=...)
+    # / common.contract_bands.contract_bands_block_reshard(layout=...)
+    # for a face-layout wfns_transverse rather than only ever working on
+    # the legacy carrier.
+    sigma_sx_k, _, _ = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, nk_tot, **face_kernel_kwargs(wfns_transverse))
+
+    # Instrumented psi inventory disclosure (report §7's "disclose the
+    # selected layout"): the transverse-centroid bundle DOUBLES whichever
+    # psi inventory the primary bundle already carries.  MEASURED (not
+    # modeled) from wfns_transverse's own arrays — see
+    # wavefunction_bundle.bundle_bytes_per_rank's docstring for why this
+    # lives here rather than in gw.gflat_memory_model.
+    if verbose and jax.process_index() == 0:
+        _psi_bytes = bundle_bytes_per_rank(wfns_transverse)
+        _per_field = ", ".join(
+            f"{k}={v / 1e9:.4f} GB" for k, v in _psi_bytes.items() if k != "total")
+        print_fn(
+            f"  Σ^B transverse ψ inventory (layout={wfns_transverse.layout!r}): "
+            f"{_psi_bytes['total'] / 1e9:.4f} GB/rank ({_per_field}) — "
+            f"doubles whichever primary-bundle psi inventory this run "
+            f"already carries")
 
     # ψ is delivered at PADDED n_rmu (load_centroids_band_chunked rounds
     # to mesh-product); V tiles on disk are at LOGICAL extent.  Pad V to
     # match ψ's μ-axis so the convolve broadcasts correctly.  Pad rows
     # of ψ are zero (Phase 3a invariant), so zero-padding V is exact.
-    n_rmu_T_padded = int(wfns_transverse.psi_yr.shape[-1])
+    n_rmu_T_padded = _n_rmu_padded(wfns_transverse)
 
     def _pad_V_to_padded(V_logical: jax.Array) -> jax.Array:
         n_l = int(V_logical.shape[-2])
@@ -175,9 +198,22 @@ def compute_sigma_x_bispinor(
 ) as reader:
         for i in _TRANSVERSE_INDICES:
             for j in _TRANSVERSE_INDICES:
-                wfns_ij = _wfns_with_lorentz_vertices(wfns_transverse, i, j)
+                wfns_ij = with_lorentz_vertices(wfns_transverse, i, j)
                 V_ij = _pad_V_to_padded(reader.get_tile(i, j))
-                contrib = sigma_sx_k(wfns_ij, Gij, V_ij)
+                if wfns_transverse.layout == "face":
+                    # Face's two-array carrier serves BOTH the G-build's
+                    # internal band sum AND the outer projection bra/ket
+                    # (unlike legacy's four independent fields) — the
+                    # G-build must read the γ̃-inserted operands
+                    # (``wfns_ij``) while projection reads the ORIGINAL,
+                    # un-rotated ones (``wfns_transverse``).
+                    # ``sigma_sx``'s ``wfns_g=`` parameter exists
+                    # precisely for this (gw.cohsex_sigma.
+                    # _make_cohsex_kernels_face's own docstring).
+                    contrib = sigma_sx_k(
+                        wfns_transverse, Gij, V_ij, wfns_g=wfns_ij)
+                else:
+                    contrib = sigma_sx_k(wfns_ij, Gij, V_ij)
                 contrib.block_until_ready()
                 # Per-tile diagonal trace (eV) for diagnostic comparison
                 # against agent-B's MoS2 reference values (commit 69e8863).
@@ -193,5 +229,22 @@ def compute_sigma_x_bispinor(
 
     if sig_x_b is None:  # pragma: no cover — should never happen
         raise RuntimeError("compute_sigma_x_bispinor produced no contributions")
+
+    if wfns_transverse.layout == "face":
+        # sigma_sx_k(layout='face') never windows its own output (report
+        # §3: a face-sharded band axis cannot be sliced to an arbitrary
+        # logical window) — sig_x_b is still (nk, nb_full, nb_full),
+        # 2-D sharded.  Gather to replicated FIRST (legal at any size),
+        # THEN window to nb_sigma (a plain slice of a replicated array,
+        # no divisibility constraint) — the SAME sequence
+        # compute_cohsex_sigma/compute_v_h_sigma_x already use for their
+        # OTHER static channels, so this function's return contract
+        # matches theirs regardless of which layout built it.
+        rep = NamedSharding(mesh_xy, P(None, None, None))
+        sig_x_b = jax.lax.with_sharding_constraint(sig_x_b, rep)
+        nb_sigma = wfns_transverse.slices.nb_sigma
+        sig_x_b = sig_x_b[:, :nb_sigma, :nb_sigma]
+        sig_x_b = jax.lax.with_sharding_constraint(sig_x_b, rep)
+
     sig_x_b.block_until_ready()
     return sig_x_b
