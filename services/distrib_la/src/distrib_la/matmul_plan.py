@@ -254,9 +254,28 @@ class GemmPlan:
         ``beta == 0`` — its content is ignored) are mutually exclusive.
         With neither, and ``beta == 0``, the zero addend is built inside
         the same compiled call — see the module docstring.
+
+        ``out=`` is refused on a ``beta != 0`` plan.  Both ``C`` and
+        ``out`` reach the identical compiled ``_fn_with_c`` — the PLAN's
+        own ``beta`` (fixed at construction, not chosen per call) decides
+        whether that buffer's content is mathematically live.  On a
+        ``beta != 0`` plan, ``out=``'s "content is ignored, pure storage"
+        contract would silently be false: whatever the buffer happened to
+        hold gets scaled by ``beta`` and added into the result.  Refuse
+        by name rather than let a caller who read only the general
+        ``out=`` framing above get a silently wrong accumulate from stale
+        buffer content; use ``C=`` on such a plan, where the accumulate
+        semantics are explicit at the call site.
         """
         if C is not None and out is not None:
             raise ValueError("gemm_plan: pass C or out, not both")
+        if out is not None and self.beta != 0:
+            raise ValueError(
+                "gemm_plan: out= is only a content-ignored donation on a "
+                f"beta==0 plan (this plan's beta={self.beta}).  On a "
+                "beta!=0 plan out='s buffer content would be scaled by "
+                "beta and added into the result -- pass C= instead, "
+                "where that accumulate is explicit at the call site.")
         _check_operand(self, "A", A, (self.nq, self.m, self.k),
                       self.in_sharding_a)
         _check_operand(self, "B", B, (self.nq, self.k, self.n),
