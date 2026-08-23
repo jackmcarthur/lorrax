@@ -3717,6 +3717,158 @@ def _maybe_dump_e_history(
     barrier("sc.e_history.write", print_fn=print_fn)
 
 
+#: Floor below which a retained link's Löwdin-overlap singular value marks
+#: its window edge as cutting a hybridized (non-separable) manifold —
+#: PLAN.md D3(a).  Calibrated against the measured Na 8^3 SOC-48-band
+#: collapse (proposal_1, Sec 1.2 item 2 / KNOWN_LORRAX_ISSUES.md, the
+#: ``file_io/parallel_transport.py:407-415`` register row's sibling
+#: finding): a manifold the transport holonomy independently flagged
+#: (``max|S-1| = 1.9906``) carried retained singular values of ``5.462e-2``
+#: at band 45 and ``4.476e-8`` at band 48, against a healthy link's
+#: near-unitary overlap (near 1.0).  0.5 is a first, round, principled
+#: floor — half the fidelity of a clean link — not yet independently
+#: calibrated against a second material or system size; PLAN.md flags this
+#: exact number as needing its own calibration run.
+_LINK_HYBRIDIZATION_FLOOR: float = 0.5
+
+
+def _refuse_unsupported_link_stencil(kgrid, *, where: str) -> None:
+    """D3(c): per-axis stencil support, checked before ANY artifact read.
+
+    Mirrors the producer-side gate
+    (``file_io.parallel_transport.write_parallel_transport_artifact``) at
+    driver-entry altitude, off the SAME threshold
+    (``common.parallel_transport.undersampled_link_axes`` /
+    ``MIN_STENCIL_POINTS`` — one name, not a second literal ``5`` here) —
+    "before any allocation" (PLAN.md pipeline step 3): a deck whose links
+    could never have been written is refused here, before this driver opens
+    the artifact at all, rather than surfacing as a shape/refusal deep
+    inside the read.  Never called for ``sc_head_update=dft_velocity``,
+    which carries no stencil requirement on any axis (PLAN.md D2).
+    """
+    from common.parallel_transport import (MIN_STENCIL_POINTS,
+                                           undersampled_link_axes)
+
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    bad_axes = undersampled_link_axes(grid)
+    if not bad_axes:
+        return
+    raise ValueError(
+        "GATE pt_head_stencil_unsupported: "
+        f"{where} requires the nearest-neighbour link/fourth-order "
+        "connection stencil along every Cartesian mesh direction.\n"
+        f"  got:  kgrid={grid}, undersampled axes {', '.join(bad_axes)}\n"
+        f"  want: >={MIN_STENCIL_POINTS} mesh points on every axis, or a "
+        "head mode that needs no links\n"
+        "  fix:  for a genuinely lower-dimensional deck (a collapsed axis "
+        "with kgrid[i]=1, e.g. a slab), set sc_head_update=dft_velocity — "
+        "it reads the exact DFT p-matrix velocity alone and needs no "
+        "stencil on any axis; for an undersampled but periodic axis "
+        "(1 < kgrid[i] < 5), densify the mesh along it\n"
+        "  why:  the fourth-order +/-2 connection stencil differentiates "
+        "along k; a direction with too few points cannot support it, and "
+        "it is never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md, "
+        "file_io/parallel_transport.py row, fix note)\n"
+        "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
+        "pipeline step 3(c)")
+
+
+def _refuse_degenerate_window_edge(
+    enk_full_ry: np.ndarray, nb_logical: int, *, where: str,
+    trs_measured=None, mode: str = "strict",
+) -> None:
+    """D3(b): independent multiplet/TRIM degeneracy check on the head window.
+
+    "Independent" of D3(a): pure DFT energies, no link/singular-value data —
+    so, unlike D3(a), it applies to BOTH metal head modes.  Reuses
+    :func:`common.band_degeneracy.check_band_window`, the SAME "minimum gap
+    over k across a boundary" primitive this module already applies to the
+    SC active window elsewhere (``BandPartition.report_multiplet_splits`` /
+    ``promoted_to_multiplets``), rather than a second notion of "clean
+    boundary" for the head window specifically — CLAUDE.md: single source of
+    truth; rebuilding a symmetry/degeneracy primitive is banned.
+
+    A Kramers pair under measured TRS is EXACTLY degenerate at its TRIM k,
+    which is a special case of "the tightest gap this boundary has anywhere
+    in the BZ" — exactly what ``boundary_min_gaps`` already computes over
+    the FULL k-mesh.  There is no separate TRIM-only code path for that
+    reason: a bespoke TRIM-point enumeration would be a second, narrower
+    implementation of the same min-over-k question this reuse already
+    answers everywhere, including at every TRIM.  ``trs_measured`` (PLAN.md:
+    "TRS is measured, never assumed") is threaded through for the message
+    only, naming why a near-zero gap here is expected rather than alarming.
+    """
+    from common.band_degeneracy import check_band_window
+
+    e = np.asarray(enk_full_ry, dtype=np.float64)
+    nb = int(nb_logical)
+    if e.ndim != 2 or e.shape[1] <= nb:
+        # No bands beyond the window are on hand, so the window's own top
+        # edge cannot be told apart from a clean cut (band_degeneracy's own
+        # ``boundary_min_gaps`` docstring: a window cannot see the cut that
+        # produced it).  An honest scope limit, not a pass — callers should
+        # prefer to pass the WFN's full loaded spectrum, not an
+        # already-windowed slice, for exactly this reason.
+        return
+    trs_note = ("TRS measured to hold" if trs_measured
+                else "TRS measured NOT to hold" if trs_measured is not None
+                else "TRS not measured")
+    check_band_window(
+        e, 0, nb, mode=mode,
+        where=f"{where}, active window top edge ({trs_note}; a Kramers "
+              "pair is exactly degenerate at its TRIM k under measured "
+              "TRS)")
+
+
+def _refuse_hybridized_window_edge(
+    singular_values: np.ndarray, nb_logical: int, *, where: str,
+    floor: float = _LINK_HYBRIDIZATION_FLOOR,
+) -> None:
+    """D3(a): refuse a window whose edge cuts a hybridized manifold.
+
+    Reads the link overlap singular values
+    ``initialize_parallel_transport_artifact`` already writes and no
+    consumer read before this fix (PLAN.md D3(a) —
+    ``file_io.parallel_transport.SINGULAR_VALUES_DATASET``).  "Retained"
+    means WITHIN the window: with ``nb_logical`` bands kept and the array
+    descending along its last axis (the dataset's own ``ordering``
+    attribute), the minimum retained singular value is exactly the LAST
+    kept one, ``singular_values[..., :nb_logical].min()`` — no comparison to
+    bands outside the window is needed or available (the artifact carries
+    no bands beyond ``nb_logical``; see ``load_parallel_transport_head``'s
+    ``band_stop == expected_nb`` gate).
+    """
+    sv = np.asarray(singular_values, dtype=np.float64)
+    kept = sv[..., :int(nb_logical)]
+    if kept.size == 0:
+        return
+    worst = float(np.min(kept))
+    if worst > float(floor):
+        return
+    ik, idir, rank0 = (int(x) for x in np.unravel_index(
+        int(np.argmin(kept)), kept.shape))
+    direction = "xyz"[idir]
+    raise ValueError(
+        "GATE pt_head_window_hybridized: "
+        f"{where}: the active window's retained link singular values dip "
+        f"to {worst:.6e} (floor {float(floor):.3g}) — the window edge cuts "
+        "a manifold the link construction cannot resolve as separable "
+        "bands.\n"
+        f"  got:  min retained singular value {worst:.6e} at source-k row "
+        f"{ik}, direction {direction!r}, retained rank {rank0 + 1} of "
+        f"{int(nb_logical)}\n"
+        f"  want: every retained link singular value > {float(floor):.3g}\n"
+        "  fix:  snap the active window outward (more bands) until the cut "
+        "lands past the collapsing rank, or narrow it below that rank\n"
+        "  why:  a near-zero link singular value means the Löwdin overlap "
+        "between this band and its rotated k+b neighbour is far from "
+        "unitary — the band mixes with a partner the window excludes, so "
+        "the finite-link covariant derivative built across the cut is not "
+        "the derivative of a well-defined single band\n"
+        "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
+        "pipeline step 3(a)")
+
+
 def load_head_velocity_source(
     config,
     input_dir: str,
@@ -3744,6 +3896,17 @@ def load_head_velocity_source(
         therefore has no finite-link derivative of Delta H.
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
+
+    THREE PREFLIGHT REFUSALS run here, before the expensive per-iteration
+    head machinery ever sees this source (PLAN.md pipeline step 3 /
+    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md`` D3):
+
+    (c) per-axis stencil support — ``parallel_transport`` only, before the
+        artifact is even opened;
+    (b) independent multiplet/TRIM degeneracy at the active window's top
+        edge — both modes, pure DFT energies;
+    (a) link singular-value hybridization at the active window's top edge —
+        ``parallel_transport`` only, needs the links this mode alone reads.
     """
     from gw.gw_config import METAL_HEAD_UPDATES
 
@@ -3754,6 +3917,12 @@ def load_head_velocity_source(
         raise ValueError(
             f"sc_head_update={mode} requires do_G0=true; "
             "otherwise the rebuilt head has no consumer.")
+
+    nb_active = int(meta.b_id_4_user)
+    trs_measured = getattr(wfn, "trs_holds", None)
+    _refuse_degenerate_window_edge(
+        np.asarray(wfn.energies)[0], nb_active,
+        where=f"sc_head_update={mode}", trs_measured=trs_measured)
 
     from file_io.paths import resolve_input_path
 
@@ -3772,10 +3941,16 @@ def load_head_velocity_source(
             "(claim 0183 parks the covariant upgrade)")
         return source
 
+    _refuse_unsupported_link_stencil(
+        wfn.kgrid, where=f"sc_head_update={mode}")
+
     from .qsgw_head import load_parallel_transport_head
 
     source = load_parallel_transport_head(
         pt_path, mesh=mesh, wfn=wfn, meta=meta)
+    _refuse_hybridized_window_edge(
+        source.singular_values, source.nb_logical,
+        where=f"sc_head_update={mode}")
     vgate = source.validation
     print_fn(
         "  SC head: loaded validated parallel transport from "
