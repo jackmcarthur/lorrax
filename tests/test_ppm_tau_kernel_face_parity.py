@@ -178,9 +178,21 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     psi_nmu = jax.device_put(jnp.asarray(psi_full), nmu_spec)
     face_shape = (nk, nb_full, n_rmu, ns)
 
+    # pack_brackets=False: this module gates the MASK bracket loop
+    # specifically (module docstring, ``brackets_ns1``'s own case
+    # comment -- "exercising _bracketed_face's mask-intersection loop for
+    # real").  ``pack_brackets`` now defaults True at the multi-bracket
+    # kernel factory (2026-08-23), which would otherwise silently route
+    # this SAME case through the packed loop instead -- a different
+    # calling convention (tuples, not bare arrays) that this test's own
+    # operands below do not use.  Pin the mask route explicitly rather
+    # than ride whatever the current default happens to be; the packed
+    # route has its own dedicated gate,
+    # tests/test_pack_band_window.py, which cross-checks packed vs mask
+    # vs legacy on the identical three-bracket shape.
     tau_kernel_face = _get_sigma_tau_kernel(
         mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets,
-        layout="face", face_shape=face_shape)
+        layout="face", face_shape=face_shape, pack_brackets=False)
 
     out_face = jax.block_until_ready(tau_kernel_face(
         psi_mun, psi_nmu, psi_nmu, psi_mun,
