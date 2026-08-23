@@ -79,6 +79,26 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
+from .wavefunction_bundle import face_kernel_kwargs
+
+
+def _face_g_plan(mesh_xy: Mesh, face_shape):
+    """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
+    ``greens_function_kernel._face_build_G`` requires — mirrors
+    ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
+    (single source of truth: same GEMM shape, same convention, both
+    named as "built ONCE by the caller" in ``build_G``'s own docstring).
+    Used only by the invalid-pole static-limit term below
+    (:func:`_compute_invalid_static_sigma` /
+    :func:`_invalid_static_coh_by_bracket`), which runs O(1) times per
+    Σ_c(ω) evaluation — NOT per τ — so building this plan inline here
+    (rather than caching it, the way ``ppm_tau_kernel``'s per-τ hot-loop
+    factories do) is proportionate to its call frequency."""
+    from distrib_la import gemm_plan
+    nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    mu_s = n_rmu * ns
+    return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
+                     dtype=jnp.complex128)
 
 
 @dataclass(frozen=True)
@@ -793,20 +813,45 @@ def _run_sigma_branch(
     n_omega = int(omega_nonneg_ry.shape[0])
 
     s = wfns.slices
-    psi_coh_xn = wfns.xn(s.full)
-    psi_coh_yr = wfns.yr(s.full)
-    psi_proj_xr = wfns.xr(s.sigma)
-    psi_proj_yn = wfns.yn(s.sigma)
-    nk_proj = int(psi_proj_xr.shape[0])
-    # Mesh-pad the QP band window: the reduce-scatter projector and the
-    # Sigma_c tile sink both need m % p_x == 0 / n % p_y == 0 (see
-    # pad_sigma_window).  ``nb_proj`` stays the REAL window everywhere the
-    # caller can see; only the in-branch machinery runs at ``nb_pad``.
-    psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
-        psi_proj_xr, psi_proj_yn, mesh_xy)
-    # m and n are padded to DIFFERENT extents in general (m→p_x, n→p_y).
-    m_pad = int(psi_proj_xr.shape[1])
-    n_pad = int(psi_proj_yn.shape[3])
+    face_kwargs = face_kernel_kwargs(wfns)
+    if wfns.layout == "legacy":
+        psi_coh_xn = wfns.xn(s.full)
+        psi_coh_yr = wfns.yr(s.full)
+        psi_proj_xr = wfns.xr(s.sigma)
+        psi_proj_yn = wfns.yn(s.sigma)
+        nk_proj = int(psi_proj_xr.shape[0])
+        # Mesh-pad the QP band window: the reduce-scatter projector and the
+        # Sigma_c tile sink both need m % p_x == 0 / n % p_y == 0 (see
+        # pad_sigma_window).  ``nb_proj`` stays the REAL window everywhere
+        # the caller can see; only the in-branch machinery runs at
+        # ``nb_pad``.
+        psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
+            psi_proj_xr, psi_proj_yn, mesh_xy)
+        # m and n are padded to DIFFERENT extents in general (m→p_x, n→p_y).
+        m_pad = int(psi_proj_xr.shape[1])
+        n_pad = int(psi_proj_yn.shape[3])
+    else:
+        # Face carrier (2026-08-22): psi_mun/psi_nmu span the FULL
+        # [b0,b4) loaded extent and cannot be sliced/windowed to the Σ
+        # band window s.sigma (report obstacle #3) — used UNSLICED for
+        # both the G-build ("coh") and projection ("proj") roles, same
+        # operand identity as cohsex_sigma's own face kernels.  The
+        # in-branch accumulator therefore runs at ``nb_full`` (already
+        # mesh-divisible, BandSlices.b4's own invariant — no padding
+        # needed), NOT the physical Σ window.  ``nb_proj`` still carries
+        # the FINAL desired extent (nb_sigma): the driver's
+        # ``strip_sigma_window`` call slices the fully-gathered/replicated
+        # host array down to it after the τ loop, which is valid at ANY
+        # extent (a plain host slice, not a sharding-divisibility
+        # constraint) — see ``compute_sigma_c_ppm_omega_grid``'s
+        # ``assert tile_meta.nb_real == nb_proj``.
+        psi_coh_xn = wfns.psi_mun
+        psi_coh_yr = wfns.psi_nmu
+        psi_proj_xr = wfns.psi_nmu
+        psi_proj_yn = wfns.psi_mun
+        nk_proj = int(meta.nk_tot)
+        nb_proj = int(s.nb_sigma)
+        m_pad = n_pad = int(s.nb_full)
 
     if n_omega == 0:
         return None, []
@@ -832,6 +877,7 @@ def _run_sigma_branch(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         brackets=brackets,
+        **face_kwargs,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
     # project="full" windows — owner order 2026-07-28); crossing windows
@@ -841,6 +887,7 @@ def _run_sigma_branch(
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         merged_x=True,
         brackets=brackets,
+        **face_kwargs,
     )
 
     # One async-D2H accumulator over the memory-tile sink: Σ_c(ω,k,m,n)
@@ -935,13 +982,16 @@ def _compute_invalid_static_sigma(
     bands must enter with their fractional weights.
     """
     from common.collectives import gather_to_host
-    from .cohsex_sigma import build_Gij
+    from .cohsex_sigma import build_Gij, _occ_diag_full
     from .greens_function_kernel import build_G
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
+    face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
+    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+             if wfns.layout == "face" else None)
 
     with mesh_xy:
         W_static = jnp.where(
@@ -950,8 +1000,16 @@ def _compute_invalid_static_sigma(
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
         W_prep = spatial.prep_w(W_static)
-        psi_xr, psi_yn, nb_real = pad_sigma_window(
-            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+
+        if wfns.layout == "legacy":
+            psi_xr, psi_yn, nb_real = pad_sigma_window(
+                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        else:
+            # Face: project over the FULL nb_full extent (report §3), then
+            # strip to nb_sigma below — same "weight, don't window" +
+            # late-window pattern as cohsex_sigma's own face kernels.
+            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
+            nb_real = int(s.nb_sigma)
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -959,13 +1017,24 @@ def _compute_invalid_static_sigma(
         # free to overlap the occupied and RI contractions.  The production
         # fused-FFI route additionally keeps the R-space G tile inside its
         # bounded handler rather than materialising the decomposed FFT chain.
-        G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        if wfns.layout == "legacy":
+            G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        else:
+            nb_full = int(s.nb_full)
+            phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
+            G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
+                            layout="face", gemm=g_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_sx), nb_real), dtype=np.complex128)
         del G_occ, sig_sx
 
-        G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
+        if wfns.layout == "legacy":
+            G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
+        else:
+            mask = wfns.band_mask(s.sigma_sum).astype(jnp.complex128)
+            G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
+                           layout="face", gemm=g_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -1023,9 +1092,12 @@ def _invalid_static_coh_by_bracket(
     from common.collectives import gather_to_host
     from .greens_function_kernel import build_G
 
+    face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
+    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+             if wfns.layout == "face" else None)
 
     out = []
     with mesh_xy:
@@ -1035,12 +1107,27 @@ def _invalid_static_coh_by_bracket(
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
         W_prep = spatial.prep_w(W_static)
-        psi_xr, psi_yn, nb_real = pad_sigma_window(
-            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        if wfns.layout == "legacy":
+            psi_xr, psi_yn, nb_real = pad_sigma_window(
+                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        else:
+            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
+            nb_real = int(s.nb_sigma)
         for lo, hi in brackets:
-            G_ri = build_G(
-                wfns.xn(slice(int(lo), int(hi))),
-                wfns.yr(slice(int(lo), int(hi))))
+            if wfns.layout == "legacy":
+                G_ri = build_G(
+                    wfns.xn(slice(int(lo), int(hi))),
+                    wfns.yr(slice(int(lo), int(hi))))
+            else:
+                # "Weight, don't window" — the SAME bracket-as-mask
+                # substitute the tau kernel's own _bracketed_face uses:
+                # psi_mun/psi_nmu cannot be sliced to an arbitrary band
+                # sub-range, so the bracket becomes a band-range mask
+                # applied as a phase weight instead.
+                mask = wfns.band_mask(
+                    slice(int(lo), int(hi))).astype(jnp.complex128)
+                G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
+                               layout="face", gemm=g_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(
                 gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -1115,7 +1202,6 @@ def compute_sigma_c_ppm_omega_grid(
         plan, s, meta=meta, where="ppm_sigma bracket partition")
     brackets = plan.bounds
     n_brk = plan.n_brackets
-    psi_proj_xr = wfns.xr(s.sigma)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
@@ -1285,9 +1371,18 @@ def compute_sigma_c_ppm_omega_grid(
                 axis=0)
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
-    # 2026-07-31).
-    nk_proj = int(psi_proj_xr.shape[0])
-    nb_proj = int(psi_proj_xr.shape[1])
+    # 2026-07-31).  ``nk_proj``/``nb_proj`` are read off ``meta``/``s``
+    # directly (2026-08-22) rather than off a ``wfns.xr(s.sigma)`` probe
+    # slice — the FINAL Σ_c(ω,k,m,n) extent this driver publishes is
+    # ALWAYS (nk_tot, nb_sigma, nb_sigma) regardless of which internal
+    # accumulator extent ``_run_sigma_branch`` used to get there (nb_sigma
+    # itself under legacy; the mesh-divisible nb_full under face — see
+    # that function's own docstring), and reading it off ``wfns.xr``
+    # crashed under ``layout='face'`` (that accessor refuses by name;
+    # this WAS the exact crash site the low_mem_bands_dynamic_ppm_unported
+    # refusal's discovery run hit first).
+    nk_proj = int(meta.nk_tot)
+    nb_proj = int(s.nb_sigma)
     n_omega = int(omega_req.size)
     kij_bytes = float(n_omega * nk_proj * nb_proj * nb_proj * 16)
 
@@ -1300,6 +1395,30 @@ def compute_sigma_c_ppm_omega_grid(
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
     sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
+    if sharded_layout and wfns.layout == "face":
+        # NOT PORTED (2026-08-22).  The sharded-output tail below
+        # (`sigma.tile_finalize`) asserts the per-rank tiles it received
+        # are ALREADY at the nb_proj=nb_sigma extent with no pad
+        # (`tile_meta.spatial_padded == (n_brk, nk_proj, nb_proj, nb_proj)`)
+        # — true under legacy (pad_sigma_window rounds UP to nb_proj's own
+        # mesh-divisible ceiling) but false under face whenever
+        # nb_full != nb_sigma (the internal accumulator runs at nb_full,
+        # per `_run_sigma_branch`'s own docstring).  `sigma_omega_layout
+        # = sharded` is production-reachable only for
+        # `mpa_material_class = metal` (gw_config.py), which is already
+        # refused under `low_mem_bands = true`
+        # (`low_mem_bands_metal_material_class_unported`) — so this is a
+        # defensive backstop for a deck that sets the layout explicitly
+        # without going through that path, not a gap in the metal port.
+        raise NotImplementedError(
+            "compute_sigma_c_ppm_omega_grid: sigma_omega_layout = 'sharded' "
+            "is not ported for low_mem_bands = true, layout = 'face' — the "
+            "sharded end-of-stage tail assumes the branch tiles already sit "
+            "at the nb_sigma extent with no pad, which face's internal "
+            "nb_full-extent accumulator does not generally satisfy.  Use "
+            "sigma_omega_layout = replicated (the default) under "
+            "low_mem_bands = true, or low_mem_bands = false for a sharded "
+            "Σ_c(ω) cube.")
     if sharded_layout:
         # ONE owner for this precondition; the MPA executor calls the same
         # function (doctrine 3 / pattern #6 -- refuse with the fix named,

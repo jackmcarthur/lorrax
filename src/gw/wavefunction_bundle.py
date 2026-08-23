@@ -393,6 +393,29 @@ jax.tree_util.register_dataclass(
 )
 
 
+def face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
+    """``{}`` under ``layout='legacy'``; ``{"layout": "face", "face_shape":
+    (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.
+
+    THE single source of truth for the layout/face_shape kwargs every
+    layout-dispatching kernel factory in this codebase needs
+    (``common.contract_bands.contract_bands_block_reshard``,
+    ``gw.cohsex_sigma._make_cohsex_kernels``, ``gw.ppm_tau_kernel``'s
+    kij/spatial/tau kernel factories, ``gw.mpa.sigma``'s shared tau
+    kernel call) — read off ``wfns.psi_mun``'s own shape rather than
+    threaded in by every call site, since the bundle already carries it.
+    Originally ``cohsex_sigma._face_kwargs`` (2026-08-22 COHSEX face
+    port); moved here and generalised the same day so the dynamic PPM/MPA
+    Σ_c(τ) port could reuse it rather than re-deriving the same 4-tuple
+    a second time (TASTE microservice rule: a routine used in 2+ places
+    gets one owner).
+    """
+    if wfns.layout != "face":
+        return {}
+    nk, s, mu, n = wfns.psi_mun.shape
+    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, s)}
+
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------

@@ -158,16 +158,39 @@ def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
 # PPM sigma use the same factory pattern.
 # ---------------------------------------------------------------------------
 
+def _occ_diag_full(Gij, nb_sigma, nb_full):
+    """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
+    nb_full) COMPLEX weight vector, zero-padded outside [0, nb_sigma).
+    Every production Gij (integer or diag(f), :func:`build_Gij`) is
+    diagonal by construction — obstacle #4's "carry the occupation vector
+    as the common path".  This reads that diagonal rather than doing the
+    O(nb_sigma^2) contraction the face path exists to avoid; it does not
+    detect a genuinely dense (off-diagonal) Gij, which
+    :func:`greens_function_kernel.build_G` already refuses by name for
+    face layout before this is reached.
+
+    Module-level (not a closure) since 2026-08-22: shared by this
+    module's own static kernels (below) AND ``gw.ppm_sigma``'s
+    invalid-pole static-limit term, which builds the identical face-G
+    occupation weight for the SAME reason (single-source-of-truth
+    microservice rule) — see ``gw.ppm_sigma._compute_invalid_static_sigma``.
+    """
+    if nb_sigma > nb_full:
+        raise ValueError(
+            f"_occ_diag_full: nb_sigma={nb_sigma} exceeds nb_full={nb_full}")
+    diag = jnp.diagonal(Gij, axis1=1, axis2=2)   # (nk, nb_sigma)
+    return jnp.pad(diag, ((0, 0), (0, nb_full - nb_sigma)))
+
+
 def _face_kwargs(wfns) -> dict:
     """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
     ``face_shape`` kwargs :func:`_make_cohsex_kernels` needs under
-    ``layout='face'`` — read off ``psi_mun``'s own shape rather than
-    threaded in by every call site, since the bundle already carries it.
-    """
-    if wfns.layout != "face":
-        return {}
-    nk, s, mu, n = wfns.psi_mun.shape
-    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, s)}
+    ``layout='face'``.  Thin alias for
+    :func:`gw.wavefunction_bundle.face_kernel_kwargs`, the shared owner
+    (2026-08-22) — kept under this name so this module's own call sites
+    below did not need to change."""
+    from .wavefunction_bundle import face_kernel_kwargs
+    return face_kernel_kwargs(wfns)
 
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
@@ -344,29 +367,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
     hartree_plan = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
                              dtype=jnp.complex128)
 
-    def _occ_diag_full(Gij, nb_sigma):
-        """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
-        nb_full) COMPLEX weight vector, zero-padded outside [0,
-        nb_sigma).  Every production Gij (integer or diag(f),
-        :func:`build_Gij`) is diagonal by construction — obstacle #4's
-        "carry the occupation vector as the common path".  This reads
-        that diagonal rather than doing the O(nb_sigma^2) contraction the
-        face path exists to avoid; it does not detect a genuinely dense
-        (off-diagonal) Gij, which :func:`greens_function_kernel.build_G`
-        already refuses by name for face layout before this is reached
-        (``sigma_sx``/``hartree`` below never pass a dense Gij to it —
-        they consume only this diagonal)."""
-        if nb_sigma > nb_full:
-            raise ValueError(
-                f"_make_cohsex_kernels_face: nb_sigma={nb_sigma} exceeds "
-                f"nb_full={nb_full}")
-        diag = jnp.diagonal(Gij, axis1=1, axis2=2)   # (nk, nb_sigma)
-        return jnp.pad(diag, ((0, 0), (0, nb_full - nb_sigma)))
-
     @jax.jit
     def sigma_sx(wfns, Gij, W_q):
         s = wfns.slices
-        phases = _occ_diag_full(Gij, s.nb_sigma)
+        phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
                         layout="face", gemm=g_plan)
         return _project(wfns.psi_nmu, wfns.psi_mun,
@@ -392,7 +396,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
         specialised to a diagonal-in-μ weight rather than a full O
         operator (see this function's docstring)."""
         s = wfns.slices
-        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma)).astype(jnp.float64)
+        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma, nb_full)).astype(jnp.float64)
         psi_mun, psi_nmu = wfns.psi_mun, wfns.psi_nmu
 
         # Local band-weighted density: |psi_mun|^2 * occ, summed over k

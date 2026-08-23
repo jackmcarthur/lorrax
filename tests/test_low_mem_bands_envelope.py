@@ -14,20 +14,37 @@ default), so it is guarded separately by
 together.
 
 THE ``low_mem_bands_dynamic_ppm_unported`` ROW (added 2026-08-22, after the
-other five) is a CORRECTION, not part of the original guide text: the guide's
-own §6 envelope listed ``compute_mode = gn_ppm`` as an example of a
-*supported* combination, and the sibling wave that ported G/projection/
-Hartree only ported the STATIC Σ channels (x_only, COHSEX's sigma_sx/
-sigma_coh/hartree) — the dynamic two-point-PPM/MPA Σ_c(ω) pipeline
-(``ppm_tau_kernel.py``, ``ppm_sigma.py``, ``mpa/sigma.py``) still reads the
-legacy ``wfns.xn/xr/yr/yn`` accessors directly.  This was discovered on real
-4-rank CUDA (`tests/multi_device/
+other five, NARROWED to MPA-only the same day) is a CORRECTION, not part of
+the original guide text: the guide's own §6 envelope listed
+``compute_mode = gn_ppm`` as an example of a *supported* combination, and
+the sibling wave that ported G/projection/Hartree only ported the STATIC Σ
+channels (x_only, COHSEX's sigma_sx/sigma_coh/hartree) — the dynamic
+two-point-PPM/MPA Σ_c(ω) pipeline (``ppm_tau_kernel.py``, ``ppm_sigma.py``,
+``mpa/sigma.py``) still read the legacy ``wfns.xn/xr/yr/yn`` accessors
+directly.  This was discovered on real 4-rank CUDA (`tests/multi_device/
 low_mem_bands_one_shot_insulating_envelope_gate.py`, ``claims/0429.md``): a
 ``compute_mode = gn_ppm`` deck ran the ISDF fit and chi0/W screening to
 completion under ``layout='face'`` and then died inside
 ``ppm_tau_kernel.precompile_sigma`` with the carrier's own named
 ``_require_legacy`` ``ValueError`` — a real crash, not a clean parse-time
-refusal.  This row closes that gap.
+refusal.
+
+LIFTED for ``gn_ppm``/``hl_ppm`` 2026-08-22 (feat/dynamic-sigma-face-port-
+2026-08-22): both now dispatch on ``wfns.layout`` and route through the
+SAME canonical ``build_G_tau(layout='face', gemm=...)``/
+``contract_bands_block_reshard(layout='face', channels=...)`` owners the
+static COHSEX channels already used.  Gated on real 4-rank CUDA (algebra
+parity, ``tests/test_ppm_tau_kernel_face_parity.py``) and a real
+end-to-end MoS2 k6_c50 ``compute_mode = gn_ppm head_correction = full``
+leg matching the legacy gn_ppm reference to ~1e-5 eV — see
+``gw.gw_config``'s own row comment and the session's ``CLAIMS.md`` rows
+for job ids.  A larger k6_c600 (mu=5282) confirmation of the same
+combination hit a pre-existing, unrelated ``qsgw_head.py`` OOM
+(``claims/0436.md``) before reaching this port's own code; production-
+scale confirmation remains open follow-up work.  ``mpa/sigma.py``
+(insulating MPA) was mechanically ported the same session but is NOT
+end-to-end gated, so the row STAYS for ``compute_mode = mpa`` — see that
+module's own comment.
 
 Same shape as ``tests/test_screening_diagrams_config.py``'s w_bse refusal
 matrix: a RED TWIN per rule (it actually fires, names its rule id, carries
@@ -94,13 +111,9 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
     ("low_mem_bands_bispinor_unported",
      "head_correction = off\nbispinor = true\n"),
     ("low_mem_bands_dynamic_ppm_unported",
-     "head_correction = off\ncompute_mode = gn_ppm\n"),
-    ("low_mem_bands_dynamic_ppm_unported",
-     "head_correction = off\ncompute_mode = hl_ppm\n"),
-    ("low_mem_bands_dynamic_ppm_unported",
-     "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA
-    ("low_mem_bands_dynamic_ppm_unported",
-     "head_correction = off\nqp_solver = fixed_point\ncompute_mode = gn_ppm\n"),
+     "head_correction = off\ncompute_mode = mpa\n"),   # insulating MPA;
+    # gn_ppm/hl_ppm/qp_solver=fixed_point(+gn_ppm) LIFTED 2026-08-22 -- see
+    # the positive-twin matrix below.
 ])
 def test_each_unsupported_combination_refuses_at_parse_time(
         tmp_path, rule_id, extra):
@@ -123,15 +136,24 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     wfns.psi_nmu/psi_mun, so the former
     low_mem_bands_head_correction_full_unported row is deleted per its own
     recorded lift condition.  A bare ``low_mem_bands = true`` deck with a
-    STATIC Sigma channel must resolve with no head refusal; a dynamic
-    compute_mode still refuses, but via the DYNAMIC row, not a head row."""
+    STATIC Sigma channel must resolve with no head refusal.  GN-PPM at the
+    bare default (head_correction=full) is ALSO now the fully-supported
+    shipping-default deck under low_mem_bands (feat/dynamic-sigma-face-
+    port-2026-08-22 -- gated end to end, see this file's module
+    docstring); a genuinely unported dynamic mode (MPA) still refuses, via
+    the DYNAMIC row, not a head row."""
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = cohsex\n")
         assert cfg.head.correction.value == "full"
     with tempfile.TemporaryDirectory() as d:
+        cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = gn_ppm\n")
+        assert cfg.head.correction.value == "full"
+    with tempfile.TemporaryDirectory() as d:
         with pytest.raises(ValueError, match="low_mem_bands_dynamic_ppm_unported"):
-            _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = gn_ppm\n")
+            _config(pathlib.Path(d),
+                   "low_mem_bands = true\nhead_correction = off\n"
+                   "compute_mode = mpa\n")
 
 
 # ---------------------------------------------------------------------------
@@ -146,21 +168,32 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "head_correction = off\ncompute_mode = cohsex\n",
     "head_correction = off\nbispinor = false\n",
     "head_correction = off\nrestart = true\n",
+    # GN-PPM/HL-PPM, LIFTED 2026-08-22 (feat/dynamic-sigma-face-port-
+    # 2026-08-22) -- gated end to end on real 4-rank CUDA (algebra parity
+    # + a real MoS2 k6_c50 leg vs the legacy gn_ppm reference; a larger
+    # k6_c600 confirmation hit an unrelated pre-existing OOM), see this
+    # file's module docstring.  head_correction is left at its bare
+    # default (full) here deliberately: that is now the fully-supported
+    # SHIPPING-DEFAULT deck under low_mem_bands, not merely a case that
+    # happens to also work.
+    "compute_mode = gn_ppm\n",
+    "compute_mode = hl_ppm\n",
+    "compute_mode = gn_ppm\nqp_solver = fixed_point\n",
 ])
 def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     """The other half of a refusal matrix: what it does NOT refuse.
 
-    scalar/spinor, one-shot insulator (qp_solver=one_shot_dft only —
-    fixed_point structurally requires a dynamic compute_mode, which the
-    low_mem_bands_dynamic_ppm_unported row now refuses), head_correction=
-    off|no_local_fields, standard chi0, the STATIC Sigma channels only
-    (x_only, COHSEX), restart — none of these should trip a rule the
-    moment low_mem_bands=true is added beside them.
+    scalar/spinor, one-shot insulator (qp_solver=one_shot_dft) OR
+    qp_solver=fixed_point with a dynamic compute_mode, head_correction=
+    off|no_local_fields|full (the bare default), standard chi0, EVERY
+    Sigma channel except MPA (x_only, COHSEX, GN-PPM, HL-PPM), restart —
+    none of these should trip a rule the moment low_mem_bands=true is
+    added beside them.
 
-    GN-PPM/HL-PPM/insulating MPA and qp_solver=fixed_point used to be
-    listed here.  A real 4-rank CUDA gate found compute_mode=gn_ppm
-    crashing mid-run (claims/0429.md); those cases moved to the red-twin
-    matrix above under low_mem_bands_dynamic_ppm_unported.
+    Insulating MPA is still refused (compute_mode = mpa's own
+    mechanical face port has no end-to-end gate yet — see gw.mpa.sigma's
+    own comment); it stays in the red-twin matrix above under
+    low_mem_bands_dynamic_ppm_unported.
     """
     config = _config(tmp_path, "low_mem_bands = true\n" + extra)
     assert config.memory.low_mem_bands is True
