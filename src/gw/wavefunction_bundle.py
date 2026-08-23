@@ -958,10 +958,19 @@ def _place_U_face(U, mesh_xy: Mesh):
     ``nk·nb_active²`` complex128, i.e. ``nk·nb_active²·16`` bytes PER
     RANK — an N_b-class object (the active σ-window, bounded by the
     deck's own band count), never an N_μ-class one.  At nb_active=640,
-    nk=144 this is 9.44 MiB/rank; contrast the μ-class objects this
-    layout exists to keep off any single rank (G/W/V at
-    ``O(N_μ²/P)`` per rank, reaching multi-GB at production μ).  This is
-    the SAME bound legacy's own replicated-U path already accepted (see
+    nk=144 this is 900.0 MiB/rank (144·640²·16 bytes — corrected
+    2026-08-23 audit round; an earlier draft of this comment stated
+    9.44 MiB, off by ~95x). In production this branch is rarely taken at
+    all: ``sc_iteration.py``'s own eigensolves (``distributed_eigh_bands``/
+    ``eigh_kshard``) always hand ``rotate_wavefunctions`` an
+    ALREADY-PLACED ``jax.Array`` U, which takes the no-op
+    ``isinstance`` branch below and never reaches this replicated
+    ``device_put`` at all — the host-numpy path this figure prices is a
+    test/harness-only fallback. Still bounded and worth contrasting with
+    the μ-class objects this layout exists to keep off any single rank
+    (G/W/V at ``O(N_μ²/P)`` per rank, reaching multi-GB at production
+    μ). This is the SAME bound legacy's own replicated-U path already
+    accepted (see
     :func:`rotate_wavefunctions`'s docstring, "U IS NEVER REPLICATED"
     section — legacy's IS, in this one host-array corner case; only the
     SHARDED-U path that section describes avoids it, and this function's
