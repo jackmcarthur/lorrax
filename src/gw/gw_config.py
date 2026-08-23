@@ -3015,42 +3015,27 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
 #: from ``compute_sigma_xc`` at the one seam that ever sees both operands
 #: together.
 _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
-    (
-        # LIFT CONDITION: a face-layout port of the full q->0 head/body
-        # wing kernel (``gw/qsgw_head.py:850-1234``, gated on
-        # ``HeadCorrection.FULL`` at ``gw_jax.py:469,573``) is being built
-        # in parallel on ``feat/head-wings-face-port-2026-08-22``.  That
-        # branch lifts this refusal with A SINGLE PREDICATE CHANGE: delete
-        # this row (the same "removing a row is the landing gesture"
-        # convention ``UNIMPLEMENTED_MODES`` uses above) once
-        # ``head_wings_sharded`` / ``static_head_wings_sharded`` read
-        # ``wfns.psi_nmu`` / ``wfns.psi_mun`` instead of the legacy
-        # accessors.
-        "low_mem_bands_head_correction_full_unported",
-        lambda cfg: cfg.head.correction is HeadCorrection.FULL,
-        lambda cfg: f"head_correction = {cfg.head.correction.value}",
-        "head_correction = off or no_local_fields",
-        "set head_correction = off or no_local_fields, or low_mem_bands = "
-        "false",
-        "the full q->0 head/body wing kernel reads wfns.psi_xn/psi_yn "
-        "directly and has no face-layout port yet (census row 'Full q->0 "
-        "head/body wings').  head_correction=full is the shipping default, "
-        "so this is the FIRST refusal an unqualified low_mem_bands=true "
-        "deck hits",
-    ),
-    (
-        "low_mem_bands_self_consistent_unported",
-        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
-        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
-        "qp_solver = one_shot_dft (the default) or fixed_point",
-        "run low_mem_bands=true single-shot; drop qp_solver or set it to "
-        "one_shot_dft/fixed_point, or set low_mem_bands = false for a QSGW "
-        "loop",
-        "every QSGW SC map rotates the wavefunction bundle "
-        "(wavefunction_bundle.py:543-706, sc_iteration.py:1753); a face "
-        "bundle needs two distributed rotations (U^T @ psi_nmu, psi_mun @ "
-        "U) that are not built (census row 'QSGW orbital rotation')",
-    ),
+    # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
+    # own recorded lift condition: rotate_wavefunctions now dispatches on
+    # wfns_dft.layout and routes layout='face' through
+    # wavefunction_bundle._rotate_wavefunctions_face (two planned
+    # distrib_la.gemm_plan N,N GEMMs -- U^T @ psi_nmu, psi_mun @ U -- against
+    # a block-embedded U rather than a sliced ψ; see wavefunction_bundle
+    # ._face_rotate_kernel/._face_embed_active_U).  sc_iteration.py:1753
+    # needed NO change: it already calls rotate_wavefunctions(inputs.
+    # wfns_dft, ...), and the dispatch reads wfns_dft.layout, not a
+    # call-site flag.  Gated: real 4-rank CUDA algebra parity vs legacy
+    # (tests/test_qsgw_rotate_face_parity.py, U from a REAL small eigh —
+    # ns=1/ns=2, default AND offset active windows — 3/3 PASS, max relative
+    # diff ~1e-16..2e-16); a real end-to-end MoS2 k6_c50 compute_mode=
+    # gn_ppm head_correction=full qp_solver=self_consistent (3 iterations)
+    # leg, face vs legacy — see this session's CLAIMS.md row for job id and
+    # measured tolerances.  ``head_wings_sharded``'s own consumer,
+    # ``build_iteration_head_response`` (qsgw_head.py), needed NO change
+    # either: it treats ``wfns_qp`` opaquely (no direct psi_* field access)
+    # and forwards it to the already layout-dispatching wing kernels; the
+    # ONLY reason it read as "still legacy-only" before this session is
+    # that its sole producer, rotate_wavefunctions, had no face arm.
     (
         "low_mem_bands_metal_material_class_unported",
         lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
