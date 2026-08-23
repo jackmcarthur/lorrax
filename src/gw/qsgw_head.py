@@ -292,6 +292,13 @@ class ParallelTransportHeadData:
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
     validation: dict[str, float]
+    #: ``(n_source, 3, nb_logical)`` link-overlap singular values, descending
+    #: along the last axis, host-resident (small: O(nk*nb) real numbers).
+    #: Read but NOT consulted by this loader itself -- the D3(a) preflight
+    #: in ``sc_iteration.load_head_velocity_source`` reads it from here to
+    #: refuse a window edge that cuts a hybridized manifold.  See
+    #: ``file_io.parallel_transport.load_link_singular_values``.
+    singular_values: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -381,6 +388,7 @@ def load_parallel_transport_head(
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
+        load_link_singular_values,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
@@ -494,6 +502,12 @@ def load_parallel_transport_head(
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
         )
+        # Small (O(nk*nb) real) host-resident diagnostic, read in the SAME
+        # handle as everything above -- one owner, one open, per this
+        # loader's own docstring.  Not consulted here; the D3(a) window
+        # preflight in ``sc_iteration.load_head_velocity_source`` reads it
+        # off the returned object.
+        singular_values = load_link_singular_values(io, nb_logical=expected_nb)
 
     expected_prefix = (3, int(meta.nk_tot))
     if (
@@ -533,6 +547,7 @@ def load_parallel_transport_head(
         nb_logical=expected_nb,
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
+        singular_values=singular_values,
     )
 
 
