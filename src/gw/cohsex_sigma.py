@@ -158,16 +158,39 @@ def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
 # PPM sigma use the same factory pattern.
 # ---------------------------------------------------------------------------
 
+def _occ_diag_full(Gij, nb_sigma, nb_full):
+    """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
+    nb_full) COMPLEX weight vector, zero-padded outside [0, nb_sigma).
+    Every production Gij (integer or diag(f), :func:`build_Gij`) is
+    diagonal by construction — obstacle #4's "carry the occupation vector
+    as the common path".  This reads that diagonal rather than doing the
+    O(nb_sigma^2) contraction the face path exists to avoid; it does not
+    detect a genuinely dense (off-diagonal) Gij, which
+    :func:`greens_function_kernel.build_G` already refuses by name for
+    face layout before this is reached.
+
+    Module-level (not a closure) since 2026-08-22: shared by this
+    module's own static kernels (below) AND ``gw.ppm_sigma``'s
+    invalid-pole static-limit term, which builds the identical face-G
+    occupation weight for the SAME reason (single-source-of-truth
+    microservice rule) — see ``gw.ppm_sigma._compute_invalid_static_sigma``.
+    """
+    if nb_sigma > nb_full:
+        raise ValueError(
+            f"_occ_diag_full: nb_sigma={nb_sigma} exceeds nb_full={nb_full}")
+    diag = jnp.diagonal(Gij, axis1=1, axis2=2)   # (nk, nb_sigma)
+    return jnp.pad(diag, ((0, 0), (0, nb_full - nb_sigma)))
+
+
 def _face_kwargs(wfns) -> dict:
     """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
     ``face_shape`` kwargs :func:`_make_cohsex_kernels` needs under
-    ``layout='face'`` — read off ``psi_mun``'s own shape rather than
-    threaded in by every call site, since the bundle already carries it.
-    """
-    if wfns.layout != "face":
-        return {}
-    nk, s, mu, n = wfns.psi_mun.shape
-    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, s)}
+    ``layout='face'``.  Thin alias for
+    :func:`gw.wavefunction_bundle.face_kernel_kwargs`, the shared owner
+    (2026-08-22) — kept under this name so this module's own call sites
+    below did not need to change."""
+    from .wavefunction_bundle import face_kernel_kwargs
+    return face_kernel_kwargs(wfns)
 
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
@@ -344,30 +367,41 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
     hartree_plan = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
                              dtype=jnp.complex128)
 
-    def _occ_diag_full(Gij, nb_sigma):
-        """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
-        nb_full) COMPLEX weight vector, zero-padded outside [0,
-        nb_sigma).  Every production Gij (integer or diag(f),
-        :func:`build_Gij`) is diagonal by construction — obstacle #4's
-        "carry the occupation vector as the common path".  This reads
-        that diagonal rather than doing the O(nb_sigma^2) contraction the
-        face path exists to avoid; it does not detect a genuinely dense
-        (off-diagonal) Gij, which :func:`greens_function_kernel.build_G`
-        already refuses by name for face layout before this is reached
-        (``sigma_sx``/``hartree`` below never pass a dense Gij to it —
-        they consume only this diagonal)."""
-        if nb_sigma > nb_full:
-            raise ValueError(
-                f"_make_cohsex_kernels_face: nb_sigma={nb_sigma} exceeds "
-                f"nb_full={nb_full}")
-        diag = jnp.diagonal(Gij, axis1=1, axis2=2)   # (nk, nb_sigma)
-        return jnp.pad(diag, ((0, 0), (0, nb_full - nb_sigma)))
-
     @jax.jit
-    def sigma_sx(wfns, Gij, W_q):
+    def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
+        """``wfns_g``, when given, supplies the G-BUILD's two operands
+        (``psi_mun``/``psi_nmu``) INSTEAD of ``wfns``; the projection
+        step always reads ``wfns``'s own copies.  Defaults to ``wfns``
+        (every non-bispinor caller — identical to the pre-2026-08-23
+        body, since ``g = wfns_g or wfns`` then reproduces the exact
+        prior computation byte-for-byte).
+
+        THE REASON THIS PARAMETER EXISTS AT ALL, and not on the legacy
+        sibling: the two-face carrier stores exactly ONE (psi_mun,
+        psi_nmu) pair, reused for BOTH the G-build's internal band sum
+        and the outer band-basis projection — unlike the legacy
+        four-copy carrier, whose G-vertex fields (psi_xn/psi_yr) and
+        projection fields (psi_xr/psi_yn) are already four INDEPENDENT
+        arrays.  The bispinor Σ^B transverse-vertex trick
+        (``gw.sigma_x_bispinor``) needs γ̃ folded into the G-build's
+        INTERNAL band sum only — never into the OUTER projection bra/
+        ket (module docstring of ``gw.sigma_x_bispinor``: "the γ̃ vertex
+        sits on the build_G side of the kernel chain, not the
+        projection side").  On legacy that separation is already free
+        (``gw.wavefunction_bundle.with_lorentz_vertices`` only ever
+        touches psi_xn/psi_yr); on face, WITHOUT this parameter, the
+        SAME two arrays would have to serve both roles at once, and a
+        γ̃-inserted psi_mun/psi_nmu would corrupt the projection's outer
+        bra/ket along with the G-build — MEASURED: real 4-rank CUDA,
+        transverse (mu_L, nu_L) != (0,0) tiles disagreed with the
+        legacy reference by O(1) relative before this parameter existed
+        (tests/multi_device/bispinor_transverse_vertex_face_gate.py's
+        own bring-up).
+        """
         s = wfns.slices
-        phases = _occ_diag_full(Gij, s.nb_sigma)
-        G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
+        g = wfns_g if wfns_g is not None else wfns
+        phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
+        G_occ = build_G(g.psi_mun, g.psi_nmu, phases=phases,
                         layout="face", gemm=g_plan)
         return _project(wfns.psi_nmu, wfns.psi_mun,
                         _convolve(G_occ, W_q, 1.0),
@@ -392,7 +426,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
         specialised to a diagonal-in-μ weight rather than a full O
         operator (see this function's docstring)."""
         s = wfns.slices
-        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma)).astype(jnp.float64)
+        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma, nb_full)).astype(jnp.float64)
         psi_mun, psi_nmu = wfns.psi_mun, wfns.psi_nmu
 
         # Local band-weighted density: |psi_mun|^2 * occ, summed over k
@@ -619,15 +653,13 @@ def compute_cohsex_sigma(
         # or ``bispinor_v_q_path`` is missing.  See
         # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and bispinor_v_q_path is not None:
-            if wfns.layout == "face":
-                raise NotImplementedError(
-                    "compute_cohsex_sigma: bispinor transverse exchange is "
-                    "not ported for layout='face' (envelope: "
-                    "bispinor=true refuses — gw.sigma_x_bispinor hard-codes "
-                    "the legacy psi_xn/psi_yr accessors).  This should "
-                    "already be unreachable via gw_init's own bispinor + "
-                    "low_mem_bands guard; refusing here too as a defensive "
-                    "backstop for a direct caller.")
+            # face-layout defensive backstop REMOVED 2026-08-23
+            # (feat/transverse-zeta-face-2026-08-23): compute_sigma_x_
+            # bispinor is representation-aware since feat/bispinor-
+            # face-2026-08-23 (with_lorentz_vertices, face_kernel_kwargs
+            # dispatch) and the low_mem_bands_bispinor_unported envelope
+            # row that made this branch unreachable for face is now
+            # lifted — this call is the real, gated path, not dead code.
             from .sigma_x_bispinor import compute_sigma_x_bispinor
             with mesh_xy:
                 sig_x_b = compute_sigma_x_bispinor(
@@ -714,11 +746,8 @@ def compute_v_h_sigma_x(
         sig_x.block_until_ready()
 
     if wfns_transverse is not None and bispinor_v_q_path is not None:
-        if wfns.layout == "face":
-            raise NotImplementedError(
-                "compute_v_h_sigma_x: bispinor transverse exchange is not "
-                "ported for layout='face' — see compute_cohsex_sigma's "
-                "identical refusal.")
+        # face-layout defensive backstop REMOVED 2026-08-23 — see
+        # compute_cohsex_sigma's identical removal, same session/reason.
         from .sigma_x_bispinor import compute_sigma_x_bispinor
         with mesh_xy:
             sig_x_b = compute_sigma_x_bispinor(

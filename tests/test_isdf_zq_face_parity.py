@@ -17,7 +17,7 @@ mirrors ``tests/test_zeta_mesh_invariance.py``'s own worker convention),
 and additionally exposes a ``__main__`` CLI for a real-CUDA confirmation
 run, matching ``test_isdf_cq_face_parity.py``'s own shape:
 
-    lx run -N 1 -G 4 -n 4 bash tmp/lm_fitfaces_run_wrap.sh \\
+    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
         tests/test_isdf_zq_face_parity.py --mesh 2x2
 
 Cases (mirroring the CCT parity test's coverage, task-specified: "including
@@ -41,6 +41,15 @@ psi_mun's own 'y'-shard boundary (shard width ``nb_full/p_y = 36/2 = 18``)
 — the multi-shard-span case ``_z_q_face``'s masked-gather-then-``psum``
 design handles generally (no alignment requirement), unlike the
 breakpoint-insertion approach considered and rejected in the design note.
+
+**γ̃ vertex extension (2026-08-23, feat/transverse-zeta-face-2026-08-23)**:
+``_GAMMA_CASES`` adds all 15 non-identity ``(mu_L, nu_L)`` Lorentz-index
+pairs at ns=4, on the SAME ``ns1_asym`` shard-straddling band window --
+the DISCRIMINATING cases (identity-vertex agreement, the three cases
+above, proves nothing: ``gamma_apply`` is a no-op under identity, so it
+never exercises ``isdf.core._z_q_face``'s post-collective endpoint
+transform).  Same bit-exact-class tolerance as the identity cases (the
+masked-``psum`` mechanism is a select either way, gamma or no gamma).
 """
 from __future__ import annotations
 
@@ -69,6 +78,24 @@ _CASES = (
     ("ns1_lower_asym", dict(ns=1, l_range=(5, 30), r_range=(0, 36), seed=3)),
 )
 
+#: γ̃-VERTEX cases (2026-08-23, feat/transverse-zeta-face-2026-08-23) —
+#: mirrors test_isdf_cq_face_parity.py's own ``_GAMMA_CASES``: the
+#: DISCRIMINATING cases (identity-vertex agreement, the three cases above,
+#: proves nothing about a non-identity γ̃ -- ``gamma_apply`` is a no-op
+#: under identity, so the endpoint-transform code in ``isdf.core._z_q_face``
+#: is never actually exercised by ``_CASES`` alone).  ns=4, ALL 15
+#: non-identity ``(mu_L, nu_L)`` pairs, the SAME ``ns1_asym`` band window
+#: (straddles psi_mun's own 'y'-shard boundary AND a band-chunk boundary --
+#: the case the masked-gather-then-psum + its post-collective γ̃ transform
+#: both exist to handle).
+_GAMMA_CASES = tuple(
+    (f"gamma_mu{mu_l}_nu{nu_l}",
+     dict(ns=4, l_range=(0, 21), r_range=(9, 36), seed=100 + 4 * mu_l + nu_l,
+          gamma_mu_L=mu_l, gamma_nu_L=nu_l))
+    for mu_l in range(4) for nu_l in range(4)
+    if not (mu_l == 0 and nu_l == 0)
+)
+
 
 def _worker(case_name: str) -> int:
     """Runs in a fresh subprocess (JAX_PLATFORMS=cpu,
@@ -82,14 +109,19 @@ def _worker(case_name: str) -> int:
 
     import isdf.core as _core
     from isdf.core import z_q_from_psi_sm
+    from common.gamma_matrices import gamma_perm_phase
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[isdf.core] {_core.__file__}", file=sys.stderr)
         print(f"[has layout=]{'layout' in z_q_from_psi_sm.__code__.co_varnames}",
               file=sys.stderr)
 
+    _case = _CASES_BY_NAME[case_name]
     ns, l_range, r_range, seed = (
-        _CASES_BY_NAME[case_name]["ns"], _CASES_BY_NAME[case_name]["l_range"],
-        _CASES_BY_NAME[case_name]["r_range"], _CASES_BY_NAME[case_name]["seed"])
+        _case["ns"], _case["l_range"], _case["r_range"], _case["seed"])
+    gamma_mu_L = _case.get("gamma_mu_L", 0)
+    gamma_nu_L = _case.get("gamma_nu_L", 0)
+    gamma_L = None if gamma_mu_L == 0 else gamma_perm_phase(gamma_mu_L)
+    gamma_R = None if gamma_nu_L == 0 else gamma_perm_phase(gamma_nu_L)
 
     devs = jax.devices()
     PX = PY = 2
@@ -203,7 +235,7 @@ def _worker(case_name: str) -> int:
         band_chunk_ranges=band_chunk_ranges,
         band_range_left=l_range, band_range_right=r_range,
         r_start_dyn=0, r_chunk_size=n_zchunk,
-        gamma_L=None, gamma_R=None, kgrid=kgrid, mesh_xy=mesh,
+        gamma_L=gamma_L, gamma_R=gamma_R, kgrid=kgrid, mesh_xy=mesh,
         layout="legacy"))
 
     # ---- face -------------------------------------------------------
@@ -217,6 +249,7 @@ def _worker(case_name: str) -> int:
         kgrid=kgrid, mesh_xy=mesh,
         layout="face",
         psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+        gamma_L=gamma_L, gamma_R=gamma_R,
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r)))
 
     # process_allgather, NOT device_get: both are genuinely multi-process
@@ -247,11 +280,13 @@ def _worker(case_name: str) -> int:
         "max_abs": max_abs, "ref_scale": ref_scale, "max_rel": max_rel,
         "case": case_name, "ns": ns, "l_range": list(l_range),
         "r_range": list(r_range),
+        "gamma_mu_L": gamma_mu_L, "gamma_nu_L": gamma_nu_L,
     }))
     return 0
 
 
-_CASES_BY_NAME = {name: kwargs for name, kwargs in _CASES}
+_ALL_CASES = _CASES + _GAMMA_CASES
+_CASES_BY_NAME = {name: kwargs for name, kwargs in _ALL_CASES}
 
 
 def _run_worker(case_name: str, ndev: int = 4, timeout: int = 300):
@@ -280,7 +315,7 @@ def _run_worker(case_name: str, ndev: int = 4, timeout: int = 300):
     return json.loads(lines[-1])
 
 
-@pytest.mark.parametrize("name,kwargs", _CASES, ids=[c[0] for c in _CASES])
+@pytest.mark.parametrize("name,kwargs", _ALL_CASES, ids=[c[0] for c in _ALL_CASES])
 def test_zq_face_layout_matches_legacy(name, kwargs):
     out = _run_worker(name)
     if "skip" in out:
@@ -321,7 +356,7 @@ def _cli_main():
 
     os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "")
     failures = 0
-    for name, _kwargs in _CASES:
+    for name, _kwargs in _ALL_CASES:
         try:
             rc = _worker_inline(name)
         except Exception as exc:  # noqa: BLE001 -- report, don't crash the sweep
@@ -340,7 +375,7 @@ def _cli_main():
             failures += 1
         p0(f"{'PASS' if ok else 'FAIL'} {name}: max|diff|={rc['max_abs']:.3e} "
            f"(ref scale {rc['ref_scale']:.3e}) max|rel diff|={rc['max_rel']:.3e}")
-    p0(f"done: {len(_CASES) - failures}/{len(_CASES)} cases passed")
+    p0(f"done: {len(_ALL_CASES) - failures}/{len(_ALL_CASES)} cases passed")
     return 1 if failures else 0
 
 

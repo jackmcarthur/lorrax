@@ -716,6 +716,15 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	ONE call site per path (fit and reuse) on purpose: the reuse leg
 	must produce bit-identical ψ to the fit leg, and the cheapest way
 	to guarantee that is for both to run the same code.
+
+	``low_mem_bands = true`` (2026-08-23): ALSO converts to the two-face
+	carrier here, SAME ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the
+	charge channel uses, and drops the single-axis copies -- once, in
+	this one function, so BOTH callers (the fresh-fit bispinor loop and
+	the ζ-reuse early return) get the face carrier identically instead
+	of each converting it their own way.  ``psi_rmu_Y``/``psi_rmuT_X``
+	are ``None`` in the returned dict in this case;
+	``psi_mun_fresh``/``psi_nmu_fresh`` carry the face arrays instead.
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked
 	with timing.section("gw_jax.load_centroid_wfns_current"):
@@ -724,6 +733,20 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			band_range=band_slices.full_range,
 			band_chunk_size=chunks['band_chunk'],
 		)
+	psi_mun_fresh_T = None
+	psi_nmu_fresh_T = None
+	if cfg.memory.low_mem_bands:
+		from jax.sharding import NamedSharding
+		from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+		with mesh_xy:
+			psi_nmu_fresh_T = jax.lax.with_sharding_constraint(
+				psi_curr_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+			psi_mun_fresh_T = jax.lax.with_sharding_constraint(
+				jnp.conj(psi_curr_rmuT_X).transpose(0, 3, 1, 2),
+				NamedSharding(mesh_xy, PSI_MUN_SPEC))
+		del psi_curr_rmu_Y, psi_curr_rmuT_X
+		psi_curr_rmu_Y = None
+		psi_curr_rmuT_X = None
 	# Keeping these arrays alive across the return is intentional —
 	# they are the only way the σ^B kernel can sample ψ at r_{μ_T}.
 	return {
@@ -731,6 +754,8 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 		'psi_rmuT_X':       psi_curr_rmuT_X,
 		'meta':             meta_T,
 		'centroid_indices': cent_T_idx,
+		'psi_mun_fresh':    psi_mun_fresh_T,
+		'psi_nmu_fresh':    psi_nmu_fresh_T,
 	}
 
 
@@ -1194,6 +1219,132 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 				f"loudly, and it changes the physics rather than fixing it).")
 
 
+def _plan_gflat_chunks_for_channel(
+		*, meta, cfg, band_slices, mesh_xy, is_bispinor, print_fn=print):
+	"""Chunk-plan ONE ISDF centroid channel: the charge channel
+	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
+	typically ≈ μ_C/3).
+
+	:func:`gw.gflat_memory_model.plan_gflat_chunks` is already
+	channel-agnostic — μ comes entirely from ``meta.n_rmu_padded`` /
+	``meta.n_rmu`` — but until this function existed only ONE call site
+	ever invoked it (``prepare_isdf_and_wavefunctions``, charge-only), so
+	all three transverse ζ_T fits inherited that CHARGE-sized ``chunks``
+	dict wholesale (register: "three ζ_T fits inherit the CHARGE chunk
+	plan (μ_T≈μ_C/3): ~3x extra r-chunks, ~2.7 GB/rank avoidable
+	gather").  This function is the ONE place that resolves
+	``plan_gflat_chunks``'s other inputs (``nb_total``, the fit-window
+	union, ``ngkmax``, the infeasibility refusal) so the charge and
+	transverse call sites cannot drift apart — "one planner, channel-
+	parameterized," not a second plan.
+
+	Returns ``(chunks, gflat_plan)`` — ``chunks`` is the plain dict
+	``fit_zeta`` / ``fit_zeta_to_h5`` consume (``band_chunk`` /
+	``chunk_r`` / ``q_chunk`` / ``gflat_chunk_size`` /
+	``memory_estimate``); ``gflat_plan`` is the raw
+	:class:`gw.gflat_memory_model.GFlatChunkPlan` for a caller that wants
+	more than the dict exposes.
+	"""
+	from gw.gflat_memory_model import plan_gflat_chunks
+	mem = cfg.memory
+	nb_total = ((band_slices.b3 - band_slices.b0)
+	            + (band_slices.b4 - band_slices.b1))
+	# The resident centroid copies follow the full consumer band
+	# inventory above, while the pair-GEMM K dimension follows the
+	# (possibly zeta_nband-narrowed) union of the ζ fit windows.
+	# Resolve the latter without logging; fit_zeta owns the one
+	# user-facing window announcement and its degeneracy checks.
+	_zeta_left, _zeta_right = zeta_fit_band_ranges(
+		band_slices,
+		resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
+		log=lambda _message: None)
+	_zeta_fit_nb = (max(_zeta_left[1], _zeta_right[1])
+	                - min(_zeta_left[0], _zeta_right[0]))
+	# Q-axis on disk: conservative full-BZ (the transverse path writes
+	# IBZ-only, which is smaller).
+	_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
+	gflat_plan = plan_gflat_chunks(
+		meta=meta, mesh_xy=mesh_xy,
+		nb_total=nb_total, fit_nb_total=_zeta_fit_nb,
+		ngkmax=_ngkmax,
+		n_q_disk=int(meta.nk_tot),
+		budget_gb=float(mem.per_device_gb),
+		target_utilization=(mem.chunk_target_utilization
+		                    if mem.chunk_target_utilization > 0 else None),
+		is_bispinor=bool(is_bispinor),
+		max_chunks=64,
+		r_chunk_override=(int(mem.r_chunk_override)
+		                  if mem.r_chunk_override > 0 else None),
+		band_chunk_override=(int(mem.band_chunk_size)
+		                     if mem.band_chunk_size > 0 else None),
+		gflat_chunk_size_override=(int(mem.gflat_chunk_size)
+		                           if mem.gflat_chunk_size > 0 else None),
+		distributed_zeta_solve=str(cfg.backend.distributed_zeta_solve),
+		low_mem_bands=bool(mem.low_mem_bands),
+		# Stage F writes per-rank hyperslabs; the planner therefore
+		# charges only the local sharded tile.
+	)
+	if jax.process_index() == 0:
+		print_fn("")
+		print_fn(gflat_plan.format())
+	# A plan the planner itself prices as infeasible is a REFUSAL, not a
+	# warning.  The 9x9/626b run printed "244% of budget (expect OOM)"
+	# here, proceeded, and OOMed at the first z_q_phase (JID 57281385
+	# step .28) — the instrument-that-measures-and-proceeds class.  An
+	# explicit ``r_chunk_size`` keeps its documented run-level-workaround
+	# authority: with it set, the operator has asserted the chunking and
+	# only the warning prints.
+	_over = (gflat_plan.hwm_bytes > gflat_plan.budget_bytes)
+	_floor_broken = gflat_plan.p_min > mesh_xy.devices.size
+	if _floor_broken or _over:
+		_msg = (
+			f"[planner] the certified plan does not fit: "
+			f"HWM {gflat_plan.hwm_bytes / 1e9:.2f} GB/dev vs budget "
+			f"{gflat_plan.budget_bytes / 1e9:.2f} GB/dev "
+			f"(binder: {gflat_plan.bottleneck})"
+			+ (f"; rank floor P_min={gflat_plan.p_min} exceeds the "
+			   f"{mesh_xy.devices.size} ranks in this mesh — no "
+			   f"chunk choice can shrink the persistent ÷P floor"
+			   if _floor_broken else "")
+			+ ".  Add ranks or raise memory_per_device_gb"
+			# NAME ONLY THE REMEDIES THAT ACTUALLY APPLY.  An explicit
+			# ``r_chunk_size`` bypasses this gate for a budget overrun
+			# and does NOTHING for a broken rank floor (the floor is
+			# the persistent ÷P term, which no chunk choice touches) —
+			# and the operator who is already running with one would
+			# be told to set the thing they set.  A refusal that names
+			# an inapplicable fix is a dead end wearing a remedy's
+			# clothes.
+			+ ("" if (_floor_broken or mem.r_chunk_override > 0)
+			   else ", or set an explicit r_chunk_size — the "
+			        "register-documented run-level workaround, "
+			        "which bypasses this gate")
+			+ ".")
+		if mem.r_chunk_override > 0 and not _floor_broken:
+			print_fn(f"  {_msg}  Proceeding under the explicit "
+			       f"r_chunk_size={int(mem.r_chunk_override)} the "
+			       f"operator asserted; the plan is still priced "
+			       f"over budget.")
+		else:
+			raise ValueError(_msg)
+	chunks = {
+		'band_chunk': int(gflat_plan.band_chunk),
+		'chunk_r': int(gflat_plan.r_chunk),
+		'q_chunk': int(gflat_plan.q_chunk),
+		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
+		'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
+		'memory_estimate': {
+			'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
+			'budget_gb': float(mem.per_device_gb),
+			'bottleneck': gflat_plan.bottleneck,
+			'available_vcoul_gb': max(
+				0.0, gflat_plan.budget_bytes
+				- gflat_plan.persistent_bytes) / 1e9,
+		},
+	}
+	return chunks, gflat_plan
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
              psi_nmu_fresh=None, psi_mun_fresh=None):
@@ -1212,10 +1363,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	single-axis copies before calling here (neither has a consumer left:
 	the CCT Gram build and the r-chunk loop's band contraction both read
 	the face carrier — see ``isdf.core._c_q_face``/``_z_q_face`` and
-	docs/architecture/zeta_fit_face_psi_cct.md).  Forwarded ONLY to the
-	charge-channel ``fit_zeta_to_h5`` call below; the bispinor
-	transverse-channel call is unreachable under ``low_mem_bands``
-	(refused upstream) and does not take them.
+	docs/architecture/zeta_fit_face_psi_cct.md).  Forwarded to the
+	charge-channel ``fit_zeta_to_h5`` call below.  The bispinor
+	transverse-channel calls build their OWN face carrier
+	(``psi_mun_fresh_T``/``psi_nmu_fresh_T``, from the transverse
+	centroid load, same ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path —
+	2026-08-23) rather than reusing this function's own
+	``psi_nmu_fresh``/``psi_mun_fresh`` parameters, since the two
+	centroid sets (charge μ, transverse μ_T) are different arrays.
 	"""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
@@ -1343,6 +1498,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_meta_T = None
 	_cent_T_idx = None
 	_transverse_identity = None
+	_chunks_T = None
 	# Transverse ζ IBZ-write activates whenever the bispinor V_q
 	# orchestrator iterates IBZ q's — the SAME gate the charge ζ uses,
 	# so it is derived from the charge value rather than re-reading the
@@ -1397,6 +1553,19 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			'distributed_lu': str(cfg.backend.distributed_lu).strip().lower(),
 			'solver_kind':    str(_transverse_solver_kind),
 		}
+		# Chunk-plan the TRANSVERSE channel SEPARATELY from the charge
+		# ``chunks`` this function was handed.  μ_T is typically ≈ μ_C/3,
+		# and reusing the charge-sized plan unchanged for all three ζ_T
+		# fits is exactly the register row this closes: "three ζ_T fits
+		# inherit the CHARGE chunk plan (μ_T≈μ_C/3): ~3x extra r-chunks,
+		# ~2.7 GB/rank avoidable gather".  ONE call here, ahead of both
+		# the ζ-reuse decision and the μ_L loop, so the ψ sampling (fit
+		# AND reuse paths) and all three Lorentz components — which share
+		# one transverse centroid set — share one transverse-sized plan,
+		# exactly mirroring how the charge channel gets one plan.
+		_chunks_T, _ = _plan_gflat_chunks_for_channel(
+			meta=_meta_T, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
+			is_bispinor=True, print_fn=print_fn)
 	# ── ζ REUSE: skip the fit when the ζ files are complete AND provably
 	# the same fit.  Before this, a rerun in the same directory always
 	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
@@ -1481,7 +1650,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		         f"but Σ^B still needs ψ(r_{{μ_T}})).")
 		return zeta_h5_path, mem_est, _transverse_wfn_data(
 			wfn, sym, _meta_T, _cent_T_idx, cfg, mesh_xy,
-			band_slices, chunks)
+			band_slices, _chunks_T)
 
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
@@ -1713,9 +1882,26 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		cents_curr_idx = _cent_T_idx
 		transverse_wfn_data = _transverse_wfn_data(
 			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
-			band_slices, chunks)
+			band_slices, _chunks_T)
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
+
+		# low_mem_bands = true: _transverse_wfn_data already converted
+		# psi_curr_rmu_Y/psi_curr_rmuT_X to the two-face carrier internally
+		# (SAME PSI_MUN_SPEC/PSI_NMU_SPEC build path the charge channel
+		# uses, not a fork) and set them to None -- ONE call site owns the
+		# conversion so this branch and the ζ-reuse early return
+		# (gw_init.fit_zeta's own "REUSING the existing ζ" path, which
+		# also calls _transverse_wfn_data) get an identically-built face
+		# carrier rather than each converting it their own way.  Just
+		# read the two fields back out here.
+		psi_mun_fresh_T = transverse_wfn_data['psi_mun_fresh']
+		psi_nmu_fresh_T = transverse_wfn_data['psi_nmu_fresh']
+		if cfg.memory.low_mem_bands:
+			print_fn("  [bispinor] ψ_T face conversion (low_mem_bands): "
+			         "psi_nmu_T/psi_mun_T built from the transverse "
+			         "centroid load; both single-axis copies dropped "
+			         "before the ζ_T fit.")
 
 		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
 		# ``jax.clear_caches()`` here because the original ζ-fit cached
@@ -1746,10 +1932,13 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					wfn=wfn, sym=sym, meta=meta_curr,
 					centroid_indices=cents_curr_idx,
 					mesh_xy=mesh_xy,
-					chunk_r=chunks['chunk_r'], output_file=zeta_mu_path,
+					chunk_r=_chunks_T['chunk_r'], output_file=zeta_mu_path,
 					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
-					band_chunk_size=chunks['band_chunk'],
-					q_chunk_size=chunks['q_chunk'],
+					low_mem_bands=bool(cfg.memory.low_mem_bands),
+					psi_mun_fresh=psi_mun_fresh_T,
+					psi_nmu_fresh=psi_nmu_fresh_T,
+					band_chunk_size=_chunks_T['band_chunk'],
+					q_chunk_size=_chunks_T['q_chunk'],
 					bispinor=cfg.bispinor,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
@@ -1761,7 +1950,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
 					transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
 					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
-					gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
+					gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
 					vertex_mu_L=mu_L,
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
@@ -2338,109 +2527,16 @@ def prepare_isdf_and_wavefunctions(
 		from common.wfn_transforms import get_enk_bandrange
 
 		with mesh_xy:
-			# Plan chunk sizes ONCE — the single production planner owns
-			# band_chunk / chunk_r / q_chunk / gflat_chunk_size, the rank
-			# floor P_min, and the binding-stage report.
-			from gw.gflat_memory_model import plan_gflat_chunks
-			mem = cfg.memory
-			nb_total = ((band_slices.b3 - band_slices.b0)
-			            + (band_slices.b4 - band_slices.b1))
-			# The resident centroid copies follow the full consumer band
-			# inventory above, while the pair-GEMM K dimension follows the
-			# (possibly zeta_nband-narrowed) union of the ζ fit windows.
-			# Resolve the latter without logging; fit_zeta owns the one
-			# user-facing window announcement and its degeneracy checks.
-			_zeta_left, _zeta_right = zeta_fit_band_ranges(
-				band_slices,
-				resolve_zeta_fit_edge(
-					band_slices, getattr(cfg, "zeta_nband", None)),
-				log=lambda _message: None)
-			_zeta_fit_nb = (max(_zeta_left[1], _zeta_right[1])
-			                - min(_zeta_left[0], _zeta_right[0]))
-			# Q-axis on disk: conservative full-BZ (the transverse path
-			# writes IBZ-only, which is smaller).
-			_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
-			gflat_plan = plan_gflat_chunks(
-				meta=meta, mesh_xy=mesh_xy,
-				nb_total=nb_total, fit_nb_total=_zeta_fit_nb,
-				ngkmax=_ngkmax,
-				n_q_disk=int(meta.nk_tot),
-				budget_gb=float(mem.per_device_gb),
-				target_utilization=(mem.chunk_target_utilization
-				                    if mem.chunk_target_utilization > 0 else None),
-				is_bispinor=bool(cfg.bispinor),
-				max_chunks=64,
-				r_chunk_override=(int(mem.r_chunk_override)
-				                  if mem.r_chunk_override > 0 else None),
-				band_chunk_override=(int(mem.band_chunk_size)
-				                     if mem.band_chunk_size > 0 else None),
-				gflat_chunk_size_override=(int(mem.gflat_chunk_size)
-				                           if mem.gflat_chunk_size > 0 else None),
-				distributed_zeta_solve=str(
-					cfg.backend.distributed_zeta_solve),
-				low_mem_bands=bool(mem.low_mem_bands),
-				# Stage F writes per-rank hyperslabs; the planner therefore
-				# charges only the local sharded tile.
-			)
-			if jax.process_index() == 0:
-				print0("")
-				print0(gflat_plan.format())
-			# A plan the planner itself prices as infeasible is a REFUSAL,
-			# not a warning.  The 9x9/626b run printed "244% of budget
-			# (expect OOM)" here, proceeded, and OOMed at the first
-			# z_q_phase (JID 57281385 step .28) — the
-			# instrument-that-measures-and-proceeds class.  An explicit
-			# ``r_chunk_size`` keeps its documented run-level-workaround
-			# authority: with it set, the operator has asserted the
-			# chunking and only the warning prints.
-			_over = (gflat_plan.hwm_bytes > gflat_plan.budget_bytes)
-			_floor_broken = gflat_plan.p_min > mesh_xy.devices.size
-			if _floor_broken or _over:
-				_msg = (
-					f"[planner] the certified plan does not fit: "
-					f"HWM {gflat_plan.hwm_bytes / 1e9:.2f} GB/dev vs budget "
-					f"{gflat_plan.budget_bytes / 1e9:.2f} GB/dev "
-					f"(binder: {gflat_plan.bottleneck})"
-					+ (f"; rank floor P_min={gflat_plan.p_min} exceeds the "
-					   f"{mesh_xy.devices.size} ranks in this mesh — no "
-					   f"chunk choice can shrink the persistent ÷P floor"
-					   if _floor_broken else "")
-					+ ".  Add ranks or raise memory_per_device_gb"
-					# NAME ONLY THE REMEDIES THAT ACTUALLY APPLY.  An
-					# explicit ``r_chunk_size`` bypasses this gate for a
-					# budget overrun and does NOTHING for a broken rank
-					# floor (the floor is the persistent ÷P term, which no
-					# chunk choice touches) — and the operator who is
-					# already running with one would be told to set the
-					# thing they set.  A refusal that names an inapplicable
-					# fix is a dead end wearing a remedy's clothes.
-					+ ("" if (_floor_broken or mem.r_chunk_override > 0)
-					   else ", or set an explicit r_chunk_size — the "
-					        "register-documented run-level workaround, "
-					        "which bypasses this gate")
-					+ ".")
-				if mem.r_chunk_override > 0 and not _floor_broken:
-					print0(f"  {_msg}  Proceeding under the explicit "
-					       f"r_chunk_size={int(mem.r_chunk_override)} the "
-					       f"operator asserted; the plan is still priced "
-					       f"over budget.")
-				else:
-					raise ValueError(_msg)
-			chunks = {
-				'band_chunk': int(gflat_plan.band_chunk),
-				'chunk_r': int(gflat_plan.r_chunk),
-				'q_chunk': int(gflat_plan.q_chunk),
-				'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
-				'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
-				'memory_estimate': {
-					'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
-					'budget_gb': float(mem.per_device_gb),
-					'bottleneck': gflat_plan.bottleneck,
-					'available_vcoul_gb': max(
-						0.0, gflat_plan.budget_bytes
-						- gflat_plan.persistent_bytes) / 1e9,
-				},
-			}
+			# Plan chunk sizes ONCE for the CHARGE channel — the single
+			# production planner owns band_chunk / chunk_r / q_chunk /
+			# gflat_chunk_size, the rank floor P_min, and the binding-stage
+			# report.  ``_plan_gflat_chunks_for_channel`` is the one call
+			# site both this (charge) and ``fit_zeta``'s own transverse
+			# re-plan (μ_T ≈ μ_C/3) go through, so the two channels cannot
+			# drift apart.
+			chunks, gflat_plan = _plan_gflat_chunks_for_channel(
+				meta=meta, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
+				is_bispinor=bool(cfg.bispinor), print_fn=print0)
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by
 			# both the zeta fit (sliced into halves internally) and the
@@ -2542,11 +2638,6 @@ def prepare_isdf_and_wavefunctions(
 			wfns = None
 			wfns_transverse = None
 			if cfg.memory.low_mem_bands:
-				# bispinor + low_mem_bands already refused at this
-				# function's entry (refuse_unsupported_low_mem_bands),
-				# before the chunk planner even ran -- so
-				# transverse_wfn_data cannot be non-None here.
-				#
 				# psi_nmu_fresh/psi_mun_fresh were already built (and
 				# psi_rmu_Y already dropped) BEFORE the ζ fit, above --
 				# they are not re-derived here.  wavefunctions_face_from_
@@ -2575,6 +2666,27 @@ def prepare_isdf_and_wavefunctions(
 				# reads psi_mun_fresh directly (isdf.core._z_q_face),
 				# so there is nothing left resident from the fit input
 				# for V_q's baseline to inherit.
+
+				# Bispinor + low_mem_bands (2026-08-23): build the
+				# transverse-centroid Σ^B bundle from the SAME face
+				# carrier ``fit_zeta`` already built
+				# (``transverse_wfn_data['psi_mun_fresh']``/
+				# ``['psi_nmu_fresh']``) -- reused, not rebuilt,
+				# mirroring the charge bundle's own reuse above.  The
+				# SAME ``enk_full``/``band_slices`` apply (the mean-field
+				# bands are a system property, not per-centroid-set --
+				# exactly what the legacy branch below does too).
+				if transverse_wfn_data is not None:
+					with timing.section("gw_jax.wavefunction_setup"):
+						wfns_transverse = wavefunctions_face_from_restart(
+							transverse_wfn_data['psi_nmu_fresh'],
+							transverse_wfn_data['psi_mun_fresh'],
+							enk_full=_enk_full_face,
+							slices=band_slices, mesh_xy=mesh_xy)
+					print0(f"  [bispinor] σ^B-side Wfns built on "
+					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
+					       f"transverse centroids (face layout; "
+					       f"low_mem_bands=true)")
 
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
@@ -2708,6 +2820,18 @@ def prepare_isdf_and_wavefunctions(
 			# ``load_restart_state_from_h5``.
 			if _write_restart:
 				if cfg.memory.low_mem_bands:
+					# NOT YET PORTED: the transverse-centroid (Σ^B) face
+					# carrier has no restart dataset -- this write covers
+					# only the charge bundle (psi_full_y/psi_full_y_mun).
+					# NOT a silent-wrong-physics risk: bispinor restart
+					# READ already refuses loudly, unconditionally,
+					# whenever a file has no 'psi_full_y_transverse'
+					# dataset (below, "Bispinor restart" -- pre-existing,
+					# independent of low_mem_bands, since a low_mem_bands
+					# file never carries that LEGACY-only dataset name
+					# either).  So this write proceeds; a bispinor deck
+					# that later restarts from it gets a clear, if late,
+					# refusal rather than a wrong answer.
 					write_restart_state_to_h5(
 						tensors_filename,
 						n_rmu_logical=int(meta.n_rmu),

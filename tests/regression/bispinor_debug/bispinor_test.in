@@ -61,6 +61,22 @@ compute_mode = gn_ppm
 vhead = 0.0
 whead_0freq = 0.0
 whead_imfreq = 0.0
+# HEAD_CORRECTION EXPLICIT, added 2026-08-23 -- this fixture predates the
+# `head_correction` key (default "full" since the low-mem-bands campaign;
+# docs/input_reference.md), which is INDEPENDENT of the vhead/whead_*
+# bypass above and separately requires dipole.h5
+# (gw.qsgw_head.build_dft_head_response). This fixture ships none (its
+# own README: "the fixture ships no dipole.h5" -- true of every OTHER
+# regression fixture that lacks one too: si_bse_debug, sigma_ppm_gates;
+# every fixture that DOES ship a dipole.h5 -- cohsex_debug, gnppm_debug,
+# hbn_cohsex_debug, si_cohsex_debug -- was unaffected by the default's
+# introduction and so never needed this key). Without this line the
+# fresh-fit leg dies at gw_jax.py's `build_dft_head_response` call with
+# `FileNotFoundError: head_correction=full requires dipole.h5` before
+# Sigma is ever reached -- caught by
+# tests/multi_device/bispinor_transverse_vertex_face_gate.py's own
+# end-to-end smoke bring-up (KNOWN_LORRAX_ISSUES.md's matching row).
+head_correction = off
 
 output_file = sigma_diag_bispinor_test.dat
 sigma_diag_file = sigma_diag_bispinor_test.dat

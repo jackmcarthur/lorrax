@@ -2947,20 +2947,64 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
 #: from ``compute_sigma_xc`` at the one seam that ever sees both operands
 #: together.
 _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
+    # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
+    # own recorded lift condition: rotate_wavefunctions now dispatches on
+    # wfns_dft.layout and routes layout='face' through
+    # wavefunction_bundle._rotate_wavefunctions_face (two planned
+    # distrib_la.gemm_plan N,N GEMMs -- U^T @ psi_nmu, psi_mun @ U -- against
+    # a block-embedded U rather than a sliced ψ; see wavefunction_bundle
+    # ._face_rotate_kernel/._face_embed_active_U).  sc_iteration.py:1753
+    # needed NO change: it already calls rotate_wavefunctions(inputs.
+    # wfns_dft, ...), and the dispatch reads wfns_dft.layout, not a
+    # call-site flag.  Gated: real 4-rank CUDA algebra parity vs legacy
+    # (tests/test_qsgw_rotate_face_parity.py, U from a REAL small eigh —
+    # ns=1/ns=2, default AND offset active windows — 3/3 PASS, max relative
+    # diff ~1e-16..2e-16); a real end-to-end MoS2 k6_c50 compute_mode=
+    # gn_ppm head_correction=full qp_solver=self_consistent (3 iterations)
+    # leg, face vs legacy — see this session's CLAIMS.md row for job id and
+    # measured tolerances.  ``head_wings_sharded``'s own consumer,
+    # ``build_iteration_head_response`` (qsgw_head.py), needed NO change
+    # either: it treats ``wfns_qp`` opaquely (no direct psi_* field access)
+    # and forwards it to the already layout-dispatching wing kernels; the
+    # ONLY reason it read as "still legacy-only" before this session is
+    # that its sole producer, rotate_wavefunctions, had no face arm.
     (
-        "low_mem_bands_self_consistent_unported",
-        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
-        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
-        "qp_solver = one_shot_dft (the default) or fixed_point",
-        "run low_mem_bands=true single-shot; drop qp_solver or set it to "
-        "one_shot_dft/fixed_point, or set low_mem_bands = false for a QSGW "
-        "loop",
-        "every QSGW SC map rotates the wavefunction bundle "
-        "(wavefunction_bundle.py:543-706, sc_iteration.py:1753); a face "
-        "bundle needs two distributed rotations (U^T @ psi_nmu, psi_mun @ "
-        "U) that are not built (census row 'QSGW orbital rotation')",
-    ),
-    (
+        # PORTED 2026-08-23 (feat/metal-response-face-2026-08-23,
+        # docs/architecture/fractional_chi0_response_face.md): the exact
+        # finite-occupation chi0 the census row named --
+        # w_isdf._fractional_pair_scan's ordered-pair kernel (Gamma static
+        # body + finite-q/finite-z direct kernel) AND the separate
+        # fractional/contour kernel -- now both dispatch on wfns.layout
+        # and route through a genuinely new 2-D band-pair mechanism
+        # (masked-gather + psum on BOTH mesh axes, isdf.core._z_q_face's
+        # idiom generalized) for the ordered-pair half, and a plain
+        # build_G_tau(layout='face', ...) substitution for the
+        # fractional/contour half (its two Green's functions are each
+        # one-particle).  Gated: real 4-rank CUDA algebra parity
+        # (tests/test_chi0_fractional_face_parity.py), a structural
+        # no-single-axis-psi proof, and a production-shape Na-deck
+        # harness (face-vs-legacy, NOT a full gw_jax driver run -- see
+        # below for why).
+        #
+        # THE ROW STAYS REFUSING ANYWAY, narrowed to name the REAL
+        # remaining blocker rather than lifted: _validate_metal_compute_
+        # mode (this file, below) REQUIRES compute_mode = mpa whenever
+        # mpa_material_class = metal, and compute_mode = mpa is
+        # UNCONDITIONALLY refused under low_mem_bands = true by the
+        # SEPARATE low_mem_bands_dynamic_ppm_unported row (gw.mpa.sigma's
+        # own Sigma_c(omega) executor -- a different subsystem entirely,
+        # frequency-domain self-energy, not this row's chi0/response
+        # subject, and outside this session's charter). So no deck
+        # combination can reach this session's ported kernels without
+        # ALSO tripping that other row first if this one were removed:
+        # lifting this row alone would not unblock a single live
+        # low_mem_bands=true metal deck, only change WHICH rule id it
+        # refuses under. Per the design doc's own closing section, this
+        # row is kept and will be lifted for real once
+        # low_mem_bands_dynamic_ppm_unported is ALSO lifted for MPA (a
+        # separate, unscoped port) -- at that point this row's own
+        # predicate can be dropped outright, since nothing else in the
+        # census blocks a metal deck once both are ported.
         "low_mem_bands_metal_material_class_unported",
         lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
                      .strip().lower() == "metal"),
@@ -2968,25 +3012,107 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "mpa_material_class = insulator (the default)",
         "set mpa_material_class = insulator (or drop the key), or set "
         "low_mem_bands = false for a metallic run",
-        "the exact finite-occupation response (w_isdf.py:1259-1620) "
-        "assumes every rank owns all bands and only mu is sharded; its "
-        "divided-difference weight depends jointly on both band "
-        "energies/occupations, so it cannot be replaced by the one-"
-        "particle G GEMM and needs its own 2-D band-pair ring/tile "
-        "algorithm (census row 'Exact finite-occupation response')",
+        "UPDATED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23, "
+        "claims/0443.md): gw.mpa.sigma's split-Sigma-window gap -- this "
+        "row's own remaining blocker as of the previous entry -- is now "
+        "FIXED and gated end to end for mpa_material_class = insulator "
+        "(strip_sigma_window's new mesh-aware device-array arm; real "
+        "4-rank CUDA parity, Si_scalar fresh one-shot MPA, eqp0/eqp1 "
+        "max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face). "
+        "low_mem_bands_dynamic_ppm_unported is narrowed accordingly (see "
+        "that row below) rather than deleted, because METAL MPA is still "
+        "refused there too: mpa_material_class = metal unconditionally "
+        "requires qp_solver = self_consistent "
+        "(gw.mpa.model._require_metal_occupations -- the one-shot "
+        "screening call never builds an OccupationState), and every "
+        "sc_head_update arm a fresh (non-restart) metal MPA deck can "
+        "reach this session hit an INFRA obstacle unrelated to this "
+        "port's own code: off falls through to a plain-midgap SC-init "
+        "check that is meaningless for a metal and refuses by name; "
+        "parallel_transport reproduces the pre-existing SlabIO rank-0-"
+        "slab defect this row's own history already named; dft_velocity "
+        "needs a pre-built parallel_transport.h5 this session had none "
+        "of (the one candidate on disk is already flagged "
+        "velocity_validation_passed=0). So this row stays refusing -- "
+        "not because the ported code is unconfirmed for metal, but "
+        "because no self-contained fresh metal-MPA deck could be driven "
+        "end to end this session to confirm it. Lift target unchanged: "
+        "a metal MPA end-to-end gate, once one of those three artifacts "
+        "exists.",
     ),
-    (
-        "low_mem_bands_bispinor_unported",
-        lambda cfg: bool(cfg.bispinor),
-        lambda cfg: f"bispinor = {cfg.bispinor}",
-        "bispinor = false",
-        "set bispinor = false, or low_mem_bands = false for a 4-spinor run",
-        "the transverse exchange vertex insertion hard-codes psi_xn/psi_yr "
-        "and clones the dataclass (sigma_x_bispinor.py:63-100,160-180); the "
-        "face carrier has no transverse-centroid bundle yet (census row "
-        "'Bispinor transverse exchange')",
-    ),
-    (
+    # LIFTED for FRESH-FIT decks (2026-08-23,
+        # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
+        # closed.  Both halves the previous session's comment named as
+        # missing are now ported and gated:
+        #
+        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
+        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
+        #   representation-aware bundle operation folding γ̃ into whichever
+        #   pair of fields plays the G-build's direct/conjugated role
+        #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
+        #   2026-08-23 (feat/bispinor-face-2026-08-23), gated on real
+        #   4-rank CUDA with a genuine ns=4 fixture (5/5 Lorentz pairs,
+        #   ~1e-16 relative; tests/multi_device/
+        #   bispinor_transverse_vertex_face_gate.py).
+        # * The transverse ζ-FIT's face path — ``isdf.core.
+        #   c_q_from_psi_sm(layout='face')``/``z_q_from_psi_sm(layout=
+        #   'face')`` now accept non-identity ``gamma_L``/``gamma_R`` via
+        #   psi-ENDPOINT application (mirroring
+        #   ``with_lorentz_vertices``'s own field/axis table, folded in
+        #   BEFORE the band GEMM / masked-gather rather than at
+        #   ``gamma_double_contract``'s post-IFFT step — see
+        #   ``docs/architecture/zeta_fit_face_psi_cct.md``'s "γ̃ VERTEX"
+        #   sections for the derivation and its conjugation-convention
+        #   correction, found by reading ``greens_function_kernel.
+        #   _build_G_face`` directly: CCT's psi_mun is the CONJUGATED
+        #   operand, the OPPOSITE role from the G-build's own psi_mun).
+        #   Gated on real 4-rank CUDA, ALL 15 non-identity
+        #   ``(mu_L, nu_L)`` Lorentz-index pairs at ns=4 (the
+        #   discriminating cases — an identity vertex passes trivially
+        #   and proves nothing): ``tests/test_isdf_cq_face_parity.py``
+        #   18/18 PASS, max relative diff ~6e-16; ``tests/
+        #   test_isdf_zq_face_parity.py`` 18/18 PASS on real CUDA
+        #   (mostly bit-exact, max relative diff ~4e-16 where not — the
+        #   masked-``psum`` mechanism is a select, immune to summation-
+        #   order noise, same as its own identity-channel result).
+        #   ``gw.isdf_fitting.fit_zeta_to_h5``'s ``vertex_mu_L != 0``
+        #   refusal under ``low_mem_bands`` is dropped;
+        #   ``isdf.core._make_fit_one_rchunk_kernel``'s matching refusal
+        #   too.  ``gw.gw_init.fit_zeta`` builds the TRANSVERSE
+        #   centroid set's OWN face carrier via the SAME
+        #   ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the charge
+        #   channel already uses (not a fork), reused for both the ζ_T
+        #   fit and the post-fit Σ^B bundle.
+        #
+        # End-to-end: MoS2 3×3 bispinor GN-PPM fixture
+        # (tests/regression/bispinor_debug/bispinor_test.in,
+        # head_correction=off, restart=false), real 4-rank CUDA,
+        # low_mem_bands=true vs low_mem_bands=false — see
+        # runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/ for the
+        # artifacts and claims/ for the numbers.
+        #
+        # DELETED, not narrowed (same precedent as
+        # ``low_mem_bands_self_consistent_unported``'s own 2026-08-23
+        # lift): the census row's gap is closed for every combination
+        # bispinor ITSELF supports.  ``restart = true`` + ``bispinor =
+        # true`` was ALREADY refused before this session and independent
+        # of ``low_mem_bands`` — ``gw.gw_init.prepare_isdf_and_
+        # wavefunctions``'s restart-read path raises loudly whenever a
+        # restart file has no ``psi_full_y_transverse`` dataset, which is
+        # every file (this predates low_mem_bands entirely; see
+        # tests/regression/bispinor_debug/README.md: "bispinor restart
+        # is not yet supported").  A ``write_restart_tensors = true``
+        # fresh run (the default) is harmless under low_mem_bands too:
+        # the low_mem_bands restart WRITE branch simply omits the
+        # transverse-centroid face carrier (no dataset for it yet), and
+        # the SAME pre-existing read-side check refuses loudly if
+        # anyone later tries to restart from that file with
+        # ``bispinor = true`` — no silent data loss, in either layout.
+        # This row is deleted outright rather than re-pointed at that
+        # pre-existing, low_mem_bands-independent limitation.
+    # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
+        # port-2026-08-22); the row was KEPT, narrowed to MPA only.  History
+        # of that narrowing:
         # DISCOVERED on real 4-rank CUDA (tests/multi_device/
         # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
         # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
@@ -2995,40 +3121,76 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # ``ppm_tau_kernel.precompile_sigma`` at the FIRST legacy accessor
         # call (``wfns.xn(s.full)``) with the carrier's own named
         # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
-        # The two-point plasmon-pole Sigma_c(omega) pipeline
-        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``,
-        # ppm_sigma.py's per-branch sigma builders, and mpa/sigma.py's
-        # equivalent for insulating MPA) reads ``wfns.xn``/``.xr``/``.yr``/
-        # ``.yn`` directly and calls ``greens_function_kernel.build_G``/
-        # ``build_G_tau`` with no ``layout=`` dispatch.  Only the STATIC
-        # channels (x_only bare exchange; COHSEX's sigma_sx/sigma_coh/
-        # hartree in cohsex_sigma.py) were ported
-        # (feat/face-g-projection-hartree-2026-08-22) -- the docs table this
-        # row's own doc string corrects had claimed GN-PPM/HL-PPM/insulating
-        # MPA were part of the supported envelope; that claim was written
-        # from the guide's landing-order text, not verified against what
-        # that branch actually shipped, and this row is the correction.
-        # ``ComputeMode.is_dynamic`` is exactly GN_PPM | HL_PPM | MPA (see
-        # its own docstring); by the time this row is reached in table
-        # order, a metal MPA deck has already been refused by the row
-        # above, so this predicate only ever fires for GN_PPM, HL_PPM, or
-        # INSULATING MPA -- ``qp_solver = fixed_point`` requires a dynamic
-        # compute_mode (gw_config.py:4130) and therefore always trips this
-        # row too; there is no static-mode escape for it under
-        # low_mem_bands=true today.
-        "low_mem_bands_dynamic_ppm_unported",
-        lambda cfg: cfg.compute_mode.is_dynamic,
-        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "compute_mode = x_only or cohsex (the ported static Sigma "
-        "channels)",
-        "set compute_mode = cohsex (or x_only), or low_mem_bands = false "
-        "for a GN-PPM/HL-PPM/MPA run",
-        "the dynamic two-point-PPM / MPA Sigma_c(omega) pipeline "
-        "(ppm_tau_kernel.py, ppm_sigma.py, mpa/sigma.py) reads "
-        "wfns.xn/xr/yr/yn directly with no face-layout port yet; only the "
-        "static Sigma channels (x_only, COHSEX's sigma_sx/sigma_coh/"
-        "hartree) were ported to layout='face'",
-    ),
+        # The dynamic two-point plasmon-pole Sigma_c(omega) pipeline
+        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``
+        # /``_get_sigma_kij_kernel``, ``common.contract_bands``'s
+        # channels="split_reim" face arm, and ppm_sigma.py's per-branch
+        # sigma builders + invalid-pole static-limit term) now dispatches
+        # on ``wfns.layout`` and routes through
+        # ``greens_function_kernel.build_G_tau(layout='face', gemm=...)``/
+        # ``contract_bands_block_reshard(layout='face', channels=...)`` —
+        # the SAME canonical owners the static COHSEX channels already
+        # used, extended rather than forked (report §5).  Gated: real
+        # 4-rank CUDA algebra parity (legacy vs face, identity + real tau
+        # weights, ns=1/ns=2, a non-mesh-divisible sigma window,
+        # tests/test_ppm_tau_kernel_face_parity.py, 5/5 PASS), a real
+        # end-to-end MoS2 k6_c50 leg at compute_mode=gn_ppm
+        # head_correction=full matching the legacy gn_ppm reference to
+        # ~1e-5 eV, and tests/test_zeta_mesh_invariance.py 7/7 unaffected
+        # (claims/0435.md).  A LARGER k6_c600 (mu=5282) confirmation of
+        # the same combination could NOT be completed this session: it
+        # dies in the already-registered, pre-existing qsgw_head.py
+        # head-response OOM (KNOWN_LORRAX_ISSUES.md's
+        # src/gw/qsgw_head.py:250-256 row; third independent
+        # reproduction, claims/0436.md) before ever reaching this
+        # pipeline's own code — that defect is inherited from this
+        # branch's base and is unrelated to this port (it also blocks
+        # head_correction=full under low_mem_bands=true for COHSEX at
+        # that scale).  Production-scale confirmation of THIS port
+        # remains open follow-up work, not claimed here.  ``mpa/sigma.py``
+        # (insulating MPA's own executor,
+        # ``_integrate_sigma_batches``) was mechanically ported the SAME
+        # session, sharing this now-gated tau-kernel/projector infra, but
+        # was NOT itself run end to end this session (its own
+        # sharded-output final layout has an additional named gap for a
+        # split Σ window — see that file's own comment) — kept refused
+        # then, pending its own gate.
+        #
+        # DELETED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23,
+        # claims/0443.md), not narrowed to metal-only: that named gap is
+        # now FIXED. gw.mpa.sigma._integrate_sigma_batches' sharded-output
+        # tail (a split Sigma window, nb_sigma != nb_full -- the ORDINARY
+        # case) is ported: strip_sigma_window gained a device-array arm
+        # that applies wavefunction_bundle.pack_band_window's OWN
+        # mechanism (jax.lax.slice_in_dim + jax.lax.with_sharding_
+        # constraint) to Sigma_c's own trailing (m,n) axes -- reusing that
+        # primitive's idiom rather than reworking psi_proj's INPUT width,
+        # which would have desynced it from contract_bands.py's eagerly-
+        # built, fixed-width GEMM plans (a shared contract this fix does
+        # not reopen).  Gated: real 4-rank CUDA mesh-aware strip_sigma_
+        # window parity (5/5, tests/test_mpa_sigma_split_window_strip.py,
+        # bit-exact) and a real end-to-end fresh one-shot insulating MPA
+        # leg (Si_scalar, a genuine split window nb_sigma=8 < nb_full=20)
+        # -- eqp0.dat max|dE_QP|=6.510e-05 eV, eqp1.dat max|dE_QP|=
+        # 8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy vs face.
+        #
+        # A NARROWED (metal-only) row was drafted first and then deleted
+        # rather than kept, per its own predicate's own "narrow it away
+        # entirely if nothing else remains under it" instruction: a
+        # metal deck's mpa_material_class == 'metal' predicate is a
+        # STRICT SUBSET of -- and, given _validate_metal_compute_mode's
+        # standing invariant (material_class == metal implies compute_
+        # mode == mpa, enforced in LorraxConfig.__post_init__ BEFORE this
+        # table ever runs), logically EQUIVALENT to -- the
+        # low_mem_bands_metal_material_class_unported row's own predicate,
+        # which appears earlier in this tuple and therefore always fires
+        # first.  A second, later row with an implied-equivalent predicate
+        # would never be reached -- a dead, vacuous entry, the exact "gate
+        # that cannot fail" shape TASTE.md warns against -- so it is
+        # deleted outright rather than shipped unreachable.  Metal MPA
+        # remains refused, by the metal row alone; see that row's own
+        # updated comment for why (three named infra obstacles this
+        # session, none of them in gw.mpa.sigma's own code).
 )
 
 

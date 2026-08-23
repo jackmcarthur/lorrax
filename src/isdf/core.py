@@ -29,6 +29,7 @@ from common import timing
 from runtime.padding import pad_last_axis_to, round_up, solve_at_logical
 from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
+    gamma_apply,
     gamma_double_contract,
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
@@ -359,10 +360,15 @@ def c_q_from_psi_sm(
 	FULL loaded band range), so the contraction is a genuinely distributed
 	SUMMA GEMM (``distrib_la.gemm_plan``) rather than a local einsum — see
 	``gw.isdf_fitting.fit_zeta_to_h5`` and
-	``docs/architecture/zeta_fit_face_psi_cct.md``.  Only the charge
-	channel (``gamma_L=gamma_R=None``) is supported; the bispinor
-	transverse channel is refused upstream under ``low_mem_bands``
-	(``gw_config.refuse_unsupported_low_mem_bands``).
+	``docs/architecture/zeta_fit_face_psi_cct.md``.  The bispinor
+	transverse channel (``gamma_L``/``gamma_R`` not ``None``) IS supported
+	here (2026-08-23, ``feat/transverse-zeta-face-2026-08-23``): the γ̃
+	vertex is folded into the appropriate psi ENDPOINT
+	(``psi_mun``/``psi_nmu``, mirroring ``gw.wavefunction_bundle.
+	with_lorentz_vertices``'s field/axis table) before the band GEMM
+	rather than at ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``
+	step — see ``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex
+	section for the derivation and its conjugation-convention correction.
 
 	    psi_mun  : (nk, s, μ, n)  P(None, None, 'x', 'y')
 	    psi_nmu  : (nk, n, s, μ)  P(None, 'x', None, 'y')
@@ -394,20 +400,13 @@ def c_q_from_psi_sm(
 		raise ValueError(
 			f"c_q_from_psi_sm: layout must be 'legacy' or 'face', got "
 			f"{layout!r}")
-	if gamma_L is not None or gamma_R is not None:
-		raise NotImplementedError(
-			"c_q_from_psi_sm(layout='face') supports only the charge "
-			"channel (gamma_L=gamma_R=None).  The bispinor transverse "
-			"channel is refused under low_mem_bands upstream "
-			"(gw_config.refuse_unsupported_low_mem_bands's bispinor row); "
-			"this path was never built for gamma_double_contract's "
-			"non-identity arm.")
 	if psi_mun is None or psi_nmu is None or weight_l is None or weight_r is None or gemm is None:
 		raise ValueError(
 			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
 			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
 			").")
 	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
+	                 gamma_L, gamma_R,
 	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
 
 
@@ -552,6 +551,8 @@ def _c_q_face(
 	psi_nmu: jax.Array,
 	weight_l: jax.Array,
 	weight_r: jax.Array,
+	gamma_L: tuple[jax.Array, jax.Array] | None = None,
+	gamma_R: tuple[jax.Array, jax.Array] | None = None,
 	*,
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
@@ -589,12 +590,46 @@ def _c_q_face(
 	The GEMM seam (``common.contract_bands.merge_spin_centroid`` /
 	``split_spin_centroid``) and the weighted-band convention
 	(``gemm(A * weight, B)``) are EXACTLY ``gw.greens_function_kernel.
-	_face_build_G``'s pattern, reused rather than re-derived — same
+	_build_G_face``'s pattern, reused rather than re-derived — same
 	merge positions (1,2) and (2,3), same "conjugate the μ/row operand,
 	leave the ν/col operand un-conjugated" convention as
 	:func:`pair_density`'s own docstring (the X-form is pre-conjugated by
 	its caller in the legacy path; here the conjugate is applied
 	explicitly since the face carrier stores un-conjugated ψ throughout).
+
+	γ̃ VERTEX (``gamma_L``/``gamma_R`` not ``None``, 2026-08-23) — endpoint
+	application, NOT ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``.
+	``_c_q_legacy`` inserts γ̃ by calling ``gamma_apply`` TWICE on ``P_r``
+	alone (once per spin axis) — ``P_l`` (only conjugated, never
+	γ̃-transformed) is untouched; see
+	``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex section for the
+	full derivation.  This path reproduces that exactly by transforming the
+	psi ENDPOINTS that feed ``P_r``'s own GEMM, mirroring
+	``gw.wavefunction_bundle.with_lorentz_vertices``'s field/axis table
+	(``_G_VERTEX_FIELDS``: ``psi_mun`` axis 1 for the mu_L/left vertex,
+	``psi_nmu`` axis 2 for the nu_L/right vertex) — ``P_l`` keeps using the
+	RAW ``psi_mun``/``psi_nmu``, ``P_r`` uses gamma-transformed copies:
+
+	* ``psi_mun`` plays CCT's CONJUGATED (μ/row) operand — the OPPOSITE
+	  conjugation role from the G-build, where ``psi_mun`` is the
+	  UNCONJUGATED direct operand (``greens_function_kernel._build_G_face``
+	  conjugates ``psi_nmu``, not ``psi_mun``).  So γ̃_L is applied to
+	  ``jnp.conj(psi_mun)`` (conjugate FIRST — commutes with the merge, a
+	  pure reshape) using the ORIGINAL, uncompensated ``phase_L``: applying
+	  γ̃ to an ALREADY-conjugated array needs no phase conjugate, whereas
+	  applying it BEFORE the conjugate would (``conj(gamma_apply(X,phase))
+	  == gamma_apply(conj(X), conj(phase))`` — this path takes the
+	  conjugate-first branch of that identity to avoid the correction).
+	* ``psi_nmu`` plays CCT's UNCONJUGATED (ν/col) operand — SAME role as
+	  the G-build's own ``psi_nmu`` argument slot except THAT one gets
+	  conjugated internally by ``_build_G_face`` and this one never is — so
+	  γ̃_R applies directly, original phase, no compensation needed either
+	  way.
+
+	``mu_L == 0`` / ``nu_L == 0`` (``gamma_L``/``gamma_R is None``) skip
+	the corresponding transform — ``P_r`` then equals ``P_l``'s own
+	construction (weight aside), and the tail's ``gamma_double_contract``
+	call runs with no perm/phase, byte-identical to the pre-vertex code.
 	"""
 	nk, s_, mu_full, nb = psi_mun.shape
 	nkx, nky, nkz = kgrid
@@ -606,6 +641,8 @@ def _c_q_face(
 	py = int(mesh_xy.shape['y'])
 	mu_loc = mu_full // px
 	col_loc = n_col_full // py
+	lhs_id = gamma_L is None
+	rhs_id = gamma_R is None
 
 	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
 	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
@@ -613,19 +650,34 @@ def _c_q_face(
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 	pair_spec = P(None, None, 'x', None, 'y')
 
-	@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
+	@partial(jax.jit,
+	         in_shardings=(in_mun, in_nmu, w_rep, w_rep,
+	                       w_rep, w_rep, w_rep, w_rep),
 	         out_shardings=out_C)
-	def _fused(psi_mun_, psi_nmu_, w_l, w_r):
-		def _pair(w: jax.Array) -> jax.Array:
-			A = jnp.conj(merge_spin_centroid(psi_mun_, 1, 2))  # (nk, mu*s, nb)  x-major
+	def _fused(psi_mun_, psi_nmu_, w_l, w_r, perm_L_, phase_L_, perm_R_, phase_R_):
+		def _pair(psi_mun_conj_: jax.Array, psi_nmu_use: jax.Array,
+		          w: jax.Array) -> jax.Array:
+			A = merge_spin_centroid(psi_mun_conj_, 1, 2)        # (nk, mu*s, nb)  x-major
 			A = A * w[None, None, :].astype(A.dtype)
-			B = merge_spin_centroid(psi_nmu_, 2, 3)             # (nk, nb, nu*s)  y-major
+			B = merge_spin_centroid(psi_nmu_use, 2, 3)          # (nk, nb, nu*s)  y-major
 			D = gemm(A, B)                                      # (nk, mu*s, nu*s)  P(_,'x','y')
 			Pp = split_spin_centroid(D, 1, s_, mu_full)         # (nk, s, mu, nu*s)
 			return split_spin_centroid(Pp, 3, s_, n_col_full)   # (nk, s, mu, s', nu)
 
-		P_l = _pair(w_l)
-		P_r = _pair(w_r)
+		psi_mun_conj = jnp.conj(psi_mun_)
+		P_l = _pair(psi_mun_conj, psi_nmu_, w_l)
+		if lhs_id and rhs_id:
+			P_r = _pair(psi_mun_conj, psi_nmu_, w_r)
+		else:
+			# Endpoint γ̃ insertion -- ONLY for P_r's own construction
+			# (mirrors _c_q_legacy's gamma_apply(P_r, ...) calls, which
+			# never touch P_l).  Both transforms act on the REPLICATED
+			# spin axis: local permute+phase, zero collectives.
+			psi_mun_conj_r = (psi_mun_conj if lhs_id else
+			                  gamma_apply(psi_mun_conj, perm_L_, phase_L_, axis=1))
+			psi_nmu_r = (psi_nmu_ if rhs_id else
+			            gamma_apply(psi_nmu_, perm_R_, phase_R_, axis=2))
+			P_r = _pair(psi_mun_conj_r, psi_nmu_r, w_r)
 
 		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
 		         out_specs=P(None, 'x', 'y'), check_vma=False)
@@ -638,7 +690,10 @@ def _c_q_face(
 			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
 			# Spin axes at (3, 5) in THIS (k,a,mu,b,nu) order -- NOT
-			# legacy's (3, 6), which is 'karmb' (k,a,col,mu,b).
+			# legacy's (3, 6), which is 'karmb' (k,a,col,mu,b).  The γ̃
+			# vertex is ALREADY baked into P_r (above), so this call is
+			# always the plain identity contraction (a trace over spin)
+			# -- no perm/phase args, in either channel.
 			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
 			del P_l_R_conj, P_r_R
 			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
@@ -649,9 +704,21 @@ def _c_q_face(
 
 		return _tail(P_l, P_r)
 
+	if lhs_id:
+		perm_L = jnp.arange(s_, dtype=jnp.int32)
+		phase_L = jnp.ones(s_, dtype=jnp.complex128)
+	else:
+		perm_L, phase_L = gamma_L
+	if rhs_id:
+		perm_R = jnp.arange(s_, dtype=jnp.int32)
+		phase_R = jnp.ones(s_, dtype=jnp.complex128)
+	else:
+		perm_R, phase_R = gamma_R
+
 	return _fused(psi_mun, psi_nmu,
 	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64))
+	             jnp.asarray(weight_r, dtype=jnp.float64),
+	             perm_L, phase_L, perm_R, phase_R)
 
 
 def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
@@ -787,14 +854,6 @@ def z_q_from_psi_sm(
 		raise ValueError(
 			f"z_q_from_psi_sm: layout must be 'legacy' or 'face', got "
 			f"{layout!r}")
-	if gamma_L is not None or gamma_R is not None:
-		raise NotImplementedError(
-			"z_q_from_psi_sm(layout='face') supports only the charge "
-			"channel (gamma_L=gamma_R=None) -- the bispinor transverse "
-			"channel is refused under low_mem_bands upstream "
-			"(gw_config.refuse_unsupported_low_mem_bands's bispinor row); "
-			"this path was never built for gamma_double_contract's "
-			"non-identity arm.")
 	if (psi_mun is None or weight_l is None or weight_r is None
 			or psi_G_store is None):
 		raise ValueError(
@@ -803,6 +862,7 @@ def z_q_from_psi_sm(
 			").")
 	return _z_q_face(
 		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
+		gamma_L, gamma_R,
 		band_chunk_ranges=band_chunk_ranges,
 		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
 		kgrid=kgrid, mesh_xy=mesh_xy)
@@ -1346,6 +1406,8 @@ def _z_q_face(
 	psi_r_cache: jax.Array | None,
 	weight_l: jax.Array,
 	weight_r: jax.Array,
+	gamma_L: tuple[jax.Array, jax.Array] | None = None,
+	gamma_R: tuple[jax.Array, jax.Array] | None = None,
 	*,
 	band_chunk_ranges: tuple[tuple[int, int], ...],
 	r_start_dyn,
@@ -1385,9 +1447,35 @@ def _z_q_face(
 	``shard_map``/``lax.scan`` untouched.  See
 	docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section.
 
-	Only the charge channel (γ̃^0 = I) is reachable here — the caller
-	(:func:`z_q_from_psi_sm`) already refuses ``gamma_L``/``gamma_R`` is
-	not ``None`` before dispatching to this function.
+	γ̃ VERTEX (``gamma_L``/``gamma_R`` not ``None``, 2026-08-23) — mirrors
+	:func:`_c_q_face`'s own endpoint-application exactly (same "transform
+	P_r's construction only, P_l stays untouched" rule as
+	``_z_q_legacy``'s ``gamma_apply(P_r, ...)`` calls), applied to THIS
+	kernel's own two per-bc operands instead of a resident psi_mun/psi_nmu
+	pair:
+
+	* γ̃_L transforms ``x_full_bc`` (the μ/bra operand, already
+	  conjugated via ``psi_mun_conj`` above) — applied AFTER the
+	  gather+``psum('y')``, not before: γ̃ acts only on the REPLICATED
+	  spin axis, which the gather/mask/psum machinery never touches (it
+	  operates on the band axis and the 'y' mesh axis), so the two
+	  commute exactly — bit-for-bit, since ``psum`` over an
+	  at-most-one-nonzero-term set is a SELECT, not a re-ordered
+	  reduction (this file's own note above `_b_hi_rel_np`).  Applying
+	  the transform after the collective, rather than to ``psi_mun_conj``
+	  before it, costs ZERO extra communication: it would otherwise mean
+	  a SECOND masked-gather-then-psum for the R construction alone.
+	* γ̃_R transforms ``psi_Y_bc`` (the ν/ket operand, unconjugated) —
+	  applied AFTER the r-scatter (``all_to_all``/``all_gather``/
+	  Y-compaction), for the identical reason: spin is orthogonal to
+	  every axis that machinery permutes.
+
+	Both transformed copies are used ONLY for ``psi_r_X_bc``/the
+	``delta_P_r`` einsum; ``psi_l_X_bc``/``delta_P_l`` keep the
+	untransformed ``x_full_bc``/``psi_Y_bc``, matching legacy's untouched
+	``P_l``.  ``gamma_L is None``/``gamma_R is None`` skip the
+	corresponding transform (identity short-circuit, no allocation),
+	reducing to the pre-vertex charge-channel code byte-for-byte.
 
 	``weight_l``/``weight_r``: ``(nb_face,)`` real, 1.0 inside the L/R
 	band window and 0.0 outside — the SAME "weight, don't window"
@@ -1426,6 +1514,8 @@ def _z_q_face(
 			f"requires this (BandSlices.b4 is world-size-padded, and "
 			f"psi_mun spans the fit's FULL [b0,b4) load extent).")
 	r_loc = n_zchunk // p_y
+	lhs_id = gamma_L is None
+	rhs_id = gamma_R is None
 
 	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
 	if not bcr:
@@ -1503,18 +1593,18 @@ def _z_q_face(
 	cache_key = (
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
-		bcr, use_psi_r_cache,
+		bcr, use_psi_r_cache, lhs_id, rhs_id,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
 	if cache_key not in _pair_pipeline_sm_cache:
 
 		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(mun_spec, w_spec, w_spec, P(), g_index_spec,
-		                   kvecs_frac_spec, cache_spec),
+		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(), P(), P(),
+		                   g_index_spec, kvecs_frac_spec, cache_spec),
 		         out_specs=out_spec, check_vma=False)
-		def _local(psi_mun_, w_l_, w_r_, r_start_, g_index_dev,
-		           kvecs_frac_dev, psi_r_cache_):
+		def _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
+		           r_start_, g_index_dev, kvecs_frac_dev, psi_r_cache_):
 			x_idx = jax.lax.axis_index('x')
 			y_idx = jax.lax.axis_index('y')
 			mu_loc = psi_mun_.shape[2]
@@ -1592,6 +1682,18 @@ def _z_q_face(
 				# (nk, ns, mu_loc, bpd_max_global) — present on every
 				# rank now, bounded to ONE band-chunk's width.
 
+				# γ̃ vertex, R-role ONLY (mirrors `_c_q_face`'s own
+				# P_r-only rule).  Applied AFTER the collective above /
+				# below — spin is a replicated axis neither the psum
+				# nor the r-scatter machinery touches, so this is a
+				# local permute+phase, zero extra collectives, and
+				# bit-identical to transforming the pre-collective
+				# source (see this function's docstring).
+				x_full_bc_r = (x_full_bc if lhs_id else
+				              gamma_apply(x_full_bc, perm_L_, phase_L_, axis=1))
+				psi_Y_bc_r = (psi_Y_bc if rhs_id else
+				             gamma_apply(psi_Y_bc, perm_R_, phase_R_, axis=2))
+
 				# bc_valid: a SHORT bc (bpd_max_global > this bc's true
 				# width -- the trailing remainder chunk) makes
 				# ``global_band`` overrun BOTH this bc's own end AND, at
@@ -1609,19 +1711,22 @@ def _z_q_face(
 				w_r_bc = jnp.where(bc_valid, jnp.take(w_r_, g_clamped), 0.0)
 				psi_l_X_bc = x_full_bc * w_l_bc[
 					None, None, None, :].astype(x_full_bc.dtype)
-				psi_r_X_bc = x_full_bc * w_r_bc[
-					None, None, None, :].astype(x_full_bc.dtype)
+				psi_r_X_bc = x_full_bc_r * w_r_bc[
+					None, None, None, :].astype(x_full_bc_r.dtype)
 
 				# einsum: X's axis order here is (k, a=spin, m=mu,
 				# n=band) — 'kamn', vs legacy's (k, m=mu, n=band,
 				# a=spin) — 'kmna'.  Same contraction, same output
 				# order 'karmb'; only the (free, notational) label
 				# order differs for the SAME data — no transpose.
+				# psi_l_* uses the UNTRANSFORMED operands (L-role, matches
+				# legacy's untouched P_l); psi_r_X_bc/psi_Y_bc_r carry the
+				# γ̃ vertex, R-role only (see this function's docstring).
 				delta_P_l = jnp.einsum(
 					'kamn,knbr->karmb', psi_l_X_bc, psi_Y_bc,
 					optimize=True)
 				delta_P_r = jnp.einsum(
-					'kamn,knbr->karmb', psi_r_X_bc, psi_Y_bc,
+					'kamn,knbr->karmb', psi_r_X_bc, psi_Y_bc_r,
 					optimize=True)
 				return (P_l_acc + delta_P_l, P_r_acc + delta_P_r), None
 
@@ -1643,6 +1748,9 @@ def _z_q_face(
 			del P_l_3d, P_l_R
 			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
+			# γ̃ is already baked into P_r above (endpoint application) —
+			# always the plain identity contraction here, in either
+			# channel, mirroring `_c_q_face`'s own tail.
 			Z_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 6))
 			del P_l_R_conj, P_r_R
 			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
@@ -1651,12 +1759,24 @@ def _z_q_face(
 				(0, 2, 1))
 
 		@jax.jit
-		def fn(psi_mun_, w_l_, w_r_, r_start_, g_index_, kvecs_frac_,
-		        psi_r_cache_):
-			return _local(psi_mun_, w_l_, w_r_, r_start_, g_index_,
+		def fn(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
+		        r_start_, g_index_, kvecs_frac_, psi_r_cache_):
+			return _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_,
+			              perm_R_, phase_R_, r_start_, g_index_,
 			              kvecs_frac_, psi_r_cache_)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
+
+	if lhs_id:
+		perm_L = jnp.arange(ns, dtype=jnp.int32)
+		phase_L = jnp.ones(ns, dtype=jnp.complex128)
+	else:
+		perm_L, phase_L = gamma_L
+	if rhs_id:
+		perm_R = jnp.arange(ns, dtype=jnp.int32)
+		phase_R = jnp.ones(ns, dtype=jnp.complex128)
+	else:
+		perm_R, phase_R = gamma_R
 
 	r_start_arg = (jnp.int32(int(r_start_dyn))
 	                if isinstance(r_start_dyn, (int, np.integer))
@@ -1666,6 +1786,7 @@ def _z_q_face(
 			(1, 1, p_x * p_y, 1, 1), dtype=jnp.complex128)
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_mun, weight_l.astype(jnp.float64), weight_r.astype(jnp.float64),
+		perm_L, phase_L, perm_R, phase_R,
 		r_start_arg, psi_G_store.g_index, psi_G_store.kvecs_frac,
 		psi_r_cache)
 
@@ -5509,25 +5630,23 @@ def _make_fit_one_rchunk_kernel(
     band-chunk pair-density streaming loop (Python-unrolled at trace),
     the ZCT, the Z_q→Z_col reshard, and the Cholesky solve.
 
-    ``layout='face'`` (``low_mem_bands=True``, charge channel only):
-    ``z_q_phase`` reads ``psi_mun``/``weight_l``/``weight_r`` instead of
+    ``layout='face'`` (``low_mem_bands=True``): ``z_q_phase`` reads
+    ``psi_mun``/``weight_l``/``weight_r`` instead of
     ``psi_l_rmuT_X_fit``/``psi_r_rmuT_X_fit``/``norms_l``/``norms_r`` —
     see :func:`isdf.core._z_q_face` and
     ``docs/architecture/zeta_fit_face_psi_cct.md``'s r-chunk section.
-    ``vertex_mu_L`` must be 0 under this layout (checked below; the
-    caller — ``gw.isdf_fitting.fit_zeta_to_h5`` — already refuses the
-    bispinor combination earlier, this is defense in depth at the lower
-    primitive).
+    ``vertex_mu_L != 0`` (2026-08-23) is now supported here too: the
+    SAME ``gamma_static`` (perm, phase) tuple this factory already
+    resolves for the legacy branch is passed as BOTH ``gamma_L=`` and
+    ``gamma_R=`` to ``z_q_from_psi_sm(layout='face')`` — mirroring the
+    legacy branch's own ``gamma_L=gamma_mu, gamma_R=gamma_mu`` call
+    exactly (``gw.isdf_fitting.fit_zeta_to_h5``'s STEP 2 CCT call uses
+    the identical single-index-for-both convention).
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_make_fit_one_rchunk_kernel: layout must be 'legacy' or "
             f"'face', got {layout!r}")
-    if layout == "face" and int(vertex_mu_L) != 0:
-        raise ValueError(
-            "_make_fit_one_rchunk_kernel: layout='face' supports only "
-            f"the charge channel (vertex_mu_L=0); got "
-            f"vertex_mu_L={int(vertex_mu_L)}.")
     nk_tot = meta.nk_tot
     vertex_mu_L = int(vertex_mu_L)
     if vertex_mu_L < 0 or vertex_mu_L > 3:
@@ -5586,11 +5705,16 @@ def _make_fit_one_rchunk_kernel(
             # band_norms is refused upstream under low_mem_bands
             # (fit_zeta_to_h5), so norms_l/norms_r are always all-ones
             # here; no scaling needed (unlike the legacy branch below).
+            # gamma_static: None for the charge channel (is_charge),
+            # the closure-captured (perm, phase) tuple for a transverse
+            # channel — SAME value passed as both gamma_L and gamma_R,
+            # mirroring the legacy branch below.
             return z_q_from_psi_sm(
                 psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
                 band_chunk_ranges=band_chunk_ranges,
                 r_start_dyn=r_start_dyn,
                 r_chunk_size=actual_n_rchunk,
+                gamma_L=gamma_static, gamma_R=gamma_static,
                 kgrid=kgrid, mesh_xy=mesh_xy,
                 layout="face", psi_mun=psi_mun,
                 weight_l=weight_l, weight_r=weight_r,
@@ -5730,9 +5854,10 @@ def fit_one_rchunk(
 
     ``layout='legacy'`` (default): ``psi_l_rmuT_X_fit``/
     ``psi_r_rmuT_X_fit``/``norms_l``/``norms_r`` are required, exactly as
-    before.  ``layout='face'`` (``low_mem_bands=True``, charge channel
-    only): ``psi_mun``/``weight_l``/``weight_r`` are required instead —
-    see :func:`isdf.core._z_q_face`.
+    before.  ``layout='face'`` (``low_mem_bands=True``): ``psi_mun``/
+    ``weight_l``/``weight_r`` are required instead — see
+    :func:`isdf.core._z_q_face`.  ``vertex_mu_L`` may be non-zero under
+    either layout (2026-08-23).
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
