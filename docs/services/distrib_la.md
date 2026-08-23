@@ -472,6 +472,14 @@ there is no provider-level "no C at all" mode — what this surface removes
 is the extra Python-level allocation and compiled program, not the C++
 argument. State that distinction when reporting the memory win.
 
+`out=` is refused on a `beta!=0` plan: `C` and `out` both reach the same
+compiled kernel, and that kernel's `beta` is fixed at *plan construction*,
+not chosen per call, so `out=`'s "content is ignored" contract only holds
+when the plan itself was built with `beta=0` — on a `beta!=0` plan the
+buffer's stale content would silently be scaled by `beta` and folded into
+the result. Pass `C=` on such a plan instead, where the accumulate is
+explicit at the call site.
+
 **Verified**, `services/distrib_la/tests/test_distrib_la_matmul_plan.py`
 (emulated CPU mesh — the eager refusal ladder only: `backend='off'`, a
 resolved non-cuBLASMp provider, mesh topology, dtype, malformed shapes;
