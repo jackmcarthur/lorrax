@@ -368,10 +368,40 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
                              dtype=jnp.complex128)
 
     @jax.jit
-    def sigma_sx(wfns, Gij, W_q):
+    def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
+        """``wfns_g``, when given, supplies the G-BUILD's two operands
+        (``psi_mun``/``psi_nmu``) INSTEAD of ``wfns``; the projection
+        step always reads ``wfns``'s own copies.  Defaults to ``wfns``
+        (every non-bispinor caller — identical to the pre-2026-08-23
+        body, since ``g = wfns_g or wfns`` then reproduces the exact
+        prior computation byte-for-byte).
+
+        THE REASON THIS PARAMETER EXISTS AT ALL, and not on the legacy
+        sibling: the two-face carrier stores exactly ONE (psi_mun,
+        psi_nmu) pair, reused for BOTH the G-build's internal band sum
+        and the outer band-basis projection — unlike the legacy
+        four-copy carrier, whose G-vertex fields (psi_xn/psi_yr) and
+        projection fields (psi_xr/psi_yn) are already four INDEPENDENT
+        arrays.  The bispinor Σ^B transverse-vertex trick
+        (``gw.sigma_x_bispinor``) needs γ̃ folded into the G-build's
+        INTERNAL band sum only — never into the OUTER projection bra/
+        ket (module docstring of ``gw.sigma_x_bispinor``: "the γ̃ vertex
+        sits on the build_G side of the kernel chain, not the
+        projection side").  On legacy that separation is already free
+        (``gw.wavefunction_bundle.with_lorentz_vertices`` only ever
+        touches psi_xn/psi_yr); on face, WITHOUT this parameter, the
+        SAME two arrays would have to serve both roles at once, and a
+        γ̃-inserted psi_mun/psi_nmu would corrupt the projection's outer
+        bra/ket along with the G-build — MEASURED: real 4-rank CUDA,
+        transverse (mu_L, nu_L) != (0,0) tiles disagreed with the
+        legacy reference by O(1) relative before this parameter existed
+        (tests/multi_device/bispinor_transverse_vertex_face_gate.py's
+        own bring-up).
+        """
         s = wfns.slices
+        g = wfns_g if wfns_g is not None else wfns
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
-        G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
+        G_occ = build_G(g.psi_mun, g.psi_nmu, phases=phases,
                         layout="face", gemm=g_plan)
         return _project(wfns.psi_nmu, wfns.psi_mun,
                         _convolve(G_occ, W_q, 1.0),
