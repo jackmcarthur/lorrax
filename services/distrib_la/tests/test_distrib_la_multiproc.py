@@ -752,6 +752,115 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
     return out
 
 
+def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
+                                     m=None, k=None, n=None, nsteps=3):
+    """``GemmPlan.local_call``: the SAME planned N,N GEMM as
+    ``check_gemm_plan_cublasmp``'s ``__call__`` coverage, but invoked from
+    INSIDE a manual-mode ``shard_map`` + ``lax.scan`` -- the composition
+    ``GemmPlan.__call__`` structurally cannot do (``matmul_plan.py``'s own
+    module docstring, "Composition inside a MANUAL-mode shard_map";
+    ``isdf.core._z_q_face``'s docstring names this as the reason its own
+    band-window reconstruction stays on a masked ``psum`` rather than a
+    SUMMA GEMM).  This is the real 4-rank CUDA proof that the composition
+    itself works -- numerics against a numpy reference, from inside a
+    manual ``shard_map`` body, streamed through ``lax.scan`` exactly like
+    a real r-chunk-shaped kernel, covering the internal-zero-C path, the
+    donated-C accumulate path and ``out=``.
+    """
+    import jax
+    from functools import partial
+    from jax.sharding import PartitionSpec as P
+    from distrib_la._shard_map import shard_map
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py, f"gemm_plan needs a square mesh; got {px}x{py}"
+    m = m if m is not None else 2 * px
+    k = k if k is not None else 3 * px
+    n = n if n is not None else 2 * px
+    rng = np.random.default_rng(20260822 + 7)
+    out = {}
+
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                       backend="cublasmp")
+
+    # 1. One call, no scan, no jit around the shard_map (proves local_call
+    # needs neither) -- the minimal case showing the WRAPPER, not the FFI,
+    # was the obstacle.
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, "x", "y"))
+    B = _put(B_np, mesh, (None, "x", "y"))
+    want = A_np @ B_np
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 2,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_once(a, b):
+        return plan.local_call(a, b)
+
+    D_once = _gather(_manual_once(A, B))
+    out["manual_no_c"] = _rel(D_once, want)
+    assert out["manual_no_c"] < RTOL, out["manual_no_c"]
+
+    # 2. Inside lax.scan, streamed -- the actual r-chunk-shaped
+    # composition (isdf.core._z_q_face's per-band-chunk scan body): one
+    # shard_map entry wrapping many local_call invocations inside its
+    # scan body, all under one outer jax.jit.
+    A_stack_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_stack_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A_stack = _put(A_stack_np, mesh, (None, None, "x", "y"))
+    B_stack = _put(B_stack_np, mesh, (None, None, "x", "y"))
+    want_scan = A_stack_np @ B_stack_np
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, None, "x", "y"),) * 2,
+             out_specs=P(None, None, "x", "y"), check_vma=False)
+    def _manual_scan(a_stack, b_stack):
+        def body(carry, ab):
+            a, b = ab
+            return carry, plan.local_call(a, b)
+        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack), unroll=1)
+        return out_stack
+
+    D_scan = _gather(jax.jit(_manual_scan)(A_stack, B_stack))
+    out["manual_scan_no_c"] = _rel(D_scan, want_scan)
+    assert out["manual_scan_no_c"] < RTOL, out["manual_scan_no_c"]
+
+    # 3. beta!=0 accumulate (donated C=), from inside the same manual
+    # shard_map -- donate_argnums=(2,) on the outer jit, mirroring
+    # _build_kernel's own fn_with_c contract, since C here IS a top-level
+    # jit argument (unlike the with_c=False path's internal jnp.zeros,
+    # which needs no donation to alias -- see _local_gemm_call).
+    plan_beta = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                            backend="cublasmp", beta=-0.5)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    C = _put(C_np, mesh, (None, "x", "y"))
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_c(a, b, c):
+        return plan_beta.local_call(a, b, C=c)
+
+    D_c = _gather(jax.jit(_manual_c, donate_argnums=(2,))(A, B, C))
+    want_c = A_np @ B_np + (-0.5) * C_np
+    out["manual_beta_accumulate"] = _rel(D_c, want_c)
+    assert out["manual_beta_accumulate"] < RTOL, out["manual_beta_accumulate"]
+
+    # 4. out= donation on a beta==0 plan, from inside the same manual
+    # shard_map.
+    scratch_np = _rng_mat(rng, (nq, m, n), dtype)
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_out(a, b, scratch):
+        return plan.local_call(a, b, out=scratch)
+
+    D_out = _gather(jax.jit(_manual_out, donate_argnums=(2,))(
+        A, B, _put(scratch_np, mesh, (None, "x", "y"))))
+    out["manual_out_donated"] = _rel(D_out, want)
+    assert out["manual_out_donated"] < RTOL, out["manual_out_donated"]
+
+    return out
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -869,6 +978,26 @@ def test_gemm_plan_cublasmp_smoke():
     check_gemm_plan_cublasmp(mesh, nq=2, m=2, k=3, n=2)
 
 
+def test_gemm_plan_manual_shard_map_smoke():
+    """Single-GPU smoke of ``GemmPlan.local_call`` inside a manual
+    shard_map; real 2x2 numerics under lax.scan are leg L-c's
+    ``gemm_plan_manual_shard_map`` cell."""
+    import jax
+    try:
+        jax.devices("gpu")
+    except Exception as exc:                                     # noqa: BLE001
+        pytest.skip(f"no CUDA backend here ({exc}); covered by leg L-c")
+    mesh = _mesh_1x1("gpu")
+    try:
+        D.resolve_matmul_backend("cublasmp", mesh)
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(
+            f"cublasmp not usable on a 1x1 CUDA mesh: {exc}  Covered by "
+            f"leg L-c (lx run -n 4 ... --mesh 2x2) where the library is "
+            f"pinned and there are four ranks")
+    check_gemm_plan_manual_shard_map(mesh, nq=2, m=2, k=3, n=2)
+
+
 def test_batch_reshard_matmul_smoke():
     """The real staged movement is the P=4 CLI cell of the same body."""
     check_distributed_matmul(
@@ -943,6 +1072,8 @@ _CLI_CELLS = [
          mesh, dt, backend="slate", batched_route="auto", nq=4)),
     ("gemm_plan_cublasmp", "CUDA",
      lambda mesh, dt: check_gemm_plan_cublasmp(mesh, dt)),
+    ("gemm_plan_manual_shard_map", "CUDA",
+     lambda mesh, dt: check_gemm_plan_manual_shard_map(mesh, dt)),
 ]
 
 

@@ -148,6 +148,7 @@ def _fake_plan(mesh, *, beta):
         mesh=mesh, backend="cublasmp", m=2, k=2, n=2, nq=1,
         dtype=jnp.dtype("complex128"), alpha=1 + 0j, beta=complex(beta),
         in_sharding_a=sharding, in_sharding_b=sharding, out_sharding=sharding,
+        ctx_handle=0,   # stand-in: no real FFI call reachable via __call__ here
         _fn_with_c=lambda A, B, C: C,   # stand-in: no real GEMM needed here
         _fn_no_c=(lambda A, B: A) if beta == 0 else None,
     )
