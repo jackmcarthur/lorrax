@@ -31,12 +31,25 @@ unchanged (G's output shape/sharding does not depend on layout).
 :func:`compute_chi0`/:func:`_chi0_multi_kernel_args`/
 :func:`_chi0_contour_kernel_args` turn a bundle into kernel operands, so
 those callers no longer extract legacy views (``.xn()``/``.yr()``)
-themselves.  NOT ported: ``_get_chi_fractional_contour_kernel`` /
-:func:`compute_chi0_contour_fractional` (a separate factory that does not
-share ``_build_Gv_Gc``) — under face layout its own ``wfns.xn()``/
-``wfns.yr()`` calls refuse by name (the legacy accessors' own guard), so
-it fails cleanly rather than silently.  See
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.
+themselves.
+
+Exact finite-occupation response (``feat/metal-response-face-2026-08-23``,
+``docs/architecture/fractional_chi0_response_face.md``): also ported.
+``_get_chi_fractional_contour_kernel`` dispatches to
+``_get_chi_fractional_contour_kernel_legacy`` (untouched) or
+``_get_chi_fractional_contour_kernel_face`` — a substitution of operands
+onto the SAME ``build_G_tau(layout='face', ...)`` mechanism the ordinary
+minimax kernel already uses, since its two Green's functions are each a
+one-particle, band_weight-diagonal contraction.  The ordered-pair kernel
+(``_fractional_pair_scan`` / :func:`_get_chi_static_fractional_gamma_kernel`
+/ :func:`_get_chi_fractional_q_kernel`) needed a genuinely new mechanism —
+its divided-difference weight depends JOINTLY on both band indices and
+cannot collapse to a one-particle GEMM — and gets one:
+``_fractional_pair_scan_face`` reconstructs each band tile it touches from
+the persistent ``psi_mun``/``psi_nmu`` via a masked-gather + ``psum`` on
+BOTH mesh axes (``isdf.core._z_q_face``'s idiom, generalized), never a
+resident single-axis copy.  See the design doc for the full derivation and
+why ``distrib_la.gemm_plan``/``GemmPlan.local_call`` do not apply here.
 """
 import os
 from functools import partial
@@ -504,8 +517,62 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
+    *, layout: str = "legacy", face_shape=None,
 ):
     """Retarded finite-occupation chi0 on one positive-time sweep.
+
+    ``layout`` (static): ``'legacy'`` (default) is the exact kernel this
+    module has always built — see
+    :func:`_get_chi_fractional_contour_kernel_legacy`.  ``'face'`` builds
+    the two-face carrier's version — a substitution of operands onto the
+    SAME ``build_G_tau(layout='face', ...)`` mechanism the ordinary
+    minimax kernel already uses (this kernel's two Green's functions are
+    each a one-particle, ``band_weight``-diagonal contraction, so no new
+    distributed algorithm is needed here — see
+    :func:`_get_chi_fractional_contour_kernel_face` and
+    ``docs/architecture/fractional_chi0_response_face.md``); requires
+    ``face_shape=(nk, nb_full, n_rmu, nspinor)``.  Mirrors
+    ``_get_chi_minimax_kernel``'s own legacy/face dispatcher split — the
+    cache-management lines below moved here from the (now pure-builder)
+    legacy body, exactly as that split's own precedent.
+    """
+    from ffi import ffi_dial_key
+
+    grid = tuple(int(n) for n in kgrid)
+    n_out = int(n_out)
+    if n_out < 1:
+        raise ValueError("fractional contour chi0 requires at least one output")
+    if layout not in ("legacy", "face"):
+        raise ValueError(
+            f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
+            f"or 'face', got {layout!r}")
+    cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
+                 n_out, layout, face_shape)
+    if cache_key in _chi_minimax_kernel_cache:
+        return _chi_minimax_kernel_cache[cache_key]
+
+    if layout == "legacy":
+        kernel = _get_chi_fractional_contour_kernel_legacy(mesh_xy, grid, n_out)
+    else:
+        if face_shape is None:
+            raise ValueError(
+                "_get_chi_fractional_contour_kernel(layout='face') requires "
+                "face_shape=(nk, nb_full, n_rmu, nspinor)")
+        kernel = _get_chi_fractional_contour_kernel_face(
+            mesh_xy, grid, n_out, face_shape)
+    _chi_minimax_kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def _get_chi_fractional_contour_kernel_legacy(
+    mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
+):
+    """The exact pre-``low_mem_bands`` kernel body, moved verbatim out of
+    :func:`_get_chi_fractional_contour_kernel` (only the cache-key/lookup/
+    store lines were removed — that bookkeeping is now the dispatcher's
+    job, mirroring ``_get_chi_minimax_kernel_legacy``'s own split) so the
+    dispatcher could gain a layout branch without touching this one at
+    all.
 
     At each node this builds only
 
@@ -532,16 +599,10 @@ def _get_chi_fractional_contour_kernel(
         PSI_XN_SPEC,
         PSI_YR_SPEC,
     )
-    from ffi import ffi_dial_key
 
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
-    if n_out < 1:
-        raise ValueError("fractional contour chi0 requires at least one output")
-    cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(), n_out)
-    if cache_key in _chi_minimax_kernel_cache:
-        return _chi_minimax_kernel_cache[cache_key]
 
     G_fftn = make_flat_k_fftn(
         mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
@@ -638,7 +699,180 @@ def _get_chi_fractional_contour_kernel(
         )
         return tuple(chi_fftn(value) for value in final_R)
 
-    _chi_minimax_kernel_cache[cache_key] = integrate
+    return integrate
+
+
+def _get_chi_fractional_contour_kernel_face(
+    mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
+):
+    """Face-layout sibling of
+    :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
+    identity (see that function's docstring); the two per-node Green's
+    functions (``Gf`` weighted by ``occ_f``, ``Gu`` weighted by
+    ``occ_u``) are each an ordinary ONE-PARTICLE ``build_G_tau``
+    contraction — this kernel is therefore a substitution of operands
+    (``psi_mun``/``psi_nmu`` instead of the four legacy views) onto the
+    SAME mechanism the ordinary minimax kernel's face port already ships,
+    not a new algorithm.  ONE ``distrib_la.gemm_plan`` (shared by both
+    ``Gf`` and ``Gu``, mirroring ``_get_chi_minimax_kernel_face``'s own
+    ``g_plan`` shared by ``Gv``/``Gc``) is built ONCE here, eagerly.
+
+    Legacy slices ψ down to the ``f_slice``/``u_slice`` occupation-support
+    window (a genuine cost cut — fewer bands enter the contraction); a
+    face carrier cannot be band-sliced (obstacle #3), so the CALLER
+    (:func:`_chi0_fractional_contour_args`) instead precomputes the FINAL
+    ``occ_f``/``occ_u`` band_weight values — ``occ`` and ``1-occ``
+    respectively, legacy's own two conventions — zero-weighted outside
+    that same window before calling here — "weight, don't window", the
+    SAME convention ``isdf.core._c_q_face`` uses for its own L/R window
+    (see the design doc).  ``occ_u`` therefore already IS ``1-occ``, not
+    a raw occupation this function must itself invert — applying a
+    SECOND ``1-x`` here reintroduces exactly the bug this comment is
+    warning against (see ``integrate``'s own comment, found via the Na
+    production-shape harness).  This function always runs the FULL
+    ``nb_full`` contraction; it does not know or care that the caller
+    has already zeroed part of the weight.
+    """
+    from common.fft_helpers import make_flat_k_fftn
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import build_G_tau
+    from .wavefunction_bundle import (
+        G_FFT7D_SPEC,
+        G_FLATK_SPEC,
+        CHI_Q_SPEC,
+        CHI_R_SPEC,
+        PSI_MUN_SPEC,
+        PSI_NMU_SPEC,
+    )
+
+    grid = tuple(int(n) for n in kgrid)
+    nk = int(np.prod(grid))
+    n_out = int(n_out)
+    nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    if nk_shape != nk:
+        raise ValueError(
+            f"_get_chi_fractional_contour_kernel_face: face_shape "
+            f"nk={nk_shape} does not match kgrid's prod={nk}")
+
+    G_fftn = make_flat_k_fftn(
+        mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
+    chi_fftn = make_flat_k_fftn(
+        mesh_xy, grid, CHI_Q_SPEC, norm="ortho")
+    G_shard = NamedSharding(mesh_xy, G_FLATK_SPEC)
+    chi_R_shard = NamedSharding(mesh_xy, CHI_R_SPEC)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    rep1 = NamedSharding(mesh_xy, P(None))
+    rep0 = NamedSharding(mesh_xy, P())
+    psi_mun_shard = NamedSharding(mesh_xy, PSI_MUN_SPEC)
+    psi_nmu_shard = NamedSharding(mesh_xy, PSI_NMU_SPEC)
+
+    # ONE planned GEMM, built here (eagerly, once) and shared by every Gf
+    # and Gu build this kernel ever does — mirrors
+    # _get_chi_minimax_kernel_face's own g_plan.
+    g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
+                       nq=nk, dtype=jnp.complex128)
+
+    @partial(
+        jax.jit,
+        in_shardings=(
+            rep1, rep0,
+            psi_mun_shard, psi_nmu_shard,
+            rep2, rep2, rep2, rep0,
+        ),
+        out_shardings=tuple(chi_R_shard for _ in range(n_out)),
+    )
+    def integrate(
+        time_nodes,
+        projection_rows,
+        psi_mun,
+        psi_nmu,
+        enk_full,
+        occ_f,
+        occ_u,
+        energy_reference,
+    ):
+        # occ_f/occ_u are the FINAL band_weight values, applied directly
+        # (no further transform here) -- the caller
+        # (_chi0_fractional_contour_args) has ALREADY done both jobs: the
+        # physical weight (occ_f is occ; occ_u is 1-occ -- legacy's own
+        # Gu_k convention, inverted BEFORE masking, not after) AND the
+        # "weight, don't window" support indicator (zero outside
+        # f_slice/u_slice).  Do NOT write `1.0 - occ_u` here: occ_u is
+        # already `(1-occ)*indicator`, and re-subtracting from 1.0 would
+        # turn the correctly-zeroed OUTSIDE-the-window positions into 1.0
+        # instead of 0.0, silently pulling every band outside u_slice
+        # into Gu_k's contraction (found and fixed 2026-08-23 via the Na
+        # production-shape harness: max_rel 0.19 -> 1e-16 at nb_full=48,
+        # 98.7% of the (mu,mu) output entries above 1% of the max diff --
+        # not a localized bug, every u_slice-adjacent band was wrong).
+        # enk_full is the bundle's own full [b0,b4) energy table, shared
+        # by both roles -- legacy's enk_f/enk_u are always the SAME array
+        # sliced twice, so this is not a new sharing, only a name
+        # simplification.
+        n_mu = psi_mun.shape[2]
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
+            chi_R_shard,
+        )
+        initial = tuple(zero for _ in range(n_out))
+
+        def body(accumulators, node):
+            time, projection = node
+            tau = jnp.asarray(1j, dtype=jnp.complex128) * time
+            Gf_k = jax.lax.with_sharding_constraint(
+                jnp.conj(build_G_tau(
+                    psi_mun,
+                    psi_nmu,
+                    enk_full,
+                    -tau,
+                    e_ref=energy_reference,
+                    band_weight=occ_f,
+                    layout="face",
+                    gemm=g_plan,
+                )),
+                G_shard,
+            )
+            Gu_k = jax.lax.with_sharding_constraint(
+                jnp.conj(build_G_tau(
+                    psi_mun,
+                    psi_nmu,
+                    enk_full,
+                    -tau,
+                    e_ref=energy_reference,
+                    band_weight=occ_u,
+                    layout="face",
+                    gemm=g_plan,
+                )),
+                G_shard,
+            )
+            Gf_R = G_fftn(Gf_k)
+            Gu_R = G_fftn(Gu_k)
+            A_R = jax.lax.with_sharding_constraint(
+                jnp.einsum(
+                    "Rambn,Rambn->Rmn",
+                    Gu_R,
+                    jnp.conj(Gf_R),
+                    optimize=True,
+                ),
+                chi_R_shard,
+            )
+            reverse_R = jnp.conj(A_R)
+            updated = tuple(
+                accumulators[i]
+                - 1j * projection[i] * A_R
+                + 1j * projection[i] * reverse_R
+                for i in range(n_out)
+            )
+            return updated, None
+
+        final_R, _ = jax.lax.scan(
+            body,
+            initial,
+            (time_nodes, jnp.transpose(projection_rows)),
+            unroll=1,
+        )
+        return tuple(chi_fftn(value) for value in final_R)
+
     return integrate
 
 
@@ -1404,7 +1638,17 @@ def _chi0_fractional_contour_args(
     energy_reference,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
-    """Prepare the exact finite-occupation positive-time response."""
+    """Prepare the exact finite-occupation positive-time response.
+
+    Layout-dispatched (``docs/architecture/fractional_chi0_response_
+    face.md``).  ``legacy``: windowed ψ views + windowed energies/
+    occupations, the historical body, unchanged.  ``face``: the FULL
+    [b0,b4) face carrier (``psi_mun``/``psi_nmu`` cannot be band-sliced —
+    obstacle #3) plus occupations WEIGHTED to zero exactly outside the
+    SAME two contiguous support windows legacy slices to — "weight, don't
+    window" — which reproduces legacy's windowed contraction bit-for-bit
+    up to summation-order roundoff (the contraction is bilinear in ψ).
+    """
     time_nodes = np.asarray(time_nodes, dtype=np.float64)
     z_values = np.asarray(z_values, dtype=np.complex128)
     if time_nodes.ndim != 1 or time_nodes.size == 0:
@@ -1442,17 +1686,48 @@ def _chi0_fractional_contour_args(
     f_slice, u_slice = _occupation_support_slices(
         occ_full, occupation_window_threshold)
     eref = 0.0 if energy_reference is None else float(energy_reference)
+    if wfns.layout == "legacy":
+        args = (
+            jnp.asarray(time_nodes, dtype=jnp.float64),
+            jnp.asarray(projection_rows, dtype=jnp.complex128),
+            wfns.xn(f_slice),
+            wfns.yr(f_slice),
+            wfns.yr(u_slice),
+            wfns.xn(u_slice),
+            wfns.enk[:, f_slice],
+            wfns.enk[:, u_slice],
+            occ_full[:, f_slice],
+            occ_full[:, u_slice],
+            jnp.asarray(eref, dtype=jnp.float64),
+        )
+        return args, z_values.size
+    # face: "weight, don't window" -- occ_full multiplied by a {0,1}
+    # indicator that is 1 exactly inside f_slice/u_slice, 0 outside,
+    # reproducing legacy's windowed sum bit-for-bit (see this function's
+    # docstring).  enk stays the bundle's FULL [b0,b4) table, unsliced,
+    # shared by both roles.  occ_f_face/occ_u_face are the FINAL
+    # band_weight values the face kernel applies directly (see
+    # _get_chi_fractional_contour_kernel_face's own comment on why the
+    # 1-occ inversion for the Gu role must happen BEFORE masking, not
+    # after -- masking a RAW occupation then inverting turns the
+    # correctly-excluded outside-window positions into 1.0 instead of
+    # 0.0).
+    nb_full = int(wfns.slices.nb_full)
+    idx = np.arange(nb_full)
+    f_ind = jnp.asarray(
+        (idx >= f_slice.start) & (idx < f_slice.stop), dtype=occ_full.dtype)
+    u_ind = jnp.asarray(
+        (idx >= u_slice.start) & (idx < u_slice.stop), dtype=occ_full.dtype)
+    occ_f_face = occ_full * f_ind[None, :]
+    occ_u_face = (1.0 - occ_full) * u_ind[None, :]
     args = (
         jnp.asarray(time_nodes, dtype=jnp.float64),
         jnp.asarray(projection_rows, dtype=jnp.complex128),
-        wfns.xn(f_slice),
-        wfns.yr(f_slice),
-        wfns.yr(u_slice),
-        wfns.xn(u_slice),
-        wfns.enk[:, f_slice],
-        wfns.enk[:, u_slice],
-        occ_full[:, f_slice],
-        occ_full[:, u_slice],
+        wfns.psi_mun,
+        wfns.psi_nmu,
+        wfns.enk,
+        occ_f_face,
+        occ_u_face,
         jnp.asarray(eref, dtype=jnp.float64),
     )
     return args, z_values.size
@@ -1493,7 +1768,8 @@ def compute_chi0_contour_fractional(
         energy_reference,
         occupation_window_threshold,
     )
-    kernel = _get_chi_fractional_contour_kernel(mesh_xy, kgrid, n_out)
+    kernel = _get_chi_fractional_contour_kernel(
+        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns))
     values = kernel(*args)
     return values[0] if n_out == 1 else values
 
@@ -1687,6 +1963,249 @@ def _get_chi_fractional_q_kernel(
     return kernel
 
 
+# ============================================================================
+# Exact finite-occupation response — face-layout ordered-pair kernel
+# ============================================================================
+#
+# See docs/architecture/fractional_chi0_response_face.md for the full
+# derivation.  ``_fractional_pair_scan`` above is FROZEN — this session
+# does not edit it, matching every other legacy/face split in this
+# codebase (isdf.core._c_q_legacy/_c_q_face, _z_q_legacy/_z_q_face,
+# greens_function_kernel._legacy_build_G/_face_build_G).  The per-pair
+# physics below (divided-difference weight, two density contractions, the
+# final zmn einsum) is intentionally re-typed rather than shared through a
+# helper both functions call, for the same reason.
+
+
+def _fractional_pair_scan_face(
+    psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
+    occ_a, occ_b, surface_a, surface_b, z_values, *,
+    nb_full, nb_logical, tile,
+):
+    """Face-layout sibling of :func:`_fractional_pair_scan`.
+
+    Runs INSIDE a shard_map body whose in_specs give this rank only its
+    own local shard of the persistent face carrier (``PSI_MUN_SPEC``/
+    ``PSI_NMU_SPEC``) — never a resident, band-replicated single-axis
+    copy.  The divided-difference weight depends JOINTLY on both band
+    indices' energies/occupations, so it cannot collapse to the
+    one-particle G GEMM (see the design doc); instead, each band TILE
+    this scan touches is reconstructed on demand from the persistent
+    carrier via a masked-gather + ``psum`` on BOTH mesh axes —
+    ``isdf.core._z_q_face``'s idiom, generalized from one axis (its own
+    ``psum('y')`` X-operand reconstruction) to both, since this kernel
+    needs BOTH ψ orientations (μ-on-X from ``psi_mun``, μ-on-Y from
+    ``psi_nmu``) at BOTH pair-index roles.
+
+    ``psi_mun_a``/``psi_nmu_a`` and ``psi_mun_b``/``psi_nmu_b`` are the
+    (already rank-local) face-carrier shards for the "a" and "b" pair-
+    index roles respectively — the SAME array for both, at Gamma; the
+    caller's own k−q-rolled copy for the finite-q kernel (rolling a
+    REPLICATED k axis is a rank-local ``jnp.take``, unaffected by layout).
+    ``energy_*``/``occ_*``/``surface_*`` are ``(nk, nb_full)`` REPLICATED
+    (already zero-padded by the caller up to ``nb_full`` if its own
+    window was narrower — safe, since any padded position is
+    ``>= nb_logical`` and hence excluded by the mask below regardless).
+
+    Tiling: nested scans, outer over the "a" band tile (reconstructed
+    ONCE per outer step, reused across the whole inner sweep), inner over
+    "b" (reconstructed fresh every step) — bounding the resident working
+    set to O(tile) band-widths at any instant.  See the design doc's
+    "Tiling choice" for the communication-cost accounting and why a
+    ``ppermute`` ring was considered and deferred, not needed at the
+    scale this session gated.
+    """
+    nk = psi_mun_a.shape[0]
+    ns = psi_mun_a.shape[1]
+    nmu_x_loc = psi_mun_a.shape[2]
+    nmu_y_loc = psi_nmu_a.shape[3]
+    shard_w_y = psi_mun_a.shape[3]   # psi_mun's own 'y'-shard width (bands)
+    shard_w_x = psi_nmu_a.shape[1]   # psi_nmu's own 'x'-shard width (bands)
+    y_idx = jax.lax.axis_index('y')
+    x_idx = jax.lax.axis_index('x')
+
+    def _gather_mun(psi_mun_local, g_lo):
+        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
+        masked-gather + psum('y') from psi_mun's local shard (bands on
+        'y').  psi_mun's own axis order (nk, s, mu, n) already matches
+        PSI_XN_SPEC's (nk, s, mu_X, n) -- no reorder needed."""
+        p = jnp.arange(tile, dtype=jnp.int32)
+        global_band = g_lo + p
+        owner = global_band // shard_w_y
+        owns = owner == y_idx
+        local_idx = jnp.clip(
+            global_band - y_idx * shard_w_y, 0, shard_w_y - 1)
+        gathered = jnp.take(psi_mun_local, local_idx, axis=3)
+        gathered = jnp.where(owns[None, None, None, :], gathered, 0)
+        return jax.lax.psum(gathered, 'y')
+
+    def _gather_nmu(psi_nmu_local, g_lo):
+        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank —
+        masked-gather + psum('x') from psi_nmu's local shard (bands on
+        'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
+        bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
+        mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
+        needs one transpose to match PSI_YN_SPEC's (nk, s, mu, n) order."""
+        p = jnp.arange(tile, dtype=jnp.int32)
+        global_band = g_lo + p
+        owner = global_band // shard_w_x
+        owns = owner == x_idx
+        local_idx = jnp.clip(
+            global_band - x_idx * shard_w_x, 0, shard_w_x - 1)
+        gathered = jnp.take(psi_nmu_local, local_idx, axis=1)
+        gathered = jnp.where(owns[None, :, None, None], gathered, 0)
+        gathered = jax.lax.psum(gathered, 'x')
+        return jnp.transpose(gathered, (0, 2, 3, 1))
+
+    nb_pad = ((int(nb_full) + tile - 1) // tile) * tile
+    pad = nb_pad - int(nb_full)
+    pad2 = ((0, 0), (0, pad))
+    ea_full = jnp.pad(energy_a, pad2)
+    eb_full = jnp.pad(energy_b, pad2)
+    fa_full = jnp.pad(occ_a, pad2)
+    fb_full = jnp.pad(occ_b, pad2)
+    sa_full = jnp.pad(surface_a, pad2)
+    sb_full = jnp.pad(surface_b, pad2)
+    z = jnp.asarray(z_values, dtype=jnp.complex128)
+    ntiles = nb_pad // tile
+
+    def _pair_contribution(pa_x, pb_x, pa_y, pb_y, ea, eb, fa, fb, sa, sb,
+                           ga, gb):
+        # EXACT mirror of _fractional_pair_scan's per-pair body -- see
+        # that function for the physics derivation/comments.
+        de = ea[:, :, None] - eb[:, None, :]
+        df = fa[:, :, None] - fb[:, None, :]
+        scale = jnp.maximum(
+            1.0, jnp.maximum(jnp.abs(ea[:, :, None]), jnp.abs(eb[:, None, :])))
+        separated = jnp.abs(de) > 64.0 * jnp.finfo(jnp.float64).eps * scale
+        diagonal_limit = -0.5 * (sa[:, :, None] + sb[:, None, :])
+        static_divided = jnp.where(
+            separated, df / jnp.where(separated, de, 1.0), diagonal_limit)
+        dynamic = df[None, :, :, :] / (de[None, :, :, :] + z[:, None, None, None])
+        weights = jnp.where(
+            (z == 0.0)[:, None, None, None], static_divided[None, :, :, :],
+            dynamic)
+        logical = (
+            (ga[:, None] < int(nb_logical)) & (gb[None, :] < int(nb_logical))
+        )[None, :, :]
+        weights = jnp.where(logical[None, :, :, :], weights, 0.0)
+        density_x = jnp.einsum(
+            "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
+        density_y = jnp.einsum(
+            "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+        return jnp.einsum(
+            "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
+            optimize=True)
+
+    zero = jnp.zeros((z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
+
+    def _outer(acc, ia_step):
+        ia = ia_step * tile
+        ga = ia + jnp.arange(tile)
+        a_x = _gather_mun(psi_mun_a, ia)
+        a_y = _gather_nmu(psi_nmu_a, ia)
+        ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
+        fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
+        sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
+
+        def _inner(acc_inner, ib_step):
+            ib = ib_step * tile
+            gb = ib + jnp.arange(tile)
+            b_x = _gather_mun(psi_mun_b, ib)
+            b_y = _gather_nmu(psi_nmu_b, ib)
+            eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
+            fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
+            sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
+            contribution = _pair_contribution(
+                a_x, b_x, a_y, b_y, ea, eb, fa, fb, sa, sb, ga, gb)
+            return acc_inner + contribution, None
+
+        acc_inner, _ = jax.lax.scan(
+            _inner, jnp.zeros_like(acc), jnp.arange(ntiles), unroll=1)
+        return acc + acc_inner, None
+
+    chi, _ = jax.lax.scan(_outer, zero, jnp.arange(ntiles), unroll=1)
+    return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+
+
+def _get_chi_static_fractional_gamma_kernel_face(
+    mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
+):
+    """Face-layout sibling of :func:`_get_chi_static_fractional_gamma_kernel`.
+    See that function's docstring for the physics; only the operand
+    source differs — the persistent face carrier, never a resident
+    band-replicated copy (:func:`_fractional_pair_scan_face`)."""
+    from common.shard_map import shard_map
+    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+
+    tile = int(pair_tile)
+    key = ("static_fractional_gamma_face", id(mesh_xy), int(nb_full),
+           int(nb_logical), tile)
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    def _local(psi_mun, psi_nmu, energies, occupations, surface_weight):
+        return _fractional_pair_scan_face(
+            psi_mun, psi_nmu, psi_mun, psi_nmu, energies, energies,
+            occupations, occupations, surface_weight, surface_weight,
+            jnp.zeros((1,), dtype=jnp.complex128),
+            nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+
+    kernel = jax.jit(shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
+                  P(None, None)),
+        out_specs=P(None, "x", "y"),
+        check_vma=False,
+    ))
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
+def _get_chi_fractional_q_kernel_face(
+    mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
+    n_z: int,
+):
+    """Face-layout sibling of :func:`_get_chi_fractional_q_kernel`.  The
+    k−q roll is unaffected by layout (a rank-local ``jnp.take`` on the
+    REPLICATED k axis, same as legacy's own roll on ``PSI_XN_SPEC``'s
+    replicated k axis); only the band-tile reconstruction differs."""
+    from common.shard_map import shard_map
+    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+
+    tile = int(pair_tile)
+    key = ("direct_fractional_q_face", id(mesh_xy), int(nb_full),
+           int(nb_logical), tile, int(n_z))
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
+               surface_weight, z_values):
+        psi_mun_b = jnp.take(psi_mun, kminq_idx, axis=0)
+        psi_nmu_b = jnp.take(psi_nmu, kminq_idx, axis=0)
+        eb = jnp.take(energies, kminq_idx, axis=0)
+        fb = jnp.take(occupations, kminq_idx, axis=0)
+        sb = jnp.take(surface_weight, kminq_idx, axis=0)
+        return _fractional_pair_scan_face(
+            psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
+            occupations, fb, surface_weight, sb, z_values,
+            nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+
+    kernel = jax.jit(shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
+                  P(None, None), P(None, None), P(None)),
+        out_specs=P(None, "x", "y"),
+        check_vma=False,
+    ))
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
 def compute_chi0_static_fractional_gamma(
     wfns,
     energies_kn_ry,
@@ -1729,15 +2248,39 @@ def compute_chi0_static_fractional_gamma(
         raise ValueError(
             f"static fractional chi needs 0 < nb_logical <= {e.shape[1]}; "
             f"got {nb_logical}")
-    if int(wfns.psi_xn.shape[-1]) < int(e.shape[1]):
-        raise ValueError("centroid wavefunctions do not cover the static bands")
-    psi_x = wfns.psi_xn[..., : int(e.shape[1])]
-    psi_y = wfns.psi_yn[..., : int(e.shape[1])]
-    return _get_chi_static_fractional_gamma_kernel(
+    if wfns.layout == "legacy":
+        if int(wfns.psi_xn.shape[-1]) < int(e.shape[1]):
+            raise ValueError(
+                "centroid wavefunctions do not cover the static bands")
+        psi_x = wfns.psi_xn[..., : int(e.shape[1])]
+        psi_y = wfns.psi_yn[..., : int(e.shape[1])]
+        return _get_chi_static_fractional_gamma_kernel(
+            mesh_xy,
+            nb_logical=int(nb_logical),
+            pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
+        )(psi_x, psi_y, e, f, surface)
+    # face: the persistent carrier spans the FULL [b0,b4) window and
+    # cannot be band-sliced (obstacle #3) -- pad the caller's
+    # energies/occupations/surface table up to nb_full instead (any
+    # padded position is >= nb_logical, so the pair kernel's own
+    # nb_logical mask excludes it regardless).
+    nb_full = int(wfns.slices.nb_full)
+    if nb_full < int(e.shape[1]):
+        raise ValueError(
+            "compute_chi0_static_fractional_gamma(layout='face'): the "
+            f"loaded face carrier covers only {nb_full} bands, fewer than "
+            f"the {e.shape[1]} the caller's tables provide")
+    bpad = nb_full - int(e.shape[1])
+    pad2 = ((0, 0), (0, bpad))
+    e_full = jnp.pad(e, pad2)
+    f_full = jnp.pad(f, pad2)
+    surface_full = jnp.pad(surface, pad2)
+    return _get_chi_static_fractional_gamma_kernel_face(
         mesh_xy,
+        nb_full=nb_full,
         nb_logical=int(nb_logical),
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
-    )(psi_x, psi_y, e, f, surface)
+    )(wfns.psi_mun, wfns.psi_nmu, e_full, f_full, surface_full)
 
 
 def occupation_support_bandwidth(
@@ -1839,9 +2382,6 @@ def compute_chi0_direct_fractional(
         raise ValueError(
             "static fractional chi kminq_rows must have shape (n_q, nk="
             f"{e.shape[0]}); got {kmq.shape}")
-    if int(wfns.psi_xn.shape[-1]) < nb:
-        raise ValueError(
-            "centroid wavefunctions do not cover the direct bands")
     z = np.asarray(z_values, dtype=np.complex128)
     if z.ndim != 1 or not z.size or not np.all(np.isfinite(z)):
         raise ValueError(
@@ -1849,13 +2389,43 @@ def compute_chi0_direct_fractional(
     surface = mp1_negative_derivative(
         e, float(occupation_state.mu_ry),
         float(occupation_state.smearing_width_ry))
-    psi_x = wfns.psi_xn[..., :nb]
-    psi_y = wfns.psi_yn[..., :nb]
-    kernel = _get_chi_fractional_q_kernel(
-        mesh_xy, nb_logical=nb_log, pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
-        n_z=z.size)
+    if wfns.layout == "legacy":
+        if int(wfns.psi_xn.shape[-1]) < nb:
+            raise ValueError(
+                "centroid wavefunctions do not cover the direct bands")
+        psi_x = wfns.psi_xn[..., :nb]
+        psi_y = wfns.psi_yn[..., :nb]
+        kernel = _get_chi_fractional_q_kernel(
+            mesh_xy, nb_logical=nb_log,
+            pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
+        rows = [
+            kernel(psi_x, psi_y, jnp.asarray(row), e, f, surface, jnp.asarray(z))
+            for row in kmq
+        ]
+        values = jnp.stack(rows, axis=1)
+        return values[0] if z.size == 1 else values
+    # face: wfns.enk is already (nk, nb_full) -- e/f/surface above are
+    # ALREADY at the full loaded extent for this call site (they are
+    # wfns.enk/occupation_state.f_kn/its own derivative, not a caller-
+    # narrowed sub-window), but pad defensively for the general case
+    # rather than assume it (mirrors the Gamma wrapper's own guard).
+    nb_full = int(wfns.slices.nb_full)
+    if nb_full < nb:
+        raise ValueError(
+            "compute_chi0_direct_fractional(layout='face'): the loaded "
+            f"face carrier covers only {nb_full} bands, fewer than the "
+            f"{nb} the caller's energies/occupations table provides")
+    bpad = nb_full - nb
+    pad2 = ((0, 0), (0, bpad))
+    e_full = jnp.pad(e, pad2)
+    f_full = jnp.pad(f, pad2)
+    surface_full = jnp.pad(surface, pad2)
+    kernel = _get_chi_fractional_q_kernel_face(
+        mesh_xy, nb_full=nb_full, nb_logical=nb_log,
+        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
     rows = [
-        kernel(psi_x, psi_y, jnp.asarray(row), e, f, surface, jnp.asarray(z))
+        kernel(wfns.psi_mun, wfns.psi_nmu, jnp.asarray(row), e_full, f_full,
+               surface_full, jnp.asarray(z))
         for row in kmq
     ]
     values = jnp.stack(rows, axis=1)
@@ -1887,7 +2457,7 @@ def precompile_chi0_contour_fractional(
         occupation_window_threshold,
     )
     _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out).lower(*args).compile()
+        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns)).lower(*args).compile()
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
