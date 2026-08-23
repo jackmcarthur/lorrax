@@ -704,7 +704,7 @@ def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
         def body(carry, ab):
             a, b = ab
             return carry, plan(a, b)
-        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack))
+        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack), unroll=1)
         return out_stack
 
     D_scan = _gather(_scanned(A_stack, B_stack))
