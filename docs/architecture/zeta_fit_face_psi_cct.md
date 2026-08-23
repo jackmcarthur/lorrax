@@ -775,3 +775,109 @@ re-verified, not merely argued:
   level: a production-scale confirmation remains open, and should be the
   first thing a follow-up session with a working multi-node launch path
   does before this capability is used in another manual-mode kernel.
+
+## γ̃ VERTEX: the transverse (bispinor) channel lands (appended
+2026-08-23, `feat/transverse-zeta-face-2026-08-23`)
+
+Both `_c_q_face` and `_z_q_face` accept `gamma_L`/`gamma_R` — the same
+`(perm, phase)` tuple calling convention `_c_q_legacy`/`_z_q_legacy`
+already had — closing the LAST gap in the bispinor+`low_mem_bands`
+census row. `gw.isdf_fitting.fit_zeta_to_h5`'s `vertex_mu_L != 0`
+refusal under `low_mem_bands` is dropped; `gw.gw_config.
+_LOW_MEM_BANDS_REFUSALS`'s `low_mem_bands_bispinor_unported` row is
+DELETED. Full narrative and every verification number: `claims/0442.md`.
+
+### The mechanism: endpoint application, not post-IFFT contraction
+
+`_c_q_legacy`'s vertex insertion happens AFTER the IFFT, inside
+`gamma_double_contract`, on the ALREADY-formed real-space open-spin
+pair densities `P_l`/`P_r` — `gamma_apply` transforms `P_r` alone
+(both its spin axes, via two sequential calls), `P_l` untouched. The
+face path reproduces the exact same physics via a structurally
+DIFFERENT mechanism: **endpoint application**, folding γ̃ into the psi
+FIELDS (`psi_mun`/`psi_nmu`) themselves, BEFORE the band GEMM
+(`_c_q_face`) or the per-band-chunk masked-gather (`_z_q_face`) —
+mirroring `gw.wavefunction_bundle.with_lorentz_vertices`'s own
+field/axis table (`_G_VERTEX_FIELDS`) rather than `_c_q_legacy`'s own
+mechanism. Both are valid because γ̃ acts ONLY on the spin axis, which
+is REPLICATED in the face carrier and untouched by every band-
+contraction/collective mechanism either kernel uses — a linear
+transform on an axis a contraction doesn't touch commutes freely
+across that contraction, regardless of which SIDE of it the transform
+sits on. `P_l`'s construction stays untransformed either way, matching
+`_c_q_legacy`'s own asymmetry (`gamma_apply` never touches `P_l`).
+
+**The conjugation-convention trap, found and avoided.** `psi_mun`
+plays OPPOSITE conjugation roles in the two kernels this vertex touches
+(same field, different sign): `_c_q_face`'s `A = conj(merge_spin_
+centroid(psi_mun, 1, 2))` conjugates `psi_mun` (`psi_nmu` stays
+unconjugated); `greens_function_kernel._build_G_face`'s `B =
+merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)` conjugates `psi_nmu`
+instead (`psi_mun` is the DIRECT/unconjugated operand there). This was
+found by READING `_build_G_face` directly — not assumed from
+`with_lorentz_vertices`'s own G-build precedent — because an
+identity-vertex check (γ̃⁰ = I, both mu_L=nu_L=0) cannot discriminate a
+swapped conjugation convention: `gamma_apply` with an identity
+perm/phase is a no-op regardless of where the conjugate sits, so the
+existing `test_isdf_cq_face_parity.py`/`test_isdf_zq_face_parity.py`
+identity cases would pass either way. Consequence: for `_c_q_face`,
+`gamma_L` (`mu_L`, the "left"/direct-role vertex per `with_lorentz_
+vertices`'s own naming) is applied to `psi_mun` — but AFTER conjugating
+it (`gamma_apply(jnp.conj(psi_mun_), perm_L, phase_L, axis=1)`), using
+the ORIGINAL phase — not before, which would need a `conj(phase_L)`
+compensation (`conj(gamma_apply(X, perm, phase)) ==
+gamma_apply(conj(X), perm, conj(phase))`; conjugating first sidesteps
+the correction entirely and is what the landed code does). `gamma_R`
+applies to `psi_nmu` directly (never conjugated on the CCT path), with
+no compensation needed either way. `_z_q_face` inherits the identical
+convention on its own per-bc operands (`x_full_bc`, already conjugated
+via `psi_mun_conj` upstream; `psi_Y_bc`, never conjugated).
+
+### Why `_z_q_face` applies γ̃ AFTER its collectives, not before
+
+The task's own framing ("apply... BEFORE the band GEMM") is followed
+literally in `_c_q_face` (gamma applied to `psi_mun_`/`psi_nmu_`
+before `merge_spin_centroid`+`gemm`, since the R-window's own GEMM
+call is already separate from `P_l`'s — no extra dispatch either way).
+`_z_q_face` instead applies γ̃ to `x_full_bc`/`psi_Y_bc` — the SHARED,
+already-collected outputs of the masked-`psum('y')` gather and the
+`all_to_all`/`all_gather` r-scatter respectively — rather than to their
+pre-collective sources. This is not a deviation from the same
+principle, it is the SAME principle applied where it actually saves
+work: γ̃ commutes with the collective regardless of order (proven
+above), so doing it after means ONE gather/scatter serves BOTH the
+untransformed (`P_l`-role) and gamma-transformed (`P_r`-role) uses,
+instead of a second masked-gather-then-`psum` purely to serve the
+R-role. Zero extra communication, confirmed by the isolated parity
+gate's own bit-exact result (identical to the identity-channel case's
+own bit-exact result — no summation-order change was introduced
+either way).
+
+### The other half: the transverse centroid set's own face carrier
+
+Porting the two kernels alone does not produce a runnable bispinor
+deck — the ζ_T fit and Σ^B both need a face `Wavefunctions` bundle
+sampled at the TRANSVERSE centroid set (`gw.gw_init.
+_transverse_wfn_data`), a SEPARATE array from the charge channel's own
+carrier. `_transverse_wfn_data` now builds it internally (the SAME
+`PSI_MUN_SPEC`/`PSI_NMU_SPEC` `with_sharding_constraint` path the
+charge channel's own caller uses, not re-derived), because it is the
+ONE function BOTH the fresh-fit bispinor loop and the ζ-reuse early
+return call — a real `KeyError: 'psi_nmu_fresh'` surfaced at exactly
+this seam during the end-to-end gate, when a second run against an
+already-fit ζ took the reuse branch instead of the fresh-fit branch a
+first (duplicated, not-yet-refactored) attempt had covered. See
+`claims/0442.md` for the full account and every job/step id.
+
+### End-to-end result
+
+MoS2 3×3 bispinor GN-PPM fixture (`tests/regression/bispinor_debug/
+bispinor_test.in`), real 4-rank CUDA, `low_mem_bands=false` vs `=true`,
+both `rc=0`: `sigma_diag_bispinor_test.dat` 0 differing non-comment
+lines; `eqp0.dat`/`eqp1.dat` max|ΔE_QP| = 1.7e-8 eV, max|ΔE_DFT| = 0.0
+eV — the same order of magnitude as this project's other lifted rows
+(QSGW rotation: 3.3e-8 eV). Both bundles' own printed layout disclosure
+(`"...face layout: psi_nmu/psi_mun..."` for charge, `"Σ^B transverse ψ
+inventory (layout='face')..."` for the transverse bundle) confirms
+neither ever falls back to a legacy single-axis copy under this deck.
+Artifacts: `runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/`.
