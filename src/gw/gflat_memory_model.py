@@ -308,6 +308,21 @@ class GFlatChunkPlan:
     #: ``"psi_copies"``) AT THE RESOLVED LAYOUT — the number the banner
     #: prints next to ``psi_layout``.
     psi_layout_bytes: float = 0.0
+    #: Per-rank bytes of the TWO X-form single-axis ψ centroid copies
+    #: (mu on 'x', bands replicated; ``2·psi_one/p_x``) that are what is
+    #: ACTUALLY resident during Stage C/D (``fit_one_rchunk`` / the
+    #: accumulate step) after ``gw.isdf_fitting.fit_zeta_to_h5`` frees the
+    #: Y-form copies right after CCT (2026-08-22 fresh-fit low-mem psi
+    #: contract; report
+    #: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` census
+    #: row "Fresh centroid load/liveness").  INFORMATIONAL ONLY: this
+    #: field is NOT folded into ``peak_breakdown``/``hwm_bytes``/
+    #: ``bottleneck``, which are computed exactly as before this fix (the
+    #: A/B stages still hold all four copies, and any pre-existing
+    #: low_mem_bands-layout pricing of A-D is unchanged — see
+    #: KNOWN_LORRAX_ISSUES.md).  Disclosed on the banner so a run can see
+    #: the fix's effect without re-deriving it from HLO.
+    stage_cd_psi_bytes: float = 0.0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -316,6 +331,9 @@ class GFlatChunkPlan:
             "  ISDF memory model — chunk plan + HWM estimate",
             f"    psi layout    = {self.psi_layout} "
             f"({self.psi_layout_bytes / 1e9:.3f} GB/dev, ψ centroid copies)",
+            f"    Stage C/D ψ floor (post-CCT, X-forms only, both "
+            f"layouts) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
+            f"[informational; not folded into hwm_bytes]",
             f"    band_chunk    = {self.band_chunk}",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
@@ -720,6 +738,13 @@ def plan_gflat_chunks(
         E_base = 2.0 * psi_one / p_xy
     else:
         E_base = psi_one / p_x + psi_one / p_y
+    # Informational Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes
+    # docstring) — the two surviving X-form single-axis copies, REGARDLESS
+    # of low_mem_bands: fit_zeta_to_h5 does not yet hold the face
+    # representation at this point in either layout, so this term is the
+    # same shape for both.  Deliberately NOT substituted into
+    # ``persistent_total``/``peaks`` — see that docstring for why.
+    stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
     E_t = (_c128(n_q_ibz, mu, mu, shard=p_xy)          # V_acc
            + zeta_slab                                  # ζ_L_all
@@ -768,4 +793,5 @@ def plan_gflat_chunks(
         target_utilization=float(target_utilization),
         psi_layout=("face" if low_mem_bands else "legacy"),
         psi_layout_bytes=float(persistent["psi_copies"]),
+        stage_cd_psi_bytes=float(stage_cd_psi_bytes),
     )
