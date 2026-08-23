@@ -325,18 +325,31 @@ class GFlatChunkPlan:
     #: ``"psi_copies"``) AT THE RESOLVED LAYOUT — the number the banner
     #: prints next to ``psi_layout``.
     psi_layout_bytes: float = 0.0
-    #: Per-rank bytes of the TWO X-form single-axis ψ centroid copies
-    #: (mu on 'x', bands replicated; ``2·psi_one/p_x``) that are what is
-    #: ACTUALLY resident during Stage C/D (``fit_one_rchunk`` / the
-    #: accumulate step) after ``gw.isdf_fitting.fit_zeta_to_h5`` frees the
-    #: Y-form copies right after CCT (2026-08-22 fresh-fit low-mem psi
-    #: contract; report
+    #: Per-rank bytes of the r-chunk loop's OWN incremental ψ residency
+    #: during Stage C/D (``fit_one_rchunk`` / the accumulate step),
+    #: beyond whatever ``psi_layout_bytes`` already counts as persistent
+    #: for the run.  LAYOUT-DEPENDENT (unlike its name suggests — kept for
+    #: back-compat):
+    #:
+    #: ``psi_layout="legacy"``: the two surviving X-form single-axis
+    #: copies (mu on 'x', bands replicated; ``2·psi_one/p_x``) that are
+    #: what is ACTUALLY resident during Stage C/D after
+    #: ``gw.isdf_fitting.fit_zeta_to_h5`` frees the Y-form copies right
+    #: after CCT (2026-08-22 fresh-fit low-mem psi contract; report
     #: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` census
-    #: row "Fresh centroid load/liveness").  INFORMATIONAL ONLY: this
-    #: field is NOT folded into ``peak_breakdown``/``hwm_bytes``/
-    #: ``bottleneck``, which are computed exactly as before this fix (the
-    #: A/B stages still hold all four copies, and any pre-existing
-    #: low_mem_bands-layout pricing of A-D is unchanged — see
+    #: row "Fresh centroid load/liveness").
+    #:
+    #: ``psi_layout="face"``: NO resident single-axis X-form at all — the
+    #: r-chunk-loop port (feat/zeta-fit-rchunk-face-psi-2026-08-22,
+    #: docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section) reads
+    #: the band-contraction operand per-band-chunk out of the PERSISTENT
+    #: psi_mun_fresh instead (``isdf.core._z_q_face``).  This field then
+    #: prices only the small bounded per-call/per-bc transients that
+    #: mechanism adds — see ``plan_gflat_chunks``'s computation for the
+    #: exact terms.
+    #:
+    #: INFORMATIONAL ONLY in both cases: this field is NOT folded into
+    #: ``peak_breakdown``/``hwm_bytes``/``bottleneck`` (see
     #: KNOWN_LORRAX_ISSUES.md).  Disclosed on the banner so a run can see
     #: the fix's effect without re-deriving it from HLO.
     stage_cd_psi_bytes: float = 0.0
@@ -348,8 +361,8 @@ class GFlatChunkPlan:
             "  ISDF memory model — chunk plan + HWM estimate",
             f"    psi layout    = {self.psi_layout} "
             f"({self.psi_layout_bytes / 1e9:.3f} GB/dev, ψ centroid copies)",
-            f"    Stage C/D ψ floor (post-CCT, X-forms only, both "
-            f"layouts) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
+            f"    Stage C/D ψ floor (post-CCT, {self.psi_layout} r-chunk "
+            f"incremental) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
             f"[informational; not folded into hwm_bytes]",
             f"    band_chunk    = {self.band_chunk}",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
@@ -756,12 +769,34 @@ def plan_gflat_chunks(
     else:
         E_base = psi_one / p_x + psi_one / p_y
     # Informational Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes
-    # docstring) — the two surviving X-form single-axis copies, REGARDLESS
-    # of low_mem_bands: fit_zeta_to_h5 does not yet hold the face
-    # representation at this point in either layout, so this term is the
-    # same shape for both.  Deliberately NOT substituted into
+    # docstring).  Deliberately NOT substituted into
     # ``persistent_total``/``peaks`` — see that docstring for why.
-    stage_cd_psi_bytes = 2.0 * psi_one / p_x
+    #
+    # low_mem_bands=False (legacy): the two surviving X-form single-axis
+    # copies (mu on 'x', bands replicated) — what is ACTUALLY resident
+    # during Stage C/D (fit_one_rchunk / the accumulate step) after
+    # fit_zeta_to_h5 frees the Y-form copies right after CCT (2026-08-22
+    # fresh-fit low-mem psi contract).
+    #
+    # low_mem_bands=True (face): the r-chunk-loop port
+    # (feat/zeta-fit-rchunk-face-psi-2026-08-22,
+    # docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section) means
+    # there is no resident single-axis X-form at all any more — the band-
+    # contraction operand is read per-band-chunk out of the PERSISTENT
+    # psi_mun_fresh (already priced in ``persistent["psi_copies"]`` /
+    # ``psi_layout_bytes`` above; NOT double-counted here).  The only
+    # INCREMENTAL Stage-C/D cost is (a) one conjugated copy of psi_mun's
+    # own local shard, held for the duration of one z_q_from_psi_sm call
+    # (``isdf.core._z_q_face``'s ``psi_mun_conj``), and (b) the
+    # band_chunk-bounded per-bc gather/weight transient (tiny against (a)
+    # whenever band_chunk << n_rmu, the normal case).  Both scale with P
+    # (px·py), not sqrt(P) — the fix this term exists to disclose.
+    if low_mem_bands:
+        stage_cd_psi_bytes = (
+            psi_one / p_xy
+            + 2.0 * _c128(nk, ns, max(1, mu // p_x), band_chunk))
+    else:
+        stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
     E_t = (_c128(n_q_ibz, mu, mu, shard=p_xy)          # V_acc
            + zeta_slab                                  # ζ_L_all
