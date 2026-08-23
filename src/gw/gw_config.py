@@ -3037,6 +3037,42 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
     # ONLY reason it read as "still legacy-only" before this session is
     # that its sole producer, rotate_wavefunctions, had no face arm.
     (
+        # PORTED 2026-08-23 (feat/metal-response-face-2026-08-23,
+        # docs/architecture/fractional_chi0_response_face.md): the exact
+        # finite-occupation chi0 the census row named --
+        # w_isdf._fractional_pair_scan's ordered-pair kernel (Gamma static
+        # body + finite-q/finite-z direct kernel) AND the separate
+        # fractional/contour kernel -- now both dispatch on wfns.layout
+        # and route through a genuinely new 2-D band-pair mechanism
+        # (masked-gather + psum on BOTH mesh axes, isdf.core._z_q_face's
+        # idiom generalized) for the ordered-pair half, and a plain
+        # build_G_tau(layout='face', ...) substitution for the
+        # fractional/contour half (its two Green's functions are each
+        # one-particle).  Gated: real 4-rank CUDA algebra parity
+        # (tests/test_chi0_fractional_face_parity.py), a structural
+        # no-single-axis-psi proof, and a production-shape Na-deck
+        # harness (face-vs-legacy, NOT a full gw_jax driver run -- see
+        # below for why).
+        #
+        # THE ROW STAYS REFUSING ANYWAY, narrowed to name the REAL
+        # remaining blocker rather than lifted: _validate_metal_compute_
+        # mode (this file, below) REQUIRES compute_mode = mpa whenever
+        # mpa_material_class = metal, and compute_mode = mpa is
+        # UNCONDITIONALLY refused under low_mem_bands = true by the
+        # SEPARATE low_mem_bands_dynamic_ppm_unported row (gw.mpa.sigma's
+        # own Sigma_c(omega) executor -- a different subsystem entirely,
+        # frequency-domain self-energy, not this row's chi0/response
+        # subject, and outside this session's charter). So no deck
+        # combination can reach this session's ported kernels without
+        # ALSO tripping that other row first if this one were removed:
+        # lifting this row alone would not unblock a single live
+        # low_mem_bands=true metal deck, only change WHICH rule id it
+        # refuses under. Per the design doc's own closing section, this
+        # row is kept and will be lifted for real once
+        # low_mem_bands_dynamic_ppm_unported is ALSO lifted for MPA (a
+        # separate, unscoped port) -- at that point this row's own
+        # predicate can be dropped outright, since nothing else in the
+        # census blocks a metal deck once both are ported.
         "low_mem_bands_metal_material_class_unported",
         lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
                      .strip().lower() == "metal"),
@@ -3044,12 +3080,17 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "mpa_material_class = insulator (the default)",
         "set mpa_material_class = insulator (or drop the key), or set "
         "low_mem_bands = false for a metallic run",
-        "the exact finite-occupation response (w_isdf.py:1259-1620) "
-        "assumes every rank owns all bands and only mu is sharded; its "
-        "divided-difference weight depends jointly on both band "
-        "energies/occupations, so it cannot be replaced by the one-"
-        "particle G GEMM and needs its own 2-D band-pair ring/tile "
-        "algorithm (census row 'Exact finite-occupation response')",
+        "the exact finite-occupation chi0 response is now ported to the "
+        "face layout (2026-08-23, docs/architecture/"
+        "fractional_chi0_response_face.md) and gated on real 4-rank CUDA, "
+        "but mpa_material_class = metal unconditionally requires "
+        "compute_mode = mpa (_validate_metal_compute_mode below), which "
+        "the SEPARATE low_mem_bands_dynamic_ppm_unported row still "
+        "refuses (gw.mpa.sigma's own Sigma_c(omega) executor is a "
+        "different, unrelated, unfinished port) -- so this row stays "
+        "refusing to give an accurate rule id until BOTH are lifted "
+        "together, rather than letting a cleared deck fall through to a "
+        "less specific refusal one row later",
     ),
     (
         "low_mem_bands_bispinor_unported",
