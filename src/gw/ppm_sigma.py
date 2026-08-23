@@ -755,7 +755,48 @@ def assert_sharded_sigma_window_divides_mesh(nb_proj: int, mesh_xy, *,
            " (compute_mode = mpa has no replicated cube plan)."))
 
 
-def strip_sigma_window(sigma_kij, nb_real: int):
+def _make_strip_sharded_sigma_window(mesh_xy: Mesh, ndim: int, nb_real: int):
+    """The device-array arm of :func:`strip_sigma_window`.
+
+    Ordinary numpy-style trailing-axis indexing (``sigma_kij[..., :nb_real,
+    :nb_real]``) is illegal on a LIVE ``P(...,'x','y')``-sharded axis whenever
+    the sliced extent would not itself divide the mesh --
+    :func:`assert_sharded_sigma_window_divides_mesh` exists to refuse that
+    case before this function is ever reached; ``nb_real`` arriving here is
+    always mesh-divisible on both trailing axes.
+
+    Given that precondition, this applies EXACTLY the mechanism
+    :func:`gw.wavefunction_bundle.pack_band_window` already uses on its own
+    ψ pair -- ``jax.lax.slice_in_dim`` on each mesh-sharded axis followed by
+    ``jax.lax.with_sharding_constraint`` back onto the canonical
+    ``P(...,'x','y')`` spec, run inside a cached ``jax.jit`` -- to Σ_c's OWN
+    trailing (m, n) axes instead of ψ's band axis.  Same idiom, different
+    tensor; not a second mechanism (2026-08-23, the MPA split-Σ-window fix).
+    """
+    axis_m, axis_n = ndim - 2, ndim - 1
+    spec = P(*((None,) * axis_m), 'x', 'y')
+
+    @jax.jit
+    def strip(sigma_kij):
+        out = jax.lax.slice_in_dim(sigma_kij, 0, nb_real, axis=axis_m)
+        out = jax.lax.slice_in_dim(out, 0, nb_real, axis=axis_n)
+        return jax.lax.with_sharding_constraint(
+            out, NamedSharding(mesh_xy, spec))
+    return strip
+
+
+def _strip_sharded_sigma_window_kernel(mesh_xy: Mesh, ndim: int, nb_real: int):
+    """One compiled repack kernel per ``(mesh, ndim, nb_real)`` -- the same
+    ``common.wfn_transforms._cached_jit`` idiom
+    ``wavefunction_bundle._pack_band_window_kernel`` uses, so a caller that
+    revisits the same (layout, window) does not re-trace."""
+    from common.wfn_transforms import _cached_jit
+    return _cached_jit(
+        'strip_sharded_sigma_window', (id(mesh_xy), ndim, nb_real),
+        lambda: _make_strip_sharded_sigma_window(mesh_xy, ndim, nb_real))
+
+
+def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
     """Drop the :func:`pad_sigma_window` pad block from a (..., m, n) Sigma.
 
     The pad rows/cols are exactly zero (bilinear in zero-padded psi); this is
@@ -765,12 +806,56 @@ def strip_sigma_window(sigma_kij, nb_real: int):
     independently, one axis can be at the real extent while the other is
     padded (mesh 8×10, window 70 → m=72, n=70).  Testing only the last axis
     would have returned an m-padded Σ untouched.
+
+    ``mesh_xy`` (2026-08-23): pass this when ``sigma_kij`` is a LIVE
+    ``jax.Array`` still carrying a mesh-partitioned ``P(...,'x','y')``
+    sharding on its trailing axes -- ``gw.mpa.sigma._integrate_sigma_batches``
+    ``layout='face'`` is the one caller today
+    (``DeviceOmegaAccumulator.finalize()`` never gathers to host/replicated
+    the way ``ppm_sigma``'s own per-rank HOST tile accumulation does).  It is
+    the EXPLICIT switch to the mesh-aware repack kernel
+    (:func:`_strip_sharded_sigma_window_kernel`), not an implicit sniff of
+    ``sigma_kij``'s type: every existing host/numpy caller, and the unit
+    tests that build a bare single-device ``jnp.asarray`` cube, never pass
+    it and take the ordinary trailing-axis slice below completely
+    unchanged.  A genuinely mesh-sharded array arriving with ``mesh_xy =
+    None`` refuses loudly instead of silently mis-indexing.
     """
     if sigma_kij is None:
         return sigma_kij
-    if (int(sigma_kij.shape[-2]) == int(nb_real)
-            and int(sigma_kij.shape[-1]) == int(nb_real)):
+    nb_real = int(nb_real)
+    if (int(sigma_kij.shape[-2]) == nb_real
+            and int(sigma_kij.shape[-1]) == nb_real):
         return sigma_kij
+    # ``mesh_xy`` is the caller's explicit signal that ``sigma_kij`` is a
+    # LIVE mesh-sharded jax.Array, not an implicit type sniff: existing
+    # host/numpy AND plain single-device jax.Array callers (the unit tests
+    # in tests/test_sigma_window_pad.py build bare ``jnp.asarray`` cubes
+    # with no mesh at all) never pass it and take the ordinary slice below
+    # completely unchanged.
+    if mesh_xy is not None:
+        kernel = _strip_sharded_sigma_window_kernel(
+            mesh_xy, int(sigma_kij.ndim), nb_real)
+        return kernel(sigma_kij)
+    if isinstance(sigma_kij, jax.Array):
+        sharding = getattr(sigma_kij, "sharding", None)
+        if (isinstance(sharding, NamedSharding)
+                and sharding.spec[-2] is not None
+                and sharding.spec[-1] is not None):
+            # Defensive backstop for a FUTURE caller that forgets mesh_xy,
+            # not a path any current caller reaches: a genuinely
+            # mesh-sharded array here would silently mis-shard under the
+            # plain slice below (the exact hazard assert_sharded_sigma_
+            # window_divides_mesh exists to prevent upstream) rather than
+            # loudly refuse.
+            raise ValueError(
+                "strip_sigma_window: sigma_kij is mesh-sharded "
+                f"(spec={tuple(sharding.spec)}) on its trailing axes but "
+                "mesh_xy was not given -- ordinary indexing is illegal on "
+                "a P(...,'x','y')-sharded axis whose sliced extent would "
+                "not itself divide the mesh; pass mesh_xy so the legal "
+                "slice+reshard kernel (pack_band_window's own mechanism) "
+                "can run.")
     return sigma_kij[..., :nb_real, :nb_real]
 
 
