@@ -121,10 +121,18 @@ def test_rchunk_gamma_attributes_are_captured_before_jit_trace():
 
 def test_cq_and_zq_both_enter_the_shared_conv_plan():
     import inspect
-    from isdf.core import c_q_from_psi_sm, z_q_from_psi_sm
+    # Both public names are now thin ``layout=`` dispatchers (CCT half:
+    # c_q_from_psi_sm/_c_q_legacy/_c_q_face; r-chunk half:
+    # z_q_from_psi_sm/_z_q_legacy/_z_q_face -- see
+    # docs/architecture/zeta_fit_face_psi_cct.md).  ``_conv_kpair_setup``
+    # is called from the LEGACY body, not the dispatcher's own source
+    # (the face body never takes the native pair_kernel arm -- see
+    # _c_q_face's/_z_q_face's own docstrings for why); check the legacy
+    # bodies directly rather than the wrapper that merely routes to them.
+    from isdf.core import _c_q_legacy, _z_q_legacy
 
-    assert "_conv_kpair_setup(" in inspect.getsource(c_q_from_psi_sm)
-    assert "_conv_kpair_setup(" in inspect.getsource(z_q_from_psi_sm)
+    assert "_conv_kpair_setup(" in inspect.getsource(_c_q_legacy)
+    assert "_conv_kpair_setup(" in inspect.getsource(_z_q_legacy)
 
 
 def test_ns2_setup_forwards_monomial_gamma_to_native_factory(monkeypatch):
