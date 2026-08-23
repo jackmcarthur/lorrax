@@ -3055,7 +3055,31 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "because no self-contained fresh metal-MPA deck could be driven "
         "end to end this session to confirm it. Lift target unchanged: "
         "a metal MPA end-to-end gate, once one of those three artifacts "
-        "exists.",
+        "exists. "
+        "UPDATED 2026-08-23 (gate/na-metal-head-e2e-2026-08-23, PLAN.md "
+        "item D6, this session's attempt): the dft_velocity obstacle "
+        "named above is CLEARED -- merging fix/head-wing-mp1-and-"
+        "retirement-2026-08-23 + feat/velocity-decouple-preflight-"
+        "2026-08-23 (D1-D3) and building a fresh velocity-only "
+        "parallel_transport artifact via get_dipole_mtxels.py "
+        "--parallel-transport-velocity-only gets a genuinely fresh "
+        "sc_head_update=dft_velocity, mpa_material_class=metal, "
+        "qp_solver=self_consistent Na SOC-48b deck PAST config parse, "
+        "PAST the ISDF fit, and 45.5s into the SC driver at real P16 "
+        "(4x4 mesh) -- further than any fresh metal-MPA deck has reached "
+        "before. It then dies on a DIFFERENT, pre-existing, wholly "
+        "unrelated defect one layer deeper: gw_iteration_map's own "
+        "mpa_mode log line references an unbound name 'mpa_z' "
+        "(sc_iteration.py:1882 -- KNOWN_LORRAX_ISSUES.md row, predates "
+        "low_mem_bands and every D1-D3 branch, has been broken since the "
+        "line was first written) and crashes on EVERY qp_solver="
+        "self_consistent, compute_mode=mpa SC iteration unconditionally, "
+        "metal or insulating. Per this session's own scope (register "
+        "pre-existing defects, do not expand scope to fix them), this "
+        "row STAYS REFUSED -- not lifted -- pending that one-line fix. "
+        "Lift target NARROWED: a metal MPA end-to-end gate now needs "
+        "only sc_iteration.py:1882 fixed, not a rebuild of the PT "
+        "artifact machinery.",
     ),
     # LIFTED for FRESH-FIT decks (2026-08-23,
         # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
