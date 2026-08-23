@@ -175,6 +175,9 @@ def fit_zeta_to_h5(
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
+    low_mem_bands: bool = False,
+    psi_nmu_fresh: jax.Array | None = None,
+    psi_mun_fresh: jax.Array | None = None,
     print_fn=print,
 ):
     """
@@ -220,6 +223,30 @@ def fit_zeta_to_h5(
         bispinor: Whether to use bispinor wavefunctions
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
+        low_mem_bands: When True (``low_mem_bands`` deck key), the CCT Gram
+                    (STEP 2) is built from ``psi_nmu_fresh``/``psi_mun_fresh``
+                    -- the two-face, all-P-sharded carrier -- via a
+                    distributed SUMMA GEMM, instead of from single-axis
+                    slices of ``psi_rmu_Y``.  ``psi_rmu_Y`` MUST be None in
+                    this mode (its only consumer, the CCT Y-forms, is
+                    replaced by the face path; the caller drops it before
+                    even calling this function -- see
+                    ``gw.gw_init.prepare_isdf_and_wavefunctions``).
+                    ``psi_rmuT_X`` is unaffected and stays single-axis: the
+                    r-chunk loop (STEP 6) still reads its X-form slices --
+                    that half of the all-P psi contract is NOT ported this
+                    session (KNOWN_LORRAX_ISSUES.md,
+                    "zeta-fit r-chunk all-P psi" row); see
+                    docs/architecture/zeta_fit_face_psi_cct.md.  Requires
+                    ``vertex_mu_L == 0`` and ``band_norms is None`` --
+                    refuses by name otherwise.  Default False: bit-identical
+                    to the pre-existing path (``psi_nmu_fresh``/
+                    ``psi_mun_fresh`` are ignored).
+        psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
+                    ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
+                    ``PSI_MUN_SPEC``), spanning the SAME [b0, b4) range
+                    ``psi_rmuT_X`` does.  Required when ``low_mem_bands``;
+                    ignored otherwise.
         print_fn: Status-output sink. Drivers pass the runtime rank-zero
                   printer so deterministic progress is emitted once.
 
@@ -228,9 +255,47 @@ def fit_zeta_to_h5(
 
     The centroid wavefunctions are inputs, not outputs — the caller is
     expected to hold the single ``load_centroids_band_chunked`` result and
-    reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` after
+    reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` (or,
+    under ``low_mem_bands``, the pre-built face carrier via
+    :func:`gw.wavefunction_bundle.wavefunctions_face_from_restart`) after
     the fit completes.
     """
+    if low_mem_bands:
+        if int(vertex_mu_L) != 0:
+            raise ValueError(
+                "fit_zeta_to_h5: low_mem_bands=True requires vertex_mu_L=0 "
+                f"(charge channel); got vertex_mu_L={int(vertex_mu_L)}.  "
+                "The bispinor transverse channel is refused under "
+                "low_mem_bands upstream "
+                "(gw_config.refuse_unsupported_low_mem_bands's bispinor "
+                "row) -- this call site should never be reached with "
+                "both set; fix the caller.")
+        if band_norms is not None:
+            raise NotImplementedError(
+                "fit_zeta_to_h5: low_mem_bands=True with pseudobands "
+                "(band_norms is not None) is not supported this session -- "
+                "the face CCT path (isdf.core._c_q_face) has no weighted-"
+                "norms arm.  Set low_mem_bands=false, or drop pseudobands, "
+                "for this deck.  See KNOWN_LORRAX_ISSUES.md, \"zeta-fit "
+                "face CCT: pseudobands unported\".")
+        if psi_nmu_fresh is None or psi_mun_fresh is None:
+            raise ValueError(
+                "fit_zeta_to_h5: low_mem_bands=True requires psi_nmu_fresh="
+                " and psi_mun_fresh= (the two-face carrier) -- see "
+                "gw.gw_init.prepare_isdf_and_wavefunctions.")
+        if psi_rmu_Y is not None:
+            raise ValueError(
+                "fit_zeta_to_h5: low_mem_bands=True expects psi_rmu_Y=None "
+                "-- the caller drops the single-axis Y-form before calling "
+                "(its only consumer, the CCT Gram, now reads "
+                "psi_nmu_fresh/psi_mun_fresh instead).  A non-None "
+                "psi_rmu_Y here means the caller kept a single-axis copy "
+                "alive the redesign exists to avoid; fix the caller rather "
+                "than silently ignoring it.")
+    elif psi_rmu_Y is None:
+        raise ValueError(
+            "fit_zeta_to_h5: psi_rmu_Y is required when low_mem_bands=False"
+            " (the legacy CCT path reads it in STEP 1).")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -292,39 +357,78 @@ def fit_zeta_to_h5(
 
         # Cheap views — the caller keeps the full arrays alive for the
         # post-fit wfn bundle build, so we don't need independent copies.
-        psi_l_rmu_Y = psi_rmu_Y[:, l_band_start:l_band_end, :, :]
+        # The X-forms are built UNCONDITIONALLY: the r-chunk loop (STEP 6)
+        # reads them in both layouts -- porting IT to the face carrier is
+        # explicitly out of scope this session (see this function's
+        # ``low_mem_bands`` docstring and KNOWN_LORRAX_ISSUES.md).
         psi_l_rmuT_X = psi_rmuT_X[:, :, l_band_start:l_band_end, :]
-        psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
         psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
 
-        print_fn(f"  Left wfns:  {psi_l_rmu_Y.shape}")
-        print_fn(f"  Right wfns: {psi_r_rmu_Y.shape}")
+        # The Y-forms are the CCT Gram's ONLY consumer.  Under
+        # low_mem_bands, psi_rmu_Y is None (validated above) -- STEP 2
+        # reads the face carrier (psi_nmu_fresh/psi_mun_fresh) instead, so
+        # skipping this slice is not merely dead-code elimination: it is
+        # the point of the redesign (no single-axis Y-form is EVER
+        # resident under low_mem_bands=True, not even transiently).
+        if low_mem_bands:
+            psi_l_rmu_Y = psi_r_rmu_Y = None
+            print_fn(f"  X-forms: left {psi_l_rmuT_X.shape}, right "
+                     f"{psi_r_rmuT_X.shape}  (low_mem_bands: Y-forms never "
+                     f"built -- CCT reads the face carrier, STEP 2 below)")
+            if env_bool("LORRAX_MEM_DEBUG", False) and jax.process_index() == 0:
+                # PER-RANK BYTES, not global shape (KNOWN_LORRAX_ISSUES.md's
+                # mem_probe row: two arrays with the same GLOBAL shape print
+                # the identical figure whether one is genuinely 2-D sharded
+                # or single-axis).  Sums this rank's OWN addressable shards
+                # -- the same measurement claims/0426.md's shard-level
+                # .nbytes check used to confirm the carrier's face arrays
+                # are genuinely 2*S/(Px*Py), not a same-shape single-axis
+                # replica.
+                _nmu_b = sum(int(s.data.nbytes)
+                             for s in psi_nmu_fresh.addressable_shards)
+                _mun_b = sum(int(s.data.nbytes)
+                             for s in psi_mun_fresh.addressable_shards)
+                print_fn(f"  [face carrier, per-rank bytes] psi_nmu_fresh="
+                         f"{_nmu_b/1e9:.4f} GB  psi_mun_fresh={_mun_b/1e9:.4f} "
+                         f"GB  (2*S/(Px*Py) expected)")
+        else:
+            psi_l_rmu_Y = psi_rmu_Y[:, l_band_start:l_band_end, :, :]
+            psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
+            print_fn(f"  Left wfns:  {psi_l_rmu_Y.shape}")
+            print_fn(f"  Right wfns: {psi_r_rmu_Y.shape}")
 
         # Pseudobands: clamp weights to ``max(1, w_n)`` and apply them to
         # the centroid copies used for CCT.  When band_norms is None the
         # slices are jnp.ones → the *_fit values are identical to the
         # *_rmu_Y / *_rmuT_X copies.  See _band_norms_slice for the why.
+        # (norms_l_jax/norms_r_jax are also STEP 6 inputs in every layout
+        # -- cheap either way, so built unconditionally.)
         norms_l_jax = _band_norms_slice(band_norms, band_range_left, nb_left)
         norms_r_jax = _band_norms_slice(band_norms, band_range_right, nb_right)
         # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
         #
-        # band_norms is None (no pseudobands -- the common/default case):
-        # dividing by an all-ones array is bit-identical to the dividend
-        # (IEEE754 x/1.0 == x), so the *_fit computation used to allocate a
-        # second, fully-redundant single-axis buffer beside its own source
-        # for no numerical benefit -- one of the four "ψ centroid copies"
-        # gflat_memory_model.py's psi_copies term prices, doubled again.
-        # ALIAS instead of computing: no new device buffer, and the
-        # `del ..._fit` cleanup below still frees the shared object once
-        # both names' refcounts drop (fresh-fit low-mem psi contract; see
+        # band_norms is None (no pseudobands -- the common/default case,
+        # and the ONLY case low_mem_bands=True accepts -- refused above
+        # otherwise): dividing by an all-ones array is bit-identical to
+        # the dividend (IEEE754 x/1.0 == x), so the *_fit computation used
+        # to allocate a second, fully-redundant single-axis buffer beside
+        # its own source for no numerical benefit -- one of the four "ψ
+        # centroid copies" gflat_memory_model.py's psi_copies term prices,
+        # doubled again.  ALIAS instead of computing: no new device
+        # buffer, and the `del ..._fit` cleanup below still frees the
+        # shared object once both names' refcounts drop (fresh-fit
+        # low-mem psi contract; see
         # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md census row
         # "Fresh centroid load/liveness").
         if band_norms is None:
-            psi_l_rmu_Y_fit = psi_l_rmu_Y
             psi_l_rmuT_X_fit = psi_l_rmuT_X
-            psi_r_rmu_Y_fit = psi_r_rmu_Y
             psi_r_rmuT_X_fit = psi_r_rmuT_X
+            psi_l_rmu_Y_fit = None if low_mem_bands else psi_l_rmu_Y
+            psi_r_rmu_Y_fit = None if low_mem_bands else psi_r_rmu_Y
         else:
+            # low_mem_bands=True refuses band_norms is not None above, so
+            # psi_l_rmu_Y/psi_r_rmu_Y are real arrays here in every branch
+            # that reaches this line.
             psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l_jax[None, :, None, None]
             psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l_jax[None, None, :, None]
             psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r_jax[None, :, None, None]
@@ -420,7 +524,71 @@ def fit_zeta_to_h5(
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
         print_fn(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
-        if vertex_mu_L == 0:
+        if low_mem_bands:
+            # Face path (report gwjax_low_mem_bands_audit_2026-08-22,
+            # docs/architecture/zeta_fit_face_psi_cct.md): the band
+            # contraction is a distributed SUMMA GEMM over the FULL
+            # [b0, b4) face carrier, band-WEIGHTED (not sliced) to the L/R
+            # window -- see isdf.core._c_q_face's docstring for why this
+            # sidesteps the sigma-window edge's (band_range_left[1],
+            # generally not mesh-divisible) own pad requirement.  ONE
+            # plan serves both P_l and P_r (mirrors greens_function_
+            # kernel._face_build_G's g_plan reuse across Gv/Gc).
+            with timing.section("zeta_fit.CCT.face_gemm_plan"):
+                from distrib_la import gemm_plan as _gemm_plan
+                _ns_face = int(psi_mun_fresh.shape[1])
+                _nb_face = int(psi_mun_fresh.shape[3])
+                if int(psi_nmu_fresh.shape[1]) != _nb_face:
+                    raise ValueError(
+                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun_fresh "
+                        f"band extent {_nb_face} != psi_nmu_fresh's "
+                        f"{int(psi_nmu_fresh.shape[1])}.")
+                if int(psi_nmu_fresh.shape[2]) != _ns_face:
+                    raise ValueError(
+                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun_fresh "
+                        f"spin extent {_ns_face} != psi_nmu_fresh's "
+                        f"{int(psi_nmu_fresh.shape[2])}.")
+                # GEMM-seam merge folds (s, μ) into ONE axis of size μ*ns
+                # (common.contract_bands.merge_spin_centroid) -- m/n must
+                # match that merged extent, exactly as
+                # greens_function_kernel's own g_plan does
+                # (``gemm_plan(mesh_xy, m=n_rmu*ns, k=nb_full, n=n_rmu*ns,
+                # ...)``).  Missing the ``*ns`` factor here is caught
+                # loudly by gemm_plan's own operand-shape check (a
+                # ValueError, not a silent wrong contraction) whenever
+                # ns > 1 -- verified 2026-08-22 on the MoS2 k6_c50 spinor
+                # deck (ns=2): "gemm_plan A: expected shape (36, 676, 76);
+                # got (36, 1352, 76)".
+                _face_gemm = _gemm_plan(
+                    mesh_xy, m=n_rmu_padded * _ns_face, k=_nb_face,
+                    n=n_rmu_padded * _ns_face,
+                    nq=nk_tot, dtype=jnp.complex128)
+                print_fn(f"  {_face_gemm.describe()}")
+                # Band-window WEIGHTS over the array's own [band_range_full)
+                # extent (matching STEP 1's l_band_start/r_band_start
+                # offset exactly -- psi_mun_fresh/psi_nmu_fresh are the
+                # SAME band indexing as psi_rmuT_X, just conj+transposed).
+                # Zero-weighted bands contribute EXACTLY zero to the band
+                # sum (bilinear in ψ); any trailing bands beyond
+                # band_range_full's own span (possible under zeta_nband
+                # narrowing) are zero in BOTH weights, contributing
+                # nothing regardless of nb_face's exact extent.
+                _off = int(band_range_full[0])
+                _idx = np.arange(_nb_face)
+                _w_l_np = np.where(
+                    (_idx >= band_range_left[0] - _off)
+                    & (_idx < band_range_left[1] - _off), 1.0, 0.0)
+                _w_r_np = np.where(
+                    (_idx >= band_range_right[0] - _off)
+                    & (_idx < band_range_right[1] - _off), 1.0, 0.0)
+                weight_l_face = jnp.asarray(_w_l_np, dtype=jnp.float64)
+                weight_r_face = jnp.asarray(_w_r_np, dtype=jnp.float64)
+            C_q = c_q_from_psi_sm(
+                kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
+                psi_mun=psi_mun_fresh, psi_nmu=psi_nmu_fresh,
+                weight_l=weight_l_face, weight_r=weight_r_face,
+                gemm=_face_gemm)
+        elif vertex_mu_L == 0:
             C_q = c_q_from_psi_sm(
                 psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
                 psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
@@ -476,8 +644,21 @@ def fit_zeta_to_h5(
     # is None: an alias of the same object per STEP 1 above, so this
     # second `del` is a no-op refcount drop, not a second free) --
     # deleting both names is what actually reaches zero refcount.
+    #
+    # low_mem_bands=True: psi_l_rmu_Y/psi_r_rmu_Y/*_fit are already None
+    # (STEP 1 never built them -- CCT read the face carrier instead), so
+    # these two ``del``s are no-op name drops for that half; the face
+    # GEMM plan and its band weights ARE real per-call objects and are
+    # the ones actually worth freeing here (the plan holds a cuBLASMp
+    # communicator + two compiled executables; CCT runs once per fit, so
+    # nothing downstream reuses it).  psi_mun_fresh/psi_nmu_fresh are
+    # NOT touched: they are the caller's own permanent face bundle
+    # (Wavefunctions.psi_mun/psi_nmu after this call returns), not a
+    # fit-local intermediate.
     del psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmu_Y_fit, psi_r_rmu_Y_fit
     del psi_l_rmuT_X, psi_r_rmuT_X
+    if low_mem_bands:
+        del _face_gemm, weight_l_face, weight_r_face
     gc.collect()
 
     # ========== STEP 3: Compute L_q from CCT ==========

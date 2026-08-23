@@ -34,6 +34,10 @@ from common.gamma_matrices import (
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
 from common.wfn_transforms import to_rchunk_inner
+# Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
+# two-face carrier and the face G-build already use.  ``common/`` layer,
+# same as everything else this module imports -- no ``gw`` dependency.
+from common.contract_bands import merge_spin_centroid, split_spin_centroid
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -323,6 +327,92 @@ def gram_q0_from_pair(
 
 
 def c_q_from_psi_sm(
+	psi_l_X: jax.Array | None = None,
+	psi_l_Y: jax.Array | None = None,
+	psi_r_X: jax.Array | None = None,
+	psi_r_Y: jax.Array | None = None,
+	gamma_L: tuple[jax.Array, jax.Array] | None = None,
+	gamma_R: tuple[jax.Array, jax.Array] | None = None,
+	*,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+	layout: str = "legacy",
+	psi_mun: jax.Array | None = None,
+	psi_nmu: jax.Array | None = None,
+	weight_l: jax.Array | None = None,
+	weight_r: jax.Array | None = None,
+	gemm=None,
+) -> jax.Array:
+	"""C_q, the ζ fit's CCT Gram (band contraction + IFFT/γ̃/FFT over k).
+
+	``layout='legacy'`` (default, ``low_mem_bands=False``) — UNCHANGED
+	body: psi is single-axis-sharded, the band contraction is a rank-local
+	einsum (bands replicated per rank), and everything (pair density +
+	IFFT + γ̃·γ̃ + FFT) runs fused inside one Manual-mode shard_map.
+
+	    psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) sharded ``P(None, 'x', None, None)``
+	    psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) sharded ``P(None, None, None, 'y')``
+	    gamma_L, gamma_R : ``(perm, phase)`` tuples or ``None`` (= γ̃^0 = I).
+
+	``layout='face'`` (``low_mem_bands=True``) — the band-contraction axis
+	is mesh-sharded on BOTH faces (``gw.wavefunction_bundle``'s
+	``psi_mun``/``psi_nmu``, both un-conjugated, both spanning the fit's
+	FULL loaded band range), so the contraction is a genuinely distributed
+	SUMMA GEMM (``distrib_la.gemm_plan``) rather than a local einsum — see
+	``gw.isdf_fitting.fit_zeta_to_h5`` and
+	``docs/architecture/zeta_fit_face_psi_cct.md``.  Only the charge
+	channel (``gamma_L=gamma_R=None``) is supported; the bispinor
+	transverse channel is refused upstream under ``low_mem_bands``
+	(``gw_config.refuse_unsupported_low_mem_bands``).
+
+	    psi_mun  : (nk, s, μ, n)  P(None, None, 'x', 'y')
+	    psi_nmu  : (nk, n, s, μ)  P(None, 'x', None, 'y')
+	    weight_l, weight_r : (nb,) real, 1.0 inside the L/R band window and
+	                          0.0 outside (``nb`` = ``psi_mun``'s own band
+	                          extent).  Zero-weighted bands contribute
+	                          EXACTLY zero to the band sum (bilinear in ψ),
+	                          so no window-divisibility pad is needed — the
+	                          ONLY divisibility requirement is ``nb`` itself
+	                          (the array's own extent, already mesh-
+	                          divisible: ``BandSlices.b4`` is padded to the
+	                          world size).
+	    gemm     : one ``distrib_la.GemmPlan`` (``m=n=n_rmu``, ``k=nb``,
+	               ``nq=nk``), built ONCE by the caller and reused for both
+	               P_l and P_r — only the weight differs between them.
+
+	Output (either layout):
+	    C_q : (nq, n_rmu, n_col) sharded ``P(None, 'x', 'y')``.
+	    ``n_col == n_rmu`` for CCT (square centroid).
+	"""
+	if layout == "legacy":
+		if psi_l_X is None or psi_l_Y is None or psi_r_X is None or psi_r_Y is None:
+			raise ValueError(
+				"c_q_from_psi_sm(layout='legacy') requires psi_l_X/"
+				"psi_l_Y/psi_r_X/psi_r_Y.")
+		return _c_q_legacy(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
+		                   gamma_L, gamma_R, kgrid=kgrid, mesh_xy=mesh_xy)
+	if layout != "face":
+		raise ValueError(
+			f"c_q_from_psi_sm: layout must be 'legacy' or 'face', got "
+			f"{layout!r}")
+	if gamma_L is not None or gamma_R is not None:
+		raise NotImplementedError(
+			"c_q_from_psi_sm(layout='face') supports only the charge "
+			"channel (gamma_L=gamma_R=None).  The bispinor transverse "
+			"channel is refused under low_mem_bands upstream "
+			"(gw_config.refuse_unsupported_low_mem_bands's bispinor row); "
+			"this path was never built for gamma_double_contract's "
+			"non-identity arm.")
+	if psi_mun is None or psi_nmu is None or weight_l is None or weight_r is None or gemm is None:
+		raise ValueError(
+			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
+			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
+			").")
+	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
+	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
+
+
+def _c_q_legacy(
 	psi_l_X: jax.Array,
 	psi_l_Y: jax.Array,
 	psi_r_X: jax.Array,
@@ -333,18 +423,9 @@ def c_q_from_psi_sm(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""C_q built from ψ directly inside one monolithic shard_map.
-
-	Inputs:
-	    psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) sharded ``P(None, 'x', None, None)``
-	    psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) sharded ``P(None, None, None, 'y')``
-	    gamma_L, gamma_R : ``(perm, phase)`` tuples or ``None`` (= γ̃^0 = I).
-	    kgrid            : (nkx, nky, nkz).
-	Output:
-	    C_q              : (nq, n_rmu, n_col) sharded ``P(None, 'x', 'y')``.
-
-	``n_col == n_rmu`` for CCT (square centroid).
-	"""
+	"""The exact pre-``layout=`` body of :func:`c_q_from_psi_sm`.  UNTOUCHED
+	— do not edit this function to add face-layout behaviour; it has its
+	own sibling, :func:`_c_q_face`, below."""
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
@@ -455,6 +536,123 @@ def c_q_from_psi_sm(
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
 		perm_L, phase_L, perm_R, phase_R)
+
+
+# ============================================================================
+# Face-layout CCT (low_mem_bands=True) — band contraction as a distributed
+# SUMMA GEMM, band-WEIGHTED rather than band-WINDOWED, so the L/R sigma
+# window edge (BandSlices.b3, generally NOT mesh-divisible) never needs its
+# own pad: the shared plan's ``k`` is the array's own full band extent
+# (``BandSlices.b4`` IS padded to the world size — an existing invariant,
+# not a new one), and ``weight_l``/``weight_r`` zero out whatever the L/R
+# window does not cover.  See docs/architecture/zeta_fit_face_psi_cct.md.
+# ============================================================================
+
+def _c_q_face(
+	psi_mun: jax.Array,
+	psi_nmu: jax.Array,
+	weight_l: jax.Array,
+	weight_r: jax.Array,
+	*,
+	kgrid: tuple[int, int, int],
+	mesh_xy: Mesh,
+	gemm,
+) -> jax.Array:
+	"""Face-layout C_q: ONE planned N,N band GEMM per side (SUMMA-
+	distributed over the mesh-sharded band contraction axis) producing the
+	open-spin pair density at (μ_X, ν_Y), then the SAME THREE PRIMITIVES
+	:func:`_c_q_legacy` uses for its own IFFT -> γ̃-double-contract -> FFT
+	tail (:func:`common.fft_helpers.local_ifftn3`/``local_fftn3``,
+	:func:`common.gamma_matrices.gamma_double_contract`), in this path's
+	OWN axis order (a=s, μ, b=s', ν — no 'karmb' transpose: no FFI
+	pair_kernel constrains the trailing axis order here, since the face
+	path always takes the XLA IFFT/FFT fallback, and that transpose would
+	be a real μ²-scale buffer, not a bitcast).
+
+	ONE OUTER ``jax.jit``, NOT THREE SEPARATE DISPATCHES.  Both GEMM calls
+	(``gemm(A_l, B)``, ``gemm(A_r, B)`` — trace-safe, per
+	``distrib_la.gemm_plan``'s own contract) and the IFFT/γ̃/FFT tail's
+	``shard_map`` are traced into ONE compiled program, mirroring
+	``gw.w_isdf._get_chi_minimax_kernel_face``'s own ``_build_Gv_Gc``
+	(one outer jit wrapping two calls into the SAME ``g_plan``) rather
+	than calling the plan, then a second top-level jit, then a third.
+	MEASURED, not a style preference: three separate top-level dispatches
+	— each its own compiled executable with no cross-executable buffer
+	reuse — OOM'd at MoS2 6x6x1/626b/mu=5282/P16
+	(`RESOURCE_EXHAUSTED ... 11.28GiB` at `C_q.block_until_ready()`);
+	folding into one outer jit, where XLA's buffer assignment sees the
+	WHOLE graph and can alias/reuse the P_l/P_r-scale buffers the way
+	`_c_q_legacy`'s own single fused shard_map already does, fixed it
+	with no other change (same fix that motivated dropping the 'karmb'
+	transpose above — both are instances of "an extra top-level
+	buffer this design does not need").
+
+	The GEMM seam (``common.contract_bands.merge_spin_centroid`` /
+	``split_spin_centroid``) and the weighted-band convention
+	(``gemm(A * weight, B)``) are EXACTLY ``gw.greens_function_kernel.
+	_face_build_G``'s pattern, reused rather than re-derived — same
+	merge positions (1,2) and (2,3), same "conjugate the μ/row operand,
+	leave the ν/col operand un-conjugated" convention as
+	:func:`pair_density`'s own docstring (the X-form is pre-conjugated by
+	its caller in the legacy path; here the conjugate is applied
+	explicitly since the face carrier stores un-conjugated ψ throughout).
+	"""
+	nk, s_, mu_full, nb = psi_mun.shape
+	nkx, nky, nkz = kgrid
+	if nk != nkx * nky * nkz:
+		raise ValueError(
+			f"_c_q_face: psi_mun k-axis {nk} != prod(kgrid)={nkx*nky*nkz}")
+	n_col_full = mu_full  # square centroid: n_rmu on both faces
+	px = int(mesh_xy.shape['x'])
+	py = int(mesh_xy.shape['y'])
+	mu_loc = mu_full // px
+	col_loc = n_col_full // py
+
+	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
+	w_rep = NamedSharding(mesh_xy, P(None))
+	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+	pair_spec = P(None, None, 'x', None, 'y')
+
+	@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
+	         out_shardings=out_C)
+	def _fused(psi_mun_, psi_nmu_, w_l, w_r):
+		def _pair(w: jax.Array) -> jax.Array:
+			A = jnp.conj(merge_spin_centroid(psi_mun_, 1, 2))  # (nk, mu*s, nb)  x-major
+			A = A * w[None, None, :].astype(A.dtype)
+			B = merge_spin_centroid(psi_nmu_, 2, 3)             # (nk, nb, nu*s)  y-major
+			D = gemm(A, B)                                      # (nk, mu*s, nu*s)  P(_,'x','y')
+			Pp = split_spin_centroid(D, 1, s_, mu_full)         # (nk, s, mu, nu*s)
+			return split_spin_centroid(Pp, 3, s_, n_col_full)   # (nk, s, mu, s', nu)
+
+		P_l = _pair(w_l)
+		P_r = _pair(w_r)
+
+		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
+		         out_specs=P(None, 'x', 'y'), check_vma=False)
+		def _tail(P_l_, P_r_):
+			P_l_3d = P_l_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+			P_r_3d = P_r_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+			P_l_R_conj = jnp.conj(P_l_R)
+			del P_l_3d, P_l_R
+			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+			del P_r_3d
+			# Spin axes at (3, 5) in THIS (k,a,mu,b,nu) order -- NOT
+			# legacy's (3, 6), which is 'karmb' (k,a,col,mu,b).
+			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
+			del P_l_R_conj, P_r_R
+			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+			# Already (kx, ky, kz, mu_loc, col_loc): the γ̃ contraction
+			# dropped the two spin axes it sat between, leaving mu then
+			# col in that order already -- no output transpose.
+			return C_q_3d.reshape(nkx * nky * nkz, mu_loc, col_loc)
+
+		return _tail(P_l, P_r)
+
+	return _fused(psi_mun, psi_nmu,
+	             jnp.asarray(weight_l, dtype=jnp.float64),
+	             jnp.asarray(weight_r, dtype=jnp.float64))
 
 
 def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
