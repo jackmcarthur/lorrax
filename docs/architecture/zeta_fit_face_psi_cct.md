@@ -616,3 +616,162 @@ carried over from a plan.
 
 See the commit messages on `feat/zeta-fit-rchunk-face-psi-2026-08-22`
 for the exact job IDs and artifact paths this section summarizes.
+
+## `GemmPlan.local_call`: the manual-mode composition, resolved — and why
+the r-chunk half still keeps the masked `psum` (appended 2026-08-23,
+`feat/gemm-in-manual-shardmap-2026-08-22`)
+
+The section above ("Why not a second SUMMA GEMM") named the blocker as
+`GemmPlan.__call__`'s own contract — a top-level `jax.jit`+`shard_map`
+that needs globally-annotated operands — not the underlying cuBLASMp FFI.
+The owner's directive this session was to test that distinction for
+real rather than accept it as a permanent wall: *"gemm_plan's jit doesn't
+compose inside a shard_map — this is a significant structural issue that
+should be able to be overcome."*
+
+**It was.** `distrib_la.matmul_plan.GemmPlan.local_call` (new this
+session) exposes the SAME `D = alpha*A@B (+ beta*C)` cuBLASMp GEMM as a
+bare function on LOCAL per-rank tiles — no `shard_map`, no `jax.jit` of
+its own — safe to call directly from inside somebody else's manual-mode
+`shard_map`/`lax.scan`. The refactor that enabled it is small: the
+transpose/`ffi_call`/transpose body that `_build_kernel` already wrapped
+in its own `shard_map` (`_local_gemm_call` now, factored out as the one
+shared implementation) needed nothing from that wrapper except being
+handed a correctly-shaped local tile — which a caller's own manual body
+already has. Descriptor/workspace lifetime (the owner's stated worry) is
+a non-issue: `batched_gemm_ffi.cc`'s `cublasMpMatrixDescriptor`/
+`cublasMpMatmulDescriptor` are built and destroyed FRESH on every FFI
+call; only the NCCL communicator (`ctx_handle`, resolved once by
+`gemm_plan()`) persists, and `local_call` reuses the identical handle
+`__call__` does.
+
+**Proven on real 4-rank CUDA, inside a manual `shard_map` + `lax.scan`**:
+`check_gemm_plan_manual_shard_map`,
+`services/distrib_la/tests/test_distrib_la_multiproc.py`, JID 57448156,
+step `lx-Xg4-230200-1474729-7510`, exit 0. Four sub-cases, all against a
+numpy reference: a bare single call, a call streamed through `lax.scan`
+(the r-chunk's own shape), a `beta!=0` donated-`C` accumulate, and
+donated `out=` — all from inside one manual `shard_map`. Max relative
+residual `2.5e-16` (complex128) / `9.6e-17` (float64), both dtypes, well
+under the package's `RTOL=1e-12` engine-parity bar. `matmul_plan.py`'s
+module docstring carries the full writeup under "Composition inside a
+MANUAL-mode shard_map."
+
+### Why `_z_q_face`'s X-operand reconstruction does not switch to it
+
+Two independent, structural reasons — checked by reading the mechanism,
+not by running the (unbuilt) alternative, because both are decisive
+before any code is written:
+
+1. **`GemmPlan`'s output is never replicated.** Every `D` it returns is
+   `P(None,'x','y')` — genuinely 2-D-sharded on BOTH mesh axes, because
+   that is what a SUMMA-distributed provider computes. `_z_q_face` needs
+   the opposite for its X operand: the SAME band-chunk window PRESENT on
+   every rank (feeding a rank-LOCAL einsum against the Y-side's own
+   band-replicated operand — see the section above). Turning a GEMM's
+   `'y'`-sharded output into a `'y'`-replicated one needs an explicit
+   `all_gather('y')` *after* the GEMM's own SUMMA communication — strictly
+   MORE data movement than today's single `psum('y')`, never less. This
+   is a shape mismatch a benchmark cannot fix, because no amount of tuning
+   changes what `D`'s sharding *is*.
+2. **The band-chunk window is not psi_mun's own block-cyclic layout.**
+   Even setting aside (1) — say the consumer were rewritten to accept a
+   `'y'`-sharded X, as CCT's own consumer does — a valid `k`-extent SUMMA
+   operand needs `k` to divide both mesh axes AND to be laid out exactly
+   as cuBLASMp's block-cyclic descriptor expects: mb=`k/px` contiguous
+   rows per rank, nb=`k/py` contiguous columns. `psi_mun`'s OWN resident
+   layout already satisfies this for `k = nb_face` (the CCT half's own
+   `A` operand, unmodified, no gather). But the r-chunk's per-scan-
+   iteration contraction extent is `bpd_max_global`
+   (`band_chunk_size`-driven, chosen for the fit's OWN memory/streaming
+   reasons) — a DIFFERENT, independently-chosen grid that generally does
+   not align with `psi_mun`'s fixed `'y'`-shard width (`shard_w =
+   nb_face/p_y`; this doc's own measured example, 16 vs. 18, is exactly a
+   non-aligned pair). A window that straddles `psi_mun`'s shard boundary
+   is not psi_mun's own block-cyclic tile for ANY `k`, so a genuine SUMMA
+   call over it needs its OWN preceding reshard to materialize a properly
+   block-cyclic-aligned local tile first — communication that is at least
+   as large as the masked-gather-then-`psum` it would be replacing, since
+   both are moving the same "assemble this rank's slice of an
+   arbitrarily-windowed band range from a differently-sharded source"
+   data. Forcing the two grids to align (making `band_chunk_size` a
+   multiple of psi_mun's `'y'`-shard width, or vice versa) is exactly the
+   alignment this design deliberately rejected before landing (see "The
+   landed design," above): it would fragment the SHARED
+   `band_chunk_ranges` grid the Y-side/`psi_G_store` machinery also uses,
+   for a benefit neither reason above actually delivers.
+
+Both reasons are about what data has to move, not about whether the call
+can be EXPRESSED — `local_call` genuinely removes the expression
+obstacle the owner named, and the two reasons above are what remains once
+it is removed. **The masked-gather+`psum('y')` route in `_z_q_face` is
+therefore kept, unchanged** — this session made no functional change to
+it, re-confirmed by the unchanged parity/mesh-invariance gates below.
+
+### What this session DID change, and its own regression check
+
+Only `services/distrib_la/src/distrib_la/matmul_plan.py` (the new
+`local_call` surface, plus a pure refactor of `_build_kernel` into a
+shared `_local_gemm_call`+`_gemm_attrs` helper — no behavior change to
+the existing `__call__` path) and its test file. Because `_c_q_face`'s
+own CCT-half GEMM calls (`gemm(A, B)`, this doc's own "Why the CCT half
+factors as a band GEMM" section) run through the SAME refactored
+`_build_kernel`, that shared code is the one place this session's change
+could have silently regressed production ζ-fit numerics — so it was
+re-verified, not merely argued:
+
+* `tests/test_zeta_mesh_invariance.py`: **7/7 PASS**, real jax collectives
+  (CPU-emulated, `lx run -N 1 -G 0 ...`), unaffected — the small-system
+  fast path never touches `matmul_plan.py`. Confirmed against THIS
+  worktree specifically, not merely assumed: a bare `lx run` without an
+  explicit `PYTHONPATH` wrapper silently resolves `isdf.core`/
+  `common.shard_map`/`gw.gw_config` from the OTHER agent checkout
+  `lorrax_A` even with `cwd` inside this worktree (module `__file__`
+  printed to confirm, matching `KNOWN_SANDBOX_ERRORS.md`'s
+  `retarget_pythonpath` row) — so this result was taken through a wrapper
+  script that exports `PYTHONPATH`/`JAX_PLATFORMS`/`XLA_FLAGS` before
+  `exec python3`, with `common/shard_map.py`'s own deprecation-warning
+  file path in the pytest output confirming the worktree copy actually
+  ran.
+* `tests/test_isdf_cq_face_parity.py` / `tests/test_isdf_zq_face_parity.py`:
+  unaffected by inspection — these gate `isdf.core.c_q_from_psi_sm`/
+  `z_q_from_psi_sm`, neither of which this session edited — but NOT
+  re-run in isolation this session; see the honest gap below.
+* **Real 4-rank CUDA, the shared code path itself, not the deck around
+  it**: `check_gemm_plan_cublasmp` (unchanged behavior) and
+  `check_gemm_plan_manual_shard_map` (new), both in
+  `services/distrib_la/tests/test_distrib_la_multiproc.py`, JID 57448156,
+  step `lx-Xg4-230200-1474729-7510`, exit 0. `check_gemm_plan_cublasmp`
+  drives `_build_kernel` through `GemmPlan.__call__` exactly as
+  `_c_q_face`'s `gemm(A, B)` calls do (eager, nested-`jit`, `lax.scan`,
+  `beta`-accumulate, donated `out=`) and matched a numpy reference to
+  `1.3e-16`–`3.3e-16` relative — this IS the refactored code CCT's own
+  GEMM calls run through, so this is direct (not by-analogy) evidence
+  the refactor is behavior-preserving for the auto-mode path.
+* **Honest gap: no k6_c600 production end-to-end regression run this
+  session.** The intended check — rerun the exact
+  `face_headoff_zetafit_rchunk_2026-08-22` reference deck
+  (`memory_per_device_gb=20`, `head_correction=off`, fresh fit, P=16
+  4×4) on this branch and diff `eqp0.dat`/`sigma_diag.dat`/`zeta_fit.CCT`
+  timing against that reference — was attempted
+  (`runs/MoS2/86_bgw_lorrax_scaling_20260819/points/
+  k6_c600_lowmem_ab_20260822/face_headoff_zetafit_rchunk_gemmplan_localcall_2026-08-22/`,
+  symlinked to the reference run's `WFN.h5`/`kin_ion.h5`/`dipole.h5`/
+  `centroids.txt`/`cohsex.in`) and did NOT complete: the deck-directory
+  `-m gw.gw_jax` launch path mis-resolved source/environment across three
+  successive attempts and a fourth (after working around the first
+  three) hung at 4-node NCCL bootstrap with zero measured progress on
+  every rank, killed after ~2 minutes rather than left occupying the
+  shared pool — see `KNOWN_SANDBOX_ERRORS.md`, "2026-08-23 — a
+  deck-directory `lx run -N n -G 4 -n P python3 -u -m gw.gw_jax` also
+  mis-resolves source..." for the full sequence and the specific
+  failures (wrong checkout, wrong `.so`, missing `libfabric`, then the
+  cross-node hang). This is a sandbox launcher/environment limitation,
+  not a code finding — it neither confirms nor refutes anything about
+  `_z_q_face` or the CCT half's own numerics, which are unmodified code.
+  The regression claim this section actually supports is the narrower
+  one above: the shared `_build_kernel`/`_local_gemm_call` refactor
+  matches its pre-refactor numerics on real hardware, at the operation
+  level: a production-scale confirmation remains open, and should be the
+  first thing a follow-up session with a working multi-node launch path
+  does before this capability is used in another manual-mode kernel.
