@@ -3029,17 +3029,33 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "mpa_material_class = insulator (the default)",
         "set mpa_material_class = insulator (or drop the key), or set "
         "low_mem_bands = false for a metallic run",
-        "the exact finite-occupation chi0 response is now ported to the "
-        "face layout (2026-08-23, docs/architecture/"
-        "fractional_chi0_response_face.md) and gated on real 4-rank CUDA, "
-        "but mpa_material_class = metal unconditionally requires "
-        "compute_mode = mpa (_validate_metal_compute_mode below), which "
-        "the SEPARATE low_mem_bands_dynamic_ppm_unported row still "
-        "refuses (gw.mpa.sigma's own Sigma_c(omega) executor is a "
-        "different, unrelated, unfinished port) -- so this row stays "
-        "refusing to give an accurate rule id until BOTH are lifted "
-        "together, rather than letting a cleared deck fall through to a "
-        "less specific refusal one row later",
+        "UPDATED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23, "
+        "claims/0443.md): gw.mpa.sigma's split-Sigma-window gap -- this "
+        "row's own remaining blocker as of the previous entry -- is now "
+        "FIXED and gated end to end for mpa_material_class = insulator "
+        "(strip_sigma_window's new mesh-aware device-array arm; real "
+        "4-rank CUDA parity, Si_scalar fresh one-shot MPA, eqp0/eqp1 "
+        "max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face). "
+        "low_mem_bands_dynamic_ppm_unported is narrowed accordingly (see "
+        "that row below) rather than deleted, because METAL MPA is still "
+        "refused there too: mpa_material_class = metal unconditionally "
+        "requires qp_solver = self_consistent "
+        "(gw.mpa.model._require_metal_occupations -- the one-shot "
+        "screening call never builds an OccupationState), and every "
+        "sc_head_update arm a fresh (non-restart) metal MPA deck can "
+        "reach this session hit an INFRA obstacle unrelated to this "
+        "port's own code: off falls through to a plain-midgap SC-init "
+        "check that is meaningless for a metal and refuses by name; "
+        "parallel_transport reproduces the pre-existing SlabIO rank-0-"
+        "slab defect this row's own history already named; dft_velocity "
+        "needs a pre-built parallel_transport.h5 this session had none "
+        "of (the one candidate on disk is already flagged "
+        "velocity_validation_passed=0). So this row stays refusing -- "
+        "not because the ported code is unconfirmed for metal, but "
+        "because no self-contained fresh metal-MPA deck could be driven "
+        "end to end this session to confirm it. Lift target unchanged: "
+        "a metal MPA end-to-end gate, once one of those three artifacts "
+        "exists.",
     ),
     # LIFTED for FRESH-FIT decks (2026-08-23,
         # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
@@ -3111,9 +3127,9 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # ``bispinor = true`` — no silent data loss, in either layout.
         # This row is deleted outright rather than re-pointed at that
         # pre-existing, low_mem_bands-independent limitation.
-    (
-        # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
-        # port-2026-08-22); the row is KEPT, narrowed to MPA only.  History:
+    # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
+        # port-2026-08-22); the row was KEPT, narrowed to MPA only.  History
+        # of that narrowing:
         # DISCOVERED on real 4-rank CUDA (tests/multi_device/
         # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
         # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
@@ -3155,22 +3171,43 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # was NOT itself run end to end this session (its own
         # sharded-output final layout has an additional named gap for a
         # split Σ window — see that file's own comment) — kept refused
-        # below pending its own gate, rather than lifted on the strength
-        # of a shared-code argument alone.
-        "low_mem_bands_dynamic_ppm_unported",
-        lambda cfg: cfg.compute_mode is ComputeMode.MPA,
-        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "compute_mode = x_only, cohsex, gn_ppm, or hl_ppm",
-        "set compute_mode = gn_ppm/hl_ppm/cohsex/x_only, or "
-        "low_mem_bands = false for an MPA run",
-        "gw.mpa.sigma's executor was mechanically ported to layout='face' "
-        "the same session as ppm_sigma.py's but has no end-to-end gate of "
-        "its own yet, and its sharded-output tail additionally refuses a "
-        "split Σ window under this layout by name (see "
-        "gw.mpa.sigma._integrate_sigma_batches) — kept refused pending "
-        "that gate rather than lifted on ppm_tau_kernel's shared "
-        "infrastructure alone",
-    ),
+        # then, pending its own gate.
+        #
+        # DELETED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23,
+        # claims/0443.md), not narrowed to metal-only: that named gap is
+        # now FIXED. gw.mpa.sigma._integrate_sigma_batches' sharded-output
+        # tail (a split Sigma window, nb_sigma != nb_full -- the ORDINARY
+        # case) is ported: strip_sigma_window gained a device-array arm
+        # that applies wavefunction_bundle.pack_band_window's OWN
+        # mechanism (jax.lax.slice_in_dim + jax.lax.with_sharding_
+        # constraint) to Sigma_c's own trailing (m,n) axes -- reusing that
+        # primitive's idiom rather than reworking psi_proj's INPUT width,
+        # which would have desynced it from contract_bands.py's eagerly-
+        # built, fixed-width GEMM plans (a shared contract this fix does
+        # not reopen).  Gated: real 4-rank CUDA mesh-aware strip_sigma_
+        # window parity (5/5, tests/test_mpa_sigma_split_window_strip.py,
+        # bit-exact) and a real end-to-end fresh one-shot insulating MPA
+        # leg (Si_scalar, a genuine split window nb_sigma=8 < nb_full=20)
+        # -- eqp0.dat max|dE_QP|=6.510e-05 eV, eqp1.dat max|dE_QP|=
+        # 8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy vs face.
+        #
+        # A NARROWED (metal-only) row was drafted first and then deleted
+        # rather than kept, per its own predicate's own "narrow it away
+        # entirely if nothing else remains under it" instruction: a
+        # metal deck's mpa_material_class == 'metal' predicate is a
+        # STRICT SUBSET of -- and, given _validate_metal_compute_mode's
+        # standing invariant (material_class == metal implies compute_
+        # mode == mpa, enforced in LorraxConfig.__post_init__ BEFORE this
+        # table ever runs), logically EQUIVALENT to -- the
+        # low_mem_bands_metal_material_class_unported row's own predicate,
+        # which appears earlier in this tuple and therefore always fires
+        # first.  A second, later row with an implied-equivalent predicate
+        # would never be reached -- a dead, vacuous entry, the exact "gate
+        # that cannot fail" shape TASTE.md warns against -- so it is
+        # deleted outright rather than shipped unreachable.  Metal MPA
+        # remains refused, by the metal row alone; see that row's own
+        # updated comment for why (three named infra obstacles this
+        # session, none of them in gw.mpa.sigma's own code).
 )
 
 
