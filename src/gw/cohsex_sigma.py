@@ -653,15 +653,13 @@ def compute_cohsex_sigma(
         # or ``bispinor_v_q_path`` is missing.  See
         # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and bispinor_v_q_path is not None:
-            if wfns.layout == "face":
-                raise NotImplementedError(
-                    "compute_cohsex_sigma: bispinor transverse exchange is "
-                    "not ported for layout='face' (envelope: "
-                    "bispinor=true refuses — gw.sigma_x_bispinor hard-codes "
-                    "the legacy psi_xn/psi_yr accessors).  This should "
-                    "already be unreachable via gw_init's own bispinor + "
-                    "low_mem_bands guard; refusing here too as a defensive "
-                    "backstop for a direct caller.")
+            # face-layout defensive backstop REMOVED 2026-08-23
+            # (feat/transverse-zeta-face-2026-08-23): compute_sigma_x_
+            # bispinor is representation-aware since feat/bispinor-
+            # face-2026-08-23 (with_lorentz_vertices, face_kernel_kwargs
+            # dispatch) and the low_mem_bands_bispinor_unported envelope
+            # row that made this branch unreachable for face is now
+            # lifted — this call is the real, gated path, not dead code.
             from .sigma_x_bispinor import compute_sigma_x_bispinor
             with mesh_xy:
                 sig_x_b = compute_sigma_x_bispinor(
@@ -748,11 +746,8 @@ def compute_v_h_sigma_x(
         sig_x.block_until_ready()
 
     if wfns_transverse is not None and bispinor_v_q_path is not None:
-        if wfns.layout == "face":
-            raise NotImplementedError(
-                "compute_v_h_sigma_x: bispinor transverse exchange is not "
-                "ported for layout='face' — see compute_cohsex_sigma's "
-                "identical refusal.")
+        # face-layout defensive backstop REMOVED 2026-08-23 — see
+        # compute_cohsex_sigma's identical removal, same session/reason.
         from .sigma_x_bispinor import compute_sigma_x_bispinor
         with mesh_xy:
             sig_x_b = compute_sigma_x_bispinor(

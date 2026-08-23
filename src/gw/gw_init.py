@@ -716,6 +716,15 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	ONE call site per path (fit and reuse) on purpose: the reuse leg
 	must produce bit-identical ψ to the fit leg, and the cheapest way
 	to guarantee that is for both to run the same code.
+
+	``low_mem_bands = true`` (2026-08-23): ALSO converts to the two-face
+	carrier here, SAME ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the
+	charge channel uses, and drops the single-axis copies -- once, in
+	this one function, so BOTH callers (the fresh-fit bispinor loop and
+	the ζ-reuse early return) get the face carrier identically instead
+	of each converting it their own way.  ``psi_rmu_Y``/``psi_rmuT_X``
+	are ``None`` in the returned dict in this case;
+	``psi_mun_fresh``/``psi_nmu_fresh`` carry the face arrays instead.
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked
 	with timing.section("gw_jax.load_centroid_wfns_current"):
@@ -724,6 +733,20 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			band_range=band_slices.full_range,
 			band_chunk_size=chunks['band_chunk'],
 		)
+	psi_mun_fresh_T = None
+	psi_nmu_fresh_T = None
+	if cfg.memory.low_mem_bands:
+		from jax.sharding import NamedSharding
+		from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+		with mesh_xy:
+			psi_nmu_fresh_T = jax.lax.with_sharding_constraint(
+				psi_curr_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+			psi_mun_fresh_T = jax.lax.with_sharding_constraint(
+				jnp.conj(psi_curr_rmuT_X).transpose(0, 3, 1, 2),
+				NamedSharding(mesh_xy, PSI_MUN_SPEC))
+		del psi_curr_rmu_Y, psi_curr_rmuT_X
+		psi_curr_rmu_Y = None
+		psi_curr_rmuT_X = None
 	# Keeping these arrays alive across the return is intentional —
 	# they are the only way the σ^B kernel can sample ψ at r_{μ_T}.
 	return {
@@ -731,6 +754,8 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 		'psi_rmuT_X':       psi_curr_rmuT_X,
 		'meta':             meta_T,
 		'centroid_indices': cent_T_idx,
+		'psi_mun_fresh':    psi_mun_fresh_T,
+		'psi_nmu_fresh':    psi_nmu_fresh_T,
 	}
 
 
@@ -1212,10 +1237,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	single-axis copies before calling here (neither has a consumer left:
 	the CCT Gram build and the r-chunk loop's band contraction both read
 	the face carrier — see ``isdf.core._c_q_face``/``_z_q_face`` and
-	docs/architecture/zeta_fit_face_psi_cct.md).  Forwarded ONLY to the
-	charge-channel ``fit_zeta_to_h5`` call below; the bispinor
-	transverse-channel call is unreachable under ``low_mem_bands``
-	(refused upstream) and does not take them.
+	docs/architecture/zeta_fit_face_psi_cct.md).  Forwarded to the
+	charge-channel ``fit_zeta_to_h5`` call below.  The bispinor
+	transverse-channel calls build their OWN face carrier
+	(``psi_mun_fresh_T``/``psi_nmu_fresh_T``, from the transverse
+	centroid load, same ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path —
+	2026-08-23) rather than reusing this function's own
+	``psi_nmu_fresh``/``psi_mun_fresh`` parameters, since the two
+	centroid sets (charge μ, transverse μ_T) are different arrays.
 	"""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
@@ -1717,6 +1746,23 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
+		# low_mem_bands = true: _transverse_wfn_data already converted
+		# psi_curr_rmu_Y/psi_curr_rmuT_X to the two-face carrier internally
+		# (SAME PSI_MUN_SPEC/PSI_NMU_SPEC build path the charge channel
+		# uses, not a fork) and set them to None -- ONE call site owns the
+		# conversion so this branch and the ζ-reuse early return
+		# (gw_init.fit_zeta's own "REUSING the existing ζ" path, which
+		# also calls _transverse_wfn_data) get an identically-built face
+		# carrier rather than each converting it their own way.  Just
+		# read the two fields back out here.
+		psi_mun_fresh_T = transverse_wfn_data['psi_mun_fresh']
+		psi_nmu_fresh_T = transverse_wfn_data['psi_nmu_fresh']
+		if cfg.memory.low_mem_bands:
+			print_fn("  [bispinor] ψ_T face conversion (low_mem_bands): "
+			         "psi_nmu_T/psi_mun_T built from the transverse "
+			         "centroid load; both single-axis copies dropped "
+			         "before the ζ_T fit.")
+
 		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
 		# ``jax.clear_caches()`` here because the original ζ-fit cached
 		# functions closed over tracers from the enclosing jit (the
@@ -1748,6 +1794,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					mesh_xy=mesh_xy,
 					chunk_r=chunks['chunk_r'], output_file=zeta_mu_path,
 					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
+					low_mem_bands=bool(cfg.memory.low_mem_bands),
+					psi_mun_fresh=psi_mun_fresh_T,
+					psi_nmu_fresh=psi_nmu_fresh_T,
 					band_chunk_size=chunks['band_chunk'],
 					q_chunk_size=chunks['q_chunk'],
 					bispinor=cfg.bispinor,
@@ -2542,11 +2591,6 @@ def prepare_isdf_and_wavefunctions(
 			wfns = None
 			wfns_transverse = None
 			if cfg.memory.low_mem_bands:
-				# bispinor + low_mem_bands already refused at this
-				# function's entry (refuse_unsupported_low_mem_bands),
-				# before the chunk planner even ran -- so
-				# transverse_wfn_data cannot be non-None here.
-				#
 				# psi_nmu_fresh/psi_mun_fresh were already built (and
 				# psi_rmu_Y already dropped) BEFORE the ζ fit, above --
 				# they are not re-derived here.  wavefunctions_face_from_
@@ -2575,6 +2619,27 @@ def prepare_isdf_and_wavefunctions(
 				# reads psi_mun_fresh directly (isdf.core._z_q_face),
 				# so there is nothing left resident from the fit input
 				# for V_q's baseline to inherit.
+
+				# Bispinor + low_mem_bands (2026-08-23): build the
+				# transverse-centroid Σ^B bundle from the SAME face
+				# carrier ``fit_zeta`` already built
+				# (``transverse_wfn_data['psi_mun_fresh']``/
+				# ``['psi_nmu_fresh']``) -- reused, not rebuilt,
+				# mirroring the charge bundle's own reuse above.  The
+				# SAME ``enk_full``/``band_slices`` apply (the mean-field
+				# bands are a system property, not per-centroid-set --
+				# exactly what the legacy branch below does too).
+				if transverse_wfn_data is not None:
+					with timing.section("gw_jax.wavefunction_setup"):
+						wfns_transverse = wavefunctions_face_from_restart(
+							transverse_wfn_data['psi_nmu_fresh'],
+							transverse_wfn_data['psi_mun_fresh'],
+							enk_full=_enk_full_face,
+							slices=band_slices, mesh_xy=mesh_xy)
+					print0(f"  [bispinor] σ^B-side Wfns built on "
+					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
+					       f"transverse centroids (face layout; "
+					       f"low_mem_bands=true)")
 
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
@@ -2708,6 +2773,18 @@ def prepare_isdf_and_wavefunctions(
 			# ``load_restart_state_from_h5``.
 			if _write_restart:
 				if cfg.memory.low_mem_bands:
+					# NOT YET PORTED: the transverse-centroid (Σ^B) face
+					# carrier has no restart dataset -- this write covers
+					# only the charge bundle (psi_full_y/psi_full_y_mun).
+					# NOT a silent-wrong-physics risk: bispinor restart
+					# READ already refuses loudly, unconditionally,
+					# whenever a file has no 'psi_full_y_transverse'
+					# dataset (below, "Bispinor restart" -- pre-existing,
+					# independent of low_mem_bands, since a low_mem_bands
+					# file never carries that LEGACY-only dataset name
+					# either).  So this write proceeds; a bispinor deck
+					# that later restarts from it gets a clear, if late,
+					# refusal rather than a wrong answer.
 					write_restart_state_to_h5(
 						tensors_filename,
 						n_rmu_logical=int(meta.n_rmu),
