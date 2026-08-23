@@ -87,9 +87,6 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("rule_id, extra", [
-    # head_correction defaults to "full", so this row needs no companion
-    # key: it is "the first refusal an unqualified deck hits".
-    ("low_mem_bands_head_correction_full_unported", ""),
     ("low_mem_bands_self_consistent_unported",
      "head_correction = off\nqp_solver = self_consistent\n"),
     ("low_mem_bands_metal_material_class_unported",
@@ -120,16 +117,21 @@ def test_each_unsupported_combination_refuses_at_parse_time(
         assert part in message, f"{rule_id} refusal is missing '{part}'"
 
 
-def test_the_head_correction_row_fires_on_the_bare_default():
-    """head_correction=full is the SHIPPING DEFAULT — this is the row an
-    unqualified ``low_mem_bands = true`` deck reaches with NO other key
-    named, which is the reason the guide calls out porting its wing kernel
-    as the first extension after the core."""
+def test_head_correction_full_is_lifted_on_the_bare_default():
+    """head_correction=full (the shipping default) is PORTED for the face
+    layout (feat/head-wings-face-port-2026-08-22): the wing kernels read
+    wfns.psi_nmu/psi_mun, so the former
+    low_mem_bands_head_correction_full_unported row is deleted per its own
+    recorded lift condition.  A bare ``low_mem_bands = true`` deck with a
+    STATIC Sigma channel must resolve with no head refusal; a dynamic
+    compute_mode still refuses, but via the DYNAMIC row, not a head row."""
     import tempfile
     with tempfile.TemporaryDirectory() as d:
-        with pytest.raises(ValueError,
-                            match="low_mem_bands_head_correction_full_unported"):
-            _config(pathlib.Path(d), "low_mem_bands = true\n")
+        cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = cohsex\n")
+        assert cfg.head.correction.value == "full"
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(ValueError, match="low_mem_bands_dynamic_ppm_unported"):
+            _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = gn_ppm\n")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +207,7 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 5, (
+    assert len(ids) == 4, (
         "the table grew or shrank -- update this test AND the docs "
         "envelope table in docs/input_reference.md together")
     for row in _LOW_MEM_BANDS_REFUSALS:

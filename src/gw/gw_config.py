@@ -2948,29 +2948,6 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
 #: together.
 _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
     (
-        # LIFT CONDITION: a face-layout port of the full q->0 head/body
-        # wing kernel (``gw/qsgw_head.py:850-1234``, gated on
-        # ``HeadCorrection.FULL`` at ``gw_jax.py:469,573``) is being built
-        # in parallel on ``feat/head-wings-face-port-2026-08-22``.  That
-        # branch lifts this refusal with A SINGLE PREDICATE CHANGE: delete
-        # this row (the same "removing a row is the landing gesture"
-        # convention ``UNIMPLEMENTED_MODES`` uses above) once
-        # ``head_wings_sharded`` / ``static_head_wings_sharded`` read
-        # ``wfns.psi_nmu`` / ``wfns.psi_mun`` instead of the legacy
-        # accessors.
-        "low_mem_bands_head_correction_full_unported",
-        lambda cfg: cfg.head.correction is HeadCorrection.FULL,
-        lambda cfg: f"head_correction = {cfg.head.correction.value}",
-        "head_correction = off or no_local_fields",
-        "set head_correction = off or no_local_fields, or low_mem_bands = "
-        "false",
-        "the full q->0 head/body wing kernel reads wfns.psi_xn/psi_yn "
-        "directly and has no face-layout port yet (census row 'Full q->0 "
-        "head/body wings').  head_correction=full is the shipping default, "
-        "so this is the FIRST refusal an unqualified low_mem_bands=true "
-        "deck hits",
-    ),
-    (
         "low_mem_bands_self_consistent_unported",
         lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
         lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
