@@ -69,6 +69,21 @@ give the next production attempt (or the next agent) an attributable,
 measured live-array snapshot at each stage instead of the single
 unattributed sync point this module had before.
 
+``low_mem_bands`` face-layout wings (2026-08-22)
+-------------------------------------------------
+``head_wings_sharded``/``static_head_wings_sharded`` (feeding ``Y_x``/
+``Z_y``/``static_Y_x``/``static_Z_y``) now dispatch on ``wfns.layout``
+(``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``, census rows
+6/7): ``layout='legacy'`` is the exact untouched body; ``layout='face'``
+routes to ``_head_wings_sharded_face``/``_static_head_wings_sharded_face``,
+whose kernels (``_head_wing_kernel_face``, ``_static_head_wings_kernel_
+face``) never hold a band-replicated psi copy the way the legacy ring
+does — see ``_head_wing_kernel_face``'s own docstring for the bounded
+mu-blocked-gather algorithm and its relationship (none) to the separately
+registered, still-open v-sharding-reshard 81.74-GiB legacy defect
+(``KNOWN_LORRAX_ISSUES.md``).  ``head_s_tensor_sharded`` (feeding
+``S_direct``) needs no face port — it never touches psi.
+
 Units and coordinates
 ---------------------
 Hamiltonians and frequencies are Ry.  ``bvec_cart`` has reciprocal lattice
@@ -208,6 +223,16 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # The full Y/Z outputs are much smaller (three Cartesian rows/columns), and a
 # ring step visits every frequency block before circulating its band tile.
 _HEAD_WING_FREQUENCY_BLOCK = 8
+
+# Bound the face-layout wing kernel's per-step psi gather (obstacle #3/#5 of
+# the low_mem_bands audit, report §"Full q->0 head/body wings").  psi_mun/
+# psi_nmu have NO replicated band axis (unlike legacy's psi_xn/psi_yn), so a
+# rank cannot read an arbitrary band window for free; instead it gathers the
+# FULL band extent for a small MU block at a time via one lax.all_gather per
+# block, keeping the transient (nk, ns, nb_full, mu_block)-shaped buffer
+# bounded independent of how many centroids this rank owns locally.  See
+# ``_head_wing_kernel_face``'s docstring for the full residency algebra.
+_HEAD_WING_MU_BLOCK = 64
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -1075,6 +1100,32 @@ def _head_wing_kernel(
     *,
     nb_logical: int,
     include_surface: bool,
+    layout: str = "legacy",
+) -> Callable:
+    """Layout dispatcher.  ``layout='legacy'`` (default) returns the exact
+    pre-``low_mem_bands`` kernel, unmoved; ``layout='face'`` returns the
+    two-face carrier's bounded band-pair-gather kernel.  Single owner, no
+    ``build_G_low_mem``-style fork: this is the ONE call site every caller
+    of the direct q-linear wings goes through (see :func:`head_wings_sharded`,
+    the only caller)."""
+    if layout == "legacy":
+        return _head_wing_kernel_legacy(
+            mesh, nb_logical=int(nb_logical),
+            include_surface=bool(include_surface))
+    if layout == "face":
+        return _head_wing_kernel_face(
+            mesh, nb_logical=int(nb_logical),
+            include_surface=bool(include_surface))
+    raise ValueError(
+        f"_head_wing_kernel: layout must be 'legacy' or 'face', got "
+        f"{layout!r}")
+
+
+def _head_wing_kernel_legacy(
+    mesh: Mesh,
+    *,
+    nb_logical: int,
+    include_surface: bool,
 ) -> Callable:
     r"""Return the cached all-band q-linear wing contraction.
 
@@ -1084,6 +1135,9 @@ def _head_wing_kernel(
     rank circulates its small velocity tile around that mesh axis.  After one
     ring every local centroid slice has seen every band tile, while no rank
     ever materialises a full ``nb x nb`` velocity matrix.
+
+    UNTOUCHED by ``low_mem_bands`` — this is the exact pre-existing body,
+    unmoved; see ``_head_wing_kernel_face`` for the two-face sibling.
     """
     key = ("head_wings", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
@@ -1325,6 +1379,292 @@ def _head_wing_kernel(
     return kernel
 
 
+def _head_wing_kernel_face(
+    mesh: Mesh,
+    *,
+    nb_logical: int,
+    include_surface: bool,
+) -> Callable:
+    r"""Two-face-carrier q-linear wing contraction (audit report §"Full
+    q->0 head/body wings", census rows 6/7).
+
+    WHY THE LEGACY RING DOES NOT PORT, AND THE 10x ALGEBRA
+    --------------------------------------------------------
+    ``_head_wing_kernel_legacy`` is cheap only because ``psi_xn``/``psi_yn``
+    carry a REPLICATED band axis: any rank can read an arbitrary band
+    window ``psi_xn_local[..., lo:hi]`` for free, so only the small
+    velocity tile (``3 x nk x nx x ny``, independent of mu) needs
+    circulating around the ring.  ``psi_mun``/``psi_nmu`` have NO such
+    replicated axis — every axis is mesh-sharded — so the identical trick
+    is unavailable, exactly the report's own words: "a face layout needs a
+    2-D band-pair ring/tile algorithm... cannot be replaced by the
+    one-particle G GEMM" (dense ``Gij``/exact-response census row).
+
+    A DIFFERENT confirmed 81.74-GiB defect (registered separately,
+    `KNOWN_LORRAX_ISSUES.md`, "the v-sharding fix is not closed") lives on
+    the LEGACY-only path and is unrelated to what follows: this module's
+    own algebra there was ``10.006x`` ONE FULL ``(nk,ns,mu,nb)`` psi copy,
+    the size GSPMD's auto-reshard prologue pays when it reconciles ONE
+    off-mesh (``SingleDeviceSharding``) operand — the freshly host-read
+    velocity — against SEVERAL already on-mesh psi-sized operands inside a
+    single compiled program.  That mechanism needs a legacy-shaped psi
+    input (a full band-replicated copy) to reproduce, so it CANNOT recur
+    here even in principle: this kernel never holds anything psi-shaped
+    that is band-replicated, and every operand it builds is explicitly
+    ``jax.device_put`` onto its declared ``NamedSharding`` before use (see
+    ``_pad_head_band_manifold_to`` below) — the exact discipline whose
+    absence caused that legacy defect.  The residency bound below is
+    therefore independent of, not a fix for, that open legacy row.
+
+    THE BOUNDED ALGORITHM
+    ----------------------
+    Split the work along the axis each face orientation already carries
+    for free:
+
+    * mu (the OUTPUT index) never moves.  ``psi_mun``'s mu axis is
+      X-sharded — the SAME axis ``Y_x``'s output is sharded on — so a
+      rank's own local mu range is already the right output range, no
+      communication.  Symmetrically for ``psi_nmu`` (mu on Y) and ``Z_y``.
+    * n (the two SUMMED band indices ``i``, ``j`` of ``b_ij(mu) = sum_s
+      conj(psi_i(mu)) psi_j(mu)``) is what is missing locally: ``psi_mun``
+      only holds a Y-fraction of it.  For a SMALL block of ``_HEAD_WING_
+      MU_BLOCK`` mu values at a time, one ``lax.all_gather`` over the
+      OTHER mesh axis assembles the full ``nb_full``-wide band vector for
+      exactly that block — bounded by ``nk * ns * nb_full * mu_block``,
+      independent of how many mu values this rank owns in total.  ``i``
+      and ``j`` then read the SAME gathered array (two labels on one
+      operand, matching ``b_ij``'s own definition), so no second ring or
+      gather is needed for the "other" band index the way a naive
+      transcription of the legacy ring might suggest.
+    * The (i,j)-operator itself — ``conj(v[a,i,j]) * F_ij(omega)`` — is
+      ``nb_full x nb_full``, INDEPENDENT of mu.  It is built once (one
+      two-axis ``lax.all_gather`` of the small, already band-mesh-sharded
+      velocity) and reused across every mu block, at the SAME
+      ``_HEAD_WING_FREQUENCY_BLOCK``-bounded omega streaming the legacy
+      kernel already uses (reused unchanged, not re-derived).
+
+    COST, NAMED (matching ``Wavefunctions.band_mask``'s own convention):
+    every mu block pays the FULL ``nb_full x nb_full`` (i,j) contraction —
+    the same "good correctness bring-up path" obstacle #3 already
+    sanctions for masked face operations — so this kernel does
+    ``mu_local / _HEAD_WING_MU_BLOCK`` TIMES the (i,j) FLOPs a
+    theoretically optimal ring would, in exchange for a residency bound
+    that never scales with mu.  Also unlike legacy, ranks sharing an
+    output mu range but differing on the OTHER mesh axis (e.g. same X,
+    different Y for ``Y_x``) redundantly compute the IDENTICAL answer —
+    correct (every rank's own local mu range is complete on its own, no
+    ``psum`` needed) but ``P``-axis-fold redundant in FLOPs, a stated
+    trade for zero extra communication.
+
+    Peak transient per rank, this kernel only (steady-state persistent
+    storage is unaffected — it is still ``psi_mun``/``psi_nmu`` at
+    ``2*S/(Px*Py)``, the carrier's own number):
+    ``v_full`` (``3*nk*nb_full^2``, gathered once) +
+    ``weight`` (``omega_block*nk*nb_full^2``, rebuilt once per mu block) +
+    the gathered psi block (``nk*ns*nb_full*mu_block``, small).  None of
+    these three terms contains ``mu_local`` or ``mu_pad``.
+    """
+    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(
+        v_local,
+        psi_mun_local,
+        psi_nmu_local,
+        energies,
+        occupations,
+        surface_weight,
+        omegas,
+        pref_inter,
+        pref_surface,
+        eta,
+    ):
+        nk = v_local.shape[1]
+        v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
+        v_full = jax.lax.all_gather(v_full, ax_y, axis=3, tiled=True)
+        nb_full = v_full.shape[-1]
+        ns = psi_mun_local.shape[1]
+        mu_x_local = psi_mun_local.shape[2]
+        mu_y_local = psi_nmu_local.shape[-1]
+
+        idx = jnp.arange(nb_full)
+        logical1d = idx < nb_logical
+        logical2d = (logical1d[:, None] & logical1d[None, :])[None, :, :]
+        dE = energies[:, :, None] - energies[:, None, :]
+        f_diff = occupations[:, None, :] - occupations[:, :, None]
+        transition = logical2d & (dE > 0.0)
+        if include_surface:
+            diagonal = logical2d & (idx[:, None] == idx[None, :])[None, :, :]
+            surface_pair = jnp.where(diagonal, surface_weight[:, :, None], 0.0)
+        else:
+            surface_pair = jnp.zeros_like(dE)
+
+        n_omega = omegas.shape[0]
+        z = omegas + 1j * eta
+        inv_z = jnp.where(
+            jnp.abs(omegas) > 1.0e-15, 1.0 / z,
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        freq_block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
+        n_omega_padded = ((int(n_omega) + freq_block - 1) // freq_block) * freq_block
+        freq_pad = n_omega_padded - int(n_omega)
+        z_blocks = jnp.pad(
+            z, (0, freq_pad),
+            constant_values=jnp.asarray(1.0j, dtype=jnp.complex128),
+        ).reshape(-1, freq_block)
+        inv_z_blocks = jnp.pad(inv_z, (0, freq_pad)).reshape(-1, freq_block)
+
+        def _weighted_stack(contract):
+            """Stream omega in bounded blocks (mirrors the legacy ring's
+            own ``_HEAD_WING_FREQUENCY_BLOCK`` discipline); no cross-block
+            accumulation is needed since distinct blocks cover distinct
+            frequencies (unlike the legacy ring's cross-RING-STEP carry)."""
+            def _step(_carry, node):
+                z_block, inv_z_block = node
+                denom = z_block[:, None, None, None] ** 2 - dE[None] ** 2
+                weight = jnp.where(
+                    transition[None] & (jnp.abs(denom) > 1.0e-16),
+                    pref_inter * f_diff[None] / denom,
+                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                )
+                if include_surface:
+                    weight = weight + (
+                        pref_surface * inv_z_block[:, None, None, None]
+                        * surface_pair[None])
+                return _carry, contract(weight)
+            _, blocks = jax.lax.scan(
+                _step, None, (z_blocks, inv_z_blocks), unroll=1)
+            return blocks
+
+        # ---- Y_x: mu on X (psi_mun's own axis), gather bands over Y ----
+        mu_x_block = min(_HEAD_WING_MU_BLOCK, int(mu_x_local))
+        n_x_blocks = -(-int(mu_x_local) // mu_x_block)
+        mu_x_padded = n_x_blocks * mu_x_block
+        psi_mun_padded = jnp.pad(
+            psi_mun_local,
+            ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
+
+        def _x_step(_carry, blk):
+            zero = jnp.zeros((), dtype=blk.dtype)
+            start = blk * mu_x_block
+            tile = jax.lax.dynamic_slice(
+                psi_mun_padded, (zero, zero, start, zero),
+                (nk, ns, mu_x_block, psi_mun_padded.shape[-1]))
+            psi_full = jax.lax.all_gather(tile, ax_y, axis=3, tiled=True)
+
+            def _contract_left(weight):
+                return jnp.einsum(
+                    "akij,wkij,ksmi,ksmj->wam",
+                    jnp.conj(v_full), weight,
+                    jnp.conj(psi_full), psi_full,
+                    optimize=True,
+                )
+            blocks = _weighted_stack(_contract_left)
+            return _carry, blocks.reshape(n_omega_padded, 3, mu_x_block)
+
+        _, y_chunks = jax.lax.scan(
+            _x_step, None, jnp.arange(n_x_blocks, dtype=jnp.int32), unroll=1)
+        Y_x = jnp.moveaxis(y_chunks, 0, 2).reshape(
+            n_omega_padded, 3, mu_x_padded)[:n_omega, :, :mu_x_local]
+
+        # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
+        mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
+        n_y_blocks = -(-int(mu_y_local) // mu_y_block)
+        mu_y_padded = n_y_blocks * mu_y_block
+        psi_nmu_padded = jnp.pad(
+            psi_nmu_local,
+            ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
+
+        def _y_step(_carry, blk):
+            zero = jnp.zeros((), dtype=blk.dtype)
+            start = blk * mu_y_block
+            tile = jax.lax.dynamic_slice(
+                psi_nmu_padded, (zero, zero, zero, start),
+                (nk, psi_nmu_padded.shape[1], ns, mu_y_block))
+            gathered = jax.lax.all_gather(tile, ax_x, axis=1, tiled=True)
+            psi_full = jnp.transpose(gathered, (0, 2, 3, 1))
+
+            def _contract_right(weight):
+                return jnp.einsum(
+                    "ksmi,ksmj,wkij,bkij->wmb",
+                    psi_full, jnp.conj(psi_full), weight, v_full,
+                    optimize=True,
+                )
+            blocks = _weighted_stack(_contract_right)
+            return _carry, blocks.reshape(n_omega_padded, mu_y_block, 3)
+
+        _, z_chunks = jax.lax.scan(
+            _y_step, None, jnp.arange(n_y_blocks, dtype=jnp.int32), unroll=1)
+        Z_y = jnp.moveaxis(z_chunks, 0, 1).reshape(
+            n_omega_padded, mu_y_padded, 3)[:n_omega, :mu_y_local, :]
+
+        return Y_x, Z_y
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),   # v_local
+            P(None, None, "x", "y"),   # psi_mun_local  (PSI_MUN_SPEC)
+            P(None, "x", None, "y"),   # psi_nmu_local  (PSI_NMU_SPEC)
+            P(None, None),             # energies (nk, nb_full), replicated
+            P(None, None),             # occupations
+            P(None, None),             # surface_weight
+            P(None),                   # omegas
+            P(),
+            P(),
+            P(),
+        ),
+        out_specs=(P(None, None, "x"), P(None, "y", None)),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
+    """Like ``_pad_head_band_manifold`` but pads to an EXPLICIT ``width``
+    rather than inferring one from ``v``'s own current extent.
+
+    The face wing kernel's contracted operand (``psi_mun``/``psi_nmu``) is
+    NOT legally sliceable to an arbitrary logical window (obstacle #3: a
+    face-sharded band axis need not be mesh-divisible at that boundary),
+    so it is always gathered at its full stored ``nb_full`` width.  ``v``/
+    ``e``/``f``/``surface`` must therefore be embedded in that SAME width
+    (zero beyond the physical ``[b0,b4)`` extent — safe, since every
+    consumer masks on ``nb_logical``, never on ``v``'s own shape) rather
+    than the smaller chi0-only padding ``_pad_head_band_manifold`` does
+    for the legacy kernel.  ``nb_full`` is already mesh-divisible by
+    construction of the two-face carrier, so no further rounding is
+    needed here.
+
+    Also applies the fix registered in ``KNOWN_LORRAX_ISSUES.md`` (the
+    v-sharding-commit defect on the legacy path): every returned array is
+    explicitly ``jax.device_put`` onto its declared mesh sharding before
+    any kernel sees it, so a foreign ``SingleDeviceSharding`` operand
+    never reaches this kernel's ``shard_map``.
+    """
+    nb = int(v.shape[-1])
+    if width < nb:
+        raise ValueError(
+            f"_pad_head_band_manifold_to: width={width} smaller than v's "
+            f"own extent {nb}")
+    pad = width - nb
+    if pad:
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
+        e = jnp.pad(e, ((0, 0), (0, pad)))
+        f = jnp.pad(f, ((0, 0), (0, pad)))
+        surface = jnp.pad(surface, ((0, 0), (0, pad)))
+    v = jax.device_put(v, NamedSharding(mesh, P(None, None, "x", "y")))
+    e = jax.device_put(e, NamedSharding(mesh, P(None, None)))
+    f = jax.device_put(f, NamedSharding(mesh, P(None, None)))
+    surface = jax.device_put(surface, NamedSharding(mesh, P(None, None)))
+    return v, e, f, surface
+
+
 def head_wings_sharded(
     velocity_cart,
     wfns,
@@ -1364,7 +1704,27 @@ def head_wings_sharded(
     axis.  Frequencies are blocked inside each ring step, so a tile is sent
     once rather than once per frequency block and no all-frequency pair
     tensor is formed.
+
+    Layout dispatch on ``wfns.layout`` (report §5, single owner): the body
+    below, unchanged, is ``layout='legacy'``.  ``layout='face'`` routes to
+    :func:`_head_wings_sharded_face`, which returns the SAME
+    ``(Y_x, Z_y)`` shapes/sharding/physics — every caller downstream of
+    this function is layout-agnostic.  A ``wfns`` with no ``layout``
+    attribute at all (pre-two-face-carrier test fixtures that stand in a
+    bare ``psi_xn``/``psi_yn``-carrying stub) defaults to ``'legacy'``,
+    matching ``Wavefunctions.layout``'s own dataclass default.
     """
+    layout = getattr(wfns, "layout", "legacy")
+    if layout == "face":
+        return _head_wings_sharded_face(
+            velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
+            mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
+            nspinor=nspinor, eta_ry=eta_ry,
+            surface_weight_kn=surface_weight_kn)
+    if layout != "legacy":
+        raise ValueError(
+            f"head_wings_sharded: wfns.layout must be 'legacy' or 'face', "
+            f"got {layout!r}")
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
@@ -1417,6 +1777,83 @@ def head_wings_sharded(
         )
 
 
+def _head_wings_sharded_face(
+    velocity_cart,
+    wfns,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+):
+    """``layout='face'`` body of :func:`head_wings_sharded`.  Same physics
+    and normalization as the legacy body's docstring; only the carrier and
+    kernel differ.  ``psi_mun``/``psi_nmu`` span the bundle's full stored
+    ``[b0,b4)`` band extent (obstacle #3), so — unlike the legacy body,
+    which truncates ``wfns.psi_xn``/``psi_yn`` down to the velocity's own
+    ``nb_pad`` — this pads ``v``/``e``/``f``/``surface`` UP to that full
+    extent instead (:func:`_pad_head_band_manifold_to`); the kernel masks
+    anything beyond ``nb_logical`` to zero.
+    """
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
+    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+        raise ValueError(
+            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            f"velocity (nk,nb)={v.shape[1:3]}.")
+    if wfns.psi_mun is None or wfns.psi_nmu is None:
+        raise ValueError(
+            "head_wings_sharded(layout='face') requires wfns.psi_mun and "
+            "wfns.psi_nmu (got None) — this bundle is not a face carrier "
+            "despite wfns.layout=='face'.")
+    nk_mun, s_mun, _mu_x, n_mun = wfns.psi_mun.shape
+    nk_nmu, n_nmu, s_nmu, _mu_y = wfns.psi_nmu.shape
+    if nk_mun != int(v.shape[1]) or nk_nmu != int(v.shape[1]):
+        raise ValueError(
+            "centroid wavefunction k axis does not match the velocity")
+    if s_mun != s_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu spinor axes disagree: {s_mun} vs {s_nmu}")
+    if n_mun != n_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu band extents disagree: {n_mun} vs {n_nmu}")
+    nb_full = int(n_mun)
+    if nb_full < int(v.shape[-1]):
+        raise ValueError("centroid wavefunctions do not cover the head manifold")
+    include_surface = surface_weight_kn is not None
+    surface = (
+        jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+        if include_surface else jnp.zeros_like(e))
+    if surface.shape != e.shape:
+        raise ValueError(
+            f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
+    v, e, f, surface = _pad_head_band_manifold_to(
+        v, e, f, surface, mesh=mesh, width=nb_full)
+    spin_denominator = (
+        float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
+    pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
+    return _head_wing_kernel(
+        mesh, nb_logical=int(nb_logical),
+        include_surface=bool(include_surface), layout="face")(
+            v, wfns.psi_mun, wfns.psi_nmu, e, f, surface, omega,
+            jnp.asarray(pref_inter, dtype=jnp.complex128),
+            jnp.asarray(pref_surface, dtype=jnp.complex128),
+            jnp.asarray(float(eta_ry), dtype=jnp.float64),
+        )
+
+
 def static_head_wings_sharded(
     wfns,
     surface_weight_kn,
@@ -1437,7 +1874,25 @@ def static_head_wings_sharded(
     the explicit minus sign below is physical.  The x/y centroid copies stay
     sharded on their respective mesh axes and the spinor axis is summed
     without any component-count special case.
+
+    Layout dispatch on ``wfns.layout`` (report §5): the body below,
+    unchanged, is ``layout='legacy'``.  ``layout='face'`` routes to
+    :func:`_static_head_wings_sharded_face` — per the audit report, this
+    is the EASY wing: a local density-weighted band sum plus one
+    ``psum``, no ring/gather needed at all (unlike the dynamic wings),
+    because the static vertex is DIAGONAL in mu — no cross-mu operator to
+    sweep.  A ``wfns`` with no ``layout`` attribute defaults to
+    ``'legacy'`` (see :func:`head_wings_sharded`'s matching note).
     """
+    layout = getattr(wfns, "layout", "legacy")
+    if layout == "face":
+        return _static_head_wings_sharded_face(
+            wfns, surface_weight_kn, mesh=mesh, nb_logical=nb_logical,
+            nk_tot=nk_tot, nspin=nspin, nspinor=nspinor)
+    if layout != "legacy":
+        raise ValueError(
+            f"static_head_wings_sharded: wfns.layout must be 'legacy' or "
+            f"'face', got {layout!r}")
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
     if surface.ndim != 2:
         raise ValueError(
@@ -1473,6 +1928,119 @@ def static_head_wings_sharded(
             NamedSharding(mesh, P("y")),
         )
     return left, right
+
+
+def _static_head_wings_kernel_face(mesh: Mesh) -> Callable:
+    """Cached shard_map kernel: a LOCAL density-weighted band sum per
+    face orientation, then one ``psum`` over the mesh axis holding the
+    summed band index.  No ring, no gather — see
+    :func:`_static_head_wings_sharded_face`'s docstring for why the
+    static vertex does not need one (it is diagonal in mu, unlike the
+    dynamic wings' genuine (i,j) operator)."""
+    key = ("static_head_wings_face", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(psi_mun_local, psi_nmu_local, weight_full):
+        nk = psi_mun_local.shape[0]
+
+        n_y_local = psi_mun_local.shape[-1]
+        y_coord = jax.lax.axis_index(ax_y)
+        y_zero = jnp.zeros((), dtype=y_coord.dtype)
+        y_start = y_coord * n_y_local
+        weight_y = jax.lax.dynamic_slice(
+            weight_full, (y_zero, y_start), (nk, n_y_local))
+        density_x = jnp.sum(jnp.square(jnp.abs(psi_mun_local)), axis=1)
+        left = jax.lax.psum(
+            jnp.einsum("kn,kmn->m", weight_y, density_x), ax_y)
+
+        n_x_local = psi_nmu_local.shape[1]
+        x_coord = jax.lax.axis_index(ax_x)
+        x_zero = jnp.zeros((), dtype=x_coord.dtype)
+        x_start = x_coord * n_x_local
+        weight_x = jax.lax.dynamic_slice(
+            weight_full, (x_zero, x_start), (nk, n_x_local))
+        density_y = jnp.sum(jnp.square(jnp.abs(psi_nmu_local)), axis=2)
+        right = jax.lax.psum(
+            jnp.einsum("kn,knm->m", weight_x, density_y), ax_x)
+        return left, right
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),   # psi_mun_local  (PSI_MUN_SPEC)
+            P(None, "x", None, "y"),   # psi_nmu_local  (PSI_NMU_SPEC)
+            P(None, None),             # weight (nk, nb_full), replicated
+        ),
+        out_specs=(P("x"), P("y")),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _static_head_wings_sharded_face(
+    wfns,
+    surface_weight_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+):
+    """``layout='face'`` body of :func:`static_head_wings_sharded`.
+
+    ``C_mu = (2/(Nk*nspin*nspinor)) sum_kn f'(E_kn)|psi_kn(mu)|^2`` is
+    DIAGONAL in mu — no cross-mu (i,j) operator, unlike the dynamic
+    wings — so no gather/ring is needed: each rank sums ``|psi|^2`` over
+    the band-index fraction it already owns locally, then one ``psum``
+    over the mesh axis holding that fraction completes the sum, exactly
+    the report's own words ("local |psi|^2 weighted band sums followed
+    by a psum").  Like the dynamic face wing, this pays the full
+    ``nb_full``-wide sum rather than a windowed one (obstacle #3).
+    """
+    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    if surface.ndim != 2:
+        raise ValueError(
+            f"static head surface weights must be (nk,nb), got {surface.shape}")
+    if wfns.psi_mun is None or wfns.psi_nmu is None:
+        raise ValueError(
+            "static_head_wings_sharded(layout='face') requires "
+            "wfns.psi_mun and wfns.psi_nmu (got None).")
+    nk_mun, _s_mun, _mu_x, n_mun = wfns.psi_mun.shape
+    _nk_nmu, n_nmu, _s_nmu, _mu_y = wfns.psi_nmu.shape
+    if n_mun != n_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu band extents disagree: {n_mun} vs {n_nmu}")
+    nb_full = int(n_mun)
+    if not (0 < int(nb_logical) <= nb_full):
+        raise ValueError(f"need 0 < nb_logical <= {nb_full}, got {nb_logical}")
+    if int(surface.shape[0]) != nk_mun:
+        raise ValueError("centroid wavefunctions do not cover static weights")
+    width = int(surface.shape[1])
+    if width > nb_full:
+        raise ValueError(
+            "static head surface weights are wider than the face bundle's "
+            f"stored band extent: {width} > {nb_full}")
+    if width < nb_full:
+        surface = jnp.pad(surface, ((0, 0), (0, nb_full - width)))
+    logical = jnp.arange(nb_full)[None, :] < int(nb_logical)
+    weight = jax.device_put(
+        jnp.where(logical, surface, 0.0),
+        NamedSharding(mesh, P(None, None)))
+    prefactor = -2.0 / (
+        float(nk_tot)
+        * float(max(int(nspin), 1))
+        * float(max(int(nspinor), 1))
+    )
+    left, right = _static_head_wings_kernel_face(mesh)(
+        wfns.psi_mun, wfns.psi_nmu, weight)
+    return prefactor * left, prefactor * right
 
 
 def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
