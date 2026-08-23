@@ -387,6 +387,15 @@ peak_B = persistent_total
        + 2·16·n_k·n_s²·μ²/P
 ```
 
+Under `low_mem_bands=true` this stage's band contraction is a distributed
+SUMMA GEMM over the two-face carrier rather than a rank-local einsum over
+single-axis ψ — see
+[`zeta_fit_face_psi_cct.md`](zeta_fit_face_psi_cct.md) for the staging and
+why it reuses `gw.greens_function_kernel`'s GEMM-seam convention.  The
+transient shape above is largely unchanged (still one open-spin pair
+density per side); the persistent floor changes as `_persistent_bytes`'s
+`psi_copies` docstring now states.
+
 ### Peak C — fit_one_rchunk
 
 The binding peak on most production runs.  The pair-density phase holds:
