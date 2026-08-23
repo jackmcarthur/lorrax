@@ -272,15 +272,12 @@ def fit_zeta_to_h5(
     the fit completes.
     """
     if low_mem_bands:
-        if int(vertex_mu_L) != 0:
-            raise ValueError(
-                "fit_zeta_to_h5: low_mem_bands=True requires vertex_mu_L=0 "
-                f"(charge channel); got vertex_mu_L={int(vertex_mu_L)}.  "
-                "The bispinor transverse channel is refused under "
-                "low_mem_bands upstream "
-                "(gw_config.refuse_unsupported_low_mem_bands's bispinor "
-                "row) -- this call site should never be reached with "
-                "both set; fix the caller.")
+        # vertex_mu_L != 0 (transverse channels) is SUPPORTED here as of
+        # 2026-08-23 -- isdf.core._c_q_face/_z_q_face both accept
+        # gamma_L=gamma_R=gamma_mu, mirroring the legacy branches' own
+        # convention exactly (see the STEP 2/STEP 6 call sites below).
+        # gw_config.refuse_unsupported_low_mem_bands's bispinor row is
+        # narrowed accordingly (see that module's own comment).
         if band_norms is not None:
             raise NotImplementedError(
                 "fit_zeta_to_h5: low_mem_bands=True with pseudobands "
@@ -619,9 +616,18 @@ def fit_zeta_to_h5(
                     & (_idx < band_range_right[1] - _off), 1.0, 0.0)
                 weight_l_face = jnp.asarray(_w_l_np, dtype=jnp.float64)
                 weight_r_face = jnp.asarray(_w_r_np, dtype=jnp.float64)
+            # gamma_mu_face: None for the charge channel, the SAME
+            # (perm, phase) tuple passed as BOTH gamma_L and gamma_R for
+            # a transverse channel -- identical convention to the legacy
+            # `else` branch below (isdf.core._c_q_face's own docstring,
+            # "γ̃ VERTEX", derives why one endpoint transform per field
+            # reproduces gamma_double_contract's P_r-only application).
+            gamma_mu_face = (
+                None if vertex_mu_L == 0 else _gamma_perm_phase_mu(vertex_mu_L))
             C_q = c_q_from_psi_sm(
                 kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
                 psi_mun=psi_mun_fresh, psi_nmu=psi_nmu_fresh,
+                gamma_L=gamma_mu_face, gamma_R=gamma_mu_face,
                 weight_l=weight_l_face, weight_r=weight_r_face,
                 gemm=_face_gemm)
         elif vertex_mu_L == 0:

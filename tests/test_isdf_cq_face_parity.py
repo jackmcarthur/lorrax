@@ -24,6 +24,15 @@ spin-merge order) and an L/R band window whose lower edges also differ
 (not just its upper edge) from ``band_range_full``'s own origin.  See
 ``docs/architecture/zeta_fit_face_psi_cct.md``.
 
+**γ̃ vertex extension (2026-08-23, feat/transverse-zeta-face-2026-08-23)**:
+``_GAMMA_CASES`` adds all 15 non-identity ``(mu_L, nu_L)`` Lorentz-index
+pairs at ns=4 -- the DISCRIMINATING cases (an identity vertex passes
+trivially: `gamma_apply` is a no-op, so the endpoint-application code below
+is never actually exercised by the three cases above).  These gate
+``isdf.core._c_q_face``'s endpoint-application vertex insertion against
+``_c_q_legacy``'s existing post-IFFT ``gamma_double_contract`` -- same
+tolerance (``1e-10`` relative), same mechanism as the identity cases.
+
 Under plain pytest (one process), the cell below SKIPS rather than
 failing -- it is not lying about the property it did not check (TASTE.md,
 "a check that cannot fail is not evidence" family): it names exactly why
@@ -61,6 +70,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from isdf.core import c_q_from_psi_sm
 from distrib_la import gemm_plan
+from common.gamma_matrices import gamma_perm_phase
 
 PX = PY = 2
 
@@ -75,6 +85,23 @@ _CASES = (
                              l_range=(2, 8), r_range=(0, 8), seed=3)),
 )
 
+#: γ̃-VERTEX cases (2026-08-23, feat/transverse-zeta-face-2026-08-23) — the
+#: DISCRIMINATING cases the task asks for: identity-vertex agreement (the
+#: three cases above, unchanged) proves nothing about a non-identity γ̃, since
+#: an identity perm/phase makes the endpoint-application code below a no-op
+#: byte-identical to the pre-vertex path.  ns=4 (a genuine bispinor fixture,
+#: not merely ns=2), ALL (mu_L, nu_L) pairs in {0,1,2,3}^2 EXCEPT (0,0)
+#: (already covered by the identity cases above) -- 15 cases, each its own
+#: seed so no two cases share random ψ.
+_GAMMA_CASES = tuple(
+    (f"gamma_mu{mu_l}_nu{nu_l}",
+     dict(ns=4, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8,
+          l_range=(0, 5), r_range=(0, 8), seed=100 + 4 * mu_l + nu_l,
+          gamma_mu_L=mu_l, gamma_nu_L=nu_l))
+    for mu_l in range(4) for nu_l in range(4)
+    if not (mu_l == 0 and nu_l == 0)
+)
+
 
 def _crand(rng, *shape):
     return (rng.standard_normal(shape)
@@ -82,7 +109,7 @@ def _crand(rng, *shape):
 
 
 def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
-                         r_range, seed):
+                         r_range, seed, gamma_mu_L=0, gamma_nu_L=0):
     """Build the SAME random ψ, feed it to both layouts, diff C_q.
 
     ``l_range``/``r_range`` need not be mesh-divisible (the face path's
@@ -90,6 +117,13 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     sigma-window edges, not mesh-aligned in general); only
     ``full = (min(l0,r0), max(l1,r1))`` must equal ``(0, nb_full)`` here,
     matching ``fit_zeta_to_h5``'s own ``band_range_full`` convention.
+
+    ``gamma_mu_L``/``gamma_nu_L`` (Lorentz index, 0-3): 0 means identity
+    (``gamma_L``/``gamma_R=None``, the pre-vertex charge channel); 1-3
+    build the ``(perm, phase)`` tuple for γ̃^{mu_L}/γ̃^{nu_L}
+    (:func:`common.gamma_matrices.gamma_perm_phase`) and feed the SAME
+    tuple to BOTH the legacy and face calls below -- the discriminating
+    check this file's own module docstring update explains.
     """
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
     nkx, nky, nkz = nk_tuple
@@ -122,9 +156,12 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     psi_r_Y_d = jax.device_put(
         jnp.asarray(psi_rmu_Y_loaded[:, r0:r1, :, :]), y3_4)
 
+    gamma_L = None if gamma_mu_L == 0 else gamma_perm_phase(gamma_mu_L)
+    gamma_R = None if gamma_nu_L == 0 else gamma_perm_phase(gamma_nu_L)
+
     C_legacy = jax.block_until_ready(c_q_from_psi_sm(
         psi_l_X_d, psi_l_Y_d, psi_r_X_d, psi_r_Y_d,
-        gamma_L=None, gamma_R=None, kgrid=nk_tuple, mesh_xy=mesh,
+        gamma_L=gamma_L, gamma_R=gamma_R, kgrid=nk_tuple, mesh_xy=mesh,
         layout="legacy"))
 
     # ---- face path -----------------------------------------------------
@@ -148,6 +185,7 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     C_face = jax.block_until_ready(c_q_from_psi_sm(
         kgrid=nk_tuple, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_d, psi_nmu=psi_nmu_d,
+        gamma_L=gamma_L, gamma_R=gamma_R,
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r), gemm=plan))
 
     # Both C_legacy/C_face are genuinely multi-process sharded
@@ -164,7 +202,8 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     max_abs = float(absdiff.max())
     max_rel = max_abs / max(ref_scale, 1e-300)
     p0(f"  ns={ns} nk={nk} n_rmu={n_rmu} nb_full={nb_full} l={l_range} "
-       f"r={r_range}: max|diff|={max_abs:.3e} (ref scale {ref_scale:.3e}) "
+       f"r={r_range} gamma=(mu_L={gamma_mu_L},nu_L={gamma_nu_L}): "
+       f"max|diff|={max_abs:.3e} (ref scale {ref_scale:.3e}) "
        f"max|rel diff|={max_rel:.3e}")
     # Engine-parity bar (C8, this repo's convention): relative, never
     # bit-exact -- a distributed SUMMA GEMM and a rank-local einsum are
@@ -172,10 +211,13 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     assert max_rel < 1e-10, (
         f"c_q_from_psi_sm layout='face' vs 'legacy' parity FAILED: "
         f"max relative diff {max_rel:.3e} (case ns={ns}, l={l_range}, "
-        f"r={r_range})")
+        f"r={r_range}, gamma=(mu_L={gamma_mu_L},nu_L={gamma_nu_L}))")
 
 
-@pytest.mark.parametrize("name,kwargs", _CASES, ids=[c[0] for c in _CASES])
+_ALL_CASES = _CASES + _GAMMA_CASES
+
+
+@pytest.mark.parametrize("name,kwargs", _ALL_CASES, ids=[c[0] for c in _ALL_CASES])
 def test_cq_face_layout_matches_legacy(name, kwargs):
     if jax.process_count() < PX * PY:
         pytest.skip(
@@ -201,14 +243,14 @@ def _cli_main():
         return 1
     mesh = Mesh(np.asarray(jax.devices()).reshape(px, py), ("x", "y"))
     failures = 0
-    for name, kwargs in _CASES:
+    for name, kwargs in _ALL_CASES:
         try:
             check_cq_face_parity(mesh, **kwargs)
             p0(f"PASS {name}")
         except AssertionError as exc:
             failures += 1
             p0(f"FAIL {name}: {exc}")
-    p0(f"done: {len(_CASES) - failures}/{len(_CASES)} cases passed")
+    p0(f"done: {len(_ALL_CASES) - failures}/{len(_ALL_CASES)} cases passed")
     return 1 if failures else 0
 
 

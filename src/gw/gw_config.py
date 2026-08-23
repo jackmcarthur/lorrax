@@ -3092,69 +3092,76 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "together, rather than letting a cleared deck fall through to a "
         "less specific refusal one row later",
     ),
-    (
-        # KEPT REFUSED (2026-08-23, feat/bispinor-face-2026-08-23) — only
-        # HALF the census row's gap closed.  The Sigma^B/vertex-insertion
-        # side this row originally cited (sigma_x_bispinor.py:63-100,160-
-        # 180's hard-coded psi_xn/psi_yr + dataclass clone) IS fixed: γ̃
-        # insertion is now gw.wavefunction_bundle.with_lorentz_vertices, a
-        # representation-aware bundle operation that folds γ̃ into
-        # whichever pair of fields plays the G-build's direct/conjugated
-        # role for the bundle's OWN layout (psi_xn/psi_yr legacy,
-        # psi_mun/psi_nmu face) — gated on real 4-rank CUDA with a genuine
-        # ns=4 fixture against an independent 4x4-γ̃-matmul reference AND
-        # legacy-vs-face parity through the exact kernel chain
-        # compute_sigma_x_bispinor uses (5/5 Lorentz pairs, ~1e-16
-        # relative both checks; tests/multi_device/
-        # bispinor_transverse_vertex_face_gate.py).  A second, genuine
-        # defect was found and fixed along the way, not merely a missing
-        # feature: the face carrier's single (psi_mun, psi_nmu) pair
-        # serves BOTH the G-build's internal band sum and the outer
-        # projection bra/ket (legacy's four independent fields keep those
-        # separate for free), so naively reusing a γ̃-inserted bundle for
-        # BOTH roles corrupted the projection too — O(1) relative
-        # disagreement vs legacy, measured before the fix. Fixed by a new
-        # ``wfns_g=`` parameter on ``_make_cohsex_kernels_face``'s
-        # ``sigma_sx`` (defaults to ``wfns``, so every non-bispinor
-        # caller is untouched) that supplies the G-build's operands
-        # separately from the projection's.
+    # LIFTED for FRESH-FIT decks (2026-08-23,
+        # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
+        # closed.  Both halves the previous session's comment named as
+        # missing are now ported and gated:
         #
-        # STILL REFUSED because the OTHER half of the row's gap is real
-        # and NOT closed this session: the transverse ζ-FIT's face path.
-        # ``isdf.core.c_q_from_psi_sm(layout='face')`` (the CCT/Gram
-        # build) and ``z_q_from_psi_sm(layout='face')`` (the r-chunk RHS)
-        # BOTH refuse `gamma_L`/`gamma_R` not None by name — a
-        # face-sharded transverse-centroid Wavefunctions bundle (what a
-        # bispinor+low_mem_bands run would need for Sigma^B) can only
-        # exist once BOTH stages carry the γ̃ double-contraction, and they
-        # are two DIFFERENT mechanisms (a SUMMA GEMM tail for CCT; a
-        # masked-gather+psum('y') for the r-chunk — docs/architecture/
-        # zeta_fit_face_psi_cct.md, "The landed design").  The CCT half
-        # LOOKS individually bounded (gamma_double_contract already
-        # accepts non-identity perm/phase args; _c_q_face's tail would
-        # only need to thread them through) but was deliberately NOT
-        # attempted this session: lifting the CCT half alone unlocks
-        # nothing (the r-chunk half would still refuse the SAME fit), and
-        # the r-chunk half's masked-gather mechanism is a recently-landed,
-        # delicately-verified design (its own doc records a real NaN bug
-        # found and fixed during that landing) that this session judged
-        # too large a surface to extend and re-verify safely alongside
-        # the vertex-insertion work above.  Lifting THIS row still needs
-        # both halves ported and end-to-end gated per the guide's own
-        # landing order (report §"Recommended landing order", item 5).
-        "low_mem_bands_bispinor_unported",
-        lambda cfg: bool(cfg.bispinor),
-        lambda cfg: f"bispinor = {cfg.bispinor}",
-        "bispinor = false",
-        "set bispinor = false, or low_mem_bands = false for a 4-spinor run",
-        "Sigma^B/vertex insertion is now representation-aware and gated "
-        "(gw.wavefunction_bundle.with_lorentz_vertices, "
-        "gw.cohsex_sigma._make_cohsex_kernels_face's wfns_g= parameter); "
-        "the transverse zeta fit's face path is not — isdf.core."
-        "c_q_from_psi_sm(layout='face')/z_q_from_psi_sm(layout='face') "
-        "both refuse a non-identity gamma_L/gamma_R by name (census row "
-        "'Bispinor transverse exchange')",
-    ),
+        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
+        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
+        #   representation-aware bundle operation folding γ̃ into whichever
+        #   pair of fields plays the G-build's direct/conjugated role
+        #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
+        #   2026-08-23 (feat/bispinor-face-2026-08-23), gated on real
+        #   4-rank CUDA with a genuine ns=4 fixture (5/5 Lorentz pairs,
+        #   ~1e-16 relative; tests/multi_device/
+        #   bispinor_transverse_vertex_face_gate.py).
+        # * The transverse ζ-FIT's face path — ``isdf.core.
+        #   c_q_from_psi_sm(layout='face')``/``z_q_from_psi_sm(layout=
+        #   'face')`` now accept non-identity ``gamma_L``/``gamma_R`` via
+        #   psi-ENDPOINT application (mirroring
+        #   ``with_lorentz_vertices``'s own field/axis table, folded in
+        #   BEFORE the band GEMM / masked-gather rather than at
+        #   ``gamma_double_contract``'s post-IFFT step — see
+        #   ``docs/architecture/zeta_fit_face_psi_cct.md``'s "γ̃ VERTEX"
+        #   sections for the derivation and its conjugation-convention
+        #   correction, found by reading ``greens_function_kernel.
+        #   _build_G_face`` directly: CCT's psi_mun is the CONJUGATED
+        #   operand, the OPPOSITE role from the G-build's own psi_mun).
+        #   Gated on real 4-rank CUDA, ALL 15 non-identity
+        #   ``(mu_L, nu_L)`` Lorentz-index pairs at ns=4 (the
+        #   discriminating cases — an identity vertex passes trivially
+        #   and proves nothing): ``tests/test_isdf_cq_face_parity.py``
+        #   18/18 PASS, max relative diff ~6e-16; ``tests/
+        #   test_isdf_zq_face_parity.py`` 18/18 PASS on real CUDA
+        #   (mostly bit-exact, max relative diff ~4e-16 where not — the
+        #   masked-``psum`` mechanism is a select, immune to summation-
+        #   order noise, same as its own identity-channel result).
+        #   ``gw.isdf_fitting.fit_zeta_to_h5``'s ``vertex_mu_L != 0``
+        #   refusal under ``low_mem_bands`` is dropped;
+        #   ``isdf.core._make_fit_one_rchunk_kernel``'s matching refusal
+        #   too.  ``gw.gw_init.fit_zeta`` builds the TRANSVERSE
+        #   centroid set's OWN face carrier via the SAME
+        #   ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the charge
+        #   channel already uses (not a fork), reused for both the ζ_T
+        #   fit and the post-fit Σ^B bundle.
+        #
+        # End-to-end: MoS2 3×3 bispinor GN-PPM fixture
+        # (tests/regression/bispinor_debug/bispinor_test.in,
+        # head_correction=off, restart=false), real 4-rank CUDA,
+        # low_mem_bands=true vs low_mem_bands=false — see
+        # runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/ for the
+        # artifacts and claims/ for the numbers.
+        #
+        # DELETED, not narrowed (same precedent as
+        # ``low_mem_bands_self_consistent_unported``'s own 2026-08-23
+        # lift): the census row's gap is closed for every combination
+        # bispinor ITSELF supports.  ``restart = true`` + ``bispinor =
+        # true`` was ALREADY refused before this session and independent
+        # of ``low_mem_bands`` — ``gw.gw_init.prepare_isdf_and_
+        # wavefunctions``'s restart-read path raises loudly whenever a
+        # restart file has no ``psi_full_y_transverse`` dataset, which is
+        # every file (this predates low_mem_bands entirely; see
+        # tests/regression/bispinor_debug/README.md: "bispinor restart
+        # is not yet supported").  A ``write_restart_tensors = true``
+        # fresh run (the default) is harmless under low_mem_bands too:
+        # the low_mem_bands restart WRITE branch simply omits the
+        # transverse-centroid face carrier (no dataset for it yet), and
+        # the SAME pre-existing read-side check refuses loudly if
+        # anyone later tries to restart from that file with
+        # ``bispinor = true`` — no silent data loss, in either layout.
+        # This row is deleted outright rather than re-pointed at that
+        # pre-existing, low_mem_bands-independent limitation.
     (
         # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
         # port-2026-08-22); the row is KEPT, narrowed to MPA only.  History:
