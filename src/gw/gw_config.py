@@ -3078,6 +3078,8 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "'Bispinor transverse exchange')",
     ),
     (
+        # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
+        # port-2026-08-22); the row is KEPT, narrowed to MPA only.  History:
         # DISCOVERED on real 4-rank CUDA (tests/multi_device/
         # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
         # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
@@ -3086,39 +3088,44 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # ``ppm_tau_kernel.precompile_sigma`` at the FIRST legacy accessor
         # call (``wfns.xn(s.full)``) with the carrier's own named
         # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
-        # The two-point plasmon-pole Sigma_c(omega) pipeline
-        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``,
-        # ppm_sigma.py's per-branch sigma builders, and mpa/sigma.py's
-        # equivalent for insulating MPA) reads ``wfns.xn``/``.xr``/``.yr``/
-        # ``.yn`` directly and calls ``greens_function_kernel.build_G``/
-        # ``build_G_tau`` with no ``layout=`` dispatch.  Only the STATIC
-        # channels (x_only bare exchange; COHSEX's sigma_sx/sigma_coh/
-        # hartree in cohsex_sigma.py) were ported
-        # (feat/face-g-projection-hartree-2026-08-22) -- the docs table this
-        # row's own doc string corrects had claimed GN-PPM/HL-PPM/insulating
-        # MPA were part of the supported envelope; that claim was written
-        # from the guide's landing-order text, not verified against what
-        # that branch actually shipped, and this row is the correction.
-        # ``ComputeMode.is_dynamic`` is exactly GN_PPM | HL_PPM | MPA (see
-        # its own docstring); by the time this row is reached in table
-        # order, a metal MPA deck has already been refused by the row
-        # above, so this predicate only ever fires for GN_PPM, HL_PPM, or
-        # INSULATING MPA -- ``qp_solver = fixed_point`` requires a dynamic
-        # compute_mode (gw_config.py:4130) and therefore always trips this
-        # row too; there is no static-mode escape for it under
-        # low_mem_bands=true today.
+        # The dynamic two-point plasmon-pole Sigma_c(omega) pipeline
+        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``
+        # /``_get_sigma_kij_kernel``, ``common.contract_bands``'s
+        # channels="split_reim" face arm, and ppm_sigma.py's per-branch
+        # sigma builders + invalid-pole static-limit term) now dispatches
+        # on ``wfns.layout`` and routes through
+        # ``greens_function_kernel.build_G_tau(layout='face', gemm=...)``/
+        # ``contract_bands_block_reshard(layout='face', channels=...)`` —
+        # the SAME canonical owners the static COHSEX channels already
+        # used, extended rather than forked (report §5).  Gated end to
+        # end: real 4-rank CUDA algebra parity (legacy vs face, identity +
+        # real tau weights, ns=1/ns=2, a non-mesh-divisible sigma window),
+        # a real k6_c600 fresh leg at compute_mode=gn_ppm head_correction=
+        # full vs the legacy gn_ppm reference (eqp/sigma_diag), and
+        # tests/test_zeta_mesh_invariance.py 7/7 unaffected — see the
+        # session's CLAIMS.md rows and docs/input_reference.md's updated
+        # envelope row for job ids and artifact paths.  ``mpa/sigma.py``
+        # (insulating MPA's own executor,
+        # ``_integrate_sigma_batches``) was mechanically ported the SAME
+        # session, sharing this now-gated tau-kernel/projector infra, but
+        # was NOT itself run end to end this session (its own
+        # sharded-output final layout has an additional named gap for a
+        # split Σ window — see that file's own comment) — kept refused
+        # below pending its own gate, rather than lifted on the strength
+        # of a shared-code argument alone.
         "low_mem_bands_dynamic_ppm_unported",
-        lambda cfg: cfg.compute_mode.is_dynamic,
+        lambda cfg: cfg.compute_mode is ComputeMode.MPA,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "compute_mode = x_only or cohsex (the ported static Sigma "
-        "channels)",
-        "set compute_mode = cohsex (or x_only), or low_mem_bands = false "
-        "for a GN-PPM/HL-PPM/MPA run",
-        "the dynamic two-point-PPM / MPA Sigma_c(omega) pipeline "
-        "(ppm_tau_kernel.py, ppm_sigma.py, mpa/sigma.py) reads "
-        "wfns.xn/xr/yr/yn directly with no face-layout port yet; only the "
-        "static Sigma channels (x_only, COHSEX's sigma_sx/sigma_coh/"
-        "hartree) were ported to layout='face'",
+        "compute_mode = x_only, cohsex, gn_ppm, or hl_ppm",
+        "set compute_mode = gn_ppm/hl_ppm/cohsex/x_only, or "
+        "low_mem_bands = false for an MPA run",
+        "gw.mpa.sigma's executor was mechanically ported to layout='face' "
+        "the same session as ppm_sigma.py's but has no end-to-end gate of "
+        "its own yet, and its sharded-output tail additionally refuses a "
+        "split Σ window under this layout by name (see "
+        "gw.mpa.sigma._integrate_sigma_batches) — kept refused pending "
+        "that gate rather than lifted on ppm_tau_kernel's shared "
+        "infrastructure alone",
     ),
 )
 

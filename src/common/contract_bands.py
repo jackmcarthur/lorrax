@@ -23,7 +23,11 @@ psum_scatter — because face's ψ operands are 2-D sharded on BOTH mesh
 axes from the start, unlike legacy's ``psi_xr``/``psi_yn`` (band axis
 replicated going in, sharded only at the output).  See
 :func:`contract_bands_block_reshard`'s own docstring and
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.
+``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.  Face's
+``channels="split_reim"`` arm (2026-08-22) is the dynamic PPM/MPA
+Σ_c(τ) two-channel plan, consumed by ``gw.ppm_tau_kernel``'s own face
+dispatch — see this module's :func:`_face_project_kernel` for the
+mechanism.
 
 Structure (per rank, inside one shard_map)::
 
@@ -302,7 +306,8 @@ _DIVISIBILITY_MSG = (
 FaceProjectShape = tuple
 
 
-def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str]):
+def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
+                         channels: str = "none"):
     """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
     no psum_scatter — cuBLASMp's own distributed algorithm does the
     reduction the legacy body does by hand.  See the module docstring's
@@ -322,6 +327,24 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str]):
     (s,ν) is already on 'x'; psi_nmu's (s,μ) is already on 'y'.  T comes
     out of GEMM 1 already shaped like a ψ_mun-family operand (μ,s merged
     on 'x', n on 'y'), which is exactly GEMM 2's required B operand.
+
+    ``channels="none"`` (default): the single merged-complex chain,
+    Σ = ψ†Oψ.  ``channels="split_reim"`` (2026-08-22, the dynamic PPM/MPA
+    Σ_c(τ) two-channel plan — see ``gw.ppm_tau_kernel.
+    _make_project_ri_reduce_scatter``'s identically-named legacy plan):
+    O is split into ``Re O``/``Im O`` BEFORE projection and EACH real
+    channel rides the SAME two-GEMM chain independently, returning
+    ``(S_R, S_I)`` — both complex (ψ is complex even though the channel
+    weight is real).  No f64-split de-promotion trick here: that lever
+    exists on the legacy XLA-einsum body to dodge XLA's real-operand
+    promotion inside a mixed-dtype ``jnp.dot``; a planned cuBLASMp GEMM
+    is typed ``complex128`` at construction regardless of the operand's
+    algebraic content, so there is nothing to de-promote — running the
+    SAME complex chain twice (once per channel) is already the minimal
+    form.  ``extra`` (BSE/Σ-channel stack axis) stays unsupported here —
+    see :func:`contract_bands_block_reshard`'s own guard; the dynamic
+    Σ_c(τ) band-bracket stack rides a Python loop over this kernel
+    instead (``ppm_tau_kernel._stack_channels``), not this axis.
     """
     from distrib_la import gemm_plan
 
@@ -333,10 +356,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str]):
     plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
                       dtype=jnp.complex128)
 
-    def project(psi_nmu, O, psi_mun):
-        """``project(psi_left, O, psi_right)`` — SAME argument order as
-        the legacy closure (psi_left is the one conjugated inside): under
-        ``layout='face'`` that is ``(psi_nmu, O, psi_mun)``."""
+    def _check(psi_nmu, O, psi_mun):
         if psi_nmu.ndim != 4 or psi_mun.ndim != 4 or O.ndim != 5:
             raise ValueError(
                 "contract_bands_block_reshard(layout='face'): expected "
@@ -344,6 +364,11 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str]):
                 f"psi_mun rank 4 (nk,s,mu,n); got "
                 f"{tuple(psi_nmu.shape)}, {tuple(O.shape)}, "
                 f"{tuple(psi_mun.shape)}")
+
+    def _project_one(psi_nmu, O, psi_mun):
+        """``project(psi_left, O, psi_right)`` — SAME argument order as
+        the legacy closure (psi_left is the one conjugated inside): under
+        ``layout='face'`` that is ``(psi_nmu, O, psi_mun)``."""
         O1 = merge_spin_centroid(O, 1, 2)             # (nk, M, s', nu)
         O_flat = merge_spin_centroid(O1, 2, 3)         # (nk, M, K)
         psi_mun_flat = merge_spin_centroid(psi_mun, 1, 2)  # (nk, K, n)
@@ -352,7 +377,26 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str]):
         A = jnp.conj(psi_nmu_flat)
         return plan2(A, T)                             # (nk, m, n)
 
-    return project
+    if channels == "none":
+        def project(psi_nmu, O, psi_mun):
+            _check(psi_nmu, O, psi_mun)
+            return _project_one(psi_nmu, O, psi_mun)
+        return project
+
+    if channels != "split_reim":
+        raise ValueError(
+            f"_face_project_kernel: channels must be 'none' or "
+            f"'split_reim', got {channels!r}")
+
+    def project_split(psi_nmu, O, psi_mun):
+        _check(psi_nmu, O, psi_mun)
+        O_re = jnp.real(O).astype(jnp.complex128)
+        O_im = jnp.imag(O).astype(jnp.complex128)
+        S_R = _project_one(psi_nmu, O_re, psi_mun)
+        S_I = _project_one(psi_nmu, O_im, psi_mun)
+        return (S_R, S_I)
+
+    return project_split
 
 
 def contract_bands_block_reshard(
@@ -413,10 +457,12 @@ def contract_bands_block_reshard(
         start (unlike legacy's ``psi_xr``/``psi_yn``, whose band axis is
         REPLICATED going in and only becomes sharded at the output) — the
         collective-based algorithm below is not expressible on them.
-        Requires ``face_shape``; ``channels``/``extra`` must be their
-        defaults (refused otherwise — narrower than legacy by design, not
-        an oversight: those two knobs serve the dynamic PPM Σ projector,
-        which is not ported to face layout by this change).
+        Requires ``face_shape``; ``channels`` may be ``"none"`` or
+        ``"split_reim"`` (2026-08-22 — the dynamic PPM/MPA Σ_c(τ)
+        two-channel plan, ported: see :func:`_face_project_kernel`).
+        ``extra`` must stay ``"none"`` (refused otherwise — the face
+        projector has no batched-stack axis; a caller with several
+        projections calls this kernel once per slice instead).
     face_shape
         ``(nk, nb_full, n_rmu, nspinor)`` — required when ``layout=
         'face'``.  Fixes both GEMM plans' shapes EAGERLY at this call
@@ -436,20 +482,27 @@ def contract_bands_block_reshard(
             f"contract_bands_block_reshard: layout must be 'legacy' or "
             f"'face', got {layout!r}")
     if layout == "face":
-        if channels != "none" or extra != "none":
+        if channels not in ("none", "split_reim"):
+            raise ValueError(
+                f"contract_bands_block_reshard(layout='face'): channels="
+                f"{channels!r} not in ('none', 'split_reim')")
+        if extra != "none":
             raise NotImplementedError(
-                "contract_bands_block_reshard(layout='face'): channels="
-                f"{channels!r}/extra={extra!r} are not ported — the "
-                "two-GEMM face projector serves the ordinary band-basis "
-                "projection only (COHSEX/one-shot Σ).  The dynamic PPM "
-                "Σ_c τ-projector (gw.ppm_tau_kernel, the consumer of both "
-                "knobs) is out of this change's scope; refuse by name "
-                "rather than silently ignore the request.")
+                "contract_bands_block_reshard(layout='face'): extra="
+                f"{extra!r} is not ported — the two-GEMM face projector "
+                "has no batched-stack axis; a caller with several "
+                "projections to make (Σ channels, band brackets) calls "
+                "this kernel once per slice instead (see "
+                "gw.ppm_tau_kernel._bracketed_face / _stack_channels).  "
+                "channels='split_reim' IS ported (2026-08-22, the dynamic "
+                "PPM/MPA Σ_c(τ) two-channel plan) — see "
+                "_face_project_kernel's docstring.")
         if face_shape is None:
             raise ValueError(
                 "contract_bands_block_reshard(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        return _face_project_kernel(mesh_xy, face_shape, axes)
+        return _face_project_kernel(mesh_xy, face_shape, axes,
+                                    channels=channels)
 
     from common.shard_map import shard_map
 

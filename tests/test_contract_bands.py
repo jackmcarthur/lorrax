@@ -657,16 +657,35 @@ def test_face_projector_requires_face_shape():
         contract_bands_block_reshard(mesh, layout="face")
 
 
-def test_face_projector_rejects_channels_and_extra():
+def test_face_projector_rejects_extra():
+    """``extra`` (the BSE/Σ-channel stack axis) has no face-layout
+    mechanism — the two-GEMM projector takes no batched stack; a caller
+    with several projections calls it once per slice instead
+    (``gw.ppm_tau_kernel._bracketed_face``/``_stack_channels``).  Still
+    refused after 2026-08-22's ``channels='split_reim'`` port — see the
+    next test for what that port changed."""
     mesh = _mesh()
     face_shape = (NK, MN, MU, NS)
-    with pytest.raises(NotImplementedError, match="channels"):
-        contract_bands_block_reshard(
-            mesh, layout="face", face_shape=face_shape,
-            channels="split_reim")
-    with pytest.raises(NotImplementedError, match="channels"):
+    with pytest.raises(NotImplementedError, match="extra"):
         contract_bands_block_reshard(
             mesh, layout="face", face_shape=face_shape, extra="leading")
+
+
+def test_face_projector_rejects_bad_channels():
+    """A ``channels`` value that is neither ``'none'`` nor ``'split_reim'``
+    still refuses at the SAME validation ladder, before ``gemm_plan`` is
+    ever reached — this is the CPU-checkable half of the guard.  Positive
+    construction of ``channels='split_reim'`` (2026-08-22, the dynamic
+    PPM/MPA Σ_c(τ) two-channel plan) needs a real ``distrib_la.gemm_plan``
+    — CUDA-only today — so it is NOT checked here; see
+    ``tests/test_ppm_tau_kernel_face_parity.py``'s real 4-rank CUDA gate,
+    which exercises exactly this channels value end to end (the
+    ``merged_x=False`` cases)."""
+    mesh = _mesh()
+    face_shape = (NK, MN, MU, NS)
+    with pytest.raises(ValueError, match="channels"):
+        contract_bands_block_reshard(
+            mesh, layout="face", face_shape=face_shape, channels="bogus")
 
 
 def test_contract_bands_rejects_bad_layout():
