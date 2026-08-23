@@ -17,7 +17,7 @@ mirrors ``tests/test_zeta_mesh_invariance.py``'s own worker convention),
 and additionally exposes a ``__main__`` CLI for a real-CUDA confirmation
 run, matching ``test_isdf_cq_face_parity.py``'s own shape:
 
-    lx run -N 1 -G 4 -n 4 bash tmp/lm_fitfaces_run_wrap.sh \\
+    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
         tests/test_isdf_zq_face_parity.py --mesh 2x2
 
 Cases (mirroring the CCT parity test's coverage, task-specified: "including
