@@ -125,3 +125,81 @@ def test_unsupported_dtype_refuses():
     mesh = _mesh()
     with pytest.raises(TypeError):
         D.gemm_plan(mesh, m=4, k=4, n=4, nq=2, dtype="float32")
+
+
+# ---------------------------------------------------------------------------
+# ``GemmPlan.__call__``'s own Python-level guards -- shape/dtype/sharding
+# and the out=/beta interaction -- are pure checks on static metadata, run
+# BEFORE either compiled kernel is invoked (module docstring, "safe on a
+# tracer").  Constructing a ``GemmPlan`` directly (bypassing ``gemm_plan()``,
+# which needs real cuBLASMp) with stand-in ``_fn_with_c``/``_fn_no_c``
+# lambdas exercises exactly that guard logic without any backend at all --
+# a real warmed plan's numerics are the four-rank CUDA gate's job
+# (``check_gemm_plan_cublasmp``), not this file's.
+# ---------------------------------------------------------------------------
+
+def _fake_plan(mesh, *, beta):
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la.matmul_plan import GemmPlan
+
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    return GemmPlan(
+        mesh=mesh, backend="cublasmp", m=2, k=2, n=2, nq=1,
+        dtype=jnp.dtype("complex128"), alpha=1 + 0j, beta=complex(beta),
+        in_sharding_a=sharding, in_sharding_b=sharding, out_sharding=sharding,
+        _fn_with_c=lambda A, B, C: C,   # stand-in: no real GEMM needed here
+        _fn_no_c=(lambda A, B: A) if beta == 0 else None,
+    )
+
+
+def _sharded(mesh, value, shape):
+    """(nq,m,k)-shaped P(None,'x','y') operand -- ``_check_operand``
+    refuses a plain ``jnp.zeros`` (single-device sharded), so every fake
+    operand in this section needs a real placement, exactly like
+    ``distrib_la.matmul._zeros``."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    return jax.jit(lambda: jnp.full(shape, value, dtype=jnp.complex128),
+                   out_shardings=sharding)()
+
+
+def test_out_refuses_on_a_beta_nonzero_plan():
+    """A caller who read only the general ``out=`` docstring framing
+    ("content is ignored") and reaches for it on an accumulate (beta!=0)
+    plan must get a named refusal, not a silent wrong answer built from
+    whatever the buffer happened to hold."""
+    mesh = _mesh()
+    plan = _fake_plan(mesh, beta=1.0)
+    A = _sharded(mesh, 0, (1, 2, 2))
+    B = _sharded(mesh, 0, (1, 2, 2))
+    scratch = _sharded(mesh, 0, (1, 2, 2))
+    with pytest.raises(ValueError, match="content-ignored donation"):
+        plan(A, B, out=scratch)
+
+
+def test_out_is_accepted_on_a_beta_zero_plan():
+    """The same call shape is legal -- and reaches the compiled kernel --
+    on a beta==0 plan, where out='s content-ignored contract actually
+    holds."""
+    mesh = _mesh()
+    plan = _fake_plan(mesh, beta=0.0)
+    A = _sharded(mesh, 0, (1, 2, 2))
+    B = _sharded(mesh, 0, (1, 2, 2))
+    scratch = _sharded(mesh, 0, (1, 2, 2))
+    out = plan(A, B, out=scratch)
+    assert out is scratch   # this plan's stand-in _fn_with_c returns C
+                             # unchanged, so out= must reach it as C
+
+
+def test_c_still_works_unaffected_on_a_beta_nonzero_plan():
+    """The new out=/beta guard must not touch the existing C= path."""
+    mesh = _mesh()
+    plan = _fake_plan(mesh, beta=1.0)
+    A = _sharded(mesh, 0, (1, 2, 2))
+    B = _sharded(mesh, 0, (1, 2, 2))
+    C = _sharded(mesh, 1, (1, 2, 2))
+    out = plan(A, B, C=C)
+    assert out is C
