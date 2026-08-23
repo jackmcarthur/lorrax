@@ -764,8 +764,11 @@ def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
     SUMMA GEMM).  This is the real 4-rank CUDA proof that the composition
     itself works -- numerics against a numpy reference, from inside a
     manual ``shard_map`` body, streamed through ``lax.scan`` exactly like
-    a real r-chunk-shaped kernel, covering the internal-zero-C path, the
-    donated-C accumulate path and ``out=``.
+    a real r-chunk-shaped kernel, covering the internal-zero-C path, a
+    single donated-C accumulate call, ``out=``, and (case 5) C DONATED AS
+    THE SCAN CARRY ITSELF -- an accumulate-over-many-iterations shape no
+    other case here exercises, and the one composition closest to a real
+    production tau/q-accumulation kernel.
     """
     import jax
     from functools import partial
@@ -857,6 +860,47 @@ def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
         A, B, _put(scratch_np, mesh, (None, "x", "y"))))
     out["manual_out_donated"] = _rel(D_out, want)
     assert out["manual_out_donated"] < RTOL, out["manual_out_donated"]
+
+    # 5. C AS THE lax.scan CARRY ITSELF (not a scan-stacked output like
+    # case 2, and not a single call outside scan like case 3) --
+    # carry_{i+1} = A_i@B_i + beta*carry_i, accumulated over nsteps scan
+    # iterations, the FFI's own input_output_aliases={2:0} donation
+    # composing with scan's own carry-buffer reuse.  This is the one
+    # untested cell in the task's own "FFI lifetime hazards ... across
+    # scan iterations" concern: case 2 proved repeated create/destroy of
+    # cuBLASMp's per-call descriptors against the SAME persistent
+    # ctx/workspace is safe under scan, but never donated C THROUGH the
+    # carry; case 3 proved donated-C accumulate but only as a single
+    # call, never repeated.  A production accumulate-over-tau/q pattern
+    # is shaped exactly like this case.
+    # beta stays REAL (like case 3's -0.5): gemm_plan refuses a complex
+    # alpha/beta on a real dtype (float64 is one of this cell's two
+    # dtypes -- caught by exactly that guard on the first attempt here,
+    # which used a complex beta and silently dropped float64 coverage of
+    # this case instead of erroring).
+    beta5 = -0.75
+    plan_beta2 = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                             backend="cublasmp", beta=beta5)
+    C0_np = _rng_mat(rng, (nq, m, n), dtype)
+    carry_want = C0_np.copy()
+    for i in range(nsteps):
+        carry_want = A_stack_np[i] @ B_stack_np[i] + beta5 * carry_want
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, None, "x", "y"),) * 2 + (P(None, "x", "y"),),
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_scan_carry(a_stack, b_stack, c0):
+        def body(carry, ab):
+            a, b = ab
+            return plan_beta2.local_call(a, b, C=carry), None
+        final_carry, _ = jax.lax.scan(body, c0, (a_stack, b_stack), unroll=1)
+        return final_carry
+
+    D_carry = _gather(jax.jit(_manual_scan_carry, donate_argnums=(2,))(
+        A_stack, B_stack, _put(C0_np, mesh, (None, "x", "y"))))
+    out["manual_scan_carry_donation"] = _rel(D_carry, carry_want)
+    assert (out["manual_scan_carry_donation"] < RTOL
+           ), out["manual_scan_carry_donation"]
 
     return out
 
