@@ -903,6 +903,219 @@ def static_slab_photon_head_moment_chunk(
         jnp.asarray(n_valid, dtype=jnp.int32))
 
 
+@dataclass(frozen=True)
+class StaticSlabPhotonHeadCompletion:
+    """Small evidence record for one coupled slab q=0 reconstruction."""
+
+    bare_D_mean: np.ndarray
+    screened_moments: np.ndarray
+    samples_per_replicate: tuple[int, ...]
+    max_dyson_relative_residual: float
+    estimator: str = "vcoul_minibz_equal_replicate_mean_v1"
+
+
+_STATIC_PHOTON_DYSON_RESIDUAL_MAX = 1.0e-8
+
+
+def complete_static_slab_photon_q0(
+    V_packed: jax.Array,
+    W_packed: jax.Array,
+    coefficients,
+    g0_X: jax.Array,
+    g0_Y: jax.Array,
+    photon_sample_chunks,
+    *,
+    cell_volume: float,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    r"""Complete bare and screened packed photon operators in the Γ cell.
+
+    ``photon_sample_chunks`` is the sole vcoul provider's streamed slab
+    output.  Each sample first solves the coupled four-field head Dyson
+    equation; only its ``(1,qx,qy)`` moments survive.  The packed body is
+    then updated by one bare and nine screened rank-four outer products.
+    No sample-by-centroid tensor or second photon packing convention exists.
+    """
+    from .photon_layout import (
+        MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
+
+    layout = coefficients.layout
+    layout.assert_mesh(mesh_xy)
+    packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
+                    layout.packed_extent)
+    if (tuple(V_packed.shape) != packed_shape
+            or tuple(W_packed.shape) != packed_shape):
+        raise ValueError(
+            "coupled photon head requires equal packed V/W bodies; got "
+            f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
+    if tuple(coefficients.H_direct.shape) != (2, 4, 4):
+        raise ValueError(
+            f"photon H_direct must be (2,4,4); got "
+            f"{coefficients.H_direct.shape}")
+    if tuple(coefficients.Q_direct.shape) != (2, 2, 4, 4):
+        raise ValueError(
+            f"photon Q_direct must be (2,2,4,4); got "
+            f"{coefficients.Q_direct.shape}")
+    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+    if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
+        raise ValueError(
+            f"packed Γ vectors must both be {factor_shape}; got "
+            f"{g0_X.shape}/{g0_Y.shape}")
+    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
+        raise ValueError(f"cell_volume must be positive; got {cell_volume}")
+
+    # The headless Gamma body remains resident and 2-D sharded.  Four calls
+    # reuse the sole bounded Schur-fold graph; broadcasting W over the two
+    # coordinate axes would create four body views in one executable.
+    W_gamma = W_packed[0]
+    Q_effective = coefficients.Q_direct
+    for a in range(2):
+        for b in range(2):
+            folded = fold_small_head_wings_sharded(
+                coefficients.Q_direct[a, b],
+                coefficients.Y_x[a], W_gamma, coefficients.Z_y[b],
+                float(cell_volume), mesh_xy=mesh_xy)
+            Q_effective = Q_effective.at[a, b].set(folded)
+    YW_y, WZ_x = small_head_wing_halves_sharded(
+        coefficients.Y_x, W_gamma, coefficients.Z_y, mesh_xy=mesh_xy)
+    jax.block_until_ready((Q_effective, YW_y, WZ_x))
+
+    # Finish one Sobol replicate before starting the next.  This preserves
+    # the provider's equal-replicate estimator rather than weighting a short
+    # or padded tail as another draw.
+    per_rep_moments = []
+    per_rep_D = []
+    samples_per_rep = []
+    current_rep = None
+    expected_start = 0
+    moment_sum = D_sum = residual_max = None
+    count_sum = 0
+
+    def _finish_replicate():
+        if current_rep is None:
+            return
+        if count_sum <= 0:
+            raise ValueError(
+                f"photon mini-BZ replicate {current_rep} has no samples")
+        moment_host, D_host, residual_host = jax.device_get(
+            (moment_sum, D_sum, residual_max))
+        per_rep_moments.append(
+            np.asarray(moment_host, dtype=np.complex128) / float(count_sum))
+        per_rep_D.append(
+            np.asarray(D_host, dtype=np.complex128) / float(count_sum))
+        samples_per_rep.append(int(count_sum))
+        return float(np.asarray(residual_host))
+
+    residual_per_rep = []
+    for item in photon_sample_chunks:
+        if len(item) != 8:
+            raise ValueError(
+                "vcoul photon sample chunks must have eight fields")
+        rep, start, stop, q_cart, D_raw, valid_count, mc_weight, analytic_D = item
+        rep, start, stop = int(rep), int(start), int(stop)
+        n_valid = int(valid_count)
+        if current_rep is None or rep != current_rep:
+            if current_rep is not None:
+                value = _finish_replicate()
+                residual_per_rep.append(value)
+                if rep != current_rep + 1:
+                    raise ValueError(
+                        "vcoul photon replicate indices must be contiguous; "
+                        f"got {current_rep} then {rep}")
+            current_rep = rep
+            expected_start = 0
+            moment_sum = D_sum = residual_max = None
+            count_sum = 0
+        if start != expected_start or stop - start != n_valid:
+            raise ValueError(
+                "vcoul photon chunks must be contiguous and valid_count must "
+                f"equal stop-start; rep={rep}, start/expected={start}/"
+                f"{expected_start}, stop={stop}, valid={n_valid}")
+        expected_start = stop
+
+        q_host = np.asarray(q_cart, dtype=np.float64)
+        weight = np.asarray(mc_weight, dtype=np.float64)
+        analytic = np.asarray(analytic_D)
+        if (np.any(q_host[:n_valid, 2] != 0.0)
+                or np.any(weight[:n_valid] != 1.0)
+                or np.any(weight[n_valid:] != 0.0)
+                or np.any(analytic != 0.0)):
+            raise ValueError(
+                "coupled photon q0 completion currently accepts only the "
+                "slab estimator (qz=0, unit valid weights, no 3-D analytic "
+                "sphere addend)")
+        moments, bare_sum, returned_count, residual = (
+            static_slab_photon_head_moment_chunk(
+                q_host, D_raw, coefficients.H_direct, Q_effective, n_valid))
+        if int(np.asarray(returned_count)) != n_valid:
+            raise RuntimeError(
+                "static photon head moment kernel changed valid_count")
+        moment_sum = moments if moment_sum is None else moment_sum + moments
+        D_sum = bare_sum if D_sum is None else D_sum + bare_sum
+        residual_max = (residual if residual_max is None
+                        else jnp.maximum(residual_max, residual))
+        count_sum += n_valid
+
+    if current_rep is None:
+        raise ValueError("vcoul photon sample provider yielded no chunks")
+    residual_per_rep.append(_finish_replicate())
+    D_mean = np.mean(np.stack(per_rep_D, axis=0), axis=0)
+    moments_mean = np.mean(np.stack(per_rep_moments, axis=0), axis=0)
+    max_residual = float(max(residual_per_rep))
+    if (not np.all(np.isfinite(D_mean))
+            or not np.all(np.isfinite(moments_mean))
+            or not np.isfinite(max_residual)):
+        raise ValueError("coupled photon mini-BZ average is non-finite")
+    if max_residual > _STATIC_PHOTON_DYSON_RESIDUAL_MAX:
+        raise ValueError(
+            "coupled photon mini-BZ Dyson solve failed its relative-residual "
+            f"gate: {max_residual:.3e} > "
+            f"{_STATIC_PHOTON_DYSON_RESIDUAL_MAX:.1e}")
+
+    dtype = V_packed.dtype
+    sh_x = NamedSharding(mesh_xy, P(None, "x"))
+    sh_y = NamedSharding(mesh_xy, P(None, "y"))
+    volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
+    with mesh_xy:
+        left_bare = jax.lax.with_sharding_constraint(
+            jnp.conj(g0_X).astype(dtype), sh_x)
+        right_bare = jax.lax.with_sharding_constraint(
+            jnp.einsum(
+                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
+                optimize=True) / volume,
+            sh_y)
+    V_packed = add_photon_q0_low_rank(
+        V_packed, layout, mesh_xy,
+        left_rows_X=left_bare, right_rows_Y=right_bare)
+
+    left_basis = (
+        left_bare,
+        jax.lax.with_sharding_constraint(jnp.swapaxes(WZ_x[0], 0, 1), sh_x),
+        jax.lax.with_sharding_constraint(jnp.swapaxes(WZ_x[1], 0, 1), sh_x),
+    )
+    right_basis = (g0_Y, YW_y[0], YW_y[1])
+    for u in range(3):
+        for v in range(3):
+            with mesh_xy:
+                right_rows = jax.lax.with_sharding_constraint(
+                    jnp.einsum(
+                        "AB,Bj->Aj",
+                        jnp.asarray(moments_mean[u, v], dtype=dtype),
+                        right_basis[v], optimize=True) / volume,
+                    sh_y)
+            W_packed = add_photon_q0_low_rank(
+                W_packed, layout, mesh_xy,
+                left_rows_X=left_basis[u], right_rows_Y=right_rows)
+
+    evidence = StaticSlabPhotonHeadCompletion(
+        bare_D_mean=D_mean,
+        screened_moments=moments_mean,
+        samples_per_replicate=tuple(samples_per_rep),
+        max_dyson_relative_residual=max_residual,
+    )
+    return V_packed, W_packed, evidence
+
+
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
                         sym=None, meta=None, params=None, print_fn=print):
     """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it.
