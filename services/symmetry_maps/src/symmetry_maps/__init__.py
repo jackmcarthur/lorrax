@@ -4,7 +4,8 @@ Everything LORRAX knows about the space group of a deck, in one package:
 the k-grid reduction and the IBZ⇄full-BZ tables (:class:`SymMaps`), the
 band-index k-star map (:class:`KStarMap` and the ``star_*`` helpers), the
 sharded q-axis unfolds (:func:`unfold_isdf_operator`,
-:func:`mix_channels_by_proper_rotation`), the ψ-unfold antiunitary rule
+:func:`unfold_isdf_one_leg`, :func:`mix_channels_by_proper_rotation`),
+the ψ-unfold antiunitary rule
 (:func:`unfold_psi`, :func:`spinor_rotation_for_sym_row`,
 :func:`tau_phase_row`), the real-space orbit machinery the ISDF
 quadrature is built on (:func:`real_space_action_tables`,
@@ -82,10 +83,12 @@ The surface
     writer never holds ``kirr_fullids``.  Pure selection.  NOT the exact
     inverse of the file-wedge unfold — see its docstring.  There is no
     star-wedge twin because that is ``star_select``.
-``unfold_isdf_operator`` / ``mix_channels_by_proper_rotation`` /
-``slice_q_full_to_ibz``
-    The sharded q-axis unfolds, ``shard_map`` over an ``('x','y')`` mesh
-    with a 1× single-tile memory contract.
+``unfold_isdf_operator`` / ``unfold_isdf_one_leg`` /
+``mix_channels_by_proper_rotation`` / ``slice_q_full_to_ibz``
+    The sharded q-axis actions.  The one-leg action owns exact parent-G
+    relabelling and scalar/polar component transport without materialising a
+    full-zone G-sphere; the bilinear actions keep their 1× single-tile memory
+    contract on an ``('x','y')`` mesh.
 ``unfold_psi`` / ``spinor_rotation_for_sym_row`` / ``tau_phase_row``
     The ψ-unfold rule, and the single sources of the spinor TRS
     augmentation and the τ phase.
@@ -204,6 +207,7 @@ from symmetry_maps.maps import (
     spinor_rotation_for_sym_row,
     unfold_psi,
     unfold_isdf_operator,
+    unfold_isdf_one_leg,
     mix_channels_by_proper_rotation,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
@@ -278,7 +282,7 @@ __all__ = [
     "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
-    "slice_q_full_to_ibz", "unfold_isdf_operator",
+    "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "tau_phase_row",

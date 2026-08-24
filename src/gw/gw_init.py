@@ -39,7 +39,6 @@ from .gw_config import (
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
-	uses_coupled_photon_head,
 )
 
 # ── The ζ file's DOOR ────────────────────────────────────────────────────
@@ -447,7 +446,8 @@ def _same_wfn_file(old_path, new_path, *, old_bytes=None, new_bytes=None):
 
 
 def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
-                   print_fn=print, *, n_rmu_expected=None):
+                   print_fn=print, *, n_rmu_expected=None,
+                   q_irr_is_full_identity=False):
 	"""Can we skip the ζ fit and reuse ``zeta_h5_path`` as-is?
 
 	Returns ``True`` only when EVERY one of these holds:
@@ -556,6 +556,25 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 					print_fn(f"    [zeta reuse] {zeta_h5_path} was fit from a "
 					         f"DIFFERENT WFN — {_why} — refitting.")
 					return False
+			# A q-IBZ REQUEST over the exact identity q table writes the same
+			# rows, in the same order, as the historical full-BZ request.  Run20
+			# was stamped ``write_ibz_only=false`` before the coupled-head
+			# exception was removed; a new run correctly records the requested
+			# ``true``.  Accept exactly that old-false/new-true difference only
+			# when the caller has proved ``q_irr_full_idx == irr_idx_q ==
+			# arange(nq)`` and the parent q table equals the full q table.  This
+			# is a diagnosed storage equivalence, not an ignored provenance key.
+			if (q_irr_is_full_identity
+					and diff == ['write_ibz_only']
+					and old.get('write_ibz_only') is False
+					and new.get('write_ibz_only') is True):
+				print_fn(
+					f"    [zeta reuse] {zeta_h5_path}: on-disk provenance "
+					"records write_ibz_only=false while this run requests true, "
+					"but SymMaps proves the q-IBZ is the full identity q table; "
+					"the stored q rows and order are identical, so reuse is "
+					"allowed without mutating the artifact.")
+				diff.remove('write_ibz_only')
 			detail = "; ".join(
 				[f"{k}: on-disk={old.get(k)!r} now={new.get(k)!r}"
 				 for k in diff]
@@ -1436,20 +1455,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# were converted together — a knob with two grammars is worse than one
 	# with a single wrong grammar, because then the failure depends on
 	# which code path reads it first.
-	# A coupled four-current head needs canonical one-leg G=0 vectors for
-	# C,T1,T2,T3.  The symmetry service does not yet own the transverse
-	# one-leg IBZ rotation, so resolve the full-BZ producer from the physical
-	# mode before either charge or transverse fitting starts.  This does not
-	# disable symmetry reduction in the later screening calculation.
-	_coupled_photon_head = uses_coupled_photon_head(cfg)
 	_force_full_bz_fit = env_bool(
 		'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
-	_write_ibz_only_charge = not (
-		_coupled_photon_head or _force_full_bz_fit)
-	if _coupled_photon_head:
-		print_fn(
-			"    coupled photon head: fitting charge/transverse zeta on "
-			"the full BZ for canonical C,T1,T2,T3 G=0 vectors")
+	_write_ibz_only_charge = not _force_full_bz_fit
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
@@ -1626,15 +1634,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
 		for mu_L in (1, 2, 3)
 	}
+	_q_irr_identity = bool(sym.q_irr_is_full_identity)
 	_reuse = _zeta_reuse_ok(
 		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn,
-		n_rmu_expected=int(meta.n_rmu))
+		n_rmu_expected=int(meta.n_rmu),
+		q_irr_is_full_identity=_q_irr_identity)
 	if _reuse and cfg.bispinor:
 		for mu_L, _zeta_T_path in _zeta_T_paths.items():
 			if not _zeta_reuse_ok(
 					_zeta_T_path, _provenance_T(mu_L), _cent_T_idx,
 					print_fn=print_fn,
-					n_rmu_expected=int(_meta_T.n_rmu)):
+					n_rmu_expected=int(_meta_T.n_rmu),
+					q_irr_is_full_identity=_q_irr_identity):
 				print_fn(
 					f"    [zeta reuse] the transverse ζ for μ_L={mu_L} "
 					f"({_zeta_T_path}) is NOT reusable, so the charge ζ is "
@@ -2197,21 +2208,9 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# ANNOUNCES it once per centroid set — the charge and the
 		# transverse set are separate facts and get separate lines.
 		# It used to fall back SILENTLY; see gw/qgrid_symmetry.py.
-		# The coupled photon q->0 reconstruction consumes the canonical G=0
-		# vector from all four Lorentz channels.  The IBZ V producer deliberately
-		# persists only the charge-channel G=0 vector, so this one producer must
-		# run on the full BZ when the coupled head is requested.  This is not the
-		# broad LORRAX_FORCE_FULL_BZ debug dial: screening and every other symmetry
-		# reduction keep their configured production route.
-		_coupled_photon_head = uses_coupled_photon_head(cfg)
 		_force_full_bz_v = env_bool(
 			'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
-		_use_ibz_bispinor = not (
-			_coupled_photon_head or _force_full_bz_v)
-		if _coupled_photon_head:
-			print_fn(
-				"  [bispinor] head_correction=full: using the canonical "
-				"full-BZ V/g0 producer so C,T1,T2,T3 Gamma vectors are present")
+		_use_ibz_bispinor = not _force_full_bz_v
 		if _use_ibz_bispinor:
 			_cents_curr_path = cfg.paths.centroids_file_current
 			_, _cent_T_idx_np, _ = _load_centroids(

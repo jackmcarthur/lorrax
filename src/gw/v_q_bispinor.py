@@ -283,10 +283,10 @@ def compute_V_q_bispinor_g_flat_to_h5(
     is just the 7-tile loop + per-tile HDF5 plumbing.
 
     Each centroid family follows its resolved full-BZ/IBZ path.  Diagonal
-    one-leg g0 vectors are persisted for all four channels on full BZ.
-    Charge retains its existing scalar IBZ unfold; transverse g0 is stamped
-    unavailable under IBZ until the symmetry service owns its one-leg
-    Cartesian rotation.
+    one-leg g0 vectors are persisted for all four channels on the full q
+    grid.  On an IBZ source, the symmetry service reconstructs the exact
+    parent G coefficient and applies the scalar or polar-vector action; the
+    writer owns no q map, centroid action or Cartesian rotation.
 
     The reader :class:`BispinorVqReader` opens this on-disk format.
     """
@@ -343,6 +343,22 @@ def compute_V_q_bispinor_g_flat_to_h5(
     _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')
     _ibz_T, _use_ibz_T = _ibz_tables_for(centroid_T_idx, 'transverse')
 
+    # ONE measured q-row policy for every bispinor consumer: CC, TT operator
+    # mixing and all four one-leg vectors.  In particular, a ferromagnet's
+    # policy contains no antiunitary rows; no tile may fall back to the raw
+    # ``sym.sym_idx_q`` table and take a second TRS decision.
+    qgrid_policy = None
+    if (_use_ibz_C or _use_ibz_T) and sym is not None:
+        from .qgrid_symmetry import qgrid_trs_policy_for
+        qgrid_policy = qgrid_trs_policy_for(
+            sym=sym,
+            irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
+            sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            kgrid=tuple(kgrid),
+            n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]),
+            context="bispinor V / one-leg",
+        )
+
     # Buffer the 6 unique TT tiles post-unfold so we can apply the 3×3
     # Lorentz mixing across them before writing.  CC tile streams straight
     # to disk — no mixing.  Decision: write-time mixing keeps the on-disk
@@ -353,6 +369,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # mixing keeps the reader's per-tile contract clean.  See derivation
     # §A5 (the algebraic identity for V^{i,j}_full[q]).
     tt_buffer: dict[tuple[int, int], jax.Array] = {}
+    tt_g0 = None
 
     for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
         same_zeta = (mu_L == nu_L)
@@ -363,12 +380,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
         n_rmu_L = n_rmu_C if mu_L == 0 else n_rmu_T
         n_rmu_R = n_rmu_C if nu_L == 0 else n_rmu_T
         is_CC = (mu_L == 0 and nu_L == 0)
-        # g0 is a one-leg ζ coefficient, so diagonal tiles are its sole
-        # canonical producer.  Charge already has a scalar IBZ unfold;
-        # transverse IBZ needs a one-leg Cartesian channel rotation that the
-        # symmetry service does not yet expose.  Full-BZ diagonal T tiles
-        # need no rotation and stream g0 beside their existing tile.
-        write_g0 = same_zeta and (is_CC or not _use_ibz_T)
+        # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
+        # producer.  On the transverse IBZ path each streamed source
+        # component returns its contributions to all three target Cartesian
+        # channels; only those three small carriers are accumulated.
+        write_g0 = same_zeta
 
         # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
         # centroid orbit closure.  These are independent; either may
@@ -419,9 +435,22 @@ def compute_V_q_bispinor_g_flat_to_h5(
             g_chunk=g_chunk,
             sym=_tile_sym, centroid_indices=_tile_cent,
             write_g0=write_g0,
+            qgrid_policy=qgrid_policy,
+            one_leg_action=(
+                "polar" if (same_zeta and mu_L != 0 and _tile_use_ibz)
+                else "scalar"),
+            source_component=(
+                mu_L - 1 if (same_zeta and mu_L != 0 and _tile_use_ibz)
+                else None),
             timing_label=tile_dataset_name(mu_L, nu_L),
             verbose=verbose,
         )
+
+        if (same_zeta and mu_L != 0 and _use_ibz_T
+                and g0_acc is not None):
+            tt_g0 = g0_acc if tt_g0 is None else tt_g0 + g0_acc
+            del g0_acc
+            g0_acc = None
 
         if is_CC or not _use_ibz_T:
             # Two cases stream straight to disk per-tile:
@@ -471,7 +500,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
         tt_mixed = mix_channels_by_proper_rotation(
             tt_full_in,
-            sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            sym_idx=np.asarray(
+                qgrid_policy.unfold_sym_idx, dtype=np.int32),
             R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),
             mesh_xy=mesh_xy,
         )
@@ -488,8 +518,19 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_mix.dtype)
                 tile_io.write_slab(name, V_mix)
+                if mu_L == nu_L:
+                    if tt_g0 is None:
+                        raise RuntimeError(
+                            "bispinor transverse IBZ one-leg accumulation "
+                            "is missing despite three diagonal source tiles.")
+                    g0_mix = tt_g0[mu_L - 1]
+                    tile_io.create_dataset(
+                        f"{name}_g0",
+                        shape=(int(g0_mix.shape[0]), n_rmu_T),
+                        dtype=g0_mix.dtype)
+                    tile_io.write_slab(f"{name}_g0", g0_mix)
         del tt_full_in, tt_mixed
-    del tt_buffer
+    del tt_buffer, tt_g0
 
     # Format string + tile-layout JSON — rank-0 post-close write so
     # the BispinorVqReader can h5-open without rank coordination.
@@ -503,9 +544,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 [list(t) for t in sorted(ZERO_TILES)])
             f.attrs["hermitian_pairs"] = json.dumps(
                 [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
-            f.attrs[G0_CHANNEL_PROVENANCE_ATTR] = (
-                G0_TRANSVERSE_IBZ_UNAVAILABLE_V1 if _use_ibz_T
-                else G0_DIAGONAL_FULL_BZ_V1)
+            f.attrs[G0_CHANNEL_PROVENANCE_ATTR] = G0_DIAGONAL_FULL_BZ_V1
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
     return output_h5_path
 
@@ -656,11 +695,11 @@ class BispinorVqReader:
     def get_g0(self, mu_L: int) -> jax.Array | None:
         """Read diagonal-channel ``ζ(q,μ,G=0)`` as ``P(None,'x')``.
 
-        The returned shape is ``(n_q_total, n_μ_padded)``.  Charge remains
+        The returned shape is ``(n_q_total, n_mu_padded)``.  Charge remains
         backward-compatible with legacy files and returns ``None`` when its
-        dataset is absent.  A missing transverse vector refuses explicitly:
-        under the stamped IBZ path it requires a one-leg Cartesian rotation
-        that is intentionally not reimplemented outside the symmetry service.
+        dataset is absent.  The named transverse-IBZ refusal is retained only
+        for files written before the symmetry service acquired the canonical
+        one-leg action.
         """
         if not 0 <= int(mu_L) < 4:
             raise ValueError(
