@@ -400,7 +400,8 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
         wedge = compute_wc_qwedge(
             tensors_filename, z, mesh_xy, include_w=include_w,
             gmres_tol=tol, gmres_max_iter=_GMRES_MAX_ITER,
-            input_file=input_file)
+            input_file=input_file,
+            route=__import__('os').environ.get('LX_DIAG_LADDER_ROUTE', 'auto'))
     resid = _wedge_field(wedge, _RESIDUAL_FIELDS, np.float64)
     iters = _wedge_field(wedge, _ITERATION_FIELDS, np.int64)
     # AN ABSENT RESIDUAL IS A REFUSAL, NOT A SKIPPED CHECK.  "no residuals
