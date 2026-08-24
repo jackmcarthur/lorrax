@@ -612,6 +612,369 @@ def _get_unfold_isdf_operator_jit(
     return _do_unfold
 
 
+def unfold_isdf_one_leg(
+    zeta_ibz,
+    *,
+    gvec_components=None,
+    source_gvec_components=None,
+    sym,
+    sym_idx,
+    sym_perm,
+    L_table,
+    q_irr_frac,
+    kgrid,
+    mesh_xy,
+    component_action,
+    source_component=None,
+):
+    r"""Transport one ISDF Fourier leg from the q-IBZ to the full q grid.
+
+    This is the one-leg companion to :func:`unfold_isdf_operator`.  It
+    normally consumes the stored q-IBZ G-sphere rather than an
+    already-selected ``G=0`` column, because under a star operation the
+    full-zone literal ``G=0`` coefficient can come from a *nonzero* parent
+    Miller vector::
+
+        q_full = S_full (q_parent + G_parent).
+
+    For target centroid ``mu`` the scalar action is
+
+    .. math::
+
+       z_{q,\mu}(0) = e^{-i(S K_p)\cdot t_s}
+                       e^{-2\pi i q_p\cdot L_{s\mu}}
+                       z_{p,\alpha_s(\mu)}(G_p),
+
+    followed by conjugation of the complete spatial result on an
+    antiunitary row.  ``alpha`` is the *source* map returned by
+    :func:`centroid_source_map_and_wrap`; it is used directly, never
+    inverted.  ``t_s`` is raw BGW ``tnp = 2*pi*tau``.  The tau factor is
+    formed with the spatial row and conjugated with the rest of the result
+    under time reversal, matching :func:`unfold_psi`.
+
+    ``component_action='scalar'`` returns that scalar leg.  The ``'polar'``
+    action takes one streamed source Cartesian component and returns its
+    contributions to all three target components using exactly the named
+    ``SymMaps.R_cart_forward`` column.  Its TRS-augmented row already carries
+    the single time-reversal minus for a polar current; no second parity sign
+    is applied.  Summing the three calls with ``source_component=0,1,2`` is
+    the full vector action, while only one large zeta slab is resident.
+
+    ``sym_idx`` is deliberately explicit: callers must pass the measured
+    :class:`QgridTrsPolicy`'s ``unfold_sym_idx``.  This function never falls
+    back to ``sym.sym_idx_q`` and therefore cannot take a second opinion on
+    which antiunitary rows are legal.
+
+    Parameters
+    ----------
+    zeta_ibz
+        ``(n_q_ibz, n_mu, ngkmax)`` complex, sharded
+        ``P(None, ('x','y'), None)``.
+    gvec_components
+        ``(n_q_ibz, 3, ngkmax)`` integer Miller vectors for ``zeta_ibz``.
+        Required for the rank-3 literal-G=0 form.
+    source_gvec_components
+        Optional ``(n_q_ibz,3)`` source Miller vector when ``zeta_ibz`` is
+        an already-selected rank-2 one-leg carrier.  This is used by the
+        tied Coulomb-head columns: the service still owns every symmetry
+        action and tau phase, while the producer owns which physical source
+        column it selected.  Exactly one of this and ``gvec_components`` is
+        used, selected by the rank of ``zeta_ibz``.
+    sym
+        :class:`SymMaps`; owns the q/star maps, reciprocal actions,
+        translations and Cartesian rotations.
+    sym_idx
+        ``(n_q_full,)`` rows from ``QgridTrsPolicy.unfold_sym_idx``.
+    sym_perm, L_table, q_irr_frac, kgrid
+        The same centroid source-map, lattice-wrap and parent-q tables used
+        by :func:`unfold_isdf_operator`; ``kgrid`` is explicit rather than
+        invented as state on :class:`SymMaps`.
+    component_action
+        ``'scalar'`` or ``'polar'``.
+    source_component
+        Required for ``'polar'``; source Cartesian component in ``0..2``.
+
+    Returns
+    -------
+    jax.Array
+        Scalar: ``(n_q_full, n_mu)`` under ``P(None,'x')``.  Polar source
+        contribution: ``(3, n_q_full, n_mu)`` under
+        ``P(None,None,'x')``.
+    """
+    action = str(component_action).strip().lower()
+    if action not in ("scalar", "polar"):
+        raise ValueError(
+            "unfold_isdf_one_leg: component_action must be 'scalar' or "
+            f"'polar'; got {component_action!r}.")
+    if action == "scalar":
+        if source_component is not None:
+            raise ValueError(
+                "unfold_isdf_one_leg: source_component is only meaningful "
+                "for component_action='polar'.")
+        source = -1
+    else:
+        if source_component is None or int(source_component) not in (0, 1, 2):
+            raise ValueError(
+                "unfold_isdf_one_leg: polar action requires "
+                "source_component in {0,1,2}.")
+        source = int(source_component)
+
+    zshape = tuple(int(v) for v in zeta_ibz.shape)
+    preselected = len(zshape) == 2
+    if len(zshape) not in (2, 3):
+        raise ValueError(
+            "unfold_isdf_one_leg: zeta_ibz must be a rank-3 G-sphere or "
+            f"rank-2 preselected carrier; got {zshape}.")
+    if preselected:
+        if gvec_components is not None:
+            raise ValueError(
+                "unfold_isdf_one_leg: rank-2 preselected input takes "
+                "source_gvec_components, not a G-sphere table.")
+        source_gvec = np.asarray(source_gvec_components, dtype=np.int32)
+        if source_gvec.shape != (zshape[0], 3):
+            raise ValueError(
+                "unfold_isdf_one_leg: source_gvec_components must have "
+                f"shape ({zshape[0]},3); got {source_gvec.shape}.")
+        gvec = None
+        n_mu = zshape[1]
+    else:
+        if source_gvec_components is not None:
+            raise ValueError(
+                "unfold_isdf_one_leg: rank-3 G-sphere input determines its "
+                "exact source G internally; do not pass source_gvec_components.")
+        gvec = np.asarray(gvec_components, dtype=np.int32)
+        if gvec.shape != (zshape[0], 3, zshape[2]):
+            raise ValueError(
+                "unfold_isdf_one_leg: gvec_components must have shape "
+                f"({zshape[0]}, 3, {zshape[2]}); got {gvec.shape}.")
+        source_gvec = None
+        n_mu = zshape[1]
+
+    q_full_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    grid = np.asarray(kgrid, dtype=np.int64).reshape(3)
+    q_parent_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
+    n_q_full = int(np.prod(grid))
+    if q_full_int.shape != (n_q_full, 3):
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.kvecs_asints disagrees with its "
+            f"kgrid {tuple(grid)}; got {q_full_int.shape}.")
+    idx = np.asarray(sym.irr_idx_q, dtype=np.int32)
+    rows = np.asarray(sym_idx, dtype=np.int32)
+    if idx.shape != (n_q_full,) or rows.shape != (n_q_full,):
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.irr_idx_q and policy sym_idx must "
+            f"both have shape ({n_q_full},); got {idx.shape}, {rows.shape}.")
+    if int(q_parent_int.shape[0]) != zshape[0]:
+        raise ValueError(
+            "unfold_isdf_one_leg: zeta q extent does not match the SymMaps "
+            f"q-IBZ ({zshape[0]} != {int(q_parent_int.shape[0])}).")
+
+    def _bgw_frac(q_int):
+        q = np.asarray(q_int, dtype=np.float64)
+        wrapped = np.where(q > grid[None, :] / 2.0,
+                           q - grid[None, :], q)
+        return wrapped / grid[None, :]
+
+    q_parent = np.asarray(q_irr_frac, dtype=np.float64)
+    q_parent_expected = _bgw_frac(q_parent_int)
+    if q_parent.shape != q_parent_expected.shape or not np.allclose(
+            q_parent, q_parent_expected, rtol=0.0, atol=1e-12):
+        raise ValueError(
+            "unfold_isdf_one_leg: q_irr_frac is not the BGW-wrapped "
+            "SymMaps.q_irr_kgrid_int table; the zeta G labels and the star "
+            "map would describe different parent momenta.")
+    q_full = _bgw_frac(q_full_int)
+
+    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    if S_all.shape[0] != 2 * n_spatial:
+        raise ValueError(
+            "unfold_isdf_one_leg: SymMaps.sym_mats_k must contain spatial "
+            "and TRS-augmented halves.")
+    if np.any(rows < 0) or np.any(rows >= S_all.shape[0]):
+        raise ValueError(
+            "unfold_isdf_one_leg: policy sym_idx contains a row outside "
+            f"[0,{S_all.shape[0]}).")
+
+    perm = np.asarray(sym_perm, dtype=np.int32)
+    wraps = np.asarray(L_table, dtype=np.float64)
+    if perm.shape != (S_all.shape[0], n_mu):
+        raise ValueError(
+            "unfold_isdf_one_leg: sym_perm must cover every augmented row "
+            f"and zeta centroid, expected {(S_all.shape[0], n_mu)}, "
+            f"got {perm.shape}.")
+    if wraps.shape != (S_all.shape[0], n_mu, 3):
+        raise ValueError(
+            "unfold_isdf_one_leg: L_table must have shape "
+            f"{(S_all.shape[0], n_mu, 3)}; got {wraps.shape}.")
+
+    # Literal target G=0 may be a nonzero parent G.  Build that exact
+    # relabel once on the host from the service-owned star rows, then make
+    # the device operation a pair of gathers plus phases.
+    source_slot = np.empty(n_q_full, dtype=np.int32)
+    tau_spatial = np.empty(n_q_full, dtype=np.complex128)
+    translations = np.asarray(sym.translations, dtype=np.float64)
+    for iq in range(n_q_full):
+        s = int(rows[iq])
+        p = int(idx[iq])
+        S_full = S_all[s]
+        S_inv = np.rint(np.linalg.inv(S_full)).astype(np.int64)
+        if not np.array_equal(S_full @ S_inv, np.eye(3, dtype=np.int64)):
+            raise ValueError(
+                f"unfold_isdf_one_leg: symmetry row {s} is not unimodular.")
+        if preselected:
+            G_parent = source_gvec[p]
+            source_slot[iq] = 0
+            # A preselected carrier need not land at literal target G=0
+            # (the tied Coulomb-head columns are an unordered invariant
+            # set), but it must still land on an integer reciprocal label
+            # at this target q.  Refuse a carrier/table mismatch rather than
+            # silently attaching the transformed column to the wrong q row.
+            G_target_f = S_full @ (q_parent[p] + G_parent) - q_full[iq]
+            G_target = np.rint(G_target_f).astype(np.int32)
+            if not np.allclose(
+                    G_target_f, G_target, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "unfold_isdf_one_leg: preselected parent q+G does not "
+                    f"map to an integer target G at full q {iq}: "
+                    f"parent={p}, sym={s}, G_target={G_target_f.tolist()}.")
+        else:
+            K_parent = S_inv @ q_full[iq]
+            G_parent_f = K_parent - q_parent[p]
+            G_parent = np.rint(G_parent_f).astype(np.int32)
+            if not np.allclose(G_parent_f, G_parent, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "unfold_isdf_one_leg: exact q/G relabel failed at full q "
+                    f"{iq}: parent={p}, sym={s}, "
+                    f"G_parent={G_parent_f.tolist()}.")
+            if not np.allclose(S_full @ (q_parent[p] + G_parent), q_full[iq],
+                               rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "unfold_isdf_one_leg: reconstructed parent q+G does not "
+                    f"map to literal full-zone G=0 at q {iq}.")
+            hits = np.flatnonzero(np.all(
+                gvec[p].T == G_parent[None, :], axis=1))
+            if hits.size != 1:
+                raise ValueError(
+                    "GATE isdf_one_leg_parent_g: literal full-zone G=0 at "
+                    f"q={iq} requires parent q={p}, G={G_parent.tolist()}, "
+                    f"but the stored zeta sphere contains {int(hits.size)} "
+                    "exact matches.  Increase zeta_cutoff_ry if it is "
+                    "missing; a one-leg coefficient cannot be reconstructed "
+                    "from parent G=0 alone.")
+            source_slot[iq] = int(hits[0])
+
+        # Spatial tau phase first; the device conjugates this together with
+        # zeta and the L phase on antiunitary rows.  This is the same ordering
+        # as unfold_psi and makes exp[-i(S Kp).tnp] -> its conjugate there.
+        s_spatial = s % n_spatial
+        S_spatial = S_all[s_spatial]
+        phase = tau_phase_row(
+            S_spatial, translations[s_spatial],
+            (q_parent[p] + G_parent)[None, :])
+        tau_spatial[iq] = 1.0 if phase is None else phase[0]
+
+    trs = rows >= n_spatial
+    q_per_full = q_parent[idx]
+    L_per_full = wraps[rows]
+    qL = np.einsum('qi,qmi->qm', q_per_full, L_per_full)
+    one_leg_phase = (tau_spatial[:, None]
+                     * np.exp(-2j * np.pi * qL))
+    R_column = None
+    if action == "polar":
+        R = np.asarray(sym.R_cart_forward, dtype=np.float64)
+        if R.shape != (S_all.shape[0], 3, 3):
+            raise ValueError(
+                "unfold_isdf_one_leg: SymMaps.R_cart_forward has shape "
+                f"{R.shape}, expected {(S_all.shape[0], 3, 3)}.")
+        R_column = R[rows, :, source]
+
+    fn = _get_unfold_isdf_one_leg_jit(
+        zeta_shape=zshape, idx=idx, rows=rows, perm=perm,
+        trs=trs, preselected=preselected, action=action, mesh_xy=mesh_xy)
+    slot_sh = NamedSharding(mesh_xy, P(None))
+    phase_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    source_slot_dev = jax.device_put(source_slot, slot_sh)
+    one_leg_phase_dev = jax.device_put(one_leg_phase, phase_sh)
+    if action == "scalar":
+        return fn(zeta_ibz, source_slot_dev, one_leg_phase_dev)
+    R_sh = NamedSharding(mesh_xy, P(None, None))
+    return fn(
+        zeta_ibz, source_slot_dev, one_leg_phase_dev,
+        jax.device_put(np.asarray(R_column), R_sh))
+
+
+_UNFOLD_ISDF_ONE_LEG_JIT_CACHE: dict = {}
+
+
+def _get_unfold_isdf_one_leg_jit(
+    *, zeta_shape, idx, rows, perm, trs, preselected, action, mesh_xy,
+):
+    """Content-keyed one-leg action shared by all streamed source legs.
+
+    The source G slot and its phase are runtime operands on purpose: tied
+    head columns differ only in those two small tables and must not create a
+    separate compiled module per column.
+    """
+    key = (
+        tuple(zeta_shape), idx.tobytes(), rows.tobytes(),
+        perm.shape, perm.tobytes(), trs.tobytes(), bool(preselected),
+        str(action), id(mesh_xy),
+    )
+    hit = _UNFOLD_ISDF_ONE_LEG_JIT_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    idx_j = jnp.asarray(idx)
+    rows_j = jnp.asarray(rows)
+    perm_j = jnp.asarray(perm)
+    trs_j = jnp.asarray(trs)
+    in_sh = NamedSharding(
+        mesh_xy,
+        P(None, 'x') if preselected else P(None, ('x', 'y'), None))
+    scalar_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    polar_sh = NamedSharding(mesh_xy, P(None, None, 'x'))
+    slot_sh = NamedSharding(mesh_xy, P(None))
+    phase_sh = NamedSharding(mesh_xy, P(None, 'x'))
+
+    if action == "scalar":
+        @partial(
+            jax.jit, in_shardings=(in_sh, slot_sh, phase_sh),
+            out_shardings=scalar_sh)
+        def _do_unfold(zeta, source_slot_runtime, phase_runtime):
+            parent = zeta[idx_j]
+            selected = (parent if preselected else jnp.take_along_axis(
+                parent, source_slot_runtime[:, None, None], axis=2,
+                mode='promise_in_bounds')[:, :, 0])
+            gathered = jnp.take_along_axis(
+                selected, perm_j[rows_j], axis=1,
+                mode='promise_in_bounds')
+            spatial = phase_runtime * gathered
+            return jnp.where(trs_j[:, None], jnp.conj(spatial), spatial)
+    else:
+        R_sh = NamedSharding(mesh_xy, P(None, None))
+
+        @partial(jax.jit,
+                 in_shardings=(in_sh, slot_sh, phase_sh, R_sh),
+                 out_shardings=polar_sh)
+        def _do_unfold(
+                zeta, source_slot_runtime, phase_runtime, R_column_runtime):
+            parent = zeta[idx_j]
+            selected = (parent if preselected else jnp.take_along_axis(
+                parent, source_slot_runtime[:, None, None], axis=2,
+                mode='promise_in_bounds')[:, :, 0])
+            gathered = jnp.take_along_axis(
+                selected, perm_j[rows_j], axis=1,
+                mode='promise_in_bounds')
+            spatial = phase_runtime * gathered
+            scalar = jnp.where(
+                trs_j[:, None], jnp.conj(spatial), spatial)
+            return jnp.einsum('qi,qm->iqm', R_column_runtime, scalar)
+
+    _UNFOLD_ISDF_ONE_LEG_JIT_CACHE[key] = _do_unfold
+    return _do_unfold
+
+
 def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
@@ -869,9 +1232,10 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
 
 
 def tau_phase_row(sym_mat_k, tau, g_kbar):
-    """τ-phase ``exp(-i (S·G_kbar)·τ)`` for one sym row on its IBZ G-axis.
+    """τ-phase ``exp(-i (S·K_parent)·τ)`` for reciprocal carriers.
 
-    Single source of the ψ-unfold τ-phase rule (see :func:`unfold_psi`).
+    Single source of the reciprocal-space translation phase shared by
+    :func:`unfold_psi` and :func:`unfold_isdf_one_leg`.
     ``sym_mat_k`` is the TRS-augmented sym matrix ``sym_mats_k[sym_idx]`` —
     for TRS rows it already carries the ``-S`` sign, so the same formula
     yields ``exp(+i (S·G_kbar)·τ) = conj(spatial-phase)`` automatically.
@@ -885,8 +1249,9 @@ def tau_phase_row(sym_mat_k, tau, g_kbar):
         ``sym_mats_k[sym_idx]`` (TRS-augmented; carries the ±S sign).
     tau : (3,) float
         Spatial fractional translation ``translations[sym_idx % n_tran]``.
-    g_kbar : (ngk, 3) int
-        IBZ G-list of ψ_kbar.
+    g_kbar : (ncarrier, 3) int or float
+        Parent reciprocal-coordinate carriers.  Wavefunction unfolding passes
+        its integer G list; an ISDF one-leg action passes q+G.
 
     Returns
     -------
@@ -1193,13 +1558,23 @@ class SymMaps:
             # Rotation matrices and spinor (identity)
             self.R_grid = np.eye(3, dtype=np.int32)[None, :, :]
             self.Rinv_grid = self.R_grid.copy()
-            self.R_cart = self.R_grid.astype(float)
+            # Keep the same augmented-row invariant as ``sym_mats_k``:
+            # the TRS row is the negative Cartesian row.  The old one-row
+            # special case made ``R_cart_forward[sym_idx]`` fail exactly on
+            # an identity-only WFN if a measured policy selected its TRS
+            # partner, despite the reciprocal table correctly having two
+            # rows.
+            _R_identity = self.R_grid.astype(float)
+            self.R_cart = np.concatenate(
+                [_R_identity, -_R_identity], axis=0)
             self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
             # ``R_proper`` is the proper (det = +1) Cartesian rotation used
             # by the bispinor 3-vector vertex mixing.  Identity case: a
-            # single 3×3 identity is its own proper part.  See
+            # spatial identity is its own proper part; the TRS-augmented
+            # half reuses it, as in the general branch.  See
             # ``reports/bispinor_ibz_2026-05-16/derivation.md`` §A2.
-            self.R_proper = np.eye(3, dtype=np.float64)[None, :, :]
+            self.R_proper = np.repeat(
+                np.eye(3, dtype=np.float64)[None, :, :], 2, axis=0)
 
             # Build direct integer-grid lookup for the identity/no-symmetry case.
             kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -1791,6 +2166,27 @@ class SymMaps:
         # Match the existing 2·ntran-row convention for downstream consumers.
         R_full = np.concatenate([R_spatial, -R_spatial], axis=0)
         return R_full
+
+    @property
+    def q_irr_is_full_identity(self):
+        """Whether the q-IBZ table is exactly the ordered full q table.
+
+        This is stronger than equality of the two q counts.  It proves that
+        every parent row is its own full-zone row, that the full-to-parent
+        map is identity, and that the stored integer q rows are byte/layout
+        equivalent to ``kvecs_asints``.  Storage/provenance consumers use
+        this named service fact rather than rebuilding q-table logic.
+        """
+        q_full = np.asarray(self.kvecs_asints, dtype=np.int32)
+        n_q = int(q_full.shape[0])
+        identity = np.arange(n_q, dtype=np.int32)
+        return bool(
+            np.array_equal(
+                np.asarray(self.q_irr_full_idx, dtype=np.int32), identity)
+            and np.array_equal(
+                np.asarray(self.irr_idx_q, dtype=np.int32), identity)
+            and np.array_equal(
+                np.asarray(self.q_irr_kgrid_int, dtype=np.int32), q_full))
 
     @property
     def R_cart_forward(self):
