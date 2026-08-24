@@ -1,4 +1,4 @@
-"""ISDF mini-library: ψ + centroids -> ζ interpolation vectors; GW and BSE are consumers."""
+"""ISDF mini-library: ζ fitting and streamed Galerkin projection."""
 from isdf.core import (
     pair_density,        # centroid-selection Gram building block
     gram_q0_from_pair,   # q=0 Gram (centroid selection)

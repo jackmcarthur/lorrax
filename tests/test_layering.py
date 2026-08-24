@@ -570,12 +570,12 @@ _DRIVER_PLUMBING_BUDGET = {
     # exciton-band assembly lives.  Numbered request.
     "bse.exciton_bands": 1,
     # ``jax.sharding`` at :20.  Same shape as exciton_bands, larger:
-    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on,
-    # and its Galerkin solve is written in ``shard_map``.  Its hand-rolled
+    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on.
+    # Its projected-Gram shard_map and r/band schedule now live in the named
+    # ``isdf.galerkin`` kernel owner, but the remaining basis fit and fH
+    # interpolation still carry one ``jax.sharding`` import.  Its hand-rolled
     # ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it hands back
-    # the mesh ``initialize_communicator_stack`` built), and since 2026-08-06
-    # its ``shard_map`` comes from ``common.shard_map`` rather than from
-    # ``jax.experimental`` — so the residue is one ``jax.sharding`` import.
+    # the mesh ``initialize_communicator_stack`` built).
     "bandstructure.htransform": 1,
     # One ``from jax.sharding import ...`` each.  The four BSE CLIs also
     # default ``--px/--py`` to 1 and slice ``devices[:px*py]``, so on 16

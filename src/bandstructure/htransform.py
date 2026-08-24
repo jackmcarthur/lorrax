@@ -22,7 +22,6 @@ from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from common.shard_map import shard_map
 from functools import partial
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -39,9 +38,9 @@ from common.units import RYD_TO_EV
 from common.wfn_layout import band_sphere_spec
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import (
-    get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
-    load_psi_gflat_padded,
+    get_enk_bandrange, load_centroids_band_chunked, load_psi_gflat_padded,
 )
+from isdf.galerkin import build_streamed_projected_gram
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
 # this driver reads a raw params dict rather than a LorraxConfig, which is
 # exactly the case that function exists for.
@@ -84,105 +83,6 @@ def _build_mesh_xy() -> Mesh:
     """
     return RUNTIME.mesh
 
-
-_accum_G_cache: dict = {}
-_fold_G_cache: dict = {}
-
-def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
-                       psi_layout_, sharding_q_):
-    """One compiled Galerkin Q-accumulation kernel per static config.
-
-    THE psi INPUT SHARDING IS PINNED to Q's r layout (in_shardings); the
-    iterator's canonical staged reshard puts it there before this kernel.
-    The historical kernel reshaped (nk, bc, ns, r_'y') to
-    (nk·bc, ns·r) — merging the replicated spinor axis with the sharded r
-    axis, which no NamedSharding can express — and then asked for
-    ('x','y')-sharded output columns.  The legacy SPMD partitioner cannot
-    synthesize that band-to-r exchange: at P16 it fell back to fully
-    replicating the 54.3-GiB c128[81,1,2,1406256] slab per 40-GB GPU and
-    OOMed (Perlmutter JID 57271407, "Involuntary full rematerialization",
-    125.60 GiB live).  With psi already r-sharded in Q's own layout and
-    the spinor axis kept SEPARATE, the contraction is purely
-    device-local: UH_bc is replicated, psi's contracted (nk·bc) rows are
-    all present locally, and each device writes only its own r block of
-    Q.  Module-level so the P>1 transition twin
-    (``tests/test_htransform_q_accum.py``) drives the production kernel,
-    not a re-implementation.
-    """
-    key = (id(mesh_), rank_, bc_size, nspinor_)
-    fn = _accum_G_cache.get(key)
-    if fn is not None:
-        return fn
-
-    # Only the accumulator can alias the result.  ``psi_bc`` is a streamed
-    # read-only source and cannot back an output with Q's different shape;
-    # advertising it as donated merely asks XLA for an impossible alias and
-    # emits one warning per band chunk.
-    @partial(jax.jit, donate_argnums=(3,),
-             in_shardings=(rep_, rep_, psi_layout_, sharding_q_),
-             out_shardings=sharding_q_)
-    def _accum(UH_bc, inv_s, psi_bc, Q_in):
-        # UH_bc: (rank, nk·bc) replicated; inv_s: (rank,1) replicated
-        # psi_bc: (nk, bc, ns, r) sharded P(None,None,None,r_entry)
-        nkv, bcv, nsv, rcv = psi_bc.shape
-        # Merge only the two REPLICATED leading axes; the sharded r
-        # axis and the spinor axis are never combined.
-        psi_flat = psi_bc.reshape(nkv * bcv, nsv, rcv)
-        Q = inv_s[:, :, None] * jnp.einsum(
-            'ak,ksr->asr', UH_bc, psi_flat, optimize=True)
-        return Q_in + Q
-
-    _accum_G_cache[key] = _accum
-    return _accum
-
-
-def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
-    """Add one already-bounded, r-sharded ``Q_chunk Q_chunk†`` to G.
-
-    The caller owns the zeta-style outer-r loop and therefore never hands this
-    executable Q over all ``r_tot``.  Each device forms the Gram contribution
-    from its unique local-r shard; the established two-stage
-    ``psum_scatter`` sums those shards while distributing matrix rows and
-    columns onto ``P('x','y')``.
-    """
-    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
-           tuple(grid_xy_.spec))
-    fn = _fold_G_cache.get(key)
-    if fn is not None:
-        return fn
-
-    p_x = int(mesh_.shape['x'])
-    p_y = int(mesh_.shape['y'])
-    if rank_ % p_x or rank_ % p_y:
-        raise ValueError(
-            "_make_fold_G_kernel: the carried Galerkin rank must divide "
-            f"both mesh axes; rank={rank_}, mesh={p_x}x{p_y}")
-
-    @partial(
-        shard_map,
-        mesh=mesh_,
-        in_specs=(sharding_q_.spec, P('x', 'y')),
-        out_specs=P('x', 'y'),
-        check_vma=False,
-    )
-    def _fold_local(Q_local, G_local):
-        partial = jnp.einsum(
-            'asr,bsr->ab', Q_local, jnp.conj(Q_local),
-            optimize=True)
-        partial = jax.lax.psum_scatter(
-            partial, 'x', scatter_dimension=0, tiled=True)
-        partial = jax.lax.psum_scatter(
-            partial, 'y', scatter_dimension=1, tiled=True)
-        return G_local + partial
-
-    fn = jax.jit(
-        _fold_local,
-        donate_argnums=(1,),
-        in_shardings=(sharding_q_, grid_xy_),
-        out_shardings=grid_xy_,
-    )
-    _fold_G_cache[key] = fn
-    return fn
 
 # Per-device ceiling on one streamed Galerkin Q r-chunk.
 #
@@ -359,123 +259,6 @@ def _lowdin_orthonormalize_band_rows(ctilde: jax.Array):
     return out, jnp.min(evals), jnp.max(evals), before, after, rel_move
 
 
-def galerkin_q_ledger(*, rank: int, nk: int, nspinor: int, n_rtot: int,
-                      band_chunk: int, m_states: int, mu_pad: int,
-                      psi_win_elems: int, p_total: int, q_shards: int,
-                      y_shards: int) -> dict:
-    """Per-device byte ledger for one streamed-Galerkin r chunk.
-
-    ``n_rtot`` is the chunk carrier, never the full FFT grid.  The Q charge
-    includes both the donated accumulation overlap and one conservative
-    Q-sized conjugate/layout workspace for the subsequent Gram fold.  Thus
-    the compiler may choose that workspace without violating the ledger, but
-    no full-``r_tot`` Q exists to copy.
-
-    Keys are printable labels; ``TOTAL`` is their sum.
-    """
-    C16 = 16.0
-    led = {
-        # The bounded Q accumulator, donated input/output overlap, and one
-        # Q-sized fold workspace:
-        # ``_accum`` donates Q_in and writes Q_in + delta into it, but the
-        # GEMM's delta-Q result buffer coexists with the accumulator, so
-        # the loop's floor is 2x Q per device.
-        "Q r-chunk (x2 accumulation + x1 fold workspace)":
-            3.0 * rank * nspinor * n_rtot * C16 / q_shards,
-        # One streamed psi band chunk in Q's r layout (the _accum input).
-        "psi chunk (r-layout)":
-            1.0 * nk * band_chunk * nspinor * n_rtot * C16 / q_shards,
-        # The source shard remains live during the two staged all-to-alls.
-        # It is band-sharded over the same full mesh product, so source and
-        # destination are equal-volume shards; no y-replicated carrier exists.
-        "psi chunk (band-layout, transition overlap)":
-            1.0 * nk * band_chunk * nspinor * n_rtot * C16 / q_shards,
-        # Persistent Gram state, replicated on every device: coeffs
-        # (m_states, rank), UH (rank, m_states), UH_kb (its eager-reshape
-        # copy), the per-chunk UH_bc block and inv_s.
-        "Gram state (replicated)":
-            (3.0 * m_states * rank + 1.0 * rank * nk * band_chunk
-             + 1.0 * rank) * C16,
-        # Vh, mu-sharded on 'y', live from step 2 until B_at_mu.
-        "Vh (mu on 'y')":
-            1.0 * rank * nspinor * mu_pad * C16 / y_shards,
-        # ``_fold_local`` forms the full rank×rank partial on every device
-        # before the two psum_scatter operations distribute its rows/columns.
-        "fold partial (replicated)": 1.0 * rank * rank * C16,
-        # The G face, P('x','y').
-        "G face": 1.0 * rank * rank * C16 / p_total,
-        # The resident psi(G-flat) window, band-sharded over all P.
-        "psi(G-flat) window": 1.0 * psi_win_elems * C16 / p_total,
-    }
-    led["TOTAL"] = sum(led.values())
-    return led
-
-
-def _refuse_unfit_galerkin_mesh(ledger: dict, *, rank: int, nk: int,
-                                nspinor: int, n_rtot: int, band_chunk: int,
-                                m_states: int, mu_pad: int,
-                                psi_win_elems: int, mesh_xy: Mesh,
-                                q_spec, log_fn) -> None:
-    """REFUSE, before any Q compilation, a mesh whose Galerkin live set
-    cannot fit the device pool — naming the smallest square mesh that can.
-
-    ``n_rtot`` is the largest logical r-chunk extent, not the full FFT grid.
-    Each candidate uses the same canonical padding carrier as the live path.
-
-    The pool size comes from the allocator's own ``bytes_limit`` (the
-    owned reader in ``common.gpu_utils``); when it is unreadable (CPU
-    backend, platform allocator) the ledger is printed and the gate is
-    announced as OFF — a gate that silently checked nothing is the worse
-    failure (TASTE 2026-08-15).  The candidate-mesh scan holds this run's
-    carried ``rank`` fixed; the lcm mesh-alignment pad varies by a few
-    rows across meshes and is noise at refusal scale.
-    """
-    from common.gpu_utils import _get_jax_gpu_memory_bytes
-    limit, _, _ = _get_jax_gpu_memory_bytes()
-    if limit is None or limit <= 0:
-        log_fn("  [galerkin-mem] device pool size unreadable (CPU backend "
-               "or platform allocator) — ledger printed above, the "
-               "non-fitting-mesh refusal DID NOT RUN")
-        return
-    total = float(ledger["TOTAL"])
-    if total <= float(limit):
-        return
-    fitting = None
-    # Search ALL supported square meshes: a larger current mesh can use more
-    # memory when another live object replicates, so the truthful remedy is
-    # the minimum-P fitting geometry, not merely the first larger one.
-    for s in range(1, 65):
-        n_r_carrier_s = round_up(n_rtot, s * s)
-        led_s = galerkin_q_ledger(
-            rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_r_carrier_s,
-            band_chunk=band_chunk, m_states=m_states, mu_pad=mu_pad,
-            psi_win_elems=psi_win_elems, p_total=s * s,
-            q_shards=s * s, y_shards=s)
-        if led_s["TOTAL"] <= float(limit):
-            fitting = (s, float(led_s["TOTAL"]))
-            break
-    detail = "; ".join(
-        f"{name} {b / 1024**3:.2f} GiB" for name, b in ledger.items()
-        if name != "TOTAL")
-    if fitting is not None:
-        s, tot_s = fitting
-        remedy = (f"the smallest square mesh that fits at this pool size is "
-                  f"{s}x{s} (P={s * s}: projected "
-                  f"{tot_s / 1024**3:.2f} GiB/device)")
-    else:
-        remedy = ("no square mesh up to 64x64 fits this r chunk; lower "
-                  "LORRAX_GALERKIN_CHUNK_GIB or narrow the model rank")
-    raise ValueError(
-        f"streaming_galerkin_solve: the Galerkin live set does not fit "
-        f"this mesh.  Projected {total / 1024**3:.2f} GiB/device against a "
-        f"{limit / 1024**3:.2f} GiB pool on the "
-        f"{mesh_xy.shape['x']}x{mesh_xy.shape['y']} mesh "
-        f"(Q sharded {q_spec}, {spec_divisor(mesh_xy, q_spec, axis=2)}-way on "
-        f"r).  Ledger: {detail}.  {remedy}.  This is refused BEFORE "
-        f"compilation.  Lower LORRAX_GALERKIN_CHUNK_GIB to use more, smaller "
-        f"r chunks without changing the fit.")
-
-
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
@@ -490,7 +273,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
     ``load_centroids_band_chunked``; ψ at full r is streamed via
-    ``iter_psi_rchunk_bandwise`` (band+r chunked). G is built
+    ``common.wfn_transforms.iter_psi_rchunk_bandwise`` (band+r chunked)
+    through ``isdf.galerkin.build_streamed_projected_gram``. G is built
     sharded ``P('x','y')`` and Cholesky-factored without changing its gauge.
 
     MEMORY AND SHARDING (2026-08-24).  The accumulator is
@@ -504,10 +288,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     contraction.  The y-replicated carrier and the merged-axis layout that
     forced the SPMD
     partitioner's full-replication fallback at P16 (JID 57271407) is
-    gone.  ``galerkin_q_ledger`` prices the largest Q chunk (accumulation
-    overlap plus fold workspace), both equal-volume ψ transition shards,
-    replicated Gram state, Vh and G per device, then refuses a non-fitting
-    chunk before compilation.
+    gone.  ``isdf.galerkin.galerkin_q_ledger`` prices the largest Q chunk
+    (accumulation overlap plus fold workspace), both equal-volume ψ
+    transition shards, replicated Gram state, Vh and G per device, then
+    refuses a non-fitting chunk before compilation.
 
     Args:
         wfn, sym, meta: standard gw_jax handles.
@@ -1043,115 +827,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     Vh_sh = _vh_sharded(inv_s, UH, psi_rmu_Y)
     del psi_rmu_Y
 
-    # ── 3. G = Q Q^H with Q = inv_s · U^H ψ, streamed r-OUTER / band-INNER ──
-    #
-    # Q[α, x] = Σ_{k,n} inv_s[α] U^H[α,(k,n)] ψ[(k,n), x]  — the contraction
-    # runs over the PAIR index (k, n) and is FREE in x = (spinor, r).  So:
-    #
-    #   * splitting x (the r axis) and summing G over the pieces is EXACT —
-    #     G = Σ_rc Q_rc Q_rc^H, because each Q_rc is a disjoint column block;
-    #   * splitting the CONTRACTED (k, n) axis and summing G over the pieces
-    #     is NOT — Σ_bc Q_bc Q_bc^H drops every bc ≠ bc' cross term of
-    #     (Σ_bc Q_bc)(Σ_bc' Q_bc')^H.
-    #
-    # The band chunks must therefore be summed INTO Q before the outer
-    # product, which is what this loop does.  Getting that backwards is a
-    # silent wrong answer, not a crash: G stays Hermitian positive-definite,
-    # Cholesky succeeds, and the only symptom is that ctilde comes out
-    # non-orthonormal — ``ctilde[0] orthogonality error`` jumps to ~0.5 —
-    # so fH = Σ_n f(ε_n) c_n c_n^H no longer has eigenvalues f(ε_n) and the
-    # recovered energies drift by ~1.7 eV.  Measured on MoS2 12x12 30 Ry /
-    # n_μ=640 / nb=40, on-grid max|Δε_c| vs the stored grid:
-    #   one band chunk (nb ≤ band_chunk_size)  0.63 meV
-    #   two band chunks, G summed per chunk    1742.48 meV
-    # It stayed hidden while ``band_chunk_size`` defaulted to a fixed 64 ≥ nb
-    # (one chunk, no cross terms to lose) and surfaced when the chunk was
-    # sized to the ψ box instead.
-    # Align band_chunk to the mesh band-shard count (p_band = mesh.size): the
-    # loader pads nb to round_up(band_chunk, p_band) regardless, so e.g. 7 real
-    # bands on a 16-way mesh still COSTS 16 -- and pushes 9 zero-pad bands
-    # through every local FFT and the UH@psi GEMM (~2.3x waste) while doubling
-    # the iteration count (and the per-chunk XLA retrace storm).  Rounding up to
-    # a p_band multiple is free (same padded memory) and both removes the waste
-    # and halves the iterations/compiles.  Pure chunking change -> identical G.
-    band_chunk_ranges = [
-        (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
-        for i in range((nb + _bc - 1) // _bc)
-    ]
-    # r is a FREE column index of Q.  The canonical runtime-padding backend
-    # adds exact-zero columns until the carrier divides the full mesh product;
-    # these contribute exactly zero to Q and to G = Q Q^H.  Consequently Q
-    # always uses both mesh axes instead of sharding_fit's replication fallback
-    # on FFT grids such as CrI3's 1,406,250 cells.  The ('y','x') order matches
-    # the canonical staged exchange: r is split by y first and x second.  No
-    # observable sees Q's internal column order.
-    sharding_q = NamedSharding(mesh_xy, q_spec)
-    _q_r_entry = sharding_q.spec[2]
-    q_shards = r_mesh_divisor
-    # The staged-reshard target: the SAME r entry as Q, so the iterator's
-    # output, accumulation input, and Q layout cannot drift apart.
-    psi_r_layout = NamedSharding(mesh_xy, P(None, None, None, _q_r_entry))
-
-    # ── The zeta-style r plan + Q memory ledger ───────────────────────────
-    # The budget is per-device Q storage.  Convert it to a count of LOCAL r
-    # columns, then to the global logical chunk owned collectively by the
-    # product-r mesh.  Every non-final chunk is mesh-aligned; the canonical
-    # iterator zero-pads only the final carrier.
-    q_tile_budget = stream_budget
-    q_bytes_per_local_r = rank * nspinor * np.dtype(np.complex128).itemsize
-    if q_bytes_per_local_r > q_tile_budget:
-        raise ValueError(
-            "streaming_galerkin_solve: one local r column of Q needs "
-            f"{q_bytes_per_local_r / 1024**3:.6f} GiB/device, exceeding "
-            f"LORRAX_GALERKIN_CHUNK_GIB={q_tile_budget / 1024**3:.6f}. "
-            "Increase that budget or reduce the retained rank.")
-    r_local_cap = q_tile_budget // q_bytes_per_local_r
-    r_chunk = min(n_rtot, r_local_cap * r_mesh_divisor)
-    if r_chunk < n_rtot:
-        r_chunk = max(
-            r_mesh_divisor,
-            (r_chunk // r_mesh_divisor) * r_mesh_divisor,
-        )
-    r_chunk_ranges = [
-        (r0, min(r0 + r_chunk, n_rtot))
-        for r0 in range(0, n_rtot, r_chunk)
-    ]
-    max_r_logical = max(r1 - r0 for r0, r1 in r_chunk_ranges)
-    max_r_carrier = round_up(max_r_logical, r_mesh_divisor)
-    q_tile_local_bytes = (
-        rank * nspinor * (max_r_carrier // r_mesh_divisor)
-        * np.dtype(np.complex128).itemsize
-    )
-    log_fn(
-        f"  Galerkin r plan: {len(r_chunk_ranges)} chunk(s), "
-        f"logical width <= {max_r_logical}, carrier <= {max_r_carrier}; "
-        f"Q <= {q_tile_local_bytes / 1024**3:.2f} GiB/device "
-        f"(budget {q_tile_budget / 1024**3:.2f} GiB/device)")
-
-    # Price the largest r chunk before compilation: Q accumulation + fold
-    # workspace, both ψ transition layouts, Gram state, Vh and G.
-    _p_y_shards = int(mesh_xy.shape['y'])
-    _ledger = galerkin_q_ledger(
-        rank=rank, nk=nk, nspinor=nspinor, n_rtot=max_r_carrier,
-        band_chunk=_bc,
-        m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=0,
-        p_total=int(mesh_xy.size), q_shards=q_shards, y_shards=_p_y_shards)
-    log_fn(f"  Galerkin Q ledger (per device): Q sharded "
-           f"{sharding_q.spec} ({q_shards}-way on r), "
-           + ", ".join(f"{name} {b / 1024**3:.2f} GiB"
-                       for name, b in _ledger.items()))
-    _refuse_unfit_galerkin_mesh(
-        _ledger, rank=rank, nk=nk, nspinor=nspinor,
-        n_rtot=max_r_logical,
-        band_chunk=_bc, m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=0, mesh_xy=mesh_xy,
-        q_spec=sharding_q.spec, log_fn=log_fn)
-    grid_xy_G = grid_xy
-
-    fold_G = _make_fold_G_kernel(
-        rank, mesh_xy, sharding_q, grid_xy_G)
-
+    # ── 3. Projected real-space Gram ──────────────────────────────────────
+    # ``isdf.galerkin`` owns the Q kernels, sharding, memory plan, and the
+    # load-bearing r-outer / band-inner schedule.  This caller owns only the
+    # exact-null identity block that makes its subsequent Cholesky nonsingular.
     # Allocate G sharded directly.  ``jax.device_put(jnp.zeros(...), sharding)``
     # on a multi-process mesh hands JAX an UNCOMMITTED fully-addressable array,
     # which takes ``_device_put_sharding_impl``'s ``multihost_utils.assert_equal``
@@ -1178,71 +857,24 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     G = jax.jit(_alloc_G, out_shardings=grid_xy)()
 
-    t2 = time.time()
-    band_eval_count = 0
-    UH_kb = UH.reshape(rank, nk, nb)  # for band-chunk slicing
-    from common.progress import LoopProgress
-    _g_steps = len(r_chunk_ranges) * len(band_chunk_ranges)
-    _g_progress = LoopProgress(
-        _g_steps, progress_fn or (lambda *_: None),
-        title="Galerkin real-space accumulation", item_name="(r, band) chunk",
-        max_updates=min(_g_steps, 12),
-        enabled=progress_fn is not None).start()
-
-    @partial(jax.jit, static_argnums=(0,), out_shardings=sharding_q)
-    def _alloc_Q(r_extent):
-        return jnp.zeros(
-            (rank, nspinor, r_extent), dtype=jnp.complex128)
-
-    for r_idx, (r0, r1) in enumerate(r_chunk_ranges):
-        r_carrier = round_up(r1 - r0, r_mesh_divisor)
-        # Allocate only Q for this r chunk, already product-r sharded.  All
-        # band chunks are summed into it before the outer product, preserving
-        # every cross-band term exactly.
-        Q = _alloc_Q(r_carrier)
-        for bc_range, psi_bc_r in iter_psi_rchunk_bandwise(
-                wfn, sym, meta, mesh_xy, band_range, r0, r1, bispinor,
-                band_chunk_size=band_chunk_size,
-                band_chunk_ranges=band_chunk_ranges,
-                band_pad_to=_bc,
-                product_r_spec=psi_r_layout.spec):
-            if int(psi_bc_r.shape[-1]) != r_carrier:
-                raise ValueError(
-                    "Galerkin iterator r carrier disagrees with Q chunk: "
-                    f"psi={int(psi_bc_r.shape[-1])}, Q={r_carrier}, "
-                    f"r=[{r0},{r1})")
-            bc = bc_range[1] - bc_range[0]
-            bc_lo = bc_range[0] - b_start
-            bc_hi = bc_range[1] - b_start
-            # The iterator zero-pads every band chunk to the one mesh-aligned
-            # width w.  Matching zero columns in UH preserve the contraction.
-            w = int(psi_bc_r.shape[1])
-            UH_bc_kb = UH_kb[:, :, bc_lo:bc_hi]
-            if w > bc:
-                UH_bc_kb = jnp.pad(
-                    UH_bc_kb, ((0, 0), (0, 0), (0, w - bc)))
-            UH_bc = UH_bc_kb.reshape(rank, nk * w)
-
-            accum = _make_accum_kernel(
-                rank, w, nspinor, mesh_xy,
-                rep, psi_r_layout, sharding_q)
-            Q = accum(UH_bc, inv_s, psi_bc_r, Q)
-            del psi_bc_r
-            band_eval_count += 1
-            _g_progress.step()
-
-        G = fold_G(Q, G)
-        jax.block_until_ready(G)
-        del Q
-        log_fn(
-            f"  G r-chunk {r_idx + 1}/{len(r_chunk_ranges)}: "
-            f"[{r0},{r1}) -> carrier {r_carrier}")
-
-    _g_progress.finish()
-    log_fn(
-        f"  G accumulation: {len(r_chunk_ranges)} r chunk(s) x "
-        f"{len(band_chunk_ranges)} band chunk(s) "
-        f"({band_eval_count} streamed evaluations), {time.time()-t2:.2f}s")
+    from common.gpu_utils import _get_jax_gpu_memory_bytes
+    device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
+    G = build_streamed_projected_gram(
+        wfn=wfn,
+        meta=meta,
+        mesh_xy=mesh_xy,
+        band_range=band_range,
+        UH=UH,
+        inv_s=inv_s,
+        gram_init=G,
+        band_chunk_size=_bc,
+        mu_pad=mu_pad,
+        q_tile_budget=stream_budget,
+        device_pool_limit=device_pool_limit,
+        bispinor=bispinor,
+        log_fn=log_fn,
+        progress_fn=progress_fn,
+    )
 
     # ── 4. Cholesky on G ──
     # FFI seam: gw_jax's factor_c_q (which has dual 1×1-dense /
