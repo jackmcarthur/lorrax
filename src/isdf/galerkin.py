@@ -41,6 +41,7 @@ from runtime.padding import round_up, spec_divisor
 __all__ = [
     "GalerkinBasis",
     "GalerkinStreamPlan",
+    "QRCP_RNG_VERSION",
     "fit_galerkin_basis",
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
@@ -48,7 +49,7 @@ __all__ = [
 ]
 
 
-_QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
+QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,7 @@ class GalerkinBasis:
     selected_state_indices: tuple[int, ...]
     selection_factor: jax.Array
     qrcp_seed: int = 0
-    qrcp_rng_version: str = _QRCP_RNG_VERSION
+    qrcp_rng_version: str = QRCP_RNG_VERSION
     qrcp_eps: float = 1.0e-3
     qrcp_raw_rank: int = 0
     qrcp_search_rank: int = 0
@@ -117,6 +118,7 @@ class GalerkinBasis:
     @property
     def rank_carrier(self) -> int:
         return int(self.ctilde.shape[2])
+
 
 def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
     """Validate the whole-state QRCP search ceiling multiplier.
@@ -451,7 +453,7 @@ def fit_galerkin_basis(
         f"max_search=ceil({search_multiplier:g}*{nb}) -> {max_search}, "
         f"candidates={n_candidates} (+{candidate_carrier-n_candidates} "
         f"inactive mesh pad), qr_eps={float(qr_eps):.3e}, seed={qrcp_seed}, "
-        f"rng={_QRCP_RNG_VERSION}, WFN band carrier={bc_carrier}")
+        f"rng={QRCP_RNG_VERSION}, WFN band carrier={bc_carrier}")
     log_fn(f"  [qrcp] candidate SHA256={candidate_hash}")
 
     rep = NamedSharding(mesh_xy, P())
@@ -671,7 +673,7 @@ def fit_galerkin_basis(
         selected_state_indices=tuple(int(v) for v in selected),
         selection_factor=L,
         qrcp_seed=qrcp_seed,
-        qrcp_rng_version=_QRCP_RNG_VERSION,
+        qrcp_rng_version=QRCP_RNG_VERSION,
         qrcp_eps=float(qr_eps),
         qrcp_raw_rank=rank_qr,
         qrcp_search_rank=max_search,

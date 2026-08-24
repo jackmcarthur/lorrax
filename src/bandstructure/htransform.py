@@ -29,8 +29,11 @@ from common.units import RYD_TO_EV
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
+    GalerkinBasisStamp,
     fit_galerkin_basis,
+    read_galerkin_basis,
     validate_rank_multiplier,
+    write_galerkin_basis,
 )
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
 # this driver reads a raw params dict rather than a LorraxConfig, which is
@@ -174,9 +177,41 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              rank_multiplier: float = 20.0,
                              qr_eps: float = 1.0e-3,
-                             qrcp_seed: int = 0):
-    """Htransform policy adapter for :func:`isdf.galerkin.fit_galerkin_basis`."""
+                             qrcp_seed: int = 0,
+                             basis_input: str | None = None,
+                             basis_output: str | None = None):
+    """Resolve htransform policy around the reusable Galerkin fit service.
+
+    Input and output are deliberately distinct: a requested restart may not
+    silently refit, while a requested fit artifact may not silently reuse an
+    old file.  The owner-level service validates the exact numerical identity.
+    """
+    if log_fn is None:
+        log_fn = lambda *args, **kwargs: None
+    if basis_input and basis_output:
+        raise ValueError(
+            "Galerkin basis input and output are mutually exclusive")
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
+    extra_rank_pad = resolve_extra_rank_pad()
+    stamp = GalerkinBasisStamp.from_runtime(
+        wfn=wfn, meta=meta, centroid_indices=centroid_indices,
+        band_range=band_range, bispinor=bispinor,
+        rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
+        qrcp_seed=qrcp_seed)
+    if basis_input:
+        basis_path = os.fspath(basis_input)
+        if not os.path.isfile(basis_path):
+            raise FileNotFoundError(
+                f"Galerkin basis input does not exist: {basis_path}")
+        log_fn(f"  [galerkin-restart] reading {basis_path}")
+        basis = read_galerkin_basis(
+            basis_path, mesh_xy=mesh_xy, expected=stamp,
+            extra_rank_pad=extra_rank_pad)
+        log_fn(
+            f"  [galerkin-restart] reused physical rank "
+            f"{basis.rank_physical} in carried extent {basis.rank_carrier}")
+        return basis
+
     # The whole-state ledger describes allocations made *after this point*.
     # Compare it with the allocator budget still available to the fit, not
     # with the arena limit: the driver, WFN metadata and symmetry service are
@@ -219,9 +254,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         qrcp_seed=qrcp_seed,
         q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_fit_budget,
-        extra_rank_pad=resolve_extra_rank_pad(),
+        extra_rank_pad=extra_rank_pad,
     )
+    if basis_output:
+        write_galerkin_basis(
+            os.fspath(basis_output), basis, stamp, mesh_xy=mesh_xy)
+        log_fn(
+            f"  [galerkin-restart] wrote physical rank "
+            f"{basis.rank_physical} to {basis_output}")
     return basis
+
 
 def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
                             a_band_index: int | None = None) -> tuple[float, float, float]:
@@ -701,7 +743,9 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
-                    *, require_all_occupied: bool = False):
+                    *, require_all_occupied: bool = False,
+                    basis_input: str | None = None,
+                    basis_output: str | None = None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -866,6 +910,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
+    basis_input = _resolve(basis_input) if basis_input else None
+    basis_output = _resolve(basis_output) if basis_output else None
     with mesh_xy:
         basis = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
@@ -873,6 +919,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
             qr_eps=params.get("htransform_qr_eps", 1.0e-3),
             qrcp_seed=params.get("htransform_qrcp_seed", 0),
+            basis_input=basis_input, basis_output=basis_output,
         )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
            f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
@@ -1328,6 +1375,13 @@ def main(argv=None):
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
     parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
+    basis_group = parser.add_mutually_exclusive_group()
+    basis_group.add_argument(
+        "--basis-input", default=None,
+        help="Read an immutable fitted Galerkin basis; mismatches refuse.")
+    basis_group.add_argument(
+        "--basis-output", default=None,
+        help="Fit once and atomically publish an immutable Galerkin basis.")
     parser.add_argument("--verbose", action="store_true", help="Print diagnostic details")
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
@@ -1410,7 +1464,8 @@ def main(argv=None):
     with timing.section("initialize_wfns"):
         wfn, sym, meta, mesh_xy, basis, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
-            n_guard_bands=args.guard_bands, require_all_occupied=True)
+            n_guard_bands=args.guard_bands, require_all_occupied=True,
+            basis_input=args.basis_input, basis_output=args.basis_output)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     # ── Galerkin-input gate ───────────────────────────────────────────
     # ``ctilde`` is the compact Galerkin coefficient table and ``enk_sigma``
