@@ -20,23 +20,46 @@ for nk, expected_width in expected.items():
 
 assert widths[81] < widths[8], widths
 
-# The registered square law is not the whole physical allocation at P=1:
-# pair_density keeps all M candidate rows and blocks only its columns.  The
-# runtime cap must therefore be tighter when M exceeds the model width.
-p1_model = pc.auto_gram_col_block_width(
-    36, nspinor=2, budget_bytes=budget,
-)
-p1_width = pc._cap_gram_width_to_device_footprint(
-    p1_model, nk=36, nspinor=2, n_rows=3600, budget_bytes=budget,
-    x_shards=1, y_shards=1,
-)
-assert p1_width < p1_model, (p1_width, p1_model)
+# The implementation now tiles BOTH candidate axes, so the registered square
+# law and the physical pair tensors describe the same object.  On 4x4 the
+# exact local two-pair footprint is 1/16 of the global square model.
+tile = widths[81]
 assert pc.gram_col_block_device_bytes(
-    36, 2, 3600, p1_width,
-) <= budget
-assert pc.gram_col_block_device_bytes(
-    36, 2, 3600, p1_width + 1,
-) > budget
+    81, 2, 3600, tile, x_shards=4, y_shards=4,
+) == pc.gram_col_block_bytes(81, 2, tile) // 16
+
+# Complete-live-set accounting: right pair build carries the completed left
+# pair tile; final assembly has four local-G slots.  The max is explicit.
+live = pc.gram_block_live_set_bytes(
+    resident_bytes=1000,
+    pair_left_peak_bytes=200,
+    pair_right_peak_bytes=300,
+    gram_fold_peak_bytes=400,
+    one_pair_tile_bytes=50,
+    gram_matrix_local_bytes=25,
+)
+assert live == {
+    "pair_left": 1225,
+    "pair_right": 1375,
+    "gram_fold": 1425,
+    "final_fold": 1100,
+    "peak": 1425,
+}
+
+# Geometric selection returns a rung it actually queried and never rounds a
+# width off the common x/y divisor.
+seen = []
+def peak_for_width(width):
+    seen.append(width)
+    return {"peak": width * 100}
+
+chosen, chosen_facts = pc._auto_gram_width_from_compiled_peaks(
+    256, max_width=1020, divisor=4, budget_bytes=70000,
+    peak_for_width=peak_for_width,
+)
+assert chosen == 512, (chosen, seen)
+assert chosen_facts["peak"] == 51200
+assert seen == [256, 512, 1020], seen
 
 required = pc.gram_col_block_bytes(81, 2, 256)
 try:
@@ -47,7 +70,7 @@ else:
     raise AssertionError("undersized Gram budget did not refuse")
 
 print(f"GRAM_COL_BLOCK_PRICING_OK nk8={widths[8]} nk81={widths[81]} "
-      f"p1_model={p1_model} p1_capped={p1_width}")
+      f"compiled_rung={chosen}")
 '''
 
 
