@@ -45,6 +45,7 @@ equality, and where it is not we check the structural property.
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from pathlib import Path
@@ -272,6 +273,79 @@ def test_there_is_exactly_one_mesh_divisibility_pad_helper():
     assert hits == [], (
         f"a second mesh-divisibility pad helper is back in {hits}; "
         "runtime.padding.pad_axis is the one implementation")
+
+
+def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
+    """The kmeans/htransform seam has one spec and one arithmetic backend.
+
+    This is deliberately a source gate: importing htransform initializes the
+    communicator/FFI stack, while the property under test is which authority
+    its static layout planning names.  Value/HLO parity remains in the driver
+    and staged-reshard suites.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    layout_path = src / "common" / "wfn_layout.py"
+    app_paths = (
+        layout_path,
+        src / "common" / "mtxel_sweep.py",
+        src / "common" / "wfn_transforms.py",
+        src / "common" / "psi_G_store.py",
+        src / "bandstructure" / "htransform.py",
+    )
+    wfn = (src / "common" / "wfn_transforms.py").read_text()
+    store = (src / "common" / "psi_G_store.py").read_text()
+    ht = (src / "bandstructure" / "htransform.py").read_text()
+    staged = (src / "common" / "staged_reshard.py").read_text()
+    fit = (src / "common" / "sharding_fit.py").read_text()
+    gflat_body = wfn.split("def gflat_to_rmu(", 1)[1].split("\ndef ", 1)[0]
+    galerkin_body = ht.split("def streaming_galerkin_solve(", 1)[1].split(
+        "\ndef ", 1)[0]
+    move_body = staged.split("def band_to_product_r_reshard(", 1)[1].split(
+        "\ndef ", 1)[0]
+    subset_body = fit.split("def _largest_divisible_subset(", 1)[1].split(
+        "\ndef ", 1)[0]
+
+    # Code-token census, not a grep through comments/docstrings (TASTE 17):
+    # the application-side ψ(G-flat) clients may contain exactly one literal,
+    # at the dependency-light authority.  A retyped literal in any live client
+    # makes this fail even if that client still imports the authority too.
+    def is_band_sphere_literal(node):
+        if not isinstance(node, ast.Call) or len(node.args) != 4:
+            return False
+        if not isinstance(node.func, ast.Name) or node.func.id != "P":
+            return False
+        first, axes, third, fourth = node.args
+        if not all(isinstance(arg, ast.Constant) and arg.value is None
+                   for arg in (first, third, fourth)):
+            return False
+        if not isinstance(axes, (ast.Tuple, ast.List)) or len(axes.elts) != 2:
+            return False
+        return [getattr(item, "value", None) for item in axes.elts] == ["x", "y"]
+
+    literal_sites = {
+        path.relative_to(src).as_posix(): [
+            node.lineno for node in ast.walk(ast.parse(path.read_text()))
+            if is_band_sphere_literal(node)
+        ]
+        for path in app_paths
+    }
+    literal_sites = {path: lines for path, lines in literal_sites.items() if lines}
+    assert list(literal_sites) == ["common/wfn_layout.py"], literal_sites
+    assert len(literal_sites["common/wfn_layout.py"]) == 1, literal_sites
+
+    assert "GFLAT_LOAD_SPEC" not in wfn
+    assert "band_sphere_spec()" in store
+    assert "p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)" in gflat_body
+    assert "np.prod([mesh.shape" not in gflat_body
+    assert "_p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
+    assert "_p_band = max(1, int(mesh_xy.size))" not in galerkin_body
+    assert "n_pad = round_up(nq, batch_size) - nq" in ht
+    assert "n_pad = (-nq) % batch_size" not in ht
+    assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
+    assert "r_divisor = spec_divisor(mesh, out_spec, axis=3)" in move_body
+    assert "ndev = p_x * p_y" not in move_body
+    assert "p = shard_factor(mesh, picked)" in subset_body
+    assert "p *= int(mesh.shape[a])" not in subset_body
 
 
 def test_init_bse_subspace_drops_the_pad_by_count_not_by_value():

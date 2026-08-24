@@ -31,6 +31,7 @@ from common import rank_criterion
 from common import spectral_closure
 from common import timing
 from common.units import RYD_TO_EV
+from common.wfn_layout import band_sphere_spec
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
@@ -599,7 +600,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # A product-band chunk smaller than the mesh still occupies one band on
     # every device after the loader's canonical band pad.  Carry that actual
     # width through the banner, range construction, FFT cache and ledger.
-    _p_band = max(1, int(mesh_xy.size))
+    _p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
     _bc = round_up(band_chunk_size, _p_band)
     _n_band_chunks = (nb + _bc - 1) // _bc
 
@@ -2245,7 +2246,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         _t0 = _perf()                                      # instrument:
         batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
         nq = int(kpath_frac.shape[0])
-        n_pad = (-nq) % batch_size
+        n_pad = round_up(nq, batch_size) - nq
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
         jax.block_until_ready(wrapped_k)                   # instrument:
