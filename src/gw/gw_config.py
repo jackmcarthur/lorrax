@@ -3111,22 +3111,16 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         # DELETED, not narrowed (same precedent as
         # ``low_mem_bands_self_consistent_unported``'s own 2026-08-23
         # lift): the census row's gap is closed for every combination
-        # bispinor ITSELF supports.  ``restart = true`` + ``bispinor =
-        # true`` was ALREADY refused before this session and independent
-        # of ``low_mem_bands`` — ``gw.gw_init.prepare_isdf_and_
-        # wavefunctions``'s restart-read path raises loudly whenever a
-        # restart file has no ``psi_full_y_transverse`` dataset, which is
-        # every file (this predates low_mem_bands entirely; see
-        # tests/regression/bispinor_debug/README.md: "bispinor restart
-        # is not yet supported").  A ``write_restart_tensors = true``
-        # fresh run (the default) is harmless under low_mem_bands too:
-        # the low_mem_bands restart WRITE branch simply omits the
-        # transverse-centroid face carrier (no dataset for it yet), and
-        # the SAME pre-existing read-side check refuses loudly if
-        # anyone later tries to restart from that file with
-        # ``bispinor = true`` — no silent data loss, in either layout.
-        # This row is deleted outright rather than re-pointed at that
-        # pre-existing, low_mem_bands-independent limitation.
+        # bispinor ITSELF supports.  ``restart = true`` +
+        # ``bispinor = true`` round-trips in BOTH layouts (legacy
+        # per-channel ``psi_full_y_transverse`` since 2026-07-27; the
+        # face pair ``psi_full_y_transverse`` +
+        # ``psi_full_y_transverse_mun`` since 2026-08-23,
+        # feat/bispinor-restart-2026-08-23).  A file written by one
+        # layout read by the other refuses loudly by name in
+        # ``gw.gw_init.prepare_isdf_and_wavefunctions`` /
+        # ``file_io.read_restart_state_from_h5`` -- no silent data loss
+        # in any combination.
     # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
         # port-2026-08-22); the row was KEPT, narrowed to MPA only.  History
         # of that narrowing:
