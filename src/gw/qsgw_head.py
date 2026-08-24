@@ -87,11 +87,17 @@ registered, still-open v-sharding-reshard 81.74-GiB legacy defect
 Units and coordinates
 ---------------------
 Hamiltonians and frequencies are Ry.  ``bvec_cart`` has reciprocal lattice
-vectors as rows in 1/bohr, matching ``blat * WfnLoader.bvec``.  The FFT is
-used only by the retained spectral/reference derivative; the production
-finite-link stencil differentiates on the reduced-coordinate kappa grid and
-``B^{-1}`` converts that covector to Cartesian k.  There is no extra hbar
-conversion in LORRAX's Ry/bohr velocity convention.
+vectors as rows in 1/bohr, matching ``blat * WfnLoader.bvec``.  The
+production finite-link stencil differentiates on the reduced-coordinate
+kappa grid and ``B^{-1}`` converts that covector to Cartesian k.  There is
+no extra hbar conversion in LORRAX's Ry/bohr velocity convention.  (An
+FFT-based spectral derivative plus a separate finite-link connection
+commutator existed here as a second discretization of ``D_k Sigma``; it is
+retired as of the 2026-08-23 retirement sweep — the Si velocity
+expeditions measured its correction as ~uncorrelated with the true one on
+real SOC data, not merely lower-order, because a finite grid gives the
+split no exact product rule to cancel truncation error against.  See
+``covariant_link_derivative``, the sole production/gate discretization.)
 
 TIME-REVERSAL PARITY OF THE QSGW VELOCITY — the convention, derived
 --------------------------------------------------------------------
@@ -178,7 +184,6 @@ __all__ = [
     "build_iteration_head_samples",
     "build_iteration_head_response",
     "build_dft_head_response",
-    "covariant_cartesian_derivative",
     "covariant_link_derivative",
     "head_s_tensor_sharded",
     "head_wings_sharded",
@@ -192,9 +197,7 @@ __all__ = [
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
     "report_trs_velocity_parity",
-    "spectral_cartesian_derivative",
     "trs_velocity_parity_residual",
-    "validate_dft_velocity_identity",
 ]
 
 # The band-trace parity residual above which the assembled velocity is
@@ -682,6 +685,32 @@ def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
 
 
 def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
+    """Cached FFT-based Cartesian derivative kernel.
+
+    RETAINED WITHOUT A PRODUCTION CALLER (2026-08-23 retirement sweep,
+    D4): this and :func:`_cartesian_fft_multipliers` used to back the
+    public ``spectral_cartesian_derivative``/``covariant_cartesian_
+    derivative`` pair, both retired below (dead: zero production callers,
+    and the Si velocity expeditions measured the split construction they
+    implemented -- a separately-FFT-differentiated operator plus a
+    finite-link commutator -- as producing a correction with ~0 overlap
+    to the true one on real SOC data; see the module docstring's
+    ``v_Q = v_DFT + D_link(...)`` note and
+    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md``).  These two
+    stayed: ``tests/multi_device/parallel_transport_profile.py`` imports
+    them directly (bypassing the now-deleted public wrapper) for its own
+    HLO-rematerialization check.  That test module was ALREADY broken
+    before this sweep touched anything -- it also imports
+    ``covariant_structured_delta``/``_structured_delta_kernel``, which do
+    not exist anywhere in this file and have not since before this
+    session (grep-verified); registered separately in
+    KNOWN_LORRAX_ISSUES.md rather than repaired here, since untangling it
+    means editing a P=4 real-distributed-service gate this sweep cannot
+    execute to verify.  Left in place rather than deleted out from under
+    that reference, per DISCIPLINE's "grep-verified zero callers in src/
+    AND tests/" bar -- this one is not zero in tests/, even though the
+    caller is inert.
+    """
     from ffi import ffi_dial_key
 
     key = ("spectral_cart", id(mesh), tuple(kgrid), ffi_dial_key())
@@ -711,93 +740,6 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
     _KERNEL_CACHE[key] = _kernel
     return _kernel
-
-
-def spectral_cartesian_derivative(
-    operator_k,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-):
-    """Spectrally differentiate a full-BZ band operator.
-
-    ``operator_k`` is ``(nk,nb,nb)`` at ``P(None,'x','y')``.  The full
-    k grid remains local to each band tile, so the FFT communicates no band
-    data.  One cached compiled graph contains the forward FFT and one inverse
-    FFT batched across the three Cartesian components.
-    """
-    kgrid = tuple(int(n) for n in kgrid)
-    nk = int(np.prod(kgrid))
-    if tuple(operator_k.shape[:1]) != (nk,) or operator_k.ndim != 3:
-        raise ValueError(
-            f"operator_k must have shape ({nk},nb,nb), got {tuple(operator_k.shape)}."
-        )
-    if operator_k.shape[1] != operator_k.shape[2]:
-        raise ValueError("spectral derivative requires square band matrices.")
-    mult = jnp.asarray(
-        _cartesian_fft_multipliers(kgrid, np.asarray(bvec_cart)), dtype=jnp.float64
-    )
-    return _spectral_kernel(mesh, kgrid)(
-        jnp.asarray(operator_k, dtype=jnp.complex128), mult
-    )
-
-
-def _commutator_kernel(mesh: Mesh) -> Callable:
-    key = ("band_commutator", id(mesh))
-    hit = _KERNEL_CACHE.get(key)
-    if hit is not None:
-        return hit
-    _mesh_xy(mesh)
-
-    def _local(A_row, H_col, H_row, A_col):
-        AH = jnp.einsum("akim,kmj->akij", A_row, H_col, optimize=True)
-        HA = jnp.einsum("kim,akmj->akij", H_row, A_col, optimize=True)
-        return AH - HA
-
-    # Gather only one band dimension of each operand.  No rank ever owns a
-    # full (nb,nb) matrix; the output returns to the native 2-D band tile.
-    sm = shard_map(
-        _local,
-        mesh=mesh,
-        in_specs=(
-            P(None, None, "x", None),
-            P(None, None, "y"),
-            P(None, "x", None),
-            P(None, None, None, "y"),
-        ),
-        out_specs=P(None, None, "x", "y"),
-        check_vma=False,
-    )
-
-    @jax.jit
-    def _kernel(A, H):
-        return sm(A, H, H, A)
-
-    _KERNEL_CACHE[key] = _kernel
-    return _kernel
-
-
-def covariant_cartesian_derivative(
-    operator_k,
-    connection_cart,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-):
-    """Return ``partial_i operator - i[A_i,operator]`` for i=x,y,z."""
-    H = jnp.asarray(operator_k, dtype=jnp.complex128)
-    A = jnp.asarray(connection_cart, dtype=jnp.complex128)
-    expected = (3,) + tuple(H.shape)
-    if tuple(A.shape) != expected:
-        raise ValueError(
-            f"connection_cart must have shape {expected}, got {tuple(A.shape)}."
-        )
-    partial = spectral_cartesian_derivative(
-        H, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart
-    )
-    return partial - 1j * _commutator_kernel(mesh)(A, H)
 
 
 def covariant_link_derivative(
@@ -1011,14 +953,78 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    key = ("head_s", id(mesh), int(nb_logical))
+def _interband_degenerate_weight(
+    dE, f_diff, z, s_avg, prefactor, near_degenerate, *, include_surface: bool,
+):
+    r"""Adler-Wiser interband weight, continuous through ``dE -> 0``.
+
+    ``prefactor * f_diff / (dE * (z**2 - dE**2))`` has a removable
+    singularity at ``dE = 0`` for FIXED, nonzero ``z``: by l'Hopital on the
+    numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
+    ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
+    caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
+    mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
+    limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
+    ``_fractional_pair_scan`` already takes for its own ``z=0`` diagonal
+    limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
+    is ``+`` rather than ``-`` because this module's ``f_diff`` is built
+    ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical
+    limit, opposite index convention).  The ``z``-dependence keeps its
+    finite-``z`` form throughout: only ``dE`` is taken to a limit, never
+    ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
+    different singularity and is untouched by this branch.
+
+    ``s_avg`` (``0.5*(s_bra+s_ket)``) and ``near_degenerate`` (the
+    resolution-scaled ``|dE|`` test) are precomputed by the caller,
+    already broadcast to ``dE``'s shape: neither depends on ``omega``, so
+    hoisting them out of the inner per-frequency closure avoids
+    recomputing a comparison already fixed by the band-pair tile alone.
+
+    ``include_surface`` is a plain Python ``bool``, closed over at trace
+    time by the caller (its kernel factory already keys its compilation
+    cache on it): when ``False`` -- no ``-f'`` data, i.e. every insulating
+    or fixed-occupation deck -- this compiles to EXACTLY the pre-fix
+    ``jnp.where(|denom|>1e-16, regular, 0)`` body; the degenerate branch
+    is never lowered into that HLO graph and ``s_avg``/``near_degenerate``
+    are unused (may be ``None``).
+
+    SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
+    is ``_s_tensor_kernel``'s ONLY; the wing kernels
+    (``_head_wing_kernel_legacy``/``_face``) build a structurally
+    DIFFERENT ``F_ij = pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
+    power of ``dE`` (documented explicitly in ``head_wings_sharded``'s own
+    docstring), because a wing pairs one velocity leg with one
+    dimension-1-in-energy density vertex where the head pairs two
+    velocity legs.  At fixed nonzero ``z``, THAT formula is already
+    continuous as ``dE -> 0`` (``f_diff -> 0`` at the same order as the
+    numerator, no compensating ``dE`` in the denominator to cancel), so
+    its own ``|denom|>1e-16`` clip is not this same defect -- it guards a
+    ``z ~= dE`` resonance, a different singularity this helper does not
+    address.  Do not reuse this helper there without rederiving the limit.
+    """
+    denom = dE * (z * z - dE * dE)
+    zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
+    regular = prefactor * f_diff / denom
+    clipped = jnp.where(jnp.abs(denom) > 1.0e-16, regular, zero)
+    if not include_surface:
+        return clipped
+    z_ok = jnp.abs(z) > 1.0e-15
+    degenerate = prefactor * s_avg / (z * z)
+    return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+
+
+def _s_tensor_kernel(
+    mesh: Mesh, *, nb_logical: int, include_surface: bool = False,
+) -> Callable:
+    key = ("head_s", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta):
+    def _local(
+        v_local, e_bra, e_ket, f_bra, f_ket, s_bra, s_ket, omegas, prefactor, eta,
+    ):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -1031,13 +1037,26 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         # occupation difference.  The historical 0/1 path is unchanged
         # because its energy-ordered nonzero differences are positive.
         transition = logical & (dE > 0.0)
+        if include_surface:
+            scale = jnp.maximum(
+                1.0,
+                jnp.maximum(jnp.abs(e_bra)[:, :, None], jnp.abs(e_ket)[:, None, :]),
+            )
+            near_degenerate = (
+                jnp.abs(dE) <= 64.0 * jnp.finfo(jnp.float64).eps * scale)
+            s_avg = 0.5 * (s_bra[:, :, None] + s_ket[:, None, :])
+        else:
+            near_degenerate = None
+            s_avg = None
 
         def _one(omega):
             z = omega + 1j * eta
-            denom = dE * (z * z - dE * dE)
             weight = jnp.where(
-                transition & (jnp.abs(denom) > 1.0e-16),
-                prefactor * f_diff / denom,
+                transition,
+                _interband_degenerate_weight(
+                    dE, f_diff, z, s_avg, prefactor, near_degenerate,
+                    include_surface=include_surface,
+                ),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
             local = jnp.einsum(
@@ -1079,6 +1098,8 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         mesh=mesh,
         in_specs=(
             P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
             P(None, "x"),
             P(None, "y"),
             P(None, "x"),
@@ -2191,12 +2212,16 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    interband = _s_tensor_kernel(
+        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
+    )(
         v,
         e,
         e,
         f,
         f,
+        surface,
+        surface,
         omega,
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
@@ -3000,42 +3025,3 @@ def report_trs_velocity_parity(
         return False
     print_fn(f"  sanity[{name}]: {detail} — parity holds.")
     return True
-
-
-def validate_dft_velocity_identity(
-    h_dft_k,
-    connection_cart,
-    velocity_dft_cart,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-) -> dict[str, float]:
-    """Mandatory full-matrix gate for ``v = partial H - i[A,H]``.
-
-    Reductions happen on device; only five scalars cross to the host.
-    Diagonal and off-diagonal maxima are reported separately so a passing
-    diagonal cannot hide a link-orientation error in the transition sector.
-    """
-    target = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    got = covariant_cartesian_derivative(
-        h_dft_k, connection_cart, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart
-    )
-    if got.shape != target.shape:
-        raise ValueError(
-            f"reconstructed/target velocity shapes differ: {got.shape}/{target.shape}."
-        )
-    diff = jnp.abs(got - target)
-    nb = int(diff.shape[-1])
-    eye = jnp.eye(nb, dtype=bool)[None, None, :, :]
-    scale = jnp.max(jnp.abs(target))
-    herm = jnp.max(jnp.abs(got - jnp.conj(jnp.swapaxes(got, -1, -2))))
-    vals = (
-        jnp.max(diff),
-        jnp.max(jnp.where(eye, diff, 0.0)),
-        jnp.max(jnp.where(~eye, diff, 0.0)),
-        jnp.max(diff) / jnp.maximum(scale, 1.0e-30),
-        herm,
-    )
-    names = ("max_abs", "max_abs_diag", "max_abs_offdiag", "max_rel", "hermiticity")
-    return {name: float(value) for name, value in zip(names, vals)}

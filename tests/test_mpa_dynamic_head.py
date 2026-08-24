@@ -249,6 +249,10 @@ def test_s_tensor_kernel_streamed_matches_unblocked_reference():
     e_y = put(jnp.asarray(e), NamedSharding(mesh, P(None, "y")))
     f_x = put(jnp.asarray(f), NamedSharding(mesh, P(None, "x")))
     f_y = put(jnp.asarray(f), NamedSharding(mesh, P(None, "y")))
+    # include_surface=False (the default, matching every insulating deck):
+    # s_bra/s_ket are unused by the kernel body, so zeros are a legal filler.
+    s_x = put(jnp.zeros_like(jnp.asarray(e)), NamedSharding(mesh, P(None, "x")))
+    s_y = put(jnp.zeros_like(jnp.asarray(e)), NamedSharding(mesh, P(None, "y")))
     kernel = _s_tensor_kernel(mesh, nb_logical=nb_logical)
 
     block = _HEAD_WING_FREQUENCY_BLOCK
@@ -258,7 +262,7 @@ def test_s_tensor_kernel_streamed_matches_unblocked_reference():
         ref = np.asarray(jax.device_get(
             _s_tensor_reference(v, e, f, omegas, pref, eta, nb_logical)))
         got = np.asarray(jax.device_get(kernel(
-            v_sh, e_x, e_y, f_x, f_y,
+            v_sh, e_x, e_y, f_x, f_y, s_x, s_y,
             jnp.asarray(omegas, dtype=jnp.complex128),
             jnp.asarray(pref, dtype=jnp.complex128), jnp.asarray(eta))))
         assert got.shape == (n_omega, 3, 3)
@@ -298,13 +302,17 @@ def test_s_tensor_kernel_temp_size_is_bounded_past_one_frequency_block():
     e_y = sds((nk, nb_pad), f64, P(None, "y"))
     f_x = sds((nk, nb_pad), f64, P(None, "x"))
     f_y = sds((nk, nb_pad), f64, P(None, "y"))
+    # include_surface=False (the default): s_bra/s_ket are unused, but the
+    # kernel signature still needs a same-shaped filler.
+    s_x = sds((nk, nb_pad), f64, P(None, "x"))
+    s_y = sds((nk, nb_pad), f64, P(None, "y"))
     pref = sds((), c128, P())
     eta = sds((), f64, P())
     kernel = _s_tensor_kernel(mesh, nb_logical=nb_logical)
 
     def compiled_peak(n_omega):
         omega = sds((n_omega,), c128, P(None))
-        ma = kernel.lower(v, e_x, e_y, f_x, f_y, omega, pref, eta) \
+        ma = kernel.lower(v, e_x, e_y, f_x, f_y, s_x, s_y, omega, pref, eta) \
                    .compile().memory_analysis()
         return (ma.temp_size_in_bytes + ma.argument_size_in_bytes
                 + ma.output_size_in_bytes - ma.alias_size_in_bytes)
@@ -323,6 +331,100 @@ def test_s_tensor_kernel_temp_size_is_bounded_past_one_frequency_block():
         "KNOWN_LORRAX_ISSUES.md 'the bounded full-head fold still needs a "
         "fresh-fit lifetime boundary'."
     )
+
+
+def test_s_tensor_degenerate_limit_replaces_the_hard_clip_discontinuity():
+    """Red twin for D1: the pre-fix ``|denom|>1e-16`` clip
+    (``_s_tensor_reference``, the literal pre-fix body, kept undisturbed
+    here so this A/B does not depend on the code under test) drops a
+    near-degenerate interband pair's weight to EXACTLY zero the instant
+    ``|dE*(z**2-dE**2)|`` crosses the machine-epsilon floor, even though
+    the true divided difference ``f_diff/dE`` has a finite limit there
+    (the analytic MP1 ``-df/dE``).  Two bands, one at the chemical
+    potential and one ``dE`` above it (``e_ket`` pinned at exactly 0.0 so
+    ``dE = e_bra - e_ket`` is representable to full float64 precision at
+    any scale -- no cancellation in ``dE`` itself, only in the physically
+    unavoidable ``f_diff`` cancellation this fix must survive), at fixed
+    ``z=1+0j`` so ``denom ~= dE`` to leading order and the pre-fix
+    threshold falls almost exactly at ``dE ~= 1e-16``.
+    """
+    if len(jax.devices()) < 4:
+        import pytest
+        pytest.skip("requires four CPU test devices")
+
+    from gw.efermi import mp1_negative_derivative, mp1_occupations
+
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    nk, nb, nb_logical = 1, 2, 2
+    mu, width = 0.0, 0.05  # Ry; both bands sit at/near E_F, the metal case
+    pref, eta = 1.0, 0.0
+    omega = np.array([1.0])  # z = 1+0j -> z^2 = 1, denom ~= dE for tiny dE
+
+    def build(dE):
+        e = np.array([[dE, 0.0]], dtype=np.float64)  # (nk, nb) = [bra, ket]
+        f = np.asarray(jax.device_get(mp1_occupations(e, mu, width)))
+        s = np.asarray(jax.device_get(mp1_negative_derivative(e, mu, width)))
+        return e, f, s
+
+    # All velocity weight on the single (bra=0,ket=1) transition, so S[0,0]
+    # extracts exactly this one pair's weight (the (1,0) entry never
+    # contributes: its dE is negative, so `transition` excludes it on both
+    # the pre-fix and fixed kernel).
+    v = np.zeros((3, nk, nb, nb), dtype=np.complex128)
+    v[0, 0, 0, 1] = 1.0
+    v[0, 0, 1, 0] = 1.0
+
+    def old_S00(dE):
+        e, f, _s = build(dE)
+        ref = _s_tensor_reference(v, e, f, omega, pref, eta, nb_logical)
+        return complex(np.asarray(jax.device_get(ref))[0, 0, 0])
+
+    put = jax.device_put
+    kernel = _s_tensor_kernel(mesh, nb_logical=nb_logical, include_surface=True)
+
+    def new_S00(dE):
+        e, f, s = build(dE)
+        sh = lambda a, spec: put(jnp.asarray(a), NamedSharding(mesh, spec))
+        got = kernel(
+            sh(v, P(None, None, "x", "y")),
+            sh(e, P(None, "x")), sh(e, P(None, "y")),
+            sh(f, P(None, "x")), sh(f, P(None, "y")),
+            sh(s, P(None, "x")), sh(s, P(None, "y")),
+            jnp.asarray(omega, dtype=jnp.complex128),
+            jnp.asarray(pref, dtype=jnp.complex128), jnp.asarray(eta))
+        return complex(np.asarray(jax.device_get(got))[0, 0, 0])
+
+    dE_below = 5.0e-17   # |denom| ~= 5e-17 <= 1e-16: the pre-fix clip fires
+    dE_above = 1.0e-14   # |denom| ~= 1e-14 >  1e-16: the pre-fix clip does not
+    dE_far = 1.0e-10     # far outside EITHER kernel's near-degenerate test
+
+    # Pre-fix: an O(1) jump to EXACTLY zero once |denom| <= 1e-16, even
+    # though the physical weight (below) is finite and non-tiny on both
+    # sides -- "exactly-zero vs finite" at neighbouring dE.
+    old_below, old_above = old_S00(dE_below), old_S00(dE_above)
+    assert old_below == 0.0
+    assert abs(old_above) > 1.0e-3, (
+        f"fixture did not land in the pre-fix UNclipped region: {old_above}")
+
+    # Fixed kernel: finite on the clipped side, and CONTINUOUS across the
+    # old clip boundary -- its own near-degenerate branch (dE_below) and
+    # its unchanged regular-divided-difference branch far outside it
+    # (dE_far, where |dE| >> 64*eps*scale so it never touches the new
+    # branch at all) agree to high relative precision, because both are
+    # approximating the SAME smooth function (f_diff/dE at fixed z) near
+    # the SAME point.
+    new_below, new_far = new_S00(dE_below), new_S00(dE_far)
+    assert new_below != 0.0
+    np.testing.assert_allclose(
+        new_below, new_far, rtol=1.0e-6,
+        err_msg=f"fixed kernel is not continuous through dE->0: "
+                f"S(dE={dE_below})={new_below}, S(dE={dE_far})={new_far}")
+
+    # And the fix is scoped EXACTLY to the formerly-clipped region: at
+    # dE_far (comfortably outside both the pre-fix clip and the new
+    # resolution-scaled test), the fixed kernel reproduces the pre-fix
+    # reference bit-for-bit -- it has not touched the regular branch.
+    np.testing.assert_array_equal(new_far, old_S00(dE_far))
 
 
 def test_pad_head_band_manifold_commits_v_to_the_declared_mesh_sharding():
