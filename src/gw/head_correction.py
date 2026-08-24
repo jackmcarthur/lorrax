@@ -735,6 +735,105 @@ def fold_cartesian_head_wings_sharded(
         S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
 
 
+@jax.jit
+def _static_slab_photon_head_moment_chunk(
+    q_cart: jax.Array,
+    D_raw: jax.Array,
+    R_linear: jax.Array,
+    R_quadratic: jax.Array,
+    valid_count: jax.Array,
+):
+    r"""Accumulate one fixed-size chunk of the coupled small-head solve.
+
+    ``R(q) = q_a R_linear[a] + q_a q_b R_quadratic[a,b]`` uses the two
+    periodic in-plane Cartesian coordinates of a slab.  For every valid
+    mini-BZ sample this evaluates the *coupled* four-field Dyson equation
+
+    ``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
+
+    before averaging.  The returned ``(1,qx,qy)`` moments are sufficient to
+    rebuild the head, both single wings, and the double-wing body update as
+    repeated rank-four outer products; no sample-by-centroid array exists.
+
+    This is the sole sample-sized graph.  The vcoul provider zero-pads its
+    final chunk to the same fixed size and passes ``valid_count``, preventing
+    a tail-shape recompile and keeping the invalid q=0 rows outside every
+    accumulated quantity.
+    """
+    q = jnp.asarray(q_cart, dtype=jnp.float64)
+    D = jnp.asarray(D_raw, dtype=jnp.complex128)
+    H = jnp.asarray(R_linear, dtype=jnp.complex128)
+    Q = jnp.asarray(R_quadratic, dtype=jnp.complex128)
+    qxy = q[:, :2]
+    R = (
+        jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
+        + jnp.einsum("sa,sb,abij->sij", qxy, qxy, Q, optimize=True)
+    )
+    identity = jnp.eye(4, dtype=jnp.complex128)[None, :, :]
+    lhs = identity - jnp.einsum("sik,skj->sij", D, R, optimize=True)
+    W_head = jnp.linalg.solve(lhs, D)
+
+    valid = jnp.arange(q.shape[0], dtype=jnp.int32) < valid_count
+    weight = valid.astype(jnp.float64)
+    basis = jnp.concatenate(
+        (jnp.ones((q.shape[0], 1), dtype=jnp.float64), qxy), axis=1)
+    moments = jnp.einsum(
+        "s,su,sij,sv->uvij", weight, basis, W_head, basis,
+        optimize=True)
+    D_sum = jnp.einsum("s,sij->ij", weight, D, optimize=True)
+
+    residual = jnp.einsum(
+        "sik,skj->sij", lhs, W_head, optimize=True) - D
+    residual_norm = jnp.linalg.norm(residual, axis=(-2, -1))
+    D_norm = jnp.linalg.norm(D, axis=(-2, -1))
+    relative = residual_norm / jnp.maximum(
+        D_norm, jnp.asarray(1.0e-300, dtype=jnp.float64))
+    max_relative = jnp.max(jnp.where(valid, relative, 0.0))
+    return moments, D_sum, valid_count, max_relative
+
+
+def static_slab_photon_head_moment_chunk(
+    q_cart,
+    D_raw,
+    R_linear,
+    R_quadratic,
+    valid_count,
+):
+    """Validated entry to the fixed-size static slab photon-head graph.
+
+    Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
+    ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
+    units (no cell-volume factor), and the response coefficients are
+    ``(2,4,4)`` and ``(2,2,4,4)``.  The caller averages these sums per
+    independent mini-BZ repetition, then across repetitions; it applies the
+    one and only ``1/Vcell`` while rebuilding the packed q=Gamma row.
+
+    The function is intentionally slab/static-only.  A bulk analytic-sphere
+    correction cannot be added after this nonlinear coupled solve, and must
+    have its own derived integrator before that policy is admitted.
+    """
+    q_shape = tuple(np.shape(q_cart))
+    d_shape = tuple(np.shape(D_raw))
+    h_shape = tuple(np.shape(R_linear))
+    Q_shape = tuple(np.shape(R_quadratic))
+    if len(q_shape) != 2 or q_shape[1] != 3:
+        raise ValueError(f"q_cart must be (chunk,3), got {q_shape}")
+    expected_D = (q_shape[0], 4, 4)
+    if d_shape != expected_D:
+        raise ValueError(f"D_raw must be {expected_D}, got {d_shape}")
+    if h_shape != (2, 4, 4) or Q_shape != (2, 2, 4, 4):
+        raise ValueError(
+            "static slab response coefficients must be R_linear=(2,4,4) "
+            f"and R_quadratic=(2,2,4,4); got {h_shape}/{Q_shape}")
+    n_valid = int(valid_count)
+    if not 0 <= n_valid <= q_shape[0]:
+        raise ValueError(
+            f"valid_count must lie in [0,{q_shape[0]}], got {n_valid}")
+    return _static_slab_photon_head_moment_chunk(
+        q_cart, D_raw, R_linear, R_quadratic,
+        jnp.asarray(n_valid, dtype=jnp.int32))
+
+
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
                         sym=None, meta=None, params=None, print_fn=print):
     """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it.
