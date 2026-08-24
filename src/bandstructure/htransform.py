@@ -1166,21 +1166,32 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # Pad nq to a multiple of batch_size — every batch has the same
         # shape, _kpath_batch compiles ONCE.
         #
-        # And pad batch_size itself to a multiple of ndev.  ``batch_mat_shard``
-        # / ``batch_eig_shard`` above are RAW ``P(('x','y'), …)`` NamedShardings
-        # with no fitter, so a width that does not divide px*py does not
-        # degrade here — it raises ``IndivisibleError`` inside the jit.  A
-        # fixed 32 therefore restricts this driver to device counts dividing
-        # 32; at P=64 it cannot run at all.  Third member of the same class as
-        # the zero-padded Galerkin r carrier above and the ``bs`` block in
-        # ``bandstructure.bse_setup`` (whose 32-wide q-batch, which DOES have a
-        # fitter, replicated instead of refusing and cost 866.5 s vs 105.7 s —
-        # jobs 7882533 / 7882569).  Padding is the right lever for all three:
-        # the extra q are zero rows already appended here and already dropped
-        # by the ``[:nq]`` slice in ``_post_kpath``, so this changes how many
-        # q are evaluated and where, never a value.
+        # The q axis is split over the WHOLE mesh by
+        # ``P(('x','y'), None, None)``.  Its smallest legal nonempty extent is
+        # therefore exactly ndev, which gives each device ONE whole
+        # ``(rank, rank)`` matrix.  A fixed width of 32 was placement-legal at
+        # P16 but assigned TWO rank-4800 matrices/device; the native eigvalsh
+        # workspace then requested 13.73 GiB and killed the CrI3 200-band arm
+        # after every fH/Gamma gate had passed (JID 57538651).  This is the
+        # native path's memory plan: minimize concurrent whole matrices while
+        # retaining ndev-way q parallelism.  A distributed-within-matrix path
+        # belongs to ``distrib_la.plan``, not a second eig implementation here.
+        #
+        # ``padded_extent`` is the canonical placement owner also used by
+        # bse_setup.  Starting from one means this policy cannot drift from
+        # the divisor that judges the actual NamedSharding.  Extra q are zero
+        # rows and ``_post_kpath[:nq]`` discards them, so only scheduling and
+        # the static executable shape change, never a retained value.
         _t0 = _perf()                                      # instrument:
-        batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
+        batch_size = _pad_to(mesh_xy, ('x', 'y'), 1)
+        ndev = spec_divisor(mesh_xy, P(('x', 'y'), None), axis=0)
+        matrices_per_device = batch_size // ndev
+        matrix_bytes = rank * rank * np.dtype(np.complex128).itemsize
+        log_fn(
+            f"  kpath native eig ledger: q-batch={batch_size}, ndev={ndev}, "
+            f"whole matrices/device={matrices_per_device}; one "
+            f"({rank}, {rank}) complex128 operand={matrix_bytes / 2**30:.3f} "
+            f"GiB/device (backend eigensolver workspace excluded)")
         nq = int(kpath_frac.shape[0])
         n_pad = round_up(nq, batch_size) - nq
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))

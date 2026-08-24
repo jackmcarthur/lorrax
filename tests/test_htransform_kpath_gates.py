@@ -7,7 +7,9 @@ Two cells, two claims from HTRANSFORM_FFT.md, both reached by driving the real
   killed two of the four reference decks at P=4 (PROFILE_htransform_exciton
   §1.5): ``_post_kpath`` carried no ``out_shardings``, so its outputs inherited
   the q-sharding of the batches it concatenates and the host fetch on the next
-  line died whenever ``nq`` divided the device count.
+  line died whenever ``nq`` divided the device count.  The same cell pins the
+  native batch to one whole matrix/device; a placement-legal fixed width of 32
+  OOMed the rank-4800/P16 CrI3 arm by assigning two per device.
 * ``test_identity_metric_route_matches_the_cholesky_route`` — S is the identity
   from its one producer, so the two triangular solves per q are vestigial;
   removing them is analytic, not bitwise, and this pins the size of the
@@ -88,6 +90,8 @@ def test_post_kpath_outputs_are_replicated(ndev):
                           kpath_data, lines.append, mesh,
                           n_return_bands=ct.shape[1] - 1)
     banner = " ".join(lines)
+    assert (f"kpath native eig ledger: q-batch={ndev}, ndev={ndev}, "
+            f"whole matrices/device=1" in banner), banner
     assert "[gate] _post_kpath out spec:" in banner, banner
     spec = banner.split("[gate] _post_kpath out spec:")[1].split()[0]
     assert spec in ("P()", "PartitionSpec()"), (
