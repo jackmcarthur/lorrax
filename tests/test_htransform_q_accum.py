@@ -196,10 +196,7 @@ def _twin_body() -> dict:
         Q_ref += inv_s * (UH @ psi.reshape(nk * w, ns * n_rtot))
     q_layout_ok = (Q.sharding.spec == sharding_q.spec)
 
-    fold = jax.jit(
-        lambda Q_, G_: G_ + jnp.einsum("asr,bsr->ab", Q_, jnp.conj(Q_),
-                                       optimize=True),
-        donate_argnums=(0, 1), out_shardings=grid_xy)
+    fold = ht._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
     G = fold(Q, G)
     G_ref = Q_ref @ Q_ref.conj().T
 

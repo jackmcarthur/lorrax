@@ -82,6 +82,7 @@ def _build_mesh_xy() -> Mesh:
 
 
 _accum_G_cache: dict = {}
+_fold_G_cache: dict = {}
 
 
 def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
@@ -126,6 +127,54 @@ def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
 
     _accum_G_cache[key] = _accum
     return _accum
+
+
+def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
+    """Fold r-sharded ``Q Q†`` directly onto a 2-D matrix face.
+
+    ``Q`` owns a different r block on every ``(x,y)`` rank.  Form the small
+    full-rank Gram contribution from that local block, then use the
+    established two-stage ``psum_scatter`` face contraction: x sums its r
+    groups while scattering matrix rows, y sums the remaining groups while
+    scattering columns.  No generic partitioner is allowed to trade the
+    0.4-GiB Q shard for a replicated multi-GiB operand.
+    """
+    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec))
+    fn = _fold_G_cache.get(key)
+    if fn is not None:
+        return fn
+
+    p_x = int(mesh_.shape['x'])
+    p_y = int(mesh_.shape['y'])
+    if rank_ % p_x or rank_ % p_y:
+        raise ValueError(
+            "_make_fold_G_kernel: the carried Galerkin rank must divide "
+            f"both mesh axes; rank={rank_}, mesh={p_x}x{p_y}")
+
+    @partial(
+        shard_map,
+        mesh=mesh_,
+        in_specs=(sharding_q_.spec, P('x', 'y')),
+        out_specs=P('x', 'y'),
+        check_vma=False,
+    )
+    def _fold_local(Q_local, G_local):
+        partial = jnp.einsum(
+            'asr,bsr->ab', Q_local, jnp.conj(Q_local), optimize=True)
+        partial = jax.lax.psum_scatter(
+            partial, 'x', scatter_dimension=0, tiled=True)
+        partial = jax.lax.psum_scatter(
+            partial, 'y', scatter_dimension=1, tiled=True)
+        return G_local + partial
+
+    fn = jax.jit(
+        _fold_local,
+        donate_argnums=(1,),
+        in_shardings=(sharding_q_, grid_xy_),
+        out_shardings=grid_xy_,
+    )
+    _fold_G_cache[key] = fn
+    return fn
 
 # Ceiling on ONE streamed ψ band-chunk in the Galerkin build.
 #
@@ -543,6 +592,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     bc_cap = max(1, int(resolve_galerkin_chunk_bytes()
                         // max(1, bytes_per_band)))
     band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
+    # A product-band chunk smaller than the mesh still occupies one band on
+    # every device after the loader's canonical band pad.  Carry that actual
+    # width through the banner, range construction, FFT cache and ledger.
+    _p_band = max(1, int(mesh_xy.size))
+    _bc = round_up(band_chunk_size, _p_band)
+    _n_band_chunks = (nb + _bc - 1) // _bc
 
     _rank_policy = ("numerical (exact-span default)" if rank_multiplier == 0.0
                     else f"target {rank_multiplier:g}*nb="
@@ -552,8 +607,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         + (f" -> {n_r_carrier} zero-padded carrier" if n_r_carrier != n_rtot
            else "") + ", "
         f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']}), "
-        f"band_chunk={band_chunk_size}, rank={_rank_policy} "
-        f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
+        f"band_chunk={_bc}"
+        + (f" (planner {band_chunk_size}, mesh-aligned)"
+           if _bc != band_chunk_size else "")
+        + f", rank={_rank_policy} "
+        f"({bytes_per_band * _bc / mesh_xy.size / 1024**3:.2f} "
+        "GiB/device r-shard)"
     )
     # The chunk figure above is NOT the peak: the full-r Q accumulator is
     # live across all band chunks and dominates at production rank.  Its
@@ -566,22 +625,18 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
            f"{_rank_cap * nspinor * n_r_carrier * 16 / 1024**3:.2f} GiB "
            f"global before r-sharding; exact per-device ledger printed "
            f"after rank selection")
-    if band_chunk_size < nb:
+    if _n_band_chunks > 1:
         log_fn(f"  (band axis split into "
-               f"{(nb + band_chunk_size - 1)//band_chunk_size} chunks; G is "
+               f"{_n_band_chunks} chunks; G is "
                f"accumulated r-outer / band-inner so the split stays exact)")
 
     # ── 1. Load ψ(G-flat) ONCE for the whole band window ──
-    # One capped+padded load (band-sharded over ('x','y')) serves BOTH the
-    # centroid sampling below AND the r-streaming Galerkin sweep in step 3
-    # — previously each streamed band chunk re-issued its own
-    # ``loader.load`` (h5py read + symmetry unfold per chunk), so ψ was
-    # read from file twice per run (once for centroids, once chunk-by-chunk
-    # for the stream).  G-flat is small (~6-11% of the FFT box, same
-    # tensor ``load_centroids_band_chunked`` already held), so keeping it
-    # resident through the Q loop trades a few GB global for a single
-    # file read + single unfold.  Numerics: per-chunk consumption is a
-    # device SLICE of the same values — bit-identical.
+    # One capped+padded load (band-sharded over ('x','y')) serves centroid
+    # sampling.  It must NOT be dynamically sliced along that sharded band
+    # axis for the later r sweep: GSPMD gathers the full window to perform
+    # that slice (15.36 GiB/device on this CrI3 deck).  Step 3 therefore uses
+    # the iterator's bounded per-chunk loader and this one-shot window is
+    # released as soon as its centroid consumer has been dispatched.
     t0 = time.time()
     psi_G_win = load_psi_gflat_padded(
         wfn, band_range, mesh_xy=mesh_xy, bispinor=bispinor)
@@ -590,8 +645,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             f"streaming_galerkin_solve: band window {band_range} lies "
             f"entirely past the file's band extent ({int(wfn.nbands)})")
     log_fn(f"  ψ(G-flat) window load: {time.time()-t0:.2f}s "
-           f"(shape {tuple(psi_G_win.shape)}, shared by centroid sample + "
-           f"r-stream)")
+           f"(shape {tuple(psi_G_win.shape)}, centroid sample only)")
 
     # ── 1b. ψ at centroids (band-sharded internally on 'y') ──
     psi_rmu_Y, _ = load_centroids_band_chunked(
@@ -599,6 +653,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_range=band_range, band_chunk_size=band_chunk_size,
         psi_G_flat=psi_G_win,
     )
+    del psi_G_win
     # psi_rmu_Y: (nk, nb, ns, n_μ), sharded P(None, None, None, 'y')
     log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
     # Captured for the Q memory ledger below — psi_rmu_Y is deleted before
@@ -1009,8 +1064,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # the iteration count (and the per-chunk XLA retrace storm).  Rounding up to
     # a p_band multiple is free (same padded memory) and both removes the waste
     # and halves the iterations/compiles.  Pure chunking change -> identical G.
-    _p_band = max(1, int(mesh_xy.size))
-    _bc = round_up(band_chunk_size, _p_band)
     band_chunk_ranges = [
         (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
         for i in range((nb + _bc - 1) // _bc)
@@ -1039,7 +1092,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_r_carrier,
         band_chunk=_bc,
         m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=int(np.prod(psi_G_win.shape)),
+        psi_win_elems=0,
         p_total=int(mesh_xy.size), q_shards=q_shards, y_shards=_p_y_shards)
     log_fn(f"  Galerkin Q ledger (per device): Q sharded "
            f"{sharding_q.spec} ({q_shards}-way on r), "
@@ -1048,19 +1101,11 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     _refuse_unfit_galerkin_mesh(
         _ledger, rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_rtot,
         band_chunk=_bc, m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=int(np.prod(psi_G_win.shape)), mesh_xy=mesh_xy,
+        psi_win_elems=0, mesh_xy=mesh_xy,
         q_spec=sharding_q.spec, log_fn=log_fn)
     grid_xy_G = grid_xy
 
-    @partial(jax.jit, donate_argnums=(0, 1), out_shardings=grid_xy_G)
-    def _fold_G(Q, G_in):
-        # Contract (s, r) locally per r shard; the partitioner closes the
-        # (rank, rank) face with one all-reduce.  Same sum as the
-        # historical flattened ``Q @ Q^H`` — the spinor axis is merely no
-        # longer folded into r (value-level parity: reduction blocking
-        # changes, the summed terms do not).
-        return G_in + jnp.einsum('asr,bsr->ab', Q, jnp.conj(Q),
-                                 optimize=True)
+    fold_G = _make_fold_G_kernel(rank, mesh_xy, sharding_q, grid_xy_G)
 
     # Allocate G sharded directly.  ``jax.device_put(jnp.zeros(...), sharding)``
     # on a multi-process mesh hands JAX an UNCOMMITTED fully-addressable array,
@@ -1104,7 +1149,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             band_chunk_size=band_chunk_size,
             band_chunk_ranges=band_chunk_ranges,
             band_pad_to=_bc,
-            psi_G_flat=psi_G_win,
             product_r_spec=psi_r_layout.spec):
         if int(psi_bc_r.shape[-1]) != n_r_carrier:
             raise ValueError(
@@ -1134,8 +1178,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         Q = accum(UH_bc, inv_s, psi_bc_r, Q)
         del psi_bc_r
         chunk_count += 1
-    del psi_G_win  # window served its last consumer; free before Q Qᴴ
-    G = _fold_G(Q, G)
+    G = fold_G(Q, G)
     del Q
     jax.block_until_ready(G)
     log_fn(f"  G accumulation: {chunk_count} band chunk(s) summed into Q, "
