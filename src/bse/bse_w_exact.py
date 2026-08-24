@@ -12,7 +12,7 @@ Hamiltonian with the bare-exchange RING kernel V (the B1 dense k-summed form):
              [  -V   , -D - V ]]
 
 V sits in BOTH blocks — the RPA ring coupling K^A = (1/Nk)<M_t|v|M_t'>
-(``build_bse_ring_matvec_full(..., screening=True)``), NOT the excitonic V_B of
+(``build_bse_stack_matvec(..., full=True, screening=True)``), NOT the excitonic V_B of
 Henneke Eq. 2-20.  This is the test-charge screening whose resolvent resums the
 RPA bubble chi = chi0 (1 - v chi0)^{-1}; the exciton V_B kernel is a different
 response and does NOT reproduce W (it overshoots the q=0 tile by ~1.8x).  The GW
@@ -60,12 +60,12 @@ from .bse_feast import (
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
 from .bse_ring_comm import (
-    build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
     create_mesh_xy,
     make_bse_shardings,
 )
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_serial import compute_pair_amplitude
 from common.collectives import device_put_process_local, gather_to_host
 from common import rank_criterion
@@ -106,8 +106,8 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     """
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     ensure_W_R(data, include_W=False, mesh_xy=mesh_xy)
-    matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=False, screening=True)
+    matvec = build_bse_stack_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="rpa", full=True, screening=True)
     diag_h = build_preconditioner_diagonal_sharded(
         data, mesh_xy, include_W=False, use_tda=False)
     gen = build_realspace_random_transition_generator(
@@ -977,7 +977,7 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
          ``W(mu_X, nu_Y)`` = ``sh.V``.  No replicated ``(mu, nu)`` is ever formed.
 
     Block-Lanczos plug-in (future W(omega), do NOT build here).  The screening
-    matvec (``build_bse_ring_matvec_full(screening=True)``) is symmetric under
+    matvec (``build_bse_stack_matvec(full=True, screening=True)``) is symmetric under
     the symplectic metric, so a single block-Lanczos run seeded with the SAME
     stage-1 pair-basis block ``rhs`` (the v-probe seeds) tridiagonalizes the
     screening operator ONCE; every ``omega`` is then a small

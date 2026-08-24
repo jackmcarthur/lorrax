@@ -12,8 +12,8 @@ the (mu, nu) tiles this module returns.
 ``build_ladder_resolvent(..., include_w=False)`` DELEGATES to
 ``bse_w_exact._build_rpa_resolvent`` — the RPA limit of this SAME
 resolvent identity, with the direct rung parameterized out of the ring
-matvec (``bse_ring_comm.build_bse_ring_matvec_full(..., include_W=
-False)``) rather than a second matvec builder.  As of 2026-08-23 that
+matvec (``bse_stack_matvec.build_bse_stack_matvec(..., kernel='rpa',
+full=True)``) rather than a second matvec builder.  As of 2026-08-23 that
 limit is ALSO a served production diagram, ``screening_diagrams =
 w_rpa_resolvent`` (``gw.screening_bse.compute_screening_ladder``'s
 ``include_w=False`` arm) — a second route to ``w_rpa``'s own W, useful
@@ -328,11 +328,11 @@ from .bse_feast import (ensure_W_R, build_preconditioner_diagonal_sharded,
                         ladder_matvec_operands, matvec_operands)
 from .bse_io import load_bse_data_from_restart_sharded
 from .bse_ring_comm import (
-    build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
     make_bse_shardings,
 )
+from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_w_exact import (
     _build_rpa_resolvent,
     apply_screening_resolvent_block,
@@ -401,10 +401,10 @@ def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
     # ``fuse_ladder_rung`` is a COST switch, not a physics one: it sums the two
     # rung T intermediates of each block row before the (mu, nu, s, s, k) FFT
     # chain instead of after, so the matvec runs that chain twice instead of
-    # four times (bse_ring_comm._impl_core_fused).  Same operator to rounding;
+    # four times (bse_stack_matvec's full fused core). Same operator to rounding;
     # False is the A/B arm.
-    matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=True, screening=True,
+    matvec = build_bse_stack_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="bse", full=True, screening=True,
         ladder_rung_slots=True, fuse_ladder_rung=fuse_ladder_rung)
     diag_h = build_preconditioner_diagonal_sharded(
         data, mesh_xy, include_W=True, use_tda=False)

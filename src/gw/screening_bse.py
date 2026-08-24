@@ -11,8 +11,8 @@ the W that Sigma consumes is the LADDER-corrected screened Coulomb::
                                    direct rung -W(0) in its kernel
 
 Under ``w_rpa_resolvent`` it is the SAME resolvent identity with the rung
-parameterized OUT of the ring matvec (``include_w=False`` — see
-``bse.bse_ring_comm.build_bse_ring_matvec_full``), i.e. ``H = H_RPA``: a
+parameterized OUT of the shared matvec (``kernel='rpa'`` — see
+``bse.bse_stack_matvec.build_bse_stack_matvec(full=True)``), i.e. ``H = H_RPA``: a
 second route to ``w_rpa``'s own W, useful precisely because it shares
 every other moving part with the ladder (restart handoff, TRS/finite-q
 machinery it does not need but is built alongside, head resolvent) and so
@@ -992,7 +992,7 @@ def compute_screening_ladder(
     ``True`` (default) is the LADDER kernel, i.e. ``screening_diagrams =
     w_bse``; ``False`` builds the RPA operator inside the same resolvent
     machinery instead (the rung parameterized out --
-    ``bse.bse_ring_comm.build_bse_ring_matvec_full(..., include_W=False)``
+    ``bse.bse_stack_matvec.build_bse_stack_matvec(..., kernel='rpa', full=True)``
     -- one matvec builder, not a second one), i.e. ``screening_diagrams =
     w_rpa_resolvent``.  :func:`gw.screening.compute_screening_model` is
     the ONLY caller and sets it from ``diagrams`` directly.  Both arms

@@ -40,7 +40,7 @@ from common.fft_helpers import (
     make_sharded_fftn_3d,
     make_sharded_ifftn_3d,
 )
-from .bse_ring_comm import make_bse_shardings
+from .bse_ring_comm import make_bse_shardings, ring_spin_degeneracy
 
 
 def build_bse_simple_matvec(
@@ -110,7 +110,7 @@ def build_bse_simple_matvec(
             jnp.conj(M_Y), X, optimize=True,
         )
         S = lax.with_sharding_constraint(S, sh.S_k0)
-        S = S / sqrt_nk
+        S = (S / sqrt_nk) * ring_spin_degeneracy(psi_c_X.shape[2])
 
         # U[b, μ] = V_q0[μ, ν] · S[b, ν].
         # V_q0 P(x, y) on (μ, ν); S P(None, y) on (b, ν).

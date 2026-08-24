@@ -484,9 +484,9 @@ class ScreeningDiagrams(str, enum.Enum):
     - ``W_RPA_RESOLVENT`` — the SAME resolvent identity
       ``W(ω) − v = v (ω − H)⁻¹ v`` evaluated with the RPA operator
       (``H_RPA``, the ladder's own ``include_w=False`` limit: the direct
-      rung ``−W_R(0)`` is parameterized OUT of the ring matvec rather than
-      rebuilt by a second matvec — ``bse.bse_ring_comm.
-      build_bse_ring_matvec_full(..., include_W=False)`` — so this value
+      rung ``−W_R(0)`` is parameterized OUT of the shared matvec rather than
+      rebuilt by a second matvec — ``bse.bse_stack_matvec.
+      build_bse_stack_matvec(..., kernel='rpa', full=True)`` — so this value
       exercises the same operator family as ``w_bse``, minus one term).
       DESIGNED to reproduce ``w_rpa``'s W to the minimax-quadrature floor,
       and CERTIFIED to do so on the spinor fixture the existing unit

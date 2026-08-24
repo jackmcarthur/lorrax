@@ -21,7 +21,7 @@ instrument for that; do not promote any arm of it as it stands.
 **This module is a measurement instrument, not a production path.**  Nothing in
 ``src/`` imports it; ``tests/bench/bench_w_ladder_fftffi.py`` is its only
 caller.  It exists because the rung
-(``bse_ring_comm.build_bse_ring_matvec_full._apply_W_from_T``) is 96-99% of a
+(``bse_stack_matvec._build_bse_stack_matvec_full._apply_W_from_T``) is 96-99% of a
 ladder matvec (opt_shifts, 2026-08-16: 7.92 ms with the rung vs 0.255 ms
 without, gnppm_debug, 1×A100) and its FFT pair is one of the four BSE modules
 carrying the registered eager-FFT debt (``docs/architecture/decisions.md``
@@ -47,7 +47,7 @@ transformed axes minor-most, so every boundary paid a transpose of the μ² tile
 wants.  What the rung DOES pay is on the far side: the decode
 (``contract_bands_block_reshard``, ``extra="leading"``) wants
 ``O = (b, k, t, μ, s, ν)``, so the production rung transposes the whole U tile
-k-minor→k-leading after the second FFT (``bse_ring_comm.py:889``, whose own
+k-minor→k-leading after the second FFT (the shared full builder's decode, whose own
 comment predicts this: "composes with the future flat-k conv layout … which
 emits k-leading natively").  So the FFI's k-major contract is aligned with the
 DECODE, not with the encode — which is why this module measures three arms and
@@ -172,7 +172,7 @@ def flatten_W_R(W_R):
 
 def to_O_from_kminor(U6):
     """(b, μ, ν, t, s, nk) -> (b, k, t, μ, s, ν) — the production transpose
-    (``bse_ring_comm.py:889``)."""
+    (``bse_stack_matvec._build_bse_stack_matvec_full``)."""
     return jnp.transpose(U6, _O_FROM_KMINOR)
 
 
@@ -275,8 +275,8 @@ def make_conv_ffi_kminor(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
 # ---------------------------------------------------------------------------
 # Signature-compatible drop-in replacements for the two factories
-# ``bse_ring_comm`` imports.  Rebinding these two names on that module before
-# ``build_bse_ring_matvec_full`` gives an FFI-served REAL matvec with no edit to
+# ``bse_stack_matvec`` imports. Rebinding these two names on that module before
+# ``build_bse_stack_matvec(full=True)`` gives an FFI-served REAL matvec with no edit to
 # a production file — which is how the end-to-end arm is measured while the
 # integration agent owns the rung mechanics concurrently.
 #

@@ -802,8 +802,8 @@ def compute_screening_model(
     ``w_bse`` and ``w_rpa_resolvent`` reach the SAME stage helper
     (:func:`gw.screening_bse.compute_screening_ladder`) with ``include_w``
     set to whether the ladder's direct rung is in the operator — one
-    matvec builder with a kernel switch (``bse.bse_ring_comm.
-    build_bse_ring_matvec_full``'s own ``include_W``), not a second
+    matvec builder with a kernel switch (``bse.bse_stack_matvec.
+    build_bse_stack_matvec``'s ``kernel``), not a second
     facade.
 
     ``tensors_filename`` is the ISDF restart file.  It is unused by the
