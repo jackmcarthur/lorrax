@@ -1,7 +1,9 @@
 """ISDF mini-library: ζ fitting and streamed Galerkin projection."""
 from isdf.core import (
     pair_density,        # centroid-selection Gram building block
+    pair_density_aot_peak_bytes,  # compiler peak for the same kernel
     gram_q0_from_pair,   # q=0 Gram (centroid selection)
+    gram_q0_aot_peak_bytes,       # compiler peak for the same fold
     c_q_from_psi_sm,     # centroid ψ -> C_q metric
     z_q_from_psi_sm,     # ψ(G) -> Z_q rhs (exported for tests)
     factor_c_q,          # C_q -> L_q (chol factor / indefinite passthrough)
@@ -12,7 +14,8 @@ from isdf.core import (
 from isdf.galerkin import GalerkinBasis, fit_galerkin_basis
 
 __all__ = [
-    "pair_density", "gram_q0_from_pair",
+    "pair_density", "pair_density_aot_peak_bytes",
+    "gram_q0_from_pair", "gram_q0_aot_peak_bytes",
     "c_q_from_psi_sm", "z_q_from_psi_sm",
     "factor_c_q", "solve_zeta", "fit_one_rchunk",
     "solve_zeta_charge_dense", "GalerkinBasis", "fit_galerkin_basis",

@@ -152,6 +152,32 @@ def _conv_kpair_setup(mesh_xy, kgrid, ns, trailing_shape, gamma_L, gamma_R):
 	return arm, reason, kernel, gamma_key
 
 
+def _pair_density_kernel(
+	mesh_xy: Mesh,
+	nk: int,
+	n_rmu: int,
+	nb: int,
+	ns: int,
+	n_col: int,
+):
+	"""Return the one cached executable factory used by run and planning."""
+	cache_key = ('pair_density', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+
+	if cache_key not in _pair_density_cache:
+		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
+		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+		xy_out = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+
+		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
+		def _pair_density(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
+			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R,
+			                  optimize=True)
+
+		_pair_density_cache[cache_key] = _pair_density
+
+	return _pair_density_cache[cache_key]
+
+
 def pair_density(
 	psi_rmuT_X: jax.Array,
 	psi_rcol_Y: jax.Array,
@@ -173,20 +199,44 @@ def pair_density(
 	"""
 	nk, n_rmu, nb, ns = psi_rmuT_X.shape
 	_, _, _, n_col = psi_rcol_Y.shape
-	cache_key = ('pair_density', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	return _pair_density_kernel(
+		mesh_xy, nk, n_rmu, nb, ns, n_col,
+	)(psi_rmuT_X, psi_rcol_Y)
 
-	if cache_key not in _pair_density_cache:
-		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
-		y3_4 = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-		xy_out = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 
-		@partial(jax.jit, in_shardings=(x1_4, y3_4), out_shardings=xy_out)
-		def _pair_density(psi_L: jax.Array, psi_R: jax.Array) -> jax.Array:
-			return jnp.einsum('kmna,knbr->kabmr', psi_L, psi_R, optimize=True)
+def pair_density_aot_peak_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	n_rmu: int,
+	nb: int,
+	nspinor: int,
+	n_col: int,
+	dtype=jnp.complex128,
+) -> int:
+	"""Per-rank compiled peak for the canonical :func:`pair_density`.
 
-		_pair_density_cache[cache_key] = _pair_density
-
-	return _pair_density_cache[cache_key](psi_rmuT_X, psi_rcol_Y)
+	This is a planning view of the SAME cached JIT production calls.  It does
+	not carry a modelling-only einsum: shapes and shardings are passed to the
+	canonical factory above, then the shared AOT memory service reads XLA's
+	buffer assignment.  There is no FFT in this kernel, so the service's
+	cuFFT-workspace term is exactly zero.
+	"""
+	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
+	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+	x = jax.ShapeDtypeStruct(
+		(int(nk), int(n_rmu), int(nb), int(nspinor)), dtype,
+		sharding=x_sh,
+	)
+	y = jax.ShapeDtypeStruct(
+		(int(nk), int(nb), int(nspinor), int(n_col)), dtype,
+		sharding=y_sh,
+	)
+	compiled = _pair_density_kernel(
+		mesh_xy, int(nk), int(n_rmu), int(nb), int(nspinor), int(n_col),
+	).lower(x, y).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).total)
 
 
 # Cache for ISDF pipeline jitted functions
@@ -201,56 +251,21 @@ _isdf_pipeline_cache = {}  # ISDF pipeline (z_q/c_q from psi_sm) kernel
 # the answer.  Used by :mod:`centroid.pivoted_cholesky` to score
 # candidate centroids on valence × conduction pair products.
 
-def gram_q0_from_pair(
-	P_v_k: jax.Array,
-	P_c_k: jax.Array,
-	k_weights: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
+def _gram_q0_kernel(
 	mesh_xy: Mesh,
-	symmetrize: bool = True,
-) -> jax.Array:
-	"""q=0 valence-conduction pair-product Gram from open-spin pair densities.
-
-	``symmetrize=False`` skips the final Hermitian symmetrization (which
-	requires a SQUARE G) — used by the column-blocked Gram build in
-	:mod:`centroid.pivoted_cholesky`, which assembles rectangular column
-	blocks and applies the identical 0.5·(G+G^H) once on the full matrix.
-
-	Mathematically (q=0 special case of the CCT-over-k structure):
-
-	    G(μ,ν) = Σ_k w_k · [Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
-	                          · P_v_{αβ}(μ,ν;k)*  · P_c_{α'β'}(μ,ν;k)]
-
-	γ̃ identity short-circuit: pass ``gamma_L=None`` (and/or
-	``gamma_R=None``) for charge / left-only / right-only sides.
-	Both None → Σ_{αβ} P_v* · P_c, the historical pivoted-Cholesky
-	candidate Gram in open-spin form.  γ̃^μ is monomial — each non-
-	identity contraction is one ``jnp.take`` + element-wise phase
-	multiply, not a 4×4 matmul.
-
-	Used by :mod:`centroid.pivoted_cholesky`.
-
-	Args:
-		P_v_k: (nk, ns, ns, n_rmu, n_rmu) complex, valence open-spin pair
-			density (output of :func:`pair_density` on the valence band
-			window), sharded ``P(None, None, None, 'x', 'y')``.
-		P_c_k: (nk, ns, ns, n_rmu, n_rmu) complex, conduction window,
-			same layout.
-		k_weights: (nk,) real, k-point weights (IBZ weights summing to 1,
-			or 1/nk_tot for each full-BZ k-point).
-		gamma_L, gamma_R: ``(perm, phase)`` tuples or ``None`` (=identity).
-		mesh_xy: ('x','y') device mesh, same as the pair densities.
-
-	Returns:
-		G: (n_rmu, n_rmu) complex Hermitian PSD, sharded ``P('x','y')``.
-	"""
-	nk, ns1, ns2, n_rmu, _ = P_v_k.shape
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
+	nk: int,
+	ns1: int,
+	ns2: int,
+	n_rmu: int,
+	n_col: int,
+	*,
+	lhs_id: bool,
+	rhs_id: bool,
+	symmetrize: bool,
+):
+	"""Return the one cached q=0 executable used by run and planning."""
 	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
-	             lhs_id, rhs_id, symmetrize)
+	             n_col, lhs_id, rhs_id, symmetrize)
 
 	if cache_key not in _isdf_pipeline_cache:
 		in_spin = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
@@ -278,14 +293,65 @@ def gram_q0_from_pair(
 			)
 			G = jnp.sum(kw[:, None, None] * prod, axis=0)
 			# Symmetrize: q=0 Gram is Hermitian by construction; fp roundoff
-			# can break it.  Cheap fix.  (Skipped for rectangular column
-			# blocks — the blocked caller symmetrizes the assembled square.)
+			# can break it.  (Skipped for rectangular column blocks.)
 			if _symmetrize:
 				G = 0.5 * (G + jnp.conj(G.T))
 			return G
 
 		_isdf_pipeline_cache[cache_key] = _gram_q0
 
+	return _isdf_pipeline_cache[cache_key]
+
+
+def gram_q0_from_pair(
+	P_v_k: jax.Array,
+	P_c_k: jax.Array,
+	k_weights: jax.Array,
+	gamma_L: tuple[jax.Array, jax.Array] | None = None,
+	gamma_R: tuple[jax.Array, jax.Array] | None = None,
+	*,
+	mesh_xy: Mesh,
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""q=0 valence-conduction pair-product Gram from open-spin pair densities.
+
+	``symmetrize=False`` skips the final Hermitian symmetrization (which
+	requires a SQUARE G) — used by the tiled Gram build in
+	:mod:`centroid.pivoted_cholesky`, which assembles rectangular edge tiles
+	and applies the identical 0.5·(G+G^H) once on the full matrix.
+
+	Mathematically (q=0 special case of the CCT-over-k structure):
+
+	    G(μ,ν) = Σ_k w_k · [Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
+	                          · P_v_{αβ}(μ,ν;k)*  · P_c_{α'β'}(μ,ν;k)]
+
+	γ̃ identity short-circuit: pass ``gamma_L=None`` (and/or
+	``gamma_R=None``) for charge / left-only / right-only sides.
+	Both None → Σ_{αβ} P_v* · P_c, the historical pivoted-Cholesky
+	candidate Gram in open-spin form.  γ̃^μ is monomial — each non-
+	identity contraction is one ``jnp.take`` + element-wise phase
+	multiply, not a 4×4 matmul.
+
+	Used by :mod:`centroid.pivoted_cholesky`.
+
+	Args:
+		P_v_k: (nk, ns, ns, n_rows, n_cols) complex, valence open-spin pair
+			density (output of :func:`pair_density` on the valence band
+			window), sharded ``P(None, None, None, 'x', 'y')``.
+		P_c_k: (nk, ns, ns, n_rows, n_cols) complex, conduction window,
+			same layout.
+		k_weights: (nk,) real, k-point weights (IBZ weights summing to 1,
+			or 1/nk_tot for each full-BZ k-point).
+		gamma_L, gamma_R: ``(perm, phase)`` tuples or ``None`` (=identity).
+		mesh_xy: ('x','y') device mesh, same as the pair densities.
+
+	Returns:
+		G: (n_rows, n_cols) complex, sharded ``P('x','y')``. Hermitian PSD
+			when square and ``symmetrize=True``.
+	"""
+	nk, ns1, ns2, n_rmu, n_col = P_v_k.shape
+	lhs_id = gamma_L is None
+	rhs_id = gamma_R is None
 	if lhs_id:
 		perm_L = jnp.arange(ns1, dtype=jnp.int32)
 		phase_L = jnp.ones(ns1, dtype=jnp.complex128)
@@ -297,8 +363,40 @@ def gram_q0_from_pair(
 	else:
 		perm_R, phase_R = gamma_R
 
-	return _isdf_pipeline_cache[cache_key](
+	return _gram_q0_kernel(
+		mesh_xy, nk, ns1, ns2, n_rmu, n_col,
+		lhs_id=lhs_id, rhs_id=rhs_id, symmetrize=symmetrize,
+	)(
 		P_v_k, P_c_k, k_weights, perm_L, phase_L, perm_R, phase_R)
+
+
+def gram_q0_aot_peak_bytes(
+	*,
+	mesh_xy: Mesh,
+	nk: int,
+	nspinor: int,
+	n_rmu: int,
+	n_col: int,
+	dtype=jnp.complex128,
+) -> int:
+	"""Per-rank compiled peak for the canonical charge q=0 tile fold."""
+	pair_sh = NamedSharding(
+		mesh_xy, P(None, None, None, 'x', 'y'),
+	)
+	rep = NamedSharding(mesh_xy, P())
+	pair = jax.ShapeDtypeStruct(
+		(int(nk), int(nspinor), int(nspinor), int(n_rmu), int(n_col)),
+		dtype, sharding=pair_sh,
+	)
+	kw = jax.ShapeDtypeStruct((int(nk),), jnp.float64, sharding=rep)
+	perm = jax.ShapeDtypeStruct((int(nspinor),), jnp.int32, sharding=rep)
+	phase = jax.ShapeDtypeStruct((int(nspinor),), dtype, sharding=rep)
+	compiled = _gram_q0_kernel(
+		mesh_xy, int(nk), int(nspinor), int(nspinor), int(n_rmu),
+		int(n_col), lhs_id=True, rhs_id=True, symmetrize=False,
+	).lower(pair, pair, kw, perm, phase, perm, phase).compile()
+	from runtime.aot_memory import aot_kernel_peak_bytes
+	return int(aot_kernel_peak_bytes(compiled).total)
 
 
 # ============================================================================
