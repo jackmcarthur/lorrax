@@ -85,6 +85,12 @@ def _build_mesh_xy() -> Mesh:
 _accum_G_cache: dict = {}
 _fold_G_cache: dict = {}
 
+# Bound the largest conjugated Q tile live inside the final local Gram fold.
+# The full Q shard is multi-GiB at production rank; spelling ``conj(Q)`` on
+# that whole shard lets XLA materialize an equal-sized temporary.  The fold is
+# linear in the r columns, so a bounded tile changes only the reduction order.
+_FOLD_Q_TILE_BYTES = 512 * 1024**2
+
 
 def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
                        psi_layout_, sharding_q_):
@@ -144,7 +150,11 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
     scattering columns.  No generic partitioner is allowed to trade the
     0.4-GiB Q shard for a replicated multi-GiB operand.
     """
-    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec))
+    # Include the byte ceiling because focused gates deliberately lower it to
+    # exercise the blocked path in-process.  Production uses the module
+    # constant, so this adds no compile variants there.
+    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
+           int(_FOLD_Q_TILE_BYTES))
     fn = _fold_G_cache.get(key)
     if fn is not None:
         return fn
@@ -164,8 +174,30 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
         check_vma=False,
     )
     def _fold_local(Q_local, G_local):
-        partial = jnp.einsum(
-            'asr,bsr->ab', Q_local, jnp.conj(Q_local), optimize=True)
+        n_r_local = int(Q_local.shape[2])
+        nspinor_local = int(Q_local.shape[1])
+        itemsize = np.dtype(np.complex128).itemsize
+        r_block = max(
+            1,
+            min(n_r_local,
+                _FOLD_Q_TILE_BYTES // (rank_ * nspinor_local * itemsize)),
+        )
+        n_full = n_r_local // r_block
+        n_tail = n_r_local - n_full * r_block
+        partial = jnp.zeros((rank_, rank_), dtype=Q_local.dtype)
+
+        def _add_r_block(i, acc):
+            q = jax.lax.dynamic_slice_in_dim(
+                Q_local, i * r_block, r_block, axis=2)
+            return acc + jnp.einsum(
+                'asr,bsr->ab', q, jnp.conj(q), optimize=True)
+
+        partial = jax.lax.fori_loop(0, n_full, _add_r_block, partial)
+        if n_tail:
+            q_tail = jax.lax.dynamic_slice_in_dim(
+                Q_local, n_full * r_block, n_tail, axis=2)
+            partial = partial + jnp.einsum(
+                'asr,bsr->ab', q_tail, jnp.conj(q_tail), optimize=True)
         partial = jax.lax.psum_scatter(
             partial, 'x', scatter_dimension=0, tiled=True)
         partial = jax.lax.psum_scatter(
