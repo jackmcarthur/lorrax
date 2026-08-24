@@ -6,9 +6,10 @@ into ``Q`` before folding ``Q Q^H`` into the projected Gram matrix.  The
 ordering is load-bearing.  Folding once per band chunk would omit all
 cross-band terms while still producing a plausible Hermitian matrix.
 
-Wavefunction loading and G-to-r transforms remain owned by
-``common.wfn_transforms``.  The caller resolves policy such as environment
-overrides and the device-pool limit, then passes explicit values here.
+Wavefunction loading and G-to-r transforms remain owned by the reusable
+``common.psi_G_store`` source and its canonical transform helpers.  The caller
+resolves policy such as environment overrides and the device-pool limit, then
+passes explicit values here.
 """
 from __future__ import annotations
 
@@ -290,30 +291,41 @@ def _refuse_unfit_galerkin_mesh(
 
 
 def build_streamed_projected_gram(
-        *, wfn, meta, mesh_xy: Mesh, band_range: tuple[int, int],
-        UH, inv_s, gram_init, band_chunk_size: int, mu_pad: int,
+        *, source, meta, mesh_xy: Mesh,
+        UH, inv_s, gram_init, mu_pad: int,
         q_tile_budget: int, device_pool_limit: float | None,
-        bispinor: bool = False, log_fn=None):
+        log_fn=None):
     """Build ``G = Q Q^H`` with r outermost and contracted bands innermost.
 
-    ``band_chunk_size`` is the already-resolved, mesh-aligned carrier width;
-    ``q_tile_budget`` and ``device_pool_limit`` are caller-resolved policy.
-    ``gram_init`` carries the caller's exact-null padding block and must be
-    sharded on ``P('x', 'y')``.
+    ``source`` is the caller-owned :class:`common.psi_G_store.PsiGStore`.
+    It owns the one coefficient load, the logical band schedule and the
+    canonical G-to-r/reshard route.  ``q_tile_budget`` and
+    ``device_pool_limit`` are caller-resolved policy.  ``gram_init`` carries
+    the caller's exact-null padding block and must be sharded on
+    ``P('x', 'y')``.
     """
     if log_fn is None:
         log_fn = lambda *a, **kw: None
 
-    from common.wfn_transforms import iter_psi_rchunk_bandwise
-
-    b_start, b_end = band_range
+    band_chunk_ranges = tuple(
+        (int(lo), int(hi)) for lo, hi in source.band_chunk_ranges)
+    if not band_chunk_ranges:
+        raise ValueError(
+            "build_streamed_projected_gram: source has no band chunks")
+    b_start = band_chunk_ranges[0][0]
+    b_end = band_chunk_ranges[-1][1]
+    if any(band_chunk_ranges[i][1] != band_chunk_ranges[i + 1][0]
+           for i in range(len(band_chunk_ranges) - 1)):
+        raise ValueError(
+            "build_streamed_projected_gram: source band chunks must form "
+            f"one contiguous interval; got {band_chunk_ranges!r}")
     nb = b_end - b_start
     nk = int(meta.nk_tot)
     nspinor = int(meta.nspinor)
     n_rtot = int(meta.n_rtot)
     rank = int(UH.shape[0])
     m_states = nk * nb
-    _bc = int(band_chunk_size)
+    _bc = int(source.band_chunk_carrier)
 
     rep = NamedSharding(mesh_xy, P())
     grid_xy = NamedSharding(mesh_xy, P('x', 'y'))
@@ -330,14 +342,9 @@ def build_streamed_projected_gram(
     # correct single-Q fold.  Bands are therefore innermost and every band
     # chunk is summed into Q before the fold below.
     #
-    # The caller has already aligned ``_bc`` to the product-band mesh.  The
-    # loader pads a narrower width to that same carrier anyway, so pushing
-    # partial carriers through separate FFTs only adds iterations and compile
-    # shapes; matching zero columns in UH below make the alignment inert.
-    band_chunk_ranges = [
-        (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
-        for i in range((nb + _bc - 1) // _bc)
-    ]
+    # The source's already-aligned carrier is the single band schedule.  A
+    # narrower terminal logical range still arrives in the same exact-zero
+    # carrier, and matching zero columns in UH below make that padding inert.
 
     # r is the free Q column.  Runtime padding adds exact-zero terminal
     # columns and product-shards them over the full mesh.
@@ -389,12 +396,8 @@ def build_streamed_projected_gram(
     for r_idx, (r0, r1) in enumerate(plan.r_chunk_ranges):
         r_carrier = round_up(r1 - r0, r_mesh_divisor)
         Q = _alloc_Q(r_carrier)
-        for bc_range, psi_bc_r in iter_psi_rchunk_bandwise(
-                wfn, None, meta, mesh_xy, band_range, r0, r1, bispinor,
-                band_chunk_size=_bc,
-                band_chunk_ranges=band_chunk_ranges,
-                band_pad_to=_bc,
-                product_r_spec=psi_r_layout.spec):
+        for bc_range, psi_bc_r in source.iter_rchunk_bandwise(
+                r0, r1, product_r_spec=psi_r_layout.spec):
             if int(psi_bc_r.shape[-1]) != r_carrier:
                 raise ValueError(
                     "Galerkin iterator r carrier disagrees with Q chunk: "

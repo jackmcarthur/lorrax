@@ -12,14 +12,16 @@ Register rows closed here (sandbox KNOWN_LORRAX_ISSUES 2026-08-19):
   to the resulting product-r layout.
 
 The multi-device transition twin runs in a 4-CPU-device subprocess (the
-house pattern of ``test_transverse_rank_truncate``).  Importing htransform
-first performs the production runtime/path bootstrap before the test reaches
-the extracted owner.  The P=4 GPU leg is the compute-node ``lx test`` run.
+house pattern of ``test_transverse_rank_truncate``).  It imports the extracted
+owner directly: pulling in htransform would initialize the whole driver before
+the kernel test runs and would make the test describe launcher policy rather
+than Galerkin arithmetic.  The P=4 GPU leg is the compute-node ``lx test`` run.
 """
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -29,10 +31,23 @@ import pytest
 _NDEV = 4
 
 
+def test_projected_gram_consumes_one_public_wfn_source():
+    """The r loop must not reopen the WFN or invent a second schedule."""
+    root = Path(__file__).resolve().parents[1] / "src"
+    gal = (root / "isdf" / "galerkin.py").read_text()
+    ht = (root / "bandstructure" / "htransform.py").read_text()
+
+    body = gal.split("def build_streamed_projected_gram(", 1)[1]
+    assert "source.iter_rchunk_bandwise(" in body
+    assert "source.band_chunk_ranges" in body
+    assert "source.band_chunk_carrier" in body
+    assert "iter_psi_rchunk_bandwise(" not in body
+    assert "build_psi_G_store(" in ht
+
+
 def _import_galerkin():
     pytest.importorskip("jax")
     try:
-        from bandstructure import htransform as _htransform  # noqa: F401
         from isdf import galerkin
     except RuntimeError as exc:  # FFI host library not built here
         if "FFI" in str(exc) or "liblorrax" in str(exc):
@@ -137,7 +152,6 @@ def _twin_body() -> dict:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from bandstructure import htransform as _htransform  # noqa: F401
     from isdf import galerkin as gal
     from common.sharding_fit import shard_factor
     from common.staged_reshard import band_to_product_r_reshard
