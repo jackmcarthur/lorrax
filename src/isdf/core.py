@@ -5889,7 +5889,8 @@ def fit_one_rchunk(
         tuple(meta.fft_grid),
         hash(kvecs_frac.tobytes()),
         id(psi_G_store),
-        tuple(int(s) for s in psi_r_cache.shape),
+        (None if psi_r_cache is None
+         else tuple(int(s) for s in psi_r_cache.shape)),
         int(vertex_mu_L),
         str(solver_kind),
         str(zeta_gather),
