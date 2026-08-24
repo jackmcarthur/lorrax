@@ -91,12 +91,16 @@ class AotPeakBreakdown:
     ``cufft_measured`` ``False`` means the cuFFT query was unavailable, so
                        ``cufft_scratch = 0`` is a KNOWN-LOW placeholder.
     ``fft_specs``      the plans parsed out of the HLO.
+    ``resident_increment`` extra bytes above arguments that a caller has
+                       already counted as resident: ``temp + output - alias``
+                       plus cuFFT scratch.
     """
     compiled_peak: int
     cufft_scratch: int
     total: int
     cufft_measured: bool
     fft_specs: tuple[FftSpec, ...]
+    resident_increment: int = 0
 
 
 class HloFftParseError(RuntimeError):
@@ -382,6 +386,17 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                      + int(m.argument_size_in_bytes)
                      + int(m.output_size_in_bytes)
                      - int(m.alias_size_in_bytes))
+    # Some planners query an executable whose arguments are already part of
+    # their measured resident floor (a shard-local slice is the motivating
+    # case).  ``resident_increment`` is the exact extra buffer-assignment
+    # footprint above those live arguments; ``total`` remains the standalone
+    # kernel peak used by callers whose arguments are not otherwise priced.
+    compiled_increment = max(
+        0,
+        int(m.temp_size_in_bytes)
+        + int(m.output_size_in_bytes)
+        - int(m.alias_size_in_bytes),
+    )
 
     fft_specs = tuple(parse_fft_specs_from_hlo(compiled.as_text()))
 
@@ -405,4 +420,5 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
         total=compiled_peak + cufft_scratch,
         cufft_measured=measured,
         fft_specs=fft_specs,
+        resident_increment=compiled_increment + cufft_scratch,
     )
