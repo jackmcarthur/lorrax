@@ -290,6 +290,7 @@ def test_breakdown_adds_cufft_scratch_to_compiled_peak(monkeypatch):
     assert got.compiled_peak == 550
     assert got.cufft_scratch == 4_096
     assert got.total == 4_646
+    assert got.resident_increment == 4_446  # temp + out - alias + cuFFT
     assert got.cufft_measured is True
     assert len(got.fft_specs) == 1
 
