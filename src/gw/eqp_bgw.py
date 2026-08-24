@@ -591,32 +591,19 @@ def resolve_hartree_diag_ev(
 	other        (``isdf`` / ``gspace`` / ``none`` / unknown) —
 	             ``hartree_diag_ev`` *is* the run's V_H.  **Use as given.**
 
-	``hartree_already_resolved=True`` says the caller's ``hartree_diag_ev``
-	has ALREADY had this scalar source policy applied to it upstream, so
-	this function must preserve the array as given rather than applying the
-	policy a second time.  A caller holding a raw, unresolved column leaves
-	the flag false.  In THIS tree the flag has exactly one caller —
-	``make_eqp_bgw``'s schema-v3 receipt branch, whose ``hartree_diag_ev``
-	is the resolved H that the live assembly persisted.  The live driver
-	(``gw.gw_output.write_results``) still hands this seam a PRE-seam column
-	and leaves the flag false; see the note on ``exact_hartree_diag_ev``.
-
-	Ported verbatim (signature, this flag's body, and the threading through
-	:func:`assemble_eqp`) from ``9d78648e`` on
-	``fix/sigma-hartree-artifact-provenance-2026-08-25``, where the flag has
-	a second motivation absent here: a non-scalar transverse photon Hartree
-	field living in ``sig_h`` beside the scalar term, which is why that
-	branch also flips the ``write_results`` call site to ``True``.  Neither
-	that field nor that call-site flip is in this tree.
+	``hartree_already_resolved=True`` is the live-driver contract:
+	``gw.sigma_dispatch`` has already applied this scalar source policy at the
+	operator seam, and the array may additionally contain a non-scalar direct
+	field (the transverse photon Hartree term).  In that case this function
+	must preserve the array as given rather than applying the scalar policy a
+	second time.  The post-hoc path leaves the flag false and supplies raw
+	file columns.
 
 	``exact_hartree_diag_ev`` is the substitution operand and is optional
-	on purpose.  On the live driver path ``gw.sigma_dispatch`` has already
-	substituted the exact matrix into ``sig_h`` at the one point V_H
-	enters ``SigmaResult``, so the caller passes ``None`` and this
-	function is a no-op for ``stored``.  On the post-hoc CLI path nothing
-	upstream did that, so ``make_eqp_bgw`` reads ``kin_ion.h5``'s
-	``v_hartree`` and passes it here.  Either way the decision is made
-	once, by this function.
+	on purpose.  The live driver passes an already-resolved ``sig_h`` and no
+	substitution operand.  On the post-hoc CLI path nothing upstream applied
+	the policy, so ``make_eqp_bgw`` reads ``kin_ion.h5``'s ``v_hartree`` and
+	passes it here.
 
 	Reading the file attribute is the only supported discriminator —
 	never infer the state from magnitudes (``file_io.kin_ion`` docstring).
@@ -740,8 +727,7 @@ def assemble_eqp(
 	Order of operations, and each step happens exactly once:
 
 	1. the V_H seam (:func:`resolve_hartree_diag_ev`), resolving a raw
-	   pre-seam column or, under ``hartree_already_resolved``, preserving
-	   an explicitly already-resolved one;
+	   post-hoc column or preserving an explicitly resolved live-driver one;
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
