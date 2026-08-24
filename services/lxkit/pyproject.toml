@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lxkit"
 version = "0.1.0"
-description = "Shared foundation for LORRAX standalone services: capability gates, probe vocabulary, jax-version shims, pytest harness"
+description = "Shared foundation for LORRAX services: gates, probes, JAX compatibility, process-local placement, and pytest harness"
 requires-python = ">=3.12"
 
 # ZERO RUNTIME DEPENDENCIES, AND THAT IS A PINNED PROPERTY, NOT AN ACCIDENT.
