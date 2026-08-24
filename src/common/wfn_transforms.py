@@ -705,12 +705,17 @@ def to_rchunk(
     mesh: Mesh,
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    allow_padded_tail: bool = False,
 ) -> jax.Array:
     """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
 
     Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz``.  ``r0``
     may be a Python int (bounds-checked) or a traced scalar (caller's
-    responsibility).
+    responsibility).  ``allow_padded_tail=True`` permits only the upper end
+    of that interval to exceed the physical FFT box; the canonical
+    :func:`take_rchunk_padded` body fills those carrier cells with exact
+    zeros.  The caller remains responsible for deriving the carrier extent
+    through :mod:`runtime.padding`.
 
     The full G-flat gather → FFT-box → IFFT → r-slice (→ Bloch phase)
     pipeline runs inside one ``shard_map`` region.  Keeping it
@@ -725,10 +730,17 @@ def to_rchunk(
     n_rtot = nx * ny * nz
     r_len_i = int(r_len)
     if isinstance(r0, (int, np.integer)):
-        if r0 < 0 or int(r0) + r_len_i > n_rtot:
+        r0_i = int(r0)
+        outside = r0_i < 0 or r0_i + r_len_i > n_rtot
+        padded_tail = (bool(allow_padded_tail) and 0 <= r0_i < n_rtot
+                       and r0_i + r_len_i > n_rtot)
+        if outside and not padded_tail:
             raise ValueError(
-                f"to_rchunk: [{int(r0)}, {int(r0) + r_len_i}) "
-                f"out of [0, {n_rtot})")
+                f"to_rchunk: [{r0_i}, {r0_i + r_len_i}) "
+                f"out of [0, {n_rtot})"
+                + (" (set allow_padded_tail=True only for a "
+                   "runtime.padding-derived carrier)"
+                   if r0_i + r_len_i > n_rtot else ""))
 
     psi_spec = P(*_spec_of(psi))
     out_spec = tuple(_output_sharding(psi, mesh, n_extra_axes=1).spec)
@@ -1860,34 +1872,6 @@ def load_psi_gflat_padded(
     return psi
 
 
-def _slice_bands_gflat(psi_full: jax.Array, lo: int, width: int,
-                       mesh: Mesh) -> jax.Array:
-    """Band-window slice ``psi_full[:, lo:lo+width]`` of a device-resident
-    ψ(G-flat) window, re-sharded to the standard band-sharded spec.
-
-    One cached jit per (shape, width) — ``lo`` is a traced scalar, so the
-    whole band-chunk sweep dispatches ONE compiled slicer.  Caller must
-    guarantee ``lo + width <= psi_full.shape[1]`` (``dynamic_slice``
-    would silently clamp-and-shift otherwise).
-    """
-    if lo + width > int(psi_full.shape[1]):
-        raise ValueError(
-            f"_slice_bands_gflat: [{lo}, {lo + width}) out of "
-            f"[0, {int(psi_full.shape[1])})")
-    key = (psi_full.shape, int(width), _sharding_key(psi_full), id(mesh))
-
-    def build():
-        out_shard = NamedSharding(mesh, _GFLAT_LOAD_SPEC)
-
-        @partial(jax.jit, out_shardings=out_shard)
-        def fn(psi_, lo_):
-            return jax.lax.dynamic_slice_in_dim(psi_, lo_, width, axis=1)
-        return fn
-
-    fn = _cached_jit('slice_bands_gflat', key, build)
-    return fn(psi_full, jnp.int32(lo))
-
-
 # ============================================================================
 # R-CHUNK EXTRACTION: Contiguous r-space chunking via flattened r-index
 # ============================================================================
@@ -1903,7 +1887,6 @@ def iter_psi_rchunk_bandwise(
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
-    psi_G_flat: jax.Array | None = None,
     product_r_spec: P | None = None,
 ):
     """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time.
@@ -1911,9 +1894,10 @@ def iter_psi_rchunk_bandwise(
     By default each result has shape ``(nk, bc, ns, r_end-r_start)`` sharded
     ``P(None, None, None, 'y')``, preserving the historical contract.  When
     ``product_r_spec=P(None,None,None,('y','x'))``, the free r axis is first
-    zero-padded through :func:`runtime.padding.pad_axis` to that spec's
-    canonical divisor and then moved directly from the input's product-band
-    layout to the product-r layout by
+    rounded through :mod:`runtime.padding` to that spec's canonical divisor;
+    :func:`take_rchunk_padded` emits the exact-zero carrier tail inside the
+    existing FFT shard-map, and the result moves directly from the input's
+    product-band layout to the product-r layout by
     :func:`common.staged_reshard.band_to_product_r_reshard`.  That route is
     two volume-preserving all-to-alls and never constructs the historical
     x-replicated r-on-y global carrier.  The caller is responsible for
@@ -1936,18 +1920,6 @@ def iter_psi_rchunk_bandwise(
     ``UH_bc @ psi`` fold) must slice/zero-pad its contraction operand to
     the same width — the extra bands then contribute exactly zero.
     ``None`` disables the pad (legacy per-chunk-shape behaviour).
-
-    ``psi_G_flat`` — optional device-resident ψ(G-flat) window covering
-    ``band_range`` (band-sharded ``P(None, ('x','y'), None, None)``, as
-    returned by :func:`load_psi_gflat_padded`).  When given, each band
-    chunk is a device SLICE of it instead of a fresh ``loader.load`` —
-    ONE file read (+ symmetry unfold) serves the whole sweep, and a
-    caller that already holds the window (htransform loads the same
-    window for centroid sampling) pays zero extra I/O.  Slice columns
-    beyond the chunk's real bands hold the window's own pad rows
-    (finite; zero or real file bands) — same contract as the loader's
-    internal band round-up, so consumers must keep masking ``[bc, w)``.
-    Full-BZ path only (``k_chunk_size`` must stay 0).
 
     Uses :class:`wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
     is unused (loader builds its own SymMaps).
@@ -1973,20 +1945,23 @@ def iter_psi_rchunk_bandwise(
         r_pad_divisor = 1
         out_r = out_Y
     n_rchunk_carrier = round_up(n_rchunk, r_pad_divisor)
+    if (product_reshard is not None and n_rchunk_carrier != n_rchunk
+            and int(r_end) != int(meta.n_rtot)):
+        raise ValueError(
+            "iter_psi_rchunk_bandwise: product-r padding is only inert on "
+            "a terminal slab ending at the physical FFT-grid extent; got "
+            f"[{int(r_start)}, {int(r_end)}) of [0, {int(meta.n_rtot)})")
 
     def _finish_r_carrier(a):
-        """Pad one logical r slab and commit it to the requested layout."""
-        padded = pad_axis(a, r_pad_divisor, axis=-1)
-        if (padded.logical != n_rchunk
-                or padded.padded != n_rchunk_carrier):
+        """Commit one already zero-filled carrier to its requested layout."""
+        if int(a.shape[-1]) != n_rchunk_carrier:
             raise AssertionError(
-                "iter_psi_rchunk_bandwise: runtime.padding returned "
-                "inconsistent r-carrier metadata: "
-                f"logical={padded.logical} (expected {n_rchunk}), "
-                f"padded={padded.padded} (expected {n_rchunk_carrier})")
+                "iter_psi_rchunk_bandwise: canonical padded-r slice "
+                f"returned extent {int(a.shape[-1])}, expected runtime."
+                f"padding carrier {n_rchunk_carrier}")
         if product_reshard is None:
-            return jax.lax.with_sharding_constraint(padded.array, out_Y)
-        return product_reshard(padded.array)
+            return jax.lax.with_sharding_constraint(a, out_Y)
+        return product_reshard(a)
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -2013,59 +1988,15 @@ def iter_psi_rchunk_bandwise(
     sharding_load = _GFLAT_LOAD_SPEC
 
     loader = wfn  # reuse top-level WfnLoader
-    g_index_full = loader.box_index(k="full_bz")
+    # Reuse the loader-owned replicated device table.  Passing the host table
+    # here would make ``to_rchunk`` allocate a second identical G-vector to
+    # FFT-box map beside the centroid path's canonical buffer.
+    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
     sym_loader = loader.symmetry()
     kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
     kvecs_frac_full = (
         np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
         / kgrid_arr[None, :])
-
-    # ── Window-reuse fast path: slice per-bc from a resident G-flat ──
-    if psi_G_flat is not None:
-        if 0 < nk_batch < nk_tot:
-            raise ValueError(
-                "iter_psi_rchunk_bandwise: psi_G_flat reuse requires the "
-                "full-BZ path (k_chunk_size=0)")
-        # Widths per chunk (band_pad_to overrides so to_rchunk compiles
-        # once); pad the window ONCE up to the max slice extent so the
-        # dynamic-slice never clamps (clamp would shift the window and
-        # leak earlier bands into pad columns).
-        # ``max`` guards a chunk wider than band_pad_to (never truncate
-        # real bands) — same semantics as the pad-only-if-smaller load
-        # path.
-        widths = [
-            (max(int(band_pad_to), b1 - b0) if band_pad_to is not None
-             else (b1 - b0))
-            for (b0, b1) in band_chunk_ranges]
-        need = max(
-            (b0 - b_start) + w
-            for (b0, _b1), w in zip(band_chunk_ranges, widths))
-        nb_avail = int(psi_G_flat.shape[1])
-        if need > nb_avail:
-            def _build_pad():
-                out_shard = NamedSharding(mesh_xy, sharding_load)
-
-                @partial(jax.jit, out_shardings=out_shard)
-                def fn(psi_):
-                    return jnp.pad(
-                        psi_, ((0, 0), (0, need - nb_avail), (0, 0), (0, 0)))
-                return fn
-            psi_G_flat = _cached_jit(
-                'pad_bands_gflat',
-                (psi_G_flat.shape, need, _sharding_key(psi_G_flat),
-                 id(mesh_xy)),
-                _build_pad)(psi_G_flat)
-        for bc_range, w in zip(band_chunk_ranges, widths):
-            psi_bc = _slice_bands_gflat(
-                psi_G_flat, int(bc_range[0]) - b_start, w, mesh_xy)
-            psi_bc_r = to_rchunk(
-                psi_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
-                kvecs_frac=jnp.asarray(kvecs_frac_full))
-            psi_bc_r = _finish_r_carrier(psi_bc_r)
-            del psi_bc
-            yield bc_range, psi_bc_r
-        return
 
     for bc_range in band_chunk_ranges:
         if nk_batch >= nk_tot:
@@ -2084,8 +2015,9 @@ def iter_psi_rchunk_bandwise(
                     f"({int(loader.nbands)})")
             psi_bc_r = to_rchunk(
                 psi_G_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
-                kvecs_frac=jnp.asarray(kvecs_frac_full))
+                int(r_start), n_rchunk_carrier, mesh=mesh_xy, norm="ortho",
+                kvecs_frac=jnp.asarray(kvecs_frac_full),
+                allow_padded_tail=(n_rchunk_carrier > n_rchunk))
             psi_bc_r = _finish_r_carrier(psi_bc_r)
             del psi_G_bc
             yield bc_range, psi_bc_r
@@ -2103,9 +2035,10 @@ def iter_psi_rchunk_bandwise(
                 psi_k_chunk = to_rchunk(
                     psi_G_flat,
                     g_index_full[k0:k1],
-                    meta.fft_grid, int(r_start), n_rchunk,
+                    meta.fft_grid, int(r_start), n_rchunk_carrier,
                     mesh=mesh_xy, norm="ortho",
-                    kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
+                    kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]),
+                    allow_padded_tail=(n_rchunk_carrier > n_rchunk))
                 psi_k_chunk = _finish_r_carrier(psi_k_chunk)
                 psi_bc_r_full = psi_bc_r_full.at[
                     k0:k1, :, :, :].set(psi_k_chunk)
