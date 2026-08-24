@@ -17,6 +17,9 @@ import jax.numpy as jnp
 # ``get_small_psi_component`` and the k-batched ``lift_to_4spinor`` (the
 # WfnLoader production path) use it.
 HALFALPHA = 0.00364867628215
+# The full fine-structure constant is derived here, beside the lift scale,
+# rather than re-spelled by current-vertex consumers.
+ALPHA_FS = 2.0 * HALFALPHA
 
 
 def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):

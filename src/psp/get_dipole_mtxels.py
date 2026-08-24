@@ -48,7 +48,7 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 dipole_operator, sweep_matrix_elements)
 from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
 from common.wfn_transforms import load_kpoint_fftbox_local
-from common.bispinor_init import HALFALPHA
+from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -61,8 +61,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
-
-_ALPHA_FS = 2.0 * HALFALPHA
 
 # --------------------------
 # K+G helpers
@@ -549,7 +547,7 @@ def compute_finite_q_mtxels(
                     energies_full_ry[ikmq, c_lo:c_hi, None]
                     - energies_full_ry[ik, None, v_lo:n_occ])
                 ward_np = (delta_e_ry * np.asarray(rho_mn)
-                           + (2.0 / _ALPHA_FS)
+                           + (2.0 / ALPHA_FS)
                            * np.einsum('a,amn->mn', q_cart_bohr, alpha_np,
                                        optimize=True))
                 ward_residual_cvkq[:, :, ik, jq] = ward_np
@@ -1562,7 +1560,7 @@ def main(argv=None):
 				fq.attrs['selected_current_lift'] = (
 					"psi_S=(alpha_fs/2)*sigma.p*psi_L")
 				fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
-				fq.attrs['alpha_fs'] = float(_ALPHA_FS)
+				fq.attrs['alpha_fs'] = float(ALPHA_FS)
 	barrier("dipole_write")
 	print(f"\nWrote dipole data to {out_path}")
 	timing.report(title="--- Timing (seconds) ---",
