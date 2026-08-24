@@ -1706,6 +1706,11 @@ def compute_static_photon_response(
         V_packed, chi_packed, meta, mesh_xy,
         dyson_solver="distributed",
         distrib_la_batched_route=distrib_la_batched_route)
+    # The bare Hartree/exchange stage that follows does not depend on W and
+    # could otherwise begin allocating its Green/operator workspaces while
+    # the asynchronous distributed LU still owns A, RHS and donated chi.
+    # Finish the response here, inside its timing/lifetime boundary.
+    W_packed.block_until_ready()
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=current_contact)
