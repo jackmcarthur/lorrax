@@ -711,6 +711,98 @@ def test_sharded_select_on_four_real_shards():
     assert "R4_MULTISHARD_OK" in out.stdout, out.stdout
 
 
+_KMEANS_GRID_PAD_WORKER = r'''
+import numpy as np
+import jax
+from jax.sharding import Mesh
+
+assert jax.device_count() == 4, f"want 4 devices, got {jax.device_count()}"
+
+from centroid.kmeans_isdf import weighted_kmeans_jax
+import centroid.kmeans_isdf as _kmeans_module
+print("KMEANS_PAD_MODULE=" + _kmeans_module.__file__)
+
+devices = np.asarray(jax.devices())
+serial_mesh = Mesh(devices[:1].reshape(1, 1), ("x", "y"))
+mesh_2x2 = Mesh(devices.reshape(2, 2), ("x", "y"))
+
+# 3^3 = 27 is deliberately indivisible by the fake 2x2 mesh.  Exactly four
+# logical points carry weight, so four centroids must be those points.  The
+# appended 28th position is (0, 0, 0) with zero weight: choosing it would be
+# immediately observable because (0, 0, 0) is not in the support.
+rho = np.zeros((3, 3, 3), dtype=np.float64)
+support_idx = np.asarray([
+    (0, 1, 2),
+    (1, 0, 1),
+    (1, 2, 0),
+    (2, 1, 1),
+], dtype=np.int64)
+rho[tuple(support_idx.T)] = np.asarray([1.0, 2.0, 3.0, 4.0])
+support_frac = support_idx / np.asarray(rho.shape, dtype=np.float64)
+
+kwargs = dict(
+    N_c=4,
+    max_steps=30,
+    tolerance=1e-12,
+    seed=17,
+    mesh_axis=("x", "y"),
+    init_method="kpp",
+)
+labels_ref, cent_ref, steps_ref, move_ref = weighted_kmeans_jax(
+    np.eye(3), rho, mesh=serial_mesh, **kwargs
+)
+labels_pad, cent_pad, steps_pad, move_pad = weighted_kmeans_jax(
+    np.eye(3), rho, mesh=mesh_2x2, **kwargs
+)
+
+labels_ref = np.asarray(labels_ref)
+labels_pad = np.asarray(labels_pad)
+cent_ref = np.asarray(cent_ref)
+cent_pad = np.asarray(cent_pad)
+
+assert labels_ref.shape == (27,), labels_ref.shape
+assert labels_pad.shape == (28,), labels_pad.shape
+assert np.all(labels_pad[:27] >= 0), labels_pad
+assert labels_pad[27] == -1, labels_pad
+np.testing.assert_array_equal(labels_pad[:27], labels_ref)
+np.testing.assert_allclose(cent_pad, cent_ref, rtol=0, atol=0)
+assert steps_pad == steps_ref, (steps_pad, steps_ref)
+assert move_pad == move_ref, (move_pad, move_ref)
+
+# Each selected centroid must be a positive-weight LOGICAL support point.
+for centroid in cent_pad:
+    assert any(np.array_equal(centroid, point) for point in support_frac), (
+        centroid, support_frac
+    )
+assert not any(np.array_equal(c, np.zeros(3)) for c in cent_pad), cent_pad
+print("KMEANS_GRID_PAD_INERT_OK")
+'''
+
+
+def test_kmeans_indivisible_grid_padding_is_inert_on_fake_2x2_mesh():
+    """A zero-weight mesh pad neither seeds nor changes Lloyd's result."""
+    import os
+    import subprocess
+    import sys
+
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "src")
+    env = os.environ.copy()
+    env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
+                        + " --xla_force_host_platform_device_count=4").strip()
+    env["JAX_PLATFORMS"] = "cpu"
+    env["JAX_ENABLE_X64"] = "1"
+    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+    out = subprocess.run(
+        [sys.executable, "-c", _KMEANS_GRID_PAD_WORKER],
+        env=env, capture_output=True, text=True, timeout=900,
+    )
+    assert out.returncode == 0, (
+        f"stdout:\n{out.stdout}\nstderr:\n{out.stderr}")
+    print(out.stdout, end="")
+    assert "KMEANS_GRID_PAD_INERT_OK" in out.stdout, out.stdout
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 5. R2 — rank reported at POINT granularity, not orbit granularity
 # ─────────────────────────────────────────────────────────────────────────
