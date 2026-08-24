@@ -1329,6 +1329,7 @@ def _plan_gflat_chunks_for_channel(
 		'chunk_r': int(gflat_plan.r_chunk),
 		'q_chunk': int(gflat_plan.q_chunk),
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
+		'cache_psi_r': bool(gflat_plan.cache_psi_r),
 		'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
 		'memory_estimate': {
 			'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
@@ -1409,6 +1410,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	print_fn(f"    Band chunks: {chunks['band_chunk']}")
 	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
 	print_fn(f"    Q chunks:    {chunks['q_chunk']}")
+	print_fn("    ψ(r) source: " + (
+		"hoisted all-band cache" if chunks.get('cache_psi_r', True)
+		else "streamed band-chunk FFT"))
 	if chunks.get('gflat_chunk_size') is not None:
 		print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
 	print_fn(f"    Zeta output: {zeta_h5_path}")
@@ -1669,6 +1673,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
 			zeta_rcond=cfg.backend.zeta_rcond,
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
+			cache_psi_r=bool(chunks.get('cache_psi_r', True)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
 			print_fn=print_fn,
@@ -1949,6 +1954,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
 					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
 					gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
+					cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
 					vertex_mu_L=mu_L,
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
