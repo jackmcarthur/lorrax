@@ -55,8 +55,13 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         # JAX also skips its equality assertion when this process owns no
         # device in the target sharding.
         return jax.device_put(arr, sharding)
-    shards = [
-        jax.device_put(np.ascontiguousarray(arr[idx]), dev)
-        for dev, idx in idx_map.items()
-    ]
+    shards = []
+    for dev, idx in idx_map.items():
+        piece = np.asarray(arr[idx])
+        # ``np.ascontiguousarray`` promotes a 0-D scalar to shape ``(1,)``.
+        # Preserve the scalar shard shape required by a replicated P() value;
+        # higher-rank shards still take the contiguous host-staging route.
+        if piece.ndim:
+            piece = np.ascontiguousarray(piece)
+        shards.append(jax.device_put(piece, dev))
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)

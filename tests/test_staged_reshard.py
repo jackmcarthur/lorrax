@@ -132,6 +132,7 @@ def _product_probe():
 
 
 def test_shard_local_slice_pad_never_repartitions_a_smaller_global_face():
+    from common.collectives import device_put_process_local
     mesh = _mesh()
     spec = P(None, 'x', None)
     sh = NamedSharding(mesh, spec)
@@ -141,7 +142,7 @@ def test_shard_local_slice_pad_never_repartitions_a_smaller_global_face():
     take = shard_local_slice_pad(
         mesh, spec=spec, axis=1, mesh_axis='x', local_size=2)
 
-    start = jax.device_put(np.int32(5), rep)
+    start = device_put_process_local(np.int32(5), rep)
     got = np.asarray(take(src, start))
     expected = np.zeros((2, 4, 3), dtype=np.float64)
     expected[:, 0, :] = src_np[:, 5, :]
@@ -157,13 +158,15 @@ def test_shard_local_slice_pad_never_repartitions_a_smaller_global_face():
 
 
 def test_shard_local_update_writes_tail_in_each_owned_face_without_clamp():
+    from common.collectives import device_put_process_local
     mesh = _mesh()
     spec = P('x', 'y')
     sh = NamedSharding(mesh, spec)
     rep = NamedSharding(mesh, P())
     dst = jax.device_put(np.zeros((6, 6), dtype=np.float64), sh)
     tile = jax.device_put(np.full((4, 4), 7.0, dtype=np.float64), sh)
-    starts = jax.device_put(np.asarray((2, 2), dtype=np.int32), rep)
+    starts = device_put_process_local(
+        np.asarray((2, 2), dtype=np.int32), rep)
     update = shard_local_update(mesh, spec=spec)
     got = np.asarray(update(dst, tile, starts))
     expected = np.zeros((6, 6), dtype=np.float64)
