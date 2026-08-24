@@ -3500,7 +3500,7 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "  why:  the correction replaces the q=Γ, G=0 slot of the "
             "bare bispinor TT (transverse-transverse) V-tiles, which a "
             "non-bispinor run never builds\n"
-            "  doc:  docs/input_reference.md '## Bispinor', "
+            "  doc:  docs/input_reference.md '## Screening', "
             "bispinor_tt_head_correction.")
     sys_dim = int(config.sys_dim)
     if sys_dim not in (2, 3):
@@ -3515,7 +3515,7 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
             "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
             "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
             "there is no missing slot for this correction to fill\n"
-            "  doc:  docs/input_reference.md '## Bispinor', "
+            "  doc:  docs/input_reference.md '## Screening', "
             "bispinor_tt_head_correction.")
 
 
