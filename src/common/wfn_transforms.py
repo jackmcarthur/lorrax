@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
-    "to_rmu_inner", "to_rchunk_inner",
+    "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
     "gflat_to_rmu",
     "accumulate_rchunk_to_gflat",
@@ -649,14 +649,14 @@ def to_rchunk_inner(
     # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
     # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
     rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-    slab = _take_rchunk_padded(rb_flat, r0, r_len_i)
+    slab = take_rchunk_padded(rb_flat, r0, r_len_i)
     if kvecs_frac is not None:
         slab = apply_bloch_phase_on_slice(
             slab, kvecs_frac, fft_grid_t, r0, r_len_i)
     return slab
 
 
-def _take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
+def take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
     """Take a fixed-width flat-r slab, zero-filling beyond physical r.
 
     ``lax.dynamic_slice`` clamps an out-of-bounds start backward.  That is
@@ -683,6 +683,12 @@ def _take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
         slab = jnp.take(values, safe_idx, axis=-1)
         valid_shape = (1,) * (slab.ndim - 1) + (r_len_i,)
         return jnp.where(valid.reshape(valid_shape), slab, 0)
+
+    # ``lax.cond`` traces both arms.  A slice wider than the entire operand
+    # is statically invalid even when the runtime predicate selects the
+    # padded arm, so omit that arm altogether for this tiny-grid case.
+    if r_len_i > n_rtot:
+        return _padded(None)
 
     in_bounds = (r0_arr >= 0) & (r0_arr + r_len_i <= n_rtot)
     return jax.lax.cond(in_bounds, _direct, _padded, operand=None)
