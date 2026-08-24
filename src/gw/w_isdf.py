@@ -1586,6 +1586,686 @@ def compute_chi0_block(
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
+STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
+    "experimental_no_pair_bubble_screened_breit_q0_nearest_shell_v1"
+)
+
+
+@dataclass(frozen=True)
+class PhotonG0Vectors:
+    """Canonical per-channel G=0 vectors in the two centroid shardings.
+
+    ``x_by_channel[A]`` and ``y_by_channel[A]`` both have global shape
+    ``(nq_full, layout.padded_extent(A))``.  They contain the same
+    ``zeta_tilde(q,mu,G=0)`` values, respectively sharded ``P(None,'x')``
+    and ``P(None,'y')``.  Rows follow ``SymMaps.kvecs_asints`` exactly.
+
+    This is only the consumer contract.  The Coulomb/current producer remains
+    the owner of how zeta is evaluated and unfolded; this module must not grow
+    a second G-vector, FFT, or symmetry path.
+    """
+
+    x_by_channel: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    y_by_channel: tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    provenance: str
+
+
+@dataclass(frozen=True)
+class StaticPhotonLongWaveCoefficients:
+    r"""Nearest-shell coefficients of the static packed photon response.
+
+    The coefficient form is the storage contract; finite-q body-sized samples
+    are never retained.  For in-plane Cartesian ``q`` (1/bohr),
+
+    ``R(q) = q_a H_direct[a] + q_a q_b Q_direct[a,b]``
+
+    and both wings are linear, ``q_a Y_x[a]`` and ``q_b Z_y[b]``.
+    ``Q_direct[a,b]`` is coordinate-symmetric; its antisymmetric part is
+    unidentifiable because ``q_a q_b`` annihilates it, so this record does
+    not pretend to report one.  The
+    no-reshard wing convention uses static Hermiticity explicitly:
+
+    ``R[A,B]   = g_A^dagger P g_B``
+    ``Y[A,I_x] = conj(sum_J P[I,J] g_A[J])``
+    ``Z[J_y,B] = conj(sum_I conj(g_B[I]) P[I,J])``.
+
+    These are the incumbent qsgw-head orientations ``Y W Z``.  Taking the
+    conjugates supplies the desired opposite body orientation without a
+    centroid-vector redistribution; ``hermiticity_residual`` certifies that
+    premise on every projected shell/Gamma vector used by the fit.
+    """
+
+    layout: object
+    H_direct: jax.Array                 # (2, 4, 4), replicated
+    Q_direct: jax.Array                 # (2, 2, 4, 4), replicated
+    Y_x: jax.Array                      # (2, 4, N_packed), x-sharded
+    Z_y: jax.Array                      # (2, N_packed, 4), y-sharded
+    shell_indices: tuple[int, ...]
+    shell_directions_xy: tuple[tuple[float, float], ...]
+    shell_radii_bohr_inv: tuple[float, ...]
+    linear_rank: int
+    quadratic_rank: int
+    direct_relative_residual: float
+    Y_relative_residual: float
+    Z_relative_residual: float
+    uniform_A_residual: float
+    hermiticity_residual: float
+    g0_copy_residual: float
+    g0_provenance: str
+    charge_response_source: str
+    current_contact: str
+    approximation: str = STATIC_PHOTON_LONGWAVE_APPROXIMATION
+
+
+_photon_longwave_fit_cache: dict = {}
+
+
+def _same_named_sharding(array, mesh_xy, spec) -> bool:
+    """Whether ``array`` is already on ``mesh_xy`` with exactly ``spec``."""
+    sharding = getattr(array, "sharding", None)
+    if not isinstance(sharding, NamedSharding) or sharding.spec != spec:
+        return False
+    return (
+        tuple(sharding.mesh.axis_names) == tuple(mesh_xy.axis_names)
+        and np.array_equal(sharding.mesh.devices, mesh_xy.devices)
+    )
+
+
+def _require_named_sharding(array, mesh_xy, spec, name) -> None:
+    if not _same_named_sharding(array, mesh_xy, spec):
+        actual = getattr(array, "sharding", None)
+        raise ValueError(
+            f"{name} must arrive on the production mesh with sharding "
+            f"{spec}; got {actual!r}. This response fit does not reshard "
+            "body-sized or centroid-sized inputs implicitly."
+        )
+
+
+def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
+    """Smallest complete +/-q radial-shell union identifying H and Q.
+
+    ``SymMaps.kqfull_map[0]`` supplies -q; there is no second q lookup.  The
+    next radius is included only when (as on a square axis shell) the nearest
+    radius alone cannot identify the symmetric Q_xy coefficient.
+    """
+    grid = np.asarray(kgrid, dtype=np.int64)
+    steps = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    nq = int(np.prod(grid))
+    if grid.shape != (3,) or np.any(grid <= 0) or steps.shape != (nq, 3):
+        raise ValueError("nearest-shell fit requires one full positive kgrid")
+    steps = np.mod(steps, grid[None, :])
+    gamma = np.flatnonzero(np.all(steps == 0, axis=1))
+    if not np.array_equal(gamma, np.asarray([0])):
+        raise ValueError("full-BZ q order must contain Gamma exactly at row 0")
+    signed = steps.copy()
+    for a, n in enumerate(grid):
+        signed[:, a] = np.where(
+            signed[:, a] > n // 2, signed[:, a] - n, signed[:, a])
+    bvec = np.asarray(bvec_cart_bohr, dtype=np.float64)
+    if bvec.shape != (3, 3) or not np.all(np.isfinite(bvec)):
+        raise ValueError("bvec_cart_bohr must be finite (3,3), rows in 1/bohr")
+    q_cart = (signed / grid[None, :]) @ bvec
+    candidate = np.flatnonzero(
+        np.any(steps != 0, axis=1) & (signed[:, 2] == 0))
+    radii = np.linalg.norm(q_cart[candidate, :2], axis=1)
+    keep = radii > 0.0
+    candidate, radii = candidate[keep], radii[keep]
+    if not candidate.size:
+        raise ValueError("nearest-shell fit found no nonzero in-plane q")
+
+    def _design(q):
+        linear = q
+        quadratic = np.stack(
+            (q[:, 0] ** 2, 2.0 * q[:, 0] * q[:, 1], q[:, 1] ** 2), axis=1)
+        return linear, quadratic
+
+    def _rank(a):
+        s = np.linalg.svd(a, compute_uv=False)
+        tol = 128.0 * max(a.shape) * np.finfo(float).eps * float(s[0])
+        return int(np.sum(s > tol)), tol
+
+    levels = []
+    for radius in np.sort(radii):
+        if not any(np.isclose(radius, old, rtol=1e-11,
+                              atol=1e-12 * old) for old in levels):
+            levels.append(float(radius))
+    selected = np.zeros(candidate.size, dtype=bool)
+    for radius in levels:
+        selected |= np.isclose(
+            radii, radius, rtol=1e-11, atol=1e-12 * radius)
+        shell = np.asarray(candidate[selected], dtype=np.int32)
+        q_shell = np.asarray(q_cart[shell, :2], dtype=np.float64)
+        linear, quadratic = _design(q_shell)
+        linear_rank, linear_tol = _rank(linear)
+        quadratic_rank, quadratic_tol = _rank(quadratic)
+        if (linear_rank, quadratic_rank) == (2, 3):
+            break
+    if (linear_rank, quadratic_rank) != (2, 3):
+        raise ValueError(
+            "nearest-shell active-direction design is rank deficient: "
+            f"linear={linear_rank}/2, quadratic={quadratic_rank}/3")
+
+    try:
+        negative = np.asarray(sym.kqfull_map[0], dtype=np.int64)
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise ValueError("SymMaps.kqfull_map[0] (-q) is required") from exc
+    if negative.shape != (nq,) or np.any((negative < 0) | (negative >= nq)):
+        raise ValueError("SymMaps.kqfull_map[0] is not a full-BZ permutation")
+    position = np.full(nq, -1, dtype=np.int32)
+    position[shell] = np.arange(shell.size, dtype=np.int32)
+    partners = negative[shell]
+    partner_position = position[partners]
+    if np.any(partner_position < 0):
+        raise ValueError("nearest complete shell is missing a -q partner")
+    if (np.any(partners == shell) or np.any(negative[partners] != shell)
+            or not np.array_equal(
+                steps[partners], np.mod(-steps[shell], grid[None, :]))):
+        raise ValueError("SymMaps -q pairs are ambiguous on the fitted shell")
+    scale = max(float(np.max(np.abs(q_cart[shell]))), 1.0)
+    tol = 512.0 * np.finfo(float).eps * scale
+    if (np.max(np.abs(q_cart[shell, 2])) > tol
+            or not np.allclose(q_cart[partners, :2], -q_shell,
+                               rtol=0.0, atol=tol)):
+        raise ValueError("fitted +/-q shell is not Cartesian in-plane")
+
+    pair_rows = np.eye(shell.size)[partner_position]
+    linear_weights = np.linalg.pinv(
+        linear, rcond=linear_tol / np.linalg.norm(linear, 2)
+    ) @ (0.5 * (np.eye(shell.size) - pair_rows))
+    quadratic_weights = np.linalg.pinv(
+        quadratic, rcond=quadratic_tol / np.linalg.norm(quadratic, 2)
+    ) @ (0.5 * (np.eye(shell.size) + pair_rows))
+    shell_radii = np.linalg.norm(q_shell, axis=1)
+    return (
+        shell, q_shell, q_shell / shell_radii[:, None], shell_radii,
+        linear_weights, quadratic_weights, linear_rank, quadratic_rank,
+    )
+
+
+def _static_charge_longwave_inputs(charge_response, layout, mesh_xy):
+    """Select the unique analytic omega=0 charge S/Y/Z without gathering."""
+    p_charge = layout.padded_extent(0)
+    if charge_response is None:
+        rep = NamedSharding(mesh_xy, P(None, None))
+        sh_x = NamedSharding(mesh_xy, P(None, "x"))
+        sh_y = NamedSharding(mesh_xy, P("y", None))
+        return (
+            jax.device_put(np.zeros((2, 2), np.complex128), rep),
+            jax.device_put(np.zeros((2, p_charge), np.complex128), sh_x),
+            jax.device_put(np.zeros((p_charge, 2), np.complex128), sh_y),
+            False,
+            "nearest_shell_only",
+        )
+
+    omegas = tuple(complex(z) for z in charge_response.omegas)
+    zero_rows = [i for i, z in enumerate(omegas) if z == 0.0j]
+    if len(zero_rows) != 1:
+        raise ValueError(
+            "analytic charge replacement requires exactly one literal "
+            f"omega=0 qsgw_head row; found {zero_rows} in {omegas}")
+    index = zero_rows[0]
+    if charge_response.Y_x is None or charge_response.Z_y is None:
+        raise ValueError(
+            "analytic charge replacement requires the existing qsgw_head "
+            "S, Y_x, and Z_y arrays")
+    S = charge_response.S_direct
+    Y = charge_response.Y_x
+    Z = charge_response.Z_y
+    if tuple(S.shape) != (len(omegas), 3, 3):
+        raise ValueError(
+            f"qsgw_head S_direct shape {S.shape} != ({len(omegas)},3,3)")
+    if tuple(Y.shape) != (len(omegas), 3, p_charge):
+        raise ValueError(
+            "qsgw_head Y_x does not match the padded charge centroid "
+            f"extent: got {Y.shape}, expected ({len(omegas)},3,{p_charge})")
+    if tuple(Z.shape) != (len(omegas), p_charge, 3):
+        raise ValueError(
+            "qsgw_head Z_y does not match the padded charge centroid "
+            f"extent: got {Z.shape}, expected ({len(omegas)},{p_charge},3)")
+    _require_named_sharding(Y, mesh_xy, P(None, None, "x"),
+                            "charge_response.Y_x")
+    _require_named_sharding(Z, mesh_xy, P(None, "y", None),
+                            "charge_response.Z_y")
+    S_xy_raw = np.asarray(
+        jax.device_get(S[index, :2, :2]), np.complex128)
+    # q_a q_b sees only the coordinate-symmetric part; retaining an
+    # arbitrary antisymmetric representative would contradict Q's contract.
+    S_xy_host = 0.5 * (S_xy_raw + S_xy_raw.T)
+    if not np.all(np.isfinite(S_xy_host)):
+        raise ValueError("qsgw_head static S contains non-finite entries")
+    S_xy = jax.device_put(
+        S_xy_host, NamedSharding(mesh_xy, P(None, None)))
+    return (
+        S_xy,
+        Y[index, :2, :],
+        Z[index, :, :2],
+        True,
+        "qsgw_head.IterationHeadResponse@omega=0",
+    )
+
+
+def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
+    """One compiled shape family for projection, parity split, and fit."""
+    key = (id(mesh_xy), layout)
+    hit = _photon_longwave_fit_cache.get(key)
+    if hit is not None:
+        return hit
+    from common.shard_map import shard_map
+
+    layout.assert_mesh(mesh_xy)
+    linear_mask = np.fromfunction(
+        lambda A, B: (A == 0) != (B == 0), (4, 4), dtype=int)
+    quadratic_mask = np.fromfunction(
+        lambda A, B: ((A == 0) & (B == 0)) | ((A > 0) & (B > 0)),
+        (4, 4), dtype=int)
+
+    def _local(
+        chi_local, g0_x_local, g0_y_local, shell_indices,
+        q_shell_xy, linear_weights, quadratic_weights, prefactor,
+        charge_S, charge_Y_packed_x, charge_Z_packed_y,
+        charge_mask_x, charge_mask_y, use_charge,
+    ):
+        dtype = chi_local.dtype
+        real_dtype = jnp.real(chi_local).dtype
+        x_coord = jax.lax.axis_index("x")
+        y_coord = jax.lax.axis_index("y")
+        prefactor = jnp.asarray(prefactor, dtype=dtype)
+        # Select before scaling: the full nq x body x body input is never
+        # copied into a second response buffer merely to discard all but the
+        # fitted shell and Gamma.
+        p_shell = jnp.take(chi_local, shell_indices, axis=0) * prefactor
+        gx_shell = jnp.take(g0_x_local, shell_indices, axis=0)
+        gy_shell = jnp.take(g0_y_local, shell_indices, axis=0)
+        p_gamma = chi_local[0] * prefactor
+        gx_gamma = g0_x_local[0]
+        gy_gamma = g0_y_local[0]
+
+        # Direct head and both one-sided projections.  Static Hermiticity
+        # converts the native body-head x carrier into canonical head-body Y
+        # (and conversely for Z) by conjugation, not by a body-axis reshard.
+        r_natural = jax.lax.psum(
+            jnp.einsum(
+                "sai,sij,sbj->sab", jnp.conj(gx_shell), p_shell,
+                gy_shell, optimize=True),
+            ("x", "y"))
+        r0_natural = jax.lax.psum(
+            jnp.einsum(
+                "ai,ij,bj->ab", jnp.conj(gx_gamma), p_gamma,
+                gy_gamma, optimize=True),
+            ("x", "y"))
+        r_samples = r_natural - r0_natural[None, :, :]
+
+        t_samples = jax.lax.psum(
+            jnp.einsum(
+                "sij,saj->sai", p_shell, gy_shell, optimize=True),
+            "y")
+        t0 = jax.lax.psum(
+            jnp.einsum("ij,aj->ai", p_gamma, gy_gamma, optimize=True),
+            "y")
+
+        u_samples = jax.lax.psum(
+            jnp.einsum(
+                "sbi,sij->sjb", jnp.conj(gx_shell), p_shell,
+                optimize=True),
+            "x")
+        u0 = jax.lax.psum(
+            jnp.einsum("bi,ij->jb", jnp.conj(gx_gamma), p_gamma,
+                       optimize=True),
+            "x")
+        y_samples = jnp.conj(t_samples - t0[None, :, :])
+        z_samples = jnp.conj(u_samples - u0[None, :, :])
+
+        H = jnp.einsum(
+            "as,sAB->aAB", linear_weights, r_samples, optimize=True)
+        H = jnp.where(jnp.asarray(linear_mask)[None, :, :], H, 0)
+        q_three = jnp.einsum(
+            "ks,sAB->kAB", quadratic_weights, r_samples, optimize=True)
+        q_three = jnp.where(
+            jnp.asarray(quadratic_mask)[None, :, :], q_three, 0)
+        Q = jnp.zeros((2, 2, 4, 4), dtype=dtype)
+        Q = Q.at[0, 0].set(q_three[0])
+        Q = Q.at[0, 1].set(q_three[1])
+        Q = Q.at[1, 0].set(q_three[1])
+        Q = Q.at[1, 1].set(q_three[2])
+        Y = jnp.einsum(
+            "as,sAI->aAI", linear_weights, y_samples, optimize=True)
+        Z = jnp.einsum(
+            "as,sJB->aJB", linear_weights, z_samples, optimize=True)
+
+        Q = Q.at[:, :, 0, 0].set(jnp.where(
+            use_charge, charge_S, Q[:, :, 0, 0]))
+        Y = Y.at[:, 0, :].set(jnp.where(
+            use_charge & charge_mask_x[:, 0, :],
+            charge_Y_packed_x[:, 0, :], Y[:, 0, :]))
+        Z = Z.at[:, :, 0].set(jnp.where(
+            use_charge & charge_mask_y[:, 0, :],
+            charge_Z_packed_y[:, 0, :], Z[:, :, 0]))
+
+        r_prediction = (
+            jnp.einsum("sa,aAB->sAB", q_shell_xy, H, optimize=True)
+            + jnp.einsum(
+                "sa,sb,abAB->sAB", q_shell_xy, q_shell_xy, Q,
+                optimize=True)
+        )
+        y_prediction = jnp.einsum(
+            "sa,aAI->sAI", q_shell_xy, Y, optimize=True)
+        z_prediction = jnp.einsum(
+            "sa,aJB->sJB", q_shell_xy, Z, optimize=True)
+
+        def _relative(error_sq, sample_sq):
+            tiny = jnp.finfo(real_dtype).tiny
+            return jnp.sqrt(error_sq) / jnp.maximum(
+                jnp.sqrt(sample_sq), tiny)
+
+        r_error = jnp.sum(jnp.square(jnp.abs(r_prediction - r_samples)))
+        r_norm = jnp.sum(jnp.square(jnp.abs(r_samples)))
+        y_error = jax.lax.psum(
+            jnp.sum(jnp.square(jnp.abs(y_prediction - y_samples))), "x")
+        y_norm = jax.lax.psum(
+            jnp.sum(jnp.square(jnp.abs(y_samples))), "x")
+        z_error = jax.lax.psum(
+            jnp.sum(jnp.square(jnp.abs(z_prediction - z_samples))), "y")
+        z_norm = jax.lax.psum(
+            jnp.sum(jnp.square(jnp.abs(z_samples))), "y")
+
+        uniform_A = jnp.max(jnp.abs(r0_natural[1:, 1:]))
+
+        # On diagonal mesh ranks the x/y copies carry the same global mu
+        # slice.  Those ranks collectively cover every slice once, so this
+        # scalar certifies the copies without redistributing either vector.
+        diagonal_rank = x_coord == y_coord
+        g0_copy_error = jnp.asarray(0.0, dtype=real_dtype)
+        g0_copy_scale = jnp.asarray(0.0, dtype=real_dtype)
+        g0_nonfinite = jnp.asarray(False)
+        difference = jnp.max(jnp.abs(g0_x_local - g0_y_local))
+        magnitude = jnp.maximum(
+            jnp.max(jnp.abs(g0_x_local)), jnp.max(jnp.abs(g0_y_local)))
+        g0_copy_error = jnp.where(diagonal_rank, difference, 0.0)
+        g0_copy_scale = jnp.where(diagonal_rank, magnitude, 0.0)
+        finite_here = (
+            jnp.all(jnp.isfinite(g0_x_local))
+            & jnp.all(jnp.isfinite(g0_y_local)))
+        g0_nonfinite = jnp.where(diagonal_rank, ~finite_here, False)
+
+        u_as_t = jnp.swapaxes(u_samples, 1, 2)
+        hermiticity_error = jnp.maximum(
+            jnp.max(jnp.abs(t_samples - jnp.conj(u_as_t))),
+            jnp.max(jnp.abs(t0 - jnp.conj(jnp.swapaxes(u0, 0, 1)))))
+        hermiticity_scale = jnp.maximum(
+            jnp.maximum(jnp.max(jnp.abs(t_samples)),
+                        jnp.max(jnp.abs(u_samples))),
+            jnp.maximum(jnp.max(jnp.abs(t0)), jnp.max(jnp.abs(u0))))
+        hermiticity_error = jax.lax.pmax(
+            jnp.where(diagonal_rank, hermiticity_error, 0.0), ("x", "y"))
+        hermiticity_scale = jax.lax.pmax(
+            jnp.where(diagonal_rank, hermiticity_scale, 0.0), ("x", "y"))
+        g0_copy_error = jax.lax.pmax(g0_copy_error, ("x", "y"))
+        g0_copy_scale = jax.lax.pmax(g0_copy_scale, ("x", "y"))
+        g0_nonfinite = jax.lax.pmax(
+            g0_nonfinite.astype(jnp.int32), ("x", "y"))
+        sampled_nonfinite = jax.lax.pmax(
+            (~jnp.all(jnp.isfinite(p_shell))
+             | ~jnp.all(jnp.isfinite(p_gamma))).astype(jnp.int32),
+            ("x", "y"))
+        analytic_nonfinite = (
+            ~jnp.all(jnp.isfinite(charge_S))
+            | jax.lax.pmax(
+                (~jnp.all(jnp.isfinite(charge_Y_packed_x))).astype(jnp.int32),
+                "x").astype(bool)
+            | jax.lax.pmax(
+                (~jnp.all(jnp.isfinite(charge_Z_packed_y))).astype(jnp.int32),
+                "y").astype(bool)
+        ) & use_charge
+        return (
+            H, Q, Y, Z,
+            _relative(r_error, r_norm),
+            _relative(y_error, y_norm),
+            _relative(z_error, z_norm),
+            uniform_A, hermiticity_error, hermiticity_scale,
+            g0_copy_error, g0_copy_scale,
+            g0_nonfinite | sampled_nonfinite | analytic_nonfinite,
+        )
+
+    kernel = jax.jit(shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(
+            P(None, "x", "y"),
+            P(None, None, "x"), P(None, None, "y"),
+            P(None), P(None, None), P(None, None), P(None, None), P(),
+            P(None, None), P(None, None, "x"),
+            P(None, None, "y"), P(None, None, "x"),
+            P(None, None, "y"), P(),
+        ),
+        out_specs=(
+            P(None, None, None), P(None, None, None, None),
+            P(None, None, "x"), P(None, "y", None),
+            P(), P(), P(), P(), P(), P(), P(), P(), P(),
+        ),
+        check_vma=False,
+    ))
+    _photon_longwave_fit_cache[key] = kernel
+    return kernel
+
+
+def fit_static_photon_longwave_coefficients(
+    chi_packed,
+    g0_vectors: PhotonG0Vectors,
+    layout,
+    meta,
+    mesh_xy,
+    *,
+    sym,
+    bvec_cart_bohr,
+    sys_dim: int,
+    omega_ry=0.0,
+    material_class: str,
+    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
+    charge_response=None,
+) -> StaticPhotonLongWaveCoefficients:
+    r"""Fit the experimental static slab q->0 photon response coefficients.
+
+    ``chi_packed`` is the raw packed output of :func:`compute_photon_chi0`.
+    This function forms the Dyson-normalized response
+    ``P = _w_solve_pref_scalar(meta) * chi_packed`` exactly once, then
+    projects only Gamma and the nearest complete +/-q shell.  It never reads
+    WFN/G-vectors, performs a q lookup or symmetry operation, repacks an
+    operator, folds wings, or solves Dyson.  Full packed samples die inside
+    the one sharded kernel; only coefficient arrays leave it.
+
+    The experimental power ruling is exact: CT/TC direct blocks are odd and
+    linear; Ward-subtracted TT (and CC when no analytic replacement is
+    supplied) are even and quadratic; every body wing is odd and linear; all
+    intercepts are zero through explicit subtraction of the projected Gamma
+    value.  ``charge_response``, when supplied, must be the existing
+    ``qsgw_head.IterationHeadResponse`` with one literal static row.  Its
+    in-plane S/Y/Z replace the fitted charge entries without gathering their
+    centroid axes.
+    """
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors,
+    )
+
+    if not isinstance(layout, PhotonBasisLayout):
+        raise TypeError("layout must be PhotonBasisLayout")
+    layout.assert_mesh(mesh_xy)
+    if int(sys_dim) != 2:
+        raise ValueError(
+            "nearest-shell photon long-wave fit is slab-only (sys_dim=2); "
+            f"got {sys_dim}")
+    if complex(omega_ry) != 0.0j:
+        raise ValueError(
+            "static Ward powers cannot be used for a dynamic photon "
+            f"response; omega_ry={complex(omega_ry)!r}")
+    if str(material_class).strip().lower() != "insulator":
+        raise ValueError(
+            "nearest-shell static photon fit is restricted to gapped "
+            f"insulators; material_class={material_class!r}")
+    if current_contact != _WARD_SUBTRACTED_NO_PAIR:
+        raise ValueError(
+            "nearest-shell static photon fit requires the explicit "
+            f"{_WARD_SUBTRACTED_NO_PAIR!r} contact; got {current_contact!r}")
+    if not isinstance(g0_vectors, PhotonG0Vectors):
+        raise TypeError("g0_vectors must be PhotonG0Vectors")
+    try:
+        from .v_q_bispinor import G0_DIAGONAL_FULL_BZ_V1
+    except ImportError as exc:
+        raise RuntimeError(
+            "photon long-wave fitting requires the canonical G=0 producer "
+            "contract in gw.v_q_bispinor") from exc
+    if g0_vectors.provenance != G0_DIAGONAL_FULL_BZ_V1:
+        raise ValueError(
+            "ambiguous photon G=0 provenance: expected "
+            f"{G0_DIAGONAL_FULL_BZ_V1!r}, got {g0_vectors.provenance!r}")
+
+    nq = int(meta.nk_tot)
+    expected_shape = (nq, layout.packed_extent, layout.packed_extent)
+    if tuple(chi_packed.shape) != expected_shape:
+        raise ValueError(
+            f"packed photon chi shape {chi_packed.shape} != {expected_shape}")
+    _require_named_sharding(
+        chi_packed, mesh_xy, P(None, "x", "y"), "chi_packed")
+    if len(g0_vectors.x_by_channel) != 4 or len(
+            g0_vectors.y_by_channel) != 4:
+        raise ValueError("PhotonG0Vectors requires exactly four channels")
+    for A, (gx, gy) in enumerate(zip(
+            g0_vectors.x_by_channel, g0_vectors.y_by_channel)):
+        expected = (nq, layout.padded_extent(A))
+        if tuple(gx.shape) != expected or tuple(gy.shape) != expected:
+            raise ValueError(
+                f"photon g0 channel {A} shapes {gx.shape}/{gy.shape} != "
+                f"{expected}")
+        _require_named_sharding(gx, mesh_xy, P(None, "x"),
+                                f"g0_vectors.x_by_channel[{A}]")
+        _require_named_sharding(gy, mesh_xy, P(None, "y"),
+                                f"g0_vectors.y_by_channel[{A}]")
+
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    if int(np.prod(kgrid)) != nq or int(getattr(sym, "nk_tot", nq)) != nq:
+        raise ValueError(
+            "meta and SymMaps do not describe one full-BZ q axis: "
+            f"kgrid={kgrid}, meta.nk_tot={nq}, "
+            f"sym.nk_tot={getattr(sym, 'nk_tot', None)}")
+    (
+        shell, q_shell, directions, shell_radii,
+        linear_weights, quadratic_weights, linear_rank, quadratic_rank,
+    ) = _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr)
+    charge_S, charge_Y, charge_Z, use_charge, charge_source = (
+        _static_charge_longwave_inputs(charge_response, layout, mesh_xy))
+    g0_x_packed = pack_photon_channel_vectors(
+        tuple(g0_vectors.x_by_channel), layout, mesh_xy, axis_name="x")
+    g0_y_packed = pack_photon_channel_vectors(
+        tuple(g0_vectors.y_by_channel), layout, mesh_xy, axis_name="y")
+
+    # The same layout owner embeds the analytic charge wing into the packed
+    # carrier.  Transverse rows are explicit zeros; w_isdf never spells a
+    # channel offset or packed-order constructor.
+    zero_x = tuple(jax.device_put(
+        np.zeros((2, layout.padded_extent(A)), dtype=np.complex128),
+        NamedSharding(mesh_xy, P(None, "x"))) for A in range(1, 4))
+    zero_y = tuple(jax.device_put(
+        np.zeros((2, layout.padded_extent(A)), dtype=np.complex128),
+        NamedSharding(mesh_xy, P(None, "y"))) for A in range(1, 4))
+    charge_Y_packed = pack_photon_channel_vectors(
+        (charge_Y,) + zero_x, layout, mesh_xy, axis_name="x")
+    charge_Z_rows = jnp.swapaxes(charge_Z, 0, 1)
+    charge_Z_packed = pack_photon_channel_vectors(
+        (charge_Z_rows,) + zero_y, layout, mesh_xy, axis_name="y")
+    charge_mask_x = pack_photon_channel_vectors(
+        (jax.device_put(
+            np.ones((2, layout.padded_extent(0)), dtype=np.complex128),
+            NamedSharding(mesh_xy, P(None, "x"))),) + zero_x,
+        layout, mesh_xy, axis_name="x") != 0
+    charge_mask_y = pack_photon_channel_vectors(
+        (jax.device_put(
+            np.ones((2, layout.padded_extent(0)), dtype=np.complex128),
+            NamedSharding(mesh_xy, P(None, "y"))),) + zero_y,
+        layout, mesh_xy, axis_name="y") != 0
+
+    rep1 = NamedSharding(mesh_xy, P(None))
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    shell_device = jax.device_put(shell, rep1)
+    q_device = jax.device_put(q_shell, rep2)
+    linear_device = jax.device_put(linear_weights, rep2)
+    quadratic_device = jax.device_put(quadratic_weights, rep2)
+    prefactor = jax.device_put(
+        np.asarray(_w_solve_pref_scalar(meta), dtype=np.float64),
+        NamedSharding(mesh_xy, P()))
+    use_charge_device = jax.device_put(
+        np.asarray(use_charge, dtype=np.bool_), NamedSharding(mesh_xy, P()))
+    results = _get_static_photon_longwave_fit_kernel(mesh_xy, layout)(
+        chi_packed,
+        g0_x_packed,
+        g0_y_packed,
+        shell_device,
+        q_device,
+        linear_device,
+        quadratic_device,
+        prefactor,
+        charge_S,
+        charge_Y_packed,
+        charge_Z_packed,
+        charge_mask_x,
+        charge_mask_y,
+        use_charge_device,
+    )
+    H, Q, Y, Z = results[:4]
+    # These nine values are replicated scalars already.  Copy the tiny tuple
+    # directly instead of compiling a second program merely to stack it.
+    diagnostics = np.asarray(
+        [np.asarray(value).item() for value in jax.device_get(results[4:])],
+        dtype=np.float64,
+    )
+    (
+        direct_residual, y_residual, z_residual, uniform_A,
+        hermiticity_error, hermiticity_scale,
+        g0_copy_error, g0_copy_scale, nonfinite,
+    ) = diagnostics.tolist()
+    if int(nonfinite) != 0:
+        raise ValueError(
+            "nearest-shell photon response or canonical g0 vectors contain "
+            "non-finite sampled values")
+    g0_tolerance = (
+        256.0 * np.finfo(np.float64).eps * max(g0_copy_scale, 1.0))
+    if g0_copy_error > g0_tolerance:
+        raise ValueError(
+            "photon g0 x/y carriers are not copies of the same canonical "
+            f"vectors: max_abs={g0_copy_error:.6e}, "
+            f"tolerance={g0_tolerance:.6e}")
+    hermiticity_tolerance = 1.0e-10 * max(hermiticity_scale, 1.0)
+    if hermiticity_error > hermiticity_tolerance:
+        raise ValueError(
+            "static packed response is not Hermitian in the projected "
+            f"G=0/body subspace: max_abs={hermiticity_error:.6e}, "
+            f"tolerance={hermiticity_tolerance:.6e}")
+    if uniform_A != 0.0:
+        raise ValueError(
+            "post-subtraction static uniform-A residual is nonzero in the "
+            f"projected TT Gamma head: max_abs={uniform_A:.6e}")
+
+    return StaticPhotonLongWaveCoefficients(
+        layout=layout,
+        H_direct=H,
+        Q_direct=Q,
+        Y_x=Y,
+        Z_y=Z,
+        shell_indices=tuple(int(i) for i in shell),
+        shell_directions_xy=tuple(
+            tuple(float(v) for v in row) for row in directions),
+        shell_radii_bohr_inv=tuple(float(r) for r in shell_radii),
+        linear_rank=int(linear_rank),
+        quadratic_rank=int(quadratic_rank),
+        direct_relative_residual=float(direct_residual),
+        Y_relative_residual=float(y_residual),
+        Z_relative_residual=float(z_residual),
+        uniform_A_residual=float(uniform_A),
+        hermiticity_residual=float(hermiticity_error),
+        g0_copy_residual=float(g0_copy_error),
+        g0_provenance=g0_vectors.provenance,
+        charge_response_source=charge_source,
+        current_contact=current_contact,
+    )
+
 
 @partial(jax.jit, donate_argnums=(0,))
 def _subtract_static_tt_contact(chi_tt):
