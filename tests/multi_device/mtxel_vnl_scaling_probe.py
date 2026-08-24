@@ -47,9 +47,9 @@ from common import Meta, symmetry_maps                        # noqa: E402
 from common.collectives import (process_count, process_rank,   # noqa: E402
                                 resolve_mesh)
 from common.mtxel_sweep import (SweepGeometry, Operator,        # noqa: E402
-                                band_sphere_spec, dipole_operator,
-                                kinetic_operator, sweep_matrix_elements,
-                                vnl_operator)
+                                dipole_operator, kinetic_operator,
+                                sweep_matrix_elements, vnl_operator)
+from common.wfn_layout import band_sphere_spec                   # noqa: E402
 from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
                                  # with the owner's workspace fix)
 _services.ensure_on_path()

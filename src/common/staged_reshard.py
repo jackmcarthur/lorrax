@@ -179,7 +179,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
-from runtime.padding import spec_divisor
+from runtime.padding import round_up, spec_divisor
 
 #: The two exchange schedules that land on ``P((ax_x, ax_y), None, None)``.
 #: ``split_b_first`` is the default and the measured one; ``flatten_m_first``
@@ -492,7 +492,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
                 sm = _make_sm(_body_split_b_first)
             else:
                 m_loc = m // p_x
-                m_pad = -(-m_loc // p_y) * p_y          # ceil to a p_y multiple
+                m_pad = round_up(m_loc, p_y)
                 if m_pad == m_loc:
                     keep = None
                 else:

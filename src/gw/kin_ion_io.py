@@ -879,10 +879,10 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # box the route above materialised per k.  ``band_sphere_spec`` is the
     # single definition of that layout, shared with the loader, so no
     # reshard is inserted between the read and the scan.
-    from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
-                                    blocks_to_host,
+    from common.mtxel_sweep import (SweepGeometry, blocks_to_host,
                                     local_potential_operator,
                                     sweep_matrix_elements)
+    from common.wfn_layout import band_sphere_spec
     k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
     psi_G = wfn.load(bands=(0, nb), k=k_spec, sharding=band_sphere_spec())
@@ -1305,10 +1305,11 @@ def main(argv=None):
     # G axis with the band index free, so it needs no collective and forms
     # no (nb, nb).  ``get_kin_ion_k`` is left in place — it is the per-k
     # local-plan kernel the sweep is gated against.
-    from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
-                                    blocks_to_host, kinetic_operator,
+    from common.mtxel_sweep import (SweepGeometry, blocks_to_host,
+                                    kinetic_operator,
                                     local_potential_operator, sum_operators,
                                     sweep_matrix_elements, vnl_operator)
+    from common.wfn_layout import band_sphere_spec
     #
     # THE k-SET IS THE STAR WEDGE, and so is the WRITTEN table — see "THE
     # IRREDUCIBLE k-SET" at the head of this module for the derivation,

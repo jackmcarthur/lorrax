@@ -285,7 +285,6 @@ from runtime.padding import pad_axis
 
 __all__ = [
     "SweepGeometry",
-    "band_sphere_spec",
     "Operator",
     "kinetic_operator",
     "local_potential_operator",
