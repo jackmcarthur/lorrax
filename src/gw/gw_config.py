@@ -3440,6 +3440,16 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
+def uses_coupled_photon_head(config) -> bool:
+    """Whether this config needs full-BZ four-channel Gamma vectors."""
+    return (
+        coerce_bispinor_gw_mode(getattr(
+            config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+        is BispinorGWMode.FULL_STATIC_COHSEX
+        and config.head.correction is HeadCorrection.FULL
+    )
+
+
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate the deliberately narrow first full-photon calculation.
 
@@ -3488,6 +3498,42 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (not bool(config.head.bispinor_tt_head_correction),
          "bispinor_tt_head_correction = true",
          "bispinor_tt_head_correction = false"),
+        # BGW vcoul is a scalar parity diagnostic, not a certified
+        # four-current kernel.  Applying it to CC only would make the finite-q
+        # packed photon operator internally hybrid; propagating it through TT
+        # needs a canonical scalar sampler and its own photon certification.
+        (not bool(config.head.use_bgw_vcoul),
+         "use_bgw_vcoul = true",
+         "use_bgw_vcoul = false (the default)"),
+        # The coupled photon path constructs its direct S/Y/Z from the
+        # canonical qsgw response and performs its own bordered mini-BZ solve.
+        # Scalar HeadResolver source/override controls do not enter that
+        # algebra; accepting a non-default value would falsely claim they did.
+        # eta does reach the analytic charge response, but no matching
+        # broadening exists in the finite-q current response, so nonzero eta
+        # is refused as an inconsistent charge-only prescription.
+        (str(config.head.wcoul0_source).strip().lower() == "s_tensor",
+         f"wcoul0_source = {config.head.wcoul0_source}",
+         "wcoul0_source = s_tensor (the default)"),
+        (float(config.head.wcoul0_eta) == 0.0,
+         f"wcoul0_eta = {config.head.wcoul0_eta}",
+         "wcoul0_eta = 0 (the default)"),
+        (config.head.vhead is None,
+         f"vhead = {config.head.vhead}",
+         "vhead unset"),
+        (config.head.whead_0freq is None,
+         f"whead_0freq = {config.head.whead_0freq}",
+         "whead_0freq unset"),
+        (config.head.whead_imfreq is None,
+         f"whead_imfreq = {config.head.whead_imfreq}",
+         "whead_imfreq unset"),
+        (str(config.head.mc_average_placement) == "off",
+         f"mc_average_placement = {config.head.mc_average_placement}",
+         "mc_average_placement = off (the default)"),
+        (config.head.mc_average_placement_vcoul is None,
+         ("mc_average_placement_vcoul = "
+          f"{config.head.mc_average_placement_vcoul}"),
+         "mc_average_placement_vcoul unset"),
     )
     for accepted, got, want in requirements:
         if accepted:

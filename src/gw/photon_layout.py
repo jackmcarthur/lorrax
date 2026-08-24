@@ -170,7 +170,8 @@ def _insert_program(layout, mesh_xy, nq, p_left, p_right):
         block = jnp.where(
             valid_left[None, :, None] & valid_right[None, None, :], block, 0)
         return jax.lax.dynamic_update_slice(
-            acc, block, (0, off_left, off_right))
+            acc, block, (jnp.asarray(0, dtype=jnp.int32),
+                         off_left, off_right))
 
     @partial(jax.jit,
              in_shardings=(nat, nat, rep0, rep0, rep0, rep0),
@@ -241,7 +242,8 @@ def _view_program(layout, mesh_xy, nq, p_left, p_right):
              check_vma=False)
     def view_local(packed, off_left, off_right):
         return jax.lax.dynamic_slice(
-            packed, (0, off_left, off_right),
+            packed, (jnp.asarray(0, dtype=jnp.int32),
+                     off_left, off_right),
             (int(nq), p_left // side, p_right // side))
 
     view = jax.jit(

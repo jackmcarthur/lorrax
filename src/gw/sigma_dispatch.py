@@ -868,9 +868,10 @@ def compute_sigma_xc(
                 "falling back to charge-only screened COHSEX.")
         if static_head_terms is not None:
             raise ValueError(
-                "full_static_cohsex is headless in its initial envelope, but "
-                "static_head_terms was supplied.  A scalar q->0 correction "
-                "cannot be added to a coupled four-current Dyson result.")
+                "full_static_cohsex received scalar static_head_terms.  Its "
+                "q->0 policy already lives in the packed four-current V/W; "
+                "a scalar correction would double count the charge sector "
+                "and omit coupled current wings.")
 
         # The V-only facade remains the one Hartree owner, but skips its
         # historical scalar+TT exchange contraction.  X, SX, and COH are all
