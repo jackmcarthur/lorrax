@@ -10,7 +10,7 @@ import numpy as np
 
 from jax.sharding import Mesh, PartitionSpec as P
 
-from common.psi_G_store import build_psi_G_store
+from common.psi_G_store import _mesh_device_coords, build_psi_G_store
 from common.wfn_transforms import iter_psi_rchunk_bandwise
 from ffi import _services
 
@@ -72,6 +72,16 @@ def _collect(iterator):
     return out
 
 
+def test_mesh_device_coords_excludes_nonaddressable_cells():
+    """A process allocates no host tile for another process's mesh cell."""
+    dev00, dev01, dev10, dev11 = (object() for _ in range(4))
+    mesh = SimpleNamespace(
+        devices=np.asarray([[dev00, dev01], [dev10, dev11]], dtype=object),
+        local_devices=(dev10,),
+    )
+    assert _mesh_device_coords(mesh) == {id(dev10): (1, 0)}
+
+
 def test_store_source_matches_direct_iterator_without_rereads(tmp_path):
     """Two r slabs consume one coefficient read per band chunk, not per slab.
 
@@ -97,6 +107,13 @@ def test_store_source_matches_direct_iterator_without_rereads(tmp_path):
             # Population is the only coefficient-I/O phase.
             assert counted.load_calls == [(0, 4), (4, 6)]
             assert source.band_chunk_carrier == 4
+            assert len(source._host_tiles) == len(mesh.local_devices)
+            expected_host_bytes = (
+                len(mesh.local_devices)
+                * int(np.prod(source._per_rank_shape))
+                * np.dtype(np.complex128).itemsize
+            )
+            assert source.host_cache_bytes == expected_host_bytes
 
             cached_main = _collect(source.iter_rchunk_bandwise(
                 0, 8, product_r_spec=product_r_spec))

@@ -71,6 +71,7 @@ __all__ = [
     "load_kpoint_fftbox_local",
     "process_local_mesh",
     "read_Gvecs_to_devices",
+    "prepare_rchunk_carrier",
     "iter_psi_rchunk_bandwise",
     "load_centroids_band_chunked",
     "load_psi_gflat_padded",
@@ -1878,6 +1879,73 @@ def load_psi_gflat_padded(
 # ============================================================================
 
 
+def prepare_rchunk_carrier(
+    mesh_xy: Mesh,
+    *,
+    r_start: int,
+    r_end: int,
+    n_rtot: int,
+    product_r_spec: P | None,
+):
+    """Plan and finish the canonical band-sharded r-chunk carrier.
+
+    This is the one owner for the r-range validation, runtime-padding
+    divisor, terminal-tail rule, and staged band-product → r-product move
+    shared by direct WFN iteration and reusable coefficient sources.  The
+    transform that produces the already-zero-filled carrier remains the
+    caller's responsibility.
+
+    Returns ``(carrier_extent, output_sharding, finish)``.  ``finish`` checks
+    the produced extent and commits it to the requested layout; when
+    ``product_r_spec`` is the canonical product-r layout it invokes
+    :func:`common.staged_reshard.band_to_product_r_reshard`.
+    """
+    r_start = int(r_start)
+    r_end = int(r_end)
+    n_rtot = int(n_rtot)
+    if not 0 <= r_start < r_end <= n_rtot:
+        raise ValueError(
+            "prepare_rchunk_carrier: expected "
+            f"0 <= r_start < r_end <= {n_rtot}, got "
+            f"[{r_start}, {r_end})")
+
+    out_y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    product_reshard = None
+    if product_r_spec is not None:
+        expected = P(None, None, None, ('y', 'x'))
+        if product_r_spec != expected:
+            raise ValueError(
+                "prepare_rchunk_carrier: the canonical product-r route "
+                f"has spec {expected}, got {product_r_spec}")
+        r_pad_divisor = spec_divisor(mesh_xy, product_r_spec, axis=3)
+        product_reshard = band_to_product_r_reshard(mesh_xy)
+        out_r = NamedSharding(mesh_xy, product_r_spec)
+    else:
+        r_pad_divisor = 1
+        out_r = out_y
+
+    logical_extent = r_end - r_start
+    carrier_extent = round_up(logical_extent, r_pad_divisor)
+    if (product_reshard is not None and carrier_extent != logical_extent
+            and r_end != n_rtot):
+        raise ValueError(
+            "prepare_rchunk_carrier: product-r padding is only inert on "
+            "a terminal slab ending at the physical FFT-grid extent; got "
+            f"[{r_start}, {r_end}) of [0, {n_rtot})")
+
+    def _finish(a):
+        if int(a.shape[-1]) != carrier_extent:
+            raise AssertionError(
+                "prepare_rchunk_carrier: canonical padded-r slice returned "
+                f"extent {int(a.shape[-1])}, expected runtime.padding "
+                f"carrier {carrier_extent}")
+        if product_reshard is None:
+            return jax.lax.with_sharding_constraint(a, out_y)
+        return product_reshard(a)
+
+    return carrier_extent, out_r, _finish
+
+
 def iter_psi_rchunk_bandwise(
     wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
     band_chunk_size: int = 16,
@@ -1927,38 +1995,13 @@ def iter_psi_rchunk_bandwise(
     nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
     n_rchunk = int(r_end - r_start)
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-    product_reshard = None
-    if product_r_spec is not None:
-        expected = P(None, None, None, ('y', 'x'))
-        if product_r_spec != expected:
-            raise ValueError(
-                "iter_psi_rchunk_bandwise: the canonical product-r route "
-                f"has spec {expected}, got {product_r_spec}")
-        r_pad_divisor = spec_divisor(mesh_xy, product_r_spec, axis=3)
-        product_reshard = band_to_product_r_reshard(mesh_xy)
-        out_r = NamedSharding(mesh_xy, product_r_spec)
-    else:
-        r_pad_divisor = 1
-        out_r = out_Y
-    n_rchunk_carrier = round_up(n_rchunk, r_pad_divisor)
-    if (product_reshard is not None and n_rchunk_carrier != n_rchunk
-            and int(r_end) != int(meta.n_rtot)):
-        raise ValueError(
-            "iter_psi_rchunk_bandwise: product-r padding is only inert on "
-            "a terminal slab ending at the physical FFT-grid extent; got "
-            f"[{int(r_start)}, {int(r_end)}) of [0, {int(meta.n_rtot)})")
-
-    def _finish_r_carrier(a):
-        """Commit one already zero-filled carrier to its requested layout."""
-        if int(a.shape[-1]) != n_rchunk_carrier:
-            raise AssertionError(
-                "iter_psi_rchunk_bandwise: canonical padded-r slice "
-                f"returned extent {int(a.shape[-1])}, expected runtime."
-                f"padding carrier {n_rchunk_carrier}")
-        if product_reshard is None:
-            return jax.lax.with_sharding_constraint(a, out_Y)
-        return product_reshard(a)
+    n_rchunk_carrier, out_r, _finish_r_carrier = prepare_rchunk_carrier(
+        mesh_xy,
+        r_start=r_start,
+        r_end=r_end,
+        n_rtot=meta.n_rtot,
+        product_r_spec=product_r_spec,
+    )
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
