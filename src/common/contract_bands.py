@@ -307,7 +307,7 @@ FaceProjectShape = tuple
 
 
 def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
-                         channels: str = "none"):
+                         channels: str = "none", right_face_shape=None):
     """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
     no psum_scatter — cuBLASMp's own distributed algorithm does the
     reduction the legacy body does by hand.  See the module docstring's
@@ -349,11 +349,21 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
     from distrib_la import gemm_plan
 
     ax_x, ax_y = axes
-    nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    mu_s = n_rmu * ns
-    plan1 = gemm_plan(mesh_xy, m=mu_s, k=mu_s, n=nb_full, nq=nk,
+    nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
+    if right_face_shape is None:
+        right_face_shape = face_shape
+    nk_right, nb_right, n_rmu_right, ns_right = (
+        int(v) for v in right_face_shape)
+    if (nk_right, nb_right, ns_right) != (nk, nb_full, ns):
+        raise ValueError(
+            "contract_bands_block_reshard(layout='face'): left/right "
+            "face shapes must share (nk, nb_full, nspinor); got "
+            f"{face_shape} and {right_face_shape}")
+    mu_s_left = n_rmu_left * ns
+    mu_s_right = n_rmu_right * ns
+    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_full, nq=nk,
                       dtype=jnp.complex128)
-    plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
+    plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s_left, n=nb_full, nq=nk,
                       dtype=jnp.complex128)
 
     def _check(psi_nmu, O, psi_mun):
@@ -364,6 +374,16 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
                 f"psi_mun rank 4 (nk,s,mu,n); got "
                 f"{tuple(psi_nmu.shape)}, {tuple(O.shape)}, "
                 f"{tuple(psi_mun.shape)}")
+        expected = (
+            (nk, nb_full, ns, n_rmu_left),
+            (nk, ns, n_rmu_left, ns, n_rmu_right),
+            (nk, ns, n_rmu_right, nb_full),
+        )
+        got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
+        if got != expected:
+            raise ValueError(
+                "contract_bands_block_reshard(layout='face'): rectangular "
+                f"endpoint shapes {got} do not match planned {expected}")
 
     def _project_one(psi_nmu, O, psi_mun):
         """``project(psi_left, O, psi_right)`` — SAME argument order as
@@ -408,6 +428,7 @@ def contract_bands_block_reshard(
     divisibility_hint: str = "",
     layout: str = "legacy",
     face_shape=None,
+    right_face_shape=None,
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -469,6 +490,11 @@ def contract_bands_block_reshard(
         (the reason this is a factory ARGUMENT and not read off an
         operand at call time: a ``GemmPlan`` cannot be built from inside
         a trace — see ``distrib_la.gemm_plan``'s own docstring).
+    right_face_shape
+        Optional ``(nk, nb_full, n_rmu_right, nspinor)`` for a rectangular
+        operator.  Omit for the historical square projection.  The two
+        endpoints must share ``nk``, ``nb_full`` and ``nspinor``; only their
+        centroid extents may differ.
 
     Returns
     -------
@@ -501,8 +527,9 @@ def contract_bands_block_reshard(
             raise ValueError(
                 "contract_bands_block_reshard(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        return _face_project_kernel(mesh_xy, face_shape, axes,
-                                    channels=channels)
+        return _face_project_kernel(
+            mesh_xy, face_shape, axes, channels=channels,
+            right_face_shape=right_face_shape)
 
     from common.shard_map import shard_map
 

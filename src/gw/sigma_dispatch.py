@@ -588,6 +588,7 @@ def compute_sigma_xc(
     Gij: jax.Array | None = None,
     wfns_transverse=None,
     bispinor_v_q_path: str | None = None,
+    photon_response=None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
     omit_v_h: bool = False,
@@ -655,6 +656,10 @@ def compute_sigma_xc(
         Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
         tile file).  Both-or-neither; Σ^B is folded into ``sig_x`` by
         the static kernels.  ``None`` for scalar runs.
+    photon_response
+        Packed static four-current response.  Used only by
+        ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
+        neither inspects nor constructs it.
     print_fn
         Rank-0-only print.
 
@@ -847,7 +852,55 @@ def compute_sigma_xc(
     W_static = W_by_role.get("static", V_q)
     builds_static_screened = mode_builds_channels(
         mode, SigmaChannel.SX, SigmaChannel.COH)
-    if builds_static_screened:
+    from .gw_config import BispinorGWMode, coerce_bispinor_gw_mode
+    bispinor_gw = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
+        if not builds_static_screened or mode is not ComputeMode.COHSEX:
+            raise ValueError(
+                "full_static_cohsex reached Sigma outside compute_mode=cohsex; "
+                "the config/driver envelope should have refused this before "
+                "screening allocation.")
+        if photon_response is None:
+            raise RuntimeError(
+                "bispinor_gw=full_static_cohsex reached Sigma without the "
+                "packed static photon response.  Refusing instead of "
+                "falling back to charge-only screened COHSEX.")
+        if static_head_terms is not None:
+            raise ValueError(
+                "full_static_cohsex is headless in its initial envelope, but "
+                "static_head_terms was supplied.  A scalar q->0 correction "
+                "cannot be added to a coupled four-current Dyson result.")
+
+        # The V-only facade supplies Hartree + Sigma_X^all[V] (CC plus the
+        # incumbent bare-TT adapter).  Its scalar SX/COH zeros are REPLACED,
+        # not augmented, by the sixteen-block photon sum through the same
+        # canonical Green/convolution/projector services.
+        from .cohsex_sigma import _resolve_Gij
+        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+        cohsex = compute_v_h_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=photon_Gij,
+            static_head_terms=None,
+            wfns_transverse=wfns_transverse,
+            bispinor_v_q_path=bispinor_v_q_path,
+            occupation_state=None,
+        )
+        from .photon_sigma import compute_static_photon_sigma
+        full_static = compute_static_photon_sigma(
+            wfns_charge=wfns,
+            wfns_transverse=wfns_transverse,
+            Gij=photon_Gij,
+            V_packed=photon_response.V_packed,
+            W_packed=photon_response.W_packed,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            print_fn=print_fn,
+        )
+        cohsex["sig_sx"] = full_static.sig_sx
+        cohsex["sig_coh"] = full_static.sig_coh
+    elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
             Gij=Gij,
