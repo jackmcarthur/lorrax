@@ -313,14 +313,11 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
              for qy in range(nky) for qz in range(nkz)],
             dtype=np.int32)
 
-    # BGW wrap: q > kg/2 → q - kg.  Same convention the writer used
-    # when building the per-q gvec_components on disk.
-    kg_arr = np.asarray(kgrid, dtype=np.float64)
-    q_irr_wrapped = np.where(
-        q_irr_kgrid_int > kg_arr / 2,
-        q_irr_kgrid_int - kg_arr,
-        q_irr_kgrid_int).astype(np.float64)
-    q_irr_frac = q_irr_wrapped / kg_arr
+    # The symmetry service owns BGW's strict half-grid tie convention.
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import bgw_integer_q_to_fractional
+    q_irr_frac = bgw_integer_q_to_fractional(q_irr_kgrid_int, kgrid)
     result = (q_irr_kgrid_int, q_irr_frac,
               q_full_to_irr_idx, q_full_to_irr_sym,
               sym_perm, L_table, use_ibz)
