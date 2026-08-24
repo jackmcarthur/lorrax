@@ -127,3 +127,36 @@ def test_identity_metric_route_matches_the_cholesky_route():
     assert a_id and not b_id, (a_id, b_id)
     d = float(np.max(np.abs(a["energies_sorted"] - b["energies_sorted"])))
     assert d < 1e-6, f"identity route moved an energy by {d:.3e} Ry"
+
+
+def test_approximate_basis_requires_explicit_opt_in():
+    """The finite-accuracy validation route is explicit and default-safe.
+
+    A deliberately non-orthonormal coefficient table must still trip the
+    production gate.  The experimental route may proceed only when its
+    keyword is supplied, and it must announce that the gate became
+    report-only so a validation artifact cannot masquerade as production.
+    """
+    pytest.importorskip("jax")
+    import jax
+    import jax.numpy as jnp
+    from bandstructure.htransform import build_fH_R
+
+    mesh = _mesh(1)
+    ct, enk, _B, kgrid = _synthetic()
+    ct[:, 0, :] *= 0.99
+    with mesh, pytest.raises(ValueError, match="NOT orthonormal"):
+        build_fH_R(
+            jnp.asarray(ct), jnp.asarray(enk), kgrid, mesh,
+            log_fn=lambda _line: None,
+        )
+
+    lines = []
+    with mesh:
+        out = build_fH_R(
+            jnp.asarray(ct), jnp.asarray(enk), kgrid, mesh,
+            allow_approximate_basis=True, log_fn=lines.append,
+        )
+        jax.block_until_ready(out[:2])
+    assert any("exact on-grid recovery gate is REPORT-ONLY" in line
+               for line in lines), lines

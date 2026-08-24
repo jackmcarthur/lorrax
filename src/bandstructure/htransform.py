@@ -903,6 +903,7 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
+               allow_approximate_basis: bool = False,
                log_fn=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
@@ -925,6 +926,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index whose bandwidth sets ``a``;
                    defaults to top of the htransform window (nb-1).
+        allow_approximate_basis: explicit paper-reference mode.  The HT
+                   reference implementation chooses a finite-accuracy QRCP
+                   basis (``qr_eps=1e-3``), for which projected coefficients
+                   need not be exactly orthonormal.  False preserves the
+                   production exact-recovery refusal.
         log_fn:    optional logger.
 
     Returns:
@@ -1031,7 +1037,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
            f"max|C Cᴴ − I| = {_ortho:.3e}  (cap {_tol:.1e}; measured "
            f"conversion: on-grid max|Δε| ≈ 9.0e3 × this, so this run's "
            f"on-grid energy error is ≈ {9.0e3 * _ortho:.2e} meV)")
-    if _tol > 0.0 and _ortho > _tol:
+    if _tol > 0.0 and _ortho > _tol and not allow_approximate_basis:
         raise ValueError(
             f"build_fH_R: the Galerkin coefficients are NOT orthonormal — "
             f"max|C Cᴴ − I| = {_ortho:.3e} over all k, above the {_tol:.1e} "
@@ -1044,6 +1050,12 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"window, never with rtol; (2) the G accumulation summed Q Qᴴ "
             f"per band chunk instead of summing into Q first.  Override with "
             f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
+    if _tol > 0.0 and _ortho > _tol and allow_approximate_basis:
+        log_fn(
+            "  [experimental paper-basis] exact on-grid recovery gate is "
+            "REPORT-ONLY: the finite-accuracy HT basis is being evaluated "
+            "against an independent fine-grid reference.  This mode is "
+            "explicit and never selected by a deck or environment variable.")
 
     fH_k, fH_R = _build(ctilde, f_eps)
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
@@ -1241,7 +1253,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None, return_full_proj: bool = False,
-                    n_guard_bands: int = 0):
+                    n_guard_bands: int = 0, galerkin_rtol: float = 1e-8):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1347,7 +1359,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     with mesh_xy:
         out = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
-            rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
+            rtol=float(galerkin_rtol), log_fn=log_fn, bispinor=bispinor,
             return_full_proj=return_full_proj,
             # Deck key, same family as the fH_q eigh; the CLI --eigh-backend
             # override is scoped to compute_wfns_fi and deliberately not
@@ -1391,7 +1403,8 @@ def initialize_kpath(wfn, params):
 
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
-                a_band_index: int | None = None, diagnostics: bool = True):
+                a_band_index: int | None = None, diagnostics: bool = True,
+                allow_approximate_basis: bool = False):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1403,7 +1416,8 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
     fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
-        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
+        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index,
+        allow_approximate_basis=allow_approximate_basis, log_fn=log_fn)
     jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
@@ -1858,6 +1872,15 @@ def main(argv=None):
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
+    parser.add_argument(
+        "--paper-basis-rtol", type=float, default=None,
+        help="EXPERIMENTAL validation route for the finite-accuracy numerical "
+             "basis in Wu et al.'s HT reference implementation.  The "
+             "authors default qr_eps to 1e-3; supplying this flag uses the "
+             "given SVD relative threshold and makes the exact coefficient-"
+             "orthogonality gate report-only.  It must be judged against an "
+             "independent fine-grid band reference.  Omit for the unchanged "
+             "production exact-span route (rtol=1e-8 and hard refusal).")
     parser.add_argument("--fh-diagnostics", default="auto",
                         choices=("auto", "on", "off"),
                         help="fH_k range stats, the Γ eigenvalue check against "
@@ -1889,6 +1912,9 @@ def main(argv=None):
              "backend's robust distributed route; batch_reshard moves q "
              "onto the mesh and runs whole-matrix local JAX linalg.")
     args = parser.parse_args(argv)
+    if args.paper_basis_rtol is not None and not (
+            0.0 < args.paper_basis_rtol < 1.0):
+        parser.error("--paper-basis-rtol must lie strictly between 0 and 1")
     log = _make_logger(args.verbose)
 
     # JAX persistent compile cache — the same call/pattern as gw_jax's
@@ -1929,8 +1955,14 @@ def main(argv=None):
     from common import sanity
 
     with timing.section("initialize_wfns"):
+        if args.paper_basis_rtol is not None:
+            log("  [experimental paper-basis] finite-accuracy numerical "
+                f"basis requested at relative threshold "
+                f"{args.paper_basis_rtol:.1e}; upstream HT defaults to 1e-3")
         wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
-            args.input, params, log, args.eqp_file)
+            args.input, params, log, args.eqp_file,
+            galerkin_rtol=(1e-8 if args.paper_basis_rtol is None
+                           else args.paper_basis_rtol))
     # ── Galerkin-input gate ───────────────────────────────────────────
     # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
     # construction) and ``enk_sigma`` is the band energies the whole
@@ -1962,7 +1994,9 @@ def main(argv=None):
                 else args.fh_diagnostics == "on")
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
-                             a_band_index=args.a_band, diagnostics=_diag_on)
+                             a_band_index=args.a_band, diagnostics=_diag_on,
+                             allow_approximate_basis=(
+                                 args.paper_basis_rtol is not None))
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
