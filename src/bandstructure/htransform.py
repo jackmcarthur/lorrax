@@ -2224,7 +2224,10 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         m = jax.lax.with_sharding_constraint(m, face_ij_shard)
         m = (m + jnp.swapaxes(m, 1, 2).conj())[0]
         m = jax.lax.with_sharding_constraint(m, face_one_shard)
-        return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
+        # The canonical flattened coarse grid starts at Gamma.  ``m`` is the
+        # q=0 reconstruction, so comparing it with any other k row can hide a
+        # genuine ordering/sign error behind an accidental smaller residual.
+        return jnp.max(jnp.abs(fH_k[0] - m))
 
     _t0 = _perf()                                          # instrument:
     if diagnostics:
