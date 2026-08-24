@@ -36,6 +36,7 @@ from .gw_config import (
 	env_bool,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
+	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
 )
@@ -2249,6 +2250,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						centroid_C_idx=_cent_C_idx_for_orchestrator,
 						centroid_T_idx=_cent_T_idx_for_orchestrator,
 						use_ibz=_use_ibz_bispinor,
+						tt_head_correction=bool(
+							cfg.head.bispinor_tt_head_correction),
 					)
 
 		# Read CC tile + g0 back for downstream restart-state writer.
@@ -2520,6 +2523,9 @@ def prepare_isdf_and_wavefunctions(
 	# this function used to carry on its own fresh/restart branches: this
 	# single call covers all four table rows, earlier, on both branches.
 	refuse_unsupported_low_mem_bands(cfg)
+	# Same shape, same two-call-site reason: parser-altitude coverage is
+	# duplicated here for a hand-built cfg.  No-op at the default (false).
+	refuse_unsupported_bispinor_tt_head_correction(cfg)
 
 	if not cfg.restart:
 		from common.wfn_transforms import get_enk_bandrange

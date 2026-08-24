@@ -1907,6 +1907,21 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction.
+    # False (default) = current behavior, BIT-IDENTICAL: the bare TT tiles'
+    # q=Γ, G=0 slot stays zero (the transverse projector t_ij(q̂) has no
+    # limit as q→0, so a naive point evaluation is undefined there and the
+    # shipped code leaves it at zero rather than guess).  True replaces
+    # that slot with the mini-BZ Voronoi cell average ⟨v(q) t_ij(q̂)⟩_mBZ
+    # (vcoul.{slab_2d,bulk_3d}.*.q0_average_transverse_tensor) — the
+    # current-current analogue of the charge channel's ⟨v⟩ head, needed
+    # because the current structure factor ⟨m|α^i|n⟩ does NOT collapse to
+    # δ_mn the way the charge one does.  Only meaningful under
+    # bispinor=true; requires sys_dim in (2, 3) (box truncation's q=Γ,
+    # G=0 slot is already finite and needs no substitute).  See
+    # docs/BISPINOR_DHFB_DESIGN.md §11 and
+    # gw.v_q_bispinor._make_per_q_v_builder_for_tile's docstring.
+    "bispinor_tt_head_correction": False,
     # Singular Gamma-cell policy.  ``full`` is the shipping macroscopic W
     # head (microscopic local fields folded exactly once); the other two are
     # convergence/diagnostic arms, not alternative diagram sets.
@@ -3446,6 +3461,64 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
+def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
+    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
+
+    NO-OP for the default ``false`` (returns before any predicate is
+    touched, same shape as :func:`refuse_unsupported_low_mem_bands`) and
+    for ``bispinor = false`` decks read through a hand-built config that
+    never sets the flag at all.
+
+    Two named conditions, GATE ``bispinor_tt_head_unsupported``:
+
+    1. ``bispinor = false`` — the flag corrects a bare TT V-tile that a
+       non-bispinor run never builds.
+    2. ``sys_dim not in (2, 3)`` — box truncation's q=Γ, G=0 slot is
+       already finite (``vcoul.box_0d.Box0D._v_bare_per_q`` never zeros
+       it), so there is no missing slot to substitute; the bispinor
+       g-flat path also does not reach sys_dim=0 today
+       (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
+       entry), so this is a defensive, not merely a redundant, refusal.
+
+    Called at parser altitude (``LorraxConfig.from_input_file``) and at
+    driver-entry altitude (``gw.gw_init.prepare_isdf_and_wavefunctions``),
+    mirroring :func:`refuse_unsupported_low_mem_bands`'s two call sites
+    for the same reason: the parser call saves the allocation on the
+    production path, the driver-entry call protects a hand-built config.
+    """
+    if not bool(config.head.bispinor_tt_head_correction):
+        return
+    if not bool(config.bispinor):
+        raise ValueError(
+            "GATE bispinor_tt_head_unsupported: "
+            "bispinor_tt_head_correction = true is refused with "
+            "bispinor = false.\n"
+            "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
+            "  want: bispinor = true\n"
+            "  fix:  set bispinor = true, or leave "
+            "bispinor_tt_head_correction at its default (false)\n"
+            "  why:  the correction replaces the q=Γ, G=0 slot of the "
+            "bare bispinor TT (transverse-transverse) V-tiles, which a "
+            "non-bispinor run never builds\n"
+            "  doc:  docs/input_reference.md '## Bispinor', "
+            "bispinor_tt_head_correction.")
+    sys_dim = int(config.sys_dim)
+    if sys_dim not in (2, 3):
+        raise ValueError(
+            "GATE bispinor_tt_head_unsupported: "
+            f"bispinor_tt_head_correction = true is refused with "
+            f"sys_dim = {sys_dim}.\n"
+            f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
+            "  want: sys_dim in {2, 3} (slab / bulk)\n"
+            "  fix:  set sys_dim to 2 or 3, or leave "
+            "bispinor_tt_head_correction at its default (false)\n"
+            "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
+            "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
+            "there is no missing slot for this correction to fill\n"
+            "  doc:  docs/input_reference.md '## Bispinor', "
+            "bispinor_tt_head_correction.")
+
+
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
     """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
 
@@ -3531,6 +3604,7 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
+    bispinor_tt_head_correction: bool  # bare TT q=Γ,G=0 mini-BZ head (default off)
     w_av_first_neighbors: bool
     w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
@@ -4785,6 +4859,7 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
+            bispinor_tt_head_correction=bool(_g("bispinor_tt_head_correction")),
             w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
             w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
@@ -5290,6 +5365,9 @@ class LorraxConfig:
         # gw.gw_init.prepare_isdf_and_wavefunctions (driver-entry altitude,
         # for hand-built configs) both exist.
         refuse_unsupported_low_mem_bands(resolved)
+        # Same position/reason again: bispinor_tt_head_correction = false
+        # (the default) returns before either predicate is touched.
+        refuse_unsupported_bispinor_tt_head_correction(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the

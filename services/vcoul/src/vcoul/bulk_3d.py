@@ -8,7 +8,7 @@ import numpy as np
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                          sample_minibz_qpoints)
+                          minibz_transverse_head_avg, sample_minibz_qpoints)
 
 __all__ = ["Bulk3D"]
 
@@ -120,3 +120,36 @@ class Bulk3D:
         wq = vq / (1.0 + vq * qsq * gamma)
         wcoul0 = jnp.mean(wq)
         return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
+
+    def q0_average_transverse_tensor(
+        self, geometry: CoulombGeometry, kgrid, *,
+        nsamples: int = 2**18,
+        method: str = "sobol",
+        qmc_reps: int = 10,
+        analytic_sphere: bool = False,
+    ) -> np.ndarray:
+        """``T_ab = ⟨v(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare transverse-
+        projector head (bispinor TT), bare units.  See
+        :meth:`Slab2D.q0_average_transverse_tensor` for the physics.
+
+        ``analytic_sphere=False`` (the default, matching :meth:`q0_average`)
+        is a pure-Sobol mean of a ``1/q²``-singular integrand and inherits
+        the SAME infinite-variance estimator problem the scalar 3D head has
+        (``KNOWN_LORRAX_ISSUES.md``, the ``minibz.py`` row: measured tail
+        index ``alpha≈1.5 < 2``, so ``sigma/sqrt(N)`` is not a valid error
+        bar).  Pass ``True`` for a 3D bulk production head — it adds the
+        isotropic Baldereschi-Tosatti sphere term exactly as
+        :meth:`q0_average` does for the scalar case.  The 2D slab sibling
+        is unaffected (marginal ``alpha=2``); this caveat is 3D-only.
+        """
+        nkx, nky, nkz = (int(s) for s in kgrid)
+        bvec = np.asarray(geometry.bvec, dtype=np.float64)
+        nmax = 3 if analytic_sphere else 1
+        batches = sample_minibz_qpoints(
+            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
+            qmc_reps=qmc_reps, nmax=nmax, is_2d=False)
+        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=False)
+        return minibz_transverse_head_avg(
+            np.zeros(3), [np.asarray(b) for b in batches], kind="bulk_3d",
+            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
+            q0sph2=q0sph2, analytic_sphere=analytic_sphere, adaptive=True)
