@@ -363,7 +363,7 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "legacy",
                          face_shape=None):
-    """Cached factory: returns (sigma_sx, sigma_coh, hartree) jit'd kernels.
+    """Cached factory returning SX/COH kernels and one Hartree scheduler.
 
     Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
     same shape the chi0 / ppm_sigma kernel caches use, extended with the
@@ -382,9 +382,9 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     nspinor)`` — the two ``distrib_la.gemm_plan``s this branch builds
     (one for G, one dedicated to Hartree's diagonal-weight contraction,
     plus the two inside the shared projector) need their shapes fixed
-    EAGERLY, here, once — never inside ``sigma_sx``/``sigma_coh``/
-    ``hartree``'s own ``@jax.jit`` bodies, which is exactly what caching
-    this whole factory buys.
+    EAGERLY, here, once.  Hartree schedules its three shared jitted stages
+    directly, so scalar and photon direct terms reuse those executables
+    instead of compiling a redundant outer Hartree wrapper.
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
@@ -466,9 +466,8 @@ def _make_cohsex_kernels_legacy(
         return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
                         _convolve(G_ri, W_q - V_q, -0.5))
 
-    @jax.jit
     def hartree(wfns, Gij, V_q):
-        """V_H(m,n,k) = <m| V(q=0, no G0) · ρ |n>.  V_q flat-k (nk,μ,μ); uses V_q[0]."""
+        """Schedule the three shared jitted Hartree stages."""
         rho_sum = hartree_density(wfns, wfns, Gij)
         field = hartree_field(V_q, rho_sum)
         return hartree_project(wfns, wfns, field)
@@ -571,12 +570,8 @@ def _make_cohsex_kernels_face(
                         _convolve(G_ri, W_q - V_q, -0.5),
                         layout="face", face_project_fn=proj_fn)
 
-    @jax.jit
     def hartree(wfns, Gij, V_q):
-        """Local band-weighted density + psum over the band mesh axis,
-        a distributed V-ρ matvec, then the canonical face projection —
-        specialised to a diagonal-in-μ weight rather than a full O
-        operator (see this function's docstring)."""
+        """Schedule the three shared jitted Hartree stages."""
         rho_sum = hartree_density(wfns, wfns, Gij)
         field = hartree_field(V_q, rho_sum)
         return hartree_project(wfns, wfns, field)
