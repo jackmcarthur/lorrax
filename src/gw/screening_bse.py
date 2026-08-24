@@ -752,7 +752,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                     "head_n_occ": int(meta.nelec),
                     "head_pref": head_prefactor(
                         float(meta.cell_volume), int(meta.nk_tot),
-                        int(wfn.nspin), int(meta.nspinor)),
+                        int(wfn.nspin), int(meta.nspinor_wfnfile)),
                 }
         wedge = compute_wc_qwedge(
             tensors_filename, z, mesh_xy, include_w=include_w,

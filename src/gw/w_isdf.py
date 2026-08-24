@@ -1311,13 +1311,22 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
 
 
 def _w_solve_pref_scalar(meta) -> float:
-    """The 2/(√N_k · n_spin · n_spinor) prefactor in front of χ₀ in the
-    Dyson solve.  Same value for both plans; pulled out so the dispatch
-    helper below isn't the only place it's computed."""
+    """The physical-state prefactor in front of χ₀ in the Dyson solve.
+
+    ``nspinor_wfnfile`` is the source-WFN state multiplicity.  In a
+    kinetic-balance lift ``meta.nspinor`` becomes four only to describe the
+    bispinor representation; the band and occupation axes are unchanged.
+    Using that representation width here would therefore halve every
+    charge/current response block.  Read the source field strictly: silently
+    falling back to the representation width would reinstate that error.
+    """
     nq = int(meta.nk_tot)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
-    nspinor = max(1, int(getattr(meta, 'nspinor', 1)))
-    return 2.0 / (float(max(1, nq)) ** 0.5 * float(nspin) * float(nspinor))
+    nspinor_wfnfile = max(1, int(meta.nspinor_wfnfile))
+    return 2.0 / (
+        float(max(1, nq)) ** 0.5
+        * float(nspin)
+        * float(nspinor_wfnfile))
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, dyson_solver=None,
