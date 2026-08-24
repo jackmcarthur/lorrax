@@ -887,7 +887,7 @@ def compute_sigma_xc(
             occupation_state=None,
         )
         from .photon_sigma import compute_static_photon_sigma
-        full_static = compute_static_photon_sigma(
+        photon_sx, photon_coh = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
             Gij=photon_Gij,
@@ -898,8 +898,8 @@ def compute_sigma_xc(
             mesh_xy=mesh_xy,
             print_fn=print_fn,
         )
-        cohsex["sig_sx"] = full_static.sig_sx
-        cohsex["sig_coh"] = full_static.sig_coh
+        cohsex["sig_sx"] = photon_sx
+        cohsex["sig_coh"] = photon_coh
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,

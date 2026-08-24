@@ -199,10 +199,11 @@ def pack_photon_operator(
 ) -> jax.Array:
     """Stream sixteen blocks into one packed ``P(None,'x','y')`` operator.
 
-    ``get_block(A,B)`` is called only when that block is about to be inserted;
-    the caller releases it after the insertion returns.  Peak residency is
-    therefore the accumulator plus one block, and T1/T2/T3 never imply
-    wavefunction copies.
+    ``get_block(A,B)`` is called only when that block is about to be inserted.
+    Each insertion is completed before the next callback so the consumed
+    block's device buffer is released before another response block can be
+    allocated.  Peak residency is therefore the accumulator plus one block,
+    and T1/T2/T3 never imply wavefunction copies.
     """
     layout.assert_mesh(mesh_xy)
     packed = _empty(nq, layout, mesh_xy, dtype)
@@ -210,6 +211,12 @@ def pack_photon_operator(
         for B in range(N_LORENTZ):
             packed = _insert(
                 packed, get_block(A, B), layout, A, B, mesh_xy)
+            # JAX dispatch is asynchronous.  The next get_block() is an
+            # independent, body-sized response build, so the accumulator
+            # dependency alone does not prevent two block outputs from being
+            # allocated at once.  This is the explicit one-block lifetime
+            # boundary promised by the streaming contract above.
+            packed.block_until_ready()
     return packed
 
 
