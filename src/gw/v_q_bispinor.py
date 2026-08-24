@@ -634,10 +634,15 @@ class BispinorVqReader:
             companion = HERMITIAN_PAIRS[(mu_L, nu_L)]
             n_L_c, n_R_c = self._tile_shape(*companion)[1:]
             n_L_p, n_R_p = self._padded_shape_LR(n_L_c, n_R_c)
+            # Read the companion with its two centroid axes reversed so the
+            # physical Hermitian transpose below lands directly on this
+            # reader's canonical P(None, 'x', 'y') contract.  Reading in the
+            # ordinary orientation and then swapping would return
+            # P(None, 'y', 'x') and force every consumer to repair it.
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
                 shape=(self.n_q_total, n_L_p, n_R_p),
-                mesh=self._mesh, partition_spec=spec)
+                mesh=self._mesh, partition_spec=P(None, 'y', 'x'))
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
         # Direct read (member of UNIQUE_TILES)
