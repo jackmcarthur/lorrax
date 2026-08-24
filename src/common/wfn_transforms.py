@@ -649,11 +649,43 @@ def to_rchunk_inner(
     # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
     # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
     rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-    slab = jax.lax.dynamic_slice_in_dim(rb_flat, r0, r_len_i, axis=-1)
+    slab = _take_rchunk_padded(rb_flat, r0, r_len_i)
     if kvecs_frac is not None:
         slab = apply_bloch_phase_on_slice(
             slab, kvecs_frac, fft_grid_t, r0, r_len_i)
     return slab
+
+
+def _take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
+    """Take a fixed-width flat-r slab, zero-filling beyond physical r.
+
+    ``lax.dynamic_slice`` clamps an out-of-bounds start backward.  That is
+    correct for its API but wrong for a mesh-padded final r carrier: asking
+    for ``[r0, r0 + r_len)`` must retain those exact logical cells and append
+    zeros, never substitute earlier physical cells.  The r axis is local and
+    replicated at both callers, so this bounded gather preserves their
+    existing low-memory sharding and allocates only the requested slab.
+    """
+    n_rtot = int(values.shape[-1])
+    r_len_i = int(r_len)
+    r0_arr = jnp.asarray(r0, dtype=jnp.int32)
+
+    def _direct(_):
+        # Preserve the incumbent contiguous-slice executable for every main
+        # chunk.  Only the ragged final carrier takes the masked gather arm.
+        return jax.lax.dynamic_slice_in_dim(
+            values, r0_arr, r_len_i, axis=-1)
+
+    def _padded(_):
+        r_idx = r0_arr + jnp.arange(r_len_i, dtype=jnp.int32)
+        valid = (r_idx >= 0) & (r_idx < n_rtot)
+        safe_idx = jnp.clip(r_idx, 0, n_rtot - 1)
+        slab = jnp.take(values, safe_idx, axis=-1)
+        valid_shape = (1,) * (slab.ndim - 1) + (r_len_i,)
+        return jnp.where(valid.reshape(valid_shape), slab, 0)
+
+    in_bounds = (r0_arr >= 0) & (r0_arr + r_len_i <= n_rtot)
+    return jax.lax.cond(in_bounds, _direct, _padded, operand=None)
 
 
 def to_rchunk(
@@ -1500,7 +1532,13 @@ def apply_bloch_phase_on_slice(
     # int ``r0`` (broadcast as a constant) and jax-scalar ``r0`` (each
     # element a traced add).  ``nyn nz`` are static so divmod constants
     # fold cleanly.
-    flat = r0 + jnp.arange(r_len_i, dtype=jnp.int32)         # (r_len,)
+    # ``to_rchunk_inner`` permits a fixed-width carrier whose final cells
+    # lie beyond the physical FFT box and are exact zeros.  Clip only the
+    # phase lookup for those inert cells so every gather remains in bounds;
+    # valid slab coordinates are unchanged bit-for-bit.
+    flat = jnp.clip(
+        r0 + jnp.arange(r_len_i, dtype=jnp.int32),
+        0, nx * ny * nz - 1)                                # (r_len,)
     rx = flat // (ny * nz)
     ry = (flat // nz) % ny
     rz = flat % nz
