@@ -35,6 +35,7 @@ from runtime.padding import padded_mu_extent
 N_LORENTZ = 4
 CHARGE = 0
 TRANSVERSE = (1, 2, 3)
+MAX_Q0_UPDATE_RANK = 4
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class PhotonBasisLayout:
 _zero_cache: dict = {}
 _insert_cache: dict = {}
 _view_cache: dict = {}
+_q0_update_cache: dict = {}
 
 
 def _empty(nq, layout, mesh_xy, dtype):
@@ -266,7 +268,137 @@ def photon_block_view(
             scalar(layout.local_offset(B)))
 
 
+def _q0_update_program(layout, mesh_xy, nq, dtype):
+    """One shape-stable local graph for all bounded q=0 updates."""
+    key = (id(mesh_xy), layout, int(nq), np.dtype(dtype).str)
+    if key in _q0_update_cache:
+        return _q0_update_cache[key]
+    from common.shard_map import shard_map
+
+    packed_spec = P(None, 'x', 'y')
+    left_spec = P(None, 'x')
+    right_spec = P(None, 'y')
+    packed_sharding = NamedSharding(mesh_xy, packed_spec)
+    left_sharding = NamedSharding(mesh_xy, left_spec)
+    right_sharding = NamedSharding(mesh_xy, right_spec)
+    side = layout.mesh_side
+
+    def local_valid_mask(axis_name):
+        shard = jax.lax.axis_index(axis_name)
+        pieces = []
+        for logical, padded in zip(
+                layout.logical_extents, layout.padded_extents):
+            n_local = padded // side
+            pieces.append(
+                shard * n_local + jnp.arange(n_local) < logical)
+        return jnp.concatenate(pieces)
+
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(packed_spec, left_spec, right_spec),
+             out_specs=packed_spec, check_vma=False)
+    def add_local(packed, left_rows, right_rows):
+        # Each packed shard is C_X⊕T1_X⊕T2_X⊕T3_X (and analogously
+        # along y), so masking must be local-channel-aware rather than a
+        # single trailing slice of the global packed axis.
+        left_rows = jnp.where(
+            local_valid_mask('x')[None, :], left_rows, 0)
+        right_rows = jnp.where(
+            local_valid_mask('y')[None, :], right_rows, 0)
+        delta_q0 = jnp.einsum('ai,aj->ij', left_rows, right_rows)
+        return packed.at[0, :, :].add(delta_q0)
+
+    @partial(jax.jit,
+             in_shardings=(packed_sharding, left_sharding, right_sharding),
+             out_shardings=packed_sharding, donate_argnums=(0,))
+    def add_q0(packed, left_rows, right_rows):
+        return add_local(packed, left_rows, right_rows)
+
+    _q0_update_cache[key] = add_q0
+    return add_q0
+
+
+def add_photon_q0_low_rank(
+    packed: jax.Array,
+    layout: PhotonBasisLayout,
+    mesh_xy: Mesh,
+    *,
+    left_rows_X: jax.Array | None = None,
+    right_rows_Y: jax.Array | None = None,
+) -> jax.Array:
+    """Add one bounded low-rank update to the packed q=Gamma operator.
+
+    The mathematical update is ``O[0] += L @ R`` with rank at most four.
+    For local 2-D placement, callers supply ``left_rows_X = L.T`` and
+    ``right_rows_Y = R``, both stored as fixed-capacity ``(4, N_packed)``
+    row arrays.  Their shardings are respectively ``P(None, 'x')`` and
+    ``P(None, 'y')``; unused rows are exactly zero.  No conjugation or
+    physical prefactor is implicit: directed response factors must already
+    contain both.  This convention admits general non-Hermitian bordered
+    response updates rather than silently imposing a head model here.
+
+    Internal C/T padding is masked structurally from ``layout``.  The update
+    is a local outer-product sum on each device and the donated packed
+    accumulator never gathers or reshards.  Calls with both factors absent
+    return the identical object without dispatch; supplying only one factor,
+    a non-capacity-four factor, or a non-native sharding is refused.
+    """
+    if left_rows_X is None and right_rows_Y is None:
+        return packed
+    if left_rows_X is None or right_rows_Y is None:
+        raise ValueError(
+            "q=0 low-rank update requires both left_rows_X and right_rows_Y")
+
+    layout.assert_mesh(mesh_xy)
+    if getattr(packed, "ndim", None) != 3:
+        raise ValueError(
+            f"packed photon operator must be rank 3; got shape "
+            f"{getattr(packed, 'shape', None)}")
+    packed_shape = (
+        int(packed.shape[0]), layout.packed_extent, layout.packed_extent)
+    if int(packed.shape[0]) < 1 or tuple(packed.shape) != packed_shape:
+        raise ValueError(
+            f"packed photon operator shape {packed.shape} != {packed_shape}")
+    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+    if tuple(left_rows_X.shape) != factor_shape:
+        raise ValueError(
+            f"left q=0 factor shape {left_rows_X.shape} != {factor_shape}; "
+            "zero-pad updates of physical rank < 4")
+    if tuple(right_rows_Y.shape) != factor_shape:
+        raise ValueError(
+            f"right q=0 factor shape {right_rows_Y.shape} != {factor_shape}; "
+            "zero-pad updates of physical rank < 4")
+    if (np.dtype(left_rows_X.dtype) != np.dtype(packed.dtype)
+            or np.dtype(right_rows_Y.dtype) != np.dtype(packed.dtype)):
+        raise TypeError(
+            "packed operator and q=0 factors must have exactly one dtype; "
+            f"got {packed.dtype}, {left_rows_X.dtype}, {right_rows_Y.dtype}")
+
+    expected = (
+        (packed, "packed", P(None, 'x', 'y')),
+        (left_rows_X, "left_rows_X", P(None, 'x')),
+        (right_rows_Y, "right_rows_Y", P(None, 'y')),
+    )
+    for array, name, spec in expected:
+        wanted = NamedSharding(mesh_xy, spec)
+        sharding = getattr(array, "sharding", None)
+        if (sharding is None
+                or not sharding.is_equivalent_to(wanted, array.ndim)):
+            raise ValueError(
+                f"{name} must already have sharding {spec}; got {sharding}. "
+                "Refusing an implicit packed-body reshard.")
+
+    updated = _q0_update_program(
+        layout, mesh_xy, packed_shape[0], packed.dtype)(
+            packed, left_rows_X, right_rows_Y)
+    # Repeated bounded updates reuse the donated accumulator.  This explicit
+    # lifetime boundary prevents independently produced factor pairs from
+    # overlapping the next update's live set under asynchronous dispatch.
+    updated.block_until_ready()
+    return updated
+
+
 __all__ = [
-    "CHARGE", "TRANSVERSE", "N_LORENTZ", "PhotonBasisLayout",
-    "pack_photon_operator", "photon_block_view",
+    "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
+    "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
+    "add_photon_q0_low_rank",
 ]
