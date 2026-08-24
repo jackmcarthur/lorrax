@@ -80,6 +80,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple
 
+from ffi import _services
+
+_services.ensure_on_path()
+from lxkit import device_put_process_local
+
 
 __all__ = [
     # topology
@@ -527,89 +532,6 @@ def shard_over_k(arr, mesh, *, axes=None):
 # the slab-io process-local writers): declare each rank's own shard with
 # ``jax.make_array_from_single_device_arrays``.  Zero collectives, zero
 # transient, and identical semantics for the values this is used on.
-
-def device_put_process_local(host_array, sharding, *, check: bool | None = None):
-    """Place a host array that EVERY process already holds onto ``sharding``
-    **without a collective**.
-
-    Drop-in replacement for ``jax.device_put(host_array, sharding)`` on a
-    multi-process ``NamedSharding``.  Each process slices out only the
-    shard(s) its own devices own (the full array for a replicated spec, a
-    per-rank hyperslab for a sharded one) and declares them via
-    ``jax.make_array_from_single_device_arrays``.
-
-    **Correctness precondition** (the same one ``jax.device_put`` was
-    silently spending 17 GB/rank to assert): ``host_array`` must be
-    bit-identical on every process.  Every current caller satisfies it by
-    construction — the tables are pure functions of the input file plus
-    the mesh shape, computed identically on every rank.
-
-    Set ``LORRAX_CHECK_REPLICA=1`` (or pass ``check=True``) to re-enable
-    JAX's assertion for a debugging run; it costs exactly the all-gather
-    described above, so it is OFF by default.
-
-    Parameters
-    ----------
-    host_array
-        numpy array (or anything ``np.asarray`` accepts) of the GLOBAL
-        shape, identical on every process.
-    sharding
-        Target ``jax.sharding.Sharding``.
-    check
-        Force the cross-process equality assertion on/off.  ``None``
-        (default) reads ``LORRAX_CHECK_REPLICA``.
-
-    Returns
-    -------
-    jax.Array with the requested ``sharding``.
-    """
-    import os
-
-    import jax
-    import numpy as np
-
-    # An input that is ALREADY a globally-sharded jax.Array is a genuine
-    # reshard, not a host staging: ``device_put`` handles it on the
-    # committed / non-fully-addressable branch, which never calls
-    # ``assert_equal``.  Hand it straight back (and never ``np.asarray``
-    # it — that would be the host gather this function exists to avoid).
-    if isinstance(host_array, jax.Array) and not host_array.is_fully_addressable:
-        return jax.device_put(host_array, sharding)
-
-    arr = np.asarray(host_array)
-
-    # Fully addressable target (single process, or a mesh this process
-    # owns entirely): plain device_put takes the assertion-free path.
-    if process_count() <= 1 or bool(getattr(sharding, "is_fully_addressable",
-                                            False)):
-        return jax.device_put(arr, sharding)
-
-    if check is None:
-        # Same falsy vocabulary as every other LORRAX knob ("", 0, false,
-        # no, off — case-insensitive).  The old parse recognised only
-        # ""/"0"/"false"/"False", so LORRAX_CHECK_REPLICA=off (or NO, OFF,
-        # False in another case) silently ENABLED the debug all-gather —
-        # a P-linear hidden collective (7.8 GB/rank at P=64, scorecard Y.5)
-        # turned on by a string that reads as "disabled" (workstream AT).
-        check = os.environ.get("LORRAX_CHECK_REPLICA", "0").strip().lower() \
-            not in ("", "0", "false", "no", "off")
-    if check:
-        # Opt-in debug path — this IS the P-linear all-gather.
-        return jax.device_put(arr, sharding)
-
-    shape = tuple(int(s) for s in arr.shape)
-    idx_map = sharding.addressable_devices_indices_map(shape)
-    if not idx_map:
-        # This process owns no device in the target sharding.  JAX's own
-        # assertion is skipped in that case too, so device_put is already
-        # collective-free; hand it over rather than build an empty array.
-        return jax.device_put(arr, sharding)
-    shards = [
-        jax.device_put(np.ascontiguousarray(arr[idx]), dev)
-        for dev, idx in idx_map.items()
-    ]
-    return jax.make_array_from_single_device_arrays(shape, sharding, shards)
-
 
 class HostSpill(NamedTuple):
     """A ``jax.Array``'s LOCAL shards, moved to host RAM by
