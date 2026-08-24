@@ -87,6 +87,64 @@ def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
         f"GW leg that writes it.")
 
 
+def _logical_nband_total(psi_k0, enk_full_shape1: int) -> int:
+    """The LOGICAL top-band bound for ``enk_full`` / ``psi_full_y`` — NOT
+    ``enk_full.shape[1]`` and NOT ``band_window``'s ``b4``.
+
+    THE SINGLE OWNER of the fix for KNOWN_LORRAX_ISSUES.md's
+    ``bse_loading.py`` padding-clamp row (2026-08-23).  ``enk_full`` /
+    ``psi_full_y`` are written at ``round_up(nband, world_size)`` bands
+    (``file_io.tagged_arrays``), so ``enk_full.shape[1]`` is the PADDED
+    count whenever ``nband`` does not divide the process count, and reading
+    it as the number of real bands silently grows ``n_cond_available`` by
+    the pad (measured: ``nband=20`` at P=16 gives
+    ``enk_full.shape=(64,32)``).
+
+    THE FIRST ATTEMPT AT THIS FIX read ``band_window``'s ``b4`` instead,
+    reasoning it was the restart's own logical-count stamp.  MEASURED
+    WRONG, same session: ``file_io.wavefunction_bundle.BandSlices`` states
+    outright that "``b4`` is ``max(b4_chi, b4_sigma)`` PADDED to the world
+    size" and enforces it (``from_band_edges``'s own ``ValueError`` on a
+    mismatch) — ``b4`` is not a logical count that happens to also be
+    padded, it is DEFINED as the padded top, for every writer, regardless
+    of ``low_mem_bands``.  On this exact fixture (Si_scalar, nband=20,
+    P=16) ``band_window`` reads ``[0,0,4,14,32]`` — the SAME 32 as
+    ``enk_full.shape[1]`` — so that first attempt was a no-op wearing a
+    fix's clothes; it was caught by re-measuring the P16 leg it was meant
+    to close (`h5py` dump of the run's own ``isdf_tensors_192.h5``) rather
+    than trusting the P4 arm, where ``round_up(20,4)==20`` made the bug
+    invisible by coincidence.
+
+    THE SIGNAL THAT ACTUALLY WORKS, measured on the SAME fixture: a
+    padding band's ``psi_full_y`` row is EXACT ZERO — never populated,
+    because the writer only ever copies the ``nband`` bands the deck asked
+    for — while ``enk_full``'s padding rows are NOT zero (the underlying
+    WFN often has more DFT bands than the deck requested, e.g. this
+    fixture's WFN carries 40; ``enk_full`` is written un-clipped, so its
+    pad rows are real, if unrequested, DFT eigenvalues and cannot be told
+    apart from data by value).  Every real band has finite norm by
+    construction (a converged eigenstate is normalised); a padding slot is
+    never written and stays whatever ``np.zeros`` produced it as.  So the
+    logical top band is the number of LEADING nonzero-norm rows in
+    ``psi_k0`` — the ``(nb, ns, n_rmu)`` k=0 slab (uniform across k: the
+    pad is a per-BAND property of how many bands were loaded, not a
+    per-k one), read once, cheaply, before the sharded ψ transport opens.
+    Falls back to the array's own shape when every row reads zero (an
+    all-zero restart is already a different, upstream defect this
+    function cannot diagnose, and returning 0 here would only obscure it).
+    """
+    nonzero = np.any(
+        np.asarray(psi_k0) != 0, axis=tuple(range(1, np.ndim(psi_k0))))
+    if not np.any(nonzero):
+        return int(enk_full_shape1)
+    # Leading zero-run stripped from the top down: the first index, from
+    # the END, that IS populated. Robust to an isolated zero row inside the
+    # real window (never expected, but this reads it as "not padding"
+    # rather than truncating past it).
+    real_idx = np.nonzero(nonzero)[0]
+    return int(real_idx[-1]) + 1
+
+
 def is_q_wedge(dset) -> bool:
     """Is this restart tensor stored on the IBZ q wedge?  ATTRS ONLY.
 
@@ -967,7 +1025,9 @@ def load_bse_data_from_restart_sharded(
             enk_full, n_occ=n_occ, input_file=input_file,
             fermi_energy=fermi_energy if fermi_energy != 0.0 else None,
         )
-        nb_total = int(enk_full.shape[1])
+        # k=0 only (see _logical_nband_total: the pad is uniform across k) —
+        # one small h5py slice, not the full (nk, nb, ns, n_rmu) transport.
+        nb_total = _logical_nband_total(psi_full_dset[0], enk_full.shape[1])
         n_val_available = int(n_occ)
         n_cond_available = nb_total - int(n_occ)
         if n_val > n_val_available:
@@ -1276,6 +1336,10 @@ def _load_ring_subset(
             )
         psi_full = jnp.asarray(f["psi_full_y"][:])
         enk_full_np = np.asarray(f["enk_full"][:])
+        # k=0 only (see _logical_nband_total: the pad is uniform across k).
+        # Cheap here regardless: this reader already materialises the whole
+        # (nk, nb, ns, n_rmu) tensor above (single-device full-file reader).
+        nb_total = _logical_nband_total(psi_full[0], enk_full_np.shape[1])
 
     if eqp_file is not None:
         enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
@@ -1320,7 +1384,7 @@ def _load_ring_subset(
     # Same μ re-pad convention as the sharded loader above.
     n_rmu_pad = padded_mu_extent(n_rmu, px * py)
 
-    n_bands_total = enk_full.shape[1]
+    n_bands_total = nb_total
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     n_val_available = int(n_occ)
     n_cond_available = n_bands_total - n_occ
