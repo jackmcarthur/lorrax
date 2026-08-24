@@ -9,6 +9,20 @@ of the RPA one.  It is a two-stage object by construction — the ladder kernel
 ``src/bse/`` because the operator is the BSE ring matvec; ``gw/`` consumes only
 the (mu, nu) tiles this module returns.
 
+``build_ladder_resolvent(..., include_w=False)`` DELEGATES to
+``bse_w_exact._build_rpa_resolvent`` — the RPA limit of this SAME
+resolvent identity, with the direct rung parameterized out of the ring
+matvec (``bse_ring_comm.build_bse_ring_matvec_full(..., include_W=
+False)``) rather than a second matvec builder.  As of 2026-08-23 that
+limit is ALSO a served production diagram, ``screening_diagrams =
+w_rpa_resolvent`` (``gw.screening_bse.compute_screening_ladder``'s
+``include_w=False`` arm) — a second route to ``w_rpa``'s own W, useful
+for gating this module's restart/TRS/head machinery on an operator simple
+enough to have an independent reference.  Every ``include_w=True``
+statement in this docstring — the ladder rung, its TRS-gauge derivation,
+the finite-q vertex-flip compensation — is specific to the LADDER arm and
+does not describe ``w_rpa_resolvent``, which never builds the rung at all.
+
 Scaling envelope (TASTE 8 / INVARIANTS 9) — MEASURED, not projected
 ---------------------------------------------------------------------------
 Every claim in this section was checked against the optimized HLO on a 2x2
@@ -340,13 +354,17 @@ def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
     The :func:`bse_w_exact._build_rpa_resolvent` analog with the ladder kernel.
     Returns ``(matvec, diag_h, gen, snapshot, sh)`` — the exact 5-tuple
     :func:`bse_w_exact.apply_screening_resolvent_block` consumes, which is
-    operator-agnostic: only this assembly changes between ``w_rpa`` and
-    ``w_bse``.
+    operator-agnostic: only this assembly changes between ``w_rpa_resolvent``
+    and ``w_bse``.
 
     ``include_w=False`` DELEGATES to ``_build_rpa_resolvent``.  That is
-    deliberate rather than a duplicated branch: the wiring-closure test rides
-    this flag to prove the new plumbing reproduces the production RPA W, so the
-    two must be the same object graph and not merely the same arguments.
+    deliberate rather than a duplicated branch: the wiring-closure test
+    (``tests/test_bse_w_ladder_identities.py``) rides this flag to prove
+    the plumbing reproduces the production RPA W, so the two must be the
+    same object graph and not merely the same arguments — and, since
+    2026-08-23, so does the production ``screening_diagrams =
+    w_rpa_resolvent`` path (``gw.screening_bse.compute_screening_ladder``),
+    for the same reason.
 
     ``include_w=True`` needs ``data['W_q']`` — the converged RPA ``W(0)`` from
     the restart — because ``ensure_W_R(..., include_W=True)`` inverse-FFTs it
@@ -874,7 +892,7 @@ def compute_wc_qwedge(
             head_op, data, d_pair, z_list_ry, pref=float(head_pref),
             max_iter=int(gmres_max_iter), tol=float(gmres_tol),
             arm=("micro_reducible_bse" if include_w
-                 else "micro_reducible_rpa_test2"),
+                 else "micro_reducible_rpa_resolvent"),
             delta_cvk=delta_cv)
     return WLadderWedge(
         wc=wc,
