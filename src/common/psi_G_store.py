@@ -23,9 +23,9 @@ staging pipeline:
 
 The store populates once and can either feed the one-time ψ(r) cache build or
 serve repeated r chunks through :meth:`PsiGStore.iter_rchunk_bandwise`.  Its
-host footprint is
-``nk · nb_total · ns · ngkmax · 16 / P`` bytes per process for the store's
-lifetime.
+host footprint is one band shard per process-addressable mesh cell; the
+process total is the exact sum of those local tiles (one tile in the usual
+one-rank-per-GPU launch).
 
 The reader adapters (legacy h5py vs phdf5) collapse to a single
 :class:`wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
@@ -41,7 +41,7 @@ from jax.experimental import io_callback
 from common.shard_map import shard_map
 from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from runtime.padding import round_up, spec_divisor
+from runtime.padding import spec_divisor
 
 
 def _zero_user_band_pad_in_shard(
@@ -79,11 +79,22 @@ def _zero_user_band_pad_in_shard(
 
 
 def _mesh_device_coords(mesh: Mesh) -> dict:
-    """Map ``id(device) → (x_idx, y_idx)`` for every device in the mesh."""
+    """Map only this process's addressable devices to global mesh cells."""
+    global_coords = {
+        id(dev): tuple(int(i) for i in idx)
+        for idx, dev in np.ndenumerate(np.asarray(mesh.devices))
+    }
     coords = {}
-    devs = np.asarray(mesh.devices)
-    for idx, dev in np.ndenumerate(devs):
-        coords[id(dev)] = tuple(int(i) for i in idx)
+    for dev in mesh.local_devices:
+        dev_id = id(dev)
+        if dev_id not in global_coords:
+            raise RuntimeError(
+                "PsiGStore: a Mesh.local_devices entry is absent from "
+                "Mesh.devices")
+        coords[dev_id] = global_coords[dev_id]
+    if not coords:
+        raise RuntimeError(
+            "PsiGStore: this process owns no addressable device in the mesh")
     return coords
 
 
@@ -242,9 +253,17 @@ class PsiGStore:
         self._closed = False
 
         self._populate_from_loader()
+        expected_host_bytes = (
+            len(self._coords) * self._per_rank_shape_bytes())
+        if self.host_cache_bytes != expected_host_bytes:
+            raise RuntimeError(
+                "PsiGStore: process-local host cache allocation drifted "
+                f"from its exact bound: allocated={self.host_cache_bytes} "
+                f"bytes, expected={expected_host_bytes} bytes for "
+                f"{len(self._coords)} addressable mesh cells")
         if jax.process_index() == 0:
-            tile_gb = self._per_rank_shape_bytes() / 1e9
-            print(f"  ψ(G-flat) host cache: {tile_gb:.2f} GB/process resident")
+            host_gb = self.host_cache_bytes / 1e9
+            print(f"  ψ(G-flat) host cache: {host_gb:.2f} GB/process resident")
 
     # ---------------------------------------------------------------------
     # Population — pulls from the WfnLoader, scatters into per-(x,y) tiles.
@@ -378,6 +397,11 @@ class PsiGStore:
         return (int(nk), int(self._bpd_max), int(ns), int(ngkmax))
 
     @property
+    def host_cache_bytes(self) -> int:
+        """Exact bytes in process-addressable coefficient host tiles."""
+        return sum(int(tile.nbytes) for tile in self._host_tiles.values())
+
+    @property
     def band_chunk_carrier(self) -> int:
         """Uniform global band width yielded for every logical chunk."""
         p = spec_divisor(self.mesh, band_sphere_spec(), axis=1)
@@ -500,38 +524,23 @@ class PsiGStore:
         """
         if self._closed:
             raise RuntimeError("PsiGStore.iter_rchunk_bandwise: store is closed")
+        from common.wfn_transforms import prepare_rchunk_carrier
         r_start = int(r_start)
         r_end = int(r_end)
-        n_rtot = int(self.meta.n_rtot)
-        if not 0 <= r_start < r_end <= n_rtot:
-            raise ValueError(
-                "PsiGStore.iter_rchunk_bandwise: expected "
-                f"0 <= r_start < r_end <= {n_rtot}, got "
-                f"[{r_start}, {r_end})")
-        expected = P(None, None, None, ('y', 'x'))
-        if product_r_spec != expected:
-            raise ValueError(
-                "PsiGStore.iter_rchunk_bandwise: the canonical product-r "
-                f"route has spec {expected}, got {product_r_spec}")
-
-        r_divisor = spec_divisor(self.mesh, product_r_spec, axis=3)
-        logical_n_rchunk = r_end - r_start
-        n_r_carrier = round_up(logical_n_rchunk, r_divisor)
-        if n_r_carrier != logical_n_rchunk and r_end != n_rtot:
-            raise ValueError(
-                "PsiGStore.iter_rchunk_bandwise: product-r padding is only "
-                "inert on a terminal slab ending at the physical FFT-grid "
-                f"extent; got [{r_start}, {r_end}) of [0, {n_rtot})")
-
-        from common.staged_reshard import band_to_product_r_reshard
-        product_reshard = band_to_product_r_reshard(self.mesh)
+        n_r_carrier, _, finish_r_carrier = prepare_rchunk_carrier(
+            self.mesh,
+            r_start=r_start,
+            r_end=r_end,
+            n_rtot=self.meta.n_rtot,
+            product_r_spec=product_r_spec,
+        )
         kernel = self._rchunk_kernel(n_r_carrier)
         r_start_dev = jnp.asarray(r_start, dtype=jnp.int32)
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
             psi_band_r = kernel(
                 self.g_index, self.kvecs_frac, r_start_dev,
                 jnp.asarray(bc_idx, dtype=jnp.int32))
-            psi_product_r = product_reshard(psi_band_r)
+            psi_product_r = finish_r_carrier(psi_band_r)
             yield tuple(int(v) for v in bc_range), psi_product_r
 
     @property
