@@ -205,11 +205,14 @@ def test_iterator_chunks_band_axis(synth_wfn_path):
 # Backend
 # ---------------------------------------------------------------------------
 
-def test_bispinor_lift_matches_legacy(wfn_path):
-    """``loader.load(bispinor=True)`` must reproduce the legacy
-    :func:`common.bispinor_init.get_small_psi_component` lift exactly
-    when applied to ``loader.load(bispinor=False)``."""
-    from common.bispinor_init import get_small_psi_component
+def test_bispinor_lift_uses_cartesian_momentum_with_blat(wfn_path):
+    """The production lift is ``(α/2) σ·[(k+G) @ (blat*bvec)] L``.
+
+    The reference is written independently in NumPy and every arm has
+    ``blat != 1``.  Omitting ``blat`` therefore fails this cell instead of
+    agreeing with a second copy of the same defect.
+    """
+    from common.bispinor_init import HALFALPHA
 
     with WfnLoader(wfn_path) as loader:
         if int(loader.nspinor) != 2:
@@ -225,23 +228,33 @@ def test_bispinor_lift_matches_legacy(wfn_path):
         ngk_v = loader.ngk_valid(k="full_bz")
         sym = loader._ensure_sym()
         unfolded_kpts = np.asarray(sym.unfolded_kpts, dtype=np.float64)
-        bvec = np.asarray(loader.bvec, dtype=np.float64)
+        bvec_cart_bohr = (
+            float(loader.blat) * np.asarray(loader.bvec, dtype=np.float64))
         n_k = psi_2.shape[0]
 
         for nk in range(n_k):
             n = int(ngk_v[nk])
             gvecs_k = gvecs_full[nk, :n].astype(np.float64)
             psi_L = psi_2[nk, :, :, :n]                          # (nb, 2, n)
-            import jax as _jax
-            psi_S_ref = np.asarray(get_small_psi_component(
-                _jax.numpy.asarray(gvecs_k),
-                _jax.numpy.asarray(unfolded_kpts[nk]),
-                _jax.numpy.asarray(bvec),
-                _jax.numpy.asarray(psi_L)))
+            p = (gvecs_k + unfolded_kpts[nk][None, :]) @ bvec_cart_bohr
+            px, py, pz = p.T
+            psi_S_ref = np.empty_like(psi_L)
+            psi_S_ref[:, 0, :] = HALFALPHA * (
+                pz[None, :] * psi_L[:, 0, :]
+                + (px - 1j * py)[None, :] * psi_L[:, 1, :])
+            psi_S_ref[:, 1, :] = HALFALPHA * (
+                (px + 1j * py)[None, :] * psi_L[:, 0, :]
+                - pz[None, :] * psi_L[:, 1, :])
             np.testing.assert_allclose(
                 psi_4[nk, :, 2:4, :n], psi_S_ref,
                 atol=1e-13, rtol=0,
                 err_msg=f"nk={nk}")
+            if np.linalg.norm(psi_S_ref) > 0.0:
+                wrong_without_blat = psi_S_ref / float(loader.blat)
+                assert not np.allclose(
+                    psi_4[nk, :, 2:4, :n], wrong_without_blat,
+                    atol=1e-13, rtol=1e-12), (
+                        f"nk={nk}: test failed to discriminate omitted blat")
             # Upper components preserved.
             np.testing.assert_array_equal(
                 psi_4[nk, :, 0:2, :], psi_2[nk, :, 0:2, :],
