@@ -14,6 +14,7 @@ This module centralizes:
 - head source resolution (`override`, `epshead`, `s_tensor`)
 - scalar GN-PPM head fitting
 - exact static COHSEX head terms
+- bounded small-field/body Schur folding on the 2-D mesh
 - rank-1 (μ,ν)-basis head injection at q=0
 """
 
@@ -609,68 +610,85 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
 
 
 @functools.partial(jax.jit, static_argnames=("mesh_xy",))
-def fold_cartesian_head_wings_sharded(
-    S_direct: jax.Array,
+def fold_small_head_wings_sharded(
+    R_direct: jax.Array,
     Y_x: jax.Array,
     W_body_xy: jax.Array,
     Z_y: jax.Array,
-    cell_volume: float,
+    Vcell: float,
     *,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    r"""Fold dynamic body screening into the Cartesian q² head tensor.
+    r"""Fold a bounded small-field response through the screened body.
 
-    This is the Cartesian-leading-axis generalization of the production-tested
-    sharded ``Y W Z`` reduction in ``gw.experimental.head_wing_schur``.  The
-    two are NOT interchangeable and the relationship is adjudicated at the
-    top of that module: this one returns a Cartesian ``(..., 3, 3)`` with a
-    ``1/V_cell``, that one returns a per-q scalar plus the two
-    half-contracted wings the rank-1 W rebuild needs.  What is shared is the
-    triple contraction below, and only its LOWERING differs.
+    This is the single production owner of the small head/body Schur fold.
+    It accepts independently sized left and right field bases; both field
+    extents are replicated and therefore must remain bounded.  The body is
+    never gathered: every rank contracts its local ``(I_x, J_y)`` tile and
+    only the small output is reduced across the two-dimensional mesh.
 
     .. math::
 
-        S_{ab}^{\mathrm{eff}}(z) = S_{ab}^{0}(z)
+        R_{AB}^{\mathrm{eff}}(z) = R_{AB}^{0}(z)
           + \frac{1}{V_{\mathrm{cell}}}
-            \sum_{\mu\nu}Y_{a\mu}(z)W_{\mu\nu}(z)Z_{\nu b}(z).
+            \sum_{IJ}Y_{AI}(z)W_{IJ}(z)Z_{JB}(z).
 
-    Any replicated batch/frequency axes may precede the displayed axes.  The
-    centroid axes remain tiled exactly like the screening body: ``Y`` on
-    ``x``, ``W`` on ``(x,y)``, and ``Z`` on ``y``.  Therefore the only
-    communication is the reduction of the tiny Cartesian output.  The caller
-    must supply those shardings; this kernel deliberately does not defensively
-    reshard the large inputs.
+    Any replicated batch/frequency axes may precede the displayed axes and
+    must match exactly (no broadcasting).  Body axes remain tiled exactly
+    like screening: ``Y`` on ``x``, ``W`` on ``(x,y)``, and ``Z`` on ``y``.
+    The caller supplies those shardings; this kernel deliberately does not
+    defensively reshard large inputs.
 
     Parameters
     ----------
-    S_direct
-        Direct dipole tensor, ``(..., 3, 3)``, replicated.
+    R_direct
+        Direct response, ``(..., F_left, F_right)``, replicated.  Its units
+        are set by the caller's field basis.
     Y_x
-        Left wing, ``(..., 3, n_mu)``, centroid axis sharded on ``x``.
+        Left wing, ``(..., F_left, n_I)``, body axis sharded on ``x``.
     W_body_xy
-        Already screened body, ``(..., n_mu, n_mu)``, sharded on ``(x,y)``.
+        Screened body, ``(..., n_I, n_J)``, sharded on ``(x,y)``.
     Z_y
-        Right wing, ``(..., n_mu, 3)``, centroid axis sharded on ``y``.
-    cell_volume
-        Primitive-cell volume in bohr³.  It appears exactly once.
+        Right wing, ``(..., n_J, F_right)``, body axis sharded on ``y``.
+        Wing/body units must make ``Y W Z / Vcell`` match ``R_direct``.
+    Vcell
+        Primitive-cell volume in bohr³; it appears exactly once.
     mesh_xy
         Production two-dimensional device mesh.
 
     Returns
     -------
     jax.Array
-        Effective tensor ``(..., 3, 3)``, replicated on ``mesh_xy``.
+        ``R_eff`` with shape ``(..., F_left, F_right)``, the same units as
+        ``R_direct``, replicated on ``mesh_xy``.
     """
     n_lead = W_body_xy.ndim - 2
-    if n_lead < 0 or Y_x.ndim != n_lead + 2 or Z_y.ndim != n_lead + 2:
-        raise ValueError("Y, W_body, and Z must share their leading axes")
+    arrays = (R_direct, Y_x, W_body_xy, Z_y)
+    if n_lead < 0 or any(a.ndim != n_lead + 2 for a in arrays):
+        raise ValueError(
+            "R_direct, Y, W_body, and Z must have two non-leading axes")
+    leading = tuple(W_body_xy.shape[:-2])
+    if any(tuple(a.shape[:-2]) != leading for a in arrays):
+        raise ValueError(
+            "R_direct, Y, W_body, and Z must share their leading axes")
+    if (
+        int(R_direct.shape[-2]) != int(Y_x.shape[-2])
+        or int(Y_x.shape[-1]) != int(W_body_xy.shape[-2])
+        or int(W_body_xy.shape[-1]) != int(Z_y.shape[-2])
+        or int(Z_y.shape[-1]) != int(R_direct.shape[-1])
+    ):
+        raise ValueError(
+            "small-field/body extents do not compose: "
+            f"R={R_direct.shape}, Y={Y_x.shape}, "
+            f"W={W_body_xy.shape}, Z={Z_y.shape}")
     lead = [None] * n_lead
 
     def _local_fold(s_direct, y_local, w_local, z_local, volume):
         # Each rank owns exactly one (mu_X, nu_Y) body tile.  Contract that
-        # tile before communicating, then reduce only the Cartesian result.
+        # tile before communicating, then reduce only the small-field result.
         # Leaving this as a global einsum lets XLA select a full-matrix
-        # temporary at large n_mu even though the public result is 3x3.
+        # temporary at large body extent even though the public field axes
+        # are bounded.
         local = jnp.einsum(
             "...am,...mn,...nb->...ab",
             y_local, w_local, z_local, optimize=True)
@@ -689,13 +707,32 @@ def fold_cartesian_head_wings_sharded(
         ),
         out_specs=P(*lead, None, None),
     )(
-        S_direct,
+        R_direct,
         Y_x,
         W_body_xy,
         Z_y,
-        jnp.asarray(cell_volume),
+        jnp.asarray(Vcell),
     )
     return folded
+
+
+def fold_cartesian_head_wings_sharded(
+    S_direct: jax.Array,
+    Y_x: jax.Array,
+    W_body_xy: jax.Array,
+    Z_y: jax.Array,
+    cell_volume: float,
+    *,
+    mesh_xy: Mesh,
+) -> jax.Array:
+    """Charge-head adapter to :func:`fold_small_head_wings_sharded`.
+
+    ``S_direct`` and the result have shape ``(..., 3, 3)`` and units
+    ``1/(Ry·bohr²)``; the centroid/body axes retain their existing
+    ``x``/``(x,y)``/``y`` shardings.
+    """
+    return fold_small_head_wings_sharded(
+        S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
 
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
