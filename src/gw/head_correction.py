@@ -735,6 +735,75 @@ def fold_cartesian_head_wings_sharded(
         S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
 
 
+@functools.partial(jax.jit, static_argnames=("mesh_xy",))
+def _small_head_wing_halves_sharded(Y_x, W_body_xy, Z_y, *, mesh_xy):
+    """Compiled body of :func:`small_head_wing_halves_sharded`."""
+    def _local(y_local, w_local, z_local):
+        yw = jax.lax.psum(
+            jnp.einsum("aAi,ij->aAj", y_local, w_local, optimize=True),
+            "x")
+        wz = jax.lax.psum(
+            jnp.einsum("ij,bjB->biB", w_local, z_local, optimize=True),
+            "y")
+        return yw, wz
+
+    return shard_map(
+        _local,
+        mesh=mesh_xy,
+        in_specs=(P(None, None, "x"), P("x", "y"),
+                  P(None, "y", None)),
+        out_specs=(P(None, None, "y"), P(None, "x", None)),
+        check_vma=False,
+    )(Y_x, W_body_xy, Z_y)
+
+
+def small_head_wing_halves_sharded(
+    Y_x: jax.Array,
+    W_body_xy: jax.Array,
+    Z_y: jax.Array,
+    *,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array]:
+    r"""Contract each small photon wing through one resident body ``W``.
+
+    For the two in-plane directions and four Lorentz fields this returns
+
+    ``YW[a,A,J] = sum_I Y[a,A,I] W[I,J]`` and
+    ``WZ[b,I,B] = sum_J W[I,J] Z[b,J,B]``.
+
+    Only the contracted centroid axis is reduced.  The outputs remain
+    respectively y- and x-sharded one-index objects; the body is neither
+    gathered nor transposed.  No conjugation, cell-volume factor, or head
+    model is implicit.
+    """
+    if Y_x.ndim != 3 or W_body_xy.ndim != 2 or Z_y.ndim != 3:
+        raise ValueError(
+            "small photon-head halves require Y=(2,4,N), W=(N,N), "
+            f"Z=(2,N,4); got {Y_x.shape}, {W_body_xy.shape}, {Z_y.shape}")
+    n_body = int(W_body_xy.shape[0])
+    expected = ((2, 4, n_body), (n_body, n_body), (2, n_body, 4))
+    if (tuple(Y_x.shape), tuple(W_body_xy.shape), tuple(Z_y.shape)) != expected:
+        raise ValueError(
+            "small photon-head half-contraction extents do not compose: "
+            f"Y={Y_x.shape}, W={W_body_xy.shape}, Z={Z_y.shape}")
+
+    required = (
+        (Y_x, "Y_x", P(None, None, "x")),
+        (W_body_xy, "W_body_xy", P("x", "y")),
+        (Z_y, "Z_y", P(None, "y", None)),
+    )
+    for array, name, spec in required:
+        wanted = NamedSharding(mesh_xy, spec)
+        sharding = getattr(array, "sharding", None)
+        if (sharding is None
+                or not sharding.is_equivalent_to(wanted, array.ndim)):
+            raise ValueError(
+                f"{name} must already have sharding {spec}; got {sharding}. "
+                "Refusing an implicit photon-body reshard.")
+    return _small_head_wing_halves_sharded(
+        Y_x, W_body_xy, Z_y, mesh_xy=mesh_xy)
+
+
 @jax.jit
 def _static_slab_photon_head_moment_chunk(
     q_cart: jax.Array,
