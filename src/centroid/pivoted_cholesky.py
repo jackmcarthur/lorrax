@@ -40,6 +40,7 @@ been folded" convention.
 
 from __future__ import annotations
 
+import math
 import os
 
 import numpy as np
@@ -77,6 +78,126 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 import symmetry_maps                                            # noqa: E402
+
+
+_GRAM_MIN_COL_BLOCK = 256
+_GRAM_COMPLEX_BYTES = 16
+_GRAM_TRANSIENT_BUDGET_FRACTION = 0.25
+
+
+def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
+    """Transient bytes priced for one open-spin Gram column block.
+
+    Both left and right pair-density intermediates are complex128 and have
+    ``nk * nspinor**2 * block_width**2`` elements.  Keep this formula here as
+    the single source used by the auto planner, its refusal, and unit gates.
+    """
+    nk_i = int(nk)
+    ns_i = int(nspinor)
+    block_i = int(block_width)
+    if nk_i < 1 or ns_i < 1 or block_i < 1:
+        raise ValueError(
+            "Gram block dimensions must be positive: "
+            f"nk={nk_i}, nspinor={ns_i}, block_width={block_i}"
+        )
+    return (2 * nk_i * ns_i * ns_i * block_i * block_i
+            * _GRAM_COMPLEX_BYTES)
+
+
+def auto_gram_col_block_width(
+    nk: int,
+    nspinor: int,
+    budget_bytes: int,
+    *,
+    divisor: int = 1,
+    min_width: int = _GRAM_MIN_COL_BLOCK,
+) -> int:
+    """Largest mesh-aligned Gram block whose priced transient fits.
+
+    Auto widths align *down* so rounding for a mesh can never invalidate the
+    memory bound.  Refuse before the pair-density allocation when even the
+    supported minimum block cannot fit.
+    """
+    budget_i = int(budget_bytes)
+    divisor_i = max(1, int(divisor))
+    min_aligned = ((max(1, int(min_width)) + divisor_i - 1)
+                   // divisor_i) * divisor_i
+    if budget_i < 1:
+        raise MemoryError(
+            f"Gram column-block planner has no positive budget: {budget_i} B"
+        )
+    coefficient = gram_col_block_bytes(nk, nspinor, 1)
+    max_unaligned = math.isqrt(budget_i // coefficient)
+    width = (max_unaligned // divisor_i) * divisor_i
+    if width < min_aligned:
+        required = gram_col_block_bytes(nk, nspinor, min_aligned)
+        raise MemoryError(
+            "Gram column-block planner refuses before pair-density "
+            f"allocation: nk={int(nk)}, nspinor={int(nspinor)}, minimum "
+            f"mesh-aligned block={min_aligned} prices {required / 2**30:.2f} "
+            f"GiB but the Gram transient budget is {budget_i / 2**30:.2f} "
+            "GiB. Lower the candidate count/band window or raise the "
+            "device-memory budget."
+        )
+    return width
+
+
+def gram_col_block_device_bytes(
+    nk: int,
+    nspinor: int,
+    n_rows: int,
+    block_width: int,
+    *,
+    x_shards: int = 1,
+    y_shards: int = 1,
+) -> int:
+    """Exact local bytes of the two sharded ``M x block`` pair tensors.
+
+    The registered square-law planner controls the large-nk auto width.  A
+    distinct physical bound is still needed when ``M / x_shards`` exceeds
+    that width, notably on a 1x1 mesh: the actual pair tensors have a full
+    candidate-row axis and only their output-column axis is blocked.
+    """
+    x_i = max(1, int(x_shards))
+    y_i = max(1, int(y_shards))
+    rows_local = (int(n_rows) + x_i - 1) // x_i
+    cols_local = (int(block_width) + y_i - 1) // y_i
+    return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
+
+
+def _cap_gram_width_to_device_footprint(
+    width: int,
+    *,
+    nk: int,
+    nspinor: int,
+    n_rows: int,
+    budget_bytes: int,
+    x_shards: int,
+    y_shards: int,
+) -> int:
+    """Cap a square-law width to the exact local pair-tensor footprint."""
+    x_i = max(1, int(x_shards))
+    y_i = max(1, int(y_shards))
+    min_aligned = ((_GRAM_MIN_COL_BLOCK + y_i - 1) // y_i) * y_i
+    rows_local = (int(n_rows) + x_i - 1) // x_i
+    bytes_per_local_col = gram_col_block_bytes(nk, nspinor, 1) * rows_local
+    max_local_cols = int(budget_bytes) // bytes_per_local_col
+    device_width = max_local_cols * y_i
+    capped = min(int(width), device_width)
+    capped = (capped // y_i) * y_i
+    if capped < min_aligned:
+        required = gram_col_block_device_bytes(
+            nk, nspinor, n_rows, min_aligned,
+            x_shards=x_shards, y_shards=y_shards,
+        )
+        raise MemoryError(
+            "Gram column-block planner refuses before pair-density "
+            f"allocation: the minimum mesh-aligned block={min_aligned} "
+            f"needs {required / 2**30:.2f} GiB/device for the two local "
+            f"M x block pair tensors but the Gram transient budget is "
+            f"{int(budget_bytes) / 2**30:.2f} GiB/device."
+        )
+    return capped
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1566,51 +1687,79 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
 
-    # ---- Single-device column-blocked path (size-ladder wall fix) ----
+    # ---- Column-blocked path (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
     # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
     # Per-element contraction order is unchanged by blocking the OUTPUT
     # columns, so G is numerically the same map; only materialization moves.
-    # Multi-device meshes keep the original path untouched (the 'y'-sharded
-    # column axis must not be sliced locally).
+    # On a multi-device mesh each sliced block is explicitly restored to its
+    # declared y sharding below before pair_density consumes it.
     n_dev_total = mesh_xy.devices.size
+    n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
+    n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
     col_block = 0
-    if n_dev_total == 1:
-        # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
-        # means "no override", i.e. the auto budget below.  This USED to be a bare
-        # presence test — ``=0`` and ``=off`` are the two spellings a user
-        # reaches for to DISABLE a knob, and they did the opposite or
-        # crashed: "0" is a non-empty string, so it took the override
-        # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
-        # block (maximum blocking), while "off" died in ``int()`` mid-run
-        # after the left window had already been loaded.  Same falsy
-        # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
-        env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-        if env_cb.lower() in ("", "0", "false", "no", "off"):
-            env_cb = ""
-        if env_cb:
-            try:
-                col_block = max(256, int(env_cb))
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                    f"integer column width nor a falsy token "
-                    f"('', 0, false, no, off)."
-                ) from None
+    # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
+    # means "no override", i.e. the auto budget below.  This USED to be a
+    # bare presence test — ``=0`` and ``=off`` are the two spellings a user
+    # reaches for to DISABLE a knob, and they did the opposite or crashed.
+    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+    if env_cb.lower() in ("", "0", "false", "no", "off"):
+        env_cb = ""
+    nk_, _, ns_, M_cols = (int(x) for x in psi_l_rmu_Y.shape)
+    budget_bytes = int(
+        float(meta.memory_per_device_gb) * 1e9
+        * _GRAM_TRANSIENT_BUDGET_FRACTION
+    )
+    block_source = "auto"
+    if env_cb:
+        block_source = "LORRAX_GRAM_COL_BLOCK override"
+        try:
+            requested_block = int(env_cb)
+            if requested_block <= 0:
+                raise ValueError
+            col_block = max(_GRAM_MIN_COL_BLOCK, requested_block)
+        except ValueError:
+            raise ValueError(
+                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
+                f"integer column width nor a falsy token "
+                f"('', 0, false, no, off)."
+            ) from None
+        # A manual width keeps its historical floor and is rounded UP to a
+        # whole y-shard.  It is an explicit override, so it may exceed auto's
+        # budget and the diagnostic below makes that visible.
+        col_block = ((col_block + n_y - 1) // n_y) * n_y
+    else:
+        if gram_col_block_bytes(nk_, ns_, M_cols) <= budget_bytes:
+            col_block = M_cols
         else:
-            nk_, _, ns_, M_ = psi_l_rmu_Y.shape
-            bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
-            budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
-            col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
-        if col_block >= psi_l_rmu_Y.shape[3]:
-            col_block = 0  # one full block == the original computation
+            col_block = auto_gram_col_block_width(
+                nk_, ns_, budget_bytes, divisor=n_y,
+            )
+            col_block = _cap_gram_width_to_device_footprint(
+                col_block,
+                nk=nk_, nspinor=ns_, n_rows=M_cols,
+                budget_bytes=budget_bytes,
+                x_shards=n_x, y_shards=n_y,
+            )
+    if col_block >= M_cols:
+        col_block = 0  # one full block == the original computation
 
     if col_block:
-        M_cols = psi_l_rmu_Y.shape[3]
         if verbose:
+            square_gib = (
+                gram_col_block_bytes(nk_, ns_, col_block) / 2**30
+            )
+            local_gib = gram_col_block_device_bytes(
+                nk_, ns_, M_cols, col_block,
+                x_shards=n_x, y_shards=n_y,
+            ) / 2**30
             print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
                   f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; single-device path)")
+                  f"({-(-M_cols // col_block)} blocks; {n_dev_total}-device "
+                  f"path; {block_source}; priced transient="
+                  f"{square_gib:.2f} GiB square-law, {local_gib:.2f} "
+                  f"GiB/device local; auto budget="
+                  f"{budget_bytes / 2**30:.2f} GiB/device)")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
@@ -1620,19 +1769,29 @@ def build_gram_q0_via_loadwfns(
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
             psi_r_rmu_Y.block_until_ready()
+        col_y = NamedSharding(
+            mesh_xy, PartitionSpec(None, None, None, 'y'),
+        )
         with timing.section("q0_sum"):
             g_blocks = []
             for c0 in range(0, M_cols, col_block):
                 c1 = min(c0 + col_block, M_cols)
-                P_l_b = pair_density(
-                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
-                P_r_b = pair_density(
-                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
+                # Slicing a y-sharded axis can yield replicated sharding,
+                # which pair_density's explicit input contract refuses.  The
+                # auto block and the padded final extent are y-divisible, so
+                # this placement is a local sharding restoration.
+                block_l = psi_l_rmu_Y[..., c0:c1]
+                block_r = psi_r_rmu_Y[..., c0:c1]
+                if n_dev_total > 1:
+                    block_l = device_put_process_local(block_l, col_y)
+                    block_r = device_put_process_local(block_r, col_y)
+                P_l_b = pair_density(psi_l_rmuT_X, block_l, mesh_xy)
+                P_r_b = pair_density(psi_r_rmuT_X, block_r, mesh_xy)
                 G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
                                         symmetrize=False)
                 G_b.block_until_ready()
                 g_blocks.append(G_b)
-                del P_l_b, P_r_b
+                del P_l_b, P_r_b, block_l, block_r
             G = jnp.concatenate(g_blocks, axis=1)
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
