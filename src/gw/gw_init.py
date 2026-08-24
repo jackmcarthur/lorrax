@@ -39,6 +39,7 @@ from .gw_config import (
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
+	uses_coupled_photon_head,
 )
 
 # ── The ζ file's DOOR ────────────────────────────────────────────────────
@@ -1435,8 +1436,20 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# were converted together — a knob with two grammars is worse than one
 	# with a single wrong grammar, because then the failure depends on
 	# which code path reads it first.
-	_write_ibz_only_charge = not env_bool(
+	# A coupled four-current head needs canonical one-leg G=0 vectors for
+	# C,T1,T2,T3.  The symmetry service does not yet own the transverse
+	# one-leg IBZ rotation, so resolve the full-BZ producer from the physical
+	# mode before either charge or transverse fitting starts.  This does not
+	# disable symmetry reduction in the later screening calculation.
+	_coupled_photon_head = uses_coupled_photon_head(cfg)
+	_force_full_bz_fit = env_bool(
 		'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
+	_write_ibz_only_charge = not (
+		_coupled_photon_head or _force_full_bz_fit)
+	if _coupled_photon_head:
+		print_fn(
+			"    coupled photon head: fitting charge/transverse zeta on "
+			"the full BZ for canonical C,T1,T2,T3 G=0 vectors")
 	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
 	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
 	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
@@ -2184,8 +2197,21 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# ANNOUNCES it once per centroid set — the charge and the
 		# transverse set are separate facts and get separate lines.
 		# It used to fall back SILENTLY; see gw/qgrid_symmetry.py.
-		_use_ibz_bispinor = not env_bool(
+		# The coupled photon q->0 reconstruction consumes the canonical G=0
+		# vector from all four Lorentz channels.  The IBZ V producer deliberately
+		# persists only the charge-channel G=0 vector, so this one producer must
+		# run on the full BZ when the coupled head is requested.  This is not the
+		# broad LORRAX_FORCE_FULL_BZ debug dial: screening and every other symmetry
+		# reduction keep their configured production route.
+		_coupled_photon_head = uses_coupled_photon_head(cfg)
+		_force_full_bz_v = env_bool(
 			'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
+		_use_ibz_bispinor = not (
+			_coupled_photon_head or _force_full_bz_v)
+		if _coupled_photon_head:
+			print_fn(
+				"  [bispinor] head_correction=full: using the canonical "
+				"full-BZ V/g0 producer so C,T1,T2,T3 Gamma vectors are present")
 		if _use_ibz_bispinor:
 			_cents_curr_path = cfg.paths.centroids_file_current
 			_, _cent_T_idx_np, _ = _load_centroids(

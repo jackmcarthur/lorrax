@@ -347,7 +347,7 @@ def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
     return float(val.real)
 
 
-def fine_q_cart(bvec, fine_grid) -> np.ndarray:
+def fine_q_cart(bvec, fine_grid, *, return_unwrapped: bool = False):
     """Cartesian q at every point of ``fine_grid``, in FFT index order.
 
     The k axes of ``W_q`` are FFT axes, so index ``i`` on an axis of length
@@ -370,6 +370,12 @@ def fine_q_cart(bvec, fine_grid) -> np.ndarray:
     would evaluate the pole at the wrong radius.  ``wrap_points_to_voronoi``
     is the tree's one spelling of that reduction.
 
+    ``return_unwrapped=True`` returns ``(q_wrapped, q_raw)`` in the same
+    grid shape.  This is for consumers whose coefficient is attached to a
+    literal reciprocal-lattice leg and therefore must refuse a Voronoi wrap
+    they cannot transform; it keeps both geometries under this one FFT-q
+    convention owner.
+
     Returns
     -------
     numpy.ndarray, shape ``(nfx, nfy, nfz, 3)``, float64
@@ -383,7 +389,10 @@ def fine_q_cart(bvec, fine_grid) -> np.ndarray:
     q_raw = (frac @ b).reshape(-1, 3)
     q = np.asarray(wrap_points_to_voronoi(q_raw, b, nmax=_BZ_WRAP_NMAX),
                    dtype=np.float64)
-    return q.reshape(nfx, nfy, nfz, 3)
+    wrapped = q.reshape(nfx, nfy, nfz, 3)
+    if return_unwrapped:
+        return wrapped, q_raw.reshape(nfx, nfy, nfz, 3)
+    return wrapped
 
 
 def coarse_gamma_cell_weights(q_cart, coarse_grid, fine_grid, *,
