@@ -1,17 +1,27 @@
-"""GW-side stage helper for ``screening_diagrams = w_bse``.
+"""GW-side stage helper for ``screening_diagrams = w_bse`` / ``w_rpa_resolvent``.
 
 WHAT THIS MODULE IS.  The other half of the fork in
 :func:`gw.screening.compute_screening_model`.  ``w_rpa`` reaches today's
-path; ``w_bse`` reaches here, and here the W that Sigma consumes is the
-LADDER-corrected screened Coulomb::
+path; ``w_bse`` and ``w_rpa_resolvent`` both reach here, through the SAME
+entry point (:func:`compute_screening_ladder`) with ``include_w`` set to
+whether the operator carries the ladder's direct rung.  Under ``w_bse``
+the W that Sigma consumes is the LADDER-corrected screened Coulomb::
 
     W(z) - v = v (z - H)^-1 v ,    H carrying the statically screened
                                    direct rung -W(0) in its kernel
 
-evaluated at exactly the frequencies the active Sigma ansatz already asks
-for -- the SAME :func:`gw.screening.screening_requests_for` plan the RPA
-path uses.  Nothing about the role set, the Sigma dispatch or any Sigma
-kernel changes; only which W satisfies the request does.
+Under ``w_rpa_resolvent`` it is the SAME resolvent identity with the rung
+parameterized OUT of the ring matvec (``include_w=False`` — see
+``bse.bse_ring_comm.build_bse_ring_matvec_full``), i.e. ``H = H_RPA``: a
+second route to ``w_rpa``'s own W, useful precisely because it shares
+every other moving part with the ladder (restart handoff, TRS/finite-q
+machinery it does not need but is built alongside, head resolvent) and so
+gates that shared machinery on an operator simple enough to have an
+independent reference.  Both are evaluated at exactly the frequencies the
+active Sigma ansatz already asks for -- the SAME
+:func:`gw.screening.screening_requests_for` plan the RPA path uses.
+Nothing about the role set, the Sigma dispatch or any Sigma kernel
+changes; only which W satisfies the request does.
 
 THE STAGE IS TWO-STAGE BY CONSTRUCTION, NOT BY ACCIDENT.  The ladder
 kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
@@ -58,7 +68,13 @@ metal (``mpa_material_class = metal``) is refused at parse time
 on a deck that declares nothing is refused HERE, on the mean field's own
 occupations, before any compute (:func:`refuse_fractional_occupations`,
 same rule id).  Neither is redundant: no deck key describes the WFN's
-occupations, and no WFN read happens at parse time.
+occupations, and no WFN read happens at parse time.  ``w_rpa_resolvent``
+carries the SAME two gates under its own rule id
+(``w_rpa_resolvent_insulators_only``) — the pair basis is the identical
+band-index cut at ``nelec`` whether or not the rung is in the operator, so
+the argument survives even though the ladder's own TRS-gauge fix is not
+applied on this arm (see ``gw_config._W_RPA_RESOLVENT_REFUSALS``' own
+comment on that row).
 
 WHY THE ``import bse`` CALLS ARE INSIDE THE FUNCTIONS.  Not a level
 violation -- ``gw`` and ``bse`` are both L1 and an L1->L1 call is legal
@@ -95,6 +111,20 @@ import common.timing as timing
 
 from .screening import (
     ScreeningRequest, _gate_w, compute_static_w, screening_requests_for)
+
+
+def _resolvent_diagram_name(include_w: bool) -> str:
+    """The ``screening_diagrams`` value driving one ladder-facade call.
+
+    ``include_w`` fully determines it: :func:`compute_screening_model`
+    routes ONLY ``w_bse`` (``include_w=True``) and ``w_rpa_resolvent``
+    (``include_w=False``) through this facade.  One function so every
+    message-building site below agrees on the label, instead of a ternary
+    repeated at each site -- the arbitrary-choice-under-degeneracy shape
+    TASTE.md warns produces exactly this class of drift once two sites
+    make the same decision independently.
+    """
+    return "w_bse" if include_w else "w_rpa_resolvent"
 
 
 # Block-GMRES convergence for the ladder resolvent.  NOT deck keys in v1,
@@ -211,8 +241,16 @@ _OCC_INTEGER_TOL = 1e-6
 
 
 def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
-                                  print_fn=print):
-    """Refuse ``w_bse`` on a mean field with PARTIAL occupations.
+                                  print_fn=print, diagram_name="w_bse"):
+    """Refuse the ladder resolvent on a mean field with PARTIAL occupations.
+
+    ``diagram_name`` names which ``screening_diagrams`` value reached this
+    check -- ``"w_bse"`` (the default, preserving every existing caller's
+    message byte-for-byte) or ``"w_rpa_resolvent"``.  The rule id is
+    ``f"{diagram_name}_insulators_only"`` in both cases: the pair-basis /
+    integer-occupation argument below is identical for the rung-carrying
+    and rung-free operator (see ``gw_config._W_RPA_RESOLVENT_REFUSALS``'
+    own comment on its twin row for what does and does not transfer).
 
     THE PARSE-TIME TWIN AND WHY BOTH EXIST.  ``mpa_material_class = metal``
     is refused in ``gw_config._W_BSE_REFUSALS`` under this same rule id,
@@ -260,8 +298,9 @@ def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
     if worst > _OCC_INTEGER_TOL:
         s, k, n = (int(i) for i in
                    np.unravel_index(int(distance.argmax()), distance.shape))
+        rule_id = f"{diagram_name}_insulators_only"
         raise NotImplementedError(
-            f"GATE w_bse_insulators_only: screening_diagrams = w_bse is "
+            f"GATE {rule_id}: screening_diagrams = {diagram_name} is "
             f"refused on a mean field with partial occupations.\n"
             f"  got:  occupation {float(window[s, k, n])!r} at "
             f"(spin {s}, k-point {k}, band {n + lo}) of {source} -- "
@@ -270,33 +309,33 @@ def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
             f"  want: integer occupations across the active band window "
             f"[{lo}, {hi}) -- an insulating (gapped) mean field\n"
             f"  fix:  run this system with screening_diagrams = w_rpa, or "
-            f"point w_bse at a gapped mean field\n"
-            f"  why:  the ladder operator, its TRS-gauge machinery and "
-            f"every certification this feature has are insulator-derived: "
-            f"integer occupations and a gapped D throughout.  Partial "
-            f"occupations enter both the pair basis (partially blocked "
-            f"transitions the band-index cut does not model) and the "
-            f"resolvent poles (transitions at ~0 energy), and neither is "
-            f"verified here -- the run would produce a complete, plausible "
-            f"W under a diagram set that was never checked for it.  The "
-            f"metallic MPA screening/Sigma pipeline remains available under "
-            f"screening_diagrams = w_rpa; it does not confer fractional-"
-            f"occupation semantics on this distinct ladder operator.  The "
-            f"deck-key twin of this refusal (mpa_material_class = metal) "
-            f"fires at PARSE time in "
+            f"point {diagram_name} at a gapped mean field\n"
+            f"  why:  the resolvent operator and every certification this "
+            f"feature has are insulator-derived: integer occupations and a "
+            f"gapped D throughout.  Partial occupations enter both the "
+            f"pair basis (partially blocked transitions the band-index cut "
+            f"does not model) and the resolvent poles (transitions at ~0 "
+            f"energy), and neither is verified here -- the run would "
+            f"produce a complete, plausible W under a diagram set that was "
+            f"never checked for it.  The metallic MPA screening/Sigma "
+            f"pipeline remains available under screening_diagrams = w_rpa; "
+            f"it does not confer fractional-occupation semantics on this "
+            f"distinct resolvent operator.  The deck-key twin of this "
+            f"refusal (mpa_material_class = metal) fires at PARSE time in "
             f"gw_config.refuse_unsupported_screening_diagrams; this one "
             f"catches the metallic WFN that no deck key declared.\n"
             f"  doc:  docs/input_reference.md '## Screening', "
             f"screening_diagrams.")
     print_fn(
-        f"  w_bse: occupations are integer across bands [{lo}, {hi}) of "
-        f"{os.path.basename(str(source))} (worst deviation {worst:.2e} <= "
-        f"{_OCC_INTEGER_TOL:g}) -- insulating mean field, the only kind "
-        f"the ladder is certified for.")
+        f"  {diagram_name}: occupations are integer across bands "
+        f"[{lo}, {hi}) of {os.path.basename(str(source))} (worst deviation "
+        f"{worst:.2e} <= {_OCC_INTEGER_TOL:g}) -- insulating mean field, "
+        f"the only kind the resolvent is certified for.")
     return worst
 
 
-def _refuse_metallic_mean_field(config, meta, *, print_fn=print):
+def _refuse_metallic_mean_field(config, meta, *, include_w=True,
+                                print_fn=print):
     """Read the run's own WFN occupations and hand them to the gate above.
 
     BEFORE ANY COMPUTE, beside the restart preconditions and for the same
@@ -308,26 +347,46 @@ def _refuse_metallic_mean_field(config, meta, *, print_fn=print):
     ``(nspin, nk, nb)`` doubles, not a coefficient -- through the same
     ``file_io.mf_header`` reader ``WfnLoader`` itself uses, so there is no
     second opinion about how a WFN's occupations are spelled.
+
+    ``include_w`` names which resolvent called (``True`` for ``w_bse``,
+    ``False`` for ``w_rpa_resolvent`` -- see :func:`_resolvent_diagram_name`);
+    both share this one call site inside :func:`prepare_ladder_restart`.
     """
     from file_io.mf_header import read_mf_header
 
+    diagram_name = _resolvent_diagram_name(include_w)
     path = str(getattr(getattr(config, "paths", None), "wfn_file", "") or "")
     if not path or not os.path.exists(path):
         raise ValueError(
-            f"GATE w_bse_insulators_only: screening_diagrams = w_bse checks "
+            f"GATE {diagram_name}_insulators_only: "
+            f"screening_diagrams = {diagram_name} checks "
             f"the mean field's occupations before it builds anything, and "
             f"the deck's wfn_file ({path!r}) is not readable from this "
-            f"stage.  The ladder is certified for insulators only, so the "
-            f"check is not optional; fix the path or run w_rpa.")
+            f"stage.  The resolvent is certified for insulators only, so "
+            f"the check is not optional; fix the path or run w_rpa.")
     band_lo, band_hi = int(meta.band_edges[0]), int(meta.band_edges[-1])
     return refuse_fractional_occupations(
         read_mf_header(path).occs, band_lo=band_lo, band_hi=band_hi,
-        source=path, print_fn=print_fn)
+        source=path, print_fn=print_fn, diagram_name=diagram_name)
 
 
 def _refuse_unusable_restart(config, meta, sym, centroid_indices,
-                             tensors_filename, *, print_fn=print):
+                             tensors_filename, *, include_w=True,
+                             print_fn=print):
     """Refuse, BEFORE any compute, a run whose restart the ladder cannot read.
+
+    ``include_w`` names which resolvent called (default ``True`` = ``w_bse``,
+    preserving every existing caller's rule ids and messages byte-for-byte;
+    ``False`` = ``w_rpa_resolvent``, see :func:`_resolvent_diagram_name`).
+    All three preconditions below are checks on the SHARED restart handoff
+    (``prepare_ladder_restart`` runs identically for both arms), so they
+    transfer -- audited, not copied: ``w_rpa_resolvent``'s matvec never
+    reads the persisted ``W0_qmunu`` VALUE back (``ensure_W_R(include_W=
+    False)`` is a placeholder), but the loader still needs the file to
+    carry written ``psi_full_y`` / ``enk_full`` / ``V_qmunu`` datasets,
+    which only a ``write_restart_tensors = true`` run produces -- so the
+    conclusion (refuse without the writes) holds for a different reason
+    than the ladder's own "would read stale/absent W" one.
 
     Three things have to be true for step 3 to work, and every one of them
     is knowable at the top of the stage.  Discovering them after the chi0
@@ -356,47 +415,58 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
     from .gw_output import restart_tensor_writes_enabled
     from .restart_q_storage import resolve_restart_q_storage_for_run
 
+    diagram_name = _resolvent_diagram_name(include_w)
     if not config.do_screened:
         raise ValueError(
-            "GATE w_bse_requires_screening: screening_diagrams = w_bse "
-            "reached the screening stage with do_screened = false.  There "
-            "is no W to correct.  (The parse-time refusal covers "
-            "compute_mode = x_only; this is the legacy-flag twin.)")
+            f"GATE {diagram_name}_requires_screening: screening_diagrams = "
+            f"{diagram_name} reached the screening stage with do_screened "
+            f"= false.  There is no W to correct.  (The parse-time refusal "
+            f"covers compute_mode = x_only; this is the legacy-flag twin.)")
     if not tensors_filename:
         raise ValueError(
-            "GATE w_bse_needs_the_restart_path: screening_diagrams = w_bse "
-            "persists the RPA W(0) into the ISDF restart file and then "
-            "hands that path to the BSE ladder facade, so it cannot run "
-            "without one.  The caller passed tensors_filename = None -- "
-            "the self-consistency map does this today, which is why "
-            "qp_solver = self_consistent is refused at parse time "
-            "(gw_config, w_bse_self_consistency_unimplemented).")
+            f"GATE {diagram_name}_needs_the_restart_path: "
+            f"screening_diagrams = {diagram_name} "
+            f"persists the RPA W(0) into the ISDF restart file and then "
+            f"hands that path to the BSE ladder facade, so it cannot run "
+            f"without one.  The caller passed tensors_filename = None -- "
+            f"the self-consistency map does this today, which is why "
+            f"qp_solver = self_consistent is refused at parse time "
+            f"(gw_config, {diagram_name}_self_consistency_unimplemented).")
     if not restart_tensor_writes_enabled(config, tensors_filename):
         raise ValueError(
-            f"GATE w_bse_needs_restart_writes: screening_diagrams = w_bse "
-            f"requires write_restart_tensors = true.\n"
+            f"GATE {diagram_name}_needs_restart_writes: screening_diagrams "
+            f"= {diagram_name} requires write_restart_tensors = true.\n"
             f"  got:  write_restart_tensors = false\n"
             f"  want: write_restart_tensors = true\n"
             f"  fix:  set write_restart_tensors = true, or keep "
             f"screening_diagrams = w_rpa\n"
-            f"  why:  the ladder kernel's W_R is read back out of "
-            f"{os.path.basename(tensors_filename)}.  With the writes off "
-            f"the persist is a no-op and the loader would fall back to "
-            f"BARE V with a warning banner -- an all-zero screening that "
-            f"produces plausible numbers (tests/test_bse_w0_ready_gate.py).")
+            f"  why:  the facade reads psi/eps/V"
+            f"{' and the ladder kernel W_R' if include_w else ''} back out "
+            f"of {os.path.basename(tensors_filename)}.  With the writes "
+            f"off the persist is a no-op and the loader would fall back to "
+            f"BARE V with a warning banner"
+            + (" -- an all-zero screening that produces plausible numbers "
+               "(tests/test_bse_w0_ready_gate.py)."
+               if include_w else
+               " (unused by this rung-free operator, but the SAME loader "
+               "call also needs the file to carry written psi_full_y / "
+               "enk_full / V_qmunu, which write_restart_tensors = false "
+               "never produced -- tests/test_bse_w0_ready_gate.py)."))
     if not os.path.exists(tensors_filename):
         raise ValueError(
-            f"GATE w_bse_needs_restart_writes: {tensors_filename} does not "
-            f"exist, so the W0 persist would be skipped and the ladder "
-            f"would read nothing.  A restart = true run reuses tensors it "
-            f"did not write; point the deck at the directory that has them.")
+            f"GATE {diagram_name}_needs_restart_writes: {tensors_filename} "
+            f"does not exist, so the W0 persist would be skipped and the "
+            f"ladder would read nothing.  A restart = true run reuses "
+            f"tensors it did not write; point the deck at the directory "
+            f"that has them.")
     decision = resolve_restart_q_storage_for_run(
         config, sym=sym, centroid_indices=centroid_indices,
         fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
-        context="w_bse ladder restart handoff")
+        context=f"{diagram_name} ladder restart handoff")
     if decision.store_wedge:
         raise ValueError(
-            f"GATE w_bse_needs_full_bz_restart: screening_diagrams = w_bse "
+            f"GATE {diagram_name}_needs_full_bz_restart: "
+            f"screening_diagrams = {diagram_name} "
             f"requires restart_q_storage = full.\n"
             f"  got:  restart_q_storage resolved to "
             f"{decision.mode!r} (the IBZ q wedge)\n"
@@ -412,7 +482,8 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
     return decision
 
 
-def _assert_restart_is_loadable(tensors_filename, *, print_fn=print):
+def _assert_restart_is_loadable(tensors_filename, *, include_w=True,
+                                print_fn=print):
     """PRESENCE IS NOT PERSISTENCE -- check the flags, not the datasets.
 
     ``gw_init`` allocates a full-size ZERO ``W0_qmunu`` unconditionally, so
@@ -425,29 +496,36 @@ def _assert_restart_is_loadable(tensors_filename, *, print_fn=print):
     """
     import h5py
 
+    diagram_name = _resolvent_diagram_name(include_w)
     with h5py.File(tensors_filename, "r") as f:
         missing = [k for k in ("W0_qmunu", "V_qmunu", "psi_full_y",
                                "enk_full") if k not in f]
         if missing:
             raise RuntimeError(
-                f"w_bse: {tensors_filename} is missing "
+                f"{diagram_name}: {tensors_filename} is missing "
                 f"{', '.join(missing)} after the W0 persist.  The BSE "
                 f"loader needs all four (psi/eps from psi_full_y+enk_full, "
                 f"the screening from W0_qmunu, the exchange from V_qmunu "
                 f"under load_v_full=True).")
         if not bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
             raise RuntimeError(
-                f"w_bse: {tensors_filename} carries W0_qmunu but its "
-                f"W0_ready flag is False after the persist -- the dataset "
-                f"is the zero placeholder gw_init allocates, not a written "
-                f"W.  The loader would print the bare-V fallback banner and "
-                f"the ladder would be built on no screening at all.")
+                f"{diagram_name}: {tensors_filename} carries W0_qmunu but "
+                f"its W0_ready flag is False after the persist -- the "
+                f"dataset is the zero placeholder gw_init allocates, not a "
+                f"written W.  The loader would print the bare-V fallback "
+                f"banner"
+                + (" and the ladder would be built on no screening at all."
+                   if include_w else
+                   " -- harmless for this rung-free operator's OWN matvec, "
+                   "but the flag is still the only signal that the persist "
+                   "actually ran, so it is checked regardless."))
         if not bool(f["V_qmunu"].attrs.get("V_ready", True)):
             raise RuntimeError(
-                f"w_bse: {tensors_filename} says V_ready = False; the "
-                f"ladder needs the full exchange tensor (load_v_full=True).")
+                f"{diagram_name}: {tensors_filename} says V_ready = False; "
+                f"the resolvent needs the full exchange tensor "
+                f"(load_v_full=True).")
     print_fn(
-        f"  w_bse: restart handoff verified -- "
+        f"  {diagram_name}: restart handoff verified -- "
         f"{os.path.basename(tensors_filename)} carries W0_ready + V_ready "
         f"and the psi/eps datasets the ladder loader reads.")
 
@@ -456,25 +534,34 @@ def _assert_restart_is_loadable(tensors_filename, *, print_fn=print):
 # Stage 1+2: the RPA static leg and its persist
 # ---------------------------------------------------------------------------
 
-def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None):
-    """Run ``_gate_w`` as a non-negotiable ``w_bse`` stage refusal.
+def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None,
+                      include_w=True):
+    """Run ``_gate_w`` as a non-negotiable resolvent-stage refusal.
 
     ``common.sanity`` defaults to warn-and-continue because its generic gates
-    also cover legacy paths.  That policy is unsafe here: every ``w_bse`` W is
-    either the ladder kernel's input or the operator Sigma will consume, so a
-    failed invariant would bless known-bad physics with rc=0.  Pin strict only
-    for this stage, regardless of the process-wide ``LORRAX_SANITY`` default,
-    and restore the operator's setting before returning or refusing.
+    also cover legacy paths.  That policy is unsafe here: every resolvent W
+    (``w_bse`` or ``w_rpa_resolvent``) is either the ladder kernel's input or
+    the operator Sigma will consume, so a failed invariant would bless
+    known-bad physics with rc=0.  Pin strict only for this stage, regardless
+    of the process-wide ``LORRAX_SANITY`` default, and restore the
+    operator's setting before returning or refusing.
+
+    ``include_w`` defaults ``True`` so every EXISTING direct caller (this
+    module's own production call sites did not thread it before this axis
+    grew a second value, and the unit tests call this function directly)
+    keeps the exact ``w_bse_w_stage_invariants`` rule id and message.
     """
     from common import sanity
 
+    diagram_name = _resolvent_diagram_name(include_w)
+    rule_id = f"{diagram_name}_w_stage_invariants"
     previous = os.environ.get("LORRAX_SANITY")
     os.environ["LORRAX_SANITY"] = "strict"
     try:
         _gate_w(W, req, print_fn=print_fn, kgrid=kgrid)
     except sanity.SanityError as exc:
         raise ValueError(
-            f"GATE w_bse_w_stage_invariants: screening_diagrams = w_bse "
+            f"GATE {rule_id}: screening_diagrams = {diagram_name} "
             f"refuses a screened-interaction stage that failed _gate_w.\n"
             f"  got:  {stage}: {exc}\n"
             f"  want: finite W, q=0 hermiticity residual <= 1e-6, and -- "
@@ -482,7 +569,8 @@ def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None):
             f"reciprocity residual <= 1e-5\n"
             f"  fix:  do not consume or publish this run's downstream "
             f"artifacts; fix the named W stage and rerun, or use "
-            f"screening_diagrams = w_rpa until the ladder path is repaired\n"
+            f"screening_diagrams = w_rpa until the resolvent path is "
+            f"repaired\n"
             f"  why:  this W enters the BSE/Sigma physics directly; warning "
             f"and continuing would turn a measured invariant violation into "
             f"plausible rc=0 quasiparticle output\n"
@@ -497,6 +585,7 @@ def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None):
 def prepare_ladder_restart(
     wfns, V_q, *, quad, e_ref, sym, centroid_indices, config, meta, mesh_xy,
     tensors_filename, head_resolver, head_channel=None, print_fn=print,
+    include_w=True,
 ):
     """Run the RPA static W(0), persist it, and verify the handoff.
 
@@ -512,28 +601,37 @@ def prepare_ladder_restart(
     needs, whose head grid is ``{0}`` and nothing else.  So the call opts
     into the static-only head grid BY NAME (``static_head_only=True``)
     rather than the refusal being relaxed.
+
+    ``include_w`` names which resolvent will consume this restart --
+    ``True`` (default) for ``w_bse``, ``False`` for ``w_rpa_resolvent`` --
+    and is used ONLY to label the preconditions and gates below; the RPA
+    static leg computed and persisted here is identical either way (both
+    arms need the SAME restart infrastructure, see module docstring).
     """
     from .gw_output import persist_w0_and_head
 
+    diagram_name = _resolvent_diagram_name(include_w)
     if head_channel is not None:
         raise ValueError(
-            "GATE w_bse_head_placement_unimplemented: a head_channel "
-            "reached the w_bse stage helper, which means "
-            "mc_average_placement != off got past the parse-time refusal "
-            "in gw_config.refuse_unsupported_screening_diagrams.  v1 policy "
-            "is that the q=0 head/wing channel stays RPA and the ladder "
-            "replaces the body only; a post-solve head rescale is a second "
-            "opinion about the same channel.  Fix the parse gate, do not "
-            "serve this here.")
+            f"GATE {diagram_name}_head_placement_unimplemented: a "
+            f"head_channel reached the {diagram_name} stage helper, which "
+            f"means mc_average_placement != off got past the parse-time "
+            f"refusal in gw_config.refuse_unsupported_screening_diagrams.  "
+            f"v1 policy is that the q=0 head/wing channel stays RPA and "
+            f"the resolvent replaces the body only; a post-solve head "
+            f"rescale is a second opinion about the same channel.  Fix the "
+            f"parse gate, do not serve this here.")
 
     # THE TWO PRECONDITION BLOCKS, in cost order.  The occupation gate runs
     # FIRST because it is the cheapest read in the stage (an mf_header
     # metadata block) and because it is the one that decides whether this
     # SYSTEM is one the ladder is certified for at all -- a question that
     # outranks whether the restart handoff is wired.
-    _refuse_metallic_mean_field(config, meta, print_fn=print_fn)
+    _refuse_metallic_mean_field(config, meta, include_w=include_w,
+                                print_fn=print_fn)
     _refuse_unusable_restart(config, meta, sym, centroid_indices,
-                             tensors_filename, print_fn=print_fn)
+                             tensors_filename, include_w=include_w,
+                             print_fn=print_fn)
 
     W0_rpa = compute_static_w(
         wfns, V_q, quad, e_ref=e_ref, sym=sym,
@@ -545,7 +643,7 @@ def prepare_ladder_restart(
         _gate_w_or_refuse(
             W0_rpa, ScreeningRequest(0.0 + 0.0j, "static"),
             stage="RPA input W[static] for the ladder kernel",
-            print_fn=print_fn, kgrid=tuple(meta.kgrid))
+            print_fn=print_fn, kgrid=tuple(meta.kgrid), include_w=include_w)
 
     rpa_iteration_head = None
     from .gw_config import HeadCorrection
@@ -568,7 +666,8 @@ def prepare_ladder_restart(
             config=config, meta=meta,
             mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices,
             static_head_only=True, print_fn=print_fn)
-    _assert_restart_is_loadable(tensors_filename, print_fn=print_fn)
+    _assert_restart_is_loadable(tensors_filename, include_w=include_w,
+                                print_fn=print_fn)
     return W0_rpa
 
 
@@ -882,31 +981,43 @@ def compute_screening_ladder(
     mesh_xy, tensors_filename, head_resolver, head_channel=None,
     static_only=False, print_fn=print, include_w=True,
 ):
-    """``{role: W_q}`` from the ladder, for the non-MPA modes.
+    """``{role: W_q}`` from the resolvent, for the non-MPA modes.
 
     Same return contract as :func:`gw.screening.compute_screening`:
     ``(nq_full, mu, mu)`` complex128 at ``NamedSharding(mesh_xy,
     P(None,'x','y'))``, keyed by the SAME role labels
     ``screening_requests_for`` produced.
 
-    ``include_w=False`` builds the RPA operator inside the ladder machinery
-    instead of the ladder one -- the wiring-closure arm (design section
-    6.1).  It exercises every step of this assembly and must reproduce the
-    production RPA ``W(0)`` to the minimax-quadrature floor; it is a test
-    knob, and the deck cannot reach it.
+    ``include_w`` selects the operator this call solves for:
+    ``True`` (default) is the LADDER kernel, i.e. ``screening_diagrams =
+    w_bse``; ``False`` builds the RPA operator inside the same resolvent
+    machinery instead (the rung parameterized out --
+    ``bse.bse_ring_comm.build_bse_ring_matvec_full(..., include_W=False)``
+    -- one matvec builder, not a second one), i.e. ``screening_diagrams =
+    w_rpa_resolvent``.  :func:`gw.screening.compute_screening_model` is
+    the ONLY caller and sets it from ``diagrams`` directly.  Both arms
+    reproduce their respective reference to the minimax-quadrature floor
+    (``tests/test_bse_w_ladder_identities.py``,
+    ``tests/test_w_bse_wiring_closure.py``) -- the RPA arm was a
+    wiring-closure-only knob before this axis grew a second member; it is
+    now itself a served ``screening_diagrams`` value.
     """
+    diagram_name = _resolvent_diagram_name(include_w)
     requests = screening_requests_for(mode, config)
     if static_only:
         requests = [r for r in requests if r.role == "static"]
     if not requests:
-        # X_ONLY is refused at parse time under w_bse; MPA goes through
-        # make_ladder_wc_source.  Reaching here with no request means a
-        # mode whose plan is empty asked for a ladder W anyway.
+        # X_ONLY is refused at parse time under both resolvent diagrams;
+        # MPA goes through make_ladder_wc_source under w_bse (refused at
+        # parse time under w_rpa_resolvent -- see
+        # gw_config._W_RPA_RESOLVENT_REFUSALS).  Reaching here with no
+        # request means a mode whose plan is empty asked for a resolvent W
+        # anyway.
         raise ValueError(
             f"compute_screening_ladder: compute_mode = "
             f"{getattr(mode, 'value', mode)} declares no screening "
             f"requests, so there is no frequency at which to evaluate the "
-            f"ladder W.  MPA's shared frequency walk goes through "
+            f"{diagram_name} W.  MPA's shared frequency walk goes through "
             f"gw.screening_bse.make_ladder_wc_source instead.")
 
     prepare_ladder_restart(
@@ -914,7 +1025,7 @@ def compute_screening_ladder(
         centroid_indices=centroid_indices, config=config, meta=meta,
         mesh_xy=mesh_xy, tensors_filename=tensors_filename,
         head_resolver=head_resolver, head_channel=head_channel,
-        print_fn=print_fn)
+        print_fn=print_fn, include_w=include_w)
 
     # THE z-LIST COMES FROM THE ROLE PLAN, not from a second table.
     # cohsex -> [0]; gn_ppm -> [0, i*omega_p].  One source of truth for
@@ -923,10 +1034,10 @@ def compute_screening_ladder(
     for r in requests:
         if abs(complex(r.omega_ry).real) > 0.0:
             raise NotImplementedError(
-                f"GATE w_bse_hl_ppm_broadening_unimplemented: role "
-                f"{r.role!r} wants W at the REAL frequency "
+                f"GATE {diagram_name}_hl_ppm_broadening_unimplemented: "
+                f"role {r.role!r} wants W at the REAL frequency "
                 f"{complex(r.omega_ry)!r}, and (z - H)^-1 on the real axis "
-                f"needs a broadening policy the ladder does not have.  "
+                f"needs a broadening policy the resolvent does not have.  "
                 f"Refused at parse time for hl_ppm; restated here so a new "
                 f"real-axis role cannot inherit an answer.")
 
@@ -942,8 +1053,8 @@ def compute_screening_ladder(
     wc = wedge.wc
     if int(wc.shape[0]) != len(z_list):
         raise ValueError(
-            f"w_bse: the facade returned {int(wc.shape[0])} z-slabs for a "
-            f"{len(z_list)}-frequency request.")
+            f"{diagram_name}: the facade returned {int(wc.shape[0])} "
+            f"z-slabs for a {len(z_list)}-frequency request.")
 
     W_by_role: dict[str, jax.Array] = {}
     for i, req in enumerate(requests):
@@ -952,15 +1063,16 @@ def compute_screening_ladder(
             meta=meta, mesh_xy=mesh_xy, label=req.role, print_fn=print_fn)
         # THE SAME GATE THE RPA PATH RUNS, at the same tolerances.
         # Hermiticity and W_q = conj(W_{-q}) are EXPECTED to hold for the
-        # ladder on a TRS deck at omega in {0} u iR; if this fires it is
+        # resolvent on a TRS deck at omega in {0} u iR; if this fires it is
         # evidence about the operator, not an inconvenience.  Do not
         # loosen it (design section 4).
         with timing.section("W.gate", announce=True,
-                            label=f"W[{req.role}] (ladder) finiteness + "
-                                  f"hermiticity gate"):
+                            label=f"W[{req.role}] ({diagram_name}) "
+                                  f"finiteness + hermiticity gate"):
             _gate_w_or_refuse(
-                W_q, req, stage=f"assembled ladder W[{req.role}]",
-                print_fn=print_fn, kgrid=tuple(meta.kgrid))
+                W_q, req, stage=f"assembled {diagram_name} W[{req.role}]",
+                print_fn=print_fn, kgrid=tuple(meta.kgrid),
+                include_w=include_w)
         W_by_role[req.role] = W_q
     return W_by_role
 
