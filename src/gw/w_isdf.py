@@ -1681,14 +1681,20 @@ _photon_longwave_fit_cache: dict = {}
 
 
 def _same_named_sharding(array, mesh_xy, spec) -> bool:
-    """Whether ``array`` is already on ``mesh_xy`` with exactly ``spec``."""
+    """Whether ``array`` is already on ``mesh_xy`` with ``spec``'s layout."""
     sharding = getattr(array, "sharding", None)
-    if not isinstance(sharding, NamedSharding) or sharding.spec != spec:
+    if not isinstance(sharding, NamedSharding):
         return False
-    return (
+    same_mesh = (
         tuple(sharding.mesh.axis_names) == tuple(mesh_xy.axis_names)
         and np.array_equal(sharding.mesh.devices, mesh_xy.devices)
     )
+    # JAX canonicalises trailing replicated entries away, e.g. rank-3
+    # P(None, "y", None) is reported as P(None, "y").  Compare the actual
+    # device-to-index mapping, as the adjacent head/photon layout owners do,
+    # while keeping the exact production-mesh guard above.
+    wanted = NamedSharding(mesh_xy, spec)
+    return same_mesh and sharding.is_equivalent_to(wanted, array.ndim)
 
 
 def _require_named_sharding(array, mesh_xy, spec, name) -> None:
