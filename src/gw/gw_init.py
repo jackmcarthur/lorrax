@@ -2820,24 +2820,31 @@ def prepare_isdf_and_wavefunctions(
 			# ``load_restart_state_from_h5``.
 			if _write_restart:
 				if cfg.memory.low_mem_bands:
-					# NOT YET PORTED: the transverse-centroid (Σ^B) face
-					# carrier has no restart dataset -- this write covers
-					# only the charge bundle (psi_full_y/psi_full_y_mun).
-					# NOT a silent-wrong-physics risk: bispinor restart
-					# READ already refuses loudly, unconditionally,
-					# whenever a file has no 'psi_full_y_transverse'
-					# dataset (below, "Bispinor restart" -- pre-existing,
-					# independent of low_mem_bands, since a low_mem_bands
-					# file never carries that LEGACY-only dataset name
-					# either).  So this write proceeds; a bispinor deck
-					# that later restarts from it gets a clear, if late,
-					# refusal rather than a wrong answer.
+					# Face layout writes BOTH channels' face pairs
+					# (2026-08-23): the charge pair
+					# (psi_full_y/psi_full_y_mun) and, on a bispinor
+					# deck, the transverse pair
+					# (psi_full_y_transverse/psi_full_y_transverse_mun)
+					# — sourced from the transverse face carrier's own
+					# psi_nmu/psi_mun (the same axis-order identity the
+					# charge pair relies on), clipped at the TRANSVERSE
+					# centroid count.  SlabIO writes each face's owned
+					# shards directly; no reshard, no gather.
 					write_restart_state_to_h5(
 						tensors_filename,
 						n_rmu_logical=int(meta.n_rmu),
 						psi_full_y=wfns.psi_nmu,
 						psi_full_y_mun=wfns.psi_mun,
 						mesh=mesh_xy, mode="a",
+						psi_full_y_transverse=(
+							wfns_transverse.psi_nmu
+							if wfns_transverse is not None else None),
+						psi_full_y_transverse_mun=(
+							wfns_transverse.psi_mun
+							if wfns_transverse is not None else None),
+						n_rmu_transverse_logical=(
+							int(transverse_wfn_data['meta'].n_rmu)
+							if transverse_wfn_data is not None else None),
 					)
 				else:
 					write_restart_state_to_h5(
@@ -3014,13 +3021,21 @@ def prepare_isdf_and_wavefunctions(
 			# no-op on None (rc=0, wrong physics: Σ^B dropped).
 			wfns_transverse = None
 			if cfg.bispinor:
-				if getattr(rs, 'psi_rmu_Y_transverse', None) is None:
+				_have_T_psi = (
+					getattr(rs, 'psi_nmu_transverse', None) is not None
+					if cfg.memory.low_mem_bands
+					else getattr(rs, 'psi_rmu_Y_transverse', None)
+					is not None)
+				if not _have_T_psi:
 					raise ValueError(
 						f"bispinor restart: {tensors_filename} has no "
-						f"'psi_full_y_transverse' dataset.  It was written "
-						f"either by a scalar run or by a LORRAX predating "
-						f"the bispinor restart round-trip (2026-07-27).  "
-						f"Σ^B needs ψ at the transverse centroids; rerun "
+						f"transverse ψ for this layout "
+						f"({'face pair psi_full_y_transverse[_mun]' if cfg.memory.low_mem_bands else 'psi_full_y_transverse'}).  "
+						f"It was written either by a scalar run, by a "
+						f"LORRAX predating the bispinor restart "
+						f"round-trip (legacy 2026-07-27, face "
+						f"2026-08-23), or by the other layout.  Σ^B "
+						f"needs ψ at the transverse centroids; rerun "
 						f"with restart = false to rebuild the tensors "
 						f"(the ζ fits and v_q_bispinor.h5 will be "
 						f"regenerated).")
@@ -3073,16 +3088,29 @@ def prepare_isdf_and_wavefunctions(
 						f"(silently wrong physics).  Set restart = false, "
 						f"or restore the original transverse centroid "
 						f"file.")
-				sanity.check_finite(
-					"restart transverse ψ (psi_full_y_transverse)",
-					rs.psi_rmu_Y_transverse, print_fn=print0)
-				wfns_transverse = build_wavefunction_bundle(
-					wfn, sym, meta, band_slices, mesh_xy,
-					psi_rmu_Y=rs.psi_rmu_Y_transverse,
-					psi_rmuT_X=rs.psi_rmuT_X_transverse,
-					enk_full=rs.enk_full, print_fn=print0)
+				if cfg.memory.low_mem_bands:
+					from .wavefunction_bundle import (
+						wavefunctions_face_from_restart)
+					sanity.check_finite(
+						"restart transverse ψ (psi_full_y_transverse, "
+						"face)", rs.psi_nmu_transverse, print_fn=print0)
+					wfns_transverse = wavefunctions_face_from_restart(
+						rs.psi_nmu_transverse, rs.psi_mun_transverse,
+						enk_full=rs.enk_full, slices=band_slices,
+						mesh_xy=mesh_xy)
+				else:
+					sanity.check_finite(
+						"restart transverse ψ (psi_full_y_transverse)",
+						rs.psi_rmu_Y_transverse, print_fn=print0)
+					wfns_transverse = build_wavefunction_bundle(
+						wfn, sym, meta, band_slices, mesh_xy,
+						psi_rmu_Y=rs.psi_rmu_Y_transverse,
+						psi_rmuT_X=rs.psi_rmuT_X_transverse,
+						enk_full=rs.enk_full, print_fn=print0)
 				print0(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
-				       f"(n_rmu_T={int(rs.n_rmu_transverse_disk)} "
+				       f"(layout="
+				       f"{'face' if cfg.memory.low_mem_bands else 'legacy'}, "
+				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
 
 	return SimpleNamespace(
