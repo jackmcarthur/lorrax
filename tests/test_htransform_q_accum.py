@@ -8,16 +8,14 @@ Register rows closed here (sandbox KNOWN_LORRAX_ISSUES 2026-08-19):
   live across all band chunks — CrI3 81k/160b/6800c at P=4 advertised
   3.39 GB/chunk while XLA priced Q at 133.98 GiB/device (JID 57269074).
   ``galerkin_q_ledger`` now charges Q (x2 donated in/out overlap), both
-  transition layouts of the psi chunk, the replicated Gram state, Vh, G
+  equal-volume transition shards of the psi chunk, replicated Gram state, Vh, G
   and the psi(G-flat) window, and ``_refuse_unfit_galerkin_mesh``
   refuses a non-fitting mesh BEFORE compilation, naming the smallest
   square mesh that fits.
-* The band-sharded psi slab entered the accumulation contraction with no
-  explicit reshard; the legacy SPMD partitioner fell back to fully
-  replicating a 54.3-GiB slab per GPU at P16 (JID 57271407,
-  "Involuntary full rematerialization").  ``_make_to_r_kernel`` is now
-  the ONE explicit band->r all-to-all, and ``_make_accum_kernel`` pins
-  its psi input sharding to Q's fitted r layout.
+* The generic product-band → r-on-y reshard fully rematerialised the carrier.
+  The production route now uses ``common.staged_reshard``'s two explicit,
+  volume-preserving all-to-alls and ``_make_accum_kernel`` pins its psi input
+  to the resulting product-r layout.
 
 The multi-device transition twin runs in a 4-CPU-device subprocess (the
 house pattern of ``test_transverse_rank_truncate``).  Importing
@@ -109,10 +107,11 @@ def test_refusal_names_a_fitting_square_mesh(monkeypatch):
     m = re.search(r"pool size is (\d+)x(\d+)", msg)
     assert m and m.group(1) == m.group(2), msg
     named = int(m.group(1))
+    from runtime.padding import round_up
+    kw_s = {**kw, "n_rtot": round_up(n_rtot, named * named)}
     led_s = ht.galerkin_q_ledger(
-        p_total=named * named,
-        q_shards=ht._square_q_shards(n_rtot, named),
-        y_shards=(named if n_rtot % named == 0 else 1), **kw)
+        p_total=named * named, q_shards=named * named,
+        y_shards=named, **kw_s)
     assert led_s["TOTAL"] <= limit
 
 
@@ -139,16 +138,6 @@ def test_refusal_gate_announces_when_it_cannot_run(monkeypatch):
     assert any("DID NOT RUN" in ln for ln in lines)
 
 
-def test_square_q_shards_matches_the_fitter_arithmetic():
-    ht = _import_ht()
-    # 27000 = 2^3 3^3 5^3 — the cohsex fixture extent from the sharding_fit
-    # history: indivisible by 64, divisible by 8.
-    assert ht._square_q_shards(27000, 8) == 8
-    assert ht._square_q_shards(27000, 4) == 4    # 16 does not divide; 4 does
-    assert ht._square_q_shards(27000, 7) == 1
-    assert ht._square_q_shards(4096, 4) == 16
-
-
 # ---------------------------------------------------------------------------
 # The multi-device transition twin (4 forced CPU devices, subprocess)
 # ---------------------------------------------------------------------------
@@ -163,7 +152,8 @@ def _twin_body() -> dict:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     from bandstructure import htransform as ht
-    from common.sharding_fit import fit_sharding, shard_factor
+    from common.sharding_fit import shard_factor
+    from common.staged_reshard import band_to_product_r_reshard
 
     devs = jax.devices()
     if len(devs) < _NDEV:
@@ -172,8 +162,7 @@ def _twin_body() -> dict:
 
     rank, nk, w, ns, n_rtot = 8, 3, 4, 2, 16     # n_rtot % 4 == 0
     rep = NamedSharding(mesh, P())
-    sharding_q = fit_sharding(mesh, P(None, None, ("x", "y")),
-                              (rank, ns, n_rtot), "twin.Q")
+    sharding_q = NamedSharding(mesh, P(None, None, ("y", "x")))
     q_entry = sharding_q.spec[2]
     psi_layout = NamedSharding(mesh, P(None, None, None, q_entry))
 
@@ -197,7 +186,7 @@ def _twin_body() -> dict:
                + 1j * rng.standard_normal((nk, w, ns, n_rtot)))
         # The loader hands the slab BAND-sharded over ('x','y').
         psi_dev = jax.device_put(jnp.asarray(psi), band_sh)
-        to_r = ht._make_to_r_kernel(mesh, psi_layout)
+        to_r = band_to_product_r_reshard(mesh)
         psi_r = to_r(psi_dev)
         layout_ok &= (psi_r.sharding.spec == psi_layout.spec)
         accum = ht._make_accum_kernel(rank, w, ns, mesh, rep,
@@ -266,8 +255,8 @@ def _run_worker(tag: str, timeout: int = 900):
 
 
 def test_band_to_r_transition_matches_reference_at_p4():
-    """The explicit band->r all-to-all + pinned-layout accumulation
-    reproduce the flattened reference sum, land psi in Q's exact fitted
+    """The two staged band->r all-to-alls + pinned-layout accumulation
+    reproduce the flattened reference sum, land psi in Q's exact product-r
     layout, and keep Q in that layout.  Scope: one process over 4
     devices — REAL GPUs when this interpreter already has >= 4 (the lx
     test leg), else 4 forced host CPU devices in a subprocess.  The
