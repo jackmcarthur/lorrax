@@ -327,6 +327,7 @@ def write_restart_state_to_h5(
     psi_full_y=None,
     psi_full_y_mun=None,
     psi_full_y_transverse=None,
+    psi_full_y_transverse_mun=None,
     n_rmu_transverse_logical: int | None = None,
     enk_full=None,
     S_qmunu=None,
@@ -511,6 +512,14 @@ def write_restart_state_to_h5(
             n_T = int(n_rmu_transverse_logical)
             _write("psi_full_y_transverse", psi_full_y_transverse,
                    mu_axes=(-1,), n_logical=n_T)
+            # Face layout (low_mem_bands): the ADDITIVE second face of
+            # the transverse carrier, mirroring psi_full_y_mun exactly
+            # ((nk, s, μ_T, n) — μ at axis -2).  Written only when the
+            # caller holds a face-layout transverse bundle; a legacy
+            # caller passes None and the file stays byte-identical to
+            # the pre-face schema.
+            _write("psi_full_y_transverse_mun", psi_full_y_transverse_mun,
+                   mu_axes=(-2,), n_logical=n_T)
             # Stamped for the load-time extent cross-check in
             # read_restart_state_from_h5.
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
@@ -1123,10 +1132,12 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
     specs from SlabIO" branch of the restart audit (report §"Restart
     write/read") rather than a one-face-plus-transpose branch — chosen
     because it needs no new cross-mesh-axis collective to write or
-    verify, at the cost of the doubled on-disk ψ bytes.  Bispinor
-    (``psi_full_y_transverse``) is not supported under ``low_mem_bands``
-    (refused by the caller, ``gw_init.prepare_isdf_and_wavefunctions``);
-    this reader does not look for it in that mode.
+    verify, at the cost of the doubled on-disk ψ bytes.  Bispinor under
+    ``low_mem_bands`` (2026-08-23): the transverse pair rides the
+    identical two-hyperslab pattern — ``psi_full_y_transverse`` at the
+    nmu face spec plus the ADDITIVE ``psi_full_y_transverse_mun`` — at
+    the transverse mu extent; a file carrying only the legacy-written
+    nmu-order dataset refuses by name.
     """
     from .slab_io import SlabIO
     from runtime.padding import padded_mu_extent
@@ -1147,9 +1158,18 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
         shapes = {k: tuple(int(s) for s in f[k].shape)
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
                             "psi_full_y", "psi_full_y_mun",
-                            "psi_full_y_transverse")
+                            "psi_full_y_transverse",
+                            "psi_full_y_transverse_mun")
                   if k in f}
         dtypes = {k: f[k].dtype for k in shapes}
+        if (low_mem_bands and "psi_full_y_transverse" in shapes
+                and "psi_full_y_transverse_mun" not in shapes):
+            raise ValueError(
+                f"Restart file {filename} has 'psi_full_y_transverse' but "
+                f"no 'psi_full_y_transverse_mun' dataset: it was written "
+                f"by a legacy-layout run.  Read it with low_mem_bands = "
+                f"false, or rerun with restart = false so the transverse "
+                f"face pair is written.")
         if low_mem_bands and "psi_full_y_mun" not in shapes:
             raise ValueError(
                 f"Restart file {filename} has no 'psi_full_y_mun' dataset "
@@ -1238,15 +1258,35 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
                                 spec=psi_nmu_spec)
             psi_mun = _read_psi(io, "psi_full_y_mun", n_rmu_disk,
                                 spec=psi_mun_spec, mu_axis=-2, spinor_axis=1)
+            # Transverse (bispinor) faces: same two-hyperslab pattern at
+            # the transverse μ extent.  A file holding the nmu-order
+            # dataset WITHOUT the additive mun face was written by a
+            # legacy-layout run — refuse rather than derive the second
+            # face with an unowned x<->y transpose (the same
+            # request-both-specs ruling as the charge pair).
+            psi_full_y_transverse = None
+            if n_rmu_T_disk is not None:
+                # (missing-mun refusal fired in pass 1, before SlabIO)
+                psi_nmu_T = _read_psi(
+                    io, "psi_full_y_transverse", n_rmu_T_disk,
+                    spec=psi_nmu_spec)
+                psi_mun_T = _read_psi(
+                    io, "psi_full_y_transverse_mun", n_rmu_T_disk,
+                    spec=psi_mun_spec, mu_axis=-2, spinor_axis=1)
+            else:
+                psi_nmu_T = None
+                psi_mun_T = None
         else:
             psi_full_y = _read_psi(io, "psi_full_y", n_rmu_disk,
                                    spec=psi_spec)
             psi_nmu = None
             psi_mun = None
-        psi_full_y_transverse = (
-            _read_psi(io, "psi_full_y_transverse", n_rmu_T_disk,
-                      spec=psi_spec)
-            if n_rmu_T_disk is not None else None)
+            psi_nmu_T = None
+            psi_mun_T = None
+            psi_full_y_transverse = (
+                _read_psi(io, "psi_full_y_transverse", n_rmu_T_disk,
+                          spec=psi_spec)
+                if n_rmu_T_disk is not None else None)
 
     # G0: μ-class, read whole above.  Collapse a legacy 2-D (nqz, μ) store
     # to its q=0 row, pad to the same in-memory μ extent as everything
@@ -1276,7 +1316,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False):
 
     del nspinor  # gated above; the extent itself rides on the arrays
     return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
-            psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun)
+            psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun,
+            psi_nmu_T, psi_mun_T)
 
 
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
@@ -1371,19 +1412,23 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
     # the read (SlabIO zero-fills past the dataset) and the sharding is
     # the read (SlabIO returns the tile), so none of it survives here.
     (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
-     psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun) = read_restart_state_from_h5(
+     psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
+     psi_nmu_T, psi_mun_T) = read_restart_state_from_h5(
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands))
 
     if low_mem_bands:
         # No derivation, no reshard: both faces already arrived at their
         # own spec.  Legacy psi_rmu_Y/psi_rmuT_X are not built at all.
+        # The transverse (bispinor) pair follows the identical pattern at
+        # its own mu extent; None on a scalar/spinor file.
         return SimpleNamespace(
             V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
             G0_mu_nu=G0_mu_nu, enk_full=enk_full,
             psi_rmu_Y=None, psi_rmuT_X=None,
             psi_nmu=psi_nmu, psi_mun=psi_mun,
             psi_rmu_Y_transverse=None, psi_rmuT_X_transverse=None,
-            n_rmu_transverse_disk=None,
+            psi_nmu_transverse=psi_nmu_T, psi_mun_transverse=psi_mun_T,
+            n_rmu_transverse_disk=n_rmu_T_disk,
         )
 
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
@@ -1409,5 +1454,6 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         psi_nmu=None, psi_mun=None,
         psi_rmu_Y_transverse=psi_rmu_Y_T,
         psi_rmuT_X_transverse=psi_rmuT_X_T,
+        psi_nmu_transverse=None, psi_mun_transverse=None,
         n_rmu_transverse_disk=n_rmu_T_disk,
     )
