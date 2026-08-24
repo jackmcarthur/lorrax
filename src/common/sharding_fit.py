@@ -139,9 +139,7 @@ def _largest_divisible_subset(mesh, names, dim: int):
     for k in range(len(names) - 1, 0, -1):
         for sub in combinations(range(len(names)), k):
             picked = tuple(names[i] for i in sub)
-            p = 1
-            for a in picked:
-                p *= int(mesh.shape[a])
+            p = shard_factor(mesh, picked)
             if dim % p == 0:
                 return picked
     return ()
