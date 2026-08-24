@@ -13,9 +13,9 @@ import numpy as np
 
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
-from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg, minibz_voronoi_batches,
-                          sample_minibz_qpoints)
+from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
+                          minibz_inscribed_sphere_r2,
+                          minibz_transverse_head_avg, minibz_voronoi_batches)
 
 __all__ = ["Slab2D"]
 
@@ -111,10 +111,9 @@ class Slab2D:
         # 2D head is a |Q| cusp, not a 1/q² pole → no analytic sphere term;
         # the flag only widens the Voronoi fold (nmax 1→3, BGW ncell=3).
         # Default (flag off) keeps nmax=1 → bit-identical.
-        nmax = 3 if analytic_sphere else 1
-        batches = sample_minibz_qpoints(
+        batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=nmax, is_2d=True,
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True,
         )
         # Sobol path uses the per-rep formula with the *cosine* term included
         # (since rq.z is exactly zero by construction, cos(qz·zc) == 1, but
@@ -180,10 +179,9 @@ class Slab2D:
         """
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = np.asarray(geometry.bvec, dtype=np.float64)
-        nmax = 3 if analytic_sphere else 1
-        batches = sample_minibz_qpoints(
+        batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=nmax, is_2d=True)
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True)
         q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=True)
         return minibz_transverse_head_avg(
             np.zeros(3), [np.asarray(b) for b in batches], kind="slab",

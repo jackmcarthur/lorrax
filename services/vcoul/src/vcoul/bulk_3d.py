@@ -7,8 +7,9 @@ import numpy as np
 
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
-from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg, sample_minibz_qpoints)
+from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
+                          minibz_inscribed_sphere_r2,
+                          minibz_transverse_head_avg)
 
 __all__ = ["Bulk3D"]
 
@@ -59,10 +60,9 @@ class Bulk3D:
         # Voronoi fold (BGW ncell=3) for skewed cells.  Default False keeps
         # the historical pure-Sobol average bit-identical.
         nkx, nky, nkz = (int(s) for s in kgrid)
-        nmax = 3 if analytic_sphere else 1
-        batches = sample_minibz_qpoints(
+        batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=nmax, is_2d=False,
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=False,
         )
         if analytic_sphere:
             bvec = np.asarray(geometry.bvec, dtype=np.float64)
@@ -144,10 +144,9 @@ class Bulk3D:
         """
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = np.asarray(geometry.bvec, dtype=np.float64)
-        nmax = 3 if analytic_sphere else 1
-        batches = sample_minibz_qpoints(
+        batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=nmax, is_2d=False)
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=False)
         q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=False)
         return minibz_transverse_head_avg(
             np.zeros(3), [np.asarray(b) for b in batches], kind="bulk_3d",

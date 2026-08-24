@@ -48,6 +48,12 @@ WHO CALLS WHAT
     the same two BGW branches as ``minibz_average`` — six numbers instead
     of one, which is what the BSE exchange head's cell average actually
     needs (``LT_HEAD_PROBLEM.md`` §3).  Bare units, like the scalar.
+``iter_minibz_photon_samples(kernel, geometry, kgrid, ...)``
+    Streams one Sobol replicate and one fixed-size chunk at a time, returning
+    Cartesian q together with the raw bare Coulomb-gauge kernel in the fixed
+    ``(C,Tx,Ty,Tz)`` basis.  It is the sample provider for a caller that must
+    complete a coupled q0 solve before averaging; it contains no screened
+    response physics and applies no cell-volume factor.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -103,6 +109,7 @@ from vcoul.minibz import (
     minibz_inscribed_sphere_r2,
     minibz_moment_tensor,
     minibz_voronoi_batches,
+    iter_minibz_photon_samples,
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
@@ -131,6 +138,7 @@ __all__ = [
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
+    "iter_minibz_photon_samples",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
