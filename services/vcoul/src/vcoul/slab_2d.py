@@ -187,4 +187,6 @@ class Slab2D:
             np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
             celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
             q0sph2=q0sph2, zc=float(np.pi / bvec[2, 2]),
-            analytic_sphere=analytic_sphere, adaptive=True)
+            # The slab flag widens the draw's Voronoi fold only; the
+            # Baldereschi analytic sphere is the 3D 1/q^2 treatment.
+            analytic_sphere=False, adaptive=True)
