@@ -154,11 +154,12 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
     scattering columns.  No generic partitioner is allowed to trade the
     0.4-GiB Q shard for a replicated multi-GiB operand.
     """
-    # Include the byte ceiling because focused gates deliberately lower it to
-    # exercise the blocked path in-process.  Production uses the module
-    # constant, so this adds no compile variants there.
+    # Capture the ceiling before cache lookup: the focused gate deliberately
+    # lowers it, and a returned-but-not-yet-traced jit must not observe a
+    # later mutation of the module constant.
+    fold_q_tile_bytes = int(_FOLD_Q_TILE_BYTES)
     key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
-           int(_FOLD_Q_TILE_BYTES))
+           tuple(grid_xy_.spec), fold_q_tile_bytes)
     fn = _fold_G_cache.get(key)
     if fn is not None:
         return fn
@@ -184,7 +185,7 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
         r_block = max(
             1,
             min(n_r_local,
-                _FOLD_Q_TILE_BYTES // (rank_ * nspinor_local * itemsize)),
+                fold_q_tile_bytes // (rank_ * nspinor_local * itemsize)),
         )
         n_full = n_r_local // r_block
         n_tail = n_r_local - n_full * r_block
