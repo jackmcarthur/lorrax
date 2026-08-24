@@ -2687,6 +2687,9 @@ def build_iteration_head_response(
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
     )
+    # Physical state multiplicity belongs to the source WFN.  A
+    # kinetic-balance lift changes only the stored spinor representation.
+    normalization_nspinor = int(meta.nspinor_wfnfile)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
@@ -2697,7 +2700,7 @@ def build_iteration_head_response(
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin),
-        nspinor=int(meta.nspinor),
+        nspinor=normalization_nspinor,
         eta_ry=resolved_eta_ry,
         surface_weight_kn=surface_weight_qp_kn,
     )
@@ -2714,7 +2717,7 @@ def build_iteration_head_response(
             nb_logical=nb_logical,
             nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin),
-            nspinor=int(meta.nspinor),
+            nspinor=normalization_nspinor,
             eta_ry=resolved_eta_ry,
             surface_weight_kn=surface_weight_qp_kn,
         )
@@ -2731,7 +2734,7 @@ def build_iteration_head_response(
             nb_logical=int(nb_logical),
             nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin),
-            nspinor=int(meta.nspinor),
+            nspinor=normalization_nspinor,
         )
         from gw.w_isdf import compute_chi0_static_fractional_gamma
         static_chi_body_gamma = compute_chi0_static_fractional_gamma(
@@ -2747,7 +2750,7 @@ def build_iteration_head_response(
     if surface_weight_qp_kn is not None:
         capacity = 2.0 / (
             float(max(int(wfn.nspin), 1))
-            * float(max(int(meta.nspinor), 1)))
+            * float(max(normalization_nspinor, 1)))
         # Tetrahedron weights arrive multiplied by Nk to share the distributed
         # Drude contraction's interface.  Undo that factor for the normalized
         # BZ density of states, then use kappa_TF^2=8*pi*DOS_Ry/Omega.
@@ -2814,16 +2817,19 @@ def build_dft_head_response(
             f"(3,{int(meta.nk_tot)},{nb_logical},{nb_logical}) for global "
             f"bands [{b0},{b4}).")
     z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
+    # ``meta.nspinor`` is four for the bispinor representation, whereas
+    # response normalization counts the source-WFN states.
+    normalization_nspinor = int(meta.nspinor_wfnfile)
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
-        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta))
     Y_x, Z_y = head_wings_sharded(
         jnp.asarray(velocity_cart), wfns, energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
-        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta))
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage

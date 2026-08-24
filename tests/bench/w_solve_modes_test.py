@@ -126,7 +126,8 @@ def main():
     jax.block_until_ready(chi0_q)
 
     # n_rmu (the LOGICAL extent) is a HARD read in _resolve_w_solve_fn.
-    meta = SimpleNamespace(nk_tot=nq, nspin=1, nspinor=1, n_rmu=n_log)
+    meta = SimpleNamespace(
+        nk_tot=nq, nspin=1, nspinor=1, nspinor_wfnfile=1, n_rmu=n_log)
     pref = _w_solve_pref_scalar(meta)
 
     # solve_w consumes (donates) its χ₀ argument on both plans — pass an
