@@ -192,6 +192,7 @@ from symmetry_maps.directed_edges import (
 from symmetry_maps.maps import (
     KStarMap,
     SymMaps,
+    bgw_integer_q_to_fractional,
     common_uniform_grid_indices,
     find_irreducible_bz_points,
     kgrid_shift_map,
@@ -271,7 +272,8 @@ from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
     # tables
-    "SymMaps", "kgrid_shift_map", "common_uniform_grid_indices",
+    "SymMaps", "kgrid_shift_map", "bgw_integer_q_to_fractional",
+    "common_uniform_grid_indices",
     "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",

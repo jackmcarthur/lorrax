@@ -11,6 +11,7 @@ from functools import partial
 import numpy as np
 import jax
 import jax.numpy as jnp
+from lxkit import device_put_process_local
 from ._compat import deprecated_alias
 from .directed_edges import apply_band_matrix_symmetry
 from ._shard_map import shard_map
@@ -64,6 +65,37 @@ def kgrid_shift_map(nkx, nky, nkz, q_off):
     kpq_index = (kpx * nky * nkz + kpy * nkz + kpz).astype(np.int32)
     G_umk = np.stack([Gx, Gy, Gz], axis=1).astype(np.int32)
     return kpq_index, G_umk
+
+
+def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
+    """Convert BGW integer-grid q labels to wrapped fractional vectors.
+
+    BGW keeps the positive half-grid point on an even grid and wraps only
+    labels strictly above it: ``q > kgrid/2 -> q-kgrid``.  This service owns
+    that tie convention so symmetry producers and consumers cannot attach
+    different fractional momenta to the same integer star table.
+    """
+    q = np.asarray(q_int_kgrid, dtype=np.float64)
+    grid = np.asarray(kgrid, dtype=np.float64)
+    if q.ndim < 1 or q.shape[-1] != 3:
+        raise ValueError(
+            "bgw_integer_q_to_fractional: q_int_kgrid must have trailing "
+            f"shape (...,3); got {q.shape}.")
+    if grid.shape != (3,):
+        raise ValueError(
+            "bgw_integer_q_to_fractional: kgrid must have shape (3,); got "
+            f"{grid.shape}.")
+    if not np.all(np.isfinite(q)) or not np.array_equal(q, np.rint(q)):
+        raise ValueError(
+            "bgw_integer_q_to_fractional: q_int_kgrid must contain finite "
+            "integer labels.")
+    if (not np.all(np.isfinite(grid)) or np.any(grid <= 0.0)
+            or not np.array_equal(grid, np.rint(grid))):
+        raise ValueError(
+            "bgw_integer_q_to_fractional: kgrid must contain three finite, "
+            f"positive integers; got {grid.tolist()}.")
+    wrapped = np.where(q > grid / 2.0, q - grid, q)
+    return wrapped / grid
 
 
 def common_uniform_grid_indices(grid_a, grid_b):
@@ -769,21 +801,15 @@ def unfold_isdf_one_leg(
             "unfold_isdf_one_leg: zeta q extent does not match the SymMaps "
             f"q-IBZ ({zshape[0]} != {int(q_parent_int.shape[0])}).")
 
-    def _bgw_frac(q_int):
-        q = np.asarray(q_int, dtype=np.float64)
-        wrapped = np.where(q > grid[None, :] / 2.0,
-                           q - grid[None, :], q)
-        return wrapped / grid[None, :]
-
     q_parent = np.asarray(q_irr_frac, dtype=np.float64)
-    q_parent_expected = _bgw_frac(q_parent_int)
+    q_parent_expected = bgw_integer_q_to_fractional(q_parent_int, grid)
     if q_parent.shape != q_parent_expected.shape or not np.allclose(
             q_parent, q_parent_expected, rtol=0.0, atol=1e-12):
         raise ValueError(
             "unfold_isdf_one_leg: q_irr_frac is not the BGW-wrapped "
             "SymMaps.q_irr_kgrid_int table; the zeta G labels and the star "
             "map would describe different parent momenta.")
-    q_full = _bgw_frac(q_full_int)
+    q_full = bgw_integer_q_to_fractional(q_full_int, grid)
 
     S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
@@ -875,11 +901,6 @@ def unfold_isdf_one_leg(
         tau_spatial[iq] = 1.0 if phase is None else phase[0]
 
     trs = rows >= n_spatial
-    q_per_full = q_parent[idx]
-    L_per_full = wraps[rows]
-    qL = np.einsum('qi,qmi->qm', q_per_full, L_per_full)
-    one_leg_phase = (tau_spatial[:, None]
-                     * np.exp(-2j * np.pi * qL))
     R_column = None
     if action == "polar":
         R = np.asarray(sym.R_cart_forward, dtype=np.float64)
@@ -893,15 +914,22 @@ def unfold_isdf_one_leg(
         zeta_shape=zshape, idx=idx, rows=rows, perm=perm,
         trs=trs, preselected=preselected, action=action, mesh_xy=mesh_xy)
     slot_sh = NamedSharding(mesh_xy, P(None))
-    phase_sh = NamedSharding(mesh_xy, P(None, 'x'))
-    source_slot_dev = jax.device_put(source_slot, slot_sh)
-    one_leg_phase_dev = jax.device_put(one_leg_phase, phase_sh)
+    tau_sh = NamedSharding(mesh_xy, P(None))
+    q_parent_sh = NamedSharding(mesh_xy, P(None, None))
+    wraps_sh = NamedSharding(mesh_xy, P(None, 'x', None))
+    source_slot_dev = device_put_process_local(source_slot, slot_sh)
+    tau_spatial_dev = device_put_process_local(tau_spatial, tau_sh)
+    q_parent_dev = device_put_process_local(q_parent, q_parent_sh)
+    wraps_dev = device_put_process_local(wraps, wraps_sh)
     if action == "scalar":
-        return fn(zeta_ibz, source_slot_dev, one_leg_phase_dev)
+        return fn(
+            zeta_ibz, source_slot_dev, tau_spatial_dev,
+            q_parent_dev, wraps_dev)
     R_sh = NamedSharding(mesh_xy, P(None, None))
     return fn(
-        zeta_ibz, source_slot_dev, one_leg_phase_dev,
-        jax.device_put(np.asarray(R_column), R_sh))
+        zeta_ibz, source_slot_dev, tau_spatial_dev,
+        q_parent_dev, wraps_dev,
+        device_put_process_local(np.asarray(R_column), R_sh))
 
 
 _UNFOLD_ISDF_ONE_LEG_JIT_CACHE: dict = {}
@@ -912,9 +940,11 @@ def _get_unfold_isdf_one_leg_jit(
 ):
     """Content-keyed one-leg action shared by all streamed source legs.
 
-    The source G slot and its phase are runtime operands on purpose: tied
-    head columns differ only in those two small tables and must not create a
-    separate compiled module per column.
+    Source G slots and tau phases are runtime operands on purpose: tied head
+    columns differ only in those tables and must not create a separate
+    compiled module per column.  The q/L tables are runtime operands for the
+    same cache reason; their large ``(nq,nmu)`` phase is formed only inside
+    this executable at its final sharding.
     """
     key = (
         tuple(zeta_shape), idx.tobytes(), rows.tobytes(),
@@ -935,38 +965,53 @@ def _get_unfold_isdf_one_leg_jit(
     scalar_sh = NamedSharding(mesh_xy, P(None, 'x'))
     polar_sh = NamedSharding(mesh_xy, P(None, None, 'x'))
     slot_sh = NamedSharding(mesh_xy, P(None))
-    phase_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    tau_sh = NamedSharding(mesh_xy, P(None))
+    q_parent_sh = NamedSharding(mesh_xy, P(None, None))
+    wraps_sh = NamedSharding(mesh_xy, P(None, 'x', None))
+
+    def _spatial(
+            zeta, source_slot_runtime, tau_runtime,
+            q_parent_runtime, wraps_runtime):
+        parent = zeta[idx_j]
+        selected = (parent if preselected else jnp.take_along_axis(
+            parent, source_slot_runtime[:, None, None], axis=2,
+            mode='promise_in_bounds')[:, :, 0])
+        gathered = jnp.take_along_axis(
+            selected, perm_j[rows_j], axis=1,
+            mode='promise_in_bounds')
+        q_per_full = q_parent_runtime[idx_j]
+        L_per_full = wraps_runtime[rows_j]
+        qL = jnp.einsum('qi,qmi->qm', q_per_full, L_per_full)
+        phase = tau_runtime[:, None] * jnp.exp(-2j * jnp.pi * qL)
+        phase = jax.lax.with_sharding_constraint(phase, scalar_sh)
+        return phase * gathered
 
     if action == "scalar":
         @partial(
-            jax.jit, in_shardings=(in_sh, slot_sh, phase_sh),
+            jax.jit,
+            in_shardings=(
+                in_sh, slot_sh, tau_sh, q_parent_sh, wraps_sh),
             out_shardings=scalar_sh)
-        def _do_unfold(zeta, source_slot_runtime, phase_runtime):
-            parent = zeta[idx_j]
-            selected = (parent if preselected else jnp.take_along_axis(
-                parent, source_slot_runtime[:, None, None], axis=2,
-                mode='promise_in_bounds')[:, :, 0])
-            gathered = jnp.take_along_axis(
-                selected, perm_j[rows_j], axis=1,
-                mode='promise_in_bounds')
-            spatial = phase_runtime * gathered
+        def _do_unfold(
+                zeta, source_slot_runtime, tau_runtime,
+                q_parent_runtime, wraps_runtime):
+            spatial = _spatial(
+                zeta, source_slot_runtime, tau_runtime,
+                q_parent_runtime, wraps_runtime)
             return jnp.where(trs_j[:, None], jnp.conj(spatial), spatial)
     else:
         R_sh = NamedSharding(mesh_xy, P(None, None))
 
         @partial(jax.jit,
-                 in_shardings=(in_sh, slot_sh, phase_sh, R_sh),
+                 in_shardings=(
+                     in_sh, slot_sh, tau_sh, q_parent_sh, wraps_sh, R_sh),
                  out_shardings=polar_sh)
         def _do_unfold(
-                zeta, source_slot_runtime, phase_runtime, R_column_runtime):
-            parent = zeta[idx_j]
-            selected = (parent if preselected else jnp.take_along_axis(
-                parent, source_slot_runtime[:, None, None], axis=2,
-                mode='promise_in_bounds')[:, :, 0])
-            gathered = jnp.take_along_axis(
-                selected, perm_j[rows_j], axis=1,
-                mode='promise_in_bounds')
-            spatial = phase_runtime * gathered
+                zeta, source_slot_runtime, tau_runtime,
+                q_parent_runtime, wraps_runtime, R_column_runtime):
+            spatial = _spatial(
+                zeta, source_slot_runtime, tau_runtime,
+                q_parent_runtime, wraps_runtime)
             scalar = jnp.where(
                 trs_j[:, None], jnp.conj(spatial), spatial)
             return jnp.einsum('qi,qm->iqm', R_column_runtime, scalar)

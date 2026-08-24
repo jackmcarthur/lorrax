@@ -901,15 +901,14 @@ def fit_zeta_to_h5(
     # by the orbit-closure auto-fallback, so the on-disk q-axis is IBZ when
     # it is True and full-BZ when it fell back — nothing more to decide here.
 
-    # BGW Brillouin-zone wrap (the local ``_bgw_wrap_q`` below, matching
-    # the convention the V_q consumer uses): ``q > kgrid/2 → q
-    # − kgrid``.  The writer must match so the per-q phase
+    # BGW Brillouin-zone wrap: ``q > kgrid/2 → q − kgrid``.  The writer
+    # and V_q consumer share the symmetry service's exact tie convention so
+    # the per-q phase
     # ``exp(-2πi (q/kgrid)·r)`` baked into the G-flat output is the
     # convention the consumer expects.
-    def _bgw_wrap_q(q_int_kgrid: np.ndarray) -> np.ndarray:
-        kg = np.asarray(meta.kgrid, dtype=np.float64)
-        q = np.asarray(q_int_kgrid, dtype=np.float64)
-        return np.where(q > kg / 2, q - kg, q)
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import bgw_integer_q_to_fractional
 
     if write_ibz_only:
         q_irr_kgrid_int = sym.q_irr_kgrid_int
@@ -918,9 +917,8 @@ def fit_zeta_to_h5(
         # IBZ fractional q-vectors for the G-flat accumulator (Phase C1b).
         # BGW wrap THEN divide by kgrid so the writer's per-q phase
         # matches the V_q kernel's ``apply_bloch_phase`` convention.
-        _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
-        q_irr_frac = (_bgw_wrap_q(q_irr_kgrid_int)
-                       / _kgrid_arr_for_qfrac[None, :])
+        q_irr_frac = bgw_integer_q_to_fractional(
+            q_irr_kgrid_int, meta.kgrid)
         print_fn(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
                  f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
     else:
@@ -947,14 +945,13 @@ def fit_zeta_to_h5(
     # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
     if q_irr_frac is None:
         # Full-BZ q-vectors with BGW wrap, then / kgrid — the convention
-        # the per-q sphere below is built in, via the local
-        # ``_bgw_wrap_q``.  (It used to be stated as "what the V_q
+        # the per-q sphere below is built in.  (It used to be stated as
+        # "what the V_q
         # consumer's disk→G path expects"; that path,
         # ``zeta_loader._do_disk_to_G``, was deleted on 2026-08-07 — this
         # writer bakes the phase in and the reader does no FFT at all.)
-        _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
-        q_irr_frac = (_bgw_wrap_q(sym.kvecs_asints)
-                       / _kgrid_arr_for_qfrac[None, :])
+        q_irr_frac = bgw_integer_q_to_fractional(
+            sym.kvecs_asints, meta.kgrid)
 
     # Build the per-q WFN.h5-style sphere when a cutoff is available.
     # The output is host numpy; the writer threads ``sphere_idx_padded``
