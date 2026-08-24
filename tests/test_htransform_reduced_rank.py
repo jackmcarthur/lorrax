@@ -8,6 +8,7 @@ key: rank proportional to bands at one k, followed by a per-k polar factor so
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,15 +16,16 @@ import pytest
 
 def test_rank_multiplier_vocabulary_and_default():
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_galerkin_rank_multiplier
+    from isdf.galerkin import validate_rank_multiplier
     from gw.gw_config import _DEFAULTS
 
     assert _DEFAULTS["htransform_rank_multiplier"] == 0.0
-    assert resolve_galerkin_rank_multiplier(0) == 0.0
-    assert resolve_galerkin_rank_multiplier("10") == 10.0
+    assert validate_rank_multiplier(0, name="htransform_rank_multiplier") == 0.0
+    assert validate_rank_multiplier(
+        "10", name="htransform_rank_multiplier") == 10.0
     for bad in (-1, 0.5, float("nan"), "not-a-number"):
         with pytest.raises(ValueError, match="htransform_rank_multiplier"):
-            resolve_galerkin_rank_multiplier(bad)
+            validate_rank_multiplier(bad, name="htransform_rank_multiplier")
 
 
 def test_downfold_centroid_subset_is_ordered_strict_and_checked():
@@ -39,7 +41,7 @@ def test_downfold_centroid_subset_is_ordered_strict_and_checked():
 def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import _lowdin_orthonormalize_band_rows
+    from isdf.galerkin import _lowdin_orthonormalize_band_rows
 
     rng = np.random.default_rng(20260820)
     nk, nb, rank = 5, 6, 40
@@ -64,24 +66,24 @@ def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
 
 def test_reduced_policy_is_opt_in_and_refit_is_refused():
     pytest.importorskip("jax")
-    from bandstructure import htransform as ht
-
-    sig = inspect.signature(ht.streaming_galerkin_solve)
-    assert sig.parameters["rank_multiplier"].default == 0.0
-    src = inspect.getsource(ht.streaming_galerkin_solve)
+    from isdf import galerkin
+    root = Path(__file__).resolve().parents[1] / "src"
+    src = (root / "bandstructure" / "htransform.py").read_text()
+    fit_src = inspect.getsource(galerkin.fit_galerkin_basis)
     assert "if rank_multiplier > 0.0 and return_full_proj" in src
-    assert "rank_multiplier=params.get" in inspect.getsource(ht.initialize_wfns)
+    assert 'rank_multiplier: float = 0.0' in src
+    assert "rank_multiplier=params.get" in src
     # The default must not be routed through the approximate polar factor.
-    assert "if rank_multiplier > 0.0:" in src
+    assert "if rank_multiplier > 0.0:" in fit_src
 
 
 def test_exact_rank_report_excludes_left_gram_null_tail_and_counts_pad():
     """The carried report owns the selected block plus exact-null padding."""
     pytest.importorskip("jax")
-    from bandstructure import htransform as ht
+    from isdf import galerkin
     from common import rank_criterion
 
-    src = inspect.getsource(ht.streaming_galerkin_solve)
+    src = inspect.getsource(galerkin.fit_galerkin_basis)
     assert "s_host[:rank_phys], rtol" in src
 
     # Toy of the production failure plus the closure corner: the raw left

@@ -595,9 +595,9 @@ _DRIVER_PLUMBING_BUDGET = {
     "bse.exciton_bands": 1,
     # ``jax.sharding`` at :20.  Same shape as exciton_bands, larger:
     # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on.
-    # Its projected-Gram shard_map and r/band schedule now live in the named
-    # ``isdf.galerkin`` kernel owner, but the remaining basis fit and fH
-    # interpolation still carry one ``jax.sharding`` import.  Its hand-rolled
+    # Its complete reusable Galerkin basis fit now lives in ``isdf.galerkin``;
+    # htransform retains the fH interpolation and its policy adapter, which
+    # still carry one ``jax.sharding`` import. Its hand-rolled
     # ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it hands back
     # the mesh ``initialize_communicator_stack`` built).
     "bandstructure.htransform": 1,
