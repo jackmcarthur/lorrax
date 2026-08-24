@@ -144,22 +144,42 @@ def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
     return _accum
 
 
-def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
-    """Fold r-sharded ``Q Q†`` directly onto a 2-D matrix face.
+def _make_fold_G_kernel(rank_, nspinor_, n_r_carrier_, mesh_,
+                        sharding_q_, grid_xy_):
+    """Stream r-sharded ``Q Q†`` directly onto a 2-D matrix face.
 
-    ``Q`` owns a different r block on every ``(x,y)`` rank.  Form the small
-    full-rank Gram contribution from that local block, then use the
-    established two-stage ``psum_scatter`` face contraction: x sums its r
-    groups while scattering matrix rows, y sums the remaining groups while
-    scattering columns.  No generic partitioner is allowed to trade the
-    0.4-GiB Q shard for a replicated multi-GiB operand.
+    The slice and Gram operations are deliberately separate compiled
+    programs.  A tile loop inside one program is not a memory contract: XLA
+    may commute conjugation or a GEMM layout copy through the slice and
+    materialise a full local-Q temporary.  Here the Gram executable can see
+    only one bounded local-r tile, so its operand scratch is bounded by
+    construction.
+
+    Each device slices the same offset from its own unique r shard.  The
+    smaller global carrier is just a concatenation of those local tiles; r
+    ordering is immaterial to the Gram sum.  The incumbent two-stage
+    ``psum_scatter`` sums all r shards while distributing matrix rows and
+    columns onto ``P('x','y')``.
     """
-    # Capture the ceiling before cache lookup: the focused gate deliberately
-    # lowers it, and a returned-but-not-yet-traced jit must not observe a
-    # later mutation of the module constant.
     fold_q_tile_bytes = int(_FOLD_Q_TILE_BYTES)
-    key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
-           tuple(grid_xy_.spec), fold_q_tile_bytes)
+    q_r_divisor = spec_divisor(mesh_, sharding_q_.spec, axis=2)
+    if int(n_r_carrier_) % q_r_divisor:
+        raise ValueError(
+            "_make_fold_G_kernel: Q's global r carrier must divide its "
+            f"sharding; n_r={n_r_carrier_}, divisor={q_r_divisor}")
+    n_r_local = int(n_r_carrier_) // q_r_divisor
+    itemsize = np.dtype(np.complex128).itemsize
+    r_block = max(
+        1,
+        min(n_r_local,
+            fold_q_tile_bytes
+            // (int(rank_) * int(nspinor_) * itemsize)),
+    )
+    n_full, n_tail = divmod(n_r_local, r_block)
+
+    key = (id(mesh_), int(rank_), int(nspinor_), int(n_r_carrier_),
+           tuple(sharding_q_.spec), tuple(grid_xy_.spec),
+           fold_q_tile_bytes)
     fn = _fold_G_cache.get(key)
     if fn is not None:
         return fn
@@ -171,6 +191,32 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
             "_make_fold_G_kernel: the carried Galerkin rank must divide "
             f"both mesh axes; rank={rank_}, mesh={p_x}x{p_y}")
 
+    rep = NamedSharding(mesh_, P())
+
+    def _make_local_slice(block_size):
+        @partial(
+            shard_map,
+            mesh=mesh_,
+            in_specs=(sharding_q_.spec, P()),
+            out_specs=sharding_q_.spec,
+            check_vma=False,
+        )
+        def _slice_local(Q_local, r0_local):
+            # Keep layout assignment from commuting a consumer-preferred
+            # whole-Q repack above the slice.  This is the measured
+            # post-slice boundary already used by gw.v_q_g_flat for the same
+            # whole-parameter-copy failure mode; the barrier is a scheduling
+            # fence, not a numerical operation.
+            return jax.lax.optimization_barrier(
+                jax.lax.dynamic_slice_in_dim(
+                    Q_local, r0_local, block_size, axis=2))
+
+        return jax.jit(
+            _slice_local,
+            in_shardings=(sharding_q_, rep),
+            out_shardings=sharding_q_,
+        )
+
     @partial(
         shard_map,
         mesh=mesh_,
@@ -178,45 +224,44 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
         out_specs=P('x', 'y'),
         check_vma=False,
     )
-    def _fold_local(Q_local, G_local):
-        n_r_local = int(Q_local.shape[2])
-        nspinor_local = int(Q_local.shape[1])
-        itemsize = np.dtype(np.complex128).itemsize
-        r_block = max(
-            1,
-            min(n_r_local,
-                fold_q_tile_bytes // (rank_ * nspinor_local * itemsize)),
-        )
-        n_full = n_r_local // r_block
-        n_tail = n_r_local - n_full * r_block
-        partial = jnp.zeros((rank_, rank_), dtype=Q_local.dtype)
-
-        def _add_r_block(i, acc):
-            q = jax.lax.dynamic_slice_in_dim(
-                Q_local, i * r_block, r_block, axis=2)
-            return acc + jnp.einsum(
-                'asr,bsr->ab', q, jnp.conj(q), optimize=True)
-
-        partial = jax.lax.fori_loop(0, n_full, _add_r_block, partial)
-        if n_tail:
-            q_tail = jax.lax.dynamic_slice_in_dim(
-                Q_local, n_full * r_block, n_tail, axis=2)
-            partial = partial + jnp.einsum(
-                'asr,bsr->ab', q_tail, jnp.conj(q_tail), optimize=True)
+    def _fold_block_local(Q_block_local, G_local):
+        partial = jnp.einsum(
+            'asr,bsr->ab', Q_block_local, jnp.conj(Q_block_local),
+            optimize=True)
         partial = jax.lax.psum_scatter(
             partial, 'x', scatter_dimension=0, tiled=True)
         partial = jax.lax.psum_scatter(
             partial, 'y', scatter_dimension=1, tiled=True)
         return G_local + partial
 
-    fn = jax.jit(
-        _fold_local,
+    fold_block = jax.jit(
+        _fold_block_local,
         donate_argnums=(1,),
         in_shardings=(sharding_q_, grid_xy_),
         out_shardings=grid_xy_,
     )
-    _fold_G_cache[key] = fn
-    return fn
+    slice_full = _make_local_slice(r_block)
+    slice_tail = _make_local_slice(n_tail) if n_tail else None
+
+    def _fold(Q, G):
+        if int(Q.shape[2]) != int(n_r_carrier_):
+            raise ValueError(
+                "_make_fold_G_kernel: runtime Q carrier disagrees with "
+                f"the compiled plan; Q={Q.shape[2]}, plan={n_r_carrier_}")
+        for i in range(n_full):
+            q_block = slice_full(Q, np.int32(i * r_block))
+            G = fold_block(q_block, G)
+            jax.block_until_ready(G)
+            del q_block
+        if n_tail:
+            q_block = slice_tail(Q, np.int32(n_full * r_block))
+            G = fold_block(q_block, G)
+            jax.block_until_ready(G)
+            del q_block
+        return G
+
+    _fold_G_cache[key] = _fold
+    return _fold
 
 # Ceiling on ONE streamed ψ band-chunk in the Galerkin build.
 #
@@ -1160,7 +1205,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         q_spec=sharding_q.spec, log_fn=log_fn)
     grid_xy_G = grid_xy
 
-    fold_G = _make_fold_G_kernel(rank, mesh_xy, sharding_q, grid_xy_G)
+    fold_G = _make_fold_G_kernel(
+        rank, nspinor, n_r_carrier, mesh_xy, sharding_q, grid_xy_G)
 
     # Allocate G sharded directly.  ``jax.device_put(jnp.zeros(...), sharding)``
     # on a multi-process mesh hands JAX an UNCOMMITTED fully-addressable array,
