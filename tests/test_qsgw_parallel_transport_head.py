@@ -69,6 +69,17 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     read-only handle the payload uses, ``read_slab`` is never handed an
     empty shape, and ``h5py`` is never opened at all.  The fixture makes
     the last one checkable by installing an h5py whose ``File`` raises.
+
+    UPDATED 2026-08-23 (audit finding, D2 schema-break fix): the
+    ``velocity_validation_{atol,rtol,max_abs,...}`` FLOAT diagnostics are
+    now read only AFTER the refusal check, not before — a velocity-only
+    artifact (``--parallel-transport-velocity-only``) never writes them,
+    so reading them unconditionally crashed with a bare HDF5 ``KeyError``
+    on that artifact class instead of the named ``ValueError`` refusal
+    this test drives.  Every stamp the REFUSAL DECISION itself needs
+    (the ints, kgrid, reciprocal lattice, fingerprint) still comes
+    through ``read_small`` before any refusal, and is still checked
+    below; the floats are deliberately no longer among them.
     """
     import sys
 
@@ -170,12 +181,99 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
         f"expected exactly ONE read-only SlabIO open; got {opens}.  Two "
         f"opens means the stamps and the payload are on different handles, "
         f"which is the shape the h5py-then-SlabIO version had.")
-    # Every stamp the refusal list needs, and the uint8 provenance stamp,
-    # came through the scalar door.
+    # Every stamp the REFUSAL DECISION needs, and the uint8 provenance
+    # stamp, came through the scalar door.
     for name in ("schema_version", "band_stop", "kgrid",
-                 "reciprocal_lattice_cart", "wfn_fingerprint_utf8",
-                 "velocity_validation_max_abs"):
+                 "reciprocal_lattice_cart", "wfn_fingerprint_utf8"):
         assert name in small_reads, f"{name} was not read through read_small"
+    # The validation FLOATS are read only past the refusal check (see the
+    # docstring's 2026-08-23 update) -- this fixture refuses, so none of
+    # them were ever read at all.
+    assert "velocity_validation_max_abs" not in small_reads, (
+        "a validation float was read before the refusal check fired; a "
+        "velocity-only artifact does not have these datasets and this "
+        "read ordering is what makes loading one crash instead of refuse")
+
+
+def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
+    monkeypatch,
+):
+    """Red twin, audit finding 2026-08-23 (D2 schema-break hunt).
+
+    A ``--parallel-transport-velocity-only`` artifact
+    (``initialize_parallel_transport_artifact`` alone, never followed by
+    ``write_parallel_transport_artifact``) writes ``connection_complete``
+    and ``velocity_validation_{complete,passed}`` as ``0``, but NEVER
+    writes the ``velocity_validation_{atol,rtol,max_abs,...}`` float
+    datasets at all -- those are only written by
+    ``complete_velocity_validation``, at the end of the link/connection
+    stage this artifact class skips entirely.
+
+    Reproduced live against a real artifact through this exact loader
+    before this fix (``runs/Na/02_soc48b_qsgw_mpa/
+    09_dft_velocity_headgate_p16_20260823/veloc_build/
+    parallel_transport_velocity_only.h5``): the unconditional read of
+    those floats raised a bare ``KeyError: "...doesn't exist"`` instead
+    of the named ``ValueError`` this test now pins.  This fixture omits
+    those keys from ``raw`` entirely (a plain ``dict`` lookup, so a stray
+    read reproduces the same ``KeyError`` shape the real HDF5 backend
+    gave) to keep the red twin honest about WHY it would have failed.
+    """
+    from common import parallel_transport as pt_common
+    import file_io.slab_io as slab_io_mod
+    from file_io.parallel_transport import SCHEMA_VERSION
+
+    fingerprint = "b" * 64
+    raw = {
+        name: np.asarray(value, dtype=np.int32)
+        for name, value in {
+            "schema_version": SCHEMA_VERSION,
+            "connection_complete": 0,
+            "velocity_validation_complete": 0,
+            "velocity_validation_passed": 0,
+            "band_start": 0,
+            "band_stop": 8,
+            "effective_nspinor": 1,
+            "bispinor": 0,
+        }.items()
+    }
+    raw["kgrid"] = np.asarray([2, 2, 2], dtype=np.int32)
+    raw["reciprocal_lattice_cart"] = np.eye(3)
+    raw["wfn_fingerprint_utf8"] = np.frombuffer(
+        fingerprint.encode("ascii"), dtype=np.uint8
+    )
+    # Deliberately NO "velocity_validation_{atol,rtol,max_abs,...}" keys --
+    # exactly what a real velocity-only artifact never writes.
+
+    class _FakeSlabIO:
+        def __init__(self, path, *, mode="w", mesh=None):
+            assert mode == "r"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read_small(self, name, *, dtype=None):
+            value = raw[name]
+            return value if dtype is None else np.asarray(value, dtype=dtype)
+
+        def read_slab(self, name, *, shape=None, **kw):
+            raise AssertionError(
+                f"read_slab({name!r}) reached the payload path on a "
+                f"velocity-only artifact")
+
+    monkeypatch.setattr(slab_io_mod, "SlabIO", _FakeSlabIO)
+    monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
+
+    wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
+    meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
+    with pytest.raises(ValueError, match="connection_complete is not 1"):
+        load_parallel_transport_head(
+            "parallel_transport_velocity_only.h5", mesh=_mesh(), wfn=wfn,
+            meta=meta,
+        )
 
 
 def test_reduced_covector_conversion_uses_row_basis_convention():

@@ -430,11 +430,6 @@ def load_parallel_transport_head(
         )
         fingerprint = _ascii_stamp(
             io, path, "wfn_fingerprint_utf8")
-        validation = {
-            key: float(io.read_small(f"velocity_validation_{key}",
-                                     dtype=np.float64))
-            for key in validation_names
-        }
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -486,11 +481,36 @@ def load_parallel_transport_head(
         # this raises on every rank or on none — and each rank's ``__exit__``
         # then closes the collective handle, which is the ordering
         # ``SlabIO.close`` requires.
+        #
+        # ALSO before the ``velocity_validation_*`` float read, deliberately:
+        # those 11 datasets (``atol``, ``rtol``, ``max_abs``, ...) are only
+        # written by ``complete_velocity_validation``, at the END of
+        # ``write_parallel_transport_artifact`` — never by
+        # ``initialize_parallel_transport_artifact``.  A velocity-only
+        # artifact (D2, ``--parallel-transport-velocity-only``) therefore
+        # NEVER has them, only ``velocity_validation_complete/passed = 0``
+        # (its unconditional init-time stamp).  Reading them before this
+        # refusal check crashed with a bare ``KeyError: "...doesn't exist"``
+        # on exactly that artifact class instead of the named refusal above
+        # (audit finding, 2026-08-23: reproduced live against a real
+        # velocity-only artifact through this exact loader,
+        # ``runs/Na/02_soc48b_qsgw_mpa/09_dft_velocity_headgate_p16_20260823/
+        # veloc_build/parallel_transport_velocity_only.h5``) — the
+        # "links-requiring consumer reading a velocity-only artifact must
+        # refuse, not crash" contract this artifact-schema split exists to
+        # keep.  ``velocity_validation_complete != 1`` is already one of the
+        # ``refusals`` above, so by the time this line is reached the floats
+        # are guaranteed present.
         if refusals:
             raise ValueError(
                 f"{path}: refusing QSGW parallel-transport head:\n  - "
                 + "\n  - ".join(refusals)
             )
+        validation = {
+            key: float(io.read_small(f"velocity_validation_{key}",
+                                     dtype=np.float64))
+            for key in validation_names
+        }
 
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
