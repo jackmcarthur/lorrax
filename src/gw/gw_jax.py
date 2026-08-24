@@ -246,8 +246,9 @@ def main(argv=None):
 	if config.bispinor:
 		print0(
 			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}" +
-			(" (experimental no-pair full four-current static RPA, headless)"
-			 if config.bispinor_gw.value == "full_static_cohsex" else ""))
+				(" (experimental no-pair full four-current static RPA, "
+				 "coupled slab head/wings when head_correction=full)"
+				 if config.bispinor_gw.value == "full_static_cohsex" else ""))
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -514,7 +515,10 @@ def main(argv=None):
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
-					meta, mesh_xy, energy_reference=e_ref,
+					meta, mesh_xy,
+					sym=sym, wfn=wfn, config=config,
+					charge_response=oneshot_head_response,
+					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
 						config.backend.distrib_la_batched_route))
@@ -538,7 +542,8 @@ def main(argv=None):
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 
-	if oneshot_head_response is not None:
+	if (oneshot_head_response is not None
+			and config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX):
 		if mode.value == "mpa":
 			final_head = W_by_role.get("iteration_head")
 			if final_head is None:
@@ -591,7 +596,8 @@ def main(argv=None):
 	# are overwritten downstream (sig_sx ← sig_x, sig_c ← PPM-evaluated
 	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
-	if config.do_G0:
+	if (config.do_G0
+			and config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX):
 		# A screened SC+FULL map always builds/folds its own head.  Supplying
 		# and printing a direct DFT seed here would be false provenance even
 		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep

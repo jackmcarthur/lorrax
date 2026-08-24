@@ -491,6 +491,7 @@ def check_hermitian(
     print_fn: Callable[..., Any] = print,
     rtol: float = 1e-8,
     verbose: bool = False,
+    always: bool = False,
 ) -> bool:
     """Hermiticity residual on a ``(..., μ, μ)`` tile, at construction.
 
@@ -503,8 +504,12 @@ def check_hermitian(
 
     Residual is measured relative to the tile's own scale:
     ``max|A − Aᴴ| / max|A|``.
+
+    ``always=True`` performs the shared reduction even when ``LORRAX_SANITY``
+    is off; callers that make the boolean a hard stage invariant use this
+    instead of growing a second Hermiticity implementation.
     """
-    if not sanity_enabled():
+    if not (always or sanity_enabled()):
         return True
     if _is_jax(matrix):
         import jax
@@ -532,7 +537,8 @@ def check_hermitian(
         dev = float(np.max(np.abs(a - np.conj(np.swapaxes(a, -1, -2)))))
         scale = float(np.max(np.abs(a)))
     return report_hermitian_residual(
-        name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose)
+        name, dev, scale, print_fn=print_fn, rtol=rtol, verbose=verbose,
+        always=always)
 
 
 _NEGQ_STATS_CACHE: dict = {}
