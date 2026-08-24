@@ -393,9 +393,11 @@ jax.tree_util.register_dataclass(
 )
 
 
-def face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
+def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     """``{}`` under ``layout='legacy'``; ``{"layout": "face", "face_shape":
-    (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.
+    (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.  With a
+    distinct right endpoint, also returns ``right_face_shape`` when its
+    centroid extent differs.
 
     THE single source of truth for the layout/face_shape kwargs every
     layout-dispatching kernel factory in this codebase needs
@@ -410,10 +412,22 @@ def face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
     a second time (TASTE microservice rule: a routine used in 2+ places
     gets one owner).
     """
+    if wfns_right is None:
+        wfns_right = wfns
+    if wfns.layout != wfns_right.layout:
+        raise ValueError(
+            "face_kernel_kwargs: endpoint layouts differ: "
+            f"{wfns.layout!r} vs {wfns_right.layout!r}")
     if wfns.layout != "face":
         return {}
-    nk, s, mu, n = wfns.psi_mun.shape
-    return {"layout": "face", "face_shape": (nk, wfns.slices.nb_full, mu, s)}
+    nk, s, mu, _ = wfns.psi_mun.shape
+    nk_r, s_r, mu_r, _ = wfns_right.psi_mun.shape
+    left_shape = (nk, wfns.slices.nb_full, mu, s)
+    right_shape = (nk_r, wfns_right.slices.nb_full, mu_r, s_r)
+    result = {"layout": "face", "face_shape": left_shape}
+    if right_shape != left_shape:
+        result["right_face_shape"] = right_shape
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1516,7 +1530,7 @@ def rotate_wavefunctions(
 # ---------------------------------------------------------------------------
 
 def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
-           face_shape=None, face_project_fn=None):
+           face_shape=None, right_face_shape=None, face_project_fn=None):
     """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis.
 
     ``layout='legacy'`` (default): the exact body this function has always
@@ -1553,7 +1567,8 @@ def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
                 "(see common.contract_bands.contract_bands_block_reshard)")
         from common.contract_bands import contract_bands_block_reshard
         fn = contract_bands_block_reshard(
-            mesh_xy, layout='face', face_shape=face_shape)
+            mesh_xy, layout='face', face_shape=face_shape,
+            right_face_shape=right_face_shape)
     return fn(psi_xr, sigma_k, psi_yn)
 
 

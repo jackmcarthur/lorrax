@@ -194,6 +194,40 @@ def _face_kwargs(wfns) -> dict:
 
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
+_static_convolution_cache: dict[tuple[object, ...], object] = {}
+
+
+def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+                             nk_tot: int):
+    """Build the one flat-k convolution shared by every static Sigma block.
+
+    Scalar COHSEX and photon blocks differ only in their endpoint centroid
+    extents.  Those are the independently sharded trailing axes of the
+    canonical FFT specs, so the same convolution serves square and
+    rectangular operators without another FFT service or convention.
+    """
+    from ffi import ffi_dial_key
+    cache_key = (
+        id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(), int(nk_tot))
+    if cache_key in _static_convolution_cache:
+        return _static_convolution_cache[cache_key]
+
+    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+
+    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _G_fftn = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+    _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
+
+    @jax.jit
+    def _convolve(G_k, V_or_W, prefactor):
+        """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+        G_R = _G_ifftn(G_k)
+        V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
+        return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+
+    _static_convolution_cache[cache_key] = _convolve
+    return _convolve
 
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -240,19 +274,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-
-    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-    _G_fftn  = make_flat_k_fftn( mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
-    _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
-
-    @jax.jit
-    def _convolve(G_k, V_or_W, prefactor):
-        """Σ^k-space convolution Σ = pref · FFT[ G(R) · V(R) / √Nk ]."""
-        G_R = _G_ifftn(G_k)
-        V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
-        return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+    _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
 
     if layout == "legacy":
         kernels = _make_cohsex_kernels_legacy(_convolve, nk_tot)
@@ -509,6 +531,16 @@ def _replicate_head(head_kij, mesh_xy: Mesh):
         head_kij, NamedSharding(mesh_xy, P(None, None, None)))
 
 
+def _replicate_band_sigma(sigma_kij, mesh_xy: Mesh):
+    """Place an already distributed N_b-class Sigma at its output seam.
+
+    Static Sigma producers share this exact post-contraction transition.
+    The operand is ``(nk, nb, nb)``, never a centroid-class response body.
+    """
+    return jax.lax.with_sharding_constraint(
+        sigma_kij, NamedSharding(mesh_xy, P(None, None, None)))
+
+
 def _add_static_head(sig_sx, sig_coh, *, static_head_terms, meta, mesh_xy,
                      do_screened: bool):
     """Add the q→0 head correction to SX/COH (no-op if terms is None)."""
@@ -589,8 +621,6 @@ def compute_cohsex_sigma(
     sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
         mesh_xy, kgrid, nk_tot, **_face_kwargs(wfns))
 
-    rep = NamedSharding(mesh_xy, P(None, None, None))
-
     with mesh_xy:
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
         sig_coh = sigma_coh_k(wfns, W_q, V_q)
@@ -602,9 +632,9 @@ def compute_cohsex_sigma(
                 sig_sx, sig_coh,
                 static_head_terms=static_head_terms,
                 meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
-            sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
-            sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
-            sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
+            sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
+            sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
+            sig_h   = _replicate_band_sigma(sig_h, mesh_xy)
         else:
             # Face kernels return the FULL nb_full x nb_full matrix, still
             # 2-D sharded (_make_cohsex_kernels_face's docstring): gather
@@ -615,9 +645,9 @@ def compute_cohsex_sigma(
             # stylistic choice: adding an nb_sigma head to an nb_full
             # array would be a shape error.
             nb_sigma = wfns.slices.nb_sigma
-            sig_sx  = jax.lax.with_sharding_constraint(sig_sx,  rep)
-            sig_coh = jax.lax.with_sharding_constraint(sig_coh, rep)
-            sig_h   = jax.lax.with_sharding_constraint(sig_h,   rep)
+            sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
+            sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
+            sig_h   = _replicate_band_sigma(sig_h, mesh_xy)
             sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
             sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
             sig_h   = sig_h[:, :nb_sigma, :nb_sigma]
@@ -636,7 +666,7 @@ def compute_cohsex_sigma(
         if wfns.layout == "face":
             # Gather + window BEFORE the (nb_sigma-shaped) head — see the
             # same reasoning in the sig_sx/sig_coh block above.
-            sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+            sig_x = _replicate_band_sigma(sig_x, mesh_xy)
             sig_x = sig_x[:, : wfns.slices.nb_sigma, : wfns.slices.nb_sigma]
         if static_head_terms is not None:
             x_head, _ = static_head_terms_to_kij(
@@ -645,7 +675,7 @@ def compute_cohsex_sigma(
             # roundoff-divergence risk and hidden-assert cost as the SX/COH
             # heads; see _replicate_head.
             sig_x = sig_x + _replicate_head(x_head, mesh_xy)
-        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
         # Bispinor bare exchange: add Σ^B (transverse-only sum over
@@ -718,13 +748,11 @@ def compute_v_h_sigma_x(
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
-    rep = NamedSharding(mesh_xy, P(None, None, None))
-
     with mesh_xy:
         sig_h = hartree_k(wfns, Gij, V_q)
         sig_x = sigma_sx_k(wfns, Gij, V_q)
-        sig_h = jax.lax.with_sharding_constraint(sig_h, rep)
-        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_h = _replicate_band_sigma(sig_h, mesh_xy)
+        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         if wfns.layout == "face":
             # Full nb_full x nb_full -> nb_sigma window, legal now that
             # both are replicated — see compute_cohsex_sigma's identical
@@ -742,7 +770,7 @@ def compute_v_h_sigma_x(
         # divergence risk and hidden-assert cost as the SX/COH heads; see
         # _replicate_head.  This is the X_ONLY/PPM production entry.
         sig_x = sig_x + _replicate_head(x_head, mesh_xy)
-        sig_x = jax.lax.with_sharding_constraint(sig_x, rep)
+        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
     if wfns_transverse is not None and bispinor_v_q_path is not None:
@@ -766,4 +794,3 @@ def compute_v_h_sigma_x(
         "sig_h":   sig_h,
         "sig_x":   sig_x,
     }
-

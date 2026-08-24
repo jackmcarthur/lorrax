@@ -285,6 +285,32 @@ class ComputeMode(str, enum.Enum):
         }.get(self)
 
 
+class BispinorGWMode(str, enum.Enum):
+    """How the four-current photon channels enter the GW self-energy.
+
+    This is orthogonal to :class:`ComputeMode`: that enum selects the
+    frequency ansatz, while this one selects which Lorentz blocks are screened
+    and contracted.  ``bare_transverse`` is the historical charge-screened +
+    bare-TT behavior and remains the default.
+    """
+
+    BARE_TRANSVERSE = "bare_transverse"
+    FULL_STATIC_COHSEX = "full_static_cohsex"
+
+
+def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
+    if isinstance(value, BispinorGWMode):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return BispinorGWMode(str(raw).strip().lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"bispinor_gw={raw!r} is not a known mode; expected one of: "
+            f"{', '.join(v.value for v in BispinorGWMode)}."
+        ) from exc
+
+
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
 #: replaces each.  ``compute_mode`` / ``qp_solver`` are the load-bearing axes
 #: (see :meth:`LorraxConfig.compute_mode` / :meth:`LorraxConfig.qp_solver`);
@@ -1541,6 +1567,9 @@ _DEFAULTS = {
     "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
+    # Orthogonal four-current screening policy.  The historical
+    # charge-screened + bare-transverse exchange path remains the default.
+    "bispinor_gw": "bare_transverse",
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
     # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the shipped
@@ -2253,6 +2282,7 @@ _LEGACY_DECK_KEYS = frozenset({
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
     "compute_mode",
+    "bispinor_gw",
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
@@ -3393,6 +3423,64 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
+def refuse_unsupported_bispinor_gw(config) -> None:
+    """Validate the deliberately narrow first full-photon calculation.
+
+    The default ``bare_transverse`` returns before resolving any unrelated
+    axis.  The first enabled extension is a headless, one-shot insulating
+    full-BZ static COHSEX calculation through the distributed Dyson service.
+    Every wider claim is named and refused before a photon body is allocated.
+    """
+    mode = coerce_bispinor_gw_mode(
+        getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if mode is BispinorGWMode.BARE_TRANSVERSE:
+        return
+    if not bool(config.bispinor):
+        raise ValueError(
+            f"GATE bispinor_gw_requires_bispinor: bispinor_gw = "
+            f"{mode.value} requires bispinor = true.  This axis selects "
+            "four-current screening; it does not turn four-spinor "
+            "wavefunctions on implicitly.")
+    requirements = (
+        (config.compute_mode is ComputeMode.COHSEX,
+         f"compute_mode = {config.compute_mode.value}",
+         "compute_mode = cohsex"),
+        (config.screening.diagrams is ScreeningDiagrams.W_RPA,
+         f"screening_diagrams = {config.screening.diagrams.value}",
+         "screening_diagrams = w_rpa"),
+        (config.head.correction is HeadCorrection.OFF,
+         f"head_correction = {config.head.correction.value}",
+         "head_correction = off"),
+        (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+         f"qp_solver = {config.qp_solver.value}",
+         "qp_solver = one_shot_dft"),
+        (str(config.mpa.material_class).strip().lower() == "insulator",
+         f"mpa_material_class = {config.mpa.material_class}",
+         "mpa_material_class = insulator"),
+        (not bool(config.restart), "restart = true", "restart = false"),
+        (str(config.backend.w_dyson_solver) == "distributed",
+         f"w_dyson_solver = {config.backend.w_dyson_solver}",
+         "w_dyson_solver = distributed"),
+        (not bool(config.head.bispinor_tt_head_correction),
+         "bispinor_tt_head_correction = true",
+         "bispinor_tt_head_correction = false"),
+    )
+    for accepted, got, want in requirements:
+        if accepted:
+            continue
+        raise ValueError(
+            "GATE full_static_bispinor_envelope: "
+            f"bispinor_gw = full_static_cohsex is refused with {got}.\n"
+            f"  got:  {got}\n"
+            f"  want: {want}\n"
+            "  why:  the first full-photon mode is an explicitly "
+            "experimental, headless, full-BZ, one-shot insulating static "
+            "calculation.  Photon restart storage, coupled q->0 heads, "
+            "self-consistency, and dynamic photon models have separate "
+            "contracts and are not silently approximated here.\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+
+
 def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
     """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
 
@@ -4330,6 +4418,7 @@ class LorraxConfig:
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
     bispinor: bool
+    bispinor_gw: BispinorGWMode
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
@@ -5186,6 +5275,7 @@ class LorraxConfig:
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
+            bispinor_gw=coerce_bispinor_gw_mode(_g("bispinor_gw")),
             # Compatibility mirror only.  Every new head decision reads the
             # enum above; keeping this resolved bool prevents old consumers
             # from disagreeing with ``head_correction = off``.
@@ -5218,6 +5308,7 @@ class LorraxConfig:
         # returns from this call before either property is touched.
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
+        refuse_unsupported_bispinor_gw(resolved)
         # Same position/reason as the two calls above: low_mem_bands=false
         # (the default) returns before any predicate is touched, so this
         # adds no new resolution to a default deck.  See
