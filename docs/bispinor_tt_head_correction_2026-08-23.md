@@ -241,7 +241,7 @@ test_bispinor_tt_head_correction.py`, 14/14 PASS):
 
 **Scope of this verification, stated honestly.** All of the above is
 host-side numpy/jax algebra with NO SlabIO/HDF5 write path — this
-worktree currently has no built `liblorrax_ffi.so` (see
+worktree started this session with no built `liblorrax_ffi.so` (see
 `KNOWN_SANDBOX_ERRORS.md`'s 2026-08-23 row), which blocked re-running the
 EXISTING `tests/test_compute_V_q_bispinor_g_flat.py` end-to-end HDF5
 round-trip regression (unmodified by this session) to directly confirm
@@ -249,8 +249,19 @@ the default-off path is still byte-identical all the way through the
 on-disk tile write. The parity check above (item 1) gives strong indirect
 evidence — it is the SAME function `_ref_tile_V` in that test calls, with
 the SAME default arguments — but it is not a substitute for actually
-running that file. This also blocks a real Σ^B GPU leg (Stage 3) until an
-FFI is available.
+running that file.
+
+A follow-up attempt (after the commit below) built a genuine
+`liblorrax_ffi_host.so` from THIS exact commit
+(`src/ffi/cpp/build_host.sh` under `lx run --cpu`, the bare Milan
+partition with working Cray PE modules) and got 4/6 tests in that file to
+run; the 2 SlabIO-writing tests still refuse, on an MPICH SONAME mismatch
+between the `--cpu`-partition build and the `-G 0` (jax-having) container's
+own bundled MPICH — a different, more precisely diagnosed instance of the
+same class of environment gap, not resolved. See the KNOWN_SANDBOX_ERRORS
+row for the exact libraries and the reusable `.so` path. This also blocks
+a real Σ^B GPU leg (Stage 3) until a CUDA FFI is available, which the host
+build does not provide regardless.
 
 ## Landing order this note follows (subset of the two guides' own §)
 
