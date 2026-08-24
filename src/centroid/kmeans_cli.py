@@ -168,9 +168,11 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 # switch owns all of them; the concise production report uses rank0_print.
 print0 = debug_print
 
+import gc
 import os
 import time
 
+import jax
 import numpy as np
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -201,6 +203,44 @@ from .production_output import (
 # Reachable through the one service-path bootstrap above; gated by
 # tests/test_service_path_bootstrap.py.
 import symmetry_maps                                            # noqa: E402
+
+
+def _release_lloyd_before_prune(*arrays) -> None:
+    """Synchronize and release completed Lloyd state before WFN pruning."""
+    def _bytes_in_use():
+        used_values = []
+        for device in jax.local_devices():
+            stats = device.memory_stats() or {}
+            used = stats.get("bytes_in_use")
+            if used is not None:
+                used_values.append(int(used))
+        return max(used_values) if used_values else None
+
+    before = _bytes_in_use()
+    unique_arrays = []
+    seen = set()
+    for array in arrays:
+        if isinstance(array, jax.Array) and id(array) not in seen:
+            jax.block_until_ready(array)
+            unique_arrays.append(array)
+            seen.add(id(array))
+    for array in unique_arrays:
+        if not array.is_deleted():
+            array.delete()
+    del unique_arrays
+    jax.clear_caches()
+    gc.collect()
+    after = _bytes_in_use()
+    memory_note = ""
+    if before is not None and after is not None:
+        memory_note = (
+            f"; device bytes-in-use {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
+    print0(
+        "Released completed Lloyd/preparation device state before prune "
+        f"WFN transfer{memory_note}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -563,7 +603,7 @@ def main():
         kmeans_target = M_cand
 
     with timing.section("kmeans"):
-        _, centroids, _, _ = weighted_kmeans_jax(
+        labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
             avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
@@ -580,6 +620,13 @@ def main():
     pruned = False
     prune_rank = None
     if oversample > 1.0 and n_unique > N_c:
+        release_arrays = [labels, centroids, weight, kmeans_weight]
+        if not args.plot:
+            release_arrays.append(charge_density)
+        _release_lloyd_before_prune(*release_arrays)
+        del release_arrays, labels, centroids, weight, kmeans_weight
+        if not args.plot:
+            del charge_density
         (centroid_indices, n_unique, rank, n_orbit_keep,
          _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
