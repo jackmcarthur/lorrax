@@ -127,6 +127,7 @@ class PhotonBasisLayout:
 _zero_cache: dict = {}
 _insert_cache: dict = {}
 _view_cache: dict = {}
+_vector_pack_cache: dict = {}
 _q0_update_cache: dict = {}
 
 
@@ -268,6 +269,106 @@ def photon_block_view(
             scalar(layout.local_offset(B)))
 
 
+def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
+    """One local graph for embedding four channel vectors in packed space."""
+    padded = tuple(int(n) for n in layout.padded_extents)
+    key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
+    if key in _vector_pack_cache:
+        return _vector_pack_cache[key]
+    from common.shard_map import shard_map
+
+    side = layout.mesh_side
+    vector_spec = P(None, axis_name)
+    packed_spec = P(None, None, axis_name)
+    logical_spec = P()
+    vector_sharding = NamedSharding(mesh_xy, vector_spec)
+    packed_sharding = NamedSharding(mesh_xy, packed_spec)
+    logical_sharding = NamedSharding(mesh_xy, logical_spec)
+    local_extents = tuple(n // side for n in padded)
+    local_packed = sum(local_extents)
+
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(vector_spec, vector_spec, vector_spec, vector_spec,
+                       logical_spec),
+             out_specs=packed_spec, check_vma=False)
+    def pack_local(v0, v1, v2, v3, logical_extents):
+        shard = jax.lax.axis_index(axis_name)
+        out = jnp.zeros(
+            (int(nq), N_LORENTZ, local_packed), dtype=v0.dtype)
+        offset = 0
+        for channel, (vector, n_local) in enumerate(
+                zip((v0, v1, v2, v3), local_extents)):
+            valid = (
+                shard * n_local + jnp.arange(n_local)
+                < logical_extents[channel])
+            vector = jnp.where(valid[None, :], vector, 0)
+            out = jax.lax.dynamic_update_slice(
+                out, vector[:, None, :], (0, channel, offset))
+            offset += n_local
+        return out
+
+    @partial(jax.jit,
+             in_shardings=(vector_sharding,) * N_LORENTZ
+                          + (logical_sharding,),
+             out_shardings=packed_sharding)
+    def pack(v0, v1, v2, v3, logical_extents):
+        return pack_local(v0, v1, v2, v3, logical_extents)
+
+    _vector_pack_cache[key] = pack
+    return pack
+
+
+def pack_photon_channel_vectors(
+    vectors_by_channel: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    layout: PhotonBasisLayout,
+    mesh_xy: Mesh,
+    *,
+    axis_name: str,
+) -> jax.Array:
+    """Embed four native channel vectors in the packed photon basis.
+
+    Input channel ``A`` has shape ``(nq, layout.padded_extent(A))`` and is
+    already sharded ``P(None, axis_name)``.  The result has shape
+    ``(nq, 4, layout.packed_extent)`` with sharding
+    ``P(None, None, axis_name)``; row ``A`` contains the input only in the
+    packed ``A`` segment.  Internal channel padding is zeroed here, where the
+    mesh-interleaved ordering is owned.  No conjugation or prefactor is
+    implicit.
+    """
+    layout.assert_mesh(mesh_xy)
+    if axis_name not in ('x', 'y'):
+        raise ValueError(
+            f"packed photon-vector axis must be 'x' or 'y'; got {axis_name!r}")
+    if len(vectors_by_channel) != N_LORENTZ:
+        raise ValueError(
+            f"packed photon vectors require four channels; got "
+            f"{len(vectors_by_channel)}")
+
+    nq = int(vectors_by_channel[0].shape[0])
+    dtype = np.dtype(vectors_by_channel[0].dtype)
+    wanted = NamedSharding(mesh_xy, P(None, axis_name))
+    for channel, vector in enumerate(vectors_by_channel):
+        expected = (nq, layout.padded_extent(channel))
+        if tuple(vector.shape) != expected:
+            raise ValueError(
+                f"photon channel {channel} vector shape {vector.shape} != "
+                f"{expected}")
+        if np.dtype(vector.dtype) != dtype:
+            raise TypeError(
+                "all packed photon vectors must have one dtype; got "
+                f"{dtype} and {vector.dtype} for channel {channel}")
+        sharding = getattr(vector, 'sharding', None)
+        if sharding is None or not sharding.is_equivalent_to(wanted, 2):
+            raise ValueError(
+                f"photon channel {channel} vector must already have sharding "
+                f"P(None, {axis_name!r}); got {sharding}")
+
+    logical = jnp.asarray(layout.logical_extents, dtype=jnp.int32)
+    return _vector_pack_program(
+        layout, mesh_xy, nq, dtype, axis_name)(
+            *vectors_by_channel, logical)
+
+
 def _q0_update_program(layout, mesh_xy, nq, dtype):
     """One shape-stable local graph for all bounded q=0 updates."""
     key = (id(mesh_xy), layout, int(nq), np.dtype(dtype).str)
@@ -400,5 +501,5 @@ def add_photon_q0_low_rank(
 __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
-    "add_photon_q0_low_rank",
+    "pack_photon_channel_vectors", "add_photon_q0_low_rank",
 ]
