@@ -115,7 +115,11 @@ def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
     if fn is not None:
         return fn
 
-    @partial(jax.jit, donate_argnums=(2, 3),
+    # Only the accumulator can alias the result.  ``psi_bc`` is a streamed
+    # read-only source and cannot back an output with Q's different shape;
+    # advertising it as donated merely asks XLA for an impossible alias and
+    # emits one warning per band chunk.
+    @partial(jax.jit, donate_argnums=(3,),
              in_shardings=(rep_, rep_, psi_layout_, sharding_q_),
              out_shardings=sharding_q_)
     def _accum(UH_bc, inv_s, psi_bc, Q_in):
