@@ -34,7 +34,7 @@ from common.gamma_matrices import (
     gamma_double_contract,
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
-from common.wfn_transforms import to_rchunk_inner
+from common.wfn_transforms import _take_rchunk_padded, to_rchunk_inner
 # Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
 # same as everything else this module imports -- no ``gw`` dependency.
@@ -1635,8 +1635,13 @@ def _z_q_face(
 				# unmodified, per the task's r-scatter-untouched
 				# requirement.
 				if use_psi_r_cache:
-					psi_Y_bc_local_full_r = jax.lax.dynamic_slice_in_dim(
-						psi_r_cache_[bc_idx], r_start_, n_zchunk, axis=3)
+					# A mesh-padded final carrier may extend a few cells past
+					# the physical FFT grid.  ``dynamic_slice`` would clamp its
+					# start backward and silently substitute earlier cells;
+					# the canonical padded take keeps the requested logical
+					# cells and zero-fills only the inert carrier tail.
+					psi_Y_bc_local_full_r = _take_rchunk_padded(
+						psi_r_cache_[bc_idx], r_start_, n_zchunk)
 				else:
 					psi_G_bc_local = _io_callback(
 						_slicer_host, _slicer_out_sds,
