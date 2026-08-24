@@ -3444,9 +3444,10 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate the deliberately narrow first full-photon calculation.
 
     The default ``bare_transverse`` returns before resolving any unrelated
-    axis.  The first enabled extension is a headless, one-shot insulating
-    full-BZ static COHSEX calculation through the distributed Dyson service.
-    Every wider claim is named and refused before a photon body is allocated.
+    axis.  The enabled extension is a one-shot insulating full-BZ static
+    COHSEX calculation through the distributed Dyson service.  Its q=0
+    completion is either explicitly off or the coupled slab head/wings path;
+    every wider claim is named and refused before a photon body is allocated.
     """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
@@ -3465,9 +3466,13 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
-        (config.head.correction is HeadCorrection.OFF,
+        (config.head.correction in (HeadCorrection.OFF, HeadCorrection.FULL),
          f"head_correction = {config.head.correction.value}",
-         "head_correction = off"),
+         "head_correction in {off, full}"),
+        (config.head.correction is HeadCorrection.OFF or int(config.sys_dim) == 2,
+         (f"head_correction = {config.head.correction.value}, "
+          f"sys_dim = {config.sys_dim}"),
+         "head_correction = off, or head_correction = full with sys_dim = 2"),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
@@ -3475,6 +3480,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
+        (bool(config.memory.low_mem_bands), "low_mem_bands = false",
+         "low_mem_bands = true"),
         (str(config.backend.w_dyson_solver) == "distributed",
          f"w_dyson_solver = {config.backend.w_dyson_solver}",
          "w_dyson_solver = distributed"),
@@ -3491,10 +3498,11 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"  got:  {got}\n"
             f"  want: {want}\n"
             "  why:  the first full-photon mode is an explicitly "
-            "experimental, headless, full-BZ, one-shot insulating static "
-            "calculation.  Photon restart storage, coupled q->0 heads, "
-            "self-consistency, and dynamic photon models have separate "
-            "contracts and are not silently approximated here.\n"
+            "experimental, full-BZ, one-shot insulating static calculation. "
+            "Its only completed singular-cell policy is the coupled slab "
+            "head/wings path.  Photon restart storage, bulk coupled heads, "
+            "self-consistency, and dynamic photon models are not silently "
+            "approximated here.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
