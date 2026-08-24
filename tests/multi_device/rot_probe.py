@@ -9,7 +9,7 @@ RUNTIME = initialize_communicator_stack()
 import numpy as np, jax, jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import resolve_mesh, process_rank
-from common.mtxel_sweep import band_sphere_spec
+from common.wfn_layout import band_sphere_spec
 from gw.qsgw_density import rotate_bands, band_rotation_spec
 
 NK = int(os.environ.get("RP_NK", "16")); NB = int(os.environ.get("RP_NB", "640"))

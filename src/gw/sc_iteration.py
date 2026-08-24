@@ -906,7 +906,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     if requested == "native":
         return "native"
 
-    from common.mtxel_sweep import band_sphere_spec
+    from common.wfn_layout import band_sphere_spec
     from runtime.padding import spec_divisor, round_up
 
     ndev = int(mesh_xy.size)
@@ -1535,7 +1535,7 @@ def _dft_psi_sphere(inputs):
     reconstruct one from an extent.
     """
     from jax.sharding import NamedSharding as _NS
-    from common.mtxel_sweep import band_sphere_spec
+    from common.wfn_layout import band_sphere_spec
 
     b_lo, b_hi = inputs.band_slices.sigma_range
     nb_sigma = int(inputs.kin_ion_dft.shape[1])

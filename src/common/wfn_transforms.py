@@ -1312,7 +1312,8 @@ def accumulate_rchunk_to_gflat(
     n_q       = int(rchunk.shape[0])
     n_rmu_pad = int(rchunk.shape[1])
     r_len_i   = int(rchunk.shape[-1])
-    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+    mu_gflat_spec = P(None, ('x', 'y'), None)
+    p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)
     if n_rmu_pad % p_prod != 0:
         raise ValueError(
             f"accumulate_rchunk_to_gflat: n_rmu_padded={n_rmu_pad} not "
@@ -1382,8 +1383,7 @@ def accumulate_rchunk_to_gflat(
         # Sharding: μ is the only sharded axis on both rchunk and
         # gflat_acc.  P(None, ('x','y'), None) is enforced by the
         # caller; the shard_map below sees per-rank slabs.
-        in_spec  = P(None, ('x', 'y'), None)
-        out_spec = P(None, ('x', 'y'), None)
+        in_spec = out_spec = mu_gflat_spec
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(in_spec, in_spec, P()),
@@ -2128,8 +2128,10 @@ def load_centroids_band_chunked(
     # is the same conservative XLA scratch multiplier used historically
     # by the old k_chunk_size autodetect (4 on single-rank, 9 on
     # multi-rank — covers the IFFT scratch + IFFT output).
-    n_devices = jax.device_count()
-    peak_copies = 4 if n_devices == 1 else 9
+    sharding_load = band_sphere_spec()
+    p_band = spec_divisor(mesh_xy, sharding_load, axis=1)
+    mesh_devices = int(mesh_xy.size)
+    peak_copies = 4 if mesh_devices == 1 else 9
     gpu_mem_bytes = 36e9
     if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
         gpu_mem_bytes = meta.memory_per_device_gb * 1e9
@@ -2145,19 +2147,17 @@ def load_centroids_band_chunked(
     # centroid extent loaded here must equal the meta extent the ζ-fit
     # kernels were shaped with.
     n_rmu_padded = padded_mu_extent(n_rmu, mesh_xy)
-    sharding_load = band_sphere_spec()
-
     loader = wfn  # reuse top-level WfnLoader
     # Persistent term for the bulk WFN transfer.  gflat_to_rmu keeps the
     # sharded G-flat input while building two differently sharded centroid
     # outputs.  The old planner gave its FFT scan the ENTIRE device budget,
     # so these arrays overlapped an independently full-budget scan transient.
-    nb_per_device = (nb_total + n_devices - 1) // n_devices
-    nb_padded_global = nb_per_device * n_devices
+    nb_padded_global = round_up(nb_total, p_band)
+    nb_per_band_shard = nb_padded_global // p_band
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
     gflat_local_bytes = (
-        nk_tot * nb_per_device * nspinor * int(loader.ngkmax) * 16
+        nk_tot * nb_per_band_shard * nspinor * int(loader.ngkmax) * 16
     )
     output_local_bytes = (
         nk_tot * nb_padded_global * nspinor * 16
@@ -2198,8 +2198,7 @@ def load_centroids_band_chunked(
         scan_budget_bytes // (nspinor * n_rtot * 16 * peak_copies)
     ))
     if k_chunk_size is not None and k_chunk_size > 0:
-        n_bands_per_rank = max(
-            1, (nb_total + n_devices - 1) // n_devices)
+        n_bands_per_rank = max(1, nb_per_band_shard)
         cs_hint = int(k_chunk_size) * min(
             int(band_chunk_size), n_bands_per_rank)
         cs = max(1, min(cs_hint, cs_budget))
