@@ -139,8 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Which scalar field to use as the kmeans weight. "
                         "'scalar' (default) is the standard charge density "
                         "ρ(r), the right weight for charge-channel ISDF "
-                        "(γ̃^0).  'current' is the squared Gordon-decomposed "
-                        "Pauli current Σ_{n,k,i}(j^Gordon_{n,k,i})², the "
+                        "(γ̃^0).  'current' is the squared Dirac current "
+                        "Σ_{n,k,i}|Ψ†α_iΨ/α_fs|² (exactly the Gordon current "
+                        "for LORRAX's kinetic-balance lift), the "
                         "right weight for the i-channel ISDF (γ̃^{1,2,3}) "
                         "in the bispinor pipeline.  Output files are "
                         "written with distinguishing suffixes ('' / "
@@ -282,8 +283,8 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     if args.centroid_weight != "band_range":
         return charge_density, (
             "scalar charge density ρ(r)" if args.density_mode == "scalar"
-            else "Gordon-decomposed Pauli current "
-                 "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
+            else "direct Dirac current "
+                 "Σ_{n,k,i}|Ψ†α_iΨ/α_fs|²")
 
     if args.density_mode != "scalar":
         raise ValueError(
