@@ -196,11 +196,16 @@ def _twin_body() -> dict:
         Q_ref += inv_s * (UH @ psi.reshape(nk * w, ns * n_rtot))
     q_layout_ok = (Q.sharding.spec == sharding_q.spec)
 
-    # Force the production fold through several bounded r tiles on this tiny
-    # fixture; its ordinary 512-MiB ceiling would intentionally use one tile.
-    ht._FOLD_Q_TILE_BYTES = 512
-    fold = ht._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
-    G = fold(Q, G)
+    # Force the production fold through several bounded r tiles, including a
+    # one-column tail, on this tiny fixture.  Restore the process-global knob
+    # so another in-process caller cannot inherit the test ceiling.
+    old_fold_tile_bytes = ht._FOLD_Q_TILE_BYTES
+    try:
+        ht._FOLD_Q_TILE_BYTES = 768
+        fold = ht._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
+        G = fold(Q, G)
+    finally:
+        ht._FOLD_Q_TILE_BYTES = old_fold_tile_bytes
     G_ref = Q_ref @ Q_ref.conj().T
 
     g = np.asarray(jax.device_get(G))
