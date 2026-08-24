@@ -236,8 +236,18 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
                              eigh_backend: str = "auto",
-                             rank_multiplier: float = 0.0):
-    """Htransform policy adapter for :func:`isdf.galerkin.fit_galerkin_basis`."""
+                             rank_multiplier: float = 0.0,
+                             basis_file: str | None = None):
+    """Resolve htransform policy around the reusable Galerkin fit service.
+
+    A nonempty ``basis_file`` is a restart artifact: reuse it only after the
+    format service validates the WFN, band window, grids, spinor mode, fit
+    controls and exact centroid table.  If absent, fit once and publish the
+    gauge-coupled basis through SlabIO.  Htransform owns only this path/key
+    policy; the fit and file format remain reusable services.
+    """
+    if log_fn is None:
+        log_fn = lambda *args, **kwargs: None
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
     if rank_multiplier > 0.0 and return_full_proj:
         raise ValueError(
@@ -247,6 +257,41 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             "full-r projector; pretending they share one alpha gauge would "
             "give the refit wrong wavefunctions. Use vq-mode=interp/ongrid "
             "or htransform_rank_multiplier=0 for refit.")
+    extra_rank_pad = resolve_extra_rank_pad()
+    basis_path = None
+    stamp = None
+    if basis_file is not None and os.fspath(basis_file).strip():
+        from file_io.galerkin_basis import (
+            GalerkinBasisStamp,
+            read_galerkin_basis,
+            write_galerkin_basis,
+        )
+        basis_path = os.fspath(basis_file)
+        stamp = GalerkinBasisStamp.from_runtime(
+            wfn=wfn,
+            meta=meta,
+            centroid_indices=centroid_indices,
+            band_range=band_range,
+            bispinor=bispinor,
+            rtol=rtol,
+            rank_multiplier=rank_multiplier,
+        )
+        if os.path.isfile(basis_path):
+            log_fn(f"  [galerkin-restart] reading {basis_path}")
+            basis = read_galerkin_basis(
+                basis_path,
+                mesh_xy=mesh_xy,
+                expected=stamp,
+                require_projector=return_full_proj,
+                extra_rank_pad=extra_rank_pad,
+            )
+            log_fn(
+                f"  [galerkin-restart] reused physical rank "
+                f"{basis.rank_physical} in carried extent "
+                f"{basis.rank_carrier}")
+            return basis.as_legacy_tuple(
+                mesh_xy, include_projector=return_full_proj)
+
     from common.gpu_utils import _get_jax_gpu_memory_bytes
     device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
     basis = fit_galerkin_basis(
@@ -261,10 +306,17 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_pool_limit,
         rank_policy_mode=resolve_rank_policy_mode(),
-        extra_rank_pad=resolve_extra_rank_pad(),
+        extra_rank_pad=extra_rank_pad,
     )
+    if basis_path is not None:
+        write_galerkin_basis(
+            basis_path, basis, stamp, mesh_xy=mesh_xy)
+        log_fn(
+            f"  [galerkin-restart] wrote physical rank "
+            f"{basis.rank_physical} to {basis_path}")
     return basis.as_legacy_tuple(
         mesh_xy, include_projector=return_full_proj)
+
 
 def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
                             a_band_index: int | None = None) -> tuple[float, float, float]:
@@ -876,6 +928,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
+    _basis_file_raw = str(params.get("galerkin_basis_file", "") or "").strip()
+    basis_file = _resolve(_basis_file_raw) if _basis_file_raw else None
     with mesh_xy:
         out = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
@@ -893,6 +947,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # parsed, defaulted, stored and read by nobody on this driver.
             eigh_backend=resolve_eigh_backend(params),
             rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
+            basis_file=basis_file,
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
