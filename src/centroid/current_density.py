@@ -14,11 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.bispinor_init import HALFALPHA
+from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
-
-
-_ALPHA_FS = 2.0 * HALFALPHA
 
 
 @jax.jit
@@ -45,7 +42,7 @@ def _dirac_current_weight(psi_r, band_mask=None):
         # as eager JAX slices at module import.
         perm, phase = gamma_perm_phase(mu)
         alpha_psi = gamma_apply(psi_r, perm, phase, axis=2)
-        current = (jnp.sum(psi_dag * alpha_psi, axis=2).real / _ALPHA_FS)
+        current = (jnp.sum(psi_dag * alpha_psi, axis=2).real / ALPHA_FS)
         out = out + jnp.sum(current * current * mask, axis=(0, 1))
     return out
 
