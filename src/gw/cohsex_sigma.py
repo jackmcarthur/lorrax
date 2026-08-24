@@ -720,8 +720,9 @@ def compute_v_h_sigma_x(
     wfns_transverse=None,
     bispinor_v_q_path=None,
     occupation_state=None,
+    compute_bare_x: bool = True,
 ) -> dict:
-    """Two-kernel V-only path: ``sig_h`` (Hartree) + ``sig_x`` (bare exchange).
+    """V-only Hartree plus optional bare-exchange path.
 
     Skips the screened SX/COH kernels entirely — used by callers that
     don't need them (X_ONLY mode, and PPM modes via the dispatcher,
@@ -741,6 +742,13 @@ def compute_v_h_sigma_x(
     branch — Σ^B is added to ``sig_x`` when both ``wfns_transverse``
     and ``bispinor_v_q_path`` are supplied.
 
+    ``compute_bare_x=False`` retains this function as the canonical Hartree
+    owner while returning an exact-zero ``sig_x`` placeholder.  No exchange
+    kernel or bispinor V file is touched.  The packed full-photon path uses
+    that seam because its one block loop evaluates X from the same packed V
+    that enters COH; computing the historical scalar+TT X here and discarding
+    it would be both wasteful and a second V source.
+
     ``occupation_state`` carries the same contract as in
     :func:`compute_cohsex_sigma`: ``None`` is insulating and bit-exact,
     a state puts ``diag(f)`` into Σ_X and V_H.
@@ -750,20 +758,25 @@ def compute_v_h_sigma_x(
         mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
     with mesh_xy:
         sig_h = hartree_k(wfns, Gij, V_q)
-        sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_h = _replicate_band_sigma(sig_h, mesh_xy)
-        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         if wfns.layout == "face":
             # Full nb_full x nb_full -> nb_sigma window, legal now that
             # both are replicated — see compute_cohsex_sigma's identical
             # reasoning.
             nb_sigma = wfns.slices.nb_sigma
             sig_h = sig_h[:, :nb_sigma, :nb_sigma]
-            sig_x = sig_x[:, :nb_sigma, :nb_sigma]
         sig_h.block_until_ready()
-        sig_x.block_until_ready()
 
-    if static_head_terms is not None:
+        if compute_bare_x:
+            sig_x = sigma_sx_k(wfns, Gij, V_q)
+            sig_x = _replicate_band_sigma(sig_x, mesh_xy)
+            if wfns.layout == "face":
+                sig_x = sig_x[:, :nb_sigma, :nb_sigma]
+            sig_x.block_until_ready()
+        else:
+            sig_x = jnp.zeros_like(sig_h)
+
+    if compute_bare_x and static_head_terms is not None:
         x_head, _ = static_head_terms_to_kij(
             static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
         # Broadcast + process-local replication — same per-rank roundoff-
@@ -773,7 +786,8 @@ def compute_v_h_sigma_x(
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x.block_until_ready()
 
-    if wfns_transverse is not None and bispinor_v_q_path is not None:
+    if (compute_bare_x and wfns_transverse is not None
+            and bispinor_v_q_path is not None):
         # face-layout defensive backstop REMOVED 2026-08-23 — see
         # compute_cohsex_sigma's identical removal, same session/reason.
         from .sigma_x_bispinor import compute_sigma_x_bispinor
