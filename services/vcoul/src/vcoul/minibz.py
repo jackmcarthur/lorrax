@@ -94,6 +94,7 @@ __all__ = [
     "minibz_average",
     "minibz_moment_tensor",
     "minibz_transverse_head_avg",
+    "iter_minibz_photon_samples",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
 ]
@@ -195,6 +196,75 @@ def wrap_points_to_voronoi(randcart, bvec, nmax: int = 1):
     return wrapped
 
 
+def _iter_minibz_voronoi_batches(
+    bvec, kgrid, *,
+    nsamples: int = 2**18,
+    method: str = "sobol",
+    qmc_reps: int = 10,
+    nmax: int = 1,
+    is_2d: bool = False,
+    seed_offset: int = 0,
+):
+    """Yield mini-BZ Voronoi draws one replicate at a time.
+
+    This is the sole implementation of the draw.  The public list-returning
+    :func:`minibz_voronoi_batches` and the streamed photon-kernel provider both
+    consume it, so streaming cannot acquire a second seed, geometry, or
+    Sobol-demotion policy.
+
+    See :func:`minibz_voronoi_batches` for the public contract.
+    """
+    bvec_np = np.asarray(bvec, dtype=np.float64)
+    bvec = jnp.asarray(bvec, dtype=jnp.float64)
+    nkx, nky, nkz = (int(s) for s in kgrid)
+    # Consolidated 2026-08-07: the affine is the shared numpy helper (one
+    # implementation; was a jnp twin of the body head's numpy expression).
+    # Last-ulp move possible (np.linalg.inv vs jnp) — measured, and no
+    # frozen gate reaches this path (every pinned deck overrides the head).
+    randlims = jnp.asarray(minibz_cell_affine(bvec_np, (nkx, nky, nkz)))
+
+    def _map_unit_draw(unit_draw):
+        unit_draw = jnp.asarray(unit_draw, dtype=jnp.float64)
+        randcart = minibz_frac_to_cart(unit_draw, bvec)
+        wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
+        rq = (randlims @ wrapped.T).T
+        if is_2d:
+            rq = rq.at[:, 2].set(0.0)
+        return rq
+
+    want = str(method).lower()
+    if want in ("sobol", "auto"):
+        try:
+            from scipy.stats import qmc as _qmc
+            import math as _math
+            m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
+            for rep in range(max(1, int(qmc_reps))):
+                sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
+                yield _map_unit_draw(sob.random_base2(m))
+            return
+        except Exception as exc:                                # noqa: BLE001
+            if want == "sobol":
+                raise RuntimeError(
+                    f"minibz_voronoi_batches: method='sobol' was requested "
+                    f"explicitly and the scrambled-Sobol draw is not "
+                    f"available ({type(exc).__name__}: {exc}).  This is a "
+                    f"REFUSAL, not a fallback: the uniform draw is a "
+                    f"different generator with a different sample count, so "
+                    f"serving it here would silently change every head "
+                    f"number in the run.  FIX: install scipy (the Sobol "
+                    f"generator is scipy.stats.qmc), or pass method='auto' "
+                    f"to accept an announced demotion, or method='uniform' "
+                    f"to ask for the fallback on purpose."
+                ) from exc
+            _announce_sobol_demotion(exc, int(nsamples))
+            nsamples = max(int(nsamples), _UNIFORM_FALLBACK_NSAMPLES)
+
+    # Uniform fallback (also the path on systems without scipy.stats.qmc).
+    key = jax.random.PRNGKey(int(seed_offset))
+    randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
+    yield _map_unit_draw(randvals)
+
+
 def minibz_voronoi_batches(
     bvec, kgrid, *,
     nsamples: int = 2**18,
@@ -238,59 +308,10 @@ def minibz_voronoi_batches(
         refusal, because a refusal here would be a behaviour change on a
         path nothing in the tree exercises.
     """
-    bvec_np = np.asarray(bvec, dtype=np.float64)
-    bvec = jnp.asarray(bvec, dtype=jnp.float64)
-    nkx, nky, nkz = (int(s) for s in kgrid)
-    # Consolidated 2026-08-07: the affine is the shared numpy helper (one
-    # implementation; was a jnp twin of the body head's numpy expression).
-    # Last-ulp move possible (np.linalg.inv vs jnp) — measured, and no
-    # frozen gate reaches this path (every pinned deck overrides the head).
-    randlims = jnp.asarray(minibz_cell_affine(bvec_np, (nkx, nky, nkz)))
-
-    want = str(method).lower()
-    if want in ("sobol", "auto"):
-        try:
-            from scipy.stats import qmc as _qmc
-            import math as _math
-            m = max(1, int(_math.floor(_math.log2(max(2, int(nsamples))))))
-            batches = []
-            for rep in range(max(1, int(qmc_reps))):
-                sob = _qmc.Sobol(d=3, scramble=True, seed=rep + int(seed_offset))
-                U = sob.random_base2(m)
-                Uj = jnp.asarray(np.asarray(U, dtype=np.float64))
-                randcart = minibz_frac_to_cart(Uj, bvec)
-                wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
-                rq = (randlims @ wrapped.T).T
-                if is_2d:
-                    rq = rq.at[:, 2].set(0.0)
-                batches.append(rq)
-            return batches
-        except Exception as exc:                                # noqa: BLE001
-            if want == "sobol":
-                raise RuntimeError(
-                    f"minibz_voronoi_batches: method='sobol' was requested "
-                    f"explicitly and the scrambled-Sobol draw is not "
-                    f"available ({type(exc).__name__}: {exc}).  This is a "
-                    f"REFUSAL, not a fallback: the uniform draw is a "
-                    f"different generator with a different sample count, so "
-                    f"serving it here would silently change every head "
-                    f"number in the run.  FIX: install scipy (the Sobol "
-                    f"generator is scipy.stats.qmc), or pass method='auto' "
-                    f"to accept an announced demotion, or method='uniform' "
-                    f"to ask for the fallback on purpose."
-                ) from exc
-            _announce_sobol_demotion(exc, int(nsamples))
-            nsamples = max(int(nsamples), _UNIFORM_FALLBACK_NSAMPLES)
-
-    # Uniform fallback (also the path on systems without scipy.stats.qmc)
-    key = jax.random.PRNGKey(int(seed_offset))
-    randvals = jax.random.uniform(key, (nsamples, 3), dtype=jnp.float64)
-    randcart = minibz_frac_to_cart(randvals, bvec)
-    wrapped = wrap_points_to_voronoi(randcart, bvec, nmax=nmax)
-    rq = (randlims @ wrapped.T).T
-    if is_2d:
-        rq = rq.at[:, 2].set(0.0)
-    return [rq]
+    return list(_iter_minibz_voronoi_batches(
+        bvec, kgrid, nsamples=nsamples, method=method,
+        qmc_reps=qmc_reps, nmax=nmax, is_2d=is_2d,
+        seed_offset=seed_offset))
 
 
 def sample_minibz_qpoints(
@@ -300,11 +321,18 @@ def sample_minibz_qpoints(
     qmc_reps: int = 10,
     nmax: int = 1,
     is_2d: bool = False,
+    stream_reps: bool = False,
 ):
     """Yield batches of q-points sampled in the mini-BZ Voronoi cell.
 
-    Returns a list of ``qcart`` arrays (one per Sobol replicate, or a
-    single batch in the uniform fallback) in the format that
+    By default, returns the historical list of ``qcart`` arrays (one per
+    Sobol replicate, or a single batch in the uniform fallback).  With
+    ``stream_reps=True``, returns an iterator over exactly the same arrays,
+    so consumers can finish and release one replicate before drawing the
+    next instead of stacking ``qmc_reps``.  Both paths consume the same sole
+    sampler implementation.
+
+    The arrays are in the format that
     :class:`~vcoul.bulk_3d.Bulk3D` / :class:`~vcoul.slab_2d.Slab2D`
     consume in ``q0_average``.
 
@@ -318,10 +346,29 @@ def sample_minibz_qpoints(
     extraction this took ``(wfn, meta)`` and multiplied ``wfn.blat *
     wfn.bvec`` itself, which is the product the geometry object owns now.
     """
-    return minibz_voronoi_batches(
-        jnp.asarray(geometry.bvec, dtype=jnp.float64), kgrid,
+    args = dict(
         nsamples=nsamples, method=method, qmc_reps=qmc_reps,
         nmax=nmax, is_2d=is_2d)
+    bvec = jnp.asarray(geometry.bvec, dtype=jnp.float64)
+    if stream_reps:
+        return _iter_minibz_voronoi_batches(bvec, kgrid, **args)
+    return minibz_voronoi_batches(bvec, kgrid, **args)
+
+
+def _sample_q0_minibz_qpoints(
+    geometry, kgrid, *,
+    nsamples: int,
+    method: str,
+    qmc_reps: int,
+    analytic_sphere: bool,
+    is_2d: bool,
+    stream_reps: bool = False,
+):
+    """The one q=0 sampler policy shared by CC, TT, and packed C⊕T."""
+    return sample_minibz_qpoints(
+        geometry, kgrid, nsamples=nsamples, method=method,
+        qmc_reps=qmc_reps, nmax=3 if analytic_sphere else 1,
+        is_2d=is_2d, stream_reps=stream_reps)
 
 
 def minibz_inscribed_sphere_r2(bvec, kgrid, *, is_2d: bool = False) -> float:
@@ -370,6 +417,166 @@ def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
         v = v * np.exp(-len2 / (4.0 * alpha ** 2))
     v = np.where(len2 < 1e-24, 0.0, v)
     return v, len2
+
+
+def _transverse_projector(K_cart, len2, *, eps_K2: float = 1e-30):
+    """``I - Khat Khat`` on runtime Cartesian directions."""
+    K = np.asarray(K_cart, dtype=np.float64)
+    len2 = np.asarray(len2, dtype=np.float64)
+    len2_safe = np.where(len2 > eps_K2, len2, 1.0)
+    return (np.eye(3)[None, :, :]
+            - K[:, :, None] * K[:, None, :] / len2_safe[:, None, None])
+
+
+def _analytic_sphere_bare_head(q0sph2, celvol, n_kpts) -> float:
+    """Baldereschi-Tosatti bare scalar contribution inside the sphere."""
+    return (4.0 * np.sqrt(q0sph2) * float(celvol) * float(n_kpts)
+            / np.pi)
+
+
+def iter_minibz_photon_samples(
+    kernel,
+    geometry,
+    kgrid,
+    *,
+    nsamples: int = 2**18,
+    method: str = "sobol",
+    qmc_reps: int = 10,
+    analytic_sphere: bool = False,
+    chunk_size: int = 2**15,
+):
+    """Stream q and the raw bare Coulomb-gauge ``C⊕T`` kernel at q=0.
+
+    The fixed basis is ``(C, Tx, Ty, Tz)`` and, for every valid Cartesian
+    mini-BZ sample ``q``, the returned real ``D_raw`` obeys
+
+    ``D_CC = v(q)``, ``D_TT = v(q) (I - qhat qhat)``,
+    ``D_CT = D_TC = 0``.
+
+    ``v`` is the existing bulk/slab mini-BZ bare kernel in **bare units**:
+    no ``1 / cell_volume`` is applied.  Draw geometry, seeds, Sobol
+    demotion, slab ``qz=0``, and the ``nmax=1`` versus ``nmax=3``
+    ``analytic_sphere`` policy all route through the same sampler used by
+    :meth:`Bulk3D.q0_average` and :meth:`Slab2D.q0_average`.  The projector
+    is evaluated from runtime q directions with NumPy; there is no
+    direction-specialized JIT family.
+
+    Returns
+    -------
+    iterator
+        Each item is
+        ``(rep, start, stop, q_cart, D_raw, valid_count, mc_weight,
+        analytic_D_raw)``.  ``q_cart`` has fixed shape ``(chunk_size, 3)``
+        and ``D_raw`` fixed shape ``(chunk_size, 4, 4)``; both are host
+        ``float64`` NumPy arrays.  The final chunk is zero padded and
+        ``valid_count = stop - start``.  Invalid rows have zero q, zero D,
+        and zero weight, and are never evaluated by the singular kernel.
+
+        Accumulate one replicate as
+        ``sum(mc_weight * completed_integrand) / sum(valid_count)``.  For
+        the *linear bare-kernel parity only*, add the yielded
+        ``analytic_D_raw`` values; the addend is nonzero only in the first
+        chunk of a 3D ``analytic_sphere`` replicate.  It is deliberately
+        separate because it is not a screened coupled solve inside the
+        excised sphere.  ``rep`` lets the caller finish each completed
+        integrand before averaging equally over replicates; no replicate
+        stack is materialized.
+
+    Notes
+    -----
+    Memory is ``O(nsamples * 3 + chunk_size * 16)`` for one replicate and
+    is independent of ``qmc_reps``.  A 0-D box has no finite-q mini-BZ and
+    refuses.  This new surface accepts only ``sobol``, ``auto``, and
+    ``uniform``; unlike the legacy sampler, an unknown token cannot silently
+    mean uniform.
+    """
+    try:
+        sys_dim = int(kernel.sys_dim)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError(
+            "iter_minibz_photon_samples needs a vcoul kernel from "
+            "get_kernel(sys_dim)") from exc
+    if sys_dim == 0:
+        raise NotImplementedError(
+            "iter_minibz_photon_samples: a 0-D box is Gamma-only and has "
+            "no finite-q mini-BZ sample policy")
+    if sys_dim not in (2, 3):
+        raise ValueError(
+            f"iter_minibz_photon_samples: kernel sys_dim={sys_dim!r}; "
+            "expected 2 (slab) or 3 (bulk)")
+
+    draw_method = str(method).lower()
+    if draw_method not in ("sobol", "auto", "uniform"):
+        raise ValueError(
+            f"iter_minibz_photon_samples: method={method!r} unsupported; "
+            "expected 'sobol', 'auto', or 'uniform'")
+    if int(nsamples) <= 0:
+        raise ValueError("iter_minibz_photon_samples: nsamples must be positive")
+    if int(qmc_reps) <= 0:
+        raise ValueError("iter_minibz_photon_samples: qmc_reps must be positive")
+    if int(chunk_size) <= 0:
+        raise ValueError("iter_minibz_photon_samples: chunk_size must be positive")
+    kg = tuple(int(s) for s in kgrid)
+    if len(kg) != 3 or any(s <= 0 for s in kg):
+        raise ValueError(
+            f"iter_minibz_photon_samples: kgrid={kgrid!r}; expected three "
+            "positive integers")
+
+    is_2d = sys_dim == 2
+    bvec = np.asarray(geometry.bvec, dtype=np.float64)
+    if bvec.shape != (3, 3):
+        raise ValueError(
+            f"iter_minibz_photon_samples: geometry.bvec shape={bvec.shape}; "
+            "expected (3, 3)")
+    zc = float(np.pi / bvec[2, 2]) if is_2d else None
+    kind = "slab" if is_2d else "bulk_3d"
+    q0sph2 = minibz_inscribed_sphere_r2(bvec, kg, is_2d=is_2d)
+
+    analytic_D = np.zeros((4, 4), dtype=np.float64)
+    if analytic_sphere and not is_2d:
+        analytic = _analytic_sphere_bare_head(
+            q0sph2, geometry.cell_volume, int(np.prod(kg)))
+        analytic_D[0, 0] = analytic
+        analytic_D[1:, 1:] = np.eye(3) * ((2.0 / 3.0) * analytic)
+    zero_analytic_D = np.zeros_like(analytic_D)
+
+    def _chunks():
+        q_reps = _sample_q0_minibz_qpoints(
+            geometry, kg, nsamples=int(nsamples), method=draw_method,
+            qmc_reps=int(qmc_reps), analytic_sphere=bool(analytic_sphere),
+            is_2d=is_2d, stream_reps=True)
+        for rep, q_rep in enumerate(q_reps):
+            q_rep = np.asarray(q_rep, dtype=np.float64)
+            n_rep = int(q_rep.shape[0])
+            for start in range(0, n_rep, int(chunk_size)):
+                stop = min(start + int(chunk_size), n_rep)
+                valid_count = stop - start
+                q_valid = q_rep[start:stop]
+
+                # Evaluate only the logical rows.  Padding is appended after
+                # the singular bare-kernel call and is therefore inert.
+                v, q2 = _minibz_kernel_bare(
+                    np.zeros(3), q_valid, kind=kind, zc=zc)
+                transverse = _transverse_projector(q_valid, q2)
+
+                q_chunk = np.zeros((int(chunk_size), 3), dtype=np.float64)
+                D_chunk = np.zeros((int(chunk_size), 4, 4), dtype=np.float64)
+                mc_weight = np.zeros(int(chunk_size), dtype=np.float64)
+                q_chunk[:valid_count] = q_valid
+                D_chunk[:valid_count, 0, 0] = v
+                D_chunk[:valid_count, 1:, 1:] = v[:, None, None] * transverse
+                if analytic_sphere and not is_2d:
+                    mc_weight[:valid_count] = (q2 > q0sph2)
+                else:
+                    mc_weight[:valid_count] = 1.0
+
+                yield (
+                    rep, start, stop, q_chunk, D_chunk, valid_count,
+                    mc_weight,
+                    analytic_D.copy() if start == 0 else zero_analytic_D.copy(),
+                )
+
+    return _chunks()
 
 
 def minibz_average(
@@ -423,7 +630,7 @@ def minibz_average(
             # analytic sphere term added once.
             outside = len2 > q0sph2
             mc = float(np.sum(np.where(outside, v, 0.0))) / float(n_tot)
-            analytic = 4.0 * np.sqrt(q0sph2) * float(celvol) * float(n_kpts) / np.pi
+            analytic = _analytic_sphere_bare_head(q0sph2, celvol, n_kpts)
             per_batch.append(mc + analytic)
         else:
             if adaptive and len_shift2 > 1e-12:
@@ -606,14 +813,12 @@ def minibz_transverse_head_avg(
         v, len2 = _minibz_kernel_bare(shift, dq, kind=kind,
                                       alpha=alpha, zc=zc)
         K = shift[None, :] + dq                       # (N, 3) full momentum
-        len2_safe = np.where(len2 > eps_K2, len2, 1.0)
-        t = (np.eye(3)[None, :, :]
-             - K[:, :, None] * K[:, None, :] / len2_safe[:, None, None])
+        t = _transverse_projector(K, len2, eps_K2=eps_K2)
         if head_branch:
             outside = len2 > q0sph2
             w = np.where(outside, v, 0.0)
             T = np.einsum('n,nab->ab', w, t) / float(n_tot)
-            analytic = 4.0 * np.sqrt(q0sph2) * float(celvol) * float(n_kpts) / np.pi
+            analytic = _analytic_sphere_bare_head(q0sph2, celvol, n_kpts)
             T = T + np.eye(3) * (2.0 / 3.0) * analytic
         else:
             if adaptive and len_shift2 > 1e-12:
