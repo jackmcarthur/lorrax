@@ -70,7 +70,7 @@ _services.ensure_on_path()
 if TYPE_CHECKING:                                                   # pragma: no cover
     from wfn_loader import WfnLoader
 from common import timing
-from common.collectives import device_put_process_local
+from common.collectives import all_gather_processes, device_put_process_local
 
 from . import distribution as dist
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -85,6 +85,28 @@ _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
+
+
+def _worst_process_resident_bytes(local_bytes: int) -> int:
+    """Return the rank-invariant resident floor used by the host planner.
+
+    Allocator residency is process-local and can differ because JIT arenas are
+    released asynchronously.  A static tile width is shared control flow, so
+    every process must price it from the same worst-rank floor.  Keep the
+    communication in the canonical process-collective service.
+    """
+    local_i = int(local_bytes)
+    if local_i < 0:
+        raise ValueError(f"resident bytes must be nonnegative, got {local_i}")
+    gathered = np.asarray(
+        all_gather_processes(np.asarray(local_i, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if gathered.size == 0 or np.any(gathered < 0):
+        raise ValueError(
+            "process residency gather returned no values or a negative value"
+        )
+    return int(np.max(gathered))
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -1829,10 +1851,10 @@ def build_gram_q0_via_loadwfns(
         if live_now is None:
             # CPU/fallback accounting: sum the returned WFN shards.  Announce
             # that this is weaker because it cannot see service tables.
-            resident_bytes = 0
+            resident_local_bytes = 0
             for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
                         psi_r_rmu_Y, psi_r_rmuT_X):
-                resident_bytes += sum(
+                resident_local_bytes += sum(
                     int(np.asarray(sh.data).nbytes)
                     for sh in arr.addressable_shards
                 )
@@ -1844,7 +1866,12 @@ def build_gram_q0_via_loadwfns(
                 "resident floor",
             )
         else:
-            resident_bytes = int(live_now)
+            resident_local_bytes = int(live_now)
+
+        # The selected width controls static executable shapes and loop counts
+        # on every process.  Allocator residency itself is rank-local, so price
+        # from one shared worst-rank value before entering that host branch.
+        resident_bytes = _worst_process_resident_bytes(resident_local_bytes)
 
         target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
         gram_local_bytes = (
@@ -1971,7 +1998,8 @@ def build_gram_q0_via_loadwfns(
                 f"{n_dev_total}-device path; {block_source}; "
                 f"square-law={square_gib:.2f} GiB global, "
                 f"two-pair local={local_gib:.2f} GiB/device; "
-                f"resident(two WFN windows)={resident_bytes / 2**30:.2f}, "
+                f"resident(two WFN windows; worst rank)="
+                f"{resident_bytes / 2**30:.2f}, "
                 f"compiled L/R/fold="
                 f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
                 f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
