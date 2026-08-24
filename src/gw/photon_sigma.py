@@ -19,8 +19,6 @@ never gathered or held beside another block.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -28,14 +26,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 _CHANNELS = range(4)
 _photon_sigma_kernel_cache: dict[tuple[object, ...], object] = {}
-
-
-@dataclass(frozen=True)
-class PhotonStaticSigma:
-    """The two full-channel static COHSEX contributions in band space."""
-
-    sig_sx: jax.Array
-    sig_coh: jax.Array
 
 
 def _padded_centroid_extent(wfns) -> int:
@@ -156,7 +146,7 @@ def compute_static_photon_sigma(
     mesh_xy: Mesh,
     print_fn=print,
     verbose: bool = True,
-) -> PhotonStaticSigma:
+) -> tuple[jax.Array, jax.Array]:
     """Stream all sixteen ``D^{AB}`` blocks into full static COHSEX.
 
     ``V_packed`` and ``W_packed`` must stay at ``P(None, 'x', 'y')``.
@@ -176,7 +166,9 @@ def compute_static_photon_sigma(
 
     expected_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     for name, packed in (("V_packed", V_packed), ("W_packed", W_packed)):
-        if packed.sharding != expected_sharding:
+        have = packed.sharding
+        if (getattr(have, "mesh", None) != expected_sharding.mesh
+                or getattr(have, "spec", None) != expected_sharding.spec):
             raise ValueError(
                 f"photon Sigma {name} must remain P(None,'x','y'); got "
                 f"{packed.sharding}.  A photon body may not be gathered or "
@@ -234,4 +226,4 @@ def compute_static_photon_sigma(
         sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
     sig_sx.block_until_ready()
     sig_coh.block_until_ready()
-    return PhotonStaticSigma(sig_sx=sig_sx, sig_coh=sig_coh)
+    return sig_sx, sig_coh
