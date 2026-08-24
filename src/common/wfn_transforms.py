@@ -2126,25 +2126,6 @@ def load_centroids_band_chunked(
     if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
         gpu_mem_bytes = meta.memory_per_device_gb * 1e9
 
-    # Translate legacy hints (band_chunk_size, k_chunk_size) into the
-    # new flat-row count.  Both default to a non-None value; an explicit
-    # k_chunk_size from the caller bounds rows × nb_padded, otherwise we
-    # pick cs purely from the per-rank HBM budget.  In either case the
-    # budget bound applies last so cs can never exceed it.
-    cs_budget = max(1, int(gpu_mem_bytes
-                           // (nspinor * n_rtot * 16 * peak_copies)))
-    if k_chunk_size is not None and k_chunk_size > 0:
-        # Honor an explicit cap: at most ``k_chunk_size`` k-points
-        # worth of work per iter, sized against the per-rank band
-        # block.  Same per-iter footprint as the legacy nested loops.
-        n_bands_per_rank = max(
-            1, (nb_total + n_devices - 1) // n_devices)
-        cs_hint = int(k_chunk_size) * min(
-            int(band_chunk_size), n_bands_per_rank)
-        cs = max(1, min(cs_hint, cs_budget))
-    else:
-        cs = cs_budget
-
     # Output shardings + accumulators.  Same final layout as before:
     # psi_rmu_Y has the centroid axis on 'y'; psi_rmuT_X has it on 'x'.
     out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
@@ -2159,6 +2140,70 @@ def load_centroids_band_chunked(
     sharding_load = P(None, ('x', 'y'), None, None)
 
     loader = wfn  # reuse top-level WfnLoader
+    # Persistent term for the bulk WFN transfer.  gflat_to_rmu keeps the
+    # sharded G-flat input while building two differently sharded centroid
+    # outputs.  The old planner gave its FFT scan the ENTIRE device budget,
+    # so these arrays overlapped an independently full-budget scan transient.
+    nb_per_device = (nb_total + n_devices - 1) // n_devices
+    nb_padded_global = nb_per_device * n_devices
+    n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
+    n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
+    gflat_local_bytes = (
+        nk_tot * nb_per_device * nspinor * int(loader.ngkmax) * 16
+    )
+    output_local_bytes = (
+        nk_tot * nb_padded_global * nspinor * 16
+        * (((n_rmu_padded + n_x - 1) // n_x)
+           + ((n_rmu_padded + n_y - 1) // n_y))
+    )
+    # A caller-provided G-flat tensor is already in memory_stats(); only price
+    # it here when this call will allocate it.  This avoids double-charging
+    # htransform's shared-window reuse path.
+    new_gflat_bytes = gflat_local_bytes if psi_G_flat is None else 0
+    persistent_bytes = new_gflat_bytes + output_local_bytes
+    min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
+    existing_live_bytes = 0
+    for device in jax.local_devices():
+        stats = device.memory_stats() or {}
+        existing_live_bytes = max(
+            existing_live_bytes, int(stats.get("bytes_in_use") or 0),
+        )
+    scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
+                         - persistent_bytes)
+    if scan_budget_bytes < min_scan_bytes:
+        min_live_bytes = (existing_live_bytes + persistent_bytes
+                          + min_scan_bytes)
+        raise MemoryError(
+            "load_centroids_band_chunked planner refuses before bulk WFN "
+            f"allocation: the minimum per-device live set is "
+            f"{min_live_bytes / 2**30:.2f} GiB (G-flat input + X/Y "
+            f"centroid outputs + one FFT scan row), but the residual prune "
+            f"transient budget is {gpu_mem_bytes / 2**30:.2f} GiB. "
+            "A smaller scan chunk cannot reduce this floor; use more "
+            "devices, larger-HBM devices, or a narrower prune band window."
+        )
+
+    # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
+    # flat-row count.  Only the budget LEFT AFTER persistent arrays may size
+    # the scan transient.  In either arm the bound applies last.
+    cs_budget = max(1, int(
+        scan_budget_bytes // (nspinor * n_rtot * 16 * peak_copies)
+    ))
+    if k_chunk_size is not None and k_chunk_size > 0:
+        n_bands_per_rank = max(
+            1, (nb_total + n_devices - 1) // n_devices)
+        cs_hint = int(k_chunk_size) * min(
+            int(band_chunk_size), n_bands_per_rank)
+        cs = max(1, min(cs_hint, cs_budget))
+    else:
+        cs = cs_budget
+    print(
+        "[load_centroids planner] "
+        f"existing={existing_live_bytes / 2**30:.2f}, "
+        f"persistent={persistent_bytes / 2**30:.2f}, "
+        f"scan_budget={scan_budget_bytes / 2**30:.2f} GiB/device, "
+        f"peak_copies={peak_copies}, cs={cs}"
+    )
     # Round-6 canonical accessor: pass the loader-cached device-resident
     # sphere index directly to gflat_to_rmu so the captured-in-closure
     # buffer IS the canonical one shared with psi_G_store's
