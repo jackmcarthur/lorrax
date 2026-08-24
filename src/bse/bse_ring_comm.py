@@ -381,6 +381,51 @@ def _ring_sum_B_encode(
     return T_total
 
 
+def ring_spin_degeneracy(nspinor: int) -> float:
+    """Spin-summation weight on the RING (bare-Coulomb) ENCODE step.
+
+    THE SINGLE OWNER of the fix for KNOWN_LORRAX_ISSUES.md's
+    ``bse_w_exact._build_rpa_resolvent`` / ``compute_pair_amplitude`` row
+    (2026-08-23): the ring's transition-density ENCODE (the step that
+    SUMS a (c,v,k) trial vector, weighted by ``conj(M)``, down to a
+    centroid-space (mu) density — ``S_total`` below and its twin in
+    :func:`build_density_snapshot_operator`) silently assumed weight 1 for
+    every transition. That is correct for a spinor (``nspinor == 2``)
+    calculation, where ``compute_pair_amplitude``'s own ``Sigma_s`` already
+    sums both physical spin components into one stored transition — but
+    WRONG for a spin-restricted scalar calculation (``nspinor == 1``),
+    which stores only ONE of the two spin-degenerate channels per
+    transition and must double the sum to recover the physical response.
+    This is the textbook ``D + 2V - W`` (scalar) vs ``D + V - W`` (spinor)
+    split already DOCUMENTED, but never implemented, in
+    ``bse/context/README.md`` ("Note on spin factors"); same convention,
+    same nspin==1-only scope, as the GW producer's own Dyson-route
+    prefactor (``gw.w_isdf._w_solve_pref_scalar``,
+    ``2.0/(nspin*nspinor)``) and the shared ``psp.get_DFT_mtxels.
+    spin_degeneracy_factor`` this specialises — BSE has no ``wfn`` at
+    these call sites and never tracks collinear ``nspin == 2`` (grep
+    confirms no ``nspin`` token anywhere under ``src/bse/``), so ``nspin``
+    is fixed at 1 here rather than threaded through.
+
+    Applied ONLY at ENCODE (the transition-index sum); the matching
+    DECODE (``M`` broadcast back onto (c,v,k), no sum over transitions —
+    e.g. ``VX_partial`` below, or the generator in
+    :func:`build_realspace_random_transition_generator`) does not carry
+    it, and must not: doubling a decode-only leg would introduce the
+    weight where the physical multiplicity was never lost.  Symmetric
+    consequence, stated because it is the part most likely to surprise a
+    reader: this is used by BOTH ``screening=True`` (the RPA/ladder
+    density response W is resolved from) and ``screening=False`` (the
+    production OPTICAL BSE exciton Hamiltonian's own K^x term) — the ring
+    coupling is the SAME function in every block by design (module
+    docstring, ``build_bse_ring_matvec_full``'s ``screening`` branch
+    doc), so this one fix corrects the missing spin weight in EVERY
+    scalar (``nspinor == 1``) BSE run, not only ``w_bse``/
+    ``w_rpa_resolvent``.
+    """
+    return 2.0 if int(nspinor) == 1 else 1.0
+
+
 def apply_V_ring(
     X: jax.Array,
     psi_c_Y: jax.Array,
@@ -454,7 +499,10 @@ def apply_V_ring(
     # transition-Hartree density, one V_q0 solve, then broadcast back at every
     # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
     # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
-    S_total = jnp.sum(S_total, axis=2) / sqrt_nk  # (b, nu_local)
+    # ring_spin_degeneracy(nspinor): the missing spin-restricted-singlet
+    # weight (KNOWN_LORRAX_ISSUES.md 2026-08-23) — see that function's
+    # docstring for the derivation and scope.
+    S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * ring_spin_degeneracy(nspinor)  # (b, nu_local)
 
     U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = lax.psum(U_partial, axis_name="y")
@@ -1439,7 +1487,12 @@ def build_density_snapshot_operator(
 
         _, S_total = lax.fori_loop(0, px, step_x, (A_local, S0))
 
-        S_total = S_total / sqrt_nk
+        # ring_spin_degeneracy(nspinor): this ENCODE is the resolvent's own
+        # outer readout (v(M s), the density-snapshot vertex named in
+        # bse_w_exact._build_rpa_resolvent's docstring) and needs the SAME
+        # missing weight as apply_V_ring's identically-shaped S_total — see
+        # ring_spin_degeneracy's docstring (KNOWN_LORRAX_ISSUES.md 2026-08-23).
+        S_total = (S_total / sqrt_nk) * ring_spin_degeneracy(nspinor)
 
         # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)
