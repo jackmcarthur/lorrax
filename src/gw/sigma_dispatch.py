@@ -844,22 +844,21 @@ def compute_sigma_xc(
                 "static_head_terms was supplied.  A scalar q->0 correction "
                 "cannot be added to a coupled four-current Dyson result.")
 
-        # The V-only facade supplies Hartree + Sigma_X^all[V] (CC plus the
-        # incumbent bare-TT adapter).  Its scalar SX/COH zeros are REPLACED,
-        # not augmented, by the sixteen-block photon sum through the same
-        # canonical Green/convolution/projector services.
+        # The V-only facade remains the one Hartree owner, but skips its
+        # historical scalar+TT exchange contraction.  X, SX, and COH are all
+        # REPLACED, not augmented, by one sixteen-block photon loop over the
+        # same packed V/W and canonical Green/convolution/projector services.
         from .cohsex_sigma import _resolve_Gij
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
         cohsex = compute_v_h_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=photon_Gij,
             static_head_terms=None,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=None,
+            compute_bare_x=False,
         )
         from .photon_sigma import compute_static_photon_sigma
-        photon_sx, photon_coh = compute_static_photon_sigma(
+        photon_x, photon_sx, photon_coh = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
             Gij=photon_Gij,
@@ -870,6 +869,7 @@ def compute_sigma_xc(
             mesh_xy=mesh_xy,
             print_fn=print_fn,
         )
+        cohsex["sig_x"] = photon_x
         cohsex["sig_sx"] = photon_sx
         cohsex["sig_coh"] = photon_coh
     elif builds_static_screened:
