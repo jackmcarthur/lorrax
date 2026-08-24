@@ -40,6 +40,7 @@ from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import (
     get_enk_bandrange, load_centroids_band_chunked, load_psi_gflat_padded,
 )
+from common.psi_G_store import build_psi_G_store
 from isdf.galerkin import build_streamed_projected_gram
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
 # this driver reads a raw params dict rather than a LorraxConfig, which is
@@ -370,6 +371,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     _p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
     _bc = round_up(band_chunk_size, _p_band)
     _n_band_chunks = (nb + _bc - 1) // _bc
+    _band_chunk_ranges = tuple(
+        (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
+        for i in range(_n_band_chunks))
 
     _rank_policy = ("numerical (exact-span default)" if rank_multiplier == 0.0
                     else f"target {rank_multiplier:g}*nb="
@@ -859,22 +863,26 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     from common.gpu_utils import _get_jax_gpu_memory_bytes
     device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
-    G = build_streamed_projected_gram(
-        wfn=wfn,
-        meta=meta,
-        mesh_xy=mesh_xy,
-        band_range=band_range,
-        UH=UH,
-        inv_s=inv_s,
-        gram_init=G,
-        band_chunk_size=_bc,
-        mu_pad=mu_pad,
-        q_tile_budget=stream_budget,
-        device_pool_limit=device_pool_limit,
-        bispinor=bispinor,
-        log_fn=log_fn,
-        progress_fn=progress_fn,
-    )
+    # Populate one host-resident G-flat source after the centroid-only window
+    # has been released.  It reads each band carrier once, then serves every
+    # outer-r chunk through the canonical FFT/Bloch/reshard helpers.
+    with build_psi_G_store(
+            wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+            band_chunk_ranges=_band_chunk_ranges, bispinor=bispinor,
+            band_pad_to=_bc) as source:
+        G = build_streamed_projected_gram(
+            source=source,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            UH=UH,
+            inv_s=inv_s,
+            gram_init=G,
+            mu_pad=mu_pad,
+            q_tile_budget=stream_budget,
+            device_pool_limit=device_pool_limit,
+            log_fn=log_fn,
+            progress_fn=progress_fn,
+        )
 
     # ── 4. Cholesky on G ──
     # FFI seam: gw_jax's factor_c_q (which has dual 1×1-dense /
