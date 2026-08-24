@@ -143,8 +143,14 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("rule_id, extra", [
-    ("low_mem_bands_metal_material_class_unported",
-     "head_correction = off\n" + _METAL_KEYS),
+    # low_mem_bands_metal_material_class_unported LIFTED 2026-08-23
+    # (fix/mpa-head-status-line-2026-08-23): the envelope is EMPTY.  The
+    # matrix keeps one synthetic always-absent row so the machinery that
+    # checks refusal MESSAGE GRAMMAR still runs if a future row lands;
+    # pytest.param(..., marks=skip) documents the empty state loudly.
+    pytest.param("no_rows_left", "", marks=pytest.mark.skip(
+        reason="envelope empty since 2026-08-23; re-enable with the "
+               "first future refusal row")),
     # low_mem_bands_dynamic_ppm_unported DELETED 2026-08-23 (feat/
     # mpa-executor-face-gate-2026-08-23): insulating compute_mode = mpa
     # is now supported (positive-twin matrix below); metal MPA is caught
@@ -197,9 +203,11 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
         cfg = _config(pathlib.Path(d), "low_mem_bands = true\ncompute_mode = mpa\n")
         assert cfg.head.correction.value == "full"
     with tempfile.TemporaryDirectory() as d:
-        with pytest.raises(
-                ValueError, match="low_mem_bands_metal_material_class_unported"):
-            _config(pathlib.Path(d), "low_mem_bands = true\n" + _METAL_KEYS)
+        # LIFTED 2026-08-23: a metal MPA deck now parses under
+        # low_mem_bands=true (the mpa_z status-line NameError that made
+        # the SC driver unreachable is fixed on the same branch).
+        cfg = _config(pathlib.Path(d), "low_mem_bands = true\n" + _METAL_KEYS)
+        assert str(cfg.mpa.material_class).strip().lower() == "metal"
 
 
 # ---------------------------------------------------------------------------
@@ -273,11 +281,9 @@ def test_the_supported_envelope_parses_and_does_not_refuse(tmp_path, extra):
     HL-PPM, MPA), restart — none of these should trip a rule the moment
     low_mem_bands=true is added beside them.
 
-    Metal MPA is still refused (mpa_material_class = metal's own
-    self-consistent-driver prerequisite hit three named infra obstacles
-    this session — see gw.mpa.sigma's own comment and gw_config.py's
-    metal row); it stays in the red-twin matrix above under
-    low_mem_bands_metal_material_class_unported.
+    Metal MPA is LIFTED too (2026-08-23): the envelope is empty, so
+    every combination the legacy path serves parses under
+    low_mem_bands=true.
     """
     config = _config(tmp_path, "low_mem_bands = true\n" + extra)
     assert config.memory.low_mem_bands is True
@@ -324,7 +330,7 @@ def test_every_rule_has_all_five_parts_and_a_unique_id():
 
     ids = [row[0] for row in _LOW_MEM_BANDS_REFUSALS]
     assert len(ids) == len(set(ids)), f"duplicate rule id in {ids}"
-    assert len(ids) == 1, (
+    assert len(ids) == 0, (
         "the table grew or shrank -- update this test AND the docs "
         "envelope table in docs/input_reference.md together. "
         "(2026-08-23: low_mem_bands_dynamic_ppm_unported DELETED -- "
