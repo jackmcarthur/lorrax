@@ -42,7 +42,8 @@ def test_projected_gram_consumes_one_public_wfn_source():
     assert "source.band_chunk_ranges" in body
     assert "source.band_chunk_carrier" in body
     assert "iter_psi_rchunk_bandwise(" not in body
-    assert "build_psi_G_store(" in ht
+    assert "build_psi_G_store(" in gal
+    assert "fit_galerkin_basis(" in ht
 
 
 def _import_galerkin():
