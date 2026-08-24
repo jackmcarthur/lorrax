@@ -16,7 +16,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.mtxel_sweep import band_sphere_spec
 from common.parallel_transport import (
     band_storage_extent,
     build_forward_neighbor_table,
@@ -32,6 +31,7 @@ from common.parallel_transport import (
     MIN_STENCIL_POINTS,
     undersampled_link_axes,
 )
+from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 
 

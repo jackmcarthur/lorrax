@@ -22,6 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common.wfn_layout import band_sphere_spec
+from runtime.padding import round_up, spec_divisor
+
 
 __all__ = [
     "build_forward_neighbor_table",
@@ -104,14 +107,12 @@ def band_storage_extent(mesh, nbands: int) -> int:
     their two band axes separately. Rounding to the full mesh product is
     accepted by both layouts, including rectangular meshes.
     """
-    from runtime.padding import round_up
-
     names = tuple(str(a) for a in mesh.axis_names)
     if names != ("x", "y"):
         raise ValueError(
             "parallel transport requires mesh axes ('x','y'); "
             f"got {names!r}")
-    divisor = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)
     return round_up(int(nbands), divisor)
 
 

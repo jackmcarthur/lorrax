@@ -107,14 +107,14 @@ __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
 def _band_spec() -> P:
     """ψ layout: (n_k, nb, nspinor, ngkmax), bands over the whole mesh.
 
-    Imported from ``common.mtxel_sweep`` rather than re-spelled: a second
+    Imported from ``common.wfn_layout`` rather than re-spelled: a second
     literal of the same PartitionSpec is exactly the drift that
     ``runtime.padding.spec_divisor`` was introduced to remove on the band
     DIVISOR, and it would be worse here — a spec that disagreed would not
     raise, it would silently insert a reshard between the loader, the
     matrix-element sweep and this density build.
     """
-    from common.mtxel_sweep import band_sphere_spec
+    from common.wfn_layout import band_sphere_spec
     return band_sphere_spec()
 
 

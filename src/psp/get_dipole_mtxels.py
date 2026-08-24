@@ -44,9 +44,10 @@ from common import timing
 from common.collectives import barrier, gather_k_blocks
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
-                                band_sphere_spec, blocks_to_host,
-                                dipole_operator, sweep_matrix_elements)
+                                blocks_to_host, dipole_operator,
+                                sweep_matrix_elements)
 from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gamma_apply, gamma_perm_phase

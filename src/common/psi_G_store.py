@@ -40,6 +40,7 @@ from jax.experimental import io_callback
 from common.shard_map import shard_map
 from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from runtime.padding import spec_divisor
 
 
 def _zero_user_band_pad_in_shard(
@@ -169,7 +170,7 @@ class PsiGStore:
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
         ngkmax = int(loader.ngkmax)
-        p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
+        p = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
 
         # Per-bc local band count: bands_per_device for ONE bc.  Used to
         # compute the per-rank tile's band-axis offsets (bc-stacked

@@ -283,21 +283,34 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     its static layout planning names.  Value/HLO parity remains in the driver
     and staged-reshard suites.
     """
-    src = Path(__file__).resolve().parents[1] / "src"
+    repo = Path(__file__).resolve().parents[1]
+    src = repo / "src"
     layout_path = src / "common" / "wfn_layout.py"
     app_paths = (
         layout_path,
         src / "common" / "mtxel_sweep.py",
+        src / "common" / "parallel_transport.py",
         src / "common" / "wfn_transforms.py",
         src / "common" / "psi_G_store.py",
         src / "bandstructure" / "htransform.py",
+        src / "file_io" / "parallel_transport.py",
+        src / "gw" / "kin_ion_io.py",
+        src / "gw" / "qsgw_density.py",
+        src / "gw" / "sc_iteration.py",
+        src / "psp" / "get_dipole_mtxels.py",
     )
+    mtxel = (src / "common" / "mtxel_sweep.py").read_text()
+    parallel = (src / "common" / "parallel_transport.py").read_text()
     wfn = (src / "common" / "wfn_transforms.py").read_text()
     store = (src / "common" / "psi_G_store.py").read_text()
     ht = (src / "bandstructure" / "htransform.py").read_text()
     staged = (src / "common" / "staged_reshard.py").read_text()
     fit = (src / "common" / "sharding_fit.py").read_text()
     gflat_body = wfn.split("def gflat_to_rmu(", 1)[1].split("\ndef ", 1)[0]
+    accumulate_body = wfn.split(
+        "def accumulate_rchunk_to_gflat(", 1)[1].split("\ndef ", 1)[0]
+    centroid_body = wfn.split(
+        "def load_centroids_band_chunked(", 1)[1].split("\ndef ", 1)[0]
     galerkin_body = ht.split("def streaming_galerkin_solve(", 1)[1].split(
         "\ndef ", 1)[0]
     move_body = staged.split("def band_to_product_r_reshard(", 1)[1].split(
@@ -333,10 +346,43 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     assert list(literal_sites) == ["common/wfn_layout.py"], literal_sites
     assert len(literal_sites["common/wfn_layout.py"]) == 1, literal_sites
 
+    # The old mtxel_sweep location is not a compatibility facade.  Scan import
+    # nodes over the bounded source root so a new indirect consumer cannot make
+    # two apparent owners without reintroducing the literal itself.
+    legacy_imports = []
+    for root in (src, repo / "tests"):
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if (isinstance(node, ast.ImportFrom)
+                        and node.module == "common.mtxel_sweep"
+                        and any(alias.name == "band_sphere_spec"
+                                for alias in node.names)):
+                    legacy_imports.append(
+                        f"{path.relative_to(repo).as_posix()}:{node.lineno}")
+    assert legacy_imports == [], legacy_imports
+    mtxel_all = next(
+        node.value for node in ast.walk(ast.parse(mtxel))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets)
+    )
+    assert "band_sphere_spec" not in {
+        item.value for item in mtxel_all.elts if isinstance(item, ast.Constant)
+    }
+
     assert "GFLAT_LOAD_SPEC" not in wfn
     assert "band_sphere_spec()" in store
+    assert "p = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in store
+    assert "p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])" not in store
     assert "p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)" in gflat_body
     assert "np.prod([mesh.shape" not in gflat_body
+    assert "mu_gflat_spec = P(None, ('x', 'y'), None)" in accumulate_body
+    assert "p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)" in accumulate_body
+    assert "np.prod([mesh.shape" not in accumulate_body
+    assert "p_band = spec_divisor(mesh_xy, sharding_load, axis=1)" in centroid_body
+    assert "nb_padded_global = round_up(nb_total, p_band)" in centroid_body
+    assert "(nb_total + n_devices - 1) // n_devices" not in centroid_body
+    assert "divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)" in parallel
     assert "_p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
     assert "_p_band = max(1, int(mesh_xy.size))" not in galerkin_body
     assert "n_pad = round_up(nq, batch_size) - nq" in ht
@@ -344,6 +390,8 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
     assert "r_divisor = spec_divisor(mesh, out_spec, axis=3)" in move_body
     assert "ndev = p_x * p_y" not in move_body
+    assert "m_pad = round_up(m_loc, p_y)" in staged
+    assert "m_pad = -(-m_loc // p_y) * p_y" not in staged
     assert "p = shard_factor(mesh, picked)" in subset_body
     assert "p *= int(mesh.shape[a])" not in subset_body
 
