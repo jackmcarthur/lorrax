@@ -25,6 +25,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 _CHANNELS = range(4)
+_TERM_X = 0
+_TERM_SX = 1
+_TERM_COH = 2
 _photon_sigma_kernel_cache: dict[tuple[object, ...], object] = {}
 
 
@@ -48,8 +51,8 @@ def _make_photon_static_block_kernel(
     The Lorentz matrices are folded into the two bundles outside this kernel
     by :func:`gw.wavefunction_bundle.with_lorentz_vertices`; their channel
     numbers therefore never become static kernel arguments.  ``term`` is a
-    dynamic selector so SX and COH share one executable while executing one
-    Green/operator tile at a time.
+    dynamic selector so X, SX, and COH share one executable while executing
+    one Green/operator tile at a time.
     """
     from ffi import ffi_dial_key
 
@@ -91,11 +94,11 @@ def _make_photon_static_block_kernel(
         s_right = wfns_right.slices
 
         if wfns_left.layout == "legacy":
-            def sx(_):
+            def occupied(interaction):
                 G = build_G(
                     wfns_left_g.xn(s_left.sigma),
                     wfns_right_g.yr(s_right.sigma), Gij=Gij)
-                O = convolve(G, W_AB, 1.0)
+                O = convolve(G, interaction, 1.0)
                 return project(
                     wfns_left.xr(s_left.sigma), O,
                     wfns_right.yn(s_right.sigma))
@@ -114,11 +117,11 @@ def _make_photon_static_block_kernel(
             ri_mask = wfns_left.band_mask(
                 s_left.sigma_sum).astype(jnp.complex128)
 
-            def sx(_):
+            def occupied(interaction):
                 G = build_G(
                     wfns_left_g.psi_mun, wfns_right_g.psi_nmu,
                     phases=occ, layout="face", gemm=g_plan)
-                O = convolve(G, W_AB, 1.0)
+                O = convolve(G, interaction, 1.0)
                 return project(wfns_left.psi_nmu, O, wfns_right.psi_mun)
 
             def coh(_):
@@ -128,7 +131,16 @@ def _make_photon_static_block_kernel(
                 O = convolve(G, W_AB - V_AB, -0.5)
                 return project(wfns_left.psi_nmu, O, wfns_right.psi_mun)
 
-        return jax.lax.cond(term == 0, sx, coh, operand=None)
+        def x_or_sx(_):
+            interaction = jax.lax.cond(
+                term == _TERM_X,
+                lambda __: V_AB,
+                lambda __: W_AB,
+                operand=None,
+            )
+            return occupied(interaction)
+
+        return jax.lax.cond(term == _TERM_COH, coh, x_or_sx, operand=None)
 
     _photon_sigma_kernel_cache[key] = contract_block
     return contract_block
@@ -146,7 +158,7 @@ def compute_static_photon_sigma(
     mesh_xy: Mesh,
     print_fn=print,
     verbose: bool = True,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Stream all sixteen ``D^{AB}`` blocks into full static COHSEX.
 
     ``V_packed`` and ``W_packed`` must stay at ``P(None, 'x', 'y')``.
@@ -176,6 +188,7 @@ def compute_static_photon_sigma(
 
     from .photon_layout import photon_block_view
 
+    sig_x = None
     sig_sx = None
     sig_coh = None
 
@@ -200,14 +213,19 @@ def compute_static_photon_sigma(
                     f"{expected} from its wavefunction endpoints, got "
                     f"V{tuple(V_AB.shape)} and W{tuple(W_AB.shape)}.")
 
+            x_AB = contract_block(
+                left, right, left_g, right_g, Gij, W_AB, V_AB,
+                jnp.asarray(_TERM_X, dtype=jnp.int32))
+            sig_x = x_AB if sig_x is None else sig_x + x_AB
+            sig_x.block_until_ready()
             sx_AB = contract_block(
                 left, right, left_g, right_g, Gij, W_AB, V_AB,
-                jnp.asarray(0, dtype=jnp.int32))
+                jnp.asarray(_TERM_SX, dtype=jnp.int32))
             sig_sx = sx_AB if sig_sx is None else sig_sx + sx_AB
             sig_sx.block_until_ready()
             coh_AB = contract_block(
                 left, right, left_g, right_g, Gij, W_AB, V_AB,
-                jnp.asarray(1, dtype=jnp.int32))
+                jnp.asarray(_TERM_COH, dtype=jnp.int32))
             sig_coh = coh_AB if sig_coh is None else sig_coh + coh_AB
 
             # Synchronize the small accumulator before advancing the block.
@@ -218,12 +236,15 @@ def compute_static_photon_sigma(
                 print_fn(f"  full photon COHSEX block ({A},{B}) complete")
 
     from .cohsex_sigma import _replicate_band_sigma
+    sig_x = _replicate_band_sigma(sig_x, mesh_xy)
     sig_sx = _replicate_band_sigma(sig_sx, mesh_xy)
     sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
     if wfns_charge.layout == "face":
         nb_sigma = wfns_charge.slices.nb_sigma
+        sig_x = sig_x[:, :nb_sigma, :nb_sigma]
         sig_sx = sig_sx[:, :nb_sigma, :nb_sigma]
         sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
+    sig_x.block_until_ready()
     sig_sx.block_until_ready()
     sig_coh.block_until_ready()
-    return sig_sx, sig_coh
+    return sig_x, sig_sx, sig_coh
