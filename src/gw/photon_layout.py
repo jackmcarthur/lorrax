@@ -269,8 +269,9 @@ def photon_block_view(
 
 
 def _q0_update_program(layout, mesh_xy, nq, dtype):
-    """One shape-stable local graph for all bounded q=0 updates."""
-    key = (id(mesh_xy), layout, int(nq), np.dtype(dtype).str)
+    """One shape-stable local graph per padded q=0 update geometry."""
+    padded_extents = tuple(int(n) for n in layout.padded_extents)
+    key = (id(mesh_xy), padded_extents, int(nq), np.dtype(dtype).str)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
     from common.shard_map import shard_map
@@ -278,40 +279,43 @@ def _q0_update_program(layout, mesh_xy, nq, dtype):
     packed_spec = P(None, 'x', 'y')
     left_spec = P(None, 'x')
     right_spec = P(None, 'y')
+    logical_spec = P(None)
     packed_sharding = NamedSharding(mesh_xy, packed_spec)
     left_sharding = NamedSharding(mesh_xy, left_spec)
     right_sharding = NamedSharding(mesh_xy, right_spec)
+    logical_sharding = NamedSharding(mesh_xy, logical_spec)
     side = layout.mesh_side
 
-    def local_valid_mask(axis_name):
+    def local_valid_mask(axis_name, logical_extents):
         shard = jax.lax.axis_index(axis_name)
         pieces = []
-        for logical, padded in zip(
-                layout.logical_extents, layout.padded_extents):
+        for channel, padded in enumerate(padded_extents):
             n_local = padded // side
             pieces.append(
-                shard * n_local + jnp.arange(n_local) < logical)
+                shard * n_local + jnp.arange(n_local)
+                < logical_extents[channel])
         return jnp.concatenate(pieces)
 
     @partial(shard_map, mesh=mesh_xy,
-             in_specs=(packed_spec, left_spec, right_spec),
+             in_specs=(packed_spec, left_spec, right_spec, logical_spec),
              out_specs=packed_spec, check_vma=False)
-    def add_local(packed, left_rows, right_rows):
+    def add_local(packed, left_rows, right_rows, logical_extents):
         # Each packed shard is C_X⊕T1_X⊕T2_X⊕T3_X (and analogously
         # along y), so masking must be local-channel-aware rather than a
         # single trailing slice of the global packed axis.
         left_rows = jnp.where(
-            local_valid_mask('x')[None, :], left_rows, 0)
+            local_valid_mask('x', logical_extents)[None, :], left_rows, 0)
         right_rows = jnp.where(
-            local_valid_mask('y')[None, :], right_rows, 0)
+            local_valid_mask('y', logical_extents)[None, :], right_rows, 0)
         delta_q0 = jnp.einsum('ai,aj->ij', left_rows, right_rows)
         return packed.at[0, :, :].add(delta_q0)
 
     @partial(jax.jit,
-             in_shardings=(packed_sharding, left_sharding, right_sharding),
+             in_shardings=(packed_sharding, left_sharding, right_sharding,
+                           logical_sharding),
              out_shardings=packed_sharding, donate_argnums=(0,))
-    def add_q0(packed, left_rows, right_rows):
-        return add_local(packed, left_rows, right_rows)
+    def add_q0(packed, left_rows, right_rows, logical_extents):
+        return add_local(packed, left_rows, right_rows, logical_extents)
 
     _q0_update_cache[key] = add_q0
     return add_q0
@@ -389,7 +393,8 @@ def add_photon_q0_low_rank(
 
     updated = _q0_update_program(
         layout, mesh_xy, packed_shape[0], packed.dtype)(
-            packed, left_rows_X, right_rows_Y)
+            packed, left_rows_X, right_rows_Y,
+            jnp.asarray(layout.logical_extents, dtype=jnp.int32))
     # Repeated bounded updates reuse the donated accumulator.  This explicit
     # lifetime boundary prevents independently produced factor pairs from
     # overlapping the next update's live set under asynchronous dispatch.
