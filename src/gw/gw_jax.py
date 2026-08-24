@@ -98,8 +98,8 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	HeadCorrection, LorraxConfig, QPSolver, ScreeningDiagrams,
-	refuse_unimplemented_compute_mode)
+	BispinorGWMode, HeadCorrection, LorraxConfig, QPSolver,
+	ScreeningDiagrams, refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -298,6 +298,11 @@ def main(argv=None):
 			HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
 			HeadCorrection.OFF: "no special Gamma-cell contribution",
 		}[config.head.correction]))
+	if config.bispinor:
+		print0(
+			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}" +
+			(" (experimental no-pair full four-current static RPA, headless)"
+			 if config.bispinor_gw.value == "full_static_cohsex" else ""))
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -565,21 +570,43 @@ def main(argv=None):
 	# SC solves W inside each map and persists only the final accepted map.
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.
+	photon_response = None
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		W_by_role = {}
 	else:
 		with timing.section("gw_jax.screening", announce=True,
 		                    label="screening (chi0 -> W)"):
-			W_by_role = compute_screening_model(
-				mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
-				centroid_indices=centroid_indices, config=config, meta=meta,
-				mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
-				label="oneshot", head_resolver=head_resolver,
-				head_channel=getattr(isdf, 'head_channel', None),
-				mpa_plan=oneshot_mpa_plan,
-				iteration_head_response=oneshot_head_response,
-				tensors_filename=tensors_filename,
-				print_fn=print0)
+			if config.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
+				if wfns_transverse is None or bispinor_v_q_path is None:
+					raise RuntimeError(
+						"full_static_cohsex requires the transverse wavefunction "
+						"bundle and v_q_bispinor.h5; refusing a charge-only W.")
+				from .w_isdf import compute_static_photon_response
+				photon_response = compute_static_photon_response(
+					wfns, wfns_transverse, quad, bispinor_v_q_path,
+					meta, mesh_xy, energy_reference=e_ref,
+					dyson_solver=config.backend.w_dyson_solver,
+					distrib_la_batched_route=(
+						config.backend.distrib_la_batched_route))
+				# Full Sigma consumes packed block views directly.  Do not extract a
+				# scalar W00 body solely to satisfy the legacy role mapping.
+				W_by_role = {}
+				print0(
+					"  full photon response: "
+					f"approximation={photon_response.approximation}, "
+					f"current_contact={photon_response.current_contact}, "
+					f"packed_extent={photon_response.layout.packed_extent}")
+			else:
+				W_by_role = compute_screening_model(
+					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+					centroid_indices=centroid_indices, config=config, meta=meta,
+					mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
+					label="oneshot", head_resolver=head_resolver,
+					head_channel=getattr(isdf, 'head_channel', None),
+					mpa_plan=oneshot_mpa_plan,
+					iteration_head_response=oneshot_head_response,
+					tensors_filename=tensors_filename,
+					print_fn=print0)
 
 	if oneshot_head_response is not None:
 		if mode.value == "mpa":
@@ -614,7 +641,8 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if (driver_persists_w0(mode, config)
+	if (config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX
+			and driver_persists_w0(mode, config)
 			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		with timing.section("gw_jax.persist_w0"):
 			from .gw_output import persist_w0_and_head
@@ -684,8 +712,15 @@ def main(argv=None):
 				input_dir=input_dir,
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,
+				photon_response=photon_response,
 				print_fn=print0,
 			)
+		# Screening bodies have no consumer after Sigma.  In the photon mode
+		# this drops the packed V/W pair at the exact lifetime boundary rather
+		# than carrying O(N_gamma^2) arrays through QP/output post-processing.
+		W_by_role = {}
+		photon_response = None
+		gc.collect()
 
 		# Print bare Σ_X diagonal for ISDF quality assessment.  Apply
 		# BGW-style degenerate-set averaging (mirrors Sigma/shiftenergy.f90)
