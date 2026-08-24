@@ -93,6 +93,7 @@ __all__ = [
     "minibz_inscribed_sphere_r2",
     "minibz_average",
     "minibz_moment_tensor",
+    "minibz_transverse_head_avg",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
 ]
@@ -532,6 +533,96 @@ def minibz_moment_tensor(
             Kq = K[:n_q]
             M = (Kq * v[:n_q, None]).T @ Kq / float(n_q)
         per_batch.append(M)
+    return np.mean(np.stack(per_batch, axis=0), axis=0)
+
+
+def minibz_transverse_head_avg(
+    shift_cart, dq_batches, *,
+    kind: str,
+    celvol: float,
+    n_kpts: int,
+    q0sph2: float,
+    alpha: float | None = None,
+    zc: float | None = None,
+    analytic_sphere: bool = False,
+    adaptive: bool = True,
+    n_coarse: int = 250_000,
+    eps_K2: float = 1e-30,
+) -> np.ndarray:
+    """Mini-BZ Voronoi CELL AVERAGE of ``v(q) t_ab(q̂)`` — the bare
+    Coulomb-gauge transverse-projector head, ``t_ab(q̂) = δ_ab − q̂_a q̂_b``.
+
+    This is the current-current (bispinor TT) analogue of
+    :func:`minibz_average`'s scalar charge head ``⟨v(q)⟩``: the CHARGE
+    structure factor obeys ``M_mn(q→0) → δ_mn`` so its q=0 exchange slot
+    needs only the bare cell average ``⟨v⟩``, but the CURRENT structure
+    factor ``⟨m|α^i|n⟩`` is finite and generically non-diagonal, and the
+    q=0 slot of the bare transverse propagator carries the DIRECTION-
+    DEPENDENT projector ``t_ab(q̂)`` rather than the identity.  A single
+    grid point cannot represent that — ``t_ab`` has no limit as ``q→0`` —
+    so the correct discrete-BZ-sum replacement for the zeroed q=0 slot is
+    this cell average, exactly as ``⟨v⟩`` replaces the zeroed CC slot.
+
+    For an isotropic 3D cell the closed form is
+    ``⟨t_ab⟩_angle = (2/3) δ_ab`` (the projector's trace is 2 in every
+    direction); for the in-plane mini-BZ of a slab it is
+    ``diag(1/2, 1/2, 1)`` — the measured LORRAX reference value
+    (``docs/BISPINOR_DHFB_DESIGN.md`` §11, bi4 deck: 0.4993, 0.5007,
+    1.0000).  Neither closed form is assumed here; both fall out of the
+    same Monte-Carlo estimator ``minibz_average`` already uses, weighted
+    by ``t_ab`` instead of ``1``.
+
+    ``K2_safe`` guards the SAME single degenerate sample any batch can
+    contain — ``shift_cart = 0`` and ``δq = 0`` exactly never occurs on a
+    continuous Sobol/uniform draw, so this only matters for a
+    pathological/test batch; production draws never hit it.
+
+    ESTIMATOR — same two BGW branches as :func:`minibz_average`, sample
+    for sample:
+
+    * ``|shift|² < TOL`` and ``analytic_sphere`` (3D only) — MC of
+      ``v·t_ab`` OUTSIDE the inscribed sphere (÷ full sample count) plus
+      the closed-form isotropic sphere term.  The angular average of
+      ``t_ab`` over a full sphere is ``(2/3)δ_ab`` for ANY radius, so the
+      sphere's analytic contribution is the scalar Baldereschi-Tosatti
+      term (:func:`minibz_average`) times ``(2/3)δ_ab`` — the same
+      factorisation :func:`minibz_moment_tensor` uses for its own
+      isotropic sphere twin.
+    * else — pure adaptive MC on the first ``n_q`` draws (2D slab heads,
+      whose ``|Q|`` cusp is integrable, always take this branch).
+
+    Returns a real ``(3, 3)`` array, meaned over the replicate batches
+    (the same free error bar as :func:`minibz_average`).  Bare units —
+    NO ``1/celvol`` — matching :func:`minibz_average`'s convention; the
+    caller applies its own volume factor at injection.
+    """
+    shift = np.asarray(shift_cart, dtype=np.float64)
+    len_shift2 = float(np.dot(shift, shift))
+    head_branch = (len_shift2 < 1e-12) and analytic_sphere
+    per_batch = []
+    for dq in dq_batches:
+        dq = np.asarray(dq, dtype=np.float64)
+        n_tot = dq.shape[0]
+        v, len2 = _minibz_kernel_bare(shift, dq, kind=kind,
+                                      alpha=alpha, zc=zc)
+        K = shift[None, :] + dq                       # (N, 3) full momentum
+        len2_safe = np.where(len2 > eps_K2, len2, 1.0)
+        t = (np.eye(3)[None, :, :]
+             - K[:, :, None] * K[:, None, :] / len2_safe[:, None, None])
+        if head_branch:
+            outside = len2 > q0sph2
+            w = np.where(outside, v, 0.0)
+            T = np.einsum('n,nab->ab', w, t) / float(n_tot)
+            analytic = 4.0 * np.sqrt(q0sph2) * float(celvol) * float(n_kpts) / np.pi
+            T = T + np.eye(3) * (2.0 / 3.0) * analytic
+        else:
+            if adaptive and len_shift2 > 1e-12:
+                n_q = int(round(n_coarse * 4.0 * q0sph2 / len_shift2))
+                n_q = max(1, min(n_q, n_tot))
+            else:
+                n_q = n_tot
+            T = np.einsum('n,nab->ab', v[:n_q], t[:n_q]) / float(n_q)
+        per_batch.append(T)
     return np.mean(np.stack(per_batch, axis=0), axis=0)
 
 

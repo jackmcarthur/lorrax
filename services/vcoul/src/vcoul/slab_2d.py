@@ -14,7 +14,8 @@ import numpy as np
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                          minibz_voronoi_batches, sample_minibz_qpoints)
+                          minibz_transverse_head_avg, minibz_voronoi_batches,
+                          sample_minibz_qpoints)
 
 __all__ = ["Slab2D"]
 
@@ -159,3 +160,33 @@ class Slab2D:
         wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
         wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
         return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
+
+    def q0_average_transverse_tensor(
+        self, geometry: CoulombGeometry, kgrid, *,
+        nsamples: int = 2**18,
+        method: str = "sobol",
+        qmc_reps: int = 10,
+        analytic_sphere: bool = False,
+    ) -> np.ndarray:
+        """``T_ab = ⟨v_slab(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare Coulomb-
+        gauge transverse-projector head (bispinor TT), bare units (no
+        ``1/celvol``).  Same draw as :meth:`q0_average` (``nmax`` 1↔3 on
+        the same ``analytic_sphere`` flag, ``is_2d=True``), so a caller
+        pinned to the CC ``vc0`` sampler gets the SAME sample points for
+        the TT head — see :func:`~vcoul.minibz.minibz_transverse_head_avg`
+        for the estimator and the physics it replaces (the missing q=Γ,
+        G=0 slot of the bare TT tiles,
+        ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
+        """
+        nkx, nky, nkz = (int(s) for s in kgrid)
+        bvec = np.asarray(geometry.bvec, dtype=np.float64)
+        nmax = 3 if analytic_sphere else 1
+        batches = sample_minibz_qpoints(
+            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
+            qmc_reps=qmc_reps, nmax=nmax, is_2d=True)
+        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=True)
+        return minibz_transverse_head_avg(
+            np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
+            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
+            q0sph2=q0sph2, zc=float(np.pi / bvec[2, 2]),
+            analytic_sphere=analytic_sphere, adaptive=True)
