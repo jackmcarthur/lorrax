@@ -97,6 +97,37 @@ def tile_dataset_name(mu_L: int, nu_L: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _tt_head_tensor(
+    *, bvec: np.ndarray, cell_volume: float, sys_dim: int, kgrid,
+) -> np.ndarray:
+    """``T_ab = ⟨v(q) t_ab(q̂)⟩_mBZ`` at q=Γ, BARE units (no ``1/celvol``).
+
+    The missing q=Γ, G=0 slot of the bare TT tiles — see
+    ``_make_per_q_v_builder_for_tile``'s ``tt_head_correction`` docstring
+    and ``docs/BISPINOR_DHFB_DESIGN.md`` §11.  One (3,3) tensor call per
+    run (not per tile, not per q); callers slice ``T[i, j]``.  Routed
+    through the same ``vcoul`` mini-BZ sampler ``q0_average`` uses for the
+    charge head's ``vc0`` — no second sampler.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    import vcoul
+    if int(sys_dim) not in (2, 3):
+        raise ValueError(
+            f"_tt_head_tensor: tt_head_correction is only implemented for "
+            f"sys_dim in (2, 3) (slab / bulk); got sys_dim={sys_dim}.  Box "
+            f"truncation (sys_dim=0) never zeros its q=Γ, G=0 slot, so it "
+            f"needs no head substitute (vcoul.box_0d.Box0D._v_bare_per_q's "
+            f"own docstring) — this should have been refused upstream by "
+            f"gw_config's bispinor_tt_head_correction validation.")
+    geometry = vcoul.CoulombGeometry(
+        bvec=np.asarray(bvec, dtype=np.float64), cell_volume=float(cell_volume))
+    kernel = vcoul.get_kernel(sys_dim)
+    return np.asarray(
+        kernel.q0_average_transverse_tensor(geometry, tuple(int(s) for s in kgrid)),
+        dtype=np.float64)
+
+
 def _make_per_q_v_builder_for_tile(
     *,
     mu_L: int, nu_L: int,
@@ -104,6 +135,8 @@ def _make_per_q_v_builder_for_tile(
     vcoul_cutoff_ry: float | None,
     bdot: np.ndarray | None = None,
     eps_K2: float = 1e-30,
+    kgrid=None,
+    tt_head_correction: bool = False,
 ):
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
@@ -115,7 +148,38 @@ def _make_per_q_v_builder_for_tile(
     the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
     (compute_v_q_per_G guards ``denom_zero``), so the product is zero
     regardless of t.  Head correction at q=Γ flows through the CC
-    tile's ``g0_acc``; transverse tiles intentionally omit it.
+    tile's ``g0_acc``; transverse tiles intentionally omit it —
+    UNLESS ``tt_head_correction=True``.
+
+    ``tt_head_correction`` (default False, byte-identical to every
+    existing deck when off).  The charge structure factor obeys
+    ``M_mn(q→0, G=0) → δ_mn``, an exact identity independent of direction,
+    so replacing the zeroed CC slot needs only the scalar cell average
+    ``⟨v⟩``.  The CURRENT structure factor ``⟨m|α^i|n⟩`` has no such
+    limit — it is finite and generically non-diagonal — and the bare
+    transverse propagator's own projector ``t_ij(K̂) = δ_ij − K̂_iK̂_j`` is
+    direction-dependent with NO limit as K→0 either.  A single grid point
+    (the zeroed q=Γ, G=0 slot) cannot represent either fact, and the
+    measured correction is not negligible: on the bi4 (MoS2 4×4) deck the
+    missing rank-1 head is comparable in Frobenius norm to the WHOLE
+    stored q=Γ TT slab (ratio 0.97/1.04/6.0 for the 11/22/33 tiles) and
+    the eqp effect is ≈0.2 meV at 4×4, decaying only as ~1/√N_k — the same
+    slow 2D decay that makes the charge head correction mandatory
+    (``KNOWN_LORRAX_ISSUES.md``, bispinor row; claim 41, job 7885325).
+
+    When on, the q=Γ, G=0 slot of a TT tile is replaced by the mini-BZ
+    Voronoi cell average ``⟨v(q) t_ij(q̂)⟩_mBZ`` (:func:`_tt_head_tensor`)
+    instead of being left at zero.  This is the SAME mechanism the CC
+    charge exchange head uses conceptually — a mini-BZ-averaged
+    replacement for an otherwise-undefined q→0 grid point — expressed at
+    the SAME site the value already flows through: the returned
+    ``v_per_G`` table.  No second Dyson/Σ code path is added; the
+    existing ``(μ,ν)`` convolution (``gw.v_q_g_flat``) and the existing
+    Σ^B kernel (``gw.sigma_x_bispinor``) consume the corrected tile
+    exactly as they consume any other value in it, which is what makes
+    this a rank-1 update in centroid space after the ``Σ_G`` contraction
+    (``ζ(q=Γ,μ,G=0)`` is the only nonzero-weight ζ row at that slot) even
+    though nothing here builds ``ζ`` or an outer product explicitly.
     """
     from .compute_vcoul import compute_v_q_per_G
 
@@ -127,6 +191,22 @@ def _make_per_q_v_builder_for_tile(
                 f"satisfy 1 ≤ μ_L, ν_L ≤ 3; got ({mu_L}, {nu_L}).")
         i, j = mu_L - 1, nu_L - 1
     bvec_f = np.asarray(bvec, dtype=np.float64)
+
+    _tt_correction_value = None
+    if tt_head_correction and not is_CC:
+        if kgrid is None:
+            raise ValueError(
+                "_make_per_q_v_builder_for_tile: tt_head_correction=True "
+                "needs kgrid (the mini-BZ Voronoi cell is defined by the "
+                "q-grid).")
+        T = _tt_head_tensor(
+            bvec=bvec_f, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
+        # Bare (T) -> the same "v(q+G)/Ω_cell already applied" convention
+        # compute_v_q_per_G's output carries (vcoul.base.CoulombKernel's
+        # own Protocol docstring) — divide by cell_volume ONCE, here, not
+        # inside the shared vcoul estimator (whose contract is explicitly
+        # bare, matching minibz_average/minibz_moment_tensor).
+        _tt_correction_value = complex(T[i, j] / float(cell_volume))
 
     def builder(q_irr_frac, gvec_components):
         v = compute_v_q_per_G(
@@ -142,10 +222,14 @@ def _make_per_q_v_builder_for_tile(
                     + np.asarray(gvec_components, dtype=np.float64))
         K_cart = np.einsum('ba,qbg->qag', bvec_f, qG_frac)
         K2 = np.sum(K_cart * K_cart, axis=1)             # (n_q, ngkmax)
-        K2_safe = np.where(K2 > eps_K2, K2, 1.0)
+        is_gamma_slot = K2 <= eps_K2                     # unique (q=Γ,G=0)
+        K2_safe = np.where(is_gamma_slot, 1.0, K2)
         Khat_ij = K_cart[:, i] * K_cart[:, j] / K2_safe
         t = (1.0 - Khat_ij) if i == j else -Khat_ij
-        return (v * t).astype(np.complex128)
+        v_t = (v * t).astype(np.complex128)
+        if _tt_correction_value is not None:
+            v_t = np.where(is_gamma_slot, _tt_correction_value, v_t)
+        return v_t
 
     return builder
 
@@ -179,6 +263,10 @@ def compute_V_q_bispinor_g_flat_to_h5(
     centroid_C_idx: np.ndarray | None = None,
     centroid_T_idx: np.ndarray | None = None,
     use_ibz: bool = False,
+    # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction
+    # (default off — every existing deck's TT tiles are byte-identical).
+    # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
+    tt_head_correction: bool = False,
 ) -> Path:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -283,6 +371,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             mu_L=mu_L, nu_L=nu_L,
             bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
             vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
+            kgrid=kgrid, tt_head_correction=tt_head_correction,
         )
         # BGW vcoul overlay only meaningful on the CC tile; transverse
         # tiles are pure projector applications.  Wrap the builder.
