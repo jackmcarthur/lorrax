@@ -90,6 +90,7 @@ other assertion in that file and mean nothing).
 from __future__ import annotations
 
 from itertools import combinations
+from runtime.padding import spec_divisor
 
 __all__ = ["legal_spec", "fit_sharding", "shard_factor", "padded_extent"]
 
@@ -103,13 +104,7 @@ def shard_factor(mesh, entry) -> int:
     product, because a tuple entry flattens those mesh axes onto one array
     axis.
     """
-    if entry is None:
-        return 1
-    names = (entry,) if isinstance(entry, str) else tuple(entry)
-    n = 1
-    for a in names:
-        n *= int(mesh.shape[a])
-    return n
+    return spec_divisor(mesh, (entry,), axis=0)
 
 
 def padded_extent(mesh, entry, n: int) -> int:
