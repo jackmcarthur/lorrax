@@ -40,6 +40,7 @@ been folded" convention.
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 
@@ -82,7 +83,8 @@ import symmetry_maps                                            # noqa: E402
 
 _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
-_GRAM_TRANSIENT_BUDGET_FRACTION = 0.25
+_GRAM_SEED_BUDGET_FRACTION = 0.25
+_GRAM_FINAL_FOLD_SLOTS = 4
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -112,7 +114,7 @@ def auto_gram_col_block_width(
     divisor: int = 1,
     min_width: int = _GRAM_MIN_COL_BLOCK,
 ) -> int:
-    """Largest mesh-aligned Gram block whose priced transient fits.
+    """Largest mesh-aligned Gram seed tile whose square-law price fits.
 
     Auto widths align *down* so rounding for a mesh can never invalidate the
     memory bound.  Refuse before the pair-density allocation when even the
@@ -124,7 +126,7 @@ def auto_gram_col_block_width(
                    // divisor_i) * divisor_i
     if budget_i < 1:
         raise MemoryError(
-            f"Gram column-block planner has no positive budget: {budget_i} B"
+            f"Gram tile planner has no positive seed budget: {budget_i} B"
         )
     coefficient = gram_col_block_bytes(nk, nspinor, 1)
     max_unaligned = math.isqrt(budget_i // coefficient)
@@ -132,7 +134,7 @@ def auto_gram_col_block_width(
     if width < min_aligned:
         required = gram_col_block_bytes(nk, nspinor, min_aligned)
         raise MemoryError(
-            "Gram column-block planner refuses before pair-density "
+            "Gram tile seed planner refuses before pair-density "
             f"allocation: nk={int(nk)}, nspinor={int(nspinor)}, minimum "
             f"mesh-aligned block={min_aligned} prices {required / 2**30:.2f} "
             f"GiB but the Gram transient budget is {budget_i / 2**30:.2f} "
@@ -151,53 +153,102 @@ def gram_col_block_device_bytes(
     x_shards: int = 1,
     y_shards: int = 1,
 ) -> int:
-    """Exact local bytes of the two sharded ``M x block`` pair tensors.
+    """Exact local bytes of the two sharded square pair-density tiles.
 
-    The registered square-law planner controls the large-nk auto width.  A
-    distinct physical bound is still needed when ``M / x_shards`` exceeds
-    that width, notably on a 1x1 mesh: the actual pair tensors have a full
-    candidate-row axis and only their output-column axis is blocked.
+    ``n_rows`` remains in the signature for callers of the b6 pricing API;
+    the live row extent is now bounded by the tile width rather than silently
+    remaining the full candidate extent.  That makes the physical allocation
+    agree with :func:`gram_col_block_bytes`' square law.
     """
     x_i = max(1, int(x_shards))
     y_i = max(1, int(y_shards))
-    rows_local = (int(n_rows) + x_i - 1) // x_i
+    rows_local = (min(int(n_rows), int(block_width)) + x_i - 1) // x_i
     cols_local = (int(block_width) + y_i - 1) // y_i
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
-def _cap_gram_width_to_device_footprint(
-    width: int,
+def gram_block_live_set_bytes(
     *,
-    nk: int,
-    nspinor: int,
-    n_rows: int,
+    resident_bytes: int,
+    pair_left_peak_bytes: int,
+    pair_right_peak_bytes: int,
+    gram_fold_peak_bytes: int,
+    one_pair_tile_bytes: int,
+    gram_matrix_local_bytes: int,
+) -> dict[str, int]:
+    """Complete per-device live set for one 2-D Gram tile.
+
+    ``resident_bytes`` is read from the live XLA allocator after BOTH WFN
+    windows have been produced by ``load_centroids_band_chunked``.  The three
+    executable peaks come from ``runtime.aot_memory`` applied to the exact
+    canonical pair-density and q=0-fold JITs.  The right pair build adds the
+    completed left pair tile; the fold peak already includes both pair inputs.
+    Completed Gram tiles remain resident, so one full local Gram is included
+    at every tile stage.  Finally, concatenate + transpose/conjugate + output
+    are conservatively four full local-Gram slots.
+    """
+    resident = int(resident_bytes)
+    pair_tile = int(one_pair_tile_bytes)
+    gram_local = int(gram_matrix_local_bytes)
+    stages = {
+        "pair_left": resident + gram_local + int(pair_left_peak_bytes),
+        "pair_right": (resident + gram_local + pair_tile
+                       + int(pair_right_peak_bytes)),
+        "gram_fold": resident + gram_local + int(gram_fold_peak_bytes),
+        "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
+    }
+    stages["peak"] = max(stages.values())
+    return stages
+
+
+def _auto_gram_width_from_compiled_peaks(
+    seed_width: int,
+    *,
+    max_width: int,
+    divisor: int,
     budget_bytes: int,
-    x_shards: int,
-    y_shards: int,
-) -> int:
-    """Cap a square-law width to the exact local pair-tensor footprint."""
-    x_i = max(1, int(x_shards))
-    y_i = max(1, int(y_shards))
-    min_aligned = ((_GRAM_MIN_COL_BLOCK + y_i - 1) // y_i) * y_i
-    rows_local = (int(n_rows) + x_i - 1) // x_i
-    bytes_per_local_col = gram_col_block_bytes(nk, nspinor, 1) * rows_local
-    max_local_cols = int(budget_bytes) // bytes_per_local_col
-    device_width = max_local_cols * y_i
-    capped = min(int(width), device_width)
-    capped = (capped // y_i) * y_i
-    if capped < min_aligned:
-        required = gram_col_block_device_bytes(
-            nk, nspinor, n_rows, min_aligned,
-            x_shards=x_shards, y_shards=y_shards,
-        )
+    peak_for_width,
+) -> tuple[int, dict[str, int]]:
+    """Geometrically grow/shrink to the largest certified rung.
+
+    Each rung compiles the SAME canonical tile executables production will
+    run.  A geometric ladder avoids a dozen throw-away production-shape
+    compilations while retaining a strict property: the returned rung itself
+    was queried and fits.  Tail tiles are zero-padded to this width, so there
+    is only one static executable shape to certify.
+    """
+    d = max(1, int(divisor))
+    floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
+    ceiling = (int(max_width) // d) * d
+    width = min(max(floor, (int(seed_width) // d) * d), ceiling)
+    checked: dict[int, dict[str, int]] = {}
+
+    def check(w):
+        if w not in checked:
+            checked[w] = peak_for_width(w)
+        return checked[w]
+
+    facts = check(width)
+    while facts["peak"] > int(budget_bytes) and width > floor:
+        width = max(floor, ((width // 2) // d) * d)
+        facts = check(width)
+    if facts["peak"] > int(budget_bytes):
         raise MemoryError(
-            "Gram column-block planner refuses before pair-density "
-            f"allocation: the minimum mesh-aligned block={min_aligned} "
-            f"needs {required / 2**30:.2f} GiB/device for the two local "
-            f"M x block pair tensors but the Gram transient budget is "
-            f"{int(budget_bytes) / 2**30:.2f} GiB/device."
+            "Gram tile planner refuses before pair-density allocation: "
+            f"the minimum mesh-aligned tile={floor} has a compiled full "
+            f"live set of {facts['peak'] / 2**30:.2f} GiB/device, above "
+            f"the {int(budget_bytes) / 2**30:.2f}-GiB/device target."
         )
-    return capped
+
+    while width < ceiling:
+        wider = min(ceiling, ((2 * width) // d) * d)
+        if wider <= width:
+            break
+        wider_facts = check(wider)
+        if wider_facts["peak"] > int(budget_bytes):
+            break
+        width, facts = wider, wider_facts
+    return width, facts
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1578,8 +1629,11 @@ def build_gram_q0_via_loadwfns(
     from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
+        pair_density_aot_peak_bytes,
         gram_q0_from_pair,
+        gram_q0_aot_peak_bytes,
     )
+    from runtime.padding import pad_axis
 
     # Resolve windows.
     if band_range_left is None or band_range_right is None:
@@ -1687,18 +1741,19 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
 
-    # ---- Column-blocked path (size-ladder wall fix) ----
+    # ---- 2-D tiled path (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
     # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
-    # Per-element contraction order is unchanged by blocking the OUTPUT
-    # columns, so G is numerically the same map; only materialization moves.
-    # On a multi-device mesh each sliced block is explicitly restored to its
-    # declared y sharding below before pair_density consumes it.
+    # Per-element contraction order is unchanged by tiling BOTH candidate
+    # axes, so G is numerically the same map; only materialization moves.  The
+    # two-axis tile is important: the nk-aware square law must price the same
+    # object the pair-density compiler sees, never an unpriced M x block.
     n_dev_total = mesh_xy.devices.size
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
     col_block = 0
-    # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
+    # LORRAX_GRAM_COL_BLOCK: historical name, now an explicit square-tile
+    # width; a falsy token
     # means "no override", i.e. the auto budget below.  This USED to be a
     # bare presence test — ``=0`` and ``=off`` are the two spellings a user
     # reaches for to DISABLE a knob, and they did the opposite or crashed.
@@ -1706,10 +1761,11 @@ def build_gram_q0_via_loadwfns(
     if env_cb.lower() in ("", "0", "false", "no", "off"):
         env_cb = ""
     nk_, _, ns_, M_cols = (int(x) for x in psi_l_rmu_Y.shape)
-    budget_bytes = int(
+    seed_budget_bytes = int(
         float(meta.memory_per_device_gb) * 1e9
-        * _GRAM_TRANSIENT_BUDGET_FRACTION
+        * _GRAM_SEED_BUDGET_FRACTION
     )
+    tile_divisor = math.lcm(n_x, n_y)
     block_source = "auto"
     if env_cb:
         block_source = "LORRAX_GRAM_COL_BLOCK override"
@@ -1721,45 +1777,25 @@ def build_gram_q0_via_loadwfns(
         except ValueError:
             raise ValueError(
                 f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                f"integer column width nor a falsy token "
+                f"integer tile width nor a falsy token "
                 f"('', 0, false, no, off)."
             ) from None
-        # A manual width keeps its historical floor and is rounded UP to a
-        # whole y-shard.  It is an explicit override, so it may exceed auto's
-        # budget and the diagnostic below makes that visible.
-        col_block = ((col_block + n_y - 1) // n_y) * n_y
+        # A manual width keeps its historical floor and is rounded UP so the
+        # now-square tile divides BOTH mesh axes.  It is an explicit override,
+        # so it may exceed auto's target and the diagnostic below says so.
+        col_block = ((col_block + tile_divisor - 1)
+                     // tile_divisor) * tile_divisor
     else:
-        if gram_col_block_bytes(nk_, ns_, M_cols) <= budget_bytes:
+        if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
             col_block = M_cols
         else:
             col_block = auto_gram_col_block_width(
-                nk_, ns_, budget_bytes, divisor=n_y,
-            )
-            col_block = _cap_gram_width_to_device_footprint(
-                col_block,
-                nk=nk_, nspinor=ns_, n_rows=M_cols,
-                budget_bytes=budget_bytes,
-                x_shards=n_x, y_shards=n_y,
+                nk_, ns_, seed_budget_bytes, divisor=tile_divisor,
             )
     if col_block >= M_cols:
         col_block = 0  # one full block == the original computation
 
     if col_block:
-        if verbose:
-            square_gib = (
-                gram_col_block_bytes(nk_, ns_, col_block) / 2**30
-            )
-            local_gib = gram_col_block_device_bytes(
-                nk_, ns_, M_cols, col_block,
-                x_shards=n_x, y_shards=n_y,
-            ) / 2**30
-            print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
-                  f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; {n_dev_total}-device "
-                  f"path; {block_source}; priced transient="
-                  f"{square_gib:.2f} GiB square-law, {local_gib:.2f} "
-                  f"GiB/device local; auto budget="
-                  f"{budget_bytes / 2**30:.2f} GiB/device)")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
@@ -1769,30 +1805,177 @@ def build_gram_q0_via_loadwfns(
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
             psi_r_rmu_Y.block_until_ready()
+
+        # Compiler-aware width selection happens only after BOTH canonical
+        # WFN windows exist.  The allocator reading is therefore the actual
+        # resident floor (including loader tables and any unrelated live
+        # arrays), not a second shape formula for the WFN service.
+        gc.collect()
+        from common.gpu_utils import _get_jax_gpu_memory_bytes
+        _, live_now, _ = _get_jax_gpu_memory_bytes()
+        if live_now is None:
+            # CPU/fallback accounting: sum the returned WFN shards.  Announce
+            # that this is weaker because it cannot see service tables.
+            resident_bytes = 0
+            for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
+                        psi_r_rmu_Y, psi_r_rmuT_X):
+                resident_bytes += sum(
+                    int(np.asarray(sh.data).nbytes)
+                    for sh in arr.addressable_shards
+                )
+            from runtime.aot_memory import announce_once
+            announce_once(
+                "gram-live-allocator-unavailable",
+                "allocator bytes_in_use unavailable for the Gram planner; "
+                "using the four canonical WFN output shards as a KNOWN-LOW "
+                "resident floor",
+            )
+        else:
+            resident_bytes = int(live_now)
+
+        target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
+        gram_local_bytes = (
+            ((M_cols + n_x - 1) // n_x)
+            * ((M_cols + n_y - 1) // n_y)
+            * _GRAM_COMPLEX_BYTES
+        )
+
+        def _compiled_live_set(tile_width):
+            tile_width = int(tile_width)
+            left_peak = pair_density_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_left,
+                nspinor=ns_, n_col=tile_width,
+            )
+            right_peak = pair_density_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_right,
+                nspinor=ns_, n_col=tile_width,
+            )
+            fold_peak = gram_q0_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, nspinor=ns_,
+                n_rmu=tile_width, n_col=tile_width,
+            )
+            one_pair_local = (
+                nk_ * ns_ * ns_
+                * ((tile_width + n_x - 1) // n_x)
+                * ((tile_width + n_y - 1) // n_y)
+                * _GRAM_COMPLEX_BYTES
+            )
+            facts = gram_block_live_set_bytes(
+                resident_bytes=resident_bytes,
+                pair_left_peak_bytes=left_peak,
+                pair_right_peak_bytes=right_peak,
+                gram_fold_peak_bytes=fold_peak,
+                one_pair_tile_bytes=one_pair_local,
+                gram_matrix_local_bytes=gram_local_bytes,
+            )
+            facts.update({
+                "pair_left_compiled": int(left_peak),
+                "pair_right_compiled": int(right_peak),
+                "gram_compiled": int(fold_peak),
+                "pair_tile": int(one_pair_local),
+            })
+            return facts
+
+        # Keep a genuine blocked path: the sequential full-M path below has
+        # a smaller WFN live set and remains preferable whenever the cheap
+        # b6 square-law screen said it fits.
+        max_tile_width = ((M_cols - 1) // tile_divisor) * tile_divisor
+        if not env_cb:
+            col_block, live_facts = _auto_gram_width_from_compiled_peaks(
+                col_block,
+                max_width=max_tile_width,
+                divisor=tile_divisor,
+                budget_bytes=target_bytes,
+                peak_for_width=_compiled_live_set,
+            )
+        else:
+            live_facts = _compiled_live_set(col_block)
+
+        if verbose:
+            square_gib = (
+                gram_col_block_bytes(nk_, ns_, col_block) / 2**30
+            )
+            local_gib = gram_col_block_device_bytes(
+                nk_, ns_, M_cols, col_block,
+                x_shards=n_x, y_shards=n_y,
+            ) / 2**30
+            ntiles = -(-M_cols // col_block)
+            print(
+                f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
+                f"tile={col_block} ({ntiles}x{ntiles} tiles; "
+                f"{n_dev_total}-device path; {block_source}; "
+                f"square-law={square_gib:.2f} GiB global, "
+                f"two-pair local={local_gib:.2f} GiB/device; "
+                f"resident(two WFN windows)={resident_bytes / 2**30:.2f}, "
+                f"compiled L/R/fold="
+                f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
+                f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
+                f"{live_facts['gram_compiled'] / 2**30:.2f}, "
+                f"full-live peak={live_facts['peak'] / 2**30:.2f} "
+                f"of target={target_bytes / 2**30:.2f} GiB/device)"
+            )
         col_y = NamedSharding(
             mesh_xy, PartitionSpec(None, None, None, 'y'),
         )
+        row_x = NamedSharding(
+            mesh_xy, PartitionSpec(None, 'x', None, None),
+        )
+        tile_xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
         with timing.section("q0_sum"):
-            g_blocks = []
+            g_col_blocks = []
             for c0 in range(0, M_cols, col_block):
                 c1 = min(c0 + col_block, M_cols)
-                # Slicing a y-sharded axis can yield replicated sharding,
-                # which pair_density's explicit input contract refuses.  The
-                # auto block and the padded final extent are y-divisible, so
-                # this placement is a local sharding restoration.
-                block_l = psi_l_rmu_Y[..., c0:c1]
-                block_r = psi_r_rmu_Y[..., c0:c1]
-                if n_dev_total > 1:
-                    block_l = device_put_process_local(block_l, col_y)
-                    block_r = device_put_process_local(block_r, col_y)
-                P_l_b = pair_density(psi_l_rmuT_X, block_l, mesh_xy)
-                P_r_b = pair_density(psi_r_rmuT_X, block_r, mesh_xy)
-                G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
-                                        symmetrize=False)
-                G_b.block_until_ready()
-                g_blocks.append(G_b)
-                del P_l_b, P_r_b, block_l, block_r
-            G = jnp.concatenate(g_blocks, axis=1)
+                g_row_tiles = []
+                for r0 in range(0, M_cols, col_block):
+                    r1 = min(r0 + col_block, M_cols)
+
+                    # Tail tiles use ONE static compiled shape.  Padding is
+                    # exact zero through runtime.padding's canonical helper;
+                    # pair density and q=0 folding are bilinear, so the pad is
+                    # inert.  Slice only the finished G tile back to logical.
+                    row_l = pad_axis(
+                        psi_l_rmuT_X[:, r0:r1, :, :], col_block, axis=1,
+                    ).array
+                    block_l = pad_axis(
+                        psi_l_rmu_Y[..., c0:c1], col_block, axis=3,
+                    ).array
+                    if n_dev_total > 1:
+                        row_l = device_put_process_local(row_l, row_x)
+                        block_l = device_put_process_local(block_l, col_y)
+                    P_l_b = pair_density(row_l, block_l, mesh_xy)
+                    # This barrier makes the planner's stage max real: the
+                    # left compiler arena is gone before the right one starts.
+                    P_l_b.block_until_ready()
+                    del row_l, block_l
+
+                    row_r = pad_axis(
+                        psi_r_rmuT_X[:, r0:r1, :, :], col_block, axis=1,
+                    ).array
+                    block_r = pad_axis(
+                        psi_r_rmu_Y[..., c0:c1], col_block, axis=3,
+                    ).array
+                    if n_dev_total > 1:
+                        row_r = device_put_process_local(row_r, row_x)
+                        block_r = device_put_process_local(block_r, col_y)
+                    P_r_b = pair_density(row_r, block_r, mesh_xy)
+                    P_r_b.block_until_ready()
+                    del row_r, block_r
+
+                    G_b = gram_q0_from_pair(
+                        P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                        symmetrize=False,
+                    )
+                    G_b.block_until_ready()
+                    del P_l_b, P_r_b
+                    G_b = G_b[:r1 - r0, :c1 - c0]
+                    if n_dev_total > 1:
+                        G_b = device_put_process_local(G_b, tile_xy)
+                    g_row_tiles.append(G_b)
+                G_col = jnp.concatenate(g_row_tiles, axis=0)
+                G_col.block_until_ready()
+                g_col_blocks.append(G_col)
+                del g_row_tiles
+            G = jnp.concatenate(g_col_blocks, axis=1)
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
             G = 0.5 * (G + jnp.conj(G.T))
