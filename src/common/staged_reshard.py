@@ -179,6 +179,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
+from runtime.padding import spec_divisor
 
 #: The two exchange schedules that land on ``P((ax_x, ax_y), None, None)``.
 #: ``split_b_first`` is the default and the measured one; ``flatten_m_first``
@@ -245,9 +246,10 @@ def band_to_product_r_reshard(
             f"{names} do not contain axes={axes!r}")
     p_x = int(mesh.shape[ax_x])
     p_y = int(mesh.shape[ax_y])
-    ndev = p_x * p_y
     in_spec = P(None, (ax_x, ax_y), None, None)
     out_spec = P(None, None, None, (ax_y, ax_x))
+    band_divisor = spec_divisor(mesh, in_spec, axis=1)
+    r_divisor = spec_divisor(mesh, out_spec, axis=3)
 
     def _body(a):
         if p_y > 1:
@@ -294,7 +296,7 @@ def band_to_product_r_reshard(
                 f"committed to {in_spec} on the supplied Mesh; got "
                 f"spec={P(*actual_spec)} on {type(sharding).__name__}. "
                 "Refusing an implicit pre-reshard at the shard_map boundary.")
-        if shape[1] % ndev or shape[3] % ndev:
+        if shape[1] % band_divisor or shape[3] % r_divisor:
             raise ValueError(
                 "band_to_product_r_reshard requires the band and r extents "
                 f"to divide the {p_x}x{p_y} mesh product: shape={shape}. "

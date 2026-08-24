@@ -278,6 +278,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis
 
@@ -299,20 +300,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-
-def band_sphere_spec() -> P:
-    """THE ψ layout: ``(n_k, nb, nspinor, ngkmax)``, bands over the mesh.
-
-    One definition, three consumers — ``wfn_loader`` defaults to
-    it, this sweep contracts in it, and ``gw.qsgw_density`` builds ρ from
-    it.  A second literal of the same PartitionSpec would not raise if it
-    drifted; it would silently insert a reshard between them, which is the
-    same class of latent bug ``runtime.padding.spec_divisor`` removed on
-    the band divisor.
-    """
-    return P(None, ("x", "y"), None, None)
-
-
 
 class SweepGeometry:
     """The fixed shapes every operator and the scan agree on.

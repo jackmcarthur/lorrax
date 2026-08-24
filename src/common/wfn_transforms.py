@@ -49,6 +49,7 @@ import numpy as np
 from runtime.padding import round_up, pad_axis, spec_divisor
 from common.shard_map import shard_map
 from common.staged_reshard import band_to_product_r_reshard
+from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -1000,7 +1001,7 @@ def gflat_to_rmu(
             f"gflat_to_rmu: r_mu must be (n_rmu, 3); got shape "
             f"{r_mu_arr.shape}.")
     n_rmu     = int(r_mu_arr.shape[0])
-    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+    p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)
     # Band-flat sharding needs the band axis divisible by the mesh.  Pad it
     # up with ZERO bands so ANY device count works: the htransform SP /
     # galerkin entry (bandstructure.htransform.streaming_galerkin_solve)
@@ -1105,9 +1106,9 @@ def gflat_to_rmu(
         # already used by ``isdf_fitting._make_pair_pipeline_sm`` for
         # the same buffer and ensures both sides share the canonical
         # WfnLoader-cached device allocation.
-        in_spec  = P(None, ('x', 'y'), None, None)
+        in_spec  = band_sphere_spec()
         gidx_spec = P(None, None, None, None)
-        out_spec = P(None, ('x', 'y'), None, None)
+        out_spec = band_sphere_spec()
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(in_spec, gidx_spec),
@@ -1798,7 +1799,7 @@ def read_Gvecs_to_devices(
     else:
         k = list(range(int(k_range[0]), int(k_range[1])))
 
-    sharding = P(None, ("x", "y"), None, None)
+    sharding = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
     psi_G_flat = loader.load(
@@ -1815,10 +1816,6 @@ def read_Gvecs_to_devices(
     return psi_box, nb_logical
 
 
-# Default band-sharded G-flat spec shared by every ψ(G-flat) load site.
-_GFLAT_LOAD_SPEC = P(None, ('x', 'y'), None, None)
-
-
 def load_psi_gflat_padded(
     loader,
     bands: tuple[int, int],
@@ -1827,7 +1824,7 @@ def load_psi_gflat_padded(
     bispinor: bool,
     pad_to: int | None = None,
     k="full_bz",
-    sharding: P = _GFLAT_LOAD_SPEC,
+    sharding: P = band_sphere_spec(),
 ) -> "jax.Array | None":
     """One capped + zero-padded ψ(G-flat) load — THE shared load dance.
 
@@ -1985,7 +1982,7 @@ def iter_psi_rchunk_bandwise(
             _zeros_out_cache[shape] = fn
         return fn()
 
-    sharding_load = _GFLAT_LOAD_SPEC
+    sharding_load = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
     # Reuse the loader-owned replicated device table.  Passing the host table
@@ -2148,7 +2145,7 @@ def load_centroids_band_chunked(
     # centroid extent loaded here must equal the meta extent the ζ-fit
     # kernels were shaped with.
     n_rmu_padded = padded_mu_extent(n_rmu, mesh_xy)
-    sharding_load = P(None, ('x', 'y'), None, None)
+    sharding_load = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
     # Persistent term for the bulk WFN transfer.  gflat_to_rmu keeps the

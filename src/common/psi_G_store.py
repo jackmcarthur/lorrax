@@ -38,12 +38,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
 from common.shard_map import shard_map
+from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
-
-# Sharding spec for the ψ(G-flat) tile that the cache builder consumes after
-# io_callback: (n_k, nb, ns, ngkmax), band-flat-sharded over (x, y).
-_PSI_G_FLAT_SPEC = P(None, ('x', 'y'), None, None)
 
 
 def _zero_user_band_pad_in_shard(
@@ -244,7 +240,7 @@ class PsiGStore:
         # is still here and drives the SlabIO write side.
         from common import timing
         from common.wfn_transforms import load_psi_gflat_padded
-        sharding_spec = P(None, ('x', 'y'), None, None)
+        sharding_spec = band_sphere_spec()
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
             bc_start, bc_end = int(bc_range[0]), int(bc_range[1])
             b_lo = self._bc_band_offsets[bc_idx]
