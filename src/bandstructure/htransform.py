@@ -170,6 +170,24 @@ def resolve_fh_ortho_tol(log_fn=None) -> float:
     return tol
 
 
+def _make_galerkin_band_to_r_reshard(mesh_xy: Mesh):
+    """Build the explicit all-to-all from streamed band shards to r shards.
+
+    The Galerkin contraction reduces the complete ``(k, band)`` axis, so its
+    input must carry that axis locally and distribute the free real-space
+    axis.  Leaving this transition implicit makes the legacy SPMD partitioner
+    replicate the complete FFT box before repartitioning it.
+    """
+    psi_r_shard = NamedSharding(
+        mesh_xy, P(None, None, None, ('x', 'y')))
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=psi_r_shard)
+    def _reshard(psi):
+        return psi
+
+    return _reshard, psi_r_shard
+
+
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              rtol: float = 1e-8, log_fn=None,
@@ -584,13 +602,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # ``band_chunk_size`` buys is unchanged; only Q is now carried across the
     # band loop, which is exactly what makes the split exact.
 
-    def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, sharding_y, sharding_xy):
+    def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, sharding_y,
+                           psi_r_sharding):
         key = (id(mesh_), rank_, bc_size, nspinor_)
         fn = _accum_G_cache.get(key)
         if fn is not None:
             return fn
 
-        @partial(jax.jit, donate_argnums=(2, 3), out_shardings=sharding_y)
+        @partial(jax.jit, donate_argnums=(2, 3),
+                 in_shardings=(rep, rep, psi_r_sharding, sharding_y),
+                 out_shardings=sharding_y)
         def _accum(UH_bc, inv_s, psi_bc, Q_in):
             # UH_bc: (rank, nk·bc) replicated; inv_s: (rank,1) replicated
             # psi_bc: (nk, bc, ns, r_chunk) sharded P(None,None,None,'y')
@@ -622,6 +643,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     n_r_carried = flat_r_carried_extent(n_rtot, nspinor, mesh_xy)
     q_extent = nspinor * n_r_carried
     sharding_y = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    reshard_psi_to_r, psi_r_sharding = (
+        _make_galerkin_band_to_r_reshard(mesh_xy))
     if n_r_carried != n_rtot:
         log_fn(
             f"  Galerkin Q r-pad: {n_rtot} physical -> {n_r_carried} "
@@ -695,9 +718,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             UH_bc_kb = jnp.pad(UH_bc_kb, ((0, 0), (0, 0), (0, w - bc)))
         UH_bc = UH_bc_kb.reshape(rank, nk * w)
 
+        # The loader distributes the padded band axis over the whole mesh.
+        # The contraction below reduces that axis and leaves r free, so make
+        # the required band->r all-to-all explicit.  If left to inference,
+        # XLA's legacy SPMD partitioner replicates the complete FFT box on
+        # every device before repartitioning it (54.3 GiB/device for CrI3).
+        psi_bc_R = reshard_psi_to_r(psi_bc_Y)
+        del psi_bc_Y
         accum = _make_accum_kernel(rank, w, nspinor, mesh_xy,
-                                   sharding_y, grid_xy)
-        Q = accum(UH_bc, inv_s, psi_bc_Y, Q)
+                                   sharding_y, psi_r_sharding)
+        Q = accum(UH_bc, inv_s, psi_bc_R, Q)
         chunk_count += 1
     del psi_G_win  # window served its last consumer; free before Q Qᴴ
     G = _fold_G(Q, G)

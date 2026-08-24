@@ -5,10 +5,32 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import pytest
 
 from common import wfn_transforms as wt
+
+
+def test_galerkin_band_shards_are_explicitly_resharded_to_r():
+    if len(jax.devices()) < 4:
+        pytest.skip(f"needs 4 devices, have {len(jax.devices())}")
+    from bandstructure.htransform import _make_galerkin_band_to_r_reshard
+
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    shape = (2, 4, 1, 8)
+    band_shard = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
+    source = jax.device_put(
+        np.arange(np.prod(shape), dtype=np.float64).reshape(shape),
+        band_shard)
+    expected = np.asarray(source)
+
+    reshard, r_shard = _make_galerkin_band_to_r_reshard(mesh)
+    carried = reshard(source)
+    carried.block_until_ready()
+
+    assert carried.sharding.spec == P(None, None, None, ('x', 'y'))
+    assert carried.sharding == r_shard
+    np.testing.assert_array_equal(np.asarray(carried), expected)
 
 
 def test_cri3_carried_extent_uses_the_full_4x4_mesh():
