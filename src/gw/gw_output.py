@@ -44,7 +44,9 @@ class GWResults:
     sig_coh : np.ndarray, (nk, nb, nb)
         Static Coulomb-hole Σ_COH (Ry).
     sig_h : np.ndarray, (nk, nb, nb)
-        Hartree self-energy (Ry).
+        Source-resolved direct Hartree contribution (Ry).  Its scalar charge
+        part is zero when the exact scalar Hartree is folded into
+        ``kin_ion_ry``; independent non-scalar direct fields may remain.
     sig_x : np.ndarray, (nk, nb, nb)
         Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
         and as a quality-of-fit check in COHSEX mode.
@@ -59,9 +61,10 @@ class GWResults:
     kin_ion_has_hartree : bool
         True when ``kin_ion.h5`` carried ``has_hartree=True``, i.e. the
         exact FFT-grid mean-field V_H is already inside ``kin_ion_ry``.
-        The writer then adds NO Hartree term of its own; ``sig_h`` is
-        already zeroed upstream in ``sigma_dispatch``, and this flag
-        makes the writer's contract explicit rather than implicit.
+        The writer then adds no separate *scalar* Hartree term;
+        ``sigma_dispatch`` has already removed that part from ``sig_h``.
+        Independent non-scalar direct fields remain in ``sig_h`` and this
+        flag does not suppress them.
     band_start, band_stop : int
         0-based band window [band_start, band_stop).
     use_ppm : bool
@@ -1225,12 +1228,11 @@ def write_results(
     # sigSX/sigCOH/sigTOT/VH; PPM prints sigX/sigC/sigXC/VH (same array
     # slots, relabelled).  The driver passes the right arrays for each mode.
     #
-    # NOTE on the VH column when ``kin_ion_has_hartree``: it reads 0.000
-    # by design.  V_H is no longer a self-energy channel there — it was
-    # folded into kin_ion at generation time — so the ISDF quadrature is
-    # suppressed upstream and this column truthfully reports "no Hartree
-    # added here".  The mean-field V_H is not separately recoverable from
-    # ``kin_ion.h5``; regenerate with ``--no-hartree`` if you need it split.
+    # NOTE on the VH column when ``kin_ion_has_hartree``: its scalar charge
+    # part is 0.000 by design because that V_H was folded into kin_ion at
+    # generation time.  A separately resolved non-scalar direct field may
+    # remain and is reported here; the folded scalar mean field is not
+    # separately recoverable from ``kin_ion.h5``.
     if results.use_ppm:
         sx_arr = results.sig_x
         diag_ry = results.sigma_c_diag_at_dft_ry
@@ -1343,13 +1345,14 @@ def write_results(
         np.real(np.diagonal(_wedge(results.kin_ion_ry), axis1=1, axis2=2)) * r2e
     )
     # ── H₀'s Hartree term ─────────────────────────────────────────────────
-    # Handed to the assembly PRE-seam: ``eqp_bgw.resolve_hartree_diag_ev``
-    # is the one place that decides whether this column is suppressed
-    # (legacy folded kin_ion), substituted (a stored exact V_H the caller
-    # supplies) or used as given (ISDF quadrature, or the exact matrix
-    # ``sigma_dispatch`` already substituted into ``sig_h``).  The rule
-    # used to be restated here AND in ``eqp_bgw.make_eqp_bgw``; it is now
-    # written once, so the live driver and the post-hoc CLI cannot drift.
+    # Handed to the assembly POST-seam: ``sigma_dispatch`` has already
+    # resolved the scalar source into ``sig_h``.  That distinction matters
+    # when ``sig_h`` also carries a non-scalar direct field (the transverse
+    # photon Hartree term): applying the folded/stored scalar rule again
+    # would erase the residual from eqp0/eqp1 while leaving it in the live
+    # Hamiltonian.  ``hartree_already_resolved=True`` makes the shared eqp
+    # seam preserve this exact operator; the post-hoc CLI leaves the flag
+    # false and resolves its raw file column there.
     # The mean-field (implied-V_xc) gate moved with it — ``assemble_eqp``
     # runs ``_warn_on_unphysical_h0`` on the resolved arrays, so a broken
     # H₀ still reports itself exactly once, with the same wording.
@@ -1441,6 +1444,7 @@ def write_results(
         nspin=1,
         hartree_source=results.hartree_source,
         kin_ion_has_hartree=results.kin_ion_has_hartree,
+        hartree_already_resolved=True,
         print_fn=print_fn,
     ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
@@ -1486,9 +1490,10 @@ def write_results(
         not results.self_consistent
         and results.sigma_xc_at_dft_ev is not None
     ):
-        # ``sig_h`` is identically zero in exact-V_H mode (suppressed in
-        # ``sigma_dispatch``), so this sum is the same H₀ the eqp writer
-        # used in both modes.
+        # The scalar part of ``sig_h`` is zero in folded exact-V_H mode;
+        # any independently resolved non-scalar direct field remains.  This
+        # is therefore the same H0 operator the eqp writer used in every
+        # source mode.
         h0_diag = (
             np.real(
                 np.diagonal(results.kin_ion_ry + results.sig_h, axis1=1, axis2=2)

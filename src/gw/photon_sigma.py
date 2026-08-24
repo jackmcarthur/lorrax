@@ -104,8 +104,8 @@ def compute_static_photon_hartree(
             f"wavefunctions ({n_t}) and packed layout ({expected_t})")
 
     from .cohsex_sigma import (
-        _make_hartree_density_kernel, _make_hartree_field_kernel,
-        _make_hartree_projection_kernel,
+        make_hartree_density_kernel, make_hartree_field_kernel,
+        make_hartree_projection_kernel,
         _replicate_band_sigma,
     )
     from .photon_layout import photon_block_view
@@ -116,10 +116,10 @@ def compute_static_photon_hartree(
     endpoint = face_kernel_kwargs(wfns_transverse)
     layout = endpoint.get("layout", "legacy")
     face_shape = endpoint.get("face_shape")
-    density = _make_hartree_density_kernel(
+    density = make_hartree_density_kernel(
         mesh_xy, layout=layout, face_shape=face_shape)
-    field = _make_hartree_field_kernel(mesh_xy, int(meta.nk_tot))
-    project = _make_hartree_projection_kernel(
+    field = make_hartree_field_kernel(mesh_xy, int(meta.nk_tot))
+    project = make_hartree_projection_kernel(
         mesh_xy, layout=layout, face_shape=face_shape)
 
     fields_A = [None, None, None]

@@ -17,8 +17,8 @@ optional and applied to SX/COH (and to the bare-X pass separately).
 
 Two-face carrier (``low_mem_bands = true``, ``wfns.layout == "face"``):
 :func:`_make_cohsex_kernels` dispatches to
-:func:`_make_cohsex_kernels_legacy` (the exact pre-existing body,
-untouched) or :func:`_make_cohsex_kernels_face`, which builds G via
+:func:`_make_cohsex_kernels_legacy` or :func:`_make_cohsex_kernels_face`,
+whose SX/COH bodies retain their pre-existing algorithms and which build G via
 ``greens_function_kernel.build_G(layout="face")``, projects via
 ``common.contract_bands.contract_bands_block_reshard(layout="face")``
 (through ``wavefunction_bundle.project``), and gives Hartree its OWN
@@ -200,7 +200,7 @@ _hartree_field_cache: dict[tuple[object, ...], object] = {}
 _hartree_projection_cache: dict[tuple[object, ...], object] = {}
 
 
-def _make_hartree_density_kernel(
+def make_hartree_density_kernel(
     mesh_xy: Mesh, *, layout: str, face_shape=None,
 ):
     """Occupied one-point ``sum_kn f_kn psi^dag Gamma_B psi`` owner.
@@ -251,7 +251,7 @@ def _make_hartree_density_kernel(
     return density
 
 
-def _make_hartree_field_kernel(mesh_xy: Mesh, nk_tot: int):
+def make_hartree_field_kernel(mesh_xy: Mesh, nk_tot: int):
     """Canonical ``V_AB(q=0) rho_B / Nk`` distributed matvec."""
     key = (id(mesh_xy), int(nk_tot))
     if key in _hartree_field_cache:
@@ -271,7 +271,7 @@ def _make_hartree_field_kernel(mesh_xy: Mesh, nk_tot: int):
     return field
 
 
-def _make_hartree_projection_kernel(
+def make_hartree_projection_kernel(
     mesh_xy: Mesh, *, layout: str, face_shape=None,
 ):
     """Project one local ``Gamma_A phi_A`` field into band space.
@@ -405,10 +405,10 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         return _cohsex_kernel_cache[cache_key]
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
-    hartree_density = _make_hartree_density_kernel(
+    hartree_density = make_hartree_density_kernel(
         mesh_xy, layout=layout, face_shape=face_shape)
-    hartree_field = _make_hartree_field_kernel(mesh_xy, nk_tot)
-    hartree_project = _make_hartree_projection_kernel(
+    hartree_field = make_hartree_field_kernel(mesh_xy, nk_tot)
+    hartree_project = make_hartree_projection_kernel(
         mesh_xy, layout=layout, face_shape=face_shape)
 
     if layout == "legacy":
