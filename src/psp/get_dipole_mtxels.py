@@ -48,6 +48,8 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 dipole_operator, sweep_matrix_elements)
 from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
 from common.wfn_transforms import load_kpoint_fftbox_local
+from common.bispinor_init import HALFALPHA
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
@@ -59,6 +61,8 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
+
+_ALPHA_FS = 2.0 * HALFALPHA
 
 # --------------------------
 # K+G helpers
@@ -193,9 +197,10 @@ def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
     return map_arr, mask
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=('selected_dirac_current',))
 def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
-                                map_arr, mask):
+                                map_arr, mask, *,
+                                selected_dirac_current=False):
     """Symmetric-velocity cell overlap on G-sphere with umklapp lookup.
 
     All inputs in the canonical-kmq / k G-sphere layouts:
@@ -217,6 +222,8 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
                  v_sym = ½(v_R + v_L)
                  v_R = ⟨bra | (kin + VNL(k))|ket⟩       — bra unchanged
                  v_L = ⟨(kin + VNL(k_can_kmq))|bra⟩† |ket⟩
+    alpha_mn : (3, nc, nv) complex128 or None — exact selected
+                 ⟨bra|alpha_i|ket⟩ on the same four-spinor coefficients.
     """
     # Bra aligned to ket's G-axis: (nc, ns, nG_k).
     bra_aligned = jnp.take(c_can_m, map_arr, axis=-1)
@@ -235,7 +242,22 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
     v_L = jnp.einsum('amsG,nsG->amn', jnp.conj(vbra_aligned), c_n_k,
                        optimize=True)
     v_sym = 0.5 * (v_R + v_L)
-    return rho_mn, v_sym
+
+    alpha_mn = None
+    if selected_dirac_current:
+        if c_n_k.shape[1] != 4:
+            raise ValueError(
+                "selected Dirac current requires four-spinor coefficients; "
+                f"got spin axis {c_n_k.shape[1]}")
+        alpha_channels = []
+        for mu in (1, 2, 3):
+            perm, phase = gamma_perm_phase(mu)
+            alpha_ket = gamma_apply(c_n_k, perm, phase, axis=1)
+            alpha_channels.append(jnp.einsum(
+                'msG,nsG->mn', jnp.conj(bra_aligned), alpha_ket,
+                optimize=True))
+        alpha_mn = jnp.stack(alpha_channels, axis=0)
+    return rho_mn, v_sym, alpha_mn
 
 
 @functools.partial(jax.jit, static_argnames=('fft_grid',))
@@ -350,6 +372,10 @@ def compute_finite_q_mtxels(
       v_cvkq[3, nc, nv, nk, nq] complex128 — symmetric (v_R + v_L)/2 of
                                               ⟨u_{c, k-q} | v^α | u_{v, k}⟩_cell
                                               including kinetic + VNL.
+      alpha_cvkq[3, nc, nv, nk, nq] complex128 or None — dimensionless
+                                              ⟨u_{c,k-q}|alpha_i|u_{v,k}⟩.
+      ward_residual_cvkq[nc, nv, nk, nq] complex128 or None —
+          (E_c,k-q - E_v,k)_Ry rho + q_bohr^-1 · (2 alpha / alpha_fs), in Ry.
       kminq_idx[nk, nq] int32 — canonical k-q lookup.
 
     Plumbing:
@@ -389,6 +415,10 @@ def compute_finite_q_mtxels(
     nc_eff = c_hi - c_lo
 
     kpts_full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    energies_full_ry = (np.asarray(wfn.energies[0, :, :int(nb)],
+                                   dtype=np.float64)[np.asarray(
+                                       sym.irr_idx_k, dtype=np.int32)]
+                        if bispinor else None)
 
     # ── Per-k apply: kinetic + VNL on the ket side, plus same on bra side ──
     # Note: the apply'd vectors live on each k's own G-sphere.  We need
@@ -474,6 +504,8 @@ def compute_finite_q_mtxels(
     nq = len(iq_list)
     rho_cvkq = np.zeros((nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
     v_cvkq   = np.zeros((3, nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
+    alpha_cvkq = np.zeros_like(v_cvkq) if bispinor else None
+    ward_residual_cvkq = np.zeros_like(rho_cvkq) if bispinor else None
     kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
 
     for jq, iq_red in enumerate(iq_list):
@@ -482,6 +514,8 @@ def compute_finite_q_mtxels(
 
         qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
         qvec = qvec_pos - np.round(qvec_pos)
+        q_cart_bohr = qvec @ (np.asarray(wfn.bvec, dtype=np.float64)
+                              * float(wfn.blat))
 
         max_rho = max_v = 0.0
         for ik in range(nk_full):
@@ -498,20 +532,33 @@ def compute_finite_q_mtxels(
             map_arr_j = jnp.asarray(map_arr, dtype=jnp.int32)
             mask_j    = jnp.asarray(mask)
 
-            rho_mn, v_sym = _cell_overlap_with_lookup(
+            rho_mn, v_sym, alpha_mn = _cell_overlap_with_lookup(
                 psi_c_per_k[ikmq], psi_v_per_k[ik],
                 vket_v_per_k[ik],  vket_c_per_k[ikmq],
                 map_arr_j, mask_j,
+                selected_dirac_current=bool(bispinor),
             )
             rho_cvkq[:, :, ik, jq] = np.asarray(rho_mn)
             v_cvkq[:, :, :, ik, jq] = np.asarray(v_sym)
             max_rho = max(max_rho, float(jnp.max(jnp.abs(rho_mn))))
             max_v   = max(max_v,   float(jnp.max(jnp.abs(v_sym))))
+            if bispinor:
+                alpha_np = np.asarray(alpha_mn)
+                alpha_cvkq[:, :, :, ik, jq] = alpha_np
+                delta_e_ry = (
+                    energies_full_ry[ikmq, c_lo:c_hi, None]
+                    - energies_full_ry[ik, None, v_lo:n_occ])
+                ward_np = (delta_e_ry * np.asarray(rho_mn)
+                           + (2.0 / _ALPHA_FS)
+                           * np.einsum('a,amn->mn', q_cart_bohr, alpha_np,
+                                       optimize=True))
+                ward_residual_cvkq[:, :, ik, jq] = ward_np
         if verbose:
             print(f"    iq={iq_red:>3d}  q_signed={tuple(float(v) for v in qvec)}  "
                   f"|rho|_∞={max_rho:.3e}  |v|_∞={max_v:.3e}")
 
-    return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
+    return (rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
+            kminq_idx_kq, n_occ, v_lo, c_hi)
 
 # --------------------------
 # Provenance: which WFN and which band window produced this dipole.h5
@@ -1428,13 +1475,15 @@ def main(argv=None):
 	del dip_k_major
 
 	# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
-	rho_cvkq = v_cvkq = kminq_idx_kq = None
+	rho_cvkq = v_cvkq = alpha_cvkq = ward_residual_cvkq = None
+	kminq_idx_kq = None
 	cv_meta = None
 	if args.with_finite_q:
 		print("\nComputing finite-q matrix elements (SOS pipeline)...")
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 		with timing.section("finite_q"):
-			rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
+			(rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
+			 kminq_idx_kq, n_occ_eff, v_lo, c_hi) = compute_finite_q_mtxels(
 			wfn, sym, meta, vnl_setup, gtab,
 			nb=nb,
 			bispinor=bispinor,
@@ -1494,6 +1543,26 @@ def main(argv=None):
 				"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
 				"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
 				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
+			if alpha_cvkq is not None:
+				ds_alpha = fq.create_dataset('alpha_cvkq', data=alpha_cvkq)
+				ds_alpha.attrs['operator'] = (
+					"<u_{c,k-q}|alpha_i=gamma^0 gamma^i|u_{v,k}>_cell")
+				ds_alpha.attrs['units'] = "dimensionless"
+				ds_alpha.attrs['normalization'] = (
+					"same unrenormalized kinetic-balance four-spinors as rho_cvkq")
+				ds_ward = fq.create_dataset(
+					'ward_residual_cvkq', data=ward_residual_cvkq)
+				ds_ward.attrs['units'] = "rydberg"
+				ds_ward.attrs['formula'] = (
+					"(E_c(k-q)-E_v(k))_Ry*rho_cvkq + "
+					"q_cart_bohr^-1 dot (2*alpha_cvkq/alpha_fs)")
+				ds_ward.attrs['energy_source'] = "WFN mean-field eigenvalues"
+				fq.attrs['selected_current_model'] = (
+					"no_pair_kinetic_balance_raw_dirac_alpha")
+				fq.attrs['selected_current_lift'] = (
+					"psi_S=(alpha_fs/2)*sigma.p*psi_L")
+				fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
+				fq.attrs['alpha_fs'] = float(_ALPHA_FS)
 	barrier("dipole_write")
 	print(f"\nWrote dipole data to {out_path}")
 	timing.report(title="--- Timing (seconds) ---",
