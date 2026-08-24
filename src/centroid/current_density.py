@@ -1,187 +1,130 @@
-"""Gordon-decomposed Pauli current weight for ISDF centroid selection.
+"""Direct-Dirac current weight for transverse-channel ISDF centroids.
 
-W_curr(r) = Σ_{n∈occ, k, i} | j^Gordon_{n,k,i}(r) |²
-
-with
-
-  j^Gordon_{n,k}(r) = Im[ψ_L^† ∇ ψ_L]  +  (1/2) ∇ × (ψ_L^† σ ψ_L).
-                     └────────┬────────┘   └──────────┬──────────┘
-                       paramagnetic            spin-curl
-
-Vectorised across bands at fixed k (batched FFTs) to amortise JIT
-dispatch.  The 5-D ``∂_j s^k`` intermediate that blew up the naïve
-implementation is avoided by computing each curl component separately,
-each of which only touches two of the three s components.
+The only current-specific operation here is
+``sum_{n,k,i} |Psi_nk^dagger alpha_i Psi_nk / alpha_fs|^2``.  WFN symmetry
+unfolding, the kinetic-balance lift, G-sphere placement, and the FFT stay in
+their existing owners.
 """
 
 from __future__ import annotations
 
-import math
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.gamma_matrices import sigma_x, sigma_y, sigma_z
-from common.fft_helpers import local_fftn3, local_ifftn3
+from common.bispinor_init import HALFALPHA
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 
 
-def _build_K_cart(gvecs_k, kvec_frac, bvec_dimless, alat):
-    gk_frac = (gvecs_k.astype(np.float64) + kvec_frac[None, :])
-    return gk_frac @ bvec_dimless * (2.0 * math.pi / float(alat))
+_ALPHA_FS = 2.0 * HALFALPHA
 
 
-def build_current_density(wfn, sym, n_occ: int, *,
-                          verbose: bool = True) -> np.ndarray:
-    """Gordon-current weight on the FFT grid.
+@jax.jit
+def _dirac_current_weight(psi_r, band_mask=None):
+    """Band/k-summed physical current square from a real-space 4-spinor.
 
-    Vectorised over all occupied bands at each k — one JIT compile
-    per (ngk_k) shape.  Peak GPU memory ≈ O(n_occ × FFT-grid) scalars
-    plus a few transient buffers; for CrI3 6×6×1 (n_occ=70, FFT
-    75×75×200) that's ~7 GB, fits comfortably in 1× A100.
+    ``psi_r`` has shape ``(nk, nb, 4, nx, ny, nz)``.  The three matrices in
+    ``common.gamma_matrices`` are LORRAX's stored ``γ̃^i = γ⁰γ^i = α_i``;
+    :func:`gamma_apply` is their canonical monomial action.  Dividing the
+    bilinear by ``α_fs`` matches the existing Gordon-current convention.
     """
-    fft_grid = tuple(int(x) for x in wfn.fft_grid)
-    nx, ny, nz = fft_grid
-    nk_full = int(sym.nk_tot)
-    nspinor_wfn = int(wfn.nspinor)
+    if psi_r.ndim != 6 or psi_r.shape[2] != 4:
+        raise ValueError(
+            "_dirac_current_weight expects (nk, nb, 4, nx, ny, nz), got "
+            f"{psi_r.shape}")
+    if band_mask is None:
+        band_mask = jnp.ones((psi_r.shape[1],), dtype=jnp.float64)
+    mask = jnp.asarray(band_mask, dtype=jnp.float64).reshape(
+        1, -1, 1, 1, 1)
+    out = jnp.zeros(psi_r.shape[-3:], dtype=jnp.float64)
+    psi_dag = jnp.conj(psi_r)
+    for mu in (1, 2, 3):
+        # Resolve these canonical tables while tracing this one kernel, not
+        # as eager JAX slices at module import.
+        perm, phase = gamma_perm_phase(mu)
+        alpha_psi = gamma_apply(psi_r, perm, phase, axis=2)
+        current = (jnp.sum(psi_dag * alpha_psi, axis=2).real / _ALPHA_FS)
+        out = out + jnp.sum(current * current * mask, axis=(0, 1))
+    return out
 
-    bvec_dimless = np.asarray(wfn.bvec, dtype=np.float64)
-    alat = float(wfn.alat)
 
-    # FFT-grid Cartesian momentum for the spatial Fourier dual of unit-cell
-    # periodic fields like s(r).  Bohr⁻¹ via 2π/alat conversion.
-    gx_int = jnp.fft.fftfreq(nx, d=1.0/nx).astype(jnp.float64)
-    gy_int = jnp.fft.fftfreq(ny, d=1.0/ny).astype(jnp.float64)
-    gz_int = jnp.fft.fftfreq(nz, d=1.0/nz).astype(jnp.float64)
-    bvec_cart = jnp.asarray(bvec_dimless * (2.0 * math.pi / alat),
-                            dtype=jnp.float64)
+def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
+    """Build the occupied-state current weight on the WFN FFT grid."""
+    from common.collectives import single_device_mesh
+    from common.wfn_transforms import to_rbox
+    from wfn_loader import WfnLoader
+    from .charge_density import _uniform_band_windows
 
-    def _Kc_axis(j):
-        return (gx_int[:, None, None] * bvec_cart[0, j]
-                + gy_int[None, :, None] * bvec_cart[1, j]
-                + gz_int[None, None, :] * bvec_cart[2, j]).astype(jnp.complex128)
+    if not isinstance(wfn, WfnLoader):
+        raise TypeError(
+            "build_current_density requires the driver's open WfnLoader; "
+            f"got {type(wfn).__name__}")
+    if int(wfn.nspinor) != 2:
+        raise ValueError(
+            "density-mode=current requires a two-component Pauli WFN so the "
+            f"canonical kinetic-balance lift is defined; got nspinor="
+            f"{int(wfn.nspinor)}")
 
-    Kc_x, Kc_y, Kc_z = _Kc_axis(0), _Kc_axis(1), _Kc_axis(2)
-    sigmas = jnp.stack([sigma_x, sigma_y, sigma_z], axis=0)  # (3, 2, 2)
-
-    @jax.jit
-    def _kpt_contrib(psi_G_k, K_cart_g, ng_x, ng_y, ng_z):
-        """All-bands-at-once Σ_n,i (j^Gordon_{n,i})² for a single k.
-
-        psi_G_k: (n_occ, 2, ngk)
-        K_cart_g: (ngk, 3) Cartesian (k+G) in Bohr⁻¹
-        ng_{x,y,z}: (ngk,) int FFT-bin indices
-
-        Returns: (nx, ny, nz) float64 — band-summed j² + (1/2 curl_s)² + cross term.
-        """
-        n_occ_local = psi_G_k.shape[0]
-
-        # Place ψ_G into FFT box: (n_occ, 2, nx, ny, nz)
-        zero_box = jnp.zeros((n_occ_local, 2, nx, ny, nz), dtype=jnp.complex128)
-        psi_box = zero_box.at[:, :, ng_x, ng_y, ng_z].set(psi_G_k)
-        psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
-        # (n_occ, 2, nx, ny, nz)
-
-        def _grad_i(i):
-            """∂_i ψ_L(r): IFFT of i (k+G)_i ψ_L(G).  Output (n_occ, 2, nx, ny, nz)."""
-            iK_g = (1j * K_cart_g[:, i]).astype(jnp.complex128)
-            grad_G = psi_G_k * iK_g[None, None, :]
-            grad_box = zero_box.at[:, :, ng_x, ng_y, ng_z].set(grad_G)
-            return local_ifftn3(grad_box, axes=(-3, -2, -1), norm='ortho')
-
-        # Paramagnetic j^para_i(r) per band (use grad_i, then free)
-        grad_x = _grad_i(0)
-        j_x_n = jnp.einsum('naxyz,naxyz->nxyz', jnp.conj(psi_r), grad_x).imag
-        del grad_x
-        grad_y = _grad_i(1)
-        j_y_n = jnp.einsum('naxyz,naxyz->nxyz', jnp.conj(psi_r), grad_y).imag
-        del grad_y
-        grad_z = _grad_i(2)
-        j_z_n = jnp.einsum('naxyz,naxyz->nxyz', jnp.conj(psi_r), grad_z).imag
-        del grad_z
-
-        # Spin density per band per direction: (n_occ, nx, ny, nz) per i
-        s_x_n = jnp.einsum('naxyz,ab,nbxyz->nxyz',
-                            jnp.conj(psi_r), sigmas[0], psi_r).real
-        s_y_n = jnp.einsum('naxyz,ab,nbxyz->nxyz',
-                            jnp.conj(psi_r), sigmas[1], psi_r).real
-        s_z_n = jnp.einsum('naxyz,ab,nbxyz->nxyz',
-                            jnp.conj(psi_r), sigmas[2], psi_r).real
-        del psi_r
-
-        # FFT each component (per band); produce (n_occ, nx, ny, nz) cplx
-        sx_G = local_fftn3(s_x_n.astype(jnp.complex128),
-                            axes=(-3, -2, -1), norm='ortho')
-        sy_G = local_fftn3(s_y_n.astype(jnp.complex128),
-                            axes=(-3, -2, -1), norm='ortho')
-        sz_G = local_fftn3(s_z_n.astype(jnp.complex128),
-                            axes=(-3, -2, -1), norm='ortho')
-        del s_x_n, s_y_n, s_z_n
-
-        # Curl per direction (only two s components per call → no 5-D blowup)
-        curl_x = local_ifftn3(1j * (Kc_y[None, ...] * sz_G - Kc_z[None, ...] * sy_G),
-                               axes=(-3, -2, -1), norm='ortho').real
-        curl_y = local_ifftn3(1j * (Kc_z[None, ...] * sx_G - Kc_x[None, ...] * sz_G),
-                               axes=(-3, -2, -1), norm='ortho').real
-        curl_z = local_ifftn3(1j * (Kc_x[None, ...] * sy_G - Kc_y[None, ...] * sx_G),
-                               axes=(-3, -2, -1), norm='ortho').real
-        del sx_G, sy_G, sz_G
-
-        # j^Gordon_n,i = j^para_n,i + (1/2) curl_n,i; sum over (n, i) of squares
-        out = ((j_x_n + 0.5 * curl_x) ** 2
-               + (j_y_n + 0.5 * curl_y) ** 2
-               + (j_z_n + 0.5 * curl_z) ** 2)
-        return jnp.sum(out, axis=0)
+    n_occ = int(n_occ)
+    if n_occ < 1 or n_occ > int(wfn.nbands):
+        raise ValueError(
+            f"n_occ must lie in [1, {int(wfn.nbands)}], got {n_occ}")
+    fft_grid = tuple(int(v) for v in wfn.fft_grid)
+    n_grid = int(np.prod(fft_grid))
+    # Same fixed-shape window rule as the charge-density stream.  The 3x
+    # factor prices the r-box plus the current kernel's two live equivalents.
+    bytes_per_band = 3 * 4 * n_grid * np.dtype(np.complex128).itemsize
+    chunk = max(1, min(n_occ, (4 * 1024 ** 3) // bytes_per_band))
+    windows = [
+        (lo, jnp.asarray(mask))
+        for lo, mask in _uniform_band_windows(0, n_occ, chunk)
+    ]
 
     t0 = time.perf_counter()
-    rho_curr = jnp.zeros(fft_grid, dtype=jnp.float64)
     last_log = t0
+    mesh = single_device_mesh()
 
-    # WfnLoader covers per-k unfold (U_spinor + τ-phase + TRS-conj) +
-    # G-vector rotation in one place; the per-ik loop stays so the
-    # full ψ_all × full-BZ-k slab never has to fit in host RAM.
-    from ffi import _services
-    _services.ensure_on_path()
-    from wfn_loader import WfnLoader
-    with WfnLoader(wfn.path) as loader:
-        gvecs_full = loader.gvecs(k="full_bz")        # (nk_full, ngkmax, 3)
-        ngk_valid = loader.ngk_valid(k="full_bz")     # (nk_full,)
-        for ik in range(nk_full):
-            n = int(ngk_valid[ik])
-            gvecs_k = gvecs_full[ik, :n]
-            kvec_frac = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
-            K_cart = _build_K_cart(gvecs_k, kvec_frac, bvec_dimless, alat)
-
-            psi_k = loader.load(
-                bands=(0, n_occ), k=[ik], sharding=None)   # (1, n_occ, ns, ngkmax)
-            psi_G_k_np = np.zeros((n_occ, 2, n), dtype=np.complex128)
-            psi_G_k_np[:, :nspinor_wfn, :] = np.asarray(
-                psi_k[0, :, :, :n])
-
-            rho_curr = rho_curr + _kpt_contrib(
-                jnp.asarray(psi_G_k_np),
-                jnp.asarray(K_cart, dtype=jnp.complex128),
-                jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32),
-                jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32),
-                jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32),
+    def field_for_k(k_spec):
+        box_index = wfn.box_index(k=k_spec)
+        field = jnp.zeros(fft_grid, dtype=jnp.float64)
+        for b_lo, band_mask in windows:
+            psi_g = wfn.load_process_local(
+                bands=(b_lo, b_lo + chunk), k=k_spec, bispinor=True)
+            psi_r = to_rbox(
+                psi_g,
+                box_index,
+                fft_grid,
+                mesh=mesh,
+                norm="ortho",
             )
+            field = field + _dirac_current_weight(psi_r, band_mask)
+            field.block_until_ready()
+            del psi_g, psi_r
+        return field
 
-            if verbose and (time.perf_counter() - last_log > 5.0):
-                rho_curr.block_until_ready()
-                last_log = time.perf_counter()
-                print(f"    [j^Gordon] {ik+1}/{nk_full} k-points "
-                      f"after {last_log - t0:.1f}s", flush=True)
+    rho_curr = jnp.zeros(fft_grid, dtype=jnp.float64)
+    nk_full = int(sym.nk_tot)
+    # Exact selected-row symmetry action stays in WfnLoader.  A global scalar
+    # projector is not equivalent for sum_n |j_nn|^2 under degenerate-band
+    # mixing, even though the resulting field is time-reversal even.
+    for ik in range(nk_full):
+        rho_curr = rho_curr + field_for_k([ik])
+        rho_curr.block_until_ready()
+        if verbose and time.perf_counter() - last_log > 5.0:
+            last_log = time.perf_counter()
+            print(f"    [Dirac current] {ik + 1}/{nk_full} full-BZ k "
+                  f"points after {last_log - t0:.1f}s", flush=True)
 
+    rho_curr = rho_curr / float(nk_full)
     rho_curr.block_until_ready()
-    rho_curr = rho_curr / nk_full
     rho_np = np.asarray(rho_curr)
-
     if verbose:
         dt = time.perf_counter() - t0
-        print(f"  ρ_current (Gordon Pauli) built in {dt:.2f}s; "
-              f"max={float(rho_np.max()):.3e}, mean={float(rho_np.mean()):.3e}",
-              flush=True)
+        print(f"  ρ_current (direct Dirac, WfnLoader full-BZ, chunk={chunk}) built "
+              f"in {dt:.2f}s; max={float(rho_np.max()):.3e}, "
+              f"mean={float(rho_np.mean()):.3e}", flush=True)
     return rho_np
 
 
