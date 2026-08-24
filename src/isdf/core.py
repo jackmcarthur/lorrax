@@ -33,7 +33,7 @@ from common.gamma_matrices import (
     gamma_double_contract,
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
-from common.wfn_transforms import _take_rchunk_padded, to_rchunk_inner
+from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
 # Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
 # same as everything else this module imports -- no ``gw`` dependency.
@@ -1639,7 +1639,7 @@ def _z_q_face(
 					# start backward and silently substitute earlier cells;
 					# the canonical padded take keeps the requested logical
 					# cells and zero-fills only the inert carrier tail.
-					psi_Y_bc_local_full_r = _take_rchunk_padded(
+					psi_Y_bc_local_full_r = take_rchunk_padded(
 						psi_r_cache_[bc_idx], r_start_, n_zchunk)
 				else:
 					psi_G_bc_local = _io_callback(
