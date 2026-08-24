@@ -235,9 +235,10 @@ A level assignment nobody argued is a level assignment nobody will keep.
    2026-07-31 (§6); `SlabIOBackend` was resolved by deletion 2026-08-06 (§5).
 9. **`bandstructure/htransform.py` — still an L1 driver and an L1 library in
    one file.** Same shape `gw/kin_ion_io.py` had before it was split. The
-   projected-Gram `shard_map`, memory plan, and r-outer/band-inner schedule
-   now live in the named L1 kernel owner `isdf/galerkin.py`; the remaining
-   centroid basis fit and fH interpolation are still library code, while
+   complete reusable centroid Galerkin fit — typed basis, projected-Gram
+   `shard_map`, memory plan, and r-outer/band-inner schedule — now lives in
+   the named L1 owner `isdf/galerkin.py`. Htransform retains only the thin
+   deck/environment policy adapter plus its fH interpolation library, while
    `main()` is a driver. Its hand-rolled `_build_mesh_xy` was the first
    separable part and is gone.
 10. **`runtime/padding.py` — L3, though it is arithmetic.** `round_up` looks
