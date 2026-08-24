@@ -75,6 +75,31 @@ def test_reduced_policy_is_opt_in_and_refit_is_refused():
     assert "if rank_multiplier > 0.0:" in src
 
 
+def test_exact_rank_report_excludes_left_gram_null_tail_and_counts_pad():
+    """The carried report owns the selected block plus exact-null padding."""
+    pytest.importorskip("jax")
+    from bandstructure import htransform as ht
+    from common import rank_criterion
+
+    src = inspect.getsource(ht.streaming_galerkin_solve)
+    assert "s_host[:rank_phys], rtol" in src
+
+    # Toy of the production failure plus the closure corner: the raw left
+    # Gram has three above-rtol null-space values beyond a five-direction
+    # physical block.  A mesh-aligned carrier of eight must be reported as
+    # +3 exact-null pads, never as a -3 device-grid truncation.
+    raw_left_gram = np.asarray([1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.09, 0.08])
+    rank_phys = 5
+    carried = 8
+    assert rank_criterion.select_rank(raw_left_gram, 1.0e-8) > rank_phys
+    report = rank_criterion.rank_report(
+        raw_left_gram[:rank_phys], 1.0e-8, rank_used=carried)
+    assert report.rank_criterion == rank_phys
+    assert report.n_padded_alignment == carried - rank_phys
+    assert report.n_dropped_alignment == 0
+    assert not report.violations(), report.violations()
+
+
 def test_bse_consumers_forward_the_q_chunk_key():
     """The local-batch route is useful only if the documented width arrives."""
     from pathlib import Path

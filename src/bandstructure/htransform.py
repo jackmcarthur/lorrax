@@ -949,16 +949,18 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         log=log_fn)
 
     if rank_multiplier == 0.0:
-        # Historical report and accounting, unchanged on the default route.
+        # The numerical report above owns the full left-Gram spectrum, its
+        # structural ceiling and any symmetry-closure drop.  This second
+        # report describes only the physical block actually selected plus
+        # the exact-null carrier pad.  Feeding it the left-Gram null tail
+        # would mislabel above-rtol round-off as a device-grid round-down;
+        # feeding it the pre-closure ceiling would hide closure-sized pads.
         _trunc = rank_criterion.rank_report(
-            s_host, rtol,
+            s_host[:rank_phys], rtol,
             label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
                   f"{nspinor*n_mu})",
             quantity="singular values", rank_used=rank,
-            n_rows=nk * nb, n_cols=nspinor * n_mu,
-            n_dropped_closure=max(
-                0, _sc_numerical["n_keep"] -
-                _sc_numerical["n_keep_closed"]))
+            n_rows=nk * nb, n_cols=nspinor * n_mu)
         _closure_for_report = _sc_numerical
     else:
         # The model-order tail is not a GRID drop and must never be fed to
