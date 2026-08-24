@@ -195,6 +195,136 @@ def _face_kwargs(wfns) -> dict:
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 _static_convolution_cache: dict[tuple[object, ...], object] = {}
+_hartree_density_cache: dict[tuple[object, ...], object] = {}
+_hartree_field_cache: dict[tuple[object, ...], object] = {}
+_hartree_projection_cache: dict[tuple[object, ...], object] = {}
+
+
+def _make_hartree_density_kernel(
+    mesh_xy: Mesh, *, layout: str, face_shape=None,
+):
+    """Occupied one-point ``sum_kn f_kn psi^dag Gamma_B psi`` owner.
+
+    The returned vector is the unnormalised k-sum on its native centroid
+    ``P('y')`` face.  The sole ``1/Nk`` factor remains in the field matvec
+    kernel, exactly where the incumbent scalar Hartree path applies it.
+
+    ``wfns_vertex`` is produced by the canonical
+    :func:`gw.wavefunction_bundle.with_lorentz_vertices`: its right/G-conjugate
+    field carries ``Gamma_B``.  Scalar Hartree passes ``wfns`` itself, which
+    is exactly what channel zero's identity specialization returns.
+    """
+    shape_key = None if face_shape is None else tuple(int(v) for v in face_shape)
+    key = (id(mesh_xy), layout, shape_key)
+    if key in _hartree_density_cache:
+        return _hartree_density_cache[key]
+
+    if layout not in ("legacy", "face"):
+        raise ValueError(f"Hartree density: unknown layout {layout!r}")
+    if layout == "face" and face_shape is None:
+        raise ValueError("face Hartree density requires face_shape")
+    nb_full = None if face_shape is None else int(face_shape[1])
+
+    @jax.jit
+    def density(wfns, wfns_vertex, Gij):
+        s = wfns.slices
+        if layout == "legacy":
+            psi = wfns.yr(s.sigma)
+            vertex_psi = wfns_vertex.yr(s.sigma)
+            rho_sum = jnp.real(jnp.einsum(
+                "kisx,kjsx,kij->x", jnp.conj(psi), vertex_psi, Gij,
+                optimize=True))
+            return jax.lax.with_sharding_constraint(
+                rho_sum, NamedSharding(mesh_xy, P("y")))
+
+        occ = jnp.real(_occ_diag_full(
+            Gij, s.nb_sigma, nb_full)).astype(jnp.float64)
+        psi = wfns.psi_nmu
+        vertex_psi = wfns_vertex.psi_nmu
+        rho_sum = jnp.real(jnp.sum(
+            jnp.conj(psi) * vertex_psi * occ[:, :, None, None],
+            axis=(0, 1, 2)))
+        return jax.lax.with_sharding_constraint(
+            rho_sum, NamedSharding(mesh_xy, P("y")))
+
+    _hartree_density_cache[key] = density
+    return density
+
+
+def _make_hartree_field_kernel(mesh_xy: Mesh, nk_tot: int):
+    """Canonical ``V_AB(q=0) rho_B / Nk`` distributed matvec."""
+    key = (id(mesh_xy), int(nk_tot))
+    if key in _hartree_field_cache:
+        return _hartree_field_cache[key]
+
+    @jax.jit
+    def field(V_AB, rho_sum):
+        rho = rho_sum / jnp.asarray(nk_tot, dtype=jnp.float64)
+        rho = jax.lax.with_sharding_constraint(
+            rho, NamedSharding(mesh_xy, P("y")))
+        Vrho = jnp.einsum(
+            "xy,y->x", V_AB[0], rho.astype(V_AB.dtype), optimize=True)
+        return jax.lax.with_sharding_constraint(
+            Vrho, NamedSharding(mesh_xy, P("x")))
+
+    _hartree_field_cache[key] = field
+    return field
+
+
+def _make_hartree_projection_kernel(
+    mesh_xy: Mesh, *, layout: str, face_shape=None,
+):
+    """Project one local ``Gamma_A phi_A`` field into band space.
+
+    This is the canonical local-potential Hartree projection for both scalar
+    charge and transverse photon fields.  It never materialises a diagonal
+    centroid operator: only the centroid vector and ordinary band-matrix
+    result are live.  Photon Hartree may therefore sum ``phi_A = sum_B
+    V_AB rho_B`` before projecting, paying three band GEMMs rather than nine.
+    """
+    shape_key = None if face_shape is None else tuple(int(v) for v in face_shape)
+    key = (id(mesh_xy), layout, shape_key)
+    if key in _hartree_projection_cache:
+        return _hartree_projection_cache[key]
+
+    if layout not in ("legacy", "face"):
+        raise ValueError(f"Hartree projection: unknown layout {layout!r}")
+    hartree_plan = None
+    if layout == "face":
+        if face_shape is None:
+            raise ValueError("face Hartree projection requires face_shape")
+        from distrib_la import gemm_plan
+        nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+        hartree_plan = gemm_plan(
+            mesh_xy, m=nb_full, k=n_rmu * ns, n=nb_full, nq=nk,
+            dtype=jnp.complex128)
+
+    @jax.jit
+    def project(wfns, wfns_vertex, field_x):
+        if layout == "legacy":
+            psi = wfns.xn(wfns.slices.sigma)
+            vertex_psi = wfns_vertex.xn(wfns.slices.sigma)
+            return jnp.einsum(
+                "ksxm,x,ksxn->kmn", jnp.conj(psi), field_x, vertex_psi,
+                optimize=True)
+
+        from common.contract_bands import merge_spin_centroid
+
+        Vrho_rep = jax.lax.with_sharding_constraint(
+            field_x, NamedSharding(mesh_xy, P(None)))
+        Vrho_y = jax.lax.with_sharding_constraint(
+            Vrho_rep, NamedSharding(mesh_xy, P("y")))
+
+        psi_nmu, psi_mun = wfns.psi_nmu, wfns.psi_mun
+        vertex_psi_mun = wfns_vertex.psi_mun
+        weighted = (jnp.conj(psi_nmu)
+                    * Vrho_y.astype(psi_nmu.dtype)[None, None, None, :])
+        left = merge_spin_centroid(weighted, 2, 3)
+        right = merge_spin_centroid(vertex_psi_mun, 1, 2)
+        return hartree_plan(left, right)
+
+    _hartree_projection_cache[key] = project
+    return project
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -275,21 +405,28 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         return _cohsex_kernel_cache[cache_key]
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
+    hartree_density = _make_hartree_density_kernel(
+        mesh_xy, layout=layout, face_shape=face_shape)
+    hartree_field = _make_hartree_field_kernel(mesh_xy, nk_tot)
+    hartree_project = _make_hartree_projection_kernel(
+        mesh_xy, layout=layout, face_shape=face_shape)
 
     if layout == "legacy":
-        kernels = _make_cohsex_kernels_legacy(_convolve, nk_tot)
+        kernels = _make_cohsex_kernels_legacy(
+            _convolve, hartree_density, hartree_field, hartree_project)
     else:
         kernels = _make_cohsex_kernels_face(
-            mesh_xy, nk_tot, face_shape, _convolve)
+            mesh_xy, face_shape, _convolve,
+            hartree_density, hartree_field, hartree_project)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
 
 
-def _make_cohsex_kernels_legacy(_convolve, nk_tot):
-    """The exact pre-``low_mem_bands`` kernel bodies.  UNTOUCHED — moved
-    verbatim out of :func:`_make_cohsex_kernels` so that function could
-    gain a layout dispatch without disturbing this branch at all."""
+def _make_cohsex_kernels_legacy(
+    _convolve, hartree_density, hartree_field, hartree_project,
+):
+    """Legacy static kernels; SX/COH retain their pre-face bodies exactly."""
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q):
@@ -332,34 +469,30 @@ def _make_cohsex_kernels_legacy(_convolve, nk_tot):
     @jax.jit
     def hartree(wfns, Gij, V_q):
         """V_H(m,n,k) = <m| V(q=0, no G0) · ρ |n>.  V_q flat-k (nk,μ,μ); uses V_q[0]."""
-        s = wfns.slices
-        psi_yr, psi_xr = wfns.yr(s.sigma), wfns.xr(s.sigma)
-        rho = jnp.real(jnp.einsum(
-            'kisx,kjsx,kij->x',
-            jnp.conj(psi_yr), psi_yr, Gij, optimize=True))
-        Vrho = jnp.einsum(
-            'xy,y->x', V_q[0],
-            rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
-        return jnp.einsum(
-            'kmsx,x,knsx->kmn',
-            jnp.conj(psi_xr), Vrho, psi_xr, optimize=True)
+        rho_sum = hartree_density(wfns, wfns, Gij)
+        field = hartree_field(V_q, rho_sum)
+        return hartree_project(wfns, wfns, field)
 
     return sigma_sx, sigma_coh, hartree
 
 
-def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
-                              _convolve):
+def _make_cohsex_kernels_face(
+    mesh_xy: Mesh, face_shape, _convolve, hartree_density, hartree_field,
+    hartree_project,
+):
     """Face-layout kernel bodies.
 
     G and Σ-projection route through the two owning modules'
     ``layout='face'`` branches (``greens_function_kernel.build_G``,
     ``common.contract_bands.contract_bands_block_reshard`` via
     ``wavefunction_bundle.project``); Hartree gets its OWN dedicated
-    planned GEMM (below) because ``V_H`` is diagonal-in-μ, not a general
+    planned GEMM from the enclosing factory because ``V_H`` is diagonal-in-μ,
+    not a general
     (μ,ν) operator — routing it through the general two-GEMM projector
     would materialise a needless dense diag(Vρ) operand.  Every
     ``distrib_la.gemm_plan`` used by any of the three kernels below is
-    built HERE, once, eagerly — see :func:`_make_cohsex_kernels`'s
+    built by the enclosing factory, once, eagerly — see
+    :func:`_make_cohsex_kernels`'s
     docstring.
 
     None of the three kernels windows its OWN output to the σ band count:
@@ -376,8 +509,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
     the FULL nb_full×nb_full GEMM work, not the windowed nb_sigma one.
     """
     from distrib_la import gemm_plan
-    from common.contract_bands import (contract_bands_block_reshard,
-                                       merge_spin_centroid)
+    from common.contract_bands import contract_bands_block_reshard
 
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     mu_s = n_rmu * ns
@@ -386,8 +518,6 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
                        dtype=jnp.complex128)
     proj_fn = contract_bands_block_reshard(
         mesh_xy, layout="face", face_shape=face_shape)
-    hartree_plan = gemm_plan(mesh_xy, m=nb_full, k=mu_s, n=nb_full, nq=nk,
-                             dtype=jnp.complex128)
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
@@ -447,49 +577,9 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, nk_tot: int, face_shape,
         a distributed V-ρ matvec, then the canonical face projection —
         specialised to a diagonal-in-μ weight rather than a full O
         operator (see this function's docstring)."""
-        s = wfns.slices
-        occ = jnp.real(_occ_diag_full(Gij, s.nb_sigma, nb_full)).astype(jnp.float64)
-        psi_mun, psi_nmu = wfns.psi_mun, wfns.psi_nmu
-
-        # Local band-weighted density: |psi_mun|^2 * occ, summed over k
-        # (replicated) and s (replicated) locally, and over n — which
-        # sits on the 'y' mesh axis, so this last reduction is a genuine
-        # cross-rank psum (XLA inserts it automatically for a jnp.sum
-        # over a sharded axis, exactly as legacy's own einsum already
-        # relies on for its μ-axis contractions elsewhere in this file).
-        dens = jnp.sum(jnp.abs(psi_mun) ** 2 * occ[:, None, None, :],
-                       axis=(0, 1, 3))
-        rho = dens / jnp.asarray(nk_tot, dtype=jnp.float64)
-        rho = jax.lax.with_sharding_constraint(
-            rho, NamedSharding(mesh_xy, P("x")))
-
-        # Distributed V-rho matvec.  rho is only known on its OWN 'x'
-        # shard; V0's second index needs it 'y'-sharded, which is a
-        # cross-rank layout change (gather to replicated, then a free
-        # local re-slice) — genuinely two collectives, named rather than
-        # hidden, the "distributed" half of "distributed V-rho matvec".
-        rho_rep = jax.lax.with_sharding_constraint(
-            rho, NamedSharding(mesh_xy, P(None)))
-        rho_y = jax.lax.with_sharding_constraint(
-            rho_rep, NamedSharding(mesh_xy, P("y")))
-        V0 = V_q[0]
-        Vrho = jnp.einsum("xy,y->x", V0, rho_y.astype(V0.dtype),
-                          optimize=True)
-        Vrho = jax.lax.with_sharding_constraint(
-            Vrho, NamedSharding(mesh_xy, P("x")))
-
-        # Vrho is needed on 'y' to weight psi_nmu's own mu axis (native
-        # 'y') — the SAME gather-then-reslice pattern as rho above.
-        Vrho_rep = jax.lax.with_sharding_constraint(
-            Vrho, NamedSharding(mesh_xy, P(None)))
-        Vrho_y = jax.lax.with_sharding_constraint(
-            Vrho_rep, NamedSharding(mesh_xy, P("y")))
-
-        weighted = (jnp.conj(psi_nmu)
-                   * Vrho_y.astype(psi_nmu.dtype)[None, None, None, :])
-        A = merge_spin_centroid(weighted, 2, 3)   # (nk, n, mu*s)
-        B = merge_spin_centroid(psi_mun, 1, 2)    # (nk, mu*s, n)
-        return hartree_plan(A, B)                  # (nk, n, n) == Sigma_H
+        rho_sum = hartree_density(wfns, wfns, Gij)
+        field = hartree_field(V_q, rho_sum)
+        return hartree_project(wfns, wfns, field)
 
     return sigma_sx, sigma_coh, hartree
 

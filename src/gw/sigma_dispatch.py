@@ -862,6 +862,7 @@ def compute_sigma_xc(
     from .gw_config import BispinorGWMode, coerce_bispinor_gw_mode
     bispinor_gw = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    photon_h_t = None
     if bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
@@ -880,7 +881,7 @@ def compute_sigma_xc(
                 "a scalar correction would double count the charge sector "
                 "and omit coupled current wings.")
 
-        # The V-only facade remains the one Hartree owner, but skips its
+        # The V-only facade remains the scalar Hartree owner, but skips its
         # historical scalar+TT exchange contraction.  X, SX, and COH are all
         # REPLACED, not augmented, by one sixteen-block photon loop over the
         # same packed V/W and canonical Green/convolution/projector services.
@@ -893,7 +894,18 @@ def compute_sigma_xc(
             occupation_state=None,
             compute_bare_x=False,
         )
-        from .photon_sigma import compute_static_photon_sigma
+        from .photon_sigma import (
+            compute_static_photon_hartree, compute_static_photon_sigma,
+        )
+        photon_h_t = compute_static_photon_hartree(
+            wfns_transverse=wfns_transverse,
+            Gij=photon_Gij,
+            V_packed=photon_response.V_packed,
+            photon_layout=photon_response.layout,
+            meta=meta,
+            mesh_xy=mesh_xy,
+            print_fn=print_fn,
+        )
         photon_x, photon_sx, photon_coh = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
@@ -932,10 +944,10 @@ def compute_sigma_xc(
     sig_x = cohsex["sig_x"]
 
     # ── The V_H-source seam (single point of truth) ──────────────────────
-    # ``sig_h`` above is the ISDF V_q[0] quadrature.  This is the ONE
-    # place it enters ``SigmaResult``, so resolving the source here makes
-    # every downstream consumer consistent by construction rather than by
-    # each remembering the rule: the eigh operand ``sigma_total =
+    # ``sig_h`` above is the scalar ISDF V_q[0] quadrature.  This is the ONE
+    # place the scalar term enters ``SigmaResult``, so resolving its source
+    # here makes every downstream consumer consistent by construction rather
+    # than each remembering the rule: the eigh operand ``sigma_total =
     # Σ_xc + V_H``, the fixed-point h₀, the SC iteration map, eqp{0,1}.dat
     # and sigma_diag.dat's VH column all read what this decides.
     #   stored/gspace → replace it with the exact FFT-grid matrix
@@ -991,6 +1003,14 @@ def compute_sigma_xc(
                                      sig_h.dtype),
                 mesh=mesh_xy)
         sig_h = v_h_ext
+    if photon_h_t is not None:
+        # ``hartree_source`` and ``omit_v_h`` own only the scalar charge
+        # potential.  A stored/gspace replacement (or kin_ion fold) contains
+        # no transverse Breit direct field, so append that independently
+        # after the scalar source seam rather than letting the replacement
+        # erase it.
+        sig_h = sig_h + photon_h_t
+        sig_h.block_until_ready()
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
 
