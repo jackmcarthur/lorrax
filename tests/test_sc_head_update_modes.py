@@ -311,7 +311,9 @@ def _head_fixture(seed: int):
         U=U, bvec=bvec,
         omegas=np.asarray([0.31 + 0.05j, 0.77 + 0.05j, 1.4 + 0.05j]),
         wfn=SimpleNamespace(nspin=1),
-        meta=SimpleNamespace(cell_volume=97.3, nk_tot=nk, nspinor=2),
+        meta=SimpleNamespace(
+            cell_volume=97.3, nk_tot=nk, nspinor=2,
+            nspinor_wfnfile=2),
         config=SimpleNamespace(head=SimpleNamespace(wcoul0_eta=0.0)),
     )
 
