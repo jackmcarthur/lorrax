@@ -196,6 +196,9 @@ def _twin_body() -> dict:
         Q_ref += inv_s * (UH @ psi.reshape(nk * w, ns * n_rtot))
     q_layout_ok = (Q.sharding.spec == sharding_q.spec)
 
+    # Force the production fold through several bounded r tiles on this tiny
+    # fixture; its ordinary 512-MiB ceiling would intentionally use one tile.
+    ht._FOLD_Q_TILE_BYTES = 512
     fold = ht._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
     G = fold(Q, G)
     G_ref = Q_ref @ Q_ref.conj().T
