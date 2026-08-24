@@ -264,100 +264,6 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
     return rho_mn, v_sym, alpha_mn
 
 
-@functools.partial(jax.jit, static_argnames=('fft_grid',))
-def _apply_kinetic_velocity_Gbox(psi_Gbox_k, kvec, bvec_blat, fft_grid):
-    """Compute v^α_kin |ψ_n,k⟩ in the G-space FFT-box layout.
-
-    ``load_kpoint_fftbox`` stores ``c_nk(G)`` scattered into an FFT-box
-    array (zero outside the G-sphere).  The kinetic velocity in G-space
-    is just an elementwise multiplication by ``(k + G)_cart^α`` — no
-    FFT.  Note: this matches the convention of
-    ``dft_operators.momentum_matrix_k``  (atomic-unit cartesian
-    velocity, no V_cell factor).
-
-    Parameters
-    ----------
-    psi_Gbox_k : (nb, nspinor, nx, ny, nz) complex128 — c_n,k(G) in box.
-    kvec       : (3,) float64 crystal coords.
-    bvec_blat  : (3, 3) float64 — blat·bvec (cartesian rec-lat).
-    fft_grid   : static (nx, ny, nz).
-
-    Returns
-    -------
-    (3, nb, nspinor, nx, ny, nz) — c_n,k(G) · (k+G)_cart^α per α.
-    """
-    nx, ny, nz = fft_grid
-    gx = jnp.fft.fftfreq(nx, d=1.0 / nx).astype(jnp.float64)
-    gy = jnp.fft.fftfreq(ny, d=1.0 / ny).astype(jnp.float64)
-    gz = jnp.fft.fftfreq(nz, d=1.0 / nz).astype(jnp.float64)
-    kGc_x = kvec[0] + gx[:, None, None]
-    kGc_y = kvec[1] + gy[None, :, None]
-    kGc_z = kvec[2] + gz[None, None, :]
-    kG_cart_x = (kGc_x * bvec_blat[0, 0] + kGc_y * bvec_blat[1, 0]
-                  + kGc_z * bvec_blat[2, 0])
-    kG_cart_y = (kGc_x * bvec_blat[0, 1] + kGc_y * bvec_blat[1, 1]
-                  + kGc_z * bvec_blat[2, 1])
-    kG_cart_z = (kGc_x * bvec_blat[0, 2] + kGc_y * bvec_blat[1, 2]
-                  + kGc_z * bvec_blat[2, 2])
-
-    return jnp.stack((
-        psi_Gbox_k * kG_cart_x[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-        psi_Gbox_k * kG_cart_y[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-        psi_Gbox_k * kG_cart_z[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-    ), axis=0)
-
-
-@functools.partial(jax.jit, static_argnames=('fft_grid',))
-def _cell_overlaps_at_q_Gbox(
-    psi_Gbox_k_n, vpsi_Gbox_k_n, psi_Gbox_kmq_m_canonical, G_wrap, fft_grid,
-):
-    """G-space cell overlaps for one (k, q) pair — kinetic-only velocity.
-
-    Compute
-        rho_mn(k, q) = ⟨u_{m, k-q} | u_{n, k}⟩_cell
-        v_mn_α(k, q) = ⟨u_{m, k-q} | v^α | u_{n, k}⟩_cell  (kinetic part)
-
-    in G-space.  Umklapp from canonical-(k-q) to actual k-q is handled
-    via a 3-axis ``jnp.roll`` of the bra:
-        c_{m, k-q}(G) = c_{m, canonical}(G + G_wrap)
-                       = roll(c_{m, canonical}, shift=−G_wrap)(G)
-    so the bra in G-box is roll(c_can, −G_wrap_int) along the (gx, gy, gz)
-    axes.  No 1/N_grid factor — convention matches
-    ``momentum_matrix_k`` (sum over G of c* (k+G) c gives the AU velocity
-    matrix element directly).
-
-    Parameters
-    ----------
-    psi_Gbox_k_n            : (nb_n, nspinor, nx, ny, nz)
-    vpsi_Gbox_k_n           : (3, nb_n, nspinor, nx, ny, nz)
-    psi_Gbox_kmq_m_canonical : (nb_m, nspinor, nx, ny, nz)
-    G_wrap                  : (3,) int32 — umklapp shift for THIS (k, q).
-    fft_grid                : static.
-
-    Returns
-    -------
-    rho_mn   : (nb_m, nb_n) complex128
-    v_mn_alp : (3, nb_m, nb_n) complex128
-    """
-    # Roll the bra by −G_wrap along the 3 G-axes (last 3).
-    # ``shift`` is the number of places to shift TOWARDS HIGHER indices;
-    # roll(x, +s)[i] = x[i − s].  We want bra[G] = c_can[G + G_wrap], so
-    # shift = −G_wrap.
-    # G_wrap is a 3-vector traced under vmap; jnp.roll accepts traced
-    # shifts in modern JAX, but we re-roll one axis at a time so the
-    # codepath is robust across versions.
-    bra_can = jnp.conj(psi_Gbox_kmq_m_canonical)
-    bra = jnp.roll(bra_can, shift=-G_wrap[0], axis=-3)
-    bra = jnp.roll(bra,     shift=-G_wrap[1], axis=-2)
-    bra = jnp.roll(bra,     shift=-G_wrap[2], axis=-1)
-
-    rho_mn = jnp.einsum('msxyz,nsxyz->mn', bra, psi_Gbox_k_n,
-                          optimize=True)
-    v_mn_alp = jnp.einsum('msxyz,ansxyz->amn', bra, vpsi_Gbox_k_n,
-                          optimize=True)
-    return rho_mn, v_mn_alp
-
-
 def compute_finite_q_mtxels(
     wfn, sym, meta, vnl_setup, gtab,
     *,
@@ -410,8 +316,8 @@ def compute_finite_q_mtxels(
     import psp.vnl_ops as vnl_ops
 
     nk_full = int(sym.nk_tot)
-    bvec_blat = jnp.asarray(np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
-                             dtype=jnp.float64)
+    bvec_blat_np = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    bvec_blat = jnp.asarray(bvec_blat_np, dtype=jnp.float64)
     n_occ = int(wfn.nelec)
     v_lo = max(0, n_occ - int(nv_block))
     c_lo = n_occ
@@ -532,15 +438,14 @@ def compute_finite_q_mtxels(
 
         qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
         qvec = qvec_pos - np.round(qvec_pos)
-        q_cart_bohr = qvec @ (np.asarray(wfn.bvec, dtype=np.float64)
-                              * float(wfn.blat))
+        q_cart_bohr = qvec @ bvec_blat_np
+        G_wrap_k = np.asarray(umklapp_G_wrap(
+            kpts_full, kpts_full[kminq_idx], qvec), dtype=np.int32)
 
         max_rho = max_v = 0.0
         for ik in range(nk_full):
             ikmq = int(kminq_idx[ik])
-            kvec_k_np   = kpts_full[ik]
-            kvec_kmq_np = kpts_full[ikmq]
-            G_wrap_np = np.round((kvec_k_np - qvec) - kvec_kmq_np).astype(np.int32)
+            G_wrap_np = G_wrap_k[ik]
 
             Gk_int_k   = np.asarray(gtab.gvecs[ik],   dtype=np.int32)
             Gk_int_can = np.asarray(gtab.gvecs[ikmq], dtype=np.int32)
