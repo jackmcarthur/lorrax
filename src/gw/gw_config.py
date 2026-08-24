@@ -481,6 +481,36 @@ class ScreeningDiagrams(str, enum.Enum):
       Two-stage by construction — the RPA ``W(0)`` of the first stage IS
       the ``W_R`` the ladder kernel consumes — which is why this value
       changes the dataflow rather than one solver call.
+    - ``W_RPA_RESOLVENT`` — the SAME resolvent identity
+      ``W(ω) − v = v (ω − H)⁻¹ v`` evaluated with the RPA operator
+      (``H_RPA``, the ladder's own ``include_w=False`` limit: the direct
+      rung ``−W_R(0)`` is parameterized OUT of the ring matvec rather than
+      rebuilt by a second matvec — ``bse.bse_ring_comm.
+      build_bse_ring_matvec_full(..., include_W=False)`` — so this value
+      exercises the same operator family as ``w_bse``, minus one term).
+      DESIGNED to reproduce ``w_rpa``'s W to the minimax-quadrature floor,
+      and CERTIFIED to do so on the spinor fixture the existing unit
+      suite exercises (``tests/test_bse_w_ladder_identities.py``,
+      ``tests/test_w_bse_wiring_closure.py`` — ``gnppm_debug``, nspinor=2,
+      ~7e-12 agreement). **OPEN, MEASURED 2026-08-23 on a SCALAR
+      (nspinor=1) system: it does NOT.** A direct q=0 tile probe against
+      the incumbent ``W0_qmunu`` on a fresh scalar Si deck found a
+      38-61%-relative, P-independent, window-size-insensitive
+      disagreement (KNOWN_LORRAX_ISSUES.md, the
+      ``bse_w_exact._build_rpa_resolvent`` row) — high shape-correlation
+      (cos~0.999) but a non-uniform per-entry under-scaling, the
+      signature of a missing/misapplied occupation or spin-degeneracy
+      weight rather than a sign, operator, or solver-tolerance defect.
+      THIS IS UPSTREAM OF ``include_w``: the same shared ring term backs
+      ``w_bse`` too, and that feature's own first-ever scalar decks
+      (``runs/Si_scalar/01_wbse_ab_2026-08-16``) never finished far
+      enough to have compared against a reference, so the gap has been
+      latent and undetected since that feature shipped. Do not read this
+      value (or ``w_bse``) as certified-correct on a scalar mean field
+      until that row closes; it exists to gate the resolvent machinery
+      against the incumbent Dyson route on a diagram set simple enough to
+      have an independent right answer, and on THIS run it correctly
+      caught that the two disagree.
 
     WHY AN ENUM AND NOT A BOOL.  ``ladder_screening = true`` would name the
     one alternative that exists today and spend the axis: the resolvent
@@ -499,10 +529,30 @@ class ScreeningDiagrams(str, enum.Enum):
     cannot always express: a metallic WFN on a deck that declares nothing
     is refused at the stage instead, on the occupations themselves
     (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
+    ``w_rpa_resolvent`` is refused at parse time against ``x_only``, the
+    self-consistent QP solver, ``mc_average_placement != off`` and
+    ``compute_mode = mpa`` — audited against ``w_bse``'s table, not
+    copied: the x_only / broadening / SC-loop / head-placement arguments
+    transfer (some by MECHANISM, some as an inherited infrastructure
+    risk; see ``_W_RPA_RESOLVENT_REFUSALS``' own per-row comments), and
+    ``compute_mode = mpa`` is a NEW row here — MPA's ``wc_source`` seam
+    (``gw.screening_bse.make_ladder_wc_source``) has not been extended or
+    gated for the RPA-resolvent arm this session, unlike ``w_bse``, where
+    it is SUPPORTED.  INSULATORS ONLY has NO parse-time row for this
+    value: it is subsumed by the ``compute_mode = mpa`` refusal (a
+    declared metal requires ``compute_mode = mpa``, which is refused
+    unconditionally here, making a parallel deck-key predicate always
+    shadowed — see ``_W_RPA_RESOLVENT_REFUSALS``' comment at that site).
+    The certification and its enforcement survive in full through the
+    OTHER half w_bse already has: a metallic WFN on a deck that declares
+    nothing is refused at the stage, on the occupations themselves,
+    under the SAME ``{value}_insulators_only`` id pattern
+    (``gw.screening_bse``).
     """
 
     W_RPA = "w_rpa"
     W_BSE = "w_bse"
+    W_RPA_RESOLVENT = "w_rpa_resolvent"
 
 
 def coerce_screening_diagrams(value) -> ScreeningDiagrams:
@@ -625,8 +675,160 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
 )
 
 
+#: WHICH COMBINATIONS OF ``screening_diagrams = w_rpa_resolvent`` v1
+#: REFUSES, and why.  AUDITED against ``_W_BSE_REFUSALS`` above rather than
+#: copied: ``w_rpa_resolvent`` reaches the identical ladder facade
+#: (``gw.screening_bse.compute_screening_ladder``) with
+#: ``include_w=False`` -- ``H_RPA`` in place of ``H_BSE``, same ring
+#: matvec builder, same restart handoff, same head resolvent -- so every
+#: row below states, per rule, whether the ``w_bse`` row's MECHANISM
+#: survives the missing rung or only its INFRASTRUCTURE risk does.
+#:
+#: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``
+#: and ``qp_solver = one_shot_dft`` / ``fixed_point``.  Unlike ``w_bse``,
+#: ``mpa`` is NOT supported here (see its own row) -- ``w_bse``'s
+#: ``wc_source`` seam (``make_ladder_wc_source``) was extended and gated
+#: for the ladder; doing the same for the RPA-resolvent arm is a real port,
+#: not merely flipping ``include_w``, because ``make_ladder_wc_source``
+#: hard-codes ``include_w=True`` in its one call site and that call site's
+#: own persist-timing (first call, cached across MPA's sample plan) has
+#: not been audited for the RPA-resolvent arm.
+_W_RPA_RESOLVENT_REFUSALS: tuple[
+    tuple[str, object, object, str, str, str], ...] = (
+    (
+        "w_rpa_resolvent_needs_a_screened_mode",
+        lambda cfg: cfg.compute_mode is ComputeMode.X_ONLY,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "a mode that consumes W: cohsex or gn_ppm",
+        "drop screening_diagrams (or set it to w_rpa) for a bare-exchange "
+        "run, or pick a screened compute_mode",
+        "MECHANISM UNCHANGED from w_bse_needs_a_screened_mode: x_only "
+        "builds no W at all regardless of which operator the resolvent "
+        "would have solved, so a computed-and-discarded W is the same "
+        "waste either way",
+    ),
+    (
+        "w_rpa_resolvent_mpa_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.MPA,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "cohsex or gn_ppm, or screening_diagrams = w_bse / w_rpa under mpa",
+        "use cohsex or gn_ppm with w_rpa_resolvent, or keep compute_mode = "
+        "mpa with screening_diagrams = w_bse (the ladder, supported) or "
+        "w_rpa (the incumbent Dyson route)",
+        "NOT an audited w_bse row -- mpa is w_bse's own supported case. "
+        "gw.screening_bse.make_ladder_wc_source hard-codes include_w=True "
+        "at its one call site, and its persist-on-first-call timing "
+        "against MPA's own sample plan has not been extended or gated for "
+        "the RPA-resolvent arm this session. Refused by name rather than "
+        "silently falling back to mpa's plain RPA Dyson solve under this "
+        "diagram set's label",
+    ),
+    (
+        "w_rpa_resolvent_hl_ppm_broadening_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.HL_PPM,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "cohsex (static resolvent) or gn_ppm (static + imaginary-axis "
+        "resolvent)",
+        "use gn_ppm, whose probe sits on the imaginary axis where the "
+        "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
+        "MECHANISM UNCHANGED from w_bse_hl_ppm_broadening_unimplemented: "
+        "(z - H_RPA)^-1 on the real axis needs the same undecided "
+        "broadening (eta / xi) policy the ladder's (z - H_BSE)^-1 does "
+        "-- the gap is in the SHIFTED SOLVE, not in the rung",
+    ),
+    (
+        "w_rpa_resolvent_self_consistency_unimplemented",
+        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
+        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
+        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "run w_rpa_resolvent single-shot; for a QSGW loop keep "
+        "screening_diagrams = w_rpa until the per-iteration cycle lands",
+        "INFRASTRUCTURE RISK INHERITED, MECHANISM DOES NOT LITERALLY "
+        "APPLY: H_RPA carries no rung, so ensure_W_R(include_W=False) "
+        "never reads a previous iteration's W(0) back -- the SPECIFIC "
+        "stale-rung failure w_bse's row names cannot occur here. But "
+        "compute_screening_ladder's persist-then-read restart handoff "
+        "(prepare_ladder_restart -> _ladder_wedge) is the SAME facade "
+        "call for both diagram values, its SC-loop provenance was never "
+        "built or audited for either arm (DESIGN_2026-08-15.md section "
+        "1), and this session gated only qp_solver=one_shot_dft. Refusing "
+        "conservatively rather than shipping an unaudited combination "
+        "under a new name",
+    ),
+    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW -- audited and
+    # found DEAD, not omitted by oversight.  ``w_bse_insulators_only``'s
+    # deck-key predicate (``mpa_material_class != insulator``) is only
+    # ever TRUE past ``_validate_metal_compute_mode``'s standing invariant
+    # (material_class = metal implies compute_mode = mpa, enforced in
+    # ``LorraxConfig.__post_init__`` BEFORE this table runs -- see
+    # ``metal_material_class_requires_mpa``), i.e. the predicate can only
+    # fire on a ``compute_mode = mpa`` deck.  ``w_rpa_resolvent_mpa_
+    # unimplemented`` above already refuses EVERY ``compute_mode = mpa``
+    # deck under this diagram set, unconditionally, and it appears FIRST
+    # in this tuple -- so a parallel insulators-only row here would be
+    # logically implied by, and always shadowed by, that row: the exact
+    # "narrowed row that is a STRICT SUBSET of an earlier row's predicate"
+    # shape the ``low_mem_bands_metal_material_class_unported`` /
+    # ``low_mem_bands_dynamic_ppm_unported`` precedent in
+    # ``_LOW_MEM_BANDS_REFUSALS`` names and deletes on sight.  MEASURED,
+    # not merely reasoned: ``tests/test_w_rpa_resolvent_config.py`` tried
+    # exactly this deck (``mpa_material_class = metal`` under a non-mpa
+    # compute_mode) and reached ``metal_material_class_requires_mpa``
+    # instead, before this table ever ran.
+    #
+    # The insulators-only CERTIFICATION still applies in full -- audited,
+    # not dropped -- through its OTHER half, the one that does not need a
+    # deck key at all: ``gw.screening_bse.refuse_fractional_occupations``
+    # / ``_refuse_metallic_mean_field`` read the mean field's OWN
+    # occupations at the stage, before any compute, under the rule id
+    # ``w_rpa_resolvent_insulators_only`` (``diagram_name`` threaded from
+    # ``include_w``).  That check fires on every compute_mode this
+    # diagram set supports (cohsex, gn_ppm) and is not shadowed by
+    # anything: it is what actually gates a metallic WFN on a
+    # ``w_rpa_resolvent`` deck that declares nothing, which is the
+    # harder-to-see half of "insulators only" the ``w_bse`` docstring
+    # itself says the deck key cannot always express.  The pair-basis /
+    # integer-occupation argument transfers unchanged from ``w_bse``'s
+    # row (the band-index cut at ``nelec`` does not depend on
+    # ``include_w``); the ladder's OWN TRS-gauge machinery
+    # (``enforce_trs_pair_gauge``) is NOT part of that argument --
+    # ``sweep_q_wedge`` applies the gauge fix only on the
+    # ``include_w=True`` branch, and the RPA arm's reciprocity already
+    # holds without it (``w_ladder.py``'s own measurement: ring dyad and
+    # D are band-window/gauge invariant) -- stated so this comment cannot
+    # be read as citing a defect the RPA arm does not have.
+    (
+        "w_rpa_resolvent_head_placement_unimplemented",
+        lambda cfg: str(cfg.head.mc_average_placement) != "off",
+        lambda cfg: f"mc_average_placement = {cfg.head.mc_average_placement}",
+        "mc_average_placement = off (the default)",
+        "leave mc_average_placement at off under w_rpa_resolvent, or keep "
+        "screening_diagrams = w_rpa to use the BGW head placement",
+        "MECHANISM UNCHANGED from w_bse_head_placement_unimplemented: "
+        "head_correction=full obtains q=0 from the SAME micro-reducible "
+        "resolvent mechanism regardless of include_w (bse.head_resolvent."
+        "build_head_operator(..., include_w=include_w) is the one "
+        "operator builder for both arms); composing a post-solve "
+        "mc_average_placement with it has not been derived or certified "
+        "for either arm",
+    ),
+)
+
+
+#: One dispatch table for both resolvent screening diagrams, so a THIRD
+#: resolvent-family value added later gets its own row here rather than a
+#: new branch in the function below (the same reasoning
+#: ``MODE_SIGMA_CHANNELS`` uses for ``ComputeMode``).
+_RESOLVENT_REFUSAL_TABLES: dict[
+    "ScreeningDiagrams", tuple[tuple[str, object, object, str, str, str], ...]
+] = {
+    ScreeningDiagrams.W_BSE: _W_BSE_REFUSALS,
+    ScreeningDiagrams.W_RPA_RESOLVENT: _W_RPA_RESOLVENT_REFUSALS,
+}
+
+
 def refuse_unsupported_screening_diagrams(config) -> None:
-    """Refuse the ``w_bse`` combinations v1 does not serve, at PARSE time.
+    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time.
 
     Called from :meth:`LorraxConfig.from_input_file` once the record
     exists, because every predicate here reads a RESOLVED axis
@@ -638,19 +840,26 @@ def refuse_unsupported_screening_diagrams(config) -> None:
     NO-OP FOR ``w_rpa``, evaluated first and returning before any property
     is touched: a default deck must not acquire a new parse-time
     resolution -- and hence a new possible refusal -- from this function
-    existing.
+    existing.  ``w_bse`` and ``w_rpa_resolvent`` each carry their OWN
+    table (:data:`_RESOLVENT_REFUSAL_TABLES`) rather than one shared list,
+    because a shared table's ``doc`` text would have to describe both
+    operators at once -- which is exactly how the hl_ppm gate's dead-gate
+    incident happened (TASTE.md, "a gate pinned to a convention re-arms
+    itself"): a reused reference that does not resolve per call site reads
+    as evidence for a case it never measured.
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    if diagrams is not ScreeningDiagrams.W_BSE:
+    table = _RESOLVENT_REFUSAL_TABLES.get(diagrams)
+    if table is None:
         return
-    for rule_id, predicate, got, want, fix, doc in _W_BSE_REFUSALS:
+    for rule_id, predicate, got, want, fix, doc in table:
         if not predicate(config):
             continue
         raise ValueError(
-            f"GATE {rule_id}: screening_diagrams = w_bse is refused with "
-            f"{got(config)}.\n"
-            f"  got:  screening_diagrams = w_bse, {got(config)}\n"
+            f"GATE {rule_id}: screening_diagrams = {diagrams.value} is "
+            f"refused with {got(config)}.\n"
+            f"  got:  screening_diagrams = {diagrams.value}, {got(config)}\n"
             f"  want: {want}\n"
             f"  fix:  {fix}\n"
             f"  why:  {doc}.\n"
@@ -1690,10 +1899,16 @@ _DEFAULTS = {
     #   "w_bse" — ladder-corrected W(omega) - v = v (omega - H)^-1 v with
     #        the statically screened direct rung -W(0) in H's kernel.  The
     #        RPA W(0) is still computed and persisted first; it IS the
-    #        ladder kernel's W_R.  Refused against x_only / hl_ppm /
-    #        qp_solver = self_consistent / mc_average_placement != off.
+    #        ladder kernel's W_R.  Refused against x_only / mpa (except
+    #        supported) / hl_ppm / qp_solver = self_consistent /
+    #        mc_average_placement != off.
+    #   "w_rpa_resolvent" — the SAME resolvent identity with the rung
+    #        parameterized out (H_RPA, not H_BSE): a cross-check route to
+    #        w_rpa's own W, not a third physical model.  Same refusal
+    #        family as w_bse, PLUS mpa (unlike w_bse, not yet supported).
     "screening_diagrams": "w_rpa",
-    # w_bse only: probe columns of the mu^2 ladder tile solved per block.
+    # w_bse / w_rpa_resolvent only: probe columns of the mu^2 ladder tile
+    # solved per block.
     # 0 (default) = the whole padded centroid basis in one block — the
     # historical behaviour, bit-identical for every existing deck.  A
     # positive value bounds the per-block solve memory; the facade rounds
@@ -3363,9 +3578,10 @@ class ScreeningConfig:
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
-    # w_bse only — ``bse.w_ladder.compute_wc_qwedge``'s public
-    # ``probe_chunk`` memory knob, threaded through the facade
-    # (``gw.screening_bse._ladder_wedge``).  0 = whole padded basis in
+    # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
+    # ``bse.w_ladder.compute_wc_qwedge``'s public ``probe_chunk`` memory
+    # knob, threaded through the facade (``gw.screening_bse._ladder_wedge``,
+    # which does not branch on ``include_w``).  0 = whole padded basis in
     # one block (historical).  Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
 
@@ -3398,20 +3614,25 @@ class ScreeningConfig:
                 f"never selected a different method, so replacing it with "
                 f"'screening_method = minimax' (or deleting the key, "
                 f"which defaults to minimax) changes no result.")
-        # REFUSE a spelling this axis does not have, naming the two it
+        # REFUSE a spelling this axis does not have, naming the ones it
         # does.  The parser already normalises through
         # ``coerce_screening_diagrams``; this is the guard for every OTHER
         # constructor of this record (tools, test stubs, a future reader),
-        # so the axis cannot acquire a third value by assignment.
+        # so the axis cannot acquire a fourth value by assignment.
         if not isinstance(self.diagrams, ScreeningDiagrams):
             raise ValueError(
                 f"screening_diagrams = {self.diagrams!r} is not supported.  "
                 f"The legal set is exactly "
                 f"{{{', '.join(d.value for d in ScreeningDiagrams)}}}: "
                 f"'w_rpa' (default) sums the random-phase series "
-                f"W = (1 - V chi0)^-1 V, and 'w_bse' sums the ladder series "
+                f"W = (1 - V chi0)^-1 V, 'w_bse' sums the ladder series "
                 f"W(w) - v = v (w - H)^-1 v with the statically screened "
-                f"direct rung in H.  Pass a ScreeningDiagrams member or run "
+                f"direct rung in H, and 'w_rpa_resolvent' evaluates the SAME "
+                f"resolvent identity with the rung parameterized out "
+                f"(H_RPA in place of H_BSE, one matvec builder, "
+                f"include_W=False) -- a cross-check route to the same W "
+                f"'w_rpa' sums by Dyson series, not a third physical model. "
+                f"Pass a ScreeningDiagrams member or run "
                 f"the value through gw_config.coerce_screening_diagrams, "
                 f"which raises with this same set for a typo.  This axis is "
                 f"ORTHOGONAL to screening_method and to compute_mode; see "
