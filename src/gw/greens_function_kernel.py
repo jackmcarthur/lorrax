@@ -162,18 +162,28 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
             "genuinely dense (non-diagonal) band operator would need its "
             "own face-sharded two-GEMM contract (like the projector's), "
             "not this identity/diagonal-weight path.")
-    nk_, s_, mu_, n_ = psi_mun.shape
+    nk_, s_, mu_l_, n_ = psi_mun.shape
+    nk_r_, n_r_, s_r_, mu_r_ = psi_nmu.shape
+    if nk_r_ != nk_ or n_r_ != n_ or s_r_ != s_:
+        raise ValueError(
+            "build_G(layout='face'): left psi_mun and right psi_nmu must "
+            "share (nk, nb, nspinor); got "
+            f"{psi_mun.shape} and {psi_nmu.shape}.")
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
     if phases is not None:
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
     B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
     G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
-    # Undo BOTH merges, restoring legacy's (k, s, μ_X, s', μ_Y) axis order.
+    # Undo BOTH merges, restoring legacy's rectangular
+    # (k, s, μ_left_X, s', μ_right_Y) axis order.  The historical
+    # square path is the mu_l_ == mu_r_ specialization; accepting distinct
+    # endpoint extents here lets the canonical G builder serve mixed C/T
+    # response blocks without a second Green-function implementation.
     # The row merge sits at axis 1, the (still-merged) column pair shifts
     # from axis 2 to axis 3 once the first split inserts an axis.
-    G = split_spin_centroid(G_flat, 1, s_, mu_)       # (nk, s, mu, mu*s)
-    G = split_spin_centroid(G, 3, s_, mu_)            # (nk, s, mu, s', mu')
+    G = split_spin_centroid(G_flat, 1, s_, mu_l_)
+    G = split_spin_centroid(G, 3, s_, mu_r_)
     return G
 
 
