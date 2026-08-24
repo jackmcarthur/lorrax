@@ -593,9 +593,14 @@ def main():
                              Rinv, tau, n_sym, M_cand)
 
     if oversample > 1.0 and n_unique > N_c:
-        release_arrays = [labels, centroids, weight, kmeans_weight]
-        if not args.plot:
-            release_arrays.append(charge_density)
+        release_arrays = [labels, centroids]
+        for array in (weight, kmeans_weight, charge_density):
+            # ``charge_density`` is the plot payload.  In charge-weight mode
+            # both weight names alias that same JAX array, so retaining only
+            # the charge_density Python reference is not enough: deleting an
+            # alias deletes the underlying device buffer for every reference.
+            if not args.plot or array is not charge_density:
+                release_arrays.append(array)
         _release_lloyd_before_prune(*release_arrays)
         del release_arrays, labels, centroids, weight, kmeans_weight
         if not args.plot:
