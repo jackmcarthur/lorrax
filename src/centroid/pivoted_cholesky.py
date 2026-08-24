@@ -84,7 +84,7 @@ import symmetry_maps                                            # noqa: E402
 _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
-_GRAM_FINAL_FOLD_SLOTS = 4
+_GRAM_FINAL_FOLD_SLOTS = 3
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -175,6 +175,10 @@ def gram_block_live_set_bytes(
     gram_fold_peak_bytes: int,
     one_pair_tile_bytes: int,
     gram_matrix_local_bytes: int,
+    extract_left_increment_bytes: int = 0,
+    extract_right_increment_bytes: int = 0,
+    one_left_input_tile_bytes: int = 0,
+    one_right_input_tile_bytes: int = 0,
 ) -> dict[str, int]:
     """Complete per-device live set for one 2-D Gram tile.
 
@@ -183,15 +187,21 @@ def gram_block_live_set_bytes(
     executable peaks come from ``runtime.aot_memory`` applied to the exact
     canonical pair-density and q=0-fold JITs.  The right pair build adds the
     completed left pair tile; the fold peak already includes both pair inputs.
-    Completed Gram tiles remain resident, so one full local Gram is included
-    at every tile stage.  Finally, concatenate + transpose/conjugate + output
-    are conservatively four full local-Gram slots.
+    The donated shard-local update keeps one full local Gram at every tile
+    stage.  Finally, input + transpose/conjugate + output are conservatively
+    three full local-Gram slots; there is no global concatenate.
     """
     resident = int(resident_bytes)
     pair_tile = int(one_pair_tile_bytes)
     gram_local = int(gram_matrix_local_bytes)
     stages = {
+        "extract_left": (resident + gram_local
+                         + int(one_left_input_tile_bytes)
+                         + int(extract_left_increment_bytes)),
         "pair_left": resident + gram_local + int(pair_left_peak_bytes),
+        "extract_right": (resident + gram_local + pair_tile
+                          + int(one_right_input_tile_bytes)
+                          + int(extract_right_increment_bytes)),
         "pair_right": (resident + gram_local + pair_tile
                        + int(pair_right_peak_bytes)),
         "gram_fold": resident + gram_local + int(gram_fold_peak_bytes),
@@ -1633,7 +1643,10 @@ def build_gram_q0_via_loadwfns(
         gram_q0_from_pair,
         gram_q0_aot_peak_bytes,
     )
-    from runtime.padding import pad_axis
+    from common.staged_reshard import (
+        shard_local_slice_pad,
+        shard_local_update,
+    )
 
     # Resolve windows.
     if band_range_left is None or band_range_right is None:
@@ -1840,8 +1853,46 @@ def build_gram_q0_via_loadwfns(
             * _GRAM_COMPLEX_BYTES
         )
 
+        rep_sh = NamedSharding(mesh_xy, PartitionSpec())
+        row_spec = PartitionSpec(None, 'x', None, None)
+        col_spec = PartitionSpec(None, None, None, 'y')
+        tile_spec = PartitionSpec('x', 'y')
+        tile_services = {}
+
+        def _services_for_width(tile_width):
+            tile_width = int(tile_width)
+            if tile_width not in tile_services:
+                tile_services[tile_width] = (
+                    shard_local_slice_pad(
+                        mesh_xy, spec=row_spec, axis=1, mesh_axis='x',
+                        local_size=tile_width // n_x),
+                    shard_local_slice_pad(
+                        mesh_xy, spec=col_spec, axis=3, mesh_axis='y',
+                        local_size=tile_width // n_y),
+                )
+            return tile_services[tile_width]
+
+        def _extract_increment(extractor, arr):
+            from runtime.aot_memory import aot_kernel_peak_bytes
+            arr_arg = jax.ShapeDtypeStruct(
+                tuple(int(s) for s in arr.shape), arr.dtype,
+                sharding=arr.sharding)
+            start_arg = jax.ShapeDtypeStruct(
+                (), jnp.int32, sharding=rep_sh)
+            compiled = extractor.lower(arr_arg, start_arg).compile()
+            return int(aot_kernel_peak_bytes(compiled).resident_increment)
+
         def _compiled_live_set(tile_width):
             tile_width = int(tile_width)
+            extract_x, extract_y = _services_for_width(tile_width)
+            extract_left = max(
+                _extract_increment(extract_x, psi_l_rmuT_X),
+                _extract_increment(extract_y, psi_l_rmu_Y),
+            )
+            extract_right = max(
+                _extract_increment(extract_x, psi_r_rmuT_X),
+                _extract_increment(extract_y, psi_r_rmu_Y),
+            )
             left_peak = pair_density_aot_peak_bytes(
                 mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_left,
                 nspinor=ns_, n_col=tile_width,
@@ -1860,6 +1911,14 @@ def build_gram_q0_via_loadwfns(
                 * ((tile_width + n_y - 1) // n_y)
                 * _GRAM_COMPLEX_BYTES
             )
+            one_left_input_local = (
+                nk_ * (tile_width // n_x) * nb_left * ns_
+                * _GRAM_COMPLEX_BYTES
+            )
+            one_right_input_local = (
+                nk_ * (tile_width // n_x) * nb_right * ns_
+                * _GRAM_COMPLEX_BYTES
+            )
             facts = gram_block_live_set_bytes(
                 resident_bytes=resident_bytes,
                 pair_left_peak_bytes=left_peak,
@@ -1867,8 +1926,14 @@ def build_gram_q0_via_loadwfns(
                 gram_fold_peak_bytes=fold_peak,
                 one_pair_tile_bytes=one_pair_local,
                 gram_matrix_local_bytes=gram_local_bytes,
+                extract_left_increment_bytes=extract_left,
+                extract_right_increment_bytes=extract_right,
+                one_left_input_tile_bytes=one_left_input_local,
+                one_right_input_tile_bytes=one_right_input_local,
             )
             facts.update({
+                "extract_left": int(extract_left),
+                "extract_right": int(extract_right),
                 "pair_left_compiled": int(left_peak),
                 "pair_right_compiled": int(right_peak),
                 "gram_compiled": int(fold_peak),
@@ -1911,52 +1976,51 @@ def build_gram_q0_via_loadwfns(
                 f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
                 f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
                 f"{live_facts['gram_compiled'] / 2**30:.2f}, "
+                f"extract L/R increment="
+                f"{live_facts['extract_left'] / 2**30:.2f}/"
+                f"{live_facts['extract_right'] / 2**30:.2f}, "
                 f"full-live peak={live_facts['peak'] / 2**30:.2f} "
                 f"of target={target_bytes / 2**30:.2f} GiB/device)"
             )
-        col_y = NamedSharding(
-            mesh_xy, PartitionSpec(None, None, None, 'y'),
-        )
-        row_x = NamedSharding(
-            mesh_xy, PartitionSpec(None, 'x', None, None),
-        )
-        tile_xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
-        with timing.section("q0_sum"):
-            g_col_blocks = []
-            for c0 in range(0, M_cols, col_block):
-                c1 = min(c0 + col_block, M_cols)
-                g_row_tiles = []
-                for r0 in range(0, M_cols, col_block):
-                    r1 = min(r0 + col_block, M_cols)
+        extract_x, extract_y = _services_for_width(col_block)
+        tile_xy = NamedSharding(mesh_xy, tile_spec)
+        update_g = shard_local_update(mesh_xy, spec=tile_spec)
+        local_rows = M_cols // n_x
+        local_cols = M_cols // n_y
+        local_row_tile = col_block // n_x
+        local_col_tile = col_block // n_y
 
-                    # Tail tiles use ONE static compiled shape.  Padding is
-                    # exact zero through runtime.padding's canonical helper;
-                    # pair density and q=0 folding are bilinear, so the pad is
-                    # inert.  Slice only the finished G tile back to logical.
-                    row_l = pad_axis(
-                        psi_l_rmuT_X[:, r0:r1, :, :], col_block, axis=1,
-                    ).array
-                    block_l = pad_axis(
-                        psi_l_rmu_Y[..., c0:c1], col_block, axis=3,
-                    ).array
-                    if n_dev_total > 1:
-                        row_l = device_put_process_local(row_l, row_x)
-                        block_l = device_put_process_local(block_l, col_y)
+        @partial(jax.jit, out_shardings=tile_xy)
+        def _zero_gram():
+            return jnp.zeros((M_cols, M_cols), dtype=jnp.complex128)
+
+        G = _zero_gram()
+        G.block_until_ready()
+
+        def _rep_i32(value):
+            return device_put_process_local(
+                np.asarray(value, dtype=np.int32), rep_sh)
+
+        with timing.section("q0_sum"):
+            for c0 in range(0, local_cols, local_col_tile):
+                c_start = _rep_i32(c0)
+                for r0 in range(0, local_rows, local_row_tile):
+                    r_start = _rep_i32(r0)
+
+                    # Slice inside each already-owned X/Y shard.  The generic
+                    # layout primitive zero-pads the local tail, so no smaller
+                    # global extent is ever repartitioned and the pair/fold
+                    # executables keep one static shape.
+                    row_l = extract_x(psi_l_rmuT_X, r_start)
+                    block_l = extract_y(psi_l_rmu_Y, c_start)
                     P_l_b = pair_density(row_l, block_l, mesh_xy)
                     # This barrier makes the planner's stage max real: the
                     # left compiler arena is gone before the right one starts.
                     P_l_b.block_until_ready()
                     del row_l, block_l
 
-                    row_r = pad_axis(
-                        psi_r_rmuT_X[:, r0:r1, :, :], col_block, axis=1,
-                    ).array
-                    block_r = pad_axis(
-                        psi_r_rmu_Y[..., c0:c1], col_block, axis=3,
-                    ).array
-                    if n_dev_total > 1:
-                        row_r = device_put_process_local(row_r, row_x)
-                        block_r = device_put_process_local(block_r, col_y)
+                    row_r = extract_x(psi_r_rmuT_X, r_start)
+                    block_r = extract_y(psi_r_rmu_Y, c_start)
                     P_r_b = pair_density(row_r, block_r, mesh_xy)
                     P_r_b.block_until_ready()
                     del row_r, block_r
@@ -1967,15 +2031,11 @@ def build_gram_q0_via_loadwfns(
                     )
                     G_b.block_until_ready()
                     del P_l_b, P_r_b
-                    G_b = G_b[:r1 - r0, :c1 - c0]
-                    if n_dev_total > 1:
-                        G_b = device_put_process_local(G_b, tile_xy)
-                    g_row_tiles.append(G_b)
-                G_col = jnp.concatenate(g_row_tiles, axis=0)
-                G_col.block_until_ready()
-                g_col_blocks.append(G_col)
-                del g_row_tiles
-            G = jnp.concatenate(g_col_blocks, axis=1)
+                    starts = _rep_i32((r0, c0))
+                    G = update_g(G, G_b, starts)
+                    G.block_until_ready()
+                    del G_b, r_start, starts
+                del c_start
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
             G = 0.5 * (G + jnp.conj(G.T))

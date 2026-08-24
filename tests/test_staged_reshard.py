@@ -86,6 +86,8 @@ from common.staged_reshard import (
     band_to_product_r_reshard,
     face_to_batch_reshard,
     face_to_batch_reshard_supported,
+    shard_local_slice_pad,
+    shard_local_update,
 )
 
 # FOUR DEVICES.  Was a ``skipif(jax.device_count() < 4)``, which skipped in
@@ -127,6 +129,46 @@ def _product_probe():
     idx = np.arange(RK * RB * RS * RR, dtype=np.float64).reshape(
         RK, RB, RS, RR)
     return jnp.asarray(idx + 1j * (idx * 0.25 + 3.0))
+
+
+def test_shard_local_slice_pad_never_repartitions_a_smaller_global_face():
+    mesh = _mesh()
+    spec = P(None, 'x', None)
+    sh = NamedSharding(mesh, spec)
+    rep = NamedSharding(mesh, P())
+    src_np = np.arange(2 * 12 * 3, dtype=np.float64).reshape(2, 12, 3)
+    src = jax.device_put(src_np, sh)
+    take = shard_local_slice_pad(
+        mesh, spec=spec, axis=1, mesh_axis='x', local_size=2)
+
+    start = jax.device_put(np.int32(5), rep)
+    got = np.asarray(take(src, start))
+    expected = np.zeros((2, 4, 3), dtype=np.float64)
+    expected[:, 0, :] = src_np[:, 5, :]
+    expected[:, 2, :] = src_np[:, 11, :]
+    np.testing.assert_array_equal(got, expected)
+
+    compiled = take.lower(
+        jax.ShapeDtypeStruct(src.shape, src.dtype, sharding=sh),
+        jax.ShapeDtypeStruct((), jnp.int32, sharding=rep),
+    ).compile()
+    hlo = compiled.as_text().lower()
+    assert 'all-gather' not in hlo and 'all-to-all' not in hlo
+
+
+def test_shard_local_update_writes_tail_in_each_owned_face_without_clamp():
+    mesh = _mesh()
+    spec = P('x', 'y')
+    sh = NamedSharding(mesh, spec)
+    rep = NamedSharding(mesh, P())
+    dst = jax.device_put(np.zeros((6, 6), dtype=np.float64), sh)
+    tile = jax.device_put(np.full((4, 4), 7.0, dtype=np.float64), sh)
+    starts = jax.device_put(np.asarray((2, 2), dtype=np.int32), rep)
+    update = shard_local_update(mesh, spec=spec)
+    got = np.asarray(update(dst, tile, starts))
+    expected = np.zeros((6, 6), dtype=np.float64)
+    expected[np.ix_((2, 5), (2, 5))] = 7.0
+    np.testing.assert_array_equal(got, expected)
 
 
 def _unstaged(mesh):

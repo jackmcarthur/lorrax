@@ -29,7 +29,7 @@ assert pc.gram_col_block_device_bytes(
 ) == pc.gram_col_block_bytes(81, 2, tile) // 16
 
 # Complete-live-set accounting: right pair build carries the completed left
-# pair tile; final assembly has four local-G slots.  The max is explicit.
+# pair tile; final Hermitian fold has three local-G slots.  The max is explicit.
 live = pc.gram_block_live_set_bytes(
     resident_bytes=1000,
     pair_left_peak_bytes=200,
@@ -37,12 +37,18 @@ live = pc.gram_block_live_set_bytes(
     gram_fold_peak_bytes=400,
     one_pair_tile_bytes=50,
     gram_matrix_local_bytes=25,
+    extract_left_increment_bytes=125,
+    extract_right_increment_bytes=150,
+    one_left_input_tile_bytes=10,
+    one_right_input_tile_bytes=20,
 )
 assert live == {
+    "extract_left": 1160,
     "pair_left": 1225,
+    "extract_right": 1245,
     "pair_right": 1375,
     "gram_fold": 1425,
-    "final_fold": 1100,
+    "final_fold": 1075,
     "peak": 1425,
 }
 
