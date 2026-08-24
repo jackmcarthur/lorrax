@@ -2232,6 +2232,12 @@ _DEFAULTS = {
     # then restore the per-k row-isometry required by f(H).  This is NOT an
     # rtol alias and must be converged on the final observable.
     "htransform_rank_multiplier": 0.0,
+    # Optional mesh-independent restart for the reusable Galerkin basis.
+    # Empty preserves the fit-every-call path.  A nonempty path is read when
+    # present and otherwise written after the fit; the format stamps the WFN,
+    # exact centroid table, band window, grids, spinor mode and fit controls,
+    # and refuses a mismatch rather than silently refitting or reusing it.
+    "galerkin_basis_file": "",
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
