@@ -1452,12 +1452,16 @@ class WfnLoader:
             kvecs_np = np.asarray(
                 self.kpoints, dtype=np.float64)[
                     np.asarray(k_idxs, dtype=np.int32)]
-        bvec = np.asarray(self.bvec, dtype=np.float64)
+        # WFN stores bvec in reciprocal-lattice units and blat=2π/alat in
+        # bohr⁻¹.  This file-format boundary is the one place the bispinor
+        # lift converts to the Cartesian momentum its API requires.
+        bvec_cart_bohr = (
+            float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
         return _bispinor_lift_kernel(
             psi_2,
             jnp.asarray(gvecs, dtype=jnp.float64),
             jnp.asarray(kvecs_np),
-            jnp.asarray(bvec),
+            jnp.asarray(bvec_cart_bohr),
             sharding=sharding,
         )
 
@@ -1556,8 +1560,9 @@ def _get_bispinor_lift_jit(sharding: NamedSharding | None):
     from common.bispinor_init import lift_to_4spinor
 
     @jax.jit
-    def _kernel(psi_2, gvecs, kvecs, bvec):
-        out = lift_to_4spinor(psi_2, gvecs, kvecs, bvec)
+    def _kernel(psi_2, gvecs, kvecs, bvec_cart_bohr):
+        out = lift_to_4spinor(
+            psi_2, gvecs, kvecs, bvec_cart_bohr)
         if sharding is not None:
             out = jax.lax.with_sharding_constraint(out, sharding)
         return out
@@ -1568,7 +1573,7 @@ def _bispinor_lift_kernel(
     psi_2: jax.Array,
     gvecs: jax.Array,
     kvecs: jax.Array,
-    bvec: jax.Array,
+    bvec_cart_bohr: jax.Array,
     *,
     sharding: NamedSharding | None,
 ) -> jax.Array:
@@ -1577,9 +1582,10 @@ def _bispinor_lift_kernel(
     psi_2: (n_k, nb, 2, ngkmax) c128
     gvecs: (n_k, ngkmax, 3)  float64 (already cast)
     kvecs: (n_k, 3)          float64
-    bvec : (3, 3)            float64
+    bvec_cart_bohr : (3, 3)  float64, reciprocal rows in bohr⁻¹
     """
-    return _get_bispinor_lift_jit(sharding)(psi_2, gvecs, kvecs, bvec)
+    return _get_bispinor_lift_jit(sharding)(
+        psi_2, gvecs, kvecs, bvec_cart_bohr)
 
 
 # ---------------------------------------------------------------------------
