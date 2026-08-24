@@ -3036,102 +3036,15 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
     # and forwards it to the already layout-dispatching wing kernels; the
     # ONLY reason it read as "still legacy-only" before this session is
     # that its sole producer, rotate_wavefunctions, had no face arm.
-    (
-        # PORTED 2026-08-23 (feat/metal-response-face-2026-08-23,
-        # docs/architecture/fractional_chi0_response_face.md): the exact
-        # finite-occupation chi0 the census row named --
-        # w_isdf._fractional_pair_scan's ordered-pair kernel (Gamma static
-        # body + finite-q/finite-z direct kernel) AND the separate
-        # fractional/contour kernel -- now both dispatch on wfns.layout
-        # and route through a genuinely new 2-D band-pair mechanism
-        # (masked-gather + psum on BOTH mesh axes, isdf.core._z_q_face's
-        # idiom generalized) for the ordered-pair half, and a plain
-        # build_G_tau(layout='face', ...) substitution for the
-        # fractional/contour half (its two Green's functions are each
-        # one-particle).  Gated: real 4-rank CUDA algebra parity
-        # (tests/test_chi0_fractional_face_parity.py), a structural
-        # no-single-axis-psi proof, and a production-shape Na-deck
-        # harness (face-vs-legacy, NOT a full gw_jax driver run -- see
-        # below for why).
-        #
-        # THE ROW STAYS REFUSING ANYWAY, narrowed to name the REAL
-        # remaining blocker rather than lifted: _validate_metal_compute_
-        # mode (this file, below) REQUIRES compute_mode = mpa whenever
-        # mpa_material_class = metal, and compute_mode = mpa is
-        # UNCONDITIONALLY refused under low_mem_bands = true by the
-        # SEPARATE low_mem_bands_dynamic_ppm_unported row (gw.mpa.sigma's
-        # own Sigma_c(omega) executor -- a different subsystem entirely,
-        # frequency-domain self-energy, not this row's chi0/response
-        # subject, and outside this session's charter). So no deck
-        # combination can reach this session's ported kernels without
-        # ALSO tripping that other row first if this one were removed:
-        # lifting this row alone would not unblock a single live
-        # low_mem_bands=true metal deck, only change WHICH rule id it
-        # refuses under. Per the design doc's own closing section, this
-        # row is kept and will be lifted for real once
-        # low_mem_bands_dynamic_ppm_unported is ALSO lifted for MPA (a
-        # separate, unscoped port) -- at that point this row's own
-        # predicate can be dropped outright, since nothing else in the
-        # census blocks a metal deck once both are ported.
-        "low_mem_bands_metal_material_class_unported",
-        lambda cfg: (str(getattr(cfg.mpa, "material_class", "insulator"))
-                     .strip().lower() == "metal"),
-        lambda cfg: f"mpa_material_class = {cfg.mpa.material_class}",
-        "mpa_material_class = insulator (the default)",
-        "set mpa_material_class = insulator (or drop the key), or set "
-        "low_mem_bands = false for a metallic run",
-        "UPDATED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23, "
-        "claims/0443.md): gw.mpa.sigma's split-Sigma-window gap -- this "
-        "row's own remaining blocker as of the previous entry -- is now "
-        "FIXED and gated end to end for mpa_material_class = insulator "
-        "(strip_sigma_window's new mesh-aware device-array arm; real "
-        "4-rank CUDA parity, Si_scalar fresh one-shot MPA, eqp0/eqp1 "
-        "max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face). "
-        "low_mem_bands_dynamic_ppm_unported is narrowed accordingly (see "
-        "that row below) rather than deleted, because METAL MPA is still "
-        "refused there too: mpa_material_class = metal unconditionally "
-        "requires qp_solver = self_consistent "
-        "(gw.mpa.model._require_metal_occupations -- the one-shot "
-        "screening call never builds an OccupationState), and every "
-        "sc_head_update arm a fresh (non-restart) metal MPA deck can "
-        "reach this session hit an INFRA obstacle unrelated to this "
-        "port's own code: off falls through to a plain-midgap SC-init "
-        "check that is meaningless for a metal and refuses by name; "
-        "parallel_transport reproduces the pre-existing SlabIO rank-0-"
-        "slab defect this row's own history already named; dft_velocity "
-        "needs a pre-built parallel_transport.h5 this session had none "
-        "of (the one candidate on disk is already flagged "
-        "velocity_validation_passed=0). So this row stays refusing -- "
-        "not because the ported code is unconfirmed for metal, but "
-        "because no self-contained fresh metal-MPA deck could be driven "
-        "end to end this session to confirm it. Lift target unchanged: "
-        "a metal MPA end-to-end gate, once one of those three artifacts "
-        "exists. "
-        "UPDATED 2026-08-23 (gate/na-metal-head-e2e-2026-08-23, PLAN.md "
-        "item D6, this session's attempt): the dft_velocity obstacle "
-        "named above is CLEARED via a NEW, independent route -- merging "
-        "fix/head-wing-mp1-and-retirement-2026-08-23 + feat/velocity-"
-        "decouple-preflight-2026-08-23 (D1-D3) and building a fresh "
-        "velocity-only parallel_transport artifact via get_dipole_"
-        "mtxels.py --parallel-transport-velocity-only gets a genuinely "
-        "fresh sc_head_update=dft_velocity, mpa_material_class=metal, "
-        "qp_solver=self_consistent Na SOC-48b deck PAST config parse, "
-        "PAST the ISDF fit, and 45.5s into the SC driver at real P16 "
-        "(4x4 mesh). It then dies on a PRE-EXISTING, already-registered "
-        "defect (KNOWN_LORRAX_ISSUES.md's src/gw/sc_iteration.py:1784-"
-        "1788/:1882 row, first found 2026-08-19 on origin/main@15d79af8 "
-        "via an independently-built velocity artifact, JID 57269074): "
-        "gw_iteration_map's mpa_mode log line references an unbound "
-        "name 'mpa_z', and crashes on EVERY qp_solver=self_consistent, "
-        "compute_mode=mpa SC iteration unconditionally, metal or "
-        "insulating -- RECONFIRMED, not newly discovered, one month and "
-        "37+ commits later on the current integ tip. Per this session's "
-        "own scope (register pre-existing defects, do not expand scope "
-        "to fix them), this row STAYS REFUSED -- not lifted -- pending "
-        "that one-line fix. Lift target NARROWED: a metal MPA "
-        "end-to-end gate now needs only sc_iteration.py:1882 fixed, not "
-        "a rebuild of the PT artifact machinery.",
-    ),
+    # LIFTED 2026-08-23 (fix/mpa-head-status-line-2026-08-23): the metal
+    # row was the LAST entry.  Both of its originally-named blockers were
+    # already ported+gated (metallic chi0 response; the MPA executor), and
+    # the residual reachability obstacle was the sc_iteration mpa_z
+    # NameError (KNOWN_LORRAX_ISSUES 2026-08-19 row), fixed in the same
+    # branch and gated by the staged Na dft_velocity P16 legs
+    # (runs/Na/02_soc48b_qsgw_mpa/09_dft_velocity_headgate_p16_20260823).
+    # The envelope is now EMPTY: every deck the legacy path serves is
+    # served under low_mem_bands=true.
     # LIFTED for FRESH-FIT decks (2026-08-23,
         # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
         # closed.  Both halves the previous session's comment named as
