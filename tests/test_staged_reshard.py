@@ -83,6 +83,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.staged_reshard import (
+    band_to_product_r_reshard,
     face_to_batch_reshard,
     face_to_batch_reshard_supported,
 )
@@ -102,6 +103,13 @@ B, M, N = 8, 12, 20
 FACE = P(None, 'x', 'y')
 BATCH = P(('x', 'y'), None, None)
 
+# Rank-4 wavefunction carrier for the product-band -> product-r route.
+# Every dimension is index-visible, both distributed extents divide the 2x2
+# mesh, and no two nontrivial axes have the same size.
+RK, RB, RS, RR = 3, 8, 2, 20
+PRODUCT_BAND = P(None, ('x', 'y'), None, None)
+PRODUCT_R = P(None, None, None, ('y', 'x'))
+
 
 def _mesh(px=2, py=2, names=('x', 'y')):
     devs = np.array(jax.devices()[:px * py]).reshape(px, py)
@@ -112,6 +120,13 @@ def _probe(b=B, m=M, n=N):
     """Values that encode their own (batch, row, col) index."""
     idx = np.arange(b * m * n, dtype=np.float64).reshape(b, m, n)
     return jnp.asarray(idx + 1j * (idx * 0.5 + 1.0))
+
+
+def _product_probe():
+    """Rank-4 values encoding their exact global ``(k,b,s,r)`` order."""
+    idx = np.arange(RK * RB * RS * RR, dtype=np.float64).reshape(
+        RK, RB, RS, RR)
+    return jnp.asarray(idx + 1j * (idx * 0.25 + 3.0))
 
 
 def _unstaged(mesh):
@@ -361,6 +376,34 @@ def test_hlo_pin_two_all_to_all_zero_all_gather():
     facts = _module_facts(jax.jit(face_to_batch_reshard(mesh)), a)
     full = B * M * N * 16
     _assert_movement_only(facts, full // ndev, full, where="staged")
+
+
+def test_band_to_product_r_preserves_order_layout_and_one_shard_hlo():
+    """The rank-4 wavefunction move is exact and movement-only on 2x2."""
+    mesh = _mesh()
+    ndev = int(mesh.devices.size)
+    a = jax.device_put(
+        _product_probe(), NamedSharding(mesh, PRODUCT_BAND))
+    fn = band_to_product_r_reshard(mesh)
+
+    out = fn(a)
+    # PRODUCT_R ends in a non-None entry, so JAX's normalized spec has all
+    # four entries and can be pinned exactly rather than padded for comparison.
+    assert tuple(out.sharding.spec) == tuple(PRODUCT_R), out.sharding.spec
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(_product_probe()))
+
+    full = RK * RB * RS * RR * 16
+    facts = _module_facts(fn, a)
+    _assert_movement_only(
+        facts, full // ndev, full, where="band-to-product-r")
+
+
+def test_band_to_product_r_refuses_a_wrong_concrete_source_layout():
+    """A shard_map boundary may not silently synthesize the pre-reshard."""
+    mesh = _mesh()
+    a = jax.device_put(_product_probe(), NamedSharding(mesh, PRODUCT_R))
+    with pytest.raises(ValueError, match="implicit pre-reshard"):
+        band_to_product_r_reshard(mesh)(a)
 
 
 def test_hlo_red_twin_the_unstaged_chain_replicates():

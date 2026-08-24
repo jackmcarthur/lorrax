@@ -46,8 +46,9 @@ from typing import Sequence, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from runtime.padding import round_up, pad_axis
+from runtime.padding import round_up, pad_axis, spec_divisor
 from common.shard_map import shard_map
+from common.staged_reshard import band_to_product_r_reshard
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -1903,13 +1904,19 @@ def iter_psi_rchunk_bandwise(
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
     psi_G_flat: jax.Array | None = None,
+    product_r_spec: P | None = None,
 ):
-    """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
+    """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time.
 
-    Each yielded ``psi_bc_Y`` has shape
-    ``(nk, bc_range[1]-bc_range[0], ns, r_end-r_start)`` sharded
-    ``P(None, None, None, 'y')`` — the FFT-to-r-chunk slab of just
-    the current band chunk.  The caller is responsible for
+    By default each result has shape ``(nk, bc, ns, r_end-r_start)`` sharded
+    ``P(None, None, None, 'y')``, preserving the historical contract.  When
+    ``product_r_spec=P(None,None,None,('y','x'))``, the free r axis is first
+    zero-padded through :func:`runtime.padding.pad_axis` to that spec's
+    canonical divisor and then moved directly from the input's product-band
+    layout to the product-r layout by
+    :func:`common.staged_reshard.band_to_product_r_reshard`.  That route is
+    two volume-preserving all-to-alls and never constructs the historical
+    x-replicated r-on-y global carrier.  The caller is responsible for
     accumulating contributions (e.g. ``P += einsum(ψ_L_bc, ψ_R_bc)``)
     so only one band chunk's r-chunk shard is live at any moment,
     decoupling the pair-density peak from the total band count.
@@ -1951,6 +1958,35 @@ def iter_psi_rchunk_bandwise(
     nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
     n_rchunk = int(r_end - r_start)
+    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    product_reshard = None
+    if product_r_spec is not None:
+        expected = P(None, None, None, ('y', 'x'))
+        if product_r_spec != expected:
+            raise ValueError(
+                "iter_psi_rchunk_bandwise: the canonical product-r route "
+                f"has spec {expected}, got {product_r_spec}")
+        r_pad_divisor = spec_divisor(mesh_xy, product_r_spec, axis=3)
+        product_reshard = band_to_product_r_reshard(mesh_xy)
+        out_r = NamedSharding(mesh_xy, product_r_spec)
+    else:
+        r_pad_divisor = 1
+        out_r = out_Y
+    n_rchunk_carrier = round_up(n_rchunk, r_pad_divisor)
+
+    def _finish_r_carrier(a):
+        """Pad one logical r slab and commit it to the requested layout."""
+        padded = pad_axis(a, r_pad_divisor, axis=-1)
+        if (padded.logical != n_rchunk
+                or padded.padded != n_rchunk_carrier):
+            raise AssertionError(
+                "iter_psi_rchunk_bandwise: runtime.padding returned "
+                "inconsistent r-carrier metadata: "
+                f"logical={padded.logical} (expected {n_rchunk}), "
+                f"padded={padded.padded} (expected {n_rchunk_carrier})")
+        if product_reshard is None:
+            return jax.lax.with_sharding_constraint(padded.array, out_Y)
+        return product_reshard(padded.array)
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -1964,15 +2000,14 @@ def iter_psi_rchunk_bandwise(
     # JIT'd zero-allocator used by the k-chunked path (memoised by
     # shape).  Keeps the top-level ``jnp.zeros`` from being
     # rematerialised replicated on every device.
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-    _zeros_Y_cache: dict = {}
-    def _zeros_Y(shape):
-        fn = _zeros_Y_cache.get(shape)
+    _zeros_out_cache: dict = {}
+    def _zeros_out(shape):
+        fn = _zeros_out_cache.get(shape)
         if fn is None:
             fn = jax.jit(
                 lambda: jnp.zeros(shape, dtype=jnp.complex128),
-                out_shardings=out_Y)
-            _zeros_Y_cache[shape] = fn
+                out_shardings=out_r)
+            _zeros_out_cache[shape] = fn
         return fn()
 
     sharding_load = _GFLAT_LOAD_SPEC
@@ -2023,13 +2058,13 @@ def iter_psi_rchunk_bandwise(
         for bc_range, w in zip(band_chunk_ranges, widths):
             psi_bc = _slice_bands_gflat(
                 psi_G_flat, int(bc_range[0]) - b_start, w, mesh_xy)
-            psi_bc_Y = to_rchunk(
+            psi_bc_r = to_rchunk(
                 psi_bc, g_index_full, meta.fft_grid,
                 int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
-            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
+            psi_bc_r = _finish_r_carrier(psi_bc_r)
             del psi_bc
-            yield bc_range, psi_bc_Y
+            yield bc_range, psi_bc_r
         return
 
     for bc_range in band_chunk_ranges:
@@ -2047,18 +2082,18 @@ def iter_psi_rchunk_bandwise(
                     f"iter_psi_rchunk_bandwise: band chunk {bc_range} lies "
                     f"entirely past the file's band extent "
                     f"({int(loader.nbands)})")
-            psi_bc_Y = to_rchunk(
+            psi_bc_r = to_rchunk(
                 psi_G_bc, g_index_full, meta.fft_grid,
                 int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
                 kvecs_frac=jnp.asarray(kvecs_frac_full))
-            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
+            psi_bc_r = _finish_r_carrier(psi_bc_r)
             del psi_G_bc
-            yield bc_range, psi_bc_Y
+            yield bc_range, psi_bc_r
         else:
             nb_chunk = bc_range[1] - bc_range[0]
             nspinor = meta.nspinor
-            psi_bc_Y_full = _zeros_Y(
-                (nk_tot, nb_chunk, nspinor, n_rchunk))
+            psi_bc_r_full = _zeros_out(
+                (nk_tot, nb_chunk, nspinor, n_rchunk_carrier))
             for k0 in range(0, nk_tot, nk_batch):
                 k1 = min(k0 + nk_batch, nk_tot)
                 k_ids = list(range(k0, k1))
@@ -2071,12 +2106,11 @@ def iter_psi_rchunk_bandwise(
                     meta.fft_grid, int(r_start), n_rchunk,
                     mesh=mesh_xy, norm="ortho",
                     kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
-                psi_k_chunk = jax.lax.with_sharding_constraint(
-                    psi_k_chunk, out_Y)
-                psi_bc_Y_full = psi_bc_Y_full.at[
+                psi_k_chunk = _finish_r_carrier(psi_k_chunk)
+                psi_bc_r_full = psi_bc_r_full.at[
                     k0:k1, :, :, :].set(psi_k_chunk)
                 del psi_G_flat, psi_k_chunk
-            yield bc_range, psi_bc_Y_full
+            yield bc_range, psi_bc_r_full
 
 
 # ============================================================================
