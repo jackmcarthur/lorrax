@@ -175,6 +175,7 @@ def fit_zeta_to_h5(
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
     low_mem_bands: bool = False,
+    cache_psi_r: bool = True,
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
 ):
@@ -246,6 +247,11 @@ def fit_zeta_to_h5(
                     None`` -- refuses by name otherwise.  Default False:
                     bit-identical to the pre-existing path (``psi_nmu_fresh``/
                     ``psi_mun_fresh`` are ignored).
+        cache_psi_r: Hoist all band/grid ψ(r) coefficients once when True.
+                    False uses the same z_q kernel's streamed band-chunk
+                    ψ(G)->ψ(r_chunk) route and keeps the host staging store
+                    open through the r loop.  The memory planner selects
+                    False only when a low-memory run cannot hold the cache.
         psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
                     ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
                     ``PSI_MUN_SPEC``), spanning the SAME [b0, b4) range
@@ -1175,24 +1181,29 @@ def fit_zeta_to_h5(
         bispinor=bispinor,
     )
 
-    # Hoist the full-grid ψ(G)->ψ(r) transforms once.  The cache's band
-    # axis is sharded over the complete ('x','y') mesh; no rank holds the
-    # full window at P>1, and there is no μ axis (hence no N_μ² object).
-    # Block until every io_callback has drained before freeing the host tiles.
-    with timing.section("zeta_fit.build_psi_r_cache"):
-        psi_r_cache = build_psi_r_cache_sm(
-            psi_G_store, mesh_xy=mesh_xy)
-        psi_r_cache.block_until_ready()
-    _cache_local_bytes = sum(
-        int(shard.data.size) * int(shard.data.dtype.itemsize)
-        for shard in psi_r_cache.addressable_shards)
-    if jax.process_index() == 0:
-        print(f"  ψ(r) cache: {psi_r_cache.shape}, "
-              f"band-sharded over ('x','y'), "
-              f"{_cache_local_bytes / 1e9:.2f} GB local")
-    # The r-chunk loop consumes only the device cache.  Drop host ψ(G) now;
-    # g_index/kvecs remain staged properties used as compatibility operands.
-    psi_G_store.close()
+    # Hoist the full-grid ψ(G)->ψ(r) transforms when the memory plan admits
+    # the cache.  Otherwise retain the SAME host staging store and let the
+    # canonical z_q kernel stream one band chunk through to_rchunk_inner per
+    # r chunk.  This is a storage policy only; both routes enter the same
+    # pair-density/FFT/solve physics below.
+    psi_r_cache = None
+    if cache_psi_r:
+        with timing.section("zeta_fit.build_psi_r_cache"):
+            psi_r_cache = build_psi_r_cache_sm(
+                psi_G_store, mesh_xy=mesh_xy)
+            psi_r_cache.block_until_ready()
+        _cache_local_bytes = sum(
+            int(shard.data.size) * int(shard.data.dtype.itemsize)
+            for shard in psi_r_cache.addressable_shards)
+        if jax.process_index() == 0:
+            print(f"  ψ(r) cache: {psi_r_cache.shape}, "
+                  f"band-sharded over ('x','y'), "
+                  f"{_cache_local_bytes / 1e9:.2f} GB local")
+        # Every io_callback has drained; only the device cache is consumed.
+        psi_G_store.close()
+    elif jax.process_index() == 0:
+        print("  ψ(r) cache: disabled by the low-memory plan; streaming "
+              "one ψ(G) band chunk per r chunk")
 
     # ========== STEP 6: Loop over chunks ==========
     # Wall-clock totals for the end-of-fit timing line.  ``t_fit_total``
