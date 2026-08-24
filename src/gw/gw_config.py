@@ -3038,7 +3038,31 @@ _LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] =
         "because no self-contained fresh metal-MPA deck could be driven "
         "end to end this session to confirm it. Lift target unchanged: "
         "a metal MPA end-to-end gate, once one of those three artifacts "
-        "exists.",
+        "exists. "
+        "UPDATED 2026-08-23 (gate/na-metal-head-e2e-2026-08-23, PLAN.md "
+        "item D6, this session's attempt): the dft_velocity obstacle "
+        "named above is CLEARED via a NEW, independent route -- merging "
+        "fix/head-wing-mp1-and-retirement-2026-08-23 + feat/velocity-"
+        "decouple-preflight-2026-08-23 (D1-D3) and building a fresh "
+        "velocity-only parallel_transport artifact via get_dipole_"
+        "mtxels.py --parallel-transport-velocity-only gets a genuinely "
+        "fresh sc_head_update=dft_velocity, mpa_material_class=metal, "
+        "qp_solver=self_consistent Na SOC-48b deck PAST config parse, "
+        "PAST the ISDF fit, and 45.5s into the SC driver at real P16 "
+        "(4x4 mesh). It then dies on a PRE-EXISTING, already-registered "
+        "defect (KNOWN_LORRAX_ISSUES.md's src/gw/sc_iteration.py:1784-"
+        "1788/:1882 row, first found 2026-08-19 on origin/main@15d79af8 "
+        "via an independently-built velocity artifact, JID 57269074): "
+        "gw_iteration_map's mpa_mode log line references an unbound "
+        "name 'mpa_z', and crashes on EVERY qp_solver=self_consistent, "
+        "compute_mode=mpa SC iteration unconditionally, metal or "
+        "insulating -- RECONFIRMED, not newly discovered, one month and "
+        "37+ commits later on the current integ tip. Per this session's "
+        "own scope (register pre-existing defects, do not expand scope "
+        "to fix them), this row STAYS REFUSED -- not lifted -- pending "
+        "that one-line fix. Lift target NARROWED: a metal MPA "
+        "end-to-end gate now needs only sc_iteration.py:1882 fixed, not "
+        "a rebuild of the PT artifact machinery.",
     ),
     # LIFTED for FRESH-FIT decks (2026-08-23,
         # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
