@@ -233,10 +233,13 @@ A level assignment nobody argued is a level assignment nobody will keep.
    dataclasses) is genuinely GW's and should stay. Its *environment* half is
    not: the XLA-memory quarter moved out to `runtime/xla_memory.py` on
    2026-07-31 (§6); `SlabIOBackend` was resolved by deletion 2026-08-06 (§5).
-9. **`bandstructure/htransform.py` — an L1 driver and an L1 library in one
-   file.** Same shape `gw/kin_ion_io.py` had before it was split. Its
-   `shard_map` Galerkin solve is a kernel; its `main()` is a driver. Its
-   hand-rolled `_build_mesh_xy` was the separable part and is gone.
+9. **`bandstructure/htransform.py` — still an L1 driver and an L1 library in
+   one file.** Same shape `gw/kin_ion_io.py` had before it was split. The
+   projected-Gram `shard_map`, memory plan, and r-outer/band-inner schedule
+   now live in the named L1 kernel owner `isdf/galerkin.py`; the remaining
+   centroid basis fit and fH interpolation are still library code, while
+   `main()` is a driver. Its hand-rolled `_build_mesh_xy` was the first
+   separable part and is gone.
 10. **`runtime/padding.py` — L3, though it is arithmetic.** `round_up` looks
     like L2 mathematics. It exists **only** because a mesh axis has to divide
     an extent; delete the mesh and the module has no reason to exist. Level
