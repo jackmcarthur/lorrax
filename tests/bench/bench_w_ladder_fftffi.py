@@ -16,7 +16,7 @@ question without a deck:
 
 ``matvec``  END-TO-END: the real ladder matvec on a real payload, baseline vs
             an FFI-served twin obtained by rebinding the two factory names
-            ``bse_ring_comm`` imports (``w_ladder_fftffi.make_sharded_*_ffi``)
+            ``bse_stack_matvec`` imports (``w_ladder_fftffi.make_sharded_*_ffi``)
             BEFORE the matvec is built.  No production file is edited — the
             integration agent owns those concurrently.  The RPA matvec
             (``include_w=False``) is timed beside both, which is what makes the
@@ -280,7 +280,7 @@ def mode_matvec(args, mesh):
     import harness                                               # noqa: F401
     from runtime import bootstrap
     bootstrap()
-    from bse import bse_io, bse_ring_comm
+    from bse import bse_io, bse_stack_matvec
     from bse.bse_feast import ladder_matvec_operands, matvec_operands
     from bse.bse_w_exact import _symmetry_tables, build_finite_q_data
     from bse.w_ladder import build_ladder_resolvent
@@ -305,11 +305,11 @@ def mode_matvec(args, mesh):
     rows, outs, cens = [], {}, []
     for arm in args.arms:
         if arm == "ffi":
-            bse_ring_comm.make_sharded_ifftn_3d = X.make_sharded_ifftn_3d_ffi
-            bse_ring_comm.make_sharded_fftn_3d = X.make_sharded_fftn_3d_ffi
+            bse_stack_matvec.make_sharded_ifftn_3d = X.make_sharded_ifftn_3d_ffi
+            bse_stack_matvec.make_sharded_fftn_3d = X.make_sharded_fftn_3d_ffi
         else:
-            bse_ring_comm.make_sharded_ifftn_3d = make_sharded_ifftn_3d
-            bse_ring_comm.make_sharded_fftn_3d = make_sharded_fftn_3d
+            bse_stack_matvec.make_sharded_ifftn_3d = make_sharded_ifftn_3d
+            bse_stack_matvec.make_sharded_fftn_3d = make_sharded_fftn_3d
         for include_w in ([True, False] if arm == "xla" else [True]):
             stack = build_ladder_resolvent(mesh, data, include_w=include_w)
             matvec, _, gen, snapshot, sh = stack

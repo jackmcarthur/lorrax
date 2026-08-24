@@ -106,6 +106,7 @@ def _worker() -> int:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     import bse.bse_ring_comm as brc
+    import bse.bse_stack_matvec as bsm
     from bse.bse_serial import compute_pair_amplitude
 
     devs = jax.devices()
@@ -185,17 +186,17 @@ def _worker() -> int:
     # The RED arm needs a seam.  It patches the shipped coupling encode helper;
     # if that helper is gone the twin cannot be installed and says so rather
     # than passing silently.
-    shipped = getattr(brc, "_ring_sum_B_encode", None)
+    shipped = getattr(bsm, "_ring_sum_B_encode", None)
     if shipped is None:
         res["red_unavailable"] = (
-            "bse_ring_comm._ring_sum_B_encode is gone, so the pre-fix twin "
+            "bse_stack_matvec._ring_sum_B_encode is gone, so the pre-fix twin "
             "could not be installed")
     else:
-        brc._ring_sum_B_encode = _pre_fix_B_encode
+        bsm._ring_sum_B_encode = _pre_fix_B_encode
         try:
             score("red_ring", True)      # the gather route has its own body
         finally:
-            brc._ring_sum_B_encode = shipped
+            bsm._ring_sum_B_encode = shipped
     print(json.dumps(res))
     return 0
 

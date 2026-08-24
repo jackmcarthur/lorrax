@@ -122,10 +122,10 @@ _SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 #: id -> human description.  Adding a route here is all it takes to put it
 #: under every gate in this file; the worker builds it from the id.
 COUPLING_ROUTES = {
-    "ring": "bse_ring_comm.build_bse_ring_matvec_full(low_mem=True) "
-            "half-applier apply_B -- the production non-TDA ring route",
-    "gather": "bse_ring_comm.build_bse_ring_matvec_full(low_mem=False) "
-              "half-applier apply_B -- the all_gather encode spelling",
+    "ring": "the former ring compatibility entry with low_mem=True, "
+            "delegating to the shared stack full-space apply_B",
+    "gather": "the former ring compatibility entry with low_mem=False, "
+              "delegating to the shared stack all_gather encode spelling",
     "stack_fused": "bse_stack_matvec.build_bse_stack_pair_matvec(fuse=True) "
                    "-- the SDY matrix-free pair applier (production)",
     "stack_unfused": "bse_stack_matvec.build_bse_stack_pair_matvec(fuse=False) "
@@ -137,7 +137,7 @@ COUPLING_ROUTES = {
 #: encode is covered iff some registered route drives it.
 _ENCODE_TO_ROUTES = {
     "bse/bse_ring_comm.py::_ring_sum_B_encode": ("ring",),
-    "bse/bse_ring_comm.py::build_bse_ring_matvec_full._encode_T_B_gather": (
+    "bse/bse_stack_matvec.py::_build_bse_stack_matvec_full._encode_T_B_gather": (
         "gather",),
     "bse/bse_stack_matvec.py::_encode_T_B": ("stack_fused", "stack_unfused"),
     "bse/bse_stack_matvec.py::build_bse_stack_pair_matvec._w_pair": (
@@ -468,17 +468,17 @@ def _worker() -> int:
             bsm._encode_T_B = shipped
 
     # --- RED ARM 2: instance 1's defect, back in ----------------------------
-    shipped_ring = getattr(brc, "_ring_sum_B_encode", None)
+    shipped_ring = getattr(bsm, "_ring_sum_B_encode", None)
     if shipped_ring is None:
         res["red_ring_unavailable"] = (
-            "bse_ring_comm._ring_sum_B_encode is gone, so the pre-fix twin "
+            "bse_stack_matvec._ring_sum_B_encode is gone, so the pre-fix twin "
             "could not be installed")
     else:
-        brc._ring_sum_B_encode = _pre_fix_ring_encode
+        bsm._ring_sum_B_encode = _pre_fix_ring_encode
         try:
             res["red_ring"] = score(["ring", "stack_fused"])
         finally:
-            brc._ring_sum_B_encode = shipped_ring
+            bsm._ring_sum_B_encode = shipped_ring
 
     print("RESULT " + json.dumps(res))
     return 0

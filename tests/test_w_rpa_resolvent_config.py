@@ -2,8 +2,8 @@
 
 WHAT IS BEING PINNED.  ``w_rpa_resolvent`` reaches the SAME ladder facade
 as ``w_bse`` (``gw.screening_bse.compute_screening_ladder``) with
-``include_w=False``: one matvec builder (``bse.bse_ring_comm.
-build_bse_ring_matvec_full``), kernel-switched, not a second one.  This
+``include_w=False``: one matvec builder (``bse.bse_stack_matvec.
+build_bse_stack_matvec(full=True)``), kernel-switched, not a second one.  This
 file pins the config-level half of that: the value parses and normalises,
 each audited refusal fires at PARSE TIME with its own rule id, the
 combinations the ``w_bse`` audit did NOT carry over (MPA) refuse by name
