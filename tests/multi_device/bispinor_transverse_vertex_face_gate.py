@@ -37,8 +37,12 @@ Checks:
      inserted ψ and the SAME (Hermitian, physical) V tile — this is
      ``compute_sigma_x_bispinor``'s own per-tile mechanism, minus the
      HDF5 reader / 9-tile Python loop (pure orchestration, not new
-     physics).  ``mu_L == 0`` also exercises the no-op short-circuit
-     path (``with_lorentz_vertices`` returns the SAME bundle object).
+     physics).  The same fixture also checks that the packed-photon block
+     kernel's dynamic X/SX selector reproduces V and 2V algebra through
+     one compiled executable, and that its full-photon caller can request
+     Hartree without running the historical bare-X path.  ``mu_L == 0``
+     also exercises the no-op short-circuit path
+     (``with_lorentz_vertices`` returns the SAME bundle object).
 
 Run:
     lx run -N 1 -G 4 -n 4 bash <pythonpath-wrapper> python3 -u \\
@@ -186,7 +190,11 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
 def check_sigma_sx_chain_face_matches_legacy(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
-    from gw.cohsex_sigma import _make_cohsex_kernels
+    from types import SimpleNamespace
+
+    from gw.cohsex_sigma import _make_cohsex_kernels, compute_v_h_sigma_x
+    from gw.photon_sigma import (
+        _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
     from gw.wavefunction_bundle import (
         BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_XR_SPEC, PSI_YR_SPEC,
         PSI_YN_SPEC, PSI_MUN_SPEC, PSI_NMU_SPEC, with_lorentz_vertices)
@@ -265,7 +273,62 @@ def check_sigma_sx_chain_face_matches_legacy(
     assert r < RTOL, (
         f"sigma_sx chain face-vs-legacy rel err {r:.3e} "
         f"(mu_L={mu_L}, nu_L={nu_L})")
-    return {"face_vs_legacy": r}
+
+    # The coupled photon path must evaluate X[V_packed] and SX[W_packed]
+    # through the same Green/convolution/projector graph and one compiled
+    # executable.  Use W=2V so both selector branches have an exact algebraic
+    # reference, while keeping V/W in their production 2-D packed sharding.
+    V_q_packed = _put(V_q_np, mesh, (None, "x", "y"))
+    W_q_packed = 2.0 * V_q_packed
+    photon_block = _make_photon_static_block_kernel(
+        mesh, kgrid, nk, wfns_face, wfns_face)
+    left_g = with_lorentz_vertices(wfns_face, mu_L, 0)
+    right_g = with_lorentz_vertices(wfns_face, 0, nu_L)
+    photon_x = photon_block(
+        wfns_face, wfns_face, left_g, right_g, Gij_face,
+        W_q_packed, V_q_packed, np.asarray(_TERM_X, dtype=np.int32))
+    photon_x.block_until_ready()
+    photon_sx = photon_block(
+        wfns_face, wfns_face, left_g, right_g, Gij_face,
+        W_q_packed, V_q_packed, np.asarray(_TERM_SX, dtype=np.int32))
+    photon_sx.block_until_ready()
+    r_photon_x = _rel(_gather(photon_x), got_face_full)
+    r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)
+    assert r_photon_x < RTOL, (
+        f"photon X[V] rel err {r_photon_x:.3e} "
+        f"(mu_L={mu_L}, nu_L={nu_L})")
+    assert r_photon_sx < RTOL, (
+        f"photon SX[2V] rel err {r_photon_sx:.3e} "
+        f"(mu_L={mu_L}, nu_L={nu_L})")
+    cache_size = photon_block._cache_size()
+    assert cache_size == 1, (
+        "dynamic photon X/SX selector compiled more than one executable: "
+        f"cache_size={cache_size}")
+
+    # Full photon mode retains compute_v_h_sigma_x as the sole Hartree owner,
+    # but must not touch either scalar or transverse bare-X.  A deliberately
+    # nonexistent transverse file makes the latter contract executable rather
+    # than documentary; the exact-zero placeholder is the dispatch seam.
+    v_only = compute_v_h_sigma_x(
+        wfns_face, V_q_face,
+        SimpleNamespace(kgrid=kgrid, nk_tot=nk), mesh,
+        Gij=Gij_face,
+        wfns_transverse=wfns_face,
+        bispinor_v_q_path="/deliberately/nonexistent/full-photon-v.h5",
+        compute_bare_x=False,
+    )
+    max_skipped_x = float(np.abs(_gather(v_only["sig_x"])).max())
+    assert max_skipped_x == 0.0, (
+        "compute_bare_x=False did not return its exact-zero exchange "
+        f"placeholder: max_abs={max_skipped_x:.3e}")
+
+    return {
+        "face_vs_legacy": r,
+        "photon_x_vs_v": r_photon_x,
+        "photon_sx_vs_2v": r_photon_sx,
+        "photon_kernel_cache_size": cache_size,
+        "skipped_x_max_abs": max_skipped_x,
+    }
 
 
 # ---------------------------------------------------------------------------
