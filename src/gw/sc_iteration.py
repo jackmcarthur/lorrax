@@ -2342,10 +2342,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             "QSGW finite-link covariant velocity" if forward_links is not None
             else "QP-rotated DFT p-matrix velocity")
         if mpa_mode:
+            # The fit-sample count comes from the RETURNED plan --
+            # ``mpa_z`` is a local inside ``_sc_head_frequency_plan`` and
+            # was never visible here (KNOWN_LORRAX_ISSUES 2026-08-19 row;
+            # every sc_head_update=dft_velocity + compute_mode=mpa
+            # iteration raised NameError at this line before W sampling).
+            # ``plan_z`` excludes the separately appended exact-static
+            # G=0 head sample, which is exactly the count meant here.
+            from .mpa import sample_plan as _sample_plan
             inputs.print_fn(
                 "    SC head: occupation-aware QSGW response plus sharded "
                 f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
-                f"nb={pt.nb_logical}, fit samples={mpa_z.size})")
+                f"nb={pt.nb_logical}, "
+                f"fit samples={len(_sample_plan.plan_z(mpa_plan))})")
         else:
             inputs.print_fn(
                 f"    SC head: {velocity_kind} + current-basis wings "
