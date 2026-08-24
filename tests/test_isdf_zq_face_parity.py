@@ -35,6 +35,10 @@ non-mesh-divisible band edges and ns=2"):
   ``band_range_full``'s own origin (``[5, 30)``), the case a
   psi_mun-offset bug (``bc.lo - _bfs`` vs some other origin) would show up
   in first.
+* ``face_tail_r11`` — an 11-cell logical tail transported in a 12-cell
+  carrier on the P4 / ``p_y=2`` mesh.  It compares against the same cells
+  of a full-grid face evaluation and requires the carrier pad cell to be
+  exactly zero, catching ``dynamic_slice``'s backward-clamp substitution.
 
 Each case ALSO forces a band chunk (``(0, 24)``, width 24) to straddle
 psi_mun's own 'y'-shard boundary (shard width ``nb_full/p_y = 36/2 = 18``)
@@ -96,6 +100,12 @@ _GAMMA_CASES = tuple(
     if not (mu_l == 0 and nu_l == 0)
 )
 
+_TAIL_CASES = (
+    ("face_tail_r11",
+     dict(ns=2, l_range=(0, 21), r_range=(9, 36), seed=4,
+          tail_logical=11)),
+)
+
 
 def _worker(case_name: str) -> int:
     """Runs in a fresh subprocess (JAX_PLATFORMS=cpu,
@@ -120,6 +130,7 @@ def _worker(case_name: str) -> int:
         _case["ns"], _case["l_range"], _case["r_range"], _case["seed"])
     gamma_mu_L = _case.get("gamma_mu_L", 0)
     gamma_nu_L = _case.get("gamma_nu_L", 0)
+    tail_logical = _case.get("tail_logical")
     gamma_L = None if gamma_mu_L == 0 else gamma_perm_phase(gamma_mu_L)
     gamma_R = None if gamma_nu_L == 0 else gamma_perm_phase(gamma_nu_L)
 
@@ -135,7 +146,8 @@ def _worker(case_name: str) -> int:
     fft_grid = (4, 4, 4); n_rtot = 4 * 4 * 4
     ngkmax = n_rtot // 2 + 1
     n_rmu = 4                       # divides p_x=2
-    n_zchunk = 12                   # divides p_y=2
+    n_zchunk = 12                   # divides p_y=2; tail case carries 11+1 pad
+    r_start = 0 if tail_logical is None else n_rtot - int(tail_logical)
     nb_full = 36                    # divides p_y=2 (psi_mun's own shard axis)
     band_chunk_ranges = ((0, 24), (24, 36))   # widths 24, 12: both p_xy=4-divisible
     l0, l1 = l_range
@@ -228,15 +240,17 @@ def _worker(case_name: str) -> int:
     mun_spec = NamedSharding(mesh, P(None, None, "x", "y"))
 
     # ---- legacy ---------------------------------------------------------
-    Z_legacy = jax.block_until_ready(z_q_from_psi_sm(
-        jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
-        jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
-        store, psi_r_cache,
-        band_chunk_ranges=band_chunk_ranges,
-        band_range_left=l_range, band_range_right=r_range,
-        r_start_dyn=0, r_chunk_size=n_zchunk,
-        gamma_L=gamma_L, gamma_R=gamma_R, kgrid=kgrid, mesh_xy=mesh,
-        layout="legacy"))
+    Z_legacy = None
+    if tail_logical is None:
+        Z_legacy = jax.block_until_ready(z_q_from_psi_sm(
+            jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
+            jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
+            store, psi_r_cache,
+            band_chunk_ranges=band_chunk_ranges,
+            band_range_left=l_range, band_range_right=r_range,
+            r_start_dyn=0, r_chunk_size=n_zchunk,
+            gamma_L=gamma_L, gamma_R=gamma_R, kgrid=kgrid, mesh_xy=mesh,
+            layout="legacy"))
 
     # ---- face -------------------------------------------------------
     idx = np.arange(nb_full)
@@ -245,7 +259,7 @@ def _worker(case_name: str) -> int:
     Z_face = jax.block_until_ready(z_q_from_psi_sm(
         psi_G_store=store, psi_r_cache=psi_r_cache,
         band_chunk_ranges=band_chunk_ranges,
-        r_start_dyn=0, r_chunk_size=n_zchunk,
+        r_start_dyn=r_start, r_chunk_size=n_zchunk,
         kgrid=kgrid, mesh_xy=mesh,
         layout="face",
         psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
@@ -260,8 +274,28 @@ def _worker(case_name: str) -> int:
     # equivalent read.  Mirrors test_isdf_cq_face_parity.py's own fix for
     # the identical issue.
     from jax.experimental import multihost_utils as _mhu
-    Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     Zf = np.asarray(_mhu.process_allgather(Z_face, tiled=True))
+    if tail_logical is None:
+        Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
+    else:
+        # Independent-width reference: the full-grid face evaluation has
+        # no out-of-range slice.  Its final logical cells must be retained
+        # in order and the mesh-divisibility carrier cell must remain inert.
+        Z_full = jax.block_until_ready(z_q_from_psi_sm(
+            psi_G_store=store, psi_r_cache=psi_r_cache,
+            band_chunk_ranges=band_chunk_ranges,
+            r_start_dyn=0, r_chunk_size=n_rtot,
+            kgrid=kgrid, mesh_xy=mesh,
+            layout="face",
+            psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+            gamma_L=gamma_L, gamma_R=gamma_R,
+            weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r)))
+        Z_full_np = np.asarray(_mhu.process_allgather(Z_full, tiled=True))
+        Zl = np.concatenate(
+            (Z_full_np[..., r_start:],
+             np.zeros((*Z_full_np.shape[:-1], n_zchunk - int(tail_logical)),
+                      dtype=Z_full_np.dtype)),
+            axis=-1)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -281,11 +315,12 @@ def _worker(case_name: str) -> int:
         "case": case_name, "ns": ns, "l_range": list(l_range),
         "r_range": list(r_range),
         "gamma_mu_L": gamma_mu_L, "gamma_nu_L": gamma_nu_L,
+        "tail_logical": tail_logical, "r_start": r_start,
     }))
     return 0
 
 
-_ALL_CASES = _CASES + _GAMMA_CASES
+_ALL_CASES = _CASES + _GAMMA_CASES + _TAIL_CASES
 _CASES_BY_NAME = {name: kwargs for name, kwargs in _ALL_CASES}
 
 
