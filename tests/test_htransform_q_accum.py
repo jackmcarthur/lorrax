@@ -202,7 +202,8 @@ def _twin_body() -> dict:
     old_fold_tile_bytes = ht._FOLD_Q_TILE_BYTES
     try:
         ht._FOLD_Q_TILE_BYTES = 768
-        fold = ht._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
+        fold = ht._make_fold_G_kernel(
+            rank, ns, n_rtot, mesh, sharding_q, grid_xy)
         G = fold(Q, G)
     finally:
         ht._FOLD_Q_TILE_BYTES = old_fold_tile_bytes
