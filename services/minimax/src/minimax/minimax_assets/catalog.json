@@ -21,7 +21,8 @@
   "sweeps": {
     "error_bounds": [
       1e-06,
-      2e-07
+      2e-07,
+      6.86665972794514e-08
     ],
     "crossing_A_dim_values": [
       20.0,
@@ -31,6 +32,7 @@
       10.0,
       21.544346900318832,
       46.41588833612777,
+      92.36189541312946,
       100.0,
       215.44346900318823,
       464.15888336127773,
@@ -163,6 +165,16 @@
       "node_count": 9,
       "max_error": 2.61359545783435e-07,
       "file": "noncrossing/noncrossing_R_46p415888_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 6.86665972794514e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 92.36189541312946,
+      "node_count": 11,
+      "max_error": 3.8641991384480434e-08,
+      "file": "noncrossing/noncrossing_R_92p361895_eps_6p9em08.npz"
     },
     {
       "family": "noncrossing",
