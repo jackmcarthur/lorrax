@@ -312,6 +312,51 @@ def _worker(case_name: str) -> int:
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
         cache_face_y_blocks=False))
 
+    # Production-closure seam: direct z_q parity alone does not prove the
+    # planner-owned structural bit reaches ``fit_one_rchunk``'s factory/cache
+    # key.  Run the full z_q -> solve closure for charge ns=1/2, the short-r
+    # tail, and all three physical diagonal current vertices.  Identity C+
+    # makes the solve value-neutral while preserving the production sharding
+    # and phase boundary; all 15 nonidentity (mu,nu) pairs remain covered by
+    # the direct oracle above.
+    closure_cases = {
+        "ns1_asym", "ns2_spinor", "face_tail_r11",
+        "gamma_mu1_nu1", "gamma_mu2_nu2", "gamma_mu3_nu3",
+    }
+    fit_outputs = ()
+    if case_name in closure_cases:
+        from types import SimpleNamespace
+        from isdf.core import fit_one_rchunk
+
+        meta = SimpleNamespace(
+            nk_tot=nk, nspinor=ns, n_rmu=n_rmu,
+            n_rmu_padded=n_rmu, kgrid=kgrid, fft_grid=fft_grid)
+        lq_shard = NamedSharding(mesh, P(None, "x", "y"))
+        L_q = jax.device_put(
+            np.broadcast_to(
+                np.eye(n_rmu, dtype=np.complex128),
+                (nk, n_rmu, n_rmu)).copy(),
+            lq_shard)
+        vertex_mu = gamma_mu_L if gamma_mu_L == gamma_nu_L else 0
+
+        def _fit(cache_y):
+            return jax.block_until_ready(fit_one_rchunk(
+                psi_G_store=store, psi_r_cache=None, L_q=L_q,
+                r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                mesh_xy=mesh, meta=meta,
+                band_chunk_ranges=band_chunk_ranges,
+                band_range_left=l_range, band_range_right=r_range,
+                band_range_full=(0, nb_full),
+                actual_n_rchunk=n_zchunk, q_chunk_size=1,
+                vertex_mu_L=vertex_mu,
+                solver_kind="distributed_rank_truncate",
+                zeta_gather="distributed", layout="face",
+                psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+                weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
+                cache_face_y_blocks=cache_y))
+
+        fit_outputs = (_fit(True), _fit(False))
+
     # process_allgather, NOT device_get: both are genuinely multi-process
     # sharded (P(None,'x','y')) under a REAL multi-process mesh (the
     # `lx run -N 1 -G 4 -n 4` CLI path -- 4 processes, one device each),
@@ -325,9 +370,12 @@ def _worker(case_name: str) -> int:
         Z_face_streamed_cached, tiled=True))
     Zfsr = np.asarray(_mhu.process_allgather(
         Z_face_streamed_repeated, tiled=True))
+    fit_outputs_np = tuple(
+        np.asarray(_mhu.process_allgather(value, tiled=True))
+        for value in fit_outputs)
     Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
-        comparisons = (Zf, Zfsc, Zfsr)
+        comparisons = (Zf, Zfsc, Zfsr, *fit_outputs_np)
     else:
         # Independent-width reference: the full-grid face evaluation has
         # no out-of-range slice.  Its final logical cells must be retained
@@ -349,7 +397,7 @@ def _worker(case_name: str) -> int:
             axis=-1)
         Zls = np.asarray(_mhu.process_allgather(
             Z_legacy_streamed, tiled=True))
-        comparisons = (Zf, Zfsc, Zfsr, Zl, Zls)
+        comparisons = (Zf, Zfsc, Zfsr, Zl, Zls, *fit_outputs_np)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -374,6 +422,7 @@ def _worker(case_name: str) -> int:
         "r_range": list(r_range),
         "gamma_mu_L": gamma_mu_L, "gamma_nu_L": gamma_nu_L,
         "tail_logical": tail_logical, "r_start": r_start,
+        "fit_one_rchunk_routes": len(fit_outputs_np),
     }))
     return 0
 
