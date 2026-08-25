@@ -98,6 +98,30 @@ def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
     return wrapped / grid
 
 
+def q_negation_index(kgrid):
+    """C-order full-grid permutation ``index(q) -> index(-q)``.
+
+    The q axis used by the ISDF fit, GW restart tensors, and BSE is the
+    row-major flattening of ``(qx, qy, qz)``.  This service owns the
+    involution so normal-equation completion, diagnostics, and downfolding
+    cannot carry independent spellings of the same q convention.
+    """
+    raw = np.asarray(kgrid)
+    if raw.shape != (3,) or not np.all(np.isfinite(raw)):
+        raise ValueError(
+            "q_negation_index: kgrid must contain three finite positive "
+            f"integers; got shape={raw.shape}, values={raw.tolist()}.")
+    grid = raw.astype(np.int64)
+    if np.any(grid <= 0) or not np.array_equal(raw, grid):
+        raise ValueError(
+            "q_negation_index: kgrid must contain three finite positive "
+            f"integers; got {raw.tolist()}.")
+    coords = np.stack(
+        np.unravel_index(np.arange(int(np.prod(grid))), tuple(grid)), axis=1)
+    neg = (-coords) % grid[None, :]
+    return np.ravel_multi_index(neg.T, tuple(grid)).astype(np.int32)
+
+
 def common_uniform_grid_indices(grid_a, grid_b):
     """Aligned C-order rows shared by two unshifted uniform BZ grids.
 

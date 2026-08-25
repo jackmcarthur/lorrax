@@ -30,6 +30,7 @@ from .gw_config import (ZETA_RCOND_DEFAULT,
 from isdf.core import (
     build_psi_r_cache_sm,
     c_q_from_psi_sm,
+    complete_ordered_pair_normal_equations,
     host_rss_gb as _host_rss_gb,
     factor_c_q,
     fit_one_rchunk,
@@ -360,6 +361,26 @@ def fit_zeta_to_h5(
     if band_range_right is None:
         band_range_right = (meta.b_id_0, meta.b_id_4)
 
+    # The production charge fit uses asymmetric serving windows: L contains
+    # all occupied states plus the Sigma conduction window, while R contains
+    # the Sigma occupied window plus all empty states.  Complex conjugation
+    # swaps those ordered endpoints, so LR alone is not a conjugation-closed
+    # training space.  Complete the *normal equations* before factor/solve;
+    # no fitted zeta, V, or W is projected downstream.  The q involution is
+    # owned by the symmetry service and passed into neutral ``isdf.core``.
+    _complete_charge_pairs = (
+        int(vertex_mu_L) == 0
+        and tuple(band_range_left) != tuple(band_range_right))
+    if _complete_charge_pairs:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import q_negation_index
+        _q_neg_idx = q_negation_index(kgrid)
+        print("  Charge pair training domain: ordered LR + RL "
+              "(conjugation-closed normal equations)")
+    else:
+        _q_neg_idx = None
+
     # Full range for loading (max of left and right)
     band_range_full = (min(band_range_left[0], band_range_right[0]),
                        max(band_range_left[1], band_range_right[1]))
@@ -650,6 +671,9 @@ def fit_zeta_to_h5(
         C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
         flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
+        if _q_neg_idx is not None:
+            C_q_flat = complete_ordered_pair_normal_equations(
+                C_q_flat, _q_neg_idx)
 
         # IBZ cascade for the per-q factor: slice C_q to IBZ rows *before*
         # ``factor_c_q`` runs so Cholesky / LU factors only ``n_q_ibz``
@@ -1376,6 +1400,7 @@ def fit_zeta_to_h5(
                     vertex_mu_L=int(vertex_mu_L),
                     solver_kind=_resolved_solver_kind,
                     q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
+                    q_neg_idx=_q_neg_idx,
                     cct_trace_per_q=cct_trace_per_q,
                     zeta_gather=_resolved_zeta_gather,
                     lu_piv=lu_piv,

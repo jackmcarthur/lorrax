@@ -360,6 +360,13 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
+	# Stamp only the path whose physics changed.  Equal-window charge fits and
+	# every transverse fit retain their byte-identical schema-1 provenance;
+	# an old asymmetric LR-only stamp lacks this non-legacy key and therefore
+	# refits instead of entering the ordered LR+RL serving basis.
+	if (int(vertex_mu_L) == 0
+			and tuple(band_range_left) != tuple(band_range_right)):
+		prov['charge_pair_training_domain'] = 'ordered_lr_plus_rl'
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -596,9 +603,10 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# are such missing keys, reuse is allowed iff this run requests
 		# exactly the legacy value for each (one-line notice); requesting
 		# anything else IS a real mismatch — refit, naming the key.  The
-		# schema number stays at 1 on purpose: bumping it would force a
-		# refit of every existing on-disk zeta, which this branch exists
-		# to avoid.  Keys and their implied legacy values:
+		# schema stays at 1 for additions with an exact legacy meaning.  The
+		# asymmetric charge pair-domain key is deliberately absent from this
+		# table: its old LR-only meaning is not reusable.  Keys and their
+		# implied legacy values:
 		#   distributed_zeta_solve  'replicated'  (the distributed tier's
 		#       block-cyclic eigh is a different gauge — 2026-08-01)
 		#   transverse_zeta_solve   'ridge'       (the rank_truncate

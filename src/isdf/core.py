@@ -116,6 +116,44 @@ _pair_pipeline_sm_cache = {}  # pair-density shard_map pipeline kernel
 _psi_r_cache_sm_cache = {}    # one-time ψ(G)->ψ(r) cache builders
 
 
+@partial(jax.jit, donate_argnums=(0,))
+def _ordered_pair_normal_equations(normal_eq, q_neg_idx):
+	"""Device kernel for the exact ``LR + RL`` normal-equation sum."""
+	return normal_eq + jnp.conj(jnp.take(normal_eq, q_neg_idx, axis=0))
+
+
+def complete_ordered_pair_normal_equations(normal_eq, q_neg_idx):
+	"""Complete an LR normal equation to the conjugation-closed LR+RL set.
+
+	For a Hermitian charge vertex, relabelling ``(n,m,k)`` gives exactly
+
+	``N_RL(q) = conj(N_LR(-q))``
+
+	for both the CCT metric and every ZCT right-hand-side chunk.  Therefore
+	this one operation is the normal equation of the concatenated ordered
+	pair training domain; it is not a projection of fitted zeta, V, or W.
+	The q permutation is supplied by the symmetry service so this neutral
+	ISDF layer does not own a second q-grid convention.
+	"""
+	if getattr(normal_eq, "ndim", 0) < 1:
+		raise ValueError(
+			"complete_ordered_pair_normal_equations: normal_eq must have a "
+			"leading full-q axis.")
+	nq = int(normal_eq.shape[0])
+	neg = np.asarray(q_neg_idx, dtype=np.int32)
+	if neg.shape != (nq,):
+		raise ValueError(
+			"complete_ordered_pair_normal_equations: q_neg_idx must have "
+			f"shape ({nq},); got {neg.shape}.")
+	if (np.any(neg < 0) or np.any(neg >= nq)
+			or not np.array_equal(np.sort(neg), np.arange(nq))
+			or not np.array_equal(neg[neg], np.arange(nq))):
+		raise ValueError(
+			"complete_ordered_pair_normal_equations: q_neg_idx must be an "
+			"involutive permutation of the full q axis.")
+	return _ordered_pair_normal_equations(normal_eq, jnp.asarray(neg))
+
+
 def _conv_kpair_static_gamma(gamma, ns: int):
 	"""Host-stable monomial data for the conv_kpair attribute ABI.
 
@@ -5702,6 +5740,7 @@ def _make_fit_one_rchunk_kernel(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
+    q_neg_idx: np.ndarray | None = None,
     zeta_gather: str = 'replicated',
     lu_hoisted: bool = False,
     distrib_la_batched_route: str = "auto",
@@ -5782,6 +5821,8 @@ def _make_fit_one_rchunk_kernel(
             np.asarray(q_irr_full_idx, dtype=np.int32))
     else:
         q_irr_idx_j = None
+    q_neg_idx_np = (None if q_neg_idx is None else
+                    np.asarray(q_neg_idx, dtype=np.int32))
 
     # ψ enters at PADDED n_rmu.  All in-memory arrays here operate at
     # PADDED extent so the inner shard_map boundaries see divisible
@@ -5809,7 +5850,7 @@ def _make_fit_one_rchunk_kernel(
             # the closure-captured (perm, phase) tuple for a transverse
             # channel — SAME value passed as both gamma_L and gamma_R,
             # mirroring the legacy branch below.
-            return z_q_from_psi_sm(
+            Z_q = z_q_from_psi_sm(
                 psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
                 band_chunk_ranges=band_chunk_ranges,
                 r_start_dyn=r_start_dyn,
@@ -5819,29 +5860,33 @@ def _make_fit_one_rchunk_kernel(
                 layout="face", psi_mun=psi_mun,
                 weight_l=weight_l, weight_r=weight_r,
             )
-        # Pre-multiply by 1/norms so the pair-density einsum sees the
-        # norm-scaled input without a per-bc divide inside the scan
-        # (algebraically identical: einsum is linear in psi_X·psi_Y).
-        psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
-        psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
-        # gamma_perm/gamma_phase remain in this callable's compatibility ABI,
-        # but the FFI path must use the closure-captured attribute values.
-        gamma_mu = gamma_static
-        # Streaming pair density + γ̃·γ̃ + FFT — single shard_map.  The
-        # expensive full-grid ψ IFFT is hoisted outside the r-chunk loop.
-        # Output Z_q at FULL-BZ q-shape.
-        return z_q_from_psi_sm(
-            psi_l_X_scaled, psi_r_X_scaled, psi_G_store, psi_r_cache,
-            band_chunk_ranges=band_chunk_ranges,
-            band_range_left=band_range_left,
-            band_range_right=band_range_right,
-            r_start_dyn=r_start_dyn,
-            r_chunk_size=actual_n_rchunk,
-            gamma_L=gamma_mu,
-            gamma_R=gamma_mu,
-            kgrid=kgrid,
-            mesh_xy=mesh_xy,
-        )
+        else:
+            # Pre-multiply by 1/norms so the pair-density einsum sees the
+            # norm-scaled input without a per-bc divide inside the scan
+            # (algebraically identical: einsum is linear in psi_X·psi_Y).
+            psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
+            psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
+            # gamma_perm/gamma_phase remain in this callable's compatibility ABI,
+            # but the FFI path must use the closure-captured attribute values.
+            gamma_mu = gamma_static
+            # Streaming pair density + γ̃·γ̃ + FFT — single shard_map.  The
+            # expensive full-grid ψ IFFT is hoisted outside the r-chunk loop.
+            # Output Z_q at FULL-BZ q-shape.
+            Z_q = z_q_from_psi_sm(
+                psi_l_X_scaled, psi_r_X_scaled, psi_G_store, psi_r_cache,
+                band_chunk_ranges=band_chunk_ranges,
+                band_range_left=band_range_left,
+                band_range_right=band_range_right,
+                r_start_dyn=r_start_dyn,
+                r_chunk_size=actual_n_rchunk,
+                gamma_L=gamma_mu,
+                gamma_R=gamma_mu,
+                kgrid=kgrid,
+                mesh_xy=mesh_xy,
+            )
+        if q_neg_idx_np is not None:
+            Z_q = complete_ordered_pair_normal_equations(Z_q, q_neg_idx_np)
+        return Z_q
 
     def solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv=None):
         # IBZ-only solve (Phase B): L_q + cct_trace + lu_piv come in
@@ -5934,6 +5979,7 @@ def fit_one_rchunk(
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
+    q_neg_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
     zeta_gather: str = 'replicated',
     lu_piv: jax.Array | None = None,
@@ -6005,6 +6051,9 @@ def fit_one_rchunk(
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
                                dtype=np.int32).tobytes()))),
+        (None if q_neg_idx is None
+         else (int(np.asarray(q_neg_idx).shape[0]),
+               hash(np.asarray(q_neg_idx, dtype=np.int32).tobytes()))),
     )
     fn = _fit_one_rchunk_cache.get(cache_key)
     if fn is None:
@@ -6020,6 +6069,7 @@ def fit_one_rchunk(
             vertex_mu_L=int(vertex_mu_L),
             solver_kind=str(solver_kind),
             q_irr_full_idx=q_irr_full_idx,
+            q_neg_idx=q_neg_idx,
             zeta_gather=str(zeta_gather),
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),

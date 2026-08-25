@@ -552,11 +552,10 @@ def neg_q_index(kgrid) -> np.ndarray:
     with (``.reshape(nkx, nky, nkz, mu, nu)``), so this permutation and the
     BSE's own k-transform agree by construction.
     """
-    nx, ny, nz = (int(v) for v in kgrid)
-    idx = np.arange(nx * ny * nz).reshape(nx, ny, nz)
-    return idx[
-        (-np.arange(nx)) % nx, :, :][:, (-np.arange(ny)) % ny, :][
-        :, :, (-np.arange(nz)) % nz].reshape(-1)
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import q_negation_index
+    return q_negation_index(kgrid)
 
 
 def _negq_stats(a, neg):

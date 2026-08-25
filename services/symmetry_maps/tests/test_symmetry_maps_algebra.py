@@ -44,7 +44,7 @@ from _deck_stub import deck_available, read_deck
 from symmetry_maps import (SymMaps, centroid_source_map_and_wrap,
                            common_uniform_grid_indices,
                            fft_grid_pullback_perm, find_irreducible_bz_points,
-                           kgrid_shift_map,
+                           kgrid_shift_map, q_negation_index,
                            recover_symmorphic_density_point_group,
                            spinor_rotation_for_sym_row, tau_phase_row,
                            unfold_psi)
@@ -54,6 +54,15 @@ from symmetry_maps.maps import _I_SIGMA_Y
 # ---------------------------------------------------------------------------
 # common_uniform_grid_indices — exact native-grid intersection
 # ---------------------------------------------------------------------------
+
+def test_q_negation_index_is_the_c_order_involution():
+    grid = (3, 4, 2)
+    neg = q_negation_index(grid)
+    coords = np.stack(np.unravel_index(np.arange(np.prod(grid)), grid), axis=1)
+    expected = np.ravel_multi_index(((-coords) % np.asarray(grid)).T, grid)
+    np.testing.assert_array_equal(neg, expected)
+    np.testing.assert_array_equal(neg[neg], np.arange(neg.size))
+
 
 def test_nonnested_8x8_to_12x12_has_the_exact_4x4_intersection():
     """RED TWIN: 8→12 shares 4 points/axis, not all 8 and not a prefix."""
