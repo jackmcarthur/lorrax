@@ -34,7 +34,6 @@ from common.units import RYD_TO_EV
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
-    GalerkinBasisStamp,
     fit_galerkin_basis,
     read_galerkin_basis,
     validate_rank_multiplier,
@@ -185,11 +184,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             "Galerkin basis input and output are mutually exclusive")
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
     extra_rank_pad = resolve_extra_rank_pad()
-    stamp = GalerkinBasisStamp.from_runtime(
-        wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        band_range=band_range, bispinor=bispinor,
-        rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
-        qrcp_seed=qrcp_seed)
     if basis_input:
         basis_path = os.fspath(basis_input)
         if not os.path.isfile(basis_path):
@@ -197,7 +191,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                 f"Galerkin basis input does not exist: {basis_path}")
         log_fn(f"  [galerkin-restart] reading {basis_path}")
         basis = read_galerkin_basis(
-            basis_path, mesh_xy=mesh_xy, expected=stamp,
+            basis_path, wfn=wfn, meta=meta,
+            centroid_indices=centroid_indices, band_range=band_range,
+            bispinor=bispinor, rank_multiplier=rank_multiplier,
+            qrcp_eps=qr_eps, qrcp_seed=qrcp_seed, mesh_xy=mesh_xy,
             extra_rank_pad=extra_rank_pad)
         log_fn(
             f"  [galerkin-restart] reused physical rank "
@@ -252,7 +249,10 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     )
     if basis_output:
         write_galerkin_basis(
-            os.fspath(basis_output), basis, stamp, mesh_xy=mesh_xy)
+            os.fspath(basis_output), basis, wfn=wfn, meta=meta,
+            centroid_indices=centroid_indices, bispinor=bispinor,
+            rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
+            qrcp_seed=qrcp_seed, mesh_xy=mesh_xy)
         log_fn(
             f"  [galerkin-restart] wrote physical rank "
             f"{basis.rank_physical} to {basis_output}")
