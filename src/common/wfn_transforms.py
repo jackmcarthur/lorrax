@@ -1217,10 +1217,13 @@ def gflat_to_rmu(
         tuple(int(s) for s in psi_G.shape), tuple(g_shape),
         fft_grid_t, n_rmu, r_mu_id, ngkmax,
         norm, kvecs_shape, cs, n_chunks, pad_N,
-        # Key the explicit transform mesh, not ``psi_G.sharding.mesh``:
-        # recent JAX may return a fresh equivalent Mesh wrapper on each
-        # device_put, which would make identical streamed tiles miss here.
-        (id(mesh), _spec_of(psi_G)),
+        # The shard_map below owns the input layout: every operand enters as
+        # ``band_sphere_spec()`` on this explicit mesh.  Key that contract,
+        # not the incidental sharding wrapper returned by each streamed
+        # loader call; recent JAX can represent equal placements with
+        # distinct wrappers/spec spellings and would otherwise grow one
+        # compiled family per tile.
+        (id(mesh), tuple(band_sphere_spec())),
     )
 
     def build():
