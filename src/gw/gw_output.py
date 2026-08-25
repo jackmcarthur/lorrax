@@ -1286,7 +1286,6 @@ def write_results(
     *,
     degeneracy_policy: str,
     degeneracy_tol_ry: float,
-    correlation_basis: str,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
@@ -1353,10 +1352,6 @@ def write_results(
         The already-applied output conditioning (``"bgw_average"`` or
         ``"disabled"``) and its tolerance.  These are receipt provenance,
         not instructions: this function never applies the projection itself.
-    correlation_basis
-        Basis of the supplied C(E_DFT) diagonal: ``"dft_band"`` for one-shot
-        runs and ``"qp_band"`` for the current self-consistent path.  H/X are
-        always in the DFT band basis at this output seam.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1581,19 +1576,30 @@ def write_results(
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
     # their diagonals in place would alter QSGW/SC operator semantics and
     # destroy information for every non-EQP consumer.  The three arrays below
-    # are a different object — the exact DFT-basis, source-resolved,
-    # output-conditioned H/X/C(E_DFT) inputs this function is about to hand
-    # the sole EQP assembler.  Persist that small receipt through
+    # are a different object — the exact source-resolved, output-conditioned
+    # H/X/C(E_DFT) inputs this function is about to hand the sole EQP
+    # assembler.  H/X are DFT-band-basis operands; C's DFT/SC-QP basis is
+    # stamped explicitly.  Persist that small receipt through
     # sigma_output, the file's owner, and let post-hoc assembly consume it
     # without re-running the degeneracy policy or guessing Hartree state from
     # magnitudes.
     if results.sigma_omega_h5_path is not None:
         from file_io import append_eqp_assembly_receipt_h5
+        # H/X are members of sigma_result_dft at every production call to
+        # this gateway.  C remains in the Sigma basis under SC; the results
+        # object's own basis-state flag owns that provenance stamp.
+        correlation_basis = (
+            "qp_band" if results.self_consistent else "dft_band")
         append_eqp_assembly_receipt_h5(
             results.sigma_omega_h5_path,
             hartree_diag_ev=hartree_diag_ev,
             sigma_x_diag_ev=sigma_x_diag_ev,
             sigma_c_at_dft_diag_ev=sigma_c_at_dft_diag_ev,
+            # This receipt is FILE-wedge ordered.  Persist its full-BZ row
+            # identities through the same symmetry-service reduction; the
+            # raw frequency cube may instead be STAR-wedge ordered.
+            file_wedge_full_bz_rows=_wedge(np.arange(
+                np.asarray(sym.unfolded_kpts).shape[0], dtype=np.int64)),
             band_start=results.band_start,
             band_stop=results.band_stop,
             degeneracy_policy=degeneracy_policy,

@@ -1028,9 +1028,6 @@ def main(argv=None):
 			degeneracy_policy=(
 				"disabled" if config.no_degen_averaging else "bgw_average"),
 			degeneracy_tol_ry=float(config.degen_avg_tol_ry),
-			correlation_basis=(
-				"qp_band" if qp_solver is QPSolver.SELF_CONSISTENT
-				else "dft_band"),
 			write_qp_rotations=not rotations_written,
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,
