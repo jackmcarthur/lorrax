@@ -237,6 +237,15 @@ _HEAD_WING_FREQUENCY_BLOCK = 8
 # bounded independent of how many centroids this rank owns locally.  See
 # ``_head_wing_kernel_face``'s docstring for the full residency algebra.
 _HEAD_WING_MU_BLOCK = 64
+# Width three is the incumbent Rydberg velocity.  Width eight has the same
+# energy-denominator contract: for a literal long-wave transition derivative
+# D^(I,a) = d_q_a M^I|_0 it consumes P^(I,a) = -DeltaE * D^(I,a), flattened
+# as (a,I)=(2,4).  It never consumes D itself.  Keeping that distinction at
+# this shared boundary prevents a future producer from adding two spurious
+# inverse powers of DeltaE.  The width-eight contraction is only the
+# first-derivative/first-derivative piece of a generalized CT/TT response;
+# second jets, response-weight derivatives and contact terms are assembled by
+# the producer, not inferred here.
 _HEAD_VERTEX_WIDTHS = (3, 8)
 
 
@@ -1781,10 +1790,14 @@ def head_wings_sharded(
     matching ``Wavefunctions.layout``'s own dataclass default.
 
     Exactly two operator widths are admitted: the incumbent three Cartesian
-    velocity rows and the canonical eight-row packed ``(a,I)`` transition
-    derivative (two in-plane q directions by four Lorentz fields).  Keeping
-    that boundary closed gives the shared kernel exactly two XLA shapes,
-    rather than one compile for every caller-chosen width.
+    velocity rows and the canonical eight-row packed ``(a,I)`` energy-scaled
+    jet ``P^(I,a)=-DeltaE*d_q_a M^I|_0`` (two in-plane q directions by four
+    Lorentz fields).  Literal transition derivatives are not accepted by
+    this denominator convention.  The width-eight result is the associated
+    first-derivative one-leg contribution, not a claim that the complete
+    CT/TT response needs no response-weight, second-jet, or contact terms.
+    Keeping that boundary closed gives the shared kernel exactly two XLA
+    shapes, rather than one compile for every caller-chosen width.
     """
     layout = getattr(wfns, "layout", "legacy")
     if layout == "face":
@@ -2234,9 +2247,15 @@ def head_s_tensor_sharded(
     shardings.  Each rank forms only its local conduction-by-valence tile;
     a two-axis psum reduces the final operator-axis tensor.  The ordinary
     path passes three Cartesian velocities.  A static-gauge producer instead
-    flattens its canonical ``(a,I)=(2,4)`` transition-derivative axes.  No
-    other width is admitted, so this shared kernel has exactly the incumbent
-    width-three and packed width-eight executable shapes.
+    flattens its canonical energy-scaled jet
+    ``P^(I,a)=-DeltaE*d_q_a M^I|_0`` over ``(a,I)=(2,4)``.  Passing the
+    literal transition derivative would be wrong by two powers of the
+    interband energy in this kernel's bilinear.  This width-eight contraction
+    owns only the first-derivative/first-derivative term; the producer must add
+    the independently derived response-weight, second-jet, and contact terms
+    before calling a result complete.  No other width is admitted, so this
+    shared kernel has exactly the incumbent width-three and packed width-eight
+    executable shapes.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
@@ -2291,7 +2310,7 @@ def head_s_tensor_sharded(
         return interband
     if int(v.shape[0]) != 3:
         raise ValueError(
-            "packed transition derivatives do not yet have a derived "
+            "packed energy-scaled transition jets do not yet have a derived "
             "metallic Drude completion; surface_weight_kn is admitted only "
             "for the incumbent three-Cartesian-velocity path")
     drude = head_drude_tensor_sharded(
