@@ -202,7 +202,7 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
         import json
         unique = [tuple(t) for t in json.loads(f.attrs['unique_tiles'])]
         assert set(unique) == set(UNIQUE_TILES)
-        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v1"
+        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v2"
 
 
 def test_bispinor_CC_tile_matches_charge_orchestrator(
@@ -280,7 +280,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
 
 # ===========================================================================
 #  transverse rank-2 Cartesian projector tiles (merged from
-#  test_v_q_bispinor_helpers.py): TT/CC ratio = (delta_ij - Khat_i Khat_j)
+#  test_v_q_bispinor_helpers.py): TT/CC ratio = -(delta_ij - Khat_i Khat_j)
 # ===========================================================================
 
 
@@ -317,20 +317,21 @@ def test_cc_tile_is_bare_v_real():
     assert np.all(np.abs(v) > 0)                   # nonzero at K≠0
 
 
-def test_tt_diagonal_applies_1_minus_khat2():
+def test_tt_diagonal_applies_negative_transverse_projector():
     v_cc = _build(0, 0)
     v_11 = _build(1, 1)                            # i=j=0
     K, K2 = _K_and_K2()
     khat_x2 = K[:, 0] ** 2 / K2
-    np.testing.assert_allclose(v_11, v_cc * (1.0 - khat_x2), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        v_11, -v_cc * (1.0 - khat_x2), rtol=1e-10, atol=1e-12)
 
 
-def test_tt_offdiagonal_applies_minus_khat_ij():
+def test_tt_offdiagonal_applies_negative_transverse_projector():
     v_cc = _build(0, 0)
     v_12 = _build(1, 2)                            # i=0, j=1
     K, K2 = _K_and_K2()
     khat_xy = K[:, 0] * K[:, 1] / K2
-    np.testing.assert_allclose(v_12, v_cc * (-khat_xy), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(v_12, v_cc * khat_xy, rtol=1e-10, atol=1e-12)
 
 
 def test_invalid_tt_indices_raise():
