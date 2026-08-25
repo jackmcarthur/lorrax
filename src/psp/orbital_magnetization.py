@@ -18,7 +18,8 @@ in Bohr).  Per-cell orbital moment, component gamma, in Bohr magnetons:
                                                      / (eps_n - eps_m)^2
 
 with v^a_nm = <u_nk| dH_k/dk_a |u_mk> the velocity matrix element (Ry*Bohr,
-exactly what ``dft_operators.velocity_matrix_k`` returns), w_k the k-point
+assembled from ``dft_operators.apply_kinetic_velocity_to_ket`` and the
+canonical ``vnl_ops.vnl_velocity_matrix`` derivative), w_k the k-point
 weights (sum to 1), and the leading -1/2 the electron-charge gyromagnetic
 prefactor m_e/hbar^2 = 1/(2 Ry a0^2) carrying the orbital moment = -mu_B L/hbar
 sign.  See ``orbital_magnetization_THEORY.md`` for the full derivation,
@@ -598,7 +599,7 @@ def main(argv=None):
                   f"({hf['nsamples']} band/k samples):")
             print(f"         RMS |Re diag(v) - d eps/dk|:  "
                   f"p+vNL = {hf[1]:.4f}   p-vNL = {hf[-1]:.4f}  (Ry*Bohr)")
-            # Physical sign = p+vNL (canonical velocity_matrix_k); verified
+            # Physical sign = p+vNL (canonical vnl_ops derivative); verified
             # compute_vnl_velocity_cart == +dV_NL/dk off-diagonally (ratio 1.000).
             # dV_NL/dk is ~900x larger off-diagonal, so the diagonal HF test ties
             # — it validates kinetic part/units only.  Flip only on a large margin.
