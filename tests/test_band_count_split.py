@@ -593,11 +593,14 @@ def test_the_isdf_window_invariant_refuses_a_window_sized_by_the_smaller():
     pytest.importorskip("jax")
     from gw import gw_init
     s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
+    meta = types.SimpleNamespace(
+        b_id_4_user=28, b_id_4_chi_user=28, b_id_4_sigma_user=20)
     # the right range the resolver actually returns: tops out at the max
-    gw_init.assert_isdf_window_is_the_max(s, (0, 28), None, log=lambda *_: None)
+    gw_init.assert_isdf_window_is_the_max(
+        s, (0, 28), None, meta=meta, log=lambda *_: None)
     with pytest.raises(ValueError, match="0.36 eV"):
         # a window sized by the SMALLER consumer
-        gw_init.assert_isdf_window_is_the_max(s, (0, 20), None,
+        gw_init.assert_isdf_window_is_the_max(s, (0, 20), None, meta=meta,
                                               log=lambda *_: None)
 
 
@@ -606,7 +609,10 @@ def test_the_isdf_sizing_line_names_the_count_that_set_it():
     from gw import gw_init
     lines = []
     s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
-    gw_init.assert_isdf_window_is_the_max(s, (0, 28), None, log=lines.append)
+    meta = types.SimpleNamespace(
+        b_id_4_user=28, b_id_4_chi_user=28, b_id_4_sigma_user=20)
+    gw_init.assert_isdf_window_is_the_max(
+        s, (0, 28), None, meta=meta, log=lines.append)
     text = "\n".join(lines)
     assert "28" in text and "20" in text
     assert "number_bands_chi" in text, "the winner must be named"
@@ -621,11 +627,45 @@ def test_narrowing_the_fit_below_a_band_sum_is_reported_per_consumer():
     from gw import gw_init
     lines = []
     s = _slices(b2=8, b3=20, b4=28, b4_chi=28, b4_sigma=20)
-    gw_init.assert_isdf_window_is_the_max(s, (0, 16), 16, log=lines.append)
+    meta = types.SimpleNamespace(
+        b_id_4_user=28, b_id_4_chi_user=28, b_id_4_sigma_user=20)
+    gw_init.assert_isdf_window_is_the_max(
+        s, (0, 16), 16, meta=meta, log=lines.append)
     text = "\n".join(lines)
     assert text.count("EXTRAPOLATED") == 2, (
         "both consumers top out above 16, so both must be reported")
     assert "number_bands_chi" in text and "number_bands_sigma" in text
+
+
+def test_logical_250_is_not_extrapolation_into_the_exact_zero_256_carrier():
+    """CrI3 P16: physical sums stop at 250; b4=256 is only a carrier."""
+    pytest.importorskip("jax")
+    from gw import gw_init
+    s = _slices(b2=130, b3=190, b4=256,
+                b4_chi=256, b4_sigma=256)
+    meta = types.SimpleNamespace(
+        b_id_4_user=250, b_id_4_chi_user=250,
+        b_id_4_sigma_user=250)
+
+    lines = []
+    gw_init.assert_isdf_window_is_the_max(
+        s, (0, 250), 250, meta=meta, log=lines.append)
+    text = "\n".join(lines)
+    assert "physical window top 250" in text
+    assert "exact-zero inert pad [250, 256)" in text
+    assert "EXTRAPOLATED" not in text
+
+    narrowed = []
+    gw_init.assert_isdf_window_is_the_max(
+        s, (0, 190), 190, meta=meta, log=narrowed.append)
+    narrow_text = "\n".join(narrowed)
+    assert narrow_text.count("EXTRAPOLATED") == 2
+    assert "Bands [190, 250)" in narrow_text
+    assert "Bands [190, 256)" not in narrow_text
+
+    with pytest.raises(ValueError, match="exact-zero mesh carrier pad"):
+        gw_init.assert_isdf_window_is_the_max(
+            s, (0, 252), 252, meta=meta, log=lambda *_: None)
 
 
 # ---------------------------------------------------------------------------
