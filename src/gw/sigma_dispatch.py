@@ -626,8 +626,9 @@ def compute_sigma_xc(
         bit-for-bit the integer ``occ > 0.5`` projector.
     wfns_transverse, bispinor_v_q_path
         Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
-        tile file).  Both-or-neither; Σ^B is folded into ``sig_x`` by
-        the static kernels.  ``None`` for scalar runs.
+        tile file).  Both-or-neither; the static kernels fold Σ^B into
+        ``sig_x`` and, for COHSEX, the physical ``sig_sx`` component that
+        forms ``sigma_xc``.  ``None`` for scalar runs.
     photon_response
         Packed static four-current response.  Used only by
         ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
