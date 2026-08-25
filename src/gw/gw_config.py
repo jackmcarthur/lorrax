@@ -3438,10 +3438,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate the deliberately narrow first full-photon calculation.
 
     The default ``bare_transverse`` returns before resolving any unrelated
-    axis.  The enabled extension is a one-shot insulating full-BZ static
-    COHSEX calculation through the distributed Dyson service.  Its q=0
-    completion is either explicitly off or the coupled slab head/wings path;
-    every wider claim is named and refused before a photon body is allocated.
+    axis.  The enabled extension remains an explicitly experimental one-shot
+    insulating full-BZ static COHSEX calculation through the distributed
+    Dyson service when ``head_correction=off``.  Production ``full`` refuses
+    until the preprocessing/runtime contract can load a versioned
+    ``StaticGaugeHeadResponse`` with a current-equivalent operator, exact
+    same-Hamiltonian contact, and separately sourced Hall term.
     """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
@@ -3453,6 +3455,20 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"{mode.value} requires bispinor = true.  This axis selects "
             "four-current screening; it does not turn four-spinor "
             "wavefunctions on implicitly.")
+    if config.head.correction is HeadCorrection.FULL:
+        raise ValueError(
+            "GATE full_static_bispinor_gauge_head_unavailable: production "
+            "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
+            "  got:  bispinor_gw = full_static_cohsex, "
+            "head_correction = full\n"
+            "  want: a versioned StaticGaugeHeadResponse carrying "
+            "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
+            "contact/operator provenance, and certified Ward/Hermiticity "
+            "residuals\n"
+            "  fix:  complete the gauged VNL/downfolded operator artifact "
+            "and its loader, or set head_correction = off for the explicitly "
+            "experimental no-pair finite-body calculation\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
     requirements = (
         (config.compute_mode is ComputeMode.COHSEX,
          f"compute_mode = {config.compute_mode.value}",
@@ -3460,13 +3476,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
-        (config.head.correction in (HeadCorrection.OFF, HeadCorrection.FULL),
+        (config.head.correction is HeadCorrection.OFF,
          f"head_correction = {config.head.correction.value}",
-         "head_correction in {off, full}"),
-        (config.head.correction is HeadCorrection.OFF or int(config.sys_dim) == 2,
-         (f"head_correction = {config.head.correction.value}, "
-          f"sys_dim = {config.sys_dim}"),
-         "head_correction = off, or head_correction = full with sys_dim = 2"),
+         "head_correction = off"),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
@@ -3529,8 +3541,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"  want: {want}\n"
             "  why:  the first full-photon mode is an explicitly "
             "experimental, full-BZ, one-shot insulating static calculation. "
-            "Its only completed singular-cell policy is the coupled slab "
-            "head/wings path.  Photon restart storage, bulk coupled heads, "
+            "Its singular-cell completion is refused until the versioned "
+            "gauge-response artifact is available.  Photon restart storage, "
+            "bulk coupled heads, "
             "self-consistency, and dynamic photon models are not silently "
             "approximated here.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")

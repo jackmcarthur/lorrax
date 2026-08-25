@@ -1602,10 +1602,10 @@ def compute_no_pair_dirac_current_block(
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
 STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
-STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
+EXPERIMENTAL_STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
     "no_pair_dirac_current_bubble_screened_breit_q0_nested_shell_v3"
 )
-STATIC_PHOTON_HALL_SOURCE = (
+EXPERIMENTAL_STATIC_PHOTON_HALL_SOURCE = (
     "no_external_hall_term; nested_shell_no_pair_bubble_CT_TC_only"
 )
 
@@ -1633,8 +1633,8 @@ class PhotonG0Vectors:
 
 
 @dataclass(frozen=True)
-class StaticPhotonLongWaveCoefficients:
-    r"""Nested-shell coefficients of the static packed photon response.
+class ExperimentalStaticPhotonLongWaveFit:
+    r"""Diagnostic nested-shell fit of the static no-pair photon response.
 
     The coefficient form is the storage contract; finite-q body-sized samples
     are never retained.  For in-plane Cartesian ``q`` (1/bohr),
@@ -1693,7 +1693,7 @@ class StaticPhotonLongWaveCoefficients:
     hall_topological_source: str
     current_contact: str
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
-    approximation: str = STATIC_PHOTON_LONGWAVE_APPROXIMATION
+    approximation: str = EXPERIMENTAL_STATIC_PHOTON_LONGWAVE_APPROXIMATION
 
 
 _photon_longwave_fit_cache: dict = {}
@@ -2354,7 +2354,7 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
     return kernel
 
 
-def fit_static_photon_longwave_coefficients(
+def fit_experimental_static_photon_longwave_coefficients(
     chi_packed,
     g0_vectors: PhotonG0Vectors,
     layout,
@@ -2368,10 +2368,12 @@ def fit_static_photon_longwave_coefficients(
     material_class: str,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     charge_response=None,
-) -> StaticPhotonLongWaveCoefficients:
-    r"""Fit the declared no-pair static slab q->0 photon coefficients.
+    experimental_diagnostic: bool = False,
+) -> ExperimentalStaticPhotonLongWaveFit:
+    r"""Fit diagnostic no-pair static slab q->0 photon coefficients.
 
-    ``chi_packed`` is the raw packed output of :func:`compute_photon_chi0`.
+    ``chi_packed`` is the raw packed output of
+    :func:`compute_experimental_no_pair_photon_chi0`.
     This function forms the Dyson-normalized response
     ``P = _w_solve_pref_scalar(meta) * chi_packed`` exactly once, then
     projects only Gamma and a bounded nested +/-q shell union.  It never reads
@@ -2391,11 +2393,26 @@ def fit_static_photon_longwave_coefficients(
     ``qsgw_head.IterationHeadResponse`` with one literal static row.  Its
     in-plane S/Y/Z replace the fitted charge entries without gathering their
     centroid axes.
+
+    This fitter is intentionally not a production q=0 response constructor.
+    An arbitrary fitted CT/TC coefficient is not a sourced Hall response, and
+    the TT ``Pi(q)-Pi(0)`` subtraction is not an exact contact.  Callers must
+    opt in explicitly so a refactor cannot silently route FULL_SCREENED back
+    through this diagnostic.
     """
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors,
     )
 
+    if not bool(experimental_diagnostic):
+        raise ValueError(
+            "GATE experimental_static_photon_longwave_fit: the nested "
+            "q/q3 and q2/q4 current fit is diagnostic only.\n"
+            "  got:  experimental_diagnostic=false\n"
+            "  want: an explicit diagnostic opt-in\n"
+            "  fix:  production FULL_SCREENED must consume a versioned "
+            "StaticGaugeHeadResponse with a separately sourced Hall term "
+            "and exact same-Hamiltonian contact")
     if not isinstance(layout, PhotonBasisLayout):
         raise TypeError("layout must be PhotonBasisLayout")
     layout.assert_mesh(mesh_xy)
@@ -2567,7 +2584,7 @@ def fit_static_photon_longwave_coefficients(
             "post-subtraction static uniform-A residual is nonzero in the "
             f"projected TT Gamma head: max_abs={uniform_A:.6e}")
 
-    return StaticPhotonLongWaveCoefficients(
+    return ExperimentalStaticPhotonLongWaveFit(
         layout=layout,
         H_direct=H,
         Q_direct=Q,
@@ -2590,7 +2607,7 @@ def fit_static_photon_longwave_coefficients(
         g0_copy_residual=float(g0_copy_error),
         g0_provenance=g0_vectors.provenance,
         charge_response_source=charge_source,
-        hall_topological_source=STATIC_PHOTON_HALL_SOURCE,
+        hall_topological_source=EXPERIMENTAL_STATIC_PHOTON_HALL_SOURCE,
         current_contact=current_contact,
     )
 
@@ -2674,10 +2691,9 @@ class StaticPhotonResponse:
 def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
-    sym=None,
     wfn=None,
     config=None,
-    charge_response=None,
+    gauge_head_response=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
@@ -2685,13 +2701,13 @@ def compute_static_photon_response(
 ) -> StaticPhotonResponse:
     """Build the packed static photon body and optional coupled slab q=0 cell.
 
-    ``head_correction=off`` preserves the finite-body bring-up path.  ``full``
-    fits the bounded nested in-plane shell union, replaces its charge sector from
-    the incumbent symmetry-aware qsgw-head response, solves the headless body,
-    and then applies the bounded bordered-Dyson reconstruction.  The sole
-    vcoul sampler supplies every mini-BZ draw and bare propagator.  No photon
-    body, shell-by-centroid tensor, G-vector transform, or symmetry operation
-    is rebuilt here.
+    ``head_correction=off`` preserves the explicitly experimental finite-body
+    no-pair bring-up path.  ``full`` accepts only a validated
+    :class:`gw.head_correction.StaticGaugeHeadResponse`; it never manufactures
+    a Hall term or promotes the diagnostic nested-shell fit.  The sole vcoul
+    sampler supplies every mini-BZ draw and bare propagator, and the incumbent
+    photon-layout owner packs all body/Gamma vectors.  No photon body,
+    G-vector transform, or symmetry operation is rebuilt here.
     """
     from .gw_config import HeadCorrection
     from .photon_layout import (
@@ -2709,15 +2725,26 @@ def compute_static_photon_response(
             "full static photon response accepts only head_correction=off "
             f"or full; got {head_policy!r}")
     coupled_head = head_policy is HeadCorrection.FULL
-    if coupled_head and (sym is None or wfn is None or config is None):
+    if coupled_head and gauge_head_response is None:
         raise ValueError(
-            "coupled photon head completion requires sym, wfn, and config")
-    if coupled_head and charge_response is None:
+            "GATE static_gauge_head_response_missing: production "
+            "FULL_SCREENED q=0 completion has no gauge-closed response "
+            "artifact.\n"
+            "  got:  gauge_head_response=None\n"
+            "  want: StaticGaugeHeadResponse(S_direct, sigma_H, Y_x, Z_y) "
+            "with current-equivalent operator and exact-contact provenance\n"
+            "  fix:  generate and load the versioned operator artifact; "
+            "head_correction=off retains only the experimental no-pair "
+            "finite-body diagnostic")
+    if coupled_head and (wfn is None or config is None):
         raise ValueError(
-            "coupled photon head completion requires the incumbent static "
-            "qsgw-head charge response; refusing a second charge-head fit")
+            "coupled photon head completion requires wfn and config")
+    head_response = None
+    if coupled_head:
+        from .head_correction import require_static_gauge_head_response
+        head_response = require_static_gauge_head_response(
+            gauge_head_response, mesh_xy)
 
-    g0_vectors = None
     with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
         if int(reader.n_q_total) != int(meta.nk_tot):
             raise ValueError(
@@ -2728,6 +2755,11 @@ def compute_static_photon_response(
         V_packed = pack_photon_operator(
             reader.get_tile, reader.n_q_total, layout, mesh_xy)
         if coupled_head:
+            if head_response.layout != layout:
+                raise ValueError(
+                    "StaticGaugeHeadResponse layout does not match the "
+                    "canonical v_q_bispinor body layout: "
+                    f"response={head_response.layout!r}, body={layout!r}")
             g0_x = tuple(reader.get_g0(A) for A in range(4))
             if any(vector is None for vector in g0_x):
                 raise ValueError(
@@ -2741,11 +2773,6 @@ def compute_static_photon_response(
             g0_y = tuple(jax.device_put(vector, y_sharding)
                          for vector in g0_x)
             jax.block_until_ready(g0_y)
-            g0_vectors = PhotonG0Vectors(
-                x_by_channel=g0_x,
-                y_by_channel=g0_y,
-                provenance=reader.g0_channel_provenance,
-            )
 
     if jax.process_index() == 0:
         print(
@@ -2760,7 +2787,6 @@ def compute_static_photon_response(
         current_contact=current_contact,
         energy_reference=energy_reference)
 
-    coefficients = None
     g0_X = g0_Y = None
     if coupled_head:
         from ffi import _services
@@ -2768,23 +2794,14 @@ def compute_static_photon_response(
         import vcoul
 
         geometry = vcoul.CoulombGeometry.from_wfn(wfn)
-        coefficients = fit_static_photon_longwave_coefficients(
-            chi_packed, g0_vectors, layout, meta, mesh_xy,
-            sym=sym,
-            bvec_cart_bohr=geometry.bvec,
-            sys_dim=int(config.sys_dim),
-            material_class=config.mpa.material_class,
-            current_contact=current_contact,
-            charge_response=charge_response,
-        )
         g0_X = pack_photon_channel_vectors(
-            g0_vectors.x_by_channel, layout, mesh_xy, axis_name="x")[0]
+            g0_x, layout, mesh_xy, axis_name="x")[0]
         g0_Y = pack_photon_channel_vectors(
-            g0_vectors.y_by_channel, layout, mesh_xy, axis_name="y")[0]
+            g0_y, layout, mesh_xy, axis_name="y")[0]
         jax.block_until_ready((g0_X, g0_Y))
         # The packed Gamma rows are now independent device buffers.  Do not
         # retain four per-channel x/y copies across the distributed LU.
-        del g0_vectors, g0_x, g0_y
+        del g0_x, g0_y
 
     W_packed = solve_w(
         V_packed, chi_packed, meta, mesh_xy,
@@ -2819,7 +2836,7 @@ def compute_static_photon_response(
             analytic_sphere=config.head.analytic_q0_sphere,
         )
         V_packed, W_packed, completion = complete_static_slab_photon_q0(
-            V_packed, W_packed, coefficients, g0_X, g0_Y, sample_chunks,
+            V_packed, W_packed, head_response, g0_X, g0_Y, sample_chunks,
             cell_volume=geometry.cell_volume,
             mesh_xy=mesh_xy,
         )
@@ -2840,48 +2857,28 @@ def compute_static_photon_response(
                 raise ValueError(
                     "coupled photon head/body completion produced a "
                     f"non-Hermitian {name}[q=0] row")
-        approximation = coefficients.approximation
+        approximation = "no_pair_dirac_body_static_gauge_head_v1"
         if jax.process_index() == 0:
             print(
                 "  [photon q0] coupled slab head/wings complete: "
-                f"shell_rows={len(coefficients.shell_indices)}, "
-                f"radial_levels={coefficients.radial_shell_count}, "
-                f"nested_fit_residuals=(direct={coefficients.direct_relative_residual:.3e}, "
-                f"Y={coefficients.Y_relative_residual:.3e}, "
-                f"Z={coefficients.Z_relative_residual:.3e}), "
-                f"wing_even_shell_fractions=(Y={coefficients.Y_even_shell_fraction:.3e}, "
-                f"Z={coefficients.Z_even_shell_fraction:.3e}), "
+                f"Ward={completion.ward_residual:.3e}, "
+                f"Hermiticity={completion.hermiticity_residual:.3e}, "
                 f"Dyson={completion.max_dyson_relative_residual:.3e}",
                 flush=True,
             )
             print(
                 "  [photon q0 provenance] "
-                f"approximation={coefficients.approximation}; "
-                f"shell_indices={coefficients.shell_indices}; "
-                f"directions_xy={coefficients.shell_directions_xy}; "
-                f"radii_bohr^-1={coefficients.shell_radii_bohr_inv}; "
-                f"nested_design_ranks=(odd_q_q3="
-                f"{coefficients.odd_extrapolation_rank}/"
-                f"{_ODD_LONGWAVE_DESIGN_RANK},even_q2_q4="
-                f"{coefficients.even_extrapolation_rank}/"
-                f"{_EVEN_LONGWAVE_DESIGN_RANK}); "
-                f"max_nested_fitted_block_residuals=({coefficients.direct_relative_residual:.6e},"
-                f"{coefficients.Y_relative_residual:.6e},"
-                f"{coefficients.Z_relative_residual:.6e}); "
-                f"max_wing_even_shell_fractions=("
-                f"{coefficients.Y_even_shell_fraction:.6e},"
-                f"{coefficients.Z_even_shell_fraction:.6e}); "
-                f"g0={coefficients.g0_provenance}; "
-                f"charge={coefficients.charge_response_source}; "
-                f"hall_topological={coefficients.hall_topological_source}; "
-                f"contact={coefficients.current_contact}; "
-                f"current_model={coefficients.current_model}",
+                f"response={completion.response_provenance}; "
+                f"operator={completion.operator_provenance}; "
+                f"contact={completion.contact_provenance}; "
+                f"hall={completion.hall_provenance}; "
+                f"body_current_model={STATIC_PHOTON_NO_PAIR_MODEL}",
                 flush=True,
             )
         # The response object owns corrected V/W and compact evidence only;
         # retaining Y/Z here would pin two centroid-sized wing carriers through
         # all three Sigma contractions despite having no downstream consumer.
-        del coefficients, g0_X, g0_Y
+        del head_response, g0_X, g0_Y
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=current_contact,
