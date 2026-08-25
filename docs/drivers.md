@@ -89,10 +89,13 @@ Computes velocity matrix elements `<mk|v|nk> = p + i[r, V_NL]` per Cartesian com
 `deltaE = E_b - E_b'` table, for all full-BZ k. Reads the deck (`-i`, default `cohsex.in`) for
 `wfn_file`/`nval`/`ncond`/`nband`/`bispinor`; writes `dipole.h5` (`dipole_cart` (3,nk,nb,nb), `deltaE`),
 consumed by `gw.head_correction` for the q->0 head S(omega) in Sigma_SX/Sigma_COH. Reuse contract: root
-attrs `prov_wfn_sha256` (SHA-256 over the WFN eigenvalue table + k-list — the DFT solution's identity, not
-the file bytes) plus `prov_{nval,ncond,nband,nb_written,wfn_file}`; `check_dipole_provenance` warns/refuses
-when a regenerated WFN left a stale `dipole.h5` of the right shape but wrong contents (an unstamped
-pre-guard file also fails).
+attrs `prov_wfn_sha256` plus its fingerprint scheme, `prov_{nval,ncond,nband,nb_written,wfn_file}` and the
+representation/VNL/q->0-operator scheme. The ordinary payload is a full square over `nb_written`, so a
+literal `ncond` mismatch is accepted only when producer and run resolve to the same exact written extent,
+both physical dataset band axes agree, and no `finite_q/` group is present. `finite_q/` is the exception:
+its conduction axis is literally sized by producer `ncond`. `check_dipole_provenance` refuses an
+unstamped/unknown operator scheme or incompatible WFN, extent, representation, or VNL convention even
+when the file has a plausible shape.
 
 Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`; multi-process capable (k-partitioned
 sweep, rank-0 write); certified 1-proc in `deck_b300.sbatch` step 5 and at P=16 (both datasets EXACT vs P=1,
