@@ -27,7 +27,7 @@ from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
 from common import timing
 from common.units import RYD_TO_EV
-from runtime.padding import round_up
+from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
     fit_galerkin_basis,
