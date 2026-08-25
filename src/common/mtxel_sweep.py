@@ -1135,11 +1135,11 @@ def finite_transfer_current_to_centroids(
     """
     from common.bispinor_init import HALFALPHA
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from common.gvec_fft_box import pad_mask
     from common.kq_mapping import umklapp_G_wrap
     from common.parallel_transport import build_g_wrap_lookup
     from common.wfn_transforms import gflat_to_rmu
     from psp import vnl_ops
+    from psp.dft_operators import padded_gvectors
     from symmetry_maps import bgw_integer_q_to_fractional
 
     start, stop = int(band_start), int(band_stop)
@@ -1187,8 +1187,7 @@ def finite_transfer_current_to_centroids(
             f"{int(geom.ngkmax)}); got {tuple(psi.shape)}")
     psi = pad_axis(psi, geom.p_prod, axis=1).array
 
-    required_loader_api = (
-        "symmetry", "gvecs", "ngk_valid", "kvecs", "box_index_dev")
+    required_loader_api = ("symmetry", "box_index_dev")
     missing_loader_api = tuple(
         name for name in required_loader_api
         if not callable(getattr(wfn, name, None)))
@@ -1207,35 +1206,17 @@ def finite_transfer_current_to_centroids(
             f"WfnLoader.ngkmax exactly; got {int(geom.ngkmax)} vs "
             f"{int(wfn.ngkmax)}")
     sym = wfn.symmetry()
-    gvecs_host = np.ascontiguousarray(np.asarray(
-        wfn.gvecs(k="full_bz"), dtype=np.int32))
-    ngk_valid_host = np.ascontiguousarray(np.asarray(
-        wfn.ngk_valid(k="full_bz"), dtype=np.int32))
-    if (ngk_valid_host.shape != (int(geom.nk),)
-            or np.any(ngk_valid_host < 0)
-            or np.any(ngk_valid_host > int(geom.ngkmax))):
-        raise ValueError(
-            "finite-transfer current WfnLoader.ngk_valid must have shape "
-            f"({int(geom.nk)},) with rows in [0,{int(geom.ngkmax)}]; got "
-            f"shape={ngk_valid_host.shape}, values={ngk_valid_host.tolist()}")
-    gmask_host = np.ascontiguousarray(
-        pad_mask(ngk_valid_host, int(geom.ngkmax)).astype(np.float64))
-    kvecs_host = np.ascontiguousarray(np.asarray(
-        wfn.kvecs(k="full_bz"), dtype=np.float64))
+    gtab = padded_gvectors(wfn, k="full_bz")
+    gvecs_host = np.ascontiguousarray(gtab.gvecs, dtype=np.int32)
+    ngk_valid_host = np.ascontiguousarray(gtab.ngk, dtype=np.int32)
+    gmask_host = np.ascontiguousarray(gtab.mask, dtype=np.float64)
+    kvecs_host = np.ascontiguousarray(gtab.kvecs, dtype=np.float64)
     box_index = wfn.box_index_dev(k="full_bz", mesh=geom.mesh)
     expected_g = (int(geom.nk), int(geom.ngkmax), 3)
     if gvecs_host.shape != expected_g:
         raise ValueError(
-            f"finite-transfer current gvecs must be {expected_g}; got "
-            f"{gvecs_host.shape}")
-    if gmask_host.shape != expected_g[:2]:
-        raise ValueError(
-            "finite-transfer current gmask must match (nk,ngkmax); got "
-            f"{gmask_host.shape}")
-    if kvecs_host.shape != (int(geom.nk), 3):
-        raise ValueError(
-            "finite-transfer current kvecs must match (nk,3); got "
-            f"{kvecs_host.shape}")
+            f"finite-transfer current paired G table must be {expected_g}; "
+            f"got {gvecs_host.shape}")
     r_mu_host = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
     if r_mu_host.ndim != 2 or int(r_mu_host.shape[1]) != 3:
         raise ValueError(
