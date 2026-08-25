@@ -10,7 +10,10 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
-from gw.gflat_memory_model import plan_gflat_chunks
+from gw.gflat_memory_model import (
+    centroid_fft_tile_geometry,
+    plan_gflat_chunks,
+)
 
 
 def _plan(p_x: int, p_y: int):
@@ -67,6 +70,10 @@ def test_stage_a_bounds_local_rows_at_p1_and_p16():
     # CrI3 nk=36 therefore has two complete 16-k tiles and a four-k tail.
     # The physical carrier stays fixed at 16; the loader must own the pad.
     assert divmod(36, p16.centroid_k_chunk) == (2, 4)
+    # Reuse contracts can start from an unrounded deck hint; the same owner
+    # resolves its physical band tile through runtime.padding.round_up.
+    assert centroid_fft_tile_geometry(
+        nk=36, band_chunk=7, p_band=4) == (4, 8)
 
 
 def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
@@ -98,6 +105,7 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         kw.value for kw in charge_calls[0].keywords if kw.arg == "k_chunk_size"
     )
     assert "chunks['centroid_k_chunk']" in ast.unparse(charge_k)
+    assert "zeta_contract.loader_k_chunk" in ast.unparse(charge_k)
 
     transverse = _function(gw_tree, "_transverse_wfn_data")
     transverse_calls = _calls(transverse, "load_centroids_band_chunked")
@@ -107,6 +115,15 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         if kw.arg == "k_chunk_size"
     )
     assert ast.unparse(transverse_k) == "k_chunk_size"
+
+    contract = _function(gw_tree, "_resolve_zeta_fit_contract")
+    geometry_calls = _calls(contract, "centroid_fft_tile_geometry")
+    assert len(geometry_calls) == 1
+    contract_k = next(
+        kw.value for call in _calls(contract, "_ZetaFitContract")
+        for kw in call.keywords if kw.arg == "loader_k_chunk"
+    )
+    assert ast.unparse(contract_k) == "loader_k_chunk"
 
     loader = _function(wfn_tree, "load_centroids_band_chunked")
     pad_inputs = {
@@ -129,4 +146,3 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         if isinstance(target, ast.Name)
     }
     assert assignments["nk_accum"] == "round_up(nk_tot, k_tile)"
-
