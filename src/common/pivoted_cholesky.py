@@ -1,0 +1,456 @@
+"""Pure pivoted-Cholesky row selection and numerical certificates.
+
+This L2 module owns the greedy recurrence shared by centroid construction and
+GW downfolding.  It knows only about a Hermitian PSD matrix, optional integer
+group labels, an optional active-row mask, and a JAX mesh.  ``orbit_id`` is
+retained as the compatibility spelling for arbitrary group labels; the
+kernel assigns no physical interpretation to them.
+
+The reference and row-sharded kernels return
+``(piv, L, rank, d_final, d_taken, trR_over_trG, psd_info)``.  For an
+``(M, M)`` Gram and ``k_keep`` requested rows, their shapes are ``(k_keep,)``,
+``(M, k_keep)``, scalar, ``(M,)``, ``(k_keep,)``, ``(k_keep + 1,)``, and
+three scalars.  The sharded kernel requires the Gram, optional labels, and
+optional mask to be row-sharded across ``mesh_axis``; all outputs except
+``L`` and ``d_final`` are replicated.
+
+Selection semantics are intentionally strict: global ties choose the lowest
+row index, grouped mode deactivates every row with the chosen label, and the
+collective order is two ``pmax`` operations followed by one fused ``psum`` per
+iteration.  The reference implementation is the bit-exact parity oracle for
+the distributed path.
+"""
+
+from __future__ import annotations
+
+import math
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.sharding import Mesh, PartitionSpec
+
+from common.shard_map import shard_map
+
+
+__all__ = [
+    "pivoted_cholesky_select",
+    "make_sharded_pivoted_cholesky_select",
+]
+
+
+def _mesh_axis_size(
+    mesh: Mesh,
+    mesh_axis: str | tuple[str, ...],
+    who: str,
+) -> int:
+    """Validate ``mesh_axis`` and return its total shard count."""
+    axes = (mesh_axis,) if isinstance(mesh_axis, str) else tuple(mesh_axis)
+    if not axes:
+        raise ValueError(f"{who}: mesh_axis must name at least one axis")
+    missing = tuple(axis for axis in axes if axis not in mesh.axis_names)
+    if missing:
+        raise ValueError(
+            f"{who}: mesh axes {missing} are absent from {mesh.axis_names}"
+        )
+    return math.prod(int(mesh.shape[axis]) for axis in axes)
+
+
+@partial(jax.jit, static_argnames=('k_keep', 'tol_rel'))
+def pivoted_cholesky_select(
+    G: jnp.ndarray,
+    k_keep: int,
+    orbit_id: jnp.ndarray | None = None,
+    *,
+    tol_rel: float | None = None,
+):
+    """Greedy pivoted Cholesky on an Hermitian PSD ``G``. STOPS at the
+    numerical-rank floor. Returns ``(piv, L, rank, d_final, d_taken,
+    trR_over_trG, psd_info)``.
+
+    ``rank`` is the number of numerically independent pivots and is a
+    contract: ``L[:, rank:] == 0`` and ``d_taken[rank:] == 0``.  Selection
+    still delivers distinct active rows after the numerical floor is reached;
+    ``piv[j] == -1`` means only that no active row remained at step ``j``.
+
+    ``psd_info`` is ``(d_min_raw, at_row, at_step)`` — the most negative
+    pre-clamp residual diagonal observed, the candidate row that attained
+    it, and the iteration it happened on.  ``d_min_raw < -tol_rel·max(diag
+    G)`` says the input was not positive semidefinite, and the two indices
+    are what lets the refusal NAME the pivot rather than merely assert the
+    condition, which is the ``pstrf`` ``INFO`` contract.
+
+    ``tol_rel`` overrides the stopping tolerance, relative to the largest
+    initial diagonal; ``None`` means ``sqrt(eps)``.
+
+    When ``orbit_id`` is given (shape ``(M,)`` int), each pivot iteration
+    marks every row with the picked row's label inactive.  Thus at most one
+    row per group is returned; asking for more groups than exist produces
+    the ``-1`` exhaustion sentinel.
+    """
+    M = G.shape[0]
+    real_dtype = G.real.dtype
+    eps = jnp.finfo(real_dtype).eps
+    minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+    if orbit_id is None:
+        orbit_id = jnp.arange(M, dtype=jnp.int32)         # each point its own orbit
+
+    diag_raw = jnp.real(jnp.diag(G))
+    # The floor moves ABOVE the loop: it is the stopping rule now, not a
+    # post-hoc label on a number the loop already ruined.
+    tol = jnp.sqrt(eps) if tol_rel is None else jnp.asarray(tol_rel,
+                                                            real_dtype)
+    floor = tol * jnp.max(diag_raw)
+    diag0 = jnp.maximum(diag_raw, 0.0)
+    trG = jnp.sum(diag0)
+
+    # The initial diagonal is itself a PSD statement: a negative entry on
+    # the diagonal of a PSD matrix is impossible, and step -1 names it.
+    at0 = jnp.argmin(diag_raw).astype(jnp.int32)
+    neg0 = diag_raw[at0] < 0.0
+    init = (
+        diag0,                                                       # d
+        jnp.zeros((M, k_keep), dtype=G.dtype),                       # L
+        -jnp.ones((k_keep,), dtype=jnp.int32),                       # piv
+        jnp.ones((M,), dtype=bool),                                  # active
+        jnp.zeros((k_keep,), dtype=real_dtype),                      # d_taken
+        jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),   # trR/trG
+        jnp.minimum(diag_raw[at0], jnp.zeros((), dtype=real_dtype)),  # d_min
+        jnp.where(neg0, at0, jnp.int32(-1)),                         # at_row
+        jnp.where(neg0, jnp.int32(-1), jnp.int32(-1)),               # at_step
+    )
+    col_ids = jnp.arange(k_keep)
+
+    def body(j, carry):
+        (d, L, piv, active, d_taken, trR_over_trG,
+         d_min_raw, d_min_at, d_min_j) = carry
+
+        masked_d = jnp.where(active, d, minus_inf)
+        p = jnp.argmax(masked_d)
+        # THE STOP.  ``pivot_val`` clamps at ``floor`` (not ``eps``), so on a
+        # healthy input this is bit-for-bit the old arithmetic and past the
+        # rank the divisor can no longer manufacture a blow-up.
+        take = masked_d[p] > floor
+        pivot_val = jnp.maximum(masked_d[p], floor)
+        # …AND THE CONTINUATION, which is a different question from the stop.
+        # ``take`` says "this pivot adds an independent DIRECTION"; ``avail``
+        # says "there is still a row to hand back".  Past the numerical
+        # rank the two diverge, and the selection keeps DELIVERING rows
+        # (largest frozen residual first, ties to the lowest index — the same
+        # deterministic rule as above) while ``rank`` below keeps counting
+        # only the certified ones.  Whether a rank-deficient pool is accepted
+        # is a caller policy, not part of this recurrence.
+        # This is only safe because the clamp above already removed the
+        # 2026-08-07 blow-up: with ``take`` false, ``newcol`` is exactly zero,
+        # so ``d`` is unchanged and no divisor can run away.
+        avail = jnp.any(active)
+
+        # L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] · conj(L[p, i])) / sqrt(d[p])
+        prev_mask = (col_ids < j).astype(G.dtype)
+        corr = L @ (jnp.conj(L[p, :]) * prev_mask)
+        denom = jnp.sqrt(pivot_val)
+        newcol = (G[:, p] - corr) / denom
+        # Pivot entry exactly sqrt(d[p]) — kills rounding drift.
+        newcol = newcol.at[p].set(denom.astype(G.dtype))
+        newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+
+        L = L.at[:, j].set(newcol)
+        # ``avail``, not ``take``: a delivered pivot is a real candidate index
+        # even when it certifies no new direction.  ``-1`` now means ONLY
+        # "the pool ran out", which is the structural refusal.
+        piv = piv.at[j].set(jnp.where(avail, p, -1).astype(jnp.int32))
+        d_taken = d_taken.at[j].set(
+            jnp.where(take, pivot_val, 0.0).astype(real_dtype))
+
+        # Schur-complement update; d_new[p] ≈ 0 by the cleanup above.  The
+        # PSD detector reads d_raw BEFORE the clamp, over ACTIVE rows only
+        # (inactive rows carry −inf and would swamp the minimum).
+        d_raw = d - jnp.abs(newcol) ** 2
+        masked_raw = jnp.where(active, d_raw, jnp.inf)
+        step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+        step_min = masked_raw[step_at]
+        # Keep the row and the step alongside the value, so the refusal can
+        # NAME the pivot the way pstrf's INFO does instead of only asserting
+        # that indefiniteness happened somewhere.
+        beats = take & (step_min < d_min_raw)
+        d_min_at = jnp.where(beats, step_at, d_min_at)
+        d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+        d_min_raw = jnp.where(beats, step_min, d_min_raw)
+        # ``d_new`` past the stop is just the frozen residual with the −inf
+        # kill markers clipped away, so the trace ratio holds its last real
+        # value instead of going −inf/NaN.
+        d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
+        trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
+        # Mark p (or its whole label group, if orbit_id was provided) inactive.
+        # ``avail``, not ``take``: without this the loop STALLS past the
+        # numerical rank — it re-picks the same p every remaining iteration
+        # and delivers nothing — which is what made the rank deficiency an
+        # unavoidable refusal rather than a reportable fact.
+        kill_mask = (orbit_id == orbit_id[p]) & avail
+        d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
+        active = active & ~kill_mask
+
+        return (d, L, piv, active, d_taken, trR_over_trG,
+                d_min_raw, d_min_at, d_min_j)
+
+    (d, L, piv, _, d_taken, trR_over_trG,
+     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(0, k_keep, body, init)
+    d_final = jnp.where(jnp.isfinite(d), d, 0.0)
+    # Effective rank = #pivots taken.  With the stopping rule above this is
+    # exactly the loop's trip count: ``d_taken[j] > floor`` for every taken
+    # pivot by construction and 0 for every untaken one, so the count is a
+    # contract rather than the §4.4 assumption that ``d_taken`` happens to
+    # be monotone past the numerical rank (it is not, when it is noise).
+    rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+    return (piv, L, rank, d_final, d_taken, trR_over_trG,
+            (d_min_raw, d_min_at, d_min_j))
+
+
+def make_sharded_pivoted_cholesky_select(
+    mesh: Mesh,
+    M: int,
+    k_keep: int,
+    *,
+    mesh_axis: str | tuple[str, ...] = 'x',
+    tol_rel: float | None = None,
+):
+    """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
+    numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
+    returns the same 7-tuple: ``(piv, L, rank, d_final, d_taken,
+    trR_over_trG, psd_info)`` with shardings (replicated, row-sharded,
+    replicated, row-sharded-1d, replicated, replicated, replicated).
+
+    The stopping predicate is ``global_pv > floor``, and BOTH sides of it
+    are ``pmax`` results — so every shard computes the same bool and the
+    two kernels agree on where to stop at any shard count.  That is the
+    property ``tests/test_centroid_distribution.py`` gates at >1 shard on an
+    emulated mesh; before 2026-08-07 that gate ran both sides at 1×1 and
+    every collective in here was satisfied vacuously."""
+    n_dev = _mesh_axis_size(
+        mesh, mesh_axis, "make_sharded_pivoted_cholesky_select"
+    )
+    if M % n_dev != 0:
+        raise ValueError(f"M={M} must be divisible by product of mesh axes "
+                         f"{mesh_axis} (= {n_dev})")
+    M_slab = M // n_dev
+
+    row_shard = PartitionSpec(mesh_axis, None)
+    row_shard_1d = PartitionSpec(mesh_axis)
+    rep = PartitionSpec()
+
+    # Input layouts: G alone, or with ``orbit_id`` and/or ``active_init``, each
+    # row-sharded the same way as G's row dim. Rows marked False in
+    # ``active_init`` are never eligible for selection.
+    in_specs_no_orbit = (row_shard,)
+    in_specs_orbit    = (row_shard, row_shard_1d)
+    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
+                 (rep, rep, rep))
+
+    @jax.jit
+    def step(G, orbit_id=None, active_init=None):
+        def body_local(G_slab, orbit_id_slab=None, active_slab=None):
+            real_dtype = G_slab.real.dtype
+            eps = jnp.finfo(real_dtype).eps
+            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
+            my_idx = lax.axis_index(mesh_axis)
+
+            # Local diagonal of G: each device owns rows [my_idx*M_slab,
+            # (my_idx+1)*M_slab); the diag entry sits at col == row.
+            col_ids_local = my_idx * M_slab + jnp.arange(M_slab)
+            local_diag_raw = jnp.real(
+                G_slab[jnp.arange(M_slab), col_ids_local])
+            local_diag = jnp.maximum(local_diag_raw, 0.0)
+            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
+            col_ids_k = jnp.arange(k_keep)
+            # The floor moves ABOVE the loop, same as the reference kernel:
+            # it is the stopping rule, and ``pmax`` makes it identical on
+            # every shard so the two kernels stop at the same iteration.
+            d0max_global = lax.pmax(jnp.max(local_diag_raw),
+                                    axis_name=mesh_axis)
+            tol = (jnp.sqrt(eps) if tol_rel is None
+                   else jnp.asarray(tol_rel, real_dtype))
+            floor = tol * d0max_global
+
+            # A negative entry on the INITIAL diagonal is already a PSD
+            # statement; step -1 names it.  Row indices are kept GLOBAL so
+            # the refusal names a candidate, not a slab offset.
+            at0_loc = jnp.argmin(local_diag_raw).astype(jnp.int32)
+            at0_glob = (my_idx * M_slab + at0_loc).astype(jnp.int32)
+            neg0 = local_diag_raw[at0_loc] < 0.0
+
+            # Pad rows enter with d = 0 (their G row/col is exactly zero), so
+            # they contribute nothing to trG, to d0max, or to the Schur update.
+            # Starting them INACTIVE is what makes them unpickable: relying on
+            # the tie-break (pads sit at the highest global indices and the
+            # pivot rule takes the LOWEST index among ties) would work today but
+            # is an accident, not a contract.
+            active0 = (jnp.ones((M_slab,), dtype=bool) if active_slab is None
+                       else active_slab.astype(bool))
+
+            init = (
+                local_diag,                                              # d_slab
+                jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype),         # L_slab
+                -jnp.ones((k_keep,), dtype=jnp.int32),                   # piv
+                active0,                                                 # active
+                jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
+                # trR partials, LOCAL: slot 0 holds this shard's share of
+                # trG so the post-loop psum makes trR_over_trG[0] exactly 1.
+                jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(
+                    jnp.sum(local_diag)),
+                # d_min_raw / at_row / at_step — the pstrf INFO triple.
+                jnp.minimum(local_diag_raw[at0_loc],
+                            jnp.zeros((), dtype=real_dtype)),
+                jnp.where(neg0, at0_glob, jnp.int32(-1)),
+                jnp.int32(-1),
+            )
+
+            def body(j, carry):
+                (d, L, piv, active, d_taken, trR_over_trG,
+                 d_min_raw, d_min_at, d_min_j) = carry
+
+                # Pick global pivot: per-device argmax then pmax + tie-break
+                # to lowest global index.
+                masked_d = jnp.where(active, d, minus_inf)
+                local_p_idx = jnp.argmax(masked_d)
+                local_pv = masked_d[local_p_idx]
+                global_pv = lax.pmax(local_pv, mesh_axis)
+                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
+                winner_p = jnp.where(
+                    local_pv >= global_pv, local_global_p, jnp.int32(2**30),
+                )
+                global_p = -lax.pmax(-winner_p, mesh_axis)
+                # THE STOP.  Both operands are pmax results, so this bool is
+                # identical on every shard — no shard can run an iteration
+                # another one skipped, and no collective goes unmatched.
+                take = global_pv > floor
+                pivot_val = jnp.maximum(global_pv, floor)
+                # THE CONTINUATION — see the reference kernel for the whole
+                # argument.  ``global_pv`` is ``-inf`` exactly when no shard
+                # holds an active candidate, so this bool is a pmax result
+                # too and is identical on every shard.
+                avail = global_pv > minus_inf
+
+                # Column p of G (no collective: G is row-sharded).
+                gcol_slab = G_slab[:, global_p]
+
+                # Row p of L: broadcast from owning shard via masked psum.
+                my_has_p = (global_p // M_slab == my_idx)
+                local_p_rel = global_p - my_idx * M_slab
+                safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
+                local_Lp = jnp.where(
+                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
+                )
+                if orbit_id_slab is None:
+                    L_p = lax.psum(local_Lp, mesh_axis)
+                else:
+                    # ONE psum, not two.  The orbit id of the picked pivot
+                    # rides the SAME masked broadcast as L[p, :] — it is the
+                    # same idiom, from the same owner, at the same point in
+                    # the iteration, and it was a second round trip purely
+                    # because it was written a few lines further down.  Orbit
+                    # ids are small integers and complex128 carries them
+                    # exactly, so packing costs nothing in precision.
+                    _oid_term = jnp.where(
+                        my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
+                    ).astype(G_slab.dtype)
+                    _fused = lax.psum(
+                        jnp.concatenate([local_Lp, _oid_term[None]]),
+                        mesh_axis)
+                    L_p = _fused[:k_keep]
+                    orbit_id_p = jnp.round(
+                        jnp.real(_fused[k_keep])).astype(jnp.int32)
+
+                # New column.
+                prev_mask = (col_ids_k < j).astype(G_slab.dtype)
+                corr = L @ (jnp.conj(L_p) * prev_mask)
+                denom = jnp.sqrt(pivot_val)
+                newcol = (gcol_slab - corr) / denom
+                # Pivot-row entry exactly sqrt(d[p]), only on the owner.
+                fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype), newcol)
+                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+
+                L = L.at[:, j].set(newcol)
+                piv = piv.at[j].set(jnp.where(avail, global_p, jnp.int32(-1)))
+                d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
+
+                # Schur update; the PSD detector reads the residual BEFORE
+                # the clamp, over this shard's ACTIVE rows only.
+                d_raw = d - jnp.abs(newcol) ** 2
+                masked_raw = jnp.where(active, d_raw, jnp.inf)
+                step_at = jnp.argmin(masked_raw).astype(jnp.int32)
+                step_min = masked_raw[step_at]
+                beats = take & (step_min < d_min_raw)
+                d_min_at = jnp.where(
+                    beats, (my_idx * M_slab + step_at).astype(jnp.int32),
+                    d_min_at)
+                d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
+                d_min_raw = jnp.where(beats, step_min, d_min_raw)
+                d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
+                # LOCAL partial only.  The psum that turns these into the
+                # global trace ratio runs ONCE, after the loop, on the whole
+                # (k_keep+1,) vector — it is a pure DIAGNOSTIC and paying a
+                # collective round trip per iteration for a number nobody
+                # reads until the end was the cheapest 25% on the hot path.
+                trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new))
+                if orbit_id_slab is None:
+                    kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                else:
+                    # ``orbit_id_p`` came back on the FUSED psum above.
+                    kill_mask = orbit_id_slab == orbit_id_p
+                kill_mask = kill_mask & avail
+                active = active & ~kill_mask
+                d = jnp.where(kill_mask, minus_inf,
+                              jnp.where(take, d_new, d))
+
+                return (d, L, piv, active, d_taken, trR_over_trG,
+                        d_min_raw, d_min_at, d_min_j)
+
+            (d_final, L_out, piv_out, _, d_taken, trR_over_trG,
+             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
+                0, k_keep, body, init)
+            d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
+            # The one psum the per-iteration diagnostic was costing.
+            trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG
+            rank = jnp.sum(d_taken > floor).astype(jnp.int32)
+            # THREE reductions, ONCE, after the loop — not per iteration:
+            # the global minimum, then the row and step that attained it,
+            # tie-broken to the lowest global row exactly as the pivot rule
+            # is.  Putting these on the hot path would be a third collective
+            # per iteration for a number only the refusal reads.
+            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
+            mine = d_min_raw == g_min
+            far = jnp.int32(2 ** 30)
+            g_at = -lax.pmax(-jnp.where(mine, d_min_at, far),
+                             axis_name=mesh_axis)
+            g_j = -lax.pmax(-jnp.where(mine, d_min_j, far),
+                            axis_name=mesh_axis)
+            return (piv_out, L_out, rank, d_final, d_taken, trR_over_trG,
+                    (g_min, g_at, g_j))
+
+        specs = [row_shard]
+        args = [G]
+        if orbit_id is not None:
+            specs.append(row_shard_1d); args.append(orbit_id)
+        if active_init is not None:
+            specs.append(row_shard_1d); args.append(active_init)
+        has_orbit = orbit_id is not None
+        has_active = active_init is not None
+
+        def _entry(*a):
+            g = a[0]
+            i = 1
+            oid = a[i] if has_orbit else None
+            if has_orbit:
+                i += 1
+            act = a[i] if has_active else None
+            return body_local(g, oid, act)
+
+        return shard_map(
+            _entry, mesh=mesh,
+            in_specs=tuple(specs), out_specs=out_specs,
+            check_vma=False,
+        )(*args)
+
+    return step

@@ -251,7 +251,7 @@ is **uncertified** and the site warns rather than refuses, and says which.
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | — (no truncation) | — | κ ≥ 1e12 refuses | refuse |
 | `bandstructure/htransform.streaming_galerkin_solve` | ψ@centroids Gram-eigh σ | `rtol` (1e-8) | `min(nk·nb, nspinor·n_μ)` | 1e8 | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | `rcond` (caller) | `μ_S` | 1e8 | refuse (κ only — the route reduces over q before host, so it carries no per-q trace and cannot make the weight finding) |
-| `centroid/pivoted_cholesky` select | candidate Gram, PSD | `sqrt(eps)` relative | candidate count | — | see §7 |
+| `common/pivoted_cholesky` select (centroid/downfold callers) | candidate Gram, PSD | `sqrt(eps)` relative | candidate count | — | see §7 |
 | `bse/bse_w_exact` TRIM probes | probe independence | relative (§3) | block size | — | refuse on deficiency, with k/block/norm named |
 | `bse/bse_pseudopoles._orthonormalize` | filtered-vector overlap Gram | `s_cutoff`, floored at an absolute `1e-30` | — | — | **UNWIRED** — see below |
 | `solvers/davidson._whiten_rank_revealing` | CGS2 residual-block Gram | hard-coded `1e-10` | — | — | **UNWIRED** — see below |
@@ -271,7 +271,8 @@ here instead of being quietly rewritten.
 
 ## 7. Where a rank deficiency must NOT refuse
 
-`centroid/pivoted_cholesky`'s select is the counter-example that keeps the
+`common/pivoted_cholesky`'s select, under the centroid policy seam, is the
+counter-example that keeps the
 policy honest.  Its rank gate refuses the shipped Si **960**-point anchor set
 (certified 799) — and that set scores `sigTOT` MAE **0.644 meV**, the best
 BerkeleyGW agreement on record for this deck, while the orbit-mode arm the
