@@ -278,7 +278,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
-from common.wfn_layout import band_sphere_spec
+from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, band_sphere_spec
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis
 
@@ -784,9 +784,10 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     r"""One exact finite-q current endpoint sampled at current centroids.
 
     ``current_nmu`` and ``current_mun`` are the two face orientations of
-    ``Gamma_i(k,q)|Psi_nk>``.  Their shapes are ``(nk,nb,3,4,n_rmu)`` at
-    ``P(None,'x',None,None,'y')`` and ``(nk,3,4,n_rmu,nb)`` at
-    ``P(None,None,None,'x','y')``.  They are deliberately not a
+    ``Gamma_i(k,q)|Psi_nk>``.  Their shapes are ``(nk,nb,3,4,n_rmu)`` and
+    ``(nk,3,4,n_rmu,nb)``; after flattening the replicated ``(cart,spin)``
+    pair, they use the canonical :data:`common.wfn_layout.PSI_NMU_SPEC` and
+    :data:`common.wfn_layout.PSI_MUN_SPEC`.  They are deliberately not a
     :class:`gw.wavefunction_bundle.Wavefunctions`: the endpoint depends
     jointly on ``(k,q)`` and pretending it were a q-independent wavefunction
     face would let the incumbent k-FFT silently apply the wrong operator at
@@ -1403,20 +1404,18 @@ def finite_transfer_current_to_centroids(
             f"{int(rmu_pad.logical)} != {n_rmu_logical}")
     current_rmu_flat = rmu_pad.array
     n_rmu_padded = int(rmu_pad.padded)
-    current_rmu = current_rmu_flat.reshape(
-        nk, nb, 3, ns, n_rmu_padded)
-    current_nmu_sharding = NamedSharding(
-        geom.mesh, P(None, 'x', None, None, 'y'))
-    current_mun_sharding = NamedSharding(
-        geom.mesh, P(None, None, None, 'x', 'y'))
+    current_nmu_sharding = NamedSharding(geom.mesh, PSI_NMU_SPEC)
+    current_mun_sharding = NamedSharding(geom.mesh, PSI_MUN_SPEC)
     to_faces = _cached_jit(
         'finite_transfer_current_to_faces',
-        (tuple(int(v) for v in current_rmu.shape), id(geom.mesh)),
+        (tuple(int(v) for v in current_rmu_flat.shape), id(geom.mesh)),
         lambda: jax.jit(
-            lambda value: (value, value.transpose(0, 2, 3, 4, 1)),
+            lambda value: (value, value.transpose(0, 2, 3, 1)),
             out_shardings=(current_nmu_sharding, current_mun_sharding)))
-    current_nmu, current_mun = to_faces(current_rmu)
-    del current_rmu, current_rmu_flat
+    current_nmu, current_mun = to_faces(current_rmu_flat)
+    current_nmu = current_nmu.reshape(nk, nb, 3, ns, n_rmu_padded)
+    current_mun = current_mun.reshape(nk, 3, ns, n_rmu_padded, nb)
+    del current_rmu_flat
 
     fingerprint = _gauge_hamiltonian_operator_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
