@@ -85,6 +85,7 @@ import jax.numpy as jnp
 import numpy as np
 
 __all__ = [
+    "COULOMB_GAUGE_TT_SIGN",
     "wrap_points_to_voronoi",
     "minibz_frac_to_cart",
     "minibz_cell_affine",
@@ -98,6 +99,14 @@ __all__ = [
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
 ]
+
+
+#: Lorentz-metric sign of the spatial Coulomb-gauge photon block in the
+#: stored ``(C, Tx, Ty, Tz)`` current basis.  The geometric transverse
+#: projector remains ``P_T = I - Khat Khat``; physical bare interactions use
+#: ``D_TT = COULOMB_GAUGE_TT_SIGN * v * P_T``.  This is the single sign owner
+#: shared by the G-flat TT builder and streamed mini-BZ photon samples.
+COULOMB_GAUGE_TT_SIGN = -1.0
 
 
 def minibz_frac_to_cart(U, bvec):
@@ -450,7 +459,7 @@ def iter_minibz_photon_samples(
     The fixed basis is ``(C, Tx, Ty, Tz)`` and, for every valid Cartesian
     mini-BZ sample ``q``, the returned real ``D_raw`` obeys
 
-    ``D_CC = v(q)``, ``D_TT = v(q) (I - qhat qhat)``,
+    ``D_CC = v(q)``, ``D_TT = -v(q) (I - qhat qhat)``,
     ``D_CT = D_TC = 0``.
 
     ``v`` is the existing bulk/slab mini-BZ bare kernel in **bare units**:
@@ -537,7 +546,9 @@ def iter_minibz_photon_samples(
         analytic = _analytic_sphere_bare_head(
             q0sph2, geometry.cell_volume, int(np.prod(kg)))
         analytic_D[0, 0] = analytic
-        analytic_D[1:, 1:] = np.eye(3) * ((2.0 / 3.0) * analytic)
+        analytic_D[1:, 1:] = (
+            COULOMB_GAUGE_TT_SIGN * np.eye(3)
+            * ((2.0 / 3.0) * analytic))
     zero_analytic_D = np.zeros_like(analytic_D)
 
     def _chunks():
@@ -564,7 +575,9 @@ def iter_minibz_photon_samples(
                 mc_weight = np.zeros(int(chunk_size), dtype=np.float64)
                 q_chunk[:valid_count] = q_valid
                 D_chunk[:valid_count, 0, 0] = v
-                D_chunk[:valid_count, 1:, 1:] = v[:, None, None] * transverse
+                D_chunk[:valid_count, 1:, 1:] = (
+                    COULOMB_GAUGE_TT_SIGN
+                    * v[:, None, None] * transverse)
                 if analytic_sphere and not is_2d:
                     mc_weight[:valid_count] = (q2 > q0sph2)
                 else:

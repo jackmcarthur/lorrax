@@ -11,10 +11,10 @@ are CURRENT densities ψ† α^i ψ (not spin densities — α^i couples the
 large and small bispinor components).  We work in Coulomb gauge, where
 the photon propagator couples the four channels by
 
-    V^{μ_L,ν_L}_q(μ,ν) = Σ_K  ζ̄_{μ_L,μ}(K) · t^{μ_L,ν_L}(K) · v(K) · ζ_{ν_L,ν}(K)
-    t^{0,0}      = 1
-    t^{i,j}      = δ_ij − K̂_i K̂_j        (transverse projector)
-    t^{0,i}=t^{i,0} = 0                    (Coulomb-gauge cross term)
+    V^{μ_L,ν_L}_q(μ,ν) = Σ_K  ζ̄_{μ_L,μ}(K) · d^{μ_L,ν_L}(K) · v(K) · ζ_{ν_L,ν}(K)
+    d^{0,0}      = 1
+    d^{i,j}      = −(δ_ij − K̂_i K̂_j)       (spatial metric × projector)
+    d^{0,i}=d^{i,0} = 0                    (Coulomb-gauge cross term)
 
 so out of the 16 (μ_L, ν_L) blocks:
     6 zero by gauge — never computed.
@@ -77,7 +77,7 @@ HERMITIAN_PAIRS: dict[tuple[int, int], tuple[int, int]] = {
     (3, 2): (2, 3),
 }
 
-V_QMUNU_FORMAT = "bispinor_lorentz_v1"
+V_QMUNU_FORMAT = "bispinor_lorentz_v2"
 G0_CHANNEL_PROVENANCE_ATTR = "g0_channel_provenance"
 G0_DIAGONAL_FULL_BZ_V1 = "diagonal_one_leg_full_bz_v1"
 G0_TRANSVERSE_IBZ_UNAVAILABLE_V1 = (
@@ -104,14 +104,17 @@ def tile_dataset_name(mu_L: int, nu_L: int) -> str:
 def _tt_head_tensor(
     *, bvec: np.ndarray, cell_volume: float, sys_dim: int, kgrid,
 ) -> np.ndarray:
-    """``T_ab = ⟨v(q) t_ab(q̂)⟩_mBZ`` at q=Γ, BARE units (no ``1/celvol``).
+    """``T_ab = ⟨v(q) P^T_ab(q̂)⟩_mBZ`` at q=Γ, BARE units.
 
     The missing q=Γ, G=0 slot of the bare TT tiles — see
     ``_make_per_q_v_builder_for_tile``'s ``tt_head_correction`` docstring
     and ``docs/BISPINOR_DHFB_DESIGN.md`` §11.  One (3,3) tensor call per
     run (not per tile, not per q); callers slice ``T[i, j]``.  Routed
     through the same ``vcoul`` mini-BZ sampler ``q0_average`` uses for the
-    charge head's ``vc0`` — no second sampler.
+    charge head's ``vc0`` — no second sampler.  This helper owns the
+    positive geometric projector average; the returned TT propagator applies
+    the Coulomb-gauge spatial-metric minus once, after the optional head-slot
+    replacement, in ``_make_per_q_v_builder_for_tile``.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -145,8 +148,8 @@ def _make_per_q_v_builder_for_tile(
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
     CC tile (μ_L=ν_L=0): bare Coulomb ``v(q+G)`` (real, ≥0).
-    TT diagonal (i=j): ``v(q+G) · (1 − K̂_i²)``.
-    TT off-diagonal (i≠j): ``v(q+G) · (−K̂_i K̂_j)``.
+    TT diagonal (i=j): ``−v(q+G) · (1 − K̂_i²)``.
+    TT off-diagonal (i≠j): ``+v(q+G) · K̂_i K̂_j``.
 
     The ``K̂`` factor uses ``K2_safe = max(|q+G|², eps_K2)`` to keep
     the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
@@ -161,7 +164,7 @@ def _make_per_q_v_builder_for_tile(
     so replacing the zeroed CC slot needs only the scalar cell average
     ``⟨v⟩``.  The CURRENT structure factor ``⟨m|α^i|n⟩`` has no such
     limit — it is finite and generically non-diagonal — and the bare
-    transverse propagator's own projector ``t_ij(K̂) = δ_ij − K̂_iK̂_j`` is
+    transverse propagator's projector ``P^T_ij(K̂) = δ_ij − K̂_iK̂_j`` is
     direction-dependent with NO limit as K→0 either.  A single grid point
     (the zeroed q=Γ, G=0 slot) cannot represent either fact, and the
     measured correction is not negligible: on the bi4 (MoS2 4×4) deck the
@@ -172,8 +175,9 @@ def _make_per_q_v_builder_for_tile(
     (``KNOWN_LORRAX_ISSUES.md``, bispinor row; claim 41, job 7885325).
 
     When on, the q=Γ, G=0 slot of a TT tile is replaced by the mini-BZ
-    Voronoi cell average ``⟨v(q) t_ij(q̂)⟩_mBZ`` (:func:`_tt_head_tensor`)
-    instead of being left at zero.  This is the SAME mechanism the CC
+    Voronoi cell average ``−⟨v(q) P^T_ij(q̂)⟩_mBZ``
+    (:func:`_tt_head_tensor`) instead of being left at zero.  This is the
+    SAME mechanism the CC
     charge exchange head uses conceptually — a mini-BZ-averaged
     replacement for an otherwise-undefined q→0 grid point — expressed at
     the SAME site the value already flows through: the returned
@@ -194,6 +198,10 @@ def _make_per_q_v_builder_for_tile(
                 f"_make_per_q_v_builder_for_tile: TT tile indices must "
                 f"satisfy 1 ≤ μ_L, ν_L ≤ 3; got ({mu_L}, {nu_L}).")
         i, j = mu_L - 1, nu_L - 1
+        from ffi import _services
+        _services.ensure_on_path()
+        from vcoul import COULOMB_GAUGE_TT_SIGN
+        tt_metric_sign = float(COULOMB_GAUGE_TT_SIGN)
     bvec_f = np.asarray(bvec, dtype=np.float64)
 
     _tt_correction_value = None
@@ -230,10 +238,15 @@ def _make_per_q_v_builder_for_tile(
         K2_safe = np.where(is_gamma_slot, 1.0, K2)
         Khat_ij = K_cart[:, i] * K_cart[:, j] / K2_safe
         t = (1.0 - Khat_ij) if i == j else -Khat_ij
+        # Assemble the positive transverse-projector weight first so the
+        # finite-q body and optional mini-BZ replacement share one, and only
+        # one, Coulomb-gauge spatial-metric sign below.  Stored currents use
+        # j^i = Psi† alpha^i Psi; no vertex or Sigma contraction compensates
+        # this propagator sign.
         v_t = (v * t).astype(np.complex128)
         if _tt_correction_value is not None:
             v_t = np.where(is_gamma_slot, _tt_correction_value, v_t)
-        return v_t
+        return tt_metric_sign * v_t
 
     return builder
 

@@ -121,7 +121,7 @@ def test_tt_head_correction_off_leaves_gamma_slot_zero():
 
 def test_tt_head_correction_on_injects_only_at_gamma_g0():
     """tt_head_correction=True: the q=Γ, G=0 slot equals
-    ``_tt_head_tensor(...)[i, j] / cell_volume`` and nothing else moves."""
+    ``-_tt_head_tensor(...)[i, j] / cell_volume`` and nothing else moves."""
     from gw.v_q_bispinor import (
         _make_per_q_v_builder_for_tile, _tt_head_tensor)
 
@@ -142,7 +142,7 @@ def test_tt_head_correction_on_injects_only_at_gamma_g0():
             kgrid=_KGRID, tt_head_correction=True)
         out_off = np.asarray(b_off(q_irr_frac, gvec_components))
         out_on = np.asarray(b_on(q_irr_frac, gvec_components))
-        expected = complex(T[i, j] / _CELL_VOLUME)
+        expected = -complex(T[i, j] / _CELL_VOLUME)
         np.testing.assert_allclose(out_on[0, 1], expected, rtol=1e-12)
         # Every OTHER (q, G) slot is untouched by the correction.
         untouched = np.array([0, 2])
