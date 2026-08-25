@@ -203,9 +203,10 @@ class SlabIO:
         3. ``H5Fclose``, collectively;
         4. release the :mod:`file_io.hdf5_owner` claim — then RANK 0
            reopens the file with serial h5py to write the deferred
-           :meth:`write_attr` datasets and :meth:`stamp_dataset_attrs`
-           attributes, flushes, and every rank meets an unconditional
-           barrier after it.  That reopen is the other HDF5 library
+           :meth:`write_attr` datasets, :meth:`stamp_dataset_attrs`
+           attributes, and :meth:`stamp_file_attrs` root attributes,
+           flushes, and every rank meets an unconditional barrier after
+           it.  That reopen is the other HDF5 library
            instance touching this path, and it is legal only because
            step 3 already let go.
 
@@ -320,6 +321,31 @@ class SlabIO:
                         cnt=len(attrs), mode=self.mode,
                         handle=self._handle())
         self._backend._deferred_ds_attrs.append((str(name), dict(attrs)))
+
+    def stamp_file_attrs(self, attrs: dict) -> None:
+        """Stamp H5 attributes onto the file root when this handle closes.
+
+        Like dataset attributes, root metadata cannot be written while the
+        collective MPI-IO handle is live.  It therefore rides the same one
+        rank-0 h5py reopen after ``H5Fclose`` and is visible once ``close``
+        returns.  File-root keys are single-assignment per handle.  This
+        method only queues them; the backend's one close-phase validator
+        normalizes keys and refuses duplicates before rank 0 may reopen the
+        file.  Deferring the verdict is load-bearing: a rank-local exception
+        here would let that rank skip ``H5Fclose`` while its peers entered it.
+
+        RANK SEMANTICS match :meth:`write_attr`: rank 0's values are
+        authoritative and other ranks' queues are ignored.  The close barrier
+        is unconditional, not gated on any rank's queue, so correctness and
+        liveness do not assume identical enqueue lists.  Production SPMD
+        callers nevertheless pass rank-constant metadata by construction.
+        """
+        if self.mode == "r":
+            raise ValueError("SlabIO.stamp_file_attrs requires a writable handle.")
+        _journal.record("attr_w", self.path, stack=_STACK, ds="/",
+                        cnt=len(attrs), mode=self.mode,
+                        handle=self._handle())
+        self._backend._deferred_file_attrs.extend(attrs.items())
 
     def sync_writes(self) -> None:
         """Wait for queued writes without closing the collective handle.

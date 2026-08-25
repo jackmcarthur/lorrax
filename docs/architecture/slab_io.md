@@ -82,7 +82,7 @@ contract — every row is something a caller has actually got wrong.
 | it can hold an h5py handle and a `SlabIO` handle on the same file at once | **REFUSED by name.** Two HDF5 library instances are mapped in this process; either side being a writer is undefined. See [One HDF5 library per file](#one-owner) |
 | a scalar (rank-0) dataset can be read with `read_slab` | it cannot, structurally: a scalar dataspace has **no hyperslab**, and the request refuses at `_normalize_slab_request` before HDF5 sees it. `read_small` is the door — see [The API](#api) |
 | program order at the Python call site serializes two HDF5 calls | the FFI writer is **asynchronous**. Two handles on the same ranks need `SlabIO.sync_writes()` between them, or the second enters HDF5 while the first is still draining |
-| a `create_dataset(attrs=…)` or `stamp_dataset_attrs` stamp is readable before `close()` | attrs are **deferred** to one rank-0 h5py reopen after `H5Fclose` — the transport cannot stamp while collective MPI-IO holds the file |
+| a `create_dataset(attrs=…)`, `stamp_dataset_attrs`, or `stamp_file_attrs` stamp is readable before `close()` | attrs are **deferred** to one rank-0 h5py reopen after `H5Fclose` — the transport cannot stamp while collective MPI-IO holds the file |
 | `close()` is a local operation | it drains pending writes on every rank, then rank 0 reopens the file serially. `close()` is where three of this page's failure modes surface |
 | the caller may close, free, or reuse the underlying `PhdfCtx` | it does not own it. `SlabIO` opens it in `__init__` and closes it in `close()`; there is no other lifetime |
 | a `SlabIO` object is re-openable, thread-safe, or fork-safe | it is a single collective handle over one mesh. Use `with`, one handle at a time, and re-construct rather than reopen |
@@ -91,10 +91,19 @@ contract — every row is something a caller has actually got wrong.
 **Collectivity, stated once.** `create_dataset`, `write_slab`, `read_slab`,
 `read_slabs`, `sync_writes` and `close` are **collective over the mesh
 passed to the constructor** and must be called by every rank in the same
-order with the same dataset name. `write_attr` and `stamp_dataset_attrs`
-are the two exceptions: they queue rank-replicated metadata that only rank
-0 writes, at close. There is no per-rank subset call in this API, and a
-rank that skips one call deadlocks the rest with no traceback
+order with the same dataset name. `write_attr`, `stamp_dataset_attrs`, and
+`stamp_file_attrs` are the exceptions: they only enqueue metadata; rank 0's
+queue is authoritative at close, and the close barrier is unconditional, so
+liveness does not depend on identical per-rank queues. `stamp_file_attrs`
+normalizes every key to its HDF5 string spelling on every calling rank and
+makes that spelling single-assignment per handle. A duplicate is recorded
+locally, agreed across ranks at close, and raised everywhere only after the
+collective teardown; rank 0 never enters the metadata reopen in that state.
+Likewise, an exception inside rank 0's serial-h5py reopen is carried through
+the repository process-allgather wrapper, lists are cleared and the close
+barrier completes in lockstep, then every rank raises the same verdict.
+There is no per-rank subset call for a collective operation in this API, and
+a rank that skips one deadlocks the rest with no traceback
 (`ffi_layout.md` §7d).
 
 ---
@@ -337,6 +346,7 @@ not at an HDF5 bug.
 from file_io.slab_io import SlabIO
 
 with SlabIO(path, mode="w", mesh=mesh) as io:
+    io.stamp_file_attrs({"format_version": 2})       # root metadata at close
     io.create_dataset("V_qmunu", shape=(n_q, n_mu, n_mu), dtype=c128)
     io.write_slab("V_qmunu", V)                    # V may be padded
     W = io.read_slab("V_qmunu", partition_spec=P(None, "x", "y"))
@@ -359,6 +369,12 @@ logical shapes**. A caller does *not*:
 **Padding is SlabIO's business, not the caller's** (decisions.md
 2026-08-04):
 
+- `stamp_file_attrs(attrs)` queues small file-root metadata for the same
+  rank-0 reopen that lands deferred datasets and dataset attributes. Rank
+  0's values are authoritative; the close barrier is unconditional, so
+  per-rank queue identity is not a liveness assumption. A normalized root
+  key is single-assignment per handle: duplicate enqueues refuse before the
+  reopen, through an all-rank close verdict rather than a rank-local raise.
 - `write_slab(name, A, offset=...)` accepts any `A`. What reaches the file
   is `min(A.shape, dataset - offset)` per dim, derived from the dataset —
   a buffer padded for mesh divisibility needs no argument at all.

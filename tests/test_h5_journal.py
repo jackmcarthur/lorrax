@@ -96,12 +96,21 @@ class FakeBackend:
                                    where="test: FakeBackend")
         self.fh = 0x7F1234000000            # a plausible ctx pointer
         self._deferred_ds_attrs = []
+        self._deferred_file_attrs = []
         self.calls = []
 
     def close(self):
+        from file_io._slab_io_ffi import _validate_file_attrs
+        error = None
+        try:
+            _validate_file_attrs(self._deferred_file_attrs)
+        except BaseException as exc:  # mirror the real deferred close verdict
+            error = exc
         self.calls.append("close")
         self.fh = 0
         HO.note_close(self.path, self._token)
+        if error is not None:
+            raise error
 
     def create_dataset(self, name, *, shape, dtype, chunks=None, attrs=None):
         self.calls.append(("create", name, tuple(shape)))
@@ -191,6 +200,30 @@ def test_one_cycle_through_both_stacks_lands_in_one_journal(monkeypatch,
     assert next(r for r in ffi if r["op"] == "read")["cnt"] == "(2,2)"
     assert float(rows[0]["t"]) <= float(rows[-1]["t"])
     assert {int(r["rank"]) for r in rows} == {int(rows[0]["rank"])}
+
+
+def test_file_root_attrs_enqueue_once_and_refuse_duplicate(monkeypatch,
+                                                            tmp_path):
+    """Root metadata is rank-0-authoritative and single-assignment."""
+    io = slabio(monkeypatch, str(tmp_path / "root.h5"))
+    io.stamp_file_attrs({"schema": 2, "state": "raw"})
+    assert io._backend._deferred_file_attrs == [
+        ("schema", 2), ("state", "raw")]
+    io.stamp_file_attrs({"schema": 3})
+    assert io._backend._deferred_file_attrs == [
+        ("schema", 2), ("state", "raw"), ("schema", 3)]
+    with pytest.raises(ValueError, match="duplicate file-root attribute.*schema"):
+        io.close()
+
+
+def test_file_root_keys_normalize_before_duplicate_detection(monkeypatch,
+                                                               tmp_path):
+    io = slabio(monkeypatch, str(tmp_path / "root_normalized.h5"))
+    io.stamp_file_attrs({1: "integer spelling", "1": "string spelling"})
+    assert io._backend._deferred_file_attrs == [
+        (1, "integer spelling"), ("1", "string spelling")]
+    with pytest.raises(ValueError, match="duplicate file-root attribute.*'1'"):
+        io.close()
 
 
 def test_the_line_format_is_frozen(monkeypatch, tmp_path):

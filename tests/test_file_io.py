@@ -1360,6 +1360,26 @@ def test_an_attr_for_a_missing_dataset_refuses(tmp_path):
             _apply_dataset_attrs(f, [("B", {"k_storage": "ibz"})])
 
 
+def test_file_root_attrs_use_same_host_metadata_contract(tmp_path):
+    from file_io._slab_io_ffi import _apply_file_attrs, _validate_file_attrs
+
+    path = tmp_path / "root_attrs.h5"
+    with h5py.File(path, "w") as f:
+        _apply_file_attrs(f, _validate_file_attrs([
+            ("format_version", 2),
+            ("semantic_state", "raw_pre_output_conditioning"),
+        ]))
+    with h5py.File(path, "r") as f:
+        assert int(f.attrs["format_version"]) == 2
+        assert f.attrs["semantic_state"] == "raw_pre_output_conditioning"
+
+    with h5py.File(path, "a") as f:
+        with pytest.raises(ValueError, match="duplicate file-root attribute"):
+            _validate_file_attrs([(1, "raw"), ("1", "ready")])
+        assert "state" not in f.attrs
+        assert "1" not in f.attrs
+
+
 def test_slabio_create_dataset_attrs_reach_the_file(
         tmp_path, single_device_mesh):
     """THE RED TWIN, on the transport that had the defect.
@@ -1373,12 +1393,14 @@ def test_slabio_create_dataset_attrs_reach_the_file(
     stamp = _k_irr_stamp()
     path = tmp_path / "attrs.h5"
     with SlabIO(str(path), mode="w", mesh=single_device_mesh) as io:
+        io.stamp_file_attrs({"format_version": 2})
         io.create_dataset("A", shape=(3, 3), dtype=np.float64, attrs=stamp)
         io.write_slab("A", np.ones((3, 3), dtype=np.float64))
 
     with h5py.File(str(path), "r") as f:
         got = _attr_signature(f["A"])
         np.testing.assert_array_equal(np.asarray(f["A"]), np.ones((3, 3)))
+        assert int(f.attrs["format_version"]) == 2
     missing = sorted(set(stamp) - set(got))
     assert not missing, (
         f"{missing} were handed to create_dataset(attrs=) and are not in "

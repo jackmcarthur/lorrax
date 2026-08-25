@@ -39,7 +39,11 @@ import numpy as np
 from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import barrier as _barrier, device_put_process_local
+from common.collectives import (
+    all_gather_processes as _all_gather_processes,
+    barrier as _barrier,
+    device_put_process_local,
+)
 
 from . import h5_journal as _journal
 
@@ -1656,6 +1660,58 @@ def _apply_dataset_attrs(h5, pending) -> None:
             ds.attrs[key] = _host_attr_value(value)
 
 
+def _validate_file_attrs(pending):
+    """Normalize and validate one complete deferred root-attribute queue.
+
+    This is the sole duplicate validator.  It runs on every rank during close,
+    before rank 0 may reopen the file, so keys that collide only after string
+    normalization refuse without making provenance depend on enqueue order.
+    """
+    pending = [(str(key), value) for key, value in pending]
+    keys = [key for key, _ in pending]
+    duplicate = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicate:
+        raise ValueError(
+            f"SlabIO: duplicate file-root attribute(s) {duplicate}; refusing "
+            "order-dependent provenance metadata before writing any.")
+    return pending
+
+
+def _apply_file_attrs(h5, pending) -> None:
+    """Stamp a prevalidated root-attribute queue onto a writable HDF5 file."""
+    for key, value in pending:
+        h5.attrs[key] = _host_attr_value(value)
+
+
+_CLOSE_ERROR_PAYLOAD_BYTES = 4096
+
+
+def _agree_close_error(error: BaseException | None, *, context: str):
+    """Return one identical all-rank error after a close-phase failure.
+
+    The rank-0 serial-h5py reopen is deliberately not collective, but raising
+    from it is: a direct rank-0 raise skips the following barrier and strands
+    every peer.  Encode the small status/message into a fixed-shape uint8
+    payload and use the repository's process-allgather owner so every rank
+    learns the same verdict before any rank is allowed to raise.
+    """
+    payload = np.zeros((_CLOSE_ERROR_PAYLOAD_BYTES,), dtype=np.uint8)
+    if error is not None:
+        message = f"{type(error).__name__}: {error}".encode(
+            "utf-8", errors="replace")
+        message = message[: _CLOSE_ERROR_PAYLOAD_BYTES - 1]
+        payload[0] = 1
+        payload[1 : 1 + len(message)] = np.frombuffer(message, dtype=np.uint8)
+    gathered = np.asarray(_all_gather_processes(payload, tiled=False))
+    for rank, row in enumerate(gathered):
+        if int(row[0]) == 0:
+            continue
+        body = bytes(np.asarray(row[1:], dtype=np.uint8).tolist())
+        body = body.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        return RuntimeError(f"{context} failed on rank {rank}: {body}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -1771,6 +1827,10 @@ class _FfiBackend(_DatasetGeometry):
         # write is metadata on a file MPI-IO still holds open.  See
         # :func:`_apply_dataset_attrs`.
         self._deferred_ds_attrs: list[tuple[str, dict]] = []
+        # File-root attributes need the same rank-0 post-H5Fclose metadata
+        # seam as dataset attributes; format-level promises must be durable
+        # with the initial file close, not added through a second transport.
+        self._deferred_file_attrs: list[tuple[str, object]] = []
         # Python-level async writer.  ``write_slab`` enqueues a callable
         # here; the ``AsyncDispatcher`` worker pops it and calls
         # ``jax.jit(shard_map(_per_rank))(A).block_until_ready()``.
@@ -2482,6 +2542,7 @@ class _FfiBackend(_DatasetGeometry):
                   f"raised {type(_worker_error).__name__}: {_worker_error} — "
                   f"completing the collective teardown before re-raising.",
                   flush=True)
+        _h5close_error: BaseException | None = None
         if self.fh:
             if _verbose:
                 print(f"  [SlabIO.close] writer thread joined in "
@@ -2492,10 +2553,16 @@ class _FfiBackend(_DatasetGeometry):
             # SIGSEGV that lands in the writer-thread join inside this
             # very call.  A journal whose last line is this one names the
             # ctx handle that died (SLAB_IO_ROOT_CAUSE_AUDIT.md §A/S1).
-            with _journal.op_scope("close", self.path, stack=_J_FFI,
-                                   mode=self.mode, handle=self.fh):
-                self._close_file(self.fh)
-            self.fh = 0
+            try:
+                with _journal.op_scope("close", self.path, stack=_J_FFI,
+                                       mode=self.mode, handle=self.fh):
+                    self._close_file(self.fh)
+            except BaseException as exc:                      # noqa: BLE001
+                _h5close_error = exc
+            finally:
+                # The collective close was attempted; never retain or reuse a
+                # native handle after that teardown path reports an error.
+                self.fh = 0
             _t_close = _time.perf_counter() - _t0
             if _verbose:
                 print(f"  [SlabIO.close] H5Fclose returned in "
@@ -2515,8 +2582,9 @@ class _FfiBackend(_DatasetGeometry):
             self._owner_token = None
         # Now that MPI-IO has released the file, rank 0 can safely
         # reopen with h5py to tack on the deferred small-metadata
-        # datasets (omega_ev and friends) and the deferred dataset
-        # attributes (``k_storage`` and friends).  ONE reopen for both:
+        # datasets (omega_ev and friends), deferred dataset attributes
+        # (``k_storage`` and friends), and deferred file-root attributes.
+        # ONE reopen for all three:
         # they are deferred for the same reason and land in the same
         # place, and a second open would be a second thing to keep in
         # step with the barrier below.
@@ -2531,39 +2599,68 @@ class _FfiBackend(_DatasetGeometry):
         # the callers, not of this method, and it is not checkable here.
         # An unconditional barrier costs one rendezvous per file close
         # and removes the question.
-        if (_worker_error is None
-                and (self._deferred_attrs or self._deferred_ds_attrs)
+        # ONE any-rank verdict owns the complete pre-metadata boundary:
+        # worker drain/join, the collective H5Fclose attempt, and root-queue
+        # validation.  Rank 0 must not stamp completion metadata when ANY
+        # rank reports that its payload close failed.
+        _local_pre_metadata_error = _worker_error or _h5close_error
+        _validated_file_attrs = []
+        try:
+            _validated_file_attrs = _validate_file_attrs(
+                self._deferred_file_attrs)
+        except BaseException as exc:                          # noqa: BLE001
+            if _local_pre_metadata_error is None:
+                _local_pre_metadata_error = exc
+        _pre_metadata_error = _agree_close_error(
+            _local_pre_metadata_error,
+            context="SlabIO pre-metadata close",
+        )
+        _metadata_error: BaseException | None = None
+        if (_pre_metadata_error is None
+                and (self._deferred_attrs or self._deferred_ds_attrs
+                     or _validated_file_attrs)
                 and jax.process_index() == 0):
-            import h5py
-            with open_scope(self.path, STACK_H5PY, "a",
-                            where="_FfiBackend.close deferred-attr reopen"), \
-                    _journal.op_scope(
-                        "attr_w", self.path, stack=_J_H5PY, mode="a",
-                        cnt=(len(self._deferred_attrs),
-                             len(self._deferred_ds_attrs))), \
-                    h5py.File(self.path, "a") as h5:
-                for name, value in self._deferred_attrs:
-                    if name in h5:
-                        del h5[name]
-                    host = value
-                    if not isinstance(host, np.ndarray):
-                        host = np.asarray(jax.device_get(host))
-                    h5.create_dataset(name, data=host)
-                # AFTER the small datasets, because that loop
-                # delete-and-recreates by name and a recreated dataset
-                # would come back stripped of anything stamped first.
-                _apply_dataset_attrs(h5, self._deferred_ds_attrs)
-                # Explicit flush before close: this is the ONE serial-h5py
-                # write onto a file the FFI also drives, so its bytes must
-                # be durable before any rank's next collective open sees
-                # the superblock (audit A1 item 3).
-                h5.flush()
+            try:
+                import h5py
+                with open_scope(
+                        self.path, STACK_H5PY, "a",
+                        where="_FfiBackend.close deferred-attr reopen"), \
+                        _journal.op_scope(
+                            "attr_w", self.path, stack=_J_H5PY, mode="a",
+                            cnt=(len(self._deferred_attrs),
+                                 len(self._deferred_ds_attrs),
+                                 len(_validated_file_attrs))), \
+                        h5py.File(self.path, "a") as h5:
+                    for name, value in self._deferred_attrs:
+                        if name in h5:
+                            del h5[name]
+                        host = value
+                        if not isinstance(host, np.ndarray):
+                            host = np.asarray(jax.device_get(host))
+                        h5.create_dataset(name, data=host)
+                    # AFTER the small datasets, because that loop
+                    # delete-and-recreates by name and a recreated dataset
+                    # would come back stripped of anything stamped first.
+                    _apply_dataset_attrs(h5, self._deferred_ds_attrs)
+                    _apply_file_attrs(h5, _validated_file_attrs)
+                    # Explicit flush before close: this is the ONE serial-h5py
+                    # write onto a file the FFI also drives, so its bytes must
+                    # be durable before any rank's next collective open sees
+                    # the superblock (audit A1 item 3).
+                    h5.flush()
+            except BaseException as exc:                      # noqa: BLE001
+                _metadata_error = exc
+        _metadata_error = _agree_close_error(
+            _metadata_error,
+            context="SlabIO rank-0 deferred-metadata reopen",
+        )
         # Same reason as the write-ordering barriers above: rank 0 may
         # have just rewritten datasets in this file with serial h5py, and
         # no other rank may reopen it until that is durable.
         _barrier("slab_io_ffi_close_attrs")
         self._deferred_attrs = []
         self._deferred_ds_attrs = []
+        self._deferred_file_attrs = []
         _t_total = _t_drain + _t_join + _t_close
         if (_log_level == 1
                 and (_pending or _drained_bytes or _t_total >= 1.0)):
@@ -2571,5 +2668,7 @@ class _FfiBackend(_DatasetGeometry):
             print(f"  [SlabIO.close] {os.path.basename(self.path)}: "
                   f"{_pending} queued write{'s' if _pending != 1 else ''}{_moved}, "
                   f"drain+join+H5Fclose {_t_total:.1f} s", flush=True)
-        if _worker_error is not None:
-            raise _worker_error
+        if _pre_metadata_error is not None:
+            raise _pre_metadata_error
+        if _metadata_error is not None:
+            raise _metadata_error
