@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+import common.parallel_transport as parallel_transport_module
 from common.chi_from_dipole import compute_S_omega
 from common.bispinor_init import HALFALPHA
 from common.parallel_transport import build_forward_neighbor_table
@@ -156,7 +157,8 @@ def test_static_gauge_first_order_component_reuses_charge_head_and_state_jet():
             surface_weight_kn=jnp.ones_like(jnp.asarray(energies)))
 
 
-def test_static_gauge_second_order_retained_jet_and_weight_hessian():
+def test_static_gauge_second_order_retained_jet_and_weight_hessian(
+        monkeypatch):
     mesh = _mesh()
     kgrid = (8, 5, 1)
     nk, nb = int(np.prod(kgrid)), 2
@@ -222,12 +224,33 @@ def test_static_gauge_second_order_retained_jet_and_weight_hessian():
     ])
     omegas = jnp.asarray([0.37j], dtype=jnp.complex128)
 
+    matmul_widths = []
+    original_make_matmul = (
+        parallel_transport_module.make_distributed_band_matmul)
+
+    def tracked_make_matmul(mesh_arg, *, n_batch_axes):
+        multiply = original_make_matmul(mesh_arg, n_batch_axes=n_batch_axes)
+        if n_batch_axes != 2:
+            return multiply
+
+        def tracked_multiply(left, right):
+            matmul_widths.append((int(left.shape[0]), int(right.shape[0])))
+            return multiply(left, right)
+
+        return tracked_multiply
+
+    monkeypatch.setattr(
+        parallel_transport_module,
+        "make_distributed_band_matmul",
+        tracked_make_matmul,
+    )
     got = static_gauge_second_order_component_sharded(
         jnp.asarray(gamma), jnp.asarray(q1), jnp.asarray(q2),
         jnp.asarray(links), plus, jnp.asarray(energies),
         jnp.asarray(occupations), omegas,
         mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
         cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2)
+    assert matmul_widths == [(6, 6)] * 6
 
     def covariant_derivative_const(operator, axis):
         h = 1.0 / kgrid[axis]
