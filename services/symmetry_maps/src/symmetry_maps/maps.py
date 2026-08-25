@@ -67,6 +67,40 @@ def kgrid_shift_map(nkx, nky, nkz, q_off):
     return kpq_index, G_umk
 
 
+def _bgw_positive_half_wrap_fractional(q_fractional):
+    """Apply BGW's signed-cell wrap while retaining the ``+1/2`` tie."""
+    q = np.asarray(q_fractional, dtype=np.float64)
+    return np.where(q > 0.5, q - 1.0, q)
+
+
+def bgw_signed_q_representative(qvec):
+    r"""Return BGW's signed representative for stored fractional q rows.
+
+    Input rows must have trailing shape ``(..., 3)`` and lie in the one-cell
+    storage interval ``[-1/2, 1)`` (up to roundoff).  Components strictly
+    greater than one half wrap negative; the even-grid boundary remains
+    ``+1/2``.  This is the public symmetry-service door for consumers whose
+    WFN contract already supplies fractional q representatives.
+    """
+    q = np.asarray(qvec, dtype=np.float64)
+    if q.ndim < 1 or q.shape[-1] != 3:
+        raise ValueError(
+            "bgw_signed_q_representative: qvec must have trailing shape "
+            f"(...,3); got {q.shape}")
+    if not np.all(np.isfinite(q)):
+        raise ValueError(
+            "bgw_signed_q_representative: qvec must be finite")
+    tol = 32.0 * np.finfo(np.float64).eps
+    if np.any(q < -0.5 - tol) or np.any(q >= 1.0 + tol):
+        raise ValueError(
+            "bgw_signed_q_representative: stored fractional q rows must "
+            f"lie in [-1/2,1); got range [{float(np.min(q))},"
+            f"{float(np.max(q))}]")
+    canonical = np.mod(q, 1.0)
+    return np.ascontiguousarray(
+        _bgw_positive_half_wrap_fractional(canonical))
+
+
 def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
     """Convert BGW integer-grid q labels to wrapped fractional vectors.
 
@@ -94,8 +128,7 @@ def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
         raise ValueError(
             "bgw_integer_q_to_fractional: kgrid must contain three finite, "
             f"positive integers; got {grid.tolist()}.")
-    wrapped = np.where(q > grid / 2.0, q - grid, q)
-    return wrapped / grid
+    return _bgw_positive_half_wrap_fractional(q / grid)
 
 
 def q_negation_index(kgrid):
