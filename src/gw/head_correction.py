@@ -113,6 +113,223 @@ class StaticHeadTerms:
     source: str
 
 
+_STATIC_GAUGE_WARD_RESIDUAL_MAX = 1.0e-8
+_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
+
+
+@dataclass(frozen=True)
+class StaticGaugeHeadResponse:
+    r"""Gauge-closed static slab head/wings supplied by an operator artifact.
+
+    For in-plane Cartesian momentum ``q=(qx,qy)``, the regular response is
+
+    ``Pi_reg(q) = q_a q_b S_direct[a,b]``.
+
+    The only admitted linear CT/TC term is generated structurally from the
+    separately sourced Hall pseudovector ``sigma_H`` by
+
+    ``Pi_H[0,i](q) = i epsilon[b,a,i] sigma_H[b] q[a]``.
+
+    Thus this record has no arbitrary ``H_direct`` field.  ``Y_x`` and ``Z_y``
+    are the incumbent qsgw-head one-leg orientations and remain sharded on the
+    packed photon body.  The two reported residuals are dimensionless relative
+    certificates evaluated by the artifact producer on the complete operator;
+    this module independently rechecks the bounded ``S_direct`` tensor before
+    the mini-BZ solve.
+
+    ``operator_current_equivalent`` means the charge, current, and multipoles
+    were differentiated from the Hamiltonian named by ``operator_provenance``.
+    ``contact_is_exact`` means ``contact_provenance`` identifies that same
+    Hamiltonian's second gauge-field variation, not a uniform-A subtraction.
+    Both are required in production; the raw kinetic-balance alpha-current
+    bubble cannot set either flag merely by fitting finite q.
+    """
+
+    layout: object
+    S_direct: jax.Array                # (2, 2, 4, 4), replicated
+    sigma_H: object                    # (3,), real Hall pseudovector
+    Y_x: jax.Array                     # (2, 4, N_packed), x-sharded
+    Z_y: jax.Array                     # (2, N_packed, 4), y-sharded
+    response_provenance: str
+    operator_provenance: str
+    contact_provenance: str
+    hall_provenance: str
+    operator_current_equivalent: bool
+    contact_is_exact: bool
+    ward_residual: float
+    hermiticity_residual: float
+
+
+def static_hall_linear_response(sigma_H) -> jax.Array:
+    r"""Return the unique static Hall-only linear CT/TC tensor.
+
+    The result has shape ``(2,4,4)`` with coordinate index ``a=(x,y)``.
+    Charge is Lorentz row/column zero and currents are columns/rows 1:4.
+    Every CC and TT entry is exactly zero; TC is the Hermitian conjugate of
+    CT.  A real, separately sourced ``sigma_H`` is required so this function
+    cannot manufacture an unconstrained fitted Hall matrix.
+    """
+    sigma_raw = np.asarray(sigma_H)
+    if sigma_raw.shape != (3,):
+        raise ValueError(
+            f"sigma_H must be a three-component Hall pseudovector; got "
+            f"{sigma_raw.shape}")
+    if not np.all(np.isfinite(sigma_raw)):
+        raise ValueError("sigma_H contains non-finite values")
+    if np.any(np.imag(sigma_raw) != 0.0):
+        raise ValueError(
+            "static sigma_H must be explicitly real; refusing to discard an "
+            "imaginary component")
+    sigma = np.asarray(np.real(sigma_raw), dtype=np.float64)
+    axes = np.eye(3, dtype=np.float64)[:2]
+    # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].
+    ct = 1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
+    linear = np.zeros((2, 4, 4), dtype=np.complex128)
+    linear[:, 0, 1:] = ct
+    linear[:, 1:, 0] = np.conj(ct)
+    return jnp.asarray(linear)
+
+
+def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
+    r"""Return algebraic in-plane Ward and Hermiticity residuals of ``S``.
+
+    The Ward residual is the largest coefficient of the two cubic identities
+    ``q_i q_a q_b S[a,b,i,J]=0`` and
+    ``q_a q_b S[a,b,I,i] q_i=0``, normalized by ``max|S|``.  Hermiticity also
+    includes the coordinate-canonical condition ``S[a,b]=S[b,a]``; an
+    antisymmetric coordinate tensor is unobservable under ``q_a q_b`` and is
+    refused rather than retained as an arbitrary representative.
+    """
+    S = np.asarray(jax.device_get(S_direct), dtype=np.complex128)
+    if S.shape != (2, 2, 4, 4):
+        raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
+    if not np.all(np.isfinite(S)):
+        raise ValueError("S_direct contains non-finite values")
+    scale = float(np.max(np.abs(S)))
+    if scale == 0.0:
+        return 0.0, 0.0
+
+    coordinate_error = float(np.max(np.abs(S - np.swapaxes(S, 0, 1))))
+    lorentz_error = float(np.max(np.abs(
+        S - np.conj(np.swapaxes(S, 2, 3)))))
+
+    # Coefficients of (qx^3, qx^2*qy, qx*qy^2, qy^3), retaining the open
+    # opposite Lorentz leg.  Current x/y are Lorentz indices 1/2.
+    left = np.stack((
+        S[0, 0, 1, :],
+        S[0, 1, 1, :] + S[1, 0, 1, :] + S[0, 0, 2, :],
+        S[1, 1, 1, :] + S[0, 1, 2, :] + S[1, 0, 2, :],
+        S[1, 1, 2, :],
+    ), axis=0)
+    right = np.stack((
+        S[0, 0, :, 1],
+        S[0, 1, :, 1] + S[1, 0, :, 1] + S[0, 0, :, 2],
+        S[1, 1, :, 1] + S[0, 1, :, 2] + S[1, 0, :, 2],
+        S[1, 1, :, 2],
+    ), axis=0)
+    ward_error = float(max(np.max(np.abs(left)), np.max(np.abs(right))))
+    return ward_error / scale, max(coordinate_error, lorentz_error) / scale
+
+
+def require_static_gauge_head_response(
+    response: StaticGaugeHeadResponse, mesh_xy: Mesh,
+) -> StaticGaugeHeadResponse:
+    """Validate the production artifact without gathering either body wing."""
+    if not isinstance(response, StaticGaugeHeadResponse):
+        raise TypeError(
+            "production photon q0 completion requires StaticGaugeHeadResponse; "
+            f"got {type(response).__name__}")
+    from .photon_layout import PhotonBasisLayout
+    if not isinstance(response.layout, PhotonBasisLayout):
+        raise TypeError(
+            "StaticGaugeHeadResponse.layout must be the canonical "
+            f"PhotonBasisLayout; got {type(response.layout).__name__}")
+    response.layout.assert_mesh(mesh_xy)
+    n_body = int(response.layout.packed_extent)
+    expected_shapes = (
+        (response.S_direct, "S_direct", (2, 2, 4, 4), P()),
+        (response.Y_x, "Y_x", (2, 4, n_body), P(None, None, "x")),
+        (response.Z_y, "Z_y", (2, n_body, 4), P(None, "y", None)),
+    )
+    for array, name, shape, spec in expected_shapes:
+        if tuple(array.shape) != shape:
+            raise ValueError(f"{name} shape {array.shape} != {shape}")
+        sharding = getattr(array, "sharding", None)
+        wanted = NamedSharding(mesh_xy, spec)
+        same_mesh = (
+            isinstance(sharding, NamedSharding)
+            and tuple(sharding.mesh.axis_names) == tuple(mesh_xy.axis_names)
+            and np.array_equal(sharding.mesh.devices, mesh_xy.devices)
+        )
+        if not same_mesh or not sharding.is_equivalent_to(wanted, array.ndim):
+            raise ValueError(
+                f"{name} must arrive on the production mesh with sharding "
+                f"{spec}; got {sharding!r}. Refusing an implicit response "
+                "reshard.")
+
+    # Constructs and validates the small Hall tensor; its return is consumed by
+    # the mini-BZ stage, so no second Hall spelling exists.
+    static_hall_linear_response(response.sigma_H)
+    provenance = {
+        "response": response.response_provenance,
+        "operator": response.operator_provenance,
+        "contact": response.contact_provenance,
+        "Hall": response.hall_provenance,
+    }
+    missing = [name for name, value in provenance.items()
+               if not str(value).strip()]
+    if missing:
+        raise ValueError(
+            "GATE static_gauge_head_provenance: response artifact is missing "
+            f"{missing}.\n"
+            f"  got:  provenance={provenance}\n"
+            "  want: non-empty response/operator/contact/Hall artifact ids\n"
+            "  fix:  regenerate the response from the versioned gauged "
+            "operator pipeline; do not infer provenance in GW\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+    if not bool(response.operator_current_equivalent):
+        raise ValueError(
+            "GATE static_gauge_head_operator: the supplied current/multipoles "
+            "are not certified as derivatives of their named Hamiltonian.\n"
+            f"  got:  operator_provenance={response.operator_provenance!r}, "
+            "operator_current_equivalent=false\n"
+            "  want: one current-equivalent charge/current/multipole operator\n"
+            "  fix:  complete the raw no-pair alpha vertex with the gauged "
+            "VNL/downfolded operator track\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+    if not bool(response.contact_is_exact):
+        raise ValueError(
+            "GATE static_gauge_head_contact: the supplied contact is not the "
+            "same Hamiltonian's exact second gauge-field variation.\n"
+            f"  got:  contact_provenance={response.contact_provenance!r}, "
+            "contact_is_exact=false\n"
+            "  want: exact second-variation/contact provenance\n"
+            "  fix:  supply the VNL plus negative-energy/downfolded contact; "
+            "a Pi(q)-Pi(0) proxy is diagnostic only\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+
+    reported = (float(response.ward_residual),
+                float(response.hermiticity_residual))
+    if not np.all(np.isfinite(reported)) or min(reported) < 0.0:
+        raise ValueError(
+            "static gauge response reports invalid Ward/Hermiticity "
+            f"residuals: {reported}")
+    structural = static_gauge_tensor_residuals(response.S_direct)
+    ward = max(reported[0], structural[0])
+    hermiticity = max(reported[1], structural[1])
+    if ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX:
+        raise ValueError(
+            "GATE static_gauge_head_ward: response violates the static Ward "
+            f"identity: max_relative={ward:.6e} > "
+            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
+    if hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
+        raise ValueError(
+            "GATE static_gauge_head_hermiticity: response violates its "
+            f"canonical Hermiticity contract: max_relative={hermiticity:.6e} "
+            f"> {_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
+    return response
+
+
 @dataclass(frozen=True)
 class BGWQ0Channel:
     """One finite grid-q head channel used as BGW's epsilon q0 sample."""
@@ -808,14 +1025,16 @@ def small_head_wing_halves_sharded(
 def _static_slab_photon_head_moment_chunk(
     q_cart: jax.Array,
     D_raw: jax.Array,
-    R_linear: jax.Array,
-    R_quadratic: jax.Array,
+    H_hall: jax.Array,
+    S_quadratic: jax.Array,
     valid_count: jax.Array,
 ):
     r"""Accumulate one fixed-size chunk of the coupled small-head solve.
 
-    ``R(q) = q_a R_linear[a] + q_a q_b R_quadratic[a,b]`` uses the two
-    periodic in-plane Cartesian coordinates of a slab.  For every valid
+    ``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the two
+    periodic in-plane Cartesian coordinates of a slab.  ``H_hall`` is private
+    to this numerical kernel: the public entry derives it from ``sigma_H`` so
+    an arbitrary linear CT/TC matrix cannot enter production.  For every valid
     mini-BZ sample this evaluates the *coupled* four-field Dyson equation
 
     ``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
@@ -831,12 +1050,12 @@ def _static_slab_photon_head_moment_chunk(
     """
     q = jnp.asarray(q_cart, dtype=jnp.float64)
     D = jnp.asarray(D_raw, dtype=jnp.complex128)
-    H = jnp.asarray(R_linear, dtype=jnp.complex128)
-    Q = jnp.asarray(R_quadratic, dtype=jnp.complex128)
+    H = jnp.asarray(H_hall, dtype=jnp.complex128)
+    S = jnp.asarray(S_quadratic, dtype=jnp.complex128)
     qxy = q[:, :2]
     R = (
         jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
-        + jnp.einsum("sa,sb,abij->sij", qxy, qxy, Q, optimize=True)
+        + jnp.einsum("sa,sb,abij->sij", qxy, qxy, S, optimize=True)
     )
     identity = jnp.eye(4, dtype=jnp.complex128)[None, :, :]
     lhs = identity - jnp.einsum("sik,skj->sij", D, R, optimize=True)
@@ -864,16 +1083,17 @@ def _static_slab_photon_head_moment_chunk(
 def static_slab_photon_head_moment_chunk(
     q_cart,
     D_raw,
-    R_linear,
-    R_quadratic,
+    sigma_H,
+    S_quadratic,
     valid_count,
 ):
     """Validated entry to the fixed-size static slab photon-head graph.
 
     Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
     ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
-    units (no cell-volume factor), and the response coefficients are
-    ``(2,4,4)`` and ``(2,2,4,4)``.  The caller averages these sums per
+    units (no cell-volume factor), ``sigma_H`` is the separately sourced real
+    Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
+    averages these sums per
     independent mini-BZ repetition, then across repetitions; it applies the
     one and only ``1/Vcell`` while rebuilding the packed q=Gamma row.
 
@@ -883,23 +1103,28 @@ def static_slab_photon_head_moment_chunk(
     """
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
-    h_shape = tuple(np.shape(R_linear))
-    Q_shape = tuple(np.shape(R_quadratic))
+    sigma_shape = tuple(np.shape(sigma_H))
+    S_shape = tuple(np.shape(S_quadratic))
     if len(q_shape) != 2 or q_shape[1] != 3:
         raise ValueError(f"q_cart must be (chunk,3), got {q_shape}")
     expected_D = (q_shape[0], 4, 4)
     if d_shape != expected_D:
         raise ValueError(f"D_raw must be {expected_D}, got {d_shape}")
-    if h_shape != (2, 4, 4) or Q_shape != (2, 2, 4, 4):
+    if sigma_shape != (3,) or S_shape != (2, 2, 4, 4):
         raise ValueError(
-            "static slab response coefficients must be R_linear=(2,4,4) "
-            f"and R_quadratic=(2,2,4,4); got {h_shape}/{Q_shape}")
+            "static slab response requires sigma_H=(3,) and "
+            f"S_quadratic=(2,2,4,4); got {sigma_shape}/{S_shape}")
     n_valid = int(valid_count)
     if not 0 <= n_valid <= q_shape[0]:
         raise ValueError(
             f"valid_count must lie in [0,{q_shape[0]}], got {n_valid}")
+    H_hall = static_hall_linear_response(sigma_H)
+    S_sharding = getattr(S_quadratic, "sharding", None)
+    if isinstance(S_sharding, NamedSharding):
+        H_hall = jax.device_put(
+            H_hall, NamedSharding(S_sharding.mesh, P()))
     return _static_slab_photon_head_moment_chunk(
-        q_cart, D_raw, R_linear, R_quadratic,
+        q_cart, D_raw, H_hall, S_quadratic,
         jnp.asarray(n_valid, dtype=jnp.int32))
 
 
@@ -911,6 +1136,12 @@ class StaticSlabPhotonHeadCompletion:
     screened_moments: np.ndarray
     samples_per_replicate: tuple[int, ...]
     max_dyson_relative_residual: float
+    ward_residual: float
+    hermiticity_residual: float
+    response_provenance: str
+    operator_provenance: str
+    contact_provenance: str
+    hall_provenance: str
     estimator: str = "vcoul_minibz_equal_replicate_mean_v1"
 
 
@@ -920,7 +1151,7 @@ _STATIC_PHOTON_DYSON_RESIDUAL_MAX = 1.0e-8
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
     W_packed: jax.Array,
-    coefficients,
+    response: StaticGaugeHeadResponse,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     photon_sample_chunks,
@@ -939,8 +1170,8 @@ def complete_static_slab_photon_q0(
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
 
-    layout = coefficients.layout
-    layout.assert_mesh(mesh_xy)
+    response = require_static_gauge_head_response(response, mesh_xy)
+    layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
     if (tuple(V_packed.shape) != packed_shape
@@ -948,14 +1179,6 @@ def complete_static_slab_photon_q0(
         raise ValueError(
             "coupled photon head requires equal packed V/W bodies; got "
             f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
-    if tuple(coefficients.H_direct.shape) != (2, 4, 4):
-        raise ValueError(
-            f"photon H_direct must be (2,4,4); got "
-            f"{coefficients.H_direct.shape}")
-    if tuple(coefficients.Q_direct.shape) != (2, 2, 4, 4):
-        raise ValueError(
-            f"photon Q_direct must be (2,2,4,4); got "
-            f"{coefficients.Q_direct.shape}")
     factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
     if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
         raise ValueError(
@@ -968,17 +1191,30 @@ def complete_static_slab_photon_q0(
     # reuse the sole bounded Schur-fold graph; broadcasting W over the two
     # coordinate axes would create four body views in one executable.
     W_gamma = W_packed[0]
-    Q_effective = coefficients.Q_direct
+    S_effective = response.S_direct
     for a in range(2):
         for b in range(2):
             folded = fold_small_head_wings_sharded(
-                coefficients.Q_direct[a, b],
-                coefficients.Y_x[a], W_gamma, coefficients.Z_y[b],
+                response.S_direct[a, b],
+                response.Y_x[a], W_gamma, response.Z_y[b],
                 float(cell_volume), mesh_xy=mesh_xy)
-            Q_effective = Q_effective.at[a, b].set(folded)
+            S_effective = S_effective.at[a, b].set(folded)
     YW_y, WZ_x = small_head_wing_halves_sharded(
-        coefficients.Y_x, W_gamma, coefficients.Z_y, mesh_xy=mesh_xy)
-    jax.block_until_ready((Q_effective, YW_y, WZ_x))
+        response.Y_x, W_gamma, response.Z_y, mesh_xy=mesh_xy)
+    jax.block_until_ready((S_effective, YW_y, WZ_x))
+    effective_ward, effective_hermiticity = static_gauge_tensor_residuals(
+        S_effective)
+    if effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX:
+        raise ValueError(
+            "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
+            f"response violates the Ward identity: {effective_ward:.6e} > "
+            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
+    if effective_hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
+        raise ValueError(
+            "GATE static_gauge_head_fold_hermiticity: the actual Y-W-Z-"
+            f"folded response violates Hermiticity: "
+            f"{effective_hermiticity:.6e} > "
+            f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
 
     # Finish one Sobol replicate before starting the next.  This preserves
     # the provider's equal-replicate estimator rather than weighting a short
@@ -1046,7 +1282,7 @@ def complete_static_slab_photon_q0(
                 "sphere addend)")
         moments, bare_sum, returned_count, residual = (
             static_slab_photon_head_moment_chunk(
-                q_host, D_raw, coefficients.H_direct, Q_effective, n_valid))
+                q_host, D_raw, response.sigma_H, S_effective, n_valid))
         if int(np.asarray(returned_count)) != n_valid:
             raise RuntimeError(
                 "static photon head moment kernel changed valid_count")
@@ -1112,6 +1348,13 @@ def complete_static_slab_photon_q0(
         screened_moments=moments_mean,
         samples_per_replicate=tuple(samples_per_rep),
         max_dyson_relative_residual=max_residual,
+        ward_residual=max(float(response.ward_residual), effective_ward),
+        hermiticity_residual=max(
+            float(response.hermiticity_residual), effective_hermiticity),
+        response_provenance=response.response_provenance,
+        operator_provenance=response.operator_provenance,
+        contact_provenance=response.contact_provenance,
+        hall_provenance=response.hall_provenance,
     )
     return V_packed, W_packed, evidence
 
