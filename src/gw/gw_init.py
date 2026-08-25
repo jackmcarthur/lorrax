@@ -2291,8 +2291,9 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# view returned by the same projection that built V; it is deliberately
 		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
 		# source of truth.  The three transverse views have no production
-		# consumer until the authenticated static-gauge artifact loader lands,
-		# so do not pin them through the rest of GW bring-up.
+		# consumer until the gauged VNL producer is connected to the
+		# authenticated static-gauge artifact, so do not pin them through the
+		# rest of GW bring-up.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,

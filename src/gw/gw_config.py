@@ -3441,9 +3441,10 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     axis.  The enabled extension remains an explicitly experimental one-shot
     insulating full-BZ static COHSEX calculation through the distributed
     Dyson service when ``head_correction=off``.  Production ``full`` refuses
-    until the preprocessing/runtime contract can load a versioned
-    ``StaticGaugeHeadResponse`` with a current-equivalent operator, exact
-    same-Hamiltonian contact, and separately sourced Hall term.
+    until the gauged VNL producer is connected to the versioned
+    ``StaticGaugeHeadResponse`` artifact contract with a current-equivalent
+    operator, exact same-Hamiltonian contact, and separately sourced Hall
+    term.
     """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
@@ -3461,12 +3462,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
             "  got:  bispinor_gw = full_static_cohsex, "
             "head_correction = full\n"
-            "  want: a versioned StaticGaugeHeadResponse carrying "
-            "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
-            "contact/operator provenance, and certified Ward/Hermiticity "
-            "residuals\n"
-            "  fix:  complete the gauged VNL/downfolded operator artifact "
-            "and its loader, or set head_correction = off for the explicitly "
+            "  want: the gauged VNL producer connected to the versioned "
+            "StaticGaugeHead artifact writer, supplying S_direct, separately "
+            "sourced sigma_H, sharded Y/Z, one shared operator fingerprint, "
+            "and certified Ward/Hermiticity residuals\n"
+            "  fix:  complete and audit that producer connection, or set "
+            "head_correction = off for the explicitly "
             "experimental no-pair finite-body calculation\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
     requirements = (

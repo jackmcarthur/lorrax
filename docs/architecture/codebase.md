@@ -483,13 +483,28 @@ Written by `isdf_fitting.fit_zeta_chunked_to_h5` via `SlabIO`.
 
 `file_io.tagged_arrays.read_restart_state_from_h5` / `write_restart_state_to_h5`. Lets you skip the zeta-fit stage on a rerun. Contains V_q, ψ bundle arrays, kin_ion submatrix pointers, and related metadata.
 
-### 6.6 Output — `eqp0.dat` / `eqp1.dat`
+### 6.6 Intermediate — static gauge head artifact
+
+`file_io.static_gauge_head` owns this immutable SlabIO format and its sealed
+loader result.  The payload is fixed-dtype `S_direct_cart[2,2,4,4]`,
+`Y_cart_x[2,4,N_packed]`, `Z_cart_y[2,N_packed,4]`, and the bounded Hall
+pseudovector.  Y and Z read directly onto the canonical X/Y packed-body axes;
+neither is gathered.  One stored convention ID owns all Fourier, current,
+sign, unit, normalization and packing choices, and one SHA-256 fingerprint
+binds all operator components.  A completed temporary inode is atomically
+hard-linked to a create-once final name; readers refuse partial paths.
+
+This format does not enable production full-screened bispinor GW by itself.
+The independent deck/runtime refusals remain until the gauged VNL producer is
+connected to its writer.
+
+### 6.7 Output — `eqp0.dat` / `eqp1.dat`
 
 BGW-compatible text, on the **IBZ wedge** (one block per `wfn.kpoints` entry, k-coordinates in the BGW `(3f13.9,i8)` block header). Written by `gw.eqp_bgw.write_bgw_eqp`, via `assemble_eqp` — one assembly shared by the live driver (`gw_output.write_results`) and the post-hoc CLI (`gw.eqp_bgw.make_eqp_bgw`), so the V_H seam, the mean-field gate, the Z-factor and the formatter each exist once. `eqp1` differs from `eqp0` only in the `E_QP` column (Z-linearized vs zeroth-order; Z=1 in static modes ⇒ identical).
 
 Not to be confused with the **full-BZ** `sigma_diag.dat` / `eqp_g0w0.dat` (`file_io.sigma_output.write_sigma_to_file` / `write_eqp_g0w0`), which use `k-point N:` blocks plus a `# kcrys` line. The two bases are deliberate — see `docs/drivers.md` and `tests/test_eqp_kpoint_basis.py`.
 
-### 6.7 Output — `sigma_mnk.h5` (new format)
+### 6.8 Output — `sigma_mnk.h5` (new format)
 
 Written by `write_sigma_omega_h5` (phdf5-capable). Datasets in eV:
 
@@ -500,11 +515,11 @@ Written by `write_sigma_omega_h5` (phdf5-capable). Datasets in eV:
 /hartree_kij_ev    (nk, nb_sigma, nb_sigma)           complex128
 ```
 
-### 6.8 Output — `qp_rotations.h5`
+### 6.9 Output — `qp_rotations.h5`
 
 `file_io.qp_wfn.write_qp_rotations_h5`. U matrices + eigenvalues for QP rotation.
 
-### 6.9 Sandbox (not this repo) — `manifest.yaml`, `reports/*/report.md`
+### 6.10 Sandbox (not this repo) — `manifest.yaml`, `reports/*/report.md`
 
 Run-tracking metadata in the `lorrax_sandbox` superproject.
 

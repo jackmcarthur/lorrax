@@ -1695,9 +1695,10 @@ def compute_static_photon_response(
 
     ``head_correction=off`` preserves the explicitly experimental finite-body
     no-pair bring-up path.  ``full`` is refused here, below deck parsing,
-    until an authenticated, versioned response loader exists.  In particular,
-    a caller-provided dataclass cannot stand in for the missing producer and
-    loader.  No photon body, G-vector transform, or symmetry operation is
+    until the gauged VNL producer is connected to the authenticated artifact
+    writer/loader.  In particular, neither a caller-provided dataclass nor a
+    loader-issued but test-produced record can stand in for that missing
+    producer.  No photon body, G-vector transform, or symmetry operation is
     rebuilt here.
     """
     from .gw_config import HeadCorrection
@@ -1716,11 +1717,12 @@ def compute_static_photon_response(
     coupled_head = head_policy is HeadCorrection.FULL
     if coupled_head:
         raise ValueError(
-            "GATE static_gauge_head_response_loader_unavailable: production "
-            "FULL_SCREENED q=0 completion is unreachable until its "
-            "authenticated, versioned artifact loader exists.  A "
-            "caller-provided StaticGaugeHeadResponse is not accepted.  "
-            "Land the producer and exact loader type before enabling full; "
+            "GATE static_gauge_head_producer_unavailable: production "
+            "FULL_SCREENED q=0 completion is unreachable until the gauged "
+            "VNL producer is connected to the authenticated StaticGaugeHead "
+            "artifact writer.  Caller-provided and loader-issued test "
+            "responses are both refused.  Land and audit the producer "
+            "connection before enabling full; "
             "head_correction=off retains only the experimental no-pair "
             "finite-body diagnostic")
 
