@@ -769,7 +769,7 @@ def _apply_qp_block_to_compact_state(
 
 
 def resolve_qp_hamiltonian_state(
-        *, basis, enk_sigma, sym, meta, wfn_path: str,
+        *, basis, enk_sigma, sym, meta, wfn, wfn_path: str,
         qp_rotations_file: str, eqp_file: str | None = None,
         log_fn=None):
     """Overlay a matched QP block on a reusable mean-field Galerkin fit.
@@ -807,8 +807,13 @@ def resolve_qp_hamiltonian_state(
     if not os.path.isfile(path):
         raise FileNotFoundError(f"QP rotation artifact does not exist: {path}")
 
-    from file_io.qp_wfn import read_qp_rotations_artifact
+    from file_io.qp_wfn import (
+        authenticate_qp_rotations_source_wfn,
+        read_qp_rotations_artifact,
+    )
     artifact = read_qp_rotations_artifact(path)
+    authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path=path)
     U = np.asarray(artifact["U_mnk"])
     E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
     rot_range = np.asarray(artifact["band_range"], dtype=np.int64)
@@ -898,10 +903,10 @@ def resolve_qp_hamiltonian_state(
         f"compact rotation O({nk}*{nb_qp}^2*{int(ctilde.shape[2])}), no "
         "WFN/FFT rebuild")
     say(
-        "  [QP provenance] band_range, kgrid and full-BZ k coordinates "
-        "match the selected WFN, but qp_wfn_rotations.h5 does not yet carry "
-        "a source-WFN fingerprint.  This validates the represented window "
-        "and k-set, not the exact source-WFN identity.")
+        "  [QP provenance] canonical source-WFN fingerprint, band_range, "
+        "kgrid and full-BZ k coordinates all match the selected mean-field "
+        "WFN; the QP artifact carries energies/rotations only, so no "
+        "bispinor WFN is loaded or constructed")
     # This exact range comes from the authenticated artifact metadata above;
     # the standalone driver carries it to the active/projected output seam.
     # Do not reconstruct it later from a deck count or an array shape.
@@ -2124,6 +2129,7 @@ def main(argv=None):
         (ctilde, enk_sigma,
          qp_corrected_band_range) = resolve_qp_hamiltonian_state(
             basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta,
+            wfn=wfn,
             wfn_path=_wfn_path, qp_rotations_file=_qp_rotations_path,
             eqp_file=args.eqp_file, log_fn=log)
     # ── Galerkin-input gate ───────────────────────────────────────────

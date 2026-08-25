@@ -98,36 +98,46 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energ
         verbose: Print progress information
         energy_only: If True, only update energies, don't rotate wavefunctions
     """
-    # Copy WFN.h5 to output file first
+    # Read and authenticate BEFORE copying or mutating an output.  U_mnk is
+    # labelled in a particular DFT-band basis; matching shapes and k-points
+    # cannot make a rotation from a different source WFN safe.
+    from file_io.qp_wfn import (
+        authenticate_qp_rotations_source_wfn,
+        read_qp_rotations_artifact,
+    )
+    from wfn_loader import WfnLoader
+    _arr = read_qp_rotations_artifact(rot_file)
+    with WfnLoader(wfn_file) as _source_wfn:
+        authenticate_qp_rotations_source_wfn(
+            _arr, _source_wfn, artifact_path=rot_file)
+
+    # Copy WFN.h5 only after the source-basis contract succeeds.
     if verbose:
         print(f"Copying {wfn_file} -> {output_file}")
     shutil.copy2(wfn_file, output_file)
-    
-    # Open rotation file.  THE ARRAYS COME BACK THROUGH THE ADAPTER, the
+
+    # THE ARRAYS COME BACK THROUGH THE ADAPTER, the
     # coordinates straight off the file: ``U_mnk`` and ``E_qp_nk_rydberg``
     # may be stored on the file wedge (``k_storage='ibz'``) and are unfolded
     # here, while ``kpoints_crys`` and ``kirr_to_kfull`` are ALWAYS full-BZ
     # and keep their old meaning, so everything below indexes by full-BZ k
     # exactly as it always did.  A file with no ``k_storage`` attr is read
     # verbatim, so a pre-format file is untouched by this.
-    from file_io.qp_wfn import read_qp_rotations_full_bz
-    _arr = read_qp_rotations_full_bz(rot_file)
     U_mnk = _arr['U_mnk']                      # (nk_full, nb, nb)
     E_qp_ry = _arr['E_qp_nk_rydberg']          # (nk_full, nb) in Rydberg
-    with h5py.File(rot_file, 'r') as f_rot:
-        band_range = f_rot['band_range'][:]  # [band_start, band_stop]
-        rot_kpoints = f_rot['kpoints_crys'][:]  # (nk_full, 3)
-        kgrid = f_rot['kgrid'][:]  # [nkx, nky, nkz]
-        
-        band_start, band_stop = band_range
-        nb_sigma = band_stop - band_start
-        
-        if verbose:
-            print(f"Rotation file: {rot_file}")
-            print(f"  U_mnk shape: {U_mnk.shape}")
-            print(f"  Band range: [{band_start}, {band_stop})")
-            print(f"  K-grid: {kgrid}")
-            print(f"  Number of full-zone k-points: {len(rot_kpoints)}")
+    band_range = _arr['band_range']  # [band_start, band_stop]
+    rot_kpoints = _arr['kpoints_crys']  # (nk_full, 3)
+    kgrid = _arr['kgrid']  # [nkx, nky, nkz]
+
+    band_start, band_stop = band_range
+    nb_sigma = band_stop - band_start
+
+    if verbose:
+        print(f"Rotation file: {rot_file}")
+        print(f"  U_mnk shape: {U_mnk.shape}")
+        print(f"  Band range: [{band_start}, {band_stop})")
+        print(f"  K-grid: {kgrid}")
+        print(f"  Number of full-zone k-points: {len(rot_kpoints)}")
     
     # Open WFN file and get k-point info
     with h5py.File(wfn_file, 'r') as f_wfn:
@@ -347,4 +357,3 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
-

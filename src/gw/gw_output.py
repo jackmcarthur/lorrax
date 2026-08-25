@@ -1281,6 +1281,7 @@ def write_results(
     input_dir: str,
     kgrid: tuple[int, int, int],
     sym,
+    wfn,
     print_fn=print,
     *,
     eqp_dE_ev: float = 0.5,
@@ -1337,6 +1338,11 @@ def write_results(
         reader then had to reconstruct what the five meant and how they had
         to agree; the reduction now happens where the data is written,
         which is the only place that knows what it is writing.
+    wfn : WfnLoader
+        Mean-field WFN whose DFT-band basis defines ``results.U_qp``.  The
+        rotations writer fingerprints it through the canonical provenance
+        owner; it is not loaded again and no bispinor representation is
+        constructed.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1629,6 +1635,7 @@ def write_results(
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
             k_storage=str(qp_rotations_k_storage),
             star_tables=_sm.star_tables_of(sym),
+            source_wfn=wfn,
             print_fn=print_fn,
         )
 
