@@ -841,17 +841,17 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             for perm, phase in alpha_vertices
         ], axis=0)
 
-        vnl = vnl_ops.apply_uniform_vnl_derivatives_to_ket(
+        vnl = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
             psi_L, gvec, kvec, vnl_setup, gmask)
         gamma_vnl = _pad_spinor(
             halfalpha.astype(psi_4.real.dtype)
-            * vnl.gamma_cart_ket,
+            * vnl.gamma0_cart_ket,
             int(psi_4.shape[1]))
         gamma = gamma_kin + gamma_vnl
 
         lambda_kin = apply_kinetic_contact_to_ket(psi_L)
         lambda_large = halfalpha.astype(psi_4.real.dtype) * (
-            lambda_kin + vnl.lambda_cart_ket)
+            lambda_kin + vnl.lambda0_cart_ket)
         contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
 
         packed = jnp.concatenate(
@@ -920,6 +920,7 @@ def sweep_uniform_gauge_matrix_elements(
         ("wfn_scheme", WFN_FINGERPRINT_SCHEME),
         ("wfn", wfn_fingerprint(wfn)),
         ("vnl", vnl_fingerprint),
+        ("vnl_gauge_path", vnl_ops.ICL_STRAIGHT_GAUGE_PATH),
         ("kinetic_balance", KINETIC_BALANCE_LIFT_PROVENANCE),
         ("band_interval", f"{start}:{stop}"),
         ("nk", str(int(geom.nk))),

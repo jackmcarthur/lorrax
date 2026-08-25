@@ -1,4 +1,4 @@
-"""Five deterministic first-principles gates for uniform VNL gauge actions."""
+"""Deterministic first-principles gates for uniform VNL gauge actions."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -15,6 +15,7 @@ from psp.species import SpeciesData
 from psp.vnl_ops import (
     ChannelMeta,
     VNLSetup,
+    apply_icl_vnl_transfer_jet_to_ket,
     apply_uniform_vnl_derivatives_to_ket,
     build_vnl_kdata_from_kvec,
 )
@@ -244,3 +245,68 @@ def test_ordinary_and_gauge_projector_values_share_exact_origin_owner():
     expected = setup.prefactor * 1.2 / np.sqrt(4.0 * np.pi)
     np.testing.assert_allclose(ordinary, gauge, rtol=0.0, atol=0.0)
     np.testing.assert_allclose(ordinary[0, 0], expected, rtol=2e-15, atol=0.0)
+
+
+def test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly():
+    setup = _setup(curved=False)
+    psi = _states()
+    G = jnp.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
+    mask = jnp.asarray([1.0, 1.0, 1.0, 0.0])
+    k = jnp.asarray([0.19, -0.17, 0.12])
+    uniform = apply_uniform_vnl_derivatives_to_ket(
+        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
+    icl = apply_icl_vnl_transfer_jet_to_ket(
+        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
+    np.testing.assert_array_equal(
+        np.asarray(icl.gamma0_cart_ket),
+        np.asarray(uniform.gamma_cart_ket))
+    np.testing.assert_array_equal(
+        np.asarray(icl.lambda0_cart_ket),
+        np.asarray(uniform.lambda_cart_ket))
+    np.testing.assert_allclose(
+        icl.dgamma_dq_cart_ket,
+        -0.5 * uniform.lambda_cart_ket,
+        rtol=0.0, atol=0.0)
+
+
+def test_icl_kminusq_taylor_ward_and_transfer_hermiticity():
+    """The q jet is the straight-line average of dV(k-lambda*q)."""
+    setup = _setup(curved=False)
+    psi = _states()
+    G = jnp.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
+    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
+    k = np.asarray([0.19, -0.17, 0.12])
+    Binv = np.linalg.inv(setup.B)
+    jet = apply_icl_vnl_transfer_jet_to_ket(
+        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
+    gamma0 = np.asarray(jet.gamma0_cart_ket)
+    dgamma = np.asarray(jet.dgamma_dq_cart_ket)
+    direction = np.asarray([0.31, -0.47, 0.29])
+
+    # Ward/Taylor identity for the positive Hamiltonian vertex:
+    # q.Gamma = [V(k)-V(k-q)] through the retained O(q^2) terms.
+    def ward_error(step):
+        q = step * direction
+        gamma_q = gamma0 + np.einsum("b,abnsg->ansg", q, dgamma)
+        lhs = np.einsum("a,ansg->nsg", q, gamma_q)
+        rhs = (
+            _ordinary_vnl_action(psi, G, mask, k, setup)
+            - _ordinary_vnl_action(
+                psi, G, mask, k - q @ Binv, setup))
+        return np.linalg.norm(lhs - rhs)
+
+    err_big = ward_error(4.0e-3)
+    err_small = ward_error(2.0e-3)
+    assert err_small < 0.14 * err_big  # cubic remainder: ideal ratio 1/8
+
+    # At one k, V_,a and V_,ab are Hermitian.  This is precisely the
+    # O(q) content of Gamma(k,q)^dagger = Gamma(k-q,-q).
+    bra = np.conj(np.asarray(psi) * mask[None, None, :])
+    gamma_mtx = np.einsum("msg,ansg->amn", bra, gamma0)
+    dgamma_mtx = np.einsum("msg,abnsg->abmn", bra, dgamma)
+    np.testing.assert_allclose(
+        gamma_mtx, np.swapaxes(np.conj(gamma_mtx), -1, -2),
+        rtol=2e-12, atol=2e-12)
+    np.testing.assert_allclose(
+        dgamma_mtx, np.swapaxes(np.conj(dgamma_mtx), -1, -2),
+        rtol=2e-12, atol=2e-12)

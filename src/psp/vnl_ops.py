@@ -135,6 +135,33 @@ class VNLGaugeKetDerivatives:
     lambda_cart_ket: jax.Array
 
 
+ICL_STRAIGHT_GAUGE_PATH = "icl_straight_segment_v1"
+
+
+@dataclass(frozen=True)
+class ICLVNLTransferJet:
+    r"""Straight-segment VNL photon jet for ``bra k-q, ket k``.
+
+    All arrays are unscaled Pauli-Hamiltonian derivatives.  With
+    ``V_a = d V_NL(k) / d k_a`` and Cartesian transfer ``q``, the
+    Ismail-Beigi--Chang--Louie straight Wilson segment gives
+
+    ``Gamma_a(k,q) = V_a - q_b V_ab/2 + O(q^2)``.
+
+    Thus the transfer gradient is not a second current construction: it is
+    exactly minus one half of the incumbent uniform contact.  The uniform
+    current and contact fields remain byte-for-byte the arrays returned by
+    :class:`VNLGaugeKetDerivatives`.  The ``q^2`` coefficient requires the
+    physical third projector derivative and is deliberately not represented
+    by this type; differentiating the linear table interpolant would not be
+    that operator.
+    """
+
+    gamma0_cart_ket: jax.Array
+    dgamma_dq_cart_ket: jax.Array
+    lambda0_cart_ket: jax.Array
+
+
 # ---------------------------------------------------------------------------
 # Setup builder
 # ---------------------------------------------------------------------------
@@ -1147,6 +1174,49 @@ def apply_uniform_vnl_derivatives_to_ket(
     return VNLGaugeKetDerivatives(
         gamma_cart_ket=gamma[..., :nG],
         lambda_cart_ket=contact[..., :nG])
+
+
+def apply_icl_vnl_transfer_jet_to_ket(
+    psi_G,
+    G_int,
+    k_crys,
+    setup: VNLSetup,
+    g_mask,
+    *,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+) -> ICLVNLTransferJet:
+    r"""Apply the canonical ICL straight-segment VNL jet at ``q=0``.
+
+    ``k_crys`` is the ket momentum in the repository's transition
+    orientation ``<bra,k-q|Gamma(k,q)|ket,k>``.  In the positive raw
+    Hamiltonian-vertex convention used by :mod:`common.mtxel_sweep`,
+
+    .. math::
+
+       \Gamma_a^{\rm NL}(k,q)
+       = \int_0^1 d\lambda\,\partial_a V_{\rm NL}(k-\lambda q)
+       = V_{,a}(k)-\frac{q_b}{2}V_{,ab}(k)+O(q^2).
+
+    The sole bounded projector-coefficient scan already produces both
+    derivatives.  This wrapper only binds their finite-transfer meaning; it
+    performs no second projector contraction and creates no persistent
+    coefficient, G-space, or band-square carrier.
+    """
+    uniform = apply_uniform_vnl_derivatives_to_ket(
+        psi_G,
+        G_int,
+        k_crys,
+        setup,
+        g_mask,
+        projector_row_chunk=projector_row_chunk,
+        g_chunk=g_chunk,
+    )
+    return ICLVNLTransferJet(
+        gamma0_cart_ket=uniform.gamma_cart_ket,
+        dgamma_dq_cart_ket=-0.5 * uniform.lambda_cart_ket,
+        lambda0_cart_ket=uniform.lambda_cart_ket,
+    )
 
 
 # ---------------------------------------------------------------------------
