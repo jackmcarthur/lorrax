@@ -467,15 +467,16 @@ def test_gflat_to_rmu_chunked_matches_oneshot(synth_loader):
             err_msg=f"chunk_size={cs} disagrees with one-shot")
 
 
-def test_gflat_to_rmu_runtime_k_operands_share_one_family(synth_loader):
-    """Same-shaped streamed k tiles vary values without one JIT per tile."""
+def test_gflat_to_rmu_runtime_k_and_centroid_operands_share_one_family(
+        synth_loader):
+    """Same-shaped k and centroid values vary without one JIT per tile."""
     for key in list(_wfn_transforms._KERNEL_CACHE):
         if key[0] == "gflat_to_rmu":
             del _wfn_transforms._KERNEL_CACHE[key]
 
     nb = min(4, int(synth_loader.nbands))
     nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
-    r_mu = np.asarray([
+    r_mu_base = np.asarray([
         [0, 0, 0],
         [min(1, nx - 1), min(2, ny - 1), min(3, nz - 1)],
     ], dtype=np.int32)
@@ -483,6 +484,9 @@ def test_gflat_to_rmu_runtime_k_operands_share_one_family(synth_loader):
     tile_sharding = NamedSharding(MESH, P(None, ('x', 'y'), None, None))
 
     for ik in (0, 1):
+        r_mu = r_mu_base.copy()
+        r_mu[:, 0] = (r_mu[:, 0] + ik) % nx
+        r_mu[:, 1] = (r_mu[:, 1] + 2 * ik) % ny
         psi = jax.device_put(
             synth_loader.load(bands=(0, nb), k=[ik]), tile_sharding)
         g_index = synth_loader.box_index_dev(k=[ik], mesh=MESH)

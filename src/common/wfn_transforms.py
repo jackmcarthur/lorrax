@@ -115,9 +115,8 @@ def _cached_jit(name: str, key: tuple, build):
 
 # Module-level dedup for the device-resident ``(nk, nx, ny, nz) int32``
 # g_index buffer captured by ``build()`` closures.  Without this cache,
-# every distinct ``_cached_jit`` key (which changes per channel via
-# ``r_mu_id`` for centroid loads) would build a NEW compiled fn with a
-# NEW captured ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED buffer
+# every distinct ``_cached_jit`` key would otherwise build a NEW compiled fn
+# with a NEW captured ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED buffer
 # — leaking +1 buffer per channel from the centroid-load path on top of
 # the (now-fixed) ``psi_G_store._g_index_dev`` leak (agent_h §3 Finding
 # 3).  Keyed by content-hash of the numpy g_index so different k-sets
@@ -1157,12 +1156,12 @@ def gflat_to_rmu(
     nb_total  = int(psi_G.shape[1])
     ns        = int(psi_G.shape[2])
     ngkmax    = int(psi_G.shape[3])
-    r_mu_arr  = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
-    if r_mu_arr.ndim != 2 or int(r_mu_arr.shape[1]) != 3:
+    r_mu_shape = tuple(int(s) for s in np.shape(r_mu))
+    if len(r_mu_shape) != 2 or r_mu_shape[1] != 3:
         raise ValueError(
             f"gflat_to_rmu: r_mu must be (n_rmu, 3); got shape "
-            f"{r_mu_arr.shape}.")
-    n_rmu     = int(r_mu_arr.shape[0])
+            f"{r_mu_shape}.")
+    n_rmu     = r_mu_shape[0]
     p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)
     # Band-flat sharding needs the band axis divisible by the mesh.  Pad it
     # up with ZERO bands so ANY device count works: the htransform SP /
@@ -1194,14 +1193,19 @@ def gflat_to_rmu(
             f"gflat_to_rmu: g_index trailing shape {g_shape[1:]} "
             f"≠ fft_grid {fft_grid_t}.")
 
-    # r_mu range check (Python int values; replicated, OK to validate
-    # at trace time).
-    if (np.any(r_mu_arr[:, 0] < 0) or np.any(r_mu_arr[:, 0] >= nx)
-            or np.any(r_mu_arr[:, 1] < 0) or np.any(r_mu_arr[:, 1] >= ny)
-            or np.any(r_mu_arr[:, 2] < 0) or np.any(r_mu_arr[:, 2] >= nz)):
-        raise ValueError(
-            f"gflat_to_rmu: r_mu has out-of-range coords for "
-            f"fft_grid {fft_grid_t}.")
+    # Retain the eager caller guard without forcing a device→host roundtrip
+    # when the canonical producer already supplies a jax.Array.  Device
+    # values remain runtime operands below, exactly as in ``to_rmu``.
+    if not isinstance(r_mu, jax.Array):
+        r_mu_host = np.asarray(r_mu, dtype=np.int32)
+        if (np.any(r_mu_host[:, 0] < 0) or np.any(r_mu_host[:, 0] >= nx)
+                or np.any(r_mu_host[:, 1] < 0)
+                or np.any(r_mu_host[:, 1] >= ny)
+                or np.any(r_mu_host[:, 2] < 0)
+                or np.any(r_mu_host[:, 2] >= nz)):
+            raise ValueError(
+                f"gflat_to_rmu: r_mu has out-of-range coords for "
+                f"fft_grid {fft_grid_t}.")
 
     # Clamp the chunk to the actual row count: a chunk larger than the
     # data only inflates the flat-axis zero-pad — and with it the
@@ -1244,11 +1248,11 @@ def gflat_to_rmu(
     # Resolve the canonical device buffer without a numpy roundtrip for
     # jax.Array inputs.  See _resolve_gindex_dev.
     g_index_dev_canonical, _ = _resolve_gindex_dev(g_index)
-    r_mu_id    = hash(r_mu_arr.tobytes())
+    r_mu_dev = jnp.asarray(r_mu, dtype=jnp.int32)
 
     key = (
         tuple(int(s) for s in psi_G.shape), tuple(g_shape),
-        fft_grid_t, n_rmu, r_mu_id, ngkmax,
+        fft_grid_t, r_mu_shape, ngkmax,
         norm, kvecs_shape, k_row_map_shape, cs, n_chunks, pad_N,
         # The shard_map below owns the input layout: every operand enters as
         # ``band_sphere_spec()`` on this explicit mesh.  Key that contract,
@@ -1260,12 +1264,9 @@ def gflat_to_rmu(
     )
 
     def build():
-        # Centroid coordinates remain a shape/content-static constant.  The
-        # G-index and k-vectors are runtime operands: streamed k tiles have
-        # one fixed shape but different values, and baking either into this
-        # closure would create one compiled executable (and retained device
-        # constant) per tile.
-        r_mu_c    = jnp.asarray(r_mu_arr, dtype=jnp.int32)
+        # G-index, centroid coordinates and k-vectors are runtime operands:
+        # fixed-shape streamed tiles and centroid sets share one executable,
+        # with no retained per-content device constant.
 
         # Round-6: pass g_index through shard_map's in_specs (NOT
         # closure capture) so the Auto-sharded NamedSharding-replicated
@@ -1282,10 +1283,11 @@ def gflat_to_rmu(
         # WfnLoader-cached device allocation.
         in_spec  = band_sphere_spec()
         gidx_spec = P(None, None, None, None)
+        rmu_spec = P(None, None)
         kvec_spec = P(None, None)
         out_spec = band_sphere_spec()
 
-        def _body(psi_, g_index_, kvecs_, k_row_map_):
+        def _body(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
             # Per-rank: (nk, nb_local, ns, ngkmax).
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
@@ -1303,9 +1305,9 @@ def gflat_to_rmu(
                 phx = _ph(kvecs_[:, 0], nx)
                 phy = _ph(kvecs_[:, 1], ny)
                 phz = _ph(kvecs_[:, 2], nz)
-                phx_rmu_all = phx[:, r_mu_c[:, 0]]
-                phy_rmu_all = phy[:, r_mu_c[:, 1]]
-                phz_rmu_all = phz[:, r_mu_c[:, 2]]
+                phx_rmu_all = phx[:, r_mu_[:, 0]]
+                phy_rmu_all = phy[:, r_mu_[:, 1]]
+                phz_rmu_all = phz[:, r_mu_[:, 2]]
             else:
                 phx_rmu_all = phy_rmu_all = phz_rmu_all = None
 
@@ -1327,7 +1329,7 @@ def gflat_to_rmu(
                 box = box.reshape(cs, ns, nx, ny, nz)
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
-                samples = rb[:, :, r_mu_c[:, 0], r_mu_c[:, 1], r_mu_c[:, 2]]
+                samples = rb[:, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 if phx_rmu_all is not None:
                     # Per-row Bloch phase at the gathered centroid
                     # cells — apply_bloch_phase is multiplicative on the
@@ -1350,45 +1352,48 @@ def gflat_to_rmu(
 
         if kvecs_frac is None and k_row_map is None:
             @partial(shard_map, mesh=mesh,
-                     in_specs=(in_spec, gidx_spec),
+                     in_specs=(in_spec, gidx_spec, rmu_spec),
                      out_specs=out_spec,
                      check_vma=False)
-            def _kernel(psi_, g_index_):
-                return _body(psi_, g_index_, None, None)
+            def _kernel(psi_, g_index_, r_mu_):
+                return _body(psi_, g_index_, r_mu_, None, None)
         elif k_row_map is None:
             @partial(shard_map, mesh=mesh,
-                     in_specs=(in_spec, gidx_spec, kvec_spec),
+                     in_specs=(in_spec, gidx_spec, rmu_spec, kvec_spec),
                      out_specs=out_spec,
                      check_vma=False)
-            def _kernel(psi_, g_index_, kvecs_):
-                return _body(psi_, g_index_, kvecs_, None)
+            def _kernel(psi_, g_index_, r_mu_, kvecs_):
+                return _body(psi_, g_index_, r_mu_, kvecs_, None)
         elif kvecs_frac is None:
             @partial(shard_map, mesh=mesh,
-                     in_specs=(in_spec, gidx_spec, P(None)),
+                     in_specs=(in_spec, gidx_spec, rmu_spec, P(None)),
                      out_specs=out_spec,
                      check_vma=False)
-            def _kernel(psi_, g_index_, k_row_map_):
-                return _body(psi_, g_index_, None, k_row_map_)
+            def _kernel(psi_, g_index_, r_mu_, k_row_map_):
+                return _body(psi_, g_index_, r_mu_, None, k_row_map_)
         else:
             @partial(shard_map, mesh=mesh,
-                     in_specs=(in_spec, gidx_spec, kvec_spec, P(None)),
+                     in_specs=(in_spec, gidx_spec, rmu_spec, kvec_spec,
+                               P(None)),
                      out_specs=out_spec,
                      check_vma=False)
-            def _kernel(psi_, g_index_, kvecs_, k_row_map_):
-                return _body(psi_, g_index_, kvecs_, k_row_map_)
+            def _kernel(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
+                return _body(
+                    psi_, g_index_, r_mu_, kvecs_, k_row_map_)
 
         return jax.jit(_kernel)
 
     fn = _cached_jit('gflat_to_rmu', key, build)
     if kvecs_frac is None and k_row_map is None:
-        out = fn(psi_G, g_index_dev_canonical)
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev)
     elif k_row_map is None:
-        out = fn(psi_G, g_index_dev_canonical, kvecs_dev)
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev, kvecs_dev)
     elif kvecs_frac is None:
-        out = fn(psi_G, g_index_dev_canonical, k_row_map_dev)
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev, k_row_map_dev)
     else:
         out = fn(
-            psi_G, g_index_dev_canonical, kvecs_dev, k_row_map_dev)
+            psi_G, g_index_dev_canonical, r_mu_dev, kvecs_dev,
+            k_row_map_dev)
     if nb_pad_total != nb_total:
         # Drop the zero pad-bands.  Replicate the band axis first (bands off
         # the mesh) so the slice to the logical nb_total — which need not
