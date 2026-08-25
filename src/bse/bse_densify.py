@@ -571,6 +571,14 @@ def _interpolate_bse_data_to_grid(
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
 
+    # The restart and fresh htransform WFN first meet at this seam.
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    from .bse_window import _parse_wfn_path
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_parse_wfn_path(input_file),
+        state_artifact_path=restart_file,
+        where="bse_k_grid restart/htransform state")
+
     # ── WHICH ISDF BASIS THE htransform FITS IN ───────────────────────────
     # On a NATIVE bundle: the deck's own table, and ``keep`` is None — this
     # block is then a no-op and everything below is the program it always was.

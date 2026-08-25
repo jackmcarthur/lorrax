@@ -2766,6 +2766,7 @@ def prepare_isdf_and_wavefunctions(
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
 				from file_io import coulomb_policy_from_config
+				from file_io.qp_wfn import qp_state_source_provenance
 				write_restart_state_to_h5(
 					tensors_filename,
 					n_rmu_logical=int(meta.n_rmu),
@@ -2778,6 +2779,7 @@ def prepare_isdf_and_wavefunctions(
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
+					qp_state_source_record=qp_state_source_provenance(wfn),
 					# Stamp the band window + n_rmu so a later restart
 					# under a CHANGED window fails loudly instead of
 					# silently misindexing Sigma (job 7874375).
@@ -2921,6 +2923,16 @@ def prepare_isdf_and_wavefunctions(
 		# (refuse_unsupported_low_mem_bands), before either restart branch
 		# above ran.
 		from file_io import load_restart_state_from_h5
+		from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+		_qp_state_wfn = getattr(wfn, 'path', None)
+		if not _qp_state_wfn:
+			raise ValueError(
+				"gw_jax restart consumer cannot identify the selected WFN "
+				"path, so restart psi/E compatibility cannot be checked.")
+		refuse_conflicting_qp_state_sources(
+			wfn_path=_qp_state_wfn,
+			state_artifact_path=tensors_filename,
+			where="gw_jax restart")
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
