@@ -13,8 +13,9 @@ the bispinor bare exchange splits into two pieces:
     Σ^B_{αβ}(12) = -Σ_{i,j} γ̃^i_{αγ} G^0_{γδ}(12) γ̃^j_{δβ} D^{ij}_bare(12)
 
   where γ̃^μ ≡ γ^0 γ^μ (so γ̃^0 = I_4 and γ̃^i = α^i in the LORRAX
-  convention), and D^{ij}_bare = V_qmunu_TT_{ij} (the transverse
-  projector-weighted Coulomb).
+  convention), and D^{ij}_bare = V_qmunu_TT_{ij} = -v P_T^{ij}.  The
+  Lorentz-metric minus belongs to the propagator builder; this Sigma
+  contraction carries no compensating sign.
 
 This module computes Σ^B by reusing the existing scalar
 ``sigma_sx`` kernel.  The trick:
