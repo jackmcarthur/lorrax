@@ -80,6 +80,31 @@ def test_quiet_startup_receipt_stays_quiet_at_later_first_use(capsys):
         reset_gate_state()
 
 
+def test_quiet_startup_also_suppresses_an_off_accelerator(capsys,
+                                                           monkeypatch):
+    """The OFF branch must honor the same production ``announce=False``.
+
+    This is the branch that leaked one KLEAD line per rank even after all
+    successful ON/AUTO receipts had become quiet.
+    """
+    from ffi.gate import Gate, reset_gate_state
+
+    gate = Gate(
+        env="LORRAX_TEST_QUIET_OFF", target="unused", platforms=("CUDA",),
+        modes=("off",), default="off", off_label="reference path",
+        off_policy="fallback", off_announce_msg="forensic OFF receipt")
+    monkeypatch.delenv(gate.env, raising=False)
+    reset_gate_state()
+    try:
+        assert gate.enforce(object(), announce=False) is None
+        assert capsys.readouterr().out == ""
+        # The quiet resolution consumed its key; first use cannot leak it.
+        assert gate.enforce(object(), announce=True) is None
+        assert capsys.readouterr().out == ""
+    finally:
+        reset_gate_state()
+
+
 @pytest.mark.parametrize("relative", [
     "centroid/kmeans_cli.py",
     "psp/get_dipole_mtxels.py",

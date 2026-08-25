@@ -139,9 +139,12 @@ debug rendering, captured **2026-08-06 on Perlmutter, job 56393848** from
 under jax 0.5.3.dev20260806`. This is the line that tells you which JAX you
 are on (§2) — and note that the container restamps its display string to the
 *run* date, so `0.5.3.dev20260806` means "a 0.5.3-line build, looked at on
-2026-08-06", not a build from that day. **Today's image prints
-`0.7.0.dev20260806`: same date suffix, different generation.** That is why
-the string is never the evidence and `__version_info__` is.
+2026-08-06", not a build from that day. The intermediate 2026-08-06 image
+printed `0.7.0.dev20260806`; neither old image is launchable by current
+LORRAX. Production now requires JAX and JAXLIB 0.9.x, and the Perlmutter
+`lorrax_A` lane resolves both to 0.9.1. The displayed string is still not the
+authority: startup checks the parsed package generations and the private API
+shapes the code actually uses.
 
 It is also the line that explains the warning printed immediately *after* the
 block on the captured run:

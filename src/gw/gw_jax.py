@@ -45,7 +45,7 @@ from runtime import (
 #:
 #: Idempotent, so the ``python -m gw.gw_jax`` -> ``gw_init`` -> ``gw.gw_jax``
 #: re-import path gets the same stack rather than a second mesh.
-RUNTIME = initialize_communicator_stack()
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import argparse
 import gc
@@ -94,6 +94,7 @@ from .head_correction import (
 )
 from .wavefunction_bundle import BandSlices
 from .production_report import GWProductionReport
+from runtime.production_stream import ProductionStdout
 from .gw_output import (
 	GWResults,
 	print_banner,
@@ -230,6 +231,11 @@ def main(argv=None):
 	report = GWProductionReport(
 		config.paths.report_file, runtime=RUNTIME,
 		debug=debug_print_enabled(), stdout=rank0_print)
+	production_stdout = ProductionStdout(
+		debug=debug_print_enabled(), rank=RUNTIME.process_index)
+	production_stdout.install()
+	report.stdout = (rank0_print if debug_print_enabled()
+	                 else production_stdout.emit)
 	print0 = report.legacy_print
 	report.begin(input_file=args.input, config=config)
 	report.architecture()
@@ -1072,6 +1078,7 @@ def main(argv=None):
 	report.files(_file_rows)
 	report.timings(timing.records(), wall=_wall)
 	report.finish()
+	production_stdout.close()
 
 	return 0
 

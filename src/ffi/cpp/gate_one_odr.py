@@ -16,12 +16,13 @@ type has a DIFFERENT LAYOUT in the two builds.
 
 HOW TO RUN IT (Perlmutter; needs a GPU node and BOTH pins):
 
-    LX_BASE_MODULE=lorrax_J070 LORRAX_CHECKOUT=$PWD PYTHONPATH=$PWD/src \
+    LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD PYTHONPATH=$PWD/src \
     LORRAX_FFI_SO=<device .so> LORRAX_FFI_HOST_SO=<host .so> \
     lx run -G 1 -n 1 env JAX_PLATFORMS=cuda,cpu JAX_ENABLE_X64=1 \
         LORRAX_FFI_SO=<device .so> LORRAX_FFI_HOST_SO=<host .so> \
         PROBE_DIR=<scratch dir> \
-        python3 -u src/ffi/cpp/gate_one_odr.py
+        bash -c 'tools/require_jax09.py && \
+                 python3 -u src/ffi/cpp/gate_one_odr.py'
 
 `JAX_PLATFORMS=cuda,cpu` is the whole setup: the process IS CUDA-capable
 (`jax.default_backend() == 'gpu'`), which is what `_process_can_use_cuda()`

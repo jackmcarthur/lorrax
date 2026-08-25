@@ -316,6 +316,17 @@ def _say(msg: str) -> None:
     print(f"  [compile-cache] {msg}", flush=True)
 
 
+def _debug_say(msg: str) -> None:
+    """Healthy cache telemetry follows the driver's one debug switch."""
+    try:
+        from runtime import debug_print_enabled
+        enabled = debug_print_enabled()
+    except Exception:                                      # noqa: BLE001
+        enabled = False
+    if enabled:
+        _say(msg)
+
+
 # ---------------------------------------------------------------------------
 # jax._src surface this file patches
 # ---------------------------------------------------------------------------
@@ -975,8 +986,9 @@ def _install_agreement_patch() -> None:
     _orig_in_cache = _cc.is_executable_in_cache
 
     # ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
-    # executable_devices)`` on both supported jaxes (0.7.0 container, 0.9.1
-    # wheel — MEASURED).  The arity PROBE and its announcement, which existed
+    # executable_devices)`` on the supported 0.9.1 wheel (and was the same on
+    # the historical 0.7.0 container — MEASURED).  The arity PROBE and its
+    # announcement, which existed
     # to report jax 0.5.3's 3-parameter form, are gone; ``runtime.jax_support``
     # asserts the 4 at startup.
     #
@@ -1111,8 +1123,9 @@ def _install_atomic_put_patch() -> None:
 
 
 #: The ``jax._src.compiler`` entry point a real XLA compile goes through.
-#: Both supported jaxes route compiles through ``backend_compile_and_load``
-#: (MEASURED: present on the 0.7.0 container and the 0.9.1 wheel), and it
+#: The supported 0.9 series routes compiles through
+#: ``backend_compile_and_load`` (MEASURED on the 0.9.1 wheel; also present on
+#: the historical 0.7.0 container), and it
 #: itself calls ``backend_compile`` — so exactly ONE of them may be patched or
 #: every compile is counted twice.
 #:
@@ -1255,11 +1268,16 @@ def _report_impl() -> None:
     # directory, so a disagreement means the cache is inert in a way no
     # other number on this line shows.
     where = "" if (not bound or bound == s.dir) else f" BOUND-ELSEWHERE={bound}"
-    _say(f"rank {s.proc_idx}/{s.n_proc} summary: xla_compiles={s.compiles} "
-         f"({s.compile_secs:.2f}s)  cache_probes={s.probes} hits={s.hits} "
-         f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
-         f"agreed={s.n_agreed}/{s.n_seen} prefetch={s.prefetch_secs:.2f}s  "
-         f"enabled={s.enabled}{where}")
+    msg = (f"rank {s.proc_idx}/{s.n_proc} summary: "
+           f"xla_compiles={s.compiles} ({s.compile_secs:.2f}s)  "
+           f"cache_probes={s.probes} hits={s.hits} "
+           f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
+           f"agreed={s.n_agreed}/{s.n_seen} "
+           f"prefetch={s.prefetch_secs:.2f}s  enabled={s.enabled}{where}")
+    # A healthy per-rank performance receipt is forensic detail.  Binding to
+    # a different directory is a broken agreement contract and remains loud
+    # in production.
+    (_say if where else _debug_say)(msg)
 
 
 def compile_cache_stats() -> dict:
@@ -1391,8 +1409,9 @@ def ensure_jax_compile_cache() -> None:
     if default_note is not None and proc_idx == 0:
         # Announce the resolved default exactly once — a location the user
         # never chose must be visible in the log (quality-pattern #8).
-        _say(f"cache dir (default): {cache_dir} ({default_note}; override "
-             f"with ISDF_JAX_CACHE_DIR, \"\" opts out).")
+        _debug_say(
+            f"cache dir (default): {cache_dir} ({default_note}; override "
+            f"with ISDF_JAX_CACHE_DIR, \"\" opts out).")
 
     # ---- back-compat escape hatch: the scorecard-AG refusal --------------
     if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS", "1"):
@@ -1441,7 +1460,7 @@ def ensure_jax_compile_cache() -> None:
     # `jax._src.compilation_cache._cache` is built ONCE, lazily, at the first
     # compile that consults the cache, from `jax_compilation_cache_dir` AS IT
     # READ THEN — and `reset_cache()` is the only way to rebind it; a later
-    # `config.update` does not.  The `lorrax_J070` modulefile exports
+    # `config.update` does not.  The retired `lorrax_J070` modulefile exported
     # `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` and passes it into the
     # Shifter container (`0.1.0.lua:312` and the `--env=` at `:252`), JAX picks
     # that up at import, and the mesh warm-up in
@@ -1482,11 +1501,12 @@ def ensure_jax_compile_cache() -> None:
                      f"P>1.  Unset JAX_COMPILATION_CACHE_DIR to avoid it.")
         else:
             if proc_idx == 0:
-                _say(f"rebound JAX's compile cache from {_prev_bound} "
-                     f"(inherited, usually JAX_COMPILATION_CACHE_DIR from the "
-                     f"module) to {cache_path}.  The inherited directory is "
-                     f"not per-world-size, so the P>1 agreement cannot be "
-                     f"taken over it.")
+                _debug_say(
+                    f"rebound JAX's compile cache from {_prev_bound} "
+                    f"(inherited, usually JAX_COMPILATION_CACHE_DIR from the "
+                    f"module) to {cache_path}.  The inherited directory is "
+                    f"not per-world-size, so the P>1 agreement cannot be "
+                    f"taken over it.")
 
     if n_proc == 1:
         _STATE.enabled = True
@@ -1519,8 +1539,8 @@ def ensure_jax_compile_cache() -> None:
     # ``XlaRuntimeError: INVALID_ARGUMENT: Device assignment ... does not have
     # any local devices`` and ``_fatal`` aborted the job, rc 70).
     #
-    # Both supported jaxes HAVE the parameter (0.7.0 container measured at 4
-    # parameters with ``executable_devices`` named, same as the 0.9.1 wheel),
+    # The supported 0.9.1 wheel HAS the parameter (the historical 0.7.0
+    # container also measured 4 parameters with ``executable_devices`` named),
     # so the branch was unreachable and is deleted rather than left as a
     # permanent compatibility layer for a version being abandoned.  The
     # condition itself is not unguarded: ``runtime.jax_support`` requires
@@ -1603,10 +1623,11 @@ def ensure_jax_compile_cache() -> None:
 
     dropped = n_seen - len(agreed)
     if proc_idx == 0:
-        _say(f"ARMED at {n_proc} processes, shared dir {cache_path} "
-             f"({n_seen} entries advertised, {len(agreed)} agreed by all "
-             f"ranks; agree+prefetch {time.monotonic() - t0:.2f}s of which "
-             f"prefetch {_STATE.prefetch_secs:.2f}s).")
+        _debug_say(
+            f"ARMED at {n_proc} processes, shared dir {cache_path} "
+            f"({n_seen} entries advertised, {len(agreed)} agreed by all "
+            f"ranks; agree+prefetch {time.monotonic() - t0:.2f}s of which "
+            f"prefetch {_STATE.prefetch_secs:.2f}s).")
         if dropped:
             _say(f"*** {dropped} entr{'y' if dropped == 1 else 'ies'} DROPPED "
                  f"— at least one rank could not see them, so NO rank will "
@@ -1614,5 +1635,6 @@ def ensure_jax_compile_cache() -> None:
                  f"is the agreement doing its job (a divergent hit/miss "
                  f"pattern is what deadlocks XLA:GPU autotuning). ***")
         if n_seen == 0:
-            _say("cold cache: nothing to reuse this run; process 0 will "
-                 "populate it for the next one.")
+            _debug_say(
+                "cold cache: nothing to reuse this run; process 0 will "
+                "populate it for the next one.")

@@ -33,6 +33,7 @@ RETIRED_PRINT_ENVS = (
     "LORRAX_RESTART_WRITE_LOG",
     "LORRAX_SCALAPACK_EIGH_LOG",
     "LORRAX_SCALAPACK_PROVIDER_LOG",
+    "LORRAX_SELECT_GPU_QUIET",
     "LORRAX_TIMING_TRACE",
     "LORRAX_TIMING_TRACE_DEPTH",
     "LORRAX_ZETA_RANK_LOG",
@@ -41,7 +42,7 @@ RETIRED_PRINT_ENVS = (
 
 def _active_source_text() -> str:
     roots = (ROOT / "src", ROOT / "services")
-    suffixes = {".py", ".cc", ".h"}
+    suffixes = {".py", ".cc", ".h", ".sh"}
     return "\n".join(
         path.read_text(errors="replace")
         for root in roots
@@ -78,6 +79,8 @@ def test_native_and_python_layers_share_the_exact_spelling():
               / "mkl_thread_pin.h").read_text()
     phdf5 = "\n".join((ROOT / "src" / "ffi" / "cpp" / "phdf5" / p).read_text()
                        for p in ("context.cc", "read_ffi.cc", "write_ffi.cc"))
+    selector = (ROOT / "src" / "ffi" / "cpp" / "select_gpu.sh").read_text()
     assert 'DEBUG_PRINT_ENV = "LORRAX_DEBUG_PRINT"' in runtime
     assert 'std::getenv("LORRAX_DEBUG_PRINT")' in native
     assert 'env_flag("LORRAX_DEBUG_PRINT", false)' in phdf5
+    assert 'LORRAX_DEBUG_PRINT' in selector

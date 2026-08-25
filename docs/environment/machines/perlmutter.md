@@ -75,9 +75,11 @@ actually inherit.
 > directory therefore runs old code without saying so beyond that one line.
 >
 > `LORRAX_CHECKOUT=/path/to/tree` is the fix, and it is the only one that works
-> from a data directory; `LX_BASE_MODULE=lorrax_B|_C|_J070|…` swaps the base
-> module (and with it the container image), and `LORRAX_DEFAULT_BASE` sets the
-> default. Two other things stay visible: `lx doctor` prints `base module` and
+> from a data directory. `LX_BASE_MODULE=lorrax_A` selects the deployed
+> JAX/JAXLIB-0.9.1 CUDA-13 environment independently of the checkout, and
+> `LORRAX_DEFAULT_BASE` sets the default. Retired `J070`/pre-0.9 base modules
+> are refusal test fixtures, not runnable alternatives. Two other things stay
+> visible: `lx doctor` prints `base module` and
 > `LORRAX_ROOT` before you run anything, and every run's
 > [startup block](../overview.md#startup-block) prints the path of the `.so` it
 > loaded. `lx test` is the exception that has always used `cwd`: it runs pytest

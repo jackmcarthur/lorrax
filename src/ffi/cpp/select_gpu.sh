@@ -49,10 +49,11 @@
 # step distinguishes those legs; only the scheduler that placed them knows,
 # and this is how it says so.
 #
-# Announces its choice on stderr (one line per rank; GPU steps here are at
-# most 4 ranks/node).  Silence with LORRAX_SELECT_GPU_QUIET=1.  Placement
-# being invisible in the logs is a large part of why the device-0 stacking
-# above ran for as long as it did.
+# Production placement is silent: the driver's processor block reports the
+# device count once.  LORRAX_DEBUG_PRINT=1 exposes the per-rank binding line,
+# using the same and only debug switch as the driver it launches.  Refusals
+# remain unconditional because a short explicit placement would put two ranks
+# on one device.
 set -u
 
 _select_gpu_nth() {
@@ -109,11 +110,13 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${_select_gpu_device}"
 
-if [[ "${LORRAX_SELECT_GPU_QUIET:-0}" != "1" ]]; then
-    echo "[select_gpu] $(hostname) local rank ${_select_gpu_localid} ->" \
-         "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \
-         "(from ${_select_gpu_from})" >&2
-fi
+case "${LORRAX_DEBUG_PRINT:-0}" in
+    1|on|ON|true|TRUE|yes|YES)
+        echo "[select_gpu] $(hostname) local rank ${_select_gpu_localid} ->" \
+             "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \
+             "(from ${_select_gpu_from})" >&2
+        ;;
+esac
 
 unset -f _select_gpu_nth
 unset -v _select_gpu_localid _select_gpu_device _select_gpu_from \

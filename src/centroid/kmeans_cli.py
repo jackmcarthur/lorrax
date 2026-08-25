@@ -27,7 +27,7 @@ from runtime import (
     initialize_communicator_stack,
     rank0_print,
 )
-RUNTIME = initialize_communicator_stack()
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 # Historical progress messages are forensic detail.  The one driver-wide
 # switch owns all of them; the concise production report uses rank0_print.
@@ -47,6 +47,7 @@ _services.ensure_on_path()
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import process_rank
+from runtime.production_stream import ProductionStdout
 
 from . import distribution as dist
 from .charge_density import get_charge_density
@@ -435,6 +436,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
 def main():
     args = build_parser().parse_args()
+    production_stdout = ProductionStdout(
+        debug=debug_print_enabled(), rank=RUNTIME.process_index)
+    production_stdout.install()
 
     try:
         from common.jax_compile_cache import ensure_jax_compile_cache
@@ -722,12 +726,16 @@ def main():
             runtime=RUNTIME)
         with open(report_file, "w", encoding="utf-8") as stream:
             stream.write(report_text)
-        rank0_print(report_text, end="")
+        if debug_print_enabled():
+            rank0_print(report_text, end="")
+        else:
+            production_stdout.emit(report_text, end="")
 
     if args.plot:
         from .kmeans_plot import plot_density_and_centroids, interpolate_density
         rho_plot = interpolate_density(charge_density, (args.plot_zoom,) * 3)
         plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
+    production_stdout.close()
     return 0
 
 

@@ -51,7 +51,7 @@ def _select(**env):
     PROCESS sees — the thing the script exists to set — rather than the
     script's own idea of it.
     """
-    base = {"LORRAX_SELECT_GPU_QUIET": "1", "PATH": os.environ.get("PATH", "")}
+    base = {"PATH": os.environ.get("PATH", "")}
     base.update({k: str(v) for k, v in env.items()})
     proc = subprocess.run(
         ["bash", SCRIPT, "bash", "-c", 'printf "%s" "$CUDA_VISIBLE_DEVICES"'],
@@ -178,19 +178,26 @@ def test_it_execs_its_arguments_and_passes_them_through():
     proc = subprocess.run(
         ["bash", SCRIPT, "bash", "-c", 'printf "%s|%s" "$0" "$1"',
          "arg-zero", "arg-one"],
-        env={"LORRAX_SELECT_GPU_QUIET": "1", "SLURM_LOCALID": "0",
+        env={"SLURM_LOCALID": "0",
              "PATH": os.environ.get("PATH", "")},
         capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0
     assert proc.stdout == "arg-zero|arg-one"
 
 
-def test_it_announces_its_choice_unless_silenced():
-    """Placement being invisible in the logs is a large part of why the
-    device-0 stacking ran as long as it did."""
+def test_it_is_silent_in_production_and_debug_announces_its_choice():
     proc = subprocess.run(
         ["bash", SCRIPT, "true"],
         env={"SLURM_LOCALID": "1", "CUDA_VISIBLE_DEVICES": "2,3",
+             "PATH": os.environ.get("PATH", "")},
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0
+    assert proc.stderr == ""
+
+    proc = subprocess.run(
+        ["bash", SCRIPT, "true"],
+        env={"SLURM_LOCALID": "1", "CUDA_VISIBLE_DEVICES": "2,3",
+             "LORRAX_DEBUG_PRINT": "1",
              "PATH": os.environ.get("PATH", "")},
         capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0

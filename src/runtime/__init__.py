@@ -1621,11 +1621,11 @@ def finalize_process(rc: int = 0):
                      f"({type(exc).__name__}: {exc}); continuing")
     pjrt_notices = _stop_pjrt_log_filter()
     if pjrt_notices:
-        _print_rank0(
+        debug_print(
             f"[runtime] filtered {pjrt_notices} repetition(s) on rank 0 of "
             "the upstream-removed PjRt-IFRT cache-deserialization notice; "
             "all other stderr was forwarded unchanged.")
-    _print_rank0(
+    debug_print(
         "[runtime] process finalized explicitly (effects barrier, "
         "distributed shutdown, atexit hooks) and ending with os._exit: the "
         "interpreter-teardown destruction of the XLA:CPU client is skipped "

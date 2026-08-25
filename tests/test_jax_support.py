@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from pathlib import Path
 import sys
 import types
 
@@ -228,6 +229,28 @@ def test_the_declared_window_matches_pyproject():
         assert spec == f">={want_lo},<{want_hi}", (
             "pyproject.toml pins jax %r but runtime/jax_support.py declares "
             "the window [%s, %s)" % (spec, want_lo, want_hi))
+
+
+def test_active_launch_recipes_never_select_the_retired_j070_lane():
+    """Old evidence may name 0.7; runnable instructions may not select it."""
+    root = Path(__file__).resolve().parents[1]
+    active = (
+        "config/perlmutter/install.sh",
+        "config/perlmutter/site_config.sh",
+        "src/ffi/cpp/build_host.sh",
+        "src/ffi/cpp/run_shifter.sh",
+        "src/ffi/cpp/gate_one_odr.py",
+        "docs/installation/index.md",
+        "docs/environment/machines/perlmutter.md",
+        "src/ffi/PORTING.md",
+    )
+    offenders = [
+        relative for relative in active
+        if "LX_BASE_MODULE=lorrax_J070" in (root / relative).read_text()
+    ]
+    assert offenders == [], (
+        "active launch guidance still selects the retired JAX-0.7 lane: "
+        + ", ".join(offenders))
 
 
 def test_the_startup_path_calls_the_gate():

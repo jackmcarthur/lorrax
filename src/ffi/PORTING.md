@@ -374,9 +374,9 @@ was skipped.
 | Requirement             | Minimum | Notes |
 |-------------------------|---------|-------|
 | NVIDIA GPU              | CC ≥ 7.0 | A100 / H100 tested. |
-| CUDA toolkit            | 12.0    | 12.9 is what we link against. |
+| CUDA toolkit            | 13.0    | 13.2 is the current Perlmutter production stack; the FFI artifact must match the JAX/JAXLIB wheel's CUDA major. |
 | NCCL                    | 2.18    | Ships with CUDA 12.4+; JAX bundles it. |
-| JAX with `jax.ffi`      | 0.7     | Must match CUDA major. `ghcr.io/nvidia/jax:jax-2025-07-21` (jax 0.7.0 / CUDA 12.9) is our container — the LAST CUDA-12 tag in that family. `XLA_FFI_API_MAJOR/MINOR` is 0/1 on 0.5.3 and 0.7.0 alike; the `xla/ffi/api` headers differ only by additions. |
+| JAX and JAXLIB with `jax.ffi` | 0.9.0 | Both packages must be `<0.10.0` and from the same generation; `pyproject.toml`, `tools/require_jax09.py`, and `runtime.jax_support` independently refuse every other series. Perlmutter production is 0.9.1 / CUDA 13.2. |
 | NVHPC SDK (cuSOLVERMp)  | 22.7    | 25.5 validated. Only the `libcusolverMp` + `libcal` subset is needed. |
 | Parallel HDF5           | 1.12    | Either Cray HDF5 (MPICH ABI) or a MPI-linked conda-forge build. |
 | SLATE (+ blaspp/lapackpp)| any     | Built from source against the target MPI + libsci/BLAS. |
