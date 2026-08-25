@@ -844,7 +844,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     k's bands sharded over every process (``common.mtxel_sweep``).
     ``mesh`` is the collectives' device mesh — pass the run's own (the
     driver does) or leave it None and one is derived, 1×1 on a single
-    device.  P=1 is bit-for-bit the serial result.
+    device.  With no band-memory bound, P=1 retains the serial operation
+    order bit-for-bit.  A tighter ``band_chunk_size`` only reassociates the
+    exact occupied-band sum; it does not change its terms.
 
     Needs no pseudopotentials: ρ comes from ψ, V_H from the Poisson
     solve, and the matrix element from the same normalisation chain
