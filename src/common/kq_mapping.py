@@ -21,7 +21,7 @@ API
 ``umklapp_G_wrap(kvec_full, kvec_kmq_full, qvec) -> (nk_full, 3) int32``
     Integer G-shift  ``G_wrap = round((k − q) − k_kmq)``  per source k.
     Both ``kvec_full`` and ``qvec`` are in crystal coords; ``qvec`` is the
-    *signed* representative in [−½, ½)³.
+    BGW *signed* representative in (−½, ½]³ (positive half-grid tie).
 
 ``umklapp_phase_box_batched(G_wrap, fft_grid, sign=+1) -> (nk, nx, ny, nz)``
     Cell-periodic phase  ``e^{i sign 2π G_wrap · r}``  on the FFT box,
@@ -61,7 +61,7 @@ def umklapp_G_wrap(
     All inputs in crystal coords.  ``kvec_full[ik]`` is the source-k for
     the ik-th full-BZ point; ``kvec_kmq_full[ik]`` is the canonical
     representative of ``k − q`` (= ``kvec_full[kminq_idx[ik]]``); ``qvec``
-    is the signed representative in [−½, ½)³.  Output dtype is i32.
+    is the BGW signed representative in (−½, ½]³.  Output dtype is i32.
 
     Used inside JIT'd stack builders; safe under ``vmap`` over batched q.
     """
