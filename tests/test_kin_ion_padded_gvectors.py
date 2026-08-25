@@ -69,6 +69,54 @@ from psp.dft_operators import (
 from psp.get_DFT_mtxels import compute_kinetic_k, compute_local_V_k
 
 
+def _write_kin_ion_provenance_twin(path, *, bispinor):
+    import h5py
+
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
+        if bispinor is not None:
+            ds.attrs["bispinor"] = bool(bispinor)
+
+
+def test_kin_ion_provenance_refuses_wrong_or_missing_bispinor_before_read(
+        tmp_path, monkeypatch):
+    """Same-shaped two- and four-spinor mean fields are not interchangeable."""
+    import h5py
+    from file_io import kin_ion as owner
+
+    true_path = tmp_path / "kin_ion_true.h5"
+    false_path = tmp_path / "kin_ion_false.h5"
+    legacy_path = tmp_path / "kin_ion_unstamped.h5"
+    _write_kin_ion_provenance_twin(true_path, bispinor=True)
+    _write_kin_ion_provenance_twin(false_path, bispinor=False)
+    _write_kin_ion_provenance_twin(legacy_path, bispinor=None)
+
+    reads = []
+    original_getitem = h5py.Dataset.__getitem__
+
+    def record_payload_read(dataset, key):
+        if dataset.name == "/kin_ion":
+            reads.append(key)
+        return original_getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", record_payload_read)
+    assert owner.validate_kin_ion_against_run(
+        true_path, expected_bispinor=True,
+        print_fn=lambda *_args: None)["bispinor"]
+
+    import pytest
+    with pytest.raises(ValueError, match="bispinor=False.*bispinor=True"):
+        owner.validate_kin_ion_against_run(
+            false_path, expected_bispinor=True,
+            print_fn=lambda *_args: None)
+    with pytest.raises(ValueError, match="no bispinor provenance stamp"):
+        owner.validate_kin_ion_against_run(
+            legacy_path, expected_bispinor=True,
+            print_fn=lambda *_args: None)
+    assert reads == [], "provenance gate read a kin_ion matrix payload"
+
+
 # D10's gate.  Bit-exactness is explicitly NOT required: appending exact
 # zeros cannot change a sum in IEEE-754, but a shape change does move
 # XLA's choice of reduction BLOCKING, so the two routes may associate the
