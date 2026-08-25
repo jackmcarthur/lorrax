@@ -555,11 +555,6 @@ def compute_ppm_sigma_pipeline(
             print_fn=print_fn,
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
-            # GN's two-point imaginary-axis fit can produce a tiny population
-            # of poorly conditioned extreme poles whose Ω span dominates the
-            # minimax plan.  Re-anchor the exact 0.2% tails in the fit owner.
-            # HL is a different real-axis model and is deliberately unchanged.
-            coarsen_extreme_tails=not is_hl,
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)

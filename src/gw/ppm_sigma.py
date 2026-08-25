@@ -60,7 +60,6 @@ from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
-    GN_PPM_EXTREME_TAIL_DIVISOR,
     MinimaxNodes,
     fit_gn_ppm_from_wc_pair,
 )
@@ -115,15 +114,6 @@ class PPMBuildResult:
     valid_mask_q: jax.Array   # (nq, μ, μ)
     unfulfilled_fraction: float
     n_nodes_static: int
-    # Successfully fitted GN lanes whose extreme Ω was re-anchored before
-    # dynamic Sigma.  Trailing/defaulted for hand-built fixtures and HL.
-    n_tail_low: int = 0
-    n_tail_high: int = 0
-    omega_min_raw: float = float("nan")
-    omega_max_raw: float = float("nan")
-    omega_min_after: float = float("nan")
-    omega_max_after: float = float("nan")
-    tail_anchor_omega: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -377,7 +367,6 @@ def fit_ppm(
     print_fn=None,
     model_label: str = "PPM",
     n_mu_logical: int,
-    coarsen_extreme_tails: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -392,10 +381,6 @@ def fit_ppm(
     count.  The fitted tensors keep the padded extent, but pad modes are
     born DEAD (Ω = B = 0, valid = False) and the ``unfulfilled``
     fraction counts logical modes only — see ``fit_gn_ppm_from_wc_pair``.
-
-    ``coarsen_extreme_tails=True`` is the shipping GN-only policy.  It is
-    explicit here because the same algebra also fits HL poles, whose real-axis
-    two-point model must not silently inherit a GN conditioning policy.
     """
     import time as _t
     z = complex(probe_omega)
@@ -403,17 +388,16 @@ def fit_ppm(
 
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    fit = fit_gn_ppm_from_wc_pair(
+    (omega_qmunu, b_qmunu, valid_qmunu, unfulfilled,
+     n_valid, omega_min, omega_max,
+     pair_rel_min) = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-         n_mu_logical=int(n_mu_logical),
-         coarsen_extreme_tails=bool(coarsen_extreme_tails))
+         n_mu_logical=int(n_mu_logical))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    Omega = jax.lax.with_sharding_constraint(
-        jnp.asarray(fit.omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
-    valid_mask = jax.lax.with_sharding_constraint(
-        jnp.asarray(fit.valid_qmunu), q_shard)
+    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
@@ -445,33 +429,12 @@ def fit_ppm(
         kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
         print_fn(
             f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
-            f"unfulfilled={100.0 * fit.unfulfilled_fraction:.2f}%")
+            f"unfulfilled={100.0 * unfulfilled:.2f}%")
         print_fn(
-            f"  {model_label} pole census: valid={fit.n_valid}, "
-            f"Omega=[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] Ry, "
+            f"  {model_label} pole census: valid={n_valid}, "
+            f"Omega=[{omega_min:.8e}, {omega_max:.8e}] Ry, "
             f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
-            f"{fit.pair_relative_separation_min:.8e}")
-        if coarsen_extreme_tails:
-            budget = fit.n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
-            print_fn(
-                "  GN fitted-pole tail policy: "
-                f"low={fit.n_tail_low}/{budget}, "
-                f"high={fit.n_tail_high}/{budget} "
-                "(each <=0.2%; equal-frequency boundary groups are not split)"
-            )
-            print_fn(
-                "  GN dynamic Omega range: "
-                f"[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] -> "
-                f"[{fit.omega_min_after:.8e}, {fit.omega_max_after:.8e}] Ry; "
-                f"tail anchor={fit.tail_anchor_omega:.8e} Ry"
-            )
-            if fit.n_tail_low + fit.n_tail_high:
-                print_fn(
-                    "  GN tail residue ruling: B'=-Wc(0)*Omega'/2 preserves "
-                    "the exact static matrix element.  Its 1/z^2 moment is "
-                    "intentionally not preserved: preserving both would "
-                    "require Omega'^2=Omega^2."
-                )
+            f"{pair_rel_min:.8e}")
 
     return PPMBuildResult(
         omega_p=probe_mag,
@@ -479,15 +442,8 @@ def fit_ppm(
         B_q=B,
         Omega_q=Omega,
         valid_mask_q=valid_mask,
-        unfulfilled_fraction=fit.unfulfilled_fraction,
+        unfulfilled_fraction=unfulfilled,
         n_nodes_static=n_nodes_static,
-        n_tail_low=fit.n_tail_low,
-        n_tail_high=fit.n_tail_high,
-        omega_min_raw=fit.omega_min_raw,
-        omega_max_raw=fit.omega_max_raw,
-        omega_min_after=fit.omega_min_after,
-        omega_max_after=fit.omega_max_after,
-        tail_anchor_omega=fit.tail_anchor_omega,
     )
 
 
