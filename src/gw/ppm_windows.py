@@ -878,6 +878,10 @@ def _sign_definite_support(
     if subtract_omega:
         raw_min = float(E_min) + float(B_min) - omega_hi
         raw_max = float(E_max) + float(B_max) - omega_lo
+        if raw_min <= 0.0 or raw_max < raw_min:
+            raise AssertionError(
+                "GATE sign_definite_support: E + Omega - omega is not "
+                f"strictly positive on [{raw_min:.16g}, {raw_max:.16g}]")
     else:
         raw_min = float(E_min) + float(B_min) + omega_lo
         raw_max = float(E_max) + float(B_max) + omega_hi

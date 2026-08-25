@@ -368,6 +368,16 @@ def test_hgl_negative_cell_tail_panes_preserve_exact_partition(monkeypatch):
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
 
 
+def test_subtractive_sign_definite_support_refuses_a_crossing_interval():
+    """A pane mislabeled negative must not be clipped into a Laplace rule."""
+    from gw.ppm_windows import _sign_definite_support
+
+    with pytest.raises(AssertionError, match="sign_definite_support"):
+        _sign_definite_support(
+            0.1, 0.2, 0.1, 0.2, 1.0,
+            omega_min=0.9, subtract_omega=True)
+
+
 def test_memory_tile_sink_splices_disjoint_omega_clusters():
     """Cluster rows assemble on the existing bracket-then-omega layout."""
     from gw.ppm_accumulators import _MemoryTileSink
