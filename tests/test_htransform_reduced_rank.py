@@ -1,10 +1,4 @@
-"""Opt-in reduced cross-k Galerkin model-order contract.
-
-The historical htransform carries the full numerical rank and remains the
-default.  These cells pin the distinct approximation requested by the input
-key: rank proportional to bands at one k, followed by a per-k polar factor so
-``build_fH_R`` keeps its row-isometry invariant.
-"""
+"""Published whole-state randomized-QRCP htransform contract."""
 from __future__ import annotations
 
 import inspect
@@ -19,8 +13,8 @@ def test_rank_multiplier_vocabulary_and_default():
     from isdf.galerkin import validate_rank_multiplier
     from gw.gw_config import _DEFAULTS
 
-    assert _DEFAULTS["htransform_rank_multiplier"] == 0.0
-    assert validate_rank_multiplier(0, name="htransform_rank_multiplier") == 0.0
+    assert _DEFAULTS["htransform_rank_multiplier"] == 20.0
+    assert validate_rank_multiplier(0, name="htransform_rank_multiplier") == 20.0
     assert validate_rank_multiplier(
         "10", name="htransform_rank_multiplier") == 10.0
     for bad in (-1, 0.5, float("nan"), "not-a-number"):
@@ -38,30 +32,56 @@ def test_downfold_centroid_subset_is_ordered_strict_and_checked():
             validate_centroid_subset_idx(np.asarray(bad), 10)
 
 
-def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
+def test_newton_inverse_reports_the_archived_residual_contract():
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from isdf.galerkin import _lowdin_orthonormalize_band_rows
+    from bandstructure.htransform import (
+        NEWTON_RESIDUAL_MAX,
+        fun,
+        newton_inv,
+        require_newton_converged,
+    )
 
-    rng = np.random.default_rng(20260820)
-    nk, nb, rank = 5, 6, 40
-    c = (rng.standard_normal((nk, nb, rank))
-         + 1j * rng.standard_normal((nk, nb, rank)))
-    # Plant a well-conditioned but visibly non-isometric shared-span block.
-    c[:, 0] *= 0.35
-    gram_before = np.einsum("kna,kma->knm", c, np.conj(c), optimize=True)
-    before = float(np.max(np.abs(gram_before - np.eye(nb)[None])))
-    assert before > 1.0, "RED TWIN DID NOT GO RED: input was accidentally isometric"
+    a, n, shift = 0.8, 3.0, 1.25
+    expected = jnp.asarray([-1.6, -0.4, 0.2, 1.0], dtype=jnp.float64)
+    recovered, residual = newton_inv(
+        a, n, shift, fun(a, n, shift, expected))
+    assert np.max(np.abs(np.asarray(recovered) - np.asarray(expected))) < 1e-11
+    assert float(residual) <= NEWTON_RESIDUAL_MAX
+    require_newton_converged(float(residual), where="unit receipt")
+    with pytest.raises(ValueError, match="did not converge"):
+        require_newton_converged(
+            2.0 * NEWTON_RESIDUAL_MAX, where="red receipt")
 
-    out, lmin, lmax, before_dev, after_dev, move = (
-        _lowdin_orthonormalize_band_rows(jnp.asarray(c)))
-    out = np.asarray(out)
-    gram_after = np.einsum("kna,kma->knm", out, np.conj(out), optimize=True)
-    assert np.max(np.abs(gram_after - np.eye(nb)[None])) < 2.0e-13
-    assert float(after_dev) < 2.0e-13
-    assert float(before_dev) == pytest.approx(before, rel=2.0e-13)
-    assert 0.0 < float(lmin) <= float(lmax)
-    assert float(move) > 0.01
+
+def test_standalone_htransform_refuses_an_occupied_band_cut(monkeypatch):
+    pytest.importorskip("jax")
+    from types import SimpleNamespace
+    import file_io.centroids
+    from bandstructure import htransform
+
+    monkeypatch.setattr(
+        htransform, "setup_wfn_and_sym",
+        lambda *args, **kwargs: (SimpleNamespace(nelec=12), object()))
+
+    def _centroids_were_reached(*args, **kwargs):
+        raise RuntimeError("centroid stage reached")
+
+    monkeypatch.setattr(
+        file_io.centroids, "load_centroids",
+        _centroids_were_reached)
+    params = {"wfn_file": "unused.h5", "nval": 11, "ncond": 2, "nband": 13}
+    with pytest.raises(ValueError, match="requires every occupied band"):
+        htransform.initialize_wfns(
+            "unused.in", params, lambda *args: None, mesh_xy=object(),
+            require_all_occupied=True)
+
+    # Internal BSE windows deliberately keep their explicit partial-window
+    # contract, so the same setup reaches the next stage when the standalone
+    # gate is absent.
+    with pytest.raises(RuntimeError, match="centroid stage reached"):
+        htransform.initialize_wfns(
+            "unused.in", params, lambda *args: None, mesh_xy=object())
 
 
 def test_refit_consumes_the_compact_whole_state_factor():
@@ -78,31 +98,6 @@ def test_refit_consumes_the_compact_whole_state_factor():
     assert "selection_factor=L" in fit_src
 
 
-def test_exact_rank_report_excludes_left_gram_null_tail_and_counts_pad():
-    """The carried report owns the selected block plus exact-null padding."""
-    pytest.importorskip("jax")
-    from isdf import galerkin
-    from common import rank_criterion
-
-    src = inspect.getsource(galerkin.fit_galerkin_basis)
-    assert "s_host[:rank_phys], rtol" in src
-
-    # Toy of the production failure plus the closure corner: the raw left
-    # Gram has three above-rtol null-space values beyond a five-direction
-    # physical block.  A mesh-aligned carrier of eight must be reported as
-    # +3 exact-null pads, never as a -3 device-grid truncation.
-    raw_left_gram = np.asarray([1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.09, 0.08])
-    rank_phys = 5
-    carried = 8
-    assert rank_criterion.select_rank(raw_left_gram, 1.0e-8) > rank_phys
-    report = rank_criterion.rank_report(
-        raw_left_gram[:rank_phys], 1.0e-8, rank_used=carried)
-    assert report.rank_criterion == rank_phys
-    assert report.n_padded_alignment == carried - rank_phys
-    assert report.n_dropped_alignment == 0
-    assert not report.violations(), report.violations()
-
-
 def test_bse_consumers_forward_the_q_chunk_key():
     """The local-batch route is useful only if the documented width arrives."""
     from pathlib import Path
@@ -112,7 +107,12 @@ def test_bse_consumers_forward_the_q_chunk_key():
         src = (root / name).read_text()
         assert 'batch_size=int(params.get("wfn_fi_q_chunk", 0))' in src, name
         assert "centroid_subset_idx=_fit_subset" in src, name
-        assert "_output_keep = None if _fit_subset is not None" in src, name
+        assert "_fit_subset = keep" in src, name
+        assert "_output_keep = None" in src, name
+
+    refit_src = (root / "vq_interp.py").read_text()
+    assert "centroid_subset_idx=keep_idx" in refit_src
+    assert "B_at_mu = B_at_mu[:, :," not in refit_src
 
 
 def test_exciton_a_band_reaches_both_htransform_calls():

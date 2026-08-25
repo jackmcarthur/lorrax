@@ -575,10 +575,9 @@ def _interpolate_bse_data_to_grid(
     #
     # On a DOWNFOLDED bundle the two questions come apart, and the densifier
     # has to answer them through ``exciton_bands.resolve_isdf_basis``, the ONE
-    # owner of this contract.  The exact rank-0 arm fits in the parent basis
-    # and slices its output.  The explicit reduced arm applies the same
-    # ordered ``keep`` before fitting and is born at μ_S.  Without either
-    # deliberate route, the pad below is asked for
+    # owner of this contract.  The sole whole-state QRCP fit applies the
+    # ordered ``keep`` before evaluating its basis and is born at μ_S.
+    # Without that route, the pad below is asked for
     # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
     # with an index error that names neither the downfold nor the basis.
     # Same defect class as PIPELINE_HEALTH row 4, which closed this for
@@ -593,10 +592,8 @@ def _interpolate_bse_data_to_grid(
     keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
 
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
-    _rank_multiplier = ht.resolve_galerkin_rank_multiplier(
-        params.get("htransform_rank_multiplier", 0.0))
-    _fit_subset = keep if _rank_multiplier > 0.0 else None
-    _output_keep = None if _fit_subset is not None else keep
+    _fit_subset = keep
+    _output_keep = None
     (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
