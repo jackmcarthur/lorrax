@@ -1327,6 +1327,7 @@ class _ZetaFitContract:
 	zeta_vcoul_cutoff: float
 	write_ibz_only_charge: bool
 	loader_band_chunk: int
+	loader_k_chunk: int
 	provenance: str
 	reuse_charge: bool
 	meta_transverse: object = None
@@ -1483,6 +1484,18 @@ def _resolve_zeta_fit_contract(
 	loader_band_chunk = (
 		int(cfg.memory.band_chunk_size)
 		if int(cfg.memory.band_chunk_size) > 0 else 64)
+	# Reuse skips the full fit planner by design, but it still re-samples the
+	# WFN for downstream Sigma.  Resolve the same pure Stage-A geometry here so
+	# a valid zeta artifact cannot turn k streaming off by setting ``chunks`` to
+	# None.  The geometry owner and common loader both route physical band-tile
+	# rounding through runtime.padding.round_up; nothing allocates or compiles.
+	from gw.gflat_memory_model import centroid_fft_tile_geometry
+	_loader_band_request = min(
+		int(band_slices.full_range[1] - band_slices.full_range[0]),
+		int(loader_band_chunk))
+	loader_k_chunk, _ = centroid_fft_tile_geometry(
+		nk=int(meta.nk_tot), band_chunk=_loader_band_request,
+		p_band=int(mesh_xy.size))
 	return _ZetaFitContract(
 		zeta_h5_path=zeta_h5_path,
 		band_range_left=band_range_left,
@@ -1492,6 +1505,7 @@ def _resolve_zeta_fit_contract(
 		zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 		write_ibz_only_charge=write_ibz_only_charge,
 		loader_band_chunk=loader_band_chunk,
+		loader_k_chunk=loader_k_chunk,
 		provenance=provenance,
 		reuse_charge=bool(reuse_charge),
 		meta_transverse=meta_transverse,
@@ -1788,7 +1802,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		return zeta_h5_path, mem_est, _transverse_wfn_data(
 			wfn, sym, zeta_contract.meta_transverse,
 			zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
-			zeta_contract.loader_band_chunk)
+			zeta_contract.loader_band_chunk,
+			k_chunk_size=zeta_contract.loader_k_chunk)
 	# Any missing bispinor channel consumes the transverse identity already
 	# resolved by the per-channel contract.  Only the fit-specific chunk plan
 	# remains here.
@@ -2009,7 +2024,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			 else zeta_contract.loader_band_chunk),
 			k_chunk_size=(
 				_chunks_T['centroid_k_chunk']
-				if _chunks_T is not None else None))
+				if _chunks_T is not None
+				else zeta_contract.loader_k_chunk))
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
@@ -2682,7 +2698,8 @@ def prepare_isdf_and_wavefunctions(
 					band_chunk_size=load_band_chunk,
 					k_chunk_size=(
 						chunks['centroid_k_chunk']
-						if chunks is not None else None),
+						if chunks is not None
+						else zeta_contract.loader_k_chunk),
 				)
 
 			# ``low_mem_bands = true``: convert to the two-face carrier
