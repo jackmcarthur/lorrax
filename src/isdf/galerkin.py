@@ -30,6 +30,7 @@ from common.shard_map import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_centroids_band_chunked
+from distrib_la import plan as linalg_plan
 from runtime.padding import round_up, spec_divisor
 
 
@@ -40,6 +41,9 @@ __all__ = [
     "plan_galerkin_stream",
     "validate_rank_multiplier",
 ]
+
+
+_QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class GalerkinBasis:
     selected_state_indices: tuple[int, ...] = ()
     selection_factor: jax.Array | None = None
     qrcp_seed: int = 0
+    qrcp_rng_version: str = _QRCP_RNG_VERSION
     qrcp_eps: float = 1.0e-3
     qrcp_raw_rank: int = 0
     qrcp_search_rank: int = 0
@@ -355,6 +360,13 @@ def fit_galerkin_basis(
         raise ValueError(
             f"fit_galerkin_basis: qrcp_seed={qrcp_seed!r} is not an integer") \
             from None
+    if not 0 <= qrcp_seed <= np.iinfo(np.uint32).max:
+        raise ValueError(
+            f"fit_galerkin_basis: qrcp_seed={qrcp_seed} must fit uint32")
+    if n_rtot > np.iinfo(np.uint32).max:
+        raise ValueError(
+            "fit_galerkin_basis: the stateless QRCP sketch indexes global "
+            f"r in uint32, but n_rtot={n_rtot} exceeds that range")
     search_multiplier = validate_rank_multiplier(
         rank_multiplier, name="htransform_rank_multiplier")
     extra_rank_pad = int(extra_rank_pad)
@@ -386,25 +398,41 @@ def fit_galerkin_basis(
     align = math.lcm(
         int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
     p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
-    bc_hint = max(1, min(int(band_chunk_size), nb))
+    bc_hint = max(p_band, min(int(band_chunk_size), nb))
     bc_carrier = round_up(bc_hint, p_band)
+    while True:
+        try:
+            q_tile_budget, _memory_ledger = \
+                _resolve_whole_state_stream_budget(
+                    meta=meta, mesh_xy=mesh_xy, nk=nk,
+                    nspinor=nspinor, band_carrier=bc_carrier,
+                    state_count=m_states, search_rank=max_search,
+                    candidate_carrier=candidate_carrier,
+                    requested_q_tile_budget=int(q_tile_budget),
+                    device_pool_limit=device_pool_limit, log_fn=log_fn)
+            break
+        except MemoryError as exc:
+            if bc_carrier <= p_band:
+                raise
+            next_carrier = max(
+                p_band, (bc_carrier // (2 * p_band)) * p_band)
+            if next_carrier >= bc_carrier:
+                next_carrier = bc_carrier - p_band
+            log_fn(
+                f"  Whole-state planner reduces the canonical WFN band "
+                f"carrier {bc_carrier} -> {next_carrier}: {exc}")
+            bc_carrier = next_carrier
     band_chunk_ranges = tuple(
         (b0, min(b0 + bc_carrier, b_end))
         for b0 in range(b_start, b_end, bc_carrier))
-
-    q_tile_budget, _memory_ledger = _resolve_whole_state_stream_budget(
-        meta=meta, mesh_xy=mesh_xy, nk=nk, nspinor=nspinor,
-        band_carrier=bc_carrier, state_count=m_states,
-        search_rank=max_search, candidate_carrier=candidate_carrier,
-        requested_q_tile_budget=int(q_tile_budget),
-        device_pool_limit=device_pool_limit, log_fn=log_fn)
 
     log_fn(
         f"  Whole-state randomized QRCP: states={m_states} "
         f"({nk} k * {nb} bands), full-Bloch dimension={state_dim}, "
         f"max_search=ceil({search_multiplier:g}*{nb}) -> {max_search}, "
         f"candidates={n_candidates} (+{candidate_carrier-n_candidates} "
-        f"inactive mesh pad), qr_eps={float(qr_eps):.3e}, seed={qrcp_seed}")
+        f"inactive mesh pad), qr_eps={float(qr_eps):.3e}, seed={qrcp_seed}, "
+        f"rng={_QRCP_RNG_VERSION}, WFN band carrier={bc_carrier}")
     log_fn(f"  [qrcp] candidate SHA256={candidate_hash}")
 
     rep = NamedSharding(mesh_xy, P())
@@ -424,7 +452,7 @@ def fit_galerkin_basis(
             q_tile_budget=int(q_tile_budget),
             device_pool_limit=device_pool_limit, log_fn=log_fn)
 
-        @partial(jax.jit, out_shardings=face)
+        @partial(jax.jit, out_shardings=(face, rep, rep))
         def _normalized_sketch_gram(y):
             norms = jnp.sqrt(jnp.sum(jnp.abs(y) ** 2, axis=0))
             active = jnp.arange(y.shape[1]) < n_candidates
@@ -432,10 +460,26 @@ def fit_galerkin_basis(
             yn = jnp.where(active[None, :], y / safe[None, :], 0.0)
             gram = jnp.einsum(
                 'ra,rb->ab', jnp.conj(yn), yn, optimize=True)
-            return 0.5 * (gram + gram.conj().T)
+            gram = jax.lax.with_sharding_constraint(gram, face)
+            gram = 0.5 * (gram + gram.conj().T)
+            return (gram,
+                    jnp.min(jnp.where(active, norms, jnp.inf)),
+                    jnp.max(jnp.where(active, norms, 0.0)))
 
-        sketch_gram = _normalized_sketch_gram(sketch)
+        sketch_gram, sketch_norm_min, sketch_norm_max = \
+            _normalized_sketch_gram(sketch)
         del sketch
+        if (not np.isfinite(float(sketch_norm_min))
+                or not np.isfinite(float(sketch_norm_max))
+                or float(sketch_norm_min) <= 0.0):
+            raise ValueError(
+                "fit_galerkin_basis: randomized sketch produced a zero or "
+                "non-finite physical candidate norm: min/max="
+                f"{float(sketch_norm_min):.6e}/"
+                f"{float(sketch_norm_max):.6e}")
+        log_fn(
+            f"  [qrcp] sketch column norm min/max before normalization="
+            f"{float(sketch_norm_min):.6e}/{float(sketch_norm_max):.6e}")
         sketch_gram_row = jax.device_put(sketch_gram, row)
         del sketch_gram
 
@@ -510,32 +554,41 @@ def fit_galerkin_basis(
             q_tile_budget=int(q_tile_budget),
             device_pool_limit=device_pool_limit, log_fn=log_fn)
 
-        @partial(jax.jit, out_shardings=(rep, rep, rep))
-        def _factor_selected(g):
+        batch_face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+        @partial(jax.jit, out_shardings=batch_face)
+        def _prepare_selected(g):
             g = 0.5 * (g + g.conj().T)
             if n_pad:
                 pad_diag = jnp.concatenate([
                     jnp.zeros(rank_phys, dtype=jnp.float64),
                     jnp.ones(n_pad, dtype=jnp.float64)])
                 g = g + jnp.diag(pad_diag).astype(g.dtype)
-            L = jnp.linalg.cholesky(g)
-            Linv_g = jsp_linalg.solve_triangular(L, g, lower=True)
-            metric = jsp_linalg.solve_triangular(
-                L, Linv_g.conj().T, lower=True).conj().T
-            eye = jnp.eye(rank, dtype=g.dtype)
-            return L, jnp.max(jnp.abs(metric - eye)), jnp.min(
-                jnp.real(jnp.diag(L))[:rank_phys])
+            return g[None]
 
-        L, basis_ortho_err, min_chol_diag = _factor_selected(selected_gram)
+        gram_stack = _prepare_selected(selected_gram)
         del selected_gram
+        chol_plan = linalg_plan(
+            "cholesky", mesh_xy, backend="native2d", n=rank)
+        log_fn(f"  [route] selected-state factor: {chol_plan.describe()}")
+        L_stack = chol_plan.batched(gram_stack)
+        del gram_stack
+
+        @partial(jax.jit, in_shardings=batch_face,
+                 out_shardings=(rep, rep))
+        def _replicate_lower(factors):
+            L_ = jnp.tril(factors[0])
+            return L_, jnp.min(jnp.real(jnp.diag(L_))[:rank_phys])
+
+        L, min_chol_diag = _replicate_lower(L_stack)
+        del L_stack
         if (not np.isfinite(float(min_chol_diag))
                 or float(min_chol_diag) <= 0.0):
             raise ValueError(
                 "fit_galerkin_basis: selected physical states are linearly "
                 f"dependent; min diag(L)={float(min_chol_diag):.6e}")
         log_fn(
-            f"  [qrcp] physical basis max|B B^H-I|="
-            f"{float(basis_ortho_err):.3e}; min diag(L)="
+            f"  [qrcp] selected-state min diag(L)="
             f"{float(min_chol_diag):.6e}")
 
         ctilde = _build_physical_coefficients(
@@ -565,12 +618,31 @@ def fit_galerkin_basis(
                 jnp.max(jnp.abs(row_norm - 1.0)),
                 jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(row_norm))))
 
-    c_ortho, max_state_resid2, fro_resid = _coefficient_receipt(ctilde)
+    c_ortho, max_missing_norm2, fro_resid = _coefficient_receipt(ctilde)
+    selected_dev = np.asarray(selected, dtype=np.int32)
+
+    @partial(jax.jit, out_shardings=(rep, rep))
+    def _selected_state_receipt(c, factor):
+        picked = c.reshape(m_states, rank)[jnp.asarray(selected_dev)]
+        reference = factor[:rank_phys, :]
+        scale = jnp.maximum(1.0, jnp.max(jnp.abs(reference)))
+        return jnp.max(jnp.abs(picked - reference)), scale
+
+    selected_err, selected_scale = _selected_state_receipt(ctilde, L)
+    selected_tol = np.sqrt(np.finfo(np.float64).eps) * float(selected_scale)
+    if (not np.isfinite(float(selected_err))
+            or float(selected_err) > selected_tol):
+        raise ValueError(
+            "fit_galerkin_basis: selected-state orientation identity "
+            f"C[selected]=L failed: max error {float(selected_err):.3e} "
+            f"> sqrt(eps)*scale={selected_tol:.3e}")
     log_fn(
         f"  [gate] physical projection over all coarse states: "
         f"max|C C^H-I|={float(c_ortho):.3e}, "
-        f"max missing state norm={float(max_state_resid2):.3e}, "
-        f"||Psi-CB||_F/||Psi||_F={float(fro_resid):.3e}")
+        f"max missing state norm^2={float(max_missing_norm2):.3e}, "
+        f"||Psi-CB||_F/||Psi||_F={float(fro_resid):.3e}; "
+        f"max|C[selected]-L|={float(selected_err):.3e} "
+        f"(cap {selected_tol:.3e})")
 
     projector = None
     if include_projector:
@@ -595,6 +667,7 @@ def fit_galerkin_basis(
         selected_state_indices=tuple(int(v) for v in selected),
         selection_factor=L,
         qrcp_seed=qrcp_seed,
+        qrcp_rng_version=_QRCP_RNG_VERSION,
         qrcp_eps=float(qr_eps),
         qrcp_raw_rank=rank_qr,
         qrcp_search_rank=max_search,
@@ -723,11 +796,20 @@ def _make_sketch_random_kernel(
     @partial(
         jax.jit, in_shardings=(rep, rep), out_shardings=row_layout)
     def _draw(r_start, logical_width):
-        key_ = jax.random.fold_in(
-            jax.random.PRNGKey(int(seed)), r_start.astype(jnp.uint32))
-        omega = jax.random.normal(
-            key_, (int(sketch_rows), int(nspinor), int(r_carrier)),
-            dtype=jnp.float64)
+        # A physical grid point owns its PRNG key.  Drawing one normal block
+        # per global r index makes the sketch invariant to r-chunk boundaries,
+        # device count and Q-memory budget; only physics inputs (seed, rank,
+        # spinor count and global r) can change it.  The per-key output shape
+        # is fixed, so vmap length also cannot perturb retained values.
+        base = jax.random.PRNGKey(int(seed))
+        global_r = (r_start.astype(jnp.uint32)
+                    + jnp.arange(int(r_carrier), dtype=jnp.uint32))
+        keys = jax.vmap(lambda r: jax.random.fold_in(base, r))(global_r)
+        omega_r = jax.vmap(
+            lambda key: jax.random.normal(
+                key, (int(sketch_rows), int(nspinor)), dtype=jnp.float64)
+        )(keys)
+        omega = jnp.moveaxis(omega_r, 0, 2)
         active_r = jnp.arange(int(r_carrier)) < logical_width
         return jnp.where(active_r[None, None, :], omega, 0.0)
 
