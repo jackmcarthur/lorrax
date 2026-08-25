@@ -2,8 +2,8 @@
 
 The reader and format-contract owner of `zeta_q.h5` (and the bispinor
 siblings `zeta_q_mu{1,2,3}.h5`). One door: the header surface, the
-collective slab read that feeds V_q, the sanctioned local plan, the
-never-raising probe, and the one post-close append. It owns no
+collective slab read that feeds V_q, the sanctioned local plan, and the
+never-raising probe. It owns no
 mathematics — `zeta_rcond`, the fit and the solver tiers are
 producer-side (`isdf` / `gw.isdf_fitting`).
 
@@ -13,8 +13,8 @@ producer-side (`isdf` / `gw.isdf_fitting`).
 many times — by V_q (`gw/v_q_g_flat`, `gw/v_q_bispinor`), by the BSE
 interpolation (`bse/vq_interp`), by basis projection
 (`common/zeta_projection`) and by the fit-reuse gates (`gw/gw_init`).
-Before this service, four sites read or wrote the file around the loader
-(raw h5py; one of them a WRITE with no door), and the layout dispatch
+Before this service, four sites read the file around the loader
+(raw h5py), and the layout dispatch
 `(('zeta_q_G',1),('zeta_q',2))` existed in three copies — one of which
 probed only the legacy dataset name for months and silently passed on
 exactly the production files it guarded. The service is that surface,
@@ -37,7 +37,6 @@ zeta_loader.ZetaLoader(path, *, mesh=None, mode='r')     # first access imports 
     .close() / context manager
     # + the bound mf_header/isdf_header attribute surface (see Contract)
 zeta_loader.probe_zeta_file(path) -> ZetaFileProbe   # NEVER raises
-zeta_loader.write_g0_mu(path, g0_logical, *, n_rmu_expected=None)
 ```
 
 `mesh=None` is HEADER-ONLY mode: every header attribute and the local
@@ -75,11 +74,10 @@ import on first attribute access.
 - **`read_zeta_G_local` is non-collective BY CONTRACT.** Making it
   collective turns a rank-0 diagnostic into a hang. It works at
   `mesh=None`.
-- **`write_g0_mu` is the one sanctioned post-close serial append.** The
-  caller keeps the rank-0 gate and the barriers (its docstring gives the
-  exact sequence); the logical-extent guard refuses padded arrays —
-  files store LOGICAL extents so they re-read identically at any
-  process count.
+- **G=0 is not duplicated on disk.** For each stored parent q,
+  `zeta_q_G[q, :, 0]` is the G=(0,0,0) coefficient by the canonical sphere
+  ordering. Full-BZ literal G=0 under IBZ symmetry is a derived unfolded
+  view through the symmetry service, not a second dataset.
 - **Header surface** (pinned by the contract test): nspin, kgrid,
   fft_grid, sym_matrices, ntran, bvec, adot, blat, cell_volume, ifmax,
   kpoints, vertex_mu_L, r_mu_fft_idx, n_rmu, zeta_layout,
@@ -90,8 +88,8 @@ import on first attribute access.
 ## Backends
 
 One transport: SlabIO (`_FfiBackend`, phdf5 via the LORRAX FFI pair) for
-the collective plan; serial h5py for the headers, the probe, the local
-plan and the g0_mu append. There is no backend switch and nothing to
+the collective plan; serial h5py for the headers, the probe and the local
+plan. There is no backend switch and nothing to
 demote to: a stack without the phdf5 FFI serves the whole header/format
 surface and refuses collective reads by name. The transport carries a
 per-PROCESS MPI context, so a mesh handed to the loader must satisfy
@@ -163,15 +161,14 @@ page-cache-warm, so compare rows to rows, not bands to bands).
   you are about to hand-roll is `read_zeta_G_local`.
 - **Making the local plan collective** (or wrapping it in a SlabIO read
   "for consistency"): a rank-0 diagnostic becomes a hang.
-- **Calling `write_g0_mu` from every rank** or before the collective
-  handles close: silent corruption on a shared filesystem. The caller
-  owns the gate and barriers, deliberately.
+- **Persisting a `g0_mu` mirror.** It duplicates the canonical G=0 slice of
+  `zeta_q_G`; symmetry-dependent full-zone views belong to the symmetry
+  service.
 - **Consuming `gvec_components` raw** when `gvecs()` exists: the raw
   table is unvalidated against the FFT grid; the accessor refuses the
   corrupt case.
-- **Writing padded extents to disk.** Files store LOGICAL extents;
-  `write_g0_mu` refuses a padded μ axis, and any new dataset must follow
-  the same rule.
+- **Writing padded extents to disk.** Files store LOGICAL extents; any new
+  dataset must follow the same rule.
 - **Re-deriving the layout dispatch.** `(('zeta_q_G',1),('zeta_q',2))`
   lives in `format.py`, once. A new copy is a future silent-pass.
 - **Adding a `zeta_rcond` mirror.** Import `ZETA_RCOND_DEFAULT` from

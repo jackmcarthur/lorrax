@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zeta_loader"
 version = "0.1.0"
-description = "The reader and format-contract owner of zeta_q.h5: header surface, the collective V_q slab read, the sanctioned local plan, the never-raising probe and the one post-close g0_mu append"
+description = "The reader and format-contract owner of zeta_q.h5: header surface, the collective V_q slab read, the sanctioned local plan and the never-raising probe"
 requires-python = ">=3.12"
 
 # h5py IS this service's own declared native dependency, and it is the only
@@ -20,7 +20,7 @@ requires-python = ">=3.12"
 # the LORRAX HOST TREE, lazily, at call time (see the four `_*_binders` /
 # `_*_helpers` refusals in zeta_loader.loader).  They are deliberately not
 # dependencies: `import zeta_loader` is clean with lorrax off sys.path, and
-# `probe_zeta_file` / `write_g0_mu` are fully functional there.  When
+# `probe_zeta_file` is fully functional there.  When
 # slab_io and the header binders are extracted as services of their own
 # (wave 1b), those four lazy imports become entries in this list and the
 # refusals go.  Until then the honest statement is that the DATA path
