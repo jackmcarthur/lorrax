@@ -1890,11 +1890,12 @@ _DEFAULTS = {
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
     # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction.
-    # False (default) = current behavior, BIT-IDENTICAL: the bare TT tiles'
-    # q=Γ, G=0 slot stays zero (the transverse projector t_ij(q̂) has no
+    # False (default): the bare TT tiles' q=Γ, G=0 slot stays zero (the
+    # transverse projector P^T_ij(q̂) has no
     # limit as q→0, so a naive point evaluation is undefined there and the
     # shipped code leaves it at zero rather than guess).  True replaces
-    # that slot with the mini-BZ Voronoi cell average ⟨v(q) t_ij(q̂)⟩_mBZ
+    # that slot with the Coulomb-gauge spatial block
+    # −⟨v(q) P^T_ij(q̂)⟩_mBZ
     # (vcoul.{slab_2d,bulk_3d}.*.q0_average_transverse_tensor) — the
     # current-current analogue of the charge channel's ⟨v⟩ head, needed
     # because the current structure factor ⟨m|α^i|n⟩ does NOT collapse to

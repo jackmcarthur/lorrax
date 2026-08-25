@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 
 from vcoul import (
+    COULOMB_GAUGE_TT_SIGN,
     build_miniBZ_dq_cart,
     build_v_head_miniBZ_fn_3d,
     minibz_cell_affine,
@@ -90,6 +91,35 @@ def test_the_minibz_draw_is_closed_under_negation():
     # closure trivially true.
     assert np.abs(dq).max() > 0.0
     assert len(np.unique(dq[:, 0])) > 512 // 2
+
+
+def test_streamed_photon_samples_apply_the_spatial_metric_once():
+    """The packed q0 provider returns physical ``D_TT=-v P_T``.
+
+    This is the independent mini-BZ route that does not read the G-flat
+    bispinor V file.  Its CC trace fixes ``v``, while the TT trace and null
+    direction distinguish the metric sign from a positive projector sample.
+    """
+    import vcoul
+
+    assert COULOMB_GAUGE_TT_SIGN == -1.0
+    item = next(vcoul.iter_minibz_photon_samples(
+        vcoul.get_kernel(2),
+        vcoul.CoulombGeometry(
+            bvec=HEX_BVEC, cell_volume=HEX_CELVOL),
+        HEX_KGRID,
+        nsamples=8, qmc_reps=1, chunk_size=8))
+    _, _, _, q_cart, D_raw, valid_count, _, _ = item
+    q = np.asarray(q_cart[:valid_count])
+    D = np.asarray(D_raw[:valid_count])
+    v = D[:, 0, 0]
+    assert np.all(v > 0.0)
+    np.testing.assert_allclose(
+        np.trace(D[:, 1:, 1:], axis1=1, axis2=2), -2.0 * v,
+        rtol=2e-15, atol=1e-14)
+    np.testing.assert_allclose(
+        np.einsum("sij,sj->si", D[:, 1:, 1:], q), 0.0,
+        rtol=0.0, atol=2e-13)
 
 
 def test_the_head_is_an_exactly_even_function_of_K():

@@ -49,7 +49,7 @@ Deferred (phase-2+): full $\chi^{\mu\nu}/W^{\mu\nu}$, transverse screening, reta
 
 **Gauge:** Coulomb. The bare 4×4 photon propagator is block-diagonal,
 
-$$D^{\mu_L\nu_L}(K) = \begin{pmatrix} 4\pi/|K|^2 & 0 \\ 0 & (4\pi/|K|^2)\,(\delta_{ij}-K_iK_j/|K|^2) \end{pmatrix},\quad K=q+G.$$
+$$D^{\mu_L\nu_L}(K) = \begin{pmatrix} 4\pi/|K|^2 & 0 \\ 0 & -(4\pi/|K|^2)\,(\delta_{ij}-K_iK_j/|K|^2) \end{pmatrix},\quad K=q+G.$$
 
 Off-block ($D^{0i}=0$) is exact in Coulomb gauge.
 
@@ -190,6 +190,14 @@ measurement for how each (μ_L, ν_L) tile behaves at q → 0, for the Coulomb
 kernel the code actually builds.  Measured on the bi4 deck (MoS2 4×4, 402
 charge + 143 transverse centroids, P=4), job 7885325; artifacts under
 `/scratch2/08271/jackmc/bispinor_gamma_check/`.
+
+**Sign clarification (2026-08-25).** The tabulated `⟨v t^{ij}⟩` values below
+are positive moments of the geometric projector
+$P_T^{ij}=\delta_{ij}-\hat K_i\hat K_j$.  The physical Coulomb-gauge spatial
+propagator slot is their negative, $D^{ij}_{TT}=-\langle vP_T^{ij}\rangle$,
+as in §2.  The historical Sigma-direction sentences below predate that sign
+repair; their magnitudes remain provenance, not predictions for the corrected
+operator.
 
 **The kernel as built.**  Every bispinor system currently runs `sys_dim=2`,
 so `compute_v_q_per_G` evaluates the slab-truncated kernel
