@@ -36,9 +36,10 @@ non-mesh-divisible band edges and ns=2"):
   psi_mun-offset bug (``bc.lo - _bfs`` vs some other origin) would show up
   in first.
 * ``face_tail_r11`` — an 11-cell logical tail transported in a 12-cell
-  carrier on the P4 / ``p_y=2`` mesh.  It compares against the same cells
-  of a full-grid face evaluation and requires the carrier pad cell to be
-  exactly zero, catching ``dynamic_slice``'s backward-clamp substitution.
+  carrier on the P4 / ``p_y=2`` mesh.  Cached legacy, streamed legacy, and
+  face layouts are compared against the same cells of a full-grid face
+  evaluation, and the carrier pad cell must be exactly zero.  This catches
+  ``dynamic_slice``'s backward-clamp substitution in either legacy source.
 
 Each case ALSO forces a band chunk (``(0, 24)``, width 24) to straddle
 psi_mun's own 'y'-shard boundary (shard width ``nb_full/p_y = 36/2 = 18``)
@@ -240,15 +241,24 @@ def _worker(case_name: str) -> int:
     mun_spec = NamedSharding(mesh, P(None, None, "x", "y"))
 
     # ---- legacy ---------------------------------------------------------
-    Z_legacy = None
-    if tail_logical is None:
-        Z_legacy = jax.block_until_ready(z_q_from_psi_sm(
+    Z_legacy = jax.block_until_ready(z_q_from_psi_sm(
+        jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
+        jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
+        store, psi_r_cache,
+        band_chunk_ranges=band_chunk_ranges,
+        band_range_left=l_range, band_range_right=r_range,
+        r_start_dyn=r_start, r_chunk_size=n_zchunk,
+        gamma_L=gamma_L, gamma_R=gamma_R, kgrid=kgrid, mesh_xy=mesh,
+        layout="legacy"))
+    Z_legacy_streamed = None
+    if tail_logical is not None:
+        Z_legacy_streamed = jax.block_until_ready(z_q_from_psi_sm(
             jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
             jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
-            store, psi_r_cache,
+            store, None,
             band_chunk_ranges=band_chunk_ranges,
             band_range_left=l_range, band_range_right=r_range,
-            r_start_dyn=0, r_chunk_size=n_zchunk,
+            r_start_dyn=r_start, r_chunk_size=n_zchunk,
             gamma_L=gamma_L, gamma_R=gamma_R, kgrid=kgrid, mesh_xy=mesh,
             layout="legacy"))
 
@@ -275,8 +285,9 @@ def _worker(case_name: str) -> int:
     # the identical issue.
     from jax.experimental import multihost_utils as _mhu
     Zf = np.asarray(_mhu.process_allgather(Z_face, tiled=True))
+    Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
-        Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
+        comparisons = (Zf,)
     else:
         # Independent-width reference: the full-grid face evaluation has
         # no out-of-range slice.  Its final logical cells must be retained
@@ -291,11 +302,14 @@ def _worker(case_name: str) -> int:
             gamma_L=gamma_L, gamma_R=gamma_R,
             weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r)))
         Z_full_np = np.asarray(_mhu.process_allgather(Z_full, tiled=True))
-        Zl = np.concatenate(
+        Z_expected = np.concatenate(
             (Z_full_np[..., r_start:],
              np.zeros((*Z_full_np.shape[:-1], n_zchunk - int(tail_logical)),
                       dtype=Z_full_np.dtype)),
             axis=-1)
+        Zls = np.asarray(_mhu.process_allgather(
+            Z_legacy_streamed, tiled=True))
+        comparisons = (Zf, Zl, Zls)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -306,9 +320,13 @@ def _worker(case_name: str) -> int:
         print(json.dumps({
             "error": f"shape mismatch: legacy={Zl.shape} face={Zf.shape}"}))
         return 1
-    absdiff = np.abs(Zl - Zf)
-    ref_scale = float(np.abs(Zl).max())
-    max_abs = float(absdiff.max())
+    if tail_logical is None:
+        reference = Zl
+    else:
+        reference = Z_expected
+    ref_scale = float(np.abs(reference).max())
+    max_abs = max(float(np.abs(value - reference).max())
+                  for value in comparisons)
     max_rel = max_abs / max(ref_scale, 1e-300)
     print(json.dumps({
         "max_abs": max_abs, "ref_scale": ref_scale, "max_rel": max_rel,

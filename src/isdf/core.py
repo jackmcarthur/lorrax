@@ -1315,8 +1315,8 @@ def _z_q_legacy(
 				#     aliased across iters by XLA's scan-internal
 				#     allocator → single slot of each.
 				if use_psi_r_cache:
-					psi_Y_bc_local_full_r = jax.lax.dynamic_slice_in_dim(
-						psi_r_cache_[bc_idx], r_start_, n_zchunk, axis=3)
+					psi_Y_bc_local_full_r = take_rchunk_padded(
+						psi_r_cache_[bc_idx], r_start_, n_zchunk)
 				else:
 					psi_G_bc_local = _io_callback(
 						_slicer_host, _slicer_out_sds,

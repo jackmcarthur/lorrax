@@ -17,6 +17,7 @@ from common.collectives import (
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 from runtime import debug_print_enabled
+from runtime.padding import round_up
 
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
@@ -1349,16 +1350,13 @@ def fit_zeta_to_h5(
             r_start = chunk_idx * chunk_r
             r_end = min(r_start + chunk_r, n_rtot)
             logical_n_rchunk = r_end - r_start
-            # The face Z carrier shards r over mesh axis 'y', so its static
+            # Z shards r over mesh axis 'y' in both layouts, so its static
             # width must divide p_y.  Only the carrier is rounded: the
             # canonical r-slice zero-fills cells beyond the physical grid,
             # the solve carries those inert RHS columns, and the slice below
             # restores the exact logical slab before G-flat accumulation.
-            # Legacy keeps its historical width/compile family unchanged.
             _p_y = int(mesh_xy.shape['y'])
-            actual_n_rchunk = (
-                ((logical_n_rchunk + _p_y - 1) // _p_y) * _p_y
-                if low_mem_bands else logical_n_rchunk)
+            actual_n_rchunk = round_up(logical_n_rchunk, _p_y)
 
             _dbg_rchunk = debug_print_enabled()
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
