@@ -364,6 +364,15 @@ class PsiGStore:
     def _clear_tiles(self) -> None:
         self._host_tiles.clear()
 
+    def release_host_tiles(self) -> None:
+        """Release coefficient tiles after their callbacks have drained.
+
+        The device-resident box index and k vectors remain valid for cached
+        r-space consumers.  :meth:`close` is the sole full teardown.
+        """
+        self._rchunk_kernel_cache.clear()
+        self._clear_tiles()
+
     # ---------------------------------------------------------------------
     # Per-rank host-tile slice for one bc, padded to a static shape.
     # ---------------------------------------------------------------------
@@ -435,6 +444,9 @@ class PsiGStore:
         if getattr(self, "_closed", False):
             raise RuntimeError(
                 "PsiGStore.read_local_band_chunk: the store is closed")
+        if not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.read_local_band_chunk: host tiles were released")
         x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
         if not 0 <= bc < len(self.band_chunk_ranges):
             raise ValueError(
@@ -525,6 +537,9 @@ class PsiGStore:
         """
         if self._closed:
             raise RuntimeError("PsiGStore.iter_rchunk_bandwise: store is closed")
+        if not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.iter_rchunk_bandwise: host tiles were released")
         from common.wfn_transforms import prepare_rchunk_carrier
         r_start = int(r_start)
         r_end = int(r_end)
@@ -565,9 +580,8 @@ class PsiGStore:
         return self._kvecs_frac_dev
 
     def close(self) -> None:
-        """Release all host tiles; the shared loader remains caller-owned."""
-        self._rchunk_kernel_cache.clear()
-        self._clear_tiles()
+        """Release all store resources; the shared loader remains caller-owned."""
+        self.release_host_tiles()
         self._g_index_dev = None
         self._kvecs_frac_dev = None
         self._closed = True
