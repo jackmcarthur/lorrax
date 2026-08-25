@@ -877,7 +877,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                                     local_potential_operator,
                                     sweep_matrix_elements)
     from common.wfn_layout import band_sphere_spec
-    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
     psi_G = wfn.load(bands=(0, nb), k=k_spec, sharding=band_sphere_spec())
     geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
@@ -892,12 +892,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
             box_index=wfn.box_index(k=k_spec),
-            # The WFN's OWN k for these rows, NOT ``sym.unfolded_kpts``:
-            # ψ and the G-list here are the untransformed WFN slab, and
-            # the only k that belongs with them is the file's own — the
-            # pairing is self-consistent by definition, whatever wrapping
-            # convention the unfold uses.
-            kvecs=kvecs_irr)
+            # The WFN loader's paired k representative for these exact G rows,
+            # not a separately returned table that is only equal today.
+            kvecs=gtab.kvecs)
         # THE BOUNDARY, stated rather than implied.  Both consumers want a
         # HOST array — the CLI writes it with serial h5py on rank 0
         # (``owner_only=True``), and ``sigma_dispatch``'s gspace route hands
@@ -1232,7 +1229,7 @@ def main(argv=None):
     # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
-    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
     psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
                      sharding=band_sphere_spec())
@@ -1255,9 +1252,9 @@ def main(argv=None):
             psi_G, operator=sum_operators(*terms), geom=geom,
             gvecs=gtab.gvecs, gmask=gtab.mask,
             box_index=wfn.box_index(k=k_spec),
-            # the WFN's own k for these rows, for the same reason as the
-            # V_H sweep: ψ and the G-list here are the untransformed slab.
-            kvecs=kvecs_irr)
+            # The WFN loader's paired k representative for these exact G rows,
+            # for the same reason as the V_H sweep above.
+            kvecs=gtab.kvecs)
         # THE BOUNDARY: the sink is a serial h5py write on rank 0, which
         # cannot take a sharded operand, so the block is gathered to the
         # owner here and nowhere else.  ``owner_only`` keeps the peers'
