@@ -97,8 +97,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             complex_contour: bool = False,
                             layout: str = "legacy", face_shape=None,
                             right_face_shape=None,
-                            vertex_pair: bool = False,
-                            vertex_identity=(False, False)):
+                            vertex_pair: bool = False):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
     ``n_out`` (static): number of χ outputs accumulated over the SAME τ
@@ -136,9 +135,6 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             f"_get_chi_minimax_kernel: layout must be 'legacy' or 'face', "
             f"got {layout!r}")
     vertex_pair = bool(vertex_pair)
-    vertex_identity = tuple(bool(x) for x in vertex_identity)
-    if len(vertex_identity) != 2:
-        raise ValueError("vertex_identity must be (left_identity,right_identity)")
     if vertex_pair and n_out != 1:
         raise ValueError(
             "four-current vertex chi currently supports one static output "
@@ -149,7 +145,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "wavefunction layout")
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, vertex_identity)
+                 vertex_pair)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -164,8 +160,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         kernel = _get_chi_minimax_kernel_face(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
             right_face_shape=right_face_shape,
-            vertex_pair=vertex_pair,
-            vertex_identity=vertex_identity)
+            vertex_pair=vertex_pair)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -377,8 +372,7 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
 
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
-                                 vertex_pair=False,
-                                 vertex_identity=(False, False)):
+                                 vertex_pair=False):
     """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
 
     G construction is the only part that forks (module-level docstring):
@@ -515,7 +509,6 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
     if vertex_pair:
         from common.gamma_matrices import gamma_double_contract
-    left_identity, right_identity = vertex_identity
 
     def _single_impl(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
@@ -541,14 +534,14 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 perm_l, phase_l, perm_r, phase_r = vertex_operands
                 chi_tau_raw = gamma_double_contract(
                     jnp.conj(Gv_R), Gc_R,
-                    perm_L=None if left_identity else perm_l,
-                    phase_L=None if left_identity else phase_l,
+                    perm_L=perm_l,
+                    phase_L=phase_l,
                     # Right endpoint orientation: the trace uses
                     # Gamma_B[c,d], whereas the helper's row form is
                     # Gamma_B[d,c].  Canonical alpha matrices are Hermitian
                     # monomials, so conjugating the row phase transposes it.
-                    perm_R=None if right_identity else perm_r,
-                    phase_R=(None if right_identity else jnp.conj(phase_r)),
+                    perm_R=perm_r,
+                    phase_R=jnp.conj(phase_r),
                     spin_axes=(1, 3))
             chi_tau = jax.lax.with_sharding_constraint(
                 chi_tau_raw, _chi_R_shard)
@@ -1581,8 +1574,7 @@ def compute_no_pair_dirac_current_block(
     right_shape = face_kernel_kwargs(wfns_right)["face_shape"]
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, layout="face", face_shape=left_shape,
-        right_face_shape=right_shape, vertex_pair=True,
-        vertex_identity=(A == 0, B == 0))
+        right_face_shape=right_shape, vertex_pair=True)
     mask_v = wfns_left.band_mask(s.val)
     mask_c = wfns_left.band_mask(s.cond)
     enk_full = wfns_left.enk - jnp.asarray(

@@ -3424,16 +3424,6 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
-def uses_coupled_photon_head(config) -> bool:
-    """Whether this config needs full-BZ four-channel Gamma vectors."""
-    return (
-        coerce_bispinor_gw_mode(getattr(
-            config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-        is BispinorGWMode.FULL_STATIC_COHSEX
-        and config.head.correction is HeadCorrection.FULL
-    )
-
-
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate the deliberately narrow first full-photon calculation.
 
