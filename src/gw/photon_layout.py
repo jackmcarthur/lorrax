@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable
+from typing import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +36,8 @@ N_LORENTZ = 4
 CHARGE = 0
 TRANSVERSE = (1, 2, 3)
 MAX_Q0_UPDATE_RANK = 4
+PHOTON_BASIS_ORDERING = "mesh_interleaved_direct_sum_v1"
+PHOTON_BARE_PROPAGATOR = "instantaneous_coulomb_gauge_v1"
 
 
 @dataclass(frozen=True)
@@ -45,8 +47,8 @@ class PhotonBasisLayout:
     logical_extents: tuple[int, int, int, int]
     padded_extents: tuple[int, int, int, int]
     mesh_side: int
-    ordering: str = "mesh_interleaved_direct_sum_v1"
-    bare_propagator: str = "instantaneous_coulomb_gauge_v1"
+    ordering: str = PHOTON_BASIS_ORDERING
+    bare_propagator: str = PHOTON_BARE_PROPAGATOR
 
     def __post_init__(self) -> None:
         logical = tuple(int(n) for n in self.logical_extents)
@@ -198,7 +200,7 @@ def _insert(packed, block, layout, A, B, mesh_xy):
 
 
 def pack_photon_operator(
-    get_block: Callable[[int, int], jax.Array], nq: int,
+    get_block: Callable[[int, int], jax.Array | None], nq: int,
     layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128,
 ) -> jax.Array:
     """Stream sixteen blocks into one packed ``P(None,'x','y')`` operator.
@@ -213,8 +215,13 @@ def pack_photon_operator(
     packed = _empty(nq, layout, mesh_xy, dtype)
     for A in range(N_LORENTZ):
         for B in range(N_LORENTZ):
-            packed = _insert(
-                packed, get_block(A, B), layout, A, B, mesh_xy)
+            block = get_block(A, B)
+            # Missing physical channels are exact zero blocks.  Keeping this
+            # case in the sole packer avoids a second packing graph and a
+            # second body-sized zero accumulator.
+            if block is None:
+                continue
+            packed = _insert(packed, block, layout, A, B, mesh_xy)
             # JAX dispatch is asynchronous.  The next get_block() is an
             # independent, body-sized response build, so the accumulator
             # dependency alone does not prevent two block outputs from being
@@ -269,6 +276,73 @@ def photon_block_view(
         layout.padded_extent(A), layout.padded_extent(B))(
             packed, scalar(layout.local_offset(A)),
             scalar(layout.local_offset(B)))
+
+
+def pack_photon_response_tiles(
+    tiles: Mapping[tuple[int, int], jax.Array | None],
+    nq: int,
+    layout: PhotonBasisLayout,
+    mesh_xy: Mesh,
+    *,
+    dtype=jnp.complex128,
+) -> jax.Array:
+    """Pack present 4x4 response tiles, zero-filling absent channels.
+
+    This mapping adapter delegates all ordering, padding, and insertion to
+    :func:`pack_photon_operator`.  A present tile is already in the canonical
+    padded block shape with ``P(None,'x','y')`` sharding.  No conjugation,
+    symmetry completion, physical prefactor, or alternate JIT is implicit.
+    """
+    layout.assert_mesh(mesh_xy)
+    wanted_dtype = np.dtype(dtype)
+    wanted_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    normalized = {}
+    for key, tile in tiles.items():
+        if (not isinstance(key, tuple) or len(key) != 2
+                or any(not isinstance(v, (int, np.integer)) for v in key)):
+            raise TypeError(
+                "photon response tile keys must be integer (A,B) pairs; "
+                f"got {key!r}")
+        A, B = int(key[0]), int(key[1])
+        layout._check_channel(A)
+        layout._check_channel(B)
+        if tile is not None:
+            expected = layout.block_shape(int(nq), A, B)
+            if tuple(tile.shape) != expected:
+                raise ValueError(
+                    f"photon response tile ({A},{B}) shape {tile.shape} != "
+                    f"{expected}")
+            if np.dtype(tile.dtype) != wanted_dtype:
+                raise TypeError(
+                    f"photon response tile ({A},{B}) dtype {tile.dtype} != "
+                    f"{wanted_dtype}")
+            sharding = getattr(tile, "sharding", None)
+            if (not isinstance(sharding, NamedSharding)
+                    or not sharding.is_equivalent_to(
+                        wanted_sharding, tile.ndim)):
+                raise ValueError(
+                    f"photon response tile ({A},{B}) must already have "
+                    f"sharding P(None,'x','y'); got {sharding!r}")
+        normalized[(A, B)] = tile
+    return pack_photon_operator(
+        lambda A, B: normalized.get((A, B)), int(nq), layout, mesh_xy,
+        dtype=dtype)
+
+
+def unpack_photon_response_tiles(
+    packed: jax.Array,
+    layout: PhotonBasisLayout,
+    mesh_xy: Mesh,
+) -> tuple[tuple[jax.Array, ...], ...]:
+    """Return the padded 4x4 response-tile views of one packed operator.
+
+    Every entry delegates to :func:`photon_block_view`; this helper adds no
+    ordering, trimming, redistribution, JIT, or compile-cache surface.
+    """
+    return tuple(
+        tuple(photon_block_view(packed, layout, A, B, mesh_xy)
+              for B in range(N_LORENTZ))
+        for A in range(N_LORENTZ))
 
 
 def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
@@ -508,5 +582,6 @@ def add_photon_q0_low_rank(
 __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
+    "pack_photon_response_tiles", "unpack_photon_response_tiles",
     "pack_photon_channel_vectors", "add_photon_q0_low_rank",
 ]
