@@ -1,13 +1,6 @@
 {
   "schema_version": 2,
   "family": "complex_laplace",
-  "clause": {
-    "name": "height",
-    "numerator": "varpi / x_min -- a sampling line height over a band gap (the chi0 probe and the MPA fit stage)",
-    "beta_max": 64.0,
-    "derivation": "the height clause's edge is an OBSERVATION: the protocol fixes varpi_1 = 0.2 Ry and varpi_2 = 1 Ha = 2 Ry, the in-tree decks' gaps run 0.0497 to 0.3427 Ry, and the resulting omega-hat runs 0.58 to 40.214 (MINIMAX_REQUEST_CENSUS.md sec 7.2). 64 is the next rung of a geometric ladder above the largest measured value.",
-    "note": "beta is ONE dimensionless number formed from two unrelated numerators, and the two ranges overlap near 0.6, so a request must say which clause it is asking under. common.minimax_beta_selector.CATALOG_CLAUSE stamps this catalog's target.version with the clause above and refuses a request from the other one by name."
-  },
   "target": {
     "definition": "1/(u - i*beta) on u in [1, R]",
     "version": "complex_laplace/v1",
@@ -22,7 +15,7 @@
     "beta": "|requested - entry beta| <= entry beta_tolerance, a MEASURED two-sided band and not a rounding rule. The target is a different function at every beta, so no direction is conservative; but d/dbeta of the target has modulus 1/(1 + beta^2) at the hard end of the interval, so an entry absorbs a mismatch of about error_bound*(1 + beta^2) -- 2.6e-4 at beta = 16 and the 1e-6 tier. Entries whose beta_axis is 'exact_phase_on_fixed_nodes' additionally serve the whole band [beta_min, beta] exactly, because there beta enters only as a unit-modulus phase on nodes chosen without reference to it."
   },
   "shipping_rule": {
-    "source": "MPA_THEORY_PLAN.md section E",
+    "source": "docs/theory/THEORY_mpa_implementation.md",
     "kappa0_definition": "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
     "kappa0_reference": "the pure-damping envelope integral 1/u, which is the same normalisation gw.mpa.evaluator.damped_line_rule uses for the strip; every certified shipped noncrossing table measures between 1.0000 and 1.0215 under it.",
     "normal": 2.0,
@@ -43,15 +36,15 @@
   },
   "provenance": {
     "tool": "tools/generate_imag_minimax_assets.py",
-    "tool_sha256": "b692e2da0619734f381d86897bb7f411d5fdf0b77bfa4adcaa937611ad94c5e0",
-    "numpy": "2.5.2",
-    "scipy": "1.18.0",
-    "python": "3.12.12",
+    "tool_sha256": "3e1d93212c32354cdcbde6bed49247ffd9b59d78dac44481f381a0ee20d4e9bd",
+    "numpy": "2.4.3",
+    "scipy": "1.17.1",
+    "python": "3.12.3",
     "lp_solver": "scipy.optimize.linprog(method='highs')",
     "seed_policy": "no seed: both routes are deterministic convex programs or fixed Gauss-Legendre panels. The only randomness is the rescaling check's draw, which is seeded at 20260808 and is a test, not a solve."
   },
   "sweep": {
-    "solver_wall_seconds": 135.59,
+    "solver_wall_seconds": 135.7,
     "entries": 55,
     "certified": 55,
     "by_rule": {
@@ -2263,7 +2256,7 @@
       "node_count": 238,
       "max_error": 7.695096194946137e-14,
       "real_part_max_error": 2.9341112872671715e-14,
-      "kappa0": 1.0000000000000009,
+      "kappa0": 1.0000000000000007,
       "kappa0_bound": 1.0,
       "kappa0_tier": "normal",
       "sum_abs_w": 29.017315477048438,
@@ -2371,7 +2364,7 @@
       "node_count": 586,
       "max_error": 5.440143123988793e-14,
       "real_part_max_error": 4.423328023306361e-14,
-      "kappa0": 1.0000000000000007,
+      "kappa0": 1.0000000000000009,
       "kappa0_bound": 1.0,
       "kappa0_tier": "normal",
       "sum_abs_w": 29.01731547704844,
@@ -2898,5 +2891,12 @@
         "beta_min": 0.0
       }
     }
-  ]
+  ],
+  "clause": {
+    "name": "height",
+    "numerator": "varpi / x_min -- a sampling line height over a band gap (the chi0 probe and the MPA fit stage)",
+    "beta_max": 64.0,
+    "derivation": "the height clause's edge is an OBSERVATION: the protocol fixes varpi_1 = 0.2 Ry and varpi_2 = 1 Ha = 2 Ry, the in-tree decks' gaps run 0.0497 to 0.3427 Ry, and the resulting omega-hat runs 0.58 to 40.214 (MINIMAX_REQUEST_CENSUS.md sec 7.2). 64 is the next rung of a geometric ladder above the largest measured value.",
+    "note": "beta is ONE dimensionless number formed from two unrelated numerators, and the two ranges overlap near 0.6, so a request must say which clause it is asking under. common.minimax_beta_selector.CATALOG_CLAUSE stamps this catalog's target.version with the clause above and refuses a request from the other one by name."
+  }
 }
