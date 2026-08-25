@@ -1658,10 +1658,11 @@ def main(argv=None):
     # projected wavefunction cache.
     _fit_subset = keep_idx if _rank_multiplier > 0.0 else None
     _output_keep = None if _fit_subset is not None else keep_idx
-    (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
+    (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          args.input, params, log, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset)
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
         # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
@@ -1825,8 +1826,9 @@ def main(argv=None):
     # that at the one on-grid point it always has (Γ, below).  ``--vq-mode
     # ongrid`` extends that existing special case to every on-grid Q — no
     # interpolation error, no b26p stencil, no ζ.  It also makes the exciton
-    # bandstructure runnable on a restart whose ζ is stored IBZ-only (the
-    # D3h-orbit-closure cascade), which ``vq_interp`` refuses.  Cost: the full
+    # bandstructure runnable without reading ζ.  Pure refit is also
+    # compatible with IBZ-only ζ: it reads metadata/provenance, then rebuilds
+    # ζ(Q) from the canonical full-BZ WFN source.  Cost of ongrid: the full
     # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
     ongrid = (args.vq_mode == "ongrid")
     # ``refit`` used to refuse ("not wired") and to be unusable anyway: its
@@ -1905,7 +1907,8 @@ def main(argv=None):
             # producer's own Coulomb door.  So this branch loads ζ and stops.
             zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
                                             mesh=mesh_xy, log_fn=log,
-                                            require_slab=False)
+                                            require_slab=False,
+                                            require_full_bz_zeta=False)
             prep = eval_vq = pinvF = coeffs_packed = None
             if head_mbz:
                 raise SystemExit(
@@ -2566,6 +2569,16 @@ def main(argv=None):
     # is not on any solver path: one sync, once, after all the physics.
     from common.collectives import barrier
     barrier("exciton_bands.outputs_written")
+
+    # The streamed refit owns a second mesh-aware WFN loader plus its bounded
+    # PsiGStore.  Release the store first, then enter the loader's collective
+    # close while every rank is still aligned at the output barrier.
+    if rst is not None:
+        try:
+            vq_interp.close_refit_state(rst)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"  [exciton_bands] refit resource close failed "
+                  f"({type(exc).__name__}: {exc}); continuing to exit")
 
     # CLOSE THE LOADER HERE, EXPLICITLY, WHILE THE RANKS ARE STILL IN STEP.
     # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``

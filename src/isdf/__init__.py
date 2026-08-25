@@ -11,7 +11,8 @@ from isdf.core import (
     fit_one_rchunk,      # fused per-r-chunk ζ workhorse; consumers loop this
     solve_zeta_charge_dense,  # (C, Z) -> ζ on ONE whole tile, producer's solve
 )
-from isdf.galerkin import GalerkinBasis, fit_galerkin_basis
+from isdf.galerkin import (GalerkinBasis, fit_galerkin_basis,
+                           iter_galerkin_rchunks)
 
 __all__ = [
     "pair_density", "pair_density_aot_peak_bytes",
@@ -19,4 +20,5 @@ __all__ = [
     "c_q_from_psi_sm", "z_q_from_psi_sm",
     "factor_c_q", "solve_zeta", "fit_one_rchunk",
     "solve_zeta_charge_dense", "GalerkinBasis", "fit_galerkin_basis",
+    "iter_galerkin_rchunks",
 ]
