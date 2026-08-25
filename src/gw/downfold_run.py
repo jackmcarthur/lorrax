@@ -1758,7 +1758,8 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
     THE STAMP IS THE FFT-INDEX HASH, NOT THE TEXT FILE'S.  This function used
     to write ``md5(bytes of the .txt)``, which is a perfectly good hash of a
     different object: ``centroids_charge_md5`` is defined by
-    ``gw_init._centroid_table_md5`` as md5 over the int64 FFT-GRID INDICES,
+    ``file_io.isdf_header.centroid_table_md5`` as md5 over the int64
+    FFT-GRID INDICES,
     and ``gw_init`` compares against it in exactly that algebra.  A bundle
     stamped the other way can never match, so the stamp was not merely
     unverifiable but actively false — a downfolded bundle handed to a fresh
