@@ -242,6 +242,17 @@ def main(argv=None):
 	# refusal names the mode; a typo'd mode value never reaches this line
 	# because ``config.compute_mode`` already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+	# Dynamic SC currently returns two basis sectors by design: finalized H/X
+	# operators are rotated back to DFT bands, while the full C(omega) operator
+	# remains in QP bands for the QSGW ansatz.  Refuse that unsupported output
+	# contract here, before screening or the expensive SC loop.  A second guard
+	# remains at the post-Sigma seam as an invariant against future routing drift.
+	if qp_solver is QPSolver.SELF_CONSISTENT and mode.is_dynamic:
+		raise ValueError(
+			"self-consistent dynamic EQP output is not basis-consistent: H and "
+			"Sigma_x would be dft_band while the full C(omega) operator remains "
+			"qp_band. Rotate the full correlation operator before running this "
+			"combination.")
 	do_screened = mode.needs_screening
 	print0(
 		f"  Head policy: head_correction={config.head.correction.value}; "
@@ -859,6 +870,13 @@ def main(argv=None):
 	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
+	if (qp_solver is QPSolver.SELF_CONSISTENT
+			and sigma_c_omega is not None):
+		raise ValueError(
+			"self-consistent dynamic EQP output is not basis-consistent: H and "
+			"Sigma_x have been rotated to dft_band, while the full C(omega) "
+			"operator remains qp_band. Refusing to combine their diagonals until "
+			"the full C(omega) operator is rotated consistently.")
 	head_sigma_diag_w_kn_ry = (
 		sc_result.head_sigma_diag_dft_w_kn_ry
 		if qp_solver is QPSolver.SELF_CONSISTENT
@@ -869,13 +887,6 @@ def main(argv=None):
 	omega_grid_ry = (
 		np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
 		if sigma_result.omega_grid_ry is not None else None)
-	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
-	# only).  Same spelling as the PPM pipeline's step 4.
-	sigma_xc_at_dft_ev = (
-		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
-		+ sigma_c_at_dft_ev
-		if sigma_c_at_dft_ev is not None else None)
-
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
 	if not config.no_degen_averaging:
@@ -893,17 +904,10 @@ def main(argv=None):
 			arr = np.asarray(diag)
 			if arr.ndim == 1:
 				arr = np.broadcast_to(arr, np.asarray(enk_dft).shape)
-			if arr.ndim == 2:
+			if arr.ndim in (2, 3):
 				return average_within_degenerate_sets(
 					arr, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 					tol_ry=float(config.degen_avg_tol_ry))
-			if arr.ndim == 3:
-				return np.stack([
-					average_within_degenerate_sets(
-						slab,
-						energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-						tol_ry=float(config.degen_avg_tol_ry))
-					for slab in arr], axis=0)
 			raise ValueError(
 				f"head diagnostic has unsupported shape {arr.shape}")
 
@@ -923,6 +927,17 @@ def main(argv=None):
 		if head_sigma_diag_w_kn_ry is not None:
 			head_sigma_diag_w_kn_ry = _average_head_diag(
 				head_sigma_diag_w_kn_ry)
+
+	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
+	# only).  Form it AFTER the one canonical conditioning seam above: forming
+	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
+	# unequal degenerate diagonals even while every other live text output used
+	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
+	# so this same expression deliberately preserves the raw red twin.
+	sigma_xc_at_dft_ev = (
+		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
+		+ sigma_c_at_dft_ev
+		if sigma_c_at_dft_ev is not None else None)
 
 	# ---- Single H-build + diagonalization on replicated arrays ----
 	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
@@ -984,6 +999,14 @@ def main(argv=None):
 	if sigma_c_omega is not None:
 		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
 			sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		if not config.no_degen_averaging:
+			# Output-only diagonal curve.  The full persisted operator stays raw,
+			# while this curve uses the SAME canonical group owner at every omega;
+			# assemble_eqp consequently derives C(E_DFT) and Z from one function.
+			sigma_c_omega_diag_ev = average_within_degenerate_sets(
+				sigma_c_omega_diag_ev,
+				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry))
 		omega_rel_ev = omega_grid_ev
 	else:
 		sigma_c_omega_diag_ev = None

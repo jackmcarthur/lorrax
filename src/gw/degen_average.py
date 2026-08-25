@@ -33,13 +33,18 @@ def average_within_degenerate_sets(
     energies_kn_ry: np.ndarray,
     tol_ry: float = TOL_DEGENERACY_RY,
 ) -> np.ndarray:
-    """Return a copy of ``values_kn`` with each band replaced by the mean
-    over its contiguous degenerate set in ``energies_kn_ry``.
+    """Average trailing ``(k, band)`` values over each degenerate set.
+
+    ``values_kn`` may carry any number of leading spectral/component axes;
+    only its trailing ``(nk, nb)`` must match ``energies_kn_ry``.  This is the
+    one group owner for both ordinary diagonals and output-only C(omega)
+    diagonal curves, so C(E_DFT) and its derivative cannot be conditioned by
+    different loops.
 
     Parameters
     ----------
-    values_kn : np.ndarray, shape (nk, nb), real or complex
-        Per-(k, band) diagonal values to be averaged.
+    values_kn : np.ndarray, shape (..., nk, nb), real or complex
+        Per-(k, band) values, optionally with leading spectral axes.
     energies_kn_ry : np.ndarray, shape (nk, nb)
         DFT eigenvalues in **Rydberg** (matching BGW's tol convention).
     tol_ry : float
@@ -48,26 +53,29 @@ def average_within_degenerate_sets(
 
     Returns
     -------
-    out : np.ndarray, shape (nk, nb), same dtype as ``values_kn``
+    out : np.ndarray, shape (..., nk, nb), same dtype as ``values_kn``
         Group-averaged values.
     """
     out = np.array(values_kn, copy=True)
     e = np.asarray(energies_kn_ry, dtype=np.float64)
-    if out.shape != e.shape:
+    if out.ndim < 2 or out.shape[-2:] != e.shape:
         raise ValueError(
-            f"average_within_degenerate_sets: values shape {out.shape} "
-            f"!= energies shape {e.shape}"
+            "average_within_degenerate_sets: values trailing shape "
+            f"{out.shape[-2:] if out.ndim >= 2 else out.shape} != energies "
+            f"shape {e.shape}"
         )
-    nk, nb = out.shape
+    nk, nb = e.shape
     for k in range(nk):
         i0 = 0
         for i in range(1, nb):
             if abs(e[k, i] - e[k, i - 1]) >= tol_ry:
                 if i - i0 > 1:
-                    out[k, i0:i] = out[k, i0:i].mean()
+                    out[..., k, i0:i] = out[..., k, i0:i].mean(
+                        axis=-1, keepdims=True)
                 i0 = i
         if nb - i0 > 1:
-            out[k, i0:nb] = out[k, i0:nb].mean()
+            out[..., k, i0:nb] = out[..., k, i0:nb].mean(
+                axis=-1, keepdims=True)
     return out
 
 
