@@ -223,6 +223,7 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     import jax.numpy as jnp
     from types import SimpleNamespace
     from bandstructure.htransform import h_transform
+    from symmetry_maps import SymMaps
 
     mesh = _mesh(1)
     nk, states, rank = 2, 6, 8
@@ -238,19 +239,30 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     wfn = SimpleNamespace(efermi=0.0, nelec=2)
     kpath = np.asarray([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]])
     kpath_data = (kpath, np.arange(2.0), [0], ["Gamma"], [0])
+    sym = object.__new__(SymMaps)
+    sym.unfolded_kpts = np.asarray(
+        [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
     lines = []
     with mesh:
         result = h_transform(
             meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
             kpath_data, lines.append, mesh,
-            n_return_bands=3)
+            n_return_bands=3, sym=sym)
 
     # VBM is active row 1 at -2 Ry, so the raised active state appears at +3
     # Ry.  The old energy truncation published the lower guard at +1 Ry.
     np.testing.assert_allclose(
         result["energies_sorted"], [[-1.0, 0.0, 3.0]] * 2,
         rtol=0.0, atol=2.0e-11)
+    np.testing.assert_array_equal(result["coincident_path_indices"], [0])
+    np.testing.assert_array_equal(result["coincident_coarse_indices"], [0])
+    np.testing.assert_allclose(
+        result["coincident_exact"], [[-1.0, 0.0, 3.0]],
+        rtol=0.0, atol=0.0)
+    assert result["coincident_max_abs_ry"] < 2.0e-11
+    np.testing.assert_array_equal(result["gamma_exact"], [-1.0, 0.0, 3.0])
     assert "active/guard character selection" in " ".join(lines)
+    assert "path/coarse coincidences: 1 path row" in " ".join(lines)
 
 
 @pytest.mark.parametrize(("first_dft_guard", "must_refuse"), (

@@ -106,6 +106,20 @@ def test_common_grid_map_keeps_every_point_when_grids_nest_or_match():
             fine_xyz / np.asarray(fine_grid)[None, :], rtol=0.0, atol=0.0)
 
 
+def test_qpoint_lookup_keeps_signed_representatives_periodically_paired():
+    """The CrI3 -4/9 representative is the same point as wrapped +5/9."""
+    sym = object.__new__(SymMaps)
+    sym.unfolded_kpts = np.asarray([
+        [0.0, 0.0, 0.0],
+        [0.0, -4.0 / 9.0, 0.0],
+        [1.0 / 3.0, 1.0 / 3.0, 0.0],
+    ])
+    assert sym.find_qpoint_index([0.0, 5.0 / 9.0, 0.0]) == 1
+    assert sym.find_qpoint_index([0.0, -4.0 / 9.0, 0.0]) == 1
+    with pytest.raises(ValueError, match="periodic tolerance"):
+        sym.find_qpoint_index([0.0, 0.2, 0.0], tol=1.0e-8)
+
+
 # ---------------------------------------------------------------------------
 # kgrid_shift_map — the C-order fold and its umklapp G
 # ---------------------------------------------------------------------------

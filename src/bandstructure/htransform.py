@@ -1354,7 +1354,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
-                progress_fn=None, quality_record_fn=None):
+                progress_fn=None, quality_record_fn=None, sym=None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1524,6 +1524,11 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     energies_sorted = None
     path_range = None
     gamma_exact = None
+    coincident_path_indices = np.empty((0,), dtype=np.int32)
+    coincident_coarse_indices = np.empty((0,), dtype=np.int32)
+    coincident_exact = None
+    coincident_max_abs_ry = None
+    coincident_rms_ry = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -1779,19 +1784,88 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # whenever the window started above band zero.
         fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
         _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
+        if not np.all(np.isfinite(_k_np)):
+            raise ValueError(
+                "htransform path contains non-finite crystal coordinates; "
+                "coarse/path identity cannot be measured.")
+        labelled_gamma_positions = tuple(int(i) for i in gamma_positions)
         if not gamma_positions:
             # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
             # rows (they are exact zeros and would win the tie on any path
             # that does not start at Γ).  Host numpy — two values for a log
             # line and the plot markers, no reason for two eager XLA modules.
             gamma_positions = [int(np.argmin(np.linalg.norm(_k_np, axis=1)))]
-        _gamma_position = int(gamma_positions[0])
-        _gamma_is_exact = bool(
-            np.linalg.norm(_k_np[_gamma_position]) <= 1.0e-10)
-        # The first ``nb_keep`` compact rows ARE the returned active block.
-        # Sorting all fitted energies and truncating here would repeat the
-        # guard-contamination defect in the independent Gamma receipt.
-        gamma_exact = np.sort(np.asarray(enk_sigma[:nb_keep, 0]))
+
+        # Every actual path/coarse coincidence, through the symmetry
+        # service's periodic coordinate owner.  This replaces the old
+        # ``enk_sigma[:, 0] == Gamma`` assumption, which was false on a
+        # shifted mesh and observed only one point even on an unshifted one.
+        # It is a receipt rather than an accuracy refusal: whole-state QRCP
+        # is an approximate projection and its independent fine-QE oracle
+        # decides the interpolation tolerance.
+        if sym is not None:
+            path_rows = []
+            coarse_rows = []
+            for iq, q_frac in enumerate(_k_np):
+                try:
+                    ik_coarse = int(sym.find_qpoint_index(q_frac))
+                except ValueError:
+                    continue
+                path_rows.append(iq)
+                coarse_rows.append(ik_coarse)
+            coincident_path_indices = np.asarray(path_rows, dtype=np.int32)
+            coincident_coarse_indices = np.asarray(
+                coarse_rows, dtype=np.int32)
+
+        if coincident_path_indices.size:
+            enk_host = np.asarray(gather_to_host(enk_sigma), dtype=np.float64)
+            # Match the publication route exactly.  With an active/DFT-guard
+            # boundary it selects the COMPLETE authenticated corrected block
+            # before returning its lowest interior; without that boundary it
+            # energy-orders the whole fitted Hamiltonian.
+            n_reference_candidates = (
+                states if active_R is None else n_qp_corrected)
+            candidate = enk_host[
+                :n_reference_candidates, coincident_coarse_indices].T
+            coincident_exact = np.sort(candidate, axis=1)[:, :nb_keep]
+            coincident_delta = (
+                energies_sorted[coincident_path_indices] - coincident_exact)
+            coincident_max_abs_ry = float(np.max(np.abs(coincident_delta)))
+            coincident_rms_ry = float(np.sqrt(np.mean(
+                np.square(coincident_delta))))
+            worst_flat = int(np.argmax(np.abs(coincident_delta)))
+            worst_match, worst_band = np.unravel_index(
+                worst_flat, coincident_delta.shape)
+            log_fn(
+                "  [receipt] path/coarse coincidences: "
+                f"{coincident_path_indices.size} path row(s), "
+                f"max|Delta E|={coincident_max_abs_ry:.6e} Ry, "
+                f"RMS={coincident_rms_ry:.6e} Ry; worst path row "
+                f"{int(coincident_path_indices[worst_match])}, coarse row "
+                f"{int(coincident_coarse_indices[worst_match])}, returned "
+                f"band {int(worst_band)}")
+
+            # Plot an exact Gamma marker only when a Gamma-labelled path row
+            # is also the coarse mesh's periodic Gamma row.  A nearest path
+            # point or row zero is not an exact Gamma reference.
+            try:
+                coarse_gamma = int(sym.find_qpoint_index(
+                    np.zeros(3, dtype=np.float64)))
+            except ValueError:
+                coarse_gamma = None
+            match_by_path = dict(zip(
+                coincident_path_indices.tolist(),
+                coincident_coarse_indices.tolist()))
+            for gamma_path in labelled_gamma_positions:
+                if match_by_path.get(gamma_path) == coarse_gamma:
+                    match_row = int(np.where(
+                        coincident_path_indices == gamma_path)[0][0])
+                    gamma_exact = coincident_exact[match_row].copy()
+                    break
+        else:
+            log_fn(
+                "  [receipt] path/coarse coincidences: none; no nearest-point "
+                "value is labelled exact")
         # Shift all reported energies so VBM is at 0
         if energies_on_path is not None:
             energies_on_path = energies_on_path - fermi_energy
@@ -1799,16 +1873,27 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             energies_sorted = energies_sorted - fermi_energy
         if gamma_exact is not None:
             gamma_exact = gamma_exact - fermi_energy
+        if coincident_exact is not None:
+            coincident_exact = coincident_exact - fermi_energy
         # Recompute path range after shift and report
         path_range = (float(energies_sorted.min()), float(energies_sorted.max()))
         log_fn(
             f"Path energy range: {path_range[0] * RYD_TO_EV:.5f} to "
             f"{path_range[1] * RYD_TO_EV:.5f} eV (VBM@0)")
-        delta = ((energies_sorted[gamma_positions[0]] - gamma_exact)
-                 * RYD_TO_EV * 1000.0)
-        log_fn(("Γ Δε (meV): " if _gamma_is_exact else
-                "nearest-path-point Δε vs Γ source (meV): ")
-               + ", ".join(f"{d:+.2f}" for d in delta[:6]))
+        # Gamma deltas (in meV) remain unchanged by uniform shift.  Unlike
+        # the old receipt this is emitted only for an authenticated
+        # path/coarse Gamma coincidence.
+        if gamma_exact is not None:
+            gamma_path = next(
+                i for i in labelled_gamma_positions
+                if i in coincident_path_indices.tolist()
+                and coincident_coarse_indices[
+                     np.where(coincident_path_indices == i)[0][0]]
+                 == coarse_gamma)
+            delta = ((energies_sorted[gamma_path] - gamma_exact)
+                     * RYD_TO_EV * 1000.0)
+            log_fn("Γ Δε (meV): "
+                   + ", ".join(f"{d:+.2f}" for d in delta[:6]))
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
         timing.record("ht.kpath_host_tail", _perf() - _t0)  # instrument:
@@ -1832,6 +1917,11 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 states - 1 if a_band_index is None else a_band_index),
             "shoulder_band_local": int(states - 1),
         },
+        "coincident_path_indices": coincident_path_indices,
+        "coincident_coarse_indices": coincident_coarse_indices,
+        "coincident_exact": coincident_exact,
+        "coincident_max_abs_ry": coincident_max_abs_ry,
+        "coincident_rms_ry": coincident_rms_ry,
         "kpath_data": (kpath_frac, x_path, node_indices, node_labels, gamma_positions),
     }
 
@@ -1860,6 +1950,10 @@ def plot_bands(result):
 
     x_ticks = x_path[np.asarray(node_indices, dtype=int)]
     labels = [(lbl or "") for lbl in node_labels]
+    labelled_gamma = {
+        int(idx) for idx, lbl in zip(node_indices, node_labels)
+        if (lbl or "").strip() == "Gamma" or (lbl or "").strip() == "Γ"
+    }
     for xpos in x_ticks:
         ax.axvline(xpos, color='k', lw=0.6, alpha=0.3)
     ax.set_xticks(x_ticks, labels)
@@ -1867,7 +1961,8 @@ def plot_bands(result):
     for pos_idx, idx in enumerate(gamma_positions or [0]):
         xpos = x_path[idx]
         label_exact = 'Exact Γ' if pos_idx == 0 else None
-        label_ht = 'HT Γ' if pos_idx == 0 else None
+        label_ht = (('HT Γ' if idx in labelled_gamma else 'HT nearest Γ')
+                    if pos_idx == 0 else None)
         if gamma_exact_ev is not None:
             ax.scatter(np.full(nb_keep, xpos), gamma_exact_ev, marker='o', facecolors='none', edgecolors='red', label=label_exact)
         ax.scatter(np.full(nb_keep, xpos), energies_ev[idx], marker='x', color='black', label=label_ht)
@@ -2147,7 +2242,8 @@ def main(argv=None):
                              n_return_bands=n_return_bands,
                              qp_corrected_band_range=qp_corrected_band_range,
                              progress_fn=report.progress,
-                             quality_record_fn=_quality_records.append)
+                             quality_record_fn=_quality_records.append,
+                             sym=sym)
     _transform_progress.step()
     _transform_progress.finish()
 
