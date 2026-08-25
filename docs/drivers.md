@@ -221,6 +221,23 @@ Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and w
 ## htransform — `bandstructure.htransform`
 
 Hamiltonian-transformation bandstructure interpolation to an arbitrary k-path from coarse-grid data. `isdf.galerkin` selects the published shared whole-state basis from stacked full-Bloch states with deterministic randomized QRCP, factors the selected physical states exactly, and projects all states into that one alpha gauge. The canonical `PsiGStore` and WFN transforms stream the G-flat→real-space work; centroids are only registered evaluation points for the fitted basis. The driver forms `fH_k = Σ_n f(ε_nk)c_nk c_nkᴴ`, applies the canonical flat-k IFFT to obtain `fH_R`, and recovers path energies with the existing batched eigensolver plus the archived Newton inverse. `--qp-rotations qp_wfn_rotations.h5` is the full quasiparticle-Hamiltonian path: it consumes the matched `U_mnk,E_qp` artifact through `file_io.qp_wfn` and rotates only the compact Galerkin state rows, so the unchanged builder represents `f(H_QP)=U f(E_QP) Uᴴ`. `--eqp-file` is deliberately the cheaper diagonal approximation: it changes energies in the current WFN band labels and cannot represent off-diagonal QP mixing.
+
+When the fitted window contains DFT guard states above a smaller returned QP
+window, energy ordering is not a state label: a guard may lie below a raised QP
+conduction state.  The driver therefore forms, from the same compact rows and
+the same flat-k transform,
+`P_A(k)=Σ_{n<n_return}|c_nk><c_nk|` and its Fourier interpolant `P_A(q)`.
+For `fH(q) u_j(q)=λ_j(q)u_j(q)`, it returns exactly the `n_return` states
+with largest active character `p_j=<u_j|P_A(q)|u_j>`, then orders that retained
+energy set.  This rule is invariant to unitary rotations inside the active
+coarse-grid block and reproduces that block at every coarse node; it does not
+invent energies for the DFT guards.  A numerically unresolved character cut
+refuses unless the two boundary energies are in one multiplet, in which case
+the published energy multiset is basis-independent.  Eigenvector phase cannot
+reach the file (only phase-invariant character and energies leave the kernel),
+and stable energy/index tie-breaking makes the representation deterministic.
+The character operator is face-sharded like `fH_R`; no rank-squared object is
+gathered or replicated.
 Consumes the same deck as gw_jax ([cohsex] keys + `K_POINTS {crystal_b}` path), `WFN.h5` (or `--wfn-file WFN_qp.h5`), `centroids_file`; writes `bandstructure.dat` (VBM shifted to 0, energies in eV; rank 0 is the only writer). Mutually exclusive `--basis-output` and `--basis-input` publish or require the reusable mesh-independent fit artifact; `isdf.galerkin` owns both the basis and its stamped SlabIO lifecycle. Distributed-key coverage (`eigh_backend`, `use_low_mem_eigh`) and the per-rank memory story: `docs/dev/large_nmu_operation.md`.
 The returned band window is `(nelec−nval, nelec+ncond)`. Standalone output
 requires `nval=nelec`, hence it begins at absolute band zero; internal BSE
