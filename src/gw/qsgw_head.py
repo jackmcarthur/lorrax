@@ -2808,23 +2808,22 @@ def static_gauge_second_order_component_sharded(
     multiply_six = make_distributed_band_matmul(mesh, n_batch_axes=2)
 
     def _multiply_in_six(left, right):
-        """Reuse the first-jet's sole six-component matmul executable."""
+        """Run one bounded block on the first-jet's six-wide executable."""
         count = int(left.shape[0])
         if right.shape != left.shape:
             raise ValueError(
                 f"paired component products differ: {left.shape}/{right.shape}")
-        rows = []
-        for start in range(0, count, 6):
-            lblock = left[start:start + 6]
-            rblock = right[start:start + 6]
-            pad = 6 - int(lblock.shape[0])
-            if pad:
-                zeros = jnp.zeros(
-                    (pad, nk, storage, storage), dtype=left.dtype)
-                lblock = jnp.concatenate((lblock, zeros), axis=0)
-                rblock = jnp.concatenate((rblock, zeros), axis=0)
-            rows.append(multiply_six(lblock, rblock)[:6 - pad if pad else 6])
-        return jnp.concatenate(rows, axis=0)
+        if not 0 < count <= 6:
+            raise ValueError(
+                "second-order band products must be streamed in one "
+                f"six-component block; got {count}")
+        pad = 6 - count
+        if pad:
+            zeros = jnp.zeros(
+                (pad, nk, storage, storage), dtype=left.dtype)
+            left = jnp.concatenate((left, zeros), axis=0)
+            right = jnp.concatenate((right, zeros), axis=0)
+        return multiply_six(left, right)[:count]
 
     def _cartesian_covariant_derivatives(operators):
         rows = []
@@ -2864,32 +2863,31 @@ def static_gauge_second_order_component_sharded(
     t_pair = jnp.stack(tuple(retained_t[a, b] for a, b in pair_axes))
 
     # One existing distributed-matmul family owns every T*Gamma and A*Q
-    # product.  The component axis is flattened so no new band layout or
-    # manual collective appears here.
-    tg_left = jnp.broadcast_to(
-        t_pair[:, None], (3, 3, nk, storage, storage),
-    ).reshape(9, nk, storage, storage)
-    tg_right = jnp.broadcast_to(
-        gamma_dir[None], (3, 3, nk, storage, storage),
-    ).reshape(9, nk, storage, storage)
-    aq_left = jnp.broadcast_to(
-        connection[:, None, None], (2, 2, 3, nk, storage, storage),
-    ).reshape(12, nk, storage, storage)
-    aq_right = jnp.broadcast_to(
-        q_current[None], (2, 2, 3, nk, storage, storage),
-    ).reshape(12, nk, storage, storage)
-    products = _multiply_in_six(
-        jnp.concatenate((tg_left, aq_left), axis=0),
-        jnp.concatenate((tg_right, aq_right), axis=0),
-    )
-    t_gamma = products[:9].reshape(3, 3, nk, storage, storage)
-    a_q = products[9:].reshape(2, 2, 3, nk, storage, storage)
-    current_d2 = jnp.stack(tuple(
-        t_gamma[p]
-        - 1.0j * (a_q[a, b] + a_q[b, a])
-        + q2_cart[a, b]
-        for p, (a, b) in enumerate(pair_axes)
-    ))
+    # product.  Stream one retained pair at a time: the first block holds
+    # [T_ab*Gamma_i, A_a*Q_i,b], the diagonal reuses its A*Q half, and only
+    # xy needs a second (three-valid, six-wide padded) A_b*Q_i,a block.
+    # No 21-component band-square input or product carrier is materialized.
+    current_d2_rows = []
+    for p, (a, b) in enumerate(pair_axes):
+        primary_left = jnp.concatenate((
+            jnp.broadcast_to(
+                t_pair[p][None], (3, nk, storage, storage)),
+            jnp.broadcast_to(
+                connection[a][None], (3, nk, storage, storage)),
+        ), axis=0)
+        primary_right = jnp.concatenate((gamma_dir, q_current[b]), axis=0)
+        primary = _multiply_in_six(primary_left, primary_right)
+        current = primary[:3] - 1.0j * primary[3:]
+        if a == b:
+            current = current - 1.0j * primary[3:]
+        else:
+            secondary_left = jnp.broadcast_to(
+                connection[b][None], (3, nk, storage, storage))
+            secondary = _multiply_in_six(
+                secondary_left, q_current[a])
+            current = current - 1.0j * secondary
+        current_d2_rows.append(current + q2_cart[a, b])
+    current_d2 = jnp.stack(current_d2_rows)
     transition_d2 = jnp.concatenate((t_pair[:, None], current_d2), axis=1)
 
     velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
