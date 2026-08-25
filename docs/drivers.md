@@ -259,7 +259,7 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `wfn_fi_q_chunk` | 0 = N_q_coarse | fine-q chunk per f(H(q)) build; floor, rounded to device count |
 | `--a-band` | top band | band whose bandwidth sets the f-transform scale a |
 | `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
-| `--fh-diagnostics` | `auto` (follows `--verbose`) | `on`/`off` force only optional fH_k range statistics. The paired canonical FFT round-trip, small `N_band×N_band` transformed-spectrum recovery, and Newton residual run at every coarse k regardless of this switch. |
+| `--fh-diagnostics` | `auto` (follows `--verbose`) | `on`/`off` force only optional fH_k range statistics. The paired canonical FFT round-trip is enforced at the flat-k service's registered relative `1e-12` contract and the Newton residual refuses above `1e-12` at every coarse k regardless of this switch. The small `N_band×N_band` transformed-spectrum recovery is diagnostic because whole-state QRCP is approximate. |
 | env `LORRAX_GALERKIN_CHUNK_GIB` | 6 | bounded whole-state r-stream tile budget; changes chunk count, never fitted basis semantics |
 
 Failure modes: a standalone occupied-band refusal means `nval` omitted lower
@@ -268,11 +268,13 @@ uncontrolled lower spectral boundary. A QRCP search-saturation refusal means
 the rank criterion reached the configured search ceiling; inspect its
 projection receipts before increasing `htransform_rank_multiplier`. An
 `f-shoulder` refusal means a requested output band is absent from fH at some
-coarse k; add guard bands, do not disable the gate. Newton inversion refuses
-when the archived 50-step method leaves `max|f(x)-y| > 1e-12 Ry`. The
-all-coarse FFT/spectrum/energy receipts are necessary implementation checks,
-not a positive locality certificate: a Fourier interpolant can reproduce every
-sample and still ring between samples. FATAL on `--eqp-file` not found/parsed;
+coarse k; add guard bands, do not disable the gate. Newton inversion stops as
+soon as the archived global residual contract is met and refuses if the
+50-step cap leaves `max|f(x)-y| > 1e-12 Ry`. The all-coarse FFT round-trip is
+an enforced transform invariant; the spectrum/energy values are necessary
+approximate-projection diagnostics. Neither is a positive locality
+certificate: a Fourier interpolant can reproduce every sample and still ring
+between samples. FATAL on `--eqp-file` not found/parsed;
 sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 20 Ry.
 
 ## bse — `bse.bse_jax`

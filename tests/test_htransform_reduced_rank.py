@@ -53,6 +53,10 @@ def test_newton_inverse_reports_the_archived_residual_contract():
         require_newton_converged(
             2.0 * NEWTON_RESIDUAL_MAX, where="red receipt")
 
+    inverse_src = inspect.getsource(newton_inv)
+    assert "lax.while_loop" in inverse_src
+    assert "lax.fori_loop" not in inverse_src
+
 
 def test_standalone_htransform_refuses_an_occupied_band_cut(monkeypatch):
     pytest.importorskip("jax")
@@ -108,11 +112,24 @@ def test_bse_consumers_forward_the_q_chunk_key():
         assert 'batch_size=int(params.get("wfn_fi_q_chunk", 0))' in src, name
         assert "centroid_subset_idx=_fit_subset" in src, name
         assert "_fit_subset = keep" in src, name
-        assert "_output_keep = None" in src, name
+        assert "centroid_keep_idx" not in src, name
 
     refit_src = (root / "vq_interp.py").read_text()
     assert "centroid_subset_idx=keep_idx" in refit_src
     assert "B_at_mu = B_at_mu[:, :," not in refit_src
+
+
+def test_kpath_inverts_only_physical_states_and_publishes_return_window():
+    """The rank-space null carrier is not a physical band window."""
+    root = Path(__file__).resolve().parents[1] / "src"
+    src = (root / "bandstructure" / "htransform.py").read_text()
+    fft_src = (root / "common" / "fft_helpers.py").read_text()
+
+    assert "[:nq, :states]" in src
+    assert "energies_on_path = energies_sorted_jax" in src
+    assert "jax.vmap(\n                lambda row: newton_inv" not in src
+    assert "FLAT_K_FFT_VALUE_RTOL = 1.0e-12" in fft_src
+    assert "fft_rel > FLAT_K_FFT_VALUE_RTOL" in src
 
 
 def test_exciton_a_band_reaches_both_htransform_calls():

@@ -41,7 +41,11 @@ from gw.gw_config import (
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
 )
-from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+from common.fft_helpers import (
+    FLAT_K_FFT_VALUE_RTOL,
+    make_flat_k_fftn,
+    make_flat_k_ifftn,
+)
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -413,8 +417,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         recovered_f = jax.vmap(jnp.linalg.eigvalsh)(small_fH)
         expected_f = jnp.sort(f_eps_T, axis=1)
         f_recovery_error = jnp.max(jnp.abs(recovered_f - expected_f))
-        recovered_e, inverse_residual = jax.vmap(
-            lambda row: newton_inv(a_f, n_f, shift, row.real))(recovered_f)
+        recovered_e, inverse_residual = newton_inv(
+            a_f, n_f, shift, recovered_f.real)
         energy_recovery_error = jnp.max(
             jnp.abs(jnp.sort(recovered_e, axis=1)
                     - jnp.sort(enk_sigma.T, axis=1)))
@@ -422,8 +426,12 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         # Use the paired canonical flat-k service for the complete inverse
         # transform.  A one-point explicit Fourier sum can certify Gamma while
         # still missing an ordering, normalization or non-Gamma defect.
-        fft_roundtrip_error = jnp.max(jnp.abs(local_fftn(fH_R) - fH_k))
-        return (fH_k, fH_R, fft_roundtrip_error, f_recovery_error,
+        fft_roundtrip_abs = jnp.max(jnp.abs(local_fftn(fH_R) - fH_k))
+        fft_scale = jnp.max(jnp.abs(fH_k))
+        fft_roundtrip_rel = jnp.where(
+            fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
+            fft_roundtrip_abs)
+        return (fH_k, fH_R, fft_roundtrip_rel, f_recovery_error,
                 energy_recovery_error, jnp.max(inverse_residual))
 
     # Projection receipt, not a rank gate.  The published whole-state QRCP
@@ -443,12 +451,21 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    (fH_k, fH_R, fft_roundtrip_error, f_recovery_error,
+    (fH_k, fH_R, fft_roundtrip_rel, f_recovery_error,
      energy_recovery_error, inverse_residual) = _build(ctilde, f_eps)
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
-        f"round-trip max|FFT(IFFT(fH))-fH|="
-        f"{float(fft_roundtrip_error):.3e}")
+        f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
+        f"{float(fft_roundtrip_rel):.3e} "
+        f"(limit {FLAT_K_FFT_VALUE_RTOL:.1e})")
+    fft_rel = float(fft_roundtrip_rel)
+    if not np.isfinite(fft_rel) or fft_rel > FLAT_K_FFT_VALUE_RTOL:
+        raise ValueError(
+            "build_fH_R: canonical flat-k FFT round-trip violated the "
+            f"registered value-level contract: relative residual "
+            f"{fft_rel:.6e} exceeds {FLAT_K_FFT_VALUE_RTOL:.1e}.  "
+            "The forward/inverse pair must preserve every coarse-k fH tile; "
+            "do not publish or interpolate this Hamiltonian.")
     log_fn(
         f"  [receipt] all-coarse transformed spectrum: "
         f"max|eig(-A A^H)-f(eps)|={float(f_recovery_error):.3e} Ry; "
@@ -467,24 +484,35 @@ def newton_inv(a: float, n: float, shift: float, y: jax.Array,
                max_iter: int = 50) -> tuple[jax.Array, jax.Array]:
     """Invert ``f`` and return ``(x, max|f(x)-y|)``.
 
-    The 50-step cap, ``a/2`` step clip, exact ``df != 0`` condition and
-    1e-12 caller refusal are the archived implementation's convergence
-    contract.  Returning the residual keeps one inverse implementation while
-    letting each JITted caller enforce that contract at its existing host seam.
+    The global 1e-12 early stop, 50-step cap, ``a/2`` step clip and exact
+    ``df != 0`` condition are the archived implementation's convergence
+    contract.  ``y`` may have any shape: one array-valued ``lax.while_loop``
+    owns the inverse for every caller, and the global max residual is returned
+    so each caller can refuse at its existing host seam.
     """
     dxmax = a / 2.0
     x0 = y + shift  # Fortran initial guess: x = y + s
 
-    def body_fun(_, x_curr):
-        res = fun(a, n, shift, x_curr) - y
-        df_val = dfun(a, n, shift, x_curr)
-        dx = jnp.where(df_val != 0.0, -res / df_val, 0.0)
-        dx = jnp.clip(dx, -dxmax, dxmax)
-        return x_curr + dx
+    residual0 = fun(a, n, shift, x0) - y
 
-    x = lax.fori_loop(0, max_iter, body_fun, x0)
-    residual = jnp.max(jnp.abs(fun(a, n, shift, x) - y))
-    return x, residual
+    def cond_fun(carry):
+        iteration, _x_curr, residual = carry
+        return jnp.logical_and(
+            iteration < max_iter,
+            jnp.max(jnp.abs(residual)) > NEWTON_RESIDUAL_MAX)
+
+    def body_fun(carry):
+        iteration, x_curr, residual = carry
+        df_val = dfun(a, n, shift, x_curr)
+        dx = jnp.where(df_val != 0.0, -residual / df_val, 0.0)
+        dx = jnp.clip(dx, -dxmax, dxmax)
+        x_next = x_curr + dx
+        residual_next = fun(a, n, shift, x_next) - y
+        return iteration + 1, x_next, residual_next
+
+    _iteration, x, residual = lax.while_loop(
+        cond_fun, body_fun, (jnp.asarray(0), x0, residual0))
+    return x, jnp.max(jnp.abs(residual))
 
 
 def require_newton_converged(residual: float, *, where: str) -> None:
@@ -928,10 +956,11 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         f_eps, 0, nb_keep, shift, log_fn, rank=rank,
         where="htransform")
 
-    # Optional range diagnostics.  Coarse-grid correctness is not optional and
-    # is already receipted inside ``build_fH_R`` over every k through the paired
-    # canonical FFT and the nb-by-nb ``-A A^H`` spectral identity.  Keep this
-    # switch for the informational full-array extrema only.
+    # Optional range diagnostics.  The canonical FFT round-trip is an enforced
+    # invariant inside ``build_fH_R``; the nb-by-nb ``-A A^H`` spectrum is a
+    # diagnostic because the published whole-state QRCP projection is
+    # deliberately approximate.  Keep this switch for the informational
+    # full-array extrema only.
     @jax.jit
     def _diag_stats_fast(fH_k):
         return (jnp.min(jnp.real(fH_k)),
@@ -943,9 +972,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     # The former range + Gamma eigensolve + explicit Gamma Fourier receipt was
     # 1.442 s of the 4.327 s cache-cold ``h_transform`` stage and seven XLA
     # programs (PROFILE_htransform_exciton §1.2).  The Gamma-only checks are
-    # gone: the mandatory all-coarse receipts now share ``build_fH_R``'s one
-    # production compile.  This optional block is only the one small reduction
-    # whose values reach a verbose log and not ``bandstructure.dat``.
+    # gone: the mandatory FFT/Newton receipts and the all-coarse approximate-
+    # projection diagnostics now share ``build_fH_R``'s one production compile.
+    # This optional block is only the one small reduction whose values reach a
+    # verbose log and not ``bandstructure.dat``.
     #
     # ``fH_k`` exists ONLY for this block: the kpath solve consumes ``fH_R``
     # alone.  At the reference shape it is (64, 768, 768) complex128 = 576 MiB
@@ -961,7 +991,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             float(re_min), float(re_max), float(im_max)))
     else:
         log_fn("  [route] optional fH range diagnostics: OFF; the all-coarse "
-               "FFT/spectrum/Newton receipts remain enforced")
+               "FFT/Newton gates and approximate-spectrum receipt still run")
     timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
     del fH_k
 
@@ -1084,10 +1114,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
 
-        # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
-        # post-loop processing emits one compile rather than 4 (concatenate,
-        # sort, gather, vmap-newton).
-        # ``out_shardings=(rep, rep, rep)`` is a CORRECTNESS requirement at
+        # Bundle concat + physical-state slice + newton_inv + sort into ONE
+        # jit so the post-loop processing emits one compile rather than 4
+        # (concatenate, sort, gather, Newton loop).
+        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at
         # P>1, not
         # a placement preference.  ``batches`` arrive q-sharded
         # (``batch_eig_shard = P(('x','y'), None)``); left to inference the
@@ -1103,34 +1133,41 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # reference decks could not run multi-process at all
         # (PROFILE_htransform_exciton §1.5).
         #
-        # Replication is the right answer and not merely the safe one: the two
-        # arrays are consumed on the host by every process immediately below
-        # (``np.asarray``, ``np.max``, the writer gate), and the third output is
-        # one scalar Newton receipt.  They are small —
-        # ``energies`` is (nq, rank) f64 and ``energies_sorted`` (nq, nb_keep),
-        # 854 KB and 13 KB at nq=139 / rank 768, against the (nk, rank, rank)
-        # 576 MiB arrays this driver already holds.  Values are untouched:
-        # ``out_shardings`` moves data, it does not compute.
-        # Gate: ``tests/test_htransform_post_kpath_sharding.py``.
+        # Replication is the right answer and not merely the safe one: the
+        # retained energy array is consumed on the host by every process
+        # immediately below (``gather_to_host``, ``np.max``, the writer gate),
+        # and the second output is one scalar Newton receipt.  It is small —
+        # ``energies_sorted`` is (nq, nb_keep), 13 KB at nq=139 / nb_keep=12,
+        # against the (nk, rank, rank) 576 MiB arrays this driver already holds.
+        # Values are untouched: ``out_shardings`` moves data, it does not
+        # compute.
+        # Gate: ``tests/test_htransform_kpath_gates.py``.
         @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
-                 out_shardings=(rep, rep, rep))
+                 out_shardings=(rep, rep))
         def _post_kpath(batches, nq, nb_keep):
-            lambda_q = jnp.concatenate(batches, axis=0)[:nq]
-            energies, inverse_residual = jax.vmap(
-                lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
+            # The eigensolver returns the complete rank-dimensional spectrum,
+            # including fH's off-grid null carrier.  The archived ZHEEVR call
+            # selects eigenvalues 1..nbnd_window BEFORE Newton inversion; only
+            # these ``states`` eigenvalues correspond to fitted physical
+            # bands.  Inverting the positive/null tail can have df=0 and must
+            # neither fail the global residual nor enter a published file.
+            lambda_q = jnp.concatenate(batches, axis=0)[:nq, :states]
+            energies, inverse_residual = newton_inv(
+                a_f, n_f, shift, lambda_q.real)
             energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
-            return energies, energies_sorted, jnp.max(inverse_residual)
+            return energies_sorted, inverse_residual
 
         _t0 = _perf()                                      # instrument:
-        energies_on_path, energies_sorted_jax, inverse_residual = _post_kpath(
+        energies_sorted_jax, inverse_residual = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
+        energies_on_path = energies_sorted_jax
         require_newton_converged(
             float(inverse_residual), where="htransform path")
         # Report the sharding that was ACTUALLY produced, not the one asked
         # for.  Anything other than ``P()`` here is the non-addressable-fetch
         # crash of PROFILE_htransform_exciton §1.5 waiting for a P>1 run with
         # nq divisible by the device count.  ``_post_kpath`` now pins
-        # ``out_shardings=(rep, rep, rep)``, so this line should always read
+        # ``out_shardings=(rep, rep)``, so this line should always read
         # ``P()``;
         # it earns its keep by reporting the spec that came back rather than
         # the one that was requested.  Gated by
@@ -1305,9 +1342,9 @@ def main(argv=None):
     parser.add_argument("--fh-diagnostics", default="auto",
                         choices=("auto", "on", "off"),
                         help="Optional fH_k real/imaginary range statistics. "
-                             "The canonical FFT round-trip, transformed "
-                             "spectrum and Newton-inverse receipts run over "
-                             "every coarse k regardless of this switch. auto "
+                             "The canonical FFT/Newton gates and approximate-"
+                             "projection spectrum receipt run over every "
+                             "coarse k regardless of this switch. auto "
                              "(default) follows --verbose; on/off force only "
                              "the informational range reduction.")
     parser.add_argument("--eigh-backend", default=None,

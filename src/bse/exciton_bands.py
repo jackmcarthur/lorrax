@@ -1633,7 +1633,6 @@ def main(argv=None):
     # 20*nb QRCP search ceiling, not an exact parent-fit alternate.  Therefore
     # no parent-width B or projected-wavefunction cache is ever formed.
     _fit_subset = keep_idx
-    _output_keep = None
     (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          args.input, params, log, mesh_xy=mesh_xy,
@@ -1744,7 +1743,6 @@ def main(argv=None):
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
         mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-        centroid_keep_idx=_output_keep,
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
         distrib_la_batched_route=args.distrib_la_batched_route)

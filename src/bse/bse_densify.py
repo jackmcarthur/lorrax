@@ -593,7 +593,6 @@ def _interpolate_bse_data_to_grid(
 
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
     _fit_subset = keep
-    _output_keep = None
     (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
@@ -630,7 +629,6 @@ def _interpolate_bse_data_to_grid(
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-        centroid_keep_idx=_output_keep,
         distrib_la_batched_route=_distrib_la_batched_route)
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
@@ -640,10 +638,10 @@ def _interpolate_bse_data_to_grid(
     @partial(jax.jit, out_shardings=(x4, y4, x4, y4, rep, rep))
     def _split_pad(psi, enk):
         # psi (nk_f, n_val+n_cond, ns, n_mu); enk (nk_f, n_val+n_cond).
-        # A downfold parent→child column slice has already run INSIDE
-        # compute_wfns_fi as each q chunk entered its retained cache, before
-        # the global concatenate.  This jit therefore never receives a
-        # parent-width psi operand.
+        # ``initialize_wfns`` evaluated the sole whole-state basis directly
+        # on the resolved child centroid rows, so ``compute_wfns_fi`` and this
+        # split both receive the restart's final μ width.  There is no
+        # parent-width projected-wavefunction route here.
         psi_v = psi[:, :n_val]
         psi_c = psi[:, n_val:n_val + n_cond]
         psi_v = jnp.pad(psi_v, ((0, 0), (0, nv_pad - n_val), (0, 0),
