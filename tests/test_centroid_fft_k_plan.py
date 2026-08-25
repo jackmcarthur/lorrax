@@ -119,6 +119,11 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     contract = _function(gw_tree, "_resolve_zeta_fit_contract")
     geometry_calls = _calls(contract, "centroid_fft_tile_geometry")
     assert len(geometry_calls) == 1
+    divisor_calls = _calls(contract, "spec_divisor")
+    assert len(divisor_calls) == 1
+    assert ast.unparse(divisor_calls[0]) == (
+        "spec_divisor(mesh_xy, band_sphere_spec(), axis=1)"
+    )
     contract_k = next(
         kw.value for call in _calls(contract, "_ZetaFitContract")
         for kw in call.keywords if kw.arg == "loader_k_chunk"
