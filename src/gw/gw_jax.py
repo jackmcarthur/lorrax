@@ -1043,9 +1043,8 @@ def main(argv=None):
 	report.sigma_coverage(
 		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
 		sigma_result=sigma_result)
-	report.qp_energies(
-		wfn=wfn, sym=sym, band_slices=band_slices,
-		e_dft_ry=enk_dft, e_qp_ry=E_full)
+	report.qp_gap(
+		band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
 	_file_rows = [
 		("input deck", "read", args.input),
 		("DFT wavefunctions", "read", config.paths.wfn_file),
@@ -1076,8 +1075,9 @@ def main(argv=None):
 			"written" if os.path.exists(sigma_omega_h5_path) else "absent",
 			sigma_omega_h5_path))
 	_file_rows.append(("calculation report", "written", report.path))
-	report.files(_file_rows)
 	report.timings(timing.records(), wall=_wall)
+	report.warnings()
+	report.files(_file_rows)
 	report.finish()
 	production_stdout.close()
 

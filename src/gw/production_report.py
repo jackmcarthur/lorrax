@@ -14,6 +14,16 @@ from typing import Iterable
 
 import numpy as np
 
+from common.scientific_output import (
+    FLOAT_DIGITS,
+    abs_path,
+    architecture_lines,
+    band_range,
+    file_table_lines,
+    numerical_environment_lines,
+    policy,
+    symmetry_sampling_lines,
+)
 from common.units import RYD_TO_EV
 
 
@@ -23,33 +33,17 @@ _WARNING_WORDS = (
 )
 
 
-def _fmt_range(lo: int, hi: int) -> str:
-    """A human interval with its exact code-index convention."""
-    if hi <= lo:
-        return "none"
-    return f"{lo + 1}-{hi}  (indices [{lo},{hi}))"
-
-
-def _matrix_text(matrix) -> str:
-    rows = np.asarray(matrix, dtype=np.int64).reshape(3, 3)
-    return "[" + "; ".join(" ".join(f"{int(v):2d}" for v in row)
-                            for row in rows) + "]"
-
-
-def _abs(path: str | os.PathLike | None) -> str:
-    return "-" if not path else os.path.abspath(os.fspath(path))
-
-
 class GWProductionReport:
     """One clean GW report, owned and written only by process zero."""
 
     def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
-        self.path = _abs(path)
+        self.path = abs_path(path)
         self.runtime = runtime
         self.debug = bool(debug)
         self.stdout = stdout
         self.rank = int(getattr(runtime, "process_index", 0))
         self._warnings: list[str] = []
+        self._warnings_emitted = False
         self._stream = None
         if self.rank == 0:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -76,6 +70,13 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
+        # The long-loop cadence is part of the scientific run record, not
+        # component chatter.  LoopProgress owns these three stable shapes.
+        if (text.startswith("Started ") or text.startswith("Finished ")
+                or (text.startswith("[ ") and " | " in text
+                    and " / " in text)):
+            self.progress(text)
+            return
         if self.debug:
             self.stdout(text, **kwargs)
             return
@@ -90,39 +91,23 @@ class GWProductionReport:
         self.emit(title.upper())
         self.emit("-" * len(title))
 
+    def progress(self, line: str) -> None:
+        """Write one deliberately selected rank-zero progress line."""
+        self.emit(line)
+
     def begin(self, *, input_file: str, config) -> None:
         self.emit("=" * 78)
         self.emit("LORRAX GW CALCULATION")
         self.emit("=" * 78)
-        self.emit(f"Input          : {_abs(input_file)}")
+        self.emit(f"Input          : {abs_path(input_file)}")
         self.emit(f"Method         : {config.compute_mode.value} / "
                   f"{config.qp_solver.value}")
 
     def architecture(self) -> None:
-        f = self.runtime.facts
-        p = int(f.get("process_count", 1))
-        ndev = int(f.get("n_devices", 0))
-        nlocal = int(f.get("n_local_devices", 0))
-        mesh = tuple(int(v) for v in f.get("mesh_shape", (1, 1)))
-        threads = f.get("threads") or {}
-        affinity = threads.get("affinity")
-        thread_fields = []
-        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
-                    "OPENBLAS_NUM_THREADS", "LORRAX_MKLBLAS_THREADS"):
-            value = threads.get(key)
-            if value not in (None, ""):
-                thread_fields.append(f"{key}={value}")
-
         self.heading("Processor architecture")
-        self.emit(f"MPI ranks      : {p}")
-        self.emit(f"Accelerators   : {ndev} {str(f.get('backend', 'unknown')).upper()} "
-                  f"devices ({nlocal} per rank), {f.get('device_kind', 'unknown')}")
-        self.emit(f"Processor mesh : {mesh[0]} x {mesh[1]}  "
-                  f"(centroid axes X x Y)")
-        self.emit(f"CPU allocation : {affinity if affinity is not None else '?'} "
-                  f"cores per rank")
-        self.emit("Host threads   : " + (", ".join(thread_fields)
-                                         if thread_fields else "runtime defaults"))
+        for line in architecture_lines(
+                self.runtime, mesh_role="centroid axes X x Y"):
+            self.emit(line)
 
     def method(self, *, config) -> None:
         """Dense statement of the physical approximations that actually run."""
@@ -158,15 +143,16 @@ class GWProductionReport:
         self.emit(f"Screening      : {diagram_text}; "
                   f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
-        self.emit(f"Coulomb system : {geometry}; Hartree source="
-                  f"{getattr(config, 'hartree_source', '-')}")
+        self.emit(f"Coulomb system : {geometry}; Hartree source=" + policy(
+            getattr(config, "hartree_source", "-"),
+            ("auto", "stored", "isdf", "gspace")))
         self.emit("Spin channels  : " + (
             "charge + transverse current (bispinor)"
             if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
         self.emit("Degenerate sets: " + (
             "left in the input gauge" if bool(getattr(
                 config, "no_degen_averaging", False))
-            else f"averaged at {float(getattr(config, 'degen_avg_tol_ry', 0.0)):g} Ry"))
+            else f"averaged at {float(getattr(config, 'degen_avg_tol_ry', 0.0)):.5e} Ry"))
         self.emit("ISDF state     : " + (
             "restart requested" if bool(getattr(config, "restart", False))
             else "fresh fit requested"))
@@ -175,20 +161,22 @@ class GWProductionReport:
         f = self.runtime.facts
         backend = str(f.get("backend", "unknown")).lower()
         platform = "CUDA" if backend in ("gpu", "cuda") else backend
-        precision = "FP64 / complex128" if f.get("x64") else "FP32 / complex64"
-        collectives = "NCCL" if backend in ("gpu", "cuda", "rocm") else str(
-            (f.get("collectives") or {}).get("impl", "local")).upper()
-
         self.heading("Numerical environment")
-        self.emit(f"JAX/JAXLIB     : {f.get('jax_version', 'unknown')} / "
-                  f"{f.get('jaxlib_version', 'unknown')} | "
-                  f"{precision} | {collectives} collectives")
+        for line in numerical_environment_lines(self.runtime):
+            self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
         self.emit(f"ISDF solve     : {config.backend.charge_zeta_solve} | "
-                  f"back-solve policy={config.backend.distributed_zeta_solve}")
+                  "back-solve policy=" + policy(
+                      config.backend.distributed_zeta_solve,
+                      ("auto", "replicated", "per_q", "distributed")))
         self.emit(f"W Dyson solve  : {config.backend.w_dyson_solver} | "
-                  f"LU policy={config.backend.distributed_lu}")
-        self.emit(f"QP eigensolve  : {config.backend.eigh_backend}")
+                  "LU policy=" + policy(
+                      config.backend.distributed_lu,
+                      ("auto", "off", "cusolvermp", "scalapack")))
+        self.emit("QP eigensolve  : " + policy(
+            config.backend.eigh_backend,
+            ("auto", "off", "distributed", "cusolvermp", "slate",
+             "scalapack")))
 
         # Report only controls with a caller in this calculation.  In
         # particular, the k-leading candidate has no production Sigma caller,
@@ -222,45 +210,24 @@ class GWProductionReport:
                       f"{descriptions[name]} ({implementation})")
 
     def sampling(self, *, wfn, sym) -> None:
-        n_sym = int(np.asarray(sym.Rinv_grid).shape[0])
-        tau = np.asarray(sym.translations, dtype=np.float64)[:n_sym] / (2.0 * np.pi)
-        weights = np.asarray(wfn.kweights, dtype=np.float64)
-        weights = weights / float(np.sum(weights))
-
         self.heading("Crystal symmetry and Brillouin-zone sampling")
-        self.emit("Real-space action: r' = R^-1 r + tau")
-        self.emit(f"Spatial operations: {n_sym}; time reversal: "
-                  f"{'used' if bool(sym.trs_allowed) else 'not used'}")
-        for i, (rotation, shift) in enumerate(zip(sym.Rinv_grid, tau), start=1):
-            self.emit(f"  S{i:02d}  R^-1={_matrix_text(rotation)}  "
-                      f"tau=({shift[0]: .8f} {shift[1]: .8f} {shift[2]: .8f})")
-
-        kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
-        shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
-        self.emit(f"Full BZ grid   : {int(sym.nk_tot)} k points | mesh "
-                  f"{kgrid[0]} x {kgrid[1]} x {kgrid[2]} | "
-                  f"shift ({shift[0]:g}, {shift[1]:g}, {shift[2]:g})")
-        self.emit(f"Stored IBZ     : {int(sym.nk_red)} k points")
-        self.emit("  ik        kx           ky           kz          weight")
-        for ik, (point, weight) in enumerate(zip(np.asarray(wfn.kpoints), weights),
-                                                start=1):
-            self.emit(f"  {ik:3d}  {point[0]: .9f}  {point[1]: .9f}  "
-                      f"{point[2]: .9f}  {weight: .10f}")
+        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
+            self.emit(line)
 
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
         b = band_slices
         n_e = float(getattr(wfn, "num_electrons", np.nan))
         self.heading("Band spaces and energy coverage")
-        self.emit(f"Electrons      : {n_e:.8g}; occupied-band boundary = {b.b2}")
-        self.emit(f"Occupied bands : {_fmt_range(b.b0, b.b2)}")
-        self.emit(f"QP valence     : {_fmt_range(b.b1, b.b2)}")
-        self.emit(f"QP conduction  : {_fmt_range(b.b2, b.b3)}")
-        self.emit(f"QP matrix      : {_fmt_range(b.b0, b.b3)}")
-        self.emit(f"chi0/W sum     : {_fmt_range(b.b0, b.b4_chi)}")
-        self.emit(f"Sigma sum      : {_fmt_range(b.b0, b.b4_sigma)}")
-        self.emit(f"Loaded ISDF psi: {_fmt_range(b.b0, b.b4)}")
-        self.emit(f"zeta fit       : left {_fmt_range(*zeta_ranges[0])}; "
-                  f"right {_fmt_range(*zeta_ranges[1])}")
+        self.emit(f"Electrons      : {n_e:.5f}; occupied-band boundary = {b.b2}")
+        self.emit(f"Occupied bands : {band_range(b.b0, b.b2)}")
+        self.emit(f"QP valence     : {band_range(b.b1, b.b2)}")
+        self.emit(f"QP conduction  : {band_range(b.b2, b.b3)}")
+        self.emit(f"QP matrix      : {band_range(b.b0, b.b3)}")
+        self.emit(f"chi0/W sum     : {band_range(b.b0, b.b4_chi)}")
+        self.emit(f"Sigma sum      : {band_range(b.b0, b.b4_sigma)}")
+        self.emit(f"Loaded ISDF psi: {band_range(b.b0, b.b4)}")
+        self.emit(f"zeta fit       : left {band_range(*zeta_ranges[0])}; "
+                  f"right {band_range(*zeta_ranges[1])}")
 
     def sigma_coverage(self, *, config, band_slices, enk_dft_ry,
                        sigma_result) -> None:
@@ -295,25 +262,23 @@ class GWProductionReport:
                   for v in pair]
 
         self.heading("Dynamic Sigma energy coverage")
-        self.emit(f"Energy origin   : E_F = {ef_ev:+.6f} eV ({provenance})")
+        self.emit(f"Energy origin   : E_F = {ef_ev:+.5f} eV ({provenance})")
         omega_grid = np.asarray(
             getattr(sigma_result, "omega_grid_ev", ()), dtype=np.float64)
-        grid_note = (f"; step={float(config.sigma.omega_step_ev):g} eV; "
+        grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
                      f"{int(omega_grid.size)} points")
-        self.emit(f"Sigma omega    : [{grid_lo:+.3f}, {grid_hi:+.3f}] eV "
+        self.emit(f"Sigma omega    : [{grid_lo:+.5f}, {grid_hi:+.5f}] eV "
                   f"relative to E_F{grid_note}")
-        self.emit(f"Absolute window: [{ef_ev + grid_lo:+.3f}, "
-                  f"{ef_ev + grid_hi:+.3f}] eV")
         if val_span is not None:
-            self.emit(f"DFT QP valence : [{val_span[0]:+.3f}, "
-                      f"{val_span[1]:+.3f}] eV relative to E_F")
+            self.emit(f"DFT QP valence : [{val_span[0]:+.5f}, "
+                      f"{val_span[1]:+.5f}] eV relative to E_F")
         if cond_span is not None:
-            self.emit(f"DFT QP conduct.: [{cond_span[0]:+.3f}, "
-                      f"{cond_span[1]:+.3f}] eV relative to E_F")
+            self.emit(f"DFT QP conduct.: [{cond_span[0]:+.5f}, "
+                      f"{cond_span[1]:+.5f}] eV relative to E_F")
         if target:
             target_lo, target_hi = min(target), max(target)
-            self.emit(f"Omega margins  : {target_lo - grid_lo:+.3f} eV below; "
-                      f"{grid_hi - target_hi:+.3f} eV above protected DFT states")
+            self.emit(f"Omega margins  : {target_lo - grid_lo:+.5f} eV below; "
+                      f"{grid_hi - target_hi:+.5f} eV above protected DFT states")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
@@ -330,24 +295,33 @@ class GWProductionReport:
                 + " cumulative bands")
 
     def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
-        self.heading("Files")
-        self.emit("  role                     state       path")
-        for role, state, path in rows:
-            self.emit(f"  {role:<24} {state:<11} {_abs(path)}")
+        self.heading("Output files and inputs")
+        for line in file_table_lines(rows):
+            self.emit(line)
 
-    def qp_energies(self, *, wfn, sym, band_slices, e_dft_ry, e_qp_ry) -> None:
+    def qp_gap(self, *, band_slices, e_dft_ry, e_qp_ry) -> None:
+        """Summarize the fundamental gap without duplicating EQP tables."""
         b = band_slices
-        rows = np.asarray(sym.kirr_fullids, dtype=np.int64)
-        dft = np.asarray(e_dft_ry, dtype=np.float64)[rows] * RYD_TO_EV
-        qp = np.asarray(e_qp_ry, dtype=np.float64)[rows] * RYD_TO_EV
-        i0, i1 = b.b1 - b.b0, b.b3 - b.b0
-        self.heading("Quasiparticle energies")
-        self.emit("  ik  band      E_DFT (eV)       E_QP (eV)     Delta (eV)")
-        for ik in range(dft.shape[0]):
-            for local in range(i0, i1):
-                self.emit(f"  {ik + 1:3d} {b.b0 + local + 1:5d}  "
-                          f"{dft[ik, local]:14.6f}  {qp[ik, local]:14.6f}  "
-                          f"{qp[ik, local] - dft[ik, local]:12.6f}")
+        dft = np.asarray(e_dft_ry, dtype=np.float64) * RYD_TO_EV
+        qp = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
+        iv = int(b.b2 - b.b0 - 1)
+        ic = int(b.b2 - b.b0)
+        self.heading("Fundamental gap")
+        if (dft.ndim != 2 or qp.ndim != 2 or dft.shape != qp.shape
+                or iv < 0 or ic >= dft.shape[1]):
+            self.emit("Gap            : unavailable (no complete protected "
+                      "valence/conduction pair in the QP result)")
+            return
+        dft_gap = float(np.min(dft[:, ic]) - np.max(dft[:, iv]))
+        qp_gap = float(np.min(qp[:, ic]) - np.max(qp[:, iv]))
+        if not np.isfinite(dft_gap) or not np.isfinite(qp_gap):
+            self.emit("Gap            : unavailable (non-finite band edge)")
+            return
+        state = "insulating" if qp_gap > 0.0 else "metallic/overlapping"
+        self.emit(f"DFT gap        : {dft_gap:.5f} eV")
+        self.emit(f"QP gap         : {qp_gap:.5f} eV ({state})")
+        self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
+        self.emit("State energies  : written to the EQP files listed below")
 
     def timings(self, records, *, wall: float) -> None:
         """Print accumulated, non-overlapping major scientific stages."""
@@ -369,15 +343,21 @@ class GWProductionReport:
         self.heading("Major-stage timing")
         self.emit("  stage             wall (s)     fraction")
         for name, seconds in stages:
-            self.emit(f"  {name:<12} {seconds:14.3f}  "
-                      f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<12} {wall:14.3f}  {100.0:9.2f}%")
+            self.emit(f"  {name:<12} {seconds:14.5f}  "
+                      f"{100.0 * seconds / wall if wall else 0.0:9.5f}%")
+        self.emit(f"  {'total run':<12} {wall:14.5f}  {100.0:9.5f}%")
 
-    def finish(self, *, status: str = "completed") -> None:
+    def warnings(self) -> None:
+        if self._warnings_emitted:
+            return
+        self._warnings_emitted = True
         if self._warnings:
             self.heading("Warnings")
             for warning in self._warnings:
                 self.emit(f"  {warning}")
+
+    def finish(self, *, status: str = "completed") -> None:
+        self.warnings()
         self.emit()
         self.emit(f"LORRAX GW calculation {status}.")
         self.emit(f"Report written to {self.path}")

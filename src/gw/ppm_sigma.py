@@ -548,7 +548,7 @@ def _integrate_tau_windows_for_branch(
     total_tau_nodes = sum(win.n_tau for win in windows)
     progress = LoopProgress(
         total_tau_nodes, print_fn, title=f"sigma[{branch_label}]",
-        item_name="tau node", max_updates=10)
+        item_name="tau node", max_updates=10).start()
 
     # One profiler SESSION per branch, first window only, active only when
     # ISDF_JAX_PROFILE_DIR is set (jax_profile.trace_section no-ops

@@ -117,9 +117,12 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
         config=config, band_slices=bands, enk_dft_ry=energies,
         sigma_result=sigma_result)
     report.legacy_print("[rank 1] harmless backend implementation chatter")
+    report.legacy_print("Started sigma[correlation] at 12:00:00.")
+    report.legacy_print(
+        "[ 12:00:01 | █████░░░░░ |  50% ] tau node 5 / 10 · ETA 1 s")
     report.legacy_print("WARNING: protected state leaves the omega grid")
-    report.qp_energies(wfn=wfn, sym=sym, band_slices=bands,
-                       e_dft_ry=energies, e_qp_ry=energies + 0.1 / RYD_TO_EV)
+    report.qp_gap(band_slices=bands, e_dft_ry=energies,
+                  e_qp_ry=energies + 0.1 / RYD_TO_EV)
     report.timings([
         {"name": "gw_jax.zeta_fit_chunked", "path":
          ("gw_jax.isdf", "gw_jax.zeta_fit_chunked"), "inclusive": 1.0},
@@ -143,22 +146,30 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "Coulomb system : 2D slab; Hartree source=auto" in text
     assert "Full BZ grid   : 2 k points" in text
     assert "Stored IBZ     : 2 k points" in text
-    assert "QP valence     : 2-2  (indices [1,2))" in text
-    assert "Energy origin   : E_F = +1.000000 eV (fixed-N mu)" in text
-    assert "Omega margins  : +3.800 eV below; +5.600 eV above" in text
+    assert "QP valence     : 2-2" in text
+    assert "indices [" not in text
+    assert "Energy origin   : E_F = +1.00000 eV (fixed-N mu)" in text
+    assert "Absolute window" not in text
+    assert "Omega margins  : +3.80000 eV below; +5.60000 eV above" in text
     assert "Tail calculations: N1=36 / N2=41 / N3=46 cumulative bands" in text
+    assert "DFT gap        : 0.40000 eV" in text
+    assert "QP gap         : 0.40000 eV (insulating)" in text
+    assert "Gap correction : +0.00000 eV relative to DFT" in text
+    assert "Quasiparticle energies" not in text
     gemm_line = next(line for line in text.splitlines()
                      if "LORRAX_BANDS_GEMM_FFI" in line)
     assert "= NATIVE" in gemm_line
     assert "LORRAX_CONV_KLEAD_FFI" not in text
     assert "harmless backend implementation chatter" not in text
+    assert "Started sigma[correlation]" in text
+    assert "tau node 5 / 10" in text
     assert "protected state leaves the omega grid" in text
     zeta_line = next(line for line in text.splitlines()
                      if line.startswith("  zeta"))
     sigma_line = next(line for line in text.splitlines()
                       if line.startswith("  Sigma"))
-    assert "1.000" in zeta_line
-    assert "5.000" in sigma_line
+    assert "1.00000" in zeta_line
+    assert "5.00000" in sigma_line
     assert "HDF5" not in text and "h5py" not in text
 
 

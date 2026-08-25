@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import os
 
+from common.scientific_output import (
+    architecture_lines,
+    numerical_environment_lines,
+)
+
 
 def prune_band_ranges(args, n_val: int, n_cond: int):
     """Resolved pair-density windows, shared by pruning and provenance."""
@@ -55,8 +60,6 @@ def format_kmeans_report(*, header: str, source_wfn: str,
                          wfn_backend: str, elapsed_s: float, runtime,
                          warnings=()) -> str:
     """Compact scientific output for one completed centroid selection."""
-    facts = runtime.facts
-    mesh = tuple(int(v) for v in facts.get("mesh_shape", (1, 1)))
     lines = [
         "=" * 78,
         "LORRAX ISDF CENTROID SELECTION",
@@ -64,17 +67,11 @@ def format_kmeans_report(*, header: str, source_wfn: str,
         "",
         "PROCESSOR ARCHITECTURE",
         "----------------------",
-        f"MPI ranks      : {int(facts.get('process_count', 1))}",
-        f"Accelerators   : {int(facts.get('n_devices', 0))} "
-        f"{str(facts.get('backend', 'unknown')).upper()} devices, "
-        f"{facts.get('device_kind', 'unknown')}",
-        f"Processor mesh : {mesh[0]} x {mesh[1]}",
+        *architecture_lines(runtime, mesh_role="centroid selection"),
         "",
         "NUMERICAL ENVIRONMENT",
         "---------------------",
-        f"JAX/JAXLIB     : {facts.get('jax_version', 'unknown')} / "
-        f"{facts.get('jaxlib_version', 'unknown')} | "
-        f"{'FP64 / complex128' if facts.get('x64') else 'FP32 / complex64'}",
+        *numerical_environment_lines(runtime),
         f"Wavefunctions  : {wfn_backend} reader",
         "Selection      : density-weighted k-means on the real-space FFT grid",
         "",

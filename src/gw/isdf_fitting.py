@@ -985,8 +985,8 @@ def fit_zeta_to_h5(
 
     from common.progress import LoopProgress
     r_progress = LoopProgress(
-        num_chunks, print, title="zeta fitting",
-        item_name="r-chunk", max_updates=min(num_chunks, 20))
+        num_chunks, print_fn, title="zeta fitting",
+        item_name="r-chunk", max_updates=min(num_chunks, 20)).start()
 
     # norms_l_jax / norms_r_jax were built in STEP 1 above — reuse them
     # as the uniform-shape (nb,) inputs to the fit_one_rchunk jit.

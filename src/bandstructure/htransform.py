@@ -8,7 +8,11 @@ import numpy as np
 # mesh, compile cache, rank-0 report.  MUST run before this module's own
 # `import jax`; idempotent, so importing htransform as a LIBRARY from an
 # already-started driver (bse.exciton_bands does) returns the same stack.
-from runtime import initialize_communicator_stack
+from runtime import (
+    debug_print_enabled,
+    initialize_communicator_stack,
+    rank0_print,
+)
 RUNTIME = initialize_communicator_stack()
 
 import jax
@@ -54,6 +58,8 @@ from common.collectives import gather_to_host
 from common.sharding_fit import fit_sharding as _fit
 from common.sharding_fit import padded_extent as _pad_to
 from common.sharding_fit import shard_factor as _shard_factor
+from runtime.production_stream import ProductionStdout
+from .production_report import HTransformProductionReport
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -483,7 +489,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
                              eigh_backend: str = "auto",
-                             rank_multiplier: float = 0.0):
+                             rank_multiplier: float = 0.0,
+                             progress_fn=None):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -1177,6 +1184,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     Q = jax.jit(lambda: jnp.zeros((rank, nspinor, n_rtot),
                                   dtype=jnp.complex128),
                 out_shardings=sharding_q)()
+    from common.progress import LoopProgress
+    _g_progress = LoopProgress(
+        len(band_chunk_ranges), progress_fn or (lambda *_: None),
+        title="Galerkin real-space accumulation", item_name="band chunk",
+        max_updates=min(len(band_chunk_ranges), 12),
+        enabled=progress_fn is not None).start()
     for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
             wfn, sym, meta, mesh_xy, band_range, 0, n_rtot, bispinor,
             band_chunk_size=band_chunk_size,
@@ -1213,6 +1226,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         Q = accum(UH_bc, inv_s, psi_bc_r, Q)
         del psi_bc_r
         chunk_count += 1
+        _g_progress.step()
+    _g_progress.finish()
     del psi_G_win  # window served its last consumer; free before Q Qᴴ
     G = _fold_G(Q, G)
     del Q
@@ -1682,10 +1697,6 @@ def _shift_indices(n: int) -> jnp.ndarray:
     return jnp.where(arr >= (n + 1) // 2, arr - n, arr)
 
 
-def _make_logger(verbose: bool):
-    return print if verbose else (lambda *_, **__: None)
-
-
 def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.Array:
     """Full-BZ QP energies from the IRREDUCIBLE-WEDGE ``eqp{0,1}.dat``.
 
@@ -1787,7 +1798,8 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None, return_full_proj: bool = False,
-                    n_guard_bands: int = 0, centroid_subset_idx=None):
+                    n_guard_bands: int = 0, centroid_subset_idx=None,
+                    progress_fn=None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1950,6 +1962,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # parsed, defaulted, stored and read by nobody on this driver.
             eigh_backend=resolve_eigh_backend(params),
             rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
+            progress_fn=progress_fn,
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
@@ -1995,7 +2008,8 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None, diagnostics: bool = True,
-                band_start: int = 0, n_return_bands: int | None = None):
+                band_start: int = 0, n_return_bands: int | None = None,
+                progress_fn=None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -2067,9 +2081,10 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     # ``h_transform`` stage — 33 %, 7 XLA programs — and 0.120 s warm
     # (PROFILE_htransform_exciton §1.2).  Every value it computes reaches a
     # ``log_fn`` line and nothing else; none of them reaches
-    # ``bandstructure.dat``.  And ``log_fn`` is ``print if verbose else a
-    # no-op`` (``_make_logger``), so WITHOUT ``--verbose`` the driver was
-    # spending a third of the stage computing numbers it then discarded.
+    # the interpolated-band table.  Diagnostics now follow the driver's one
+    # ``LORRAX_DEBUG_PRINT`` switch when ``--fh-diagnostics=auto``; without
+    # that switch the old implementation spent a third of the stage computing
+    # numbers it then discarded.
     #
     # ``fH_k`` exists ONLY for this block: the kpath solve consumes ``fH_R``
     # alone.  At the reference shape it is (64, 768, 768) complex128 = 576 MiB
@@ -2282,10 +2297,19 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
         lambda_q_list = []
+        from common.progress import LoopProgress
+        _n_batches = int(nq_padded // batch_size)
+        _path_progress = LoopProgress(
+            _n_batches, progress_fn or (lambda *_: None),
+            title="Hamiltonian interpolation along k path",
+            item_name="k batch", max_updates=min(_n_batches, 12),
+            enabled=progress_fn is not None).start()
         for i in range(0, nq_padded, batch_size):
             batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R, S_chol)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
+            _path_progress.step()
+        _path_progress.finish()
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
 
@@ -2490,7 +2514,12 @@ def main(argv=None):
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
     parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
-    parser.add_argument("--verbose", action="store_true", help="Print diagnostic details")
+    parser.add_argument("-o", "--output-file", default="bandstructure.dat",
+                        help="Interpolated band table (relative paths are "
+                             "resolved beside the input deck)")
+    parser.add_argument("--report-file", default="htransform.out",
+                        help="Human-readable calculation report (relative "
+                             "paths are resolved beside the input deck)")
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
@@ -2510,8 +2539,9 @@ def main(argv=None):
                              "reference shape — alive across the whole solve, "
                              "for four log lines that never reach "
                              "bandstructure.dat.  auto (default) = follow "
-                             "--verbose, i.e. compute them only if anything "
-                             "will print them; on = always; off = never.")
+                             "LORRAX_DEBUG_PRINT, i.e. compute them only if "
+                             "the driver debug stream is enabled; on = always; "
+                             "off = never.")
     parser.add_argument("--eigh-backend", default=None,
                         choices=eigh_backend_choices(),
                         help="Eigensolver for the fH_q eigendecomposition of "
@@ -2532,7 +2562,27 @@ def main(argv=None):
              "backend's robust distributed route; batch_reshard moves q "
              "onto the mesh and runs whole-matrix local JAX linalg.")
     args = parser.parse_args(argv)
-    log = _make_logger(args.verbose)
+    input_dir = os.path.dirname(os.path.abspath(args.input))
+
+    def _output_path(value: str) -> str:
+        return value if os.path.isabs(value) else os.path.join(input_dir, value)
+
+    output_path = _output_path(args.output_file)
+    report_path = _output_path(args.report_file)
+    _debug = debug_print_enabled()
+    report = HTransformProductionReport(
+        report_path, runtime=RUNTIME, debug=_debug, stdout=rank0_print)
+    production_stdout = ProductionStdout(
+        debug=_debug, rank=RUNTIME.process_index,
+        warning_fn=report.legacy_print)
+    production_stdout.install()
+    report.stdout = rank0_print if _debug else production_stdout.emit
+    log = report.legacy_print
+    _energy_source = (f"quasiparticle energies from {os.path.basename(args.eqp_file)}"
+                      if args.eqp_file else "DFT eigenvalues from the WFN")
+    report.begin(input_file=args.input, output_file=output_path,
+                 energy_source=_energy_source)
+    report.architecture()
 
     # JAX persistent compile cache — the same call/pattern as gw_jax's
     # _warm_start (and run_nscf / run_sternheimer / kmeans_cli).  This CLI
@@ -2547,7 +2597,7 @@ def main(argv=None):
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()
     except Exception as exc:
-        print(f"  [jax compile cache] skipped: {exc}", flush=True)
+        log(f"WARNING: JAX compile cache unavailable: {exc}")
 
     from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
@@ -2572,10 +2622,16 @@ def main(argv=None):
 
     from common import sanity
 
+    from common.progress import LoopProgress
+    _setup_progress = LoopProgress(
+        1, report.progress, title="wavefunction and Galerkin setup",
+        item_name="stage", max_updates=1).start()
     with timing.section("initialize_wfns"):
         wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
-            n_guard_bands=args.guard_bands)
+            n_guard_bands=args.guard_bands, progress_fn=report.progress)
+    _setup_progress.step()
+    _setup_progress.finish()
     # ── Galerkin-input gate ───────────────────────────────────────────
     # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
     # construction) and ``enk_sigma`` is the band energies the whole
@@ -2603,13 +2659,34 @@ def main(argv=None):
             0.0, 20.0, unit="Ry", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
-    _diag_on = (args.verbose if args.fh_diagnostics == "auto"
+    _diag_on = (_debug if args.fh_diagnostics == "auto"
                 else args.fh_diagnostics == "on")
+    report.environment(
+        params=params, wfn=wfn, eigh_backend=eigh_backend,
+        batched_route=distrib_la_batched_route,
+        diagnostics_policy=args.fh_diagnostics,
+        diagnostics_enabled=_diag_on)
+    report.sampling(wfn=wfn, sym=sym)
+    _transform_progress = LoopProgress(
+        1, report.progress, title="fH construction and path solution",
+        item_name="stage", max_updates=1).start()
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band, diagnostics=_diag_on,
                              band_start=int(wfn.nelec) - int(params["nval"]),
-                             n_return_bands=n_return_bands)
+                             n_return_bands=n_return_bands,
+                             progress_fn=report.progress)
+    _transform_progress.step()
+    _transform_progress.finish()
+
+    _centroid_path = params.get("centroids_file", "centroids_frac.txt")
+    _centroid_path = (_centroid_path if os.path.isabs(_centroid_path) else
+                      os.path.join(input_dir, _centroid_path))
+    report.interpolation_space(
+        params=params, wfn=wfn, meta=meta, result=result,
+        enk_sigma_ry=enk_sigma, ctilde=ctilde,
+        centroid_file=_centroid_path, energy_source=_energy_source)
+    report.path_summary(result=result)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
@@ -2662,23 +2739,28 @@ def main(argv=None):
     # bandstructure.dat is the file downstream tooling and the regression
     # gate diff against ground truth; a NaN row silently changes the file
     # length rather than the exit code.
-    sanity.check_finite("bandstructure.dat energies",
+    sanity.check_finite(f"{os.path.basename(output_path)} energies",
                         result['energies_sorted'], print_fn=log)
 
     # Rank-0 writer gate: at P>1 every process reaches this line with the
     # same (replicated) energies and used to write the SAME shared-FS file
     # concurrently — a race that can interleave partial writes.  Same idiom
     # as the gw_output/gw_init writers.
-    output_dir = os.path.dirname(os.path.abspath(args.input))
+    _write_progress = LoopProgress(
+        1, report.progress, title="interpolated-band output",
+        item_name="file", max_updates=1).start()
     if jax.process_index() == 0:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         write_bands_to_file(
-            os.path.join(output_dir, 'bandstructure.dat'),
+            output_path,
             result['energies_sorted'],  # sorted & truncated to nb_keep, not raw eigenvalues
             kpath_data[0],
             kpath_data[1],
             band_start=result["band_start"],
             nb_fit=result["nb_fit"],
         )
+    _write_progress.step()
+    _write_progress.finish()
 
     # ── Outputs barrier, then CLOSE THE LOADER EXPLICITLY ─────────────
     # The block above is rank-0-only, so without this barrier the other
@@ -2713,16 +2795,8 @@ def main(argv=None):
     try:
         wfn.close()
     except Exception as exc:                                  # noqa: BLE001
-        print(f"  [htransform] WfnLoader.close() failed "
-              f"({type(exc).__name__}: {exc}); continuing to exit")
-
-    summary = (f"HT complete: {result['nb_keep']} returned / "
-               f"{result['nb_fit']} fit bands "
-               f"({result['n_guard_bands']} guards), nk={result['nk_total']}, "
-               f"fermi={result['fermi_energy']:.6f} Ry")
-    if result['path_range'] is not None:
-        summary += f", path range [{result['path_range'][0]:.6f}, {result['path_range'][1]:.6f}] Ry"
-    print(summary)
+        log(f"WARNING: WfnLoader.close() failed "
+            f"({type(exc).__name__}: {exc}); continuing to exit")
     # Close the table against the PROCESS wall, not against ``main()``'s.
     # ``_pre_main`` is everything above this function: the module body's
     # ``initialize_communicator_stack()`` (env, jax.distributed, backend init,
@@ -2745,7 +2819,31 @@ def main(argv=None):
         timing.record("htransform.imports",
                       max(_pre_main - float(_phases.get("total", 0.0)), 0.0))
         _wall = _pre_main + _wall
-    timing.report(title="--- Timing (seconds) ---", wall=_wall)
+    if _debug:
+        timing.report(print_fn=log, title="--- Timing (seconds) ---", wall=_wall)
+
+    _wfn_path = params["wfn_file"]
+    _wfn_path = (_wfn_path if os.path.isabs(_wfn_path) else
+                 os.path.join(input_dir, _wfn_path))
+    _file_rows = [
+        ("input deck", "read", args.input),
+        ("DFT wavefunctions", "read", _wfn_path),
+        ("ISDF centroids", "read", _centroid_path),
+    ]
+    if args.eqp_file:
+        _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file) else
+                     os.path.join(input_dir, args.eqp_file))
+        _file_rows.append(("QP energies", "read", _eqp_path))
+    _file_rows.extend([
+        ("interpolated bands",
+         "written" if os.path.exists(output_path) else "absent", output_path),
+        ("calculation report", "written", report.path),
+    ])
+    report.timings(timing.records(), wall=_wall)
+    report.warnings()
+    report.files(_file_rows)
+    report.finish()
+    production_stdout.close()
     return 0
 
 
