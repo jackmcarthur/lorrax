@@ -13,14 +13,10 @@ from pathlib import Path as _Path
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
-# The HDF5 operation journal (``file_io.h5_journal``) is ON by default in
-# a RUN, and off by default in the SUITE: its output lands in the working
-# directory, which under pytest is the checkout, and a test run must not
-# leave ``h5_journal.rank0.log`` in a git tree.  ``setdefault``, so an
-# explicit ``LORRAX_H5_JOURNAL=1`` still turns it on for a debugging run,
-# and ``tests/test_h5_journal.py`` — which needs it on — clears the
-# variable per cell and points ``LORRAX_H5_JOURNAL_DIR`` at ``tmp_path``.
-os.environ.setdefault("LORRAX_H5_JOURNAL", "0")
+# The HDF5 operation journal is off by default in production and in the
+# suite.  ``tests/test_h5_journal.py`` enables it explicitly in a private
+# directory; no global override is needed here and an operator's explicit
+# debugging setting remains visible to other tests.
 
 # ``harness`` first, and BEFORE the GPU pin below, because the pin's
 # decision lives there as a pure function so it can be unit-tested (a

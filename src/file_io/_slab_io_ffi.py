@@ -1700,13 +1700,13 @@ class _FfiBackend(_DatasetGeometry):
         # has, so the hints are a no-op there; export anyway so the log
         # line and the environment agree on every path.
         _sc, _su = _export_striping_env()
-        if mode == "w" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+        if mode == "w" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", False):
             print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
                   f"ranks={jax.process_count()} stripe_count={_sc} "
                   f"stripe_unit={_su} B (policy; "
                   f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
                   flush=True)
-        elif mode == "r" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", True):
+        elif mode == "r" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", False):
             # The read side names its own dominant term, and it is a
             # DIFFERENT number: a Lustre layout is fixed at inode create, so
             # on a file LORRAX did not write (every WFN.h5 — pw2bgw creates

@@ -159,9 +159,11 @@ that to 1.14.6-against-1.12.x, and `v3` moved the FFI leg to 1.14.3.7.
 
 ### The measurement — 1027 alternations on one file, in one iteration {#alternations}
 
-The driver now prints what is mapped and what has been shared, at startup
-and after every SC store cycle (`hdf5_owner.probe`). Verbatim, JID
-57038615, iteration 2:
+The driver measures what is mapped and what has been shared at startup and
+after every SC store cycle (`hdf5_owner.probe`). Safe probes are silent in a
+production run; an `UNSAFE-BY-A1` condition is always printed. Set
+`LORRAX_H5_JOURNAL=1` to print the full inventory as well. Diagnostic output
+from JID 57038615, iteration 2:
 
 ```
 [hdf5-probe startup] libhdf5 2 core mapped: libhdf5-9e18f0c6.so.320.0.0,
@@ -258,16 +260,17 @@ The fingerprints in [Failure modes](#failures) below name the lines it
 emits.*
 
 The journal is the **black box for a segfault**: one choke-pointed,
-line-buffered, per-rank log of every HDF5 operation, cheap enough to leave
-on in production — and it is **on by default**. Line-buffered writes
-survive the process, so a native death leaves a file current to its last
-line, which is the one thing a Python traceback cannot give you when rank
-0 dies inside `close_ctx`.
+line-buffered, per-rank log of every HDF5 operation. It is **opt-in**:
+normal production runs create only the consolidated driver log and physics
+outputs, while an incident run sets `LORRAX_H5_JOURNAL=1`. Line-buffered
+writes then survive the process, so a native death leaves a file current to
+its last line, which is the one thing a Python traceback cannot give you
+when rank 0 dies inside `close_ctx`.
 
 | | |
 |---|---|
 | module | `src/file_io/h5_journal.py` |
-| toggle | `LORRAX_H5_JOURNAL` — `1` on (**default**), `0` off, `sync` = fsync after every line |
+| toggle | `LORRAX_H5_JOURNAL` — `0` off (**default**), `1` on, `sync` = fsync after every line |
 | output dir | `LORRAX_H5_JOURNAL_DIR`, default the process's cwd (the run directory, for every LORRAX driver launch) |
 | files | `h5_journal.rank<R>.log`, and `h5_journal_crash.rank<R>.txt` for the ring |
 | crash ring | last 256 lines |

@@ -21,7 +21,7 @@ from __future__ import annotations
 # mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
 # floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
 # back this same startup mesh, not a second one.
-from runtime import initialize_communicator_stack
+from runtime import initialize_communicator_stack, rank0_print as print0
 RUNTIME = initialize_communicator_stack()
 
 import argparse
@@ -301,11 +301,12 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     # group may not be.
     ops = (np.asarray(Rinv) if Rinv is not None
            and np.allclose(np.asarray(tau), 0.0, atol=1e-8) else None)
-    print(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk|²"
-          f"{'' if ops is None else f' (symmetrized, {len(ops)} ops)'}")
+    print0(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk|²"
+           f"{'' if ops is None else f' (symmetrized, {len(ops)} ops)'}")
     from .charge_density import rho_from_band_range
-    return (rho_from_band_range(wfn, (b_lo, b_hi), sym_ops=ops,
-                                dist_mesh=dist_mesh),
+    return (rho_from_band_range(
+                wfn, (b_lo, b_hi), sym_ops=ops, dist_mesh=dist_mesh,
+                verbose=(process_rank() == 0)),
             f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²")
 
 
@@ -322,7 +323,7 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         # cells. Snap-then-unfold guarantees on-grid orbit closure (because
         # R is integer and τ × fft_grid is integer for grid-commensurate τ).
         _, reps_snapped, _ = snap_centroids_to_grid(
-            centroids_frac, fft_grid, deduplicate=False)
+            centroids_frac, fft_grid, deduplicate=False, print_fn=print0)
         # Unfold with Rinv = inv(mtrx): the BGW r-action is r' = Rinv·r + τ,
         # matching centroid_source_map_and_wrap and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
@@ -332,21 +333,22 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         from symmetry_maps import unfold_orbit_unique_with_id
         unfolded, orbit_id = unfold_orbit_unique_with_id(
             reps_snapped, np.asarray(Rinv), np.asarray(tau))
-        print(f"\nUnfolded {centroids_frac.shape[0]} reps → "
-              f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
+        print0(f"\nUnfolded {centroids_frac.shape[0]} reps → "
+               f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
         indices, snapped, _ = snap_centroids_to_grid(
-            unfolded, fft_grid, deduplicate=False)
+            unfolded, fft_grid, deduplicate=False, print_fn=print0)
         return indices, snapped, indices.shape[0], orbit_id
 
-    print(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
+    print0(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
     indices, snapped, n_dups = snap_centroids_to_grid(
-        centroids_frac, fft_grid, deduplicate=True)
+        centroids_frac, fft_grid, deduplicate=True, print_fn=print0)
     if n_dups == 0:
-        print(f"✓ All {indices.shape[0]} centroids on unique grid points.")
+        print0(f"✓ All {indices.shape[0]} centroids on unique grid points.")
         return indices, snapped, indices.shape[0], None
 
-    print(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
-    snapped = ensure_unique_centroids(centroids_frac, fft_grid, rho=weight)
+    print0(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
+    snapped = ensure_unique_centroids(
+        centroids_frac, fft_grid, rho=weight, print_fn=print0)
     indices = (np.round(snapped * np.asarray(fft_grid))
                .astype(np.int64) % np.asarray(fft_grid))
     return indices, snapped, snapped.shape[0], None
@@ -376,8 +378,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     n_orbits = len(np.unique(orbit_id)) if orbit_id is not None else n_unique
     n_orbit_keep = (max(1, int(np.ceil(N_c * n_orbits / n_unique)))
                     if orbit_id is not None else N_c)
-    print(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-          f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
+    print0(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
+           f"{f' (target {n_orbit_keep} orbits)' if orbit_id is not None else ''}")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     max_band = n_val + n_cond
@@ -385,27 +387,28 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
         orbit_id=orbit_id,
         n_point_budget=(int(N_c) if orbit_id is not None else None),
+        verbose=(process_rank() == 0),
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = (0, n_val)
         kwargs["band_range_right"] = (0, max_band)
-        print(f"  prune window: v×(v+c)  left=(0,{n_val}) "
-              f"right=(0,{max_band})  [covers |ψ_v|² + v×c]")
+        print0(f"  prune window: v×(v+c)  left=(0,{n_val}) "
+               f"right=(0,{max_band})  [covers |ψ_v|² + v×c]")
     elif args.prune_window == "vc_x_vc":
         kwargs["band_range_left"] = (0, max_band)
         kwargs["band_range_right"] = (0, max_band)
-        print(f"  prune window: (v+c)×(v+c)  left=right=(0,{max_band})"
-              f"  [full σ-window square Gram, covers |ψ_c|² too]")
+        print0(f"  prune window: (v+c)×(v+c)  left=right=(0,{max_band})"
+               f"  [full σ-window square Gram, covers |ψ_c|² too]")
     else:
         kwargs["n_val"] = n_val
         kwargs["n_cond"] = n_cond
-        print(f"  prune window: v×c  left=(0,{n_val}) "
-              f"right=({n_val},{max_band})  [legacy]")
+        print0(f"  prune window: v×c  left=(0,{n_val}) "
+               f"right=({n_val},{max_band})  [legacy]")
 
     with timing.section("prune"):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
-    print(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
+    print0(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
     # The rank gate in main() compares rank against n_orbit_keep and names
     # the effective prune window in its refusal — return all four.
     return indices, indices.shape[0], int(rank), n_orbit_keep, n_val, max_band
@@ -422,9 +425,9 @@ def main():
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()
     except Exception as e:
-        print(f"  [jax compile cache] skipped: {e}", flush=True)
+        print0(f"  [jax compile cache] skipped: {e}")
 
-    print(f"✓ JAX initialized: {dist.device_summary()}")
+    print0(f"✓ JAX initialized: {dist.device_summary()}")
 
     timing.reset()
 
@@ -432,10 +435,10 @@ def main():
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
     if M_cand != N_c:
-        print(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
-              f"(ratio {oversample:g})")
+        print0(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
+               f"(ratio {oversample:g})")
     else:
-        print(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
+        print0(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
     with timing.section("setup.wfn_io"):
         wfn = WfnLoader("WFN.h5")
@@ -444,10 +447,10 @@ def main():
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
         if init_msg is not None:
-            print(init_msg)
+            print0(init_msg)
         dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
         if dense_warn is not None:
-            print(dense_warn)
+            print0(dense_warn)
 
     with timing.section("setup.charge_density"):
         if args.density_mode == "current":
@@ -455,14 +458,17 @@ def main():
             # n_occ convention: nelec for FR (nspinor=2), nelec/2 for scalar
             # (nspinor=1 — restricted Kohn-Sham, two electrons per band).
             n_occ = int(wfn.nelec) if int(wfn.nspinor) == 2 else int(wfn.nelec) // 2
-            print(f"  density-mode=current: building bispinor j² weight "
-                  f"with n_occ={n_occ} (nspinor_wfn={int(wfn.nspinor)})")
-            charge_density = build_current_density(wfn, sym, n_occ)
+            print0(f"  density-mode=current: building bispinor j² weight "
+                   f"with n_occ={n_occ} (nspinor_wfn={int(wfn.nspinor)})")
+            charge_density = build_current_density(
+                wfn, sym, n_occ, verbose=(process_rank() == 0))
         else:
             charge_density = get_charge_density(
                 wfn=wfn, sym=sym,
                 source=args.rho_source,
                 save_dir=args.qe_save,
+                print_fn=print0,
+                warn=(process_rank() == 0),
             )
     fft_grid = tuple(int(x) for x in charge_density.shape)
     if fft_grid != tuple(int(x) for x in wfn.fft_grid):
@@ -473,12 +479,13 @@ def main():
         )
 
     avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
-    print(f"Charge density shape: {charge_density.shape}")
-    print(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
+    print0(f"Charge density shape: {charge_density.shape}")
+    print0(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
 
     mesh = dist.build_mesh(int(np.prod(fft_grid)),
                            shard=not args.no_shard,
-                           force_shard=args.force_shard)
+                           force_shard=args.force_shard,
+                           print_fn=print0)
     mesh_axis = dist.MESH_AXES
 
     # The loader was necessarily built mesh-less (the mesh is sized from
@@ -507,8 +514,8 @@ def main():
         # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
         kmeans_weight = np.maximum(
             np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
-        print(f"k-means weight: (weight)^{args.rho_power:g} "
-              f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
+        print0(f"k-means weight: (weight)^{args.rho_power:g} "
+               f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
 
     if orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
@@ -524,9 +531,9 @@ def main():
                 f"kmeans can sample at least one orbit; pass --no-orbit or "
                 f"raise N_c."
             )
-        print(f"Orbit-aware mode: n_sym = {n_sym}, "
-              f"running kmeans for M_rep = {M_cand_orbit} representatives "
-              f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
+        print0(f"Orbit-aware mode: n_sym = {n_sym}, "
+               f"running kmeans for M_rep = {M_cand_orbit} representatives "
+               f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
         kmeans_target = M_cand_orbit
     else:
         kmeans_target = M_cand
@@ -537,6 +544,7 @@ def main():
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
             R=R, Rinv=Rinv, tau=tau,
+            print_fn=print0,
         )
     centroids_frac = np.asarray(centroids)
 
@@ -617,8 +625,8 @@ def main():
                 f"deficient set deliberately — the named override, and the\n"
                 f"    one to use when you have MEASURED that this set is the "
                 f"accurate one.\n")
-        print(f"  [rank gate] {rank}/{n_orbit_keep} {_unit} certified "
-              f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
+        print0(f"  [rank gate] {rank}/{n_orbit_keep} {_unit} certified "
+               f"(floor {_rank_floor}, tol {_rank_tol:g}) — PASS")
         if orbit_id_arr is not None:
             # SAY WHAT THIS PASS DOES NOT CERTIFY.  In orbit mode the select
             # deflates by one direction per ORBIT while removing all n_sym
@@ -628,10 +636,10 @@ def main():
             # whose ζ back-solve then truncated ~24% of the modes per q.
             # The delivered-granularity number is the `[point rank]` line
             # printed by the select above.
-            print(f"  [rank gate] SCOPE: that PASS is stated in ORBITS.  It "
-                  f"certifies nothing about the {n_unique} POINTS this file "
-                  f"will contain — read the [point rank] line above for the "
-                  f"delivered-granularity number.")
+            print0(f"  [rank gate] SCOPE: that PASS is stated in ORBITS.  It "
+                   f"certifies nothing about the {n_unique} POINTS this file "
+                   f"will contain — read the [point rank] line above for the "
+                   f"delivered-granularity number.")
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix
@@ -659,7 +667,7 @@ def main():
             header=header,
             fmt="%.6f", delimiter=" ", comments="# ",
         )
-        print(f"Saved centroids to {out_file}")
+        print0(f"Saved centroids to {out_file}")
 
     if process_rank() == 0:
         timing.report(title="--- kmeans_cli timing (s) ---")

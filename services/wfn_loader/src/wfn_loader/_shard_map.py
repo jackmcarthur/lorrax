@@ -139,8 +139,10 @@ def shard_map(f, *, mesh, in_specs, out_specs, check_vma=True):
     mode, ver, exp = _resolve()
     if not _ANNOUNCED:
         _ANNOUNCED = True
-        print("  [wfn_loader] shard_map via %s (jax %s)"
-              % (shard_map_mode(), ".".join(map(str, ver))), flush=True)
+        import jax
+        if jax.process_index() == 0:
+            print("  [wfn_loader] shard_map via %s (jax %s)"
+                  % (shard_map_mode(), ".".join(map(str, ver))), flush=True)
     if mode == "jax.shard_map":
         import jax
         return jax.shard_map(f, mesh=mesh, in_specs=in_specs,

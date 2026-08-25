@@ -1017,9 +1017,20 @@ def test_reshape_exists_for_the_one_case_the_entry_point_cannot_serve():
 
 def test_the_public_surface_is_the_entry_point():
     for name in ("initialize_communicator_stack", "RuntimeStack",
-                 "collect_startup_facts", "format_startup_report"):
+                 "collect_startup_facts", "format_startup_report",
+                 "rank0_print"):
         assert name in runtime.__all__
         assert hasattr(runtime, name)
+
+
+def test_rank0_print_owns_the_consolidated_driver_stream(monkeypatch, capsys):
+    monkeypatch.setattr(runtime, "_resolve_proc_id", lambda: 2)
+    runtime.rank0_print("hidden")
+    assert capsys.readouterr().out == ""
+
+    monkeypatch.setattr(runtime, "_resolve_proc_id", lambda: 0)
+    runtime.rank0_print("visible")
+    assert capsys.readouterr().out == "visible\n"
 
 
 # ---------------------------------------------------------------------------

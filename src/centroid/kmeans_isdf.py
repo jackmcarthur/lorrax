@@ -673,6 +673,7 @@ def weighted_kmeans_jax(
     R=None,
     Rinv=None,
     tau=None,
+    print_fn=print,
 ):
     """Density-weighted PBC k-means over the real-space FFT grid.
 
@@ -705,8 +706,8 @@ def weighted_kmeans_jax(
     avec = jnp.asarray(avec, dtype=jnp.float64)
     metric_tensor = avec @ avec.T
     offsets = jnp.asarray(build_min_image_offsets(metric_tensor))
-    print(f"PBC min-image offsets: {offsets.shape[0]} (1 ⇒ orthorhombic); "
-          f"orbit mode: {'on (n_sym=' + str(int(R.shape[0])) + ')' if orbit_aware else 'off'}")
+    print_fn(f"PBC min-image offsets: {offsets.shape[0]} (1 ⇒ orthorhombic); "
+             f"orbit mode: {'on (n_sym=' + str(int(R.shape[0])) + ')' if orbit_aware else 'off'}")
 
     Nx, Ny, Nz = rho.shape
     fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
@@ -714,7 +715,7 @@ def weighted_kmeans_jax(
     positions = jnp.stack(jnp.meshgrid(fx, fy, fz, indexing="ij"),
                           axis=-1).reshape(-1, 3)
     rho_flat = jnp.asarray(rho, dtype=jnp.float64).reshape(-1)
-    print(f"Grid: {Nx}×{Ny}×{Nz} = {positions.shape[0]} points; N_c = {N_c}")
+    print_fn(f"Grid: {Nx}×{Ny}×{Nz} = {positions.shape[0]} points; N_c = {N_c}")
 
     with timing.section("init"):
         if init_method == 'kpp':
@@ -751,8 +752,8 @@ def weighted_kmeans_jax(
         )
         centroids.block_until_ready()
     steps = int(steps)
-    print(f"Lloyd: {steps} steps, max movement = "
-          f"{float(jnp.sqrt(max_mv_sq)):.6f}")
+    print_fn(f"Lloyd: {steps} steps, max movement = "
+             f"{float(jnp.sqrt(max_mv_sq)):.6f}")
 
     with timing.section("assign_labels"):
         if orbit_aware:
@@ -778,6 +779,8 @@ def snap_centroids_to_grid(
     centroids_frac: np.ndarray,
     fft_grid: tuple[int, int, int],
     deduplicate: bool = True,
+    *,
+    print_fn=print,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Round fractional centroids to the nearest FFT-grid integer indices.
 
@@ -789,8 +792,8 @@ def snap_centroids_to_grid(
         indices = np.unique(indices, axis=0)
         n_duplicates = n_original - indices.shape[0]
         if n_duplicates > 0:
-            print(f"snap_centroids_to_grid: {n_duplicates} duplicates "
-                  f"({n_original} → {indices.shape[0]} unique)")
+            print_fn(f"snap_centroids_to_grid: {n_duplicates} duplicates "
+                     f"({n_original} → {indices.shape[0]} unique)")
     else:
         n_duplicates = 0
     return indices, indices.astype(float) / fft_grid, n_duplicates
@@ -800,6 +803,8 @@ def ensure_unique_centroids(
     centroids_frac: np.ndarray,
     fft_grid: tuple[int, int, int],
     rho: np.ndarray | None = None,
+    *,
+    print_fn=print,
 ) -> np.ndarray:
     """Snap to the FFT grid; redistribute duplicates onto the highest-density
     unoccupied grid points (arbitrary order if ρ is None). O(N log N), fully
@@ -819,8 +824,8 @@ def ensure_unique_centroids(
         free = free[np.argsort(-rho.ravel()[free])]
     take = free[:min(n_dups, free.shape[0])]
     if take.shape[0] < n_dups:
-        print(f"ensure_unique_centroids: only {take.shape[0]} unoccupied "
-              f"grid points for {n_dups} duplicates; the rest are dropped.")
+        print_fn(f"ensure_unique_centroids: only {take.shape[0]} unoccupied "
+                 f"grid points for {n_dups} duplicates; the rest are dropped.")
 
     extra = np.stack([take // (Ny * Nz), (take // Nz) % Ny, take % Nz], axis=1)
     out = np.concatenate([indices[first_idx], extra], axis=0)

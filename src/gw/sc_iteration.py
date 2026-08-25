@@ -2263,10 +2263,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # AFTER this iteration's complete store cycle (allocate → fit →
         # finalize → head → Σ → retain), which is the point at which the
         # per-iteration churn audit A1 measures has actually happened.
-        # Cheap: one /proc/self/maps read and a dict walk.  It reports the
-        # mapped-libhdf5 count and, per file, how many times each HDF5
-        # library instance opened it — the number that grows with
-        # iteration count and that A1 predicts is the segfault's driver.
+        # Cheap: one /proc/self/maps read and a dict walk.  It stays quiet
+        # while safe; an A1-unsafe condition reports the mapped-libhdf5
+        # count and the written paths touched through both libraries.
         from file_io.hdf5_owner import probe as _hdf5_probe
         _hdf5_probe(f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
 

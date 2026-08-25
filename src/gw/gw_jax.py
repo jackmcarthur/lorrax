@@ -31,7 +31,7 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
-from runtime import initialize_communicator_stack
+from runtime import initialize_communicator_stack, rank0_print
 
 #: THE startup call.  One line brings up everything below the physics: the
 #: JAX env defaults, the fail-fast excepthook, the CPU-collectives
@@ -49,6 +49,7 @@ import argparse
 import gc
 import os
 import time
+import warnings
 
 import numpy as np
 import jax
@@ -209,14 +210,10 @@ def main(argv=None):
 	_pre_main = timing.process_elapsed_s()
 	timing.reset()
 
-	# Rank-gated print used as ``print_fn=`` throughout the driver.  We do
-	# NOT clobber ``builtins.print`` — that historically affected every
-	# imported library, including ones that legitimately want to write
-	# from non-zero ranks (logging, error paths).
-	def print0(*a, **k):
-		if jax.process_index() == 0:
-			k.setdefault("flush", True)
-			print(*a, **k)
+	# The runtime owns rank-zero production output.  Exceptions and
+	# rank-local refusals still write directly; deterministic status and
+	# timing flow through this one callable.
+	print0 = rank0_print
 
 	# ---- Configuration ----
 	# The two orthogonal physics axes are resolved + validated up front so
@@ -276,15 +273,16 @@ def main(argv=None):
 	)
 
 	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
-	# from /proc/self/maps, printed, not asserted (audit A1 fix 3).  Two
+	# from /proc/self/maps, not asserted (audit A1 fix 3).  Two
 	# instances — h5py's bundled libhdf5 and the FFI's cray
 	# libhdf5_parallel — alternately touching one file is the standing
 	# explanation for the metallic driver's iteration-3 rank-0 segfault,
 	# and until now the condition was INFERRED from the deployed
 	# artifacts' NEEDED entries rather than observed in the running
-	# process.  ``file_io.hdf5_owner`` prints again after each SC
-	# iteration's store cycle, with the paths that were touched through
-	# both.
+	# process.  Healthy inventory is diagnostic-only and quiet by default;
+	# an unsafe condition is always printed.  ``file_io.hdf5_owner`` probes
+	# again after each SC iteration's store cycle, with the paths that were
+	# touched through both.
 	from file_io.hdf5_owner import probe as _hdf5_probe
 	_hdf5_probe("startup", print_fn=print0)
 
@@ -456,8 +454,17 @@ def main(argv=None):
 		# and with no row of its own that 95 s reads as "GW startup".
 		with timing.section("gw_jax.minimax_quadrature", announce=True,
 		                    label="minimax tau-axis"):
-			quad, e_ref = build_static_quadrature(
-				wfns, config.minimax_config, print_fn=print0)
+			# The minimax service announces every served/uncertified rule with
+			# ``warnings.warn`` in each process.  This request is deterministic
+			# and collective, so keep its loud provenance warning once on the
+			# output owner instead of repeating it P times.  The filter is local
+			# to this call; exceptions and warnings from later rank-local work
+			# remain untouched.
+			with warnings.catch_warnings():
+				if jax.process_index() != 0:
+					warnings.simplefilter("ignore", RuntimeWarning)
+				quad, e_ref = build_static_quadrature(
+					wfns, config.minimax_config, print_fn=print0)
 
 	# One-shot and QSGW now share one response/finalization implementation.
 	# Build the irreducible DFT tensor and its wings on the exact chi0 band

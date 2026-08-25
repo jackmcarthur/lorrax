@@ -61,9 +61,11 @@ from ``_slab_io_ffi`` the handle is the FFI **ctx that is live on the
 same path while h5py touches it** — which is the concurrency the line
 exists to record, and is corroborated by ``owner=h5py+ffi:2r``.
 
-TOGGLE.  ``LORRAX_H5_JOURNAL``: ``1`` (default, ON), ``0`` off, ``sync``
+TOGGLE.  ``LORRAX_H5_JOURNAL``: ``0`` (default, OFF), ``1`` on, ``sync``
 = fsync after every line, for segfault-grade capture where even the
-kernel's page cache is suspect.  ``LORRAX_H5_JOURNAL_DIR`` moves the
+kernel's page cache is suspect.  The journal is an incident instrument,
+not a production result, so a normal run creates no per-rank sidecars.
+``LORRAX_H5_JOURNAL_DIR`` moves the
 output; default is the process's working directory, which is the run
 directory for every LORRAX driver launch.  Files:
 ``h5_journal.rank<R>.log`` and ``h5_journal_crash.rank<R>.txt``.
@@ -71,8 +73,9 @@ directory for every LORRAX driver launch.  Files:
 COST.  ~1-2 µs per formatted, line-buffered line; the measured op rate is
 ~1030 HDF5 ops per SC iteration and this journal writes ~1 line per slab
 op and 3 per file open, i.e. a few thousand lines against a ~280 s
-iteration — order 1e-5.  That is why the default is ON.  ``sync`` costs
-~1 ms/line and is opt-in only.
+iteration — order 1e-5.  ``sync`` costs ~1 ms/line.  Both modes are opt-in
+because production runs should contain driver logs and physics outputs,
+not one diagnostic file per rank.
 
 THE JOURNAL NEVER TAKES A RUN DOWN.  An I/O error on the journal file
 disables the journal with one warning and lets the caller proceed: a log
@@ -177,7 +180,7 @@ def mode() -> str:
     switch, and a cached parse is a switch that stops working the moment
     a test or a driver flips it.
     """
-    got = str(os.environ.get("LORRAX_H5_JOURNAL", "1")).strip().lower()
+    got = str(os.environ.get("LORRAX_H5_JOURNAL", "0")).strip().lower()
     if got in _OFF_TOKENS:
         return MODE_OFF
     if got in _SYNC_TOKENS:
@@ -185,8 +188,8 @@ def mode() -> str:
     if got in _ON_TOKENS:
         return MODE_ON
     raise ValueError(
-        f"{MODE_ENV}={got!r} is not one of 1/true/yes/on (journal on, the "
-        f"default), 0/false/no/off (journal off), or sync (fsync every "
+        f"{MODE_ENV}={got!r} is not one of 1/true/yes/on (journal on), "
+        f"0/false/no/off (journal off, the default), or sync (fsync every "
         f"line — segfault-grade capture, ~1 ms/line).  The journal is the "
         f"black box for the native HDF5 failures in "
         f"SLAB_IO_ROOT_CAUSE_AUDIT.md; refusing an unrecognised token is "

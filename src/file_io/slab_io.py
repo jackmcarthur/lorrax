@@ -70,9 +70,10 @@ your h5py handle on a path before opening SlabIO on it, not after — the
 ordering ``close`` itself uses for its rank-0 deferred-attr reopen.
 ``docs/architecture/slab_io.md#one-owner`` is the whole rule.
 
-EVERY OPERATION IS JOURNALED.  One line per op, per rank, written
-BEFORE the call, to ``h5_journal.rank<R>.log``
-(:mod:`file_io.h5_journal`; ``LORRAX_H5_JOURNAL=0`` turns it off).  The
+EVERY OPERATION CAN BE JOURNALED.  With ``LORRAX_H5_JOURNAL=1``, one line
+per op, per rank is written BEFORE the call to
+``h5_journal.rank<R>.log`` (:mod:`file_io.h5_journal`).  The production
+default is off, so normal runs create no journal sidecars.  The
 three measured failure signatures on this transport are native deaths or
 native refusals, so the journal is the only instrument that survives
 them — ``docs/architecture/slab_io.md#journal`` says how to read one.
@@ -106,8 +107,9 @@ from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
 __all__ = ["SlabIO", "assert_available", "mesh_divisible_shape",
            "probe_availability", "probe_read_availability"]
 
-#: Every op through this class is one line in the per-rank HDF5 journal
-#: (``file_io.h5_journal``; ``LORRAX_H5_JOURNAL=0`` turns it off).  The
+#: With ``LORRAX_H5_JOURNAL=1``, every op through this class is one line in
+#: the per-rank HDF5 journal (``file_io.h5_journal``).  The production
+#: default is off.  When enabled, the
 #: line is written BEFORE the call, so a rank that dies inside HDF5
 #: leaves a file whose last line names the op that killed it — which is
 #: the whole instrument, given that all three failure signatures in

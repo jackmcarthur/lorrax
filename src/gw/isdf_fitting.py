@@ -174,6 +174,7 @@ def fit_zeta_to_h5(
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
+    print_fn=print,
 ):
     """
     Full zeta fitting pipeline with r-chunk loop and HDF5 output.
@@ -218,6 +219,8 @@ def fit_zeta_to_h5(
         bispinor: Whether to use bispinor wavefunctions
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
+        print_fn: Status-output sink. Drivers pass the runtime rank-zero
+                  printer so deterministic progress is emitted once.
 
     Returns:
         peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
@@ -274,9 +277,9 @@ def fit_zeta_to_h5(
     nb_right = band_range_right[1] - band_range_right[0]
     nb_full = band_range_full[1] - band_range_full[0]
 
-    print(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
-          f"{nb_full} bands ({nb_left} left + {nb_right} right)")
-    print(f"  Output: {output_file}")
+    print_fn(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
+             f"{nb_full} bands ({nb_left} left + {nb_right} right)")
+    print_fn(f"  Output: {output_file}")
 
     # ========== STEP 1: Slice pre-loaded centroid ψ into left/right halves ==========
     with timing.section("zeta_fit.slice_halves"):
@@ -293,8 +296,8 @@ def fit_zeta_to_h5(
         psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
         psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
 
-        print(f"  Left wfns:  {psi_l_rmu_Y.shape}")
-        print(f"  Right wfns: {psi_r_rmu_Y.shape}")
+        print_fn(f"  Left wfns:  {psi_l_rmu_Y.shape}")
+        print_fn(f"  Right wfns: {psi_r_rmu_Y.shape}")
 
         # Pseudobands: clamp weights to ``max(1, w_n)`` and apply them to
         # the centroid copies used for CCT.  When band_norms is None the
@@ -310,8 +313,8 @@ def fit_zeta_to_h5(
         if band_norms is not None:
             n_weighted = int(np.sum(band_norms > 1.01))
             n_zero = int(np.sum(band_norms < 1e-10))
-            print(f"  Pseudobands normalization: {n_weighted} weighted, "
-                  f"{n_zero} zero-weight (skipped)")
+            print_fn(f"  Pseudobands normalization: {n_weighted} weighted, "
+                     f"{n_zero} zero-weight (skipped)")
 
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     # γ̃^0 = I_4 → vertex_mu_L=0 is the standard spin-traced path.  For
@@ -397,7 +400,7 @@ def fit_zeta_to_h5(
         # rank-3 (k, μ, ν).
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
-        print(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
+        print_fn(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
         if vertex_mu_L == 0:
             C_q = c_q_from_psi_sm(
                 psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
@@ -509,8 +512,8 @@ def fit_zeta_to_h5(
                     else "distributed rank-truncated pinv (2D-sharded C+)"
                     if _resolved_solver_kind == 'distributed_rank_truncate'
                     else "chol(C_q)")
-            print(f"  Computing L_q = {_how}  [PSD, charge channel, "
-                  f"path={_resolved_solver_kind}]")
+            print_fn(f"  Computing L_q = {_how}  [PSD, charge channel, "
+                     f"path={_resolved_solver_kind}]")
         else:
             _how_t = ("hoisted per-q pivoted LU (once per channel)"
                       if _resolved_solver_kind == 'lu'
@@ -527,20 +530,20 @@ def fit_zeta_to_h5(
                       if _resolved_solver_kind
                       == 'distributed_transverse_rank_truncate'
                       else "CCT passthrough (fused per-r-chunk getrf+getrs)")
-            print(f"  Computing transverse factor = {_how_t}  "
-                  f"[γ̃^{vertex_mu_L} indefinite — "
-                  f"path={_resolved_solver_kind}]")
+            print_fn(f"  Computing transverse factor = {_how_t}  "
+                     f"[γ̃^{vertex_mu_L} indefinite — "
+                     f"path={_resolved_solver_kind}]")
         _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
                       * 16 / 1e9)
         # per-q tile: the two structural all_gathers inside ``_per_q_block``
         # move μ²/p_y (row block) + μ² (full tile) — measured, not nominal.
         _p_y = int(mesh_xy.shape['y'])
         _tile_gb = (int(n_rmu_padded) ** 2 * 16 * (1.0 + 1.0 / _p_y)) / 1e9
-        print(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
-              f"(distributed_zeta_solve={distributed_zeta_solve})  "
-              f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
-              f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
-              f"distributed tier gathers NO (μ,μ) object")
+        print_fn(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
+                 f"(distributed_zeta_solve={distributed_zeta_solve})  "
+                 f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
+                 f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
+                 f"distributed tier gathers NO (μ,μ) object")
         if int(vertex_mu_L) != 0:
             # Transverse: the factor stage is HOISTED (2026-08) — one
             # pivoted LU per q per CHANNEL instead of per r-chunk.
@@ -565,10 +568,10 @@ def fit_zeta_to_h5(
         # to print and no single buffer to block on (a ScaLAPACK token
         # holds factors AND pivots).  Report what it does publish.
         if isinstance(L_q, FactorToken):
-            print(f"  L_q: {L_q!r}")
+            print_fn(f"  L_q: {L_q!r}")
         else:
             L_q.block_until_ready()
-            print(f"  L_q: {L_q.shape}")
+            print_fn(f"  L_q: {L_q.shape}")
 
     # Pre-compute per-q trace of the CCT ONCE per channel — needed ONLY
     # by the remaining FUSED transverse route (cusolvermp passthrough,
@@ -645,14 +648,14 @@ def fit_zeta_to_h5(
         _kgrid_arr_for_qfrac = np.asarray(meta.kgrid, dtype=np.float64)
         q_irr_frac = (_bgw_wrap_q(q_irr_kgrid_int)
                        / _kgrid_arr_for_qfrac[None, :])
-        print(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
-              f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
+        print_fn(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
+                 f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
     else:
         q_irr_full_idx = None
         q_irr_frac = None
         n_q_disk = nq
-        print(f"  q axis on disk: full BZ ({nq} q-points) "
-              f"(write_ibz_only=False or closure check failed)")
+        print_fn(f"  q axis on disk: full BZ ({nq} q-points) "
+                 f"(write_ibz_only=False or closure check failed)")
 
     # ---- G-flat on-disk format ---------------------------------
     # The writer accumulates each r-chunk's contribution into a
@@ -719,7 +722,7 @@ def fit_zeta_to_h5(
         _gflat_ngk_per_q = _sphere_pkg["ngk_per_q"]
         _gflat_ngkmax = int(_sphere_pkg["ngkmax"])
         if jax.process_index() == 0:
-            print(
+            print_fn(
                 f"  G-flat ζ sphere: ngkmax={_gflat_ngkmax}, "
                 f"min ngk={int(_gflat_ngk_per_q.min())}, "
                 f"max ngk={int(_gflat_ngk_per_q.max())} "
@@ -925,9 +928,9 @@ def fit_zeta_to_h5(
         int(shard.data.size) * int(shard.data.dtype.itemsize)
         for shard in psi_r_cache.addressable_shards)
     if jax.process_index() == 0:
-        print(f"  ψ(r) cache: {psi_r_cache.shape}, "
-              f"band-sharded over ('x','y'), "
-              f"{_cache_local_bytes / 1e9:.2f} GB local")
+        print_fn(f"  ψ(r) cache: {psi_r_cache.shape}, "
+                 f"band-sharded over ('x','y'), "
+                 f"{_cache_local_bytes / 1e9:.2f} GB local")
     # The r-chunk loop consumes only the device cache.  Drop host ψ(G) now;
     # g_index/kvecs remain staged properties used as compatibility operands.
     psi_G_store.close()
@@ -1026,10 +1029,10 @@ def fit_zeta_to_h5(
         _n_mu_local = int(meta.n_rmu_padded) // _p_prod
         _N = n_q_disk * _n_mu_local
         _cs = _gflat_chunk_size or _N
-        print(f"  G-flat ζ accumulator: N={_N} rows/rank "
-              f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
-              f"chunk_size={_cs} → "
-              f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
+        print_fn(f"  G-flat ζ accumulator: N={_N} rows/rank "
+                 f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
+                 f"chunk_size={_cs} → "
+                 f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
     # Numpy → replicated, process-locally: ``jax.device_put(numpy, <a
     # multi-process NamedSharding>)`` fires JAX's hidden
     # ``multihost_utils.assert_equal`` all-gather (see
@@ -1170,14 +1173,14 @@ def fit_zeta_to_h5(
                                      * _a.dtype.itemsize) / 1e9
                 except Exception:
                     _live_gb = -1.0
-                print(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
-                      f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
-                      f"write={_t_write*1000:.0f}ms "
-                      f"total={(_t_fit+_t_write)*1000:.0f}ms "
-                      f"rss={_rss2:.3f}GB live={_live_gb:.3f}GB "
-                      f"d_fit={_rss1 - _rss0:+.3f} "
-                      f"d_acc={_rss2 - _rss1:+.3f} "
-                      f"rss_trim={_trimmed:.3f}GB", flush=True)
+                print_fn(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
+                         f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
+                         f"write={_t_write*1000:.0f}ms "
+                         f"total={(_t_fit+_t_write)*1000:.0f}ms "
+                         f"rss={_rss2:.3f}GB live={_live_gb:.3f}GB "
+                         f"d_fit={_rss1 - _rss0:+.3f} "
+                         f"d_acc={_rss2 - _rss1:+.3f} "
+                         f"rss_trim={_trimmed:.3f}GB")
             r_progress.step()
             # LORRAX_MAX_RCHUNKS=N: stop the r-chunk loop after N chunks
             # for profiling/sweeping.  Clean python exit avoids the
@@ -1212,10 +1215,9 @@ def fit_zeta_to_h5(
                     )
             if _max_rchunks and (chunk_idx + 1) >= _max_n:
                 if jax.process_index() == 0:
-                    print(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
-                          f"reached after chunk {chunk_idx+1}; "
-                          f"breaking r-chunk loop for profiling.",
-                          flush=True)
+                    print_fn(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
+                             f"reached after chunk {chunk_idx+1}; "
+                             f"breaking r-chunk loop for profiling.")
                 break
 
 
@@ -1279,16 +1281,16 @@ def fit_zeta_to_h5(
     _trunc = active_zeta_truncating_knobs()
     if _trunc and jax.process_index() == 0:
         _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        print("")
-        print("  " + "!" * 68)
-        print(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
-              f"(fewer than {num_chunks} r-chunks). ***")
-        print(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
-        print( "  complete (isdf_header/zeta_is_done stays False), so no")
-        print( "  restart or reuse path will trust it.  Profiling only —")
-        print( "  delete this file before any production run from this")
-        print( "  directory.")
-        print("  " + "!" * 68, flush=True)
+        print_fn("")
+        print_fn("  " + "!" * 68)
+        print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
+                 f"(fewer than {num_chunks} r-chunks). ***")
+        print_fn(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
+        print_fn("  complete (isdf_header/zeta_is_done stays False), so no")
+        print_fn("  restart or reuse path will trust it.  Profiling only —")
+        print_fn("  delete this file before any production run from this")
+        print_fn("  directory.")
+        print_fn("  " + "!" * 68)
     elif jax.process_index() == 0:
         from file_io.isdf_header import mark_zeta_done
         mark_zeta_done(output_file)
@@ -1300,12 +1302,12 @@ def fit_zeta_to_h5(
     # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;
     # ``H5`` is the allgather+write (or FFI write_slab).  Everything else
     # lives inside the jit — see xprof for the intra-jit breakdown.
-    print(f"  Zeta output: {output_file}  shape: "
-          f"(n_q_disk={n_q_disk} of {nqx}·{nqy}·{nqz}={nq} full-BZ, "
-          f"n_rtot={n_rtot}, n_rmu={n_rmu})")
-    print(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
+    print_fn(f"  Zeta output: {output_file}  shape: "
+             f"(n_q_disk={n_q_disk} of {nqx}·{nqy}·{nqz}={nq} full-BZ, "
+             f"n_rtot={n_rtot}, n_rmu={n_rmu})")
+    print_fn(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
     for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
-        print(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
+        print_fn(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
 
     # P3 — exit of ζ-fit.  Captures what's still alive after the chunk
     # loop completes: gflat_acc was del'd above, zeta_chunk freed, but

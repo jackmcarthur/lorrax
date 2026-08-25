@@ -1491,6 +1491,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 			write_ibz_only=_write_ibz_only_charge,
 			zeta_cutoff_ry=_zeta_cutoff,
+			print_fn=print_fn,
 		)
 
 	# ── THE ζ RANK CUT'S CLOSURE VERDICT, refused HERE if it must be ──────
@@ -1757,6 +1758,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					# is loud per the bispinor IBZ requirement.
 					write_ibz_only=_write_ibz_only_transverse,
 					zeta_cutoff_ry=_zeta_cutoff,
+					print_fn=print_fn,
 				)
 			# Stamp this ζ_T so a later run can reuse it — same ordering
 			# and same truncating-knob veto as the charge stamp above

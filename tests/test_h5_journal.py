@@ -52,7 +52,10 @@ def journal_dir(tmp_path, monkeypatch):
     """A private journal directory and a clean registry for every cell."""
     HO.reset_for_test()
     J.reset_for_test()
-    monkeypatch.delenv(J.MODE_ENV, raising=False)
+    # The production default is deliberately quiet.  This suite tests the
+    # opt-in instrument, so enable it explicitly except in the default-mode
+    # cell below.
+    monkeypatch.setenv(J.MODE_ENV, "1")
     monkeypatch.delenv(HO.POLICY_ENV, raising=False)
     monkeypatch.setenv(J.DIR_ENV, str(tmp_path))
     yield tmp_path
@@ -315,8 +318,14 @@ def test_sync_mode_fsyncs_every_line_in_order(monkeypatch, tmp_path):
     assert [parse(ln)["ds"] for ln in lines()] == ["d0", "d1", "d2"]
 
 
-def test_the_toggle_defaults_on_and_zero_silences_it(monkeypatch, tmp_path):
-    assert J.mode() == J.MODE_ON, "documented default is ON (audit §C)"
+def test_the_toggle_defaults_off_and_one_enables_it(monkeypatch, tmp_path):
+    monkeypatch.delenv(J.MODE_ENV, raising=False)
+    assert J.mode() == J.MODE_OFF, "production default creates no sidecar"
+    assert not J.enabled()
+    assert J.record("open", tmp_path / "f.h5", stack="ffi", mode="w") is None
+    assert lines() == []
+    monkeypatch.setenv(J.MODE_ENV, "1")
+    assert J.mode() == J.MODE_ON and J.enabled()
     J.record("open", tmp_path / "f.h5", stack="ffi", mode="w")
     assert len(lines()) == 1
     monkeypatch.setenv(J.MODE_ENV, "0")

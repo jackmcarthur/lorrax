@@ -41,6 +41,7 @@ implementation (total electron number ≈ ``np.sum(ρ)``).
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -134,6 +135,8 @@ def rho_from_wfn_ibz(
     wfn: WfnLoader,
     sym: symmetry_maps.SymMaps,
     n_val: int | None = None,
+    *,
+    warn: bool = True,
 ) -> np.ndarray:
     """Sum ρ(r) = Σ_k w_k Σ_n |ψ_nk(r)|² over IBZ k-points.
 
@@ -169,7 +172,10 @@ def rho_from_wfn_ibz(
         n_val = int(wfn.nelec)
 
     wfn_k = _load_wfn_k_fftbox_ibz(wfn, n_val)
-    rho_jax = compute_valence_density(wfn_k, sym, wfn)
+    with warnings.catch_warnings():
+        if not warn:
+            warnings.simplefilter("ignore")
+        rho_jax = compute_valence_density(wfn_k, sym, wfn)
     return np.asarray(rho_jax, dtype=np.float64)
 
 
@@ -519,6 +525,8 @@ def get_charge_density(
     source: str = "auto",
     save_dir: str | os.PathLike | None = None,
     n_val: int | None = None,
+    print_fn=print,
+    warn: bool = True,
 ) -> np.ndarray:
     """Return ρ_val(r) on the QE FFT grid. Dispatch to one of two sources.
 
@@ -555,10 +563,10 @@ def get_charge_density(
         if resolved is not None and (resolved / "charge-density.hdf5").is_file():
             save_dir = resolved
             use_save = True
-            print(f"[charge_density] source='auto' → reading {save_dir}/charge-density.hdf5")
+            print_fn(f"[charge_density] source='auto' → reading {save_dir}/charge-density.hdf5")
         else:
-            print("[charge_density] source='auto' → no QE .save found, "
-                  "falling back to IBZ wavefunction sum from WFN.h5")
+            print_fn("[charge_density] source='auto' → no QE .save found, "
+                     "falling back to IBZ wavefunction sum from WFN.h5")
 
     if use_save:
         if save_dir is None:
@@ -568,4 +576,4 @@ def get_charge_density(
     # wfn_ibz path
     if wfn is None or sym is None:
         raise ValueError("source='wfn_ibz' requires both wfn=... and sym=...")
-    return rho_from_wfn_ibz(wfn, sym, n_val=n_val)
+    return rho_from_wfn_ibz(wfn, sym, n_val=n_val, warn=warn)

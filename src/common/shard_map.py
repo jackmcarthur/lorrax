@@ -212,6 +212,8 @@ def _announce() -> None:
     if _announced:
         return
     _announced = True
+    if jax.process_index() != 0:
+        return
     print("  [shard_map] using %s (jax %s)"
           % (SHARD_MAP_MODE, ".".join(map(str, _VER))), flush=True)
 

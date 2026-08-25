@@ -241,12 +241,21 @@ def test_the_probe_counts_mapped_libhdf5_objects_and_prints_them():
     assert len(set(libs)) == len(libs), "distinct objects, not occurrences"
 
     lines = []
-    out = HO.probe("unit-test", print_fn=lines.append)
+    out = HO.probe("unit-test", print_fn=lines.append, verbose=True)
     assert out["libraries"] == libs
     joined = "\n".join(lines)
     assert "[hdf5-probe unit-test]" in joined
     assert f"{len(libs)} core mapped" in joined
     assert "HDF5_USE_FILE_LOCKING=" in joined
+
+
+def test_a_safe_production_probe_is_silent(monkeypatch):
+    """Healthy library inventory is diagnostic detail, not driver output."""
+    monkeypatch.delenv("LORRAX_H5_JOURNAL", raising=False)
+    lines = []
+    out = HO.probe("startup", print_fn=lines.append)
+    assert out["unsafe"] == []
+    assert lines == []
 
 
 def test_the_probe_does_not_count_hl_as_a_second_library():

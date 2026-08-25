@@ -432,11 +432,16 @@ def alternation_rows() -> list[tuple[str, int, int, int, int, int]]:
     return rows
 
 
-def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
-    """Print the mapped-libhdf5 count and the registry's shared paths.
+def probe(where: str, *, print_fn=print, escalate: bool = True,
+          verbose: bool | None = None) -> dict:
+    """Measure the mapped-libhdf5 count and the registry's shared paths.
 
-    MEASURED, NOT ASSERTED, by default: this prints what is true and
-    returns it.  ``escalate`` only decides whether the *strict* policy is
+    MEASURED, NOT ASSERTED, by default: this returns what is true.  A safe
+    production probe is silent; an unsafe condition is always printed.
+    Passing ``verbose=True`` prints the full inventory, while ``None``
+    follows the HDF5 operation journal so an explicitly instrumented run
+    gets both kinds of evidence.  ``escalate`` only decides whether the
+    *strict* policy is
     allowed to turn the measured unsafe condition — two mapped libhdf5
     objects AND a path this process has written through both — into the
     same refusal :func:`note_open` raises.  Under the default ``measure``
@@ -447,6 +452,9 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
     both = [r for r in rows if r[1] and r[2]]
     unsafe = [r for r in both if r[4]]
     locking = os.environ.get("HDF5_USE_FILE_LOCKING", "<unset>")
+    if verbose is None:
+        from . import h5_journal
+        verbose = h5_journal.enabled()
 
     if not libs:
         shown = "unmeasurable (no /proc/self/maps)"
@@ -455,9 +463,10 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
         if companions:
             shown += (f" (+{len(companions)} companion: "
                       + ", ".join(companions) + ")")
-    print_fn(f"  [hdf5-probe {where}] libhdf5 {shown}; "
-             f"HDF5_USE_FILE_LOCKING={locking}; policy={policy()}")
-    if both:
+    if verbose:
+        print_fn(f"  [hdf5-probe {where}] libhdf5 {shown}; "
+                 f"HDF5_USE_FILE_LOCKING={locking}; policy={policy()}")
+    if verbose and both:
         worst = both[0]
         print_fn(
             f"  [hdf5-probe {where}] {len(both)} path(s) opened through "
@@ -465,7 +474,7 @@ def probe(where: str, *, print_fn=print, escalate: bool = True) -> dict:
             f"worst: {os.path.basename(worst[0])} "
             f"(h5py {worst[1]} opens, FFI {worst[2]}, "
             f"{worst[3]} alternations)")
-    else:
+    elif verbose:
         print_fn(f"  [hdf5-probe {where}] no path opened through both "
                  f"stacks so far")
     if len(libs) >= 2 and unsafe:

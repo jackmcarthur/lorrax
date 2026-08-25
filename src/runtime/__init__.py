@@ -148,6 +148,7 @@ def _import_jax():
 
 __all__ = [
     "initialize_communicator_stack",
+    "rank0_print",
     "finalize_process",
     "run_main_and_finalize",
     "RuntimeStack",
@@ -1496,10 +1497,22 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     return _STACK
 
 
-def _print_rank0(*a, **k):
+def rank0_print(*a, **k):
+    """Print one flushed production-log stream from process zero.
+
+    Drivers pass this through their existing ``print_fn`` seams.  Exceptions
+    and rank-local refusal paths continue to use stderr directly; this helper
+    is only for deterministic status, progress and timing output.
+    """
     if _resolve_proc_id() == 0:
         k.setdefault("flush", True)
         print(*a, **k)
+
+
+# Private compatibility spelling used inside this module.  Keep one
+# implementation of rank ownership while existing internal call sites remain
+# intentionally private.
+_print_rank0 = rank0_print
 
 
 def finalize_process(rc: int = 0):
