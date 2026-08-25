@@ -213,12 +213,12 @@ def test_hgl_cell_plan_tiles_direct_denominator_and_respects_capacity():
 
 
 def test_hgl_cell_rules_rephase_the_direct_scalar_kernel(monkeypatch):
-    """The +/crossing/- rows reproduce ``exp(i*t*(omega-E-B))``.
+    """Bounded +/crossing/- rows reproduce ``exp(i*t*(omega-E-B))``.
 
     This is the complete scalar coefficient product used by the production
-    G, W, and omega projector, including both reference phases.  One A value,
-    one omega point, and three deterministic pole values populate exactly one
-    cell of each kind; no random tensor or frontend fixture is involved.
+    G, W, and omega projector, including both reference phases.  Deliberate
+    near-shell and far-tail poles force exact B panes on both sign-definite
+    flanks; no random tensor or frontend fixture is involved.
     """
     from gw import ppm_windows
     from gw.minimax_screening import (
@@ -249,8 +249,11 @@ def test_hgl_cell_rules_rephase_the_direct_scalar_kernel(monkeypatch):
     xi = 0.2
     omega = 1.0
     energy = 0.2
-    poles = np.array([[[0.4, 0.8, 1.2]]], dtype=np.float64)
-    windows, _plan = ppm_windows._build_partitioned_hgl_windows(
+    poles_flat = np.array(
+        [1.0e-4, 0.4, 0.7979, 0.8, 0.8021, 2.0, 1000.0],
+        dtype=np.float64)
+    poles = poles_flat.reshape(1, 1, -1)
+    windows, plan = ppm_windows._build_partitioned_hgl_windows(
         E_A=np.array([[energy]], dtype=np.float64),
         base_mask_A=np.array([[True]]),
         Omega_q=ppm_windows.jnp.asarray(poles),
@@ -258,47 +261,69 @@ def test_hgl_cell_rules_rephase_the_direct_scalar_kernel(monkeypatch):
         omega_nonneg_ry=np.array([omega]),
         neg_omega_half=False,
         regularization_width_ry=xi,
-        edge_factor=1.5,
+        edge_factor=0.01,
         target_error=1.0e-6,
         max_nodes=64,
         crossing_eps_q=1.0e-3,
         crossing_max_nodes=64,
         use_shipped_tables=False,
     )
-    assert [w.name for w in windows] == [
-        "pane_positive", "pane_crossing", "pane_negative"]
+    assert plan.max_A_dim <= ppm_windows._CROSSING_A_MAX
+    assert sum(w.name == "pane_positive" for w in windows) > 1
+    assert sum(w.name == "pane_crossing" for w in windows) == 1
+    assert sum(w.name == "pane_negative" for w in windows) > 1
 
-    pole_for = {"pane_positive": 0.4, "pane_crossing": 0.8,
-                "pane_negative": 1.2}
+    ownership = np.zeros(poles_flat.size, dtype=np.int64)
     for window in windows:
-        pole = pole_for[window.name]
+        lo, hi = ppm_windows.window_mask_B_bounds(window)
+        selected = (poles_flat > lo) & (poles_flat <= hi)
+        ownership += selected
+        selected_poles = poles_flat[selected]
+        assert selected_poles.size > 0
+        if window.name == "pane_positive":
+            x = omega - energy - selected_poles
+            assert float(np.max(x)) / float(np.min(x)) <= 256.0
+        elif window.name == "pane_negative":
+            x = energy + selected_poles - omega
+            assert float(np.max(x)) / float(np.min(x)) <= 256.0
+
         t = complex(np.asarray(window.nodes.t)[0])
         alpha = complex(np.asarray(window.nodes.alpha)[0])
-        factorized = (
-            np.exp(-1j * (energy - window.E_ref_A) * t)
-            * np.exp(-1j * (pole - window.E_ref_B) * t)
-            * np.exp(-1j * (
-                window.E_ref_A + window.E_ref_B - omega) * t)
-        )
-        direct_phase = np.exp(1j * t * (omega - energy - pole))
-        np.testing.assert_allclose(
-            factorized, direct_phase, rtol=2.0e-15, atol=2.0e-15)
-
-        direct_weighted = window.prefactor * alpha * direct_phase
-        factorized_weighted = window.prefactor * alpha * factorized
-        if window.project == "imag":
-            # Diagonal band-adjoint completion is Im(Z).
+        for pole in (float(np.min(selected_poles)),
+                     float(np.max(selected_poles))):
+            factorized = (
+                np.exp(-1j * (energy - window.E_ref_A) * t)
+                * np.exp(-1j * (pole - window.E_ref_B) * t)
+                * np.exp(-1j * (
+                    window.E_ref_A + window.E_ref_B - omega) * t)
+            )
+            direct_phase = np.exp(1j * t * (omega - energy - pole))
             np.testing.assert_allclose(
-                np.imag(factorized_weighted),
-                np.imag(direct_weighted), rtol=2.0e-15, atol=2.0e-15)
-        else:
-            np.testing.assert_allclose(
-                factorized_weighted, direct_weighted,
-                rtol=2.0e-15, atol=2.0e-15)
+                factorized, direct_phase, rtol=2.0e-15, atol=2.0e-15)
 
-    assert complex(np.asarray(windows[0].nodes.t)[0]).imag > 0.0
-    assert complex(np.asarray(windows[2].nodes.t)[0]).imag < 0.0
-    assert [w.prefactor for w in windows] == [-1.0, -1.0, 1.0]
+            direct_weighted = window.prefactor * alpha * direct_phase
+            factorized_weighted = window.prefactor * alpha * factorized
+            if window.project == "imag":
+                # Diagonal band-adjoint completion is Im(Z).
+                np.testing.assert_allclose(
+                    np.imag(factorized_weighted),
+                    np.imag(direct_weighted), rtol=2.0e-15, atol=2.0e-15)
+            else:
+                np.testing.assert_allclose(
+                    factorized_weighted, direct_weighted,
+                    rtol=2.0e-15, atol=2.0e-15)
+
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
+    assert all(complex(np.asarray(w.nodes.t)[0]).imag > 0.0
+               for w in windows if w.name == "pane_positive")
+    assert all(complex(np.asarray(w.nodes.t)[0]).imag < 0.0
+               for w in windows if w.name == "pane_negative")
+    assert {w.prefactor for w in windows
+            if w.name == "pane_positive"} == {-1.0}
+    assert {w.prefactor for w in windows
+            if w.name == "pane_crossing"} == {-1.0}
+    assert {w.prefactor for w in windows
+            if w.name == "pane_negative"} == {1.0}
 
 
 def test_hgl_negative_cell_tail_panes_preserve_exact_partition(monkeypatch):
@@ -406,6 +431,7 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     from types import SimpleNamespace
     from gw.ppm_windows import (
         _build_single_sigma_window,
+        _plan_sign_definite_cells,
         _plan_sign_definite_omega_panes,
         window_mask_B_bounds,
     )
@@ -452,6 +478,17 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     target_error = 1.0e-6
     all_windows = []
     for neg_omega_half in (False, True):
+        cells_run33 = _plan_sign_definite_cells(
+            E_A=np.array([E_min, E_max], dtype=np.float64),
+            base_mask_A=np.array([True, True]),
+            Omega_q=jnp.asarray(omega),
+            base_mask_B=jnp.asarray(mask),
+            mask_B_count=omega.size,
+            mask_B_min=float(omega.min()),
+            mask_B_max=float(omega.max()),
+            omega_nonneg_ry=np.array([0.0, omega_eval]),
+            orientation="E+B+omega",
+        )
         windows = _build_single_sigma_window(
             E_A=np.array([E_min, E_max], dtype=np.float64),
             base_mask_A=np.array([True, True]),
@@ -464,7 +501,7 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
             target_error=target_error,
             max_nodes=64,
             use_shipped_tables=True,
-            omega_panes=panes,
+            sign_definite_cells=cells_run33,
         )
         assert len(windows) == len(panes)
         all_windows.extend(windows)
@@ -495,9 +532,7 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     assert any("R_256p000000_eps_3p0em08" in str(window.provenance)
                for window in all_windows)
 
-    # A singleton Ω support cannot be split.  Its E/ω floor may therefore
-    # remain wider than eight octaves for the canonical minimax service to
-    # accept or refuse; the planner still owns it exactly once.
+    # A singleton Ω support cannot be split by the B-axis owner alone.
     irreducible = _plan_sign_definite_omega_panes(
         Omega_q=jnp.asarray([1.0e-4]), base_mask_B=jnp.asarray([True]),
         mask_B_count=1, mask_B_min=1.0e-4, mask_B_max=1.0e-4,
@@ -508,6 +543,70 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     assert count == 1 and lo < 1.0e-4 <= hi
     assert actual_min == actual_max == 1.0e-4
     assert (5.0 + actual_max + 1.0) / (1.0e-3 + actual_min) > 256.0
+
+    # The canonical product continuation therefore tiles the existing A and
+    # evaluation-omega selectors.  This fixture forces both cuts: the low-A
+    # singleton still needs its [0,1] omega grid split after the A cut.
+    singleton_E = np.array([1.0e-3, 5.0], dtype=np.float64)
+    singleton_w = np.array([0.0, 1.0], dtype=np.float64)
+    cells = _plan_sign_definite_cells(
+        E_A=singleton_E,
+        base_mask_A=np.ones_like(singleton_E, dtype=bool),
+        Omega_q=jnp.asarray([1.0e-4]),
+        base_mask_B=jnp.asarray([True]),
+        mask_B_count=1,
+        mask_B_min=1.0e-4,
+        mask_B_max=1.0e-4,
+        omega_nonneg_ry=singleton_w,
+        orientation="E+B+omega",
+    )
+    assert len(cells) == 3
+    assert all(cell.x_max / cell.x_min <= 256.0 for cell in cells)
+    ownership = np.zeros((singleton_E.size, singleton_w.size), dtype=np.int64)
+    for cell in cells:
+        selected_E = ((singleton_E > cell.E_lo)
+                      & (singleton_E <= cell.E_hi))
+        ownership[np.ix_(selected_E, np.isin(
+            np.arange(singleton_w.size), cell.omega_indices))] += 1
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
+
+    bounded = _build_single_sigma_window(
+        E_A=singleton_E,
+        base_mask_A=np.ones_like(singleton_E, dtype=bool),
+        mask_B_count=1,
+        mask_B_min=1.0e-4,
+        mask_B_max=1.0e-4,
+        omega_nonneg_ry=singleton_w,
+        denom_can_cross=False,
+        neg_omega_half=False,
+        target_error=target_error,
+        max_nodes=64,
+        use_shipped_tables=True,
+        sign_definite_cells=cells,
+    )
+    assert len(bounded) == len(cells)
+    for window in bounded:
+        assert window.max_error <= target_error
+        E_lo = -np.inf if window.E_min is None else window.E_min
+        E_hi = np.inf if window.E_max is None else window.E_max
+        selected_E = singleton_E[(singleton_E > E_lo)
+                                 & (singleton_E <= E_hi)]
+        selected_w = (singleton_w if window.omega_indices is None
+                      else singleton_w[window.omega_indices])
+        t = np.asarray(window.nodes.t, dtype=np.complex128)
+        alpha = np.asarray(window.nodes.alpha, dtype=np.complex128)
+        for energy in selected_E:
+            for frequency in selected_w:
+                got = window.prefactor * np.sum(
+                    alpha
+                    * np.exp(-1j * (window.E_ref_A
+                                    + window.E_ref_B) * t)
+                    * np.exp(-1j * (energy - window.E_ref_A) * t)
+                    * np.exp(-1j * (1.0e-4 - window.E_ref_B) * t)
+                    * np.exp(+1j * window.omega_sign * frequency * t)
+                )
+                want = window.prefactor / (frequency + energy + 1.0e-4)
+                assert abs(got - want) <= target_error
 
 
 def test_crossing_b_slab_reuses_exact_bounded_omega_panes(monkeypatch):
@@ -570,23 +669,36 @@ def test_crossing_b_slab_reuses_exact_bounded_omega_panes(monkeypatch):
     slab = [window for window in windows
             if window.name.startswith("b_slab")]
     assert len(slab) > 1
-    ownership = np.zeros((energies.size, poles.size), dtype=np.int64)
+    ownership = np.zeros(
+        (energies.size, poles.size, omega_eval.size), dtype=np.int64)
     for window in windows:
         lo, hi = ppm_windows.window_mask_B_bounds(window)
         selected_B = (poles > lo) & (poles <= hi)
-        selected_A = np.asarray(window.mask_A, dtype=bool).reshape(-1)
-        ownership += selected_A[:, None] & selected_B[None, :]
-        if window.name.startswith("b_slab"):
+        selected_A = np.asarray(
+            window.mask_A, dtype=bool).reshape(-1).copy()
+        E_lo = -np.inf if window.E_min is None else window.E_min
+        E_hi = np.inf if window.E_max is None else window.E_max
+        selected_A &= ((energies.reshape(-1) > E_lo)
+                       & (energies.reshape(-1) <= E_hi))
+        selected_w = np.ones(omega_eval.size, dtype=bool)
+        if window.omega_indices is not None:
+            selected_w[:] = False
+            selected_w[window.omega_indices] = True
+        ownership += (selected_A[:, None, None]
+                      & selected_B[None, :, None]
+                      & selected_w[None, None, :])
+        if (window.name.startswith("a_stripe")
+                or window.name.startswith("b_slab")):
             pane_poles = poles[selected_B]
+            pane_energies = energies.reshape(-1)[selected_A]
+            pane_omega = omega_eval[selected_w]
             assert pane_poles.size > 0
-            x_min, x_max = ppm_windows._sign_definite_support(
-                float(np.min(energies)), float(np.max(energies)),
+            x_min, x_max = ppm_windows._oriented_sign_definite_support(
+                float(np.min(pane_energies)), float(np.max(pane_energies)),
                 float(np.min(pane_poles)), float(np.max(pane_poles)),
-                float(np.max(omega_eval)), subtract_omega=True,
-                x_min_floor=edge * xi)
-            assert (x_max / x_min
-                    <= ppm_windows._SIGN_DEFINITE_PANE_MAX_RANGE
-                    or np.min(pane_poles) == np.max(pane_poles))
+                float(np.min(pane_omega)), float(np.max(pane_omega)),
+                "E+B-omega")
+            assert x_max / x_min <= ppm_windows._SIGN_DEFINITE_PANE_MAX_RANGE
 
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
 

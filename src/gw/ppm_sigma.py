@@ -1005,7 +1005,13 @@ def _run_sigma_branch(
         return None, []
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
-    energy_windows = bool(partition_hgl)
+    # Product cells do not make per-cell executables.  E/B bounds below are
+    # rank-0 scalar runtime operands to the incumbent cached kernel; this bool
+    # selects its one pre-existing bounded-energy compile family once for the
+    # whole branch.  ``omega_indices`` never reaches JAX at all: the canonical
+    # host accumulator slices/scatters that axis after each tau result.
+    energy_windows = any(
+        win.E_min is not None or win.E_max is not None for win in windows)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
