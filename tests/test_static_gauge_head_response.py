@@ -68,10 +68,7 @@ def _response(mesh, *, S=None, **changes):
             np.zeros((2, n_body, 4), dtype=np.complex128),
             NamedSharding(mesh, P(None, "y", None)),
         ),
-        response_provenance="fixture:static-gauge-response-v1",
-        operator_provenance="fixture:current-equivalent-H[A]-v1",
-        contact_provenance="fixture:d2H/dA2-v1",
-        hall_provenance="fixture:sigma-H-Kubo-v1",
+        hamiltonian_config_operator_fingerprint="sha256:" + "a" * 64,
         operator_current_equivalent=True,
         contact_is_exact=True,
         ward_residual=0.0,
@@ -170,7 +167,8 @@ def test_static_gauge_response_refuses_a_wrong_wing_axis():
     (
         ({"operator_current_equivalent": False}, "static_gauge_head_operator"),
         ({"contact_is_exact": False}, "static_gauge_head_contact"),
-        ({"hall_provenance": ""}, "static_gauge_head_provenance"),
+        ({"hamiltonian_config_operator_fingerprint": ""},
+         "static_gauge_head_fingerprint"),
     ),
 )
 def test_static_gauge_response_refuses_missing_physics_provenance(changes, gate):
