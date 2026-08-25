@@ -328,18 +328,20 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     import jax.numpy as jnp
     from types import SimpleNamespace
     from gw.ppm_windows import (
+        _build_single_sigma_window,
         _plan_sign_definite_omega_panes,
         window_mask_B_bounds,
     )
 
-    # Two 0.2% tails around a compact body, with the frozen run33 scales.
-    omega = np.concatenate([
-        np.array([2.0e-4, 4.0e-4]),
-        np.linspace(0.05, 4.0, 996),
-        np.array([95.8565, 97.8518]),
-    ]).astype(np.float64)
+    # Minimal deterministic support spanning the frozen run33 endpoints.
+    omega = np.array(
+        [2.0e-4, 4.0e-4, 0.05, 4.0, 95.8565, 97.8518],
+        dtype=np.float64,
+    )
     mask = np.ones_like(omega, dtype=bool)
-    E_min, E_max, omega_eval = 0.0343332986397257, 5.40437906406350, 1.46997235298981
+    E_min = 0.0343332986397257
+    E_max = 5.40437906406350
+    omega_eval = 1.46997235298981
     panes = _plan_sign_definite_omega_panes(
         Omega_q=jnp.asarray(omega), base_mask_B=jnp.asarray(mask),
         mask_B_count=omega.size,
@@ -348,9 +350,6 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     )
 
     ownership = np.zeros(omega.size, dtype=np.int64)
-    pane_sum = 0.0 + 0.0j
-    residues = (np.linspace(0.2, 1.2, omega.size)
-                + 1j * np.linspace(-0.3, 0.4, omega.size))
     for lo, hi, count, actual_min, actual_max in panes:
         # Explicit B_lo/B_hi wins over mask_B_mode="all" in the existing
         # runtime selector; no second mask convention is hidden in the test.
@@ -365,12 +364,73 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
         R = ((E_max + actual_max + omega_eval)
              / (E_min + actual_min))
         assert R <= 256.0 or actual_min == actual_max
-        pane_sum += np.sum(residues[selected] / (0.7 + E_max + omega[selected]))
 
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
-    direct = np.sum(residues / (0.7 + E_max + omega))
-    np.testing.assert_allclose(pane_sum, direct, rtol=2e-15, atol=2e-15)
     assert len(panes) > 1
+
+    # Drive the production window builder and shipped rules for both omega
+    # halves.  Recompose exactly the A phase, B phase, E_ref rephasing and
+    # accumulator frequency factor; boundary lanes must recover the direct
+    # signed rational kernel within its requested physical L-infinity error.
+    target_error = 1.0e-6
+    all_windows = []
+    for neg_omega_half in (False, True):
+        windows = _build_single_sigma_window(
+            E_A=np.array([E_min, E_max], dtype=np.float64),
+            base_mask_A=np.array([True, True]),
+            mask_B_count=omega.size,
+            mask_B_min=float(omega.min()),
+            mask_B_max=float(omega.max()),
+            omega_nonneg_ry=np.array([0.0, omega_eval]),
+            denom_can_cross=False,
+            neg_omega_half=neg_omega_half,
+            target_error=target_error,
+            max_nodes=64,
+            use_shipped_tables=True,
+            omega_panes=panes,
+        )
+        assert len(windows) == len(panes)
+        all_windows.extend(windows)
+        for window in windows:
+            got_lo, got_hi = window_mask_B_bounds(window)
+            selected_omega = omega[(omega > got_lo) & (omega <= got_hi)]
+            assert selected_omega.size > 0
+            assert window.max_error <= target_error
+            t = np.asarray(window.nodes.t, dtype=np.complex128)
+            alpha = np.asarray(window.nodes.alpha, dtype=np.complex128)
+            for energy in (E_min, E_max):
+                for pole in (selected_omega.min(), selected_omega.max()):
+                    for frequency in (0.0, omega_eval):
+                        factorized = window.prefactor * np.sum(
+                            alpha
+                            * np.exp(-1j * (window.E_ref_A
+                                            + window.E_ref_B) * t)
+                            * np.exp(-1j * (energy - window.E_ref_A) * t)
+                            * np.exp(-1j * (pole - window.E_ref_B) * t)
+                            * np.exp(-1j * (
+                                -window.omega_sign * frequency) * t)
+                        )
+                        direct = window.prefactor / (
+                            frequency + energy + pole)
+                        assert abs(factorized - direct) <= target_error
+
+    assert {window.prefactor for window in all_windows} == {-1.0, 1.0}
+    assert any("R_256p000000_eps_3p0em08" in str(window.provenance)
+               for window in all_windows)
+
+    # A singleton Ω support cannot be split.  Its E/ω floor may therefore
+    # remain wider than eight octaves for the canonical minimax service to
+    # accept or refuse; the planner still owns it exactly once.
+    irreducible = _plan_sign_definite_omega_panes(
+        Omega_q=jnp.asarray([1.0e-4]), base_mask_B=jnp.asarray([True]),
+        mask_B_count=1, mask_B_min=1.0e-4, mask_B_max=1.0e-4,
+        E_min=1.0e-3, E_max=5.0, omega_max=1.0,
+    )
+    assert len(irreducible) == 1
+    lo, hi, count, actual_min, actual_max = irreducible[0]
+    assert count == 1 and lo < 1.0e-4 <= hi
+    assert actual_min == actual_max == 1.0e-4
+    assert (5.0 + actual_max + 1.0) / (1.0e-3 + actual_min) > 256.0
 
 
 def _build_branch_windows():
