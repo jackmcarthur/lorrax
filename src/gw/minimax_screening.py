@@ -268,7 +268,7 @@ def fit_gn_ppm_from_wc_pair(
     *,
     fallback_omega: float,
     n_mu_logical: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, float]:
+) -> tuple[jax.Array, jax.Array, jax.Array, float, int, float, float, float]:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
     Parameters
@@ -297,11 +297,14 @@ def fit_gn_ppm_from_wc_pair(
 
     Returns
     -------
-    omega_qmunu, B_qmunu, valid_qmunu, unfulfilled_fraction
+    omega_qmunu, B_qmunu, valid_qmunu, unfulfilled_fraction,
+    n_valid, omega_min, omega_max, pair_relative_separation_min
         Elementwise GN-PPM parameters in the same ``(nkx,nky,nkz,n_rmu,n_rmu)``
-        layout; ``unfulfilled_fraction`` counts LOGICAL modes only. The fit is
-        pure local algebra: no host gathers and no communication beyond
-        whatever sharding is already attached to the inputs.
+        layout; ``unfulfilled_fraction`` and the census count LOGICAL modes
+        only.  The extrema are over valid logical modes; the relative
+        separation is ``|Wc(0)-Wc(z)| / max(|Wc(0)|, |Wc(z)|)``.  The fit is
+        pure local algebra: no tensor host gathers and no communication
+        beyond scalar reductions on the inputs' existing sharding.
     """
 
     n_mu = int(jnp.asarray(Wc0_qmunu).shape[-1])
@@ -327,30 +330,50 @@ def fit_gn_ppm_from_wc_pair(
 
     if _qb >= _nq:
         # Whole thing fits: the historical single-shot call, untouched.
-        omega_vals, B_vals, good, n_good, n_modes = _gn_ppm_fit_kernel(
+        (omega_vals, B_vals, good, n_good, n_modes,
+         omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
             Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
     else:
         _om, _bv, _gd = [], [], []
         n_good = jnp.asarray(0.0, dtype=jnp.float64)
         n_modes = jnp.asarray(0.0, dtype=jnp.float64)
+        omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
+        omega_max = jnp.asarray(-jnp.inf, dtype=jnp.float64)
+        pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
         for _q0 in range(0, _nq, _qb):
             _q1 = min(_q0 + _qb, _nq)
-            _o, _b, _g, _ng, _nm = _gn_ppm_fit_kernel(
-                Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1], _z, _fb, n_log)
+            (_o, _b, _g, _ng, _nm,
+             _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
+                 Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
+                 _z, _fb, n_log)
             _om.append(_o); _bv.append(_b); _gd.append(_g)
             # Exact integer counts -> summation order is irrelevant.
             n_good = n_good + _ng
             n_modes = n_modes + _nm
+            omega_min = jnp.minimum(omega_min, _omin)
+            omega_max = jnp.maximum(omega_max, _omax)
+            pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
         omega_vals = jnp.concatenate(_om, axis=0)
         B_vals = jnp.concatenate(_bv, axis=0)
         good = jnp.concatenate(_gd, axis=0)
         del _om, _bv, _gd
 
     fulfilled = n_good / jnp.maximum(n_modes, 1.0)
-    # The ONLY host sync in the fit, and it is deliberately outside the
-    # kernel: ``_scalar_to_host_float`` gathers, which cannot happen
-    # under ``jit``.
-    return omega_vals, B_vals, good, 1.0 - _scalar_to_host_float(fulfilled)
+    # Every host transfer in the fit is a scalar and deliberately outside
+    # the kernel: ``_scalar_to_host_float`` gathers, which cannot happen
+    # under ``jit``.  The fitted tensors never leave their input sharding.
+    n_valid = int(_scalar_to_host_float(n_good))
+    unfulfilled = 1.0 - _scalar_to_host_float(fulfilled)
+    if n_valid:
+        omega_min_host = _scalar_to_host_float(omega_min)
+        omega_max_host = _scalar_to_host_float(omega_max)
+        pair_rel_min_host = _scalar_to_host_float(pair_rel_min)
+    else:
+        omega_min_host = omega_max_host = pair_rel_min_host = float("nan")
+    return (
+        omega_vals, B_vals, good, unfulfilled, n_valid,
+        omega_min_host, omega_max_host, pair_rel_min_host,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +453,9 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     have retraced on anyway.  Module-level, so no in-body-jit recompile
     hazard (scorecard Z.1 class (a)).
 
-    Returns ``(omega_vals, B_vals, good, fulfilled_fraction)``; the
-    caller turns the last one into ``1 - fraction`` on the host.
+    Returns the fitted arrays, exact logical counts, and the valid-mode
+    pole/two-point-conditioning extrema; the caller turns the counts and
+    scalar reductions into one host census.
     """
     Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
     Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
@@ -521,11 +545,22 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
         n_modes = jnp.sum(
             jnp.broadcast_to(mode_mask, good.shape).astype(jnp.float64))
     n_good = jnp.sum(good.astype(jnp.float64))
+    omega_min = jnp.min(jnp.where(good, omega_vals, jnp.inf))
+    omega_max = jnp.max(jnp.where(good, omega_vals, -jnp.inf))
+    pair_scale = jnp.maximum(
+        jnp.maximum(jnp.abs(Wc0), jnp.abs(Wc_probe)),
+        jnp.finfo(jnp.float64).tiny,
+    )
+    pair_rel = jnp.abs(denom) / pair_scale
+    pair_rel_min = jnp.min(jnp.where(good, pair_rel, jnp.inf))
     # RAW COUNTS, not the ratio (q-chunking 2026-07-29).  Both are sums of
     # booleans, i.e. EXACT integers in float64 (max here ~1e10 << 2^53), so
     # summing them across q-blocks is associativity-safe and the wrapper's
     # single division reproduces the one-shot value BIT-EXACTLY.
-    return omega_vals, B_vals, good, n_good, n_modes
+    return (
+        omega_vals, B_vals, good, n_good, n_modes,
+        omega_min, omega_max, pair_rel_min,
+    )
 
 
 def solve_laplace_minimax_interval(

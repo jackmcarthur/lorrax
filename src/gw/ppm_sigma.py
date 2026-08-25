@@ -388,9 +388,11 @@ def fit_ppm(
 
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
-        Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-        n_mu_logical=int(n_mu_logical))
+    (omega_qmunu, b_qmunu, valid_qmunu, unfulfilled,
+     n_valid, omega_min, omega_max,
+     pair_rel_min) = fit_gn_ppm_from_wc_pair(
+         Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
+         n_mu_logical=int(n_mu_logical))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
@@ -428,6 +430,11 @@ def fit_ppm(
         print_fn(
             f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
             f"unfulfilled={100.0 * unfulfilled:.2f}%")
+        print_fn(
+            f"  {model_label} pole census: valid={n_valid}, "
+            f"Omega=[{omega_min:.8e}, {omega_max:.8e}] Ry, "
+            f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
+            f"{pair_rel_min:.8e}")
 
     return PPMBuildResult(
         omega_p=probe_mag,
