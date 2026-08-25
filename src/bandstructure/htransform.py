@@ -177,8 +177,21 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              qrcp_seed: int = 0):
     """Htransform policy adapter for :func:`isdf.galerkin.fit_galerkin_basis`."""
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
-    from common.gpu_utils import _get_jax_gpu_memory_bytes
-    device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
+    # The whole-state ledger describes allocations made *after this point*.
+    # Compare it with the allocator budget still available to the fit, not
+    # with the arena limit: the driver, WFN metadata and symmetry service are
+    # already live.  ``get_device_memory_info`` is the public owner of that
+    # policy and retains its standard 10% reserve for allocator fragmentation
+    # and state materialised between planning and the first streamed slab.
+    from common.gpu_utils import get_device_memory_info
+    memory = get_device_memory_info()
+    device_fit_budget = float(memory["budget_gb"]) * 1.0e9
+    log_fn(
+        "  Whole-state live fit budget: "
+        f"{device_fit_budget/2**30:.2f} GiB/device from "
+        f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
+        f"({memory['source']}); the allocator limit is not reusable "
+        "capacity while earlier driver state remains live")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,
@@ -189,7 +202,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         qr_eps=qr_eps,
         qrcp_seed=qrcp_seed,
         q_tile_budget=resolve_galerkin_chunk_bytes(),
-        device_pool_limit=device_pool_limit,
+        device_pool_limit=device_fit_budget,
         extra_rank_pad=resolve_extra_rank_pad(),
     )
     return basis.as_legacy_tuple(
