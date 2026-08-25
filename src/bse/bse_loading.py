@@ -1342,7 +1342,9 @@ def _load_ring_subset(
         nb_total = _logical_nband_total(psi_full[0], enk_full_np.shape[1])
 
     if eqp_file is not None:
-        enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
+        enk_full_np = apply_eqp_corrections(
+            enk_full_np, eqp_file, input_file=input_file,
+            state_artifact_path=restart_file)
 
     enk_full = jnp.asarray(enk_full_np)
 
