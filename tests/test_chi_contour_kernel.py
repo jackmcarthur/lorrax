@@ -97,6 +97,78 @@ def _direct_node_sum(psi, enk, slices, tau, alpha_rows, *, wrong_time=False):
     return out / np.sqrt(float(nk))
 
 
+def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
+    monkeypatch,
+):
+    """Broken-TR complex states need both static transition orientations.
+
+    Every valence/conduction gap is exactly one Ry, so the one-node
+    ``tau=0, alpha=1`` quadrature is exact rather than an approximation.
+    The reference is the finite-occupation owner's literal ordered-pair
+    scan at integer occupations.  This cell therefore isolates the
+    transition-orientation completion from minimax error, Dyson, V, and
+    any time-reversal gauge assumption.
+    """
+    import common.fft_helpers as fft_helpers
+
+    monkeypatch.setattr(
+        fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260825)
+    nk, nv, nc, ns, nmu = 3, 2, 2, 2, 4
+    nb = nv + nc
+    psi = (
+        rng.normal(size=(nk, nb, ns, nmu))
+        + 1j * rng.normal(size=(nk, nb, ns, nmu))
+    )
+    enk = np.concatenate((
+        -0.5 * np.ones((nk, nv)),
+        +0.5 * np.ones((nk, nc)),
+    ), axis=1)
+    occ = np.concatenate((
+        np.ones((nk, nv)), np.zeros((nk, nc))), axis=1)
+    slices = BandSlices.from_band_edges(0, 0, nv, nb, nb)
+    wfns = Wavefunctions(
+        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
+        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
+        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
+        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        enk=_put(enk, mesh, P(None, None)),
+        occ=_put(occ, mesh, P(None, None)),
+        slices=slices,
+    )
+    meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
+    quad = SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
+    got = np.asarray(jax.device_get(
+        w_isdf.compute_chi0(wfns, quad, meta, mesh)))
+
+    # Integer-occupation limit of the exact finite-q SSOT.  Same-side
+    # degenerate pairs have df=0 and an exactly-zero supplied surface limit.
+    pair_kernel = w_isdf._get_chi_fractional_q_kernel(
+        mesh, nb_logical=nb, pair_tile=nb, n_z=1)
+    psi_x = wfns.psi_xn
+    psi_y = wfns.psi_yn
+    surface = jnp.zeros_like(wfns.enk)
+    rows = []
+    for q in range(nk):
+        kmq = jnp.asarray([(k - q) % nk for k in range(nk)])
+        row = pair_kernel(
+            psi_x, psi_y, kmq, wfns.enk, wfns.occ, surface,
+            jnp.zeros((1,), dtype=jnp.complex128))
+        rows.append(row[0])
+    ordered = np.asarray(jax.device_get(jnp.stack(rows)))
+
+    neg = np.asarray([(-q) % nk for q in range(nk)])
+    got_recip = np.max(np.abs(got - np.conj(got[neg]))) / np.max(np.abs(got))
+    ordered_recip = (
+        np.max(np.abs(ordered - np.conj(ordered[neg])))
+        / np.max(np.abs(ordered))
+    )
+    assert ordered_recip < 3.0e-13
+    np.testing.assert_allclose(got, ordered, rtol=3.0e-13, atol=3.0e-13)
+    assert got_recip < 3.0e-13
+
+
 def test_complex_contour_matches_direct_k_minus_q_sum(monkeypatch):
     import common.fft_helpers as fft_helpers
 

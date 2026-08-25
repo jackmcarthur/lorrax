@@ -12,7 +12,7 @@ from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import process_count, process_rank, resolve_mesh
-from gw.w_isdf import compute_chi0_contour_fractional
+from gw.w_isdf import compute_chi0, compute_chi0_contour_fractional
 from gw.wavefunction_bundle import (
     BandSlices,
     PSI_XN_SPEC,
@@ -194,6 +194,68 @@ def main():
         )
     if rel_s > 5.0e-12:
         raise AssertionError("finite-q static divided-difference mismatch")
+
+    # --- Integer insulator: minimax orientation completion -----------------
+    # Flat unit gaps make the one-node (tau=0, alpha=1) inverse exact.  The
+    # oracle below literally sums every ordered Adler-Wiser pair, including
+    # both v->c and c->v.  Complex random spinors deliberately break the
+    # special real/TR condition under which replacing the reverse
+    # orientation by a second copy of the forward orientation would work.
+    nv = 2
+    enk_i = np.concatenate((
+        -0.5 * np.ones((nk, nv)),
+        +0.5 * np.ones((nk, nb - nv)),
+    ), axis=1)
+    occ_i = np.concatenate((
+        np.ones((nk, nv)), np.zeros((nk, nb - nv))), axis=1)
+    wfns_i = Wavefunctions(
+        psi_xn=wfns.psi_xn, psi_xr=wfns.psi_xr,
+        psi_yr=wfns.psi_yr, psi_yn=wfns.psi_yn,
+        enk=_put(enk_i, mesh, P(None, None)),
+        occ=_put(occ_i, mesh, P(None, None)), slices=slices)
+    got_i = np.asarray(multihost_utils.process_allgather(
+        compute_chi0(
+            wfns_i,
+            SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
+            SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk),
+            mesh,
+        ),
+        tiled=True,
+    ))
+
+    want_i = np.zeros((nk, nmu, nmu), np.complex128)
+    for q in range(nk):
+        for k in range(nk):
+            kmq = (k - q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    de = enk_i[k, a] - enk_i[kmq, b]
+                    fdiff = occ_i[k, a] - occ_i[kmq, b]
+                    if fdiff == 0.0:
+                        continue
+                    M = np.einsum(
+                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
+                    want_i[q] += (fdiff / de) * np.outer(M, np.conj(M))
+    want_i /= np.sqrt(float(nk))
+
+    err_i = float(np.max(np.abs(got_i - want_i)))
+    rel_i = err_i / max(float(np.max(np.abs(want_i))), 1.0e-300)
+    neg_q = np.asarray([(-q) % nk for q in range(nk)])
+    recip_i = (
+        float(np.max(np.abs(got_i - np.conj(got_i[neg_q]))))
+        / max(float(np.max(np.abs(got_i))), 1.0e-300)
+    )
+    if rank == 0:
+        print(
+            "[integer-static-chi] direct_AW_max_abs={:.3e} "
+            "direct_AW_max_rel={:.3e} q_recip={:.3e}".format(
+                err_i, rel_i, recip_i),
+            flush=True,
+        )
+    if rel_i > 5.0e-12:
+        raise AssertionError("integer static chi direct Adler-Wiser mismatch")
+    if recip_i > 5.0e-12:
+        raise AssertionError("integer static chi q reciprocity mismatch")
     multihost_utils.sync_global_devices("fractional_chi_gate_pass")
 
 
