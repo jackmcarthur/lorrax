@@ -346,7 +346,9 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
         v_h_np = compute_hartree_matrix(
             wfn, sym, meta,
             truncation_2d=(int(config.sys_dim) == 2),
-            nb=int(band_slices.b3), mesh=mesh_xy, print_fn=print_fn)
+            nb=int(band_slices.b3), mesh=mesh_xy,
+            band_chunk_size=int(config.memory.band_chunk_size),
+            print_fn=print_fn)
         # ``compute_hartree_matrix`` hands every rank the same host array;
         # publish it as a genuinely REPLICATED global array so it composes
         # with the (global) ``sig_h`` it replaces.  ``jnp.asarray`` here

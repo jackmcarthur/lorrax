@@ -99,6 +99,20 @@ def test_rho_work_items_still_is_the_serial_sweep_at_p_le_nk():
         assert f(144, 26, world) == [(ik, 0, 26) for ik in range(144)]
 
 
+def test_rho_work_items_applies_the_band_memory_bound_without_ragged_shapes():
+    """The explicit deck bound is stronger than the P<=nk serial shape."""
+    f = _load_pure("src/gw/kin_ion_io.py", "rho_work_items")
+    items = f(36, 130, 16, max_bands_per_item=16)
+    assert len(items) == 36 * 10
+    assert {(lo, hi) for _, lo, hi in items} == {
+        (i * 13, (i + 1) * 13) for i in range(10)}
+    assert {hi - lo for _, lo, hi in items} == {13}
+
+    # A looser memory bound must preserve the incumbent parallel divisor.
+    incumbent = f(9, 26, 64)
+    assert f(9, 26, 64, max_bands_per_item=26) == incumbent
+
+
 def test_rho_work_items_balance_is_unchanged():
     f = _load_pure("src/gw/kin_ion_io.py", "rho_work_items")
     items = f(9, 26, 4)
