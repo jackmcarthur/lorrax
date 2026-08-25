@@ -155,10 +155,12 @@ class _SigmaBranchTiles(NamedTuple):
     place of the old device-assembled, branch-stripped jax.Array (comms fix,
     2026-07-28; evidence: AQ 4962c/P=64 gw.log branch tails — 4× device
     re-upload + 4× 64-process allgather of the full Σ slab, ~17-18 s of the
-    Σ stage).  ``tiles[d]`` is (n_ω_branch, nk, m_pad/p_x, n_pad/p_y) numpy
-    at global 4-D index ``tile_index[d]``; the driver sums branches at their
-    global ω indices and gathers ONCE at stage end.  The mesh pad block is
-    still attached (stripped once, after the gather).
+    Σ stage).  ``tiles[d]`` is
+    (n_bracket, n_ω_branch, nk, m_pad/p_x, n_pad/p_y) numpy at global 5-D
+    index ``tile_index[d]``; the driver sums branches at their global ω
+    indices and gathers ONCE at stage end.  The internal carrier tail is
+    still attached (zero mesh pad under legacy; higher loaded bands under
+    face) and is stripped once at publication.
     """
     tiles: list                      # list[np.ndarray], one per addressable shard
     tile_index: list                 # list[tuple[slice, ...]] 5-D global indices
@@ -167,7 +169,7 @@ class _SigmaBranchTiles(NamedTuple):
                                      # (the ω axis sits BETWEEN n_brk and nk_proj
                                      # in the assembled cube, so it is not here)
     sharding: NamedSharding          # P(None, None, None, 'x', 'y'), 5-D global
-    nb_real: int                     # real QP window extent (pre-pad), for strip
+    nb_real: int                     # published QP-window extent, for strip
 
 
 # ---------------------------------------------------------------------------
@@ -797,10 +799,14 @@ def _strip_sharded_sigma_window_kernel(mesh_xy: Mesh, ndim: int, nb_real: int):
 
 
 def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
-    """Drop the :func:`pad_sigma_window` pad block from a (..., m, n) Sigma.
+    """Publish the leading logical window of a wider (..., m, n) Sigma.
 
-    The pad rows/cols are exactly zero (bilinear in zero-padded psi); this is
-    the single seam where the padded extent stops.  No-op when unpadded.
+    Under legacy the wider tail is :func:`pad_sigma_window`'s exact-zero
+    mesh pad (bilinear in zero-padded psi).  Under the face carrier it can
+    contain real higher-band matrix elements; selecting the leading block
+    is still exact because every output ``Sigma[k,m,n]`` is an independent
+    contraction.  This is the single seam where either internal carrier
+    stops.  No-op when the input already has the logical extent.
 
     BOTH trailing extents are tested: since ``pad_sigma_window`` pads m and n
     independently, one axis can be at the real extent while the other is
@@ -809,11 +815,10 @@ def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
 
     ``mesh_xy`` (2026-08-23): pass this when ``sigma_kij`` is a LIVE
     ``jax.Array`` still carrying a mesh-partitioned ``P(...,'x','y')``
-    sharding on its trailing axes -- ``gw.mpa.sigma._integrate_sigma_batches``
-    ``layout='face'`` is the one caller today
-    (``DeviceOmegaAccumulator.finalize()`` never gathers to host/replicated
-    the way ``ppm_sigma``'s own per-rank HOST tile accumulation does).  It is
-    the EXPLICIT switch to the mesh-aware repack kernel
+    sharding on its trailing axes -- both dynamic-Sigma face finalizers use
+    it today: ``gw.mpa.sigma._integrate_sigma_batches`` directly, and this
+    module after its per-rank HOST tiles have been reassembled as a live
+    sharded array.  It is the EXPLICIT switch to the mesh-aware repack kernel
     (:func:`_strip_sharded_sigma_window_kernel`), not an implicit sniff of
     ``sigma_kij``'s type: every existing host/numpy caller, and the unit
     tests that build a bare single-device ``jnp.asarray`` cube, never pass
@@ -1027,10 +1032,11 @@ def _run_sigma_branch(
     # drain here under this row; everything else overlaps).
     with timing.section("sigma.finalize"):
         tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()
-    # The mesh pad block stays attached here; the driver strips it ONCE
-    # after the single end-of-stage gather (pad rows are exactly zero, so
-    # summing padded branch tiles then stripping equals stripping each
-    # branch — see pad_sigma_window/strip_sigma_window).
+    # The internal carrier tail stays attached here; the driver strips it
+    # ONCE after final assembly.  Under legacy it is zero mesh pad.  Under
+    # face it contains real higher-band matrix elements, but each output
+    # element is independent, so selecting the leading nb_sigma block after
+    # branch summation is the same operation as selecting it per branch.
     return _SigmaBranchTiles(
         tiles=tiles,
         tile_index=tile_index,
@@ -1521,30 +1527,6 @@ def compute_sigma_c_ppm_omega_grid(
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
     sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
-    if sharded_layout and wfns.layout == "face":
-        # NOT PORTED (2026-08-22).  The sharded-output tail below
-        # (`sigma.tile_finalize`) asserts the per-rank tiles it received
-        # are ALREADY at the nb_proj=nb_sigma extent with no pad
-        # (`tile_meta.spatial_padded == (n_brk, nk_proj, nb_proj, nb_proj)`)
-        # — true under legacy (pad_sigma_window rounds UP to nb_proj's own
-        # mesh-divisible ceiling) but false under face whenever
-        # nb_full != nb_sigma (the internal accumulator runs at nb_full,
-        # per `_run_sigma_branch`'s own docstring).  `sigma_omega_layout
-        # = sharded` is production-reachable only for
-        # `mpa_material_class = metal` (gw_config.py), which is already
-        # refused under `low_mem_bands = true`
-        # (`low_mem_bands_metal_material_class_unported`) — so this is a
-        # defensive backstop for a deck that sets the layout explicitly
-        # without going through that path, not a gap in the metal port.
-        raise NotImplementedError(
-            "compute_sigma_c_ppm_omega_grid: sigma_omega_layout = 'sharded' "
-            "is not ported for low_mem_bands = true, layout = 'face' — the "
-            "sharded end-of-stage tail assumes the branch tiles already sit "
-            "at the nb_sigma extent with no pad, which face's internal "
-            "nb_full-extent accumulator does not generally satisfy.  Use "
-            "sigma_omega_layout = replicated (the default) under "
-            "low_mem_bands = true, or low_mem_bands = false for a sharded "
-            "Σ_c(ω) cube.")
     if sharded_layout:
         # ONE owner for this precondition; the MPA executor calls the same
         # function (doctrine 3 / pattern #6 -- refuse with the fix named,
@@ -1679,9 +1661,9 @@ def compute_sigma_c_ppm_omega_grid(
                     padded_shape, tile_meta.sharding, arrays)
                 full_pad = _to_host_np(
                     gathered, dtype=np.complex128, tiled=True)
-            # Strip the mesh pad block (exactly zero) — the ONE seam
-            # where the padded QP window stops; everything below (host
-            # Σ buffer, eqp write) sees only the real nb_proj extent.
+            # Strip the internal carrier tail — the ONE seam where the
+            # wider legacy-pad/face-full window stops; everything below
+            # (host Σ buffer, eqp write) sees only nb_proj.
             sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
 
     # Sharded-layout tail: NO reconstruction collective.  The per-rank
@@ -1690,14 +1672,17 @@ def compute_sigma_c_ppm_omega_grid(
     # static-COHSEX invalid-pole term added RANK-LOCALLY, are placed
     # back on their owning local devices (device_put of a process-local
     # buffer — no collective), and are published as ONE
-    # P(None,None,'x','y')-sharded jax.Array on the existing mesh.
+    # P(None,None,'x','y')-sharded jax.Array on the existing mesh.  Face
+    # tiles retain their nb_full carrier through that assembly and then use
+    # strip_sigma_window's canonical slice+reshard movement to publish
+    # nb_sigma -- the same output-side finalizer the MPA face executor uses.
     # Consumers (head injection, diag extraction, QSGW build,
     # sigma_mnk.h5 SlabIO write) read this array at its native
     # sharding.  The timing row exists to PROVE the tail stays ~0 s
     # (it replaces 'sigma.host_gather', which does not run here).
     if sharded_layout:
         with timing.section("sigma.tile_finalize"):
-            gshape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
+            logical_shape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
             if tile_acc is None:
                 # No branch produced tiles (all-empty branches): a zero
                 # Σ_c, mirroring the replicated path's untouched zeros
@@ -1706,21 +1691,28 @@ def compute_sigma_c_ppm_omega_grid(
                 sharding = NamedSharding(
                     mesh_xy, P(None, None, None, 'x', 'y'))
                 devices = list(sharding.addressable_devices)
-                dmap = sharding.devices_indices_map(gshape)
-                local_shape = sharding.shard_shape(gshape)
+                dmap = sharding.devices_indices_map(logical_shape)
+                local_shape = sharding.shard_shape(logical_shape)
                 tile_acc = [np.zeros(local_shape, dtype=np.complex128)
                             for _ in devices]
                 tile_index = [tuple(dmap[d]) for d in devices]
+                assembled_shape = logical_shape
             else:
                 assert tile_meta.nb_real == nb_proj
-                # The divisibility refusal above guarantees the mesh pad
-                # resolved to identity — padded extents ARE the real
-                # extents (pattern #7: assert it, don't assume it).
-                assert tuple(int(s) for s in tile_meta.spatial_padded) \
-                    == (n_brk, nk_proj, nb_proj, nb_proj), (
-                    f"sharded Σ layout saw a padded window "
-                    f"{tile_meta.spatial_padded} despite the "
-                    f"divisibility guard (nb={nb_proj})")
+                # spatial_padded is (n_brk, nk, m_carrier, n_carrier); the
+                # omega axis is inserted at position 1.  Under legacy the
+                # carrier is pad_sigma_window's mesh pad; under face it is
+                # nb_full.  Both are legal for the current sharding, and
+                # only the published nb_proj extent must satisfy the guard.
+                _sp = tuple(int(v) for v in tile_meta.spatial_padded)
+                assert (len(_sp) == 4
+                        and _sp[:2] == (n_brk, nk_proj)
+                        and _sp[2] >= nb_proj and _sp[3] >= nb_proj), (
+                    f"sharded Sigma tile metadata disagrees with the run: "
+                    f"spatial_padded={_sp}, expected "
+                    f"(n_bracket={n_brk}, nk={nk_proj}, "
+                    f"m_carrier>={nb_proj}, n_carrier>={nb_proj})")
+                assembled_shape = (_sp[0], n_omega) + _sp[1:]
                 sharding = tile_meta.sharding
                 devices = tile_meta.devices
                 tile_index = tile_meta.tile_index
@@ -1766,11 +1758,33 @@ def compute_sigma_c_ppm_omega_grid(
             # being asserted away in a comment, as it was here.
             if sigma_static_host is not None:
                 for d, ix5 in enumerate(tile_index):
-                    tile_acc[d][0] += sigma_static_host[tuple(ix5[2:])][None, ...]
+                    # Face tiles may extend beyond nb_proj with REAL
+                    # higher-band values, not a zero mesh pad.  Add the
+                    # logical static term only on the overlap and leave the
+                    # carrier tail untouched for the canonical strip below.
+                    # m/n are the only sharded axes; k is retained from ix5
+                    # so this remains correct if its replicated spec changes.
+                    k_ix, m_ix, n_ix = ix5[2:]
+                    m0, m1, ms = m_ix.indices(assembled_shape[-2])
+                    n0, n1, ns = n_ix.indices(assembled_shape[-1])
+                    assert ms == ns == 1, (
+                        f"Sigma tile indices must be unit-stride slices; "
+                        f"got m={m_ix}, n={n_ix}")
+                    m1 = min(m1, nb_proj)
+                    n1 = min(n1, nb_proj)
+                    if m0 < m1 and n0 < n1:
+                        tile_acc[d][0, :, :, :m1 - m0, :n1 - n0] += (
+                            sigma_static_host[k_ix, m0:m1, n0:n1][None, ...])
             arrays = [jax.device_put(t, dev)
                       for t, dev in zip(tile_acc, devices)]
             sigma_kij_sharded = jax.make_array_from_single_device_arrays(
-                gshape, sharding, arrays)
+                assembled_shape, sharding, arrays)
+            sigma_kij_sharded = strip_sigma_window(
+                sigma_kij_sharded, nb_proj, mesh_xy=mesh_xy)
+            assert tuple(int(v) for v in sigma_kij_sharded.shape) \
+                == logical_shape, (
+                    f"sharded Sigma finalizer published "
+                    f"{sigma_kij_sharded.shape}, expected {logical_shape}")
 
     # static_limit: fold the ω-independent invalid-pole static-COHSEX
     # term into Σ_c at every ω (host add; the sharded layout folded it
