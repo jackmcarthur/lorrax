@@ -134,7 +134,8 @@ def test_active_character_follows_state_through_guard_energy_crossing():
     values = jnp.asarray([[-3.0, -2.0, -1.0, 1.0, 2.0]])
     vectors = jnp.eye(5, dtype=jnp.complex128)[None]
     active = jnp.diag(jnp.asarray([1.0, 1.0, 0.0, 1.0, 0.0]))[None]
-    selected, scores, gap, tol, cluster_values, cluster_mask = (
+    (selected, scores, gap, tol, cluster_values, cluster_mask,
+     min_nonreturned) = (
         select_active_eigenpairs(values, vectors, active, 3))
 
     np.testing.assert_array_equal(np.asarray(selected), [[-3.0, -2.0, 1.0]])
@@ -143,6 +144,7 @@ def test_active_character_follows_state_through_guard_energy_crossing():
     assert float(gap[0]) > float(tol[0])
     assert not np.any(np.asarray(cluster_mask))
     assert np.asarray(cluster_values).shape == (1, 5)
+    np.testing.assert_array_equal(np.asarray(min_nonreturned), [-1.0])
 
 
 def test_degenerate_character_boundary_has_invariant_energy_multiset():
@@ -163,7 +165,8 @@ def test_degenerate_character_boundary_has_invariant_energy_multiset():
     gaps = []
     boundaries = []
     for vectors in (identity, rotated):
-        selected, _scores, gap, tol, cluster_values, cluster_mask = (
+        (selected, _scores, gap, tol, cluster_values, cluster_mask,
+         _min_nonreturned) = (
             select_active_eigenpairs(
                 values, jnp.asarray(vectors[None]),
                 jnp.asarray(active[None]), 2))
@@ -206,7 +209,7 @@ def test_character_tie_cluster_includes_every_boundary_member():
     vectors = jnp.eye(4, dtype=jnp.complex128)[None]
     active = jnp.diag(jnp.asarray([1.0, 0.5, 0.5, 0.5]))[None]
     (_selected, _scores, gap, tol,
-     cluster_values, cluster_mask) = select_active_eigenpairs(
+     cluster_values, cluster_mask, _min_nonreturned) = select_active_eigenpairs(
          values, vectors, active, 2)
     assert float(gap[0]) <= float(tol[0])
     tied = np.asarray(cluster_values)[np.asarray(cluster_mask)]
@@ -248,3 +251,52 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
         result["energies_sorted"], [[-1.0, 0.0, 3.0]] * 2,
         rtol=0.0, atol=2.0e-11)
     assert "active/guard character selection" in " ".join(lines)
+
+
+@pytest.mark.parametrize(("first_dft_guard", "must_refuse"), (
+    (2.0, False),
+    (-1.5, True),
+))
+def test_authenticated_qp_corrected_margin_protects_returned_interior(
+        first_dft_guard, must_refuse):
+    """A wider authenticated QP block is required and its energy margin gates."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from types import SimpleNamespace
+    from bandstructure.htransform import h_transform
+
+    mesh = _mesh(1)
+    nk, states, rank = 2, 7, 8
+    ctilde = np.broadcast_to(
+        np.eye(states, rank, dtype=np.complex128),
+        (nk, states, rank)).copy()
+    # [0,4) is the authenticated QP block; [0,3) is returned.  A DFT guard
+    # below band 2 makes a future active/guard character swap observable and
+    # must refuse even though the pointwise character order itself is exact.
+    energies = np.broadcast_to(
+        np.asarray([-3.0, -2.0, -1.0, 1.0,
+                    first_dft_guard, 3.0, 4.0])[:, None],
+        (states, nk)).copy()
+    meta = SimpleNamespace(nkx=2, nky=1, nkz=1)
+    wfn = SimpleNamespace(efermi=0.0, nelec=2)
+    kpath = np.asarray([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]])
+    kpath_data = (kpath, np.arange(2.0), [0], ["Gamma"], [0])
+    lines = []
+
+    def run():
+        with mesh:
+            return h_transform(
+                meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
+                kpath_data, lines.append, mesh, diagnostics=False,
+                band_start=0, n_return_bands=3,
+                qp_corrected_band_range=(0, 4))
+
+    if must_refuse:
+        with pytest.raises(ValueError, match="protect the returned interior"):
+            run()
+    else:
+        result = run()
+        np.testing.assert_allclose(
+            result["energies_sorted"], [[-1.0, 0.0, 1.0]] * 2,
+            rtol=0.0, atol=2.0e-11)
+        assert "corrected interior margin" in " ".join(lines)

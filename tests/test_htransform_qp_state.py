@@ -83,11 +83,12 @@ def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path):
     path = tmp_path / "qp_wfn_rotations.h5"
     _write_rotations(path, U, E, qp_range)
 
-    C_qp_dev, enk_qp_dev = resolve_qp_hamiltonian_state(
+    C_qp_dev, enk_qp_dev, authenticated_range = resolve_qp_hamiltonian_state(
         **_state(C, enk, band_range=fit_range),
         qp_rotations_file=str(path))
     C_qp = np.asarray(C_qp_dev)
     enk_qp = np.asarray(enk_qp_dev)
+    assert authenticated_range == qp_range
 
     # The canonical QP-WFN convention has no conjugation on U here.
     C_block = C[:, 1:4]
@@ -127,11 +128,12 @@ def test_identity_rotation_is_exact_identity(tmp_path):
     path = tmp_path / "identity.h5"
     _write_rotations(path, U, E, (4, 7))
 
-    got_C, got_E = resolve_qp_hamiltonian_state(
+    got_C, got_E, authenticated_range = resolve_qp_hamiltonian_state(
         **_state(C, enk, band_range=(4, 7)),
         qp_rotations_file=str(path))
     np.testing.assert_array_equal(np.asarray(got_C), C)
     np.testing.assert_array_equal(np.asarray(got_E), enk)
+    assert authenticated_range == (4, 7)
 
 
 def test_qp_block_may_not_cut_through_the_fit_window(tmp_path):

@@ -375,7 +375,8 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
                              eigenvectors: jax.Array,
                              active_character: jax.Array,
                              n_active: int,
-                             *, n_physical: int | None = None):
+                             *, n_physical: int | None = None,
+                             n_return: int | None = None):
     """Select the transformed eigenpairs with maximum active-subspace weight.
 
     ``eigenvectors[..., :, j]`` is eigenvector ``j`` of the already-built
@@ -402,7 +403,8 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
 
     Returns
     -------
-    values, scores, score_gap, score_tol, cluster_values, cluster_mask
+    values, scores, score_gap, score_tol, cluster_values, cluster_mask,
+    min_nonreturned_value
         Batched arrays.  ``cluster_values`` and ``cluster_mask`` describe the
         complete score-tied cluster crossing the selection boundary, not just
         the last selected and first rejected neighbours.  ``score_tol`` is a
@@ -421,6 +423,11 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
         raise ValueError(
             f"select_active_eigenpairs: n_active={n_active} must lie in "
             f"[1, {n_total - 1}] for an active/guard split.")
+    n_return = n_active if n_return is None else int(n_return)
+    if not (0 < n_return <= n_active):
+        raise ValueError(
+            f"select_active_eigenpairs: n_return={n_return} must lie in "
+            f"[1, {n_active}] for the selected active block.")
 
     scores = jnp.real(jnp.einsum(
         '...mi,...mn,...ni->...i',
@@ -443,6 +450,11 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
         selected_values, by_energy, axis=-1)
     selected_scores = jnp.take_along_axis(
         selected_scores, by_energy, axis=-1)
+    rejected_values = jnp.take_along_axis(
+        eigenvalues, rejected_idx, axis=-1)
+    nonreturned_values = jnp.concatenate(
+        (selected_values[..., n_return:], rejected_values), axis=-1)
+    min_nonreturned_value = jnp.min(nonreturned_values, axis=-1)
 
     last_selected_idx = by_character[..., n_active - 1:n_active]
     first_rejected_idx = rejected_idx[..., :1]
@@ -473,13 +485,13 @@ def select_active_eigenpairs(eigenvalues: jax.Array,
         (left_connected, right_connected), axis=-1)
         & boundary_link[..., None])
     return (selected_values, selected_scores, score_gap, score_tol,
-            character_values, cluster_mask)
+            character_values, cluster_mask, min_nonreturned_value)
 
 
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
-               active_count: int | None = None,
+               active_band_range: tuple[int, int] | None = None,
                log_fn=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
@@ -507,10 +519,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index whose bandwidth sets ``a``;
                    defaults to top of the htransform window (nb-1).
-        active_count: if set, also build the Fourier-interpolated character
-                   operator from ``ctilde[:, :active_count]``.  This is the
-                   returned-QP/DFT-guard selector; it uses the same compact
-                   gauge and canonical flat-k transform as fH.
+        active_band_range: if set, also build the Fourier-interpolated
+                   character operator from this half-open compact-row range.
+                   This is the corrected-QP/DFT-guard selector; it uses the
+                   same compact gauge and canonical flat-k transform as fH.
         log_fn:    optional logger.
 
     Returns:
@@ -537,13 +549,21 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
     # transpose is a permutation of the same f64 values).
-    if active_count is not None:
-        active_count = int(active_count)
-        if not (0 < active_count < int(ctilde.shape[1])):
+    if active_band_range is not None:
+        active_start, active_stop = map(int, active_band_range)
+        if not (0 <= active_start < active_stop <= int(ctilde.shape[1])):
             raise ValueError(
-                f"build_fH_R: active_count={active_count} must lie in [1, "
-                f"{int(ctilde.shape[1]) - 1}] when guard states are fitted.")
-    active_out = flat_xy if active_count is not None else rep_
+                "build_fH_R: active_band_range="
+                f"[{active_start},{active_stop}) must lie inside [0, "
+                f"{int(ctilde.shape[1])}).")
+        if active_stop - active_start >= int(ctilde.shape[1]):
+            raise ValueError(
+                "build_fH_R: the active range covers every fitted state; "
+                "use the ordinary full-H energy ordering because no DFT "
+                "guard boundary exists.")
+    else:
+        active_start = active_stop = 0
+    active_out = flat_xy if active_band_range is not None else rep_
 
     @partial(jax.jit,
              out_shardings=(flat_xy, flat_xy, active_out,
@@ -568,11 +588,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
 
-        if active_count is None:
+        if active_band_range is None:
             active_R = jnp.empty((0,), dtype=ctilde_in.dtype)
             active_fft_roundtrip_rel = jnp.asarray(0.0, dtype=f_eps_in.dtype)
         else:
-            active_rows = ctilde_in[:, :active_count, :]
+            active_rows = ctilde_in[:, active_start:active_stop, :]
             active_k = jnp.einsum(
                 'kim,kin->kmn', active_rows, jnp.conj(active_rows),
                 optimize=True)
@@ -650,10 +670,12 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"{fft_rel:.6e} exceeds {FLAT_K_FFT_VALUE_RTOL:.1e}.  "
             "The forward/inverse pair must preserve every coarse-k fH tile; "
             "do not publish or interpolate this Hamiltonian.")
-    if active_count is not None:
+    if active_band_range is not None:
         active_fft_rel = float(active_fft_roundtrip_rel)
         log_fn(
-            f"  [receipt] active-character P_A from {active_count} state(s): "
+            "  [receipt] active-character P_A from compact rows "
+            f"[{active_start},{active_stop}) "
+            f"({active_stop - active_start} state(s)): "
             f"canonical FFT round-trip relative residual="
             f"{active_fft_rel:.3e} (limit {FLAT_K_FFT_VALUE_RTOL:.1e}); "
             "P_A(k) is positive by construction, off-grid P_A(q) is "
@@ -674,7 +696,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     require_newton_converged(
         float(inverse_residual), where="build_fH_R all-coarse recovery")
     return (fH_k, fH_R, (a_f, n_f, shift), f_eps,
-            active_R if active_count is not None else None)
+            active_R if active_band_range is not None else None)
 
 
 NEWTON_RESIDUAL_MAX = 1.0e-12
@@ -771,6 +793,11 @@ def resolve_qp_hamiltonian_state(
     ``nk * nb_qp^2`` rotation artifact and its matched energies.  There is one
     executable shape, including for band-window remainders: the complete QP
     block is one fixed operand and no chunk/remainder kernel exists.
+
+    Returns the rotated compact rows, matched energy table, and the exact
+    absolute half-open QP range read from the canonical artifact.  The range
+    is carried to the standalone output contract; callers must not infer a
+    corrected extent from the returned array shapes.
     """
     say = log_fn if log_fn is not None else (lambda *_a, **_k: None)
     path = os.fspath(qp_rotations_file)
@@ -875,7 +902,10 @@ def resolve_qp_hamiltonian_state(
         "match the selected WFN, but qp_wfn_rotations.h5 does not yet carry "
         "a source-WFN fingerprint.  This validates the represented window "
         "and k-set, not the exact source-WFN identity.")
-    return ctilde_qp, enk_qp
+    # This exact range comes from the authenticated artifact metadata above;
+    # the standalone driver carries it to the active/projected output seam.
+    # Do not reconstruct it later from a deck count or an array shape.
+    return ctilde_qp, enk_qp, (q0, q1)
 
 
 def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
@@ -1277,7 +1307,8 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
 
 def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None, diagnostics: bool = True,
-                band_start: int = 0, n_return_bands: int | None = None):
+                band_start: int = 0, n_return_bands: int | None = None,
+                qp_corrected_band_range: tuple[int, int] | None = None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1291,11 +1322,57 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     fermi_band_idx = resolve_local_vbm_index(
         int(wfn.nelec), int(band_start), nb_keep)
     n_guard_bands = int(states) - nb_keep
-    log_fn(
-        f"  [two-window] standalone htransform returns {nb_keep} band(s) "
-        f"from absolute window [{int(band_start)}, "
-        f"{int(band_start) + nb_keep}) and fits {states} band(s) "
-        f"({n_guard_bands} guard band(s) above).")
+    fit_start = int(band_start)
+    fit_stop = fit_start + int(states)
+    return_stop = fit_start + nb_keep
+    require_qp_interior_margin = False
+    if qp_corrected_band_range is not None:
+        qp_start, qp_stop = map(int, qp_corrected_band_range)
+        if qp_start != fit_start:
+            raise ValueError(
+                "htransform: authenticated QP corrected range must start at "
+                f"the returned/fitted band start {fit_start}, found "
+                f"[{qp_start},{qp_stop}).  A shifted active block needs an "
+                "explicit returned-band offset; do not relabel it as a "
+                "prefix.")
+        if not (return_stop <= qp_stop <= fit_stop):
+            raise ValueError(
+                "htransform: the authenticated QP corrected range must "
+                f"contain the returned window [{fit_start},{return_stop}) "
+                "and remain inside the "
+                f"fit [{fit_start},{fit_stop}); found [{qp_start},{qp_stop}).")
+        if qp_stop < fit_stop and qp_stop == return_stop:
+            raise ValueError(
+                "htransform: a partial QP corrected block ending at "
+                f"{qp_stop} has no corrected interior above the returned "
+                f"window [{fit_start},{return_stop}).  Widen canonical QP "
+                "U/E or return fewer bands; a DFT guard boundary may not "
+                "coincide with the published boundary.")
+        n_qp_corrected = qp_stop - qp_start
+        n_corrected_margin = qp_stop - return_stop
+        n_dft_guards = fit_stop - qp_stop
+        # If every fitted state is QP corrected there is no active/DFT-guard
+        # boundary: the incumbent full-H energy ordering is exact.  Otherwise
+        # the same compact projector/FFT path selects the complete corrected
+        # block and the returned interior is gated below.
+        active_band_range = (
+            None if qp_stop == fit_stop else
+            (qp_start - fit_start, qp_stop - fit_start))
+        require_qp_interior_margin = active_band_range is not None
+        log_fn(
+            f"  [three-window] standalone htransform returns {nb_keep} "
+            f"band(s) from [{fit_start},{return_stop}), authenticates "
+            f"{n_qp_corrected} QP-corrected band(s) from "
+            f"[{qp_start},{qp_stop}) ({n_corrected_margin} corrected "
+            f"interior margin), and fits [{fit_start},{fit_stop}) "
+            f"({n_dft_guards} outer DFT guard band(s)).")
+    else:
+        n_qp_corrected = nb_keep
+        active_band_range = ((0, nb_keep) if n_guard_bands else None)
+        log_fn(
+            f"  [two-window] standalone htransform returns {nb_keep} band(s) "
+            f"from absolute window [{fit_start}, {return_stop}) and fits "
+            f"{states} band(s) ({n_guard_bands} guard band(s) above).")
 
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
@@ -1304,7 +1381,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
         coeffs, enk_sigma, kgrid, mesh_xy,
         a_band_index=a_band_index,
-        active_count=(nb_keep if n_guard_bands else None), log_fn=log_fn)
+        active_band_range=active_band_range, log_fn=log_fn)
     jax.block_until_ready((fH_k, fH_R, f_eps, active_R))   # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
@@ -1415,16 +1492,19 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             jax.jit,
             out_shardings=(batch_eig_shard, batch_eig_shard,
                            batch_scalar_shard, batch_scalar_shard,
-                           batch_eig_shard, batch_eig_shard))
+                           batch_eig_shard, batch_eig_shard,
+                           batch_scalar_shard))
         def _kpath_batch(batch_k, fH_R, active_R):
             mat = _fourier_matrix(batch_k, fH_R)
             active_mat = _fourier_matrix(batch_k, active_R)
             values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
             (selected_values, selected_scores, score_gap, score_tol,
-             cluster_values, cluster_mask) = select_active_eigenpairs(
-                 values, vectors, active_mat, nb_keep, n_physical=states)
+             cluster_values, cluster_mask,
+             min_nonreturned_value) = select_active_eigenpairs(
+                 values, vectors, active_mat, n_qp_corrected,
+                 n_physical=states, n_return=nb_keep)
             return (selected_values, selected_scores, score_gap, score_tol,
-                    cluster_values, cluster_mask)
+                    cluster_values, cluster_mask, min_nonreturned_value)
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -1554,12 +1634,19 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     tuple(x[3] for x in selection), axis=0)[:nq]
                 cluster_mask = jnp.concatenate(
                     tuple(x[4] for x in selection), axis=0)[:nq]
+                min_nonreturned_lambda = jnp.concatenate(
+                    tuple(x[5] for x in selection), axis=0)[:nq]
 
                 energies, inverse_residual = newton_inv(
                     a_f, n_f, shift, lambda_q.real)
                 cluster_energies, cluster_inverse_residual = newton_inv(
                     a_f, n_f, shift, cluster_lambda.real)
+                min_nonreturned_energy, outside_inverse_residual = newton_inv(
+                    a_f, n_f, shift, min_nonreturned_lambda.real)
                 energies_sorted = jnp.sort(energies, axis=1)
+                returned_energies = energies_sorted[:, :nb_keep]
+                interior_margin = (
+                    min_nonreturned_energy - returned_energies[:, -1])
 
                 ambiguous = score_gap <= score_tol
                 cluster_min = jnp.min(jnp.where(
@@ -1583,10 +1670,13 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                         cluster_energy_span <= DEGENERACY_TOL_RY)),
                     jnp.max(jnp.where(
                         unsafe, cluster_energy_span, 0.0)),
+                    jnp.min(interior_margin),
                 ))
-                return (energies_sorted,
-                        jnp.maximum(inverse_residual,
-                                    cluster_inverse_residual),
+                return (returned_energies,
+                        jnp.maximum(
+                            jnp.maximum(inverse_residual,
+                                        cluster_inverse_residual),
+                            outside_inverse_residual),
                         diagnostics)
 
         _t0 = _perf()                                      # instrument:
@@ -1599,7 +1689,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                  tuple(lambda_q_list), tuple(active_selection_list), int(nq))
             (min_score_gap, max_score_tol, min_selected_character,
              max_rejected_character, n_ambiguous, n_degenerate_safe,
-             max_unsafe_energy_span) = map(float, selection_diagnostics)
+             max_unsafe_energy_span,
+             min_returned_interior_margin) = map(
+                 float, selection_diagnostics)
             log_fn(
                 "  [gate] active/guard character selection: "
                 f"min score gap={min_score_gap:.6e} (max numerical floor "
@@ -1608,6 +1700,13 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 f"character={max_rejected_character:.6e}; "
                 f"numerically tied q={int(n_ambiguous)}, of which "
                 f"energy-degenerate-safe={int(n_degenerate_safe)}")
+            if require_qp_interior_margin:
+                log_fn(
+                    "  [gate] authenticated QP returned-interior margin: "
+                    f"min(nonreturned fitted energy) - max(returned energy)="
+                    f"{min_returned_interior_margin:.6e} Ry (must exceed "
+                    f"{DEGENERACY_TOL_RY:.6e} Ry); corrected="
+                    f"{n_qp_corrected}, returned={nb_keep}, fitted={states}")
             if max_unsafe_energy_span > DEGENERACY_TOL_RY:
                 raise ValueError(
                     "htransform active-subspace selection is numerically "
@@ -1619,6 +1718,17 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     "Supply QP U/E through every interleaving guard or widen "
                     "the active state block; do not publish a round-off-chosen "
                     "band assignment.")
+            if (require_qp_interior_margin
+                    and min_returned_interior_margin <= DEGENERACY_TOL_RY):
+                raise ValueError(
+                    "htransform authenticated QP corrected extent does not "
+                    "protect the returned interior: the minimum energy "
+                    "separation from every nonreturned fitted state is "
+                    f"{min_returned_interior_margin:.6e} Ry, not above the "
+                    f"canonical multiplet tolerance {DEGENERACY_TOL_RY:.6e} "
+                    "Ry.  Produce canonical QP U/E for a wider corrected "
+                    "block or return fewer bands; do not track branches "
+                    "along this plotting path.")
         energies_on_path = energies_sorted_jax
         require_newton_converged(
             float(inverse_residual), where="htransform path")
@@ -1909,8 +2019,10 @@ def main(argv=None):
             n_guard_bands=args.guard_bands, require_all_occupied=True,
             basis_input=args.basis_input, basis_output=args.basis_output)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    qp_corrected_band_range = None
     if _qp_rotations_path is not None:
-        ctilde, enk_sigma = resolve_qp_hamiltonian_state(
+        (ctilde, enk_sigma,
+         qp_corrected_band_range) = resolve_qp_hamiltonian_state(
             basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta,
             wfn_path=_wfn_path, qp_rotations_file=_qp_rotations_path,
             eqp_file=args.eqp_file, log_fn=log)
@@ -1946,7 +2058,8 @@ def main(argv=None):
         result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band, diagnostics=_diag_on,
                              band_start=int(wfn.nelec) - int(params["nval"]),
-                             n_return_bands=n_return_bands)
+                             n_return_bands=n_return_bands,
+                             qp_corrected_band_range=qp_corrected_band_range)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
     # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
