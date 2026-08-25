@@ -71,6 +71,7 @@ from .ppm_windows import (
     _to_host_np,
     _CROSSING_A_MAX,
     crossing_regularization_floor,
+    hgl_partition_required,
     resolve_sigma_regularization,
 )
 from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
@@ -545,6 +546,7 @@ def _integrate_tau_windows_for_branch(
     psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
     tau_kernel_x: Callable[..., jax.Array],
+    energy_windows: bool,
     log_tag: str,
     print_fn,
 ) -> None:
@@ -605,6 +607,12 @@ def _integrate_tau_windows_for_branch(
                     _om_lo, _om_hi = window_mask_B_bounds(win)
                     Om_lo_j     = jnp.asarray(_om_lo, dtype=jnp.float64)
                     Om_hi_j     = jnp.asarray(_om_hi, dtype=jnp.float64)
+                    E_min_j = jnp.asarray(
+                        -np.inf if win.E_min is None else win.E_min,
+                        dtype=jnp.float64)
+                    E_max_j = jnp.asarray(
+                        np.inf if win.E_max is None else win.E_max,
+                        dtype=jnp.float64)
                     E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                     E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
 
@@ -614,13 +622,19 @@ def _integrate_tau_windows_for_branch(
                 kern = tau_kernel_x if use_merged_x else tau_kernel
 
                 def build_sigma_tau(t_j):
-                    out = kern(
+                    common = (
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
                         E_A, mask_A_j, B_q, Omega_q, base_mask_B,
                         Om_lo_j, Om_hi_j,
-                        E_ref_A_j, E_ref_B_j, t_j,
                     )
+                    if not energy_windows:
+                        out = kern(
+                            *common, E_ref_A_j, E_ref_B_j, t_j)
+                    else:
+                        out = kern(
+                            *common, E_min_j, E_max_j,
+                            E_ref_A_j, E_ref_B_j, t_j)
                     # Merged kernel emits the single complex X = ψ†σψ; the
                     # accumulator reads (X, None).  Two-channel kernel emits
                     # the (σ_re, σ_im) tuple unchanged.
@@ -888,6 +902,7 @@ def _run_sigma_branch(
     print_fn=print,
     use_shipped_minimax_tables: bool = True,
     packed_coh: tuple[tuple, tuple] | None = None,
+    partition_hgl: bool = False,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -977,16 +992,19 @@ def _run_sigma_branch(
             crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
             use_shipped_minimax_tables=use_shipped_minimax_tables,
             log_tag=log_tag, print_fn=print_fn,
+            partition_hgl=partition_hgl,
         )
     if not windows:
         return None, []
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
+    energy_windows = bool(partition_hgl)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         brackets=brackets,
         pack_brackets=pack_brackets,
+        energy_windows=energy_windows,
         **face_kwargs,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
@@ -998,6 +1016,7 @@ def _run_sigma_branch(
         merged_x=True,
         brackets=brackets,
         pack_brackets=pack_brackets,
+        energy_windows=energy_windows,
         **face_kwargs,
     )
 
@@ -1020,6 +1039,7 @@ def _run_sigma_branch(
         psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
         psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
         tau_kernel=tau_kernel, tau_kernel_x=tau_kernel_x,
+        energy_windows=energy_windows,
         log_tag=log_tag, print_fn=print_fn,
     )
 
@@ -1393,6 +1413,8 @@ def compute_sigma_c_ppm_omega_grid(
             f"    (A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ "
             f"would make the HGL crossing quadrature ill-conditioned)")
     regularization_width_ry = _xi.resolved_ry
+    partition_hgl = hgl_partition_required(
+        omega_values_ry, regularization_width_ry, edge_factor)
     fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -1562,6 +1584,7 @@ def compute_sigma_c_ppm_omega_grid(
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         brackets=brackets,
         packed_coh=packed_coh,
+        partition_hgl=partition_hgl,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
