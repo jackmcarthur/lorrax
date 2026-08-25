@@ -77,6 +77,12 @@ _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3
 #: table, loosen an error, or alter a pole.
 _SIGN_DEFINITE_PANE_MAX_OCTAVES = 8.0
 
+#: Initial planning hint only: isolate the lowest/highest 0.2% of live poles
+#: before applying the range-cost criterion.  It never decides whether a pole
+#: is physical and never clips support; exact count conservation below is the
+#: correctness rule.
+_SIGN_DEFINITE_TAIL_FRACTION = 0.002
+
 
 def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> float:
     """Minimum ξ (Ry) so the HGL core bandwidth A_core ≤ _CROSSING_A_MAX.
@@ -944,8 +950,11 @@ def _plan_sign_definite_omega_panes(
     passes through the incumbent minimax service, whose refusal is final.
     Each split equalises the two continuous-support child range bounds.
 
-    Splits use the existing ``(lo, hi]`` convention and scalar reduction.
-    No pole-sized host array or retained mask is formed.  Count conservation
+    The lowest/highest 0.2% are initial split hints, found by scalar rank
+    bisection.  They are not clipping or a physical acceptance rule; every
+    hinted pane is still recursively checked against the same range ceiling.
+    Splits use the existing ``(lo, hi]`` convention and scalar reduction.  No
+    pole-sized host array or retained mask is formed.  Count conservation
     proves every live Ω lane is owned exactly once.  Giving every disjoint
     pane the original per-denominator L-infinity kernel tolerance preserves
     that tolerance on their disjoint union: the union error is the maximum
@@ -958,8 +967,41 @@ def _plan_sign_definite_omega_panes(
         _SIGN_DEFINITE_PANE_MAX_OCTAVES,
     )
     max_range = float(2.0 ** max_octaves)
-    pending = [(-np.inf, np.inf, int(mask_B_count),
-                float(mask_B_min), float(mask_B_max))]
+    root = (-np.inf, np.inf, int(mask_B_count),
+            float(mask_B_min), float(mask_B_max))
+    pending = [root]
+    tail_count = max(
+        1, int(np.ceil(_SIGN_DEFINITE_TAIL_FRACTION * mask_B_count)))
+    if mask_B_count > 2 * tail_count and mask_B_min < mask_B_max:
+        cuts = []
+        for rank in (tail_count, mask_B_count - tail_count):
+            cut_lo = float(mask_B_min)
+            cut_hi = float(mask_B_max)
+            # 48 scalar bisections resolve far below the precision at which
+            # an O(100 Ry) production pole can change a float64 comparison.
+            for _ in range(48):
+                mid = cut_lo + 0.5 * (cut_hi - cut_lo)
+                count_le = _masked_interval_stats_device(
+                    Omega_q, base_mask_B, -np.inf, mid)[1]
+                if count_le < rank:
+                    cut_lo = mid
+                else:
+                    cut_hi = mid
+            cuts.append(float(np.nextafter(cut_hi, np.inf)))
+        low_cut, high_cut = cuts
+        if low_cut < high_cut:
+            pending = []
+            for lo, hi in ((-np.inf, low_cut),
+                           (low_cut, high_cut),
+                           (high_cut, np.inf)):
+                stats = _masked_interval_stats_device(
+                    Omega_q, base_mask_B, lo, hi)
+                if stats[1]:
+                    pending.append((lo, hi, stats[1], stats[2], stats[3]))
+            if sum(p[2] for p in pending) != int(mask_B_count):
+                raise AssertionError(
+                    "GATE sign_definite_omega_partition: tail hints do not "
+                    "own every live pole exactly once")
     panes: list[tuple[float, float, int, float, float]] = []
     while pending:
         lo, hi, count, B_min, B_max = pending.pop()

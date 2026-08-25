@@ -371,7 +371,7 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
     direct = np.sum(residues / (0.7 + E_max + omega))
     np.testing.assert_allclose(pane_sum, direct, rtol=2e-15, atol=2e-15)
-    assert len(panes) > 1
+    assert [panes[0][2], panes[-1][2]] == [2, 2]
 
 
 def _build_branch_windows():
