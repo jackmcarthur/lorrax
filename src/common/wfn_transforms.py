@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 __all__ = [
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
     "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
+    "gflat_to_rchunk_aot_peak_bytes",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
     "gflat_to_rmu",
     "accumulate_rchunk_to_gflat",
@@ -87,6 +88,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _KERNEL_CACHE: dict = {}
+_RCHUNK_PEAK_CACHE: dict = {}
 
 
 def _cached_jit(name: str, key: tuple, build):
@@ -799,6 +801,117 @@ def to_rchunk(
         return fn(psi, g_index_j, r0_arg)
     return fn(psi, g_index_j, r0_arg,
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
+
+
+def gflat_to_rchunk_aot_peak_bytes(
+    *,
+    mesh: Mesh,
+    nk: int,
+    band_carrier: int,
+    nspinor: int,
+    ngkmax: int,
+    fft_grid: Sequence[int],
+    r_carrier: int,
+    norm: str,
+    dtype=jnp.complex128,
+) -> int:
+    """Per-rank peak HBM of the canonical full-Bloch WFN r-slab program.
+
+    This is the planning view of :func:`to_rchunk_inner`, not an FFT-box
+    proxy.  It compiles the same G-flat gather -> FFT box -> local IFFT ->
+    flat-r slice -> Bloch-phase program used inside
+    :class:`common.psi_G_store.PsiGStore`, with the production shardings and
+    carrier extents, then asks :mod:`runtime.aot_memory` for XLA's complete
+    buffer peak plus the cuFFT plan workspace.
+
+    ``PsiGStore`` obtains ``psi_G`` from an ``io_callback`` inside its
+    ``shard_map``.  Here that callback result is represented as a regular
+    argument of the identical local program.  The AOT service includes
+    argument bytes in ``total``, so the callback output remains priced while
+    avoiding a second WFN reader or transform implementation.
+
+    A standalone IFFT measurement is insufficient for this decision: its
+    argument represents an already-built FFT box and therefore cannot see the
+    gather buffer, retained r-slab, or Bloch-phase/output buffers surrounding
+    the FFT.  Those buffers were enough for a 32-band CrI3 carrier to pass the
+    old preflight and then fail its first real cuFFT workspace allocation.
+    """
+    nk = int(nk)
+    band_carrier = int(band_carrier)
+    nspinor = int(nspinor)
+    ngkmax = int(ngkmax)
+    r_carrier = int(r_carrier)
+    fft_grid_t = tuple(int(v) for v in fft_grid)
+    if len(fft_grid_t) != 3 or any(v <= 0 for v in fft_grid_t):
+        raise ValueError(
+            "gflat_to_rchunk_aot_peak_bytes: fft_grid must contain three "
+            f"positive extents; got {fft_grid_t}")
+    if min(nk, band_carrier, nspinor, ngkmax, r_carrier) <= 0:
+        raise ValueError(
+            "gflat_to_rchunk_aot_peak_bytes: all logical extents must be "
+            "positive")
+    if norm not in ("backward", "ortho", "forward"):
+        raise ValueError(
+            "gflat_to_rchunk_aot_peak_bytes: norm must be 'backward', "
+            f"'ortho', or 'forward'; got {norm!r}")
+
+    platform = mesh.devices.flat[0].platform
+    key = (
+        id(mesh), nk, band_carrier, nspinor, ngkmax, fft_grid_t,
+        r_carrier, norm, jnp.dtype(dtype).str, platform,
+        tuple(mesh.axis_names),
+        tuple(int(mesh.shape[a]) for a in mesh.axis_names),
+    )
+    hit = _RCHUNK_PEAK_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    psi_sharding = NamedSharding(mesh, band_sphere_spec())
+    gindex_sharding = NamedSharding(mesh, P(None, None, None, None))
+    kvec_sharding = NamedSharding(mesh, P(None, None))
+    rep = NamedSharding(mesh, P())
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(band_sphere_spec(), P(None, None, None, None), P(),
+                  P(None, None)),
+        out_specs=band_sphere_spec(),
+        check_vma=False,
+    )
+    def _local(psi_G, g_index, r0, kvecs_frac):
+        return to_rchunk_inner(
+            psi_G, g_index, fft_grid_t, r0, r_carrier,
+            norm=norm, kvecs_frac=kvecs_frac)
+
+    kernel = jax.jit(
+        _local,
+        in_shardings=(psi_sharding, gindex_sharding, rep, kvec_sharding),
+        out_shardings=psi_sharding,
+    )
+    specs = (
+        jax.ShapeDtypeStruct(
+            (nk, band_carrier, nspinor, ngkmax), dtype,
+            sharding=psi_sharding),
+        jax.ShapeDtypeStruct(
+            (nk, *fft_grid_t), jnp.int32, sharding=gindex_sharding),
+        jax.ShapeDtypeStruct((), jnp.int32, sharding=rep),
+        jax.ShapeDtypeStruct((nk, 3), jnp.float64, sharding=kvec_sharding),
+    )
+    lowered = kernel.lower(*specs)
+    compiled = lowered.compile(
+        compiler_options={"xla_gpu_memory_limit_slop_factor": 10000}
+    ) if platform in ("gpu", "cuda") else lowered.compile()
+    from runtime.aot_memory import aot_kernel_peak_bytes
+    peak = aot_kernel_peak_bytes(compiled, platform=platform)
+    if platform in ("gpu", "cuda") and not peak.fft_specs:
+        raise RuntimeError(
+            "gflat_to_rchunk_aot_peak_bytes: the compiled canonical WFN "
+            "r-slab program exposes no FFT operation, so its cuFFT workspace "
+            "cannot be certified")
+    total = int(peak.total)
+    _RCHUNK_PEAK_CACHE[key] = total
+    return total
 
 
 
