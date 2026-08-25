@@ -38,11 +38,12 @@ This module owns TWO things that must not drift apart:
    sentinel cell in ANY row, padded or not — max ``|G|`` per axis runs
    ``(8, 8, 27)`` against a corner at ``(15, 15, 60)``, and similar.
 
-2. **The gather.**  See ``GVEC_FFT_BOX_GATHER.md``.  For each k-point a
-   lookup table maps every ``(nx, ny, nz)`` FFT-box cell to the
-   ``g``-index within that k's coefficient slab (or ``ngkmax`` if the
-   cell has no coefficient).  At runtime one ``jnp.take`` fills the whole
-   FFT box — no scatter, no per-k loop.
+2. **The gather index.**  See ``GVEC_FFT_BOX_GATHER.md``.  For each k-point
+   a lookup table maps every ``(nx, ny, nz)`` FFT-box cell to the ``g``-index
+   within that k's coefficient slab (or ``ngkmax`` if the cell has no
+   coefficient).  Device-side gathers and FFTs belong to
+   :mod:`common.wfn_transforms`; this module owns only their host-built index
+   and padded-G representation.
 
 Public API
 ----------
@@ -53,17 +54,13 @@ Public API
                               — the consumer-side detector for a padded
                                 list that lost its mask.
 ``build_g_index_for_fft_box`` — host-side precompute, once per WFN.
-``make_fft_box_kernel``       — jitted shard_map kernel, reused per
-                                band chunk.
 
-Only ``make_fft_box_kernel`` needs jax, and it imports it in its body.
-Everything above is pure numpy: the pad sentinel and the padded-table
-build are host-side facts about an FFT grid, reasonable and testable
-without a device, and a host-side producer (``coulomb_sphere``) does not
-acquire an accelerator dependency by asking what the pad row is.  (The
-``common`` package's own ``__init__`` still pulls jax, so `import
-common.gvec_fft_box` does too — this is about the module's dependency,
-not the package's.)
+Everything here is pure numpy: the pad sentinel, padded-table build and
+inverse index are host-side facts about an FFT grid.  A host-side producer
+(``coulomb_sphere``) therefore does not acquire an accelerator dependency by
+asking what the pad row is.  (The ``common`` package's own ``__init__`` still
+pulls jax, so ``import common.gvec_fft_box`` does too — this is about the
+module's dependency, not the package's.)
 """
 from __future__ import annotations
 
@@ -78,7 +75,6 @@ __all__ = [
     "pad_gvecs_to_sentinel",
     "refuse_padded_gvecs_without_mask",
     "build_g_index_for_fft_box",
-    "make_fft_box_kernel",
 ]
 
 
@@ -507,78 +503,3 @@ def build_g_index_for_fft_box(
             wrapped[..., 1][valid],
             wrapped[..., 2][valid]] = g_of[valid]
     return g_index
-
-
-def make_fft_box_kernel(
-    mesh: "Mesh",                                       # noqa: F821
-    nk: int,
-    ngkmax: int,
-    nb_padded: int,
-    nspinor: int,
-    fft_grid: tuple[int, int, int],
-):
-    """Build a jitted ``(cnk_slab, g_index) → psi_G_box`` kernel.
-
-    Inputs (global, cnk_slab band-sharded over the combined ``(x,y)``
-    mesh axes, g_index replicated):
-
-    ``cnk_slab``     ``(nb_padded, nspinor, nk, ngkmax, 2)`` f64 — the
-                     ``re/im``-packed output of ``read_kchunk_union_sharded``
-                     with ``kchunk_axis=2``.
-    ``g_index``      ``(nk, nx, ny, nz)`` int32 from
-                     :func:`build_g_index_for_fft_box`.
-
-    Output:
-
-    ``psi_G_box``    ``(nk, nb_padded, nspinor, nx, ny, nz)`` c128
-                     sharded ``P(None, ('x','y'), None, None, None, None)``.
-    """
-    # jax is imported HERE, not at module scope: everything above this
-    # function is pure numpy, and host-side producers (coulomb_sphere,
-    # and any tool that only wants the pad sentinel) must not have to
-    # bring up the accelerator stack to ask what the pad row is.
-    import jax
-    import jax.numpy as jnp
-    from common.shard_map import shard_map
-    from jax.sharding import PartitionSpec as P
-
-    mesh_x = int(mesh.shape["x"])
-    mesh_y = int(mesh.shape["y"])
-    world_size = mesh_x * mesh_y
-    if nb_padded % world_size != 0:
-        raise ValueError(f"nb_padded={nb_padded} not divisible by {world_size}")
-    bands_per_rank = nb_padded // world_size
-    nx, ny, nz = (int(v) for v in fft_grid)
-
-    def _per_rank(cnk_slab, g_index):
-        # (bpr, ns, nk, ngkmax, 2) f64 → (bpr, ns, nk, ngkmax) c128
-        cnk = cnk_slab[..., 0] + 1j * cnk_slab[..., 1]
-        # Append one zero slot so the sentinel index (== ngkmax) gathers
-        # zero.  `_padded` has the extra slot on the G axis only.
-        zero_slot = jnp.zeros(
-            (bands_per_rank, nspinor, nk, 1), dtype=jnp.complex128)
-        cnk_padded = jnp.concatenate([cnk, zero_slot], axis=-1)
-
-        # Single flat-axis gather: view cnk_padded as
-        # (bpr, ns, nk * (ngkmax + 1)) and look up a k-and-g-combined
-        # index per FFT cell.  One kernel launch for every (k, box cell).
-        cnk_flat = cnk_padded.reshape(
-            bands_per_rank, nspinor, nk * (ngkmax + 1))
-        k_stride = ngkmax + 1
-        flat_index = (
-            jnp.arange(nk, dtype=jnp.int32)[:, None, None, None] * k_stride
-            + g_index
-        )  # (nk, nx, ny, nz)
-        gathered = jnp.take(cnk_flat, flat_index, axis=2)
-        # Move nk to the front for the canonical output layout.
-        return jnp.transpose(gathered, (2, 0, 1, 3, 4, 5))
-
-    return jax.jit(shard_map(
-        _per_rank, mesh=mesh,
-        in_specs=(
-            P(("x", "y"), None, None, None, None),   # cnk_slab
-            P(None, None, None, None),                # g_index
-        ),
-        out_specs=P(None, ("x", "y"), None, None, None, None),
-        check_vma=False,
-    ))
