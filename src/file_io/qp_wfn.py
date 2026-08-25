@@ -101,6 +101,12 @@ QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
 #: before.
 QP_ROT_FULL_BZ_DATASETS = ("kpoints_crys", "kirr_to_kfull")
 
+#: Small, non-k-reduced datasets that define which Hamiltonian the physics
+#: arrays belong to.  Consumers of both ``U_mnk`` and ``E_qp`` must read
+#: these through :func:`read_qp_rotations_artifact`; opening the HDF5 file a
+#: second time in each driver would create another metadata contract.
+QP_ROT_METADATA_DATASETS = ("band_range", "kpoints_crys", "kgrid")
+
 #: Root attribute :func:`write_qp_wfn_h5` stamps on its output, and the ONLY
 #: content-based way to tell a QP WFN.h5 from a mean-field one.  A QP WFN's ψ
 #: and E are a matched pair — the rotated orbitals carry the eigenvalues that
@@ -400,6 +406,41 @@ def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
             out[name] = (arr if star is None
                          else np.asarray(broadcast_ibz_to_full_bz(arr, *star)))
     return out
+
+
+def read_qp_rotations_artifact(h5_path: str) -> dict:
+    """Read one complete ``qp_wfn_rotations.h5`` Hamiltonian artifact.
+
+    The physics arrays are unfolded through
+    :func:`read_qp_rotations_full_bz`, so wedge and full-BZ storage retain
+    one meaning.  The small identity datasets are read here as part of the
+    same public format contract rather than independently in every physics
+    driver.
+
+    Returns ``U_mnk`` and ``E_qp_nk_rydberg`` on the full BZ together with
+    ``band_range``, ``kpoints_crys`` and ``kgrid``.  A partial artifact is
+    refused: a rotation without its matched eigenvalues, band labels or
+    k-set cannot define ``H_QP = U diag(E_QP) U^H``.
+    """
+    path = os.fspath(h5_path)
+    arrays = read_qp_rotations_full_bz(
+        path, datasets=("U_mnk", "E_qp_nk_rydberg"))
+    missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
+               if name not in arrays]
+    with h5py.File(path, "r") as h5:
+        missing.extend(name for name in QP_ROT_METADATA_DATASETS
+                       if name not in h5)
+        if missing:
+            raise ValueError(
+                f"{os.path.basename(path)} is not a complete QP rotation "
+                f"artifact; missing {sorted(set(missing))}.")
+        arrays.update({
+            "band_range": np.asarray(h5["band_range"][()], dtype=np.int64),
+            "kpoints_crys": np.asarray(
+                h5["kpoints_crys"][()], dtype=np.float64),
+            "kgrid": np.asarray(h5["kgrid"][()], dtype=np.int64),
+        })
+    return arrays
 
 
 # ---------------------------------------------------------------------------
