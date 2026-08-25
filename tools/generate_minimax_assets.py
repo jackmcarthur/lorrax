@@ -564,17 +564,10 @@ def generate_assets(
                         eps_q=float(crossing_eps_q),
                     )
                     tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
+                    _write_table(
+                        table_path, tau=tau, alpha=alpha,
+                        max_error=max_error)
                     action = "solve"
-                certificate = certify_noncrossing_inverse(
-                    tau, alpha, float(R), float(err))
-                if not certificate["certified"]:
-                    raise RuntimeError(
-                        f"noncrossing R={R:g} eps={err:.1e} failed "
-                        f"certification: {certificate['failures']}")
-                max_error = float(certificate["max_error"])
-                _write_table(
-                    table_path, tau=tau, alpha=alpha, max_error=max_error,
-                    certificate=certificate)
                 table_map[rel_path.as_posix()] = {
                     "family": "crossing",
                     "target_kind": str(crossing_target_kind),
@@ -585,30 +578,6 @@ def generate_assets(
                     "eps_q": float(crossing_eps_q),
                     "node_count": int(len(tau)),
                     "max_error": float(max_error),
-                    "held_out_max_error": float(
-                        certificate["held_out_max_error"]),
-                    "kappa0": float(certificate["kappa0"]),
-                    "kappa0_bound": float(certificate["kappa0_bound"]),
-                    "sum_abs_alpha": float(certificate["sum_abs_alpha"]),
-                    "rescale_max_error_ratio": float(
-                        certificate["rescale_max_error_ratio"]),
-                    "payload_sha256": str(certificate["payload_sha256"]),
-                    "certified": True,
-                    "certification": {
-                        "method": (
-                            "held-out log grid plus endpoints, analytic "
-                            "derivative roots, and bounded local extrema"),
-                        "held_out_grid_size": int(certificate["n_eval"]),
-                        "derivative_root_count": int(
-                            certificate["derivative_root_count"]),
-                        "local_refinement_count": int(
-                            certificate["local_refinement_count"]),
-                        "checks": [
-                            "refined_error", "positive_nodes",
-                            "positive_weights", "kappa0", "rescale",
-                        ],
-                    },
-                    "provenance": _generator_provenance(),
                     "file": rel_path.as_posix(),
                 }
                 print(
@@ -647,8 +616,17 @@ def generate_assets(
                         n_max=64,
                     )
                     tau, alpha, max_error = _q.nodes, _q.weights, _q.max_error
-                    _write_table(table_path, tau=tau, alpha=alpha, max_error=max_error)
                     action = "solve"
+                certificate = certify_noncrossing_inverse(
+                    tau, alpha, float(R), float(err))
+                if not certificate["certified"]:
+                    raise RuntimeError(
+                        f"noncrossing R={R:g} eps={err:.1e} failed "
+                        f"certification: {certificate['failures']}")
+                max_error = float(certificate["max_error"])
+                _write_table(
+                    table_path, tau=tau, alpha=alpha, max_error=max_error,
+                    certificate=certificate)
                 table_map[rel_path.as_posix()] = {
                     "family": "noncrossing",
                     "error_bound": float(err),
@@ -657,6 +635,30 @@ def generate_assets(
                     "range_max": float(R),
                     "node_count": int(len(tau)),
                     "max_error": float(max_error),
+                    "held_out_max_error": float(
+                        certificate["held_out_max_error"]),
+                    "kappa0": float(certificate["kappa0"]),
+                    "kappa0_bound": float(certificate["kappa0_bound"]),
+                    "sum_abs_alpha": float(certificate["sum_abs_alpha"]),
+                    "rescale_max_error_ratio": float(
+                        certificate["rescale_max_error_ratio"]),
+                    "payload_sha256": str(certificate["payload_sha256"]),
+                    "certified": True,
+                    "certification": {
+                        "method": (
+                            "held-out log grid plus endpoints, analytic "
+                            "derivative roots, and bounded local extrema"),
+                        "held_out_grid_size": int(certificate["n_eval"]),
+                        "derivative_root_count": int(
+                            certificate["derivative_root_count"]),
+                        "local_refinement_count": int(
+                            certificate["local_refinement_count"]),
+                        "checks": [
+                            "refined_error", "positive_nodes",
+                            "positive_weights", "kappa0", "rescale",
+                        ],
+                    },
+                    "provenance": _generator_provenance(),
                     "file": rel_path.as_posix(),
                 }
                 print(
