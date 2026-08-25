@@ -3,9 +3,64 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def test_whole_state_workspace_must_fit_the_bfc_reserve(monkeypatch):
+    """An aggregate-safe FFT still refuses when its arena cannot be placed."""
+    pytest.importorskip("jax")
+    from isdf import galerkin
+
+    def _ledger(**kwargs):
+        del kwargs
+        return {
+            "HWM": 700.0,
+            "WFN_RCHUNK_TRANSFORM": 650.0,
+            "WFN_RCHUNK_COMPILED": 450.0,
+            "WFN_CUFFT_WORKSPACE": 200.0,
+            "Q_TILE_LOCAL": 10.0,
+            "r_chunk_carrier": 16.0,
+        }
+
+    monkeypatch.setattr(galerkin, "_whole_state_memory_ledger", _ledger)
+    mesh = SimpleNamespace(size=16, shape={"x": 4, "y": 4})
+    kwargs = dict(
+        meta=object(), mesh_xy=mesh, nk=2, nspinor=2, ngkmax=8,
+        band_carrier=64, state_count=32, search_rank=4,
+        candidate_carrier=8, requested_q_tile_budget=512,
+        device_pool_limit=1000.0, log_fn=lambda *args: None)
+
+    # spinor width 2 owns the public 0.85 target: HWM 700 < 850, but the
+    # independently allocated workspace 200 is larger than its 150 reserve.
+    with pytest.raises(MemoryError, match="contiguous BFC reserve"):
+        galerkin._resolve_whole_state_stream_budget(**kwargs)
+
+    safe = dict(kwargs, device_pool_limit=1400.0)
+    _, ledger = galerkin._resolve_whole_state_stream_budget(**safe)
+    assert ledger["WFN_CUFFT_WORKSPACE"] == 200.0
+
+
+def test_wfn_rchunk_integer_peak_api_is_the_cached_breakdown_view(monkeypatch):
+    """Existing callers retain the integer-total API without another compile."""
+    pytest.importorskip("jax")
+    from common import wfn_transforms
+
+    calls = []
+
+    def _memory(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(total=1234)
+
+    monkeypatch.setattr(
+        wfn_transforms, "gflat_to_rchunk_aot_memory", _memory)
+    got = wfn_transforms.gflat_to_rchunk_aot_peak_bytes(
+        mesh=object(), nk=1, band_carrier=1, nspinor=1, ngkmax=1,
+        fft_grid=(1, 1, 1), r_carrier=1, norm="ortho")
+    assert got == 1234
+    assert len(calls) == 1
 
 
 def test_rank_multiplier_vocabulary_and_default():
