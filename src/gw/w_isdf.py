@@ -87,26 +87,30 @@ _w_solve_cache: dict = {}
 _STATIC_FRACTIONAL_PAIR_TILE = 8
 
 
-def _complete_static_charge_orientations(A_R):
-    r"""Return both ordered particle-hole orientations in R space.
+def _complete_static_vertex_orientations(forward_R, reverse_R=None):
+    r"""Return both ordered Hermitian-vertex orientations in R space.
 
-    ``A_R`` is the valence-to-conduction half of the integer-occupation
-    response.  For a general complex, broken-time-reversal wavefunction the
-    reverse ordered transition is not a second copy of that half.  Density-
-    vertex Hermiticity and the full-grid FFT convention instead give
-    ``FFT_R[conj(A_R)](q) = conj(A_-q)``.
+    ``forward_R`` has endpoint axes ``(mu_A,mu_B)``.  For two different
+    Hermitian vertices, ``reverse_R`` is the reversed ordered contribution
+    in its natural ``(mu_B,mu_A)`` orientation.  Its dagger maps it back to
+    the forward endpoint order before addition::
 
-    The static/imaginary-axis charge response is therefore proportional to
-    ``A_R + conj(A_R)``.  Replacing this by ``2*A_R`` is valid only when
-    ``A_R`` is already real.  This is the integer-occupation limit of the
-    exact ordered-pair evaluator and the same orientation identity used by
-    the fractional contour kernel below.
+        forward_R + reverse_R^dagger
+
+    Charge is the same-vertex special case: its natural reverse is
+    ``swapaxes(forward_R)`` and the expression reduces exactly to the
+    incumbent ``forward_R + conj(forward_R)`` completion.  Replacing either
+    form by ``2*forward_R`` is valid only in a real gauge and is wrong for a
+    complex broken-time-reversal wavefunction.
 
     Keep this completion before the final R-to-q FFT.  It is transition
     algebra, not a post-hoc q symmetrization, and preserves sharding
     elementwise.
     """
-    return A_R + jnp.conj(A_R)
+    if reverse_R is None:
+        # Preserve the incumbent scalar graph and arithmetic order exactly.
+        return forward_R + jnp.conj(forward_R)
+    return forward_R + jnp.conj(jnp.swapaxes(reverse_R, -1, -2))
 
 
 
@@ -322,7 +326,7 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
                                Gc_R, jnp.conj(Gv_R), optimize=True),
                     _chi_R_shard)
                 if not complex_contour:
-                    chi_tau = _complete_static_charge_orientations(chi_tau)
+                    chi_tau = _complete_static_vertex_orientations(chi_tau)
                 return tuple(a + alpha_col[i] * chi_tau
                              for i, a in enumerate(accs)), None
 
@@ -386,7 +390,7 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
                            Gc_R, jnp.conj(Gv_R), optimize=True),
                 _chi_R_shard)
             if not complex_contour:
-                chi_tau = _complete_static_charge_orientations(chi_tau)
+                chi_tau = _complete_static_vertex_orientations(chi_tau)
             # α is complex; its Im part is zero for the chi0 Laplace
             # window.  Multiplying complex·complex is identical to
             # float·complex at the hardware level when Im(α)=0.
@@ -531,7 +535,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                Gc_R, jnp.conj(Gv_R), optimize=True),
                     _chi_R_shard)
                 if not complex_contour:
-                    chi_tau = _complete_static_charge_orientations(chi_tau)
+                    chi_tau = _complete_static_vertex_orientations(chi_tau)
                 return tuple(a + alpha_col[i] * chi_tau
                              for i, a in enumerate(accs)), None
 
@@ -561,7 +565,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                       enk_full, tau_kernel, vmax, cmin)
             Gv_R = _Gv_fftn(Gv_k)
             Gc_R = _Gc_fftn(Gc_k)
-            if vertex_operands is None:
+            reverse_tau_raw = None
+            if vertex_operands is None or (left_identity and right_identity):
                 chi_tau_raw = jnp.einsum(
                     'Rambn,Rambn->Rmn',
                     Gc_R, jnp.conj(Gv_R), optimize=True)
@@ -578,14 +583,30 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                     perm_R=None if right_identity else perm_r,
                     phase_R=(None if right_identity else jnp.conj(phase_r)),
                     spin_axes=(1, 3))
+                # The reverse ordered transition has natural endpoint axes
+                # (mu_B,mu_A) and swapped Lorentz labels (B,A).  The local
+                # transposes are views of the SAME two Green tensors: no
+                # second G build or FFT is required.  Only the orientation
+                # owner below applies its dagger back to (mu_A,mu_B).
+                Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
+                Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
+                reverse_tau_raw = gamma_double_contract(
+                    jnp.conj(Gv_R_ba), Gc_R_ba,
+                    perm_L=None if right_identity else perm_r,
+                    # Taking the natural BA endpoint adjoint conjugates
+                    # both Hermitian vertex tables.  On the left that is
+                    # the conjugated row phase; on the helper's transposed
+                    # right convention the two conjugations cancel.
+                    phase_L=(None if right_identity
+                             else jnp.conj(phase_r)),
+                    perm_R=None if left_identity else perm_l,
+                    phase_R=None if left_identity else phase_l,
+                    spin_axes=(1, 3))
             chi_tau = jax.lax.with_sharding_constraint(
                 chi_tau_raw, _chi_R_shard)
-            # Scalar charge needs both ordered transition orientations.
-            # Lorentz-current blocks retain their separately derived vertex
-            # convention: the reverse of fixed (A,B) is not obtained by
-            # blindly conjugating that same block.
-            if vertex_operands is None and not complex_contour:
-                chi_tau = _complete_static_charge_orientations(chi_tau)
+            if not complex_contour:
+                chi_tau = _complete_static_vertex_orientations(
+                    chi_tau, reverse_tau_raw)
             return chi_R_acc + alpha_scalar * chi_tau, None
 
         final_R, _ = jax.lax.scan(
@@ -1551,10 +1572,13 @@ def compute_no_pair_dirac_current_block(
 
     ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
     x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical χ₀ is::
+    The physical static χ₀ is::
 
-        χ₀_AB = -2 Σ_ℓ α_ℓ Σ_{v,c}
-                 M^A_vc M^B_cv exp(-τ_ℓ (E_c - E_v))
+        χ₀_AB(q) = -Σ_ℓ α_ℓ [F_AB(q,τ_ℓ)
+                              + F_BA(-q,τ_ℓ)^dagger]
+
+    The two ordered orientations meet in R space before the final q FFT.
+    They are not two copies of ``F_AB`` on a complex broken-TR deck.
 
     A uniform energy shift via ``energy_reference`` is applied to both
     valence and conduction energies before building the minimax factors.
@@ -1587,11 +1611,6 @@ def compute_no_pair_dirac_current_block(
             "four-current gamma vertices require four-component bispinors; "
             f"got endpoint spinor extents ({ns_left},{ns_right})")
 
-    if wfns_left is wfns_right and A == 0 and B == 0:
-        return compute_chi0(
-            wfns_left, quad, meta, mesh_xy,
-            energy_reference=energy_reference)
-
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1606,10 +1625,10 @@ def compute_no_pair_dirac_current_block(
     E_gap = cmin - vmax
 
     tau = np.asarray(quad.tau, dtype=np.float64)
-    # Fold the chi0 prefactor (-2 · exp(-τ·E_gap)) into α so the τ-scan
-    # body can apply a single weighted add per node.  ``MinimaxNodes``
-    # carries both in complex128; τ has Im=0 for the Laplace quad.
-    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into alpha.  The
+    # kernel adds the exact forward and reverse ordered transitions before
+    # the final q FFT; retaining the historical -2 here would double count.
+    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -1734,23 +1753,26 @@ def compute_finite_transfer_current_block_row(
 
 
 def _compute_finite_transfer_current_block_row_unverified(
-    endpoint, wfns_transverse, quad, meta, mesh_xy, *,
+    endpoint, endpoint_minus_q, wfns_transverse, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
     r"""Private fixed-q TT algebra oracle at one stored q row.
 
-    ``endpoint`` must come from
+    ``endpoint`` and ``endpoint_minus_q`` must come from
     :func:`common.mtxel_sweep.finite_transfer_current_to_centroids` for the
-    same transverse centroid set and band window.  The routine reuses the
-    incumbent distributed face Green builder and minimax normalization; it
-    neither constructs a second Green function nor materializes a band-pair
-    carrier.  One block is returned so the existing photon packer can retain
-    its one-live-block memory schedule.
+    same transverse centroid set and band window, at transfers ``q`` and
+    ``-q`` respectively.  The pair is authenticated with the symmetry
+    service's q-negation involution and the existing operator receipts.  The
+    routine reuses the incumbent distributed face Green builder and minimax
+    normalization; it neither constructs a second Green-function mechanism
+    nor materializes a band-pair carrier.  One block is returned so the
+    existing photon packer can retain its one-live-block memory schedule.
 
     This is deliberately private because :class:`Wavefunctions` does not yet
     carry the non-JIT source/band/centroid receipt needed to authenticate it
     against ``endpoint``.  Deterministic tests use it to pin the fixed-q Green
-    normalization and conjugation.  Production reaches only the refusing
+    normalization, conjugation, and exact ordered pair
+    ``-[F_AB(q)+F_BA(-q)^dagger]``.  Production reaches only the refusing
     public seam above.  The transverse zeta/V side also still needs the
     matching q-resolved C/Z contraction, exact contact/downfolded completion,
     and vector-symmetry reciprocity gate.
@@ -1772,22 +1794,119 @@ def _compute_finite_transfer_current_block_row_unverified(
             f"(x,y) processor mesh; got axes={tuple(mesh_xy.axis_names)}, "
             f"shape={mesh_shape}")
     ensure_jax_compile_cache()
-    current_nmu = endpoint.current_nmu
-    current_mun = endpoint.current_mun
-    nk, nb, ncart, ns, n_rmu = (int(v) for v in current_nmu.shape)
-    if (ncart, ns) != (3, 4):
+    validated = []
+    for endpoint_label, current_endpoint in (
+            ("q", endpoint), ("-q", endpoint_minus_q)):
+        current_nmu = current_endpoint.current_nmu
+        current_mun = current_endpoint.current_mun
+        nk, nb, ncart, ns, n_rmu = (
+            int(v) for v in current_nmu.shape)
+        if (ncart, ns) != (3, 4):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} current endpoint must "
+                f"have (cart,spin)=(3,4); got {(ncart, ns)}")
+        if tuple(int(v) for v in current_mun.shape) != (
+                nk, 3, 4, n_rmu, nb):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint face "
+                f"orientations disagree: nmu={current_nmu.shape}, "
+                f"mun={current_mun.shape}")
+        if int(current_endpoint.n_rmu_logical) > n_rmu:
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint logical "
+                f"centroid extent exceeds its padded face: "
+                f"{int(current_endpoint.n_rmu_logical)} > {n_rmu}")
+        if nk != int(meta.nk_tot):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint nk={nk} != "
+                f"meta.nk_tot={int(meta.nk_tot)}")
+        if int(current_endpoint.iq_irr) < 0:
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint carries a "
+                "negative q-IBZ row")
+        q_label = np.asarray(
+            current_endpoint.q_irr_kgrid_int, dtype=np.int32)
+        q_crys = np.asarray(current_endpoint.q_crys, dtype=np.float64)
+        if q_label.shape != (3,) or q_crys.shape != (3,) or not np.all(
+                np.isfinite(q_crys)):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint q labels must "
+                f"be finite 3-vectors; got q_int={q_label}, "
+                f"q_crys={q_crys}")
+        kminq = np.asarray(current_endpoint.kminq_idx, dtype=np.int32)
+        if kminq.shape != (nk,) or np.any(kminq < 0) or np.any(kminq >= nk):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint carries an "
+                "invalid k-q row map")
+        if not np.array_equal(
+                np.sort(kminq), np.arange(nk, dtype=np.int32)):
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint k-q row map "
+                "must be a full-BZ permutation")
+        for fingerprint_label, fingerprint in (
+            ("Hamiltonian",
+             current_endpoint.hamiltonian_config_operator_fingerprint),
+            ("finite-path", current_endpoint.vnl_path_operator_fingerprint),
+        ):
+            value = str(fingerprint).strip()
+            if (not value.startswith("sha256:")
+                    or len(value) != len("sha256:") + 64
+                    or any(c not in "0123456789abcdef" for c in value[7:])):
+                raise ValueError(
+                    f"finite-transfer {endpoint_label} endpoint carries an "
+                    f"invalid {fingerprint_label} operator fingerprint")
+        validated.append((current_endpoint, current_mun, current_nmu,
+                          nk, nb, ns, n_rmu, q_label, q_crys, kminq))
+
+    (endpoint_q, current_mun_q, current_nmu_q,
+     nk, nb, ns, n_rmu, q_label, q_crys, kminq_q), (
+     endpoint_mq, current_mun_mq, current_nmu_mq,
+     nk_mq, nb_mq, ns_mq, n_rmu_mq,
+     mq_label, mq_crys, kminq_mq) = validated
+    if (nk_mq, nb_mq, ns_mq, n_rmu_mq) != (nk, nb, ns, n_rmu):
         raise ValueError(
-            "finite-transfer current endpoint must have (cart,spin)=(3,4); "
-            f"got {(ncart, ns)}")
-    if tuple(int(v) for v in current_mun.shape) != (
-            nk, 3, 4, n_rmu, nb):
+            "finite-transfer q/-q endpoint carrier shapes differ: "
+            f"q={(nk, nb, ns, n_rmu)}, "
+            f"-q={(nk_mq, nb_mq, ns_mq, n_rmu_mq)}")
+    if int(endpoint_q.n_rmu_logical) != int(endpoint_mq.n_rmu_logical):
         raise ValueError(
-            "finite-transfer current endpoint face orientations disagree: "
-            f"nmu={current_nmu.shape}, mun={current_mun.shape}")
-    if int(endpoint.n_rmu_logical) > n_rmu:
+            "finite-transfer q/-q endpoint logical centroid extents differ: "
+            f"{int(endpoint_q.n_rmu_logical)} != "
+            f"{int(endpoint_mq.n_rmu_logical)}")
+    if (endpoint_q.hamiltonian_config_operator_fingerprint
+            != endpoint_mq.hamiltonian_config_operator_fingerprint
+            or endpoint_q.vnl_path_operator_fingerprint
+            != endpoint_mq.vnl_path_operator_fingerprint):
         raise ValueError(
-            "finite-transfer current logical centroid extent exceeds its "
-            f"padded face: {int(endpoint.n_rmu_logical)} > {n_rmu}")
+            "finite-transfer q/-q endpoints carry different Hamiltonian "
+            "or finite-path operator receipts")
+
+    kgrid = np.asarray(
+        (int(meta.nkx), int(meta.nky), int(meta.nkz)), dtype=np.int64)
+    if int(np.prod(kgrid)) != nk:
+        raise ValueError(
+            f"finite-transfer meta kgrid={tuple(kgrid)} has product "
+            f"{int(np.prod(kgrid))}, expected nk={nk}")
+    from symmetry_maps import (
+        bgw_integer_q_to_fractional, q_negation_index)
+    q_index = int(np.ravel_multi_index(
+        tuple(np.mod(q_label, kgrid)), tuple(kgrid)))
+    mq_index = int(np.ravel_multi_index(
+        tuple(np.mod(mq_label, kgrid)), tuple(kgrid)))
+    expected_mq_index = int(q_negation_index(kgrid)[q_index])
+    if mq_index != expected_mq_index:
+        raise ValueError(
+            "finite-transfer endpoint pair is not q/-q under the symmetry "
+            f"service: q_index={q_index}, supplied_minus_q={mq_index}, "
+            f"expected_minus_q={expected_mq_index}")
+    expected_q_crys = bgw_integer_q_to_fractional(q_label, kgrid)
+    expected_mq_crys = bgw_integer_q_to_fractional(mq_label, kgrid)
+    if (not np.array_equal(q_crys, expected_q_crys)
+            or not np.array_equal(mq_crys, expected_mq_crys)):
+        raise ValueError(
+            "finite-transfer endpoint fractional q representatives do not "
+            "match the symmetry service's positive-half convention")
+
     if (tuple(int(v) for v in wfns_transverse.psi_nmu.shape)
             != (nk, nb, 4, n_rmu)
             or tuple(int(v) for v in wfns_transverse.psi_mun.shape)
@@ -1795,74 +1914,58 @@ def _compute_finite_transfer_current_block_row_unverified(
         raise ValueError(
             "finite-transfer current endpoint and transverse WFN faces must "
             "share (nk,nb,spin,n_rmu); got endpoint "
-            f"{current_nmu.shape} and WFN "
+            f"{current_nmu_q.shape} and WFN "
             f"{wfns_transverse.psi_nmu.shape}/"
             f"{wfns_transverse.psi_mun.shape}")
-    if nk != int(meta.nk_tot):
-        raise ValueError(
-            f"finite-transfer endpoint nk={nk} != meta.nk_tot="
-            f"{int(meta.nk_tot)}")
-    if int(endpoint.iq_irr) < 0:
-        raise ValueError(
-            "finite-transfer endpoint carries a negative q-IBZ row")
-    q_label = np.asarray(endpoint.q_irr_kgrid_int, dtype=np.int32)
-    q_crys = np.asarray(endpoint.q_crys, dtype=np.float64)
-    if q_label.shape != (3,) or q_crys.shape != (3,) or not np.all(
-            np.isfinite(q_crys)):
-        raise ValueError(
-            "finite-transfer endpoint q labels must be finite 3-vectors; "
-            f"got q_int={q_label}, q_crys={q_crys}")
-    kminq = np.asarray(endpoint.kminq_idx, dtype=np.int32)
-    if kminq.shape != (nk,) or np.any(kminq < 0) or np.any(kminq >= nk):
-        raise ValueError(
-            "finite-transfer endpoint carries an invalid k-q row map")
-    if not np.array_equal(np.sort(kminq), np.arange(nk, dtype=np.int32)):
-        raise ValueError(
-            "finite-transfer endpoint k-q row map must be a full-BZ "
-            "permutation")
-    for label, fingerprint in (
-        ("Hamiltonian", endpoint.hamiltonian_config_operator_fingerprint),
-        ("finite-path", endpoint.vnl_path_operator_fingerprint),
-    ):
-        value = str(fingerprint).strip()
-        if (not value.startswith("sha256:")
-                or len(value) != len("sha256:") + 64
-                or any(c not in "0123456789abcdef" for c in value[7:])):
-            raise ValueError(
-                f"finite-transfer endpoint carries an invalid {label} "
-                "operator fingerprint")
 
     eref = 0.0 if energy_reference is None else float(energy_reference)
     energy_source = wfns_transverse.enk - eref
-    energy_target = jnp.take(energy_source, kminq, axis=0)
     s = wfns_transverse.slices
     mask_v = wfns_transverse.band_mask(s.val)
-    mask_c_target = jnp.take(
-        wfns_transverse.band_mask(s.cond), kminq, axis=0)
-    target_mun = jnp.take(wfns_transverse.psi_mun, kminq, axis=0)
-    target_nmu = jnp.take(wfns_transverse.psi_nmu, kminq, axis=0)
 
     val_host = np.asarray(jax.device_get(
         energy_source[:, s.val]), dtype=np.float64)
     cond_host = np.asarray(jax.device_get(
-        energy_target[:, s.cond]), dtype=np.float64)
+        energy_source[:, s.cond]), dtype=np.float64)
     vmax = float(np.max(val_host))
     cmin = float(np.min(cond_host))
     gap = cmin - vmax
     tau = np.asarray(quad.tau, dtype=np.float64)
-    alpha_chi = (-2.0 * np.asarray(quad.alpha, dtype=np.float64)
+    alpha_chi = (-1.0 * np.asarray(quad.alpha, dtype=np.float64)
                  * np.exp(-tau * gap))
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128))
     kernel = _get_finite_transfer_current_block_kernel(
         mesh_xy, nk=nk, nb=nb, ns=ns, n_rmu=n_rmu)
-    return kernel(
-        nodes, current_mun[:, A - 1], current_nmu[:, :, B - 1],
-        target_mun, target_nmu, mask_v, mask_c_target,
-        energy_source, energy_target,
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64))
+    orientations = []
+    for current_mun, current_nmu, kminq, left_vertex, right_vertex in (
+        (current_mun_q, current_nmu_q, kminq_q, A, B),
+        (current_mun_mq, current_nmu_mq, kminq_mq, B, A),
+    ):
+        energy_target = jnp.take(energy_source, kminq, axis=0)
+        mask_c_target = jnp.take(
+            wfns_transverse.band_mask(s.cond), kminq, axis=0)
+        target_mun = jnp.take(wfns_transverse.psi_mun, kminq, axis=0)
+        target_nmu = jnp.take(wfns_transverse.psi_nmu, kminq, axis=0)
+        orientations.append(kernel(
+            nodes,
+            current_mun[:, left_vertex - 1],
+            current_nmu[:, :, right_vertex - 1],
+            target_mun, target_nmu, mask_v, mask_c_target,
+            energy_source, energy_target,
+            jnp.asarray(vmax, dtype=jnp.float64),
+            jnp.asarray(cmin, dtype=jnp.float64)))
+    # The natural -q BA block is itself P('x','y') in (mu_B,mu_A).
+    # Its dagger swaps that layout; request the incumbent block layout on
+    # output so JAX performs the required distributed transpose rather than
+    # choosing a replicated eager result.
+    block_sharding = NamedSharding(mesh_xy, P("x", "y"))
+    complete_orientations = jax.jit(
+        _complete_static_vertex_orientations,
+        in_shardings=(block_sharding, block_sharding),
+        out_shardings=block_sharding)
+    return complete_orientations(*orientations)
 
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"

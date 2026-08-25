@@ -930,13 +930,16 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
-    meta = SimpleNamespace(nk_tot=1)
+    meta = SimpleNamespace(nkx=1, nky=1, nkz=1, nk_tot=1)
     with pytest.raises(NotImplementedError, match="source/band/centroid"):
         w_isdf.compute_finite_transfer_current_block_row(
             endpoint, wfns, quad, meta, mesh,
             vertex_left=1, vertex_right=2)
+    endpoint_minus_q = endpoint._replace(
+        current_nmu=endpoint.current_nmu + 0.0)
+    assert endpoint_minus_q is not endpoint
     chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint, wfns, quad, meta, mesh,
+        endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     raw_c = np.asarray(raw_rmu[0, 1])
     current_v_A = np.asarray(endpoint.current_nmu[0, 0, 0])
@@ -1006,6 +1009,8 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         psi_4, iq_irr=0, **common_kwargs)
     endpoint_q1 = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4, iq_irr=1, **common_kwargs)
+    endpoint_q3 = mtxel_sweep.finite_transfer_current_to_centroids(
+        psi_4, iq_irr=3, **common_kwargs)
 
     q = np.asarray([0.25, 0.0, 0.0])
     target_rows = kqfull[:, 1]
@@ -1064,10 +1069,16 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         occ=jnp.asarray(np.tile([1.0, 0.0], (4, 1))), slices=slices,
         psi_nmu=raw_rmu,
         psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
+    meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=4)
+    with pytest.raises(ValueError, match="not q/-q"):
+        w_isdf._compute_finite_transfer_current_block_row_unverified(
+            endpoint_q1, endpoint_q0, wfns,
+            SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
+            meta, mesh, vertex_left=1, vertex_right=2)
     chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint_q1, wfns,
+        endpoint_q1, endpoint_q3, wfns,
         SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
-        SimpleNamespace(nk_tot=4), mesh,
+        meta, mesh,
         vertex_left=1, vertex_right=2)
     raw_target_c = np.asarray(raw_rmu[target_rows, 1])
     current_v_A = np.asarray(endpoint_q1.current_nmu[:, 0, 0])
@@ -1076,7 +1087,19 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         'ksm,ksm->km', np.conj(raw_target_c), current_v_A)
     D_B = np.einsum(
         'ksm,ksm->km', np.conj(raw_target_c), current_v_B)
-    expected_chi_12 = (-2.0 / np.sqrt(4.0)) * np.einsum(
+    forward_12 = (-1.0 / np.sqrt(4.0)) * np.einsum(
         'km,kn->mn', np.conj(D_A), D_B)
+
+    minus_target_rows = kqfull[:, 3]
+    raw_minus_target_c = np.asarray(raw_rmu[minus_target_rows, 1])
+    minus_current_v_A = np.asarray(endpoint_q3.current_nmu[:, 0, 0])
+    minus_current_v_B = np.asarray(endpoint_q3.current_nmu[:, 0, 1])
+    D_A_minus = np.einsum(
+        'ksm,ksm->km', np.conj(raw_minus_target_c), minus_current_v_A)
+    D_B_minus = np.einsum(
+        'ksm,ksm->km', np.conj(raw_minus_target_c), minus_current_v_B)
+    reverse_21 = (-1.0 / np.sqrt(4.0)) * np.einsum(
+        'kn,km->nm', np.conj(D_B_minus), D_A_minus)
+    expected_chi_12 = forward_12 + np.conj(reverse_21.T)
     np.testing.assert_allclose(
         chi_12, expected_chi_12, rtol=6.0e-12, atol=6.0e-12)
