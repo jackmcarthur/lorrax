@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "FULL_BLOCH_TRANSFORM_SCHEME",
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
     "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
     "gflat_to_rchunk_aot_memory", "gflat_to_rchunk_aot_peak_bytes",
@@ -78,6 +79,16 @@ __all__ = [
     "load_centroids_band_chunked",
     "load_psi_gflat_padded",
 ]
+
+
+#: Versioned physics convention for the full-Bloch real-space rows produced
+#: by this owner and :class:`common.psi_G_store.PsiGStore`.  Persisted
+#: consumers must stamp this word: a WFN content fingerprint alone cannot
+#: distinguish coefficients transformed with the old independently rebuilt
+#: modular k table from coefficients transformed with loader-paired k/G
+#: representatives.
+FULL_BLOCH_TRANSFORM_SCHEME = (
+    "lorrax-full-bloch-v1:loader-paired-k-g:ifftn-ortho:phase-plus")
 
 
 # ---------------------------------------------------------------------------

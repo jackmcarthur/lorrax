@@ -32,6 +32,7 @@ from common.shard_map import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import (
+    FULL_BLOCH_TRANSFORM_SCHEME,
     gflat_to_rchunk_aot_memory,
     load_centroids_band_chunked,
 )
@@ -53,7 +54,7 @@ __all__ = [
 
 
 QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
-_BASIS_FORMAT = 1
+_BASIS_FORMAT = 2
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_basis_at_nodes",
                  "galerkin_selection_factor")
 _BASIS_META = "galerkin_"
@@ -192,6 +193,7 @@ def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
         "bispinor": bool(bispinor), "centroid_shape": shape,
         "centroid_hash": centroid_hash, "wfn_hash": wfn_fingerprint(wfn),
         "wfn_scheme": WFN_FINGERPRINT_SCHEME,
+        "transform_scheme": FULL_BLOCH_TRANSFORM_SCHEME,
         "rank_multiplier": validate_rank_multiplier(
             rank_multiplier, name="htransform_rank_multiplier"),
         "qrcp_eps": qrcp_eps, "qrcp_seed": qrcp_seed,
@@ -260,6 +262,7 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
             ("centroid_hash", provenance["centroid_hash"]),
             ("wfn_hash", provenance["wfn_hash"]),
             ("wfn_scheme", provenance["wfn_scheme"]),
+            ("transform_scheme", provenance["transform_scheme"]),
             ("qrcp_rng", provenance["qrcp_rng"]),
             ("candidate_hash", basis.candidate_hash),
             ("pivot_hash", basis.pivot_hash)):
@@ -341,6 +344,7 @@ def _basis_read_meta(io) -> dict:
             "centroid_shape", np.int32)),
         "centroid_hash": text("centroid_hash"), "wfn_hash": text("wfn_hash"),
         "wfn_scheme": text("wfn_scheme"),
+        "transform_scheme": text("transform_scheme"),
         "rank_multiplier": float(controls[0]), "qrcp_eps": float(controls[1]),
         "qrcp_seed": int(small("qrcp_seed", np.int64)[0]),
         "qrcp_rng": text("qrcp_rng"),

@@ -20,6 +20,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.sharding_fit import fit_sharding
+from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 from isdf.galerkin import GalerkinBasis, read_galerkin_basis, write_galerkin_basis
 
 
@@ -101,6 +102,9 @@ def test_galerkin_basis_logical_roundtrip_and_provenance(tmp_path, monkeypatch):
         assert h5["galerkin_basis_at_nodes"].shape == (3, 2, 6)
         assert h5["galerkin_selection_factor"].shape == (3, 3)
         assert int(np.asarray(h5["galerkin_complete"])[0]) == 1
+        scheme = bytes(np.asarray(
+            h5["galerkin_transform_scheme"], dtype=np.uint8)).decode()
+        assert scheme == FULL_BLOCH_TRANSFORM_SCHEME
 
     restored = read_galerkin_basis(
         path, band_range=(4, 7), extra_rank_pad=2,
@@ -118,3 +122,11 @@ def test_galerkin_basis_logical_roundtrip_and_provenance(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="centroid_hash"):
         read_galerkin_basis(
             path, band_range=(4, 7), **_kwargs(mesh, meta, changed))
+    with h5py.File(path, "r+") as h5:
+        encoded = np.frombuffer(
+            "pre-paired-k-g", dtype=np.uint8).astype(np.int32)
+        del h5["galerkin_transform_scheme"]
+        h5.create_dataset("galerkin_transform_scheme", data=encoded)
+    with pytest.raises(ValueError, match="transform_scheme"):
+        read_galerkin_basis(
+            path, band_range=(4, 7), **_kwargs(mesh, meta, centroids))
