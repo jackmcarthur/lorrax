@@ -5755,6 +5755,7 @@ def _make_fit_one_rchunk_kernel(
     lu_hoisted: bool = False,
     distrib_la_batched_route: str = "auto",
     layout: str = "legacy",
+    cache_face_y_blocks: bool = False,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` carrying
@@ -5794,6 +5795,9 @@ def _make_fit_one_rchunk_kernel(
     legacy branch's own ``gamma_L=gamma_mu, gamma_R=gamma_mu`` call
     exactly (``gw.isdf_fitting.fit_zeta_to_h5``'s STEP 2 CCT call uses
     the identical single-index-for-both convention).
+
+    ``cache_face_y_blocks`` is the memory planner's internal face-route
+    decision; it is static, cache-keyed, and has no frontend/env spelling.
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
@@ -5872,6 +5876,7 @@ def _make_fit_one_rchunk_kernel(
                 kgrid=kgrid, mesh_xy=mesh_xy,
                 layout="face", psi_mun=psi_mun,
                 weight_l=weight_l, weight_r=weight_r,
+                cache_face_y_blocks=bool(cache_face_y_blocks),
             )
         else:
             # Pre-multiply by 1/norms so the pair-density einsum sees the
@@ -6001,6 +6006,7 @@ def fit_one_rchunk(
     psi_mun: jax.Array | None = None,
     weight_l: jax.Array | None = None,
     weight_r: jax.Array | None = None,
+    cache_face_y_blocks: bool = False,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -6060,6 +6066,7 @@ def fit_one_rchunk(
         str(distrib_la_batched_route),
         bool(lu_piv is not None),
         str(layout),
+        bool(cache_face_y_blocks),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -6087,6 +6094,7 @@ def fit_one_rchunk(
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),
             layout=str(layout),
+            cache_face_y_blocks=bool(cache_face_y_blocks),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path

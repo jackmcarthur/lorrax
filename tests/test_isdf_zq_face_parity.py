@@ -204,6 +204,14 @@ def _worker(case_name: str) -> int:
             out[:, :bpd, :, :] = psi_G[:, b_lo + r * bpd: b_lo + (r + 1) * bpd, :, :]
             return out
 
+        @property
+        def local_band_chunk_shape(self):
+            return (nk, self._bpd_max, ns, ngkmax)
+
+        @property
+        def band_chunk_carrier(self):
+            return self._bpd_max * mesh.size
+
         # Legacy/build-cache arms remain intentionally frozen on the
         # compatibility spelling; the changed face-streaming arm above uses
         # PsiGStore's public owner.
