@@ -33,6 +33,8 @@ _services.ensure_on_path()
 from zeta_loader import ZetaLoader  # noqa: E402
 ZetaReader = ZetaLoader  # merged 2026-07-09; slab API lives on ZetaLoader
 from gw.v_q_bispinor import (
+    BispinorVqReader,
+    V_QMUNU_FORMAT,
     compute_V_q_bispinor_g_flat_to_h5,
     _make_per_q_v_builder_for_tile,
     UNIQUE_TILES, tile_dataset_name,
@@ -123,6 +125,28 @@ def _ref_tile_V(zeta_L_disk, zeta_R_disk, q_frac, gvec_components, ngk_per_q,
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+def test_reader_refuses_stale_format_before_collective_open(tmp_path,
+                                                            monkeypatch):
+    """A schema refusal must not strand an unreachable collective handle."""
+    stale_path = tmp_path / "stale_v_q_bispinor.h5"
+    with h5py.File(stale_path, "w") as f:
+        f.create_dataset("v_qmunu_format", data=np.bytes_(
+            "bispinor_lorentz_v1"))
+
+    collective_opened = False
+
+    class RefuseCollectiveOpen:
+        def __init__(self, *args, **kwargs):
+            nonlocal collective_opened
+            collective_opened = True
+            raise AssertionError("SlabIO opened before schema acceptance")
+
+    monkeypatch.setattr("file_io.slab_io.SlabIO", RefuseCollectiveOpen)
+    with pytest.raises(ValueError, match=V_QMUNU_FORMAT):
+        BispinorVqReader(stale_path, object())
+    assert not collective_opened
+
 
 def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
     """All 7 unique tiles agree with a per-q einsum reference."""
