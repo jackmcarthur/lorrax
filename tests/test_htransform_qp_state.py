@@ -7,30 +7,51 @@ import numpy as np
 import pytest
 
 
+_DEFAULT_KPOINTS = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+
+
+def _source_wfn(*, energies=None):
+    if energies is None:
+        energies = np.linspace(-1.0, 1.0, 64, dtype=np.float64).reshape(
+            1, 2, 32)
+    return SimpleNamespace(
+        energies=np.asarray(energies, dtype=np.float64),
+        kpoints=_DEFAULT_KPOINTS.copy(),
+        nelec=8,
+        nspinor=2,
+        nbands=32,
+        path=None,
+    )
+
+
 def _write_rotations(path, U, E_ry, band_range, *, kgrid=(2, 1, 1),
-                     kpoints=None):
+                     kpoints=None, source_wfn=True):
     from file_io.qp_wfn import write_qp_rotations_h5
 
     if kpoints is None:
-        kpoints = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+        kpoints = _DEFAULT_KPOINTS
     write_qp_rotations_h5(
         str(path), U, np.asarray(E_ry) / 2.0,
         int(band_range[0]), int(band_range[1]), np.asarray(kpoints),
-        *kgrid, k_storage="full")
+        *kgrid, k_storage="full",
+        source_wfn=(_source_wfn() if source_wfn is True else source_wfn))
 
 
 def _state(ctilde, enk, *, band_range=(10, 15), kgrid=(2, 1, 1),
-           kpoints=None):
+           kpoints=None, wfn=None):
     import jax.numpy as jnp
 
     if kpoints is None:
-        kpoints = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+        kpoints = _DEFAULT_KPOINTS
+    if wfn is None:
+        wfn = _source_wfn()
     return dict(
         basis=SimpleNamespace(
             ctilde=jnp.asarray(ctilde), band_range=band_range),
         enk_sigma=jnp.asarray(enk),
         sym=SimpleNamespace(unfolded_kpts=np.asarray(kpoints)),
         meta=SimpleNamespace(kgrid=kgrid),
+        wfn=wfn,
         wfn_path="unstamped-mean-field-WFN.h5",
         log_fn=lambda *_a, **_k: None,
     )
@@ -170,6 +191,38 @@ def test_qp_artifact_must_match_the_wfn_k_set(tmp_path, mismatch):
     with pytest.raises(ValueError, match=match):
         resolve_qp_hamiltonian_state(
             **state, qp_rotations_file=str(path))
+
+
+def test_qp_artifact_must_authenticate_the_source_wfn(tmp_path):
+    pytest.importorskip("jax")
+    from bandstructure.htransform import resolve_qp_hamiltonian_state
+
+    U = np.broadcast_to(np.eye(2, dtype=np.complex128), (2, 2, 2)).copy()
+    E = np.zeros((2, 2))
+    state = _state(np.ones((2, 5, 2)), np.zeros((5, 2)))
+
+    legacy = tmp_path / "legacy-unstamped.h5"
+    _write_rotations(legacy, U, E, (11, 13))
+    import h5py
+    from file_io.qp_wfn import (
+        QP_ROT_WFN_FINGERPRINT_ATTR,
+        QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR,
+    )
+    with h5py.File(legacy, "r+") as h5:
+        del h5.attrs[QP_ROT_WFN_FINGERPRINT_ATTR]
+        del h5.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR]
+    with pytest.raises(ValueError, match="no authenticated source-WFN"):
+        resolve_qp_hamiltonian_state(
+            **state, qp_rotations_file=str(legacy))
+
+    mismatched = tmp_path / "mismatched-wfn.h5"
+    changed = _source_wfn()
+    changed.energies = np.asarray(changed.energies).copy()
+    changed.energies[0, 0, 0] += 1.0e-3
+    _write_rotations(mismatched, U, E, (11, 13), source_wfn=changed)
+    with pytest.raises(ValueError, match="different mean-field WFN"):
+        resolve_qp_hamiltonian_state(
+            **state, qp_rotations_file=str(mismatched))
 
 
 def test_qp_state_sources_cannot_be_stacked(tmp_path):

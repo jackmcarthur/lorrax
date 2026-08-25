@@ -1156,6 +1156,7 @@ def write_results(
     input_dir: str,
     kgrid: tuple[int, int, int],
     sym,
+    wfn,
     print_fn=print,
     *,
     eqp2_file: str | None = None,
@@ -1226,6 +1227,11 @@ def write_results(
         The already-applied output conditioning (``"bgw_average"`` or
         ``"disabled"``) and its tolerance.  These are receipt provenance,
         not instructions: this function never applies the projection itself.
+    wfn : WfnLoader
+        Mean-field WFN whose DFT-band basis defines ``results.U_qp``.  The
+        rotations writer fingerprints it through the canonical provenance
+        owner; it is not loaded again and no bispinor representation is
+        constructed.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1605,6 +1611,7 @@ def write_results(
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
             k_storage=str(qp_rotations_k_storage),
             star_tables=_sm.star_tables_of(sym),
+            source_wfn=wfn,
             print_fn=print_fn,
             **provenance,
         )

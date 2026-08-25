@@ -8,6 +8,8 @@ the arrays in hand and keeps the wedge only if the reconstruction is
 exact.  These cells pin that, in both directions, and pin the thing the
 whole format rests on — that a file with no stamp is read as full-BZ.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -42,6 +44,14 @@ _KIRR_TO_KFULL = np.array([0, 2, 4], dtype=np.int32)
 _TABLES = (_IRR, _SYM, _NSS)
 
 
+def _source_wfn(kpoints, nb):
+    """Small pathless WFN identity for this format-only test module."""
+    return SimpleNamespace(
+        energies=np.zeros((1, len(kpoints), nb), dtype=np.float64),
+        kpoints=np.asarray(kpoints, dtype=np.float64),
+        nelec=max(1, nb // 2), nspinor=1, nbands=nb, path=None)
+
+
 def _star_consistent_payload(nb=3, seed=0):
     """Full-BZ arrays that ARE the unfold of their own wedge rows.
 
@@ -67,7 +77,8 @@ def _write(tmp_path, name, U, E, kpts, **kw):
     stored = write_qp_rotations_h5(
         path, U_mnk=U, E_qp_nk=E, band_start=0, band_stop=U.shape[-1],
         kpoints_crys=kpts, nkx=2, nky=1, nkz=1,
-        kirr_to_kfull=_KIRR_TO_KFULL, **kw)
+        kirr_to_kfull=_KIRR_TO_KFULL,
+        source_wfn=_source_wfn(kpts, U.shape[-1]), **kw)
     return path, stored
 
 
@@ -265,7 +276,8 @@ def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
             str(tmp_path / f"np_{k_storage}.h5"), U_mnk=U, E_qp_nk=E,
             band_start=0, band_stop=nb, kpoints_crys=kpts,
             nkx=2, nky=1, nkz=1, kirr_to_kfull=rows,
-            k_storage=k_storage, star_tables=tables, **kw)
+            k_storage=k_storage, star_tables=tables,
+            source_wfn=_source_wfn(kpts, nb), **kw)
 
     with pytest.raises(ValueError, match="never an orbit parent"):
         _w("ibz")
