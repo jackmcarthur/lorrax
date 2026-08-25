@@ -3,7 +3,7 @@
 One door for the ISDF ζ tensor a GW run writes once and reads many times
 (and for its bispinor siblings ``zeta_q_mu{1,2,3}.h5``): the header
 surface, the collective slab read that feeds V_q, the sanctioned local
-plan, the never-raising probe, and the one post-close append.  It owns no
+plan, and the never-raising probe.  It owns no
 mathematics — ``zeta_rcond``, the fit and the solver tiers are
 producer-side (``isdf`` / ``gw.isdf_fitting``) and stay there.
 
@@ -47,10 +47,6 @@ The surface
     NEVER raises, for any input.  Owns the
     ``(('zeta_q_G',1),('zeta_q',2))`` layout dispatch as the one copy of
     that truth.
-``write_g0_mu(path, g0_logical, *, n_rmu_expected=None)``
-    The one sanctioned rank-0 serial append after the collective handle
-    closes.  The caller owns the gating and the barriers, deliberately.
-
 Contracts
 ---------
 ONE DATA LAYOUT.  Every data method reads G-flat ``zeta_q_G`` and refuses
@@ -73,10 +69,9 @@ Standalone, and honestly so
 ---------------------------
 Declared dependencies are lxkit, jax, numpy and h5py.  ``import
 zeta_loader`` is clean with no LORRAX checkout on ``sys.path`` at all,
-and the FORMAT surface — :func:`probe_zeta_file`, :func:`write_g0_mu` —
-is FULLY FUNCTIONAL there, which matters because both of its call sites
-run outside a loader's lifetime (the probes gate whether the fit runs;
-the append happens after the collective handle is gone).
+and the FORMAT surface — :func:`probe_zeta_file` — is FULLY FUNCTIONAL
+there, which matters because its call sites run outside a loader's lifetime
+(the probes gate whether the fit runs).
 
 The DATA path is not standalone, and that is stated rather than blurred:
 ``ZetaLoader`` reaches ``file_io.mf_header``, ``file_io.isdf_header``,
@@ -88,13 +83,13 @@ dependencies.
 
 from __future__ import annotations
 
-from zeta_loader.format import ZetaFileProbe, probe_zeta_file, write_g0_mu
+from zeta_loader.format import ZetaFileProbe, probe_zeta_file
 
 __all__ = [
     # the reader
     "ZetaLoader",
     # the format surface (pure h5py + numpy; works with no lorrax, no jax)
-    "probe_zeta_file", "ZetaFileProbe", "write_g0_mu",
+    "probe_zeta_file", "ZetaFileProbe",
 ]
 
 
