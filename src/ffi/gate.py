@@ -488,7 +488,7 @@ class Gate:
                 f"retained native-JAX path ({self.off_label}).  This path "
                 f"is UNCERTIFIED for production (the FFI layer is required, "
                 f"decisions.md 2026-08-01).",
-                scope="local")
+                scope="local", emit=announce)
             return None
         if self.mode() == "auto":
             # ONE line, at startup, saying which arm this run actually took.
