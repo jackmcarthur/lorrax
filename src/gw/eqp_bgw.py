@@ -725,7 +725,9 @@ def assemble_eqp(
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
-	3. Σ_c at E_DFT — always, it is what eqp0 means — and, when the
+	3. output-conditioned Σ_c at E_DFT when supplied (otherwise interpolate
+	   the legacy raw cube) — it is what eqp0 means — while Z and its
+	   derivative always come from the raw ω cube; when the
 	   caller says the Σ spectrum was evaluated somewhere else
 	   (``e_eval_ev``), a SECOND interpolation and central-difference
 	   Z there, which is where eqp1 is linearized
@@ -795,19 +797,32 @@ def assemble_eqp(
 		if omega_rel_ev is None or e_dft_rel_ev is None:
 			raise ValueError(
 				"sigma_c_omega_diag_ev requires omega_rel_ev and e_dft_rel_ev")
-		# Re-derive σ_c at E_DFT from the full ω-grid for self-consistency
-		# with the Z-factor central difference.
-		sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
+		# The raw omega cube remains the sole owner of Z and its derivative.
+		# The live driver may, however, have output-conditioned C(E_DFT)
+		# after interpolation (BGW degenerate-set averaging).  Keep that
+		# authoritative value when supplied; otherwise the grid interpolation
+		# is the legacy/post-hoc value.  Before this split, passing the
+		# conditioned array alongside the cube was a silent no-op.
+		sigma_c_grid_at_dft, z_factor = compute_z_factor_from_omega_grid(
 			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 			omega_rel_ev=omega_rel_ev,
 			e_dft_rel_ev=e_dft_rel_ev,
 			dE_ev=dE_ev,
 		)
+		if sigma_c_at_dft_diag_ev is None:
+			sigma_c_at_dft = sigma_c_grid_at_dft
+		else:
+			sigma_c_at_dft = np.asarray(
+				sigma_c_at_dft_diag_ev, dtype=np.complex128)
+			if sigma_c_at_dft.shape != e_dft_ev.shape:
+				raise ValueError(
+					"conditioned sigma_c_at_dft_diag_ev has shape "
+					f"{sigma_c_at_dft.shape}; expected {e_dft_ev.shape}.")
 		# THE SECOND CENTRE, and only when it is a different one.  The
 		# equality test is what keeps every one-shot run — where the Σ
 		# spectrum IS evaluated at E_DFT, so the caller passes the same
-		# numbers — on exactly the code above, hence bit-for-bit on the
-		# historical answer.  It is an ``array_equal``, not a tolerance:
+		# numbers — on the single-centre code above.  It is an
+		# ``array_equal``, not a tolerance:
 		# these arrays are either literally the same energies or a
 		# different spectrum.
 		if e_eval_rel_ev is not None and not np.array_equal(
