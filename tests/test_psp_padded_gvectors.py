@@ -304,9 +304,41 @@ def test_provenance_guard_accepts_its_own_stamp(tmp_path):
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
-    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=3, nband=8,
-                                    print_fn=lambda *a: None) is True
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
+                   vnl_velocity_sign=+1)
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=False, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=+1, print_fn=lambda *a: None) is True
+
+
+def test_provenance_guard_refuses_representation_or_vnl_sign_mismatch(
+        tmp_path, monkeypatch):
+    """Equal shapes do not make two velocity operators interchangeable."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
+                   vnl_velocity_sign=+1)
+
+    representation_lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=True, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=+1,
+        print_fn=representation_lines.append) is False
+    assert any("prov_bispinor" in line for line in representation_lines)
+
+    sign_lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=False, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=-1,
+        print_fn=sign_lines.append) is False
+    assert any("prov_vnl_velocity_sign" in line for line in sign_lines)
 
 
 def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):

@@ -15,6 +15,8 @@ kernels would still be caught.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -327,6 +329,30 @@ def test_pad_head_band_manifold_to_commits_to_declared_sharding():
     assert v_out.shape == (3, 2, 8, 8)
     assert v_out.committed
     assert e_out.shape == f_out.shape == s_out.shape == (2, 8)
+
+
+def test_dft_head_refuses_dipole_provenance_before_read_or_allocation(
+        tmp_path, monkeypatch):
+    """A four-spinor charge body must not consume a two-spinor dipole."""
+    import common.chi_from_dipole as dipole_reader
+    import psp.get_dipole_mtxels as dipole_owner
+
+    (tmp_path / "dipole.h5").write_bytes(b"not read")
+    monkeypatch.setattr(
+        dipole_owner, "resolve_vnl_velocity_sign", lambda *_args: +1)
+    monkeypatch.setattr(
+        dipole_owner, "check_dipole_provenance", lambda *_args, **_kw: False)
+    monkeypatch.setattr(
+        dipole_reader, "read_dipole_h5",
+        lambda *_args, **_kw: pytest.fail("dipole payload was read"))
+
+    config = SimpleNamespace(
+        nval=2, ncond=2, nband=4, vnl_velocity_sign="")
+    meta = SimpleNamespace(nspinor=4)
+    with pytest.raises(ValueError, match="dft_head_dipole_provenance"):
+        qsgw_head.build_dft_head_response(
+            object(), [0.0], input_dir=str(tmp_path), mesh=object(),
+            wfn=object(), meta=meta, config=config)
 
 
 def test_head_wings_sharded_face_requires_face_psi_fields():
