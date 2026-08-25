@@ -592,14 +592,13 @@ class BispinorVqReader:
         import h5py
         self._filename = Path(filename)
         self._mesh = mesh_xy
-        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
-)
-        self._io.__enter__()
 
         # Small metadata scalars are written via SlabIO.write_attr (which
         # creates a dataset in the file).  Read them via h5py — every rank
         # opens its own 'r' handle for a few-byte read; broadcast overhead
-        # would dominate.
+        # would dominate.  Validate all metadata before opening SlabIO: its
+        # constructor opens a collective PhdfCtx which only __exit__ can
+        # close, so a constructor-time refusal must happen first.
         with h5py.File(self._filename, "r") as f:
             def _read_scalar(name):
                 d = f[name]
@@ -608,6 +607,12 @@ class BispinorVqReader:
             fmt = _read_scalar("v_qmunu_format")
             if isinstance(fmt, bytes):
                 fmt = fmt.decode("utf-8")
+            if str(fmt) != V_QMUNU_FORMAT:
+                raise ValueError(
+                    f"{self._filename}: v_qmunu_format='{fmt}', "
+                    f"expected '{V_QMUNU_FORMAT}'.  Wrong file or stale "
+                    f"format from a different LORRAX revision."
+                )
             self.kgrid = tuple(int(x) for x in _read_scalar("kgrid"))
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))
             self.n_rmu_T = int(_read_scalar("n_rmu_T"))
@@ -620,12 +625,9 @@ class BispinorVqReader:
             self._g0_datasets = frozenset(
                 name for name in f if name.endswith("_g0"))
 
-        if str(fmt) != V_QMUNU_FORMAT:
-            raise ValueError(
-                f"{self._filename}: v_qmunu_format='{fmt}', "
-                f"expected '{V_QMUNU_FORMAT}'.  Wrong file or stale "
-                f"format from a different LORRAX revision."
-            )
+        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
+)
+        self._io.__enter__()
 
     def __enter__(self):
         return self
