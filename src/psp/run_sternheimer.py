@@ -1353,16 +1353,15 @@ def run_sternheimer(
     # ══════════════════════════════════════════════════════════════════
     #  q-loop:  Python over q, vmap+jit over k
     # ══════════════════════════════════════════════════════════════════
+    from common.kq_mapping import (
+        bgw_signed_q_representative, kminq_idx_for_iq)
     for q_idx, iq_red in enumerate(iq_list):
-        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
-        # Signed representative q_signed ∈ [-1/2, 1/2)³.
-        qvec = qvec_pos - np.round(qvec_pos)
+        qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
         if verbose:
             print(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
 
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)
         Gprime_j = jnp.asarray(Gprime_int)
-        from common.kq_mapping import kminq_idx_for_iq
         kminq_idx_j = jnp.asarray(kminq_idx_for_iq(sym, iq_red))
         qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
 

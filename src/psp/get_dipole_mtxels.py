@@ -262,7 +262,8 @@ def compute_finite_q_mtxels(
       m ∈ [n_occ, n_occ + nc_block)  (conduction)
       n ∈ [n_occ - nv_block, n_occ)  (valence)
     """
-    from common.kq_mapping import kminq_idx_for_iq, umklapp_G_wrap
+    from common.kq_mapping import (
+        bgw_signed_q_representative, kminq_idx_for_iq, umklapp_G_wrap)
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     import psp.vnl_ops as vnl_ops
 
@@ -374,8 +375,7 @@ def compute_finite_q_mtxels(
         kminq_idx = kminq_idx_for_iq(sym, iq_red)
         kminq_idx_kq[:, jq] = kminq_idx
 
-        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
-        qvec = qvec_pos - np.round(qvec_pos)
+        qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
         q_cart_bohr = qvec @ bvec_blat_np
         G_wrap_k = np.asarray(umklapp_G_wrap(
             kpts_full, kpts_full[kminq_idx], qvec), dtype=np.int32)
