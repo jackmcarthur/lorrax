@@ -251,6 +251,7 @@ def announce_cpu_collectives() -> None
 def tune_glibc_malloc() -> bool
 def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict
 def format_startup_report(f: dict) -> list
+def format_production_startup_report(f: dict) -> list
 
 # runtime/xla_memory.py (moved out of gw.gw_config 2026-07-31; re-exported there)
 def resolve_xla_gpu_memory_env() -> XlaGpuMemoryEnv

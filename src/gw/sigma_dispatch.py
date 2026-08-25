@@ -134,6 +134,13 @@ class SigmaResult:
     #: cells are measurements and which are grid endpoints, and the Na
     #: semicore run shipped 41.3 % endpoints as if they were Σ.
     omega_coverage: object | None = None
+    #: The three ACTUAL cumulative band counts used by the PPM tail fit.
+    #: These come from the bracket planner after snapping/derivation; they are
+    #: carried to the human report so it never substitutes requested counts
+    #: for the calculation that ran.
+    band_extrapolation_counts: tuple[int, ...] | None = None
+    band_extrapolation_estimator: str | None = None
+    band_extrapolation_scheme: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +219,9 @@ BASIS_FREE_FIELDS = (
     "sigma_omega_h5_path",
     "efermi_dft_ev",
     "omega_reference_provenance",
+    "band_extrapolation_counts",
+    "band_extrapolation_estimator",
+    "band_extrapolation_scheme",
 )
 
 
@@ -510,6 +520,19 @@ def finalize_dynamic_sigma(
                 sigma_omega_h5_path, sigma_xc_qsgw,
                 config=config, print_fn=print_fn)
 
+    _band_attrs = ((band_extrapolation or {}).get("attrs") or {})
+    _band_counts_raw = _band_attrs.get("band_counts")
+    _band_counts = (tuple(int(v) for v in np.asarray(
+        _band_counts_raw, dtype=np.int64).reshape(-1))
+        if _band_counts_raw is not None else None)
+    _band_estimator = _band_attrs.get("band_extrapolation_estimator")
+    # Absence is the established artifact spelling for the historical
+    # total-fractions scheme (band_extrapolation._bracket_h5_attrs).
+    _band_scheme = (_band_attrs.get("band_extrapolation_bracket_scheme")
+                    if _band_counts is not None else None)
+    if _band_counts is not None and _band_scheme is None:
+        _band_scheme = "total_fractions"
+
     return SigmaResult(
         v_h_kij_ry=sig_h,
         sigma_x_kij_ry=sig_x,
@@ -532,6 +555,11 @@ def finalize_dynamic_sigma(
         efermi_dft_ev=efermi_dft_ev,
         omega_reference_provenance=omega_reference_provenance,
         omega_coverage=omega_coverage,
+        band_extrapolation_counts=_band_counts,
+        band_extrapolation_estimator=(
+            str(_band_estimator) if _band_estimator is not None else None),
+        band_extrapolation_scheme=(
+            str(_band_scheme) if _band_scheme is not None else None),
     )
 
 

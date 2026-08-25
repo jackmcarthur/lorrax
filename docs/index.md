@@ -80,7 +80,7 @@ one sentence and a link.
 | **what a deck key does** | [Input reference](input_reference.md) | generated from the parser; the deck is the record for anything that changes the numbers. |
 | **how MPA samples chi0, fits W and windows Sigma** | [Multipole frequency integration](theory/THEORY_mpa_implementation.md) | the frequency equations, validity domains, window partition, SlabIO boundaries and production-enablement boundary. |
 | **how metallic (finite-occupation) screening works** | [Metallic MPA screening](theory/metallic-mpa-screening.md) | the occupation-weight factorization and its cancellation analysis, the metal frequency plan and the origin-row decision, the two `q->0` heads and their order of limits, the occupation-weighted Sigma, the per-iteration QSGW occupation state, **and metallic self-consistency — what one map call rebuilds, the one-omega-reference rule, the entry-solve rule, the `max\|dE\|` stop rule, and the measured damped-vs-undamped convergence**. |
-| **what a particular run actually resolved** | **the run's own rank-0 startup block** — [annotated, with a real one printed verbatim](environment/overview.md#startup-block) | see the warning below — it outranks every page here. |
+| **what a particular run actually resolved** | **the driver report** (`kmeans.out` for centroid selection; `gwjax.out` for GW), with the exhaustive runtime inventory behind `LORRAX_DEBUG_PRINT=1` — [annotated startup formats](environment/overview.md#startup-block) | the report records active calculation pathways; debug adds allocator/library/capability forensics. Both outrank static defaults. |
 | **what the machine provides, and what breaks when a layer is missing** | [Environment overview](environment/overview.md) · [Frontera](environment/machines/frontera.md) · [Perlmutter](environment/machines/perlmutter.md) | the layered dependency tree, the shared JAX configuration, the three CUDA allocators, and the per-machine facts. |
 | **why CPU collectives run on `impl=mpi`** | [Collective transports](environment/transports.md) · [`docs/dev/mpi_collectives.md`](dev/mpi_collectives.md) | the gloo corruption evidence and the MPIwrapper recipe. |
 | **how to judge whether a claim or a check is any good** | [`docs/dev/QUALITY_PATTERNS.md`](dev/QUALITY_PATTERNS.md) | the ten failure classes and the assessment rubric. Cited by number (`#8`) from other pages. |
@@ -91,10 +91,11 @@ one sentence and a link.
 > `XLA_PYTHON_CLIENT_PREALLOCATE`) are read only *before* backend init, after
 > which `os.environ` is a false witness — measured, job 7882443: two runs with
 > byte-identical environments and `bytes_limit` 11.805 GB vs 0.000 GB.
-> `runtime.initialize_communicator_stack()` prints one rank-0 block naming
-> every choice where more than one outcome was possible. Read the block —
-> [a real one, annotated](environment/overview.md#startup-block), if you
-> have not seen one before.
+> The production driver report records the active scientific choices from the
+> resolved runtime.  When allocator, library or unavailable-capability detail
+> matters, rerun with `LORRAX_DEBUG_PRINT=1`; that renders the exhaustive
+> measured inventory — [a real one, annotated](environment/overview.md#startup-block),
+> if you have not seen one before.
 
 ### Two things about this tree that surprise people
 

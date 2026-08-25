@@ -80,15 +80,18 @@ reading the last column answers "which layer is broken" from a job log.
 
 ---
 
-## 2.0 What a run actually resolved — the startup block {#startup-block}
+## 2.0 What a run actually resolved — production and debug startup {#startup-block}
 
-Several pages in this tree, including the [register](../index.md#register),
-tell you that the run's own rank-0 startup block outranks every documented
-default. None of them showed one. This is one, verbatim, so you know what
-you are looking for before you need it.
+Every production driver prints only a four-line rank-zero preamble: ranks,
+devices, mesh, CPU affinity, JAX/precision/collectives, and startup time.
+`kmeans` and `gwjax` then write calculation-specific choices to `kmeans.out`
+and `gwjax.out`, including their **Numerical environment** blocks.  This keeps
+allocator, capability, library and per-handler diagnostics out of the
+scientific output.
 
-`runtime.initialize_communicator_stack()` prints it once on rank 0, ahead of
-the first stage line. Captured **2026-08-06 on Perlmutter, job 56393848**,
+Set the one driver-wide switch `LORRAX_DEBUG_PRINT=1` to render the exhaustive
+startup inventory from the same measured facts.  The block below is that
+debug rendering, captured **2026-08-06 on Perlmutter, job 56393848** from
 `python3 -u -m gw.gw_jax -i cohsex_test.in` on the bundled COHSEX fixture,
 **1 process / 1 A100**, launched with `lx run`
 ([Perlmutter §1](machines/perlmutter.md#1-entry-point-lx)):
@@ -123,7 +126,7 @@ the first stage line. Captured **2026-08-06 on Perlmutter, job 56393848**,
 ==============================================================================
 ```
 
-!!! note "The block above was captured on the OLD image and is kept verbatim"
+!!! note "The debug block above was captured on the OLD image and is kept verbatim"
     It is a real run's output from `nvcr.io/nvidia/jax:25.04-py3` (jax 0.5.3),
     the Perlmutter GPU container until 2026-08-06. It is **not** edited to
     match today's stack, because a captured artifact that has been retouched

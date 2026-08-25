@@ -352,6 +352,34 @@ class TimingCollector:
 		_, rows = self._rows(kwargs.get("min_percent"), kwargs.get("max_depth"))
 		return rows
 
+	def records(self) -> list[dict[str, Any]]:
+		"""A stable, structured snapshot of the accumulated timing tree.
+
+		Human-facing drivers should not parse :meth:`format`'s aligned text in
+		order to build their own stage summary.  Each record keeps the node's
+		local name, full path, depth, count and inclusive/exclusive wall time.
+		The snapshot is read-only and preserves insertion order.
+		"""
+		out: list[dict[str, Any]] = []
+
+		def visit(node: TimingNode, parents: tuple[str, ...]) -> None:
+			path = parents + (node.name,)
+			out.append({
+				"name": node.name,
+				"path": path,
+				"depth": len(parents),
+				"count": int(node.count),
+				"inclusive": float(node.inclusive),
+				"exclusive": float(node.exclusive),
+			})
+			for child in node.children.values():
+				visit(child, path)
+
+		with self._lock:
+			for child in self._root.children.values():
+				visit(child, ())
+		return out
+
 
 _GLOBAL_COLLECTOR = TimingCollector()
 
@@ -375,6 +403,11 @@ def timed(name: str | None = None, *, watch: bool = False) -> Callable:
 
 def record(name: str, seconds: float, *, count: int = 1) -> None:
 	_GLOBAL_COLLECTOR.record(name, seconds, count=count)
+
+
+def records() -> list[dict[str, Any]]:
+	"""Structured snapshot of the global timing collector."""
+	return _GLOBAL_COLLECTOR.records()
 
 
 def process_elapsed_s() -> float | None:

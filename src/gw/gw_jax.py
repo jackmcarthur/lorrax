@@ -31,7 +31,9 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
-from runtime import initialize_communicator_stack, rank0_print
+from runtime import (
+	debug_print, debug_print_enabled, initialize_communicator_stack, rank0_print,
+)
 
 #: THE startup call.  One line brings up everything below the physics: the
 #: JAX env defaults, the fail-fast excepthook, the CPU-collectives
@@ -72,7 +74,8 @@ from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver, ScreeningDiagrams,
 	refuse_unimplemented_compute_mode)
 from .gw_init import (prepare_isdf_and_wavefunctions,
-                      check_band_sum_degeneracy, resolve_zeta_fit_edge)
+	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
+	                  zeta_fit_band_ranges)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from .screening import (
@@ -90,6 +93,7 @@ from .head_correction import (
 	format_static_head_diagnostics,
 )
 from .wavefunction_bundle import BandSlices
+from .production_report import GWProductionReport
 from .gw_output import (
 	GWResults,
 	print_banner,
@@ -210,10 +214,10 @@ def main(argv=None):
 	_pre_main = timing.process_elapsed_s()
 	timing.reset()
 
-	# The runtime owns rank-zero production output.  Exceptions and
-	# rank-local refusals still write directly; deterministic status and
-	# timing flow through this one callable.
-	print0 = rank0_print
+	# Configuration parsing predates the scientific report file.  Its deck
+	# echo is forensic detail, so it follows the driver's ONE debug switch;
+	# production output begins with GWProductionReport below.
+	print0 = debug_print
 
 	# ---- Configuration ----
 	# The two orthogonal physics axes are resolved + validated up front so
@@ -223,6 +227,13 @@ def main(argv=None):
 	input_dir = config.input_dir
 	qp_solver = config.qp_solver     # how QP energies are extracted from Σ
 	mode = config.compute_mode       # the self-energy ansatz
+	report = GWProductionReport(
+		config.paths.report_file, runtime=RUNTIME,
+		debug=debug_print_enabled(), stdout=rank0_print)
+	print0 = report.legacy_print
+	report.begin(input_file=args.input, config=config)
+	report.architecture()
+	report.method(config=config)
 	# A mode may be DECLARED on the axis before its Σ stage exists (today:
 	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
 	# any allocation is spent — is the difference between an operator
@@ -373,6 +384,13 @@ def main(argv=None):
 	enk_dft, _ = get_enk_bandrange(
 		wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
 		nspinor=meta.nspinor)
+	_zeta_ranges = zeta_fit_band_ranges(
+		band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
+	report.environment(config=config, wfn=wfn)
+	report.sampling(wfn=wfn, sym=sym)
+	report.bands(
+		config=config, wfn=wfn, band_slices=band_slices,
+		zeta_ranges=_zeta_ranges)
 
 	# Single resolver for every q→0 head sample we'll need this run; the
 	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
@@ -993,7 +1011,7 @@ def main(argv=None):
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,
 		)
-	timing.record("gw_jax.output", time.perf_counter() - _t_out)
+		timing.record("gw_jax.output", time.perf_counter() - _t_out)
 	if _pre_main is not None:
 		# DECOMPOSE the pre-main span; do not add rows to it.  The entry
 		# point timed its own phases (it happened before ``timing.reset()``,
@@ -1009,11 +1027,51 @@ def main(argv=None):
 				timing.record(f"gw_jax.runtime_stack.{_phase}", _secs)
 		timing.record("gw_jax.imports",
 		              max(_pre_main - _phases.get("total", 0.0), 0.0))
-	if meta.rank == 0:
+	_wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
+	if meta.rank == 0 and debug_print_enabled():
 		# ``wall=`` closes the table: printed rows + ``(untimed)`` == the
 		# whole PROCESS when /proc gave us the pre-main span, else main().
-		_wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
 		timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
+
+	report.sigma_coverage(
+		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
+		sigma_result=sigma_result)
+	report.qp_energies(
+		wfn=wfn, sym=sym, band_slices=band_slices,
+		e_dft_ry=enk_dft, e_qp_ry=E_full)
+	_file_rows = [
+		("input deck", "read", args.input),
+		("DFT wavefunctions", "read", config.paths.wfn_file),
+		("ISDF centroids", "read", config.paths.centroids_file),
+		("mean-field Hamiltonian", "read", config.paths.kin_ion_file),
+		("long-wave dipoles", "read" if os.path.exists(os.path.join(
+			input_dir, "dipole.h5")) else "absent",
+		 os.path.join(input_dir, "dipole.h5")),
+		("parallel transport", "read" if os.path.exists(
+			config.paths.parallel_transport_file) else "absent",
+		 config.paths.parallel_transport_file),
+		("ISDF restart tensors", "present" if os.path.exists(tensors_filename)
+		 else "absent", tensors_filename),
+		("self-energy table", "written" if os.path.exists(
+			config.paths.sigma_diag_file) else "absent",
+		 config.paths.sigma_diag_file),
+		("G0W0 energies", "written" if os.path.exists(config.paths.eqp0_file)
+		 else "absent", config.paths.eqp0_file),
+		("linearized energies", "written" if os.path.exists(
+			config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
+	]
+	if config.paths.centroids_file_current:
+		_file_rows.insert(3, (
+			"current centroids", "read", config.paths.centroids_file_current))
+	if sigma_omega_h5_path:
+		_file_rows.append((
+			"dynamic Sigma spectrum",
+			"written" if os.path.exists(sigma_omega_h5_path) else "absent",
+			sigma_omega_h5_path))
+	_file_rows.append(("calculation report", "written", report.path))
+	report.files(_file_rows)
+	report.timings(timing.records(), wall=_wall)
+	report.finish()
 
 	return 0
 

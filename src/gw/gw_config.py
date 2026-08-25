@@ -1175,6 +1175,10 @@ _DEFAULTS = {
     "sigma_diag_file": "sigma_diag.dat",
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
+    # Rank-zero, human-readable calculation report.  This is the clean
+    # application output; launcher placement and rank-binding diagnostics
+    # remain in the launcher's own log.
+    "report_file": "gwjax.out",
     "sigma_omega_h5_file": "sigma_mnk.h5",
     # Core flags
     "restart": True,
@@ -2857,6 +2861,7 @@ class FilePaths:
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
+    report_file: str
     sigma_omega_h5_file: str
 
 
@@ -4118,6 +4123,7 @@ class LorraxConfig:
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
+            report_file=str(_g("report_file")),
             sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
         )
         _head_correction = coerce_head_correction(_g("head_correction"))

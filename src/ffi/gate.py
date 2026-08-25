@@ -166,9 +166,11 @@ def rank0() -> bool:
     return r is None or r == 0
 
 
-def announce_once(key, msg: str, *, scope: str = "rank0") -> bool:
+def announce_once(key, msg: str, *, scope: str = "rank0",
+                  emit: bool = True) -> bool:
     """Print ``msg`` at most once per process for ``key``.  Returns whether
-    it printed.
+    it printed.  ``emit=False`` records the resolved receipt without printing
+    it, so production startup can probe once and keep later first use quiet.
 
     ``scope="rank0"``  the decision is rank-invariant; only rank 0 prints.
     ``scope="local"``  the decision is rank-LOCAL (env grammar, a failed
@@ -189,6 +191,12 @@ def announce_once(key, msg: str, *, scope: str = "rank0") -> bool:
     if key in _ANNOUNCED:
         return False
     _ANNOUNCED.add(key)
+    # Startup still resolves and probes every required backend in production,
+    # but its successful forensic receipt belongs behind the driver's one
+    # debug switch.  Burning the key here is load-bearing: a later kernel
+    # factory must not re-emit the receipt that startup intentionally hid.
+    if not emit:
+        return False
     r = rank_id()
     if scope == "rank0":
         if not (r is None or r == 0):
@@ -361,7 +369,8 @@ class Gate:
         """True when ``mesh``'s devices are a platform this dial exists on."""
         return mesh_ffi_platform(mesh) in self.platforms
 
-    def require(self, mesh, *, target: str | None = None) -> str:
+    def require(self, mesh, *, target: str | None = None,
+                announce: bool = True) -> str:
         """Announce-or-REFUSE: the FFI platform key, or ``RuntimeError``.
 
         Deliberately MODE-INDEPENDENT.  It answers exactly one question —
@@ -401,7 +410,7 @@ class Gate:
         msg = self.resolved_msg.get(plat)
         if msg:
             announce_once((self.env, "resolved", tgt, plat),
-                          msg.format(target=tgt), scope="rank0")
+                          msg.format(target=tgt), scope="rank0", emit=announce)
         return plat
 
     def resolve(self, mesh, *, target: str | None = None) -> str | None:
@@ -440,7 +449,7 @@ class Gate:
             return None
         return self.require(mesh, target=target)
 
-    def enforce(self, mesh) -> str | None:
+    def enforce(self, mesh, *, announce: bool = True) -> str | None:
         """The startup contract for a required layer or optional accelerator.
 
         Called once per gate by
@@ -505,13 +514,14 @@ class Gate:
                    (self.auto_off_msg or
                     f"[{self.env}] auto -> OFF ({self.off_label}): {{reason}}")
                    .format(reason=reason))
-            announce_once((self.env, "auto", str(got)), msg, scope="rank0")
+            announce_once((self.env, "auto", str(got)), msg, scope="rank0",
+                          emit=announce)
             return got
         if not self.platform_ok(mesh):
             if not self.silent_platform_demote:
                 announce_once(
                     (self.env, "mesh", "platform"),
                     self._demote_msg(mesh.devices.flat[0].platform),
-                    scope="rank0")
+                    scope="rank0", emit=announce)
             return None
-        return self.require(mesh)
+        return self.require(mesh, announce=announce)

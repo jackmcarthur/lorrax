@@ -22,14 +22,20 @@ from __future__ import annotations
 # floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
 # back this same startup mesh, not a second one.
 from runtime import (
+    debug_print,
     debug_print_enabled,
     initialize_communicator_stack,
-    rank0_print as print0,
+    rank0_print,
 )
 RUNTIME = initialize_communicator_stack()
 
+# Historical progress messages are forensic detail.  The one driver-wide
+# switch owns all of them; the concise production report uses rank0_print.
+print0 = debug_print
+
 import argparse
 import os
+import time
 
 import numpy as np
 
@@ -51,6 +57,11 @@ from .kmeans_isdf import (
     weighted_kmeans_jax,
     snap_centroids_to_grid,
     ensure_unique_centroids,
+)
+from .production_output import (
+    format_centroid_header,
+    format_kmeans_report,
+    prune_band_ranges,
 )
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
@@ -274,7 +285,8 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
 
 def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     """WHICH density weights the k-means — i.e. where the quadrature gets
-    points at all.  Returns ``(weight, label)``.
+    points at all.  Returns ``(weight, label, band_range)``; the last item is
+    carried unchanged into the centroid file's provenance header.
 
     WHY ``band_range`` EXISTS: the occupied-only ρ(r) is entirely inside
     the slab, so a ρ-weighted k-means places ZERO centroids in the vacuum
@@ -287,7 +299,7 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
         return charge_density, (
             "scalar charge density ρ(r)" if args.density_mode == "scalar"
             else "Gordon-decomposed Pauli current "
-                 "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²")
+                 "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²"), None
 
     if args.density_mode != "scalar":
         raise ValueError(
@@ -311,7 +323,8 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     return (rho_from_band_range(
                 wfn, (b_lo, b_hi), sym_ops=ops, dist_mesh=dist_mesh,
                 verbose=(debug_print_enabled() and process_rank() == 0)),
-            f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²")
+            f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²",
+            (b_lo, b_hi))
 
 
 def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
@@ -387,6 +400,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     max_band = n_val + n_cond
+    left_range, right_range, range_label = prune_band_ranges(
+        args, n_val, n_cond)
     kwargs: dict = dict(
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
         orbit_id=orbit_id,
@@ -394,20 +409,16 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         verbose=(debug_print_enabled() and process_rank() == 0),
     )
     if args.prune_window == "v_x_vc":
-        kwargs["band_range_left"] = (0, n_val)
-        kwargs["band_range_right"] = (0, max_band)
-        print0(f"  prune window: v×(v+c)  left=(0,{n_val}) "
-               f"right=(0,{max_band})  [covers |ψ_v|² + v×c]")
+        kwargs["band_range_left"] = left_range
+        kwargs["band_range_right"] = right_range
     elif args.prune_window == "vc_x_vc":
-        kwargs["band_range_left"] = (0, max_band)
-        kwargs["band_range_right"] = (0, max_band)
-        print0(f"  prune window: (v+c)×(v+c)  left=right=(0,{max_band})"
-               f"  [full σ-window square Gram, covers |ψ_c|² too]")
+        kwargs["band_range_left"] = left_range
+        kwargs["band_range_right"] = right_range
     else:
         kwargs["n_val"] = n_val
         kwargs["n_cond"] = n_cond
-        print0(f"  prune window: v×c  left=(0,{n_val}) "
-               f"right=({n_val},{max_band})  [legacy]")
+    print0(f"  prune window: left={left_range} right={right_range} "
+           f"[{range_label}]")
 
     with timing.section("prune"):
         keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
@@ -434,6 +445,7 @@ def main():
     print0(f"✓ JAX initialized: {dist.device_summary()}")
 
     timing.reset()
+    selection_start = time.perf_counter()
 
     N_c = int(args.N_c)
     oversample = float(args.oversample)
@@ -507,7 +519,7 @@ def main():
         if args.centroid_weight is None:      # scalar defaults to band_range
             args.centroid_weight = ("band_range" if args.density_mode == "scalar"
                                     else "charge_density")
-        weight, weight_label = _resolve_weight(
+        weight, weight_label, weight_band_range = _resolve_weight(
             args, wfn, charge_density, Rinv, tau, dist_mesh=mesh)
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
@@ -558,12 +570,16 @@ def main():
             _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
                              Rinv, tau, n_sym, M_cand)
 
+    pruned = False
+    prune_rank = None
     if oversample > 1.0 and n_unique > N_c:
         (centroid_indices, n_unique, rank, n_orbit_keep,
          _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
         centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
+        pruned = True
+        prune_rank = int(rank)
 
         # --- HARD REFUSAL: the achieved rank must meet the request ----------
         # (size campaign 2026-07-29, ladder notes R12.4; owner-approved.)
@@ -651,13 +667,32 @@ def main():
                   if args.out_suffix is not None
                   else ("" if args.density_mode == "scalar" else "_current"))
     out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
-    header = (
-        f"x y z (snapped to FFT grid {fft_grid}, {n_unique} unique)\n"
-        f"density: {args.density_mode}  centroid-weight: {args.centroid_weight}\n"
-        f"weight: {weight_label}\n"
-        f"intended channels: "
-        f"{'γ̃^0 (charge) ISDF' if args.density_mode == 'scalar' else 'γ̃^{1,2,3} (current) ISDF'}"
-    )
+    n_val_header, n_cond_header = _resolve_sigma_window(args, wfn)
+    prune_left, prune_right, prune_label = prune_band_ranges(
+        args, n_val_header, n_cond_header)
+    if weight_band_range is not None:
+        density_fit = (
+            f"bands {weight_band_range[0] + 1}-{weight_band_range[1]} "
+            f"(indices [{weight_band_range[0]},{weight_band_range[1]})): "
+            f"sum_n sum_k w_k |psi_nk(r)|^2")
+    else:
+        density_fit = (
+            f"ground-state {args.density_mode} density; occupied-band "
+            f"boundary {int(wfn.nelec)}")
+    kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
+    shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
+    prune_state = "pivoted Cholesky" if pruned else "not applied"
+    header = format_centroid_header(
+        density_fit=density_fit, source_wfn="WFN.h5",
+        weight_label=weight_label,
+        num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
+        occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,
+        kgrid=kgrid, shift=shift, seed=args.seed, rho_power=args.rho_power,
+        requested=N_c, candidates=M_cand, written=n_unique,
+        pruning=prune_state, prune_rank=prune_rank,
+        prune_left=prune_left, prune_right=prune_right,
+        prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
+        density_mode=args.density_mode)
     # ONE writer.  Every rank used to reach this savetxt on the same shared
     # path.  It survived P=16 only because all ranks write identical bytes —
     # which is precisely the latent form of the bug that DID bite at P=64 in
@@ -674,8 +709,20 @@ def main():
         )
         print0(f"Saved centroids to {out_file}")
 
-    if process_rank() == 0:
+    if process_rank() == 0 and debug_print_enabled():
         timing.report(title="--- kmeans_cli timing (s) ---")
+
+    if process_rank() == 0:
+        report_file = "kmeans.out"
+        report_text = format_kmeans_report(
+            header=header, source_wfn="WFN.h5", centroid_file=out_file,
+            report_file=report_file,
+            wfn_backend=str(getattr(wfn, "backend", "unknown")),
+            elapsed_s=time.perf_counter() - selection_start,
+            runtime=RUNTIME)
+        with open(report_file, "w", encoding="utf-8") as stream:
+            stream.write(report_text)
+        rank0_print(report_text, end="")
 
     if args.plot:
         from .kmeans_plot import plot_density_and_centroids, interpolate_density

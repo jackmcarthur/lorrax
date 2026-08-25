@@ -157,6 +157,7 @@ __all__ = [
     "RuntimeStack",
     "collect_startup_facts",
     "format_startup_report",
+    "format_production_startup_report",
     "bootstrap",
     "set_default_env",
     "announce_cpu_collectives",
@@ -1453,7 +1454,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     from common.collectives import prepare_mesh
     mesh = prepare_mesh(axis_names=tuple(axis_names), print_fn=say)
     # -- 6b -----------------------------------------------------------------
-    _enforce_required_ffi(mesh)
+    _enforce_required_ffi(mesh, announce=debug_print_enabled())
     _t_mesh = time.perf_counter()
     # -- 7 ------------------------------------------------------------------
     cache_error = None
@@ -1488,7 +1489,12 @@ def initialize_communicator_stack(*, platform: str = "gpu",
         "measurement": time.perf_counter() - _t_cache,
         "total": time.perf_counter() - _t0,
     }
-    report = format_startup_report(facts)
+    # Keep the exhaustive prose as the forensic rendering, but do not put it
+    # in a production quantum-chemistry output.  The compact preamble states
+    # the hardware once; each driver then writes its method-specific
+    # numerical-pathway table from the same ``facts`` record.
+    report = (format_startup_report(facts) if debug_print_enabled()
+              else format_production_startup_report(facts))
     import jax
     _STACK = RuntimeStack(
         mesh=mesh,
@@ -1827,7 +1833,7 @@ def _enforce_cpu_mpi_thread_multiple(say) -> None:
         f"({provided.value}), queried through {wrapper}.")
 
 
-def _enforce_required_ffi(mesh) -> None:
+def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     """Startup enforcement of the REQUIRED FFI layer (decisions.md
     2026-08-01) — step 6b of :func:`initialize_communicator_stack`.
 
@@ -1849,20 +1855,21 @@ def _enforce_required_ffi(mesh) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, FUSED_GATE,
-                         GATE as _FFT_GATE)
+    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, CONV_KPAIR_GATE,
+                         FUSED_GATE, GATE as _FFT_GATE)
     from ffi.gemm import GATE as _GEMM_GATE
 
     for gate in (_FFT_GATE, FUSED_GATE, _GEMM_GATE):
-        gate.enforce(mesh)
+        gate.enforce(mesh, announce=announce)
     # The CONV_K* dials are ACCELERATOR gates, so enforce() reports their
     # platform/handler capability at startup while each caller resolves the
     # runtime shape through its plan helper.  `auto` never raises; `on`
     # refuses missing platform/handler capability by name; `off` announces
     # the explicit opt-out.  The k-leading member defaults off and has no
     # production consumer until its separately-reviewed Sigma seam lands.
-    CONV_KMINOR_GATE.enforce(mesh)
-    CONV_KLEAD_GATE.enforce(mesh)
+    CONV_KMINOR_GATE.enforce(mesh, announce=announce)
+    CONV_KLEAD_GATE.enforce(mesh, announce=announce)
+    CONV_KPAIR_GATE.enforce(mesh, announce=announce)
 
 
 def _ffi_dial_facts() -> list:
@@ -1881,7 +1888,7 @@ def _ffi_dial_facts() -> list:
     try:
         from ffi.gemm import GATE as _GEMM_GATE
         from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
-                             GATE as _FFT_GATE, FUSED_GATE)
+                             CONV_KPAIR_GATE, GATE as _FFT_GATE, FUSED_GATE)
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
@@ -1895,7 +1902,10 @@ def _ffi_dial_facts() -> list:
                         "ladder-W rung; accelerator)"),
                        (CONV_KLEAD_GATE,
                         "the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT "
-                        "conv (Sigma; accelerator, default off)")):
+                        "conv (Sigma; accelerator, default off)"),
+                       (CONV_KPAIR_GATE,
+                        "the fused post-pair convolution used to form the "
+                        "ISDF Coulomb operator")):
         try:
             mode = gate.mode()
             enabled = gate.enabled()
@@ -2453,3 +2463,49 @@ def format_startup_report(f: dict) -> list:
             "describing an environment LORRAX did not configure.")
     L.append(_RULE)
     return L
+
+
+def format_production_startup_report(f: dict) -> list:
+    """Compact rank-zero runtime preamble for scientific output.
+
+    The exhaustive :func:`format_startup_report` remains the forensic record
+    behind ``LORRAX_DEBUG_PRINT``.  Production stdout needs only enough
+    information to establish the parallel architecture before a driver writes
+    its method-specific report.  In particular, capability inventories,
+    allocator explanations, FFI provenance and unavailable backends do not
+    belong in the main quantum-chemistry output.
+
+    This formatter is deliberately pure, like its exhaustive sibling.  A
+    method-specific reporter may reuse the underlying ``RuntimeStack.facts``
+    to give the same facts a denser table without parsing these lines.
+    """
+    p = int(f.get("process_count", 1))
+    ndev = int(f.get("n_devices", 0))
+    nlocal = int(f.get("n_local_devices", 0))
+    gx, gy = (list(f.get("mesh_shape", (1, 1))) + [1, 1])[:2]
+    backend = str(f.get("backend", "unknown")).upper()
+    kind = str(f.get("device_kind", "unknown"))
+    threads = f.get("threads") or {}
+    affinity = threads.get("affinity")
+    affinity_text = (
+        f"{int(affinity)} CPU cores/rank" if affinity is not None
+        else "CPU affinity unavailable")
+    x64 = "FP64/complex128" if f.get("x64") else "FP32/complex64"
+    collective = "NCCL" if backend in ("GPU", "CUDA", "ROCM") and p > 1 \
+        else str((f.get("collectives") or {}).get("impl") or "local").upper()
+    elapsed = (f.get("elapsed") or {}).get("total")
+
+    lines = [
+        (f"LORRAX runtime | {p} MPI rank{'s' if p != 1 else ''} | "
+         f"{ndev} {backend} device{'s' if ndev != 1 else ''} | "
+         f"mesh {int(gx)}x{int(gy)}"),
+        (f"Hardware       | {kind} | {nlocal} device"
+         f"{'s' if nlocal != 1 else ''}/rank | {affinity_text}"),
+        (f"Environment    | JAX {f.get('jax_version', 'unknown')} | "
+         f"{collective} collectives | {x64}"),
+    ]
+    if elapsed is not None:
+        lines.append(f"Runtime startup | {float(elapsed):.1f} s")
+    for demotion in f.get("demotions", ()):
+        lines.append(f"WARNING         | {demotion}")
+    return lines

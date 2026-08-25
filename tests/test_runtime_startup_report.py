@@ -62,6 +62,24 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "src")
 
 
+def test_quiet_startup_receipt_stays_quiet_at_later_first_use(capsys):
+    """A production startup probes a backend once without leaking its prose.
+
+    The suppressed receipt must still consume its deduplication key; otherwise
+    the first physics kernel prints the long handler message mid-calculation.
+    """
+    from ffi.gate import announce_once, reset_gate_state
+
+    reset_gate_state()
+    try:
+        assert not announce_once("quiet-production-receipt", "forensic detail",
+                                 emit=False)
+        assert not announce_once("quiet-production-receipt", "forensic detail")
+        assert capsys.readouterr().out == ""
+    finally:
+        reset_gate_state()
+
+
 @pytest.mark.parametrize("relative", [
     "centroid/kmeans_cli.py",
     "psp/get_dipole_mtxels.py",
@@ -274,6 +292,14 @@ def _facts(**over):
              "off_label": "the certified plan-based k-leading gw_conv handler",
              "auto_capability": "CUDA mesh, handler present, row resident",
              "detail": "the direct fused k-LEADING Sigma conv"},
+            {"env": "LORRAX_CONV_KPAIR_FFI", "mode": "auto",
+             "enabled": True, "default": "auto",
+             "target": "lorrax_cufft_conv_kpair",
+             "platforms": ("CUDA",), "raw": None,
+             "off_policy": "fallback",
+             "off_label": "the XLA post-pair convolution",
+             "auto_capability": "CUDA mesh and handler present",
+             "detail": "the fused post-pair ISDF Coulomb convolution"},
         ],
         "linalg": {"eigh": ["native", "scalapack"], "cholesky": ["native"],
                    "solve_lu": ["native", "scalapack"]},
@@ -312,6 +338,18 @@ def _is_sentence(line):
 
 def _text(f):
     return "\n".join(runtime.format_startup_report(f))
+
+
+def test_production_startup_is_compact_and_has_no_library_inventory():
+    text = "\n".join(runtime.format_production_startup_report(_facts()))
+    assert "16 MPI ranks" in text
+    assert "16 CPU devices" in text
+    assert "mesh 4x4" in text
+    assert "28 CPU cores/rank" in text
+    assert "FFI" not in text
+    assert "HDF5" not in text
+    assert "allocator" not in text.lower()
+    assert len(text.splitlines()) == 4
 
 
 # ---------------------------------------------------------------------------
