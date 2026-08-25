@@ -26,6 +26,7 @@ from common import jax_profile
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
 from runtime import debug_print_enabled
+from file_io.isdf_header import centroid_table_md5 as _centroid_table_md5
 
 # Canonical env grammar for this layer.  ``gw_config`` is deliberately
 # jax-free, so importing it here adds nothing to the import graph that
@@ -739,26 +740,6 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			         f"n_mu={int(n_rmu_expected)} — refitting.")
 			return False
 	return True
-
-
-def _centroid_table_md5(centroid_fft_idx) -> str:
-	"""Canonical content hash of a centroid fft-index table: int64,
-	C-order bytes → md5 hexdigest.
-
-	Stamped on the restart tensors file at write and verified at restart
-	load, so a restart proves the σ quadrature BASIS — not just its size —
-	matches this run's centroid file(s).  A regenerated centroid file with
-	the SAME count but different points (kmeans reruns plausibly produce
-	this) used to pass the count-only guard and evaluate Σ with ψ sampled
-	at the wrong r_μ — silently wrong physics (pattern #10).  The sibling
-	ζ-reuse cache compares its centroid table element-wise
-	(:func:`_zeta_reuse_ok`); this is the same check compressed to an HDF5
-	attr.  (audit fix/zq 2026-07-28)
-	"""
-	import hashlib
-	arr = np.ascontiguousarray(
-		np.asarray(jax.device_get(centroid_fft_idx), dtype=np.int64))
-	return hashlib.md5(arr.tobytes()).hexdigest()
 
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
@@ -2607,7 +2588,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 def build_wavefunction_bundle(
 	wfn, sym, meta, band_slices, mesh_xy,
-	*, psi_rmu_Y, psi_rmuT_X, enk_full=None, print_fn=print,
+	*, psi_rmu_Y, psi_rmuT_X, basis_receipt, enk_full=None,
+	print_fn=print,
 ):
 	"""Build 4-copy Wavefunctions bundle from the two centroid-sampled
 	arrays produced by ``load_centroids_band_chunked``.
@@ -2622,7 +2604,8 @@ def build_wavefunction_bundle(
 
 	wfns = build_wavefunctions(
 		psi_rmu_Y, psi_rmuT_X,
-		enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy)
+		enk_full=enk_full, slices=band_slices, mesh_xy=mesh_xy,
+		basis_receipt=basis_receipt)
 
 	print_fn(f"  Wavefunctions built (b0:b4={band_slices.nb_full} bands, "
 	         f"4 sharded copies: xn/xr/yr/yn)")
@@ -2665,8 +2648,20 @@ def prepare_isdf_and_wavefunctions(
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
+	from file_io.isdf_header import WavefunctionBasisReceipt
+	# The receipt's band interval is PHYSICAL, not the mesh-padded carrier
+	# edge.  ``b_id_4_user`` is the exact loaded WFN boundary; ``b4`` may be
+	# rounded past WFN.nbands and names allocation only.
+	_basis_band_interval = (
+		int(band_slices.b0), int(meta.b_id_4_user))
+	charge_basis_receipt = None
 
 	if not cfg.restart:
+		charge_basis_receipt = WavefunctionBasisReceipt.from_source(
+			wfn=wfn, role='charge', band_interval=_basis_band_interval,
+			fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
+			n_rmu_logical=int(meta.n_rmu),
+			n_rmu_padded=int(meta.n_rmu_padded))
 		from common.wfn_transforms import get_enk_bandrange
 
 		with mesh_xy:
@@ -2755,6 +2750,18 @@ def prepare_isdf_and_wavefunctions(
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0,
 				psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh,
 				zeta_contract=zeta_contract)
+			transverse_basis_receipt = None
+			if transverse_wfn_data is not None:
+				_meta_receipt_T = transverse_wfn_data['meta']
+				transverse_basis_receipt = (
+					WavefunctionBasisReceipt.from_source(
+						wfn=wfn, role='transverse',
+						band_interval=_basis_band_interval,
+						fft_grid=_meta_receipt_T.fft_grid,
+						centroid_fft_idx=(
+							transverse_wfn_data['centroid_indices']),
+						n_rmu_logical=int(_meta_receipt_T.n_rmu),
+						n_rmu_padded=int(_meta_receipt_T.n_rmu_padded)))
 			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
 			# the pipeline right after ζ-fit, before the expensive V_q
 			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_DEBUG_PRINT=1
@@ -2817,7 +2824,8 @@ def prepare_isdf_and_wavefunctions(
 				with timing.section("gw_jax.wavefunction_setup"):
 					wfns = wavefunctions_face_from_restart(
 						psi_nmu_fresh, psi_mun_fresh, enk_full=_enk_full_face,
-						slices=band_slices, mesh_xy=mesh_xy)
+						slices=band_slices, mesh_xy=mesh_xy,
+						basis_receipt=charge_basis_receipt)
 				print0(f"  Wavefunctions built (b0:b4={band_slices.nb_full} "
 				       f"bands, face layout: psi_nmu/psi_mun; "
 				       f"low_mem_bands=true) — V_q's baseline is the "
@@ -2845,7 +2853,8 @@ def prepare_isdf_and_wavefunctions(
 							transverse_wfn_data['psi_nmu_fresh'],
 							transverse_wfn_data['psi_mun_fresh'],
 							enk_full=_enk_full_face,
-							slices=band_slices, mesh_xy=mesh_xy)
+							slices=band_slices, mesh_xy=mesh_xy,
+							basis_receipt=transverse_basis_receipt)
 					print0(f"  [bispinor] σ^B-side Wfns built on "
 					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
 					       f"transverse centroids (face layout; "
@@ -2945,6 +2954,7 @@ def prepare_isdf_and_wavefunctions(
 					wfns = build_wavefunction_bundle(
 						wfn, sym, meta, band_slices, mesh_xy,
 						psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+						basis_receipt=charge_basis_receipt,
 						enk_full=enk_full, print_fn=print0)
 
 					# Bispinor: build a second Wfns bundle on the
@@ -2958,6 +2968,7 @@ def prepare_isdf_and_wavefunctions(
 							band_slices, mesh_xy,
 							psi_rmu_Y=transverse_wfn_data['psi_rmu_Y'],
 							psi_rmuT_X=transverse_wfn_data['psi_rmuT_X'],
+							basis_receipt=transverse_basis_receipt,
 							enk_full=enk_full, print_fn=print0)
 						print0(f"  [bispinor] σ^B-side Wfns built on "
 						       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
@@ -3066,7 +3077,10 @@ def prepare_isdf_and_wavefunctions(
 		# branch.  The entry resolver above is a centralized compatibility
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
-		from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+		from file_io.qp_wfn import (
+			read_qp_state_source_provenance,
+			refuse_conflicting_qp_state_sources,
+		)
 		_qp_state_wfn = getattr(wfn, 'path', None)
 		if not _qp_state_wfn:
 			raise ValueError(
@@ -3076,6 +3090,11 @@ def prepare_isdf_and_wavefunctions(
 			wfn_path=_qp_state_wfn,
 			state_artifact_path=tensors_filename,
 			where="gw_jax restart")
+		# The owner above authenticates a present record.  Absence remains
+		# usable by legacy GW paths, but cannot support a new immutable basis
+		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
+		_restart_wfn_provenance_complete = (
+			read_qp_state_source_provenance(tensors_filename) is not None)
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
@@ -3140,7 +3159,9 @@ def prepare_isdf_and_wavefunctions(
 					f"run's centroids_file; only counts and band windows "
 					f"are checked.  If the centroid file may have been "
 					f"regenerated since these tensors were written, rerun "
-					f"with restart = false. ***")
+					f"with restart = false.  This legacy bundle carries NO "
+					f"WavefunctionBasisReceipt, so authenticated endpoint "
+					f"consumers will refuse. ***")
 			elif _have_c != _centroid_table_md5(centroid_indices):
 				raise ValueError(
 					f"restart: {tensors_filename} was written for a "
@@ -3150,6 +3171,23 @@ def prepare_isdf_and_wavefunctions(
 					f"different points ⇒ ψ/V_q sampled at the wrong r_μ "
 					f"(silently wrong physics).  Set restart = false, or "
 					f"restore the original centroid file.")
+			elif not _restart_wfn_provenance_complete:
+				print0(
+					f"  *** LORRAX SANITY: {tensors_filename} carries a "
+					f"matching charge centroid stamp but no canonical "
+					f"qp_state_source_provenance record.  Legacy restart "
+					f"consumers remain available, but this bundle carries NO "
+					f"WavefunctionBasisReceipt because its stored psi/E source "
+					f"cannot be authenticated; finite-transfer current "
+					f"construction will refuse. ***")
+			else:
+				charge_basis_receipt = WavefunctionBasisReceipt.from_source(
+					wfn=wfn, role='charge',
+					band_interval=_basis_band_interval,
+					fft_grid=meta.fft_grid,
+					centroid_fft_idx=centroid_indices,
+					n_rmu_logical=int(meta.n_rmu),
+					n_rmu_padded=int(meta.n_rmu_padded))
 			if cfg.memory.low_mem_bands:
 				# Both faces were already read at their OWN specs
 				# (P(None,'x',None,'y') / P(None,None,'x','y')) directly
@@ -3159,13 +3197,15 @@ def prepare_isdf_and_wavefunctions(
 				from .wavefunction_bundle import wavefunctions_face_from_restart
 				wfns = wavefunctions_face_from_restart(
 					rs.psi_nmu, rs.psi_mun, enk_full=rs.enk_full,
-					slices=band_slices, mesh_xy=mesh_xy)
+					slices=band_slices, mesh_xy=mesh_xy,
+					basis_receipt=charge_basis_receipt)
 				print0(f"  Wavefunctions loaded from restart (face layout: "
 				       f"psi_nmu/psi_mun; low_mem_bands=true)")
 			else:
 				wfns = build_wavefunction_bundle(
 					wfn, sym, meta, band_slices, mesh_xy,
 					psi_rmu_Y=rs.psi_rmu_Y, psi_rmuT_X=rs.psi_rmuT_X,
+					basis_receipt=charge_basis_receipt,
 					enk_full=rs.enk_full, print_fn=print0)
 			if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
 				zeta_path = os.path.join(tmp_dir, "zeta_q.h5")
@@ -3238,6 +3278,7 @@ def prepare_isdf_and_wavefunctions(
 				# Content check — same count does NOT mean same points
 				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
 				_have_t = _stamped.get('centroids_transverse_md5')
+				transverse_basis_receipt = None
 				if _have_t is None:
 					print0(
 						f"  *** LORRAX SANITY: {tensors_filename} carries "
@@ -3249,7 +3290,8 @@ def prepare_isdf_and_wavefunctions(
 						f"A regenerated centroids_file_current with the "
 						f"same count would be consumed SILENTLY (Σ^B at "
 						f"the wrong r_μ).  If in doubt, rerun with "
-						f"restart = false. ***")
+						f"restart = false.  This legacy transverse bundle "
+						f"carries NO WavefunctionBasisReceipt. ***")
 				elif _have_t != _centroid_table_md5(_cent_T_idx_now):
 					raise ValueError(
 						f"bispinor restart: {tensors_filename} was "
@@ -3262,6 +3304,26 @@ def prepare_isdf_and_wavefunctions(
 						f"(silently wrong physics).  Set restart = false, "
 						f"or restore the original transverse centroid "
 						f"file.")
+				elif not _restart_wfn_provenance_complete:
+					print0(
+						f"  *** LORRAX SANITY: {tensors_filename} carries a "
+						f"matching transverse centroid stamp but no canonical "
+						f"qp_state_source_provenance record.  The transverse "
+						f"bundle carries NO WavefunctionBasisReceipt; "
+						f"finite-transfer current construction will refuse. ***")
+				else:
+					_n_rmu_T_padded = (
+						int(rs.psi_nmu_transverse.shape[-1])
+						if cfg.memory.low_mem_bands else
+						int(rs.psi_rmu_Y_transverse.shape[-1]))
+					transverse_basis_receipt = (
+						WavefunctionBasisReceipt.from_source(
+							wfn=wfn, role='transverse',
+							band_interval=_basis_band_interval,
+							fft_grid=meta.fft_grid,
+							centroid_fft_idx=_cent_T_idx_now,
+							n_rmu_logical=int(_n_rmu_curr_now),
+							n_rmu_padded=_n_rmu_T_padded))
 				if cfg.memory.low_mem_bands:
 					from .wavefunction_bundle import (
 						wavefunctions_face_from_restart)
@@ -3271,7 +3333,8 @@ def prepare_isdf_and_wavefunctions(
 					wfns_transverse = wavefunctions_face_from_restart(
 						rs.psi_nmu_transverse, rs.psi_mun_transverse,
 						enk_full=rs.enk_full, slices=band_slices,
-						mesh_xy=mesh_xy)
+						mesh_xy=mesh_xy,
+						basis_receipt=transverse_basis_receipt)
 				else:
 					sanity.check_finite(
 						"restart transverse ψ (psi_full_y_transverse)",
@@ -3280,6 +3343,7 @@ def prepare_isdf_and_wavefunctions(
 						wfn, sym, meta, band_slices, mesh_xy,
 						psi_rmu_Y=rs.psi_rmu_Y_transverse,
 						psi_rmuT_X=rs.psi_rmuT_X_transverse,
+						basis_receipt=transverse_basis_receipt,
 						enk_full=rs.enk_full, print_fn=print0)
 				print0(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
 				       f"(layout="

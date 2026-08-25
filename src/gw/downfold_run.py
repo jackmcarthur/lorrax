@@ -69,6 +69,7 @@ from file_io import (
     write_head_scalars_to_h5,
     write_restart_state_to_h5,
 )
+from file_io.isdf_header import centroid_table_md5 as _centroid_table_md5
 from gw.downfold import (
     BandWindow,
     R19_ANCHOR,
@@ -1577,9 +1578,8 @@ def _frac_to_fft_idx(rows, fft_grid):
     ``file_io.centroids.load_centroids``'s arithmetic, restated on host numpy
     so this module can reproduce the index table a consumer will derive from a
     coordinate file — including its wrap of an index that rounds up ONTO the
-    grid extent.  Restated rather than imported for the same reason
-    :func:`_centroid_table_md5` is: what has to agree is the FORMULA, and
-    spelling it here is what makes a disagreement visible in review.
+    grid extent.  The resulting table is stamped by the canonical
+    :func:`file_io.isdf_header.centroid_table_md5` owner.
     """
     fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
     idx = np.rint(np.asarray(rows, dtype=np.float64)[:, :3]
@@ -1587,28 +1587,6 @@ def _frac_to_fft_idx(rows, fft_grid):
     for a in range(3):
         idx[idx[:, a] == fg[a], a] = 0
     return idx
-
-
-def _centroid_table_md5(fft_idx) -> str:
-    """The parent bundle's ``centroids_charge_md5``, recomputed.
-
-    ONE-LINE COPY OF ``gw_init._centroid_table_md5`` AND THAT IS DELIBERATE
-    — but it is a copy of the FORMULA, not of a number: int64, C-order
-    bytes, md5.  It is restated here rather than imported because
-    ``gw.gw_init`` is the GW driver's setup module and pulls the whole
-    fitting stack in behind it, and because this file needs the hash for the
-    opposite purpose: gw_init STAMPS it, this VERIFIES it.
-
-    The thing worth writing down is what the hash is OF.  It is not the
-    content of ``centroids_frac_*.txt``: that file holds FRACTIONAL
-    coordinates and the stamp hashes the FFT-GRID INDICES they round to.
-    Comparing a text file's own md5 against the stamp therefore never
-    matches, which is a mistake this function exists to make unavailable.
-    """
-    import hashlib
-    arr = np.ascontiguousarray(np.asarray(fft_idx, dtype=np.int64))
-    return hashlib.md5(arr.tobytes()).hexdigest()
-
 
 def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
                              print_fn=print) -> tuple:
