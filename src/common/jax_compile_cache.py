@@ -28,13 +28,13 @@ Knobs (all optional):
                                           naive shared-dir design.  This is
                                           the deadlock reproducer; never use
                                           it in production.
-  ``LORRAX_JAX_CACHE_EXPLAIN=1``        — turn on ``jax_explain_cache_misses``.
+  ``LORRAX_DEBUG_PRINT=1``              — also turn on JAX cache-miss logging.
   ``LORRAX_JAX_CACHE_KEYDUMP=<dir>``    — every rank writes the SET of
                                           persistent-cache keys it asked
                                           about to ``<dir>/rank{i}_of{N}.json``
                                           at exit.  This is what makes the
                                           key-symmetry invariant falsifiable:
-                                          ``LORRAX_JAX_CACHE_EXPLAIN`` names
+                                          JAX cache-miss logging names
                                           only the keys that MISSED, so on a
                                           healthy warm run it prints nothing
                                           and two ranks asking about
@@ -1423,7 +1423,8 @@ def ensure_jax_compile_cache() -> None:
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
             # desynchronises AutotunerPass' modulo-P work split.
             _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
-        if _truthy("LORRAX_JAX_CACHE_EXPLAIN"):
+        from runtime import debug_print_enabled
+        if debug_print_enabled():
             _jax.config.update("jax_explain_cache_misses", True)
     except Exception as exc:
         if proc_idx == 0:

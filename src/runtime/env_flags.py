@@ -86,7 +86,7 @@ def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
     Parameters
     ----------
     name
-        Environment variable, e.g. ``"LORRAX_MEM_DEBUG"``.
+        Environment variable, e.g. ``"LORRAX_DEBUG_PRINT"``.
     default
         Value when the variable is unset or blank.  This is the knob's
         DOCUMENTED default, not a guess — ``docs/dev/env_vars.md`` is the

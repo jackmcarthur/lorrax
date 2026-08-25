@@ -235,20 +235,20 @@ layout and is what class 2 measures.
 |---|---|---|
 | `LORRAX_FFT_FFI_THREADS` | `fft_flat_k_ffi.cc::team_threads` | OpenMP team size for the chunk loop |
 | `LORRAX_FFT_FFI_CHUNK` | `fft_flat_k_ffi.cc::chunk_elems` | compact-chunk staging size (the L2 lever, 2.8×) |
-| `LORRAX_FFT_FFI_LOG` | `fft_flat_k_ffi.cc::log_enabled`, `fft_flat_k_cuda_ffi.cc::log_enabled` | descriptor/plan/arena/first-call diagnostics, ONE spelling on both platforms |
+| `LORRAX_DEBUG_PRINT` | `fft_flat_k_ffi.cc::log_enabled`, `fft_flat_k_cuda_ffi.cc::log_enabled` | descriptor/plan/arena/first-call diagnostics through the one driver debug stream |
 
-`LORRAX_MKLFFT_{THREADS,CHUNK,LOG}` and `LORRAX_CUFFT_LOG` are deprecated
-aliases, honored with a one-time announcement (`mklpin::knob_value`).
+`LORRAX_MKLFFT_{THREADS,CHUNK}` remain deprecated tuning aliases, honored
+with a one-time announcement (`mklpin::knob_value`). The former backend-log
+aliases are retired; native verbosity has one owner.
 
 > **SUPERSEDED 2026-07-31** — two claims that stood here are closed:
 > *(a)* "none of these is documented in `docs/dev/env_vars.md`" — rows now
-> exist there (§2b for THREADS/CHUNK, §3b for LOG), under the current
-> `LORRAX_FFT_FFI_*` spellings with the alias policy stated;
+> exist there (§2b for THREADS/CHUNK, §3a for driver debug), under the current
+> shared spellings with the alias policy stated;
 > *(b)* "the C++ log output is NOT rank-guarded" — both handlers are
-> rank-scoped since the 2026-07-30 audit (rank 0 by default, `=all` for
-> every rank), via the shared MPI-free header `cpp/common/mkl_thread_pin.h`
-> (`announce_here` / `log_value_here`) that `vendor_gemm_service.md` §5
-> proposed and that now exists.  Pre-audit, `LORRAX_MKLFFT_LOG` printed
+> rank-scoped via the shared MPI-free header
+> `cpp/common/mkl_thread_pin.h` (`announce_here` / `debug_print_here`).
+> Pre-audit, the backend-local log control printed
 > once per thread per descriptor geometry per rank (kept as the reason the
 > default is rank 0).
 

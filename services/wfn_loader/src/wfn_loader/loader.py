@@ -360,12 +360,15 @@ class WfnLoader:
     _BACKEND_ANNOUNCED: set = set()
 
     def _announce_backend(self, backend: str) -> None:
-        """Print the auto-picked read backend once per (backend, world).
+        """Debug-print the auto-picked backend once per (backend, world).
 
         Rank-0 only, once per distinct decision — so a driver that opens
         several loaders does not spam, but a run whose read path changed
         because an ``.so`` appeared on ``LD_LIBRARY_PATH`` says so.
         """
+        from runtime import debug_print_enabled
+        if not debug_print_enabled():
+            return
         try:
             world = int(jax.process_count())
             if int(jax.process_index()) != 0:

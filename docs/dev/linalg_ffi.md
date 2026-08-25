@@ -352,7 +352,7 @@ loudest available failure: job 7876062 died at P=144 inside the unchunked
 control on the same 144 ranks was issuing 104 MB collectives. Setting the
 knob to `0` restores the single-shot behaviour (for reproducing that failure
 only); below the cap it is a no-op, so at fixture scale the emitted HLO is
-unchanged. `LORRAX_COLLECTIVE_CHUNK_LOG=0` silences the per-site line.
+unchanged. The per-site payload line is a mandatory production receipt.
 
 * `--eigh-backend` (htransform, exciton_bands CLIs) **overrides** the
   `eigh_backend` key; unset, the key (default `auto`) applies.
@@ -652,7 +652,7 @@ you to edit (`src/ffi/<name>/`, `ffi/linalg/resolve.py`,
   minimum with `INFO = -16`**. `eigh_ffi.cc` therefore treats a failed
   query as fatal and uses `max(query, reference formula)`. The workspace
   is `malloc`'d inside the handler, so it is invisible to the JAX memory
-  planner — `LORRAX_SCALAPACK_EIGH_LOG=1` prints it per call (measured
+  planner — `LORRAX_DEBUG_PRINT=1` prints it per call (measured
   11 MB WORK + 6 MB RWORK at n=2016 on a 4×4 grid; it grows as the grid
   shrinks). Also: netlib and MKL both implement `JOBZ='V'` ONLY for
   `pzheevd` (`'N'` returns `INFO=-1`), and `IA=JA=1` with `MB_A == NB_A`

@@ -145,7 +145,7 @@ std::string vec_to_string(const std::vector<T>& v)
     } else {
         os << " -- NOT a plausible double, so the stale-allocation "
               "explanation does not fit this one.  Suspect the marshalling "
-              "instead: dump the boundary with LORRAX_PHDF5_DEBUG_DESCRIPTOR"
+              "instead: dump the boundary with LORRAX_DEBUG_PRINT=1"
               "=1 and check that the Python side handed over int64.";
     }
     return os.str();

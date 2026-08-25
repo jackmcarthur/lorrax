@@ -227,7 +227,7 @@ GATE = Gate(
     # These strings said "MKL FFT (DFTI API)" for the five days after the
     # DFTI code was deleted, so every CPU startup block named an engine the
     # translation unit no longer contained.  Name the ABI; let
-    # LORRAX_FFT_FFI_LOG name the library.
+    # LORRAX_DEBUG_PRINT name the library.
     label={"cpu": "FFTW3-ABI host",
            "CUDA": "cuFFT strided CUDA"},
     resolved_msg={

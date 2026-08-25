@@ -369,8 +369,7 @@ static constexpr int kRowsMaxCtg = 128;
 
 static bool log_enabled() {
     static const bool on = [] {
-        return mklpin::log_here("LORRAX_CONV_KMINOR_LOG") ||
-               mklpin::log_here("LORRAX_FFT_FFI_LOG");
+        return mklpin::debug_print_here();
     }();
     return on;
 }

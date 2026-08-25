@@ -296,7 +296,7 @@ instead: `gemm_batch_ffi.cc`'s `announce_entry_once` prints one
 unconditional line per precision at that precision's first use (e.g.
 `[mklblas] gemm_batch first call: dtype=c128 … via cblas_?gemm_batch
 (batched entry)`), which is what makes a silent downgrade impossible by
-construction.  It is not behind `LORRAX_MKLBLAS_LOG` on purpose.
+construction.  It is not behind `LORRAX_DEBUG_PRINT` on purpose.
 
 **Platform reach of this module (CPU/GPU sweep, 2026-07-29).**  The
 primitive itself is backend-neutral and *supported on both platforms*:

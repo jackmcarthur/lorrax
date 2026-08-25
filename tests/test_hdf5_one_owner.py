@@ -251,11 +251,18 @@ def test_the_probe_counts_mapped_libhdf5_objects_and_prints_them():
 
 def test_a_safe_production_probe_is_silent(monkeypatch):
     """Healthy library inventory is diagnostic detail, not driver output."""
-    monkeypatch.delenv("LORRAX_H5_JOURNAL", raising=False)
+    monkeypatch.delenv("LORRAX_DEBUG_PRINT", raising=False)
     lines = []
     out = HO.probe("startup", print_fn=lines.append)
     assert out["unsafe"] == []
     assert lines == []
+
+
+def test_driver_debug_enables_the_safe_probe_inventory(monkeypatch):
+    monkeypatch.setenv("LORRAX_DEBUG_PRINT", "1")
+    lines = []
+    HO.probe("startup", print_fn=lines.append)
+    assert any("[hdf5-probe startup]" in line for line in lines)
 
 
 def test_the_probe_does_not_count_hl_as_a_second_library():

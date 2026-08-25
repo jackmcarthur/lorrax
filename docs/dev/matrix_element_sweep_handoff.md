@@ -204,7 +204,7 @@ operand; do not wrap.
 **Compiles vs dispatches.** Under D10 every transform lowers **once** for the
 whole sweep regardless, because shapes are fixed. Eager glue costs
 *dispatches*, not compiles. Do not "fix" a compile storm that is not there —
-measure with `LORRAX_JAX_CACHE_EXPLAIN=1`
+measure with `LORRAX_DEBUG_PRINT=1`
 (`common/jax_compile_cache.py:31`) before optimising.
 
 **`dynamic_slice` clamps silently.** `lax.dynamic_slice` clamps
@@ -271,7 +271,7 @@ an unmasked `(0,0,0)`-padded table; keep that guard.
   rank checking its own block. A global `device_get` would gather the very
   tile this exists to remove, and a rank-0-only check passes a plan that puts
   the right answer on the wrong rank.
-* one compile for the whole k sweep (`LORRAX_JAX_CACHE_EXPLAIN=1`).
+* one compile for the whole k sweep (`LORRAX_DEBUG_PRINT=1`).
 * no host readback inside the scan.
 * the reshard is along `'x'` only, not a global collective.
 * per-rank stdout AND stderr to separate files — stderr is lost under

@@ -27,6 +27,7 @@ from common import rank_criterion
 from common import spectral_closure
 from common import timing
 from runtime.padding import pad_last_axis_to, round_up, solve_at_logical
+from runtime import debug_print_enabled
 from common.gamma_matrices import (
     gamma_perm_phase as _gamma_perm_phase_mu,
     gamma_double_contract,
@@ -1730,10 +1731,9 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 
 # Canonical boolean env grammar — ONE parser, imported, not copied.
 #
-# This module used to carry its own ``_env_bool`` (same token set, no
-# telemetry): a typo'd value (``LORRAX_ZETA_RANK_LOG=ture``) resolved
-# silently to False, which for a default-ON knob silently turned the μ
-# ladder's conditioning signal OFF.  ``gw.gw_config.env_bool`` has the
+# This module used to carry its own ``_env_bool`` for conditioning telemetry.
+# The rank receipt is now mandatory production output, so it has no env gate.
+# ``gw.gw_config.env_bool`` has the
 # identical vocabulary plus the once-per-(name,value) ``*** LORRAX
 # SANITY`` announcement on unrecognised tokens.  The import direction is
 # L1→L1 and safe: ``gw/__init__`` pulls only ``gw_config``, which is
@@ -2251,7 +2251,7 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
         # over-completed the pair-density rank (κ blow-up) and by how
         # much.  It lives inside the jit, so print it from there.
         # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
-        # Silence with LORRAX_ZETA_RANK_LOG=0.
+        # Mandatory conditioning receipt; there is no silence knob.
         #
         # THE CRITERION, stated: ``keep`` above is NOT a search for a
         # gap in λ — a real ISDF charge spectrum is smooth and has
@@ -2343,7 +2343,7 @@ the-tile-null-still-refuses.md`` §4).  A second, private re-implementation
     deck is what is being resolved.
 
     ``rank_log`` defaults to the producer's rule (on for
-    ``rank_truncate`` unless ``LORRAX_ZETA_RANK_LOG`` says otherwise), so a
+    ``rank_truncate``), so a
     refit prints the same ``n_keep``/``kappa`` line the fit did and the two
     can be read against each other.  jit-safe: everything below is jnp plus
     ``jax.debug`` callbacks.
@@ -2358,8 +2358,7 @@ the-tile-null-still-refuses.md`` §4).  A second, private re-implementation
             f"and do not belong on this entry point.")
     n_log = int(C.shape[-1])
     if rank_log is None:
-        rank_log = (mode == 'rank_truncate'
-                    and env_bool("LORRAX_ZETA_RANK_LOG", True))
+        rank_log = mode == 'rank_truncate'
     F = _charge_factor_math(
         C[None, ...], mode=mode, n_log=n_log,
         ridge_extra=float(zeta_ridge), rcond=float(zeta_rcond),
@@ -2445,8 +2444,7 @@ def _factor_c_q_replicated(
     if key not in _replicated_chol_cache:
         _re = ridge_extra
         _rc = rcond
-        _rank_log = (mode in ('rank_truncate', 'transverse_rank_truncate')
-                     and env_bool("LORRAX_ZETA_RANK_LOG", True))
+        _rank_log = mode in ('rank_truncate', 'transverse_rank_truncate')
         @partial(jax.jit, out_shardings=out_sh)
         def _fn(C):
             def _factor_log(C_log):
@@ -2696,8 +2694,7 @@ def _factor_c_q_replicated_qparallel(
     rcond = (float(zeta_rcond) if mode == 'transverse_rank_truncate'
              else _deprecated_env_float(
                  "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
-    rank_log = (mode in ('rank_truncate', 'transverse_rank_truncate')
-                and env_bool("LORRAX_ZETA_RANK_LOG", True))
+    rank_log = mode in ('rank_truncate', 'transverse_rank_truncate')
     ndev = int(mesh_xy.devices.size)
     py = int(mesh_xy.shape['y'])
     nq_pad = round_up(int(nq), ndev)
@@ -3285,7 +3282,7 @@ _chunk_logged: set = set()
 def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     """One line per call site naming the emitted per-collective payload.
 
-    On by default (``LORRAX_COLLECTIVE_CHUNK_LOG=0`` silences it): a tier
+    Mandatory production telemetry: a tier
     that silently stopped chunking would otherwise be invisible until it
     took a 72-node job down again.  Deduplicated on the tuple, because the
     back-solve site is re-entered once per r-chunk (9–81 times).
@@ -3312,9 +3309,8 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     # Larger measured back-solve payloads: 926 MB at mu=10015, 1386 MB at
     # 15007, 1773 MB at 24933 -- up to 13.2x the cap.
     # NOTE: no failure has ever been attributed to the violation; this is an
-    # honesty fix, not a wall.  Deliberately announced BEFORE the
-    # LORRAX_COLLECTIVE_CHUNK_LOG check — a routine-logging knob must not be
-    # able to silence a bound violation — and with its own dedup key.
+    # honesty fix, not a wall.  Deliberately announced independently of the
+    # routine receipt below, and with its own dedup key.
     _budget = _collective_chunk_bytes()
     if int(qb) <= 1 and int(per_q_bytes) > _budget and jax.process_index() == 0:
         _wsig = ("__floor__", where, int(per_q_bytes))
@@ -3333,8 +3329,6 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
                   f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
                   f"honestly, or accept the larger payload.",
                   flush=True)
-    if not env_bool("LORRAX_COLLECTIVE_CHUNK_LOG", True):
-        return
     if jax.process_index() != 0:
         return
     sig = (where, int(nq), int(qb), int(per_q_bytes))
@@ -3425,7 +3419,7 @@ def _factor_c_q_distributed_rank_truncate(
         # DEPRECATED env form — the input key is the record (scorecard AV).
         rcond = _deprecated_env_float(
             "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    rank_log = env_bool("LORRAX_ZETA_RANK_LOG", True)
+    rank_log = True
 
     # ONE resolved plan, then one call.  ``'distributed'`` (not a hard-coded
     # 'scalapack') is deliberate and is the SAME name ``_resolve_zeta_gather``
@@ -5124,10 +5118,8 @@ def fit_one_rchunk(
     # ``timing.section`` for per-r-chunk breakdown.  ``block_until_ready``
     # at each phase boundary is the cost of separating them — a few
     # microseconds on small kernels, dominated by the per-phase work.
-    # Same knob, same grammar as gw/isdf_fitting.py:937.  This was a bare
-    # presence test, so ``LORRAX_RCHUNK_DEBUG=0`` turned the debug path ON
-    # here and OFF there — one knob, two answers, in the same r-chunk loop.
-    _dbg = env_bool("LORRAX_RCHUNK_DEBUG", False)
+    # Same canonical driver-debug switch as gw/isdf_fitting.py.
+    _dbg = debug_print_enabled()
     # Per-phase host-RSS deltas: on CPU the XLA arena is invisible to
     # ``memory_stats()``, so attributing the per-r-chunk anonymous ramp
     # to z_q_build vs solve needs the kernel's own accounting.

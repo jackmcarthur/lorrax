@@ -887,7 +887,7 @@ The Round-2 refit (commit `38xxxxx`, 2026-05-17) added per-array
 accounting to `gflat_memory_model.plan_gflat_chunks` based on
 `jax.live_arrays()` probes in `isdf_fitting.py` and `gw_init.py`.
 This appendix is the cheat-sheet for future agents: when
-`LORRAX_MEM_DEBUG=1` shows an unexpected shape in HBM, grep this
+`LORRAX_DEBUG_PRINT=1` shows an unexpected shape in HBM, grep this
 table for the shape and you'll find the planner term to inspect.
 
 Quantitative measurements are for the production CrI3 6×6 80 Ry SOC
@@ -935,7 +935,7 @@ bispinor on 16 GPUs (4×4 mesh, ``p_xy=16``, ``nk=36``, ``ns=2``,
 
 ### How to use this appendix
 
-If `LORRAX_MEM_DEBUG=1` prints a `live_arrays()` row whose shape you
+If `LORRAX_DEBUG_PRINT=1` prints a `live_arrays()` row whose shape you
 don't recognise:
 
 1. Grep for the shape pattern (e.g. ``(36, 1520, 59990)``) in the

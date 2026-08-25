@@ -132,17 +132,11 @@ namespace ffi = ::xla::ffi;
 // ``checked_buffer_bytes`` / ``announce_error`` are in shard_index.h, shared
 // verbatim with read_ffi.cc so the two TUs cannot drift.
 
-// THE SHARED GRAMMAR, not a third one (2026-08-22).  This was
-// ``env && env[0] && strcmp(env, "0")`` — non-empty and not exactly "0" —
-// under which ``=false``, ``=off`` and ``=no`` all turned the debug banner
-// ON, while its two neighbours in this subpackage
-// (``LORRAX_PHDF5_TIME``, ``LORRAX_PHDF5_DUMP_HINTS``) had already been
-// converted to ``ctx.h::env_flag``.  Three knobs, one prefix, three
-// answers to ``=false`` is the defect class ``env_flag`` exists to end;
-// the Python twin is ``runtime.env_flags.env_bool``.
+// HDF5 write detail follows the one driver debug-print switch and the shared
+// C++ boolean grammar in ctx.h.
 static bool write_debug_enabled()
 {
-    return env_flag("LORRAX_PHDF5_WRITE_DEBUG", false);
+    return env_flag("LORRAX_DEBUG_PRINT", false);
 }
 
 static std::string h5_object_name(hid_t id)
@@ -183,15 +177,12 @@ static void async_worker(
     ffi::Promise promise)
 {
     // Diagnostic timing, symmetric with read_ffi.cc's two do_time sites.
-    // LORRAX_PHDF5_TIME used to cover the READ path only, so setting it on
-    // a full run produced no write lines at all while its name and
-    // docs/dev/env_vars.md both promised phdf5 timing generally (measured
-    // 2026-08-07: zero write lines on a run that wrote 1.9 GB).  Timing
+    // Debug timing
     // lives HERE, on the ctx writer thread, because this is where the D2H
     // wait and the collective H5Dwrite actually happen — the dispatch half
     // of a write returns as soon as the task is queued, so a timer there
     // would report queueing latency and call it I/O.
-    const bool do_time = env_flag("LORRAX_PHDF5_TIME", false);
+    const bool do_time = env_flag("LORRAX_DEBUG_PRINT", false);
     auto now = []() { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();

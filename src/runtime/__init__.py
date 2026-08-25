@@ -149,6 +149,9 @@ def _import_jax():
 __all__ = [
     "initialize_communicator_stack",
     "rank0_print",
+    "debug_print",
+    "debug_print_enabled",
+    "DEBUG_PRINT_ENV",
     "finalize_process",
     "run_main_and_finalize",
     "RuntimeStack",
@@ -164,6 +167,13 @@ __all__ = [
     "pin_matmul_precision",
     "read_matmul_precision",
 ]
+
+
+#: The one print-verbosity switch every driver honors.  Keep this in runtime:
+#: it is needed before configuration parsing by startup, file I/O and native
+#: handlers, and a driver-local spelling would immediately recreate the
+#: scattered-output-control problem this constant closes.
+DEBUG_PRINT_ENV = "LORRAX_DEBUG_PRINT"
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +1517,25 @@ def rank0_print(*a, **k):
     if _resolve_proc_id() == 0:
         k.setdefault("flush", True)
         print(*a, **k)
+
+
+def debug_print_enabled() -> bool:
+    """Whether the process-wide driver debug stream is enabled.
+
+    Debug printing is deliberately a runtime concern, not a physics-config
+    field.  Every production driver executes in its own process, so this one
+    switch is one debug stream *per driver invocation*.  Forensic writers and
+    diagnostics that perform extra numerical work retain separate controls;
+    they are not print verbosity.
+    """
+    from .env_flags import env_bool
+    return env_bool(DEBUG_PRINT_ENV, False, print_fn=rank0_print)
+
+
+def debug_print(*a, **k):
+    """Print to the one rank-zero debug stream when it is enabled."""
+    if debug_print_enabled():
+        rank0_print(*a, **k)
 
 
 # Private compatibility spelling used inside this module.  Keep one

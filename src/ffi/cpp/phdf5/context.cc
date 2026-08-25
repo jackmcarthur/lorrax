@@ -24,7 +24,7 @@
 //   _CB_PER_NODE                (unset) ROMIO pass-throughs; unset = ROMIO
 //                                       automatic policy (measured best on
 //                                       Frontera — scorecard AI/AW)
-//   LORRAX_PHDF5_DUMP_HINTS       (0)   print the hints ROMIO retained
+//   LORRAX_DEBUG_PRINT            (0)   print native diagnostic detail
 
 #include <cctype>
 #include <cstdio>
@@ -177,7 +177,7 @@ static long stripe_policy_unit(int world_size) {
 
 // env_flag (the boolean grammar) moved to ctx.h on 2026-08-06 so every
 // phdf5 translation unit shares it.  It was static here, which is why
-// read_ffi.cc's LORRAX_PHDF5_TIME had to be a bare presence test.
+// read_ffi.cc's former timing flag had to be a bare presence test.
 // Boolean knobs used to go through env_long, whose strtol grammar
 // silently kept the DEFAULT on word spellings — so e.g.
 // LORRAX_PHDF5_COLLECTIVE_WRITES=false left the FFI writer collective
@@ -695,7 +695,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     //     doesn't clutter normal output; indispensable when tuning
     //     Lustre/ROMIO performance because ROMIO silently ignores hints
     //     it doesn't understand or that the filesystem overrides.
-    if (ctx->rank == 0 && env_flag("LORRAX_PHDF5_DUMP_HINTS", false)) {
+    if (ctx->rank == 0 && env_flag("LORRAX_DEBUG_PRINT", false)) {
         void* vfd_handle = nullptr;
         if (H5Fget_vfd_handle(ctx->file_id, ctx->fapl_id, &vfd_handle) >= 0
             && vfd_handle != nullptr) {

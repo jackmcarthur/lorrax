@@ -55,7 +55,7 @@ for the real one, which is exactly what the deleted shim was.
 
 | name | what it is |
 |---|---|
-| `WfnLoader(path, *, mesh=None, backend='auto')` | Open + read header + measure TRS. **Eager** on metadata, lazy on ψ. `backend='auto'` announces its pick once per (backend, world). |
+| `WfnLoader(path, *, mesh=None, backend='auto')` | Open + read header + measure TRS. **Eager** on metadata, lazy on ψ. With `LORRAX_DEBUG_PRINT=1`, `backend='auto'` announces its pick once per (backend, world). |
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |

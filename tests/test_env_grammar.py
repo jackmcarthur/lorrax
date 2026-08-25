@@ -306,18 +306,12 @@ OWNED_FILES = (
 OWNED_BOOL_KNOBS = (
     "LORRAX_EXIT_AFTER_ZETA",
     "LORRAX_MALLOC_TRIM",
-    "LORRAX_MEM_DEBUG",
-    "LORRAX_RCHUNK_DEBUG",
     # Converted 2026-07-30 across ALL FIVE readers at once (gw_init.py x3,
     # gw/v_q_g_flat.py, gw/screening.py), which is what let it move from
     # CROSS_FILE_BOOL_KNOBS to here.  The whole-tree gate lives in
     # tests/test_crossfile_requests.py::
     # test_no_module_anywhere_reads_force_full_bz_by_hand.
     "LORRAX_FORCE_FULL_BZ",
-    # P1.3: the isdf/core.py knobs, owned since that file joined
-    # OWNED_FILES (its readers all route through gw_config.env_bool now).
-    "LORRAX_ZETA_RANK_LOG",
-    "LORRAX_COLLECTIVE_CHUNK_LOG",
     # Read once, in gw_init's ζ-reuse gate — previously through a lazy
     # ``from isdf.core import _env_bool`` (the last consumer of that
     # helper); collapsed onto the module-scope env_bool import.
@@ -330,12 +324,9 @@ OWNED_BOOL_KNOBS = (
 #: single wrong grammar.  Filed as cross-file requests; exempted here so
 #: this gate stays green on a correct tree.
 CROSS_FILE_BOOL_KNOBS = {
-    # EMPTY since P1.3: LORRAX_RCHUNK_DEBUG's second reader (isdf/core.py,
-    # historically a bare presence test under which ``=0`` meant ON) now
-    # reads through gw_config.env_bool like gw/isdf_fitting.py, and
-    # isdf/core.py itself is in OWNED_FILES.  The dict stays so the next
-    # genuinely cross-file knob has somewhere to be filed WITH its request
-    # number instead of silently exempted.
+    # Empty.  Keep the dict so the next genuinely cross-file knob has
+    # somewhere to be filed WITH its request number instead of silently
+    # exempted.
 }
 
 
@@ -697,11 +688,11 @@ def test_no_hand_rolled_boolean_env_parse_in_owned_files():
 
 _BAD_PRESENCE = 'import os\nif os.environ.get("LORRAX_EXIT_AFTER_ZETA"):\n    raise SystemExit(0)\n'
 _BAD_CASE = 'import os\nif os.environ.get("LORRAX_MALLOC_TRIM", "1") not in ("0", "off"):\n    x = 1\n'
-_BAD_BOOLCALL = 'import os\nd = bool(os.environ.get("LORRAX_RCHUNK_DEBUG"))\n'
-_BAD_NOT = 'import os\nif not os.environ.get("LORRAX_MEM_DEBUG"):\n    pass\n'
+_BAD_BOOLCALL = 'import os\nd = bool(os.environ.get("LORRAX_DEBUG_PRINT"))\n'
+_BAD_NOT = 'import os\nif not os.environ.get("LORRAX_DEBUG_PRINT"):\n    pass\n'
 _BAD_INT = 'import os\nif bool(int(os.environ.get("LORRAX_FORCE_FULL_BZ", "0"))):\n    pass\n'
-_BAD_GETENV = 'import os\nif os.getenv("LORRAX_MEM_DEBUG"):\n    pass\n'
-_BAD_SUBSCRIPT = 'import os\nif os.environ["LORRAX_MEM_DEBUG"]:\n    pass\n'
+_BAD_GETENV = 'import os\nif os.getenv("LORRAX_DEBUG_PRINT"):\n    pass\n'
+_BAD_SUBSCRIPT = 'import os\nif os.environ["LORRAX_DEBUG_PRINT"]:\n    pass\n'
 _GOOD = ('from .gw_config import env_bool\n'
          'if env_bool("LORRAX_EXIT_AFTER_ZETA", False):\n    pass\n')
 

@@ -4,7 +4,6 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 """
 from __future__ import annotations
 
-import os
 import time
 
 import numpy as np
@@ -32,21 +31,15 @@ def _mu_logical_shape(shape, mu_axes, n_rmu_logical):
 
 
 def _restart_write_log_on() -> bool:
-    """Gate for the per-dataset liveness telemetry (scorecard AF.4c).
+    """Rank-0 owner for debug-only per-dataset storage telemetry.
 
-    ON by default, rank 0 only: this module writes tens of GB at
-    production scale (~40 GB at MoS2 12x12/c2406) and used to print
-    NOTHING while doing it — job 7876423 spent 2 h 55 m in here and was
-    wall-clock-killed with no way to tell "slow" from "wedged".  File
-    size is the trap AC.3b documents (parallel HDF5 pre-allocates at
-    create time, so the file reaches full size before any data lands);
-    one line per dataset with its own elapsed time is the cheapest
-    thing that makes this stage diagnosable while alive.
-    ``LORRAX_RESTART_WRITE_LOG=0`` silences it.
+    Large writes can take long enough that this detail is valuable while
+    diagnosing a run.  It is nevertheless storage-library chatter rather
+    than a physics result, so production mode stays quiet and the driver's
+    one debug switch restores it.
     """
-    return (os.environ.get("LORRAX_RESTART_WRITE_LOG", "1")
-            not in ("0", "", "false")
-            and jax.process_index() == 0)
+    from runtime import debug_print_enabled
+    return debug_print_enabled() and jax.process_index() == 0
 
 
 def _log_restart_write(name, shape, dtype, dt) -> None:
@@ -55,7 +48,8 @@ def _log_restart_write(name, shape, dtype, dt) -> None:
     Single implementation on purpose: the AF.4c line format is
     load-bearing for log diagnosis, and this module used to carry four
     hand-synced copies of it (audit 2026-07-28; QUALITY_PATTERNS #3).
-    Gated by :func:`_restart_write_log_on`.
+    Emitted by the rank-zero owner selected by
+    :func:`_restart_write_log_on` when driver debug printing is enabled.
 
     ``dt`` is the CALLER's elapsed time, and SlabIO's write path returns
     as soon as the tile is queued on its writer thread — so ``dt`` is the
@@ -456,17 +450,17 @@ def write_restart_state_to_h5(
                 np.asarray(format_coulomb_policy(coulomb_policy or {})
                            .encode("utf-8"), dtype="S"))
 
-        # PER-DATASET LIVENESS (scorecard AF.4c): every dataset below
-        # emits one [restart_write] line naming its size as it is handed
-        # to the writer thread.  The transfer itself is asynchronous and
-        # is timed where it completes, on the SlabIO.close drain line —
-        # rationale and the LORRAX_RESTART_WRITE_LOG gate live at
+        # DEBUG PER-DATASET LIVENESS (scorecard AF.4c): in driver debug
+        # mode every dataset below emits one [restart_write] line naming
+        # its size as it is handed to the writer thread.  The transfer is
+        # asynchronous and timed where it completes, on the debug-only
+        # SlabIO.close drain line.  The one-switch/rank-0 policy lives at
         # :func:`_restart_write_log_on` / :func:`_log_restart_write`.
 
         def _write(name, arr, mu_axes=(), n_logical=None):
             """create+write one dataset, μ axes clipped to ``n_logical``
             (default: the charge ``n_rmu_logical``), with the AF.4c
-            telemetry line.  Single write path for every dataset in
+            debug telemetry line.  Single write path for every dataset in
             this file, including the transverse ψ and the real W0
             (audit 2026-07-28 — the transverse block used to be an
             inline copy of this helper)."""

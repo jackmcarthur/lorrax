@@ -964,7 +964,7 @@ def sweep_lookahead() -> int:
     pipelined default rather than asserted.
 
     Malformed input REFUSES, naming the variable — the same rule
-    ``common.timing`` applies to ``LORRAX_TIMING_TRACE_DEPTH``.  The parse
+    ``common.timing`` applies to the fixed driver-debug trace depth.  The parse
     this replaces swallowed ``ValueError`` and returned the default, so
     ``LORRAX_KIN_ION_LOOKAHEAD=one`` silently ran the PIPELINED path while
     the operator believed the control cell had disabled it, and a control

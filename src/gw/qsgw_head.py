@@ -45,7 +45,7 @@ that one line with no attribution.  ``build_dft_head_response`` and
 ``finalize_iteration_head_samples`` now each end their own stage on an
 explicit ``jax.block_until_ready`` plus a
 ``gw.isdf_fitting.mem_probe(...)`` call (env-gated on
-``LORRAX_MEM_DEBUG=1``, the SAME probe ``isdf_fitting``/``gw_init`` already
+``LORRAX_DEBUG_PRINT=1``, the SAME probe ``isdf_fitting``/``gw_init`` already
 use for the zeta-fit/V_q HBM lifecycle -- single source of truth, not a
 second memory-diagnostic helper).  This is a pure scheduling change: it
 does not alter any value, only when the allocator is charged for it and

@@ -68,6 +68,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+from runtime import debug_print_enabled
 
 __all__ = [
     "STACK_FFI",
@@ -439,8 +440,9 @@ def probe(where: str, *, print_fn=print, escalate: bool = True,
     MEASURED, NOT ASSERTED, by default: this returns what is true.  A safe
     production probe is silent; an unsafe condition is always printed.
     Passing ``verbose=True`` prints the full inventory, while ``None``
-    follows the HDF5 operation journal so an explicitly instrumented run
-    gets both kinds of evidence.  ``escalate`` only decides whether the
+    follows the one driver debug-print switch.  The HDF5 operation journal
+    remains an independent forensic sidecar and does not make stdout noisy.
+    ``escalate`` only decides whether the
     *strict* policy is
     allowed to turn the measured unsafe condition — two mapped libhdf5
     objects AND a path this process has written through both — into the
@@ -453,8 +455,7 @@ def probe(where: str, *, print_fn=print, escalate: bool = True,
     unsafe = [r for r in both if r[4]]
     locking = os.environ.get("HDF5_USE_FILE_LOCKING", "<unset>")
     if verbose is None:
-        from . import h5_journal
-        verbose = h5_journal.enabled()
+        verbose = debug_print_enabled()
 
     if not libs:
         shown = "unmeasurable (no /proc/self/maps)"

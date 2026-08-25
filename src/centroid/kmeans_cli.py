@@ -21,7 +21,11 @@ from __future__ import annotations
 # mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
 # floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
 # back this same startup mesh, not a second one.
-from runtime import initialize_communicator_stack, rank0_print as print0
+from runtime import (
+    debug_print_enabled,
+    initialize_communicator_stack,
+    rank0_print as print0,
+)
 RUNTIME = initialize_communicator_stack()
 
 import argparse
@@ -306,7 +310,7 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     from .charge_density import rho_from_band_range
     return (rho_from_band_range(
                 wfn, (b_lo, b_hi), sym_ops=ops, dist_mesh=dist_mesh,
-                verbose=(process_rank() == 0)),
+                verbose=(debug_print_enabled() and process_rank() == 0)),
             f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²")
 
 
@@ -387,7 +391,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=n_orbit_keep, mesh=mesh,
         orbit_id=orbit_id,
         n_point_budget=(int(N_c) if orbit_id is not None else None),
-        verbose=(process_rank() == 0),
+        verbose=(debug_print_enabled() and process_rank() == 0),
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = (0, n_val)
@@ -461,7 +465,8 @@ def main():
             print0(f"  density-mode=current: building bispinor j² weight "
                    f"with n_occ={n_occ} (nspinor_wfn={int(wfn.nspinor)})")
             charge_density = build_current_density(
-                wfn, sym, n_occ, verbose=(process_rank() == 0))
+                wfn, sym, n_occ,
+                verbose=(debug_print_enabled() and process_rank() == 0))
         else:
             charge_density = get_charge_density(
                 wfn=wfn, sym=sym,

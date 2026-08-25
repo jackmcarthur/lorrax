@@ -16,6 +16,7 @@ from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
+from runtime import debug_print_enabled
 
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
@@ -53,7 +54,7 @@ _NVSMI_LAST_MB = 0
 
 
 def mem_probe(label, *, only_rank0=True):
-    """``LORRAX_MEM_DEBUG=1`` runtime probe of process-wide HBM at named sites.
+    """Driver-debug runtime probe of process-wide HBM at named sites.
 
     Reports the JAX/XLA allocator ``bytes_in_use+peak`` plus the top-10
     ``jax.live_arrays()`` shapes.  Module-level so both ``fit_zeta_to_h5``
@@ -70,7 +71,7 @@ def mem_probe(label, *, only_rank0=True):
     sample — the *canonical* OOM-relevance metric since
     ``device.memory_stats()`` returns ``None`` on this stack.
     """
-    if not env_bool("LORRAX_MEM_DEBUG", False):
+    if not debug_print_enabled():
         return
     if only_rank0 and jax.process_index() != 0:
         return
@@ -944,7 +945,7 @@ def fit_zeta_to_h5(
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
 
-    # ``LORRAX_MEM_DEBUG=1`` — runtime probe of process-wide HBM at
+    # Driver debug — runtime probe of process-wide HBM at
     # named lifecycle sites.  The module-level ``mem_probe`` helper is
     # reused so the r-chunk loop sites and the gw_init V_q sites all
     # share one source of truth.  HLO's buffer-assignment.txt is per-jit
@@ -1046,7 +1047,7 @@ def fit_zeta_to_h5(
     # should match: centroids (ψ_l/ψ_r in both Y and X transposes), L_q
     # (Cholesky factor at IBZ for charge / pass-through CCT for
     # transverse), and the freshly-zeroed gflat_acc.  Round-1 addition.
-    if env_bool("LORRAX_MEM_DEBUG", False):
+    if debug_print_enabled():
         jax.block_until_ready(gflat_acc)
         jax.block_until_ready(L_q)
     mem_probe("pre_rchunk_loop")
@@ -1078,7 +1079,7 @@ def fit_zeta_to_h5(
             r_end = min(r_start + chunk_r, n_rtot)
             actual_n_rchunk = r_end - r_start
 
-            _dbg_rchunk = env_bool("LORRAX_RCHUNK_DEBUG", False)
+            _dbg_rchunk = debug_print_enabled()
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
             t0 = time.perf_counter()
@@ -1138,7 +1139,7 @@ def fit_zeta_to_h5(
                     mesh=mesh_xy,
                 )
                 del zeta_chunk
-                if env_bool("LORRAX_MEM_DEBUG", False):
+                if debug_print_enabled():
                     jax.block_until_ready(gflat_acc)
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write

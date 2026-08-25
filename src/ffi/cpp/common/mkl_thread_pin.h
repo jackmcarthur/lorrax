@@ -83,6 +83,7 @@
 #include <cstring>
 #include <initializer_list>   // announce_here's range-for over a braced list;
                               // gemm_batch_ffi.cc only got this transitively
+#include <string>
 
 #include <dlfcn.h>
 
@@ -191,27 +192,34 @@ inline bool announce_here() {
     return true;
 }
 
-// Grammar for the opt-in C++ debug-log knobs (LORRAX_MKLFFT_LOG,
-// LORRAX_CUFFT_LOG).  Presence-tested, as before, so every value that
-// enabled logging before still does — with ONE addition: a value of "all"
-// or "*" asks for every rank.  Anything else logs on rank 0 only.
-//
-// Why the default flipped to rank-0-only rather than staying all-ranks: the
-// knob's job is "show me what the handler decided", which is a per-process
-// property that is identical on every rank in every configuration this code
-// supports (plan keys, arena sizes and team sizes are functions of the
-// SHARDED tile shape).  At P=1000 the all-ranks default turned a 5-line
-// answer into 5000 interleaved lines.  "all" is kept because a genuinely
-// per-rank question (a rank whose shard is ragged) does exist, and answering
-// it must remain possible.
-inline bool log_value_here(const char* v) {
+// The one production-driver debug-print switch.  It is a BOOLEAN:
+// DEBUG_PRINT=0 must not reproduce the historical presence-test bug, and
+// debug detail must not multiply a driver log by the process count.
+inline bool debug_print_here() {
+    const char* v = std::getenv("LORRAX_DEBUG_PRINT");
     if (v == nullptr) return false;
-    if (str_ieq(v, "all") || std::strcmp(v, "*") == 0) return true;
-    return announce_here();
-}
-
-inline bool log_here(const char* env_name) {
-    return log_value_here(std::getenv(env_name));
+    std::string token(v);
+    const auto first = token.find_first_not_of(" \t\r\n");
+    const auto last = token.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos) return false;
+    token = token.substr(first, last - first + 1);
+    for (char& c : token) c = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(c)));
+    if (token == "1" || token == "true" || token == "yes" ||
+        token == "on") {
+        return announce_here();
+    }
+    if (token != "0" && token != "false" && token != "no" &&
+        token != "off") {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true) && announce_here()) {
+            std::fprintf(stderr,
+                "  *** LORRAX SANITY: LORRAX_DEBUG_PRINT='%s' is not a "
+                "recognised boolean; treating it as OFF. ***\n", v);
+            std::fflush(stderr);
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

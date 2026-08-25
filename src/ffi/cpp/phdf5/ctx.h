@@ -41,10 +41,10 @@ namespace lorrax_ffi::phdf5 {
 //   anything else ("0", "false", "no", "off", ...)  -> false
 //
 // It lives in the header, not in context.cc, because it was static there
-// and read_ffi.cc could not see it -- so LORRAX_PHDF5_TIME was written as
+// and read_ffi.cc could not see it -- so the former timing flag was written as
 // a bare `getenv(...) != nullptr` presence test, in which `=0` turns
 // timing ON.  That is the same defect this project already post-mortems
-// for LORRAX_MEM_DEBUG and LORRAX_EXIT_AFTER_ZETA (gw_config.env_bool's
+// for the Python driver debug switch and LORRAX_EXIT_AFTER_ZETA
 // docstring).  A grammar only one file can reach is a grammar the next
 // file will re-invent wrongly.
 inline bool env_flag(const char* name, bool default_value) {

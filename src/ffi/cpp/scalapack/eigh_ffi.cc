@@ -221,10 +221,9 @@ static ffi::Error EighImpl(
 
         // Workspace can dwarf the local matrix block on a small grid, and
         // it is invisible to the JAX-side memory planner (it is malloc'd
-        // here, not an XLA buffer).  LORRAX_SCALAPACK_EIGH_LOG=1 prints it
-        // once per call so a planner surprise is diagnosable.
-        static const bool log_ws =
-            (std::getenv("LORRAX_SCALAPACK_EIGH_LOG") != nullptr);
+        // here, not an XLA buffer).  Driver debug prints it once per call so
+        // a planner surprise is diagnosable.
+        static const bool log_ws = mklpin::debug_print_here();
         if (log_ws) {
             const double gib = 1024.0 * 1024.0 * 1024.0;
             std::fprintf(

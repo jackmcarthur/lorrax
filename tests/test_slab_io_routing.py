@@ -155,19 +155,19 @@ def test_deleted_hdf5_selectors_do_not_survive_in_neighbouring_apis():
 
 
 @pytest.mark.parametrize("value, expected", [
-    (None, 1),
-    ("", 1),
+    (None, 0),
+    ("", 0),
     ("0", 0),
     ("false", 0),
     ("1", 2),
     ("true", 2),
 ])
-def test_close_logging_defaults_to_compact(monkeypatch, value, expected):
-    """Empty closes stay quiet by default while explicit 0/1 remain compatible."""
+def test_close_logging_is_debug_only(monkeypatch, value, expected):
+    """Healthy storage-library close telemetry follows the one debug switch."""
     if value is None:
-        monkeypatch.delenv("LORRAX_PHDF5_CLOSE_VERBOSE", raising=False)
+        monkeypatch.delenv("LORRAX_DEBUG_PRINT", raising=False)
     else:
-        monkeypatch.setenv("LORRAX_PHDF5_CLOSE_VERBOSE", value)
+        monkeypatch.setenv("LORRAX_DEBUG_PRINT", value)
     assert slab_ffi._close_log_level() == expected
 
 

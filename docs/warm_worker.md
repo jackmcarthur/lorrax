@@ -209,7 +209,7 @@ agrees too, at `1f100810eb6f31284896357d671e6b05` across the warm legs and the
 cold control. So warm legs match each other and match a cold-leg control.
 
 The env-sensitive twin behaves as designed. A leg declaring
-`LORRAX_TIMING_TRACE=1` without `--recyclable` was refused in 0.10 s with the
+`LORRAX_DEBUG_PRINT=1` without `--recyclable` was refused in 0.10 s with the
 offending key named; the same leg with `--recyclable` caused the quartet to
 re-exec into generation 1, come back ready in 7.2 s, and run — still
 byte-identical. Neither path contaminated anything silently.

@@ -698,7 +698,7 @@ default of `16 × 1 MiB` happens to equal `nranks × 1 MiB`. That coincidence
 is what made a constant look like a tuning.
 
 The mechanism, **read back from ROMIO rather than assumed**
-(`LORRAX_PHDF5_DUMP_HINTS=1`, which dumps `MPI_File_get_info` after
+(`LORRAX_DEBUG_PRINT=1`, which dumps `MPI_File_get_info` after
 `H5Fcreate` — the hints ROMIO *retained*, not the ones we asked for):
 
 | requested `striping_factor` | 4 ranks → `cb_nodes` | 16 ranks → `cb_nodes` |

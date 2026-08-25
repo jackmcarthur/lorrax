@@ -532,10 +532,8 @@ static ffi::Error ReadKchunkImpl(
 {
     const int n_kchunk = (int)offsets.size();
     const int N_file = (int)count.size();
-    // Diagnostic timing (LORRAX_PHDF5_TIME=1 to enable per-phase prints).
-    // Parsed, not merely PRESENT: this was `getenv(...) != nullptr`, so
-    // LORRAX_PHDF5_TIME=0 turned timing ON.  Grammar lives in ctx.h.
-    const bool do_time = env_flag("LORRAX_PHDF5_TIME", false);
+    // Per-phase timing follows the one driver debug-print switch.
+    const bool do_time = env_flag("LORRAX_DEBUG_PRINT", false);
     auto now = []() { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -916,7 +914,7 @@ static void async_read_kchunk_union_worker(
     const int n_kchunk = (int)file_offsets.size();
     const int N_file = (int)per_rank_max_shape.size();
     const int N_out = N_file + 1;
-    const bool do_time = env_flag("LORRAX_PHDF5_TIME", false);
+    const bool do_time = env_flag("LORRAX_DEBUG_PRINT", false);
     auto now = []() { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();

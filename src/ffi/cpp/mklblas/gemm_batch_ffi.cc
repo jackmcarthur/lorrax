@@ -250,7 +250,7 @@ static bool batched_for(ffi::DataType dt) {
 // which had NO rank guard at all — can share the one implementation.
 using mklpin::announce_here;
 
-// UNCONDITIONAL (not behind LORRAX_MKLBLAS_LOG): which entry is live must
+// UNCONDITIONAL (not behind LORRAX_DEBUG_PRINT): which entry is live must
 // always be visible in the log, so a silent downgrade cannot happen.  Once
 // per PRECISION at that precision's first use — bounded at four lines per
 // process, and it names the precision because availability is per-dtype.
@@ -330,7 +330,7 @@ static int team_threads() {
 }
 
 static bool log_enabled() {
-    static const bool on = (std::getenv("LORRAX_MKLBLAS_LOG") != nullptr);
+    static const bool on = mklpin::debug_print_here();
     return on;
 }
 

@@ -194,21 +194,9 @@ static int64_t chunk_elems(int64_t nk) {
     return std::max<int64_t>(c, 64);
 }
 
-// Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
-// rank 0 by default, every rank with =all.  ONE spelling per FFI target
-// family across platforms (P1.11): LORRAX_FFT_FFI_LOG is the shared knob;
-// LORRAX_MKLFFT_LOG / LORRAX_CUFFT_LOG are deprecated aliases honored on
-// BOTH platforms (announced once).  See the log_here() note in
-// cpp/common/mkl_thread_pin.h for why the default flipped — at P=1000 the
-// all-ranks default multiplied a 5-line answer by the process count, and
-// (at the commit site below) by the OpenMP team size on top of that.
+// Native FFT detail follows the one rank-zero driver debug stream.
 static bool log_enabled() {
-    static const bool on = [] {
-        static std::atomic<bool> alias_warned{false};
-        return mklpin::log_value_here(mklpin::knob_value(
-            "LORRAX_FFT_FFI_LOG",
-            {"LORRAX_MKLFFT_LOG", "LORRAX_CUFFT_LOG"}, alias_warned));
-    }();
+    static const bool on = mklpin::debug_print_here();
     return on;
 }
 
@@ -651,7 +639,7 @@ static ffi::Error FlatKDispatch(
 //  The R-space G tile exists only as per-thread ~4 MiB compact chunks; the
 //  IFFT'd W (V_R, the small (nk, mx, my) tile) is staged once per call in a
 //  reused process arena (malloc'd, invisible to the XLA planner — same
-//  class as the scalapack workspace, logged under LORRAX_MKLFFT_LOG).
+//  class as the scalapack workspace, logged under LORRAX_DEBUG_PRINT).
 // ---------------------------------------------------------------------------
 struct Arena {
     std::mutex mu;

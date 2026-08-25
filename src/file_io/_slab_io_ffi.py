@@ -40,6 +40,7 @@ from common.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier as _barrier, device_put_process_local
+from runtime import debug_print_enabled
 
 from . import h5_journal as _journal
 
@@ -184,17 +185,13 @@ def _announce_legacy_introspect(path: str) -> None:
 
 
 def _close_log_level() -> int:
-    """Return 0=quiet, 1=compact (default), or 2=explicit verbose.
+    """Return 0=quiet production close or 2=driver debug detail.
 
-    Close progress remains visible when a queued collective can genuinely
-    take time, but empty/read-only closes no longer contribute four zero-time
-    lines to every GW log.  The historical boolean override stays compatible:
-    false spellings are quiet and any true spelling requests the old detail.
+    Storage-library progress is debug detail.  Worker errors remain
+    unconditional below, but healthy drains, joins and ``H5Fclose`` calls do
+    not belong in a production physics log.
     """
-    value = os.environ.get("LORRAX_PHDF5_CLOSE_VERBOSE")
-    if value is None or not value.strip():
-        return 1
-    return 0 if value.strip().lower() in _FALSE else 2
+    return 2 if debug_print_enabled() else 0
 
 
 def _stripe_policy(nranks: int) -> tuple[int, int]:
@@ -1700,13 +1697,13 @@ class _FfiBackend(_DatasetGeometry):
         # has, so the hints are a no-op there; export anyway so the log
         # line and the environment agree on every path.
         _sc, _su = _export_striping_env()
-        if mode == "w" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", False):
+        if mode == "w" and _rank0() and debug_print_enabled():
             print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
                   f"ranks={jax.process_count()} stripe_count={_sc} "
                   f"stripe_unit={_su} B (policy; "
                   f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
                   flush=True)
-        elif mode == "r" and _rank0() and _env_flag("LORRAX_PHDF5_LOG", False):
+        elif mode == "r" and _rank0() and debug_print_enabled():
             # The read side names its own dominant term, and it is a
             # DIFFERENT number: a Lustre layout is fixed at inode create, so
             # on a file LORRAX did not write (every WFN.h5 — pw2bgw creates
@@ -2178,7 +2175,7 @@ class _FfiBackend(_DatasetGeometry):
             slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
         gshape = ds_shape
 
-        if os.environ.get("LORRAX_FFI_DEBUG_SHARDS"):
+        if debug_print_enabled():
             import sys
             local_shapes = [tuple(s.data.shape) for s in A.addressable_shards]
             sys.__stdout__.write(
@@ -2564,12 +2561,5 @@ class _FfiBackend(_DatasetGeometry):
         _barrier("slab_io_ffi_close_attrs")
         self._deferred_attrs = []
         self._deferred_ds_attrs = []
-        _t_total = _t_drain + _t_join + _t_close
-        if (_log_level == 1
-                and (_pending or _drained_bytes or _t_total >= 1.0)):
-            _moved = f", {_drained_bytes / 1e9:.2f} GB" if _drained_bytes else ""
-            print(f"  [SlabIO.close] {os.path.basename(self.path)}: "
-                  f"{_pending} queued write{'s' if _pending != 1 else ''}{_moved}, "
-                  f"drain+join+H5Fclose {_t_total:.1f} s", flush=True)
         if _worker_error is not None:
             raise _worker_error

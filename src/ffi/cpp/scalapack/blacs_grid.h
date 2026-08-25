@@ -345,7 +345,7 @@ inline void scalapack_announce_slate_api(const char* op, const char* name) {
 }
 
 // ---------------------------------------------------------------------------
-//  WHO IS ANSWERING?  (LORRAX_SCALAPACK_PROVIDER_LOG)
+//  WHO IS ANSWERING?  (LORRAX_DEBUG_PRINT)
 //
 //  The whole point of calling a published API is that any of several
 //  packages can satisfy it — MKL here, Cray LibSci on a Cray, AOCL on AMD,
@@ -367,7 +367,7 @@ inline void scalapack_log_providers_once() {
     // thread pin below) — re-reading the environment per solve bought
     // nothing but a getenv on the hot path (2026-08-01 seam-audit leftover).
     static const bool enabled =
-        lorrax_ffi::mklpin::log_here("LORRAX_SCALAPACK_PROVIDER_LOG");
+        lorrax_ffi::mklpin::debug_print_here();
     if (!enabled) return;
     static std::once_flag once;
     std::call_once(once, [] {

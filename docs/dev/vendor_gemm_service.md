@@ -172,7 +172,7 @@ costs 1.6–1.9× does not belong in the build.
 
 What replaces it as the receipt: `announce_entry_once` prints one line per
 precision at that precision's first use, **unconditionally** — not behind
-`LORRAX_MKLBLAS_LOG` — so a silent downgrade is impossible by construction:
+`LORRAX_DEBUG_PRINT` — so a silent downgrade is impossible by construction:
 
 ```
 [mklblas] GEMM entry (c128): cblas_zgemm_batch (batched) — this BLAS provides the batched entry.

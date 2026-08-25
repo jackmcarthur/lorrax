@@ -18,12 +18,13 @@ from typing import Any, Callable
 # indistinguishable from a hang while alive — a job that prints nothing
 # cannot be triaged, only waited out or killed.
 #
-# ``LORRAX_TIMING_TRACE=1`` makes every section announce its entry and
+# ``LORRAX_DEBUG_PRINT=1`` makes every section announce its entry and
 # exit with a wall-clock timestamp on rank 0.  That is a milestone
 # cadence for the WHOLE code, including stages that are one monolithic
 # jit call and so cannot carry a ``LoopProgress``.  Print-only; the
 # accumulated tree and the final report are byte-identical either way.
-# ``LORRAX_TIMING_TRACE_DEPTH`` caps nesting depth (default 3).
+# Debug tracing is capped at nesting depth 3.  There is deliberately no
+# second depth knob: one driver has one debug-print control.
 #
 # Sections that must ALWAYS announce (env-independent stage cadence —
 # e.g. the screening phases, whose silence was paid for three times:
@@ -33,42 +34,16 @@ from typing import Any, Callable
 # ``timing.section``.  Same formatting path, same rank-0 gate, no
 # depth cap — ONE cadence mechanism, not two.
 # ---------------------------------------------------------------------------
-# Both knobs are read at USE time, not import time: common.timing is
-# imported by essentially every LORRAX CLI, and an import-time ``int()``
-# of a malformed LORRAX_TIMING_TRACE_DEPTH killed every rank before
-# main() even ran, even with tracing disabled — an observability knob
-# must never take down the run it observes (QUALITY_PATTERNS #8; audit
-# 2026-07-28).  Use-time reads also match the rest of LORRAX's env
-# flags (cf. ``file_io._slab_io_ffi._env_flag``): tests/drivers that set
-# the env after import see the new value.
-_TRACE_TRUE = ("1", "true", "yes", "on")
+# The knob is read at USE time, not import time: common.timing is
+# imported by essentially every LORRAX CLI.  Use-time reads also let tests
+# and driver wrappers set the shared runtime switch after import.
 _TRACE_RANK0: bool | None = None
+_TRACE_DEPTH = 3
 
 
 def _trace_flag() -> bool:
-    return (os.environ.get("LORRAX_TIMING_TRACE", "0").strip().lower()
-            in _TRACE_TRUE)
-
-
-def _trace_depth() -> int:
-    """``LORRAX_TIMING_TRACE_DEPTH`` (nesting-depth cap, default 3).
-
-    Unset/empty → default (the module falsy-parse convention, matching
-    :func:`_trace_flag`); anything else must be a plain int.  Malformed
-    input refuses with the variable name (doctrine 3) — and only once
-    tracing is actually on, since :func:`_trace_enabled` short-circuits
-    on the flag first.
-    """
-    raw = os.environ.get("LORRAX_TIMING_TRACE_DEPTH", "").strip()
-    if not raw:
-        return 3
-    try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(
-            f"LORRAX_TIMING_TRACE_DEPTH={raw!r} is not a valid trace "
-            f"depth: expected a plain integer nesting cap (default 3)."
-        ) from None
+    from runtime import debug_print_enabled
+    return debug_print_enabled()
 
 
 def _rank0() -> bool:
@@ -121,7 +96,7 @@ def _rank0() -> bool:
 
 
 def _trace_enabled(depth: int) -> bool:
-    if not _trace_flag() or depth > _trace_depth():
+    if not _trace_flag() or depth > _TRACE_DEPTH:
         return False
     return _rank0()
 
@@ -167,7 +142,7 @@ class TimingSection:
 		self.child_elapsed = 0.0
 		self._watchers: list[Callable[[], Any]] = []
 		# ``announce=True``: enter/exit lines are printed regardless of
-		# LORRAX_TIMING_TRACE (rank-0 only), through the SAME _trace
+		# driver debug (rank-0 only), through the SAME _trace
 		# formatter.  ``label`` replaces the node name in those lines
 		# (the tree/report always keeps the node name).
 		self.announce = announce

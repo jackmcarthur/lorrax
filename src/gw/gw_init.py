@@ -24,6 +24,7 @@ from common import jax_profile
 # being attribute-reachable off a bare ``import jax`` (an import-order
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
+from runtime import debug_print_enabled
 
 
 
@@ -1670,7 +1671,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			         f"{budget_gb:.2f} GB budget ({_pct})  [backend="
 			         f"{_backend}: this figure comes from the device "
 			         f"memory-stats/nvidia-smi tracker and is NOT this "
-			         f"run's host RSS — use LORRAX_MEM_DEBUG=1 for that]")
+			         f"run's host RSS — use LORRAX_DEBUG_PRINT=1 for that]")
 
 	# Default: no transverse-channel ψ to surface to the caller.
 	transverse_wfn_data = None
@@ -2429,7 +2430,7 @@ def prepare_isdf_and_wavefunctions(
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0)
 			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
 			# the pipeline right after ζ-fit, before the expensive V_q
-			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_RCHUNK_DEBUG=1
+			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_DEBUG_PRINT=1
 			# for fast per-r-chunk timing sweeps.
 			#
 			# The parse used to be a bare presence test, so *every* non-empty
@@ -2458,7 +2459,7 @@ def prepare_isdf_and_wavefunctions(
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
 			# peak stacks on top of.  Same env gate as the ζ-fit probes
-			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
+			# (the one driver debug stream).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
 			V_qmunu, G0, head_channel = compute_V_q(
@@ -2471,7 +2472,7 @@ def prepare_isdf_and_wavefunctions(
 			# G0) plus anything held over from ζ-fit.  Combined with P4
 			# and the V_q HLO buffer-assignment.txt this lets us model
 			# V_q's contribution to overall HBM peak.  Round-1 addition.
-			if env_bool("LORRAX_MEM_DEBUG", False, print_fn=print0):
+			if debug_print_enabled():
 				jax.block_until_ready(V_qmunu)
 			_mem_probe("post_v_q")
 

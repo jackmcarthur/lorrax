@@ -85,7 +85,7 @@
 // stages IFFT[W] in a second grow-only arena of the sharded W tile's size
 // (nk·mx·my·16 B).  Both are cudaMalloc'd outside the XLA allocator — safe
 // under the production env (ffi_env.sh: cuda_async allocator + preallocate
-// false) and logged under LORRAX_CUFFT_LOG, same class as the host
+// false) and logged under LORRAX_DEBUG_PRINT, same class as the host
 // handler's malloc'd V_R arena.  Arena growth cudaDeviceSynchronize()s
 // first so no enqueued work can still reference the old allocation.
 //
@@ -130,25 +130,9 @@ namespace lorrax_ffi::cufft_flat_k {
 namespace ffi = ::xla::ffi;
 using C128 = std::complex<double>;
 
-// Opt-in debug logging.  Presence-tested as before, but now rank-scoped:
-// rank 0 by default, every rank with =all.  ONE spelling per FFI target
-// family across platforms (audit P1.11): LORRAX_FFT_FFI_LOG is the shared
-// knob; LORRAX_CUFFT_LOG / LORRAX_MKLFFT_LOG are deprecated aliases honored
-// on BOTH platforms (announced once) — before this fix the log knob under
-// the SAME target name was spelled differently per platform, so a deck
-// moved between platforms silently lost its logging.  Before the 2026-07-30
-// audit there was additionally no rank guard at all here (mklblas had
-// announce_here(), this file and mklfft had nothing), so at P=1000+ each of
-// the five sites below was multiplied by the process count.  Rank detection
-// reads the launcher env, not MPI_Comm_rank: this TU is comms-free by design
-// and must not link MPI.  See cpp/common/mkl_thread_pin.h.
+// Native FFT detail follows the one rank-zero driver debug stream.
 static bool log_enabled() {
-    static const bool on = [] {
-        static std::atomic<bool> alias_warned{false};
-        return mklpin::log_value_here(mklpin::knob_value(
-            "LORRAX_FFT_FFI_LOG",
-            {"LORRAX_CUFFT_LOG", "LORRAX_MKLFFT_LOG"}, alias_warned));
-    }();
+    static const bool on = mklpin::debug_print_here();
     return on;
 }
 

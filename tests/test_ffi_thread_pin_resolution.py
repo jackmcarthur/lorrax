@@ -93,8 +93,8 @@ int probe_absent(void) {
         "LORRAX_definitely_not_a_real_symbol_9f3a") != nullptr;
 }
 
-int probe_log_here(const char* env) {
-    return lorrax_ffi::mklpin::log_here(env) ? 1 : 0;
+int probe_debug_print(void) {
+    return lorrax_ffi::mklpin::debug_print_here() ? 1 : 0;
 }
 }
 """
@@ -192,7 +192,7 @@ def call(built, *, probe: str, probe_scope: str, fn: str,
     if arg is not None:
         cmd.append(arg)
     e = dict(os.environ)
-    e.pop("LORRAX_TEST_LOG_GATE", None)
+    e.pop("LORRAX_DEBUG_PRINT", None)
     if env:
         e.update(env)
     r = subprocess.run(cmd, capture_output=True, text=True, env=e)
@@ -276,34 +276,29 @@ def test_pin_scope_pins_and_restores(built):
 
 
 # --------------------------------------------------------------------------
-#  Rank scoping of the opt-in C++ debug-log knobs.
+#  Boolean grammar + rank ownership of the one native debug-print switch.
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "value,rank,expect",
     [
         (None, "0", 0),      # unset -> off everywhere
         (None, "7", 0),
-        ("1", "0", 1),       # set -> on at rank 0
-        ("1", "7", 0),       # set -> OFF elsewhere: this is the new rank guard
-        ("all", "7", 1),     # explicit opt-out of the rank guard
-        ("ALL", "7", 1),     # case-insensitive
-        ("*", "7", 1),
-        ("yes", "7", 0),     # any other value keeps the rank-0 default
+        ("0", "0", 0),       # false tokens must not act as presence tests
+        ("OFF", "0", 0),
+        ("1", "0", 1),       # true tokens enable rank 0
+        (" true ", "0", 1),  # case/whitespace grammar matches Python
+        ("YES", "0", 1),
+        ("on", "7", 0),      # debug detail never multiplies by process count
+        ("not-a-bool", "0", 0),
     ],
 )
-def test_log_gate_rank_scoping(built, value, rank, expect):
-    """LORRAX_{MKLFFT,CUFFT}_LOG: presence-tested, rank-0 by default, 'all' opts out.
-
-    Before the audit these two families had NO rank guard, so an opt-in debug
-    log was multiplied by the process count -- and at the mklfft
-    descriptor-commit site by the OpenMP team size on top of that.
-    """
-    name = "LORRAX_TEST_LOG_GATE"
+def test_driver_debug_print_gate_rank_scoping(built, value, rank, expect):
+    """The C++ backends honor the same switch, grammar and rank owner."""
     env = {"SLURM_PROCID": rank}
     for stale in ("PMI_RANK", "OMPI_COMM_WORLD_RANK"):
         env[stale] = ""
     if value is not None:
-        env[name] = value
-    got = call(built, probe="dep", probe_scope="G", fn="probe_log_here",
-               arg=name, env=env)
+        env["LORRAX_DEBUG_PRINT"] = value
+    got = call(built, probe="dep", probe_scope="G",
+               fn="probe_debug_print", env=env)
     assert got == expect
