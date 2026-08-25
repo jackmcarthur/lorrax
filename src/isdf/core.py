@@ -1664,8 +1664,19 @@ def _z_q_face(
 	_bfs = bcr[0][0]
 	use_psi_r_cache = psi_r_cache is not None
 	P_total = p_x * p_y
-	bpd_max = int(psi_G_store._bpd_max)
-	bpd_max_global = bpd_max * P_total
+	local_band_chunk_shape = tuple(
+		int(v) for v in psi_G_store.local_band_chunk_shape)
+	if local_band_chunk_shape[0] != nk or local_band_chunk_shape[2] != ns:
+		raise ValueError(
+			"_z_q_face: PsiGStore public callback shape disagrees with the "
+			f"face carrier: store={local_band_chunk_shape}, nk={nk}, ns={ns}")
+	bpd_max = int(local_band_chunk_shape[1])
+	bpd_max_global = int(psi_G_store.band_chunk_carrier)
+	if bpd_max_global != bpd_max * P_total:
+		raise ValueError(
+			"_z_q_face: PsiGStore public carrier metadata is inconsistent: "
+			f"band_chunk_carrier={bpd_max_global}, local width={bpd_max}, "
+			f"world_size={P_total}")
 	n_bc = len(bcr)
 
 	# Y-side compaction table — IDENTICAL derivation to `_z_q_legacy`'s
@@ -1673,12 +1684,13 @@ def _z_q_face(
 	# untouched body; see its comment for the reasoning).
 	_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
 	for _bc in range(n_bc):
-		_bpd = int(psi_G_store._bpd_per_bc[_bc])
+		_bc_width = bcr[_bc][1] - bcr[_bc][0]
+		_bpd, _remainder = divmod(_bc_width, P_total)
 		_nb_tot = _bpd * P_total
-		if _nb_tot != (bcr[_bc][1] - bcr[_bc][0]) or _bpd > bpd_max:
+		if _remainder or _bpd > bpd_max:
 			raise ValueError(
 				f"_z_q_face band chunk {_bc} width "
-				f"{bcr[_bc][1]-bcr[_bc][0]} is not a multiple of "
+				f"{_bc_width} is not a multiple of "
 				f"world_size {P_total} (bpd_per_bc={_bpd}); set "
 				f"band_chunk_size to a multiple of world_size")
 		if _bpd <= 0:
@@ -1711,7 +1723,7 @@ def _z_q_face(
 	_b_hi_rel_np = np.asarray(
 		[hi - _bfs for (_lo, hi) in bcr], dtype=np.int32)
 
-	ngkmax = int(psi_G_store._per_rank_shape[3])
+	ngkmax = int(local_band_chunk_shape[3])
 	_per_rank_bc_shape = (nk, bpd_max, ns, ngkmax)
 	_slicer_out_sds = jax.ShapeDtypeStruct(_per_rank_bc_shape, jnp.complex128)
 
