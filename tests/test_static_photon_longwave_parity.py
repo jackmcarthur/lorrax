@@ -113,10 +113,7 @@ def test_odd_wing_fit_does_not_count_even_shell_dispersion_as_error():
         material_class="insulator",
     )
 
-    # The Voronoi service may split equal FFT-index radii on nontrivial cell
-    # metrics; the contract is the attained polynomial ranks, not a hard-coded
-    # number of geometric levels.
-    assert coefficients.radial_shell_count >= 4
+    assert coefficients.radial_shell_count == 4
     assert coefficients.odd_extrapolation_rank == 6
     assert coefficients.even_extrapolation_rank == 8
     np.testing.assert_allclose(
