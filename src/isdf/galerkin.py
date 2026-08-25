@@ -31,7 +31,7 @@ from common.shard_map import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import (
-    gflat_to_rchunk_aot_peak_bytes,
+    gflat_to_rchunk_aot_memory,
     load_centroids_band_chunked,
 )
 from distrib_la import plan as linalg_plan
@@ -163,10 +163,11 @@ def _whole_state_memory_ledger(
         n_rtot=int(meta.n_rtot), r_mesh_divisor=r_divisor,
         q_tile_budget=int(q_tile_budget))
     r_carrier = int(stream.max_r_carrier)
-    wfn_rchunk_peak = float(gflat_to_rchunk_aot_peak_bytes(
+    wfn_rchunk_memory = gflat_to_rchunk_aot_memory(
         mesh=mesh_xy, nk=nk, band_carrier=band_carrier,
         nspinor=nspinor, ngkmax=ngkmax, fft_grid=meta.fft_grid,
-        r_carrier=r_carrier, norm="ortho", dtype=jnp.complex128))
+        r_carrier=r_carrier, norm="ortho", dtype=jnp.complex128)
+    wfn_rchunk_peak = float(wfn_rchunk_memory.total)
 
     c16 = float(np.dtype(np.complex128).itemsize)
     f8 = float(np.dtype(np.float64).itemsize)
@@ -206,12 +207,26 @@ def _whole_state_memory_ledger(
                   selected_rows + g_index + psi_r + project_partial)),
     }
     stages["WFN_RCHUNK_TRANSFORM"] = wfn_rchunk_peak
+    stages["WFN_RCHUNK_COMPILED"] = float(
+        wfn_rchunk_memory.compiled_peak)
+    stages["WFN_CUFFT_WORKSPACE"] = float(
+        wfn_rchunk_memory.cufft_scratch)
     stages["r_chunk_carrier"] = float(r_carrier)
     stages["Q_TILE_LOCAL"] = selected_rows
     stages["HWM"] = max(
         value for name, value in stages.items()
         if name not in ("r_chunk_carrier", "Q_TILE_LOCAL"))
     return stages
+
+
+def _whole_state_memory_fits(
+        ledger: dict[str, float], *, capacity_target: float,
+        workspace_reserve: float) -> bool:
+    """Whether both aggregate HWM and one contiguous FFT arena fit."""
+    return (
+        ledger["HWM"] <= float(capacity_target)
+        and ledger["WFN_CUFFT_WORKSPACE"] <= float(workspace_reserve)
+    )
 
 
 def _resolve_whole_state_stream_budget(
@@ -232,6 +247,9 @@ def _resolve_whole_state_stream_budget(
         float(device_pool_limit) * target_utilization
         if device_pool_limit is not None and device_pool_limit > 0
         else None)
+    workspace_reserve = (
+        float(device_pool_limit) - float(capacity_target)
+        if capacity_target is not None else None)
     max_local_r = max(1, requested_q_tile_budget // bytes_per_local_r)
     minimum = _whole_state_memory_ledger(
         meta=meta, mesh_xy=mesh_xy, nk=nk,
@@ -240,14 +258,21 @@ def _resolve_whole_state_stream_budget(
         state_count=state_count, search_rank=search_rank,
         candidate_carrier=candidate_carrier,
         q_tile_budget=bytes_per_local_r)
-    if capacity_target is not None and minimum["HWM"] > capacity_target:
+    if (capacity_target is not None
+            and not _whole_state_memory_fits(
+                minimum, capacity_target=capacity_target,
+                workspace_reserve=workspace_reserve)):
         raise MemoryError(
             "fit_galerkin_basis: the measured whole-state live set does "
             "not fit even at one local real-space column: projected HWM "
             f"{minimum['HWM']/2**30:.2f} GiB/device against the "
             f"fragmentation-safe target {capacity_target/2**30:.2f} "
             f"GiB/device ({target_utilization:.2f} x live budget "
-            f"{float(device_pool_limit)/2**30:.2f} GiB/device). The "
+            f"{float(device_pool_limit)/2**30:.2f} GiB/device), and the "
+            "independently allocated cuFFT workspace is "
+            f"{minimum['WFN_CUFFT_WORKSPACE']/2**30:.2f} GiB/device "
+            "against the contiguous BFC reserve "
+            f"{workspace_reserve/2**30:.2f} GiB/device. The "
             "compiled canonical G-flat -> full-Bloch r-chunk transform "
             "(gather, ifftn(norm='ortho'), slice and phase) is priced at "
             f"{minimum['WFN_RCHUNK_TRANSFORM']/2**30:.2f} GiB/device.")
@@ -265,7 +290,10 @@ def _resolve_whole_state_stream_budget(
                 state_count=state_count, search_rank=search_rank,
                 candidate_carrier=candidate_carrier,
                 q_tile_budget=budget)
-            if capacity_target is None or ledger["HWM"] <= capacity_target:
+            if (capacity_target is None
+                    or _whole_state_memory_fits(
+                        ledger, capacity_target=capacity_target,
+                        workspace_reserve=workspace_reserve)):
                 chosen = (budget, ledger)
                 break
         local_r //= 2
@@ -283,7 +311,8 @@ def _resolve_whole_state_stream_budget(
         + f", r_chunk_carrier={int(ledger['r_chunk_carrier'])}"
         + (f", target={capacity_target/2**30:.2f} GiB "
            f"({target_utilization:.2f} x live budget "
-           f"{float(device_pool_limit)/2**30:.2f} GiB)"
+           f"{float(device_pool_limit)/2**30:.2f} GiB; contiguous cuFFT "
+           f"reserve={workspace_reserve/2**30:.2f} GiB)"
            if capacity_target is not None
            else ", target=unavailable (HWM refusal not run)"))
     if budget < int(requested_q_tile_budget):
@@ -291,7 +320,8 @@ def _resolve_whole_state_stream_budget(
             f"  Whole-state planner reduced the Q budget from "
             f"{requested_q_tile_budget/2**30:.2f} to {budget/2**30:.2f} "
             "GiB/device so the compiled IFFT workspace and persistent fit "
-            "state do not overlap past the fragmentation-safe target")
+            "state satisfy the fragmentation-safe target and contiguous "
+            "workspace reserve")
     return budget, ledger
 
 
