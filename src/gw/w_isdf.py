@@ -1665,8 +1665,13 @@ class StaticPhotonLongWaveCoefficients:
     # Maximum fitted Lorentz/body-block shell closure diagnostics.  Analytic
     # charge replacements are excluded; one shell cannot certify convergence.
     direct_relative_residual: float
+    # Wing closure is measured against the odd-in-q shell component that
+    # actually defines the linear coefficient.  The even-in-q fraction is a
+    # separate finite-shell contamination diagnostic, not a fit error.
     Y_relative_residual: float
     Z_relative_residual: float
+    Y_even_shell_fraction: float
+    Z_even_shell_fraction: float
     uniform_A_residual: float
     hermiticity_residual: float
     g0_copy_residual: float
@@ -1816,6 +1821,12 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
         raise ValueError("fitted +/-q shell is not Cartesian in-plane")
 
     pair_rows = np.eye(shell.size)[partner_position]
+    pair_first = np.flatnonzero(
+        np.arange(shell.size, dtype=np.int32) < partner_position
+    ).astype(np.int32)
+    pair_second = partner_position[pair_first].astype(np.int32)
+    if 2 * pair_first.size != shell.size:
+        raise ValueError("nearest complete shell does not split into +/-q pairs")
     linear_weights = np.linalg.pinv(
         linear, rcond=linear_tol / np.linalg.norm(linear, 2)
     ) @ (0.5 * (np.eye(shell.size) - pair_rows))
@@ -1825,7 +1836,8 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
     shell_radii = np.linalg.norm(q_shell, axis=1)
     return (
         shell, q_shell, q_shell / shell_radii[:, None], shell_radii,
-        linear_weights, quadratic_weights, linear_rank, quadratic_rank,
+        linear_weights, quadratic_weights, pair_first, pair_second,
+        linear_rank, quadratic_rank,
     )
 
 
@@ -1911,7 +1923,8 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
 
     def _local(
         chi_local, g0_x_local, g0_y_local, shell_indices,
-        q_shell_xy, linear_weights, quadratic_weights, prefactor,
+        q_shell_xy, linear_weights, quadratic_weights,
+        pair_first, pair_second, prefactor,
         inverse_volume,
         charge_S, charge_Y_packed_x, charge_Z_packed_y,
         charge_mask_x, charge_mask_y, use_charge,
@@ -2045,60 +2058,108 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
             zero_blocks, zero_blocks, zero_blocks,
             zero_blocks, zero_blocks, zero_blocks,
             zero_blocks, zero_blocks, zero_blocks,
+            zero_blocks, zero_blocks,
+            zero_blocks, zero_blocks,
             zero_real, zero_real,
         )
 
-        def _diagnose_row(carry, shell_position):
+        def _diagnose_pair(carry, pair_position):
             (
                 r_error, r_norm, r_prediction_norm,
                 y_error, y_norm, y_prediction_norm,
                 z_error, z_norm, z_prediction_norm,
+                y_even_norm, y_full_norm,
+                z_even_norm, z_full_norm,
                 herm_error, herm_scale,
             ) = carry
-            r_row, y_row, z_row, t_row, u_row, _ = (
-                _project_shell_row(shell_position))
-            q_row = q_shell_xy[shell_position]
-            r_prediction = (
-                jnp.einsum("a,aAB->AB", q_row, H_shell, optimize=True)
+            plus_position = pair_first[pair_position]
+            minus_position = pair_second[pair_position]
+            r_plus, y_plus, z_plus, t_plus, u_plus, _ = (
+                _project_shell_row(plus_position))
+            r_minus, y_minus, z_minus, t_minus, u_minus, _ = (
+                _project_shell_row(minus_position))
+            q_plus = q_shell_xy[plus_position]
+            q_minus = q_shell_xy[minus_position]
+            r_prediction_plus = (
+                jnp.einsum("a,aAB->AB", q_plus, H_shell, optimize=True)
                 + jnp.einsum(
-                    "a,b,abAB->AB", q_row, q_row, Q, optimize=True))
+                    "a,b,abAB->AB", q_plus, q_plus, Q, optimize=True))
+            r_prediction_minus = (
+                jnp.einsum("a,aAB->AB", q_minus, H_shell, optimize=True)
+                + jnp.einsum(
+                    "a,b,abAB->AB", q_minus, q_minus, Q, optimize=True))
+
+            # The wing coefficients were fitted from the odd projector
+            # (I-P_-q)/2.  Diagnose that same target.  Comparing a q-linear
+            # prediction with the unprojected finite-q wing folds the even
+            # O(q^2) spatial-dispersion piece into the alleged fit error; on
+            # the first CrI3 shell that produced the reported 0.770 number.
+            y_odd = 0.5 * (y_plus - y_minus)
+            z_odd = 0.5 * (z_plus - z_minus)
+            y_even = 0.5 * (y_plus + y_minus)
+            z_even = 0.5 * (z_plus + z_minus)
             y_prediction = jnp.einsum(
-                "a,aAI->AI", q_row, Y, optimize=True)
+                "a,aAI->AI", q_plus, Y, optimize=True)
             z_prediction = jnp.einsum(
-                "a,aJB->JB", q_row, Z, optimize=True)
+                "a,aJB->JB", q_plus, Z, optimize=True)
             return (
-                r_error + _abs2(r_prediction - r_row),
-                r_norm + _abs2(r_row),
-                r_prediction_norm + _abs2(r_prediction),
-                y_error + _head_body_block_norms(y_prediction - y_row),
-                y_norm + _head_body_block_norms(y_row),
+                r_error + _abs2(r_prediction_plus - r_plus)
+                        + _abs2(r_prediction_minus - r_minus),
+                r_norm + _abs2(r_plus) + _abs2(r_minus),
+                r_prediction_norm + _abs2(r_prediction_plus)
+                                  + _abs2(r_prediction_minus),
+                y_error + _head_body_block_norms(y_prediction - y_odd),
+                y_norm + _head_body_block_norms(y_odd),
                 y_prediction_norm + _head_body_block_norms(y_prediction),
-                z_error + _body_head_block_norms(z_prediction - z_row),
-                z_norm + _body_head_block_norms(z_row),
+                z_error + _body_head_block_norms(z_prediction - z_odd),
+                z_norm + _body_head_block_norms(z_odd),
                 z_prediction_norm + _body_head_block_norms(z_prediction),
+                y_even_norm + _head_body_block_norms(y_even),
+                y_full_norm + 0.5 * (
+                    _head_body_block_norms(y_plus)
+                    + _head_body_block_norms(y_minus)),
+                z_even_norm + _body_head_block_norms(z_even),
+                z_full_norm + 0.5 * (
+                    _body_head_block_norms(z_plus)
+                    + _body_head_block_norms(z_minus)),
                 jnp.maximum(
                     herm_error,
-                    jnp.max(jnp.abs(t_row - jnp.conj(
-                        jnp.swapaxes(u_row, 0, 1))))),
+                    jnp.maximum(
+                        jnp.max(jnp.abs(t_plus - jnp.conj(
+                            jnp.swapaxes(u_plus, 0, 1)))),
+                        jnp.max(jnp.abs(t_minus - jnp.conj(
+                            jnp.swapaxes(u_minus, 0, 1)))))),
                 jnp.maximum(
                     herm_scale,
-                    jnp.maximum(jnp.max(jnp.abs(t_row)),
-                                jnp.max(jnp.abs(u_row)))),
+                    jnp.maximum(
+                        jnp.maximum(jnp.max(jnp.abs(t_plus)),
+                                    jnp.max(jnp.abs(u_plus))),
+                        jnp.maximum(jnp.max(jnp.abs(t_minus)),
+                                    jnp.max(jnp.abs(u_minus))))),
             ), None
 
         (
             r_error, r_norm, r_prediction_norm,
             y_error, y_norm, y_prediction_norm,
             z_error, z_norm, z_prediction_norm,
+            y_even_norm, y_full_norm,
+            z_even_norm, z_full_norm,
             hermiticity_error, hermiticity_scale,
         ), _ = jax.lax.scan(
-            _diagnose_row, diagnostic_initial, shell_positions, unroll=1)
+            _diagnose_pair, diagnostic_initial,
+            jnp.arange(pair_first.shape[0], dtype=jnp.int32), unroll=1)
         y_error, y_norm, y_prediction_norm = (
             jax.lax.psum(value, "x") for value in (
                 y_error, y_norm, y_prediction_norm))
         z_error, z_norm, z_prediction_norm = (
             jax.lax.psum(value, "y") for value in (
                 z_error, z_norm, z_prediction_norm))
+        y_even_norm, y_full_norm = (
+            jax.lax.psum(value, "x") for value in (
+                y_even_norm, y_full_norm))
+        z_even_norm, z_full_norm = (
+            jax.lax.psum(value, "y") for value in (
+                z_even_norm, z_full_norm))
 
         # Diagnose closure per Lorentz/body-channel block, excluding exactly
         # the (0,0) entries replaced by the canonical analytic charge S/Y/Z.
@@ -2120,6 +2181,17 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
             y_error, y_norm, y_prediction_norm)
         z_residual = _maximum_block_residual(
             z_error, z_norm, z_prediction_norm)
+
+        def _maximum_even_fraction(even_sq, full_sq):
+            denominator = jnp.maximum(
+                jnp.sqrt(full_sq), jnp.finfo(real_dtype).tiny)
+            relative = jnp.sqrt(even_sq) / denominator
+            return jnp.max(jnp.where(fitted_blocks, relative, 0.0))
+
+        y_even_fraction = _maximum_even_fraction(
+            y_even_norm, y_full_norm)
+        z_even_fraction = _maximum_even_fraction(
+            z_even_norm, z_full_norm)
 
         uniform_A = jnp.max(
             jnp.abs(r0_natural[1:, 1:] * inverse_volume))
@@ -2177,6 +2249,7 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
         return (
             H, Q, Y, Z,
             direct_residual, y_residual, z_residual,
+            y_even_fraction, z_even_fraction,
             uniform_A, hermiticity_error, hermiticity_scale,
             g0_copy_error, g0_copy_scale,
             g0_nonfinite | sampled_nonfinite | analytic_nonfinite,
@@ -2188,7 +2261,8 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
         in_specs=(
             P(None, "x", "y"),
             P(None, None, "x"), P(None, None, "y"),
-            P(None), P(None, None), P(None, None), P(None, None), P(), P(),
+            P(None), P(None, None), P(None, None), P(None, None),
+            P(None), P(None), P(), P(),
             P(None, None), P(None, None, "x"),
             P(None, None, "y"), P(None, None, "x"),
             P(None, None, "y"), P(),
@@ -2196,7 +2270,7 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
         out_specs=(
             P(None, None, None), P(None, None, None, None),
             P(None, None, "x"), P(None, "y", None),
-            P(), P(), P(), P(), P(), P(), P(), P(), P(),
+            P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
         ),
         check_vma=False,
     ))
@@ -2307,7 +2381,8 @@ def fit_static_photon_longwave_coefficients(
             f"sym.nk_tot={getattr(sym, 'nk_tot', None)}")
     (
         shell, q_shell, directions, shell_radii,
-        linear_weights, quadratic_weights, linear_rank, quadratic_rank,
+        linear_weights, quadratic_weights, pair_first, pair_second,
+        linear_rank, quadratic_rank,
     ) = _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr)
     charge_S, charge_Y, charge_Z, use_charge, charge_source = (
         _static_charge_longwave_inputs(charge_response, layout, mesh_xy))
@@ -2343,7 +2418,8 @@ def fit_static_photon_longwave_coefficients(
 
     rep1 = NamedSharding(mesh_xy, P(None))
     rep2 = NamedSharding(mesh_xy, P(None, None))
-    shell_device = jax.device_put(shell, rep1)
+    shell_device, pair_first_device, pair_second_device = jax.device_put(
+        (shell, pair_first, pair_second), (rep1, rep1, rep1))
     q_device = jax.device_put(q_shell, rep2)
     linear_device = jax.device_put(linear_weights, rep2)
     quadratic_device = jax.device_put(quadratic_weights, rep2)
@@ -2368,6 +2444,8 @@ def fit_static_photon_longwave_coefficients(
         q_device,
         linear_device,
         quadratic_device,
+        pair_first_device,
+        pair_second_device,
         prefactor,
         inverse_volume,
         charge_S,
@@ -2378,14 +2456,15 @@ def fit_static_photon_longwave_coefficients(
         use_charge_device,
     )
     H, Q, Y, Z = results[:4]
-    # These nine values are replicated scalars already.  Copy the tiny tuple
+    # These values are replicated scalars already.  Copy the tiny tuple
     # directly instead of compiling a second program merely to stack it.
     diagnostics = np.asarray(
         [np.asarray(value).item() for value in jax.device_get(results[4:])],
         dtype=np.float64,
     )
     (
-        direct_residual, y_residual, z_residual, uniform_A,
+        direct_residual, y_residual, z_residual,
+        y_even_fraction, z_even_fraction, uniform_A,
         hermiticity_error, hermiticity_scale,
         g0_copy_error, g0_copy_scale, nonfinite,
     ) = diagnostics.tolist()
@@ -2426,6 +2505,8 @@ def fit_static_photon_longwave_coefficients(
         direct_relative_residual=float(direct_residual),
         Y_relative_residual=float(y_residual),
         Z_relative_residual=float(z_residual),
+        Y_even_shell_fraction=float(y_even_fraction),
+        Z_even_shell_fraction=float(z_even_fraction),
         uniform_A_residual=float(uniform_A),
         hermiticity_residual=float(hermiticity_error),
         g0_copy_residual=float(g0_copy_error),
@@ -2683,9 +2764,11 @@ def compute_static_photon_response(
             print(
                 "  [photon q0] coupled slab head/wings complete: "
                 f"shell_rows={len(coefficients.shell_indices)}, "
-                f"fit_residuals=(direct={coefficients.direct_relative_residual:.3e}, "
+                f"odd_fit_residuals=(direct={coefficients.direct_relative_residual:.3e}, "
                 f"Y={coefficients.Y_relative_residual:.3e}, "
                 f"Z={coefficients.Z_relative_residual:.3e}), "
+                f"wing_even_shell_fractions=(Y={coefficients.Y_even_shell_fraction:.3e}, "
+                f"Z={coefficients.Z_even_shell_fraction:.3e}), "
                 f"Dyson={completion.max_dyson_relative_residual:.3e}",
                 flush=True,
             )
@@ -2697,9 +2780,12 @@ def compute_static_photon_response(
                 f"radii_bohr^-1={coefficients.shell_radii_bohr_inv}; "
                 f"design_ranks=({coefficients.linear_rank},"
                 f"{coefficients.quadratic_rank}); "
-                f"max_fitted_block_residuals=({coefficients.direct_relative_residual:.6e},"
+                f"max_odd_fitted_block_residuals=({coefficients.direct_relative_residual:.6e},"
                 f"{coefficients.Y_relative_residual:.6e},"
                 f"{coefficients.Z_relative_residual:.6e}); "
+                f"max_wing_even_shell_fractions=("
+                f"{coefficients.Y_even_shell_fraction:.6e},"
+                f"{coefficients.Z_even_shell_fraction:.6e}); "
                 f"g0={coefficients.g0_provenance}; "
                 f"charge={coefficients.charge_response_source}; "
                 f"hall_topological={coefficients.hall_topological_source}; "
