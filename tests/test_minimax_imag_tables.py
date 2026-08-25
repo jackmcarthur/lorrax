@@ -288,6 +288,20 @@ def test_static_no_clobber_preserves_prior_rows_bytes_and_sweep(
         max_error = 3.0e-8
 
     monkeypatch.setattr(static_gen, "solve_uncertified", lambda **_kw: _Rule())
+    monkeypatch.setattr(
+        static_gen, "certify_noncrossing_inverse",
+        lambda tau, alpha, *_args: {
+            "certified": True, "failures": [], "max_error": 3.0e-8,
+            "held_out_max_error": 3.0e-8, "derivative_root_count": 1,
+            "local_refinement_count": 1, "n_eval": 5,
+            "kappa0": 1.0, "kappa0_bound": 2.0,
+            "sum_abs_alpha": float(np.sum(np.abs(alpha))),
+            "rescale_max_error_ratio": 1.0,
+            "payload_sha256": static_gen.payload_sha256(tau, alpha),
+        })
+    monkeypatch.setattr(
+        static_gen, "_generator_provenance",
+        lambda: {"tool": "fixture", "generator_commit": "fixture"})
     doc = static_gen.generate_assets(
         output_root=tmp_path,
         error_bounds=[6.86665972794514e-8],

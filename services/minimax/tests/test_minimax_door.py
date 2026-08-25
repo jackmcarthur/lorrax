@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import warnings
 
+import numpy as np
 import pytest
 
 import minimax as M
@@ -206,6 +207,132 @@ def test_certified_and_shipped_are_different_claims():
     assert q.provenance.certified is False
     assert "shipped" in q.provenance.one_line()
     assert "UNCERTIFIED" in q.provenance.one_line()
+
+
+def test_mixed_v1_certified_entry_is_complete_and_error_bound_to_payload(
+        tmp_path, monkeypatch):
+    """A certified append cannot borrow legacy absence or a catalog claim."""
+    from minimax import _catalog as C                # noqa: PLC0415
+
+    tau = np.array([0.5], dtype=np.float64)
+    alpha = np.array([1.0], dtype=np.float64)
+    provenance = {
+        "tool": "tools/generate_minimax_assets.py",
+        "tool_sha256": "1" * 64,
+        "generator_commit": "2" * 40,
+        "backend_sha256": "3" * 64,
+    }
+    entry = {
+        "family": "noncrossing", "range_max": 2.0,
+        "error_bound": 1.0e-6, "node_count": 1,
+        "file": "noncrossing/certified.npz", "max_error": 1.0e-8,
+        "kappa0": 1.0, "payload_sha256": M.payload_sha256(tau, alpha),
+        "certification": {"checks": ["refined_error"]},
+        "provenance": provenance, "certified": True,
+    }
+    for missing in ("payload_sha256", "kappa0", "certification",
+                    "provenance"):
+        incomplete = dict(entry)
+        incomplete.pop(missing)
+        with pytest.raises(M.CatalogCorrupt, match="incomplete"):
+            M.parse_catalog(
+                {"schema_version": 1, "tables": [incomplete]},
+                catalog_name="incomplete.json")
+
+    for invalid_error in (-1.0, np.inf, 2.0e-6):
+        invalid = dict(entry, max_error=invalid_error)
+        with pytest.raises(M.CatalogCorrupt, match="within"):
+            M.parse_catalog(
+                {"schema_version": 1, "tables": [invalid]},
+                catalog_name="invalid-error.json")
+
+    root = tmp_path / "minimax_assets"
+    path = root / entry["file"]
+    path.parent.mkdir(parents=True)
+    np.savez_compressed(
+        path, tau=tau, alpha=alpha,
+        max_error=np.asarray(2.0e-8, dtype=np.float64))
+    monkeypatch.setattr(C, "_asset_root", lambda: root)
+    C.clear_caches()
+    parsed = M.parse_catalog(
+        {"schema_version": 1, "tables": [entry]},
+        catalog_name="mismatched.json")[0]
+    with pytest.raises(M.TableUnreadable, match="differs bit-exactly"):
+        C.load_table(parsed)
+    np.savez_compressed(
+        path, tau=tau, alpha=alpha,
+        max_error=np.asarray(np.inf, dtype=np.float64))
+    C.clear_caches()
+    with pytest.raises(M.TableUnreadable, match="payload max_error=.*within"):
+        C.load_table(parsed)
+
+
+@pytest.mark.parametrize("tau,alpha,node_count,match", [
+    (np.array([[0.5]]), np.array([1.0]), 1, "equal-length 1-D"),
+    (np.array([0.5]), np.array([1.0]), 2, "matching node_count"),
+    (np.array([np.nan]), np.array([1.0]), 1, "non-finite"),
+    (np.array([0.5]), np.array([-1.0]), 1, "positive real"),
+])
+def test_certified_noncrossing_payload_shape_and_values_refuse(
+        tmp_path, monkeypatch, tau, alpha, node_count, match):
+    """Selector metadata cannot outrun the certified numerical payload."""
+    from minimax import _catalog as C                # noqa: PLC0415
+
+    root = tmp_path / "minimax_assets"
+    rel = "noncrossing/certified.npz"
+    path = root / rel
+    path.parent.mkdir(parents=True)
+    np.savez_compressed(
+        path, tau=tau, alpha=alpha,
+        max_error=np.asarray(1.0e-8, dtype=np.float64))
+    raw = {
+        "family": "noncrossing", "range_max": 2.0,
+        "error_bound": 1.0e-6, "node_count": node_count, "file": rel,
+        "max_error": 1.0e-8, "kappa0": 1.0,
+        "payload_sha256": M.payload_sha256(tau, alpha),
+        "certification": {"checks": ["refined_error"]},
+        "provenance": {
+            "tool": "tools/generate_minimax_assets.py",
+            "tool_sha256": "1" * 64, "generator_commit": "2" * 40,
+            "backend_sha256": "3" * 64,
+        },
+        "certified": True,
+    }
+    entry = M.parse_catalog(
+        {"schema_version": 1, "tables": [raw]},
+        catalog_name="bad-payload.json")[0]
+    monkeypatch.setattr(C, "_asset_root", lambda: root)
+    C.clear_caches()
+    with pytest.raises(M.TableUnreadable, match=match):
+        C.load_table(entry)
+
+
+def test_final_run33_two_pane_requests_are_publicly_certified():
+    """The final equal-range plan is closed; obsolete percentile panes are not."""
+    low = M.lookup(
+        family="noncrossing", target="inverse",
+        range_value=212.23793639387773,
+        error_bound=3.4533298639725701e-8, n_max=64)
+    assert low.provenance.catalog_entry.endswith(
+        "noncrossing_R_256p000000_eps_3p0em08.npz")
+    assert low.provenance.certified is True
+    assert low.max_error == 1.8089704512114224e-8
+    assert low.kappa0 == 1.0000026652201994
+    assert "tools/generate_minimax_assets.py@c55621b2" in (
+        low.provenance.generator_commit)
+    assert "id-" in low.provenance.generation_backend
+    assert low.provenance.one_line().endswith("CERTIFIED")
+
+    high = M.lookup(
+        family="noncrossing", target="inverse",
+        range_value=212.32817285287737,
+        error_bound=4.9322777100153476e-7, n_max=64)
+    assert high.provenance.catalog_entry.endswith(
+        "noncrossing_R_215p443469_eps_2p0em07.npz")
+    assert high.provenance.certified is True
+    assert high.max_error == 5.882476630022365e-8
+    assert high.kappa0 == 1.0000064579102943
+    assert high.provenance.one_line().endswith("CERTIFIED")
 
 
 # ---------------------------------------------------------------------------

@@ -353,6 +353,25 @@ def _sum_abs_w(w: np.ndarray) -> float:
     return float(np.sum(np.abs(np.asarray(w))))
 
 
+def noncrossing_kappa0(
+    tau: np.ndarray,
+    weights: np.ndarray,
+    range_value: float,
+    *,
+    n_eval: int = 512,
+) -> float:
+    """Return the service-owned noncrossing amplification functional."""
+    tau = np.asarray(tau, dtype=np.float64)
+    weights = np.asarray(weights)
+    upper = max(float(range_value), 1.0 + 1.0e-12)
+    u = np.geomspace(1.0, upper, int(n_eval))
+    envelope = u * np.sum(
+        np.abs(weights)[None, :] * np.exp(-tau[None, :] * u[:, None]),
+        axis=1,
+    )
+    return float(np.max(envelope))
+
+
 def _kappa0(family: str, tau: np.ndarray, w: np.ndarray,
             range_value: float) -> float:
     """The amplification metric, per family.
@@ -368,11 +387,7 @@ def _kappa0(family: str, tau: np.ndarray, w: np.ndarray,
     w = np.asarray(w)
     if family == "crossing":
         return _sum_abs_w(w)
-    tau = np.asarray(tau, dtype=np.float64)
-    u = np.geomspace(1.0, max(float(range_value), 1.0 + 1e-12), 512)
-    env = u * np.sum(np.abs(w)[None, :] * np.exp(-tau[None, :] * u[:, None]),
-                     axis=1)
-    return float(np.max(env))
+    return noncrossing_kappa0(tau, w, range_value)
 
 
 def _announce(quad: Quadrature) -> None:
