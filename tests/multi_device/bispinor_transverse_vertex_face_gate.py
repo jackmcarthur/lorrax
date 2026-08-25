@@ -43,6 +43,12 @@ Checks:
      Hartree without running the historical bare-X path.  ``mu_L == 0``
      also exercises the no-op short-circuit path
      (``with_lorentz_vertices`` returns the SAME bundle object).
+  3. The static four-current bubble for all 16 Lorentz blocks against a
+     literal ordered-band-pair NumPy oracle on deterministic complex
+     broken-TR states.  Longitudinal and transverse centroid extents differ,
+     so CT/TC reverse axes cannot pass by an accidental square transpose.
+     The combined tensor is Hermitian per q and exactly q-reciprocal; a
+     distinct-but-value-identical CC endpoint matches scalar charge.
 
 Run:
     lx run -N 1 -G 4 -n 4 bash <pythonpath-wrapper> python3 -u \\
@@ -332,6 +338,131 @@ def check_sigma_sx_chain_face_matches_legacy(
 
 
 # ---------------------------------------------------------------------------
+# 3. Static four-current ordered-pair response vs literal band sum.
+# ---------------------------------------------------------------------------
+
+def check_four_current_ordered_pair_all16(
+        mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8):
+    """Discriminate AB/BA, q/-q, and rectangular CT/TC orientations."""
+    import jax
+    from types import SimpleNamespace
+
+    from symmetry_maps import q_negation_index
+    from gw import w_isdf
+    from gw.wavefunction_bundle import (
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
+
+    if dtype != "complex128":
+        raise ValueError("four-current ordered-pair gate requires complex128")
+    rng = np.random.default_rng(2026082517)
+    psi_c = _rng_mat(rng, (nk, nb, 4, n_c), np.complex128)
+    psi_t = _rng_mat(rng, (nk, nb, 4, n_t), np.complex128)
+    enk = np.tile(np.asarray([-0.5, -0.5, 0.5, 0.5]), (nk, 1))
+    occ = np.tile(np.asarray([1.0, 1.0, 0.0, 0.0]), (nk, 1))
+    slices = BandSlices.from_band_edges(0, 0, 2, 4, 4)
+
+    def bundle(psi):
+        return Wavefunctions(
+            psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+            psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
+            enk=_put(enk, mesh, (None, None)),
+            occ=_put(occ, mesh, (None, None)),
+            slices=slices, layout="face")
+
+    wfns_c = bundle(psi_c)
+    wfns_t = bundle(psi_t)
+    families = (wfns_c, wfns_t, wfns_t, wfns_t)
+    psi_families = (psi_c, psi_t, psi_t, psi_t)
+    extents = (n_c, n_t, n_t, n_t)
+    offsets = np.cumsum((0,) + extents)
+    quad = SimpleNamespace(
+        tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
+    meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
+
+    got_blocks = {}
+    worst_oracle = 0.0
+    for A in range(4):
+        gamma_a = _gamma_full(A)
+        psi_a = psi_families[A]
+        for B in range(4):
+            gamma_b = _gamma_full(B)
+            psi_b = psi_families[B]
+            got = _gather(w_isdf.compute_no_pair_dirac_current_block(
+                families[A], families[B], quad, meta, mesh,
+                vertex_left=A, vertex_right=B))
+            want = np.zeros(
+                (nk, extents[A], extents[B]), dtype=np.complex128)
+            for q in range(nk):
+                for k in range(nk):
+                    kmq = (k - q) % nk
+                    for v in (0, 1):
+                        for c in (2, 3):
+                            # Occupied-to-empty ordered transition.
+                            left_vc = np.einsum(
+                                "am,aA,Am->m", psi_a[k, v], gamma_a,
+                                np.conj(psi_a[kmq, c]), optimize=True)
+                            right_vc = np.einsum(
+                                "bn,Bb,Bn->n", np.conj(psi_b[k, v]),
+                                gamma_b, psi_b[kmq, c], optimize=True)
+                            # Empty-to-occupied ordered transition.  This is
+                            # F_BA(-q)^dagger after relabelling k; spelling it
+                            # directly keeps the oracle independent of the
+                            # production R-space completion.
+                            left_cv = np.einsum(
+                                "am,aA,Am->m", psi_a[k, c], gamma_a,
+                                np.conj(psi_a[kmq, v]), optimize=True)
+                            right_cv = np.einsum(
+                                "bn,Bb,Bn->n", np.conj(psi_b[k, c]),
+                                gamma_b, psi_b[kmq, v], optimize=True)
+                            want[q] -= (
+                                left_vc[:, None] * right_vc[None, :]
+                                + left_cv[:, None] * right_cv[None, :]
+                            ) / np.sqrt(float(nk))
+            err = _rel(got, want)
+            worst_oracle = max(worst_oracle, err)
+            assert err < RTOL, (
+                f"four-current ({A},{B}) ordered-pair rel err {err:.3e}")
+            got_blocks[A, B] = got
+
+    combined = np.zeros(
+        (nk, int(offsets[-1]), int(offsets[-1])), dtype=np.complex128)
+    for A in range(4):
+        for B in range(4):
+            combined[:, offsets[A]:offsets[A + 1],
+                     offsets[B]:offsets[B + 1]] = got_blocks[A, B]
+    scale = max(float(np.max(np.abs(combined))), 1e-300)
+    herm = max(float(np.max(np.abs(row - row.conj().T)))
+               for row in combined) / scale
+    neg = q_negation_index((nk, 1, 1))
+    reciprocity = float(np.max(
+        np.abs(combined - np.conj(combined[neg])))) / scale
+    assert herm < RTOL, f"combined current chi Hermiticity {herm:.3e}"
+    assert reciprocity < RTOL, (
+        f"combined current chi q reciprocity {reciprocity:.3e}")
+
+    # Object identity is deliberately absent from the physics dispatch.
+    # A separately allocated but value-identical right endpoint must run the
+    # same CC contraction and equal the scalar charge SSOT bit for bit.
+    wfns_c_clone = bundle(psi_c.copy())
+    assert wfns_c_clone is not wfns_c
+    cc_distinct = _gather(w_isdf.compute_no_pair_dirac_current_block(
+        wfns_c, wfns_c_clone, quad, meta, mesh,
+        vertex_left=0, vertex_right=0))
+    cc_charge = _gather(w_isdf.compute_chi0(
+        wfns_c, quad, meta, mesh))
+    assert np.array_equal(cc_distinct, cc_charge), (
+        "distinct value-identical CC endpoints differ from charge SSOT: "
+        f"rel={_rel(cc_distinct, cc_charge):.3e}")
+
+    return {
+        "all16_worst_rel": worst_oracle,
+        "combined_hermiticity": herm,
+        "q_reciprocity": reciprocity,
+        "distinct_cc_bit_equal": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI mode.
 # ---------------------------------------------------------------------------
 
@@ -345,6 +476,8 @@ _CLI_CELLS = (
          check_sigma_sx_chain_face_matches_legacy(
              mesh, dt, mu_L=mu_L, nu_L=nu_L)))
        for (mu_L, nu_L) in _LORENTZ_PAIRS]
+    + [("four_current_ordered_pair_all16",
+        check_four_current_ordered_pair_all16)]
 )
 
 

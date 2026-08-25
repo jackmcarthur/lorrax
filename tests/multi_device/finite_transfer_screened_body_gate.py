@@ -140,6 +140,8 @@ def check_finite_transfer_screened_body(mesh):
         psi_4, iq_irr=0, **endpoint_kwargs)
     endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4, iq_irr=1, **endpoint_kwargs)
+    endpoint_minus_q = mtxel_sweep.finite_transfer_current_to_centroids(
+        psi_4, iq_irr=3, **endpoint_kwargs)
     endpoint.current_nmu.block_until_ready()
     del endpoint_q0
 
@@ -182,7 +184,7 @@ def check_finite_transfer_screened_body(mesh):
         slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face")
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
-    meta = SimpleNamespace(nk_tot=nk)
+    meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=nk)
     try:
         w_isdf.compute_finite_transfer_current_block_row(
             endpoint, wfns, quad, meta, mesh,
@@ -194,7 +196,7 @@ def check_finite_transfer_screened_body(mesh):
         raise AssertionError(
             "finite-transfer public body row accepted no source receipt")
     chi = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint, wfns, quad, meta, mesh,
+        endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     chi.block_until_ready()
     if chi.sharding.spec != P("x", "y"):
