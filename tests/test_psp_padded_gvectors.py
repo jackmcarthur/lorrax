@@ -93,20 +93,25 @@ def _pad(G, ngkmax):
 # ---------------------------------------------------------------------------
 
 def test_g_lookup_padded_matches_ragged_on_the_physical_prefix():
-    from psp.get_dipole_mtxels import _build_g_lookup
+    from common.parallel_transport import build_g_wrap_lookup
 
     G_k = _sphere(11, 29)
     G_can = _sphere(12, 33)
     ngk_k, ngk_can = int(G_k.shape[0]), int(G_can.shape[0])
     ngkmax = 40
+    ref_width = max(ngk_k, ngk_can) + 1
+    Gr_k, _ = _pad(G_k, ref_width)
+    Gr_can, _ = _pad(G_can, ref_width)
     Gp_k, _ = _pad(G_k, ngkmax)
     Gp_can, _ = _pad(G_can, ngkmax)
     G_wrap = np.asarray([1, 0, -1], dtype=np.int32)
 
-    ref_map, ref_mask = _build_g_lookup(G_can, G_k, G_wrap,
-                                         ngk_kmq=ngk_can, ngk_k=ngk_k)
-    pad_map, pad_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                         ngk_kmq=ngk_can, ngk_k=ngk_k)
+    ref_map, ref_mask = build_g_wrap_lookup(
+        Gr_can, Gr_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
+    pad_map, pad_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
 
     assert pad_map.shape == (ngkmax,) and pad_mask.shape == (ngkmax,)
     assert np.array_equal(pad_map[:ngk_k], ref_map[:ngk_k])
@@ -125,7 +130,7 @@ def test_g_lookup_pad_rows_would_alias_a_real_bra_G_without_the_extent():
     unlike everywhere else in the D10 work, the damage here is not a
     doubled Γ but a spurious cross term between two different G.
     """
-    from psp.get_dipole_mtxels import _build_g_lookup
+    from common.parallel_transport import build_g_wrap_lookup
 
     G_k = _sphere(21, 25)
     G_can = _sphere(22, 30)
@@ -136,11 +141,13 @@ def test_g_lookup_pad_rows_would_alias_a_real_bra_G_without_the_extent():
     # Pick a shift that IS in the bra sphere, so a pad row resolves.
     G_wrap = np.asarray(G_can[5], dtype=np.int32)
 
-    good_map, good_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                           ngk_kmq=ngk_can, ngk_k=ngk_k)
+    good_map, good_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
     # NEGATIVE CONTROL: pretend the whole padded width is physical.
-    bad_map, bad_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                         ngk_kmq=ngkmax, ngk_k=ngkmax)
+    bad_map, bad_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngkmax, ngk_center=ngkmax)
 
     assert not good_mask[ngk_k:].any(), "pad rows must be gated off"
     assert bad_mask[ngk_k:].any(), (

@@ -51,7 +51,9 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 blocks_to_host, dipole_operator,
                                 sweep_matrix_elements)
-from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+from common.parallel_transport import (
+	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
+)
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common.bispinor_init import (
@@ -152,54 +154,6 @@ def compute_block_direct_cnk(*args, **kwargs):
 # --------------------------
 # Finite-q matrix elements for SOS chi head/wing/S/w pipeline
 # --------------------------
-
-def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
-                     G_wrap: np.ndarray, *,
-                     ngk_kmq: int, ngk_k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Per-(k, q) integer lookup that translates between the G-spheres of
-    ``k`` and ``canonical(k − q)`` under umklapp.
-
-    For each μ_k in the ket's G-sphere, we want the μ_kmq such that
-    ``Gk_int_kmq[μ_kmq] == Gk_int_k[μ_k] + G_wrap``.  When that G-vector
-    lies outside the canonical-kmq sphere we mark it −1 (the bra
-    coefficient there is zero anyway, so the contribution to the
-    overlap is zero).
-
-    Both G-lists are the loader's fixed ``(ngkmax, 3)`` tables, so the
-    PHYSICAL extents ``ngk_kmq`` / ``ngk_k`` are passed explicitly and the
-    pad rows take no part:
-
-    * the bra-side dictionary is built over the first ``ngk_kmq`` rows —
-      the pad rows are all ``(0,0,0)``, so including them would rebind
-      the Γ key to the LAST pad index and every ket G that maps to Γ
-      would then read a zero coefficient;
-    * the ket-side loop runs over the first ``ngk_k`` rows and the rest
-      of the mask is False — a pad row would otherwise look up
-      ``(0,0,0) + G_wrap``, which is frequently a real member of the bra
-      sphere, and contribute a spurious ψ(Γ) term.
-
-    The Python dictionary work is therefore unchanged from the ragged
-    route; only the returned arrays are widened to ``ngkmax``.
-
-    Returns
-    -------
-    map_arr : (ngkmax,) int32  — μ_kmq index per μ_k (0 placeholder where
-              not found or padded; use ``mask`` to gate).
-    mask    : (ngkmax,) bool   — True where the lookup succeeded.
-    """
-    ngkmax = int(Gk_int_k.shape[0])
-    ngk_k = int(ngk_k)
-    target = Gk_int_k[:ngk_k] + G_wrap[None, :]                         # (ngk_k, 3)
-    g_dict = {tuple(int(x) for x in g): i
-              for i, g in enumerate(Gk_int_kmq[:int(ngk_kmq)])}
-    map_arr = np.zeros(ngkmax, dtype=np.int32)
-    mask = np.zeros(ngkmax, dtype=bool)
-    for i, t in enumerate(target):
-        idx = g_dict.get((int(t[0]), int(t[1]), int(t[2])), -1)
-        mask[i] = idx >= 0
-        map_arr[i] = idx if idx >= 0 else 0
-    return map_arr, mask
-
 
 @functools.partial(jax.jit, static_argnames=('selected_dirac_current',))
 def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
@@ -449,9 +403,10 @@ def compute_finite_q_mtxels(
 
             Gk_int_k   = np.asarray(gtab.gvecs[ik],   dtype=np.int32)
             Gk_int_can = np.asarray(gtab.gvecs[ikmq], dtype=np.int32)
-            map_arr, mask = _build_g_lookup(
+            map_arr, mask = build_g_wrap_lookup(
                 Gk_int_can, Gk_int_k, G_wrap_np,
-                ngk_kmq=int(gtab.ngk[ikmq]), ngk_k=int(gtab.ngk[ik]))
+                ngk_neighbor=int(gtab.ngk[ikmq]),
+                ngk_center=int(gtab.ngk[ik]))
             map_arr_j = jnp.asarray(map_arr, dtype=jnp.int32)
             mask_j    = jnp.asarray(mask)
 
