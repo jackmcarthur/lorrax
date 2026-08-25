@@ -523,6 +523,8 @@ def apply_eqp_corrections(
     eqp_file: str,
     input_file: str,
     ry_to_ev: float = 13.6056980659,
+    *,
+    state_artifact_path: str | None = None,
 ) -> np.ndarray:
     """Apply BGW ``eqp{0,1}.dat`` corrections to full-BZ DFT eigenvalues.
 
@@ -560,7 +562,9 @@ def apply_eqp_corrections(
     # rather than relying on each CLI to remember the same content contract.
     from file_io.qp_wfn import refuse_conflicting_qp_state_sources
     refuse_conflicting_qp_state_sources(
-        wfn_path=_parse_wfn_path(input_file), eqp_file=eqp_file)
+        wfn_path=_parse_wfn_path(input_file), eqp_file=eqp_file,
+        state_artifact_path=state_artifact_path,
+        where="BSE diagonal-eqp state")
 
     from ffi import _services
     _services.ensure_on_path()
@@ -637,7 +641,9 @@ def apply_eqp_and_reslice_bands(
     """
     with h5py.File(restart_file, "r") as f:
         enk_full_np = np.asarray(f["enk_full"][:])
-    enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
+    enk_full_np = apply_eqp_corrections(
+        enk_full_np, eqp_file, input_file=input_file,
+        state_artifact_path=restart_file)
     n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     # Degeneracy guard, REPORT-ONLY here by construction.  The loader already
     # snapped the window on the DFT spectrum and ψ has been read at those

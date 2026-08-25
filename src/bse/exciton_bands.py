@@ -145,7 +145,6 @@ from .bse_ring_comm import make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_w_exact import _create_mesh_xy
-from .bse_window import refuse_eqp_on_a_qp_wfn
 from . import vq_interp
 
 RY2EV = 13.6056980659
@@ -1568,7 +1567,6 @@ def main(argv=None):
         # The refusal lives in ``bse_window`` beside the other eqp helpers and
         # ``_parse_wfn_path`` — one owner for "which WFN does this deck name",
         # and it asks the FILE's stamp rather than its name.
-        refuse_eqp_on_a_qp_wfn(args.input, args.eqp)
         from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
                              resolve_n_occ)
         import h5py as _h5py
@@ -1592,7 +1590,8 @@ def main(argv=None):
                 "mean-field WFN plus diagonal eqp corrections needs the eqp "
                 "ladder applied inside the htransform densification, not "
                 "patched onto its output here.")
-        enk_qp_full = apply_eqp_corrections(_enk_dft_full, args.eqp, args.input)
+        enk_qp_full = apply_eqp_corrections(
+            _enk_dft_full, args.eqp, args.input)
         _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
         log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
             f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "
@@ -1614,6 +1613,15 @@ def main(argv=None):
                 f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
                 f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
+
+    # Densify/eqp already check this join on their dominating paths.
+    if "V_q_coarse" not in data and not args.eqp:
+        from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+        from .bse_window import _parse_wfn_path
+        refuse_conflicting_qp_state_sources(
+            wfn_path=_parse_wfn_path(args.input),
+            state_artifact_path=restart_file,
+            where="exciton_bands restart/htransform state")
 
     # ── which ISDF basis the htransform fits in ──────────────────────────
     # BEFORE initialize_wfns, because that call is the one that reads the
