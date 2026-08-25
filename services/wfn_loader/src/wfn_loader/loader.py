@@ -962,12 +962,12 @@ class WfnLoader:
         # ``nspinor`` is NOT optional here.  ``sym.U_spinor`` is always
         # (ntran, 2, 2) — it is built from the CARTESIAN rotations and
         # knows nothing about how many components psi has — so on a scalar
-        # (nspinor=1) WFN the un-told helper hands back a 2x2, the unfold
-        # kernel's ``einsum("kac,bckg->bakg", ...)`` BROADCASTS the size-1
-        # spinor axis instead of raising, and psi comes back 2-component
-        # holding ``U[a,0]+U[a,1]`` times itself.  Told ``nspinor``, the
-        # helper returns the 1x1 identity and the same einsum is a genuine
-        # no-op.  Registered nspinor=1 loader defect, fixed 2026-08-09;
+        # (nspinor=1) WFN the un-told helper hands back a 2x2; the former
+        # unfold einsum BROADCASTED the size-1 spinor axis instead of raising,
+        # and psi came back 2-component holding ``U[a,0]+U[a,1]`` times
+        # itself.  Told ``nspinor``, the helper returns the 1x1 identity and
+        # the static service application is a genuine no-op.  Registered
+        # nspinor=1 loader defect, fixed 2026-08-09;
         # see ``tests/KNOWN_FAILURES.md``.
         from symmetry_maps import trs_augment_U
         U_per = trs_augment_U(
@@ -1664,6 +1664,8 @@ def _phdf5_unfold_kernel(
     ``(n_k, nb_padded, ns, ngkmax)``.
     """
     if unfold:
+        from symmetry_maps import apply_spinor_rotation
+
         def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
                        position_in_reads):
             cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
@@ -1671,9 +1673,14 @@ def _phdf5_unfold_kernel(
             cnk = jnp.where(
                 tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
             cnk = cnk * phase_per_k[None, None, :, :]
-            cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
-            # (bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)
-            return jnp.transpose(cnk, (2, 0, 1, 3))
+            # Normalize to spinor-last so symmetry_maps owns the same static
+            # ns=1/ns=2 application as the eager host unfold.  U's inserted
+            # singleton axes align k without materializing a broadcast.
+            cnk_last = jnp.transpose(cnk, (0, 2, 3, 1))
+            cnk_last = apply_spinor_rotation(
+                U_per_k[None, :, None, :, :], cnk_last)
+            # (bpr, n_k, ngkmax, ns) → (n_k, bpr, ns, ngkmax)
+            return jnp.transpose(cnk_last, (1, 0, 3, 2))
 
         in_specs = (
             P(("x", "y"), None, None, None, None),     # cnk_at_ibz
