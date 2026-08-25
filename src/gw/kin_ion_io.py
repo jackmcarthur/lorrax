@@ -704,10 +704,13 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     # a distributed rotation, not silently applying independent band slices.
     if (rotated and max_bands_per_item is not None
             and 0 < int(max_bands_per_item) < int(nocc)):
-        print_fn(
-            "    rho band bound: NOT APPLIED to rotated psi; the occupied "
-            "rotation couples all bands and needs a separately distributed "
-            "rotation before it can be chunked")
+        raise ValueError(
+            "build_valence_density_distributed: the requested "
+            f"max_bands_per_item={int(max_bands_per_item)} is tighter than "
+            f"nocc={int(nocc)}, but psi_rotation couples the full occupied "
+            "manifold.  The rotated path has not been ported to the "
+            "distributed band-rotation owner; refusing instead of silently "
+            "retaining an all-band FFT box.")
     items = (rho_work_items(nk, int(nocc), 1) if rotated
              else rho_work_items(
                  nk, int(nocc), world,
