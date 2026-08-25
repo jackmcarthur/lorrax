@@ -7,6 +7,7 @@ sharded q-axis unfolds (:func:`unfold_isdf_operator`,
 :func:`unfold_isdf_one_leg`, :func:`mix_channels_by_proper_rotation`),
 the ψ-unfold antiunitary rule
 (:func:`unfold_psi`, :func:`spinor_rotation_for_sym_row`,
+:func:`apply_spinor_rotation`,
 :func:`tau_phase_row`), the real-space orbit machinery the ISDF
 quadrature is built on (:func:`real_space_action_tables`,
 :func:`centroid_source_map_and_wrap`, …), and
@@ -89,9 +90,11 @@ The surface
     relabelling and scalar/polar component transport without materialising a
     full-zone G-sphere; the bilinear actions keep their 1× single-tile memory
     contract on an ``('x','y')`` mesh.
-``unfold_psi`` / ``spinor_rotation_for_sym_row`` / ``tau_phase_row``
+``unfold_psi`` / ``spinor_rotation_for_sym_row`` /
+``apply_spinor_rotation`` / ``tau_phase_row``
     The ψ-unfold rule, and the single sources of the spinor TRS
-    augmentation and the τ phase.
+    augmentation, its static one- or two-component application, and the τ
+    phase.
 ``kgrid_shift_map`` / ``bgw_signed_q_representative`` /
 ``bgw_integer_q_to_fractional`` / ``common_uniform_grid_indices`` /
 ``find_irreducible_bz_points``
@@ -210,6 +213,7 @@ from symmetry_maps.maps import (
     star_spread,
     tau_phase_row,
     spinor_rotation_for_sym_row,
+    apply_spinor_rotation,
     unfold_psi,
     unfold_isdf_operator,
     unfold_isdf_one_leg,
@@ -293,7 +297,8 @@ __all__ = [
     "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
-    "unfold_psi", "spinor_rotation_for_sym_row", "tau_phase_row",
+    "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
+    "tau_phase_row",
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
