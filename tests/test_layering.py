@@ -766,26 +766,19 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
-    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad /
-    # resolve_fh_ortho_tol / resolve_rank_policy_mode — one resolver each,
-    # refuse-on-garbage; the kwarg/entry layer can override by passing values
-    # down.  The last one carries the AUTHORITY of the rank-truncation gate
-    # (docs/dev/rank_truncation_policy.md); its name and grammar live in
-    # common/rank_criterion, which is L2 and may not read the environment, so
-    # the driver looks it up and passes it in.
+    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
+    # each, refuse-on-garbage; the entry layer passes resolved values down.
     "bandstructure.htransform": {
         "LORRAX_GALERKIN_CHUNK_GIB",
         "LORRAX_EXTRA_RANK_PAD",
-        "LORRAX_FH_ORTHO_TOL",
-        "LORRAX_RANK_POLICY",
     },
     # resolve_reshard_route — explicit kwarg wins, env is the A/B path the
     # production exciton_bands driver cannot plumb an argument to (file
     # ownership); unknown tokens announce, never silently.
     # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
-    # refuse-on-garbage, same shape as ``resolve_fh_ortho_tol`` in the sibling
-    # module four lines up.  It is deliberately NOT a driver flag: the gate
-    # catches a returned band that is ABSENT from fH, which is not a
+    # refuse-on-garbage, resolved once and passed down.  It is deliberately
+    # NOT a driver flag: the gate catches a returned band that is ABSENT from
+    # fH, which is not a
     # tolerance question, and the only value that changes its verdict is a
     # negative one, whose whole purpose is reproducing a known-bad run.
     "bandstructure.bse_setup": {
