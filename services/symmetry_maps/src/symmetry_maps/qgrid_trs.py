@@ -168,9 +168,10 @@ def trs_pair_coherent_unfold_sym_idx(
     # the owning policy is instead the identity map.
     if len(reps) == n_full:
         return out
-    coords = np.stack(np.unravel_index(np.arange(n_full), grid), axis=1)
-    neg = np.ravel_multi_index(
-        tuple(((-coords) % np.asarray(grid, dtype=np.int64)).T), grid)
+    # The q-axis convention is owned by maps.q_negation_index; this policy
+    # consumes the table instead of carrying another C-order spelling.
+    from .maps import q_negation_index
+    neg = q_negation_index(grid)
     for iq, jq_value in enumerate(neg):
         jq = int(jq_value)
         if iq >= jq:

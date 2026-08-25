@@ -423,11 +423,10 @@ def negate_q_index(kgrid) -> np.ndarray:
     to coincide with it on a SYMMETRIC window (``S(-q) = conj(S(q))``) and
     does not in general, which is why the relabel is what ships.
     """
-    n1, n2, n3 = (int(v) for v in kgrid)
-    lin = np.arange(n1 * n2 * n3).reshape(n1, n2, n3)
-    return lin[np.ix_((-np.arange(n1)) % n1,
-                      (-np.arange(n2)) % n2,
-                      (-np.arange(n3)) % n3)].ravel()
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import q_negation_index
+    return q_negation_index(kgrid)
 
 
 # ---------------------------------------------------------------------------
