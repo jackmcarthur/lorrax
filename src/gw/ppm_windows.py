@@ -68,6 +68,15 @@ from .minimax_screening import (
 #  enough to force an ill-conditioned crossing; a narrow grid keeps the user's ξ.
 _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3 below)
 
+#: A sign-definite inverse-Laplace pane spends at most eight binary octaves
+#: on denominator range.  The minimax service remains the authority on
+#: whether a concrete ``(R, error, n_max)`` request is certified: every pane
+#: still goes through ``solve_laplace_minimax_interval`` and refuses there if
+#: unsupported.  This ceiling only prevents one far-tail pole from making a
+#: single request several octaves wider than necessary; it does not bless a
+#: table, loosen an error, or alter a pole.
+_SIGN_DEFINITE_PANE_MAX_OCTAVES = 8.0
+
 
 def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> float:
     """Minimum ξ (Ry) so the HGL core bandwidth A_core ≤ _CROSSING_A_MAX.
@@ -929,18 +938,26 @@ def _plan_sign_definite_omega_panes(
     """Make exact scalar Ω panes when one sign-definite range is costly.
 
     Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  A pane
-    may spend at most ``sqrt(max_nodes)`` binary octaves on range, leaving the
-    rest of the requested rank for accuracy.  This rule depends on the
-    algorithmic node budget, not on today's shipped catalog.  Each split
-    equalises the two continuous-support child range bounds.
+    may spend at most ``min(sqrt(max_nodes), 8)`` binary octaves on range,
+    leaving the rest of the requested rank for accuracy.  The eight-octave
+    operational ceiling is not certification: each resulting request still
+    passes through the incumbent minimax service, whose refusal is final.
+    Each split equalises the two continuous-support child range bounds.
 
     Splits use the existing ``(lo, hi]`` convention and scalar reduction.
     No pole-sized host array or retained mask is formed.  Count conservation
     proves every live Ω lane is owned exactly once.  Giving every disjoint
-    pane the original L-infinity tolerance preserves that tolerance on their
-    union: the aggregate error is the maximum pane error, not their sum.
+    pane the original per-denominator L-infinity kernel tolerance preserves
+    that tolerance on their disjoint union: the union error is the maximum
+    pane error.  This is not a claim that errors in the final residue-weighted
+    Sigma matrix sum by maximum; its amplification bound is unchanged from
+    the unpartitioned per-denominator contract.
     """
-    max_range = float(2.0 ** np.sqrt(max(4, int(max_nodes))))
+    max_octaves = min(
+        float(np.sqrt(max(4, int(max_nodes)))),
+        _SIGN_DEFINITE_PANE_MAX_OCTAVES,
+    )
+    max_range = float(2.0 ** max_octaves)
     pending = [(-np.inf, np.inf, int(mask_B_count),
                 float(mask_B_min), float(mask_B_max))]
     panes: list[tuple[float, float, int, float, float]] = []

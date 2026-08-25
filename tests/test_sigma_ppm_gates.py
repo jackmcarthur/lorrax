@@ -326,7 +326,11 @@ def test_memory_tile_sink_splices_disjoint_omega_clusters():
 def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     """CrI3-shaped pole tails are partitioned, never dropped/staticised."""
     import jax.numpy as jnp
-    from gw.ppm_windows import _plan_sign_definite_omega_panes
+    from types import SimpleNamespace
+    from gw.ppm_windows import (
+        _plan_sign_definite_omega_panes,
+        window_mask_B_bounds,
+    )
 
     # Two 0.2% tails around a compact body, with the frozen run33 scales.
     omega = np.concatenate([
@@ -341,7 +345,7 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
         mask_B_count=omega.size,
         mask_B_min=float(omega.min()), mask_B_max=float(omega.max()),
         E_min=E_min, E_max=E_max, omega_max=omega_eval,
-        max_nodes=16,
+        max_nodes=64,
     )
 
     ownership = np.zeros(omega.size, dtype=np.int64)
@@ -349,14 +353,19 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     residues = (np.linspace(0.2, 1.2, omega.size)
                 + 1j * np.linspace(-0.3, 0.4, omega.size))
     for lo, hi, count, actual_min, actual_max in panes:
-        selected = (omega > lo) & (omega <= hi)
+        # Explicit B_lo/B_hi wins over mask_B_mode="all" in the existing
+        # runtime selector; no second mask convention is hidden in the test.
+        got_lo, got_hi = window_mask_B_bounds(SimpleNamespace(
+            B_lo=lo, B_hi=hi, mask_B_mode="all",
+            mask_B_threshold=None))
+        selected = (omega > got_lo) & (omega <= got_hi)
         ownership += selected
         assert int(np.sum(selected)) == count
         assert actual_min == float(np.min(omega[selected]))
         assert actual_max == float(np.max(omega[selected]))
         R = ((E_max + actual_max + omega_eval)
              / (E_min + actual_min))
-        assert R <= 2.0 ** np.sqrt(16) or actual_min == actual_max
+        assert R <= 2.0 ** np.sqrt(64) or actual_min == actual_max
         pane_sum += np.sum(residues[selected] / (0.7 + E_max + omega[selected]))
 
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
