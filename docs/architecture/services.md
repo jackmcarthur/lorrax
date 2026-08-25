@@ -191,7 +191,8 @@ L1  physics drivers & kernels
     gw/  bse/  psp/  isdf/  bandstructure/  centroid/  file_io readers
      │ calls
      ▼
-L2  solvers/  mixing/  common.rank_criterion  centroid.kmeans_isdf
+L2  solvers/  mixing/  common.rank_criterion  common.pivoted_cholesky
+    centroid.kmeans_isdf
     (common.minimax left for services/minimax/ 2026-08-08;
      common.cholesky_2d for services/distrib_la/ before it)
      │ calls

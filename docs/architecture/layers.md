@@ -15,8 +15,8 @@ its directory:
 **Imports run downhill only: L1 → L2 → L3.** Nothing else is allowed, and
 `tests/test_layering.py` fails when it happens.
 
-Today: **143 L1, 18 L2, 60 L3** over the 221 modules under `src/` — re-counted
-2026-08-06 from the map itself, because the previous figure (140/18/56) summed
+Today: **143 L1, 19 L2, 60 L3** over the 222 modules under `src/` — re-counted
+2026-08-24 from the map itself, because the previous figure (140/18/56) summed
 to 214 and the tree had grown past it. Zero exempt bench drivers — the 26 that
 used to live under `src/` moved to `tests/bench/` on 2026-07-31 (see
 [below](#the-26-exempt-bench-drivers)). **One** upward edge survives, named in
@@ -104,8 +104,9 @@ it without editing the table, so a budget cannot quietly become a licence.
 pseudobands, subspace projectors, Sternheimer preconditioner) · `mixing/`
 (Anderson, CROP, rCROP) · `common/minimax.py` (minimax quadrature) ·
 `common/cholesky_2d.py` (blocked Cholesky) · `common/rank_criterion.py` (the
-pseudo-inverse truncation criterion) · `centroid/kmeans_isdf.py` (the
-density-weighted Lloyd loop).
+pseudo-inverse truncation criterion) · `common/pivoted_cholesky.py` (greedy
+row selection and its numerical certificates) · `centroid/kmeans_isdf.py`
+(the density-weighted Lloyd loop).
 
 **The test for L2 is: could this module be lifted into another physics code
 unchanged?** A Lanczos that knows what a band index is has failed it.
@@ -200,14 +201,14 @@ A level assignment nobody argued is a level assignment nobody will keep.
    registered — inject the orbit map as a parameter; that is a signature
    change, so it is a request, not a landing. What extraction moved is the
    module's address, not its argument list.
-3. **`centroid/pivoted_cholesky.py` — L1, not L2.** Tempting as "pivoted
-   Cholesky, a numerical routine", but it imports `file_io`, `symmetry_maps`,
-   `common.meta`, `common.wfn_transforms` and `isdf`. It prunes ISDF
-   *candidate points* using ψ. The algorithm inside is L2; the module is not,
-   and pretending otherwise would have put five upward edges under an
-   exception list. (One of the five has since become a service-door edge and
-   would no longer be counted; the other four are unmoved, and the verdict
-   never rested on the count alone.)
+3. **`centroid/pivoted_cholesky.py` — L1, with its numerical selector at
+   L2.** The centroid module imports `file_io`, `symmetry_maps`,
+   `common.meta`, `common.wfn_transforms` and `isdf`; it owns ψ-based Gram
+   construction, ISDF candidate policy and reporting. The reusable greedy
+   recurrence and its rank/PSD certificates live in
+   `common/pivoted_cholesky.py`, which knows only matrices, group labels,
+   active rows and a caller-supplied mesh. Both centroid construction and GW
+   downfolding call that owner directly; there is no L1 compatibility facade.
 4. **`solvers/sternheimer_solve.py` — filed L2, and it fails its own test.**
    `from psp.dft_operators import apply_H_k_from_G` at module scope, used in
    the matvec. A solver that applies a *specific* Hamiltonian is not
