@@ -83,7 +83,8 @@ def _tid(cfg, cents_T=CENTS_T, solver_kind="lu"):
 
 def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
           cents_T=CENTS_T, solver_kind="lu", wfn_path="",
-          band_range_left=(0, 26), band_range_right=(1, 128)):
+          band_range_left=(0, 26), band_range_right=(1, 128),
+          logical_band_stop=128):
     wfn = SimpleNamespace(_filename=wfn_path, ecutwfc=30.0, ecutrho=120.0)
     meta = SimpleNamespace(
         n_rmu=(CENTS.shape[0] if n_rmu is None else int(n_rmu)),
@@ -94,6 +95,7 @@ def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
     return gw_init._zeta_fit_provenance(
         wfn=wfn, meta=meta, cfg=cfg,
         band_range_left=band_range_left, band_range_right=band_range_right,
+        logical_band_stop=logical_band_stop,
         zeta_cutoff=30.0, zeta_vcoul_cutoff=30.0,
         write_ibz_only=True, band_norms=None,
         vertex_mu_L=vertex_mu_L,
@@ -202,7 +204,62 @@ def test_pair_domain_stamp_changes_only_asymmetric_charge():
     assert asymmetric["charge_pair_training_domain"] == "ordered_lr_plus_rl"
     assert "charge_pair_training_domain" not in equal
     assert "charge_pair_training_domain" not in transverse
-    assert asymmetric["schema"] == equal["schema"] == transverse["schema"] == 1
+    assert asymmetric["schema"] == equal["schema"] == transverse["schema"] == 2
+
+
+def test_logical_band_ranges_are_mesh_invariant_and_physics_sensitive(
+        stub_reader):
+    """Zero pad endpoints vary with P; the explicit logical window does not."""
+    cfg = _cfg(bispinor=False)
+    p4 = _prov(cfg, band_range_left=(0, 160),
+               band_range_right=(0, 252), logical_band_stop=250)
+    p16 = _prov(cfg, band_range_left=(0, 160),
+                band_range_right=(0, 256), logical_band_stop=250)
+    physical_256 = _prov(cfg, band_range_left=(0, 160),
+                         band_range_right=(0, 256), logical_band_stop=256)
+    assert p4 == p16
+    p250 = json.loads(p16)
+    p256 = json.loads(physical_256)
+    assert p250["band_range_right_logical"] == [0, 250]
+    assert p256["band_range_right_logical"] == [0, 256]
+    assert "band_range_right" not in p250
+    assert physical_256 != p16
+    path = stub_reader(p4)
+    assert gw_init._zeta_reuse_ok(path, p16, CENTS,
+                                  print_fn=lambda *a: None)
+
+
+def test_legacy_same_padding_cannot_prove_logical_stop(stub_reader):
+    """[0,256] in schema 1 is ambiguous between logical 250 and 256."""
+    new = _prov(_cfg(bispinor=False), band_range_left=(0, 160),
+                band_range_right=(0, 256), logical_band_stop=250)
+    legacy = json.loads(new)
+    legacy["schema"] = 1
+    legacy["band_range_left"] = legacy.pop("band_range_left_logical")
+    legacy.pop("band_range_right_logical")
+    legacy["band_range_right"] = [0, 256]
+    path = stub_reader(json.dumps(legacy, sort_keys=True))
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS,
+                                      print_fn=msgs.append)
+    assert any("matching storage padding cannot prove equivalence" in m
+               for m in msgs)
+
+
+def test_refit_consumer_reads_each_schema_at_its_declared_range():
+    """BSE reproduction reads schema 2 logically and schema 1 historically."""
+    from bse.vq_interp import _zeta_fit_window_of
+
+    schema2 = json.loads(_prov(
+        _cfg(bispinor=False), band_range_left=(0, 256),
+        band_range_right=(0, 256), logical_band_stop=250))
+    assert _zeta_fit_window_of(schema2) == (0, 250)
+    schema1 = {
+        "schema": 1,
+        "band_range_left": [0, 256],
+        "band_range_right": [0, 256],
+    }
+    assert _zeta_fit_window_of(schema1) == (0, 256)
 
 
 def test_provenance_collapse_nonbispinor_and_ridge_tau():
