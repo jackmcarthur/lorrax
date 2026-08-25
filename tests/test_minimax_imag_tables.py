@@ -45,6 +45,7 @@ The six checks, and what each one is actually guarding:
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -151,6 +152,38 @@ def test_every_entry_declares_a_known_rule_and_a_shipping_tier():
         assert entry["kappa0"] <= gen.KAPPA_EXCEPTION
         assert entry["beta_axis"] in ("exact_entry_only",
                                       "exact_phase_on_fixed_nodes")
+
+
+def test_btv_lps_share_the_pinned_highs_accuracy_owner(monkeypatch):
+    """Both incumbent LPs use one explicit sub-1e-7 solver contract."""
+
+    seen = []
+
+    def _fake_linprog(*args, **kwargs):
+        seen.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(gen, "linprog", _fake_linprog)
+    marker = gen._linprog_certified(np.ones(1), method="highs")
+    assert marker is not None
+    assert len(seen) == 1
+    assert seen[0][1]["method"] == "highs"
+    assert seen[0][1]["options"] == {
+        "primal_feasibility_tolerance": 1.0e-10,
+        "dual_feasibility_tolerance": 1.0e-10,
+        "ipm_optimality_tolerance": 1.0e-12,
+    }
+
+    # Structural half of the gate: the feasibility and polish programs
+    # route through that owner, not scipy's linprog independently.
+    for func in (gen._lp_l1, gen._lp_minimax):
+        source = inspect.getsource(func)
+        assert source.count("_linprog_certified(") == 1
+        assert " linprog(" not in source
+
+    with pytest.raises(ValueError, match="owns the HiGHS accuracy options"):
+        gen._linprog_certified(
+            np.ones(1), method="highs", options={"presolve": False})
 
 
 # ---------------------------------------------------------------------------
