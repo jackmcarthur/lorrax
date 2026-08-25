@@ -361,6 +361,27 @@ def test_static_gauge_second_order_retained_jet_and_weight_hessian(
     np.testing.assert_allclose(
         got.S_bubble_second_derivative, expected_full,
         rtol=2e-12, atol=2e-12)
+    expected_coefficient_pairs = 0.5 * expected_full
+    expected_coefficient_cart = np.stack((
+        np.stack((expected_coefficient_pairs[:, 0],
+                  expected_coefficient_pairs[:, 1]), axis=1),
+        np.stack((expected_coefficient_pairs[:, 1],
+                  expected_coefficient_pairs[:, 2]), axis=1),
+    ), axis=1)
+    np.testing.assert_allclose(
+        got.S_bubble_q2_coefficient_cart, expected_coefficient_cart,
+        rtol=2e-12, atol=2e-12)
+    q_probe = np.asarray([0.17, -0.11])
+    expected_quadratic = 0.5 * (
+        q_probe[0] ** 2 * expected_full[:, 0]
+        + 2.0 * q_probe[0] * q_probe[1] * expected_full[:, 1]
+        + q_probe[1] ** 2 * expected_full[:, 2])
+    np.testing.assert_allclose(
+        np.einsum(
+            "a,wabij,b->wij", q_probe,
+            np.asarray(got.S_bubble_q2_coefficient_cart), q_probe),
+        expected_quadratic,
+        rtol=2e-12, atol=2e-12)
 
     bad_q2 = q2.copy()
     bad_q2[:, 0, 0, 1, 0, 1] += 1.0e-5
