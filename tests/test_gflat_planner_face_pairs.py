@@ -57,6 +57,7 @@ def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
     assert plan.target_utilization == 0.78
     assert plan.psi_layout_bytes == 176_947_200
     assert plan.persistent_bytes == 7_925_407_200
+    assert plan.p_min == 8
     assert plan.r_chunk == 38_324
     assert plan.n_r_chunks == 37
     assert plan.face_y_cache_bytes == 5_651_103_744
