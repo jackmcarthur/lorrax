@@ -13,8 +13,9 @@ stays here is everything that knows about physics.  Concretely:
 
 * the three ``solve_*`` wrappers rescale the service's SCALED tables
   (``[1, R]`` for the Laplace families, ``[0, A]`` for the crossing one)
-  into Rydberg and name *windows* — a division by ``x_min``, nothing more,
-  which is what makes the extraction bit-identical by construction;
+  into Rydberg and name *windows*.  For a Laplace family both the achieved
+  error and the requested physical error scale with ``1/x_min``; keeping
+  that units conversion here makes this the single physical-window owner;
 * ``MinimaxNodes`` and the complex128 / ``time_axis`` convention stay,
   because they are a jax pytree in this package's sign convention and
   keeping them out of the service is what keeps the service jax-free;
@@ -56,6 +57,41 @@ _beta_selector = _mm.beta_selector
 
 
 _TINY = 1.0e-12
+
+
+def _scaled_laplace_error_bound(x_min: float, target_error: float) -> float:
+    """Convert a physical Laplace-kernel tolerance to the ``[1, R]`` units.
+
+    With ``y = x / x_min``, both supported targets have the form
+
+    ``K(x) = f(y) / x_min``.
+
+    Therefore a scaled rule with error ``eps_hat`` has physical error
+    ``eps_hat / x_min``.  To honor a caller's physical absolute tolerance
+    ``eps_phys``, the minimax service must be asked for
+    ``eps_hat <= eps_phys * x_min``.  The reverse conversion is already used
+    when the achieved error is stamped on ``LaplaceMinimaxQuadrature``.
+
+    Reject invalid tolerances rather than clipping them: a floor here would
+    silently loosen the physical contract for small gaps.
+    """
+
+    x_min = float(x_min)
+    target_error = float(target_error)
+    if not np.isfinite(x_min) or x_min <= 0.0:
+        raise ValueError(
+            f"x_min must be finite and positive before minimax rescaling; "
+            f"got {x_min!r}.")
+    if not np.isfinite(target_error) or target_error <= 0.0:
+        raise ValueError(
+            f"target_error must be a finite positive physical absolute "
+            f"tolerance; got {target_error!r}.")
+    scaled = target_error * x_min
+    if not np.isfinite(scaled) or scaled <= 0.0:
+        raise ValueError(
+            f"Scaled minimax tolerance is not representable: "
+            f"{target_error!r} * {x_min!r} = {scaled!r}.")
+    return scaled
 
 
 def _scalar_to_host_float(a) -> float:
@@ -502,25 +538,22 @@ def solve_laplace_minimax_interval(
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``1/x ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
-    Error convention:
-      1. The underlying table/solver works on the scaled interval ``[1, R]`` with
-         ``R = x_max / x_min``.
-      2. ``target_error`` is the L-infinity absolute error on that scaled problem:
-         ``max_{y in [1,R]} |1/y - approx(y)|``.
-      3. After rescaling back to ``[x_min, x_max]``, the physical absolute error is
-         ``target_error / x_min``. This is not a relative-at-endpoint tolerance.
+    ``target_error`` is the requested physical L-infinity absolute error on
+    ``[x_min, x_max]``.  The service works on ``[1, R]``; its request is
+    therefore ``target_error * x_min``, while its achieved error is divided by
+    ``x_min`` on return.  This is not a relative-at-endpoint tolerance.
     """
 
     x_min = max(float(x_min), _TINY)
     x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
-    target_error = max(float(target_error), 1.0e-14)
+    scaled_target_error = _scaled_laplace_error_bound(x_min, target_error)
     max_nodes = max(4, int(max_nodes))
 
     R = x_max / x_min
 
     served = _mm.serve(
         family="noncrossing", target="inverse",
-        range_value=R, error_bound=target_error, n_max=max_nodes,
+        range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
         use_shipped=bool(use_shipped_tables),
     )
     tau_hat, w_hat, err_hat = served.nodes, served.weights, served.max_error
@@ -565,6 +598,11 @@ def solve_laplace_minimax_imag_interval(
     Used for chi0(i*omega_p) where the resonant+antiresonant sum gives
     2*x/(x^2+omega_p^2) with x = E_c - E_v.
 
+    ``target_error`` is the requested physical L-infinity absolute error.
+    As for :func:`solve_laplace_minimax_interval`, the scaled service request
+    is ``target_error * x_min`` and the achieved scaled error is divided by
+    ``x_min`` on return.
+
     THE BETA AXIS.  On the scaled interval this is ``u/(u^2 + beta^2)``
     with ``beta = omega_p / x_min``, which is the real part of the
     ``complex_laplace`` catalog's ``1/(u - i beta)`` -- one payload, two
@@ -584,7 +622,7 @@ def solve_laplace_minimax_imag_interval(
     x_min = max(float(x_min), _TINY)
     x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
     omega_p = float(omega_p)
-    target_error = max(float(target_error), 1.0e-14)
+    scaled_target_error = _scaled_laplace_error_bound(x_min, target_error)
     max_nodes = max(4, int(max_nodes))
 
     R = x_max / x_min
@@ -606,7 +644,7 @@ def solve_laplace_minimax_imag_interval(
             range_value=R,
             beta=omega_hat,
             beta_clause=beta_clause,
-            target_error=target_error,
+            target_error=scaled_target_error,
             max_nodes=max_nodes,
         )
     if isinstance(picked, _beta_selector.TableSelection):
@@ -628,7 +666,7 @@ def solve_laplace_minimax_imag_interval(
         # was never allowed to look for.
         served = _mm.serve(
             family="noncrossing_imag", target="inverse_imag",
-            range_value=R, error_bound=target_error, n_max=max_nodes,
+            range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
             omega_hat=omega_hat, use_shipped=use_shipped_tables,
         )
         tau_hat, w_hat, err_hat = (served.nodes, served.weights,
@@ -1002,4 +1040,3 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
             f"(R'={(Omega-quad.x_min)/(Omega-quad.x_max):.3f}), "
             f"err~{err_combined:.1e}  [{fused.provenance}]")
     return fused
-
