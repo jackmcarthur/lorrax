@@ -1,8 +1,8 @@
 """Memory detection helpers for JAX device budget.
 
 Used by ``gw.gw_init`` and ``gw.gw_config`` to size chunking parameters.
-The only public entry points callers actually use are
-:func:`get_device_memory_gb` and :func:`get_device_memory_info`.
+This module also owns the one BFC fragmentation target shared by planners
+whose large stage allocations scale with a small field-width factor.
 """
 
 import os
@@ -12,6 +12,36 @@ import subprocess
 # ============================================================================
 # Memory Detection for Auto-sizing Chunk Parameters
 # ============================================================================
+
+def bfc_fragmentation_target_utilization(width_factor: int) -> float:
+    """Return the conservative stage fraction of an available BFC budget.
+
+    This is a *second* bound after live available memory has been measured;
+    it is not an estimate of array bytes.  A stage can fit by arithmetic and
+    still fail when BFC must place one large arena among earlier transient
+    allocations.  ``width_factor`` is the caller-visible multiplier of the
+    stage's large buffers (the physics meaning stays at the caller).
+
+    The table is measured production policy, formerly private to the G-flat
+    planner: factor 4 at 0.85 failed with a 23-GB single arena on a 40-GB
+    device, while 0.78 fit.  Factors 2 and 1 retain progressively more of the
+    budget.  Keeping the table here prevents independent GW and htransform
+    copies from drifting.
+    """
+    try:
+        factor = int(width_factor)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"width_factor must be a positive integer, got {width_factor!r}") \
+            from None
+    if factor != width_factor or factor <= 0:
+        raise ValueError(
+            f"width_factor must be a positive integer, got {width_factor!r}")
+    if factor >= 4:
+        return 0.78
+    if factor == 2:
+        return 0.85
+    return 0.90
 
 def _query_nvidia_smi_memory(field: str) -> float | None:
     """Query a single GPU memory field (in MiB) from nvidia-smi."""
@@ -193,5 +223,6 @@ def get_device_memory_info() -> dict:
     }
 
 
-__all__ = ["get_device_memory_gb", "get_device_memory_info",
+__all__ = ["bfc_fragmentation_target_utilization",
+           "get_device_memory_gb", "get_device_memory_info",
            "get_gpu_memory_nvidia_smi", "get_cpu_memory_total"]

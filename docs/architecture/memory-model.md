@@ -566,7 +566,8 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
    `get_device_memory_gb` returns `0.9 · bytes_available`; choose
    `28.0` for a 40 GB A100, `56.0`–`72.0` for an 80 GB hbm80g A100,
    `6.0` for an 8 GB local GPU.  The planner default is `ns²`-aware
-   (`_default_util`): 0.90 scalar, 0.85 spinor `ns=2`, 0.78 bispinor
+   (`common.gpu_utils.bfc_fragmentation_target_utilization`): 0.90 scalar,
+   0.85 spinor `ns=2`, 0.78 bispinor
    `ns=4` — larger `ns²` means a bigger single contiguous Stage-C arena,
    which needs more headroom against BFC fragmentation.
 2. **Pick the mesh** `p_x × p_y = total_GPUs`.  Square-ish meshes
@@ -762,10 +763,12 @@ That figure is theirs, not measured here, so it is recorded rather than
 folded into a term: adding an unverified constant to the model is how the
 `fft_box_factor` story started. Two things make it tolerable for now — it is
 a per-process constant rather than a shape-dependent term that grows with the
-chunk knobs, and `_default_util` already withholds 10–22 % of the budget
-(0.90 / 0.85 / 0.78 by `ns`), which is 0.8–1.8 GB on an 8 GB card and far
-more on production cards. It is still an unmodelled term and should be closed
-by an arena-size query on the FFI side, not by a constant here.
+chunk knobs, and
+`common.gpu_utils.bfc_fragmentation_target_utilization` already withholds
+10–22 % of the budget (0.90 / 0.85 / 0.78 by `ns`), which is 0.8–1.8 GB on
+an 8 GB card and far more on production cards. It is still an unmodelled term
+and should be closed by an arena-size query on the FFI side, not by a constant
+here.
 
 ## Measured corrections behind the G-flat terms
 

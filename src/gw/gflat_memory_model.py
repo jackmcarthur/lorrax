@@ -93,6 +93,8 @@ from typing import Optional
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.gpu_utils import bfc_fragmentation_target_utilization
+
 # The planner's ONE printing path: every fallback below announces its demotion
 # through this, once per process, tagged with the rank it happened on.  (Safe
 # at import time — ``runtime.aot_memory`` pulls in no JAX at module scope.)
@@ -394,22 +396,6 @@ class GFlatChunkPlan:
 # The planner
 # ---------------------------------------------------------------------------
 
-def _default_util(ns: int) -> float:
-    """ns²-aware default utilization (§5 divergence #1).
-
-    Stage C's binding transient is a SINGLE ``slots·nk·ns²·μ·cr`` arena;
-    at large ``ns²`` (bispinor ns=4 → ns²=16) it approaches the whole
-    budget as one contiguous buffer, which the allocator cannot place
-    against BFC fragmentation + the card's MEM_FRACTION.  Leave more
-    headroom the larger ns² is (validated: MoS2 bispinor ns=4 at 0.85
-    OOM'd on a 40 GB card with a 23 GB single arena; 0.78 fits)."""
-    if ns >= 4:
-        return 0.78      # bispinor (ns²=16): the big single-arena regime
-    if ns == 2:
-        return 0.85      # spinor / SOC charge (ns²=4)
-    return 0.90          # scalar (ns²=1)
-
-
 def plan_gflat_chunks(
     *,
     meta,
@@ -479,7 +465,7 @@ def plan_gflat_chunks(
     n_q_ibz = int(n_q_ibz)
 
     if target_utilization is None:
-        target_utilization = _default_util(ns)
+        target_utilization = bfc_fragmentation_target_utilization(ns)
     slots = pair_density_slots if pair_density_slots is not None \
         else _pair_density_slots()
 
