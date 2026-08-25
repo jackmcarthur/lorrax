@@ -55,12 +55,13 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 
 if TYPE_CHECKING:
     from common.meta import Meta
+    from runtime.aot_memory import AotPeakBreakdown
 
 
 __all__ = [
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
     "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
-    "gflat_to_rchunk_aot_peak_bytes",
+    "gflat_to_rchunk_aot_memory", "gflat_to_rchunk_aot_peak_bytes",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
     "gflat_to_rmu",
     "accumulate_rchunk_to_gflat",
@@ -803,7 +804,7 @@ def to_rchunk(
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
 
 
-def gflat_to_rchunk_aot_peak_bytes(
+def gflat_to_rchunk_aot_memory(
     *,
     mesh: Mesh,
     nk: int,
@@ -814,8 +815,8 @@ def gflat_to_rchunk_aot_peak_bytes(
     r_carrier: int,
     norm: str,
     dtype=jnp.complex128,
-) -> int:
-    """Per-rank peak HBM of the canonical full-Bloch WFN r-slab program.
+) -> AotPeakBreakdown:
+    """AOT memory breakdown of the canonical full-Bloch WFN r-slab program.
 
     This is the planning view of :func:`to_rchunk_inner`, not an FFT-box
     proxy.  It compiles the same G-flat gather -> FFT box -> local IFFT ->
@@ -844,15 +845,15 @@ def gflat_to_rchunk_aot_peak_bytes(
     fft_grid_t = tuple(int(v) for v in fft_grid)
     if len(fft_grid_t) != 3 or any(v <= 0 for v in fft_grid_t):
         raise ValueError(
-            "gflat_to_rchunk_aot_peak_bytes: fft_grid must contain three "
+            "gflat_to_rchunk_aot_memory: fft_grid must contain three "
             f"positive extents; got {fft_grid_t}")
     if min(nk, band_carrier, nspinor, ngkmax, r_carrier) <= 0:
         raise ValueError(
-            "gflat_to_rchunk_aot_peak_bytes: all logical extents must be "
+            "gflat_to_rchunk_aot_memory: all logical extents must be "
             "positive")
     if norm not in ("backward", "ortho", "forward"):
         raise ValueError(
-            "gflat_to_rchunk_aot_peak_bytes: norm must be 'backward', "
+            "gflat_to_rchunk_aot_memory: norm must be 'backward', "
             f"'ortho', or 'forward'; got {norm!r}")
 
     platform = mesh.devices.flat[0].platform
@@ -903,15 +904,38 @@ def gflat_to_rchunk_aot_peak_bytes(
         compiler_options={"xla_gpu_memory_limit_slop_factor": 10000}
     ) if platform in ("gpu", "cuda") else lowered.compile()
     from runtime.aot_memory import aot_kernel_peak_bytes
-    peak = aot_kernel_peak_bytes(compiled, platform=platform)
-    if platform in ("gpu", "cuda") and not peak.fft_specs:
+    memory = aot_kernel_peak_bytes(compiled, platform=platform)
+    if platform in ("gpu", "cuda") and not memory.fft_specs:
         raise RuntimeError(
-            "gflat_to_rchunk_aot_peak_bytes: the compiled canonical WFN "
+            "gflat_to_rchunk_aot_memory: the compiled canonical WFN "
             "r-slab program exposes no FFT operation, so its cuFFT workspace "
             "cannot be certified")
-    total = int(peak.total)
-    _RCHUNK_PEAK_CACHE[key] = total
-    return total
+    _RCHUNK_PEAK_CACHE[key] = memory
+    return memory
+
+
+def gflat_to_rchunk_aot_peak_bytes(
+    *,
+    mesh: Mesh,
+    nk: int,
+    band_carrier: int,
+    nspinor: int,
+    ngkmax: int,
+    fft_grid: Sequence[int],
+    r_carrier: int,
+    norm: str,
+    dtype=jnp.complex128,
+) -> int:
+    """Per-rank total peak HBM for the canonical WFN r-slab program.
+
+    Compatibility view of :func:`gflat_to_rchunk_aot_memory`.  Both APIs use
+    the same signature-keyed compiled-memory cache, so a planner that needs
+    the independently placeable cuFFT workspace does not compile twice.
+    """
+    return int(gflat_to_rchunk_aot_memory(
+        mesh=mesh, nk=nk, band_carrier=band_carrier, nspinor=nspinor,
+        ngkmax=ngkmax, fft_grid=fft_grid, r_carrier=r_carrier, norm=norm,
+        dtype=dtype).total)
 
 
 
