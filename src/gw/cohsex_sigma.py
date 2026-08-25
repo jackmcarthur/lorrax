@@ -686,7 +686,10 @@ def compute_cohsex_sigma(
     Returns
     -------
     dict with keys:
-        sig_sx   (nk, nb_sigma, nb_sigma)  screened exchange + head
+        sig_sx   (nk, nb_sigma, nb_sigma)  physical occupied/SX component:
+                                              screened charge exchange + head,
+                                              plus bare transverse Σ^B when
+                                              the bispinor operands are present
         sig_coh  (nk, nb_sigma, nb_sigma)  Coulomb hole + head (if screened)
         sig_h    (nk, nb_sigma, nb_sigma)  Hartree
         sig_x    (nk, nb_sigma, nb_sigma)  bare exchange + head, or None
@@ -764,8 +767,13 @@ def compute_cohsex_sigma(
         sig_x.block_until_ready()
 
         # Bispinor bare exchange: add Σ^B (transverse-only sum over
-        # (i, j) ∈ {1, 2, 3}²) to sig_x.  No-op when ``wfns_transverse``
-        # or ``bispinor_v_q_path`` is missing.  See
+        # (i, j) ∈ {1, 2, 3}²) to the bare-X diagnostic AND to the
+        # physical occupied/SX component.  The COHSEX dispatcher builds
+        # Sigma_xc = sig_sx + sig_coh, so this is the single seam that carries
+        # Σ^B into Eqp, the live Hamiltonian and sigma_diag without changing
+        # X_ONLY (which uses compute_v_h_sigma_x) or the packed full-photon
+        # route (which replaces all three photon components).  No-op when
+        # ``wfns_transverse`` or ``bispinor_v_q_path`` is missing.  See
         # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and bispinor_v_q_path is not None:
             # face-layout defensive backstop REMOVED 2026-08-23
@@ -785,6 +793,7 @@ def compute_cohsex_sigma(
                 )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
+            sig_sx = sig_sx + sig_x_b
 
     return {
         "sig_sx":  sig_sx,
