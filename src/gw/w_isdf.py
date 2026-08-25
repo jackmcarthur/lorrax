@@ -1630,7 +1630,7 @@ class PhotonG0Vectors:
 
 @dataclass(frozen=True)
 class StaticPhotonLongWaveCoefficients:
-    r"""Nearest-shell coefficients of the static packed photon response.
+    r"""Nested-shell coefficients of the static packed photon response.
 
     The coefficient form is the storage contract; finite-q body-sized samples
     are never retained.  For in-plane Cartesian ``q`` (1/bohr),
@@ -1722,6 +1722,23 @@ def _require_named_sharding(array, mesh_xy, spec, name) -> None:
         )
 
 
+def _static_photon_longwave_design(q_xy, xp):
+    """Return the sole odd q+q^3 and even q^2+q^4 monomial tables.
+
+    ``xp`` is NumPy during host-side rank/weight construction and ``jax.numpy``
+    inside the sharded diagnostic.  Keeping the order here makes the fitted
+    coefficient rows and their reconstruction one convention.
+    """
+    x, y = q_xy[..., 0], q_xy[..., 1]
+    odd = xp.stack(
+        (x, y, x ** 3, x ** 2 * y, x * y ** 2, y ** 3), axis=-1)
+    even = xp.stack(
+        (x ** 2, 2.0 * x * y, y ** 2,
+         x ** 4, x ** 3 * y, x ** 2 * y ** 2, x * y ** 3, y ** 4),
+        axis=-1)
+    return odd, even
+
+
 def _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
     """Smallest +/-q radial union separating leading and next-order powers.
 
@@ -1794,13 +1811,7 @@ def _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
         scale = float(np.max(np.linalg.norm(q, axis=1)))
         if not np.isfinite(scale) or scale <= 0.0:
             raise ValueError("nested-shell q scale must be positive")
-        x, y = (q / scale).T
-        odd = np.stack(
-            (x, y, x ** 3, x ** 2 * y, x * y ** 2, y ** 3), axis=1)
-        even = np.stack(
-            (x ** 2, 2.0 * x * y, y ** 2,
-             x ** 4, x ** 3 * y, x ** 2 * y ** 2, x * y ** 3, y ** 4),
-            axis=1)
+        odd, even = _static_photon_longwave_design(q / scale, np)
         return odd, even, scale
 
     def _rank(a):
@@ -1814,7 +1825,8 @@ def _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
                               atol=1e-12 * old) for old in levels):
             levels.append(float(radius))
     selected = np.zeros(candidate.size, dtype=bool)
-    for radius in levels:
+    selected_level_count = 0
+    for selected_level_count, radius in enumerate(levels, start=1):
         selected |= np.isclose(
             radii, radius, rtol=1e-11, atol=1e-12 * radius)
         shell = np.asarray(candidate[selected], dtype=np.int32)
@@ -1876,7 +1888,7 @@ def _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
     return (
         shell, q_shell, q_shell / shell_radii[:, None], shell_radii,
         odd_weights, even_weights, pair_first, pair_second,
-        odd_rank, even_rank, len(levels),
+        odd_rank, even_rank, selected_level_count,
     )
 
 
@@ -2128,22 +2140,9 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
             q_plus = q_shell_xy[plus_position]
             q_minus = q_shell_xy[minus_position]
 
-            def _odd_basis(q):
-                x, y = q[0], q[1]
-                return jnp.stack(
-                    (x, y, x ** 3, x ** 2 * y, x * y ** 2, y ** 3))
-
-            def _even_basis(q):
-                x, y = q[0], q[1]
-                return jnp.stack(
-                    (x ** 2, 2.0 * x * y, y ** 2,
-                     x ** 4, x ** 3 * y, x ** 2 * y ** 2,
-                     x * y ** 3, y ** 4))
-
-            odd_plus = _odd_basis(q_plus)
-            odd_minus = _odd_basis(q_minus)
-            even_plus = _even_basis(q_plus)
-            even_minus = _even_basis(q_minus)
+            odd_plus, even_plus = _static_photon_longwave_design(q_plus, jnp)
+            odd_minus, even_minus = _static_photon_longwave_design(
+                q_minus, jnp)
             r_prediction_plus = (
                 jnp.einsum(
                     "u,uAB->AB", odd_plus, odd_direct_allowed,
