@@ -51,6 +51,7 @@ What lives in ``isdf_header``
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 
 import h5py as h5
@@ -58,6 +59,253 @@ import numpy as np
 
 
 _GROUP = 'isdf_header'
+
+#: Existing restart/ISDF centroid-table content identity, now named once.
+#: The bytes are deliberately unchanged from the historical
+#: ``gw.gw_init._centroid_table_md5`` contract: int64, C order, bare MD5
+#: hexadecimal digest.  The scheme name lets compound provenance receipts
+#: state which established artifact identity they embedded without inventing
+#: another hash of the same table.
+CENTROID_TABLE_FINGERPRINT_SCHEME = 'int64-c-order-md5-v1'
+
+
+def centroid_table_md5(centroid_fft_idx) -> str:
+    """Return the canonical restart/ISDF centroid-table content digest.
+
+    This is the one spelling of the ``centroids_{charge,transverse}_md5``
+    root attributes on restart tensor files.  Hash FFT-grid INDICES, not a
+    fractional-coordinate text file: two text representations that snap to
+    the same grid points describe the same basis.
+    """
+    # ``centroid_fft_idx`` is a small replicated table on production paths,
+    # but can already be a JAX array.  Preserve the historical explicit
+    # device_get without importing JAX when this format helper is merely read.
+    try:
+        import jax
+        values = jax.device_get(centroid_fft_idx)
+    except ImportError:  # pragma: no cover - h5py-only inspection installs
+        values = centroid_fft_idx
+    table = np.ascontiguousarray(np.asarray(values, dtype=np.int64))
+    if table.ndim != 2 or table.shape[1] != 3:
+        raise ValueError(
+            "centroid_table_md5 requires FFT-grid indices with shape "
+            f"(n_rmu, 3); got {table.shape}")
+    return hashlib.md5(table.tobytes()).hexdigest()
+
+
+@dataclass(frozen=True)
+class WavefunctionBasisReceipt:
+    """Immutable identity of ψ sampled at one ordered centroid table.
+
+    This is host/static provenance, never a JAX array.  In particular,
+    ``layout`` is absent: legacy four-copy and low-memory two-face carriers
+    built from the same sampled ψ compare equal.  ``source_identity`` is the
+    canonical full-Bloch transform convention; the WFN content fingerprint
+    alone cannot distinguish two real-space transform gauges.
+
+    ``n_rmu_padded`` describes the live in-memory carrier and may therefore
+    change when a restart is read on another processor count.  The remaining
+    fields describe the physical source/basis and are process-layout
+    independent.
+    """
+
+    role: str
+    wfn_fingerprint_scheme: str
+    wfn_fingerprint: str
+    band_interval: tuple[int, int]
+    fft_grid: tuple[int, int, int]
+    centroid_fingerprint_scheme: str
+    centroid_table_md5: str
+    n_rmu_logical: int
+    n_rmu_padded: int
+    source_identity: str
+
+    def __post_init__(self) -> None:
+        from common.parallel_transport import WFN_FINGERPRINT_SCHEME
+        from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
+
+        if str(self.role) not in ('charge', 'transverse'):
+            raise ValueError(
+                "WavefunctionBasisReceipt.role must be 'charge' or "
+                f"'transverse'; got {self.role!r}")
+        if self.wfn_fingerprint_scheme != WFN_FINGERPRINT_SCHEME:
+            raise ValueError(
+                "WavefunctionBasisReceipt requires the canonical WFN "
+                f"fingerprint scheme {WFN_FINGERPRINT_SCHEME!r}; got "
+                f"{self.wfn_fingerprint_scheme!r}")
+        fingerprint = str(self.wfn_fingerprint)
+        if (len(fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in fingerprint)):
+            raise ValueError(
+                "WavefunctionBasisReceipt.wfn_fingerprint must be a "
+                "64-digit lowercase hexadecimal SHA-256")
+        start, stop = (int(v) for v in self.band_interval)
+        if start < 0 or stop <= start:
+            raise ValueError(
+                "WavefunctionBasisReceipt.band_interval must satisfy "
+                f"0 <= start < stop; got [{start},{stop})")
+        grid = tuple(int(v) for v in self.fft_grid)
+        if len(grid) != 3 or any(v <= 0 for v in grid):
+            raise ValueError(
+                "WavefunctionBasisReceipt.fft_grid must contain three "
+                f"positive integers; got {self.fft_grid!r}")
+        if (str(self.centroid_fingerprint_scheme)
+                != CENTROID_TABLE_FINGERPRINT_SCHEME):
+            raise ValueError(
+                "WavefunctionBasisReceipt requires the canonical centroid "
+                f"fingerprint scheme {CENTROID_TABLE_FINGERPRINT_SCHEME!r}; "
+                f"got {self.centroid_fingerprint_scheme!r}")
+        centroid_md5 = str(self.centroid_table_md5)
+        if (len(centroid_md5) != 32
+                or any(c not in "0123456789abcdef" for c in centroid_md5)):
+            raise ValueError(
+                "WavefunctionBasisReceipt.centroid_table_md5 must be the "
+                "canonical 32-digit lowercase MD5 stamp")
+        logical, padded = int(self.n_rmu_logical), int(self.n_rmu_padded)
+        if logical <= 0 or padded < logical:
+            raise ValueError(
+                "WavefunctionBasisReceipt centroid extents must satisfy "
+                f"0 < logical <= padded; got {logical}/{padded}")
+        if self.source_identity != FULL_BLOCH_TRANSFORM_SCHEME:
+            raise ValueError(
+                "WavefunctionBasisReceipt requires the canonical full-Bloch "
+                f"source identity {FULL_BLOCH_TRANSFORM_SCHEME!r}; got "
+                f"{self.source_identity!r}")
+        # Frozen is meaningful only when every nested value is immutable.
+        # Canonicalize numpy scalars/list-like intervals at the boundary so a
+        # caller cannot mutate a list behind an otherwise frozen receipt.
+        object.__setattr__(self, 'role', str(self.role))
+        object.__setattr__(
+            self, 'wfn_fingerprint_scheme',
+            str(self.wfn_fingerprint_scheme))
+        object.__setattr__(self, 'wfn_fingerprint', fingerprint)
+        object.__setattr__(self, 'band_interval', (start, stop))
+        object.__setattr__(self, 'fft_grid', grid)
+        object.__setattr__(
+            self, 'centroid_fingerprint_scheme',
+            str(self.centroid_fingerprint_scheme))
+        object.__setattr__(self, 'centroid_table_md5', centroid_md5)
+        object.__setattr__(self, 'n_rmu_logical', logical)
+        object.__setattr__(self, 'n_rmu_padded', padded)
+        object.__setattr__(self, 'source_identity', str(self.source_identity))
+
+    @classmethod
+    def from_source(
+        cls,
+        *,
+        wfn,
+        role: str,
+        band_interval,
+        fft_grid,
+        centroid_fft_idx,
+        n_rmu_logical: int,
+        n_rmu_padded: int,
+    ) -> 'WavefunctionBasisReceipt':
+        """Build the one receipt from canonical WFN/transform/hash owners."""
+        from common.parallel_transport import (
+            WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+        from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
+
+        start, stop = (int(v) for v in band_interval)
+        nbands = getattr(wfn, 'nbands', None)
+        if nbands is not None and stop > int(nbands):
+            raise ValueError(
+                "WavefunctionBasisReceipt band interval exceeds the source "
+                f"WFN: stop={stop}, WFN.nbands={int(nbands)}")
+        grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(3))
+        import jax
+        centroids = np.ascontiguousarray(np.asarray(
+            jax.device_get(centroid_fft_idx), dtype=np.int64))
+        if centroids.ndim != 2 or centroids.shape[1] != 3:
+            raise ValueError(
+                "WavefunctionBasisReceipt centroid table must have shape "
+                f"(n_rmu,3); got {centroids.shape}")
+        logical = int(n_rmu_logical)
+        if int(centroids.shape[0]) != logical:
+            raise ValueError(
+                "WavefunctionBasisReceipt logical centroid extent differs "
+                f"from the exact table: {logical} vs {centroids.shape[0]}")
+        grid_array = np.asarray(grid, dtype=np.int64)
+        if (np.any(centroids < 0)
+                or np.any(centroids >= grid_array[None, :])):
+            raise ValueError(
+                "WavefunctionBasisReceipt centroid indices must lie inside "
+                f"fft_grid={grid}")
+        return cls(
+            role=str(role),
+            wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME,
+            wfn_fingerprint=wfn_fingerprint(wfn),
+            band_interval=(start, stop),
+            fft_grid=grid,
+            centroid_fingerprint_scheme=(
+                CENTROID_TABLE_FINGERPRINT_SCHEME),
+            centroid_table_md5=centroid_table_md5(centroids),
+            n_rmu_logical=logical,
+            n_rmu_padded=int(n_rmu_padded),
+            source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
+        )
+
+    def assert_matches_source(
+        self,
+        *,
+        wfn,
+        role: str,
+        band_interval,
+        fft_grid,
+        centroid_fft_idx,
+        n_rmu_logical: int,
+        n_rmu_padded: int,
+        where: str,
+    ) -> None:
+        """Refuse unless current source inputs reproduce this exact receipt."""
+        expected = type(self).from_source(
+            wfn=wfn, role=role, band_interval=band_interval,
+            fft_grid=fft_grid,
+            centroid_fft_idx=centroid_fft_idx,
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
+        if self == expected:
+            return
+        names = tuple(self.__dataclass_fields__)
+        differing = [name for name in names
+                     if getattr(self, name) != getattr(expected, name)]
+        raise ValueError(
+            f"{where}: supplied WavefunctionBasisReceipt disagrees with "
+            f"the canonical source in fields {differing}")
+
+    def assert_same_source(
+        self, other: 'WavefunctionBasisReceipt', *, where: str,
+    ) -> None:
+        """Refuse unless two receipts name one physical sampled basis.
+
+        The processor-dependent padded extent is deliberately excluded from
+        this cross-runtime comparison.  :meth:`assert_same_carrier` adds it
+        back for arrays that coexist in one runtime.
+        """
+        if not isinstance(other, WavefunctionBasisReceipt):
+            raise TypeError(
+                f"{where}: expected WavefunctionBasisReceipt, got "
+                f"{type(other).__name__}")
+        fields = (
+            'role', 'wfn_fingerprint_scheme', 'wfn_fingerprint',
+            'band_interval', 'fft_grid', 'centroid_fingerprint_scheme',
+            'centroid_table_md5',
+            'n_rmu_logical', 'source_identity')
+        differing = [name for name in fields
+                     if getattr(self, name) != getattr(other, name)]
+        if differing:
+            raise ValueError(
+                f"{where}: wavefunction-at-centroids receipts differ in "
+                f"physical source fields {differing}")
+
+    def assert_same_carrier(
+        self, other: 'WavefunctionBasisReceipt', *, where: str,
+    ) -> None:
+        """Refuse unless physical source and current padded extent agree."""
+        self.assert_same_source(other, where=where)
+        if int(self.n_rmu_padded) != int(other.n_rmu_padded):
+            raise ValueError(
+                f"{where}: receipt padded centroid extents differ: "
+                f"{int(self.n_rmu_padded)} vs {int(other.n_rmu_padded)}")
 
 
 @dataclass(frozen=True)
@@ -378,7 +626,10 @@ def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
 
 
 __all__ = [
+    'CENTROID_TABLE_FINGERPRINT_SCHEME',
+    'centroid_table_md5',
     'IsdfHeader',
+    'WavefunctionBasisReceipt',
     'read_isdf_header',
     'read_isdf_header_from_file',
     'bind_isdf_attrs',

@@ -1749,12 +1749,13 @@ def test_the_wfn_loader_door_scan_does_not_cry_wolf(sources):
 
 def test_finite_q_publication_stays_refused_and_private_oracle_unreachable(
         sources):
-    """The unauthenticated fixed-q algebra cannot become a source API.
+    """Authenticated fixed-q algebra still cannot become a source API.
 
     The public seam remains one unconditional refusal, and no module under
     ``src/`` may reference the private deterministic oracle.  Tests may call
     the oracle to pin its algebra; production source may not route around the
-    missing WFN/band/centroid authentication receipt.
+    remaining q-resolved C/Z, completion, rectangular-IBZ-action, and artifact
+    provenance requirements.
     """
     refusal = scan_finite_q_public_refusal(sources["gw.w_isdf"])
     assert refusal == [], (
@@ -1766,7 +1767,7 @@ def test_finite_q_publication_stays_refused_and_private_oracle_unreachable(
         if hits:
             callers[mod] = hits
     assert callers == {}, (
-        "src/ reaches the unauthenticated finite-q private oracle: "
+        "src/ reaches the finite-q private oracle: "
         f"{callers}")
 
 

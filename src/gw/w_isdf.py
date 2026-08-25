@@ -1740,16 +1740,17 @@ def compute_finite_transfer_current_block_row(
     endpoint, wfns_transverse, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
-    """Refuse publication until the WFN bundle carries a source receipt."""
+    """Keep public finite-q/FULL publication fail-closed.
+
+    Basis authentication now exists in the private algebra oracle.  It is not
+    the q-resolved C/Z side, completion, rectangular IBZ action, or artifact
+    provenance still required to publish FULL.
+    """
     raise NotImplementedError(
-        "finite-transfer current body publication is refused: the existing "
-        "Wavefunctions bundle carries arrays, band slices and layout, but no "
-        "canonical non-JIT source/band/centroid receipt to compare with the "
-        "endpoint.  Shape agreement and fingerprint syntax do not prove that "
-        "the current endpoint and target faces came from the same WFN and "
-        "transverse centroid basis.  Wire that receipt through the incumbent "
-        "wavefunction/restart provenance owner before publishing this row; "
-        "FULL remains unavailable.")
+        "finite-transfer current body publication remains refused after "
+        "basis-receipt authentication: q-resolved C/Z, exact contact/"
+        "downfolded completion, rectangular IBZ response action, and "
+        "artifact provenance are not complete; FULL remains unavailable.")
 
 
 def _compute_finite_transfer_current_block_row_unverified(
@@ -1762,15 +1763,18 @@ def _compute_finite_transfer_current_block_row_unverified(
     :func:`common.mtxel_sweep.finite_transfer_current_to_centroids` for the
     same transverse centroid set and band window, at transfers ``q`` and
     ``-q`` respectively.  The pair is authenticated with the symmetry
-    service's q-negation involution and the existing operator receipts.  The
-    routine reuses the incumbent distributed face Green builder and minimax
+    service's q-negation involution and the existing operator receipts.  Both
+    endpoints and the target wavefunction faces must also carry the exact same
+    immutable WFN/band/FFT/centroid receipt; equality is checked before any
+    Green contraction.  The routine reuses the incumbent distributed face
+    Green builder and minimax
     normalization; it neither constructs a second Green-function mechanism
     nor materializes a band-pair carrier.  One block is returned so the
     existing photon packer can retain its one-live-block memory schedule.
 
-    This is deliberately private because :class:`Wavefunctions` does not yet
-    carry the non-JIT source/band/centroid receipt needed to authenticate it
-    against ``endpoint``.  Deterministic tests use it to pin the fixed-q Green
+    This remains deliberately private because authenticated fixed-q algebra is
+    not the missing rectangular IBZ response action or the rest of FULL's
+    completion.  Deterministic tests use it to pin the fixed-q Green
     normalization, conjugation, and exact ordered pair
     ``-[F_AB(q)+F_BA(-q)^dagger]``.  Production reaches only the refusing
     public seam above.  The transverse zeta/V side also still needs the
@@ -1786,6 +1790,24 @@ def _compute_finite_transfer_current_block_row_unverified(
         raise ValueError(
             "finite-transfer current row requires the canonical face "
             "wavefunction bundle (low_mem_bands=true)")
+    target_basis_receipt = getattr(
+        wfns_transverse, "basis_receipt", None)
+    if target_basis_receipt is None:
+        raise ValueError(
+            "finite-transfer current target Wavefunctions carries no "
+            "WavefunctionBasisReceipt; matching face shapes are not basis "
+            "authentication")
+    for endpoint_label, current_endpoint in (
+            ("q", endpoint), ("-q", endpoint_minus_q)):
+        endpoint_receipt = getattr(current_endpoint, "basis_receipt", None)
+        if endpoint_receipt is None:
+            raise ValueError(
+                f"finite-transfer {endpoint_label} endpoint carries no "
+                "WavefunctionBasisReceipt")
+        target_basis_receipt.assert_same_carrier(
+            endpoint_receipt,
+            where=(f"finite-transfer {endpoint_label} endpoint vs target "
+                   "Wavefunctions before Green contraction"))
     mesh_shape = tuple(int(v) for v in mesh_xy.devices.shape)
     if (tuple(mesh_xy.axis_names) != ("x", "y")
             or len(mesh_shape) != 2 or mesh_shape[0] != mesh_shape[1]):
@@ -1880,7 +1902,6 @@ def _compute_finite_transfer_current_block_row_unverified(
         raise ValueError(
             "finite-transfer q/-q endpoints carry different Hamiltonian "
             "or finite-path operator receipts")
-
     kgrid = np.asarray(
         (int(meta.nkx), int(meta.nky), int(meta.nkz)), dtype=np.int64)
     if int(np.prod(kgrid)) != nk:
