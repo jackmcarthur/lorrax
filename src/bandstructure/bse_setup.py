@@ -535,7 +535,7 @@ def compute_wfns_fi(
             f"bands [{b_min}, {b_max}) of {rank}, {_batch_note}")
 
     # ── Build fH_R via the shared htransform core ────────────────────────
-    fH_k, fH_R, (a_f, n_f, shift), _f_eps = build_fH_R(
+    fH_k, fH_R, (a_f, n_f, shift), _f_eps, _active_R = build_fH_R(
         ctilde, enk_sigma, kgrid_co, mesh_xy,
         a_band_index=a_band_index, log_fn=log)
     del fH_k  # diagnostic-only here; not needed downstream
