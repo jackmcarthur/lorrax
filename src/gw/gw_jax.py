@@ -232,7 +232,8 @@ def main(argv=None):
 		config.paths.report_file, runtime=RUNTIME,
 		debug=debug_print_enabled(), stdout=rank0_print)
 	production_stdout = ProductionStdout(
-		debug=debug_print_enabled(), rank=RUNTIME.process_index)
+		debug=debug_print_enabled(), rank=RUNTIME.process_index,
+		warning_fn=report.legacy_print)
 	production_stdout.install()
 	report.stdout = (rank0_print if debug_print_enabled()
 	                 else production_stdout.emit)

@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 
 
 class ProductionStdout:
     """Route incidental stdout away from one driver's scientific output."""
 
-    def __init__(self, *, debug: bool, rank: int) -> None:
+    def __init__(self, *, debug: bool, rank: int, warning_fn=None) -> None:
         self.debug = bool(debug)
         self.rank = int(rank)
+        self.warning_fn = warning_fn
         self._console = sys.stdout
         self._sink = None
+        self._showwarning = None
+        self._warning_handler = None
 
     def install(self) -> None:
         """Start routing incidental Python stdout in production mode."""
@@ -33,6 +37,20 @@ class ProductionStdout:
             return
         self._sink = open(os.devnull, "w", encoding="utf-8")
         sys.stdout = self._sink
+        # Python warnings otherwise bypass stdout and repeat once per process.
+        # A driver reporter can retain them once in its final warning block;
+        # workers without a reporter stay silent.  Exceptions and native
+        # diagnostics still use stderr and are never intercepted here.
+        if self.warning_fn is not None or self.rank != 0:
+            self._showwarning = warnings.showwarning
+
+            def _route_warning(message, category, filename, lineno,
+                               file=None, line=None):
+                if self.rank == 0 and self.warning_fn is not None:
+                    self.warning_fn(f"{category.__name__}: {message}")
+
+            self._warning_handler = _route_warning
+            warnings.showwarning = self._warning_handler
 
     def emit(self, text: str = "", *, end: str = "\n") -> None:
         """Write scientific output once, from process zero."""
@@ -47,6 +65,11 @@ class ProductionStdout:
             sys.stdout = self._console
         self._sink.close()
         self._sink = None
+        if (self._warning_handler is not None
+                and warnings.showwarning is self._warning_handler):
+            warnings.showwarning = self._showwarning
+        self._showwarning = None
+        self._warning_handler = None
 
 
 __all__ = ["ProductionStdout"]
