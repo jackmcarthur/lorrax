@@ -36,10 +36,10 @@ itself:
 
 ## Sweep values in this bundle
 
-- Error bounds: 1.0e-06, 2.0e-07, 6.9e-08, 1.8e-08
+- Error bounds: 1.0e-06, 2.0e-07, 6.9e-08, 3.0e-08, 1.8e-08
 - Crossing target kind: `hgl`
 - Crossing `eps_q`: 1.000e-03
 - Crossing `A_dim` values: 20, 24, 40
-- Noncrossing `R` values: 10, 21.5443, 46.4159, 92.3619, 100, 215.443, 464.159, 1000, 2154.43, 4641.59, 10000, 21544.3, 46415.9, 100000
+- Noncrossing `R` values: 10, 21.5443, 46.4159, 92.3619, 100, 215.443, 256, 464.159, 1000, 2154.43, 4641.59, 10000, 21544.3, 46415.9, 100000
 
 The machine-readable descriptor is `catalog.json`.
