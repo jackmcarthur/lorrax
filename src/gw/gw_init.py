@@ -58,19 +58,19 @@ from .gw_config import (
 # Transitional plumbing with an owner decision behind it; see
 # ``src/ffi/_services.py``.
 #
-# THREE NAMES, THREE FORMER RAW-h5py SITES.  ``probe_zeta_file`` replaced
+# TWO NAMES, THREE FORMER RAW-h5py SITES.  ``probe_zeta_file`` replaced
 # the two hand-written copies of the dataset-name/μ-axis dispatch below
 # (``_check_zeta_h5_matches_basis`` and ``_zeta_reuse_ok``) — that tuple is
 # spelled ONCE now, in the service, and this comment deliberately does not
 # spell it a fourth time; ``ZetaLoader`` replaced the raw ``n_rmu_T`` shape
-# read; ``write_g0_mu`` replaced the raw ``del``+``create_dataset`` append.
+# read.  G=0 remains an in-memory view of the canonical ζ tensor; it is not
+# persisted as a duplicate dataset.
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
 
-from zeta_loader import (                                        # noqa: E402
-	ZetaLoader, probe_zeta_file, write_g0_mu)
+from zeta_loader import ZetaLoader, probe_zeta_file              # noqa: E402
 # The vcoul door, for the ONE thing this module needs from it: the
 # Cartesian reciprocal rows, taken as a geometry rather than written out as
 # ``blat * bvec`` at the V_q call site below.
@@ -2081,7 +2081,7 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
-	"""Compute bare Coulomb V_qmunu from zeta HDF5 and write G0 back.
+	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
 
 	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
 	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
@@ -2375,8 +2375,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						vcoul_cutoff_ry=vcoul_cutoff_ry,
 						print_fn=print_fn)
 
-	# Write G0 = ζ_μ(G=0) at q=0 back to zeta file via SlabIO's deferred
-	# attr path (small; rank-0-only after MPI-IO file is closed).
+	# Keep G0 = ζ_μ(G=0) in memory for the current compute consumers.
+	# It is already the G=0 coefficient of canonical ``zeta_q_G`` (stored
+	# parent-q slot 0), so persisting ``g0_mu`` would create a second source
+	# of truth.  Full-BZ literal G=0 under IBZ symmetry is a derived unfolded
+	# view and likewise must not be persisted as a duplicate dataset.
 	# ``common.collectives.gather_to_host`` is the sanctioned L3 gather and
 	# is what ``_slab_io_allgather._to_host`` was a private copy of.  This
 	# import used to reach straight into the allgather backend, bypassing
@@ -2386,31 +2389,6 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	# was.  Same dispatch, public name.
 	from common.collectives import gather_to_host as _gather_to_host
 	G0_gathered = _gather_to_host(G0_all)
-	# The door's documented sequence (``write_g0_mu``: close -> barrier ->
-	# rank-0 write -> barrier) is now LITERALLY what this caller does.
-	# ``gather_to_host`` above is itself collective and synchronized this
-	# point in practice, but the step-3 blind audit (Arm B §7) found the
-	# pre-write barrier existing only by that side effect — one explicit
-	# line is cheaper than a sequence that is true by coincidence.
-	barrier("g0_pre_write")
-	if jax.process_index() == 0:
-		# Clip the μ axis to the LOGICAL extent: files on disk store
-		# logical extents so they re-read identically on any process
-		# count (G0_all is at the in-memory padded extent, pad
-		# entries exact zeros).  THE CLIP STAYS HERE, at the call site,
-		# because only this caller knows which of its axes is μ; the door
-		# takes ``n_rmu_expected`` and turns "the caller clipped
-		# correctly" from a convention into a check.
-		_g0_np = np.asarray(G0_gathered)[..., :int(meta.n_rmu)]
-		# THE ONE sanctioned post-close serial append into a ζ file.  The
-		# rank-0 gate and the barrier below are the CALLER's on purpose
-		# (``write_g0_mu``'s docstring: putting the gate inside would make
-		# it look safe to call anywhere, and the failure that hides is
-		# silent concurrent-writer corruption).  Ordering is unchanged:
-		# after ``gather_to_host``, after every collective handle has
-		# closed, rank-0 only, barrier'd.
-		write_g0_mu(zeta_h5_path, _g0_np, n_rmu_expected=int(meta.n_rmu))
-	barrier("g0_write")
 
 	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
 	# axes of the legacy 8-D layout were never used in scalar mode and
