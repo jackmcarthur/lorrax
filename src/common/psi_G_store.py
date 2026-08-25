@@ -347,10 +347,11 @@ class PsiGStore:
             # ~1.3 GB/rank wasted by V_q time (agent_h §3 Finding 3).
             self._g_index_dev = self.loader.box_index_dev(
                 k="full_bz", mesh=self.mesh)
-            kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
-            sym = self.loader.symmetry()
-            kvecs_frac = np.asarray(
-                sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
+            # k and G are one gauge contract owned by WfnLoader. Rebuilding
+            # k from integer grid labels can pick a different reciprocal-
+            # lattice image than ``box_index``'s G table (notably on an
+            # identity-only WFN whose stored full grid is centered).
+            kvecs_frac = self.loader.kvecs(k="full_bz")
             # Process-local placement — see
             # ``common.collectives.device_put_process_local``: on a
             # multi-process mesh ``jax.device_put(numpy, sharding)``

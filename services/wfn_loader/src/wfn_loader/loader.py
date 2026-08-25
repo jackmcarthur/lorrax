@@ -589,6 +589,31 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # G-vector and ngk_valid accessors
     # ------------------------------------------------------------------
+    def kvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Return the fractional k representatives paired with ``gvecs``.
+
+        This is the coordinate half of the loader's G-flat gauge contract.
+        For raw IBZ rows it returns the WFN file's own ``kpoints``; for a
+        full-BZ request it returns ``SymMaps.unfolded_kpts`` in the exact
+        requested row order. Consumers that form ``k+G`` or apply a Bloch
+        phase must take both tables from this loader: rebuilding k from an
+        integer grid can choose a different reciprocal-lattice image without
+        applying the compensating shift to G.
+        """
+        k_idxs, unfold = self._resolve_k(k)
+        if unfold:
+            table = np.asarray(
+                self._ensure_sym().unfolded_kpts, dtype=np.float64)
+        else:
+            table = np.asarray(self.kpoints, dtype=np.float64)
+        out = np.asarray(table[np.asarray(k_idxs, dtype=np.int32)],
+                         dtype=np.float64)
+        if out.shape != (len(k_idxs), 3) or not np.all(np.isfinite(out)):
+            raise ValueError(
+                "WfnLoader.kvecs: resolved k table must be finite with shape "
+                f"({len(k_idxs)}, 3); got {out.shape}.")
+        return np.ascontiguousarray(out)
+
     def gvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
         """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, padded
         beyond logical ``ngk`` with the FFT-box **pad sentinel**.
@@ -1232,8 +1257,7 @@ class WfnLoader:
                 nb_padded=nb_padded, out_sharding=named_sharding)
             if bispinor:
                 psi = self._apply_bispinor_lift(
-                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
-                    sharding=named_sharding)
+                    psi, k=k, sharding=named_sharding)
             return psi
 
         if bispinor:
@@ -1244,7 +1268,7 @@ class WfnLoader:
                 nb_padded=nb_padded)
             psi_j = jnp.asarray(psi_np)
             psi_j = self._apply_bispinor_lift(
-                psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+                psi_j, k=k, sharding=None)
             if named_sharding is None:
                 return psi_j
             # Process-local shard-out.  ``jax.device_put`` of an
@@ -1339,7 +1363,7 @@ class WfnLoader:
         psi = jax.device_put(psi_np, jax.local_devices()[0])
         if bispinor:
             psi = self._apply_bispinor_lift(
-                psi, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+                psi, k=k, sharding=None)
         return psi
 
     def _eager_build_process_local(
@@ -1419,8 +1443,6 @@ class WfnLoader:
         psi_2: jax.Array,
         *,
         k: KSpec,
-        k_idxs: np.ndarray,
-        unfold: bool,
         sharding: NamedSharding | None,
     ) -> jax.Array:
         """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
@@ -1435,20 +1457,11 @@ class WfnLoader:
         Pad rows of ψ are zero → small components of pad rows are also
         zero (clean propagation, no per-k mask needed).
 
-        ``unfold`` tells us which kvec table to use: raw IBZ
-        (``wfn.kpoints``, k_idxs are IBZ indices) vs full-BZ
-        (``sym.unfolded_kpts``, k_idxs are full-BZ indices).
+        ``k`` is resolved once by :meth:`kvecs`, the same public loader door
+        whose representatives are paired with :meth:`gvecs`.
         """
         gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int
-        if unfold:
-            sym = self._ensure_sym()
-            kvecs_np = np.asarray(
-                sym.unfolded_kpts, dtype=np.float64)[
-                    np.asarray(k_idxs, dtype=np.int32)]
-        else:
-            kvecs_np = np.asarray(
-                self.kpoints, dtype=np.float64)[
-                    np.asarray(k_idxs, dtype=np.int32)]
+        kvecs_np = self.kvecs(k=k)
         # WFN stores bvec in reciprocal-lattice units and blat=2π/alat in
         # bohr⁻¹.  This file-format boundary is the one place the bispinor
         # lift converts to the Cartesian momentum its API requires.
