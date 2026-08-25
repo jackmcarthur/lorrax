@@ -94,6 +94,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.gpu_utils import bfc_fragmentation_target_utilization
+from runtime.padding import round_up
 
 # The planner's ONE printing path: every fallback below announces its demotion
 # through this, once per process, tagged with the rank it happened on.  (Safe
@@ -164,6 +165,31 @@ def _factor_mesh(pp: int) -> tuple[int, int]:
     while pp % gx != 0:
         gx -= 1
     return gx, pp // gx
+
+
+def centroid_fft_tile_geometry(
+    *, nk: int, band_chunk: int, p_band: int,
+) -> tuple[int, int]:
+    """Return ``(k_tile, local_flat_rows)`` for a centroid WFN transfer.
+
+    The loader mesh-rounds its global band tile before distributing that
+    axis.  Bound ``k_tile * (band_tile / p_band)`` by that same physical band
+    tile, so the local FFT-row batch does not grow just because the band axis
+    is divided over more ranks.  This pure rule also serves artifact-reuse
+    paths, which need a safe centroid resample but deliberately do not run the
+    full zeta-fit memory planner.
+    """
+    nk = int(nk)
+    band_chunk = int(band_chunk)
+    p_band = int(p_band)
+    if nk <= 0 or band_chunk <= 0 or p_band <= 0:
+        raise ValueError(
+            "centroid FFT geometry requires positive nk, band_chunk, and "
+            f"p_band; got nk={nk}, band_chunk={band_chunk}, p_band={p_band}")
+    band_tile = round_up(band_chunk, p_band)
+    local_bands = band_tile // p_band
+    k_tile = min(nk, max(1, band_tile // local_bands))
+    return k_tile, k_tile * local_bands
 
 
 # ---------------------------------------------------------------------------
@@ -549,28 +575,12 @@ def plan_gflat_chunks(
         fit_nb_padded = ((fit_nb + p_xy - 1) // p_xy) * p_xy
         return min(max(bc, p_xy), max(fit_nb_padded, p_xy))
 
-    def _centroid_fft_geometry(bc: int) -> tuple[int, int]:
-        """Return ``(k_tile, local_flat_rows)`` for Stage A.
-
-        ``bc`` is a mesh-divisible GLOBAL band tile whose local band extent
-        is ``bc / P_band``.  Bound the product of that extent and the outer k
-        tile by the already resolved Stage-A band extent ``bc``.  Therefore a
-        shipping ``band_chunk=16`` means 16 local FFT rows at both P=1
-        (1 k x 16 bands) and P=16 (16 k x 1 band), instead of silently growing
-        to ``nk`` rows as band sharding becomes finer.  This reuses the one
-        existing memory-policy knob; it is not a second planner or a new
-        frontend choice.
-        """
-        bc = int(bc)
-        local_bands = max(1, bc // p_xy)
-        k_tile = min(nk, max(1, bc // local_bands))
-        return k_tile, k_tile * local_bands
-
     _fft_box_cache: dict[tuple[int, int], float] = {}
 
     def _fft_for_bc(bc: int) -> float:
         bc = int(bc)
-        k_tile, _ = _centroid_fft_geometry(bc)
+        k_tile, _ = centroid_fft_tile_geometry(
+            nk=nk, band_chunk=bc, p_band=p_xy)
         key = (k_tile, bc)
         if key not in _fft_box_cache:
             _fft_box_cache[key] = _fft_box_bytes(
@@ -631,8 +641,8 @@ def plan_gflat_chunks(
                 bc *= 2
 
     fft_box_A = _fft_for_bc(band_chunk)
-    centroid_k_chunk, centroid_fft_rows_local = _centroid_fft_geometry(
-        band_chunk)
+    centroid_k_chunk, centroid_fft_rows_local = centroid_fft_tile_geometry(
+        nk=nk, band_chunk=band_chunk, p_band=p_xy)
 
     # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
     # all-P-sharded cache, never a replicated full-window object.  Price its
