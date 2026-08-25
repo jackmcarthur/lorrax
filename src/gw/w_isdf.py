@@ -87,6 +87,28 @@ _w_solve_cache: dict = {}
 _STATIC_FRACTIONAL_PAIR_TILE = 8
 
 
+def _complete_static_charge_orientations(A_R):
+    r"""Return both ordered particle-hole orientations in R space.
+
+    ``A_R`` is the valence-to-conduction half of the integer-occupation
+    response.  For a general complex, broken-time-reversal wavefunction the
+    reverse ordered transition is not a second copy of that half.  Density-
+    vertex Hermiticity and the full-grid FFT convention instead give
+    ``FFT_R[conj(A_R)](q) = conj(A_-q)``.
+
+    The static/imaginary-axis charge response is therefore proportional to
+    ``A_R + conj(A_R)``.  Replacing this by ``2*A_R`` is valid only when
+    ``A_R`` is already real.  This is the integer-occupation limit of the
+    exact ordered-pair evaluator and the same orientation identity used by
+    the fractional contour kernel below.
+
+    Keep this completion before the final R-to-q FFT.  It is transition
+    algebra, not a post-hoc q symmetrization, and preserves sharding
+    elementwise.
+    """
+    return A_R + jnp.conj(A_R)
+
+
 
 # ============================================================================
 # χ₀ kernel — minimax quadrature
@@ -299,6 +321,8 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
                     jnp.einsum('Rambn,Rambn->Rmn',
                                Gc_R, jnp.conj(Gv_R), optimize=True),
                     _chi_R_shard)
+                if not complex_contour:
+                    chi_tau = _complete_static_charge_orientations(chi_tau)
                 return tuple(a + alpha_col[i] * chi_tau
                              for i, a in enumerate(accs)), None
 
@@ -329,9 +353,9 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
         Sibling of ``ppm_sigma.minimax_tau_integrate_sigma`` — takes a
         ``MinimaxNodes`` pytree in the same slot.  For chi0 the nodes
         arrive with purely-real τ (``time_axis='real'``) and complex α
-        whose Im part is zero; ``alpha`` already includes the chi0
-        prefactor ``-2·α_quad·exp(-τ·E_gap)`` so the scan body only
-        scales the per-τ contraction.
+        whose Im part is zero; ``alpha`` includes the one-orientation
+        prefactor ``-α_quad·exp(-τ·E_gap)``.  The scan body explicitly adds
+        the reverse ordered transition before scaling the per-τ contraction.
 
         For each τ node: build Gv, Gc via build_G_tau; FFT both to R;
         element-wise contract (Σ_{a,b} Gc_R · conj(Gv_R)) into chi_R;
@@ -361,6 +385,8 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
                 jnp.einsum('Rambn,Rambn->Rmn',
                            Gc_R, jnp.conj(Gv_R), optimize=True),
                 _chi_R_shard)
+            if not complex_contour:
+                chi_tau = _complete_static_charge_orientations(chi_tau)
             # α is complex; its Im part is zero for the chi0 Laplace
             # window.  Multiplying complex·complex is identical to
             # float·complex at the hardware level when Im(α)=0.
@@ -504,6 +530,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                     jnp.einsum('Rambn,Rambn->Rmn',
                                Gc_R, jnp.conj(Gv_R), optimize=True),
                     _chi_R_shard)
+                if not complex_contour:
+                    chi_tau = _complete_static_charge_orientations(chi_tau)
                 return tuple(a + alpha_col[i] * chi_tau
                              for i, a in enumerate(accs)), None
 
@@ -552,6 +580,12 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                     spin_axes=(1, 3))
             chi_tau = jax.lax.with_sharding_constraint(
                 chi_tau_raw, _chi_R_shard)
+            # Scalar charge needs both ordered transition orientations.
+            # Lorentz-current blocks retain their separately derived vertex
+            # convention: the reverse of fixed (A,B) is not obtained by
+            # blindly conjugating that same block.
+            if vertex_operands is None and not complex_contour:
+                chi_tau = _complete_static_charge_orientations(chi_tau)
             return chi_R_acc + alpha_scalar * chi_tau, None
 
         final_R, _ = jax.lax.scan(
@@ -1452,9 +1486,13 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
 
     ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
     x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical χ₀ is::
+    The physical static/imaginary-axis χ₀ contains both ordered
+    particle-hole orientations.  In the real-space convolution used here::
 
-        χ₀ = -2 Σ_ℓ α_ℓ Σ_{v,c} |M_vc|² exp(-τ_ℓ (E_c - E_v))
+        χ₀ = -Σ_ℓ α_ℓ [A_R(τ_ℓ) + conj(A_R(τ_ℓ))]
+
+    before the final R-to-q FFT.  The conjugate term maps to
+    ``conj(A_-q)`` and is distinct from ``A_q`` for complex broken-TR states.
 
     A uniform energy shift via ``energy_reference`` is applied to both
     valence and conduction energies before building the minimax factors.
@@ -1475,10 +1513,11 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     E_gap = cmin - vmax
 
     tau = np.asarray(quad.tau, dtype=np.float64)
-    # Fold the chi0 prefactor (-2 · exp(-τ·E_gap)) into α so the τ-scan
-    # body can apply a single weighted add per node.  ``MinimaxNodes``
-    # carries both in complex128; τ has Im=0 for the Laplace quad.
-    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into α.  The
+    # kernel adds A_R + conj(A_R), the two ordered particle-hole
+    # orientations, before this weight is applied.  ``MinimaxNodes`` carries
+    # both in complex128; τ has Im=0 for the Laplace quad.
+    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -2016,8 +2055,9 @@ def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
     row per output, all on ``tau``.  Row 0 is normally the static weights
     (zero-padded onto any extra nodes — zero-weight nodes add exact
     zeros); further rows are probe representations on the same nodes.
-    The χ₀ prefactor ``-2·exp(-τ·E_gap)`` folds into every row exactly as
-    the single-output path folds it into its one α vector.
+    The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into every row;
+    the kernel adds the reverse ordered transition through the shared
+    R-space orientation combiner exactly as the single-output path does.
     """
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
@@ -2035,7 +2075,7 @@ def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
             f"chi0 multi: alpha_rows shape {alpha_rows.shape} does not "
             f"match tau nodes ({tau.shape[0]},) — every row must be a "
             f"weight vector on quad.tau.")
-    alpha_chi = -2.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
+    alpha_chi = -1.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -3069,7 +3109,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
     tau = np.asarray(quad.tau, dtype=np.float64)
     if len(tau) == 0:
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
-    alpha_chi = -2.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
