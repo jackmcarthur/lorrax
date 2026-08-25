@@ -101,7 +101,11 @@ $$\vec j^{\,\rm Gordon}_{n,k}(r) = \underbrace{\mathrm{Im}\big[\psi_L^\dagger(r)
 + \tfrac{1}{2}\,\nabla\times\big[\psi_L^\dagger(r)\,\boldsymbol\sigma\,\psi_L(r)\big],
 \qquad W_{\rm curr}(r)=\sum_{n\in\rm occ,\,k,\,i}|j^{\,\rm Gordon}_{n,k,i}(r)|^2.$$
 
-Built from $\psi_L$ (no bispinor lift dependency, no $\alpha_{\rm FS}$ suppression) by [`current_density.build_current_density`](../src/centroid/current_density.py).
+The production builder evaluates the algebraically equivalent direct Dirac
+vertex $\Psi^\dagger\alpha_i\Psi/\alpha_{\rm FS}$ from the canonical
+kinetic-balance lift.  The Gordon form above remains the independent parity
+identity and makes explicit why the lifted result has no
+$\alpha_{\rm FS}$ suppression.
 
 **Effect on MoS2** (`run_zeta_proper_gram.py`, aggregate over 3.3M band-pair × k × q × test-point samples per channel):
 

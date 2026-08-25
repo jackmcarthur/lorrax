@@ -71,7 +71,7 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     """
     from common.collectives import single_device_mesh
     from common.wfn_transforms import to_rbox
-    from symmetry_maps import fft_grid_pullback_perm
+    from symmetry_maps import fft_grid_pullback_perm, star_tables_of
     from wfn_loader import IBZRows, WfnLoader
     from .charge_density import _uniform_band_windows
 
@@ -129,9 +129,10 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
         return field
 
     nk_full = int(sym.nk_tot)
-    parent_for_k = np.asarray(sym.irr_idx_k, dtype=np.int32)
-    sym_row_for_k = np.asarray(sym.sym_idx_k, dtype=np.int32)
-    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    # Keep the full-k parent row, selected symmetry row, and spatial/TRS
+    # split inseparable.  ``star_tables_of`` derives the split from the same
+    # TRS-augmented table that the WFN unfold consumes.
+    parent_for_k, sym_row_for_k, n_spatial = star_tables_of(sym)
     if n_spatial < 1:
         raise ValueError("SymMaps contains no spatial symmetry row")
     sym_mats_k_shape = np.asarray(sym.sym_mats_k).shape
