@@ -815,7 +815,6 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     current_nmu: jax.Array
     current_mun: jax.Array
     n_rmu_logical: int
-    basis_receipt: object
     iq_irr: int
     q_irr_kgrid_int: np.ndarray
     q_crys: np.ndarray
@@ -826,6 +825,9 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     vnl_ward_reference_norm: jax.Array
     hamiltonian_config_operator_fingerprint: str
     vnl_path_operator_fingerprint: str
+    # Appended so the pre-receipt tuple positions remain stable for readers
+    # that treated this NamedTuple as a positional record.
+    basis_receipt: object
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
