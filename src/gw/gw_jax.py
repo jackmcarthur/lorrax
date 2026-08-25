@@ -791,6 +791,7 @@ def main(argv=None):
 	_t_kin = time.perf_counter()
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
+		expected_bispinor=config.bispinor,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
