@@ -62,8 +62,7 @@ survivable.  Both registered catastrophes satisfied it exactly.
 ### The number, and why it is 1e8
 
 The gate is on the **absolute achieved amplification**, and its ceiling is
-**κ_certified = 1e8**, measured on two systems that share no code path
-downstream of the fit:
+**κ_certified = 1e8**, measured by the GW fit results below:
 
 | deck | rtol | κ_eff | truncation bound? | outcome |
 |---|---|---|---|---|
@@ -72,7 +71,6 @@ downstream of the fit:
 | MoS₂ 4×4, same | 1e-12 | ≈1e12 | yes, rank 9461 | eqp0 −5049.59 |
 | Si 4×4×4 SYM/SOC, 128 band, 1776 centroids (register 2026-08-15) | 1e-10 | 9.7e9 … 1.0e10 | yes, 1469/1776 | Σ_c MAE **54.4 eV**, exit 0 |
 | Si 4×4×4, 600 centroids | 1e-10 | — | **no** | Σ_c MAE 0.90 eV |
-| MoS₂ 4×4 htransform ψ@centroids (job 7883150) | 1e-8 | 4.44e4 | no (full row rank) | on-grid 3.2e-5 meV |
 
 Read the third column, not the fourth.  Everything at κ_eff ≈ 1e10 or above is
 wrong by electron-volts; everything at or below 1e8 is right.  That is the
@@ -107,8 +105,8 @@ compares `κ_eff` against `κ_certified`; whenever `κ_cap ≤ κ_certified` tha
 comparison *cannot be true*, and the gate returns clean from a path that
 tested nothing.
 
-That is the case at **every default in this tree today** — `zeta_rcond = 1e-8`
-and htransform's `rtol = 1e-8` both give `κ_cap = 1e8 = KAPPA_CERTIFIED_GRAM`.
+That is the case at the registered zeta default today: `zeta_rcond = 1e-8`
+gives `κ_cap = 1e8 = KAPPA_CERTIFIED_GRAM`.
 The arm becomes live exactly when an operator loosens the dial below the
 certified plateau, which is where both registered catastrophes sat
 (rcond 1e-10 → −206.83 eV, 1e-12 → −5049.59 eV; Si 4×4×4 at κ_eff 9.7e9).
@@ -249,7 +247,6 @@ is **uncertified** and the site warns rather than refuses, and says which.
 | `isdf/core._charge_factor_math` `transverse_rank_truncate` | transverse CCT, indefinite | `transverse_zeta_rcond` (deck) | `n_log` | — (uncertified) | warn |
 | `isdf/core._factor_c_q_distributed_rank_truncate` | same, 2-D pzheevd | as above | `n_log` | as above | as above |
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | — (no truncation) | — | κ ≥ 1e12 refuses | refuse |
-| `bandstructure/htransform.streaming_galerkin_solve` | ψ@centroids Gram-eigh σ | `rtol` (1e-8) | `min(nk·nb, nspinor·n_μ)` | 1e8 | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | `rcond` (caller) | `μ_S` | 1e8 | refuse (κ only — the route reduces over q before host, so it carries no per-q trace and cannot make the weight finding) |
 | `common/pivoted_cholesky` select (centroid/downfold callers) | candidate Gram, PSD | `sqrt(eps)` relative | candidate count | — | see §7 |
 | `bse/bse_w_exact` TRIM probes | probe independence | relative (§3) | block size | — | refuse on deficiency, with k/block/norm named |
@@ -326,15 +323,12 @@ Stated so nobody quotes it as coverage it does not have.
   that site's ceiling is `None` and it warns.  Getting a number there is the
   next measurement, not a code change.
 * It does not bound N_μ from the plane-wave count.  §2 says why.
-* It does not make the htransform exact-span route N_k-independent.  The
-  paper-faithful finite-accuracy route is `htransform_rank_multiplier`
-  (landed `7b6f9dd3`, opt-in, model order `ceil(m·N_b)` and therefore
-  N_k-independent by construction).  Its default is still 0 — the exact-span
-  path — because the only A/B on record is 2.218 meV RMS / 6.820 meV max on a
-  MoS₂ exciton spectrum and is inspection-grade, not a production
-  certification.  What changed is that the exact-span route's refusal now
-  *names* it as the supported repair instead of telling the operator to buy
-  centroids, which is measured wrong advice on a dense metal k-grid.
+* It does not own htransform model order.  Htransform has one published
+  whole-state randomized-QRCP route in `isdf.galerkin`: `htransform_qr_eps`
+  is its rank criterion and `htransform_rank_multiplier` (default 20; `0` is
+  an archived alias) is only the search ceiling.  That basis reports its own
+  projection and search-saturation receipts rather than routing through this
+  zeta/Gram truncation policy.
 * It does not reach the two BSE-owned cuts in §6's last two rows.  Both
   wirings change numbers in a shipped eigensolver, so each needs an A/B first.
 * It does not turn `κ_eff ≤ κ_cap` into a sufficient condition.  It never was.

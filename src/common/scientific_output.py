@@ -189,13 +189,17 @@ def htransform_quality_lines(receipt) -> list[str]:
     reference, as the report states explicitly.
     """
     isometry = float(receipt["row_isometry_max"])
-    cap = float(receipt["row_isometry_cap"])
+    cap = receipt.get("row_isometry_cap")
     shell = 100.0 * float(receipt["outer_shell_l2_fraction"])
     shell_max = 100.0 * float(receipt["outer_shell_max_over_r0"])
     wall = float(receipt["locality_wall_seconds"])
+    isometry_line = f"Row isometry   : max |C C^H - I|={isometry:.5e}"
+    if cap is None:
+        isometry_line += " (diagnostic only; no per-k gauge repair)"
+    else:
+        isometry_line += f" (acceptance cap {float(cap):.5e})"
     return [
-        f"Row isometry   : max |C C^H - I|={isometry:.5e} "
-        f"(acceptance cap {cap:.5e})",
+        isometry_line,
         f"f(H)_R locality: outer-shell ||f(H)_R||_F / total = {shell:.2f}%; "
         f"largest shell ||f(H)_R||_F / R=0 = {shell_max:.2f}%",
         "Error meaning  : the locality receipt diagnoses finite-supercell "

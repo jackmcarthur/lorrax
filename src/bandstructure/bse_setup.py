@@ -57,7 +57,12 @@ from common.staged_reshard import (
     DEFAULT_ROUTE as _RESHARD_ROUTE_DEFAULT,
 )
 
-from .htransform import build_fH_R, build_R_grid_np, newton_inv
+from .htransform import (
+    build_fH_R,
+    build_R_grid_np,
+    newton_inv,
+    require_newton_converged,
+)
 
 
 def resolve_reshard_route(explicit=None, *, log_fn=None) -> str:
@@ -180,13 +185,11 @@ FI_FSHOULDER_TOL_DEFAULT = 0.0
 def resolve_fi_fshoulder_tol(log_fn=None) -> float:
     """``LORRAX_FI_FSHOULDER_TOL`` (default 0.0) — the f-shoulder gate floor.
 
-    Same announce-or-refuse grammar as ``LORRAX_FH_ORTHO_TOL``
-    (``gw_config.env_float`` in refuse mode), with ONE deliberate difference
-    that is worth stating because the two gates sit four lines apart: here
-    ``0`` is the DEFAULT, not the off switch.  A band whose ``f`` is exactly
-    zero at some k is not a tolerance question — it is absent from ``fH``
-    — so the floor that catches it is zero, and turning the gate OFF needs a
-    value no threshold could ever be (negative).
+    Uses the canonical ``gw_config.env_float`` announce-or-refuse grammar.
+    Here ``0`` is the DEFAULT, not an off switch: a band whose ``f`` is exactly
+    zero at some k is absent from ``fH``, so the floor that catches it is zero.
+    Turning the gate OFF needs a value no physical threshold could be
+    (negative).
     """
     from gw.gw_config import env_float
     tol = env_float("LORRAX_FI_FSHOULDER_TOL", FI_FSHOULDER_TOL_DEFAULT,
@@ -1064,13 +1067,16 @@ def compute_wfns_fi(
     def _build_inv():
         @jax.jit
         def _inv(lam):
-            return jax.vmap(
+            energies, inverse_residual = jax.vmap(
                 lambda row: newton_inv(a_f, n_f, shift, row.real))(lam)
+            return energies, jnp.max(inverse_residual)
         return _inv
 
-    energies_fi = _cached_kernel(
+    energies_fi, inverse_residual = _cached_kernel(
         ("inv", _mesh_id, float(a_f), float(n_f), float(shift)),
         _build_inv)(lam_fi)
+    require_newton_converged(
+        float(inverse_residual), where="compute_wfns_fi")
 
     # ── Reshard into the canonical (Y, X) wfn-bundle layout ──────────────
     # Matches ``common.wfn_transforms.load_centroids_band_chunked``:

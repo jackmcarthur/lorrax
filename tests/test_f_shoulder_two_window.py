@@ -241,10 +241,9 @@ def test_fshoulder_tol_grammar(monkeypatch):
     """``LORRAX_FI_FSHOULDER_TOL``: default 0.0, garbage REFUSES, a negative
     value disables and announces, a positive value tightens.
 
-    The one deliberate difference from ``LORRAX_FH_ORTHO_TOL`` — where ``0``
-    is the off switch — is that here ``0`` is the DEFAULT, because a band
-    whose ``f`` is exactly zero is absent rather than inaccurate.  Turning
-    this gate off therefore needs a value no threshold could be.
+    Here ``0`` is the DEFAULT because a band whose ``f`` is exactly zero is
+    absent rather than inaccurate.  Turning this gate off therefore needs a
+    value no physical threshold could be.
     """
     pytest.importorskip("jax")
     from bandstructure.bse_setup import (FI_FSHOULDER_TOL_DEFAULT,

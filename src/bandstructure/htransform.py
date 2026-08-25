@@ -47,7 +47,7 @@ from gw.gw_config import (
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
 )
-from common.fft_helpers import make_flat_k_ifftn
+from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -79,13 +79,11 @@ def _build_mesh_xy() -> Mesh:
     return RUNTIME.mesh
 
 
-# Per-device ceiling on one streamed Galerkin Q r-chunk.
-#
-# The outer-r / inner-band loop mirrors zeta fitting: all band chunks are
-# summed into Q for ONE r chunk before its Gram contribution is formed and Q
-# is discarded.  This ceiling bounds that Q shard on each device.  Splitting
-# r changes only the Gram reduction order; splitting bands before the outer
-# product would drop cross terms and is forbidden.
+# Per-device ceiling on one bounded whole-state real-space tile.  The
+# randomized sketch, exact selected-state Gram and physical projection all use
+# the canonical ``PsiGStore`` outer-r / inner-band stream; the shared planner
+# chooses one carrier that bounds their selected/random rows and WFN transform
+# workspace.  No full-r Galerkin basis is materialized.
 # Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
 #
 # Resolved INSIDE the consuming function, not at module scope: the old
@@ -98,7 +96,7 @@ def _build_mesh_xy() -> Mesh:
 
 
 def resolve_galerkin_chunk_bytes() -> int:
-    """Per-device ``LORRAX_GALERKIN_CHUNK_GIB`` Q-tile budget in bytes.
+    """Per-device ``LORRAX_GALERKIN_CHUNK_GIB`` stream budget in bytes.
 
     Blank/unset → the default; garbage REFUSES naming the variable
     (``gw_config.env_float`` refuse mode); non-positive values refuse too
@@ -109,7 +107,7 @@ def resolve_galerkin_chunk_bytes() -> int:
     if gib <= 0.0:
         raise ValueError(
             f"LORRAX_GALERKIN_CHUNK_GIB={gib!r} must be > 0 (GiB budget "
-            f"for one Galerkin Q r-chunk; unset/blank = 6).")
+            f"for one whole-state real-space tile; unset/blank = 6).")
     return int(gib * 1024 ** 3)
 
 
@@ -411,13 +409,16 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
 
     flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     spec_3d = P(None, None, None, 'x', 'y')
+    rep_ = NamedSharding(mesh_xy, P())
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
     local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
+    local_fftn = make_flat_k_fftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
 
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
     # transpose is a permutation of the same f64 values).
-    @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
+    @partial(jax.jit,
+             out_shardings=(flat_xy, flat_xy, rep_, rep_, rep_, rep_))
     def _build(ctilde_in, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
@@ -437,15 +438,37 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
-        return fH_k, fH_R
+
+        # The rank-by-rank fH eigensolve is not needed to certify its coarse
+        # spectrum.  If A = sqrt(-f(eps)) C, the nonzero eigenvalues of
+        # -A^H A are exactly those of the much smaller -A A^H.  This checks
+        # every coarse k in the nb-by-nb state space while the weighted rows
+        # are already live, rather than compiling a rank-by-rank Gamma-only
+        # eigensolve beside the production batched eigensolver.
+        small_fH = -jnp.einsum(
+            'kim,kjm->kij', weighted, jnp.conj(weighted), optimize=True)
+        small_fH = 0.5 * (small_fH + jnp.swapaxes(small_fH, -1, -2).conj())
+        recovered_f = jax.vmap(jnp.linalg.eigvalsh)(small_fH)
+        expected_f = jnp.sort(f_eps_T, axis=1)
+        f_recovery_error = jnp.max(jnp.abs(recovered_f - expected_f))
+        recovered_e, inverse_residual = jax.vmap(
+            lambda row: newton_inv(a_f, n_f, shift, row.real))(recovered_f)
+        energy_recovery_error = jnp.max(
+            jnp.abs(jnp.sort(recovered_e, axis=1)
+                    - jnp.sort(enk_sigma.T, axis=1)))
+
+        # Use the paired canonical flat-k service for the complete inverse
+        # transform.  A one-point explicit Fourier sum can certify Gamma while
+        # still missing an ordering, normalization or non-Gamma defect.
+        fft_roundtrip_error = jnp.max(jnp.abs(local_fftn(fH_R) - fH_k))
+        return (fH_k, fH_R, fft_roundtrip_error, f_recovery_error,
+                energy_recovery_error, jnp.max(inverse_residual))
 
     # Projection receipt, not a rank gate.  The published whole-state QRCP
     # basis is deliberately approximate, so C C^H need not be the identity.
     # Applying a per-k Löwdin map would change the one shared alpha gauge and
     # is therefore forbidden.  Accuracy is decided directly from recovered
     # coarse-grid energies/wavefunctions and the independent fine-QE oracle.
-    rep_ = NamedSharding(mesh_xy, P())
-
     @partial(jax.jit, out_shardings=rep_)
     def _ortho_all_k(c):
         nb_ = c.shape[1]
@@ -458,7 +481,20 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    fH_k, fH_R = _build(ctilde, f_eps)
+    (fH_k, fH_R, fft_roundtrip_error, f_recovery_error,
+     energy_recovery_error, inverse_residual) = _build(ctilde, f_eps)
+    log_fn(
+        f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
+        f"round-trip max|FFT(IFFT(fH))-fH|="
+        f"{float(fft_roundtrip_error):.3e}")
+    log_fn(
+        f"  [receipt] all-coarse transformed spectrum: "
+        f"max|eig(-A A^H)-f(eps)|={float(f_recovery_error):.3e} Ry; "
+        f"max recovered-energy residual="
+        f"{float(energy_recovery_error):.3e} Ry; Newton residual="
+        f"{float(inverse_residual):.3e} Ry")
+    require_newton_converged(
+        float(inverse_residual), where="build_fH_R all-coarse recovery")
     if quality_record_fn is not None:
         from time import perf_counter as _quality_clock
         _quality_t0 = _quality_clock()
@@ -466,8 +502,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         _shell_fraction, _shell_max_over_r0 = jax.device_get(
             _fh_locality_metrics(fH_R, jnp.asarray(_outer_shell)))
         quality_record_fn({
-            "row_isometry_max": float(_ortho),
-            "row_isometry_cap": float(_tol),
+            "row_isometry_max": _projection_defect,
             "outer_shell_l2_fraction": float(_shell_fraction),
             "outer_shell_max_over_r0": float(_shell_max_over_r0),
             "outer_shell_vectors": int(np.count_nonzero(_outer_shell)),
@@ -477,20 +512,40 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
 
 
+NEWTON_RESIDUAL_MAX = 1.0e-12
+
+
 def newton_inv(a: float, n: float, shift: float, y: jax.Array,
-               max_iter: int = 50) -> jax.Array:
-    """Newton inversion — matches Fortran newton_inv(). Works in unshifted space."""
+               max_iter: int = 50) -> tuple[jax.Array, jax.Array]:
+    """Invert ``f`` and return ``(x, max|f(x)-y|)``.
+
+    The 50-step cap, ``a/2`` step clip, exact ``df != 0`` condition and
+    1e-12 caller refusal are the archived implementation's convergence
+    contract.  Returning the residual keeps one inverse implementation while
+    letting each JITted caller enforce that contract at its existing host seam.
+    """
     dxmax = a / 2.0
     x0 = y + shift  # Fortran initial guess: x = y + s
 
     def body_fun(_, x_curr):
         res = fun(a, n, shift, x_curr) - y
         df_val = dfun(a, n, shift, x_curr)
-        dx = jnp.where(jnp.abs(df_val) > 1e-14, -res / df_val, 0.0)
+        dx = jnp.where(df_val != 0.0, -res / df_val, 0.0)
         dx = jnp.clip(dx, -dxmax, dxmax)
         return x_curr + dx
 
-    return lax.fori_loop(0, max_iter, body_fun, x0)
+    x = lax.fori_loop(0, max_iter, body_fun, x0)
+    residual = jnp.max(jnp.abs(fun(a, n, shift, x) - y))
+    return x, residual
+
+
+def require_newton_converged(residual: float, *, where: str) -> None:
+    """Host refusal shared by the two htransform consumers."""
+    if not np.isfinite(residual) or residual > NEWTON_RESIDUAL_MAX:
+        raise ValueError(
+            f"{where}: f-transform Newton inverse did not converge: "
+            f"max|f(x)-y|={residual:.6e} Ry exceeds the archived "
+            f"{NEWTON_RESIDUAL_MAX:.1e}-Ry residual cap after 50 steps")
 
 
 def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
@@ -657,7 +712,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                     mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
                     progress_fn=None, centroid_record_fn=None,
-                    rank_record_fn=None, wfn_sym=None):
+                    rank_record_fn=None, wfn_sym=None, *,
+                    require_all_occupied: bool = False):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -698,6 +754,19 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     else:
         wfn, sym = wfn_sym
+    nval = int(params["nval"])
+    ncond = int(params["ncond"])
+    nband = int(params["nband"])
+    if require_all_occupied and nval != int(wfn.nelec):
+        raise ValueError(
+            "standalone htransform output requires every occupied band in "
+            "its one contiguous Hamiltonian: "
+            f"nval={nval}, occupied bands={int(wfn.nelec)}, so absolute "
+            f"bands [{int(wfn.nelec)-nval},{int(wfn.nelec)}) would be "
+            "omitted. A lower spectral boundary can be recovered exactly at "
+            "sampled k while producing uncontrolled off-grid ringing. Set "
+            f"nval={int(wfn.nelec)}. Internal BSE interpolation retains its "
+            "explicit window contract and does not use this standalone gate.")
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
     centroid_basis = load_centroid_basis(
         centroid_path, tuple(int(x) for x in wfn.fft_grid), sym=sym,
@@ -713,9 +782,6 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     if centroid_record_fn is not None:
         centroid_record_fn(centroid_basis)
 
-    nval = int(params["nval"])
-    ncond = int(params["ncond"])
-    nband = int(params["nband"])
     n_guard_bands = int(n_guard_bands)
     if n_guard_bands < 0:
         raise ValueError(
@@ -1045,7 +1111,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
         # post-loop processing emits one compile rather than 4 (concatenate,
         # sort, gather, vmap-newton).
-        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at P>1, not
+        # ``out_shardings=(rep, rep, rep)`` is a CORRECTNESS requirement at
+        # P>1, not
         # a placement preference.  ``batches`` arrive q-sharded
         # (``batch_eig_shard = P(('x','y'), None)``); left to inference the
         # concatenate propagates that sharding onto the outputs, and whether
@@ -1060,30 +1127,35 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # reference decks could not run multi-process at all
         # (PROFILE_htransform_exciton §1.5).
         #
-        # Replication is the right answer and not merely the safe one: BOTH
-        # outputs are consumed on the host by every process immediately below
-        # (``np.asarray``, ``np.max``, the writer gate), and they are small —
+        # Replication is the right answer and not merely the safe one: the two
+        # arrays are consumed on the host by every process immediately below
+        # (``np.asarray``, ``np.max``, the writer gate), and the third output is
+        # one scalar Newton receipt.  They are small —
         # ``energies`` is (nq, rank) f64 and ``energies_sorted`` (nq, nb_keep),
         # 854 KB and 13 KB at nq=139 / rank 768, against the (nk, rank, rank)
         # 576 MiB arrays this driver already holds.  Values are untouched:
         # ``out_shardings`` moves data, it does not compute.
         # Gate: ``tests/test_htransform_post_kpath_sharding.py``.
         @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
-                 out_shardings=(rep, rep))
+                 out_shardings=(rep, rep, rep))
         def _post_kpath(batches, nq, nb_keep):
             lambda_q = jnp.concatenate(batches, axis=0)[:nq]
-            energies = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
+            energies, inverse_residual = jax.vmap(
+                lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
             energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
-            return energies, energies_sorted
+            return energies, energies_sorted, jnp.max(inverse_residual)
 
         _t0 = _perf()                                      # instrument:
-        energies_on_path, energies_sorted_jax = _post_kpath(
+        energies_on_path, energies_sorted_jax, inverse_residual = _post_kpath(
             tuple(lambda_q_list), int(nq), int(nb_keep))
+        require_newton_converged(
+            float(inverse_residual), where="htransform path")
         # Report the sharding that was ACTUALLY produced, not the one asked
         # for.  Anything other than ``P()`` here is the non-addressable-fetch
         # crash of PROFILE_htransform_exciton §1.5 waiting for a P>1 run with
         # nq divisible by the device count.  ``_post_kpath`` now pins
-        # ``out_shardings=(rep, rep)``, so this line should always read ``P()``;
+        # ``out_shardings=(rep, rep, rep)``, so this line should always read
+        # ``P()``;
         # it earns its keep by reporting the spec that came back rather than
         # the one that was requested.  Gated by
         # ``tests/test_htransform_kpath_gates.py::test_post_kpath_outputs_are_replicated``.
@@ -1370,7 +1442,8 @@ def main(argv=None):
             mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
             n_guard_bands=args.guard_bands, progress_fn=report.progress,
             centroid_record_fn=_centroid_records.append,
-            rank_record_fn=_rank_records.append)
+            rank_record_fn=_rank_records.append,
+            require_all_occupied=True)
     _setup_progress.step()
     _setup_progress.finish()
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
