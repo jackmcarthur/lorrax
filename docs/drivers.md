@@ -238,6 +238,14 @@ no active/DFT boundary and the ordinary full-H energy ordering remains the
 exact path.  Eigenvector phase cannot reach the file; the character operator
 is face-sharded like `fH_R`, and no rank-squared object is gathered or
 replicated.
+At the host publication seam the driver asks the symmetry service to identify
+every path point that is periodically identical to a coarse-grid row.  It
+reports max/RMS returned-spectrum differences and the worst path/coarse/band
+indices over the complete intersection.  This is an accuracy receipt, not a
+replacement tolerance: the shared whole-state projection is approximate and
+the independent fine-QE oracle still decides acceptance.  A plotted “Exact
+Gamma” marker is emitted only when Gamma is actually on both grids; neither
+coarse row zero nor a nearest path point is assumed to be Gamma.
 Consumes the same deck as gw_jax ([cohsex] keys + `K_POINTS {crystal_b}` path), `WFN.h5` (or `--wfn-file WFN_qp.h5`), `centroids_file`; writes `bandstructure.dat` (VBM shifted to 0, energies in eV; rank 0 is the only writer). Mutually exclusive `--basis-output` and `--basis-input` publish or require the reusable mesh-independent fit artifact; `isdf.galerkin` owns both the basis and its stamped SlabIO lifecycle. Distributed-key coverage (`eigh_backend`, `use_low_mem_eigh`) and the per-rank memory story: `docs/dev/large_nmu_operation.md`.
 The returned band window is `(nelec−nval, nelec+ncond)`. Standalone output
 requires `nval=nelec`, hence it begins at absolute band zero; internal BSE
