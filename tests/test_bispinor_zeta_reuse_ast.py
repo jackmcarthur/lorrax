@@ -5,7 +5,8 @@ is a two-leg job (fit, then reuse in the same directory, compared
 EXACT-0), which is far too expensive to be a regression test.  What is
 cheap to pin is the SHAPE of the code that job certified:
 
-1. ``fit_zeta``'s reuse decision is not gated on ``cfg.bispinor``.
+1. The one pre-fit contract's reuse decision is not gated on
+   ``cfg.bispinor``.
    The line ``_reuse = (not cfg.bispinor) and _zeta_reuse_ok(...)``
    switched the cache off for the entire bispinor run and cost a
    measured 318 s of a 660 s GW wall on every rerun (b600 bispinor,
@@ -39,13 +40,17 @@ SRC = os.path.join(os.path.dirname(__file__), "..", "src", "gw",
                    "gw_init.py")
 
 
-def _fit_zeta_tree():
+def _function_tree(name):
     with open(SRC, encoding="utf-8") as fh:
         mod = ast.parse(fh.read(), filename=SRC)
     for node in mod.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "fit_zeta":
+        if isinstance(node, ast.FunctionDef) and node.name == name:
             return mod, node
-    raise AssertionError("gw_init.fit_zeta not found")
+    raise AssertionError("gw_init.%s not found" % name)
+
+
+def _fit_zeta_tree():
+    return _function_tree("fit_zeta")
 
 
 def _calls(tree, name):
@@ -61,37 +66,58 @@ def _calls(tree, name):
 
 
 def test_reuse_decision_is_not_gated_on_bispinor():
-    _, fit_zeta = _fit_zeta_tree()
-    seen = 0
-    for n in ast.walk(fit_zeta):
-        if not isinstance(n, ast.Assign):
-            continue
-        if not any(isinstance(t, ast.Name) and t.id == "_reuse"
-                   for t in n.targets):
-            continue
-        seen += 1
-        # The first assignment must be the bare reuse check.  A BoolOp
-        # here is how the bispinor gate was spelled.
-        if seen == 1:
-            assert isinstance(n.value, ast.Call), (
-                "fit_zeta's `_reuse = ...` is not a bare _zeta_reuse_ok "
-                "call — the bispinor gate (or another short-circuit) is "
-                "back, which switches the ζ cache off for bispinor runs")
-            assert isinstance(n.value.func, ast.Name) and \
-                n.value.func.id == "_zeta_reuse_ok"
-    assert seen >= 1, "no `_reuse` assignment in fit_zeta"
+    _, contract = _function_tree("_resolve_zeta_fit_contract")
+    assigns = [n for n in ast.walk(contract)
+               if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "reuse"
+                       for t in n.targets)]
+    assert assigns, "the zeta contract has no canonical `reuse` verdict"
+    first = min(assigns, key=lambda n: (n.lineno, n.col_offset))
+    assert isinstance(first.value, ast.Call), (
+        "the first reuse verdict is not a bare _zeta_reuse_ok call — a "
+        "bispinor short-circuit would switch off the all-channel cache")
+    assert isinstance(first.value.func, ast.Name) and \
+        first.value.func.id == "_zeta_reuse_ok"
 
 
 def test_every_reuse_check_probes_the_dataset_extent():
-    _, fit_zeta = _fit_zeta_tree()
-    calls = _calls(fit_zeta, "_zeta_reuse_ok")
+    _, contract = _function_tree("_resolve_zeta_fit_contract")
+    calls = _calls(contract, "_zeta_reuse_ok")
     assert len(calls) == 2, (
-        "expected exactly two _zeta_reuse_ok call sites in fit_zeta "
+        "expected exactly two _zeta_reuse_ok call sites in the contract "
         "(charge, transverse); found %d" % len(calls))
     for c in calls:
         assert any(kw.arg == "n_rmu_expected" for kw in c.keywords), (
             "a _zeta_reuse_ok call omits n_rmu_expected, so a ζ whose "
             "dataset extent disagrees with its header would be reused")
+
+
+def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
+    """A complete cache never enters either charge or transverse fit HWM."""
+    _, contract = _function_tree("_resolve_zeta_fit_contract")
+    assert not _calls(contract, "_plan_gflat_chunks_for_channel")
+    assert not _calls(contract, "load_centroids_band_chunked")
+
+    _, prepare = _function_tree("prepare_isdf_and_wavefunctions")
+    resolves = _calls(prepare, "_resolve_zeta_fit_contract")
+    plans = _calls(prepare, "_plan_gflat_chunks_for_channel")
+    assert len(resolves) == 1 and len(plans) == 1
+    assert resolves[0].lineno < plans[0].lineno
+    guarded = [n for n in ast.walk(prepare)
+               if isinstance(n, ast.If)
+               and ast.unparse(n.test) == "not zeta_reused"
+               and any(x is plans[0] for x in ast.walk(n))]
+    assert len(guarded) == 1
+    assert ast.unparse(guarded[0].test) == "not zeta_reused"
+
+    _, fit_zeta = _fit_zeta_tree()
+    transverse_plans = _calls(fit_zeta, "_plan_gflat_chunks_for_channel")
+    assert len(transverse_plans) == 1
+    reuse_if = next(n for n in ast.walk(fit_zeta)
+                    if isinstance(n, ast.If)
+                    and ast.unparse(n.test) == "zeta_contract.reuse")
+    assert reuse_if.lineno < transverse_plans[0].lineno
+    assert any(isinstance(n, ast.Return) for n in ast.walk(reuse_if))
 
 
 def test_bispinor_reuse_path_returns_rebuilt_transverse_data():
