@@ -54,7 +54,8 @@ The bare transverse (current-current) exchange sum has the same divergent
 grid slot, but TWO things differ from the charge case:
 
 1. **The kernel itself has no q→0 limit.** The Coulomb-gauge transverse
-   propagator carries the projector `t_ij(K̂) = δ_ij − K̂_iK̂_j`
+   propagator carries the spatial block
+   `−P^T_ij(K̂) = −(δ_ij − K̂_iK̂_j)`
    (`gw.v_q_bispinor._make_per_q_v_builder_for_tile`), which depends only
    on DIRECTION and is therefore discontinuous at K=0 — there is no single
    number `t_ij(0)` to fall back on, unlike the charge kernel's isotropic
@@ -69,7 +70,7 @@ grid slot, but TWO things differ from the charge case:
    case.
 
 Point (1) is why a naive "just reuse `vc0`" fix is wrong: `v(q)` alone is
-not the object that needs averaging; `v(q)·t_ij(q̂)` is, and that product
+not the object that needs averaging; `−v(q)·P^T_ij(q̂)` is, and that product
 DOES have a well-defined (anisotropic) mini-BZ cell average even though
 neither factor has a limit on its own. Point (2) is why the fix must land
 in the (μ,ν) CENTROID-BASIS V-tile that Σ^B's existing `sigma_sx_k`
@@ -93,10 +94,10 @@ at exactly zero by `gw.v_q_bispinor._make_per_q_v_builder_for_tile`
 Voronoi cell average of the FULL transverse kernel,
 
 ```
-T_ij = ⟨ v(q) t_ij(q̂) ⟩_mBZ
+D^TT_ij = −⟨ v(q) P^T_ij(q̂) ⟩_mBZ
 ```
 
-which — unlike `t_ij` alone — is perfectly well-defined: it is the same
+which — unlike `P^T_ij` alone — is perfectly well-defined: it is the same
 kind of Monte-Carlo cell average `vc0` already is, just weighted by the
 projector instead of by 1.
 
@@ -110,7 +111,7 @@ head is comparable in Frobenius norm to the WHOLE stored q=Γ TT slab
 4×4 — sub-meV at that grid, but decaying only as ~1/√N_k, "the same slow
 decay that makes the CC head correction mandatory in 2D." That row also
 names the smallest fix: replace the q=Γ, G=0 slot of the TT builders with
-`⟨v t^{ij}⟩`.
+`−⟨v P_T^{ij}⟩`.
 
 For an isotropic 3D cell the closed form is `⟨t_ij⟩_angle = (2/3)δ_ij`
 (the projector's trace is 2 in every direction). For the in-plane mini-BZ
