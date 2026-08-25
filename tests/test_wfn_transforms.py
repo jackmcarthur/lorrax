@@ -17,12 +17,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+import common.wfn_transforms as _wfn_transforms
 from common.wfn_transforms import (
     to_box, to_rbox, to_rmu, to_rchunk,
     to_rchunk_inner, to_rmu_inner,
-    gflat_to_rmu)
+    gflat_to_rmu, load_centroids_band_chunked)
+from common.meta import Meta
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -463,6 +465,92 @@ def test_gflat_to_rmu_chunked_matches_oneshot(synth_loader):
         np.testing.assert_allclose(
             chunked, one_shot, rtol=1e-10, atol=1e-12,
             err_msg=f"chunk_size={cs} disagrees with one-shot")
+
+
+def test_gflat_to_rmu_runtime_k_operands_share_one_family(synth_loader):
+    """Same-shaped streamed k tiles vary values without one JIT per tile."""
+    for key in list(_wfn_transforms._KERNEL_CACHE):
+        if key[0] == "gflat_to_rmu":
+            del _wfn_transforms._KERNEL_CACHE[key]
+
+    nb = min(4, int(synth_loader.nbands))
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r_mu = np.asarray([
+        [0, 0, 0],
+        [min(1, nx - 1), min(2, ny - 1), min(3, nz - 1)],
+    ], dtype=np.int32)
+    kvecs = np.asarray(synth_loader.kvecs(k="full_bz"), dtype=np.float64)
+    tile_sharding = NamedSharding(MESH, P(None, ('x', 'y'), None, None))
+
+    for ik in (0, 1):
+        psi = jax.device_put(
+            synth_loader.load(bands=(0, nb), k=[ik]), tile_sharding)
+        g_index = synth_loader.box_index_dev(k=[ik], mesh=MESH)
+        out = np.asarray(gflat_to_rmu(
+            psi, g_index, r_mu, mesh=MESH,
+            fft_grid=synth_loader.fft_grid,
+            kvecs_frac=jnp.asarray(kvecs[ik:ik + 1]),
+            norm="ortho", chunk_size=2))
+        ref = np.asarray(to_rmu(
+            psi, g_index, synth_loader.fft_grid, r_mu, mesh=MESH,
+            kvecs_frac=kvecs[ik:ik + 1], norm="ortho"))
+        np.testing.assert_allclose(out, ref, rtol=1e-10, atol=1e-12)
+
+    families = [
+        key for key in _wfn_transforms._KERNEL_CACHE
+        if key[0] == "gflat_to_rmu"
+    ]
+    assert len(families) == 1, [
+        (i, values) for i, values in enumerate(zip(*families))
+        if len(set(values)) != 1
+    ]
+
+
+def test_streamed_centroid_transfer_matches_bulk(synth_loader):
+    """Two-dimensional WFN tiles preserve the public centroid faces."""
+    sym = synth_loader.symmetry()
+    nb = min(7, int(synth_loader.nbands))
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r_mu = jnp.asarray([
+        [0, 0, 0],
+        [min(1, nx - 1), min(2, ny - 1), min(3, nz - 1)],
+        [min(2, nx - 1), min(1, ny - 1), min(4, nz - 1)],
+    ], dtype=jnp.int32)
+    meta = Meta.from_system(
+        synth_loader, sym, nval=2, ncond=1, nband=nb,
+        n_rmu=int(r_mu.shape[0]), bispinor=False)
+    meta.memory_per_device_gb = 1000.0
+
+    bulk_y, bulk_x = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=nb)
+    preloaded = synth_loader.load(
+        bands=(0, nb), k="full_bz",
+        sharding=P(None, ('x', 'y'), None, None))
+    reused_y, reused_x = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=4, k_chunk_size=1, psi_G_flat=preloaded)
+
+    np.testing.assert_allclose(
+        np.asarray(reused_y), np.asarray(bulk_y), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(reused_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
+
+    for key in list(_wfn_transforms._KERNEL_CACHE):
+        if key[0] == "gflat_to_rmu":
+            del _wfn_transforms._KERNEL_CACHE[key]
+    stream_y, stream_x = load_centroids_band_chunked(
+        synth_loader, sym, meta, r_mu, False, MESH, (0, nb),
+        band_chunk_size=4, k_chunk_size=1)
+    np.testing.assert_allclose(
+        np.asarray(stream_y), np.asarray(bulk_y), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(stream_x), np.asarray(bulk_x), rtol=1e-10, atol=1e-12)
+    families = [
+        key for key in _wfn_transforms._KERNEL_CACHE
+        if key[0] == "gflat_to_rmu"
+    ]
+    assert len(families) == 1
 
 
 # ---------------------------------------------------------------------------
