@@ -42,6 +42,7 @@ __all__ = [
     "MIN_STENCIL_POINTS",
     "undersampled_link_axes",
     "WFN_FINGERPRINT_SCHEME",
+    "fingerprint_update_value",
     "wfn_fingerprint",
 ]
 
@@ -116,7 +117,7 @@ def band_storage_extent(mesh, nbands: int) -> int:
     return round_up(int(nbands), divisor)
 
 
-def _fingerprint_update_value(digest, label: str, value) -> None:
+def fingerprint_update_value(digest, label: str, value) -> None:
     """Add an ndarray-like value to ``digest`` without object-pointer bytes."""
     array = np.asarray(value)
     digest.update(label.encode("utf-8"))
@@ -141,7 +142,7 @@ def _fingerprint_sample_indices(size: int, count: int) -> np.ndarray:
 
 def _fingerprint_h5_attrs(digest, label: str, obj) -> None:
     for key in sorted(obj.attrs):
-        _fingerprint_update_value(
+        fingerprint_update_value(
             digest, f"attr:{label}:{key}", obj.attrs[key])
 
 
@@ -162,7 +163,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
             for name, obj in sorted(header_objects, key=lambda pair: pair[0]):
                 _fingerprint_h5_attrs(digest, name, obj)
                 if isinstance(obj, h5py.Dataset):
-                    _fingerprint_update_value(
+                    fingerprint_update_value(
                         digest, f"dataset:{name}", obj[()])
 
         if "wfns" not in h5:
@@ -176,7 +177,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
             dataset = wfns[dataset_name]
             _fingerprint_h5_attrs(
                 digest, f"wfns/{dataset_name}", dataset)
-            _fingerprint_update_value(
+            fingerprint_update_value(
                 digest, f"contract:wfns/{dataset_name}",
                 np.asarray(dataset.shape, dtype=np.int64))
             digest.update(dataset.dtype.str.encode("ascii"))
@@ -187,7 +188,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
                 f"WFN wfns/gvecs must be rank 2; got shape {gvecs.shape}")
         for ig in _fingerprint_sample_indices(
                 gvecs.shape[0], _WFN_GVEC_SAMPLE_COUNT):
-            _fingerprint_update_value(
+            fingerprint_update_value(
                 digest, f"sample:wfns/gvecs:{int(ig)}", gvecs[int(ig), :])
 
         coeffs = wfns["coeffs"]
@@ -201,7 +202,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
         for ib in bands:
             for ig in g_rows:
                 # Spinor and real/imag axes are small and are included whole.
-                _fingerprint_update_value(
+                fingerprint_update_value(
                     digest,
                     f"sample:wfns/coeffs:{int(ib)}:{int(ig)}",
                     coeffs[int(ib), :, int(ig), :],
@@ -230,8 +231,8 @@ def wfn_fingerprint(wfn) -> str:
         ("loaded:energies", np.asarray(wfn.energies, dtype=np.float64)),
         ("loaded:kpoints", np.asarray(wfn.kpoints, dtype=np.float64)),
     ):
-        _fingerprint_update_value(digest, label, value)
-    _fingerprint_update_value(
+        fingerprint_update_value(digest, label, value)
+    fingerprint_update_value(
         digest, "loaded:counts",
         np.asarray(
             [int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands)],

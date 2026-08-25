@@ -187,6 +187,7 @@ __all__ = [
     "covariant_link_derivative",
     "head_s_tensor_sharded",
     "head_wings_sharded",
+    "raw_hall_pseudovector_sharded",
     "static_head_wings_sharded",
     "head_samples_from_s",
     "finalize_iteration_head_sample",
@@ -236,6 +237,7 @@ _HEAD_WING_FREQUENCY_BLOCK = 8
 # bounded independent of how many centroids this rank owns locally.  See
 # ``_head_wing_kernel_face``'s docstring for the full residency algebra.
 _HEAD_WING_MU_BLOCK = 64
+_HEAD_VERTEX_WIDTHS = (3, 8)
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -1126,7 +1128,9 @@ def _s_tensor_kernel(
             return _carry, jax.vmap(_one)(omega_block)
 
         _, out_blocks = jax.lax.scan(_block, None, omega_blocks, unroll=1)
-        return out_blocks.reshape(n_padded, 3, 3)[:n_omega]
+        n_vertex = int(v_local.shape[0])
+        return out_blocks.reshape(
+            n_padded, n_vertex, n_vertex)[:n_omega]
 
     sm = shard_map(
         _local,
@@ -1295,8 +1299,9 @@ def _head_wing_kernel_legacy(
         psi_low_x = jax.lax.dynamic_slice(
             psi_xn_local, (zero, zero, zero, y_start), (nk, ns, nmu_x, ny))
 
+        n_vertex = int(v_local.shape[0])
         y0 = jnp.zeros(
-            (n_omega_padded, 3, nmu_x), dtype=jnp.complex128)
+            (n_omega_padded, n_vertex, nmu_x), dtype=jnp.complex128)
 
         def _left_step(step, carry):
             v_tile, acc = carry
@@ -1358,7 +1363,7 @@ def _head_wing_kernel_legacy(
         psi_high_y = jax.lax.dynamic_slice(
             psi_yn_local, (zero, zero, zero, x_start), (nk, ns, nmu_y, nx))
         z0 = jnp.zeros(
-            (n_omega_padded, nmu_y, 3), dtype=jnp.complex128)
+            (n_omega_padded, nmu_y, n_vertex), dtype=jnp.complex128)
 
         def _right_step(step, carry):
             v_tile, acc = carry
@@ -1618,12 +1623,15 @@ def _head_wing_kernel_face(
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_left)
-            return _carry, blocks.reshape(n_omega_padded, 3, mu_x_block)
+            return _carry, blocks.reshape(
+                n_omega_padded, int(v_full.shape[0]), mu_x_block)
 
         _, y_chunks = jax.lax.scan(
             _x_step, None, jnp.arange(n_x_blocks, dtype=jnp.int32), unroll=1)
+        n_vertex = int(v_full.shape[0])
         Y_x = jnp.moveaxis(y_chunks, 0, 2).reshape(
-            n_omega_padded, 3, mu_x_padded)[:n_omega, :, :mu_x_local]
+            n_omega_padded, n_vertex,
+            mu_x_padded)[:n_omega, :, :mu_x_local]
 
         # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
         mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
@@ -1649,12 +1657,14 @@ def _head_wing_kernel_face(
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_right)
-            return _carry, blocks.reshape(n_omega_padded, mu_y_block, 3)
+            return _carry, blocks.reshape(
+                n_omega_padded, mu_y_block, n_vertex)
 
         _, z_chunks = jax.lax.scan(
             _y_step, None, jnp.arange(n_y_blocks, dtype=jnp.int32), unroll=1)
         Z_y = jnp.moveaxis(z_chunks, 0, 1).reshape(
-            n_omega_padded, mu_y_padded, 3)[:n_omega, :mu_y_local, :]
+            n_omega_padded, mu_y_padded,
+            n_vertex)[:n_omega, :mu_y_local, :]
 
         return Y_x, Z_y
 
@@ -1769,6 +1779,12 @@ def head_wings_sharded(
     attribute at all (pre-two-face-carrier test fixtures that stand in a
     bare ``psi_xn``/``psi_yn``-carrying stub) defaults to ``'legacy'``,
     matching ``Wavefunctions.layout``'s own dataclass default.
+
+    Exactly two operator widths are admitted: the incumbent three Cartesian
+    velocity rows and the canonical eight-row packed ``(a,I)`` transition
+    derivative (two in-plane q directions by four Lorentz fields).  Keeping
+    that boundary closed gives the shared kernel exactly two XLA shapes,
+    rather than one compile for every caller-chosen width.
     """
     layout = getattr(wfns, "layout", "legacy")
     if layout == "face":
@@ -1785,9 +1801,11 @@ def head_wings_sharded(
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
-    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+    if (v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS
+            or v.shape[2] != v.shape[3]):
         raise ValueError(
-            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -1861,9 +1879,11 @@ def _head_wings_sharded_face(
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
-    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+    if (v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS
+            or v.shape[2] != v.shape[3]):
         raise ValueError(
-            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -2212,14 +2232,20 @@ def head_s_tensor_sharded(
 
     Energies and occupations are passed twice with complementary one-axis
     shardings.  Each rank forms only its local conduction-by-valence tile;
-    a two-axis psum reduces the final 3x3 tensor.
+    a two-axis psum reduces the final operator-axis tensor.  The ordinary
+    path passes three Cartesian velocities.  A static-gauge producer instead
+    flattens its canonical ``(a,I)=(2,4)`` transition-derivative axes.  No
+    other width is admitted, so this shared kernel has exactly the incumbent
+    width-three and packed width-eight executable shapes.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
-    if v.ndim != 4 or v.shape[0] != 3:
-        raise ValueError(f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS:
+        raise ValueError(
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -2263,6 +2289,11 @@ def head_s_tensor_sharded(
     )
     if not include_surface:
         return interband
+    if int(v.shape[0]) != 3:
+        raise ValueError(
+            "packed transition derivatives do not yet have a derived "
+            "metallic Drude completion; surface_weight_kn is admitted only "
+            "for the incumbent three-Cartesian-velocity path")
     drude = head_drude_tensor_sharded(
         v,
         surface,
@@ -2284,6 +2315,163 @@ def head_s_tensor_sharded(
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
     return interband + drude[None, :, :] * inv_z2[:, None, None]
+
+
+def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    """Distributed occupied-state Berry-overlap contraction.
+
+    This is the band-tiled form of ``orbital_magnetization.cB``.  It returns
+    the axial cross product before physical prefactors; no band matrix is
+    gathered and only the three-component reduction is replicated.
+    """
+    key = ("static_gauge_raw_hall", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(gamma_local, e_bra, e_ket, f_bra, f_ket, deps_tol):
+        nx, ny = gamma_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        logical = (
+            (ix[:, None] < nb_logical)
+            & (iy[None, :] < nb_logical)
+        )[None, :, :]
+        dE = e_bra[:, :, None] - e_ket[:, None, :]
+        separated = jnp.abs(dE) > deps_tol
+        inv_dE2 = jnp.where(
+            logical & separated,
+            1.0 / jnp.square(jnp.where(separated, dE, 1.0)),
+            0.0,
+        )
+        weight = f_bra[:, :, None] * inv_dE2
+
+        gx, gy, gz = gamma_local
+        # Hermiticity gives Gamma_b[m,n] = conj(Gamma_b[n,m]), avoiding a
+        # transpose/all-to-all of the band tile.  This is exactly the axial
+        # product used by psp.orbital_magnetization.orbital_pieces_at_k.
+        cross = jnp.stack((
+            gy * jnp.conj(gz) - gz * jnp.conj(gy),
+            gz * jnp.conj(gx) - gx * jnp.conj(gz),
+            gx * jnp.conj(gy) - gy * jnp.conj(gx),
+        ))
+        cB_raw = jnp.einsum("akij,kij->a", cross, weight, optimize=True)
+
+        # A degeneracy joining differently occupied states invalidates the
+        # ordinary insulating SOS expression; report one small flag rather
+        # than silently clipping it into a Hall number.
+        unsafe = jnp.any(
+            logical
+            & (~separated)
+            & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
+        return (
+            jax.lax.psum(cB_raw, (ax_x, ax_y)),
+            jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
+        )
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(),
+        ),
+        out_specs=(P(None), P()),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def raw_hall_pseudovector_sharded(
+    gamma_raw,
+    energies_kn_ry,
+    occupations_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor_wfn: int,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+):
+    r"""Derive the schema's real raw Hall pseudovector from ``Gamma_raw``.
+
+    The accepted raw Breit vertex and physical Pauli velocity are
+
+    ``Gamma_raw = (alpha_FS/2) v_Ry`` and
+    ``j = c Gamma_raw = v_Ry/2``.
+
+    Let ``cB`` be the incumbent orbital-magnetization Berry overlap built
+    from ``v_Ry``.  With state capacity
+    ``C=2/(nspin*nspinor_wfn)``, the immutable-schema convention is
+
+    ``sigma_H_raw = -(alpha_FS*C/(2*Omega_cell)) Im(cB)``.
+
+    This implementation contracts the same transaction's ``Gamma_raw``
+    directly, so ``cB_raw=(alpha_FS/2)^2 cB`` and the applied prefactor is
+    equivalently ``-C/(Omega_cell*Nk*(alpha_FS/2))``.  The minus sign is the
+    documented occupied-Berry/Hall sign; ``static_hall_linear_response``
+    later inserts the independent ``+i epsilon[b,a,i]`` CT convention.
+    """
+    from common.bispinor_init import HALFALPHA
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    if gamma.ndim != 4 or gamma.shape[1] != 3:
+        raise ValueError(
+            "gamma_raw must be (nk,3,nb,nb) from "
+            f"sweep_uniform_gauge_matrix_elements; got {gamma.shape}")
+    if gamma.shape[2] != gamma.shape[3]:
+        raise ValueError("gamma_raw band matrices must be square")
+    if e.shape != f.shape or tuple(e.shape) != (
+            int(gamma.shape[0]), int(gamma.shape[2])):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            f"gamma_raw {gamma.shape}")
+    if not (0 < int(nb_logical) <= int(gamma.shape[2])):
+        raise ValueError(
+            f"need 0 < nb_logical <= stored nb={gamma.shape[2]}; "
+            f"got {nb_logical}")
+    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
+        raise ValueError("cell_volume must be positive")
+    if int(nk_tot) <= 0 or int(nspin) <= 0 or int(nspinor_wfn) <= 0:
+        raise ValueError("nk_tot, nspin, and nspinor_wfn must be positive")
+    if float(degeneracy_tolerance_ry) <= 0.0:
+        raise ValueError("degeneracy_tolerance_ry must be positive")
+
+    # Reuse the incumbent head manifold's one padding/sharding owner.  The
+    # transpose is a view putting the replicated component axis first.
+    vertex = jnp.transpose(gamma, (1, 0, 2, 3))
+    vertex, e, f, _ = _pad_head_band_manifold(
+        vertex, e, f, jnp.zeros_like(e), mesh=mesh)
+    cB_raw, unsafe = _raw_hall_kernel(
+        mesh, nb_logical=int(nb_logical))(
+            vertex,
+            e,
+            e,
+            f,
+            f,
+            jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64),
+        )
+    if int(np.asarray(unsafe)):
+        raise ValueError(
+            "GATE static_gauge_raw_hall_degenerate: differently occupied "
+            "states are degenerate within degeneracy_tolerance_ry; the "
+            "insulating occupied-state Berry SOS formula is undefined")
+    capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
+    prefactor = -capacity / (
+        float(cell_volume) * float(nk_tot) * float(HALFALPHA))
+    return jnp.asarray(
+        prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
 
 
 @dataclass(frozen=True)

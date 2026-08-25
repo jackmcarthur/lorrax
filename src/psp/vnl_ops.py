@@ -84,6 +84,10 @@ class VNLSetup:
     # Analytic second radial derivative of the reduced projector form factor.
     # Kept beside G/Gp so every VNL derivative consumes the same radial owner.
     Gpp_table: jax.Array | None = None     # (total_nbeta, n_q)
+    # Content identity built from the host radial/projector/E data before
+    # device transfer.  Empty only on hand-built test fixtures; production
+    # uniform gauge transactions refuse an empty value.
+    uniform_gauge_fingerprint: str = ""
 
 
 @dataclass
@@ -261,7 +265,8 @@ def build_vnl_setup(
     compute_contact : bool
         Opt in to the extra analytic ``G''`` radial table needed by the
         uniform nonlocal contact.  False by default so existing Hamiltonian,
-        NSCF, and dipole setup pays no l+2 Bessel compilation/pass.
+        NSCF, and dipole setup pays no l+2 Bessel compilation/pass and no
+        uniform-gauge content-fingerprint pass.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
@@ -372,12 +377,18 @@ def build_vnl_setup(
             ))
             beta_idx += nbeta
 
-    G_table = jnp.asarray(np.stack(G_rows), dtype=jnp.float64) if G_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
-    Gp_table = jnp.asarray(np.stack(Gp_rows), dtype=jnp.float64) if Gp_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
-    Gpp_table = (
-        (jnp.asarray(np.stack(Gpp_rows), dtype=jnp.float64)
-         if Gpp_rows else jnp.zeros((0, n_q), dtype=jnp.float64))
+    G_table_np = (np.stack(G_rows).astype(np.float64, copy=False)
+                  if G_rows else np.zeros((0, n_q), dtype=np.float64))
+    Gp_table_np = (np.stack(Gp_rows).astype(np.float64, copy=False)
+                   if Gp_rows else np.zeros((0, n_q), dtype=np.float64))
+    Gpp_table_np = (
+        (np.stack(Gpp_rows).astype(np.float64, copy=False)
+         if Gpp_rows else np.zeros((0, n_q), dtype=np.float64))
         if compute_contact else None)
+    G_table = jnp.asarray(G_table_np, dtype=jnp.float64)
+    Gp_table = jnp.asarray(Gp_table_np, dtype=jnp.float64)
+    Gpp_table = (None if Gpp_table_np is None
+                 else jnp.asarray(Gpp_table_np, dtype=jnp.float64))
     total_R = sum(ch.R * ch.natoms for ch in channels)
     l_max = max((ch.l for ch in channels), default=0)
 
@@ -421,6 +432,38 @@ def build_vnl_setup(
             offset += R
     E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
 
+    uniform_gauge_fingerprint = ""
+    if compute_contact:
+        # Authenticate the exact host values before device transfer.  This is
+        # the single PP/SOC/radial identity consumed by the uniform current,
+        # contact, and Hall transaction; ordinary VNL/dipole setup neither
+        # has the G'' capability nor pays this O(table-size) pass.
+        import hashlib
+        from common.parallel_transport import fingerprint_update_value
+
+        digest = hashlib.sha256()
+        digest.update(b"lorrax.vnl_uniform_gauge/v1\0")
+
+        for label, value in (
+            ("B_cart", B),
+            ("cell_volume", np.float64(cell_volume)),
+            ("grid", np.asarray((dq, n_q, q_max), dtype=np.float64)),
+            ("prefactor", np.float64(prefactor)),
+            ("nspinor_soc", np.asarray(
+                (int(nspinor), int(bool(soc_resolved))), dtype=np.int64)),
+            ("G", G_table_np),
+            ("Gp", Gp_table_np),
+            ("Gpp", Gpp_table_np),
+            ("row_beta", np.asarray(row_beta_idx, dtype=np.int32)),
+            ("row_l", np.asarray(row_l, dtype=np.int32)),
+            ("row_m", np.asarray(row_m, dtype=np.int32)),
+            ("row_tau", row_tau_np),
+            ("coupled_blocks", np.asarray(coupled_row_blocks, dtype=np.int64)),
+            ("E_super", E_super),
+        ):
+            fingerprint_update_value(digest, label, value)
+        uniform_gauge_fingerprint = "sha256:" + digest.hexdigest()
+
     return VNLSetup(
         channels=channels,
         dq=dq, n_q=n_q, q_max=q_max,
@@ -433,6 +476,7 @@ def build_vnl_setup(
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
         coupled_row_blocks=tuple(coupled_row_blocks),
         Gpp_table=Gpp_table,
+        uniform_gauge_fingerprint=uniform_gauge_fingerprint,
     )
 
 

@@ -21,6 +21,7 @@ from gw.qsgw_head import (
     covariant_link_derivative,
     head_wings_sharded,
     head_s_tensor_sharded,
+    raw_hall_pseudovector_sharded,
     load_parallel_transport_head,
     reduced_covector_to_cartesian,
     rotate_velocity_active_to_qp,
@@ -348,6 +349,149 @@ def test_sharded_s_tensor_pads_unaligned_manifold_and_matches_dft_formula():
     np.testing.assert_allclose(got, ref, rtol=4e-15, atol=4e-15)
 
 
+def test_packed_vertex_s_tensor_preserves_incumbent_three_axis_bits():
+    """Width three stays exact; packed width eight has one direct oracle."""
+    rng = np.random.default_rng(20260825)
+    nk, nb = 2, 5
+    energies = np.sort(rng.normal(size=(nk, nb)), axis=1)
+    occupations = np.zeros((nk, nb), dtype=np.float64)
+    occupations[:, :2] = 1.0
+    v3 = (rng.normal(size=(3, nk, nb, nb))
+          + 1j * rng.normal(size=(3, nk, nb, nb)))
+    v8 = np.zeros((8, nk, nb, nb), dtype=np.complex128)
+    v8[:3] = v3
+    kwargs = dict(
+        mesh=_mesh(), nb_logical=nb, cell_volume=41.0, nk_tot=nk,
+        nspin=1, nspinor=2)
+    s3 = np.asarray(head_s_tensor_sharded(
+        v3, energies, occupations, [0.37j], **kwargs))
+    s3_from_packed = np.asarray(head_s_tensor_sharded(
+        v8[:3], energies, occupations, [0.37j], **kwargs))
+    s8 = np.asarray(head_s_tensor_sharded(
+        v8, energies, occupations, [0.37j], **kwargs))
+    np.testing.assert_array_equal(s3_from_packed, s3)
+
+    delta_e = energies[:, :, None] - energies[:, None, :]
+    s8_oracle = np.asarray(compute_S_omega(
+        v8, delta_e, occupations, 41.0, nk, 1, 2,
+        np.asarray([0.37j])))
+    scale = max(1.0, float(np.max(np.abs(s8_oracle))))
+    assert np.max(np.abs(s8 - s8_oracle)) <= 32.0 * np.finfo(float).eps * scale
+    np.testing.assert_array_equal(s8[:, 3:, :], 0.0)
+    np.testing.assert_array_equal(s8[:, :, 3:], 0.0)
+    with pytest.raises(ValueError, match="canonical n_vertex"):
+        head_s_tensor_sharded(
+            v8[:4], energies, occupations, [0.37j], **kwargs)
+
+
+def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
+    """Distributed raw Hall is the incumbent orbital cB with one rescale."""
+    from common.bispinor_init import HALFALPHA
+    from psp.orbital_magnetization import orbital_pieces_at_k
+
+    rng = np.random.default_rng(82531)
+    nk, nb, nocc = 3, 6, 3
+    energies = np.sort(rng.normal(size=(nk, nb)), axis=1)
+    # A same-occupation degeneracy exercises the incumbent denominator mask
+    # without making the insulating occupied/unoccupied separation invalid.
+    energies[:, 1] = energies[:, 0]
+    raw = (rng.normal(size=(3, nk, nb, nb))
+           + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
+    occupations = np.zeros((nk, nb), dtype=np.float64)
+    occupations[:, :nocc] = 1.0
+    gamma_raw = HALFALPHA * np.transpose(velocity, (1, 0, 2, 3))
+    volume = 37.25
+    nspin, nspinor_wfn = 1, 2
+
+    got = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_raw, energies, occupations,
+        mesh=_mesh(), nb_logical=nb, cell_volume=volume, nk_tot=nk,
+        nspin=nspin, nspinor_wfn=nspinor_wfn,
+        degeneracy_tolerance_ry=1.0e-10))
+    cB = np.zeros(3, dtype=np.complex128)
+    for k in range(nk):
+        _pa, pb = orbital_pieces_at_k(
+            velocity[:, k], energies[k], nocc, 1.0e-10)
+        cB += pb.sum(axis=(1, 2)) / nk
+    capacity = 2.0 / (nspin * nspinor_wfn)
+    expected = -(HALFALPHA * capacity / volume) * np.imag(cB)
+    np.testing.assert_allclose(got, expected, rtol=3e-14, atol=3e-14)
+    # Red twin: omitting the occupied-Berry minus is an observable sign flip.
+    assert np.max(np.abs(got - (-expected))) > 1.0e-10
+
+
+def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
+    from common.bispinor_init import HALFALPHA
+
+    rng = np.random.default_rng(82532)
+    nk, nb = 2, 5
+    energies = np.asarray([
+        [-1.0, -0.2, 0.4, 0.9, 1.6],
+        [-0.8, -0.1, 0.5, 1.1, 1.7],
+    ])
+    occupations = np.asarray([
+        [1.0, 0.73, 0.21, 0.0, 0.0],
+        [1.0, 0.61, 0.18, 0.0, 0.0],
+    ])
+    raw = (rng.normal(size=(3, nk, nb, nb))
+           + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
+    gamma_raw = HALFALPHA * np.transpose(velocity, (1, 0, 2, 3))
+    got = np.asarray(raw_hall_pseudovector_sharded(
+        gamma_raw, energies, occupations,
+        mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
+        nspin=1, nspinor_wfn=2))
+
+    cB = np.zeros(3, dtype=np.complex128)
+    for k in range(nk):
+        for n in range(nb):
+            for m in range(nb):
+                de = energies[k, n] - energies[k, m]
+                if abs(de) <= 1.0e-10:
+                    continue
+                vn, vm = velocity[:, k, n, m], velocity[:, k, m, n]
+                cB += (occupations[k, n] / (nk * de * de)) * np.asarray((
+                    vn[1] * vm[2] - vn[2] * vm[1],
+                    vn[2] * vm[0] - vn[0] * vm[2],
+                    vn[0] * vm[1] - vn[1] * vm[0],
+                ))
+    expected = -(HALFALPHA / 29.0) * np.imag(cB)
+    np.testing.assert_allclose(got, expected, rtol=3e-14, atol=3e-14)
+
+    bad_energies = energies.copy()
+    bad_energies[0, 2] = bad_energies[0, 1]
+    with pytest.raises(ValueError, match="differently occupied states"):
+        raw_hall_pseudovector_sharded(
+            gamma_raw, bad_energies, occupations,
+            mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
+            nspin=1, nspinor_wfn=2)
+
+
+def test_uniform_gauge_fingerprint_is_contact_capability_only():
+    """Ordinary VNL setup does not hash tables it cannot authenticate."""
+    from psp.vnl_ops import build_vnl_setup
+
+    wfn = SimpleNamespace(
+        nspinor=1,
+        blat=1.0,
+        bvec=np.eye(3),
+        cell_volume=1.0,
+        atom_types=np.zeros(0, dtype=np.int32),
+        atom_crys=np.zeros((0, 3), dtype=np.float64),
+    )
+    ordinary = build_vnl_setup(
+        wfn, pseudos={}, n_q=2, q_max=1.0, soc=False,
+        compute_contact=False, print_fn=lambda *_: None)
+    contact = build_vnl_setup(
+        wfn, pseudos={}, n_q=2, q_max=1.0, soc=False,
+        compute_contact=True, print_fn=lambda *_: None)
+    assert (
+        ordinary.uniform_gauge_fingerprint,
+        contact.uniform_gauge_fingerprint.startswith("sha256:"),
+    ) == ("", True)
+
+
 def test_head_manifold_embedding_preserves_inactive_identity_and_cross_blocks():
     rng = np.random.default_rng(19)
     nk, na, nf = 2, 3, 6
@@ -480,7 +624,10 @@ def test_frequency_blocked_isdf_wings_match_direct_transition_sum():
 
 def test_finite_link_derivative_is_exactly_gauge_covariant():
     rng = np.random.default_rng(410)
-    grid = (2, 2, 2)
+    # A two-point periodic axis makes the +1 and -1 neighbours identical,
+    # so every centred derivative (and the red twin below) is exactly zero.
+    # Five points exercise the actual fourth-order covariant stencil.
+    grid = (5, 5, 5)
     nk, nb = int(np.prod(grid)), 8
     coords = np.stack(
         np.meshgrid(*(np.arange(n) for n in grid), indexing="ij"), axis=-1

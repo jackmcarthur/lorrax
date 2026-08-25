@@ -97,8 +97,9 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
     nk, nb = e.shape
     mu = psi.shape[-1]
     n_omega = len(omega)
-    Y = np.zeros((n_omega, 3, mu), dtype=np.complex128)
-    Z = np.zeros((n_omega, mu, 3), dtype=np.complex128)
+    n_vertex = int(v.shape[0])
+    Y = np.zeros((n_omega, n_vertex, mu), dtype=np.complex128)
+    Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
     pref = 4.0 / (float(nk_tot) * spin_denom)
     for k in range(nk):
@@ -180,6 +181,51 @@ def test_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
     z_parity = np.max(np.abs(Z_legacy - Z_face))
     assert y_parity < 1.0e-10, f"legacy vs face Y_x parity {y_parity}"
     assert z_parity < 1.0e-10, f"legacy vs face Z_y parity {z_parity}"
+
+
+def test_packed_vertex_wings_preserve_three_axis_bits_legacy_and_face():
+    """One n_vertex kernel serves Cartesian and packed (a,I) axes."""
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260825)
+    nk, nb, ns, nmu = 2, 4, 2, 8
+    legacy, face, psi, enk, occ = _build_pair(
+        rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    v3 = (rng.standard_normal((3, nk, nb, nb))
+          + 1j * rng.standard_normal((3, nk, nb, nb)))
+    v8 = np.zeros((8, nk, nb, nb), dtype=np.complex128)
+    v8[:3] = v3
+    kwargs = dict(
+        energies_kn_ry=enk, occupations_kn=occ,
+        omegas_ry=np.asarray([0.19 + 0.03j]), mesh=mesh,
+        nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns)
+
+    for wfns in (legacy, face):
+        y3, z3 = head_wings_sharded(v3, wfns, **kwargs)
+        y3_from_packed, z3_from_packed = head_wings_sharded(
+            v8[:3], wfns, **kwargs)
+        y8, z8 = head_wings_sharded(v8, wfns, **kwargs)
+        y3, z3, y3_from_packed, z3_from_packed, y8, z8 = map(
+            _gather,
+            (y3, z3, y3_from_packed, z3_from_packed, y8, z8),
+        )
+        np.testing.assert_array_equal(y3_from_packed, y3)
+        np.testing.assert_array_equal(z3_from_packed, z3)
+
+        y8_oracle, z8_oracle = _numpy_wings(
+            v8, enk, occ, psi,
+            nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
+            omega=np.asarray([0.19 + 0.03j]), eta=0.0)
+        scale = max(
+            1.0, float(np.max(np.abs(y8_oracle))),
+            float(np.max(np.abs(z8_oracle))))
+        assert max(
+            float(np.max(np.abs(y8 - y8_oracle))),
+            float(np.max(np.abs(z8 - z8_oracle))),
+        ) <= 64.0 * np.finfo(float).eps * scale
+        np.testing.assert_array_equal(y8[:, 3:], 0.0)
+        np.testing.assert_array_equal(z8[..., 3:], 0.0)
+        with pytest.raises(ValueError, match="canonical n_vertex"):
+            head_wings_sharded(v8[:4], wfns, **kwargs)
 
 
 def test_head_wings_face_mu_blocking_exercised(monkeypatch):
