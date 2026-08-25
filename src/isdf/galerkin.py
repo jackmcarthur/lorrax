@@ -701,7 +701,7 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
     """
     key = (id(mesh_), int(rank_), tuple(sharding_q_.spec),
            tuple(grid_xy_.spec))
-    fn = _fold_G_cache.get(key)
+    fn = _FOLD_G_KERNELS.get(key)
     if fn is not None:
         return fn
 
@@ -735,10 +735,11 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
         in_shardings=(sharding_q_, grid_xy_),
         out_shardings=grid_xy_,
     )
-    _fold_G_cache[key] = fn
+    _FOLD_G_KERNELS[key] = fn
     return fn
 
 
+_FOLD_G_KERNELS: dict = {}
 _SELECTED_FILL_KERNELS: dict = {}
 _SKETCH_RANDOM_KERNELS: dict = {}
 _SKETCH_ACCUM_KERNELS: dict = {}
