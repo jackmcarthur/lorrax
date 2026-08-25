@@ -599,11 +599,12 @@ def _interpolate_bse_data_to_grid(
         params.get("htransform_rank_multiplier", 0.0))
     _fit_subset = keep if _rank_multiplier > 0.0 else None
     _output_keep = None if _fit_subset is not None else keep
-    (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
+    (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn)
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond

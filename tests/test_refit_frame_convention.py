@@ -34,9 +34,9 @@ these are the cells that hold the same fact in a second on CPU.
 1. THE INSTRUMENT — at a finite q the two spellings DISAGREE at O(1) on a
    random ζ.  Without this the rest could pass on an accident of the fixture
    and the file would be measuring nothing.
-2. ``zeta_r_to_sphere_q`` agrees with :func:`vq_interp.to_sphere` — the
-   module's already-pinned host transform, the one ``recon`` inverts — to
-   round-off, at finite q, on the stored sphere.
+2. the canonical streamed G-flat accumulator agrees with
+   :func:`vq_interp.to_sphere` — the module's already-pinned host transform,
+   the one ``recon`` inverts — to round-off at finite q.
 3. At q = 0 all three spellings coincide exactly, which is why Γ never saw
    this and why the Γ null does not move under the fix.
 4. ``refit_vq`` routes through the helper: the winding phase is gone from the
@@ -101,6 +101,29 @@ def _relF(a, b):
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
+def _streamed(vqi, zx, zeta, qw, fi):
+    """The production refit's canonical, two-slab r→G route on one device."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local, gather_to_host
+    from common.wfn_transforms import accumulate_rchunk_to_gflat
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    sh = NamedSharding(mesh, P(None, ("x", "y"), None))
+    acc = device_put_process_local(
+        np.zeros((1, _N_MU, len(fi)), dtype=np.complex128), sh)
+    cut = zx["n_rtot"] // 3
+    for r0, r1 in ((0, cut), (cut, zx["n_rtot"])):
+        slab = device_put_process_local(
+            np.ascontiguousarray(zeta[:, r0:r1])[None], sh)
+        acc = accumulate_rchunk_to_gflat(
+            slab, acc, mesh=mesh, fft_grid=_FFT, r0=r0,
+            sphere_idx=np.asarray(fi, dtype=np.int32)[None],
+            qvec_frac=np.asarray(qw)[None], norm="backward")
+    return gather_to_host(acc[0])
+
+
 # A finite q ON a coarse grid the fixture never has to own — the transforms
 # take q as a number, and 1/4, 1/2 are the two the tile null failed at.
 _Q_FINITE = np.array([0.25, 0.5, 0.5])
@@ -111,7 +134,7 @@ def test_old_and_new_spellings_disagree_at_finite_q():
     vqi = pytest.importorskip("bse.vq_interp")
     zx, zeta = _synthetic_zx(_Q_FINITE)
     fi = vqi.flat_idx(zx, zx["gvec"][0])
-    new = np.asarray(vqi.zeta_r_to_sphere_q(zx, zeta, _Q_FINITE, fi))
+    new = np.asarray(_streamed(vqi, zx, zeta, _Q_FINITE, fi))
     old = _old_spelling(vqi, zx, zeta, _Q_FINITE, fi)
     assert _relF(old, new) > 0.5, (
         "the pre-fix spelling and the producer's transform agree on this "
@@ -119,11 +142,11 @@ def test_old_and_new_spellings_disagree_at_finite_q():
 
 
 def test_refit_transform_is_the_producers_at_finite_q():
-    """THE FIX.  ``zeta_r_to_sphere_q`` == ``to_sphere``, the pinned one."""
+    """THE FIX.  streamed producer accumulator == pinned ``to_sphere``."""
     vqi = pytest.importorskip("bse.vq_interp")
     zx, zeta = _synthetic_zx(_Q_FINITE)
     fi = vqi.flat_idx(zx, zx["gvec"][0])
-    new = np.asarray(vqi.zeta_r_to_sphere_q(zx, zeta, _Q_FINITE, fi))
+    new = np.asarray(_streamed(vqi, zx, zeta, _Q_FINITE, fi))
     ref = vqi.to_sphere(zx, zeta, 0)[:, :_NGK]
     assert _relF(new, ref) < 1e-12, (
         f"refit r→G transform differs from vq_interp.to_sphere by "
@@ -138,7 +161,7 @@ def test_gamma_is_where_the_two_spellings_coincide():
     where it is exact: at q = 0 both ``e^{−2πi q·r}`` and ``e^{−2πi q·s_μ}``
     evaluate to 1.0 + 0.0j in every slot, so neither transform is doing
     anything and the tile cannot move.  The two SPELLINGS are then compared
-    at round-off rather than at zero, because ``zeta_r_to_sphere_q`` goes
+    at round-off rather than at zero, because the streamed accumulator goes
     through ``local_fftn3`` (jax, and on a GPU leg a GPU FFT) while the
     pre-fix spelling here is ``np.fft`` — two implementations of the same
     transform, measured 2.1e-16 apart on this fixture at four GPUs.  A
@@ -151,7 +174,7 @@ def test_gamma_is_where_the_two_spellings_coincide():
     fi = vqi.flat_idx(zx, zx["gvec"][0])
     assert np.all(np.exp(-2j * np.pi * (zx["rfrac"] @ q0)) == 1.0 + 0.0j)
     assert np.all(np.exp(-2j * np.pi * (zx["rmu_frac"] @ q0)) == 1.0 + 0.0j)
-    new = np.asarray(vqi.zeta_r_to_sphere_q(zx, zeta, q0, fi))
+    new = np.asarray(_streamed(vqi, zx, zeta, q0, fi))
     old = _old_spelling(vqi, zx, zeta, q0, fi)
     ref = vqi.to_sphere(zx, zeta, 0)[:, :_NGK]
     assert _relF(old, new) < 1e-12, "at q = 0 the two spellings coincide"
@@ -170,5 +193,6 @@ def test_refit_vq_carries_no_centroid_winding_phase():
         f"interpolation model, where it is an APPROXIMATION taken out of a "
         f"stored ζ on purpose; in the refit it stood in for the producer's "
         f"r-space Bloch factor and cost every finite-q tile.")
-    assert "def zeta_r_to_sphere_q" in src
-    assert "zeta_r_to_sphere_q(zx, zeta, qw, fi)" in body
+    assert "accumulate_rchunk_to_gflat(" in body
+    assert "local_fftn3" not in body
+    assert "zeta_r_to_sphere_q" not in src
