@@ -342,7 +342,7 @@ def check_sigma_sx_chain_face_matches_legacy(
 # ---------------------------------------------------------------------------
 
 def check_four_current_ordered_pair_all16(
-        mesh, dtype="complex128", *, nk=3, nb=4, n_c=6, n_t=8):
+        mesh, dtype="complex128", *, nk=3, nb=4, n_c=2, n_t=3):
     """Discriminate AB/BA, q/-q, and rectangular CT/TC orientations."""
     import jax
     from types import SimpleNamespace
@@ -355,9 +355,25 @@ def check_four_current_ordered_pair_all16(
     if dtype != "complex128":
         raise ValueError("four-current ordered-pair gate requires complex128")
     rng = np.random.default_rng(2026082517)
-    psi_c = _rng_mat(rng, (nk, nb, 4, n_c), np.complex128)
-    psi_t = _rng_mat(rng, (nk, nb, 4, n_t), np.complex128)
-    enk = np.tile(np.asarray([-0.5, -0.5, 0.5, 0.5]), (nk, 1))
+    # The logical T extent is intentionally odd.  Pad only to the incumbent
+    # square face-mesh divisor and leave the padding exactly zero, as a real
+    # low-memory face bundle does.
+    mesh_divisor = int(mesh.devices.shape[0])
+    n_c_pad = ((n_c + mesh_divisor - 1) // mesh_divisor) * mesh_divisor
+    n_t_pad = ((n_t + mesh_divisor - 1) // mesh_divisor) * mesh_divisor
+    psi_c = np.zeros((nk, nb, 4, n_c_pad), dtype=np.complex128)
+    psi_t = np.zeros((nk, nb, 4, n_t_pad), dtype=np.complex128)
+    psi_c[..., :n_c] = _rng_mat(
+        rng, (nk, nb, 4, n_c), np.complex128)
+    psi_t[..., :n_t] = _rng_mat(
+        rng, (nk, nb, 4, n_t), np.complex128)
+    k_row = np.arange(nk, dtype=np.float64)
+    enk = np.stack((
+        -0.92 + 0.07 * k_row,
+        -0.61 + 0.05 * k_row,
+        +0.43 + 0.09 * k_row,
+        +0.86 + 0.11 * k_row,
+    ), axis=1)
     occ = np.tile(np.asarray([1.0, 1.0, 0.0, 0.0]), (nk, 1))
     slices = BandSlices.from_band_edges(0, 0, 2, 4, 4)
 
@@ -373,14 +389,17 @@ def check_four_current_ordered_pair_all16(
     wfns_t = bundle(psi_t)
     families = (wfns_c, wfns_t, wfns_t, wfns_t)
     psi_families = (psi_c, psi_t, psi_t, psi_t)
-    extents = (n_c, n_t, n_t, n_t)
+    extents = (n_c_pad, n_t_pad, n_t_pad, n_t_pad)
+    logical_extents = (n_c, n_t, n_t, n_t)
     offsets = np.cumsum((0,) + extents)
+    tau = 0.37
     quad = SimpleNamespace(
-        tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
+        tau=np.asarray([tau]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
 
     got_blocks = {}
     worst_oracle = 0.0
+    max_orientation_weight_delta = 0.0
     for A in range(4):
         gamma_a = _gamma_full(A)
         psi_a = psi_families[A]
@@ -414,15 +433,35 @@ def check_four_current_ordered_pair_all16(
                             right_cv = np.einsum(
                                 "bn,Bb,Bn->n", np.conj(psi_b[k, c]),
                                 gamma_b, psi_b[kmq, v], optimize=True)
+                            weight_vc = np.exp(
+                                -tau * (enk[kmq, c] - enk[k, v]))
+                            weight_cv = np.exp(
+                                -tau * (enk[k, c] - enk[kmq, v]))
+                            max_orientation_weight_delta = max(
+                                max_orientation_weight_delta,
+                                abs(weight_vc - weight_cv))
                             want[q] -= (
-                                left_vc[:, None] * right_vc[None, :]
-                                + left_cv[:, None] * right_cv[None, :]
+                                weight_vc
+                                * left_vc[:, None] * right_vc[None, :]
+                                + weight_cv
+                                * left_cv[:, None] * right_cv[None, :]
                             ) / np.sqrt(float(nk))
             err = _rel(got, want)
             worst_oracle = max(worst_oracle, err)
             assert err < RTOL, (
                 f"four-current ({A},{B}) ordered-pair rel err {err:.3e}")
             got_blocks[A, B] = got
+
+            n_a = logical_extents[A]
+            n_b = logical_extents[B]
+            if n_a < extents[A]:
+                assert np.count_nonzero(got[:, n_a:, :]) == 0
+            if n_b < extents[B]:
+                assert np.count_nonzero(got[:, :, n_b:]) == 0
+
+    assert max_orientation_weight_delta > 1e-3, (
+        "dispersive-energy oracle did not distinguish the explicit "
+        "occupied-to-empty and empty-to-occupied weights")
 
     combined = np.zeros(
         (nk, int(offsets[-1]), int(offsets[-1])), dtype=np.complex128)
@@ -459,6 +498,9 @@ def check_four_current_ordered_pair_all16(
         "combined_hermiticity": herm,
         "q_reciprocity": reciprocity,
         "distinct_cc_bit_equal": True,
+        "orientation_weight_delta": max_orientation_weight_delta,
+        "logical_extents_CT": (n_c, n_t),
+        "padded_extents_CT": (n_c_pad, n_t_pad),
     }
 
 
