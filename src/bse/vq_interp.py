@@ -2395,17 +2395,26 @@ def _zeta_fit_window_of(prov: dict) -> tuple[int, int] | None:
     """The ABSOLUTE band window ζ was fitted on, or ``None`` when the two
     halves of the pair density do not share one.
 
-    The producer fits ``ρ_mn`` with m from ``band_range_left`` and n from
-    ``band_range_right`` — ``(b0, b3)`` and ``(b1, b4)`` on a stock deck.
+    The producer fits ``ρ_mn`` with m from its left range and n from its
+    right range — ``(b0, b3)`` and ``(b1, b4)`` on a stock deck.  Schema 2
+    names the logical ranges explicitly; schema 1 carries the historical
+    storage ranges.  This reader may reproduce either completed artifact,
+    but the GW reuse validator never treats a schema-1 storage endpoint as
+    proof of a schema-2 logical endpoint.
     The refit fits a SYMMETRIC window (one band axis, both legs), so it can
     only reproduce ζ when those two ranges coincide; when they do not, this
     returns ``None`` and the caller keeps the historical behaviour of fitting
     the whole stored band axis.  On every deck the tile null has ever passed
     on, ``nval == nelec`` and ``ncond == nband − nelec`` make them coincide.
     """
+    schema = int(prov.get("schema", 1))
+    left_key = ("band_range_left_logical" if schema >= 2
+                else "band_range_left")
+    right_key = ("band_range_right_logical" if schema >= 2
+                 else "band_range_right")
     try:
-        bl = [int(v) for v in prov["band_range_left"]]
-        br = [int(v) for v in prov["band_range_right"]]
+        bl = [int(v) for v in prov[left_key]]
+        br = [int(v) for v in prov[right_key]]
     except (KeyError, TypeError, ValueError):
         return None
     return (bl[0], bl[1]) if bl == br else None
