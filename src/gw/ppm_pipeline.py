@@ -49,6 +49,7 @@ from .ppm_sigma import (
     fit_ppm,
 )
 from .ppm_tau_kernel import precompile_sigma
+from .ppm_windows import hgl_partition_required, sigma_regularization_for_config
 
 
 @dataclass(frozen=True)
@@ -605,7 +606,15 @@ def compute_ppm_sigma_pipeline(
             for note in plan.notes:
                 print_fn(f"  Σc band extrapolation: {note}")
         with timing.section("sigma.compile"):
-            precompile_sigma(wfns, ppm, meta, mesh_xy, brackets=plan.bounds)
+            sigma_xi = sigma_regularization_for_config(config)
+            precompile_sigma(
+                wfns, ppm, meta, mesh_xy,
+                brackets=plan.bounds,
+                energy_windows=hgl_partition_required(
+                    config.omega_grid_ry,
+                    sigma_xi.resolved_ry,
+                    config.sigma.window_edge_factor),
+            )
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,

@@ -92,6 +92,28 @@ def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> fl
 _HGL_CROSSING_ANSATZE = frozenset({"gn_ppm", "hl_ppm"})
 
 
+def hgl_partition_required(
+    omega_grid_ry,
+    regularization_width_ry: float,
+    edge_factor: float,
+) -> bool:
+    """Whether the resolved grid exceeds the incumbent HGL capacity."""
+    omega = np.asarray(omega_grid_ry, dtype=np.float64)
+    omega_max = float(np.max(np.abs(omega))) if omega.size else 0.0
+    xi = float(regularization_width_ry)
+    edge = float(edge_factor)
+    if not np.isfinite(xi) or xi <= 0.0:
+        raise ValueError("regularization_width_ry must be finite and positive")
+    if not np.isfinite(edge) or edge < 0.0:
+        raise ValueError("edge_factor must be finite and non-negative")
+    if not np.isfinite(omega_max):
+        raise ValueError("omega_grid_ry contains a non-finite value")
+    A_core = 2.0 * (omega_max + edge * xi) / xi
+    capacity = _CROSSING_A_MAX * (
+        1.0 + 8.0 * np.finfo(np.float64).eps)
+    return A_core > capacity
+
+
 class SigmaRegularization(NamedTuple):
     """The EFFECTIVE Σ broadening ξ, and where it came from.
 
@@ -270,6 +292,17 @@ class _SigmaWindow:
     #: trusted for the wrong reason.
     max_error: float | None = None
     provenance: str | None = None
+    #: Optional scalar pane selectors.  They are execution metadata for the
+    #: bounded HGL decomposition, not replacement masks: ``mask_A`` remains
+    #: the band-identity/occupation selector, while the canonical
+    #: ``build_G_tau(..., E_min, E_max)`` owner applies ``(E_min,E_max]``.
+    #: ``omega_indices`` lets the incumbent accumulator project only the
+    #: omega cluster this rule certifies and scatter it into the branch tile.
+    E_min: float | None = None
+    E_max: float | None = None
+    B_lo: float | None = None
+    B_hi: float | None = None
+    omega_indices: np.ndarray | None = None
 
     @property
     def n_tau(self) -> int:
@@ -719,6 +752,45 @@ def _masked_stats_device(values: jax.Array, mask: jax.Array) -> tuple[int, int, 
     return total, count, min_val, max_val
 
 
+@jax.jit
+def _masked_interval_stats_kernel(values, base_mask, lo, hi):
+    """Scalar statistics for one ``(lo, hi]`` pane, without a mask tile."""
+    selected = base_mask & (values > lo) & (values <= hi)
+    return (
+        jnp.sum(selected, dtype=jnp.int64),
+        jnp.min(jnp.where(selected, values, jnp.inf)),
+        jnp.max(jnp.where(selected, values, -jnp.inf)),
+    )
+
+
+def _masked_interval_stats_device(
+    values: jax.Array,
+    base_mask: jax.Array,
+    lo: float,
+    hi: float,
+) -> tuple[int, int, float | None, float | None]:
+    """As :func:`_masked_stats_device`, for a dynamic scalar interval.
+
+    The pane predicate is born and consumed inside one compiled reduction;
+    no pole-sized boolean operand is materialised or retained per window.
+    """
+    total = int(np.prod(values.shape))
+    count_j, min_j, max_j = _masked_interval_stats_kernel(
+        values, base_mask,
+        jnp.asarray(lo, dtype=jnp.float64),
+        jnp.asarray(hi, dtype=jnp.float64),
+    )
+    count = int(_to_host_scalar(count_j, int))
+    if count == 0:
+        return total, 0, None, None
+    return (
+        total,
+        count,
+        float(_to_host_scalar(min_j, float)),
+        float(_to_host_scalar(max_j, float)),
+    )
+
+
 def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
     """One window's B-side Ω selector, as the SCALAR bounds ``(lo, hi)``.
 
@@ -757,6 +829,14 @@ def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
     ``good`` gating on ``isfinite``), so the ±inf sentinels are safe: no
     lane can compare false against both of them.
     """
+    if window.B_lo is not None or window.B_hi is not None:
+        if window.B_lo is None or window.B_hi is None:
+            raise ValueError("A scalar B pane requires both B_lo and B_hi")
+        lo, hi = float(window.B_lo), float(window.B_hi)
+        if not lo < hi:
+            raise ValueError(f"Invalid B pane ({lo!r}, {hi!r}]")
+        return lo, hi
+
     mode = str(window.mask_B_mode)
     if mode == "all":
         return (-np.inf, np.inf)
@@ -983,6 +1063,143 @@ def _build_three_sigma_windows(
     return windows
 
 
+def _build_partitioned_hgl_windows(
+    *,
+    E_A: np.ndarray,
+    base_mask_A: np.ndarray,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    omega_nonneg_ry: np.ndarray,
+    neg_omega_half: bool,
+    regularization_width_ry: float,
+    edge_factor: float,
+    target_error: float,
+    max_nodes: int,
+    crossing_eps_q: float,
+    crossing_max_nodes: int,
+    use_shipped_tables: bool,
+) -> tuple[list[_SigmaWindow], HGLCrossingPlan]:
+    """Build certified rules for the exact HGL pane plan.
+
+    This is the execution leaf for :func:`plan_hgl_crossing_cells`.  It adds
+    no second convolution or accumulator: every returned row is the existing
+    :class:`_SigmaWindow` vocabulary, augmented only with scalar A/B bounds
+    and its omega-cluster indices.
+
+    The two sign-definite orientations follow directly from
+    ``x = omega - E - B``.  ``x < 0`` uses the incumbent ``t=-i*tau``
+    placement anchored at the A/B minima.  ``x > 0`` uses its conjugate
+    ``t=+i*tau`` placement anchored at the maxima, so both factorised
+    exponentials have magnitude at most one.  The shell uses the incumbent
+    HGL rule and physical ``eps_hat = xi*eps_phys`` conversion unchanged.
+    """
+    from common.units import RYD_TO_EV
+
+    xi = float(regularization_width_ry)
+    plan = plan_hgl_crossing_cells(
+        omega_abs=np.asarray(omega_nonneg_ry, dtype=np.float64),
+        E_A=E_A,
+        base_mask_A=base_mask_A,
+        regularization_width_ry=xi,
+        edge_factor=float(edge_factor),
+        omega_cluster_gap_ry=1.0,
+        omega_max_span_ry=1.0 / RYD_TO_EV,
+        crossing_A_max=_CROSSING_A_MAX,
+    )
+    neg = -1.0 if neg_omega_half else 1.0
+    base = np.asarray(base_mask_A, dtype=bool)
+    stats_cache: dict[tuple[float, float], tuple[int, int, float | None, float | None]] = {}
+    windows: list[_SigmaWindow] = []
+
+    for cell in plan.cells:
+        b_key = (float(cell.b_lo), float(cell.b_hi))
+        stats = stats_cache.get(b_key)
+        if stats is None:
+            stats = _masked_interval_stats_device(
+                Omega_q, base_mask_B, cell.b_lo, cell.b_hi)
+            stats_cache[b_key] = stats
+        _, count_B, B_min, B_max = stats
+        if count_B == 0 or B_min is None or B_max is None:
+            continue
+
+        if cell.kind == "crossing":
+            target_error_hat = _scaled_crossing_error_bound(
+                xi, target_error)
+            q_cross = solve_phase_minimax_bandwidth(
+                float(cell.A_dim),
+                target_error=target_error_hat,
+                max_nodes=crossing_max_nodes,
+                eps_q=crossing_eps_q,
+                target_kind="hgl",
+                use_shipped_tables=use_shipped_tables,
+            )
+            raw = q_cross.to_minimax_nodes(time_axis="crossing_hgl")
+            nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
+            E_ref_A = float(cell.e_min)
+            E_ref_B = float(B_min)
+            project = "imag"
+            prefactor = -1.0 * neg
+            max_error = float(q_cross.max_error) / xi
+            provenance = q_cross.provenance
+            crossing_kind = "hgl"
+        else:
+            if cell.kind == "negative":
+                x_min = float(cell.e_min + B_min - cell.omega_hi)
+                x_max = float(cell.e_max + B_max - cell.omega_lo)
+                E_ref_A = float(cell.e_min)
+                E_ref_B = float(B_min)
+                prefactor = +1.0 * neg
+                conjugate = False
+            elif cell.kind == "positive":
+                x_min = float(cell.omega_lo - cell.e_max - B_max)
+                x_max = float(cell.omega_hi - cell.e_min - B_min)
+                E_ref_A = float(cell.e_max)
+                E_ref_B = float(B_max)
+                prefactor = -1.0 * neg
+                conjugate = True
+            else:
+                raise AssertionError(f"Unknown HGL cell kind {cell.kind!r}")
+            if x_min <= 0.0 or x_max < x_min:
+                raise AssertionError(
+                    "GATE hgl_sign_definite_cell: invalid Laplace interval "
+                    f"for {cell.kind}: [{x_min:.16g}, {x_max:.16g}]")
+            q = solve_laplace_minimax_interval(
+                x_min,
+                max(x_max, x_min * (1.0 + 1.0e-9)),
+                target_error=target_error,
+                max_nodes=max_nodes,
+                use_shipped_tables=use_shipped_tables,
+            )
+            raw = q.to_minimax_nodes(time_axis="imag")
+            nodes = (MinimaxNodes(t=-raw.t, alpha=raw.alpha)
+                     if conjugate else raw)
+            project = "full"
+            max_error = float(q.max_error)
+            provenance = q.provenance
+            crossing_kind = None
+
+        windows.append(_SigmaWindow(
+            name=f"pane_{cell.kind}",
+            nodes=nodes,
+            mask_A=base,
+            E_ref_A=E_ref_A,
+            E_ref_B=E_ref_B,
+            omega_sign=+1,
+            project=project,
+            prefactor=float(prefactor),
+            crossing_kind=crossing_kind,
+            max_error=max_error,
+            provenance=provenance,
+            E_min=float(cell.e_lo),
+            E_max=float(cell.e_hi),
+            B_lo=float(cell.b_lo),
+            B_hi=float(cell.b_hi),
+            omega_indices=np.asarray(cell.omega_indices, dtype=np.int64),
+        ))
+
+    return windows, plan
+
+
 # ---------------------------------------------------------------------------
 #  Sigma convolution — host-side window construction.  The device-side tau
 #  loop lives in the driver (ppm_sigma); the two halves have no shared state
@@ -1007,6 +1224,7 @@ def _build_windows_for_branch(
     use_shipped_minimax_tables: bool,
     log_tag: str,
     print_fn,
+    partition_hgl: bool = False,
 ) -> list[_SigmaWindow]:
     """Host-side window construction for a single branch.
 
@@ -1036,26 +1254,55 @@ def _build_windows_for_branch(
     if denom_can_cross and omega_max > 1.0e-14:
         xi = max(float(regularization_width_ry), 1.0e-12)
         T = omega_max + float(edge_factor) * xi
-        _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(
-            Omega_q, base_mask_B & (Omega_q <= T))
-        _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(
-            Omega_q, base_mask_B & (Omega_q > T))
-        windows = _build_three_sigma_windows(
-            E_A=E_A_host, base_mask_A=base_A_host,
-            mask_B_all_count=mask_B_all_count,
-            mask_B_le_count=mask_B_le_count,
-            mask_B_le_min=mask_B_le_min, mask_B_le_max=mask_B_le_max,
-            mask_B_gt_count=mask_B_gt_count,
-            mask_B_gt_min=mask_B_gt_min, mask_B_gt_max=mask_B_gt_max,
-            omega_nonneg_ry=omega_nonneg_ry,
-            neg_omega_half=neg_omega_half,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error, max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q,
-            crossing_max_nodes=crossing_max_nodes,
-            use_shipped_tables=bool(use_shipped_minimax_tables),
-        )
+        if partition_hgl and hgl_partition_required(
+                omega_nonneg_ry, xi, edge_factor):
+            windows, plan = _build_partitioned_hgl_windows(
+                E_A=E_A_host,
+                base_mask_A=base_A_host,
+                Omega_q=Omega_q,
+                base_mask_B=base_mask_B,
+                omega_nonneg_ry=omega_nonneg_ry,
+                neg_omega_half=neg_omega_half,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                target_error=target_error,
+                max_nodes=max_nodes,
+                crossing_eps_q=crossing_eps_q,
+                crossing_max_nodes=crossing_max_nodes,
+                use_shipped_tables=bool(use_shipped_minimax_tables),
+            )
+            counts = {
+                kind: sum(win.name == f"pane_{kind}" for win in windows)
+                for kind in ("positive", "crossing", "negative")
+            }
+            print_fn(
+                f"    {log_tag} bounded HGL plan: "
+                f"{plan.omega_cluster_count} omega clusters, "
+                f"{plan.energy_pane_count} A panes, "
+                f"{len(windows)}/{len(plan.cells)} nonempty cells "
+                f"(+{counts['positive']}/crossing{counts['crossing']}"
+                f"/-{counts['negative']}), max A={plan.max_A_dim:.6f}")
+        else:
+            _, mask_B_le_count, mask_B_le_min, mask_B_le_max = _masked_stats_device(
+                Omega_q, base_mask_B & (Omega_q <= T))
+            _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(
+                Omega_q, base_mask_B & (Omega_q > T))
+            windows = _build_three_sigma_windows(
+                E_A=E_A_host, base_mask_A=base_A_host,
+                mask_B_all_count=mask_B_all_count,
+                mask_B_le_count=mask_B_le_count,
+                mask_B_le_min=mask_B_le_min, mask_B_le_max=mask_B_le_max,
+                mask_B_gt_count=mask_B_gt_count,
+                mask_B_gt_min=mask_B_gt_min, mask_B_gt_max=mask_B_gt_max,
+                omega_nonneg_ry=omega_nonneg_ry,
+                neg_omega_half=neg_omega_half,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                target_error=target_error, max_nodes=max_nodes,
+                crossing_eps_q=crossing_eps_q,
+                crossing_max_nodes=crossing_max_nodes,
+                use_shipped_tables=bool(use_shipped_minimax_tables),
+            )
     else:
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,
@@ -1070,6 +1317,8 @@ def _build_windows_for_branch(
 
     for win in windows:
         A_vals = E_A_host[win.mask_A]
+        if win.E_min is not None:
+            A_vals = A_vals[(A_vals > win.E_min) & (A_vals <= win.E_max)]
         kind = "crossing" if win.crossing_kind else "Laplace"
         # ACHIEVED, not requested (R2).  The old line said
         # ``err<{target_error:.0e}``, which is what was ASKED for -- so a

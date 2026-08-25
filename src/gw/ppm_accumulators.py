@@ -360,13 +360,18 @@ class _WindowAccum:
     71.2 s sigma.exec at b300/P=16, job 7884656).
     """
 
-    __slots__ = ('omega_sign_f', 'pref_f', 'project_code',
-                 'win_shards', 'pending_count', 'closed')
+    __slots__ = ('omega_sign_f', 'pref_f', 'project_code', 'omega_vec',
+                 'omega_indices', 'win_shards', 'pending_count', 'closed')
 
-    def __init__(self, window: '_SigmaWindow'):
+    def __init__(self, window: '_SigmaWindow', omega_vec: np.ndarray):
         self.omega_sign_f = float(window.omega_sign)
         self.pref_f       = float(window.prefactor)
         self.project_code = window.project_code
+        self.omega_indices = (
+            None if window.omega_indices is None
+            else np.asarray(window.omega_indices, dtype=np.int64))
+        self.omega_vec = (omega_vec if self.omega_indices is None
+                          else omega_vec[self.omega_indices])
         self.win_shards: list | None = None
         self.pending_count = 0
         self.closed = False
@@ -431,7 +436,7 @@ class _TauAccumulator(_SigmaAccumulator):
         if self._cur is not None and not self._cur.closed:
             raise RuntimeError(
                 "_TauAccumulator.begin_window: previous window never closed")
-        self._cur = _WindowAccum(window)
+        self._cur = _WindowAccum(window, self._omega_vec_np)
 
     def add_tau(self, sigma_re, sigma_im, t_c: complex, alpha_eff_c: complex) -> None:
         # Grab EVERY local shard handle and start the D2H copies now — do NOT
@@ -487,7 +492,7 @@ class _TauAccumulator(_SigmaAccumulator):
                 si = None if hi is None else np.asarray(hi)
             with timing.section("sigma.tau.omega_project"):
                 proj = _project_tau_onto_omega_np(
-                    sr, si, self._omega_vec_np,
+                    sr, si, wctx.omega_vec,
                     t_c, alpha_eff_c, wctx.omega_sign_f, wctx.pref_f,
                     wctx.project_code,
                 )
@@ -514,8 +519,13 @@ class _TauAccumulator(_SigmaAccumulator):
         if wctx.project_code == 1:
             shards = _complete_one_sided_tau(
                 shards, self._shard_devices, self._sigma_sharding)
-        self._sink.consume_window(
-            shards, self._shard_index, self._shard_devices)
+        if wctx.omega_indices is None:
+            self._sink.consume_window(
+                shards, self._shard_index, self._shard_devices)
+        else:
+            self._sink.consume_window(
+                shards, self._shard_index, self._shard_devices,
+                omega_indices=wctx.omega_indices)
         wctx.win_shards = None
 
     def end_window(self) -> None:
@@ -664,7 +674,9 @@ class DeviceOmegaAccumulator:
 
 class _WindowSink:
     """Protocol for what a finished window's per-shard tiles become."""
-    def consume_window(self, win_shards, shard_index, shard_devices) -> None: ...
+    def consume_window(
+        self, win_shards, shard_index, shard_devices, *, omega_indices=None,
+    ) -> None: ...
     def result(self) -> jax.Array | None: ...
 
 
@@ -692,18 +704,41 @@ class _MemoryTileSink(_WindowSink):
         self._sharding = sharding
         self._total_shards: list[np.ndarray] | None = None
         self._devices: list | None = None
+        self._omega_clustered: bool | None = None
         # 4-D σ^τ shard indices (n_brk, nk, m, n) captured with the first
         # window — needed by host_tiles() to place each tile in the 5-D
         # global Σ.
         self._index: list[tuple] | None = None
 
-    def consume_window(self, win_shards, shard_index, shard_devices) -> None:
+    def consume_window(
+        self, win_shards, shard_index, shard_devices, *, omega_indices=None,
+    ) -> None:
+        clustered = omega_indices is not None
+        if self._omega_clustered is None:
+            self._omega_clustered = clustered
+        elif self._omega_clustered != clustered:
+            raise RuntimeError(
+                "_MemoryTileSink cannot mix clustered and full-omega "
+                "windows in one branch")
         if self._total_shards is None:
-            self._total_shards = [np.zeros_like(w) for w in win_shards]
+            if omega_indices is None:
+                # Incumbent full-omega path: retain its allocation and add
+                # order exactly.
+                self._total_shards = [np.zeros_like(w) for w in win_shards]
+            else:
+                self._total_shards = []
+                for w in win_shards:
+                    shape = list(w.shape)
+                    shape[1] = int(self._shape[1])
+                    self._total_shards.append(
+                        np.zeros(tuple(shape), dtype=w.dtype))
             self._devices = list(shard_devices)
             self._index = [tuple(ix) for ix in shard_index]
         for d, w in enumerate(win_shards):
-            self._total_shards[d] += w
+            if omega_indices is None:
+                self._total_shards[d] += w
+            else:
+                self._total_shards[d][:, omega_indices, ...] += w
 
     def host_tiles(self):
         """Per-shard host tiles, their 4-D global indices, and owning devices.
