@@ -3,12 +3,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import jax
 import jax.numpy as jnp
 
+from common import mtxel_sweep
+from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from psp import vnl_ops
 from psp import dft_operators, radial_tables
 from psp.species import SpeciesData
@@ -22,7 +27,7 @@ from psp.vnl_ops import (
 
 
 _EXPECTED_SRC = Path(__file__).resolve().parents[1] / "src"
-for _module in (vnl_ops, dft_operators, radial_tables):
+for _module in (mtxel_sweep, vnl_ops, dft_operators, radial_tables):
     if _EXPECTED_SRC not in Path(_module.__file__).resolve().parents:
         raise RuntimeError(
             f"split-source gate: {_module.__name__} imported from "
@@ -396,4 +401,118 @@ def test_icl_q2_physical_radial_third_derivative_and_operator_jet():
     d2gamma_mtx = np.einsum("msg,abcnsg->abcmn", bra, d2gamma)
     np.testing.assert_allclose(
         d2gamma_mtx, np.swapaxes(np.conj(d2gamma_mtx), -1, -2),
+        rtol=3e-11, atol=3e-11)
+
+
+def test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity():
+    setup = _setup(curved=False, third_derivatives=True)
+    G = jnp.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
+    mask = jnp.asarray([1.0, 1.0, 1.0, 0.0])
+    psi_L = _states() * mask[None, None, :]
+    k = np.asarray([0.19, -0.17, 0.12])
+    B = np.asarray(setup.B)
+    Binv = np.linalg.inv(B)
+    psi_4 = lift_to_4spinor(
+        psi_L[None], G[None], jnp.asarray(k[None]), jnp.asarray(B))[0]
+
+    # Exercise the incumbent transaction's apply-to-ket packing.  The
+    # negative adjoint below is the production unpack rule that converts
+    # <Psi|alpha_i dPsi_a> into the bra-(k-q) endpoint derivative.
+    geom = SimpleNamespace(ns=4, ngkmax=int(G.shape[0]))
+    operator = mtxel_sweep.uniform_gauge_operator(
+        geom, bvec=B, blat=1.0, vnl_setup=setup,
+        include_transfer_q2=True)
+    packed_action = np.moveaxis(np.asarray(operator.apply(
+        psi_4[None], G, mask, jnp.zeros((1, 1, 1, 1), jnp.int32),
+        jnp.asarray(k))), -1, 0)[:, 0]
+    packed_mtx = np.einsum(
+        "msg,xnsg->xmn", np.conj(np.asarray(psi_4)), packed_action,
+        optimize=True)
+    gamma0 = packed_mtx[:3]
+    contact = packed_mtx[3:12].reshape(3, 3, 2, 2)
+    q1_source = packed_mtx[12:21].reshape(3, 3, 2, 2)
+    q1 = -np.swapaxes(np.conj(q1_source), -1, -2)
+    q2 = packed_mtx[21:].reshape(3, 3, 3, 2, 2)
+
+    uniform = apply_uniform_vnl_derivatives_to_ket(
+        psi_L, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
+    lambda_kin = dft_operators.apply_kinetic_contact_to_ket(psi_L)
+    contact_action = np.zeros((3, 3, 2, 4, 4), np.complex128)
+    contact_action[:, :, :, :2] = HALFALPHA * np.asarray(
+        lambda_kin + uniform.lambda_cart_ket)
+    contact_direct = np.einsum(
+        "msg,abnsg->abmn", np.conj(np.asarray(psi_4)), contact_action,
+        optimize=True)
+    np.testing.assert_array_equal(contact, contact_direct)
+
+    @jax.jit
+    def vnl_gamma_at(k_crys):
+        return apply_uniform_vnl_derivatives_to_ket(
+            psi_L, G, k_crys, setup, mask,
+            projector_row_chunk=1, g_chunk=2).gamma_cart_ket
+
+    gauss_x, gauss_w = np.polynomial.legendre.leggauss(6)
+    segment_s = 0.5 * (gauss_x + 1.0)
+    segment_w = 0.5 * gauss_w
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+
+    def direct_vertex(base_k, q_cart):
+        q_crys = q_cart @ Binv
+        ket = lift_to_4spinor(
+            psi_L[None], G[None], jnp.asarray(base_k[None]), jnp.asarray(B))[0]
+        bra = lift_to_4spinor(
+            psi_L[None], G[None],
+            jnp.asarray((base_k - q_crys)[None]), jnp.asarray(B))[0]
+        gamma_kin = np.stack([
+            np.asarray(gamma_apply(ket, perm, phase, axis=1))
+            for perm, phase in alpha_vertices
+        ])
+        gamma_vnl = sum(
+            weight * np.asarray(vnl_gamma_at(base_k - s * q_crys))
+            for s, weight in zip(segment_s, segment_w))
+        action = gamma_kin.copy()
+        action[:, :, :2] += HALFALPHA * gamma_vnl
+        return np.einsum(
+            "msg,insg->imn", np.conj(np.asarray(bra)), action,
+            optimize=True)
+
+    direction = np.asarray([0.31, -0.47, 0.29])
+
+    def taylor_error(step):
+        q_cart = step * direction
+        direct = direct_vertex(k, q_cart)
+        taylor = (
+            gamma0
+            + np.einsum("a,iamn->imn", q_cart, q1)
+            + 0.5 * np.einsum("a,b,iabmn->imn", q_cart, q_cart, q2))
+        return np.linalg.norm(direct - taylor)
+
+    err_big = taylor_error(4.0e-3)
+    err_small = taylor_error(2.0e-3)
+    assert err_small < 0.14 * err_big  # cubic remainder: ideal ratio 1/8
+
+    # Direct ICL Ward identity, including the kinetic spin term.  The
+    # antisymmetric Pauli product cancels after contraction with q_i q_a.
+    q_cart = 3.0e-3 * direction
+    q_crys = q_cart @ Binv
+    direct = direct_vertex(k, q_cart)
+    lhs = (2.0 / ALPHA_FS) * np.einsum("i,imn->mn", q_cart, direct)
+    K = (np.asarray(G) + k[None]) @ B
+    Kmq = K - q_cart[None]
+    kinetic_diff = np.asarray(psi_L) * (
+        np.sum(K * K, axis=1) - np.sum(Kmq * Kmq, axis=1))[None, None]
+    vnl_diff = (
+        _ordinary_vnl_action(psi_L, G, mask, k, setup)
+        - _ordinary_vnl_action(psi_L, G, mask, k - q_crys, setup))
+    rhs = np.einsum(
+        "msg,nsG->mn", np.conj(np.asarray(psi_L)),
+        kinetic_diff + vnl_diff, optimize=True)
+    np.testing.assert_allclose(lhs, rhs, rtol=2e-11, atol=2e-11)
+
+    reverse = direct_vertex(k - q_crys, -q_cart)
+    np.testing.assert_allclose(
+        direct, np.swapaxes(np.conj(reverse), -1, -2),
+        rtol=3e-12, atol=3e-12)
+    np.testing.assert_allclose(
+        q2, np.swapaxes(np.conj(q2), -1, -2),
         rtol=3e-11, atol=3e-11)

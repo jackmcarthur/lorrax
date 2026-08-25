@@ -758,23 +758,29 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
 
 
 class UniformGaugeMatrixElements(NamedTuple):
-    r"""Band-sharded first and second uniform gauge variations.
+    r"""Band-sharded uniform gauge action and optional transfer jet.
 
     ``gamma_raw`` is the dimensionless no-pair vertex
     ``(alpha_FS/2) dH_Pauli_Ry/dk``. ``lambda_raw`` is its exact uniform
     derivative ``(alpha_FS/2) d2H_Pauli_Ry/dkdk``.  Their shapes are
     ``(nk,3,nb,nb)`` and ``(nk,3,3,nb,nb)`` and both retain the sweep's
-    two-dimensional band sharding.  They are deliberately one transaction:
-    Hall and contact consumers must not reopen the WFN or rebuild projectors.
+    two-dimensional band sharding.  With the separately priced transfer-q2
+    capability, ``dgamma_dq_raw`` and ``d2gamma_dq2_raw`` have shapes
+    ``(nk,3,3,nb,nb)`` and ``(nk,3,3,3,nb,nb)``.  They are deliberately one
+    transaction: Hall, response-jet, and contact consumers must not reopen
+    the WFN or rebuild projectors.
     """
 
     gamma_raw: jax.Array
     lambda_raw: jax.Array
     hamiltonian_config_operator_fingerprint: str
+    dgamma_dq_raw: jax.Array | None = None
+    d2gamma_dq2_raw: jax.Array | None = None
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
-                           vnl_setup) -> Operator:
+                           vnl_setup,
+                           include_transfer_q2: bool = False) -> Operator:
     r"""One apply-to-ket owner for raw current and exact uniform contact.
 
     The first three packed components are
@@ -793,10 +799,22 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     so the WFN bra reshard and projector coefficient pass are not paid by
     separate current/contact drivers.
 
-    This is strictly the uniform ``q=0`` operator transaction.  The VNL
-    owner independently refuses finite q until a Wilson-line prescription is
-    selected.  It also does not claim to supply the covariant multipoles
-    needed for a finite-q photon body or a generalized long-wave S tensor.
+    ``include_transfer_q2=True`` extends the SAME transaction with the
+    explicit ICL transfer derivatives at fixed large-component coefficients.
+    For the repository's bra ``k-q`` orientation,
+
+    ``Q_raw[i,a] = -(alpha/2) sigma_a sigma_i
+                    -(alpha/4) V_NL,ia``
+
+    and ``Q2_raw[i,a,b] = (alpha/6) V_NL,iab``.  The Pauli ordering comes
+    from differentiating the BRA kinetic-balance endpoint.  It is formed by
+    sweeping ``alpha_i dPsi_a`` and taking its negative band-space adjoint,
+    thereby reusing :func:`common.bispinor_init.kinetic_balance_lift_jet`
+    instead of spelling a second sigma-product kernel.
+
+    These are explicit vertex derivatives only.  They do not include
+    eigenstate, energy, occupation, or response-weight derivatives and are
+    not by themselves a generalized long-wave response.
     """
     if int(geom.ns) != 4:
         raise ValueError(
@@ -814,8 +832,13 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         raise ValueError(
             "uniform_gauge_operator requires VNLSetup built with "
             "compute_contact=True")
+    transfer_q2 = bool(include_transfer_q2)
+    if transfer_q2 and vnl_setup.Gppp_table is None:
+        raise ValueError(
+            "uniform_gauge_operator transfer q2 requires VNLSetup built "
+            "with compute_transfer_q2=True")
 
-    from common.bispinor_init import HALFALPHA
+    from common.bispinor_init import HALFALPHA, kinetic_balance_lift_jet
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
     from psp.dft_operators import apply_kinetic_contact_to_ket
     from psp import vnl_ops
@@ -842,7 +865,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         ], axis=0)
 
         vnl = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
-            psi_L, gvec, kvec, vnl_setup, gmask)
+            psi_L, gvec, kvec, vnl_setup, gmask,
+            include_q2=transfer_q2)
         gamma_vnl = _pad_spinor(
             halfalpha.astype(psi_4.real.dtype)
             * vnl.gamma0_cart_ket,
@@ -854,14 +878,48 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             lambda_kin + vnl.lambda0_cart_ket)
         contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
 
-        packed = jnp.concatenate(
-            (gamma, contact.reshape(9, *contact.shape[2:])), axis=0)
+        fields = [gamma, contact.reshape(9, *contact.shape[2:])]
+        if transfer_q2:
+            # dPsi/dK is independent of K.  Evaluating the canonical lift
+            # jet at zero avoids threading a second reciprocal-lattice
+            # operand through this already k-resolved operator.
+            _lifted_zero, dpsi_dK = kinetic_balance_lift_jet(
+                psi_L,
+                jnp.zeros((int(psi_L.shape[-1]), 3),
+                          dtype=psi_4.real.dtype))
+            del _lifted_zero
+            # This is B[i,a]=<Psi|alpha_i dPsi_a>.  The physical bra k-q
+            # derivative is -B^dagger, preserving sigma_a sigma_i ordering.
+            kinetic_q1_source = jnp.stack([
+                gamma_apply(dpsi_dK, perm, phase, axis=2)
+                for perm, phase in alpha_vertices
+            ], axis=0)
+            vnl_q1 = _pad_spinor(
+                halfalpha.astype(psi_4.real.dtype)
+                * vnl.dgamma_dq_cart_ket,
+                int(psi_4.shape[1]))
+            q1_adjoint_source = kinetic_q1_source - vnl_q1
+            q2 = _pad_spinor(
+                halfalpha.astype(psi_4.real.dtype)
+                * vnl.d2gamma_dq2_cart_ket,
+                int(psi_4.shape[1]))
+            fields.extend((
+                q1_adjoint_source.reshape(
+                    9, *q1_adjoint_source.shape[2:]),
+                q2.reshape(27, *q2.shape[3:]),
+            ))
+
+        packed = jnp.concatenate(tuple(fields), axis=0)
         return jnp.moveaxis(packed, 0, -1)[None]
 
+    operator_key = (
+        "uniform_gauge_current_contact", geom.ngkmax, geom.ns,
+        float(blat), id(vnl_setup))
+    if transfer_q2:
+        operator_key += ("explicit_transfer_q2",)
     return Operator(
-        apply=op, post=1.0, ncomp=12,
-        key=("uniform_gauge_current_contact", geom.ngkmax, geom.ns,
-             float(blat), id(vnl_setup)))
+        apply=op, post=1.0, ncomp=(48 if transfer_q2 else 12),
+        key=operator_key)
 
 
 def sweep_uniform_gauge_matrix_elements(
@@ -879,6 +937,7 @@ def sweep_uniform_gauge_matrix_elements(
     box_index,
     kvecs,
     use_scan: bool = True,
+    include_transfer_q2: bool = False,
 ) -> UniformGaugeMatrixElements:
     """Run the canonical uniform current/contact transaction once.
 
@@ -927,25 +986,40 @@ def sweep_uniform_gauge_matrix_elements(
         ("cell_volume", float(geom.cell_volume).hex()),
     ):
         fingerprint_update_value(digest, label, value)
+    if bool(include_transfer_q2):
+        fingerprint_update_value(
+            digest, "transfer_jet", "explicit_q2_fixed_large_component_v1")
     fingerprint = "sha256:" + digest.hexdigest()
 
     packed = sweep_matrix_elements(
         psi_G,
         geom=geom,
         operator=uniform_gauge_operator(
-            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup),
+            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
+            include_transfer_q2=bool(include_transfer_q2)),
         gvecs=gvecs,
         gmask=gmask,
         box_index=box_index,
         kvecs=kvecs,
         use_scan=use_scan,
     )
+    q1_raw = q2_raw = None
+    if bool(include_transfer_q2):
+        q1_source = packed[:, 12:21].reshape(
+            int(packed.shape[0]), 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1]))
+        q1_raw = -jnp.swapaxes(jnp.conj(q1_source), -1, -2)
+        q2_raw = packed[:, 21:48].reshape(
+            int(packed.shape[0]), 3, 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1]))
     return UniformGaugeMatrixElements(
         gamma_raw=packed[:, :3],
-        lambda_raw=packed[:, 3:].reshape(
+        lambda_raw=packed[:, 3:12].reshape(
             int(packed.shape[0]), 3, 3,
             int(packed.shape[-2]), int(packed.shape[-1])),
         hamiltonian_config_operator_fingerprint=fingerprint,
+        dgamma_dq_raw=q1_raw,
+        d2gamma_dq2_raw=q2_raw,
     )
 
 
