@@ -81,6 +81,7 @@ _T_GAMMA5 = _t128([[0, 0, 1, 0],
 sigma_x = jnp.asarray(_T_SIGMA_X)
 sigma_y = jnp.asarray(_T_SIGMA_Y)
 sigma_z = jnp.asarray(_T_SIGMA_Z)
+paulis = jnp.asarray(_np.stack((_T_SIGMA_X, _T_SIGMA_Y, _T_SIGMA_Z)))
 
 gamma0 = jnp.asarray(_T_GAMMA0)
 gamma1 = jnp.asarray(_T_GAMMA1)
@@ -362,7 +363,7 @@ def set_gamma_contract_mode(mode: str) -> None:
 
 
 __all__ = [
-    "sigma_x", "sigma_y", "sigma_z",
+    "sigma_x", "sigma_y", "sigma_z", "paulis",
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
