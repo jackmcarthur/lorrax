@@ -172,6 +172,7 @@ EQP_ASSEMBLY_C_BASES = (
 )
 EQP_ASSEMBLY_K_STORAGE_ATTR = "k_storage"
 EQP_ASSEMBLY_K_STORAGE_WEDGE = "file_wedge"
+EQP_ASSEMBLY_FILE_ROWS_ATTR = "file_wedge_full_bz_rows"
 EQP_ASSEMBLY_HARTREE_STATE_ATTR = "hartree_state"
 EQP_ASSEMBLY_HARTREE_STATE_RESOLVED = "source_resolved"
 EQP_ASSEMBLY_BAND_START_ATTR = "band_start"
@@ -1248,9 +1249,11 @@ def write_sigma_omega_h5(
 		# Creation-time promise, before the later live assemble_eqp append.
 		# If the run stops after this writer closes but before that append, a
 		# reader sees an expected-receipt artifact with no receipt and fails closed.
-		io.stamp_file_attrs({
-			EQP_ASSEMBLY_EXPECTED_ATTR: EQP_ASSEMBLY_SCHEMA_VERSION,
-		})
+		# Existing SlabIO small-metadata owner, in the same close as omega_ev.
+		# The explicit legacy upgrader below uses the same name as a root attr;
+		# readers accept either encoding and refuse if both ever disagree.
+		io.write_attr(EQP_ASSEMBLY_EXPECTED_ATTR,
+			np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, dtype=np.int32))
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
 		# The ω axis's own reference, stamped ON the ω axis — one place to
 		# look, and it cannot drift away from the array it describes.
@@ -1401,11 +1404,33 @@ def read_eval_energies(filepath):
 	return arr, str(prov), cov
 
 
+def _read_eqp_assembly_expectation(h5):
+	"""Read the creation marker, accepting the two owned HDF5 encodings."""
+	root_value = h5.attrs.get(EQP_ASSEMBLY_EXPECTED_ATTR)
+	dataset_value = None
+	if EQP_ASSEMBLY_EXPECTED_ATTR in h5:
+		ds = h5[EQP_ASSEMBLY_EXPECTED_ATTR]
+		if not isinstance(ds, h5py.Dataset) or ds.shape != ():
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_EXPECTED_ATTR}: expected a scalar "
+				"creation-marker dataset.")
+		dataset_value = int(ds[()])
+	if root_value is not None:
+		root_value = int(root_value)
+	if (root_value is not None and dataset_value is not None
+			and root_value != dataset_value):
+		raise ValueError(
+			f"conflicting {EQP_ASSEMBLY_EXPECTED_ATTR} markers: root attribute "
+			f"{root_value} versus creation dataset {dataset_value}.")
+	return dataset_value if dataset_value is not None else root_value
+
+
 def append_eqp_assembly_receipt_h5(
 	filepath, *,
 	hartree_diag_ev,
 	sigma_x_diag_ev,
 	sigma_c_at_dft_diag_ev,
+	file_wedge_full_bz_rows,
 	band_start: int,
 	band_stop: int,
 	degeneracy_policy: str,
@@ -1420,8 +1445,11 @@ def append_eqp_assembly_receipt_h5(
 	The full cubes remain raw and keep their off-diagonals.  This single
 	``(3, nk_wedge, nb_window)`` dataset instead records the assembler-ready
 	Hartree, exchange, and C(E_DFT) diagonals, in that order.  Z and its
-	frequency derivative still come from the raw omega cube.  A candidate-name
-	then rename makes interruption visible without a sidecar or second file.
+	frequency derivative still come from the raw omega cube.  The canonical
+	full-BZ identity of every file-wedge row travels with the receipt; file and
+	star wedges are deliberately distinct symmetry-service products and shape
+	alone is not an ordering proof.  A candidate-name then rename makes
+	interruption visible without a sidecar or second file.
 	Call on rank 0 after the collective cube writer has closed the artifact.
 	"""
 	abs_path = os.path.abspath(filepath)
@@ -1433,6 +1461,7 @@ def append_eqp_assembly_receipt_h5(
 	h = np.asarray(hartree_diag_ev, dtype=np.float64)
 	x = np.asarray(sigma_x_diag_ev, dtype=np.float64)
 	c = np.asarray(sigma_c_at_dft_diag_ev, dtype=np.complex128)
+	file_rows = np.asarray(file_wedge_full_bz_rows, dtype=np.int64)
 	if h.ndim != 2 or x.shape != h.shape or c.shape != h.shape:
 		raise ValueError(
 			"EQP assembly receipt needs matching (nk_file_wedge, nb_window) "
@@ -1444,6 +1473,13 @@ def append_eqp_assembly_receipt_h5(
 			f"but the arrays have width {h.shape[1]}.")
 	if not all(np.all(np.isfinite(a)) for a in (h, x, c)):
 		raise ValueError("EQP assembly receipt refuses non-finite H/X/C diagonals.")
+	if (file_rows.ndim != 1 or file_rows.shape[0] != h.shape[0]
+			or (file_rows.size and np.min(file_rows) < 0)
+			or np.unique(file_rows).size != file_rows.size):
+		raise ValueError(
+			"EQP assembly receipt needs one distinct non-negative full-BZ row "
+			"identity per file-wedge row; got "
+			f"rows {file_rows.tolist()} for H/X/C shape {h.shape}.")
 	policy = str(degeneracy_policy)
 	if policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES:
 		raise ValueError(
@@ -1462,7 +1498,7 @@ def append_eqp_assembly_receipt_h5(
 				f"{os.path.basename(abs_path)} contains none of "
 				f"{list(SIGMA_CUBE_DATASETS)}; refusing to attach an EQP receipt "
 				"to a file that is not a sigma_mnk.h5 artifact.")
-		expected = h5.attrs.get(EQP_ASSEMBLY_EXPECTED_ATTR)
+		expected = _read_eqp_assembly_expectation(h5)
 		if expected is None:
 			# A truly legacy raw file may be upgraded by this explicit appender.
 			# A new raw-stamped file without the root promise is instead partial:
@@ -1474,8 +1510,8 @@ def append_eqp_assembly_receipt_h5(
 			if tagged:
 				raise ValueError(
 					f"{os.path.basename(abs_path)} has new raw-operator stamps "
-					f"on {tagged} but no {EQP_ASSEMBLY_EXPECTED_ATTR!r} root "
-					"marker; refusing a partial creation artifact.")
+					f"on {tagged} but no {EQP_ASSEMBLY_EXPECTED_ATTR!r} "
+					"creation marker; refusing a partial creation artifact.")
 			h5.attrs[EQP_ASSEMBLY_EXPECTED_ATTR] = EQP_ASSEMBLY_SCHEMA_VERSION
 		elif int(expected) != EQP_ASSEMBLY_SCHEMA_VERSION:
 			raise ValueError(
@@ -1490,6 +1526,7 @@ def append_eqp_assembly_receipt_h5(
 		ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR] = EQP_ASSEMBLY_DFT_BAND_BASIS
 		ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR] = c_basis
 		ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR] = EQP_ASSEMBLY_K_STORAGE_WEDGE
+		ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR] = file_rows
 		ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR] = (
 			EQP_ASSEMBLY_HARTREE_STATE_RESOLVED)
 		ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR] = b0
@@ -1527,7 +1564,7 @@ def read_eqp_assembly_receipt(filepath):
 		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 	with h5py.File(abs_path, "r") as h5:
-		expected = h5.attrs.get(EQP_ASSEMBLY_EXPECTED_ATTR)
+		expected = _read_eqp_assembly_expectation(h5)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
 		candidate_present = EQP_ASSEMBLY_CANDIDATE_DATASET in h5
 		if expected is None and not canonical_present and not candidate_present:
@@ -1577,6 +1614,7 @@ def read_eqp_assembly_receipt(filepath):
 			EQP_ASSEMBLY_HX_BASIS_ATTR,
 			EQP_ASSEMBLY_C_BASIS_ATTR,
 			EQP_ASSEMBLY_K_STORAGE_ATTR,
+			EQP_ASSEMBLY_FILE_ROWS_ATTR,
 			EQP_ASSEMBLY_HARTREE_STATE_ATTR,
 			EQP_ASSEMBLY_BAND_START_ATTR,
 			EQP_ASSEMBLY_BAND_STOP_ATTR,
@@ -1612,6 +1650,8 @@ def read_eqp_assembly_receipt(filepath):
 				f"k_storage={k_storage!r}, "
 				f"hartree_state={hartree_state!r}, policy={policy!r}.")
 		values = np.asarray(ds[()], dtype=np.complex128)
+		file_rows = np.asarray(
+			ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR], dtype=np.int64)
 		b0 = int(ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR])
 		b1 = int(ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR])
 		if values.ndim != 3 or values.shape[0] != 3 or values.shape[2] != b1 - b0:
@@ -1620,12 +1660,19 @@ def read_eqp_assembly_receipt(filepath):
 				f"for band window [{b0},{b1}).")
 		if not np.all(np.isfinite(values)):
 			raise ValueError(f"{EQP_ASSEMBLY_DATASET} contains non-finite values.")
+		if (file_rows.ndim != 1 or file_rows.shape[0] != values.shape[1]
+				or (file_rows.size and np.min(file_rows) < 0)
+				or np.unique(file_rows).size != file_rows.size):
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_FILE_ROWS_ATTR} {file_rows.tolist()} "
+				f"for {values.shape[1]} file-wedge rows.")
 		return {
 			"hartree_diag_ev": np.real(values[0]),
 			"sigma_x_diag_ev": np.real(values[1]),
 			"sigma_c_at_dft_diag_ev": values[2],
 			"band_start": b0,
 			"band_stop": b1,
+			"file_wedge_full_bz_rows": file_rows,
 			"degeneracy_policy": policy,
 			"degeneracy_tol_ry": float(
 				ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR]),
