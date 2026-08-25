@@ -25,6 +25,7 @@ _services.ensure_on_path()
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
 from common import timing
+from common.band_degeneracy import DEGENERACY_TOL_RY
 from common.units import RYD_TO_EV
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
@@ -370,9 +371,115 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
         axis=-1).reshape(-1, 3)
 
 
+def select_active_eigenpairs(eigenvalues: jax.Array,
+                             eigenvectors: jax.Array,
+                             active_character: jax.Array,
+                             n_active: int,
+                             *, n_physical: int | None = None):
+    """Select the transformed eigenpairs with maximum active-subspace weight.
+
+    ``eigenvectors[..., :, j]`` is eigenvector ``j`` of the already-built
+    htransform matrix and ``active_character`` is the Fourier interpolant of
+
+        P_A(k) = sum_{n < n_active} |c_nk><c_nk|.
+
+    The returned values are ordered by energy.  Selection itself is by
+    ``<u_j|P_A|u_j>`` with stable energy/index tie-breaking.  Eigenvector phase
+    cancels in this expectation value and no eigenvector leaves standalone
+    htransform, so there is deliberately no phase-fixing/output API here.
+
+    ``n_physical`` excludes fH's rank-minus-state null carrier *before*
+    character ranking.  Away from a coarse node the independently
+    interpolated fH and P_A matrices need not commute, so a null-carrier
+    eigenvector can have nonzero character; it is not a fitted state and may
+    never displace one.
+
+    The character operator is positive at the coarse samples by construction.
+    Its finite Fourier interpolant need not be positive between samples, so no
+    clipping or projector fiction is applied: signed character values are
+    ranked directly and the caller receives the boundary gap needed for the
+    numerical-ambiguity refusal.
+
+    Returns
+    -------
+    values, scores, score_gap, score_tol, cluster_values, cluster_mask
+        Batched arrays.  ``cluster_values`` and ``cluster_mask`` describe the
+        complete score-tied cluster crossing the selection boundary, not just
+        the last selected and first rejected neighbours.  ``score_tol`` is a
+        backward-error scale, not a physics tolerance.
+    """
+    rank = int(eigenvalues.shape[-1])
+    n_total = rank if n_physical is None else int(n_physical)
+    if not (0 < n_total <= rank):
+        raise ValueError(
+            f"select_active_eigenpairs: n_physical={n_total} must lie in "
+            f"[1, {rank}].")
+    eigenvalues = eigenvalues[..., :n_total]
+    eigenvectors = eigenvectors[..., :, :n_total]
+    n_active = int(n_active)
+    if not (0 < n_active < n_total):
+        raise ValueError(
+            f"select_active_eigenpairs: n_active={n_active} must lie in "
+            f"[1, {n_total - 1}] for an active/guard split.")
+
+    scores = jnp.real(jnp.einsum(
+        '...mi,...mn,...ni->...i',
+        jnp.conj(eigenvectors), active_character, eigenvectors,
+        optimize=True))
+    # ``eigh`` orders by energy.  A stable descending-character sort therefore
+    # resolves equal characters by lower energy and finally by the incumbent
+    # eigenpair index; no backend-dependent phase enters the assignment.
+    by_character = jnp.argsort(-scores, axis=-1, stable=True)
+    selected_idx = by_character[..., :n_active]
+    rejected_idx = by_character[..., n_active:]
+
+    selected_values = jnp.take_along_axis(
+        eigenvalues, selected_idx, axis=-1)
+    selected_scores = jnp.take_along_axis(scores, selected_idx, axis=-1)
+
+    # Publish bands in energy order after the state-character selection.
+    by_energy = jnp.argsort(selected_values, axis=-1, stable=True)
+    selected_values = jnp.take_along_axis(
+        selected_values, by_energy, axis=-1)
+    selected_scores = jnp.take_along_axis(
+        selected_scores, by_energy, axis=-1)
+
+    last_selected_idx = by_character[..., n_active - 1:n_active]
+    first_rejected_idx = rejected_idx[..., :1]
+    character_values = jnp.take_along_axis(
+        eigenvalues, by_character, axis=-1)
+    character_scores = jnp.take_along_axis(scores, by_character, axis=-1)
+    score_gap = (jnp.take_along_axis(scores, last_selected_idx, axis=-1)
+                 - jnp.take_along_axis(scores, first_rejected_idx, axis=-1)
+                 ).squeeze(axis=-1)
+    score_scale = jnp.maximum(1.0, jnp.max(jnp.abs(scores), axis=-1))
+    score_tol = (64.0 * jnp.finfo(scores.dtype).eps
+                 * float(n_total) * score_scale)
+    links = ((character_scores[..., :-1] - character_scores[..., 1:])
+             <= score_tol[..., None])
+    left_links = links[..., :n_active - 1]
+    left_connected = jnp.flip(
+        jnp.cumprod(jnp.flip(left_links, axis=-1), axis=-1), axis=-1).astype(bool)
+    left_connected = jnp.concatenate(
+        (left_connected,
+         jnp.ones(left_connected.shape[:-1] + (1,), dtype=bool)), axis=-1)
+    right_links = links[..., n_active:]
+    right_connected = jnp.cumprod(right_links, axis=-1).astype(bool)
+    right_connected = jnp.concatenate(
+        (jnp.ones(right_connected.shape[:-1] + (1,), dtype=bool),
+         right_connected), axis=-1)
+    boundary_link = links[..., n_active - 1]
+    cluster_mask = (jnp.concatenate(
+        (left_connected, right_connected), axis=-1)
+        & boundary_link[..., None])
+    return (selected_values, selected_scores, score_gap, score_tol,
+            character_values, cluster_mask)
+
+
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
+               active_count: int | None = None,
                log_fn=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
@@ -400,6 +507,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index whose bandwidth sets ``a``;
                    defaults to top of the htransform window (nb-1).
+        active_count: if set, also build the Fourier-interpolated character
+                   operator from ``ctilde[:, :active_count]``.  This is the
+                   returned-QP/DFT-guard selector; it uses the same compact
+                   gauge and canonical flat-k transform as fH.
         log_fn:    optional logger.
 
     Returns:
@@ -407,6 +518,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
         params:  (a_f, n_f, shift) — for ``newton_inv`` on the eigvals of fH_q.
         f_eps:   (nb, nk_co) f-transformed eigenvalues, replicated.
+        active_R: (nk_co, rank, rank), sharded P(None, 'x', 'y'), or None.
     """
     if log_fn is None:
         log_fn = lambda *a, **kw: None
@@ -425,8 +537,17 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
     # transpose is a permutation of the same f64 values).
+    if active_count is not None:
+        active_count = int(active_count)
+        if not (0 < active_count < int(ctilde.shape[1])):
+            raise ValueError(
+                f"build_fH_R: active_count={active_count} must lie in [1, "
+                f"{int(ctilde.shape[1]) - 1}] when guard states are fitted.")
+    active_out = flat_xy if active_count is not None else rep_
+
     @partial(jax.jit,
-             out_shardings=(flat_xy, flat_xy, rep_, rep_, rep_, rep_))
+             out_shardings=(flat_xy, flat_xy, active_out,
+                            rep_, rep_, rep_, rep_, rep_))
     def _build(ctilde_in, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
@@ -446,6 +567,25 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
+
+        if active_count is None:
+            active_R = jnp.empty((0,), dtype=ctilde_in.dtype)
+            active_fft_roundtrip_rel = jnp.asarray(0.0, dtype=f_eps_in.dtype)
+        else:
+            active_rows = ctilde_in[:, :active_count, :]
+            active_k = jnp.einsum(
+                'kim,kin->kmn', active_rows, jnp.conj(active_rows),
+                optimize=True)
+            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+            active_k = 0.5 * (
+                active_k + jnp.swapaxes(active_k, -1, -2).conj())
+            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+            active_R = local_ifftn(active_k)
+            active_fft_abs = jnp.max(jnp.abs(local_fftn(active_R) - active_k))
+            active_scale = jnp.max(jnp.abs(active_k))
+            active_fft_roundtrip_rel = jnp.where(
+                active_scale > 0.0, active_fft_abs / active_scale,
+                active_fft_abs)
 
         # The rank-by-rank fH eigensolve is not needed to certify its coarse
         # spectrum.  If A = sqrt(-f(eps)) C, the nonzero eigenvalues of
@@ -473,7 +613,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fft_roundtrip_rel = jnp.where(
             fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
             fft_roundtrip_abs)
-        return (fH_k, fH_R, fft_roundtrip_rel, f_recovery_error,
+        return (fH_k, fH_R, active_R, fft_roundtrip_rel,
+                active_fft_roundtrip_rel, f_recovery_error,
                 energy_recovery_error, jnp.max(inverse_residual))
 
     # Projection receipt, not a rank gate.  The published whole-state QRCP
@@ -493,7 +634,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
         f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    (fH_k, fH_R, fft_roundtrip_rel, f_recovery_error,
+    (fH_k, fH_R, active_R, fft_roundtrip_rel,
+     active_fft_roundtrip_rel, f_recovery_error,
      energy_recovery_error, inverse_residual) = _build(ctilde, f_eps)
     log_fn(
         f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
@@ -508,6 +650,21 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"{fft_rel:.6e} exceeds {FLAT_K_FFT_VALUE_RTOL:.1e}.  "
             "The forward/inverse pair must preserve every coarse-k fH tile; "
             "do not publish or interpolate this Hamiltonian.")
+    if active_count is not None:
+        active_fft_rel = float(active_fft_roundtrip_rel)
+        log_fn(
+            f"  [receipt] active-character P_A from {active_count} state(s): "
+            f"canonical FFT round-trip relative residual="
+            f"{active_fft_rel:.3e} (limit {FLAT_K_FFT_VALUE_RTOL:.1e}); "
+            "P_A(k) is positive by construction, off-grid P_A(q) is "
+            "unclipped")
+        if (not np.isfinite(active_fft_rel)
+                or active_fft_rel > FLAT_K_FFT_VALUE_RTOL):
+            raise ValueError(
+                "build_fH_R: active-character canonical flat-k FFT "
+                f"round-trip residual {active_fft_rel:.6e} exceeds "
+                f"{FLAT_K_FFT_VALUE_RTOL:.1e}; do not select or publish "
+                "an active returned subspace.")
     log_fn(
         f"  [receipt] all-coarse transformed spectrum: "
         f"max|eig(-A A^H)-f(eps)|={float(f_recovery_error):.3e} Ry; "
@@ -516,7 +673,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         f"{float(inverse_residual):.3e} Ry")
     require_newton_converged(
         float(inverse_residual), where="build_fH_R all-coarse recovery")
-    return fH_k, fH_R, (a_f, n_f, shift), f_eps
+    return (fH_k, fH_R, (a_f, n_f, shift), f_eps,
+            active_R if active_count is not None else None)
 
 
 NEWTON_RESIDUAL_MAX = 1.0e-12
@@ -1143,9 +1301,11 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
-    fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
-        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
-    jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
+    fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
+        coeffs, enk_sigma, kgrid, mesh_xy,
+        a_band_index=a_band_index,
+        active_count=(nb_keep if n_guard_bands else None), log_fn=log_fn)
+    jax.block_until_ready((fH_k, fH_R, f_eps, active_R))   # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
     # The top of the fit window is identically invisible to fH at the k where
@@ -1230,26 +1390,41 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     # Sharding specs for batched (bs, rank, rank) → (bs, rank) eigvalsh.
     batch_mat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     batch_eig_shard = NamedSharding(mesh_xy, P(('x', 'y'), None))
+    batch_scalar_shard = NamedSharding(mesh_xy, P(('x', 'y'),))
     face_ij_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    @partial(jax.jit, out_shardings=batch_eig_shard)
-    def _kpath_batch(batch_k, fH_R):
-        # batch_k: (bs, 3) replicated; fH_R: (nk, rank, rank) at P(None,'x','y');
-        # The einsum contracts over the replicated R axis only, so it is local
-        # on each (i, j) tile.
-        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
-        mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R)             # (bs, rank, rank)
-        # Pin the contraction OUTPUT to the (i, j) layout: left free, XLA
-        # materialises the whole (bs, rank, rank) batch on every device before
-        # the reshard below (bs·rank²·16 = 11.4 GiB/device at bs=32/rank 4716).
+    def _fourier_matrix(batch_k, operator_R):
+        """The one path-q contraction for both fH and active character."""
+        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))
+        mat = 0.5 * jnp.einsum(
+            'bk,kij->bij', phase, operator_R, optimize=True)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
-        # Reshard (i,j)→q FIRST, then hermitize: on the q-sharded layout each
-        # device owns whole matrices, so the transpose is local.  The other
-        # order costs a second all-to-all for ``swapaxes``.
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
-        mat = mat + jnp.swapaxes(mat, 1, 2).conj()
+        return mat + jnp.swapaxes(mat, 1, 2).conj()
 
-        return jax.vmap(jnp.linalg.eigvalsh)(mat)
+    if active_R is None:
+        @partial(jax.jit, out_shardings=batch_eig_shard)
+        def _kpath_batch(batch_k, fH_R):
+            # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The R-only
+            # contraction is local, then the one face→q reshard gives each
+            # device a whole matrix for the native eigensolver.
+            mat = _fourier_matrix(batch_k, fH_R)
+            return jax.vmap(jnp.linalg.eigvalsh)(mat)
+    else:
+        @partial(
+            jax.jit,
+            out_shardings=(batch_eig_shard, batch_eig_shard,
+                           batch_scalar_shard, batch_scalar_shard,
+                           batch_eig_shard, batch_eig_shard))
+        def _kpath_batch(batch_k, fH_R, active_R):
+            mat = _fourier_matrix(batch_k, fH_R)
+            active_mat = _fourier_matrix(batch_k, active_R)
+            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            (selected_values, selected_scores, score_gap, score_tol,
+             cluster_values, cluster_mask) = select_active_eigenpairs(
+                 values, vectors, active_mat, nb_keep, n_physical=states)
+            return (selected_values, selected_scores, score_gap, score_tol,
+                    cluster_values, cluster_mask)
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -1310,10 +1485,18 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
         lambda_q_list = []
+        active_selection_list = []
         for i in range(0, nq_padded, batch_size):
-            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
-            lambda_q_list.append(batch_eigs)
-            jax.block_until_ready(batch_eigs)
+            if active_R is None:
+                batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
+                lambda_q_list.append(batch_eigs)
+                jax.block_until_ready(batch_eigs)
+            else:
+                batch_result = _kpath_batch(
+                    wrapped_k[i:i+batch_size], fH_R, active_R)
+                lambda_q_list.append(batch_result[0])
+                active_selection_list.append(batch_result[1:])
+                jax.block_until_ready(batch_result)
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
 
@@ -1345,24 +1528,97 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Values are untouched: ``out_shardings`` moves data, it does not
         # compute.
         # Gate: ``tests/test_htransform_kpath_gates.py``.
-        @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
-                 out_shardings=(rep, rep))
-        def _post_kpath(batches, nq, nb_keep):
-            # The eigensolver returns the complete rank-dimensional spectrum,
-            # including fH's off-grid null carrier.  The archived ZHEEVR call
-            # selects eigenvalues 1..nbnd_window BEFORE Newton inversion; only
-            # these ``states`` eigenvalues correspond to fitted physical
-            # bands.  Inverting the positive/null tail can have df=0 and must
-            # neither fail the global residual nor enter a published file.
-            lambda_q = jnp.concatenate(batches, axis=0)[:nq, :states]
-            energies, inverse_residual = newton_inv(
-                a_f, n_f, shift, lambda_q.real)
-            energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
-            return energies_sorted, inverse_residual
+        if active_R is None:
+            @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
+                     out_shardings=(rep, rep))
+            def _post_kpath(batches, nq, nb_keep):
+                # With no wider fitted guard window, the archived lowest-state
+                # selection remains the complete physical output contract.
+                lambda_q = jnp.concatenate(batches, axis=0)[:nq, :states]
+                energies, inverse_residual = newton_inv(
+                    a_f, n_f, shift, lambda_q.real)
+                energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
+                return energies_sorted, inverse_residual
+        else:
+            @partial(jax.jit, static_argnames=('nq',),
+                     out_shardings=(rep, rep, rep))
+            def _post_active_kpath(batches, selection, nq):
+                lambda_q = jnp.concatenate(batches, axis=0)[:nq]
+                selected_scores = jnp.concatenate(
+                    tuple(x[0] for x in selection), axis=0)[:nq]
+                score_gap = jnp.concatenate(
+                    tuple(x[1] for x in selection), axis=0)[:nq]
+                score_tol = jnp.concatenate(
+                    tuple(x[2] for x in selection), axis=0)[:nq]
+                cluster_lambda = jnp.concatenate(
+                    tuple(x[3] for x in selection), axis=0)[:nq]
+                cluster_mask = jnp.concatenate(
+                    tuple(x[4] for x in selection), axis=0)[:nq]
+
+                energies, inverse_residual = newton_inv(
+                    a_f, n_f, shift, lambda_q.real)
+                cluster_energies, cluster_inverse_residual = newton_inv(
+                    a_f, n_f, shift, cluster_lambda.real)
+                energies_sorted = jnp.sort(energies, axis=1)
+
+                ambiguous = score_gap <= score_tol
+                cluster_min = jnp.min(jnp.where(
+                    cluster_mask, cluster_energies, jnp.inf), axis=1)
+                cluster_max = jnp.max(jnp.where(
+                    cluster_mask, cluster_energies, -jnp.inf), axis=1)
+                cluster_energy_span = jnp.where(
+                    ambiguous, cluster_max - cluster_min, 0.0)
+                unsafe = jnp.logical_and(
+                    ambiguous, cluster_energy_span > DEGENERACY_TOL_RY)
+                min_selected = jnp.min(selected_scores, axis=1)
+                max_rejected = min_selected - score_gap
+                diagnostics = jnp.stack((
+                    jnp.min(score_gap),
+                    jnp.max(score_tol),
+                    jnp.min(min_selected),
+                    jnp.max(max_rejected),
+                    jnp.sum(ambiguous),
+                    jnp.sum(jnp.logical_and(
+                        ambiguous,
+                        cluster_energy_span <= DEGENERACY_TOL_RY)),
+                    jnp.max(jnp.where(
+                        unsafe, cluster_energy_span, 0.0)),
+                ))
+                return (energies_sorted,
+                        jnp.maximum(inverse_residual,
+                                    cluster_inverse_residual),
+                        diagnostics)
 
         _t0 = _perf()                                      # instrument:
-        energies_sorted_jax, inverse_residual = _post_kpath(
-            tuple(lambda_q_list), int(nq), int(nb_keep))
+        if active_R is None:
+            energies_sorted_jax, inverse_residual = _post_kpath(
+                tuple(lambda_q_list), int(nq), int(nb_keep))
+        else:
+            (energies_sorted_jax, inverse_residual,
+             selection_diagnostics) = _post_active_kpath(
+                 tuple(lambda_q_list), tuple(active_selection_list), int(nq))
+            (min_score_gap, max_score_tol, min_selected_character,
+             max_rejected_character, n_ambiguous, n_degenerate_safe,
+             max_unsafe_energy_span) = map(float, selection_diagnostics)
+            log_fn(
+                "  [gate] active/guard character selection: "
+                f"min score gap={min_score_gap:.6e} (max numerical floor "
+                f"{max_score_tol:.6e}); min selected character="
+                f"{min_selected_character:.6e}, max first-rejected "
+                f"character={max_rejected_character:.6e}; "
+                f"numerically tied q={int(n_ambiguous)}, of which "
+                f"energy-degenerate-safe={int(n_degenerate_safe)}")
+            if max_unsafe_energy_span > DEGENERACY_TOL_RY:
+                raise ValueError(
+                    "htransform active-subspace selection is numerically "
+                    "underdetermined: the active/guard character boundary is "
+                    "unresolved while the complete score-tied boundary "
+                    "cluster spans up to "
+                    f"{max_unsafe_energy_span:.6e} Ry, above the canonical "
+                    f"multiplet tolerance {DEGENERACY_TOL_RY:.6e} Ry.  "
+                    "Supply QP U/E through every interleaving guard or widen "
+                    "the active state block; do not publish a round-off-chosen "
+                    "band assignment.")
         energies_on_path = energies_sorted_jax
         require_newton_converged(
             float(inverse_residual), where="htransform path")
@@ -1398,7 +1654,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             # line and the plot markers, no reason for two eager XLA modules.
             _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
             gamma_positions = [int(np.argmin(np.linalg.norm(_k_np, axis=1)))]
-        gamma_exact = np.sort(np.asarray(enk_sigma[:, 0]))[:nb_keep]
+        # The first ``nb_keep`` compact rows ARE the returned active block.
+        # Sorting all fitted energies and truncating here would repeat the
+        # guard-contamination defect in the independent Gamma receipt.
+        gamma_exact = np.sort(np.asarray(enk_sigma[:nb_keep, 0]))
         # Shift all reported energies so VBM is at 0
         if energies_on_path is not None:
             energies_on_path = energies_on_path - fermi_energy

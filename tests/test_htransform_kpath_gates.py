@@ -24,7 +24,10 @@ import pytest
 def _mesh(n=1):
     import jax
     from jax.sharding import Mesh
-    devs = jax.devices()
+    # A one-device submesh must be process-local in a multi-process P4 gate;
+    # ``jax.devices()[0]`` is rank 0's GPU and is non-addressable on ranks 1--3.
+    # The 2x2 case intentionally exercises the global four-device mesh.
+    devs = jax.local_devices() if n == 1 else jax.devices()
     if len(devs) < n * n:
         pytest.skip(f"needs {n * n} devices, have {len(devs)}")
     return Mesh(np.asarray(devs[:n * n]).reshape(n, n), ("x", "y"))
@@ -118,3 +121,130 @@ def test_htransform_carries_no_dense_identity_metric():
     banner = " ".join(lines)
     assert "metric: identity" in banner
     assert "no dense" in banner
+
+
+def test_active_character_follows_state_through_guard_energy_crossing():
+    """A lower DFT guard must not replace a raised active QP state."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import select_active_eigenpairs
+
+    # Active state 2 lies above guard state 1.  Lowest-energy truncation would
+    # return (-3, -2, -1); character selection must return (-3, -2, +1).
+    values = jnp.asarray([[-3.0, -2.0, -1.0, 1.0, 2.0]])
+    vectors = jnp.eye(5, dtype=jnp.complex128)[None]
+    active = jnp.diag(jnp.asarray([1.0, 1.0, 0.0, 1.0, 0.0]))[None]
+    selected, scores, gap, tol, cluster_values, cluster_mask = (
+        select_active_eigenpairs(values, vectors, active, 3))
+
+    np.testing.assert_array_equal(np.asarray(selected), [[-3.0, -2.0, 1.0]])
+    np.testing.assert_array_equal(np.asarray(scores), [[1.0, 1.0, 1.0]])
+    assert float(gap[0]) == 1.0
+    assert float(gap[0]) > float(tol[0])
+    assert not np.any(np.asarray(cluster_mask))
+    assert np.asarray(cluster_values).shape == (1, 5)
+
+
+def test_degenerate_character_boundary_has_invariant_energy_multiset():
+    """A basis rotation at an exact crossing cannot change published energy."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import select_active_eigenpairs
+
+    values = jnp.asarray([[-1.0, 0.0, 0.0, 2.0]])
+    active = np.diag([1.0, 1.0, 0.0, 0.0]).astype(np.complex128)
+    identity = np.eye(4, dtype=np.complex128)
+    angle = np.pi / 4.0
+    rotated = identity.copy()
+    rotated[1:3, 1:3] = [[np.cos(angle), -np.sin(angle)],
+                          [np.sin(angle), np.cos(angle)]]
+
+    outputs = []
+    gaps = []
+    boundaries = []
+    for vectors in (identity, rotated):
+        selected, _scores, gap, tol, cluster_values, cluster_mask = (
+            select_active_eigenpairs(
+                values, jnp.asarray(vectors[None]),
+                jnp.asarray(active[None]), 2))
+        outputs.append(np.asarray(selected))
+        gaps.append(float(gap[0]))
+        boundaries.append(np.asarray(cluster_values)[np.asarray(cluster_mask)])
+        assert float(gap[0]) <= float(tol[0]) or vectors is identity
+
+    np.testing.assert_array_equal(outputs[0], [[-1.0, 0.0]])
+    np.testing.assert_array_equal(outputs[1], [[-1.0, 0.0]])
+    # The unresolved character boundary in the rotated representation lies
+    # wholly inside the zero-energy multiplet, so the energy output is safe.
+    assert gaps[1] <= 1.0e-14
+    np.testing.assert_array_equal(boundaries[1], [0.0, 0.0])
+
+
+def test_null_carrier_character_cannot_displace_a_fitted_state():
+    """Only the fitted physical spectrum participates in state selection."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import select_active_eigenpairs
+
+    values = jnp.asarray([[-3.0, -2.0, -1.0, 0.0]])
+    vectors = jnp.eye(4, dtype=jnp.complex128)[None]
+    # The rank-minus-state null carrier is deliberately assigned the largest
+    # apparent character.  It is not a fitted state and must be sliced out.
+    active = jnp.diag(jnp.asarray([1.0, 1.0, 0.0, 10.0]))[None]
+    selected, *_rest = select_active_eigenpairs(
+        values, vectors, active, 2, n_physical=3)
+    np.testing.assert_array_equal(np.asarray(selected), [[-3.0, -2.0]])
+
+
+def test_character_tie_cluster_includes_every_boundary_member():
+    """Three-way tie red twin: the nondegenerate third member cannot hide."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from bandstructure.htransform import select_active_eigenpairs
+
+    values = jnp.asarray([[-1.0, 0.0, 0.0, 0.1]])
+    vectors = jnp.eye(4, dtype=jnp.complex128)[None]
+    active = jnp.diag(jnp.asarray([1.0, 0.5, 0.5, 0.5]))[None]
+    (_selected, _scores, gap, tol,
+     cluster_values, cluster_mask) = select_active_eigenpairs(
+         values, vectors, active, 2)
+    assert float(gap[0]) <= float(tol[0])
+    tied = np.asarray(cluster_values)[np.asarray(cluster_mask)]
+    np.testing.assert_array_equal(tied, [0.0, 0.0, 0.1])
+    assert float(tied.max() - tied.min()) > 1.0e-3
+
+
+def test_htransform_active_window_beats_lower_guard_on_the_path():
+    """Drive the real fH/FFT/Newton path through the crossing red twin."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from types import SimpleNamespace
+    from bandstructure.htransform import h_transform
+
+    mesh = _mesh(1)
+    nk, states, rank = 2, 6, 8
+    ctilde = np.broadcast_to(
+        np.eye(states, rank, dtype=np.complex128),
+        (nk, states, rank)).copy()
+    # First three rows are the requested active block.  Guard row 3 is lower
+    # than active row 2, while rows 4/5 keep the f-transform shoulder above it.
+    energies = np.broadcast_to(
+        np.asarray([-3.0, -2.0, 1.0, -1.0, 2.0, 3.0])[:, None],
+        (states, nk)).copy()
+    meta = SimpleNamespace(nkx=2, nky=1, nkz=1)
+    wfn = SimpleNamespace(efermi=0.0, nelec=2)
+    kpath = np.asarray([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]])
+    kpath_data = (kpath, np.arange(2.0), [0], ["Gamma"], [0])
+    lines = []
+    with mesh:
+        result = h_transform(
+            meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
+            kpath_data, lines.append, mesh, diagnostics=False,
+            n_return_bands=3)
+
+    # VBM is active row 1 at -2 Ry, so the raised active state appears at +3
+    # Ry.  The old energy truncation published the lower guard at +1 Ry.
+    np.testing.assert_allclose(
+        result["energies_sorted"], [[-1.0, 0.0, 3.0]] * 2,
+        rtol=0.0, atol=2.0e-11)
+    assert "active/guard character selection" in " ".join(lines)
