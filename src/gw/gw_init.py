@@ -1486,12 +1486,16 @@ def _resolve_zeta_fit_contract(
 	# None.  The geometry owner and common loader both route physical band-tile
 	# rounding through runtime.padding.round_up; nothing allocates or compiles.
 	from gw.gflat_memory_model import centroid_fft_tile_geometry
+	from common.wfn_layout import band_sphere_spec
+	from runtime.padding import spec_divisor
 	_loader_band_request = min(
 		int(band_slices.full_range[1] - band_slices.full_range[0]),
 		int(loader_band_chunk))
+	_loader_p_band = spec_divisor(
+		mesh_xy, band_sphere_spec(), axis=1)
 	loader_k_chunk, _ = centroid_fft_tile_geometry(
 		nk=int(meta.nk_tot), band_chunk=_loader_band_request,
-		p_band=int(mesh_xy.size))
+		p_band=_loader_p_band)
 	return _ZetaFitContract(
 		zeta_h5_path=zeta_h5_path,
 		band_range_left=band_range_left,
