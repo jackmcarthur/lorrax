@@ -19,7 +19,7 @@ The fit-loop model is two things summed:
 **stage transients** — each stage adds ONE transient on top; they do not
 co-exist, so the HWM takes a ``max``, not a sum:
 
-    A  centroid load    fit FFT box (nk, bc, ns, n_rtot)      knob: band_chunk
+    A  centroid load    fit FFT box (k_tile, bc, ns, n_rtot)  knob: band_chunk
     B  CCT + Cholesky   C_q + full-(μ,μ) pair density
     C  fit_one_rchunk   slots·(nk,ns²,μ,cr) + Z_q (nq,μ,cr)   knob: chunk_r  ← binder
     D  accumulate       accumulate FFT box (cs, n_rtot)       knob: gflat_chunk_size
@@ -305,6 +305,13 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
 class GFlatChunkPlan:
     """Resolved chunk sizes + per-rank HBM high-water estimate."""
     band_chunk: int
+    #: Outer k tile for the centroid WFN transfer.  This is derived from the
+    #: resolved band tile (not a frontend knob) so the LOCAL flat FFT-row
+    #: batch stays bounded as P changes.
+    centroid_k_chunk: int
+    #: Actual per-rank flat-row extent priced for one centroid FFT batch:
+    #: ``centroid_k_chunk * (band_chunk / P_band)``.
+    centroid_fft_rows_local: int
     r_chunk: int
     n_r_chunks: int
     q_chunk: int
@@ -374,6 +381,8 @@ class GFlatChunkPlan:
                 "hoisted all-band cache" if self.cache_psi_r else
                 "streamed band-chunk FFT (low-memory fallback)"),
             f"    band_chunk    = {self.band_chunk}",
+            f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
+            f"{self.centroid_fft_rows_local} local rows",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
             f"    ζ solve memory = {self.zeta_solve_memory_route}",
@@ -416,7 +425,8 @@ def plan_gflat_chunks(
     distributed_zeta_solve: str = "auto",
     low_mem_bands: bool = False,
 ) -> GFlatChunkPlan:
-    """Pick ``(band_chunk, r_chunk, q_chunk, gflat_chunk_size)`` so the
+    """Pick ``(band_chunk, centroid_k_chunk, r_chunk, q_chunk,
+    gflat_chunk_size)`` so the
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
     ``P_min`` and the binding stage.
 
@@ -539,15 +549,34 @@ def plan_gflat_chunks(
         fit_nb_padded = ((fit_nb + p_xy - 1) // p_xy) * p_xy
         return min(max(bc, p_xy), max(fit_nb_padded, p_xy))
 
-    _fft_box_cache: dict[int, float] = {}
+    def _centroid_fft_geometry(bc: int) -> tuple[int, int]:
+        """Return ``(k_tile, local_flat_rows)`` for Stage A.
+
+        ``bc`` is a mesh-divisible GLOBAL band tile whose local band extent
+        is ``bc / P_band``.  Bound the product of that extent and the outer k
+        tile by the already resolved Stage-A band extent ``bc``.  Therefore a
+        shipping ``band_chunk=16`` means 16 local FFT rows at both P=1
+        (1 k x 16 bands) and P=16 (16 k x 1 band), instead of silently growing
+        to ``nk`` rows as band sharding becomes finer.  This reuses the one
+        existing memory-policy knob; it is not a second planner or a new
+        frontend choice.
+        """
+        bc = int(bc)
+        local_bands = max(1, bc // p_xy)
+        k_tile = min(nk, max(1, bc // local_bands))
+        return k_tile, k_tile * local_bands
+
+    _fft_box_cache: dict[tuple[int, int], float] = {}
 
     def _fft_for_bc(bc: int) -> float:
         bc = int(bc)
-        if bc not in _fft_box_cache:
-            _fft_box_cache[bc] = _fft_box_bytes(
-                nk=nk, bc=bc, ns=ns, fft_grid=fft_grid,
+        k_tile, _ = _centroid_fft_geometry(bc)
+        key = (k_tile, bc)
+        if key not in _fft_box_cache:
+            _fft_box_cache[key] = _fft_box_bytes(
+                nk=k_tile, bc=bc, ns=ns, fft_grid=fft_grid,
                 mesh_xy=mesh_xy, p_xy=p_xy)
-        return _fft_box_cache[bc]
+        return _fft_box_cache[key]
 
     # The full-window decision accounts for both things whose live size the
     # band chunk changes: the ψ(G)->ψ(r) FFT box (Stage A) and Stage C's
@@ -602,6 +631,8 @@ def plan_gflat_chunks(
                 bc *= 2
 
     fft_box_A = _fft_for_bc(band_chunk)
+    centroid_k_chunk, centroid_fft_rows_local = _centroid_fft_geometry(
+        band_chunk)
 
     # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
     # all-P-sharded cache, never a replicated full-window object.  Price its
@@ -861,6 +892,8 @@ def plan_gflat_chunks(
 
     return GFlatChunkPlan(
         band_chunk=int(band_chunk),
+        centroid_k_chunk=int(centroid_k_chunk),
+        centroid_fft_rows_local=int(centroid_fft_rows_local),
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
         q_chunk=int(q_chunk),

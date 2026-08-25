@@ -762,7 +762,7 @@ def _centroid_table_md5(centroid_fft_idx) -> str:
 
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
-                         band_slices, band_chunk_size):
+                         band_slices, band_chunk_size, k_chunk_size=None):
 	"""Sample ψ at the TRANSVERSE centroid set and package it for σ^B.
 
 	This is the whole of ``transverse_wfn_data``: ψ at r_{μ_T} over the
@@ -790,6 +790,7 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			wfn, sym, meta_T, cent_T_idx, cfg.bispinor, mesh_xy,
 			band_range=band_slices.full_range,
 			band_chunk_size=int(band_chunk_size),
+			k_chunk_size=k_chunk_size,
 		)
 	psi_mun_fresh_T = None
 	psi_nmu_fresh_T = None
@@ -1519,7 +1520,7 @@ def _plan_gflat_chunks_for_channel(
 
 	Returns ``(chunks, gflat_plan)`` — ``chunks`` is the plain dict
 	``fit_zeta`` / ``fit_zeta_to_h5`` consume (``band_chunk`` /
-	``chunk_r`` / ``q_chunk`` / ``gflat_chunk_size`` /
+	``centroid_k_chunk`` / ``chunk_r`` / ``q_chunk`` / ``gflat_chunk_size`` /
 	``memory_estimate``); ``gflat_plan`` is the raw
 	:class:`gw.gflat_memory_model.GFlatChunkPlan` for a caller that wants
 	more than the dict exposes.
@@ -1608,6 +1609,7 @@ def _plan_gflat_chunks_for_channel(
 			raise ValueError(_msg)
 	chunks = {
 		'band_chunk': int(gflat_plan.band_chunk),
+		'centroid_k_chunk': int(gflat_plan.centroid_k_chunk),
 		'chunk_r': int(gflat_plan.r_chunk),
 		'q_chunk': int(gflat_plan.q_chunk),
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
@@ -2001,7 +2003,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
 			band_slices,
 			(_chunks_T['band_chunk'] if _chunks_T is not None
-			 else zeta_contract.loader_band_chunk))
+			 else zeta_contract.loader_band_chunk),
+			k_chunk_size=(
+				_chunks_T['centroid_k_chunk']
+				if _chunks_T is not None else None))
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
@@ -2673,6 +2678,9 @@ def prepare_isdf_and_wavefunctions(
 					wfn, sym, meta, centroid_indices, cfg.bispinor, mesh_xy,
 					band_range=band_slices.full_range,
 					band_chunk_size=load_band_chunk,
+					k_chunk_size=(
+						chunks['centroid_k_chunk']
+						if chunks is not None else None),
 				)
 
 			# ``low_mem_bands = true``: convert to the two-face carrier
