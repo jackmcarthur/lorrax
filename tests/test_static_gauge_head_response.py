@@ -180,13 +180,18 @@ def test_static_gauge_response_refuses_missing_physics_provenance(changes, gate)
             _response(mesh, **changes), mesh)
 
 
-def test_full_screened_runtime_refuses_before_opening_a_body_without_artifact():
+@pytest.mark.parametrize("caller_response", (None, "fabricated"))
+def test_full_screened_runtime_refuses_before_opening_a_body(caller_response):
+    mesh = _mesh()
     config = SimpleNamespace(
         head=SimpleNamespace(correction=HeadCorrection.FULL),
     )
-    with pytest.raises(ValueError, match="static_gauge_head_response_missing"):
+    response = None if caller_response is None else _response(mesh)
+    with pytest.raises(
+            ValueError, match="static_gauge_head_response_loader_unavailable"):
         compute_static_photon_response(
-            None, None, None, None, None, _mesh(), config=config,
+            None, None, None, None, None, mesh, config=config,
+            gauge_head_response=response,
         )
 
 

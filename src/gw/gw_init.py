@@ -2264,7 +2264,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                ) as zt3:
 				with mesh_xy:
-					compute_V_q_bispinor_g_flat_to_h5(
+					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
 						zeta_C_loader=zc,
 						zeta_T_loaders=(zt1, zt2, zt3),
 						output_h5_path=bispinor_h5_path,
@@ -2287,13 +2287,19 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 							cfg.head.bispinor_tt_head_correction),
 					)
 
-		# Read CC tile + g0 back for downstream restart-state writer.
+		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
+		# view returned by the same projection that built V; it is deliberately
+		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
+		# source of truth.  The three transverse views have no production
+		# consumer until the authenticated static-gauge artifact loader lands,
+		# so do not pin them through the rest of GW bring-up.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,
 		                      ) as reader:
 			V_q_raw = reader.get_tile(0, 0)
-			G0_all = reader.get_g0_CC()
+		G0_all = photon_g0_vectors[0]
+		del photon_g0_vectors
 		# V_q_raw is on disk at LOGICAL n_rmu (the orchestrator strips
 		# the V-tile pad before write).  In-memory ψ flows at PADDED
 		# n_rmu so the σ_X kernel can broadcast V across G's μ axis.
