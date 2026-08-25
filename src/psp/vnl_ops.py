@@ -25,9 +25,7 @@ import jax.numpy as jnp
 from psp.radial.build_projectors_qe import (
     build_E_blocks_full, pseudo_has_j_channels, pseudo_soc_strength_ry,
 )
-from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-from psp.radial_tables import projector_deriv_table as _projector_deriv_table
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +77,13 @@ class VNLSetup:
     row_l: jax.Array | None = None         # (total_R,) int — angular momentum
     row_m: jax.Array | None = None         # (total_R,) int — m index into S_all[l]
     row_tau: jax.Array | None = None       # (total_R, 3) float — atom position (crystal)
+    # ``(start, stop, channel_index)`` for each independently coupled atom
+    # block.  Low-memory kernels traverse these blocks without ever splitting
+    # a canonical ``ChannelMeta.E`` matrix or inventing a second dense D.
+    coupled_row_blocks: tuple[tuple[int, int, int], ...] = ()
+    # Analytic second radial derivative of the reduced projector form factor.
+    # Kept beside G/Gp so every VNL derivative consumes the same radial owner.
+    Gpp_table: jax.Array | None = None     # (total_nbeta, n_q)
 
 
 @dataclass
@@ -101,6 +106,29 @@ class VNLKData:
     # field documents the layout rather than being a required argument to
     # anything: a kdata from that route is already inert on the pad.
     g_mask: np.ndarray | None = None   # (nG,) float64 or None
+
+
+@dataclass(frozen=True)
+class _VNLProjectorCoefficientBlock:
+    r"""Private in-memory ``<beta|psi>`` operator-derivative carrier.
+
+    It has no G axis and never crosses a public/persistence boundary. A
+    durable carrier would require a canonical k/G/mask/PP/SOC/band-window
+    fingerprint, which no shared artifact contract owns yet.
+    """
+
+    c: jax.Array                    # (R, spin, band)
+    dc_cart: jax.Array              # (cart, R, spin, band)
+    d2c_cart: jax.Array             # (cart, cart, R, spin, band)
+    E: jax.Array
+
+
+@dataclass(frozen=True)
+class VNLGaugeKetDerivatives:
+    """Canonical VNL current/contact action on a two-component ket block."""
+
+    gamma_cart_ket: jax.Array
+    lambda_cart_ket: jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +241,7 @@ def build_vnl_setup(
     nspinor: int | None = None,
     q_max: float | None = None,
     soc: bool | None = None,
+    compute_contact: bool = False,
     print_fn=print,
 ) -> VNLSetup:
     """Build k-independent VNL data: radial tables, channel metadata.
@@ -229,6 +258,10 @@ def build_vnl_setup(
         a QE ``<spinorbit>`` flag and, failing that, keeps the historical
         j-resolved behaviour and ANNOUNCES the assumption.  See
         ``psp.radial.build_projectors_qe`` for why noncolin ≠ lspinorb.
+    compute_contact : bool
+        Opt in to the extra analytic ``G''`` radial table needed by the
+        uniform nonlocal contact.  False by default so existing Hamiltonian,
+        NSCF, and dipole setup pays no l+2 Bessel compilation/pass.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
@@ -268,7 +301,8 @@ def build_vnl_setup(
 
     # Extract species data and projector tables
     species_list = extract_species(pseudos, nspinor=nspinor)
-    tables = build_all_tables(species_list, q_max, n_q)
+    tables = build_all_tables(
+        species_list, q_max, n_q, second_derivatives=compute_contact)
     species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
     q_grid = tables["q"]
     dq = tables["dq"]
@@ -277,6 +311,7 @@ def build_vnl_setup(
     channels: list[ChannelMeta] = []
     G_rows: list[np.ndarray] = []
     Gp_rows: list[np.ndarray] = []
+    Gpp_rows: list[np.ndarray] = []
     beta_idx = 0
 
     for isp, sp in enumerate(species_list):
@@ -312,19 +347,23 @@ def build_vnl_setup(
             for ip in proj_ids:
                 F_vals = tables["proj_tables"][isp][ip]
                 H_vals = tables["deriv_tables"][isp][ip]
+                Gpp_vals = (tables["second_deriv_tables"][isp][ip]
+                            if compute_contact else None)
                 if l == 0:
                     G_vals = F_vals.copy()
                     Gp_vals = -H_vals
                 else:
                     G_vals = np.empty(n_q, dtype=np.float64)
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
-                    G_vals[0] = F_vals[1] / q_grid[1] ** l
+                    G_vals[0] = tables["reduced_origins"][isp][ip]
                     Gp_vals = np.zeros(n_q, dtype=np.float64)
                     Gp_vals[1:] = -H_vals[1:] / q_grid[1:] ** l
                     # q=0 limit of dG_l/dq is 0 (j_{l+1}(qr) ~ q^{l+1}, so
                     # H_{l+1}/q^l → 0 as q → 0).
                 G_rows.append(G_vals)
                 Gp_rows.append(Gp_vals)
+                if compute_contact:
+                    Gpp_rows.append(Gpp_vals)
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
@@ -335,6 +374,10 @@ def build_vnl_setup(
 
     G_table = jnp.asarray(np.stack(G_rows), dtype=jnp.float64) if G_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
     Gp_table = jnp.asarray(np.stack(Gp_rows), dtype=jnp.float64) if Gp_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
+    Gpp_table = (
+        (jnp.asarray(np.stack(Gpp_rows), dtype=jnp.float64)
+         if Gpp_rows else jnp.zeros((0, n_q), dtype=jnp.float64))
+        if compute_contact else None)
     total_R = sum(ch.R * ch.natoms for ch in channels)
     l_max = max((ch.l for ch in channels), default=0)
 
@@ -345,15 +388,21 @@ def build_vnl_setup(
     row_l = []
     row_m = []
     row_tau = []
+    coupled_row_blocks = []
+    row_offset = 0
 
-    for ch in channels:
+    for channel_index, ch in enumerate(channels):
         for a in range(ch.natoms):
+            block_start = row_offset
             for ib in range(ch.nbeta):
                 for im in range(ch.msize):
                     row_beta_idx.append(ch.beta_table_start + ib)
                     row_l.append(ch.l)
                     row_m.append(im)
                     row_tau.append(ch.tau[a])
+                    row_offset += 1
+            coupled_row_blocks.append(
+                (block_start, row_offset, channel_index))
 
     row_beta_idx_j = jnp.asarray(row_beta_idx, dtype=jnp.int32)
     row_l_j = jnp.asarray(row_l, dtype=jnp.int32)
@@ -382,6 +431,8 @@ def build_vnl_setup(
         E_super=E_super_j, l_max=l_max, soc=bool(soc_resolved),
         row_beta_idx=row_beta_idx_j,
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
+        coupled_row_blocks=tuple(coupled_row_blocks),
+        Gpp_table=Gpp_table,
     )
 
 
@@ -432,6 +483,14 @@ def _interp_with_deriv_jvp(primals, tangents):
     val = _table_interp(q, dq, table)
     slope = _table_interp(q, dq, deriv_table)
     return val, slope * q_dot
+
+
+def _reduced_radial_values_on_cart(K_cart, dq, table):
+    """Exact-origin reduced radial values shared by H and gauge vertices."""
+    q2 = jnp.sum(K_cart * K_cart, axis=1)
+    q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
+    q = jnp.where(q2 > 0.0, q_safe, 0.0)
+    return _table_interp(q, dq, table)
 
 
 # ---------------------------------------------------------------------------
@@ -492,9 +551,9 @@ def build_vnl_kdata_from_kvec(
     compute_dZ: bool = False,
 ) -> VNLKData:
     """Build dense Z [and dZ] from explicit k-vector + G-list (no SymMaps)."""
-    return _build_vnl_kdata_core(np.asarray(kvec, dtype=float),
-                                  np.asarray(Gk_int, dtype=int),
-                                  setup, compute_dZ=compute_dZ)
+    return _build_vnl_kdata_core(
+        np.asarray(kvec, dtype=float), np.asarray(Gk_int, dtype=int),
+        setup, compute_dZ=compute_dZ)
 
 
 def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
@@ -520,7 +579,7 @@ def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
 @functools.partial(jax.jit, static_argnames=('l_max',))
 def _assemble_Z_jit(
     kvec, Gk_int,
-    B, dq, G_table, Gp_table, prefactor,
+    B, dq, G_table, prefactor,
     row_beta_idx, row_l, row_m, row_tau,
     *, l_max,
 ):
@@ -537,21 +596,13 @@ def _assemble_Z_jit(
     doesn't enter the jit.  ``l_max`` is the only static arg (it
     controls the unrolled solid-harmonics block).
     """
-    from psp.radial.solid_harmonics import all_solid_harmonics
-
     K_crys = Gk_int.astype(jnp.float64) + kvec[None, :]
     K_cart = K_crys @ B
-    # Regularizer: avoids 1/q divergence in autodiff.  See
-    # _build_vnl_kdata_core for the full physics rationale.
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
-    G_all = _interp_with_deriv(q, dq, G_table, Gp_table)        # (total_nbeta, nG)
-    S_all = all_solid_harmonics(K_cart, l_max=l_max)            # (l_max+1, 2*l_max+1, nG)
-
-    G_r = G_all[row_beta_idx]                                    # (total_R, nG)
-    S_r = S_all[row_l, row_m]                                    # (total_R, nG)
-    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T     # (total_R, nG)
-    c_il_r = prefactor * (1j) ** row_l                           # (total_R,)
-    return c_il_r[:, None] * G_r * S_r * phase_r                 # (total_R, nG)
+    G_all = _reduced_radial_values_on_cart(
+        K_cart, dq, G_table)                                  # (total_nbeta, nG)
+    return _assemble_projector_rows(
+        K_crys, K_cart, G_all, prefactor,
+        row_beta_idx, row_l, row_m, row_tau, l_max=l_max)
 
 
 def _build_vnl_kdata_core(
@@ -581,7 +632,7 @@ def _build_vnl_kdata_core(
             jnp.asarray(Gk_np, dtype=jnp.int32),
             jnp.asarray(setup.B, dtype=jnp.float64),
             jnp.asarray(setup.dq, dtype=jnp.float64),
-            setup.G_table, setup.Gp_table,
+            setup.G_table,
             jnp.asarray(setup.prefactor, dtype=jnp.float64),
             setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
             l_max=int(setup.l_max),
@@ -596,9 +647,12 @@ def _build_vnl_kdata_core(
     K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]
     B_j = jnp.asarray(setup.B, dtype=jnp.float64)
     K_cart = K_crys @ B_j
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
+    q2 = jnp.sum(K_cart ** 2, axis=1)
+    q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
+    q = jnp.where(q2 > 0.0, q_safe, 0.0)
 
-    G_all = _interp_with_deriv(q, setup.dq, setup.G_table, setup.Gp_table)
+    G_all = _reduced_radial_values_on_cart(
+        K_cart, setup.dq, setup.G_table)
     S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)
 
     G_r = G_all[setup.row_beta_idx]
@@ -611,7 +665,8 @@ def _build_vnl_kdata_core(
     # dZ for velocity (optional — still uses per-channel JVP, TODO: vectorize)
     dZ_j = None
     if compute_dZ:
-        K_over_q = K_cart / q[:, None]
+        K_over_q = jnp.where(
+            q2[:, None] > 0.0, K_cart / q_safe[:, None], 0.0)
         Gp_all = _table_interp(q, setup.dq, setup.Gp_table)
         dZ_blocks = []
         for ch in setup.channels:
@@ -667,6 +722,387 @@ def _build_vnl_kdata_core(
         Z=Z, E_super=setup.E_super, nG=nG,
         total_R=setup.total_R, dZ=dZ_j,
     )
+
+
+# ---------------------------------------------------------------------------
+# Uniform-gauge derivatives — canonical rows, bounded private coefficients
+# ---------------------------------------------------------------------------
+
+_FINITE_Q_GATE = "EM-VERTEX-FINITE-Q-WILSON"
+
+
+def require_uniform_gauge_transfer(
+    q_cart_bohr_inv=(0.0, 0.0, 0.0), *, caller: str,
+) -> None:
+    """One fail-closed boundary for the still-unbound finite-q VNL path."""
+    q = np.asarray(q_cart_bohr_inv, dtype=np.float64)
+    if q.shape != (3,):
+        raise ValueError(
+            f"{caller}: q_cart_bohr_inv must have shape (3,), got {q.shape}")
+    if not np.array_equal(q, np.zeros(3, dtype=np.float64)):
+        raise NotImplementedError(
+            f"GATE {_FINITE_Q_GATE}: got q_cart_bohr_inv={q.tolist()}; "
+            "only exact uniform q=0 is bound. A finite-q nonlocal "
+            "pseudopotential vertex requires the repository-selected "
+            "Wilson-line/path prescription.")
+
+
+@jax.custom_jvp
+def _interp_reduced_on_cart(K_cart, dq, table, dtable, d2table):
+    """Exact-origin reduced radial table with physical Cartesian JVPs."""
+    return _reduced_radial_values_on_cart(K_cart, dq, table)
+
+
+@_interp_reduced_on_cart.defjvp
+def _interp_reduced_on_cart_jvp(primals, tangents):
+    K_cart, dq, table, dtable, d2table = primals
+    dK_cart, _, _, _, _ = tangents
+    q2 = jnp.sum(K_cart * K_cart, axis=1)
+    q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
+    q = jnp.where(q2 > 0.0, q_safe, 0.0)
+    value = _reduced_radial_values_on_cart(K_cart, dq, table)
+    radial_prime = _interp_with_deriv(q, dq, dtable, d2table)
+    radial_second = _table_interp(q, dq, d2table)
+    radial_prime_over_q = jnp.where(
+        q2[None, :] > 0.0,
+        radial_prime / q_safe[None, :],
+        radial_second)
+    tangent = radial_prime_over_q * jnp.sum(
+        K_cart * dK_cart, axis=1)[None, :]
+    return value, tangent
+
+
+def _assemble_projector_rows(
+    K_crys, K_cart, G_all, prefactor,
+    row_beta_idx, row_l, row_m, row_tau, *, l_max,
+):
+    """The single flattened production projector-row spelling."""
+    from psp.radial.solid_harmonics import all_solid_harmonics
+
+    S_all = all_solid_harmonics(K_cart, l_max=l_max)
+    G_r = G_all[row_beta_idx]
+    S_r = S_all[row_l, row_m]
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T
+    c_il_r = prefactor * (1j) ** row_l
+    return c_il_r[:, None] * G_r * S_r * phase_r
+
+
+def _assemble_uniform_projector_rows(
+    k_crys, G_int, setup: VNLSetup,
+    row_beta_idx, row_l, row_m, row_tau,
+):
+    """Gauge-differentiable view of the canonical flattened row owner."""
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
+    K_cart = K_crys @ B
+    G_all = _interp_reduced_on_cart(
+        K_cart, jnp.asarray(setup.dq), setup.G_table, setup.Gp_table,
+        setup.Gpp_table)
+    return _assemble_projector_rows(
+        K_crys, K_cart, G_all, jnp.asarray(setup.prefactor),
+        row_beta_idx, row_l, row_m, row_tau, l_max=int(setup.l_max))
+
+
+def _projector_derivatives_cartesian_rows(
+    k_crys, G_chunk, setup: VNLSetup,
+    row_beta_idx, row_l, row_m, row_tau, g_mask, row_mask,
+):
+    """Z/dZ/d2Z for one fixed-shape row/G scan tile."""
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    Binv = jnp.linalg.inv(B)
+
+    def z_at_cart_shift(delta_cart):
+        shifted_k = k_crys + delta_cart @ Binv
+        return _assemble_uniform_projector_rows(
+            shifted_k, G_chunk, setup,
+            row_beta_idx, row_l, row_m, row_tau)
+
+    zero = jnp.zeros((3,), dtype=jnp.float64)
+    Z = z_at_cart_shift(zero)
+    dZ = jnp.moveaxis(jax.jacfwd(z_at_cart_shift)(zero), -1, 0)
+    d2_raw = jax.jacfwd(jax.jacfwd(z_at_cart_shift))(zero)
+    d2Z = jnp.moveaxis(d2_raw, (-2, -1), (0, 1))
+    mask = (
+        row_mask[:, None].astype(Z.real.dtype)
+        * g_mask[None, :].astype(Z.real.dtype))
+    return (
+        Z * mask,
+        dZ * mask[None, :, :],
+        d2Z * mask[None, None, :, :],
+    )
+
+
+def _contract_projector_coefficients(psi_G, Z, dZ, d2Z, E):
+    """Contract one G tile into the private low-rank coefficient carrier."""
+    return _VNLProjectorCoefficientBlock(
+        c=jnp.einsum("RG,nsG->Rsn", jnp.conj(Z), psi_G, optimize=True),
+        dc_cart=jnp.einsum(
+            "aRG,nsG->aRsn", jnp.conj(dZ), psi_G, optimize=True),
+        d2c_cart=jnp.einsum(
+            "abRG,nsG->abRsn", jnp.conj(d2Z), psi_G, optimize=True),
+        E=E,
+    )
+
+
+def _coupled_projector_coefficients(block):
+    """Apply the canonical PP/SOC E block once to c/dc/d2c."""
+    E = block.E
+    Ec = jnp.einsum("stRQ,Qtn->Rsn", E, block.c, optimize=True)
+    Edc = jnp.einsum(
+        "stRQ,aQtn->aRsn", E, block.dc_cart, optimize=True)
+    Ed2c = jnp.einsum(
+        "stRQ,abQtn->abRsn", E, block.d2c_cart, optimize=True)
+    return Ec, Edc, Ed2c
+
+
+def _apply_vnl_gauge_from_coefficients(block, Z, dZ, d2Z):
+    """Re-expand current/contact only where a G-space action is requested."""
+    Ec, Edc, Ed2c = _coupled_projector_coefficients(block)
+    gamma = (
+        jnp.einsum("aRG,Rsn->ansG", dZ, Ec, optimize=True)
+        + jnp.einsum("RG,aRsn->ansG", Z, Edc, optimize=True))
+    contact = (
+        jnp.einsum("abRG,Rsn->abnsG", d2Z, Ec, optimize=True)
+        + jnp.einsum("aRG,bRsn->abnsG", dZ, Edc, optimize=True)
+        + jnp.einsum("bRG,aRsn->abnsG", dZ, Edc, optimize=True)
+        + jnp.einsum("RG,abRsn->abnsG", Z, Ed2c, optimize=True))
+    return VNLGaugeKetDerivatives(
+        gamma_cart_ket=gamma, lambda_cart_ket=contact)
+
+
+def _coupled_projector_row_blocks(setup: VNLSetup, max_rows: int):
+    """Validate and return each canonical coupled block exactly once."""
+    if int(max_rows) <= 0:
+        raise ValueError("projector_row_chunk must be positive")
+    blocks = tuple(setup.coupled_row_blocks)
+    if int(setup.total_R) and not blocks:
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-ROW-PROVENANCE: rebuild VNLSetup with "
+            "canonical coupled_row_blocks")
+    expected = 0
+    normalized = []
+    for raw_block in blocks:
+        if len(raw_block) != 3:
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-ROW-PROVENANCE: coupled blocks must "
+                "carry (start,stop,channel_index)")
+        block_start, block_stop, channel_index = raw_block
+        start, stop = int(block_start), int(block_stop)
+        ich = int(channel_index)
+        if start != expected or stop <= start:
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-ROW-COVERAGE: coupled blocks must "
+                f"cover [0,total_R) once; expected {expected}, got "
+                f"({start},{stop})")
+        if ich < 0 or ich >= len(setup.channels):
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: invalid channel index "
+                f"{ich} for {len(setup.channels)} channels")
+        expected_width = int(setup.channels[ich].R)
+        if stop - start != expected_width:
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: coupled row width "
+                f"{stop - start} does not match ChannelMeta.R="
+                f"{expected_width} for channel {ich}")
+        if stop - start > int(max_rows):
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-ROW-CHUNK: a coupled projector block "
+                f"has {stop - start} rows, exceeding projector_row_chunk="
+                f"{int(max_rows)}; splitting its PP/SOC E block is forbidden")
+        normalized.append((start, stop, ich))
+        expected = stop
+    if expected != int(setup.total_R):
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-ROW-COVERAGE: coupled blocks end at "
+            f"{expected}, total_R={int(setup.total_R)}")
+
+    cursor = 0
+    for start, stop, _ in normalized:
+        if start != cursor or stop <= start:
+            raise AssertionError(
+                "internal VNL row packer produced a gap/overlap/duplicate")
+        cursor = stop
+    if cursor != int(setup.total_R):
+        raise AssertionError("internal VNL row packer lost projector rows")
+    return tuple(normalized)
+
+
+def _compact_channel_couplings(setup: VNLSetup, row_width: int):
+    """Stack canonical ``ChannelMeta.E`` blocks at one bounded scan shape.
+
+    There is one compact entry per channel, not one ``total_R x total_R``
+    matrix and not one duplicate per atom.  ``E_super`` remains the ordinary
+    Hamiltonian owner's derived dense representation; this gauge action never
+    pads or copies it.
+    """
+    blocks = []
+    for ich, channel in enumerate(setup.channels):
+        E = jnp.asarray(channel.E[:2, :2], dtype=jnp.complex128)
+        R = int(channel.R)
+        if E.shape != (2, 2, R, R):
+            raise ValueError(
+                "GATE EM-VERTEX-VNL-E-PROVENANCE: ChannelMeta.E for "
+                f"channel {ich} has shape {E.shape}, expected (2,2,{R},{R})")
+        blocks.append(jnp.pad(
+            E, ((0, 0), (0, 0), (0, row_width - R),
+                (0, row_width - R))))
+    return jnp.stack(blocks, axis=0)
+
+
+def apply_uniform_vnl_derivatives_to_ket(
+    psi_G,
+    G_int,
+    k_crys,
+    setup: VNLSetup,
+    g_mask,
+    *,
+    q_cart_bohr_inv=(0.0, 0.0, 0.0),
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+) -> VNLGaugeKetDerivatives:
+    r"""Apply uniform VNL Gamma/Lambda with bounded row and G carriers.
+
+    ``psi_G`` must be the explicit two-component large-component block
+    ``Psi_L=(band,2,G)``. Four-component input refuses; the named bispinor
+    owner must slice once before entering this Pauli pseudopotential API.
+
+    One fixed-shape outer ``lax.scan`` traverses packed complete E blocks.
+    Two inner G scans first accumulate private ``c/dc/d2c`` and then
+    re-expand the action. No full-G Z/dZ/d2Z or band-square matrix exists.
+    """
+    require_uniform_gauge_transfer(
+        q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
+    psi = jnp.asarray(psi_G)
+    G = jnp.asarray(G_int, dtype=jnp.int32)
+    mask = jnp.asarray(g_mask, dtype=jnp.float64)
+    if psi.ndim != 3 or int(psi.shape[1]) != 2:
+        raise ValueError(
+            "GATE EM-VERTEX-LARGE-COMPONENTS: expected explicit Psi_L "
+            f"with shape (band,2,G), got {tuple(psi.shape)}")
+    if int(setup.nspinor) != 2:
+        raise ValueError(
+            "GATE EM-VERTEX-PAULI-VNL: VNLSetup.nspinor must be 2, got "
+            f"{int(setup.nspinor)}")
+    if setup.Gpp_table is None:
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-GPP-MISSING: rebuild VNLSetup with "
+            "compute_contact=True")
+    if (setup.row_beta_idx is None or setup.row_l is None
+            or setup.row_m is None
+            or setup.row_tau is None):
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-SETUP: incomplete canonical VNLSetup")
+    if G.shape != (psi.shape[-1], 3) or mask.shape != (psi.shape[-1],):
+        raise ValueError(
+            "paired G/mask/Psi_L mismatch: got "
+            f"G={G.shape}, mask={mask.shape}, psi={psi.shape}")
+    if int(g_chunk) <= 0:
+        raise ValueError("g_chunk must be positive")
+
+    nband, nG = int(psi.shape[0]), int(psi.shape[-1])
+    gstep = int(g_chunk)
+    ncarrier = ((nG + gstep - 1) // gstep) * gstep
+    gpad = ncarrier - nG
+    psi_pad = jnp.pad(psi, ((0, 0), (0, 0), (0, gpad)))
+    G_pad = jnp.pad(G, ((0, gpad), (0, 0)))
+    mask_pad = jnp.pad(mask, (0, gpad))
+    nchunk = ncarrier // gstep
+    psi_chunks = jnp.moveaxis(
+        psi_pad.reshape(nband, 2, nchunk, gstep), 2, 0)
+    G_chunks = G_pad.reshape(nchunk, gstep, 3)
+    mask_chunks = mask_pad.reshape(nchunk, gstep)
+
+    gamma_zero = jnp.zeros((3, nband, 2, ncarrier), dtype=psi.dtype)
+    contact_zero = jnp.zeros(
+        (3, 3, nband, 2, ncarrier), dtype=psi.dtype)
+    row_blocks = _coupled_projector_row_blocks(
+        setup, int(projector_row_chunk))
+    if not row_blocks:
+        return VNLGaugeKetDerivatives(
+            gamma_cart_ket=gamma_zero[..., :nG],
+            lambda_cart_ket=contact_zero[..., :nG])
+
+    row_width = max(stop - start for start, stop, _ in row_blocks)
+    row_starts = jnp.asarray(
+        [start for start, _, _ in row_blocks], jnp.int32)
+    row_lengths = jnp.asarray(
+        [stop - start for start, stop, _ in row_blocks], jnp.int32)
+    row_channels = jnp.asarray(
+        [channel for _, _, channel in row_blocks], jnp.int32)
+    row_beta_padded = jnp.pad(setup.row_beta_idx, (0, row_width))
+    row_l_padded = jnp.pad(setup.row_l, (0, row_width))
+    row_m_padded = jnp.pad(setup.row_m, (0, row_width))
+    row_tau_padded = jnp.pad(setup.row_tau, ((0, row_width), (0, 0)))
+    channel_E = _compact_channel_couplings(setup, row_width)
+
+    def row_pass(total, row_spec):
+        row_start, row_length, row_channel = row_spec
+        row_beta = jax.lax.dynamic_slice_in_dim(
+            row_beta_padded, row_start, row_width, axis=0)
+        row_l = jax.lax.dynamic_slice_in_dim(
+            row_l_padded, row_start, row_width, axis=0)
+        row_m = jax.lax.dynamic_slice_in_dim(
+            row_m_padded, row_start, row_width, axis=0)
+        row_tau = jax.lax.dynamic_slice_in_dim(
+            row_tau_padded, row_start, row_width, axis=0)
+        row_mask = jnp.arange(row_width, dtype=jnp.int32) < row_length
+        E_block = channel_E[row_channel]
+        E_block = E_block * (
+            row_mask[None, None, :, None]
+            * row_mask[None, None, None, :]).astype(E_block.dtype)
+        coeff_zero = (
+            jnp.zeros((row_width, 2, nband), dtype=psi.dtype),
+            jnp.zeros((3, row_width, 2, nband), dtype=psi.dtype),
+            jnp.zeros((3, 3, row_width, 2, nband), dtype=psi.dtype),
+        )
+
+        def coefficient_pass(carry, xs):
+            psi_part, G_part, mask_part = xs
+            Z, dZ, d2Z = _projector_derivatives_cartesian_rows(
+                k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
+                mask_part, row_mask)
+            part = _contract_projector_coefficients(
+                psi_part, Z, dZ, d2Z, E_block)
+            return (
+                carry[0] + part.c,
+                carry[1] + part.dc_cart,
+                carry[2] + part.d2c_cart,
+            ), None
+
+        coefficient_arrays, _ = jax.lax.scan(
+            coefficient_pass, coeff_zero,
+            (psi_chunks, G_chunks, mask_chunks), unroll=1)
+        coefficients = _VNLProjectorCoefficientBlock(
+            c=coefficient_arrays[0], dc_cart=coefficient_arrays[1],
+            d2c_cart=coefficient_arrays[2], E=E_block)
+
+        def expansion_pass(carry, xs):
+            G_part, mask_part = xs
+            Z, dZ, d2Z = _projector_derivatives_cartesian_rows(
+                k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
+                mask_part, row_mask)
+            out = _apply_vnl_gauge_from_coefficients(
+                coefficients, Z, dZ, d2Z)
+            return carry, (out.gamma_cart_ket, out.lambda_cart_ket)
+
+        _, (gamma_chunks, contact_chunks) = jax.lax.scan(
+            expansion_pass, None, (G_chunks, mask_chunks), unroll=1)
+        gamma_block = jnp.transpose(
+            gamma_chunks, (1, 2, 3, 0, 4)).reshape(
+                3, nband, 2, ncarrier)
+        contact_block = jnp.transpose(
+            contact_chunks, (1, 2, 3, 4, 0, 5)).reshape(
+                3, 3, nband, 2, ncarrier)
+        gamma_total, contact_total = total
+        return (gamma_total + gamma_block,
+                contact_total + contact_block), None
+
+    (gamma, contact), _ = jax.lax.scan(
+        row_pass, (gamma_zero, contact_zero),
+        (row_starts, row_lengths, row_channels), unroll=1)
+    return VNLGaugeKetDerivatives(
+        gamma_cart_ket=gamma[..., :nG],
+        lambda_cart_ket=contact[..., :nG])
 
 
 # ---------------------------------------------------------------------------

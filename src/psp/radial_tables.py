@@ -98,6 +98,53 @@ def projector_deriv_table(sp: SpeciesData, ip: int, q: np.ndarray) -> np.ndarray
     return deriv
 
 
+def _odd_double_factorial(n: int) -> float:
+    """Return ``n!!`` for positive odd ``n`` (and ``(-1)!! = 1``)."""
+    value = 1
+    for factor in range(n, 0, -2):
+        value *= factor
+    return float(value)
+
+
+def projector_reduced_origin(sp: SpeciesData, ip: int) -> float:
+    r"""Exact regular value ``lim_(q->0) F_l(q)/q^l`` as a radial moment."""
+    l = int(sp.proj_l[ip])
+    weights = _simpson_weights(len(sp.r)) * sp.rab
+    moment = np.sum(
+        np.asarray(sp.beta_r[ip], dtype=np.float64)
+        * sp.r ** (l + 2) * weights)
+    return float(moment / _odd_double_factorial(2 * l + 1))
+
+
+def _reduced_projector_second_derivative(
+    q: np.ndarray,
+    l: int,
+    H_lp1: np.ndarray,
+    J_lp2: np.ndarray,
+    origin_moment: float,
+) -> np.ndarray:
+    r"""Canonical Bessel-recurrence algebra for ``d2(F_l/q^l)/dq2``.
+
+    ``H_lp1 = int beta(r) j_(l+1)(qr) r^2 dr`` and
+    ``J_lp2 = int r beta(r) j_(l+2)(qr) r^2 dr``.  For ``q > 0``,
+
+    ``G_l'' = J_(l+2)/q^l - H_(l+1)/q^(l+1)``.
+
+    The two terms have a finite analytic limit at the origin.  Evaluating
+    that limit as the radial moment, instead of subtracting singular terms,
+    is essential for the exact Gamma-point Hessian.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    out = np.empty_like(H_lp1, dtype=np.float64)
+    nonzero = q > 0.0
+    out[nonzero] = (
+        J_lp2[nonzero] / q[nonzero] ** l
+        - H_lp1[nonzero] / q[nonzero] ** (l + 1)
+    )
+    out[~nonzero] = -origin_moment / _odd_double_factorial(2 * l + 3)
+    return out
+
+
 def alpha_z(sp: SpeciesData, vol: float) -> float:
     """G=0 local potential: (4π/Ω) ∫ r·[r·V_loc(r) + Z·e²] rab dr."""
     e2 = 2.0
@@ -128,12 +175,15 @@ def build_all_tables(
     species_list: list[SpeciesData],
     q_max: float,
     n_q: int = 4000,
+    *,
+    second_derivatives: bool = False,
 ) -> dict:
     """Build Hankel tables for all species on a uniform q-grid.
 
     Per-species the per-projector forward (F_l) and analytic-deriv
     raw-Hankel (H_{l+1}) tables are produced in two batched JAX kernel
-    invocations — one per unique l (resp. l+1).  All Bessel evaluation
+    families — one per unique l (resp. l+1).  Contact setup adds the
+    opt-in l+2 family.  All Bessel evaluation
     + integrand reduction lives on GPU; only the (n_proj_s, n_q)
     result moves back to host.  Replaces a per-projector scipy.special
     .spherical_jn call site (~10 s total on MoS2) with ~1 s of GPU
@@ -146,10 +196,17 @@ def build_all_tables(
       nlcc : (n_species, n_q) core density tables       (l=0 Hankel)
       has_vloc, has_nlcc : (n_species,) bool
       proj_tables   : list of (n_proj_s, n_q) — F_l(q) per species
+      reduced_origins : list of (n_proj_s,) — exact regular
+                       ``lim_(q->0) F_l/q^l`` radial moments.
       deriv_tables  : list of (n_proj_s, n_q) — raw H_{l+1}(β; q) per
                        species, the *unscaled* integral that
                        projector_deriv_table normalises by /q^l.  Caller
                        (build_vnl_setup) does the q^l division.
+      second_deriv_tables : list of (n_proj_s, n_q) or None — analytic
+                       ``d2(F_l/q^l)/dq2``, including the exact regular
+                       radial-moment value at q=0.  Built only when
+                       ``second_derivatives=True`` so ordinary Hamiltonian
+                       setup does not pay the extra l+2 Bessel pass.
     """
     import jax.numpy as jnp
     from psp.radial.radial_jax import spherical_hankel_table_batch_jax
@@ -163,7 +220,9 @@ def build_all_tables(
     has_vloc = np.ones(n_sp, dtype=bool)
     has_nlcc = np.zeros(n_sp, dtype=bool)
     proj_tables = []
+    reduced_origins = []
     deriv_tables = []
+    second_deriv_tables = [] if second_derivatives else None
 
     e2 = 2.0
     for i, sp in enumerate(species_list):
@@ -218,11 +277,38 @@ def build_all_tables(
             )
             H_table[idx] = np.asarray(H_block)
 
+        if second_derivatives:
+            J_table = np.zeros((n_proj, n_q), dtype=np.float64)
+            # Second derivative recurrence: J_{l+2} uses r*beta(r).
+            for l_val in np.unique(ls + 2):
+                idx = np.where(ls + 2 == l_val)[0]
+                J_block = spherical_hankel_table_batch_jax(
+                    int(l_val), r_j,
+                    jnp.asarray(beta_full[idx] * sp.r[None, :],
+                                dtype=jnp.float64),
+                    q_j, w_j,
+                )
+                J_table[idx] = np.asarray(J_block)
+
+            Gpp_table = np.empty_like(F_table)
+            for ip, l_val in enumerate(ls):
+                origin_moment = float(np.sum(
+                    beta_full[ip] * sp.r ** (int(l_val) + 3) * weights_np))
+                Gpp_table[ip] = _reduced_projector_second_derivative(
+                    q, int(l_val), H_table[ip], J_table[ip], origin_moment)
+
         proj_tables.append(F_table)
+        reduced_origins.append(np.asarray([
+            projector_reduced_origin(sp, ip) for ip in range(n_proj)
+        ], dtype=np.float64))
         deriv_tables.append(H_table)
+        if second_derivatives:
+            second_deriv_tables.append(Gpp_table)
 
     return dict(q=q, dq=float(q[1] - q[0]) if n_q > 1 else 1.0,
                 vloc=vloc, nlcc=nlcc,
                 has_vloc=has_vloc, has_nlcc=has_nlcc,
                 proj_tables=proj_tables,
-                deriv_tables=deriv_tables)
+                reduced_origins=reduced_origins,
+                deriv_tables=deriv_tables,
+                second_deriv_tables=second_deriv_tables)
