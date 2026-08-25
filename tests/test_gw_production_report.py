@@ -157,6 +157,9 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "QP gap         : 0.40000 eV (insulating)" in text
     assert "Gap correction : +0.00000 eV relative to DFT" in text
     assert "Quasiparticle energies" not in text
+    assert "cuFFT flat-k FFI" in text
+    assert "cuFFT pair-convolution FFI" in text
+    assert "mklfft" not in text
     gemm_line = next(line for line in text.splitlines()
                      if "LORRAX_BANDS_GEMM_FFI" in line)
     assert "= NATIVE" in gemm_line

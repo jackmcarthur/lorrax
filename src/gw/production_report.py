@@ -193,6 +193,18 @@ class GWProductionReport:
             "LORRAX_CONV_KPAIR_FFI": "pair-density convolution forming V(q)",
             "LORRAX_CONV_KMINOR_FFI": "fused convolution in ladder-W",
         }
+        cuda_engines = {
+            "LORRAX_FFT_FFI": "cuFFT flat-k FFI",
+            "LORRAX_FFT_FFI_FUSED": "cuFFT fused-convolution FFI",
+            "LORRAX_CONV_KPAIR_FFI": "cuFFT pair-convolution FFI",
+            "LORRAX_CONV_KMINOR_FFI": "cuFFT k-minor convolution FFI",
+        }
+        host_engines = {
+            # The host FFT target resolves its linked FFTW3-ABI engine inside
+            # the library; RuntimeFacts intentionally does not guess a vendor.
+            "LORRAX_FFT_FFI": "host flat-k FFT FFI",
+            "LORRAX_FFT_FFI_FUSED": "host fused-convolution FFI",
+        }
         for dial in f.get("ffi_dials", ()):
             name = str(dial.get("env", ""))
             if name not in relevant:
@@ -203,7 +215,10 @@ class GWProductionReport:
                 implementation = str(dial.get("off_label") or "JAX/XLA lowering")
             elif dial.get("enabled"):
                 state = "ON"
-                implementation = str(dial.get("target") or "platform FFI kernel")
+                engine_names = (cuda_engines if platform == "CUDA"
+                                else host_engines)
+                implementation = engine_names.get(
+                    name, str(dial.get("target") or "platform FFI kernel"))
             else:
                 state = "OFF"
                 implementation = str(dial.get("off_label") or "default lowering")
