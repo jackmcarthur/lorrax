@@ -31,7 +31,14 @@ Public API (per-component builders):
 
 Public API (velocity / dipole, autodiff through V_NL):
   vnl_matrix_at_k       — V_NL as pure function of k (jax.jacfwd-able)
+  vnl_projector_coefficients_k
+                        — low-rank <beta|psi> and its first/second derivatives
+  vnl_matrix_derivatives_from_projector_coefficients
+                        — V_NL, dV_NL/dk and d2V_NL/dk2 without G re-expansion
   velocity_matrix_k     — dH/dk = 2(k+G) + dV_NL/dk
+  static_gauge_vertices_matrix_k
+                        — uniform Gamma=dH/dk and Lambda=d2H/dk2, with a
+                          fail-closed finite-q nonlocal-gauge boundary
   compute_dipole_all    — batch velocity matrix elements for all k-points
 
 V_scf = V_loc + V_H + V_xc is a single (nx,ny,nz) real-space potential.
@@ -946,6 +953,10 @@ from psp.radial.radial_jax import (
     differentiate_uniform_table,
     interp_uniform_jax,
 )
+from psp.vnl_ops import (
+    VNLMatrixDerivatives,
+    VNLProjectorCoefficientBlock,
+)
 
 
 # --- VNL channel data (k-independent, for autodiff path) -----------------
@@ -1120,15 +1131,15 @@ def vnl_matrix_at_k(k_crys, psi_G, G_int, B, channels):
     K_cart = K_crys @ B
     nb = psi_G.shape[0]
     V_NL = jnp.zeros((nb, nb), dtype=jnp.complex128)
+    import psp.vnl_ops as vnl_ops
 
     for ch in channels:
         Z = _build_Z_channel_jax(K_crys, K_cart, ch)
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', ch.E, proj, optimize=True)
-        vnl_G = jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
-        V_NL = V_NL + jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G), vnl_G, optimize=True,
-        )
+        block = vnl_ops.contract_projector_coefficients(
+            psi_G, Z, ch.E)
+        value, _ = vnl_ops.vnl_value_and_gamma_from_projector_coefficients(
+            block)
+        V_NL = V_NL + value
     return V_NL
 
 
@@ -1192,31 +1203,176 @@ def build_Z_and_dZ(k_crys, G_int, B, channels):
     return result
 
 
+@dataclass(frozen=True)
+class VNLProjectorDerivatives:
+    """One channel's beta projectors through second Cartesian derivative.
+
+    Projector axes are kept low rank: ``Z=(atom,beta,G)``,
+    ``dZ=(cart,atom,beta,G)``, and ``d2Z=(cart,cart,atom,beta,G)``.  No band
+    axis is present, so this is the only G-space derivative carrier retained.
+    """
+
+    Z: jax.Array
+    dZ: jax.Array
+    d2Z: jax.Array
+    E: jax.Array
+
+
+def build_Z_dZ_d2Z(k_crys, G_int, B, channels):
+    r"""Build beta projectors and their first/second Cartesian derivatives.
+
+    The first derivative is the existing :func:`build_Z_and_dZ` owner.  The
+    second derivative differentiates that exact first-derivative spelling and
+    applies only the crystal-to-Cartesian chain rule.  There is no second
+    radial/projector formula.
+    """
+    channels = tuple(channels)
+    base = build_Z_and_dZ(k_crys, G_int, B, channels)
+    Binv = jnp.linalg.inv(B)
+    result = []
+    for channel_index, (Z, dZ, E) in enumerate(base):
+        ch = channels[channel_index]
+
+        def dZ_cart_at_k(k_value):
+            return build_Z_and_dZ(k_value, G_int, B, (ch,))[0][1]
+
+        # Output axes (first-cart,atom,beta,G,crystal-derivative).
+        d2Z_crys = jax.jacfwd(dZ_cart_at_k)(k_crys)
+        d2Z = jnp.einsum(
+            'xprgi,yi->xyprg', d2Z_crys, Binv, optimize=True)
+        result.append(VNLProjectorDerivatives(Z=Z, dZ=dZ, d2Z=d2Z, E=E))
+    return tuple(result)
+
+
+def contract_vnl_projector_coefficients(psi_G, projector_derivatives):
+    r"""Contract one band block with beta, ``d beta``, and ``d2 beta`` once.
+
+    The result is coefficient-only and may be persisted or streamed between
+    low-memory stages.  This function never re-expands a coefficient through
+    a projector onto G space.
+    """
+    import psp.vnl_ops as vnl_ops
+
+    blocks = []
+    for item in projector_derivatives:
+        blocks.append(vnl_ops.contract_projector_coefficients(
+            psi_G, item.Z, item.E, dZ=item.dZ, d2Z=item.d2Z))
+    return tuple(blocks)
+
+
+def vnl_projector_coefficients_k(k_crys, psi_G, G_int, B, channels):
+    """Canonical low-rank VNL derivative carrier for one k/band block.
+
+    Channels stream one at a time: a channel's beta/d-beta/d2-beta G-space
+    carrier dies after contraction, while only its small coefficient block is
+    retained.  Thus the peak never contains all channels' G derivatives.
+    """
+    blocks = []
+    for ch in channels:
+        derivative = build_Z_dZ_d2Z(k_crys, G_int, B, (ch,))[0]
+        block = contract_vnl_projector_coefficients(
+            psi_G, (derivative,))[0]
+        blocks.append(block)
+    return tuple(blocks)
+
+
+def vnl_matrix_derivatives_from_projector_coefficients(
+    projector_coefficients,
+    *,
+    nb: int | None = None,
+    dtype=jnp.complex128,
+) -> VNLMatrixDerivatives:
+    r"""Close ``V_NL``, ``dV_NL``, and ``d2V_NL`` entirely in beta space.
+
+    For ``c=<beta|psi>`` and the existing spinor/SOC coupling ``E``, the
+    Hessian is
+
+    ``d2(c^dag E c) = d2c^dag E c + dc^dag E dc +``
+    ``                    dc^dag E dc + c^dag E d2c``.
+
+    No ``(band,spin,G)`` derivative object is formed.  A Sternheimer operator
+    that actually needs ``V_NL|psi>`` retains the separate existing
+    apply-to-ket door and re-expands only there.
+    """
+    import psp.vnl_ops as vnl_ops
+
+    blocks = tuple(projector_coefficients)
+    if blocks:
+        inferred_nb = int(blocks[0].c.shape[-1])
+        if any(int(block.c.shape[-1]) != inferred_nb for block in blocks):
+            raise ValueError("all VNL coefficient blocks must share a band extent")
+        if nb is not None and int(nb) != inferred_nb:
+            raise ValueError(
+                f"VNL coefficient band extent {inferred_nb} != nb={int(nb)}")
+        nband = inferred_nb
+        out_dtype = jnp.result_type(dtype, *(block.c.dtype for block in blocks))
+    else:
+        if nb is None:
+            raise ValueError("empty VNL coefficient set requires explicit nb")
+        nband = int(nb)
+        out_dtype = jnp.dtype(dtype)
+
+    value = jnp.zeros((nband, nband), dtype=out_dtype)
+    gamma = jnp.zeros((3, nband, nband), dtype=out_dtype)
+    contact = jnp.zeros((3, 3, nband, nband), dtype=out_dtype)
+    for block in blocks:
+        one = vnl_ops.vnl_matrix_derivatives_from_projector_coefficients(
+            block)
+        value = value + one.value
+        gamma = gamma + one.gamma_cart
+        contact = contact + one.lambda_cart
+    return VNLMatrixDerivatives(
+        value=value, gamma_cart=gamma, lambda_cart=contact)
+
+
 def vnl_velocity_from_dZ(psi_G, Z_dZ_E):
-    """V_NL velocity from precomputed Z and dZ.  Returns (3, nb, nb)."""
-    nb = psi_G.shape[0]
-    v = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
+    """V_NL velocity from precomputed Z/dZ, closed only in beta space."""
+    import psp.vnl_ops as vnl_ops
+
+    gamma = jnp.zeros(
+        (3, int(psi_G.shape[0]), int(psi_G.shape[0])),
+        dtype=jnp.complex128)
     for Z, dZ, E in Z_dZ_E:
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', E, proj, optimize=True)
-        # dZ† E Z ψ
-        for j in range(3):
-            dproj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(dZ[j]), psi_G, optimize=True)
-            dd = jnp.einsum('strq,aqtv->arsv', E, dproj, optimize=True)
-            vnl_dZ_G = jnp.einsum('arG,arsv->vsG', Z, dd, optimize=True)
-            vnl_Z_dG = jnp.einsum('arG,arsv->vsG', dZ[j], d, optimize=True)
-            v_j_G = vnl_dZ_G + vnl_Z_dG
-            v = v.at[j].add(jnp.einsum(
-                'msG,nsG->mn', jnp.conj(psi_G), v_j_G, optimize=True,
-            ))
-    return v
+        block = vnl_ops.contract_projector_coefficients(
+            psi_G, Z, E, dZ=dZ)
+        _, one_gamma = (
+            vnl_ops.vnl_value_and_gamma_from_projector_coefficients(block))
+        gamma = gamma + one_gamma
+    return gamma
 
 
 def vnl_velocity_autodiff(k_crys, psi_G, G_int, B, channels):
     """V_NL velocity via jacfwd.  Returns (3, nb, nb)."""
     def f(k):
         return vnl_matrix_at_k(k, psi_G, G_int, B, channels)
-    return jax.jacfwd(f)(k_crys) @ jnp.linalg.inv(B)
+    derivative_crys = jax.jacfwd(f)(k_crys)  # (nb, nb, crystal-axis)
+    Binv = jnp.linalg.inv(B)
+    # K_cart = k_crys @ B, hence dk_crys_i/dK_cart_a = Binv[a,i].
+    return jnp.einsum('mni,ai->amn', derivative_crys, Binv, optimize=True)
+
+
+def vnl_contact_autodiff(k_crys, psi_G, G_int, B, channels):
+    r"""Reference Hessian of ``vnl_matrix_at_k`` as ``(3,3,nb,nb)``.
+
+    This independent whole-matrix autodiff door validates the production
+    beta-coefficient product rule in
+    :func:`vnl_matrix_derivatives_from_projector_coefficients`; the public
+    static gauge-vertex path does not call it.  Both differentiate the same
+    canonical Kleinman--Bylander projectors and spinor ``E`` matrices, so no
+    second Hamiltonian or pseudopotential representation is introduced.
+
+    ``k_crys`` is dimensionless crystal momentum and rows of ``B`` are the
+    Cartesian reciprocal vectors in ``1/bohr``.  The returned units are
+    ``Ry*bohr^2``.  No electron-charge or ``1/c`` coupling factor is applied.
+    """
+    def f(k):
+        return vnl_matrix_at_k(k, psi_G, G_int, B, channels)
+
+    hessian_crys = jax.jacfwd(jax.jacfwd(f))(k_crys)
+    Binv = jnp.linalg.inv(B)
+    # Two applications of k_crys = K_cart @ inv(B).
+    return jnp.einsum(
+        'mnij,ai,bj->abmn', hessian_crys, Binv, Binv, optimize=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1257,6 +1413,158 @@ def velocity_matrix_k(psi_G, G_int, k_crys, B, channels, *, Z_dZ_E=None):
     if Z_dZ_E is None:
         Z_dZ_E = build_Z_and_dZ(k_crys, G_int, B, channels)
     return p + vnl_velocity_from_dZ(psi_G, Z_dZ_E)
+
+
+# ---------------------------------------------------------------------------
+# Gauge vertices of the canonical plane-wave DFT Hamiltonian
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GaugeVertexProvenance:
+    """Static provenance carried beside uniform electromagnetic vertices."""
+
+    model: str
+    q_scope: str
+    gamma_definition: str
+    lambda_definition: str
+    gamma_units: str
+    lambda_units: str
+    charge_coupling: str
+    nonlocal_uniform_path: str
+    nonlocal_finite_q_path: str
+    included_terms: str
+
+
+UNIFORM_DFT_GAUGE_VERTEX_PROVENANCE = GaugeVertexProvenance(
+    model="plane_wave_norm_conserving_dft_uniform_gauge_vertices_v1",
+    q_scope="exact_q_cart_bohr_inv_zero_only",
+    gamma_definition="+dH/dK_cart; no electron-charge or 1/c factor",
+    lambda_definition="+d2H/dK_cart_a_dK_cart_b; no charge-squared/c-squared factor",
+    gamma_units="rydberg*bohr",
+    lambda_units="rydberg*bohr^2",
+    charge_coupling=(
+        "apply the caller's minimal-coupling K_cart shift and its charge/c "
+        "factors exactly once outside this neutral Hamiltonian derivative"),
+    nonlocal_uniform_path=(
+        "uniform A is endpoint-path-independent and equals a K_cart shift of "
+        "the canonical Kleinman-Bylander projector Hamiltonian"),
+    nonlocal_finite_q_path="unbound_and_refused",
+    included_terms=(
+        "kinetic 2(K+G), kinetic 2*delta_ab contact, and first/second "
+        "K_cart derivatives of V_NL including spin-orbit E matrices, closed "
+        "in beta-projector coefficient space; local multiplicative V_scf is "
+        "K-independent"),
+)
+
+
+@dataclass(frozen=True)
+class StaticGaugeVerticesK:
+    r"""Band-basis uniform current and contact matrices at one k point.
+
+    ``gamma_cart[a,m,n] = <m|dH/dK_a|n>`` has units ``Ry*bohr`` and
+    ``lambda_cart[a,b,m,n] = <m|d2H/dK_a dK_b|n>`` has units
+    ``Ry*bohr^2``.  Arrays stay on their JAX devices; this record performs no
+    WFN load, FFT, symmetry action, gather, or host conversion.
+    """
+
+    gamma_cart: jax.Array
+    lambda_cart: jax.Array
+    provenance: GaugeVertexProvenance = UNIFORM_DFT_GAUGE_VERTEX_PROVENANCE
+
+
+def _require_uniform_gauge_transfer(q_cart_bohr_inv) -> None:
+    q = np.asarray(q_cart_bohr_inv, dtype=np.float64)
+    if q.shape != (3,):
+        raise ValueError(
+            "static_gauge_vertices_matrix_k: q_cart_bohr_inv must have shape "
+            f"(3,), got {q.shape}")
+    if not np.array_equal(q, np.zeros(3, dtype=np.float64)):
+        raise NotImplementedError(
+            "GATE EM-VERTEX-FINITE-Q-WILSON: "
+            f"got q_cart_bohr_inv={q.tolist()}; want exact [0,0,0]; "
+            "fix: bind one gauge-covariant Wilson-line/path prescription for "
+            "the nonlocal pseudopotential before requesting finite q; why: "
+            "endpoint-averaged velocities and raw Dirac alpha do not determine "
+            "the finite-q nonlocal current/contact and need not satisfy the "
+            "Ward identity; doc: psp.dft_operators."
+        )
+
+
+def static_gauge_vertices_matrix_k(
+    psi_G,
+    G_int,
+    k_crys,
+    B,
+    channels,
+    *,
+    q_cart_bohr_inv=(0.0, 0.0, 0.0),
+    vnl_projector_coefficients=None,
+) -> StaticGaugeVerticesK:
+    r"""Build the uniform ``Gamma=dH/dK`` and ``Lambda=d2H/dK2`` vertices.
+
+    This is the public derivative boundary for the plane-wave norm-conserving
+    DFT Hamiltonian.  Kinetic terms compose with the canonical beta-projector
+    coefficient API; it does not build a second Hamiltonian.  The kinetic
+    contact is
+
+    ``Lambda_kin[a,b,m,n] = 2 delta_ab <psi_m|psi_n>``
+
+    in LORRAX's Rydberg convention.  The nonlocal contact includes the full
+    second derivative of the projector and the canonical spinor/SOC ``E``
+    coupling.  That pseudopotential coupling is k-independent, so no ``dE``
+    term exists for the supported norm-conserving representation.
+    Local multiplicative potentials are independent of a uniform vector
+    potential and contribute neither vertex.
+
+    ``q_cart_bohr_inv`` exists to make the validity boundary executable.
+    Exact zero is accepted.  Finite q refuses because the repository has not
+    selected the Wilson-line path needed to gauge a nonlocal kernel; this API
+    will not invent endpoint averaging as a substitute.
+
+    ``psi_G`` must use the canonical fixed G labels paired with ``k_crys``;
+    padded columns must already be zero, matching :func:`velocity_matrix_k`.
+    A low-memory caller may pass the result of
+    :func:`vnl_projector_coefficients_k` as ``vnl_projector_coefficients``;
+    then this function performs no beta/G contraction and closes both VNL
+    derivatives wholly in the persisted coefficient blocks.  No charge or
+    speed-of-light factors are included: callers map these neutral Hamiltonian
+    derivatives into their chosen ``H[A]`` convention.  ``psi_G`` is held
+    fixed while differentiating the operator; eigenstate/projector drift is a
+    Sternheimer response and is deliberately outside this API.
+    """
+    _require_uniform_gauge_transfer(q_cart_bohr_inv)
+    psi = jnp.asarray(psi_G)
+    G = jnp.asarray(G_int)
+    k = jnp.asarray(k_crys, dtype=jnp.float64)
+    B_cart = jnp.asarray(B, dtype=jnp.float64)
+    if psi.ndim != 3:
+        raise ValueError(
+            "static_gauge_vertices_matrix_k: psi_G must be "
+            f"(nb,nspinor,nG), got {psi.shape}")
+    if G.ndim != 2 or G.shape != (psi.shape[-1], 3):
+        raise ValueError(
+            "static_gauge_vertices_matrix_k: G_int must be (nG,3) paired "
+            f"with psi_G; got G={G.shape}, psi={psi.shape}")
+    if k.shape != (3,) or B_cart.shape != (3, 3):
+        raise ValueError(
+            "static_gauge_vertices_matrix_k: expected k_crys=(3,) and "
+            f"B=(3,3), got {k.shape}/{B_cart.shape}")
+
+    if vnl_projector_coefficients is None:
+        vnl_projector_coefficients = vnl_projector_coefficients_k(
+            k, psi, G, B_cart, channels)
+    vnl_derivatives = vnl_matrix_derivatives_from_projector_coefficients(
+        vnl_projector_coefficients, nb=int(psi.shape[0]), dtype=psi.dtype)
+    gamma = momentum_matrix_k(psi, G, k, B_cart) + vnl_derivatives.gamma_cart
+    overlap = jnp.einsum(
+        'msG,nsG->mn', jnp.conj(psi), psi, optimize=True)
+    lambda_kinetic = (
+        2.0 * jnp.eye(3, dtype=overlap.dtype)[:, :, None, None]
+        * overlap[None, None, :, :])
+    return StaticGaugeVerticesK(
+        gamma_cart=gamma,
+        lambda_cart=lambda_kinetic + vnl_derivatives.lambda_cart,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════

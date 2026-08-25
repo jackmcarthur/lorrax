@@ -103,6 +103,41 @@ class VNLKData:
     g_mask: np.ndarray | None = None   # (nG,) float64 or None
 
 
+@dataclass(frozen=True)
+class VNLProjectorCoefficientBlock:
+    r"""Low-rank ``<beta|psi>`` coefficients and operator derivatives.
+
+    ``c=(group,beta,spin,band)``.  When present, ``dc`` and ``d2c`` prepend
+    one and two Cartesian derivative axes.  ``group`` is normally the atom
+    axis for one channel; the flattened production projector uses one group.
+    The band axis stays last so callers can persist or stream their existing
+    band blocks without ever materialising a band-by-G derivative state.
+    """
+
+    c: jax.Array
+    dc: jax.Array | None
+    d2c: jax.Array | None
+    E: jax.Array
+
+
+@dataclass(frozen=True)
+class VNLMatrixDerivatives:
+    """Band matrices ``V_NL``, ``dV_NL/dK``, and ``d2V_NL/dK2``."""
+
+    value: jax.Array
+    gamma_cart: jax.Array
+    lambda_cart: jax.Array
+
+
+@dataclass(frozen=True)
+class VNLKetDerivatives:
+    """Explicit G-space VNL action, formed only when a consumer requests it."""
+
+    value_ket: jax.Array
+    gamma_cart_ket: jax.Array
+    lambda_cart_ket: jax.Array
+
+
 # ---------------------------------------------------------------------------
 # Setup builder
 # ---------------------------------------------------------------------------
@@ -673,6 +708,163 @@ def _build_vnl_kdata_core(
 # Core operators — single JIT, no loops
 # ---------------------------------------------------------------------------
 
+def contract_projector_coefficients(
+    psi_G,
+    Z,
+    E_super,
+    *,
+    dZ=None,
+    d2Z=None,
+):
+    r"""Contract a band block once with beta and its operator derivatives.
+
+    ``Z`` may be ``(beta,G)`` or ``(group,beta,G)``; derivative arrays
+    prepend Cartesian axes.  The returned carrier has no G axis.  This is
+    the canonical coefficient-space entry point shared by flattened VNL
+    applications and the channel-streamed gauge-vertex builder.
+    """
+    Z_grouped = Z[None, ...] if Z.ndim == 2 else Z
+    if Z_grouped.ndim != 3:
+        raise ValueError("Z must have shape (beta,G) or (group,beta,G)")
+    c = jnp.einsum(
+        'prG,nsG->prsn', jnp.conj(Z_grouped), psi_G, optimize=True)
+
+    dc = None
+    if dZ is not None:
+        dZ_grouped = dZ[:, None, ...] if dZ.ndim == 3 else dZ
+        if dZ_grouped.ndim != 4:
+            raise ValueError(
+                "dZ must have shape (cart,beta,G) or "
+                "(cart,group,beta,G)")
+        dc = jnp.einsum(
+            'xprG,nsG->xprsn', jnp.conj(dZ_grouped), psi_G,
+            optimize=True)
+
+    d2c = None
+    if d2Z is not None:
+        d2Z_grouped = d2Z[:, :, None, ...] if d2Z.ndim == 4 else d2Z
+        if d2Z_grouped.ndim != 5:
+            raise ValueError(
+                "d2Z must have shape (cart,cart,beta,G) or "
+                "(cart,cart,group,beta,G)")
+        d2c = jnp.einsum(
+            'xyprG,nsG->xyprsn', jnp.conj(d2Z_grouped), psi_G,
+            optimize=True)
+
+    return VNLProjectorCoefficientBlock(
+        c=c, dc=dc, d2c=d2c, E=E_super)
+
+
+def vnl_value_and_gamma_from_projector_coefficients(block):
+    r"""Close ``c^dag E c`` and its first operator derivative in beta space."""
+    c, dc, E = block.c, block.dc, block.E
+    Ec = jnp.einsum('strq,pqtn->prsn', E, c, optimize=True)
+    value = jnp.einsum(
+        'prsm,prsn->mn', jnp.conj(c), Ec, optimize=True)
+    if dc is None:
+        return value, None
+    Edc = jnp.einsum('strq,xpqtn->xprsn', E, dc, optimize=True)
+    gamma = (
+        jnp.einsum(
+            'xprsm,prsn->xmn', jnp.conj(dc), Ec, optimize=True)
+        + jnp.einsum(
+            'prsm,xprsn->xmn', jnp.conj(c), Edc, optimize=True)
+    )
+    return value, gamma
+
+
+def vnl_matrix_derivatives_from_projector_coefficients(block):
+    r"""Close the exact first and second VNL operator derivatives.
+
+    ``E`` is k-independent in the canonical norm-conserving
+    pseudopotential owner.  At fixed ket block, the Hessian is
+
+    ``d2(c^dag E c) = d2c^dag E c + dc^dag E dc``
+    ``                  + dc^dag E dc + c^dag E d2c``.
+
+    Eigenstate/projector drift is deliberately absent; it belongs to the
+    Sternheimer response, not to this Hamiltonian-derivative API.
+    """
+    value, gamma = vnl_value_and_gamma_from_projector_coefficients(block)
+    if block.dc is None or block.d2c is None:
+        raise ValueError("VNL contact requires both dZ and d2Z coefficients")
+    c, dc, d2c, E = block.c, block.dc, block.d2c, block.E
+    Ec = jnp.einsum('strq,pqtn->prsn', E, c, optimize=True)
+    Edc = jnp.einsum('strq,xpqtn->xprsn', E, dc, optimize=True)
+    Ed2c = jnp.einsum(
+        'strq,xypqtn->xyprsn', E, d2c, optimize=True)
+    contact = (
+        jnp.einsum(
+            'xyprsm,prsn->xymn', jnp.conj(d2c), Ec, optimize=True)
+        + jnp.einsum(
+            'xprsm,yprsn->xymn', jnp.conj(dc), Edc, optimize=True)
+        + jnp.einsum(
+            'yprsm,xprsn->xymn', jnp.conj(dc), Edc, optimize=True)
+        + jnp.einsum(
+            'prsm,xyprsn->xymn', jnp.conj(c), Ed2c, optimize=True)
+    )
+    return VNLMatrixDerivatives(
+        value=value, gamma_cart=gamma, lambda_cart=contact)
+
+
+def _apply_vnl_value_and_gamma_from_projector_coefficients(block, Z, dZ):
+    """One coefficient-space owner for explicit value/velocity ket action."""
+    Z_grouped = Z[None, ...] if Z.ndim == 2 else Z
+    dZ_grouped = dZ[:, None, ...] if dZ.ndim == 3 else dZ
+    c, dc, E = block.c, block.dc, block.E
+    Ec = jnp.einsum('strq,pqtn->prsn', E, c, optimize=True)
+    Edc = jnp.einsum('strq,xpqtn->xprsn', E, dc, optimize=True)
+    value_ket = jnp.einsum(
+        'prG,prsn->nsG', Z_grouped, Ec, optimize=True)
+    gamma_ket = (
+        jnp.einsum(
+            'xprG,prsn->xnsG', dZ_grouped, Ec, optimize=True)
+        + jnp.einsum(
+            'prG,xprsn->xnsG', Z_grouped, Edc, optimize=True)
+    )
+    return value_ket, gamma_ket, Ec, Edc
+
+
+def apply_vnl_derivatives_to_ket(psi_G, Z, dZ, d2Z, E_super):
+    r"""Apply ``V_NL``, ``dV_NL``, and ``d2V_NL`` to a fixed ket block.
+
+    This is the explicit G-space door for Sternheimer/operator-action
+    consumers.  It first contracts the canonical low-rank coefficients and
+    re-expands whole blocks only here.  With k-independent ``E``, the contact
+    action is
+
+    ``ddZ_ij E c + dZ_i E dc_j + dZ_j E dc_i + Z E d2c_ij``.
+
+    ``Z`` may be flattened or retain a leading independent group/atom axis,
+    matching :func:`contract_projector_coefficients`.
+    """
+    block = contract_projector_coefficients(
+        psi_G, Z, E_super, dZ=dZ, d2Z=d2Z)
+    Z_grouped = Z[None, ...] if Z.ndim == 2 else Z
+    dZ_grouped = dZ[:, None, ...] if dZ.ndim == 3 else dZ
+    d2Z_grouped = d2Z[:, :, None, ...] if d2Z.ndim == 4 else d2Z
+    d2c = block.d2c
+    value_ket, gamma_ket, Ec, Edc = (
+        _apply_vnl_value_and_gamma_from_projector_coefficients(
+            block, Z_grouped, dZ_grouped))
+    Ed2c = jnp.einsum(
+        'strq,xypqtn->xyprsn', E_super, d2c, optimize=True)
+    lambda_ket = (
+        jnp.einsum(
+            'xyprG,prsn->xynsG', d2Z_grouped, Ec, optimize=True)
+        + jnp.einsum(
+            'xprG,yprsn->xynsG', dZ_grouped, Edc, optimize=True)
+        + jnp.einsum(
+            'yprG,xprsn->xynsG', dZ_grouped, Edc, optimize=True)
+        + jnp.einsum(
+            'prG,xyprsn->xynsG', Z_grouped, Ed2c, optimize=True)
+    )
+    return VNLKetDerivatives(
+        value_ket=value_ket,
+        gamma_cart_ket=gamma_ket,
+        lambda_cart_ket=lambda_ket,
+    )
+
 @jax.jit
 def apply_vnl(psi_G, Z, E_super):
     """V_NL|psi> = Z E Z† |psi>.   (nvec, nspinor, nG) → same.
@@ -688,9 +880,9 @@ def apply_vnl(psi_G, Z, E_super):
 @jax.jit
 def vnl_matrix(psi_G, Z, E_super):
     """V_NL matrix elements <m|V_NL|n>.   Returns (nb, nb)."""
-    P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
-    return jnp.einsum('Rsm,Rsn->mn', jnp.conj(P), D, optimize=True)
+    block = contract_projector_coefficients(psi_G, Z, E_super)
+    value, _ = vnl_value_and_gamma_from_projector_coefficients(block)
+    return value
 
 
 @jax.jit
@@ -708,25 +900,24 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
     different k for the finite-q matrix element used in the SOS chi
     head/wing pipeline.
     """
-    P  = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z),  psi_G, optimize=True)   # ⟨Z|n⟩
-    D  = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
-    dP = jnp.einsum('jRG,nsG->jRsn', jnp.conj(dZ), psi_G, optimize=True)
-    dD = jnp.einsum('stRQ,jQtn->jRsn', E_super, dP, optimize=True)
-    # (∂Z^j) D — first piece in the symmetrized derivative
-    t1 = jnp.einsum('jRG,Rsn->jnsG', dZ, D, optimize=True)
-    # Z dD — second piece
-    t2 = jnp.einsum('RG,jRsn->jnsG', Z,  dD, optimize=True)
-    return t1 + t2
+    block = contract_projector_coefficients(
+        psi_G, Z, E_super, dZ=dZ)
+    _, gamma_ket, _, _ = (
+        _apply_vnl_value_and_gamma_from_projector_coefficients(
+            block, Z, dZ))
+    return gamma_ket
 
 
 @jax.jit
 def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).
 
-    Thin bra-contraction wrapper around :func:`apply_vnl_velocity_to_ket`
-    so the q=0 dipole path and the finite-q SOS path share the same
-    underlying velocity application — no duplicated logic.
+    A same-k band matrix closes directly in beta-coefficient space.  The
+    separate :func:`apply_vnl_velocity_to_ket` door remains authoritative
+    when a Sternheimer solve or a different finite-q bra genuinely needs
+    the G-space operator action.
     """
-    v_ket = apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super)            # (3, nb, ns, nG)
-    return jnp.einsum('msG,jnsG->jmn', jnp.conj(psi_G), v_ket,
-                       optimize=True)
+    block = contract_projector_coefficients(
+        psi_G, Z, E_super, dZ=dZ)
+    _, gamma = vnl_value_and_gamma_from_projector_coefficients(block)
+    return gamma
