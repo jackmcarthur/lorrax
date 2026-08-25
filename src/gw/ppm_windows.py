@@ -41,7 +41,6 @@ from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                      band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import (
     MinimaxNodes,
-    laplace_minimax_interval_has_shipped_rule,
     solve_laplace_minimax_interval,
     solve_phase_minimax_bandwidth,
 )
@@ -69,20 +68,13 @@ from .minimax_screening import (
 #  enough to force an ill-conditioned crossing; a narrow grid keeps the user's ξ.
 _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3 below)
 
-#: A sign-definite inverse-Laplace pane spends at most eight binary octaves
-#: on denominator range.  The minimax service remains the authority on
-#: whether a concrete ``(R, error, n_max)`` request is certified: every pane
-#: still goes through ``solve_laplace_minimax_interval`` and refuses there if
-#: unsupported.  This ceiling only prevents one far-tail pole from making a
-#: single request several octaves wider than necessary; it does not bless a
-#: table, loosen an error, or alter a pole.
-_SIGN_DEFINITE_PANE_MAX_OCTAVES = 8.0
-
-#: Initial planning hint only: isolate the lowest/highest 0.2% of live poles
-#: before applying the range-cost criterion.  It never decides whether a pole
-#: is physical and never clips support; exact count conservation below is the
-#: correctness rule.
-_SIGN_DEFINITE_TAIL_FRACTION = 0.002
+#: A sign-definite inverse-Laplace pane may span at most eight binary octaves
+#: in its denominator, ``x_max/x_min <= 2**8``.  The minimax service remains
+#: the authority on whether a concrete request is served: every pane still
+#: goes through ``solve_laplace_minimax_interval`` and refuses there if
+#: unsupported.  This range-cost ceiling neither blesses a table nor changes
+#: a pole, and is independent of the caller's node budget.
+_SIGN_DEFINITE_PANE_MAX_RANGE = 2.0 ** 8
 
 
 def crossing_regularization_floor(omega_max_ry: float, edge_factor: float) -> float:
@@ -940,26 +932,15 @@ def _plan_sign_definite_omega_panes(
     E_min: float,
     E_max: float,
     omega_max: float,
-    target_error: float,
-    max_nodes: int,
-    use_shipped_tables: bool,
 ) -> list[tuple[float, float, int, float, float]]:
     """Make exact scalar Ω panes when one sign-definite range is costly.
 
-    Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  A pane
-    may spend at most ``min(sqrt(max_nodes), 8)`` binary octaves on range,
-    leaving the rest of the requested rank for accuracy.  The eight-octave
-    operational ceiling is not certification: each resulting request still
-    passes through the incumbent minimax service, whose refusal is final.
-    Each split equalises the two continuous-support child range bounds.
+    Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  Each pane
+    is recursively bounded to eight binary octaves, independent of the
+    minimax catalog and node budget; the canonical builder then serves or
+    refuses the resulting physical requests exactly once.  Each split
+    equalises the two continuous-support child range bounds.
 
-    The lowest/highest 0.2% are initial split hints, found by scalar rank
-    bisection.  They are not clipping or a physical acceptance rule; every
-    hinted pane is still recursively checked against the same range ceiling
-    and the canonical shipped-rule lookup at the requested physical error.
-    A refusal is split only when the zero-width-Ω lower bound is itself
-    serviceable; otherwise Ω partitioning cannot cure the missing error
-    tier, so the pane is retained and the builder refuses actionably.
     Splits use the existing ``(lo, hi]`` convention and scalar reduction.  No
     pole-sized host array or retained mask is formed.  Count conservation
     proves every live Ω lane is owned exactly once.  Giving every disjoint
@@ -969,75 +950,16 @@ def _plan_sign_definite_omega_panes(
     Sigma matrix sum by maximum; its amplification bound is unchanged from
     the unpartitioned per-denominator contract.
     """
-    max_octaves = min(
-        float(np.sqrt(max(4, int(max_nodes)))),
-        _SIGN_DEFINITE_PANE_MAX_OCTAVES,
-    )
-    max_range = float(2.0 ** max_octaves)
-    root = (-np.inf, np.inf, int(mask_B_count),
-            float(mask_B_min), float(mask_B_max))
-    pending = [root]
-    tail_count = max(
-        1, int(np.ceil(_SIGN_DEFINITE_TAIL_FRACTION * mask_B_count)))
-    if mask_B_count > 2 * tail_count and mask_B_min < mask_B_max:
-        cuts = []
-        for rank in (tail_count, mask_B_count - tail_count):
-            cut_lo = float(mask_B_min)
-            cut_hi = float(mask_B_max)
-            # 48 scalar bisections resolve far below the precision at which
-            # an O(100 Ry) production pole can change a float64 comparison.
-            for _ in range(48):
-                mid = cut_lo + 0.5 * (cut_hi - cut_lo)
-                count_le = _masked_interval_stats_device(
-                    Omega_q, base_mask_B, -np.inf, mid)[1]
-                if count_le < rank:
-                    cut_lo = mid
-                else:
-                    cut_hi = mid
-            cuts.append(float(np.nextafter(cut_hi, np.inf)))
-        low_cut, high_cut = cuts
-        if low_cut < high_cut:
-            pending = []
-            for lo, hi in ((-np.inf, low_cut),
-                           (low_cut, high_cut),
-                           (high_cut, np.inf)):
-                stats = _masked_interval_stats_device(
-                    Omega_q, base_mask_B, lo, hi)
-                if stats[1]:
-                    pending.append((lo, hi, stats[1], stats[2], stats[3]))
-            if sum(p[2] for p in pending) != int(mask_B_count):
-                raise AssertionError(
-                    "GATE sign_definite_omega_partition: tail hints do not "
-                    "own every live pole exactly once")
+    pending = [(-np.inf, np.inf, int(mask_B_count),
+                float(mask_B_min), float(mask_B_max))]
     panes: list[tuple[float, float, int, float, float]] = []
     while pending:
         lo, hi, count, B_min, B_max = pending.pop()
         x_min = max(float(E_min) + B_min, 1.0e-12)
         x_max = max(float(E_max) + B_max + float(omega_max),
                     x_min * (1.0 + 1.0e-9))
-        range_is_bounded = x_max / x_min <= max_range
-        serviceable = (
-            not use_shipped_tables
-            or laplace_minimax_interval_has_shipped_rule(
-                x_min, x_max, target_error=target_error,
-                max_nodes=max_nodes)
-        )
-        # If even a zero-width Ω pane at this pane's lowest live pole has
-        # no shipped rule, no further Ω split can repair that refusal.  Keep
-        # the exact pane so the canonical builder emits its actionable miss
-        # instead of exploding one missing error tier into pole-count windows.
-        floor_x_max = max(
-            float(E_max) + B_min + float(omega_max),
-            x_min * (1.0 + 1.0e-9),
-        )
-        floor_serviceable = (
-            not use_shipped_tables
-            or laplace_minimax_interval_has_shipped_rule(
-                x_min, floor_x_max, target_error=target_error,
-                max_nodes=max_nodes)
-        )
-        if ((range_is_bounded and serviceable)
-                or not floor_serviceable or B_min >= B_max):
+        if (x_max / x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE
+                or B_min >= B_max):
             panes.append((lo, hi, count, B_min, B_max))
             continue
 
@@ -1065,6 +987,10 @@ def _plan_sign_definite_omega_panes(
             raise AssertionError(
                 "GATE sign_definite_omega_partition: pane counts do not "
                 f"conserve live poles ({owned} != {count})")
+        if len(live) != 2 or any(p[2] >= count for p in live):
+            raise AssertionError(
+                "GATE sign_definite_omega_partition: range split made no "
+                "strict progress")
         pending.extend(reversed(live))
 
     panes.sort(key=lambda p: p[0])
@@ -1479,9 +1405,6 @@ def _build_windows_for_branch(
                 E_min=float(np.min(A_live)),
                 E_max=float(np.max(A_live)),
                 omega_max=omega_max,
-                target_error=target_error,
-                max_nodes=max_nodes,
-                use_shipped_tables=bool(use_shipped_minimax_tables),
             )
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,

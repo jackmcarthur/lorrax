@@ -572,39 +572,6 @@ def solve_laplace_minimax_interval(
     )
 
 
-def laplace_minimax_interval_has_shipped_rule(
-    x_min: float,
-    x_max: float,
-    *,
-    target_error: float,
-    max_nodes: int,
-) -> bool:
-    """Whether the canonical service can serve this physical interval.
-
-    This is a planning query, not a second selector: it performs the same
-    physical ``[x_min,x_max] -> (R, scaled_error)`` conversion as
-    :func:`solve_laplace_minimax_interval` and asks the public minimax
-    ``lookup`` door, which never runtime-solves.  The eventual builder still
-    calls :func:`solve_laplace_minimax_interval`; this predicate only tells a
-    physics planner whether another exact support split could turn a refused
-    global request into serviceable requests.
-    """
-    x_min = max(float(x_min), _TINY)
-    x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
-    scaled_target_error = _scaled_laplace_error_bound(x_min, target_error)
-    try:
-        _mm.lookup(
-            family="noncrossing",
-            target="inverse",
-            range_value=x_max / x_min,
-            error_bound=scaled_target_error,
-            n_max=max(4, int(max_nodes)),
-        )
-    except _mm.NoCertifiedTable:
-        return False
-    return True
-
-
 #: The most recent refusal from the ``complex_laplace`` selector, kept so
 #: that a caller (or a test, or the census shim) can read WHY a request
 #: fell through to the runtime solve without the door having to raise.
