@@ -41,6 +41,7 @@ from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                      band_in_occupation_window, occupation_weight_floor)
 from .minimax_screening import (
     MinimaxNodes,
+    laplace_minimax_interval_has_shipped_rule,
     solve_laplace_minimax_interval,
     solve_phase_minimax_bandwidth,
 )
@@ -939,7 +940,9 @@ def _plan_sign_definite_omega_panes(
     E_min: float,
     E_max: float,
     omega_max: float,
+    target_error: float,
     max_nodes: int,
+    use_shipped_tables: bool,
 ) -> list[tuple[float, float, int, float, float]]:
     """Make exact scalar Ω panes when one sign-definite range is costly.
 
@@ -952,7 +955,11 @@ def _plan_sign_definite_omega_panes(
 
     The lowest/highest 0.2% are initial split hints, found by scalar rank
     bisection.  They are not clipping or a physical acceptance rule; every
-    hinted pane is still recursively checked against the same range ceiling.
+    hinted pane is still recursively checked against the same range ceiling
+    and the canonical shipped-rule lookup at the requested physical error.
+    A refusal is split only when the zero-width-Ω lower bound is itself
+    serviceable; otherwise Ω partitioning cannot cure the missing error
+    tier, so the pane is retained and the builder refuses actionably.
     Splits use the existing ``(lo, hi]`` convention and scalar reduction.  No
     pole-sized host array or retained mask is formed.  Count conservation
     proves every live Ω lane is owned exactly once.  Giving every disjoint
@@ -1008,7 +1015,29 @@ def _plan_sign_definite_omega_panes(
         x_min = max(float(E_min) + B_min, 1.0e-12)
         x_max = max(float(E_max) + B_max + float(omega_max),
                     x_min * (1.0 + 1.0e-9))
-        if x_max / x_min <= max_range or B_min >= B_max:
+        range_is_bounded = x_max / x_min <= max_range
+        serviceable = (
+            not use_shipped_tables
+            or laplace_minimax_interval_has_shipped_rule(
+                x_min, x_max, target_error=target_error,
+                max_nodes=max_nodes)
+        )
+        # If even a zero-width Ω pane at this pane's lowest live pole has
+        # no shipped rule, no further Ω split can repair that refusal.  Keep
+        # the exact pane so the canonical builder emits its actionable miss
+        # instead of exploding one missing error tier into pole-count windows.
+        floor_x_max = max(
+            float(E_max) + B_min + float(omega_max),
+            x_min * (1.0 + 1.0e-9),
+        )
+        floor_serviceable = (
+            not use_shipped_tables
+            or laplace_minimax_interval_has_shipped_rule(
+                x_min, floor_x_max, target_error=target_error,
+                max_nodes=max_nodes)
+        )
+        if ((range_is_bounded and serviceable)
+                or not floor_serviceable or B_min >= B_max):
             panes.append((lo, hi, count, B_min, B_max))
             continue
 
@@ -1450,7 +1479,9 @@ def _build_windows_for_branch(
                 E_min=float(np.min(A_live)),
                 E_max=float(np.max(A_live)),
                 omega_max=omega_max,
+                target_error=target_error,
                 max_nodes=max_nodes,
+                use_shipped_tables=bool(use_shipped_minimax_tables),
             )
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,

@@ -345,7 +345,9 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
         mask_B_count=omega.size,
         mask_B_min=float(omega.min()), mask_B_max=float(omega.max()),
         E_min=E_min, E_max=E_max, omega_max=omega_eval,
+        target_error=1.0e-6,
         max_nodes=64,
+        use_shipped_tables=False,
     )
 
     ownership = np.zeros(omega.size, dtype=np.int64)
