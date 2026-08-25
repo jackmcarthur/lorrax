@@ -92,11 +92,13 @@ The surface
 ``unfold_psi`` / ``spinor_rotation_for_sym_row`` / ``tau_phase_row``
     The ψ-unfold rule, and the single sources of the spinor TRS
     augmentation and the τ phase.
-``kgrid_shift_map`` / ``common_uniform_grid_indices`` /
+``kgrid_shift_map`` / ``bgw_signed_q_representative`` /
+``bgw_integer_q_to_fractional`` / ``common_uniform_grid_indices`` /
 ``find_irreducible_bz_points``
-    Pure integer k-grid algebra: the C-order fold with its umklapp G, the
-    exact intersection of two native uniform grids, and the IBZ reduction
-    (derive-IBZ and anchored-IBZ branches).
+    Pure k/q-grid algebra: the C-order fold with its umklapp G, BGW's shared
+    signed-q representative and positive half-grid tie for fractional and
+    integer labels, the exact intersection of two native uniform grids, and
+    the IBZ reduction (derive-IBZ and anchored-IBZ branches).
 ``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
 ``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
 ``fft_grid_pullback_perm`` / ``recover_symmorphic_density_point_group``
@@ -193,6 +195,7 @@ from symmetry_maps.maps import (
     KStarMap,
     SymMaps,
     bgw_integer_q_to_fractional,
+    bgw_signed_q_representative,
     common_uniform_grid_indices,
     find_irreducible_bz_points,
     kgrid_shift_map,
@@ -274,6 +277,7 @@ from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 __all__ = [
     # tables
     "SymMaps", "kgrid_shift_map", "bgw_integer_q_to_fractional",
+    "bgw_signed_q_representative",
     "q_negation_index",
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
