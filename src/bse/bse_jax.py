@@ -13,14 +13,21 @@ import time
 # MUST run before this module's own `import jax`.  ``create_mesh_2d()``
 # below returns this same startup mesh (plus the BSE-specific
 # process_allgather warm-up bse_ring_comm documents).
-from runtime import initialize_communicator_stack
-RUNTIME = initialize_communicator_stack()
+from runtime import (debug_print, debug_print_enabled,
+                     initialize_communicator_stack, rank0_print)
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 import jax.numpy as jnp
 
 import common.timing as timing
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
+from common.collectives import barrier
+from common.preprocessing_output import (ScientificProductionReport,
+                                         timing_total)
+from common.progress import LoopProgress
+from common.scientific_output import policy
+from runtime.production_stream import ProductionStdout
 
 from .bse_ring_comm import (
     build_bse_ring_matvec,
@@ -132,7 +139,9 @@ def _preview_lanczos(
     tda: bool = True,
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
-) -> None:
+    report=None,
+    stage_progress=None,
+) -> dict:
     # ---- Stage timing --------------------------------------------------
     # This driver printed NO timing table at all, which is why the release
     # regression table's "BSE 377 s" was a single opaque number that could
@@ -207,6 +216,8 @@ def _preview_lanczos(
                     int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
                     grid_y, degeneracy_mode=degeneracy_mode,
                     degeneracy_tol_ry=degeneracy_tol_ry)
+        if stage_progress is not None:
+            stage_progress.step()
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
         nk = nkx * nky * nkz
         nc_pad = int(data["n_cond_pad"])
@@ -278,6 +289,8 @@ def _preview_lanczos(
                 degeneracy_mode=degeneracy_mode,
                 degeneracy_tol_ry=degeneracy_tol_ry,
             )
+        if stage_progress is not None:
+            stage_progress.step()
         psi_c = payload["psi_c"]
         psi_v = payload["psi_v"]
         eps_c = payload["eps_c"]
@@ -311,9 +324,26 @@ def _preview_lanczos(
                 n_eig=n_eig, max_iter=max_lanczos_iter, include_W=include_W,
             )
             _sec.watch(eigenvalues, eigenvectors)
+    if stage_progress is not None:
+        stage_progress.step()
     ryd2ev = 13.6056980659
     print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
     print(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
+
+    eigenvalues_host = jax.device_get(eigenvalues).real
+    if report is not None:
+        report.bands((
+            f"BSE valence    : {int(n_val_eff)} bands below the occupied boundary",
+            f"BSE conduction : {int(n_cond_eff)} bands above the occupied boundary",
+            f"Transition size: {int(bse_dim)} padded basis states; "
+            f"{int(n_val_eff * n_cond_eff * nk)} physical",
+            f"Requested roots: {int(n_eig)}",
+        ))
+        report.heading("Exciton spectrum")
+        report.emit("  state       energy (Ry)      energy (eV)")
+        for index, value in enumerate(eigenvalues_host[:n_eig], start=1):
+            report.emit(f"  S{index:03d}  {float(value):16.5f}  "
+                        f"{float(value) * ryd2ev:15.5f}")
 
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
@@ -331,13 +361,41 @@ def _preview_lanczos(
                 use_tda=tda,
             )
 
-    if jax.process_index() == 0:
+    if stage_progress is not None:
+        stage_progress.step()
+        stage_progress.finish()
+
+    wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
+    if report is not None:
+        records = timing.records()
+        runtime_seconds = sum(
+            float(row["inclusive"]) for row in records
+            if str(row["name"]).startswith("bse.runtime_stack."))
+        report.timings((
+            ("runtime + imports", runtime_seconds
+             + timing_total(records, "bse.imports")),
+            ("restart input", timing_total(records, "bse.load")),
+            ("BSE eigensolve", timing_total(records, "bse.eigensolve")),
+            ("eigenvector write", timing_total(
+                records, "bse.write_eigenvectors")),
+        ), wall=wall)
+    elif jax.process_index() == 0:
         # ``wall=`` closes the table: printed rows + ``(untimed)`` == the whole
         # PROCESS when /proc gave us the pre-main span, else this function.
         # ``(untimed)`` is then the mesh creation + clique warm-up and the
         # small host work between the named stages.
         timing.report(print_fn=print, title="--- BSE Timing ---",
-                      wall=time.perf_counter() - _t_main + (_pre_main or 0.0))
+                      wall=wall)
+
+    return {
+        "wall": wall,
+        "n_val": int(n_val_eff),
+        "n_cond": int(n_cond_eff),
+        "nk": int(nk),
+        "bse_dim": int(bse_dim),
+        "restart_file": str(restart_file),
+        "eigenvector_file": "eigenvectors.h5" if write_eigs is not None else None,
+    }
 
 
 
@@ -412,6 +470,9 @@ def main(argv=None) -> int:
         type=int,
         help="Write eigenvectors.h5 (optional N, default: n-eig).",
     )
+    parser.add_argument(
+        "--report-file", default=None,
+        help="human-readable Lanczos report (default: bse.out)")
     parser.add_argument(
         "--max-lanczos-iter",
         type=int,
@@ -687,7 +748,58 @@ def main(argv=None) -> int:
     # Non-TDA (full BSE) now flows through the same preview via the
     # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-
     # preserving definite-pencil / product solve).  TDA stays the default.
-    _preview_lanczos(
+    report_path = os.path.abspath(args.report_file or "bse.out")
+    debug = debug_print_enabled()
+    report = ScientificProductionReport(
+        report_path, runtime=RUNTIME, debug=debug, stdout=rank0_print,
+        driver_name="bse.bse_jax",
+        calculation_name="Bethe-Salpeter eigensolve")
+    production_stdout = ProductionStdout(
+        debug=debug, rank=RUNTIME.process_index,
+        warning_fn=report.legacy_print)
+    production_stdout.install()
+    report.stdout = rank0_print if debug else production_stdout.emit
+    report.begin(input_file=args.input)
+    report.architecture(mesh_role="BSE transition axes X x Y")
+    include_w = not (args.rpa or not args.bse)
+    report.pathways((
+        "Hamiltonian    : " + (
+            "Tamm-Dancoff Hermitian BSE" if use_tda else
+            "full resonant-antiresonant BSE"),
+        "Interaction    : " + (
+            "D + V - W (screened direct term enabled)" if include_w else
+            "D + V (RPA kernel; screened direct term omitted)"),
+        f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
+        f"requested roots={int(args.n_eig)}",
+        "Iteration mode : " + (
+            f"relative convergence {float(args.lanczos_rtol):.5e}, "
+            f"checked every {int(args.lanczos_check_every)} iterations"
+            if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
+        f"Matvec route   : {('gather' if args.gather_t else args.matvec_kind)}",
+        f"Band boundary  : {args.band_degeneracy}; "
+        f"tolerance={float(args.degeneracy_tol_ry):.5e} Ry",
+    ))
+
+    from .bse_window import _parse_wfn_path
+    from wfn_loader import WfnLoader
+    wfn_path = _parse_wfn_path(args.input)
+    wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
+    sym = wfn.symmetry()
+    report.environment(wfn=wfn, lines=(
+        "Transition data: distributed band and centroid blocks on X x Y",
+        "Eigensolve path: " + policy(
+            args.solver, ("lanczos", "davidson", "trlan")),
+        "Eigenvectors   : " + (
+            "written to a separate numerical artifact"
+            if args.write_eigs is not None else "not requested"),
+    ))
+    report.sampling(wfn=wfn, sym=sym)
+    stage_progress = LoopProgress(
+        3, report.progress, title="BSE eigensolve",
+        item_name="major stage", max_updates=3)
+    stage_progress.start()
+
+    result = _preview_lanczos(
         args.input,
         args.n_val,
         args.n_cond,
@@ -712,7 +824,31 @@ def main(argv=None) -> int:
         degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry,
         tda=use_tda,
+        report=report,
+        stage_progress=stage_progress,
     )
+
+    try:
+        wfn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        report.legacy_print(
+            f"WARNING: WfnLoader.close() failed "
+            f"({type(exc).__name__}: {exc}); continuing to exit")
+    file_rows = [
+        ("human-readable report", "written", report_path),
+        ("GW/BSE restart", "read", result["restart_file"]),
+        ("wavefunctions", "read", wfn_path),
+    ]
+    if result["eigenvector_file"]:
+        file_rows.append(("exciton eigenvectors", "written",
+                          result["eigenvector_file"]))
+    if args.eqp:
+        file_rows.append(("QP corrections", "read", args.eqp))
+    file_rows.append(("input deck", "read", args.input))
+    report.files(file_rows)
+    report.finish()
+    barrier("bse.report_written")
+    production_stdout.close()
     return 0
 
 
