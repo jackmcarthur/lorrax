@@ -516,8 +516,7 @@ def main(argv=None):
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
 					meta, mesh_xy,
-					sym=sym, wfn=wfn, config=config,
-					charge_response=oneshot_head_response,
+					wfn=wfn, config=config,
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(

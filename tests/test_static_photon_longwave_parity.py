@@ -1,9 +1,9 @@
-"""Nested-parity contract for the no-pair static photon completion.
+"""Explicitly diagnostic nested-parity contract for the no-pair response.
 
-The production coefficients are extrapolated from the odd/even parts of a
-symmetry-owned ``+q/-q`` radial union.  This test plants leading and
-next-order terms simultaneously and executes the real sharded
-projection/fitter at P=1.
+The diagnostic coefficients are extrapolated from the odd/even parts of a
+symmetry-owned ``+q/-q`` radial union.  This test plants leading and next-order
+terms simultaneously and executes the real sharded projection/fitter at P=1.
+It does not certify a Hall coefficient or exact electromagnetic contact.
 """
 from types import SimpleNamespace
 
@@ -17,7 +17,7 @@ from gw.w_isdf import (
     PhotonG0Vectors,
     _nested_paired_inplane_shell,
     _w_solve_pref_scalar,
-    fit_static_photon_longwave_coefficients,
+    fit_experimental_static_photon_longwave_coefficients,
 )
 
 
@@ -52,7 +52,7 @@ def test_odd_wing_fit_does_not_count_even_shell_dispersion_as_error():
     # P(q) is Hermitian.  Its CT/TC pair contains q+q^3 odd terms and q^2+q^4
     # even terms.  The diagonal TT block contains q^2+q^4 after the declared
     # uniform-A subtraction.  A leading-only one-shell fit aliases the higher
-    # orders; the production nested fit must recover the planted q and q^2
+    # orders; the diagnostic nested fit must recover the planted q and q^2
     # coefficients instead.
     response = np.zeros((meta.nk_tot, 4, 4), dtype=np.complex128)
     linear_x = 0.7 + 0.2j
@@ -105,12 +105,13 @@ def test_odd_wing_fit_does_not_count_even_shell_dispersion_as_error():
         provenance=G0_DIAGONAL_FULL_BZ_V1,
     )
 
-    coefficients = fit_static_photon_longwave_coefficients(
+    coefficients = fit_experimental_static_photon_longwave_coefficients(
         chi, g0, layout, meta, mesh,
         sym=sym,
         bvec_cart_bohr=bvec,
         sys_dim=2,
         material_class="insulator",
+        experimental_diagnostic=True,
     )
 
     assert coefficients.radial_shell_count == 4
@@ -130,6 +131,18 @@ def test_odd_wing_fit_does_not_count_even_shell_dispersion_as_error():
     assert coefficients.Z_even_shell_fraction > 0.2
     assert coefficients.hall_topological_source.startswith(
         "no_external_hall_term")
+
+
+def test_nested_no_pair_fit_requires_explicit_diagnostic_opt_in():
+    with np.testing.assert_raises_regex(
+            ValueError, "experimental_static_photon_longwave_fit"):
+        fit_experimental_static_photon_longwave_coefficients(
+            None, None, None, None, None,
+            sym=None,
+            bvec_cart_bohr=np.eye(3),
+            sys_dim=2,
+            material_class="insulator",
+        )
 
 
 def test_nested_no_pair_completion_refuses_an_underdetermined_mesh():
