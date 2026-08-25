@@ -137,12 +137,13 @@ class StaticGaugeHeadResponse:
     this module independently rechecks the bounded ``S_direct`` tensor before
     the mini-BZ solve.
 
-    ``operator_current_equivalent`` means the charge, current, and multipoles
-    were differentiated from the Hamiltonian named by ``operator_provenance``.
-    ``contact_is_exact`` means ``contact_provenance`` identifies that same
-    Hamiltonian's second gauge-field variation, not a uniform-A subtraction.
-    Both are required in production; the raw kinetic-balance alpha-current
-    bubble cannot set either flag merely by fitting finite q.
+    ``hamiltonian_config_operator_fingerprint`` is one SHA-256 identity for
+    the Hamiltonian/configuration and the complete operator construction.  It
+    binds sigma.p, the VNL/downfolded contact, and the Hall response together;
+    per-component provenance strings are deliberately absent because they can
+    drift independently.  ``operator_current_equivalent`` and
+    ``contact_is_exact`` are required in production; the raw kinetic-balance
+    alpha-current bubble cannot set either flag merely by fitting finite q.
     """
 
     layout: object
@@ -150,10 +151,7 @@ class StaticGaugeHeadResponse:
     sigma_H: object                    # (3,), real Hall pseudovector
     Y_x: jax.Array                     # (2, 4, N_packed), x-sharded
     Z_y: jax.Array                     # (2, N_packed, 4), y-sharded
-    response_provenance: str
-    operator_provenance: str
-    contact_provenance: str
-    hall_provenance: str
+    hamiltonian_config_operator_fingerprint: str
     operator_current_equivalent: bool
     contact_is_exact: bool
     ward_residual: float
@@ -270,28 +268,25 @@ def require_static_gauge_head_response(
     # Constructs and validates the small Hall tensor; its return is consumed by
     # the mini-BZ stage, so no second Hall spelling exists.
     static_hall_linear_response(response.sigma_H)
-    provenance = {
-        "response": response.response_provenance,
-        "operator": response.operator_provenance,
-        "contact": response.contact_provenance,
-        "Hall": response.hall_provenance,
-    }
-    missing = [name for name, value in provenance.items()
-               if not str(value).strip()]
-    if missing:
+    fingerprint = str(
+        response.hamiltonian_config_operator_fingerprint).strip()
+    if (not fingerprint.startswith("sha256:")
+            or len(fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
         raise ValueError(
-            "GATE static_gauge_head_provenance: response artifact is missing "
-            f"{missing}.\n"
-            f"  got:  provenance={provenance}\n"
-            "  want: non-empty response/operator/contact/Hall artifact ids\n"
-            "  fix:  regenerate the response from the versioned gauged "
-            "operator pipeline; do not infer provenance in GW\n"
+            "GATE static_gauge_head_fingerprint: response artifact lacks one "
+            "canonical Hamiltonian/config/operator SHA-256 fingerprint.\n"
+            f"  got:  {fingerprint!r}\n"
+            "  want: sha256:<64 lowercase hex>, shared by sigma.p, the VNL "
+            "contact, and Hall response\n"
+            "  fix:  regenerate all response components in one versioned "
+            "gauged-operator transaction; do not join component stamps in GW\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
     if not bool(response.operator_current_equivalent):
         raise ValueError(
             "GATE static_gauge_head_operator: the supplied current/multipoles "
             "are not certified as derivatives of their named Hamiltonian.\n"
-            f"  got:  operator_provenance={response.operator_provenance!r}, "
+            f"  got:  fingerprint={fingerprint!r}, "
             "operator_current_equivalent=false\n"
             "  want: one current-equivalent charge/current/multipole operator\n"
             "  fix:  complete the raw no-pair alpha vertex with the gauged "
@@ -301,7 +296,7 @@ def require_static_gauge_head_response(
         raise ValueError(
             "GATE static_gauge_head_contact: the supplied contact is not the "
             "same Hamiltonian's exact second gauge-field variation.\n"
-            f"  got:  contact_provenance={response.contact_provenance!r}, "
+            f"  got:  fingerprint={fingerprint!r}, "
             "contact_is_exact=false\n"
             "  want: exact second-variation/contact provenance\n"
             "  fix:  supply the VNL plus negative-energy/downfolded contact; "
@@ -1138,10 +1133,7 @@ class StaticSlabPhotonHeadCompletion:
     max_dyson_relative_residual: float
     ward_residual: float
     hermiticity_residual: float
-    response_provenance: str
-    operator_provenance: str
-    contact_provenance: str
-    hall_provenance: str
+    hamiltonian_config_operator_fingerprint: str
     estimator: str = "vcoul_minibz_equal_replicate_mean_v1"
 
 
@@ -1351,10 +1343,8 @@ def complete_static_slab_photon_q0(
         ward_residual=max(float(response.ward_residual), effective_ward),
         hermiticity_residual=max(
             float(response.hermiticity_residual), effective_hermiticity),
-        response_provenance=response.response_provenance,
-        operator_provenance=response.operator_provenance,
-        contact_provenance=response.contact_provenance,
-        hall_provenance=response.hall_provenance,
+        hamiltonian_config_operator_fingerprint=(
+            response.hamiltonian_config_operator_fingerprint),
     )
     return V_packed, W_packed, evidence
 
