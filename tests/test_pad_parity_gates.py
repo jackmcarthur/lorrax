@@ -286,6 +286,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     repo = Path(__file__).resolve().parents[1]
     src = repo / "src"
     layout_path = src / "common" / "wfn_layout.py"
+    galerkin_path = src / "isdf" / "galerkin.py"
     app_paths = (
         layout_path,
         src / "common" / "mtxel_sweep.py",
@@ -293,6 +294,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         src / "common" / "wfn_transforms.py",
         src / "common" / "psi_G_store.py",
         src / "bandstructure" / "htransform.py",
+        galerkin_path,
         src / "file_io" / "parallel_transport.py",
         src / "gw" / "kin_ion_io.py",
         src / "gw" / "qsgw_density.py",
@@ -305,6 +307,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     wfn = (src / "common" / "wfn_transforms.py").read_text()
     store = (src / "common" / "psi_G_store.py").read_text()
     ht = (src / "bandstructure" / "htransform.py").read_text()
+    galerkin = galerkin_path.read_text()
     staged = (src / "common" / "staged_reshard.py").read_text()
     fit = (src / "common" / "sharding_fit.py").read_text()
     gflat_body = wfn.split("def gflat_to_rmu(", 1)[1].split("\ndef ", 1)[0]
@@ -312,7 +315,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         "def accumulate_rchunk_to_gflat(", 1)[1].split("\ndef ", 1)[0]
     centroid_body = wfn.split(
         "def load_centroids_band_chunked(", 1)[1].split("\ndef ", 1)[0]
-    galerkin_body = ht.split("def streaming_galerkin_solve(", 1)[1].split(
+    galerkin_body = galerkin.split("def fit_galerkin_basis(", 1)[1].split(
         "\ndef ", 1)[0]
     move_body = staged.split("def band_to_product_r_reshard(", 1)[1].split(
         "\ndef ", 1)[0]
@@ -424,11 +427,43 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     assert "p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)" in accumulate_body
     assert "np.prod([mesh.shape" not in accumulate_body
     assert "p_band = spec_divisor(mesh_xy, sharding_load, axis=1)" in centroid_body
-    assert "nb_padded_global = round_up(nb_total, p_band)" in centroid_body
+
+    # Streaming owns one fixed, mesh-divisible band tile and pads the logical
+    # window to an integer number of those tiles.  Match expressions as ASTs:
+    # this pins the contract without copying its extent arithmetic into a
+    # second executable helper (and without depending on source formatting).
+    centroid_tree = ast.parse(
+        "def load_centroids_band_chunked(" + centroid_body)
+
+    def has_centroid_assignment(name, expression):
+        expected = ast.dump(ast.parse(expression, mode="eval").body)
+        return any(
+            ast.dump(node.value) == expected
+            for node in ast.walk(centroid_tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+        )
+
+    assert has_centroid_assignment(
+        "band_tile", "round_up(requested_band_tile, p_band)")
+    assert has_centroid_assignment(
+        "nb_accum", "round_up(nb_total, band_tile)")
+    assert has_centroid_assignment(
+        "nb_per_band_shard",
+        "band_tile // p_band if stream_tiles "
+        "else round_up(nb_total, p_band) // p_band",
+    )
+    assert has_centroid_assignment(
+        "nb_padded_global",
+        "band_tile if stream_tiles else nb_per_band_shard * p_band",
+    )
     assert "(nb_total + n_devices - 1) // n_devices" not in centroid_body
     assert "divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)" in parallel
-    assert "_p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
-    assert "_p_band = max(1, int(mesh_xy.size))" not in galerkin_body
+    assert "p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
+    assert "p_band = max(1, int(mesh_xy.size))" not in galerkin_body
     assert "n_pad = round_up(nq, batch_size) - nq" in ht
     assert "n_pad = (-nq) % batch_size" not in ht
     assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
