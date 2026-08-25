@@ -192,13 +192,15 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         raise RuntimeError(
             "htransform live-capacity gather returned no positive budget")
     device_fit_budget = float(np.min(process_budgets))
-    log_fn(
-        "  Whole-state live fit budget: "
-        f"{device_fit_budget/2**30:.2f} GiB/device from "
-        f"worst-rank reserve (this rank {local_fit_budget/2**30:.2f} GiB; "
-        f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
-        f"({memory['source']}); the allocator limit is not reusable "
-        "capacity while earlier driver state remains live)")
+    if log_fn is not None:
+        log_fn(
+            "  Whole-state live fit budget: "
+            f"{device_fit_budget/2**30:.2f} GiB/device from "
+            f"worst-rank reserve (this rank "
+            f"{local_fit_budget/2**30:.2f} GiB; "
+            f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
+            f"({memory['source']}); the allocator limit is not reusable "
+            "capacity while earlier driver state remains live)")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,
