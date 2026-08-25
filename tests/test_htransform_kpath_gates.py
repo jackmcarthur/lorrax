@@ -97,7 +97,8 @@ def test_post_kpath_outputs_are_replicated(ndev):
         f"nq divisible by the device count this is the non-addressable-fetch "
         f"crash of PROFILE_htransform_exciton §1.5.")
     assert isinstance(res["energies_sorted"], np.ndarray)
-    assert res["energies_sorted"].shape[0] == 8
+    assert res["energies_sorted"].shape == (8, ct.shape[1] - 1)
+    assert res["energies_on_path"].shape == (8, ct.shape[1] - 1)
     _ = jax.devices()          # keep the jax import meaningful to linters
 
 
