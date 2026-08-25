@@ -48,6 +48,7 @@ Nothing here weakens the absent-means-full rule: an old file, a
 hand-written test file and a full-BZ file written today are all read
 verbatim, because the discriminator is an attribute no old writer wrote.
 """
+import json
 import os
 
 import numpy as np
@@ -126,6 +127,13 @@ QP_WFN_ATTR = "qp_wfn_scheme"
 #: Versioned so a future change of what "rotated" means is a different word
 #: rather than the same word meaning something else.
 QP_WFN_SCHEME = "lorrax-qp-wfn-v1"
+
+#: Small top-level dataset carried by a restart bundle to say which WFN
+#: supplied its matched ``psi_full_y`` / ``enk_full`` state.  The payload is
+#: JSON owned and parsed in this module; restart I/O only transports the
+#: opaque bytes through its incumbent SlabIO metadata path.
+QP_STATE_SOURCE_DATASET = "qp_state_source_provenance"
+QP_STATE_SOURCE_SCHEMA = 1
 
 
 def _wedge_reduction(payload, kirr_to_kfull, star_tables):
@@ -620,22 +628,106 @@ def read_qp_wfn_stamp(path) -> dict | None:
         return None
 
 
+def _validate_qp_state_source(record, *, path: str) -> dict:
+    """Return one canonical restart source-state record or refuse it."""
+    from common.parallel_transport import WFN_FINGERPRINT_SCHEME
+
+    try:
+        fingerprint = record["wfn_fingerprint"]
+        stamp = record["qp_wfn_stamp"]
+        valid = (set(record) == {
+            "schema", "wfn_fingerprint_scheme", "wfn_fingerprint",
+            "qp_wfn_stamp"} and isinstance(fingerprint, str)
+            and len(fingerprint) == 64 and int(fingerprint, 16) >= 0
+            and record.get("schema") == QP_STATE_SOURCE_SCHEMA
+            and record.get("wfn_fingerprint_scheme")
+            == WFN_FINGERPRINT_SCHEME)
+        valid = valid and (stamp is None or (
+            isinstance(stamp, dict) and set(stamp) == {
+                "scheme", "band_start", "band_stop", "source"}))
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError(f"{path}: invalid {QP_STATE_SOURCE_DATASET} record")
+    return record
+
+
+def read_qp_state_source_provenance(path) -> dict | None:
+    """Read a restart source-state record; ``None`` means legacy/unproven."""
+    try:
+        with h5py.File(str(path), "r") as h5:
+            if QP_STATE_SOURCE_DATASET not in h5:
+                return None
+            raw = h5[QP_STATE_SOURCE_DATASET][()]
+        payload = raw if isinstance(raw, bytes) else np.asarray(raw).tobytes()
+        record = json.loads(payload.decode("utf-8", "strict").rstrip("\x00"))
+    except (OSError, KeyError):
+        return None
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError(
+            f"{path}: {QP_STATE_SOURCE_DATASET} is not valid UTF-8 JSON") \
+            from exc
+    return _validate_qp_state_source(record, path=str(path))
+
+
+def qp_state_source_provenance(wfn) -> dict:
+    """Describe the already-loaded WFN which supplied restart ``psi/E``."""
+    from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+    source_path = getattr(wfn, "path", None)
+    if not source_path:
+        raise ValueError("QP restart provenance requires a path-bearing WFN")
+    return {
+        "schema": QP_STATE_SOURCE_SCHEMA,
+        "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
+        "wfn_fingerprint": wfn_fingerprint(wfn),
+        "qp_wfn_stamp": read_qp_wfn_stamp(source_path),
+    }
+
+
+def encode_qp_state_source_provenance(record) -> np.ndarray:
+    """Opaque scalar bytes for the restart writer's existing metadata path."""
+    record = _validate_qp_state_source(record, path="restart writer")
+    text = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    return np.asarray(text.encode("utf-8"), dtype="S")
+
+
+def _qp_state_source_from_path(path) -> dict:
+    """Fingerprint one WFN through the canonical loader and hash owner."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
+
+    wfn = WfnLoader(path)
+    try:
+        return qp_state_source_provenance(wfn)
+    finally:
+        close = getattr(wfn, "close", None)
+        if close is not None:
+            close()
+
+
 def refuse_conflicting_qp_state_sources(
         *, wfn_path: str, eqp_file: str | None = None,
-        qp_rotations_file: str | None = None) -> None:
+        qp_rotations_file: str | None = None,
+        state_artifact_path: str | None = None,
+        where: str = "QP-state consumer") -> None:
     """Refuse two explicit descriptions of one quasiparticle state.
 
     A positively stamped QP WFN already contains the matched rotated orbitals
     and eigenvalues.  Applying either a DFT-labelled diagonal eqp ladder or a
     second rotation artifact changes that Hamiltonian while preserving every
     array shape.  Conversely, a mean-field/unverifiable WFN may consume one
-    explicit QP source.  Absence of the stamp proves nothing and therefore
-    never refuses by itself.
+    explicit QP source when no restart carrier also needs association.  At a
+    restart join, missing legacy provenance refuses an external QP source
+    because its band labels cannot be proved to index the stored ``psi/E``.
 
     Association is established only by explicit arguments and the content
     stamp.  In particular, this owner never infers a relationship from a
     filename or sibling directory: ``qp_wfn_rotations.h5`` does not yet carry
-    a source-WFN fingerprint.
+    a source-WFN fingerprint.  When ``state_artifact_path`` is supplied, its
+    canonical content fingerprint is compared with the selected WFN.  A
+    missing legacy record remains usable only without an external or positive
+    QP description.
     """
     if eqp_file and qp_rotations_file:
         raise ValueError(
@@ -644,19 +736,55 @@ def refuse_conflicting_qp_state_sources(
             "the WFN's current DFT band LABELS, while the second supplies "
             "the matched U_mnk,E_qp for H_QP = U diag(E_qp) U^H.  Select "
             "exactly one.")
-    if not (eqp_file or qp_rotations_file):
-        return
+    external = eqp_file or qp_rotations_file
+    wfn_stamp = read_qp_wfn_stamp(wfn_path)
+    stamp = wfn_stamp
 
-    stamp = read_qp_wfn_stamp(wfn_path)
+    if state_artifact_path is not None:
+        provenance = read_qp_state_source_provenance(state_artifact_path)
+        if provenance is None:
+            if external or wfn_stamp is not None:
+                requested = (f"diagonal eqp override {eqp_file}"
+                             if eqp_file else
+                             (f"QP rotation artifact {qp_rotations_file}"
+                              if qp_rotations_file else
+                              f"stamped QP WFN {wfn_path}"))
+                raise ValueError(
+                    f"{where}: {requested} cannot be combined with "
+                    f"{state_artifact_path}: that restart predates "
+                    f"{QP_STATE_SOURCE_DATASET} and cannot prove which WFN "
+                    "supplied its matched psi_full_y/enk_full state.  "
+                    "Regenerate the restart from the selected WFN.  A legacy "
+                    "restart remains usable only without an external or "
+                    "positively stamped QP state.")
+            return
+
+        selected = _qp_state_source_from_path(wfn_path)
+        stamp = provenance["qp_wfn_stamp"]
+        if provenance["wfn_fingerprint"] != selected["wfn_fingerprint"]:
+            raise ValueError(
+                f"{where}: restart {state_artifact_path} and selected WFN "
+                f"{wfn_path} have different canonical content fingerprints. "
+                "They do not carry the same psi/E representation; regenerate "
+                "the restart from the selected WFN.")
+        if stamp != selected["qp_wfn_stamp"]:
+            raise ValueError(
+                f"{where}: restart {state_artifact_path} has a torn QP-state "
+                f"record for {wfn_path}: its content fingerprint matches but "
+                "its QP-WFN stamp does not.")
+
+    if not external:
+        return
     if stamp is None:
         return
     requested = (f"diagonal eqp override {eqp_file}"
                  if eqp_file else
                  f"QP rotation artifact {qp_rotations_file}")
-    where = ""
+    band_where = ""
     if stamp.get("band_stop") is not None:
-        where = (f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
-                 f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
+        band_where = (
+            f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
+            f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
     version_note = ""
     if stamp["scheme"] != QP_WFN_SCHEME:
         version_note = (
@@ -671,7 +799,7 @@ def refuse_conflicting_qp_state_sources(
            "select the mean-field WFN before applying the rotation artifact.")
     raise ValueError(
         f"{requested} cannot be applied to {wfn_path}: it is already a "
-        f"LORRAX QP WFN (stamp {stamp['scheme']!r}{where}).  Its "
+        f"LORRAX QP WFN (stamp {stamp['scheme']!r}{band_where}).  Its "
         "wavefunctions ARE the QP orbitals and its energies ARE the matched "
         "QP eigenvalues.  A second eqp ladder is written against DFT band "
         "LABELS, and a second U rotates the state twice; either operation "

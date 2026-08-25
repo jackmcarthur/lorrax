@@ -347,6 +347,7 @@ def write_restart_state_to_h5(
     band_slices=None,
     qirr=None,
     coulomb_policy=None,
+    qp_state_source_record: dict | None = None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -403,6 +404,11 @@ def write_restart_state_to_h5(
     next writer to close since dbe3b4ec.  ``None`` (the default, and what
     every existing caller passes) is today's behaviour exactly: full-BZ V,
     full-BZ placeholder, no stamp, no table group.
+
+    ``qp_state_source_record`` identifies the WFN whose matched
+    ``psi_full_y`` / ``enk_full`` state this restart stores.  Its format and
+    serialization belong only to :mod:`file_io.qp_wfn`; this writer transports
+    the opaque bytes through the incumbent SlabIO metadata path on ``mode=w``.
     """
     from .slab_io import SlabIO
 
@@ -430,6 +436,15 @@ def write_restart_state_to_h5(
 ) as io:
         if mode == "w":
             io.write_attr("restart_format_version", np.int64(2))
+            if qp_state_source_record is not None:
+                from .qp_wfn import (
+                    QP_STATE_SOURCE_DATASET,
+                    encode_qp_state_source_provenance,
+                )
+                io.write_attr(
+                    QP_STATE_SOURCE_DATASET,
+                    encode_qp_state_source_provenance(
+                        qp_state_source_record))
         # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
         # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
         # as a length-3 int64 dataset (the SlabIO ``write_attr`` path

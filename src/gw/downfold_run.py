@@ -1010,8 +1010,9 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
     band_slices = (_BandSlices(geom["band_window"],
                                geom.get("band_window_split"))
                    if geom["band_window"] is not None else None)
-    policy = read_coulomb_policy_from_h5(
-        resolve_restart_file(cfg.source_restart))
+    parent_file = resolve_restart_file(cfg.source_restart)
+    policy = read_coulomb_policy_from_h5(parent_file)
+    from file_io.qp_wfn import read_qp_state_source_provenance
 
     # THE COULOMB POLICY IS INHERITED VERBATIM, and stamped.  The congruence
     # is LINEAR and applied AFTER the Dyson solve, so the head convention
@@ -1025,6 +1026,7 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
         V_qmunu=small["V_qmunu"], W0_qmunu=small["W0_qmunu"],
         G0_mu_nu=g0_S, enk_full=enk_full,
         mesh=mesh_xy, mode="w",
+        qp_state_source_record=read_qp_state_source_provenance(parent_file),
         kgrid=tuple(int(v) for v in geom["kgrid"]),
         band_slices=band_slices, coulomb_policy=policy)
     write_restart_state_to_h5(
