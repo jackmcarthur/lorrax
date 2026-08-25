@@ -703,6 +703,129 @@ def test_crossing_b_slab_reuses_exact_bounded_omega_panes(monkeypatch):
     np.testing.assert_array_equal(ownership, np.ones_like(ownership))
 
 
+@pytest.mark.parametrize(
+    ("space", "neg_omega_half", "expected_prefactor"),
+    (("cond", False, 1.0), ("val", True, -1.0)),
+)
+def test_tiny_positive_crossing_fallback_keeps_subtractive_support(
+    monkeypatch, space, neg_omega_half, expected_prefactor,
+):
+    """The no-HGL tiny-omega door keeps the physical E+Omega-omega form."""
+    from gw import ppm_windows
+    from gw.minimax_screening import LaplaceMinimaxQuadrature
+
+    # omega_max sits exactly on the branch builder's no-HGL threshold.  Pick a
+    # live pole only one ulp-scale decade above it: the subtractive support is
+    # strictly positive but much wider than the (incorrect) additive support,
+    # forcing the exact E/omega continuation to expose the orientation.
+    omega_eval = np.array([0.0, 1.0e-14], dtype=np.float64)
+    energies = np.array([[0.0, 1.0]], dtype=np.float64)
+    poles = np.array([1.001e-14], dtype=np.float64)
+
+    def _exact_at_left(x_min, x_max, **_kwargs):
+        # Each forced low-energy cell is a singleton denominator.  The other
+        # terminal cell has a 1e-14 absolute span near x=1, so this deterministic
+        # one-node rule reconstructs all selected points to roundoff without a
+        # minimax service or platform dependency.
+        tau = 0.5
+        return LaplaceMinimaxQuadrature(
+            x_min=float(x_min), x_max=float(x_max),
+            tau=np.array([tau]),
+            alpha=np.array([np.exp(tau * float(x_min)) / float(x_min)]),
+            max_error=2.0e-14,
+            provenance="deterministic tiny-omega fixture",
+        )
+
+    monkeypatch.setattr(
+        ppm_windows, "solve_laplace_minimax_interval", _exact_at_left)
+    windows = ppm_windows._build_windows_for_branch(
+        omega_nonneg_ry=omega_eval,
+        E_A=ppm_windows.jnp.asarray(energies),
+        base_mask_A=ppm_windows.jnp.ones_like(energies, dtype=bool),
+        Omega_q=ppm_windows.jnp.asarray(poles),
+        base_mask_B=ppm_windows.jnp.ones_like(poles, dtype=bool),
+        space=space,
+        neg_omega_half=neg_omega_half,
+        regularization_width_ry=0.1,
+        edge_factor=1.5,
+        target_error=1.0e-6,
+        max_nodes=64,
+        crossing_eps_q=1.0e-3,
+        crossing_max_nodes=64,
+        use_shipped_minimax_tables=False,
+        log_tag="tiny-positive",
+        print_fn=lambda *_args, **_kwargs: None,
+        partition_hgl=False,
+    )
+
+    assert len(windows) == 3
+    assert all(window.crossing_kind is None for window in windows)
+    assert {window.omega_sign for window in windows} == {1}
+    assert {window.prefactor for window in windows} == {expected_prefactor}
+
+    ownership = np.zeros(
+        (energies.size, poles.size, omega_eval.size), dtype=np.int64)
+    energies_flat = energies.reshape(-1)
+    for window in windows:
+        E_lo = -np.inf if window.E_min is None else window.E_min
+        E_hi = np.inf if window.E_max is None else window.E_max
+        selected_E = ((energies_flat > E_lo) & (energies_flat <= E_hi)
+                      & np.asarray(window.mask_A, dtype=bool).reshape(-1))
+        B_lo, B_hi = ppm_windows.window_mask_B_bounds(window)
+        selected_B = (poles > B_lo) & (poles <= B_hi)
+        selected_w = np.ones(omega_eval.size, dtype=bool)
+        if window.omega_indices is not None:
+            selected_w[:] = False
+            selected_w[window.omega_indices] = True
+        ownership += (selected_E[:, None, None]
+                      & selected_B[None, :, None]
+                      & selected_w[None, None, :])
+
+        live_E = energies_flat[selected_E]
+        live_B = poles[selected_B]
+        live_w = omega_eval[selected_w]
+        x_min, x_max = ppm_windows._oriented_sign_definite_support(
+            float(np.min(live_E)), float(np.max(live_E)),
+            float(np.min(live_B)), float(np.max(live_B)),
+            float(np.min(live_w)), float(np.max(live_w)),
+            "E+B-omega",
+        )
+        assert x_max / x_min <= ppm_windows._SIGN_DEFINITE_PANE_MAX_RANGE
+
+        t = np.asarray(window.nodes.t, dtype=np.complex128)
+        alpha = np.asarray(window.nodes.alpha, dtype=np.complex128)
+        for energy in live_E:
+            for pole in live_B:
+                for frequency in live_w:
+                    got = window.prefactor * np.sum(
+                        alpha
+                        * np.exp(-1j * (window.E_ref_A
+                                        + window.E_ref_B) * t)
+                        * np.exp(-1j * (energy - window.E_ref_A) * t)
+                        * np.exp(-1j * (pole - window.E_ref_B) * t)
+                        * np.exp(+1j * window.omega_sign * frequency * t)
+                    )
+                    want = expected_prefactor / (energy + pole - frequency)
+                    np.testing.assert_allclose(got, want, rtol=3.0e-14)
+
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
+
+    # The exact same orientation must fail closed, rather than floor a cell
+    # whose physical denominator reaches zero.
+    with pytest.raises(AssertionError, match="not strictly positive"):
+        ppm_windows._plan_sign_definite_cells(
+            E_A=np.array([0.0]),
+            base_mask_A=np.array([True]),
+            Omega_q=ppm_windows.jnp.asarray([1.0e-14]),
+            base_mask_B=ppm_windows.jnp.asarray([True]),
+            mask_B_count=1,
+            mask_B_min=1.0e-14,
+            mask_B_max=1.0e-14,
+            omega_nonneg_ry=np.array([1.0e-14]),
+            orientation="E+B-omega",
+        )
+
+
 def _build_branch_windows():
     """Build the 4 branches × their windows from controlled synthetic inputs.
 
