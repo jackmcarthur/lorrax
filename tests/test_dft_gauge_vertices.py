@@ -505,7 +505,7 @@ def test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity():
         _ordinary_vnl_action(psi_L, G, mask, k, setup)
         - _ordinary_vnl_action(psi_L, G, mask, k - q_crys, setup))
     rhs = np.einsum(
-        "msg,nsG->mn", np.conj(np.asarray(psi_L)),
+        "msg,nsg->mn", np.conj(np.asarray(psi_L)),
         kinetic_diff + vnl_diff, optimize=True)
     np.testing.assert_allclose(lhs, rhs, rtol=2e-11, atol=2e-11)
 
