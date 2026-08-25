@@ -664,7 +664,7 @@ is a systematic *low bound* for a kernel containing an FFT.
 
 ```
 gw/gflat_memory_model.py::_fft_box_bytes          # Stage-A FFT-box term
-  -> common/fft_helpers.py::query_fft_peak_bytes  # compile the production FFT
+  -> common/fft_helpers.py::query_fft_peak_bytes  # compile exact kind + norm
      -> runtime/aot_memory.py::aot_kernel_peak_bytes
           compiled.memory_analysis()      -> compiled_peak
           parse fft ops from as_text()    -> FftSpec per op
@@ -672,13 +672,17 @@ gw/gflat_memory_model.py::_fft_box_bytes          # Stage-A FFT-box term
         total = compiled_peak + cufft_scratch
 ```
 
-`query_fft_peak_bytes` compiles **the same helper production runs**
-(`make_sharded_fftn_3d`: a `shard_map`'d device-local rank-3 `jnp.fft.fftn`,
-one cuFFT plan per rank). Before 2026-07-30 it compiled the per-axis
+`query_fft_peak_bytes` requires the caller to state the transform kind and
+normalization, then compiles **the same helper production runs**. Stage A asks
+for `make_sharded_ifftn_3d(..., norm='ortho')`, exactly matching the WFN
+spatial loader: a `shard_map`'d device-local rank-3 `jnp.fft.ifftn`, one cuFFT
+plan per rank. Before 2026-07-30 the query compiled the per-axis
 `custom_partitioning` form instead — three rank-1 plans that no production path
 ever builds — and read only `memory_analysis()`, while its own docstring
 promised the result "includes cuFFT scratch". Both defects are fixed; the
-per-axis form has been deleted rather than left as a modelling-only path.
+per-axis form has been deleted rather than left as a modelling-only path. The
+query cache includes kind and norm because the normalization scale can change
+XLA's live buffers even when cuFFT happens to choose the same plan.
 
 The query itself was calibrated in `scripts/profiling/aot_cufft_sanity.py`
 using the `(75, 75, 200)` CrI3 grid and the batched FFT shape from the old

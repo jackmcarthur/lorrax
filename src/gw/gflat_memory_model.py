@@ -195,10 +195,11 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
     """Per-rank bytes of the centroid-load FFT box (Stage A).
 
     MEASURED whenever a real ``Mesh`` is available: compiles the production
-    FFT helper at this shape/sharding and reads XLA's buffer peak PLUS the
-    cuFFT plan workspace, which is not in buffer assignment.  Both halves
-    matter — the analytic factor alone under-predicted Si-10³ by 19 GiB
-    (design §6), and the cuFFT half is >13.7 GB/rank at the CrI3 V_q box.
+    WFN spatial ``ifftn(norm='ortho')`` helper at this shape/sharding and
+    reads XLA's buffer peak PLUS the cuFFT plan workspace, which is not in
+    buffer assignment.  Both halves matter — the analytic factor alone
+    under-predicted Si-10³ by 19 GiB (design §6), and the cuFFT half is
+    >13.7 GB/rank at the CrI3 V_q box.
     Otherwise: the analytic
     ``nk·(bc/p_xy)·ns·n_rtot·16·4.0`` box-copy bound,
     which does NOT see the plan workspace — and announces that."""
@@ -212,6 +213,8 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
                 fft_axes=(-3, -2, -1),
                 sharding=NamedSharding(
                     mesh_xy, P(None, ('x', 'y'), None, None, None, None)),
+                kind="ifftn",
+                norm="ortho",
                 dtype=jnp.complex128,
             ))
         except Exception as exc:
