@@ -610,6 +610,9 @@ def make_sharded_ifftn_3d(mesh, in_spec, out_spec, *, norm=None,
                           axes=(-3, -2, -1))
 def make_sharded_fftn_3d(mesh, in_spec, out_spec, *, norm=None,
                          axes=(-3, -2, -1))
+# planner-time measurement of the exact sharded program above:
+def query_fft_peak_bytes(*, input_shape, fft_axes, sharding,
+                         kind, norm, dtype=jnp.complex128) -> int
 ```
 
 **Contract.** Resolve time (factory): `validate_flat_spec` refuses a
@@ -619,6 +622,11 @@ probe reason — never a silent XLA fallback for an explicit request.
 not which backend serves it (one refusal wording, owned by `GATE`). Both
 dials are factory-time reads and MUST be in every consumer cache key
 (`ffi.ffi_dial_key()`). Parity gates: unit 1e-16, h5 ≤ 2.5e-14 eV.
+`query_fft_peak_bytes` is measurement, not a second transform: it requires
+`kind='fftn'|'ifftn'` and the exact production `norm`, compiles the matching
+factory above, and adds the cuFFT plan workspace through
+`runtime.aot_memory.aot_kernel_peak_bytes`. Its cache keys on both semantics;
+an unknown spelling refuses instead of demoting to an analytic estimate.
 
 **The `make_w_densifier` consumer pattern** (`bse/bse_densify.py`): the
 coarse→fine W densifier composes the `shard_map`-interior kernels —
