@@ -3701,8 +3701,9 @@ def build_dft_head_response(
             vnl_velocity_sign=expected_vnl_sign):
         raise ValueError(
             "GATE dft_head_dipole_provenance: head_correction=full refuses "
-            "dipole.h5 because its WFN/window/VNL/representation stamp does "
-            "not exactly match the charge-response body. Regenerate the "
+            "dipole.h5 because its WFN/q→0-coverage/VNL/representation "
+            "provenance does not authenticate the charge-response body. "
+            "Regenerate the "
             "dipole from this run's deck before building S_direct or wings.")
     velocity_cart, _ = read_dipole_h5(dipole_path)
     b0 = int(meta.b_id_0)

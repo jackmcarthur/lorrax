@@ -288,14 +288,21 @@ class _FakeWfn:
         self.nelec, self.nspinor, self.nbands = nelec, nspinor, nbands
 
 
-def _write_stamped(path, wfn, **kw):
+def _write_stamped(path, wfn, *, nb_written=4, dataset_nb=None,
+                   finite_q=False, **kw):
     import h5py
     from psp.get_dipole_mtxels import stamp_dipole_provenance
 
+    dataset_nb = int(nb_written if dataset_nb is None else dataset_nb)
     with h5py.File(str(path), "w") as h5:
-        h5.create_dataset("dipole_cart", data=np.zeros((3, 1, 1, 1)))
+        h5.create_dataset(
+            "dipole_cart", data=np.zeros((3, 1, dataset_nb, dataset_nb)))
+        h5.create_dataset(
+            "deltaE", data=np.zeros((1, dataset_nb, dataset_nb)))
+        if finite_q:
+            h5.create_group("finite_q")
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
-                                 nb_written=4, bispinor=False,
+                                 nb_written=nb_written, bispinor=False,
                                  skip_vnl=False, vnl_mode="analytic", **kw)
 
 
@@ -361,18 +368,124 @@ def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):
     assert any("DIFFERENT DFT solution" in ln for ln in lines)
 
 
-def test_provenance_guard_refuses_a_changed_band_window(tmp_path, monkeypatch):
+def test_provenance_guard_accepts_ncond_mismatch_at_identical_q0_extent(
+        tmp_path):
+    """ncond labels no smaller matrix when nband already sets the extent."""
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is True
+    assert any("producer ncond=3 differs" in ln
+               and "identical q→0 extent 8" in ln for ln in lines)
+
+
+def test_provenance_guard_refuses_unversioned_q0_operator_despite_coverage(
+        tmp_path, monkeypatch):
+    """Mode/sign alone cannot authenticate the pre-exact-origin operator."""
+    import h5py
     from common import sanity
     from psp.get_dipole_mtxels import check_dipole_provenance
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+    with h5py.File(p, "r+") as h5:
+        del h5.attrs["prov_q0_operator_scheme"]
     lines = []
-    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=5, nband=8,
-                                    print_fn=lines.append) is False
-    assert any("prov_ncond" in ln for ln in lines)
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("prov_q0_operator_scheme: file=<absent>" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_mismatch_that_changes_q0_extent(
+        tmp_path, monkeypatch):
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    # Producer extent max(nelec+ncond, nband) = max(6, 6) = 6;
+    # run extent max(7, 6) = 7.  Equal nband stamps do not make these files
+    # interchangeable.
+    _write_stamped(
+        p, wfn, nval=2, ncond=2, nband=6, nb_written=6)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=6,
+        print_fn=lines.append) is False
+    assert any("prov_ncond" in ln and "run-resolved=7" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_mismatch_for_finite_q_payload(
+        tmp_path, monkeypatch):
+    """finite_q conduction data are literally sized by producer ncond."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8, finite_q=True)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("prov_ncond" in ln and "finite_q/ is present" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short(
+        tmp_path, monkeypatch):
+    """A plausible coverage stamp cannot overrule the physical HDF5 axes."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8,
+        nb_written=8, dataset_nb=7)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("dipole_cart shape=(3, 1, 7, 7)" in ln
+               and "deltaE shape=(1, 7, 7)" in ln for ln in lines)
+
+
+def test_provenance_guard_still_refuses_nval_or_nband_mismatch(
+        tmp_path, monkeypatch):
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+
+    for change, spelling in (({"nval": 1}, "prov_nval"),
+                             ({"nband": 7}, "prov_nband")):
+        window = dict(nval=2, ncond=3, nband=8)
+        window.update(change)
+        lines = []
+        assert check_dipole_provenance(
+            p, wfn=wfn, print_fn=lines.append, **window) is False
+        assert any(spelling in ln for ln in lines)
 
 
 def test_provenance_guard_reports_an_unstamped_file(tmp_path):
