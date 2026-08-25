@@ -442,6 +442,11 @@ def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
         gamma_raw, energies, occupations,
         mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
         nspin=1, nspinor_wfn=2))
+    with pytest.raises(ValueError, match="one Gamma_raw row per full-BZ"):
+        raw_hall_pseudovector_sharded(
+            gamma_raw, energies, occupations,
+            mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk + 1,
+            nspin=1, nspinor_wfn=2)
 
     cB = np.zeros(3, dtype=np.complex128)
     for k in range(nk):

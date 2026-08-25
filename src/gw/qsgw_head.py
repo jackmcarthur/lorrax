@@ -2445,6 +2445,12 @@ def raw_hall_pseudovector_sharded(
         raise ValueError("cell_volume must be positive")
     if int(nk_tot) <= 0 or int(nspin) <= 0 or int(nspinor_wfn) <= 0:
         raise ValueError("nk_tot, nspin, and nspinor_wfn must be positive")
+    if int(gamma.shape[0]) != int(nk_tot):
+        raise ValueError(
+            "raw Hall requires one Gamma_raw row per full-BZ k point: "
+            f"gamma_raw nk={int(gamma.shape[0])}, nk_tot={int(nk_tot)}. "
+            "IBZ/subset rows must be unfolded through the symmetry service "
+            "before the 1/Nk normalization is applied")
     if float(degeneracy_tolerance_ry) <= 0.0:
         raise ValueError("degeneracy_tolerance_ry must be positive")
 
