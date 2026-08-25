@@ -810,6 +810,12 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     physical band interval, FFT grid, ordered centroid table and live padded
     extent, then propagates that same object rather than inferring provenance
     from the two face shapes.
+
+    This NamedTuple is an orchestration record, not a compiled operand: its
+    q labels and fingerprints are host strings/NumPy arrays.  The producer
+    compiles only numerical inputs and constructs this record afterward;
+    the private response oracle validates it and extracts its arrays before
+    calling the cached Green kernel.
     """
 
     current_nmu: jax.Array
@@ -825,9 +831,9 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     vnl_ward_reference_norm: jax.Array
     hamiltonian_config_operator_fingerprint: str
     vnl_path_operator_fingerprint: str
-    # Appended so the pre-receipt tuple positions remain stable for readers
-    # that treated this NamedTuple as a positional record.
-    basis_receipt: object
+    # Appended with a default so both pre-receipt positions AND constructor
+    # arity remain compatible for readers treating this as a positional row.
+    basis_receipt: object = None
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
@@ -1213,7 +1219,7 @@ def finite_transfer_current_to_centroids(
         raise ValueError(
             f"finite-transfer current r_mu must be (n_rmu,3); got "
             f"{r_mu_host.shape}")
-    from file_io.isdf_header import WavefunctionBasisReceipt
+    from file_io.wfn_basis import WavefunctionBasisReceipt
     if not isinstance(basis_receipt, WavefunctionBasisReceipt):
         raise TypeError(
             "finite-transfer current requires the canonical immutable "
@@ -1223,7 +1229,8 @@ def finite_transfer_current_to_centroids(
     expected_mu_padded = padded_mu_extent(
         int(r_mu_host.shape[0]), geom.mesh)
     basis_receipt.assert_matches_source(
-        wfn=wfn, role="transverse", band_interval=(start, stop),
+        wfn=wfn, role="transverse", bispinor=True,
+        band_interval=(start, stop),
         fft_grid=geom.fft_grid,
         centroid_fft_idx=r_mu_host,
         n_rmu_logical=int(r_mu_host.shape[0]),

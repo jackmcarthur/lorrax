@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from file_io.isdf_header import (
+from file_io.wfn_basis import (
     CENTROID_TABLE_FINGERPRINT_SCHEME,
     WavefunctionBasisReceipt,
     centroid_table_md5,
@@ -32,11 +32,13 @@ def _wfn(*, shift: float = 0.0):
 
 
 def _receipt(*, role="transverse", pad=4, centroids=CENTROIDS,
-             grid=(4, 4, 4), band_interval=(1, 5), wfn=None):
+             grid=(4, 4, 4), band_interval=(1, 5), wfn=None,
+             bispinor=False):
     table = np.asarray(centroids, dtype=np.int32)
     return WavefunctionBasisReceipt.from_source(
         wfn=_wfn() if wfn is None else wfn,
         role=role,
+        bispinor=bispinor,
         band_interval=band_interval,
         fft_grid=grid,
         centroid_fft_idx=table,
@@ -54,7 +56,7 @@ def test_receipt_is_immutable_and_reuses_the_restart_centroid_digest():
         receipt.role = "charge"
 
 
-def test_fresh_and_restart_face_builders_propagate_one_receipt_object():
+def test_fresh_and_restart_face_builders_validate_host_receipt():
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh
@@ -77,8 +79,10 @@ def test_fresh_and_restart_face_builders_propagate_one_receipt_object():
     restart = wavefunctions_face_from_restart(
         fresh.psi_nmu, fresh.psi_mun, enk_full=enk, slices=slices,
         mesh_xy=mesh, basis_receipt=receipt)
-    assert fresh.basis_receipt is receipt
-    assert restart.basis_receipt is receipt
+    assert not hasattr(fresh, "basis_receipt")
+    assert not hasattr(restart, "basis_receipt")
+    receipt.assert_matches_carrier(fresh, where="fresh orchestration")
+    receipt.assert_matches_carrier(restart, where="restart orchestration")
 
 
 def test_physical_source_identity_is_layout_and_device_count_independent():
@@ -96,6 +100,17 @@ def test_charge_and_transverse_are_distinct_even_on_the_same_points():
     transverse = _receipt(role="transverse")
     with pytest.raises(ValueError, match="role"):
         charge.assert_same_source(transverse, where="Lorentz channel")
+
+
+def test_scalar_spinor_and_kinetic_balance_lift_are_distinct_sources():
+    scalar = _receipt(role="charge", bispinor=False)
+    kinetic_balance = _receipt(role="charge", bispinor=True)
+    assert scalar.nspinor_sampled == 2
+    assert kinetic_balance.nspinor_sampled == 4
+    assert scalar.bispinor_lift_provenance is None
+    with pytest.raises(ValueError, match="nspinor_sampled"):
+        scalar.assert_same_source(
+            kinetic_balance, where="sampled representation")
 
 
 @pytest.mark.parametrize(
@@ -123,13 +138,105 @@ def test_wavefunctions_authenticates_receipt_against_live_mu_carrier():
     wfns = Wavefunctions(
         enk=jnp.zeros((1, 4)), occ=jnp.zeros((1, 4)), slices=slices,
         psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face",
-        basis_receipt=_receipt(role="charge"),
     )
-    assert wfns.basis_receipt.role == "charge"
+    _receipt(role="charge").assert_matches_carrier(
+        wfns, where="host orchestration")
 
     with pytest.raises(ValueError, match="centroid extent"):
-        Wavefunctions(
+        mismatched_mu = Wavefunctions(
             enk=jnp.zeros((1, 4)), occ=jnp.zeros((1, 4)), slices=slices,
             psi_nmu=psi_nmu[..., :3], psi_mun=psi_mun[:, :, :3],
-            layout="face", basis_receipt=_receipt(role="charge"),
-        )
+            layout="face")
+        _receipt(role="charge").assert_matches_carrier(
+            mismatched_mu, where="host orchestration")
+
+    with pytest.raises(ValueError, match="spinor extent"):
+        _receipt(role="charge", bispinor=True).assert_matches_carrier(
+            Wavefunctions(
+            enk=jnp.zeros((1, 4)), occ=jnp.zeros((1, 4)), slices=slices,
+            psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face",
+            ), where="host orchestration")
+
+
+def test_receipt_is_host_only_and_does_not_split_jit_cache_family():
+    import jax
+    import jax.numpy as jnp
+    from gw.wavefunction_bundle import (
+        AuthenticatedWavefunctions, BandSlices, Wavefunctions)
+
+    slices = BandSlices.from_band_edges(1, 1, 2, 3, 5)
+    carrier = dict(
+        enk=jnp.zeros((1, 4)), occ=jnp.zeros((1, 4)), slices=slices,
+        psi_nmu=jnp.zeros((1, 4, 2, 4), dtype=jnp.complex128),
+        psi_mun=jnp.zeros((1, 2, 4, 4), dtype=jnp.complex128),
+        layout="face",
+    )
+    wfns = Wavefunctions(**carrier)
+    first_receipt = _receipt(role="charge")
+    second_receipt = _receipt(role="charge", wfn=_wfn(shift=1.0e-3))
+    assert first_receipt != second_receipt
+    first_receipt.assert_matches_carrier(wfns, where="first source")
+    second_receipt.assert_matches_carrier(wfns, where="second source")
+
+    python_traces = []
+
+    @jax.jit
+    def numerical_kernel(wfns):
+        python_traces.append(wfns.layout)
+        return wfns.enk + 1.0
+
+    first = AuthenticatedWavefunctions(wfns, first_receipt)
+    second = AuthenticatedWavefunctions(wfns, second_receipt)
+
+    def orchestrate(binding):
+        return numerical_kernel(binding.wavefunctions)
+
+    np.testing.assert_array_equal(orchestrate(first), np.ones((1, 4)))
+    np.testing.assert_array_equal(orchestrate(second), np.ones((1, 4)))
+    assert python_traces == ["face"]
+
+    # A whole-carrier JIT round-trip cannot silently erase provenance because
+    # provenance was never embedded in the numerical pytree.  Its explicit
+    # orchestration owner survives independently.
+    roundtripped = jax.jit(lambda value: value)(wfns)
+    assert not hasattr(roundtripped, "basis_receipt")
+    assert first.receipt.wfn_fingerprint != second.receipt.wfn_fingerprint
+    with pytest.raises(TypeError, match="Error interpreting argument"):
+        jax.jit(lambda value: value)(first)
+
+
+def test_finite_transfer_endpoint_preserves_pre_receipt_positional_abi():
+    import jax
+    import jax.numpy as jnp
+    from common.mtxel_sweep import FiniteTransferCurrentEndpoint
+
+    assert FiniteTransferCurrentEndpoint._fields[-1] == "basis_receipt"
+    assert FiniteTransferCurrentEndpoint.__new__.__defaults__ == (None,)
+    old_arity_values = [None] * (len(FiniteTransferCurrentEndpoint._fields) - 1)
+    assert FiniteTransferCurrentEndpoint(*old_arity_values).basis_receipt is None
+
+    values = dict.fromkeys(FiniteTransferCurrentEndpoint._fields, None)
+    values.update(
+        current_nmu=jnp.zeros((1, 1, 3, 4, 1)),
+        current_mun=jnp.zeros((1, 3, 4, 1, 1)),
+        n_rmu_logical=1,
+        iq_irr=0,
+        q_irr_kgrid_int=np.zeros(3, dtype=np.int32),
+        q_crys=np.zeros(3),
+        kminq_idx=np.zeros(1, dtype=np.int32),
+        g_wrap=np.zeros((1, 3), dtype=np.int32),
+        hamiltonian_config_operator_fingerprint="sha256:" + "0" * 64,
+        vnl_path_operator_fingerprint="sha256:" + "1" * 64,
+    )
+    endpoint = FiniteTransferCurrentEndpoint(**values)
+    with pytest.raises(TypeError):
+        jax.jit(lambda row: row.current_nmu)(endpoint)
+
+
+def test_isdf_header_keeps_candidate_import_compatibility_without_ownership():
+    from file_io import isdf_header
+    from file_io import wfn_basis
+
+    assert (isdf_header.WavefunctionBasisReceipt
+            is wfn_basis.WavefunctionBasisReceipt)
+    assert isdf_header.centroid_table_md5 is wfn_basis.centroid_table_md5

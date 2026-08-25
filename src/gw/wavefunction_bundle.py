@@ -58,7 +58,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
-from file_io.isdf_header import WavefunctionBasisReceipt
+from file_io.wfn_basis import WavefunctionBasisReceipt
 from runtime.padding import round_up, spec_divisor
 
 
@@ -289,48 +289,10 @@ class Wavefunctions:
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
     #: STATIC (pytree meta, never traced).  "legacy" | "face".
     layout: str = "legacy"
-    #: Immutable non-JIT provenance for the sampled ψ basis.  ``None`` is
-    #: retained for synthetic/legacy bundles that predate authentication;
-    #: finite-transfer consumers refuse such a bundle rather than inferring
-    #: identity from matching shapes.  The receipt deliberately excludes
-    #: ``layout``, so fresh/restart and legacy/face carriers share it.
-    basis_receipt: WavefunctionBasisReceipt | None = None
-
     def __post_init__(self) -> None:
         if self.layout not in _LAYOUTS:
             raise ValueError(
                 f"Wavefunctions: layout={self.layout!r} not in {_LAYOUTS}.")
-        receipt = self.basis_receipt
-        if receipt is None:
-            return
-        if not isinstance(receipt, WavefunctionBasisReceipt):
-            raise TypeError(
-                "Wavefunctions.basis_receipt is not a canonical immutable "
-                f"receipt; got {type(receipt).__name__}")
-        start, stop = (int(v) for v in receipt.band_interval)
-        if start != int(self.slices.b0) or stop > int(self.slices.b4):
-            raise ValueError(
-                "Wavefunctions basis receipt band interval is outside the "
-                f"bundle's global carrier: receipt=[{start},{stop}), "
-                f"carrier=[{int(self.slices.b0)},{int(self.slices.b4)})")
-        if stop - start > int(self.enk.shape[1]):
-            raise ValueError(
-                "Wavefunctions basis receipt band width exceeds the energy "
-                f"carrier: {stop-start} > {int(self.enk.shape[1])}")
-        mu_extents = []
-        for value, axis in (
-                (self.psi_xn, 2), (self.psi_xr, 3),
-                (self.psi_yr, 3), (self.psi_yn, 2),
-                (self.psi_nmu, 3), (self.psi_mun, 2)):
-            if value is not None:
-                mu_extents.append(int(value.shape[axis]))
-        if mu_extents and any(
-                extent != int(receipt.n_rmu_padded)
-                for extent in mu_extents):
-            raise ValueError(
-                "Wavefunctions carrier centroid extent disagrees with its "
-                f"basis receipt: carrier={mu_extents}, "
-                f"receipt={int(receipt.n_rmu_padded)}")
 
     def _require_legacy(self, accessor: str) -> None:
         """Refuse BY NAME rather than silently rebuild a legacy replica.
@@ -414,18 +376,42 @@ class Wavefunctions:
 
 
 # Register as JAX pytree so Wavefunctions can be passed to @jax.jit functions.
-# Array fields are traced; slices/layout (static metadata) are compile-time
-# constants — ``layout`` as a META field (not data) is what makes it
-# SPECIALIZE a jit into a separate compiled kernel per layout rather than
-# becoming a traced value a kernel branches on (report §5).  A ``None``
-# array field (the unused half of the legacy/face split) is a valid, empty
-# pytree leaf-set; it costs nothing and traces to nothing.
+# Provenance is intentionally not a Wavefunctions field: the orchestration
+# owner keeps its receipt beside this numerical carrier and validates it
+# before array extraction.  Per-WFN identities therefore cannot enter a
+# treedef, and a compiled carrier round-trip cannot silently discard one.
 jax.tree_util.register_dataclass(
     Wavefunctions,
     data_fields=['psi_xn', 'psi_xr', 'psi_yr', 'psi_yn',
                  'psi_nmu', 'psi_mun', 'enk', 'occ'],
-    meta_fields=['slices', 'layout', 'basis_receipt'],
+    meta_fields=['slices', 'layout'],
 )
+
+
+@dataclass(frozen=True)
+class AuthenticatedWavefunctions:
+    """Host orchestration binding of a numerical carrier to its receipt.
+
+    This type is intentionally not a JAX pytree.  Orchestration validates and
+    unwraps it before a compiled call; an accidental attempt to pass the
+    authenticated object through ``jax.jit`` therefore refuses instead of
+    dropping provenance or specializing on per-WFN hashes.
+    """
+
+    wavefunctions: Wavefunctions
+    receipt: WavefunctionBasisReceipt
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.wavefunctions, Wavefunctions):
+            raise TypeError(
+                "AuthenticatedWavefunctions requires a Wavefunctions "
+                f"carrier; got {type(self.wavefunctions).__name__}")
+        if not isinstance(self.receipt, WavefunctionBasisReceipt):
+            raise TypeError(
+                "AuthenticatedWavefunctions requires a canonical basis "
+                f"receipt; got {type(self.receipt).__name__}")
+        self.receipt.assert_matches_carrier(
+            self.wavefunctions, where="AuthenticatedWavefunctions")
 
 
 def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
@@ -666,11 +652,13 @@ def build_wavefunctions(
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
         occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
-    return Wavefunctions(
+    wfns = Wavefunctions(
         psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
-        enk=enk_full, occ=occ_full, slices=slices,
-        basis_receipt=basis_receipt,
-    )
+        enk=enk_full, occ=occ_full, slices=slices)
+    if basis_receipt is not None:
+        basis_receipt.assert_matches_carrier(
+            wfns, where="build_wavefunctions")
+    return wfns
 
 
 def build_wavefunctions_face(
@@ -715,11 +703,13 @@ def build_wavefunctions_face(
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
         occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
-    return Wavefunctions(
+    wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
-        enk=enk_full, occ=occ_full, slices=slices, layout="face",
-        basis_receipt=basis_receipt,
-    )
+        enk=enk_full, occ=occ_full, slices=slices, layout="face")
+    if basis_receipt is not None:
+        basis_receipt.assert_matches_carrier(
+            wfns, where="build_wavefunctions_face")
+    return wfns
 
 
 def wavefunctions_face_from_restart(
@@ -741,11 +731,13 @@ def wavefunctions_face_from_restart(
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
         occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
-    return Wavefunctions(
+    wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
-        enk=enk_full, occ=occ_full, slices=slices, layout="face",
-        basis_receipt=basis_receipt,
-    )
+        enk=enk_full, occ=occ_full, slices=slices, layout="face")
+    if basis_receipt is not None:
+        basis_receipt.assert_matches_carrier(
+            wfns, where="wavefunctions_face_from_restart")
+    return wfns
 
 
 # ---------------------------------------------------------------------------
@@ -1364,10 +1356,9 @@ def _rotate_wavefunctions_legacy(
         occ_full = jax.lax.with_sharding_constraint(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
-    # A QP rotation changes the sampled wavefunction source while retaining
-    # its carrier shape.  Drop the DFT receipt deliberately: no canonical
-    # rotated-source receipt producer exists yet, and retaining it would make
-    # a future finite-transfer consumer authenticate the wrong orbitals.
+    # A QP rotation returns only a numerical carrier.  The DFT binding held
+    # by orchestration cannot follow it; a future QP receipt owner must issue
+    # a new AuthenticatedWavefunctions object for this transformed source.
     return Wavefunctions(
         psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
@@ -1437,9 +1428,7 @@ def _rotate_wavefunctions_face(
         occ_full = jax.lax.with_sharding_constraint(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
-    # See the legacy sibling: rotation invalidates the incoming DFT basis
-    # receipt.  The safe value is None until the QP-state provenance owner can
-    # issue a canonical receipt for this transformed source.
+    # As above, the host DFT binding cannot follow a QP-rotated carrier.
     return Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
