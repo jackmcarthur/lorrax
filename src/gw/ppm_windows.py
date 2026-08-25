@@ -867,50 +867,124 @@ def _build_single_sigma_window(
     target_error: float,
     max_nodes: int,
     use_shipped_tables: bool,
+    omega_panes: list[tuple[float, float, int, float, float]] | None = None,
 ) -> list[_SigmaWindow]:
     A_vals = E_A[base_mask_A]
     if A_vals.size == 0 or mask_B_count == 0 or mask_B_min is None or mask_B_max is None:
         return []
-    S_min = float(np.min(A_vals) + mask_B_min)
-    S_max = float(np.max(A_vals) + mask_B_max)
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
-    x_min = max(S_min, 1.0e-12)
-    if denom_can_cross:
-        # Denominator ω̃ − S: the Laplace argument stays within [S_min, S_max]
-        # (the crossing region proper only appears once ω is large enough to
-        # split off the three-window path).
-        x_max = max(S_max, x_min * (1.0 + 1.0e-9))
-    else:
-        # Sign-definite denominator ω̃ + S: its argument grows with ω, so the
-        # Laplace interval must reach S_max + ω_max.
-        x_max = max(S_max + omega_max, x_min * (1.0 + 1.0e-9))
-    q = solve_laplace_minimax_interval(
-        x_min, x_max,
-        target_error=target_error,
-        max_nodes=max_nodes,
-        use_shipped_tables=use_shipped_tables,
-    )
-    # ω enters the ω-kernel as exp(+i·ω·τ) for the (ω̃ − S) branch and
-    # exp(−i·ω·τ) for the definite (ω̃ + S) branch; the (ω̃ + S) branch also
-    # carries the −1 from the Laplace-vs-kernel identity.  The −ω half applies
-    # an additional overall −1, folded into the prefactor here.
-    omega_sign = +1 if denom_can_cross else -1
-    prefactor = (1.0 if denom_can_cross else -1.0) * (-1.0 if neg_omega_half else 1.0)
-    return [
-        _SigmaWindow(
-            name="single",
+    panes = (omega_panes if omega_panes is not None else
+             [(-np.inf, np.inf, mask_B_count, mask_B_min, mask_B_max)])
+    windows: list[_SigmaWindow] = []
+    for pane_idx, (B_lo, B_hi, count_B, B_min, B_max) in enumerate(panes):
+        if count_B == 0:
+            continue
+        S_min = float(np.min(A_vals) + B_min)
+        S_max = float(np.max(A_vals) + B_max)
+        x_min = max(S_min, 1.0e-12)
+        x_max = max(
+            S_max if denom_can_cross else S_max + omega_max,
+            x_min * (1.0 + 1.0e-9),
+        )
+        q = solve_laplace_minimax_interval(
+            x_min, x_max,
+            target_error=target_error,
+            max_nodes=max_nodes,
+            use_shipped_tables=use_shipped_tables,
+        )
+        omega_sign = +1 if denom_can_cross else -1
+        prefactor = ((1.0 if denom_can_cross else -1.0)
+                     * (-1.0 if neg_omega_half else 1.0))
+        one_pane = len(panes) == 1
+        windows.append(_SigmaWindow(
+            name="single" if one_pane else f"single_pane_{pane_idx}",
             nodes=q.to_minimax_nodes(time_axis='imag'),
             mask_A=np.asarray(base_mask_A, dtype=bool),
             E_ref_A=float(np.min(A_vals)),
-            E_ref_B=float(mask_B_min),
+            E_ref_B=float(B_min),
             omega_sign=omega_sign,
             project="full",
             prefactor=float(prefactor),
             mask_B_mode="all",
             max_error=float(q.max_error),
             provenance=q.provenance,
-        )
-    ]
+            B_lo=None if one_pane else float(B_lo),
+            B_hi=None if one_pane else float(B_hi),
+        ))
+    return windows
+
+
+def _plan_sign_definite_omega_panes(
+    *,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    mask_B_count: int,
+    mask_B_min: float,
+    mask_B_max: float,
+    E_min: float,
+    E_max: float,
+    omega_max: float,
+    max_nodes: int,
+) -> list[tuple[float, float, int, float, float]]:
+    """Make exact scalar Ω panes when one sign-definite range is costly.
+
+    Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  A pane
+    may spend at most ``sqrt(max_nodes)`` binary octaves on range, leaving the
+    rest of the requested rank for accuracy.  This rule depends on the
+    algorithmic node budget, not on today's shipped catalog.  Each split
+    equalises the two continuous-support child range bounds.
+
+    Splits use the existing ``(lo, hi]`` convention and scalar reduction.
+    No pole-sized host array or retained mask is formed.  Count conservation
+    proves every live Ω lane is owned exactly once.  Giving every disjoint
+    pane the original L-infinity tolerance preserves that tolerance on their
+    union: the aggregate error is the maximum pane error, not their sum.
+    """
+    max_range = float(2.0 ** np.sqrt(max(4, int(max_nodes))))
+    pending = [(-np.inf, np.inf, int(mask_B_count),
+                float(mask_B_min), float(mask_B_max))]
+    panes: list[tuple[float, float, int, float, float]] = []
+    while pending:
+        lo, hi, count, B_min, B_max = pending.pop()
+        x_min = max(float(E_min) + B_min, 1.0e-12)
+        x_max = max(float(E_max) + B_max + float(omega_max),
+                    x_min * (1.0 + 1.0e-9))
+        if x_max / x_min <= max_range or B_min >= B_max:
+            panes.append((lo, hi, count, B_min, B_max))
+            continue
+
+        a = float(E_min)
+        C = float(E_max) + float(omega_max)
+        disc = (a - C) ** 2 + 4.0 * (C + B_max) * (a + B_min)
+        threshold = 0.5 * (-(a + C) + np.sqrt(max(disc, 0.0)))
+        threshold = max(float(np.nextafter(B_min, B_max)), threshold)
+        threshold = min(float(np.nextafter(B_max, B_min)), threshold)
+        if not B_min < threshold < B_max:
+            panes.append((lo, hi, count, B_min, B_max))
+            continue
+
+        left = _masked_interval_stats_device(
+            Omega_q, base_mask_B, lo, threshold)
+        right = _masked_interval_stats_device(
+            Omega_q, base_mask_B, threshold, hi)
+        children = [
+            (lo, threshold, left[1], left[2], left[3]),
+            (threshold, hi, right[1], right[2], right[3]),
+        ]
+        live = [p for p in children if p[2] > 0]
+        owned = sum(p[2] for p in live)
+        if owned != count:
+            raise AssertionError(
+                "GATE sign_definite_omega_partition: pane counts do not "
+                f"conserve live poles ({owned} != {count})")
+        pending.extend(reversed(live))
+
+    panes.sort(key=lambda p: p[0])
+    if sum(p[2] for p in panes) != int(mask_B_count):
+        raise AssertionError(
+            "GATE sign_definite_omega_partition: final panes do not own "
+            "every live pole exactly once")
+    return panes
 
 
 def _scaled_crossing_error_bound(
@@ -1304,6 +1378,21 @@ def _build_windows_for_branch(
                 use_shipped_tables=bool(use_shipped_minimax_tables),
             )
     else:
+        A_live = E_A_host[base_A_host]
+        omega_panes = None
+        if (A_live.size and mask_B_all_count and
+                mask_B_all_min is not None and mask_B_all_max is not None):
+            omega_panes = _plan_sign_definite_omega_panes(
+                Omega_q=Omega_q,
+                base_mask_B=base_mask_B,
+                mask_B_count=mask_B_all_count,
+                mask_B_min=float(mask_B_all_min),
+                mask_B_max=float(mask_B_all_max),
+                E_min=float(np.min(A_live)),
+                E_max=float(np.max(A_live)),
+                omega_max=omega_max,
+                max_nodes=max_nodes,
+            )
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,
             mask_B_count=mask_B_all_count,
@@ -1313,6 +1402,7 @@ def _build_windows_for_branch(
             neg_omega_half=neg_omega_half,
             target_error=target_error, max_nodes=max_nodes,
             use_shipped_tables=bool(use_shipped_minimax_tables),
+            omega_panes=omega_panes,
         )
 
     for win in windows:

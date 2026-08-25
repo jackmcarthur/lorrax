@@ -323,6 +323,48 @@ def test_memory_tile_sink_splices_disjoint_omega_clusters():
             shard_index, devices)
 
 
+def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
+    """CrI3-shaped pole tails are partitioned, never dropped/staticised."""
+    import jax.numpy as jnp
+    from gw.ppm_windows import _plan_sign_definite_omega_panes
+
+    # Two 0.2% tails around a compact body, with the frozen run33 scales.
+    omega = np.concatenate([
+        np.array([2.0e-4, 4.0e-4]),
+        np.linspace(0.05, 4.0, 996),
+        np.array([95.8565, 97.8518]),
+    ]).astype(np.float64)
+    mask = np.ones_like(omega, dtype=bool)
+    E_min, E_max, omega_eval = 0.0343332986397257, 5.40437906406350, 1.46997235298981
+    panes = _plan_sign_definite_omega_panes(
+        Omega_q=jnp.asarray(omega), base_mask_B=jnp.asarray(mask),
+        mask_B_count=omega.size,
+        mask_B_min=float(omega.min()), mask_B_max=float(omega.max()),
+        E_min=E_min, E_max=E_max, omega_max=omega_eval,
+        max_nodes=16,
+    )
+
+    ownership = np.zeros(omega.size, dtype=np.int64)
+    pane_sum = 0.0 + 0.0j
+    residues = (np.linspace(0.2, 1.2, omega.size)
+                + 1j * np.linspace(-0.3, 0.4, omega.size))
+    for lo, hi, count, actual_min, actual_max in panes:
+        selected = (omega > lo) & (omega <= hi)
+        ownership += selected
+        assert int(np.sum(selected)) == count
+        assert actual_min == float(np.min(omega[selected]))
+        assert actual_max == float(np.max(omega[selected]))
+        R = ((E_max + actual_max + omega_eval)
+             / (E_min + actual_min))
+        assert R <= 2.0 ** np.sqrt(16) or actual_min == actual_max
+        pane_sum += np.sum(residues[selected] / (0.7 + E_max + omega[selected]))
+
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
+    direct = np.sum(residues / (0.7 + E_max + omega))
+    np.testing.assert_allclose(pane_sum, direct, rtol=2e-15, atol=2e-15)
+    assert len(panes) > 1
+
+
 def _build_branch_windows():
     """Build the 4 branches × their windows from controlled synthetic inputs.
 
