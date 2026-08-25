@@ -3,8 +3,8 @@
 Two guards, and neither is about ``zeta_loader``'s own code.  That is the
 point of the service owning the FORMAT CONTRACT and not just the reader
 (survey §6.2): the writer is split across three modules — ``isdf_fitting``
-for payload and create-order, ``isdf_header`` for the metadata groups,
-``gw_init`` for ``g0_mu`` and provenance — while the reader is one class, and
+for payload and create-order and ``isdf_header`` for the metadata groups,
+while the reader is one class, and
 "a service that owns the read contract but not the write contract cannot
 enforce it" is exactly how the striping defect and the ``zeta_is_done``-
 never-read defect both survived.

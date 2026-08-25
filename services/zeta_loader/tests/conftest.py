@@ -120,7 +120,7 @@ _ALLOWED = (
                 "96a6399 signature)"),
     # The header binders and gvec_fft_box live in the host tree until wave
     # 1b extracts them.  A standalone install has no lorrax, so the DATA
-    # cells cannot run there; the FORMAT cells (probe/write_g0_mu) have no
+    # cells cannot run there; the FORMAT cells (probe_zeta_file) have no
     # such row because they have no such dependency, which is the whole
     # claim test_zeta_loader_import_isolation makes.
     AllowedSkip("", "no lorrax host tree",

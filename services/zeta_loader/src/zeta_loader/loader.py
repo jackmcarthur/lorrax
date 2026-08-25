@@ -103,7 +103,7 @@ def _host_tree_refusal(module: str, names: str, needed_for: str) -> str:
         f"header binders are extracted as services of their own (wave 1b), "
         f"and this import is that seam.  Put <lorrax>/src on sys.path — "
         f"ffi._services.ensure_on_path() is what the monorepo does — or use "
-        f"the standalone surface (probe_zeta_file / write_g0_mu), which is "
+        f"the standalone surface (probe_zeta_file), which is "
         f"pure h5py+numpy and needs none of this.")
 
 

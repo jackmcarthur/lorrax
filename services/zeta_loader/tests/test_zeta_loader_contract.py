@@ -2,7 +2,7 @@
 
 Everything here is single-device or ``mesh=None``.  Nothing here needs the
 phdf5 FFI, and that is a property of the SURFACE rather than an accident of
-the fixtures: the probe and ``write_g0_mu`` are pure h5py, the refusals all
+the fixtures: the probe is pure h5py, the refusals all
 fire before any transport is reached, and ``read_zeta_G_local`` is serial
 h5py BY CONTRACT (the local plan exists so a rank-0 diagnostic is not a
 collective).  The one thing that does need a transport —
@@ -22,8 +22,6 @@ WHAT THIS FILE PINS THAT NOTHING PINNED BEFORE
   ``zeta_synth``'s docstring.
 * **The probe's never-raises contract**, fed the inputs that would break a
   narrower ``except``.
-* **``write_g0_mu``'s logical-extent guard**, which is what turns "the
-  caller clipped the μ axis correctly" from a convention into a check.
 """
 
 from __future__ import annotations
@@ -40,8 +38,7 @@ if _TESTS not in sys.path:                          # bare-checkout / CLI runs
     sys.path.insert(0, _TESTS)
 
 import zeta_synth as Z                                         # noqa: E402
-from zeta_loader import (                                      # noqa: E402
-    ZetaFileProbe, ZetaLoader, probe_zeta_file, write_g0_mu)
+from zeta_loader import ZetaFileProbe, ZetaLoader, probe_zeta_file  # noqa: E402
 
 
 def _needs_host_tree():
@@ -254,92 +251,7 @@ def test_the_probe_record_has_no_equality_operator(tmp_path):
 
 
 # ===========================================================================
-# 2. write_g0_mu — the one sanctioned post-close serial append
-# ===========================================================================
-
-def test_write_g0_mu_round_trips(tmp_path):
-    import h5py as h5
-    path, _p = Z.build_gflat(tmp_path / "z.h5", n_q=3, n_rmu=5, ngkmax=4)
-    g0 = (np.arange(15, dtype=np.float64).reshape(3, 5)
-          + 1j * np.arange(15, dtype=np.float64).reshape(3, 5) * 0.25)
-    shape = write_g0_mu(path, g0, n_rmu_expected=5)
-    assert shape == (3, 5)
-    with h5.File(path, "r") as f:
-        np.testing.assert_array_equal(np.asarray(f["g0_mu"]), g0)
-
-
-def test_write_g0_mu_deletes_and_recreates_at_a_new_shape(tmp_path):
-    """A re-run at a different centroid count must not hit a stale dataset.
-
-    ``del f['g0_mu']`` then ``create_dataset`` — NOT ``f['g0_mu'][...] =``,
-    which is what a shape-preserving write would be and which would refuse
-    the moment the centroid count moved.  That is the behaviour the raw
-    four lines in ``gw_init`` had; the door keeps it and says why.
-    """
-    import h5py as h5
-    path, _p = Z.build_gflat(tmp_path / "z.h5", n_q=3, n_rmu=5, ngkmax=4)
-    write_g0_mu(path, np.ones((3, 5), dtype=np.complex128), n_rmu_expected=5)
-    second = np.full((2, 9), 7.0 + 1j, dtype=np.complex128)
-    assert write_g0_mu(path, second, n_rmu_expected=9) == (2, 9)
-    with h5.File(path, "r") as f:
-        assert f["g0_mu"].shape == (2, 9)
-        np.testing.assert_array_equal(np.asarray(f["g0_mu"]), second)
-
-
-def test_write_g0_mu_refuses_a_padded_array(tmp_path):
-    """RED TWIN of the logical-extent rule.
-
-    ``g0_mu`` must be written at the LOGICAL centroid count.  A caller that
-    hands over the mesh-PADDED array puts exact-zero rows on disk that every
-    later reader takes for real ζ̃(q, G=0) values — a silent wrong number,
-    not a crash.  ``n_rmu_expected`` is the guard, and this is the case
-    where it returns FALSE: the same call that passes above, with the pad
-    left on.
-    """
-    path, _p = Z.build_gflat(tmp_path / "z.h5", n_q=3, n_rmu=5, ngkmax=4)
-    padded = np.zeros((3, 8), dtype=np.complex128)      # 5 logical in 8
-    padded[:, :5] = 1.0
-    with pytest.raises(ValueError) as ei:
-        write_g0_mu(path, padded, n_rmu_expected=5)
-    msg = str(ei.value)
-    assert "LOGICAL centroid count" in msg
-    assert "g0[..., :n_rmu]" in msg            # the FIX is in the message
-    assert "8" in msg and "5" in msg           # both numbers named
-    # …and the file is untouched: a refusal must not half-write.
-    import h5py as h5
-    with h5.File(path, "r") as f:
-        assert "g0_mu" not in f
-
-
-def test_write_g0_mu_refuses_a_scalar(tmp_path):
-    """A 0-d array has no μ axis for ``n_rmu_expected`` to check against.
-
-    Reported as its own refusal rather than as an IndexError out of
-    ``arr.shape[-1]``, because the two have different fixes.
-    """
-    path, _p = Z.build_gflat(tmp_path / "z.h5")
-    with pytest.raises(ValueError, match="scalar"):
-        write_g0_mu(path, 3.0, n_rmu_expected=5)
-
-
-def test_write_g0_mu_without_the_guard_writes_whatever_it_is_given(tmp_path):
-    """The guard is OPTIONAL, and this is what optional costs.
-
-    Stated as a test rather than left implicit: with ``n_rmu_expected``
-    omitted the padded array above lands on disk unchallenged.  That is the
-    argument for every call site passing it, and it is the behaviour a
-    future reader of this function needs to know about.
-    """
-    import h5py as h5
-    path, _p = Z.build_gflat(tmp_path / "z.h5")
-    padded = np.zeros((3, 8), dtype=np.complex128)
-    assert write_g0_mu(path, padded) == (3, 8)
-    with h5.File(path, "r") as f:
-        assert f["g0_mu"].shape == (3, 8)
-
-
-# ===========================================================================
-# 3. ZetaLoader refusals at open
+# 2. ZetaLoader refusals at open
 # ===========================================================================
 
 def test_open_refuses_an_unfinished_zeta(tmp_path):
