@@ -1697,7 +1697,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     H_vh = sweep_matrix_elements(
         psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
         gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
-        kvecs=np.asarray(inputs.sym.unfolded_kpts))
+        kvecs=gtab.kvecs)
     return H_vh, e_f
 
 
