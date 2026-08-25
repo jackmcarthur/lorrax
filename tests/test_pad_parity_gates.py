@@ -300,6 +300,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
         src / "psp" / "get_dipole_mtxels.py",
     )
     mtxel = (src / "common" / "mtxel_sweep.py").read_text()
+    bundle = (src / "gw" / "wavefunction_bundle.py").read_text()
     parallel = (src / "common" / "parallel_transport.py").read_text()
     wfn = (src / "common" / "wfn_transforms.py").read_text()
     store = (src / "common" / "psi_G_store.py").read_text()
@@ -345,6 +346,49 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     literal_sites = {path: lines for path, lines in literal_sites.items() if lines}
     assert list(literal_sites) == ["common/wfn_layout.py"], literal_sites
     assert len(literal_sites["common/wfn_layout.py"]) == 1, literal_sites
+
+    # The two low-memory face layouts likewise have one common-layer
+    # spelling.  The GW bundle re-exports them for compatibility, while the
+    # finite-q common-layer endpoint consumes the common owner directly.
+    layout_tree = ast.parse(layout_path.read_text())
+    layout_names = {
+        target.id
+        for node in ast.walk(layout_tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert {"PSI_NMU_SPEC", "PSI_MUN_SPEC"} <= layout_names
+    bundle_tree = ast.parse(bundle)
+    bundle_assignments = {
+        target.id
+        for node in ast.walk(bundle_tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert not ({"PSI_NMU_SPEC", "PSI_MUN_SPEC"} & bundle_assignments)
+    assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC" in bundle
+    assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, band_sphere_spec" in mtxel
+    assert "NamedSharding(geom.mesh, PSI_NMU_SPEC)" in mtxel
+    assert "NamedSharding(geom.mesh, PSI_MUN_SPEC)" in mtxel
+    endpoint = next(
+        node for node in ast.parse(mtxel).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "finite_transfer_current_to_centroids")
+    old_face_literals = {
+        (None, "x", None, None, "y"),
+        (None, None, None, "x", "y"),
+    }
+    endpoint_literals = {
+        tuple(arg.value for arg in node.args)
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "P"
+        and all(isinstance(arg, ast.Constant) for arg in node.args)
+    }
+    assert endpoint_literals.isdisjoint(old_face_literals), endpoint_literals
 
     # The old mtxel_sweep location is not a compatibility facade.  Scan import
     # nodes over the bounded source root so a new indirect consumer cannot make
