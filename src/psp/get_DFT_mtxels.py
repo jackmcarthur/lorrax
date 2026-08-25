@@ -837,8 +837,6 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)  # Crystal coordinates
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
     bvec = jnp.asarray(wfn.bvec, dtype=jnp.float64)
-    kpoints = jnp.asarray(sym.unfolded_kpts, dtype=jnp.float64)
-    
     print(f"\nSystem: {len(atom_positions)} atoms, {len(pseudos)} pseudopotential types")
     assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
     for ap in assignments:
@@ -872,6 +870,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     # re-padded it by hand to the max — three passes to arrive where the
     # loader already was (owner decision D10).
     gtab = padded_gvectors(wfn, k="full_bz")
+    kpoints = jnp.asarray(gtab.kvecs, dtype=jnp.float64)
     vnl_setup = vnl_ops.build_vnl_setup(
         wfn,
         sym,

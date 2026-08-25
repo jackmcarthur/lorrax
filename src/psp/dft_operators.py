@@ -177,22 +177,26 @@ def generate_gvectors_k(kpoint_idx, sym, wfn, meta):
     :func:`padded_gvectors` instead — the loader's table is *already*
     the padded one, so the fixed-shape route is strictly less work.
     """
-    kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
     loader = _as_loader(wfn)
     gvecs_full = loader.gvecs(k="full_bz")           # (n_full, ngkmax, 3) int32
     ngk_full = loader.ngk_valid(k="full_bz")         # (n_full,) int32
+    kvecs_full = loader.kvecs(k="full_bz")           # paired reciprocal representative
     nk = int(kpoint_idx)
+    kpoint_crys = jnp.asarray(kvecs_full[nk], dtype=jnp.float64)
     Gk_crys = jnp.asarray(gvecs_full[nk, : int(ngk_full[nk])], dtype=jnp.int32)
     return Gk_crys, kpoint_crys
 
 
 @dataclass(frozen=True)
 class PaddedGVectors:
-    """Every k's G-list at ONE fixed shape ``(n_k, ngkmax, 3)`` + its mask.
+    """Every k's paired representative/G-list at one fixed G shape.
 
     This is the *native* layout of ``WfnLoader.gvecs()``: the loader
     stores the G table padded to the file's ``ngkmax`` and reports the
-    logical extent separately through ``ngk_valid()``.
+    logical extent separately through ``ngk_valid()``.  ``kvecs`` is read
+    from the same loader transaction and is the coordinate half explicitly
+    paired with those G labels; physical ``k+G`` consumers must not replace
+    it with an independently fetched symmetry representative.
     :func:`generate_gvectors_k` throws that away by slicing back to
     ``ngk[ik]``; this class hands it over intact, plus the 1/0 mask that
     makes the pad columns inert.
@@ -242,6 +246,7 @@ class PaddedGVectors:
     gvecs: np.ndarray        # (n_k, ngkmax, 3) int32, sentinel-padded
     mask: np.ndarray         # (n_k, ngkmax) float64, 1 valid / 0 pad
     ngk: np.ndarray          # (n_k,) int32 — logical extent per k
+    kvecs: np.ndarray        # (n_k, 3) float64 — loader-paired representative
 
     @property
     def ngkmax(self) -> int:
@@ -269,16 +274,23 @@ def padded_gvectors(wfn, *, k="full_bz") -> PaddedGVectors:
 
     ``k`` is any ``WfnLoader`` k-spec (``"full_bz"``, ``"ibz"``, or an
     explicit index list), so a rank can build the table for exactly the
-    k it owns.
+    k it owns.  The returned carrier includes ``loader.kvecs(k=k)`` from
+    the same row selection; no second wrapping or symmetry lookup occurs.
     """
     from common.gvec_fft_box import pad_mask as _pad_mask
     loader = _as_loader(wfn)
     gvecs = np.asarray(loader.gvecs(k=k), dtype=np.int32)
     ngk = np.asarray(loader.ngk_valid(k=k), dtype=np.int32)
+    kvecs = np.asarray(loader.kvecs(k=k), dtype=np.float64)
+    if kvecs.shape != (int(gvecs.shape[0]), 3):
+        raise ValueError(
+            "padded_gvectors: WfnLoader.kvecs must carry the coordinate "
+            f"half of the G table with shape ({int(gvecs.shape[0])}, 3); "
+            f"got {kvecs.shape} for gvecs {gvecs.shape}.")
     # ``pad_mask`` is the same "which slots are real" expression the
     # loader's box_index and the ζ writer use — one definition.
     mask = _pad_mask(ngk, int(gvecs.shape[1])).astype(np.float64)
-    return PaddedGVectors(gvecs=gvecs, mask=mask, ngk=ngk)
+    return PaddedGVectors(gvecs=gvecs, mask=mask, ngk=ngk, kvecs=kvecs)
 
 
 def generate_gvectors_k_padded(kpoint_idx, sym, wfn, meta):
@@ -289,9 +301,9 @@ def generate_gvectors_k_padded(kpoint_idx, sym, wfn, meta):
     :func:`padded_gvectors` when sweeping more than one k — it builds the
     mask once for the whole table instead of once per call.
     """
-    kpoint_crys = jnp.asarray(sym.unfolded_kpts[kpoint_idx], dtype=jnp.float64)
     tab = padded_gvectors(wfn, k="full_bz")
     G_pad, g_mask = tab.at(kpoint_idx)
+    kpoint_crys = jnp.asarray(tab.kvecs[int(kpoint_idx)], dtype=jnp.float64)
     return jnp.asarray(G_pad, dtype=jnp.int32), g_mask, kpoint_crys
 
 
@@ -378,10 +390,9 @@ def build_T_diag(
     Pass ``gvectors`` to reuse one :class:`PaddedGVectors` table across a
     k sweep instead of rebuilding it per k.
     """
-    kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
-
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     G_pad, g_mask = tab.at(k_idx)
+    kvec = np.asarray(tab.kvecs[int(k_idx)], dtype=float)
     T_diag, Gx, Gy, Gz = _T_diag_from_G(
         np.asarray(G_pad, dtype=int), kvec, wfn.bdot)
     return T_diag, Gx, Gy, Gz, g_mask
@@ -648,7 +659,7 @@ def setup_H_k(
 
     Parameters
     ----------
-    k_idx : index into sym.unfolded_kpts (full BZ)
+    k_idx : index into the loader's full-BZ row order
     V_scf : (nx, ny, nz) — V_loc + V_H + V_xc, from build_V_scf
     vnl_setup : from vnl_ops.build_vnl_setup (k-independent, built once)
     wfn, sym, meta : standard LORRAX objects
@@ -661,8 +672,9 @@ def setup_H_k(
         a k's physical G-sphere.
     gvectors : PaddedGVectors, optional — reuse one table across a sweep.
     """
+    tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     T_diag, Gx, Gy, Gz, g_mask = build_T_diag(
-        k_idx, wfn, sym, meta, gvectors=gvectors)
+        k_idx, wfn, sym, meta, gvectors=tab)
     nG_actual = int(np.count_nonzero(g_mask))
     nG_pad = int(g_mask.shape[0])
 
@@ -687,7 +699,7 @@ def setup_H_k(
 
     # Build VNL at padded size — one JIT trace for all k-points
     Gk_int = np.stack([np.asarray(Gx), np.asarray(Gy), np.asarray(Gz)], axis=-1)
-    kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
+    kvec = np.asarray(tab.kvecs[int(k_idx)], dtype=float)
     import psp.vnl_ops as vnl_ops
     kdata = vnl_ops.build_vnl_kdata_from_kvec(kvec, Gk_int, vnl_setup)
 

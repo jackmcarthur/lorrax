@@ -105,7 +105,7 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
     wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)            # (nb, ns, nx,ny,nz)
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     Gk_crys, g_mask = tab.at(ik)
-    kpoint = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)  # crystal coords
+    kpoint = np.asarray(tab.kvecs[int(ik)], dtype=np.float64)  # crystal coords
 
     v_kin = np.asarray(compute_p_operator_k(
         wfn_k, Gk_crys, kpoint,
@@ -241,13 +241,13 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         # Mask ψ, not Z: every contraction below closes against conj(ψ_G).
         psi_G = (jnp.asarray(np.asarray(psi_ibz[i]))
                  * jnp.asarray(g_mask)[None, None, :])           # (nb,ns,ngkmax)
-        k_crys = jnp.asarray(np.asarray(wfn.kpoints[i]), dtype=jnp.float64)
+        k_crys = jnp.asarray(gtab.kvecs[i], dtype=jnp.float64)
         eps = np.asarray(wfn.energies[0, i, :nbnd], dtype=np.float64)
         E[i] = eps
         v = np.asarray(momentum_matrix_k(psi_G, G_int, k_crys, jnp.asarray(B)))
         if sign != 0:
             kdata = vnl_ops.build_vnl_kdata_from_kvec(
-                np.asarray(wfn.kpoints[i], dtype=float),
+                np.asarray(gtab.kvecs[i], dtype=float),
                 np.asarray(G_pad, dtype=int), vnl_setup, compute_dZ=True)
             nsE = kdata.E_super.shape[0]
             psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
@@ -311,7 +311,8 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
     rho_val = build_rho_val_from_wfn(wfn, sym, meta, nocc, verbose=True)
     V_scf, V_loc, _vnl2 = build_dft_potentials(
         wfn, pseudos, rho_val, truncation_2d=truncation_2d, verbose=True)
-    ngkmax = int(compute_ngkmax(np.asarray(sym.unfolded_kpts, dtype=np.float64),
+    kvecs_full = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
+    ngkmax = int(compute_ngkmax(kvecs_full,
                                 np.asarray(wfn.bdot), float(wfn.ecutwfc), fft_grid))
     # QE-DFPT level shift α_pv = 2(E_max − E_min) over occupied bands (all k)
     en_occ = np.asarray(wfn.energies[0, :, :nocc], dtype=np.float64)
@@ -330,7 +331,7 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
         return jnp.stack([A[:, 1, 2], A[:, 2, 0], A[:, 0, 1]], axis=-1).sum(axis=0)
 
     for ik in range(nk):
-        kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+        kv = np.asarray(kvecs_full[ik], dtype=np.float64)
         k_red = int(sym.irr_idx_k[ik])
         eps_full = np.asarray(wfn.energies[0, k_red, :nbnd], dtype=np.float64)
         E[ik] = eps_full
@@ -593,7 +594,7 @@ def main(argv=None):
             vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd,
                                               gvectors=gtab)
             Vp[ik], Vnl[ik], E[ik], SZ[ik] = vk, vnlk, eps, sz
-            Kc[ik] = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+            Kc[ik] = np.asarray(gtab.kvecs[ik], dtype=np.float64)
             if (ik + 1) % 6 == 0 or ik == nk - 1:
                 print(f"         k {ik+1}/{nk}")
         B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
