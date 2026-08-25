@@ -1283,7 +1283,7 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 
 @dataclass(frozen=True)
 class _ZetaFitContract:
-	"""Host-only identity and canonical reuse verdict for all zeta channels."""
+	"""Host-only identities and canonical per-channel zeta reuse verdicts."""
 
 	zeta_h5_path: str
 	band_range_left: tuple[int, int]
@@ -1294,24 +1294,32 @@ class _ZetaFitContract:
 	write_ibz_only_charge: bool
 	loader_band_chunk: int
 	provenance: str
-	reuse: bool
+	reuse_charge: bool
 	meta_transverse: object = None
 	centroids_transverse: object = None
 	transverse_identity: object = None
 	write_ibz_only_transverse: bool = False
 	zeta_transverse_paths: tuple[str, ...] = ()
 	provenance_transverse: tuple[str, ...] = ()
+	reuse_transverse: tuple[bool, ...] = ()
+
+	@property
+	def reuse(self):
+		"""Whether every artifact required by this contract is reusable."""
+		return bool(self.reuse_charge and all(self.reuse_transverse))
 
 
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
 		*, print_fn=print):
-	"""Resolve the one all-channel zeta identity before fit-only planning.
+	"""Resolve all zeta identities and reuse verdicts before fit planning.
 
 	Only host metadata and the canonical :func:`_zeta_reuse_ok` owner are used.
-	A bispinor contract includes the transverse centroid/solver identity and
-	requires all four files to pass; partial reuse remains forbidden.  No
-	wavefunction sampling, fit memory planner, or zeta data load occurs here.
+	A bispinor contract validates charge and each transverse artifact
+	independently, so an interrupted later channel cannot invalidate a completed
+	earlier one.  The derived ``reuse`` property remains the all-artifact bundle
+	verdict.  No wavefunction sampling, fit planner, or zeta data load occurs
+	here.
 	"""
 	zeta_edge = resolve_zeta_fit_edge(
 		band_slices, getattr(cfg, "zeta_nband", None))
@@ -1425,24 +1433,18 @@ def _resolve_zeta_fit_contract(
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
-	reuse = _zeta_reuse_ok(
+	reuse_charge = _zeta_reuse_ok(
 		zeta_h5_path, provenance, centroid_indices,
 		print_fn=print_fn, n_rmu_expected=int(meta.n_rmu),
 		q_irr_is_full_identity=q_irr_identity)
-	if reuse and cfg.bispinor:
-		for mu_L, (path_T, provenance_T) in enumerate(
-				zip(transverse_paths, provenance_transverse), start=1):
-			if not _zeta_reuse_ok(
-					path_T, provenance_T, centroids_transverse,
-					print_fn=print_fn,
-					n_rmu_expected=int(meta_transverse.n_rmu),
-					q_irr_is_full_identity=q_irr_identity):
-				print_fn(
-					f"    [zeta reuse] the transverse ζ for μ_L={mu_L} "
-					f"({path_T}) is NOT reusable, so the charge ζ is not "
-					"reused either — refitting all four channels.")
-				reuse = False
-				break
+	reuse_transverse = tuple(
+		bool(_zeta_reuse_ok(
+			path_T, provenance_T, centroids_transverse,
+			print_fn=print_fn,
+			n_rmu_expected=int(meta_transverse.n_rmu),
+			q_irr_is_full_identity=q_irr_identity))
+		for path_T, provenance_T in
+		zip(transverse_paths, provenance_transverse))
 
 	loader_band_chunk = (
 		int(cfg.memory.band_chunk_size)
@@ -1457,13 +1459,14 @@ def _resolve_zeta_fit_contract(
 		write_ibz_only_charge=write_ibz_only_charge,
 		loader_band_chunk=loader_band_chunk,
 		provenance=provenance,
-		reuse=bool(reuse),
+		reuse_charge=bool(reuse_charge),
 		meta_transverse=meta_transverse,
 		centroids_transverse=centroids_transverse,
 		transverse_identity=transverse_identity,
 		write_ibz_only_transverse=write_ibz_only_transverse,
 		zeta_transverse_paths=transverse_paths,
-		provenance_transverse=provenance_transverse)
+		provenance_transverse=provenance_transverse,
+		reuse_transverse=reuse_transverse)
 
 
 def _plan_gflat_chunks_for_channel(
@@ -1603,8 +1606,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
 	``load_centroids_band_chunked``) and (b) the chunk plan dict from
 	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  ``chunks`` may be
-	``None`` only when ``zeta_contract`` carries a completed canonical reuse
-	verdict, in which case no fit-only planner state is consumed.  Returns
+	``None`` only when ``zeta_contract`` carries a completed canonical charge
+	reuse verdict, in which case no charge-fit planner state is consumed.
+	Transverse channels have independent reuse verdicts and use their own
+	channel-sized plan only when at least one must be fit.  Returns
 	``(zeta_h5_path, mem_est, transverse_wfn_data)``.
 
 	``psi_nmu_fresh``/``psi_mun_fresh``: the two-face carrier, required
@@ -1642,6 +1647,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_zeta_cutoff = zeta_contract.zeta_cutoff
 	_zeta_vcoul_cutoff = zeta_contract.zeta_vcoul_cutoff
 	_write_ibz_only_charge = zeta_contract.write_ibz_only_charge
+	_reuse_charge = bool(zeta_contract.reuse_charge)
+	_reuse_T = tuple(bool(value) for value in zeta_contract.reuse_transverse)
 
 	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
 	# picked once by ``plan_gflat_chunks`` in the caller and live in
@@ -1682,15 +1689,19 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			wfn, sym, zeta_contract.meta_transverse,
 			zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
 			zeta_contract.loader_band_chunk)
-	# The non-reusable bispinor path now consumes the transverse identity
-	# already resolved by the all-channel contract.  Only the fit-specific
-	# chunk plan remains here.
+	# Any missing bispinor channel consumes the transverse identity already
+	# resolved by the per-channel contract.  Only the fit-specific chunk plan
+	# remains here.
 	_meta_T = zeta_contract.meta_transverse
 	_cent_T_idx = zeta_contract.centroids_transverse
 	_transverse_identity = zeta_contract.transverse_identity
 	_chunks_T = None
 	_write_ibz_only_transverse = zeta_contract.write_ibz_only_transverse
 	if cfg.bispinor:
+		if len(_reuse_T) != 3:
+			raise AssertionError(
+				"a bispinor zeta contract must carry three transverse "
+				"reuse verdicts")
 		_cent_T_idx = jnp.asarray(
 			zeta_contract.centroids_transverse, dtype=jnp.int32)
 		# Chunk-plan the TRANSVERSE channel SEPARATELY from the charge
@@ -1701,9 +1712,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# ~2.7 GB/rank avoidable gather".  ONE call here, after reuse was
 		# definitively declined and ahead of the μ_L fit loop; all three
 		# Lorentz components share this one transverse-sized plan.
-		_chunks_T, _ = _plan_gflat_chunks_for_channel(
-			meta=_meta_T, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
-			is_bispinor=True, print_fn=print_fn)
+		if not all(_reuse_T):
+			_chunks_T, _ = _plan_gflat_chunks_for_channel(
+				meta=_meta_T, cfg=cfg, band_slices=band_slices,
+				mesh_xy=mesh_xy, is_bispinor=True, print_fn=print_fn)
 	# Fresh writers and provenance stamps consume exactly the identity that
 	# was tested before planning; there is no second reconstruction here.
 	_provenance = zeta_contract.provenance
@@ -1715,36 +1727,43 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	if chunks is None:
+	if not _reuse_charge and chunks is None:
 		raise AssertionError(
-			"a non-reusable zeta reached fit_zeta without the canonical "
+			"a non-reusable charge zeta reached fit_zeta without the canonical "
 			"G-flat chunk plan")
-	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
-		peak_bytes = fit_zeta_to_h5(
-			wfn=wfn, sym=sym, meta=meta,
-			centroid_indices=centroid_indices, mesh_xy=mesh_xy,
-			chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
-			psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
-			band_chunk_size=chunks['band_chunk'],
-			q_chunk_size=chunks['q_chunk'],
-			bispinor=cfg.bispinor,
-			band_range_left=band_range_left,
-			band_range_right=band_range_right,
-			band_norms=_band_norms,
-			distributed_cholesky=cfg.backend.distributed_cholesky,
-			distributed_lu=cfg.backend.distributed_lu,
-			distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
-			zeta_ridge=cfg.backend.zeta_ridge,
-			charge_zeta_solve=cfg.backend.charge_zeta_solve,
-			distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
-			zeta_rcond=cfg.backend.zeta_rcond,
-			gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
-			cache_psi_r=bool(chunks.get('cache_psi_r', True)),
-			write_ibz_only=_write_ibz_only_charge,
-			zeta_cutoff_ry=_zeta_cutoff,
-			low_mem_bands=bool(cfg.memory.low_mem_bands),
-			psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh,
-		)
+	peak_bytes = 0
+	if _reuse_charge:
+		print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
+		         "charge fit skipped independently.")
+	else:
+		with timing.section("gw_jax.zeta_fit_chunked"), \
+		     jax_profile.trace_section("zeta_fit"):
+			peak_bytes = fit_zeta_to_h5(
+				wfn=wfn, sym=sym, meta=meta,
+				centroid_indices=centroid_indices, mesh_xy=mesh_xy,
+				chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
+				psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
+				band_chunk_size=chunks['band_chunk'],
+				q_chunk_size=chunks['q_chunk'],
+				bispinor=cfg.bispinor,
+				band_range_left=band_range_left,
+				band_range_right=band_range_right,
+				band_norms=_band_norms,
+				distributed_cholesky=cfg.backend.distributed_cholesky,
+				distributed_lu=cfg.backend.distributed_lu,
+				distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
+				zeta_ridge=cfg.backend.zeta_ridge,
+				charge_zeta_solve=cfg.backend.charge_zeta_solve,
+				distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
+				zeta_rcond=cfg.backend.zeta_rcond,
+				gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
+				cache_psi_r=bool(chunks.get('cache_psi_r', True)),
+				write_ibz_only=_write_ibz_only_charge,
+				zeta_cutoff_ry=_zeta_cutoff,
+				low_mem_bands=bool(cfg.memory.low_mem_bands),
+				psi_nmu_fresh=psi_nmu_fresh,
+				psi_mun_fresh=psi_mun_fresh,
+			)
 
 	# ── THE ζ RANK CUT'S CLOSURE VERDICT, refused HERE if it must be ──────
 	# The four ζ truncation sites live inside jitted kernels, which cannot
@@ -1763,25 +1782,26 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# against a tolerance of 1e-6, five decades clear of firing.  That deck is
 	# the control for the direction flip: a cut in a gap is unmoved by EITHER
 	# direction, so its retained ranks must be bit-unchanged across it.
-	_sc_mode = spectral_closure.resolve_mode(
-		os.environ.get(spectral_closure.MODE_ENV))
-	# Read the findings BEFORE the refusal clears them, so the "clean" line
-	# below cannot contradict a snap that just fired one line above it.
-	_sc_fired = bool(spectral_closure.pending())
-	spectral_closure.raise_if_pending(
-		"the ζ fit's rank truncation", mode=_sc_mode, log=print_fn)
-	if _sc_mode == "off":
+	if not _reuse_charge:
+		_sc_mode = spectral_closure.resolve_mode(
+			os.environ.get(spectral_closure.MODE_ENV))
+		# Read the findings BEFORE the refusal clears them, so the "clean" line
+		# below cannot contradict a snap that just fired one line above it.
+		_sc_fired = bool(spectral_closure.pending())
+		spectral_closure.raise_if_pending(
+			"the ζ fit's rank truncation", mode=_sc_mode, log=print_fn)
+	if not _reuse_charge and _sc_mode == "off":
 		print_fn("    ζ rank-cut closure: guard is OFF "
 		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
 		         "absence and not a pass.")
-	elif _sc_fired:
+	elif not _reuse_charge and _sc_fired:
 		print_fn(f"    ζ rank-cut closure: guard fired above and the "
 		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
 		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
 		         f"retained span is point-group invariant; the rank it "
 		         f"carries is LOWER than the one zeta_rcond alone would have "
 		         f"chosen, and its κ_eff is correspondingly better.")
-	else:
+	elif not _reuse_charge:
 		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
 		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
 		         f"fell inside a degenerate block of C_q on any q.")
@@ -1795,21 +1815,22 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# The gate fires inside the jitted kernels, which cannot raise, so it
 	# records through a host callback and refuses HERE — before ζ is
 	# consumed by W.  docs/dev/rank_truncation_policy.md owns the policy.
-	_rp_mode = rank_criterion.resolve_policy_mode(
-		os.environ.get(rank_criterion.POLICY_MODE_ENV))
-	_rp_fired = bool(rank_criterion.pending())
-	rank_criterion.raise_if_pending(
-		"the ζ fit's rank truncation", mode=_rp_mode, log=print_fn)
-	if _rp_mode == "off":
+	if not _reuse_charge:
+		_rp_mode = rank_criterion.resolve_policy_mode(
+			os.environ.get(rank_criterion.POLICY_MODE_ENV))
+		_rp_fired = bool(rank_criterion.pending())
+		rank_criterion.raise_if_pending(
+			"the ζ fit's rank truncation", mode=_rp_mode, log=print_fn)
+	if not _reuse_charge and _rp_mode == "off":
 		print_fn("    ζ rank-cut certification: gate is OFF "
 		         f"({rank_criterion.POLICY_MODE_ENV}=off) — NOT CHECKED, "
 		         f"which is an absence and not a pass.")
-	elif _rp_fired:
+	elif not _reuse_charge and _rp_fired:
 		print_fn(f"    ζ rank-cut certification: FIRED above "
 		         f"(mode={_rp_mode}).  The cut bound outside the regime any "
 		         f"measurement certifies; the numbers are in the "
 		         f"[rank-policy] lines.")
-	else:
+	elif not _reuse_charge:
 		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
 		         f"certified κ ceiling "
 		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e} for the charge "
@@ -1841,7 +1862,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# provenance answers "may a later run REUSE this", zeta_is_done answers
 	# "did the writer FINISH" — and either alone stops the reuse.
 	_trunc = active_zeta_truncating_knobs()
-	if _trunc:
+	if not _reuse_charge and _trunc:
 		_names = ", ".join(f"{k}={v}" for k, v in _trunc)
 		print_fn("")
 		print_fn("  " + "!" * 68)
@@ -1854,7 +1875,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		print_fn( "  directory.")
 		print_fn("  " + "!" * 68)
 		print_fn("")
-	elif jax.process_index() == 0:
+	elif not _reuse_charge and jax.process_index() == 0:
 		try:
 			from file_io.isdf_header import stamp_fit_provenance
 			stamp_fit_provenance(zeta_h5_path, _provenance)
@@ -1862,7 +1883,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			# Non-fatal: the ζ itself is fine, it just won't be reusable.
 			print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
 			         f"will be refit on the next run.")
-	barrier("zeta_provenance")
+	if not _reuse_charge:
+		barrier("zeta_provenance")
 
 	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
 	if peak_bytes > 0:
@@ -1941,7 +1963,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# bispinor PRE-FLIGHT above (before the charge fit), so this branch
 	# gate is only reachable with the path present.
 	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
-		print_fn(f"\n  [bispinor] fitting ζ^{{μ_L=1,2,3}} on current-density "
+		print_fn(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
 		         f"centroids: {cfg.paths.centroids_file_current}")
 		# ``meta_T``, the centroid table and its μ padding were built ONCE
 		# in the bispinor pre-flight (they are inputs to the ζ-reuse
@@ -1950,7 +1972,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		cents_curr_idx = _cent_T_idx
 		transverse_wfn_data = _transverse_wfn_data(
 			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
-			band_slices, _chunks_T['band_chunk'])
+			band_slices,
+			(_chunks_T['band_chunk'] if _chunks_T is not None
+			 else zeta_contract.loader_band_chunk))
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
@@ -1991,8 +2015,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			gc.collect()
 
 		for mu_L in (1, 2, 3):
-			_drop_traced_caches()
 			zeta_mu_path = _zeta_T_paths[mu_L]
+			if _reuse_T[mu_L - 1]:
+				print_fn(f"  [zeta reuse] μ_L={mu_L} accepted at "
+				         f"{zeta_mu_path}; fit skipped independently.")
+				continue
+			_drop_traced_caches()
 			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
 			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
 			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
@@ -2582,11 +2610,11 @@ def prepare_isdf_and_wavefunctions(
 			# Resolve the complete charge/bispinor zeta identity before
 			# allocating or pricing anything used solely by a fit.  The one
 			# contract includes transverse centroid/solver provenance and an
-			# all-four-channel verdict when bispinor=true.
+			# independent verdict for every artifact when bispinor=true.
 			zeta_contract = _resolve_zeta_fit_contract(
 				wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
 				tmp_dir, print_fn=print0)
-			zeta_reused = bool(zeta_contract.reuse)
+			charge_zeta_reused = bool(zeta_contract.reuse_charge)
 
 			# Plan chunks ONCE for a channel that will actually FIT.  The
 			# canonical planner still owns band/r/q/G-flat chunks, P_min and
@@ -2595,7 +2623,7 @@ def prepare_isdf_and_wavefunctions(
 			# same owner, so fresh charge and transverse channels cannot drift.
 			chunks = None
 			gflat_plan = None
-			if not zeta_reused:
+			if not charge_zeta_reused:
 				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
 					meta=meta, cfg=cfg, band_slices=band_slices,
 					mesh_xy=mesh_xy, is_bispinor=bool(cfg.bispinor),

@@ -5,8 +5,9 @@ is a two-leg job (fit, then reuse in the same directory, compared
 EXACT-0), which is far too expensive to be a regression test.  What is
 cheap to pin is the SHAPE of the code that job certified:
 
-1. The one pre-fit contract's reuse decision is not gated on
-   ``cfg.bispinor``.
+1. The one pre-fit contract validates charge and every transverse artifact
+   independently; a failed later channel cannot invalidate an accepted earlier
+   channel.
    The line ``_reuse = (not cfg.bispinor) and _zeta_reuse_ok(...)``
    switched the cache off for the entire bispinor run and cost a
    measured 318 s of a 660 s GW wall on every rerun (b600 bispinor,
@@ -26,7 +27,10 @@ cheap to pin is the SHAPE of the code that job certified:
    sampling ψ through the same code; a third, open-coded sampling site
    is how that guarantee would rot.
 
-5. The transverse ζ files get a provenance stamp.  Without it every
+5. Only missing channels reach the incumbent fit/stamp path; accepted files
+   are never opened by the writer during resume.
+
+6. The transverse ζ files get a provenance stamp.  Without it every
    bispinor rerun refits: rule 4 of ``_zeta_reuse_ok`` is "no
    provenance ⇒ refit", and the μ_L loop used to write none.
 """
@@ -65,19 +69,24 @@ def _calls(tree, name):
     return out
 
 
-def test_reuse_decision_is_not_gated_on_bispinor():
+def test_reuse_decisions_are_independent_and_use_one_validator():
     _, contract = _function_tree("_resolve_zeta_fit_contract")
-    assigns = [n for n in ast.walk(contract)
-               if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "reuse"
-                       for t in n.targets)]
-    assert assigns, "the zeta contract has no canonical `reuse` verdict"
-    first = min(assigns, key=lambda n: (n.lineno, n.col_offset))
-    assert isinstance(first.value, ast.Call), (
-        "the first reuse verdict is not a bare _zeta_reuse_ok call — a "
-        "bispinor short-circuit would switch off the all-channel cache")
-    assert isinstance(first.value.func, ast.Name) and \
-        first.value.func.id == "_zeta_reuse_ok"
+    direct_assigns = {
+        t.id: n for n in contract.body if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)
+    }
+    charge = direct_assigns.get("reuse_charge")
+    transverse = direct_assigns.get("reuse_transverse")
+    assert charge is not None and transverse is not None, (
+        "the zeta contract must publish direct charge and transverse reuse "
+        "verdicts before any fit planning")
+    assert len(_calls(charge.value, "_zeta_reuse_ok")) == 1
+    assert len(_calls(transverse.value, "_zeta_reuse_ok")) == 1
+    assert charge.lineno < transverse.lineno
+    # Both assignments are direct function-body statements, rather than the
+    # transverse probe living under ``if reuse_charge``.  Thus a bad charge
+    # artifact cannot prevent authentication/reuse of completed current files.
+    assert charge in contract.body and transverse in contract.body
 
 
 def test_every_reuse_check_probes_the_dataset_extent():
@@ -105,10 +114,10 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     assert resolves[0].lineno < plans[0].lineno
     guarded = [n for n in ast.walk(prepare)
                if isinstance(n, ast.If)
-               and ast.unparse(n.test) == "not zeta_reused"
+               and ast.unparse(n.test) == "not charge_zeta_reused"
                and any(x is plans[0] for x in ast.walk(n))]
     assert len(guarded) == 1
-    assert ast.unparse(guarded[0].test) == "not zeta_reused"
+    assert ast.unparse(guarded[0].test) == "not charge_zeta_reused"
 
     _, fit_zeta = _fit_zeta_tree()
     transverse_plans = _calls(fit_zeta, "_plan_gflat_chunks_for_channel")
@@ -118,6 +127,40 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
                     and ast.unparse(n.test) == "zeta_contract.reuse")
     assert reuse_if.lineno < transverse_plans[0].lineno
     assert any(isinstance(n, ast.Return) for n in ast.walk(reuse_if))
+    transverse_plan_guard = [n for n in ast.walk(fit_zeta)
+                             if isinstance(n, ast.If)
+                             and ast.unparse(n.test) == "not all(_reuse_T)"
+                             and any(x is transverse_plans[0]
+                                     for x in ast.walk(n))]
+    assert len(transverse_plan_guard) == 1
+
+
+def test_only_missing_channels_reach_fit_writers():
+    _, fit_zeta = _fit_zeta_tree()
+    fits = _calls(fit_zeta, "fit_zeta_to_h5")
+    assert len(fits) == 2, (
+        "expected the incumbent charge and transverse fit call sites only; "
+        "found %d" % len(fits))
+    charge_guards = [n for n in ast.walk(fit_zeta)
+                     if isinstance(n, ast.If)
+                     and ast.unparse(n.test) == "_reuse_charge"
+                     and any(x is fits[0] for stmt in n.orelse
+                             for x in ast.walk(stmt))]
+    assert len(charge_guards) == 1, (
+        "the charge writer is not exclusively in the non-reuse branch")
+
+    mu_loops = [n for n in ast.walk(fit_zeta)
+                if isinstance(n, ast.For)
+                and ast.unparse(n.target) == "mu_L"
+                and any(x is fits[1] for x in ast.walk(n))]
+    assert len(mu_loops) == 1
+    loop = mu_loops[0]
+    skip = next((n for n in loop.body if isinstance(n, ast.If)
+                 and ast.unparse(n.test) == "_reuse_T[mu_L - 1]"), None)
+    assert skip is not None and any(isinstance(n, ast.Continue)
+                                    for n in ast.walk(skip)), (
+        "an accepted transverse artifact does not continue past the writer")
+    assert skip.lineno < fits[1].lineno
 
 
 def test_bispinor_reuse_path_returns_rebuilt_transverse_data():
