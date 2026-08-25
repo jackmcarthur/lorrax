@@ -667,7 +667,8 @@ def test_exact_icl_finite_transfer_rejects_noncanonical_wrap_and_stamps_rule():
     assert len({first, second, third}) == 3
 
 
-def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity():
+def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
+        monkeypatch):
     """The body endpoint meets the uniform owner before either response fit.
 
     q=0 isolates the new transaction's raw-alpha + HALFALPHA*VNL assembly
@@ -712,6 +713,7 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity():
         ngk_valid=lambda *, k: np.asarray([3], dtype=np.int32),
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
+    monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
 
     endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4[None], wfn=wfn, band_start=0, band_stop=2,
@@ -766,10 +768,15 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity():
         occ=jnp.asarray([[1.0, 0.0]]), slices=slices,
         psi_nmu=raw_rmu,
         psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
-    chi_12 = w_isdf.compute_finite_transfer_current_block_row(
-        endpoint, wfns,
-        SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
-        SimpleNamespace(nk_tot=1), mesh,
+    quad = SimpleNamespace(
+        tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
+    meta = SimpleNamespace(nk_tot=1)
+    with pytest.raises(NotImplementedError, match="source/band/centroid"):
+        w_isdf.compute_finite_transfer_current_block_row(
+            endpoint, wfns, quad, meta, mesh,
+            vertex_left=1, vertex_right=2)
+    chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
+        endpoint, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     raw_c = np.asarray(raw_rmu[0, 1])
     current_v_A = np.asarray(endpoint.current_nmu[0, 0, 0])
@@ -781,7 +788,8 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity():
         chi_12, expected_chi_12, rtol=5.0e-13, atol=5.0e-13)
 
 
-def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap():
+def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
+        monkeypatch):
     """A second q at one executable shape cannot reuse the q=0 closure."""
     setup = _finite_setup(third_derivatives=True)
     G = np.asarray([
@@ -827,6 +835,7 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap():
         ngk_valid=lambda *, k: ngk,
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
+    monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
 
     common_kwargs = dict(
         wfn=wfn, band_start=0, band_stop=2, geom=geom,
@@ -895,7 +904,7 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap():
         occ=jnp.asarray(np.tile([1.0, 0.0], (4, 1))), slices=slices,
         psi_nmu=raw_rmu,
         psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
-    chi_12 = w_isdf.compute_finite_transfer_current_block_row(
+    chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
         endpoint_q1, wfns,
         SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
         SimpleNamespace(nk_tot=4), mesh,
