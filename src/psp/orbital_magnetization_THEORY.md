@@ -20,9 +20,8 @@ v = dH/dk = 2(k+G)_cart  +  dV_NL/dk      [Ry·Bohr]
 i.e. the kinetic part is `2(k+G)` because a plane wave has kinetic energy
 `T = |k+G|²` (Ry) and `dT/dk = 2(k+G)`; this factor of 2 is exactly what
 distinguishes the *velocity* `dH/dk` from the bare *momentum* `⟨p⟩ = (k+G)`
-(`v = 2p` since `mₑ = ½`). In LORRAX this is what
-`dft_operators.velocity_matrix_k` returns (`dft_operators.py:1063` hard-codes
-the `2.0`, line `1082` adds the nonlocal `dV_NL/dk`).
+(`v = 2p` since `mₑ = ½`). In LORRAX this is assembled from
+`dft_operators.momentum_matrix_k` and `vnl_ops.vnl_velocity_matrix`.
 
 ## 1. Master formula (modern theory)
 
@@ -108,7 +107,7 @@ m_γ / μ_B = (−1) · ─────  Σ_k w_k  Im Σ      Σ    ε_γab v^a_
 > **Prefactor = −½.** The magnitude ½ is `mₑ/ħ²` in Ry·a₀² and is confirmed
 > three independent ways (direct, momentum cross-check `v = 2p`, and SI
 > dimensional analysis). The **sign** is the electron-charge minus
-> (`m = −μ_B L/ħ`); LORRAX's `velocity_matrix_k` returns the velocity (not the
+> (`m = −μ_B L/ħ`); LORRAX's production operator pair returns the velocity (not the
 > momentum), so no extra factor of 2 is applied. There is **no spin-degeneracy
 > factor of 2** — each 2-component spinor band is counted once.
 
@@ -169,8 +168,8 @@ computed sign is reported, not assumed. The expected magnitude for CrI₃ is
 * **Nonlocal-velocity sign (definitive).** The sign of `dV_NL/dk` is fixed by a
   direct off-diagonal finite difference of `⟨m|V_NL(k)|n⟩` (ψ held fixed):
   the analytic `compute_vnl_velocity_cart` equals `+dV_NL/dk` to ratio +1.000.
-  Hence the physical velocity is **`v = p + vNL`** (the canonical
-  `velocity_matrix_k` convention). The dipole driver's `p − vNL` flip is a
+  Hence the physical velocity is **`v = p + vNL`** (the canonical production
+  operator convention). The dipole driver's `p − vNL` flip is a
   BerkeleyGW-matching convention for optical matrix elements, *not* the
   physical velocity, and must not be used here — it would flip the orbital
   moment's sign (CrI₃: `+0.026` → `−0.081 μ_B`).

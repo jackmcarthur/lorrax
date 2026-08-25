@@ -17,7 +17,7 @@ autodiff-safe behaviour at K=0.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -25,9 +25,13 @@ import jax.numpy as jnp
 from psp.radial.build_projectors_qe import (
     build_E_blocks_full, pseudo_has_j_channels, pseudo_soc_strength_ry,
 )
-from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-from psp.radial_tables import projector_deriv_table as _projector_deriv_table
+
+
+# A deserialized or manually forged VNLKData cannot reproduce this identity.
+# That makes uniform coefficient carriers deliberately in-process only until
+# WFN/state stores expose a durable identity that can be validated instead.
+_UNIFORM_CONTEXT_TOKEN = object()
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +83,19 @@ class VNLSetup:
     row_l: jax.Array | None = None         # (total_R,) int — angular momentum
     row_m: jax.Array | None = None         # (total_R,) int — m index into S_all[l]
     row_tau: jax.Array | None = None       # (total_R, 3) float — atom position (crystal)
+    # Analytic second radial derivative of the reduced projector form factor.
+    # Kept beside G/Gp so every VNL derivative consumes the same radial owner.
+    Gpp_table: jax.Array | None = None     # (total_nbeta, n_q)
 
 
 @dataclass
 class VNLKData:
     """Per-k-point VNL projector data.  Precomputed for fast apply."""
-    Z: jax.Array                    # (total_R, nG) complex128
+    # ``None`` only for an exact-q=0 coefficient context: its normal path
+    # fuses Z differentiation directly into c/dc/d2c and deliberately never
+    # materializes a standalone projector array.  Hamiltonian kdata always
+    # carries ``(total_R,nG)`` here.
+    Z: jax.Array | None             # (total_R, nG) complex128
     E_super: jax.Array              # (nspinor, nspinor, total_R, total_R)
     nG: int
     total_R: int
@@ -101,6 +112,50 @@ class VNLKData:
     # field documents the layout rather than being a required argument to
     # anything: a kdata from that route is already inert on the pad.
     g_mask: np.ndarray | None = None   # (nG,) float64 or None
+    # Production identity/layout metadata.  Ordinary Hamiltonian builders
+    # populate these too; ``uniform_gauge`` is true only for the exact-q=0
+    # derivative constructor below.
+    setup: VNLSetup | None = None
+    k_crys: np.ndarray | None = None
+    G_int: np.ndarray | None = None
+    uniform_gauge: bool = False
+    _uniform_token: object | None = field(
+        default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class VNLProjectorCoefficientBlock:
+    r"""Ephemeral ``<beta|psi>`` block through second operator derivative.
+
+    The carrier has no G axis.  It is valid only with the exact in-process
+    :class:`VNLKData` instance that produced it; this fail-closed identity is
+    intentional because the WFN/state-block stores do not yet expose one
+    durable identity shared by every caller.
+    """
+
+    c: jax.Array                    # (R, spin, band)
+    dc_cart: jax.Array              # (cart, R, spin, band)
+    d2c_cart: jax.Array             # (cart, cart, R, spin, band)
+    kdata: VNLKData
+    state_block_identity: object
+
+
+@dataclass(frozen=True)
+class VNLMatrixDerivatives:
+    """Rectangular bra/ket matrices of VNL and its uniform derivatives."""
+
+    value: jax.Array
+    gamma_cart: jax.Array
+    lambda_cart: jax.Array
+
+
+@dataclass(frozen=True)
+class VNLKetDerivatives:
+    """Explicit G-space action, formed only at the dedicated apply door."""
+
+    value_ket: jax.Array
+    gamma_cart_ket: jax.Array
+    lambda_cart_ket: jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +268,7 @@ def build_vnl_setup(
     nspinor: int | None = None,
     q_max: float | None = None,
     soc: bool | None = None,
+    compute_contact: bool = False,
     print_fn=print,
 ) -> VNLSetup:
     """Build k-independent VNL data: radial tables, channel metadata.
@@ -229,6 +285,10 @@ def build_vnl_setup(
         a QE ``<spinorbit>`` flag and, failing that, keeps the historical
         j-resolved behaviour and ANNOUNCES the assumption.  See
         ``psp.radial.build_projectors_qe`` for why noncolin ≠ lspinorb.
+    compute_contact : bool
+        Opt in to the extra analytic ``G''`` radial table needed by the
+        uniform nonlocal contact.  False by default so existing Hamiltonian,
+        NSCF, and dipole setup pays no l+2 Bessel compilation/pass.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
@@ -268,7 +328,8 @@ def build_vnl_setup(
 
     # Extract species data and projector tables
     species_list = extract_species(pseudos, nspinor=nspinor)
-    tables = build_all_tables(species_list, q_max, n_q)
+    tables = build_all_tables(
+        species_list, q_max, n_q, second_derivatives=compute_contact)
     species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
     q_grid = tables["q"]
     dq = tables["dq"]
@@ -277,6 +338,7 @@ def build_vnl_setup(
     channels: list[ChannelMeta] = []
     G_rows: list[np.ndarray] = []
     Gp_rows: list[np.ndarray] = []
+    Gpp_rows: list[np.ndarray] = []
     beta_idx = 0
 
     for isp, sp in enumerate(species_list):
@@ -312,19 +374,23 @@ def build_vnl_setup(
             for ip in proj_ids:
                 F_vals = tables["proj_tables"][isp][ip]
                 H_vals = tables["deriv_tables"][isp][ip]
+                Gpp_vals = (tables["second_deriv_tables"][isp][ip]
+                            if compute_contact else None)
                 if l == 0:
                     G_vals = F_vals.copy()
                     Gp_vals = -H_vals
                 else:
                     G_vals = np.empty(n_q, dtype=np.float64)
                     G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
-                    G_vals[0] = F_vals[1] / q_grid[1] ** l
+                    G_vals[0] = tables["reduced_origins"][isp][ip]
                     Gp_vals = np.zeros(n_q, dtype=np.float64)
                     Gp_vals[1:] = -H_vals[1:] / q_grid[1:] ** l
                     # q=0 limit of dG_l/dq is 0 (j_{l+1}(qr) ~ q^{l+1}, so
                     # H_{l+1}/q^l → 0 as q → 0).
                 G_rows.append(G_vals)
                 Gp_rows.append(Gp_vals)
+                if compute_contact:
+                    Gpp_rows.append(Gpp_vals)
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
@@ -335,6 +401,10 @@ def build_vnl_setup(
 
     G_table = jnp.asarray(np.stack(G_rows), dtype=jnp.float64) if G_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
     Gp_table = jnp.asarray(np.stack(Gp_rows), dtype=jnp.float64) if Gp_rows else jnp.zeros((0, n_q), dtype=jnp.float64)
+    Gpp_table = (
+        (jnp.asarray(np.stack(Gpp_rows), dtype=jnp.float64)
+         if Gpp_rows else jnp.zeros((0, n_q), dtype=jnp.float64))
+        if compute_contact else None)
     total_R = sum(ch.R * ch.natoms for ch in channels)
     l_max = max((ch.l for ch in channels), default=0)
 
@@ -382,6 +452,7 @@ def build_vnl_setup(
         E_super=E_super_j, l_max=l_max, soc=bool(soc_resolved),
         row_beta_idx=row_beta_idx_j,
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
+        Gpp_table=Gpp_table,
     )
 
 
@@ -479,6 +550,8 @@ def build_vnl_kdata(
         total_R=kdata.total_R,
         dZ=None if kdata.dZ is None else kdata.dZ * mask_j[None, None, :],
         g_mask=g_mask,
+        setup=setup, k_crys=np.asarray(kvec, dtype=np.float64),
+        G_int=np.asarray(G_pad, dtype=np.int32),
     )
 
 
@@ -492,9 +565,14 @@ def build_vnl_kdata_from_kvec(
     compute_dZ: bool = False,
 ) -> VNLKData:
     """Build dense Z [and dZ] from explicit k-vector + G-list (no SymMaps)."""
-    return _build_vnl_kdata_core(np.asarray(kvec, dtype=float),
-                                  np.asarray(Gk_int, dtype=int),
-                                  setup, compute_dZ=compute_dZ)
+    k_np = np.asarray(kvec, dtype=float)
+    G_np = np.asarray(Gk_int, dtype=int)
+    out = _build_vnl_kdata_core(
+        k_np, G_np, setup, compute_dZ=compute_dZ)
+    out.setup = setup
+    out.k_crys = k_np
+    out.G_int = G_np
+    return out
 
 
 def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
@@ -537,21 +615,15 @@ def _assemble_Z_jit(
     doesn't enter the jit.  ``l_max`` is the only static arg (it
     controls the unrolled solid-harmonics block).
     """
-    from psp.radial.solid_harmonics import all_solid_harmonics
-
     K_crys = Gk_int.astype(jnp.float64) + kvec[None, :]
     K_cart = K_crys @ B
     # Regularizer: avoids 1/q divergence in autodiff.  See
     # _build_vnl_kdata_core for the full physics rationale.
     q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
     G_all = _interp_with_deriv(q, dq, G_table, Gp_table)        # (total_nbeta, nG)
-    S_all = all_solid_harmonics(K_cart, l_max=l_max)            # (l_max+1, 2*l_max+1, nG)
-
-    G_r = G_all[row_beta_idx]                                    # (total_R, nG)
-    S_r = S_all[row_l, row_m]                                    # (total_R, nG)
-    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T     # (total_R, nG)
-    c_il_r = prefactor * (1j) ** row_l                           # (total_R,)
-    return c_il_r[:, None] * G_r * S_r * phase_r                 # (total_R, nG)
+    return _assemble_projector_rows(
+        K_crys, K_cart, G_all, prefactor,
+        row_beta_idx, row_l, row_m, row_tau, l_max=l_max)
 
 
 def _build_vnl_kdata_core(
@@ -667,6 +739,325 @@ def _build_vnl_kdata_core(
         Z=Z, E_super=setup.E_super, nG=nG,
         total_R=setup.total_R, dZ=dZ_j,
     )
+
+
+# ---------------------------------------------------------------------------
+# Uniform-gauge derivatives — production setup, coefficient-space closure
+# ---------------------------------------------------------------------------
+
+_FINITE_Q_GATE = "EM-VERTEX-FINITE-Q-WILSON"
+
+
+def _require_uniform_vnl_context(
+    *, caller: str, q_cart_bohr_inv=None, kdata: VNLKData | None = None,
+) -> None:
+    """The one validity boundary shared by every public derivative/apply door."""
+    if q_cart_bohr_inv is not None:
+        q = np.asarray(q_cart_bohr_inv, dtype=np.float64)
+        if q.shape != (3,):
+            raise ValueError(
+                f"{caller}: q_cart_bohr_inv must have shape (3,), got {q.shape}")
+        if not np.array_equal(q, np.zeros(3, dtype=np.float64)):
+            raise NotImplementedError(
+                f"GATE {_FINITE_Q_GATE}: got q_cart_bohr_inv={q.tolist()}; "
+                "only exact uniform q=0 is bound. A finite-q nonlocal "
+                "pseudopotential vertex requires the repository's selected "
+                "Wilson-line/path prescription."
+            )
+    if kdata is not None:
+        if (not isinstance(kdata, VNLKData) or not kdata.uniform_gauge
+                or kdata._uniform_token is not _UNIFORM_CONTEXT_TOKEN):
+            raise ValueError(
+                f"{caller}: requires VNLKData from build_uniform_vnl_kdata")
+        setup = kdata.setup
+        if setup is None or setup.Gpp_table is None:
+            raise ValueError(
+                f"{caller}: incomplete uniform VNL production context")
+        if kdata.k_crys is None or kdata.G_int is None:
+            raise ValueError(f"{caller}: missing k/G identity")
+        if (setup.E_super is None or setup.row_beta_idx is None
+                or setup.row_l is None or setup.row_m is None
+                or setup.row_tau is None):
+            raise ValueError(
+                f"{caller}: incomplete flattened production VNL metadata")
+        if setup.soc and setup.nspinor != 2:
+            raise ValueError(
+                f"{caller}: SOC VNL requires two physical spin components, "
+                f"got nspinor={setup.nspinor}")
+
+
+@jax.custom_jvp
+def _interp_reduced_on_cart(K_cart, dq, table, dtable, d2table):
+    """Evaluate reduced radial tables with their exact regular Cartesian JVP."""
+    q2 = jnp.sum(K_cart * K_cart, axis=1)
+    q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
+    q = jnp.where(q2 > 0.0, q_safe, 0.0)
+    return _table_interp(q, dq, table)
+
+
+@_interp_reduced_on_cart.defjvp
+def _interp_reduced_on_cart_jvp(primals, tangents):
+    K_cart, dq, table, dtable, d2table = primals
+    dK_cart, _, _, _, _ = tangents
+    q2 = jnp.sum(K_cart * K_cart, axis=1)
+    q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
+    q = jnp.where(q2 > 0.0, q_safe, 0.0)
+    value = _table_interp(q, dq, table)
+    # Nested JVPs must differentiate G' with the analytic G'' table, not
+    # with the slope of the linear interpolant.
+    radial_prime = _interp_with_deriv(q, dq, dtable, d2table)
+    radial_second = _table_interp(q, dq, d2table)
+    radial_prime_over_q = jnp.where(
+        q2[None, :] > 0.0,
+        radial_prime / q_safe[None, :],
+        radial_second,
+    )
+    tangent = radial_prime_over_q * jnp.sum(
+        K_cart * dK_cart, axis=1)[None, :]
+    return value, tangent
+
+
+def _assemble_projector_rows(
+    K_crys, K_cart, G_all, prefactor,
+    row_beta_idx, row_l, row_m, row_tau, *, l_max,
+):
+    """The single flattened production projector-row spelling."""
+    from psp.radial.solid_harmonics import all_solid_harmonics
+
+    S_all = all_solid_harmonics(K_cart, l_max=l_max)
+    G_r = G_all[row_beta_idx]
+    S_r = S_all[row_l, row_m]
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T
+    c_il_r = prefactor * (1j) ** row_l
+    return c_il_r[:, None] * G_r * S_r * phase_r
+
+
+def _assemble_uniform_projectors(
+    k_crys, G_int, B, dq, G_table, Gp_table, Gpp_table, prefactor,
+    row_beta_idx, row_l, row_m, row_tau, *, l_max,
+):
+    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
+    K_cart = K_crys @ B
+    G_all = _interp_reduced_on_cart(
+        K_cart, dq, G_table, Gp_table, Gpp_table)
+    return _assemble_projector_rows(
+        K_crys, K_cart, G_all, prefactor,
+        row_beta_idx, row_l, row_m, row_tau, l_max=l_max)
+
+
+def build_uniform_vnl_kdata(
+    k_crys,
+    G_int,
+    setup: VNLSetup,
+    *,
+    g_mask=None,
+    q_cart_bohr_inv=(0.0, 0.0, 0.0),
+) -> VNLKData:
+    """Bind exact-q=0 derivative work to one production VNL k/G context."""
+    _require_uniform_vnl_context(
+        caller="build_uniform_vnl_kdata",
+        q_cart_bohr_inv=q_cart_bohr_inv)
+    if setup.Gpp_table is None:
+        raise ValueError(
+            "build_uniform_vnl_kdata: VNLSetup lacks analytic Gpp_table")
+    k_np = np.array(k_crys, dtype=np.float64, copy=True)
+    G_np = np.array(G_int, dtype=np.int32, copy=True)
+    if k_np.shape != (3,) or G_np.ndim != 2 or G_np.shape[1] != 3:
+        raise ValueError(
+            "build_uniform_vnl_kdata: expected k_crys=(3,), G_int=(nG,3), "
+            f"got {k_np.shape}/{G_np.shape}")
+    if g_mask is None:
+        mask_np = np.ones(G_np.shape[0], dtype=np.float64)
+    else:
+        mask_np = np.array(g_mask, dtype=np.float64, copy=True)
+        if mask_np.shape != (G_np.shape[0],):
+            raise ValueError(
+                "build_uniform_vnl_kdata: g_mask must match G_int rows")
+        if not np.all((mask_np == 0.0) | (mask_np == 1.0)):
+            raise ValueError("build_uniform_vnl_kdata: g_mask must be binary")
+    k_np.flags.writeable = False
+    G_np.flags.writeable = False
+    mask_np.flags.writeable = False
+
+    return VNLKData(
+        Z=None, E_super=setup.E_super, nG=G_np.shape[0],
+        total_R=setup.total_R, dZ=None, g_mask=mask_np,
+        setup=setup, k_crys=k_np, G_int=G_np, uniform_gauge=True,
+        _uniform_token=_UNIFORM_CONTEXT_TOKEN,
+    )
+
+
+def physical_vnl_spinor_block(psi_G, kdata: VNLKData, caller: str):
+    """Canonical physical two-spinor slice/mismatch refusal for VNL users."""
+    psi = jnp.asarray(psi_G)
+    setup = kdata.setup
+    if psi.ndim != 3:
+        raise ValueError(
+            f"{caller}: psi_G must be (band,spin,G), got {psi.shape}")
+    if psi.shape[-1] != kdata.nG:
+        raise ValueError(
+            f"{caller}: psi_G/G-label extent mismatch "
+            f"{psi.shape[-1]} != {kdata.nG}")
+    if psi.shape[1] == setup.nspinor:
+        physical = psi
+    elif psi.shape[1] == 4 and setup.nspinor == 2:
+        # Canonical bispinor order is [large_up, large_down, small_up,
+        # small_down].  The norm-conserving DFT VNL acts on the physical
+        # two-spinor (large component) only.
+        physical = psi[:, :2, :]
+    else:
+        raise ValueError(
+            f"{caller}: physical-spinor mismatch: psi has {psi.shape[1]} "
+            f"components, VNLSetup owns {setup.nspinor}; only canonical "
+            "4-component bispinor -> first 2 physical components is allowed")
+    mask = jnp.asarray(kdata.g_mask, dtype=physical.real.dtype)
+    return physical * mask[None, None, :]
+
+
+@functools.partial(jax.jit, static_argnames=("l_max",))
+def _projector_coefficient_derivatives(
+    k_crys, G_int, psi_G, B, dq, G_table, Gp_table, Gpp_table,
+    prefactor, row_beta_idx, row_l, row_m, row_tau, Binv, *, l_max,
+):
+    def coefficients(k_value):
+        Z = _assemble_uniform_projectors(
+            k_value, G_int, B, dq, G_table, Gp_table, Gpp_table,
+            prefactor, row_beta_idx, row_l, row_m, row_tau,
+            l_max=l_max)
+        return jnp.einsum(
+            "RG,nsG->Rsn", jnp.conj(Z), psi_G, optimize=True)
+
+    c = coefficients(k_crys)
+    dc_crys = jax.jacfwd(coefficients)(k_crys)
+    d2c_crys = jax.jacfwd(jax.jacfwd(coefficients))(k_crys)
+    dc_cart = jnp.einsum("Rsni,ai->aRsn", dc_crys, Binv, optimize=True)
+    d2c_cart = jnp.einsum(
+        "Rsnij,ai,bj->abRsn", d2c_crys, Binv, Binv, optimize=True)
+    return c, dc_cart, d2c_cart
+
+
+def vnl_projector_coefficients_k(
+    kdata: VNLKData,
+    psi_G,
+    *,
+    state_block_identity,
+) -> VNLProjectorCoefficientBlock:
+    """Contract one band block with beta/d-beta/d2-beta in one fused trace."""
+    _require_uniform_vnl_context(
+        caller="vnl_projector_coefficients_k", kdata=kdata)
+    if state_block_identity is None:
+        raise ValueError(
+            "vnl_projector_coefficients_k: state_block_identity is required")
+    psi = physical_vnl_spinor_block(
+        psi_G, kdata, "vnl_projector_coefficients_k")
+    setup = kdata.setup
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    c, dc, d2c = _projector_coefficient_derivatives(
+        jnp.asarray(kdata.k_crys), jnp.asarray(kdata.G_int), psi, B,
+        jnp.asarray(setup.dq), setup.G_table, setup.Gp_table,
+        setup.Gpp_table, jnp.asarray(setup.prefactor),
+        setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
+        jnp.linalg.inv(B), l_max=int(setup.l_max))
+    return VNLProjectorCoefficientBlock(
+        c=c, dc_cart=dc, d2c_cart=d2c, kdata=kdata,
+        state_block_identity=state_block_identity)
+
+
+def vnl_matrix_derivatives_from_projector_coefficients(
+    bra: VNLProjectorCoefficientBlock,
+    ket: VNLProjectorCoefficientBlock,
+) -> VNLMatrixDerivatives:
+    r"""Close rectangular bra/ket VNL derivatives in coefficient space.
+
+    The contact contains exactly the four product-rule terms
+    ``d2cL^dag E cR + dcL^dag E dcR + dcL^dag E dcR + cL^dag E d2cR``.
+    """
+    _require_uniform_vnl_context(
+        caller="vnl_matrix_derivatives_from_projector_coefficients",
+        kdata=bra.kdata)
+    _require_uniform_vnl_context(
+        caller="vnl_matrix_derivatives_from_projector_coefficients",
+        kdata=ket.kdata)
+    if bra.kdata is not ket.kdata:
+        raise ValueError(
+            "stale VNL coefficient carrier: bra/ket do not share the exact "
+            "in-process k/setup/G/mask context")
+    E = bra.kdata.setup.E_super
+    Ec = jnp.einsum("stRQ,Qtn->Rsn", E, ket.c, optimize=True)
+    Edc = jnp.einsum(
+        "stRQ,aQtn->aRsn", E, ket.dc_cart, optimize=True)
+    Ed2c = jnp.einsum(
+        "stRQ,abQtn->abRsn", E, ket.d2c_cart, optimize=True)
+    value = jnp.einsum("Rsm,Rsn->mn", jnp.conj(bra.c), Ec, optimize=True)
+    gamma = (
+        jnp.einsum(
+            "aRsm,Rsn->amn", jnp.conj(bra.dc_cart), Ec, optimize=True)
+        + jnp.einsum(
+            "Rsm,aRsn->amn", jnp.conj(bra.c), Edc, optimize=True))
+    contact = (
+        jnp.einsum(
+            "abRsm,Rsn->abmn", jnp.conj(bra.d2c_cart), Ec,
+            optimize=True)
+        + jnp.einsum(
+            "aRsm,bRsn->abmn", jnp.conj(bra.dc_cart), Edc,
+            optimize=True)
+        + jnp.einsum(
+            "bRsm,aRsn->abmn", jnp.conj(bra.dc_cart), Edc,
+            optimize=True)
+        + jnp.einsum(
+            "Rsm,abRsn->abmn", jnp.conj(bra.c), Ed2c,
+            optimize=True))
+    return VNLMatrixDerivatives(
+        value=value, gamma_cart=gamma, lambda_cart=contact)
+
+
+@functools.partial(jax.jit, static_argnames=("l_max",))
+def _apply_uniform_vnl_derivatives(
+    k_crys, G_int, psi_G, B, dq, G_table, Gp_table, Gpp_table,
+    prefactor, row_beta_idx, row_l, row_m, row_tau, E_super, Binv,
+    *, l_max,
+):
+    def action(k_value):
+        Z = _assemble_uniform_projectors(
+            k_value, G_int, B, dq, G_table, Gp_table, Gpp_table,
+            prefactor, row_beta_idx, row_l, row_m, row_tau,
+            l_max=l_max)
+        c = jnp.einsum(
+            "RG,nsG->Rsn", jnp.conj(Z), psi_G, optimize=True)
+        Ec = jnp.einsum("stRQ,Qtn->Rsn", E_super, c, optimize=True)
+        return jnp.einsum("RG,Rsn->nsG", Z, Ec, optimize=True)
+
+    value = action(k_crys)
+    d_crys = jax.jacfwd(action)(k_crys)
+    d2_crys = jax.jacfwd(jax.jacfwd(action))(k_crys)
+    gamma = jnp.einsum("nsGi,ai->ansG", d_crys, Binv, optimize=True)
+    contact = jnp.einsum(
+        "nsGij,ai,bj->abnsG", d2_crys, Binv, Binv, optimize=True)
+    return value, gamma, contact
+
+
+def apply_uniform_vnl_derivatives_to_ket(
+    kdata: VNLKData,
+    psi_G,
+) -> VNLKetDerivatives:
+    """Dedicated explicit G-space action; no projector Hessian is retained."""
+    _require_uniform_vnl_context(
+        caller="apply_uniform_vnl_derivatives_to_ket", kdata=kdata)
+    psi = physical_vnl_spinor_block(
+        psi_G, kdata, "apply_uniform_vnl_derivatives_to_ket")
+    setup = kdata.setup
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    value, gamma, contact = _apply_uniform_vnl_derivatives(
+        jnp.asarray(kdata.k_crys), jnp.asarray(kdata.G_int), psi, B,
+        jnp.asarray(setup.dq), setup.G_table, setup.Gp_table,
+        setup.Gpp_table, jnp.asarray(setup.prefactor),
+        setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
+        setup.E_super, jnp.linalg.inv(B), l_max=int(setup.l_max))
+    mask = jnp.asarray(kdata.g_mask, dtype=value.real.dtype)
+    return VNLKetDerivatives(
+        value_ket=value * mask[None, None, :],
+        gamma_cart_ket=gamma * mask[None, None, None, :],
+        lambda_cart_ket=contact * mask[None, None, None, None, :])
 
 
 # ---------------------------------------------------------------------------

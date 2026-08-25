@@ -687,8 +687,9 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     The structural argument is the sharpest: dropping the term entirely
     is BETTER than including it with the legacy sign, which is the
     signature of a sign and not of a magnitude.  Four further witnesses
-    agree, three of them internal to this tree — ``velocity_matrix_k``
-    and ``orbital_magnetization`` both assemble ``p + dV_NL/dK`` and
+    agree, three of them internal to this tree — the production
+    ``momentum_matrix_k``/``vnl_velocity_matrix`` pair and
+    ``orbital_magnetization`` both assemble ``p + dV_NL/dK`` and
     call it canonical, and ``--vnl-mode numeric`` did too (by way of a
     double negation nobody had noticed).
 
