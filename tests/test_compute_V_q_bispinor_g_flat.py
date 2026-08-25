@@ -180,7 +180,7 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -216,17 +216,19 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
                 V_got, V_ref, atol=1e-10, rtol=1e-10,
                 err_msg=f"tile (μ_L={mu_L}, ν_L={nu_L}) mismatch")
 
-        # g0 only on the CC tile
-        assert "V_qmunu_CC_g0" in ds, ds
-        g0_got = np.asarray(f["V_qmunu_CC_g0"][...])
-        # g0[q, μ] = ζ_C[q, μ, 0] (G=0 lives at sphere position 0)
-        np.testing.assert_allclose(
-            g0_got, z_C[:, :, 0], atol=1e-12, rtol=1e-12)
+        # V persistence owns only V.  Literal-G=0 is a derived in-memory
+        # view of each channel's canonical zeta_q_G, never a twin dataset.
+        assert not [name for name in ds if name.endswith("_g0")], ds
         # Layout metadata
         import json
         unique = [tuple(t) for t in json.loads(f.attrs['unique_tiles'])]
         assert set(unique) == set(UNIQUE_TILES)
         assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v2"
+
+    for channel in range(4):
+        np.testing.assert_allclose(
+            np.asarray(g0_by_channel[channel]),
+            z_disks[channel][:, :, 0], atol=1e-12, rtol=1e-12)
 
 
 def test_bispinor_CC_tile_matches_charge_orchestrator(
@@ -282,7 +284,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -297,9 +299,9 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
 
     with h5py.File(out_path, 'r') as f:
         V_CC = np.asarray(f["V_qmunu_CC"][...])
-        g0_CC = np.asarray(f["V_qmunu_CC_g0"][...])
     np.testing.assert_allclose(V_CC, V_charge, atol=1e-12, rtol=1e-12)
-    np.testing.assert_allclose(g0_CC, g0_charge, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(g0_by_channel[0]), g0_charge, atol=1e-12, rtol=1e-12)
 
 
 # ===========================================================================

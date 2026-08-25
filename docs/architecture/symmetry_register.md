@@ -789,8 +789,9 @@ The move was scoped anyway and **not taken**. Two reasons, in order:
    verdicts** (`n_rmu_C` charge, `n_rmu_T` transverse — and on
    `bispinor_debug` the charge set is non-closed while the transverse one is
    closed), a stamping layer `stamp_qirr_tensor` cannot serve as-is because it
-   assumes one `QirrTables` per file, plus `V_qmunu_CC_g0`, a rank-2 head it
-   refuses outright. Then unfold **and then** mix inside
+   assumes one `QirrTables` per file. Literal-G=0 channel vectors are now
+   derived in memory at the shared V projection seam and are not a second
+   persisted dataset. Then unfold **and then** mix inside
    `BispinorVqReader.get_tile`, where the full-BZ q extent is hard-coded into
    the requested slab shape at `:529`/`:538`, threading `sym` through
    `compute_sigma_x_bispinor` → `cohsex_sigma.py:371`/`:450` → `gw_jax`.

@@ -78,10 +78,6 @@ HERMITIAN_PAIRS: dict[tuple[int, int], tuple[int, int]] = {
 }
 
 V_QMUNU_FORMAT = "bispinor_lorentz_v2"
-G0_CHANNEL_PROVENANCE_ATTR = "g0_channel_provenance"
-G0_DIAGONAL_FULL_BZ_V1 = "diagonal_one_leg_full_bz_v1"
-G0_TRANSVERSE_IBZ_UNAVAILABLE_V1 = (
-    "charge_only_transverse_ibz_rotation_unavailable_v1")
 
 
 def tile_dataset_name(mu_L: int, nu_L: int) -> str:
@@ -284,7 +280,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # (default off — every existing deck's TT tiles are byte-identical).
     # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
     tt_head_correction: bool = False,
-) -> Path:
+) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
 
@@ -295,11 +291,13 @@ def compute_V_q_bispinor_g_flat_to_h5(
     :func:`gw.v_q_g_flat._compute_V_q_g_flat_one_tile`; this function
     is just the 7-tile loop + per-tile HDF5 plumbing.
 
-    Each centroid family follows its resolved full-BZ/IBZ path.  Diagonal
-    one-leg g0 vectors are persisted for all four channels on the full q
-    grid.  On an IBZ source, the symmetry service reconstructs the exact
-    parent G coefficient and applies the scalar or polar-vector action; the
-    writer owns no q map, centroid action or Cartesian rotation.
+    Each centroid family follows its resolved full-BZ/IBZ path.  The returned
+    four-channel tuple is the derived literal-G=0 view produced at the same
+    projection seam as V.  It is not persisted beside V: canonical
+    ``zeta_q_G`` remains the sole source of truth.  On an IBZ source, the
+    symmetry service reconstructs the exact parent G coefficient and applies
+    the scalar or polar-vector action; the writer owns no q map, centroid
+    action or Cartesian rotation.
 
     The reader :class:`BispinorVqReader` opens this on-disk format.
     """
@@ -383,6 +381,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # §A5 (the algebraic identity for V^{i,j}_full[q]).
     tt_buffer: dict[tuple[int, int], jax.Array] = {}
     tt_g0 = None
+    g0_by_channel: list[jax.Array | None] = [None, None, None, None]
 
     for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
         same_zeta = (mu_L == nu_L)
@@ -465,6 +464,12 @@ def compute_V_q_bispinor_g_flat_to_h5(
             del g0_acc
             g0_acc = None
 
+        # Keep the literal-G=0 view in memory at its projection owner.  The
+        # transverse IBZ case is filled after its three source components are
+        # rotated and accumulated by the symmetry service below.
+        if same_zeta and g0_acc is not None:
+            g0_by_channel[mu_L] = g0_acc
+
         if is_CC or not _use_ibz_T:
             # Two cases stream straight to disk per-tile:
             #   * CC tile — never Lorentz-mixed (γ̃^0 = I is invariant).
@@ -480,12 +485,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_acc.dtype)
                 tile_io.write_slab(name, V_acc)
-                if write_g0 and g0_acc is not None:
-                    g0_logical_shape = (int(g0_acc.shape[0]), n_rmu_L)
-                    tile_io.create_dataset(
-                        f"{name}_g0", shape=g0_logical_shape,
-                        dtype=g0_acc.dtype)
-                    tile_io.write_slab(f"{name}_g0", g0_acc)
             del V_acc, g0_acc
         else:
             # Buffer for post-loop Lorentz mixing (IBZ cascade active on
@@ -536,12 +535,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                         raise RuntimeError(
                             "bispinor transverse IBZ one-leg accumulation "
                             "is missing despite three diagonal source tiles.")
-                    g0_mix = tt_g0[mu_L - 1]
-                    tile_io.create_dataset(
-                        f"{name}_g0",
-                        shape=(int(g0_mix.shape[0]), n_rmu_T),
-                        dtype=g0_mix.dtype)
-                    tile_io.write_slab(f"{name}_g0", g0_mix)
+                    g0_by_channel[mu_L] = tt_g0[mu_L - 1]
         del tt_full_in, tt_mixed
     del tt_buffer, tt_g0
 
@@ -557,9 +551,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 [list(t) for t in sorted(ZERO_TILES)])
             f.attrs["hermitian_pairs"] = json.dumps(
                 [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
-            f.attrs[G0_CHANNEL_PROVENANCE_ATTR] = G0_DIAGONAL_FULL_BZ_V1
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
-    return output_h5_path
+    if any(vector is None for vector in g0_by_channel):
+        missing = [i for i, vector in enumerate(g0_by_channel)
+                   if vector is None]
+        raise RuntimeError(
+            "bispinor literal-G=0 projection did not produce channels "
+            f"{missing}")
+    return output_h5_path, tuple(g0_by_channel)
 
 
 # ---------------------------------------------------------------------------
@@ -579,10 +578,6 @@ class BispinorVqReader:
                                        For Hermitian-redundant tiles
                                        reads the companion + applies
                                        ``conj(swapaxes(.., -1, -2))``.
-    * ``get_g0(μ_L)``                — diagonal-channel G=0 coefficient
-                                       vectors, sharded ``P(None,'x')``.
-    * ``get_g0_CC()``                — thin legacy adapter for channel C.
-
     Caller manages the lifecycle (use as a context manager).
     """
 
@@ -617,13 +612,6 @@ class BispinorVqReader:
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))
             self.n_rmu_T = int(_read_scalar("n_rmu_T"))
             self.n_q_total = int(_read_scalar("n_q_total"))
-            provenance = f.attrs.get(G0_CHANNEL_PROVENANCE_ATTR)
-            if isinstance(provenance, bytes):
-                provenance = provenance.decode("utf-8")
-            self.g0_channel_provenance = (
-                None if provenance is None else str(provenance))
-            self._g0_datasets = frozenset(
-                name for name in f if name.endswith("_g0"))
 
         self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
 )
@@ -706,45 +694,6 @@ class BispinorVqReader:
             tile_dataset_name(mu_L, nu_L),
             shape=(self.n_q_total, n_L_p, n_R_p),
             mesh=self._mesh, partition_spec=spec)
-
-    def get_g0(self, mu_L: int) -> jax.Array | None:
-        """Read diagonal-channel ``ζ(q,μ,G=0)`` as ``P(None,'x')``.
-
-        The returned shape is ``(n_q_total, n_mu_padded)``.  Charge remains
-        backward-compatible with legacy files and returns ``None`` when its
-        dataset is absent.  The named transverse-IBZ refusal is retained only
-        for files written before the symmetry service acquired the canonical
-        one-leg action.
-        """
-        if not 0 <= int(mu_L) < 4:
-            raise ValueError(
-                f"Lorentz channel must be in {{0,1,2,3}}; got {mu_L}")
-        channel = int(mu_L)
-        name = tile_dataset_name(channel, channel) + "_g0"
-        if name not in self._g0_datasets:
-            if channel == 0:
-                return None
-            if (self.g0_channel_provenance
-                    == G0_TRANSVERSE_IBZ_UNAVAILABLE_V1):
-                raise ValueError(
-                    "GATE bispinor_g0_transverse_ibz_rotation_unavailable: "
-                    f"channel T{channel} has no canonical one-leg g0 in "
-                    f"{self._filename}; the symmetry service does not expose "
-                    "the required transverse-vector rotation.  Produce V_q "
-                    "on the full-BZ path before enabling the coupled head.")
-            raise ValueError(
-                f"GATE bispinor_g0_channel_unavailable: {self._filename} "
-                f"has no {name}; provenance="
-                f"{self.g0_channel_provenance!r}")
-        n_mu = int(self.n_rmu_C if channel == 0 else self.n_rmu_T)
-        n_mu_padded, _ = self._padded_shape_LR(n_mu, n_mu)
-        return self._io.read_slab(
-            name, shape=(self.n_q_total, n_mu_padded),
-            mesh=self._mesh, partition_spec=P(None, 'x'))
-
-    def get_g0_CC(self) -> jax.Array | None:
-        """Legacy charge-channel adapter; ``None`` if absent."""
-        return self.get_g0(0)
 
     @property
     def filename(self) -> Path:
