@@ -494,6 +494,7 @@ def load_hartree_submatrix(
 def validate_kin_ion_against_run(
 	h5_path: str,
 	*,
+	expected_bispinor: bool,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
@@ -502,14 +503,34 @@ def validate_kin_ion_against_run(
 	"""Refuse a ``kin_ion.h5`` that disagrees with the run it feeds.
 
 	``kin_ion`` fixes the Coulomb truncation convention and the band
-	window for the whole mean-field side of H₀.  A file generated under
+	window and wavefunction representation for the whole mean-field side of H₀.
+	A two-spinor and kinetic-balance four-spinor file have identical shapes but
+	different matrix elements, so ``bispinor`` is required provenance: a missing
+	or unequal stamp refuses before any matrix payload is read.  A file generated under
 	``sys_dim=3`` silently consumed by a ``sys_dim=2`` run puts a large
 	*systematic* error into a ~500 eV cancellation — indistinguishable,
 	from the outside, from a basis-convergence problem.  Check it once,
 	loudly, at load time.  Legacy files (no provenance attrs) are
-	accepted with a note; only explicit disagreements raise.
+	accepted with a note for older optional fields; representation is the one
+	fail-closed exception because the writer already stamps it and there is no
+	safe legacy default.
 	"""
 	attrs = read_kin_ion_provenance(h5_path)
+	stored_bispinor = attrs.get("bispinor")
+	if stored_bispinor is None:
+		raise ValueError(
+			"kin_ion.h5 carries no bispinor provenance stamp, so its "
+			"wavefunction representation cannot be compared with this run. "
+			"Regenerate kin_ion.h5 from the run's exact input deck."
+		)
+	if bool(stored_bispinor) != bool(expected_bispinor):
+		raise ValueError(
+			f"kin_ion.h5 was generated with bispinor="
+			f"{bool(stored_bispinor)} but this run uses bispinor="
+			f"{bool(expected_bispinor)}. The mean-field matrix must use the "
+			"same wavefunction representation as the GW body; regenerate "
+			"kin_ion.h5 from this run's exact input deck."
+		)
 	stored_sys_dim = attrs.get("sys_dim")
 	if sys_dim is not None and stored_sys_dim is not None and (
 		int(stored_sys_dim) != int(sys_dim)
