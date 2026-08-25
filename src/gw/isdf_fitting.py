@@ -178,6 +178,7 @@ def fit_zeta_to_h5(
     zeta_cutoff_ry: float | None = None,
     low_mem_bands: bool = False,
     cache_psi_r: bool = True,
+    cache_face_y_blocks: bool = False,
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
 ):
@@ -245,8 +246,9 @@ def fit_zeta_to_h5(
                     ever built or held; the caller drops both before even
                     calling this function -- see
                     ``gw.gw_init.prepare_isdf_and_wavefunctions``).
-                    Requires ``vertex_mu_L == 0`` and ``band_norms is
-                    None`` -- refuses by name otherwise.  Default False:
+                    Supports charge and monomial transverse vertices;
+                    ``band_norms`` must be None and is refused by name
+                    otherwise.  Default False:
                     bit-identical to the pre-existing path (``psi_nmu_fresh``/
                     ``psi_mun_fresh`` are ignored).
         cache_psi_r: Hoist all band/grid ψ(r) coefficients once when True.
@@ -254,6 +256,10 @@ def fit_zeta_to_h5(
                     ψ(G)->ψ(r_chunk) route and keeps the host staging store
                     open through the r loop.  The memory planner selects
                     False only when a low-memory run cannot hold the cache.
+        cache_face_y_blocks: Internal face-kernel memory-plan decision.
+                    True reuses one bounded current-r Y cache across scalar
+                    spin pairs; False repeats the canonical transform as the
+                    large-band/ns=1 fallback.  Not a frontend/env knob.
         psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
                     ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
                     ``PSI_MUN_SPEC``), spanning the SAME [b0, b4) range
@@ -1409,6 +1415,7 @@ def fit_zeta_to_h5(
                     psi_mun=(psi_mun_fresh if low_mem_bands else None),
                     weight_l=(weight_l_face if low_mem_bands else None),
                     weight_r=(weight_r_face if low_mem_bands else None),
+                    cache_face_y_blocks=bool(cache_face_y_blocks),
                 )
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]

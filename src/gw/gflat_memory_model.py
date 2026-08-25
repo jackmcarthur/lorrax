@@ -21,7 +21,7 @@ co-exist, so the HWM takes a ``max``, not a sum:
 
     A  centroid load    fit FFT box (k_tile, bc, ns, n_rtot)  knob: band_chunk
     B  CCT + Cholesky   C_q + full-(μ,μ) pair density
-    C  fit_one_rchunk   slots·(nk,ns²,μ,cr) + Z_q (nq,μ,cr)   knob: chunk_r  ← binder
+    C  fit_one_rchunk   legacy open-spin or face scalar-pair rank-3 peaks    ← binder
     D  accumulate       accumulate FFT box (cs, n_rtot)       knob: gflat_chunk_size
 Post-fit stages use their own smaller base because ``L_q`` and ``gflat_acc``
 have been released:
@@ -45,10 +45,11 @@ not sum); the full-BZ ``Z_q`` is charged as LIVE ACROSS the solve seam
 outranks the μ-wide performance floor.  ``r_chunk_override`` still wins
 over all of it — the register-documented run-level workaround.
 
-Bispinor (§1b): the fit loop (A–D) runs the charge channel only — the 3
-transverse channels are *exactly parallel* with μ_T ≤ μ_C, so they are
-never the binder.  The model carries the spinor factor ``ns² = nspinor²``
-in the pair density and does not size the transverse channels separately.
+Bispinor (§1b): charge and the 3 transverse fits are exactly parallel with
+``mu_T <= mu_C``, so the charge shape remains the planning binder.  Legacy
+uses the calibrated open-spin ``ns²`` pair density.  Face layout completes
+one scalar spin pair's full band sum before its k-IFFTs and prices the cold-
+HLO four-total rank-3 live set; it never imports the legacy ``ns²`` carrier.
 
 SCOPE, STATED SO IT IS NOT ASSUMED: this model prices Stages A-F — the
 ISDF ζ fit through the V_q tensor write — and NOTHING PAST IT.  The
@@ -75,9 +76,10 @@ Phase 1/2 below do for Stages A-F — remains open and is NOT this file's
 job today; do not read the absence of a screening-stage row here as "it
 fits", only as "unmeasured".
 
-Most terms above are closed-form shape algebra.  Stage A compiles the
-production FFT helper at the real shape/mesh and queries XLA's buffer peak
-plus cuFFT plan workspace through
+Most terms above are closed-form shape algebra.  The bounded-k Stage-A load
+and the separate full-nk psi-r/to_rchunk transform both query the same
+production FFT helper at their real shape/mesh, including XLA's buffer peak
+plus cuFFT plan workspace, through
 ``common.fft_helpers.query_fft_peak_bytes``.  Stage D's two-box factor and
 the pair-density ``slots`` count (3 GPU / 4 CPU) are HLO-calibrated facts.
 Where the Stage-A query is unavailable the model demotes to an analytic bound
@@ -126,6 +128,17 @@ def _pair_density_slots() -> int:
                   f"{exc}); assuming 3 pair-density slots (GPU).  CPU really "
                   f"has 4, so Stage C would be one (nk, ns², μ, cr) arena low")
         return 3
+
+
+def _face_pair_density_slots() -> int:
+    """Total rank-3 equivalents live at the face pair-accumulation peak.
+
+    The exact cold P4 production closure at ``49d0b405`` retains four:
+    old ``Z_R``, the two k-IFFT outputs, and new ``Z_R``.  This is the sole
+    slot-count owner for the scalar-pair face executable; accumulated-Z and
+    k-FFT terms must not be charged again beside it.
+    """
+    return 4
 
 
 # Analytic FALLBACK factor for the FFT box, used only when it cannot be
@@ -249,8 +262,10 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
 
 
 def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
-    """Per-rank bytes of the centroid-load FFT box (Stage A).
+    """Per-rank bytes of one production WFN spatial FFT box.
 
+    The caller supplies the transform's actual live k extent: bounded
+    ``centroid_k_chunk`` for Stage A, full ``nk`` for psi-r/to_rchunk stages.
     MEASURED whenever a real ``Mesh`` is available: compiles the production
     WFN spatial ``ifftn(norm='ortho')`` helper at this shape/sharding and
     reads XLA's buffer peak PLUS the cuFFT plan workspace, which is not in
@@ -280,7 +295,7 @@ def _fft_box_bytes(*, nk, bc, ns, fft_grid, mesh_xy, p_xy) -> float:
         why = f"mesh_xy is a {type(mesh_xy).__name__}, not a jax Mesh"
     # Analytic fallback (bands sharded over all P; ns + FFT axes replicated).
     _announce(f"fft-box-unmeasured:{why}",
-              f"Stage A FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
+              f"WFN FFT-box term is the analytic {_FFT_CUFFT_FACTOR}x "
               f"box-copy bound because {why}.  It does NOT include cuFFT plan "
               f"workspace, so this planner will UNDER-predict FFT-box stages")
     return _c128(nk, bc, ns, n_rtot, shard=p_xy) * _FFT_CUFFT_FACTOR
@@ -323,6 +338,49 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
             + _c128(nk, max(1, band_chunk // p_xy), ns))
 
 
+def _stage_C_face_terms(
+        *, nk, ns, mu, face_nb, slots, p_x, p_y, p_xy,
+        band_chunk, n_band_chunks) -> dict[str, float]:
+    """Analytic live-shape census for the scalar-pair face kernel.
+
+    No term carries an open ``ns²`` axis.  One scalar spin pair completes
+    its full band sum before either k-IFFT, so the pair peak is a fixed count
+    of rank-3 ``(nk, mu/Px, r/Py)`` equivalents.  ``slots`` is already the
+    *total* cold-HLO count from :func:`_face_pair_density_slots`; accumulated
+    Z and k-IFFT outputs are included there and are not additional terms.
+
+    ``face_nb`` is the exact ``psi_mun[..., b0:b4]`` carrier width, distinct
+    from both the legacy inventory and a possibly narrowed zeta-fit union.
+    The cached route retains one current-r Y slab per padded fit-band chunk;
+    the repeated-transform fallback retains one slab and its source.
+    """
+    x_rows = 1 if int(ns) == 1 else 2
+    face_conj = _c128(nk, ns, mu, face_nb, shard=p_xy)
+    x_block = _c128(nk, x_rows, max(1, mu // p_x), band_chunk)
+    pair_rank3 = _c128(nk, mu, shard=p_xy)
+    pair_peak = float(slots) * pair_rank3
+    y_block = _c128(nk, band_chunk, ns, shard=p_y)
+    y_source = _c128(nk, max(1, band_chunk // p_xy), ns)
+    y_cache = float(n_band_chunks) * y_block
+    return {
+        # psi_mun_conj plus the selected-row gather and psum result.
+        "constant": face_conj + 2.0 * x_block,
+        # Four total rank-3 equivalents at the calibrated pair peak.
+        "pair_arena_slope": pair_peak,
+        "y_block_slope": y_block,
+        "y_source_slope": y_source,
+        "y_cache_slope": y_cache,
+        # Build peak: completed stack + last gather/compaction/source.
+        "cache_build_slope": (
+            y_cache + _GATHERED_PSI_SLOTS * y_block + y_source),
+        # Pair peak: cached stack plus the calibrated rank-3 live set.
+        "cache_pair_slope": y_cache + pair_peak,
+        # Bounded fallback: one gathered block/source plus the pair peak.
+        "repeated_pair_slope": (
+            _GATHERED_PSI_SLOTS * y_block + y_source + pair_peak),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------
@@ -338,6 +396,10 @@ class GFlatChunkPlan:
     #: Actual per-rank flat-row extent priced for one centroid FFT batch:
     #: ``centroid_k_chunk * (band_chunk / P_band)``.
     centroid_fft_rows_local: int
+    #: Stage-A centroid-load FFT price at the bounded outer-k tile.
+    centroid_fft_bytes: float
+    #: Full-nk to_rchunk_inner price for psi-r cache/streamed face stages.
+    zeta_transform_fft_bytes: float
     r_chunk: int
     n_r_chunks: int
     q_chunk: int
@@ -382,16 +444,22 @@ class GFlatChunkPlan:
     #: mechanism adds — see ``plan_gflat_chunks``'s computation for the
     #: exact terms.
     #:
-    #: INFORMATIONAL ONLY in both cases: this field is NOT folded into
-    #: ``peak_breakdown``/``hwm_bytes``/``bottleneck`` (see
-    #: KNOWN_LORRAX_ISSUES.md).  Disclosed on the banner so a run can see
-    #: the fix's effect without re-deriving it from HLO.
+    #: The face value is folded into its separate Stage-C build/pair peaks;
+    #: this field discloses that already-priced subset.  The legacy value
+    #: remains a compatibility disclosure of the post-CCT inventory.
     stage_cd_psi_bytes: float = 0.0
     #: Whether the ζ fit hoists every band/grid coefficient into one
     #: all-P-sharded ψ(r) cache.  ``False`` selects the existing streamed
     #: band-chunk FFT path; the planner uses it only for ``low_mem_bands``
     #: when even the cache's minimum persistent floor exceeds the target.
     cache_psi_r: bool = True
+    #: Face-layout Stage-C structural route.  True stacks the canonical
+    #: current-r-chunk Y band slabs once and reuses them for every scalar
+    #: spin pair; False repeats one bounded transform/scatter and is the
+    #: always-valid large-band fallback.  Planner-owned, never a knob.
+    cache_face_y_blocks: bool = False
+    #: Per-rank bytes in the selected face Y cache at resolved r width.
+    face_y_cache_bytes: float = 0.0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -402,13 +470,25 @@ class GFlatChunkPlan:
             f"({self.psi_layout_bytes / 1e9:.3f} GB/dev, ψ centroid copies)",
             f"    Stage C/D ψ floor (post-CCT, {self.psi_layout} r-chunk "
             f"incremental) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
-            f"[informational; not folded into hwm_bytes]",
+            + ("[included in face Stage-C peaks]"
+               if self.psi_layout == "face" else
+               "[legacy compatibility disclosure]"),
             "    ψ(r) source   = " + (
                 "hoisted all-band cache" if self.cache_psi_r else
                 "streamed band-chunk FFT (low-memory fallback)"),
+            "    face Y route  = " + (
+                "current-r cache" if self.cache_face_y_blocks else
+                ("repeated bounded transform" if self.psi_layout == "face"
+                 else "n/a (legacy layout)")),
+            *([f"    face Y cache = "
+               f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
+              if self.psi_layout == "face" else []),
             f"    band_chunk    = {self.band_chunk}",
             f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
-            f"{self.centroid_fft_rows_local} local rows",
+            f"{self.centroid_fft_rows_local} local rows, "
+            f"{self.centroid_fft_bytes / 1e9:.3f} GB/dev",
+            f"    zeta FFT      = full-nk transform, "
+            f"{self.zeta_transform_fft_bytes / 1e9:.3f} GB/dev",
             f"    r_chunk       = {self.r_chunk}  ({self.n_r_chunks} chunks)",
             f"    q_chunk       = {self.q_chunk}",
             f"    ζ solve memory = {self.zeta_solve_memory_route}",
@@ -436,6 +516,7 @@ def plan_gflat_chunks(
     meta,
     mesh_xy,
     nb_total: int,
+    face_nb_total: int | None = None,
     fit_nb_total: int | None = None,
     ngkmax: int,
     n_q_disk: int,
@@ -456,7 +537,9 @@ def plan_gflat_chunks(
     per-rank HWM lands under ``util·budget``.  Reports the rank floor
     ``P_min`` and the binding stage.
 
-    ``nb_total`` sizes the resident centroid-wavefunction inventory;
+    ``nb_total`` sizes the legacy resident centroid-wavefunction inventory;
+    ``face_nb_total`` is the exact low-memory ``[b0,b4)`` face-carrier width
+    (defaults to ``nb_total`` for compatibility);
     ``fit_nb_total`` is the logical union of the two ζ fit windows and owns
     the band-chunk K extent.  Keeping those extents separate matters when
     ``zeta_nband`` narrows only the fit.
@@ -491,9 +574,16 @@ def plan_gflat_chunks(
     n_rtot = int(meta.n_rtot)
     ngkmax = int(ngkmax)
     nb = int(nb_total)
+    face_nb = int(face_nb_total if face_nb_total is not None else nb)
     fit_nb = int(fit_nb_total if fit_nb_total is not None else nb)
-    if fit_nb <= 0:
-        raise ValueError(f"fit_nb_total must be positive, got {fit_nb}")
+    if fit_nb <= 0 or face_nb <= 0:
+        raise ValueError(
+            f"fit_nb_total and face_nb_total must be positive, got "
+            f"fit={fit_nb}, face={face_nb}")
+    if low_mem_bands and face_nb % p_y:
+        raise ValueError(
+            f"face_nb_total={face_nb} must divide the face band mesh axis "
+            f"Py={p_y}")
     fft_grid = tuple(getattr(meta, 'fft_grid', None)
                      or (int(round(n_rtot ** (1 / 3))),) * 3)
     if n_q_ibz is None:
@@ -504,11 +594,14 @@ def plan_gflat_chunks(
         target_utilization = bfc_fragmentation_target_utilization(ns)
     slots = pair_density_slots if pair_density_slots is not None \
         else _pair_density_slots()
+    face_slots = _face_pair_density_slots()
 
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu, nb=nb,
+    inventory_nb = face_nb if low_mem_bands else nb
+    sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
+               nb=inventory_nb,
                ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands))
 
     # The hoisted ψ(r) cache has no centroid axis: at large FFT grids it can
@@ -523,21 +616,45 @@ def plan_gflat_chunks(
         p_xy, ((fit_nb + p_xy - 1) // p_xy) * p_xy)
     _min_cache_bytes = _c128(
         nk, _min_cache_slots, ns, n_rtot, shard=p_xy)
-    cache_psi_r = not (
-        low_mem_bands
-        and sum(_persistent_base.values()) + _min_cache_bytes > target)
+    cache_psi_r = True
+    _cache_probe_peak = sum(_persistent_base.values()) + _min_cache_bytes
+    if low_mem_bands:
+        _cache_probe_bc = (
+            int(band_chunk_override)
+            if band_chunk_override and band_chunk_override > 0 else fit_nb)
+        _cache_probe_bc = max(
+            p_xy, ((_cache_probe_bc + p_xy - 1) // p_xy) * p_xy)
+        _cache_probe_bc = min(_cache_probe_bc, _min_cache_slots)
+        _cache_probe_r = min(
+            n_rtot, max(min(mu, n_rtot), math.ceil(n_rtot / max_chunks)))
+        _cache_probe_r = max(
+            p_y, _cache_probe_r - _cache_probe_r % max(p_y, 1))
+        _cache_probe_face = _stage_C_face_terms(
+            nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+            slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+            band_chunk=_cache_probe_bc,
+            n_band_chunks=math.ceil(fit_nb / _cache_probe_bc))
+        _cache_probe_peak += (
+            _cache_probe_face["constant"]
+            + _cache_probe_face["repeated_pair_slope"] * _cache_probe_r)
+        cache_psi_r = not (
+            sum(_persistent_base.values()) + _min_cache_bytes > target
+            or _cache_probe_peak > target)
     if not cache_psi_r:
         _announce(
             "stream-psi-r-cache-lowmem",
             "the all-band ψ(r) cache is disabled for low_mem_bands: its "
             f"minimum persistent floor is "
             f"{(sum(_persistent_base.values()) + _min_cache_bytes) / 1e9:.2f} "
-            f"GB/dev vs the {target / 1e9:.2f} GB/dev target.  The ζ fit "
+            f"GB/dev and its minimum-performance face peak is "
+            f"{_cache_probe_peak / 1e9:.2f} GB/dev vs the "
+            f"{target / 1e9:.2f} GB/dev target.  The ζ fit "
             "will use its canonical streamed band-chunk FFT path")
 
     # ---- Phase 1: the rank floor (un-chunkable ÷P / ÷√P family) ---------
     def _floor_at(pp: int) -> float:
         px, py = _factor_mesh(pp)
+        face_nb_pp = ((face_nb + pp - 1) // pp) * pp
         if band_chunk_override and band_chunk_override > 0:
             floor_bc = int(band_chunk_override)
         else:
@@ -547,8 +664,29 @@ def plan_gflat_chunks(
         floor_bc = min(floor_bc, fit_padded)
         cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
         psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
-        return (sum(_persistent_bytes(p_x=px, p_y=py, **sys).values())
-                + (psi_r_cache if cache_psi_r else 0.0))
+        floor_sys = dict(sys)
+        if low_mem_bands:
+            floor_sys["nb"] = face_nb_pp
+        floor = (sum(_persistent_bytes(
+                     p_x=px, p_y=py, **floor_sys).values())
+                 + (psi_r_cache if cache_psi_r else 0.0))
+        if low_mem_bands:
+            # P_min must admit one legal face r slab.  Use the universal
+            # repeated route at r=Py and the full-nk analytic transform.
+            face_floor = _stage_C_face_terms(
+                nk=nk, ns=ns, mu=mu, face_nb=face_nb_pp,
+                slots=face_slots, p_x=px, p_y=py, p_xy=pp,
+                band_chunk=floor_bc,
+                n_band_chunks=math.ceil(fit_nb / floor_bc))
+            fft_floor = (_c128(
+                nk, floor_bc, ns, n_rtot, shard=pp)
+                * _FFT_CUFFT_FACTOR)
+            pair_floor = (
+                face_floor["constant"]
+                + face_floor["repeated_pair_slope"] * py
+                + (0.0 if cache_psi_r else fft_floor))
+            floor += max(fft_floor if cache_psi_r else 0.0, pair_floor)
+        return floor
 
     # ``loader_tables`` is P-INDEPENDENT, so if it alone busts the budget no
     # rank count fixes it — say so at once instead of stepping the search a
@@ -577,14 +715,13 @@ def plan_gflat_chunks(
 
     _fft_box_cache: dict[tuple[int, int], float] = {}
 
-    def _fft_for_bc(bc: int) -> float:
+    def _fft_for_bc(bc: int, *, nk_extent: int) -> float:
         bc = int(bc)
-        k_tile, _ = centroid_fft_tile_geometry(
-            nk=nk, band_chunk=bc, p_band=p_xy)
-        key = (k_tile, bc)
+        nk_extent = int(nk_extent)
+        key = (nk_extent, bc)
         if key not in _fft_box_cache:
             _fft_box_cache[key] = _fft_box_bytes(
-                nk=k_tile, bc=bc, ns=ns, fft_grid=fft_grid,
+                nk=nk_extent, bc=bc, ns=ns, fft_grid=fft_grid,
                 mesh_xy=mesh_xy, p_xy=p_xy)
         return _fft_box_cache[key]
 
@@ -595,13 +732,15 @@ def plan_gflat_chunks(
     # planner's existing performance floor / max-chunk floor; Phase 2 may
     # still choose a larger affordable r chunk after band K is resolved.
     r_lo = min(mu, n_rtot)
+    r_alignment = p_y if low_mem_bands else p_xy
     if r_chunk_override and r_chunk_override > 0:
         r_for_band_guard = min(int(r_chunk_override), n_rtot)
     else:
         r_for_band_guard = max(r_lo, math.ceil(n_rtot / max_chunks))
-    if p_xy > 1:
+    if r_alignment > 1:
         r_for_band_guard = max(
-            p_xy, r_for_band_guard - r_for_band_guard % p_xy)
+            r_alignment,
+            r_for_band_guard - r_for_band_guard % r_alignment)
 
     def _band_candidate_fits(bc: int) -> bool:
         n_bc = math.ceil(fit_nb / bc)
@@ -610,12 +749,28 @@ def plan_gflat_chunks(
         # rows are extra, and they remain zero-masked.
         psi_r_cache = _c128(
             nk, n_bc * bc, ns, n_rtot, shard=p_xy)
-        c_slope = _stage_C_slope(
-            nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
-            p_xy=p_xy, band_chunk=bc, p_y=p_y)
-        fft_t = _fft_for_bc(bc)
-        fit_t = c_slope * r_for_band_guard
-        transient = max(fft_t, fit_t) if cache_psi_r else fft_t + fit_t
+        centroid_k, _ = centroid_fft_tile_geometry(
+            nk=nk, band_chunk=bc, p_band=p_xy)
+        centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
+        zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
+        if low_mem_bands:
+            face = _stage_C_face_terms(
+                nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+                slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+                band_chunk=bc, n_band_chunks=n_bc)
+            fit_t = (face["constant"]
+                     + face["repeated_pair_slope"] * r_for_band_guard)
+        else:
+            c_slope = _stage_C_slope(
+                nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+                p_xy=p_xy, band_chunk=bc, p_y=p_y)
+            fit_t = c_slope * r_for_band_guard
+        # Centroid sampling sees only its bounded k tile.  The incumbent
+        # to_rchunk_inner source sees full nk and is a distinct peak when
+        # hoisted, or coexists with the streamed pair route when not.
+        transient = (max(centroid_fft_t, zeta_fft_t, fit_t)
+                     if cache_psi_r else
+                     max(centroid_fft_t, zeta_fft_t + fit_t))
         return (persistent_total + (psi_r_cache if cache_psi_r else 0.0)
                 + transient <= target)
 
@@ -640,9 +795,12 @@ def plan_gflat_chunks(
                 band_chunk = trial
                 bc *= 2
 
-    fft_box_A = _fft_for_bc(band_chunk)
     centroid_k_chunk, centroid_fft_rows_local = centroid_fft_tile_geometry(
         nk=nk, band_chunk=band_chunk, p_band=p_xy)
+    fft_box_A = _fft_for_bc(
+        band_chunk, nk_extent=centroid_k_chunk)
+    fft_box_zeta_transform = _fft_for_bc(
+        band_chunk, nk_extent=nk)
 
     # ψ(r) is hoisted across the outer r-chunk loop.  It is a band-flat
     # all-P-sharded cache, never a replicated full-window object.  Price its
@@ -659,46 +817,94 @@ def plan_gflat_chunks(
     persistent_total = sum(persistent.values())
 
     # ---- Phase 2: dial chunk_r against Stage C's slope ------------------
-    # ``band_chunk`` is resolved above — Stage C's ψ(r) slab is sized by it
-    # (the gathered band axis), so the two knobs are coupled.
-    C_slope = _stage_C_slope(nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
-                             p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
-    # The z_q executable's pair-density temps are ONE contiguous BFC
-    # arena of ``slots`` rank-5 carries; its per-cr slope is priced
-    # separately because it carries a PLACEMENT bound on top of the sum
-    # (see ``_ARENA_PLACEMENT_FRAC``).
-    arena_slope = slots * _c128(nk, ns, ns, mu, shard=p_xy)
-    # WHY THE SEAM IS *NOT* IN THIS DIAL, stated because it looks like it
-    # should be.  ``C_t`` below is ``max(C_fit_t, solve_t + zq_live)`` and
-    # the r-LINEAR part of that second member is ``3·(nq, μ, cr)/P``,
-    # against a ``C_slope`` whose pair-carry term alone is
-    # ``slots·nk·ns²·μ/P`` and which carries its own ``(nq, μ)/P`` Z_q term
-    # besides.  For ``nq ≤ nk`` — every real deck, since q runs over the
-    # same mesh as k — and ``slots = 3`` the fit slope is strictly larger,
-    # so a seam-derived r cap can never bind.  MEASURED on both geometries
-    # this model's Stage-C note cites (JID 57405800 step
-    # lx-Xg1-030359-905761): seam/fit = 0.199 at MoS2 8x8 and 0.590 at 9x9.
-    # An r cap taken from the seam would be a no-op dressed as a guard.
-    #
-    # What the seam DOES bind through is the r-INDEPENDENT
-    # ``q_chunk·(μ,μ)`` replicated factor — see ``_factor_headroom``.
-    # On the streamed route the per-band FFT is inside the pair pipeline
-    # and coexists with its r-linear carry arena.  Reserve it before sizing
-    # r_chunk; otherwise the picker would spend the same headroom twice.
+    # The face route has three non-overlapping peaks: current-r Y-cache
+    # build, scalar-pair accumulation/final k FFT, and the all-P-aligned
+    # solve seam.  Keep them separate; adding them invents a live set.
+    cache_face_y_blocks = False
+    face_terms = None
+    face_cache_build_t = 0.0
+    face_y_cache_bytes = 0.0
+    if low_mem_bands:
+        face_terms = _stage_C_face_terms(
+            nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+            slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+            band_chunk=band_chunk, n_band_chunks=_cache_n_bc)
+        # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
+        # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
+        streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
+        face_headroom = max(
+            target - persistent_total - face_terms["constant"], 0.0)
+
+        cache_pair_cap = int(
+            face_headroom / face_terms["cache_pair_slope"])
+        cache_build_headroom = max(face_headroom - streamed_fft, 0.0)
+        cache_build_cap = int(
+            cache_build_headroom / face_terms["cache_build_slope"])
+        # The calibrated four-slot arena already contains old/new Z and both
+        # k-IFFT outputs.  Only the Y cache sits outside its placement bound.
+        cache_other_slope = face_terms["y_cache_slope"]
+        cache_arena_cap = int(
+            _ARENA_PLACEMENT_FRAC * face_headroom
+            / (face_terms["pair_arena_slope"]
+               + _ARENA_PLACEMENT_FRAC * cache_other_slope))
+        cache_cap = min(cache_pair_cap, cache_build_cap, cache_arena_cap)
+
+        repeated_headroom = max(face_headroom - streamed_fft, 0.0)
+        repeated_pair_cap = int(
+            repeated_headroom / face_terms["repeated_pair_slope"])
+        repeated_other_slope = (
+            _GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+            + face_terms["y_source_slope"])
+        repeated_arena_cap = int(
+            _ARENA_PLACEMENT_FRAC * repeated_headroom
+            / (face_terms["pair_arena_slope"]
+               + _ARENA_PLACEMENT_FRAC * repeated_other_slope))
+        repeated_cap = min(repeated_pair_cap, repeated_arena_cap)
+
+        route_width = (min(int(r_chunk_override), n_rtot)
+                       if r_chunk_override and r_chunk_override > 0
+                       else min(n_rtot, max(
+                           r_lo, math.ceil(n_rtot / max_chunks))))
+        route_width = max(
+            r_alignment,
+            route_width - route_width % max(r_alignment, 1))
+        cache_face_y_blocks = bool(ns > 1 and cache_cap >= route_width)
+        if cache_face_y_blocks:
+            C_slope = face_terms["cache_pair_slope"]
+            C_constant = face_terms["constant"]
+            r_from_budget = min(cache_pair_cap, cache_build_cap)
+            r_from_arena = cache_arena_cap
+            r_budget_cap = cache_cap
+        else:
+            C_slope = face_terms["repeated_pair_slope"]
+            C_constant = face_terms["constant"] + streamed_fft
+            r_from_budget = repeated_pair_cap
+            r_from_arena = repeated_arena_cap
+            r_budget_cap = repeated_cap
+    else:
+        C_slope = _stage_C_slope(
+            nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+            p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
+        C_constant = 0.0
+        arena_slope = slots * _c128(nk, ns, ns, mu, shard=p_xy)
+
     headroom_C = max(
-        target - persistent_total - (0.0 if cache_psi_r else fft_box_A),
+        target - persistent_total - C_constant
+        - (0.0 if (low_mem_bands or cache_psi_r)
+           else fft_box_zeta_transform),
         0.0)
     if r_chunk_override and r_chunk_override > 0:
         # The register-documented run-level workaround: an explicit
         # r_chunk_size wins over every cap below, exactly as before.
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
-        r_from_budget = int(headroom_C / C_slope) if C_slope > 0 else n_rtot
-        # Placement cap: the single Stage-C arena must fit the contiguous
-        # headroom, not just the sum.
-        r_from_arena = (int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
-                        if arena_slope > 0 else n_rtot)
-        r_budget_cap = min(r_from_budget, r_from_arena)
+        if not low_mem_bands:
+            r_from_budget = (
+                int(headroom_C / C_slope) if C_slope > 0 else n_rtot)
+            r_from_arena = (
+                int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
+                if arena_slope > 0 else n_rtot)
+            r_budget_cap = min(r_from_budget, r_from_arena)
         # Performance floors — chunks at least μ wide, at most
         # ``max_chunks`` of them.  THE BUDGET OUTRANKS THE FLOORS: until
         # 2026-08-22 ``r_lo = min(μ, n_rtot)`` silently overrode a
@@ -710,7 +916,7 @@ def plan_gflat_chunks(
         r_floor_perf = max(r_lo, math.ceil(n_rtot / max_chunks))
         r_chunk = min(n_rtot, r_floor_perf)
         if r_budget_cap < r_chunk:
-            capped = max(p_xy, r_budget_cap)
+            capped = max(r_alignment, r_budget_cap)
             _announce(
                 "stage-c-rchunk-budget-cap",
                 f"Stage C r_chunk lowered {r_chunk} -> {capped} by the "
@@ -723,8 +929,9 @@ def plan_gflat_chunks(
         else:
             r_chunk = max(r_chunk, min(n_rtot, r_budget_cap))
         r_chunk = min(r_chunk, n_rtot)
-    if p_xy > 1:
-        r_chunk = max(p_xy, r_chunk - r_chunk % p_xy)
+    if r_alignment > 1:
+        r_chunk = max(
+            r_alignment, r_chunk - r_chunk % r_alignment)
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
 
     # ---- gflat_chunk_size (Stage D FFT box) ----------------------------
@@ -753,11 +960,15 @@ def plan_gflat_chunks(
         raise ValueError(
             "distributed_zeta_solve must be auto, replicated, per_q, or "
             f"distributed; got {distributed_zeta_solve!r}")
-    _rhs_stacks = 2 * _c128(nq, mu, r_chunk, shard=p_xy)
+    # Face pair accumulation needs only Py alignment; every solve still sees
+    # an all-P carrier.  Price that pad here without imposing it on the face
+    # kernel or duplicating the runtime channel resolver.
+    _solve_r_chunk = ((r_chunk + p_xy - 1) // p_xy) * p_xy
+    _rhs_stacks = 2 * _c128(nq, mu, _solve_r_chunk, shard=p_xy)
     # The full-BZ Z_q the solve is handed as a live input.  Defined HERE
     # rather than beside ``C_t`` because ``q_chunk``'s own headroom has to
     # subtract it: see ``_factor_headroom``.
-    _zq_live = _c128(nq, mu, r_chunk, shard=p_xy)
+    _zq_live = _c128(nq, mu, _solve_r_chunk, shard=p_xy)
     if _solve_route_requested == "distributed":
         q_chunk = 1                    # ignored by the distributed route
         solve_t = _rhs_stacks
@@ -798,15 +1009,25 @@ def plan_gflat_chunks(
             "replicated")
 
     # ---- stage transients + per-stage peaks ----------------------------
-    # The hoisted route pays the FFT box while constructing its persistent
-    # cache.  The streamed route pays the same box inside the pair pipeline,
-    # alongside its r-chunk carries, and has no separate Stage-A allocation.
-    A_t = fft_box_A if cache_psi_r else 0.0
+    # These are different transforms and different peaks.  Centroid sampling
+    # sees only ``centroid_k_chunk``; the psi-r cache / streamed face source
+    # passes full nk to the incumbent to_rchunk_inner owner.
+    A_t = fft_box_A
+    A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
-    C_fit_t = C_slope * r_chunk
-    if not cache_psi_r:
-        C_fit_t += fft_box_A
+    if low_mem_bands:
+        C_fit_t = C_constant + C_slope * r_chunk
+        if cache_face_y_blocks:
+            face_y_cache_bytes = face_terms["y_cache_slope"] * r_chunk
+            face_cache_build_t = (
+                face_terms["constant"]
+                + (0.0 if cache_psi_r else fft_box_zeta_transform)
+                + face_terms["cache_build_slope"] * r_chunk)
+    else:
+        C_fit_t = C_slope * r_chunk
+        if not cache_psi_r:
+            C_fit_t += fft_box_zeta_transform
     # THE Z_q/SOLVE SEAM IS A SUM, NOT A MAX.  ``fit_one_rchunk`` hands
     # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
     # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
@@ -834,14 +1055,13 @@ def plan_gflat_chunks(
     #   gw.gw_init.prepare_isdf_and_wavefunctions), so the SAME 2S/(Px·Py)
     #   that is live for the rest of the run is already what is resident
     #   here — there is no separate "post-fit narrowing" step to price.
-    psi_one = _c128(nk, ns, mu, nb)
+    psi_one = _c128(nk, ns, mu, inventory_nb)
     if low_mem_bands:
         E_base = 2.0 * psi_one / p_xy
     else:
         E_base = psi_one / p_x + psi_one / p_y
-    # Informational Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes
-    # docstring).  Deliberately NOT substituted into
-    # ``persistent_total``/``peaks`` — see that docstring for why.
+    # Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes docstring).
+    # The face value is already present in the separate build/pair peaks.
     #
     # low_mem_bands=False (legacy): the two surviving X-form single-axis
     # copies (mu on 'x', bands replicated) — what is ACTUALLY resident
@@ -863,9 +1083,13 @@ def plan_gflat_chunks(
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
     if low_mem_bands:
-        stage_cd_psi_bytes = (
-            psi_one / p_xy
-            + 2.0 * _c128(nk, ns, max(1, mu // p_x), band_chunk))
+        if cache_face_y_blocks:
+            face_y_route_bytes = face_y_cache_bytes
+        else:
+            face_y_route_bytes = (
+                (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+                 + face_terms["y_source_slope"]) * r_chunk)
+        stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
     else:
         stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
@@ -897,6 +1121,12 @@ def plan_gflat_chunks(
         "E_v_q":           E_base + E_t,
         "F_tensor_write":  E_base + F_t,
     }
+    if cache_psi_r:
+        peaks["A_psi_r_cache_build"] = (
+            persistent_total + A_psi_r_cache_t)
+    if cache_face_y_blocks:
+        peaks["C_face_y_cache_build"] = (
+            persistent_total + face_cache_build_t)
     bottleneck = max(peaks, key=peaks.get)
     hwm = peaks[bottleneck]
 
@@ -904,6 +1134,8 @@ def plan_gflat_chunks(
         band_chunk=int(band_chunk),
         centroid_k_chunk=int(centroid_k_chunk),
         centroid_fft_rows_local=int(centroid_fft_rows_local),
+        centroid_fft_bytes=float(fft_box_A),
+        zeta_transform_fft_bytes=float(fft_box_zeta_transform),
         r_chunk=int(r_chunk),
         n_r_chunks=int(n_r_chunks),
         q_chunk=int(q_chunk),
@@ -920,4 +1152,6 @@ def plan_gflat_chunks(
         psi_layout_bytes=float(persistent["psi_copies"]),
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),
+        cache_face_y_blocks=bool(cache_face_y_blocks),
+        face_y_cache_bytes=float(face_y_cache_bytes),
     )
