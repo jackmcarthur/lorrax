@@ -1646,6 +1646,12 @@ def build_gram_q0_via_loadwfns(
             memory_per_device_gb = 0.0  # falls back to the 36 GB default
     setattr(meta, "memory_per_device_gb", float(memory_per_device_gb))
 
+    # Prune must not retain the full-k G-flat WFN beside both final centroid
+    # faces.  A one-k fixed tile is the hard memory bound; the shared
+    # transform owner pads only the final tile and reuses one executable, so
+    # this changes transfer scheduling, not the Gram or selection semantics.
+    prune_k_tile = 1
+
     # Optional pseudoband norms — same clamp recipe as isdf_fitting.
     if band_norms is not None:
         band_norms_np = np.asarray(band_norms, dtype=np.float64)
@@ -1673,13 +1679,15 @@ def build_gram_q0_via_loadwfns(
               f"norms={'on' if band_norms is not None else 'off'}, "
               f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
-              f"band_chunk_size={band_chunk_size}")
+              f"band_chunk_size={band_chunk_size}, "
+              f"transfer_k_tile={prune_k_tile}")
 
     # ---- Left window ----
     with timing.section("left.load"):
         psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
             band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile,
         )
         if norms_l_j is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
@@ -1764,6 +1772,7 @@ def build_gram_q0_via_loadwfns(
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
                 band_chunk_size=band_chunk_size,
+                k_chunk_size=prune_k_tile,
             )
             if norms_r_j is not None:
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
@@ -1810,6 +1819,7 @@ def build_gram_q0_via_loadwfns(
         psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
             band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile,
         )
         if norms_r_j is not None:
             psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
