@@ -516,8 +516,10 @@ def write_qp_wfn_h5(
             f"(nk={wfn.nkpts}, nb_active={nb_active}).")
 
     # All-band IBZ coefficients + per-k G-vectors via the unified loader.
-    # qp_wfn is a one-shot host-mutate-write path; everything stays on
-    # the host (sharding=None forces replicated → host numpy view).
+    # The output writer is already k-streamed, so the input must be too:
+    # materialising ``(nk, nbands, ns, ngkmax)`` first made this optional
+    # end-of-run artifact a whole-WFN device allocation after Sigma.  Keep
+    # exactly one raw IBZ row live and rotate it on the host.
     if enk_full_base_ry is None:
         enk_full_ry = np.array(
             wfn.energies[0], dtype=np.float64).copy()  # (nk, nbands)
@@ -540,33 +542,35 @@ def write_qp_wfn_h5(
     # end-of-run dump and the re-slurp cost is paid once.
     from ffi import _services
     _services.ensure_on_path()
-    from wfn_loader import WfnLoader
-    loader = WfnLoader(wfn.path)
-    psi_all = np.asarray(loader.load(
-        bands=(0, int(wfn.nbands)), k="ibz", sharding=None))   # (nk, nb, ns, ngkmax)
-    gvecs_full = loader.gvecs(k="ibz")                          # (nk, ngkmax, 3)
-    ngk_v = loader.ngk_valid(k="ibz")                           # (nk,)
-    gvecs_per_k = [gvecs_full[ik, : int(ngk_v[ik])]
-                   for ik in range(int(wfn.nkpts))]
-    loader.close()
+    from wfn_loader import IBZRows, WfnLoader
+    with WfnLoader(wfn.path) as loader:
+        gvecs_full = loader.gvecs(k="ibz")                     # (nk, ngkmax, 3)
+        ngk_v = loader.ngk_valid(k="ibz")                      # (nk,)
+        gvecs_per_k = [gvecs_full[ik, : int(ngk_v[ik])]
+                       for ik in range(int(wfn.nkpts))]
 
-    with WFNWriter(
-        output_path, wfn,
-        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
-        weights=np.asarray(wfn.kweights, dtype=np.float64),
-        kgrid=tuple(int(x) for x in wfn.kgrid),
-        nbands=int(wfn.nbands),
-        gvecs_per_k=gvecs_per_k,
-        nosym=False,
-        shift=tuple(float(x) for x in wfn.shift),
-    ) as w:
-        for ik in range(int(wfn.nkpts)):
-            n = int(ngk_v[ik])
-            c_all_dft = psi_all[ik, :, :, :n].copy()           # (nbands, ns, ngk)
-            c_active_dft = c_all_dft[band_start:band_stop]      # view
-            c_all_dft[band_start:band_stop] = np.einsum(
-                "mn,msg->nsg", U_kmn[ik], c_active_dft, optimize=True)
-            w.write_k(ik, enk_full_ry[ik], c_all_dft)
+        with WFNWriter(
+            output_path, wfn,
+            kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
+            weights=np.asarray(wfn.kweights, dtype=np.float64),
+            kgrid=tuple(int(x) for x in wfn.kgrid),
+            nbands=int(wfn.nbands),
+            gvecs_per_k=gvecs_per_k,
+            nosym=False,
+            shift=tuple(float(x) for x in wfn.shift),
+        ) as writer:
+            for ik in range(int(wfn.nkpts)):
+                n = int(ngk_v[ik])
+                psi_k = loader.load(
+                    bands=(0, int(wfn.nbands)),
+                    k=IBZRows((ik,)), sharding=None)
+                c_all_dft = np.asarray(psi_k)[0, :, :, :n].copy()
+                del psi_k
+                c_active_dft = c_all_dft[band_start:band_stop]
+                c_all_dft[band_start:band_stop] = np.einsum(
+                    "mn,msg->nsg", U_kmn[ik], c_active_dft,
+                    optimize=True)
+                writer.write_k(ik, enk_full_ry[ik], c_all_dft)
 
     # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
     # rotated orbitals carry the QP eigenvalues that produced the rotation,
