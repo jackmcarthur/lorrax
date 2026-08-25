@@ -136,6 +136,24 @@ def _strip(prov_json, keys):
     return json.dumps(d, sort_keys=True)
 
 
+def test_cri3_asymmetric_physical_ranges_exclude_the_p16_carrier_pad():
+    """Schema 2 records physics, not the mesh-dependent b4=256 carrier."""
+    cfg = _cfg(bispinor=False)
+    explicit = json.loads(_prov(
+        cfg, band_range_left=(0, 190), band_range_right=(0, 250),
+        logical_band_stop=250))
+    followed_carrier = json.loads(_prov(
+        cfg, band_range_left=(0, 190), band_range_right=(0, 256),
+        logical_band_stop=250))
+
+    assert explicit["band_range_left_logical"] == [0, 190]
+    assert explicit["band_range_right_logical"] == [0, 250]
+    assert followed_carrier["band_range_left_logical"] == [0, 190]
+    assert followed_carrier["band_range_right_logical"] == [0, 250]
+    assert 256 not in explicit["band_range_right_logical"]
+    assert 256 not in followed_carrier["band_range_right_logical"]
+
+
 _ALL3 = ("distributed_zeta_solve", "transverse_zeta_solve",
          "transverse_zeta_rcond")
 

@@ -932,10 +932,11 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 			f"window; it cannot move it outside the loaded bands.")
 	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
 	right = (band_slices.b1, b4_zeta)
-	log(f"    ζ-fit window DECOUPLED from the band sum: zeta_nband="
-	    f"{b4_zeta} (nband/b4={band_slices.b4}).  χ0/Σ still sum "
-	    f"[{band_slices.b0}, {band_slices.b4}); ζ is fitted on left {left} "
-	    f"x right {right}.")
+	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
+	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
+	    f"b4={band_slices.b4} (any tail above the logical loaded extent is "
+	    f"exact-zero mesh padding).  ζ is fitted on left {left} x right "
+	    f"{right}.")
 	if band_slices.b3 > b4_zeta:
 		log(f"    *** zeta_nband={b4_zeta} is BELOW the Σ evaluation window's "
 		    f"top b3={band_slices.b3}.  Quasiparticle energies for bands "
@@ -1067,7 +1068,7 @@ _BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
 
 
 def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
-                                  *, log=print):
+								  *, meta, log=print):
 	"""THE SIZING RULE, ENFORCED AT THE SEAM THAT CONSUMES IT.
 
 	*The ISDF basis must span the band window its consumers actually reach.*
@@ -1090,9 +1091,12 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 
 	THREE THINGS ARE CHECKED, and they are different questions:
 
-	1. The fit's right range tops out at ``max(b4_chi, b4_sigma)`` (== ``b4``,
-	   the padded edge).  A window sized by the smaller consumer is refused
-	   outright — that is the failure above, one index over.
+	1. With no explicit narrowing, the fit's STORAGE range tops out at
+	   ``max(b4_chi, b4_sigma)`` (== ``b4``, the padded carrier edge).  Its
+	   PHYSICAL top is instead the logical count owned by
+	   ``Meta.b_id_4_{chi,sigma}_user``.  ``load_centroids_band_chunked``
+	   makes the difference exact-zero ψ, so carrier padding is inert and is
+	   never called a physical band sum here.
 	2. If ``zeta_nband`` narrows the fit BELOW either band sum's top, the
 	   consumer above it is running on an EXTRAPOLATED ζ basis.  Reported per
 	   consumer, loudly, and named — narrowing is a legitimate request
@@ -1101,33 +1105,62 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 	3. The window and the count that set it are logged unconditionally, so
 	   "no news" and "a good number" do not look alike.
 	"""
-	top = int(band_range_right[1])
+	carrier_top = int(band_range_right[1])
 	b4_chi, b4_sigma = int(band_slices.b4_chi), int(band_slices.b4_sigma)
-	expected = max(b4_chi, b4_sigma)
-	if zeta_nband is None and top != expected:
+	expected_carrier = max(b4_chi, b4_sigma)
+	logical_chi = int(meta.b_id_4_chi_user)
+	logical_sigma = int(meta.b_id_4_sigma_user)
+	expected_logical = max(logical_chi, logical_sigma)
+
+	# ``Meta`` owns the logical-versus-carrier relation.  Assert that the
+	# BandSlices handed to this seam still describes that same Meta rather than
+	# silently accepting two independently plausible windows.
+	if ((logical_chi, logical_sigma) !=
+			(min(b4_chi, int(meta.b_id_4_user)),
+			 min(b4_sigma, int(meta.b_id_4_user)))):
 		raise ValueError(
-			f"ISDF ζ-fit window top is {top} but the band sums reach "
-			f"max(chi={b4_chi}, sigma={b4_sigma}) = {expected}.  The "
+			"ISDF ζ-fit received BandSlices and Meta with inconsistent logical "
+			"χ/Σ tops; the diagnostic cannot establish which carrier rows are "
+			"physical.  Build both through the canonical Meta/BandSlices path.")
+	if zeta_nband is None and carrier_top != expected_carrier:
+		raise ValueError(
+			f"ISDF ζ-fit carrier top is {carrier_top} but the loaded band "
+			f"carriers reach max(chi={b4_chi}, sigma={b4_sigma}) = "
+			f"{expected_carrier}.  The "
 			f"interpolation basis MUST span the pair densities of whichever "
 			f"consumer reaches higher; a basis fitted to the smaller window "
 			f"and used for the larger one is the 0.36 eV / negative-gap "
 			f"failure in docs/dev/isdf_basis_adequacy_at_large_nband.md, "
 			f"which passed every gate in the suite.  This is a code defect, "
 			f"not a deck error.")
-	source = ("tied" if b4_chi == b4_sigma
-	          else ("number_bands_chi" if b4_chi > b4_sigma
+	if zeta_nband is not None and carrier_top > expected_logical:
+		raise ValueError(
+			f"zeta_nband={carrier_top} exceeds the logical loaded band top "
+			f"{expected_logical}; [{expected_logical}, {expected_carrier}) is "
+			"an exact-zero mesh carrier pad, not physical bands.  Request the "
+			"logical edge or omit zeta_nband to follow the padded carrier.")
+	physical_top = min(carrier_top, expected_logical)
+	source = ("tied" if logical_chi == logical_sigma
+	          else ("number_bands_chi" if logical_chi > logical_sigma
 	                else "number_bands_sigma"))
-	log(f"    ζ-fit window sized for {top} bands "
-	    f"(band sums reach chi {b4_chi}, sigma {b4_sigma}; the max is set by "
-	    f"{source})"
-	    + ("" if zeta_nband is None
-	       else f", NARROWED from {expected} by deck key zeta_nband={top}"))
+	pad_note = (
+		f"; loaded carrier top {expected_carrier}, exact-zero inert pad "
+		f"[{expected_logical}, {expected_carrier})"
+		if expected_carrier > expected_logical else "")
+	log(f"    ζ-fit physical window top {physical_top} bands "
+	    f"(logical band sums reach chi {logical_chi}, sigma {logical_sigma}; "
+	    f"the max is set by {source}{pad_note})"
+	    + ("" if physical_top == expected_logical
+	       else f", NARROWED from {expected_logical} by deck key "
+	            f"zeta_nband={carrier_top}"))
 	if zeta_nband is not None:
-		for edge, what, key in ((b4_chi, "χ0/W band sum", "number_bands_chi"),
-		                        (b4_sigma, "Σ band sum", "number_bands_sigma")):
-			if top < edge:
-				log(f"    *** zeta_nband={top} is BELOW the {what}'s top "
-				    f"({key} → band {edge}).  Bands [{top}, {edge}) of that "
+		for edge, what, key in (
+				(logical_chi, "χ0/W band sum", "number_bands_chi"),
+				(logical_sigma, "Σ band sum", "number_bands_sigma")):
+			if physical_top < edge:
+				log(f"    *** zeta_nband={physical_top} is BELOW the {what}'s top "
+				    f"({key} → band {edge}).  Bands [{physical_top}, {edge}) "
+				    f"of that "
 				    f"sum are built on pair densities whose ζ basis was "
 				    f"never fitted to them — the basis is EXTRAPOLATED "
 				    f"there.  This is the mechanism behind the 0.36 eV gap "
@@ -1329,7 +1362,7 @@ def _resolve_zeta_fit_contract(
 		int(zeta_edge) if zeta_edge is not None
 		else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4))
 	assert_isdf_window_is_the_max(
-		band_slices, band_range_right, zeta_edge, log=print_fn)
+		band_slices, band_range_right, zeta_edge, meta=meta, log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
 		zeta_edge, logical_band_stop,
