@@ -66,6 +66,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
 from common.jax_compile_cache import ensure_jax_compile_cache
 from runtime.padding import round_up, solve_at_logical
 from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
@@ -1491,18 +1492,23 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     )
 
 
-def compute_chi0_block(
+def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
-    """Compute one rectangular four-current response block ``chi_AB``.
+    """Compute one raw no-pair Dirac-current response block ``chi_AB``.
 
     Returns ``(nq, mu_left, mu_right)`` at ``P(None,'x','y')``.  Endpoint
     Green functions are built by the same :func:`build_G_tau` path as scalar
     charge response; only its two centroid operands may have different
     extents.  The final open-spin trace routes through the canonical
     :func:`common.gamma_matrices.gamma_double_contract` for a non-scalar
-    vertex pair.
+    vertex pair.  This is the exact paramagnetic component selected by
+    :data:`common.bispinor_init.NO_PAIR_DIRAC_CURRENT_MODEL`: it contains no
+    diamagnetic/seagull contact, gauged nonlocal-pseudopotential term, Hall
+    coefficient, or negative-energy/downfolded completion.  Consumers must not
+    label this block gauge-complete merely because its four-spinor contraction
+    is algebraically closed.
 
     ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
     x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
@@ -1522,11 +1528,11 @@ def compute_chi0_block(
             f"chi Lorentz vertices must be in {{0,1,2,3}}; got ({A},{B})")
     if wfns_left.layout != wfns_right.layout:
         raise ValueError(
-            "compute_chi0_block endpoint layouts differ: "
+            "compute_no_pair_dirac_current_block endpoint layouts differ: "
             f"{wfns_left.layout!r} vs {wfns_right.layout!r}")
     if wfns_left.layout != "face":
         raise ValueError(
-            "compute_chi0_block four-current response requires "
+            "compute_no_pair_dirac_current_block requires "
             "layout='face' (low_mem_bands=true); the incumbent legacy "
             "scalar chi kernel remains unchanged")
     if wfns_right.slices != wfns_left.slices or tuple(
@@ -1595,9 +1601,7 @@ def compute_chi0_block(
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
-STATIC_PHOTON_NO_PAIR_MODEL = (
-    "positive_energy_kinetic_balance_dirac_current_v1"
-)
+STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
 STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
     "no_pair_dirac_current_bubble_screened_breit_q0_nested_shell_v3"
 )
@@ -2604,12 +2608,12 @@ def _subtract_static_tt_contact(chi_tt):
     return corrected.at[0].set(jnp.zeros_like(corrected[0]))
 
 
-def compute_photon_chi0(
+def compute_experimental_no_pair_photon_chi0(
     wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout, *,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
 ):
-    """Build and locally pack all sixteen static CC/CT/TC/TT blocks.
+    """Build all sixteen no-pair blocks with an experimental TT proxy.
 
     Only one response block and the donated packed accumulator are live at a
     time.  The three transverse channels reuse ``wfns_transverse`` and differ
@@ -2641,7 +2645,7 @@ def compute_photon_chi0(
                 wfns_transverse, wfns_transverse)
 
     def get_block(A, B):
-        chi_ab = compute_chi0_block(
+        chi_ab = compute_no_pair_dirac_current_block(
             families[A], families[B], quad, meta, mesh_xy,
             vertex_left=A, vertex_right=B,
             energy_reference=energy_reference)
@@ -2751,7 +2755,7 @@ def compute_static_photon_response(
             f"Breit; current_contact={current_contact}; "
             f"head_correction={head_policy.value}",
             flush=True)
-    chi_packed = compute_photon_chi0(
+    chi_packed = compute_experimental_no_pair_photon_chi0(
         wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact=current_contact,
         energy_reference=energy_reference)

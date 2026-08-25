@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.bispinor_init import ALPHA_FS
+from common.bispinor_init import ALPHA_FS, NO_PAIR_DIRAC_CURRENT_MODEL
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 
 
@@ -71,7 +71,7 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     """
     from common.collectives import single_device_mesh
     from common.wfn_transforms import to_rbox
-    from symmetry_maps import fft_grid_pullback_perm
+    from symmetry_maps import fft_grid_pullback_perm, star_tables_of
     from wfn_loader import IBZRows, WfnLoader
     from .charge_density import _uniform_band_windows
 
@@ -129,9 +129,9 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
         return field
 
     nk_full = int(sym.nk_tot)
-    parent_for_k = np.asarray(sym.irr_idx_k, dtype=np.int32)
-    sym_row_for_k = np.asarray(sym.sym_idx_k, dtype=np.int32)
-    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    # Keep parent, selected action, and the spatial/TRS split inseparable.
+    # This is the same service-owned tuple used by the WFN unfold.
+    parent_for_k, sym_row_for_k, n_spatial = star_tables_of(sym)
     if n_spatial < 1:
         raise ValueError("SymMaps contains no spatial symmetry row")
     sym_mats_k_shape = np.asarray(sym.sym_mats_k).shape
@@ -193,7 +193,8 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     rho_np = (rho_flat / float(nk_full)).reshape(fft_grid)
     if verbose:
         dt = time.perf_counter() - t0
-        print(f"  ρ_current (direct Dirac, WFN-IBZ + exact star pullback, "
+        print(f"  ρ_current ({NO_PAIR_DIRAC_CURRENT_MODEL}, "
+              "WFN-IBZ + exact star pullback, "
               f"chunk={chunk}) built "
               f"in {dt:.2f}s; max={float(rho_np.max()):.3e}, "
               f"mean={float(rho_np.mean()):.3e}", flush=True)
