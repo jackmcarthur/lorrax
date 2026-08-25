@@ -59,10 +59,11 @@ def check_finite_transfer_screened_body(mesh):
     from common.bispinor_init import lift_to_4spinor
     from common.wfn_layout import band_sphere_spec
     from common.wfn_transforms import gflat_to_rmu
-    from file_io.isdf_header import WavefunctionBasisReceipt
+    from file_io.wfn_basis import WavefunctionBasisReceipt
     from gw import w_isdf
     from gw.wavefunction_bundle import (
-        BandSlices, PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions)
+        AuthenticatedWavefunctions, BandSlices, PSI_MUN_SPEC, PSI_NMU_SPEC,
+        Wavefunctions)
     from psp import dft_operators
     from runtime.padding import pad_axis, padded_mu_extent
     from tests.test_dft_gauge_vertices import _finite_setup
@@ -135,7 +136,7 @@ def check_finite_transfer_screened_body(mesh):
         wfn=wfn, band_start=0, band_stop=nb_logical, geom=geom,
         vnl_setup=setup, r_mu=r_mu,
         basis_receipt=WavefunctionBasisReceipt.from_source(
-            wfn=wfn, role='transverse',
+            wfn=wfn, role='transverse', bispinor=True,
             band_interval=(0, nb_logical), fft_grid=fft_grid,
             centroid_fft_idx=r_mu, n_rmu_logical=len(r_mu),
             n_rmu_padded=padded_mu_extent(len(r_mu), mesh)),
@@ -192,7 +193,7 @@ def check_finite_transfer_screened_body(mesh):
         enk=_put(energies, mesh, P(None, None)),
         occ=_put(np.zeros_like(energies), mesh, P(None, None)),
         slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face",
-        basis_receipt=endpoint.basis_receipt)
+    )
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=nk)
@@ -209,13 +210,11 @@ def check_finite_transfer_screened_body(mesh):
             "refusal")
     wrong_receipt = replace(
         endpoint.basis_receipt, centroid_table_md5="0" * 32)
-    wrong_wfns = Wavefunctions(
-        enk=wfns.enk, occ=wfns.occ, slices=wfns.slices,
-        psi_nmu=wfns.psi_nmu, psi_mun=wfns.psi_mun, layout="face",
-        basis_receipt=wrong_receipt)
     try:
         w_isdf._compute_finite_transfer_current_block_row_unverified(
-            endpoint, endpoint_minus_q, wrong_wfns, quad, meta, mesh,
+            endpoint, endpoint_minus_q,
+            AuthenticatedWavefunctions(wfns, wrong_receipt),
+            quad, meta, mesh,
             vertex_left=1, vertex_right=2)
     except ValueError as exc:
         if "before Green contraction" not in str(exc):
@@ -224,7 +223,9 @@ def check_finite_transfer_screened_body(mesh):
         raise AssertionError(
             "finite-transfer Green oracle accepted mismatched target faces")
     chi = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
+        endpoint, endpoint_minus_q,
+        AuthenticatedWavefunctions(wfns, endpoint.basis_receipt),
+        quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     chi.block_until_ready()
     if chi.sharding.spec != P("x", "y"):
