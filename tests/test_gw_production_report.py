@@ -172,8 +172,8 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
                      if line.startswith("  zeta"))
     sigma_line = next(line for line in text.splitlines()
                       if line.startswith("  Sigma"))
-    assert "1.00000" in zeta_line
-    assert "5.00000" in sigma_line
+    assert "          1.00" in zeta_line
+    assert "          5.00" in sigma_line
     assert "HDF5" not in text and "h5py" not in text
 
 

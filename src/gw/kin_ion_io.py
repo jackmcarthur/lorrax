@@ -89,7 +89,9 @@ import common.timing as timing
 from common.preprocessing_output import (PreprocessingProductionReport,
                                          timing_total)
 from common.progress import LoopProgress
-from common.scientific_output import band_range, policy
+from common.scientific_output import (
+    band_range, policy, pseudopotential_file_rows,
+)
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -1543,13 +1545,15 @@ def main(argv=None):
         ("T + ionic matrix", timing_total(records, "kin_ion")),
         ("artifact write", timing_total(records, "write_h5")),
     ), wall=wall)
-    report.files((
+    file_rows = [
         ("human-readable report", "written", report_path),
         ("mean-field matrices", "written", out_path),
         ("wavefunctions", "read", wfn_path),
-        ("pseudopotentials", "read", pseudo_source),
-        ("input deck", "read", args.input),
-    ))
+    ]
+    file_rows.extend(pseudopotential_file_rows(
+        pseudos, fallback=pseudo_source))
+    file_rows.append(("input deck", "read", args.input))
+    report.files(file_rows)
     report.finish()
     production_stdout.close()
     return 0

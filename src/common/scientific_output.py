@@ -15,6 +15,7 @@ import numpy as np
 
 
 FLOAT_DIGITS = 5
+TAU_DIGITS = 3
 
 
 def clean_rounded(values, *, digits: int = FLOAT_DIGITS) -> np.ndarray:
@@ -150,17 +151,14 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
             "from the measured density verdict")
 
-    display_tau = clean_rounded(tau, digits=digits)
-    for i, (rotation, shift, is_non) in enumerate(
-            zip(rotations, display_tau, fractional_tau), start=1):
-        # A fractional translation makes the nonsymmorphic content visible,
-        # but presentation alone must not classify the space-group element
-        # as a screw/glide (that needs crystallographic origin analysis).
-        tag = "  fractional tau" if bool(is_non) else ""
+    display_tau = clean_rounded(tau, digits=TAU_DIGITS)
+    for i, (rotation, shift) in enumerate(
+            zip(rotations, display_tau), start=1):
         lines.append(
             f"  S{i:02d}  R^-1={_matrix_text(rotation)}  "
-            f"tau=({shift[0]: .{digits}f} {shift[1]: .{digits}f} "
-            f"{shift[2]: .{digits}f}){tag}")
+            f"tau=({shift[0]: .{TAU_DIGITS}f} "
+            f"{shift[1]: .{TAU_DIGITS}f} "
+            f"{shift[2]: .{TAU_DIGITS}f})")
 
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in clean_rounded(
@@ -186,15 +184,31 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
     return lines
 
 
-def file_table_lines(rows: Iterable[tuple[str, str, str]]) -> list[str]:
+def file_table_lines(rows: Iterable[tuple[str, str, str]], *,
+                     omit_paths: Iterable[str] = ()) -> list[str]:
+    omitted = {abs_path(path) for path in omit_paths}
     lines = ["  role                     state       path"]
-    lines.extend(f"  {role:<24} {state:<11} {abs_path(path)}"
-                 for role, state, path in rows)
+    lines.extend(
+        f"  {role:<24} {state:<11} {abs_path(path)}"
+        for role, state, path in rows if abs_path(path) not in omitted)
     return lines
+
+
+def pseudopotential_file_rows(
+        pseudos, *, fallback: str = "") -> list[tuple[str, str, str]]:
+    """Return one clean input-file row per loaded pseudopotential."""
+    rows = []
+    for element, pseudo in sorted(pseudos.items()):
+        path = getattr(pseudo, "_source_path", "") or fallback
+        rows.append((f"pseudopotential {element}", "read", path))
+    if not rows and fallback:
+        rows.append(("pseudopotentials", "read", fallback))
+    return rows
 
 
 __all__ = [
     "FLOAT_DIGITS",
+    "TAU_DIGITS",
     "abs_path",
     "architecture_lines",
     "band_range",
@@ -202,5 +216,6 @@ __all__ = [
     "file_table_lines",
     "numerical_environment_lines",
     "policy",
+    "pseudopotential_file_rows",
     "symmetry_sampling_lines",
 ]

@@ -54,9 +54,10 @@ def test_preprocessing_report_is_human_readable_and_shared(tmp_path):
     assert "MPI ranks      : 4" in text
     assert "JAX/JAXLIB     : 0.9.1 / 0.9.1" in text
     assert "Spatial group   : 1 operations; 1 with fractional translations" in text
-    assert "tau=( 0.50000  0.00000  0.00000)" in text
+    assert "tau=( 0.500  0.000  0.000)" in text
+    assert "fractional tau" not in text
     assert "  2   0.50000   0.00000   0.00000   0.75000" in text
-    assert "1.25000" in text
+    assert "          1.25" in text
     assert "HDF5 library rank-local" not in text
     assert "retained physical warning" in text
     assert "OUTPUT FILES AND INPUTS" in text

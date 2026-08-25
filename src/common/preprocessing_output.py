@@ -138,8 +138,8 @@ class ScientificProductionReport:
         for name, seconds in stages:
             seconds = float(seconds)
             fraction = 100.0 * seconds / wall if wall else 0.0
-            self.emit(f"  {str(name):<22} {seconds:14.5f}  {fraction:9.5f}%")
-        self.emit(f"  {'total run':<22} {float(wall):14.5f}  {100.0:9.5f}%")
+            self.emit(f"  {str(name):<22} {seconds:14.2f}  {fraction:9.2f}%")
+        self.emit(f"  {'total run':<22} {float(wall):14.2f}  {100.0:9.2f}%")
 
     def warnings(self) -> None:
         if self._warnings_emitted:
@@ -152,7 +152,7 @@ class ScientificProductionReport:
 
     def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
         self.heading("Output files and inputs")
-        for line in file_table_lines(rows):
+        for line in file_table_lines(rows, omit_paths=(self.path,)):
             self.emit(line)
 
     def finish(self, *, status: str = "completed") -> None:

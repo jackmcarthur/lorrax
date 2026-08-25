@@ -79,6 +79,7 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "auto (other choices:" in text
     assert "Started Hamiltonian interpolation" in text
     assert "OUTPUT FILES AND INPUTS" in text
+    assert "calculation report" not in text
     assert "HDF5" not in text and "h5py" not in text
 
 

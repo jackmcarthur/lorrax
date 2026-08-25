@@ -46,7 +46,7 @@ from common.collectives import barrier, gather_k_blocks
 from common.preprocessing_output import (PreprocessingProductionReport,
 									 timing_total)
 from common.progress import LoopProgress
-from common.scientific_output import band_range
+from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 band_sphere_spec, blocks_to_host,
@@ -1577,9 +1577,10 @@ def main(argv=None):
 		file_rows.append(("parallel-transport", "written", str(pt_path)))
 	file_rows.extend((
 		("wavefunctions", "read", str(wfn_path)),
-		("pseudopotentials", "read", searched[-1] if searched else ""),
-		("input deck", "read", str(input_path)),
 	))
+	file_rows.extend(pseudopotential_file_rows(
+		pseudos, fallback=searched[-1] if searched else ""))
+	file_rows.append(("input deck", "read", str(input_path)))
 	report.files(file_rows)
 	report.finish()
 	production_stdout.close()
