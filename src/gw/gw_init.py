@@ -1596,6 +1596,71 @@ def _plan_gflat_chunks_for_channel(
 	return chunks, gflat_plan
 
 
+def _gate_fresh_zeta_rank_findings(
+		finding_context, *, transverse=False, print_fn=print):
+	"""Dispose deferred rank findings before a fresh ζ channel is stamped.
+
+	The ζ truncations execute inside jitted kernels and therefore record through
+	the incumbent ``spectral_closure`` and ``rank_criterion`` services.  Every
+	fresh charge or transverse writer must cross this host seam immediately
+	after its fit, before provenance makes that artifact reusable.  Accepted
+	restart artifacts never call this function.
+	"""
+	_sc_mode = spectral_closure.resolve_mode(
+		os.environ.get(spectral_closure.MODE_ENV))
+	# Read findings before the disposition clears them, so the clean/fired
+	# banner below cannot contradict the service result.
+	_sc_fired = bool(spectral_closure.pending())
+	spectral_closure.raise_if_pending(
+		finding_context, mode=_sc_mode, log=print_fn)
+	if _sc_mode == "off":
+		print_fn("    ζ rank-cut closure: guard is OFF "
+		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
+		         "absence and not a pass.")
+	elif _sc_fired:
+		print_fn(f"    ζ rank-cut closure: guard fired above and the "
+		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
+		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
+		         f"retained span is point-group invariant; the rank it "
+		         f"carries is LOWER than the one zeta_rcond alone would have "
+		         f"chosen, and its κ_eff is correspondingly better.")
+	else:
+		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
+		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
+		         f"fell inside a degenerate block of C_q on any q.")
+
+	_rp_mode = rank_criterion.resolve_policy_mode(
+		os.environ.get(rank_criterion.POLICY_MODE_ENV))
+	_rp_fired = bool(rank_criterion.pending())
+	rank_criterion.raise_if_pending(
+		finding_context, mode=_rp_mode, log=print_fn)
+	if _rp_mode == "off":
+		print_fn("    ζ rank-cut certification: gate is OFF "
+		         f"({rank_criterion.POLICY_MODE_ENV}=off) — NOT CHECKED, "
+		         f"which is an absence and not a pass.")
+	elif _rp_fired:
+		print_fn(f"    ζ rank-cut certification: FIRED above "
+		         f"(mode={_rp_mode}).  The cut bound outside the regime any "
+		         f"measurement certifies; the numbers are in the "
+		         f"[rank-policy] lines.")
+	elif transverse:
+		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
+		         f"transverse κ is UNCERTIFIED, discarded-weight ceiling "
+		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
+		         f"either the cut bound nothing, or its discarded weight "
+		         f"remained inside the certified regime.")
+	else:
+		# Preserve the established charge-channel message verbatim.
+		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
+		         f"certified κ ceiling "
+		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e} for the charge "
+		         f"Gram, discarded-weight ceiling "
+		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
+		         f"either the cut bound nothing, or it bound inside the "
+		         f"certified regime.  The transverse channel is "
+		         f"UNCERTIFIED and can only raise the weight finding.")
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
              psi_nmu_fresh=None, psi_mun_fresh=None,
@@ -1765,80 +1830,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				psi_mun_fresh=psi_mun_fresh,
 			)
 
-	# ── THE ζ RANK CUT'S CLOSURE VERDICT, refused HERE if it must be ──────
-	# The four ζ truncation sites live inside jitted kernels, which cannot
-	# raise; under ``LORRAX_SPECTRAL_CLOSURE=strict`` they record the finding
-	# through a host callback and this is the seam that refuses on it — the
-	# same division of labour ``centroid/pivoted_cholesky`` documents for the
-	# select kernel.  Placed immediately after the fit and BEFORE ζ is
-	# consumed by anything, so ``strict`` stops the run rather than letting W
-	# be built on a basis whose span is not point-group invariant.
-	#
-	# Under the default (``snap``) this prints any firing and continues; the
-	# cut has already been moved inside the kernel, DROPPING the straddled
-	# block (owner ruling 2026-08-10).  On a deck whose cut falls in a gap it
-	# does nothing at all, which is what the Si 6×6×6 ``armF`` (nband=68) arm
-	# is expected to show — its tightest cut has a relative gap of 0.315
-	# against a tolerance of 1e-6, five decades clear of firing.  That deck is
-	# the control for the direction flip: a cut in a gap is unmoved by EITHER
-	# direction, so its retained ranks must be bit-unchanged across it.
+	# Device kernels can only record closure/certification findings.  The
+	# shared host seam must dispose them after this fresh writer and before its
+	# provenance stamp makes the artifact reusable.
 	if not _reuse_charge:
-		_sc_mode = spectral_closure.resolve_mode(
-			os.environ.get(spectral_closure.MODE_ENV))
-		# Read the findings BEFORE the refusal clears them, so the "clean" line
-		# below cannot contradict a snap that just fired one line above it.
-		_sc_fired = bool(spectral_closure.pending())
-		spectral_closure.raise_if_pending(
-			"the ζ fit's rank truncation", mode=_sc_mode, log=print_fn)
-	if not _reuse_charge and _sc_mode == "off":
-		print_fn("    ζ rank-cut closure: guard is OFF "
-		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
-		         "absence and not a pass.")
-	elif not _reuse_charge and _sc_fired:
-		print_fn(f"    ζ rank-cut closure: guard fired above and the "
-		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
-		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
-		         f"retained span is point-group invariant; the rank it "
-		         f"carries is LOWER than the one zeta_rcond alone would have "
-		         f"chosen, and its κ_eff is correspondingly better.")
-	elif not _reuse_charge:
-		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
-		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
-		         f"fell inside a degenerate block of C_q on any q.")
-
-	# ── THE ζ RANK CUT'S CERTIFICATION VERDICT, same seam, same reason ────
-	# ``spectral_closure`` asks WHERE the cut landed; this asks whether the
-	# cut was allowed to happen at this conditioning at all.  Until
-	# 2026-08-22 the ζ truncation printed n_keep/q and kappa/q and gated on
-	# NEITHER: a 1776-centroid Si 4×4×4 fit dropped 300+ modes per q at
-	# kappa 9.7e9 and delivered Σ_c MAE 54.4 eV at exit 0 with no banner.
-	# The gate fires inside the jitted kernels, which cannot raise, so it
-	# records through a host callback and refuses HERE — before ζ is
-	# consumed by W.  docs/dev/rank_truncation_policy.md owns the policy.
-	if not _reuse_charge:
-		_rp_mode = rank_criterion.resolve_policy_mode(
-			os.environ.get(rank_criterion.POLICY_MODE_ENV))
-		_rp_fired = bool(rank_criterion.pending())
-		rank_criterion.raise_if_pending(
-			"the ζ fit's rank truncation", mode=_rp_mode, log=print_fn)
-	if not _reuse_charge and _rp_mode == "off":
-		print_fn("    ζ rank-cut certification: gate is OFF "
-		         f"({rank_criterion.POLICY_MODE_ENV}=off) — NOT CHECKED, "
-		         f"which is an absence and not a pass.")
-	elif not _reuse_charge and _rp_fired:
-		print_fn(f"    ζ rank-cut certification: FIRED above "
-		         f"(mode={_rp_mode}).  The cut bound outside the regime any "
-		         f"measurement certifies; the numbers are in the "
-		         f"[rank-policy] lines.")
-	elif not _reuse_charge:
-		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
-		         f"certified κ ceiling "
-		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e} for the charge "
-		         f"Gram, discarded-weight ceiling "
-		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
-		         f"either the cut bound nothing, or it bound inside the "
-		         f"certified regime.  The transverse channel is "
-		         f"UNCERTIFIED and can only raise the weight finding.")
+		_gate_fresh_zeta_rank_findings(
+			"the ζ fit's rank truncation", print_fn=print_fn)
 
 	# Stamp what this ζ was fit FOR, so a later run can reuse it.  AFTER
 	# the fit (and therefore after ``mark_zeta_done`` inside
@@ -2060,6 +2057,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					write_ibz_only=_write_ibz_only_transverse,
 					zeta_cutoff_ry=_zeta_cutoff,
 				)
+			_gate_fresh_zeta_rank_findings(
+				f"the μ_L={mu_L} transverse ζ fit's rank truncation",
+				transverse=True, print_fn=print_fn)
 			# Stamp this ζ_T so a later run can reuse it — same ordering
 			# and same truncating-knob veto as the charge stamp above
 			# (fit → mark_zeta_done → stamp; a run killed between the
