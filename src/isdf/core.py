@@ -1047,8 +1047,6 @@ def _z_q_legacy(
 	    Z_q                 : (nq, n_rmu, n_zchunk) sharded
 	                          ``P(None, 'x', 'y')``.
 	"""
-	from common.psi_G_store import _PSI_G_FLAT_SPEC  # noqa: F401  (sharding contract)
-
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
