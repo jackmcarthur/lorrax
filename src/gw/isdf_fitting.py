@@ -1228,8 +1228,10 @@ def fit_zeta_to_h5(
             print_fn(f"  ψ(r) cache: {psi_r_cache.shape}, "
                      f"band-sharded over ('x','y'), "
                      f"{_cache_local_bytes / 1e9:.2f} GB local")
-        # Every io_callback has drained; only the device cache is consumed.
-        psi_G_store.close()
+        # Every io_callback has drained.  Release the host coefficient tiles,
+        # but retain the store-owned box index and k vectors consumed by the
+        # cached face/legacy kernel ABI until the final close below.
+        psi_G_store.release_host_tiles()
     elif jax.process_index() == 0:
         print_fn("  ψ(r) cache: disabled by the low-memory plan; streaming "
                  "one ψ(G) band chunk per r chunk")
@@ -1608,8 +1610,8 @@ def fit_zeta_to_h5(
         from file_io.isdf_header import mark_zeta_done
         mark_zeta_done(output_file)
 
-    # Idempotent after the post-cache-build close above.  The phdf5 reader
-    # itself is cached at module level and survives.
+    # Full teardown after the last cached kernel has completed.  The phdf5
+    # reader itself is cached at module level and survives.
     psi_G_store.close()
 
     # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;

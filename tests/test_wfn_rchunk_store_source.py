@@ -7,6 +7,7 @@ import sys
 
 import jax
 import numpy as np
+import pytest
 
 from jax.sharding import Mesh, PartitionSpec as P
 
@@ -145,3 +146,21 @@ def test_store_source_matches_direct_iterator_without_rereads(tmp_path):
                 # logical terminal width 3 -> carrier width 4 on product-r P4
                 assert cached_tail[0][1].shape[-1] == 4
                 assert np.all(cached_tail[0][1][..., 3] == 0)
+
+            # Production hoisted-cache lifecycle: callbacks have drained, so
+            # host coefficient tiles can go away while the canonical paired
+            # transform metadata remains owned by this store.
+            g_index = source.g_index
+            kvecs_frac = source.kvecs_frac
+            source.release_host_tiles()
+            assert source.host_cache_bytes == 0
+            assert source.g_index is g_index
+            assert source.kvecs_frac is kvecs_frac
+            with pytest.raises(RuntimeError, match="host tiles were released"):
+                source.read_local_band_chunk(0, 0, 0)
+
+        # Negative discriminator: final close is still the full teardown.
+        with pytest.raises(RuntimeError, match="did not stage the box index"):
+            _ = source.g_index
+        with pytest.raises(RuntimeError, match="did not stage k vectors"):
+            _ = source.kvecs_frac
