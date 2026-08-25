@@ -22,10 +22,12 @@
     "error_bounds": [
       1e-06,
       2e-07,
-      6.86665972794514e-08
+      6.86665972794514e-08,
+      1.837465441237269e-08
     ],
     "crossing_A_dim_values": [
       20.0,
+      24.0,
       40.0
     ],
     "noncrossing_R_values": [
@@ -69,6 +71,18 @@
       "node_count": 25,
       "max_error": 4.4319801295600314e-07,
       "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em06_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 1.837465441237269e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 24.0,
+      "eps_q": 0.001,
+      "node_count": 38,
+      "max_error": 7.759544937147034e-09,
+      "file": "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"
     },
     {
       "family": "crossing",
