@@ -88,6 +88,7 @@ not conservative but simply wrong.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import platform
@@ -1067,7 +1068,7 @@ def catalog_document(entries, ledger, total_wall):
                 "chosen without reference to it."),
         },
         "shipping_rule": {
-            "source": "MPA_THEORY_PLAN.md section E",
+            "source": "docs/theory/THEORY_mpa_implementation.md",
             "kappa0_definition":
                 "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
             "kappa0_reference": (
@@ -1246,6 +1247,33 @@ def merge_entries(existing, fresh):
     return ordered, replaced
 
 
+def append_catalog_document(prior, entries, ledger, total_wall):
+    """Add rows without re-authoring certificates already in the bundle.
+
+    ``--append`` generates new bytes; only explicit ``--recertify`` may
+    remeasure old payloads.  Preserve the prior document and its table rows,
+    updating only the catalog census, ledger, and merged table list.  The
+    top-level provenance describes the original bundle campaign and must not
+    be reassigned to a later one-cell append.
+    """
+
+    doc = copy.deepcopy(prior)
+    sweep_doc = doc.setdefault("sweep", {})
+    sweep_doc["solver_wall_seconds"] = round(
+        float(sweep_doc.get("solver_wall_seconds", 0.0))
+        + float(total_wall), 2)
+    sweep_doc["entries"] = len(entries)
+    sweep_doc["certified"] = sum(
+        1 for entry in entries if entry["certified"])
+    sweep_doc["by_rule"] = {
+        rule: sum(1 for entry in entries if entry["rule"] == rule)
+        for rule in sorted({entry["rule"] for entry in entries})
+    }
+    sweep_doc["ledger"] = ledger
+    doc["tables"] = entries
+    return doc
+
+
 def recertify(output_root, verbose=True):
     """Re-derive every catalog field from the STAGED BYTES, not the solve.
 
@@ -1385,7 +1413,11 @@ def main(argv=None):
 
     def _checkpoint(entries, ledger, wall):
         merged, replaced = merge_entries(prior_tables, entries)
-        doc = catalog_document(merged, prior_ledger + ledger, wall)
+        if args.append and prior_tables:
+            doc = append_catalog_document(
+                prior, merged, prior_ledger + ledger, wall)
+        else:
+            doc = catalog_document(merged, prior_ledger + ledger, wall)
         tmp = path.with_suffix(".json.partial")
         tmp.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n",
                        encoding="utf-8")
