@@ -431,6 +431,7 @@ def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
+    energy_windows: bool = False,
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
 
@@ -520,7 +521,7 @@ def _get_sigma_kij_kernel(
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           bool(pack_brackets))
+           bool(pack_brackets), bool(energy_windows))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
@@ -561,7 +562,7 @@ def _get_sigma_kij_kernel(
                         mesh_xy, m=mu_s_f, k=w_pad, n=mu_s_f, nq=nk_f,
                         dtype=jnp.complex128))
 
-    def _g_from_selector(xn, yr, E, sel, ref, t):
+    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
         # The A-side selector operand is dtype-dispatched (static at trace
         # time): bool = the incumbent band-identity mask, bit-exact; float =
         # the metallic mask×weight product (f or 1−f folded by the executor),
@@ -578,13 +579,22 @@ def _get_sigma_kij_kernel(
         # about the other, so this dispatch stays dtype-only and the bracket
         # loop stays occupation-agnostic.
         if sel.dtype == jnp.bool_:
+            if energy_windows:
+                return build_G_tau(
+                    xn, yr, E, 1j * t, e_ref=ref, mask=sel,
+                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
                                layout=layout, gemm=g_plan)
+        if energy_windows:
+            return build_G_tau(
+                xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
+                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
                            layout=layout, gemm=g_plan)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                        E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):
+                        E_A, mask_A, E_min, E_max, E_ref_A, t_node,
+                        W_prep, build_g, conv):
         """Face sibling of :func:`_bracketed` — see this factory's own
         docstring's ``layout='face'`` section.  ψ is never sliced; each
         bracket narrows ``mask_A`` by a band-range predicate instead.
@@ -607,25 +617,35 @@ def _get_sigma_kij_kernel(
             mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
                            else mask_A * in_range.astype(mask_A.dtype))
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
-                         E_ref_A, t_node)
+                         E_min, E_max, E_ref_A, t_node)
             prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
 
-    def _g_from_selector_packed(xn, yr, E, sel, ref, t, gemm):
+    def _g_from_selector_packed(
+        xn, yr, E, sel, E_min, E_max, ref, t, gemm,
+    ):
         """Same dtype dispatch as :func:`_g_from_selector`, but ``gemm`` is
         an explicit argument rather than the factory's shared ``g_plan``
         closure — each bracket calls this with ITS OWN packed-width plan
         (:func:`_bracketed_face_packed`)."""
         if sel.dtype == jnp.bool_:
+            if energy_windows:
+                return build_G_tau(
+                    xn, yr, E, 1j * t, e_ref=ref, mask=sel,
+                    E_min=E_min, E_max=E_max, layout="face", gemm=gemm)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
                                layout="face", gemm=gemm)
+        if energy_windows:
+            return build_G_tau(
+                xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
+                E_min=E_min, E_max=E_max, layout="face", gemm=gemm)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
                            layout="face", gemm=gemm)
 
     def _bracketed_face_packed(psi_coh_xn, psi_coh_yr, psi_proj_xr,
-                               psi_proj_yn, E_A, mask_A, E_ref_A, t_node,
-                               W_prep, g_plans, conv):
+                               psi_proj_yn, E_A, mask_A, E_min, E_max,
+                               E_ref_A, t_node, W_prep, g_plans, conv):
         """Packed sibling of :func:`_bracketed_face` — see this factory's
         own docstring's ``layout='face'`` section for when this is used
         instead of the mask loop.
@@ -674,14 +694,15 @@ def _get_sigma_kij_kernel(
                     sel_w,
                     [(0, 0)] * (sel_w.ndim - 1) + [(0, w_pad - width)])
             G_k = _g_from_selector_packed(
-                psi_coh_xn[i], psi_coh_yr[i], E_w, sel_w, E_ref_A, t_node,
-                g_plans[i])
+                psi_coh_xn[i], psi_coh_yr[i], E_w, sel_w, E_min, E_max,
+                E_ref_A, t_node, g_plans[i])
             prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
 
     def _bracketed(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                   E_A, mask_A, E_ref_A, t_node, W_prep, build_g, conv):
+                   E_A, mask_A, E_min, E_max, E_ref_A, t_node,
+                   W_prep, build_g, conv):
         """The bracket loop.  ONE G(τ) live at a time, by construction."""
         outs = []
         prev = None
@@ -721,7 +742,8 @@ def _get_sigma_kij_kernel(
             # load-bearing: it could not save this path anyway, because it
             # runs AFTER the slice that corrupted the array.
             G_k = build_g(psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
-                          E_A[:, lo:hi], mask_A[..., lo:hi], E_ref_A, t_node)
+                          E_A[:, lo:hi], mask_A[..., lo:hi], E_min, E_max,
+                          E_ref_A, t_node)
             prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
@@ -729,10 +751,9 @@ def _get_sigma_kij_kernel(
     if not _stage_timing_enabled():
         _build_g = _g_from_selector
 
-        @partial(jax.jit, donate_argnums=(8,))
-        def kernel(
+        def _kernel_impl(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_q,
+            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q,
         ):
             # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
             # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
@@ -740,19 +761,31 @@ def _get_sigma_kij_kernel(
             W_prep = spatial.prep_w(W_q)
             if brackets is None:
                 G_k = _build_g(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                               E_ref_A, t_node)
+                               E_min, E_max, E_ref_A, t_node)
                 return spatial.conv_project(
                     psi_proj_xr, psi_proj_yn, G_k, W_prep)
             if use_packed:
                 return _bracketed_face_packed(
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A, mask_A, E_ref_A, t_node, W_prep,
+                    E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
                     g_plans, spatial.conv_project)
             bracket_loop = _bracketed_face if layout == "face" else _bracketed
             return bracket_loop(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, E_ref_A, t_node, W_prep,
+                E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
                 _build_g, spatial.conv_project)
+
+        if energy_windows:
+            kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
+        else:
+            @partial(jax.jit, donate_argnums=(8,))
+            def kernel(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, E_ref_A, t_node, W_q,
+            ):
+                return _kernel_impl(
+                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                    E_A, mask_A, None, None, E_ref_A, t_node, W_q)
 
         _sigma_kij_kernel_cache[key] = kernel
         return kernel
@@ -766,20 +799,20 @@ def _get_sigma_kij_kernel(
 
     build_g = jax.jit(_g_from_selector)
 
-    def _build_g_timed(xn, yr, E, mask, ref, t):
+    def _build_g_timed(xn, yr, E, mask, E_min, E_max, ref, t):
         with timing.section("sigma.tau.G_build") as sec:
-            G_k = build_g(xn, yr, E, mask, ref, t)
+            G_k = build_g(xn, yr, E, mask, E_min, E_max, ref, t)
             sec.watch(G_k)
         return G_k
 
-    def staged(
+    def _staged_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-        E_A, mask_A, E_ref_A, t_node, W_q,
+        E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q,
     ):
         W_prep = spatial.prep_w(W_q)
         if brackets is None:
             G_k = _build_g_timed(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                                 E_ref_A, t_node)
+                                 E_min, E_max, E_ref_A, t_node)
             return spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep)
         # Python-level loop over already-jitted stages: the barrier is not
@@ -797,10 +830,22 @@ def _get_sigma_kij_kernel(
             # precisely when they are already debugging.
             G_k = _build_g_timed(
                 psi_coh_xn[..., lo:hi], psi_coh_yr[:, lo:hi],
-                E_A[:, lo:hi], mask_A[..., lo:hi], E_ref_A, t_node)
+                E_A[:, lo:hi], mask_A[..., lo:hi], E_min, E_max,
+                E_ref_A, t_node)
             outs.append(spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep))
         return _stack_channels(outs, mesh_xy)
+
+    if energy_windows:
+        staged = _staged_impl
+    else:
+        def staged(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_ref_A, t_node, W_q,
+        ):
+            return _staged_impl(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, None, None, E_ref_A, t_node, W_q)
 
     _sigma_kij_kernel_cache[key] = staged
     return staged
@@ -815,6 +860,7 @@ def _get_sigma_tau_kernel(
     layout: str = "legacy",
     face_shape=None,
     pack_brackets: bool = True,
+    energy_windows: bool = False,
 ) -> Callable[..., jax.Array]:
     """Return a cached tau-node sigma builder with jittable local FFTs.
 
@@ -860,7 +906,7 @@ def _get_sigma_tau_kernel(
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
                  ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-                 bool(pack_brackets))
+                 bool(pack_brackets), bool(energy_windows))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -871,7 +917,8 @@ def _get_sigma_tau_kernel(
                                              brackets=brackets,
                                              layout=layout,
                                              face_shape=face_shape,
-                                             pack_brackets=pack_brackets)
+                                             pack_brackets=pack_brackets,
+                                             energy_windows=energy_windows)
 
     @jax.jit
     def _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi, E_ref_B, t_node):
@@ -908,7 +955,22 @@ def _get_sigma_tau_kernel(
         return jax.lax.with_sharding_constraint(W_t_q, q_mu_shard)
 
     @jax.jit
-    def _tau_kernel(
+    def _tau_kernel_bounded(
+        psi_coh_xn, psi_coh_yr,
+        psi_proj_xr, psi_proj_yn,
+        E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
+        E_min, E_max, E_ref_A, E_ref_B, t_node,
+    ):
+        W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                             E_ref_B, t_node)
+        return sigma_kij_kernel(
+            psi_coh_xn, psi_coh_yr,
+            psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_t_q,
+        )
+
+    @jax.jit
+    def _tau_kernel_incumbent(
         psi_coh_xn, psi_coh_yr,
         psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
@@ -929,7 +991,23 @@ def _get_sigma_tau_kernel(
         # the staged variant from _get_sigma_kij_kernel (same cache-key
         # flag) and emits the remaining stage rows.  Numerics: identical
         # op sequence to the fused _tau_kernel above.
-        def _tau_kernel_staged(
+        def _tau_kernel_staged_bounded(
+            psi_coh_xn, psi_coh_yr,
+            psi_proj_xr, psi_proj_yn,
+            E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
+            E_min, E_max, E_ref_A, E_ref_B, t_node,
+        ):
+            with timing.section("sigma.tau.w_phase") as sec:
+                W_t_q = _build_W_t_q(B_q, Omega_q, mask_B, Om_lo, Om_hi,
+                                     E_ref_B, t_node)
+                sec.watch(W_t_q)
+            return sigma_kij_kernel(
+                psi_coh_xn, psi_coh_yr,
+                psi_proj_xr, psi_proj_yn,
+                E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_t_q,
+            )
+
+        def _tau_kernel_staged_incumbent(
             psi_coh_xn, psi_coh_yr,
             psi_proj_xr, psi_proj_yn,
             E_A, mask_A, B_q, Omega_q, mask_B, Om_lo, Om_hi,
@@ -945,11 +1023,15 @@ def _get_sigma_tau_kernel(
                 E_A, mask_A, E_ref_A, t_node, W_t_q,
             )
 
-        _sigma_tau_kernel_cache[cache_key] = _tau_kernel_staged
-        return _tau_kernel_staged
+        tau_kernel = (_tau_kernel_staged_bounded if energy_windows
+                      else _tau_kernel_staged_incumbent)
+        _sigma_tau_kernel_cache[cache_key] = tau_kernel
+        return tau_kernel
 
-    _sigma_tau_kernel_cache[cache_key] = _tau_kernel
-    return _tau_kernel
+    tau_kernel = (_tau_kernel_bounded if energy_windows
+                  else _tau_kernel_incumbent)
+    _sigma_tau_kernel_cache[cache_key] = tau_kernel
+    return tau_kernel
 
 
 def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
@@ -1065,6 +1147,7 @@ def get_shared_sigma_tau_kernel(
 def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
                      brackets: tuple[tuple[int, int], ...] = ((0, None),),
                      pack_brackets: bool = True,
+                     energy_windows: bool = False,
                      ) -> None:
     """AOT lower + compile the per-τ sigma kernel.
 
@@ -1109,9 +1192,11 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
     tau_kernels = [
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid,
                               brackets=brackets, pack_brackets=pack_brackets,
+                              energy_windows=energy_windows,
                               **face_kwargs),
         _get_sigma_tau_kernel(mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
                               brackets=brackets, pack_brackets=pack_brackets,
+                              energy_windows=energy_windows,
                               **face_kwargs),
     ]
 
@@ -1197,17 +1282,22 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
     # the branch loop does, so the AOT signature still matches exactly.
     Om_lo   = jnp.asarray(-np.inf, dtype=jnp.float64)
     Om_hi   = jnp.asarray(np.inf, dtype=jnp.float64)
+    E_min   = jnp.asarray(-np.inf, dtype=jnp.float64)
+    E_max   = jnp.asarray(np.inf, dtype=jnp.float64)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node  = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
 
     for tau_kernel in tau_kernels:
         if hasattr(tau_kernel, "lower"):
-            tau_kernel.lower(
+            args = (
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
-                E_ref_A, E_ref_B, t_node,
-            ).compile()
+            )
+            if energy_windows:
+                args += (E_min, E_max)
+            tau_kernel.lower(
+                *args, E_ref_A, E_ref_B, t_node).compile()
         else:
             # Stage-split diagnostic dispatcher (LORRAX_SIGMA_TAU_TIMING=1): a
             # plain Python callable over five stage jits, so there is no single
@@ -1218,9 +1308,11 @@ def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,
             # execution inside sigma.compile.  All ranks reach this call
             # synchronously (module contract), so the psum_scatters inside are
             # collective-safe.  Output is discarded.
-            out = tau_kernel(
+            args = (
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, ppm.B_q, ppm.Omega_q, mask_B, Om_lo, Om_hi,
-                E_ref_A, E_ref_B, t_node,
             )
+            if energy_windows:
+                args += (E_min, E_max)
+            out = tau_kernel(*args, E_ref_A, E_ref_B, t_node)
             jax.block_until_ready(out)
