@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -376,12 +377,27 @@ def test_static_gauge_second_order_retained_jet_and_weight_hessian(
         q_probe[0] ** 2 * expected_full[:, 0]
         + 2.0 * q_probe[0] * q_probe[1] * expected_full[:, 1]
         + q_probe[1] ** 2 * expected_full[:, 2])
+    assert np.max(np.abs(expected_quadratic)) > 1.0e-8
     np.testing.assert_allclose(
         np.einsum(
             "a,wabij,b->wij", q_probe,
             np.asarray(got.S_bubble_q2_coefficient_cart), q_probe),
         expected_quadratic,
         rtol=2e-12, atol=2e-12)
+    missing_half_quadratic = np.einsum(
+        "a,wabij,b->wij", q_probe, 2.0 * expected_coefficient_cart, q_probe)
+    assert np.max(np.abs(
+        missing_half_quadratic - expected_quadratic)) > 1.0e-8
+
+    malformed_carrier = replace(
+        got,
+        S_bubble_second_derivative=jnp.zeros(
+            (1, 3, 5, 4), dtype=jnp.complex128),
+    )
+    with pytest.raises(
+            ValueError,
+            match=r"must have shape \(n_omega,3,4,4\)"):
+        _ = malformed_carrier.S_bubble_q2_coefficient_cart
 
     bad_q2 = q2.copy()
     bad_q2[:, 0, 0, 1, 0, 1] += 1.0e-5

@@ -426,7 +426,7 @@ class StaticGaugeSecondOrderComponent:
         used by itself to publish a production FULL head.
         """
         hessian = jnp.asarray(self.S_bubble_second_derivative)
-        if hessian.ndim != 4 or hessian.shape[1] != 3:
+        if hessian.ndim != 4 or hessian.shape[1:] != (3, 4, 4):
             raise ValueError(
                 "S_bubble_second_derivative must have shape "
                 "(n_omega,3,4,4) in pair order (xx,xy,yy); got "
