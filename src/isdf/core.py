@@ -5672,7 +5672,7 @@ def solve_zeta(
 # setup (centroids, L_q, G-space cache) and H5 I/O writes around the jit call.
 #
 # All "structural" configuration (band_chunk_ranges, band_range_left/right,
-# actual_n_rchunk, q_chunk_size, kvecs_frac, mesh, meta) is closure state —
+# actual_n_rchunk, q_chunk_size, mesh, meta) is closure state —
 # the factory compiles a distinct jit per (hashable) tuple.  The typical
 # r-chunk loop has exactly TWO compiled variants: the full-sized r-chunks
 # and the last remainder.
@@ -5694,7 +5694,6 @@ def _make_fit_one_rchunk_kernel(
     band_range_full: tuple[int, int],
     actual_n_rchunk: int,
     q_chunk_size: int,
-    kvecs_frac,
     psi_G_store,
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
@@ -5928,7 +5927,6 @@ def fit_one_rchunk(
     band_range_full: tuple[int, int],
     actual_n_rchunk: int,
     q_chunk_size: int,
-    kvecs_frac: np.ndarray,
     vertex_mu_L: int = 0,
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
@@ -5990,7 +5988,6 @@ def fit_one_rchunk(
         q_chunk_size,
         meta.n_rmu, meta.n_rmu_padded, meta.nk_tot, meta.nspinor,
         tuple(meta.fft_grid),
-        hash(kvecs_frac.tobytes()),
         id(psi_G_store),
         (None if psi_r_cache is None
          else tuple(int(s) for s in psi_r_cache.shape)),
@@ -6015,7 +6012,6 @@ def fit_one_rchunk(
             tuple(band_range_full),
             actual_n_rchunk,
             q_chunk_size,
-            kvecs_frac,
             psi_G_store,
             vertex_mu_L=int(vertex_mu_L),
             solver_kind=str(solver_kind),
