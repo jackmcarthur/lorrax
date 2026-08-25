@@ -386,7 +386,7 @@ def test_zeta_contract_takes_its_ranges_from_the_resolver():
 
 
 def test_the_fit_window_travels_into_the_provenance_stamp():
-    """``_zeta_fit_provenance`` records ``band_range_left``/``_right``, which
+    """``_zeta_fit_provenance`` records the logical left/right ranges, which
     is how ζ reuse notices a changed window AND how ``bse.vq_interp``'s refit
     learns which bands the producer actually fitted.  Both are the same two
     tuples this resolver returns."""
@@ -401,6 +401,7 @@ def test_the_fit_window_travels_into_the_provenance_stamp():
     fit_body = ast.get_source_segment(src, fit) or ""
     assert "band_range_left=band_range_left" in contract_body
     assert "band_range_right=band_range_right" in contract_body
+    assert "logical_band_stop=logical_band_stop" in contract_body
     # The contract owns the stamp identity; fit_zeta consumes those same
     # fields and passes them to the canonical writer.
     assert "band_range_left = zeta_contract.band_range_left" in fit_body
