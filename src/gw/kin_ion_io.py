@@ -537,17 +537,22 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 # hold a full (nb, nb) to reduce into, which is the wall being removed.
 
 
-def rho_work_items(nk: int, nocc: int, world: int) -> list[tuple[int, int, int]]:
+def rho_work_items(
+    nk: int,
+    nocc: int,
+    world: int,
+    *,
+    max_bands_per_item: int | None = None,
+) -> list[tuple[int, int, int]]:
     """The ρ sweep's work list: ``(ik, b_lo, b_hi)`` items, k-major.
 
-    One item per k while ``world <= nk`` — i.e. the band axis is left
-    whole, which makes the P=1 sweep the *identical* sequence of
-    operations the serial implementation performed (one k at a time,
-    all occupied bands, in k order) and therefore bit-for-bit its
-    result.  Past ``world > nk`` the occupied manifold is cut into
-    ``ceil(world/nk)`` contiguous band chunks so ranks beyond the k
-    count still get work; ``valence_density_from_kpoint`` sums whatever
-    bands it is handed, so no band-index bookkeeping leaks out of here.
+    Without an explicit memory bound, one item per k while ``world <= nk``
+    leaves the band axis whole.  That retains the former P=1 sequence for
+    small fixtures.  Past ``world > nk`` the occupied manifold is cut into
+    ``ceil(world/nk)`` contiguous band chunks so ranks beyond the k count
+    still get work.  A positive ``max_bands_per_item`` can require a tighter
+    split at any P; ``valence_density_from_kpoint`` sums whatever bands it is
+    handed, so no band-index bookkeeping leaks out of here.
 
     EVERY CHUNK IS THE SAME WIDTH, and that is a cache-contract
     requirement rather than a tidiness preference.  The band extent of an
@@ -563,25 +568,39 @@ def rho_work_items(nk: int, nocc: int, world: int) -> list[tuple[int, int, int]]
     which is the collective-compile deadlock precondition
     (FIX_multislice_cachekey.md §6.1, sibling 2).
 
-    So ``n_bchunk`` is snapped DOWN to a divisor of ``nocc``.  The cost is
-    stated rather than hidden: when ``nocc`` has no divisor near
-    ``ceil(world/nk)`` the split is coarser than asked for (``nocc=26``,
-    target 4, gives 2), and at prime ``nocc`` it collapses to 1, which
-    leaves ranks past ``nk`` with no item at all.  That residual is the
-    SANCTIONED EMPTY SHARE of ``common.collectives.local_share`` — the
-    red-listed sibling 4 — and not a new condition introduced here.
+    So the parallel ``n_bchunk`` is snapped DOWN to a divisor of ``nocc``.
+    ``max_bands_per_item`` then imposes the memory bound owned by the run's
+    existing ``band_chunk_size`` policy: when the parallel split is too
+    coarse, choose the smallest divisor whose uniform width is no larger
+    than that bound.  The parallel divisor is retained exactly when it is
+    already tighter.  At CrI3 ``nocc=130``, ``P=16 <= nk=36`` and
+    ``max_bands_per_item=16``, this changes one 130-band FFT box into ten
+    identically-shaped 13-band boxes without introducing a ragged compile.
 
-    The three properties this function is pinned on are unchanged: every
-    band is covered exactly once (uniform division of ``nocc`` by one of
-    its divisors), ``world <= nk`` is still one whole-band item per k, and
-    the round-robin share is still balanced to within one item.
+    The cost of divisor-uniform shapes is stated rather than hidden: at
+    prime ``nocc`` a tight memory bound collapses the width to one band.
+    That is slower, but bounded and cache-symmetric; padding a ragged final
+    carrier would be a separate transport-ABI change.
+
+    The three properties this function is pinned on are: every band is
+    covered exactly once (uniform division of ``nocc`` by one of its
+    divisors), the no-bound ``world <= nk`` path remains one whole-band item
+    per k, and the round-robin share stays balanced to within one item.
     """
     nk = int(nk)
     nocc = int(nocc)
     target = max(1, min(-(-int(world) // max(nk, 1)), nocc))
-    # The largest divisor of nocc that is <= target.  ``1`` always
-    # qualifies, so the loop cannot fall through.
-    n_bchunk = next(d for d in range(target, 0, -1) if nocc % d == 0)
+    # Preserve the incumbent parallel split: largest divisor <= target.
+    parallel_chunks = next(
+        d for d in range(target, 0, -1) if nocc % d == 0)
+    n_bchunk = parallel_chunks
+    if max_bands_per_item is not None and int(max_bands_per_item) > 0:
+        min_chunks = min(
+            nocc, -(-nocc // int(max_bands_per_item)))
+        threshold = max(parallel_chunks, min_chunks)
+        # Smallest divisor >= threshold.  ``nocc`` always qualifies.
+        n_bchunk = next(
+            d for d in range(threshold, nocc + 1) if nocc % d == 0)
     width = nocc // n_bchunk
     bounds = [(i * width, (i + 1) * width) for i in range(n_bchunk)]
     return [(ik, lo, hi) for ik in range(nk) for lo, hi in bounds if hi > lo]
@@ -625,6 +644,7 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
                                       nk: int | None = None,
                                       mesh=None,
                                       psi_rotation=None,
+                                      max_bands_per_item: int | None = None,
                                       print_fn=print) -> np.ndarray:
     """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
 
@@ -679,8 +699,19 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     nk = int(sym.nk_tot if nk is None else nk)
     nx, ny, nz = (int(s) for s in meta.fft_grid)
     rotated = psi_rotation is not None
+    # A supplied rotation couples the whole occupied band manifold.  It
+    # deliberately retains the all-band item; making that path bounded needs
+    # a distributed rotation, not silently applying independent band slices.
+    if (rotated and max_bands_per_item is not None
+            and 0 < int(max_bands_per_item) < int(nocc)):
+        print_fn(
+            "    rho band bound: NOT APPLIED to rotated psi; the occupied "
+            "rotation couples all bands and needs a separately distributed "
+            "rotation before it can be chunked")
     items = (rho_work_items(nk, int(nocc), 1) if rotated
-             else rho_work_items(nk, int(nocc), world))
+             else rho_work_items(
+                 nk, int(nocc), world,
+                 max_bands_per_item=max_bands_per_item))
     mine = local_share(items)
     f_spin = spin_degeneracy_factor(wfn)
     wk = 1.0 / float(nk)
@@ -717,6 +748,7 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
 def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            nb: int, mesh=None,
                            psi_rotation=None,
+                           band_chunk_size: int | None = None,
                            print_fn=print,
                            owner_only: bool = False,
                            k_set: str = "full"):
@@ -806,7 +838,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     with timing.section("vh_rho"):
         rho_np = build_valence_density_distributed(
             wfn, sym, meta, nocc, nk=nk, mesh=mesh,
-            psi_rotation=psi_rotation, print_fn=print_fn)
+            psi_rotation=psi_rotation,
+            max_bands_per_item=band_chunk_size,
+            print_fn=print_fn)
 
     # ---- 2. Poisson: REPLICATED BY DESIGN ------------------------------
     # Two 3-D FFTs on a 1.4 MB array: 3.1e7 flop against the sweep's
@@ -1190,7 +1224,9 @@ def main(argv=None):
         with timing.section("build_V_H"):
             v_h_all = compute_hartree_matrix(
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
-                mesh=mesh_xy, print_fn=print0, owner_only=True,
+                mesh=mesh_xy,
+                band_chunk_size=int(params["band_chunk_size"]),
+                print_fn=print0, owner_only=True,
                 k_set=("ibz" if store_ibz else "full"))
 
     # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
