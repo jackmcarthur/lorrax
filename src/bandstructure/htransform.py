@@ -42,6 +42,12 @@ from gw.gw_config import (
     resolve_eigh_backend,
 )
 from common.fft_helpers import make_flat_k_ifftn
+from bandstructure.kspace_interpolation import (
+    build_R_grid_np,
+    build_uniform_k_grid_np,
+    build_wigner_seitz_phase_plan,
+    effective_fourier_phase,
+)
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
@@ -313,17 +319,6 @@ def f_transform_eigs(enk_nb_nk: jax.Array,
                                           a_band_index=a_band_index)
     f_eps = fun(a, n, shift, enk_nb_nk)
     return f_eps, a, n, shift
-
-
-def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
-    """Lattice-R grid (nk, 3) matching the IFFT-shift convention used by
-    ``make_flat_k_ifftn`` — symmetric around 0, with R_i ∈ {-n/2, ..., n/2-1}."""
-    def _shift(n):
-        a = np.arange(n, dtype=np.float64)
-        return np.where(a >= (n + 1) // 2, a - n, a)
-    return np.stack(np.meshgrid(
-        _shift(kgrid[0]), _shift(kgrid[1]), _shift(kgrid[2]), indexing='ij'),
-        axis=-1).reshape(-1, 3)
 
 
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
@@ -933,8 +928,43 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     log_fn(f"  [route] fH_q metric: identity (selected-state Galerkin basis; "
            f"no dense {rank}x{rank} identity object)")
 
+    shift_frac = np.asarray(getattr(wfn, "shift", np.zeros(3)), dtype=np.float64)
+    if np.max(np.abs(shift_frac)) > 1.0e-12:
+        raise ValueError(
+            "Wigner-Seitz htransform probe requires an unshifted coarse k-grid; "
+            f"WFN shift is {shift_frac.tolist()}.  Shifted-grid phase twists "
+            "must be implemented in this same interpolation owner before use.")
+    ws_plan = build_wigner_seitz_phase_plan(kgrid, np.asarray(wfn.avec))
+    R_images = jnp.asarray(ws_plan.images)
+    R_weights = jnp.asarray(ws_plan.weights)
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready(R_grid)                            # instrument:
+
+    # Mandatory algebra receipt: every image of residue r is r + N*l, so at
+    # every unshifted coarse k=m/N its phase must equal the canonical residue
+    # phase.  Checking the complete phase table (not only Gamma, and not one
+    # Hamiltonian) proves exact recovery for every possible fH_R coefficient.
+    coarse_k = jnp.asarray(build_uniform_k_grid_np(kgrid))
+
+    @jax.jit
+    def _coarse_phase_receipt(q_coarse, images, weights, canonical_R):
+        ws_phase = effective_fourier_phase(q_coarse, images, weights)
+        canonical_phase = jnp.exp(-2j * jnp.pi * (q_coarse @ canonical_R.T))
+        return jnp.max(jnp.abs(ws_phase - canonical_phase))
+
+    coarse_phase_error = float(
+        _coarse_phase_receipt(coarse_k, R_images, R_weights, R_grid))
+    if not np.isfinite(coarse_phase_error) or coarse_phase_error > 1.0e-12:
+        raise RuntimeError(
+            "Wigner-Seitz interpolation changed a coarse-grid Fourier phase: "
+            f"max|phase_WS-phase_canonical|={coarse_phase_error:.3e} > 1e-12")
+    log_fn(
+        f"  [gate] Wigner-Seitz phase plan: all {nk} coarse nodes exact to "
+        f"{coarse_phase_error:.3e}; changed canonical representatives="
+        f"{ws_plan.canonical_changed}/{nk}, redistributed classes="
+        f"{ws_plan.redistributed}/{nk}, max degeneracy="
+        f"{int(np.max(ws_plan.degeneracies))}, certified search shell="
+        f"{ws_plan.search_shell}")
+    jax.block_until_ready((R_images, R_weights))             # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -963,7 +993,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # batch_k: (bs, 3) replicated; fH_R: (nk, rank, rank) at P(None,'x','y');
         # The einsum contracts over the replicated R axis only, so it is local
         # on each (i, j) tile.
-        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
+        phase = effective_fourier_phase(batch_k, R_images, R_weights)  # (bs, nk)
         mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R)             # (bs, rank, rank)
         # Pin the contraction OUTPUT to the (i, j) layout: left free, XLA
         # materialises the whole (bs, rank, rank) batch on every device before
@@ -991,7 +1021,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     # scalar reaches the log only.
     @jax.jit
     def _gamma_rt(fH_R, fH_k):
-        phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
+        phase0 = effective_fourier_phase(q0, R_images, R_weights)
         m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R)
         m = jax.lax.with_sharding_constraint(m, face_ij_shard)
         m = (m + jnp.swapaxes(m, 1, 2).conj())[0]
