@@ -5,8 +5,9 @@ the independent numerical oracles.  This cell owns the production layout:
 one 2x2 mesh, non-divisible logical band/centroid extents, WfnLoader-paired
 k/G/box labels, a nonzero q-IBZ row after a same-shape q=0 call, the incumbent
 distributed face Green builder, and the public row's fail-closed identity
-gate.  Production publication remains blocked until ``Wavefunctions`` carries
-the canonical non-JIT source/band/centroid receipt this oracle lacks.
+gate.  Endpoint and target faces carry the same immutable basis receipt;
+production publication remains blocked on the separate C/Z, completion,
+rectangular-IBZ-action, and artifact-provenance work.
 
 Run only through the Perlmutter compute harness::
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -57,11 +59,12 @@ def check_finite_transfer_screened_body(mesh):
     from common.bispinor_init import lift_to_4spinor
     from common.wfn_layout import band_sphere_spec
     from common.wfn_transforms import gflat_to_rmu
+    from file_io.isdf_header import WavefunctionBasisReceipt
     from gw import w_isdf
     from gw.wavefunction_bundle import (
         BandSlices, PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions)
     from psp import dft_operators
-    from runtime.padding import pad_axis
+    from runtime.padding import pad_axis, padded_mu_extent
     from tests.test_dft_gauge_vertices import _finite_setup
 
     if tuple(mesh.devices.shape) != (2, 2):
@@ -130,7 +133,13 @@ def check_finite_transfer_screened_body(mesh):
     dft_operators._as_loader = lambda value: value
     endpoint_kwargs = dict(
         wfn=wfn, band_start=0, band_stop=nb_logical, geom=geom,
-        vnl_setup=setup, r_mu=r_mu, path_order=8,
+        vnl_setup=setup, r_mu=r_mu,
+        basis_receipt=WavefunctionBasisReceipt.from_source(
+            wfn=wfn, role='transverse',
+            band_interval=(0, nb_logical), fft_grid=fft_grid,
+            centroid_fft_idx=r_mu, n_rmu_logical=len(r_mu),
+            n_rmu_padded=padded_mu_extent(len(r_mu), mesh)),
+        path_order=8,
         projector_row_chunk=1, g_chunk=2,
         include_transfer_q2_identity=True)
 
@@ -167,7 +176,8 @@ def check_finite_transfer_screened_body(mesh):
     raw_rmu = gflat_to_rmu(
         psi_4, box_index_dev, r_mu, mesh=mesh, fft_grid=fft_grid,
         kvecs_frac=kvecs, norm="ortho")
-    raw_rmu = pad_axis(raw_rmu, geom.p_prod, axis=-1).array
+    raw_rmu = pad_axis(
+        raw_rmu, padded_mu_extent(len(r_mu), mesh), axis=-1).array
     to_faces = jax.jit(
         lambda value: (value, value.transpose(0, 2, 3, 1)),
         out_shardings=(NamedSharding(mesh, PSI_NMU_SPEC),
@@ -181,7 +191,8 @@ def check_finite_transfer_screened_body(mesh):
     wfns = Wavefunctions(
         enk=_put(energies, mesh, P(None, None)),
         occ=_put(np.zeros_like(energies), mesh, P(None, None)),
-        slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face")
+        slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face",
+        basis_receipt=endpoint.basis_receipt)
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=nk)
@@ -190,11 +201,28 @@ def check_finite_transfer_screened_body(mesh):
             endpoint, wfns, quad, meta, mesh,
             vertex_left=1, vertex_right=2)
     except NotImplementedError as exc:
-        if "source/band/centroid" not in str(exc):
+        if "FULL remains unavailable" not in str(exc):
             raise
     else:
         raise AssertionError(
-            "finite-transfer public body row accepted no source receipt")
+            "finite-transfer public body row bypassed the remaining FULL "
+            "refusal")
+    wrong_receipt = replace(
+        endpoint.basis_receipt, centroid_table_md5="0" * 32)
+    wrong_wfns = Wavefunctions(
+        enk=wfns.enk, occ=wfns.occ, slices=wfns.slices,
+        psi_nmu=wfns.psi_nmu, psi_mun=wfns.psi_mun, layout="face",
+        basis_receipt=wrong_receipt)
+    try:
+        w_isdf._compute_finite_transfer_current_block_row_unverified(
+            endpoint, endpoint_minus_q, wrong_wfns, quad, meta, mesh,
+            vertex_left=1, vertex_right=2)
+    except ValueError as exc:
+        if "before Green contraction" not in str(exc):
+            raise
+    else:
+        raise AssertionError(
+            "finite-transfer Green oracle accepted mismatched target faces")
     chi = w_isdf._compute_finite_transfer_current_block_row_unverified(
         endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)

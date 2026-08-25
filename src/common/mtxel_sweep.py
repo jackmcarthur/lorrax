@@ -804,11 +804,18 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     identity; ``q_crys`` is its BGW signed fractional representative.  The
     response consumer can therefore keep a one-row block attached to its
     storage label without rebuilding a q grid.
+
+    ``basis_receipt`` is the exact immutable object supplied by the target
+    wavefunction bundle.  The producer authenticates it against the WFN,
+    physical band interval, FFT grid, ordered centroid table and live padded
+    extent, then propagates that same object rather than inferring provenance
+    from the two face shapes.
     """
 
     current_nmu: jax.Array
     current_mun: jax.Array
     n_rmu_logical: int
+    basis_receipt: object
     iq_irr: int
     q_irr_kgrid_int: np.ndarray
     q_crys: np.ndarray
@@ -1094,6 +1101,7 @@ def finite_transfer_current_to_centroids(
     geom: SweepGeometry,
     vnl_setup,
     r_mu,
+    basis_receipt,
     iq_irr: int,
     path_order: int = 12,
     path_rtol: float = 1.0e-10,
@@ -1123,8 +1131,14 @@ def finite_transfer_current_to_centroids(
     sampled with the target representative's paired ``box_index`` and Bloch
     vector.  Bands remain sharded over all processors throughout; no band
     matrix or fewer-than-P current carrier is formed.  The centroid tail is
-    zero padded to ``geom.p_prod`` so it can be converted to the incumbent
-    two-face layout without inventing a second padding convention.
+    zero padded to :func:`runtime.padding.padded_mu_extent` so it can be
+    converted to the incumbent two-face layout without inventing a second
+    padding convention.
+
+    ``basis_receipt`` must be the receipt carried by the target
+    :class:`gw.wavefunction_bundle.Wavefunctions` bundle for these same
+    source inputs.  The canonical receipt owner checks it before the
+    finite-transfer kernel runs and the endpoint returns it unchanged.
 
     This routine intentionally emits one q-resolved endpoint.  It does not
     pass it to the incumbent q-independent k-FFT C/Z or Green builders:
@@ -1174,20 +1188,6 @@ def finite_transfer_current_to_centroids(
             f"processor mesh; got axes={tuple(geom.mesh.axis_names)}, "
             f"shape={mesh_shape}")
 
-    psi = jnp.asarray(psi_G, dtype=jnp.complex128)
-    if int(psi.shape[1]) not in (int(geom.nb_logical), int(geom.nb)):
-        raise ValueError(
-            "finite-transfer current psi_G band axis must be logical or "
-            f"mesh padded ({int(geom.nb_logical)} or {int(geom.nb)}); "
-            f"got {tuple(psi.shape)}")
-    if (int(psi.shape[0]), int(psi.shape[2]), int(psi.shape[3])) != (
-            int(geom.nk), 4, int(geom.ngkmax)):
-        raise ValueError(
-            "finite-transfer current psi_G must have shape "
-            f"(nk,nb,4,ngkmax)=({int(geom.nk)},nb,4,"
-            f"{int(geom.ngkmax)}); got {tuple(psi.shape)}")
-    psi = pad_axis(psi, geom.p_prod, axis=1).array
-
     required_loader_api = ("symmetry", "box_index_dev")
     missing_loader_api = tuple(
         name for name in required_loader_api
@@ -1206,6 +1206,43 @@ def finite_transfer_current_to_centroids(
             "finite-transfer current SweepGeometry.ngkmax must match "
             f"WfnLoader.ngkmax exactly; got {int(geom.ngkmax)} vs "
             f"{int(wfn.ngkmax)}")
+    r_mu_host = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
+    if r_mu_host.ndim != 2 or int(r_mu_host.shape[1]) != 3:
+        raise ValueError(
+            f"finite-transfer current r_mu must be (n_rmu,3); got "
+            f"{r_mu_host.shape}")
+    from file_io.isdf_header import WavefunctionBasisReceipt
+    if not isinstance(basis_receipt, WavefunctionBasisReceipt):
+        raise TypeError(
+            "finite-transfer current requires the canonical immutable "
+            "WavefunctionBasisReceipt from its target Wavefunctions bundle; "
+            f"got {type(basis_receipt)!r}")
+    from runtime.padding import padded_mu_extent
+    expected_mu_padded = padded_mu_extent(
+        int(r_mu_host.shape[0]), geom.mesh)
+    basis_receipt.assert_matches_source(
+        wfn=wfn, role="transverse", band_interval=(start, stop),
+        fft_grid=geom.fft_grid,
+        centroid_fft_idx=r_mu_host,
+        n_rmu_logical=int(r_mu_host.shape[0]),
+        n_rmu_padded=expected_mu_padded,
+        where="finite-transfer current endpoint")
+
+    # Only after the target bundle's receipt authenticates the source do any
+    # finite-transfer current arrays enter construction.
+    psi = jnp.asarray(psi_G, dtype=jnp.complex128)
+    if int(psi.shape[1]) not in (int(geom.nb_logical), int(geom.nb)):
+        raise ValueError(
+            "finite-transfer current psi_G band axis must be logical or "
+            f"mesh padded ({int(geom.nb_logical)} or {int(geom.nb)}); "
+            f"got {tuple(psi.shape)}")
+    if (int(psi.shape[0]), int(psi.shape[2]), int(psi.shape[3])) != (
+            int(geom.nk), 4, int(geom.ngkmax)):
+        raise ValueError(
+            "finite-transfer current psi_G must have shape "
+            f"(nk,nb,4,ngkmax)=({int(geom.nk)},nb,4,"
+            f"{int(geom.ngkmax)}); got {tuple(psi.shape)}")
+    psi = pad_axis(psi, geom.p_prod, axis=1).array
     sym = wfn.symmetry()
     gtab = padded_gvectors(wfn, k="full_bz")
     gvecs_host = np.ascontiguousarray(gtab.gvecs, dtype=np.int32)
@@ -1218,12 +1255,6 @@ def finite_transfer_current_to_centroids(
         raise ValueError(
             f"finite-transfer current paired G table must be {expected_g}; "
             f"got {gvecs_host.shape}")
-    r_mu_host = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
-    if r_mu_host.ndim != 2 or int(r_mu_host.shape[1]) != 3:
-        raise ValueError(
-            f"finite-transfer current r_mu must be (n_rmu,3); got "
-            f"{r_mu_host.shape}")
-
     iq = int(iq_irr)
     q_rows_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
     q_full_rows = np.asarray(sym.q_irr_full_idx, dtype=np.int32)
@@ -1397,7 +1428,10 @@ def finite_transfer_current_to_centroids(
         k_row_map=kminq_idx, norm="ortho", chunk_size=fft_chunk_size)
     del current_G, current_flat
     n_rmu_logical = int(r_mu_host.shape[0])
-    rmu_pad = pad_axis(current_rmu_flat, int(geom.p_prod), axis=-1)
+    # ``expected_mu_padded`` is the canonical runtime-padding owner's exact
+    # target (including the fixed-P pad-invariance test knob).  Using it as
+    # the divisor retains :func:`pad_axis` as the sole array pad spelling.
+    rmu_pad = pad_axis(current_rmu_flat, expected_mu_padded, axis=-1)
     if int(rmu_pad.logical) != n_rmu_logical:
         raise AssertionError(
             "canonical centroid padding changed the logical extent: "
@@ -1428,6 +1462,7 @@ def finite_transfer_current_to_centroids(
         current_nmu=current_nmu,
         current_mun=current_mun,
         n_rmu_logical=n_rmu_logical,
+        basis_receipt=basis_receipt,
         iq_irr=iq,
         q_irr_kgrid_int=np.ascontiguousarray(q_rows_int[iq], dtype=np.int32),
         q_crys=np.ascontiguousarray(q_crys, dtype=np.float64),

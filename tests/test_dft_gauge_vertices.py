@@ -16,6 +16,7 @@ from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
 from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common.wfn_transforms import gflat_to_rmu
+from file_io.isdf_header import WavefunctionBasisReceipt
 from gw import w_isdf
 from gw.wavefunction_bundle import BandSlices, Wavefunctions
 from psp import vnl_ops
@@ -92,6 +93,16 @@ def _setup(
         row_tau=jnp.asarray(tau),
         coupled_row_blocks=tuple((ia, ia + 1, 0) for ia in range(natoms)),
     )
+
+
+def _basis_receipt(wfn, geom, r_mu, band_start, band_stop):
+    from runtime.padding import padded_mu_extent
+    return WavefunctionBasisReceipt.from_source(
+        wfn=wfn, role='transverse',
+        band_interval=(band_start, band_stop),
+        fft_grid=geom.fft_grid, centroid_fft_idx=r_mu,
+        n_rmu_logical=len(r_mu),
+        n_rmu_padded=padded_mu_extent(len(r_mu), geom.mesh))
 
 
 def _states():
@@ -877,9 +888,26 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
 
     endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4[None], wfn=wfn, band_start=0, band_stop=2,
-        geom=geom, vnl_setup=setup, r_mu=r_mu, iq_irr=0,
+        geom=geom, vnl_setup=setup, r_mu=r_mu,
+        basis_receipt=_basis_receipt(wfn, geom, r_mu, 0, 2), iq_irr=0,
         path_order=8, projector_row_chunk=1, g_chunk=2,
         include_transfer_q2_identity=True)
+
+    # Red twin for the ordering of the gate itself: a stale target receipt
+    # must refuse before the current producer even asks for symmetry tables,
+    # much less constructs a current tensor.
+    symmetry_owner = wfn.symmetry
+    wfn.symmetry = lambda: pytest.fail(
+        "stale basis receipt reached finite-current construction")
+    with pytest.raises(ValueError, match="centroid_table_md5"):
+        mtxel_sweep.finite_transfer_current_to_centroids(
+            psi_4[None], wfn=wfn, band_start=0, band_stop=2,
+            geom=geom, vnl_setup=setup, r_mu=r_mu,
+            basis_receipt=_basis_receipt(
+                wfn, geom, r_mu[::-1], 0, 2),
+            iq_irr=0, path_order=8, projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True)
+    wfn.symmetry = symmetry_owner
 
     uniform_action = apply_uniform_vnl_derivatives_to_ket(
         psi_L, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
@@ -927,17 +955,25 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         enk=jnp.asarray([[0.1, 0.6]]),
         occ=jnp.asarray([[1.0, 0.0]]), slices=slices,
         psi_nmu=raw_rmu,
-        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face',
+        basis_receipt=endpoint.basis_receipt)
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=1, nky=1, nkz=1, nk_tot=1)
-    with pytest.raises(NotImplementedError, match="source/band/centroid"):
+    with pytest.raises(NotImplementedError, match="FULL remains unavailable"):
         w_isdf.compute_finite_transfer_current_block_row(
             endpoint, wfns, quad, meta, mesh,
             vertex_left=1, vertex_right=2)
     endpoint_minus_q = endpoint._replace(
         current_nmu=endpoint.current_nmu + 0.0)
     assert endpoint_minus_q is not endpoint
+    mismatched_target = replace(
+        wfns, basis_receipt=_basis_receipt(
+            wfn, geom, r_mu[::-1], 0, 2))
+    with pytest.raises(ValueError, match="before Green contraction"):
+        w_isdf._compute_finite_transfer_current_block_row_unverified(
+            endpoint, endpoint_minus_q, mismatched_target, quad, meta, mesh,
+            vertex_left=1, vertex_right=2)
     chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
         endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)
@@ -1002,7 +1038,8 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
 
     common_kwargs = dict(
         wfn=wfn, band_start=0, band_stop=2, geom=geom,
-        vnl_setup=setup, r_mu=r_mu, path_order=8,
+        vnl_setup=setup, r_mu=r_mu,
+        basis_receipt=_basis_receipt(wfn, geom, r_mu, 0, 2), path_order=8,
         projector_row_chunk=1, g_chunk=2,
         include_transfer_q2_identity=True)
     endpoint_q0 = mtxel_sweep.finite_transfer_current_to_centroids(
@@ -1068,7 +1105,8 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         enk=jnp.asarray(np.tile([0.1, 0.6], (4, 1))),
         occ=jnp.asarray(np.tile([1.0, 0.0], (4, 1))), slices=slices,
         psi_nmu=raw_rmu,
-        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face',
+        basis_receipt=endpoint_q1.basis_receipt)
     meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=4)
     with pytest.raises(ValueError, match="not q/-q"):
         w_isdf._compute_finite_transfer_current_block_row_unverified(
