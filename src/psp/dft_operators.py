@@ -29,10 +29,9 @@ Public API (per-component builders):
   build_h_diag          — preconditioner diagonal: T + V_loc(G=0) + V_NL_diag
   build_vnl_kdata       — dense VNL projectors (Z, E) from vnl_ops
 
-Public API (velocity / dipole, autodiff through V_NL):
-  vnl_matrix_at_k       — V_NL as pure function of k (jax.jacfwd-able)
-  velocity_matrix_k     — dH/dk = 2(k+G) + dV_NL/dk
-  compute_dipole_all    — batch velocity matrix elements for all k-points
+Public API (uniform kinetic gauge actions):
+  apply_kinetic_velocity_to_ket — dT/dK applied to a ket block
+  apply_kinetic_contact_to_ket  — d2T/dK2 applied to a ket block
 
 V_scf = V_loc + V_H + V_xc is a single (nx,ny,nz) real-space potential.
 The caller builds it from charge_density.py (V_xc, V_H) and
@@ -49,16 +48,13 @@ HamiltonianK zeros padding in apply_H_k and build_matrix_k.
 """
 from __future__ import annotations
 
-import os
 import functools
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-import common.timing as timing
 from common.fft_helpers import local_fftn3, local_ifftn3
 
 
@@ -928,298 +924,6 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Autodiff-compatible V_NL: differentiate through k for velocity
-# ═══════════════════════════════════════════════════════════════════════
-#
-# The velocity operator v = dH/dk = 2(k+G) + dV_NL/dk.
-# The kinetic part is trivial; the V_NL part requires differentiating
-# the KB projectors Z(k) through the k-dependence of |k+G|.
-#
-# Three evaluation paths, all giving the same result:
-#   vnl_velocity_autodiff  — full jacfwd (safest, verifiable)
-#   vnl_velocity_from_dZ   — precomputed Z and dZ (fast for repeated use)
-#   vnl_matrix_at_k        — k-traceable V_NL for custom autodiff chains
-
-from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-from psp.radial.radial_jax import (
-    RadialTable,
-    differentiate_uniform_table,
-    interp_uniform_jax,
-)
-
-
-# --- VNL channel data (k-independent, for autodiff path) -----------------
-
-@dataclass
-class VNLChannelData:
-    """Pre-extracted data for one (species, l) VNL channel.
-
-    All fields are plain arrays suitable for JIT / autodiff.
-    """
-    tau: jax.Array              # (natoms, 3) crystal positions
-    prefactor: float            # 4π / √Ω
-    l: int
-    nbeta: int
-    q0: float
-    dq: float
-    reduced_tables: tuple[np.ndarray, ...]    # G_l(q) = F_l(q) / q^l
-    reduced_dtables: tuple[np.ndarray, ...]   # d/dq of reduced_tables
-    E: jax.Array                # (nspinor, nspinor, R, R) D-matrix
-
-
-def _build_reduced_tables(tab: RadialTable, l: int) -> tuple[np.ndarray, np.ndarray]:
-    """Reduced radial table G_l(q) = F_l(q)/q^l and its q-derivative."""
-    F_vals = np.asarray(tab.values, dtype=np.float64)
-    q_grid = tab.q0 + tab.dq * np.arange(F_vals.size, dtype=np.float64)
-    if l == 0:
-        G_vals = F_vals.copy()
-    else:
-        G_vals = np.empty_like(F_vals)
-        G_vals[1:] = F_vals[1:] / q_grid[1:] ** l
-        G_vals[0] = F_vals[1] / q_grid[1] ** l
-    return G_vals, differentiate_uniform_table(G_vals, tab.dq)
-
-
-def extract_vnl_channel_data(
-    plan: dict,
-    nspinor: int = 2,
-) -> list[VNLChannelData]:
-    """Extract all VNL channels from a projector plan into autodiff-ready form."""
-    channels = []
-    for _key, sp in plan.items():
-        tau = np.asarray(sp['atoms']['tau'], dtype=np.float64)
-        if tau.size == 0:
-            continue
-        if tau.ndim == 1:
-            tau = tau.reshape(1, 3)
-        pref = float(sp['prefactor'])
-        radial_tables = sp['radial_tables']
-
-        for l_key, info in sp['l_channels'].items():
-            l = int(l_key)
-            E_np = info['E']
-            if E_np is None:
-                continue
-            beta_ids = info['beta_ids']
-            if not beta_ids:
-                continue
-
-            q0 = None
-            dq = None
-            red_tables = []
-            red_dtables = []
-            for bid in beta_ids:
-                tab = radial_tables[(l, int(bid))]
-                if not isinstance(tab, RadialTable):
-                    raise TypeError("Expected RadialTable in projector plan")
-                q0 = float(tab.q0) if q0 is None else q0
-                dq = float(tab.dq) if dq is None else dq
-                G_vals, Gp_vals = _build_reduced_tables(tab, l)
-                red_tables.append(G_vals)
-                red_dtables.append(Gp_vals)
-
-            E_j = jnp.asarray(E_np, dtype=jnp.complex128)[:nspinor, :nspinor]
-            channels.append(VNLChannelData(
-                tau=jnp.asarray(tau, dtype=jnp.float64),
-                prefactor=pref,
-                l=l,
-                nbeta=len(beta_ids),
-                q0=0.0 if q0 is None else q0,
-                dq=1.0 if dq is None else dq,
-                reduced_tables=tuple(red_tables),
-                reduced_dtables=tuple(red_dtables),
-                E=E_j,
-            ))
-    return channels
-
-
-# --- KB projector construction (JAX-traceable through k) ------------------
-
-def _build_Z_channel_jax(K_crys, K_cart, ch):
-    """KB projector Z for one channel.  Pure JAX, k-traceable.
-
-    Uses solid-harmonic factorisation:
-        Z = pref · i^l · [F_l(q)/q^l] · S_lm(K) · exp(-2πi K·τ)
-    """
-    nG = K_crys.shape[0]
-    radial_times_S = _radial_times_solid_harm(K_cart, ch, ch.prefactor)
-    phase = jnp.exp(-2j * jnp.pi * (K_crys @ ch.tau.T)).T
-    Z_atoms = phase[:, None, None, :] * radial_times_S[None, ...]
-    R = ch.nbeta * (2 * ch.l + 1)
-    return Z_atoms.reshape(ch.tau.shape[0], R, nG)
-
-
-def _radial_times_solid_harm(K_cart, ch, pref):
-    return _radial_times_solid_harm_impl(
-        K_cart,
-        tuple(ch.reduced_tables),
-        tuple(ch.reduced_dtables),
-        ch.q0,
-        ch.dq,
-        pref,
-        ch.l,
-        ch.nbeta,
-    )
-
-
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3, 4, 5, 6, 7))
-def _radial_times_solid_harm_impl(
-    K_cart, tables, dtables, q0, dq, pref, l, nbeta,
-):
-    _EPS2 = 1e-60
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + _EPS2)
-    G_bG = jnp.stack(
-        [interp_uniform_jax(q, q0, dq, jnp.asarray(tables[ib], dtype=jnp.float64)) for ib in range(nbeta)],
-    )
-    S = _solid_harmonics_jax(l, K_cart)
-    return pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
-
-
-@_radial_times_solid_harm_impl.defjvp
-def _radial_times_solid_harm_jvp(
-    tables, dtables, q0, dq, pref, l, nbeta,
-    primals, tangents,
-):
-    """Stable JVP: G'_l from precomputed derivative table, no autodiff
-    through sqrt(K²) which would give NaN at K=0."""
-    (K_cart,) = primals
-    (dK_cart,) = tangents
-    _EPS2 = 1e-60
-
-    K_sq = jnp.sum(K_cart ** 2, axis=1)
-    q = jnp.sqrt(K_sq + _EPS2)
-    G_list, Gp_list = [], []
-    for ib in range(nbeta):
-        G_list.append(interp_uniform_jax(q, q0, dq, jnp.asarray(tables[ib], dtype=jnp.float64)))
-        Gp_list.append(interp_uniform_jax(q, q0, dq, jnp.asarray(dtables[ib], dtype=jnp.float64)))
-    G_bG = jnp.stack(G_list)
-    Gp_bG = jnp.stack(Gp_list)
-    S = _solid_harmonics_jax(l, K_cart)
-
-    primal_out = pref * (1j) ** l * G_bG[:, None, :] * S[None, :, :]
-
-    dq = jnp.sum(K_cart * dK_cart, axis=1) / q
-    dG = Gp_bG * dq[None, :]
-    _, dS = jax.jvp(lambda K: _solid_harmonics_jax(l, K), (K_cart,), (dK_cart,))
-
-    tangent_out = pref * (1j) ** l * (
-        dG[:, None, :] * S[None, :, :] + G_bG[:, None, :] * dS[None, :, :]
-    )
-    return primal_out, tangent_out
-
-
-# --- V_NL matrix elements (k-traceable for autodiff) ---------------------
-
-def vnl_matrix_at_k(k_crys, psi_G, G_int, B, channels):
-    """V_NL matrix elements as a pure function of k.
-
-    Fully JAX-traceable — jax.jacfwd w.r.t. k_crys gives dV_NL/dk.
-    Returns (nb, nb) complex128.
-    """
-    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
-    K_cart = K_crys @ B
-    nb = psi_G.shape[0]
-    V_NL = jnp.zeros((nb, nb), dtype=jnp.complex128)
-
-    for ch in channels:
-        Z = _build_Z_channel_jax(K_crys, K_cart, ch)
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', ch.E, proj, optimize=True)
-        vnl_G = jnp.einsum('arG,arsv->vsG', Z, d, optimize=True)
-        V_NL = V_NL + jnp.einsum(
-            'msG,nsG->mn', jnp.conj(psi_G), vnl_G, optimize=True,
-        )
-    return V_NL
-
-
-def build_Z_and_dZ(k_crys, G_int, B, channels):
-    """Precompute Z and dZ/dK_cart for all channels.
-
-    Returns list of (Z, dZ, E) per channel where:
-      Z  : (natoms, R, nG) complex128
-      dZ : (3, natoms, R, nG) complex128
-      E  : (nspinor, nspinor, R, R) complex128
-    """
-    _EPS2 = 1e-60
-    K_crys = G_int.astype(jnp.float64) + k_crys[None, :]
-    K_cart = K_crys @ B
-    Binv = jnp.linalg.inv(B)
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + _EPS2)
-
-    result = []
-    for ch in channels:
-        l, pref = ch.l, ch.prefactor
-        msize = 2 * l + 1
-
-        G_bG = jnp.stack([
-            interp_uniform_jax(q, ch.q0, ch.dq, jnp.asarray(ch.reduced_tables[ib], dtype=jnp.float64))
-            for ib in range(ch.nbeta)
-        ])
-        Gp_bG = jnp.stack([
-            interp_uniform_jax(q, ch.q0, ch.dq, jnp.asarray(ch.reduced_dtables[ib], dtype=jnp.float64))
-            for ib in range(ch.nbeta)
-        ])
-        S = _solid_harmonics_jax(l, K_cart)
-        dS = jnp.stack([
-            jax.jvp(lambda K: _solid_harmonics_jax(l, K), (K_cart,),
-                     (jnp.zeros_like(K_cart).at[:, j].set(1.0),))[1]
-            for j in range(3)
-        ])
-
-        phase = jnp.exp(-2j * jnp.pi * (K_crys @ ch.tau.T)).T
-        tau_cart_eff = ch.tau @ Binv.T
-        dphase = -2j * jnp.pi * tau_cart_eff[:, :, None] * phase[:, None, :]
-
-        c_il = pref * (1j) ** l
-        radS = G_bG[:, None, :] * S[None, :, :]
-        Z_atoms = c_il * phase[:, None, None, :] * radS[None, ...]
-
-        K_over_q = K_cart / q[:, None]
-        drad = Gp_bG[:, None, :] * K_over_q.T[None, :, :]
-        term1 = drad[:, :, None, :] * S[None, None, :, :]
-        term2 = G_bG[:, None, None, :] * dS[None, :, :, :]
-        dZ_core = c_il * (term1 + term2)
-        dZ_full = (phase[:, None, None, None, :] * dZ_core[None, ...]
-                   + c_il * radS[None, :, None, :, :] * dphase[:, None, :, None, :])
-
-        R = ch.nbeta * msize
-        nG = K_cart.shape[0]
-        result.append((
-            Z_atoms.reshape(ch.tau.shape[0], R, nG),
-            dZ_full.transpose(2, 0, 1, 3, 4).reshape(3, ch.tau.shape[0], R, nG),
-            ch.E,
-        ))
-    return result
-
-
-def vnl_velocity_from_dZ(psi_G, Z_dZ_E):
-    """V_NL velocity from precomputed Z and dZ.  Returns (3, nb, nb)."""
-    nb = psi_G.shape[0]
-    v = jnp.zeros((3, nb, nb), dtype=jnp.complex128)
-    for Z, dZ, E in Z_dZ_E:
-        proj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(Z), psi_G, optimize=True)
-        d = jnp.einsum('strq,aqtv->arsv', E, proj, optimize=True)
-        # dZ† E Z ψ
-        for j in range(3):
-            dproj = jnp.einsum('aqG,vtG->aqtv', jnp.conj(dZ[j]), psi_G, optimize=True)
-            dd = jnp.einsum('strq,aqtv->arsv', E, dproj, optimize=True)
-            vnl_dZ_G = jnp.einsum('arG,arsv->vsG', Z, dd, optimize=True)
-            vnl_Z_dG = jnp.einsum('arG,arsv->vsG', dZ[j], d, optimize=True)
-            v_j_G = vnl_dZ_G + vnl_Z_dG
-            v = v.at[j].add(jnp.einsum(
-                'msG,nsG->mn', jnp.conj(psi_G), v_j_G, optimize=True,
-            ))
-    return v
-
-
-def vnl_velocity_autodiff(k_crys, psi_G, G_int, B, channels):
-    """V_NL velocity via jacfwd.  Returns (3, nb, nb)."""
-    def f(k):
-        return vnl_matrix_at_k(k, psi_G, G_int, B, channels)
-    return jax.jacfwd(f)(k_crys) @ jnp.linalg.inv(B)
-
-
-# ═══════════════════════════════════════════════════════════════════════
 #  Velocity / dipole matrix elements
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1240,6 +944,12 @@ def apply_kinetic_velocity_to_ket(psi_G, G_int, k_crys, B):
     return 2.0 * jnp.einsum('Gi,nsG->insG', K_cart, psi_G, optimize=True)
 
 
+def apply_kinetic_contact_to_ket(psi_G):
+    r"""``d2T/dK_a dK_b |psi> = 2 delta_ab |psi>`` in Ry units."""
+    eye = 2.0 * jnp.eye(3, dtype=psi_G.real.dtype)
+    return jnp.einsum('ab,nsG->abnsG', eye, psi_G, optimize=True)
+
+
 @jax.jit
 def momentum_matrix_k(psi_G, G_int, k_crys, B):
     """Kinetic part of velocity: p_i = 2(k+G)_i.  Returns (3, nb, nb).
@@ -1249,72 +959,3 @@ def momentum_matrix_k(psi_G, G_int, k_crys, B):
     v_ket = apply_kinetic_velocity_to_ket(psi_G, G_int, k_crys, B)         # (3, nb, ns, nG)
     return jnp.einsum('msG,insG->imn', jnp.conj(psi_G), v_ket,
                       optimize=True)
-
-
-def velocity_matrix_k(psi_G, G_int, k_crys, B, channels, *, Z_dZ_E=None):
-    """Full velocity: v = dH/dk = 2(k+G) + dV_NL/dk.  Returns (3, nb, nb)."""
-    p = momentum_matrix_k(psi_G, G_int, k_crys, B)
-    if Z_dZ_E is None:
-        Z_dZ_E = build_Z_and_dZ(k_crys, G_int, B, channels)
-    return p + vnl_velocity_from_dZ(psi_G, Z_dZ_E)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Batch helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-def compute_dipole_all(wfn, sym, meta, vnl_plan, B, nb=None):
-    """Velocity matrix elements for all k-points.
-
-    Returns (dipole, deltaE) where:
-      dipole : (3, nk, nb, nb) complex128
-      deltaE : (nk, nb, nb) float64
-    """
-
-    from common.wfn_transforms import load_kpoint_fftbox
-
-    if nb is None:
-        nb = int(meta.b_id_4)
-    nk = sym.nk_tot
-    nspinor = int(meta.nspinor)
-
-    channels = extract_vnl_channel_data(vnl_plan, nspinor=nspinor)
-    B_j = jnp.asarray(B, dtype=jnp.float64)
-
-    dipole = np.zeros((3, nk, nb, nb), dtype=np.complex128)
-    deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
-    energies = np.asarray(wfn.energies)
-
-    # One fixed-shape G table for the whole sweep.  Masking ψ_G alone is
-    # sufficient here: every contraction downstream — the kinetic
-    # 2(k+G)·ψ in ``momentum_matrix_k`` and both halves of
-    # ``vnl_velocity_from_dZ`` — closes against ``conj(psi_G)``, so a
-    # zero at a pad column kills that column's contribution even though
-    # Z/dZ are finite there.
-    gtab = padded_gvectors(wfn, k="full_bz")
-
-    for ik in range(nk):
-        with timing.section(f"dipole_k{ik}"):
-            wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)
-            G_pad, g_mask = gtab.at(ik)
-            psi_G = gather_psi_G_from_crys(wfn_k, G_pad, g_mask)
-            G_int = jnp.asarray(G_pad, dtype=jnp.int32)
-            k_j = jnp.asarray(sym.unfolded_kpts[ik], dtype=jnp.float64)
-
-            Z_dZ_E = build_Z_and_dZ(k_j, G_int, B_j, channels)
-            dipole[:, ik] = np.asarray(
-                velocity_matrix_k(psi_G, G_int, k_j, B_j, channels, Z_dZ_E=Z_dZ_E)
-            )
-
-            try:
-                k_red = int(sym.irr_idx_k[ik])
-            except Exception:
-                k_red = int(ik)
-            e_b = np.asarray(
-                energies[0, k_red, :nb] if energies.ndim >= 3 else energies[:nb],
-                dtype=float,
-            )
-            deltaE[ik] = e_b[:, None] - e_b[None, :]
-            del wfn_k
-
-    return dipole, deltaE
