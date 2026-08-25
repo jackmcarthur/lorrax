@@ -284,7 +284,7 @@ def compute_finite_q_mtxels(
     nv_eff = n_occ - v_lo
     nc_eff = c_hi - c_lo
 
-    kpts_full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    kpts_full = np.asarray(gtab.kvecs, dtype=np.float64)
     energies_full_ry = (np.asarray(wfn.energies[0, :, :int(nb)],
                                    dtype=np.float64)[np.asarray(
                                        sym.irr_idx_k, dtype=np.int32)]
@@ -1218,7 +1218,7 @@ def main(argv=None):
 		"""
 		wfn_k = load_kpoint_fftbox_local(wfn, meta, i, nb,
 		                                 bispinor=bispinor)
-		kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
+		kpoint = jnp.asarray(gtab.kvecs[i], dtype=jnp.float64)
 		Gk_crys, g_mask = gtab.at(i)
 		# Momentum per component
 		p_cart = compute_p_operator_k(
@@ -1354,7 +1354,7 @@ def main(argv=None):
 				psi_G, operator=op, geom=geom,
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(sym.unfolded_kpts))
+				kvecs=np.asarray(gtab.kvecs))
 			if args.parallel_transport_out is not None:
 				# The feature is deliberately opt-in: the default dipole
 				# artifact and its bitwise production path remain untouched.

@@ -239,6 +239,9 @@ def test_build_vnl_kdata_zeroes_Z_on_the_pad(monkeypatch):
         def ngk_valid(self, *, k="full_bz"):
             return np.asarray([ngk], dtype=np.int32)
 
+        def kvecs(self, *, k="full_bz"):
+            return np.zeros((1, 3), dtype=np.float64)
+
     monkeypatch.setattr(dop, "_as_loader", lambda w: _Loader())
 
     total_R = 3

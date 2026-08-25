@@ -382,22 +382,26 @@ def test_the_sentinel_arm_catches_a_single_pad_row():
 # ---------------------------------------------------------------------------
 
 class _FakeLoader:
-    """Minimal stand-in for ``WfnLoader``'s two G accessors.
+    """Minimal stand-in for ``WfnLoader``'s paired k/G accessors.
 
     ``padded_gvectors`` reaches the loader through ``_as_loader``, which
     accepts a real ``WfnLoader`` or falls back to reopening ``_filename``.
-    Duck-typing the two methods keeps this test free of a WFN fixture;
+    Duck-typing the three methods keeps this test free of a WFN fixture;
     the full-deck agreement is measured by the sbatch harness, not here.
     """
 
     def __init__(self, gvecs, ngk):
         self._g, self._n = gvecs, ngk
+        self._k = np.arange(gvecs.shape[0] * 3, dtype=np.float64).reshape(-1, 3)
 
     def gvecs(self, *, k="full_bz"):
         return self._g
 
     def ngk_valid(self, *, k="full_bz"):
         return self._n
+
+    def kvecs(self, *, k="full_bz"):
+        return self._k
 
 
 def test_padded_gvectors_mask_matches_ngk_valid(monkeypatch):
@@ -416,6 +420,7 @@ def test_padded_gvectors_mask_matches_ngk_valid(monkeypatch):
     tab = padded_gvectors(object())
     assert isinstance(tab, PaddedGVectors)
     assert tab.ngkmax == ngkmax and tab.n_k == nk
+    assert np.array_equal(tab.kvecs, fake._k)
     assert tab.mask.sum(axis=1).tolist() == ngk.tolist()
     for j in range(nk):
         G_j, m_j = tab.at(j)
@@ -429,6 +434,20 @@ def test_padded_gvectors_mask_matches_ngk_valid(monkeypatch):
         assert np.array_equal(
             G_j[int(ngk[j]):],
             np.broadcast_to(_SENTINEL, (ngkmax - int(ngk[j]), 3)))
+
+
+def test_padded_gvectors_refuses_unpaired_k_rows(monkeypatch):
+    import pytest
+    import psp.dft_operators as dop
+
+    fake = _FakeLoader(
+        np.zeros((2, 4, 3), dtype=np.int32),
+        np.asarray([4, 4], dtype=np.int32))
+    fake._k = np.zeros((1, 3), dtype=np.float64)
+    monkeypatch.setattr(dop, "_as_loader", lambda w: fake)
+
+    with pytest.raises(ValueError, match="coordinate half of the G table"):
+        padded_gvectors(object())
 
 
 # ---------------------------------------------------------------------------
