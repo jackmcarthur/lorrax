@@ -25,6 +25,12 @@ if __name__ == "__main__":
         _src = os.path.join(_REPO, "services", _svc, "src")
         if os.path.isdir(_src) and _src not in sys.path:
             sys.path.insert(0, _src)
+    # The module environment also carries a LORRAX checkout.  Put THIS
+    # gate's source first so the exact commit under test owns ``gw``.
+    _SRC = os.path.join(_REPO, "src")
+    if _SRC in sys.path:
+        sys.path.remove(_SRC)
+    sys.path.insert(0, _SRC)
     from lxkit.gate import platform_from_env
     from runtime import initialize_communicator_stack
 
@@ -104,7 +110,7 @@ def _analytic_branch_tiles(*, omega_nonneg_ry, log_tag, wfns, mesh_xy,
 
     # The production tags contain Greek omega.  Give each physical branch a
     # distinct exact coefficient so the cond/val fold is observable.
-    if log_tag.startswith("ω>="):
+    if log_tag.startswith("ω≥"):
         branch_code = 1.0 if log_tag.endswith("cond") else 10.0
     elif log_tag.startswith("ω<"):
         branch_code = 100.0 if log_tag.endswith("cond") else 1000.0
