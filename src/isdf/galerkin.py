@@ -1368,14 +1368,80 @@ def _make_basis_solve_kernel(
         return fn
     rep = NamedSharding(mesh, P())
 
+    # ``solve_triangular`` acts on the replicated rank face and independent
+    # RHS columns.  Make the product-r block boundary explicit: leaving this
+    # to GSPMD can lower one library solve over the full logical RHS and
+    # rematerialize both selected_rows and its output on every device.
     @partial(
-        jax.jit, donate_argnums=(1,),
-        in_shardings=(rep, row_layout), out_shardings=row_layout)
-    def _solve(L, selected_rows):
-        return _solve_selected_basis_rows(L, selected_rows)
+        shard_map,
+        mesh=mesh,
+        in_specs=(P(), row_layout.spec),
+        out_specs=row_layout.spec,
+        check_vma=False,
+    )
+    def _solve_local(L, selected_rows_local):
+        return _solve_selected_basis_rows(L, selected_rows_local)
 
-    _BASIS_SOLVE_KERNELS[key] = _solve
-    return _solve
+    fn = jax.jit(
+        _solve_local,
+        donate_argnums=(1,),
+        in_shardings=(rep, row_layout),
+        out_shardings=row_layout,
+    )
+    _BASIS_SOLVE_KERNELS[key] = fn
+    return fn
+
+
+def _preflight_physical_solve_kernel(
+        *, mesh: Mesh, rank: int, nspinor: int, r_carrier: int,
+        row_layout, device_pool_limit: float | None,
+        persistent_coefficient_bytes: int, log_fn):
+    """Compile and capacity-gate the exact local-r triangular solve.
+
+    The analytic fit ledger intentionally prices local product-r blocks.  An
+    accidental return to implicit GSPMD placement can instead make the
+    compiled program own a full logical RHS.  Reading the production
+    executable's buffer assignment here joins that placement fact to the
+    same fragmentation target before any physical-projection WFN pass.
+    """
+    rep = NamedSharding(mesh, P())
+    solve = _make_basis_solve_kernel(
+        mesh=mesh, rank=rank, nspinor=nspinor,
+        r_carrier=r_carrier, row_layout=row_layout)
+    factor_spec = jax.ShapeDtypeStruct(
+        (int(rank), int(rank)), jnp.complex128, sharding=rep)
+    rows_spec = jax.ShapeDtypeStruct(
+        (int(rank), int(nspinor), int(r_carrier)),
+        jnp.complex128, sharding=row_layout)
+    compiled = solve.lower(factor_spec, rows_spec).compile()
+    from runtime.aot_memory import aot_kernel_peak_bytes
+    peak = aot_kernel_peak_bytes(
+        compiled, platform=mesh.devices.flat[0].platform)
+    stage_peak = int(peak.total) + int(persistent_coefficient_bytes)
+    local_r = int(r_carrier) // spec_divisor(
+        mesh, row_layout.spec, axis=2)
+    capacity_target = (
+        float(device_pool_limit)
+        * bfc_fragmentation_target_utilization(nspinor)
+        if device_pool_limit is not None and device_pool_limit > 0
+        else None)
+    log_fn(
+        "  [gate] physical selected-row solve AOT: "
+        f"global=({rank},{nspinor},{r_carrier}), local-r={local_r}, "
+        f"compiled={peak.total/2**30:.2f} GiB/device, persistent-C="
+        f"{persistent_coefficient_bytes/2**30:.2f} GiB/device, stage="
+        f"{stage_peak/2**30:.2f} GiB/device"
+        + (f", target={capacity_target/2**30:.2f} GiB/device"
+           if capacity_target is not None else ", target=unavailable"))
+    if capacity_target is not None and stage_peak > capacity_target:
+        raise MemoryError(
+            "_build_physical_coefficients: compiled selected-row solve "
+            f"needs {stage_peak/2**30:.2f} GiB/device including persistent "
+            f"coefficients, above the fragmentation-safe target "
+            f"{capacity_target/2**30:.2f} GiB/device. This gate includes "
+            "the production SPMD buffer assignment; an implicit full-r "
+            "gather cannot be admitted by the analytic local-block ledger.")
+    return peak
 
 
 def iter_galerkin_rchunks(
@@ -1481,16 +1547,32 @@ def _make_physical_project_kernel(
         return fn
     rep = NamedSharding(mesh, P())
 
+    # Both operands carry the same product-r partition.  Contract only the
+    # local block, then reduce the small coefficient partial; never ask GSPMD
+    # to infer a global contracting-dimension reshard of the WFN/basis slabs.
     @partial(
-        jax.jit, donate_argnums=(2,),
-        in_shardings=(psi_layout, basis_layout, rep), out_shardings=rep)
-    def _project(psi_bc, basis, coefficients):
+        shard_map,
+        mesh=mesh,
+        in_specs=(psi_layout.spec, basis_layout.spec, P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+    def _project_local(psi_bc_local, basis_local, coefficients):
         delta = jnp.einsum(
-            'kbsr,asr->kba', psi_bc, jnp.conj(basis), optimize=True)
+            'kbsr,asr->kba', psi_bc_local, jnp.conj(basis_local),
+            optimize=True)
+        delta = jax.lax.psum(delta, 'x')
+        delta = jax.lax.psum(delta, 'y')
         return coefficients + delta
 
-    _PHYSICAL_PROJECT_KERNELS[key] = _project
-    return _project
+    fn = jax.jit(
+        _project_local,
+        donate_argnums=(2,),
+        in_shardings=(psi_layout, basis_layout, rep),
+        out_shardings=rep,
+    )
+    _PHYSICAL_PROJECT_KERNELS[key] = fn
+    return fn
 
 
 def _assemble_coefficient_chunks(
@@ -1516,7 +1598,6 @@ def _build_physical_coefficients(
         selected_states, rank_carrier: int, factor,
         q_tile_budget: int, device_pool_limit: float | None, log_fn):
     """Stream ``C = Psi B^H`` in the one selected-state basis gauge."""
-    del device_pool_limit
     nk = int(meta.nk_tot)
     nspinor = int(meta.nspinor)
     n_rtot = int(meta.n_rtot)
@@ -1529,6 +1610,14 @@ def _build_physical_coefficients(
     plan = plan_galerkin_stream(
         rank=rank_carrier, nspinor=nspinor, n_rtot=n_rtot,
         r_mesh_divisor=r_divisor, q_tile_budget=q_tile_budget)
+    _preflight_physical_solve_kernel(
+        mesh=mesh_xy, rank=rank_carrier, nspinor=nspinor,
+        r_carrier=int(plan.max_r_carrier), row_layout=row_layout,
+        device_pool_limit=device_pool_limit,
+        persistent_coefficient_bytes=(
+            nk * int(band_count) * int(rank_carrier)
+            * np.dtype(np.complex128).itemsize),
+        log_fn=log_fn)
     maps = _selected_maps_on_device(
         source=source, selected_states=selected_states,
         rank_carrier=rank_carrier, band_start=band_start,
