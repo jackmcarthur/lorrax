@@ -459,10 +459,13 @@ def compute_finite_q_mtxels(
 # gauge coefficients.  It is independent of the WFN's path and inode; see
 # ``common.parallel_transport.wfn_fingerprint`` for the exact coverage bound.
 
+_DIPOLE_Q0_OPERATOR_SCHEME = "lorrax.dipole_q0.exact_reduced_origin/v1"
+
 _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nval", "prov_ncond", "prov_nband",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
-               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign")
+               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign",
+               "prov_q0_operator_scheme")
 
 #: Word spellings of the two arms, so a deck can say which one it means
 #: rather than carrying a bare ``-1`` whose meaning is a source comment.
@@ -538,8 +541,81 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_bispinor"] = bool(bispinor)
     h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+    # ``analytic`` and the VNL sign do not identify the implementation.  In
+    # particular, 5036f21b replaced the old sqrt(q^2+1e-8) projector
+    # regularizer and approximate l>0 origin row by exact reduced-radial
+    # moments.  That reaches ordinary Gamma-point dZ and therefore the stored
+    # velocity.  Fail closed across that boundary rather than calling two
+    # different operator discretisations the same artifact.
+    h5.attrs["prov_q0_operator_scheme"] = _DIPOLE_Q0_OPERATOR_SCHEME
     if vnl_velocity_sign is not None:
         h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
+
+
+def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
+    """Band extent of the ordinary q→0 matrix written by this driver.
+
+    ``ncond`` is not otherwise an operand of the ordinary dipole sweep: the
+    producer loads ``[0, nb_written)`` and evaluates the full square operator
+    on that manifold.  Keep the resolution here because provenance may relax
+    a literal ``ncond`` mismatch only when both decks resolve to this same
+    physical matrix extent.  The optional ``finite_q`` payload is different:
+    its conduction axis is literally sliced with ``ncond`` and is therefore
+    handled as an explicit exception by :func:`check_dipole_provenance`.
+    """
+    return min(
+        int(wfn.nbands),
+        max(int(wfn.nelec) + int(ncond), int(nband)),
+    )
+
+
+def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
+    """Can an ``ncond``-mismatched file represent the identical q→0 matrix?"""
+    expected = _resolve_dipole_nb_written(
+        wfn, ncond=int(ncond), nband=int(nband))
+    if "finite_q" in h5:
+        return False, (
+            "finite_q/ is present and its stored conduction axis is sized by "
+            "the producer's ncond")
+
+    problems = []
+    if "prov_nb_written" not in h5.attrs:
+        problems.append("prov_nb_written is absent")
+    else:
+        got = int(np.asarray(h5.attrs["prov_nb_written"]))
+        producer_expected = _resolve_dipole_nb_written(
+            wfn,
+            ncond=int(np.asarray(h5.attrs["prov_ncond"])),
+            nband=int(np.asarray(h5.attrs.get("prov_nband", nband))),
+        )
+        if got != producer_expected:
+            problems.append(
+                f"prov_nb_written: file={got} producer-resolved="
+                f"{producer_expected}")
+        if got != expected:
+            problems.append(
+                f"prov_nb_written: file={got} run-resolved={expected}")
+
+    shapes = {}
+    for name, rank in (("dipole_cart", 4), ("deltaE", 3)):
+        if name not in h5:
+            problems.append(f"{name} is absent")
+            continue
+        shape = tuple(int(v) for v in h5[name].shape)
+        shapes[name] = shape
+        if len(shape) != rank or shape[-2:] != (expected, expected):
+            problems.append(
+                f"{name} shape={shape}, expected square band axes "
+                f"({expected},{expected})")
+    if (len(shapes.get("dipole_cart", ())) >= 2
+            and len(shapes.get("deltaE", ())) >= 1
+            and shapes["dipole_cart"][1] != shapes["deltaE"][0]):
+        problems.append(
+            "dipole_cart and deltaE carry different k extents "
+            f"({shapes['dipole_cart'][1]} versus {shapes['deltaE'][0]})")
+
+    return not problems, ("; ".join(problems) if problems
+                          else f"identical q→0 extent {expected}")
 
 
 def check_dipole_provenance(
@@ -561,6 +637,13 @@ def check_dipole_provenance(
     try:
         with h5py.File(str(path), "r") as h5:
             attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
+            ncond_mismatch = (
+                "prov_ncond" not in attrs
+                or _prov_ne(attrs["prov_ncond"], int(ncond)))
+            q0_ncond_ok, q0_ncond_detail = (False, "prov_ncond is absent")
+            if ncond_mismatch and "prov_ncond" in attrs:
+                q0_ncond_ok, q0_ncond_detail = _q0_ncond_coverage(
+                    h5, wfn=wfn, ncond=ncond, nband=nband)
     except OSError as exc:
         print_fn(f"  [dipole provenance] cannot open {path} "
                  f"({type(exc).__name__}: {exc})")
@@ -591,7 +674,8 @@ def check_dipole_provenance(
             "to make it checkable.")
 
     want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
-            "prov_nband": int(nband)}
+            "prov_nband": int(nband),
+            "prov_q0_operator_scheme": _DIPOLE_Q0_OPERATOR_SCHEME}
     if fingerprint_checkable:
         want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     optional = {
@@ -606,10 +690,13 @@ def check_dipole_provenance(
     # uncheckable provenance.  The caller choosing that convention must fail
     # closed instead of silently reading whichever operator made the file.
     bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
-           if k not in attrs or _prov_ne(attrs[k], v)]
+           if (k != "prov_ncond" or not q0_ncond_ok)
+           and (k not in attrs or _prov_ne(attrs[k], v))]
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
+        if ncond_mismatch and not q0_ncond_ok:
+            detail += f"; q→0 coverage refusal: {q0_ncond_detail}"
         sanity.warn(
             f"{path} was generated from a DIFFERENT DFT solution, band "
             f"window, or velocity/representation convention than this run "
@@ -623,6 +710,12 @@ def check_dipole_provenance(
 
     if not fingerprint_checkable:
         return False
+    if ncond_mismatch:
+        print_fn(
+            "  [dipole provenance] producer "
+            f"ncond={int(np.asarray(attrs['prov_ncond']))} differs from run "
+            f"ncond={int(ncond)}, accepted because {q0_ncond_detail}; the "
+            "ordinary payload is the same full-square operator.")
     print_fn(
         f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
         f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)}"
@@ -921,7 +1014,8 @@ def main(argv=None):
 
 	# Ensure we load enough conduction bands for debug/output comparisons.
 	# ψ is NOT loaded here — see the k sweep below.
-	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
+	nband_eff = _resolve_dipole_nb_written(
+		wfn, ncond=ncond, nband=nband)
 
 	if args.w_av_only:
 		report.environment(wfn=wfn, lines=(
