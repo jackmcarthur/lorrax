@@ -1325,14 +1325,20 @@ def make_eqp_bgw(
 			      f"{_eval_cov['policy']}.  Those states' sigC is an "
 			      f"endpoint value, not Sigma at their own energy.")
 
-	# ── The V_H seam's ONE extra input on this path ───────────────────
-	# ``gw.sigma_dispatch`` applies the source rule at the single point
-	# V_H enters ``SigmaResult`` — but that covers the live driver only.
-	# This CLI rebuilds eqp{0,1} straight from files, so it has to look
-	# the source up itself and hand the seam its operand.  Everything
-	# after that is :func:`assemble_eqp`, byte-for-byte the live path.
+	# ── The persisted live-assembly receipt, or the legacy raw seam ─────
+	# New sigma_mnk.h5 files keep the full H/X/C(omega) operator cubes RAW
+	# (complete off-diagonals, pre-output conditioning) and carry a receipt with
+	# the exact conditioned H/X/C(E_DFT) diagonals the live writer handed
+	# assemble_eqp.
+	# Consume that receipt as data; do NOT re-run degenerate-set averaging
+	# here, which would be a second physics owner and is impossible to do
+	# correctly for every SC basis from this file alone.
 	#
-	# The mixed case is the *normal* one here, not an edge case: a
+	# A file with no receipt is deliberately legacy: its Hartree column is
+	# interpreted by the historical raw-scalar rule below.  Partial/unknown
+	# new schemas already refused inside sigma_output's one reader.
+	#
+	# The mixed legacy case is normal, not an edge case: a
 	# ``sigma_mnk.h5`` written by an older run carries a non-zero ISDF
 	# V_H, and pointing this CLI at a regenerated ``kin_ion.h5`` is
 	# exactly how one re-derives QP energies without re-running Σ (Σ_xc
@@ -1345,9 +1351,52 @@ def make_eqp_bgw(
 	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
 	# kin_ion read above, which is the same lazy import for the same
 	# reason.
+	from file_io.sigma_output import read_eqp_assembly_receipt
+	_receipt = read_eqp_assembly_receipt(sigma_mnk_path)
 	_src = kin_ion_hartree_source(kin_ion_path)
 	vh_exact = None
-	if _src == "stored":
+	hartree_already_resolved = False
+	sigma_c_at_dft_receipt = None
+	if _receipt is not None:
+		if (_receipt["band_start"], _receipt["band_stop"]) != (
+				band_start, band_stop):
+			raise ValueError(
+				f"{os.path.basename(sigma_mnk_path)}'s EQP assembly receipt "
+				f"covers [{_receipt['band_start']},{_receipt['band_stop']}) but "
+				f"the QP rotations request [{band_start},{band_stop}).")
+		expect_shape = (nk_irr, nb_window)
+		if (_receipt["hartree_diag_ev"].shape != expect_shape
+				or _receipt["sigma_x_diag_ev"].shape != expect_shape
+				or _receipt["sigma_c_at_dft_diag_ev"].shape != expect_shape):
+			raise ValueError(
+				f"{os.path.basename(sigma_mnk_path)}'s EQP assembly receipt has "
+				f"H {_receipt['hartree_diag_ev'].shape}, X "
+				f"{_receipt['sigma_x_diag_ev'].shape}, C(E_DFT) "
+				f"{_receipt['sigma_c_at_dft_diag_ev'].shape}; expected file-wedge "
+				f"shape {expect_shape}.")
+		if _receipt["hartree_source"] != _src:
+			raise ValueError(
+				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "
+				f"does not match {os.path.basename(kin_ion_path)} source {_src!r}; "
+				"refusing to combine an assembler-ready H from one source policy "
+				"with a different mean-field artifact.")
+		if bool(_receipt["kin_ion_has_hartree"]) != (_src == "folded"):
+			raise ValueError(
+				"EQP receipt and kin_ion disagree about whether scalar Hartree is "
+				"folded into kin_ion.")
+		hartree_diag = _receipt["hartree_diag_ev"]
+		sigma_x_diag = _receipt["sigma_x_diag_ev"]
+		sigma_c_at_dft_receipt = _receipt["sigma_c_at_dft_diag_ev"]
+		hartree_already_resolved = True
+		print(
+			f"  EQP assembly receipt: file-wedge H/X/C(E_DFT), "
+			f"bases={_receipt['hartree_exchange_basis']}/"
+			f"{_receipt['correlation_basis']}, "
+			f"policy={_receipt['degeneracy_policy']}, "
+			f"tol={_receipt['degeneracy_tol_ry']:.3e} Ry; preserving the "
+			"conditioned assembly diagonals as written; Z remains from the raw "
+			"omega cube.")
+	elif _src == "stored":
 		vh_full = read_full_bz_dataset(kin_ion_path, HARTREE_DATASET)
 		if vh_full.shape[1] < band_stop:
 			raise ValueError(
@@ -1368,6 +1417,7 @@ def make_eqp_bgw(
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=np.real(hartree_diag),
 		sigma_x_diag_ev=np.real(sigma_x_diag),
+		sigma_c_at_dft_diag_ev=sigma_c_at_dft_receipt,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
@@ -1377,6 +1427,7 @@ def make_eqp_bgw(
 		nspin=1,
 		hartree_source=_src,
 		exact_hartree_diag_ev=vh_exact,
+		hartree_already_resolved=hartree_already_resolved,
 	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 

@@ -488,6 +488,35 @@ def test_make_eqp_bgw_stored_array_is_substituted_not_ignored():
         f"got {shift:.6f} eV — the array is being ignored")
 
 
+def test_make_eqp_bgw_prefers_the_live_assembly_receipt():
+    """A stamped file rebuilds from live H/X, not the raw operator cubes."""
+    from file_io.sigma_output import append_eqp_assembly_receipt_h5
+    from gw.eqp_bgw import make_eqp_bgw
+
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, stored=True)
+        h_live = np.tile([285.0, 275.0, 285.0, 275.0], (2, 1))
+        x_live = np.tile([-21.0, -19.0, -21.0, -19.0], (2, 1))
+        append_eqp_assembly_receipt_h5(
+            os.path.join(d, "sigma_mnk.h5"),
+            hartree_diag_ev=h_live,
+            sigma_x_diag_ev=x_live,
+            sigma_c_at_dft_diag_ev=np.zeros_like(h_live),
+            band_start=1,
+            band_stop=5,
+            degeneracy_policy="bgw_average",
+            degeneracy_tol_ry=1.0e-6,
+            correlation_basis="dft_band",
+            hartree_source="stored",
+            kin_ion_has_hartree=False,
+        )
+        make_eqp_bgw(d)
+        got = _read_eqp_qp_column(os.path.join(d, "eqp0.dat")).reshape(2, 4)
+
+    # kin_ion=-300 eV and correlation=0, so this is the exact assembly.
+    assert np.array_equal(got, -300.0 + h_live + x_live)
+
+
 def test_kin_ion_hartree_source_resolution():
     """The precedence ladder and the refusals, on real files."""
     from file_io.kin_ion import (
