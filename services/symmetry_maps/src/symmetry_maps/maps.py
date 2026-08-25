@@ -2485,7 +2485,7 @@ class SymMaps:
         return kg0
 
     def find_qpoint_index(self, q_ext, tol=1e-6):
-        """Find index of q-point in unfolded k-points list.
+        """Find a periodic q-point in the canonical full-grid row table.
 
         Args:
             q_ext: Vector of length 3 (crystal coordinates)
@@ -2494,17 +2494,32 @@ class SymMaps:
         Returns:
             Index of matching q-point, or raises ValueError if not found
         """
-        # Get fractional part of q_ext
-        q_frac = q_ext % 1.0
-        diffs = jnp.abs(self.unfolded_kpts - q_frac[None, :])
-        # Sum over coordinates and find minimum difference
-        total_diffs = jnp.sum(diffs, axis=1)
-        min_diff = jnp.min(total_diffs)
+        q = np.asarray(q_ext, dtype=np.float64)
+        tolerance = float(tol)
+        if q.shape != (3,) or not np.all(np.isfinite(q)):
+            raise ValueError(
+                "find_qpoint_index: q_ext must be a finite length-3 "
+                f"crystal-coordinate vector, got shape={q.shape}, "
+                f"values={q.tolist()}.")
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(
+                f"find_qpoint_index: tol must be finite and nonnegative, "
+                f"got {tol!r}.")
 
-        if min_diff > tol:
-            raise ValueError(f"No matching q-point found within tolerance {tol}")
-
-        return jnp.argmin(total_diffs)
+        # ``unfolded_kpts`` deliberately preserves the representative paired
+        # with the unfolded G labels; it may therefore contain signed rows.
+        # Compare on the reciprocal torus instead of wrapping only the query
+        # and measuring an ordinary distance (where -4/9 and +5/9 differ by
+        # one despite being the same physical point).
+        metric = np.max(np.abs(self._periodic_delta(
+            np.asarray(self.unfolded_kpts, dtype=np.float64), q)), axis=1)
+        match = int(np.argmin(metric))
+        if float(metric[match]) > tolerance:
+            raise ValueError(
+                "No matching q-point found within periodic tolerance "
+                f"{tolerance}; nearest row {match} has max|Delta q|="
+                f"{float(metric[match]):.6e}.")
+        return match
 
 
 # ---------------------------------------------------------------------------
