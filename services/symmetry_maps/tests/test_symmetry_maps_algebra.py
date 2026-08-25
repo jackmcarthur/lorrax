@@ -41,7 +41,8 @@ import numpy as np
 import pytest
 
 from _deck_stub import deck_available, read_deck
-from symmetry_maps import (SymMaps, centroid_source_map_and_wrap,
+from symmetry_maps import (SymMaps, apply_spinor_rotation,
+                           centroid_source_map_and_wrap,
                            common_uniform_grid_indices,
                            fft_grid_pullback_perm, find_irreducible_bz_points,
                            kgrid_shift_map, q_negation_index,
@@ -411,6 +412,67 @@ def test_the_augmentation_vectorizes_over_a_row_of_sym_indices():
     for i, s in enumerate(idx):
         np.testing.assert_array_equal(
             batch[i], spinor_rotation_for_sym_row(U, int(s), 3))
+
+
+def test_static_spinor_application_matches_ordered_complex_contraction():
+    """Complex spatial/TR rows agree with the direct ordered contraction.
+
+    The reference retains the old mathematical statement but not its
+    production lowering.  Four k rows include both spatial and antiunitary
+    rotations; the leading band/G axes exercise the broadcast contract used
+    by the collective WFN loader.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    rng = np.random.default_rng(0x58)
+    U_spatial = np.stack((_su2(rng), _su2(rng)))
+    U_rows = spinor_rotation_for_sym_row(
+        U_spatial, np.array([0, 1, 2, 3]), 2)
+    coeff = (rng.standard_normal((3, 4, 7, 2))
+             + 1j * rng.standard_normal((3, 4, 7, 2)))
+    expected = np.einsum("kac,bkgc->bkga", U_rows, coeff)
+
+    got_host = apply_spinor_rotation(
+        U_rows[None, :, None, :, :], coeff)
+    np.testing.assert_allclose(got_host, expected, rtol=2e-15, atol=2e-15)
+
+    apply_jit = jax.jit(lambda u, c: apply_spinor_rotation(
+        u[None, :, None, :, :], c))
+    got_device = np.asarray(apply_jit(
+        jnp.asarray(U_rows), jnp.asarray(coeff)))
+    np.testing.assert_allclose(got_device, expected, rtol=2e-15, atol=2e-15)
+
+
+def test_static_spinor_application_covers_scalar_and_refuses_wrong_extent():
+    coeff = np.array([[1.0 + 2.0j], [-3.0 + 0.5j]])
+    np.testing.assert_array_equal(
+        apply_spinor_rotation(np.ones((1, 1), dtype=np.complex128), coeff),
+        coeff)
+    with pytest.raises(ValueError, match="spinor extent must be 1"):
+        apply_spinor_rotation(np.eye(3), np.ones((4, 3)))
+    with pytest.raises(ValueError, match="final axes must match"):
+        apply_spinor_rotation(np.eye(2), np.ones((4, 1)))
+
+
+def test_run58_spinor_shape_compiles_without_a_cublas_gemm():
+    """Exact failed local shape: k16 × G76551 × ns2, one local band.
+
+    Run58 failed while compiling the former K=2 einsum as a cuBLAS custom
+    call with output ``c128[16,76551,2]``.  Shape-only lowering is sufficient
+    to falsify that compiler failure and avoids allocating a production WFN.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    apply_jit = jax.jit(apply_spinor_rotation)
+    lowered = apply_jit.lower(
+        jax.ShapeDtypeStruct((16, 1, 2, 2), jnp.complex128),
+        jax.ShapeDtypeStruct((16, 76551, 2), jnp.complex128),
+    )
+    compiled = lowered.compile()
+    hlo = compiled.as_text()
+    assert '__cublas$gemm' not in hlo
 
 
 def test_tau_phase_row_is_none_at_tau_zero():
