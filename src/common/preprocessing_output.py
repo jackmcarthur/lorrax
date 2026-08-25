@@ -26,8 +26,8 @@ _WARNING_WORDS = (
 )
 
 
-class PreprocessingProductionReport:
-    """One rank-zero scientific stream shared by dipole and ``kin_ion``."""
+class ScientificProductionReport:
+    """One rank-zero scientific stream for a LORRAX core driver."""
 
     def __init__(self, path: str, *, runtime, debug: bool, stdout,
                  driver_name: str, calculation_name: str) -> None:
@@ -163,6 +163,9 @@ class PreprocessingProductionReport:
         self.close()
 
 
+PreprocessingProductionReport = ScientificProductionReport
+
+
 def timing_total(records, *names: str) -> float:
     """Sum canonical timing records without exposing collector internals."""
     wanted = set(names)
@@ -170,4 +173,8 @@ def timing_total(records, *names: str) -> float:
                if str(row["name"]) in wanted)
 
 
-__all__ = ["PreprocessingProductionReport", "timing_total"]
+__all__ = [
+    "PreprocessingProductionReport",
+    "ScientificProductionReport",
+    "timing_total",
+]

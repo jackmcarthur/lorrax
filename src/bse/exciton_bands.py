@@ -120,8 +120,9 @@ import numpy as np
 # This driver names ``--px/--py``; ``_create_mesh_xy(px, py)`` in main()
 # reuses the startup mesh when the requested shape matches it and builds
 # (and warms) the requested one when it does not.
-from runtime import initialize_communicator_stack
-RUNTIME = initialize_communicator_stack()
+from runtime import (debug_print, debug_print_enabled,
+                     initialize_communicator_stack, rank0_print)
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 import jax.numpy as jnp
@@ -136,7 +137,11 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
                                     check_band_window)
 from common.collectives import device_put_process_local
 from common.fft_helpers import make_sharded_ifftn_3d
+from common.preprocessing_output import ScientificProductionReport
+from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
+from common.scientific_output import abs_path, band_range, policy
+from runtime.production_stream import ProductionStdout
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
@@ -1348,6 +1353,9 @@ def build_parser():
                          "any disagreement is off-grid interpolation error, "
                          "and its size localises the leg.")
     ap.add_argument("--out-prefix", type=str, default="exciton_bands")
+    ap.add_argument(
+        "--report-file", type=str, default=None,
+        help="human-readable report (default: <out-prefix>.out)")
     ap.add_argument("--w-coarse-grid", type=str, default=None,
                     help="NX,NY,NZ — sample the screened W on this COARSE BZ "
                          "sub-grid (a divisor of the WFN/BSE grid), then "
@@ -1440,6 +1448,45 @@ def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
 
+    report_path = os.path.abspath(
+        args.report_file if args.report_file else args.out_prefix + ".out")
+    debug = debug_print_enabled()
+    report = ScientificProductionReport(
+        report_path, runtime=RUNTIME, debug=debug, stdout=rank0_print,
+        driver_name="bse.exciton_bands",
+        calculation_name="exciton bandstructure")
+    production_stdout = ProductionStdout(
+        debug=debug, rank=RUNTIME.process_index,
+        warning_fn=report.legacy_print)
+    production_stdout.install()
+    report.stdout = rank0_print if debug else production_stdout.emit
+    log = report.legacy_print
+    report.begin(input_file=args.input)
+    report.architecture(mesh_role="BSE transition axes X x Y")
+    report.pathways((
+        "Hamiltonian    : finite-Q Tamm-Dancoff BSE, D_Q + V_Q - W",
+        f"Exchange V_Q   : {args.vq_mode} "
+        "(other choices: interp, refit, both, ongrid)",
+        "Screened W    : " + (
+            f"coarse {args.w_coarse_grid} grid, trigonometric densification"
+            if args.w_coarse_grid else "native BSE k grid"),
+        f"Eigensolver    : block Lanczos; block={int(args.block_size)}; "
+        f"maximum iterations={int(args.max_iter)}",
+        "Energy source : " + (
+            f"quasiparticle corrections from {abs_path(args.eqp)}"
+            if args.eqp else "DFT eigenvalues from the WFN"),
+        "Refit cert     : " + policy(
+            args.cert_grade, tuple(CERT_TOL_BY_GRADE)),
+        "Warm rerun     : " + (
+            "enabled as a reproducibility diagnostic"
+            if rerun_check_enabled(args) else
+            "off (pass --rerun-check to enable)"),
+    ))
+    stage_progress = LoopProgress(
+        7, report.progress, title="exciton-band calculation",
+        item_name="major stage", max_updates=7)
+    stage_progress.start()
+
     # ---- Stage timing -----------------------------------------------------
     # DELIBERATELY a driver-local two-column table (``name  seconds``) and NOT
     # ``common.timing.report``: eight live campaign harnesses parse this table
@@ -1483,10 +1530,6 @@ def main(argv=None):
     # it is also threaded into the heavy helpers as ``log_fn`` so their
     # progress is not emitted 16×.
     _rank0 = jax.process_index() == 0
-
-    def log(*a, **k):
-        if _rank0:
-            print(*a, **k)
 
     mesh_xy = _create_mesh_xy(args.px, args.py)
     log(f"[dist] jax.device_count()={jax.device_count()} "
@@ -1636,6 +1679,7 @@ def main(argv=None):
                 f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
                 f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
+    stage_progress.step()
 
     # ── which ISDF basis the htransform fits in ──────────────────────────
     # BEFORE initialize_wfns, because that call is the one that reads the
@@ -1694,6 +1738,27 @@ def main(argv=None):
     log(f"Q path: {nQ_path} path points (+{nQ - nQ_path} extra), nodes at "
         f"{list(map(int, node_idx))} labels {node_labels}")
     tick("htransform_setup", t0)
+    stage_progress.step()
+    report.environment(wfn=wfn, lines=(
+        f"Restart tensors: {abs_path(restart_file)}",
+        "Transition data: distributed band and centroid blocks on X x Y",
+        "Gram eigensolve: " + policy(
+            args.eigh_backend,
+            ("auto", "off", "distributed", "cusolvermp", "slate",
+             "scalapack")),
+        "Batched LA     : " + policy(
+            args.distrib_la_batched_route, ("auto", "batch_reshard")),
+    ))
+    report.sampling(wfn=wfn, sym=sym)
+    report.heading("Exciton momentum path")
+    report.emit(f"Path sampling  : {int(nQ_path)} plotted Q points; "
+                f"{int(nQ - nQ_path)} extra diagnostic points")
+    for inode, (idx, label) in enumerate(zip(node_idx, node_labels), start=1):
+        point = Qpath[int(idx)]
+        report.emit(
+            f"  N{inode:02d}  {label or '-':>3}  "
+            f"Q=({point[0]: .5f} {point[1]: .5f} {point[2]: .5f})  "
+            f"path index {int(idx) + 1}")
 
     # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
     # FULL-BAND htransform basis — the single lever that removes the off-grid
@@ -1759,6 +1824,19 @@ def main(argv=None):
     log(f"  full-band htransform: fH over {nb_window} bands "
         f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
         f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
+    _nelec = int(wfn.nelec)
+    report.bands((
+        f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
+        f"occupied-band boundary = {_nelec}",
+        f"BSE valence    : {band_range(_nelec - n_val, _nelec)}",
+        f"BSE conduction : {band_range(_nelec, _nelec + n_cond)}",
+        f"htransform fit : {band_range(_nelec - nval_in, _nelec - nval_in + nb_window)} "
+        f"({int(n_guard)} conduction guard bands)",
+        f"Transition size: {int(nc_pad * nv_pad * nk)} padded; "
+        f"{int(n_cond * n_val * nk)} physical",
+        f"Centroid basis : {int(n_rmu)} logical; {int(n_rmu_pad)} mesh-padded; "
+        f"table {abs_path(centroids_path)}",
+    ))
     k_frac = np.stack(np.meshgrid(np.arange(nkx) / nkx, np.arange(nky) / nky,
                                   np.arange(nkz) / nkz, indexing="ij"),
                       axis=-1).reshape(-1, 3)
@@ -1791,6 +1869,7 @@ def main(argv=None):
     # ``bundle`` alone is ψ at every (Q, k) in both shardings.
     del bundle, ctilde, B_at_mu, enk_sigma
     tick("htransform_psi_cQ", t0)
+    stage_progress.step()
 
     # on-grid gate at the first Γ node (path convention: starts at Γ)
     iGamma = [i for i in range(nQ)
@@ -1924,6 +2003,20 @@ def main(argv=None):
             eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
                                              vqm.coeffs_packed)
     tick("vq_prepare", t0)
+    report.heading("Resolved interaction kernels")
+    report.emit("Exchange route : " + (
+        f"exact stored tiles at {nQ} on-grid Q points" if ongrid else
+        "per-Q ISDF refit with the producer Coulomb service" if pure_refit else
+        "arbitrary-Q interpolation with exact stored Γ tile"))
+    report.emit("Exchange head  : " + (
+        "mini-BZ cell-averaged tensor" if head_mbz else
+        "point value (stored Γ head-body tile at Γ)"))
+    report.emit("Direct W       : " + (
+        f"sampled on {args.w_coarse_grid}; densified to "
+        f"{nkx} x {nky} x {nkz}" if args.w_coarse_grid else
+        f"native {nkx} x {nky} x {nkz} grid"))
+    report.emit(f"Window policy  : degeneracy={args.band_degeneracy}; "
+                f"tolerance={float(args.degeneracy_tol_ry):.5e} Ry")
 
     # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
     rst = None
@@ -2211,6 +2304,7 @@ def main(argv=None):
         if len(head_scalars) > 4:
             log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
     tick("vq_eval", t0)
+    stage_progress.step()
 
     # cert twins and refit rows reuse their Q's conduction caches: extend the
     # scan xs in the row order fixed above.  This is what makes the twin an
@@ -2337,6 +2431,7 @@ def main(argv=None):
         block_size=args.block_size, max_iter=args.max_iter,
         head_tensor=head_mbz)
     tick("w_r_and_build", t0)
+    stage_progress.step()
     t_c0 = time.time()
     evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                 data["psi_v_X"], data["psi_v_Y"],
@@ -2351,10 +2446,11 @@ def main(argv=None):
     # The α-Hermiticity invariant, replayed on the host from scalars the scan
     # returned.  Same tolerance, same message, same LORRAX_SANITY=strict raise
     # as the in-jit callback it replaces — see _report_alpha_over_path.
-    _report_alpha_over_path(solver.alpha_labels, jax.device_get(alpha_dev),
-                            log=log)
+    alpha_ok = _report_alpha_over_path(
+        solver.alpha_labels, jax.device_get(alpha_dev), log=log)
     t_first = time.time() - t_c0
     tick("solve_scan_cold", t_c0)
+    stage_progress.step()
     if rerun_check_enabled(args):
         # warm re-run: census-clean per-Q cost + reproducibility assert.
         # Pure diagnostic — it re-executes the ENTIRE Q scan a second time.
@@ -2419,6 +2515,28 @@ def main(argv=None):
             f"{cert_grade_stamp(args.cert_grade, cert_worst)}; "
             f"refit window={args.refit_window}, {len(cert_rows)} on-grid "
             f"certification Q, out-prefix {args.out_prefix}")
+
+    report.heading("Exciton spectrum and validation")
+    _path_ev = np.asarray(evs_path[:nQ_path], dtype=np.float64) * RY2EV
+    report.emit(f"Computed levels: {int(args.n_eig)} at {int(nQ_path)} path points")
+    report.emit(f"Energy extent  : [{float(np.min(_path_ev)):.5f}, "
+                f"{float(np.max(_path_ev)):.5f}] eV")
+    report.emit("Hermiticity    : " + ("PASS" if alpha_ok else "FAILED"))
+    for inode, (idx, label) in enumerate(zip(node_idx, node_labels), start=1):
+        levels = _path_ev[int(idx)]
+        shown = "  ".join(f"{float(value):.5f}" for value in levels[:3])
+        suffix = "  ..." if levels.size > 3 else ""
+        report.emit(f"  N{inode:02d} {label or '-':>3}  lowest E_S (eV): "
+                    f"{shown}{suffix}")
+    if cert_worst is not None:
+        report.emit(f"Refit cert     : {args.cert_grade}; worst "
+                    f"{float(cert_worst):.5f} meV over {len(cert_rows)} "
+                    "on-grid Q points")
+    elif args.vq_mode in ("refit", "both"):
+        report.emit("Refit cert     : tile-level certification completed "
+                    "for the producer zeta window")
+    else:
+        report.emit("Refit cert     : not applicable to this exchange route")
 
     # ── outputs (rank 0 ONLY — the .dat / .png writes and the plot must not
     #    race across the 16 processes; evs_all is fully addressable on every
@@ -2553,6 +2671,9 @@ def main(argv=None):
               f"{100.0*untimed/max(total,1e-9):5.1f}%")
         print(f"  {'TOTAL':<22s} {total:9.2f}   100.0%")
 
+    stage_progress.step()
+    stage_progress.finish()
+
     # LEAVE TOGETHER.  Everything above this line inside ``if _rank0`` — the
     # .dat write, the interp-vs-refit table, matplotlib — is rank-0 only and
     # takes seconds.  Without this barrier ranks 1..P-1 return from main(),
@@ -2594,8 +2715,37 @@ def main(argv=None):
     try:
         wfn.close()
     except Exception as exc:                                  # noqa: BLE001
-        print(f"  [exciton_bands] WfnLoader.close() failed "
-              f"({type(exc).__name__}: {exc}); continuing to exit")
+        report.legacy_print(
+            f"WARNING: WfnLoader.close() failed "
+            f"({type(exc).__name__}: {exc}); continuing to exit")
+
+    report.timings(tuple(timers.items()), wall=time.time() - t_wall)
+    dat_path = os.path.abspath(args.out_prefix + ".dat")
+    png_path = os.path.abspath(args.out_prefix + ".png")
+    wfn_name = str(params.get("wfn_file", "WFN.h5"))
+    if not os.path.isabs(wfn_name):
+        wfn_name = os.path.join(os.path.dirname(os.path.abspath(args.input)),
+                                wfn_name)
+    file_rows = [
+        ("human-readable report", "written", report_path),
+        ("exciton bands", "written", dat_path),
+        ("exciton plot", "written", png_path),
+        ("GW/BSE restart", "read", restart_file),
+        ("wavefunctions", "read", wfn_name),
+        ("centroid coordinates", "read", centroids_path),
+    ]
+    if args.eqp:
+        file_rows.append(("QP corrections", "read", args.eqp))
+    if head_mbz:
+        dipole_path = (args.dipole if args.dipole else
+                       os.path.join(os.path.dirname(os.path.abspath(args.input)),
+                                    "dipole.h5"))
+        file_rows.append(("dipole head tensor", "read", dipole_path))
+    file_rows.append(("input deck", "read", args.input))
+    report.files(file_rows)
+    report.finish()
+    barrier("exciton_bands.report_written")
+    production_stdout.close()
     return 0
 
 

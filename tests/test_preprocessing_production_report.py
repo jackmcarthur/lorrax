@@ -88,3 +88,15 @@ def test_bse_random_demo_is_named_as_a_self_test_not_a_debug_switch():
               "bse_jax.py").read_text(encoding="utf-8")
     assert '"--debug-parallelism"' not in source
     assert '"--parallelism-self-test"' in source
+
+
+def test_exciton_bands_uses_shared_report_and_paths_last_contract():
+    source = (Path(__file__).parents[1] / "src" / "bse" /
+              "exciton_bands.py").read_text(encoding="utf-8")
+    assert "ScientificProductionReport" in source
+    assert "ProductionStdout" in source
+    assert '"--report-file"' in source
+    assert "report.sampling(wfn=wfn, sym=sym)" in source
+    assert "stage_progress = LoopProgress(" in source
+    assert "report.files(file_rows)" in source
+    assert source.index("report.files(file_rows)") < source.index("report.finish()")
