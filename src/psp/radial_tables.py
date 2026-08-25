@@ -145,6 +145,35 @@ def _reduced_projector_second_derivative(
     return out
 
 
+def _reduced_projector_third_derivative(
+    q: np.ndarray,
+    l: int,
+    J_lp2: np.ndarray,
+    K_lp3: np.ndarray,
+) -> np.ndarray:
+    r"""Canonical recurrence for ``d3(F_l/q^l)/dq3``.
+
+    With ``J_lp2 = int r beta(r) j_(l+2)(qr) r^2 dr`` and
+    ``K_lp3 = int r^2 beta(r) j_(l+3)(qr) r^2 dr``, differentiating the
+    second-derivative recurrence once gives, for ``q > 0``,
+
+    ``G_l''' = 3 J_(l+2)/q^(l+1) - K_(l+3)/q^l``.
+
+    ``G_l`` is analytic and even in radial ``q``, so its third derivative is
+    exactly zero at the origin.  Stamping that value avoids deriving it from
+    a table slope and is required by the Cartesian third-derivative owner.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    out = np.empty_like(J_lp2, dtype=np.float64)
+    nonzero = q > 0.0
+    out[nonzero] = (
+        3.0 * J_lp2[nonzero] / q[nonzero] ** (l + 1)
+        - K_lp3[nonzero] / q[nonzero] ** l
+    )
+    out[~nonzero] = 0.0
+    return out
+
+
 def alpha_z(sp: SpeciesData, vol: float) -> float:
     """G=0 local potential: (4π/Ω) ∫ r·[r·V_loc(r) + Z·e²] rab dr."""
     e2 = 2.0
@@ -177,13 +206,15 @@ def build_all_tables(
     n_q: int = 4000,
     *,
     second_derivatives: bool = False,
+    third_derivatives: bool = False,
 ) -> dict:
     """Build Hankel tables for all species on a uniform q-grid.
 
     Per-species the per-projector forward (F_l) and analytic-deriv
     raw-Hankel (H_{l+1}) tables are produced in two batched JAX kernel
     families — one per unique l (resp. l+1).  Contact setup adds the
-    opt-in l+2 family.  All Bessel evaluation
+    opt-in l+2 family; a finite-transfer q2 jet adds the opt-in l+3 family.
+    All Bessel evaluation
     + integrand reduction lives on GPU; only the (n_proj_s, n_q)
     result moves back to host.  Replaces a per-projector scipy.special
     .spherical_jn call site (~10 s total on MoS2) with ~1 s of GPU
@@ -207,6 +238,9 @@ def build_all_tables(
                        radial-moment value at q=0.  Built only when
                        ``second_derivatives=True`` so ordinary Hamiltonian
                        setup does not pay the extra l+2 Bessel pass.
+      third_deriv_tables : list of (n_proj_s, n_q) or None — analytic
+                       ``d3(F_l/q^l)/dq3``, including its exact zero at
+                       q=0. Built only when ``third_derivatives=True``.
     """
     import jax.numpy as jnp
     from psp.radial.radial_jax import spherical_hankel_table_batch_jax
@@ -222,7 +256,11 @@ def build_all_tables(
     proj_tables = []
     reduced_origins = []
     deriv_tables = []
+    if third_derivatives and not second_derivatives:
+        raise ValueError(
+            "third_derivatives=True requires second_derivatives=True")
     second_deriv_tables = [] if second_derivatives else None
+    third_deriv_tables = [] if third_derivatives else None
 
     e2 = 2.0
     for i, sp in enumerate(species_list):
@@ -297,6 +335,23 @@ def build_all_tables(
                 Gpp_table[ip] = _reduced_projector_second_derivative(
                     q, int(l_val), H_table[ip], J_table[ip], origin_moment)
 
+            if third_derivatives:
+                K_table = np.zeros((n_proj, n_q), dtype=np.float64)
+                # Third derivative recurrence: K_{l+3} uses r^2*beta(r).
+                for l_val in np.unique(ls + 3):
+                    idx = np.where(ls + 3 == l_val)[0]
+                    K_block = spherical_hankel_table_batch_jax(
+                        int(l_val), r_j,
+                        jnp.asarray(beta_full[idx] * sp.r[None, :] ** 2,
+                                    dtype=jnp.float64),
+                        q_j, w_j,
+                    )
+                    K_table[idx] = np.asarray(K_block)
+                Gppp_table = np.empty_like(F_table)
+                for ip, l_val in enumerate(ls):
+                    Gppp_table[ip] = _reduced_projector_third_derivative(
+                        q, int(l_val), J_table[ip], K_table[ip])
+
         proj_tables.append(F_table)
         reduced_origins.append(np.asarray([
             projector_reduced_origin(sp, ip) for ip in range(n_proj)
@@ -304,6 +359,8 @@ def build_all_tables(
         deriv_tables.append(H_table)
         if second_derivatives:
             second_deriv_tables.append(Gpp_table)
+        if third_derivatives:
+            third_deriv_tables.append(Gppp_table)
 
     return dict(q=q, dq=float(q[1] - q[0]) if n_q > 1 else 1.0,
                 vloc=vloc, nlcc=nlcc,
@@ -311,4 +368,5 @@ def build_all_tables(
                 proj_tables=proj_tables,
                 reduced_origins=reduced_origins,
                 deriv_tables=deriv_tables,
-                second_deriv_tables=second_deriv_tables)
+                second_deriv_tables=second_deriv_tables,
+                third_deriv_tables=third_deriv_tables)

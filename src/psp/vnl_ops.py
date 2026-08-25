@@ -84,6 +84,10 @@ class VNLSetup:
     # Analytic second radial derivative of the reduced projector form factor.
     # Kept beside G/Gp so every VNL derivative consumes the same radial owner.
     Gpp_table: jax.Array | None = None     # (total_nbeta, n_q)
+    # Analytic third radial derivative.  This is a separately priced
+    # capability for the ICL q^2 transfer jet; uniform current/contact does
+    # not allocate or compile it.
+    Gppp_table: jax.Array | None = None    # (total_nbeta, n_q)
     # Content identity built from the host radial/projector/E data before
     # device transfer.  Empty only on hand-built test fixtures; production
     # uniform gauge transactions refuse an empty value.
@@ -125,6 +129,7 @@ class _VNLProjectorCoefficientBlock:
     dc_cart: jax.Array              # (cart, R, spin, band)
     d2c_cart: jax.Array             # (cart, cart, R, spin, band)
     E: jax.Array
+    d3c_cart: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +138,7 @@ class VNLGaugeKetDerivatives:
 
     gamma_cart_ket: jax.Array
     lambda_cart_ket: jax.Array
+    third_cart_ket: jax.Array | None = None
 
 
 ICL_STRAIGHT_GAUGE_PATH = "icl_straight_segment_v1"
@@ -151,15 +157,16 @@ class ICLVNLTransferJet:
     Thus the transfer gradient is not a second current construction: it is
     exactly minus one half of the incumbent uniform contact.  The uniform
     current and contact fields remain byte-for-byte the arrays returned by
-    :class:`VNLGaugeKetDerivatives`.  The ``q^2`` coefficient requires the
-    physical third projector derivative and is deliberately not represented
-    by this type; differentiating the linear table interpolant would not be
-    that operator.
+    :class:`VNLGaugeKetDerivatives`.  ``d2gamma_dq2_cart_ket`` is present only
+    for a setup carrying the separately priced physical third projector
+    derivative; differentiating the linear table interpolant is never used as
+    a substitute.
     """
 
     gamma0_cart_ket: jax.Array
     dgamma_dq_cart_ket: jax.Array
     lambda0_cart_ket: jax.Array
+    d2gamma_dq2_cart_ket: jax.Array | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +280,7 @@ def build_vnl_setup(
     q_max: float | None = None,
     soc: bool | None = None,
     compute_contact: bool = False,
+    compute_transfer_q2: bool = False,
     print_fn=print,
 ) -> VNLSetup:
     """Build k-independent VNL data: radial tables, channel metadata.
@@ -294,6 +302,11 @@ def build_vnl_setup(
         uniform nonlocal contact.  False by default so existing Hamiltonian,
         NSCF, and dipole setup pays no l+2 Bessel compilation/pass and no
         uniform-gauge content-fingerprint pass.
+    compute_transfer_q2 : bool
+        Opt in to the analytic ``G'''`` table and l+3 Bessel family needed by
+        the ICL straight-segment second transfer derivative.  This implies
+        ``compute_contact`` because the q2 jet includes the same q0 contact.
+        False leaves the uniform/current compile family unchanged.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
@@ -333,8 +346,11 @@ def build_vnl_setup(
 
     # Extract species data and projector tables
     species_list = extract_species(pseudos, nspinor=nspinor)
+    compute_contact = bool(compute_contact or compute_transfer_q2)
     tables = build_all_tables(
-        species_list, q_max, n_q, second_derivatives=compute_contact)
+        species_list, q_max, n_q,
+        second_derivatives=compute_contact,
+        third_derivatives=bool(compute_transfer_q2))
     species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
     q_grid = tables["q"]
     dq = tables["dq"]
@@ -344,6 +360,7 @@ def build_vnl_setup(
     G_rows: list[np.ndarray] = []
     Gp_rows: list[np.ndarray] = []
     Gpp_rows: list[np.ndarray] = []
+    Gppp_rows: list[np.ndarray] = []
     beta_idx = 0
 
     for isp, sp in enumerate(species_list):
@@ -381,6 +398,8 @@ def build_vnl_setup(
                 H_vals = tables["deriv_tables"][isp][ip]
                 Gpp_vals = (tables["second_deriv_tables"][isp][ip]
                             if compute_contact else None)
+                Gppp_vals = (tables["third_deriv_tables"][isp][ip]
+                             if compute_transfer_q2 else None)
                 if l == 0:
                     G_vals = F_vals.copy()
                     Gp_vals = -H_vals
@@ -396,6 +415,8 @@ def build_vnl_setup(
                 Gp_rows.append(Gp_vals)
                 if compute_contact:
                     Gpp_rows.append(Gpp_vals)
+                if compute_transfer_q2:
+                    Gppp_rows.append(Gppp_vals)
 
             channels.append(ChannelMeta(
                 l=l, nbeta=nbeta, msize=msize, R=R,
@@ -416,6 +437,12 @@ def build_vnl_setup(
     Gp_table = jnp.asarray(Gp_table_np, dtype=jnp.float64)
     Gpp_table = (None if Gpp_table_np is None
                  else jnp.asarray(Gpp_table_np, dtype=jnp.float64))
+    Gppp_table_np = (
+        (np.stack(Gppp_rows).astype(np.float64, copy=False)
+         if Gppp_rows else np.zeros((0, n_q), dtype=np.float64))
+        if compute_transfer_q2 else None)
+    Gppp_table = (None if Gppp_table_np is None
+                  else jnp.asarray(Gppp_table_np, dtype=jnp.float64))
     total_R = sum(ch.R * ch.natoms for ch in channels)
     l_max = max((ch.l for ch in channels), default=0)
 
@@ -489,6 +516,11 @@ def build_vnl_setup(
             ("E_super", E_super),
         ):
             fingerprint_update_value(digest, label, value)
+        if compute_transfer_q2:
+            # Preserve the incumbent contact-only identity exactly.  The
+            # additional radial capability joins the identity only when it
+            # can affect the finite-transfer jet.
+            fingerprint_update_value(digest, "Gppp", Gppp_table_np)
         uniform_gauge_fingerprint = "sha256:" + digest.hexdigest()
 
     return VNLSetup(
@@ -503,6 +535,7 @@ def build_vnl_setup(
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
         coupled_row_blocks=tuple(coupled_row_blocks),
         Gpp_table=Gpp_table,
+        Gppp_table=Gppp_table,
         uniform_gauge_fingerprint=uniform_gauge_fingerprint,
     )
 
@@ -554,6 +587,22 @@ def _interp_with_deriv_jvp(primals, tangents):
     val = _table_interp(q, dq, table)
     slope = _table_interp(q, dq, deriv_table)
     return val, slope * q_dot
+
+
+@jax.custom_jvp
+def _interp_with_two_derivs(q, dq, table, deriv_table, second_deriv_table):
+    """Table interpolation carrying two physical derivative levels."""
+    return _table_interp(q, dq, table)
+
+
+@_interp_with_two_derivs.defjvp
+def _interp_with_two_derivs_jvp(primals, tangents):
+    q, dq, table, deriv_table, second_deriv_table = primals
+    q_dot, _, _, _, _ = tangents
+    value = _table_interp(q, dq, table)
+    slope = _interp_with_deriv(
+        q, dq, deriv_table, second_deriv_table)
+    return value, slope * q_dot
 
 
 def _reduced_radial_values_on_cart(K_cart, dq, table):
@@ -819,21 +868,27 @@ def require_uniform_gauge_transfer(
 
 
 @jax.custom_jvp
-def _interp_reduced_on_cart(K_cart, dq, table, dtable, d2table):
+def _interp_reduced_on_cart(
+    K_cart, dq, table, dtable, d2table, d3table,
+):
     """Exact-origin reduced radial table with physical Cartesian JVPs."""
     return _reduced_radial_values_on_cart(K_cart, dq, table)
 
 
 @_interp_reduced_on_cart.defjvp
 def _interp_reduced_on_cart_jvp(primals, tangents):
-    K_cart, dq, table, dtable, d2table = primals
-    dK_cart, _, _, _, _ = tangents
+    K_cart, dq, table, dtable, d2table, d3table = primals
+    dK_cart, _, _, _, _, _ = tangents
     q2 = jnp.sum(K_cart * K_cart, axis=1)
     q_safe = jnp.sqrt(jnp.where(q2 > 0.0, q2, 1.0))
     q = jnp.where(q2 > 0.0, q_safe, 0.0)
     value = _reduced_radial_values_on_cart(K_cart, dq, table)
-    radial_prime = _interp_with_deriv(q, dq, dtable, d2table)
-    radial_second = _table_interp(q, dq, d2table)
+    radial_prime = _interp_with_two_derivs(
+        q, dq, dtable, d2table, d3table)
+    # The primal is G''.  Its custom JVP is the physical G''' table when a
+    # third Cartesian derivative is requested; contact-only traces consume
+    # only the primal and therefore do not create a third-derivative family.
+    radial_second = _interp_with_deriv(q, dq, d2table, d3table)
     radial_prime_over_q = jnp.where(
         q2[None, :] > 0.0,
         radial_prime / q_safe[None, :],
@@ -868,7 +923,9 @@ def _assemble_uniform_projector_rows(
     K_cart = K_crys @ B
     G_all = _interp_reduced_on_cart(
         K_cart, jnp.asarray(setup.dq), setup.G_table, setup.Gp_table,
-        setup.Gpp_table)
+        setup.Gpp_table,
+        (setup.Gppp_table if setup.Gppp_table is not None
+         else jnp.zeros_like(setup.Gpp_table)))
     return _assemble_projector_rows(
         K_crys, K_cart, G_all, jnp.asarray(setup.prefactor),
         row_beta_idx, row_l, row_m, row_tau, l_max=int(setup.l_max))
@@ -877,8 +934,15 @@ def _assemble_uniform_projector_rows(
 def _projector_derivatives_cartesian_rows(
     k_crys, G_chunk, setup: VNLSetup,
     row_beta_idx, row_l, row_m, row_tau, g_mask, row_mask,
+    *, derivative_order: int = 2,
 ):
-    """Z/dZ/d2Z for one fixed-shape row/G scan tile."""
+    """Z derivatives through order two or three for one row/G tile."""
+    if int(derivative_order) not in (2, 3):
+        raise ValueError("derivative_order must be 2 or 3")
+    if int(derivative_order) == 3 and setup.Gppp_table is None:
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
+            "compute_transfer_q2=True")
     B = jnp.asarray(setup.B, dtype=jnp.float64)
     Binv = jnp.linalg.inv(B)
 
@@ -896,14 +960,21 @@ def _projector_derivatives_cartesian_rows(
     mask = (
         row_mask[:, None].astype(Z.real.dtype)
         * g_mask[None, :].astype(Z.real.dtype))
-    return (
+    through_second = (
         Z * mask,
         dZ * mask[None, :, :],
         d2Z * mask[None, None, :, :],
     )
+    if int(derivative_order) == 2:
+        return through_second
+    d3_raw = jax.jacfwd(jax.jacfwd(jax.jacfwd(z_at_cart_shift)))(zero)
+    d3Z = jnp.moveaxis(d3_raw, (-3, -2, -1), (0, 1, 2))
+    return through_second + (
+        d3Z * mask[None, None, None, :, :],
+    )
 
 
-def _contract_projector_coefficients(psi_G, Z, dZ, d2Z, E):
+def _contract_projector_coefficients(psi_G, Z, dZ, d2Z, E, d3Z=None):
     """Contract one G tile into the private low-rank coefficient carrier."""
     return _VNLProjectorCoefficientBlock(
         c=jnp.einsum("RG,nsG->Rsn", jnp.conj(Z), psi_G, optimize=True),
@@ -912,6 +983,9 @@ def _contract_projector_coefficients(psi_G, Z, dZ, d2Z, E):
         d2c_cart=jnp.einsum(
             "abRG,nsG->abRsn", jnp.conj(d2Z), psi_G, optimize=True),
         E=E,
+        d3c_cart=(None if d3Z is None else jnp.einsum(
+            "abcRG,nsG->abcRsn", jnp.conj(d3Z), psi_G,
+            optimize=True)),
     )
 
 
@@ -939,6 +1013,25 @@ def _apply_vnl_gauge_from_coefficients(block, Z, dZ, d2Z):
         + jnp.einsum("RG,abRsn->abnsG", Z, Ed2c, optimize=True))
     return VNLGaugeKetDerivatives(
         gamma_cart_ket=gamma, lambda_cart_ket=contact)
+
+
+def _apply_vnl_third_from_coefficients(block, Z, dZ, d2Z, d3Z):
+    r"""Apply ``d3 V_NL / dk_a dk_b dk_c`` from the same coefficients."""
+    if block.d3c_cart is None:
+        raise ValueError("third VNL action requires d3 projector coefficients")
+    Ec, Edc, Ed2c = _coupled_projector_coefficients(block)
+    Ed3c = jnp.einsum(
+        "stRQ,abcQtn->abcRsn", block.E, block.d3c_cart, optimize=True)
+    return (
+        jnp.einsum("abcRG,Rsn->abcnsG", d3Z, Ec, optimize=True)
+        + jnp.einsum("abRG,cRsn->abcnsG", d2Z, Edc, optimize=True)
+        + jnp.einsum("acRG,bRsn->abcnsG", d2Z, Edc, optimize=True)
+        + jnp.einsum("bcRG,aRsn->abcnsG", d2Z, Edc, optimize=True)
+        + jnp.einsum("aRG,bcRsn->abcnsG", dZ, Ed2c, optimize=True)
+        + jnp.einsum("bRG,acRsn->abcnsG", dZ, Ed2c, optimize=True)
+        + jnp.einsum("cRG,abRsn->abcnsG", dZ, Ed2c, optimize=True)
+        + jnp.einsum("RG,abcRsn->abcnsG", Z, Ed3c, optimize=True)
+    )
 
 
 def _coupled_projector_row_blocks(setup: VNLSetup, max_rows: int):
@@ -1030,6 +1123,7 @@ def apply_uniform_vnl_derivatives_to_ket(
     q_cart_bohr_inv=(0.0, 0.0, 0.0),
     projector_row_chunk: int = 64,
     g_chunk: int = 1024,
+    compute_third: bool = False,
 ) -> VNLGaugeKetDerivatives:
     r"""Apply uniform VNL Gamma/Lambda with bounded row and G carriers.
 
@@ -1040,6 +1134,9 @@ def apply_uniform_vnl_derivatives_to_ket(
     One fixed-shape outer ``lax.scan`` traverses packed complete E blocks.
     Two inner G scans first accumulate private ``c/dc/d2c`` and then
     re-expand the action. No full-G Z/dZ/d2Z or band-square matrix exists.
+    ``compute_third=True`` extends those same scans with ``d3c/d3Z`` and a
+    third Hamiltonian action for the ICL q2 jet.  It requires the separately
+    priced setup capability and does not alter the default compile family.
     """
     require_uniform_gauge_transfer(
         q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
@@ -1058,6 +1155,10 @@ def apply_uniform_vnl_derivatives_to_ket(
         raise ValueError(
             "GATE EM-VERTEX-VNL-GPP-MISSING: rebuild VNLSetup with "
             "compute_contact=True")
+    if bool(compute_third) and setup.Gppp_table is None:
+        raise ValueError(
+            "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
+            "compute_transfer_q2=True")
     if (setup.row_beta_idx is None or setup.row_l is None
             or setup.row_m is None
             or setup.row_tau is None):
@@ -1086,12 +1187,17 @@ def apply_uniform_vnl_derivatives_to_ket(
     gamma_zero = jnp.zeros((3, nband, 2, ncarrier), dtype=psi.dtype)
     contact_zero = jnp.zeros(
         (3, 3, nband, 2, ncarrier), dtype=psi.dtype)
+    third_zero = (jnp.zeros(
+        (3, 3, 3, nband, 2, ncarrier), dtype=psi.dtype)
+        if bool(compute_third) else None)
     row_blocks = _coupled_projector_row_blocks(
         setup, int(projector_row_chunk))
     if not row_blocks:
         return VNLGaugeKetDerivatives(
             gamma_cart_ket=gamma_zero[..., :nG],
-            lambda_cart_ket=contact_zero[..., :nG])
+            lambda_cart_ket=contact_zero[..., :nG],
+            third_cart_ket=(None if third_zero is None
+                            else third_zero[..., :nG]))
 
     row_width = max(stop - start for start, stop, _ in row_blocks)
     row_starts = jnp.asarray(
@@ -1126,54 +1232,86 @@ def apply_uniform_vnl_derivatives_to_ket(
             jnp.zeros((3, row_width, 2, nband), dtype=psi.dtype),
             jnp.zeros((3, 3, row_width, 2, nband), dtype=psi.dtype),
         )
+        if bool(compute_third):
+            coeff_zero = coeff_zero + (jnp.zeros(
+                (3, 3, 3, row_width, 2, nband), dtype=psi.dtype),)
 
         def coefficient_pass(carry, xs):
             psi_part, G_part, mask_part = xs
-            Z, dZ, d2Z = _projector_derivatives_cartesian_rows(
+            derivatives = _projector_derivatives_cartesian_rows(
                 k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
-                mask_part, row_mask)
+                mask_part, row_mask,
+                derivative_order=(3 if bool(compute_third) else 2))
+            Z, dZ, d2Z = derivatives[:3]
+            d3Z = derivatives[3] if bool(compute_third) else None
             part = _contract_projector_coefficients(
-                psi_part, Z, dZ, d2Z, E_block)
-            return (
+                psi_part, Z, dZ, d2Z, E_block, d3Z=d3Z)
+            updated = (
                 carry[0] + part.c,
                 carry[1] + part.dc_cart,
                 carry[2] + part.d2c_cart,
-            ), None
+            )
+            if bool(compute_third):
+                updated = updated + (carry[3] + part.d3c_cart,)
+            return updated, None
 
         coefficient_arrays, _ = jax.lax.scan(
             coefficient_pass, coeff_zero,
             (psi_chunks, G_chunks, mask_chunks), unroll=1)
         coefficients = _VNLProjectorCoefficientBlock(
             c=coefficient_arrays[0], dc_cart=coefficient_arrays[1],
-            d2c_cart=coefficient_arrays[2], E=E_block)
+            d2c_cart=coefficient_arrays[2], E=E_block,
+            d3c_cart=(coefficient_arrays[3]
+                      if bool(compute_third) else None))
 
         def expansion_pass(carry, xs):
             G_part, mask_part = xs
-            Z, dZ, d2Z = _projector_derivatives_cartesian_rows(
+            derivatives = _projector_derivatives_cartesian_rows(
                 k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
-                mask_part, row_mask)
+                mask_part, row_mask,
+                derivative_order=(3 if bool(compute_third) else 2))
+            Z, dZ, d2Z = derivatives[:3]
             out = _apply_vnl_gauge_from_coefficients(
                 coefficients, Z, dZ, d2Z)
-            return carry, (out.gamma_cart_ket, out.lambda_cart_ket)
+            outputs = (out.gamma_cart_ket, out.lambda_cart_ket)
+            if bool(compute_third):
+                outputs = outputs + (_apply_vnl_third_from_coefficients(
+                    coefficients, Z, dZ, d2Z, derivatives[3]),)
+            return carry, outputs
 
-        _, (gamma_chunks, contact_chunks) = jax.lax.scan(
+        _, expanded_chunks = jax.lax.scan(
             expansion_pass, None, (G_chunks, mask_chunks), unroll=1)
+        gamma_chunks, contact_chunks = expanded_chunks[:2]
         gamma_block = jnp.transpose(
             gamma_chunks, (1, 2, 3, 0, 4)).reshape(
                 3, nband, 2, ncarrier)
         contact_block = jnp.transpose(
             contact_chunks, (1, 2, 3, 4, 0, 5)).reshape(
                 3, 3, nband, 2, ncarrier)
-        gamma_total, contact_total = total
-        return (gamma_total + gamma_block,
-                contact_total + contact_block), None
+        updated_total = (
+            total[0] + gamma_block,
+            total[1] + contact_block,
+        )
+        if bool(compute_third):
+            third_chunks = expanded_chunks[2]
+            third_block = jnp.transpose(
+                third_chunks, (1, 2, 3, 4, 5, 0, 6)).reshape(
+                    3, 3, 3, nband, 2, ncarrier)
+            updated_total = updated_total + (total[2] + third_block,)
+        return updated_total, None
 
-    (gamma, contact), _ = jax.lax.scan(
-        row_pass, (gamma_zero, contact_zero),
+    initial = (gamma_zero, contact_zero)
+    if bool(compute_third):
+        initial = initial + (third_zero,)
+    totals, _ = jax.lax.scan(
+        row_pass, initial,
         (row_starts, row_lengths, row_channels), unroll=1)
+    gamma, contact = totals[:2]
     return VNLGaugeKetDerivatives(
         gamma_cart_ket=gamma[..., :nG],
-        lambda_cart_ket=contact[..., :nG])
+        lambda_cart_ket=contact[..., :nG],
+        third_cart_ket=(totals[2][..., :nG]
+                        if bool(compute_third) else None))
 
 
 def apply_icl_vnl_transfer_jet_to_ket(
@@ -1185,6 +1323,7 @@ def apply_icl_vnl_transfer_jet_to_ket(
     *,
     projector_row_chunk: int = 64,
     g_chunk: int = 1024,
+    include_q2: bool = False,
 ) -> ICLVNLTransferJet:
     r"""Apply the canonical ICL straight-segment VNL jet at ``q=0``.
 
@@ -1196,7 +1335,8 @@ def apply_icl_vnl_transfer_jet_to_ket(
 
        \Gamma_a^{\rm NL}(k,q)
        = \int_0^1 d\lambda\,\partial_a V_{\rm NL}(k-\lambda q)
-       = V_{,a}(k)-\frac{q_b}{2}V_{,ab}(k)+O(q^2).
+       = V_{,a}(k)-\frac{q_b}{2}V_{,ab}(k)
+         +\frac{q_bq_c}{6}V_{,abc}(k)+O(q^3).
 
     The sole bounded projector-coefficient scan already produces both
     derivatives.  This wrapper only binds their finite-transfer meaning; it
@@ -1211,11 +1351,15 @@ def apply_icl_vnl_transfer_jet_to_ket(
         g_mask,
         projector_row_chunk=projector_row_chunk,
         g_chunk=g_chunk,
+        compute_third=bool(include_q2),
     )
     return ICLVNLTransferJet(
         gamma0_cart_ket=uniform.gamma_cart_ket,
         dgamma_dq_cart_ket=-0.5 * uniform.lambda_cart_ket,
         lambda0_cart_ket=uniform.lambda_cart_ket,
+        d2gamma_dq2_cart_ket=(
+            uniform.third_cart_ket / 3.0
+            if bool(include_q2) else None),
     )
 
 

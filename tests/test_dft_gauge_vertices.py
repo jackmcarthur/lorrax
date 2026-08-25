@@ -29,7 +29,9 @@ for _module in (vnl_ops, dft_operators, radial_tables):
             f"{_module.__file__}, expected {_EXPECTED_SRC}")
 
 
-def _setup(*, curved: bool, natoms: int = 1) -> VNLSetup:
+def _setup(
+    *, curved: bool, natoms: int = 1, third_derivatives: bool = False,
+) -> VNLSetup:
     dq = 0.002
     q = dq * np.arange(2501, dtype=np.float64)
     if curved:
@@ -68,6 +70,8 @@ def _setup(*, curved: bool, natoms: int = 1) -> VNLSetup:
         G_table=jnp.asarray(radial[None, :]),
         Gp_table=jnp.asarray(radial_prime[None, :]),
         Gpp_table=jnp.asarray(radial_second[None, :]),
+        Gppp_table=(jnp.zeros((1, q.size), dtype=jnp.float64)
+                    if third_derivatives else None),
         prefactor=0.67, B=B, cell_volume=1.0,
         total_R=natoms, nspinor=2, E_super=jnp.asarray(E_super), l_max=0,
         soc=True,
@@ -310,3 +314,86 @@ def test_icl_kminusq_taylor_ward_and_transfer_hermiticity():
     np.testing.assert_allclose(
         dgamma_mtx, np.swapaxes(np.conj(dgamma_mtx), -1, -2),
         rtol=2e-12, atol=2e-12)
+
+
+def test_icl_q2_physical_radial_third_derivative_and_operator_jet():
+    # Independent analytic l=0 Gaussian Hankel transform:
+    # int r^2 exp(-a r^2) j0(qr) dr = A exp(-q^2/(4a)).
+    a = 0.8
+    r = np.linspace(0.0, 8.0, 801)
+    dr = r[1] - r[0]
+    beta_over_r = np.exp(-a * r * r)[None, :]
+    species = SpeciesData(
+        element="H", z_valence=1.0, z_atomic=1, r=r,
+        rab=np.full_like(r, dr), vloc_r=np.zeros_like(r),
+        rho_core_r=np.zeros_like(r), has_nlcc=False, n_proj=1,
+        beta_r=beta_over_r, proj_l=np.asarray([0]),
+        proj_j=np.asarray([0.5]), dij=np.ones((1, 1)), nspinor=1)
+    tables = radial_tables.build_all_tables(
+        [species], q_max=0.6, n_q=61,
+        second_derivatives=True, third_derivatives=True)
+    q = tables["q"]
+    amplitude = np.sqrt(np.pi) / (4.0 * a ** 1.5)
+    expected_gppp = amplitude * np.exp(-q * q / (4.0 * a)) * (
+        3.0 * q / (4.0 * a * a) - q**3 / (8.0 * a**3))
+    np.testing.assert_allclose(
+        tables["third_deriv_tables"][0][0], expected_gppp,
+        rtol=3e-12, atol=3e-13)
+    assert tables["third_deriv_tables"][0][0, 0] == 0.0
+
+    # Full separable VNL third derivative, through the same bounded
+    # coefficient scan, against a centered derivative of the incumbent
+    # analytic contact action.
+    setup = _setup(curved=False, third_derivatives=True)
+    psi = _states()
+    G = jnp.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
+    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
+    k = np.asarray([0.19, -0.17, 0.12])
+    Binv = np.linalg.inv(setup.B)
+    jet = apply_icl_vnl_transfer_jet_to_ket(
+        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2,
+        include_q2=True)
+    third = 3.0 * np.asarray(jet.d2gamma_dq2_cart_ket)
+    h = 2.0e-4
+    third_fd = np.zeros_like(third)
+    for c in range(3):
+        dc = np.zeros(3)
+        dc[c] = h
+        plus = apply_uniform_vnl_derivatives_to_ket(
+            psi, G, k + dc @ Binv, setup, mask,
+            projector_row_chunk=1, g_chunk=2).lambda_cart_ket
+        minus = apply_uniform_vnl_derivatives_to_ket(
+            psi, G, k - dc @ Binv, setup, mask,
+            projector_row_chunk=1, g_chunk=2).lambda_cart_ket
+        third_fd[:, :, c] = (np.asarray(plus) - np.asarray(minus)) / (2.0 * h)
+    np.testing.assert_allclose(third, third_fd, rtol=3e-7, atol=3e-7)
+
+    # The retained q2 ICL Taylor jet obeys q.Gamma=V(k)-V(k-q) with a
+    # quartic remainder, and its third Hamiltonian derivative is Hermitian.
+    gamma0 = np.asarray(jet.gamma0_cart_ket)
+    dgamma = np.asarray(jet.dgamma_dq_cart_ket)
+    d2gamma = np.asarray(jet.d2gamma_dq2_cart_ket)
+    direction = np.asarray([0.31, -0.47, 0.29])
+
+    def ward_error(step):
+        qv = step * direction
+        gamma_q = (
+            gamma0
+            + np.einsum("b,abnsg->ansg", qv, dgamma)
+            + 0.5 * np.einsum("b,c,abcnsg->ansg", qv, qv, d2gamma))
+        lhs = np.einsum("a,ansg->nsg", qv, gamma_q)
+        rhs = (
+            _ordinary_vnl_action(psi, G, mask, k, setup)
+            - _ordinary_vnl_action(
+                psi, G, mask, k - qv @ Binv, setup))
+        return np.linalg.norm(lhs - rhs)
+
+    err_big = ward_error(4.0e-3)
+    err_small = ward_error(2.0e-3)
+    assert err_small < 0.07 * err_big  # quartic remainder: ideal ratio 1/16
+
+    bra = np.conj(np.asarray(psi) * mask[None, None, :])
+    d2gamma_mtx = np.einsum("msg,abcnsg->abcmn", bra, d2gamma)
+    np.testing.assert_allclose(
+        d2gamma_mtx, np.swapaxes(np.conj(d2gamma_mtx), -1, -2),
+        rtol=3e-11, atol=3e-11)
