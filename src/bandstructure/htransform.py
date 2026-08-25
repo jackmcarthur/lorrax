@@ -177,13 +177,28 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # and state materialised between planning and the first streamed slab.
     from common.gpu_utils import get_device_memory_info
     memory = get_device_memory_info()
-    device_fit_budget = float(memory["budget_gb"]) * 1.0e9
+    local_fit_budget = int(float(memory["budget_gb"]) * 1.0e9)
+    # The carrier and r-chunk extents are shared static control flow.  BFC
+    # residency is rank-local and asynchronous, so one rank choosing from its
+    # own larger budget can send its peers into a different compile/loop
+    # schedule.  Resolve one worst-rank budget through the process-collective
+    # service before planning any static extent.
+    from common.collectives import all_gather_processes
+    process_budgets = np.asarray(
+        all_gather_processes(np.asarray(local_fit_budget, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if process_budgets.size == 0 or np.any(process_budgets <= 0):
+        raise RuntimeError(
+            "htransform live-capacity gather returned no positive budget")
+    device_fit_budget = float(np.min(process_budgets))
     log_fn(
         "  Whole-state live fit budget: "
         f"{device_fit_budget/2**30:.2f} GiB/device from "
+        f"worst-rank reserve (this rank {local_fit_budget/2**30:.2f} GiB; "
         f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
         f"({memory['source']}); the allocator limit is not reusable "
-        "capacity while earlier driver state remains live")
+        "capacity while earlier driver state remains live)")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,
