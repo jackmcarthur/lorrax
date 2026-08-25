@@ -41,6 +41,70 @@ from harness import gpu_available, requested_platform  # noqa: E402
 G2_REF = _REG / "sigma_ppm_gates" / "g2_branch_window_ref.npz"
 
 
+def test_crossing_core_rescales_the_physical_error_contract(monkeypatch):
+    """The HGL service request and certificate follow the same xi scaling.
+
+    This uses a non-unit regularization width so an omitted conversion cannot
+    pass by coincidence.  The explicit sine values also prove that the
+    incumbent ``tau/xi, alpha/xi`` rule represents ``G(x/xi)/xi``; no solver
+    or random fixture is involved.
+    """
+    from gw import ppm_windows
+    from gw.minimax_screening import CrossingMinimaxQuadrature
+
+    xi = 2.5
+    target_error_phys = 4.0e-7
+    tau_hat = np.array([0.5, 1.5], dtype=np.float64)
+    alpha_hat = np.array([0.2, -0.1], dtype=np.float64)
+    error_hat = 5.0e-7
+    seen = {}
+
+    def _served(A_dim, **kwargs):
+        seen.update(A_dim=A_dim, **kwargs)
+        return CrossingMinimaxQuadrature(
+            A_dim=float(A_dim), tau=tau_hat, alpha=alpha_hat,
+            max_error=error_hat, target_kind="hgl",
+            provenance="deterministic scaling fixture")
+
+    monkeypatch.setattr(ppm_windows, "solve_phase_minimax_bandwidth", _served)
+    windows = ppm_windows._build_three_sigma_windows(
+        E_A=np.array([0.2], dtype=np.float64),
+        base_mask_A=np.array([True]),
+        mask_B_all_count=1,
+        mask_B_le_count=1,
+        mask_B_le_min=0.4,
+        mask_B_le_max=0.4,
+        mask_B_gt_count=0,
+        mask_B_gt_min=None,
+        mask_B_gt_max=None,
+        omega_nonneg_ry=np.array([0.3], dtype=np.float64),
+        neg_omega_half=False,
+        regularization_width_ry=xi,
+        edge_factor=1.5,
+        target_error=target_error_phys,
+        max_nodes=64,
+        crossing_eps_q=1.0e-3,
+        crossing_max_nodes=500,
+        use_shipped_tables=True,
+    )
+
+    assert [window.name for window in windows] == ["core"]
+    core = windows[0]
+    assert seen["target_error"] == target_error_phys * xi
+    assert core.max_error == error_hat / xi
+    np.testing.assert_allclose(np.asarray(core.nodes.t).real, tau_hat / xi)
+    np.testing.assert_allclose(np.asarray(core.nodes.alpha).real, alpha_hat / xi)
+
+    u = np.array([0.0, 0.25, 0.75, 1.5], dtype=np.float64)
+    x = xi * u
+    fitted_hat = np.sin(np.outer(u, tau_hat)) @ alpha_hat
+    fitted_phys = (
+        np.sin(np.outer(x, np.asarray(core.nodes.t).real))
+        @ np.asarray(core.nodes.alpha).real
+    )
+    np.testing.assert_allclose(fitted_phys, fitted_hat / xi, rtol=1.0e-14)
+
+
 def _build_branch_windows():
     """Build the 4 branches × their windows from controlled synthetic inputs.
 
