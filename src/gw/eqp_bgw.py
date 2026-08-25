@@ -682,10 +682,16 @@ class EqpAssembly:
 	hartree_diag_ev: np.ndarray          # post-seam: the V_H actually used
 	sigma_x_diag_ev: np.ndarray
 	sigma_c_at_dft_diag_ev: np.ndarray
+	#: The exact output-conditioned diagonal curve used to derive both
+	#: ``sigma_c_at_dft_diag_ev`` and ``z_factor``.  The persisted full
+	#: operator cube remains raw; this smaller curve is an assembly operand.
+	sigma_c_omega_diag_ev: np.ndarray | None
 	z_factor: np.ndarray | None
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
 	nspin: int = 1
+	hartree_source: str | None = None
+	kin_ion_has_hartree: bool = False
 	#: Where eqp1 was linearized, when that was not E_DFT (self-consistent
 	#: runs).  None on every one-shot path, where it IS E_DFT.
 	e_eval_ev: np.ndarray | None = None
@@ -739,7 +745,9 @@ def assemble_eqp(
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
-	3. Σ_c at E_DFT — always, it is what eqp0 means — and, when the
+	3. for a dynamic run, derive both Σ_c(E_DFT) and Z from the SAME
+	   output-conditioned diagonal C(omega) curve; for a static run, consume
+	   the supplied Σ_c diagonal.  When the
 	   caller says the Σ spectrum was evaluated somewhere else
 	   (``e_eval_ev``), a SECOND interpolation and central-difference
 	   Z there, which is where eqp1 is linearized
@@ -809,8 +817,11 @@ def assemble_eqp(
 		if omega_rel_ev is None or e_dft_rel_ev is None:
 			raise ValueError(
 				"sigma_c_omega_diag_ev requires omega_rel_ev and e_dft_rel_ev")
-		# Re-derive σ_c at E_DFT from the full ω-grid for self-consistency
-		# with the Z-factor central difference.
+		if sigma_c_at_dft_diag_ev is not None:
+			raise ValueError(
+				"dynamic assemble_eqp derives both C(E_DFT) and Z from its one "
+				"sigma_c_omega_diag_ev curve; a second C(E_DFT) operand would "
+				"duplicate the correlation producer.")
 		sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
 			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 			omega_rel_ev=omega_rel_ev,
@@ -820,8 +831,8 @@ def assemble_eqp(
 		# THE SECOND CENTRE, and only when it is a different one.  The
 		# equality test is what keeps every one-shot run — where the Σ
 		# spectrum IS evaluated at E_DFT, so the caller passes the same
-		# numbers — on exactly the code above, hence bit-for-bit on the
-		# historical answer.  It is an ``array_equal``, not a tolerance:
+		# numbers — on the single-centre code above.  It is an
+		# ``array_equal``, not a tolerance:
 		# these arrays are either literally the same energies or a
 		# different spectrum.
 		if e_eval_rel_ev is not None and not np.array_equal(
@@ -862,10 +873,15 @@ def assemble_eqp(
 		hartree_diag_ev=hartree_used,
 		sigma_x_diag_ev=sigma_x_diag_ev,
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
+		sigma_c_omega_diag_ev=(
+			None if sigma_c_omega_diag_ev is None
+			else np.asarray(sigma_c_omega_diag_ev, dtype=np.complex128)),
 		z_factor=z_factor,
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
 		nspin=int(nspin),
+		hartree_source=hartree_source,
+		kin_ion_has_hartree=bool(kin_ion_has_hartree),
 		e_eval_ev=(None if e_eval_ev is None
 		           else np.asarray(e_eval_ev, dtype=np.float64)),
 	)
@@ -915,67 +931,6 @@ def write_eqp_bgw_pair(
 	write_bgw_eqp(eqp1_path, kpoints_irr_frac, e_dft_ev, eqp1_ev,
 	              band_offset=band_offset, nspin=nspin)
 	return eqp0_path, eqp1_path
-
-
-# ---------------------------------------------------------------------------
-# In-memory entry point — used by the standard ``gw_output.write_results``
-# path during a live gw_jax run (avoids re-reading sigma_mnk.h5 from disk).
-# ---------------------------------------------------------------------------
-
-def write_eqp_bgw_in_memory(
-	*,
-	eqp0_path: str,
-	eqp1_path: str,
-	kpoints_irr_frac: np.ndarray,
-	band_offset: int,
-	e_dft_ev: np.ndarray,                                  # (nk, nb)
-	kin_ion_diag_ev: np.ndarray,                           # (nk, nb)
-	hartree_diag_ev: np.ndarray,                           # (nk, nb)
-	sigma_x_diag_ev: np.ndarray,                           # (nk, nb)
-	sigma_c_at_dft_diag_ev: np.ndarray,                    # (nk, nb)
-	# Optional: full ω-grid for the Z-factor (PPM modes only).
-	# If None ⇒ Z=1 ⇒ eqp1 == eqp0 (BGW behavior in static modes).
-	sigma_c_omega_diag_ev: np.ndarray | None = None,       # (n_omega, nk, nb)
-	omega_rel_ev: np.ndarray | None = None,                # (n_omega,)
-	e_dft_rel_ev: np.ndarray | None = None,                # (nk, nb), required if dynamic
-	dE_ev: float = 0.5,
-	nspin: int = 1,
-	hartree_source: str | None = None,
-	kin_ion_has_hartree: bool = False,
-	exact_hartree_diag_ev: np.ndarray | None = None,
-	print_fn=print,
-) -> tuple[str, str]:
-	"""Compute and write BGW-format ``eqp0.dat`` / ``eqp1.dat`` from in-memory arrays.
-
-	Parallel of :func:`make_eqp_bgw` (the post-hoc CLI orchestrator) for the
-	live gw_jax write path: the caller already has ``Σ_x``, ``V_H``,
-	``kin_ion``, ``E_DFT`` in memory, so reloading them from disk would be
-	wasteful.  **Both entry points are now the same two calls** —
-	:func:`assemble_eqp` then :meth:`EqpAssembly.write` — so the V_H seam,
-	the mean-field gate, the Z-factor and the formatter each exist once.
-
-	``hartree_diag_ev`` is handed in PRE-seam (i.e. whatever the Σ side
-	produced); the seam decides whether it is suppressed, substituted or
-	used as given.
-	"""
-	return assemble_eqp(
-		kpoints_irr_frac=kpoints_irr_frac,
-		band_offset=band_offset,
-		e_dft_ev=e_dft_ev,
-		kin_ion_diag_ev=kin_ion_diag_ev,
-		hartree_diag_ev=hartree_diag_ev,
-		sigma_x_diag_ev=sigma_x_diag_ev,
-		sigma_c_at_dft_diag_ev=sigma_c_at_dft_diag_ev,
-		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
-		omega_rel_ev=omega_rel_ev,
-		e_dft_rel_ev=e_dft_rel_ev,
-		dE_ev=dE_ev,
-		nspin=nspin,
-		hartree_source=hartree_source,
-		kin_ion_has_hartree=kin_ion_has_hartree,
-		exact_hartree_diag_ev=exact_hartree_diag_ev,
-		print_fn=print_fn,
-	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 
 #: Occupations this far from an integer are FRACTIONAL, i.e. a smeared
