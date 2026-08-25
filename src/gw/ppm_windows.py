@@ -68,12 +68,11 @@ from .minimax_screening import (
 #  enough to force an ill-conditioned crossing; a narrow grid keeps the user's ξ.
 _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3 below)
 
-#: A sign-definite inverse-Laplace pane may span at most eight binary octaves
-#: in its denominator, ``x_max/x_min <= 2**8``.  The minimax service remains
-#: the authority on whether a concrete request is served: every pane still
-#: goes through ``solve_laplace_minimax_interval`` and refuses there if
-#: unsupported.  This range-cost ceiling neither blesses a table nor changes
-#: a pole, and is independent of the caller's node budget.
+#: A reducible sign-definite inverse-Laplace pane may span at most eight binary
+#: octaves in its denominator, ``x_max/x_min <= 2**8``.  A zero-width Ω pane
+#: can retain a larger irreducible E/ω floor; the minimax service then refuses
+#: that physical request canonically.  This ceiling neither blesses a table
+#: nor changes a pole, and is independent of the caller's node budget.
 _SIGN_DEFINITE_PANE_MAX_RANGE = 2.0 ** 8
 
 
@@ -862,6 +861,22 @@ def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:
 #  Minimax window construction
 # ---------------------------------------------------------------------------
 
+def _sign_definite_support(
+    E_min: float,
+    E_max: float,
+    B_min: float,
+    B_max: float,
+    omega_max: float,
+) -> tuple[float, float]:
+    """Exact denominator interval for one sign-definite ``ω + E + Ω`` pane."""
+    x_min = max(float(E_min) + float(B_min), 1.0e-12)
+    x_max = max(
+        float(E_max) + float(B_max) + float(omega_max),
+        x_min * (1.0 + 1.0e-9),
+    )
+    return x_min, x_max
+
+
 def _build_single_sigma_window(
     *,
     E_A: np.ndarray,
@@ -889,11 +904,13 @@ def _build_single_sigma_window(
             continue
         S_min = float(np.min(A_vals) + B_min)
         S_max = float(np.max(A_vals) + B_max)
-        x_min = max(S_min, 1.0e-12)
-        x_max = max(
-            S_max if denom_can_cross else S_max + omega_max,
-            x_min * (1.0 + 1.0e-9),
-        )
+        if denom_can_cross:
+            x_min = max(S_min, 1.0e-12)
+            x_max = max(S_max, x_min * (1.0 + 1.0e-9))
+        else:
+            x_min, x_max = _sign_definite_support(
+                float(np.min(A_vals)), float(np.max(A_vals)),
+                B_min, B_max, omega_max)
         q = solve_laplace_minimax_interval(
             x_min, x_max,
             target_error=target_error,
@@ -955,9 +972,8 @@ def _plan_sign_definite_omega_panes(
     panes: list[tuple[float, float, int, float, float]] = []
     while pending:
         lo, hi, count, B_min, B_max = pending.pop()
-        x_min = max(float(E_min) + B_min, 1.0e-12)
-        x_max = max(float(E_max) + B_max + float(omega_max),
-                    x_min * (1.0 + 1.0e-9))
+        x_min, x_max = _sign_definite_support(
+            E_min, E_max, B_min, B_max, omega_max)
         if (x_max / x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE
                 or B_min >= B_max):
             panes.append((lo, hi, count, B_min, B_max))

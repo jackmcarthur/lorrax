@@ -368,6 +368,15 @@ def nearest_below(
 _HASH_CACHE: dict[str, str] = {}
 
 
+def payload_sha256(tau: np.ndarray, alpha: np.ndarray) -> str:
+    """SHA-256 over the canonical little-endian numerical payload bytes."""
+    digest = hashlib.sha256()
+    digest.update(np.asarray(tau, dtype="<f8").tobytes())
+    alpha_dtype = "<c16" if np.iscomplexobj(alpha) else "<f8"
+    digest.update(np.asarray(alpha, dtype=alpha_dtype).tobytes())
+    return digest.hexdigest()
+
+
 def _sha256_of(path) -> str:
     key = str(path)
     cached = _HASH_CACHE.get(key)
@@ -423,6 +432,14 @@ def load_table(entry: CatalogEntry) -> tuple[np.ndarray, np.ndarray, float,
         # keeping that cast keeps the served bytes identical.  The strip
         # families ship complex128 alpha and must NOT be flattened to real.
         alpha = np.asarray(alpha, dtype=np.float64)
+    expected_payload = entry.raw.get("payload_sha256")
+    if expected_payload is not None:
+        actual_payload = payload_sha256(tau, alpha)
+        if str(expected_payload) != actual_payload:
+            raise TableUnreadable(
+                f"minimax: shipped table {entry.file!r} payload SHA-256 "
+                f"is {actual_payload}, but catalog {entry.catalog_name!r} "
+                f"entry {entry.index} stamps {expected_payload!r}.")
     if entry.kappa0 is not None:
         kappa0 = entry.kappa0
     return tau, alpha, err, kappa0, table_hash
@@ -438,7 +455,13 @@ def provenance_for(entry: CatalogEntry, table_hash: str,
     bundle, and printing it on every serve is what makes WP6's absence
     visible in a log instead of only in a design document.
     """
-    prov = (catalog_raw or {}).get("provenance") or {}
+    entry_prov = entry.raw.get("provenance")
+    if entry_prov is not None and not isinstance(entry_prov, Mapping):
+        raise CatalogCorrupt(
+            f"minimax: catalog {entry.catalog_name!r} entry {entry.index} "
+            f"has non-object provenance {entry_prov!r}.")
+    prov = (entry_prov if entry_prov is not None
+            else (catalog_raw or {}).get("provenance") or {})
     tool = prov.get("tool")
     commit = prov.get("generator_commit") or prov.get("tool_sha256")
     if commit and tool:
@@ -451,6 +474,8 @@ def provenance_for(entry: CatalogEntry, table_hash: str,
         f"numpy-{prov['numpy']}" if "numpy" in prov else None,
         f"scipy-{prov['scipy']}" if "scipy" in prov else None,
         f"python-{prov['python']}" if "python" in prov else None,
+        f"id-{str(prov['backend_sha256'])[:12]}"
+        if "backend_sha256" in prov else None,
     ) if b]
     backend = ("cpu:" + "/".join(backend_bits) if backend_bits
                else "unrecorded (catalog schema v1)")
