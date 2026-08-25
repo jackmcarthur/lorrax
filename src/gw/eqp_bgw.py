@@ -1374,6 +1374,15 @@ def make_eqp_bgw(
 				f"{_receipt['sigma_x_diag_ev'].shape}, C(E_DFT) "
 				f"{_receipt['sigma_c_at_dft_diag_ev'].shape}; expected file-wedge "
 				f"shape {expect_shape}.")
+		if not np.array_equal(
+				_receipt["file_wedge_full_bz_rows"], kirr_to_kfull):
+			raise ValueError(
+				f"{os.path.basename(sigma_mnk_path)}'s EQP receipt names full-BZ "
+				f"rows {_receipt['file_wedge_full_bz_rows'].tolist()}, but "
+				f"{os.path.basename(qp_rotations_path)} requests file-wedge rows "
+				f"{kirr_to_kfull.tolist()}; refusing a shape-compatible k-row "
+				"permutation.  The raw cube's requested rows were independently "
+				"validated against its star table above.")
 		if _receipt["hartree_source"] != _src:
 			raise ValueError(
 				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "

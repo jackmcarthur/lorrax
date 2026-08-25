@@ -39,6 +39,7 @@ def _append(path, h, x, c=None, *, source="stored", c_basis="dft_band"):
         sigma_x_diag_ev=np.asarray(x, dtype=np.float64),
         sigma_c_at_dft_diag_ev=(
             np.zeros_like(h, dtype=np.complex128) if c is None else c),
+        file_wedge_full_bz_rows=np.arange(h.shape[0], dtype=np.int64),
         band_start=0,
         band_stop=2,
         degeneracy_policy="bgw_average",
@@ -146,6 +147,15 @@ def test_partial_new_receipt_refuses_instead_of_falling_back_to_legacy(tmp_path)
         read_eqp_assembly_receipt(path)
 
 
+def test_unreleased_v1_receipt_cannot_collide_with_v2_semantics(tmp_path):
+    path = _sigma_file(tmp_path / "sigma_mnk.h5")
+    _append(path, [[11.0, 11.0]], [[-3.0, -3.0]])
+    with h5py.File(path, "a") as h5:
+        h5.attrs[EQP_ASSEMBLY_EXPECTED_ATTR] = 1
+    with pytest.raises(ValueError, match="expectation .*1.*expected 2"):
+        read_eqp_assembly_receipt(path)
+
+
 def test_new_raw_cube_without_closed_receipt_refuses_as_interrupted(tmp_path):
     path = _sigma_file(tmp_path / "sigma_mnk.h5")
     with h5py.File(path, "a") as h5:
@@ -156,6 +166,16 @@ def test_new_raw_cube_without_closed_receipt_refuses_as_interrupted(tmp_path):
         read_eqp_assembly_receipt(path)
 
 
+def test_appender_refuses_new_raw_cube_missing_creation_marker(tmp_path):
+    path = _sigma_file(tmp_path / "sigma_mnk.h5")
+    with h5py.File(path, "a") as h5:
+        ds = h5["sigma_c_kij_ev"]
+        ds.attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+        ds.attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+    with pytest.raises(ValueError, match="raw-operator stamps.*creation marker"):
+        _append(path, [[11.0, 11.0]], [[-3.0, -3.0]])
+
+
 def test_receipt_validates_band_window_and_policy_before_writing(tmp_path):
     path = _sigma_file(tmp_path / "sigma_mnk.h5")
     with pytest.raises(ValueError, match="band window"):
@@ -164,6 +184,7 @@ def test_receipt_validates_band_window_and_policy_before_writing(tmp_path):
             hartree_diag_ev=np.zeros((1, 2)),
             sigma_x_diag_ev=np.zeros((1, 2)),
             sigma_c_at_dft_diag_ev=np.zeros((1, 2)),
+            file_wedge_full_bz_rows=np.array([0]),
             band_start=0,
             band_stop=3,
             degeneracy_policy="bgw_average",
@@ -178,6 +199,7 @@ def test_receipt_validates_band_window_and_policy_before_writing(tmp_path):
             hartree_diag_ev=np.zeros((1, 2)),
             sigma_x_diag_ev=np.zeros((1, 2)),
             sigma_c_at_dft_diag_ev=np.zeros((1, 2)),
+            file_wedge_full_bz_rows=np.array([0]),
             band_start=0,
             band_stop=2,
             degeneracy_policy="guess",
