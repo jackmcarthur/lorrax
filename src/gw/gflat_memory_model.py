@@ -499,7 +499,6 @@ def plan_gflat_chunks(
     gflat_chunk_size_override: int | None = None,
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
-    face_pair_density_slots: int | None = None,
     distributed_zeta_solve: str = "auto",
     low_mem_bands: bool = False,
 ) -> GFlatChunkPlan:
@@ -564,9 +563,7 @@ def plan_gflat_chunks(
         target_utilization = bfc_fragmentation_target_utilization(ns)
     slots = pair_density_slots if pair_density_slots is not None \
         else _pair_density_slots()
-    face_slots = (face_pair_density_slots
-                  if face_pair_density_slots is not None
-                  else _face_pair_density_slots())
+    face_slots = _face_pair_density_slots()
 
     budget = budget_gb * 1e9
     target = budget * target_utilization
