@@ -773,16 +773,28 @@ def read_qp_state_source_provenance(path) -> dict | None:
     return _validate_qp_state_source(record, path=str(path))
 
 
-def qp_state_source_provenance(wfn) -> dict:
-    """Describe the already-loaded WFN which supplied restart ``psi/E``."""
+def qp_state_source_provenance(
+        wfn, *, wfn_fingerprint_value: str | None = None) -> dict:
+    """Describe the already-loaded WFN which supplied restart ``psi/E``.
+
+    ``wfn_fingerprint_value`` lets an orchestration owner reuse the canonical
+    fingerprint it already computed for the same loaded WFN.  The default
+    remains self-contained; no second fingerprint implementation is added.
+    """
     from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
     source_path = getattr(wfn, "path", None)
     if not source_path:
         raise ValueError("QP restart provenance requires a path-bearing WFN")
+    fingerprint = (
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_value is None
+        else _require_wfn_fingerprint(
+            wfn_fingerprint_value,
+            where="QP restart provenance precomputed WFN fingerprint"))
     return {
         "schema": QP_STATE_SOURCE_SCHEMA,
         "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
-        "wfn_fingerprint": wfn_fingerprint(wfn),
+        "wfn_fingerprint": fingerprint,
         "qp_wfn_stamp": read_qp_wfn_stamp(source_path),
     }
 
@@ -813,7 +825,7 @@ def refuse_conflicting_qp_state_sources(
         *, wfn_path: str, eqp_file: str | None = None,
         qp_rotations_file: str | None = None,
         state_artifact_path: str | None = None,
-        where: str = "QP-state consumer") -> None:
+        where: str = "QP-state consumer") -> dict | None:
     """Refuse two explicit descriptions of one quasiparticle state.
 
     A positively stamped QP WFN already contains the matched rotated orbitals
@@ -833,6 +845,11 @@ def refuse_conflicting_qp_state_sources(
     content fingerprint is compared with the selected WFN.  A missing legacy
     restart record remains usable only without an external or positive QP
     description.
+
+    Return the already-read, authenticated restart source record when one is
+    present, otherwise ``None``.  Callers that only need the refusal may
+    ignore the return; orchestration owners can reuse it without reopening
+    the artifact after authentication.
     """
     if eqp_file and qp_rotations_file:
         raise ValueError(
@@ -844,6 +861,7 @@ def refuse_conflicting_qp_state_sources(
     external = eqp_file or qp_rotations_file
     wfn_stamp = read_qp_wfn_stamp(wfn_path)
     stamp = wfn_stamp
+    authenticated_restart_source = None
 
     if state_artifact_path is not None:
         provenance = read_qp_state_source_provenance(state_artifact_path)
@@ -877,11 +895,12 @@ def refuse_conflicting_qp_state_sources(
                 f"{where}: restart {state_artifact_path} has a torn QP-state "
                 f"record for {wfn_path}: its content fingerprint matches but "
                 "its QP-WFN stamp does not.")
+        authenticated_restart_source = provenance
 
     if not external:
-        return
+        return authenticated_restart_source
     if stamp is None:
-        return
+        return authenticated_restart_source
     requested = (f"diagonal eqp override {eqp_file}"
                  if eqp_file else
                  f"QP rotation artifact {qp_rotations_file}")

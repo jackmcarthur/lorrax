@@ -157,6 +157,7 @@ class WavefunctionBasisReceipt:
         cls,
         *,
         wfn,
+        wfn_fingerprint_value: str | None = None,
         role: str,
         bispinor: bool,
         band_interval,
@@ -165,7 +166,15 @@ class WavefunctionBasisReceipt:
         n_rmu_logical: int,
         n_rmu_padded: int,
     ) -> "WavefunctionBasisReceipt":
-        """Build the receipt from the canonical WFN/transform/hash owners."""
+        """Build the receipt from the canonical WFN/transform/hash owners.
+
+        ``wfn_fingerprint_value`` is only for host orchestration that already
+        evaluated :func:`common.parallel_transport.wfn_fingerprint` for this
+        exact ``wfn``.  The GW initializer uses it to share one bounded HDF5
+        fingerprint scan across the charge/transverse receipts (and the
+        restart provenance writer).  Omitting it preserves the self-contained
+        constructor used by standalone producers and tests.
+        """
         from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
         from common.parallel_transport import (
             WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
@@ -206,10 +215,14 @@ class WavefunctionBasisReceipt:
             raise ValueError(
                 "WavefunctionBasisReceipt centroid indices must lie inside "
                 f"fft_grid={grid}")
+        fingerprint = (
+            wfn_fingerprint(wfn)
+            if wfn_fingerprint_value is None
+            else str(wfn_fingerprint_value))
         return cls(
             role=str(role),
             wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME,
-            wfn_fingerprint=wfn_fingerprint(wfn),
+            wfn_fingerprint=fingerprint,
             band_interval=(start, stop),
             fft_grid=grid,
             centroid_fingerprint_scheme=CENTROID_TABLE_FINGERPRINT_SCHEME,
