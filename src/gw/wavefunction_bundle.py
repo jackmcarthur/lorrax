@@ -57,6 +57,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
 from runtime.padding import round_up, spec_divisor
 
 
@@ -201,14 +202,10 @@ PSI_XR_SPEC = P(None, None, None, 'x')   # (nk, n, s, μ_X)
 PSI_YR_SPEC = P(None, None, None, 'y')   # (nk, n, s, μ_Y)
 PSI_YN_SPEC = P(None, None, 'y', None)   # (nk, s, μ_Y, n)
 
-# ---------------------------------------------------------------------------
-# Sharding specs for the two FACE copies (``low_mem_bands = true``).  Both
-# 2-D sharded on the full (x, y) mesh; both un-conjugated.  See the module
-# docstring and reports/gwjax_low_mem_bands_audit_2026-08-22/report.md for
-# why these two orientations (not one, not a transpose of one another) are
-# the portable representation under a cuBLASMp N,N-only multi-rank GEMM.
-PSI_NMU_SPEC = P(None, 'x', None, 'y')   # (nk, n_X, s, μ_Y)
-PSI_MUN_SPEC = P(None, None, 'x', 'y')   # (nk, s, μ_X, n_Y)
+# The two FACE specs are imported from ``common.wfn_layout`` and re-exported
+# here for the established GW public API.  See the module docstring and
+# reports/gwjax_low_mem_bands_audit_2026-08-22/report.md for why both
+# orientations are required by cuBLASMp's portable N,N-only path.
 
 # ---------------------------------------------------------------------------
 # Sharding specs for the intermediate tensors that flow between chi0 / W /
