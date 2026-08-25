@@ -591,6 +591,42 @@ def _build_single_sigma_window(
     ]
 
 
+def _scaled_crossing_error_bound(
+    regularization_width_ry: float,
+    target_error: float,
+) -> float:
+    """Convert a physical HGL-kernel tolerance to dimensionless units.
+
+    The crossing service approximates a dimensionless target ``G(u)``.  The
+    Sigma consumer maps its rule to physical energy units with
+
+    ``t = tau_hat / xi`` and ``alpha = alpha_hat / xi``.
+
+    Hence an error ``eps_hat`` in the service rule becomes
+    ``eps_phys = eps_hat / xi``.  The service request must be
+    ``eps_hat <= eps_phys * xi``.  Reject invalid values rather than clipping
+    the tolerance, since a floor would silently loosen the public physical
+    contract.
+    """
+
+    xi = float(regularization_width_ry)
+    target_error = float(target_error)
+    if not np.isfinite(xi) or xi <= 0.0:
+        raise ValueError(
+            "regularization_width_ry must be finite and positive before "
+            f"crossing-rule rescaling; got {xi!r}.")
+    if not np.isfinite(target_error) or target_error <= 0.0:
+        raise ValueError(
+            "target_error must be a finite positive physical absolute "
+            f"tolerance; got {target_error!r}.")
+    scaled = target_error * xi
+    if not np.isfinite(scaled) or scaled <= 0.0:
+        raise ValueError(
+            "Scaled crossing tolerance is not representable: "
+            f"{target_error!r} * {xi!r} = {scaled!r}.")
+    return scaled
+
+
 def _build_three_sigma_windows(
     *,
     E_A: np.ndarray,
@@ -651,20 +687,23 @@ def _build_three_sigma_windows(
 
         if name == "core":
             A_core = max(2.0 * T / xi, 1.0e-8)
+            target_error_hat = _scaled_crossing_error_bound(
+                xi, target_error)
             q_cross = solve_phase_minimax_bandwidth(
                 A_core,
-                target_error=target_error,
+                target_error=target_error_hat,
                 max_nodes=crossing_max_nodes,
                 eps_q=crossing_eps_q,
                 target_kind="hgl",
                 use_shipped_tables=use_shipped_tables,
             )
-            win_quad = q_cross
             raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
             # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
             nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
             project = "imag"
             prefactor = -1.0 * neg
+            max_error = float(q_cross.max_error) / xi
+            provenance = q_cross.provenance
         else:
             S_min = float(np.min(A_vals) + B_min)
             S_max = float(np.max(A_vals) + B_max)
@@ -676,10 +715,11 @@ def _build_three_sigma_windows(
                 max_nodes=max_nodes,
                 use_shipped_tables=use_shipped_tables,
             )
-            win_quad = q
             nodes = q.to_minimax_nodes(time_axis='imag')
             project = "full"
             prefactor = +1.0 * neg
+            max_error = float(q.max_error)
+            provenance = q.provenance
 
         windows.append(
             _SigmaWindow(
@@ -694,8 +734,8 @@ def _build_three_sigma_windows(
                 mask_B_mode=mask_B_mode,
                 mask_B_threshold=float(T),
                 crossing_kind="hgl" if name == "core" else None,
-                max_error=float(win_quad.max_error),
-                provenance=win_quad.provenance,
+                max_error=max_error,
+                provenance=provenance,
             )
         )
     return windows
