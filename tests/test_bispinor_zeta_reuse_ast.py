@@ -33,6 +33,11 @@ cheap to pin is the SHAPE of the code that job certified:
 6. The transverse ζ files get a provenance stamp.  Without it every
    bispinor rerun refits: rule 4 of ``_zeta_reuse_ok`` is "no
    provenance ⇒ refit", and the μ_L loop used to write none.
+
+7. Every freshly fit channel crosses the one incumbent deferred-finding
+   host seam before its provenance stamp.  Accepted channels cross neither:
+   pending rank/closure state must never leak from a transverse fit into a
+   later stage or authenticate an artifact before refusal.
 """
 from __future__ import annotations
 
@@ -223,6 +228,50 @@ def test_transverse_zeta_files_are_stamped():
         "rerun refits (no provenance ⇒ refit).")
     provs = _calls(fit_zeta, "_provenance_T")
     assert provs, "no per-vertex transverse provenance is built"
+
+
+def test_every_fresh_channel_gates_rank_findings_before_stamp():
+    _, gate = _function_tree("_gate_fresh_zeta_rank_findings")
+    assert len(_calls(gate, "raise_if_pending")) == 2, (
+        "the shared zeta host seam must invoke exactly the incumbent "
+        "spectral-closure and rank-policy dispositions")
+
+    _, fit_zeta = _fit_zeta_tree()
+    fits = sorted(_calls(fit_zeta, "fit_zeta_to_h5"), key=lambda n: n.lineno)
+    gates = sorted(_calls(fit_zeta, "_gate_fresh_zeta_rank_findings"),
+                   key=lambda n: n.lineno)
+    stamps = sorted(_calls(fit_zeta, "stamp_fit_provenance"),
+                    key=lambda n: n.lineno)
+    assert len(fits) == len(gates) == len(stamps) == 2, (
+        "charge and transverse must each have one fit, one shared gate, "
+        "and one provenance-stamp source site")
+    assert fits[0].lineno < gates[0].lineno < stamps[0].lineno, (
+        "fresh charge does not cross the rank-finding seam before stamping")
+
+    charge_gate_guards = [
+        n for n in ast.walk(fit_zeta)
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "not _reuse_charge"
+        and any(x is gates[0] for stmt in n.body for x in ast.walk(stmt))
+    ]
+    assert len(charge_gate_guards) == 1, (
+        "an accepted charge artifact can still enter the fresh-fit gate")
+
+    mu_loops = [
+        n for n in ast.walk(fit_zeta)
+        if isinstance(n, ast.For)
+        and ast.unparse(n.target) == "mu_L"
+        and any(x is fits[1] for x in ast.walk(n))
+    ]
+    assert len(mu_loops) == 1
+    loop = mu_loops[0]
+    skip = next(n for n in loop.body if isinstance(n, ast.If)
+                and ast.unparse(n.test) == "_reuse_T[mu_L - 1]")
+    assert (skip.lineno < fits[1].lineno < gates[1].lineno
+            < stamps[1].lineno), (
+        "transverse resume/fit/gate/stamp ordering is not fail-closed")
+    assert all(any(x is call for x in ast.walk(loop))
+               for call in (fits[1], gates[1], stamps[1]))
 
 
 if __name__ == "__main__":
