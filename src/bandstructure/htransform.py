@@ -742,17 +742,21 @@ def resolve_qp_hamiltonian_state(
             f"{expected_kpts[bad].tolist()} (periodic max|Delta k|="
             f"{worst_k:.3e}).")
 
-    # ``ctilde`` and ``enk_sigma`` are replicated by the Galerkin owner.
-    # Put the small companion arrays in the incumbent sharding rather than
-    # creating a second placement policy here.
+    # The Galerkin owner defines the compact state's global placement.  The
+    # energy table can still arrive on each process's local default device,
+    # so put it and both small QP companions in that incumbent placement
+    # before entering one multi-host JIT.
     state_sharding = ctilde.sharding
+    enk_dev = jax.device_put(
+        np.asarray(enk_sigma, dtype=np.dtype(enk_sigma.dtype)),
+        state_sharding)
     U_dev = jax.device_put(
         np.asarray(U, dtype=np.dtype(ctilde.dtype)), state_sharding)
     E_dev = jax.device_put(
         np.asarray(E, dtype=np.dtype(enk_sigma.dtype)),
-        enk_sigma.sharding)
+        state_sharding)
     ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
-        ctilde, enk_sigma, U_dev, E_dev, band_offset=q0 - fit0)
+        ctilde, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)
     say(
         f"  [QP state] {os.path.basename(path)}: full "
         f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); DFT block-identity "
