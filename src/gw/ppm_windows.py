@@ -70,9 +70,9 @@ _CROSSING_A_MAX = 24.0     # dimensionless bandwidth ceiling (Σ|α_hat| ~ 2–3
 
 #: A reducible sign-definite inverse-Laplace pane may span at most eight binary
 #: octaves in its denominator, ``x_max/x_min <= 2**8``.  A zero-width Ω pane
-#: can retain a larger irreducible E/ω floor; the minimax service then refuses
-#: that physical request canonically.  This ceiling neither blesses a table
-#: nor changes a pole, and is independent of the caller's node budget.
+#: continues over the existing E/ω selectors rather than sending an
+#: over-wide request to minimax.  This ceiling neither blesses a table nor
+#: changes a pole, and is independent of the caller's node budget.
 _SIGN_DEFINITE_PANE_MAX_RANGE = 2.0 ** 8
 
 
@@ -453,6 +453,33 @@ class HGLCrossingPlan:
     max_A_dim: float
     regularization_width_ry: float
     edge_factor: float
+
+
+@dataclass(frozen=True)
+class _SignDefiniteCell:
+    """One exact ``A x Omega x omega`` cell served by a Laplace rule.
+
+    All three selectors reuse metadata already consumed by the canonical
+    Sigma executor: ``(E_lo,E_hi]`` by ``build_G_tau``, ``(B_lo,B_hi]`` by
+    ``_build_W_t_q``, and explicit evaluation-frequency indices by the
+    accumulator.  ``x_min/x_max`` are the actual extrema of the cell, not a
+    requested catalog tier.
+    """
+
+    E_lo: float
+    E_hi: float
+    E_min: float
+    E_max: float
+    B_lo: float
+    B_hi: float
+    B_count: int
+    B_min: float
+    B_max: float
+    omega_indices: np.ndarray
+    omega_min: float
+    omega_max: float
+    x_min: float
+    x_max: float
 
 
 def _energy_panes(values: np.ndarray, max_span_ry: float):
@@ -893,6 +920,52 @@ def _sign_definite_support(
     return x_min, x_max
 
 
+def _oriented_sign_definite_support(
+    E_min: float,
+    E_max: float,
+    B_min: float,
+    B_max: float,
+    omega_min: float,
+    omega_max: float,
+    orientation: str,
+) -> tuple[float, float]:
+    """Actual positive support for one of the three Sigma Laplace forms."""
+    if orientation == "E+B+omega":
+        raw_min = float(E_min) + float(B_min) + float(omega_min)
+        raw_max = float(E_max) + float(B_max) + float(omega_max)
+    elif orientation == "E+B-omega":
+        raw_min = float(E_min) + float(B_min) - float(omega_max)
+        raw_max = float(E_max) + float(B_max) - float(omega_min)
+    elif orientation == "omega-E-B":
+        raw_min = float(omega_min) - float(E_max) - float(B_max)
+        raw_max = float(omega_max) - float(E_min) - float(B_min)
+    else:
+        raise ValueError(f"Unknown sign-definite orientation {orientation!r}")
+    if raw_min <= 0.0 or raw_max < raw_min:
+        raise AssertionError(
+            f"GATE sign_definite_support: {orientation} is not strictly "
+            f"positive on [{raw_min:.16g}, {raw_max:.16g}]")
+    return raw_min, raw_max
+
+
+def _assert_bounded_laplace_support(x_min: float, x_max: float) -> None:
+    """Fail closed before an unpartitioned Sigma range reaches minimax."""
+    if (not np.isfinite(x_min) or not np.isfinite(x_max)
+            or float(x_min) <= 0.0 or float(x_max) < float(x_min)):
+        raise AssertionError(
+            "GATE sign_definite_partition: invalid Laplace support reached "
+            f"the minimax door ([{float(x_min):.16g}, "
+            f"{float(x_max):.16g}])")
+    R = float(x_max) / float(x_min)
+    limit = _SIGN_DEFINITE_PANE_MAX_RANGE * (
+        1.0 + 8.0 * np.finfo(np.float64).eps)
+    if R > limit:
+        raise AssertionError(
+            "GATE sign_definite_partition: unbounded Laplace cell reached "
+            f"the minimax door (R={R:.16g} > "
+            f"{_SIGN_DEFINITE_PANE_MAX_RANGE:.16g})")
+
+
 def _build_single_sigma_window(
     *,
     E_A: np.ndarray,
@@ -906,27 +979,44 @@ def _build_single_sigma_window(
     target_error: float,
     max_nodes: int,
     use_shipped_tables: bool,
-    omega_panes: list[tuple[float, float, int, float, float]] | None = None,
+    sign_definite_cells: list[_SignDefiniteCell] | None = None,
 ) -> list[_SigmaWindow]:
     A_vals = E_A[base_mask_A]
     if A_vals.size == 0 or mask_B_count == 0 or mask_B_min is None or mask_B_max is None:
         return []
     omega_max = float(np.max(omega_nonneg_ry)) if omega_nonneg_ry.size else 0.0
-    panes = (omega_panes if omega_panes is not None else
-             [(-np.inf, np.inf, mask_B_count, mask_B_min, mask_B_max)])
+    panes = ([
+            (cell.B_lo, cell.B_hi, cell.B_count, cell.B_min, cell.B_max)
+            for cell in sign_definite_cells
+        ] if sign_definite_cells is not None else
+        [(-np.inf, np.inf, mask_B_count, mask_B_min, mask_B_max)])
     windows: list[_SigmaWindow] = []
     for pane_idx, (B_lo, B_hi, count_B, B_min, B_max) in enumerate(panes):
         if count_B == 0:
             continue
-        S_min = float(np.min(A_vals) + B_min)
-        S_max = float(np.max(A_vals) + B_max)
-        if denom_can_cross:
-            x_min = max(S_min, 1.0e-12)
-            x_max = max(S_max, x_min * (1.0 + 1.0e-9))
+        cell = (None if sign_definite_cells is None
+                else sign_definite_cells[pane_idx])
+        if cell is not None:
+            x_min, x_max = cell.x_min, cell.x_max
+            E_ref_A = cell.E_min
+            E_lo = None if np.isneginf(cell.E_lo) else cell.E_lo
+            E_hi = None if np.isposinf(cell.E_hi) else cell.E_hi
+            omega_indices = (
+                None if cell.omega_indices.size == omega_nonneg_ry.size
+                else cell.omega_indices)
         else:
-            x_min, x_max = _sign_definite_support(
-                float(np.min(A_vals)), float(np.max(A_vals)),
-                B_min, B_max, omega_max)
+            S_min = float(np.min(A_vals) + B_min)
+            S_max = float(np.max(A_vals) + B_max)
+            if denom_can_cross:
+                x_min = max(S_min, 1.0e-12)
+                x_max = max(S_max, x_min * (1.0 + 1.0e-9))
+            else:
+                x_min, x_max = _sign_definite_support(
+                    float(np.min(A_vals)), float(np.max(A_vals)),
+                    B_min, B_max, omega_max)
+            E_ref_A = float(np.min(A_vals))
+            E_lo = E_hi = omega_indices = None
+        _assert_bounded_laplace_support(x_min, x_max)
         q = solve_laplace_minimax_interval(
             x_min, x_max,
             target_error=target_error,
@@ -941,7 +1031,7 @@ def _build_single_sigma_window(
             name="single" if one_pane else f"single_pane_{pane_idx}",
             nodes=q.to_minimax_nodes(time_axis='imag'),
             mask_A=np.asarray(base_mask_A, dtype=bool),
-            E_ref_A=float(np.min(A_vals)),
+            E_ref_A=float(E_ref_A),
             E_ref_B=float(B_min),
             omega_sign=omega_sign,
             project="full",
@@ -951,6 +1041,9 @@ def _build_single_sigma_window(
             provenance=q.provenance,
             B_lo=None if one_pane else float(B_lo),
             B_hi=None if one_pane else float(B_hi),
+            E_min=E_lo,
+            E_max=E_hi,
+            omega_indices=omega_indices,
         ))
     return windows
 
@@ -966,18 +1059,18 @@ def _plan_sign_definite_omega_panes(
     E_max: float,
     omega_max: float,
     omega_min: float = 0.0,
-    subtract_omega: bool = False,
+    orientation: str = "E+B+omega",
     support_lo: float = -np.inf,
     support_hi: float = np.inf,
-    x_min_floor: float = 1.0e-12,
 ) -> list[tuple[float, float, int, float, float]]:
     """Make exact scalar Ω panes when one sign-definite range is costly.
 
-    Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  Each pane
-    is recursively bounded to eight binary octaves, independent of the
-    minimax catalog and node budget; the canonical builder then serves or
-    refuses the resulting physical requests exactly once.  Each split
-    equalises the two continuous-support child range bounds.
+    Inverse-Laplace range cost is logarithmic in ``R=x_max/x_min``.  A
+    non-singleton pane is recursively bounded to eight binary octaves,
+    independent of the minimax catalog and node budget; a singleton is handed
+    to :func:`_plan_sign_definite_cells` for exact E/evaluation-omega
+    continuation.  The two ``E+B`` forms use the balanced continuous-support
+    cut; the reversed HGL flank uses its exact midpoint cut.
 
     Splits use the existing ``(lo, hi]`` convention and scalar reduction.  No
     pole-sized host array or retained mask is formed.  Count conservation
@@ -993,28 +1086,40 @@ def _plan_sign_definite_omega_panes(
     panes: list[tuple[float, float, int, float, float]] = []
     while pending:
         lo, hi, count, B_min, B_max = pending.pop()
-        x_min, x_max = _sign_definite_support(
-            E_min, E_max, B_min, B_max, omega_max,
-            omega_min=omega_min, subtract_omega=subtract_omega,
-            x_min_floor=x_min_floor)
+        x_min, x_max = _oriented_sign_definite_support(
+            E_min, E_max, B_min, B_max, omega_min, omega_max,
+            orientation)
         if (x_max / x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE
                 or B_min >= B_max):
             panes.append((lo, hi, count, B_min, B_max))
             continue
 
-        if subtract_omega:
+        if orientation == "E+B-omega":
             a = float(E_min) - float(omega_max)
             C = float(E_max) - float(omega_min)
-        else:
+            disc = (a - C) ** 2 + 4.0 * (C + B_max) * (a + B_min)
+            threshold = 0.5 * (-(a + C) + np.sqrt(max(disc, 0.0)))
+        elif orientation == "E+B+omega":
             a = float(E_min) + float(omega_min)
             C = float(E_max) + float(omega_max)
-        disc = (a - C) ** 2 + 4.0 * (C + B_max) * (a + B_min)
-        threshold = 0.5 * (-(a + C) + np.sqrt(max(disc, 0.0)))
+            disc = (a - C) ** 2 + 4.0 * (C + B_max) * (a + B_min)
+            threshold = 0.5 * (-(a + C) + np.sqrt(max(disc, 0.0)))
+        elif orientation == "omega-E-B":
+            threshold = B_min + 0.5 * (B_max - B_min)
+        else:
+            raise ValueError(
+                f"Unknown sign-definite orientation {orientation!r}")
         threshold = max(float(np.nextafter(B_min, B_max)), threshold)
         threshold = min(float(np.nextafter(B_max, B_min)), threshold)
         if not B_min < threshold < B_max:
-            panes.append((lo, hi, count, B_min, B_max))
-            continue
+            # Adjacent finite floats have no representable interior.  The
+            # actual minimum is still a legal (lo,hi] boundary: it assigns all
+            # equal-min lanes left and every strictly larger lane right.
+            threshold = B_min
+        if not lo < threshold < hi:
+            raise AssertionError(
+                "GATE sign_definite_omega_partition: no legal strict cut "
+                f"inside support ({lo!r}, {hi!r}]")
 
         left = _masked_interval_stats_device(
             Omega_q, base_mask_B, lo, threshold)
@@ -1042,6 +1147,182 @@ def _plan_sign_definite_omega_panes(
             "GATE sign_definite_omega_partition: final panes do not own "
             "every live pole exactly once")
     return panes
+
+
+def _bisect_discrete_axis(
+    values: np.ndarray,
+    indices: np.ndarray,
+) -> tuple[float, tuple[tuple[np.ndarray, float, float], ...]]:
+    """Bisect one finite discrete support without losing repeated values."""
+    values = np.asarray(values, dtype=np.float64)
+    indices = np.asarray(indices, dtype=np.int64)
+    if not indices.size:
+        raise AssertionError("cannot bisect empty discrete support")
+    selected = values[indices]
+    value_min = float(np.min(selected))
+    value_max = float(np.max(selected))
+    if not value_min < value_max:
+        raise AssertionError("discrete-axis bisection needs nonzero support")
+    cut = value_min + 0.5 * (value_max - value_min)
+    cut = max(float(np.nextafter(value_min, value_max)), cut)
+    cut = min(float(np.nextafter(value_max, value_min)), cut)
+    if not value_min < cut < value_max:
+        # Adjacent finite floats have no representable interior; the actual
+        # minimum remains a legal ``(lo,hi]`` cut and keeps its repeats left.
+        cut = value_min
+    rows = []
+    for select in (selected <= cut, selected > cut):
+        child = indices[select]
+        if child.size:
+            child_values = values[child]
+            rows.append((child, float(np.min(child_values)),
+                         float(np.max(child_values))))
+    if (len(rows) != 2
+            or any(row[0].size >= indices.size for row in rows)):
+        raise AssertionError("discrete-axis bisection made no strict progress")
+    return cut, tuple(rows)
+
+
+def _plan_sign_definite_cells(
+    *,
+    E_A: np.ndarray,
+    base_mask_A: np.ndarray,
+    Omega_q: jax.Array,
+    base_mask_B: jax.Array,
+    mask_B_count: int,
+    mask_B_min: float,
+    mask_B_max: float,
+    omega_nonneg_ry: np.ndarray,
+    orientation: str,
+    support_B_lo: float = -np.inf,
+    support_B_hi: float = np.inf,
+    support_E_lo: float = -np.inf,
+    support_E_hi: float = np.inf,
+    omega_indices: np.ndarray | None = None,
+) -> list[_SignDefiniteCell]:
+    """Bound every exact sign-definite Sigma cell to eight octaves.
+
+    The incumbent Omega-pane owner is the first cut for the two ``E+B``
+    orientations.  A constant-Omega pane can still be wide because of its
+    band-energy or evaluation-frequency support, so this routine continues
+    that *same* exact partition over those already-supported scalar selectors.
+    The ``omega-E-B`` HGL flank uses the identical recursion, with midpoint
+    Omega cuts because its denominator orientation is reversed.
+
+    ``_energy_panes`` and ``_omega_clusters`` remain the one fixed-width
+    packing idiom for an HGL crossing shell.  This continuation is
+    ratio-adaptive instead: globally crossing those two covers would run every
+    energy pane against every frequency pane even where the denominator is
+    already cheap.  The shared discrete-axis bisection below therefore acts
+    only on a proved over-cap Cartesian cell and stops as soon as that cell is
+    bounded.
+
+    No pole, residue, energy, or evaluation point is changed.  Recursive
+    children are disjoint Cartesian cells, and terminal singleton support has
+    ``R=1``; therefore a finite discrete input must terminate with every
+    ``x_max/x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE``.
+    """
+    energies = np.asarray(E_A, dtype=np.float64)
+    base_A = np.asarray(base_mask_A, dtype=bool)
+    if energies.shape != base_A.shape:
+        raise ValueError("E_A and base_mask_A must have identical shapes")
+    selected_A = (base_A & (energies > float(support_E_lo))
+                  & (energies <= float(support_E_hi)))
+    A_vals = energies[selected_A]
+    omega = np.asarray(omega_nonneg_ry, dtype=np.float64)
+    idx_all = (np.arange(omega.size, dtype=np.int64)
+               if omega_indices is None
+               else np.asarray(omega_indices, dtype=np.int64))
+    if A_vals.size == 0 or int(mask_B_count) == 0 or idx_all.size == 0:
+        return []
+    if not np.all(np.isfinite(A_vals)) or not np.all(np.isfinite(omega[idx_all])):
+        raise ValueError("sign-definite support contains a non-finite scalar")
+
+    E_min0, E_max0 = float(np.min(A_vals)), float(np.max(A_vals))
+    w_min0 = float(np.min(omega[idx_all]))
+    w_max0 = float(np.max(omega[idx_all]))
+
+    B_panes = _plan_sign_definite_omega_panes(
+        Omega_q=Omega_q,
+        base_mask_B=base_mask_B,
+        mask_B_count=int(mask_B_count),
+        mask_B_min=float(mask_B_min),
+        mask_B_max=float(mask_B_max),
+        E_min=E_min0,
+        E_max=E_max0,
+        omega_min=w_min0,
+        omega_max=w_max0,
+        orientation=orientation,
+        support_lo=float(support_B_lo),
+        support_hi=float(support_B_hi),
+    )
+
+    pending = []
+    E_indices0 = np.arange(A_vals.size, dtype=np.int64)
+    for B_lo, B_hi, count_B, B_min, B_max in B_panes:
+        pending.append((
+            float(support_E_lo), float(support_E_hi), E_indices0,
+            E_min0, E_max0,
+            float(B_lo), float(B_hi), int(count_B), float(B_min), float(B_max),
+            np.asarray(idx_all, dtype=np.int64), w_min0, w_max0,
+        ))
+
+    cells: list[_SignDefiniteCell] = []
+    while pending:
+        (E_lo, E_hi, E_idx, E_min, E_max, B_lo, B_hi, count_B, B_min,
+         B_max, w_idx, w_min, w_max) = pending.pop()
+        x_min, x_max = _oriented_sign_definite_support(
+            E_min, E_max, B_min, B_max, w_min, w_max, orientation)
+        if x_max / x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE:
+            cells.append(_SignDefiniteCell(
+                E_lo, E_hi, E_min, E_max,
+                B_lo, B_hi, count_B, B_min, B_max,
+                np.asarray(w_idx, dtype=np.int64), w_min, w_max,
+                x_min, x_max))
+            continue
+
+        if B_min != B_max:
+            raise AssertionError(
+                "GATE sign_definite_partition: B owner returned an over-cap "
+                "non-singleton pane")
+
+        # Omega is already singleton here: the incumbent B planner only
+        # returns an over-cap pane when B_min == B_max.  Split whichever of
+        # the two remaining exact host axes contributes the larger width.
+        e_span = E_max - E_min
+        w_span = w_max - w_min
+        if e_span <= 0.0 and w_span <= 0.0:
+            raise AssertionError(
+                "GATE sign_definite_partition: singleton Cartesian support "
+                f"has irreducible range {x_max / x_min:.16g}")
+        if e_span >= w_span and e_span > 0.0:
+            cut, rows = _bisect_discrete_axis(A_vals, E_idx)
+            bounds = ((E_lo, cut), (cut, E_hi))
+            for (child_idx, child_min, child_max), (
+                    child_lo, child_hi) in reversed(tuple(zip(rows, bounds))):
+                pending.append((
+                    child_lo, child_hi, child_idx, child_min, child_max,
+                    B_lo, B_hi, count_B, B_min, B_max,
+                    w_idx, w_min, w_max))
+        else:
+            _cut, rows = _bisect_discrete_axis(omega, w_idx)
+            for child_idx, child_min, child_max in reversed(rows):
+                pending.append((
+                    E_lo, E_hi, E_idx, E_min, E_max,
+                    B_lo, B_hi, count_B, B_min, B_max,
+                    child_idx, child_min, child_max))
+
+    expected = int(A_vals.size) * int(mask_B_count) * int(idx_all.size)
+    owned = sum(
+        int(np.sum((A_vals > c.E_lo) & (A_vals <= c.E_hi)))
+        * int(c.B_count) * int(c.omega_indices.size)
+        for c in cells)
+    if owned != expected:
+        raise AssertionError(
+            "GATE sign_definite_partition: Cartesian ownership is not exact "
+            f"({owned} != {expected})")
+    cells.sort(key=lambda c: (int(c.omega_indices[0]), c.E_lo, c.B_lo))
+    return cells
 
 
 def _scaled_crossing_error_bound(
@@ -1100,7 +1381,7 @@ def _build_three_sigma_windows(
     crossing_eps_q: float,
     crossing_max_nodes: int,
     use_shipped_tables: bool,
-    b_slab_panes: list[tuple[float, float, int, float, float]] | None = None,
+    laplace_cells_by_name: dict[str, list[_SignDefiniteCell]] | None = None,
 ) -> list[_SigmaWindow]:
     # This is the crossing branch: the pole S can coincide with a grid ω, so
     # the denominator is ω̃ − S and ω enters the kernel as exp(+i·ω·τ)
@@ -1135,21 +1416,30 @@ def _build_three_sigma_windows(
         if not np.any(mA) or count_B == 0 or B_min is None or B_max is None:
             continue
 
-        pane_rows = (
-            b_slab_panes
-            if name == "b_slab" and b_slab_panes is not None
-            else [(None, None, count_B, B_min, B_max)]
-        )
+        cells = (None if laplace_cells_by_name is None
+                 else laplace_cells_by_name.get(name))
+        pane_rows = ([
+            (cell.B_lo, cell.B_hi, cell.B_count, cell.B_min, cell.B_max)
+            for cell in cells
+        ] if cells is not None else
+            [(None, None, count_B, B_min, B_max)])
         for pane_idx, (B_lo, B_hi, pane_count, pane_min, pane_max) in enumerate(
                 pane_rows):
             if pane_count == 0 or pane_min is None or pane_max is None:
                 continue
+            cell = None if cells is None else cells[pane_idx]
             A_vals = E_A[mA]
-            E_ref_A = float(np.min(A_vals))
+            E_ref_A = (float(np.min(A_vals)) if cell is None
+                       else float(cell.E_min))
             E_ref_B = float(pane_min)
 
             if name == "core":
                 A_core = max(2.0 * T / xi, 1.0e-8)
+                if A_core > _CROSSING_A_MAX * (
+                        1.0 + 8.0 * np.finfo(np.float64).eps):
+                    raise AssertionError(
+                        "GATE hgl_shell_capacity: unpartitioned HGL range "
+                        f"A={A_core:.16g} exceeds {_CROSSING_A_MAX:.16g}")
                 target_error_hat = _scaled_crossing_error_bound(
                     xi, target_error)
                 q_cross = solve_phase_minimax_bandwidth(
@@ -1168,10 +1458,14 @@ def _build_three_sigma_windows(
                 max_error = float(q_cross.max_error) / xi
                 provenance = q_cross.provenance
             else:
-                x_min, x_max = _sign_definite_support(
-                    float(np.min(A_vals)), float(np.max(A_vals)),
-                    float(pane_min), float(pane_max), omega_max,
-                    subtract_omega=True, x_min_floor=z_edge)
+                if cell is None:
+                    x_min, x_max = _sign_definite_support(
+                        float(np.min(A_vals)), float(np.max(A_vals)),
+                        float(pane_min), float(pane_max), omega_max,
+                        subtract_omega=True, x_min_floor=z_edge)
+                else:
+                    x_min, x_max = cell.x_min, cell.x_max
+                _assert_bounded_laplace_support(x_min, x_max)
                 q = solve_laplace_minimax_interval(
                     x_min, x_max,
                     target_error=target_error,
@@ -1185,6 +1479,13 @@ def _build_three_sigma_windows(
                 provenance = q.provenance
 
             many_panes = len(pane_rows) > 1
+            E_lo = (None if cell is None or np.isneginf(cell.E_lo)
+                    else cell.E_lo)
+            E_hi = (None if cell is None or np.isposinf(cell.E_hi)
+                    else cell.E_hi)
+            omega_indices = None
+            if cell is not None and cell.omega_indices.size != omega_nonneg_ry.size:
+                omega_indices = cell.omega_indices
             windows.append(
                 _SigmaWindow(
                     name=(f"{name}_pane_{pane_idx}"
@@ -1203,6 +1504,9 @@ def _build_three_sigma_windows(
                     provenance=provenance,
                     B_lo=float(B_lo) if many_panes else None,
                     B_hi=float(B_hi) if many_panes else None,
+                    E_min=E_lo,
+                    E_max=E_hi,
+                    omega_indices=omega_indices,
                 )
             )
     return windows
@@ -1267,27 +1571,45 @@ def _build_partitioned_hgl_windows(
         if count_B == 0 or B_min is None or B_max is None:
             continue
 
-        pane_rows = [(cell.b_lo, cell.b_hi, count_B, B_min, B_max)]
-        if cell.kind == "negative":
-            pane_rows = _plan_sign_definite_omega_panes(
+        laplace_cells = None
+        if cell.kind != "crossing":
+            laplace_cells = _plan_sign_definite_cells(
+                E_A=E_A,
+                base_mask_A=base,
                 Omega_q=Omega_q,
                 base_mask_B=base_mask_B,
                 mask_B_count=count_B,
                 mask_B_min=float(B_min),
                 mask_B_max=float(B_max),
-                E_min=float(cell.e_min),
-                E_max=float(cell.e_max),
-                omega_min=float(cell.omega_lo),
-                omega_max=float(cell.omega_hi),
-                subtract_omega=True,
-                support_lo=float(cell.b_lo),
-                support_hi=float(cell.b_hi),
+                omega_nonneg_ry=np.asarray(omega_nonneg_ry, dtype=np.float64),
+                orientation=("E+B-omega" if cell.kind == "negative"
+                             else "omega-E-B"),
+                support_B_lo=float(cell.b_lo),
+                support_B_hi=float(cell.b_hi),
+                support_E_lo=float(cell.e_lo),
+                support_E_hi=float(cell.e_hi),
+                omega_indices=np.asarray(cell.omega_indices, dtype=np.int64),
             )
+        pane_rows = (
+            [(cell.b_lo, cell.b_hi, count_B, B_min, B_max)]
+            if laplace_cells is None else
+            [(row.B_lo, row.B_hi, row.B_count, row.B_min, row.B_max)
+             for row in laplace_cells]
+        )
 
-        for B_lo, B_hi, pane_count, pane_min, pane_max in pane_rows:
+        for pane_idx, (B_lo, B_hi, pane_count, pane_min, pane_max) in enumerate(
+                pane_rows):
             if pane_count == 0 or pane_min is None or pane_max is None:
                 continue
+            sign_cell = (None if laplace_cells is None
+                         else laplace_cells[pane_idx])
             if cell.kind == "crossing":
+                if float(cell.A_dim) > _CROSSING_A_MAX * (
+                        1.0 + 8.0 * np.finfo(np.float64).eps):
+                    raise AssertionError(
+                        "GATE hgl_shell_capacity: planned HGL range "
+                        f"A={float(cell.A_dim):.16g} exceeds "
+                        f"{_CROSSING_A_MAX:.16g}")
                 target_error_hat = _scaled_crossing_error_bound(
                     xi, target_error)
                 q_cross = solve_phase_minimax_bandwidth(
@@ -1308,22 +1630,15 @@ def _build_partitioned_hgl_windows(
                 provenance = q_cross.provenance
                 crossing_kind = "hgl"
             else:
+                x_min, x_max = sign_cell.x_min, sign_cell.x_max
                 if cell.kind == "negative":
-                    x_min, x_max = _sign_definite_support(
-                        float(cell.e_min), float(cell.e_max),
-                        float(pane_min), float(pane_max),
-                        float(cell.omega_hi),
-                        omega_min=float(cell.omega_lo),
-                        subtract_omega=True)
-                    E_ref_A = float(cell.e_min)
-                    E_ref_B = float(pane_min)
+                    E_ref_A = float(sign_cell.E_min)
+                    E_ref_B = float(sign_cell.B_min)
                     prefactor = +1.0 * neg
                     conjugate = False
                 elif cell.kind == "positive":
-                    x_min = float(cell.omega_lo - cell.e_max - pane_max)
-                    x_max = float(cell.omega_hi - cell.e_min - pane_min)
-                    E_ref_A = float(cell.e_max)
-                    E_ref_B = float(pane_max)
+                    E_ref_A = float(sign_cell.E_max)
+                    E_ref_B = float(sign_cell.B_max)
                     prefactor = -1.0 * neg
                     conjugate = True
                 else:
@@ -1333,6 +1648,7 @@ def _build_partitioned_hgl_windows(
                     raise AssertionError(
                         "GATE hgl_sign_definite_cell: invalid Laplace interval "
                         f"for {cell.kind}: [{x_min:.16g}, {x_max:.16g}]")
+                _assert_bounded_laplace_support(x_min, x_max)
                 q = solve_laplace_minimax_interval(
                     x_min,
                     max(x_max, x_min * (1.0 + 1.0e-9)),
@@ -1360,11 +1676,18 @@ def _build_partitioned_hgl_windows(
                 crossing_kind=crossing_kind,
                 max_error=max_error,
                 provenance=provenance,
-                E_min=float(cell.e_lo),
-                E_max=float(cell.e_hi),
+                E_min=(float(cell.e_lo) if sign_cell is None
+                       else (None if np.isneginf(sign_cell.E_lo)
+                             else float(sign_cell.E_lo))),
+                E_max=(float(cell.e_hi) if sign_cell is None
+                       else (None if np.isposinf(sign_cell.E_hi)
+                             else float(sign_cell.E_hi))),
                 B_lo=float(B_lo),
                 B_hi=float(B_hi),
-                omega_indices=np.asarray(cell.omega_indices, dtype=np.int64),
+                omega_indices=(np.asarray(cell.omega_indices, dtype=np.int64)
+                               if sign_cell is None else
+                               np.asarray(sign_cell.omega_indices,
+                                          dtype=np.int64)),
             ))
 
     return windows, plan
@@ -1457,25 +1780,28 @@ def _build_windows_for_branch(
                 Omega_q, base_mask_B & (Omega_q <= T))
             _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(
                 Omega_q, base_mask_B & (Omega_q > T))
-            b_slab_panes = None
-            A_live = E_A_host[base_A_host]
-            if (A_live.size and mask_B_gt_count
-                    and mask_B_gt_min is not None
-                    and mask_B_gt_max is not None):
-                b_slab_panes = _plan_sign_definite_omega_panes(
-                    Omega_q=Omega_q,
-                    base_mask_B=base_mask_B,
-                    mask_B_count=mask_B_gt_count,
-                    mask_B_min=float(mask_B_gt_min),
-                    mask_B_max=float(mask_B_gt_max),
-                    E_min=float(np.min(A_live)),
-                    E_max=float(np.max(A_live)),
-                    omega_max=omega_max,
-                    subtract_omega=True,
-                    support_lo=T,
-                    support_hi=np.inf,
-                    x_min_floor=float(edge_factor) * xi,
-                )
+            laplace_cells_by_name = {}
+            for name, mask_A, count_B, B_min, B_max, B_lo, B_hi in (
+                ("a_stripe", base_A_host & (E_A_host > T),
+                 mask_B_le_count, mask_B_le_min, mask_B_le_max, -np.inf, T),
+                ("b_slab", base_A_host,
+                 mask_B_gt_count, mask_B_gt_min, mask_B_gt_max, T, np.inf),
+            ):
+                if (np.any(mask_A) and count_B and B_min is not None
+                        and B_max is not None):
+                    laplace_cells_by_name[name] = _plan_sign_definite_cells(
+                        E_A=E_A_host,
+                        base_mask_A=mask_A,
+                        Omega_q=Omega_q,
+                        base_mask_B=base_mask_B,
+                        mask_B_count=count_B,
+                        mask_B_min=float(B_min),
+                        mask_B_max=float(B_max),
+                        omega_nonneg_ry=omega_nonneg_ry,
+                        orientation="E+B-omega",
+                        support_B_lo=B_lo,
+                        support_B_hi=B_hi,
+                    )
             windows = _build_three_sigma_windows(
                 E_A=E_A_host, base_mask_A=base_A_host,
                 mask_B_all_count=mask_B_all_count,
@@ -1491,22 +1817,23 @@ def _build_windows_for_branch(
                 crossing_eps_q=crossing_eps_q,
                 crossing_max_nodes=crossing_max_nodes,
                 use_shipped_tables=bool(use_shipped_minimax_tables),
-                b_slab_panes=b_slab_panes,
+                laplace_cells_by_name=laplace_cells_by_name,
             )
     else:
         A_live = E_A_host[base_A_host]
-        omega_panes = None
+        sign_definite_cells = None
         if (A_live.size and mask_B_all_count and
                 mask_B_all_min is not None and mask_B_all_max is not None):
-            omega_panes = _plan_sign_definite_omega_panes(
+            sign_definite_cells = _plan_sign_definite_cells(
+                E_A=E_A_host,
+                base_mask_A=base_A_host,
                 Omega_q=Omega_q,
                 base_mask_B=base_mask_B,
                 mask_B_count=mask_B_all_count,
                 mask_B_min=float(mask_B_all_min),
                 mask_B_max=float(mask_B_all_max),
-                E_min=float(np.min(A_live)),
-                E_max=float(np.max(A_live)),
-                omega_max=omega_max,
+                omega_nonneg_ry=omega_nonneg_ry,
+                orientation="E+B+omega",
             )
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,
@@ -1517,13 +1844,15 @@ def _build_windows_for_branch(
             neg_omega_half=neg_omega_half,
             target_error=target_error, max_nodes=max_nodes,
             use_shipped_tables=bool(use_shipped_minimax_tables),
-            omega_panes=omega_panes,
+            sign_definite_cells=sign_definite_cells,
         )
 
     for win in windows:
         A_vals = E_A_host[win.mask_A]
-        if win.E_min is not None:
-            A_vals = A_vals[(A_vals > win.E_min) & (A_vals <= win.E_max)]
+        if win.E_min is not None or win.E_max is not None:
+            E_lo = -np.inf if win.E_min is None else win.E_min
+            E_hi = np.inf if win.E_max is None else win.E_max
+            A_vals = A_vals[(A_vals > E_lo) & (A_vals <= E_hi)]
         kind = "crossing" if win.crossing_kind else "Laplace"
         # ACHIEVED, not requested (R2).  The old line said
         # ``err<{target_error:.0e}``, which is what was ASKED for -- so a
