@@ -1599,6 +1599,215 @@ def compute_no_pair_dirac_current_block(
     return kernel(*args, perm_l, phase_l, perm_r, phase_r)
 
 
+def _get_finite_transfer_current_block_kernel(
+    mesh_xy, *, nk: int, nb: int, ns: int, n_rmu: int,
+):
+    """One-q current block through the incumbent face Green builder.
+
+    The exact finite-transfer endpoint already contains its Lorentz vertex,
+    so this kernel has no gamma-matrix arm.  It differs from the all-q
+    minimax kernel only in the unavoidable outer convolution: a jointly
+    ``(k,q)`` endpoint must be contracted at its fixed q, not sent through
+    the q-independent k-FFT.  Both one-particle factors remain the canonical
+    :func:`greens_function_kernel.build_G_tau` with one hoisted distributed
+    GEMM plan.
+    """
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import build_G_tau
+    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+
+    key = ("finite_transfer_current_block", id(mesh_xy), int(nk), int(nb),
+           int(ns), int(n_rmu))
+    hit = _chi_minimax_kernel_cache.get(key)
+    if hit is not None:
+        return hit
+
+    g_plan = gemm_plan(
+        mesh_xy, m=int(n_rmu) * int(ns), k=int(nb),
+        n=int(n_rmu) * int(ns), nq=int(nk), dtype=jnp.complex128)
+    mun_sharding = NamedSharding(mesh_xy, PSI_MUN_SPEC)
+    nmu_sharding = NamedSharding(mesh_xy, PSI_NMU_SPEC)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    rep0 = NamedSharding(mesh_xy, P())
+    out_sharding = NamedSharding(mesh_xy, P("x", "y"))
+    nodes_sharding = MinimaxNodes(
+        t=NamedSharding(mesh_xy, P(None)),
+        alpha=NamedSharding(mesh_xy, P(None)))
+
+    @partial(
+        jax.jit,
+        in_shardings=(nodes_sharding, mun_sharding, nmu_sharding,
+                      mun_sharding, nmu_sharding, rep2, rep2, rep2, rep2,
+                      rep0, rep0),
+        out_shardings=out_sharding,
+    )
+    def kernel(nodes, current_mun_A, current_nmu_B,
+               target_mun, target_nmu, mask_v, mask_c_target,
+               energy_source, energy_target, vmax, cmin):
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((int(n_rmu), int(n_rmu)), dtype=jnp.complex128),
+            out_sharding)
+
+        def body(accumulator, xs):
+            tau, alpha = xs
+            tau_kernel = jnp.real(tau).astype(jnp.float64)
+            Gv_current = build_G_tau(
+                current_mun_A, current_nmu_B, energy_source, -tau_kernel,
+                e_ref=vmax, mask=mask_v, layout="face", gemm=g_plan)
+            Gc_target = build_G_tau(
+                target_mun, target_nmu, energy_target, tau_kernel,
+                e_ref=cmin, mask=mask_c_target,
+                layout="face", gemm=g_plan)
+            # D_i(c,v,mu)=<c,k-q|Gamma_i(k,q)|v,k> at the current
+            # centroids.  Gc*conj(Gv_AB) therefore gives
+            # conj(D_A(mu))*D_B(nu), with the two open spin sums retained
+            # until this contraction.  The 1/sqrt(Nk) is the fixed-q
+            # specialization of the incumbent three unitary k FFTs.
+            chi_tau = jnp.einsum(
+                "kambn,kambn->mn", Gc_target, jnp.conj(Gv_current),
+                optimize=True) / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+            chi_tau = jax.lax.with_sharding_constraint(
+                chi_tau, out_sharding)
+            return accumulator + alpha * chi_tau, None
+
+        result, _ = jax.lax.scan(
+            body, zero, (nodes.t, nodes.alpha), unroll=1)
+        return result
+
+    _chi_minimax_kernel_cache[key] = kernel
+    return kernel
+
+
+def compute_finite_transfer_current_block_row(
+    endpoint, wfns_transverse, quad, meta, mesh_xy, *,
+    vertex_left: int, vertex_right: int, energy_reference=0.0,
+):
+    r"""Return one exact-current TT response block at one stored q row.
+
+    ``endpoint`` must come from
+    :func:`common.mtxel_sweep.finite_transfer_current_to_centroids` for the
+    same transverse centroid set and band window.  The routine reuses the
+    incumbent distributed face Green builder and minimax normalization; it
+    neither constructs a second Green function nor materializes a band-pair
+    carrier.  One block is returned so the existing photon packer can retain
+    its one-live-block memory schedule.
+
+    This is authenticated paramagnetic-body infrastructure, not a claim that
+    FULL is complete.  The transverse zeta/V side still needs the matching
+    q-resolved C/Z contraction, and the exact contact/downfolded completion
+    and vector-symmetry reciprocity gate remain absent.  Consequently the
+    production FULL refusal is unchanged.
+    """
+    A, B = int(vertex_left), int(vertex_right)
+    if A not in (1, 2, 3) or B not in (1, 2, 3):
+        raise ValueError(
+            "finite-transfer current row is a TT block and requires "
+            f"vertices in {{1,2,3}}; got ({A},{B})")
+    if getattr(wfns_transverse, "layout", None) != "face":
+        raise ValueError(
+            "finite-transfer current row requires the canonical face "
+            "wavefunction bundle (low_mem_bands=true)")
+    mesh_shape = tuple(int(v) for v in mesh_xy.devices.shape)
+    if (tuple(mesh_xy.axis_names) != ("x", "y")
+            or len(mesh_shape) != 2 or mesh_shape[0] != mesh_shape[1]):
+        raise ValueError(
+            "finite-transfer current row requires the canonical square "
+            f"(x,y) processor mesh; got axes={tuple(mesh_xy.axis_names)}, "
+            f"shape={mesh_shape}")
+    ensure_jax_compile_cache()
+    current_nmu = endpoint.current_nmu
+    current_mun = endpoint.current_mun
+    nk, nb, ncart, ns, n_rmu = (int(v) for v in current_nmu.shape)
+    if (ncart, ns) != (3, 4):
+        raise ValueError(
+            "finite-transfer current endpoint must have (cart,spin)=(3,4); "
+            f"got {(ncart, ns)}")
+    if tuple(int(v) for v in current_mun.shape) != (
+            nk, 3, 4, n_rmu, nb):
+        raise ValueError(
+            "finite-transfer current endpoint face orientations disagree: "
+            f"nmu={current_nmu.shape}, mun={current_mun.shape}")
+    if int(endpoint.n_rmu_logical) > n_rmu:
+        raise ValueError(
+            "finite-transfer current logical centroid extent exceeds its "
+            f"padded face: {int(endpoint.n_rmu_logical)} > {n_rmu}")
+    if (tuple(int(v) for v in wfns_transverse.psi_nmu.shape)
+            != (nk, nb, 4, n_rmu)
+            or tuple(int(v) for v in wfns_transverse.psi_mun.shape)
+            != (nk, 4, n_rmu, nb)):
+        raise ValueError(
+            "finite-transfer current endpoint and transverse WFN faces must "
+            "share (nk,nb,spin,n_rmu); got endpoint "
+            f"{current_nmu.shape} and WFN "
+            f"{wfns_transverse.psi_nmu.shape}/"
+            f"{wfns_transverse.psi_mun.shape}")
+    if nk != int(meta.nk_tot):
+        raise ValueError(
+            f"finite-transfer endpoint nk={nk} != meta.nk_tot="
+            f"{int(meta.nk_tot)}")
+    if int(endpoint.iq_irr) < 0:
+        raise ValueError(
+            "finite-transfer endpoint carries a negative q-IBZ row")
+    q_label = np.asarray(endpoint.q_irr_kgrid_int, dtype=np.int32)
+    q_crys = np.asarray(endpoint.q_crys, dtype=np.float64)
+    if q_label.shape != (3,) or q_crys.shape != (3,) or not np.all(
+            np.isfinite(q_crys)):
+        raise ValueError(
+            "finite-transfer endpoint q labels must be finite 3-vectors; "
+            f"got q_int={q_label}, q_crys={q_crys}")
+    kminq = np.asarray(endpoint.kminq_idx, dtype=np.int32)
+    if kminq.shape != (nk,) or np.any(kminq < 0) or np.any(kminq >= nk):
+        raise ValueError(
+            "finite-transfer endpoint carries an invalid k-q row map")
+    if not np.array_equal(np.sort(kminq), np.arange(nk, dtype=np.int32)):
+        raise ValueError(
+            "finite-transfer endpoint k-q row map must be a full-BZ "
+            "permutation")
+    for label, fingerprint in (
+        ("Hamiltonian", endpoint.hamiltonian_config_operator_fingerprint),
+        ("finite-path", endpoint.vnl_path_operator_fingerprint),
+    ):
+        value = str(fingerprint).strip()
+        if (not value.startswith("sha256:")
+                or len(value) != len("sha256:") + 64
+                or any(c not in "0123456789abcdef" for c in value[7:])):
+            raise ValueError(
+                f"finite-transfer endpoint carries an invalid {label} "
+                "operator fingerprint")
+
+    eref = 0.0 if energy_reference is None else float(energy_reference)
+    energy_source = wfns_transverse.enk - eref
+    energy_target = jnp.take(energy_source, kminq, axis=0)
+    s = wfns_transverse.slices
+    mask_v = wfns_transverse.band_mask(s.val)
+    mask_c_target = jnp.take(
+        wfns_transverse.band_mask(s.cond), kminq, axis=0)
+    target_mun = jnp.take(wfns_transverse.psi_mun, kminq, axis=0)
+    target_nmu = jnp.take(wfns_transverse.psi_nmu, kminq, axis=0)
+
+    val_host = np.asarray(jax.device_get(
+        energy_source[:, s.val]), dtype=np.float64)
+    cond_host = np.asarray(jax.device_get(
+        energy_target[:, s.cond]), dtype=np.float64)
+    vmax = float(np.max(val_host))
+    cmin = float(np.min(cond_host))
+    gap = cmin - vmax
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha_chi = (-2.0 * np.asarray(quad.alpha, dtype=np.float64)
+                 * np.exp(-tau * gap))
+    nodes = MinimaxNodes(
+        t=jnp.asarray(tau, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128))
+    kernel = _get_finite_transfer_current_block_kernel(
+        mesh_xy, nk=nk, nb=nb, ns=ns, n_rmu=n_rmu)
+    return kernel(
+        nodes, current_mun[:, A - 1], current_nmu[:, :, B - 1],
+        target_mun, target_nmu, mask_v, mask_c_target,
+        energy_source, energy_target,
+        jnp.asarray(vmax, dtype=jnp.float64),
+        jnp.asarray(cmin, dtype=jnp.float64))
+
+
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
 STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL

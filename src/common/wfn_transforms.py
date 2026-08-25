@@ -1039,6 +1039,7 @@ def gflat_to_rmu(
     mesh: Mesh,
     fft_grid: Sequence[int],
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    k_row_map: np.ndarray | jax.Array | None = None,
     norm: str = "backward",
     chunk_size: int | None = None,
 ) -> jax.Array:
@@ -1116,6 +1117,13 @@ def gflat_to_rmu(
         gathered samples are multiplied by ``exp(+2πi k·r_mu)`` per
         ``(k, r_mu)`` pair (separable in x/y/z; pre-computed once per
         k).  ``None`` skips the phase.
+    k_row_map
+        Optional ``(nk,)`` integer row selector.  Row ``k`` of ``psi_G``
+        then uses ``g_index[k_row_map[k]]`` and, when present,
+        ``kvecs_frac[k_row_map[k]]``.  The selector is a runtime operand so
+        every q row shares one executable and the loader's cached full
+        FFT-box table is never copied/reordered outside this owner.  The
+        default ``None`` preserves the historical row-aligned path.
     norm
         Forwarded to :func:`jnp.fft.ifftn`.  Defaults to ``"backward"``
         to match the legacy :func:`to_rmu` default; centroid-load
@@ -1208,6 +1216,20 @@ def gflat_to_rmu(
                 f"gflat_to_rmu: kvecs_frac must be ({nk}, 3); got "
                 f"{kvecs_shape}.")
         kvecs_dev = jnp.asarray(kvecs_frac, dtype=jnp.float64)
+    if k_row_map is None:
+        k_row_map_shape = None
+        k_row_map_dev = None
+    else:
+        k_row_map_shape = tuple(int(s) for s in np.shape(k_row_map))
+        if k_row_map_shape != (nk,):
+            raise ValueError(
+                f"gflat_to_rmu: k_row_map must be ({nk},); got "
+                f"{k_row_map_shape}.")
+        k_row_map_host = np.asarray(k_row_map, dtype=np.int64)
+        if np.any(k_row_map_host < 0) or np.any(k_row_map_host >= nk):
+            raise ValueError(
+                f"gflat_to_rmu: k_row_map contains a row outside [0,{nk}).")
+        k_row_map_dev = jnp.asarray(k_row_map, dtype=jnp.int32)
     # Resolve the canonical device buffer without a numpy roundtrip for
     # jax.Array inputs.  See _resolve_gindex_dev.
     g_index_dev_canonical, _ = _resolve_gindex_dev(g_index)
@@ -1216,7 +1238,7 @@ def gflat_to_rmu(
     key = (
         tuple(int(s) for s in psi_G.shape), tuple(g_shape),
         fft_grid_t, n_rmu, r_mu_id, ngkmax,
-        norm, kvecs_shape, cs, n_chunks, pad_N,
+        norm, kvecs_shape, k_row_map_shape, cs, n_chunks, pad_N,
         # The shard_map below owns the input layout: every operand enters as
         # ``band_sphere_spec()`` on this explicit mesh.  Key that contract,
         # not the incidental sharding wrapper returned by each streamed
@@ -1252,7 +1274,7 @@ def gflat_to_rmu(
         kvec_spec = P(None, None)
         out_spec = band_sphere_spec()
 
-        def _body(psi_, g_index_, kvecs_):
+        def _body(psi_, g_index_, kvecs_, k_row_map_):
             # Per-rank: (nk, nb_local, ns, ngkmax).
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
@@ -1282,11 +1304,13 @@ def gflat_to_rmu(
                     psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
                 k_row = jnp.clip(
                     (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)  # (cs,)
+                mapped_k_row = (k_row if k_row_map_ is None
+                                else k_row_map_[k_row])
                 # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row g_index gather: (cs, nx, ny, nz).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = g_index_[k_row]
+                g_per_row = g_index_[mapped_k_row]
                 box = _box_kernel(
                     sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
@@ -1300,9 +1324,9 @@ def gflat_to_rmu(
                     # algebraically identical to applying it on the
                     # full FFT box before gather (cf. gflat_to_rchunk's
                     # phase-on-slice pattern).
-                    phx_q = phx_rmu_all[k_row]
-                    phy_q = phy_rmu_all[k_row]
-                    phz_q = phz_rmu_all[k_row]
+                    phx_q = phx_rmu_all[mapped_k_row]
+                    phy_q = phy_rmu_all[mapped_k_row]
+                    phz_q = phz_rmu_all[mapped_k_row]
                     samples = samples * (phx_q * phy_q * phz_q)[:, None, :]
                 return jax.lax.dynamic_update_slice_in_dim(
                     out, samples, i0, axis=0), None
@@ -1313,28 +1337,47 @@ def gflat_to_rmu(
                 out_flat = out_flat[:N]
             return out_flat.reshape(nk, nb_local, ns, n_rmu)
 
-        if kvecs_frac is None:
+        if kvecs_frac is None and k_row_map is None:
             @partial(shard_map, mesh=mesh,
                      in_specs=(in_spec, gidx_spec),
                      out_specs=out_spec,
                      check_vma=False)
             def _kernel(psi_, g_index_):
-                return _body(psi_, g_index_, None)
-        else:
+                return _body(psi_, g_index_, None, None)
+        elif k_row_map is None:
             @partial(shard_map, mesh=mesh,
                      in_specs=(in_spec, gidx_spec, kvec_spec),
                      out_specs=out_spec,
                      check_vma=False)
             def _kernel(psi_, g_index_, kvecs_):
-                return _body(psi_, g_index_, kvecs_)
+                return _body(psi_, g_index_, kvecs_, None)
+        elif kvecs_frac is None:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, P(None)),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, k_row_map_):
+                return _body(psi_, g_index_, None, k_row_map_)
+        else:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, kvec_spec, P(None)),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, kvecs_, k_row_map_):
+                return _body(psi_, g_index_, kvecs_, k_row_map_)
 
         return jax.jit(_kernel)
 
     fn = _cached_jit('gflat_to_rmu', key, build)
-    if kvecs_frac is None:
+    if kvecs_frac is None and k_row_map is None:
         out = fn(psi_G, g_index_dev_canonical)
-    else:
+    elif k_row_map is None:
         out = fn(psi_G, g_index_dev_canonical, kvecs_dev)
+    elif kvecs_frac is None:
+        out = fn(psi_G, g_index_dev_canonical, k_row_map_dev)
+    else:
+        out = fn(
+            psi_G, g_index_dev_canonical, kvecs_dev, k_row_map_dev)
     if nb_pad_total != nb_total:
         # Drop the zero pad-bands.  Replicate the band axis first (bands off
         # the mesh) so the slice to the logical nb_total — which need not
