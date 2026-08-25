@@ -910,6 +910,11 @@ def gflat_to_rchunk_aot_memory(
             "gflat_to_rchunk_aot_memory: the compiled canonical WFN "
             "r-slab program exposes no FFT operation, so its cuFFT workspace "
             "cannot be certified")
+    if platform in ("gpu", "cuda") and not memory.cufft_measured:
+        raise RuntimeError(
+            "gflat_to_rchunk_aot_memory: the canonical WFN r-slab program's "
+            "cuFFT workspace query is unavailable on CUDA; refusing a "
+            "known-low memory preflight")
     _RCHUNK_PEAK_CACHE[key] = memory
     return memory
 

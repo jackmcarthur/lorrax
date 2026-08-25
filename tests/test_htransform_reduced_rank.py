@@ -48,6 +48,11 @@ def test_wfn_rchunk_integer_peak_api_is_the_cached_breakdown_view(monkeypatch):
     pytest.importorskip("jax")
     from common import wfn_transforms
 
+    planning_src = inspect.getsource(
+        wfn_transforms.gflat_to_rchunk_aot_memory)
+    assert "not memory.cufft_measured" in planning_src
+    assert "known-low memory preflight" in planning_src
+
     calls = []
 
     def _memory(**kwargs):
