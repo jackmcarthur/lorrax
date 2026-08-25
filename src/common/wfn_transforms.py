@@ -2145,11 +2145,10 @@ def iter_psi_rchunk_bandwise(
     # here would make ``to_rchunk`` allocate a second identical G-vector to
     # FFT-box map beside the centroid path's canonical buffer.
     g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
-    sym_loader = loader.symmetry()
-    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
-    kvecs_frac_full = (
-        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
-        / kgrid_arr[None, :])
+    # WfnLoader owns the paired (k,G) gauge. A local integer-grid rebuild can
+    # choose k+G_lattice while ``box_index`` still labels coefficients for k,
+    # corrupting the full-Bloch phase.
+    kvecs_frac_full = loader.kvecs(k="full_bz")
 
     for bc_range in band_chunk_ranges:
         if nk_batch >= nk_tot:
@@ -2378,11 +2377,9 @@ def load_centroids_band_chunked(
     # device buffers for the same (nk, nx, ny, nz) data (agent_l Round-5
     # §2 measured live count = 3 at pre_rchunk_loop).
     g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
-    sym_loader = loader.symmetry()
-    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
-    kvecs_frac_full = (
-        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
-        / kgrid_arr[None, :])
+    # Use the k representatives paired with this loader's full-BZ G table;
+    # see the identical streamed-r door above.
+    kvecs_frac_full = loader.kvecs(k="full_bz")
 
     # Pull all (nk_tot, nb_padded, ns, ngkmax) ψ(G-flat) onto device in
     # one collective load.  The G-flat tensor is small relative to the
