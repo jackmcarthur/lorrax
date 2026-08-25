@@ -25,13 +25,11 @@ _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
-from common import rank_criterion
 from common import timing
 from common.units import RYD_TO_EV
 from runtime.padding import round_up
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
-    _lowdin_orthonormalize_band_rows,
     fit_galerkin_basis,
     validate_rank_multiplier,
 )
@@ -135,61 +133,6 @@ def resolve_extra_rank_pad() -> int:
     return extra
 
 
-def resolve_fh_ortho_tol(log_fn=None) -> float:
-    """``LORRAX_FH_ORTHO_TOL`` (default 1e-6) — the build_fH_R gate cap.
-
-    Routed through ``gw_config.env_float`` in refuse mode: blank/unset →
-    the default (the old inline ``float(get(...) or 0.0)`` made a BLANK
-    export silently DISABLE the orthonormality gate — the failure it
-    guards is a wrong number, not a crash, so silent-off is the worst
-    possible reading of a typo); garbage REFUSES naming the variable; a
-    NON-DEFAULT value is announced, and ``0`` (gate off) is announced as
-    exactly that.
-    """
-    from gw.gw_config import env_float
-    tol = env_float("LORRAX_FH_ORTHO_TOL", 1e-6, refuse=True)
-    if tol != 1e-6 and log_fn is not None:
-        log_fn(f"  [gate] LORRAX_FH_ORTHO_TOL={tol:.3e} overrides the "
-               f"default 1e-6"
-               + ("  ** THE ORTHONORMALITY GATE IS DISABLED — only ever "
-                  "to reproduce a known-bad run **" if tol == 0.0 else ""))
-    return tol
-
-
-def resolve_rank_policy_mode() -> str:
-    """``LORRAX_RANK_POLICY`` (default ``refuse``) — the truncation gate's authority.
-
-    The name and the grammar live once, in ``common/rank_criterion``, which is
-    L2 and must be a function of its arguments (``tests/test_layering.py``);
-    this driver does the lookup and hands the answer over.  Same shape as
-    :func:`resolve_fh_ortho_tol` two functions up, and it exists for the same
-    reason: an L1 library dial reaches the environment through EXACTLY ONE
-    named resolver, so a reader can find every env-dependent decision this
-    module makes by grepping for ``resolve``.
-
-    A mis-spelled mode REFUSES naming the variable — a gate disarmed by a
-    typo reads clean in the log, which is the worst possible reading of one.
-
-    WHY THE NAME IS SPELLED OUT HERE.  Everywhere else in the tree the lookup
-    is ``os.environ.get(rank_criterion.POLICY_MODE_ENV)`` — one source of
-    truth for the spelling.  This module is under the EXACT-SET env ratchet in
-    ``tests/test_layering.py``, whose AST scan reads the argument literally
-    and records a constant as ``<dynamic>``; pinning that would make the
-    ratchet stop naming the variable, which is the degenerate-value failure
-    ``TASTE.md`` #18 is about.  So the literal is written for the scanner and
-    checked against the constant immediately below, which makes a rename a
-    loud refusal at exactly one line instead of a silent second spelling.
-    """
-    if rank_criterion.POLICY_MODE_ENV != "LORRAX_RANK_POLICY":
-        raise RuntimeError(
-            f"resolve_rank_policy_mode: common/rank_criterion renamed its "
-            f"policy dial to {rank_criterion.POLICY_MODE_ENV!r}, but this "
-            f"resolver still reads 'LORRAX_RANK_POLICY' — the literal exists "
-            f"only so the L1 env ratchet can see the name.  Update both.")
-    return rank_criterion.resolve_policy_mode(
-        os.environ.get("LORRAX_RANK_POLICY"))
-
-
 def resolve_galerkin_rank_multiplier(value) -> float:
     """Resolve the whole-state randomized-QRCP search ceiling.
 
@@ -225,11 +168,10 @@ def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
 
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
-                             rtol: float = 1e-8, log_fn=None,
+                             log_fn=None,
                              band_chunk_size: int = 64,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
-                             eigh_backend: str = "auto",
                              rank_multiplier: float = 20.0,
                              qr_eps: float = 1.0e-3,
                              qrcp_seed: int = 0):
@@ -239,18 +181,15 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
-        rtol=rtol,
         log_fn=log_fn,
         band_chunk_size=band_chunk_size,
         bispinor=bispinor,
         include_projector=return_full_proj,
-        eigh_backend=eigh_backend,
         rank_multiplier=rank_multiplier,
         qr_eps=qr_eps,
         qrcp_seed=qrcp_seed,
         q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_pool_limit,
-        rank_policy_mode=resolve_rank_policy_mode(),
         extra_rank_pad=resolve_extra_rank_pad(),
     )
     return basis.as_legacy_tuple(
@@ -436,57 +375,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_R = local_ifftn(fH_k)
         return fH_k, fH_R
 
-    # ── THE ON-GRID RECOVERY GATE ─────────────────────────────────────────
-    # fH_k = Σ_n f(ε_n,k) c_n,k c_n,kᴴ has eigenvalues EXACTLY {f(ε_n,k)} (plus
-    # rank−nb exact zeros) if and only if the rows of ctilde[k] are
-    # orthonormal.  When they are not, the eigenvalues are no longer f(ε_n)
-    # and ``newton_inv`` returns wrong ENERGIES on the coarse grid — silently,
-    # with a Hermitian positive-semidefinite fH, a successful Cholesky
-    # upstream and a plot that looks fine.
-    #
-    # WHY HERE.  This is the one function BOTH consumers pass through — the
-    # ``bandstructure.htransform`` CLI and ``bandstructure.bse_setup.
-    # compute_wfns_fi`` (hence ``bse.exciton_bands``).  Gating here covers the
-    # exciton path without reaching into it.
-    #
-    # WHY ALL k.  ``streaming_galerkin_solve`` prints ``ctilde[0]`` only, and
-    # k=0 is Γ, the most symmetric point in the zone.  Cheap to fix: this is
-    # nk·nb²·rank, four orders below the nk·rank³ of an eigendecomposition.
-    #
-    # THE THRESHOLD IS MEASURED, not chosen.  Jobs 7883150 / 7883160, MoS2 4×4
-    # / n_μ=785 / rtol 1e-8, walking ncond across the capacity limit
-    # (nk·nb → nspinor·n_μ = 1570).  ``ortho`` is this number; ``on-grid'' is
-    # the order-matched max|Δε| over the whole band window against the stored
-    # eigenvalues:
-    #
-    #   ncond  nk·nb  rank   ortho      on-grid max   on-grid over BSE cond
-    #     70    1536  1536   1.87e-14   3.2e-05 meV        8.8e-11 meV
-    #     71    1552  1551   2.97e-04   2.955   meV        0.201   meV   ←
-    #     72    1568  1562   6.31e-04   6.939   meV        0.242   meV
-    #     74    1600  1570   3.11e-03   23.60   meV        0.860   meV
-    #     78    1632  1570   9.35e-03   88.92   meV        3.142   meV
-    #
-    # Losing ONE direction of 1552 (rank 1551) is what crosses the owner's
-    # 0.1 meV requirement.  Over that range on-grid max|Δε| ≈ 9.0e3 · ortho
-    # (7.6e3 … 1.1e4), so a cap of 1e-6 holds the on-grid energy error under
-    # ~0.01 meV with a decade of margin, while every healthy configuration
-    # measured — every window from nb=30 to nb=96 — sits at 1.9e-14, EIGHT
-    # decades below the cap.  There is no false-positive room here.
-    #
-    # AND IT IS NOT A CONDITIONING PROBLEM, so do not reach for ``rtol``.
-    # Same job, ncond=72, tightening the amplification cap makes it WORSE
-    # because it discards more of a basis that already cannot span:
-    #     rtol 1e-8 → rank 1562, ortho 6.31e-04, on-grid  6.9 meV
-    #     rtol 1e-6 → rank 1494, ortho 1.04e-02, on-grid 80.3 meV
-    #     rtol 1e-4 → rank 1086, ortho 2.61e-02, on-grid 219.3 meV
-    # The lever for the EXACT-SPAN route is n_μ (or a narrower window), never
-    # the truncation tolerance.  ``htransform_rank_multiplier`` is different:
-    # it declares a reduced cross-k MODEL and restores the row-isometry with a
-    # per-k polar factor before this gate.  Its accuracy is decided by an
-    # observable A/B, not by relabeling its cut as numerical noise.
-    #
-    # ``LORRAX_FH_ORTHO_TOL`` overrides; 0 disables. Never disable to make a
-    # run finish — the failure it catches is a wrong number, not a crash.
+    # Projection receipt, not a rank gate.  The published whole-state QRCP
+    # basis is deliberately approximate, so C C^H need not be the identity.
+    # Applying a per-k Löwdin map would change the one shared alpha gauge and
+    # is therefore forbidden.  Accuracy is decided directly from recovered
+    # coarse-grid energies/wavefunctions and the independent fine-QE oracle.
     rep_ = NamedSharding(mesh_xy, P())
 
     @partial(jax.jit, out_shardings=rep_)
@@ -495,39 +388,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         G = jnp.einsum('kim,kjm->kij', c, jnp.conj(c), optimize=True)
         return jnp.max(jnp.abs(G - jnp.eye(nb_, dtype=G.dtype)[None]))
 
-    _ortho = float(_ortho_all_k(ctilde))
-    _tol = resolve_fh_ortho_tol(log_fn)
-    log_fn(f"  [gate] ctilde orthonormality over ALL {int(ctilde.shape[0])} k: "
-           f"max|C Cᴴ − I| = {_ortho:.3e}  (cap {_tol:.1e}; measured "
-           f"conversion: on-grid max|Δε| ≈ 9.0e3 × this, so this run's "
-           f"on-grid energy error is ≈ {9.0e3 * _ortho:.2e} meV)")
-    if _tol > 0.0 and _ortho > _tol:
-        raise ValueError(
-            f"build_fH_R: the Galerkin coefficients are NOT orthonormal — "
-            f"max|C Cᴴ − I| = {_ortho:.3e} over all k, above the {_tol:.1e} "
-            f"cap.  fH's eigenvalues are then not f(ε_n) and the recovered "
-            f"ENERGIES are wrong on the coarse grid by roughly "
-            f"{9.0e3 * _ortho:.2e} meV, silently.  Cause, in order of "
-            f"likelihood: (1) ψ-at-centroids cannot span the band window — "
-            f"check the rank line from streaming_galerkin_solve for "
-            f"rank < nk·nb.  THREE repairs, and which one applies depends on "
-            f"WHY the span failed: MORE CENTROIDS or a NARROWER window if the "
-            f"basis is genuinely too small for the bands; or an explicit "
-            f"reduced model order, htransform_rank_multiplier >= 1, if the "
-            f"span failed because nk·nb grew with the K-POINT COUNT.  The "
-            f"exact-span route retains up to nk·nb directions, so on a dense "
-            f"metal grid it demands a basis that grows with N_k, which the "
-            f"method's own scaling contract does not (Wu et al. S1 estimates "
-            f"the QRCP basis at 20–40·N_b, INDEPENDENT of N_k, and reports "
-            f"N_mu saturating as N_k grows).  Measured: Na 512 k × 12 bands "
-            f"with the validated c1016 basis retains the full column rank "
-            f"2032 and refuses here at 2.324e-4, while the SAME basis "
-            f"completes at three bands — buying centroids is the wrong "
-            f"repair for that shape.  Never rtol: same job, tightening the "
-            f"amplification cap made ortho WORSE (1e-8 → 6.31e-4, 1e-6 → "
-            f"1.04e-2, 1e-4 → 2.61e-2).  (2) the G accumulation summed Q Qᴴ "
-            f"per band chunk instead of summing into Q first.  Override with "
-            f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
+    _projection_defect = float(_ortho_all_k(ctilde))
+    log_fn(
+        f"  [receipt] whole-state projection over all "
+        f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
+        f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
     fH_k, fH_R = _build(ctilde, f_eps)
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
@@ -883,19 +748,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     with mesh_xy:
         out = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
-            rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
+            log_fn=log_fn, bispinor=bispinor,
             return_full_proj=return_full_proj,
-            # Deck key, same family as the fH_q eigh; the CLI --eigh-backend
-            # override is scoped to compute_wfns_fi and deliberately not
-            # threaded here — the deck is the source of truth for the fit.
-            #
-            # RESOLVED, not raw.  ``eigh_backend`` and ``use_low_mem_eigh``
-            # are two spellings of ONE axis and ``gw_config.resolve_eigh_
-            # backend`` is the single place they combine; reading the raw
-            # key here meant a deck that said ``use_low_mem_eigh = true``
-            # got the native replicated Gram eigh anyway — the key was
-            # parsed, defaulted, stored and read by nobody on this driver.
-            eigh_backend=resolve_eigh_backend(params),
             rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
             qr_eps=params.get("htransform_qr_eps", 1.0e-3),
             qrcp_seed=params.get("htransform_qrcp_seed", 0),

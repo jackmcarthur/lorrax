@@ -25,6 +25,7 @@ from jax.scipy import linalg as jsp_linalg
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.psi_G_store import build_psi_G_store
+from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
 from common.shard_map import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
@@ -303,17 +304,15 @@ def _resolve_whole_state_stream_budget(
 def fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_range: tuple[int, int], *,
-        rtol: float = 1e-8, log_fn=None,
+        log_fn=None,
         band_chunk_size: int = 64,
         bispinor: bool = False,
         include_projector: bool = False,
-        eigh_backend: str = "auto",
         rank_multiplier: float = 20.0,
         qr_eps: float = 1.0e-3,
         qrcp_seed: int = 0,
         q_tile_budget: int,
         device_pool_limit: float | None,
-        rank_policy_mode: str = "refuse",
         extra_rank_pad: int = 0,
 ) -> GalerkinBasis:
     """Fit the published whole-state Hamiltonian-transform basis.
@@ -332,11 +331,9 @@ def fit_galerkin_basis(
     global basis has been selected.  No centroid weighting, state-space SVD,
     or per-k gauge repair participates in basis construction.
 
-    ``rtol``, ``eigh_backend`` and ``rank_policy_mode`` remain accepted only
-    while callers migrate from the displaced centroid-Gram API.  They do not
-    select physics in this route; ``qr_eps`` is the rank-revealing tolerance.
+    ``qr_eps`` is the sole rank-revealing tolerance.
     """
-    del sym, rtol, eigh_backend, rank_policy_mode
+    del sym
     if log_fn is None:
         log_fn = lambda *a, **kw: None
 
@@ -442,11 +439,6 @@ def fit_galerkin_basis(
         sketch_gram_row = jax.device_put(sketch_gram, row)
         del sketch_gram
 
-        # Temporary import until the concurrently reviewed pure numerical
-        # owner lands; no centroid physics is called here.
-        from centroid.pivoted_cholesky import (
-            make_sharded_pivoted_cholesky_select,
-        )
         from common.collectives import device_put_process_local
         active_np = np.zeros(candidate_carrier, dtype=bool)
         active_np[:n_candidates] = True
