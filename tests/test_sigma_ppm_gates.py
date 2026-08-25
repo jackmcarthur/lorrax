@@ -124,6 +124,21 @@ def test_shared_omega_clusters_preserve_gap_only_owner_and_cap_spans():
         ([3], 3.1, 3.1), ([0], 3.2, 3.2)]
 
 
+def test_hgl_capacity_owner_keeps_the_roundoff_band_on_incumbent_family():
+    from gw.ppm_windows import _CROSSING_A_MAX, hgl_partition_required
+
+    xi = 0.2
+    edge = 1.5
+    omega_at_capacity = (0.5 * _CROSSING_A_MAX - edge) * xi
+    eps = np.finfo(np.float64).eps
+    assert not hgl_partition_required(
+        np.array([-omega_at_capacity, omega_at_capacity]), xi, edge)
+    assert not hgl_partition_required(
+        np.array([omega_at_capacity * (1.0 + 4.0 * eps)]), xi, edge)
+    assert hgl_partition_required(
+        np.array([omega_at_capacity * (1.0 + 32.0 * eps)]), xi, edge)
+
+
 def test_hgl_cell_plan_tiles_direct_denominator_and_respects_capacity():
     """Exact omega x A x B ownership and first-principles sign bounds.
 
@@ -195,6 +210,117 @@ def test_hgl_cell_plan_tiles_direct_denominator_and_respects_capacity():
                 decomposed = sum(
                     1.0 / (w - e - b + 1j * xi) for _cell in owners)
                 np.testing.assert_array_equal(decomposed, direct)
+
+
+def test_hgl_cell_rules_rephase_the_direct_scalar_kernel(monkeypatch):
+    """The +/crossing/- rows reproduce ``exp(i*t*(omega-E-B))``.
+
+    This is the complete scalar coefficient product used by the production
+    G, W, and omega projector, including both reference phases.  One A value,
+    one omega point, and three deterministic pole values populate exactly one
+    cell of each kind; no random tensor or frontend fixture is involved.
+    """
+    from gw import ppm_windows
+    from gw.minimax_screening import (
+        CrossingMinimaxQuadrature,
+        LaplaceMinimaxQuadrature,
+    )
+
+    tau_laplace = 0.7
+    tau_cross_hat = 0.5
+
+    def _laplace(x_min, x_max, **kwargs):
+        return LaplaceMinimaxQuadrature(
+            x_min=float(x_min), x_max=float(x_max),
+            tau=np.array([tau_laplace]), alpha=np.array([1.0]),
+            max_error=0.0, provenance="deterministic scalar rule")
+
+    def _crossing(A_dim, **kwargs):
+        return CrossingMinimaxQuadrature(
+            A_dim=float(A_dim), tau=np.array([tau_cross_hat]),
+            alpha=np.array([1.0]), max_error=0.0, target_kind="hgl",
+            provenance="deterministic scalar rule")
+
+    monkeypatch.setattr(
+        ppm_windows, "solve_laplace_minimax_interval", _laplace)
+    monkeypatch.setattr(
+        ppm_windows, "solve_phase_minimax_bandwidth", _crossing)
+
+    xi = 0.2
+    omega = 1.0
+    energy = 0.2
+    poles = np.array([[[0.4, 0.8, 1.2]]], dtype=np.float64)
+    windows, _plan = ppm_windows._build_partitioned_hgl_windows(
+        E_A=np.array([[energy]], dtype=np.float64),
+        base_mask_A=np.array([[True]]),
+        Omega_q=ppm_windows.jnp.asarray(poles),
+        base_mask_B=ppm_windows.jnp.ones(poles.shape, dtype=bool),
+        omega_nonneg_ry=np.array([omega]),
+        neg_omega_half=False,
+        regularization_width_ry=xi,
+        edge_factor=1.5,
+        target_error=1.0e-6,
+        max_nodes=64,
+        crossing_eps_q=1.0e-3,
+        crossing_max_nodes=64,
+        use_shipped_tables=False,
+    )
+    assert [w.name for w in windows] == [
+        "pane_positive", "pane_crossing", "pane_negative"]
+
+    pole_for = {"pane_positive": 0.4, "pane_crossing": 0.8,
+                "pane_negative": 1.2}
+    for window in windows:
+        pole = pole_for[window.name]
+        t = complex(np.asarray(window.nodes.t)[0])
+        alpha = complex(np.asarray(window.nodes.alpha)[0])
+        factorized = (
+            np.exp(-1j * (energy - window.E_ref_A) * t)
+            * np.exp(-1j * (pole - window.E_ref_B) * t)
+            * np.exp(-1j * (
+                window.E_ref_A + window.E_ref_B - omega) * t)
+        )
+        direct_phase = np.exp(1j * t * (omega - energy - pole))
+        np.testing.assert_allclose(
+            factorized, direct_phase, rtol=2.0e-15, atol=2.0e-15)
+
+        direct_weighted = window.prefactor * alpha * direct_phase
+        factorized_weighted = window.prefactor * alpha * factorized
+        if window.project == "imag":
+            # Diagonal band-adjoint completion is Im(Z).
+            np.testing.assert_allclose(
+                np.imag(factorized_weighted),
+                np.imag(direct_weighted), rtol=2.0e-15, atol=2.0e-15)
+        else:
+            np.testing.assert_allclose(
+                factorized_weighted, direct_weighted,
+                rtol=2.0e-15, atol=2.0e-15)
+
+    assert complex(np.asarray(windows[0].nodes.t)[0]).imag > 0.0
+    assert complex(np.asarray(windows[2].nodes.t)[0]).imag < 0.0
+    assert [w.prefactor for w in windows] == [-1.0, -1.0, 1.0]
+
+
+def test_memory_tile_sink_splices_disjoint_omega_clusters():
+    """Cluster rows assemble on the existing bracket-then-omega layout."""
+    from gw.ppm_accumulators import _MemoryTileSink
+
+    sink = _MemoryTileSink(shape=(1, 5, 1, 1, 1), sharding=None)
+    shard_index = [(slice(None), slice(None), slice(None), slice(None))]
+    devices = [None]
+    sink.consume_window(
+        [np.array([2.0, 3.0], dtype=np.complex128).reshape(1, 2, 1, 1, 1)],
+        shard_index, devices, omega_indices=np.array([0, 3]))
+    sink.consume_window(
+        [np.array([5.0, 7.0], dtype=np.complex128).reshape(1, 2, 1, 1, 1)],
+        shard_index, devices, omega_indices=np.array([1, 4]))
+    tiles, _, _ = sink.host_tiles()
+    np.testing.assert_array_equal(
+        tiles[0].reshape(-1), np.array([2.0, 5.0, 0.0, 3.0, 7.0]))
+    with pytest.raises(RuntimeError, match="cannot mix clustered"):
+        sink.consume_window(
+            [np.zeros((1, 5, 1, 1, 1), dtype=np.complex128)],
+            shard_index, devices)
 
 
 def _build_branch_windows():
