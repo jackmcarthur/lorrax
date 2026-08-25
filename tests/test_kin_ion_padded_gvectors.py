@@ -50,6 +50,9 @@ kernels return.
 """
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import numpy as np
 
 import jax
@@ -448,6 +451,29 @@ def test_padded_gvectors_refuses_unpaired_k_rows(monkeypatch):
 
     with pytest.raises(ValueError, match="coordinate half of the G table"):
         padded_gvectors(object())
+
+
+def test_sweep_consumers_take_kvecs_from_the_same_gtab():
+    """Every migrated sweep pairs ``gtab.gvecs`` with ``gtab.kvecs``."""
+    root = Path(__file__).resolve().parents[1]
+    for relpath, expected in (
+            ("src/gw/kin_ion_io.py", 2),
+            ("src/gw/sc_iteration.py", 1),
+    ):
+        tree = ast.parse((root / relpath).read_text(encoding="utf-8"))
+        paired = 0
+        for call in (node for node in ast.walk(tree)
+                     if isinstance(node, ast.Call)):
+            keywords = {kw.arg: kw.value for kw in call.keywords
+                        if kw.arg is not None}
+            if ast.unparse(keywords.get("gvecs")) != "gtab.gvecs":
+                continue
+            paired += 1
+            assert ast.unparse(keywords.get("kvecs")) == "gtab.kvecs", (
+                f"{relpath}:{call.lineno} separates the physical k "
+                "representative from the PaddedGVectors G rows")
+        assert paired == expected, (
+            f"{relpath}: expected {expected} gtab-backed sweeps, found {paired}")
 
 
 # ---------------------------------------------------------------------------
