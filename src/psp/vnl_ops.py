@@ -189,6 +189,26 @@ class ICLVNLFiniteTransfer:
     vnl_path_operator_fingerprint: str
 
 
+@dataclass(frozen=True)
+class ICLVNLFiniteContact:
+    r"""Exact straight-path ``q,-q`` VNL two-photon contact action.
+
+    ``lambda_cart_ket`` is the unscaled Pauli-Hamiltonian vertex.  The
+    separately owned kinetic contact ``2 delta_ab`` is deliberately absent.
+    The Ward certificate contracts the first Cartesian photon index.
+    """
+
+    lambda_cart_ket: jax.Array
+    ward_residual_abs: jax.Array
+    ward_residual_rel: jax.Array
+    ward_reference_norm: jax.Array
+    certified: jax.Array
+    tolerance_abs: float
+    tolerance_rel: float
+    path_order: int
+    vnl_path_operator_fingerprint: str
+
+
 # ---------------------------------------------------------------------------
 # Setup builder
 # ---------------------------------------------------------------------------
@@ -1483,10 +1503,15 @@ def apply_icl_vnl_transfer_jet_to_ket(
     )
 
 
-def icl_vnl_finite_transfer_operator_fingerprint(
-    setup: VNLSetup, *, path_order: int, path_rtol: float, path_atol: float,
+def _icl_vnl_path_operator_fingerprint(
+    setup: VNLSetup,
+    *,
+    schema_tag: bytes,
+    path_order: int,
+    path_rtol: float,
+    path_atol: float,
 ) -> str:
-    """Bind the canonical VNL identity and selected path integration rule."""
+    """Bind one ICL vertex kind to the shared VNL/path quadrature owner."""
     import hashlib
     from common.parallel_transport import fingerprint_update_value
 
@@ -1499,7 +1524,7 @@ def icl_vnl_finite_transfer_operator_fingerprint(
         raise ValueError("path tolerances must be finite, rtol>0 and atol>=0")
     gauss_legendre_interval(int(path_order), 0.0, 1.0)  # validates order
     digest = hashlib.sha256()
-    digest.update(b"lorrax.icl_vnl_finite_transfer/v1\0")
+    digest.update(schema_tag + b"\0")
     for label, value in (
         ("vnl", vnl_fingerprint),
         ("path", ICL_STRAIGHT_GAUGE_PATH),
@@ -1510,6 +1535,32 @@ def icl_vnl_finite_transfer_operator_fingerprint(
     ):
         fingerprint_update_value(digest, label, value)
     return "sha256:" + digest.hexdigest()
+
+
+def icl_vnl_finite_transfer_operator_fingerprint(
+    setup: VNLSetup, *, path_order: int, path_rtol: float, path_atol: float,
+) -> str:
+    """Bind the canonical one-photon VNL path integration rule."""
+    return _icl_vnl_path_operator_fingerprint(
+        setup,
+        schema_tag=b"lorrax.icl_vnl_finite_transfer/v1",
+        path_order=path_order,
+        path_rtol=path_rtol,
+        path_atol=path_atol,
+    )
+
+
+def icl_vnl_finite_contact_operator_fingerprint(
+    setup: VNLSetup, *, path_order: int, path_rtol: float, path_atol: float,
+) -> str:
+    """Bind the canonical ``q,-q`` two-photon VNL path integration rule."""
+    return _icl_vnl_path_operator_fingerprint(
+        setup,
+        schema_tag=b"lorrax.icl_vnl_finite_contact/v1",
+        path_order=path_order,
+        path_rtol=path_rtol,
+        path_atol=path_atol,
+    )
 
 
 def compute_icl_vnl_finite_transfer_to_ket(
@@ -1625,6 +1676,142 @@ def compute_icl_vnl_finite_transfer_to_ket(
             icl_vnl_finite_transfer_operator_fingerprint(
                 setup, path_order=path_order, path_rtol=path_rtol,
                 path_atol=path_atol)),
+    )
+
+
+def compute_icl_vnl_finite_contact_to_ket(
+    psi_G,
+    G_int,
+    k_crys,
+    q_crys,
+    setup: VNLSetup,
+    g_mask,
+    *,
+    path_order: int = 12,
+    path_rtol: float = 1.0e-10,
+    path_atol: float = 1.0e-12,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+) -> ICLVNLFiniteContact:
+    r"""Apply the exact straight-path VNL contact for photons ``q,-q``.
+
+    For the repository orientation and positive raw Hamiltonian vertex,
+
+    .. math::
+
+       \Lambda^{\rm NL}_{ab}(k;q,-q)
+       &= \int_0^1 ds\int_0^1 dt\,
+          V^{\rm NL}_{,ab}(k-(s-t)q) \\
+       &= \int_0^1 du\,(1-u)\left[
+          V^{\rm NL}_{,ab}(k-uq)+V^{\rm NL}_{,ab}(k+uq)\right].
+
+    The second form is one fixed Gauss--Legendre scan through the incumbent
+    bounded projector/coefficient/re-expansion core.  It is even in ``q``
+    and tends to the uniform ``lambda_raw`` without a fitted long-wave
+    limit.  Contracting the first photon index gives the exact path Ward
+    identity
+
+    .. math::
+
+       q_a\Lambda_{ab}=\int_0^1du\,[V_{,b}(k+uq)-V_{,b}(k-uq)].
+
+    ``q_crys`` is a crystal-coordinate photon transfer while both vertex
+    indices and the Ward contraction are Cartesian.  The net transfer is
+    zero, so this operator maps the ket ``k`` carrier back to the same
+    carrier.  The kinetic contact remains owned by
+    :func:`psp.dft_operators.apply_kinetic_contact_to_ket`.
+    """
+    psi = jnp.asarray(psi_G)
+    G_values = jnp.asarray(G_int, dtype=jnp.int32)
+    k = jnp.asarray(k_crys, dtype=jnp.float64)
+    q = jnp.asarray(q_crys, dtype=jnp.float64)
+    mask = jnp.asarray(g_mask, dtype=jnp.float64)
+    if k.shape != (3,) or q.shape != (3,):
+        raise ValueError("k_crys and q_crys must both have shape (3,)")
+
+    fingerprint = icl_vnl_finite_contact_operator_fingerprint(
+        setup,
+        path_order=path_order,
+        path_rtol=path_rtol,
+        path_atol=path_atol,
+    )
+    nodes_np, weights_np = gauss_legendre_interval(
+        int(path_order), 0.0, 1.0)
+    nodes = jnp.asarray(nodes_np, dtype=jnp.float64)
+    weights = jnp.asarray(weights_np, dtype=jnp.float64)
+
+    nband, nG = int(psi.shape[0]), int(G_values.shape[0])
+    contact_zero = jnp.zeros(
+        (3, 3, nband, 2, nG), dtype=psi.dtype)
+    current_difference_zero = jnp.zeros(
+        (3, nband, 2, nG), dtype=psi.dtype)
+
+    def path_pass(carry, xs):
+        contact, current_difference = carry
+        path_node, weight = xs
+        minus = _apply_vnl_derivatives_between_g_carriers(
+            psi, G_values, G_values, k - path_node * q, setup, mask, mask,
+            derivative_order=2,
+            projector_row_chunk=projector_row_chunk,
+            g_chunk=g_chunk,
+        )
+        plus = _apply_vnl_derivatives_between_g_carriers(
+            psi, G_values, G_values, k + path_node * q, setup, mask, mask,
+            derivative_order=2,
+            projector_row_chunk=projector_row_chunk,
+            g_chunk=g_chunk,
+        )
+        real_weight = weight.astype(contact.real.dtype)
+        triangle_weight = real_weight * (1.0 - path_node)
+        return (
+            contact + triangle_weight * (
+                minus.lambda_cart_ket + plus.lambda_cart_ket),
+            current_difference + real_weight * (
+                plus.gamma_cart_ket - minus.gamma_cart_ket),
+        ), None
+
+    (contact, current_difference), _ = jax.lax.scan(
+        path_pass,
+        (contact_zero, current_difference_zero),
+        (nodes, weights),
+        unroll=1,
+    )
+
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    q_cart = q @ B
+    ward_delta = jnp.einsum(
+        "a,abnsG->bnsG", q_cart, contact, optimize=True
+    ) - current_difference
+    error_abs = jnp.sqrt(jnp.real(jnp.vdot(ward_delta, ward_delta)))
+    reference_norm = jnp.sqrt(jnp.real(jnp.vdot(
+        current_difference, current_difference)))
+    error_rel = error_abs / jnp.maximum(
+        reference_norm, jnp.asarray(np.finfo(np.float64).tiny))
+
+    radius_at_endpoints = jnp.stack([
+        jnp.linalg.norm((G_values + k + sign * q) @ B, axis=-1)
+        for sign in (-1.0, 1.0)
+    ])
+    max_radius = jnp.max(jnp.where(
+        mask[None, :] > 0.0, radius_at_endpoints, 0.0))
+    radial_covered = max_radius <= jnp.asarray(
+        float(setup.q_max) * (1.0 + 16.0 * np.finfo(np.float64).eps),
+        dtype=jnp.float64)
+    certificate_limit = (
+        jnp.asarray(float(path_atol), dtype=jnp.float64)
+        + jnp.asarray(float(path_rtol), dtype=jnp.float64) * reference_norm)
+    certified = jnp.logical_and(
+        radial_covered, error_abs <= certificate_limit)
+    return ICLVNLFiniteContact(
+        lambda_cart_ket=contact,
+        ward_residual_abs=error_abs,
+        ward_residual_rel=error_rel,
+        ward_reference_norm=reference_norm,
+        certified=certified,
+        tolerance_abs=float(path_atol),
+        tolerance_rel=float(path_rtol),
+        path_order=int(path_order),
+        vnl_path_operator_fingerprint=fingerprint,
     )
 
 
