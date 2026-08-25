@@ -194,17 +194,11 @@ def resolve_rank_policy_mode() -> str:
 
 
 def resolve_galerkin_rank_multiplier(value) -> float:
-    """Validate the opt-in cross-k Galerkin model-order multiplier.
+    """Resolve the whole-state randomized-QRCP search ceiling.
 
-    ``0`` preserves the historical numerical-rank solve.  A positive value
-    means ``ceil(value * N_band)`` shared alpha directions, capped by the
-    numerical rank.  Values below one are refused: fewer alpha directions
-    than bands at one k cannot give the row-orthonormal coefficient block
-    required by :func:`build_fH_R`.
-
-    This is deliberately separate from ``rtol``.  The latter protects a
-    pseudo-inverse from numerical noise; this value is an explicit physical
-    model-order approximation that exploits redundancy between k points.
+    The published default is ``20*N_band``.  ``0`` remains a compatibility
+    spelling of 20 for archived decks, not an alternate exact-span path.
+    The QR threshold—not this ceiling—selects the delivered physical rank.
     """
     return validate_rank_multiplier(
         value, name="htransform_rank_multiplier")
@@ -226,19 +220,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
                              eigh_backend: str = "auto",
-                             eigh_plan=None,
-                             rank_multiplier: float = 0.0,
+                             rank_multiplier: float = 20.0,
+                             qr_eps: float = 1.0e-3,
+                             qrcp_seed: int = 0,
                              progress_fn=None, rank_record_fn=None):
     """Htransform policy adapter for :func:`isdf.galerkin.fit_galerkin_basis`."""
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
-    if rank_multiplier > 0.0 and return_full_proj:
-        raise ValueError(
-            "streaming_galerkin_solve: htransform_rank_multiplier cannot be "
-            "combined with return_full_proj/refit. The reduced route applies "
-            "a k-dependent Löwdin map to ctilde, while W_proj is one global "
-            "full-r projector; pretending they share one alpha gauge would "
-            "give the refit wrong wavefunctions. Use vq-mode=interp/ongrid "
-            "or htransform_rank_multiplier=0 for refit.")
     from common.gpu_utils import _get_jax_gpu_memory_bytes
     device_pool_limit, _, _ = _get_jax_gpu_memory_bytes()
     basis = fit_galerkin_basis(
@@ -249,8 +236,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         bispinor=bispinor,
         include_projector=return_full_proj,
         eigh_backend=eigh_backend,
-        eigh_plan=eigh_plan,
         rank_multiplier=rank_multiplier,
+        qr_eps=qr_eps,
+        qrcp_seed=qrcp_seed,
         q_tile_budget=resolve_galerkin_chunk_bytes(),
         device_pool_limit=device_pool_limit,
         rank_policy_mode=resolve_rank_policy_mode(),
@@ -867,7 +855,16 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                f"than zero-padded.  f(ε) ≡ 0 for ε ≥ max_k ε[nb−1], so the "
                f"guards absorb the shoulder and every band the caller asks "
                f"for is interior to fH.")
-    bispinor = bool(params.get("bispinor", False))
+    # Htransform interpolates the one-particle Hamiltonian.  A bispinor GW
+    # deck changes the QP energies supplied through eqp1.dat; it does not
+    # require rebuilding a four-component interpolation basis.  The source
+    # WFN's canonical spinors therefore remain the sole wavefunction route.
+    # This also keeps scalar/bare/full energy arms in one fixed gauge.
+    _gw_bispinor = bool(params.get("bispinor", False))
+    bispinor = False
+    if _gw_bispinor:
+        log_fn("  [route] bispinor QP energies with the canonical spinor "
+               "WFN interpolation basis (no synthetic small components)")
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     # ``sys_dim`` IS A DECK KEY AND ``Meta`` HAS NO FIELD FOR IT.  The GW
     # driver stamps it on the Meta it builds (``gw_jax.main``:
@@ -944,8 +941,9 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # got the native replicated Gram eigh anyway — the key was
             # parsed, defaulted, stored and read by nobody on this driver.
             eigh_backend=resolve_eigh_backend(params),
-            eigh_plan=galerkin_eigh_plan,
-            rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
+            rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
+            qr_eps=params.get("htransform_qr_eps", 1.0e-3),
+            qrcp_seed=params.get("htransform_qrcp_seed", 0),
             progress_fn=progress_fn,
             rank_record_fn=rank_record_fn,
         )

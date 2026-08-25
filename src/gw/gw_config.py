@@ -2292,12 +2292,12 @@ _DEFAULTS = {
     "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
-    # 0 preserves the exact numerical-rank htransform span.  A value >= 1 is
-    # an explicit cross-k model-order approximation: retain approximately
-    # multiplier * (bands in the htransform window) shared alpha directions,
-    # then restore the per-k row-isometry required by f(H).  This is NOT an
-    # rtol alias and must be converged on the final observable.
-    "htransform_rank_multiplier": 0.0,
+    # Search ceiling for the published whole-state randomized QRCP basis.
+    # The qr_eps rank criterion selects the physical rank; this multiplier
+    # only bounds the search.  0 is accepted as an archived spelling of 20.
+    "htransform_rank_multiplier": 20.0,
+    "htransform_qr_eps": 1.0e-3,
+    "htransform_qrcp_seed": 0,
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
