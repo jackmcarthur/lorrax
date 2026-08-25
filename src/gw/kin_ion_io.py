@@ -746,6 +746,13 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
             psi_k, nocc=None, weight=wk,
             cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
         )
+        # The Python loop is otherwise an asynchronous dispatch queue.  At a
+        # large FFT grid, queuing every local item can retain several completed
+        # box/workspace families until the final np.asarray synchronisation.
+        # Make the updated carry the per-item scheduling boundary so psi_k and
+        # its FFT temporaries are dead before the next item is loaded.  This is
+        # the same arithmetic and the same accumulator order.
+        rho_local.block_until_ready()
         del psi_k
     with timing.section("vh_rho_psum"):
         return psum_replicate(np.asarray(rho_local), mesh)
