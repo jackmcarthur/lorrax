@@ -108,6 +108,24 @@ QP_ROT_FULL_BZ_DATASETS = ("kpoints_crys", "kirr_to_kfull")
 #: second time in each driver would create another metadata contract.
 QP_ROT_METADATA_DATASETS = ("band_range", "kpoints_crys", "kgrid")
 
+#: Source mean-field identity for the DFT-band basis in which ``U_mnk`` is
+#: expressed.  These are root attributes because they do not carry a k axis
+#: and must survive either full-BZ or wedge storage unchanged.
+QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR = "source_wfn_fingerprint_scheme"
+QP_ROT_WFN_FINGERPRINT_ATTR = "source_wfn_fingerprint"
+
+
+def _require_wfn_fingerprint(value, *, where: str) -> str:
+    """Validate the canonical owner's lowercase SHA-256 representation."""
+    fingerprint = str(value).strip()
+    if (len(fingerprint) != 64
+            or any(c not in "0123456789abcdef" for c in fingerprint)):
+        raise ValueError(
+            f"{where} must be a 64-digit lowercase hexadecimal SHA-256, "
+            f"got {value!r}.")
+    return fingerprint
+
+
 #: Root attribute :func:`write_qp_wfn_h5` stamps on its output, and the ONLY
 #: content-based way to tell a QP WFN.h5 from a mean-field one.  A QP WFN's ψ
 #: and E are a matched pair — the rotated orbitals carry the eigenvalues that
@@ -188,6 +206,7 @@ def write_qp_rotations_h5(
     kirr_to_kfull: np.ndarray = None,
     k_storage: str = "full",
     star_tables=None,
+    source_wfn=None,
     print_fn=None,
 ):
     """Write QP rotation matrices and eigenvalues to HDF5 file.
@@ -215,6 +234,9 @@ def write_qp_rotations_h5(
                the reader unfolds with, written INTO the file beside the
                arrays.  A table that lives elsewhere is a table that
                silently decays when anything upstream is regenerated.
+        source_wfn: loaded mean-field WFN whose DFT-band basis defines
+               ``U_mnk``.  Required: the writer computes the artifact's
+               identity through :func:`common.parallel_transport.wfn_fingerprint`.
         print_fn: where the storage decision is announced, or ``None``.
 
     For postprocessing WFN.h5 → WFN_qp.h5:
@@ -238,6 +260,19 @@ def write_qp_rotations_h5(
             f"{QP_ROTATIONS_K_STORAGE}.")
 
     say = print_fn if print_fn is not None else (lambda *_a, **_k: None)
+    if source_wfn is None:
+        raise ValueError(
+            "write_qp_rotations_h5 requires source_wfn: U_mnk is labelled "
+            "in that WFN's DFT-band basis and an unstamped future artifact "
+            "cannot be authenticated by a consumer.")
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME,
+        wfn_fingerprint,
+    )
+    source_wfn_scheme = WFN_FINGERPRINT_SCHEME
+    source_wfn_fingerprint = _require_wfn_fingerprint(
+        wfn_fingerprint(source_wfn),
+        where="write_qp_rotations_h5 canonical WFN fingerprint")
     payload = {
         "U_mnk": np.asarray(U_mnk),
         "E_qp_nk_hartree": np.asarray(E_qp_nk),
@@ -359,6 +394,8 @@ def write_qp_rotations_h5(
         )
         f.attrs['energy_units'] = 'E_qp_nk_hartree in Hartree, E_qp_nk_rydberg in Rydberg'
         f.attrs['band_convention'] = '0-based indexing; bands [band_start, band_stop) were computed'
+        f.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR] = source_wfn_scheme
+        f.attrs[QP_ROT_WFN_FINGERPRINT_ATTR] = source_wfn_fingerprint
         if kirr_to_kfull is not None:
             f.attrs['mapping_description'] = (
                 'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
@@ -426,9 +463,11 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
     driver.
 
     Returns ``U_mnk`` and ``E_qp_nk_rydberg`` on the full BZ together with
-    ``band_range``, ``kpoints_crys`` and ``kgrid``.  A partial artifact is
-    refused: a rotation without its matched eigenvalues, band labels or
-    k-set cannot define ``H_QP = U diag(E_QP) U^H``.
+    ``band_range``, ``kpoints_crys``, ``kgrid`` and the optional legacy/source
+    WFN fingerprint pair.  A partial artifact is refused: a rotation without
+    its matched eigenvalues, band labels or k-set cannot define
+    ``H_QP = U diag(E_QP) U^H``; one fingerprint attribute without the other
+    cannot define which identity scheme was used.
     """
     path = os.fspath(h5_path)
     arrays = read_qp_rotations_full_bz(
@@ -448,7 +487,67 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
                 h5["kpoints_crys"][()], dtype=np.float64),
             "kgrid": np.asarray(h5["kgrid"][()], dtype=np.int64),
         })
+        has_scheme = QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR in h5.attrs
+        has_fingerprint = QP_ROT_WFN_FINGERPRINT_ATTR in h5.attrs
+        if has_scheme != has_fingerprint:
+            raise ValueError(
+                f"{os.path.basename(path)} has an incomplete source-WFN "
+                "identity: fingerprint and scheme attributes must appear "
+                "together.")
+        if has_fingerprint:
+            def _text(value):
+                return value.decode("ascii") if isinstance(value, bytes) \
+                    else str(value)
+            scheme = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR])
+            fingerprint = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_ATTR])
+            fingerprint = _require_wfn_fingerprint(
+                fingerprint,
+                where=(f"{os.path.basename(path)} source-WFN fingerprint"))
+        else:
+            scheme = fingerprint = None
+        arrays["source_wfn_fingerprint_scheme"] = scheme
+        arrays["source_wfn_fingerprint"] = fingerprint
     return arrays
+
+
+def authenticate_qp_rotations_source_wfn(
+        artifact: dict, source_wfn, *, artifact_path: str) -> str:
+    """Require that one QP rotation artifact names its exact DFT basis.
+
+    Every consumer that applies ``U_mnk`` calls this owner after
+    :func:`read_qp_rotations_artifact`.  The comparison deliberately uses
+    the already-loaded WFN and the sole repository fingerprint service; a
+    filename, k-grid, or array shape is not a DFT-band-basis identity.
+    """
+    name = os.path.basename(os.fspath(artifact_path))
+    scheme = artifact.get("source_wfn_fingerprint_scheme")
+    fingerprint = artifact.get("source_wfn_fingerprint")
+    if scheme is None or fingerprint is None:
+        raise ValueError(
+            f"{name} has no authenticated source-WFN fingerprint.  "
+            "Regenerate the QP rotation artifact through the canonical "
+            "writer with the mean-field WFN that defines U_mnk; matching "
+            "filenames, k grids, and band counts do not prove the DFT-band "
+            "basis identity.")
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME,
+        wfn_fingerprint,
+    )
+    if scheme != WFN_FINGERPRINT_SCHEME:
+        raise ValueError(
+            f"{name} source-WFN fingerprint scheme {scheme!r} does not "
+            "match the installed canonical scheme "
+            f"{WFN_FINGERPRINT_SCHEME!r}.")
+    expected = _require_wfn_fingerprint(
+        wfn_fingerprint(source_wfn),
+        where="installed canonical WFN fingerprint")
+    if fingerprint != expected:
+        raise ValueError(
+            f"{name} was produced from a different mean-field WFN "
+            f"(source fingerprint {fingerprint}, selected WFN fingerprint "
+            f"{expected}).  U_mnk is expressed in the source WFN's DFT-band "
+            "basis and may not be applied by shape.")
+    return expected
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +824,15 @@ def refuse_conflicting_qp_state_sources(
     restart join, missing legacy provenance refuses an external QP source
     because its band labels cannot be proved to index the stored ``psi/E``.
 
-    Association is established only by explicit arguments and the content
-    stamp.  In particular, this owner never infers a relationship from a
-    filename or sibling directory: ``qp_wfn_rotations.h5`` does not yet carry
-    a source-WFN fingerprint.  When ``state_artifact_path`` is supplied, its
-    canonical content fingerprint is compared with the selected WFN.  A
-    missing legacy record remains usable only without an external or positive
-    QP description.
+    Association is established only by explicit arguments and content
+    stamps.  In particular, this owner never infers a relationship from a
+    filename or sibling directory.  A rotation consumer separately requires
+    its source-WFN fingerprint through
+    :func:`authenticate_qp_rotations_source_wfn`; when
+    ``state_artifact_path`` is supplied here, the restart carrier's canonical
+    content fingerprint is compared with the selected WFN.  A missing legacy
+    restart record remains usable only without an external or positive QP
+    description.
     """
     if eqp_file and qp_rotations_file:
         raise ValueError(
