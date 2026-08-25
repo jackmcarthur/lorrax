@@ -245,9 +245,68 @@ def parse_catalog(raw: Mapping[str, Any], *, catalog_name: str
             f"a {type(tables).__name__}, not a list.")
     default_family = raw.get("family") if isinstance(raw.get("family"), str) \
         else None
-    return tuple(parse_entry(e, i, catalog_name=catalog_name,
-                             default_family=default_family)
-                 for i, e in enumerate(tables))
+    entries = tuple(parse_entry(e, i, catalog_name=catalog_name,
+                                default_family=default_family)
+                    for i, e in enumerate(tables))
+    schema_version = int(raw.get("schema_version", 0))
+    top_provenance = raw.get("provenance")
+    top_certificate = raw.get("certification")
+    for entry in entries:
+        if not entry.certified:
+            continue
+        missing = [key for key in (
+            "payload_sha256", "kappa0", "max_error")
+            if entry.raw.get(key) is None]
+        certificate = entry.raw.get("certification", top_certificate)
+        provenance = entry.raw.get("provenance", top_provenance)
+        if certificate is None:
+            missing.append("certification")
+        if provenance is None:
+            missing.append("provenance")
+        if schema_version <= 1 and "provenance" not in entry.raw:
+            missing.append("per-entry provenance")
+        if missing:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} is incomplete; missing {missing}.")
+        if not isinstance(certificate, Mapping) or not certificate:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has no usable certification object.")
+        if not isinstance(provenance, Mapping):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has no usable provenance object.")
+        required_provenance = (
+            ("tool", "tool_sha256", "generator_commit", "backend_sha256")
+            if schema_version <= 1 else ("tool",))
+        missing_provenance = [key for key in required_provenance
+                              if not provenance.get(key)]
+        if (schema_version > 1
+                and not (provenance.get("generator_commit")
+                         or provenance.get("tool_sha256"))):
+            missing_provenance.append("generator_commit|tool_sha256")
+        if (schema_version > 1
+                and not any(provenance.get(key)
+                            for key in ("backend_sha256", "numpy", "scipy",
+                                        "python"))):
+            missing_provenance.append("backend identity")
+        if missing_provenance:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} provenance lacks {missing_provenance}.")
+        for key in ("payload_sha256",):
+            value = str(entry.raw[key])
+            if len(value) != 64 or any(c not in "0123456789abcdef"
+                                      for c in value.lower()):
+                raise CatalogCorrupt(
+                    f"minimax: certified catalog {catalog_name!r} entry "
+                    f"{entry.index} has invalid {key}={value!r}.")
+        if not np.isfinite(float(entry.raw["kappa0"])):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has non-finite kappa0.")
+    return entries
 
 
 @lru_cache(maxsize=4)
@@ -440,6 +499,12 @@ def load_table(entry: CatalogEntry) -> tuple[np.ndarray, np.ndarray, float,
                 f"minimax: shipped table {entry.file!r} payload SHA-256 "
                 f"is {actual_payload}, but catalog {entry.catalog_name!r} "
                 f"entry {entry.index} stamps {expected_payload!r}.")
+    if (entry.certified and entry.claimed_max_error is not None
+            and err != entry.claimed_max_error):
+        raise TableUnreadable(
+            f"minimax: certified table {entry.file!r} payload max_error "
+            f"{err!r} differs bit-exactly from catalog max_error "
+            f"{entry.claimed_max_error!r}.")
     if entry.kappa0 is not None:
         kappa0 = entry.kappa0
     return tau, alpha, err, kappa0, table_hash
