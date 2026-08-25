@@ -28,6 +28,7 @@ from gw.qsgw_head import (
     rotate_velocity_active_to_qp,
     rotate_velocity_to_qp,
     static_gauge_first_order_component_sharded,
+    static_gauge_second_order_component_sharded,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -153,6 +154,200 @@ def test_static_gauge_first_order_component_reuses_charge_head_and_state_jet():
             mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
             cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2,
             surface_weight_kn=jnp.ones_like(jnp.asarray(energies)))
+
+
+def test_static_gauge_second_order_retained_jet_and_weight_hessian():
+    mesh = _mesh()
+    kgrid = (8, 5, 1)
+    nk, nb = int(np.prod(kgrid)), 2
+    kints = np.stack(np.unravel_index(
+        np.arange(nk), kgrid), axis=1).astype(np.int32)
+    plus = build_forward_neighbor_table(kints, kgrid)
+
+    sigma_x = np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    connections_exact = (2.0 * np.pi * sigma_x, 2.0 * np.pi * sigma_x)
+    eye = np.eye(nb, dtype=np.complex128)
+    links = np.broadcast_to(eye, (3, nk, nb, nb)).copy()
+    connections = []
+    for axis, (grid_n, a_exact) in enumerate(zip(kgrid[:2], connections_exact)):
+        h = 1.0 / grid_n
+        evals, evecs = np.linalg.eigh(a_exact)
+        link = evecs @ np.diag(np.exp(-1.0j * h * evals)) @ evecs.conj().T
+        links[axis] = link
+        link2 = link @ link
+        a_discrete = (1.0j / (12.0 * h)) * (
+            -link2 + 8.0 * link - 8.0 * link.conj().T
+            + link2.conj().T)
+        connections.append(0.5 * (a_discrete + a_discrete.conj().T))
+    connections = np.asarray(connections)
+
+    energies = np.broadcast_to(np.asarray([1.0, 0.0]), (nk, nb)).copy()
+    occupations = np.broadcast_to(np.asarray([0.0, 1.0]), (nk, nb)).copy()
+    hamiltonian = np.diag(energies[0])
+    velocity = np.zeros((3, nk, nb, nb), dtype=np.complex128)
+    velocity[0] = (
+        -1.0j * (connections[0] @ hamiltonian
+                  - hamiltonian @ connections[0])
+        + np.diag(np.asarray([0.31, -0.17])))
+    velocity[1] = (
+        -1.0j * (connections[1] @ hamiltonian
+                  - hamiltonian @ connections[1])
+        + np.diag(np.asarray([-0.23, 0.29])))
+    velocity[2] = np.asarray([[0.13, 0.07j], [-0.07j, -0.11]])
+    gamma = np.moveaxis(HALFALPHA * velocity, 0, 1)
+
+    q1 = np.zeros((nk, 3, 3, nb, nb), dtype=np.complex128)
+    q1[:, 0, 0] = np.asarray([[0.02, 0.03j], [-0.03j, -0.01]])
+    q1[:, 0, 1] = np.asarray([[-0.04, 0.01], [0.01, 0.05]])
+    q1[:, 1, 0] = np.asarray([[0.01, -0.02], [-0.02, -0.03]])
+    q1[:, 1, 1] = np.asarray([[0.015, 0.025j], [-0.025j, -0.02]])
+    q1[:, 2, 0] = np.asarray([[-0.01, 0.007], [0.007, 0.012]])
+    q1[:, 2, 1] = np.asarray([[0.019, -0.011j], [0.011j, -0.014]])
+    q2 = np.zeros((nk, 3, 3, 3, nb, nb), dtype=np.complex128)
+    q2[:, :, 0, 0] = np.asarray([
+        [[0.004, 0.002j], [-0.002j, -0.003]],
+        [[-0.002, 0.001], [0.001, 0.005]],
+        [[0.003, -0.001j], [0.001j, -0.004]],
+    ])
+    q2[:, :, 0, 1] = np.asarray([
+        [[-0.001, 0.003], [0.003, 0.002]],
+        [[0.002, -0.001j], [0.001j, -0.004]],
+        [[0.005, 0.002j], [-0.002j, -0.003]],
+    ])
+    q2[:, :, 1, 0] = q2[:, :, 0, 1]
+    q2[:, :, 1, 1] = np.asarray([
+        [[0.006, -0.002j], [0.002j, -0.001]],
+        [[-0.003, 0.004], [0.004, 0.002]],
+        [[0.001, 0.003j], [-0.003j, -0.005]],
+    ])
+    omegas = jnp.asarray([0.37j], dtype=jnp.complex128)
+
+    got = static_gauge_second_order_component_sharded(
+        jnp.asarray(gamma), jnp.asarray(q1), jnp.asarray(q2),
+        jnp.asarray(links), plus, jnp.asarray(energies),
+        jnp.asarray(occupations), omegas,
+        mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
+        cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2)
+
+    def covariant_derivative_const(operator, axis):
+        h = 1.0 / kgrid[axis]
+        link = links[axis, 0]
+        link2 = link @ link
+        tp1 = link @ operator @ link.conj().T
+        tp2 = link2 @ operator @ link2.conj().T
+        tm1 = link.conj().T @ operator @ link
+        tm2 = link2.conj().T @ operator @ link2
+        return (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2) / (12.0 * h)
+
+    connection_derivative = np.asarray([
+        [covariant_derivative_const(connections[a], b) for b in range(2)]
+        for a in range(2)])
+    ordered_t = np.asarray([
+        [1.0j * connection_derivative[a, b]
+         - connections[b] @ connections[a] for b in range(2)]
+        for a in range(2)])
+    retained_t = 0.5 * (ordered_t + np.swapaxes(ordered_t, 0, 1))
+    pairs = ((0, 0), (0, 1), (1, 1))
+    t_pair = np.asarray([retained_t[a, b] for a, b in pairs])
+    gamma_dir = np.moveaxis(gamma, 1, 0)
+    q_current = np.transpose(q1, (2, 1, 0, 3, 4))[:2]
+    expected_e2 = np.empty((3, 4, nk, nb, nb), np.complex128)
+    for p, (a, b) in enumerate(pairs):
+        expected_e2[p, 0] = t_pair[p]
+        for i in range(3):
+            expected_e2[p, i + 1] = (
+                t_pair[p] @ gamma_dir[i, 0]
+                - 1.0j * (
+                    connections[a] @ q_current[b, i, 0]
+                    + connections[b] @ q_current[a, i, 0])
+                + q2[0, i, a, b])
+    np.testing.assert_allclose(
+        got.transition_d2_raw, expected_e2, rtol=3e-13, atol=3e-13)
+
+    velocity_hessian = np.asarray([
+        [0.5 * (
+            covariant_derivative_const(velocity[a, 0], b)
+            + covariant_derivative_const(velocity[b, 0], a))
+         for b in range(2)] for a in range(2)])
+    expected_energy_d2 = np.broadcast_to(np.asarray([
+        np.real(np.diag(velocity_hessian[a, b])) for a, b in pairs
+    ])[:, None, :], (3, nk, nb))
+    np.testing.assert_allclose(
+        got.bra_energy_dq2_ry, expected_energy_d2,
+        rtol=3e-13, atol=3e-13)
+    np.testing.assert_array_equal(
+        got.occupation_difference_dq2,
+        np.zeros_like(np.asarray(got.occupation_difference_dq2)))
+    assert float(got.q2_symmetry_residual) == 0.0
+    assert float(got.ordered_curvature_residual) < 2.0e-14
+
+    delta = energies[:, :, None] - energies[:, None, :]
+    d1 = np.where(
+        delta[None, None] != 0.0,
+        -np.asarray(got.first_order.energy_scaled_d1_raw)
+        / np.where(delta != 0.0, delta, 1.0)[None, None],
+        0.0)
+    m0 = np.concatenate((
+        np.broadcast_to(eye, (1, nk, nb, nb)), gamma_dir), axis=0)
+    f_diff = occupations[:, None, :] - occupations[:, :, None]
+    mask = delta > 0.0
+    prefactor = 4.0 / (7.0 * nk * 2.0)
+    z = complex(np.asarray(omegas)[0])
+    g = delta / (z * z - delta * delta)
+    gp = (z * z + delta * delta) / (z * z - delta * delta) ** 2
+    gpp = (
+        2.0 * delta * (3.0 * z * z + delta * delta)
+        / (z * z - delta * delta) ** 3)
+    phi = f_diff * g
+    energy_d1 = np.asarray(got.first_order.bra_energy_dq_ry)
+    expected_full = np.zeros((1, 3, 4, 4), np.complex128)
+    expected_second_zero = np.zeros_like(expected_full)
+    expected_weight = np.zeros_like(expected_full)
+    for p, (a, b) in enumerate(pairs):
+        phi_a = f_diff * gp * energy_d1[a, :, :, None]
+        phi_b = f_diff * gp * energy_d1[b, :, :, None]
+        phi_ab = f_diff * (
+            gpp * energy_d1[a, :, :, None] * energy_d1[b, :, :, None]
+            + gp * expected_energy_d2[p, :, :, None])
+        for i in range(4):
+            for j in range(4):
+                r_a = np.conj(d1[a, i]) * m0[j] + np.conj(m0[i]) * d1[a, j]
+                r_b = np.conj(d1[b, i]) * m0[j] + np.conj(m0[i]) * d1[b, j]
+                r0 = np.conj(m0[i]) * m0[j]
+                first_first = (
+                    np.conj(d1[a, i]) * d1[b, j]
+                    + np.conj(d1[b, i]) * d1[a, j])
+                second_zero = (
+                    np.conj(expected_e2[p, i]) * m0[j]
+                    + np.conj(m0[i]) * expected_e2[p, j])
+                second_term = prefactor * np.sum(
+                    np.where(mask, phi * second_zero, 0.0))
+                weight_term = prefactor * np.sum(np.where(
+                    mask, phi_a * r_b + phi_b * r_a + phi_ab * r0, 0.0))
+                first_term = prefactor * np.sum(
+                    np.where(mask, phi * first_first, 0.0))
+                expected_second_zero[0, p, i, j] = second_term
+                expected_weight[0, p, i, j] = weight_term
+                expected_full[0, p, i, j] = (
+                    first_term + second_term + weight_term)
+    np.testing.assert_allclose(
+        got.S_second_zero_zero_second, expected_second_zero,
+        rtol=2e-12, atol=2e-12)
+    np.testing.assert_allclose(
+        got.S_response_weight, expected_weight, rtol=2e-12, atol=2e-12)
+    np.testing.assert_allclose(
+        got.S_bubble_second_derivative, expected_full,
+        rtol=2e-12, atol=2e-12)
+
+    bad_q2 = q2.copy()
+    bad_q2[:, 0, 0, 1, 0, 1] += 1.0e-5
+    with pytest.raises(ValueError, match="Q2 transfer indices are not symmetric"):
+        static_gauge_second_order_component_sharded(
+            jnp.asarray(gamma), jnp.asarray(q1), jnp.asarray(bad_q2),
+            jnp.asarray(links), plus, jnp.asarray(energies),
+            jnp.asarray(occupations), omegas,
+            mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
+            cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2)
 
 
 def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
