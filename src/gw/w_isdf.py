@@ -1595,10 +1595,18 @@ def compute_chi0_block(
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
 
-STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
-    "experimental_no_pair_bubble_screened_breit_q0_nearest_shell_v2"
+STATIC_PHOTON_NO_PAIR_MODEL = (
+    "positive_energy_kinetic_balance_dirac_current_v1"
 )
-STATIC_PHOTON_HALL_SOURCE = "absent_uncertified_zero"
+STATIC_PHOTON_LONGWAVE_APPROXIMATION = (
+    "no_pair_dirac_current_bubble_screened_breit_q0_nested_shell_v3"
+)
+STATIC_PHOTON_HALL_SOURCE = (
+    "no_external_hall_term; nested_shell_no_pair_bubble_CT_TC_only"
+)
+
+_ODD_LONGWAVE_DESIGN_RANK = 6   # q_x,q_y plus all four cubic monomials
+_EVEN_LONGWAVE_DESIGN_RANK = 8  # three quadratic plus five quartic monomials
 
 
 @dataclass(frozen=True)
@@ -1629,14 +1637,14 @@ class StaticPhotonLongWaveCoefficients:
 
     ``R(q) = q_a H_direct[a] + q_a q_b Q_direct[a,b]``.
 
-    ``H_direct`` is structurally zero under
-    ``hall_topological_source=absent_uncertified_zero``.  A nearest-shell odd
-    CT/TC signal is not a dc-Hall certificate: cubic spatial dispersion
-    aliases into its linear fit on one radius.  The odd fit is used only in
-    the shell-closure diagnostic until a separately certified Hall/Chern
-    source owns this coefficient.
+    ``H_direct`` contains only the CT/TC part of the declared no-pair bubble's
+    odd q-linear coefficient.  It is obtained together with every cubic odd
+    monomial on a nested radial-shell union, so q-cubic spatial dispersion is
+    not aliased into the returned q-linear term.  It is not an externally
+    supplied, quantized, or gauge-complete Hall/Chern coefficient; that scope
+    is carried explicitly by ``hall_topological_source``.
 
-    and both wings are linear, ``q_a Y_x[a]`` and ``q_b Z_y[b]``.
+    Both returned wings are linear, ``q_a Y_x[a]`` and ``q_b Z_y[b]``.
     ``Q_direct[a,b]`` is coordinate-symmetric; its antisymmetric part is
     unidentifiable because ``q_a q_b`` annihilates it, so this record does
     not pretend to report one.  The
@@ -1660,10 +1668,11 @@ class StaticPhotonLongWaveCoefficients:
     shell_indices: tuple[int, ...]
     shell_directions_xy: tuple[tuple[float, float], ...]
     shell_radii_bohr_inv: tuple[float, ...]
-    linear_rank: int
-    quadratic_rank: int
-    # Maximum fitted Lorentz/body-block shell closure diagnostics.  Analytic
-    # charge replacements are excluded; one shell cannot certify convergence.
+    radial_shell_count: int
+    odd_extrapolation_rank: int
+    even_extrapolation_rank: int
+    # Maximum nested-polynomial Lorentz/body-block closure diagnostics.
+    # Analytic charge replacements are excluded.
     direct_relative_residual: float
     # Wing closure is measured against the odd-in-q shell component that
     # actually defines the linear coefficient.  The even-in-q fraction is a
@@ -1679,6 +1688,7 @@ class StaticPhotonLongWaveCoefficients:
     charge_response_source: str
     hall_topological_source: str
     current_contact: str
+    current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
     approximation: str = STATIC_PHOTON_LONGWAVE_APPROXIMATION
 
 
@@ -1712,18 +1722,20 @@ def _require_named_sharding(array, mesh_xy, spec, name) -> None:
         )
 
 
-def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
-    """Smallest complete +/-q radial-shell union identifying H and Q.
+def _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
+    """Smallest +/-q radial union separating leading and next-order powers.
 
-    ``SymMaps.kqfull_map[0]`` supplies -q; there is no second q lookup.  The
-    next radius is included only when (as on a square axis shell) the nearest
-    radius alone cannot identify the symmetric Q_xy coefficient.
+    ``SymMaps.kqfull_map[0]`` supplies -q; there is no second q lookup.  Radial
+    levels are added in order until the odd design resolves q+q^3 (rank 6)
+    and the even design resolves q^2+q^4 (rank 8).  The returned leading
+    weights therefore extrapolate the declared no-pair response to q=0
+    without folding the first omitted parity-allowed order into it.
     """
     grid = np.asarray(kgrid, dtype=np.int64)
     steps = np.asarray(sym.kvecs_asints, dtype=np.int64)
     nq = int(np.prod(grid))
     if grid.shape != (3,) or np.any(grid <= 0) or steps.shape != (nq, 3):
-        raise ValueError("nearest-shell fit requires one full positive kgrid")
+        raise ValueError("nested-shell fit requires one full positive kgrid")
     steps = np.mod(steps, grid[None, :])
     gamma = np.flatnonzero(np.all(steps == 0, axis=1))
     if not np.array_equal(gamma, np.asarray([0])):
@@ -1740,6 +1752,13 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
         bvec, tuple(int(n) for n in grid), return_unwrapped=True)
     q_cart = q_box.reshape(-1, 3)[fft_flat]
     q_raw = q_raw_box.reshape(-1, 3)[fft_flat]
+    try:
+        negative = np.asarray(sym.kqfull_map[0], dtype=np.int64)
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise ValueError("SymMaps.kqfull_map[0] (-q) is required") from exc
+    if negative.shape != (nq,) or np.any((negative < 0) | (negative >= nq)):
+        raise ValueError("SymMaps.kqfull_map[0] is not a full-BZ permutation")
+
     candidate = np.flatnonzero(
         np.any(steps != 0, axis=1) & (steps[:, 2] == 0))
     # The persisted one-leg coefficient is literally zeta(q,G=0).  If the
@@ -1752,16 +1771,37 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
     wrapped_row = np.linalg.norm(q_cart - q_raw, axis=1) > (
         512.0 * np.finfo(float).eps * wrap_scale)
     radii = np.linalg.norm(q_cart[candidate, :2], axis=1)
-    keep = radii > 0.0
+    partners = negative[candidate]
+    pair_scale = np.maximum(
+        np.maximum(np.linalg.norm(q_cart[candidate], axis=1),
+                   np.linalg.norm(q_cart[partners], axis=1)), 1.0)
+    pair_tol = 512.0 * np.finfo(float).eps * pair_scale
+    pair_ok = (
+        (partners != candidate)
+        & (negative[partners] == candidate)
+        & np.all(steps[partners] == np.mod(-steps[candidate], grid[None, :]),
+                 axis=1)
+        & (np.linalg.norm(
+            q_cart[partners, :2] + q_cart[candidate, :2], axis=1) <= pair_tol)
+    )
+    keep = (radii > 0.0) & ~wrapped_row[candidate] & pair_ok
     candidate, radii = candidate[keep], radii[keep]
     if not candidate.size:
-        raise ValueError("nearest-shell fit found no nonzero in-plane q")
+        raise ValueError(
+            "nested-shell fit found no unwrapped nonzero in-plane +/-q pair")
 
     def _design(q):
-        linear = q
-        quadratic = np.stack(
-            (q[:, 0] ** 2, 2.0 * q[:, 0] * q[:, 1], q[:, 1] ** 2), axis=1)
-        return linear, quadratic
+        scale = float(np.max(np.linalg.norm(q, axis=1)))
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError("nested-shell q scale must be positive")
+        x, y = (q / scale).T
+        odd = np.stack(
+            (x, y, x ** 3, x ** 2 * y, x * y ** 2, y ** 3), axis=1)
+        even = np.stack(
+            (x ** 2, 2.0 * x * y, y ** 2,
+             x ** 4, x ** 3 * y, x ** 2 * y ** 2, x * y ** 3, y ** 4),
+            axis=1)
+        return odd, even, scale
 
     def _rank(a):
         s = np.linalg.svd(a, compute_uv=False)
@@ -1779,40 +1819,33 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
             radii, radius, rtol=1e-11, atol=1e-12 * radius)
         shell = np.asarray(candidate[selected], dtype=np.int32)
         q_shell = np.asarray(q_cart[shell, :2], dtype=np.float64)
-        linear, quadratic = _design(q_shell)
-        linear_rank, linear_tol = _rank(linear)
-        quadratic_rank, quadratic_tol = _rank(quadratic)
-        if (linear_rank, quadratic_rank) == (2, 3):
+        odd_design, even_design, q_scale = _design(q_shell)
+        odd_rank, odd_tol = _rank(odd_design)
+        even_rank, even_tol = _rank(even_design)
+        if (odd_rank, even_rank) == (
+                _ODD_LONGWAVE_DESIGN_RANK, _EVEN_LONGWAVE_DESIGN_RANK):
             break
-    if (linear_rank, quadratic_rank) != (2, 3):
+    if (odd_rank, even_rank) != (
+            _ODD_LONGWAVE_DESIGN_RANK, _EVEN_LONGWAVE_DESIGN_RANK):
         raise ValueError(
-            "nearest-shell active-direction design is rank deficient: "
-            f"linear={linear_rank}/2, quadratic={quadratic_rank}/3")
-    if np.any(wrapped_row[shell]):
-        bad = shell[wrapped_row[shell]]
-        raise ValueError(
-            "nearest-shell photon fit found a selected q whose first-BZ "
-            "Voronoi representative changes the literal G=0 leg: rows="
-            f"{bad.tolist()}. The canonical V producer must persist the "
-            "corresponding argmin-|q+G| one-leg vector before this skew-grid "
-            "shell can be fitted.")
+            "nested-shell no-pair q->0 extrapolation is underdetermined: "
+            f"odd(q+q^3) rank={odd_rank}/{_ODD_LONGWAVE_DESIGN_RANK}, "
+            f"even(q^2+q^4) rank={even_rank}/{_EVEN_LONGWAVE_DESIGN_RANK}, "
+            f"usable_rows={int(candidate.size)}, kgrid={tuple(grid)}. "
+            "The full-BZ mesh must supply at least six independent odd and "
+            "eight independent even +/-q pairs on unwrapped G=0 shells; "
+            "use a finer in-plane kgrid.")
 
-    try:
-        negative = np.asarray(sym.kqfull_map[0], dtype=np.int64)
-    except (AttributeError, IndexError, TypeError) as exc:
-        raise ValueError("SymMaps.kqfull_map[0] (-q) is required") from exc
-    if negative.shape != (nq,) or np.any((negative < 0) | (negative >= nq)):
-        raise ValueError("SymMaps.kqfull_map[0] is not a full-BZ permutation")
     position = np.full(nq, -1, dtype=np.int32)
     position[shell] = np.arange(shell.size, dtype=np.int32)
     partners = negative[shell]
     partner_position = position[partners]
     if np.any(partner_position < 0):
-        raise ValueError("nearest complete shell is missing a -q partner")
+        raise ValueError("nested shell union is missing a -q partner")
     if (np.any(partners == shell) or np.any(negative[partners] != shell)
             or not np.array_equal(
                 steps[partners], np.mod(-steps[shell], grid[None, :]))):
-        raise ValueError("SymMaps -q pairs are ambiguous on the fitted shell")
+        raise ValueError("SymMaps -q pairs are ambiguous on the nested shell")
     scale = max(float(np.max(np.abs(q_cart[shell]))), 1.0)
     tol = 512.0 * np.finfo(float).eps * scale
     if (np.max(np.abs(q_cart[shell, 2])) > tol
@@ -1826,18 +1859,24 @@ def _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr):
     ).astype(np.int32)
     pair_second = partner_position[pair_first].astype(np.int32)
     if 2 * pair_first.size != shell.size:
-        raise ValueError("nearest complete shell does not split into +/-q pairs")
-    linear_weights = np.linalg.pinv(
-        linear, rcond=linear_tol / np.linalg.norm(linear, 2)
-    ) @ (0.5 * (np.eye(shell.size) - pair_rows))
-    quadratic_weights = np.linalg.pinv(
-        quadratic, rcond=quadratic_tol / np.linalg.norm(quadratic, 2)
-    ) @ (0.5 * (np.eye(shell.size) + pair_rows))
+        raise ValueError("nested shell union does not split into +/-q pairs")
+    odd_projector = 0.5 * (np.eye(shell.size) - pair_rows)
+    even_projector = 0.5 * (np.eye(shell.size) + pair_rows)
+    odd_weights = np.linalg.pinv(
+        odd_design, rcond=odd_tol / np.linalg.norm(odd_design, 2)
+    ) @ odd_projector
+    even_weights = np.linalg.pinv(
+        even_design, rcond=even_tol / np.linalg.norm(even_design, 2)
+    ) @ even_projector
+    odd_weights *= np.asarray(
+        [q_scale ** -1] * 2 + [q_scale ** -3] * 4)[:, None]
+    even_weights *= np.asarray(
+        [q_scale ** -2] * 3 + [q_scale ** -4] * 5)[:, None]
     shell_radii = np.linalg.norm(q_shell, axis=1)
     return (
         shell, q_shell, q_shell / shell_radii[:, None], shell_radii,
-        linear_weights, quadratic_weights, pair_first, pair_second,
-        linear_rank, quadratic_rank,
+        odd_weights, even_weights, pair_first, pair_second,
+        odd_rank, even_rank, len(levels),
     )
 
 
@@ -1853,7 +1892,7 @@ def _static_charge_longwave_inputs(charge_response, layout, mesh_xy):
             jax.device_put(np.zeros((2, p_charge), np.complex128), sh_x),
             jax.device_put(np.zeros((p_charge, 2), np.complex128), sh_y),
             False,
-            "nearest_shell_only",
+            "nested_shell_only",
         )
 
     omegas = tuple(complex(z) for z in charge_response.omegas)
@@ -1923,7 +1962,7 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
 
     def _local(
         chi_local, g0_x_local, g0_y_local, shell_indices,
-        q_shell_xy, linear_weights, quadratic_weights,
+        q_shell_xy, odd_weights, even_weights,
         pair_first, pair_second, prefactor,
         inverse_volume,
         charge_S, charge_Y_packed_x, charge_Z_packed_y,
@@ -2013,38 +2052,46 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
         n_shell = shell_indices.shape[0]
         shell_positions = jnp.arange(n_shell, dtype=jnp.int32)
         fit_initial = (
-            jnp.zeros((2, 4, 4), dtype=dtype),
-            jnp.zeros((3, 4, 4), dtype=dtype),
-            jnp.zeros((2, 4, g0_x_local.shape[-1]), dtype=dtype),
-            jnp.zeros((2, g0_y_local.shape[-1], 4), dtype=dtype),
+            jnp.zeros((_ODD_LONGWAVE_DESIGN_RANK, 4, 4), dtype=dtype),
+            jnp.zeros((_EVEN_LONGWAVE_DESIGN_RANK, 4, 4), dtype=dtype),
+            jnp.zeros(
+                (_ODD_LONGWAVE_DESIGN_RANK, 4, g0_x_local.shape[-1]),
+                dtype=dtype),
+            jnp.zeros(
+                (_ODD_LONGWAVE_DESIGN_RANK, g0_y_local.shape[-1], 4),
+                dtype=dtype),
             jnp.asarray(False),
         )
 
         def _fit_row(carry, shell_position):
-            H_acc, q_three_acc, Y_acc, Z_acc, nonfinite_acc = carry
+            odd_acc, even_acc, Y_acc, Z_acc, nonfinite_acc = carry
             r_row, y_row, z_row, _, _, nonfinite_row = (
                 _project_shell_row(shell_position))
-            lw = linear_weights[:, shell_position]
-            qw = quadratic_weights[:, shell_position]
+            ow = odd_weights[:, shell_position]
+            ew = even_weights[:, shell_position]
             return (
-                H_acc + lw[:, None, None] * r_row[None, :, :],
-                q_three_acc + qw[:, None, None] * r_row[None, :, :],
-                Y_acc + lw[:, None, None] * y_row[None, :, :],
-                Z_acc + lw[:, None, None] * z_row[None, :, :],
+                odd_acc + ow[:, None, None] * r_row[None, :, :],
+                even_acc + ew[:, None, None] * r_row[None, :, :],
+                Y_acc + ow[:, None, None] * y_row[None, :, :],
+                Z_acc + ow[:, None, None] * z_row[None, :, :],
                 nonfinite_acc | nonfinite_row,
             ), None
 
-        (H_shell, q_three, Y, Z, sampled_nonfinite), _ = jax.lax.scan(
-            _fit_row, fit_initial, shell_positions, unroll=1)
-        H_shell = jnp.where(
-            jnp.asarray(linear_mask)[None, :, :], H_shell, 0)
+        (odd_direct, even_direct, Y_odd, Z_odd, sampled_nonfinite), _ = (
+            jax.lax.scan(
+                _fit_row, fit_initial, shell_positions, unroll=1))
+        odd_direct_allowed = jnp.where(
+            jnp.asarray(linear_mask)[None, :, :], odd_direct, 0)
+        H = odd_direct_allowed[:2]
         Q = jnp.zeros((2, 2, 4, 4), dtype=dtype)
-        Q = Q.at[0, 0].set(q_three[0])
-        Q = Q.at[0, 1].set(q_three[1])
-        Q = Q.at[1, 0].set(q_three[1])
-        Q = Q.at[1, 1].set(q_three[2])
+        Q = Q.at[0, 0].set(even_direct[0])
+        Q = Q.at[0, 1].set(even_direct[1])
+        Q = Q.at[1, 0].set(even_direct[1])
+        Q = Q.at[1, 1].set(even_direct[2])
         Q = Q.at[:, :, 0, 0].set(jnp.where(
             use_charge, charge_S, Q[:, :, 0, 0]))
+        Y = Y_odd[:2]
+        Z = Z_odd[:2]
         Y = Y.at[:, 0, :].set(jnp.where(
             use_charge & charge_mask_x[:, 0, :],
             charge_Y_packed_x[:, 0, :], Y[:, 0, :]))
@@ -2080,14 +2127,35 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
                 _project_shell_row(minus_position))
             q_plus = q_shell_xy[plus_position]
             q_minus = q_shell_xy[minus_position]
+
+            def _odd_basis(q):
+                x, y = q[0], q[1]
+                return jnp.stack(
+                    (x, y, x ** 3, x ** 2 * y, x * y ** 2, y ** 3))
+
+            def _even_basis(q):
+                x, y = q[0], q[1]
+                return jnp.stack(
+                    (x ** 2, 2.0 * x * y, y ** 2,
+                     x ** 4, x ** 3 * y, x ** 2 * y ** 2,
+                     x * y ** 3, y ** 4))
+
+            odd_plus = _odd_basis(q_plus)
+            odd_minus = _odd_basis(q_minus)
+            even_plus = _even_basis(q_plus)
+            even_minus = _even_basis(q_minus)
             r_prediction_plus = (
-                jnp.einsum("a,aAB->AB", q_plus, H_shell, optimize=True)
+                jnp.einsum(
+                    "u,uAB->AB", odd_plus, odd_direct_allowed,
+                    optimize=True)
                 + jnp.einsum(
-                    "a,b,abAB->AB", q_plus, q_plus, Q, optimize=True))
+                    "u,uAB->AB", even_plus, even_direct, optimize=True))
             r_prediction_minus = (
-                jnp.einsum("a,aAB->AB", q_minus, H_shell, optimize=True)
+                jnp.einsum(
+                    "u,uAB->AB", odd_minus, odd_direct_allowed,
+                    optimize=True)
                 + jnp.einsum(
-                    "a,b,abAB->AB", q_minus, q_minus, Q, optimize=True))
+                    "u,uAB->AB", even_minus, even_direct, optimize=True))
 
             # The wing coefficients were fitted from the odd projector
             # (I-P_-q)/2.  Diagnose that same target.  Comparing a q-linear
@@ -2099,9 +2167,9 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
             y_even = 0.5 * (y_plus + y_minus)
             z_even = 0.5 * (z_plus + z_minus)
             y_prediction = jnp.einsum(
-                "a,aAI->AI", q_plus, Y, optimize=True)
+                "u,uAI->AI", odd_plus, Y_odd, optimize=True)
             z_prediction = jnp.einsum(
-                "a,aJB->JB", q_plus, Z, optimize=True)
+                "u,uJB->JB", odd_plus, Z_odd, optimize=True)
             return (
                 r_error + _abs2(r_prediction_plus - r_plus)
                         + _abs2(r_prediction_minus - r_minus),
@@ -2163,9 +2231,10 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
 
         # Diagnose closure per Lorentz/body-channel block, excluding exactly
         # the (0,0) entries replaced by the canonical analytic charge S/Y/Z.
-        # This is deliberately not an acceptance threshold: on one radius,
-        # q^3 aliases into H and q^4 into Q.  A nested-shell/Richardson result
-        # is required before this statistic can claim q->0 convergence.
+        # The nested design includes the first omitted parity-allowed powers,
+        # so these residuals diagnose q^5/q^6-and-higher content rather than
+        # aliasing q^3 into H or q^4 into Q.  The returned production tensors
+        # contain only the extrapolated leading q and q^2 coefficients.
         fitted_blocks = jnp.ones((4, 4), dtype=bool).at[0, 0].set(~use_charge)
 
         def _maximum_block_residual(error_sq, sample_sq, prediction_sq):
@@ -2173,7 +2242,14 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
                 jnp.maximum(jnp.sqrt(sample_sq), jnp.sqrt(prediction_sq)),
                 jnp.finfo(real_dtype).tiny)
             relative = jnp.sqrt(error_sq) / denominator
-            return jnp.max(jnp.where(fitted_blocks, relative, 0.0))
+            # A structurally zero Lorentz/body block acquires roundoff-sized
+            # pseudoinverse coefficients.  It has no relative residual: both
+            # its target and model are zero.  Select active blocks relative to
+            # the largest sampled block before taking the maximum.
+            active_scale = jnp.max(denominator)
+            active = denominator > (
+                1024.0 * jnp.finfo(real_dtype).eps * active_scale)
+            return jnp.max(jnp.where(fitted_blocks & active, relative, 0.0))
 
         direct_residual = _maximum_block_residual(
             r_error, r_norm, r_prediction_norm)
@@ -2186,7 +2262,10 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
             denominator = jnp.maximum(
                 jnp.sqrt(full_sq), jnp.finfo(real_dtype).tiny)
             relative = jnp.sqrt(even_sq) / denominator
-            return jnp.max(jnp.where(fitted_blocks, relative, 0.0))
+            active_scale = jnp.max(denominator)
+            active = denominator > (
+                1024.0 * jnp.finfo(real_dtype).eps * active_scale)
+            return jnp.max(jnp.where(fitted_blocks & active, relative, 0.0))
 
         y_even_fraction = _maximum_even_fraction(
             y_even_norm, y_full_norm)
@@ -2240,12 +2319,6 @@ def _get_static_photon_longwave_fit_kernel(mesh_xy, layout):
                 (~jnp.all(jnp.isfinite(charge_Z_packed_y))).astype(jnp.int32),
                 "y").astype(bool)
         ) & use_charge
-        # A one-radius odd fit cannot distinguish the q-linear topological
-        # Hall/Chern term from q-cubic spatial dispersion.  Keep H out of the
-        # production completion until an independently certified source owns
-        # it; the fitted H_shell above survives only through the closure
-        # diagnostic.
-        H = jnp.zeros_like(H_shell)
         return (
             H, Q, Y, Z,
             direct_residual, y_residual, z_residual,
@@ -2293,23 +2366,24 @@ def fit_static_photon_longwave_coefficients(
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     charge_response=None,
 ) -> StaticPhotonLongWaveCoefficients:
-    r"""Fit the experimental static slab q->0 photon response coefficients.
+    r"""Fit the declared no-pair static slab q->0 photon coefficients.
 
     ``chi_packed`` is the raw packed output of :func:`compute_photon_chi0`.
     This function forms the Dyson-normalized response
     ``P = _w_solve_pref_scalar(meta) * chi_packed`` exactly once, then
-    projects only Gamma and the nearest complete +/-q shell.  It never reads
+    projects only Gamma and a bounded nested +/-q shell union.  It never reads
     WFN/G-vectors, performs a q lookup or symmetry operation, repacks an
     operator, folds wings, or solves Dyson.  Full packed samples die inside
     the one sharded kernel; only coefficient arrays leave it.
 
-    The fitted powers follow the static field expansion: an odd linear direct
-    term is possible only in CT/TC, but the one-shell value is diagnostic and
-    the returned H is zero until a separately certified Hall/Chern source is
-    available.  The ordinary quadratic Q is retained in all CC/CT/TC/TT
-    blocks, including magnetoelectric CT/TC.  Every body wing is linear; all
-    intercepts are zero through explicit subtraction of the projected Gamma
-    value.
+    The fitted powers follow the static field expansion.  Odd q+q^3 and even
+    q^2+q^4 designs are solved together on the smallest radial union with full
+    ranks 6 and 8; the returned H/Y/Z and Q retain only the extrapolated q and
+    q^2 coefficients.  H is restricted to CT/TC.  It is the declared no-pair
+    bubble coefficient, not an added or topologically certified Hall term.
+    The contact-subtracted TT response is parity-projected onto q^2.  Every
+    body wing is odd-fit and linear at q=0; all intercepts are zero through
+    explicit subtraction of the projected Gamma value.
     ``charge_response``, when supplied, must be the existing
     ``qsgw_head.IterationHeadResponse`` with one literal static row.  Its
     in-plane S/Y/Z replace the fitted charge entries without gathering their
@@ -2324,7 +2398,7 @@ def fit_static_photon_longwave_coefficients(
     layout.assert_mesh(mesh_xy)
     if int(sys_dim) != 2:
         raise ValueError(
-            "nearest-shell photon long-wave fit is slab-only (sys_dim=2); "
+            "nested-shell photon long-wave fit is slab-only (sys_dim=2); "
             f"got {sys_dim}")
     if complex(omega_ry) != 0.0j:
         raise ValueError(
@@ -2332,11 +2406,11 @@ def fit_static_photon_longwave_coefficients(
             f"response; omega_ry={complex(omega_ry)!r}")
     if str(material_class).strip().lower() != "insulator":
         raise ValueError(
-            "nearest-shell static photon fit is restricted to gapped "
+            "nested-shell static photon fit is restricted to gapped "
             f"insulators; material_class={material_class!r}")
     if current_contact != _WARD_SUBTRACTED_NO_PAIR:
         raise ValueError(
-            "nearest-shell static photon fit requires the explicit "
+            "nested-shell static photon fit requires the explicit "
             f"{_WARD_SUBTRACTED_NO_PAIR!r} contact; got {current_contact!r}")
     if not isinstance(g0_vectors, PhotonG0Vectors):
         raise TypeError("g0_vectors must be PhotonG0Vectors")
@@ -2381,9 +2455,9 @@ def fit_static_photon_longwave_coefficients(
             f"sym.nk_tot={getattr(sym, 'nk_tot', None)}")
     (
         shell, q_shell, directions, shell_radii,
-        linear_weights, quadratic_weights, pair_first, pair_second,
-        linear_rank, quadratic_rank,
-    ) = _nearest_paired_inplane_shell(sym, kgrid, bvec_cart_bohr)
+        odd_weights, even_weights, pair_first, pair_second,
+        odd_rank, even_rank, radial_shell_count,
+    ) = _nested_paired_inplane_shell(sym, kgrid, bvec_cart_bohr)
     charge_S, charge_Y, charge_Z, use_charge, charge_source = (
         _static_charge_longwave_inputs(charge_response, layout, mesh_xy))
     g0_x_packed = pack_photon_channel_vectors(
@@ -2421,8 +2495,8 @@ def fit_static_photon_longwave_coefficients(
     shell_device, pair_first_device, pair_second_device = jax.device_put(
         (shell, pair_first, pair_second), (rep1, rep1, rep1))
     q_device = jax.device_put(q_shell, rep2)
-    linear_device = jax.device_put(linear_weights, rep2)
-    quadratic_device = jax.device_put(quadratic_weights, rep2)
+    odd_device = jax.device_put(odd_weights, rep2)
+    even_device = jax.device_put(even_weights, rep2)
     prefactor = jax.device_put(
         np.asarray(_w_solve_pref_scalar(meta), dtype=np.float64),
         NamedSharding(mesh_xy, P()))
@@ -2442,8 +2516,8 @@ def fit_static_photon_longwave_coefficients(
         g0_y_packed,
         shell_device,
         q_device,
-        linear_device,
-        quadratic_device,
+        odd_device,
+        even_device,
         pair_first_device,
         pair_second_device,
         prefactor,
@@ -2470,7 +2544,7 @@ def fit_static_photon_longwave_coefficients(
     ) = diagnostics.tolist()
     if int(nonfinite) != 0:
         raise ValueError(
-            "nearest-shell photon response or canonical g0 vectors contain "
+            "nested-shell photon response or canonical g0 vectors contain "
             "non-finite sampled values")
     g0_tolerance = (
         256.0 * np.finfo(np.float64).eps * max(g0_copy_scale, 1.0))
@@ -2500,8 +2574,9 @@ def fit_static_photon_longwave_coefficients(
         shell_directions_xy=tuple(
             tuple(float(v) for v in row) for row in directions),
         shell_radii_bohr_inv=tuple(float(r) for r in shell_radii),
-        linear_rank=int(linear_rank),
-        quadratic_rank=int(quadratic_rank),
+        radial_shell_count=int(radial_shell_count),
+        odd_extrapolation_rank=int(odd_rank),
+        even_extrapolation_rank=int(even_rank),
         direct_relative_residual=float(direct_residual),
         Y_relative_residual=float(y_residual),
         Z_relative_residual=float(z_residual),
@@ -2582,13 +2657,14 @@ def compute_photon_chi0(
 
 @dataclass(frozen=True)
 class StaticPhotonResponse:
-    """Experimental full-body static photon response and provenance."""
+    """Declared no-pair full-body static photon response and provenance."""
 
     layout: object
     V_packed: jax.Array
     W_packed: jax.Array
     current_contact: str
     head_completion: object | None = None
+    current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
     approximation: str = "experimental_no_pair_bubble_screened_breit_v1"
 
 
@@ -2607,7 +2683,7 @@ def compute_static_photon_response(
     """Build the packed static photon body and optional coupled slab q=0 cell.
 
     ``head_correction=off`` preserves the finite-body bring-up path.  ``full``
-    fits the nearest complete in-plane shell, replaces its charge sector from
+    fits the bounded nested in-plane shell union, replaces its charge sector from
     the incumbent symmetry-aware qsgw-head response, solves the headless body,
     and then applies the bounded bordered-Dyson reconstruction.  The sole
     vcoul sampler supplies every mini-BZ draw and bare propagator.  No photon
@@ -2670,7 +2746,9 @@ def compute_static_photon_response(
 
     if jax.process_index() == 0:
         print(
-            "  [photon response] EXPERIMENTAL no-pair bubble-screened "
+            "  [photon response] DECLARED no-pair model "
+            "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
+            "j=c*Psi^dagger*alpha*Psi; bubble-screened "
             f"Breit; current_contact={current_contact}; "
             f"head_correction={head_policy.value}",
             flush=True)
@@ -2764,7 +2842,8 @@ def compute_static_photon_response(
             print(
                 "  [photon q0] coupled slab head/wings complete: "
                 f"shell_rows={len(coefficients.shell_indices)}, "
-                f"odd_fit_residuals=(direct={coefficients.direct_relative_residual:.3e}, "
+                f"radial_levels={coefficients.radial_shell_count}, "
+                f"nested_fit_residuals=(direct={coefficients.direct_relative_residual:.3e}, "
                 f"Y={coefficients.Y_relative_residual:.3e}, "
                 f"Z={coefficients.Z_relative_residual:.3e}), "
                 f"wing_even_shell_fractions=(Y={coefficients.Y_even_shell_fraction:.3e}, "
@@ -2778,9 +2857,12 @@ def compute_static_photon_response(
                 f"shell_indices={coefficients.shell_indices}; "
                 f"directions_xy={coefficients.shell_directions_xy}; "
                 f"radii_bohr^-1={coefficients.shell_radii_bohr_inv}; "
-                f"design_ranks=({coefficients.linear_rank},"
-                f"{coefficients.quadratic_rank}); "
-                f"max_odd_fitted_block_residuals=({coefficients.direct_relative_residual:.6e},"
+                f"nested_design_ranks=(odd_q_q3="
+                f"{coefficients.odd_extrapolation_rank}/"
+                f"{_ODD_LONGWAVE_DESIGN_RANK},even_q2_q4="
+                f"{coefficients.even_extrapolation_rank}/"
+                f"{_EVEN_LONGWAVE_DESIGN_RANK}); "
+                f"max_nested_fitted_block_residuals=({coefficients.direct_relative_residual:.6e},"
                 f"{coefficients.Y_relative_residual:.6e},"
                 f"{coefficients.Z_relative_residual:.6e}); "
                 f"max_wing_even_shell_fractions=("
@@ -2789,7 +2871,8 @@ def compute_static_photon_response(
                 f"g0={coefficients.g0_provenance}; "
                 f"charge={coefficients.charge_response_source}; "
                 f"hall_topological={coefficients.hall_topological_source}; "
-                f"contact={coefficients.current_contact}",
+                f"contact={coefficients.current_contact}; "
+                f"current_model={coefficients.current_model}",
                 flush=True,
             )
         # The response object owns corrected V/W and compact evidence only;
@@ -2800,6 +2883,7 @@ def compute_static_photon_response(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=current_contact,
         head_completion=completion,
+        current_model=STATIC_PHOTON_NO_PAIR_MODEL,
         approximation=approximation,
     )
 
