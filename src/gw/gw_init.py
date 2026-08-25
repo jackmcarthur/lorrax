@@ -167,12 +167,12 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 
 #: Bump when the provenance schema changes meaning (forces a refit of
 #: every ζ stamped by an older LORRAX, rather than a false match).
-_ZETA_PROVENANCE_SCHEMA = 1
+_ZETA_PROVENANCE_SCHEMA = 2
 
 
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
-                         zeta_cutoff, zeta_vcoul_cutoff, write_ibz_only,
-                         band_norms, vertex_mu_L=0,
+                         logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
+                         write_ibz_only, band_norms, vertex_mu_L=0,
                          transverse_identity=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
@@ -221,6 +221,14 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	different, and a ζ_T stamped for one vertex can never be reused as
 	another.
 
+	``band_range_*`` are the storage ranges handed to the fit.  Their right
+	edge may include exact-zero mesh padding, so schema 2 stamps only the
+	corresponding ``*_logical`` ranges, clipped at ``logical_band_stop``.
+	That stop is the already-resolved ``zeta_nband`` when narrowed and
+	``Meta.b_id_4_user`` otherwise.  A legacy schema-1 stamp has only the
+	storage ranges and cannot prove whether its last rows were padding or
+	physical bands; :func:`_zeta_reuse_ok` therefore fails it closed.
+
 	``transverse_identity`` pins the transverse CHANNEL on every stamp,
 	including the charge one: the transverse centroid count, that
 	table's content hash, and the two knobs that set the transverse
@@ -254,11 +262,24 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if band_norms is not None:
 		arr = np.asarray(band_norms, dtype=np.float64)
 		bn = [int(arr.size), float(arr.sum()), float(arr.max()) if arr.size else 0.0]
+	logical_band_stop = int(logical_band_stop)
+	left_lo, left_hi = (int(v) for v in band_range_left)
+	right_lo, right_hi = (int(v) for v in band_range_right)
+	logical_left = [left_lo, min(left_hi, logical_band_stop)]
+	logical_right = [right_lo, min(right_hi, logical_band_stop)]
+	for name, logical, storage in (
+			("left", logical_left, (left_lo, left_hi)),
+			("right", logical_right, (right_lo, right_hi))):
+		if logical[0] < 0 or logical[1] <= logical[0]:
+			raise ValueError(
+				f"_zeta_fit_provenance: invalid logical {name} fit range "
+				f"{logical} from storage {storage} and "
+				f"logical stop {logical_band_stop}.")
 	prov = {
 		'schema':               _ZETA_PROVENANCE_SCHEMA,
 		'n_rmu':                int(meta.n_rmu),
-		'band_range_left':      [int(band_range_left[0]), int(band_range_left[1])],
-		'band_range_right':     [int(band_range_right[0]), int(band_range_right[1])],
+		'band_range_left_logical':  logical_left,
+		'band_range_right_logical': logical_right,
 		'bispinor':             bool(cfg.bispinor),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
@@ -520,6 +541,14 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		try:
 			old = json.loads(hdr.fit_provenance)
 			new = json.loads(provenance_json)
+			if old.get('schema') != new.get('schema'):
+				print_fn(
+					f"    [zeta reuse] {zeta_h5_path}: provenance schema "
+					f"{old.get('schema')!r} on disk != {new.get('schema')!r} "
+					"now.  Legacy stamps do not explicitly identify their "
+					"logical fit ranges, so matching storage padding cannot "
+					"prove equivalence — refitting.")
+				return False
 			# THREE distinct ways two stamps disagree, kept apart because
 			# they get different verdicts (2026-08-04).  The earlier code
 			# collapsed them into one value-difference list over the key
@@ -597,9 +626,11 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# are such missing keys, reuse is allowed iff this run requests
 		# exactly the legacy value for each (one-line notice); requesting
 		# anything else IS a real mismatch — refit, naming the key.  The
-		# schema number stays at 1 on purpose: bumping it would force a
-		# refit of every existing on-disk zeta, which this branch exists
-		# to avoid.  Keys and their implied legacy values:
+		# These feature keys were all introduced within schema 1 and retain
+		# their declared legacy meanings when BOTH stamps have the same
+		# schema.  Schema-1 -> schema-2 is handled above and fails closed,
+		# because no implied value can recover the missing logical band stop.
+		# Keys and their implied legacy values:
 		#   distributed_zeta_solve  'replicated'  (the distributed tier's
 		#       block-cyclic eigh is a different gauge — 2026-08-01)
 		#   transverse_zeta_solve   'ridge'       (the rank_truncate
@@ -1277,13 +1308,14 @@ def _resolve_zeta_fit_contract(
 		band_slices, getattr(cfg, "zeta_nband", None))
 	band_range_left, band_range_right = zeta_fit_band_ranges(
 		band_slices, zeta_edge, log=print_fn)
+	logical_band_stop = (
+		int(zeta_edge) if zeta_edge is not None
+		else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4))
 	assert_isdf_window_is_the_max(
 		band_slices, band_range_right, zeta_edge, log=print_fn)
 	check_zeta_fit_windows(
 		getattr(wfn, "energies", None), band_range_left, band_range_right,
-		zeta_edge,
-		(int(zeta_edge) if zeta_edge is not None
-		 else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4)),
+		zeta_edge, logical_band_stop,
 		log=print_fn)
 
 	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
@@ -1365,6 +1397,7 @@ def _resolve_zeta_fit_contract(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
 		band_range_right=band_range_right,
+		logical_band_stop=logical_band_stop,
 		zeta_cutoff=zeta_cutoff,
 		zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 		write_ibz_only=write_ibz_only_charge,
@@ -1375,6 +1408,7 @@ def _resolve_zeta_fit_contract(
 			wfn=wfn, meta=meta_transverse, cfg=cfg,
 			band_range_left=band_range_left,
 			band_range_right=band_range_right,
+			logical_band_stop=logical_band_stop,
 			zeta_cutoff=zeta_cutoff,
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
