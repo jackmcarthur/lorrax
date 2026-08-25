@@ -7,6 +7,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map
 
 
+# Value-level parity contract for the canonical flat-k service.  This is the
+# registered Sigma-path class from ``docs/dev/flat_k_fft_service.md`` section
+# 7 and ``docs/architecture/ffi_layout.md`` section 7, not a bit-equality
+# promise between FFT engines.
+FLAT_K_FFT_VALUE_RTOL = 1.0e-12
+
+
 # =============================================================================
 # FFT peak-memory query (for memory-model sizing)
 # =============================================================================

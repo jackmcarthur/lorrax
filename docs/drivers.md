@@ -270,11 +270,13 @@ uncontrolled lower spectral boundary. A QRCP search-saturation refusal means
 the rank criterion reached the configured search ceiling; inspect its
 projection receipts before increasing `htransform_rank_multiplier`. An
 `f-shoulder` refusal means a requested output band is absent from fH at some
-coarse k; add guard bands, do not disable the gate. Newton inversion refuses
-when the archived 50-step method leaves `max|f(x)-y| > 1e-12 Ry`. The
-all-coarse FFT/spectrum/energy receipts are necessary implementation checks,
-not a positive locality certificate: a Fourier interpolant can reproduce every
-sample and still ring between samples. FATAL on `--eqp-file` not found/parsed;
+coarse k; add guard bands, do not disable the gate. Newton inversion stops as
+soon as the archived global residual contract is met and refuses if the
+50-step cap leaves `max|f(x)-y| > 1e-12 Ry`. The all-coarse FFT round-trip is
+an enforced transform invariant; the spectrum/energy values are necessary
+approximate-projection diagnostics. Neither is a positive locality
+certificate: a Fourier interpolant can reproduce every sample and still ring
+between samples. FATAL on `--eqp-file` not found/parsed;
 sanity refusals on NaN ctilde/E_nk or E_nk spread > 272.11 eV.
 
 ## bse — `bse.bse_jax`
