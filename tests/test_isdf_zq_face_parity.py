@@ -195,7 +195,7 @@ def _worker(case_name: str) -> int:
             self._k = jax.device_put(
                 jnp.asarray(kvecs), NamedSharding(mesh, P(None, None)))
 
-        def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx):
+        def read_local_band_chunk(self, x_idx, y_idx, bc_idx):
             r = int(x_idx) * self._py + int(y_idx)
             bc = int(bc_idx)
             b_lo = self._offs[bc]
@@ -203,6 +203,12 @@ def _worker(case_name: str) -> int:
             out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=np.complex128)
             out[:, :bpd, :, :] = psi_G[:, b_lo + r * bpd: b_lo + (r + 1) * bpd, :, :]
             return out
+
+        # Legacy/build-cache arms remain intentionally frozen on the
+        # compatibility spelling; the changed face-streaming arm above uses
+        # PsiGStore's public owner.
+        def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx):
+            return self.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
         @property
         def g_index(self):
@@ -213,12 +219,9 @@ def _worker(case_name: str) -> int:
             return self._k
 
     store = _MeshStore(mesh)
-    # Production always supplies a hoisted psi_r_cache (built ONCE before
-    # the r-chunk loop, gw.isdf_fitting.fit_zeta_to_h5 STEP 5) -- exercise
-    # the REAL cache path, not just the io_callback compatibility
-    # fallback, using the REAL build_psi_r_cache_sm against this mock
-    # store (it only reads the same four attributes _MeshStore already
-    # implements).
+    # Exercise the optional full-grid hoist as one route.  The face calls
+    # below also exercise the production streamed PsiGStore route with and
+    # without the bounded current-rchunk Y cache.
     from isdf.core import build_psi_r_cache_sm
     psi_r_cache = jax.block_until_ready(
         build_psi_r_cache_sm(store, mesh_xy=mesh))
@@ -274,7 +277,32 @@ def _worker(case_name: str) -> int:
         layout="face",
         psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
         gamma_L=gamma_L, gamma_R=gamma_R,
-        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r)))
+        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
+        cache_face_y_blocks=True))
+
+    # Discriminating production-source arm: CrI3 streams from PsiGStore
+    # (psi_r_cache=None).  Exercise both structural choices: the one-pass
+    # bounded-rchunk Y cache and its always-valid repeated-transform fallback.
+    Z_face_streamed_cached = jax.block_until_ready(z_q_from_psi_sm(
+        psi_G_store=store, psi_r_cache=None,
+        band_chunk_ranges=band_chunk_ranges,
+        r_start_dyn=r_start, r_chunk_size=n_zchunk,
+        kgrid=kgrid, mesh_xy=mesh,
+        layout="face",
+        psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+        gamma_L=gamma_L, gamma_R=gamma_R,
+        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
+        cache_face_y_blocks=True))
+    Z_face_streamed_repeated = jax.block_until_ready(z_q_from_psi_sm(
+        psi_G_store=store, psi_r_cache=None,
+        band_chunk_ranges=band_chunk_ranges,
+        r_start_dyn=r_start, r_chunk_size=n_zchunk,
+        kgrid=kgrid, mesh_xy=mesh,
+        layout="face",
+        psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+        gamma_L=gamma_L, gamma_R=gamma_R,
+        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
+        cache_face_y_blocks=False))
 
     # process_allgather, NOT device_get: both are genuinely multi-process
     # sharded (P(None,'x','y')) under a REAL multi-process mesh (the
@@ -285,9 +313,13 @@ def _worker(case_name: str) -> int:
     # the identical issue.
     from jax.experimental import multihost_utils as _mhu
     Zf = np.asarray(_mhu.process_allgather(Z_face, tiled=True))
+    Zfsc = np.asarray(_mhu.process_allgather(
+        Z_face_streamed_cached, tiled=True))
+    Zfsr = np.asarray(_mhu.process_allgather(
+        Z_face_streamed_repeated, tiled=True))
     Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
-        comparisons = (Zf,)
+        comparisons = (Zf, Zfsc, Zfsr)
     else:
         # Independent-width reference: the full-grid face evaluation has
         # no out-of-range slice.  Its final logical cells must be retained
@@ -309,7 +341,7 @@ def _worker(case_name: str) -> int:
             axis=-1)
         Zls = np.asarray(_mhu.process_allgather(
             Z_legacy_streamed, tiled=True))
-        comparisons = (Zf, Zl, Zls)
+        comparisons = (Zf, Zfsc, Zfsr, Zl, Zls)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -377,6 +409,22 @@ def test_zq_face_layout_matches_legacy(name, kwargs):
     assert out["max_rel"] < _TOL, (
         f"z_q_from_psi_sm layout='face' vs 'legacy' parity FAILED: "
         f"max relative diff {out['max_rel']:.3e} (case {name})")
+
+
+def test_band_chunks_must_complete_before_pair_product():
+    """Negative oracle: per-chunk products omit cross-band-chunk terms."""
+    import numpy as np
+
+    left = np.asarray([1.0 + 2.0j, -0.5 + 0.25j])
+    right = np.asarray([0.75 - 0.5j, 2.0 + 1.5j])
+    completed_then_product = np.conj(left.sum()) * right.sum()
+    product_per_chunk = np.sum(np.conj(left) * right)
+    cross_terms = (np.conj(left[0]) * right[1]
+                   + np.conj(left[1]) * right[0])
+    np.testing.assert_allclose(
+        completed_then_product - product_per_chunk, cross_terms,
+        rtol=0.0, atol=1e-15)
+    assert not np.isclose(completed_then_product, product_per_chunk)
 
 
 # ---------------------------------------------------------------------------
