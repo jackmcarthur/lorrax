@@ -236,6 +236,32 @@ def test_the_introspect_prefers_the_ffi():
         "it anyway with a message that names no repair.")
 
 
+def test_legacy_introspect_receipt_obeys_driver_debug(monkeypatch, capsys,
+                                                       tmp_path):
+    """The safe serial-metadata fallback is forensic detail, not physics."""
+    from file_io import _slab_io_ffi as slab_ffi
+
+    quiet_path = str(tmp_path / "quiet.h5")
+    debug_path = str(tmp_path / "debug.h5")
+    slab_ffi._LEGACY_INTROSPECT_ANNOUNCED.clear()
+    try:
+        monkeypatch.setenv("LORRAX_DEBUG_PRINT", "0")
+        slab_ffi._announce_legacy_introspect(quiet_path)
+        assert capsys.readouterr().out == ""
+
+        # Suppression consumes the path key, so a later call cannot leak it.
+        monkeypatch.setenv("LORRAX_DEBUG_PRINT", "1")
+        slab_ffi._announce_legacy_introspect(quiet_path)
+        assert capsys.readouterr().out == ""
+
+        slab_ffi._announce_legacy_introspect(debug_path)
+        out = capsys.readouterr().out
+        assert "debug.h5" in out
+        assert "dataset geometry read through SERIAL h5py" in out
+    finally:
+        slab_ffi._LEGACY_INTROSPECT_ANNOUNCED.clear()
+
+
 def test_read_small_is_a_separate_door_from_read_slab():
     """A scalar is not a degenerate hyperslab, and the API says so."""
     src = _SLAB_IO.read_text()

@@ -173,7 +173,7 @@ def _announce_legacy_introspect(path: str) -> None:
     if path in _LEGACY_INTROSPECT_ANNOUNCED:
         return
     _LEGACY_INTROSPECT_ANNOUNCED.add(path)
-    if not _rank0():
+    if not debug_print_enabled() or not _rank0():
         return
     print(f"  [SlabIO] {os.path.basename(path)}: dataset geometry read "
           f"through SERIAL h5py — the loaded FFI library predates "
