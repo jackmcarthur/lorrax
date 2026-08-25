@@ -533,6 +533,21 @@ def _cli_main():
             failures += 1
         p0(f"{'PASS' if ok else 'FAIL'} {name}: max|diff|={rc['max_abs']:.3e} "
            f"(ref scale {rc['ref_scale']:.3e}) max|rel diff|={rc['max_rel']:.3e}")
+    stats = jax.local_devices()[0].memory_stats() or {}
+    local_hbm = np.asarray([
+        int(stats.get("bytes_in_use", 0) or 0),
+        int(stats.get("peak_bytes_in_use", 0) or 0),
+        int(stats.get("bytes_limit", 0) or 0),
+    ], dtype=np.int64)
+    from jax.experimental import multihost_utils as _mhu
+    gathered_hbm = np.asarray(
+        _mhu.process_allgather(local_hbm)).reshape(-1, 3)
+    p0(json.dumps({
+        "runtime_hbm_bytes_in_use_max": int(gathered_hbm[:, 0].max()),
+        "runtime_hbm_peak_bytes_in_use_max": int(gathered_hbm[:, 1].max()),
+        "runtime_hbm_bytes_limit_min": int(gathered_hbm[:, 2].min()),
+        "runtime_hbm_ranks": int(gathered_hbm.shape[0]),
+    }))
     p0(f"done: {len(_ALL_CASES) - failures}/{len(_ALL_CASES)} cases passed")
     return 1 if failures else 0
 
