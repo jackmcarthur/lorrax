@@ -1563,7 +1563,9 @@ def _plan_gflat_chunks_for_channel(
 	_ngkmax = int(getattr(meta, 'ngkmax', 0)) or int(0.06 * meta.n_rtot)
 	gflat_plan = plan_gflat_chunks(
 		meta=meta, mesh_xy=mesh_xy,
-		nb_total=nb_total, fit_nb_total=_zeta_fit_nb,
+		nb_total=nb_total,
+		face_nb_total=int(band_slices.b4 - band_slices.b0),
+		fit_nb_total=_zeta_fit_nb,
 		ngkmax=_ngkmax,
 		n_q_disk=int(meta.nk_tot),
 		budget_gb=float(mem.per_device_gb),
@@ -1632,6 +1634,7 @@ def _plan_gflat_chunks_for_channel(
 		'q_chunk': int(gflat_plan.q_chunk),
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
 		'cache_psi_r': bool(gflat_plan.cache_psi_r),
+		'cache_face_y_blocks': bool(gflat_plan.cache_face_y_blocks),
 		'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
 		'memory_estimate': {
 			'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
@@ -1873,6 +1876,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				zeta_rcond=cfg.backend.zeta_rcond,
 				gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
 				cache_psi_r=bool(chunks.get('cache_psi_r', True)),
+				cache_face_y_blocks=bool(
+					chunks.get('cache_face_y_blocks', False)),
 				write_ibz_only=_write_ibz_only_charge,
 				zeta_cutoff_ry=_zeta_cutoff,
 				print_fn=print_fn,
@@ -2100,6 +2105,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
 					gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
 					cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+					cache_face_y_blocks=bool(
+						_chunks_T.get('cache_face_y_blocks', False)),
 					vertex_mu_L=mu_L,
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
