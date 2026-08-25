@@ -407,7 +407,8 @@ def test_a_short_q_label_list_falls_back_to_the_identity_and_says_so():
 def test_the_centroid_stamp_is_the_fft_index_hash_not_the_text_files():
     """Found while teaching the driver to VERIFY a parent table with this hash.
 
-    ``centroids_charge_md5`` is defined by ``gw_init._centroid_table_md5`` as
+    ``centroids_charge_md5`` is defined by
+    ``file_io.isdf_header.centroid_table_md5`` as
     md5 over the int64 FFT-GRID INDEX table, and ``gw_init`` compares against
     it in exactly that algebra.  The downfold used to stamp ``md5(bytes of the
     .txt)`` — a perfectly good hash of a DIFFERENT object, which could

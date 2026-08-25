@@ -1364,6 +1364,10 @@ def _rotate_wavefunctions_legacy(
         occ_full = jax.lax.with_sharding_constraint(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
+    # A QP rotation changes the sampled wavefunction source while retaining
+    # its carrier shape.  Drop the DFT receipt deliberately: no canonical
+    # rotated-source receipt producer exists yet, and retaining it would make
+    # a future finite-transfer consumer authenticate the wrong orbitals.
     return Wavefunctions(
         psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices,
@@ -1433,6 +1437,9 @@ def _rotate_wavefunctions_face(
         occ_full = jax.lax.with_sharding_constraint(
             _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
 
+    # See the legacy sibling: rotation invalidates the incoming DFT basis
+    # receipt.  The safe value is None until the QP-state provenance owner can
+    # issue a canonical receipt for this transformed source.
     return Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
