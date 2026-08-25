@@ -290,8 +290,11 @@ __all__ = [
     "local_potential_operator",
     "vnl_operator",
     "dipole_operator",
+    "uniform_gauge_operator",
     "sum_operators",
     "sweep_matrix_elements",
+    "sweep_uniform_gauge_matrix_elements",
+    "UniformGaugeMatrixElements",
     "blocks_to_host",
 ]
 
@@ -398,8 +401,9 @@ class Operator(NamedTuple):
     index 1 and the component axis is appended.  It must NOT form
     anything of shape ``(nb, nb)`` and must not gather over bands.
 
-    ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL) and 3 for
-    a Cartesian one (dipole).  It is not a shape the sweep can infer:
+    ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL), 3 for
+    a Cartesian one (dipole), and 12 for the one packed uniform
+    current/contact transaction.  It is not a shape the sweep can infer:
     the sweep has to pick its einsum and its output spec at trace time,
     before it has seen the operator's output.
 
@@ -751,6 +755,197 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
                          None if vnl_setup is None else id(vnl_setup),
                          sign))
+
+
+class UniformGaugeMatrixElements(NamedTuple):
+    r"""Band-sharded first and second uniform gauge variations.
+
+    ``gamma_raw`` is the dimensionless no-pair vertex
+    ``(alpha_FS/2) dH_Pauli_Ry/dk``. ``lambda_raw`` is its exact uniform
+    derivative ``(alpha_FS/2) d2H_Pauli_Ry/dkdk``.  Their shapes are
+    ``(nk,3,nb,nb)`` and ``(nk,3,3,nb,nb)`` and both retain the sweep's
+    two-dimensional band sharding.  They are deliberately one transaction:
+    Hall and contact consumers must not reopen the WFN or rebuild projectors.
+    """
+
+    gamma_raw: jax.Array
+    lambda_raw: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+
+
+def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
+                           vnl_setup) -> Operator:
+    r"""One apply-to-ket owner for raw current and exact uniform contact.
+
+    The first three packed components are
+
+    ``Gamma_i = alpha_i + (alpha_FS/2) dV_NL/dK_i``
+
+    on the kinetic-balance bispinor.  Contracting the ``alpha_i`` term with
+    that bispinor is identically ``(alpha_FS/2) dT/dK_i``; no second
+    sigma.p spelling is introduced here.  The final nine components are
+
+    ``Lambda_ab = (alpha_FS/2) d2(T+V_NL)/dK_a dK_b``.
+
+    Kinetic contact comes from :mod:`psp.dft_operators`; the exact-origin,
+    row/G-bounded VNL current and contact come from :mod:`psp.vnl_ops`.
+    Everything is evaluated inside one :func:`sweep_matrix_elements` scan,
+    so the WFN bra reshard and projector coefficient pass are not paid by
+    separate current/contact drivers.
+
+    This is strictly the uniform ``q=0`` operator transaction.  The VNL
+    owner independently refuses finite q until a Wilson-line prescription is
+    selected.  It also does not claim to supply the covariant multipoles
+    needed for a finite-q photon body or a generalized long-wave S tensor.
+    """
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "uniform_gauge_operator requires the canonical four-component "
+            f"kinetic-balance WFN carrier; geom.ns={int(geom.ns)}")
+    if vnl_setup is None:
+        raise ValueError(
+            "uniform_gauge_operator requires the canonical VNLSetup; a "
+            "kinetic-only transaction cannot certify pseudopotential current")
+    if int(vnl_setup.nspinor) != 2:
+        raise ValueError(
+            "uniform_gauge_operator requires a two-component Pauli VNLSetup; "
+            f"got nspinor={int(vnl_setup.nspinor)}")
+    if vnl_setup.Gpp_table is None:
+        raise ValueError(
+            "uniform_gauge_operator requires VNLSetup built with "
+            "compute_contact=True")
+
+    from common.bispinor_init import HALFALPHA
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from psp.dft_operators import apply_kinetic_contact_to_ket
+    from psp import vnl_ops
+
+    B_host = np.asarray(bvec, dtype=np.float64) * float(blat)
+    if not np.array_equal(B_host, np.asarray(vnl_setup.B, dtype=np.float64)):
+        raise ValueError(
+            "uniform_gauge_operator reciprocal lattice differs from the "
+            "VNLSetup used to differentiate the Hamiltonian")
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        del bidx
+        psi_4 = _ket(psi_n, gmask)
+        psi_L = psi_4[:, :2, :]
+
+        # The alpha matrices are the incumbent monomial gamma owner.  The
+        # input was lifted by WfnLoader through bispinor_init.lift_to_4spinor,
+        # so this contraction consumes (rather than reimplements) sigma.p.
+        gamma_kin = jnp.stack([
+            gamma_apply(psi_4, perm, phase, axis=1)
+            for perm, phase in alpha_vertices
+        ], axis=0)
+
+        vnl = vnl_ops.apply_uniform_vnl_derivatives_to_ket(
+            psi_L, gvec, kvec, vnl_setup, gmask)
+        gamma_vnl = _pad_spinor(
+            halfalpha.astype(psi_4.real.dtype)
+            * vnl.gamma_cart_ket,
+            int(psi_4.shape[1]))
+        gamma = gamma_kin + gamma_vnl
+
+        lambda_kin = apply_kinetic_contact_to_ket(psi_L)
+        lambda_large = halfalpha.astype(psi_4.real.dtype) * (
+            lambda_kin + vnl.lambda_cart_ket)
+        contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
+
+        packed = jnp.concatenate(
+            (gamma, contact.reshape(9, *contact.shape[2:])), axis=0)
+        return jnp.moveaxis(packed, 0, -1)[None]
+
+    return Operator(
+        apply=op, post=1.0, ncomp=12,
+        key=("uniform_gauge_current_contact", geom.ngkmax, geom.ns,
+             float(blat), id(vnl_setup)))
+
+
+def sweep_uniform_gauge_matrix_elements(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    bvec,
+    blat,
+    vnl_setup,
+    gvecs,
+    gmask,
+    box_index,
+    kvecs,
+    use_scan: bool = True,
+) -> UniformGaugeMatrixElements:
+    """Run the canonical uniform current/contact transaction once.
+
+    The returned objects are views of one packed sweep output.  No host
+    gather, duplicate contraction, or new sharding convention is introduced.
+    The shared fingerprint is derived here from the canonical WFN identity,
+    the VNL owner's host-built content identity, the physical band interval,
+    and geometry.  This is the Hamiltonian/operator identity, deliberately
+    separate from the artifact-format convention stamped by its writer.
+    """
+    start, stop = int(band_start), int(band_stop)
+    if start < 0 or stop <= start or stop > int(wfn.nbands):
+        raise ValueError(
+            "uniform gauge band interval must satisfy "
+            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
+    if stop - start != int(geom.nb_logical):
+        raise ValueError(
+            "uniform gauge band interval does not match SweepGeometry: "
+            f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
+    vnl_fingerprint = str(
+        getattr(vnl_setup, "uniform_gauge_fingerprint", "")).strip()
+    if (not vnl_fingerprint.startswith("sha256:")
+            or len(vnl_fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef"
+                   for c in vnl_fingerprint[7:])):
+        raise ValueError(
+            "uniform gauge transaction requires the canonical VNLSetup "
+            "content fingerprint; rebuild it with build_vnl_setup(..., "
+            "compute_contact=True)")
+
+    import hashlib
+    from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, fingerprint_update_value, wfn_fingerprint)
+
+    digest = hashlib.sha256()
+    digest.update(b"lorrax.uniform_gauge_operator/v1\0")
+    for label, value in (
+        ("wfn_scheme", WFN_FINGERPRINT_SCHEME),
+        ("wfn", wfn_fingerprint(wfn)),
+        ("vnl", vnl_fingerprint),
+        ("kinetic_balance", KINETIC_BALANCE_LIFT_PROVENANCE),
+        ("band_interval", f"{start}:{stop}"),
+        ("nk", str(int(geom.nk))),
+        ("cell_volume", float(geom.cell_volume).hex()),
+    ):
+        fingerprint_update_value(digest, label, value)
+    fingerprint = "sha256:" + digest.hexdigest()
+
+    packed = sweep_matrix_elements(
+        psi_G,
+        geom=geom,
+        operator=uniform_gauge_operator(
+            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup),
+        gvecs=gvecs,
+        gmask=gmask,
+        box_index=box_index,
+        kvecs=kvecs,
+        use_scan=use_scan,
+    )
+    return UniformGaugeMatrixElements(
+        gamma_raw=packed[:, :3],
+        lambda_raw=packed[:, 3:].reshape(
+            int(packed.shape[0]), 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1])),
+        hamiltonian_config_operator_fingerprint=fingerprint,
+    )
 
 
 def sum_operators(*ops: Operator) -> Operator:

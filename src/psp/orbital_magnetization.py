@@ -63,7 +63,6 @@ from common import Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
-from psp.get_dipole_mtxels import compute_p_operator_k, compute_vnl_velocity_cart
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 import psp.vnl_ops as vnl_ops
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -95,6 +94,14 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
                   aliases Γ, so dropping the mask would double-count ψ(Γ)
                   in every one of the three quantities below.
     """
+    # Keep the pure orbital-response algebra importable without starting the
+    # dipole driver's communicator/FFI stack.  Only this WFN-owning execution
+    # path needs those producer routines.
+    from psp.get_dipole_mtxels import (
+        compute_p_operator_k,
+        compute_vnl_velocity_cart,
+    )
+
     wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)            # (nb, ns, nx,ny,nz)
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     Gk_crys, g_mask = tab.at(ik)

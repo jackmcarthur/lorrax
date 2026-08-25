@@ -33,19 +33,23 @@ from gw.photon_layout import (
 )
 
 
-STATIC_GAUGE_HEAD_SCHEMA_VERSION = 1
+STATIC_GAUGE_HEAD_SCHEMA_VERSION = 2
 STATIC_GAUGE_HEAD_CONVENTION_ID = (
-    "lorrax.static_gauge_head/v1"
+    "lorrax.static_gauge_head/v2"
     "|omega=0_static"
     "|energy=Rydberg"
     "|length=bohr"
     "|fourier=zeta_G(q):FFT_backward[exp(-i*q_cart.r)*zeta(r)]"
-    "|current=j:c*Psi^dagger*alpha*Psi"
+    "|Gamma_raw=(alpha_FS/2)*dH_Pauli_Ry/dk"
+    "|physical_current=j:c*Gamma_raw=(1/2)*dH_Pauli_Ry/dk"
+    "|Lambda_raw=(alpha_FS/2)*d2H_Pauli_Ry/dkdk"
     "|lorentz=(C,Jx,Jy,Jz)"
     "|q_cart=bohr^-1"
     "|head=Pi_reg(q):q_a*q_b*S_direct[a,b]"
     "|hall_CT=+i*epsilon[b,a,i]*sigma_H[b]*q[a]"
     "|hall_TC=CT^dagger"
+    "|sigma_H_raw=-(alpha_FS*C/(2*Omega_cell))*Im(cB);"
+    "C=2/(nspin*nspinor_wfn)"
     "|normalization=S_direct_includes_1/Omega;Y,Z_unscaled;"
     "Schur_adds_YWZ/Omega"
     f"|packing={PHOTON_BASIS_ORDERING}"
