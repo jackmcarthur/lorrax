@@ -598,6 +598,7 @@ def main(argv=None):
 				print0(
 					"  full photon response: "
 					f"approximation={photon_response.approximation}, "
+					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
 			else:
