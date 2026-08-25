@@ -22,7 +22,7 @@ from gw.efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                        band_in_occupation_window, occupation_weight_floor)
 from gw.mpa.evaluator import damped_rectangle_positive_rule
 from gw.minimax_screening import MinimaxNodes
-from gw.ppm_windows import _SigmaBranch, _SigmaWindow
+from gw.ppm_windows import _SigmaBranch, _SigmaWindow, _omega_clusters
 
 
 class SharedSigmaWindow(NamedTuple):
@@ -270,26 +270,6 @@ def _rectangles(rows, E_bounds, omega_max, eta, *, crossing):
                            0.0 if real_phase else g_lo + eta,
                            0.0 if real_phase else g_hi + eta))
     return rectangles
-
-
-def _omega_clusters(omega_abs, gap_ry):
-    """Split the |ω| evaluation values at gaps larger than ``gap_ry``.
-
-    Returns ``[(index_array, w_lo, w_hi), ...]`` in ascending-w order.
-    A uniform production grid is always one cluster, which is the
-    monolithic-core (incumbent) geometry; a patched semicore grid
-    (``sigma_omega_patches_ev``) arrives pre-gapped and is where the
-    clustered decomposition pays.  ``docs/dev/crossing-rule-cost-law.md``
-    is the derivation of why the gap — not the span — is what a rule
-    never has to resolve.
-    """
-    w = np.asarray(omega_abs, dtype=np.float64)
-    order = np.argsort(w, kind="stable")
-    breaks = np.nonzero(np.diff(w[order]) > float(gap_ry))[0]
-    return [
-        (np.sort(piece), float(np.min(w[piece])), float(np.max(w[piece])))
-        for piece in np.split(order, breaks + 1)
-    ]
 
 
 #: Shell rules are cached on this f_max lattice (Ry).  A rule certified at

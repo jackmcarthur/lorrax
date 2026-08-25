@@ -316,6 +316,248 @@ class _SigmaBranch(NamedTuple):
     # (docs/theory/finite-occupation-screening.md).
 
 
+# ---------------------------------------------------------------------------
+#  Shared scalar crossing geometry.  MPA and GN have different pole carriers,
+#  but the omega-axis partition is physics-neutral and therefore has one owner
+#  here, below both planners.  The GN cell planner is deliberately host-only:
+#  it returns scalar interval metadata and never builds a pole-sized mask.
+# ---------------------------------------------------------------------------
+
+def _omega_clusters(
+    omega_abs,
+    gap_ry: float,
+    *,
+    max_span_ry: float | None = None,
+):
+    """Split ``|omega|`` values at gaps, optionally capping cluster span.
+
+    Returns ``[(index_array, w_lo, w_hi), ...]`` in ascending-energy order.
+    Each index array is sorted back into the caller's original order, which is
+    the ordering the Sigma branch accumulator consumes.  ``max_span_ry=None``
+    is the incumbent MPA rule exactly: only genuine gaps split a grid.
+
+    The optional span cap is a planning constraint, not a second clustering
+    algorithm.  Within each gap-connected component the greedy left-to-right
+    packing is the minimum number of scalar intervals of the requested maximum
+    width that cover the actual evaluation points.
+    """
+    gap = float(gap_ry)
+    if not np.isfinite(gap) or gap <= 0.0:
+        raise ValueError("omega cluster gap must be finite and positive")
+    span = None if max_span_ry is None else float(max_span_ry)
+    if span is not None and (not np.isfinite(span) or span <= 0.0):
+        raise ValueError("omega cluster maximum span must be finite and positive")
+
+    w = np.asarray(omega_abs, dtype=np.float64)
+    if w.ndim != 1:
+        raise ValueError("omega_abs must be one-dimensional")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("omega_abs contains a non-finite value")
+    if not w.size:
+        return []
+
+    order = np.argsort(w, kind="stable")
+    breaks = np.nonzero(np.diff(w[order]) > gap)[0]
+    gap_pieces = np.split(order, breaks + 1)
+    pieces = []
+    for piece in gap_pieces:
+        if span is None:
+            pieces.append(piece)
+            continue
+        start = 0
+        while start < piece.size:
+            w_start = float(w[piece[start]])
+            stop = start + 1
+            while (stop < piece.size
+                   and float(w[piece[stop]]) - w_start <= span):
+                stop += 1
+            pieces.append(piece[start:stop])
+            start = stop
+    return [
+        (np.sort(piece), float(np.min(w[piece])), float(np.max(w[piece])))
+        for piece in pieces
+    ]
+
+
+@dataclass(frozen=True)
+class HGLCrossingCell:
+    """One exact rectangular cell of a clustered GN crossing branch.
+
+    ``omega_indices`` addresses the owning branch's omega vector.  The A and B
+    selectors both use the repository-wide ``(lo, hi]`` convention.  ``e_min``
+    and ``e_max`` are the actual live A-energy extrema in that selector; they
+    are kept separate from ``e_lo`` because the first selector begins at
+    ``-inf``.  ``A_dim`` is present only on the crossing shell.
+    """
+
+    kind: str
+    omega_indices: np.ndarray
+    omega_lo: float
+    omega_hi: float
+    e_lo: float
+    e_hi: float
+    e_min: float
+    e_max: float
+    b_lo: float
+    b_hi: float
+    A_dim: float | None = None
+
+
+@dataclass(frozen=True)
+class HGLCrossingPlan:
+    """Pure scalar plan for omega-cluster x A-pane x B-cell tiling."""
+
+    cells: tuple[HGLCrossingCell, ...]
+    omega_cluster_count: int
+    energy_pane_count: int
+    max_A_dim: float
+    regularization_width_ry: float
+    edge_factor: float
+
+
+def _energy_panes(values: np.ndarray, max_span_ry: float):
+    """Minimum-width-capped ``(lo, hi]`` cover of actual scalar energies."""
+    cap = float(max_span_ry)
+    if not np.isfinite(cap) or cap < 0.0:
+        raise ValueError("A-energy pane maximum span must be finite and non-negative")
+    unique = np.unique(np.asarray(values, dtype=np.float64))
+    if not unique.size:
+        return []
+    panes = []
+    select_lo = -np.inf
+    start = 0
+    while start < unique.size:
+        e_min = float(unique[start])
+        stop = int(np.searchsorted(unique, e_min + cap, side="right"))
+        # ``unique[start]`` is always inside its own zero-width pane.  Keep the
+        # guard explicit because a NaN/overflow here would otherwise loop.
+        if stop <= start:
+            raise AssertionError("energy-pane packing made no progress")
+        e_max = float(unique[stop - 1])
+        panes.append((float(select_lo), e_max, e_min, e_max))
+        select_lo = e_max
+        start = stop
+    return panes
+
+
+def plan_hgl_crossing_cells(
+    *,
+    omega_abs,
+    E_A,
+    base_mask_A,
+    regularization_width_ry: float,
+    edge_factor: float,
+    omega_cluster_gap_ry: float,
+    omega_max_span_ry: float,
+    crossing_A_max: float = _CROSSING_A_MAX,
+) -> HGLCrossingPlan:
+    """Plan the exact clustered GN crossing decomposition, without execution.
+
+    For an omega cluster ``[w0,w1]``, an A-energy pane ``(e0,e1]`` with
+    actual extrema ``[emin,emax]``, and ``z = edge*xi``, the B axis is split
+    into three adjacent cells::
+
+        (-inf, w0-emax-z]                 x = omega-E-B >= z
+        (w0-emax-z, w1-emin+z]           crossing shell
+        (w1-emin+z, +inf)                x = omega-E-B <= -z
+
+    The shell obeys
+    ``max|x| <= Delta_omega + Delta_E + z``.  Energy panes are greedily
+    packed at the largest width allowed by ``crossing_A_max``; that greedy
+    cover is minimal for the chosen omega clustering.  Nothing here chooses a
+    quadrature, touches JAX, or changes the incumbent contiguous-grid path.
+    """
+    xi = float(regularization_width_ry)
+    edge = float(edge_factor)
+    A_max = float(crossing_A_max)
+    omega_span = float(omega_max_span_ry)
+    if not np.isfinite(xi) or xi <= 0.0:
+        raise ValueError("regularization_width_ry must be finite and positive")
+    if not np.isfinite(edge) or edge < 0.0:
+        raise ValueError("edge_factor must be finite and non-negative")
+    if not np.isfinite(A_max) or A_max <= edge:
+        raise ValueError("crossing_A_max must be finite and exceed edge_factor")
+    capacity = (A_max - edge) * xi
+    if (not np.isfinite(omega_span) or omega_span <= 0.0
+            or omega_span >= capacity):
+        raise ValueError(
+            "omega_max_span_ry must be positive and smaller than the HGL "
+            f"pane capacity {(capacity):.6g} Ry")
+
+    energies = np.asarray(E_A, dtype=np.float64)
+    base = np.asarray(base_mask_A, dtype=bool)
+    if energies.shape != base.shape:
+        raise ValueError("E_A and base_mask_A must have identical shapes")
+    live = energies[base]
+    if not live.size:
+        return HGLCrossingPlan((), 0, 0, 0.0, xi, edge)
+    if not np.all(np.isfinite(live)):
+        raise ValueError("live A-energy support contains a non-finite value")
+
+    clusters = _omega_clusters(
+        omega_abs, omega_cluster_gap_ry, max_span_ry=omega_span)
+    z = edge * xi
+    cells = []
+    n_panes = 0
+    max_A_dim = 0.0
+    for omega_indices, w_lo, w_hi in clusters:
+        delta_w = w_hi - w_lo
+        e_span_cap = A_max * xi - z - delta_w
+        if e_span_cap < 0.0:
+            raise AssertionError(
+                "omega cluster exceeds the HGL capacity after span capping")
+        panes = _energy_panes(live, e_span_cap)
+        n_panes += len(panes)
+
+        # The energy intervals must tile the live A support exactly once.
+        ownership = np.zeros(live.shape, dtype=np.int32)
+        for e_lo, e_hi, _e_min, _e_max in panes:
+            ownership += ((live > e_lo) & (live <= e_hi)).astype(np.int32)
+        if not np.all(ownership == 1):
+            raise AssertionError(
+                "GATE hgl_A_partition: A panes do not tile live support exactly")
+
+        for e_lo, e_hi, e_min, e_max in panes:
+            b_shell_lo = w_lo - e_max - z
+            b_shell_hi = w_hi - e_min + z
+            A_dim = (delta_w + (e_max - e_min) + z) / xi
+            if A_dim > A_max * (1.0 + 8.0 * np.finfo(np.float64).eps):
+                raise AssertionError(
+                    "GATE hgl_shell_capacity: planned shell exceeds "
+                    f"A_dim={A_dim:.16g} > {A_max:.16g}")
+            max_A_dim = max(max_A_dim, A_dim)
+            common = dict(
+                omega_indices=np.asarray(omega_indices, dtype=np.int64),
+                omega_lo=w_lo, omega_hi=w_hi,
+                e_lo=e_lo, e_hi=e_hi, e_min=e_min, e_max=e_max)
+            cells.extend((
+                HGLCrossingCell(
+                    "positive", b_lo=-np.inf, b_hi=b_shell_lo,
+                    **common),
+                HGLCrossingCell(
+                    "crossing", b_lo=b_shell_lo, b_hi=b_shell_hi,
+                    A_dim=A_dim, **common),
+                HGLCrossingCell(
+                    "negative", b_lo=b_shell_hi, b_hi=np.inf,
+                    **common),
+            ))
+
+    # Each omega point belongs to exactly one cluster, including repeated
+    # values (stable indices, not value equality, own the partition).
+    omega = np.asarray(omega_abs, dtype=np.float64)
+    omega_ownership = np.zeros(omega.shape, dtype=np.int32)
+    for idx, _lo, _hi in clusters:
+        omega_ownership[np.asarray(idx, dtype=np.int64)] += 1
+    if not np.all(omega_ownership == 1):
+        raise AssertionError(
+            "GATE hgl_omega_partition: omega clusters do not tile the branch")
+
+    return HGLCrossingPlan(
+        cells=tuple(cells), omega_cluster_count=len(clusters),
+        energy_pane_count=n_panes, max_A_dim=max_A_dim,
+        regularization_width_ry=xi, edge_factor=edge)
+
+
 def _iter_branches(
     *,
     omega_pos: np.ndarray, idx_pos: np.ndarray,
