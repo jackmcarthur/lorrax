@@ -1316,8 +1316,8 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
     if nspinor == 1:
         # Scalar ψ: one factor, and it is 1, for spatial AND TRS rows
         # alike (Θ = K carries no iσ_y).  Shaped (1, 1) / (nk, 1, 1) so the
-        # consumers' einsum contracts a matching axis and is a true no-op
-        # rather than a silent broadcast.
+        # consumers' static application contracts a matching axis and is a
+        # true no-op rather than a silent broadcast.
         out = np.ones((idx1.size, 1, 1), dtype=np.complex128)
         return out[0] if scalar else out
     # ``% n_tran`` folds a TRS row (idx ≥ n_tran) back to its spatial op;
@@ -1331,6 +1331,56 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
     U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))    # (nk, 2, 2)
     out = np.where(is_trs[:, None, None], U_trs, U_sp)
     return out[0] if scalar else out
+
+
+def apply_spinor_rotation(U, coeff_last):
+    """Apply a scalar or Pauli-spinor rotation without a general GEMM.
+
+    ``spinor_rotation_for_sym_row`` owns the physical matrix; this function
+    owns its application to wavefunction coefficients.  ``U`` has shape
+    ``(..., a, c)`` and ``coeff_last`` has shape ``(..., c)``.  Their leading
+    dimensions follow ordinary broadcasting, so a caller normalizes its own
+    physical layout once and this service sees only the spinor-last algebra.
+
+    The spinor extent is static and must be one or two.  Writing the Pauli
+    case as two explicit two-term multiply-adds is deliberate: lowering the
+    old ``einsum`` as a general K=2 cuBLAS GEMM made the production PHDF5
+    unfold shape un-compilable under XLA's sharding autotuner.  This spelling
+    is the exact same linear action without asking a matrix-multiply backend
+    to choose a GEMM algorithm for a fixed two-component representation.
+
+    NumPy inputs return a NumPy array; JAX arrays/tracers remain in JAX.  This
+    keeps the eager host unfold host-only while giving the collective loader
+    the same semantic owner inside ``jit``/``shard_map``.
+    """
+    u_shape = np.shape(U)
+    coeff_shape = np.shape(coeff_last)
+    if len(u_shape) < 2 or len(coeff_shape) < 1:
+        raise ValueError(
+            "apply_spinor_rotation: expected U(...,a,c) and "
+            f"coeff_last(...,c); got shapes {u_shape} and {coeff_shape}")
+    ns = int(coeff_shape[-1])
+    if ns not in (1, 2):
+        raise ValueError(
+            "apply_spinor_rotation: spinor extent must be 1 (scalar/non-SOC) "
+            f"or 2 (SOC); got {ns}")
+    if tuple(int(x) for x in u_shape[-2:]) != (ns, ns):
+        raise ValueError(
+            "apply_spinor_rotation: U's final axes must match the "
+            f"coefficient spinor extent; got U{u_shape[-2:]} vs ns={ns}")
+
+    is_jax = isinstance(U, (jax.Array, jax.core.Tracer)) or isinstance(
+        coeff_last, (jax.Array, jax.core.Tracer))
+    xp = jnp if is_jax else np
+    U_x = xp.asarray(U)
+    coeff_x = xp.asarray(coeff_last)
+    if ns == 1:
+        return xp.expand_dims(U_x[..., 0, 0] * coeff_x[..., 0], axis=-1)
+    out0 = (U_x[..., 0, 0] * coeff_x[..., 0]
+            + U_x[..., 0, 1] * coeff_x[..., 1])
+    out1 = (U_x[..., 1, 0] * coeff_x[..., 0]
+            + U_x[..., 1, 1] * coeff_x[..., 1])
+    return xp.stack((out0, out1), axis=-1)
 
 
 def tau_phase_row(sym_mat_k, tau, g_kbar):
@@ -1431,8 +1481,8 @@ def unfold_psi(
         spinor half disappears. Both lines are what this function already
         computes once ``spinor_rotation_for_sym_row`` is told ``ns = 1``
         and hands back the 1×1 identity instead of a 2×2 — see the
-        einsum below and that helper's own docstring for the defect this
-        replaced (registered 2026-08-08, fixed 2026-08-09).
+        service application below and that helper's own docstring for the
+        defect this replaced (registered 2026-08-08, fixed 2026-08-09).
 
         Note that ns = 1 does NOT switch the TRS rows off. A scalar
         nspin=1 deck is spin-degenerate by construction, so
@@ -1538,23 +1588,24 @@ def unfold_psi(
             cnk = cnk * phase[None, None, :]
     # Spinor rotation with the TRS augmentation single-sourced.  ``ns`` is
     # READ OFF THE DATA rather than taken from a parameter: it is the axis
-    # the einsum below contracts, so the array itself is the only source
-    # that cannot disagree with what is about to be multiplied.
+    # the static service application below contracts, so the array itself is
+    # the only source that cannot disagree with what is about to be applied.
     ns = int(np.shape(cnk)[1])
     U_eff = spinor_rotation_for_sym_row(
         U_spinor_spatial, sym_idx, n_sym_spatial, nspinor=ns)
 
     # Spinor rotation.  For ns=1 (non-SOC) ``U_eff`` genuinely IS the 1x1
-    # identity — the helper is told ``ns`` and returns it — so this einsum
-    # is a true no-op and callers still need no special case.  Before
+    # identity — the helper is told ``ns`` and returns it — so this
+    # application is a true no-op and callers still need no special case.
+    # Before
     # 2026-08-09 that sentence stood here and was FALSE: the helper
     # returned the 2x2 unconditionally, numpy broadcast the size-1 spinor
     # axis instead of raising, and a scalar WFN came back (nb, 2, ngk).
     #
-    # The guard is the anti-regression, not decoration: a mismatch here is
-    # invisible to einsum (it broadcasts) and only surfaces downstream as
-    # a slab-write ValueError with no mention of spinors, which is exactly
-    # how the original defect presented.
+    # The guard is the anti-regression, not decoration: the former einsum
+    # silently broadcast this mismatch and only surfaced downstream as a
+    # slab-write ValueError with no mention of spinors, which is exactly how
+    # the original defect presented.
     if int(np.shape(U_eff)[-1]) != ns:
         raise ValueError(
             f"unfold_psi: spinor factor is {np.shape(U_eff)[-1]}x"
@@ -1562,7 +1613,8 @@ def unfold_psi(
             f"einsum would BROADCAST the size-1 axis rather than raise, "
             f"returning sum_k U[j,k]*psi[n,0,l] on an ns-wrong output "
             f"shape.  See spinor_rotation_for_sym_row's nspinor argument.")
-    cnk = np.einsum("jk,nkl->njl", U_eff, cnk)
+    cnk = np.moveaxis(
+        apply_spinor_rotation(U_eff, np.moveaxis(cnk, 1, -1)), -1, 1)
     return cnk
 
 
