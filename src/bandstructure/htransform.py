@@ -1437,13 +1437,18 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     Math (htransform paper):
         fH_k  = -Σ_n |sqrt(-f(ε_n,k))|² ctilde_n,k ctilde_n,k^H
               = Σ_n f(ε_n,k) ctilde_n,k ctilde_n,k^H
-        fH_R  = (1/N_k) Σ_k e^{-2πi k·R} fH_k                          # IFFT
+        fH_R  = (1/N_k) Σ_k e^{+2πi k·R} fH_k                          # IFFT
     where f(ε) is the smooth bandwidth-bound transform from
     ``f_transform_eigs`` (≤0 for ε<shift, =0 for ε≥shift). For any q,
-    fH_q = Σ_R e^{-2πi q·R} fH_R recovers the rank-α-basis Hamiltonian
+    fH_q = Herm[Σ_R e^{-2πi q·R} fH_R] recovers the rank-α-basis Hamiltonian
     whose eigenvalues are f(ε_n,q) and whose eigenvectors are c_n,q,
     enabling both bandstructure interpolation (eigvalsh + newton_inv on
     eigvals) and wfn recovery (eigh, then ψ_n,q(r_μ) = Σ_α c_n,q[α]·B[α,s,μ]).
+
+    The paper/archive use the conjugate sign pair.  Because every ``fH_k`` is
+    Hermitian and both implementations Hermitize the reconstructed matrix,
+    the two spellings are exactly equivalent; keeping the signs here aligned
+    with the actual IFFT prevents a documentation-only convention mismatch.
 
     Args:
         ctilde:    (nk_co, nb, rank) Galerkin coefficients in the rank-α basis,
