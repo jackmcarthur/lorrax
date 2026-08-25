@@ -75,6 +75,40 @@ def spectral_compression_lines(receipt, *,
     htransform, BSE and exciton-band drivers cannot drift onto different
     explanations of the same retained subspace.
     """
+    if receipt.get("method") == "whole_state_randomized_qrcp":
+        retained = int(receipt["retained_rank"])
+        carried = int(receipt["carried_rank"])
+        n_pad = int(receipt["null_padding"])
+        return [
+            f"{label:<15}: {int(receipt['stacked_states'])} stacked states x "
+            f"{int(receipt['state_dimension'])} full-Bloch components",
+            f"QRCP search    : {int(receipt['candidate_count'])} candidates; "
+            f"ceiling {int(receipt['search_rank'])} "
+            f"({float(receipt['rank_multiplier']):.5f} x fitted bands)",
+            f"QRCP rank      : qr_eps={float(receipt['qr_eps']):.5e}; raw "
+            f"rank {int(receipt['raw_rank'])}; retained rank {retained}",
+            f"Reproducibility: seed={int(receipt['qrcp_seed'])}; "
+            f"rng={receipt['qrcp_rng_version']}; candidate SHA256="
+            f"{receipt['candidate_hash']}; pivot SHA256={receipt['pivot_hash']}",
+            f"Selected basis : min diag(L)="
+            f"{float(receipt['min_cholesky_diagonal']):.5e}; "
+            f"max |C[selected]-L|="
+            f"{float(receipt['selected_orientation_error']):.5e} "
+            f"(cap {float(receipt['selected_orientation_tolerance']):.5e})",
+            f"Projection     : max |C C^H-I|="
+            f"{float(receipt['coefficient_orthogonality_error']):.5e}; "
+            f"max missing norm^2="
+            f"{float(receipt['max_missing_state_norm_squared']):.5e}; "
+            f"relative Frobenius residual="
+            f"{float(receipt['relative_frobenius_residual']):.5e}",
+            "Error meaning     : projection residuals diagnose the fitted "
+            "whole-state representation; they are not a fine-k band-energy "
+            "error bound",
+            f"Distributed carry: rank {carried} = {retained} physical + "
+            f"{n_pad} exact-null mesh pad; no rank was dropped for device "
+            "alignment",
+        ]
+
     report = receipt["numerical_report"]
     metrics = receipt["compression"]
     numerical_closure = receipt.get("numerical_closure")

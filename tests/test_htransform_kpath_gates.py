@@ -82,11 +82,9 @@ def test_post_kpath_outputs_are_replicated(ndev):
     mesh = _mesh(1 if ndev == 1 else 2)
     meta, ct, enk, wfn, kpath_data = _kpath_inputs()
     import jax.numpy as jnp
-    rank = ct.shape[2]
-    S = jnp.eye(rank, dtype=jnp.complex128)
     lines = []
     with mesh:
-        res = h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk), wfn,
+        res = h_transform(meta, jnp.asarray(ct), jnp.asarray(enk), wfn,
                           kpath_data, lines.append, mesh,
                           n_return_bands=ct.shape[1] - 1)
     banner = " ".join(lines)
@@ -103,32 +101,19 @@ def test_post_kpath_outputs_are_replicated(ndev):
     _ = jax.devices()          # keep the jax import meaningful to linters
 
 
-def test_identity_metric_route_matches_the_cholesky_route():
-    """The S = I fast path drops two triangular solves per q.  It is NOT
-    bit-identical — the shipped path divides every eigenvalue by (1+1e-10)
-    through the ridge on chol(S) — so this cell pins the size of that
-    difference rather than asserting an equality that is not true."""
+def test_htransform_carries_no_dense_identity_metric():
+    """The selected-state basis owns one orthonormal gauge, not a dense S."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from bandstructure.htransform import h_transform
     mesh = _mesh(1)
     meta, ct, enk, wfn, kpath_data = _kpath_inputs()
-    rank = ct.shape[2]
-    S_eye = jnp.eye(rank, dtype=jnp.complex128)
-    # A metric that is the identity to the LAST BIT except for one entry
-    # perturbed far above the route's ``== 0.0`` test: same physics, but it
-    # forces the Cholesky route so the two can be compared at all.
-    S_near = S_eye.at[0, 0].add(1e-13)
-    outs = []
-    for S in (S_eye, S_near):
-        lines = []
-        with mesh:
-            outs.append(h_transform(meta, S, jnp.asarray(ct), jnp.asarray(enk),
-                                    wfn, kpath_data, lines.append, mesh,
-                                    n_return_bands=ct.shape[1] - 1))
-        banner = " ".join(lines)
-        outs[-1] = (outs[-1], "identity" in banner.split("metric: ")[1][:10])
-    (a, a_id), (b, b_id) = outs
-    assert a_id and not b_id, (a_id, b_id)
-    d = float(np.max(np.abs(a["energies_sorted"] - b["energies_sorted"])))
-    assert d < 1e-6, f"identity route moved an energy by {d:.3e} Ry"
+    lines = []
+    with mesh:
+        out = h_transform(meta, jnp.asarray(ct), jnp.asarray(enk), wfn,
+                          kpath_data, lines.append, mesh,
+                          n_return_bands=ct.shape[1] - 1)
+    assert np.all(np.isfinite(out["energies_sorted"]))
+    banner = " ".join(lines)
+    assert "metric: identity" in banner
+    assert "no dense" in banner

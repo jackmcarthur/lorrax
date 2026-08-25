@@ -1570,31 +1570,27 @@ def main(argv=None):
     apply_q_per_segment(params, args.q_per_segment, log=log)
 
     # Resolve and print the numerical environment before either htransform
-    # Galerkin setup can emit progress.  The pre-resolved Gram Plan is reused
-    # by the explicit exciton-path fit below, so this is the concrete backend
-    # in execution rather than a policy guess.
+    # Galerkin setup can emit progress. Whole-state QRCP owns basis selection;
+    # the only eigensolver plan here is the fine-k plan executed downstream.
     _wfn_name = str(params["wfn_file"])
     if not os.path.isabs(_wfn_name):
         _wfn_name = os.path.join(
             os.path.dirname(os.path.abspath(args.input)), _wfn_name)
     wfn, sym = ht.setup_wfn_and_sym(_wfn_name, mesh_xy=mesh_xy)
     from distrib_la import plan as _linalg_plan
-    _gram_plan = _linalg_plan(
-        "eigh", mesh_xy, backend=resolve_eigh_backend(params),
-        n=int(sym.nk_tot) * (int(params["nval"]) + int(params["ncond"])))
     _fine_plan = _linalg_plan(
         "eigh", mesh_xy, backend=args.eigh_backend, n=None,
         batched_route=args.distrib_la_batched_route)
-    _gram_geometry = (
-        "replicated native JAX" if _gram_plan.is_native else
-        f"one matrix tile over {int(mesh_xy.shape['x'])} x "
-        f"{int(mesh_xy.shape['y'])} ranks")
+    _basis_multiplier = ht.resolve_galerkin_rank_multiplier(
+        params.get("htransform_rank_multiplier", 20.0))
     restart_file = _find_restart_file(args.input)
     report.environment(wfn=wfn, lines=(
         f"Restart tensors: {abs_path(restart_file)}",
         "Transition data: distributed band and centroid blocks on X x Y",
-        f"Gram eigensolve: {_gram_plan.requested} -> {_gram_plan.backend}; "
-        f"{_gram_geometry}; n={int(_gram_plan.n)}",
+        "Galerkin basis: whole-state randomized QRCP; search ceiling "
+        f"{_basis_multiplier:g} x fitted bands; qr_eps="
+        f"{float(params.get('htransform_qr_eps', 1.0e-3)):.3e}; seed="
+        f"{int(params.get('htransform_qrcp_seed', 0))}; no Gram eigensolve",
         f"Fine-k eigensolve: {_fine_plan.requested} -> "
         f"{_fine_plan.backend}; matrix extent follows retained Galerkin rank",
         f"Batched LA schedule: {_fine_plan.requested_batched_route} -> "
@@ -1752,12 +1748,12 @@ def main(argv=None):
     _fit_subset = keep_idx if _rank_multiplier > 0.0 else None
     _output_keep = None if _fit_subset is not None else keep_idx
     _path_rank_records = []
-    (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
+    (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          args.input, params, log, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset, wfn_sym=(wfn, sym),
-         galerkin_eigh_plan=_gram_plan,
          rank_record_fn=_path_rank_records.append)
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
         # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
@@ -1965,8 +1961,9 @@ def main(argv=None):
     # that at the one on-grid point it always has (Γ, below).  ``--vq-mode
     # ongrid`` extends that existing special case to every on-grid Q — no
     # interpolation error, no b26p stencil, no ζ.  It also makes the exciton
-    # bandstructure runnable on a restart whose ζ is stored IBZ-only (the
-    # D3h-orbit-closure cascade), which ``vq_interp`` refuses.  Cost: the full
+    # bandstructure runnable without reading ζ.  Pure refit is also
+    # compatible with IBZ-only ζ: it reads metadata/provenance, then rebuilds
+    # ζ(Q) from the canonical full-BZ WFN source.  Cost of ongrid: the full
     # (μ, ν, nkx, nky, nkz) exchange tensor alongside W_q.
     ongrid = (args.vq_mode == "ongrid")
     # ``refit`` used to refuse ("not wired") and to be unusable anyway: its
@@ -2045,7 +2042,8 @@ def main(argv=None):
             # producer's own Coulomb door.  So this branch loads ζ and stops.
             zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
                                             mesh=mesh_xy, log_fn=log,
-                                            require_slab=False)
+                                            require_slab=False,
+                                            require_full_bz_zeta=False)
             prep = eval_vq = pinvF = coeffs_packed = None
             if head_mbz:
                 raise SystemExit(
@@ -2748,6 +2746,16 @@ def main(argv=None):
     # is not on any solver path: one sync, once, after all the physics.
     from common.collectives import barrier
     barrier("exciton_bands.outputs_written")
+
+    # The streamed refit owns a second mesh-aware WFN loader plus its bounded
+    # PsiGStore.  Release the store first, then enter the loader's collective
+    # close while every rank is still aligned at the output barrier.
+    if rst is not None:
+        try:
+            vq_interp.close_refit_state(rst)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"  [exciton_bands] refit resource close failed "
+                  f"({type(exc).__name__}: {exc}); continuing to exit")
 
     # CLOSE THE LOADER HERE, EXPLICITLY, WHILE THE RANKS ARE STILL IN STEP.
     # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``

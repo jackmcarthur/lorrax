@@ -71,9 +71,10 @@ are exact nowhere else), and that half is ENFORCED by
 build — before anything expensive.  It used to fire at load, and moved when
 the refit below stopped being slab-bound; ``load_zeta_coarse`` still defaults
 to ``require_slab=True`` and only the refit caller passes ``False``.  Both
-paths need FULL-BZ stored ζ (nq == nk); IBZ-only storage (the IBZ cascade) is
-rejected with a clear error — unfolding ζ through the one canonical SymMaps
-sym-action is deferred work, not a parallel helper here.
+The interpolation model needs FULL-BZ stored ζ (nq == nk); unfolding its
+stored tiles through the canonical symmetry service remains separate work.
+The refit needs only the producer's ζ metadata/solve stamp and the restart's
+already-unfolded V gate, so IBZ-only ζ storage is legal on that route.
 
 The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
 — a per-Q ζ refit from htransform full-r wavefunctions — lives in this
@@ -103,7 +104,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-from common.fft_helpers import local_fftn3
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -418,7 +418,8 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
 # ===========================================================================
 def load_zeta_coarse(restart_file: str, zeta_file: str, *,
                      mesh: Mesh | None = None, log_fn=print,
-                     require_slab: bool = True) -> dict:
+                     require_slab: bool = True,
+                     require_full_bz_zeta: bool = True) -> dict:
     """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
 
     q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
@@ -430,8 +431,10 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     (``_fix_sphere_wrap``).  Every downstream phase/kernel uses these
     wrapped labels.
 
-    Requires FULL-BZ ζ storage (nq == nk).  IBZ-only storage (the IBZ
-    cascade) raises — see the module docstring.
+    ``require_full_bz_zeta`` is true for the interpolation model, which reads
+    every stored ζ tile.  The pure-refit caller sets it false: that route reads
+    ζ metadata and the producer's solve provenance but reconstructs ζ(Q) from
+    the canonical full-BZ WFN source, so an IBZ-only ζ file is sufficient.
 
     THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
     ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
@@ -540,12 +543,18 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     zx["ngkmax"] = zx["ZG"].shape[2]
     zx["nx"], zx["ny"], zx["nz"] = [int(x) for x in fg]
     zx["n_rtot"] = zx["nx"] * zx["ny"] * zx["nz"]
-    if zx["nq"] != zx["nk"]:
+    if require_full_bz_zeta and zx["nq"] != zx["nk"]:
         raise ValueError(
             f"vq_interp needs FULL-BZ zeta storage: zeta_q.h5 has nq={zx['nq']} "
             f"but the k-grid has nk={zx['nk']} (IBZ cascade active).  "
             f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
             f"unfold (deferred; must route through the one SymMaps sym-action).")
+    if not require_full_bz_zeta and zx["nq"] != zx["nk"]:
+        log_fn(
+            f"  [vq_interp] pure refit accepts IBZ-only ζ metadata: "
+            f"nq={zx['nq']}, full-BZ nk={zx['nk']}. Stored ZG is not read; "
+            "the symmetry service supplies the full-BZ WFN source and the "
+            "restart loader supplies unfolded V_qmunu for the on-grid gate.")
     # ── q LABELS FOR A FULL-BZ ζ WRITTEN FROM A SYMMETRY-REDUCED WFN ──────
     # ``mf_header`` is copied verbatim from the WFN, so ``kpoints/rk`` holds
     # the WFN's k-list — the IBZ when the mean-field run used symmetry.  The ζ
@@ -2301,20 +2310,22 @@ def exciton_evs(zx, D, Hdir, B, nstate=4):
 # null refit-vs-stored below):
 #     ρ̃_kmn(r) = Σ_s conj(u^{ht}_{m, wrap(k−q), s}(r)) u_{n, k, s}(r)
 #         (cell-periodic u at wrapped labels — torus convention, both legs;
-#          m-leg from htransform: u_m(r) = Σ_α c_{m,wrap(k−q)}[α] B_full[α](r))
+#          m-leg from htransform: u_m(r_chunk) =
+#              Σ_α c_{m,wrap(k−q)}[α] B_α(r_chunk))
 #     C_Q[μν] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r_ν)
 #     Z_Q[μr] = Σ_{k,mn} conj(ρ̃(r_μ)) ρ̃(r)
 #     ζ̃_Q    = C_Q⁺ Z_Q                                (THE PRODUCER'S SOLVE:
 #               isdf.core.solve_zeta_charge_dense at the charge_zeta_solve
 #               and zeta_rcond THIS BUNDLE'S ζ was fitted with, read from
 #               its own isdf_header/fit_provenance — see _zeta_solve_of)
-#     ζ̃_Q(G) = FFT_r ζ̃_Q  gathered on the sphere |bᵀ(q+G)|² ≤ cutoff
+#     ζ̃_Q(G) = Σ_rchunk FFT_r[ζ̃_Q(r_chunk)] on
+#               |bᵀ(q+G)|² ≤ cutoff (canonical G-flat accumulator)
 #     V_Q    = Σ_G conj(ζ̃(G)) v(q+G) ζ̃(G)
 #
-# Scale note: this mode holds full-r ψ for the whole fit window on device
-# (~(nk·nb)·(ns·n_rtot)·16 B — ~1 GB on the MoS2 3×3 fixtures) and costs a
-# fit-scale GEMM chain per Q.  It is the EXPENSIVE mode by design; the
-# fixture-scale target is 1 GPU, minutes per Q.
+# Scale note: this remains a fit-scale GEMM chain per Q, but its live spatial
+# state is one r slab: bounded ζ-window ψ, selected-state B rows, Z and ζ.
+# The only all-r result is already compressed to the physical G sphere and
+# μ-sharded over all P.
 
 def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
     """The producer's ζ-fit stamp off ``zeta_q.h5``; ``None`` if absent.
@@ -2544,7 +2555,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                   degeneracy_tol_ry: float | None = None,
                   n_guard: int | None = None,
                   distrib_la_batched_route: str | None = None):
-    """One-time refit state: htransform handles + full-r α-basis.
+    """One-time refit state: htransform handles + compact α-basis factor.
 
     THE TWO-WINDOW CONTRACT.  There are two windows here and they are not the
     same window:
@@ -2554,7 +2565,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         it is not the producer's ζ and ``refit_ongrid_null`` (correctly)
         refuses it.  ``zx_fit`` carries it; ``refit_vq`` fits in it.
       * the **fH window** — the ζ window PLUS ``n_guard`` bands above it.
-        ``ctilde``, ``B_at_mu``, ``enk_sigma``, ``B_full`` and ``rank`` all
+        ``ctilde``, ``B_at_mu``, ``enk_sigma`` and ``rank`` all
         live here.
 
     WHY THEY MUST DIFFER.  ``f(ε)`` is identically zero for ε ≥ ``shift`` and
@@ -2587,17 +2598,16 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
           call must be handed this, not the caller's ``zx``.
       ctilde, B_at_mu, enk_sigma, kgrid_co — htransform setup on the WIDE
           (fH) window: ``nb_wide = zx_fit["nb"] + n_guard``
-      psi_r    (nk·nb_ζ, ns·n_rp)  stored ζ-WINDOW u on the full r-grid,
-                                 device, zero-padded on r to a multiple of
-                                 r_chunk.  The guard bands are deliberately
-                                 NOT here: they shape fH, they are not pair
-                                 density.
-      B_full   (rank, ns·n_rp)   α-basis on the full r-grid = W_proj ψ_r,
-                                 built from the WIDE ψ because ``W_proj`` and
-                                 ``ctilde`` are the wide window's
+      basis     selected indices, physical rank and triangular factor for the
+          WIDE window; :func:`isdf.galerkin.iter_galerkin_rchunks` evaluates
+          B(r_chunk) on demand in that gauge.
+      psi_source  the canonical G-flat WFN store for the WIDE window.  It
+          yields only a bounded r slab; ζ-window ψ is retained for the pair
+          density while guard rows participate only in B(r_chunk).
       n_guard, nb_wide, window_abs (ζ), window_abs_fh (wide) — the contract,
           recorded so a reader of ``rst`` never has to infer which is which
-      n_rtot, r_chunk, galerkin_rel — bookkeeping + printed residual
+      r_chunk_ranges, galerkin_rel — bounded schedule + compact projection
+          receipt; no full-grid Psi/B/Z/zeta is retained.
       zeta_solve  ``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit
           on disk — read from the ζ file's own ``isdf_header/fit_provenance``
           and NOT from the deck.  ``refit_vq`` refuses without it.
@@ -2617,7 +2627,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         resolve_distrib_la_batched_route,
     )
     from bandstructure.htransform import initialize_wfns
-    from common.wfn_transforms import iter_psi_rchunk_bandwise
+    from common.psi_G_store import build_psi_G_store
+    from common.wfn_layout import band_sphere_spec
+    from runtime.padding import round_up, spec_divisor
 
     # THE ζ SOLVE, BEFORE ANYTHING EXPENSIVE.  A refit whose solve does not
     # match the producer's cannot reproduce the producer's tiles no matter how
@@ -2645,10 +2657,10 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     params = read_lorrax_input(input_file)
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
-    (wfn, sym, meta, _, _S, ctilde, B_at_mu, enk_sigma,
-     W_proj) = initialize_wfns(input_file, params, log_fn, mesh_xy=mesh_xy,
-                               return_full_proj=True,
-                               n_guard_bands=n_guard)
+    (wfn, sym, meta, _, basis, enk_sigma) = initialize_wfns(
+        input_file, params, log_fn, mesh_xy=mesh_xy,
+        n_guard_bands=n_guard)
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nk, nb_wide, rank = (int(ctilde.shape[0]), int(ctilde.shape[1]),
                          int(ctilde.shape[2]))
     # ``nb`` is, everywhere below and in every ``refit_vq`` call, the ζ-FIT
@@ -2785,80 +2797,50 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                f"~1 meV at nband<=48, ~955 meV at nband 80).  Keep the guards "
                f"just deep enough to clear the f-shoulder.")
 
-    # Stream the ψ of the fH (WIDE) window onto the full r-grid (host
-    # assembly, one band chunk at a time), then push once to device.
-    # ``band_range_fh`` is the window ``initialize_wfns`` built ``ctilde``
-    # over, so it is the window ``W_proj`` projects and the ONLY window
-    # ``B_full = W_proj @ ψ`` is defined on.  The ζ-window sub-block is sliced
-    # back out below and is what ``refit_vq`` contracts; the guard bands exist
-    # to shape fH and are deliberately absent from every pair density.
-    psi_r_host = np.empty((nk, nb_wide, ns, n_rtot), dtype=np.complex128)
-    for bc_range, psi_bc in iter_psi_rchunk_bandwise(
-            wfn, sym, meta, mesh_xy, band_range_fh, 0, n_rtot,
-            bool(params.get("bispinor", False)), band_chunk_size=16):
-        lo = bc_range[0] - band_range_fh[0]
-        hi = bc_range[1] - band_range_fh[0]
-        # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get.
-        # ``iter_psi_rchunk_bandwise`` yields a mesh-sharded global array, so on a MULTI-PROCESS run its
-        # shards live on other processes and ``jax.device_get`` raises
-        # ("Fetching value for a jax.Array that spans non-addressable
-        # devices") — measured at P=4/4-process, job 56612363 step .59, the
-        # first time this function ever ran under the driver.  Its three-arm
-        # branch is also why the naive repair is wrong: ``process_allgather(
-        # tiled=True)`` on the fully-addressable P=1 array would concatenate
-        # this process's whole copy and multiply the k axis by P.
-        # SLICE TO THE CHUNK'S OWN WIDTH.  ``load_psi_gflat_padded`` pads the
-        # band axis up to a multiple of the device count, so a chunk narrower
-        # than that comes back WIDER than ``bc_range`` says — 9 requested
-        # bands arriving as 12 at four devices.  Every window this function
-        # ever saw before the two-window contract had a band count divisible
-        # by the device count (52, 24, 20 at P=4), so the last chunk was
-        # always already aligned and the pad never materialised; a guard count
-        # that makes ``nb_fh`` odd (53, 55, 57) is the first caller to see it,
-        # and it arrives as a numpy broadcast error naming two shapes and
-        # neither the loader nor the pad.  The pad rows are physically zero,
-        # so the slice discards nothing.
-        _bc = _to_host(psi_bc)
-        psi_r_host[:, lo:hi] = _bc[:, :hi - lo]
-        del _bc
-    n_rp = ((n_rtot + r_chunk - 1) // r_chunk) * r_chunk
-    if n_rp > n_rtot:
-        psi_r_host = np.concatenate(
-            [psi_r_host, np.zeros((nk, nb_wide, ns, n_rp - n_rtot),
-                                  dtype=np.complex128)], axis=3)
-    psi_r_fh = jnp.asarray(psi_r_host.reshape(nk * nb_wide, ns * n_rp))
-    # α-basis on full r; Galerkin fidelity printed (the refit floor at
-    # on-grid q is bounded below by this residual)
-    W_proj = jnp.asarray(W_proj)
-    # ns folds with r: W_proj columns are (nk·nb_wide); psi_r_fh rows likewise
-    # — but the SVD's column space folded (ns, n_mu); on full r the fold is
-    # (ns, n_rp), consistent because ψ rows carry (s, r) in C order.
-    B_full = W_proj @ psi_r_fh                   # (rank, ns·n_rp)
-    rec = jnp.asarray(ctilde.reshape(nk * nb_wide, rank)) @ B_full
-    gal = float(jnp.linalg.norm(rec - psi_r_fh) / jnp.linalg.norm(psi_r_fh))
-    # TWO RESIDUALS, because the two windows are two objects.  The fH one is
-    # what ``B_full`` and ``ctilde`` actually represent; the ζ one is the
-    # floor that bounds the tile, because the pair densities the tile
-    # contracts live in the ζ window and nowhere else.  Printing only the
-    # first would attribute the guards' own (larger, harmless) representation
-    # error to the tile; printing only the second would hide a wide window
-    # that has stopped spanning.
-    _r3 = rec.reshape(nk, nb_wide, ns * n_rp)[:, :nb]
-    _p3 = psi_r_fh.reshape(nk, nb_wide, ns * n_rp)[:, :nb]
-    gal_zeta = float(jnp.linalg.norm(_r3 - _p3) / jnp.linalg.norm(_p3))
-    del rec, _r3, _p3
+    # The compact selected-state factor is the persistent α basis.  Its
+    # physical rows and the ζ-window ψ rows are regenerated together for one
+    # bounded r slab by ``isdf.galerkin.iter_galerkin_rchunks``.  This replaces
+    # the old full-grid host Ψ plus dense projector/B materialisation.
+    if int(r_chunk) <= 0:
+        raise ValueError(f"refit_prepare: r_chunk={r_chunk} must be positive")
+    p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
+    # One low-memory WFN carrier.  This is a storage schedule only; the
+    # Galerkin factor was already fitted.  Sixteen is the established refit
+    # carrier, rounded only when a wider process product is the minimum legal
+    # band shard.
+    band_hint = max(1, min(16, nb_wide))
+    band_carrier = round_up(band_hint, p_band)
+    band_chunk_ranges = tuple(
+        (b0, min(b0 + band_carrier, band_range_fh[1]))
+        for b0 in range(band_range_fh[0], band_range_fh[1], band_carrier))
+    v_on_set = make_v_on_set(zx, policy, log_fn=log_fn)
+    psi_source = build_psi_G_store(
+        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+        band_chunk_ranges=band_chunk_ranges, band_pad_to=band_carrier,
+        bispinor=bool(params.get("bispinor", False)))
+    r_chunk_ranges = tuple(
+        (r0, min(r0 + int(r_chunk), n_rtot))
+        for r0 in range(0, n_rtot, int(r_chunk)))
+
+    # B is orthonormal by construction, so the full-r projection residual is
+    # exactly sqrt(1-mean(||C_state||²)) for normalized WFN states.  Read the
+    # receipt from compact C rather than reconstructing full Ψ and B merely to
+    # measure the same projector norm.
+    @jax.jit
+    def _projection_residual(c):
+        captured = jnp.sum(jnp.abs(c) ** 2, axis=-1)
+        return jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(captured)))
+
+    gal = float(_projection_residual(ctilde))
+    gal_zeta = float(_projection_residual(ctilde[:, :nb]))
     log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} over "
            f"the fH window ({nb_wide} bands), {gal_zeta:.3e} over the ζ-fit "
            f"window ({nb} bands) — the ζ one is the refit-vs-stored on-grid "
            f"floor, since only ζ-window pair densities enter the tile")
-    # The ζ-WINDOW ψ is what ``refit_vq`` contracts, on BOTH legs: the n leg
-    # directly, the stored-m-leg twin by k-index.  Slice it out of the wide
-    # host buffer and drop the wide device copy — the guards' job is done the
-    # moment ``B_full`` exists.
-    del psi_r_fh
-    psi_r = jnp.asarray(
-        np.ascontiguousarray(psi_r_host[:, :nb]).reshape(nk * nb, ns * n_rp))
-    del psi_r_host
+    # Coordinates and on-grid lookup stay owned by SymMaps.  In particular,
+    # unfolded_kpts includes a shifted Monkhorst-Pack offset while the integer
+    # star labels do not.
+    k_frac = np.asarray(sym.unfolded_kpts, dtype=np.float64)
     return {"zx_fit": zx, "window_mode": window_mode,
             "window_abs": (int(band_range[0]), int(band_range[1])),
             "window_abs_fh": (int(band_range_fh[0]), int(band_range_fh[1])),
@@ -2866,12 +2848,15 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             "zeta_solve": _zeta_solve,
             "ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
-            "psi_r": psi_r, "B_full": B_full, "n_rtot": n_rtot,
-            "n_rp": n_rp, "r_chunk": int(r_chunk), "galerkin_rel": gal,
+            "basis": basis, "psi_source": psi_source, "wfn": wfn,
+            "meta": meta, "sym": sym, "k_frac": k_frac,
+            "r_chunk_ranges": r_chunk_ranges, "n_rtot": n_rtot,
+            "r_chunk": int(r_chunk), "galerkin_rel": gal,
             "galerkin_rel_zeta": gal_zeta,
             "rank": rank,
+            "gflat_chunk_size": int(params.get("gflat_chunk_size", 0)),
             "distrib_la_batched_route": _distrib_la_batched_route,
-            "v_on_set": make_v_on_set(zx, policy, log_fn=log_fn)}
+            "v_on_set": v_on_set}
 
 
 def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
@@ -2968,57 +2953,6 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
     return out
 
 
-def zeta_r_to_sphere_q(zx, zeta, qw, fi):
-    """ζ(r) rows → ζ(q+G) rows at the flat FFT slots ``fi``, host.
-
-    THE PRODUCER'S FRAME, and the only place the refit states it::
-
-        ZG_μ(G) = Σ_r e^{−2πi (q+G)·r} ζ_μ(r)
-
-    — the Bloch factor multiplies ζ ON THE r GRID, before the FFT, which is
-    exactly what the ζ writer does (``gw.isdf_fitting`` hands ``qvec_frac``
-    to ``common.wfn_transforms.accumulate_rchunk_to_gflat``, whose per-q
-    phase site is pre-FFT).  This is the device twin of the host
-    :func:`to_sphere` four hundred lines up: same factor, same
-    ``norm="backward"``, same flat-index gather, differing only in that
-    ``to_sphere`` gathers the STORED sphere at a stored q index while this
-    takes an explicit slot list, so it also serves an off-grid q.
-
-    It is a named function rather than four lines inside :func:`refit_vq`
-    because ``tests/test_refit_frame_convention.py`` pins it against
-    :func:`to_sphere` on a random ζ at finite q, and that identity is the one
-    the sixth wall broke: the refit used to apply a per-μ centroid winding
-    phase ``e^{−2πi q·s_μ}`` to a phase-free FFT instead, which is exact only
-    for a ζ that is a delta at s_μ, is an exact no-op at q = 0, and is why Γ
-    was clean at 4.7e-06 while every finite q read 1.11–1.17.
-    """
-    n_mu = int(zeta.shape[0])
-    ph_r = np.exp(-2j * np.pi * (zx["rfrac"] @ np.asarray(qw)))
-    box = local_fftn3((jnp.asarray(zeta) * jnp.asarray(ph_r)[None, :]).reshape(
-        n_mu, zx["nx"], zx["ny"], zx["nz"]), axes=(1, 2, 3), norm="backward")
-    # ``_to_host`` (= common.collectives.gather_to_host), NOT device_get, and
-    # THE PARITY OF n_μ IS WHY THAT WAS NOT OBVIOUS.  ζ inherits its μ-axis
-    # sharding from ``psi_m_mu`` — ``bse_setup``'s ``psi_rmu_Y``, laid out
-    # ``P(None, None, None, 'y')`` — so this box is μ-sharded across the
-    # mesh and, at P>1, across PROCESSES.  ``jax.device_get`` on that raises
-    # "Fetching value for a jax.Array that spans non-addressable (non process
-    # local) devices" (measured at 4 GPUs in 4 processes on the μ=960 parent,
-    # `qsign_recut_0811/_logs/xb_ctl_parent.log`).
-    #
-    # It hid for as long as it did because ``sharding_fit`` silently declines
-    # a spec the extent cannot satisfy: at the μ=191 child, 191 % 2 != 0, the
-    # μ axis is REPLICATED instead, and ``Array._value`` serves a fully
-    # replicated array out of the local shard before it ever reaches the
-    # addressability check — so the identical call works.  Every P=4 leg the
-    # refit path had ever had was the odd-μ child, and odd μ cannot see this
-    # by construction.  ``gather_to_host`` covers all three shapes in the one
-    # branch it already owns: device_get when fully addressable (P=1),
-    # addressable_data(0) when replicated (the odd-μ arm, still no
-    # collective), process_allgather(tiled=True) when genuinely sharded.
-    # Placement only — the tile is arithmetic on the same values.
-    return _to_host(box.reshape(n_mu, zx["n_rtot"])[:, jnp.asarray(fi)])
-
-
 def _sphere_millers(zx, qw):
     """All Miller G with |bᵀ(qw+G)|² ≤ zeta_cutoff (the fit sphere at qw)."""
     Kmax = np.sqrt(zx["zeta_cutoff"])
@@ -3033,9 +2967,12 @@ def _sphere_millers(zx, qw):
 
 
 _REFIT_KERNELS: dict = {}
+_REFIT_CHUNK_KERNELS: dict = {}
+_REFIT_MU_PAD_KERNELS: dict = {}
+_REFIT_GFLAT_ZERO_KERNELS: dict = {}
 
 
-def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk, zeta_solve):
+def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
     """Jitted refit chunk kernels, cached on the (shape) signature so every
     refit Q after the first is dispatch-only (per-q-recompile lesson).
 
@@ -3045,7 +2982,7 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk, zeta_solve):
     different program per (kind, rcond), and a key that omitted it would hand
     the second bundle of a process the first bundle's compiled solve.
     """
-    key = (nk, nb, ns, n_mu, rank, r_chunk, tuple(zeta_solve))
+    key = (nk, nb, ns, n_mu, tuple(zeta_solve))
     hit = _REFIT_KERNELS.get(key)
     if hit is not None:
         return hit
@@ -3063,18 +3000,6 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk, zeta_solve):
         Xf = X.reshape(nk * nb * nb, n_mu)
         C = jnp.conj(Xf).T @ Xf
         return Xf, 0.5 * (C + jnp.conj(C).T)
-
-    @jax.jit
-    def _psi_m_chunk(c_m, B_chunk):
-        # ψ^{ht}_{m,k−q,s}(r) = Σ_α c_m[k,α,m] B_full[α,s,r]   (chunk of r)
-        return jnp.einsum("kam,asr->kmsr", c_m,
-                          B_chunk.reshape(rank, ns, r_chunk))
-
-    @jax.jit
-    def _z_chunk(psi_m, psi_chunk, Xf):
-        rho = jnp.einsum("kmsr,knsr->kmnr", jnp.conj(psi_m),
-                         psi_chunk.reshape(nk, nb, ns, r_chunk))
-        return jnp.conj(Xf).T @ rho.reshape(nk * nb * nb, r_chunk)
 
     @jax.jit
     def _solve_zeta(C, Z):
@@ -3099,9 +3024,79 @@ def _refit_kernels(nk, nb, ns, n_mu, rank, r_chunk, zeta_solve):
             C, Z, charge_zeta_solve=_solve_kind, zeta_rcond=_rcond,
             zeta_ridge=_ridge)
 
-    kernels = (_cq_and_x, _psi_m_chunk, _z_chunk, _solve_zeta)
+    kernels = (_cq_and_x, _solve_zeta)
     _REFIT_KERNELS[key] = kernels
     return kernels
+
+
+def _refit_chunk_kernels(nk, nb, ns, n_mu, rank, n_band, r_carrier):
+    """One compile family for a bounded Galerkin/pair-density slab."""
+    key = (nk, nb, ns, n_mu, rank, n_band, r_carrier)
+    hit = _REFIT_CHUNK_KERNELS.get(key)
+    if hit is not None:
+        return hit
+
+    @jax.jit
+    def _psi_m(c_m, basis_chunk):
+        return jnp.einsum(
+            "kam,asr->kmsr", c_m,
+            basis_chunk.reshape(rank, ns, r_carrier), optimize=True)
+
+    @jax.jit
+    def _z_part(psi_m, psi_n, X_part):
+        rho = jnp.einsum(
+            "kmsr,knsr->kmnr", jnp.conj(psi_m),
+            psi_n.reshape(nk, n_band, ns, r_carrier), optimize=True)
+        return (jnp.conj(X_part).reshape(nk * nb * n_band, n_mu).T
+                @ rho.reshape(nk * nb * n_band, r_carrier))
+
+    out = (_psi_m, _z_part)
+    _REFIT_CHUNK_KERNELS[key] = out
+    return out
+
+
+def _pad_refit_zeta_for_gflat(zeta, *, n_mu_padded: int, mesh_xy: Mesh):
+    """Zero-pad and place one logical ζ slab in the producer's μ layout."""
+    n_mu, r_len = (int(v) for v in zeta.shape)
+    key = (id(mesh_xy), n_mu, int(n_mu_padded), r_len)
+    fn = _REFIT_MU_PAD_KERNELS.get(key)
+    if fn is None:
+        out = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+
+        @partial(jax.jit, out_shardings=out)
+        def _pad(z):
+            return jnp.pad(z[None], ((0, 0),
+                                     (0, int(n_mu_padded) - n_mu),
+                                     (0, 0)))
+
+        fn = _REFIT_MU_PAD_KERNELS[key] = _pad
+    return fn(zeta)
+
+
+def _refit_gflat_zeros(*, n_mu_padded: int, ngk: int, mesh_xy: Mesh):
+    """Allocate the persistent sphere carrier once per distinct shape."""
+    key = (id(mesh_xy), int(n_mu_padded), int(ngk))
+    fn = _REFIT_GFLAT_ZERO_KERNELS.get(key)
+    if fn is None:
+        out = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+
+        @partial(jax.jit, out_shardings=out)
+        def _zeros():
+            return jnp.zeros(
+                (1, int(n_mu_padded), int(ngk)), dtype=jnp.complex128)
+
+        fn = _REFIT_GFLAT_ZERO_KERNELS[key] = _zeros
+    return fn()
+
+
+def close_refit_state(rst: dict) -> None:
+    """Collectively-safe explicit release of a streamed refit's resources."""
+    source = rst.pop("psi_source", None)
+    if source is not None:
+        source.close()
+    wfn = rst.pop("wfn", None)
+    if wfn is not None:
+        wfn.close()
 
 
 def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
@@ -3127,10 +3122,8 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     t0 = _time.time()
     nk, nb, ns, n_mu = zx["nk"], zx["nb"], zx["ns"], zx["n_mu"]
     rank = rst["rank"]
-    r_chunk = rst["r_chunk"]
     qw = np.asarray(q_tile_frac, dtype=np.float64)
     qw = qw - np.round(qw)
-    n_rp = rst["n_rp"]
     # THE PRODUCER'S SOLVE OR NOTHING.  ``rst["zeta_solve"]`` is set by
     # ``refit_prepare`` from the ζ file's own fit_provenance; there is no
     # default, because the default this call used to carry (ridged Cholesky)
@@ -3145,16 +3138,17 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             "and V_Q is quadratic in that difference.  Build the state with "
             "vq_interp.refit_prepare, which reads the triple from the ζ "
             "file's isdf_header/fit_provenance.")
-    cq_and_x, psi_m_chunk, z_chunk, solve_zeta = _refit_kernels(
-        nk, nb, ns, n_mu, rank, r_chunk, rst["zeta_solve"])
-    psi_r = rst["psi_r"].reshape(nk, nb, ns, n_rp)
+    cq_and_x, solve_zeta = _refit_kernels(
+        nk, nb, ns, n_mu, rst["zeta_solve"])
+    if m_leg not in ("htransform", "stored"):
+        raise ValueError(
+            f"refit_vq: m_leg={m_leg!r}; expected 'htransform' or 'stored'")
     if m_leg == "stored":
-        kqs = np.array([kq_index_of_frac(zx, k_frac - qw) for k_frac in
-                        (zx["k_int"].astype(np.float64)
-                         / zx["kgrid"][None, :])])
+        kqs = np.array([
+            int(rst["sym"].find_qpoint_index(k_frac - qw))
+            for k_frac in rst["k_frac"]], dtype=np.int64)
         psi_m_mu = jnp.asarray(zx["psi"][kqs])
         c_m = None
-        psi_m_r = psi_r[jnp.asarray(kqs)]
     else:
         # IMPORTED IN THE BRANCH THAT USES IT.  ``bandstructure.bse_setup``
         # pulls in ``htransform``, whose module body runs
@@ -3169,8 +3163,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         from bandstructure.bse_setup import compute_wfns_fi
 
         # m-leg q list: wrap(k − q) for every coarse k, via htransform
-        k_frac = zx["k_int"].astype(np.float64) / zx["kgrid"][None, :]
-        qm_list = k_frac - qw[None, :]
+        qm_list = rst["k_frac"] - qw[None, :]
         bundle = compute_wfns_fi(
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
@@ -3180,57 +3173,57 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
                 "distrib_la_batched_route", "auto"))
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
-        psi_m_r = None
 
     Xf, C = cq_and_x(psi_m_mu, jnp.asarray(zx["psi"]))
-    Z_parts = []
-    B_full = rst["B_full"].reshape(rank, ns, n_rp)
-    psi_r_flat = rst["psi_r"].reshape(nk * nb, ns, n_rp)
-    for r0 in range(0, n_rp, r_chunk):
-        if m_leg == "stored":
-            pm = psi_m_r[:, :, :, r0:r0 + r_chunk]
-        else:
-            pm = psi_m_chunk(
-                c_m,
-                B_full[:, :, r0:r0 + r_chunk].reshape(rank, ns * r_chunk))
-        Z_parts.append(z_chunk(
-            pm,
-            psi_r_flat[:, :, r0:r0 + r_chunk].reshape(nk * nb, ns * r_chunk),
-            Xf))
-    # Z columns are r slots of the PADDED grid; solve then trim the r pad
-    # (pad columns are exact zeros — zero ψ ⇒ zero ρ ⇒ zero Z).
-    Z = jnp.concatenate(Z_parts, axis=1)              # (n_μ, n_rp)
-    zeta = solve_zeta(C, Z)[:, : rst["n_rtot"]]       # (n_μ, n_rtot)
-    # ζ(r) → sphere coefficients at qw → V tile, through the ONE spelling of
-    # the producer's frame (:func:`zeta_r_to_sphere_q`, which says why).
-    #
-    # These lines used to hold a different transform: a phase-free FFT
-    # followed by a per-μ centroid winding phase ``e^{−2πi q·s_μ}``.  It is
-    # the sixth wall.  Measured on ``dp2628n20``, ``m_leg="stored"``, four
-    # coarse q — ζ' against the STORED ζ on the matched sphere, and the tile
-    # against the stored tile:
-    #
-    #   transform                         ζ' relF            tile relF
-    #   e^{−2πi q·s_μ}·FFT[ζ]  (was)      0.44 – 1.10        0.56 – 1.17
-    #   FFT[ζ]  (winding dropped)         0.80 – 1.76        0.23 – 0.57
-    #   THIS: FFT[e^{−2πi q·r} ζ]         1.4e-06 – 4.6e-06  2.0e-06 – 7.9e-06
-    #
-    # and the winding phase applied ON TOP of the right transform puts the
-    # tile back at 1.27–1.37, which is what says it is spurious rather than
-    # merely misplaced.  The MAGNITUDES moved too — |ζ'| alone was 0.20–0.57
-    # wrong — so this was never a phase convention a sign flip could reach.
-    # The other two finite-q suspects are exonerated by the same leg:
-    # ``_sphere_millers`` returns exactly the producer's stored G set at every
-    # q (0 missing either way) and ``rst["v_on_set"]`` agrees with the
-    # producer's own kernel on the stored sphere at relF 0.0.
-    #
-    # No centroid winding phase is applied anywhere below.  ``zx["rmu_frac"]``
-    # is still the right object in the F-scheme, where the same factor is
-    # taken OUT of a stored ζ to leave something smooth enough to interpolate
-    # — an approximation there ON PURPOSE, and never an identity here.
+    X4 = Xf.reshape(nk, nb, nb, n_mu)
+
+    # ζ(r_chunk) is solved and consumed immediately by the SAME G-flat FFT
+    # accumulator as the producer.  The accumulator is the sole all-r object,
+    # already compressed to the physical q+G sphere and μ-sharded over all P.
+    from common.wfn_transforms import accumulate_rchunk_to_gflat
+    from isdf.galerkin import iter_galerkin_rchunks
+    from runtime.padding import padded_mu_extent
+
     GS = _sphere_millers(zx, qw)
-    fi = flat_idx(zx, GS)
-    zt = zeta_r_to_sphere_q(zx, zeta, qw, fi)
+    sphere_idx = flat_idx(zx, GS)[None, :]
+    n_mu_padded = padded_mu_extent(n_mu, mesh_xy)
+    gflat_acc = _refit_gflat_zeros(
+        n_mu_padded=n_mu_padded, ngk=GS.shape[1], mesh_xy=mesh_xy)
+    zeta_b0 = int(rst["window_abs"][0])
+    for r0, r1, basis_chunk, psi_parts in iter_galerkin_rchunks(
+            rst["psi_source"], rst["basis"], rst["meta"], mesh_xy,
+            r_chunk_ranges=rst["r_chunk_ranges"],
+            retained_band_range=rst["window_abs"]):
+        r_carrier = int(basis_chunk.shape[-1])
+        if m_leg == "stored":
+            psi_zeta = jnp.concatenate(
+                tuple(psi for _, psi in psi_parts), axis=1)
+            pm = psi_zeta[jnp.asarray(kqs)]
+        else:
+            psi_m, _ = _refit_chunk_kernels(
+                nk, nb, ns, n_mu, rank, 1, r_carrier)
+            pm = psi_m(c_m, basis_chunk)
+        Z = None
+        for (b_lo, b_hi), psi_n in psi_parts:
+            n0, n1 = int(b_lo) - zeta_b0, int(b_hi) - zeta_b0
+            _, z_part = _refit_chunk_kernels(
+                nk, nb, ns, n_mu, rank, n1 - n0, r_carrier)
+            contribution = z_part(pm, psi_n, X4[:, :, n0:n1])
+            Z = contribution if Z is None else Z + contribution
+        if Z is None:
+            raise RuntimeError("refit_vq: empty ζ-window WFN slab")
+        logical_r = int(r1) - int(r0)
+        zeta_chunk = solve_zeta(C, Z)[:, :logical_r]
+        zeta_chunk = _pad_refit_zeta_for_gflat(
+            zeta_chunk, n_mu_padded=n_mu_padded, mesh_xy=mesh_xy)
+        gflat_acc = accumulate_rchunk_to_gflat(
+            rchunk=zeta_chunk, gflat_acc=gflat_acc, mesh=mesh_xy,
+            fft_grid=(zx["nx"], zx["ny"], zx["nz"]), r0=r0,
+            sphere_idx=sphere_idx, qvec_frac=qw[None, :],
+            norm="backward",
+            chunk_size=(rst["gflat_chunk_size"] or None))
+        del basis_chunk, psi_parts, Z, zeta_chunk
+    zt = _to_host(gflat_acc[0])[:n_mu]
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
     v = rst.get("v_on_set", None)

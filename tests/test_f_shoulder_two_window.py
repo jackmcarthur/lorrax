@@ -43,9 +43,10 @@ WHAT IS ASSERTED, in the order that makes it mean anything:
    passes.  Both arms in one cell so neither can be quoted alone.
 3. The gate's env grammar: garbage refuses, a negative value disables (and
    says so), a positive value tightens.
-4. The two-window contract in ``refit_prepare``: ψ is streamed over the fH
-   window, ``B_full`` is built from it, and ``psi_r`` — the pair-density leg —
-   is the ζ sub-block.  Guards shape fH; they are never pair density.
+4. The two-window contract in ``refit_prepare``: the canonical ψ source spans
+   the fH window, the compact selected-state factor spans it too, and bounded
+   pair-density slabs retain only the ζ sub-block.  Guards shape fH; they are
+   never pair density.
 5. Default identity: ``initialize_wfns``' widening is opt-in at 0, so no
    caller that omits it loads a band it did not load before.
 6. The splash radius of §7: both other callers that ask for the top of their
@@ -280,24 +281,16 @@ def _refit_prepare_src() -> str:
 
 
 def test_refit_prepare_streams_psi_over_the_FH_window():
-    """ψ for ``B_full`` comes from ``band_range_fh``, not ``band_range``.
+    """The persistent PsiGStore spans ``band_range_fh``, not ζ alone.
 
-    ``B_full = W_proj @ ψ`` and ``W_proj``/``ctilde`` are the WIDE window's
-    objects — a ζ-window ψ here is a shape error at best and a silently
-    wrong α-basis at worst.
+    The selected-state factor and ``ctilde`` are WIDE-window objects; the
+    iterator retains the ζ subwindow only after collecting those selected
+    rows from the same canonical source pass.
     """
     src = _refit_prepare_src()
-    tree = ast.parse(inspect.cleandoc(src) if src.startswith(" ") else src)
-    calls = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Call)
-             and getattr(n.func, "id", None) == "iter_psi_rchunk_bandwise"]
-    assert len(calls) == 1, f"expected one ψ stream, found {len(calls)}"
-    names = {a.id for a in calls[0].args if isinstance(a, ast.Name)}
-    assert "band_range_fh" in names, (
-        f"the ψ stream must read the fH window; it read {sorted(names)}")
-    assert "band_range" not in names, (
-        "the ψ stream must NOT read the ζ window — that is the pinning this "
-        "contract removes")
+    assert "for b0 in range(band_range_fh[0], band_range_fh[1]" in src
+    assert "band_chunk_ranges=band_chunk_ranges" in src
+    assert '"basis": basis, "psi_source": psi_source' in src
 
 
 def test_psi_chunks_are_sliced_to_their_own_width():
@@ -312,23 +305,24 @@ def test_psi_chunks_are_sliced_to_their_own_width():
     ``could not broadcast input array from shape (64,12,2,13824) into shape
     (64,9,2,13824)`` — a numpy message naming neither the loader nor the pad.
     """
-    src = _refit_prepare_src()
-    assert "psi_r_host[:, lo:hi] = _bc[:, :hi - lo]" in src, (
-        "the chunk must be sliced to its own width, not broadcast whole")
+    from isdf.galerkin import iter_galerkin_rchunks
+    src = inspect.getsource(iter_galerkin_rchunks)
+    assert "psi_bc[:, offset:offset + (hi - lo)]" in src, (
+        "the bounded retained slab must be sliced to its logical width")
 
 
 def test_refit_prepare_stores_the_ZETA_block_as_pair_density():
-    """``rst["psi_r"]`` is the ζ sub-block: guards shape fH, never ρ.
+    """The iterator retains the ζ sub-block: guards shape fH, never ρ.
 
-    ``refit_vq`` reshapes ``psi_r`` to ``(nk, zx["nb"], ns, n_rp)`` and both
-    legs of the pair density come out of it, so a wide ``psi_r`` would be a
-    silent reshape onto the wrong bands.
+    No full-grid ψ object is stored; ``refit_vq`` explicitly hands the ζ
+    absolute band range to the compact Galerkin iterator.
     """
-    src = _refit_prepare_src()
-    assert "psi_r_host[:, :nb]" in src, (
-        "psi_r must be the ζ-window slice of the wide host buffer")
-    assert '"psi_r": psi_r' in src
-    assert "nb = nb_wide - n_guard" in src, (
+    prep = _refit_prepare_src()
+    import bse.vq_interp as vq
+    body = inspect.getsource(vq.refit_vq)
+    assert 'retained_band_range=rst["window_abs"]' in body
+    assert '"psi_r"' not in prep and '"B_full"' not in prep
+    assert "nb = nb_wide - n_guard" in prep, (
         "``nb`` must be the ζ window's band count everywhere below the load")
 
 

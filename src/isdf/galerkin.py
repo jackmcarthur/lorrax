@@ -42,6 +42,7 @@ __all__ = [
     "GalerkinBasis",
     "GalerkinStreamPlan",
     "fit_galerkin_basis",
+    "iter_galerkin_rchunks",
     "plan_galerkin_stream",
     "validate_rank_multiplier",
 ]
@@ -55,8 +56,11 @@ class GalerkinBasis:
     """One fitted interpolation basis in a single shared alpha gauge.
 
     ``ctilde`` and ``basis_at_nodes`` are inseparable: independently replacing
-    either array changes the gauge and invalidates reconstruction.  The
-    optional ``projector`` is in that same gauge.  ``rank_physical`` excludes
+    either array changes the gauge and invalidates reconstruction.  The compact
+    selected-state factor ``(selected_state_indices, selection_factor)`` is the
+    source for physical basis rows away from the registered nodes.  It replaces
+    the former dense ``(rank, nk*nb)`` projector; callers obtain bounded basis
+    rows with :func:`iter_galerkin_rchunks` instead.  ``rank_physical`` excludes
     exact-null mesh padding, so persistence can be mesh-independent and a
     reader can reconstruct the carrier required by its own mesh.
     """
@@ -65,9 +69,8 @@ class GalerkinBasis:
     basis_at_nodes: jax.Array
     rank_physical: int
     band_range: tuple[int, int]
-    projector: jax.Array | None = None
-    selected_state_indices: tuple[int, ...] = ()
-    selection_factor: jax.Array | None = None
+    selected_state_indices: tuple[int, ...]
+    selection_factor: jax.Array
     qrcp_seed: int = 0
     qrcp_rng_version: str = _QRCP_RNG_VERSION
     qrcp_eps: float = 1.0e-3
@@ -100,53 +103,20 @@ class GalerkinBasis:
             raise ValueError(
                 f"GalerkinBasis band range [{b0},{b1}) has width {b1-b0}, "
                 f"but ctilde carries {int(self.ctilde.shape[1])} bands")
-        if self.projector is not None:
-            expected = (rank, int(self.ctilde.shape[0] * self.ctilde.shape[1]))
-            if tuple(self.projector.shape) != expected:
-                raise ValueError(
-                    f"GalerkinBasis.projector must have shape {expected}; "
-                    f"got {tuple(self.projector.shape)}")
-        if self.selected_state_indices:
-            if len(self.selected_state_indices) != int(self.rank_physical):
-                raise ValueError(
-                    "GalerkinBasis selected-state count must equal the "
-                    f"physical rank; got {len(self.selected_state_indices)} "
-                    f"and {self.rank_physical}")
-            if self.selection_factor is None:
-                raise ValueError(
-                    "GalerkinBasis selected states require their shared "
-                    "triangular factor")
-        if self.selection_factor is not None:
-            expected = (rank, rank)
-            if tuple(self.selection_factor.shape) != expected:
-                raise ValueError(
-                    "GalerkinBasis.selection_factor must have shape "
-                    f"{expected}; got {tuple(self.selection_factor.shape)}")
+        if len(self.selected_state_indices) != int(self.rank_physical):
+            raise ValueError(
+                "GalerkinBasis selected-state count must equal the physical "
+                f"rank; got {len(self.selected_state_indices)} and "
+                f"{self.rank_physical}")
+        expected = (rank, rank)
+        if tuple(self.selection_factor.shape) != expected:
+            raise ValueError(
+                "GalerkinBasis.selection_factor must have shape "
+                f"{expected}; got {tuple(self.selection_factor.shape)}")
 
     @property
     def rank_carrier(self) -> int:
         return int(self.ctilde.shape[2])
-
-    def identity_metric(self, mesh_xy: Mesh) -> jax.Array:
-        """Reconstruct the legacy exact-identity overlap on ``mesh_xy``."""
-        rep = NamedSharding(mesh_xy, P())
-        rank = self.rank_carrier
-        return jax.jit(
-            lambda: jnp.eye(rank, dtype=jnp.complex128),
-            out_shardings=rep)()
-
-    def as_legacy_tuple(self, mesh_xy: Mesh, *, include_projector: bool):
-        """Compatibility surface for existing tuple-based consumers."""
-        out = (self.identity_metric(mesh_xy), self.ctilde,
-               self.basis_at_nodes)
-        if include_projector:
-            if self.projector is None:
-                raise ValueError(
-                    "GalerkinBasis has no projector, but the legacy caller "
-                    "requested one")
-            return out + (self.projector,)
-        return out
-
 
 def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
     """Validate the whole-state QRCP search ceiling multiplier.
@@ -331,7 +301,6 @@ def fit_galerkin_basis(
         log_fn=None,
         band_chunk_size: int = 64,
         bispinor: bool = False,
-        include_projector: bool = False,
         rank_multiplier: float = 20.0,
         qr_eps: float = 1.0e-3,
         qrcp_seed: int = 0,
@@ -690,24 +659,9 @@ def fit_galerkin_basis(
             "selected_orientation_tolerance": float(selected_tol),
         })
 
-    projector = None
-    if include_projector:
-        # Compatibility carrier for the existing refit consumer.  It is the
-        # sparse selector followed by the same physical triangular solve;
-        # no per-k gauge exists.  The follow-on low-memory refit migration
-        # consumes ``selected_state_indices`` + ``selection_factor`` directly
-        # and removes this dense compatibility object.
-        @partial(jax.jit, out_shardings=rep)
-        def _selector_projector(L):
-            E = jnp.zeros((rank, m_states), dtype=jnp.complex128)
-            E = E.at[jnp.arange(rank_phys), jnp.asarray(selected)].set(1.0)
-            return jsp_linalg.solve_triangular(L, E, lower=True)
-        projector = _selector_projector(L)
-
     return GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=B_at_mu,
-        projector=projector,
         rank_physical=rank_phys,
         band_range=(b_start, b_end),
         selected_state_indices=tuple(int(v) for v in selected),
@@ -775,6 +729,7 @@ def _make_fold_G_kernel(rank_, mesh_, sharding_q_, grid_xy_):
 
 _FOLD_G_KERNELS: dict = {}
 _SELECTED_FILL_KERNELS: dict = {}
+_SELECTED_ZERO_KERNELS: dict = {}
 _SKETCH_RANDOM_KERNELS: dict = {}
 _SKETCH_ACCUM_KERNELS: dict = {}
 _BASIS_SOLVE_KERNELS: dict = {}
@@ -828,6 +783,26 @@ def _make_selected_fill_kernel(
 
     _SELECTED_FILL_KERNELS[key] = _fill
     return _fill
+
+
+def _make_selected_zero_kernel(
+        *, mesh: Mesh, row_count: int, nspinor: int, r_carrier: int,
+        row_layout):
+    """Cached allocation for one selected-state row carrier."""
+    key = (id(mesh), int(row_count), int(nspinor), int(r_carrier),
+           tuple(row_layout.spec))
+    fn = _SELECTED_ZERO_KERNELS.get(key)
+    if fn is not None:
+        return fn
+
+    @partial(jax.jit, out_shardings=row_layout)
+    def _zeros():
+        return jnp.zeros(
+            (int(row_count), int(nspinor), int(r_carrier)),
+            dtype=jnp.complex128)
+
+    _SELECTED_ZERO_KERNELS[key] = _zeros
+    return _zeros
 
 
 def _make_sketch_random_kernel(
@@ -1106,6 +1081,99 @@ def _make_basis_solve_kernel(
 
     _BASIS_SOLVE_KERNELS[key] = _solve
     return _solve
+
+
+def iter_galerkin_rchunks(
+        source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
+        r_chunk_ranges, retained_band_range: tuple[int, int]):
+    """Yield bounded physical basis rows and requested WFN rows together.
+
+    This is the public continuation of a fitted :class:`GalerkinBasis` away
+    from its registered centroid nodes.  The compact selected-state factor
+
+    ``B(r_chunk) = L^-1 X_selected(r_chunk)``
+
+    is evaluated from the caller-owned canonical :class:`PsiGStore`.  During
+    the same WFN/FFT pass, only the overlap with ``retained_band_range`` is
+    retained for a consumer's pair-density contraction.  The yielded shape is
+    therefore bounded by one real-space carrier; no full-grid ``Psi`` or
+    ``B`` exists, and no second WFN reader or FFT convention is introduced.
+
+    Yields ``(r0, r1, B_chunk, psi_parts)``.  ``B_chunk`` has shape
+    ``(rank, nspinor, r_carrier)`` and ``psi_parts`` is an ordered tuple of
+    ``((band_lo, band_hi), psi_chunk)`` pairs covering exactly the retained
+    band range.  Its arrays have shape
+    ``(nk, band_hi-band_lo, nspinor, r_carrier)``; the terminal carrier tail
+    is exact zero.  The caller must finish a yield before advancing the
+    iterator so the bounded slabs can be released promptly.
+    """
+    b_start, b_end = (int(v) for v in basis.band_range)
+    keep_start, keep_end = (int(v) for v in retained_band_range)
+    if not b_start <= keep_start < keep_end <= b_end:
+        raise ValueError(
+            "iter_galerkin_rchunks: retained band range "
+            f"[{keep_start},{keep_end}) escapes basis range "
+            f"[{b_start},{b_end})")
+    if (not source.band_chunk_ranges
+            or int(source.band_chunk_ranges[0][0]) != b_start
+            or int(source.band_chunk_ranges[-1][1]) != b_end):
+        raise ValueError(
+            "iter_galerkin_rchunks: PsiGStore must span the fitted basis "
+            f"range [{b_start},{b_end}); got {source.band_chunk_ranges}")
+
+    rank = int(basis.rank_carrier)
+    nspinor = int(meta.nspinor)
+    row_spec = P(None, None, ('y', 'x'))
+    row_layout = NamedSharding(mesh_xy, row_spec)
+    psi_layout = NamedSharding(mesh_xy, P(None, None, None, ('y', 'x')))
+    r_divisor = spec_divisor(mesh_xy, row_spec, axis=2)
+    maps = _selected_maps_on_device(
+        source=source,
+        selected_states=basis.selected_state_indices,
+        rank_carrier=rank,
+        band_start=b_start,
+        band_count=b_end - b_start,
+        mesh_xy=mesh_xy)
+
+    for r0, r1 in r_chunk_ranges:
+        r0, r1 = int(r0), int(r1)
+        if not 0 <= r0 < r1 <= int(meta.n_rtot):
+            raise ValueError(
+                f"iter_galerkin_rchunks: r slab [{r0},{r1}) escapes "
+                f"[0,{int(meta.n_rtot)})")
+        r_carrier = round_up(r1 - r0, r_divisor)
+        selected_rows = _make_selected_zero_kernel(
+            mesh=mesh_xy, row_count=rank, nspinor=nspinor,
+            r_carrier=r_carrier, row_layout=row_layout)()
+        retained = []
+        fill = _make_selected_fill_kernel(
+            mesh=mesh_xy, row_count=rank, nk=int(meta.nk_tot),
+            band_carrier=source.band_chunk_carrier, nspinor=nspinor,
+            r_carrier=r_carrier, psi_layout=psi_layout,
+            row_layout=row_layout)
+        for bc_idx, (bc_range, psi_bc) in enumerate(
+                source.iter_rchunk_bandwise(
+                    r0, r1, product_r_spec=psi_layout.spec)):
+            take, active = maps[bc_idx]
+            selected_rows = fill(psi_bc, take, active, selected_rows)
+            lo = max(int(bc_range[0]), keep_start)
+            hi = min(int(bc_range[1]), keep_end)
+            if lo < hi:
+                offset = lo - int(bc_range[0])
+                retained.append(
+                    ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
+            else:
+                del psi_bc
+        solve = _make_basis_solve_kernel(
+            mesh=mesh_xy, rank=rank, nspinor=nspinor,
+            r_carrier=r_carrier, row_layout=row_layout)
+        basis_chunk = solve(basis.selection_factor, selected_rows)
+        del selected_rows
+        if sum(hi - lo for (lo, hi), _ in retained) != keep_end - keep_start:
+            raise RuntimeError(
+                "iter_galerkin_rchunks: retained WFN pieces do not cover "
+                f"[{keep_start},{keep_end})")
+        yield r0, r1, basis_chunk, tuple(retained)
 
 
 def _make_physical_project_kernel(

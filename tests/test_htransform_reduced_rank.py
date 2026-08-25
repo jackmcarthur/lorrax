@@ -64,17 +64,18 @@ def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
     assert float(move) > 0.01
 
 
-def test_reduced_policy_is_opt_in_and_refit_is_refused():
+def test_refit_consumes_the_compact_whole_state_factor():
     pytest.importorskip("jax")
     from isdf import galerkin
     root = Path(__file__).resolve().parents[1] / "src"
     src = (root / "bandstructure" / "htransform.py").read_text()
     fit_src = inspect.getsource(galerkin.fit_galerkin_basis)
-    assert "if rank_multiplier > 0.0 and return_full_proj" in src
-    assert 'rank_multiplier: float = 0.0' in src
+    assert "return_full_proj" not in src
+    assert "include_projector" not in fit_src
+    assert "selector_projector" not in fit_src
     assert "rank_multiplier=params.get" in src
-    # The default must not be routed through the approximate polar factor.
-    assert "if rank_multiplier > 0.0:" in fit_src
+    assert "selected_state_indices" in fit_src
+    assert "selection_factor=L" in fit_src
 
 
 def test_exact_rank_report_excludes_left_gram_null_tail_and_counts_pad():

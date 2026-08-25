@@ -17,7 +17,6 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 import jax.numpy as jnp
-from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -162,7 +161,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              log_fn=None,
                              band_chunk_size: int = 64,
                              bispinor: bool = False,
-                             return_full_proj: bool = False,
                              rank_multiplier: float = 20.0,
                              qr_eps: float = 1.0e-3,
                              qrcp_seed: int = 0,
@@ -206,7 +204,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         log_fn=log_fn,
         band_chunk_size=band_chunk_size,
         bispinor=bispinor,
-        include_projector=return_full_proj,
         rank_multiplier=rank_multiplier,
         qr_eps=qr_eps,
         qrcp_seed=qrcp_seed,
@@ -216,8 +213,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         progress_fn=progress_fn,
         rank_record_fn=rank_record_fn,
     )
-    return basis.as_legacy_tuple(
-        mesh_xy, include_projector=return_full_proj)
+    return basis
 
 
 def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
@@ -658,11 +654,10 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
-                    mesh_xy: Mesh | None = None, return_full_proj: bool = False,
+                    mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
                     progress_fn=None, centroid_record_fn=None,
-                    rank_record_fn=None, wfn_sym=None,
-                    galerkin_eigh_plan=None):
+                    rank_record_fn=None, wfn_sym=None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -822,21 +817,18 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
     with mesh_xy:
-        out = streaming_galerkin_solve(
+        basis = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
             log_fn=log_fn, bispinor=bispinor,
-            return_full_proj=return_full_proj,
             rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
             qr_eps=params.get("htransform_qr_eps", 1.0e-3),
             qrcp_seed=params.get("htransform_qrcp_seed", 0),
             progress_fn=progress_fn,
             rank_record_fn=rank_record_fn,
         )
-    S, ctilde, B_at_mu = out[:3]
-    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
-    if return_full_proj:
-        return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma, out[3]
-    return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma
+    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
+           f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
+    return wfn, sym, meta, mesh_xy, basis, enk_sigma
 
 
 def initialize_kpath(wfn, params):
@@ -874,7 +866,7 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
     return idx
 
 
-def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
+def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
                 progress_fn=None, quality_record_fn=None):
@@ -923,59 +915,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     del fH_k
 
     _t0 = _perf()                                          # instrument:
-    # ── THE METRIC ROUTE — S is the identity, and the code already knows it ──
-    #
-    # ``_kpath_batch`` below reduces a GENERALIZED eigenproblem fH_q c = λ S c
-    # by two triangular solves against chol(S) per q.  But S has exactly ONE
-    # producer — ``streaming_galerkin_solve`` returns
-    #     S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128), …)()
-    # (see its closing lines) — because the α basis is Cholesky-orthogonalised
-    # upstream, which is the whole point of ``_finalize``'s ``coeffs @ L``.  The
-    # other consumer of the identical math, ``bse_setup._q_batch``, already
-    # takes S = I for granted: it calls ``jnp.linalg.eigh(fH_q)`` with no
-    # metric at all.  The two solves here are vestigial.
-    #
-    # WHAT THEY COST.  Each ``solve_triangular`` of a (rank, rank) triangular
-    # factor against a (rank, rank) right-hand side is rank³/2 complex MACs, so
-    # the pair is ~8·rank³ real flops per q against the ~5.3·rank³ of the
-    # eigenvalues-only Hermitian eigensolve they feed.  They are the LARGER
-    # half of the arithmetic in the batch — and the Fourier sum this whole
-    # workstream is about is 8·N_k·rank², a further factor rank/N_k below both.
-    #
-    # WHAT THEY CHANGE.  With S = I the ridge makes S_sym = (1+1e-10)·I, so
-    # chol(S) = sqrt(1+1e-10)·I and the pair divides every eigenvalue by
-    # (1+1e-10) — a systematic -1e-10 RELATIVE shift of λ, applied for no
-    # reason.  Skipping them is therefore not bit-identical; it is analytically
-    # exact and removes a small bias rather than adding one.  The measured
-    # energy delta on the reference deck is in HTRANSFORM_FFT.md §6.
-    #
-    # The route is decided ONCE, from the data, and announced.  A caller that
-    # ever hands this driver a non-identity S keeps the Cholesky path
-    # unchanged — the branch is on a measured deviation, not on an assumption.
-    @partial(jax.jit, out_shardings=rep)
-    def _s_dev_from_eye(S_in):
-        return jnp.max(jnp.abs(S_in - jnp.eye(rank, dtype=S_in.dtype)))
-
-    _s_dev = float(_s_dev_from_eye(S))
-    metric_route = "identity" if _s_dev == 0.0 else "cholesky"
-    log_fn(f"  [route] fH_q metric: {metric_route}  (max|S - I| = {_s_dev:.3e}; "
-           f"'identity' skips 2 triangular solves of {rank}³/2 complex MACs per q)")
-
-    S_chol = None
-    if metric_route == "cholesky":
-        # Built ONLY on the path that uses it — on the identity route this
-        # compile (one XLA program, 0.34 s cache-cold) is not paid at all,
-        # which is what keeps the route program-count-neutral.
-        @jax.jit
-        def _build_S_chol(S):
-            S_sym = (S + S.conj().T) * 0.5
-            S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
-            return jnp.linalg.cholesky(S_sym)
-        S_chol = _build_S_chol(S)
+    # The selected-state Cholesky basis is orthonormal by construction.  There
+    # is no separately mutable metric: carrying a dense identity S was a
+    # compatibility object that cost rank² storage and enabled a dead
+    # generalized-eigenproblem branch beside bse_setup's canonical identity
+    # eigensolve.
+    log_fn(f"  [route] fH_q metric: identity (selected-state Galerkin basis; "
+           f"no dense {rank}x{rank} identity object)")
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready(                                 # instrument:
-        (R_grid,) if S_chol is None else (S_chol, R_grid)) # instrument:
+    jax.block_until_ready(R_grid)                            # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1000,10 +949,10 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     face_ij_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=batch_eig_shard)
-    def _kpath_batch(batch_k, fH_R, S_chol):
+    def _kpath_batch(batch_k, fH_R):
         # batch_k: (bs, 3) replicated; fH_R: (nk, rank, rank) at P(None,'x','y');
-        # S_chol: (rank, rank) replicated.  The einsum contracts over the
-        # (replicated) R axis only → local on each (i, j) tile.
+        # The einsum contracts over the replicated R axis only, so it is local
+        # on each (i, j) tile.
         phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
         mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R)             # (bs, rank, rank)
         # Pin the contraction OUTPUT to the (i, j) layout: left free, XLA
@@ -1016,18 +965,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
         mat = mat + jnp.swapaxes(mat, 1, 2).conj()
 
-        if S_chol is None:
-            # S = I (see the metric-route block above).  ``mat`` was hermitized
-            # two lines up and ``eigvalsh`` reads one triangle, so the dropped
-            # ``(z + zᴴ)/2`` cannot move an eigenvalue either.
-            return jax.vmap(jnp.linalg.eigvalsh)(mat)
-
-        def _solve_one(m):
-            y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
-            z = jsp_linalg.solve_triangular(S_chol, y, lower=True, trans=2)
-            return jnp.linalg.eigvalsh((z + z.conj().T) * 0.5)
-
-        return jax.vmap(_solve_one)(mat)
+        return jax.vmap(jnp.linalg.eigvalsh)(mat)
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -1096,7 +1034,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             item_name="k batch", max_updates=min(_n_batches, 12),
             enabled=progress_fn is not None).start()
         for i in range(0, nq_padded, batch_size):
-            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R, S_chol)
+            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
             lambda_q_list.append(batch_eigs)
             jax.block_until_ready(batch_eigs)
             _path_progress.step()
@@ -1401,28 +1339,21 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
-    # Resolve the concrete Gram plan before the first setup/progress line.
-    # The same Plan object is executed below, so the numerical-environment
-    # block describes what this run actually uses rather than re-deriving a
-    # backend name from policy text after the calculation has started.
+    # Resolve the concrete fine-k plan before the first setup/progress line.
+    # Whole-state QRCP owns basis selection and has no Gram eigensolve.
     mesh_xy = _build_mesh_xy()
     _wfn_path = params["wfn_file"]
     if not os.path.isabs(_wfn_path):
         _wfn_path = os.path.join(input_dir, _wfn_path)
     wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
     from distrib_la import plan as _linalg_plan
-    _gram_backend = resolve_eigh_backend(params)
-    _n_fit_bands = n_return_bands + int(args.guard_bands)
-    _gram_plan = _linalg_plan(
-        "eigh", mesh_xy, backend=_gram_backend,
-        n=int(sym.nk_tot) * _n_fit_bands)
     _fine_enabled = bool(params.get("get_centroids_fi", False))
     _fine_plan = (_linalg_plan(
         "eigh", mesh_xy, backend=eigh_backend, n=None,
         batched_route=distrib_la_batched_route)
         if _fine_enabled else None)
     report.environment(
-        params=params, wfn=wfn, gram_plan=_gram_plan,
+        params=params, wfn=wfn,
         fine_plan=_fine_plan, fine_enabled=_fine_enabled)
 
     from common import sanity
@@ -1434,24 +1365,23 @@ def main(argv=None):
     _centroid_records = []
     _rank_records = []
     with timing.section("initialize_wfns"):
-        wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
+        wfn, sym, meta, mesh_xy, basis, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
             mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
-            galerkin_eigh_plan=_gram_plan,
             n_guard_bands=args.guard_bands, progress_fn=report.progress,
             centroid_record_fn=_centroid_records.append,
             rank_record_fn=_rank_records.append)
     _setup_progress.step()
     _setup_progress.finish()
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     # ── Galerkin-input gate ───────────────────────────────────────────
-    # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
-    # construction) and ``enk_sigma`` is the band energies the whole
+    # ``ctilde`` is the compact Galerkin coefficient table and ``enk_sigma``
+    # is the band energies the whole
     # interpolation is anchored to — including, when ``--eqp-file`` is
     # given, energies read from a GW run that may itself have produced
     # garbage.  A −136 eV QP energy fed into htransform yields a
     # bandstructure.dat that is numerically finite, plots fine, and is
     # wrong.  Bracket it here, where the file name is still in scope.
-    sanity.check_finite("htransform S (ISDF overlap)", S, print_fn=log)
     sanity.check_finite("htransform ctilde", ctilde, print_fn=log)
     sanity.check_finite("htransform band energies", enk_sigma, print_fn=log)
     # Bandwidth, not absolute energy: the zero of a pseudopotential
@@ -1485,7 +1415,7 @@ def main(argv=None):
         item_name="stage", max_updates=1).start()
     _quality_records = []
     with mesh_xy, timing.section("h_transform"):
-        result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
+        result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band,
                              band_start=int(wfn.nelec) - int(params["nval"]),
                              n_return_bands=n_return_bands,
