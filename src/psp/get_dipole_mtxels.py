@@ -672,6 +672,12 @@ def check_dipole_provenance(
             f"scheme {got_scheme!r}, not {WFN_FINGERPRINT_SCHEME!r}; "
             "regenerate dipole.h5 with `python -m psp.get_dipole_mtxels` "
             "to make it checkable.")
+    if not fingerprint_checkable:
+        # This is an identity refusal, not evidence that any later field
+        # differs.  Preserve that distinction: legacy-fingerprint tests and
+        # users must not receive a fabricated DFT/window/operator mismatch
+        # merely because a newly required field is also absent.
+        return False
 
     want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
             "prov_nband": int(nband),
@@ -708,8 +714,6 @@ def check_dipole_provenance(
             print_fn=print_fn)
         return False
 
-    if not fingerprint_checkable:
-        return False
     if ncond_mismatch:
         print_fn(
             "  [dipole provenance] producer "
