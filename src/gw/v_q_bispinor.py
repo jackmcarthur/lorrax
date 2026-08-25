@@ -127,7 +127,14 @@ def _tt_head_tensor(
         bvec=np.asarray(bvec, dtype=np.float64), cell_volume=float(cell_volume))
     kernel = vcoul.get_kernel(sys_dim)
     return np.asarray(
-        kernel.q0_average_transverse_tensor(geometry, tuple(int(s) for s in kgrid)),
+        kernel.q0_average_transverse_tensor(
+            geometry, tuple(int(s) for s in kgrid),
+            # Bulk v(q)~1/q^2 gives the pure-Sobol estimator infinite
+            # variance; Bulk3D's owner requires its analytic sphere term
+            # for a production head.  The slab sibling deliberately keeps
+            # that 3D term off (its flag only widens the Voronoi fold).
+            analytic_sphere=(int(sys_dim) == 3),
+        ),
         dtype=np.float64)
 
 

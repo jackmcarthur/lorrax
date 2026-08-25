@@ -546,9 +546,12 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
         h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
 
 
-def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
-                             print_fn=print) -> bool:
-    """Does ``path`` match the WFN and band window of the CURRENT run?
+def check_dipole_provenance(
+    path, *, wfn, nval, ncond, nband,
+    bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    print_fn=print,
+) -> bool:
+    """Does ``path`` match the WFN, window, and requested operator convention?
 
     Returns True only when a stamp exists AND agrees.  Disagreement goes
     through ``common.sanity.warn`` (the same channel
@@ -595,17 +598,29 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
             "prov_nband": int(nband)}
     if fingerprint_checkable:
         want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
-    bad = [(k, attrs[k], v) for k, v in want.items()
-           if k in attrs and _prov_ne(attrs[k], v)]
+    optional = {
+        "prov_bispinor": bispinor,
+        "prov_skip_vnl": skip_vnl,
+        "prov_vnl_mode": vnl_mode,
+        "prov_vnl_velocity_sign": vnl_velocity_sign,
+    }
+    want.update({key: value for key, value in optional.items()
+                 if value is not None})
+    # An expected operator field that is absent is not a legacy default: it is
+    # uncheckable provenance.  The caller choosing that convention must fail
+    # closed instead of silently reading whichever operator made the file.
+    bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
+           if k not in attrs or _prov_ne(attrs[k], v)]
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
         sanity.warn(
-            f"{path} was generated from a DIFFERENT DFT solution or band "
-            f"window than this run ({detail}).  dipole.h5 has the right "
-            f"shape either way, so nothing downstream will notice: the q→0 "
-            f"head S(ω), and every Σ_SX/Σ_COH correction built from it, "
-            f"would be assembled from stale velocity matrix elements.  "
+            f"{path} was generated from a DIFFERENT DFT solution, band "
+            f"window, or velocity/representation convention than this run "
+            f"({detail}).  dipole.h5 has the right shape either way, so a "
+            f"shape-only reader would not notice: the q→0 head S(ω), and "
+            f"every Σ_SX/Σ_COH correction built from it, would be assembled "
+            f"from incompatible velocity matrix elements.  "
             f"Regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.",
             print_fn=print_fn)
         return False
@@ -614,7 +629,11 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
         return False
     print_fn(
         f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
-        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)})")
+        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)}"
+        + (f", bispinor={bool(bispinor)}" if bispinor is not None else "")
+        + (f", vnl_velocity_sign={float(vnl_velocity_sign):+.1f}"
+           if vnl_velocity_sign is not None else "")
+        + ")")
     return True
 
 
