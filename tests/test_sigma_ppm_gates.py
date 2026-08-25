@@ -301,6 +301,73 @@ def test_hgl_cell_rules_rephase_the_direct_scalar_kernel(monkeypatch):
     assert [w.prefactor for w in windows] == [-1.0, -1.0, 1.0]
 
 
+def test_hgl_negative_cell_tail_panes_preserve_exact_partition(monkeypatch):
+    """A high-Ω negative cell is split without changing pole ownership."""
+    from gw import ppm_windows
+    from gw.minimax_screening import (
+        CrossingMinimaxQuadrature,
+        LaplaceMinimaxQuadrature,
+    )
+
+    def _laplace(x_min, x_max, **_kwargs):
+        return LaplaceMinimaxQuadrature(
+            x_min=float(x_min), x_max=float(x_max),
+            tau=np.array([0.5]), alpha=np.array([1.0]),
+            max_error=0.0, provenance="deterministic scalar rule")
+
+    def _crossing(A_dim, **_kwargs):
+        return CrossingMinimaxQuadrature(
+            A_dim=float(A_dim), tau=np.array([0.5]),
+            alpha=np.array([1.0]), max_error=0.0, target_kind="hgl",
+            provenance="deterministic scalar rule")
+
+    monkeypatch.setattr(
+        ppm_windows, "solve_laplace_minimax_interval", _laplace)
+    monkeypatch.setattr(
+        ppm_windows, "solve_phase_minimax_bandwidth", _crossing)
+
+    omega = 1.0
+    energy = 0.2
+    poles = np.array([0.4, 0.8, 1.2, 100.0, 1000.0])
+    pole_tensor = poles.reshape(1, 1, -1)
+    windows, _plan = ppm_windows._build_partitioned_hgl_windows(
+        E_A=np.array([[energy]], dtype=np.float64),
+        base_mask_A=np.array([[True]]),
+        Omega_q=ppm_windows.jnp.asarray(pole_tensor),
+        base_mask_B=ppm_windows.jnp.ones(pole_tensor.shape, dtype=bool),
+        omega_nonneg_ry=np.array([omega]),
+        neg_omega_half=False,
+        regularization_width_ry=0.2,
+        edge_factor=1.5,
+        target_error=1.0e-6,
+        max_nodes=64,
+        crossing_eps_q=1.0e-3,
+        crossing_max_nodes=64,
+        use_shipped_tables=False,
+    )
+
+    negative = [window for window in windows
+                if window.name == "pane_negative"]
+    assert len(negative) > 1
+    ownership = np.zeros(poles.size, dtype=np.int64)
+    for window in windows:
+        lo, hi = ppm_windows.window_mask_B_bounds(window)
+        selected = (poles > lo) & (poles <= hi)
+        ownership += selected
+        if window.name == "pane_negative":
+            pane_poles = poles[selected]
+            assert pane_poles.size > 0
+            x_min, x_max = ppm_windows._sign_definite_support(
+                energy, energy,
+                float(np.min(pane_poles)), float(np.max(pane_poles)),
+                omega, omega_min=omega, subtract_omega=True)
+            assert (x_max / x_min
+                    <= ppm_windows._SIGN_DEFINITE_PANE_MAX_RANGE
+                    or np.min(pane_poles) == np.max(pane_poles))
+
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
+
+
 def test_memory_tile_sink_splices_disjoint_omega_clusters():
     """Cluster rows assemble on the existing bracket-then-omega layout."""
     from gw.ppm_accumulators import _MemoryTileSink
@@ -431,6 +498,87 @@ def test_sign_definite_omega_panes_exhaust_extreme_tail_exactly():
     assert count == 1 and lo < 1.0e-4 <= hi
     assert actual_min == actual_max == 1.0e-4
     assert (5.0 + actual_max + 1.0) / (1.0e-3 + actual_min) > 256.0
+
+
+def test_crossing_b_slab_reuses_exact_bounded_omega_panes(monkeypatch):
+    """The crossing core/stripe/slab cover survives a high-Ω tail split."""
+    from gw import ppm_windows
+    from gw.minimax_screening import (
+        CrossingMinimaxQuadrature,
+        LaplaceMinimaxQuadrature,
+    )
+
+    def _laplace(x_min, x_max, **_kwargs):
+        return LaplaceMinimaxQuadrature(
+            x_min=float(x_min), x_max=float(x_max),
+            tau=np.array([0.5]), alpha=np.array([1.0]),
+            max_error=0.0, provenance="deterministic scalar rule")
+
+    def _crossing(A_dim, **_kwargs):
+        return CrossingMinimaxQuadrature(
+            A_dim=float(A_dim), tau=np.array([0.5]),
+            alpha=np.array([1.0]), max_error=0.0, target_kind="hgl",
+            provenance="deterministic scalar rule")
+
+    monkeypatch.setattr(
+        ppm_windows, "solve_laplace_minimax_interval", _laplace)
+    monkeypatch.setattr(
+        ppm_windows, "solve_phase_minimax_bandwidth", _crossing)
+
+    xi = 0.1
+    edge = 1.5
+    omega_eval = np.array([0.0, 0.5], dtype=np.float64)
+    threshold = float(np.max(omega_eval)) + edge * xi
+    energies = np.array([[0.2, threshold, 1.0]], dtype=np.float64)
+    energy_mask = np.ones_like(energies, dtype=bool)
+    poles = np.array(
+        [0.2, threshold, 0.7, 1.0, 100.0, 1000.0],
+        dtype=np.float64,
+    )
+    pole_mask = np.ones_like(poles, dtype=bool)
+
+    windows = ppm_windows._build_windows_for_branch(
+        omega_nonneg_ry=omega_eval,
+        E_A=ppm_windows.jnp.asarray(energies),
+        base_mask_A=ppm_windows.jnp.asarray(energy_mask),
+        Omega_q=ppm_windows.jnp.asarray(poles),
+        base_mask_B=ppm_windows.jnp.asarray(pole_mask),
+        space="cond",
+        neg_omega_half=False,
+        regularization_width_ry=xi,
+        edge_factor=edge,
+        target_error=1.0e-6,
+        max_nodes=64,
+        crossing_eps_q=1.0e-3,
+        crossing_max_nodes=64,
+        use_shipped_minimax_tables=False,
+        log_tag="analytic",
+        print_fn=lambda *_args, **_kwargs: None,
+        partition_hgl=False,
+    )
+
+    slab = [window for window in windows
+            if window.name.startswith("b_slab")]
+    assert len(slab) > 1
+    ownership = np.zeros((energies.size, poles.size), dtype=np.int64)
+    for window in windows:
+        lo, hi = ppm_windows.window_mask_B_bounds(window)
+        selected_B = (poles > lo) & (poles <= hi)
+        selected_A = np.asarray(window.mask_A, dtype=bool).reshape(-1)
+        ownership += selected_A[:, None] & selected_B[None, :]
+        if window.name.startswith("b_slab"):
+            pane_poles = poles[selected_B]
+            assert pane_poles.size > 0
+            x_min, x_max = ppm_windows._sign_definite_support(
+                float(np.min(energies)), float(np.max(energies)),
+                float(np.min(pane_poles)), float(np.max(pane_poles)),
+                float(np.max(omega_eval)), subtract_omega=True,
+                x_min_floor=edge * xi)
+            assert (x_max / x_min
+                    <= ppm_windows._SIGN_DEFINITE_PANE_MAX_RANGE
+                    or np.min(pane_poles) == np.max(pane_poles))
+
+    np.testing.assert_array_equal(ownership, np.ones_like(ownership))
 
 
 def _build_branch_windows():

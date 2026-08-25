@@ -867,11 +867,23 @@ def _sign_definite_support(
     B_min: float,
     B_max: float,
     omega_max: float,
+    *,
+    omega_min: float = 0.0,
+    subtract_omega: bool = False,
+    x_min_floor: float = 1.0e-12,
 ) -> tuple[float, float]:
-    """Exact denominator interval for one sign-definite ``ω + E + Ω`` pane."""
-    x_min = max(float(E_min) + float(B_min), 1.0e-12)
+    """Conservative support for one sign-definite ``E + Ω ± ω`` pane."""
+    omega_lo = float(omega_min)
+    omega_hi = float(omega_max)
+    if subtract_omega:
+        raw_min = float(E_min) + float(B_min) - omega_hi
+        raw_max = float(E_max) + float(B_max) - omega_lo
+    else:
+        raw_min = float(E_min) + float(B_min) + omega_lo
+        raw_max = float(E_max) + float(B_max) + omega_hi
+    x_min = max(raw_min, float(x_min_floor), 1.0e-12)
     x_max = max(
-        float(E_max) + float(B_max) + float(omega_max),
+        raw_max,
         x_min * (1.0 + 1.0e-9),
     )
     return x_min, x_max
@@ -949,6 +961,11 @@ def _plan_sign_definite_omega_panes(
     E_min: float,
     E_max: float,
     omega_max: float,
+    omega_min: float = 0.0,
+    subtract_omega: bool = False,
+    support_lo: float = -np.inf,
+    support_hi: float = np.inf,
+    x_min_floor: float = 1.0e-12,
 ) -> list[tuple[float, float, int, float, float]]:
     """Make exact scalar Ω panes when one sign-definite range is costly.
 
@@ -967,20 +984,26 @@ def _plan_sign_definite_omega_panes(
     Sigma matrix sum by maximum; its amplification bound is unchanged from
     the unpartitioned per-denominator contract.
     """
-    pending = [(-np.inf, np.inf, int(mask_B_count),
+    pending = [(float(support_lo), float(support_hi), int(mask_B_count),
                 float(mask_B_min), float(mask_B_max))]
     panes: list[tuple[float, float, int, float, float]] = []
     while pending:
         lo, hi, count, B_min, B_max = pending.pop()
         x_min, x_max = _sign_definite_support(
-            E_min, E_max, B_min, B_max, omega_max)
+            E_min, E_max, B_min, B_max, omega_max,
+            omega_min=omega_min, subtract_omega=subtract_omega,
+            x_min_floor=x_min_floor)
         if (x_max / x_min <= _SIGN_DEFINITE_PANE_MAX_RANGE
                 or B_min >= B_max):
             panes.append((lo, hi, count, B_min, B_max))
             continue
 
-        a = float(E_min)
-        C = float(E_max) + float(omega_max)
+        if subtract_omega:
+            a = float(E_min) - float(omega_max)
+            C = float(E_max) - float(omega_min)
+        else:
+            a = float(E_min) + float(omega_min)
+            C = float(E_max) + float(omega_max)
         disc = (a - C) ** 2 + 4.0 * (C + B_max) * (a + B_min)
         threshold = 0.5 * (-(a + C) + np.sqrt(max(disc, 0.0)))
         threshold = max(float(np.nextafter(B_min, B_max)), threshold)
@@ -1073,6 +1096,7 @@ def _build_three_sigma_windows(
     crossing_eps_q: float,
     crossing_max_nodes: int,
     use_shipped_tables: bool,
+    b_slab_panes: list[tuple[float, float, int, float, float]] | None = None,
 ) -> list[_SigmaWindow]:
     # This is the crossing branch: the pole S can coincide with a grid ω, so
     # the denominator is ω̃ − S and ω enters the kernel as exp(+i·ω·τ)
@@ -1107,63 +1131,76 @@ def _build_three_sigma_windows(
         if not np.any(mA) or count_B == 0 or B_min is None or B_max is None:
             continue
 
-        A_vals = E_A[mA]
-        E_ref_A = float(np.min(A_vals))
-        E_ref_B = float(B_min)
-
-        if name == "core":
-            A_core = max(2.0 * T / xi, 1.0e-8)
-            target_error_hat = _scaled_crossing_error_bound(
-                xi, target_error)
-            q_cross = solve_phase_minimax_bandwidth(
-                A_core,
-                target_error=target_error_hat,
-                max_nodes=crossing_max_nodes,
-                eps_q=crossing_eps_q,
-                target_kind="hgl",
-                use_shipped_tables=use_shipped_tables,
-            )
-            raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
-            # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
-            nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
-            project = "imag"
-            prefactor = -1.0 * neg
-            max_error = float(q_cross.max_error) / xi
-            provenance = q_cross.provenance
-        else:
-            S_min = float(np.min(A_vals) + B_min)
-            S_max = float(np.max(A_vals) + B_max)
-            x_min = max(S_min - (T - z_edge), z_edge, 1.0e-12)
-            x_max = max(S_max, x_min * (1.0 + 1.0e-9))
-            q = solve_laplace_minimax_interval(
-                x_min, x_max,
-                target_error=target_error,
-                max_nodes=max_nodes,
-                use_shipped_tables=use_shipped_tables,
-            )
-            nodes = q.to_minimax_nodes(time_axis='imag')
-            project = "full"
-            prefactor = +1.0 * neg
-            max_error = float(q.max_error)
-            provenance = q.provenance
-
-        windows.append(
-            _SigmaWindow(
-                name=name,
-                nodes=nodes,
-                mask_A=np.asarray(mA, dtype=bool),
-                E_ref_A=E_ref_A,
-                E_ref_B=E_ref_B,
-                omega_sign=+1,
-                project=project,
-                prefactor=float(prefactor),
-                mask_B_mode=mask_B_mode,
-                mask_B_threshold=float(T),
-                crossing_kind="hgl" if name == "core" else None,
-                max_error=max_error,
-                provenance=provenance,
-            )
+        pane_rows = (
+            b_slab_panes
+            if name == "b_slab" and b_slab_panes is not None
+            else [(None, None, count_B, B_min, B_max)]
         )
+        for pane_idx, (B_lo, B_hi, pane_count, pane_min, pane_max) in enumerate(
+                pane_rows):
+            if pane_count == 0 or pane_min is None or pane_max is None:
+                continue
+            A_vals = E_A[mA]
+            E_ref_A = float(np.min(A_vals))
+            E_ref_B = float(pane_min)
+
+            if name == "core":
+                A_core = max(2.0 * T / xi, 1.0e-8)
+                target_error_hat = _scaled_crossing_error_bound(
+                    xi, target_error)
+                q_cross = solve_phase_minimax_bandwidth(
+                    A_core,
+                    target_error=target_error_hat,
+                    max_nodes=crossing_max_nodes,
+                    eps_q=crossing_eps_q,
+                    target_kind="hgl",
+                    use_shipped_tables=use_shipped_tables,
+                )
+                raw = q_cross.to_minimax_nodes(time_axis='crossing_hgl')
+                # Crossing scaling: t = τ/ξ, α = α/ξ (both divided by ξ).
+                nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
+                project = "imag"
+                prefactor = -1.0 * neg
+                max_error = float(q_cross.max_error) / xi
+                provenance = q_cross.provenance
+            else:
+                x_min, x_max = _sign_definite_support(
+                    float(np.min(A_vals)), float(np.max(A_vals)),
+                    float(pane_min), float(pane_max), omega_max,
+                    subtract_omega=True, x_min_floor=z_edge)
+                q = solve_laplace_minimax_interval(
+                    x_min, x_max,
+                    target_error=target_error,
+                    max_nodes=max_nodes,
+                    use_shipped_tables=use_shipped_tables,
+                )
+                nodes = q.to_minimax_nodes(time_axis='imag')
+                project = "full"
+                prefactor = +1.0 * neg
+                max_error = float(q.max_error)
+                provenance = q.provenance
+
+            many_panes = len(pane_rows) > 1
+            windows.append(
+                _SigmaWindow(
+                    name=(f"{name}_pane_{pane_idx}"
+                          if many_panes else name),
+                    nodes=nodes,
+                    mask_A=np.asarray(mA, dtype=bool),
+                    E_ref_A=E_ref_A,
+                    E_ref_B=E_ref_B,
+                    omega_sign=+1,
+                    project=project,
+                    prefactor=float(prefactor),
+                    mask_B_mode=mask_B_mode,
+                    mask_B_threshold=float(T),
+                    crossing_kind="hgl" if name == "core" else None,
+                    max_error=max_error,
+                    provenance=provenance,
+                    B_lo=float(B_lo) if many_panes else None,
+                    B_hi=float(B_hi) if many_panes else None,
+                )
+            )
     return windows
 
 
@@ -1226,80 +1263,105 @@ def _build_partitioned_hgl_windows(
         if count_B == 0 or B_min is None or B_max is None:
             continue
 
-        if cell.kind == "crossing":
-            target_error_hat = _scaled_crossing_error_bound(
-                xi, target_error)
-            q_cross = solve_phase_minimax_bandwidth(
-                float(cell.A_dim),
-                target_error=target_error_hat,
-                max_nodes=crossing_max_nodes,
-                eps_q=crossing_eps_q,
-                target_kind="hgl",
-                use_shipped_tables=use_shipped_tables,
+        pane_rows = [(cell.b_lo, cell.b_hi, count_B, B_min, B_max)]
+        if cell.kind == "negative":
+            pane_rows = _plan_sign_definite_omega_panes(
+                Omega_q=Omega_q,
+                base_mask_B=base_mask_B,
+                mask_B_count=count_B,
+                mask_B_min=float(B_min),
+                mask_B_max=float(B_max),
+                E_min=float(cell.e_min),
+                E_max=float(cell.e_max),
+                omega_min=float(cell.omega_lo),
+                omega_max=float(cell.omega_hi),
+                subtract_omega=True,
+                support_lo=float(cell.b_lo),
+                support_hi=float(cell.b_hi),
             )
-            raw = q_cross.to_minimax_nodes(time_axis="crossing_hgl")
-            nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
-            E_ref_A = float(cell.e_min)
-            E_ref_B = float(B_min)
-            project = "imag"
-            prefactor = -1.0 * neg
-            max_error = float(q_cross.max_error) / xi
-            provenance = q_cross.provenance
-            crossing_kind = "hgl"
-        else:
-            if cell.kind == "negative":
-                x_min = float(cell.e_min + B_min - cell.omega_hi)
-                x_max = float(cell.e_max + B_max - cell.omega_lo)
-                E_ref_A = float(cell.e_min)
-                E_ref_B = float(B_min)
-                prefactor = +1.0 * neg
-                conjugate = False
-            elif cell.kind == "positive":
-                x_min = float(cell.omega_lo - cell.e_max - B_max)
-                x_max = float(cell.omega_hi - cell.e_min - B_min)
-                E_ref_A = float(cell.e_max)
-                E_ref_B = float(B_max)
-                prefactor = -1.0 * neg
-                conjugate = True
-            else:
-                raise AssertionError(f"Unknown HGL cell kind {cell.kind!r}")
-            if x_min <= 0.0 or x_max < x_min:
-                raise AssertionError(
-                    "GATE hgl_sign_definite_cell: invalid Laplace interval "
-                    f"for {cell.kind}: [{x_min:.16g}, {x_max:.16g}]")
-            q = solve_laplace_minimax_interval(
-                x_min,
-                max(x_max, x_min * (1.0 + 1.0e-9)),
-                target_error=target_error,
-                max_nodes=max_nodes,
-                use_shipped_tables=use_shipped_tables,
-            )
-            raw = q.to_minimax_nodes(time_axis="imag")
-            nodes = (MinimaxNodes(t=-raw.t, alpha=raw.alpha)
-                     if conjugate else raw)
-            project = "full"
-            max_error = float(q.max_error)
-            provenance = q.provenance
-            crossing_kind = None
 
-        windows.append(_SigmaWindow(
-            name=f"pane_{cell.kind}",
-            nodes=nodes,
-            mask_A=base,
-            E_ref_A=E_ref_A,
-            E_ref_B=E_ref_B,
-            omega_sign=+1,
-            project=project,
-            prefactor=float(prefactor),
-            crossing_kind=crossing_kind,
-            max_error=max_error,
-            provenance=provenance,
-            E_min=float(cell.e_lo),
-            E_max=float(cell.e_hi),
-            B_lo=float(cell.b_lo),
-            B_hi=float(cell.b_hi),
-            omega_indices=np.asarray(cell.omega_indices, dtype=np.int64),
-        ))
+        for B_lo, B_hi, pane_count, pane_min, pane_max in pane_rows:
+            if pane_count == 0 or pane_min is None or pane_max is None:
+                continue
+            if cell.kind == "crossing":
+                target_error_hat = _scaled_crossing_error_bound(
+                    xi, target_error)
+                q_cross = solve_phase_minimax_bandwidth(
+                    float(cell.A_dim),
+                    target_error=target_error_hat,
+                    max_nodes=crossing_max_nodes,
+                    eps_q=crossing_eps_q,
+                    target_kind="hgl",
+                    use_shipped_tables=use_shipped_tables,
+                )
+                raw = q_cross.to_minimax_nodes(time_axis="crossing_hgl")
+                nodes = MinimaxNodes(t=raw.t / xi, alpha=raw.alpha / xi)
+                E_ref_A = float(cell.e_min)
+                E_ref_B = float(pane_min)
+                project = "imag"
+                prefactor = -1.0 * neg
+                max_error = float(q_cross.max_error) / xi
+                provenance = q_cross.provenance
+                crossing_kind = "hgl"
+            else:
+                if cell.kind == "negative":
+                    x_min, x_max = _sign_definite_support(
+                        float(cell.e_min), float(cell.e_max),
+                        float(pane_min), float(pane_max),
+                        float(cell.omega_hi),
+                        omega_min=float(cell.omega_lo),
+                        subtract_omega=True)
+                    E_ref_A = float(cell.e_min)
+                    E_ref_B = float(pane_min)
+                    prefactor = +1.0 * neg
+                    conjugate = False
+                elif cell.kind == "positive":
+                    x_min = float(cell.omega_lo - cell.e_max - pane_max)
+                    x_max = float(cell.omega_hi - cell.e_min - pane_min)
+                    E_ref_A = float(cell.e_max)
+                    E_ref_B = float(pane_max)
+                    prefactor = -1.0 * neg
+                    conjugate = True
+                else:
+                    raise AssertionError(
+                        f"Unknown HGL cell kind {cell.kind!r}")
+                if x_min <= 0.0 or x_max < x_min:
+                    raise AssertionError(
+                        "GATE hgl_sign_definite_cell: invalid Laplace interval "
+                        f"for {cell.kind}: [{x_min:.16g}, {x_max:.16g}]")
+                q = solve_laplace_minimax_interval(
+                    x_min,
+                    max(x_max, x_min * (1.0 + 1.0e-9)),
+                    target_error=target_error,
+                    max_nodes=max_nodes,
+                    use_shipped_tables=use_shipped_tables,
+                )
+                raw = q.to_minimax_nodes(time_axis="imag")
+                nodes = (MinimaxNodes(t=-raw.t, alpha=raw.alpha)
+                         if conjugate else raw)
+                project = "full"
+                max_error = float(q.max_error)
+                provenance = q.provenance
+                crossing_kind = None
+
+            windows.append(_SigmaWindow(
+                name=f"pane_{cell.kind}",
+                nodes=nodes,
+                mask_A=base,
+                E_ref_A=E_ref_A,
+                E_ref_B=E_ref_B,
+                omega_sign=+1,
+                project=project,
+                prefactor=float(prefactor),
+                crossing_kind=crossing_kind,
+                max_error=max_error,
+                provenance=provenance,
+                E_min=float(cell.e_lo),
+                E_max=float(cell.e_hi),
+                B_lo=float(B_lo),
+                B_hi=float(B_hi),
+                omega_indices=np.asarray(cell.omega_indices, dtype=np.int64),
+            ))
 
     return windows, plan
 
@@ -1383,7 +1445,7 @@ def _build_windows_for_branch(
                 f"    {log_tag} bounded HGL plan: "
                 f"{plan.omega_cluster_count} omega clusters, "
                 f"{plan.energy_pane_count} A panes, "
-                f"{len(windows)}/{len(plan.cells)} nonempty cells "
+                f"{len(windows)} windows from {len(plan.cells)} planned cells "
                 f"(+{counts['positive']}/crossing{counts['crossing']}"
                 f"/-{counts['negative']}), max A={plan.max_A_dim:.6f}")
         else:
@@ -1391,6 +1453,25 @@ def _build_windows_for_branch(
                 Omega_q, base_mask_B & (Omega_q <= T))
             _, mask_B_gt_count, mask_B_gt_min, mask_B_gt_max = _masked_stats_device(
                 Omega_q, base_mask_B & (Omega_q > T))
+            b_slab_panes = None
+            A_live = E_A_host[base_A_host]
+            if (A_live.size and mask_B_gt_count
+                    and mask_B_gt_min is not None
+                    and mask_B_gt_max is not None):
+                b_slab_panes = _plan_sign_definite_omega_panes(
+                    Omega_q=Omega_q,
+                    base_mask_B=base_mask_B,
+                    mask_B_count=mask_B_gt_count,
+                    mask_B_min=float(mask_B_gt_min),
+                    mask_B_max=float(mask_B_gt_max),
+                    E_min=float(np.min(A_live)),
+                    E_max=float(np.max(A_live)),
+                    omega_max=omega_max,
+                    subtract_omega=True,
+                    support_lo=T,
+                    support_hi=np.inf,
+                    x_min_floor=float(edge_factor) * xi,
+                )
             windows = _build_three_sigma_windows(
                 E_A=E_A_host, base_mask_A=base_A_host,
                 mask_B_all_count=mask_B_all_count,
@@ -1406,6 +1487,7 @@ def _build_windows_for_branch(
                 crossing_eps_q=crossing_eps_q,
                 crossing_max_nodes=crossing_max_nodes,
                 use_shipped_tables=bool(use_shipped_minimax_tables),
+                b_slab_panes=b_slab_panes,
             )
     else:
         A_live = E_A_host[base_A_host]
