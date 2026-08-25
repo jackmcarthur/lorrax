@@ -24,6 +24,7 @@ import numpy as np
 from jax.scipy import linalg as jsp_linalg
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.gpu_utils import bfc_fragmentation_target_utilization
 from common.psi_G_store import build_psi_G_store
 from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
 from common.shard_map import shard_map
@@ -248,7 +249,7 @@ def _resolve_whole_state_stream_budget(
         ngkmax: int, band_carrier: int, state_count: int, search_rank: int,
         candidate_carrier: int, requested_q_tile_budget: int,
         device_pool_limit: float | None, log_fn):
-    """Choose the largest measured-workspace-safe real-space carrier."""
+    """Choose the largest measured-workspace and BFC-placement-safe carrier."""
     if requested_q_tile_budget <= 0:
         raise ValueError(
             "whole-state Galerkin stream budget must be positive")
@@ -256,6 +257,11 @@ def _resolve_whole_state_stream_budget(
         round_up(search_rank, math.lcm(
             int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
         * int(nspinor) * np.dtype(np.complex128).itemsize)
+    target_utilization = bfc_fragmentation_target_utilization(nspinor)
+    capacity_target = (
+        float(device_pool_limit) * target_utilization
+        if device_pool_limit is not None and device_pool_limit > 0
+        else None)
     max_local_r = max(1, requested_q_tile_budget // bytes_per_local_r)
     minimum = _whole_state_memory_ledger(
         meta=meta, mesh_xy=mesh_xy, nk=nk,
@@ -264,13 +270,14 @@ def _resolve_whole_state_stream_budget(
         state_count=state_count, search_rank=search_rank,
         candidate_carrier=candidate_carrier,
         q_tile_budget=bytes_per_local_r)
-    if (device_pool_limit is not None and device_pool_limit > 0
-            and minimum["HWM"] > float(device_pool_limit)):
+    if capacity_target is not None and minimum["HWM"] > capacity_target:
         raise MemoryError(
             "fit_galerkin_basis: the measured whole-state live set does "
             "not fit even at one local real-space column: projected HWM "
-            f"{minimum['HWM']/2**30:.2f} GiB/device against pool "
-            f"{float(device_pool_limit)/2**30:.2f} GiB/device. The "
+            f"{minimum['HWM']/2**30:.2f} GiB/device against the "
+            f"fragmentation-safe target {capacity_target/2**30:.2f} "
+            f"GiB/device ({target_utilization:.2f} x live budget "
+            f"{float(device_pool_limit)/2**30:.2f} GiB/device). The "
             "compiled canonical G-flat -> full-Bloch r-chunk transform "
             "(gather, ifftn(norm='ortho'), slice and phase) is priced at "
             f"{minimum['WFN_RCHUNK_TRANSFORM']/2**30:.2f} GiB/device.")
@@ -288,8 +295,7 @@ def _resolve_whole_state_stream_budget(
                 state_count=state_count, search_rank=search_rank,
                 candidate_carrier=candidate_carrier,
                 q_tile_budget=budget)
-            if (device_pool_limit is None or device_pool_limit <= 0
-                    or ledger["HWM"] <= float(device_pool_limit)):
+            if capacity_target is None or ledger["HWM"] <= capacity_target:
                 chosen = (budget, ledger)
                 break
         local_r //= 2
@@ -305,15 +311,17 @@ def _resolve_whole_state_stream_budget(
             for name, value in ledger.items()
             if name not in ("r_chunk_carrier",))
         + f", r_chunk_carrier={int(ledger['r_chunk_carrier'])}"
-        + (f", pool={float(device_pool_limit)/2**30:.2f} GiB"
-           if device_pool_limit is not None and device_pool_limit > 0
-           else ", pool=unavailable (HWM refusal not run)"))
+        + (f", target={capacity_target/2**30:.2f} GiB "
+           f"({target_utilization:.2f} x live budget "
+           f"{float(device_pool_limit)/2**30:.2f} GiB)"
+           if capacity_target is not None
+           else ", target=unavailable (HWM refusal not run)"))
     if budget < int(requested_q_tile_budget):
         log_fn(
             f"  Whole-state planner reduced the Q budget from "
             f"{requested_q_tile_budget/2**30:.2f} to {budget/2**30:.2f} "
             "GiB/device so the compiled IFFT workspace and persistent fit "
-            "state do not overlap past the device pool")
+            "state do not overlap past the fragmentation-safe target")
     return budget, ledger
 
 
