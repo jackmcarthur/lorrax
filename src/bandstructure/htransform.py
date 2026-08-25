@@ -624,6 +624,149 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     return nsigmarange, jnp.asarray(enk_sigma).transpose(1, 0)
 
 
+@partial(jax.jit, static_argnames=("band_offset",))
+def _apply_qp_block_to_compact_state(
+        ctilde, enk_sigma, U_mnk, E_qp_nk, *, band_offset: int):
+    """One fixed-shape compact implementation of ``C_QP = U.T C_DFT``."""
+    nb_qp = U_mnk.shape[1]
+    c_qp = jnp.einsum(
+        "kmn,kma->kna", U_mnk,
+        ctilde[:, band_offset:band_offset + nb_qp, :], optimize=True)
+    ctilde_out = ctilde.at[
+        :, band_offset:band_offset + nb_qp, :].set(c_qp)
+    enk_out = enk_sigma.at[
+        band_offset:band_offset + nb_qp, :].set(E_qp_nk.T)
+    return ctilde_out, enk_out
+
+
+def resolve_qp_hamiltonian_state(
+        *, basis, enk_sigma, sym, meta, wfn_path: str,
+        qp_rotations_file: str, eqp_file: str | None = None,
+        log_fn=None):
+    """Overlay a matched QP block on a reusable mean-field Galerkin fit.
+
+    ``basis`` remains the immutable fit artifact.  Only its compact state
+    rows are rotated, using the same convention as
+    :func:`file_io.qp_wfn.write_qp_wfn_h5`::
+
+        C_QP[k,n,a] = sum_m U[k,m,n] C_DFT[k,m,a] = U[k].T C_DFT[k]
+
+    The existing ``build_fH_R`` then constructs
+    ``f(H_QP) = U f(E_QP) U^H`` without a second Hamiltonian, WFN or FFT
+    implementation.  A wider fitted window is supported exactly as the
+    canonical QP-WFN writer supports it: the complete QP block is replaced,
+    while rows outside it remain the original DFT states and energies (an
+    implicit block-identity extension).  Cutting through the QP block is
+    refused because a sliced eigenvector matrix is not unitary.
+
+    Scaling is ``O(nk * nb_qp^2 * rank)`` work.  Persistent output has the
+    same shape as ``basis.ctilde``; the only additional inputs are the
+    ``nk * nb_qp^2`` rotation artifact and its matched energies.  There is one
+    executable shape, including for band-window remainders: the complete QP
+    block is one fixed operand and no chunk/remainder kernel exists.
+    """
+    say = log_fn if log_fn is not None else (lambda *_a, **_k: None)
+    path = os.fspath(qp_rotations_file)
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file, qp_rotations_file=path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"QP rotation artifact does not exist: {path}")
+
+    from file_io.qp_wfn import read_qp_rotations_artifact
+    artifact = read_qp_rotations_artifact(path)
+    U = np.asarray(artifact["U_mnk"])
+    E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
+    rot_range = np.asarray(artifact["band_range"], dtype=np.int64)
+    rot_grid = np.asarray(artifact["kgrid"], dtype=np.int64)
+    rot_kpts = np.asarray(artifact["kpoints_crys"], dtype=np.float64)
+
+    if rot_range.shape != (2,):
+        raise ValueError(
+            f"{os.path.basename(path)} band_range has shape "
+            f"{rot_range.shape}, expected (2,).")
+    q0, q1 = (int(rot_range[0]), int(rot_range[1]))
+    if q1 <= q0:
+        raise ValueError(
+            f"{os.path.basename(path)} has empty/reversed QP band range "
+            f"[{q0},{q1}).")
+    nb_qp = q1 - q0
+    fit0, fit1 = (int(v) for v in basis.band_range)
+    ctilde = basis.ctilde
+    nk = int(ctilde.shape[0])
+    nb_fit = int(ctilde.shape[1])
+    if fit1 - fit0 != nb_fit:
+        raise ValueError(
+            f"Galerkin basis range [{fit0},{fit1}) has width {fit1-fit0}, "
+            f"but ctilde carries {nb_fit} rows.")
+    if not (fit0 <= q0 < q1 <= fit1):
+        raise ValueError(
+            f"QP range [{q0},{q1}) must be wholly contained in the fitted "
+            f"Galerkin range [{fit0},{fit1}).  A disjoint block would apply "
+            "no QP correction, while any partial overlap/cut-through would "
+            "slice U_mnk and destroy the unitary state transformation.  "
+            "Fit a window containing the complete QP block.")
+    if U.shape != (nk, nb_qp, nb_qp):
+        raise ValueError(
+            f"{os.path.basename(path)} U_mnk has shape {U.shape}, expected "
+            f"({nk},{nb_qp},{nb_qp}) from the full k-set and band_range.")
+    if E.shape != (nk, nb_qp):
+        raise ValueError(
+            f"{os.path.basename(path)} E_qp_nk_rydberg has shape {E.shape}, "
+            f"expected ({nk},{nb_qp}).")
+    expected_enk = (nb_fit, nk)
+    if tuple(enk_sigma.shape) != expected_enk:
+        raise ValueError(
+            f"enk_sigma has shape {tuple(enk_sigma.shape)}, expected "
+            f"{expected_enk} from the Galerkin state table.")
+
+    expected_grid = np.asarray(meta.kgrid, dtype=np.int64)
+    if rot_grid.shape != (3,) or not np.array_equal(rot_grid, expected_grid):
+        raise ValueError(
+            f"{os.path.basename(path)} kgrid {rot_grid.tolist()} does not "
+            f"match the WFN/symmetry kgrid {expected_grid.tolist()}.")
+    expected_kpts = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    if rot_kpts.shape != expected_kpts.shape:
+        raise ValueError(
+            f"{os.path.basename(path)} kpoints_crys has shape "
+            f"{rot_kpts.shape}, expected {expected_kpts.shape} from the "
+            "WFN symmetry service.")
+    dk = rot_kpts - expected_kpts
+    dk -= np.rint(dk)
+    worst_k = float(np.max(np.abs(dk))) if dk.size else 0.0
+    if worst_k > 1.0e-6:
+        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
+        raise ValueError(
+            f"{os.path.basename(path)} full-BZ k-point {bad} is "
+            f"{rot_kpts[bad].tolist()}, but the WFN symmetry service has "
+            f"{expected_kpts[bad].tolist()} (periodic max|Delta k|="
+            f"{worst_k:.3e}).")
+
+    # ``ctilde`` and ``enk_sigma`` are replicated by the Galerkin owner.
+    # Put the small companion arrays in the incumbent sharding rather than
+    # creating a second placement policy here.
+    state_sharding = ctilde.sharding
+    U_dev = jax.device_put(
+        np.asarray(U, dtype=np.dtype(ctilde.dtype)), state_sharding)
+    E_dev = jax.device_put(
+        np.asarray(E, dtype=np.dtype(enk_sigma.dtype)),
+        enk_sigma.sharding)
+    ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
+        ctilde, enk_sigma, U_dev, E_dev, band_offset=q0 - fit0)
+    say(
+        f"  [QP state] {os.path.basename(path)}: full "
+        f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); DFT block-identity "
+        f"rows retained outside it in fitted window [{fit0},{fit1}); "
+        f"compact rotation O({nk}*{nb_qp}^2*{int(ctilde.shape[2])}), no "
+        "WFN/FFT rebuild")
+    say(
+        "  [QP provenance] band_range, kgrid and full-BZ k coordinates "
+        "match the selected WFN, but qp_wfn_rotations.h5 does not yet carry "
+        "a source-WFN fingerprint.  This validates the represented window "
+        "and k-set, not the exact source-WFN identity.")
+    return ctilde_qp, enk_qp
+
+
 def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # Pass the device mesh so the loader can pick a sharded read backend
     # (the collective phdf5 FFI read, on GPU or the CUDA-free host lib),
@@ -821,6 +964,11 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     if mesh_xy is None:
         mesh_xy = _build_mesh_xy()
     wfn_file = _resolve(params["wfn_file"])
+    eqp_path_requested = _resolve(eqp_file) if eqp_file else None
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_file, eqp_file=eqp_path_requested,
+        qp_rotations_file=None)
     if wfn_sym is None:
         wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     else:
@@ -933,12 +1081,16 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         # --eqp-file is an explicit request: a file that cannot be found or
         # parsed must refuse, not silently fall back to the DFT energies —
         # the output would be a DFT bandstructure labeled as quasiparticle.
-        eqp_path = _resolve(eqp_file)
+        eqp_path = eqp_path_requested
         if not os.path.isfile(eqp_path):
             raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
         try:
             enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
-            log_fn(f"Using EQP energies from {os.path.basename(eqp_path)} for band window {nsigmarange}")
+            log_fn(
+                f"Using DIAGONAL QP APPROXIMATION from "
+                f"{os.path.basename(eqp_path)} for band window "
+                f"{nsigmarange}: energies only in the current WFN labels; "
+                "no U_mnk/off-diagonal QP mixing")
         except Exception as exc:
             raise SystemExit(
                 f"FATAL: --eqp-file {os.path.basename(eqp_path)} could not be "
@@ -1413,7 +1565,17 @@ def main(argv=None):
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
-    parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
+    qp_group = parser.add_mutually_exclusive_group()
+    qp_group.add_argument(
+        "--eqp-file", default=None,
+        help="Diagonal QP approximation: replace energies from eqp1.dat in "
+             "the current WFN band labels; does not represent off-diagonal "
+             "QP mixing. Mutually exclusive with --qp-rotations.")
+    qp_group.add_argument(
+        "--qp-rotations", default=None,
+        help="Full QP Hamiltonian: consume matched U_mnk,E_qp from "
+             "qp_wfn_rotations.h5 so f(H_QP)=U f(E_QP) U^H. The complete "
+             "QP block must lie inside the fitted band window.")
     parser.add_argument("-o", "--output-file", default="bandstructure.dat",
                         help="Interpolated band table (relative paths are "
                              "resolved beside the input deck)")
@@ -1473,8 +1635,16 @@ def main(argv=None):
     production_stdout.install()
     report.stdout = rank0_print if _debug else production_stdout.emit
     log = report.legacy_print
-    _energy_source = (f"quasiparticle energies from {os.path.basename(args.eqp_file)}"
-                      if args.eqp_file else "DFT eigenvalues from the WFN")
+    if args.qp_rotations:
+        _energy_source = (
+            "full quasiparticle Hamiltonian from "
+            f"{os.path.basename(args.qp_rotations)}")
+    elif args.eqp_file:
+        _energy_source = (
+            "diagonal quasiparticle energies from "
+            f"{os.path.basename(args.eqp_file)}")
+    else:
+        _energy_source = "DFT eigenvalues from the WFN"
     report.begin(input_file=args.input, output_file=output_path,
                  energy_source=_energy_source)
     report.architecture()
@@ -1499,12 +1669,26 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
+    _input_dir = os.path.dirname(os.path.abspath(args.input))
+    _wfn_path = (params["wfn_file"] if os.path.isabs(params["wfn_file"])
+                 else os.path.join(_input_dir, params["wfn_file"]))
+    _qp_rotations_path = None
+    if args.qp_rotations:
+        _qp_rotations_path = (
+            args.qp_rotations if os.path.isabs(args.qp_rotations)
+            else os.path.join(_input_dir, args.qp_rotations))
+    _eqp_path = None
+    if args.eqp_file:
+        _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file)
+                     else os.path.join(_input_dir, args.eqp_file))
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_wfn_path, eqp_file=_eqp_path,
+        qp_rotations_file=_qp_rotations_path)
+
     # Resolve the concrete fine-k plan before the first setup/progress line.
     # Whole-state QRCP owns basis selection and has no Gram eigensolve.
     mesh_xy = _build_mesh_xy()
-    _wfn_path = params["wfn_file"]
-    if not os.path.isabs(_wfn_path):
-        _wfn_path = os.path.join(input_dir, _wfn_path)
     wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
     from distrib_la import plan as _linalg_plan
     _fine_enabled = bool(params.get("get_centroids_fi", False))
@@ -1536,6 +1720,11 @@ def main(argv=None):
     _setup_progress.step()
     _setup_progress.finish()
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    if _qp_rotations_path is not None:
+        ctilde, enk_sigma = resolve_qp_hamiltonian_state(
+            basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta,
+            wfn_path=_wfn_path, qp_rotations_file=_qp_rotations_path,
+            eqp_file=args.eqp_file, log_fn=log)
     # ── Galerkin-input gate ───────────────────────────────────────────
     # ``ctilde`` is the compact Galerkin coefficient table and ``enk_sigma``
     # is the band energies the whole

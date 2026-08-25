@@ -446,31 +446,10 @@ def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
     nothing, so it does NOT refuse: an absence is a claim about what was
     searched.  Only a positive identification refuses.
     """
-    from file_io.qp_wfn import QP_WFN_SCHEME, read_qp_wfn_stamp
-
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
     wfn_path = _parse_wfn_path(input_file)
-    stamp = read_qp_wfn_stamp(wfn_path)
-    if stamp is None:
-        return
-    where = ""
-    if stamp.get("band_stop") is not None:
-        where = (f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
-                 f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
-    version_note = ""
-    if stamp["scheme"] != QP_WFN_SCHEME:
-        version_note = (f"  (That stamp is not {QP_WFN_SCHEME!r}: the file was "
-                        f"written by a different version of the QP writer.)")
-    raise ValueError(
-        f"--eqp {eqp_file} is redundant and destructive on this deck.  "
-        f"{wfn_path} is a LORRAX QP WFN (stamp {stamp['scheme']!r}{where}): "
-        f"its wavefunctions ARE the QP orbitals and its energies ARE the QP "
-        f"eigenvalues that produced them.  A second eqp ladder is written "
-        f"against DFT band LABELS, so applying it here discards the canonical "
-        f"eigenvalues and relabels the rotated orbitals with the mean-field "
-        f"ordering — with the right shapes, so nothing downstream notices.  "
-        f"Fix: drop --eqp.  To run a mean-field WFN with diagonal QP "
-        f"corrections instead, point wfn_file at the mean-field WFN.h5 and "
-        f"keep --eqp.{version_note}")
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file)
 
 
 def resolve_n_occ(
@@ -574,6 +553,14 @@ def apply_eqp_corrections(
             "it selected a mean-field-energy nearest-match that silently "
             "took QP shifts from the wrong star whenever two stars were "
             "degenerate; that path is deleted rather than defaulted.")
+
+    # Every public BSE eqp frontend (bse_jax, Haydock, Davidson, the direct
+    # restart loader and exciton bands) reaches this one correction owner.
+    # Refuse a second DFT-labelled ladder on a positively stamped QP WFN here
+    # rather than relying on each CLI to remember the same content contract.
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_parse_wfn_path(input_file), eqp_file=eqp_file)
 
     from ffi import _services
     _services.ensure_on_path()
