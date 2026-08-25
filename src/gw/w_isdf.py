@@ -1682,7 +1682,23 @@ def compute_finite_transfer_current_block_row(
     endpoint, wfns_transverse, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
-    r"""Return one exact-current TT response block at one stored q row.
+    """Refuse publication until the WFN bundle carries a source receipt."""
+    raise NotImplementedError(
+        "finite-transfer current body publication is refused: the existing "
+        "Wavefunctions bundle carries arrays, band slices and layout, but no "
+        "canonical non-JIT source/band/centroid receipt to compare with the "
+        "endpoint.  Shape agreement and fingerprint syntax do not prove that "
+        "the current endpoint and target faces came from the same WFN and "
+        "transverse centroid basis.  Wire that receipt through the incumbent "
+        "wavefunction/restart provenance owner before publishing this row; "
+        "FULL remains unavailable.")
+
+
+def _compute_finite_transfer_current_block_row_unverified(
+    endpoint, wfns_transverse, quad, meta, mesh_xy, *,
+    vertex_left: int, vertex_right: int, energy_reference=0.0,
+):
+    r"""Private fixed-q TT algebra oracle at one stored q row.
 
     ``endpoint`` must come from
     :func:`common.mtxel_sweep.finite_transfer_current_to_centroids` for the
@@ -1692,11 +1708,13 @@ def compute_finite_transfer_current_block_row(
     carrier.  One block is returned so the existing photon packer can retain
     its one-live-block memory schedule.
 
-    This is authenticated paramagnetic-body infrastructure, not a claim that
-    FULL is complete.  The transverse zeta/V side still needs the matching
-    q-resolved C/Z contraction, and the exact contact/downfolded completion
-    and vector-symmetry reciprocity gate remain absent.  Consequently the
-    production FULL refusal is unchanged.
+    This is deliberately private because :class:`Wavefunctions` does not yet
+    carry the non-JIT source/band/centroid receipt needed to authenticate it
+    against ``endpoint``.  Deterministic tests use it to pin the fixed-q Green
+    normalization and conjugation.  Production reaches only the refusing
+    public seam above.  The transverse zeta/V side also still needs the
+    matching q-resolved C/Z contraction, exact contact/downfolded completion,
+    and vector-symmetry reciprocity gate.
     """
     A, B = int(vertex_left), int(vertex_right)
     if A not in (1, 2, 3) or B not in (1, 2, 3):

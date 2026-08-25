@@ -453,6 +453,22 @@ def test_padded_gvectors_refuses_unpaired_k_rows(monkeypatch):
         padded_gvectors(object())
 
 
+def test_padded_gvectors_refuses_invalid_logical_extents(monkeypatch):
+    import pytest
+    import psp.dft_operators as dop
+
+    fake = _FakeLoader(
+        np.zeros((2, 4, 3), dtype=np.int32),
+        np.asarray([4, 5], dtype=np.int32))
+    monkeypatch.setattr(dop, "_as_loader", lambda w: fake)
+    with pytest.raises(ValueError, match="rows must lie"):
+        padded_gvectors(object())
+
+    fake._n = np.asarray([4], dtype=np.int32)
+    with pytest.raises(ValueError, match="one logical extent per G row"):
+        padded_gvectors(object())
+
+
 def test_sweep_consumers_take_kvecs_from_the_same_gtab():
     """Every migrated sweep pairs ``gtab.gvecs`` with ``gtab.kvecs``."""
     root = Path(__file__).resolve().parents[1]

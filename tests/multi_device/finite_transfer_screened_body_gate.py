@@ -1,10 +1,12 @@
-"""Real P4 gate for the exact finite-q current endpoint and TT body row.
+"""Real P4 gate for the exact finite-q current endpoint and private TT oracle.
 
 The deterministic single-device cells in ``test_dft_gauge_vertices.py`` own
 the independent numerical oracles.  This cell owns the production layout:
 one 2x2 mesh, non-divisible logical band/centroid extents, WfnLoader-paired
-k/G/box labels, a nonzero q-IBZ row after a same-shape q=0 call, and the
-incumbent distributed face Green builder.
+k/G/box labels, a nonzero q-IBZ row after a same-shape q=0 call, the incumbent
+distributed face Green builder, and the public row's fail-closed identity
+gate.  Production publication remains blocked until ``Wavefunctions`` carries
+the canonical non-JIT source/band/centroid receipt this oracle lacks.
 
 Run only through the Perlmutter compute harness::
 
@@ -58,6 +60,7 @@ def check_finite_transfer_screened_body(mesh):
     from gw import w_isdf
     from gw.wavefunction_bundle import (
         BandSlices, PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions)
+    from psp import dft_operators
     from runtime.padding import pad_axis
     from tests.test_dft_gauge_vertices import _finite_setup
 
@@ -121,6 +124,10 @@ def check_finite_transfer_screened_body(mesh):
         ngk_valid=lambda *, k: ngk,
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: box_index_dev)
+    # The production door receives a real WfnLoader.  This deterministic
+    # in-memory fixture supplies the same loader protocol without an HDF5
+    # file, so route only this gate's process through the existing owner.
+    dft_operators._as_loader = lambda value: value
     endpoint_kwargs = dict(
         wfn=wfn, band_start=0, band_stop=nb_logical, geom=geom,
         vnl_setup=setup, r_mu=r_mu, path_order=8,
@@ -173,10 +180,21 @@ def check_finite_transfer_screened_body(mesh):
         enk=_put(energies, mesh, P(None, None)),
         occ=_put(np.zeros_like(energies), mesh, P(None, None)),
         slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face")
-    chi = w_isdf.compute_finite_transfer_current_block_row(
-        endpoint, wfns,
-        SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
-        SimpleNamespace(nk_tot=nk), mesh,
+    quad = SimpleNamespace(
+        tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
+    meta = SimpleNamespace(nk_tot=nk)
+    try:
+        w_isdf.compute_finite_transfer_current_block_row(
+            endpoint, wfns, quad, meta, mesh,
+            vertex_left=1, vertex_right=2)
+    except NotImplementedError as exc:
+        if "source/band/centroid" not in str(exc):
+            raise
+    else:
+        raise AssertionError(
+            "finite-transfer public body row accepted no source receipt")
+    chi = w_isdf._compute_finite_transfer_current_block_row_unverified(
+        endpoint, wfns, quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     chi.block_until_ready()
     if chi.sharding.spec != P("x", "y"):

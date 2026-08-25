@@ -282,6 +282,18 @@ def padded_gvectors(wfn, *, k="full_bz") -> PaddedGVectors:
     gvecs = np.asarray(loader.gvecs(k=k), dtype=np.int32)
     ngk = np.asarray(loader.ngk_valid(k=k), dtype=np.int32)
     kvecs = np.asarray(loader.kvecs(k=k), dtype=np.float64)
+    if gvecs.ndim != 3 or int(gvecs.shape[-1]) != 3:
+        raise ValueError(
+            "padded_gvectors: WfnLoader.gvecs must have shape "
+            f"(n_k, ngkmax, 3); got {gvecs.shape}.")
+    if ngk.shape != (int(gvecs.shape[0]),):
+        raise ValueError(
+            "padded_gvectors: WfnLoader.ngk_valid must have one logical "
+            f"extent per G row; got {ngk.shape} for gvecs {gvecs.shape}.")
+    if np.any(ngk < 0) or np.any(ngk > int(gvecs.shape[1])):
+        raise ValueError(
+            "padded_gvectors: WfnLoader.ngk_valid rows must lie in "
+            f"[0,{int(gvecs.shape[1])}]; got {ngk.tolist()}.")
     if kvecs.shape != (int(gvecs.shape[0]), 3):
         raise ValueError(
             "padded_gvectors: WfnLoader.kvecs must carry the coordinate "
