@@ -17,6 +17,13 @@ import numpy as np
 FLOAT_DIGITS = 5
 
 
+def clean_rounded(values, *, digits: int = FLOAT_DIGITS) -> np.ndarray:
+    """Return display values with round-to-zero results made positive zero."""
+    array = np.asarray(values, dtype=np.float64).copy()
+    array[np.abs(array) < 0.5 * 10.0 ** (-digits)] = 0.0
+    return array
+
+
 def abs_path(path) -> str:
     """An absolute display path, with ``-`` for an absent optional path."""
     return "-" if not path else os.path.abspath(os.fspath(path))
@@ -143,8 +150,9 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
             "from the measured density verdict")
 
+    display_tau = clean_rounded(tau, digits=digits)
     for i, (rotation, shift, is_non) in enumerate(
-            zip(rotations, tau, fractional_tau), start=1):
+            zip(rotations, display_tau, fractional_tau), start=1):
         # A fractional translation makes the nonsymmorphic content visible,
         # but presentation alone must not classify the space-group element
         # as a screw/glide (that needs crystallographic origin analysis).
@@ -155,7 +163,8 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"{shift[2]: .{digits}f}){tag}")
 
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
-    shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
+    shift = tuple(float(v) for v in clean_rounded(
+        np.asarray(wfn.shift).reshape(-1)[:3], digits=digits))
     lines.append(
         f"Full BZ grid   : {int(sym.nk_tot)} k points | mesh "
         f"{kgrid[0]} x {kgrid[1]} x {kgrid[2]} | shift "
@@ -168,8 +177,9 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         if weight_sum != 0.0:
             weights = weights / weight_sum
         lines.append("  ik        kx        ky        kz     weight")
-        for ik, (point, weight) in enumerate(
-                zip(np.asarray(wfn.kpoints), weights), start=1):
+        points = clean_rounded(wfn.kpoints, digits=digits)
+        weights = clean_rounded(weights, digits=digits)
+        for ik, (point, weight) in enumerate(zip(points, weights), start=1):
             lines.append(
                 f"  {ik:3d}  {point[0]: .{digits}f}  {point[1]: .{digits}f}  "
                 f"{point[2]: .{digits}f}  {weight: .{digits}f}")
@@ -188,6 +198,7 @@ __all__ = [
     "abs_path",
     "architecture_lines",
     "band_range",
+    "clean_rounded",
     "file_table_lines",
     "numerical_environment_lines",
     "policy",

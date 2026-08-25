@@ -150,7 +150,8 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "indices [" not in text
     assert "Energy origin   : E_F = +1.00000 eV (fixed-N mu)" in text
     assert "Absolute window" not in text
-    assert "Omega margins  : +3.80000 eV below; +5.60000 eV above" in text
+    assert "Coverage status : COMPLETE" in text
+    assert "Grid margins    : 3.80000 eV below; 5.60000 eV above" in text
     assert "Tail calculations: N1=36 / N2=41 / N3=46 cumulative bands" in text
     assert "DFT gap        : 0.40000 eV" in text
     assert "QP gap         : 0.40000 eV (insulating)" in text
@@ -171,6 +172,28 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "1.00000" in zeta_line
     assert "5.00000" in sigma_line
     assert "HDF5" not in text and "h5py" not in text
+
+
+def test_report_collapses_minimax_catalog_receipts(tmp_path):
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    report.legacy_print(
+        "RuntimeWarning: minimax: served noncrossing/inverse R=10 "
+        "target 1e-06 -> 8 nodes, max_err 1.85e-07 | shipped a.npz "
+        "sha256:aaaa gen unrecorded backend unrecorded UNCERTIFIED")
+    report.legacy_print(
+        "RuntimeWarning: minimax: served crossing/hgl A_dim=24 "
+        "target 1e-06 -> 48 nodes, max_err 3.2e-07 | shipped b.npz "
+        "sha256:bbbb gen unrecorded backend unrecorded UNCERTIFIED")
+    report.finish()
+
+    text = path.read_text(encoding="utf-8")
+    assert "2 catalog entries used (8-48 nodes)" in text
+    assert "requested tolerance 1.00000e-06" in text
+    assert "worst reported error 3.20000e-07" in text
+    assert text.count("UNCERTIFIED") == 1
+    assert "sha256" not in text
 
 
 def test_nonzero_rank_never_creates_report(tmp_path):

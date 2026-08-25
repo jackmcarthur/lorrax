@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from typing import Iterable
 
 import numpy as np
@@ -277,8 +278,21 @@ class GWProductionReport:
                       f"{cond_span[1]:+.5f}] eV relative to E_F")
         if target:
             target_lo, target_hi = min(target), max(target)
-            self.emit(f"Omega margins  : {target_lo - grid_lo:+.5f} eV below; "
-                      f"{grid_hi - target_hi:+.5f} eV above protected DFT states")
+            lower_margin = target_lo - grid_lo
+            upper_margin = grid_hi - target_hi
+            if lower_margin >= 0.0 and upper_margin >= 0.0:
+                self.emit("Coverage status : COMPLETE")
+                self.emit(f"Grid margins    : {lower_margin:.5f} eV below; "
+                          f"{upper_margin:.5f} eV above protected DFT states")
+            else:
+                self.emit("Coverage status : INCOMPLETE")
+                shortfalls = []
+                if lower_margin < 0.0:
+                    shortfalls.append(f"{-lower_margin:.5f} eV below")
+                if upper_margin < 0.0:
+                    shortfalls.append(f"{-upper_margin:.5f} eV above")
+                self.emit("Grid shortfall  : " + "; ".join(shortfalls)
+                          + " protected DFT states")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
@@ -351,10 +365,50 @@ class GWProductionReport:
         if self._warnings_emitted:
             return
         self._warnings_emitted = True
-        if self._warnings:
+        warnings = self._display_warnings()
+        if warnings:
             self.heading("Warnings")
-            for warning in self._warnings:
+            for warning in warnings:
                 self.emit(f"  {warning}")
+
+    def _display_warnings(self) -> list[str]:
+        """Collapse repeated catalog receipts into one numerical warning."""
+        minimax = [warning for warning in self._warnings
+                   if "minimax: served " in warning and
+                   "UNCERTIFIED" in warning]
+        others = [warning for warning in self._warnings
+                  if warning not in minimax]
+        if not minimax:
+            return others
+
+        def numbers(pattern: str) -> list[float]:
+            values = []
+            for warning in minimax:
+                match = re.search(pattern, warning)
+                if match is not None:
+                    values.append(float(match.group(1)))
+            return values
+
+        targets = numbers(r"\btarget\s+([0-9.eE+-]+)")
+        errors = numbers(r"\bmax_err\s+([0-9.eE+-]+)")
+        nodes = [int(value) for value in
+                 numbers(r"->\s+([0-9]+)\s+nodes")]
+        detail = f"{len(minimax)} catalog entries used"
+        if nodes:
+            node_text = (str(nodes[0]) if min(nodes) == max(nodes) else
+                         f"{min(nodes)}-{max(nodes)}")
+            detail += f" ({node_text} nodes)"
+        if targets:
+            target_text = (f"{targets[0]:.5e}" if min(targets) == max(targets)
+                           else f"{min(targets):.5e}-{max(targets):.5e}")
+            detail += f"; requested tolerance {target_text}"
+        if errors:
+            detail += f"; worst reported error {max(errors):.5e}"
+        return [
+            "Minimax quadrature: " + detail + ". Catalog generator/backend "
+            "provenance is UNCERTIFIED.",
+            *others,
+        ]
 
     def finish(self, *, status: str = "completed") -> None:
         self.warnings()

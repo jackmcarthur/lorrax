@@ -19,6 +19,13 @@ import sys
 import warnings
 
 
+_PRODUCTION_ONLY_WARNING_NOISE = (
+    # JAX buffer donation is an optimization hint, not a numerical or physical
+    # warning.  It remains visible in the driver's forensic debug stream.
+    "Some donated buffers were not usable",
+)
+
+
 class ProductionStdout:
     """Route incidental stdout away from one driver's scientific output."""
 
@@ -46,6 +53,9 @@ class ProductionStdout:
 
             def _route_warning(message, category, filename, lineno,
                                file=None, line=None):
+                if any(fragment in str(message)
+                       for fragment in _PRODUCTION_ONLY_WARNING_NOISE):
+                    return
                 if self.rank == 0 and self.warning_fn is not None:
                     self.warning_fn(f"{category.__name__}: {message}")
 

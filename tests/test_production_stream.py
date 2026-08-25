@@ -53,3 +53,20 @@ def test_production_consolidates_rank_zero_warnings_and_silences_peers(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert retained == ["RuntimeWarning: uncertified minimax table"]
+
+
+def test_production_hides_jax_donation_hint(capsys):
+    retained = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        owner = ProductionStdout(
+            debug=False, rank=0, warning_fn=retained.append)
+        owner.install()
+        warnings.warn(
+            "Some donated buffers were not usable: complex128[64,20].",
+            UserWarning)
+        owner.close()
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert retained == []

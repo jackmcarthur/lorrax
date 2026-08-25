@@ -12,6 +12,7 @@ from common.scientific_output import (
     abs_path,
     architecture_lines,
     band_range,
+    clean_rounded,
     file_table_lines,
     numerical_environment_lines,
     policy,
@@ -101,10 +102,14 @@ class HTransformProductionReport:
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        self.emit("Gram eigensolve: " + policy(
-            resolve_text(params.get("eigh_backend", eigh_backend)),
+        requested_eigh = resolve_text(params.get("eigh_backend", eigh_backend))
+        eigh_text = policy(
+            requested_eigh,
             ("auto", "off", "distributed", "cusolvermp", "slate",
-             "scalapack")) + f" -> {eigh_backend}")
+             "scalapack"))
+        if requested_eigh.strip().lower() != str(eigh_backend).strip().lower():
+            eigh_text += f" -> {eigh_backend}"
+        self.emit("Gram eigensolve: " + eigh_text)
         self.emit("Batched LA     : " + policy(
             batched_route, ("auto", "batch_reshard")))
         self.emit("fH diagnostics : " + policy(
@@ -158,7 +163,7 @@ class HTransformProductionReport:
             self.emit("Path           : none; no K_POINTS {crystal_b} path "
                       "was supplied")
             return
-        points = np.asarray(kpath, dtype=np.float64)
+        points = clean_rounded(kpath, digits=FLOAT_DIGITS)
         self.emit(f"Path sampling  : {int(points.shape[0])} points; "
                   f"{len(node_indices)} labelled nodes")
         for number, (idx, label) in enumerate(

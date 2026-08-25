@@ -44,8 +44,8 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
     )
     wfn = SimpleNamespace(
         density_symmetry=receipt,
-        kgrid=np.array([2, 2, 2]), shift=np.array([0.0, 0.0, 0.0]),
-        kpoints=np.array([[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]]),
+        kgrid=np.array([2, 2, 2]), shift=np.array([-1.0e-8, 0.0, 0.0]),
+        kpoints=np.array([[-1.0e-8, 0.0, 0.0], [0.25, 0.25, 0.25]]),
         kweights=np.array([1.0, 3.0]),
     )
     sym = SimpleNamespace(
@@ -61,3 +61,4 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
     assert "TRS unfolding  : enabled from the measured density verdict" in text
     assert " 0.25000   0.25000   0.25000   0.75000" in text
     assert ".250000" not in text
+    assert "-0.00000" not in text

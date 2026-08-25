@@ -73,6 +73,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Centroid sites : 20 logical; 20 mesh-padded" in text
     assert "Galerkin basis : rank 12" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
+    assert "Gram eigensolve: auto (other choices:" in text
+    assert "-> auto" not in text
     assert "auto (other choices:" in text
     assert "Started Hamiltonian interpolation" in text
     assert "OUTPUT FILES AND INPUTS" in text
