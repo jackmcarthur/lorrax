@@ -970,12 +970,9 @@ def _build_selected_rows_for_rchunk(
         int(r1) - int(r0),
         spec_divisor(mesh_xy, row_layout.spec, axis=2))
 
-    @partial(jax.jit, static_argnums=(0,), out_shardings=row_layout)
-    def _zeros(r_extent):
-        return jnp.zeros(
-            (int(rank_carrier), nspinor, r_extent), dtype=jnp.complex128)
-
-    rows = _zeros(r_carrier)
+    rows = _make_selected_zero_kernel(
+        mesh=mesh_xy, row_count=rank_carrier, nspinor=nspinor,
+        r_carrier=r_carrier, row_layout=row_layout)()
     fill = _make_selected_fill_kernel(
         mesh=mesh_xy, row_count=rank_carrier, nk=nk,
         band_carrier=source.band_chunk_carrier, nspinor=nspinor,
@@ -1034,6 +1031,14 @@ def _build_selected_state_gram(
     return gram
 
 
+def _solve_selected_basis_rows(factor, selected_rows):
+    """Evaluate ``B = L^-1 X`` with spin kept outside the solve axis."""
+    rhs = jnp.moveaxis(selected_rows, 1, 0)
+    basis = jax.vmap(
+        lambda x: jsp_linalg.solve_triangular(factor, x, lower=True))(rhs)
+    return jnp.moveaxis(basis, 0, 1)
+
+
 def _make_basis_solve_kernel(
         *, mesh: Mesh, rank: int, nspinor: int, r_carrier: int,
         row_layout):
@@ -1048,10 +1053,7 @@ def _make_basis_solve_kernel(
         jax.jit, donate_argnums=(1,),
         in_shardings=(rep, row_layout), out_shardings=row_layout)
     def _solve(L, selected_rows):
-        rhs = jnp.moveaxis(selected_rows, 1, 0)
-        basis = jax.vmap(
-            lambda x: jsp_linalg.solve_triangular(L, x, lower=True))(rhs)
-        return jnp.moveaxis(basis, 0, 1)
+        return _solve_selected_basis_rows(L, selected_rows)
 
     _BASIS_SOLVE_KERNELS[key] = _solve
     return _solve
@@ -1277,10 +1279,7 @@ def _basis_at_nodes_from_selected_states(
         if int(rank_carrier) > rank_phys:
             rows = jnp.pad(
                 rows, ((0, int(rank_carrier) - rank_phys), (0, 0), (0, 0)))
-        rhs = jnp.moveaxis(rows, 1, 0)
-        basis = jax.vmap(
-            lambda x: jsp_linalg.solve_triangular(L, x, lower=True))(rhs)
-        return jnp.moveaxis(basis, 0, 1)[..., :int(n_nodes)]
+        return _solve_selected_basis_rows(L, rows)[..., :int(n_nodes)]
 
     return _evaluate(psi_rmu, factor)
 
