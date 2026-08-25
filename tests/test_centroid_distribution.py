@@ -104,7 +104,7 @@ def _psd_gram(M, rank, seed=0):
 
 def test_sharded_select_matches_single_device_reference():
     from src.centroid import distribution as dist
-    from src.centroid.pivoted_cholesky import (
+    from src.common.pivoted_cholesky import (
         pivoted_cholesky_select, make_sharded_pivoted_cholesky_select)
 
     if jax.process_count() > 1:
@@ -177,9 +177,10 @@ def test_select_delivers_past_the_rank_floor_without_diverging(capsys,
     whose refusal is unchanged), and the refusal is kept verbatim behind
     ``LORRAX_CENTROID_SELECT=strict``.
     """
-    from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                               refuse_unless_select_certified,
-                                               SELECT_MODE_ENV)
+    from src.centroid.pivoted_cholesky import (
+        refuse_unless_select_certified, SELECT_MODE_ENV,
+    )
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     M, k_keep, true_rank = 64, 40, 10
     G = _psd_gram(M, rank=true_rank, seed=1)
@@ -256,7 +257,7 @@ def test_full_rank_select_is_bit_identical_across_the_continuation():
     the continuation did not leak into the healthy path — a change that is
     "obviously local" is the one worth measuring.
     """
-    from src.centroid.pivoted_cholesky import pivoted_cholesky_select
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     M, k_keep = 48, 20
     G = _psd_gram(M, rank=M, seed=5)
@@ -289,8 +290,8 @@ def test_select_refuses_when_the_orbits_run_out():
     finite throughout.  The unfold is ``np.isin(orbit_id, picked)``, a union,
     so the delivered set was 96 points against a nominal 20x8 = 160.
     """
-    from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                               refuse_unless_select_certified)
+    from src.centroid.pivoted_cholesky import refuse_unless_select_certified
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     n_orb, orb_size, k_keep = 12, 8, 20
     oid = np.repeat(np.arange(n_orb, dtype=np.int32), orb_size)
@@ -339,8 +340,8 @@ def test_select_detects_an_indefinite_gram():
     detector before it could be observed.  LAPACK's ``pstrf`` returns
     ``INFO > 0`` for exactly this case.
     """
-    from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                               refuse_unless_select_certified)
+    from src.centroid.pivoted_cholesky import refuse_unless_select_certified
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     n = 24
     rng = np.random.default_rng(11)
@@ -396,7 +397,7 @@ def test_select_tolerance_is_a_documented_knob_not_a_constant():
     ``?pstrf`` uses ``n·eps`` instead; a caller that wants that policy has
     to be able to ask for it, and this is where that is pinned.
     """
-    from src.centroid.pivoted_cholesky import pivoted_cholesky_select
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     M, k_keep = 64, 40
     G = _psd_gram(M, rank=M, seed=17)
@@ -557,8 +558,8 @@ import jax, jax.numpy as jnp
 from jax.sharding import Mesh
 assert jax.device_count() == 4, f"want 4 devices, got {jax.device_count()}"
 
-from centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                       make_sharded_pivoted_cholesky_select)
+from common.pivoted_cholesky import (pivoted_cholesky_select,
+                                     make_sharded_pivoted_cholesky_select)
 
 mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
 AX = ("x", "y")
@@ -623,7 +624,7 @@ step = make_sharded_pivoted_cholesky_select(mesh, M, 8, mesh_axis=AX)
 assert np.array_equal(piv_lo, np.asarray(step(Gt)[0])), "tied Gram disagrees"
 
 import types
-import centroid.pivoted_cholesky as pc
+import common.pivoted_cholesky as pc
 from jax import lax as _lax
 _real_pmax = _lax.pmax
 def _flip(x, axis_name):
@@ -823,8 +824,8 @@ def test_point_granularity_rank_separates_orbits_from_points():
     has exactly 12 independent directions.  A gate reading the orbit rank
     sees 12/12 and passes; the point-granularity number says 12 of 96.
     """
-    from src.centroid.pivoted_cholesky import (pivoted_cholesky_select,
-                                               point_granularity_rank)
+    from src.centroid.pivoted_cholesky import point_granularity_rank
+    from src.common.pivoted_cholesky import pivoted_cholesky_select
 
     n_orb, orb_size = 12, 8
     oid = np.repeat(np.arange(n_orb, dtype=np.int32), orb_size)
