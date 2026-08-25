@@ -2659,7 +2659,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         params, override=distrib_la_batched_route)
     (wfn, sym, meta, _, basis, enk_sigma) = initialize_wfns(
         input_file, params, log_fn, mesh_xy=mesh_xy,
-        n_guard_bands=n_guard)
+        n_guard_bands=n_guard, centroid_subset_idx=keep_idx)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nk, nb_wide, rank = (int(ctilde.shape[0]), int(ctilde.shape[1]),
                          int(ctilde.shape[2]))
@@ -2669,19 +2669,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     # the guards, and conflating them is the defect this contract fixes.
     nb = nb_wide - n_guard
     ns = int(B_at_mu.shape[1])
-    # DOWNFOLDED BUNDLE: the htransform leg fits in the PARENT ISDF basis (it
-    # is sized by nk·nb, not by mu_S — resolve_isdf_basis), so B_at_mu comes
-    # back at the parent's mu while every ζ object here is at the child's.
-    # Slice the mu axis to the kept rows, which is the same column slice that
-    # defines the bundle's own psi_full_y, and do it HERE so psi_rmu_Y is born
-    # at the child's width instead of being trimmed after the contraction.
-    if keep_idx is not None:
-        ki = np.asarray(keep_idx, dtype=int)
-        if int(B_at_mu.shape[2]) != int(zx["n_mu"]):
-            B_at_mu = B_at_mu[:, :, jnp.asarray(ki)]
-            log_fn(f"  [refit] downfold: B_at_mu mu axis sliced "
-                   f"{int(B_at_mu.shape[2])} <- parent basis, to the "
-                   f"{len(ki)} kept centroid rows")
+    # On a downfolded bundle ``initialize_wfns`` evaluates the one whole-state
+    # basis directly at ``keep_idx``.  B_at_mu is therefore born in the child
+    # mu basis; no parent-width intermediate or after-the-fact slice exists.
     assert nk == zx["nk"] and ns == zx["ns"], \
         (f"htransform window (nk={nk}, ns={ns}) != zeta-fit window "
          f"(nk={zx['nk']}, ns={zx['ns']})")
@@ -2752,9 +2742,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             f"forward:\n"
             f"  * set the deck's nval/ncond to the GW run's "
             f"({zx['nb']} bands total); --n-val/--n-cond still choose the BSE "
-            f"window inside it.  Needs n_mu,parent*n_s >= nk*(nb + n_guard) = "
-            f"{zx['nk'] * (zx['nb'] + n_guard)} for the htransform Galerkin "
-            f"leg (the guards are inside the bound too);\n"
+            f"window inside it.  The guards also enter the whole-state QRCP "
+            f"fit, whose printed search/projection receipts decide whether "
+            f"that wider state set is represented;\n"
             f"  * or ``--refit-window=bse``, which fits ζ' on the DECK's "
             f"window instead (the BSE window plus its guard bands) and "
             f"certifies on the CONTRACTED object — on-grid BSE eigenvalues, "

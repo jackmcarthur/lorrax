@@ -116,7 +116,7 @@ def env_float(name: str, default: float, *, print_fn=print,
     ``ISDF_CHUNK_TARGET_UTILIZATION`` parser used to commit.
 
     ``refuse=True`` is for knobs that GATE correctness rather than tune
-    performance (``LORRAX_FH_ORTHO_TOL``): running with the default while
+    performance (``LORRAX_FI_FSHOULDER_TOL``): running with the default while
     the user believes a gate threshold is in force is itself the silent
     failure, so garbage refuses loudly, naming the variable — the
     announce-or-refuse doctrine's refuse half.

@@ -16,11 +16,10 @@ hope with an assert in front of it.
      table.  A downfolded bundle carried none, and the deck's ``centroids_file``
      names the parent's — which is not in the child's directory.  Failure was a
      bare ``FileNotFoundError`` out of ``np.loadtxt``.
-  2. THE BASIS THE FIT RUNS IN.  That Galerkin fit needs a basis spanning
-     ``nk*nb`` (1280 on that deck) — a completely different criterion from the
-     retained window's pair-density rank that mu_S = 189 was chosen against.
-     The fit must therefore run in the PARENT basis and be SLICED to the kept
-     rows afterwards; the restart's mu is the authority on the result.
+  2. THE CHILD EVALUATION POINTS.  The one whole-state QRCP basis is selected
+     from full Bloch states, then evaluated directly at the downfold's ordered
+     child centroid rows.  No parent-width projected wavefunction is formed;
+     the restart's mu remains the authority on the result.
   3. ZETA.  Off-grid exchange interpolates a stored ``zeta_q.h5``, which the
      downfold did not write.  It transports as ``zeta_S = conj(T) zeta_L`` —
      the head vector's map at every G rather than only at G = 0 — and that is
@@ -166,7 +165,7 @@ def test_a_downfolded_bundle_with_no_resolvable_parent_table_refuses(tmp_path):
     msg = str(exc.value)
     assert "downfolded bundle" in msg
     assert "parent_centroids_file" in msg
-    assert "nk*nb" in msg
+    assert "coordinate authority" in msg
 
 
 def test_a_deck_table_of_the_parents_size_is_accepted_over_nothing(tmp_path):
@@ -220,7 +219,7 @@ class _Bundle:
         self.enk_full = eps
 
 
-def _stacks_case(mu_src, mu_out, keep_idx, *, nQ=2, nk=2, nc=2, ns=1):
+def _stacks_case(mu_src, mu_out, *, nQ=2, nk=2, nc=2, ns=1):
     """The driver call, with ``n_rmu_pad`` resolved the way the driver does.
 
     ``mu_out`` used to be passed as BOTH the logical μ and the padded μ,
@@ -239,8 +238,7 @@ def _stacks_case(mu_src, mu_out, keep_idx, *, nQ=2, nk=2, nc=2, ns=1):
     eps = jnp.asarray(rng.normal(size=(nQ * nk, nc)))
     xb = _driver()
     out = xb.build_conduction_stacks(
-        _Bundle(psi, eps), nQ, nk, nc, nc, mu_out, _mu_pad(mu_out), mesh,
-        keep_idx=keep_idx)
+        _Bundle(psi, eps), nQ, nk, nc, nc, mu_out, _mu_pad(mu_out), mesh)
     got = np.asarray(jax.device_get(out[0]))
     assert np.array_equal(got[..., mu_out:],
                           np.zeros_like(got[..., mu_out:])), (
@@ -248,22 +246,6 @@ def _stacks_case(mu_src, mu_out, keep_idx, *, nQ=2, nk=2, nc=2, ns=1):
         "restriction — a pad carrying data would make every identity below "
         "depend on where the mesh happened to put the boundary")
     return np.asarray(psi), got[..., :mu_out]
-
-
-def test_the_conduction_caches_are_the_parent_fit_sliced_to_the_kept_rows():
-    """THE FIX FOR MECHANISM 2, stated as the identity it is.
-
-    The downfold defines the small basis's psi-at-centroids as a LITERAL
-    COLUMN SLICE of the parent's (``downfold.md``, ``mode = cur``).  psi at
-    finite Q is the same object at a different momentum, so the same slice is
-    the whole answer — the htransform runs at mu_L, where it has the span it
-    needs, and the kept columns are taken afterwards.
-    """
-    keep = [5, 0, 3]
-    psi, got = _stacks_case(8, len(keep), keep)
-    want = psi.reshape(2, 2, 2, 1, 8)[..., keep]
-    assert got.shape[-1] == len(keep)
-    assert np.array_equal(got, want)
 
 
 def test_an_unsliced_parent_width_cache_is_refused_by_the_restarts_mu():
@@ -275,7 +257,7 @@ def test_an_unsliced_parent_width_cache_is_refused_by_the_restarts_mu():
     restart's mu is the authority; everything else asserts against it.
     """
     with pytest.raises(ValueError, match="restart bundle stores mu"):
-        _stacks_case(8, 3, None)
+        _stacks_case(8, 3)
 
 
 def test_the_unsliced_path_is_bit_identical_when_nothing_was_downfolded():
@@ -284,7 +266,7 @@ def test_the_unsliced_path_is_bit_identical_when_nothing_was_downfolded():
     A natively-fitted bundle's htransform width already equals the restart's
     mu, so the new argument must be a no-op there — not "close", identical.
     """
-    psi, got = _stacks_case(8, 8, None)
+    psi, got = _stacks_case(8, 8)
     assert np.array_equal(got, psi.reshape(2, 2, 2, 1, 8))
 
 
