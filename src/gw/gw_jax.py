@@ -1023,6 +1023,7 @@ def main(argv=None):
 			# decision is made where the data is written, through
 			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
 			sym=sym,
+			wfn=wfn,
 			write_qp_rotations=not rotations_written,
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,

@@ -4363,6 +4363,7 @@ def dump_qp_wfn_artifacts(
             kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
             k_storage=str(qp_rotations_k_storage),
             star_tables=_sm.star_tables_of(sym),
+            source_wfn=wfn,
             print_fn=print_fn,
         )
     barrier("qp_wfn_h5_write")
