@@ -29,40 +29,25 @@ matrix below.
 
 | Config | OS | CUDA | JAX | MPI | parallel HDF5 | Runtime | FFI features | Tested |
 |---|---|---|---|---|---|---|---|---|
-| **Pure-JAX (no FFI)** | any | 13 or none | ≥0.7,<0.10 | — | — | bare venv | none (serial only) | CI / CPU |
-| **NERSC Perlmutter (reference)** | SLES 15 | 12.9 (staged native libs) | **0.7.0** (container `ghcr.io/nvidia/jax:jax-2025-07-21`; inside the declared window — see below) | Cray MPICH | cray-hdf5-parallel | Shifter | all | 1–4 nodes × 4 A100 |
-| **Generic Cray EX** | — | 12.x/13.x | ≥0.7,<0.10 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
-| **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.7,<0.10 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
+| **Pure-JAX (no FFI)** | any | 13 or none | ≥0.9,<0.10 | — | — | bare venv | none (serial only) | CI / CPU |
+| **NERSC Perlmutter (reference)** | SLES 15 | 13.2 | **0.9.1** (`lorrax_A`) | Cray MPICH / NCCL | cray-hdf5-parallel | bare host | CUDA FFI + pinned PHDF5 build | 1–4 nodes × 4 A100 |
+| **Generic Cray EX** | — | 12.x/13.x | ≥0.9,<0.10 | Cray MPICH | cray-hdf5-parallel | Apptainer | all | untested |
+| **Generic SLURM + OpenMPI** | Linux x86_64 | 12.x/13.x | ≥0.9,<0.10 | OpenMPI 4/5 + UCX | conda-forge `hdf5=*mpi_openmpi*` | Apptainer / bare venv | all | untested |
 
 Only the pure-JAX path works with **zero native libs**. Everything distributed needs the
 [FFI native-library stack](ffi-native-libs.md).
 
-!!! note "The reference platform's JAX version — resolved 2026-08-06"
-    This section used to warn that the reference platform ran *below* the declared
-    floor: `pyproject.toml` said `jax>=0.9.0` while the Perlmutter container shipped
-    the 0.5.3 line, and nothing enforced it. Both halves are now closed, in opposite
-    directions, and the reason the fix was not simply "raise the container" is worth
-    keeping:
+!!! note "The reference platform's JAX version — resolved 2026-08-25"
+    LORRAX requires the JAX/JAXLIB 0.9 series everywhere.  Perlmutter's
+    `lorrax_A` module supplies 0.9.1 with CUDA 13.2, and the tracked lock file
+    resolves the same patch release.  `tools/require_jax09.py` checks package
+    metadata before the first driver import; `runtime.jax_support.enforce()`
+    independently checks both packages and the private compile-cache API before
+    the first physics `jit`.  There is no unsupported-version escape hatch.
 
-    **No NVIDIA JAX container exists with both JAX ≥ 0.9 and CUDA 12** — ten tags
-    probed 2026-08-06, and the CUDA 12→13 flip lands three minor versions *before*
-    JAX reaches 0.9. Everything staged for Perlmutter (cuSOLVERMp 0.7.2_cuda12.9,
-    the CUDA-12 `libmpi_gtl_cuda`, the device `liblorrax_ffi.so` itself) is CUDA 12,
-    so a 0.9 floor was unsatisfiable on the reference platform *by construction*.
-
-    So the container moved **up** to the last CUDA-12 image,
-    `ghcr.io/nvidia/jax:jax-2025-07-21` (JAX **0.7.0**, CUDA 12.9), and the declared
-    range moved **down and closed**, to `jax>=0.7.0,<0.10.0` in all three
-    `pyproject.toml` sites. 0.7.0 is not an arbitrary floor: it is where
-    `jax.shard_map`, `lax.pvary` and varying-manual-axes tracking inside `shard_map`
-    all arrive, and where every `jax._src` private this tree patches reaches the
-    shape it has on 0.9.
-
-    **It is now enforced.** `runtime.jax_support.enforce()` runs at step 5b of
-    `runtime.initialize_communicator_stack` — after the backend exists, before the
-    first `jit` — and refuses a JAX outside the window or with an unexpected
-    `jax._src` shape, naming the fix. `LORRAX_JAX_UNSUPPORTED_OK=1` is the one
-    declared, announced escape.
+    The former CUDA-12/JAX-0.7 Shifter lane is historical evidence, not an
+    installation option.  The legacy installer and FFI header-staging scripts
+    no longer default to that image and explicitly refuse its known tags.
 
     The symptom this replaces, for anyone who meets it on an old image: a
     `UserWarning` on the first jit and a **silently dead persistent compile cache** —
@@ -110,7 +95,7 @@ uv run python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
 
 `uv sync` installs the GPU build by default: the package offers
 `jax[cuda12]` and `jax[cuda13]` extras, both pinned to the same window
-`>=0.7.0,<0.10.0`, and the wheels bundle the CUDA runtime (no system CUDA install
+`>=0.9.0,<0.10.0`, and the wheels bundle the CUDA runtime (no system CUDA install
 needed; a recent NVIDIA driver is required). Note this whole track is a *bare-host*
 install and is **not** how the Perlmutter GPU leg runs — that leg takes JAX and its
 CUDA plugin from the Shifter image (Track 2) and pip-installs nothing. See the note
@@ -118,11 +103,11 @@ in `pyproject.toml`, which is authoritative for all Python-side pins.
 
 ## Track 2 — container
 
-LORRAX runs inside the NVIDIA JAX image (`ghcr.io/nvidia/jax:jax-2025-07-21`, JAX 0.7.0
-/ CUDA 12.9; `config/perlmutter/site_config.sh` owns the tag). On NERSC the
-container runtime is **Shifter** (see [Perlmutter](perlmutter.md)); on other clusters use
-**Apptainer** or **Singularity**. The container provides JAX + CUDA; LORRAX `src/` and the
-staged native libraries are bind-mounted in.
+A container deployment must explicitly choose an image carrying JAX/JAXLIB
+0.9 and a CUDA major matching its native FFI build.  The tracked Perlmutter
+Shifter template deliberately has no image default; Perlmutter production uses
+the `lorrax_A` bare-host CUDA-13 module instead.  On other clusters use
+**Apptainer** or **Singularity** and retain the same preflight/runtime gates.
 
 !!! note "TODO"
     A worked, copy-paste Apptainer/Singularity invocation (image pull, `--nv`, the

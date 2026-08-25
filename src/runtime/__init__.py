@@ -6,6 +6,7 @@ before any physics runs::
     from runtime import initialize_communicator_stack
     RUNTIME = initialize_communicator_stack()   # BEFORE ``import jax``
     import jax
+    import jaxlib
     ...
     mesh_xy = RUNTIME.mesh
 
@@ -1771,9 +1772,8 @@ def _enforce_supported_jax(say) -> None:
     excepthook is already installed (step 0), so a refusal on any rank exits
     the job non-zero with the message at the top of the log.
 
-    ``LORRAX_JAX_UNSUPPORTED_OK=1`` downgrades every refusal to one announced
-    line — the module's single declared silence, and it is announced on rank 0
-    rather than swallowed.
+    There is no unsupported-version escape hatch.  JAX and JAXLIB must both
+    resolve to the 0.9 series for every driver invocation.
     """
     _enforce_jax_support(announce=say)
 
@@ -2002,6 +2002,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     exception text.
     """
     import jax
+    import jaxlib
 
     f: dict = {}
     f["demotions"] = list(_DEMOTIONS)
@@ -2028,6 +2029,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["matmul_precision"] = read_matmul_precision()
     f["matmul_precision_env"] = os.environ.get(_MATMUL_PRECISION_ENV)
     f["jax_version"] = getattr(jax, "__version__", "unknown")
+    f["jaxlib_version"] = getattr(jaxlib, "__version__", "unknown")
 
     f["backend"] = jax.default_backend()
     f["process_index"] = int(jax.process_index())
@@ -2156,7 +2158,8 @@ def format_startup_report(f: dict) -> list:
     add(f"  The JAX platform resolved to {f['backend']!r} on devices of kind "
         f"{f['device_kind']!r}, from JAX_PLATFORMS="
         f"{f.get('jax_platforms_env')!r}, under jax "
-        f"{f.get('jax_version')} with 64-bit values "
+        f"{f.get('jax_version')} / jaxlib {f.get('jaxlib_version')} with "
+        f"64-bit values "
         f"{'enabled' if f.get('x64') else 'DISABLED'}.")
     # The precision line is UNCONDITIONAL, including when it is fine: an
     # unpinned f32/c64 dot is TF32 on XLA:GPU (1.9e-04 against 3.2e-07
@@ -2501,7 +2504,8 @@ def format_production_startup_report(f: dict) -> list:
          f"mesh {int(gx)}x{int(gy)}"),
         (f"Hardware       | {kind} | {nlocal} device"
          f"{'s' if nlocal != 1 else ''}/rank | {affinity_text}"),
-        (f"Environment    | JAX {f.get('jax_version', 'unknown')} | "
+        (f"Environment    | JAX/JAXLIB {f.get('jax_version', 'unknown')}/"
+         f"{f.get('jaxlib_version', 'unknown')} | "
          f"{collective} collectives | {x64}"),
     ]
     if elapsed is not None:

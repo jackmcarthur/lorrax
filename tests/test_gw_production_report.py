@@ -53,6 +53,7 @@ def _runtime():
         "mesh_shape": (2, 2),
         "threads": {"affinity": 16, "OMP_NUM_THREADS": "8"},
         "jax_version": "0.test",
+        "jaxlib_version": "0.testlib",
         "x64": True,
         "ffi_dials": [
             {"env": "LORRAX_FFT_FFI", "enabled": True,
@@ -136,6 +137,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     text = report_path.read_text(encoding="utf-8")
     assert text == "\n".join(output) + "\n"
     assert "MPI ranks      : 4" in text
+    assert "JAX/JAXLIB     : 0.test / 0.testlib" in text
     assert "Godby-Needs plasmon-pole GW" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
     assert "Coulomb system : 2D slab; Hartree source=auto" in text

@@ -180,7 +180,8 @@ class GWProductionReport:
             (f.get("collectives") or {}).get("impl", "local")).upper()
 
         self.heading("Numerical environment")
-        self.emit(f"JAX execution  : {f.get('jax_version', 'unknown')} | "
+        self.emit(f"JAX/JAXLIB     : {f.get('jax_version', 'unknown')} / "
+                  f"{f.get('jaxlib_version', 'unknown')} | "
                   f"{precision} | {collectives} collectives")
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
         self.emit(f"ISDF solve     : {config.backend.charge_zeta_solve} | "

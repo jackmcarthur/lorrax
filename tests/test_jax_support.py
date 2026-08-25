@@ -43,9 +43,9 @@ from runtime import jax_support as js  # noqa: E402
 
 # ---------------------------------------------------------------- version leg
 @pytest.mark.parametrize("vi,supported", [
-    ((0, 7, 0), True),     # the Perlmutter GPU container from 2026-08-06
-    ((0, 7, 2), True),
-    ((0, 9, 1), True),     # the Frontera venv
+    ((0, 7, 0), False),    # retired CUDA-12 launcher
+    ((0, 7, 2), False),
+    ((0, 9, 1), True),     # current Perlmutter/Frontera generation
     ((0, 9, 99), True),
     ((0, 10, 0), False),   # above the window
     ((0, 6, 9), False),    # below the floor: no VMA tracking, no lax.pvary
@@ -56,6 +56,8 @@ def test_version_window(monkeypatch, vi, supported):
         "version": ".".join(map(str, vi)), "version_info": vi,
         "release_version": None, "is_dev_build": True,
         "file": "/fake/jax/__init__.py", "shard_map_top_level": False,
+        "jaxlib_version": "0.9.1", "jaxlib_version_info": (0, 9, 1),
+        "jaxlib_file": "/fake/jaxlib/__init__.py",
     })
     problems = js.check_version()
     assert (problems == []) is supported, problems
@@ -71,9 +73,11 @@ def test_dev_stamp_does_not_smuggle_a_bad_version_through(monkeypatch):
         "version": "0.5.3.dev20260806", "version_info": (0, 5, 3),
         "release_version": None, "is_dev_build": True,
         "file": "/opt/jax/jax/__init__.py", "shard_map_top_level": False,
+        "jaxlib_version": "0.9.1", "jaxlib_version_info": (0, 9, 1),
+        "jaxlib_file": "/fake/jaxlib/__init__.py",
     })
     problems = js.check_version()
-    assert problems, "a 0.5.3 dev build must not satisfy a >=0.7.0 floor"
+    assert problems, "a 0.5.3 dev build must not satisfy the 0.9-series gate"
     assert "0.5.3.dev20260806" in problems[0]
 
 
@@ -81,8 +85,23 @@ def test_empty_version_info_refuses(monkeypatch):
     monkeypatch.setattr(js, "describe", lambda: {
         "version": "weird", "version_info": (), "release_version": None,
         "is_dev_build": True, "file": "/x", "shard_map_top_level": False,
+        "jaxlib_version": "0.9.1", "jaxlib_version_info": (0, 9, 1),
+        "jaxlib_file": "/fake/jaxlib/__init__.py",
     })
     assert js.check_version(), "an unidentifiable jax must not pass"
+
+
+def test_jaxlib_must_independently_be_in_the_09_series(monkeypatch):
+    monkeypatch.setattr(js, "describe", lambda: {
+        "version": "0.9.1", "version_info": (0, 9, 1),
+        "release_version": "0.9.1", "is_dev_build": False,
+        "file": "/fake/jax/__init__.py", "shard_map_top_level": True,
+        "jaxlib_version": "0.8.2", "jaxlib_version_info": (0, 8, 2),
+        "jaxlib_file": "/wrong/jaxlib/__init__.py",
+    })
+    problems = js.check_version()
+    assert len(problems) == 1
+    assert "jaxlib 0.8.2" in problems[0]
 
 
 # ------------------------------------------------------------ private arity leg
@@ -132,7 +151,6 @@ def test_absent_private_symbol_is_detected(monkeypatch):
 
 # ------------------------------------------------------------------ enforce leg
 def test_enforce_refuses_with_the_standard_shape(monkeypatch):
-    monkeypatch.delenv(js.OVERRIDE_ENV, raising=False)
     monkeypatch.setattr(js, "check_version", lambda: ["jax 0.5.3 from /opt/jax"])
     monkeypatch.setattr(js, "check_private_arity", lambda: [])
     monkeypatch.setattr(js, "check_private_symbols", lambda: [])
@@ -144,29 +162,17 @@ def test_enforce_refuses_with_the_standard_shape(monkeypatch):
     assert js.RULE_UNSUPPORTED_VERSION in text
 
 
-def test_override_downgrades_to_one_announced_line(monkeypatch):
-    monkeypatch.setenv(js.OVERRIDE_ENV, "1")
+def test_unsupported_version_cannot_be_downgraded(monkeypatch):
     monkeypatch.setattr(js, "check_version", lambda: ["jax 0.5.3"])
     monkeypatch.setattr(js, "check_private_arity", lambda: [])
     monkeypatch.setattr(js, "check_private_symbols", lambda: [])
     said = []
-    js.enforce(announce=said.append)  # must NOT raise
-    assert len(said) == 1 and js.OVERRIDE_ENV in said[0], said
-
-
-def test_override_must_be_exactly_1_not_any_truthy_string(monkeypatch):
-    """'0', 'false', 'no' must NOT disable the gate."""
-    monkeypatch.setattr(js, "check_version", lambda: ["jax 0.5.3"])
-    monkeypatch.setattr(js, "check_private_arity", lambda: [])
-    monkeypatch.setattr(js, "check_private_symbols", lambda: [])
-    for val in ("0", "false", "no", ""):
-        monkeypatch.setenv(js.OVERRIDE_ENV, val)
-        with pytest.raises(js.JaxSupportError):
-            js.enforce()
+    with pytest.raises(js.JaxSupportError):
+        js.enforce(announce=said.append)
+    assert said == []
 
 
 def test_clean_environment_does_not_refuse(monkeypatch):
-    monkeypatch.delenv(js.OVERRIDE_ENV, raising=False)
     monkeypatch.setattr(js, "check_version", lambda: [])
     monkeypatch.setattr(js, "check_private_arity", lambda: [])
     monkeypatch.setattr(js, "check_private_symbols", lambda: [])
@@ -178,7 +184,9 @@ def test_describe_reports_the_real_jax():
     """Scope: this asserts the SHAPE of describe(), not that jax is supported."""
     d = js.describe()
     assert set(d) >= {"version", "version_info", "release_version",
-                      "is_dev_build", "file", "shard_map_top_level"}
+                      "is_dev_build", "file", "jaxlib_version",
+                      "jaxlib_version_info", "jaxlib_file",
+                      "shard_map_top_level"}
     assert isinstance(d["version"], str) and d["version"]
 
 

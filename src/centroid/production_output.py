@@ -71,7 +71,8 @@ def format_kmeans_report(*, header: str, source_wfn: str,
         "",
         "NUMERICAL ENVIRONMENT",
         "---------------------",
-        f"JAX execution  : {facts.get('jax_version', 'unknown')} | "
+        f"JAX/JAXLIB     : {facts.get('jax_version', 'unknown')} / "
+        f"{facts.get('jaxlib_version', 'unknown')} | "
         f"{'FP64 / complex128' if facts.get('x64') else 'FP32 / complex64'}",
         f"Wavefunctions  : {wfn_backend} reader",
         "Selection      : density-weighted k-means on the real-space FFT grid",

@@ -1,6 +1,6 @@
 # Perlmutter (NERSC)
 
-*The Shifter/GPU reference platform. Authoritative for module mechanics
+*The bare-host CUDA-13/JAX-0.9 reference platform. Authoritative for module mechanics
 and porting knobs: [`config/README.md`](../../../config/README.md). This
 page holds the runtime environment: the Lmod module, the FFI staging
 contract, multi-host topology — and an honest statement of what has and
@@ -84,19 +84,17 @@ actually inherit.
 > in the current directory, and only falls back to `$LORRAX_ROOT/tests` when
 > `cwd` has no `tests/`.
 >
-> One pairing is worth writing down because it costs an afternoon to find. The
-> default base module's image ships JAX 0.5.3, which current `main` **refuses**
-> (`REFUSED: jax-support.version … want jax >= 0.7.0, < 0.10.0`), so a current
-> checkout needs `LX_BASE_MODULE=lorrax_J070` for the
-> `ghcr.io/nvidia/jax:jax-2025-07-21` image. That module swaps the image only —
-> its `LORRAX_ROOT` still points at `lorrax_P` — so the working combination for
-> running current source on this machine is both variables together, plus an
-> FFI library built from that same checkout:
+> Current source requires the 0.9 series for both JAX and JAXLIB.  Select the
+> deployed bare-host CUDA-13 lane and pin the source checkout independently:
 >
 > ```bash
-> export LX_BASE_MODULE=lorrax_J070
+> export LX_BASE_MODULE=lorrax_A
 > export LORRAX_CHECKOUT=/path/to/your/checkout
 > ```
+>
+> `tools/require_jax09.py` must run before the first driver import.  The driver
+> repeats the version check internally, so an old module or copied launcher
+> refuses even if the preflight was omitted.
 
 ### Do not start from `module load lorrax`
 

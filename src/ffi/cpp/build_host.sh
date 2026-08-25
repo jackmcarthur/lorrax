@@ -23,11 +23,9 @@
 #   LORRAX_SLATE_HOST_INSTALL_DIR  SLATE none-backend install
 #                                  (default $HOME/software/slate_builds/cpu/install)
 #   LORRAX_XLA_FFI_HEADERS_DIR     pre-staged header dir (skips staging)
-#   LORRAX_FFI_HOST_IMAGE          Shifter image to stage headers from
-#                                  (default ghcr.io/nvidia/jax:jax-2025-07-21,
-#                                  the tag config/perlmutter/site_config.sh
-#                                  runs; these headers must come from the
-#                                  image the .so will be LOADED under)
+#   LORRAX_FFI_HOST_IMAGE          required Shifter image to stage headers
+#                                  from. It must be the JAX-0.9 image under
+#                                  which the .so will be loaded.
 
 set -euo pipefail
 
@@ -81,12 +79,19 @@ fi
 
 BUILD_DIR="${LORRAX_FFI_HOST_BUILD_DIR:-${SCRIPT_DIR}/build_host}"
 SLATE_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
-# Keep in step with LORRAX_IMAGE in config/perlmutter/site_config.sh, which
-# owns the tag and the reason for it.  Staging headers from a DIFFERENT image
-# than the run uses is exactly the skew this default exists to avoid: the
-# staged dir is keyed on the tag, so a stale default silently compiles the
-# host leg against another generation's xla/ffi headers.
-IMAGE="${LORRAX_FFI_HOST_IMAGE:-ghcr.io/nvidia/jax:jax-2025-07-21}"
+# Staging headers from a different generation is an ABI skew.  Do not hide
+# that choice behind a default—the old default was a retired JAX-0.7 image.
+IMAGE="${LORRAX_FFI_HOST_IMAGE:-}"
+if [[ -z "${IMAGE}" ]]; then
+    echo "[build_host] LORRAX_FFI_HOST_IMAGE is required (JAX 0.9)." >&2
+    exit 2
+fi
+case "${IMAGE}" in
+    *jax-2025-07-21*|*25.04-py3*)
+        echo "[build_host] refusing retired pre-0.9 image ${IMAGE}." >&2
+        exit 2
+        ;;
+esac
 IMAGE_TAG="${IMAGE##*:}"
 HDR_DIR="${LORRAX_XLA_FFI_HEADERS_DIR:-$HOME/software/lorrax_xla_ffi_headers/${IMAGE_TAG}}"
 

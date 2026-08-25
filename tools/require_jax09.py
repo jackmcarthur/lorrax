@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse a certified CPU-MPI launch unless JAX and jaxlib are 0.9.x.
+"""Refuse any LORRAX launch unless JAX and JAXLIB are 0.9.x.
 
 Package metadata is inspected without importing JAX, so this preflight cannot
 initialize a CPU client, start distributed coordination, or consume the one
@@ -35,7 +35,7 @@ def main() -> int:
     if override.strip().lower() not in _FALSE_VALUES:
         print(
             "JAX09_ENV_REFUSED: LORRAX_JAX_UNSUPPORTED_OK is enabled; "
-            "unsupported-JAX overrides are forbidden for certified CPU-MPI runs",
+            "unsupported-JAX overrides are forbidden for LORRAX drivers",
             file=sys.stderr,
         )
         return 86
@@ -58,8 +58,8 @@ def main() -> int:
             file=sys.stderr,
         )
         print(
-            "Fix: prepend the documented CPU JAX 0.9 virtual environment to "
-            "PATH before invoking lx.",
+            "Fix: on Perlmutter select LX_BASE_MODULE=lorrax_A; elsewhere "
+            "activate the documented JAX/JAXLIB 0.9 environment before launch.",
             file=sys.stderr,
         )
         return 86

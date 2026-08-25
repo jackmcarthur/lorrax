@@ -224,18 +224,17 @@ is fine, so "pinned" and "nobody looked" do not read alike.
 
 ## 2. JAX configuration (all platforms)
 
-> ### The two machines are on different JAX versions, inside one declared window
+> ### One JAX generation on every machine
 >
-> **Frontera's venv is jax 0.9.1. Perlmutter's GPU container
-> (`ghcr.io/nvidia/jax:jax-2025-07-21`) is jax 0.7.0.** `pyproject.toml`
-> declares `jax>=0.7.0,<0.10.0`, `runtime/jax_support.py` declares the same
-> window in `SUPPORTED_MIN`/`SUPPORTED_MAX_EXCLUSIVE`, a test fails if the two
-> drift apart, and **it is enforced at startup** — `jax_support.enforce()` at
-> step 5b of `runtime.initialize_communicator_stack`, after the backend exists
-> and before the first `jit`. `LORRAX_JAX_UNSUPPORTED_OK=1` is the one
-> declared, announced escape.
+> **Frontera and Perlmutter both run JAX/JAXLIB 0.9; the deployed Perlmutter
+> `lorrax_A` lane is 0.9.1 on bare-host CUDA 13.2.** `pyproject.toml` and
+> `runtime/jax_support.py` both declare `[0.9.0, 0.10.0)`, a test fails if
+> they drift, and the runtime checks **both** JAX and JAXLIB before the first
+> physics `jit`.  The tracked `tools/require_jax09.py` preflight gives launch
+> scripts an independent pre-import check.  There is no unsupported-version
+> escape hatch.
 >
-> **History, because the shape of the old problem explains the shape of the
+> **Historical record, because the shape of the old problem explains the
 > fix.** Until 2026-08-06 Perlmutter ran **0.5.3** against a declared floor of
 > **0.9.0** with nothing checking it — `__version__` appeared once in `src/`,
 > at `runtime/__init__.py`, *recording* the version into the run fingerprint
@@ -306,7 +305,10 @@ is fine, so "pinned" and "nobody looked" do not read alike.
 > 
 > **Divergence (1) is now two symbols, and it is not a version difference at all.**  `compilation_cache.VerificationCache` and `config.compilation_cache_check_contents` are absent from **every NVIDIA JAX container at every tag** — ten probed, 0.5.3 through 0.9.1 — and present only in the released wheel.  Every other `jax._src` private this tree patches has the *same shape* on 0.7.0 and 0.9.1: `_hash_accelerator_config` 2 params, `_hash_serialized_compile_options` 3, `get_executable_and_time` 4, `is_executable_in_cache` 2, `backend_compile_and_load` present.  That is why `common/jax_compile_cache.py` carries **one** narrow guard where it used to carry five, and why the other four were deleted rather than kept as a permanent compatibility layer for an abandoned version.
 > 
-> **Status.**  Both halves are **merged** into `integration/2026-08-07` (2026-08-06): `agent/vma-pvary-marking-2026-08-06` @ `8e6e083` (`src/common/vma.py` owns the version decision once and refuses at import on a jax that tracks VMA but offers neither spelling), then `agent/jax-070-land-2026-08-06` @ `ace2d51` (container moves to jax 0.7.0 / CUDA 12.9, `common/jax_support.py` gates the window at `[0.7.0, 0.10.0)`, four of the five compile-cache shims deleted), then `agent/shard-map-modern-2026-08-06` @ `9a4a8d5` (all 94 `shard_map` sites routed through `common/shard_map.py`).  **Not yet an ancestor of `origin/main`** — check with `git merge-base --is-ancestor` before citing it as landed.  The startup version gate was already in (`agent/jax-version-gate-2026-08-06`).
+> **Historical landing status (2026-08-06).**  The 0.7 compatibility work
+> moved through `integration/2026-08-07`; it is not current launch guidance.
+> The 2026-08-25 hardening subsequently restored the runtime/package floor to
+> 0.9 after the CUDA-13 lane became the Perlmutter production environment.
 >
 > **The FFI headers move but the ABI does not.** `XLA_FFI_API_MAJOR`/`MINOR`
 > are `0`/`1` on both images; the three `xla/ffi/api/*.h` differ only by
@@ -330,7 +332,7 @@ is fine, so "pinned" and "nobody looked" do not read alike.
 > [`ffi_layout.md`](../architecture/ffi_layout.md)). That is a port, not a pin
 > change.
 >
-> **But the exit is not to 0.9 — it is to 0.7.0, and that image does exist.**
+> **Historical CUDA-12 exit.** At that time the available exit was 0.7.0:
 > `ghcr.io/nvidia/jax:jax-2025-07-21` ships jax 0.7.0 on CUDA 12.9 and is the
 > **last CUDA-12 image**. It clears the VMA divergence above and lets the
 > supported window be `[0.7.0, 0.10.0)` — a window both machines can meet —

@@ -59,6 +59,7 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
         "device_kind": "NVIDIA A100-SXM4-40GB",
         "mesh_shape": (2, 2),
         "jax_version": "0.9.1",
+        "jaxlib_version": "0.9.1",
         "x64": True,
     })
     text = format_kmeans_report(
@@ -70,6 +71,7 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
 
     assert "MPI ranks      : 4" in text
     assert "Wavefunctions  : phdf5 reader" in text
+    assert "JAX/JAXLIB     : 0.9.1 / 0.9.1" in text
     assert "density fit: bands 1-40" in text
     assert "Selection wall : 12.500 s" in text
     assert "per-rank" not in text and "HDF5" not in text and "h5py" not in text

@@ -6,15 +6,15 @@ LORRAX on HPC clusters.
 ## Quick Start (Perlmutter)
 
 ```bash
-# 1. Edit site-specific paths (source dir, site-packages, container image)
-vi config/perlmutter/site_config.sh
-
-# 2. Install the module
-bash config/perlmutter/install.sh
-
-# 3. Start a new shell, then:
-module load lorrax
+export LX_BASE_MODULE=lorrax_A
+export LORRAX_CHECKOUT=/path/to/your/lorrax/checkout
+lx run "$LORRAX_CHECKOUT/tools/require_jax09.py"
+lx run python3 -u -m gw.gw_jax -i cohsex.in
 ```
+
+The legacy Shifter module installer has no container-image default.  If a
+site uses it, `LORRAX_IMAGE` must explicitly name a verified JAX-0.9 image;
+the installer refuses the retired JAX-0.5/0.7 tags.
 
 ## Usage
 

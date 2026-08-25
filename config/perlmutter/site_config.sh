@@ -28,33 +28,13 @@ LORRAX_SITE_PACKAGES="$HOME/software/lorrax_site"
 # for deps outside LORRAX src/ and site-packages.  Leave empty if not needed.
 LORRAX_DEPS=""
 
-# Shifter container image.
-#
-# 2026-08-06: moved off nvcr.io/nvidia/jax:25.04-py3 (JAX 0.5.3) to the JAX
-# 0.7.0 image.  Two hard constraints pick this exact tag and no other:
-#
-#   * FLOOR — 0.5.3 has no `jax.shard_map` and no `lax.pvary` at all
-#     (MEASURED in-container, both tags, this commit's evidence).  The owner's
-#     ruling: "I don't want to make everything compatible with jax 0.5.3 if it
-#     doesn't even have shard maps".
-#   * CEILING — the device FFI `.so` links CUDA 12 (cuSOLVERMp 0.7.2_cuda12.9,
-#     cuFFT/cuBLAS/cuSOLVER .so.12/.so.11).  `jax-2025-07-21` is the LAST
-#     CUDA-12 image in this family; the next tag (`jax-2025-08-25`, JAX 0.7.2)
-#     flips to CUDA 13 and `gate_one_mpi.sh` then fails with 22 unresolved
-#     sonames, while `LD_PRELOAD=/lorrax_slate/lib/libmpi_gtl_cuda.so.0`
-#     (CUDA-12-linked) kills the exec before python starts, rc=127 (CLAIMS
-#     111/112).  Going above this tag is a CUDA-13 rebuild of the whole native
-#     stack, not an image bump.
-#
-# So the reachable window is exactly [0.7.0, 0.7.2) on CUDA 12, and 0.7.0 is
-# the only tag in it.  jax >= 0.9 and CUDA 12 are mutually exclusive in this
-# image family — ten tags probed, no overlap (CLAIMS 111).
-#
-# Everything in the tree that branches on the JAX generation reads
-# `jax.version.__version_info__`, never `jax.__version__`: every container JAX
-# is a source build that restamps its display string with the date it is run
-# (this image prints `0.7.0.dev20260806` today).
-LORRAX_IMAGE="ghcr.io/nvidia/jax:jax-2025-07-21"
+# Shifter container image.  No default is intentional: the former default was
+# the retired CUDA-12/JAX-0.7 image, while current LORRAX requires JAX/JAXLIB
+# 0.9 and Perlmutter production uses the bare-host ``lorrax_A`` CUDA-13 lane.
+# A site that still installs this legacy Shifter module must name a verified
+# 0.9-series image explicitly; runtime/jax_support.py checks it again in the
+# driver before the first physics jit.
+LORRAX_IMAGE="${LORRAX_IMAGE:-}"
 
 # Modulefile install location.
 #   Personal: $HOME/modulefiles

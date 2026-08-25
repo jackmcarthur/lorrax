@@ -60,11 +60,22 @@ if [ ! -d "${LORRAX_SITE_PACKAGES:-}" ]; then
 fi
 
 MODULEFILE_DIR="${LORRAX_MODULEFILE_DIR:-$HOME/modulefiles}"
-# Fallback only — site_config.sh above sets LORRAX_IMAGE and owns the reason
-# for the tag (CUDA-12 ceiling / shard_map floor).  Kept in sync with it on
-# purpose: a stale fallback here silently reinstates the old JAX whenever
-# site_config.sh is trimmed.
-IMAGE="${LORRAX_IMAGE:-ghcr.io/nvidia/jax:jax-2025-07-21}"
+# Deliberately no image fallback.  A stale fallback here was able to reinstall
+# the retired JAX-0.7 lane after the package and run procedures moved to 0.9.
+IMAGE="${LORRAX_IMAGE:-}"
+if [ -z "$IMAGE" ]; then
+    echo "ERROR: LORRAX_IMAGE is unset. Current Perlmutter production uses" >&2
+    echo "       LX_BASE_MODULE=lorrax_A (JAX/JAXLIB 0.9, CUDA 13)." >&2
+    echo "       To install the legacy Shifter template, explicitly name a" >&2
+    echo "       verified JAX-0.9 image in LORRAX_IMAGE." >&2
+    exit 1
+fi
+case "$IMAGE" in
+    *jax-2025-07-21*|*25.04-py3*)
+        echo "ERROR: refusing retired pre-0.9 JAX image: $IMAGE" >&2
+        exit 1
+        ;;
+esac
 DEPS="${LORRAX_DEPS:-}"
 MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 

@@ -238,6 +238,7 @@ def _facts(**over):
         "matmul_precision": "highest",
         "matmul_precision_env": None,
         "jax_version": "0.9.1",
+        "jaxlib_version": "0.9.1",
         "mesh_shape": (4, 4),
         "mesh_axes": ("x", "y"),
         "demotions": [],
@@ -345,6 +346,7 @@ def test_production_startup_is_compact_and_has_no_library_inventory():
     assert "16 MPI ranks" in text
     assert "16 CPU devices" in text
     assert "mesh 4x4" in text
+    assert "JAX/JAXLIB 0.9.1/0.9.1" in text
     assert "28 CPU cores/rank" in text
     assert "FFI" not in text
     assert "HDF5" not in text

@@ -16,14 +16,11 @@ dependencies = [
     # Those two must agree with these specifiers; a floor nothing checks is
     # how the Perlmutter GPU leg came to run four minors below it unnoticed.
     #
-    # 0.7.0 floor (lowered from 0.9.0 on 2026-08-06): varying-manual-axes
-    # tracking inside shard_map starts there, `jax.shard_map` and `lax.pvary`
-    # exist from there, and — decisively — no NVIDIA JAX container has BOTH
-    # jax >= 0.9 and CUDA 12, while the Perlmutter device FFI .so links
-    # CUDA 12.  A 0.9 floor was unsatisfiable on that leg by construction.
-    # 0.10 ceiling: nothing above has been run on either leg.
-    "jax>=0.7.0,<0.10.0",
-    "jaxlib>=0.7.0,<0.10.0",
+    # One generation everywhere.  The tracked lock and Perlmutter module use
+    # 0.9.1; the series window permits patch releases while refusing old
+    # CUDA-12/JAX-0.7 launchers and unmeasured 0.10+ stacks at startup.
+    "jax>=0.9.0,<0.10.0",
+    "jaxlib>=0.9.0,<0.10.0",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
     "scipy>=1.16.0",
@@ -60,14 +57,10 @@ docs = [
 # CPU-ONLY installs need NEITHER extra: the base `jax`/`jaxlib` dependency is
 # the CPU build, which is what the host-platform FFI leg runs against.
 #
-# NEITHER EXTRA APPLIES TO THE PERLMUTTER *GPU* LEG, and the row above is
-# about a bare-host pip install there, not about how that leg actually runs.
-# It runs inside Shifter, where jax and its CUDA plugin come from the image
-# (`config/perlmutter/site_config.sh`), nothing is pip-installed, and the
-# image is CUDA **12**.9 with `jax_cuda12_plugin` — because the device FFI
-# .so links CUDA 12 and no image in this family pairs CUDA 12 with jax >= 0.9.
-cuda12 = ["jax[cuda12]>=0.7.0,<0.10.0"]
-cuda13 = ["jax[cuda13]>=0.7.0,<0.10.0"]
+# Perlmutter uses the bare-host CUDA-13/JAX-0.9 module; Frontera's RTX lane
+# uses the CUDA-12 extra.  Both remain in the same JAX generation.
+cuda12 = ["jax[cuda12]>=0.9.0,<0.10.0"]
+cuda13 = ["jax[cuda13]>=0.9.0,<0.10.0"]
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
@@ -151,8 +144,8 @@ jax = [
     # CPU/base only — see [project.optional-dependencies] cuda12 / cuda13 for
     # the per-site GPU variant.  Do not re-pin a CUDA major here.
     # Same window as [project.dependencies] and src/runtime/jax_support.py.
-    "jax>=0.7.0,<0.10.0",
-    "jaxlib>=0.7.0,<0.10.0",
+    "jax>=0.9.0,<0.10.0",
+    "jaxlib>=0.9.0,<0.10.0",
 ]
 build = [
     "scikit-build-core>=0.11.0",

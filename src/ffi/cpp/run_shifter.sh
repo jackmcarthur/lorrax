@@ -43,9 +43,8 @@
 #                          is enough for the CPU leg.
 #   LORRAX_MPICH_GPU_SUPPORT  0|1 — override the above outright.
 #   LORRAX_FFI_NVHPC_DIR   host path to the staged nvhpc subset.
-#   LORRAX_FFI_IMAGE       shifter image tag.  Default:
-#                          ghcr.io/nvidia/jax:jax-2025-07-21 (jax 0.7.0,
-#                          CUDA 12.9) -- the tag site_config.sh runs.
+#   LORRAX_FFI_IMAGE       required shifter image tag.  It must provide the
+#                          JAX/JAXLIB 0.9 series and match the native CUDA leg.
 #   LORRAX_NGPU            for srun-mode, # GPUs to request (default 1)
 #   LORRAX_NNODES          for srun-mode, # nodes
 #   LORRAX_NTASKS          for srun-mode, # total ranks
@@ -83,8 +82,19 @@ case "${LORRAX_MPICH_GPU_SUPPORT:-}" in
 esac
 
 NVHPC_HOST="${LORRAX_FFI_NVHPC_DIR:-$HOME/software/lorrax_nvhpc}"
-# config/perlmutter/site_config.sh owns this tag and the reason for it.
-IMAGE="${LORRAX_FFI_IMAGE:-ghcr.io/nvidia/jax:jax-2025-07-21}"
+# No fallback: silently selecting the retired JAX-0.7 image here bypassed the
+# environment consolidation until the in-process gate finally refused it.
+IMAGE="${LORRAX_FFI_IMAGE:-}"
+if [[ -z "${IMAGE}" ]]; then
+    echo "run_shifter.sh: LORRAX_FFI_IMAGE is required (JAX/JAXLIB 0.9)." >&2
+    exit 2
+fi
+case "${IMAGE}" in
+    *jax-2025-07-21*|*25.04-py3*)
+        echo "run_shifter.sh: refusing retired pre-0.9 image ${IMAGE}." >&2
+        exit 2
+        ;;
+esac
 NGPU="${LORRAX_NGPU:-1}"
 NTASKS="${LORRAX_NTASKS:-${NGPU}}"
 NNODES="${LORRAX_NNODES:-1}"

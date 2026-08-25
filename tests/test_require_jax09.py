@@ -1,4 +1,4 @@
-"""The documented CPU-MPI preflight is tracked and can refuse."""
+"""The documented all-driver JAX/JAXLIB preflight is tracked and can refuse."""
 from __future__ import annotations
 
 import importlib.util

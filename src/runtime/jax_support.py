@@ -1,27 +1,17 @@
-"""``jax_support`` — the STARTUP refusal for an unsupported JAX.
+"""Startup refusal for a JAX/JAXLIB stack outside the 0.9 series.
 
-Why this module exists
-----------------------
-``pyproject.toml`` declared ``jax>=0.9.0`` and nothing checked it, so on
-2026-08-06 the two production legs were measured to be running *different JAX
-generations*:
+This is the in-process backstop for the package constraints and the tracked
+``tools/require_jax09.py`` launch preflight.  All three must agree.  It checks
+both JAX and JAXLIB after backend initialization but before the first physics
+``jit``, then checks the private-API shapes used by the persistent compile
+cache.  There is no unsupported-version escape hatch: production and developer
+driver invocations run the same 0.9 contract.
 
-    Frontera CPU   jax 0.9.1                (release; ``_release_version='0.9.1'``)
-    Perlmutter GPU jax 0.5.3.dev20260806    (nvcr.io/nvidia/jax:25.04-py3, built
-                                             from source; ``_release_version=None``)
-
-The GPU leg ran four declared-minor-versions BELOW the project's own floor,
-and it was nobody's decision.  This module is the missing teeth, written to the
-same contract as :mod:`src.ffi.gate`: *an explicit request that cannot be
-honored REFUSES, naming the fix — it never silently downgrades.*
-
-Both halves of that skew are now closed, and in opposite directions.  The GPU
-leg moved UP, to ``ghcr.io/nvidia/jax:jax-2025-07-21`` (jax 0.7.0, the last
-CUDA-12 image in the family).  The declared floor moved DOWN, from 0.9.0 to
-0.7.0, because 0.9.0 was unreachable on CUDA 12 by construction — see
-:data:`SUPPORTED_MIN`.  The two legs are now jax 0.7.0 and jax 0.9.1, one
-declared window contains both, and every ``jax._src`` shape this tree patches
-was MEASURED identical on them.
+The stricter policy was restored on 2026-08-25 after a staged CUDA-12/JAX-0.7
+launcher survived an earlier environment consolidation.  The current
+Perlmutter lane is bare-host CUDA 13.2 with JAX/JAXLIB 0.9.1, so the former
+CUDA-12 reachability argument no longer applies.  Historical measurements of
+0.5/0.7 remain useful below only as negative controls for the API-shape gate.
 
 Why a version-number check ALONE would be the wrong instrument
 --------------------------------------------------------------
@@ -52,46 +42,13 @@ reason as ``ffi.gate.Gate.enforce`` one step later: refuse before anything
 compiles, never in the middle of a run.  It costs one ``inspect.signature``
 per hook.
 
-WIRED IN 2026-08-06 — and why it was right to wait until then
---------------------------------------------------------------
-This module spent a day deliberately unwired, for three reasons that were all
-correct at the time and are all gone now.  Recording them because "wire the
-gate" was recommended, then refused, then taken, and the difference each time
-was a measurement, not an opinion.
-
-1. **It was unsatisfiable on every image.**  Two required private symbols
-   (``VerificationCache``, ``compilation_cache_check_contents``) exist on no
-   NVIDIA container at any tag — ten probed, 0.5.3 through 0.9.1 — so wiring
-   it would have refused a correct stack for a reason having nothing to do
-   with that stack.  Removed 2026-08-06; see
-   :data:`REQUIRED_PRIVATE_SYMBOLS`.
-
-2. **The floor was unreachable.**  ``SUPPORTED_MIN`` was ``0.9.0`` while the
-   GPU leg ran 0.5.3 and no CUDA-12 image above 0.7.0 exists, so every GPU run
-   would have refused with no reachable remedy.  The leg is now on jax 0.7.0
-   and the floor is 0.7.0: MEASURED satisfiable, not asserted.
-
-3. **Every condition it tests was already handled elsewhere.**  While
-   ``common/jax_compile_cache.py`` carried five compatibility shims, the
-   arity/symbol clauses duplicated work the shims did quietly, so a refusal
-   keyed on them would have stopped runs that worked (that was the standing
-   ruling, and it was right).  **Four of those five shims are now deleted**
-   with jax 0.5.3 support.  That inverts the argument: the conditions are no
-   longer handled anywhere else, and unhandled they surface as a ``TypeError``
-   on the first ``jit`` — or, worse, as the silent variant, where
-   ``ensure_jax_compile_cache`` reported ``enabled=True`` over a cache writing
-   ZERO entries.  This gate is now the only thing standing between that class
-   of failure and a named startup refusal.
-
-So the gate and the shim removal are one decision, not two: the shims were
-per-call-site accommodation, this is a once-per-process assertion, and keeping
-both would be paying twice for one guarantee.
-
-MEASURED on both containers before wiring: on jax 0.7.0
-:func:`check_private_arity` and :func:`check_private_symbols` each return
-EMPTY and :func:`enforce` is clean; on jax 0.5.3 it refuses honestly, naming
-the version below the floor, the two wrong arities, and the absent
-``backend_compile_and_load``.
+Why the private-surface checks remain
+-------------------------------------
+The first version gate was wired in 2026-08-06 after four compatibility shims
+were removed from ``common/jax_compile_cache.py``.  The old 0.5 and 0.7
+measurements below are retained as negative controls: they prove that a
+version-stamped but API-incompatible build is rejected before compilation.
+They no longer define a supported production lane; only 0.9 does.
 
 WHY IT LIVES IN ``runtime/`` — moved from ``common/`` 2026-08-06
 ----------------------------------------------------------------
@@ -131,7 +88,7 @@ module scope with no jax anywhere in the chain.
 from __future__ import annotations
 
 import inspect
-import os
+import re
 from typing import Any
 
 __all__ = [
@@ -147,37 +104,12 @@ __all__ = [
 # The declared support window.  ONE place, and it is the thing pyproject.toml
 # means.  Widening it is a decision that should show up in a diff.
 #
-# FLOOR 0.7.0, lowered from 0.9.0 on 2026-08-06.  Not a relaxation of
-# standards — the opposite.  0.9.0 was a floor NO REACHABLE PERLMUTTER IMAGE
-# COULD MEET: the device FFI .so links CUDA 12, and no NVIDIA JAX image has
-# both jax >= 0.9 and CUDA 12 (ten tags probed; the CUDA 12 -> 13 flip happens
-# three minors before jax reaches 0.9).  A floor nothing can satisfy is not
-# enforcement, it is a permanent override, which is exactly why this gate sat
-# unwired.  0.7.0 is the floor the tree actually needs and can actually run:
-#
-#   * 0.5.3 has NO ``jax.shard_map`` and NO ``lax.pvary`` — the owner's
-#     ruling, and measured in-container.
-#   * varying-manual-axes tracking inside ``shard_map`` starts AT 0.7.0, and
-#     ``common.vma`` marks carries from there up.
-#   * both jax._src arities this tree patches reach their current shape at
-#     0.7.0 (see the table below) — 0.7.0 and 0.9.1 are the same shape.
-#
-# CEILING 0.10.0, unchanged, and it is a statement about what has been
-# measured rather than about what is broken: the two production legs are jax
-# 0.7.0 (Perlmutter container) and jax 0.9.1 (Frontera venv), both inside the
-# window.  Nothing at 0.10+ has been run.  One thing to check before raising
-# it: ``jax.experimental.shard_map`` is imported by ~24 files, ~60 of whose
-# call sites pass ``check_rep=False`` and are exempt from VMA marking BECAUSE
-# of it.  If that symbol is ever removed, those sites lose the exemption and
-# the import in the same release.
+# The owner requires one generation everywhere.  0.9.1 is the currently
+# deployed and locked release; the declared series leaves patch upgrades
+# possible while refusing 0.8 and 0.10 at startup.
 # --------------------------------------------------------------------------
-SUPPORTED_MIN = (0, 7, 0)
+SUPPORTED_MIN = (0, 9, 0)
 SUPPORTED_MAX_EXCLUSIVE = (0, 10, 0)
-
-#: Escape hatch for deliberately running an unsupported stack (e.g. to
-#: reproduce a container bug).  Named, not a bare truthy string, so it cannot
-#: be set by accident and always leaves a line in the log.
-OVERRIDE_ENV = "LORRAX_JAX_UNSUPPORTED_OK"
 
 # --------------------------------------------------------------------------
 # The private-API shapes this tree is WRITTEN AGAINST.
@@ -295,9 +227,18 @@ def _fmt(v: tuple[int, ...]) -> str:
     return ".".join(str(x) for x in v)
 
 
+def _parse_version_info(version: str) -> tuple[int, ...]:
+    """Numeric release prefix, independent of local/dev suffixes."""
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
+    if match is None:
+        return ()
+    return tuple(int(v) for v in match.groups(default="0"))
+
+
 def describe() -> dict[str, Any]:
-    """Everything needed to identify this JAX, WITHOUT trusting its version string."""
+    """Everything needed to identify this JAX/JAXLIB pair."""
     import jax
+    import jaxlib
     import jax.version as jv
 
     return {
@@ -306,6 +247,9 @@ def describe() -> dict[str, Any]:
         "release_version": getattr(jv, "_release_version", None),
         "is_dev_build": getattr(jv, "_release_version", None) is None,
         "file": jax.__file__,
+        "jaxlib_version": jaxlib.__version__,
+        "jaxlib_version_info": _parse_version_info(jaxlib.__version__),
+        "jaxlib_file": jaxlib.__file__,
         "shard_map_top_level": hasattr(jax, "shard_map"),
     }
 
@@ -313,15 +257,21 @@ def describe() -> dict[str, Any]:
 def check_version() -> list[str]:
     """Return a list of refusal-reason strings (empty when supported)."""
     info = describe()
-    vi = info["version_info"][:3]
-    if not vi:
-        return [f"jax.version.__version_info__ is empty (version string "
-                f"{info['version']!r}) — cannot establish a generation"]
-    if not (SUPPORTED_MIN <= vi < SUPPORTED_MAX_EXCLUSIVE):
-        return [f"jax {info['version']} (__version_info__={vi}, "
-                f"{'dev build' if info['is_dev_build'] else 'release'}) "
-                f"from {info['file']}"]
-    return []
+    problems: list[str] = []
+    for package, vi, version, path in (
+        ("jax", tuple(info.get("version_info", ()))[:3],
+         info.get("version"), info.get("file")),
+        ("jaxlib", tuple(info.get("jaxlib_version_info", ()))[:3],
+         info.get("jaxlib_version"), info.get("jaxlib_file")),
+    ):
+        if not vi:
+            problems.append(
+                f"{package} has no parseable version tuple "
+                f"(version string {version!r})")
+        elif not (SUPPORTED_MIN <= vi < SUPPORTED_MAX_EXCLUSIVE):
+            problems.append(
+                f"{package} {version} (version_info={vi}) from {path}")
+    return problems
 
 
 def check_private_arity() -> list[str]:
@@ -372,9 +322,8 @@ def enforce(*, announce=None) -> None:
     Call once, from ``runtime.initialize_communicator_stack``, right beside
     ``ffi.gate`` enforcement.  ``announce`` is an optional rank-0 print hook.
 
-    Honors :data:`OVERRIDE_ENV`, which downgrades every refusal to a single
-    announced line — the ONE declared silence, in the sense of
-    ``Gate.silent_platform_demote``.
+    ``announce`` is retained for call-signature stability; unsupported
+    versions are never downgraded or silenced.
     """
     version_problems = check_version()
     arity_problems = check_private_arity()
@@ -384,25 +333,15 @@ def enforce(*, announce=None) -> None:
     if not all_problems:
         return
 
-    if os.environ.get(OVERRIDE_ENV) == "1":
-        if announce is not None:
-            announce(
-                f"*** {OVERRIDE_ENV}=1: running an UNSUPPORTED JAX on purpose. "
-                f"{len(all_problems)} problem(s): " + "; ".join(all_problems)
-                + " ***")
-        return
-
     if version_problems:
         _refuse(
             RULE_UNSUPPORTED_VERSION,
-            got=version_problems[0],
-            want=f"jax >= {_fmt(SUPPORTED_MIN)}, < {_fmt(SUPPORTED_MAX_EXCLUSIVE)} "
-                 f"(same window as pyproject.toml; see SUPPORTED_MIN for why "
-                 f"the floor is {_fmt(SUPPORTED_MIN)} and not higher)",
-            fix=f"on Perlmutter, load a module whose image is "
-                f"ghcr.io/nvidia/jax:jax-2025-07-21 (config/perlmutter/"
-                f"site_config.sh); elsewhere install a jax in the window; or "
-                f"set {OVERRIDE_ENV}=1 to run anyway and own the consequences",
+            got="; ".join(version_problems),
+            want=f"jax and jaxlib >= {_fmt(SUPPORTED_MIN)}, "
+                 f"< {_fmt(SUPPORTED_MAX_EXCLUSIVE)} (same window as "
+                 f"pyproject.toml and tools/require_jax09.py)",
+            fix="on Perlmutter select LX_BASE_MODULE=lorrax_A; elsewhere "
+                "install matching jax and jaxlib 0.9.x packages",
         )
     if symbol_problems:
         _refuse(
@@ -410,14 +349,14 @@ def enforce(*, announce=None) -> None:
             got="; ".join(symbol_problems),
             want="the jax._src symbols common/jax_compile_cache.py resolves at "
                  "call time",
-            fix=f"use a jax whose private surface matches this tree, or set "
-                f"{OVERRIDE_ENV}=1 and expect the compile cache to be wrong",
+            fix="use the certified JAX/JAXLIB 0.9 environment whose private "
+                "surface matches this tree",
         )
     _refuse(
         RULE_PRIVATE_ARITY,
         got="; ".join(arity_problems),
         want="the jax._src arities common/jax_compile_cache.py patches against "
              "(see REQUIRED_PRIVATE_ARITY)",
-        fix=f"use a supported jax, or set {OVERRIDE_ENV}=1 together with "
-            f"ISDF_JAX_CACHE_DIR=\"\" (the compile cache is what breaks)",
+        fix="use the certified JAX/JAXLIB 0.9 environment; the compile-cache "
+            "patches cannot safely run against this private surface",
     )
