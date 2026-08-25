@@ -306,6 +306,14 @@ def parse_catalog(raw: Mapping[str, Any], *, catalog_name: str
             raise CatalogCorrupt(
                 f"minimax: certified catalog {catalog_name!r} entry "
                 f"{entry.index} has non-finite kappa0.")
+        claimed_error = float(entry.raw["max_error"])
+        if not (np.isfinite(claimed_error)
+                and 0.0 <= claimed_error <= entry.error_bound):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has max_error={claimed_error!r}, which is "
+                f"not finite and within [0, error_bound="
+                f"{entry.error_bound!r}].")
     return entries
 
 
@@ -491,6 +499,30 @@ def load_table(entry: CatalogEntry) -> tuple[np.ndarray, np.ndarray, float,
         # keeping that cast keeps the served bytes identical.  The strip
         # families ship complex128 alpha and must NOT be flattened to real.
         alpha = np.asarray(alpha, dtype=np.float64)
+    if entry.certified:
+        if (tau.ndim != 1 or alpha.ndim != 1
+                or tau.size != alpha.size
+                or tau.size != entry.node_count):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} has tau shape "
+                f"{tau.shape}, alpha shape {alpha.shape}, and catalog "
+                f"node_count={entry.node_count}; certified payload arrays "
+                f"must be equal-length 1-D arrays matching node_count.")
+        if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(alpha))):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} has non-finite "
+                f"tau or alpha values.")
+        if entry.family == "noncrossing" and (
+                np.any(tau <= 0.0) or not np.isrealobj(alpha)
+                or np.any(alpha <= 0.0)):
+            raise TableUnreadable(
+                f"minimax: certified noncrossing table {entry.file!r} "
+                f"must have positive real nodes and weights.")
+        if not (np.isfinite(err) and 0.0 <= err <= entry.error_bound):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} payload "
+                f"max_error={err!r} is not finite and within "
+                f"[0, error_bound={entry.error_bound!r}].")
     expected_payload = entry.raw.get("payload_sha256")
     if expected_payload is not None:
         actual_payload = payload_sha256(tau, alpha)
