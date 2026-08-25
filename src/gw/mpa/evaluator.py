@@ -35,6 +35,7 @@ argument, but they solve different domains and are not interchangeable.
 
 import numpy as np
 
+from common.gauss_legendre import gauss_legendre_interval
 from gw.mpa import sample_plan
 
 #: Requested error of the damped rule, RELATIVE to the kernel's own
@@ -240,9 +241,9 @@ def damped_line_rule(
                 "per-panel order fits under max_order -- reduce "
                 "wavelengths_per_panel (which lowers the per-panel "
                 "bandwidth) or loosen rel_tol.")
-        x, w = np.polynomial.legendre.leggauss(order)
-        nodes.append(left + 0.5 * width * (x + 1.0))
-        weights.append(0.5 * width * w)
+        x, w = gauss_legendre_interval(order, left, left + width)
+        nodes.append(x)
+        weights.append(w)
         orders.append(order)
 
     t = np.concatenate(nodes).astype(np.float64)
@@ -313,9 +314,9 @@ def damped_rectangle_rule(
             raise ValueError(
                 f"damped rectangle panel {panel} needs order above "
                 f"max_order={max_order}")
-        x, w = np.polynomial.legendre.leggauss(order)
-        nodes.append(left + 0.5 * width * (x + 1.0))
-        weights.append(0.5 * width * w)
+        x, w = gauss_legendre_interval(order, left, left + width)
+        nodes.append(x)
+        weights.append(w)
         orders.append(order)
     t = np.concatenate(nodes).astype(np.float64)
     h = np.concatenate(weights).astype(np.float64)
@@ -398,13 +399,8 @@ def damped_rectangle_gauss_rule(
     check_boundary = _damped_rectangle_boundary(
         g0, g1, f, 8192, 2048, midpoint=True)
 
-    legendre = {}
-
     def _rule(order, t_max):
-        if int(order) not in legendre:
-            legendre[int(order)] = np.polynomial.legendre.leggauss(int(order))
-        x, h = legendre[int(order)]
-        return 0.5 * t_max * (x + 1.0), 0.5 * t_max * h
+        return gauss_legendre_interval(int(order), 0.0, float(t_max))
 
     def _score(order, t_max, boundary):
         return _damped_rectangle_score(*_rule(order, t_max), boundary)
