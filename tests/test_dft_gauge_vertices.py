@@ -13,7 +13,11 @@ import jax.numpy as jnp
 
 from common import mtxel_sweep
 from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
+from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
+from common.wfn_transforms import gflat_to_rmu
+from gw import w_isdf
+from gw.wavefunction_bundle import BandSlices, Wavefunctions
 from psp import vnl_ops
 from psp import dft_operators, radial_tables
 from psp.species import SpeciesData
@@ -28,7 +32,7 @@ from psp.vnl_ops import (
 
 
 _EXPECTED_SRC = Path(__file__).resolve().parents[1] / "src"
-for _module in (mtxel_sweep, vnl_ops, dft_operators, radial_tables):
+for _module in (mtxel_sweep, w_isdf, vnl_ops, dft_operators, radial_tables):
     if _EXPECTED_SRC not in Path(_module.__file__).resolve().parents:
         raise RuntimeError(
             f"split-source gate: {_module.__name__} imported from "
@@ -661,3 +665,249 @@ def test_exact_icl_finite_transfer_rejects_noncanonical_wrap_and_stamps_rule():
         setup, path_order=8, path_rtol=2.0e-9, path_atol=1.0e-12)
     assert first.startswith("sha256:") and len(first) == 71
     assert len({first, second, third}) == 3
+
+
+def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity():
+    """The body endpoint meets the uniform owner before either response fit.
+
+    q=0 isolates the new transaction's raw-alpha + HALFALPHA*VNL assembly
+    from transfer interpolation.  The existing exact finite-transfer tests
+    above own nonzero-q/wrap/Ward coverage; this cell owns the body-facing
+    band sharding, canonical FFT sampler and shared head/body fingerprint.
+    """
+    setup = _finite_setup(third_derivatives=True)
+    G = np.asarray([
+        [0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0],
+    ], dtype=np.int32)
+    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
+    k = np.asarray([0.19, -0.17, 0.12])
+    psi_L = _states() * mask[None, None, :]
+    psi_4 = lift_to_4spinor(
+        psi_L[None], G[None], jnp.asarray(k[None]),
+        jnp.asarray(setup.B))[0]
+
+    mesh = single_device_mesh()
+    geom = mtxel_sweep.SweepGeometry(
+        mesh=mesh, fft_grid=(4, 4, 4), ngkmax=G.shape[0],
+        nb=psi_4.shape[0], ns=4, nk=1, cell_volume=1.0)
+    gvecs = G[None]
+    gmask = mask[None]
+    kvecs = k[None]
+    box_index = np.full((1, 4, 4, 4), G.shape[0], dtype=np.int32)
+    for ig, g in enumerate(G[:3]):
+        box_index[(0,) + tuple(np.mod(g, 4))] = ig
+    r_mu = np.asarray([[0, 0, 0], [1, 2, 3], [3, 1, 0]], dtype=np.int32)
+    sym = SimpleNamespace(
+        q_irr_kgrid_int=np.zeros((1, 3), dtype=np.int32),
+        q_irr_full_idx=np.zeros(1, dtype=np.int32),
+        kqfull_map=np.zeros((1, 1), dtype=np.int32))
+    wfn = SimpleNamespace(
+        nbands=2, nspinor=2, nelec=1,
+        energies=np.asarray([[[0.1, 0.6]]]),
+        kpoints=np.zeros((1, 3), dtype=np.float64),
+        kgrid=np.ones(3, dtype=np.int32), fft_grid=(4, 4, 4),
+        ngkmax=G.shape[0],
+        symmetry=lambda: sym,
+        gvecs=lambda *, k: gvecs,
+        ngk_valid=lambda *, k: np.asarray([3], dtype=np.int32),
+        kvecs=lambda *, k: kvecs,
+        box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
+
+    endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
+        psi_4[None], wfn=wfn, band_start=0, band_stop=2,
+        geom=geom, vnl_setup=setup, r_mu=r_mu, iq_irr=0,
+        path_order=8, projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+
+    uniform_action = apply_uniform_vnl_derivatives_to_ket(
+        psi_L, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
+    alpha_action = np.stack([
+        np.asarray(gamma_apply(psi_4, *gamma_perm_phase(mu), axis=1))
+        for mu in (1, 2, 3)
+    ], axis=1)
+    vnl_action = np.zeros_like(alpha_action)
+    vnl_action[:, :, :2, :] = np.moveaxis(
+        HALFALPHA * np.asarray(uniform_action.gamma_cart_ket), 0, 1)
+    expected_G = alpha_action + vnl_action
+    expected_rmu = gflat_to_rmu(
+        jnp.asarray(expected_G[None].reshape(1, 2, 12, G.shape[0])),
+        box_index, r_mu, mesh=mesh, fft_grid=(4, 4, 4),
+        kvecs_frac=kvecs, norm='ortho').reshape(1, 2, 3, 4, 3)
+    np.testing.assert_allclose(
+        endpoint.current_nmu, expected_rmu, rtol=3.0e-13, atol=3.0e-13)
+    np.testing.assert_allclose(
+        endpoint.current_mun, expected_rmu.transpose(0, 2, 3, 4, 1),
+        rtol=3.0e-13, atol=3.0e-13)
+    assert endpoint.n_rmu_logical == 3
+    assert endpoint.iq_irr == 0
+    np.testing.assert_array_equal(endpoint.q_irr_kgrid_int, [0, 0, 0])
+    np.testing.assert_array_equal(endpoint.q_crys, [0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(endpoint.kminq_idx, [0])
+    np.testing.assert_array_equal(endpoint.g_wrap, [[0, 0, 0]])
+
+    uniform = mtxel_sweep.sweep_uniform_gauge_matrix_elements(
+        psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        bvec=setup.B, blat=1.0, vnl_setup=setup, gvecs=gvecs,
+        gmask=gmask, box_index=box_index, kvecs=kvecs,
+        include_transfer_q2=True)
+    assert (endpoint.hamiltonian_config_operator_fingerprint
+            == uniform.hamiltonian_config_operator_fingerprint)
+    assert endpoint.vnl_path_operator_fingerprint.startswith('sha256:')
+
+    # The fixed-q body row reuses the canonical face Green builder.  At one
+    # k and one tau=0 node its normalization reduces to the explicit ordered
+    # valence/conduction pair, which is a compact sign/conjugation oracle.
+    raw_rmu = gflat_to_rmu(
+        psi_4[None], box_index, r_mu, mesh=mesh, fft_grid=(4, 4, 4),
+        kvecs_frac=kvecs, norm='ortho')
+    slices = BandSlices.from_band_edges(0, 0, 1, 1, 2)
+    wfns = Wavefunctions(
+        enk=jnp.asarray([[0.1, 0.6]]),
+        occ=jnp.asarray([[1.0, 0.0]]), slices=slices,
+        psi_nmu=raw_rmu,
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
+    chi_12 = w_isdf.compute_finite_transfer_current_block_row(
+        endpoint, wfns,
+        SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
+        SimpleNamespace(nk_tot=1), mesh,
+        vertex_left=1, vertex_right=2)
+    raw_c = np.asarray(raw_rmu[0, 1])
+    current_v_A = np.asarray(endpoint.current_nmu[0, 0, 0])
+    current_v_B = np.asarray(endpoint.current_nmu[0, 0, 1])
+    D_A = np.einsum('sm,sm->m', np.conj(raw_c), current_v_A)
+    D_B = np.einsum('sm,sm->m', np.conj(raw_c), current_v_B)
+    expected_chi_12 = -2.0 * np.conj(D_A)[:, None] * D_B[None, :]
+    np.testing.assert_allclose(
+        chi_12, expected_chi_12, rtol=5.0e-13, atol=5.0e-13)
+
+
+def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap():
+    """A second q at one executable shape cannot reuse the q=0 closure."""
+    setup = _finite_setup(third_derivatives=True)
+    G = np.asarray([
+        [-1, 0, 0], [0, 0, 0], [1, 0, 0], [-2, 0, 0],
+    ], dtype=np.int32)
+    ngk = np.full(4, 3, dtype=np.int32)
+    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
+    kvecs = np.zeros((4, 3), dtype=np.float64)
+    kvecs[:, 0] = np.arange(4) / 4.0
+    psi_L = jnp.stack([
+        _states() * (1.0 + 0.07 * ik) for ik in range(4)
+    ]) * jnp.asarray(mask)[None, None, None, :]
+    psi_4 = lift_to_4spinor(
+        psi_L, np.broadcast_to(G, (4, 4, 3)), kvecs,
+        jnp.asarray(setup.B))
+
+    mesh = single_device_mesh()
+    geom = mtxel_sweep.SweepGeometry(
+        mesh=mesh, fft_grid=(4, 1, 1), ngkmax=4,
+        nb=2, ns=4, nk=4, cell_volume=1.0)
+    box_index = np.full((4, 4, 1, 1), 4, dtype=np.int32)
+    for ik in range(4):
+        for ig, g in enumerate(G[:3]):
+            box_index[ik, int(g[0]) % 4, 0, 0] = ig
+    r_mu = np.asarray([[0, 0, 0], [1, 0, 0], [3, 0, 0]], dtype=np.int32)
+    q_int = np.zeros((4, 3), dtype=np.int32)
+    q_int[:, 0] = np.arange(4)
+    kqfull = np.asarray([
+        [(ik - iq) % 4 for iq in range(4)] for ik in range(4)
+    ], dtype=np.int32)
+    sym = SimpleNamespace(
+        q_irr_kgrid_int=q_int,
+        q_irr_full_idx=np.arange(4, dtype=np.int32),
+        kqfull_map=kqfull)
+    gvecs = np.broadcast_to(G, (4, 4, 3)).copy()
+    wfn = SimpleNamespace(
+        nbands=2, nspinor=2, nelec=1,
+        energies=np.asarray([[[0.1, 0.6]]]),
+        kpoints=np.zeros((1, 3), dtype=np.float64),
+        kgrid=np.asarray([4, 1, 1]), fft_grid=(4, 1, 1), ngkmax=4,
+        symmetry=lambda: sym,
+        gvecs=lambda *, k: gvecs,
+        ngk_valid=lambda *, k: ngk,
+        kvecs=lambda *, k: kvecs,
+        box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
+
+    common_kwargs = dict(
+        wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        vnl_setup=setup, r_mu=r_mu, path_order=8,
+        projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+    endpoint_q0 = mtxel_sweep.finite_transfer_current_to_centroids(
+        psi_4, iq_irr=0, **common_kwargs)
+    endpoint_q1 = mtxel_sweep.finite_transfer_current_to_centroids(
+        psi_4, iq_irr=1, **common_kwargs)
+
+    q = np.asarray([0.25, 0.0, 0.0])
+    target_rows = kqfull[:, 1]
+    wraps = np.rint(
+        (kvecs - q[None, :]) - kvecs[target_rows]).astype(np.int32)
+    expected_G = []
+    physical_G = {tuple(int(x) for x in row): i
+                  for i, row in enumerate(G[:3])}
+    for ik, target in enumerate(target_rows):
+        alpha_source = np.stack([
+            np.asarray(gamma_apply(
+                psi_4[ik], *gamma_perm_phase(mu), axis=1))
+            for mu in (1, 2, 3)
+        ], axis=1)
+        alpha_target = np.zeros_like(alpha_source)
+        for ig_target, G_target in enumerate(G[:3]):
+            source = physical_G.get(tuple(G_target - wraps[ik]))
+            if source is not None:
+                alpha_target[..., ig_target] = alpha_source[..., source]
+        finite = compute_icl_vnl_finite_transfer_to_ket(
+            psi_L[ik], G, G, kvecs[ik], kvecs[target], q, wraps[ik],
+            setup, mask, mask, path_order=8,
+            projector_row_chunk=1, g_chunk=2)
+        assert bool(np.asarray(finite.certified))
+        vnl_target = np.zeros_like(alpha_target)
+        vnl_target[:, :, :2, :] = HALFALPHA * np.moveaxis(
+            np.asarray(finite.gamma_cart_ket), 0, 1)
+        expected_G.append(alpha_target + vnl_target)
+    expected_G = np.asarray(expected_G)
+    expected_rmu = gflat_to_rmu(
+        jnp.asarray(expected_G.reshape(4, 2, 12, 4)),
+        box_index[target_rows], r_mu, mesh=mesh, fft_grid=(4, 1, 1),
+        kvecs_frac=kvecs[target_rows], norm='ortho').reshape(4, 2, 3, 4, 3)
+
+    assert endpoint_q1.iq_irr == 1
+    np.testing.assert_array_equal(endpoint_q1.q_irr_kgrid_int, [1, 0, 0])
+    np.testing.assert_array_equal(endpoint_q1.q_crys, q)
+    np.testing.assert_array_equal(endpoint_q1.kminq_idx, target_rows)
+    np.testing.assert_array_equal(endpoint_q1.g_wrap, wraps)
+    np.testing.assert_allclose(
+        endpoint_q1.current_nmu, expected_rmu,
+        rtol=4.0e-12, atol=4.0e-12)
+    assert not np.allclose(
+        endpoint_q1.current_nmu, endpoint_q0.current_nmu,
+        rtol=1.0e-10, atol=1.0e-10)
+
+    # Nonzero-q chi_AB oracle.  This independently spells the ordered
+    # transition element D_i(k,mu)=<c,k-q|Gamma_i(k,q)|v,k> and fixes both
+    # the A-side conjugation and the direct-k 1/sqrt(Nk) normalization.
+    raw_rmu = gflat_to_rmu(
+        psi_4, box_index, r_mu, mesh=mesh, fft_grid=(4, 1, 1),
+        kvecs_frac=kvecs, norm='ortho')
+    slices = BandSlices.from_band_edges(0, 0, 1, 1, 2)
+    wfns = Wavefunctions(
+        enk=jnp.asarray(np.tile([0.1, 0.6], (4, 1))),
+        occ=jnp.asarray(np.tile([1.0, 0.0], (4, 1))), slices=slices,
+        psi_nmu=raw_rmu,
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
+    chi_12 = w_isdf.compute_finite_transfer_current_block_row(
+        endpoint_q1, wfns,
+        SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
+        SimpleNamespace(nk_tot=4), mesh,
+        vertex_left=1, vertex_right=2)
+    raw_target_c = np.asarray(raw_rmu[target_rows, 1])
+    current_v_A = np.asarray(endpoint_q1.current_nmu[:, 0, 0])
+    current_v_B = np.asarray(endpoint_q1.current_nmu[:, 0, 1])
+    D_A = np.einsum(
+        'ksm,ksm->km', np.conj(raw_target_c), current_v_A)
+    D_B = np.einsum(
+        'ksm,ksm->km', np.conj(raw_target_c), current_v_B)
+    expected_chi_12 = (-2.0 / np.sqrt(4.0)) * np.einsum(
+        'km,kn->mn', np.conj(D_A), D_B)
+    np.testing.assert_allclose(
+        chi_12, expected_chi_12, rtol=6.0e-12, atol=6.0e-12)
