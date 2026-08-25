@@ -238,8 +238,8 @@ def _resolve_gindex_dev(g_index):
 # Shared kernel: G-flat ψ + g_index → FFT-box ψ (zero-sentinel gather)
 # ---------------------------------------------------------------------------
 #
-# Algorithm (matches ``common/gvec_fft_box.make_fft_box_kernel`` but on
-# WfnLoader's c128 layout).  For each FFT-box cell (nx, ny, nz),
+# ``common.gvec_fft_box`` owns the host-built inverse index; this is the sole
+# device gather that consumes it.  For each FFT-box cell (nx, ny, nz),
 # ``g_index[k, nx, ny, nz]`` gives the position along the G-axis of psi
 # to gather from; positions equal to ``ngkmax`` map to a synthetic
 # zero slot appended on the G-axis before the gather.  One ``take``
