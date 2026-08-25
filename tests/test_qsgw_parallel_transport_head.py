@@ -15,6 +15,7 @@ import pytest
 from jax.sharding import Mesh
 
 from common.chi_from_dipole import compute_S_omega
+from common.bispinor_init import HALFALPHA
 from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
     assemble_head_manifold,
@@ -26,6 +27,7 @@ from gw.qsgw_head import (
     reduced_covector_to_cartesian,
     rotate_velocity_active_to_qp,
     rotate_velocity_to_qp,
+    static_gauge_first_order_component_sharded,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -45,6 +47,112 @@ def _haar(rng, n):
     q, r = np.linalg.qr(z)
     phase = np.diag(r)
     return q * (phase / np.abs(phase))[None, :]
+
+
+def test_static_gauge_first_order_component_reuses_charge_head_and_state_jet():
+    mesh = _mesh()
+    kgrid = (8, 5, 1)
+    nk, nb = int(np.prod(kgrid)), 2
+    kints = np.stack(np.unravel_index(
+        np.arange(nk), kgrid), axis=1).astype(np.int32)
+    plus = build_forward_neighbor_table(kints, kgrid)
+
+    # A periodic two-band frame with a non-diagonal x connection.  Its
+    # eigenvalues +/-2*pi make the constant link close exactly on the torus.
+    A_continuum = 2.0 * np.pi * np.asarray([[0.0, 1.0], [1.0, 0.0]])
+    evals, evecs = np.linalg.eigh(A_continuum)
+    h = 1.0 / kgrid[0]
+    link_x = (
+        evecs @ np.diag(np.exp(-1.0j * h * evals)) @ evecs.conj().T)
+    eye = np.eye(nb, dtype=np.complex128)
+    links = np.broadcast_to(eye, (3, nk, nb, nb)).copy()
+    links[0] = link_x
+    link_x2 = link_x @ link_x
+    A_x = (1.0j / (12.0 * h)) * (
+        -link_x2 + 8.0 * link_x - 8.0 * link_x.conj().T
+        + link_x2.conj().T)
+    A_x = 0.5 * (A_x + A_x.conj().T)
+
+    energies = np.broadcast_to(np.asarray([1.0, 0.0]), (nk, nb)).copy()
+    occupations = np.broadcast_to(np.asarray([0.0, 1.0]), (nk, nb)).copy()
+    H = np.diag(energies[0])
+    velocity = np.zeros((3, nk, nb, nb), dtype=np.complex128)
+    velocity[0] = (
+        -1.0j * (A_x @ H - H @ A_x)
+        + np.diag(np.asarray([0.31, -0.17])))
+    velocity[1] = np.diag(np.asarray([-0.23, 0.29]))
+    velocity[2] = np.asarray([[0.13, 0.07j], [-0.07j, -0.11]])
+    gamma = np.moveaxis(HALFALPHA * velocity, 0, 1)
+    q1 = np.zeros((nk, 3, 3, nb, nb), dtype=np.complex128)
+    q1[:, 1, 0] = np.asarray([[0.02, 0.03j], [-0.03j, -0.01]])
+    q1[:, 2, 1] = np.asarray([[-0.04, 0.01], [0.01, 0.05]])
+    omegas = jnp.asarray([0.37j], dtype=jnp.complex128)
+
+    got = static_gauge_first_order_component_sharded(
+        jnp.asarray(gamma),
+        jnp.asarray(q1),
+        jnp.asarray(links),
+        plus,
+        jnp.asarray(energies),
+        jnp.asarray(occupations),
+        omegas,
+        mesh=mesh,
+        kgrid=kgrid,
+        bvec_cart=np.eye(3),
+        nb_logical=nb,
+        cell_volume=7.0,
+        nk_tot=nk,
+        nspin=1,
+        nspinor=2,
+    )
+
+    A = np.zeros((2, nk, nb, nb), dtype=np.complex128)
+    A[0] = A_x
+    gamma_dir = np.moveaxis(gamma, 1, 0)
+    q_current = np.transpose(q1, (2, 1, 0, 3, 4))[:2]
+    d_current = (
+        -1.0j * np.einsum("akml,ikln->aikmn", A, gamma_dir)
+        + q_current)
+    delta = energies[:, :, None] - energies[:, None, :]
+    expected_p_current = -delta[None, None] * d_current
+    np.testing.assert_allclose(
+        got.energy_scaled_d1_raw[:, 0], velocity[:2],
+        rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(
+        got.energy_scaled_d1_raw[:, 1:], expected_p_current,
+        rtol=2e-13, atol=2e-13)
+    np.testing.assert_allclose(
+        got.bra_energy_dq_ry,
+        -np.real(np.diagonal(velocity[:2], axis1=-2, axis2=-1)),
+        rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(
+        got.occupation_difference_dq,
+        np.zeros_like(np.asarray(got.occupation_difference_dq)))
+    assert float(got.charge_ward_residual) < 3.0e-15
+
+    incumbent = head_s_tensor_sharded(
+        jnp.asarray(velocity),
+        jnp.asarray(energies),
+        jnp.asarray(occupations),
+        omegas,
+        mesh=mesh,
+        nb_logical=nb,
+        cell_volume=7.0,
+        nk_tot=nk,
+        nspin=1,
+        nspinor=2,
+    )
+    np.testing.assert_allclose(
+        got.S_first_first[:, :, :, 0, 0], incumbent[:, :2, :2],
+        rtol=3e-14, atol=3e-14)
+
+    with pytest.raises(ValueError, match="insulating-only"):
+        static_gauge_first_order_component_sharded(
+            jnp.asarray(gamma), jnp.asarray(q1), jnp.asarray(links), plus,
+            jnp.asarray(energies), jnp.asarray(occupations), omegas,
+            mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
+            cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2,
+            surface_weight_kn=jnp.ones_like(jnp.asarray(energies)))
 
 
 def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
