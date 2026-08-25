@@ -408,6 +408,38 @@ class StaticGaugeSecondOrderComponent:
     q2_symmetry_residual: jax.Array
     nb_logical: int
 
+    @property
+    def S_bubble_q2_coefficient_cart(self) -> jax.Array:
+        r"""Retained-bubble coefficient of ``q_a q_b`` in Cartesian form.
+
+        The differentiated response is stored in symmetric pair order
+        ``(xx,xy,yy)`` as ``S_bubble_second_derivative``.  Taylor's theorem
+        supplies the factor ``1/2``.  This view expands the result to
+        ``(n_omega,2,2,4,4)`` so that its axes match the ``S_direct``
+        convention of :class:`gw.head_correction.StaticGaugeHeadResponse`::
+
+            Pi_bubble(q) = q_a q_b S_bubble_q2_coefficient_cart[a,b]
+
+        It remains only the retained-manifold bubble contribution.  In
+        particular, exposing the correctly normalized coefficient does not
+        supply the missing complement-space or contact terms and cannot be
+        used by itself to publish a production FULL head.
+        """
+        hessian = jnp.asarray(self.S_bubble_second_derivative)
+        if hessian.ndim != 4 or hessian.shape[1] != 3:
+            raise ValueError(
+                "S_bubble_second_derivative must have shape "
+                "(n_omega,3,4,4) in pair order (xx,xy,yy); got "
+                f"{hessian.shape}")
+        coefficient = 0.5 * hessian
+        xx, xy, yy = (
+            coefficient[:, 0], coefficient[:, 1], coefficient[:, 2])
+        return jnp.stack(
+            (jnp.stack((xx, xy), axis=1),
+             jnp.stack((xy, yy), axis=1)),
+            axis=1,
+        )
+
 
 def _ascii_stamp(io, path: str, name: str) -> str:
     """A ``uint8`` provenance stamp, read through SlabIO, as ``str``.
