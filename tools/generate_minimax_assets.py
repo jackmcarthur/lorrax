@@ -226,6 +226,50 @@ def _load_existing_tables(output_root: Path) -> dict[str, dict[str, object]]:
     return result
 
 
+def _merged_sweep_values(
+    output_root: Path,
+    *,
+    error_bounds: list[float],
+    crossing_a_values: list[float],
+    noncrossing_r_values: list[float],
+    families: list[str],
+    clobber: bool,
+) -> tuple[list[float], list[float], list[float]]:
+    """Keep the catalog census cumulative under ``--no-clobber``.
+
+    The solve loops still receive exactly the requested cells.  These values
+    are descriptive catalog/README metadata only; replacing them with the
+    latest one-cell request made an append falsely claim that all older
+    shipped rows had disappeared.
+    """
+
+    if clobber:
+        return error_bounds, crossing_a_values, noncrossing_r_values
+    try:
+        prior = json.loads(
+            (output_root / "catalog.json").read_text(encoding="utf-8"))
+        sweeps = prior.get("sweeps", {})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return error_bounds, crossing_a_values, noncrossing_r_values
+
+    def _union(prior_values, requested_values, *, reverse=False):
+        return sorted({float(value) for value in
+                       list(prior_values or []) + list(requested_values)},
+                      reverse=reverse)
+
+    catalog_errors = _union(
+        sweeps.get("error_bounds"), error_bounds, reverse=True)
+    catalog_crossing = _union(
+        sweeps.get("crossing_A_dim_values"),
+        crossing_a_values if "crossing" in families else [],
+    )
+    catalog_noncrossing = _union(
+        sweeps.get("noncrossing_R_values"),
+        noncrossing_r_values if "noncrossing" in families else [],
+    )
+    return catalog_errors, catalog_crossing, catalog_noncrossing
+
+
 def _sorted_table_entries(table_map: dict[str, dict[str, object]]) -> list[dict[str, object]]:
     def _sort_key(entry: dict[str, object]) -> tuple[object, ...]:
         return (
@@ -292,6 +336,16 @@ def generate_assets(
         _ensure_clean_dir(noncrossing_dir, clobber=clobber)
 
     table_map = {} if clobber else _load_existing_tables(output_root)
+    (catalog_error_bounds,
+     catalog_crossing_a_values,
+     catalog_noncrossing_r_values) = _merged_sweep_values(
+         output_root,
+         error_bounds=error_bounds,
+         crossing_a_values=crossing_a_values,
+         noncrossing_r_values=noncrossing_r_values,
+         families=families,
+         clobber=clobber,
+     )
     total_tables = 0
     if "crossing" in families:
         total_tables += len(error_bounds) * len(crossing_a_values)
@@ -345,9 +399,9 @@ def generate_assets(
                 _flush_outputs(
                     output_root,
                     tables=_sorted_table_entries(table_map),
-                    crossing_a_values=crossing_a_values,
-                    noncrossing_r_values=noncrossing_r_values,
-                    error_bounds=error_bounds,
+                    crossing_a_values=catalog_crossing_a_values,
+                    noncrossing_r_values=catalog_noncrossing_r_values,
+                    error_bounds=catalog_error_bounds,
                     crossing_eps_q=crossing_eps_q,
                     crossing_target_kind=crossing_target_kind,
                 )
@@ -393,9 +447,9 @@ def generate_assets(
                 _flush_outputs(
                     output_root,
                     tables=_sorted_table_entries(table_map),
-                    crossing_a_values=crossing_a_values,
-                    noncrossing_r_values=noncrossing_r_values,
-                    error_bounds=error_bounds,
+                    crossing_a_values=catalog_crossing_a_values,
+                    noncrossing_r_values=catalog_noncrossing_r_values,
+                    error_bounds=catalog_error_bounds,
                     crossing_eps_q=crossing_eps_q,
                     crossing_target_kind=crossing_target_kind,
                 )
@@ -403,9 +457,9 @@ def generate_assets(
     catalog = _flush_outputs(
         output_root,
         tables=_sorted_table_entries(table_map),
-        crossing_a_values=crossing_a_values,
-        noncrossing_r_values=noncrossing_r_values,
-        error_bounds=error_bounds,
+        crossing_a_values=catalog_crossing_a_values,
+        noncrossing_r_values=catalog_noncrossing_r_values,
+        error_bounds=catalog_error_bounds,
         crossing_eps_q=crossing_eps_q,
         crossing_target_kind=crossing_target_kind,
     )
