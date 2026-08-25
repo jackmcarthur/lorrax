@@ -1695,10 +1695,11 @@ def compute_static_photon_response(
 
     ``head_correction=off`` preserves the explicitly experimental finite-body
     no-pair bring-up path.  ``full`` is refused here, below deck parsing,
-    until an authenticated, versioned response loader exists.  In particular,
-    a caller-provided dataclass cannot stand in for the missing producer and
-    loader.  No photon body, G-vector transform, or symmetry operation is
-    rebuilt here.
+    until the authenticated head producer and finite-q body are wired through
+    one certified operator/content identity.  The immutable schema/loader
+    alone, or a caller-provided response record, cannot certify that missing
+    end-to-end physics.  No photon body, G-vector transform, or symmetry
+    operation is rebuilt here.
     """
     from .gw_config import HeadCorrection
     from .photon_layout import PhotonBasisLayout, pack_photon_operator
@@ -1716,13 +1717,15 @@ def compute_static_photon_response(
     coupled_head = head_policy is HeadCorrection.FULL
     if coupled_head:
         raise ValueError(
-            "GATE static_gauge_head_response_loader_unavailable: production "
-            "FULL_SCREENED q=0 completion is unreachable until its "
-            "authenticated, versioned artifact loader exists.  A "
-            "caller-provided StaticGaugeHeadResponse is not accepted.  "
-            "Land the producer and exact loader type before enabling full; "
-            "head_correction=off retains only the experimental no-pair "
-            "finite-body diagnostic")
+            "GATE static_gauge_head_end_to_end_uncertified: production "
+            "FULL_SCREENED q=0 completion is unreachable until an "
+            "authenticated producer supplies the complete mixed vertex, "
+            "exact contact and Hall response, and the finite-q photon body "
+            "carries the same certified Hamiltonian/operator/content "
+            "identity.  The existing artifact schema/loader or a "
+            "caller-provided StaticGaugeHeadResponse cannot certify that "
+            "missing wiring; head_correction=off retains only the "
+            "experimental no-pair finite-body diagnostic")
 
     with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
         if int(reader.n_q_total) != int(meta.nk_tot):

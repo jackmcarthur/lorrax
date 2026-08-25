@@ -186,7 +186,7 @@ def test_full_screened_runtime_refuses_before_opening_a_body(caller_response):
     )
     response = None if caller_response is None else _response(mesh)
     with pytest.raises(
-            ValueError, match="static_gauge_head_response_loader_unavailable"):
+            ValueError, match="static_gauge_head_end_to_end_uncertified"):
         compute_static_photon_response(
             None, None, None, None, None, mesh, config=config,
             gauge_head_response=response,
