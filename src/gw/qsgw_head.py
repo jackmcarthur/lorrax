@@ -3648,6 +3648,30 @@ def build_dft_head_response(
         raise FileNotFoundError(
             "head_correction=full requires dipole.h5 to build the direct "
             f"head and wings; missing {dipole_path}.")
+    # Fail before the host read and every sharded head allocation.  Shape does
+    # not identify a velocity artifact: in particular, a two-spinor dipole and
+    # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
+    # The producer owns both the stamp grammar and sign resolution; consume
+    # those owners directly rather than mirroring either convention here.
+    from psp.get_dipole_mtxels import (
+        check_dipole_provenance, resolve_vnl_velocity_sign)
+    expected_vnl_sign = resolve_vnl_velocity_sign(
+        None, config.vnl_velocity_sign)
+    if not check_dipole_provenance(
+            dipole_path,
+            wfn=wfn,
+            nval=int(config.nval),
+            ncond=int(config.ncond),
+            nband=int(config.nband),
+            bispinor=bool(int(meta.nspinor) == 4),
+            skip_vnl=False,
+            vnl_mode="analytic",
+            vnl_velocity_sign=expected_vnl_sign):
+        raise ValueError(
+            "GATE dft_head_dipole_provenance: head_correction=full refuses "
+            "dipole.h5 because its WFN/window/VNL/representation stamp does "
+            "not exactly match the charge-response body. Regenerate the "
+            "dipole from this run's deck before building S_direct or wings.")
     velocity_cart, _ = read_dipole_h5(dipole_path)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)

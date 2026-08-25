@@ -4584,6 +4584,10 @@ class LorraxConfig:
     do_screened: bool
     bispinor: bool
     bispinor_gw: BispinorGWMode
+    #: Raw deck spelling resolved by the canonical dipole producer at the
+    #: point of use.  Keeping the spelling (rather than a second resolver in
+    #: gw_config) lets every velocity consumer take the producer's exact arm.
+    vnl_velocity_sign: str
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
@@ -5482,6 +5486,7 @@ class LorraxConfig:
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
             bispinor_gw=coerce_bispinor_gw_mode(_g("bispinor_gw")),
+            vnl_velocity_sign=str(_g("vnl_velocity_sign") or ""),
             # Compatibility mirror only.  Every new head decision reads the
             # enum above; keeping this resolved bool prevents old consumers
             # from disagreeing with ``head_correction = off``.
