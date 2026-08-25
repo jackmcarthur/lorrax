@@ -194,8 +194,11 @@ def _worker(case_name: str) -> int:
                 NamedSharding(mesh, P(None, None, None, None)))
             self._k = jax.device_put(
                 jnp.asarray(kvecs), NamedSharding(mesh, P(None, None)))
+            self._host_tiles_live = True
 
         def read_local_band_chunk(self, x_idx, y_idx, bc_idx):
+            if not self._host_tiles_live:
+                raise RuntimeError("host tiles were released")
             r = int(x_idx) * self._py + int(y_idx)
             bc = int(bc_idx)
             b_lo = self._offs[bc]
@@ -220,19 +223,38 @@ def _worker(case_name: str) -> int:
 
         @property
         def g_index(self):
+            if self._g is None:
+                raise RuntimeError(
+                    "g_index: store population did not stage the box index")
             return self._g
 
         @property
         def kvecs_frac(self):
+            if self._k is None:
+                raise RuntimeError(
+                    "kvecs_frac: store population did not stage k vectors")
             return self._k
 
-    store = _MeshStore(mesh)
+        def release_host_tiles(self):
+            self._host_tiles_live = False
+
+        def close(self):
+            self.release_host_tiles()
+            self._g = None
+            self._k = None
+
+    cached_store = _MeshStore(mesh)
     # Exercise the optional full-grid hoist as one route.  The face calls
     # below also exercise the production streamed PsiGStore route with and
     # without the bounded current-rchunk Y cache.
     from isdf.core import build_psi_r_cache_sm
     psi_r_cache = jax.block_until_ready(
-        build_psi_r_cache_sm(store, mesh_xy=mesh))
+        build_psi_r_cache_sm(cached_store, mesh_xy=mesh))
+    # Match fit_zeta_to_h5's production cache lifecycle: the cache builder's
+    # callbacks are complete and host tiles are released before the first
+    # cached scalar face r-chunk.  A separate store owns streamed-route input.
+    cached_store.release_host_tiles()
+    streamed_store = _MeshStore(mesh)
 
     # ---- X-side: ONE random source, spanning the FULL [0, nb_full)
     # window, playing the "conjugated psi*" role the legacy X-form
@@ -255,7 +277,7 @@ def _worker(case_name: str) -> int:
     Z_legacy = jax.block_until_ready(z_q_from_psi_sm(
         jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
         jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
-        store, psi_r_cache,
+        cached_store, psi_r_cache,
         band_chunk_ranges=band_chunk_ranges,
         band_range_left=l_range, band_range_right=r_range,
         r_start_dyn=r_start, r_chunk_size=n_zchunk,
@@ -266,7 +288,7 @@ def _worker(case_name: str) -> int:
         Z_legacy_streamed = jax.block_until_ready(z_q_from_psi_sm(
             jax.device_put(jnp.asarray(psi_l_X_np), x1_4),
             jax.device_put(jnp.asarray(psi_r_X_np), x1_4),
-            store, None,
+            streamed_store, None,
             band_chunk_ranges=band_chunk_ranges,
             band_range_left=l_range, band_range_right=r_range,
             r_start_dyn=r_start, r_chunk_size=n_zchunk,
@@ -278,7 +300,7 @@ def _worker(case_name: str) -> int:
     w_l = np.where((idx >= l0) & (idx < l1), 1.0, 0.0)
     w_r = np.where((idx >= r0) & (idx < r1), 1.0, 0.0)
     Z_face = jax.block_until_ready(z_q_from_psi_sm(
-        psi_G_store=store, psi_r_cache=psi_r_cache,
+        psi_G_store=cached_store, psi_r_cache=psi_r_cache,
         band_chunk_ranges=band_chunk_ranges,
         r_start_dyn=r_start, r_chunk_size=n_zchunk,
         kgrid=kgrid, mesh_xy=mesh,
@@ -292,7 +314,7 @@ def _worker(case_name: str) -> int:
     # (psi_r_cache=None).  Exercise both structural choices: the one-pass
     # bounded-rchunk Y cache and its always-valid repeated-transform fallback.
     Z_face_streamed_cached = jax.block_until_ready(z_q_from_psi_sm(
-        psi_G_store=store, psi_r_cache=None,
+        psi_G_store=streamed_store, psi_r_cache=None,
         band_chunk_ranges=band_chunk_ranges,
         r_start_dyn=r_start, r_chunk_size=n_zchunk,
         kgrid=kgrid, mesh_xy=mesh,
@@ -302,7 +324,7 @@ def _worker(case_name: str) -> int:
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
         cache_face_y_blocks=True))
     Z_face_streamed_repeated = jax.block_until_ready(z_q_from_psi_sm(
-        psi_G_store=store, psi_r_cache=None,
+        psi_G_store=streamed_store, psi_r_cache=None,
         band_chunk_ranges=band_chunk_ranges,
         r_start_dyn=r_start, r_chunk_size=n_zchunk,
         kgrid=kgrid, mesh_xy=mesh,
@@ -341,7 +363,7 @@ def _worker(case_name: str) -> int:
 
         def _fit(cache_y):
             return jax.block_until_ready(fit_one_rchunk(
-                psi_G_store=store, psi_r_cache=None, L_q=L_q,
+                psi_G_store=cached_store, psi_r_cache=psi_r_cache, L_q=L_q,
                 r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
                 mesh_xy=mesh, meta=meta,
                 band_chunk_ranges=band_chunk_ranges,
@@ -381,7 +403,7 @@ def _worker(case_name: str) -> int:
         # no out-of-range slice.  Its final logical cells must be retained
         # in order and the mesh-divisibility carrier cell must remain inert.
         Z_full = jax.block_until_ready(z_q_from_psi_sm(
-            psi_G_store=store, psi_r_cache=psi_r_cache,
+            psi_G_store=cached_store, psi_r_cache=psi_r_cache,
             band_chunk_ranges=band_chunk_ranges,
             r_start_dyn=0, r_chunk_size=n_rtot,
             kgrid=kgrid, mesh_xy=mesh,
@@ -416,6 +438,19 @@ def _worker(case_name: str) -> int:
     max_abs = max(float(np.abs(value - reference).max())
                   for value in comparisons)
     max_rel = max_abs / max(ref_scale, 1e-300)
+    for store in (cached_store, streamed_store):
+        store.close()
+        for attr, expected in (
+                ("g_index", "did not stage the box index"),
+                ("kvecs_frac", "did not stage k vectors")):
+            try:
+                getattr(store, attr)
+            except RuntimeError as exc:
+                if expected not in str(exc):
+                    raise
+            else:
+                raise AssertionError(
+                    f"final close left {attr} accessible")
     print(json.dumps({
         "max_abs": max_abs, "ref_scale": ref_scale, "max_rel": max_rel,
         "case": case_name, "ns": ns, "l_range": list(l_range),
