@@ -8,6 +8,7 @@ entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
 production planner (persistent floor + max over five stage transients).
 """
 import os
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import jax
@@ -729,7 +730,7 @@ def _centroid_table_md5(centroid_fft_idx) -> str:
 
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
-                         band_slices, chunks):
+                         band_slices, band_chunk_size):
 	"""Sample ψ at the TRANSVERSE centroid set and package it for σ^B.
 
 	This is the whole of ``transverse_wfn_data``: ψ at r_{μ_T} over the
@@ -756,7 +757,7 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
 			wfn, sym, meta_T, cent_T_idx, cfg.bispinor, mesh_xy,
 			band_range=band_slices.full_range,
-			band_chunk_size=chunks['band_chunk'],
+			band_chunk_size=int(band_chunk_size),
 		)
 	psi_mun_fresh_T = None
 	psi_nmu_fresh_T = None
@@ -1244,6 +1245,188 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 				f"loudly, and it changes the physics rather than fixing it).")
 
 
+@dataclass(frozen=True)
+class _ZetaFitContract:
+	"""Host-only identity and canonical reuse verdict for all zeta channels."""
+
+	zeta_h5_path: str
+	band_range_left: tuple[int, int]
+	band_range_right: tuple[int, int]
+	band_norms: object
+	zeta_cutoff: float
+	zeta_vcoul_cutoff: float
+	write_ibz_only_charge: bool
+	loader_band_chunk: int
+	provenance: str
+	reuse: bool
+	meta_transverse: object = None
+	centroids_transverse: object = None
+	transverse_identity: object = None
+	write_ibz_only_transverse: bool = False
+	zeta_transverse_paths: tuple[str, ...] = ()
+	provenance_transverse: tuple[str, ...] = ()
+
+
+def _resolve_zeta_fit_contract(
+		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
+		*, print_fn=print):
+	"""Resolve the one all-channel zeta identity before fit-only planning.
+
+	Only host metadata and the canonical :func:`_zeta_reuse_ok` owner are used.
+	A bispinor contract includes the transverse centroid/solver identity and
+	requires all four files to pass; partial reuse remains forbidden.  No
+	wavefunction sampling, fit memory planner, or zeta data load occurs here.
+	"""
+	zeta_edge = resolve_zeta_fit_edge(
+		band_slices, getattr(cfg, "zeta_nband", None))
+	band_range_left, band_range_right = zeta_fit_band_ranges(
+		band_slices, zeta_edge, log=print_fn)
+	assert_isdf_window_is_the_max(
+		band_slices, band_range_right, zeta_edge, log=print_fn)
+	check_zeta_fit_windows(
+		getattr(wfn, "energies", None), band_range_left, band_range_right,
+		zeta_edge,
+		(int(zeta_edge) if zeta_edge is not None
+		 else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4)),
+		log=print_fn)
+
+	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
+	_check_zeta_h5_matches_basis(
+		zeta_h5_path, int(meta.n_rmu), print_fn, fft_grid=meta.fft_grid)
+	band_norms = getattr(wfn, "band_norms", None)
+
+	force_full_bz_fit = env_bool(
+		"LORRAX_FORCE_FULL_BZ", False, print_fn=print_fn)
+	write_ibz_only_charge = not force_full_bz_fit
+
+	def _resolve_cutoff(val, label, hi):
+		if val is None:
+			return float(wfn.ecutwfc)
+		v = float(val)
+		if v > hi + 1e-9:
+			raise ValueError(
+				f"{label} = {v} Ry exceeds ecutrho = {hi} Ry "
+				"(the FFT grid can't represent G's past ecutrho).")
+		return v
+
+	ecutrho = float(wfn.ecutrho)
+	zeta_vcoul_cutoff = _resolve_cutoff(
+		cfg.head.bare_coulomb_cutoff, "bare_coulomb_cutoff", ecutrho)
+	zeta_cutoff = _resolve_cutoff(
+		cfg.head.zeta_cutoff, "zeta_cutoff", ecutrho)
+	if zeta_vcoul_cutoff > zeta_cutoff + 1e-9:
+		raise ValueError(
+			f"bare_coulomb_cutoff = {zeta_vcoul_cutoff} Ry > "
+			f"zeta_cutoff = {zeta_cutoff} Ry.  The V_q kernel reads "
+			f"ζ̃(q+G) at every G inside its sphere; ζ must be stored "
+			f"at least as wide.  Increase zeta_cutoff (≤ ecutrho = "
+			f"{ecutrho} Ry) or lower bare_coulomb_cutoff.")
+	print_fn(
+		f"    cutoffs: zeta = {zeta_cutoff:.1f} Ry, "
+		f"bare-Coulomb = {zeta_vcoul_cutoff:.1f} Ry  "
+		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={ecutrho:.1f})")
+
+	meta_transverse = None
+	centroids_transverse = None
+	transverse_identity = None
+	write_ibz_only_transverse = False
+	transverse_paths = ()
+	if cfg.bispinor:
+		if not getattr(cfg.paths, "centroids_file_current", None):
+			raise ValueError(
+				"Bispinor calculation requires centroids_file_current in "
+				"cohsex.in (set it to a current-density kmeans output).")
+		from file_io.centroids import load_centroids as _load_cent_pf
+		from isdf.core import _resolve_solver_kind_transverse
+		from runtime.padding import padded_mu_extent
+		_, cent_T_np, n_rmu_T = _load_cent_pf(
+			cfg.paths.centroids_file_current, meta.fft_grid)
+		solver_kind_T = _resolve_solver_kind_transverse(
+			mesh_xy, cfg.backend.distributed_lu,
+			n_rmu_logical=int(n_rmu_T),
+			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
+		# Keep the pre-fit contract on the host.  The centroid table becomes a
+		# device array only after the canonical all-channel reuse verdict says
+		# that a fit or downstream Sigma sampling is actually required.
+		centroids_transverse = np.asarray(cent_T_np, dtype=np.int32)
+		meta_transverse = replace(
+			meta, n_rmu=int(n_rmu_T),
+			n_rmu_padded=int(padded_mu_extent(int(n_rmu_T),
+			                                  int(jax.device_count()))))
+		meta_transverse.sys_dim = meta.sys_dim
+		transverse_identity = {
+			"n_rmu": int(n_rmu_T),
+			"centroids_md5": _centroid_table_md5(cent_T_np),
+			"distributed_lu": str(cfg.backend.distributed_lu).strip().lower(),
+			"solver_kind": str(solver_kind_T),
+		}
+		write_ibz_only_transverse = write_ibz_only_charge
+		transverse_paths = tuple(
+			os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
+			for mu_L in (1, 2, 3))
+
+	provenance = _zeta_fit_provenance(
+		wfn=wfn, meta=meta, cfg=cfg,
+		band_range_left=band_range_left,
+		band_range_right=band_range_right,
+		zeta_cutoff=zeta_cutoff,
+		zeta_vcoul_cutoff=zeta_vcoul_cutoff,
+		write_ibz_only=write_ibz_only_charge,
+		band_norms=band_norms,
+		vertex_mu_L=0, transverse_identity=transverse_identity)
+	provenance_transverse = tuple(
+		_zeta_fit_provenance(
+			wfn=wfn, meta=meta_transverse, cfg=cfg,
+			band_range_left=band_range_left,
+			band_range_right=band_range_right,
+			zeta_cutoff=zeta_cutoff,
+			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
+			write_ibz_only=write_ibz_only_transverse,
+			band_norms=band_norms,
+			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
+		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
+	q_irr_identity = bool(sym.q_irr_is_full_identity)
+	reuse = _zeta_reuse_ok(
+		zeta_h5_path, provenance, centroid_indices,
+		print_fn=print_fn, n_rmu_expected=int(meta.n_rmu),
+		q_irr_is_full_identity=q_irr_identity)
+	if reuse and cfg.bispinor:
+		for mu_L, (path_T, provenance_T) in enumerate(
+				zip(transverse_paths, provenance_transverse), start=1):
+			if not _zeta_reuse_ok(
+					path_T, provenance_T, centroids_transverse,
+					print_fn=print_fn,
+					n_rmu_expected=int(meta_transverse.n_rmu),
+					q_irr_is_full_identity=q_irr_identity):
+				print_fn(
+					f"    [zeta reuse] the transverse ζ for μ_L={mu_L} "
+					f"({path_T}) is NOT reusable, so the charge ζ is not "
+					"reused either — refitting all four channels.")
+				reuse = False
+				break
+
+	loader_band_chunk = (
+		int(cfg.memory.band_chunk_size)
+		if int(cfg.memory.band_chunk_size) > 0 else 64)
+	return _ZetaFitContract(
+		zeta_h5_path=zeta_h5_path,
+		band_range_left=band_range_left,
+		band_range_right=band_range_right,
+		band_norms=band_norms,
+		zeta_cutoff=zeta_cutoff,
+		zeta_vcoul_cutoff=zeta_vcoul_cutoff,
+		write_ibz_only_charge=write_ibz_only_charge,
+		loader_band_chunk=loader_band_chunk,
+		provenance=provenance,
+		reuse=bool(reuse),
+		meta_transverse=meta_transverse,
+		centroids_transverse=centroids_transverse,
+		transverse_identity=transverse_identity,
+		write_ibz_only_transverse=write_ibz_only_transverse,
+		zeta_transverse_paths=transverse_paths,
+		provenance_transverse=provenance_transverse)
+
+
 def _plan_gflat_chunks_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, is_bispinor, print_fn=print):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
@@ -1373,13 +1556,16 @@ def _plan_gflat_chunks_for_channel(
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
-             psi_nmu_fresh=None, psi_mun_fresh=None):
+             psi_nmu_fresh=None, psi_mun_fresh=None,
+             zeta_contract=None):
 	"""Fit ISDF interpolation vectors ζ and write to HDF5.
 
 	The caller supplies (a) the full-range centroid wavefunctions
 	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
 	``load_centroids_band_chunked``) and (b) the chunk plan dict from
-	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  Returns
+	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  ``chunks`` may be
+	``None`` only when ``zeta_contract`` carries a completed canonical reuse
+	verdict, in which case no fit-only planner state is consumed.  Returns
 	``(zeta_h5_path, mem_est, transverse_wfn_data)``.
 
 	``psi_nmu_fresh``/``psi_mun_fresh``: the two-face carrier, required
@@ -1406,285 +1592,94 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# through every call would be churn for no benefit).
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
 
-	# ISDF left/right band windows (pair density needs asymmetric ranges),
-	# and the ``zeta_nband`` decoupling if the deck asked for one.
-	# ONE resolved edge, three consumers.  ``cfg.zeta_nband`` is the deck's
-	# logical request; ``resolve_zeta_fit_edge`` compares it against the
-	# PADDED ``band_slices.b4`` and returns None when there is nothing to
-	# narrow.  Reading ``cfg.zeta_nband`` directly below would let the three
-	# gates disagree about whether this run is decoupled at all.
-	zeta_edge = resolve_zeta_fit_edge(
-		band_slices, getattr(cfg, "zeta_nband", None))
-	band_range_left, band_range_right = zeta_fit_band_ranges(
-		band_slices, zeta_edge, log=print_fn)
-	assert_isdf_window_is_the_max(
-		band_slices, band_range_right, zeta_edge, log=print_fn)
-	check_zeta_fit_windows(
-		getattr(wfn, "energies", None), band_range_left, band_range_right,
-		zeta_edge,
-		(int(zeta_edge) if zeta_edge is not None
-		 else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4)),
-		log=print_fn)
+	if zeta_contract is None:
+		zeta_contract = _resolve_zeta_fit_contract(
+			wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
+			tmp_dir, print_fn=print_fn)
+	band_range_left = zeta_contract.band_range_left
+	band_range_right = zeta_contract.band_range_right
+	zeta_h5_path = zeta_contract.zeta_h5_path
+	_band_norms = zeta_contract.band_norms
+	_zeta_cutoff = zeta_contract.zeta_cutoff
+	_zeta_vcoul_cutoff = zeta_contract.zeta_vcoul_cutoff
+	_write_ibz_only_charge = zeta_contract.write_ibz_only_charge
 
 	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
 	# picked once by ``plan_gflat_chunks`` in the caller and live in
 	# ``chunks``; fit_zeta is a pure consumer.
-	mem_est = chunks.get('memory_estimate', {})
-
-	zeta_h5_path = os.path.join(tmp_dir, "zeta_q.h5")
-	_check_zeta_h5_matches_basis(zeta_h5_path, int(meta.n_rmu), print_fn,
-	                             fft_grid=meta.fft_grid)
-	print_fn(f"\n  Chunked ISDF fitting:")
-	print_fn(f"    Band chunks: {chunks['band_chunk']}")
-	print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
-	print_fn(f"    Q chunks:    {chunks['q_chunk']}")
-	print_fn("    ψ(r) source: " + (
-		"hoisted all-band cache" if chunks.get('cache_psi_r', True)
-		else "streamed band-chunk FFT"))
-	if chunks.get('gflat_chunk_size') is not None:
-		print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
-	print_fn(f"    Zeta output: {zeta_h5_path}")
-
-	# Band norms for pseudobands normalization (1.0 for deterministic bands)
-	_band_norms = getattr(wfn, 'band_norms', None)
-
-	# IBZ-only writes activate when sym is present, ``LORRAX_FORCE_FULL_BZ``
-	# is not set, and the charge centroid set passes orbit closure
-	# (checked downstream).  The bispinor V_q orchestrator consumes the
-	# IBZ-only ζ̃_C identically to the 2-comp path; see derivation in
-	# ``reports/bispinor_ibz_2026-05-16/derivation.md``.
-	#
-	# ``env_bool``, not ``bool(int(os.environ.get(...)))``: the latter
-	# accepts only decimal digits, so the natural spellings of this knob —
-	# ``=1`` works but ``=true``/``=on``/``=yes`` raise a bare
-	# ``ValueError: invalid literal for int() with base 10`` from inside
-	# ISDF setup, and ``=2`` silently means "on".  All five sites that read
-	# this variable (three here, ``gw/v_q_g_flat.py``, ``gw/screening.py``)
-	# were converted together — a knob with two grammars is worse than one
-	# with a single wrong grammar, because then the failure depends on
-	# which code path reads it first.
-	_force_full_bz_fit = env_bool(
-		'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
-	_write_ibz_only_charge = not _force_full_bz_fit
-	# Two cutoffs control the bare-Coulomb / ζ-sphere construction:
-	#   * ``bare_coulomb_cutoff_ry`` — V_q's sqrt_v(q+G) mask.
-	#   * ``zeta_cutoff_ry``         — the on-disk per-q ζ sphere
-	#                                   (writer's ``ngk[q]`` is taken
-	#                                   from this).
-	# Both default to ``wfn.ecutwfc`` (matches BGW's
-	# ``screened_coulomb_cutoff`` default), and both have an upper
-	# bound of ``wfn.ecutrho`` (the density grid is the largest cutoff
-	# the FFT box can represent).  ``zeta_cutoff_ry`` must be
-	# ≥ ``bare_coulomb_cutoff_ry`` — V_q reads ζ̃ at every G inside its
-	# bare-Coulomb sphere, so anything the V_q kernel needs has to be
-	# stored on disk.
-	def _resolve_cutoff(val, label, hi):
-		if val is None:
-			return float(wfn.ecutwfc)
-		v = float(val)
-		if v > hi + 1e-9:
-			raise ValueError(
-				f"{label} = {v} Ry exceeds ecutrho = {hi} Ry "
-				f"(the FFT grid can't represent G's past ecutrho).")
-		return v
-
-	_ecutrho = float(wfn.ecutrho)
-	_zeta_vcoul_cutoff = _resolve_cutoff(
-		cfg.head.bare_coulomb_cutoff, "bare_coulomb_cutoff", _ecutrho)
-	_zeta_cutoff = _resolve_cutoff(
-		cfg.head.zeta_cutoff, "zeta_cutoff", _ecutrho)
-	if _zeta_vcoul_cutoff > _zeta_cutoff + 1e-9:
-		raise ValueError(
-			f"bare_coulomb_cutoff = {_zeta_vcoul_cutoff} Ry > "
-			f"zeta_cutoff = {_zeta_cutoff} Ry.  The V_q kernel reads "
-			f"ζ̃(q+G) at every G inside its sphere; ζ must be stored at "
-			f"least as wide.  Increase zeta_cutoff (≤ ecutrho = "
-			f"{_ecutrho} Ry) or lower bare_coulomb_cutoff.")
-	print_fn(
-		f"    cutoffs: zeta = {_zeta_cutoff:.1f} Ry, "
-		f"bare-Coulomb = {_zeta_vcoul_cutoff:.1f} Ry  "
-		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={_ecutrho:.1f})")
-	# ── Bispinor PRE-FLIGHT (audit fix/zq 2026-07-28): resolve the
-	# transverse distributed-LU contract BEFORE any compute.  The
-	# divisibility refusal (isdf/core._resolve_solver_kind_transverse)
-	# used to fire only inside the transverse fit_zeta_to_h5 calls below,
-	# which run AFTER the charge fit completes, so an explicit
-	# distributed_lu whose transverse centroid count does not divide the
-	# mesh burned the multi-hour charge fit before the inevitable
-	# ValueError.  Every input needed to refuse — mesh shape,
-	# distributed_lu, the transverse centroid count — is known right here
-	# (one text-file read), so a doomed run refuses in seconds; the same
-	# call announces an ``auto`` demotion up front (rank 0).  The
-	# per-channel resolution inside fit_zeta_to_h5 later re-resolves
-	# identically (defense in depth).
-	#
-	# The pre-flight also OWNS the transverse channel's identity for the
-	# rest of this function (2026-08-04): the centroid table, its μ
-	# extent, ``meta_T`` and the resolved solver kind are all needed
-	# before the ζ-reuse decision — which now covers the transverse
-	# channel — and were previously rebuilt from scratch after the charge
-	# fit.  One construction site, consumed by the provenance stamp, the
-	# reuse check, the ψ sampling and the μ_L fit loop alike.
-	_meta_T = None
-	_cent_T_idx = None
-	_transverse_identity = None
+	mem_est = chunks.get('memory_estimate', {}) if chunks is not None else {}
+	if chunks is not None:
+		print_fn(f"\n  Chunked ISDF fitting:")
+		print_fn(f"    Band chunks: {chunks['band_chunk']}")
+		print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
+		print_fn(f"    Q chunks:    {chunks['q_chunk']}")
+		print_fn("    ψ(r) source: " + (
+			"hoisted all-band cache" if chunks.get('cache_psi_r', True)
+			else "streamed band-chunk FFT"))
+		if chunks.get('gflat_chunk_size') is not None:
+			print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
+		print_fn(f"    Zeta output: {zeta_h5_path}")
+	if zeta_contract.reuse:
+		print_fn("")
+		print_fn("  " + "=" * 68)
+		print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
+		if cfg.bispinor:
+			print_fn("  ...and the three transverse ζ at "
+			         "zeta_q_mu{1,2,3}.h5.")
+		print_fn("  isdf_header/zeta_is_done is True, the centroid table")
+		print_fn("  matches, and fit_provenance is identical to this run's")
+		print_fn("  inputs (band windows, cutoffs, solver knobs, source WFN).")
+		print_fn("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+		print_fn("  " + "=" * 68)
+		print_fn("")
+		if not cfg.bispinor:
+			return zeta_h5_path, mem_est, None
+		print_fn(
+			f"  [bispinor] re-sampling ψ at the "
+			f"{int(zeta_contract.meta_transverse.n_rmu)} transverse "
+			"centroids for σ^B (the ζ_T fit is skipped, but Σ^B still "
+			"needs ψ(r_{μ_T})).")
+		return zeta_h5_path, mem_est, _transverse_wfn_data(
+			wfn, sym, zeta_contract.meta_transverse,
+			zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
+			zeta_contract.loader_band_chunk)
+	# The non-reusable bispinor path now consumes the transverse identity
+	# already resolved by the all-channel contract.  Only the fit-specific
+	# chunk plan remains here.
+	_meta_T = zeta_contract.meta_transverse
+	_cent_T_idx = zeta_contract.centroids_transverse
+	_transverse_identity = zeta_contract.transverse_identity
 	_chunks_T = None
-	# Transverse ζ IBZ-write activates whenever the bispinor V_q
-	# orchestrator iterates IBZ q's — the SAME gate the charge ζ uses,
-	# so it is derived from the charge value rather than re-reading the
-	# environment (one env_bool call, one announcement).
-	_write_ibz_only_transverse = bool(cfg.bispinor) and _write_ibz_only_charge
+	_write_ibz_only_transverse = zeta_contract.write_ibz_only_transverse
 	if cfg.bispinor:
-		# Requirement check hoisted with the pre-flight (it used to sit
-		# after the charge fit, same late-refusal shape).
-		if not getattr(cfg.paths, 'centroids_file_current', None):
-			raise ValueError(
-				"Bispinor calculation requires centroids_file_current in cohsex.in "
-				"(set to the path of a current-density kmeans output, e.g. "
-				"centroids_frac_NNN_current.txt from "
-				"`centroid.kmeans_cli --density-mode current ...`)."
-			)
-		import dataclasses
-		from file_io.centroids import load_centroids as _load_cent_pf
-		from isdf.core import _resolve_solver_kind_transverse
-		from runtime.padding import padded_mu_extent
-		_, _cent_T_idx_np, _n_rmu_T_pf = _load_cent_pf(
-			cfg.paths.centroids_file_current, meta.fft_grid)
-		_transverse_solver_kind = _resolve_solver_kind_transverse(
-			mesh_xy, cfg.backend.distributed_lu,
-			n_rmu_logical=int(_n_rmu_T_pf),
-			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
-		_cent_T_idx = jnp.asarray(_cent_T_idx_np, dtype=jnp.int32)
-		# n_rmu_padded uses world_size (= ∏ p_a over the device mesh).
-		# Without this refresh the bispinor transverse fit_zeta inherits
-		# the charge-channel padded extent, and the C_q reshape at
-		# isdf_fitting.py:1442 trips a TypeError when the transverse
-		# centroid count differs from the charge count.
-		# ``padded_mu_extent`` also honors the test-only
-		# LORRAX_EXTRA_MU_PAD knob (pad-extent-invariance gate).
-		_meta_T = dataclasses.replace(
-			meta,
-			n_rmu=int(_n_rmu_T_pf),
-			n_rmu_padded=int(padded_mu_extent(int(_n_rmu_T_pf),
-			                                  int(jax.device_count()))),
-		)
-		# ``sys_dim`` is set dynamically on ``meta`` by gw_jax.main
-		# (Meta has no sys_dim field), so dataclasses.replace doesn't
-		# carry it over.  Copy it explicitly — fit_zeta_to_h5 reads
-		# meta.sys_dim when building the per-q G-flat sphere.
-		_meta_T.sys_dim = meta.sys_dim
-		# Hashed off the HOST table (no device round-trip), which is the
-		# same int64 view ``_centroid_table_md5`` takes of the device
-		# array stamped on the restart tensors — the two hashes of one
-		# centroid file are equal by construction.
-		_transverse_identity = {
-			'n_rmu':          int(_n_rmu_T_pf),
-			'centroids_md5':  _centroid_table_md5(_cent_T_idx_np),
-			'distributed_lu': str(cfg.backend.distributed_lu).strip().lower(),
-			'solver_kind':    str(_transverse_solver_kind),
-		}
+		_cent_T_idx = jnp.asarray(
+			zeta_contract.centroids_transverse, dtype=jnp.int32)
 		# Chunk-plan the TRANSVERSE channel SEPARATELY from the charge
 		# ``chunks`` this function was handed.  μ_T is typically ≈ μ_C/3,
 		# and reusing the charge-sized plan unchanged for all three ζ_T
 		# fits is exactly the register row this closes: "three ζ_T fits
 		# inherit the CHARGE chunk plan (μ_T≈μ_C/3): ~3x extra r-chunks,
-		# ~2.7 GB/rank avoidable gather".  ONE call here, ahead of both
-		# the ζ-reuse decision and the μ_L loop, so the ψ sampling (fit
-		# AND reuse paths) and all three Lorentz components — which share
-		# one transverse centroid set — share one transverse-sized plan,
-		# exactly mirroring how the charge channel gets one plan.
+		# ~2.7 GB/rank avoidable gather".  ONE call here, after reuse was
+		# definitively declined and ahead of the μ_L fit loop; all three
+		# Lorentz components share this one transverse-sized plan.
 		_chunks_T, _ = _plan_gflat_chunks_for_channel(
 			meta=_meta_T, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
 			is_bispinor=True, print_fn=print_fn)
-	# ── ζ REUSE: skip the fit when the ζ files are complete AND provably
-	# the same fit.  Before this, a rerun in the same directory always
-	# refit (gw_init only VALIDATED the μ extent), costing 20+ min at
-	# fixture scale and ~22 min at MoS2 12×12/P=80 for a byte-identical
-	# result.  Override with LORRAX_FORCE_REFIT=1.
-	#
-	# BISPINOR (2026-08-04).  Reuse used to be gated off for the whole
-	# bispinor run — ``_reuse = (not cfg.bispinor) and ...`` — because
-	# the bispinor branch also returns ``transverse_wfn_data`` and "that
-	# is not on disk".  It does not need to be: that dict is ψ sampled at
-	# the transverse centroids (plus meta_T and the centroid table), a
-	# pure function of WFN.h5 + the centroid file that the ζ_T fit does
-	# not contribute to.  The reuse path REBUILDS it via
-	# ``_transverse_wfn_data`` — the same call the fit path makes —
-	# instead of returning None.  Returning None here would silently drop
-	# Σ^B (rc=0, wrong physics), which is exactly the failure commit
-	# 3d89885 fixed on the restart round-trip.  Measured at b600 bispinor
-	# (job 7885966) the rebuild costs ~9 s against a 318 s refit.
-	#
-	# A bispinor reuse is ALL FOUR channels or none: the charge ζ and all
-	# three ζ_T must each pass, or every one is refit.  Partial reuse
-	# would be defensible (the channels are numerically independent) but
-	# it doubles the number of states this cache can be in for no
-	# measured gain — the expensive case is the whole set.
-	_provenance = _zeta_fit_provenance(
-		wfn=wfn, meta=meta, cfg=cfg,
-		band_range_left=band_range_left, band_range_right=band_range_right,
-		zeta_cutoff=_zeta_cutoff, zeta_vcoul_cutoff=_zeta_vcoul_cutoff,
-		write_ibz_only=_write_ibz_only_charge, band_norms=_band_norms,
-		vertex_mu_L=0, transverse_identity=_transverse_identity)
+	# Fresh writers and provenance stamps consume exactly the identity that
+	# was tested before planning; there is no second reconstruction here.
+	_provenance = zeta_contract.provenance
 
 	def _provenance_T(mu_L):
-		"""The charge stamp with this transverse channel's μ and vertex."""
-		return _zeta_fit_provenance(
-			wfn=wfn, meta=_meta_T, cfg=cfg,
-			band_range_left=band_range_left,
-			band_range_right=band_range_right,
-			zeta_cutoff=_zeta_cutoff, zeta_vcoul_cutoff=_zeta_vcoul_cutoff,
-			write_ibz_only=_write_ibz_only_transverse,
-			band_norms=_band_norms,
-			vertex_mu_L=int(mu_L), transverse_identity=_transverse_identity)
+		return zeta_contract.provenance_transverse[int(mu_L) - 1]
 
 	_zeta_T_paths = {
-		mu_L: os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
-		for mu_L in (1, 2, 3)
+		mu_L: path for mu_L, path in
+		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	_q_irr_identity = bool(sym.q_irr_is_full_identity)
-	_reuse = _zeta_reuse_ok(
-		zeta_h5_path, _provenance, centroid_indices, print_fn=print_fn,
-		n_rmu_expected=int(meta.n_rmu),
-		q_irr_is_full_identity=_q_irr_identity)
-	if _reuse and cfg.bispinor:
-		for mu_L, _zeta_T_path in _zeta_T_paths.items():
-			if not _zeta_reuse_ok(
-					_zeta_T_path, _provenance_T(mu_L), _cent_T_idx,
-					print_fn=print_fn,
-					n_rmu_expected=int(_meta_T.n_rmu),
-					q_irr_is_full_identity=_q_irr_identity):
-				print_fn(
-					f"    [zeta reuse] the transverse ζ for μ_L={mu_L} "
-					f"({_zeta_T_path}) is NOT reusable, so the charge ζ is "
-					f"not reused either — refitting all four channels.")
-				_reuse = False
-				break
-	if _reuse:
-		print_fn("")
-		print_fn("  " + "=" * 68)
-		print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
-		if cfg.bispinor:
-			print_fn( "  ...and the three transverse ζ at "
-			          "zeta_q_mu{1,2,3}.h5.")
-		print_fn( "  isdf_header/zeta_is_done is True, the centroid table")
-		print_fn( "  matches, and fit_provenance is identical to this run's")
-		print_fn( "  inputs (band windows, cutoffs, solver knobs, source WFN).")
-		print_fn( "  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
-		print_fn("  " + "=" * 68)
-		print_fn("")
-		if not cfg.bispinor:
-			return zeta_h5_path, mem_est, None
-		# ψ at r_{μ_T} is NOT on disk here (the restart tensors file is a
-		# different mechanism and may not exist yet), so re-sample it.
-		# Same call as the fit path — see ``_transverse_wfn_data``.
-		print_fn(f"  [bispinor] re-sampling ψ at the {int(_meta_T.n_rmu)} "
-		         f"transverse centroids for σ^B (the ζ_T fit is skipped, "
-		         f"but Σ^B still needs ψ(r_{{μ_T}})).")
-		return zeta_h5_path, mem_est, _transverse_wfn_data(
-			wfn, sym, _meta_T, _cent_T_idx, cfg, mesh_xy,
-			band_slices, _chunks_T)
-
+	if chunks is None:
+		raise AssertionError(
+			"a non-reusable zeta reached fit_zeta without the canonical "
+			"G-flat chunk plan")
 	with timing.section("gw_jax.zeta_fit_chunked"), jax_profile.trace_section("zeta_fit"):
 		peak_bytes = fit_zeta_to_h5(
 			wfn=wfn, sym=sym, meta=meta,
@@ -1917,7 +1912,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		cents_curr_idx = _cent_T_idx
 		transverse_wfn_data = _transverse_wfn_data(
 			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
-			band_slices, _chunks_T)
+			band_slices, _chunks_T['band_chunk'])
 		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
 		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
 
@@ -2512,13 +2507,13 @@ def prepare_isdf_and_wavefunctions(
 ):
 	"""ISDF pipeline (non-restart path reads top-to-bottom):
 
-	  1. ``plan_gflat_chunks`` → band/r/q/G-flat chunk plan.
-	  2. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
-	  3. ``fit_zeta`` → ζ.h5 (consumes ψ slices for pair density).
-	  4. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).
-	  5. Flush V_q / G0 / enk + W0 placeholder to restart H5 (mode="w").
-	  6. ``build_wavefunctions`` → 4-copy Wavefunctions bundle (reuses ψ).
-	  7. Append ``psi_full_y`` (= wfns.psi_yr) to restart H5 (mode="a").
+	  1. Resolve the canonical all-channel ζ reuse contract.
+	  2. If refitting, ``plan_gflat_chunks`` → band/r/q/G-flat chunk plan.
+	  3. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
+	  4. ``fit_zeta`` → reuse or write ζ.h5.
+	  5. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).
+	  6. Flush V_q / G0 / enk + W0 placeholder to restart H5 (mode="w").
+	  7. Build the downstream Wavefunctions bundle from the same ψ.
 
 	Returns SimpleNamespace(V_qmunu, wf_bundle).
 	"""
@@ -2533,18 +2528,11 @@ def prepare_isdf_and_wavefunctions(
 	from .restart_q_storage import (resolve_restart_q_storage_for_run,
 	                                take_pre_unfold)
 
-	# THE DRIVER-ENTRY MIRROR of the parse-time low_mem_bands envelope
-	# check (``LorraxConfig.from_input_file`` already ran this on the
-	# production path — ``gw_jax.main`` never reaches this function without
-	# it).  No-op there, so this costs nothing on the path it duplicates;
-	# what it buys is a hand-built ``cfg`` (a test harness, a future direct
-	# caller) refusing HERE, before the chunk planner / ISDF fit / restart
-	# tensor read below, rather than reaching a bare AttributeError deep in
-	# an unported consumer.  Same two-call-site shape as
-	# ``refuse_unimplemented_compute_mode`` (parser + ``compute_sigma_xc``)
-	# for the same reason.  Replaces the two bispinor-only ad hoc guards
-	# this function used to carry on its own fresh/restart branches: this
-	# single call covers all four table rows, earlier, on both branches.
+	# Driver-entry mirror of the parse-time low_mem_bands compatibility
+	# resolver for hand-built configs.  The deck-key refusal table is now
+	# empty: standard charge/bispinor fresh and restart paths are certified;
+	# retaining the one centralized call keeps future capability rows from
+	# growing ad-hoc guards in either branch.
 	refuse_unsupported_low_mem_bands(cfg)
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).
@@ -2554,25 +2542,41 @@ def prepare_isdf_and_wavefunctions(
 		from common.wfn_transforms import get_enk_bandrange
 
 		with mesh_xy:
-			# Plan chunk sizes ONCE for the CHARGE channel — the single
-			# production planner owns band_chunk / chunk_r / q_chunk /
-			# gflat_chunk_size, the rank floor P_min, and the binding-stage
-			# report.  ``_plan_gflat_chunks_for_channel`` is the one call
-			# site both this (charge) and ``fit_zeta``'s own transverse
-			# re-plan (μ_T ≈ μ_C/3) go through, so the two channels cannot
-			# drift apart.
-			chunks, gflat_plan = _plan_gflat_chunks_for_channel(
-				meta=meta, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
-				is_bispinor=bool(cfg.bispinor), print_fn=print0)
+			# Resolve the complete charge/bispinor zeta identity before
+			# allocating or pricing anything used solely by a fit.  The one
+			# contract includes transverse centroid/solver provenance and an
+			# all-four-channel verdict when bispinor=true.
+			zeta_contract = _resolve_zeta_fit_contract(
+				wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
+				tmp_dir, print_fn=print0)
+			zeta_reused = bool(zeta_contract.reuse)
+
+			# Plan chunks ONCE for a channel that will actually FIT.  The
+			# canonical planner still owns band/r/q/G-flat chunks, P_min and
+			# the binding-stage report; a proven reuse bypasses that fit-only
+			# lifecycle completely.  fit_zeta's transverse re-plan uses this
+			# same owner, so fresh charge and transverse channels cannot drift.
+			chunks = None
+			gflat_plan = None
+			if not zeta_reused:
+				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
+					meta=meta, cfg=cfg, band_slices=band_slices,
+					mesh_xy=mesh_xy, is_bispinor=bool(cfg.bispinor),
+					print_fn=print0)
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by
-			# both the zeta fit (sliced into halves internally) and the
-			# downstream Wavefunctions bundle.
+			# a fresh zeta fit (sliced into halves internally) and always by
+			# the downstream Wavefunctions bundle.  The loader owns its own
+			# FFT-scan memory plan; it does not need a fabricated fit plan on
+			# the reuse path.
+			load_band_chunk = (
+				chunks['band_chunk'] if chunks is not None
+				else zeta_contract.loader_band_chunk)
 			with timing.section("gw_jax.load_centroid_wfns"):
 				psi_rmu_Y, psi_rmuT_X = load_centroids_band_chunked(
 					wfn, sym, meta, centroid_indices, cfg.bispinor, mesh_xy,
 					band_range=band_slices.full_range,
-					band_chunk_size=chunks['band_chunk'],
+					band_chunk_size=load_band_chunk,
 				)
 
 			# ``low_mem_bands = true``: convert to the two-face carrier
@@ -2590,9 +2594,8 @@ def prepare_isdf_and_wavefunctions(
 			# wavefunction_bundle.build_wavefunctions_face's docstring,
 			# whose derivation this mirrors exactly, just earlier and
 			# reused across the fit AND the post-fit bundle instead of
-			# rebuilt for each).  bispinor + low_mem_bands is already
-			# refused above (refuse_unsupported_low_mem_bands), so this
-			# never collides with the bispinor loader branch below.
+			# rebuilt for each).  This carrier is shared by the certified
+			# charge and bispinor low_mem_bands paths.
 			psi_nmu_fresh = None
 			psi_mun_fresh = None
 			if cfg.memory.low_mem_bands:
@@ -2618,7 +2621,8 @@ def prepare_isdf_and_wavefunctions(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
 				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0,
-				psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh)
+				psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh,
+				zeta_contract=zeta_contract)
 			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
 			# the pipeline right after ζ-fit, before the expensive V_q
 			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_DEBUG_PRINT=1
@@ -2926,10 +2930,9 @@ def prepare_isdf_and_wavefunctions(
 				"are not available.  Rerun with restart = false (the placement "
 				"changes W, so an inherited W0 would be the wrong object "
 				"anyway).")
-		# bispinor + low_mem_bands (and the other three envelope rows)
-		# already refused at this function's entry
-		# (refuse_unsupported_low_mem_bands), before either restart branch
-		# above ran.
+		# low_mem_bands, including bispinor, is supported on this restart
+		# branch.  The entry resolver above is a centralized compatibility
+		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
 		from file_io.qp_wfn import refuse_conflicting_qp_state_sources
 		_qp_state_wfn = getattr(wfn, 'path', None)
