@@ -11,6 +11,8 @@ once before entering this module.
 
 import jax.numpy as jnp
 
+from common.gamma_matrices import paulis
+
 
 # Half the fine-structure constant α (Hartree atomic units).  Single home
 # for the bispinor small-component scale — both the non-batched reference
@@ -35,6 +37,68 @@ KINETIC_BALANCE_LIFT_PROVENANCE = (
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
 )
+
+
+def sigma_dot_cartesian(psi_L, vector_cart):
+    r"""Apply ``sigma . vector_cart`` to a large-component spinor block.
+
+    ``psi_L`` has shape ``(..., band, 2, G)`` and ``vector_cart`` has the
+    paired shape ``(..., G, 3)``.  The Cartesian components use the canonical
+    Pauli matrices from :mod:`common.gamma_matrices`; no charge, velocity, or
+    unit-conversion prefactor is included here.
+
+    The explicit two-component boundary is intentional.  A four-component
+    input is already lifted and must not be sliced or lifted a second time.
+    """
+    psi = jnp.asarray(psi_L)
+    vector = jnp.asarray(vector_cart)
+    if psi.ndim < 3 or int(psi.shape[-2]) != 2:
+        raise ValueError(
+            "sigma_dot_cartesian requires explicit Psi_L with shape "
+            f"(..., band, 2, G), got {tuple(psi.shape)}")
+    expected_vector_shape = psi.shape[:-3] + (psi.shape[-1], 3)
+    if vector.shape != expected_vector_shape:
+        raise ValueError(
+            "sigma_dot_cartesian requires vector_cart paired with Psi_L: "
+            f"expected {expected_vector_shape}, got {tuple(vector.shape)}")
+    return jnp.einsum(
+        "aij,...ga,...bjg->...big", paulis, vector, psi,
+        optimize=True)
+
+
+def kinetic_balance_lift_jet(psi_L, K_cart_bohr_inv):
+    r"""Return the kinetic-balance lift and its three endpoint derivatives.
+
+    Holding the explicit two-component ``psi_L`` fixed, this is the exact
+    Cartesian jet of
+
+    ``Psi(K) = [psi_L; (ALPHA_FS/2) (sigma.K) psi_L]``.
+
+    ``K_cart_bohr_inv`` has shape ``(..., G, 3)`` in bohr^-1, paired with
+    ``psi_L`` of shape ``(..., band, 2, G)``.  The returned value has shape
+    ``(..., band, 4, G)`` and ``dPsi_dK`` has shape
+    ``(3, ..., band, 4, G)`` with the Cartesian derivative axis first.
+
+    The embedding is affine in each endpoint momentum, so
+    ``d2Psi/dK_a dK_b = 0`` exactly.  No ninefold zero wavefunction carrier
+    is allocated or returned.  Bra/ket endpoint routing, product rules, and
+    charge/current/contact prefactors belong to the downstream operator
+    owner; this neutral helper adds none of them.
+    """
+    psi = jnp.asarray(psi_L)
+    sigma_K_psi = sigma_dot_cartesian(psi, K_cart_bohr_inv)
+    halfalpha = jnp.complex128(HALFALPHA)
+    lifted = jnp.concatenate((psi, halfalpha * sigma_K_psi), axis=-2)
+
+    # First form (..., cart, band, spin, G), then keep the bounded Cartesian
+    # jet axis first for direct endpoint selection by a response consumer.
+    dpsi_small = halfalpha * jnp.einsum(
+        "aij,...bjg->...abig", paulis, psi, optimize=True)
+    cart_axis = psi.ndim - 3
+    dpsi_small = jnp.moveaxis(dpsi_small, cart_axis, 0)
+    dpsi_dK = jnp.concatenate(
+        (jnp.zeros_like(dpsi_small), dpsi_small), axis=-2)
+    return lifted, dpsi_dK
 
 
 def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
@@ -96,22 +160,9 @@ def lift_to_4spinor(psi_2, gvecs, kvecs, bvec_cart_bohr):
     (n_k, nb, 4, ngkmax) complex
         4-spinor ψ: ``[ψ_L ; ψ_S]`` along the spinor axis.
     """
-    halfalpha = jnp.complex128(HALFALPHA)
     # (k + G) in cartesian, per (k, g).
     pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
-    px = p_cart[..., 0].astype(jnp.complex128)
-    py = p_cart[..., 1].astype(jnp.complex128)
-    pz = p_cart[..., 2].astype(jnp.complex128)
-    # σ·p as a (2, 2) Pauli-contraction stacked per (k, g):
-    #   [[ pz, px - i*py],
-    #    [px + i*py, -pz]]
-    sdp = jnp.stack(
-        [jnp.stack([pz,  px - 1j * py], axis=-1),
-         jnp.stack([px + 1j * py, -pz], axis=-1)],
-        axis=-2,
-    )                                                         # (n_k, ngkmax, 2, 2)
-    # ψ_S[k, b, i, g] = halfalpha · Σ_j σ·p[k, g, i, j] · ψ_L[k, b, j, g]
-    psi_S = halfalpha * jnp.einsum(
-        "kgij,kbjg->kbig", sdp, psi_2[:, :, 0:2, :])
+    psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
+        psi_2, p_cart)
     return jnp.concatenate([psi_2, psi_S], axis=2)           # (n_k, nb, 4, ngkmax)
