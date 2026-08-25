@@ -59,6 +59,7 @@ from distrib_la import (                                            # noqa: E402
     plan as linalg_plan,
     resolve_backend as _resolve_linalg_backend,
     solve as linalg_solve,
+    solve_backward_error as _solve_backward_error,
 )
 
 
@@ -3654,6 +3655,26 @@ _transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
 _transverse_scalapack_cache: dict = {}  # hoisted distributed getrf kernels
 
 
+def _transverse_ridged_operator(
+    C_log: jax.Array,
+    n_log: int,
+    trace_per_q: jax.Array | None = None,
+) -> jax.Array:
+    """Return the exact logical operator used by every transverse LU.
+
+    ``trace_per_q`` is the already-hoisted trace on the fused distributed
+    route.  Other routes leave it unset and retain their historical
+    ``jnp.trace`` reduction.  Centralising the diagonal lift here makes the
+    factor, solve, and a-posteriori residual consume the same operator rather
+    than three independently spelled approximations to it.
+    """
+    trace = (jnp.trace(C_log, axis1=-2, axis2=-1)
+             if trace_per_q is None else trace_per_q)
+    ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(trace) / int(n_log)
+    eye = jnp.eye(int(n_log), dtype=C_log.dtype)
+    return C_log + ridge[..., None, None] * eye
+
+
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
     """Per-q hoisted transverse LU arithmetic — ONE kernel shared by the
     all-ranks and q-parallel executions (bit-identity contract, same role
@@ -3690,8 +3711,7 @@ def _transverse_lu_math(C_log: jax.Array, n_log: int):
     direction for a gate that fires when the number is LARGE.  See
     ``docs/dev/rank_truncation_policy.md`` §4.
     """
-    ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(jnp.trace(C_log)) / n_log
-    C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
+    C_reg = _transverse_ridged_operator(C_log, n_log)
     lu, piv, _perm = jax.lax.linalg.lu(C_reg)
     return lu, piv.astype(jnp.int32)
 
@@ -4001,11 +4021,9 @@ def _factor_c_q_transverse_scalapack(
             C_log = jax.lax.with_sharding_constraint(
                 C[:, :n_log, :n_log], xy_shard)
             trace_per_q = jnp.einsum('qii->q', C_log)
-            ridge = (_TRANSVERSE_LU_RIDGE
-                     * jnp.abs(trace_per_q) / n_log)[:, None, None]
-            eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
             return jax.lax.with_sharding_constraint(
-                C_log + ridge * eye_n, xy_shard)
+                _transverse_ridged_operator(
+                    C_log, n_log, trace_per_q), xy_shard)
         _transverse_scalapack_cache[key] = _prep
     C_reg = _transverse_scalapack_cache[key](C_q)
     # ``n=n_log`` is redundant with C_reg's own extent and passed anyway:
@@ -4882,7 +4900,13 @@ def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array
         zeta, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
 
 
-def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
+def _distributed_backsolve(
+    Z_q: jax.Array,
+    mesh_xy: Mesh,
+    run,
+    *,
+    return_aux: bool = False,
+):
     """RHS pad → distributed back-solve → output reshard → trim.
 
     THE shared frame for every ζ back-solve that keeps the factor
@@ -4909,15 +4933,21 @@ def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
     silent NaNs from a Z re-layout, T.4's per-r-chunk recompile of one),
     so there is exactly one copy to keep right.
 
-    ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.
+    ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.  With
+    ``return_aux=True`` it instead returns ``(ζ, aux)``; only ζ is reshaped,
+    while the small diagnostic payload passes through unchanged.  The default
+    keeps the historical array-only path.
     """
     Py = int(mesh_xy.shape['y'])
     _zpad = pad_last_axis_to(Z_q, Py)
     Z_pad, n_cols = _zpad.array, _zpad.logical   # LOGICAL, by name
-    zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(run(Z_pad), mesh_xy)
+    solved = run(Z_pad)
+    if return_aux:
+        solved, aux = solved
+    zeta_out = _reshard_zeta_mu_X_r_Y_to_mu_XY(solved, mesh_xy)
     if int(Z_pad.shape[-1]) != n_cols:
-        return zeta_out[:, :, :n_cols]
-    return zeta_out
+        zeta_out = zeta_out[:, :, :n_cols]
+    return (zeta_out, aux) if return_aux else zeta_out
 
 
 def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
@@ -4979,7 +5009,9 @@ def solve_zeta(
     zeta_gather: str = "replicated",
     lu_piv: jax.Array | None = None,
     distrib_la_batched_route: str = "auto",
-) -> jax.Array:
+    measure_backward_error: bool = False,
+    backward_error_norm_a: jax.Array | None = None,
+):
     """
     Solve for zeta_q given pre-computed system matrix from
     :func:`factor_c_q`.
@@ -5063,6 +5095,16 @@ def solve_zeta(
                      modes (reports/device_invariance_2026-07-08/
                      ROOT_CAUSE.md).  ``None`` keeps the padded extent
                      (back-compat for mesh-divisible callers).
+        measure_backward_error: Debug-only measurement for the fused
+                     distributed transverse LU.  When true, preserve one
+                     explicit RHS copy, measure the per-q normwise backward
+                     error before the output reshard, and return it beside ζ.
+                     This does not change the solve route or decide a
+                     tolerance.
+        backward_error_norm_a: Optional precomputed per-q ``||A||_F`` for
+                     that measurement.  The zeta driver supplies it once per
+                     channel; direct callers may omit it and pay one
+                     recomputation.
 
     Returns:
         zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
@@ -5071,6 +5113,8 @@ def solve_zeta(
                 G-flat FFT (``accumulate_rchunk_to_gflat``) wants:
                 each rank owns a μ-slab over the full r-extent, so the
                 per-rank cuFFT runs locally without resharding.
+        When ``measure_backward_error=True``, returns
+        ``(zeta_q, backward_error_per_q)``.
     """
     # A distributed factor arrives as an opaque :class:`FactorToken` (the
     # three library-handle routes) or as a plain sharded array (every JAX
@@ -5089,6 +5133,13 @@ def solve_zeta(
     mu_pad = n_rmu - n_log
 
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
+    if (measure_backward_error
+            and (isinstance(L_q, FactorToken)
+                 or solver_kind not in ('cusolvermp_lu', 'scalapack_lu'))):
+        raise ValueError(
+            "measure_backward_error applies only to the fused distributed "
+            "transverse LU; it does not change solver policy.  Got "
+            f"solver_kind={solver_kind!r}, factor={type(L_q).__name__}.")
 
     if isinstance(L_q, FactorToken):
         # THE THREE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
@@ -5213,23 +5264,59 @@ def solve_zeta(
             # MoS2 3×3 bispinor).  Both the trace and the denominator
             # must be LOGICAL quantities or the ridge (hence ζ) depends
             # on the pad extent.
-            LU_RIDGE = 1e-12
             trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
                            else jnp.einsum('qii->q', L_log))
-            ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
-            eye_n = jnp.eye(n_log, dtype=L_log.dtype)[None, :, :]
-            return _lu_plan.batched(L_log + ridge * eye_n, Z_log)
+            A_log = _transverse_ridged_operator(
+                L_log, n_log, trace_per_q)
+            return _lu_plan.batched(A_log, Z_log)
 
         def _run_lu(Z):
+            # The fused plan donates B into X.  Only the explicit diagnostic
+            # arm preserves a distinct copy; with measurement off this line
+            # and every operation below its guard are absent from the path.
+            B_reference = (jnp.copy(Z[:, :n_log, :])
+                           if measure_backward_error else None)
             zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z)
+            backward_error = None
+            if measure_backward_error:
+                # Phase B sliced q -> IBZ exactly once before solve_zeta.
+                # Reuse those rows here; a second q selector could silently
+                # compare X and B in different orders.  Rebuild A through the
+                # same owner used by the solve because its donated temporary
+                # no longer exists after getrf.
+                xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+                L_log = jax.lax.with_sharding_constraint(
+                    L_q[:, :n_log, :n_log], xy_shard)
+                trace_per_q = (cct_trace_per_q
+                               if cct_trace_per_q is not None
+                               else jnp.einsum('qii->q', L_log))
+                A_reference = jax.lax.with_sharding_constraint(
+                    _transverse_ridged_operator(
+                        L_log, n_log, trace_per_q), xy_shard)
+                X_log = jax.lax.with_sharding_constraint(
+                    zeta_xy[:, :n_log, :], xy_shard)
+                B_reference = jax.lax.with_sharding_constraint(
+                    B_reference, xy_shard)
+                backward_error = _solve_backward_error(
+                    A_reference, X_log, B_reference,
+                    mesh=mesh_xy,
+                    backend=('scalapack' if solver_kind == 'scalapack_lu'
+                             else 'cusolvermp'),
+                    # A diagnostic may not use batch_reshard: that route
+                    # materializes whole matrices on every device.
+                    batched_route='auto',
+                    norm_a=backward_error_norm_a)
             if mu_pad:
                 # solve_at_logical's zero-refill re-embeds at the padded
                 # extent; pin the layout back before the output reshard.
                 zeta_xy = jax.lax.with_sharding_constraint(
                     zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
-            return zeta_xy
+            return ((zeta_xy, backward_error)
+                    if measure_backward_error else zeta_xy)
 
-        return _distributed_backsolve(Z_q, mesh_xy, _run_lu)
+        return _distributed_backsolve(
+            Z_q, mesh_xy, _run_lu,
+            return_aux=bool(measure_backward_error))
 
     # Compute padding needed for even sharding across all devices
     total_devices = mesh_xy.devices.size
@@ -5260,12 +5347,11 @@ def solve_zeta(
     # Hermitian indefinite, but JAX doesn't expose it; ``jnp.linalg.solve``
     # uses LU with partial pivoting which handles indefinite matrices
     # correctly as long as they aren't actually singular.  We keep a
-    # small ridge ``LU_RIDGE·trace/n_rmu`` on the diagonal to lift any
+    # small ridge ``_TRANSVERSE_LU_RIDGE·|trace|/n_rmu`` on the diagonal
+    # to lift any
     # near-zero modes from TRS-paired band cancellations safely above
     # the LU stability floor — small enough not to perturb the
     # well-conditioned modes.
-    LU_RIDGE = _TRANSVERSE_LU_RIDGE
-
     # HOISTED transverse back-solve: factor_c_q already ran the pivoted
     # LU (once per channel) and handed us (LU factors, permutation).
     # This routine then only APPLIES lax.linalg.lu_solve per r-chunk —
@@ -5329,14 +5415,14 @@ def solve_zeta(
         different, per-extent-deterministic ζ_T, amplified O(1) in the
         near-null transverse modes; ROOT_CAUSE.md 2026-07-08).
 
-        ε = ``LU_RIDGE`` (1e-12) on the logical trace/denominator: well
+        ε = :data:`_TRANSVERSE_LU_RIDGE` on the logical
+        trace/denominator: well
         below any physically meaningful eigenvalue but above the
         partial-pivoting floor, so LU stays stable on TRS-paired
         near-zero modes without perturbing the rest of the spectrum.
         """
         def _ridged_lu(L_log, Z_log):
-            ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
-            L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
+            L_reg = _transverse_ridged_operator(L_log, n_log)
             return jnp.linalg.solve(L_reg, Z_log)
         return solve_at_logical(_ridged_lu, n_log, (L,), Z)
 
@@ -5708,6 +5794,7 @@ def _make_fit_one_rchunk_kernel(
     lu_hoisted: bool = False,
     distrib_la_batched_route: str = "auto",
     layout: str = "legacy",
+    measure_backward_error: bool = False,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` carrying
@@ -5845,7 +5932,13 @@ def _make_fit_one_rchunk_kernel(
             mesh_xy=mesh_xy,
         )
 
-    def solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv=None):
+    def solve_phase(
+        Z_q,
+        L_q,
+        cct_trace_per_q,
+        lu_piv=None,
+        backward_error_norm_a=None,
+    ):
         # IBZ-only solve (Phase B): L_q + cct_trace + lu_piv come in
         # PRE-SLICED at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
         # upstream in ``fit_zeta_to_h5``; the factor stage runs after the
@@ -5868,7 +5961,9 @@ def _make_fit_one_rchunk_kernel(
             n_rmu_logical=int(meta.n_rmu),
             zeta_gather=zeta_gather,
             lu_piv=lu_piv,
-            distrib_la_batched_route=distrib_la_batched_route)
+            distrib_la_batched_route=distrib_la_batched_route,
+            measure_backward_error=measure_backward_error,
+            backward_error_norm_a=backward_error_norm_a)
 
     @jax.jit
     def _kernel(
@@ -5937,10 +6032,12 @@ def fit_one_rchunk(
     solver_kind: str = 'auto',
     q_irr_full_idx: np.ndarray | None = None,
     cct_trace_per_q: jax.Array | None = None,
+    backward_error_norm_a: jax.Array | None = None,
     zeta_gather: str = 'replicated',
     lu_piv: jax.Array | None = None,
     distrib_la_batched_route: str = "auto",
     layout: str = "legacy",
+    measure_backward_error: bool = False,
     psi_mun: jax.Array | None = None,
     weight_l: jax.Array | None = None,
     weight_r: jax.Array | None = None,
@@ -6003,6 +6100,7 @@ def fit_one_rchunk(
         str(distrib_la_batched_route),
         bool(lu_piv is not None),
         str(layout),
+        bool(measure_backward_error),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -6026,6 +6124,7 @@ def fit_one_rchunk(
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),
             layout=str(layout),
+            measure_backward_error=bool(measure_backward_error),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -6061,8 +6160,21 @@ def fit_one_rchunk(
     _r1 = host_rss_gb() if _dbg else 0.0
     _t_s0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.solve"):
-        zeta = fn.solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv)
+        if measure_backward_error:
+            solved = fn.solve_phase(
+                Z_q, L_q, cct_trace_per_q, lu_piv,
+                backward_error_norm_a=backward_error_norm_a)
+        else:
+            # Preserve the historical call signature and traced operands when
+            # the measurement is off.
+            solved = fn.solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv)
+        if measure_backward_error:
+            zeta, backward_error = solved
+        else:
+            zeta = solved
         zeta.block_until_ready()
+        if measure_backward_error:
+            backward_error.block_until_ready()
     _t_s = (time.perf_counter() - _t_s0) if _dbg else 0.0
     if _dbg and jax.process_index() == 0:
         _r2 = host_rss_gb()
@@ -6070,7 +6182,7 @@ def fit_one_rchunk(
               f"solve={_t_s*1000:.0f}ms "
               f"d_zq={_r1 - _r0:+.3f}GB d_solve={_r2 - _r1:+.3f}GB",
               flush=True)
-    return zeta
+    return ((zeta, backward_error) if measure_backward_error else zeta)
 
 
 def _band_norms_slice(

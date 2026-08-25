@@ -35,12 +35,14 @@ from isdf.core import (
     _resolve_solver_kind,
     _resolve_zeta_gather,
     _band_norms_slice,
+    _transverse_ridged_operator,
 )
-# The opaque distributed factor.  Re-exported through isdf.core rather than
-# imported from the door here: this module never CALLS distrib_la, it only
-# has to tell a token from an array in two places (a log line and the
-# fused-route trace predicate).
+# The opaque factor remains re-exported through isdf.core.  The optional
+# backward-error measurement is the one reason this module now calls the
+# distrib_la door directly: it reuses the service's canonical distributed
+# Frobenius norm instead of spelling a reduction here.
 from isdf.core import FactorToken
+from distrib_la import frobenius_norm as _frobenius_norm
 
 
 # Running max of nvidia-smi used MB across all probe points within a run
@@ -771,6 +773,16 @@ def fit_zeta_to_h5(
                         f"distributed_cholesky at 'auto' (which gives "
                         f"replicated_rank_truncate) for this tier.")
                 _resolved_solver_kind = 'distributed_rank_truncate'
+        _measure_zeta_backward_error = (
+            env_bool("LORRAX_TRANSVERSE_ZETA_BACKWARD_ERROR", False)
+            and int(vertex_mu_L) != 0)
+        if (_measure_zeta_backward_error
+                and _resolved_solver_kind != 'cusolvermp_lu'):
+            raise ValueError(
+                "LORRAX_TRANSVERSE_ZETA_BACKWARD_ERROR measures the fused "
+                "distributed CUDA transverse LU and never changes solver "
+                "policy; this "
+                f"channel resolved to {_resolved_solver_kind!r}.")
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
@@ -868,6 +880,25 @@ def fit_zeta_to_h5(
             cct_trace_per_q.block_until_ready()
     else:
         cct_trace_per_q = None
+
+    # A is fixed for the whole transverse channel.  Under the opt-in
+    # measurement, pay its Frobenius sweep ONCE and thread only the replicated
+    # per-q norm through the r-chunk seam; recomputing it inside every chunk
+    # would be simpler by one argument but would reread nq*n_mu^2 values every
+    # time.  The operator itself comes from the same helper as the solve.
+    if _measure_zeta_backward_error:
+        if cct_trace_per_q is None:
+            raise RuntimeError(
+                "transverse zeta backward-error measurement reached a fused "
+                "LU without its logical per-q trace")
+        with timing.section("zeta_fit.backward_error_norm_a"):
+            _A_for_norm = _transverse_ridged_operator(
+                L_q[:, :n_rmu, :n_rmu], n_rmu, cct_trace_per_q)
+            backward_error_norm_a = _frobenius_norm(_A_for_norm)
+            backward_error_norm_a.block_until_ready()
+            del _A_for_norm
+    else:
+        backward_error_norm_a = None
 
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
@@ -1207,6 +1238,12 @@ def fit_zeta_to_h5(
     t_fit_total = 0.0
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
+    _backward_error_per_q_max = (
+        np.zeros((n_q_disk,), dtype=np.float64)
+        if _measure_zeta_backward_error else None)
+    _backward_error_max = -np.inf
+    _backward_error_worst_chunk = -1
+    _backward_error_chunks = 0
 
     # ``LORRAX_MEM_DEBUG=1`` — runtime probe of process-wide HBM at
     # named lifecycle sites.  The module-level ``mem_probe`` helper is
@@ -1358,7 +1395,7 @@ def fit_zeta_to_h5(
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
                  jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
-                zeta_chunk = fit_one_rchunk(
+                fitted_chunk = fit_one_rchunk(
                     psi_G_store=psi_G_store,
                     psi_r_cache=psi_r_cache,
                     psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
@@ -1379,14 +1416,36 @@ def fit_zeta_to_h5(
                     solver_kind=_resolved_solver_kind,
                     q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
                     cct_trace_per_q=cct_trace_per_q,
+                    backward_error_norm_a=backward_error_norm_a,
                     zeta_gather=_resolved_zeta_gather,
                     lu_piv=lu_piv,
                     distrib_la_batched_route=distrib_la_batched_route,
                     layout=('face' if low_mem_bands else 'legacy'),
+                    measure_backward_error=_measure_zeta_backward_error,
                     psi_mun=(psi_mun_fresh if low_mem_bands else None),
                     weight_l=(weight_l_face if low_mem_bands else None),
                     weight_r=(weight_r_face if low_mem_bands else None),
                 )
+                if _measure_zeta_backward_error:
+                    zeta_chunk, backward_error_per_q = fitted_chunk
+                    backward_error_host = np.asarray(
+                        jax.device_get(backward_error_per_q),
+                        dtype=np.float64)
+                    if backward_error_host.shape != (n_q_disk,):
+                        raise RuntimeError(
+                            "transverse zeta backward-error shape drift: "
+                            f"expected {(n_q_disk,)}, got "
+                            f"{backward_error_host.shape}")
+                    _backward_error_per_q_max = np.maximum(
+                        _backward_error_per_q_max, backward_error_host)
+                    _chunk_backward_error_max = float(
+                        np.max(backward_error_host))
+                    if _chunk_backward_error_max > _backward_error_max:
+                        _backward_error_max = _chunk_backward_error_max
+                        _backward_error_worst_chunk = chunk_idx
+                    _backward_error_chunks += 1
+                else:
+                    zeta_chunk = fitted_chunk
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
                 zeta_chunk.block_until_ready()
@@ -1503,6 +1562,16 @@ def fit_zeta_to_h5(
 
     t_chunks_total = time.perf_counter() - t_chunk_start
     r_progress.finish()
+    if _measure_zeta_backward_error and jax.process_index() == 0:
+        _worst_q = int(np.argmax(_backward_error_per_q_max))
+        print(
+            "  Transverse zeta backward-error measurement "
+            f"[gamma^{int(vertex_mu_L)}; "
+            f"{_backward_error_chunks}/{num_chunks} r-chunks]: "
+            f"max={_backward_error_max:.6e} at q-row {_worst_q}, "
+            f"r-chunk {_backward_error_worst_chunk}; per-q maxima retained. "
+            "This is not a condition estimate or a pass/fail gate.",
+            flush=True)
     # Sample GPU memory ONCE after the last chunk's jit settles.  The
     # allocator keeps the peak reservation so this reads close to the
     # all-time high water.

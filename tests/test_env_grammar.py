@@ -308,6 +308,7 @@ OWNED_BOOL_KNOBS = (
     "LORRAX_MALLOC_TRIM",
     "LORRAX_MEM_DEBUG",
     "LORRAX_RCHUNK_DEBUG",
+    "LORRAX_TRANSVERSE_ZETA_BACKWARD_ERROR",
     # Converted 2026-07-30 across ALL FIVE readers at once (gw_init.py x3,
     # gw/v_q_g_flat.py, gw/screening.py), which is what let it move from
     # CROSS_FILE_BOOL_KNOBS to here.  The whole-tree gate lives in

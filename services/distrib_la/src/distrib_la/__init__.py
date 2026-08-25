@@ -53,6 +53,11 @@ GemmPlan``
     ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
     B, C=None, *, out=None)`` is trace-safe: cuBLASMp only, one replicated
     leading batch (holds k), no transpose modes.
+``frobenius_norm(A)`` / ``solve_backward_error(A, X, B, *, mesh, ...)``
+    One portable owner for face-sharded matrix norms and the normwise direct-
+    solve certificate ``||AX-B||/(||A|| ||X||+||B||)``.  The latter reuses
+    :func:`matmul` and consumes ``B`` as the residual workspace; neither
+    operation gathers a matrix or decides a tolerance.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -113,6 +118,7 @@ from distrib_la.plan import (
     plan,
 )
 from distrib_la.polar import PolarPlan, plan_polar_factor, polar_factor
+from distrib_la.residual import frobenius_norm, solve_backward_error
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -137,6 +143,8 @@ __all__ = [
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan",
+    # numerical certificates (no tolerance/policy)
+    "frobenius_norm", "solve_backward_error",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_SCAN_UNROLL",
