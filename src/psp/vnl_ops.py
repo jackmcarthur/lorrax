@@ -352,7 +352,7 @@ def build_vnl_setup(
             q_max = 0.0
             for ik in range(sym.nk_tot):
                 G_pad, g_mask = tab.at(ik)
-                kvec = np.asarray(sym.unfolded_kpts[ik], dtype=float)
+                kvec = np.asarray(tab.kvecs[ik], dtype=float)
                 K_cart = (G_pad.astype(float) + kvec[None, :]) @ B
                 # Pad rows are G=(0,0,0), i.e. |k| — small, but not
                 # provably below the physical maximum, so zero them
@@ -667,7 +667,7 @@ def build_vnl_kdata(
 
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     G_pad, g_mask = tab.at(k_idx)
-    kvec = np.asarray(sym.unfolded_kpts[k_idx], dtype=float)
+    kvec = np.asarray(tab.kvecs[int(k_idx)], dtype=float)
     kdata = _build_vnl_kdata_core(kvec, np.asarray(G_pad, dtype=int),
                                   setup, compute_dZ=compute_dZ)
     mask_j = jnp.asarray(g_mask, dtype=kdata.Z.real.dtype)
