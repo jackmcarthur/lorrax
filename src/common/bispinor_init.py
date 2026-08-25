@@ -21,6 +21,21 @@ HALFALPHA = 0.00364867628215
 # rather than re-spelled by current-vertex consumers.
 ALPHA_FS = 2.0 * HALFALPHA
 
+# Public provenance for the exact model component this module defines.  The
+# lift plus the dimensionless alpha_i vertex determines a positive-energy
+# no-pair PARAMAGNETIC current correlator.  It deliberately says nothing about
+# the same-Hamiltonian contact, gauged nonlocal pseudopotential, or eliminated
+# negative-energy sector required for an electromagnetic response.
+NO_PAIR_DIRAC_CURRENT_MODEL = (
+    "positive_energy_kinetic_balance_dirac_current_v1"
+)
+KINETIC_BALANCE_LIFT_PROVENANCE = (
+    "psi_S=(alpha_fs/2)*sigma.p*psi_L"
+)
+DIRAC_ALPHA_VERTEX_PROVENANCE = (
+    "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
+)
+
 
 def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
     """Compute the small (lower) spinor component from the large (upper).

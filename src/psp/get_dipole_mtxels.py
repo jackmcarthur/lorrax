@@ -54,7 +54,10 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
 from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
-from common.bispinor_init import ALPHA_FS
+from common.bispinor_init import (
+	ALPHA_FS, DIRAC_ALPHA_VERTEX_PROVENANCE,
+	KINETIC_BALANCE_LIFT_PROVENANCE, NO_PAIR_DIRAC_CURRENT_MODEL,
+)
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import read_lorrax_input as read_cohsex_input
@@ -1566,10 +1569,9 @@ def main(argv=None):
 						"(E_c(k-q)-E_v(k))_Ry*rho_cvkq + "
 						"q_cart_bohr^-1 dot (2*alpha_cvkq/alpha_fs)")
 					ds_ward.attrs['energy_source'] = "WFN mean-field eigenvalues"
-					fq.attrs['selected_current_model'] = (
-						"no_pair_kinetic_balance_raw_dirac_alpha")
-					fq.attrs['selected_current_lift'] = (
-						"psi_S=(alpha_fs/2)*sigma.p*psi_L")
+					fq.attrs['selected_current_model'] = NO_PAIR_DIRAC_CURRENT_MODEL
+					fq.attrs['selected_current_lift'] = KINETIC_BALANCE_LIFT_PROVENANCE
+					fq.attrs['selected_current_operator'] = DIRAC_ALPHA_VERTEX_PROVENANCE
 					fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
 					fq.attrs['alpha_fs'] = float(ALPHA_FS)
 	barrier("dipole_write")
