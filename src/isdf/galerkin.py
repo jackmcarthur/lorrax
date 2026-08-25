@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from functools import partial
 import hashlib
 import math
+import os
 import time
 
 import jax
@@ -45,11 +46,17 @@ __all__ = [
     "fit_galerkin_basis",
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
+    "read_galerkin_basis",
     "validate_rank_multiplier",
+    "write_galerkin_basis",
 ]
 
 
 QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
+_BASIS_FORMAT = 1
+_BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_basis_at_nodes",
+                 "galerkin_selection_factor")
+_BASIS_META = "galerkin_"
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,260 @@ def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
             f"{name}={multiplier:g} would retain fewer directions than bands "
             "at one k. Use the published default 20 or another value >= 1.")
     return multiplier
+
+
+def _basis_text(value: str) -> np.ndarray:
+    return np.frombuffer(str(value).encode(), dtype=np.uint8).astype(np.int32)
+
+
+def _basis_decode(value) -> str:
+    raw = np.asarray(value, dtype=np.int32).reshape(-1)
+    if np.any((raw < 0) | (raw > 255)):
+        raise ValueError("Galerkin basis text metadata contains a non-byte")
+    return bytes(raw.astype(np.uint8)).decode()
+
+
+def _basis_digest(indices) -> tuple[tuple[int, ...], str]:
+    values = np.ascontiguousarray(np.asarray(indices, dtype="<i8"))
+    shape = tuple(int(n) for n in values.shape)
+    digest = hashlib.sha256()
+    digest.update(np.asarray(shape, dtype="<i8").tobytes())
+    digest.update(values.tobytes())
+    return shape, digest.hexdigest()
+
+
+def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
+                      bispinor, rank_multiplier, qrcp_eps, qrcp_seed) -> dict:
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+
+    b0, b1 = (int(n) for n in band_range)
+    shape, centroid_hash = _basis_digest(centroid_indices)
+    qrcp_eps, qrcp_seed = float(qrcp_eps), int(qrcp_seed)
+    if b1 <= b0:
+        raise ValueError("Galerkin basis band window is empty")
+    if not 0.0 < qrcp_eps < 1.0:
+        raise ValueError("htransform_qr_eps must lie in (0,1)")
+    if not 0 <= qrcp_seed <= np.iinfo(np.uint32).max:
+        raise ValueError("htransform_qrcp_seed must fit uint32")
+    return {
+        "band_range": (b0, b1), "nk": int(meta.nk_tot), "nb": b1 - b0,
+        "nspinor": int(meta.nspinor),
+        "fft_grid": tuple(int(n) for n in meta.fft_grid),
+        "kgrid": tuple(int(n) for n in meta.kgrid),
+        "bispinor": bool(bispinor), "centroid_shape": shape,
+        "centroid_hash": centroid_hash, "wfn_hash": wfn_fingerprint(wfn),
+        "wfn_scheme": WFN_FINGERPRINT_SCHEME,
+        "rank_multiplier": validate_rank_multiplier(
+            rank_multiplier, name="htransform_rank_multiplier"),
+        "qrcp_eps": qrcp_eps, "qrcp_seed": qrcp_seed,
+        "qrcp_rng": QRCP_RNG_VERSION,
+    }
+
+
+def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
+    physical, carrier = int(basis.rank_physical), int(basis.rank_carrier)
+    if tuple(basis.band_range) != provenance["band_range"] \
+            or tuple(basis.ctilde.shape[:2]) != (
+                provenance["nk"], provenance["nb"]) \
+            or tuple(basis.basis_at_nodes.shape[1:]) != (
+                provenance["nspinor"], provenance["centroid_shape"][0]):
+        raise ValueError("Galerkin basis payload disagrees with provenance")
+    if (basis.qrcp_seed != provenance["qrcp_seed"]
+            or basis.qrcp_eps != provenance["qrcp_eps"]
+            or basis.qrcp_rng_version != provenance["qrcp_rng"]):
+        raise ValueError("Galerkin basis QRCP controls disagree with provenance")
+    picked = np.asarray(basis.selected_state_indices, dtype="<i8")
+    if (np.any(picked < 0)
+            or np.any(picked >= provenance["nk"] * provenance["nb"])
+            or np.unique(picked).size != physical):
+        raise ValueError("Galerkin selected-state indices are invalid")
+    # This is byte-for-byte the fit owner's existing pivot receipt:
+    # selected.astype('<i8', copy=False).tobytes().
+    if hashlib.sha256(picked.tobytes()).hexdigest() != basis.pivot_hash:
+        raise ValueError("Galerkin selected-state indices/pivot hash disagree")
+    if any(len(value) != 64 or any(
+            char not in "0123456789abcdef" for char in value)
+            for value in (basis.candidate_hash, basis.pivot_hash)):
+        raise ValueError("Galerkin basis hashes are malformed")
+    if physical == carrier:
+        return
+    tails = (basis.ctilde[..., physical:],
+             basis.basis_at_nodes[physical:],
+             basis.selection_factor[physical:, :physical],
+             basis.selection_factor[:physical, physical:])
+    errors = [float(jnp.max(jnp.abs(value))) for value in tails if value.size]
+    factor_tail = basis.selection_factor[physical:, physical:]
+    errors.append(float(jnp.max(jnp.abs(
+        factor_tail - jnp.eye(carrier - physical, dtype=factor_tail.dtype)))))
+    if any(error != 0.0 for error in errors):
+        raise ValueError("Galerkin basis carrier is not exact-null/identity")
+
+
+def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
+    integer = {
+        "format": [_BASIS_FORMAT], "rank": [basis.rank_physical],
+        "band_range": provenance["band_range"],
+        "nk_nb_nspinor": [provenance[k] for k in ("nk", "nb", "nspinor")],
+        "fft_grid": provenance["fft_grid"], "kgrid": provenance["kgrid"],
+        "bispinor": [provenance["bispinor"]],
+        "centroid_shape": provenance["centroid_shape"],
+        "qrcp_raw_search": [basis.qrcp_raw_rank, basis.qrcp_search_rank],
+        "selected": basis.selected_state_indices,
+    }
+    for name, value in integer.items():
+        io.write_attr(_BASIS_META + name, np.asarray(value, dtype=np.int32))
+    io.write_attr(_BASIS_META + "qrcp_controls", np.asarray([
+        provenance["rank_multiplier"], provenance["qrcp_eps"]],
+        dtype=np.float64))
+    io.write_attr(_BASIS_META + "qrcp_seed", np.asarray(
+        [provenance["qrcp_seed"]], dtype=np.int64))
+    for name, value in (
+            ("centroid_hash", provenance["centroid_hash"]),
+            ("wfn_hash", provenance["wfn_hash"]),
+            ("wfn_scheme", provenance["wfn_scheme"]),
+            ("qrcp_rng", provenance["qrcp_rng"]),
+            ("candidate_hash", basis.candidate_hash),
+            ("pivot_hash", basis.pivot_hash)):
+        io.write_attr(_BASIS_META + name, _basis_text(value))
+    # SlabIO's write_attr queues a small dataset for the rank-0 reopen after
+    # collective close; read_small is its matching collective reader.
+    io.write_attr(_BASIS_META + "complete", np.asarray([1], dtype=np.int32))
+
+
+def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
+                         centroid_indices, bispinor, rank_multiplier,
+                         qrcp_eps, qrcp_seed, mesh_xy: Mesh) -> None:
+    """Collectively publish one immutable mesh-neutral basis artifact."""
+    from common.collectives import barrier, process_count, process_rank
+    from file_io.slab_io import SlabIO
+
+    provenance = _basis_provenance(
+        wfn=wfn, meta=meta, centroid_indices=centroid_indices,
+        band_range=basis.band_range, bispinor=bispinor,
+        rank_multiplier=rank_multiplier, qrcp_eps=qrcp_eps,
+        qrcp_seed=qrcp_seed)
+    _basis_check(basis, provenance)
+    destination = os.path.abspath(os.fspath(path))
+    job, step = os.environ.get("SLURM_JOB_ID", "local"), os.environ.get(
+        "SLURM_STEP_ID")
+    if process_count() > 1 and not step:
+        raise RuntimeError("multi-process basis publication requires a shared step id")
+    token = f"{job}.{step}" if step else f"{job}.{os.getpid()}"
+    staging = destination + ".partial." + token
+    if os.path.lexists(destination) or os.path.lexists(staging):
+        raise FileExistsError(
+            f"immutable Galerkin destination/staging exists: "
+            f"{destination} / {staging}")
+    barrier("galerkin_basis.staging")
+    physical = int(basis.rank_physical)
+    # These are incumbent shardings: ctilde and selection_factor are P();
+    # basis_at_nodes retains its node-axis P(None,None,'y').  SlabIO consumes
+    # them directly, so no bulk payload is materialized on a host/process.
+    values = (basis.ctilde[..., :physical], basis.basis_at_nodes[:physical],
+              basis.selection_factor[:physical, :physical])
+    with SlabIO(staging, mode="w", mesh=mesh_xy) as io:
+        for name, value in zip(_BASIS_ARRAYS, values):
+            io.create_dataset(name, shape=value.shape, dtype=value.dtype)
+            io.write_slab(name, value)
+        _basis_write_meta(io, basis, provenance)
+    if process_rank() == 0:
+        try:
+            os.link(staging, destination)  # no-clobber atomic visibility
+            os.unlink(staging)
+        except OSError:
+            pass  # peers must reach the attribution barrier before refusal
+    barrier("galerkin_basis.published")
+    if os.path.lexists(staging) or not os.path.isfile(destination):
+        raise RuntimeError("atomic Galerkin basis publication failed")
+
+
+def _basis_read_meta(io) -> dict:
+    small = lambda name, dtype: np.asarray(io.read_small(
+        _BASIS_META + name, dtype=dtype)).reshape(-1)
+    if int(small("complete", np.int32)[0]) != 1:
+        raise ValueError("Galerkin basis artifact is incomplete")
+    version = int(small("format", np.int32)[0])
+    if version != _BASIS_FORMAT:
+        raise ValueError(f"Galerkin basis format {version} is unsupported")
+    band = small("band_range", np.int32)
+    extents = small("nk_nb_nspinor", np.int32)
+    controls = small("qrcp_controls", np.float64)
+    qrcp = small("qrcp_raw_search", np.int32)
+    text = lambda name: _basis_decode(small(name, np.int32))
+    return {
+        "rank": int(small("rank", np.int32)[0]),
+        "band_range": tuple(int(n) for n in band),
+        "nk": int(extents[0]), "nb": int(extents[1]),
+        "nspinor": int(extents[2]),
+        "fft_grid": tuple(int(n) for n in small("fft_grid", np.int32)),
+        "kgrid": tuple(int(n) for n in small("kgrid", np.int32)),
+        "bispinor": bool(small("bispinor", np.int32)[0]),
+        "centroid_shape": tuple(int(n) for n in small(
+            "centroid_shape", np.int32)),
+        "centroid_hash": text("centroid_hash"), "wfn_hash": text("wfn_hash"),
+        "wfn_scheme": text("wfn_scheme"),
+        "rank_multiplier": float(controls[0]), "qrcp_eps": float(controls[1]),
+        "qrcp_seed": int(small("qrcp_seed", np.int64)[0]),
+        "qrcp_rng": text("qrcp_rng"),
+        "qrcp_raw_rank": int(qrcp[0]), "qrcp_search_rank": int(qrcp[1]),
+        "selected": tuple(int(n) for n in small("selected", np.int32)),
+        "candidate_hash": text("candidate_hash"), "pivot_hash": text("pivot_hash"),
+    }
+
+
+def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
+                        bispinor, rank_multiplier, qrcp_eps, qrcp_seed,
+                        mesh_xy: Mesh, extra_rank_pad: int = 0) -> GalerkinBasis:
+    """Collectively validate and read a basis on the caller's target mesh."""
+    from file_io.slab_io import SlabIO
+
+    expected = _basis_provenance(
+        wfn=wfn, meta=meta, centroid_indices=centroid_indices,
+        band_range=band_range, bispinor=bispinor,
+        rank_multiplier=rank_multiplier, qrcp_eps=qrcp_eps,
+        qrcp_seed=qrcp_seed)
+    extra_rank_pad = int(extra_rank_pad)
+    if extra_rank_pad < 0:
+        raise ValueError("extra_rank_pad must be non-negative")
+    with SlabIO(os.path.abspath(os.fspath(path)), mode="r", mesh=mesh_xy) as io:
+        stored = _basis_read_meta(io)
+        mismatches = [key for key in expected if stored.get(key) != expected[key]]
+        if mismatches:
+            raise ValueError("Galerkin basis provenance mismatch: "
+                             + ", ".join(mismatches))
+        physical = stored["rank"]
+        px = spec_divisor(mesh_xy, P("x", None), axis=0)
+        py = spec_divisor(mesh_xy, P(None, "y"), axis=1)
+        align = math.lcm(px, py)
+        carrier = round_up(physical, align)
+        if extra_rank_pad:
+            carrier = round_up(carrier + extra_rank_pad, align)
+        shapes = ((stored["nk"], stored["nb"], carrier),
+                  (carrier, stored["nspinor"], stored["centroid_shape"][0]),
+                  (carrier, carrier))
+        node_spec = _fit(mesh_xy, P(None, None, "y"), shapes[1],
+                         "galerkin.restart.basis_at_nodes").spec
+        # SlabIO's registered shape>dataset contract zero-extends the physical
+        # logical datasets directly into these mesh-legal carrier shapes.
+        arrays = [io.read_slab(name, shape=shape, partition_spec=spec)
+                  for name, shape, spec in zip(
+                      _BASIS_ARRAYS, shapes, (P(), node_spec, P()))]
+    rep = NamedSharding(mesh_xy, P())
+    arrays[2] = jax.jit(
+        lambda factor: factor + jnp.diag(
+            (jnp.arange(carrier) >= physical).astype(factor.dtype)),
+        out_shardings=rep)(arrays[2])
+    basis = GalerkinBasis(
+        ctilde=arrays[0], basis_at_nodes=arrays[1], rank_physical=physical,
+        band_range=stored["band_range"], selected_state_indices=stored["selected"],
+        selection_factor=arrays[2], qrcp_seed=stored["qrcp_seed"],
+        qrcp_rng_version=stored["qrcp_rng"], qrcp_eps=stored["qrcp_eps"],
+        qrcp_raw_rank=stored["qrcp_raw_rank"],
+        qrcp_search_rank=stored["qrcp_search_rank"],
+        candidate_hash=stored["candidate_hash"], pivot_hash=stored["pivot_hash"])
+    _basis_check(basis, expected)
+    return basis
 
 
 def _whole_state_memory_ledger(
