@@ -70,8 +70,9 @@ import os
 # is idempotent — which is what makes this safe under
 # ``gw.sigma_dispatch``'s LAZY import of this module from inside an
 # already-started driver: there it returns the existing stack.
-from runtime import initialize_communicator_stack             # noqa: E402
-RUNTIME = initialize_communicator_stack()
+from runtime import (debug_print, debug_print_enabled,         # noqa: E402
+                     initialize_communicator_stack, rank0_print)
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import argparse                                               # noqa: E402
 
@@ -81,11 +82,14 @@ import h5py
 
 from common import Meta
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
-from common.collectives import (barrier, device_count,
-                                local_share, process_rank_world,
+from common.collectives import (barrier, local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
 from common.wfn_transforms import load_kpoint_fftbox_local
 import common.timing as timing
+from common.preprocessing_output import (PreprocessingProductionReport,
+                                         timing_total)
+from common.progress import LoopProgress
+from common.scientific_output import band_range, policy
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -116,7 +120,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
+from runtime.production_stream import ProductionStdout          # noqa: E402
 
 
 def _resolve_against(path: str, base_dir: str) -> str:
@@ -927,6 +931,8 @@ def build_argparser() -> argparse.ArgumentParser:
     argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
     argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
     argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
+    argp.add_argument("--report-file", default=None,
+                      help="human-readable report (default: kin_ion.out beside output)")
     argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
     argp.add_argument("--sys_dim", type=int, default=None,
                       help="system dimensionality: 0, 2, or 3.  Must AGREE with "
@@ -971,9 +977,41 @@ def main(argv=None):
 
     # (the distributed init happens at module import — see the header)
     rank, world = process_rank_world()
-    print0 = print if rank == 0 else (lambda *a, **k: None)
-    print0(f"== kin_ion_io ==  (P={world} process"
-           f"{'es' if world != 1 else ''}, {device_count()} devices)")
+
+    # Refuse a broken distributed launch before opening either an input or a
+    # report file.  A launcher advertising P tasks while JAX joined P=1 would
+    # make every task calculate and write the whole artifact independently.
+    _nproc_env = int(os.environ.get(
+        "JAX_PROCESS_COUNT",
+        os.environ.get("JAX_NUM_PROCESSES",
+                       os.environ.get("SLURM_NTASKS", "1"))))
+    if _nproc_env > 1 and world <= 1:
+        raise SystemExit(
+            f"the launcher advertises {_nproc_env} tasks (SLURM_NTASKS / "
+            f"JAX_PROCESS_COUNT) but jax.distributed joined a world of "
+            f"{world}.  Every task would redo the whole calculation and "
+            f"overwrite the same output file.  Fix the distributed launch "
+            f"(JAX_COORDINATOR_ADDRESS must be reachable from every "
+            f"task) or run `-n 1`.")
+
+    input_dir = os.path.dirname(os.path.abspath(args.input))
+    out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
+    report_path = (os.path.abspath(args.report_file) if args.report_file else
+                   os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                                "kin_ion.out"))
+    debug = debug_print_enabled()
+    report = PreprocessingProductionReport(
+        report_path, runtime=RUNTIME, debug=debug, stdout=rank0_print,
+        driver_name="gw.kin_ion_io",
+        calculation_name="kinetic, ionic, and Hartree preprocessing")
+    production_stdout = ProductionStdout(
+        debug=debug, rank=RUNTIME.process_index,
+        warning_fn=report.legacy_print)
+    production_stdout.install()
+    report.stdout = rank0_print if debug else production_stdout.emit
+    print0 = report.legacy_print
+    report.begin(input_file=args.input)
+    report.architecture(mesh_role="band-matrix axes X x Y")
 
     # Persistent compile cache — same call, same position (after the
     # distributed init, before any jit) as gw.gw_jax:145.  Without it this
@@ -1000,21 +1038,6 @@ def main(argv=None):
     # computes the full result, and every rank believes it is rank 0 — the
     # original clobber, with none of the safety.  Detect it by comparing
     # what the launcher advertises against what JAX joined.
-    _nproc_env = int(os.environ.get(
-        "JAX_PROCESS_COUNT",
-        os.environ.get("JAX_NUM_PROCESSES",
-                       os.environ.get("SLURM_NTASKS", "1"))))
-    if _nproc_env > 1 and world <= 1:
-        raise SystemExit(
-            f"the launcher advertises {_nproc_env} tasks (SLURM_NTASKS / "
-            f"JAX_PROCESS_COUNT) but jax.distributed joined a world of "
-            f"{world}.  Every task would redo the whole calculation and "
-            f"overwrite the same output file.  Fix the distributed launch "
-            f"(JAX_COORDINATOR_ADDRESS must be reachable from every "
-            f"task) or run `-n 1`.")
-
-    input_dir = os.path.dirname(os.path.abspath(args.input))
-
     # ---- parse input: the deck is the single source of truth ----
     # Everything physical (Coulomb truncation, band window, spinor
     # treatment, FFT grid) is inherited from the same file the GW run
@@ -1043,9 +1066,8 @@ def main(argv=None):
     # did this, dipole/kin-ion/kmeans did not).
     mesh_xy = RUNTIME.mesh
     with timing.section("load_wfn"):
-        wfn = WfnLoader(wfn_path)
-        wfn.adopt_mesh(mesh_xy)
-        sym = symmetry_maps.SymMaps(wfn)
+        wfn = WfnLoader(wfn_path, mesh=mesh_xy)
+        sym = wfn.symmetry()
 
     nval = int(params.get("nval", 5))
     ncond = int(params.get("ncond", 5))
@@ -1080,6 +1102,11 @@ def main(argv=None):
         raise SystemExit(
             f"wfn.grid_rho={tuple(wfn.grid_rho)} != FFT box {tuple(meta.fft_grid)}"
         )
+    report.environment(wfn=wfn, lines=(
+        "Matrix storage : distributed band blocks on the X x Y mesh",
+        "Output writer  : rank-zero artifact writer after bounded owner gathers",
+    ))
+    report.sampling(wfn=wfn, sym=sym)
     print0(f"Bands: {nb_eff} (deck nband={nband}, sigma window needs {nb_window}), "
           f"FFT grid: {meta.fft_grid}, k-points: {sym.nk_tot}")
     print0(f"sys_dim: {sys_dim}   bispinor: {bispinor}   "
@@ -1089,6 +1116,7 @@ def main(argv=None):
 
     # ---- load pseudopotentials ----
     pseudo_dir = args.pseudo_dir or input_dir
+    pseudo_source = os.path.abspath(pseudo_dir)
     pseudos = load_pseudopotentials(pseudo_dir)
     if not pseudos:
         # Also try the QE subdirectory (common sandbox layout)
@@ -1096,6 +1124,7 @@ def main(argv=None):
                          os.path.join(input_dir, '..', 'qe', 'nscf')]:
             pseudos = load_pseudopotentials(fallback)
             if pseudos:
+                pseudo_source = os.path.abspath(fallback)
                 print0(f"Found pseudopotentials in {fallback}")
                 break
 
@@ -1128,6 +1157,10 @@ def main(argv=None):
 
     # ---- build V_loc on the FFT grid (k-independent) ----
     print0("Building V_loc...")
+    vloc_progress = LoopProgress(
+        1, report.progress, title="local ionic potential construction",
+        item_name="FFT-grid potential")
+    vloc_progress.start()
     with timing.section("build_V_loc"):
         V_loc_r = build_local_ionic_potential_on_G_total(
             assignments=[
@@ -1143,6 +1176,8 @@ def main(argv=None):
             truncation_2d=ctx.truncation_2d,
         )
         V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
+    vloc_progress.step()
+    vloc_progress.finish()
 
     vnl_setup = None
     soc_flag = {"auto": None, "true": True, "false": False}[args.soc]
@@ -1154,15 +1189,62 @@ def main(argv=None):
         # caller did not declare, in which case ``resolve_soc_mode`` looks for
         # QE's <spinorbit> and, failing that, announces the assumption instead
         # of taking it silently.
-        vnl_setup = vnl_ops.build_vnl_setup(
-            wfn,
-            sym,
-            meta,
-            pseudos,
-            nspinor=int(wfn.nspinor),
-            soc=soc_flag,
-            print_fn=print0,
-        )
+        vnl_progress = LoopProgress(
+            1, report.progress, title="nonlocal projector construction",
+            item_name="projector setup")
+        vnl_progress.start()
+        with timing.section("build_V_NL"):
+            vnl_setup = vnl_ops.build_vnl_setup(
+                wfn,
+                sym,
+                meta,
+                pseudos,
+                nspinor=int(wfn.nspinor),
+                soc=soc_flag,
+                print_fn=print0,
+            )
+        vnl_progress.step()
+        vnl_progress.finish()
+
+    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
+    store_ibz = not bool(args.fold_hartree and args.hartree)
+    folded = bool(args.fold_hartree and args.hartree)
+    hartree_text = (
+        "folded into kin_ion (legacy compatibility)" if folded else
+        "stored separately as v_hartree" if args.hartree else
+        "absent; the GW driver must use its ISDF Hartree route")
+    resolved_soc = ("on" if bool(vnl_setup.soc) else "off") \
+        if vnl_setup is not None else "off (no projector setup)"
+    report.pathways((
+        "Mean-field H0  : T + V_loc + V_NL",
+        f"Hartree V_H    : {hartree_text}",
+        "Coulomb system : " + ("2D slab truncation" if ctx.truncation_2d
+                                else "3D bulk periodic"),
+        "SOC projectors : " + policy(args.soc, ("auto", "true", "false"))
+        + f" -> {resolved_soc}",
+        f"k-space compute: {nk_irr} star-wedge points; "
+        f"{int(sym.nk_tot)} full-BZ points reconstructed on read",
+        "k-space storage: " + ("star wedge" if store_ibz else
+                                "full BZ (legacy folded-Hartree layout)"),
+    ))
+    report.system(
+        natoms=int(np.asarray(wfn.atom_crys).shape[0]),
+        species=sorted(str(name) for name in ctx.pseudos),
+        fft_grid=meta.fft_grid,
+        lines=(
+            f"Spin channels  : nspin={int(getattr(wfn, 'nspin', 1))}; "
+            f"nspinor={int(wfn.nspinor)}; bispinor={bool(bispinor)}",
+            f"System dimension: {int(sys_dim)}",
+        ))
+    report.bands((
+        f"Electrons      : {float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f}; "
+        f"occupied-band boundary = {int(wfn.nelec)}",
+        f"Matrix written : {band_range(0, nb_eff)}",
+        f"Protected valence: {band_range(max(0, int(wfn.nelec) - nval), int(wfn.nelec))}",
+        f"Protected conduction: {band_range(int(wfn.nelec), nb_window)}",
+        f"Polarizability : {band_range(0, min(nb_eff, nband))}",
+        f"WFN available  : {band_range(0, int(wfn.nbands))}",
+    ))
 
     # ---- build the mean-field V_H on the same FFT grid (k-independent) ----
     # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
@@ -1187,14 +1269,19 @@ def main(argv=None):
     # question — that flag exists ONLY to reproduce pre-``v_hartree``
     # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
     # stays in the legacy layout (see ``store_ibz`` below).
-    store_ibz = not bool(args.fold_hartree and args.hartree)
     v_h_all = None
     if args.hartree:
+        vh_progress = LoopProgress(
+            1, report.progress, title="Hartree matrix construction",
+            item_name="distributed band-matrix sweep")
+        vh_progress.start()
         with timing.section("build_V_H"):
             v_h_all = compute_hartree_matrix(
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
                 mesh=mesh_xy, print_fn=print0, owner_only=True,
                 k_set=("ibz" if store_ibz else "full"))
+        vh_progress.step()
+        vh_progress.finish()
 
     # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
     # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
@@ -1216,7 +1303,6 @@ def main(argv=None):
     # G axis with the band index free, so it needs no collective and forms
     # no (nb, nb).  ``get_kin_ion_k`` is left in place — it is the per-k
     # local-plan kernel the sweep is gated against.
-    out_path = args.output or os.path.join(input_dir, "kin_ion.h5")
     from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,
                                     blocks_to_host, kinetic_operator,
                                     local_potential_operator, sum_operators,
@@ -1231,7 +1317,6 @@ def main(argv=None):
     # fits most cleanly.  No CONSUMER of ``kin_ion.h5`` sees the k-set
     # either: ``file_io.kin_ion`` unfolds on read and still hands back
     # ``(nk_tot, nb, nb)`` in full-BZ order.
-    k_spec, kvecs_irr, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
     psi_G = wfn.load(bands=(0, nb_eff), k=k_spec,
                      sharding=band_sphere_spec())
@@ -1249,6 +1334,10 @@ def main(argv=None):
     # ONE ``kin_ion`` timing section around the WHOLE sweep, count 1 — not
     # one per k.  A per-k section would time the dispatch and attribute the
     # compute to whoever happened to block next.
+    matrix_progress = LoopProgress(
+        1, report.progress, title="kinetic and ionic matrix construction",
+        item_name="distributed band-matrix sweep")
+    matrix_progress.start()
     with timing.section("kin_ion"):
         H_kin_ion = sweep_matrix_elements(
             psi_G, operator=sum_operators(*terms), geom=geom,
@@ -1266,6 +1355,8 @@ def main(argv=None):
         kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
         kin_ion_all = (kin_ion_irr if store_ibz
                        else broadcast_ibz_to_full_bz(kin_ion_irr, sym))
+    matrix_progress.step()
+    matrix_progress.finish()
     del H_kin_ion, psi_G
 
     # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
@@ -1298,7 +1389,6 @@ def main(argv=None):
     # rank 0 ONLY (None on the peers) — every consumer below is rank-0.
     # ``folded`` is derived from the args, not from ``v_h_all``, so the
     # provenance flag stays rank-invariant.
-    folded = bool(args.fold_hartree and args.hartree)
     if folded and rank == 0:
         kin_ion_all = kin_ion_all + v_h_all
 
@@ -1312,6 +1402,10 @@ def main(argv=None):
     print0(f"\nWriting to {out_path}...")
     desc = ("T + V_loc + V_NL + V_H matrix elements (H_DFT - V_xc)"
             if folded else "T + V_loc + V_NL matrix elements")
+    write_progress = LoopProgress(
+        1, report.progress, title="kinetic and ionic artifact write",
+        item_name="output artifact")
+    write_progress.start()
     with timing.section("write_h5"):
         if rank == 0:
             irr_idx_k, sym_idx_k, n_sym_spatial = star_tables(sym)
@@ -1418,6 +1512,8 @@ def main(argv=None):
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
 
     barrier("kin_ion_written")
+    write_progress.step()
+    write_progress.finish()
 
     # Diagnostics read the gathered tables, which only rank 0 holds.
     _src = ("FOLDED into kin_ion (legacy)" if folded else
@@ -1437,9 +1533,25 @@ def main(argv=None):
                   + "  ".join(f"{v:.4f}" for v in d0[:8]))
             print0("  V_H     diag (eV), k=0, first 8: "
                   + "  ".join(f"{v:.4f}" for v in v0[:8]))
-    if rank == 0:
-        timing.report(title="--- Timing (seconds) ---",
-                      wall=_time.perf_counter() - _t_main)
+    wall = _time.perf_counter() - _t_main
+    records = timing.records()
+    report.timings((
+        ("wavefunction input", timing_total(records, "load_wfn")),
+        ("local ionic potential", timing_total(records, "build_V_loc")),
+        ("nonlocal projectors", timing_total(records, "build_V_NL")),
+        ("Hartree matrix", timing_total(records, "build_V_H")),
+        ("T + ionic matrix", timing_total(records, "kin_ion")),
+        ("artifact write", timing_total(records, "write_h5")),
+    ), wall=wall)
+    report.files((
+        ("human-readable report", "written", report_path),
+        ("mean-field matrices", "written", out_path),
+        ("wavefunctions", "read", wfn_path),
+        ("pseudopotentials", "read", pseudo_source),
+        ("input deck", "read", args.input),
+    ))
+    report.finish()
+    production_stdout.close()
     return 0
 
 

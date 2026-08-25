@@ -27,8 +27,9 @@ from pathlib import Path
 # clique warm-up that gather dies at P>1 under impl=mpi when its
 # communicator is first created from an XLA pool thread (job 7884867
 # class).  The startup call does both, in the right order, above jax.
-from runtime import initialize_communicator_stack
-RUNTIME = initialize_communicator_stack()
+from runtime import (debug_print, debug_print_enabled,
+					 initialize_communicator_stack, rank0_print)
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import numpy as np
 import jax
@@ -42,6 +43,10 @@ _services.ensure_on_path()
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import barrier, gather_k_blocks
+from common.preprocessing_output import (PreprocessingProductionReport,
+									 timing_total)
+from common.progress import LoopProgress
+from common.scientific_output import band_range
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 band_sphere_spec, blocks_to_host,
@@ -55,6 +60,7 @@ from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 import psp.vnl_ops as vnl_ops
 import h5py
+from runtime.production_stream import ProductionStdout
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -341,7 +347,8 @@ def compute_finite_q_mtxels(
     nv_block: int,
     nc_block: int,
     vnl_velocity_sign: float = VNL_VELOCITY_SIGN_SHIPPED,
-    verbose: bool = True,
+    progress_fn=None,
+    diagnostic_fn=None,
 ):
     """Driver: produce symmetric finite-q matrix elements on G-sphere.
 
@@ -395,9 +402,10 @@ def compute_finite_q_mtxels(
     # the apply at every full-BZ k since both ket-side (k) and bra-side
     # (canonical k-q) draw from the same set of full-BZ k-vectors.  Build
     # once.
-    if verbose:
-        print(f"  finite-q: applying v_kin + V_NL  to {nv_eff} valence + "
-              f"{nc_eff} conduction × {nk_full} k-points (G-sphere)")
+    if diagnostic_fn is not None:
+        diagnostic_fn(
+            f"  finite-q: applying v_kin + V_NL to {nv_eff} valence + "
+            f"{nc_eff} conduction × {nk_full} k-points (G-sphere)")
 
     # Per-k (kdata, vket_v, vket_c).  Every k now presents the SAME
     # (ngkmax) G-axis, so these lists hold uniformly-shaped arrays and
@@ -415,6 +423,11 @@ def compute_finite_q_mtxels(
     vket_c_per_k = []     # (3, nc, ns, ngkmax)  each
     psi_v_per_k  = []     # (nv, ns, ngkmax)
     psi_c_per_k  = []     # (nc, ns, ngkmax)
+    prep_progress = LoopProgress(
+        nk_full, progress_fn or (lambda _line: None),
+        title="finite-q velocity preparation", item_name="full-BZ k point",
+        enabled=progress_fn is not None and jax.process_index() == 0)
+    prep_progress.start()
     for ik in range(nk_full):
         kvec = jnp.asarray(kpts_full[ik], dtype=jnp.float64)
         G_pad, g_mask = gtab.at(ik)
@@ -469,6 +482,8 @@ def compute_finite_q_mtxels(
                 v_NL_c.shape[:2] + (pad,) + v_NL_c.shape[3:], dtype=v_NL_c.dtype)], axis=2)
         vket_v_per_k.append(v_kin_v + v_NL_v)
         vket_c_per_k.append(v_kin_c + v_NL_c)
+        prep_progress.step()
+    prep_progress.finish()
 
     # ── Per (k, q) loop ──
     nq = len(iq_list)
@@ -476,6 +491,11 @@ def compute_finite_q_mtxels(
     v_cvkq   = np.zeros((3, nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
     kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
 
+    pair_progress = LoopProgress(
+        max(1, nq * nk_full), progress_fn or (lambda _line: None),
+        title="finite-q matrix elements", item_name="(k, q) pair",
+        enabled=progress_fn is not None and jax.process_index() == 0)
+    pair_progress.start()
     for jq, iq_red in enumerate(iq_list):
         kminq_idx = kminq_idx_for_iq(sym, iq_red)
         kminq_idx_kq[:, jq] = kminq_idx
@@ -507,9 +527,13 @@ def compute_finite_q_mtxels(
             v_cvkq[:, :, :, ik, jq] = np.asarray(v_sym)
             max_rho = max(max_rho, float(jnp.max(jnp.abs(rho_mn))))
             max_v   = max(max_v,   float(jnp.max(jnp.abs(v_sym))))
-        if verbose:
-            print(f"    iq={iq_red:>3d}  q_signed={tuple(float(v) for v in qvec)}  "
-                  f"|rho|_∞={max_rho:.3e}  |v|_∞={max_v:.3e}")
+            pair_progress.step()
+        if diagnostic_fn is not None:
+            diagnostic_fn(
+                f"    iq={iq_red:>3d}  q_signed="
+                f"{tuple(float(v) for v in qvec)}  "
+                f"|rho|_∞={max_rho:.5e}  |v|_∞={max_v:.5e}")
+    pair_progress.finish()
 
     return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
 
@@ -712,16 +736,6 @@ def main(argv=None):
 		help="Input file (INI-like) with [cohsex] block",
 	)
 	parser.add_argument(
-		"--divide-energy",
-		action="store_true",
-		help="Divide selected debug submatrices by ΔE (E_c - E_v). Default: off",
-	)
-	parser.add_argument(
-		"--debug",
-		action="store_true",
-		help="Print 4x6 x-direction debug table (momentum and momentum+vNL) for first k",
-	)
-	parser.add_argument(
 		"--vnl-mode",
 		choices=["analytic", "numeric"],
 		default="analytic",
@@ -788,6 +802,12 @@ def main(argv=None):
 		help="Output filename (default: dipole.h5)",
 	)
 	parser.add_argument(
+		"--report-file",
+		type=str,
+		default=None,
+		help="Human-readable calculation report (default: dipole.out beside --out)",
+	)
+	parser.add_argument(
 		"--parallel-transport-out",
 		type=str,
 		default=None,
@@ -823,12 +843,6 @@ def main(argv=None):
 		     "DFT velocity gate (default: 5e-3).",
 	)
 	parser.add_argument(
-		"--debug-kindex",
-		type=int,
-		default=1,
-		help="k-point index to use for --debug table (0-based). Default: 1",
-	)
-	parser.add_argument(
 		"--with-finite-q",
 		action="store_true",
 		help="Also compute finite-q SOS matrix elements rho_mnkq + v_mnkq "
@@ -844,6 +858,7 @@ def main(argv=None):
 		help="Reduced-BZ q-indices for --with-finite-q (default: all 0..nk-1).",
 	)
 	args = parser.parse_args(argv)
+	debug = debug_print_enabled()
 
 	if args.parallel_transport_out is not None:
 		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
@@ -872,6 +887,19 @@ def main(argv=None):
 				parser.error(f"{name} must be finite and non-negative")
 
 	input_path = Path(args.input).resolve()
+	report_path = (Path(args.report_file).resolve() if args.report_file else
+				   Path(args.out).resolve().with_name("dipole.out"))
+	report = PreprocessingProductionReport(
+		str(report_path), runtime=RUNTIME, debug=debug, stdout=rank0_print,
+		driver_name="psp.get_dipole_mtxels",
+		calculation_name="dipole and velocity preprocessing")
+	production_stdout = ProductionStdout(
+		debug=debug, rank=RUNTIME.process_index,
+		warning_fn=report.legacy_print)
+	production_stdout.install()
+	report.stdout = rank0_print if debug else production_stdout.emit
+	report.begin(input_file=str(input_path))
+	report.architecture(mesh_role="band-matrix axes X x Y")
 	params = read_cohsex_input(str(input_path))
 	w_av_first_neighbors = bool(params.get("w_av_first_neighbors", False))
 	w_av_second_neighbors = bool(params.get("w_av_second_neighbors", False))
@@ -943,7 +971,27 @@ def main(argv=None):
 	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
 
 	if args.w_av_only:
+		report.environment(wfn=wfn, lines=(
+			"Matrix storage : distributed band blocks on the X x Y mesh",
+			"Output backend : SlabIO collective artifact transaction",
+		))
+		report.pathways((
+			"Operator       : finite-q wavefunction-overlap stencil only",
+			f"Neighbour shell: first={'on' if w_av_first_neighbors else 'off'}; "
+			f"second={'on' if w_av_second_neighbors else 'off'}",
+			"Dipole matrix  : skipped by --w-av-only",
+		))
+		report.sampling(wfn=wfn, sym=sym)
+		report.bands((
+			f"Electrons      : {float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f}; "
+			f"occupied-band boundary = {int(wfn.nelec)}",
+			f"Stencil states : {band_range(0, nband_eff)}",
+		))
 		from file_io.parallel_transport import write_w_av_stencil_artifact
+		progress = LoopProgress(
+			1, report.progress, title="W-av stencil construction",
+			item_name="stencil artifact")
+		progress.start()
 		with timing.section("w_av_stencil"):
 			write_w_av_stencil_artifact(
 				Path(args.parallel_transport_out).resolve(),
@@ -953,10 +1001,21 @@ def main(argv=None):
 				second_neighbors=w_av_second_neighbors,
 				wfn_path=str(wfn_path),
 				wfn_fingerprint=wfn_fingerprint(wfn))
-		if jax.process_index() == 0:
-			print(
-				"\nWrote standalone W-av stencil to "
-				f"{Path(args.parallel_transport_out).resolve()}")
+		progress.step()
+		progress.finish()
+		wall = time.perf_counter() - _t_main
+		records = timing.records()
+		report.timings(
+			(("W-av stencil", timing_total(records, "w_av_stencil")),),
+			wall=wall)
+		report.files((
+			("human-readable report", "written", str(report_path)),
+			("W-av stencil", "written", str(Path(args.parallel_transport_out).resolve())),
+			("wavefunctions", "read", str(wfn_path)),
+			("input deck", "read", str(input_path)),
+		))
+		report.finish()
+		production_stdout.close()
 		return 0
 
 	nval = int(params.get("nval", 5))
@@ -1049,6 +1108,42 @@ def main(argv=None):
 		pseudos,
 		nspinor=int(wfn.nspinor),
 	)
+	report.environment(wfn=wfn, lines=(
+		"Matrix storage : distributed band blocks on the X x Y mesh",
+		"Output writer  : rank-zero artifact writer after a bounded owner gather",
+	))
+	_operator = ("p (nonlocal commutator intentionally omitted)"
+				 if args.skip_vnl else _arm)
+	report.pathways((
+		f"Velocity       : {_operator}",
+		f"V_NL evaluator : {args.vnl_mode} "
+		+ ("derivative" if args.vnl_mode == "analytic" else
+		   f"finite difference ({args.vnl_num_scheme})"),
+		f"V_NL sign      : {float(vnl_velocity_sign):+.5f} in the stored convention",
+		"q = 0 matrix   : enabled; full band-to-band Cartesian velocity",
+		"finite-q SOS   : " + ("enabled" if args.with_finite_q else "off"),
+		"parallel gauge : " + (
+			"enabled; covariant velocity validated before commit"
+			if args.parallel_transport_out is not None else "off"),
+		f"W-av shells   : first={'on' if w_av_first_neighbors else 'off'}; "
+		f"second={'on' if w_av_second_neighbors else 'off'}",
+	))
+	report.system(
+		natoms=int(np.asarray(wfn.atom_crys).shape[0]),
+		species=sorted(str(name) for name in pseudos),
+		fft_grid=meta.fft_grid,
+		lines=(f"Spin channels  : nspin={int(getattr(wfn, 'nspin', 1))}; "
+			   f"nspinor={int(wfn.nspinor)}; bispinor={bool(bispinor)}",))
+	report.sampling(wfn=wfn, sym=sym)
+	_nelec = int(wfn.nelec)
+	report.bands((
+		f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
+		f"occupied-band boundary = {_nelec}",
+		f"Matrix written : {band_range(0, nband_eff)}",
+		f"Deck valence   : {band_range(max(0, _nelec - nval), _nelec)}",
+		f"Deck conduction: {band_range(_nelec, min(nband_eff, _nelec + ncond))}",
+		f"Polarizability : {band_range(0, min(nband_eff, nband))}",
+	))
 
 	nk = int(sym.nk_tot)
 	nb = int(nband_eff)
@@ -1117,37 +1212,33 @@ def main(argv=None):
 		deltaE[i] = e_b[:, None] - e_b[None, :]
 
 	def _print_debug_blocks(i, p_cart, vNL_cart):
-		"""The --debug 4x6 tables for one k.  Forces a readback; debug only."""
+		"""Forensic 4x6 tables under the driver's one debug switch."""
 		# Choose up to 6 valence (highest) and up to 4 conduction (lowest) bands
 		nelec = int(wfn.nelec)
 		v_count = min(6, max(0, nelec))
 		c_count = min(4, max(0, nb - nelec))
 		if v_count == 0 or c_count == 0:
-			print("[DEBUG] Skipping 4x6 debug blocks: insufficient v/c bands (v_count=", v_count, ", c_count=", c_count, ")")
+			debug_print("[DEBUG] Skipping 4x6 debug blocks: insufficient v/c "
+						"bands (v_count=", v_count, ", c_count=", c_count, ")")
 			return
 		v_idx = np.arange(nelec - 1, nelec - v_count - 1, -1, dtype=int)  # descending
 		c_idx = np.arange(nelec, nelec + c_count, dtype=int)              # ascending
 		p_x = np.asarray(p_cart[0])
 		full_x = np.asarray(p_cart[0] + vNL_cart[0])
-		if args.divide_energy:
-			with np.errstate(divide='ignore', invalid='ignore'):
-				dE = deltaE[i]
-				p_x = np.where(np.abs(dE) < 1e-12, 0.0, p_x / dE)
-				full_x = np.where(np.abs(dE) < 1e-12, 0.0, full_x / dE)
 		mom_block = p_x[np.ix_(c_idx, v_idx)]
 		full_block = full_x[np.ix_(c_idx, v_idx)]
-		print("\n[DEBUG] 4x6 x-direction momentum block (real):")
+		debug_print("\n[DEBUG] 4x6 x-direction momentum block (real):")
 		for r in range(mom_block.shape[0]):
-			print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-		print("[DEBUG] 4x6 x-direction momentum block (imag):")
+			debug_print(' '.join(f"{np.real(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+		debug_print("[DEBUG] 4x6 x-direction momentum block (imag):")
 		for r in range(mom_block.shape[0]):
-			print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
-		print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
+			debug_print(' '.join(f"{np.imag(mom_block[r, c]):.5f}" for c in range(mom_block.shape[1])))
+		debug_print("[DEBUG] 4x6 x-direction (p + vNL) block (real):")
 		for r in range(full_block.shape[0]):
-			print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
-		print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
+			debug_print(' '.join(f"{np.real(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+		debug_print("[DEBUG] 4x6 x-direction (p + vNL) block (imag):")
 		for r in range(full_block.shape[0]):
-			print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
+			debug_print(' '.join(f"{np.imag(full_block[r, c]):.5f}" for c in range(full_block.shape[1])))
 
 		# 2x3 grid of 2x2 Frobenius norms from the 4x6 (p+vNL) block, matching parse_vmtxel.py
 		if full_block.shape[0] >= 4 and full_block.shape[1] >= 6:
@@ -1163,9 +1254,10 @@ def main(argv=None):
 			fn10 = float(np.linalg.norm(B10, ord='fro'))
 			fn11 = float(np.linalg.norm(B11, ord='fro'))
 			fn12 = float(np.linalg.norm(B12, ord='fro'))
-			print("[DEBUG] 2x3 grid of 2x2 Frobenius norms (|p+vNL|, x-direction):")
-			print(f"  {fn00:.6f} {fn01:.6f} {fn02:.6f}")
-			print(f"  {fn10:.6f} {fn11:.6f} {fn12:.6f}")
+			debug_print("[DEBUG] 2x3 grid of 2x2 Frobenius norms "
+						"(|p+vNL|, x-direction):")
+			debug_print(f"  {fn00:.5f} {fn01:.5f} {fn02:.5f}")
+			debug_print(f"  {fn10:.5f} {fn11:.5f} {fn12:.5f}")
 
 	def _dipole_block(i):
 		"""⟨mk|v|nk⟩ at this run's arm, for ONE k — ``(3, nb, nb)`` on device.
@@ -1173,7 +1265,7 @@ def main(argv=None):
 		THE LOCAL PLAN, kept for two callers only: ``--vnl-mode=numeric``
 		(whose finite difference picks its step from THIS k's median |K|
 		on the host, and costs 4–8 extra projector builds per component
-		per k) and the ``--debug`` table, which needs p and p+v_NL
+		per k) and the ``LORRAX_DEBUG_PRINT`` table, which needs p and p+v_NL
 		SEPARATELY — the sweep sums them on the ket and no longer has
 		them apart.  The default analytic path is
 		``common.mtxel_sweep``; see the sweep below.
@@ -1276,7 +1368,7 @@ def main(argv=None):
 			vNL_cart = -vNL_cart
 
 		# Optional debug: print 4x6 x-direction blocks for selected k index
-		if args.debug and int(i) == int(args.debug_kindex):
+		if debug and int(i) == int(debug_kindex):
 			_print_debug_blocks(i, p_cart, vNL_cart)
 
 		return p_cart + vNL_cart
@@ -1296,14 +1388,19 @@ def main(argv=None):
 	# per-k reshard payload is 3x.
 	pt_path = None
 	write_pt_remainder = None
+	debug_kindex = min(1, max(0, nk - 1))
+	dipole_progress = LoopProgress(
+		1, report.progress, title="q=0 velocity matrix construction",
+		item_name="distributed band-matrix sweep")
+	dipole_progress.start()
 	if args.vnl_mode == "numeric":
 		with timing.section("dipole_sweep"):
 			dip_k_major = gather_k_blocks(nk, _dipole_block,
 			                              item_shape=(3, nb, nb),
 			                              label="dipole", owner_only=True)
 	else:
-		if args.debug and jax.process_index() == 0:
-			_dipole_block(int(args.debug_kindex))     # the table, nothing else
+		if debug and jax.process_index() == 0:
+			_dipole_block(debug_kindex)     # the table, nothing else
 		psi_G = wfn.load(bands=(0, nb), k="full_bz",
 		                 sharding=band_sphere_spec(), bispinor=bispinor)
 		geom = SweepGeometry(mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
@@ -1374,6 +1471,12 @@ def main(argv=None):
 				f"max_abs={metrics['max_abs']:.6e}, "
 				f"max_rel={metrics['max_rel']:.6e}")
 			print(f"\nWrote parallel-transport data to {pt_path}")
+			report.heading("Parallel-transport validation")
+			report.emit("Covariant DFT velocity: PASS; "
+						f"max abs={float(metrics['max_abs']):.5e}; "
+						f"max rel={float(metrics['max_rel']):.5e}")
+	dipole_progress.step()
+	dipole_progress.finish()
 	if dip_k_major is not None:
 		dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
 	else:
@@ -1388,21 +1491,26 @@ def main(argv=None):
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 		with timing.section("finite_q"):
 			rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
-			wfn, sym, meta, vnl_setup, gtab,
-			nb=nb,
-			bispinor=bispinor,
-			iq_list=iq_list,
-			nv_block=int(nval),
-			nc_block=int(ncond),
-			vnl_velocity_sign=vnl_velocity_sign,
-			verbose=True,
-		)
+				wfn, sym, meta, vnl_setup, gtab,
+				nb=nb,
+				bispinor=bispinor,
+				iq_list=iq_list,
+				nv_block=int(nval),
+				nc_block=int(ncond),
+				vnl_velocity_sign=vnl_velocity_sign,
+				progress_fn=report.progress,
+				diagnostic_fn=debug_print if debug else None,
+			)
 		cv_meta = {
 			'iq_list': np.asarray(iq_list, dtype=np.int32),
 			'n_occ': int(n_occ_eff),
 			'v_lo': int(v_lo),
 			'c_hi': int(c_hi),
 		}
+		report.heading("Finite-q coverage")
+		report.emit(f"Reduced q points: {len(iq_list)} of {int(sym.nk_red)} stored points")
+		report.emit(f"Valence slice  : {band_range(v_lo, n_occ_eff)}")
+		report.emit(f"Conduction slice: {band_range(n_occ_eff, c_hi)}")
 
 	# Save to dipole.h5 with deltaE
 	out_path = Path(args.out).resolve()
@@ -1417,40 +1525,65 @@ def main(argv=None):
 	# that is a genuine corruption hazard (it merely happened not to bite at
 	# 4 ranks).  Barrier afterwards so no rank races ahead of the file
 	# existing on disk.
-	if jax.process_index() != 0:
-		barrier("dipole_write")
-		print(f"\nWrote dipole data to {out_path} (by rank 0)")
-		return 0
-	with timing.section("write_h5"), h5py.File(str(out_path), 'w') as h5:
-		h5.create_dataset('dipole_cart', data=dipole)
-		h5.create_dataset('deltaE', data=deltaE)
-		h5.attrs['nbands'] = int(wfn.nbands)
-		h5.attrs['nk'] = int(sym.nk_tot)
-		h5.attrs['skip_vnl'] = bool(args.skip_vnl)
-		h5.attrs['note'] = note
-		stamp_dipole_provenance(
-			h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
-			nband=nband, nb_written=nb, bispinor=bispinor,
-			skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
-			vnl_velocity_sign=vnl_velocity_sign)
-		if rho_cvkq is not None:
-			fq = h5.create_group('finite_q')
-			fq.create_dataset('rho_cvkq', data=rho_cvkq)         # (nc, nv, nk, nq)
-			fq.create_dataset('v_cvkq',   data=v_cvkq)           # (3, nc, nv, nk, nq)
-			fq.create_dataset('kminq_idx', data=kminq_idx_kq)    # (nk, nq)
-			fq.create_dataset('iq_list',   data=cv_meta['iq_list'])
-			fq.attrs['n_occ']   = cv_meta['n_occ']
-			fq.attrs['v_lo']    = cv_meta['v_lo']
-			fq.attrs['c_hi']    = cv_meta['c_hi']
-			fq.attrs['note'] = (
-				"rho_cvkq[c, v, k, q] = <u_{c, k-q}|u_{v, k}>_cell; "
-				"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
-				"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
-				"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
+	write_progress = LoopProgress(
+		1, report.progress, title="dipole artifact write",
+		item_name="output artifact")
+	write_progress.start()
+	if jax.process_index() == 0:
+		with timing.section("write_h5"), h5py.File(str(out_path), 'w') as h5:
+			h5.create_dataset('dipole_cart', data=dipole)
+			h5.create_dataset('deltaE', data=deltaE)
+			h5.attrs['nbands'] = int(wfn.nbands)
+			h5.attrs['nk'] = int(sym.nk_tot)
+			h5.attrs['skip_vnl'] = bool(args.skip_vnl)
+			h5.attrs['note'] = note
+			stamp_dipole_provenance(
+				h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
+				nband=nband, nb_written=nb, bispinor=bispinor,
+				skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
+				vnl_velocity_sign=vnl_velocity_sign)
+			if rho_cvkq is not None:
+				fq = h5.create_group('finite_q')
+				fq.create_dataset('rho_cvkq', data=rho_cvkq)
+				fq.create_dataset('v_cvkq',   data=v_cvkq)
+				fq.create_dataset('kminq_idx', data=kminq_idx_kq)
+				fq.create_dataset('iq_list',   data=cv_meta['iq_list'])
+				fq.attrs['n_occ'] = cv_meta['n_occ']
+				fq.attrs['v_lo'] = cv_meta['v_lo']
+				fq.attrs['c_hi'] = cv_meta['c_hi']
+				fq.attrs['note'] = (
+					"rho_cvkq[c, v, k, q] = <u_{c, k-q}|u_{v, k}>_cell; "
+					"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
+					"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
+					"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
 	barrier("dipole_write")
-	print(f"\nWrote dipole data to {out_path}")
-	timing.report(title="--- Timing (seconds) ---",
-	              wall=time.perf_counter() - _t_main)
+	write_progress.step()
+	write_progress.finish()
+	wall = time.perf_counter() - _t_main
+	records = timing.records()
+	report.timings((
+		("q=0 velocity", timing_total(records, "dipole_sweep")),
+		("parallel gauge", timing_total(
+			records, "parallel_transport_velocity", "parallel_transport_links")),
+		("gauge validation", timing_total(records, "parallel_transport_validation")),
+		("finite-q matrices", timing_total(records, "finite_q")),
+		("artifact write", timing_total(records, "write_h5")),
+	), wall=wall)
+	file_rows = [
+		("human-readable report", "written", str(report_path)),
+		("dipole matrices", "written", str(out_path)),
+	]
+	if pt_path is not None:
+		file_rows.append(("parallel-transport", "written", str(pt_path)))
+	file_rows.extend((
+		("wavefunctions", "read", str(wfn_path)),
+		("pseudopotentials", "read", searched[-1] if searched else ""),
+		("input deck", "read", str(input_path)),
+	))
+	report.files(file_rows)
+	report.finish()
+	production_stdout.close()
+	return 0
 
 
 if __name__ == '__main__':

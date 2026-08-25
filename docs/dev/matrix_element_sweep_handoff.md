@@ -77,7 +77,7 @@ Three sweeps, three call sites, one shape:
 
 (Line numbers are pre-conversion. `_vh_block` and the default-mode
 `_dipole_block` are gone; `_dipole_block` survives for `--vnl-mode=numeric`
-and the `--debug` table, which needs p and p+v_NL separately.)
+and the `LORRAX_DEBUG_PRINT` table, which needs p and p+v_NL separately.)
 
 All three called `common/collectives.py:985 gather_k_blocks`, which is
 **k-partitioned and returns an array identical on every rank**. Three

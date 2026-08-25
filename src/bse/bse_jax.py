@@ -547,7 +547,9 @@ def main(argv=None) -> int:
     # the jitted matvec -- not an unjitted arm that re-traces on every call.
     parser.add_argument("--ring-timing", action="store_true")
     parser.add_argument("--components", action="store_true")
-    parser.add_argument("--debug-parallelism", action="store_true")
+    parser.add_argument(
+        "--parallelism-self-test", action="store_true",
+        help="Run the deterministic random-data matvec/Lanczos self-test and exit.")
     args, _ = parser.parse_known_args(argv)
 
     if args.ring_test:
@@ -567,12 +569,14 @@ def main(argv=None) -> int:
         )
         raise SystemExit(0)
 
-    if args.debug_parallelism:
+    if args.parallelism_self_test:
         _main_random_demo()
         raise SystemExit(0)
 
     if args.input is None:
-        parser.error("Default run requires -i/--input (use --debug-parallelism for random data).")
+        parser.error(
+            "Default run requires -i/--input (use --parallelism-self-test "
+            "for the random-data self-test).")
 
     use_tda = args.tda
 

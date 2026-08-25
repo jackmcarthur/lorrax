@@ -461,7 +461,7 @@ def test_psp_drivers_import_the_service():
 # at P=64).  That is the OTHER array: the box is nx·ny·nz per band where the
 # sphere is ngkmax, and the sweep forms no box at all.  The streaming
 # spellings below stay because the per-k route survives for
-# ``--vnl-mode=numeric`` and the ``--debug`` table.
+# ``--vnl-mode=numeric`` and the ``LORRAX_DEBUG_PRINT`` table.
 
 _RESIDENT_SPELLINGS = ("read_Gvecs_to_devices", "shard_over_k")
 _STREAMING_SPELLINGS = ("load_kpoint_fftbox_local", "gather_k_blocks")
