@@ -29,10 +29,12 @@ from common.units import RYD_TO_EV
 from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
-    GalerkinBasisStamp,
     fit_galerkin_basis,
-    read_galerkin_basis,
     validate_rank_multiplier,
+)
+from file_io.galerkin_basis import (
+    GalerkinBasisStamp,
+    read_galerkin_basis,
     write_galerkin_basis,
 )
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
