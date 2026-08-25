@@ -1824,6 +1824,13 @@ def _build_windows_for_branch(
         sign_definite_cells = None
         if (A_live.size and mask_B_all_count and
                 mask_B_all_min is not None and mask_B_all_max is not None):
+            # A crossing-capable branch with a negligible omega range skips
+            # the HGL shell, but its denominator does not change identity:
+            # the executor below still uses omega_sign=+1 and therefore
+            # E + Omega - omega.  Keep the exact cell support oriented to the
+            # same physical denominator even at the 1e-14 dispatch boundary.
+            orientation = ("E+B-omega" if denom_can_cross
+                           else "E+B+omega")
             sign_definite_cells = _plan_sign_definite_cells(
                 E_A=E_A_host,
                 base_mask_A=base_A_host,
@@ -1833,7 +1840,7 @@ def _build_windows_for_branch(
                 mask_B_min=float(mask_B_all_min),
                 mask_B_max=float(mask_B_all_max),
                 omega_nonneg_ry=omega_nonneg_ry,
-                orientation="E+B+omega",
+                orientation=orientation,
             )
         windows = _build_single_sigma_window(
             E_A=E_A_host, base_mask_A=base_A_host,
