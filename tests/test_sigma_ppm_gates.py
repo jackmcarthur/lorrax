@@ -105,6 +105,98 @@ def test_crossing_core_rescales_the_physical_error_contract(monkeypatch):
     np.testing.assert_allclose(fitted_phys, fitted_hat / xi, rtol=1.0e-14)
 
 
+def test_shared_omega_clusters_preserve_gap_only_owner_and_cap_spans():
+    """The shared owner keeps MPA's gap-only result and adds a span cap.
+
+    Deliberately scramble the branch order: returned index arrays must retain
+    that order even though clusters themselves are ordered by energy.
+    """
+    from gw.ppm_windows import _omega_clusters
+
+    omega = np.array([3.2, 0.1, 0.2, 3.1], dtype=np.float64)
+    incumbent = _omega_clusters(omega, 1.0)
+    assert [(i.tolist(), lo, hi) for i, lo, hi in incumbent] == [
+        ([1, 2], 0.1, 0.2), ([0, 3], 3.1, 3.2)]
+
+    capped = _omega_clusters(omega, 1.0, max_span_ry=0.05)
+    assert [(i.tolist(), lo, hi) for i, lo, hi in capped] == [
+        ([1], 0.1, 0.1), ([2], 0.2, 0.2),
+        ([3], 3.1, 3.1), ([0], 3.2, 3.2)]
+
+
+def test_hgl_cell_plan_tiles_direct_denominator_and_respects_capacity():
+    """Exact omega x A x B ownership and first-principles sign bounds.
+
+    No quadrature and no random arrays: the direct retarded denominator is
+    evaluated on every deterministic cell boundary.  Its cell-selected sum
+    must be the direct value, including the repository-wide ``(lo, hi]``
+    downward assignment at both A and B boundaries.
+    """
+    from gw.ppm_windows import plan_hgl_crossing_cells
+
+    omega = np.array([0.2, 0.4, 3.1, 3.3], dtype=np.float64)
+    energies = np.array([[0.1, 0.3, 1.0, 9.0]], dtype=np.float64)
+    base = np.array([[True, True, True, False]])
+    xi = 0.2
+    edge = 1.5
+    A_max = 4.0
+    plan = plan_hgl_crossing_cells(
+        omega_abs=omega, E_A=energies, base_mask_A=base,
+        regularization_width_ry=xi, edge_factor=edge,
+        omega_cluster_gap_ry=1.0, omega_max_span_ry=0.25,
+        crossing_A_max=A_max)
+
+    assert plan.omega_cluster_count == 2
+    assert plan.energy_pane_count == 4
+    assert len(plan.cells) == 12
+    assert plan.max_A_dim <= A_max
+
+    z = edge * xi
+    live_e = energies[base]
+    for cell in plan.cells:
+        assert cell.omega_hi - cell.omega_lo <= 0.25
+        if cell.kind == "crossing":
+            corners = [
+                w - e - b
+                for w in (cell.omega_lo, cell.omega_hi)
+                for e in (cell.e_min, cell.e_max)
+                for b in (cell.b_lo, cell.b_hi)
+            ]
+            assert max(abs(x) for x in corners) <= cell.A_dim * xi * (
+                1.0 + 8.0 * np.finfo(np.float64).eps)
+        elif cell.kind == "positive":
+            # The least-positive corner sits at the closed upper B edge.
+            x_min = cell.omega_lo - cell.e_max - cell.b_hi
+            assert x_min >= z * (1.0 - 8.0 * np.finfo(np.float64).eps)
+        else:
+            assert cell.kind == "negative"
+            # The open lower B edge is approached from above.
+            x_sup = cell.omega_hi - cell.e_min - cell.b_lo
+            assert x_sup <= -z * (1.0 - 8.0 * np.finfo(np.float64).eps)
+
+    finite_edges = sorted({
+        bound for cell in plan.cells for bound in (cell.b_lo, cell.b_hi)
+        if np.isfinite(bound)})
+    b_probe = np.array(
+        [finite_edges[0] - 0.2, *finite_edges,
+         *[(a + b) / 2.0 for a, b in zip(finite_edges, finite_edges[1:])],
+         finite_edges[-1] + 0.2], dtype=np.float64)
+    for iw, w in enumerate(omega):
+        for e in live_e:
+            for b in b_probe:
+                owners = [
+                    cell for cell in plan.cells
+                    if iw in cell.omega_indices
+                    and e > cell.e_lo and e <= cell.e_hi
+                    and b > cell.b_lo and b <= cell.b_hi
+                ]
+                assert len(owners) == 1, (iw, e, b, owners)
+                direct = 1.0 / (w - e - b + 1j * xi)
+                decomposed = sum(
+                    1.0 / (w - e - b + 1j * xi) for _cell in owners)
+                np.testing.assert_array_equal(decomposed, direct)
+
+
 def _build_branch_windows():
     """Build the 4 branches × their windows from controlled synthetic inputs.
 
