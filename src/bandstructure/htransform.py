@@ -9,11 +9,12 @@ import numpy as np
 # `import jax`; idempotent, so importing htransform as a LIBRARY from an
 # already-started driver (bse.exciton_bands does) returns the same stack.
 from runtime import (
+    debug_print,
     debug_print_enabled,
     initialize_communicator_stack,
     rank0_print,
 )
-RUNTIME = initialize_communicator_stack()
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 import jax.numpy as jnp

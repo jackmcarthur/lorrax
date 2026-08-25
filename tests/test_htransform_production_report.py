@@ -1,5 +1,6 @@
 """Contract for htransform's rank-zero scientific report."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -79,3 +80,10 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Started Hamiltonian interpolation" in text
     assert "OUTPUT FILES AND INPUTS" in text
     assert "HDF5" not in text and "h5py" not in text
+
+
+def test_htransform_runtime_startup_uses_the_one_debug_stream():
+    source = (Path(__file__).parents[1] / "src" / "bandstructure" /
+              "htransform.py").read_text(encoding="utf8")
+    assert "initialize_communicator_stack(print_fn=debug_print)" in source
+    assert "RUNTIME = initialize_communicator_stack()" not in source
