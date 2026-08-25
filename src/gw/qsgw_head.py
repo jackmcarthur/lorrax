@@ -179,6 +179,7 @@ __all__ = [
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
+    "StaticGaugeFirstOrderComponent",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
     "build_iteration_head_samples",
@@ -188,6 +189,7 @@ __all__ = [
     "head_s_tensor_sharded",
     "head_wings_sharded",
     "raw_hall_pseudovector_sharded",
+    "static_gauge_first_order_component_sharded",
     "static_head_wings_sharded",
     "head_samples_from_s",
     "finalize_iteration_head_sample",
@@ -344,6 +346,31 @@ class DftVelocityHeadData:
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
+
+
+@dataclass(frozen=True)
+class StaticGaugeFirstOrderComponent:
+    r"""Retained-manifold first jet and its authentic ``D1*D1`` response.
+
+    ``energy_scaled_d1_raw[a,I]`` is
+    ``P^(I,a)=-DeltaE*D^(I,a)`` in the canonical in-plane ``(a,I)=(2,4)``
+    order.  ``S_first_first`` is only the corresponding bilinear response
+    term, shaped ``(n_omega,2,2,4,4)``.  It is deliberately not a
+    :class:`gw.head_correction.StaticGaugeHeadResponse`: response-weight
+    second derivatives, the complete second state/vertex jet, and contact
+    terms are absent.
+
+    The two band-linear fields retain the mesh-padded band extent.  They are
+    derivatives with respect to Cartesian transfer q for the bra ``k-q``
+    orientation; only entries below ``nb_logical`` are physical.
+    """
+
+    energy_scaled_d1_raw: jax.Array
+    S_first_first: jax.Array
+    bra_energy_dq_ry: jax.Array
+    occupation_difference_dq: jax.Array
+    charge_ward_residual: jax.Array
+    nb_logical: int
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
@@ -2334,6 +2361,194 @@ def head_s_tensor_sharded(
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
     return interband + drude[None, :, :] * inv_z2[:, None, None]
+
+
+def static_gauge_first_order_component_sharded(
+    gamma_raw,
+    dgamma_dq_raw,
+    forward_links,
+    forward_neighbors,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+) -> StaticGaugeFirstOrderComponent:
+    r"""Build the insulating retained-manifold ``D1*D1`` gauge component.
+
+    For band-matrix order ``(bra=m, ket=n)``, Berry connection
+    ``A_a=i<u_m|d_a u_n>`` and the repository's bra ``k-q`` orientation,
+
+    ``D_a^0=-i A_a`` and
+    ``D_a^i=-i (A_a Gamma_i) + Q_{i,a}``.
+
+    The shared width-eight head kernel consumes
+    ``P_a^I=-Delta_mn D_a^I``, not ``D``.  Its charge column is populated by
+    the exact Ward reduction ``P_a^0=v_a=Gamma_a/(alpha_FS/2)``; the
+    finite-link value ``-Delta D_a^0`` is retained only in the reported
+    closure residual.  This makes the charge-charge block reduce to the
+    incumbent dipole S tensor without inheriting finite-link truncation.
+
+    This first bounded lane is insulating.  Its occupation-difference jet is
+    exactly zero.  A metallic ``-df/dE`` table is refused because the current
+    production table may be an integrated tetrahedron weight, not a local
+    chain-rule derivative.  The explicit q2 vertex is intentionally absent:
+    using it before the second state jet exists would mislabel a partial
+    second derivative as complete.
+    """
+    if surface_weight_kn is not None:
+        raise ValueError(
+            "static gauge first-order component is insulating-only; "
+            "metallic occupation derivatives are not yet derived")
+
+    from common.bispinor_init import HALFALPHA
+    from common.parallel_transport import (
+        band_storage_extent,
+        fourth_order_connection,
+        make_distributed_band_matmul,
+        undersampled_link_axes,
+    )
+    from runtime.padding import pad_axis
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    q1 = jnp.asarray(dgamma_dq_raw, dtype=jnp.complex128)
+    links = jnp.asarray(forward_links, dtype=jnp.complex128)
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    occupations = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    grid = tuple(int(n) for n in kgrid)
+    logical = int(nb_logical)
+    storage = band_storage_extent(mesh, logical)
+    nk = int(nk_tot)
+
+    if gamma.shape != (nk, 3, storage, storage):
+        raise ValueError(
+            "gamma_raw must be the mesh-padded uniform-gauge result with "
+            f"shape {(nk, 3, storage, storage)}; got {gamma.shape}")
+    if q1.shape != (nk, 3, 3, storage, storage):
+        raise ValueError(
+            "dgamma_dq_raw must be (nk,current,transfer,band,band) with "
+            f"shape {(nk, 3, 3, storage, storage)}; got {q1.shape}")
+    if links.shape != (3, nk, storage, storage):
+        raise ValueError(
+            "forward_links must share the uniform-gauge band manifold; "
+            f"expected {(3, nk, storage, storage)}, got {links.shape}")
+    if np.shape(forward_neighbors) != (nk, 3):
+        raise ValueError(
+            f"forward_neighbors must be {(nk, 3)}; got "
+            f"{np.shape(forward_neighbors)}")
+    if int(np.prod(grid)) != nk:
+        raise ValueError(f"kgrid product {int(np.prod(grid))} != nk_tot {nk}")
+    short_in_plane = tuple(
+        axis for axis in undersampled_link_axes(grid) if axis in ("x", "y"))
+    if short_in_plane:
+        raise ValueError(
+            "static gauge in-plane first jet requires the canonical fourth-"
+            f"order link stencil; undersampled axes={short_in_plane}")
+    if energies.ndim != 2 or occupations.shape != energies.shape:
+        raise ValueError(
+            "energies and occupations must be paired (nk,nb) tables; got "
+            f"{energies.shape} and {occupations.shape}")
+    if int(energies.shape[0]) != nk or int(energies.shape[1]) not in (
+            logical, storage):
+        raise ValueError(
+            "energy/occupation tables must carry the logical or padded head "
+            f"manifold ({nk},{logical}|{storage}); got {energies.shape}")
+    occ_host = np.asarray(occupations[:, :logical])
+    if not np.all((occ_host == 0.0) | (occ_host == 1.0)):
+        raise ValueError(
+            "static gauge first-order component requires exact insulating "
+            "0/1 occupations; metallic/fractional occupation derivatives "
+            "are not yet derived")
+
+    if int(energies.shape[1]) == logical:
+        energies = pad_axis(energies, storage, axis=1).array
+        occupations = pad_axis(occupations, storage, axis=1).array
+    if energies.shape != (nk, storage) or occupations.shape != (nk, storage):
+        raise AssertionError("canonical band padding did not reach storage")
+
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
+    connection_reduced = fourth_order_connection(
+        links,
+        np.asarray(forward_neighbors, dtype=np.int64),
+        spacing,
+        band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+    )
+    connection_cart = reduced_covector_to_cartesian(
+        connection_reduced, bvec_cart)[:2]
+
+    # One batched distributed product for all (a,i), not six new kernels.
+    gamma_dir = jnp.moveaxis(gamma, 1, 0)
+    left = jnp.broadcast_to(
+        connection_cart[:, None], (2, 3, nk, storage, storage),
+    ).reshape(6, nk, storage, storage)
+    right = jnp.broadcast_to(
+        gamma_dir[None], (2, 3, nk, storage, storage),
+    ).reshape(6, nk, storage, storage)
+    a_gamma = make_distributed_band_matmul(mesh, n_batch_axes=2)(
+        left, right).reshape(2, 3, nk, storage, storage)
+    q_current = jnp.transpose(q1, (2, 1, 0, 3, 4))[:2]
+    d_current = -1.0j * a_gamma + q_current
+
+    delta = energies[:, :, None] - energies[:, None, :]
+    velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    p_charge = velocity[:2]
+    p_current = -delta[None, None] * d_current
+    p = jnp.concatenate((p_charge[:, None], p_current), axis=1)
+
+    d_charge_state = -1.0j * connection_cart
+    p_charge_state = -delta[None] * d_charge_state
+    f_diff = occupations[:, None, :] - occupations[:, :, None]
+    band = jnp.arange(storage)
+    transition = (
+        (delta > 0.0)
+        & (jnp.abs(f_diff) > 1.0e-12)
+        & (band[:, None] < logical)
+        & (band[None, :] < logical)
+    )
+    charge_error = jnp.max(jnp.where(
+        transition[None], jnp.abs(p_charge_state - p_charge), 0.0))
+    charge_scale = jnp.max(jnp.where(
+        transition[None], jnp.abs(p_charge), 0.0))
+    charge_ward_residual = jnp.where(
+        charge_scale > 0.0, charge_error / charge_scale, 0.0)
+
+    p_flat = p.reshape(8, nk, storage, storage)
+    s_flat = head_s_tensor_sharded(
+        p_flat,
+        energies,
+        occupations,
+        omegas_ry,
+        mesh=mesh,
+        nb_logical=logical,
+        cell_volume=float(cell_volume),
+        nk_tot=nk,
+        nspin=int(nspin),
+        nspinor=int(nspinor),
+        eta_ry=float(eta_ry),
+    )
+    s_first_first = jnp.transpose(
+        s_flat.reshape(int(s_flat.shape[0]), 2, 4, 2, 4),
+        (0, 1, 3, 2, 4),
+    )
+    bra_energy_dq = -jnp.real(jnp.diagonal(
+        velocity[:2], axis1=-2, axis2=-1))
+    return StaticGaugeFirstOrderComponent(
+        energy_scaled_d1_raw=p,
+        S_first_first=s_first_first,
+        bra_energy_dq_ry=bra_energy_dq,
+        occupation_difference_dq=jnp.zeros_like(bra_energy_dq),
+        charge_ward_residual=charge_ward_residual,
+        nb_logical=logical,
+    )
 
 
 def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
