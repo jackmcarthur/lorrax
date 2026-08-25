@@ -58,6 +58,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
+from file_io.isdf_header import WavefunctionBasisReceipt
 from runtime.padding import round_up, spec_divisor
 
 
@@ -288,11 +289,48 @@ class Wavefunctions:
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
     #: STATIC (pytree meta, never traced).  "legacy" | "face".
     layout: str = "legacy"
+    #: Immutable non-JIT provenance for the sampled ψ basis.  ``None`` is
+    #: retained for synthetic/legacy bundles that predate authentication;
+    #: finite-transfer consumers refuse such a bundle rather than inferring
+    #: identity from matching shapes.  The receipt deliberately excludes
+    #: ``layout``, so fresh/restart and legacy/face carriers share it.
+    basis_receipt: WavefunctionBasisReceipt | None = None
 
     def __post_init__(self) -> None:
         if self.layout not in _LAYOUTS:
             raise ValueError(
                 f"Wavefunctions: layout={self.layout!r} not in {_LAYOUTS}.")
+        receipt = self.basis_receipt
+        if receipt is None:
+            return
+        if not isinstance(receipt, WavefunctionBasisReceipt):
+            raise TypeError(
+                "Wavefunctions.basis_receipt is not a canonical immutable "
+                f"receipt; got {type(receipt).__name__}")
+        start, stop = (int(v) for v in receipt.band_interval)
+        if start != int(self.slices.b0) or stop > int(self.slices.b4):
+            raise ValueError(
+                "Wavefunctions basis receipt band interval is outside the "
+                f"bundle's global carrier: receipt=[{start},{stop}), "
+                f"carrier=[{int(self.slices.b0)},{int(self.slices.b4)})")
+        if stop - start > int(self.enk.shape[1]):
+            raise ValueError(
+                "Wavefunctions basis receipt band width exceeds the energy "
+                f"carrier: {stop-start} > {int(self.enk.shape[1])}")
+        mu_extents = []
+        for value, axis in (
+                (self.psi_xn, 2), (self.psi_xr, 3),
+                (self.psi_yr, 3), (self.psi_yn, 2),
+                (self.psi_nmu, 3), (self.psi_mun, 2)):
+            if value is not None:
+                mu_extents.append(int(value.shape[axis]))
+        if mu_extents and any(
+                extent != int(receipt.n_rmu_padded)
+                for extent in mu_extents):
+            raise ValueError(
+                "Wavefunctions carrier centroid extent disagrees with its "
+                f"basis receipt: carrier={mu_extents}, "
+                f"receipt={int(receipt.n_rmu_padded)}")
 
     def _require_legacy(self, accessor: str) -> None:
         """Refuse BY NAME rather than silently rebuild a legacy replica.
@@ -386,7 +424,7 @@ jax.tree_util.register_dataclass(
     Wavefunctions,
     data_fields=['psi_xn', 'psi_xr', 'psi_yr', 'psi_yn',
                  'psi_nmu', 'psi_mun', 'enk', 'occ'],
-    meta_fields=['slices', 'layout'],
+    meta_fields=['slices', 'layout', 'basis_receipt'],
 )
 
 
@@ -587,6 +625,7 @@ def _build_occ(enk_full, slices, efermi):
 
 def build_wavefunctions(
     psi_rmu_Y, psi_rmuT_X, *, enk_full, slices, mesh_xy, efermi=None,
+    basis_receipt=None,
 ) -> Wavefunctions:
     """Assemble the four-copy ``Wavefunctions`` bundle from the two
     centroid-sampled arrays produced by ``load_centroids_band_chunked``.
@@ -630,11 +669,13 @@ def build_wavefunctions(
     return Wavefunctions(
         psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
         enk=enk_full, occ=occ_full, slices=slices,
+        basis_receipt=basis_receipt,
     )
 
 
 def build_wavefunctions_face(
     psi_rmu_Y, psi_rmuT_X, *, enk_full, slices, mesh_xy, efermi=None,
+    basis_receipt=None,
 ) -> Wavefunctions:
     """Assemble the ``layout="face"`` ``Wavefunctions`` bundle
     (``low_mem_bands = true``) from the SAME two centroid-sampled arrays
@@ -677,11 +718,13 @@ def build_wavefunctions_face(
     return Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=slices, layout="face",
+        basis_receipt=basis_receipt,
     )
 
 
 def wavefunctions_face_from_restart(
     psi_nmu, psi_mun, *, enk_full, slices, mesh_xy, efermi=None,
+    basis_receipt=None,
 ) -> Wavefunctions:
     """Assemble the ``layout="face"`` bundle from arrays ALREADY read at
     their face specs (``file_io.load_restart_state_from_h5``,
@@ -701,6 +744,7 @@ def wavefunctions_face_from_restart(
     return Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=slices, layout="face",
+        basis_receipt=basis_receipt,
     )
 
 
