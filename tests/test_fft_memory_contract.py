@@ -19,8 +19,9 @@ instrument.  Each is written so that reverting the fix turns it RED:
 
 * ``test_planner_fft_term_flows_through_aot_kernel_peak_bytes`` fails the
   moment ``query_fft_peak_bytes`` computes its own peak again.
-* ``test_probe_compiles_the_helper_production_uses`` fails the moment the
-  probe goes back to a form no production path executes.
+* ``test_probe_compiles_the_exact_helper_production_uses`` fails the moment
+  the probe substitutes a transform kind or normalization production did not
+  request.
 * ``test_cufft_query_failure_is_announced_and_flagged`` fails if the
   unavailable-cuFFT case silently returns 0 again.
 * ``test_no_mesh_fallback_announces`` fails if the analytic fallback goes
@@ -142,34 +143,62 @@ def test_planner_fft_term_flows_through_aot_kernel_peak_bytes(monkeypatch):
         f"{calls[0][1]!r}.")
 
 
-def test_probe_compiles_the_helper_production_uses(monkeypatch):
-    """The probe must compile ``make_sharded_fftn_3d`` — the same factory
-    every production FFT box goes through (``wfn_transforms._local_box_fft``,
-    the ζ writer's r→G FFT in ``gw.isdf_fitting``, the flat-k helpers;
-    ``zeta_loader._do_disk_to_G`` was the reader-side twin until it was
-    deleted on 2026-08-07).
+@pytest.mark.parametrize(
+    ("kind", "norm", "factory_name"),
+    (("fftn", None, "make_sharded_fftn_3d"),
+     ("ifftn", "ortho", "make_sharded_ifftn_3d")),
+)
+def test_probe_compiles_the_exact_helper_production_uses(
+        monkeypatch, kind, norm, factory_name):
+    """The probe must compile the requested production factory and norm.
+
+    Every production FFT box goes through ``make_sharded_*fftn_3d``
+    (``wfn_transforms._local_box_fft``, the ζ writer's r→G FFT in
+    ``gw.isdf_fitting``, the flat-k helpers; the zeta-loader reader-side twin
+    was deleted on 2026-08-07).
 
     Modelling a different FFT form sizes cuFFT plans nothing ever builds;
     that is precisely what the per-axis ``custom_partitioning`` probe did.
     """
     seen = []
-    real = fft_helpers.make_sharded_fftn_3d
+    real = getattr(fft_helpers, factory_name)
 
     def spy(*a, **kw):
         seen.append((a, kw))
         return real(*a, **kw)
 
-    monkeypatch.setattr(fft_helpers, "make_sharded_fftn_3d", spy)
+    monkeypatch.setattr(fft_helpers, factory_name, spy)
 
     fft_helpers.query_fft_peak_bytes(
         input_shape=(_NK, _BC, _NS, *_GRID), fft_axes=(-3, -2, -1),
         sharding=NamedSharding(
             _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
+        kind=kind, norm=norm,
         dtype=jnp.complex128)
 
     assert seen, (
-        "query_fft_peak_bytes did not compile make_sharded_fftn_3d — the "
-        "memory model is probing an FFT form production does not run.")
+        f"query_fft_peak_bytes did not compile {factory_name} — the memory "
+        "model is probing an FFT form production does not run.")
+    assert seen[0][1]["norm"] == norm
+
+
+def test_gflat_prices_the_production_wfn_spatial_ifft(monkeypatch):
+    """Stage A must request the WFN path's inverse, orthonormal transform."""
+    seen = []
+
+    def fake_query(**kwargs):
+        seen.append(kwargs)
+        return 123_456_789
+
+    monkeypatch.setattr(fft_helpers, "query_fft_peak_bytes", fake_query)
+    got = gmm._fft_box_bytes(
+        nk=_NK, bc=_BC, ns=_NS, fft_grid=_GRID,
+        mesh_xy=_unit_mesh(), p_xy=1)
+
+    assert got == 123_456_789
+    assert len(seen) == 1
+    assert seen[0]["kind"] == "ifftn"
+    assert seen[0]["norm"] == "ortho"
 
 
 def test_query_result_is_the_breakdown_total(monkeypatch):
@@ -185,8 +214,66 @@ def test_query_result_is_the_breakdown_total(monkeypatch):
         input_shape=(_NK, _BC, _NS, *_GRID), fft_axes=(-3, -2, -1),
         sharding=NamedSharding(
             _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
+        kind="ifftn", norm="ortho",
         dtype=jnp.complex128)
     assert got == 3_000
+
+
+def test_query_cache_keys_on_transform_kind_and_norm(monkeypatch):
+    """Distinct production programs must not reuse one cached measurement."""
+    calls = []
+
+    class _Lowered:
+        def compile(self, **_kwargs):
+            return object()
+
+    class _Jitted:
+        def lower(self, _spec):
+            return _Lowered()
+
+    monkeypatch.setattr(fft_helpers, "make_sharded_fftn_3d",
+                        lambda *a, **kw: object())
+    monkeypatch.setattr(fft_helpers, "make_sharded_ifftn_3d",
+                        lambda *a, **kw: object())
+    monkeypatch.setattr(fft_helpers.jax, "jit",
+                        lambda *a, **kw: _Jitted())
+
+    def fake_peak(_compiled, **_kwargs):
+        calls.append(None)
+        n = len(calls)
+        return aot.AotPeakBreakdown(
+            compiled_peak=n, cufft_scratch=0, total=n,
+            cufft_measured=True, fft_specs=(object(),))
+
+    monkeypatch.setattr(aot, "aot_kernel_peak_bytes", fake_peak)
+    sharding = NamedSharding(
+        _unit_mesh(), P(None, ('x', 'y'), None, None, None, None))
+
+    def query(kind, norm):
+        return fft_helpers.query_fft_peak_bytes(
+            input_shape=(_NK, _BC, _NS, *_GRID),
+            fft_axes=(-3, -2, -1), sharding=sharding,
+            kind=kind, norm=norm, dtype=jnp.complex128)
+
+    assert [query("fftn", None), query("fftn", "ortho"),
+            query("ifftn", "ortho"), query("ifftn", "ortho")] == [1, 2, 3, 3]
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("kind", "norm", "match"),
+    (("inverse", "ortho", "kind must be"),
+     ("ifftn", "unitary", "norm must be")),
+)
+def test_query_refuses_unknown_transform_semantics(kind, norm, match):
+    """A misspelled program is an API error, not an analytic demotion."""
+    with pytest.raises(ValueError, match=match):
+        fft_helpers.query_fft_peak_bytes(
+            input_shape=(_NK, _BC, _NS, *_GRID),
+            fft_axes=(-3, -2, -1),
+            sharding=NamedSharding(
+                _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
+            kind=kind, norm=norm, dtype=jnp.complex128)
 
 
 # ---------------------------------------------------------------------------
