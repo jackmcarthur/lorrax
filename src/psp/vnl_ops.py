@@ -26,6 +26,10 @@ from psp.radial.build_projectors_qe import (
     build_E_blocks_full, pseudo_has_j_channels, pseudo_soc_strength_ry,
 )
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
+from common.gauss_legendre import (
+    GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
+    gauss_legendre_interval,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +130,8 @@ class _VNLProjectorCoefficientBlock:
     """
 
     c: jax.Array                    # (R, spin, band)
-    dc_cart: jax.Array              # (cart, R, spin, band)
-    d2c_cart: jax.Array             # (cart, cart, R, spin, band)
+    dc_cart: jax.Array | None       # (cart, R, spin, band)
+    d2c_cart: jax.Array | None      # (cart, cart, R, spin, band)
     E: jax.Array
     d3c_cart: jax.Array | None = None
 
@@ -136,9 +140,10 @@ class _VNLProjectorCoefficientBlock:
 class VNLGaugeKetDerivatives:
     """Canonical VNL current/contact action on a two-component ket block."""
 
-    gamma_cart_ket: jax.Array
-    lambda_cart_ket: jax.Array
+    gamma_cart_ket: jax.Array | None
+    lambda_cart_ket: jax.Array | None
     third_cart_ket: jax.Array | None = None
+    value_ket: jax.Array | None = None
 
 
 ICL_STRAIGHT_GAUGE_PATH = "icl_straight_segment_v1"
@@ -167,6 +172,21 @@ class ICLVNLTransferJet:
     dgamma_dq_cart_ket: jax.Array
     lambda0_cart_ket: jax.Array
     d2gamma_dq2_cart_ket: jax.Array | None = None
+
+
+@dataclass(frozen=True)
+class ICLVNLFiniteTransfer:
+    """Exact-ICL action and its device-side endpoint-Ward certificate."""
+
+    gamma_cart_ket: jax.Array
+    ward_residual_abs: jax.Array
+    ward_residual_rel: jax.Array
+    ward_reference_norm: jax.Array
+    certified: jax.Array
+    tolerance_abs: float
+    tolerance_rel: float
+    path_order: int
+    vnl_path_operator_fingerprint: str
 
 
 # ---------------------------------------------------------------------------
@@ -936,9 +956,9 @@ def _projector_derivatives_cartesian_rows(
     row_beta_idx, row_l, row_m, row_tau, g_mask, row_mask,
     *, derivative_order: int = 2,
 ):
-    """Z derivatives through order two or three for one row/G tile."""
-    if int(derivative_order) not in (2, 3):
-        raise ValueError("derivative_order must be 2 or 3")
+    """Z and Cartesian derivatives through requested order zero to three."""
+    if int(derivative_order) not in (0, 1, 2, 3):
+        raise ValueError("derivative_order must be 0, 1, 2, or 3")
     if int(derivative_order) == 3 and setup.Gppp_table is None:
         raise ValueError(
             "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
@@ -954,15 +974,22 @@ def _projector_derivatives_cartesian_rows(
 
     zero = jnp.zeros((3,), dtype=jnp.float64)
     Z = z_at_cart_shift(zero)
-    dZ = jnp.moveaxis(jax.jacfwd(z_at_cart_shift)(zero), -1, 0)
-    d2_raw = jax.jacfwd(jax.jacfwd(z_at_cart_shift))(zero)
-    d2Z = jnp.moveaxis(d2_raw, (-2, -1), (0, 1))
     mask = (
         row_mask[:, None].astype(Z.real.dtype)
         * g_mask[None, :].astype(Z.real.dtype))
-    through_second = (
-        Z * mask,
+    Z = Z * mask
+    if int(derivative_order) == 0:
+        return (Z,)
+    dZ = jnp.moveaxis(jax.jacfwd(z_at_cart_shift)(zero), -1, 0)
+    through_first = (
+        Z,
         dZ * mask[None, :, :],
+    )
+    if int(derivative_order) == 1:
+        return through_first
+    d2_raw = jax.jacfwd(jax.jacfwd(z_at_cart_shift))(zero)
+    d2Z = jnp.moveaxis(d2_raw, (-2, -1), (0, 1))
+    through_second = through_first + (
         d2Z * mask[None, None, :, :],
     )
     if int(derivative_order) == 2:
@@ -974,14 +1001,16 @@ def _projector_derivatives_cartesian_rows(
     )
 
 
-def _contract_projector_coefficients(psi_G, Z, dZ, d2Z, E, d3Z=None):
+def _contract_projector_coefficients(
+    psi_G, Z, dZ, d2Z, E, d3Z=None,
+):
     """Contract one G tile into the private low-rank coefficient carrier."""
     return _VNLProjectorCoefficientBlock(
         c=jnp.einsum("RG,nsG->Rsn", jnp.conj(Z), psi_G, optimize=True),
-        dc_cart=jnp.einsum(
-            "aRG,nsG->aRsn", jnp.conj(dZ), psi_G, optimize=True),
-        d2c_cart=jnp.einsum(
-            "abRG,nsG->abRsn", jnp.conj(d2Z), psi_G, optimize=True),
+        dc_cart=(None if dZ is None else jnp.einsum(
+            "aRG,nsG->aRsn", jnp.conj(dZ), psi_G, optimize=True)),
+        d2c_cart=(None if d2Z is None else jnp.einsum(
+            "abRG,nsG->abRsn", jnp.conj(d2Z), psi_G, optimize=True)),
         E=E,
         d3c_cart=(None if d3Z is None else jnp.einsum(
             "abcRG,nsG->abcRsn", jnp.conj(d3Z), psi_G,
@@ -993,19 +1022,26 @@ def _coupled_projector_coefficients(block):
     """Apply the canonical PP/SOC E block once to c/dc/d2c."""
     E = block.E
     Ec = jnp.einsum("stRQ,Qtn->Rsn", E, block.c, optimize=True)
-    Edc = jnp.einsum(
-        "stRQ,aQtn->aRsn", E, block.dc_cart, optimize=True)
-    Ed2c = jnp.einsum(
-        "stRQ,abQtn->abRsn", E, block.d2c_cart, optimize=True)
+    Edc = (None if block.dc_cart is None else jnp.einsum(
+        "stRQ,aQtn->aRsn", E, block.dc_cart, optimize=True))
+    Ed2c = (None if block.d2c_cart is None else jnp.einsum(
+        "stRQ,abQtn->abRsn", E, block.d2c_cart, optimize=True))
     return Ec, Edc, Ed2c
+
+
+def _apply_vnl_current_from_coupled(Ec, Edc, Z, dZ):
+    """Re-expand one VNL current action from canonical coupled coefficients."""
+    return (
+        jnp.einsum("aRG,Rsn->ansG", dZ, Ec, optimize=True)
+        + jnp.einsum("RG,aRsn->ansG", Z, Edc, optimize=True))
 
 
 def _apply_vnl_gauge_from_coefficients(block, Z, dZ, d2Z):
     """Re-expand current/contact only where a G-space action is requested."""
     Ec, Edc, Ed2c = _coupled_projector_coefficients(block)
-    gamma = (
-        jnp.einsum("aRG,Rsn->ansG", dZ, Ec, optimize=True)
-        + jnp.einsum("RG,aRsn->ansG", Z, Edc, optimize=True))
+    if Ed2c is None:
+        raise ValueError("uniform contact requires second projector coefficients")
+    gamma = _apply_vnl_current_from_coupled(Ec, Edc, Z, dZ)
     contact = (
         jnp.einsum("abRG,Rsn->abnsG", d2Z, Ec, optimize=True)
         + jnp.einsum("aRG,bRsn->abnsG", dZ, Edc, optimize=True)
@@ -1113,19 +1149,20 @@ def _compact_channel_couplings(setup: VNLSetup, row_width: int):
     return jnp.stack(blocks, axis=0)
 
 
-def apply_uniform_vnl_derivatives_to_ket(
+def _apply_vnl_derivatives_between_g_carriers(
     psi_G,
-    G_int,
+    G_source_int,
+    G_target_int,
     k_crys,
     setup: VNLSetup,
-    g_mask,
+    g_mask_source,
+    g_mask_target,
     *,
-    q_cart_bohr_inv=(0.0, 0.0, 0.0),
+    derivative_order: int,
     projector_row_chunk: int = 64,
     g_chunk: int = 1024,
-    compute_third: bool = False,
 ) -> VNLGaugeKetDerivatives:
-    r"""Apply uniform VNL Gamma/Lambda with bounded row and G carriers.
+    r"""One bounded source-coefficient/target-expansion derivative owner.
 
     ``psi_G`` must be the explicit two-component large-component block
     ``Psi_L=(band,2,G)``. Four-component input refuses; the named bispinor
@@ -1134,15 +1171,20 @@ def apply_uniform_vnl_derivatives_to_ket(
     One fixed-shape outer ``lax.scan`` traverses packed complete E blocks.
     Two inner G scans first accumulate private ``c/dc/d2c`` and then
     re-expand the action. No full-G Z/dZ/d2Z or band-square matrix exists.
-    ``compute_third=True`` extends those same scans with ``d3c/d3Z`` and a
-    third Hamiltonian action for the ICL q2 jet.  It requires the separately
-    priced setup capability and does not alter the default compile family.
+    ``derivative_order`` selects value only (0), current (1),
+    current/contact (2), or current/contact/third action (3). Uniform supplies the same G
+    carrier twice; exact finite transfer supplies the source and unwrapped
+    target carriers.  The projector, coefficient, and re-expansion spelling is
+    otherwise identical.
     """
-    require_uniform_gauge_transfer(
-        q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
+    order = int(derivative_order)
+    if order not in (0, 1, 2, 3):
+        raise ValueError("derivative_order must be 0, 1, 2, or 3")
     psi = jnp.asarray(psi_G)
-    G = jnp.asarray(G_int, dtype=jnp.int32)
-    mask = jnp.asarray(g_mask, dtype=jnp.float64)
+    G_source = jnp.asarray(G_source_int, dtype=jnp.int32)
+    mask_source = jnp.asarray(g_mask_source, dtype=jnp.float64)
+    G_target = jnp.asarray(G_target_int, dtype=jnp.int32)
+    mask_target = jnp.asarray(g_mask_target, dtype=jnp.float64)
     if psi.ndim != 3 or int(psi.shape[1]) != 2:
         raise ValueError(
             "GATE EM-VERTEX-LARGE-COMPONENTS: expected explicit Psi_L "
@@ -1151,11 +1193,11 @@ def apply_uniform_vnl_derivatives_to_ket(
         raise ValueError(
             "GATE EM-VERTEX-PAULI-VNL: VNLSetup.nspinor must be 2, got "
             f"{int(setup.nspinor)}")
-    if setup.Gpp_table is None:
+    if order >= 2 and setup.Gpp_table is None:
         raise ValueError(
             "GATE EM-VERTEX-VNL-GPP-MISSING: rebuild VNLSetup with "
             "compute_contact=True")
-    if bool(compute_third) and setup.Gppp_table is None:
+    if order == 3 and setup.Gppp_table is None:
         raise ValueError(
             "GATE EM-VERTEX-VNL-GPPP-MISSING: rebuild VNLSetup with "
             "compute_transfer_q2=True")
@@ -1164,40 +1206,63 @@ def apply_uniform_vnl_derivatives_to_ket(
             or setup.row_tau is None):
         raise ValueError(
             "GATE EM-VERTEX-VNL-SETUP: incomplete canonical VNLSetup")
-    if G.shape != (psi.shape[-1], 3) or mask.shape != (psi.shape[-1],):
+    if (G_source.shape != (psi.shape[-1], 3)
+            or mask_source.shape != (psi.shape[-1],)):
         raise ValueError(
-            "paired G/mask/Psi_L mismatch: got "
-            f"G={G.shape}, mask={mask.shape}, psi={psi.shape}")
+            "paired source G/mask/Psi_L mismatch: got "
+            f"G={G_source.shape}, mask={mask_source.shape}, psi={psi.shape}")
+    if (G_target.ndim != 2 or int(G_target.shape[1]) != 3
+            or mask_target.shape != (G_target.shape[0],)):
+        raise ValueError(
+            "paired target G/mask mismatch: got "
+            f"G={G_target.shape}, mask={mask_target.shape}")
     if int(g_chunk) <= 0:
         raise ValueError("g_chunk must be positive")
 
-    nband, nG = int(psi.shape[0]), int(psi.shape[-1])
+    nband, nG_source = int(psi.shape[0]), int(psi.shape[-1])
+    nG_target = int(G_target.shape[0])
     gstep = int(g_chunk)
-    ncarrier = ((nG + gstep - 1) // gstep) * gstep
-    gpad = ncarrier - nG
-    psi_pad = jnp.pad(psi, ((0, 0), (0, 0), (0, gpad)))
-    G_pad = jnp.pad(G, ((0, gpad), (0, 0)))
-    mask_pad = jnp.pad(mask, (0, gpad))
-    nchunk = ncarrier // gstep
+    source_carrier = ((nG_source + gstep - 1) // gstep) * gstep
+    target_carrier = ((nG_target + gstep - 1) // gstep) * gstep
+    source_pad = source_carrier - nG_source
+    target_pad = target_carrier - nG_target
+    psi_pad = jnp.pad(psi, ((0, 0), (0, 0), (0, source_pad)))
+    G_source_pad = jnp.pad(G_source, ((0, source_pad), (0, 0)))
+    mask_source_pad = jnp.pad(mask_source, (0, source_pad))
+    G_target_pad = jnp.pad(G_target, ((0, target_pad), (0, 0)))
+    mask_target_pad = jnp.pad(mask_target, (0, target_pad))
+    source_chunks = source_carrier // gstep
+    target_chunks = target_carrier // gstep
     psi_chunks = jnp.moveaxis(
-        psi_pad.reshape(nband, 2, nchunk, gstep), 2, 0)
-    G_chunks = G_pad.reshape(nchunk, gstep, 3)
-    mask_chunks = mask_pad.reshape(nchunk, gstep)
+        psi_pad.reshape(nband, 2, source_chunks, gstep), 2, 0)
+    G_source_chunks = G_source_pad.reshape(source_chunks, gstep, 3)
+    mask_source_chunks = mask_source_pad.reshape(source_chunks, gstep)
+    G_target_chunks = G_target_pad.reshape(target_chunks, gstep, 3)
+    mask_target_chunks = mask_target_pad.reshape(target_chunks, gstep)
 
-    gamma_zero = jnp.zeros((3, nband, 2, ncarrier), dtype=psi.dtype)
-    contact_zero = jnp.zeros(
-        (3, 3, nband, 2, ncarrier), dtype=psi.dtype)
+    value_zero = (jnp.zeros((nband, 2, target_carrier), dtype=psi.dtype)
+                  if order == 0 else None)
+    gamma_zero = (jnp.zeros(
+        (3, nband, 2, target_carrier), dtype=psi.dtype)
+        if order >= 1 else None)
+    contact_zero = (jnp.zeros(
+        (3, 3, nband, 2, target_carrier), dtype=psi.dtype)
+        if order >= 2 else None)
     third_zero = (jnp.zeros(
-        (3, 3, 3, nband, 2, ncarrier), dtype=psi.dtype)
-        if bool(compute_third) else None)
+        (3, 3, 3, nband, 2, target_carrier), dtype=psi.dtype)
+        if order == 3 else None)
     row_blocks = _coupled_projector_row_blocks(
         setup, int(projector_row_chunk))
     if not row_blocks:
         return VNLGaugeKetDerivatives(
-            gamma_cart_ket=gamma_zero[..., :nG],
-            lambda_cart_ket=contact_zero[..., :nG],
+            gamma_cart_ket=(None if gamma_zero is None
+                            else gamma_zero[..., :nG_target]),
+            lambda_cart_ket=(None if contact_zero is None
+                             else contact_zero[..., :nG_target]),
             third_cart_ket=(None if third_zero is None
-                            else third_zero[..., :nG]))
+                            else third_zero[..., :nG_target]),
+            value_ket=(None if value_zero is None
+                       else value_zero[..., :nG_target]))
 
     row_width = max(stop - start for start, stop, _ in row_blocks)
     row_starts = jnp.asarray(
@@ -1227,12 +1292,15 @@ def apply_uniform_vnl_derivatives_to_ket(
         E_block = E_block * (
             row_mask[None, None, :, None]
             * row_mask[None, None, None, :]).astype(E_block.dtype)
-        coeff_zero = (
-            jnp.zeros((row_width, 2, nband), dtype=psi.dtype),
-            jnp.zeros((3, row_width, 2, nband), dtype=psi.dtype),
-            jnp.zeros((3, 3, row_width, 2, nband), dtype=psi.dtype),
-        )
-        if bool(compute_third):
+        coeff_zero = (jnp.zeros(
+            (row_width, 2, nband), dtype=psi.dtype),)
+        if order >= 1:
+            coeff_zero = coeff_zero + (jnp.zeros(
+                (3, row_width, 2, nband), dtype=psi.dtype),)
+        if order >= 2:
+            coeff_zero = coeff_zero + (jnp.zeros(
+                (3, 3, row_width, 2, nband), dtype=psi.dtype),)
+        if order == 3:
             coeff_zero = coeff_zero + (jnp.zeros(
                 (3, 3, 3, row_width, 2, nband), dtype=psi.dtype),)
 
@@ -1240,78 +1308,130 @@ def apply_uniform_vnl_derivatives_to_ket(
             psi_part, G_part, mask_part = xs
             derivatives = _projector_derivatives_cartesian_rows(
                 k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
-                mask_part, row_mask,
-                derivative_order=(3 if bool(compute_third) else 2))
-            Z, dZ, d2Z = derivatives[:3]
-            d3Z = derivatives[3] if bool(compute_third) else None
+                mask_part, row_mask, derivative_order=order)
+            Z = derivatives[0]
+            dZ = derivatives[1] if order >= 1 else None
+            d2Z = derivatives[2] if order >= 2 else None
+            d3Z = derivatives[3] if order == 3 else None
             part = _contract_projector_coefficients(
                 psi_part, Z, dZ, d2Z, E_block, d3Z=d3Z)
-            updated = (
-                carry[0] + part.c,
-                carry[1] + part.dc_cart,
-                carry[2] + part.d2c_cart,
-            )
-            if bool(compute_third):
+            updated = (carry[0] + part.c,)
+            if order >= 1:
+                updated = updated + (carry[1] + part.dc_cart,)
+            if order >= 2:
+                updated = updated + (carry[2] + part.d2c_cart,)
+            if order == 3:
                 updated = updated + (carry[3] + part.d3c_cart,)
             return updated, None
 
         coefficient_arrays, _ = jax.lax.scan(
             coefficient_pass, coeff_zero,
-            (psi_chunks, G_chunks, mask_chunks), unroll=1)
+            (psi_chunks, G_source_chunks, mask_source_chunks), unroll=1)
         coefficients = _VNLProjectorCoefficientBlock(
-            c=coefficient_arrays[0], dc_cart=coefficient_arrays[1],
-            d2c_cart=coefficient_arrays[2], E=E_block,
+            c=coefficient_arrays[0],
+            dc_cart=(coefficient_arrays[1] if order >= 1 else None),
+            d2c_cart=(coefficient_arrays[2] if order >= 2 else None),
+            E=E_block,
             d3c_cart=(coefficient_arrays[3]
-                      if bool(compute_third) else None))
+                      if order == 3 else None))
 
         def expansion_pass(carry, xs):
             G_part, mask_part = xs
             derivatives = _projector_derivatives_cartesian_rows(
                 k_crys, G_part, setup, row_beta, row_l, row_m, row_tau,
-                mask_part, row_mask,
-                derivative_order=(3 if bool(compute_third) else 2))
-            Z, dZ, d2Z = derivatives[:3]
-            out = _apply_vnl_gauge_from_coefficients(
-                coefficients, Z, dZ, d2Z)
-            outputs = (out.gamma_cart_ket, out.lambda_cart_ket)
-            if bool(compute_third):
+                mask_part, row_mask, derivative_order=order)
+            Z = derivatives[0]
+            if order == 0:
+                Ec, _, _ = _coupled_projector_coefficients(coefficients)
+                outputs = (jnp.einsum(
+                    "RG,Rsn->nsG", Z, Ec, optimize=True),)
+            elif order == 1:
+                dZ = derivatives[1]
+                Ec, Edc, _ = _coupled_projector_coefficients(coefficients)
+                outputs = (_apply_vnl_current_from_coupled(
+                    Ec, Edc, Z, dZ),)
+            else:
+                dZ = derivatives[1]
+                out = _apply_vnl_gauge_from_coefficients(
+                    coefficients, Z, dZ, derivatives[2])
+                outputs = (out.gamma_cart_ket, out.lambda_cart_ket)
+            if order == 3:
                 outputs = outputs + (_apply_vnl_third_from_coefficients(
-                    coefficients, Z, dZ, d2Z, derivatives[3]),)
+                    coefficients, Z, dZ, derivatives[2], derivatives[3]),)
             return carry, outputs
 
         _, expanded_chunks = jax.lax.scan(
-            expansion_pass, None, (G_chunks, mask_chunks), unroll=1)
-        gamma_chunks, contact_chunks = expanded_chunks[:2]
-        gamma_block = jnp.transpose(
-            gamma_chunks, (1, 2, 3, 0, 4)).reshape(
-                3, nband, 2, ncarrier)
-        contact_block = jnp.transpose(
-            contact_chunks, (1, 2, 3, 4, 0, 5)).reshape(
-                3, 3, nband, 2, ncarrier)
-        updated_total = (
-            total[0] + gamma_block,
-            total[1] + contact_block,
-        )
-        if bool(compute_third):
+            expansion_pass, None,
+            (G_target_chunks, mask_target_chunks), unroll=1)
+        if order == 0:
+            value_chunks = expanded_chunks[0]
+            value_block = jnp.transpose(
+                value_chunks, (1, 2, 0, 3)).reshape(
+                    nband, 2, target_carrier)
+            updated_total = (total[0] + value_block,)
+        else:
+            gamma_chunks = expanded_chunks[0]
+            gamma_block = jnp.transpose(
+                gamma_chunks, (1, 2, 3, 0, 4)).reshape(
+                    3, nband, 2, target_carrier)
+            updated_total = (total[0] + gamma_block,)
+        if order >= 2:
+            contact_chunks = expanded_chunks[1]
+            contact_block = jnp.transpose(
+                contact_chunks, (1, 2, 3, 4, 0, 5)).reshape(
+                    3, 3, nband, 2, target_carrier)
+            updated_total = updated_total + (total[1] + contact_block,)
+        if order == 3:
             third_chunks = expanded_chunks[2]
             third_block = jnp.transpose(
                 third_chunks, (1, 2, 3, 4, 5, 0, 6)).reshape(
-                    3, 3, 3, nband, 2, ncarrier)
+                    3, 3, 3, nband, 2, target_carrier)
             updated_total = updated_total + (total[2] + third_block,)
         return updated_total, None
 
-    initial = (gamma_zero, contact_zero)
-    if bool(compute_third):
+    initial = (value_zero if order == 0 else gamma_zero,)
+    if order >= 2:
+        initial = initial + (contact_zero,)
+    if order == 3:
         initial = initial + (third_zero,)
     totals, _ = jax.lax.scan(
         row_pass, initial,
         (row_starts, row_lengths, row_channels), unroll=1)
-    gamma, contact = totals[:2]
     return VNLGaugeKetDerivatives(
-        gamma_cart_ket=gamma[..., :nG],
-        lambda_cart_ket=contact[..., :nG],
-        third_cart_ket=(totals[2][..., :nG]
-                        if bool(compute_third) else None))
+        gamma_cart_ket=(totals[0][..., :nG_target]
+                        if order >= 1 else None),
+        lambda_cart_ket=(totals[1][..., :nG_target]
+                         if order >= 2 else None),
+        third_cart_ket=(totals[2][..., :nG_target]
+                        if order == 3 else None),
+        value_ket=(totals[0][..., :nG_target]
+                   if order == 0 else None))
+
+
+def apply_uniform_vnl_derivatives_to_ket(
+    psi_G,
+    G_int,
+    k_crys,
+    setup: VNLSetup,
+    g_mask,
+    *,
+    q_cart_bohr_inv=(0.0, 0.0, 0.0),
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+    compute_third: bool = False,
+) -> VNLGaugeKetDerivatives:
+    r"""Apply uniform VNL Gamma/Lambda through the shared bounded core.
+
+    Uniform response supplies the same source/target G carrier.  The exact
+    finite-transfer path below supplies two carriers to that same core; there
+    is no second projector, coefficient, or re-expansion implementation.
+    """
+    require_uniform_gauge_transfer(
+        q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
+    return _apply_vnl_derivatives_between_g_carriers(
+        psi_G, G_int, G_int, k_crys, setup, g_mask, g_mask,
+        derivative_order=(3 if bool(compute_third) else 2),
+        projector_row_chunk=int(projector_row_chunk), g_chunk=int(g_chunk))
 
 
 def apply_icl_vnl_transfer_jet_to_ket(
@@ -1360,6 +1480,151 @@ def apply_icl_vnl_transfer_jet_to_ket(
         d2gamma_dq2_cart_ket=(
             uniform.third_cart_ket / 3.0
             if bool(include_q2) else None),
+    )
+
+
+def icl_vnl_finite_transfer_operator_fingerprint(
+    setup: VNLSetup, *, path_order: int, path_rtol: float, path_atol: float,
+) -> str:
+    """Bind the canonical VNL identity and selected path integration rule."""
+    import hashlib
+    from common.parallel_transport import fingerprint_update_value
+
+    vnl_fingerprint = str(setup.uniform_gauge_fingerprint).strip()
+    if len(vnl_fingerprint) != 71 or not vnl_fingerprint.startswith("sha256:"):
+        raise ValueError("exact ICL requires a fingerprinted VNLSetup")
+    rtol, atol = float(path_rtol), float(path_atol)
+    if not (np.isfinite(rtol) and rtol > 0.0
+            and np.isfinite(atol) and atol >= 0.0):
+        raise ValueError("path tolerances must be finite, rtol>0 and atol>=0")
+    gauss_legendre_interval(int(path_order), 0.0, 1.0)  # validates order
+    digest = hashlib.sha256()
+    digest.update(b"lorrax.icl_vnl_finite_transfer/v1\0")
+    for label, value in (
+        ("vnl", vnl_fingerprint),
+        ("path", ICL_STRAIGHT_GAUGE_PATH),
+        ("quadrature", GAUSS_LEGENDRE_INTERVAL_PROVENANCE),
+        ("path_order", np.int64(path_order)),
+        ("path_rtol", np.float64(rtol)),
+        ("path_atol", np.float64(atol)),
+    ):
+        fingerprint_update_value(digest, label, value)
+    return "sha256:" + digest.hexdigest()
+
+
+def compute_icl_vnl_finite_transfer_to_ket(
+    psi_G,
+    G_source_int,
+    G_target_int,
+    k_source_crys,
+    k_target_crys,
+    q_crys,
+    G_wrap,
+    setup: VNLSetup,
+    g_mask_source,
+    g_mask_target,
+    *,
+    path_order: int = 12,
+    path_rtol: float = 1.0e-10,
+    path_atol: float = 1.0e-12,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+) -> ICLVNLFiniteTransfer:
+    r"""Apply ``integral_0^1 dlam dV_NL(k-lam*q)/dk`` to ``psi_G``.
+
+    The target k point and integer wrap are canonical ``common.kq_mapping``
+    outputs.  Source contraction and target expansion share the bounded VNL
+    core above.  The result stays on device and is certified by
+    ``q.Gamma = V(k)-V(k-q)``; a transaction owner must reduce/refuse once.
+    """
+    psi = jnp.asarray(psi_G)
+    k_source = jnp.asarray(k_source_crys, dtype=jnp.float64)
+    k_target = jnp.asarray(k_target_crys, dtype=jnp.float64)
+    q = jnp.asarray(q_crys, dtype=jnp.float64)
+    wrap_raw = jnp.asarray(G_wrap)
+    if any(x.shape != (3,) for x in (k_source, k_target, q, wrap_raw)):
+        raise ValueError("k_source/k_target/q/G_wrap must all have shape (3,)")
+    if not jnp.issubdtype(wrap_raw.dtype, jnp.integer):
+        raise ValueError(
+            f"G_wrap must be the integer output of common.kq_mapping; got "
+            f"dtype={wrap_raw.dtype}")
+    wrap = wrap_raw.astype(jnp.int32)
+    geometry_closed = jnp.max(jnp.abs(
+        (k_source - q) - (k_target + wrap))) <= 2.0e-12
+
+    G_source = jnp.asarray(G_source_int, dtype=jnp.int32)
+    G_target_unwrapped = (
+        jnp.asarray(G_target_int, dtype=jnp.int32) - wrap[None, :])
+    source_mask = jnp.asarray(g_mask_source, dtype=jnp.float64)
+    target_mask = jnp.asarray(g_mask_target, dtype=jnp.float64)
+    nG_target = int(G_target_unwrapped.shape[0])
+
+    B = jnp.asarray(setup.B, dtype=jnp.float64)
+    def masked_radius(G_values, masks, k_value):
+        radius = jnp.linalg.norm((G_values + k_value) @ B, axis=-1)
+        return jnp.max(jnp.where(masks > 0.0, radius, 0.0))
+    carriers = ((G_source.astype(jnp.float64), source_mask),
+                (G_target_unwrapped.astype(jnp.float64), target_mask))
+    max_radius = jnp.max(jnp.stack([
+        masked_radius(G_values, mask, k_value)
+        for G_values, mask in carriers for k_value in (k_source, k_source-q)]))
+    radial_covered = max_radius <= jnp.asarray(
+        float(setup.q_max) * (1.0 + 16.0 * np.finfo(np.float64).eps),
+        dtype=jnp.float64)
+
+    nodes_np, weights_np = gauss_legendre_interval(
+        int(path_order), 0.0, 1.0)
+    nodes = jnp.asarray(nodes_np, dtype=jnp.float64)
+    weights = jnp.asarray(weights_np, dtype=jnp.float64)
+
+    nband = int(psi.shape[0])
+    gamma_zero = jnp.zeros((3, nband, 2, nG_target), dtype=psi.dtype)
+
+    def path_pass(carry, xs):
+        path_node, weight = xs
+        gamma_node = _apply_vnl_derivatives_between_g_carriers(
+            psi, G_source, G_target_unwrapped, k_source-path_node*q, setup,
+            source_mask, target_mask, derivative_order=1,
+            projector_row_chunk=projector_row_chunk,
+            g_chunk=g_chunk).gamma_cart_ket
+        return carry + weight.astype(gamma_node.real.dtype) * gamma_node, None
+
+    gamma, _ = jax.lax.scan(
+        path_pass, gamma_zero, (nodes, weights), unroll=1)
+    def endpoint(k_value):
+        return _apply_vnl_derivatives_between_g_carriers(
+            psi, G_source, G_target_unwrapped, k_value, setup,
+            source_mask, target_mask, derivative_order=0,
+            projector_row_chunk=projector_row_chunk,
+            g_chunk=g_chunk).value_ket
+    endpoint_delta = endpoint(k_source) - endpoint(k_source-q)
+    q_cart = q @ B
+    ward_delta = jnp.einsum(
+        "a,ansG->nsG", q_cart, gamma, optimize=True) - endpoint_delta
+    error_abs = jnp.sqrt(jnp.real(jnp.vdot(ward_delta, ward_delta)))
+    reference_norm = jnp.sqrt(jnp.real(jnp.vdot(
+        endpoint_delta, endpoint_delta)))
+    error_rel = error_abs / jnp.maximum(
+        reference_norm, jnp.asarray(np.finfo(np.float64).tiny))
+    certificate_limit = (
+        jnp.asarray(float(path_atol), dtype=jnp.float64)
+        + jnp.asarray(float(path_rtol), dtype=jnp.float64) * reference_norm)
+    certified = jnp.logical_and(
+        geometry_closed,
+        jnp.logical_and(radial_covered, error_abs <= certificate_limit))
+    return ICLVNLFiniteTransfer(
+        gamma_cart_ket=gamma,
+        ward_residual_abs=error_abs,
+        ward_residual_rel=error_rel,
+        ward_reference_norm=reference_norm,
+        certified=certified,
+        tolerance_abs=float(path_atol),
+        tolerance_rel=float(path_rtol),
+        path_order=int(path_order),
+        vnl_path_operator_fingerprint=(
+            icl_vnl_finite_transfer_operator_fingerprint(
+                setup, path_order=path_order, path_rtol=path_rtol,
+                path_atol=path_atol)),
     )
 
 
