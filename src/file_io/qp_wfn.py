@@ -101,6 +101,12 @@ QP_ROT_K_DATASETS = ("U_mnk", "E_qp_nk_hartree", "E_qp_nk_rydberg")
 #: before.
 QP_ROT_FULL_BZ_DATASETS = ("kpoints_crys", "kirr_to_kfull")
 
+#: Small, non-k-reduced datasets that define which Hamiltonian the physics
+#: arrays belong to.  Consumers of both ``U_mnk`` and ``E_qp`` must read
+#: these through :func:`read_qp_rotations_artifact`; opening the HDF5 file a
+#: second time in each driver would create another metadata contract.
+QP_ROT_METADATA_DATASETS = ("band_range", "kpoints_crys", "kgrid")
+
 #: Root attribute :func:`write_qp_wfn_h5` stamps on its output, and the ONLY
 #: content-based way to tell a QP WFN.h5 from a mean-field one.  A QP WFN's ψ
 #: and E are a matched pair — the rotated orbitals carry the eigenvalues that
@@ -402,6 +408,41 @@ def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
     return out
 
 
+def read_qp_rotations_artifact(h5_path: str) -> dict:
+    """Read one complete ``qp_wfn_rotations.h5`` Hamiltonian artifact.
+
+    The physics arrays are unfolded through
+    :func:`read_qp_rotations_full_bz`, so wedge and full-BZ storage retain
+    one meaning.  The small identity datasets are read here as part of the
+    same public format contract rather than independently in every physics
+    driver.
+
+    Returns ``U_mnk`` and ``E_qp_nk_rydberg`` on the full BZ together with
+    ``band_range``, ``kpoints_crys`` and ``kgrid``.  A partial artifact is
+    refused: a rotation without its matched eigenvalues, band labels or
+    k-set cannot define ``H_QP = U diag(E_QP) U^H``.
+    """
+    path = os.fspath(h5_path)
+    arrays = read_qp_rotations_full_bz(
+        path, datasets=("U_mnk", "E_qp_nk_rydberg"))
+    missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
+               if name not in arrays]
+    with h5py.File(path, "r") as h5:
+        missing.extend(name for name in QP_ROT_METADATA_DATASETS
+                       if name not in h5)
+        if missing:
+            raise ValueError(
+                f"{os.path.basename(path)} is not a complete QP rotation "
+                f"artifact; missing {sorted(set(missing))}.")
+        arrays.update({
+            "band_range": np.asarray(h5["band_range"][()], dtype=np.int64),
+            "kpoints_crys": np.asarray(
+                h5["kpoints_crys"][()], dtype=np.float64),
+            "kgrid": np.asarray(h5["kgrid"][()], dtype=np.int64),
+        })
+    return arrays
+
+
 # ---------------------------------------------------------------------------
 # Full WFN.h5 with rotated ψ + replaced energies
 # ---------------------------------------------------------------------------
@@ -577,3 +618,62 @@ def read_qp_wfn_stamp(path) -> dict | None:
             }
     except (OSError, KeyError):
         return None
+
+
+def refuse_conflicting_qp_state_sources(
+        *, wfn_path: str, eqp_file: str | None = None,
+        qp_rotations_file: str | None = None) -> None:
+    """Refuse two explicit descriptions of one quasiparticle state.
+
+    A positively stamped QP WFN already contains the matched rotated orbitals
+    and eigenvalues.  Applying either a DFT-labelled diagonal eqp ladder or a
+    second rotation artifact changes that Hamiltonian while preserving every
+    array shape.  Conversely, a mean-field/unverifiable WFN may consume one
+    explicit QP source.  Absence of the stamp proves nothing and therefore
+    never refuses by itself.
+
+    Association is established only by explicit arguments and the content
+    stamp.  In particular, this owner never infers a relationship from a
+    filename or sibling directory: ``qp_wfn_rotations.h5`` does not yet carry
+    a source-WFN fingerprint.
+    """
+    if eqp_file and qp_rotations_file:
+        raise ValueError(
+            "The diagonal eqp override and QP rotation artifact are mutually "
+            "exclusive state descriptions: the first changes energies in "
+            "the WFN's current DFT band LABELS, while the second supplies "
+            "the matched U_mnk,E_qp for H_QP = U diag(E_qp) U^H.  Select "
+            "exactly one.")
+    if not (eqp_file or qp_rotations_file):
+        return
+
+    stamp = read_qp_wfn_stamp(wfn_path)
+    if stamp is None:
+        return
+    requested = (f"diagonal eqp override {eqp_file}"
+                 if eqp_file else
+                 f"QP rotation artifact {qp_rotations_file}")
+    where = ""
+    if stamp.get("band_stop") is not None:
+        where = (f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
+                 f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
+    version_note = ""
+    if stamp["scheme"] != QP_WFN_SCHEME:
+        version_note = (
+            f"  That stamp is not {QP_WFN_SCHEME!r}: the file was written "
+            "by a different version of the QP writer, which is still a "
+            "positive QP-state identification rather than permission to "
+            "stack another source.")
+    fix = ("Fix: drop --eqp.  To run a mean-field WFN with diagonal QP "
+           "corrections instead, select the mean-field WFN and keep --eqp."
+           if eqp_file else
+           "Fix: drop --qp-rotations and use this QP WFN by itself, or "
+           "select the mean-field WFN before applying the rotation artifact.")
+    raise ValueError(
+        f"{requested} cannot be applied to {wfn_path}: it is already a "
+        f"LORRAX QP WFN (stamp {stamp['scheme']!r}{where}).  Its "
+        "wavefunctions ARE the QP orbitals and its energies ARE the matched "
+        "QP eigenvalues.  A second eqp ladder is written against DFT band "
+        "LABELS, and a second U rotates the state twice; either operation "
+        "silently changes the represented Hamiltonian with the right "
+        f"shapes.  {fix}{version_note}")
