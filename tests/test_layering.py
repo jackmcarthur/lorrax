@@ -192,6 +192,7 @@ _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 _L2_MODULES = frozenset({
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
     "common.spectral_closure",  # where that truncation is allowed to land
+    "common.pivoted_cholesky",  # row selection + numerical certificates
     "centroid.kmeans_isdf",    # density-weighted Lloyd loop under a metric
 })
 # ``common.minimax`` was here ("minimax quadrature: a Remez problem").  It is
@@ -1030,6 +1031,36 @@ def test_no_module_imports_a_lower_numbered_layer(sources):
     assert not over, (
         f"an excused upward edge grew new sites — the exception was for the "
         f"count on the left, not for the direction: {over}")
+
+
+def test_pivoted_cholesky_selection_has_one_l2_owner(sources):
+    """The centroid and downfold routes share the numerical implementation."""
+    selector_names = {
+        "pivoted_cholesky_select",
+        "make_sharded_pivoted_cholesky_select",
+    }
+    owners = {name: [] for name in selector_names}
+    for mod, source in sources.items():
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in owners:
+                    owners[node.name].append(mod)
+    assert owners == {
+        "pivoted_cholesky_select": ["common.pivoted_cholesky"],
+        "make_sharded_pivoted_cholesky_select": ["common.pivoted_cholesky"],
+    }
+
+    for caller in ("centroid.pivoted_cholesky", "gw.downfold"):
+        imports = {
+            alias.name
+            for node in ast.walk(ast.parse(sources[caller]))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "common.pivoted_cholesky"
+            for alias in node.names
+        }
+        assert "make_sharded_pivoted_cholesky_select" in imports, (
+            f"{caller} bypasses the common pivoted-Cholesky owner"
+        )
 
 
 def test_the_upward_exceptions_are_all_still_needed(sources):

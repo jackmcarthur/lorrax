@@ -856,9 +856,8 @@ def select_cur_centroids(
     moves it, the same way a band-window resolver moves the counts.
     """
     from centroid import distribution as dist
-    from centroid.pivoted_cholesky import (
-        make_sharded_pivoted_cholesky_select, refuse_unless_select_certified,
-    )
+    from centroid.pivoted_cholesky import refuse_unless_select_certified
+    from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
     from common.collectives import gather_to_host
 
     if not (0.0 < float(rcond) < 1.0):

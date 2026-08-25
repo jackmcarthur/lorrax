@@ -77,6 +77,7 @@ src/
 │   ├── wfn_transforms.py      WFN.h5 reads, per-k FFT, kchunk helpers (was load_wfns.py)
 │   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
 │   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
+│   ├── pivoted_cholesky.py    row-sharded greedy selection + certificates
 │   ├── fft_helpers.py         flat-k ↔ 3D k FFT helpers via custom_partitioning
 │   ├── gvec_fft_box.py        sphere ↔ FFT-box gather (G-space layouts)
 │   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
@@ -124,7 +125,7 @@ src/
 │   ├── kmeans_cli.py          CLI entrypoint: `python -m centroid.kmeans_cli`
 │   ├── kmeans_isdf.py         k-means algorithm (k-means++ init, charge-weighted)
 │   ├── charge_density.py      ρ(r) build for centroid weights (get_charge_density)
-│   └── pivoted_cholesky.py    Cholesky-pruned candidate list
+│   └── pivoted_cholesky.py    candidate Gram build, prune policy + reporting
 │
 ├── psp/                  # Pseudopotentials + DFT operators
 │   ├── pseudos.py, upf/, radial/

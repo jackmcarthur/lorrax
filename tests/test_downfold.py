@@ -843,7 +843,7 @@ def test_the_two_tolerances_are_different_knobs():
     tol = 1e-6
     eig_rank = downfold.rank_criterion.select_rank(
         np.linalg.eigvalsh(G), tol)
-    from centroid.pivoted_cholesky import pivoted_cholesky_select
+    from common.pivoted_cholesky import pivoted_cholesky_select
     _piv, _L, pc_rank, *_ = pivoted_cholesky_select(
         jnp.asarray(G), n, tol_rel=tol)
     assert int(pc_rank) > int(eig_rank), (
