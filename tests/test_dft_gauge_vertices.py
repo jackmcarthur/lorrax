@@ -443,7 +443,11 @@ def test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity():
     contact_direct = np.einsum(
         "msg,abnsg->abmn", np.conj(np.asarray(psi_4)), contact_action,
         optimize=True)
-    np.testing.assert_array_equal(contact, contact_direct)
+    # The production sweep and the direct oracle associate the same complex
+    # contraction in different orders.  Require roundoff-level parity rather
+    # than bit identity across those two contraction trees.
+    np.testing.assert_allclose(
+        contact, contact_direct, rtol=5e-15, atol=2e-19)
 
     @jax.jit
     def vnl_gamma_at(k_crys):
