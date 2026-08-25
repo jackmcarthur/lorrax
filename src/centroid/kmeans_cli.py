@@ -436,8 +436,10 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
 def main():
     args = build_parser().parse_args()
+    production_warnings = []
     production_stdout = ProductionStdout(
-        debug=debug_print_enabled(), rank=RUNTIME.process_index)
+        debug=debug_print_enabled(), rank=RUNTIME.process_index,
+        warning_fn=production_warnings.append)
     production_stdout.install()
 
     try:
@@ -723,7 +725,7 @@ def main():
             report_file=report_file,
             wfn_backend=str(getattr(wfn, "backend", "unknown")),
             elapsed_s=time.perf_counter() - selection_start,
-            runtime=RUNTIME)
+            runtime=RUNTIME, warnings=production_warnings)
         with open(report_file, "w", encoding="utf-8") as stream:
             stream.write(report_text)
         if debug_print_enabled():

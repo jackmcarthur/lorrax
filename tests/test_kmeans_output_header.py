@@ -67,11 +67,14 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
         source_wfn=str(tmp_path / "WFN.h5"),
         centroid_file=str(tmp_path / "centroids_frac_20.txt"),
         report_file=str(tmp_path / "kmeans.out"),
-        wfn_backend="phdf5", elapsed_s=12.5, runtime=runtime)
+        wfn_backend="phdf5", elapsed_s=12.5, runtime=runtime,
+        warnings=("RuntimeWarning: density symmetry residual is large",))
 
     assert "MPI ranks      : 4" in text
     assert "Wavefunctions  : phdf5 reader" in text
     assert "JAX/JAXLIB     : 0.9.1 / 0.9.1" in text
     assert "density fit: bands 1-40" in text
     assert "Selection wall : 12.500 s" in text
+    assert "WARNINGS" in text
+    assert "density symmetry residual is large" in text
     assert "per-rank" not in text and "HDF5" not in text and "h5py" not in text

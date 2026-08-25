@@ -52,7 +52,8 @@ def format_centroid_header(*, density_fit: str, source_wfn: str,
 
 def format_kmeans_report(*, header: str, source_wfn: str,
                          centroid_file: str, report_file: str,
-                         wfn_backend: str, elapsed_s: float, runtime) -> str:
+                         wfn_backend: str, elapsed_s: float, runtime,
+                         warnings=()) -> str:
     """Compact scientific output for one completed centroid selection."""
     facts = runtime.facts
     mesh = tuple(int(v) for v in facts.get("mesh_shape", (1, 1)))
@@ -88,8 +89,12 @@ def format_kmeans_report(*, header: str, source_wfn: str,
         f"Report         : {os.path.abspath(report_file)}",
         "",
         f"Selection wall : {float(elapsed_s):.3f} s",
-        "LORRAX ISDF centroid selection completed.",
     ]
+    retained = [" ".join(str(item).split()) for item in warnings if str(item).strip()]
+    if retained:
+        lines.extend(["", "WARNINGS", "--------"])
+        lines.extend(f"  {item}" for item in retained)
+    lines.append("LORRAX ISDF centroid selection completed.")
     return "\n".join(lines) + "\n"
 
 
