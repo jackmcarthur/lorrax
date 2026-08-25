@@ -2817,7 +2817,12 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     psi_source = build_psi_G_store(
         wfn=wfn, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges, band_pad_to=band_carrier,
-        bispinor=bool(params.get("bispinor", False)))
+        # ``initialize_wfns`` deliberately fitted ``basis`` and ``meta`` from
+        # the canonical Pauli spinors even when the QP energies came from a
+        # bispinor GW arm.  Its continuation must read the same spinor rows;
+        # lifting this second source would change both the spin dimension and
+        # the fitted gauge underneath ``selection_factor``.
+        bispinor=False)
     r_chunk_ranges = tuple(
         (r0, min(r0 + int(r_chunk), n_rtot))
         for r0 in range(0, n_rtot, int(r_chunk)))
