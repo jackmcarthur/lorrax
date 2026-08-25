@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.bispinor_init import ALPHA_FS
+from common.bispinor_init import ALPHA_FS, NO_PAIR_DIRAC_CURRENT_MODEL
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 
 
@@ -194,7 +194,8 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     rho_np = (rho_flat / float(nk_full)).reshape(fft_grid)
     if verbose:
         dt = time.perf_counter() - t0
-        print(f"  ρ_current (direct Dirac, WFN-IBZ + exact star pullback, "
+        print(f"  ρ_current ({NO_PAIR_DIRAC_CURRENT_MODEL}, "
+              "WFN-IBZ + exact star pullback, "
               f"chunk={chunk}) built "
               f"in {dt:.2f}s; max={float(rho_np.max()):.3e}, "
               f"mean={float(rho_np.mean()):.3e}", flush=True)
