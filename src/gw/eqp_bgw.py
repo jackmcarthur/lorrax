@@ -1383,6 +1383,13 @@ def make_eqp_bgw(
 				f"{kirr_to_kfull.tolist()}; refusing a shape-compatible k-row "
 				"permutation.  The raw cube's requested rows were independently "
 				"validated against its star table above.")
+		if _receipt["correlation_basis"] != "dft_band":
+			raise ValueError(
+				f"{os.path.basename(sigma_mnk_path)}'s EQP receipt carries "
+				f"C(E_DFT) in {_receipt['correlation_basis']!r}, while post-hoc "
+				"make_eqp_bgw assembles DFT-basis H/X/E_DFT.  A canonical QP-to-DFT "
+				"conversion does not yet exist at this seam; refusing the known SC "
+				"mixed-basis sum instead of treating a provenance stamp as parity.")
 		if _receipt["hartree_source"] != _src:
 			raise ValueError(
 				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "
