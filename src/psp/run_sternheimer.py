@@ -1353,8 +1353,8 @@ def run_sternheimer(
     # ══════════════════════════════════════════════════════════════════
     #  q-loop:  Python over q, vmap+jit over k
     # ══════════════════════════════════════════════════════════════════
-    from common.kq_mapping import (
-        bgw_signed_q_representative, kminq_idx_for_iq)
+    from common.kq_mapping import kminq_idx_for_iq
+    from symmetry_maps import bgw_signed_q_representative
     for q_idx, iq_red in enumerate(iq_list):
         qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
         if verbose:

@@ -262,10 +262,10 @@ def compute_finite_q_mtxels(
       m ∈ [n_occ, n_occ + nc_block)  (conduction)
       n ∈ [n_occ - nv_block, n_occ)  (valence)
     """
-    from common.kq_mapping import (
-        bgw_signed_q_representative, kminq_idx_for_iq, umklapp_G_wrap)
+    from common.kq_mapping import kminq_idx_for_iq, umklapp_G_wrap
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     import psp.vnl_ops as vnl_ops
+    from symmetry_maps import bgw_signed_q_representative
 
     nk_full = int(sym.nk_tot)
     bvec_blat_np = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)

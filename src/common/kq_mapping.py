@@ -18,11 +18,6 @@ API
     Per-source-k index of ``k − q`` in the full-BZ k-list.  Wraps
     ``SymMaps.kq_map[:, iq_red]``.
 
-``bgw_signed_q_representative(qvec) -> (..., 3) float64``
-    Put stored fractional q rows into BGW's signed representative, retaining
-    the positive half-grid tie.  This is the fractional-row counterpart of
-    ``symmetry_maps.bgw_integer_q_to_fractional``.
-
 ``umklapp_G_wrap(kvec_full, kvec_kmq_full, qvec) -> (nk_full, 3) int32``
     Integer G-shift  ``G_wrap = round((k − q) − k_kmq)``  per source k.
     Both ``kvec_full`` and ``qvec`` are in crystal coords; ``qvec`` is the
@@ -43,40 +38,6 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-
-def bgw_signed_q_representative(qvec) -> np.ndarray:
-    r"""Return BGW's signed fractional-q representative.
-
-    Input rows are stored fractional coordinates in one reciprocal cell,
-    accepted in ``[-1/2,1)``.  BGW wraps only components *strictly greater*
-    than one half, so an even-grid
-    boundary stays at ``+1/2`` rather than ``-1/2``.  Keeping that tie
-    explicit is required for the q label, k-q map and G-wrap to name one
-    reciprocal representative.
-
-    This is the same convention as the symmetry service's
-    ``bgw_integer_q_to_fractional``; it lives here as the narrow public door
-    for callers that already own fractional WFN rows and therefore must not
-    reconstruct integer q-grid labels.
-    """
-    q = np.asarray(qvec, dtype=np.float64)
-    if q.ndim < 1 or q.shape[-1] != 3:
-        raise ValueError(
-            "bgw_signed_q_representative: qvec must have trailing shape "
-            f"(...,3); got {q.shape}")
-    if not np.all(np.isfinite(q)):
-        raise ValueError(
-            "bgw_signed_q_representative: qvec must be finite")
-    tol = 32.0 * np.finfo(np.float64).eps
-    if np.any(q < -0.5 - tol) or np.any(q >= 1.0 + tol):
-        raise ValueError(
-            "bgw_signed_q_representative: stored fractional q rows must "
-            f"lie in [-1/2,1); got range [{float(np.min(q))},"
-            f"{float(np.max(q))}]")
-    canonical = np.mod(q, 1.0)
-    return np.ascontiguousarray(np.where(
-        canonical > 0.5, canonical - 1.0, canonical))
 
 
 def kminq_idx_for_iq(sym, iq_red: int) -> np.ndarray:
@@ -154,7 +115,6 @@ def gather_kminq_box(psi_full: jax.Array, kminq_idx: jax.Array) -> jax.Array:
 
 
 __all__ = [
-    "bgw_signed_q_representative",
     "kminq_idx_for_iq",
     "umklapp_G_wrap",
     "umklapp_phase_box_batched",
