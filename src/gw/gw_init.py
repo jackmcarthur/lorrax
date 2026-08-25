@@ -25,7 +25,7 @@ from common import jax_profile
 # being attribute-reachable off a bare ``import jax`` (an import-order
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
-from file_io.isdf_header import centroid_table_md5 as _centroid_table_md5
+from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
 
 
@@ -2650,17 +2650,19 @@ def prepare_isdf_and_wavefunctions(
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
-	from file_io.isdf_header import WavefunctionBasisReceipt
+	from file_io.wfn_basis import WavefunctionBasisReceipt
 	# The receipt's band interval is PHYSICAL, not the mesh-padded carrier
 	# edge.  ``b_id_4_user`` is the exact loaded WFN boundary; ``b4`` may be
 	# rounded past WFN.nbands and names allocation only.
 	_basis_band_interval = (
 		int(band_slices.b0), int(meta.b_id_4_user))
 	charge_basis_receipt = None
+	transverse_basis_receipt = None
 
 	if not cfg.restart:
 		charge_basis_receipt = WavefunctionBasisReceipt.from_source(
-			wfn=wfn, role='charge', band_interval=_basis_band_interval,
+			wfn=wfn, role='charge', bispinor=bool(cfg.bispinor),
+			band_interval=_basis_band_interval,
 			fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
 			n_rmu_logical=int(meta.n_rmu),
 			n_rmu_padded=int(meta.n_rmu_padded))
@@ -2757,7 +2759,7 @@ def prepare_isdf_and_wavefunctions(
 				_meta_receipt_T = transverse_wfn_data['meta']
 				transverse_basis_receipt = (
 					WavefunctionBasisReceipt.from_source(
-						wfn=wfn, role='transverse',
+						wfn=wfn, role='transverse', bispinor=True,
 						band_interval=_basis_band_interval,
 						fft_grid=_meta_receipt_T.fft_grid,
 						centroid_fft_idx=(
@@ -3184,7 +3186,7 @@ def prepare_isdf_and_wavefunctions(
 					f"construction will refuse. ***")
 			else:
 				charge_basis_receipt = WavefunctionBasisReceipt.from_source(
-					wfn=wfn, role='charge',
+					wfn=wfn, role='charge', bispinor=bool(cfg.bispinor),
 					band_interval=_basis_band_interval,
 					fft_grid=meta.fft_grid,
 					centroid_fft_idx=centroid_indices,
@@ -3320,7 +3322,7 @@ def prepare_isdf_and_wavefunctions(
 						int(rs.psi_rmu_Y_transverse.shape[-1]))
 					transverse_basis_receipt = (
 						WavefunctionBasisReceipt.from_source(
-							wfn=wfn, role='transverse',
+							wfn=wfn, role='transverse', bispinor=True,
 							band_interval=_basis_band_interval,
 							fft_grid=meta.fft_grid,
 							centroid_fft_idx=_cent_T_idx_now,
@@ -3353,9 +3355,22 @@ def prepare_isdf_and_wavefunctions(
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
 
+	from .wavefunction_bundle import AuthenticatedWavefunctions
+	charge_basis_binding = (
+		None if charge_basis_receipt is None else
+		AuthenticatedWavefunctions(wfns, charge_basis_receipt))
+	transverse_basis_binding = (
+		None if transverse_basis_receipt is None else
+		AuthenticatedWavefunctions(
+			wfns_transverse, transverse_basis_receipt))
 	return SimpleNamespace(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		# Host-only provenance stays in these orchestration bindings rather
+		# than entering Wavefunctions' JAX pytree.  QP rotation returns only a
+		# numerical carrier, so it cannot accidentally inherit a DFT binding.
+		wf_binding_charge=charge_basis_binding,
+		wf_binding_transverse=transverse_basis_binding,
 		head_channel=head_channel,
 	)

@@ -69,7 +69,7 @@ from file_io import (
     write_head_scalars_to_h5,
     write_restart_state_to_h5,
 )
-from file_io.isdf_header import centroid_table_md5 as _centroid_table_md5
+from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 from gw.downfold import (
     BandWindow,
     R19_ANCHOR,
@@ -1579,7 +1579,7 @@ def _frac_to_fft_idx(rows, fft_grid):
     so this module can reproduce the index table a consumer will derive from a
     coordinate file — including its wrap of an index that rounds up ONTO the
     grid extent.  The resulting table is stamped by the canonical
-    :func:`file_io.isdf_header.centroid_table_md5` owner.
+    :func:`file_io.wfn_basis.centroid_table_md5` owner.
     """
     fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
     idx = np.rint(np.asarray(rows, dtype=np.float64)[:, :3]
@@ -1758,7 +1758,7 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
     THE STAMP IS THE FFT-INDEX HASH, NOT THE TEXT FILE'S.  This function used
     to write ``md5(bytes of the .txt)``, which is a perfectly good hash of a
     different object: ``centroids_charge_md5`` is defined by
-    ``file_io.isdf_header.centroid_table_md5`` as md5 over the int64
+    ``file_io.wfn_basis.centroid_table_md5`` as md5 over the int64
     FFT-GRID INDICES,
     and ``gw_init`` compares against it in exactly that algebra.  A bundle
     stamped the other way can never match, so the stamp was not merely

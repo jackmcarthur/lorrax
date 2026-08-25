@@ -16,9 +16,10 @@ from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
 from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common.wfn_transforms import gflat_to_rmu
-from file_io.isdf_header import WavefunctionBasisReceipt
+from file_io.wfn_basis import WavefunctionBasisReceipt
 from gw import w_isdf
-from gw.wavefunction_bundle import BandSlices, Wavefunctions
+from gw.wavefunction_bundle import (
+    AuthenticatedWavefunctions, BandSlices, Wavefunctions)
 from psp import vnl_ops
 from psp import dft_operators, radial_tables
 from psp.species import SpeciesData
@@ -98,7 +99,7 @@ def _setup(
 def _basis_receipt(wfn, geom, r_mu, band_start, band_stop):
     from runtime.padding import padded_mu_extent
     return WavefunctionBasisReceipt.from_source(
-        wfn=wfn, role='transverse',
+        wfn=wfn, role='transverse', bispinor=True,
         band_interval=(band_start, band_stop),
         fft_grid=geom.fft_grid, centroid_fft_idx=r_mu,
         n_rmu_logical=len(r_mu),
@@ -955,8 +956,7 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         enk=jnp.asarray([[0.1, 0.6]]),
         occ=jnp.asarray([[1.0, 0.0]]), slices=slices,
         psi_nmu=raw_rmu,
-        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face',
-        basis_receipt=endpoint.basis_receipt)
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
     quad = SimpleNamespace(
         tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
     meta = SimpleNamespace(nkx=1, nky=1, nkz=1, nk_tot=1)
@@ -967,15 +967,17 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
     endpoint_minus_q = endpoint._replace(
         current_nmu=endpoint.current_nmu + 0.0)
     assert endpoint_minus_q is not endpoint
-    mismatched_target = replace(
-        wfns, basis_receipt=_basis_receipt(
-            wfn, geom, r_mu[::-1], 0, 2))
+    mismatched_receipt = _basis_receipt(wfn, geom, r_mu[::-1], 0, 2)
     with pytest.raises(ValueError, match="before Green contraction"):
         w_isdf._compute_finite_transfer_current_block_row_unverified(
-            endpoint, endpoint_minus_q, mismatched_target, quad, meta, mesh,
+            endpoint, endpoint_minus_q,
+            AuthenticatedWavefunctions(wfns, mismatched_receipt),
+            quad, meta, mesh,
             vertex_left=1, vertex_right=2)
     chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint, endpoint_minus_q, wfns, quad, meta, mesh,
+        endpoint, endpoint_minus_q,
+        AuthenticatedWavefunctions(wfns, endpoint.basis_receipt),
+        quad, meta, mesh,
         vertex_left=1, vertex_right=2)
     raw_c = np.asarray(raw_rmu[0, 1])
     current_v_A = np.asarray(endpoint.current_nmu[0, 0, 0])
@@ -1105,16 +1107,18 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         enk=jnp.asarray(np.tile([0.1, 0.6], (4, 1))),
         occ=jnp.asarray(np.tile([1.0, 0.0], (4, 1))), slices=slices,
         psi_nmu=raw_rmu,
-        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face',
-        basis_receipt=endpoint_q1.basis_receipt)
+        psi_mun=raw_rmu.transpose(0, 2, 3, 1), layout='face')
     meta = SimpleNamespace(nkx=4, nky=1, nkz=1, nk_tot=4)
     with pytest.raises(ValueError, match="not q/-q"):
         w_isdf._compute_finite_transfer_current_block_row_unverified(
-            endpoint_q1, endpoint_q0, wfns,
+            endpoint_q1, endpoint_q0,
+            AuthenticatedWavefunctions(wfns, endpoint_q1.basis_receipt),
             SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
-            meta, mesh, vertex_left=1, vertex_right=2)
+            meta, mesh,
+            vertex_left=1, vertex_right=2)
     chi_12 = w_isdf._compute_finite_transfer_current_block_row_unverified(
-        endpoint_q1, endpoint_q3, wfns,
+        endpoint_q1, endpoint_q3,
+        AuthenticatedWavefunctions(wfns, endpoint_q1.basis_receipt),
         SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0])),
         meta, mesh,
         vertex_left=1, vertex_right=2)

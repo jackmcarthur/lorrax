@@ -1754,7 +1754,7 @@ def compute_finite_transfer_current_block_row(
 
 
 def _compute_finite_transfer_current_block_row_unverified(
-    endpoint, endpoint_minus_q, wfns_transverse, quad, meta, mesh_xy, *,
+    endpoint, endpoint_minus_q, target_basis_binding, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
     r"""Private fixed-q TT algebra oracle at one stored q row.
@@ -1764,10 +1764,11 @@ def _compute_finite_transfer_current_block_row_unverified(
     same transverse centroid set and band window, at transfers ``q`` and
     ``-q`` respectively.  The pair is authenticated with the symmetry
     service's q-negation involution and the existing operator receipts.  Both
-    endpoints and the target wavefunction faces must also carry the exact same
-    immutable WFN/band/FFT/centroid receipt; equality is checked before any
-    Green contraction.  The routine reuses the incumbent distributed face
-    Green builder and minimax
+    endpoints and the target wavefunction faces must also have the exact same
+    immutable WFN/band/FFT/centroid receipt; the target receipt is retained by
+    the ISDF orchestration result, outside the numerical Wavefunctions pytree,
+    and equality is checked before any Green contraction.  The routine reuses
+    the incumbent distributed face Green builder and minimax
     normalization; it neither constructs a second Green-function mechanism
     nor materializes a band-pair carrier.  One block is returned so the
     existing photon packer can retain its one-live-block memory schedule.
@@ -1781,6 +1782,14 @@ def _compute_finite_transfer_current_block_row_unverified(
     matching q-resolved C/Z contraction, exact contact/downfolded completion,
     and vector-symmetry reciprocity gate.
     """
+    from .wavefunction_bundle import AuthenticatedWavefunctions
+    if not isinstance(target_basis_binding, AuthenticatedWavefunctions):
+        raise TypeError(
+            "finite-transfer current requires the host-only "
+            "AuthenticatedWavefunctions binding; got "
+            f"{type(target_basis_binding).__name__}")
+    wfns_transverse = target_basis_binding.wavefunctions
+    target_basis_receipt = target_basis_binding.receipt
     A, B = int(vertex_left), int(vertex_right)
     if A not in (1, 2, 3) or B not in (1, 2, 3):
         raise ValueError(
@@ -1790,13 +1799,9 @@ def _compute_finite_transfer_current_block_row_unverified(
         raise ValueError(
             "finite-transfer current row requires the canonical face "
             "wavefunction bundle (low_mem_bands=true)")
-    target_basis_receipt = getattr(
-        wfns_transverse, "basis_receipt", None)
-    if target_basis_receipt is None:
-        raise ValueError(
-            "finite-transfer current target Wavefunctions carries no "
-            "WavefunctionBasisReceipt; matching face shapes are not basis "
-            "authentication")
+    target_basis_receipt.assert_matches_carrier(
+        wfns_transverse,
+        where="finite-transfer target Wavefunctions before Green contraction")
     for endpoint_label, current_endpoint in (
             ("q", endpoint), ("-q", endpoint_minus_q)):
         endpoint_receipt = getattr(current_endpoint, "basis_receipt", None)
