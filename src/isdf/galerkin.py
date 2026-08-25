@@ -29,7 +29,10 @@ from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
 from common.shard_map import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
-from common.wfn_transforms import load_centroids_band_chunked
+from common.wfn_transforms import (
+    gflat_to_rchunk_aot_peak_bytes,
+    load_centroids_band_chunked,
+)
 from distrib_la import plan as linalg_plan
 from runtime.padding import round_up, spec_divisor
 
@@ -169,16 +172,15 @@ def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
 
 def _whole_state_memory_ledger(
         *, meta, mesh_xy: Mesh, nk: int, nspinor: int,
-        band_carrier: int, state_count: int, search_rank: int,
+        ngkmax: int, band_carrier: int, state_count: int, search_rank: int,
         candidate_carrier: int, q_tile_budget: int) -> dict[str, float]:
     """Zeta-style stage-maximum ledger for the whole-state fit.
 
-    The spatial source term is the compiled production inverse FFT including
-    cuFFT plan workspace.  Other terms are explicit live arrays.  Stages are
+    The spatial source term is the compiled canonical G-flat -> r-chunk WFN
+    program, including its gather/slice/Bloch buffers and cuFFT plan
+    workspace.  Other terms are explicit live arrays.  Stages are
     alternatives; the returned ``HWM`` is their maximum, never their sum.
     """
-    from common.fft_helpers import query_fft_peak_bytes
-
     p = int(mesh_xy.size)
     rank_carrier = round_up(
         int(search_rank),
@@ -190,14 +192,10 @@ def _whole_state_memory_ledger(
         n_rtot=int(meta.n_rtot), r_mesh_divisor=r_divisor,
         q_tile_budget=int(q_tile_budget))
     r_carrier = int(stream.max_r_carrier)
-    fft_peak = float(query_fft_peak_bytes(
-        input_shape=(int(nk), int(band_carrier), int(nspinor),
-                     *(int(v) for v in meta.fft_grid)),
-        fft_axes=(-3, -2, -1),
-        sharding=NamedSharding(
-            mesh_xy,
-            P(None, ('x', 'y'), None, None, None, None)),
-        kind="ifftn", norm="ortho", dtype=jnp.complex128))
+    wfn_rchunk_peak = float(gflat_to_rchunk_aot_peak_bytes(
+        mesh=mesh_xy, nk=nk, band_carrier=band_carrier,
+        nspinor=nspinor, ngkmax=ngkmax, fft_grid=meta.fft_grid,
+        r_carrier=r_carrier, norm="ortho", dtype=jnp.complex128))
 
     c16 = float(np.dtype(np.complex128).itemsize)
     f8 = float(np.dtype(np.float64).itemsize)
@@ -215,23 +213,28 @@ def _whole_state_memory_ledger(
     selected_fold = float(rank_carrier * rank_carrier * c16)
     factor = float(rank_carrier * rank_carrier * c16)
     coefficients = float(state_count * rank_carrier * c16)
+    sketch_partial = float(search_rank * candidate_carrier * c16)
+    project_partial = float(nk * band_carrier * rank_carrier * c16)
 
     stages = {
         "sketch_stream": (
-            g_index + sketch + random_rows
-            + max(fft_peak, psi_r + search_rank * band_carrier * c16)),
+            sketch + random_rows
+            + max(wfn_rchunk_peak,
+                  g_index + psi_r + sketch_partial)),
         "sketch_select": (
             g_index + sketch + candidate_face + candidate_pc),
         "selected_gram_stream": (
-            g_index + selected_face + selected_rows
-            + max(fft_peak, psi_r)),
+            selected_face + selected_rows
+            + max(wfn_rchunk_peak, g_index + psi_r)),
         "selected_gram_fold": (
             g_index + selected_face + selected_rows + selected_fold),
         "physical_projection": (
-            g_index + factor + coefficients + 2.0 * selected_rows
-            + max(fft_peak, psi_r)),
+            factor + coefficients
+            + max(2.0 * selected_rows,
+                  selected_rows + wfn_rchunk_peak,
+                  selected_rows + g_index + psi_r + project_partial)),
     }
-    stages["FFT_STANDALONE"] = fft_peak
+    stages["WFN_RCHUNK_TRANSFORM"] = wfn_rchunk_peak
     stages["r_chunk_carrier"] = float(r_carrier)
     stages["Q_TILE_LOCAL"] = selected_rows
     stages["HWM"] = max(
@@ -242,7 +245,7 @@ def _whole_state_memory_ledger(
 
 def _resolve_whole_state_stream_budget(
         *, meta, mesh_xy: Mesh, nk: int, nspinor: int,
-        band_carrier: int, state_count: int, search_rank: int,
+        ngkmax: int, band_carrier: int, state_count: int, search_rank: int,
         candidate_carrier: int, requested_q_tile_budget: int,
         device_pool_limit: float | None, log_fn):
     """Choose the largest measured-workspace-safe real-space carrier."""
@@ -254,6 +257,23 @@ def _resolve_whole_state_stream_budget(
             int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
         * int(nspinor) * np.dtype(np.complex128).itemsize)
     max_local_r = max(1, requested_q_tile_budget // bytes_per_local_r)
+    minimum = _whole_state_memory_ledger(
+        meta=meta, mesh_xy=mesh_xy, nk=nk,
+        nspinor=nspinor, ngkmax=ngkmax,
+        band_carrier=band_carrier,
+        state_count=state_count, search_rank=search_rank,
+        candidate_carrier=candidate_carrier,
+        q_tile_budget=bytes_per_local_r)
+    if (device_pool_limit is not None and device_pool_limit > 0
+            and minimum["HWM"] > float(device_pool_limit)):
+        raise MemoryError(
+            "fit_galerkin_basis: the measured whole-state live set does "
+            "not fit even at one local real-space column: projected HWM "
+            f"{minimum['HWM']/2**30:.2f} GiB/device against pool "
+            f"{float(device_pool_limit)/2**30:.2f} GiB/device. The "
+            "compiled canonical G-flat -> full-Bloch r-chunk transform "
+            "(gather, ifftn(norm='ortho'), slice and phase) is priced at "
+            f"{minimum['WFN_RCHUNK_TRANSFORM']/2**30:.2f} GiB/device.")
     tried = set()
     local_r = max_local_r
     chosen = None
@@ -263,7 +283,8 @@ def _resolve_whole_state_stream_budget(
             tried.add(budget)
             ledger = _whole_state_memory_ledger(
                 meta=meta, mesh_xy=mesh_xy, nk=nk,
-                nspinor=nspinor, band_carrier=band_carrier,
+                nspinor=nspinor, ngkmax=ngkmax,
+                band_carrier=band_carrier,
                 state_count=state_count, search_rank=search_rank,
                 candidate_carrier=candidate_carrier,
                 q_tile_budget=budget)
@@ -273,19 +294,9 @@ def _resolve_whole_state_stream_budget(
                 break
         local_r //= 2
     if chosen is None:
-        minimum = _whole_state_memory_ledger(
-            meta=meta, mesh_xy=mesh_xy, nk=nk,
-            nspinor=nspinor, band_carrier=band_carrier,
-            state_count=state_count, search_rank=search_rank,
-            candidate_carrier=candidate_carrier,
-            q_tile_budget=bytes_per_local_r)
-        raise MemoryError(
-            "fit_galerkin_basis: the measured whole-state live set does "
-            "not fit even at one local real-space column: projected HWM "
-            f"{minimum['HWM']/2**30:.2f} GiB/device against pool "
-            f"{float(device_pool_limit or 0)/2**30:.2f} GiB/device. The "
-            "compiled production ifftn(norm='ortho') is priced at "
-            f"{minimum['FFT_STANDALONE']/2**30:.2f} GiB/device.")
+        raise RuntimeError(
+            "whole-state capacity search exhausted despite its certified "
+            "one-column lower bound; this is a planner invariant failure")
     budget, ledger = chosen
     log_fn(
         "  Whole-state memory plan (stage maxima, per device): "
@@ -407,7 +418,8 @@ def fit_galerkin_basis(
             q_tile_budget, _memory_ledger = \
                 _resolve_whole_state_stream_budget(
                     meta=meta, mesh_xy=mesh_xy, nk=nk,
-                    nspinor=nspinor, band_carrier=bc_carrier,
+                    nspinor=nspinor, ngkmax=int(wfn.ngkmax),
+                    band_carrier=bc_carrier,
                     state_count=m_states, search_rank=max_search,
                     candidate_carrier=candidate_carrier,
                     requested_q_tile_budget=int(q_tile_budget),
