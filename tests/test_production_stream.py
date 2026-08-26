@@ -1,8 +1,9 @@
 """The production driver owns stdout even when a component calls print."""
 
 import warnings
+import sys
 
-from runtime.production_stream import ProductionStdout
+from runtime.production_stream import ProductionStdout, emergency_stdout
 
 
 def test_production_discards_incidental_stdout_but_emits_report(capsys):
@@ -70,3 +71,14 @@ def test_production_hides_jax_donation_hint(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert retained == []
+
+
+def test_failfast_stdout_bypasses_the_production_sink(capsys):
+    stream = ProductionStdout(debug=False, rank=0)
+    stream.install()
+    assert emergency_stdout() is not sys.stdout
+    emergency_stdout().write("fatal refusal survives\n")
+    emergency_stdout().flush()
+    stream.close()
+
+    assert capsys.readouterr().out == "fatal refusal survives\n"

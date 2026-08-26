@@ -1876,8 +1876,11 @@ def main(argv=None):
         f"({int(n_guard)} conduction guard bands)",
         f"Transition size: {int(nc_pad * nv_pad * nk)} padded; "
         f"{int(n_cond * n_val * nk)} physical",
-        f"Centroid basis : {int(n_rmu)} logical; {int(n_rmu_pad)} mesh-padded; "
-        f"table {abs_path(centroids_path)}",
+        f"Centroid basis : {int(n_rmu)} interaction centroids",
+        "Centroid table : " + (
+            f"parent htransform sites {abs_path(centroids_path)}; "
+            "the downfold selection is stored in the restart"
+            if keep_idx is not None else abs_path(centroids_path)),
     ))
     k_frac = np.stack(np.meshgrid(np.arange(nkx) / nkx, np.arange(nky) / nky,
                                   np.arange(nkz) / nkz, indexing="ij"),
@@ -2068,7 +2071,7 @@ def main(argv=None):
         f"{nkx} x {nky} x {nkz}" if args.w_coarse_grid else
         f"native {nkx} x {nky} x {nkz} grid"))
     report.emit(f"Window policy  : degeneracy={args.band_degeneracy}; "
-                f"tolerance={float(args.degeneracy_tol_ry):.5e} Ry")
+                f"tolerance={float(args.degeneracy_tol_ry) * RY2EV * 1.0e3:.5f} meV")
 
     # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
     rst = None
@@ -2352,7 +2355,7 @@ def main(argv=None):
             [M_rows, np.zeros((n_cert + len(refit_idx), 3, 3))], axis=0)
         for iQ, hv, trM in head_scalars[:4]:
             log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
-                f"tr M_ab = {trM:.6e} Ry/bohr^2")
+                f"tr M_ab = {trM * RY2EV:.6e} eV/bohr^2")
         if len(head_scalars) > 4:
             log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
     tick("vq_eval", t0)

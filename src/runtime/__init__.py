@@ -395,7 +395,8 @@ def install_failfast_excepthook() -> None:
             f"the job's exit code.  Peer ranks are blocked in a "
             f"collective this rank will never join; srun will now kill "
             f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
-        for stream in (sys.stdout, sys.stderr):
+        from .production_stream import emergency_stdout
+        for stream in (emergency_stdout(), sys.stderr):
             try:
                 stream.write(text)
                 stream.flush()

@@ -27,6 +27,7 @@ from common.preprocessing_output import (ScientificProductionReport,
                                          timing_total)
 from common.progress import LoopProgress
 from common.scientific_output import policy
+from common.units import RYD_TO_EV
 from runtime.production_stream import ProductionStdout
 
 from .bse_ring_comm import (
@@ -102,7 +103,7 @@ def _main_random_demo() -> None:
     )
     print(f"Input shape: {X.shape}, Output shape: {HX.shape}")
     E_expect = jnp.vdot(X.flatten(), HX.flatten()).real
-    ryd2ev = 13.6056980659
+    ryd2ev = RYD_TO_EV
     print(f"Expectation value: {E_expect:.6f} Ry = {E_expect * ryd2ev:.4f} eV")
 
     print("\nRunning Lanczos solver...")
@@ -354,9 +355,9 @@ def _preview_lanczos(
             f"Requested roots: {int(n_eig)}",
         ))
         report.heading("Exciton spectrum")
-        report.emit("  state       energy (Ry)      energy (eV)")
+        report.emit("  state       energy (eV)")
         for index, value in enumerate(eigenvalues_host[:n_eig], start=1):
-            report.emit(f"  S{index:03d}  {float(value):16.5f}  "
+            report.emit(f"  S{index:03d}  "
                         f"{float(value) * ryd2ev:15.5f}")
 
     if write_eigs is not None:
@@ -791,7 +792,7 @@ def main(argv=None) -> int:
             if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
         f"Matvec route   : {('gather' if args.gather_t else args.matvec_kind)}",
         f"Band boundary  : {args.band_degeneracy}; "
-        f"tolerance={float(args.degeneracy_tol_ry):.5e} Ry",
+        f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
     ))
 
     from .bse_window import _parse_wfn_path

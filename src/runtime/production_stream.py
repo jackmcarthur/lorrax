@@ -43,6 +43,11 @@ class ProductionStdout:
         if self.debug or self._sink is not None:
             return
         self._sink = open(os.devnull, "w", encoding="utf-8")
+        # Fail-fast writes its traceback to stdout as well as stderr because
+        # srun has dropped last-moment stderr in real crashes.  Preserve the
+        # launcher's stream explicitly so that emergency output bypasses this
+        # incidental-chatter sink.
+        sys._lorrax_emergency_stdout = self._console
         sys.stdout = self._sink
         # Python warnings otherwise bypass stdout and repeat once per process.
         # A driver reporter can retain them once in its final warning block;
@@ -75,6 +80,8 @@ class ProductionStdout:
             sys.stdout = self._console
         self._sink.close()
         self._sink = None
+        if getattr(sys, "_lorrax_emergency_stdout", None) is self._console:
+            del sys._lorrax_emergency_stdout
         if (self._warning_handler is not None
                 and warnings.showwarning is self._warning_handler):
             warnings.showwarning = self._showwarning
@@ -82,4 +89,9 @@ class ProductionStdout:
         self._warning_handler = None
 
 
-__all__ = ["ProductionStdout"]
+def emergency_stdout():
+    """The launcher's stdout, bypassing an installed production sink."""
+    return getattr(sys, "_lorrax_emergency_stdout", sys.stdout)
+
+
+__all__ = ["ProductionStdout", "emergency_stdout"]
