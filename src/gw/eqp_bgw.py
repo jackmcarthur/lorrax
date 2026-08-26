@@ -1144,6 +1144,21 @@ def make_eqp_bgw(
 			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
 		)
 
+	# Decode the live-assembly receipt as soon as its band/window identity can
+	# be checked.  In particular, a self-consistent receipt carries C(E_DFT)
+	# in the QP-band basis, while this post-hoc assembler is DFT-basis.  That
+	# is a provenance refusal, so it must happen before touching the potentially
+	# enormous raw operator cubes needed only by an otherwise admissible path.
+	from file_io.sigma_output import read_eqp_assembly_receipt
+	_receipt = read_eqp_assembly_receipt(sigma_mnk_path)
+	if _receipt is not None and _receipt["correlation_basis"] != "dft_band":
+		raise ValueError(
+			f"{os.path.basename(sigma_mnk_path)}'s EQP receipt carries "
+			f"C(E_DFT) in {_receipt['correlation_basis']!r}, while post-hoc "
+			"make_eqp_bgw assembles DFT-basis H/X/E_DFT.  A canonical QP-to-DFT "
+			"conversion does not yet exist at this seam; refusing the known SC "
+			"mixed-basis sum instead of treating a provenance stamp as parity.")
+
 	# ── THE ω REFERENCE: the file's stamp first, midgap only as a legacy
 	#    fallback on a file that is demonstrably insulating (audit A2) ──
 	#
@@ -1351,8 +1366,6 @@ def make_eqp_bgw(
 	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
 	# kin_ion read above, which is the same lazy import for the same
 	# reason.
-	from file_io.sigma_output import read_eqp_assembly_receipt
-	_receipt = read_eqp_assembly_receipt(sigma_mnk_path)
 	_src = kin_ion_hartree_source(kin_ion_path)
 	vh_exact = None
 	hartree_already_resolved = False
@@ -1383,13 +1396,6 @@ def make_eqp_bgw(
 				f"{kirr_to_kfull.tolist()}; refusing a shape-compatible k-row "
 				"permutation.  The raw cube's requested rows were independently "
 				"validated against its star table above.")
-		if _receipt["correlation_basis"] != "dft_band":
-			raise ValueError(
-				f"{os.path.basename(sigma_mnk_path)}'s EQP receipt carries "
-				f"C(E_DFT) in {_receipt['correlation_basis']!r}, while post-hoc "
-				"make_eqp_bgw assembles DFT-basis H/X/E_DFT.  A canonical QP-to-DFT "
-				"conversion does not yet exist at this seam; refusing the known SC "
-				"mixed-basis sum instead of treating a provenance stamp as parity.")
 		if _receipt["hartree_source"] != _src:
 			raise ValueError(
 				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "
