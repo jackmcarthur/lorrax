@@ -45,6 +45,7 @@ __all__ = [
     "GalerkinStreamPlan",
     "QRCP_RNG_VERSION",
     "fit_galerkin_basis",
+    "galerkin_rank_record",
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
     "read_galerkin_basis",
@@ -149,6 +150,74 @@ def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
             f"{name}={multiplier:g} would retain fewer directions than bands "
             "at one k. Use the published default 20 or another value >= 1.")
     return multiplier
+
+
+def galerkin_rank_record(basis: GalerkinBasis, *, meta,
+                         rank_multiplier: float) -> dict:
+    """Reconstruct the canonical QRCP receipt from a reusable basis."""
+    nk, nb, carrier = (int(n) for n in basis.ctilde.shape)
+    physical = int(basis.rank_physical)
+    stacked_states = nk * nb
+    state_dimension = int(meta.nspinor) * int(meta.n_rtot)
+    multiplier = validate_rank_multiplier(
+        rank_multiplier, name="htransform_rank_multiplier")
+    search_rank = int(basis.qrcp_search_rank)
+    raw_rank = int(basis.qrcp_raw_rank)
+    selected = jnp.asarray(basis.selected_state_indices, dtype=jnp.int32)
+
+    @jax.jit
+    def _validation_receipt(c, factor, selected_rows):
+        gram = jnp.einsum('kna,kma->knm', c, jnp.conj(c), optimize=True)
+        eye = jnp.eye(c.shape[1], dtype=c.dtype)[None]
+        row_norm = jnp.real(jnp.diagonal(gram, axis1=1, axis2=2))
+        reference = factor[:physical, :]
+        picked = c.reshape(stacked_states, carrier)[selected_rows]
+        scale = jnp.maximum(1.0, jnp.max(jnp.abs(reference)))
+        return (
+            jnp.min(jnp.real(jnp.diag(factor))[:physical]),
+            jnp.max(jnp.abs(gram - eye)),
+            jnp.max(jnp.abs(row_norm - 1.0)),
+            jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(row_norm))),
+            jnp.max(jnp.abs(picked - reference)),
+            scale,
+        )
+
+    (min_chol_diag, c_ortho, max_missing_norm2, fro_resid,
+     selected_err, selected_scale) = _validation_receipt(
+         basis.ctilde, basis.selection_factor, selected)
+    jax.block_until_ready(selected_scale)
+    min_chol_diag = float(min_chol_diag)
+    selected_err = float(selected_err)
+    selected_tol = np.sqrt(np.finfo(np.float64).eps) * float(selected_scale)
+    if not np.isfinite(selected_err) or selected_err > selected_tol:
+        raise ValueError(
+            "Galerkin basis selected-state orientation identity "
+            f"C[selected]=L failed: max error {selected_err:.3e} "
+            f"> sqrt(eps)*scale={selected_tol:.3e}")
+
+    return {
+        "method": "whole_state_randomized_qrcp",
+        "stacked_states": stacked_states,
+        "state_dimension": state_dimension,
+        "search_rank": search_rank,
+        "candidate_count": min(int(1.5 * search_rank), stacked_states),
+        "raw_rank": raw_rank,
+        "retained_rank": physical,
+        "carried_rank": carrier,
+        "null_padding": carrier - physical,
+        "rank_multiplier": multiplier,
+        "qr_eps": float(basis.qrcp_eps),
+        "qrcp_seed": int(basis.qrcp_seed),
+        "qrcp_rng_version": basis.qrcp_rng_version,
+        "candidate_hash": basis.candidate_hash,
+        "pivot_hash": basis.pivot_hash,
+        "min_cholesky_diagonal": min_chol_diag,
+        "coefficient_orthogonality_error": float(c_ortho),
+        "max_missing_state_norm_squared": float(max_missing_norm2),
+        "relative_frobenius_residual": float(fro_resid),
+        "selected_orientation_error": selected_err,
+        "selected_orientation_tolerance": selected_tol,
+    }
 
 
 def _basis_text(value: str) -> np.ndarray:
@@ -897,66 +966,7 @@ def fit_galerkin_basis(
         factor=L, rank_carrier=rank, n_nodes=n_mu, mesh_xy=mesh_xy)
     del psi_rmu
 
-    @partial(jax.jit, out_shardings=(rep, rep, rep))
-    def _coefficient_receipt(c):
-        gram = jnp.einsum('kna,kma->knm', c, jnp.conj(c), optimize=True)
-        eye = jnp.eye(c.shape[1], dtype=c.dtype)[None]
-        row_norm = jnp.real(jnp.diagonal(gram, axis1=1, axis2=2))
-        return (jnp.max(jnp.abs(gram - eye)),
-                jnp.max(jnp.abs(row_norm - 1.0)),
-                jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(row_norm))))
-
-    c_ortho, max_missing_norm2, fro_resid = _coefficient_receipt(ctilde)
-    selected_dev = np.asarray(selected, dtype=np.int32)
-
-    @partial(jax.jit, out_shardings=(rep, rep))
-    def _selected_state_receipt(c, factor):
-        picked = c.reshape(m_states, rank)[jnp.asarray(selected_dev)]
-        reference = factor[:rank_phys, :]
-        scale = jnp.maximum(1.0, jnp.max(jnp.abs(reference)))
-        return jnp.max(jnp.abs(picked - reference)), scale
-
-    selected_err, selected_scale = _selected_state_receipt(ctilde, L)
-    selected_tol = np.sqrt(np.finfo(np.float64).eps) * float(selected_scale)
-    if (not np.isfinite(float(selected_err))
-            or float(selected_err) > selected_tol):
-        raise ValueError(
-            "fit_galerkin_basis: selected-state orientation identity "
-            f"C[selected]=L failed: max error {float(selected_err):.3e} "
-            f"> sqrt(eps)*scale={selected_tol:.3e}")
-    log_fn(
-        f"  [gate] physical projection over all coarse states: "
-        f"max|C C^H-I|={float(c_ortho):.3e}, "
-        f"max missing state norm^2={float(max_missing_norm2):.3e}, "
-        f"||Psi-CB||_F/||Psi||_F={float(fro_resid):.3e}; "
-        f"max|C[selected]-L|={float(selected_err):.3e} "
-        f"(cap {selected_tol:.3e})")
-    if rank_record_fn is not None:
-        rank_record_fn({
-            "method": "whole_state_randomized_qrcp",
-            "stacked_states": int(m_states),
-            "state_dimension": int(state_dim),
-            "search_rank": int(max_search),
-            "candidate_count": int(n_candidates),
-            "raw_rank": int(rank_qr),
-            "retained_rank": int(rank_phys),
-            "carried_rank": int(rank),
-            "null_padding": int(n_pad),
-            "rank_multiplier": float(search_multiplier),
-            "qr_eps": float(qr_eps),
-            "qrcp_seed": int(qrcp_seed),
-            "qrcp_rng_version": _QRCP_RNG_VERSION,
-            "candidate_hash": candidate_hash,
-            "pivot_hash": pivot_hash,
-            "min_cholesky_diagonal": float(min_chol_diag),
-            "coefficient_orthogonality_error": float(c_ortho),
-            "max_missing_state_norm_squared": float(max_missing_norm2),
-            "relative_frobenius_residual": float(fro_resid),
-            "selected_orientation_error": float(selected_err),
-            "selected_orientation_tolerance": float(selected_tol),
-        })
-
-    return GalerkinBasis(
+    basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=B_at_mu,
         rank_physical=rank_phys,
@@ -971,6 +981,23 @@ def fit_galerkin_basis(
         candidate_hash=candidate_hash,
         pivot_hash=pivot_hash,
     )
+    rank_record = galerkin_rank_record(
+        basis, meta=meta, rank_multiplier=search_multiplier)
+    log_fn(
+        f"  [gate] physical projection over all coarse states: "
+        f"max|C C^H-I|="
+        f"{rank_record['coefficient_orthogonality_error']:.3e}, "
+        f"max missing state norm^2="
+        f"{rank_record['max_missing_state_norm_squared']:.3e}, "
+        f"||Psi-CB||_F/||Psi||_F="
+        f"{rank_record['relative_frobenius_residual']:.3e}; "
+        f"max|C[selected]-L|="
+        f"{rank_record['selected_orientation_error']:.3e} "
+        f"(cap {rank_record['selected_orientation_tolerance']:.3e})")
+    if rank_record_fn is not None:
+        rank_record_fn(rank_record)
+
+    return basis
 
 
 
