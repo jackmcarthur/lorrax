@@ -121,6 +121,7 @@ COULOMB_POLICY_KEYS = (
     "bare_coulomb_cutoff",
     "use_bgw_vcoul",
     "bgw_vcoul_file",
+    "bispinor_tt_head_correction",
     "sys_dim",
 )
 
@@ -348,6 +349,7 @@ def write_restart_state_to_h5(
     qirr=None,
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
+    bispinor_vq_restart_binding=None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -409,6 +411,12 @@ def write_restart_state_to_h5(
     ``psi_full_y`` / ``enk_full`` state this restart stores.  Its format and
     serialization belong only to :mod:`file_io.qp_wfn`; this writer transports
     the opaque bytes through the incumbent SlabIO metadata path on ``mode=w``.
+
+    ``bispinor_vq_restart_binding`` is likewise an opaque composition record
+    owned by :mod:`file_io.bispinor_vq_restart`.  The bispinor V gateway
+    produced it from the exact zeta/WFN-basis/Coulomb identities it consumed;
+    this gateway stamps that same object so restart can authenticate the
+    cross-file join before opening either distributed payload.
     """
     from .slab_io import SlabIO
 
@@ -445,6 +453,21 @@ def write_restart_state_to_h5(
                     QP_STATE_SOURCE_DATASET,
                     encode_qp_state_source_provenance(
                         qp_state_source_record))
+            if bispinor_vq_restart_binding is not None:
+                from .bispinor_vq_restart import (
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                    BispinorVqRestartBinding,
+                )
+                if not isinstance(
+                        bispinor_vq_restart_binding,
+                        BispinorVqRestartBinding):
+                    raise TypeError(
+                        "write_restart_state_to_h5 requires a "
+                        "BispinorVqRestartBinding, got "
+                        f"{type(bispinor_vq_restart_binding).__name__}")
+                io.write_attr(
+                    BISPINOR_VQ_RESTART_BINDING_DATASET,
+                    bispinor_vq_restart_binding.encode())
         # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
         # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
         # as a length-3 int64 dataset (the SlabIO ``write_attr`` path

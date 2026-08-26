@@ -19,12 +19,19 @@ import pytest
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
+from types import SimpleNamespace
 
 jax.config.update("jax_enable_x64", True)
 
 from common.coulomb_sphere import compute_per_q_bare_coulomb_components
 from file_io.isdf_header import IsdfHeader, write_isdf_header
 from file_io.mf_header import copy_mf_header
+from file_io.bispinor_vq_restart import (
+    BISPINOR_VQ_RESTART_BINDING_DATASET,
+    read_bispinor_vq_restart_binding,
+)
+from file_io.tagged_arrays import format_coulomb_policy
+from file_io.wfn_basis import WavefunctionBasisReceipt
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -93,11 +100,32 @@ def _build_g_flat_zeta(tmp_path, name, *, fft_grid, kgrid, bvec, cutoff,
         gvec_components=gvec_components,
         ngk_per_q=ngk_per_q,
         zeta_cutoff_ry=cutoff,
+        fit_provenance=f'{{"fixture":"{name}"}}',
     )
     write_isdf_header(out_path, hdr, mode='a')
     with h5py.File(out_path, 'a') as f:
         f.create_dataset('zeta_q_G', data=zeta_q_G)
     return out_path, zeta_q_G, q_frac, gvec_components, ngk_per_q
+
+
+def _binding_kwargs(*, fft_grid, n_rmu_C, n_rmu_T):
+    wfn = SimpleNamespace(nbands=2, nspinor=2)
+
+    def receipt(role, n_rmu):
+        centroid_idx = (
+            np.arange(3 * n_rmu, dtype=np.int32).reshape(n_rmu, 3)
+            % np.asarray(fft_grid, dtype=np.int32)[None, :])
+        return WavefunctionBasisReceipt.from_source(
+            wfn=wfn, wfn_fingerprint_value="a" * 64,
+            role=role, bispinor=True, band_interval=(0, 1),
+            fft_grid=fft_grid, centroid_fft_idx=centroid_idx,
+            n_rmu_logical=n_rmu, n_rmu_padded=n_rmu)
+
+    return {
+        "charge_basis_receipt": receipt("charge", n_rmu_C),
+        "transverse_basis_receipt": receipt("transverse", n_rmu_T),
+        "coulomb_policy_stamp": format_coulomb_policy({}),
+    }
 
 
 def _ref_tile_V(zeta_L_disk, zeta_R_disk, q_frac, gvec_components, ngk_per_q,
@@ -180,7 +208,7 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel, _binding = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -189,6 +217,9 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
                 bvec=bvec, cell_volume=cell_volume,
                 sys_dim=sys_dim,
                 n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+                **_binding_kwargs(
+                    fft_grid=fft_grid, n_rmu_C=n_rmu_C,
+                    n_rmu_T=n_rmu_T),
                 bare_coulomb_cutoff_ry=cutoff,
                 verbose=False,
             )
@@ -224,6 +255,9 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
         unique = [tuple(t) for t in json.loads(f.attrs['unique_tiles'])]
         assert set(unique) == set(UNIQUE_TILES)
         assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v2"
+        assert BISPINOR_VQ_RESTART_BINDING_DATASET in f
+
+    assert read_bispinor_vq_restart_binding(out_path) == _binding
 
     for channel in range(4):
         np.testing.assert_allclose(
@@ -284,7 +318,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel, _binding = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -293,6 +327,9 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
                 bvec=bvec, cell_volume=cell_volume,
                 sys_dim=sys_dim,
                 n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+                **_binding_kwargs(
+                    fft_grid=fft_grid, n_rmu_C=n_rmu_C,
+                    n_rmu_T=n_rmu_T),
                 bare_coulomb_cutoff_ry=cutoff,
                 verbose=False,
             )

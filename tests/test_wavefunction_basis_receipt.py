@@ -149,6 +149,8 @@ def test_physical_source_identity_is_layout_and_device_count_independent():
     p4 = _receipt(pad=4)
     p16 = _receipt(pad=16)
     assert p4.source_identity == p16.source_identity
+    assert p4.physical_source_record() == p16.physical_source_record()
+    assert "n_rmu_padded" not in p4.physical_source_record()
     p4.assert_same_source(p16, where="cross-device receipt")
     assert p4 != p16
     with pytest.raises(ValueError, match="padded centroid extents"):

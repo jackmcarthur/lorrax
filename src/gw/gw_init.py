@@ -2192,10 +2192,16 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
+def compute_V_q(
+	zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print,
+	bgw_v_grid_fn=None, sym=None, centroid_indices=None,
+	charge_basis_receipt=None, transverse_basis_receipt=None,
+	coulomb_policy_stamp=None,
+):
 	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
 
-	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
+	Returns (V_qmunu, G0, head_channel, bispinor_vq_restart_binding) where
+	V_qmunu has shape (nq, μ, μ)
 	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
 	``gw.head_channel.HeadChannel`` when the deck sets
 	``mc_average_placement`` to something other than ``off``, and ``None``
@@ -2208,6 +2214,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	because charge and transverse channels use different μ counts.
 	"""
 	from .compute_vcoul import compute_all_V_q
+	bispinor_vq_restart_binding = None
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -2376,28 +2383,32 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                ) as zt3:
 				with mesh_xy:
-					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
-						zeta_C_loader=zc,
-						zeta_T_loaders=(zt1, zt2, zt3),
-						output_h5_path=bispinor_h5_path,
-						mesh_xy=mesh_xy, kgrid=meta.kgrid,
-						fft_grid=meta.fft_grid, bvec=bvec,
-						cell_volume=meta.cell_volume,
-						sys_dim=meta.sys_dim,
-						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
-						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
-						       if meta.sys_dim == 0 else None),
-						g_chunk=(int(cfg.memory.vq_g_chunk_size)
-						         if cfg.memory.vq_g_chunk_size > 0 else None),
-						print_fn=print_fn,
-						sym=sym if _use_ibz_bispinor else None,
-						centroid_C_idx=_cent_C_idx_for_orchestrator,
-						centroid_T_idx=_cent_T_idx_for_orchestrator,
-						use_ibz=_use_ibz_bispinor,
-						tt_head_correction=bool(
-							cfg.head.bispinor_tt_head_correction),
-					)
+					_, photon_g0_vectors, bispinor_vq_restart_binding = (
+						compute_V_q_bispinor_g_flat_to_h5(
+							zeta_C_loader=zc,
+							zeta_T_loaders=(zt1, zt2, zt3),
+							output_h5_path=bispinor_h5_path,
+							mesh_xy=mesh_xy, kgrid=meta.kgrid,
+							fft_grid=meta.fft_grid, bvec=bvec,
+							cell_volume=meta.cell_volume,
+							sys_dim=meta.sys_dim,
+							n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+							charge_basis_receipt=charge_basis_receipt,
+							transverse_basis_receipt=transverse_basis_receipt,
+							coulomb_policy_stamp=coulomb_policy_stamp,
+							bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+							bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+							       if meta.sys_dim == 0 else None),
+							g_chunk=(int(cfg.memory.vq_g_chunk_size)
+							         if cfg.memory.vq_g_chunk_size > 0 else None),
+							print_fn=print_fn,
+							sym=sym if _use_ibz_bispinor else None,
+							centroid_C_idx=_cent_C_idx_for_orchestrator,
+							centroid_T_idx=_cent_T_idx_for_orchestrator,
+							use_ibz=_use_ibz_bispinor,
+							tt_head_correction=bool(
+								cfg.head.bispinor_tt_head_correction),
+						))
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
 		# view returned by the same projection that built V; it is deliberately
@@ -2585,7 +2596,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0, head_channel
+	return V_qmunu, G0, head_channel, bispinor_vq_restart_binding
 
 
 def build_wavefunction_bundle(
@@ -2879,11 +2890,18 @@ def prepare_isdf_and_wavefunctions(
 			# (LORRAX_MEM_DEBUG=1).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0, head_channel = compute_V_q(
+			from file_io import (
+				coulomb_policy_from_config, format_coulomb_policy)
+			_coulomb_policy = coulomb_policy_from_config(cfg, meta)
+			_coulomb_policy_stamp = format_coulomb_policy(_coulomb_policy)
+			V_qmunu, G0, head_channel, bispinor_vq_restart_binding = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
-				sym=sym, centroid_indices=centroid_indices)
+				sym=sym, centroid_indices=centroid_indices,
+				charge_basis_receipt=charge_basis_receipt,
+				transverse_basis_receipt=transverse_basis_receipt,
+				coulomb_policy_stamp=_coulomb_policy_stamp)
 			# P5 — post-V_q.  V_q's transient peak just happened inside
 			# compute_V_q; this probe captures what survives (V_qmunu,
 			# G0) plus anything held over from ζ-fit.  Combined with P4
@@ -2931,7 +2949,6 @@ def prepare_isdf_and_wavefunctions(
 				cfg, sym=sym, centroid_indices=centroid_indices,
 				fft_grid=meta.fft_grid, print_fn=print0)
 			if _write_restart:
-				from file_io import coulomb_policy_from_config
 				from file_io.qp_wfn import qp_state_source_provenance
 				write_restart_state_to_h5(
 					tensors_filename,
@@ -2941,7 +2958,9 @@ def prepare_isdf_and_wavefunctions(
 					# restart and compute_V_q never re-runs, so without this
 					# an averaging-policy change is inherited in silence with
 					# every other guard passing.
-					coulomb_policy=coulomb_policy_from_config(cfg, meta),
+					coulomb_policy=_coulomb_policy,
+					bispinor_vq_restart_binding=(
+						bispinor_vq_restart_binding),
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
@@ -3092,6 +3111,13 @@ def prepare_isdf_and_wavefunctions(
 		# branch.  The entry resolver above is a centralized compatibility
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
+		if cfg.bispinor:
+			from file_io.bispinor_vq_restart import (
+				assert_bispinor_vq_restart_binding)
+			assert_bispinor_vq_restart_binding(
+				restart_path=tensors_filename,
+				v_q_path=os.path.join(tmp_dir, "v_q_bispinor.h5"),
+				where="gw_jax bispinor restart")
 		from file_io.qp_wfn import refuse_conflicting_qp_state_sources
 		_qp_state_wfn = getattr(wfn, 'path', None)
 		if not _qp_state_wfn:

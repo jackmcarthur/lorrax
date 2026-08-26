@@ -272,6 +272,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
     sys_dim: int,
     n_rmu_C: int,
     n_rmu_T: int,
+    charge_basis_receipt,
+    transverse_basis_receipt,
+    coulomb_policy_stamp: str,
     bare_coulomb_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None,
     g_chunk: int | None = None,
@@ -287,7 +290,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # (default off — every existing deck's TT tiles are byte-identical).
     # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
     tt_head_correction: bool = False,
-) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+) -> tuple[
+    Path,
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    object,
+]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
 
@@ -309,6 +316,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     The reader :class:`BispinorVqReader` opens this on-disk format.
     """
     from file_io.slab_io import SlabIO
+    from file_io.bispinor_vq_restart import BispinorVqRestartBinding
     import h5py
     import json
     from .v_q_g_flat import _compute_V_q_g_flat_one_tile
@@ -318,6 +326,16 @@ def compute_V_q_bispinor_g_flat_to_h5(
         raise ValueError(
             f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
             f"got {len(zeta_T_loaders)}.")
+    binding = BispinorVqRestartBinding.from_sources(
+        v_qmunu_format=V_QMUNU_FORMAT,
+        zeta_fit_provenance=(
+            zeta_C_loader.fit_provenance,
+            *(loader.fit_provenance for loader in zeta_T_loaders),
+        ),
+        charge_basis_receipt=charge_basis_receipt,
+        transverse_basis_receipt=transverse_basis_receipt,
+        coulomb_policy=coulomb_policy_stamp,
+    )
     nq_total = int(np.prod(kgrid))
 
     # File creation + metadata (rank-0 + collective sync via SlabIO).
@@ -552,6 +570,12 @@ def compute_V_q_bispinor_g_flat_to_h5(
         with h5py.File(output_h5_path, "a") as f:
             f.create_dataset("v_qmunu_format",
                              data=np.bytes_(V_QMUNU_FORMAT))
+            from file_io.bispinor_vq_restart import (
+                BISPINOR_VQ_RESTART_BINDING_DATASET,
+            )
+            f.create_dataset(
+                BISPINOR_VQ_RESTART_BINDING_DATASET,
+                data=binding.encode())
             f.attrs["unique_tiles"] = json.dumps(
                 [list(t) for t in UNIQUE_TILES])
             f.attrs["zero_tiles"] = json.dumps(
@@ -565,7 +589,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
         raise RuntimeError(
             "bispinor literal-G=0 projection did not produce channels "
             f"{missing}")
-    return output_h5_path, tuple(g0_by_channel)
+    return output_h5_path, tuple(g0_by_channel), binding
 
 
 # ---------------------------------------------------------------------------

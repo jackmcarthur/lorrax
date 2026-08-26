@@ -55,6 +55,7 @@ def _cfg(**over):
         bare_coulomb_cutoff=None,
         use_bgw_vcoul=False,
         bgw_vcoul_file=None,
+        bispinor_tt_head_correction=False,
     )
     head.update(over)
     return SimpleNamespace(head=SimpleNamespace(**head))
@@ -79,8 +80,19 @@ def test_every_policy_key_is_stamped():
     pol = coulomb_policy_from_config(_cfg(), _meta())
     assert set(pol) == set(COULOMB_POLICY_KEYS)
     for k in ("mc_average_vcoul_body", "mc_average_placement",
-              "bare_coulomb_cutoff", "use_bgw_vcoul", "sys_dim"):
+              "bare_coulomb_cutoff", "use_bgw_vcoul",
+              "bispinor_tt_head_correction", "sys_dim"):
         assert k in pol
+
+
+def test_tt_head_correction_is_part_of_canonical_policy_identity():
+    off = format_coulomb_policy(coulomb_policy_from_config(
+        _cfg(bispinor_tt_head_correction=False), _meta()))
+    on = format_coulomb_policy(coulomb_policy_from_config(
+        _cfg(bispinor_tt_head_correction=True), _meta()))
+    assert off != on
+    assert "bispinor_tt_head_correction=false" in off
+    assert "bispinor_tt_head_correction=true" in on
 
 
 def test_format_parse_round_trip():
