@@ -112,9 +112,14 @@ _SRC = str(_REPO / "src")
 #: -- the shim could not fail the way a real consumer can, because the shim
 #: WAS the bootstrap's own module, whereas ``file_io/__init__.py`` now
 #: reaches the door through ``ffi._services`` like everybody else.
+#: ``common.gauss_legendre`` is the vcoul finite-interval compatibility door.
+#: It triggers no FFI shared-library or communicator stack and is therefore
+#: the exact bare-launch cell for the module-scope vcoul edge introduced by
+#: the screened-head cubature.
 _MODULE_SCOPE_CONSUMERS = (
     ("isdf.core", "distrib_la"),
     ("bse.vq_interp", "distrib_la"),
+    ("common.gauss_legendre", "vcoul"),
     ("file_io", "wfn_loader"),
     ("psp.operator_checks", "wfn_loader"),
     ("centroid.charge_density", "symmetry_maps"),
