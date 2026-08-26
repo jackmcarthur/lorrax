@@ -146,6 +146,8 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "JAX/JAXLIB     : 0.test / 0.testlib" in text
     assert "Godby-Needs plasmon-pole GW" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
+    assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
+    assert " Ry" not in text and "Rydberg" not in text
     assert "Coulomb system : 2D slab; Hartree source=auto" in text
     assert "Full BZ grid   : 2 k points" in text
     assert "Stored IBZ     : 2 k points" in text

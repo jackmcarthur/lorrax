@@ -154,7 +154,8 @@ class GWProductionReport:
         self.emit("Degenerate sets: " + (
             "left in the input gauge" if bool(getattr(
                 config, "no_degen_averaging", False))
-            else f"averaged at {float(getattr(config, 'degen_avg_tol_ry', 0.0)):.5e} Ry"))
+            else "averaged at "
+            f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
         self.emit("ISDF state     : " + (
             "restart requested" if bool(getattr(config, "restart", False))
             else "fresh fit requested"))
