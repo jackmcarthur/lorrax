@@ -22,6 +22,12 @@ Three sources, in ``auto`` precedence order:
     k-partitioned + one gather), so ``gspace`` is now the in-loop /
     QSGW-capable spelling of the exact V_H and not just an offline one.
 
+Kinetic-balance bispinor files may additionally carry
+``v_hartree_transverse``.  It is independent of the scalar-source choice and
+stores the exact periodic ``alpha.A[J/c]`` direct operator; the reader
+authenticates its own star/storage and physics provenance before reading the
+payload.  There is no centroid or exchange-head fallback.
+
 Plus one **legacy** state that only ever appears on disk, never as a
 request:
 
@@ -41,7 +47,7 @@ tell these apart — never infer from magnitudes.
 
 WHICH k-SET THE ARRAYS ARE STORED ON — read this before indexing one
 ----------------------------------------------------------------------
-Both ``kin_ion`` and ``v_hartree`` are computed on the STAR WEDGE — one
+All three matrix datasets are computed on the STAR WEDGE — one
 row per symmetry orbit — and, since the store-compressed change,
 **stored** there too: the file's k axis is ``n_orbits`` rows, not ``nk``,
 and the full-BZ table is rebuilt by :func:`broadcast_ibz_to_full_bz` when
@@ -81,6 +87,14 @@ from .slab_io import SlabIO
 
 #: Name of the separate exact-V_H dataset inside ``kin_ion.h5``.
 HARTREE_DATASET = "v_hartree"
+
+#: Exact periodic transverse direct Hartree on kinetic-balance bispinors.
+TRANSVERSE_HARTREE_DATASET = "v_hartree_transverse"
+TRANSVERSE_HARTREE_PROJECTOR = "delta_ij_minus_G_i_G_j_over_G2"
+TRANSVERSE_HARTREE_G0_POLICY = "periodic_zero_no_minibz_or_exchange_head"
+TRANSVERSE_HARTREE_G0_DIAGNOSTIC = (
+	"report_only_partial_dirac_current_omits_gauged_vnl")
+TRANSVERSE_HARTREE_SYMMETRY = "crystal_scalar_time_reversal_even"
 
 #: Legal values of the ``hartree_source`` input key.
 HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
@@ -361,6 +375,12 @@ def read_kin_ion_provenance(h5_path: str) -> dict:
 			# correctly 2D-truncated V_H.
 			for k, v in h5[HARTREE_DATASET].attrs.items():
 				out[f"hartree_{k}"] = v
+		out["_has_v_hartree_transverse"] = TRANSVERSE_HARTREE_DATASET in h5
+		if out["_has_v_hartree_transverse"]:
+			out["_transverse_hartree_shape"] = tuple(
+				int(s) for s in h5[TRANSVERSE_HARTREE_DATASET].shape)
+			for k, v in h5[TRANSVERSE_HARTREE_DATASET].attrs.items():
+				out[f"transverse_hartree_{k}"] = v
 	return out
 
 
@@ -444,6 +464,49 @@ def resolve_hartree_source(h5_path: str, requested: str = "auto",
 	return requested                      # 'isdf' or 'gspace'
 
 
+def _load_matrix_submatrix(
+	h5_path: str,
+	dataset: str,
+	band_start: int,
+	band_stop: int,
+	*,
+	mesh: Mesh | None,
+) -> jax.Array:
+	"""Format-owned collective slab read plus authenticated star unfold."""
+	if band_stop <= band_start:
+		raise ValueError(f"Invalid band slice [{band_start}, {band_stop})")
+	if not os.path.exists(h5_path):
+		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
+
+	# Authenticate the dataset's own k-storage stamp and star tables before
+	# issuing any collective payload read.
+	star = read_star_map(h5_path, dataset)
+	with h5py.File(h5_path, "r") as h5:
+		if dataset not in h5:
+			raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
+		nk_stored, nb_total, nb_total2 = h5[dataset].shape
+	if nb_total != nb_total2:
+		raise ValueError(
+			f"{dataset} must be square in band axes; "
+			f"got {(nk_stored, nb_total, nb_total2)}")
+	if band_stop > nb_total:
+		raise ValueError(
+			f"Requested bands require {band_stop} states but {dataset} only "
+			f"has {nb_total}. Regenerate kin_ion.h5 with at least -n "
+			f"{band_stop}.")
+	nb = band_stop - band_start
+	with SlabIO(h5_path, mode="r", mesh=mesh) as io:
+		arr = io.read_slab(
+			dataset,
+			shape=(nk_stored, nb, nb),
+			offset=(0, band_start, band_start),
+			dtype=jnp.complex128,
+			mesh=mesh,
+			partition_spec=P(None, None, None),
+		)
+	return _unfold_if_ibz(arr, star)
+
+
 def load_hartree_submatrix(
 	h5_path: str,
 	band_start: int,
@@ -459,36 +522,21 @@ def load_hartree_submatrix(
 	unfold a stored IBZ slab here, at the read boundary.  Raises if the
 	dataset is absent; call :func:`resolve_hartree_source` first.
 	"""
-	if band_stop <= band_start:
-		raise ValueError(f"Invalid band slice [{band_start}, {band_stop})")
-	if not os.path.exists(h5_path):
-		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
-	star = read_star_map(h5_path, HARTREE_DATASET)
-	with h5py.File(h5_path, "r") as h5:
-		if HARTREE_DATASET not in h5:
-			raise KeyError(
-				f"Dataset '{HARTREE_DATASET}' missing from {h5_path}")
-		nk_stored, nb_total, nb_total2 = h5[HARTREE_DATASET].shape
-	if nb_total != nb_total2:
-		raise ValueError(
-			f"{HARTREE_DATASET} must be square in band axes; "
-			f"got {(nk_stored, nb_total, nb_total2)}")
-	if band_stop > nb_total:
-		raise ValueError(
-			f"Requested bands require {band_stop} states but "
-			f"{HARTREE_DATASET} only has {nb_total}.  Regenerate kin_ion.h5 "
-			f"with at least -n {band_stop}.")
-	nb = band_stop - band_start
-	with SlabIO(h5_path, mode="r", mesh=mesh) as io:
-		arr = io.read_slab(
-			HARTREE_DATASET,
-			shape=(nk_stored, nb, nb),
-			offset=(0, band_start, band_start),
-			dtype=jnp.complex128,
-			mesh=mesh,
-			partition_spec=P(None, None, None),
-		)
-	return _unfold_if_ibz(arr, star)
+	return _load_matrix_submatrix(
+		h5_path, HARTREE_DATASET, band_start, band_stop, mesh=mesh)
+
+
+def load_transverse_hartree_submatrix(
+	h5_path: str,
+	band_start: int,
+	band_stop: int,
+	*,
+	mesh: Mesh | None = None,
+) -> jax.Array:
+	"""Read exact ``<m|sum_i alpha_i A_i[J/c]|n>`` replicated (Ry)."""
+	return _load_matrix_submatrix(
+		h5_path, TRANSVERSE_HARTREE_DATASET,
+		band_start, band_stop, mesh=mesh)
 
 
 def validate_kin_ion_against_run(
@@ -498,6 +546,7 @@ def validate_kin_ion_against_run(
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
+	require_transverse: bool = False,
 	print_fn=print,
 ) -> dict:
 	"""Refuse a ``kin_ion.h5`` that disagrees with the run it feeds.
@@ -561,6 +610,14 @@ def validate_kin_ion_against_run(
 				f"kin_ion.h5 stores V_H for {int(hs[1])} bands but the run's "
 				f"sigma window needs {int(band_stop)}.  The two arrays must "
 				"cover the same window — regenerate with a larger -n.")
+		if expected_bispinor:
+			matrix_nspinor = attrs.get("hartree_matrix_nspinor")
+			if matrix_nspinor is None or int(matrix_nspinor) != 4:
+				raise ValueError(
+					f"{HARTREE_DATASET} matrix_nspinor={matrix_nspinor!r}; "
+					"an exact scalar Hartree consumed by a kinetic-balance "
+					"bispinor run must be projected in the authenticated "
+					"four-component matrix basis. Regenerate kin_ion.h5.")
 		print_fn(
 			f"  kin_ion: pristine T+V_loc+V_NL, plus a stored exact V_H array "
 			f"{tuple(hs)} (truncation_2d="
@@ -578,6 +635,88 @@ def validate_kin_ion_against_run(
 			"  kin_ion: ionic only (no stored V_H) — V_H comes from the ISDF "
 			"centroid quadrature, so H0 depends on the centroid count."
 		)
+
+	if require_transverse:
+		if not attrs.get("_has_v_hartree_transverse"):
+			raise ValueError(
+				"this kinetic-balance bispinor run requires exact transverse "
+				"direct Hartree, but kin_ion.h5 has no "
+				f"{TRANSVERSE_HARTREE_DATASET!r} dataset. Regenerate the artifact "
+				"with the current `python -m gw.kin_ion_io`; centroid Hartree is "
+				"not a permitted fallback.")
+		# Authenticate this dataset's own storage receipt before any SlabIO
+		# payload read.  It may not inherit a sibling dataset's k-set claim.
+		read_star_map(h5_path, TRANSVERSE_HARTREE_DATASET)
+		shape = attrs["_transverse_hartree_shape"]
+		if band_stop is not None and int(shape[1]) < int(band_stop):
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} stores {int(shape[1])} bands but "
+				f"the run needs {int(band_stop)}; regenerate with a larger -n.")
+		required = {
+			"tt_projector": TRANSVERSE_HARTREE_PROJECTOR,
+			"g0_policy": TRANSVERSE_HARTREE_G0_POLICY,
+			"g0_current_diagnostic_policy": TRANSVERSE_HARTREE_G0_DIAGNOSTIC,
+			"symmetry_class": TRANSVERSE_HARTREE_SYMMETRY,
+		}
+		from common.bispinor_init import (
+			DIRAC_ALPHA_VERTEX_PROVENANCE,
+			KINETIC_BALANCE_LIFT_PROVENANCE,
+			NO_PAIR_DIRAC_CURRENT_MODEL,
+		)
+		required.update({
+			"current_model": NO_PAIR_DIRAC_CURRENT_MODEL,
+			"bispinor_lift": KINETIC_BALANCE_LIFT_PROVENANCE,
+			"current_vertex": DIRAC_ALPHA_VERTEX_PROVENANCE,
+		})
+		for name, expected in required.items():
+			got = attrs.get(f"transverse_hartree_{name}")
+			if str(got) != expected:
+				raise ValueError(
+					f"{TRANSVERSE_HARTREE_DATASET} provenance {name!r} is "
+					f"{got!r}, expected {expected!r}; regenerate kin_ion.h5.")
+		from ffi import _services
+		_services.ensure_on_path()
+		from vcoul import COULOMB_GAUGE_TT_SIGN
+		stored_sign = attrs.get("transverse_hartree_tt_metric_sign")
+		if stored_sign is None or float(stored_sign) != float(
+			COULOMB_GAUGE_TT_SIGN
+		):
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} tt_metric_sign={stored_sign!r}, "
+				f"expected canonical {float(COULOMB_GAUGE_TT_SIGN)}.")
+		if sys_dim is not None:
+			stored_trunc = attrs.get("transverse_hartree_truncation_2d")
+			if stored_trunc is None or bool(stored_trunc) != (int(sys_dim) == 2):
+					raise ValueError(
+					f"{TRANSVERSE_HARTREE_DATASET} truncation_2d="
+					f"{stored_trunc!r} disagrees with sys_dim={int(sys_dim)}.")
+		matrix_nspinor = attrs.get("transverse_hartree_matrix_nspinor")
+		if matrix_nspinor is None or int(matrix_nspinor) != 4:
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} matrix_nspinor="
+				f"{matrix_nspinor!r}; exact alpha.A projection requires the "
+				"canonical four-component kinetic-balance matrix basis.")
+		source_nspinor = attrs.get("transverse_hartree_source_wfn_nspinor")
+		artifact_nspinor = attrs.get("nspinor")
+		if (source_nspinor is None or artifact_nspinor is None
+				or int(source_nspinor) != int(artifact_nspinor)):
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} source_wfn_nspinor="
+				f"{source_nspinor!r} disagrees with the authenticated kin_ion "
+				f"WFN basis nspinor={artifact_nspinor!r}.")
+		for name in (
+			"current_g0_l2", "current_l2", "current_g0_relative"
+		):
+			value = attrs.get(f"transverse_hartree_{name}")
+			if value is None or not np.isfinite(float(value)) or float(value) < 0:
+				raise ValueError(
+					f"{TRANSVERSE_HARTREE_DATASET} carries invalid diagnostic "
+					f"{name}={value!r}.")
+		print_fn(
+			f"  kin_ion: exact transverse direct Hartree {tuple(shape)}; "
+			f"||J(G=0)||2/||J(r)||2="
+			f"{float(attrs['transverse_hartree_current_g0_relative']):.3e}, "
+			"periodic TT G=0 is structurally zero (no miniBZ head).")
 	return attrs
 
 
@@ -625,39 +764,5 @@ def load_kin_ion_submatrix(
 	-------
 	jax.Array, shape ``(nk, nb, nb)``, dtype ``complex128``, replicated.
 	"""
-	if band_stop <= band_start:
-		raise ValueError(f"Invalid band slice [{band_start}, {band_stop})")
-	if not os.path.exists(h5_path):
-		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
-
-	# The tables first: a file that claims IBZ storage and cannot back the
-	# claim must refuse BEFORE a collective read is issued against it.
-	star = read_star_map(h5_path, "kin_ion")
-
-	# Peek shape so we can validate the slice and pass an explicit
-	# (nk, nb, nb) request to read_slab — the FFI backend requires it.
-	with h5py.File(h5_path, "r") as h5:
-		if "kin_ion" not in h5:
-			raise KeyError("Dataset 'kin_ion' missing from kin_ion file")
-		nk_stored, nb_total, nb_total2 = h5["kin_ion"].shape
-	if nb_total != nb_total2:
-		raise ValueError(
-			f"kin_ion must be square in band axes; "
-			f"got {(nk_stored, nb_total, nb_total2)}")
-	if band_stop > nb_total:
-		raise ValueError(
-			f"Requested bands require {band_stop} states but kin_ion "
-			f"only has {nb_total}"
-		)
-
-	nb = band_stop - band_start
-	with SlabIO(h5_path, mode="r", mesh=mesh) as io:
-		arr = io.read_slab(
-			"kin_ion",
-			shape=(nk_stored, nb, nb),
-			offset=(0, band_start, band_start),
-			dtype=jnp.complex128,
-			mesh=mesh,
-			partition_spec=P(None, None, None),
-		)
-	return _unfold_if_ibz(arr, star)
+	return _load_matrix_submatrix(
+		h5_path, "kin_ion", band_start, band_stop, mesh=mesh)
