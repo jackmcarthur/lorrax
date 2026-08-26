@@ -92,7 +92,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ._collectives import device_put_process_local
 
 
-__all__ = ["IBZRows", "WfnLoader"]
+__all__ = [
+    "IBZRows", "WfnLoader", "WfnProvenance", "read_wfn_provenance",
+    "uniform_band_windows",
+]
 
 
 @dataclass(frozen=True)
@@ -105,7 +108,122 @@ class IBZRows:
 KSpec = Sequence[int] | IBZRows | Literal["ibz", "full_bz"]
 
 
+@dataclass(frozen=True)
+class _OccupationSummary:
+    nelec: int
+    state_capacity: float
+    num_electrons: float
+    exact_integer: bool
+    density_band_stop: int
+
+
+def _occupation_summary(mf) -> _OccupationSummary:
+    """Canonical immutable occupation metadata derived from one MfHeader."""
+    nspin = int(mf.nspin)
+    nspinor = int(mf.nspinor)
+    nkpts = int(mf.nkpts)
+    nbands = int(mf.nbands)
+    if min(nspin, nspinor, nkpts, nbands) <= 0:
+        raise ValueError(
+            "WFN occupation dimensions must be positive; got "
+            f"nspin={nspin}, nspinor={nspinor}, nkpts={nkpts}, "
+            f"nbands={nbands}.")
+    occs = np.asarray(mf.occs, dtype=np.float64)
+    if np.size(mf.ifmax) > 0:
+        nelec = int(np.max(mf.ifmax))
+    else:
+        nelec = int(np.sum(occs[0, 0] > 0.5))
+    if not 0 <= nelec <= nbands:
+        raise ValueError(
+            f"WFN ifmax implies band boundary {nelec}, outside [0,{nbands}].")
+    if not np.all(np.isfinite(occs)):
+        raise ValueError("WFN occupations must be finite.")
+    weights = np.asarray(mf.kweights, dtype=np.float64)
+    weight_sum = float(weights.sum())
+    if (weights.shape != (nkpts,)
+            or not np.all(np.isfinite(weights)) or np.any(weights < 0.0)
+            or not np.isfinite(weight_sum) or weight_sum <= 0.0):
+        raise ValueError(
+            "WFN k-point weights must be finite, nonnegative, and have "
+            f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
+    expected_shape = (nspin, nkpts, nbands)
+    if occs.shape != expected_shape:
+        raise ValueError(
+            f"WFN occupations have shape {occs.shape}, expected "
+            f"{expected_shape}.")
+    capacity = 2.0 / (float(nspin) * float(nspinor))
+    num_electrons = capacity * float(np.einsum(
+        "k,skb->", weights / weight_sum, occs, optimize=True))
+    exact = bool(np.all(occs[:, :, :nelec] == 1.0)
+                 and np.all(occs[:, :, nelec:] == 0.0))
+    if exact:
+        density_stop = nelec
+    else:
+        nonzero = np.flatnonzero(np.any(occs != 0.0, axis=(0, 1)))
+        density_stop = 0 if nonzero.size == 0 else int(nonzero[-1]) + 1
+    if density_stop <= 0:
+        raise ValueError(
+            "physical WFN density has no occupied states; exact Hartree "
+            "requires at least one exactly nonzero occupation.")
+    return _OccupationSummary(
+        nelec, capacity, num_electrons, exact, density_stop)
+
+
+@dataclass(frozen=True)
+class WfnProvenance:
+    """Lightweight WFN identity/occupation view; no G or psi payloads."""
+    path: str
+    energies: np.ndarray
+    kpoints: np.ndarray
+    nelec: int
+    nspinor: int
+    nbands: int
+    occupation_state_capacity: float
+    num_electrons: float
+    occupations_are_exact_integer: bool
+    physical_density_band_stop: int
+
+
+def read_wfn_provenance(path: str) -> WfnProvenance:
+    """Read one canonical MfHeader into the post-hoc authentication view."""
+    from file_io.mf_header import read_mf_header_from_file
+    resolved = str(Path(path).expanduser().resolve())
+    with h5.File(resolved, "r") as handle:
+        mf = read_mf_header_from_file(handle)
+    summary = _occupation_summary(mf)
+    energies = np.array(mf.energies, dtype=np.float64, copy=True)
+    kpoints = np.array(mf.kpoints, dtype=np.float64, copy=True)
+    energies.flags.writeable = kpoints.flags.writeable = False
+    return WfnProvenance(
+        resolved, energies, kpoints, summary.nelec, int(mf.nspinor),
+        int(mf.nbands), summary.state_capacity, summary.num_electrons,
+        summary.exact_integer, summary.density_band_stop)
+
+
+def uniform_band_windows(b_lo: int, b_hi: int, width: int) -> list:
+    """Fixed-width ``(lo, mask)`` windows covering a band range once.
+
+    The final window overlaps instead of shortening, so every consumer sees
+    one compiled FFT shape; its 0/1 mask removes the overlap exactly.
+    """
+    b_lo, b_hi = int(b_lo), int(b_hi)
+    span = b_hi - b_lo
+    if span <= 0:
+        return []
+    width = min(max(1, int(width)), span)
+    out, counted = [], b_lo
+    while counted < b_hi:
+        lo = min(counted, b_hi - width)
+        mask = np.zeros(width, dtype=np.float64)
+        mask[counted - lo:] = 1.0
+        out.append((lo, mask))
+        counted = lo + width
+    return out
+
+
 class WfnLoader:
+    uniform_band_windows = staticmethod(uniform_band_windows)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -163,38 +281,14 @@ class WfnLoader:
         self.atom_crys = np.einsum(
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
 
-        # Derived band-fill metadata — same names WFNReader exposed.
-        # ``ifmax`` is the 1-based index of the highest band with nonzero
-        # occupation.  It is a BAND BOUNDARY, not an electron count: in a
-        # metal the last band can be only partially occupied.
-        if np.size(self.ifmax) > 0:
-            self.nelec = int(np.max(self.ifmax))
-        else:
-            self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
-        weights = np.asarray(self.kweights, dtype=np.float64)
-        weight_sum = float(weights.sum())
-        if (weights.shape != (int(self.nkpts),)
-                or not np.all(np.isfinite(weights))
-                or np.any(weights < 0.0)
-                or not np.isfinite(weight_sum)
-                or weight_sum <= 0.0):
-            raise ValueError(
-                "WFN k-point weights must be finite, nonnegative, and have "
-                f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
-        occs = np.asarray(self.occs, dtype=np.float64)
-        if occs.shape != (int(self.nspin), int(self.nkpts), int(self.nbands)):
-            raise ValueError(
-                "WFN occupations have shape "
-                f"{occs.shape}, expected "
-                f"({int(self.nspin)},{int(self.nkpts)},{int(self.nbands)}).")
-        # BerkeleyGW's WFN convention counts 2/(nspin*nspinor) electrons per
-        # unit occupation.  Unlike ``nelec=max(ifmax)``, this remains the
-        # physical fixed-N target for fractional occupations.
-        state_capacity = 2.0 / (
-            float(max(int(self.nspin), 1))
-            * float(max(int(self.nspinor), 1)))
-        self.num_electrons = state_capacity * float(np.einsum(
-            "k,skb->", weights / weight_sum, occs, optimize=True))
+        # Immutable occupation metadata is derived by the same bounded header
+        # helper used by the lightweight post-hoc provenance reader.
+        occupation = _occupation_summary(hdr)
+        self.nelec = occupation.nelec
+        self._occupation_state_capacity = occupation.state_capacity
+        self.num_electrons = occupation.num_electrons
+        self._occupations_are_exact_integer = occupation.exact_integer
+        self._physical_density_band_stop = occupation.density_band_stop
         _nb = int(self.energies.shape[-1])
         _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
         self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
@@ -276,12 +370,15 @@ class WfnLoader:
         # that can turn a time-reversal row into a conjugated ψ, so
         # gating there covers every backend (eager / phdf5).
         #
-        # TODO(metal-symmetry): form this diagnostic density with the WFN
-        # occupation weights; ``nelec=max(ifmax)`` overfills its current
-        # occupied-band-only window for a metal.
+        # The diagnostic pairs the raw IBZ coefficients with this loader's
+        # canonical per-k/per-band ``occs`` rows.  ``nelec=max(ifmax)`` is
+        # only a nominal support boundary (signed smearing tails may extend
+        # past it); it is never treated as a unit-filled electron count for a
+        # fractional metal.
         # Runs last in ``__init__`` because it needs ``nelec``,
-        # ``kweights``, ``box_index`` and the open file handle.  Cost is
-        # occupied-bands-only on a ±-closed k-subsample — order a second
+        # ``kweights``, ``box_index`` and the open file handle.  Cost is the
+        # exact nonzero occupation support on a
+        # ±-closed k-subsample — order a second
         # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
         # — cached per (file, mtime, size) for the process.
         # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
@@ -306,6 +403,84 @@ class WfnLoader:
         the sibling wave-1 branches.
         """
         return self._path
+
+    @property
+    def occupations_are_exact_integer(self) -> bool:
+        """Whether the complete WFN table is exactly ``[1...1,0...0]``.
+
+        ``nelec=max(ifmax)`` is only nominal: smearing tails can extend past
+        it, so the complete stored table participates in this predicate.
+        """
+        return bool(self._occupations_are_exact_integer)
+
+    @property
+    def occupation_state_capacity(self) -> float:
+        """Electrons represented by one unit WFN occupation."""
+        return float(self._occupation_state_capacity)
+
+    @property
+    def physical_density_band_stop(self) -> int:
+        """Exclusive exact support for a physical WFN density quadrature."""
+        return int(self._physical_density_band_stop)
+
+    def physical_density_occupations(
+        self,
+        *,
+        k: str,
+        unit_as_none: bool = False,
+    ) -> np.ndarray | None:
+        """Canonical ``(nk, nb)`` occupation operand for physical density.
+
+        Full-BZ rows use the same cached ``SymMaps.irr_idx_k`` as the
+        wavefunction unfold.  ``unit_as_none`` preserves the exact insulating
+        reduction.  Collinear ``nspin=2`` is refused because the coefficient
+        carrier has no explicit spin-channel axis.
+        """
+        stop = self.physical_density_band_stop
+        if int(self.nspin) != 1:
+            raise ValueError(
+                "physical_density_occupations: WfnLoader has no explicit "
+                "collinear-spin wavefunction axis, so it cannot pair nspin="
+                f"{int(self.nspin)} occupations with its psi carrier.")
+        occs = np.asarray(self.occs, dtype=np.float64)
+        if k == "file":
+            selected = occs[0, :, :stop]
+        elif k == "full_bz":
+            sym = self.symmetry()
+            source_rows = np.asarray(
+                sym.irr_idx_k, dtype=np.int64)
+            if (source_rows.shape != (int(sym.nk_tot),)
+                    or np.any(source_rows < 0)
+                    or np.any(source_rows >= int(self.nkpts))):
+                raise ValueError(
+                    "physical_density_occupations: cached full-BZ source-row "
+                    f"map is invalid for nk_file={int(self.nkpts)}: "
+                    f"shape={source_rows.shape}.")
+            selected = occs[0, source_rows, :stop]
+        else:
+            raise ValueError(
+                "physical_density_occupations: k must be 'file' or "
+                f"'full_bz', got {k!r}.")
+        selected = np.ascontiguousarray(selected, dtype=np.float64)
+        if not np.all(np.isfinite(selected)):
+            raise ValueError(
+                "physical_density_occupations: WFN weights must be finite.")
+        if k == "full_bz":
+            unfolded_electrons = (self.occupation_state_capacity
+                                  * float(np.sum(selected))
+                                  / float(selected.shape[0]))
+            tol = (256.0 * np.finfo(np.float64).eps
+                   * max(1.0, abs(self.num_electrons), float(stop)))
+            if not np.isclose(unfolded_electrons, self.num_electrons,
+                              rtol=0.0, atol=tol):
+                raise ValueError(
+                    "full-BZ occupation unfold changes fixed N: "
+                    f"{unfolded_electrons:.16e} != "
+                    f"{self.num_electrons:.16e} (tol={tol:.3e}).")
+        if unit_as_none and np.array_equal(
+                selected, np.ones_like(selected)):
+            return None
+        return selected
 
     @property
     def kpt_starts(self) -> np.ndarray:
