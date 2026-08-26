@@ -22,8 +22,8 @@ from file_io.kin_ion import (                                    # noqa: E402
 )
 from file_io.qp_wfn import (                                     # noqa: E402
     QP_ROT_FULL_BZ_DATASETS, QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE,
-    qp_rotations_k_storage, read_qp_rotations_full_bz,
-    write_qp_rotations_h5,
+    authenticate_qp_rotations_source_wfn, qp_rotations_k_storage,
+    read_qp_rotations_full_bz, write_qp_rotations_h5,
 )
 
 
@@ -78,6 +78,29 @@ def _write(tmp_path, name, U, E, kpts, **kw):
         kirr_to_kfull=_KIRR_TO_KFULL,
         source_wfn=_source_wfn(kpts, U.shape[-1]), **kw)
     return path, stored
+
+
+def test_qp_authentication_reuses_bound_wfn_fingerprint_without_rescan(
+        monkeypatch):
+    import common.parallel_transport as transport
+
+    wfn = _source_wfn(np.zeros((_NK_FULL, 3)), 3)
+    binding = transport.bind_wfn_fingerprint(wfn)
+    canonical = transport.fingerprint_from_binding(binding, wfn)
+    artifact = {
+        "source_wfn_fingerprint_scheme": transport.WFN_FINGERPRINT_SCHEME,
+        "source_wfn_fingerprint": canonical,
+    }
+    assert authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path="qp_wfn_rotations.h5") == canonical
+
+    def unexpected_rescan(_wfn):
+        raise AssertionError("bound QP source-WFN fingerprint rescanned")
+
+    monkeypatch.setattr(transport, "wfn_fingerprint", unexpected_rescan)
+    assert authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path="qp_wfn_rotations.h5",
+        wfn_fingerprint_binding=binding) == canonical
 
 
 # ---------------------------------------------------------------------------

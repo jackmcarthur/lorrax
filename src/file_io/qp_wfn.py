@@ -511,13 +511,16 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
 
 
 def authenticate_qp_rotations_source_wfn(
-        artifact: dict, source_wfn, *, artifact_path: str) -> str:
+        artifact: dict, source_wfn, *, artifact_path: str,
+        wfn_fingerprint_binding=None) -> str:
     """Require that one QP rotation artifact names its exact DFT basis.
 
     Every consumer that applies ``U_mnk`` calls this owner after
     :func:`read_qp_rotations_artifact`.  The comparison deliberately uses
     the already-loaded WFN and the sole repository fingerprint service; a
     filename, k-grid, or array shape is not a DFT-band-basis identity.
+    Callers that already scanned the WFN may pass its opaque fingerprint
+    binding; the default retains the independent canonical scan.
     """
     name = os.path.basename(os.fspath(artifact_path))
     scheme = artifact.get("source_wfn_fingerprint_scheme")
@@ -531,6 +534,7 @@ def authenticate_qp_rotations_source_wfn(
             "basis identity.")
     from common.parallel_transport import (
         WFN_FINGERPRINT_SCHEME,
+        fingerprint_from_binding,
         wfn_fingerprint,
     )
     if scheme != WFN_FINGERPRINT_SCHEME:
@@ -539,7 +543,10 @@ def authenticate_qp_rotations_source_wfn(
             "match the installed canonical scheme "
             f"{WFN_FINGERPRINT_SCHEME!r}.")
     expected = _require_wfn_fingerprint(
-        wfn_fingerprint(source_wfn),
+        (wfn_fingerprint(source_wfn)
+         if wfn_fingerprint_binding is None
+         else fingerprint_from_binding(
+             wfn_fingerprint_binding, source_wfn)),
         where="installed canonical WFN fingerprint")
     if fingerprint != expected:
         raise ValueError(
