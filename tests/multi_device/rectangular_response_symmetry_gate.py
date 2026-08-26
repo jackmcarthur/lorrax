@@ -7,7 +7,7 @@ CT/TC tiles through the incumbent packed four-current response adapter.
 
 Run only through the Perlmutter compute harness::
 
-    lx run -N 1 -G 4 -n 1 python3 -u \
+    lx run -N 1 -G 4 -n 4 python3 -u \
       tests/multi_device/rectangular_response_symmetry_gate.py --mesh 2x2
 """
 from __future__ import annotations
@@ -96,8 +96,38 @@ def _direct_square(value, perm, wraps):
 def _put(value, mesh):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
-    return jax.device_put(
-        np.asarray(value), NamedSharding(mesh, P(None, "x", "y")))
+    host = np.asarray(value)
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    return jax.make_array_from_callback(
+        host.shape, sharding, lambda global_index: host[global_index])
+
+
+def _scalar_max_abs(value):
+    """Reduce a distributed array to one replicated diagnostic scalar."""
+    import jax.numpy as jnp
+    return float(jnp.max(jnp.abs(value)))
+
+
+def _sharded_allclose(label, got, reference, *, rtol=1.0e-13,
+                      atol=1.0e-13):
+    """Elementwise allclose through one scalar, never a response gather."""
+    import jax.numpy as jnp
+    abs_error = jnp.abs(got - reference)
+    scaled_error = abs_error / (atol + rtol * jnp.abs(reference))
+    max_abs = float(jnp.max(abs_error))
+    max_scaled = float(jnp.max(scaled_error))
+    if max_scaled > 1.0:
+        raise AssertionError(
+            f"{label} sharded oracle mismatch: max_abs={max_abs:.17e}, "
+            f"max_scaled={max_scaled:.17e}")
+    return max_abs, max_scaled
+
+
+def _local_array_summary(value):
+    """Return addressable metadata without copying shard data to the host."""
+    return tuple(
+        (str(shard.index), tuple(int(n) for n in shard.data.shape))
+        for shard in value.addressable_shards)
 
 
 def check_rectangular_response_symmetry(mesh):
@@ -155,9 +185,6 @@ def check_rectangular_response_symmetry(mesh):
         left_logical_extent=n_transverse,
         right_logical_extent=n_charge,
         trs_pair_q_ibz=ct_dev, **common)
-    ct.block_until_ready()
-    tc.block_until_ready()
-    ct_host, tc_host = np.asarray(ct), np.asarray(tc)
     ct_ref = _direct_rectangular(
         ct_ibz, tc_ibz, left_perm=charge_perm, left_wrap=charge_wrap,
         right_perm=transverse_perm, right_wrap=transverse_wrap,
@@ -167,8 +194,11 @@ def check_rectangular_response_symmetry(mesh):
         left_wrap=transverse_wrap, right_perm=charge_perm,
         right_wrap=charge_wrap, logical_left=n_transverse,
         logical_right=n_charge)
-    np.testing.assert_allclose(ct_host, ct_ref, rtol=1.0e-13, atol=1.0e-13)
-    np.testing.assert_allclose(tc_host, tc_ref, rtol=1.0e-13, atol=1.0e-13)
+    ct_ref_dev, tc_ref_dev = _put(ct_ref, mesh), _put(tc_ref, mesh)
+    ct_oracle_max_abs, ct_oracle_max_scaled = _sharded_allclose(
+        "CT", ct, ct_ref_dev)
+    tc_oracle_max_abs, tc_oracle_max_scaled = _sharded_allclose(
+        "TC", tc, tc_ref_dev)
     wanted = NamedSharding(mesh, P(None, "x", "y"))
     for label, tile in (("CT", ct), ("TC", tc)):
         if not tile.sharding.is_equivalent_to(wanted, 3):
@@ -180,9 +210,11 @@ def check_rectangular_response_symmetry(mesh):
         left_perm=charge_perm, left_wrap=charge_wrap,
         right_perm=transverse_perm, right_wrap=transverse_wrap,
         logical_left=n_charge, logical_right=n_transverse)
-    wrong_scale = max(float(np.max(np.abs(ct_ref[anti_rows]))), 1.0e-300)
-    wrong_partner_rel = float(np.max(
-        np.abs(ct_ref[anti_rows] - wrong_ct[anti_rows]))) / wrong_scale
+    wrong_ct_dev = _put(wrong_ct, mesh)
+    wrong_scale = max(
+        _scalar_max_abs(ct_ref_dev[anti_rows]), 1.0e-300)
+    wrong_partner_rel = _scalar_max_abs(
+        ct_ref_dev[anti_rows] - wrong_ct_dev[anti_rows]) / wrong_scale
     if wrong_partner_rel < 0.1:
         raise AssertionError(
             f"antiunitary CT result did not distinguish its TC partner: "
@@ -211,8 +243,11 @@ def check_rectangular_response_symmetry(mesh):
         mesh_xy=mesh, n_sym_spatial=_N_SYM_SPATIAL)
     square.block_until_ready()
     square_ref = _direct_square(square_ibz, charge_perm, charge_wrap)
-    np.testing.assert_allclose(
-        np.asarray(square), square_ref, rtol=1.0e-13, atol=1.0e-13)
+    square_ref_dev = _put(square_ref, mesh)
+    square_oracle_max_abs, square_oracle_max_scaled = _sharded_allclose(
+        "square", square, square_ref_dev)
+    if not square.sharding.is_equivalent_to(wanted, 3):
+        raise AssertionError(f"square sharding is {square.sharding!r}")
 
     # The GW boundary owns the packed C⊕T representation.  The service tile
     # drops into that incumbent path without a copy, alternate packer, or
@@ -223,25 +258,74 @@ def check_rectangular_response_symmetry(mesh):
         {(0, 1): ct, (1, 0): tc}, len(_IRR), layout, mesh,
         dtype=jnp.complex128)
     views = unpack_photon_response_tiles(packed, layout, mesh)
-    np.testing.assert_array_equal(np.asarray(views[0][1]), ct_host)
-    np.testing.assert_array_equal(np.asarray(views[1][0]), tc_host)
-    np.testing.assert_array_equal(np.asarray(views[0][0]), 0.0)
+    expected_packed = NamedSharding(mesh, P(None, "x", "y"))
+    if tuple(packed.shape) != (
+            len(_IRR), layout.packed_extent, layout.packed_extent):
+        raise AssertionError(f"packed response shape is {packed.shape}")
+    if not packed.sharding.is_equivalent_to(expected_packed, 3):
+        raise AssertionError(f"packed response sharding is {packed.sharding!r}")
+    if jax.process_count() > 1 and packed.is_fully_addressable:
+        raise AssertionError(
+            "packed response is fully addressable on a multi-process mesh")
+    packed_ct_max_abs = _scalar_max_abs(views[0][1] - ct)
+    packed_tc_max_abs = _scalar_max_abs(views[1][0] - tc)
+    packed_missing_max_abs = 0.0
+    for A, row in enumerate(views):
+        for B, view in enumerate(row):
+            if (A, B) not in ((0, 1), (1, 0)):
+                packed_missing_max_abs = max(
+                    packed_missing_max_abs, _scalar_max_abs(view))
+    if max(packed_ct_max_abs, packed_tc_max_abs,
+           packed_missing_max_abs) != 0.0:
+        raise AssertionError(
+            "packed response changed a present tile or populated an absent "
+            f"one: CT={packed_ct_max_abs}, TC={packed_tc_max_abs}, "
+            f"missing={packed_missing_max_abs}")
 
     pad_max = max(
-        float(np.max(np.abs(ct_host[:, n_charge:, :]))),
-        float(np.max(np.abs(ct_host[:, :, n_transverse:]))),
-        float(np.max(np.abs(tc_host[:, n_transverse:, :]))),
-        float(np.max(np.abs(tc_host[:, :, n_charge:]))))
+        _scalar_max_abs(ct[:, n_charge:, :]),
+        _scalar_max_abs(ct[:, :, n_transverse:]),
+        _scalar_max_abs(tc[:, n_transverse:, :]),
+        _scalar_max_abs(tc[:, :, n_charge:]))
+    packed_pad_max = max(
+        _scalar_max_abs(views[0][1][:, n_charge:, :]),
+        _scalar_max_abs(views[0][1][:, :, n_transverse:]),
+        _scalar_max_abs(views[1][0][:, n_transverse:, :]),
+        _scalar_max_abs(views[1][0][:, :, n_charge:]))
+    from gw import photon_layout as photon_layout_module
+    from symmetry_maps import maps as symmetry_maps_module
     return {
+        "process_index": int(jax.process_index()),
+        "process_count": int(jax.process_count()),
+        "local_device_count": int(jax.local_device_count()),
+        "global_device_count": int(jax.device_count()),
         "ct_shape": tuple(int(v) for v in ct.shape),
         "tc_shape": tuple(int(v) for v in tc.shape),
+        "ct_local": _local_array_summary(ct),
+        "tc_local": _local_array_summary(tc),
+        "packed_local": _local_array_summary(packed),
+        "ct_fully_addressable": bool(ct.is_fully_addressable),
+        "tc_fully_addressable": bool(tc.is_fully_addressable),
+        "packed_fully_addressable": bool(packed.is_fully_addressable),
         "pad_max": pad_max,
-        "ct_oracle_max_abs": float(np.max(np.abs(ct_host - ct_ref))),
-        "tc_oracle_max_abs": float(np.max(np.abs(tc_host - tc_ref))),
-        "square_oracle_max_abs": float(
-            np.max(np.abs(np.asarray(square) - square_ref))),
+        "packed_pad_max": packed_pad_max,
+        "ct_oracle_max_abs": ct_oracle_max_abs,
+        "ct_oracle_max_scaled": ct_oracle_max_scaled,
+        "tc_oracle_max_abs": tc_oracle_max_abs,
+        "tc_oracle_max_scaled": tc_oracle_max_scaled,
+        "square_oracle_max_abs": square_oracle_max_abs,
+        "square_oracle_max_scaled": square_oracle_max_scaled,
         "wrong_partner_rel": wrong_partner_rel,
         "packed_shape": tuple(int(v) for v in packed.shape),
+        "packed_ct_max_abs": packed_ct_max_abs,
+        "packed_tc_max_abs": packed_tc_max_abs,
+        "packed_missing_max_abs": packed_missing_max_abs,
+        "unfold_jit_cache_entries": len(
+            symmetry_maps_module._UNFOLD_ISDF_OPERATOR_JIT_CACHE),
+        "photon_zero_cache_entries": len(photon_layout_module._zero_cache),
+        "photon_insert_cache_entries": len(
+            photon_layout_module._insert_cache),
+        "photon_view_cache_entries": len(photon_layout_module._view_cache),
     }
 
 
@@ -269,4 +353,8 @@ def _main():
 
 
 if __name__ == "__main__":
+    # Production geometry is one JAX process per GPU.  This must precede
+    # _main's first jax.devices() backend touch.
+    from runtime import init_jax_distributed
+    init_jax_distributed()
     raise SystemExit(_main())
