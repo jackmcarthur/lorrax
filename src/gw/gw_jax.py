@@ -908,6 +908,14 @@ def main(argv=None):
 	sig_coh = (sigma_result.sigma_coh_kij_ry
 	           if sigma_result.sigma_coh_kij_ry is not None
 	           else jnp.zeros_like(sig_x))
+	photon_head_sigma_diag_tskn_ry = (
+		sigma_result.photon_head_sigma_diag_tskn_ry)
+	photon_head_sigma_operator_fingerprint = (
+		sigma_result.photon_head_sigma_operator_fingerprint)
+	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
+	if photon_head_sigma_diag_tskn_ry is None:
+		photon_head_sigma_diag_tskn_ry = np.zeros(
+			(3, 3) + tuple(np.asarray(enk_dft).shape), dtype=np.complex128)
 	sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
 	sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
 	omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
@@ -976,6 +984,10 @@ def main(argv=None):
 		if head_sigma_diag_w_kn_ry is not None:
 			head_sigma_diag_w_kn_ry = _average_head_diag(
 				head_sigma_diag_w_kn_ry)
+		photon_head_sigma_diag_tskn_ry = average_within_degenerate_sets(
+			np.asarray(photon_head_sigma_diag_tskn_ry),
+			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+			tol_ry=float(config.degen_avg_tol_ry))
 
 	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
 	# only).  Form it AFTER the one canonical conditioning seam above: forming
@@ -1102,10 +1114,15 @@ def main(argv=None):
 		                  else float(eqp2_result.residual_ev)),
 		eqp2_tol_ev=(None if eqp2_result is None
 		             else float(config.eqp2.tol_ev)),
+		photon_head_sigma_diag_tskn_ry=np.asarray(
+			photon_head_sigma_diag_tskn_ry),
+		photon_head_sigma_operator_fingerprint=(
+			photon_head_sigma_operator_fingerprint),
+		photon_head_sigma_basis=photon_head_sigma_basis,
 	)
 	if meta.rank == 0:
-		# Optional Σ-decomposition debug table (no-op unless
-		# ``debug.sigma_freq_debug_output``; see ``gw_output.write_freq_debug``).
+		# Canonical Σ-decomposition table.  Explicit debug requests it for all
+		# modes; actual coupled q=0 completion auto-arms the same writer.
 		write_freq_debug(
 			results, config=config,
 			static_head_terms=final_static_head_terms,

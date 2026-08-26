@@ -135,6 +135,14 @@ class GWResults:
     eqp2_iterations: int | None = None
     eqp2_residual_ev: float | None = None
     eqp2_tol_ev: float | None = None
+    #: Exact final-block q=0 photon-head diagonals in Ry, axes
+    #: (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).  ``None`` is accepted
+    #: for historical constructors; the debug writer emits exact-zero columns.
+    photon_head_sigma_diag_tskn_ry: np.ndarray | None = None
+    #: Exact completion provenance.  A non-None fingerprint auto-arms the
+    #: canonical receipt, and is accepted only with an explicit DFT stamp.
+    photon_head_sigma_operator_fingerprint: str | None = None
+    photon_head_sigma_basis: str | None = None
 
     def __post_init__(self) -> None:
         if self.sig_h_scalar is None:
@@ -662,9 +670,14 @@ def write_freq_debug(
     and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
     (static, screened mode).
 
-    No-op unless ``config.debug.sigma_freq_debug_output`` is set.
+    No-op unless ``config.debug.sigma_freq_debug_output`` is set or an actual
+    coupled-photon q=0 completion is present.  FULL completion therefore
+    always leaves this canonical parseable receipt; ordinary modes retain the
+    established opt-in behavior and write exact-zero photon-sector columns.
     """
-    if not config.debug.sigma_freq_debug_output:
+    _has_photon_head = (
+        results.photon_head_sigma_operator_fingerprint is not None)
+    if not (config.debug.sigma_freq_debug_output or _has_photon_head):
         return
     from file_io import write_sigma_freq_debug_table
     from .eqp_bgw import (
@@ -712,6 +725,74 @@ def write_freq_debug(
         ("Hdir", _h_direct_diag_ev),
         ("x_bare", _sig_x_diag_ev),
     ])
+
+    # Full coupled-photon q=0 decomposition.  The carrier was contracted in
+    # ``gw.photon_sigma`` through the same band-Sigma kernel as the completed
+    # packed V/W.  Axes are term=(X,SX,COH), sector=(CC,CT+TC,TT).  Historical
+    # and non-full modes normalize to exact zeros so this debug table has one
+    # stable schema.  In static COHSEX the incumbent final Sigma is SX+COH;
+    # bare X is a quality diagnostic and adding it here would double count
+    # exchange (the same rule used by the eqp columns below).
+    _photon_head = results.photon_head_sigma_diag_tskn_ry
+    _photon_head_metadata = None
+    if _has_photon_head:
+        if results.photon_head_sigma_basis != "dft":
+            raise ValueError(
+                "authenticated photon head Sigma diagnostics must be in "
+                f"basis='dft'; got {results.photon_head_sigma_basis!r}")
+        from .head_correction import require_canonical_operator_fingerprint
+        _fingerprint = require_canonical_operator_fingerprint(
+            results.photon_head_sigma_operator_fingerprint,
+            gate="photon_head_sigma_receipt_fingerprint",
+        )
+        if _photon_head is None:
+            raise ValueError(
+                "authenticated photon head Sigma receipt has no components")
+        _photon_head_metadata = {
+            "photon_head_basis": "dft",
+            "photon_head_operator_fingerprint": _fingerprint,
+            "photon_head_sector_convention": (
+                "final_post_dyson_lorentz_blocks"),
+        }
+    elif results.photon_head_sigma_basis is not None:
+        raise ValueError(
+            "photon head Sigma basis stamp exists without an operator "
+            "fingerprint")
+    if _photon_head is None:
+        _photon_head = np.zeros(
+            (3, 3, _nk, _nb), dtype=np.complex128)
+    _photon_head = np.asarray(_photon_head, dtype=np.complex128)
+    if _photon_head.shape != (3, 3, _nk, _nb):
+        raise ValueError(
+            "photon head Sigma diagnostics must be "
+            f"(3,3,{_nk},{_nb}); got {_photon_head.shape}")
+    if not np.all(np.isfinite(_photon_head)):
+        raise ValueError("photon head Sigma diagnostics contain non-finite values")
+    _photon_head_ev = _photon_head * RYD_TO_EV
+    _sector_names = ("CC", "CTTC", "TT")
+    _term_names = ("x", "sex", "coh")
+    _sigma_head_sector_ev = _photon_head_ev[1] + _photon_head_ev[2]
+    _sigma_head_total_ev = (
+        _sigma_head_sector_ev[0]
+        + _sigma_head_sector_ev[1]
+        + _sigma_head_sector_ev[2])
+    _cols.extend([
+        ("head_CC", _sigma_head_sector_ev[0]),
+        ("head_CTTC", _sigma_head_sector_ev[1]),
+        ("head_TT", _sigma_head_sector_ev[2]),
+        ("head_total", _sigma_head_total_ev),
+    ])
+    for _term, _term_name in enumerate(_term_names):
+        _term_sector = _photon_head_ev[_term]
+        for _sector, _sector_name in enumerate(_sector_names):
+            _cols.append((
+                f"{_term_name}_head_{_sector_name}",
+                _term_sector[_sector],
+            ))
+        _cols.append((
+            f"{_term_name}_head_total",
+            _term_sector[0] + _term_sector[1] + _term_sector[2],
+        ))
     if static_head_terms is not None:
         _cols.append((
             "x_head",
@@ -835,7 +916,8 @@ def write_freq_debug(
     write_sigma_freq_debug_table(
         config.debug.sigma_freq_debug_file, _cols,
         kpoints_crys=np.asarray(reduce_full_bz_to_file_wedge(
-            sym, np.asarray(sym.unfolded_kpts, dtype=np.float64))))
+            sym, np.asarray(sym.unfolded_kpts, dtype=np.float64))),
+        metadata=_photon_head_metadata)
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
