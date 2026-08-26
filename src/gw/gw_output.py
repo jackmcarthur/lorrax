@@ -44,9 +44,12 @@ class GWResults:
     sig_coh : np.ndarray, (nk, nb, nb)
         Static Coulomb-hole Σ_COH (Ry).
     sig_h : np.ndarray, (nk, nb, nb)
-        Source-resolved direct Hartree contribution (Ry).  Its scalar charge
-        part is zero when the exact scalar Hartree is folded into
-        ``kin_ion_ry``; independent non-scalar direct fields may remain.
+        Exact total direct contribution ``V_H + H_T`` (Ry).
+    sig_h_scalar : np.ndarray, (nk, nb, nb)
+        Source-resolved scalar charge Hartree contribution (Ry).
+    h_transverse : np.ndarray or None, (nk, nb, nb)
+        Exact periodic transverse-current Hartree contribution (Ry), absent
+        on charge-only runs.
     sig_x : np.ndarray, (nk, nb, nb)
         Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
         and as a quality-of-fit check in COHSEX mode.
@@ -96,6 +99,8 @@ class GWResults:
     kin_ion_ry: np.ndarray
     band_start: int
     band_stop: int
+    sig_h_scalar: np.ndarray | None = None
+    h_transverse: np.ndarray | None = None
     use_ppm: bool = False
     self_consistent: bool = False
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
@@ -123,6 +128,21 @@ class GWResults:
     kin_ion_has_hartree: bool = False
     #: 'stored' | 'folded' | 'isdf' | 'gspace' — see file_io.kin_ion.
     hartree_source: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.sig_h_scalar is None:
+            if self.h_transverse is not None:
+                raise ValueError(
+                    "GWResults: H_T requires an explicit scalar V_H component")
+            # Historical charge-only callers: aggregate and scalar are the
+            # same array, so no arithmetic or output byte changes.
+            self.sig_h_scalar = self.sig_h
+        elif self.h_transverse is not None and not np.array_equal(
+            np.asarray(self.sig_h),
+            np.asarray(self.sig_h_scalar) + np.asarray(self.h_transverse),
+        ):
+            raise ValueError(
+                "GWResults: sig_h must equal sig_h_scalar + h_transverse exactly")
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +663,16 @@ def write_freq_debug(
     _kin_diag_ev = np.real(
         np.diagonal(np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * RYD_TO_EV
     _v_h_diag_ev = np.real(
-        np.diagonal(np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+        np.diagonal(np.asarray(results.sig_h_scalar), axis1=1, axis2=2)
+    ) * RYD_TO_EV
+    _h_transverse_diag_ev = (
+        None if results.h_transverse is None else np.real(np.diagonal(
+            np.asarray(results.h_transverse), axis1=1, axis2=2)) * RYD_TO_EV)
+    _h_direct_diag_ev = (
+        np.real(np.diagonal(
+            np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+        if _h_transverse_diag_ev is None
+        else _v_h_diag_ev + _h_transverse_diag_ev)
     _sig_x_diag_ev = np.real(
         np.diagonal(np.asarray(results.sig_x), axis1=1, axis2=2)) * RYD_TO_EV
     _nk, _nb = _e_dft_ev_full.shape
@@ -663,8 +692,13 @@ def write_freq_debug(
         ("Edft-Ef", _e_dft_ev_full - float(results.efermi_ev or 0.0)),
         ("kin_ion", _kin_diag_ev),
         ("V_H", _v_h_diag_ev),
-        ("x_bare", _sig_x_diag_ev),
     ]
+    if _h_transverse_diag_ev is not None:
+        _cols.append(("H_T", _h_transverse_diag_ev))
+    _cols.extend([
+        ("Hdir", _h_direct_diag_ev),
+        ("x_bare", _sig_x_diag_ev),
+    ])
     if static_head_terms is not None:
         _cols.append((
             "x_head",
@@ -765,7 +799,7 @@ def write_freq_debug(
         _z_factor = None
     _eqp0_ev, _eqp1_ev = compute_eqp_diag(
         kin_ion_diag_ev=_kin_diag_ev,
-        hartree_diag_ev=_v_h_diag_ev,
+        hartree_diag_ev=_h_direct_diag_ev,
         sigma_x_diag_ev=_sig_x_for_eqp,
         sigma_c_at_dft_diag_ev=np.asarray(
             _sigma_c_at_dft_for_eqp, dtype=np.complex128),
@@ -1395,7 +1429,13 @@ def write_results(
 
     sx_out    = r2e * sx_arr
     corr_out  = r2e * corr_arr
-    sig_h_out = r2e * results.sig_h
+    sig_h_scalar_out = r2e * results.sig_h_scalar
+    h_transverse_out = (
+        None if results.h_transverse is None
+        else r2e * results.h_transverse)
+    sig_h_out = (
+        r2e * results.sig_h if h_transverse_out is None
+        else sig_h_scalar_out + h_transverse_out)
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
     # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
@@ -1477,6 +1517,8 @@ def write_results(
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
+        hartree_label=(
+            "Hdir" if results.h_transverse is not None else "VH"),
     )
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
@@ -1506,6 +1548,11 @@ def write_results(
     # H₀ still reports itself exactly once, with the same wording.
     hartree_diag_ev = np.real(
         np.diagonal(_wedge(sig_h_out), axis1=1, axis2=2))
+    hartree_scalar_diag_ev = np.real(
+        np.diagonal(_wedge(sig_h_scalar_out), axis1=1, axis2=2))
+    hartree_transverse_diag_ev = (
+        None if h_transverse_out is None else np.real(
+            np.diagonal(_wedge(h_transverse_out), axis1=1, axis2=2)))
     # MODE-CORRECT exchange, not the bare one.  ``sx_out`` is already
     # resolved per mode ~50 lines up: results.sig_x under PPM (where Sigma =
     # Sigma_x + Sigma_c and bare X is right), results.sig_sx under static
@@ -1591,6 +1638,8 @@ def write_results(
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
+        hartree_scalar_diag_ev=hartree_scalar_diag_ev,
+        hartree_transverse_diag_ev=hartree_transverse_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
         sigma_c_at_dft_diag_ev=(
             None if sigma_c_omega_diag_ev_irr is not None

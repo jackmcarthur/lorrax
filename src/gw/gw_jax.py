@@ -718,9 +718,8 @@ def main(argv=None):
 	from file_io import validate_kin_ion_against_run
 	# Called for its gate side effect only: it RAISES on any provenance
 	# disagreement and prints the file's V_H storage summary.  The returned
-	# attrs dict is deliberately not bound — the V_H routing this run
-	# actually uses is re-resolved from the file by resolve_hartree_source
-	# below, and it is THAT resolution (hartree_source /
+	# attrs dict is deliberately not bound — the V_H routing is resolved
+	# immediately below before validation, and it is THAT resolution (hartree_source /
 	# kin_ion_has_hartree) which flows into the GWResults output
 	# provenance (release audit 2026-07-28: the previous ``kin_ion_attrs``
 	# binding was dead).
@@ -728,21 +727,23 @@ def main(argv=None):
 	# a single logical stage ("get H₀ off disk") and the read is a distributed
 	# H5 slab load whose cost is a file-system property, not a physics one.
 	_t_kin = time.perf_counter()
+	from file_io.kin_ion import resolve_hartree_source
+	hartree_source = resolve_hartree_source(
+		config.paths.kin_ion_file, config.hartree_source, print_fn=print0)
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
+		require_transverse=(
+			bool(config.bispinor) and hartree_source != "gspace"),
 		print_fn=print0,
 	)
 	# Which V_H source this run will use, resolved once and printed.  Only
 	# the LEGACY ``folded`` case means "V_H is inside kin_ion's values";
 	# ``stored``/``gspace`` supply it as a separate matrix that the Σ seam
 	# substitutes for the ISDF quadrature, and ``isdf`` keeps the latter.
-	from file_io.kin_ion import resolve_hartree_source
-	hartree_source = resolve_hartree_source(
-		config.paths.kin_ion_file, config.hartree_source, print_fn=print0)
 	print0(f"  hartree_source: requested={config.hartree_source} "
 	       f"→ resolved={hartree_source}")
 	kin_ion_has_hartree = (hartree_source == "folded")
@@ -815,6 +816,8 @@ def main(argv=None):
 	# as a separate DFT-basis diagnostic while leaving SigmaResult's
 	# basis-of-computation field untouched.
 	sig_h   = sigma_result.v_h_kij_ry
+	sig_h_scalar = sigma_result.v_h_scalar_kij_ry
+	h_transverse = sigma_result.h_transverse_kij_ry
 	sig_x   = sigma_result.sigma_x_kij_ry
 	sig_sx  = (sigma_result.sigma_sx_kij_ry
 	           if sigma_result.sigma_sx_kij_ry is not None
@@ -851,9 +854,11 @@ def main(argv=None):
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
 	if not config.no_degen_averaging:
-		(sigma_total, sig_sx, sig_coh, sig_h, sig_x,
+		(sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
+		 h_transverse, sig_x,
 		 sigma_c_at_dft_ev) = average_sigma_components(
-			sigma_total, sig_sx, sig_coh, sig_h, sig_x, sigma_c_at_dft_ev,
+			sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
+			h_transverse, sig_x, sigma_c_at_dft_ev,
 			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 			tol_ry=float(config.degen_avg_tol_ry),
 			mesh_xy=mesh_xy)
@@ -984,6 +989,9 @@ def main(argv=None):
 		sig_sx=np.array(sig_sx),
 		sig_coh=np.array(sig_coh),
 		sig_h=np.array(sig_h),
+		sig_h_scalar=np.array(sig_h_scalar),
+		h_transverse=(
+			None if h_transverse is None else np.array(h_transverse)),
 		sig_x=np.array(sig_x),
 		E_qp_ry=np.array(E_full),
 		U_qp=np.array(U_full),
