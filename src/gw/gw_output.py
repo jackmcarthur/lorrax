@@ -119,6 +119,13 @@ class GWResults:
     kin_ion_has_hartree: bool = False
     #: 'stored' | 'folded' | 'isdf' | 'gspace' — see file_io.kin_ion.
     hartree_source: str | None = None
+    # Optional fixed-Sigma eigenvalue-self-consistent ladder.  This is an
+    # additional result beside the ordinary one-shot E_qp_ry/U_qp pair;
+    # screening and Sigma were not rebuilt to obtain it.
+    E_eqp2_ry: np.ndarray | None = None
+    eqp2_iterations: int | None = None
+    eqp2_residual_ev: float | None = None
+    eqp2_tol_ev: float | None = None
 
 
 def print_section(title: str, print_fn=print):
@@ -1139,6 +1146,7 @@ def write_results(
     sym,
     print_fn=print,
     *,
+    eqp2_file: str | None = None,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
@@ -1156,12 +1164,14 @@ def write_results(
        the converged QP energies under self-consistency.
     Conditional:
 
-    4. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
+    4. ``eqp2.dat`` — fixed-Sigma eigenvalue-self-consistent QP energies,
+       when explicitly requested.  This uses the same BGW formatter.
+    5. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
        skipped when the SC artifact owner already wrote the converged file.
 
     Conditional (PPM, non-SC):
 
-    5. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
+    6. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
        hand-debugging convergence.
 
     BGW-style degenerate-set averaging is applied **upstream** at the
@@ -1434,6 +1444,39 @@ def write_results(
         print_fn=print_fn,
     ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
+    # ── eqp2.dat: fixed-Sigma eigenvalue self-consistency ─────────────────
+    if results.E_eqp2_ry is not None:
+        if not eqp2_file:
+            raise ValueError(
+                "write_results: GWResults.E_eqp2_ry is populated but no "
+                "eqp2_file path was supplied.")
+        e_eqp2_ev_irr = _wedge(
+            np.asarray(results.E_eqp2_ry, dtype=np.float64) * r2e)
+        if e_eqp2_ev_irr.shape != e_dft_ev_irr.shape:
+            raise ValueError(
+                "write_results: E_eqp2_ry has wedge shape "
+                f"{e_eqp2_ev_irr.shape} against E_DFT "
+                f"{e_dft_ev_irr.shape}.")
+        from .eqp_bgw import write_bgw_eqp
+        write_bgw_eqp(
+            eqp2_file,
+            kpoints_irr_frac=kpts_irr,
+            e_dft_ev=e_dft_ev_irr,
+            e_qp_ev=e_eqp2_ev_irr,
+            band_offset=results.band_start,
+            nspin=1,
+            comments=(
+                "fixed-Sigma eigenvalue self-consistency; screening, W, "
+                "and Sigma diagrams were not recomputed",
+                f"converged in {int(results.eqp2_iterations or 0)} "
+                f"fixed-map evaluations: max|dE|="
+                f"{float(results.eqp2_residual_ev or 0.0) * 1e3:.6f} meV; "
+                f"cutoff={float(results.eqp2_tol_ev or 0.0) * 1e3:.6f} meV",
+                "off-diagonal Sigma_mn uses "
+                "0.5*[Sigma_mn(E_m)+Sigma_mn(E_n)] in each updated QP basis",
+            ),
+        )
+
     # ── eqp_g0w0.dat (PPM non-SC only) — explicit Re/Im of H₀+Σ_xc(E_DFT) ──
     if (
         not results.self_consistent
@@ -1490,6 +1533,8 @@ def write_results(
     print_fn(f"\n  Sigma diag:   {sigma_diag_file}")
     print_fn(f"  BGW eqp0:     {eqp0_file}")
     print_fn(f"  BGW eqp1:     {eqp1_file}")
+    if results.E_eqp2_ry is not None:
+        print_fn(f"  BGW eqp2:     {eqp2_file}")
     if results.sigma_omega_h5_path:
         print_fn(f"  Sigma(ω):     {results.sigma_omega_h5_path}")
     if results.tensors_filename:

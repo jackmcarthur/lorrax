@@ -547,14 +547,17 @@ def extract_sigma_diag_replicated(
 # ``_extract_diag_kernel``: a closure inside ``build_qsgw_sigma_xc``
 # retraced+recompiled the full (nω, nk, nb, nb) gather every SC
 # iteration.
-_QSGW_BUILD_KERNEL_CACHE: dict[int, object] = {}
+_QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 
 
-def _qsgw_build_kernel(mesh_xy: Mesh):
-    key = id(mesh_xy)
+def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
+    key = (id(mesh_xy), bool(replicated_output))
     fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
     if fn is None:
-        rep_3d = NamedSharding(mesh_xy, P(None, None, None))
+        out_3d = NamedSharding(
+            mesh_xy,
+            P(None, None, None) if replicated_output
+            else P(None, "x", "y"))
 
         @jax.jit
         def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
@@ -582,11 +585,15 @@ def _qsgw_build_kernel(mesh_xy: Mesh):
             B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
             B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
 
-            # Half-sum, then add static Σ_x and force replicated before
-            # Hermitisation (avoids a sharded transpose).
+            # Half-sum, then add static Σ_x.  Historical callers request a
+            # replicated matrix before Hermitisation.  The fixed-Sigma evSC
+            # loop instead keeps the matrix on both band axes: its next
+            # operation is a distributed eigh, so gathering it here would
+            # create exactly the O(nb^2)-per-rank object that loop avoids.
             M = 0.5 * (A + B) + sig_x
-            M = jax.lax.with_sharding_constraint(M, rep_3d)
-            return 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+            M = jax.lax.with_sharding_constraint(M, out_3d)
+            Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+            return jax.lax.with_sharding_constraint(Mh, out_3d)
 
         fn = _kernel
         _QSGW_BUILD_KERNEL_CACHE[key] = fn
@@ -599,6 +606,8 @@ def build_qsgw_sigma_xc(
     omega_ev: np.ndarray,
     e_qp_kn_ev: np.ndarray,
     mesh_xy: Mesh,
+    *,
+    replicated_output: bool = True,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -625,13 +634,16 @@ def build_qsgw_sigma_xc(
       replicated and ``e_qp_kn_ev`` is broadcast to all shards.
     - The intermediate ``A``, ``B`` arrays inherit ``P(None, 'x', 'y')``
       sharding for ``(k, m, n)``.
-    - The final result is forced replicated via
-      ``with_sharding_constraint`` before Hermitisation, so the
-      ``½(M + M†)`` step doesn't generate cross-shard transpose comms.
+    - The final result is replicated by default, preserving the historical
+      caller contract.  ``replicated_output=False`` returns
+      ``P(None,'x','y')`` and performs the Hermitian transpose collectively;
+      the fixed-Sigma evSC loop uses that layout so a large QP Hamiltonian is
+      never gathered merely to feed a distributed eigensolver.
 
     Returns
     -------
-    sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated.
+    sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated
+        unless ``replicated_output=False``, then two-axis band sharded.
     diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
         ``[ω_min, ω_max]`` clamped to the grid) and ``omega_min/max_ev``.
     """
@@ -686,7 +698,8 @@ def build_qsgw_sigma_xc(
     w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
 
-    sigma_xc_qsgw = _qsgw_build_kernel(mesh_xy)(
+    sigma_xc_qsgw = _qsgw_build_kernel(
+        mesh_xy, replicated_output=bool(replicated_output))(
         sigma_c_omega_ry, sigma_x_kij_ry,
         idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
     )

@@ -14,7 +14,7 @@ in this file, in execution order:
                                                            #   ⊕ q→0 head channel        (sigma_dispatch)
     Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
     E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
-    eqp0/eqp1/σ.dat = write_results(...)                   # writers, debug tables       (gw_output)
+	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
 self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm``,
@@ -768,6 +768,20 @@ def main(argv=None):
 				qp_solver, sigma_result, kin_ion,
 				config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
 
+	# Optional additional ladder: iterate ONLY the already-built, full-matrix
+	# one-shot Sigma(omega).  This deliberately sits after the sole screening /
+	# Sigma stage and calls neither dispatch, so write_eqp2 cannot accidentally
+	# turn into a second GW calculation.  The callee rotates the fixed cube into
+	# each updated QP basis before evaluating its off-diagonals.
+	eqp2_result = None
+	if config.eqp2.enabled:
+		from .sc_iteration import run_fixed_sigma_evsc
+		with timing.section("gw_jax.eqp2_evsc", announce=True,
+		                    label="fixed-Sigma eigenvalue self-consistency"):
+			eqp2_result = run_fixed_sigma_evsc(
+				sigma_result, kin_ion, enk_dft,
+				config=config, mesh_xy=mesh_xy, print_fn=print0)
+
 	# ---- Post-Σ seam: bare locals from the SigmaResult ----
 	# One extraction for SC and one-shot alike; PPM-only fields are None
 	# in static modes.
@@ -962,6 +976,14 @@ def main(argv=None):
 		tensors_filename=tensors_filename,
 		kin_ion_has_hartree=kin_ion_has_hartree,
 		hartree_source=hartree_source,
+		E_eqp2_ry=(None if eqp2_result is None
+		             else np.asarray(eqp2_result.energies_ry)),
+		eqp2_iterations=(None if eqp2_result is None
+		                 else int(eqp2_result.iterations)),
+		eqp2_residual_ev=(None if eqp2_result is None
+		                  else float(eqp2_result.residual_ev)),
+		eqp2_tol_ev=(None if eqp2_result is None
+		             else float(config.eqp2.tol_ev)),
 	)
 	if meta.rank == 0:
 		# Optional Σ-decomposition debug table (no-op unless
@@ -1000,6 +1022,7 @@ def main(argv=None):
 			sigma_diag_file=config.paths.sigma_diag_file,
 			eqp0_file=config.paths.eqp0_file,
 			eqp1_file=config.paths.eqp1_file,
+			eqp2_file=config.paths.eqp2_file,
 			input_dir=input_dir,
 			kgrid=meta.kgrid,
 			# THE symmetry object, not tables off it.  Every k-basis
@@ -1037,6 +1060,13 @@ def main(argv=None):
 		sigma_result=sigma_result)
 	report.qp_gap(
 		band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
+	if eqp2_result is not None:
+		report.eqp2_summary(
+			band_slices=band_slices,
+			e_eqp2_ry=eqp2_result.energies_ry,
+			iterations=eqp2_result.iterations,
+			residual_ev=eqp2_result.residual_ev,
+			tol_ev=config.eqp2.tol_ev)
 	_file_rows = [
 		("input deck", "read", args.input),
 		("DFT wavefunctions", "read", config.paths.wfn_file),
@@ -1058,6 +1088,10 @@ def main(argv=None):
 		("linearized energies", "written" if os.path.exists(
 			config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
 	]
+	if config.eqp2.enabled:
+		_file_rows.append((
+			"fixed-Sigma evSC energies", "written" if os.path.exists(
+				config.paths.eqp2_file) else "absent", config.paths.eqp2_file))
 	if config.paths.centroids_file_current:
 		_file_rows.insert(3, (
 			"current centroids", "read", config.paths.centroids_file_current))
