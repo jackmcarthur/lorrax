@@ -962,15 +962,21 @@ def _resolve_proc_id() -> int:
 def _resolve_coordinator_address() -> str:
     """Coordinator address for jax.distributed.
 
-    JAX_COORDINATOR_ADDRESS overrides everything.  Otherwise resolve the
-    first host of SLURM_NODELIST via ``scontrol show hostnames`` and
-    append port 12355.  Final fallback: SLURMD_NODENAME / HOSTNAME /
-    'localhost' + port 12355.
+    ``JAX_COORDINATOR_ADDRESS`` overrides everything.  Otherwise resolve the
+    first host of the current *step* (not the whole interactive allocation)
+    and use a port derived from its numeric step id.  Allocation-wide host and
+    fixed-port fallbacks remain for non-step launchers.
     """
     coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
     if coord:
         return coord
-    nodelist = os.environ.get("SLURM_NODELIST")
+    step_id = os.environ.get("SLURM_STEP_ID", "")
+    try:
+        port = 22000 + int(step_id) % 30000
+    except (TypeError, ValueError):
+        port = 12355
+    nodelist = (os.environ.get("SLURM_STEP_NODELIST")
+                or os.environ.get("SLURM_NODELIST"))
     if nodelist:
         try:
             result = subprocess.run(
@@ -978,13 +984,13 @@ def _resolve_coordinator_address() -> str:
                 capture_output=True, text=True, check=True,
             )
             first_host = result.stdout.strip().split("\n")[0]
-            return f"{first_host}:12355"
+            return f"{first_host}:{port}"
         except Exception:
             pass
     host = (os.environ.get("SLURMD_NODENAME")
             or os.environ.get("HOSTNAME")
             or "localhost")
-    return f"{host}:12355"
+    return f"{host}:{port}"
 
 
 def init_jax_distributed() -> None:
@@ -1005,15 +1011,11 @@ def init_jax_distributed() -> None:
     fall back to the explicit ``(coordinator_address, num_processes,
     process_id)`` form.
 
-    ``JAX_COORDINATOR_ADDRESS``, when set, SKIPS the auto-detected form and
-    goes straight to the explicit one.  Auto-detection derives the coordinator
-    port from ``SLURM_JOB_ID``, so every step of one allocation lands on the
-    SAME port: two concurrent runs in a shared interactive allocation (two
-    agents attached to one salloc, or one agent's two launches) join each
-    other's coordinator and die with ``ABORTED: task N unexpectedly tried to
-    connect with a different incarnation``, or hang until srun SIGKILLs them.
-    Set a per-launch address (``--env=JAX_COORDINATOR_ADDRESS=$HOST:$PORT``
-    with a port unique to the launch) to keep the runs independent.
+    Slurm steps SKIP the auto-detected form and use
+    :func:`_resolve_coordinator_address`, because JAX auto-detection derives
+    its coordinator from ``SLURM_JOB_ID``: concurrent steps of one interactive
+    allocation can otherwise join the same coordinator.  An explicit
+    ``JAX_COORDINATOR_ADDRESS`` remains the highest-priority override.
     """
     # Drivers with the three-call header (gw.kin_ion_io, psp.run_nscf, ...)
     # reach ``runtime`` here first, and this is still BEFORE anything has
@@ -1038,7 +1040,8 @@ def init_jax_distributed() -> None:
     cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
     init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
-    if not os.environ.get("JAX_COORDINATOR_ADDRESS"):
+    explicit_step = bool(os.environ.get("SLURM_STEP_NODELIST"))
+    if not os.environ.get("JAX_COORDINATOR_ADDRESS") and not explicit_step:
         try:
             jax.distributed.initialize(**init_kwargs)
             os.environ[_DISTRIBUTED_SENTINEL] = "1"

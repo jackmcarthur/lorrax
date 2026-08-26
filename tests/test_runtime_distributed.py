@@ -18,7 +18,8 @@ from runtime import (set_default_env, init_jax_distributed,
 
 _ENV_KEYS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "SLURM_NTASKS",
              "JAX_PROCESS_INDEX", "SLURM_PROCID", "JAX_COORDINATOR_ADDRESS",
-             "SLURM_NODELIST", runtime._DISTRIBUTED_SENTINEL,
+             "SLURM_NODELIST", "SLURM_STEP_NODELIST", "SLURM_STEP_ID",
+             runtime._DISTRIBUTED_SENTINEL,
              # GPU allocator knobs: cleared so the allocator tests are
              # independent of BOTH test order and the ambient shell.  A
              # developer who has sourced config/frontera/ffi_env.sh has
@@ -62,6 +63,26 @@ def test_coordinator_address_has_port(clean_env):
     # No SLURM_NODELIST → falls back to a hostname:port; must carry a port.
     addr = _resolve_coordinator_address()
     assert ":" in addr and addr.rsplit(":", 1)[1].isdigit()
+
+
+def test_coordinator_address_prefers_step_host_and_step_unique_port(
+        clean_env, monkeypatch):
+    clean_env.setenv("SLURM_NODELIST", "allocation[01-04]")
+    clean_env.setenv("SLURM_STEP_NODELIST", "step04")
+    clean_env.setenv("SLURM_STEP_ID", "97")
+
+    class Result:
+        stdout = "step04\n"
+
+    seen = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return Result()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    assert _resolve_coordinator_address() == "step04:22097"
+    assert seen[0][0][-1] == "step04"
 
 
 def test_set_default_env_defaults(clean_env):
@@ -193,6 +214,38 @@ def test_init_distributed_single_process_is_noop(clean_env):
         jax.distributed.initialize = orig
     assert called["n"] == 0
     assert os.environ.get(runtime._DISTRIBUTED_SENTINEL) == "1"
+
+
+def test_init_distributed_slurm_step_uses_explicit_unique_coordinator(
+        clean_env, monkeypatch):
+    clean_env.setenv("SLURM_NTASKS", "4")
+    clean_env.setenv("SLURM_PROCID", "2")
+    clean_env.setenv("SLURM_STEP_NODELIST", "step04")
+    clean_env.setenv("SLURM_STEP_ID", "97")
+    clean_env.setenv("CUDA_VISIBLE_DEVICES", "2")
+    calls = []
+
+    class Distributed:
+        @staticmethod
+        def initialize(**kwargs):
+            calls.append(kwargs)
+
+    class FakeJax:
+        distributed = Distributed()
+
+    class Result:
+        stdout = "step04\n"
+
+    monkeypatch.setattr(runtime, "skip_gpu_plugin_discovery", lambda: None)
+    monkeypatch.setattr(runtime, "_import_jax", lambda: FakeJax())
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *a, **k: Result())
+    init_jax_distributed()
+    assert calls == [{
+        "coordinator_address": "step04:22097",
+        "num_processes": 4,
+        "process_id": 2,
+        "local_device_ids": [0],
+    }]
 
 
 def test_init_distributed_idempotent(clean_env):
