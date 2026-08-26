@@ -76,6 +76,8 @@ def average_sigma_components(
     sig_sx,
     sig_coh,
     sig_h,
+    sig_h_scalar,
+    h_transverse,
     sig_x,
     sigma_c_at_dft_ev,
     *,
@@ -89,6 +91,7 @@ def average_sigma_components(
     averaging at the writer.  Applied to:
 
     - ``sigma_total``'s diagonal          → consistent E_qp from eigh
+    - direct-field components             → exact ``V_H + H_T`` total
     - ``sig_sx, sig_coh, sig_h, sig_x``   → consistent sigma_diag.dat
     - ``sigma_c_at_dft_ev`` (1-D, or None) → consistent eqp.dat ``sigC``
 
@@ -97,7 +100,7 @@ def average_sigma_components(
     components is not a perf concern.  Matrices come back replicated on
     ``mesh_xy`` (``P(None, None, None)``), matching the post-Σ seam.
 
-    Returns the six inputs, averaged, in the same order.
+    Returns the eight inputs, averaged, in the same order.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
@@ -115,13 +118,24 @@ def average_sigma_components(
             np.asarray(M), energies_kn_ry, tol_ry), rep)
 
     sigma_total = _dav(sigma_total)
-    sig_sx, sig_coh, sig_h, sig_x = (
-        _dav(sig_sx), _dav(sig_coh), _dav(sig_h), _dav(sig_x))
+    sig_sx, sig_coh, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_x)
+    if h_transverse is None:
+        # Historical charge-only arithmetic: average the one direct field
+        # once, then bind the scalar component to that exact result.
+        sig_h = _dav(sig_h)
+        sig_h_scalar = sig_h
+    else:
+        sig_h_scalar = _dav(sig_h_scalar)
+        h_transverse = _dav(h_transverse)
+        # The aggregate is derived, never independently rounded into a
+        # second source of truth.
+        sig_h = sig_h_scalar + h_transverse
     if sigma_c_at_dft_ev is not None:
         sigma_c_at_dft_ev = average_within_degenerate_sets(
             np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
             energies_kn_ry, tol_ry)
-    return sigma_total, sig_sx, sig_coh, sig_h, sig_x, sigma_c_at_dft_ev
+    return (sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
+            h_transverse, sig_x, sigma_c_at_dft_ev)
 
 
 def apply_to_matrix_diagonals(

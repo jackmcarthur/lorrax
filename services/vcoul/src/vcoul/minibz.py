@@ -86,6 +86,7 @@ import numpy as np
 
 __all__ = [
     "COULOMB_GAUGE_TT_SIGN",
+    "apply_transverse_projector",
     "transverse_projector",
     "wrap_points_to_voronoi",
     "minibz_frac_to_cart",
@@ -429,8 +430,53 @@ def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
     return v, len2
 
 
+def apply_transverse_projector(
+    K_cart, vector_cart, len2, *, eps_K2: float = 1e-30,
+    component_axis: int = -1,
+):
+    """Apply ``J - K (K·J)/K²`` without materialising a ``3×3`` tensor.
+
+    ``K_cart`` has shape ``(...,3)``.  ``vector_cart`` may carry additional
+    right-hand-side axes after the shared ``...`` prefix; ``component_axis``
+    names its Cartesian axis.  At a singular direction the geometric action
+    is the identity, leaving the physical consumer to own its singular-slot
+    policy (periodic direct current subsequently zeros ``G=0``).
+    """
+    use_jax = any(isinstance(x, (jax.Array, jax.core.Tracer))
+                  for x in (K_cart, vector_cart, len2))
+    xp = jnp if use_jax else np
+    K = xp.asarray(K_cart, dtype=xp.float64)
+    vector = xp.asarray(vector_cart)
+    if K.ndim < 1 or K.shape[-1] != 3:
+        raise ValueError(f"K_cart must have shape (...,3); got {K.shape}.")
+    axis = int(component_axis)
+    if axis < 0:
+        axis += vector.ndim
+    if axis < 0 or axis >= vector.ndim or vector.shape[axis] != 3:
+        raise ValueError(
+            "vector_cart's Cartesian component axis must have extent 3; "
+            f"got shape {vector.shape}, component_axis={component_axis}.")
+    moved = xp.moveaxis(vector, axis, -1)
+    extra = moved.ndim - K.ndim
+    if extra < 0 or moved.shape[:K.ndim - 1] != K.shape[:-1]:
+        raise ValueError(
+            "vector_cart must share K_cart's leading grid/sample axes; "
+            f"got K={K.shape}, vector={vector.shape}.")
+    K_broadcast = K.reshape(K.shape[:-1] + (1,) * extra + (3,))
+    len2_array = xp.asarray(len2, dtype=xp.float64)
+    if len2_array.shape != K.shape[:-1]:
+        raise ValueError(
+            f"len2 must have shape {K.shape[:-1]}; got {len2_array.shape}.")
+    len2_safe = xp.where(len2_array > eps_K2, len2_array, 1.0)
+    denominator = len2_safe.reshape(
+        len2_array.shape + (1,) * extra + (1,))
+    longitudinal = (xp.sum(K_broadcast * moved, axis=-1, keepdims=True)
+                    / denominator)
+    return xp.moveaxis(moved - K_broadcast * longitudinal, -1, axis)
+
+
 def transverse_projector(K_cart, len2, *, eps_K2: float = 1e-30):
-    """``I - Khat Khat`` on NumPy or JAX Cartesian directions.
+    """``I - Khat Khat`` derived from the matrix-free public action.
 
     This is the sole transverse-projector formula shared by finite-q photon
     tiles, mini-BZ sampling, and the periodic direct-current Hartree solve.
@@ -442,11 +488,9 @@ def transverse_projector(K_cart, len2, *, eps_K2: float = 1e-30):
         len2, (jax.Array, jax.core.Tracer))
     xp = jnp if use_jax else np
     K = xp.asarray(K_cart, dtype=xp.float64)
-    len2 = xp.asarray(len2, dtype=xp.float64)
-    len2_safe = xp.where(len2 > eps_K2, len2, 1.0)
-    return (xp.eye(3)
-            - K[..., :, None] * K[..., None, :]
-            / len2_safe[..., None, None])
+    identity = xp.broadcast_to(xp.eye(3), K.shape[:-1] + (3, 3))
+    return apply_transverse_projector(
+        K, identity, len2, eps_K2=eps_K2, component_axis=-2)
 
 
 def _analytic_sphere_bare_head(q0sph2, celvol, n_kpts) -> float:

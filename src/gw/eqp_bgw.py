@@ -666,12 +666,14 @@ class EqpAssembly:
 	eqp0_ev: np.ndarray
 	eqp1_ev: np.ndarray
 	kin_ion_diag_ev: np.ndarray
-	hartree_diag_ev: np.ndarray          # post-seam: the V_H actually used
+	hartree_diag_ev: np.ndarray          # post-seam total Hdir = V_H + H_T
+	hartree_scalar_diag_ev: np.ndarray   # scalar V_H used by DFT diagnostics
 	sigma_x_diag_ev: np.ndarray
 	sigma_c_at_dft_diag_ev: np.ndarray
 	z_factor: np.ndarray | None
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
+	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
 	#: Where eqp1 was linearized, when that was not E_DFT (self-consistent
 	#: runs).  None on every one-shot path, where it IS E_DFT.
@@ -713,6 +715,8 @@ def assemble_eqp(
 	kin_ion_has_hartree: bool = False,
 	exact_hartree_diag_ev: np.ndarray | None = None,
 	hartree_already_resolved: bool = False,
+	hartree_scalar_diag_ev: np.ndarray | None = None,
+	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
@@ -756,13 +760,40 @@ def assemble_eqp(
 		hartree_already_resolved=hartree_already_resolved,
 		print_fn=print_fn,
 	)
+	if hartree_scalar_diag_ev is None:
+		if hartree_transverse_diag_ev is not None:
+			raise ValueError(
+				"assemble_eqp: H_T was supplied without its scalar V_H twin; "
+				"component-aware direct fields require scalar, transverse, and "
+				"their aggregate together.")
+		hartree_scalar_used = np.asarray(hartree_used, dtype=np.float64)
+		hartree_transverse_used = None
+	else:
+		if not hartree_already_resolved:
+			raise ValueError(
+				"assemble_eqp: component-aware Hartree input must cross the "
+				"scalar-source seam before assembly; refusing to apply one "
+				"aggregate rule to independently supplied components.")
+		hartree_scalar_used = np.asarray(
+			hartree_scalar_diag_ev, dtype=np.float64)
+		hartree_transverse_used = (
+			None if hartree_transverse_diag_ev is None else np.asarray(
+				hartree_transverse_diag_ev, dtype=np.float64))
+		expected_total = hartree_scalar_used
+		if hartree_transverse_used is not None:
+			expected_total = hartree_scalar_used + hartree_transverse_used
+		if not np.array_equal(
+			np.asarray(hartree_used, dtype=np.float64), expected_total):
+			raise ValueError(
+				"assemble_eqp: direct-field aggregate is not exactly "
+				"V_H_scalar + H_transverse; refusing an unauthenticated Hdir.")
 
 	implied_vxc = None
 	if mean_field_gate:
 		implied_vxc = _warn_on_unphysical_h0(
 			e_dft_ev=e_dft_ev,
 			kin_ion_diag_ev=kin_ion_diag_ev,
-			hartree_diag_ev=hartree_used,
+			hartree_diag_ev=hartree_scalar_used,
 			kin_ion_has_hartree=kin_ion_has_hartree,
 			hartree_source=hartree_source,
 			print_fn=print_fn,
@@ -846,11 +877,13 @@ def assemble_eqp(
 		eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_used,
+		hartree_scalar_diag_ev=hartree_scalar_used,
 		sigma_x_diag_ev=sigma_x_diag_ev,
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
 		z_factor=z_factor,
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
+		hartree_transverse_diag_ev=hartree_transverse_used,
 		nspin=int(nspin),
 		e_eval_ev=(None if e_eval_ev is None
 		           else np.asarray(e_eval_ev, dtype=np.float64)),
@@ -1248,6 +1281,14 @@ def make_eqp_bgw(
 			kirr_to_kfull, star[0],
 			what=f"{os.path.basename(sigma_mnk_path)} (eqp_bgw)")
 	with h5py.File(sigma_mnk_path, "r") as sf:
+		if "hartree_transverse_kij_ev" in sf:
+			raise ValueError(
+				"make_eqp_bgw: this sigma_mnk.h5 carries component-aware "
+				"V_H_scalar/H_transverse direct fields. This pre-schema-v3 "
+				"post-hoc reader cannot authenticate that receipt; use the live "
+				"eqp output or port the components through the schema-v3 reader "
+				"before reassembly. Refusing to feed aggregate Hdir to the "
+				"implied-DFT-Vxc diagnostic.")
 		omega_rel_ev = np.asarray(sf["omega_ev"], dtype=np.float64)
 		sigma_x_full = np.asarray(sf["sigma_sx_kij_ev"])
 		hartree_full = np.asarray(sf["hartree_kij_ev"])

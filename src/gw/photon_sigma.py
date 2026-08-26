@@ -9,9 +9,7 @@ contracts them.  The physics kernels remain the existing owners:
 * :func:`gw.cohsex_sigma._make_static_convolution` performs the flat-k FFT
   convolution; and
 * :func:`common.contract_bands.contract_bands_block_reshard` projects the
-  exchange/correlation operator back to band space; while
-* :mod:`gw.cohsex_sigma` owns the occupied one-point density and local-field
-  projection shared by scalar and transverse direct Hartree.
+  exchange/correlation operator back to band space.
 
 The accumulator stays 2-D sharded until the ordinary static-Sigma result
 boundary (the face carrier first gathers its canonical full-band result, then
@@ -54,110 +52,6 @@ def _require_packed_operator(name, packed, mesh_xy):
             f"photon operator {name} must remain P(None,'x','y'); got "
             f"{packed.sharding}.  A photon body may not be gathered or "
             "placed on fewer than all ranks.")
-
-
-def compute_static_photon_hartree(
-    *,
-    wfns_transverse,
-    Gij: jax.Array,
-    V_packed: jax.Array,
-    photon_layout,
-    meta,
-    mesh_xy: Mesh,
-    print_fn=print,
-    verbose: bool = True,
-) -> jax.Array:
-    """Direct transverse mean field from the occupied Dirac current.
-
-    In the stored Coulomb-gauge convention the non-charge Hartree operator is
-
-    ``H_T = sum_A,B=1..3 Gamma_A V_AB(q=0) rho_B``
-
-    with ``rho_B(mu) = sum_kn f_kn Psi_kn(mu)^dag Gamma_B Psi_kn(mu) / Nk``.
-    This is a one-point occupied-current contraction, not an exchange Green
-    function and not the squared current weight used only for centroid
-    selection.  No ``1/alpha_fs`` rescaling enters the physical vertex: the
-    kinetic-balance small component already makes the current and hence this
-    direct Breit field vanish in the nonrelativistic limit.
-
-    Charge-charge Hartree remains in :mod:`gw.cohsex_sigma`, where the
-    ``hartree_source`` policy can replace its ISDF quadrature by the stored or
-    G-space operator.  Bare CT/TC blocks are exactly zero in Coulomb gauge, so
-    this routine adds only the nine TT blocks and cannot double-count charge.
-    Each ``rho_B`` is retained only while its three ``V_AB rho_B`` matvecs
-    stream.  The three resulting ``phi_A`` centroid vectors are projected
-    once each, so nine TT blocks cost three band GEMMs and no additional
-    centroid-square object.
-    """
-    if int(wfns_transverse.psi_mun.shape[1]
-           if wfns_transverse.layout == "face"
-           else wfns_transverse.psi_yr.shape[2]) != 4:
-        raise ValueError(
-            "photon Hartree requires four-component transverse bispinors")
-    _require_packed_operator("V_packed", V_packed, mesh_xy)
-    photon_layout.assert_mesh(mesh_xy)
-    n_t = _padded_centroid_extent(wfns_transverse)
-    expected_t = int(photon_layout.padded_extent(1))
-    if n_t != expected_t:
-        raise ValueError(
-            "photon Hartree transverse centroid extent differs between the "
-            f"wavefunctions ({n_t}) and packed layout ({expected_t})")
-
-    from .cohsex_sigma import (
-        make_hartree_density_kernel, make_hartree_field_kernel,
-        make_hartree_projection_kernel,
-        _replicate_band_sigma,
-    )
-    from .photon_layout import photon_block_view
-    from .wavefunction_bundle import (
-        face_kernel_kwargs, with_lorentz_vertices,
-    )
-
-    endpoint = face_kernel_kwargs(wfns_transverse)
-    layout = endpoint.get("layout", "legacy")
-    face_shape = endpoint.get("face_shape")
-    density = make_hartree_density_kernel(
-        mesh_xy, layout=layout, face_shape=face_shape)
-    field = make_hartree_field_kernel(mesh_xy, int(meta.nk_tot))
-    project = make_hartree_projection_kernel(
-        mesh_xy, layout=layout, face_shape=face_shape)
-
-    fields_A = [None, None, None]
-    for B in (1, 2, 3):
-        density_vertex = with_lorentz_vertices(wfns_transverse, 0, B)
-        rho_B = density(wfns_transverse, density_vertex, Gij)
-        rho_B.block_until_ready()
-        del density_vertex
-        for A in (1, 2, 3):
-            V_AB = photon_block_view(
-                V_packed, photon_layout, A, B, mesh_xy)
-            field_AB = field(V_AB, rho_B)
-            slot = A - 1
-            fields_A[slot] = (field_AB if fields_A[slot] is None
-                              else fields_A[slot] + field_AB)
-            fields_A[slot].block_until_ready()
-        del rho_B
-        if verbose and jax.process_index() == 0:
-            print_fn(
-                f"  full photon direct Hartree current channel B={B} complete")
-
-    sig_h_t = None
-    for A in (1, 2, 3):
-        projection_vertex = with_lorentz_vertices(
-            wfns_transverse, A, 0)
-        h_A = project(
-            wfns_transverse, projection_vertex, fields_A[A - 1])
-        sig_h_t = h_A if sig_h_t is None else sig_h_t + h_A
-        sig_h_t.block_until_ready()
-        fields_A[A - 1] = None
-        del projection_vertex
-
-    sig_h_t = _replicate_band_sigma(sig_h_t, mesh_xy)
-    if wfns_transverse.layout == "face":
-        nb_sigma = wfns_transverse.slices.nb_sigma
-        sig_h_t = sig_h_t[:, :nb_sigma, :nb_sigma]
-    sig_h_t.block_until_ready()
-    return sig_h_t
 
 
 def _make_photon_static_block_kernel(
