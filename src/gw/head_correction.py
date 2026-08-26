@@ -188,6 +188,21 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
     return jnp.asarray(linear)
 
 
+def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
+    r"""Return the unique coordinate-symmetric representative of ``q S q``.
+
+    Only ``q_a q_b S[a,b]`` is observable in the quadratic response, so the
+    coordinate-antisymmetric part is identically null.  Broken-TRS bubbles
+    and their Hermitian Schur folds generically carry such an imaginary
+    antisymmetric part; remove it at construction sites while leaving the
+    independent validation gate fail-closed for arbitrary consumer input.
+    """
+    S = jnp.asarray(S_direct)
+    if tuple(S.shape) != (2, 2, 4, 4):
+        raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
+    return 0.5 * (S + jnp.swapaxes(S, 0, 1))
+
+
 def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     r"""Return algebraic in-plane Ward and Hermiticity residuals of ``S``.
 
@@ -1422,6 +1437,7 @@ def complete_static_slab_photon_q0(
                 response.Y_x[a], W_gamma, response.Z_y[b],
                 float(cell_volume), mesh_xy=mesh_xy)
             S_effective = S_effective.at[a, b].set(folded)
+    S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
     YW_y, WZ_x = small_head_wing_halves_sharded(
         response.Y_x, W_gamma, response.Z_y, mesh_xy=mesh_xy)
     jax.block_until_ready((S_effective, YW_y, WZ_x))
