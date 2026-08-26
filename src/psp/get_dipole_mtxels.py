@@ -880,8 +880,8 @@ def main(argv=None):
 	parser.add_argument(
 		"--static-gauge-hall-only",
 		action="store_true",
-		help="Run only the canonical full-BZ uniform current/contact/transfer-"
-		     "jet sweep and print its provenance-bound raw Hall pseudovector. "
+		help="Run only the canonical full-BZ uniform current/contact sweep and "
+		     "print its provenance-bound raw Hall pseudovector. "
 		     "This diagnostic does not write dipole.h5 or fabricate the other "
 		     "fields of a StaticGaugeHeadResponse artifact.",
 	)
@@ -1126,7 +1126,7 @@ def main(argv=None):
 		pseudos,
 		nspinor=int(wfn.nspinor),
 		compute_contact=bool(args.static_gauge_hall_only),
-		compute_transfer_q2=bool(args.static_gauge_hall_only),
+		compute_transfer_q2=False,
 	)
 
 	nk = int(sym.nk_tot)
@@ -1147,7 +1147,7 @@ def main(argv=None):
 				bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(gtab.kvecs), include_transfer_q2=True)
+				kvecs=np.asarray(gtab.kvecs), include_transfer_q2=False)
 		with timing.section("static_gauge_hall_reduce"):
 			hall = static_gauge_hall_transaction(
 				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
