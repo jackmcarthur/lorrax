@@ -573,6 +573,91 @@ def _whole_state_memory_fits(
     )
 
 
+_SELECTED_RANK_STAGES = (
+    "selected_gram_stream",
+    "selected_gram_fold",
+    "physical_projection",
+)
+
+
+def _resolve_qrcp_physical_rank(
+        *, rank_qr: int, max_search: int, state_dim: int,
+        state_count: int) -> int:
+    """Return the QRCP-selected rank, refusing a truncated search.
+
+    ``qr_eps`` has already selected ``rank_qr`` inside the pivoted-Cholesky
+    owner.  This policy seam may reject a search ceiling that saturated, but
+    it must never clip the delivered physical rank: the multiplier controls
+    only ``max_search`` and is not a second rank-selection tolerance.
+    """
+    rank_qr = int(rank_qr)
+    max_search = int(max_search)
+    if rank_qr <= 0 or rank_qr > max_search:
+        raise ValueError(
+            "fit_galerkin_basis: raw QRCP rank must lie in "
+            f"[1,max_search={max_search}], found {rank_qr}")
+    structural_search = max_search >= min(int(state_dim), int(state_count))
+    if rank_qr > 0.9 * max_search and not structural_search:
+        raise ValueError(
+            "fit_galerkin_basis: the randomized QRCP search saturated: "
+            f"raw QRCP rank {rank_qr} selected by qr_eps exceeds 90% of "
+            f"max_search={max_search}. Increase htransform_rank_multiplier "
+            "or increase qr_eps; the search bound may not clip the physical "
+            "basis rank.")
+    return rank_qr
+
+
+def _refuse_unfit_selected_rank(
+        ledger: dict[str, float], *, rank_physical: int, rank_carrier: int,
+        max_search: int, qr_eps: float, nspinor: int,
+        device_pool_limit: float | None, log_fn) -> None:
+    """Capacity-gate the exact QRCP-selected carrier before allocation."""
+    required = max(float(ledger[name]) for name in _SELECTED_RANK_STAGES)
+    workspace = float(ledger["WFN_CUFFT_WORKSPACE"])
+    if device_pool_limit is None or float(device_pool_limit) <= 0:
+        log_fn(
+            "  [gate] selected-rank pre-allocation capacity DID NOT RUN: "
+            f"qr_eps={float(qr_eps):.3e} selected physical rank "
+            f"{int(rank_physical)} in carrier {int(rank_carrier)}, requiring "
+            f"{int(math.ceil(required))} "
+            "bytes/device by the analytic ledger, but no positive live "
+            "device-pool limit was available")
+        return
+
+    utilization = bfc_fragmentation_target_utilization(int(nspinor))
+    pool = float(device_pool_limit)
+    capacity_target = pool * utilization
+    workspace_reserve = pool - capacity_target
+    log_fn(
+        "  [gate] selected-rank pre-allocation capacity: "
+        f"physical={int(rank_physical)}, carrier={int(rank_carrier)}, "
+        f"required={int(math.ceil(required))} bytes/device "
+        f"({required/2**30:.2f} GiB), target="
+        f"{int(math.floor(capacity_target))} bytes/device "
+        f"({capacity_target/2**30:.2f} GiB); cuFFT workspace="
+        f"{int(math.ceil(workspace))} bytes/device against reserve="
+        f"{int(math.floor(workspace_reserve))} bytes/device")
+    if required > capacity_target or workspace > workspace_reserve:
+        raise MemoryError(
+            "fit_galerkin_basis: "
+            f"qr_eps={float(qr_eps):.3e} selected physical rank "
+            f"{int(rank_physical)} (carrier {int(rank_carrier)}) within "
+            f"max_search={int(max_search)}, but its next selected-rank stage "
+            f"requires {int(math.ceil(required))} bytes/device "
+            f"({required/2**30:.2f} GiB), above the fragmentation-safe "
+            f"available target {int(math.floor(capacity_target))} "
+            f"bytes/device ({capacity_target/2**30:.2f} GiB), or its cuFFT "
+            f"workspace requires {int(math.ceil(workspace))} bytes/device "
+            f"against a contiguous reserve of "
+            f"{int(math.floor(workspace_reserve))} bytes/device. Refusing "
+            "before the selected Gram/factor/coefficient allocation. Provide "
+            "a device with enough live memory, use a distributed selected-rank "
+            "representation, or increase qr_eps only if a lower physical rank "
+            "is scientifically intended. Do not lower "
+            "htransform_rank_multiplier to clip the delivered basis; it is "
+            "only the QRCP search bound.")
+
+
 def _resolve_whole_state_stream_budget(
         *, meta, mesh_xy: Mesh, nk: int, nspinor: int,
         ngkmax: int, band_carrier: int, state_count: int, search_rank: int,
@@ -885,26 +970,29 @@ def fit_galerkin_basis(
                 f"minimum residual {psd_host[0]:.6e} at candidate "
                 f"{psd_host[1]}, step {psd_host[2]}, below "
                 f"-{pc_floor:.6e}")
-        rank_phys = min(rank_qr, 2500)
-        structural_search = max_search >= min(state_dim, m_states)
-        if rank_phys > 0.9 * max_search and not structural_search:
-            raise ValueError(
-                "fit_galerkin_basis: the randomized QRCP search saturated: "
-                f"delivered rank {rank_phys} exceeds 90% of "
-                f"max_search={max_search}. Increase "
-                "htransform_rank_multiplier or increase qr_eps; silently "
-                "clipping this basis makes locality a tuning artifact.")
-        selected = candidates[piv_host[:rank_phys]]
-        pivot_hash = hashlib.sha256(
-            selected.astype("<i8", copy=False).tobytes()).hexdigest()
+        rank_phys = _resolve_qrcp_physical_rank(
+            rank_qr=rank_qr, max_search=max_search,
+            state_dim=state_dim, state_count=m_states)
         rank = round_up(rank_phys, align)
         if extra_rank_pad:
             rank = round_up(rank + extra_rank_pad, align)
         n_pad = rank - rank_phys
+        selected_ledger = _whole_state_memory_ledger(
+            meta=meta, mesh_xy=mesh_xy, nk=nk, nspinor=nspinor,
+            ngkmax=int(wfn.ngkmax), band_carrier=bc_carrier,
+            state_count=m_states, search_rank=rank,
+            candidate_carrier=candidate_carrier,
+            q_tile_budget=int(q_tile_budget))
+        _refuse_unfit_selected_rank(
+            selected_ledger, rank_physical=rank_phys, rank_carrier=rank,
+            max_search=max_search, qr_eps=float(qr_eps), nspinor=nspinor,
+            device_pool_limit=device_pool_limit, log_fn=log_fn)
+        selected = candidates[piv_host[:rank_phys]]
+        pivot_hash = hashlib.sha256(
+            selected.astype("<i8", copy=False).tobytes()).hexdigest()
         log_fn(
             f"  [qrcp] raw rank={rank_qr}, delivered physical rank="
-            f"{rank_phys}" + (" (upstream safety cap 2500)"
-                              if rank_qr > 2500 else "")
+            f"{rank_phys} (selected solely by qr_eps={float(qr_eps):.3e})"
             + (f", +{n_pad} exact-null mesh pad -> {rank}" if n_pad else ""))
         log_fn(
             f"  [qrcp] pivot SHA256={pivot_hash}; first/last picked "
