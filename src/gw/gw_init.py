@@ -41,6 +41,7 @@ from .gw_config import (
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
+	uses_coupled_photon_head,
 )
 
 # ── The ζ file's DOOR ────────────────────────────────────────────────────
@@ -2193,7 +2194,8 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
 	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
 
-	Returns (V_qmunu, G0, head_channel) where V_qmunu has shape (nq, μ, μ)
+	Returns (V_qmunu, G0, head_channel, photon_g0_vectors), where V_qmunu
+	has shape (nq, μ, μ)
 	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
 	``gw.head_channel.HeadChannel`` when the deck sets
 	``mc_average_placement`` to something other than ``off``, and ``None``
@@ -2206,6 +2208,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	because charge and transverse channels use different μ counts.
 	"""
 	from .compute_vcoul import compute_all_V_q
+	photon_g0_vectors = None
 
 	if jax.process_index() == 0:
 		os.sync()
@@ -2400,16 +2403,16 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
 		# view returned by the same projection that built V; it is deliberately
 		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
-		# source of truth.  The three transverse views have no production
-		# consumer until the authenticated static-gauge artifact loader lands,
-		# so do not pin them through the rest of GW bring-up.
+		# source of truth.  The four small views stay resident only for a packed
+		# coupled head; headless modes release the transverse three immediately.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
 		with BispinorVqReader(bispinor_h5_path, mesh_xy,
 		                      ) as reader:
 			V_q_raw = reader.get_tile(0, 0)
 		G0_all = photon_g0_vectors[0]
-		del photon_g0_vectors
+		if not uses_coupled_photon_head(cfg):
+			photon_g0_vectors = None
 		# V_q_raw is on disk at LOGICAL n_rmu (the orchestrator strips
 		# the V-tile pad before write).  In-memory ψ flows at PADDED
 		# n_rmu so the σ_X kernel can broadcast V across G's μ axis.
@@ -2583,7 +2586,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
 		print_fn=print_fn)
 	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0, head_channel
+	return V_qmunu, G0, head_channel, photon_g0_vectors
 
 
 def build_wavefunction_bundle(
@@ -2626,7 +2629,8 @@ def prepare_isdf_and_wavefunctions(
 	  6. Flush V_q / G0 / enk + W0 placeholder to restart H5 (mode="w").
 	  7. Build the downstream Wavefunctions bundle from the same ψ.
 
-	Returns SimpleNamespace(V_qmunu, wf_bundle).
+	Returns the resident V, wavefunction bundles and any fresh literal-Gamma
+	channel vectors needed by the packed photon head.
 	"""
 	from file_io import write_restart_state_to_h5
 	from common.wfn_transforms import load_centroids_band_chunked
@@ -2657,6 +2661,7 @@ def prepare_isdf_and_wavefunctions(
 	charge_basis_receipt = None
 	transverse_basis_receipt = None
 	basis_wfn_fingerprint_binding = None
+	photon_g0_vectors = None
 
 	if not cfg.restart:
 		# One bounded canonical HDF5 scan supplies every receipt for this
@@ -2879,7 +2884,7 @@ def prepare_isdf_and_wavefunctions(
 			# (the one driver debug stream).  Round-1 addition.
 			from gw.isdf_fitting import mem_probe as _mem_probe
 			_mem_probe("pre_v_q")
-			V_qmunu, G0, head_channel = compute_V_q(
+			V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
 				zeta_path, wfn, meta, mesh_xy, cfg,
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
@@ -3394,4 +3399,5 @@ def prepare_isdf_and_wavefunctions(
 		wf_binding_charge=charge_basis_binding,
 		wf_binding_transverse=transverse_basis_binding,
 		head_channel=head_channel,
+		photon_g0_vectors=photon_g0_vectors,
 	)

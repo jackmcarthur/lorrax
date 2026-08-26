@@ -2081,36 +2081,56 @@ def compute_static_photon_response(
     wfn=None,
     config=None,
     gauge_head_response=None,
+    photon_g0_vectors=None,
+    wf_binding_charge=None,
+    wf_binding_transverse=None,
+    wfn_fingerprint_binding=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
     dyson_solver: str = "distributed",
     distrib_la_batched_route: str = "auto",
 ) -> StaticPhotonResponse:
-    """Build the explicitly experimental packed static photon body.
+    """Build the packed static photon body and its selected q=0 model.
 
-    ``head_correction=off`` preserves the explicitly experimental finite-body
-    no-pair bring-up path.  ``full`` is refused here, below deck parsing,
-    until the authenticated head producer and finite-q body are wired through
-    one certified operator/content identity.  The immutable schema/loader
-    alone, or a caller-provided response record, cannot certify that missing
-    end-to-end physics.  No photon body, G-vector transform, or symmetry
-    operation is rebuilt here.
+    ``full_static_cohsex`` remains headless and experimental.
+    ``charge_hall_cubature`` adds only the declared charge and Hall response
+    through the existing exact slab cubature.  Neither mode claims the
+    missing ordinary-current/contact/complement terms.
     """
-    from .gw_config import HeadCorrection
-    from .photon_layout import PhotonBasisLayout, pack_photon_operator
+    from .gw_config import (
+        BispinorGWMode, HeadCorrection, coerce_bispinor_gw_mode)
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors,
+        pack_photon_operator)
     from .v_q_bispinor import BispinorVqReader
 
     if str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
-            "full static photon response requires dyson_solver='distributed'")
+            "packed static photon response requires "
+            "dyson_solver='distributed'")
     head_policy = (HeadCorrection.OFF if config is None
                    else config.head.correction)
     if head_policy not in (HeadCorrection.OFF, HeadCorrection.FULL):
         raise ValueError(
-            "full static photon response accepts only head_correction=off "
+            "packed static photon response accepts only head_correction=off "
             f"or full; got {head_policy!r}")
     coupled_head = head_policy is HeadCorrection.FULL
-    if coupled_head:
+    photon_mode = (
+        BispinorGWMode.FULL_STATIC_COHSEX
+        if config is None or not hasattr(config, "bispinor_gw")
+        else coerce_bispinor_gw_mode(config.bispinor_gw))
+    if photon_mode not in (
+            BispinorGWMode.FULL_STATIC_COHSEX,
+            BispinorGWMode.CHARGE_HALL_CUBATURE):
+        raise ValueError(
+            "packed static photon response received bispinor_gw="
+            f"{photon_mode.value!r}")
+    if (photon_mode is BispinorGWMode.CHARGE_HALL_CUBATURE
+            and not coupled_head):
+        raise ValueError(
+            "bispinor_gw=charge_hall_cubature requires "
+            "head_correction=full")
+    if coupled_head and photon_mode is not BispinorGWMode.CHARGE_HALL_CUBATURE:
         raise ValueError(
             "GATE static_gauge_head_end_to_end_uncertified: production "
             "FULL_SCREENED q=0 completion is unreachable until an "
@@ -2121,6 +2141,36 @@ def compute_static_photon_response(
             "caller-provided StaticGaugeHeadResponse cannot certify that "
             "missing wiring; head_correction=off retains only the "
             "experimental no-pair finite-body diagnostic")
+    if coupled_head:
+        if gauge_head_response is not None:
+            raise ValueError(
+                "charge_hall_cubature builds its response from the current "
+                "WFN and Hall file; a caller-supplied response is not used")
+        if (wfn is None or config is None or photon_g0_vectors is None
+                or wf_binding_charge is None
+                or wf_binding_transverse is None
+                or wfn_fingerprint_binding is None):
+            raise ValueError(
+                "charge_hall_cubature requires the fresh WFN, four Gamma "
+                "vectors, and both wavefunction-basis bindings")
+        for binding, carrier, role in (
+                (wf_binding_charge, wfns_charge, "charge"),
+                (wf_binding_transverse, wfns_transverse, "transverse")):
+            if (binding.wavefunctions is not carrier
+                    or binding.receipt.role != role):
+                raise ValueError(
+                    f"charge_hall_cubature {role} wavefunction binding does "
+                    "not name the supplied carrier")
+        from file_io.static_gauge_head import load_static_gauge_hall_artifact
+        hall = load_static_gauge_hall_artifact(
+            config.paths.static_gauge_hall_file,
+            mesh_xy=mesh_xy,
+            wfn=wfn,
+            expected_band_start=int(meta.b_id_0),
+            expected_band_stop=int(meta.b_id_4_chi_user),
+            expected_nk_tot=int(meta.nk_tot),
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+        )
 
     with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
         if int(reader.n_q_total) != int(meta.nk_tot):
@@ -2167,12 +2217,57 @@ def compute_static_photon_response(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
 
+    head_completion = None
+    if coupled_head:
+        from vcoul import (
+            CoulombGeometry, get_kernel, slab_minibz_photon_cubature)
+        from .head_correction import complete_static_slab_photon_q0
+        from .static_gauge_response import (
+            build_charge_hall_cubature_response)
+
+        response = build_charge_hall_cubature_response(
+            wfns_charge,
+            input_dir=config.input_dir,
+            mesh=mesh_xy,
+            wfn=wfn,
+            meta=meta,
+            config=config,
+            layout=layout,
+            hall_transaction=hall,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+        )
+        if len(photon_g0_vectors) != 4:
+            raise ValueError(
+                "charge_hall_cubature requires four literal-Gamma vectors")
+        g0_X = pack_photon_channel_vectors(
+            tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
+        y_sharding = NamedSharding(mesh_xy, P(None, "y"))
+        g0_Y = pack_photon_channel_vectors(
+            tuple(jax.device_put(vector, y_sharding)
+                  for vector in photon_g0_vectors),
+            layout, mesh_xy, axis_name="y")[0]
+        geometry = CoulombGeometry.from_wfn(wfn)
+        cubature = slab_minibz_photon_cubature(
+            get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))
+        V_packed, W_packed, head_completion = (
+            complete_static_slab_photon_q0(
+                V_packed, W_packed, response, g0_X, g0_Y, cubature,
+                mesh_xy=mesh_xy))
+        jax.block_until_ready((V_packed, W_packed))
+        sanity.refuse_nonfinite(
+            "charge-Hall completed static photon V", V_packed)
+        sanity.refuse_nonfinite(
+            "charge-Hall completed static photon W", W_packed)
+
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=current_contact,
-        head_completion=None,
+        head_completion=head_completion,
         current_model=STATIC_PHOTON_NO_PAIR_MODEL,
-        approximation="experimental_no_pair_bubble_screened_breit_v1",
+        approximation=(
+            "charge_hall_cubature_on_experimental_no_pair_body_v1"
+            if coupled_head
+            else "experimental_no_pair_bubble_screened_breit_v1"),
     )
 
 
