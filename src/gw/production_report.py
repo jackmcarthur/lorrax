@@ -20,6 +20,7 @@ from common.scientific_output import (
     abs_path,
     architecture_lines,
     band_range,
+    centroid_orbit_line,
     file_table_lines,
     numerical_environment_lines,
     policy,
@@ -225,10 +226,12 @@ class GWProductionReport:
             self.emit(f"{name:<26} = {state:<6} : "
                       f"{descriptions[name]} ({implementation})")
 
-    def sampling(self, *, wfn, sym) -> None:
+    def sampling(self, *, wfn, sym, centroids=None) -> None:
         self.heading("Crystal symmetry and Brillouin-zone sampling")
         for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
             self.emit(line)
+        if centroids is not None:
+            self.emit(centroid_orbit_line(centroids))
 
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
         b = band_slices

@@ -59,7 +59,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 from file_io import (
-    load_kin_ion_submatrix, load_centroids,
+    load_kin_ion_submatrix, load_centroid_basis,
 )
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
@@ -307,7 +307,13 @@ def main(argv=None):
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
 	sym = symmetry_maps.SymMaps(wfn)
-	_, centroid_indices, n_rmu = load_centroids(config.paths.centroids_file, wfn.fft_grid)
+	centroid_basis = load_centroid_basis(
+		config.paths.centroids_file, wfn.fft_grid, sym=sym)
+	centroid_indices = centroid_basis.centroid_indices
+	n_rmu = centroid_basis.n_rmu
+	# This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
+	# remains the one q-storage policy/table authority and deliberately
+	# remeasures through the same symmetry_maps service at its execution seam.
 	tmp_dir = os.path.join(input_dir, "tmp")
 	os.makedirs(tmp_dir, exist_ok=True)
 	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
@@ -394,7 +400,7 @@ def main(argv=None):
 	_zeta_ranges = zeta_fit_band_ranges(
 		band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
 	report.environment(config=config, wfn=wfn)
-	report.sampling(wfn=wfn, sym=sym)
+	report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis)
 	report.bands(
 		config=config, wfn=wfn, band_slices=band_slices,
 		zeta_ranges=_zeta_ranges)

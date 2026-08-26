@@ -39,7 +39,10 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     report.environment(
         params=params, wfn=wfn, eigh_backend="auto", batched_route="auto",
         diagnostics_policy="auto", diagnostics_enabled=False)
-    report.sampling(wfn=wfn, sym=sym)
+    centroids = SimpleNamespace(closure=SimpleNamespace(
+        closed=False, n_sym=2, n_violating=1, n_centroids=20,
+        tol=1.0e-5, worst_residual=0.25, worst_op=1))
+    report.sampling(wfn=wfn, sym=sym, centroids=centroids)
     result = {
         "band_start": 2, "nb_keep": 4, "nb_fit": 6,
         "n_guard_bands": 2, "nk_total": 8,
@@ -72,6 +75,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Returned bands : 3-6" in text
     assert "Fitted bands   : 3-8 (2 upper guard bands)" in text
     assert "Centroid sites : 20 logical; 20 mesh-padded" in text
+    assert "Centroid orbit: NOT CLOSED : 1/2 spatial operations" in text
+    assert "worst residual 2.50000e-01 at S02" in text
     assert "Galerkin basis : rank 12" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
     assert "Gram eigensolve: auto (other choices:" in text

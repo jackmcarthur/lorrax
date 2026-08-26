@@ -311,24 +311,11 @@ def resolve_galerkin_rank_multiplier(value) -> float:
 
 def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
     """Validate the ordered parent-to-child centroid row selection."""
-    idx = np.asarray(selection)
-    if idx.ndim != 1 or idx.dtype.kind not in "iu":
-        raise ValueError(
-            "htransform centroid subset must be a one-dimensional integer "
-            f"row list; got shape={idx.shape}, dtype={idx.dtype}.")
-    idx = idx.astype(np.int64, copy=False)
-    if idx.size == 0:
-        raise ValueError("htransform centroid subset may not be empty.")
-    if int(idx.min()) < 0 or int(idx.max()) >= int(n_parent):
-        raise ValueError(
-            "htransform centroid subset escapes its parent table: "
-            f"min/max={int(idx.min())}/{int(idx.max())}, parent rows="
-            f"{int(n_parent)}.")
-    if np.unique(idx).size != idx.size:
-        raise ValueError(
-            "htransform centroid subset contains duplicate parent rows; the "
-            "downfold basis must be a strict ordered subset.")
-    return idx
+    from file_io.centroids import validate_centroid_selection
+    try:
+        return validate_centroid_selection(selection, n_parent)
+    except ValueError as exc:
+        raise ValueError(f"htransform centroid subset: {exc}") from exc
 
 
 def _lowdin_orthonormalize_band_rows(ctilde: jax.Array):
@@ -1683,16 +1670,6 @@ def generate_kpath_from_qe_segments(params: dict, wfn) -> tuple[jnp.ndarray, np.
     return jnp.asarray(kpoints, dtype=jnp.float64), np.asarray(node_indices, dtype=int), labels
 
 
-def _load_centroids(centroids_path: str, fft_grid: tuple[int, int, int]) -> np.ndarray:
-    centroids_frac = np.loadtxt(centroids_path, ndmin=2)
-    if centroids_frac.size == 0:
-        raise ValueError(f"Centroids file {centroids_path} is empty")
-    fft_grid = np.asarray(fft_grid, dtype=int)
-    centroid_indices = np.round(centroids_frac * fft_grid).astype(int)
-    centroid_indices = np.mod(centroid_indices, fft_grid)
-    return centroid_indices
-
-
 def _shift_indices(n: int) -> jnp.ndarray:
     arr = jnp.arange(n, dtype=jnp.float64)
     return jnp.where(arr >= (n + 1) // 2, arr - n, arr)
@@ -1800,7 +1777,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None, return_full_proj: bool = False,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
-                    progress_fn=None):
+                    progress_fn=None, centroid_record_fn=None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1826,7 +1803,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     ``min_k ‖O[m,:]‖`` = 0.23…0.27 in the α-space overlap, and the on-grid
     tile null reads 1.267 against a 5.0e-02 bracket.
     """
-    from file_io.centroids import load_centroids as _shared_load_centroids
+    from file_io.centroids import load_centroid_basis
 
     input_dir = os.path.dirname(os.path.abspath(input_path))
 
@@ -1839,18 +1816,19 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     wfn_file = _resolve(params["wfn_file"])
     wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
-    _, centroid_indices, n_rmu = _shared_load_centroids(
-        centroid_path, tuple(int(x) for x in wfn.fft_grid))
+    centroid_basis = load_centroid_basis(
+        centroid_path, tuple(int(x) for x in wfn.fft_grid), sym=sym,
+        selection=centroid_subset_idx)
+    centroid_indices = centroid_basis.centroid_indices
+    n_rmu = centroid_basis.n_rmu
     if centroid_subset_idx is not None:
-        _n_parent = int(n_rmu)
-        _subset = validate_centroid_subset_idx(
-            centroid_subset_idx, _n_parent)
-        centroid_indices = np.asarray(centroid_indices)[_subset]
-        n_rmu = int(_subset.size)
         log_fn(
             f"  [reduced-galerkin] centroid fit born in the downfold basis: "
-            f"ordered parent subset {_n_parent} -> {n_rmu} rows.  No "
+            f"ordered parent subset {centroid_basis.source_n_rmu} -> "
+            f"{n_rmu} rows.  No "
             "parent-width B_at_mu or projected wavefunction is formed.")
+    if centroid_record_fn is not None:
+        centroid_record_fn(centroid_basis)
 
     nval = int(params["nval"])
     ncond = int(params["ncond"])
@@ -2627,10 +2605,12 @@ def main(argv=None):
     _setup_progress = LoopProgress(
         1, report.progress, title="wavefunction and Galerkin setup",
         item_name="stage", max_updates=1).start()
+    _centroid_records = []
     with timing.section("initialize_wfns"):
         wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
-            n_guard_bands=args.guard_bands, progress_fn=report.progress)
+            n_guard_bands=args.guard_bands, progress_fn=report.progress,
+            centroid_record_fn=_centroid_records.append)
     _setup_progress.step()
     _setup_progress.finish()
     # ── Galerkin-input gate ───────────────────────────────────────────
@@ -2667,7 +2647,12 @@ def main(argv=None):
         batched_route=distrib_la_batched_route,
         diagnostics_policy=args.fh_diagnostics,
         diagnostics_enabled=_diag_on)
-    report.sampling(wfn=wfn, sym=sym)
+    if len(_centroid_records) != 1:
+        raise RuntimeError(
+            "htransform initialize_wfns did not return exactly one centroid "
+            f"closure record; got {len(_centroid_records)}.")
+    report.sampling(
+        wfn=wfn, sym=sym, centroids=_centroid_records[0])
     _transform_progress = LoopProgress(
         1, report.progress, title="fH construction and path solution",
         item_name="stage", max_updates=1).start()

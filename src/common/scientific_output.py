@@ -47,6 +47,24 @@ def policy(value, choices: Iterable[str]) -> str:
             if alternatives else "auto")
 
 
+def centroid_orbit_line(loaded_centroids) -> str:
+    """Compact presentation of a canonical centroid-closure verdict."""
+    verdict = loaded_centroids.closure
+    n_sym = int(verdict.n_sym)
+    n_bad = int(verdict.n_violating)
+    n_sites = int(verdict.n_centroids)
+    tol = float(verdict.tol)
+    if bool(verdict.closed):
+        return (
+            f"Centroid orbit: CLOSED : {n_sym - n_bad}/{n_sym} spatial "
+            f"operations preserve {n_sites} sites (tol={tol:.5e})")
+    return (
+        f"Centroid orbit: NOT CLOSED : {n_bad}/{n_sym} spatial operations "
+        f"fail to preserve the {n_sites}-site set; worst residual "
+        f"{float(verdict.worst_residual):.5e} at S{int(verdict.worst_op) + 1:02d} "
+        f"(tol={tol:.5e})")
+
+
 def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
     """Compact rank/device/thread geometry from the canonical runtime facts."""
     facts = runtime.facts
@@ -212,6 +230,7 @@ __all__ = [
     "abs_path",
     "architecture_lines",
     "band_range",
+    "centroid_orbit_line",
     "clean_rounded",
     "file_table_lines",
     "numerical_environment_lines",

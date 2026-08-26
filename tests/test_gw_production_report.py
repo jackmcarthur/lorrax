@@ -103,7 +103,10 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     ]) / RYD_TO_EV
 
     report.environment(config=config, wfn=wfn)
-    report.sampling(wfn=wfn, sym=sym)
+    centroids = SimpleNamespace(closure=SimpleNamespace(
+        closed=True, n_sym=1, n_violating=0, n_centroids=399,
+        tol=1.0e-5, worst_residual=0.0, worst_op=0))
+    report.sampling(wfn=wfn, sym=sym, centroids=centroids)
     report.bands(config=config, wfn=wfn, band_slices=bands,
                  zeta_ranges=((0, 3), (1, 4)))
     sigma_result = SimpleNamespace(
@@ -146,6 +149,8 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "Coulomb system : 2D slab; Hartree source=auto" in text
     assert "Full BZ grid   : 2 k points" in text
     assert "Stored IBZ     : 2 k points" in text
+    assert ("Centroid orbit: CLOSED : 1/1 spatial operations preserve 399 "
+            "sites (tol=1.00000e-05)") in text
     assert "QP valence     : 2-2" in text
     assert "indices [" not in text
     assert "Energy origin   : E_F = +1.00000 eV (fixed-N mu)" in text

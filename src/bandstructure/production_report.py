@@ -12,6 +12,7 @@ from common.scientific_output import (
     abs_path,
     architecture_lines,
     band_range,
+    centroid_orbit_line,
     clean_rounded,
     file_table_lines,
     numerical_environment_lines,
@@ -119,10 +120,12 @@ class HTransformProductionReport:
             "ON via LORRAX_DEBUG_PRINT" if self.debug else
             "OFF (set LORRAX_DEBUG_PRINT=1 for kernel diagnostics)"))
 
-    def sampling(self, *, wfn, sym) -> None:
+    def sampling(self, *, wfn, sym, centroids=None) -> None:
         self.heading("Crystal symmetry and Brillouin-zone sampling")
         for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
             self.emit(line)
+        if centroids is not None:
+            self.emit(centroid_orbit_line(centroids))
 
     def interpolation_space(self, *, params, wfn, meta, result,
                             enk_sigma_ry, ctilde, centroid_file: str,
