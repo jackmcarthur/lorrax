@@ -25,6 +25,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
+
 
 _CHANNELS = range(4)
 _TERM_X = 0
@@ -452,7 +454,7 @@ def compute_static_photon_sigma(
             else head_diag[term][sector]
             for sector in range(3)])
          for term in range(3)])
-    components = jax.device_put(
+    components = device_put_process_local(
         components, NamedSharding(mesh_xy, P(None, None, None, None)))
     components.block_until_ready()
     direct_total = jnp.stack([

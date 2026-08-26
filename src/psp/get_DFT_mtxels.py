@@ -92,7 +92,6 @@ _services.ensure_on_path()
 # the try arm raises on every interpreter and the fallback is the only
 # live code.  The service door is reached by ONE absolute import, and a
 # dual spelling of it would be two module objects waiting to happen.
-import symmetry_maps                                            # noqa: E402
 
 
 def report_devices(print_fn=print) -> None:
@@ -1104,7 +1103,7 @@ def main(argv=None):
     # Initialize symmetry mappings
     print("\nInitializing symmetry mappings...")
     with timing.section("psp.get_DFT_mtxels.symmetry"):
-        sym = symmetry_maps.SymMaps(wfn)
+        sym = wfn.symmetry()
     print(f"  Success: {sym.nk_tot} total k-points, {sym.nk_red} irreducible k-points")
     
     # Get band ranges

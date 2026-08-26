@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
 
 
@@ -200,12 +201,12 @@ def require_charge_hall_cubature_response(
 
 
 def _replicated(value, mesh: Mesh, *, dtype):
-    return jax.device_put(
+    return device_put_process_local(
         np.asarray(value, dtype=dtype), NamedSharding(mesh, P()))
 
 
 def _channel_zeros(nq: int, extent: int, mesh: Mesh, axis: str):
-    return jax.device_put(
+    return device_put_process_local(
         np.zeros((int(nq), int(extent)), dtype=np.complex128),
         NamedSharding(mesh, P(None, axis)))
 
@@ -302,7 +303,7 @@ def build_charge_hall_cubature_response(
     # At static imaginary frequency the Adler--Wiser weight is real, hence
     # the two incumbent wing orientations obey Z[b,mu]=conj(Y[b,mu]).  Move
     # only this O(N_mu) vector to Y sharding for a scalar certificate.
-    charge_z_x = jax.device_put(
+    charge_z_x = device_put_process_local(
         charge_z, NamedSharding(mesh, P(None, "x")))
     wing_delta = jnp.max(jnp.abs(charge_y - jnp.conj(charge_z_x)))
     wing_scale = jnp.maximum(

@@ -200,11 +200,6 @@ from .production_output import (
     format_kmeans_report,
     prune_band_ranges,
 )
-# Reachable through the one service-path bootstrap above; gated by
-# tests/test_service_path_bootstrap.py.
-import symmetry_maps                                            # noqa: E402
-
-
 def _release_lloyd_before_prune(*arrays) -> None:
     """Synchronize and release completed Lloyd state before WFN pruning."""
     def _bytes_in_use():
@@ -318,8 +313,6 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
     """
     if args.no_orbit:
         return None, None, None, 1, False
-    from ffi import _services
-    _services.ensure_on_path()
     from symmetry_maps import real_space_action_tables
     R, Rinv, tau = real_space_action_tables(
         wfn, sym, charge_density=charge_density)
@@ -391,8 +384,6 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         # matching centroid_source_map_and_wrap and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
         # for Si Fd-3m.
-        from ffi import _services
-        _services.ensure_on_path()
         from symmetry_maps import unfold_orbit_unique_with_id
         unfolded, orbit_id = unfold_orbit_unique_with_id(
             reps_snapped, np.asarray(Rinv), np.asarray(tau))
@@ -505,7 +496,7 @@ def main():
 
     with timing.section("setup.wfn_io"):
         wfn = WfnLoader("WFN.h5")
-        sym = symmetry_maps.SymMaps(wfn)
+        sym = wfn.symmetry()
 
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)

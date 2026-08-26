@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from common.shard_map import shard_map
 from common.units import RYD_TO_EV
 
@@ -1172,7 +1173,7 @@ def static_slab_photon_head_moment_chunk(
     H_hall = static_hall_linear_response(sigma_H)
     S_sharding = getattr(S_quadratic, "sharding", None)
     if isinstance(S_sharding, NamedSharding):
-        H_hall = jax.device_put(
+        H_hall = device_put_process_local(
             H_hall, NamedSharding(S_sharding.mesh, P()))
     result = _static_slab_photon_head_moment_chunk(
         q_cart, D_raw, H_hall, S_quadratic,

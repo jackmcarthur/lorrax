@@ -568,7 +568,7 @@ def apply_eqp_corrections(
 
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import SymMaps, unfold_file_wedge_to_full_bz
+    from symmetry_maps import unfold_file_wedge_to_full_bz
     from wfn_loader import WfnLoader
 
     # 3-tuple: this consumer's band axis is already LOCAL to the deck's
@@ -580,7 +580,7 @@ def apply_eqp_corrections(
     nk_full, nb_full = enk_full.shape
 
     wfn = WfnLoader(_parse_wfn_path(input_file))
-    sym = SymMaps(wfn)
+    sym = wfn.symmetry()
     if sym.nk_tot != nk_full:
         raise ValueError(
             f"apply_eqp_corrections: enk_full has {nk_full} k-points but the "

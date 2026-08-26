@@ -856,6 +856,8 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
     wfn = SimpleNamespace(
         energies=energies_file,
         occs=occupations_file,
+        kpoints=np.zeros((1, 1, 3), dtype=np.float64),
+        nelec=2,
         nbands=logical,
         nspin=1,
         nspinor=2,

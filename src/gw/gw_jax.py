@@ -137,7 +137,6 @@ from .gw_output import (
 	write_qsgw_qp_ladders,
 	write_results,
 )
-import symmetry_maps                                            # noqa: E402
 
 
 def _setup_runtime() -> None:
@@ -351,7 +350,7 @@ def main(argv=None):
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
-	sym = symmetry_maps.SymMaps(wfn)
+	sym = wfn.symmetry()
 	centroid_basis = load_centroid_basis(
 		config.paths.centroids_file, wfn.fft_grid, sym=sym)
 	centroid_indices = centroid_basis.centroid_indices
