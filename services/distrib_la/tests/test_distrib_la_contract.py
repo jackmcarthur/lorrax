@@ -1481,8 +1481,12 @@ def check_compute_wfns_fi_backend(mesh, backend, dtype="complex128"):
         ref = compute_wfns_fi(eigh_backend="off", **kw)
         got = compute_wfns_fi(eigh_backend=backend, **kw)
 
-    lam_r, lam_g = np.asarray(ref.lam_fi), np.asarray(got.lam_fi)
-    e_r, e_g = np.asarray(ref.enk_full), np.asarray(got.enk_full)
+    # These arrays span every process on the real 2x2 CLI leg.  np.asarray
+    # is valid for the 1x1 pytest fixture but refuses non-addressable shards;
+    # use the suite's process-aware gather so this advertised multi-rank
+    # production-wiring check really runs there too.
+    lam_r, lam_g = _gather(ref.lam_fi), _gather(got.lam_fi)
+    e_r, e_g = _gather(ref.enk_full), _gather(got.enk_full)
     dlam = float(np.max(np.abs(lam_r - lam_g)))
     de = float(np.max(np.abs(e_r - e_g)))
     assert dlam < 1e-10, f"{backend}: fH_q eigenvalues differ by {dlam:.3e}"
@@ -1492,7 +1496,7 @@ def check_compute_wfns_fi_backend(mesh, backend, dtype="complex128"):
         p = np.asarray(psi).reshape(psi.shape[0], psi.shape[1], -1)
         return np.einsum("qni,qnj->qij", p, np.conj(p))
 
-    D_r, D_g = _dm(ref.psi_rmu_Y), _dm(got.psi_rmu_Y)
+    D_r, D_g = _dm(_gather(ref.psi_rmu_Y)), _dm(_gather(got.psi_rmu_Y))
     dpsi = float(np.max(np.abs(D_r - D_g)) / max(np.max(np.abs(D_r)), 1e-300))
     assert dpsi < 1e-9, \
         f"{backend}: window density matrix differs from native by {dpsi:.3e}"

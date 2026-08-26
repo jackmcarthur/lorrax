@@ -74,7 +74,10 @@
 #   LORRAX_FFI_EXPECT_PEER_SO      the OTHER leg's library.  When named, GATE 7
 #                                  runs across the pair, which is where a
 #                                  SOVERSION split between the legs shows up.
-#   LORRAX_FFI_EXPECT_MPI          expected libmpi SONAME fragment (GATE 1).
+#   LORRAX_FFI_EXPECT_MPI          expected libmpi SONAME fragment (GATE 1),
+#                                  or `none` for a deliberately MPI-free
+#                                  closure (for example NCCL-only cuSOLVERMp
+#                                  with neither phdf5 nor SLATE).
 #   LORRAX_FFI_EXPECT_ABI          expected handler-signature ABI.  Defaults to
 #                                  this source tree's
 #                                  src/ffi/cpp/common/lorrax_ffi_abi.h.

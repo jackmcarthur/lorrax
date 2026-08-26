@@ -1,0 +1,65 @@
+help([[
+LORRAX experimental bare-host CUDA 13.2 lane for Perlmutter.
+
+Python/JAX: private venv with JAX 0.9.1's cuda13-local plugin.
+CUDA:       NERSC cudatoolkit/13.2 and NVHPC math/communication libraries.
+FFI:        cuSOLVERMp 0.9.1 + cuBLASMp 0.10 + cuFFT.
+
+This lane intentionally has no device SLATE or parallel-HDF5 handlers yet.
+It disables Cray MPICH GPU support because the current GTL module is linked
+to CUDA 12; cuSOLVERMp communicates through NCCL instead.
+
+Use with: LX_BASE_MODULE=@MODULE_NAME@ lx run -G 4 -n 4 <command>
+]])
+
+whatis("Name: LORRAX CUDA 13 module lane")
+whatis("CUDA: NERSC cudatoolkit/13.2 (bare host)")
+whatis("FFI: cuSOLVERMp 0.9.1, cuBLASMp 0.10, cuFFT")
+family("lorrax")
+
+depends_on("@PYTHON_MODULE@")
+depends_on("@TOOLKIT_MODULE@")
+
+local root = "@ROOT@"
+local venv = "@VENV@"
+local cuda = "@CUDA@"
+local ffi = "@FFI@"
+local runtime_ld = "@RUNTIME_LD@"
+local pythonpath = "@PYTHONPATH@"
+local runtime_path = venv .. "/bin:" .. cuda .. "/bin:/usr/bin:/bin"
+
+prepend_path("PATH", venv .. "/bin")
+prepend_path("PATH", cuda .. "/bin")
+prepend_path("PYTHONPATH", root .. "/src")
+prepend_path("PYTHONPATH", root .. "/services/distrib_la/src")
+for path in string.gmatch(runtime_ld, "([^:]+)") do
+    prepend_path("LD_LIBRARY_PATH", path)
+end
+
+setenv("LORRAX_ROOT", root)
+setenv("LORRAX_FFI_SO", ffi)
+setenv("LORRAX_FFI_EXPECT_BACKENDS", "cusolvermp,cublasmp,cufft")
+setenv("LORRAX_MPI_TYPE", "cray_shasta")
+setenv("LORRAX_MPICH_GPU_SUPPORT", "0")
+setenv("MPICH_GPU_SUPPORT_ENABLED", "0")
+setenv("CUDA_HOME", cuda)
+setenv("JAX_PLATFORMS", "cuda")
+setenv("JAX_ENABLE_X64", "1")
+setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+-- `lx` treats this variable as an argv prefix.  It is named SHIFTER for
+-- historical reasons, but `env` is a valid non-container prefix and lets the
+-- existing select_gpu.sh + in_container.sh launch composition stay intact.
+setenv("LORRAX_SHIFTER", table.concat({
+    "env",
+    "PATH=" .. runtime_path,
+    "PYTHONPATH=" .. pythonpath,
+    "LD_LIBRARY_PATH=" .. runtime_ld,
+    "CUDA_HOME=" .. cuda,
+    "LORRAX_FFI_SO=" .. ffi,
+    "LORRAX_MPICH_GPU_SUPPORT=0",
+    "MPICH_GPU_SUPPORT_ENABLED=0",
+    "JAX_PLATFORMS=cuda",
+    "JAX_ENABLE_X64=1",
+    "XLA_PYTHON_CLIENT_PREALLOCATE=false"
+}, " "))

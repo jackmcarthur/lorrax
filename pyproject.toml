@@ -60,14 +60,18 @@ docs = [
 # CPU-ONLY installs need NEITHER extra: the base `jax`/`jaxlib` dependency is
 # the CPU build, which is what the host-platform FFI leg runs against.
 #
-# NEITHER EXTRA APPLIES TO THE PERLMUTTER *GPU* LEG, and the row above is
-# about a bare-host pip install there, not about how that leg actually runs.
-# It runs inside Shifter, where jax and its CUDA plugin come from the image
-# (`config/perlmutter/site_config.sh`), nothing is pip-installed, and the
-# image is CUDA **12**.9 with `jax_cuda12_plugin` — because the device FFI
-# .so links CUDA 12 and no image in this family pairs CUDA 12 with jax >= 0.9.
+# The production Perlmutter Shifter leg uses NEITHER bundled extra: jax and
+# its plugin come from the image (`config/perlmutter/site_config.sh`), whose
+# device FFI is CUDA 12.  The experimental bare-host lane deliberately uses
+# `cuda13-local` below so JAX consumes `cudatoolkit/13.2` instead of pulling a
+# second toolkit into the venv; see config/perlmutter/cuda13_module/.
 cuda12 = ["jax[cuda12]>=0.7.0,<0.10.0"]
 cuda13 = ["jax[cuda13]>=0.7.0,<0.10.0"]
+# System-toolkit variant: installs the CUDA-13 JAX plugin but not pip's copy
+# of the CUDA runtime.  This is the Perlmutter bare-host module lane under
+# config/perlmutter/cuda13_module; CUDA_HOME/LD_LIBRARY_PATH supply the NERSC
+# toolkit, math libraries, NCCL, and the deliberately staged cuDNN DSO.
+cuda13-local = ["jax[cuda13-local]>=0.7.0,<0.10.0"]
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"

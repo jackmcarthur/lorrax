@@ -33,6 +33,7 @@
 #include "../common/ffi_helpers.h"
 #include "../cusolvermp/ctx.h"
 #include "cublasmp_interface.h"
+#include "compat.h"
 
 namespace lorrax_ffi::cublasmp_batched_gemm {
 
@@ -127,12 +128,12 @@ static ffi::Error BatchedGemmImpl(
         cublasMpMatmulDescriptorCreate(&matmulDesc, mp::ComputeTypeOf<T>::value),
         "cublasMpMatmulDescriptorCreate");
     LORRAX_CUBLASMP_CHECK(
-        cublasMpMatmulDescriptorAttributeSet(
+        lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(
             matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,
             &opA, sizeof(opA)),
         "cublasMpMatmulDescriptorAttributeSet(TRANSA)");
     LORRAX_CUBLASMP_CHECK(
-        cublasMpMatmulDescriptorAttributeSet(
+        lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(
             matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,
             &opB, sizeof(opB)),
         "cublasMpMatmulDescriptorAttributeSet(TRANSB)");

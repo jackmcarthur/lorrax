@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # ===========================================================================
 # Post-link gate (hazard S3): EXACTLY ONE cray-mpich runtime object may be
-# mapped into the process.  Two libmpi means MPI_COMM_WORLD and the MPI_Comm
-# handed to Csys2blacs_handle mean different things in different frames; it
-# links fine and corrupts or hangs at the first collective.
+# mapped into an MPI-enabled process.  Two libmpi means MPI_COMM_WORLD and
+# the MPI_Comm handed to Csys2blacs_handle mean different things in different
+# frames; it links fine and corrupts or hangs at the first collective.
+#
+# A deliberately MPI-free artifact can pass with expected-variant `none`.
+# This is not an opt-out: the gate still resolves the complete closure and
+# fails if any libmpi appears.  The Perlmutter CUDA-13 cuSOLVERMp lane uses
+# this contract because its distributed backend communicates through NCCL
+# and it builds neither parallel HDF5 nor SLATE.
 #
 #   usage: gate_one_mpi.sh <so-file> [expected-variant]
 #
@@ -71,6 +77,16 @@ fi
 mapfile -t MPI_PATHS < <(printf %s\\n "$LDD_OUT" \
     | sed -n "s|.*=> \\(/[^ ]*\\).*|\\1|p" \
     | grep -E "/libmpi(_gnu_[0-9]+)?\\.so" || true)
+
+if [[ "$EXPECT" == none ]]; then
+    if [[ ${#MPI_PATHS[@]} -ne 0 ]]; then
+        echo "[$TAG] GATE FAILED (S3): expected an MPI-free closure, but found:" >&2
+        printf '%s\n' "${MPI_PATHS[@]}" | sed "s/^/[$TAG]   /" >&2
+        exit 1
+    fi
+    echo "[$TAG] GATE 1 (S3, MPI-free closure) PASSED: no libmpi mapped"
+    exit 0
+fi
 
 if [[ ${#MPI_PATHS[@]} -eq 0 ]]; then
     echo "[$TAG] GATE FAILED (S3): no libmpi in the closure of $SO" >&2
