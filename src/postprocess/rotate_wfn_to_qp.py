@@ -5,7 +5,7 @@ Rotate DFT wavefunctions to QP basis using rotation matrices from COHSEX.
 This script:
 1. Reads WFN.h5 (DFT wavefunctions in reduced BZ)
 2. Reads qp_wfn_rotations.h5 (rotation matrices U and QP energies from COHSEX)
-3. Rotates wavefunction coefficients: c_qp[n,G] = Σ_m conj(U[k,m,n]) * c_dft[m,G]
+3. Rotates wavefunction coefficients: c_qp[n,G] = Σ_m U[k,m,n] * c_dft[m,G]
 4. Writes WFN_qp.h5 with rotated coefficients and updated energies
 
 Usage:

@@ -52,14 +52,8 @@ from common.fft_helpers import (
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
-from common.collectives import gather_to_host
+from common.collectives import device_put_process_local, gather_to_host
 from common.sharding_fit import padded_extent as _pad_to
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
-import symmetry_maps                                            # noqa: E402
 
 
 def _build_mesh_xy() -> Mesh:
@@ -882,16 +876,17 @@ def resolve_qp_hamiltonian_state(
             f"{worst_k:.3e}).")
 
     # The Galerkin owner defines the compact state's global placement.  The
-    # energy table can still arrive on each process's local default device,
-    # so put it and both small QP companions in that incumbent placement
-    # before entering one multi-host JIT.
+    # energy table and both QP companions arrive as identical host arrays on
+    # every process, so place each process's incumbent shards without JAX's
+    # hidden cross-process equality/all-gather transport before entering the
+    # one multi-host JIT.
     state_sharding = ctilde.sharding
-    enk_dev = jax.device_put(
+    enk_dev = device_put_process_local(
         np.asarray(enk_sigma, dtype=np.dtype(enk_sigma.dtype)),
         state_sharding)
-    U_dev = jax.device_put(
+    U_dev = device_put_process_local(
         np.asarray(U, dtype=np.dtype(ctilde.dtype)), state_sharding)
-    E_dev = jax.device_put(
+    E_dev = device_put_process_local(
         np.asarray(E, dtype=np.dtype(enk_sigma.dtype)),
         state_sharding)
     ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
@@ -919,7 +914,7 @@ def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # band-sharding ψ instead of replicating the whole WFN on every rank.
     # Single-process / no-mesh transparently stays eager.
     wfn = WfnLoader(wfn_file, mesh=mesh_xy)
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
     return wfn, sym
 
 
