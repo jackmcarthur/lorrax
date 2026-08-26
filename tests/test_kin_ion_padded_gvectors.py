@@ -200,6 +200,55 @@ def test_fractional_hartree_receipt_checks_support_and_wfn_both_directions(
             print_fn=lambda *_args: None)
 
 
+def test_live_hartree_receipt_reuses_exact_loaded_wfn_binding(
+        tmp_path, monkeypatch):
+    """The live GW gate must not rescan a WFN already bound by gw_init."""
+    import h5py
+    from types import SimpleNamespace
+    from common import parallel_transport
+    from file_io import kin_ion as owner
+
+    path = tmp_path / "kin_ion_bound_wfn.h5"
+    fingerprint = "c" * 64
+    scans = []
+    monkeypatch.setattr(
+        parallel_transport, "wfn_fingerprint",
+        lambda source: (scans.append(source), fingerprint)[1])
+    wfn = SimpleNamespace(
+        occupations_are_exact_integer=False,
+        num_electrons=1.25,
+        physical_density_band_stop=4)
+    binding = parallel_transport.bind_wfn_fingerprint(wfn)
+    assert scans == [wfn]
+
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
+        ds.attrs["bispinor"] = False
+        ds.attrs["wfn_fingerprint_scheme"] = (
+            parallel_transport.WFN_FINGERPRINT_SCHEME)
+        ds.attrs["wfn_fingerprint"] = fingerprint
+        ds.attrs["exact_hartree_occupation_policy"] = (
+            owner.HARTREE_OCCUPATION_POLICY)
+        ds.attrs["exact_hartree_expected_electrons"] = 1.25
+        ds.attrs["exact_hartree_density_band_stop"] = 4
+        vh = h5.create_dataset(
+            owner.HARTREE_DATASET,
+            data=np.zeros((1, 2, 2), dtype=np.complex128))
+        vh.attrs["density_band_stop"] = 4
+
+    def refuse_rescan(_source):
+        raise AssertionError("live Hartree validation rescanned the WFN")
+
+    monkeypatch.setattr(
+        parallel_transport, "wfn_fingerprint", refuse_rescan)
+    owner.validate_kin_ion_against_run(
+        path, expected_bispinor=False, selected_hartree_source="stored",
+        wfn=wfn, wfn_fingerprint_binding=binding,
+        print_fn=lambda *_args: None)
+    assert scans == [wfn]
+
+
 # D10's gate.  Bit-exactness is explicitly NOT required: appending exact
 # zeros cannot change a sum in IEEE-754, but a shape change does move
 # XLA's choice of reduction BLOCKING, so the two routes may associate the

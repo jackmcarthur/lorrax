@@ -1338,9 +1338,8 @@ def make_eqp_bgw(
 	#
 	# Reading the attribute is the only supported discriminator — never
 	# infer it from magnitudes (``file_io.kin_ion`` module docstring).
-	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
-	# kin_ion read above, which is the same lazy import for the same
-	# reason.
+	# ``_src`` / ``HARTREE_DATASET`` came in with the kin_ion read above,
+	# which is the same lazy import for the same reason.
 	vh_exact = None
 	hartree_already_resolved = False
 	receipt_c_at_dft = None
