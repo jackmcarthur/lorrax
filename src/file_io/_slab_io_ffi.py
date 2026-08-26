@@ -578,22 +578,32 @@ def _probe_mpi_world_size():
             if not flag.value:
                 return None, f"{label}: MPI not initialized at this point"
             size = ctypes.c_int(-1)
+            # ABI is detected by SYMBOL PRESENCE, never by trial call: with
+            # the flavours swapped, MPI_Comm_size does not return an error —
+            # Open MPI dereferences the MPICH integer handle 0x44000000 as a
+            # pointer and SEGFAULTS (measured: Ubuntu OpenMPI 4.1/libmpi.so.40,
+            # cloud-lane bring-up 2026-08-26, crash in MPI_Comm_size+0x3c
+            # "Address not mapped").  ompi_mpi_comm_world existing in the
+            # library is what makes it Open MPI; its absence is what permits
+            # the MPICH-handle call.
+            try:
+                addr = ctypes.addressof(
+                    ctypes.c_void_p.in_dll(lib, "ompi_mpi_comm_world"))
+            except (ValueError, AttributeError):
+                addr = None
+            if addr is not None:
+                # Open MPI ABI: MPI_COMM_WORLD is &ompi_mpi_comm_world.
+                if lib.MPI_Comm_size(ctypes.c_void_p(addr),
+                                     ctypes.byref(size)) == 0 \
+                        and size.value > 0:
+                    return size.value, f"{label}, Open MPI ABI"
+                last = f"{label}: MPI_Comm_size returned no usable size (Open MPI ABI)"
+                continue
             # MPICH ABI: MPI_COMM_WORLD is the integer handle 0x44000000.
             comm = ctypes.c_int(0x44000000)
             if lib.MPI_Comm_size(comm, ctypes.byref(size)) == 0 \
                     and size.value > 0:
                 return size.value, f"{label}, MPICH ABI"
-            # Open MPI ABI: MPI_COMM_WORLD is &ompi_mpi_comm_world.
-            try:
-                addr = ctypes.addressof(
-                    ctypes.c_void_p.in_dll(lib, "ompi_mpi_comm_world"))
-                size2 = ctypes.c_int(-1)
-                if lib.MPI_Comm_size(ctypes.c_void_p(addr),
-                                     ctypes.byref(size2)) == 0 \
-                        and size2.value > 0:
-                    return size2.value, f"{label}, Open MPI ABI"
-            except (ValueError, AttributeError):
-                pass
             last = f"{label}: MPI_Comm_size returned no usable size"
         except (AttributeError, OSError) as e:
             last = f"{label}: {type(e).__name__}: {e}"
