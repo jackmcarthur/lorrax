@@ -36,6 +36,7 @@ from runtime.padding import round_up, spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
     fit_galerkin_basis,
+    galerkin_rank_record,
     read_galerkin_basis,
     validate_rank_multiplier,
     write_galerkin_basis,
@@ -198,6 +199,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         log_fn(
             f"  [galerkin-restart] reused physical rank "
             f"{basis.rank_physical} in carried extent {basis.rank_carrier}")
+        if rank_record_fn is not None:
+            rank_record_fn(galerkin_rank_record(
+                basis, meta=meta, rank_multiplier=rank_multiplier))
         return basis
 
     # The whole-state ledger describes allocations made *after this point*.
