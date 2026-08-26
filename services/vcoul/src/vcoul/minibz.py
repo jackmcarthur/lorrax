@@ -87,6 +87,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from vcoul.quadrature import gauss_legendre_interval
+
 __all__ = [
     "COULOMB_GAUGE_TT_SIGN",
     "apply_transverse_projector",
@@ -633,7 +635,12 @@ def _clip_polygon_half_plane(
 
 
 def _slab_minibz_wigner_seitz_polygon(bvec, kgrid):
-    """Return the true mini-lattice WS polygon, lattice rows, and area."""
+    """Return the true mini-lattice WS polygon, lattice rows, and area.
+
+    ``bvec`` has already passed the canonical :class:`vcoul.Slab2D`
+    orientation check.  This geometry helper owns only the two-dimensional
+    Voronoi construction and deliberately makes no second slab decision.
+    """
     bvec = np.asarray(bvec, dtype=np.float64)
     kg = tuple(int(v) for v in kgrid)
     if bvec.shape != (3, 3):
@@ -647,21 +654,6 @@ def _slab_minibz_wigner_seitz_polygon(bvec, kgrid):
             f"kgrid={kg}")
     if not np.all(np.isfinite(bvec)):
         raise ValueError("slab polygon cubature requires finite bvec rows")
-    in_plane_scale = max(
-        float(np.linalg.norm(bvec[0, :2])),
-        float(np.linalg.norm(bvec[1, :2])), 1.0)
-    if max(abs(float(bvec[0, 2])), abs(float(bvec[1, 2]))) > (
-            1.0e-12 * in_plane_scale):
-        raise ValueError(
-            "slab polygon cubature requires b1 and b2 to lie in the "
-            "Cartesian xy plane used by the slab Coulomb kernel")
-    b3_scale = max(in_plane_scale, abs(float(bvec[2, 2])), 1.0)
-    if (abs(float(bvec[2, 2]))
-            <= 128.0 * np.finfo(np.float64).eps * b3_scale
-            or np.linalg.norm(bvec[2, :2]) > 1.0e-12 * b3_scale):
-        raise ValueError(
-            "slab polygon cubature requires a finite nonzero b3 directed "
-            "along Cartesian z")
 
     # The mini reciprocal lattice itself owns the Voronoi cell.  Reducing a
     # parent-cell WS polygon and scaling it afterward is wrong on an
@@ -738,9 +730,7 @@ def _slab_minibz_polygon_rule(polygon, polygon_area, order):
     interior to ``(0,1)``, so the singular point itself is never evaluated.
     """
     n = int(order)
-    nodes, weights = np.polynomial.legendre.leggauss(n)
-    unit_nodes = 0.5 * (nodes + 1.0)
-    unit_weights = 0.5 * weights
+    unit_nodes, unit_weights = gauss_legendre_interval(n, 0.0, 1.0)
     r, s = np.meshgrid(unit_nodes, unit_nodes, indexing="ij")
     wr, ws = np.meshgrid(unit_weights, unit_weights, indexing="ij")
     q_parts = []
