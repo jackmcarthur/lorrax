@@ -203,7 +203,7 @@ def _make_per_q_v_builder_for_tile(
         i, j = mu_L - 1, nu_L - 1
         from ffi import _services
         _services.ensure_on_path()
-        from vcoul import COULOMB_GAUGE_TT_SIGN
+        from vcoul import COULOMB_GAUGE_TT_SIGN, transverse_projector
         tt_metric_sign = float(COULOMB_GAUGE_TT_SIGN)
     bvec_f = np.asarray(bvec, dtype=np.float64)
 
@@ -238,9 +238,8 @@ def _make_per_q_v_builder_for_tile(
         K_cart = np.einsum('ba,qbg->qag', bvec_f, qG_frac)
         K2 = np.sum(K_cart * K_cart, axis=1)             # (n_q, ngkmax)
         is_gamma_slot = K2 <= eps_K2                     # unique (q=Γ,G=0)
-        K2_safe = np.where(is_gamma_slot, 1.0, K2)
-        Khat_ij = K_cart[:, i] * K_cart[:, j] / K2_safe
-        t = (1.0 - Khat_ij) if i == j else -Khat_ij
+        t = transverse_projector(
+            np.moveaxis(K_cart, 1, -1), K2, eps_K2=eps_K2)[:, :, i, j]
         # Assemble the positive transverse-projector weight first so the
         # finite-q body and optional mini-BZ replacement share one, and only
         # one, Coulomb-gauge spatial-metric sign below.  Stored currents use
