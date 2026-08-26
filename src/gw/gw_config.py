@@ -1164,7 +1164,8 @@ _DEFAULTS = {
     # See file_io/kin_ion.py's module docstring for the full contract and
     # the scorecard's S.5 table for the accuracy each buys.
     "hartree_source": "auto",
-    # Three human-readable text outputs (always written):
+    # Three human-readable text outputs (always written), plus one opt-in
+    # fixed-Sigma eigenvalue-self-consistent QP ladder:
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
     #   eqp0.dat       — BGW-format zeroth-order QP energies.
     #   eqp1.dat       — BGW-format Z-linearized QP energies (Z=1 in
@@ -1175,6 +1176,7 @@ _DEFAULTS = {
     "sigma_diag_file": "sigma_diag.dat",
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
+    "eqp2_file": "eqp2.dat",
     # Rank-zero, human-readable calculation report.  This is the clean
     # application output; launcher placement and rank-binding diagnostics
     # remain in the launcher's own log.
@@ -1372,6 +1374,15 @@ _DEFAULTS = {
     "sc_eigh": "auto",           # auto | native | distributed (per-iteration
                                  # eigh of the (nk, nb, nb) carry; a LAYOUT
                                  # choice, independent of the physics knobs)
+    # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
+    # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
+    # already-computed full Sigma_c(omega) table: W, screening, and Sigma
+    # diagrams are never recomputed.  The 1 meV default is a max|dE| test.
+    "write_eqp2": False,
+    "eqp2_tol_ev": 1.0e-3,
+    "eqp2_max_iter": 20,
+    "eqp2_accelerator": "rcrop",  # rcrop | linear (Picard)
+    "eqp2_history_depth": 5,
     "use_ppm_sigma": False,
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
@@ -2861,6 +2872,7 @@ class FilePaths:
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
+    eqp2_file: str
     report_file: str
     sigma_omega_h5_file: str
 
@@ -3437,6 +3449,35 @@ class SCConfig:
 
 
 @dataclass(frozen=True)
+class EQP2Config:
+    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file.
+
+    This is deliberately separate from :class:`SCConfig`: it does not
+    rebuild G, chi0, W, or Sigma.  It repeatedly evaluates and rotates the
+    one-shot full-matrix Sigma(omega) table, diagonalizes the resulting QP
+    Hamiltonian, and tests the worst eigenvalue change in eV.
+    """
+
+    enabled: bool = False
+    tol_ev: float = 1.0e-3
+    max_iter: int = 20
+    accelerator: str = "rcrop"
+    history_depth: int = 5
+
+    def __post_init__(self):
+        if self.tol_ev <= 0.0:
+            raise ValueError("eqp2_tol_ev must be > 0.")
+        if self.max_iter < 1:
+            raise ValueError("eqp2_max_iter must be >= 1.")
+        if self.accelerator not in ("rcrop", "linear"):
+            raise ValueError(
+                "eqp2_accelerator must be 'rcrop' or 'linear'; got "
+                f"{self.accelerator!r}.")
+        if self.history_depth < 1:
+            raise ValueError("eqp2_history_depth must be >= 1.")
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     """Per-device memory budget + chunk sizing + AOT chunk-chooser flag.
 
@@ -3762,6 +3803,7 @@ class LorraxConfig:
     ppm: PPMConfig
     mpa: MPAConfig
     sc: SCConfig
+    eqp2: EQP2Config
     memory: MemoryConfig
     backend: BackendConfig
     debug: DebugConfig
@@ -3787,6 +3829,19 @@ class LorraxConfig:
     def __post_init__(self):
         """Refuse metallic and head settings outside their landed scope."""
         _validate_metal_compute_mode(self)
+        if self.eqp2.enabled:
+            if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
+                raise ValueError(
+                    "write_eqp2=true is an additional fixed-Sigma result "
+                    "for qp_solver=one_shot_dft; it cannot be combined with "
+                    f"qp_solver={self.qp_solver.value}.  Use one_shot_dft, "
+                    "or disable write_eqp2 and choose fixed_point / "
+                    "self_consistent as the primary QP treatment.")
+            if not self.compute_mode.is_dynamic:
+                raise ValueError(
+                    "write_eqp2=true requires a dynamic full-matrix "
+                    "Sigma_c(omega) table; choose compute_mode=gn_ppm, "
+                    "hl_ppm, or mpa, or disable write_eqp2.")
         if (self.qp_solver is QPSolver.SELF_CONSISTENT
                 and self.head.correction is HeadCorrection.OFF
                 and self.sc.head_update != "off"):
@@ -4123,6 +4178,7 @@ class LorraxConfig:
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
+            eqp2_file=str(_g("eqp2_file")),
             report_file=str(_g("report_file")),
             sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
         )
@@ -4217,13 +4273,30 @@ class LorraxConfig:
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
         )
+        _eqp2_enabled = bool(_g("write_eqp2"))
+        _sigma_omega_layout = str(
+            _g("sigma_omega_layout")).strip().lower()
+        if _eqp2_enabled and _sigma_omega_layout != "sharded":
+            if "sigma_omega_layout" in _named_keys:
+                raise ValueError(
+                    "write_eqp2=true requires sigma_omega_layout=sharded; "
+                    "the full Sigma(omega,k,m,n) cube is the fixed operand "
+                    "of every eqp2 iteration and may not be replicated on "
+                    "each rank.  Set sigma_omega_layout=sharded or disable "
+                    "write_eqp2.")
+            _sigma_omega_layout = "sharded"
+            print_fn(
+                "  [config provenance] write_eqp2=true: resolving the "
+                "unnamed sigma_omega_layout default replicated -> sharded; "
+                "the fixed full Sigma(omega) cube stays distributed through "
+                "every eigenvalue-consistency iteration.")
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
-            omega_layout=str(_g("sigma_omega_layout")).strip().lower(),
+            omega_layout=_sigma_omega_layout,
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
@@ -4299,6 +4372,13 @@ class LorraxConfig:
             # new knob must not add one.
             eigh=str(_g("sc_eigh")).strip().lower(),
             head_update=str(_g("sc_head_update")).strip().lower(),
+        )
+        eqp2 = EQP2Config(
+            enabled=_eqp2_enabled,
+            tol_ev=float(_g("eqp2_tol_ev")),
+            max_iter=int(_g("eqp2_max_iter")),
+            accelerator=str(_g("eqp2_accelerator")).strip().lower(),
+            history_depth=int(_g("eqp2_history_depth")),
         )
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
@@ -4619,6 +4699,7 @@ class LorraxConfig:
             ppm=ppm,
             mpa=mpa,
             sc=sc,
+            eqp2=eqp2,
             memory=memory,
             backend=backend,
             debug=debug,

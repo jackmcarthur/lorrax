@@ -146,6 +146,22 @@ class GWProductionReport:
 
         self.heading("Method and physical pathways")
         self.emit(f"Self-energy    : {mode_text}; {solver_text}")
+        self.emit(
+            f"QP consistency  : {solver} | other options: fixed_point "
+            "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)")
+        eqp2 = getattr(config, "eqp2", None)
+        if bool(getattr(eqp2, "enabled", False)):
+            self.emit(
+                "EQP2 treatment  : fixed-Sigma eigenvalue self-consistency; "
+                f"max|dE| cutoff={float(eqp2.tol_ev) * 1e3:.3f} meV; "
+                f"accelerator={eqp2.accelerator}"
+                + (f"(depth={int(eqp2.history_depth)})"
+                   if str(eqp2.accelerator) == "rcrop" else "")
+                + f"; max_iter={int(eqp2.max_iter)}; screening unchanged")
+        else:
+            self.emit(
+                "EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma "
+                "eigenvalue self-consistency)")
         self.emit(f"Screening      : {diagram_text}; "
                   f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
@@ -380,6 +396,27 @@ class GWProductionReport:
         self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
         self.emit("State energies  : written to the EQP files listed below")
 
+    def eqp2_summary(self, *, band_slices, e_eqp2_ry,
+                     iterations: int, residual_ev: float,
+                     tol_ev: float) -> None:
+        """Report the optional fixed-Sigma ladder and its actual criterion."""
+        if e_eqp2_ry is None:
+            return
+        e = np.asarray(e_eqp2_ry, dtype=np.float64) * RYD_TO_EV
+        iv = int(band_slices.b2 - band_slices.b0 - 1)
+        ic = int(band_slices.b2 - band_slices.b0)
+        self.heading("Fixed-Sigma eigenvalue consistency")
+        self.emit(f"Convergence     : {int(iterations)} map evaluations; "
+                  f"max|dE|={float(residual_ev) * 1e3:.6f} meV "
+                  f"<= {float(tol_ev) * 1e3:.6f} meV")
+        self.emit("Updated objects : QP eigenvalues/eigenvectors and the "
+                  "basis representation of stored Sigma(omega)")
+        self.emit("Held fixed      : screening, W, and all self-energy diagrams")
+        if e.ndim == 2 and iv >= 0 and ic < e.shape[1]:
+            gap = float(np.min(e[:, ic]) - np.max(e[:, iv]))
+            state = "insulating" if gap > 0.0 else "metallic/overlapping"
+            self.emit(f"EQP2 gap       : {gap:.5f} eV ({state})")
+
     def timings(self, records, *, wall: float) -> None:
         """Print accumulated, non-overlapping major scientific stages.
 
@@ -447,6 +484,7 @@ class GWProductionReport:
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
             ("QP solve + diagonalize", top_level(
                 "gw_jax.solve_qp", "gw_jax.qp_eigh")),
+            ("fixed-Sigma evSC", top_level("gw_jax.eqp2_evsc")),
             ("result writes", top_level("gw_jax.output")),
         ]
         # A stage absent in a mode should not occupy a zero-valued report row.

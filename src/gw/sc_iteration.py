@@ -122,6 +122,21 @@ class ConvergenceVerdict:
             f"{'CONVERGED' if self.converged else 'not converged'}")
 
 
+@dataclass(frozen=True)
+class FixedSigmaEVSCResult:
+    """Converged fixed-Sigma eigenvalue-self-consistent QP ladder.
+
+    ``U_dft_to_qp`` uses the driver-wide column convention
+    ``U[k,m,n] = <DFT_m|QP_n>``.  It is retained on the two-dimensional
+    band mesh; only the much smaller energy ladder is brought to the host.
+    """
+
+    energies_ry: np.ndarray
+    U_dft_to_qp: jax.Array
+    iterations: int
+    residual_ev: float
+
+
 def protected_band_convergence(
     e_new_ev: np.ndarray,
     e_prev_ev: np.ndarray,
@@ -849,7 +864,9 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     was unreachable on the default path.  ``config.sc.eigh`` selects it
     now; the E_F rule stays where it was, with ``density_self_consistent``.
 
-    ``"auto"`` picks ``distributed`` only when both hold:
+    ``"native"`` is still distributed over the k batch, but the staging
+    and local eigh now belong to ``distrib_la``'s ``batch_reshard`` route.
+    ``"auto"`` picks a one-tile-distributed backend only when both hold:
 
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
@@ -927,6 +944,32 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     return "distributed"
 
 
+def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
+    """One repeated-eigh door for SC-QSGW and fixed-Sigma evSC.
+
+    ``distrib_la`` owns both routes.  A large tile uses its explicitly
+    distributed backend; a fit-size stack uses its ``batch_reshard`` route,
+    which stages k over the mesh and runs native tiles concurrently.  Both
+    return eigenvectors as columns at ``P(None,'x','y')`` and share the
+    logical-band padding/slicing seam in :mod:`gw.qsgw_density`.
+    """
+    from .qsgw_density import distributed_eigh_bands
+
+    if kind == "distributed":
+        backend_config = getattr(config, "backend", None)
+        return distributed_eigh_bands(
+            H, mesh=mesh_xy, distrib_la_backend="distributed",
+            distrib_la_batched_route=getattr(
+                backend_config, "distrib_la_batched_route", "auto"))
+    if kind == "native":
+        return distributed_eigh_bands(
+            H, mesh=mesh_xy, distrib_la_backend="off",
+            distrib_la_batched_route="batch_reshard")
+    raise ValueError(
+        f"_sc_eigh_bands: kind must be 'native' or 'distributed', got "
+        f"{kind!r}.")
+
+
 def _band_rotation_spec() -> P:
     """``gw.qsgw_density.band_rotation_spec()``, resolved lazily.
 
@@ -974,6 +1017,317 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
     if isinstance(x, jax.Array):
         return jax.device_put(x, sh)
     return device_put_process_local(x, sh)
+
+
+_FIXED_SIGMA_ROTATE_CACHE: dict[tuple[int, tuple[int, ...]], Callable] = {}
+
+
+def _rotate_fixed_sigma_cube_to_qp(
+    sigma_c_omega_dft_ry: jax.Array,
+    U_dft_to_qp: jax.Array,
+    *,
+    mesh: Mesh,
+) -> jax.Array:
+    """Rotate every frequency slice ``U^dagger Sigma_c(omega) U``.
+
+    The frequency axis is scanned rather than folded into an extra batch
+    axis of one giant contraction.  Therefore the required output cube stays
+    ``P(None,None,'x','y')`` and the transient rotation holds only one
+    ``(nk,nb,nb)`` frequency slice.  In particular, no rank materializes the
+    full ``(nomega,nk,nb,nb)`` cube.
+    """
+    shape = tuple(int(v) for v in sigma_c_omega_dft_ry.shape)
+    key = (id(mesh), shape)
+    fn = _FIXED_SIGMA_ROTATE_CACHE.get(key)
+    if fn is None:
+        from .qsgw_density import rotate_band_matrix
+
+        cube_sh = NamedSharding(mesh, P(None, None, "x", "y"))
+        matrix_sh = NamedSharding(mesh, _band_rotation_spec())
+
+        @jax.jit
+        def _kernel(cube, U):
+            cube = jax.lax.with_sharding_constraint(cube, cube_sh)
+            U = jax.lax.with_sharding_constraint(U, matrix_sh)
+
+            def _one(_carry, sigma_kij):
+                rotated = rotate_band_matrix(
+                    sigma_kij, U, mesh=mesh, to_qp=True)
+                rotated = jax.lax.with_sharding_constraint(
+                    rotated, matrix_sh)
+                return None, rotated
+
+            _, out = jax.lax.scan(_one, None, cube, unroll=1)
+            return jax.lax.with_sharding_constraint(out, cube_sh)
+
+        fn = _kernel
+        _FIXED_SIGMA_ROTATE_CACHE[key] = fn
+    return fn(sigma_c_omega_dft_ry, U_dft_to_qp)
+
+
+@_functools.partial(jax.jit, static_argnames=("mesh", "to_qp"))
+def _rotate_fixed_matrix(A: jax.Array, U_dft_to_qp: jax.Array, *,
+                         mesh: Mesh, to_qp: bool) -> jax.Array:
+    """Shared distributed matrix basis change, kept two-axis sharded."""
+    from .qsgw_density import rotate_band_matrix
+
+    out = rotate_band_matrix(
+        A, U_dft_to_qp, mesh=mesh, to_qp=bool(to_qp))
+    return jax.lax.with_sharding_constraint(
+        out, NamedSharding(mesh, _band_rotation_spec()))
+
+
+def run_fixed_sigma_evsc(
+    sigma_result: SigmaResult,
+    kin_ion_dft_ry: jax.Array,
+    e_dft_kn_ry,
+    *,
+    config,
+    mesh_xy: Mesh,
+    print_fn: Callable = print,
+) -> FixedSigmaEVSCResult:
+    """Iterate a fixed full-matrix Sigma(omega) table to eigenvalue SC.
+
+    This is the opt-in ``eqp2.dat`` treatment.  Screening, W, and every
+    self-energy diagram are computed exactly once by the ordinary one-shot
+    path.  Its fixed-point variable is the Hermitian QP Hamiltonian in the
+    ORIGINAL DFT basis.  For an input ``H_p^DFT`` it diagonalizes
+
+    ``H_p^DFT U_p = U_p E_p``
+
+    rotates the stored cube as
+    ``Sigma_c,p(omega) = U_p^dagger Sigma_c,DFT(omega) U_p``, forms
+
+    ``Sigma_eff,p[m,n] = 1/2 [Sigma_p,mn(E_p,m)
+                              + Sigma_p,mn(E_p,n)]^h``,
+
+    and returns ``F(H_p)^DFT = H0_DFT + U_p Sigma_eff,p U_p^dagger``.
+    Keeping the fixed-point carry in one coordinate system is what makes the
+    rCROP residual meaningful: eigenvector phases and degenerate-subspace
+    gauges never enter the object being mixed.
+
+    The frequency table itself is never recomputed.  Evaluation outside its
+    sampled range, or across a patch hole, is refused: an endpoint clamp is
+    not eigenvalue self-consistency and must not be written as ``eqp2``.
+    Convergence is the maximum absolute eigenvalue difference between
+    ``F(H)`` and ``H`` over every reported state.  ``eqp2_accelerator=rcrop``
+    accelerates that fixed-basis map; ``linear`` is its unaccelerated Picard
+    fallback.
+    """
+    from common import sanity
+    from .qsgw_utils import (
+        assert_omega_grid_covers, build_qsgw_sigma_xc, omega_coverage)
+
+    sigma_c_dft = sigma_result.sigma_c_omega_kij_ry
+    sigma_x_dft = sigma_result.sigma_x_kij_ry
+    v_h_dft = sigma_result.v_h_kij_ry
+    omega_ev = sigma_result.omega_grid_ev
+    omega_ry = sigma_result.omega_grid_ry
+    efermi_ev = sigma_result.efermi_dft_ev
+    missing = [name for name, value in (
+        ("sigma_c_omega_kij_ry", sigma_c_dft),
+        ("sigma_x_kij_ry", sigma_x_dft),
+        ("v_h_kij_ry", v_h_dft),
+        ("omega_grid_ev", omega_ev),
+        ("omega_grid_ry", omega_ry),
+        ("efermi_dft_ev", efermi_ev),
+    ) if value is None]
+    if missing:
+        raise ValueError(
+            "write_eqp2=true requires the one-shot dynamic full-matrix "
+            "Sigma(omega) result, but these fields are absent: "
+            + ", ".join(missing))
+
+    e_dft_ry = np.asarray(e_dft_kn_ry, dtype=np.float64)
+    if e_dft_ry.ndim != 2:
+        raise ValueError(
+            f"run_fixed_sigma_evsc: E_DFT must be (nk,nb), got "
+            f"{e_dft_ry.shape}.")
+    nk, nb = (int(v) for v in e_dft_ry.shape)
+    expected_cube = (len(np.asarray(omega_ev)), nk, nb, nb)
+    if tuple(sigma_c_dft.shape) != expected_cube:
+        raise ValueError(
+            "run_fixed_sigma_evsc: full Sigma cube and DFT ladder disagree; "
+            f"got {tuple(sigma_c_dft.shape)} and {e_dft_ry.shape}, expected "
+            f"{expected_cube}.")
+
+    sanity.refuse_nonfinite("eqp2 E_DFT", e_dft_ry, print_fn=print_fn)
+    sanity.refuse_nonfinite(
+        "eqp2 fixed Sigma_c(omega)", sigma_c_dft, print_fn=print_fn)
+
+    rotation_spec = _band_rotation_spec()
+    matrix_sharding = NamedSharding(mesh_xy, rotation_spec)
+    ident = np.broadcast_to(
+        np.eye(nb, dtype=np.complex128)[None, :, :], (nk, nb, nb)).copy()
+    U_seed = _place(ident, mesh_xy, rotation_spec)
+    h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
+    h0_dft = jax.device_put(h0_dft, matrix_sharding)
+    sigma_c_dft = jax.device_put(
+        jnp.asarray(sigma_c_dft),
+        NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    sigma_x_dft = jax.device_put(jnp.asarray(sigma_x_dft), matrix_sharding)
+    omega_ev = np.asarray(omega_ev, dtype=np.float64)
+    omega_ry = np.asarray(omega_ry, dtype=np.float64)
+    efermi_ev = float(efermi_ev)
+    tol_ev = float(config.eqp2.tol_ev)
+    max_iter = int(config.eqp2.max_iter)
+    accelerator = str(config.eqp2.accelerator)
+    history_depth = int(config.eqp2.history_depth)
+    eigh_kind = _resolve_sc_eigh(nb, mesh_xy, config, print_fn=print_fn)
+
+    # The seed's eigensystem is exactly the DFT input basis.  Using this
+    # explicit diagonal matrix (and its explicit identity U on call zero)
+    # makes the first map evaluation exactly the requested one-shot
+    # Sigma_mn(E_m^DFT)+Sigma_mn(E_n^DFT) construction, including inside a
+    # degenerate DFT manifold where a generic eigh may choose another gauge.
+    H_seed_host = np.zeros((nk, nb, nb), dtype=np.complex128)
+    H_seed_host[:, np.arange(nb), np.arange(nb)] = e_dft_ry
+    H_seed = _place(H_seed_host, mesh_xy, rotation_spec)
+
+    def _eigh(H):
+        H = jax.device_put(H, matrix_sharding)
+        return _sc_eigh_bands(
+            H, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
+
+    map_calls = [0]
+
+    def _fixed_map(H_dft):
+        call_index = map_calls[0]
+        H_dft = jax.device_put(H_dft, matrix_sharding)
+        H_dft = 0.5 * (
+            H_dft + jnp.conj(jnp.swapaxes(H_dft, -1, -2)))
+        if call_index == 0:
+            e_in_ry = e_dft_ry
+            U_dft_to_qp = U_seed
+        else:
+            e_in_j, U_dft_to_qp = _eigh(H_dft)
+            e_in_ry = np.asarray(e_in_j, dtype=np.float64)
+
+        e_rel_ev = e_in_ry * RYD_TO_EV - efermi_ev
+        covered, n_out, frac_out = omega_coverage(omega_ev, e_rel_ev)
+        if n_out:
+            worst = float(e_rel_ev[~covered].flat[
+                int(np.argmax(np.abs(e_rel_ev[~covered])))])
+            raise ValueError(
+                "GATE eqp2_omega_coverage: fixed-Sigma eigenvalue "
+                f"self-consistency requested Sigma at {n_out}/{e_rel_ev.size} "
+                f"energies ({100.0 * frac_out:.1f}%) outside the sampled "
+                f"grid [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV "
+                f"(worst {worst:+.3f} eV).  An endpoint clamp would not be "
+                "Sigma(E), so eqp2 is refused.  Widen "
+                "sigma_omega_min_ev / sigma_omega_max_ev or add a "
+                "sigma_omega_patches_ev patch.")
+        assert_omega_grid_covers(
+            e_rel_ev / RYD_TO_EV, covered, omega_ry,
+            context=f"eqp2 map call {call_index + 1}")
+
+        # Both Sigma operands are expressed in the basis whose energies label
+        # their m,n indices.  The full cube is rotated from the ORIGINAL DFT
+        # basis on every call, not successively, so there is no cumulative
+        # basis drift.
+        if call_index == 0:
+            sigma_x_qp = sigma_x_dft
+            sigma_c_qp = sigma_c_dft
+        else:
+            sigma_x_qp = _rotate_fixed_matrix(
+                sigma_x_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
+            sigma_c_qp = _rotate_fixed_sigma_cube_to_qp(
+                sigma_c_dft, U_dft_to_qp, mesh=mesh_xy)
+
+        sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
+            sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
+            replicated_output=False)
+        if int(diagnostics["n_clipped"]):
+            raise RuntimeError(
+                "run_fixed_sigma_evsc: coverage gate/build_qsgw_sigma_xc "
+                f"disagree ({int(diagnostics['n_clipped'])} clipped).")
+        sigma_xc_dft = _rotate_fixed_matrix(
+            sigma_xc_qp, U_dft_to_qp, mesh=mesh_xy, to_qp=False)
+        H_out = h0_dft + sigma_xc_dft
+        H_out = 0.5 * (
+            H_out + jnp.conj(jnp.swapaxes(H_out, -1, -2)))
+        H_out = jax.device_put(H_out, matrix_sharding)
+        sanity.refuse_nonfinite(
+            f"eqp2 H map call {call_index + 1}", H_out,
+            print_fn=print_fn)
+
+        e_out_j, U_out = _eigh(H_out)
+        e_out_ry = np.asarray(e_out_j, dtype=np.float64)
+        sanity.refuse_nonfinite(
+            f"eqp2 E map call {call_index + 1}", e_out_ry,
+            print_fn=print_fn)
+        residual_ev = float(
+            np.max(np.abs(e_out_ry - e_in_ry)) * RYD_TO_EV)
+        map_calls[0] += 1
+        return H_out, e_out_ry, U_out, residual_ev
+
+    print_fn(
+        f"[ EQP2 | fixed Sigma(omega), screening unchanged | "
+        f"criterion max|dE| <= {tol_ev * 1e3:.3f} meV | "
+        f"accelerator {accelerator} | max_iter {max_iter} ]")
+
+    if accelerator == "linear":
+        H = H_seed
+        for iteration in range(1, max_iter + 1):
+            H, e_out_ry, U_out, residual_ev = _fixed_map(H)
+            print_fn(
+                f"[ EQP2 | Picard {iteration:02d}/{max_iter:02d} | "
+                f"max|dE| {residual_ev * 1e3:.6f} meV | "
+                f"{'CONVERGED' if residual_ev <= tol_ev else 'continue'} ]")
+            if residual_ev <= tol_ev:
+                return FixedSigmaEVSCResult(
+                    energies_ry=e_out_ry, U_dft_to_qp=U_out,
+                    iterations=map_calls[0], residual_ev=residual_ev)
+    else:
+        from mixing.acceleration import rcrop_nojit
+
+        class _EQP2Converged(Exception):
+            def __init__(self, energies, rotations, residual):
+                self.energies = energies
+                self.rotations = rotations
+                self.residual = residual
+
+        last_accepted_residual = [float("inf")]
+
+        def _residual_fn(H):
+            call_index = map_calls[0]
+            H_in = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
+            H_in = jax.device_put(H_in, matrix_sharding)
+            H_out, e_out, U_out, residual = _fixed_map(H_in)
+            role = ("initial" if call_index == 0 else
+                    "trial" if call_index % 2 else "accepted")
+            print_fn(
+                f"[ EQP2 | rCROP map {call_index + 1:02d} | {role} | "
+                f"max|dE| {residual * 1e3:.6f} meV | "
+                f"{'CONVERGED' if residual <= tol_ev else 'continue'} ]")
+            if role != "trial":
+                last_accepted_residual[0] = residual
+                if residual <= tol_ev:
+                    raise _EQP2Converged(e_out, U_out, residual)
+            return jax.device_put(H_out - H_in, matrix_sharding)
+
+        try:
+            rcrop_nojit(
+                _residual_fn, H_seed, m=history_depth, maxit=max_iter,
+                # The physical L-infinity eigenvalue test above owns stopping.
+                tol=0.0, print_fn=None, entry_sharding=matrix_sharding)
+        except _EQP2Converged as stop:
+            return FixedSigmaEVSCResult(
+                energies_ry=np.asarray(stop.energies, dtype=np.float64),
+                U_dft_to_qp=stop.rotations,
+                iterations=map_calls[0],
+                residual_ev=float(stop.residual),
+            )
+        residual_ev = last_accepted_residual[0]
+
+    raise RuntimeError(
+        "eqp2 fixed-Sigma eigenvalue self-consistency did not converge: "
+        f"accepted max|dE|={residual_ev * 1e3:.6f} meV after "
+        f"{map_calls[0]} map evaluations (accelerator={accelerator}, "
+        f"max_iter={max_iter}), above the {tol_ev * 1e3:.6f} meV cutoff.  "
+        "No eqp2 file was written; raise eqp2_max_iter or choose "
+        "eqp2_accelerator=linear only after inspecting the map history and "
+        "Sigma(omega) grid.")
 
 
 @_functools.partial(jax.jit, static_argnames=("mesh",))
@@ -1544,12 +1898,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # TWO INDEPENDENT DECISIONS, and they used to be one condition.
         #
         # (a) WHICH EIGH -- a LAYOUT question, answered by
-        # ``_resolve_sc_eigh`` from ``config.sc.eigh``.  The k-sharded
-        # batch gives each device nk/P of the per-k diagonalisations but
-        # still lands one WHOLE (nb, nb) tile on one device -- 1.6 GB at
-        # nb=1e4; ``distributed_eigh_bands`` spreads each tile over the
-        # mesh instead (owner ruling 2026-08-04: robustness at 1e4+ bands
-        # over speed at 1e3, where the native batch wins by ~ndev).  Until
+        # ``_resolve_sc_eigh`` from ``config.sc.eigh``.  distrib_la's
+        # native ``batch_reshard`` route gives each device nk/P of the
+        # per-k diagonalisations but still lands one WHOLE (nb, nb) tile on
+        # one device -- 1.6 GB at nb=1e4; its distributed backend spreads
+        # each tile over the mesh instead (owner ruling 2026-08-04:
+        # robustness at 1e4+ bands over speed at 1e3, where the native
+        # batch wins by ~ndev).  Until
         # 2026-08-05 the distributed one was reachable ONLY by turning on
         # ``density_self_consistent``, a physics knob defaulting to False,
         # so the default -- and only shipped -- configuration had no way
@@ -1560,8 +1915,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # the fixed-band-cut midgap otherwise.  Moving it would change
         # numbers; moving (a) does not.
         #
-        # Both eigh branches return U at ``band_rotation_spec``, so
-        # everything below is layout-blind.  The k-sharded one used to
+        # Both distrib_la routes return U at ``band_rotation_spec``, so
+        # everything below is layout-blind.  The k-batched one used to
         # allgather U back to replicated by default; every consumer here
         # is a device-side rotation that either wants
         # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
@@ -1590,17 +1945,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "
                 f"sc_eigh="
                 f"{getattr(getattr(inputs.config, 'sc', None), 'eigh', 'auto')})")
-        if eigh_kind == "distributed":
-            from gw.qsgw_density import distributed_eigh_bands
-            E_qp_ry, U_qp = distributed_eigh_bands(
-                state.H_qp_dft, mesh=inputs.mesh_xy,
-                distrib_la_batched_route=(
-                    getattr(inputs.config.backend,
-                            "distrib_la_batched_route", "auto")))
-        else:
-            eigh_kshard, _ = _kshard_eigh_kernels(
-                inputs.mesh_xy, _band_rotation_spec())
-            E_qp_ry, U_qp = eigh_kshard(state.H_qp_dft)
+        E_qp_ry, U_qp = _sc_eigh_bands(
+            state.H_qp_dft, kind=eigh_kind, mesh_xy=inputs.mesh_xy,
+            config=inputs.config)
 
         if bool(getattr(inputs.config, "density_self_consistent", False)):
             from gw.efermi import fermi_level_step
@@ -4191,6 +4538,7 @@ def dump_qp_wfn_artifacts(
 
 
 __all__ = [
+    "FixedSigmaEVSCResult",
     "SCInputs",
     "SCOutputs",
     "SCState",
@@ -4199,6 +4547,7 @@ __all__ = [
     "make_initial_state_from_dft",
     "run_self_consistency",
     "run_sc_driver",
+    "run_fixed_sigma_evsc",
     "final_qp_eigenstates",
     "dump_qp_wfn_artifacts",
     "dump_sigma_omega_h5_final",

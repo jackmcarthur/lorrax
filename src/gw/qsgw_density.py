@@ -600,17 +600,20 @@ _EIGH_PAD_SENTINEL_RY = 1e10
 
 @timing.timed("sc.eigh", watch=True)
 def distributed_eigh_bands(H, *, mesh: Mesh,
-                           distrib_la_batched_route: str = "auto"):
-    """(E, U_qp) for every k, with NO ``(nb, nb)`` ever on one rank.
+                           distrib_la_batched_route: str = "auto",
+                           distrib_la_backend: str = "distributed"):
+    """(E, U_qp) for every k through the ``distrib_la`` batched surface.
 
     ``H`` is ``(n_k, nb, nb)`` Hermitian at :func:`band_rotation_spec`;
     returns ``E`` ``(n_k, nb)`` replicated ascending and ``U_qp`` at the
     same 2-D layout, eigenvectors as COLUMNS — at the **logical** ``nb``,
-    whatever the mesh's band divisor.  A band axis that the divisor does
-    not divide is padded to it with a large diagonal SENTINEL and sliced
-    back BY COUNT after the solve; see the block comment at the pad.
-    Callers therefore never see a padded shape, and ``nb`` need not
-    divide anything.
+    whatever the mesh's band divisor.  The default distributed backend
+    spreads each tile over the mesh, so no rank holds a full ``(nb,nb)``.
+    The explicit ``off`` + ``batch_reshard`` route instead gives each rank
+    whole fit-size matrices from the k batch, which is faster while a tile
+    fits its memory budget.  A band axis that the divisor does not divide
+    is padded to it with a large diagonal SENTINEL and sliced back BY COUNT
+    after the solve; callers never see a padded shape.
 
     PARITY, and its limit.  Padding is **reduction-order gauge, not
     bit-exactness**.  The pad modes are exactly inert — the block is
@@ -626,15 +629,23 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     on a ULP count — that passes on a fixture and fails at production
     shapes.
 
-    Backend-agnostic.  ``resolve_backend('eigh', 'distributed', mesh)``
-    picks the platform's distributed eigh — ScaLAPACK ``pXheevd`` on a
-    host mesh, cuSOLVERMp on CUDA — and ``backend_module`` hands out that
-    module, which is the idiom every other FFI consumer uses
+    Backend-agnostic.  The default
+    ``resolve_backend('eigh', 'distributed', mesh)`` picks the platform's
+    distributed eigh — ScaLAPACK ``pXheevd`` on a host mesh, cuSOLVERMp on
+    CUDA — and ``backend_module`` hands out that module, which is the idiom
+    every other FFI consumer uses
     (``isdf.core`` for getrf/getrs/solve_lu, ``common.eigh_block_sweep``
     for cusolvermp).  Resolving first is the point: a CPU-only backend on
     a CUDA mesh, an uncompiled handler, a rectangular mesh or an
     indivisible ``n`` are refused THERE with the guard named, instead of
     failing or deadlocking inside the call.
+
+    ``distrib_la_backend='off'`` with
+    ``distrib_la_batched_route='batch_reshard'`` is the service-owned
+    small-matrix route: stage the k batch over the mesh, run local native
+    eighs concurrently, and stage the eigenvectors back to the same face
+    layout.  It deliberately shares this padding and column-convention seam
+    with the distributed route; callers do not grow a second eigensolver.
 
     Batching asymmetry (only ScaLAPACK has a batched entry; cuSOLVERMp
     and SLATE do not) is handled by ``distrib_la.dispatch_batched_eigh``,
@@ -711,7 +722,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         on_pad_diag = ((i == j) & (i >= nb))[None]
         H_j = jnp.where(on_pad_diag, _EIGH_PAD_SENTINEL_RY, H_j)
     E, U = dispatch_batched_eigh(
-        H_j, mesh, "distributed",
+        H_j, mesh, distrib_la_backend,
         batched_route=distrib_la_batched_route)
     if nb_pad != nb:
         # THE SEAM. Drop by COUNT, never by value — same shape contract the

@@ -156,6 +156,72 @@ def test_sc_bad_accelerator_rejected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Optional eqp2 fixed-Sigma eigenvalue consistency
+# ---------------------------------------------------------------------------
+
+def test_eqp2_defaults_off_with_one_mev_cutoff(tmp_path):
+    cfg = _config(tmp_path)
+    assert cfg.eqp2.enabled is False
+    assert cfg.eqp2.tol_ev == pytest.approx(1.0e-3)
+    assert cfg.eqp2.max_iter == 20
+    assert cfg.eqp2.accelerator == "rcrop"
+    assert cfg.eqp2.history_depth == 5
+    assert cfg.paths.eqp2_file.endswith("eqp2.dat")
+
+
+def test_eqp2_dynamic_one_shot_keys_parse(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "compute_mode = gn_ppm\n"
+        "write_eqp2 = true\n"
+        "eqp2_tol_ev = 0.002\n"
+        "eqp2_max_iter = 7\n"
+        "eqp2_accelerator = linear\n"
+        "eqp2_history_depth = 3\n"
+        "eqp2_file = custom.eqp2\n")
+    assert cfg.eqp2.enabled is True
+    assert cfg.eqp2.tol_ev == pytest.approx(0.002)
+    assert cfg.eqp2.max_iter == 7
+    assert cfg.eqp2.accelerator == "linear"
+    assert cfg.eqp2.history_depth == 3
+    assert cfg.paths.eqp2_file.endswith("custom.eqp2")
+    assert cfg.sigma.omega_layout == "sharded"
+
+
+def test_eqp2_explicit_replicated_sigma_cube_refuses(tmp_path):
+    with pytest.raises(ValueError, match="requires sigma_omega_layout=sharded"):
+        _config(
+            tmp_path,
+            "compute_mode = gn_ppm\nwrite_eqp2 = true\n"
+            "sigma_omega_layout = replicated\n")
+
+
+@pytest.mark.parametrize("line,match", [
+    ("eqp2_tol_ev = 0\n", "eqp2_tol_ev"),
+    ("eqp2_max_iter = 0\n", "eqp2_max_iter"),
+    ("eqp2_accelerator = bogus\n", "eqp2_accelerator"),
+    ("eqp2_history_depth = 0\n", "eqp2_history_depth"),
+])
+def test_eqp2_invalid_iteration_knobs_refuse(tmp_path, line, match):
+    with pytest.raises(ValueError, match=match):
+        _config(tmp_path, line)
+
+
+def test_eqp2_static_mode_refuses(tmp_path):
+    with pytest.raises(ValueError, match="dynamic full-matrix"):
+        _config(tmp_path, "compute_mode = cohsex\nwrite_eqp2 = true\n")
+
+
+@pytest.mark.parametrize("solver", ["fixed_point", "self_consistent"])
+def test_eqp2_is_additional_to_one_shot_only(tmp_path, solver):
+    with pytest.raises(ValueError, match="additional fixed-Sigma result"):
+        _config(
+            tmp_path,
+            "compute_mode = gn_ppm\nwrite_eqp2 = true\n"
+            f"qp_solver = {solver}\n")
+
+
+# ---------------------------------------------------------------------------
 # Distributed-linalg axes: distributed_cholesky / distributed_lu
 # (portable backend names; the legacy cusolvermp_charge/cusolvermp_lu
 # aliases were REMOVED 2026-07-31 — unknown deck keys are ignored)

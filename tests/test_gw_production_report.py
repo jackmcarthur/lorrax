@@ -171,6 +171,9 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "MPI ranks      : 4" in text
     assert "JAX/JAXLIB     : 0.test / 0.testlib" in text
     assert "Godby-Needs plasmon-pole GW" in text
+    assert ("QP consistency  : one_shot_dft | other options: fixed_point "
+            "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)") in text
+    assert "EQP2 treatment  : off (set write_eqp2=true" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
     assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
     assert " Ry" not in text and "Rydberg" not in text
@@ -218,6 +221,29 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "result writes                0.50" in text
     assert "other driver work            2.00" in text
     assert "HDF5" not in text and "h5py" not in text
+
+
+def test_report_spells_out_enabled_eqp2_and_convergence(tmp_path):
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    config = _config()
+    config.eqp2 = SimpleNamespace(
+        enabled=True, tol_ev=1.0e-3, max_iter=20,
+        accelerator="rcrop", history_depth=5)
+    report.method(config=config)
+    bands = SimpleNamespace(b0=0, b2=1)
+    energies = np.array([[-1.0, 1.0], [-0.8, 0.9]]) / RYD_TO_EV
+    report.eqp2_summary(
+        band_slices=bands, e_eqp2_ry=energies,
+        iterations=4, residual_ev=0.0007, tol_ev=0.001)
+    report.finish()
+    text = path.read_text(encoding="utf-8")
+    assert "fixed-Sigma eigenvalue self-consistency" in text
+    assert ("max|dE| cutoff=1.000 meV; accelerator=rcrop(depth=5); "
+            "max_iter=20; screening unchanged") in text
+    assert "max|dE|=0.700000 meV <= 1.000000 meV" in text
+    assert "Held fixed      : screening, W, and all self-energy diagrams" in text
 
 
 def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
