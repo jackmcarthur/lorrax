@@ -154,8 +154,10 @@ def spin_degeneracy_factor(wfn) -> float:
     channel of a collinear spin-polarised run (``nspin == 2``).
 
     Getting this wrong scales ρ — and therefore ⟨V_H⟩, a ~500 eV
-    quantity — by a factor of two, so it is derived here once and
-    checked against ``∫ρ d³r`` by :func:`build_hartree_potential`.
+    quantity — by a factor of two.  The WFN-loader occupation summary
+    derives it once; this compatibility door exposes that value to the
+    density quadrature, whose result is checked against ``∫ρ d³r`` by
+    :func:`build_hartree_potential`.
     """
     return float(wfn.occupation_state_capacity)
 

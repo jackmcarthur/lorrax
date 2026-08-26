@@ -178,7 +178,6 @@ class WfnProvenance:
     nelec: int
     nspinor: int
     nbands: int
-    occupation_state_capacity: float
     num_electrons: float
     occupations_are_exact_integer: bool
     physical_density_band_stop: int
@@ -196,7 +195,7 @@ def read_wfn_provenance(path: str) -> WfnProvenance:
     energies.flags.writeable = kpoints.flags.writeable = False
     return WfnProvenance(
         resolved, energies, kpoints, summary.nelec, int(mf.nspinor),
-        int(mf.nbands), summary.state_capacity, summary.num_electrons,
+        int(mf.nbands), summary.num_electrons,
         summary.exact_integer, summary.density_band_stop)
 
 
