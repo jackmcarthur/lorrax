@@ -104,9 +104,10 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     sigma = np.asarray((0.0, 0.0, 0.11), dtype=np.float64)
     S = _ward_closed_S()
 
-    moments, D_sum, count, residual = static_slab_photon_head_moment_chunk(
-        q, D, sigma, S, 2,
-    )
+    weight = np.asarray((1.0, 1.0, 0.0), dtype=np.float64)
+    (moments, D_sum, count, residual, sigma_min,
+     condition_max) = static_slab_photon_head_moment_chunk(
+        q, D, sigma, S, 2, weight)
 
     H = np.asarray(static_hall_linear_response(sigma))
     R = (
@@ -121,6 +122,46 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     np.testing.assert_allclose(np.asarray(D_sum), D[:2].sum(axis=0))
     assert int(np.asarray(count)) == 2
     assert float(np.asarray(residual)) < 1.0e-14
+    assert float(np.asarray(sigma_min)) > 0.0
+    assert float(np.asarray(condition_max)) >= 1.0
+
+
+def test_static_head_moment_applies_deterministic_cubature_weights():
+    q = np.asarray(
+        ((0.17, -0.09, 0.0), (-0.12, 0.21, 0.0), (0.0, 0.0, 0.0)),
+        dtype=np.float64,
+    )
+    D = np.zeros((3, 4, 4), dtype=np.complex128)
+    D[0] = np.diag((2.0, -0.7, -0.9, -0.4))
+    D[1] = np.diag((1.6, -0.8, -0.6, -0.3))
+    sigma = np.asarray((0.0, 0.0, 0.11), dtype=np.float64)
+    S = _ward_closed_S()
+    weight = np.asarray((0.23, 0.77, 0.0), dtype=np.float64)
+
+    (moments, D_sum, count, residual, sigma_min,
+     condition_max) = static_slab_photon_head_moment_chunk(
+        q, D, sigma, S, 2, weight)
+    H = np.asarray(static_hall_linear_response(sigma))
+    R = (
+        np.einsum("sa,aij->sij", q[:2, :2], H)
+        + np.einsum("sa,sb,abij->sij", q[:2, :2], q[:2, :2], S)
+    )
+    lhs = np.eye(4)[None] - D[:2] @ R
+    W = np.linalg.solve(lhs, D[:2])
+    basis = np.column_stack((np.ones(2), q[:2, :2]))
+    expected = np.einsum(
+        "s,su,sij,sv->uvij", weight[:2], basis, W, basis)
+    np.testing.assert_allclose(np.asarray(moments), expected, rtol=2e-14)
+    np.testing.assert_allclose(
+        np.asarray(D_sum), np.einsum("s,sij->ij", weight[:2], D[:2]))
+    assert int(np.asarray(count)) == 2
+    assert float(np.asarray(residual)) < 1.0e-14
+    singular_values = np.linalg.svd(lhs, compute_uv=False)
+    np.testing.assert_allclose(
+        np.asarray(sigma_min), singular_values[:, -1].min(), rtol=2e-14)
+    np.testing.assert_allclose(
+        np.asarray(condition_max),
+        np.max(singular_values[:, 0] / singular_values[:, -1]), rtol=2e-14)
 
 
 def test_static_gauge_response_accepts_a_nonzero_ward_closed_tensor():
