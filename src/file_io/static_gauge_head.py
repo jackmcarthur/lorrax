@@ -16,11 +16,16 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 
+import jax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
 from common.collectives import barrier
-from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+from common.parallel_transport import (
+    WFN_FINGERPRINT_SCHEME,
+    fingerprint_from_binding,
+    wfn_fingerprint,
+)
 from file_io.slab_io import SlabIO
 from gw.head_correction import (
     StaticGaugeHeadResponse,
@@ -57,6 +62,8 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
     "|ibz_unfold=symmetry_maps_service"
     "|dtype=S,Y,Z:complex128;sigma_H:float64"
 )
+
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 1
 
 _S_DATASET = "S_direct_cart"
 _Y_DATASET = "Y_cart_x"
@@ -113,6 +120,49 @@ def _decode_i32_text(value, *, field_name: str, encoding: str) -> str:
             f"{field_name!r} is not valid {encoding}") from exc
 
 
+def _immutable_partial_paths(
+    path: str | Path, *, artifact_name: str,
+) -> tuple[Path, Path]:
+    """Validate one create-once destination shared by both gauge schemas."""
+    final_path = Path(path)
+    partial_path = Path(str(final_path) + ".partial")
+    if final_path.name.endswith(".partial"):
+        raise ValueError(f"{artifact_name} final path may not end in '.partial'")
+    if not final_path.parent.is_dir():
+        raise FileNotFoundError(
+            f"{artifact_name} parent directory does not exist: "
+            f"{final_path.parent}")
+    if os.path.lexists(final_path):
+        raise FileExistsError(
+            f"immutable {artifact_name} artifact already exists: {final_path}")
+    if os.path.lexists(partial_path):
+        raise FileExistsError(
+            f"stale/in-flight {artifact_name} partial exists: {partial_path}")
+    return final_path, partial_path
+
+
+def _publish_completed_partial(
+    partial_path: Path,
+    final_path: Path,
+    *,
+    artifact_name: str,
+    barrier_name: str,
+) -> None:
+    """Collectively hard-link-publish one completed SlabIO inode."""
+    try:
+        os.link(partial_path, final_path)
+    except FileExistsError:
+        if not os.path.samefile(partial_path, final_path):
+            raise FileExistsError(
+                f"immutable {artifact_name} publish collided with a "
+                f"different artifact at {final_path}") from None
+    barrier(barrier_name)
+    try:
+        os.unlink(partial_path)
+    except FileNotFoundError:
+        pass
+
+
 @dataclass(frozen=True)
 class LoadedStaticGaugeHeadResponse(StaticGaugeHeadResponse):
     """Validated response subtype issued only by the artifact loader.
@@ -138,6 +188,135 @@ class LoadedStaticGaugeHeadResponse(StaticGaugeHeadResponse):
             raise TypeError(
                 "LoadedStaticGaugeHeadResponse is issued only by "
                 "load_static_gauge_head_artifact")
+
+
+def write_static_gauge_hall_artifact(
+    path: str | Path,
+    hall_transaction,
+    *,
+    mesh_xy: Mesh,
+) -> None:
+    """Collectively persist the sealed three-number Hall transaction."""
+    from gw.qsgw_head import StaticGaugeHallTransaction
+
+    if not isinstance(hall_transaction, StaticGaugeHallTransaction):
+        raise TypeError(
+            "StaticGaugeHall artifact requires the sealed canonical Hall "
+            "transaction")
+    stop = int(hall_transaction.band_stop)
+    nk_tot = int(hall_transaction.nk_tot)
+    wfn_sha256 = hall_transaction.wfn_fingerprint
+    operator_sha256 = (
+        hall_transaction.hamiltonian_config_operator_fingerprint)
+    sigma_array = hall_transaction.sigma_H
+    sigma_H = np.asarray(jax.device_get(sigma_array), dtype=np.float64)
+    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+        raise ValueError(
+            "StaticGaugeHall sigma_H must be three finite real numbers")
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="StaticGaugeHall")
+    with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
+        io.write_attr(
+            "schema_version", np.int32(STATIC_GAUGE_HALL_SCHEMA_VERSION))
+        io.write_attr("complete", np.int32(1))
+        io.write_attr(
+            "wfn_fingerprint_i32",
+            _text_i32(wfn_sha256, encoding="ascii"))
+        io.write_attr(
+            "hamiltonian_config_operator_fingerprint_i32",
+            _text_i32(operator_sha256, encoding="ascii"))
+        io.write_attr("band_stop", np.int32(stop))
+        io.write_attr("nk_tot", np.int32(nk_tot))
+        io.write_attr("sigma_H_cart", sigma_H)
+
+    _publish_completed_partial(
+        partial_path, final_path, artifact_name="StaticGaugeHall",
+        barrier_name="static_gauge_hall_artifact_published")
+
+
+def load_static_gauge_hall_artifact(
+    path: str | Path,
+    *,
+    mesh_xy: Mesh,
+    wfn,
+    expected_band_start: int,
+    expected_band_stop: int,
+    expected_nk_tot: int,
+    wfn_fingerprint_binding=None,
+):
+    """Validate and load one immutable Hall transaction artifact."""
+    from gw.qsgw_head import _static_gauge_hall_transaction_from_artifact
+
+    artifact_path = Path(path)
+    if artifact_path.name.endswith(".partial"):
+        raise ValueError(
+            "GATE static_gauge_hall_partial: refusing a partial artifact path")
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            "GATE static_gauge_hall_artifact_absent: no completed artifact "
+            f"exists at {artifact_path}")
+
+    expected_wfn = _require_wfn_sha256(
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_binding is None
+        else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    expected_start = int(expected_band_start)
+    expected_stop = int(expected_band_stop)
+    expected_nk = int(expected_nk_tot)
+    if (expected_start != 0 or expected_stop <= expected_start
+            or expected_stop > int(wfn.nbands) or expected_nk <= 0):
+        raise ValueError(
+            "expected StaticGaugeHall manifold must be bands [0,stop) "
+            "within the WFN and nk_tot>0")
+
+    with SlabIO(str(artifact_path), mode="r", mesh=mesh_xy) as io:
+        complete = int(np.asarray(_read_required_small(io, "complete")))
+        schema = int(np.asarray(_read_required_small(io, "schema_version")))
+        artifact_wfn = _decode_i32_text(
+            _read_required_small(io, "wfn_fingerprint_i32"),
+            field_name="wfn_fingerprint_i32", encoding="ascii")
+        operator_fingerprint = _decode_i32_text(
+            _read_required_small(
+                io, "hamiltonian_config_operator_fingerprint_i32"),
+            field_name="hamiltonian_config_operator_fingerprint_i32",
+            encoding="ascii")
+        stop = int(np.asarray(_read_required_small(io, "band_stop")))
+        nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
+        sigma_H = np.asarray(
+            _read_required_small(io, "sigma_H_cart"), dtype=np.float64)
+
+    if complete != 1:
+        raise ValueError(
+            f"StaticGaugeHall artifact is incomplete (complete={complete})")
+    if schema != STATIC_GAUGE_HALL_SCHEMA_VERSION:
+        raise ValueError(
+            f"schema_version={schema}, expected "
+            f"{STATIC_GAUGE_HALL_SCHEMA_VERSION}")
+    artifact_wfn = _require_wfn_sha256(artifact_wfn)
+    if artifact_wfn != expected_wfn:
+        raise ValueError("StaticGaugeHall WFN identity differs")
+    if stop != expected_stop:
+        raise ValueError(
+            f"StaticGaugeHall band_stop={stop}, expected {expected_stop}")
+    if nk_tot != expected_nk:
+        raise ValueError(
+            f"StaticGaugeHall nk_tot={nk_tot}, expected {expected_nk}")
+    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+        raise ValueError(
+            "StaticGaugeHall sigma_H_cart must contain three finite values")
+    operator_fingerprint = _require_prefixed_sha256(
+        operator_fingerprint,
+        field_name="Hall Hamiltonian/config/operator fingerprint")
+
+    return _static_gauge_hall_transaction_from_artifact(
+        sigma_H=sigma_H,
+        hamiltonian_config_operator_fingerprint=operator_fingerprint,
+        wfn_fingerprint=artifact_wfn,
+        band_start=expected_start,
+        band_stop=stop,
+        nk_tot=nk_tot,
+        mesh=mesh_xy,
+    )
 
 
 def write_static_gauge_head_artifact(
@@ -197,20 +376,8 @@ def write_static_gauge_head_artifact(
             raise TypeError(
                 f"StaticGaugeHead {name} dtype {got} != fixed {wanted}")
 
-    final_path = Path(path)
-    partial_path = Path(str(final_path) + ".partial")
-    if final_path.name.endswith(".partial"):
-        raise ValueError("StaticGaugeHead final path may not end in '.partial'")
-    if not final_path.parent.is_dir():
-        raise FileNotFoundError(
-            "StaticGaugeHead parent directory does not exist: "
-            f"{final_path.parent}")
-    if os.path.lexists(final_path):
-        raise FileExistsError(
-            f"immutable StaticGaugeHead artifact already exists: {final_path}")
-    if os.path.lexists(partial_path):
-        raise FileExistsError(
-            f"stale/in-flight StaticGaugeHead partial exists: {partial_path}")
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="StaticGaugeHead")
 
     n_body = int(layout.packed_extent)
     with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
@@ -261,18 +428,9 @@ def write_static_gauge_head_artifact(
         io.write_attr(
             "source_low_mem_bands", np.int32(source_low_mem_bands))
 
-    try:
-        os.link(partial_path, final_path)
-    except FileExistsError:
-        if not os.path.samefile(partial_path, final_path):
-            raise FileExistsError(
-                "immutable StaticGaugeHead publish collided with a different "
-                f"artifact at {final_path}") from None
-    barrier("static_gauge_head_artifact_published")
-    try:
-        os.unlink(partial_path)
-    except FileNotFoundError:
-        pass
+    _publish_completed_partial(
+        partial_path, final_path, artifact_name="StaticGaugeHead",
+        barrier_name="static_gauge_head_artifact_published")
 
 
 def load_static_gauge_head_artifact(
@@ -471,8 +629,11 @@ def load_static_gauge_head_artifact(
 
 __all__ = [
     "LoadedStaticGaugeHeadResponse",
+    "STATIC_GAUGE_HALL_SCHEMA_VERSION",
     "STATIC_GAUGE_HEAD_CONVENTION_ID",
     "STATIC_GAUGE_HEAD_SCHEMA_VERSION",
+    "load_static_gauge_hall_artifact",
     "load_static_gauge_head_artifact",
+    "write_static_gauge_hall_artifact",
     "write_static_gauge_head_artifact",
 ]

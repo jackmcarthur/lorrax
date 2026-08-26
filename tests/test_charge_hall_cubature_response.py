@@ -43,7 +43,6 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
     mesh = _mesh()
     layout = PhotonBasisLayout.from_centroid_extents(3, 2, mesh)
     wfn_sha = "1" * 64
-    body_sha = "sha256:" + "2" * 64
     operator_sha = "sha256:" + "3" * 64
     dipole_sha = "sha256:" + "4" * 64
 
@@ -94,8 +93,7 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
         head=SimpleNamespace(wcoul0_eta=0.0))
     kwargs = dict(
         input_dir="/bounded/not-read", mesh=mesh, wfn=wfn, meta=meta,
-        config=config, layout=layout, hall_transaction=hall,
-        body_response_fingerprint=body_sha)
+        config=config, layout=layout, hall_transaction=hall)
     response = build_charge_hall_cubature_response(object(), **kwargs)
     repeated = build_charge_hall_cubature_response(object(), **kwargs)
 
