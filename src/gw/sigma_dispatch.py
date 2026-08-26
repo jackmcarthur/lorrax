@@ -113,6 +113,12 @@ class SigmaResult:
     h_transverse_kij_ry: jax.Array | None = None
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
+    #: Exact final-block q=0 photon-head diagonals, already in the DFT
+    #: output basis.  Axes are (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).
+    #: Non-full modes carry None; the debug writer supplies schema zeros.
+    photon_head_sigma_diag_tskn_ry: jax.Array | None = None
+    photon_head_sigma_operator_fingerprint: str | None = None
+    photon_head_sigma_basis: str | None = None
     #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
     #: when ``use_band_extrapolation`` is driving this stage.  ``sigma_xc_
     #: kij_ry`` is then the EXTRAPOLATED one and is what enters H; this twin
@@ -218,6 +224,7 @@ SIGMA_BASIS_FIELDS = (
 #: function — labels them by the QP index.
 DFT_BASIS_FIELDS = (
     "omega_dft_rel_ev",
+    "photon_head_sigma_diag_tskn_ry",
     # Its ``mask_kn`` is derived from ``omega_dft_rel_ev`` in the same
     # function, so it carries the same band labelling and the same trap.
     "omega_coverage",
@@ -228,6 +235,8 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ev",
     "omega_grid_ry",
     "sigma_omega_h5_path",
+    "photon_head_sigma_operator_fingerprint",
+    "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
 )
@@ -893,6 +902,9 @@ def compute_sigma_xc(
     from .gw_config import BispinorGWMode, coerce_bispinor_gw_mode
     bispinor_gw = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    photon_head_sigma_diag = None
+    photon_head_sigma_operator_fingerprint = None
+    photon_head_sigma_basis = None
     if bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
@@ -925,7 +937,8 @@ def compute_sigma_xc(
             compute_bare_x=False,
         )
         from .photon_sigma import compute_static_photon_sigma
-        photon_x, photon_sx, photon_coh = compute_static_photon_sigma(
+        (photon_x, photon_sx, photon_coh,
+         photon_head_diagnostics) = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
             Gij=photon_Gij,
@@ -934,8 +947,19 @@ def compute_sigma_xc(
             photon_layout=photon_response.layout,
             meta=meta,
             mesh_xy=mesh_xy,
+            head_completion=photon_response.head_completion,
+            diagnostic_basis_rotation=hartree_basis_rotation,
+            diagnostic_input_basis=(
+                "qp" if hartree_basis_rotation is not None else "dft"),
             print_fn=print_fn,
         )
+        if photon_head_diagnostics is not None:
+            photon_head_sigma_diag = (
+                photon_head_diagnostics.components_tskn_ry)
+            photon_head_sigma_operator_fingerprint = (
+                photon_head_diagnostics
+                .hamiltonian_config_operator_fingerprint)
+            photon_head_sigma_basis = photon_head_diagnostics.output_basis
         cohsex["sig_x"] = photon_x
         cohsex["sig_sx"] = photon_sx
         cohsex["sig_coh"] = photon_coh
@@ -1040,7 +1064,6 @@ def compute_sigma_xc(
         sig_h.block_until_ready()
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
-
     if mode is ComputeMode.X_ONLY:
         # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
         # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
@@ -1053,6 +1076,10 @@ def compute_sigma_xc(
             sigma_xc_kij_ry=sig_x,
             sigma_sx_kij_ry=sig_x,
             sigma_coh_kij_ry=jnp.zeros_like(sig_x),
+            photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
+            photon_head_sigma_operator_fingerprint=(
+                photon_head_sigma_operator_fingerprint),
+            photon_head_sigma_basis=photon_head_sigma_basis,
         )
     if mode is ComputeMode.COHSEX:
         sigma_xc = sig_sx + sig_coh
@@ -1064,6 +1091,10 @@ def compute_sigma_xc(
             sigma_xc_kij_ry=sigma_xc,
             sigma_sx_kij_ry=sig_sx,
             sigma_coh_kij_ry=sig_coh,
+            photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
+            photon_head_sigma_operator_fingerprint=(
+                photon_head_sigma_operator_fingerprint),
+            photon_head_sigma_basis=photon_head_sigma_basis,
         )
 
     # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
