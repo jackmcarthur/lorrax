@@ -944,6 +944,13 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
     assert (endpoint.hamiltonian_config_operator_fingerprint
             == uniform.hamiltonian_config_operator_fingerprint)
     assert endpoint.vnl_path_operator_fingerprint.startswith('sha256:')
+    current_only = mtxel_sweep.sweep_uniform_current_matrix_elements(
+        psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        bvec=setup.B, blat=1.0, vnl_setup=setup, gvecs=gvecs,
+        gmask=gmask, box_index=box_index, kvecs=kvecs)
+    np.testing.assert_allclose(
+        current_only.gamma_raw, uniform.gamma_raw, rtol=5.0e-15,
+        atol=5.0e-19)
 
     # The fixed-q body row reuses the canonical face Green builder.  At one
     # k and one tau=0 node its normalization reduces to the explicit ordered

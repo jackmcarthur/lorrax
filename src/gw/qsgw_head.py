@@ -3241,15 +3241,19 @@ def static_gauge_hall_transaction(
     driver-local star reconstruction, wavefunction reopen, band-matrix gather,
     FFT, current operator, or second Hall contraction is introduced here.
     """
-    from common.mtxel_sweep import UniformGaugeMatrixElements
+    from common.mtxel_sweep import (
+        UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)
     from symmetry_maps import unfold_file_wedge_to_full_bz
 
-    if not isinstance(uniform_gauge, UniformGaugeMatrixElements):
+    if not isinstance(uniform_gauge, (
+            UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)):
         raise TypeError(
             "static gauge Hall production requires the canonical "
-            "UniformGaugeMatrixElements transaction")
-    if ((uniform_gauge.dgamma_dq_raw is None)
-            != (uniform_gauge.d2gamma_dq2_raw is None)):
+            "uniform-gauge current transaction")
+    complete = isinstance(uniform_gauge, UniformGaugeMatrixElements)
+    if (complete
+            and ((uniform_gauge.dgamma_dq_raw is None)
+                 != (uniform_gauge.d2gamma_dq2_raw is None))):
         raise ValueError(
             "uniform-gauge Hall transaction has only one of its optional "
             "first/second transfer-jet fields")
@@ -3277,18 +3281,18 @@ def static_gauge_hall_transaction(
             f"logical interval: got {gamma.shape}, nk_tot={nk_tot}, "
             f"logical bands={logical}")
     storage = int(gamma.shape[2])
-    if tuple(uniform_gauge.lambda_raw.shape) != (
-            nk_tot, 3, 3, storage, storage):
+    if (complete and tuple(uniform_gauge.lambda_raw.shape) != (
+            nk_tot, 3, 3, storage, storage)):
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid exact-contact "
             f"shape {uniform_gauge.lambda_raw.shape}")
-    if (uniform_gauge.dgamma_dq_raw is not None
+    if (complete and uniform_gauge.dgamma_dq_raw is not None
             and tuple(uniform_gauge.dgamma_dq_raw.shape) != (
                 nk_tot, 3, 3, storage, storage)):
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid first transfer "
             f"jet shape {uniform_gauge.dgamma_dq_raw.shape}")
-    if (uniform_gauge.d2gamma_dq2_raw is not None
+    if (complete and uniform_gauge.d2gamma_dq2_raw is not None
             and tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
                 nk_tot, 3, 3, 3, storage, storage)):
         raise ValueError(
