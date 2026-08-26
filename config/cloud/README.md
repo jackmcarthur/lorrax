@@ -82,18 +82,36 @@ exports both `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`.
 
 Verified end-to-end 2026-08-26: the tracked GN-PPM regression deck
 (`tests/regression/gnppm_debug/gnppm_test.in`, `memory_per_device_gb`
-lowered 28→6 for an 8 GB laptop GPU) ran to completion on the RTX 5070 —
-170 s wall, sigma table + `sigma_mnk.h5` written. Against the frozen
-2026-08-09 reference: sigX, VH, Eo **byte-identical**; sigC differs by up
-to 5.525e-2 eV in 828/2898 cells. A same-box CPU A/B (`JAX_PLATFORMS=cpu`,
-host FFI leg: OpenBLAS + netlib ScaLAPACK) agrees with the GPU run
-**exactly — max |Δ| = 0.0 over every cell** — so the delta is not this
+lowered 28→6 for an 8 GB laptop GPU) ran to completion on BOTH backends on
+the bring-up box:
+
+* **GPU** (RTX 5070, `Backend: GPU` confirmed in-log): 149 s wall, zeta
+  fitting 5 s.  Measured XLA BFC arena high-water mark **3.08 GB** against
+  the memory model's 3.20 GB estimate (budget 6.00 GB/dev) — the model was
+  within 4% of measurement.
+* **CPU** (XLA-CPU + host FFI leg, OpenBLAS + netlib ScaLAPACK): zeta
+  fitting 95 s.  No arena accounting on this backend (logged as such).
+
+The two backends' sigma tables agree **exactly — max |Δ| = 0.0 over all
+2898 cells** at the printed precision.  Both differ from the frozen
+2026-08-09 `sigma_diag_gnppm_ref.dat` by the same 5.525e-2 eV in the same
+828 sigC cells (sigX/VH/Eo byte-identical), so the delta is not this
 stack: it is main-tip code vs a reference frozen before the
-head-correction landings (`f83d5ea7`, `d2d6d521`, `a103f1b0`).
-`sigma_diag_gnppm_ref.dat` is due a re-freeze on current main; until then
-expect the Tier-1 gnppm frozen gate red at main tip.
-The dirty `mpirun` exit after "process finalized explicitly" is the
-documented deliberate `os._exit`; judge by artifacts.
+head-correction landings (`f83d5ea7`, `d2d6d521`, `a103f1b0`).  The
+reference is due a re-freeze on current main; until then expect the
+Tier-1 gnppm frozen gate red at main tip.
+
+Two verification traps hit and survived, kept here so the next agent
+constructs the falsification first:
+
+* **WSL demotes to CPU silently.** `skip_gpu_plugin_discovery` keys on
+  `/dev/nvidia*`, which WSL2 does not expose (its GPU is `/dev/dxg`), so a
+  "GPU run" quietly becomes a CPU run — the first A/B here compared CPU
+  to CPU and proved nothing.  The log's `Backend:`/`DEMOTION:` lines are
+  the check; `LORRAX_CPU_SKIP_GPU_PLUGINS=0` restores discovery.  Real
+  cloud boxes expose `/dev/nvidia*` and are unaffected.
+* The dirty `mpirun` exit after "process finalized explicitly" is the
+  documented deliberate `os._exit`; judge by artifacts.
 
 ## Site facts that differ from Perlmutter, and why
 
