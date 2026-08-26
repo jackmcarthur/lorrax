@@ -286,8 +286,14 @@ def build_charge_hall_cubature_response(
     Z_y = jnp.transpose(Z_packed_y, (0, 2, 1))
 
     S_host = np.zeros((2, 2, 4, 4), dtype=np.complex128)
-    S_host[:, :, 0, 0] = np.asarray(
+    charge_S = np.asarray(
         jax.device_get(direct.S_direct[0, :2, :2]), dtype=np.complex128)
+    # Only q_a q_b S_ab enters the charge response.  A broken-TRS velocity
+    # bubble may also contain an imaginary coordinate-antisymmetric part;
+    # that part cancels identically in the quadratic form and belongs to the
+    # separately constructed Hall response.  Store the unique symmetric
+    # representative required by static_gauge_tensor_residuals.
+    S_host[:, :, 0, 0] = 0.5 * (charge_S + charge_S.T)
     S_direct = _replicated(S_host, mesh, dtype=np.complex128)
     sigma_host = np.asarray(
         jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
