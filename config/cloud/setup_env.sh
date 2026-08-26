@@ -78,8 +78,6 @@ for so in "$CU13"/lib/*.so.*; do
     bare="${base%%.so*}.so"
     [[ -e "$CU13/lib/$bare" ]] || ln -sfn "$so" "$CU13/lib/$bare"
 done
-# CMakeLists' find_library PATHS name <root>/lib64; the pip layout is lib/.
-[[ -e "$CU13/lib64" ]] || ln -sfn lib "$CU13/lib64"
 
 # ---------------------------------------------------------------------------
 # Parallel HDF5 from source, against the distro OpenMPI.  Ubuntu's packaged

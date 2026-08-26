@@ -1139,12 +1139,23 @@ def _gpu_is_present() -> bool:
       * ``CUDA_VISIBLE_DEVICES=""`` → explicitly masked, no GPU.
       * any ``/dev/nvidia[0-9]*`` device node (or ``/dev/nvidiactl``) →
         a GPU is physically present on this node.
+      * ``/usr/lib/wsl/lib/libcuda.so.1`` → WSL2 with the Windows NVIDIA
+        driver mapped in.  WSL2 exposes NO ``/dev/nvidia*`` (its GPU rides
+        ``/dev/dxg``), so the device-node probe alone silently demoted GPU
+        runs to CPU there (measured 2026-08-26: a gw_jax run on an RTX 5070
+        box printed ``DEMOTION ... no NVIDIA device node`` and ran XLA:CPU).
+        ``/dev/dxg`` itself is deliberately NOT the signal — it exists on
+        any WSL2 with graphics virtualization, NVIDIA or not, and a
+        yes-here answer on a non-NVIDIA box would unmask benign GPU-init
+        failures.  The mapped libcuda is NVIDIA-exact.
     """
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None and cvd.strip() == "":
         return False
     import glob
-    return bool(glob.glob("/dev/nvidia[0-9]*")) or os.path.exists("/dev/nvidiactl")
+    return (bool(glob.glob("/dev/nvidia[0-9]*"))
+            or os.path.exists("/dev/nvidiactl")
+            or os.path.exists("/usr/lib/wsl/lib/libcuda.so.1"))
 
 
 def fallback_to_cpu_if_no_gpu_backend() -> None:
