@@ -33,13 +33,9 @@ for path in "$MPI_INCLUDE/mpi.h" "$MPI_LIB"; do
     [[ -e "$path" ]] || { echo "[cloud build] REFUSED: no $path (need libopenmpi-dev)" >&2; exit 2; }
 done
 
-# OMPI_SKIP_MPICXX: OpenMPI's mpi.h otherwise emits references to the
-# deprecated MPI C++ bindings (libmpi_cxx), which nothing links —
-# measured as `undefined symbol: _ZN3MPI8Datatype4FreeEv` at dlopen.
 "$CMAKE" --fresh -S "$SRC" -B "$LORRAX_CLOUD_BUILD" -G Ninja \
     -DLORRAX_FFI_PLATFORM=cuda \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_FLAGS="-DOMPI_SKIP_MPICXX=1" \
     -DCMAKE_MAKE_PROGRAM="$LORRAX_CLOUD_ENV/bin/ninja" \
     -DCMAKE_C_COMPILER="$(command -v gcc)" \
     -DCMAKE_CXX_COMPILER="$(command -v g++)" \

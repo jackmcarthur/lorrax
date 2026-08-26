@@ -124,11 +124,15 @@ constructs the falsification first:
 * **NCCL/cuDNN/NVSHMEM** version independently of the toolkit and keep their
   own wheel prefixes beside `nvidia/cu13`; `stack.sh` puts each on the
   runtime `LD_LIBRARY_PATH` and `build_ffi.sh` names NCCL explicitly.
-* **`lib64` symlink.** The FFI CMakeLists searches `<root>/lib64`; the pip
-  layout is `lib/`. `setup_env.sh` links one to the other.
-* **`OMPI_SKIP_MPICXX`.** OpenMPI's `mpi.h` otherwise emits references to
-  the deprecated MPI C++ bindings and the artifact dies at dlopen with
-  `undefined symbol: _ZN3MPI8Datatype4FreeEv` (measured).
+* **Two former shims are now in source** (2026-08-26): the FFI CMakeLists
+  searches `<root>/lib` alongside `lib64` (the pip wheel layout), and
+  defines `OMPI_SKIP_MPICXX` on both legs (OpenMPI's `mpi.h` otherwise
+  emits MPI-C++-binding refs nothing links; measured as a dlopen
+  `undefined symbol: _ZN3MPI8Datatype4FreeEv`). Likewise
+  `runtime._gpu_is_present` now recognizes WSL2's mapped
+  `/usr/lib/wsl/lib/libcuda.so.1`, so GW runs no longer silently demote
+  to CPU there. Both legs rebuilt shim-free and re-verified (all gates,
+  eigh bench, `Backend: GPU` with no override).
 * **Kernel architectures.** The build keeps the default
   `CMAKE_CUDA_ARCHITECTURES=80` (embeds PTX, so sm_90/H100 JITs it on first
   load; the AOT conv cubins fall back to their NVRTC path by design). For

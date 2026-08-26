@@ -24,6 +24,14 @@ if(LORRAX_FFI_PLATFORM STREQUAL "cuda")
 # ============================== CUDA leg ====================================
 project(lorrax_ffi LANGUAGES C CXX)
 
+# Open MPI's mpi.h emits references to the deprecated MPI C++ bindings
+# (libmpi_cxx) unless told not to; nothing links them, so a phdf5-bearing
+# .so built over Open MPI dies at dlopen with
+# `undefined symbol: _ZN3MPI8Datatype4FreeEv` (measured, Ubuntu 24.04
+# OpenMPI 4.1, config/cloud bring-up 2026-08-26).  A no-op macro on every
+# other MPI (Cray MPICH, Intel MPI, MPICH proper define no such guard use).
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
+
 # ----------------------------------------------------------------------------
 # Options / paths
 # ----------------------------------------------------------------------------
@@ -382,11 +390,17 @@ if(NOT EXISTS "${NCCL_INCLUDE}/nccl.h")
     message(FATAL_ERROR "nccl.h not found; pass -DNCCL_INCLUDE=<path>.")
 endif()
 
+# Toolkit lib dir spellings, all real: lib64 (container/NVHPC installs),
+# targets/x86_64-linux/lib (CUDA toolkit trees), and plain lib — the pip
+# nvidia wheels' layout (site-packages/nvidia/cu13/lib), which the
+# config/cloud lane points CUDA_TOOLKIT_ROOT at directly.
 find_library(CUDART_LIBRARY cudart
     PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+          "${CUDA_TOOLKIT_ROOT}/lib"
     NO_DEFAULT_PATH)
 find_library(CUSOLVER_LIBRARY cusolver
     PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+          "${CUDA_TOOLKIT_ROOT}/lib"
     NO_DEFAULT_PATH)
 if(NOT CUSOLVER_LIBRARY)
     message(FATAL_ERROR "libcusolver (single-GPU) not found")
@@ -413,12 +427,14 @@ if(LORRAX_FFI_HAVE_CUFFT)
     find_library(CUFFT_LIBRARY cufft
         PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
               "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+              "${CUDA_TOOLKIT_ROOT}/lib"
               "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64"
               "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/lib"
         NO_DEFAULT_PATH)
     find_library(NVRTC_LIBRARY nvrtc
         PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
               "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+              "${CUDA_TOOLKIT_ROOT}/lib"
         NO_DEFAULT_PATH)
     find_path(CUFFT_INCLUDE_DIR cufft.h
         PATHS "${CUDA_TOOLKIT_ROOT}/include"
@@ -844,6 +860,10 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "host")
 # one-line patch before it will configure here — see
 # config/frontera/build_ffi_host.sh, step "patch SLATE".
 project(lorrax_ffi_host LANGUAGES CXX)
+
+# Same Open MPI C++-bindings guard as the CUDA leg (see the comment there);
+# the host leg's phdf5 handlers include mpi.h too.
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
 
 # liblorrax_ffi_host.so — the host-platform (JAX CPU backend) FFI library.
 #
