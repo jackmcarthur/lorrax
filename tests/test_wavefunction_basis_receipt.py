@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -58,27 +59,43 @@ def test_receipt_is_immutable_and_reuses_the_restart_centroid_digest():
         receipt.role = "charge"
 
 
-def test_precomputed_canonical_wfn_fingerprint_is_reused_without_rescan(
+def test_bound_canonical_wfn_fingerprint_is_reused_without_rescan(
         monkeypatch):
     import common.parallel_transport as transport
 
-    canonical = transport.wfn_fingerprint(_wfn())
+    wfn = _wfn()
+    binding = transport.bind_wfn_fingerprint(wfn)
+    canonical = transport.fingerprint_from_binding(binding, wfn)
+    with pytest.raises(TypeError, match="host-only and transient"):
+        pickle.dumps(binding)
 
     def unexpected_rescan(_wfn_value):
         raise AssertionError("precomputed canonical WFN fingerprint rescanned")
 
     monkeypatch.setattr(transport, "wfn_fingerprint", unexpected_rescan)
-    charge = WavefunctionBasisReceipt.from_source(
-        wfn=_wfn(), wfn_fingerprint_value=canonical,
+    charge = WavefunctionBasisReceipt.from_bound_source(
+        wfn=wfn, wfn_fingerprint_binding=binding,
         role="charge", bispinor=True, band_interval=(1, 5),
         fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
         n_rmu_logical=3, n_rmu_padded=4)
-    transverse = WavefunctionBasisReceipt.from_source(
-        wfn=_wfn(), wfn_fingerprint_value=canonical,
+    transverse = WavefunctionBasisReceipt.from_bound_source(
+        wfn=wfn, wfn_fingerprint_binding=binding,
         role="transverse", bispinor=True, band_interval=(1, 5),
         fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
         n_rmu_logical=3, n_rmu_padded=4)
     assert charge.wfn_fingerprint == transverse.wfn_fingerprint == canonical
+    with pytest.raises(ValueError, match="different loaded WFN object"):
+        WavefunctionBasisReceipt.from_bound_source(
+            wfn=_wfn(), wfn_fingerprint_binding=binding,
+            role="charge", bispinor=True, band_interval=(1, 5),
+            fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
+            n_rmu_logical=3, n_rmu_padded=4)
+    with pytest.raises(TypeError, match="bind_wfn_fingerprint"):
+        WavefunctionBasisReceipt.from_bound_source(
+            wfn=wfn, wfn_fingerprint_binding=canonical,
+            role="charge", bispinor=True, band_interval=(1, 5),
+            fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
+            n_rmu_logical=3, n_rmu_padded=4)
 
 
 def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
@@ -96,11 +113,11 @@ def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "WavefunctionBasisReceipt"
-        and node.func.attr == "from_source"
+        and node.func.attr == "from_bound_source"
     ]
     assert len(receipt_calls) == 4
     assert all(
-        any(keyword.arg == "wfn_fingerprint_value"
+        any(keyword.arg == "wfn_fingerprint_binding"
             for keyword in call.keywords)
         for call in receipt_calls)
 
@@ -108,12 +125,13 @@ def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
         node for node in ast.walk(prepare)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "wfn_fingerprint"
+        and node.func.id == "bind_wfn_fingerprint"
     ]
     assert len(canonical_scans) == 1
     assert (len(canonical_scans[0].args) == 1
             and isinstance(canonical_scans[0].args[0], ast.Name)
             and canonical_scans[0].args[0].id == "wfn")
+    assert "wfn_fingerprint_value" not in source.read_text(encoding="utf-8")
 
 
 def test_fresh_and_restart_face_builders_validate_host_receipt():
