@@ -90,7 +90,7 @@ def test_restart_qp_state_matrix(
                 state_artifact_path=str(restart),
                 where="focused state matrix")
         if error is None:
-            assert call() == state
+            assert call() is None
         else:
             with pytest.raises(ValueError, match=error):
                 call()
@@ -115,25 +115,66 @@ def test_record_roundtrip_and_malformed_refusal(tmp_path):
         read_qp_state_source_provenance(restart)
 
 
-def test_qp_state_provenance_reuses_precomputed_canonical_fingerprint(
+def test_qp_state_provenance_reuses_bound_canonical_fingerprint(
         tmp_path, monkeypatch):
     from common import parallel_transport
-    from file_io.qp_wfn import qp_state_source_provenance
+    from file_io.qp_wfn import qp_state_source_provenance_from_binding
 
     source = tmp_path / "WFN.h5"
     _wfn(source, qp=False, fingerprint="d" * 64)
+
+    wfn = type("PathBearingWfn", (), {"path": str(source)})()
+    monkeypatch.setattr(
+        parallel_transport, "wfn_fingerprint", lambda _wfn: "d" * 64)
+    binding = parallel_transport.bind_wfn_fingerprint(wfn)
 
     def unexpected_rescan(_wfn_value):
         raise AssertionError("precomputed canonical WFN fingerprint rescanned")
 
     monkeypatch.setattr(
         parallel_transport, "wfn_fingerprint", unexpected_rescan)
-    record = qp_state_source_provenance(
-        type("PathBearingWfn", (), {"path": str(source)})(),
-        wfn_fingerprint_value="d" * 64)
+    record = qp_state_source_provenance_from_binding(
+        wfn, wfn_fingerprint_binding=binding)
     assert record["wfn_fingerprint"] == "d" * 64
 
-    with pytest.raises(ValueError, match="64-digit lowercase"):
-        qp_state_source_provenance(
+    with pytest.raises(ValueError, match="different loaded WFN object"):
+        qp_state_source_provenance_from_binding(
             type("PathBearingWfn", (), {"path": str(source)})(),
-            wfn_fingerprint_value="NOT-A-CANONICAL-FINGERPRINT")
+            wfn_fingerprint_binding=binding)
+    with pytest.raises(TypeError, match="bind_wfn_fingerprint"):
+        qp_state_source_provenance_from_binding(
+            wfn, wfn_fingerprint_binding="d" * 64)
+
+
+def test_restart_authentication_scans_stamped_wfn_once_and_legacy_zero(
+        tmp_path, monkeypatch):
+    from common import parallel_transport
+    from file_io.qp_wfn import (
+        authenticate_restart_qp_state_source_for_wfn,
+    )
+
+    selected = tmp_path / "WFN.h5"
+    restart = tmp_path / "restart.h5"
+    _wfn(selected, qp=False, fingerprint="e" * 64)
+    wfn = type("PathBearingWfn", (), {"path": str(selected)})()
+    scans = []
+
+    def canonical_scan(value):
+        scans.append(value)
+        return "e" * 64
+
+    monkeypatch.setattr(
+        parallel_transport, "wfn_fingerprint", canonical_scan)
+    _restart(restart, _record(selected))
+    record, binding = authenticate_restart_qp_state_source_for_wfn(
+        wfn=wfn, state_artifact_path=str(restart), where="focused restart")
+    assert record == _record(selected)
+    assert parallel_transport.fingerprint_from_binding(binding, wfn) == "e" * 64
+    assert scans == [wfn]
+
+    scans.clear()
+    _restart(restart)
+    record, binding = authenticate_restart_qp_state_source_for_wfn(
+        wfn=wfn, state_artifact_path=str(restart), where="focused restart")
+    assert (record, binding) == (None, None)
+    assert scans == []

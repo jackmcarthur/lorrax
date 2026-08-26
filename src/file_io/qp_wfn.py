@@ -828,28 +828,29 @@ def read_qp_state_source_provenance(path) -> dict | None:
     return _validate_qp_state_source(record, path=str(path))
 
 
-def qp_state_source_provenance(
-        wfn, *, wfn_fingerprint_value: str | None = None) -> dict:
-    """Describe the already-loaded WFN which supplied restart ``psi/E``.
+def qp_state_source_provenance(wfn) -> dict:
+    """Describe the already-loaded WFN which supplied restart ``psi/E``."""
+    from common.parallel_transport import bind_wfn_fingerprint
+    return qp_state_source_provenance_from_binding(
+        wfn, wfn_fingerprint_binding=bind_wfn_fingerprint(wfn))
 
-    ``wfn_fingerprint_value`` lets an orchestration owner reuse the canonical
-    fingerprint it already computed for the same loaded WFN.  The default
-    remains self-contained; no second fingerprint implementation is added.
-    """
-    from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+
+def qp_state_source_provenance_from_binding(
+        wfn, *, wfn_fingerprint_binding) -> dict:
+    """Describe ``wfn`` from a canonical digest bound to this exact object."""
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME,
+        fingerprint_from_binding,
+    )
     source_path = getattr(wfn, "path", None)
     if not source_path:
         raise ValueError("QP restart provenance requires a path-bearing WFN")
-    fingerprint = (
-        wfn_fingerprint(wfn)
-        if wfn_fingerprint_value is None
-        else _require_wfn_fingerprint(
-            wfn_fingerprint_value,
-            where="QP restart provenance precomputed WFN fingerprint"))
     return {
         "schema": QP_STATE_SOURCE_SCHEMA,
         "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
-        "wfn_fingerprint": fingerprint,
+        "wfn_fingerprint": _require_wfn_fingerprint(
+            fingerprint_from_binding(wfn_fingerprint_binding, wfn),
+            where="QP restart provenance bound WFN fingerprint"),
         "qp_wfn_stamp": read_qp_wfn_stamp(source_path),
     }
 
@@ -876,12 +877,13 @@ def _qp_state_source_from_path(path) -> dict:
             close()
 
 
-def refuse_conflicting_qp_state_sources(
+def _refuse_conflicting_qp_state_sources(
         *, wfn_path: str, eqp_file: str | None = None,
         qp_rotations_file: str | None = None,
         state_artifact_path: str | None = None,
-        where: str = "QP-state consumer") -> dict | None:
-    """Refuse two explicit descriptions of one quasiparticle state.
+        where: str = "QP-state consumer",
+        _selected_source=None) -> dict | None:
+    """Implement the QP-state refusal and return an authenticated record.
 
     A positively stamped QP WFN already contains the matched rotated orbitals
     and eigenvalues.  Applying either a DFT-labelled diagonal eqp ladder or a
@@ -901,10 +903,9 @@ def refuse_conflicting_qp_state_sources(
     restart record remains usable only without an external or positive QP
     description.
 
-    Return the already-read, authenticated restart source record when one is
-    present, otherwise ``None``.  Callers that only need the refusal may
-    ignore the return; orchestration owners can reuse it without reopening
-    the artifact after authentication.
+    ``_selected_source`` is an internal lazy callback used by the GW restart
+    owner.  Its result is still built by this module from an opaque canonical
+    WFN binding; no digest value crosses the caller API.
     """
     if eqp_file and qp_rotations_file:
         raise ValueError(
@@ -937,7 +938,9 @@ def refuse_conflicting_qp_state_sources(
                     "positively stamped QP state.")
             return
 
-        selected = _qp_state_source_from_path(wfn_path)
+        selected = (
+            _qp_state_source_from_path(wfn_path)
+            if _selected_source is None else _selected_source())
         stamp = provenance["qp_wfn_stamp"]
         if provenance["wfn_fingerprint"] != selected["wfn_fingerprint"]:
             raise ValueError(
@@ -984,3 +987,56 @@ def refuse_conflicting_qp_state_sources(
         "LABELS, and a second U rotates the state twice; either operation "
         "silently changes the represented Hamiltonian with the right "
         f"shapes.  {fix}{version_note}")
+
+
+def refuse_conflicting_qp_state_sources(
+        *, wfn_path: str, eqp_file: str | None = None,
+        qp_rotations_file: str | None = None,
+        state_artifact_path: str | None = None,
+        where: str = "QP-state consumer") -> None:
+    """Refuse two explicit descriptions of one quasiparticle state.
+
+    This established public guard deliberately remains verdict-only.  The GW
+    restart orchestrator uses
+    :func:`authenticate_restart_qp_state_source_for_wfn` when it also needs
+    the exact record and bound loaded-WFN identity used by the comparison.
+    """
+    _refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file,
+        qp_rotations_file=qp_rotations_file,
+        state_artifact_path=state_artifact_path, where=where)
+
+
+def authenticate_restart_qp_state_source_for_wfn(
+        *, wfn, state_artifact_path: str,
+        where: str = "QP-state consumer"):
+    """Authenticate one restart and return ``(record, WFN binding)``.
+
+    A legacy restart returns ``(None, None)`` without scanning the WFN.  A
+    stamped restart scans the exact already-loaded WFN once, compares that
+    bound identity with the record, and returns the same opaque binding for
+    receipt construction.  The digest string itself never enters caller
+    control.
+    """
+    wfn_path = getattr(wfn, "path", None)
+    if not wfn_path:
+        raise ValueError(
+            f"{where}: selected WFN has no path, so restart psi/E "
+            "compatibility cannot be checked")
+    binding_box = []
+
+    def selected_source():
+        from common.parallel_transport import bind_wfn_fingerprint
+        binding = bind_wfn_fingerprint(wfn)
+        binding_box.append(binding)
+        return qp_state_source_provenance_from_binding(
+            wfn, wfn_fingerprint_binding=binding)
+
+    record = _refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, state_artifact_path=state_artifact_path,
+        where=where, _selected_source=selected_source)
+    binding = binding_box[0] if binding_box else None
+    if (record is None) != (binding is None):
+        raise AssertionError(
+            "restart source authentication returned a torn host binding")
+    return record, binding
