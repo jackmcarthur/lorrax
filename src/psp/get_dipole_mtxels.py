@@ -50,7 +50,8 @@ from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 blocks_to_host, dipole_operator,
-                                sweep_matrix_elements)
+                                sweep_matrix_elements,
+                                sweep_uniform_gauge_matrix_elements)
 from common.parallel_transport import (
 	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
 )
@@ -891,6 +892,14 @@ def main(argv=None):
 			 "(dipole_cart, deltaE) blocks.",
 	)
 	parser.add_argument(
+		"--static-gauge-hall-only",
+		action="store_true",
+		help="Run only the canonical full-BZ uniform current/contact/transfer-"
+		     "jet sweep and print its provenance-bound raw Hall pseudovector. "
+		     "This diagnostic does not write dipole.h5 or fabricate the other "
+		     "fields of a StaticGaugeHeadResponse artifact.",
+	)
+	parser.add_argument(
 		"--iq-list",
 		type=int,
 		nargs='+',
@@ -905,6 +914,15 @@ def main(argv=None):
 			"--parallel-transport-velocity-only requires "
 			"--parallel-transport-out: it names the file to write the "
 			"velocity-only artifact to")
+	if args.static_gauge_hall_only:
+		if args.vnl_mode != "analytic" or args.skip_vnl:
+			parser.error(
+				"--static-gauge-hall-only requires the analytic VNL operator")
+		if (args.parallel_transport_out is not None or args.w_av_only
+				or args.with_finite_q):
+			parser.error(
+				"--static-gauge-hall-only cannot be combined with another "
+				"dipole/PT/finite-q producer")
 	if args.parallel_transport_out is not None:
 		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
 			parser.error(
@@ -1013,6 +1031,10 @@ def main(argv=None):
 	except Exception:
 		nband = max(int(wfn.nbands), int(wfn.nelec) + int(ncond))
 	bispinor = bool(params.get("bispinor", False))
+	if args.static_gauge_hall_only and not bispinor:
+		parser.error(
+			"--static-gauge-hall-only requires bispinor=true so the canonical "
+			"kinetic-balance four-current is present")
 
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``
@@ -1162,6 +1184,8 @@ def main(argv=None):
 		meta,
 		pseudos,
 		nspinor=int(wfn.nspinor),
+		compute_contact=bool(args.static_gauge_hall_only),
+		compute_transfer_q2=bool(args.static_gauge_hall_only),
 	)
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
@@ -1202,6 +1226,42 @@ def main(argv=None):
 
 	nk = int(sym.nk_tot)
 	nb = int(nband_eff)
+	if args.static_gauge_hall_only:
+		from gw.qsgw_head import static_gauge_hall_transaction
+
+		psi_G = wfn.load(
+			bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
+			bispinor=True)
+		geom = SweepGeometry(
+			mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
+			ngkmax=int(psi_G.shape[3]), nb=nb, ns=int(psi_G.shape[2]),
+			nk=nk, cell_volume=float(wfn.cell_volume))
+		with timing.section("static_gauge_uniform_sweep"):
+			uniform_gauge = sweep_uniform_gauge_matrix_elements(
+				psi_G, wfn=wfn, band_start=0, band_stop=nb, geom=geom,
+				bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
+				gvecs=gtab.gvecs, gmask=gtab.mask,
+				box_index=wfn.box_index(k="full_bz"),
+				kvecs=np.asarray(gtab.kvecs), include_transfer_q2=True)
+		with timing.section("static_gauge_hall_reduce"):
+			hall = static_gauge_hall_transaction(
+				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
+				band_stop=nb, mesh=RUNTIME.mesh)
+			sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
+		if jax.process_index() == 0:
+			print(
+				"STATIC_GAUGE_HALL_TRANSACTION "
+				f"producer_id={hall.producer_id} "
+				f"operator_fingerprint="
+				f"{hall.hamiltonian_config_operator_fingerprint} "
+				f"bands=[{hall.band_start},{hall.band_stop}) "
+				f"nk_tot={hall.nk_tot} "
+				f"sigma_H_raw_bohr^-1="
+				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
+				f"{sigma_H[2]:.17e}]")
+		timing.report(title="--- Timing (seconds) ---",
+		              wall=time.perf_counter() - _t_main)
+		return 0
 
 	# ── ΔE: pure host arithmetic on the band energy table ───────────────
 	# No ψ, no device, nk·nb²·8 B (2 MB at MoS₂ 4×4 / 128 bands), so it is

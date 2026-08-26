@@ -18,13 +18,16 @@ from jax.sharding import Mesh
 import common.parallel_transport as parallel_transport_module
 from common.chi_from_dipole import compute_S_omega
 from common.bispinor_init import HALFALPHA
+from common.mtxel_sweep import UniformGaugeMatrixElements
 from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
+    StaticGaugeHallTransaction,
     assemble_head_manifold,
     covariant_link_derivative,
     head_wings_sharded,
     head_s_tensor_sharded,
     raw_hall_pseudovector_sharded,
+    static_gauge_hall_transaction,
     load_parallel_transport_head,
     reduced_covector_to_cartesian,
     rotate_velocity_active_to_qp,
@@ -834,6 +837,70 @@ def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
             gamma_raw, bad_energies, occupations,
             mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
             nspin=1, nspinor_wfn=2)
+
+
+def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint():
+    """One full-BZ uniform transaction owns Hall values and provenance."""
+    rng = np.random.default_rng(82601)
+    nk, logical, storage = 2, 3, 4
+    raw = (rng.normal(size=(nk, 3, storage, storage))
+           + 1j * rng.normal(size=(nk, 3, storage, storage)))
+    gamma = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
+    fingerprint = "sha256:" + "c" * 64
+    uniform = UniformGaugeMatrixElements(
+        gamma_raw=jnp.asarray(gamma),
+        lambda_raw=jnp.zeros(
+            (nk, 3, 3, storage, storage), dtype=jnp.complex128),
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        dgamma_dq_raw=jnp.zeros(
+            (nk, 3, 3, storage, storage), dtype=jnp.complex128),
+        d2gamma_dq2_raw=jnp.zeros(
+            (nk, 3, 3, 3, storage, storage), dtype=jnp.complex128),
+    )
+    energies_file = np.asarray([[[-1.1, -0.3, 0.8]]], dtype=np.float64)
+    occupations_file = np.asarray([[[1.0, 1.0, 0.0]]], dtype=np.float64)
+    wfn = SimpleNamespace(
+        energies=energies_file,
+        occs=occupations_file,
+        nbands=logical,
+        nspin=1,
+        nspinor=2,
+        cell_volume=31.0,
+    )
+    sym = SimpleNamespace(
+        nk_tot=nk,
+        nk_red=1,
+        irr_idx_k=np.asarray([0, 0], dtype=np.int32),
+        sym_idx_k=np.asarray([0, 1], dtype=np.int32),
+        sym_mats_k=np.stack((np.eye(3), -np.eye(3))),
+    )
+
+    got = static_gauge_hall_transaction(
+        uniform,
+        wfn=wfn,
+        sym=sym,
+        band_start=0,
+        band_stop=logical,
+        mesh=_mesh(),
+    )
+    expected = raw_hall_pseudovector_sharded(
+        uniform.gamma_raw,
+        np.repeat(energies_file[0], nk, axis=0),
+        np.repeat(occupations_file[0], nk, axis=0),
+        mesh=_mesh(),
+        nb_logical=logical,
+        cell_volume=31.0,
+        nk_tot=nk,
+        nspin=1,
+        nspinor_wfn=2,
+    )
+    assert isinstance(got, StaticGaugeHallTransaction)
+    np.testing.assert_allclose(got.sigma_H, expected, rtol=0.0, atol=0.0)
+    assert got.hamiltonian_config_operator_fingerprint == fingerprint
+    assert (got.band_start, got.band_stop, got.nk_tot) == (0, logical, nk)
+    assert got.producer_id == "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1"
+    with pytest.raises(TypeError, match="issued only"):
+        replace(got, _producer_token=object())
 
 
 def test_uniform_gauge_fingerprint_is_contact_capability_only():
