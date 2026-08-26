@@ -26,17 +26,12 @@ from common import jax_profile
 from common.collectives import barrier
 from runtime import debug_print_enabled
 
-
-
-# Backward-compatible re-exports
-from .gw_config import read_lorrax_input, read_cohsex_input  # noqa: F401
-
 # Canonical env grammar for this layer.  ``gw_config`` is deliberately
 # jax-free, so importing it here adds nothing to the import graph that
-# ``read_lorrax_input`` above did not already add.  See the module comment
-# in gw_config for why this vocabulary is duplicated rather than imported
-# from ``isdf.core`` (which imports jax) — and for the drift gate that
-# keeps the copies identical.
+# the declarations below do not already add.  See the module comment in
+# gw_config for why this vocabulary is duplicated rather than imported from
+# ``isdf.core`` (which imports jax) — and for the drift gate that keeps the
+# copies identical.
 from .gw_config import (
 	env_bool,
 	active_zeta_truncating_knobs,

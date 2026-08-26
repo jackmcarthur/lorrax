@@ -48,6 +48,7 @@ from isdf import factor_c_q
 from gw.gw_config import (
     distrib_la_batched_route_choices,
     eigh_backend_choices,
+    read_cohsex_input,
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
 )
@@ -2565,7 +2566,6 @@ def main(argv=None):
                  energy_source=_energy_source)
     report.architecture()
 
-    from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
     # Input file is the source of truth; the CLI flag is an override — and
     # BOTH go through the one resolver, which is where ``use_low_mem_eigh``

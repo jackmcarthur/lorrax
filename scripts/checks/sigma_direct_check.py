@@ -85,7 +85,7 @@ import numpy as np
 
 from common import Meta
 from common.chi_from_dipole import compute_S_omega, read_dipole_h5
-from gw.gw_init import read_cohsex_input
+from gw.gw_config import read_cohsex_input
 from gw.minimax_screening import fit_gn_ppm_from_wc_pair
 from gw.vcoul import compute_q0_averages
 from file_io import EPSReader, resolve_input_paths

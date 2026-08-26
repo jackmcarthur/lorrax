@@ -54,7 +54,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from gw.gw_init import read_cohsex_input
+from gw.gw_config import read_cohsex_input
 from gw.vcoul import compute_q0_averages
 from file_io import EPSReader, resolve_input_paths
 # The vcoul branch reached its door with a bare ``from vcoul import ...``

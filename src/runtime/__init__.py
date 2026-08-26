@@ -50,9 +50,8 @@ this module exists to end.
 This module imports jax only inside function bodies, so importing it costs
 nothing and the env defaults it sets are in place before jax reads them.
 The distributed guard (``_LORRAX_JAX_DISTRIBUTED_DONE``) is an env sentinel
-so it survives the re-import path ``python -m gw.gw_jax`` → ``gw_init`` →
-``gw.gw_jax``; the mesh guard (``_STACK``) is a module global because a
-second mesh is a per-process hazard, not a per-job one.
+so it survives module reloads; the mesh guard (``_STACK``) is a module global
+because a second mesh is a per-process hazard, not a per-job one.
 """
 from __future__ import annotations
 
@@ -997,10 +996,10 @@ def init_jax_distributed() -> None:
     """Call ``jax.distributed.initialize()`` idempotently.
 
     Safe to call multiple times — the ``_LORRAX_JAX_DISTRIBUTED_DONE``
-    env sentinel persists across re-imports within a process (module-
-    level Python globals don't, which is why the previous per-driver
-    copies sometimes double-initialised when ``python -m gw.gw_jax``
-    pulled ``gw.gw_jax`` in again through ``gw_init``).
+    env sentinel persists across module reloads within a process (module-
+    level Python globals do not, which is why the previous per-driver copies
+    could double-initialise in harnesses that loaded more than one entry
+    point).
 
     The Cray MPICH stack on Perlmutter runs each rank with
     ``CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`` — exactly one GPU per
@@ -1415,11 +1414,11 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     print_fn
         Where the report goes; default is a rank-0-gated ``print``.
 
-    Idempotent.  Drivers import each other (``python -m gw.gw_jax`` re-imports
-    ``gw.gw_jax`` through ``gw_init``), so the second call must not build a
-    second mesh -- it returns the first :class:`RuntimeStack`.  A second call
-    asking for DIFFERENT ``axis_names`` is not a re-entry, it is a request for
-    a second mesh, and it RAISES rather than silently handing back the first.
+    Idempotent.  A library or harness can load more than one entry point in a
+    process, so the second call must not build a second mesh -- it returns the
+    first :class:`RuntimeStack`.  A second call asking for DIFFERENT
+    ``axis_names`` is not a re-entry, it is a request for a second mesh, and it
+    RAISES rather than silently handing back the first.
     """
     global _STACK
     if _STACK is not None:

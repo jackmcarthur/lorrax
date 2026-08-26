@@ -43,8 +43,8 @@ from runtime import (
 #: stating everything it resolved.  It MUST stay above this module's own
 #: ``import jax``: the env defaults only bind before jax reads them.
 #:
-#: Idempotent, so the ``python -m gw.gw_jax`` -> ``gw_init`` -> ``gw.gw_jax``
-#: re-import path gets the same stack rather than a second mesh.
+#: Idempotent so a library or harness that imports more than one entry point
+#: in one process gets the same stack rather than a second mesh.
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import argparse
@@ -403,7 +403,7 @@ def main(argv=None):
 		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
 
 	# Everything from ``main()`` entry to here is the driver PROLOGUE:
-	# config parse, the config-dependent phdf5 MPI pre-init, WFN + symmetry +
+	# config parse, the PHDF5 MPI pre-init, WFN + symmetry +
 	# centroid reads, the head resolver.  (The mesh, its collective warm-up
 	# and the compile cache are NOT here any more — they happen above
 	# ``main()`` in ``initialize_communicator_stack`` and are reported as
