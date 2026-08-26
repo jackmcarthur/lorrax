@@ -84,9 +84,13 @@ class GWProductionReport:
             return
         upper = text.upper()
         if any(word in upper for word in _WARNING_WORDS):
-            cleaned = " ".join(text.split())
-            if cleaned and cleaned not in self._warnings:
-                self._warnings.append(cleaned)
+            self._retain_warning(text)
+
+    def _retain_warning(self, text: str) -> None:
+        """Retain one normalized warning for the final consolidated block."""
+        cleaned = " ".join(str(text).split())
+        if cleaned and cleaned not in self._warnings:
+            self._warnings.append(cleaned)
 
     def heading(self, title: str) -> None:
         self.emit()
@@ -312,6 +316,26 @@ class GWProductionReport:
                     shortfalls.append(f"{-upper_margin:.5f} eV above")
                 self.emit("Grid shortfall  : " + "; ".join(shortfalls)
                           + " protected DFT states")
+                coverage = getattr(sigma_result, "omega_coverage", None)
+                policy_name = str(getattr(coverage, "policy", "unknown"))
+                affected = ""
+                if coverage is not None:
+                    mask = np.asarray(getattr(coverage, "mask_kn", ()))
+                    default_uncovered = (int(np.count_nonzero(~mask.astype(
+                        bool))) if mask.size else 0)
+                    n_uncovered = int(getattr(
+                        coverage, "n_uncovered", default_uncovered))
+                    if mask.size:
+                        affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
+                                    f"{mask.size} out-of-grid cells")
+                self._retain_warning(
+                    "WARNING: dynamic Sigma grid is incomplete for protected "
+                    "DFT states (" + "; ".join(shortfalls) + f"){affected}; "
+                    f"out-of-range policy={policy_name}. Widen "
+                    "sigma_omega_min_ev / sigma_omega_max_ev or add a "
+                    "sigma_omega_patches_ev window; use "
+                    "LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values "
+                    "must never enter an output.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
@@ -357,26 +381,77 @@ class GWProductionReport:
         self.emit("State energies  : written to the EQP files listed below")
 
     def timings(self, records, *, wall: float) -> None:
-        """Print accumulated, non-overlapping major scientific stages."""
+        """Print accumulated, non-overlapping major scientific stages.
+
+        ``gw_jax.isdf`` and ``gw_jax.screening`` are inclusive parent timers.
+        Their named child rows are therefore subtracted from a residual setup
+        row instead of being added beside the parent.  This keeps the report's
+        invariant explicit: every displayed stage contributes to the wall
+        exactly once, while retaining the zeta/V and chi0/W distinctions that
+        operators use to diagnose scaling.
+        """
+        rows = list(records)
+
         def total(predicate):
-            return sum(float(row["inclusive"]) for row in records
+            return sum(float(row["inclusive"]) for row in rows
                        if predicate(row))
+
+        def top_level(*names):
+            wanted = set(names)
+            return total(lambda r: r["name"] in wanted
+                         and tuple(r.get("path", (r["name"],)))
+                         == (r["name"],))
+
+        def outer_prefixed(prefix, *, within=None):
+            def selected(row):
+                path = tuple(row.get("path", (row["name"],)))
+                if not row["name"].startswith(prefix):
+                    return False
+                if within is not None and (not path or path[0] != within):
+                    return False
+                return not any(str(parent).startswith(prefix)
+                               for parent in path[:-1])
+            return total(selected)
+
+        isdf_total = top_level("gw_jax.isdf")
+        zeta = outer_prefixed(
+            "gw_jax.zeta_fit_chunked", within="gw_jax.isdf")
+        v_q = total(lambda r: r["name"] == "gw_jax.V_q_compute"
+                    and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        restart_load = total(
+            lambda r: r["name"] == "gw_jax.restart_load"
+            and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        isdf_support = max(isdf_total - zeta - v_q - restart_load, 0.0)
+
+        screening_total = top_level("gw_jax.screening")
+        chi0 = outer_prefixed("chi.", within="gw_jax.screening")
+        w_screen = outer_prefixed("W.", within="gw_jax.screening")
+        screening_support = max(screening_total - chi0 - w_screen, 0.0)
 
         stages = [
             ("runtime bring-up", total(lambda r: r["name"].startswith(
                 "gw_jax.runtime_stack."))),
-            ("pre-main + imports", total(lambda r: r["name"] ==
-                                          "gw_jax.imports")),
-            ("zeta", total(lambda r: r["name"].startswith(
-                "gw_jax.zeta_fit_chunked"))),
-            ("V(q)", total(lambda r: r["name"] == "gw_jax.V_q_compute")),
-            ("chi0", total(lambda r: r["name"].startswith("chi.") and
-                           not any(p.startswith("chi.") for p in r["path"][:-1]))),
-            ("W", total(lambda r: r["name"].startswith("W.") and
-                        not any(p.startswith("W.") for p in r["path"][:-1]))),
-            ("Sigma", total(lambda r: r["name"] in
-                            ("gw_jax.sigma", "gw_jax.sc_driver"))),
+            ("pre-main + imports", top_level("gw_jax.imports")),
+            ("input + run setup", top_level("gw_jax.startup")),
+            ("zeta", zeta),
+            ("V(q)", v_q),
+            ("restart load", restart_load),
+            ("ISDF setup + I/O", isdf_support),
+            ("minimax quadrature", top_level("gw_jax.minimax_quadrature")),
+            ("chi0", chi0),
+            ("W", w_screen),
+            ("screening support", screening_support),
+            ("W persist + q0 head", top_level(
+                "gw_jax.persist_w0", "gw_jax.static_head")),
+            ("Sigma", top_level("gw_jax.sigma", "gw_jax.sc_driver")),
+            ("mean-field load", top_level("gw_jax.kin_ion_load")),
+            ("QP solve + diagonalize", top_level(
+                "gw_jax.solve_qp", "gw_jax.qp_eigh")),
+            ("result writes", top_level("gw_jax.output")),
         ]
+        # A stage absent in a mode should not occupy a zero-valued report row.
+        stages = [(name, seconds) for name, seconds in stages
+                  if seconds > 0.0]
         accounted = sum(seconds for _name, seconds in stages)
         stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")
