@@ -1023,6 +1023,7 @@ def _static_slab_photon_head_moment_chunk(
     H_hall: jax.Array,
     S_quadratic: jax.Array,
     valid_count: jax.Array,
+    sample_weight: jax.Array,
 ):
     r"""Accumulate one fixed-size chunk of the coupled small-head solve.
 
@@ -1057,7 +1058,8 @@ def _static_slab_photon_head_moment_chunk(
     W_head = jnp.linalg.solve(lhs, D)
 
     valid = jnp.arange(q.shape[0], dtype=jnp.int32) < valid_count
-    weight = valid.astype(jnp.float64)
+    weight = jnp.where(
+        valid, jnp.asarray(sample_weight, dtype=jnp.float64), 0.0)
     basis = jnp.concatenate(
         (jnp.ones((q.shape[0], 1), dtype=jnp.float64), qxy), axis=1)
     moments = jnp.einsum(
@@ -1068,11 +1070,21 @@ def _static_slab_photon_head_moment_chunk(
     residual = jnp.einsum(
         "sik,skj->sij", lhs, W_head, optimize=True) - D
     residual_norm = jnp.linalg.norm(residual, axis=(-2, -1))
+    lhs_norm = jnp.linalg.norm(lhs, axis=(-2, -1))
+    W_norm = jnp.linalg.norm(W_head, axis=(-2, -1))
     D_norm = jnp.linalg.norm(D, axis=(-2, -1))
-    relative = residual_norm / jnp.maximum(
-        D_norm, jnp.asarray(1.0e-300, dtype=jnp.float64))
-    max_relative = jnp.max(jnp.where(valid, relative, 0.0))
-    return moments, D_sum, valid_count, max_relative
+    backward = residual_norm / jnp.maximum(
+        lhs_norm * W_norm + D_norm,
+        jnp.asarray(1.0e-300, dtype=jnp.float64))
+    singular_values = jnp.linalg.svd(lhs, compute_uv=False)
+    sigma_min = singular_values[:, -1]
+    condition = singular_values[:, 0] / jnp.maximum(
+        sigma_min, jnp.asarray(1.0e-300, dtype=jnp.float64))
+    max_backward = jnp.max(jnp.where(valid, backward, 0.0))
+    min_sigma = jnp.min(jnp.where(valid, sigma_min, jnp.inf))
+    max_condition = jnp.max(jnp.where(valid, condition, 0.0))
+    return (moments, D_sum, valid_count, max_backward, min_sigma,
+            max_condition)
 
 
 def static_slab_photon_head_moment_chunk(
@@ -1081,6 +1093,7 @@ def static_slab_photon_head_moment_chunk(
     sigma_H,
     S_quadratic,
     valid_count,
+    sample_weight,
 ):
     """Validated entry to the fixed-size static slab photon-head graph.
 
@@ -1113,14 +1126,24 @@ def static_slab_photon_head_moment_chunk(
     if not 0 <= n_valid <= q_shape[0]:
         raise ValueError(
             f"valid_count must lie in [0,{q_shape[0]}], got {n_valid}")
+    weight = np.asarray(sample_weight, dtype=np.float64)
+    if weight.shape != (q_shape[0],):
+        raise ValueError(
+            f"sample_weight must be {(q_shape[0],)}, got {weight.shape}")
+    if (not np.all(np.isfinite(weight)) or np.any(weight[:n_valid] < 0.0)
+            or np.any(weight[n_valid:] != 0.0)):
+        raise ValueError(
+            "sample_weight must be finite and nonnegative on valid rows, "
+            "with exact zeros on padded rows")
     H_hall = static_hall_linear_response(sigma_H)
     S_sharding = getattr(S_quadratic, "sharding", None)
     if isinstance(S_sharding, NamedSharding):
         H_hall = jax.device_put(
             H_hall, NamedSharding(S_sharding.mesh, P()))
-    return _static_slab_photon_head_moment_chunk(
+    result = _static_slab_photon_head_moment_chunk(
         q_cart, D_raw, H_hall, S_quadratic,
-        jnp.asarray(n_valid, dtype=jnp.int32))
+        jnp.asarray(n_valid, dtype=jnp.int32), jnp.asarray(weight))
+    return result
 
 
 @dataclass(frozen=True)
@@ -1129,15 +1152,23 @@ class StaticSlabPhotonHeadCompletion:
 
     bare_D_mean: np.ndarray
     screened_moments: np.ndarray
-    samples_per_replicate: tuple[int, ...]
-    max_dyson_relative_residual: float
+    cubature_receipt: object
+    observed_physical_counts: tuple[int, int, int]
+    observed_padded_solve_counts: tuple[int, int, int]
+    max_backward_residual: float
+    min_dyson_singular_value: float
+    max_dyson_condition_number: float
+    dyson_condition_roundoff_bound: float
+    mixed_scale_qstar: float
+    mixed_convergence_error_ratios: tuple[float, float]
     ward_residual: float
     hermiticity_residual: float
     hamiltonian_config_operator_fingerprint: str
-    estimator: str = "vcoul_minibz_equal_replicate_mean_v1"
 
 
-_STATIC_PHOTON_DYSON_RESIDUAL_MAX = 1.0e-8
+_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
+_STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL = 1.0e-8
+_STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL = 1.0e-12
 
 
 def complete_static_slab_photon_q0(
@@ -1146,15 +1177,16 @@ def complete_static_slab_photon_q0(
     response: StaticGaugeHeadResponse,
     g0_X: jax.Array,
     g0_Y: jax.Array,
-    photon_sample_chunks,
+    cubature_receipt,
     *,
     cell_volume: float,
     mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
-    ``photon_sample_chunks`` is the sole vcoul provider's streamed slab
-    output.  Each sample first solves the coupled four-field head Dyson
+    ``cubature_receipt`` is the sole vcoul provider's authenticated exact
+    Wigner--Seitz/Duffy ladder.  Each sample first solves the coupled
+    four-field head Dyson
     equation; only its ``(1,qx,qy)`` moments survive.  The packed body is
     then updated by one bare and nine screened rank-four outer products.
     No sample-by-centroid tensor or second photon packing convention exists.
@@ -1178,6 +1210,14 @@ def complete_static_slab_photon_q0(
             f"{g0_X.shape}/{g0_Y.shape}")
     if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
         raise ValueError(f"cell_volume must be positive; got {cell_volume}")
+    from vcoul import SlabMinibzPhotonReceipt
+    if not isinstance(cubature_receipt, SlabMinibzPhotonReceipt):
+        raise TypeError(
+            "production coupled photon completion requires the provider-"
+            "issued exact Wigner-Seitz SlabMinibzPhotonReceipt; Sobol, "
+            "equal-replicate, and caller-labelled chunk iterators are "
+            f"refused (got {type(cubature_receipt).__name__})")
+    cubature_receipt.require_integrity()
 
     # The headless Gamma body remains resident and 2-D sharded.  Four calls
     # reuse the sole bounded Schur-fold graph; broadcasting W over the two
@@ -1208,97 +1248,121 @@ def complete_static_slab_photon_q0(
             f"{effective_hermiticity:.6e} > "
             f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
 
-    # Finish one Sobol replicate before starting the next.  This preserves
-    # the provider's equal-replicate estimator rather than weighting a short
-    # or padded tail as another draw.
-    per_rep_moments = []
-    per_rep_D = []
-    samples_per_rep = []
-    current_rep = None
-    expected_start = 0
-    moment_sum = D_sum = residual_max = None
-    count_sum = 0
-
-    def _finish_replicate():
-        if current_rep is None:
-            return
-        if count_sum <= 0:
-            raise ValueError(
-                f"photon mini-BZ replicate {current_rep} has no samples")
-        moment_host, D_host, residual_host = jax.device_get(
-            (moment_sum, D_sum, residual_max))
-        per_rep_moments.append(
-            np.asarray(moment_host, dtype=np.complex128) / float(count_sum))
-        per_rep_D.append(
-            np.asarray(D_host, dtype=np.complex128) / float(count_sum))
-        samples_per_rep.append(int(count_sum))
-        return float(np.asarray(residual_host))
-
-    residual_per_rep = []
-    for item in photon_sample_chunks:
-        if len(item) != 8:
-            raise ValueError(
-                "vcoul photon sample chunks must have eight fields")
-        rep, start, stop, q_cart, D_raw, valid_count, mc_weight, analytic_D = item
-        rep, start, stop = int(rep), int(start), int(stop)
-        n_valid = int(valid_count)
-        if current_rep is None or rep != current_rep:
-            if current_rep is not None:
-                value = _finish_replicate()
-                residual_per_rep.append(value)
-                if rep != current_rep + 1:
-                    raise ValueError(
-                        "vcoul photon replicate indices must be contiguous; "
-                        f"got {current_rep} then {rep}")
-            current_rep = rep
-            expected_start = 0
-            moment_sum = D_sum = residual_max = None
-            count_sum = 0
-        if start != expected_start or stop - start != n_valid:
-            raise ValueError(
-                "vcoul photon chunks must be contiguous and valid_count must "
-                f"equal stop-start; rep={rep}, start/expected={start}/"
-                f"{expected_start}, stop={stop}, valid={n_valid}")
-        expected_start = stop
-
-        q_host = np.asarray(q_cart, dtype=np.float64)
-        weight = np.asarray(mc_weight, dtype=np.float64)
-        analytic = np.asarray(analytic_D)
-        if (np.any(q_host[:n_valid, 2] != 0.0)
-                or np.any(weight[:n_valid] != 1.0)
-                or np.any(weight[n_valid:] != 0.0)
-                or np.any(analytic != 0.0)):
-            raise ValueError(
-                "coupled photon q0 completion currently accepts only the "
-                "slab estimator (qz=0, unit valid weights, no 3-D analytic "
-                "sphere addend)")
-        moments, bare_sum, returned_count, residual = (
-            static_slab_photon_head_moment_chunk(
-                q_host, D_raw, response.sigma_H, S_effective, n_valid))
-        if int(np.asarray(returned_count)) != n_valid:
+    # Exactly three provider-issued rules are solved sequentially.  All three
+    # have the same padded carrier, so the JAX graph compiles once; the
+    # physical and executed row counts remain separate evidence.
+    per_order_moments = []
+    per_order_D = []
+    residuals = []
+    min_sigmas = []
+    max_conditions = []
+    observed_physical = []
+    observed_padded = []
+    for chunk in cubature_receipt.chunks:
+        q_host = np.asarray(chunk.q_cart, dtype=np.float64)
+        weight = np.asarray(chunk.sample_weight, dtype=np.float64)
+        n_valid = int(chunk.physical_count)
+        (moments, bare_sum, returned_count, backward, chunk_sigma_min,
+         chunk_condition_max) = static_slab_photon_head_moment_chunk(
+            q_host, chunk.D_raw, response.sigma_H, S_effective,
+            n_valid, weight)
+        (moment_host, D_host, count_host, residual_host, sigma_host,
+         condition_host) = jax.device_get((
+             moments, bare_sum, returned_count, backward,
+             chunk_sigma_min, chunk_condition_max))
+        returned = int(np.asarray(count_host))
+        if returned != n_valid:
             raise RuntimeError(
-                "static photon head moment kernel changed valid_count")
-        moment_sum = moments if moment_sum is None else moment_sum + moments
-        D_sum = bare_sum if D_sum is None else D_sum + bare_sum
-        residual_max = (residual if residual_max is None
-                        else jnp.maximum(residual_max, residual))
-        count_sum += n_valid
+                "static photon head moment kernel changed physical_count")
+        measure = float(np.sum(weight[:n_valid]))
+        if not np.isfinite(measure) or measure <= 0.0:
+            raise ValueError(
+                "provider-issued photon cubature has nonpositive measure")
+        per_order_moments.append(
+            np.asarray(moment_host, dtype=np.complex128) / measure)
+        per_order_D.append(
+            np.asarray(D_host, dtype=np.complex128) / measure)
+        residuals.append(float(np.asarray(residual_host)))
+        min_sigmas.append(float(np.asarray(sigma_host)))
+        max_conditions.append(float(np.asarray(condition_host)))
+        observed_physical.append(returned)
+        observed_padded.append(int(q_host.shape[0]))
 
-    if current_rep is None:
-        raise ValueError("vcoul photon sample provider yielded no chunks")
-    residual_per_rep.append(_finish_replicate())
-    D_mean = np.mean(np.stack(per_rep_D, axis=0), axis=0)
-    moments_mean = np.mean(np.stack(per_rep_moments, axis=0), axis=0)
-    max_residual = float(max(residual_per_rep))
+    if (tuple(observed_physical) != cubature_receipt.physical_counts
+            or tuple(observed_padded) != cubature_receipt.padded_counts):
+        raise RuntimeError(
+            "executed photon solve counts differ from the vcoul receipt: "
+            f"physical={tuple(observed_physical)}/"
+            f"{cubature_receipt.physical_counts}, padded="
+            f"{tuple(observed_padded)}/{cubature_receipt.padded_counts}")
+    D_mean = per_order_D[-1]
+    moments_mean = per_order_moments[-1]
+    qstar = np.sqrt(float(cubature_receipt.polygon_area))
+
+    def _dimensionless_moments(moment):
+        scaled = np.empty_like(moment)
+        degrees = (0, 1, 1)
+        for u in range(3):
+            for v in range(3):
+                scaled[u, v] = moment[u, v] / (
+                    qstar ** (degrees[u] + degrees[v]))
+        return scaled
+
+    def _mixed_error_ratio(index):
+        previous_blocks = [per_order_D[index - 1]]
+        current_blocks = [per_order_D[index]]
+        previous_scaled = _dimensionless_moments(
+            per_order_moments[index - 1])
+        current_scaled = _dimensionless_moments(per_order_moments[index])
+        for u in range(3):
+            for v in range(3):
+                previous_blocks.append(previous_scaled[u, v])
+                current_blocks.append(current_scaled[u, v])
+        ratios = []
+        for previous, current in zip(previous_blocks, current_blocks):
+            delta = float(np.linalg.norm(current - previous))
+            scale = max(float(np.linalg.norm(previous)),
+                        float(np.linalg.norm(current)))
+            limit = (
+                _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL
+                + _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL * scale)
+            ratios.append(delta / limit)
+        return max(ratios)
+
+    mixed_error_ratios = tuple(
+        _mixed_error_ratio(index)
+        for index in range(1, len(per_order_D)))
+    max_residual = float(max(residuals))
+    min_sigma = float(min(min_sigmas))
+    max_condition = float(max(max_conditions))
+    condition_roundoff = max_condition * np.finfo(np.float64).eps
     if (not np.all(np.isfinite(D_mean))
             or not np.all(np.isfinite(moments_mean))
-            or not np.isfinite(max_residual)):
+            or not np.isfinite(max_residual)
+            or not np.isfinite(min_sigma) or min_sigma <= 0.0
+            or not np.isfinite(max_condition)
+            or not np.isfinite(condition_roundoff)):
         raise ValueError("coupled photon mini-BZ average is non-finite")
-    if max_residual > _STATIC_PHOTON_DYSON_RESIDUAL_MAX:
+    if max_residual > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
         raise ValueError(
-            "coupled photon mini-BZ Dyson solve failed its relative-residual "
+            "coupled photon mini-BZ Dyson solve failed its backward-error "
             f"gate: {max_residual:.3e} > "
-            f"{_STATIC_PHOTON_DYSON_RESIDUAL_MAX:.1e}")
+            f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}")
+    if condition_roundoff > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
+        raise ValueError(
+            "GATE static_photon_dyson_conditioning: the observed 4x4 "
+            "Dyson condition number cannot keep float64 roundoff inside "
+            f"the numerical error budget: cond*eps={condition_roundoff:.3e} "
+            f"> {_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}, "
+            f"min_sigma={min_sigma:.3e}, cond={max_condition:.3e}")
+    if mixed_error_ratios[-1] > 1.0:
+        raise ValueError(
+            "GATE static_photon_polygon_not_converged: the final polygon "
+            "Duffy--Gauss order pair did not converge every dimensionless "
+            "bare/screened moment under the mixed absolute+relative budget: "
+            f"orders={cubature_receipt.orders[-2:]}, error_ratio="
+            f"{mixed_error_ratios[-1]:.3e} > 1.  The provider ladder is "
+            "fixed; refusing insertion rather than accepting a caller dial.")
 
     dtype = V_packed.dtype
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
@@ -1338,8 +1402,15 @@ def complete_static_slab_photon_q0(
     evidence = StaticSlabPhotonHeadCompletion(
         bare_D_mean=D_mean,
         screened_moments=moments_mean,
-        samples_per_replicate=tuple(samples_per_rep),
-        max_dyson_relative_residual=max_residual,
+        cubature_receipt=cubature_receipt,
+        observed_physical_counts=tuple(observed_physical),
+        observed_padded_solve_counts=tuple(observed_padded),
+        max_backward_residual=max_residual,
+        min_dyson_singular_value=min_sigma,
+        max_dyson_condition_number=max_condition,
+        dyson_condition_roundoff_bound=condition_roundoff,
+        mixed_scale_qstar=qstar,
+        mixed_convergence_error_ratios=mixed_error_ratios,
         ward_residual=max(float(response.ward_residual), effective_ward),
         hermiticity_residual=max(
             float(response.hermiticity_residual), effective_hermiticity),
