@@ -1612,6 +1612,7 @@ def main(argv=None):
     # ── load the Q-independent BSE data (production loader) ──────────────
     t0 = time.time()
     _bse_grid_rank_records = []
+    _bse_grid_quality_records = []
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
         mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
@@ -1629,7 +1630,8 @@ def main(argv=None):
         degeneracy_tol_ry=args.degeneracy_tol_ry,
         distrib_la_batched_route=args.distrib_la_batched_route,
         htransform_a_band=args.a_band,
-        htransform_rank_record_fn=_bse_grid_rank_records.append)
+        htransform_rank_record_fn=_bse_grid_rank_records.append,
+        htransform_quality_record_fn=_bse_grid_quality_records.append)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -1718,6 +1720,9 @@ def main(argv=None):
     for receipt in _bse_grid_rank_records:
         report.spectral_compression(
             receipt, title="BSE-grid htransform spectral compression")
+    for receipt in _bse_grid_quality_records:
+        report.htransform_quality(
+            receipt, title="BSE-grid htransform interpolation quality")
 
     # ── which ISDF basis the htransform fits in ──────────────────────────
     # BEFORE initialize_wfns, because that call is the one that reads the
@@ -1886,6 +1891,7 @@ def main(argv=None):
     # ``prod(coarse)``; passing the fine grid crashes (36-k ctilde ≠ 12×12).
     # No-op when bse_k_grid is unset (data grid == meta grid).
     kgrid_co_ct = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    _path_quality_records = []
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
@@ -1894,7 +1900,16 @@ def main(argv=None):
         centroid_keep_idx=_output_keep,
         eigh_backend=args.eigh_backend,
         use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
-        distrib_la_batched_route=args.distrib_la_batched_route)
+        distrib_la_batched_route=args.distrib_la_batched_route,
+        htransform_quality_record_fn=_path_quality_records.append)
+    if len(_path_quality_records) != 1:
+        raise RuntimeError(
+            "exciton_bands htransform returned "
+            f"{len(_path_quality_records)} interpolation-quality receipts; "
+            "expected one")
+    report.htransform_quality(
+        _path_quality_records[0],
+        title="Exciton-path htransform interpolation quality")
     psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
         bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy,
         keep_idx=None)

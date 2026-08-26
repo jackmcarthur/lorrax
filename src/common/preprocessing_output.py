@@ -15,6 +15,7 @@ from common.scientific_output import (
     abs_path,
     architecture_lines,
     file_table_lines,
+    htransform_quality_lines,
     numerical_environment_lines,
     spectral_compression_lines,
     symmetry_sampling_lines,
@@ -138,6 +139,13 @@ class ScientificProductionReport:
         """Print the one shared Galerkin truncation/compression receipt."""
         self.heading(title)
         for line in spectral_compression_lines(receipt):
+            self.emit(line)
+
+    def htransform_quality(self, receipt, *,
+                           title: str = "Htransform interpolation quality") -> None:
+        """Print the shared representation/locality receipt."""
+        self.heading(title)
+        for line in htransform_quality_lines(receipt):
             self.emit(line)
 
     def timings(self, stages: Iterable[tuple[str, float]], *, wall: float) -> None:

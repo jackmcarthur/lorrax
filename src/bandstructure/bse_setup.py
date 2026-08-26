@@ -315,6 +315,7 @@ def compute_wfns_fi(
     use_low_mem_eigh: bool = False,
     distrib_la_batched_route: str = "auto",
     reshard_route: str | None = None,
+    htransform_quality_record_fn=None,
     log_fn=None,
 ):
     """Recover ψ at the coarse-grid centroids on a finer uniform k-grid —
@@ -565,7 +566,8 @@ def compute_wfns_fi(
     # ── Build fH_R via the shared htransform core ────────────────────────
     fH_k, fH_R, (a_f, n_f, shift), _f_eps = build_fH_R(
         ctilde, enk_sigma, kgrid_co, mesh_xy,
-        a_band_index=a_band_index, log_fn=log)
+        a_band_index=a_band_index, log_fn=log,
+        quality_record_fn=htransform_quality_record_fn)
     del fH_k  # diagnostic-only here; not needed downstream
     _f_shoulder_gate(_f_eps, b_min, b_max, shift, log, rank=rank)
 

@@ -184,6 +184,7 @@ def _preview_lanczos(
     # loader + ``solve_bse_sharded(tda=False)`` on a 1x1 mesh just as well.
     use_sharded = n_devices > 1 or not tda
     _htransform_rank_records = []
+    _htransform_quality_records = []
 
     if use_sharded:
         # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
@@ -203,6 +204,8 @@ def _preview_lanczos(
                 degeneracy_mode=degeneracy_mode,
                 degeneracy_tol_ry=degeneracy_tol_ry,
                 htransform_rank_record_fn=_htransform_rank_records.append,
+                htransform_quality_record_fn=(
+                    _htransform_quality_records.append),
             )
             # T-encoding strategy plumbed via the data dict (see solve_bse_sharded).
             data["matvec_kind"] = matvec_kind
@@ -223,6 +226,10 @@ def _preview_lanczos(
                 report.spectral_compression(
                     receipt,
                     title="BSE-grid htransform spectral compression")
+            for receipt in _htransform_quality_records:
+                report.htransform_quality(
+                    receipt,
+                    title="BSE-grid htransform interpolation quality")
         if stage_progress is not None:
             stage_progress.step()
         nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]

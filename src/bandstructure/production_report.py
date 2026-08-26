@@ -15,6 +15,7 @@ from common.scientific_output import (
     centroid_orbit_line,
     clean_rounded,
     file_table_lines,
+    htransform_quality_lines,
     numerical_environment_lines,
     policy,
     spectral_compression_lines,
@@ -93,8 +94,7 @@ class HTransformProductionReport:
 
     def architecture(self) -> None:
         self.heading("Processor architecture")
-        for line in architecture_lines(
-                self.runtime, mesh_role="Galerkin matrix axes X x Y"):
+        for line in architecture_lines(self.runtime):
             self.emit(line)
 
     def environment(self, *, params, wfn, gram_plan, fine_plan,
@@ -170,10 +170,17 @@ class HTransformProductionReport:
         self.emit(f"Source states  : {energy_source}; "
                   f"{int(energies.size)} k-resolved band energies")
         if finite.size:
-            self.emit(f"Source E range : [{float(np.min(finite)):.5f}, "
-                      f"{float(np.max(finite)):.5f}] Ry; span "
-                      f"{float(np.ptp(finite)) * RYD_TO_EV:.5f} eV")
+            finite_ev = finite * RYD_TO_EV
+            self.emit(f"Source E range : [{float(np.min(finite_ev)):.5f}, "
+                      f"{float(np.max(finite_ev)):.5f}] eV; span "
+                      f"{float(np.ptp(finite_ev)):.5f} eV")
         if fit > keep and energies.ndim == 2 and energies.shape[0] >= fit:
+            guard_block_ev = energies[keep:fit] * RYD_TO_EV
+            self.emit(
+                f"Guard bands    : {band_range(start + keep, start + fit)}; "
+                f"E range [{float(np.min(guard_block_ev)):.5f}, "
+                f"{float(np.max(guard_block_ev)):.5f}] eV; span "
+                f"{float(np.ptp(guard_block_ev)):.5f} eV")
             requested_top = energies[keep - 1]
             fitted_top = energies[fit - 1]
             guard_ev = (
@@ -190,17 +197,15 @@ class HTransformProductionReport:
                 f"{start + fit}) - max E(band {start + keep}); {relation}")
         self.emit(f"Centroid file  : {abs_path(centroid_file)}")
         if centroids is None:
-            self.emit(f"Centroid sites : {int(meta.n_rmu)} requested/loaded; "
-                      f"{int(meta.n_rmu_padded)} mesh-padded")
+            self.emit(f"Centroid sites : {int(meta.n_rmu)} requested/loaded")
         elif int(centroids.source_n_rmu) == int(centroids.n_rmu):
             self.emit(
                 f"Centroid sites : {int(centroids.n_rmu)} requested from "
-                f"the full table; {int(meta.n_rmu_padded)} mesh-padded")
+                "the full table")
         else:
             self.emit(
                 f"Centroid sites : requested subset {int(centroids.n_rmu)} "
-                f"of {int(centroids.source_n_rmu)} source rows; "
-                f"{int(meta.n_rmu_padded)} mesh-padded")
+                f"of {int(centroids.source_n_rmu)} source rows")
         self.emit(f"Galerkin basis : rank {int(ctilde.shape[2])} shared across "
                   f"{int(result['nk_total'])} coarse-grid k points")
         multiplier = float(params.get("htransform_rank_multiplier", 0.0))
@@ -212,17 +217,23 @@ class HTransformProductionReport:
             scale_band = start + int(transform["scale_band_local"]) + 1
             shoulder_band = start + int(transform["shoulder_band_local"]) + 1
             self.emit(
-                f"f-transform    : a={float(transform['a_ry']):.5f} Ry "
+                f"f-transform    : a={float(transform['a_ry']) * RYD_TO_EV:.5f} eV "
                 f"(4 x bandwidth of band {scale_band}); "
                 f"n={float(transform['n']):.2f}")
             self.emit(
                 f"Zero shoulder  : max E(band {shoulder_band}) = "
-                f"{float(transform['shift_ry']):.5f} Ry; the full top-band "
+                f"{float(transform['shift_ry']) * RYD_TO_EV:.5f} eV; "
+                "the full top-band "
                 "dispersion lies at or below the cutoff")
 
     def spectral_compression(self, receipt) -> None:
         self.heading("Spectral compression and validation")
         for line in spectral_compression_lines(receipt):
+            self.emit(line)
+
+    def htransform_quality(self, receipt) -> None:
+        self.heading("Real-space locality and interpolation risk")
+        for line in htransform_quality_lines(receipt):
             self.emit(line)
 
     def path_summary(self, *, result) -> None:
@@ -252,23 +263,10 @@ class HTransformProductionReport:
                 f"intervals; {intervals + 1} endpoint-inclusive points")
         path_range = result.get("path_range")
         if path_range is not None:
-            self.emit(f"Energy range   : [{float(path_range[0]):+.5f}, "
-                      f"{float(path_range[1]):+.5f}] Ry relative to VBM "
-                      f"([{float(path_range[0]) * RYD_TO_EV:+.5f}, "
-                      f"{float(path_range[1]) * RYD_TO_EV:+.5f}] eV)")
-        checkpoint = result.get("gamma_energy_checkpoint")
-        if checkpoint is None:
-            self.emit("Energy checkpoint: unavailable; Gamma is not an exact "
-                      "point on this interpolation path")
-        else:
             self.emit(
-                f"Energy checkpoint: Gamma max |Delta E|="
-                f"{float(checkpoint['max_abs_ev']):.5e} eV; RMS="
-                f"{float(checkpoint['rms_ev']):.5e} eV over "
-                f"{int(checkpoint['n_bands'])} returned bands")
-            self.emit(
-                "Checkpoint scope: measured at Gamma against the source "
-                "coarse-grid bands; this is not a global path-error bound")
+                f"Energy range   : "
+                f"[{float(path_range[0]) * RYD_TO_EV:+.5f}, "
+                f"{float(path_range[1]) * RYD_TO_EV:+.5f}] eV relative to VBM")
 
     def timings(self, records, *, wall: float) -> None:
         def total(name: str) -> float:

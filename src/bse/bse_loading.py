@@ -861,6 +861,7 @@ def load_bse_data_from_restart_sharded(
     distrib_la_batched_route: str | None = None,
     htransform_a_band: int | None = None,
     htransform_rank_record_fn=None,
+    htransform_quality_record_fn=None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_full_y/enk_full).
 
@@ -1178,7 +1179,8 @@ def load_bse_data_from_restart_sharded(
             head_channel=head_channel,
             distrib_la_batched_route=distrib_la_batched_route,
             htransform_a_band=htransform_a_band,
-            htransform_rank_record_fn=htransform_rank_record_fn)
+            htransform_rank_record_fn=htransform_rank_record_fn,
+            htransform_quality_record_fn=htransform_quality_record_fn)
     return data
 
 

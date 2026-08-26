@@ -1454,10 +1454,48 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
         axis=-1).reshape(-1, 3)
 
 
+def outer_r_shell_mask(kgrid: tuple[int, int, int]) -> np.ndarray:
+    """Mask the outer lattice-vector shell of the interpolation supercell.
+
+    Each periodic direction with more than one point contributes its largest
+    represented ``|R_i|``.  The definition works for odd and even meshes and
+    excludes singleton/non-periodic directions.  It is host-only metadata;
+    the large ``f(H)_R`` tensor remains sharded.
+    """
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    if grid.shape != (3,) or np.any(grid <= 0):
+        raise ValueError(f"outer_r_shell_mask: invalid k grid {tuple(grid)}")
+    r_grid = np.asarray(build_R_grid_np(tuple(grid)), dtype=np.int64)
+    edge = grid // 2
+    active = grid > 1
+    return np.any((np.abs(r_grid) == edge[None, :]) & active[None, :], axis=1)
+
+
+@jax.jit
+def _fh_locality_metrics(fh_r: jax.Array,
+                         outer_shell: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Two scale-free locality metrics without gathering ``f(H)_R``.
+
+    ``fh_r`` is face-sharded on its matrix axes.  JAX therefore reduces each
+    local tile first and communicates only the resulting R-vector/scalars.
+    """
+    norm_sq_r = jnp.sum(jnp.real(fh_r * jnp.conj(fh_r)), axis=(1, 2))
+    shell = jnp.asarray(outer_shell, dtype=bool)
+    total_sq = jnp.sum(norm_sq_r)
+    shell_sq = jnp.sum(jnp.where(shell, norm_sq_r, 0.0))
+    shell_max_sq = jnp.max(jnp.where(shell, norm_sq_r, 0.0))
+    r0_sq = norm_sq_r[0]
+    shell_fraction = jnp.where(
+        total_sq > 0.0, jnp.sqrt(shell_sq / total_sq), 0.0)
+    shell_max_over_r0 = jnp.where(
+        r0_sq > 0.0, jnp.sqrt(shell_max_sq / r0_sq), 0.0)
+    return shell_fraction, shell_max_over_r0
+
+
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
-               log_fn=None):
+               log_fn=None, quality_record_fn=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
     Math (htransform paper):
@@ -1480,6 +1518,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         a_band_index: optional band index whose bandwidth sets ``a``;
                    defaults to top of the htransform window (nb-1).
         log_fn:    optional logger.
+        quality_record_fn: optional callback receiving the shared
+                   row-isometry and real-space-locality receipt.  The
+                   reduction preserves the matrix sharding and transfers only
+                   scalars to the host.
 
     Returns:
         fH_k:    (nk_co, rank, rank), sharded P(None, 'x', 'y').
@@ -1618,6 +1660,25 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
 
     fH_k, fH_R = _build(ctilde, f_eps)
+    if quality_record_fn is not None:
+        from time import perf_counter as _quality_clock
+        _quality_t0 = _quality_clock()
+        _outer_shell = outer_r_shell_mask(kgrid_co)
+        _shell_fraction, _shell_max_over_r0 = jax.device_get(
+            _fh_locality_metrics(fH_R, jnp.asarray(_outer_shell)))
+        quality_record_fn({
+            "row_isometry_max": float(_ortho),
+            "row_isometry_cap": float(_tol),
+            # Empirical conversion already used by the production refusal:
+            # measured on the MoS2 capacity ladder documented above.  This is
+            # an on-grid representation screen, never an off-grid estimate.
+            "on_grid_error_scale_mev": float(9.0e3 * _ortho),
+            "outer_shell_l2_fraction": float(_shell_fraction),
+            "outer_shell_max_over_r0": float(_shell_max_over_r0),
+            "outer_shell_vectors": int(np.count_nonzero(_outer_shell)),
+            "r_vectors": int(_outer_shell.size),
+            "locality_wall_seconds": float(_quality_clock() - _quality_t0),
+        })
     return fH_k, fH_R, (a_f, n_f, shift), f_eps
 
 
@@ -2018,7 +2079,7 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None, diagnostics: bool = True,
                 band_start: int = 0, n_return_bands: int | None = None,
-                progress_fn=None):
+                progress_fn=None, quality_record_fn=None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -2043,7 +2104,8 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
     fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
-        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index, log_fn=log_fn)
+        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index,
+        log_fn=log_fn, quality_record_fn=quality_record_fn)
     jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
@@ -2264,7 +2326,6 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     energies_sorted = None
     path_range = None
     gamma_exact = None
-    gamma_energy_checkpoint = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -2410,14 +2471,6 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         log_fn(("Γ Δε (mRy): " if _gamma_is_exact else
                 "nearest-path-point Δε vs Γ source (mRy): ")
                + ", ".join(f"{d:+.2f}" for d in delta[:6]))
-        if _gamma_is_exact:
-            _delta_ev = ((energies_sorted[_gamma_position] - gamma_exact)
-                         * RYD_TO_EV)
-            gamma_energy_checkpoint = {
-                "max_abs_ev": float(np.max(np.abs(_delta_ev))),
-                "rms_ev": float(np.sqrt(np.mean(np.square(_delta_ev)))),
-                "n_bands": int(_delta_ev.size),
-            }
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
         timing.record("ht.kpath_host_tail", _perf() - _t0)  # instrument:
@@ -2433,7 +2486,6 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         "energies_sorted": energies_sorted,
         "path_range": path_range,
         "gamma_exact": gamma_exact,
-        "gamma_energy_checkpoint": gamma_energy_checkpoint,
         "f_transform": {
             "a_ry": float(a_f),
             "n": float(n_f),
@@ -2738,12 +2790,14 @@ def main(argv=None):
     _transform_progress = LoopProgress(
         1, report.progress, title="fH construction and path solution",
         item_name="stage", max_updates=1).start()
+    _quality_records = []
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band, diagnostics=_diag_on,
                              band_start=int(wfn.nelec) - int(params["nval"]),
                              n_return_bands=n_return_bands,
-                             progress_fn=report.progress)
+                             progress_fn=report.progress,
+                             quality_record_fn=_quality_records.append)
     _transform_progress.step()
     _transform_progress.finish()
 
@@ -2756,6 +2810,12 @@ def main(argv=None):
         centroid_file=_centroid_path, energy_source=_energy_source,
         centroids=_centroid_records[0])
     report.spectral_compression(_rank_records[0])
+    if len(_quality_records) != 1:
+        raise RuntimeError(
+            "htransform returned "
+            f"{len(_quality_records)} interpolation-quality receipts; "
+            "expected one")
+    report.htransform_quality(_quality_records[0])
     report.path_summary(result=result)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.

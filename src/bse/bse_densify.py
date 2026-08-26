@@ -488,6 +488,7 @@ def _interpolate_bse_data_to_grid(
     distrib_la_batched_route: str | None = None,
     htransform_a_band: int | None = None,
     htransform_rank_record_fn=None,
+    htransform_quality_record_fn=None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -635,7 +636,8 @@ def _interpolate_bse_data_to_grid(
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
         centroid_keep_idx=_output_keep,
-        distrib_la_batched_route=_distrib_la_batched_route)
+        distrib_la_batched_route=_distrib_la_batched_route,
+        htransform_quality_record_fn=htransform_quality_record_fn)
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
     y4 = NamedSharding(mesh_xy, P(None, None, None, "y"))

@@ -55,9 +55,6 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         "band_start": 2, "nb_keep": 4, "nb_fit": 6,
         "n_guard_bands": 2, "nk_total": 8,
         "path_range": (-0.2, 0.4),
-        "gamma_energy_checkpoint": {
-            "max_abs_ev": 1.2e-3, "rms_ev": 4.0e-4, "n_bands": 4,
-        },
         "f_transform": {
             "a_ry": 0.4, "n": 3.0, "shift_ry": 0.47,
             "scale_band_local": 5, "shoulder_band_local": 5,
@@ -85,6 +82,14 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         "numerical_closure": spectral_closure.cluster_at_cut(spectrum, 3),
         "model_closure": None,
     })
+    report.htransform_quality({
+        "row_isometry_max": 2.0e-7,
+        "row_isometry_cap": 1.0e-6,
+        "on_grid_error_scale_mev": 1.8e-3,
+        "outer_shell_l2_fraction": 0.051,
+        "outer_shell_max_over_r0": 0.012,
+        "locality_wall_seconds": 0.08,
+    })
     report.path_summary(result=result)
     report.progress("Started Hamiltonian interpolation at 12:00:00.")
     report.timings([
@@ -102,7 +107,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert text == "\n".join(output) + "\n"
     assert "Returned bands : 3-6" in text
     assert "Fitted bands   : 3-8 (2 upper guard bands)" in text
-    assert "Centroid sites : 20 requested from the full table; 20 mesh-padded" in text
+    assert "Centroid sites : 20 requested from the full table" in text
+    assert "mesh-padded" not in text
     assert "Centroid orbit: NOT CLOSED : 1/2 spatial operations" in text
     assert "worst residual 2.50000e-01 at S02" in text
     assert "Galerkin basis : rank 12" in text
@@ -112,16 +118,22 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "not a band-energy error bound" in text
     assert "rank 4 = 3 physical + 1 exact-null mesh pad" in text
     assert "Guard buffer   :" in text
-    assert "f-transform    : a=0.40000 Ry (4 x bandwidth of band 8); n=3.00" in text
-    assert "Zero shoulder  : max E(band 8) = 0.47000 Ry" in text
+    assert "Guard bands    : 7-8; E range" in text
+    assert "f-transform    : a=5.44228 eV (4 x bandwidth of band 8); n=3.00" in text
+    assert "Zero shoulder  : max E(band 8) = 6.39468 eV" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
     assert "L01  Γ -> X: 1 intervals; 2 endpoint-inclusive points" in text
     assert "Gram eigensolve: auto (other choices:" in text
     assert "-> native; replicated native JAX; n=48" in text
     assert "Fine-k eigensolve: distributed -> cusolvermp" in text
     assert "Batched LA     : auto (other choices: batch_reshard) -> scan" in text
-    assert "Energy checkpoint: Gamma max |Delta E|=1.20000e-03 eV" in text
-    assert "not a global path-error bound" in text
+    assert "Row isometry   : max |C C^H - I|=2.00000e-07" in text
+    assert "On-grid screen : empirical max-energy scale ~1.80000e-03 meV" in text
+    assert "f(H)_R locality: outer-shell ||f(H)_R||_F / total = 5.10%" in text
+    assert "Fine-k error   : unavailable without an independent" in text
+    assert "Energy checkpoint" not in text
+    assert "Processor mesh : 2 x 2\n" in text
+    assert " Ry" not in text
     assert "auto (other choices:" in text
     assert "Started Hamiltonian interpolation" in text
     assert "OUTPUT FILES AND INPUTS" in text
@@ -134,3 +146,16 @@ def test_htransform_runtime_startup_uses_the_one_debug_stream():
               "htransform.py").read_text(encoding="utf8")
     assert "initialize_communicator_stack(print_fn=debug_print)" in source
     assert "RUNTIME = initialize_communicator_stack()" not in source
+
+
+def test_outer_r_shell_mask_handles_even_odd_and_singleton_axes():
+    from bandstructure.htransform import build_R_grid_np, outer_r_shell_mask
+
+    grid = (4, 3, 1)
+    r_grid = np.asarray(build_R_grid_np(grid), dtype=int)
+    mask = outer_r_shell_mask(grid)
+    expected = ((np.abs(r_grid[:, 0]) == 2)
+                | (np.abs(r_grid[:, 1]) == 1))
+    assert mask.dtype == np.bool_
+    assert np.array_equal(mask, expected)
+    assert not mask[np.flatnonzero(np.all(r_grid == 0, axis=1))[0]]

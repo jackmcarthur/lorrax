@@ -145,6 +145,37 @@ def spectral_compression_lines(receipt, *,
     return lines
 
 
+def htransform_quality_lines(receipt) -> list[str]:
+    """Render the shared htransform representation/locality receipt.
+
+    The row-isometry number screens recovery on the fitted coarse grid.  The
+    real-space number measures how much of ``f(H)_R`` reaches the outer shell
+    of the available Born--von Karman supercell.  Neither is silently promoted
+    into an off-grid band-energy error: that requires an independent fine-k
+    reference, as the report states explicitly.
+    """
+    isometry = float(receipt["row_isometry_max"])
+    cap = float(receipt["row_isometry_cap"])
+    estimate = float(receipt["on_grid_error_scale_mev"])
+    shell = 100.0 * float(receipt["outer_shell_l2_fraction"])
+    shell_max = 100.0 * float(receipt["outer_shell_max_over_r0"])
+    wall = float(receipt["locality_wall_seconds"])
+    return [
+        f"Row isometry   : max |C C^H - I|={isometry:.5e} "
+        f"(acceptance cap {cap:.5e})",
+        f"On-grid screen : empirical max-energy scale ~{estimate:.5e} meV "
+        "from the row-isometry residual (MoS2 calibration; not a bound)",
+        f"f(H)_R locality: outer-shell ||f(H)_R||_F / total = {shell:.2f}%; "
+        f"largest shell ||f(H)_R||_F / R=0 = {shell_max:.2f}%",
+        "Error meaning  : the locality receipt diagnoses finite-supercell "
+        "aliasing risk; it is not an off-grid energy-error bound",
+        "Fine-k error   : unavailable without an independent fine-k "
+        "wavefunction reference",
+        f"Receipt cost   : {wall:.2f} s; one sharded reduction, no matrix "
+        "gather",
+    ]
+
+
 def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
     """Compact rank/device/thread geometry from the canonical runtime facts."""
     facts = runtime.facts
@@ -313,6 +344,7 @@ __all__ = [
     "centroid_orbit_line",
     "clean_rounded",
     "file_table_lines",
+    "htransform_quality_lines",
     "numerical_environment_lines",
     "policy",
     "pseudopotential_file_rows",
