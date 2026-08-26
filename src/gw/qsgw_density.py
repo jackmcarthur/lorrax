@@ -267,6 +267,59 @@ def rotate_band_matrix(A, U, *, mesh: Mesh, to_qp: bool):
                             to_qp=to_qp, conj_u=to_qp)
 
 
+def diagonal_rotated_band_matrix(A, U, *, mesh: Mesh, to_qp: bool):
+    """Diagonal of a basis-rotated band matrix, without the dense result.
+
+    ``A`` is ``(n_k, ..., nb, nb)``: any axes between k and the final two
+    band axes are batches.  The convention is identical to
+    :func:`rotate_band_matrix`, but after the canonical ket-first rotation
+    the bra transform is contracted directly onto its diagonal.  Thus the
+    only dense ``nb x nb`` temporary is the same sharded half-rotation the
+    full transform requires; no completed rotated matrix is materialised.
+
+    The result is ``(n_k, ..., nb)`` with its final band axis sharded on the
+    rotation's free mesh axis.  Gathering that small diagonal, when needed,
+    remains the caller's explicit cost.
+    """
+    nd = int(getattr(A, "ndim", np.ndim(A)))
+    if nd < 3:
+        raise ValueError(
+            "diagonal_rotated_band_matrix requires (nk,...,nb,nb); "
+            f"got {nd} dimensions")
+    if int(A.shape[-2]) != int(A.shape[-1]):
+        raise ValueError(
+            "diagonal_rotated_band_matrix requires square trailing band "
+            f"axes; got {tuple(A.shape[-2:])}")
+
+    half = rotate_band_axis(
+        A, U, mesh=mesh, axis=nd - 1,
+        to_qp=to_qp, conj_u=not to_qp)
+    # The half rotation is (..., bra, ket_out).  Partition its bra on the
+    # contraction mesh axis while retaining the output band on the free one;
+    # the einsum then needs only the corresponding one-axis psum.
+    contract_ax, free_ax = ("x", "y") if to_qp else ("y", "x")
+    half_spec = P(
+        None, *([None] * (nd - 3)), contract_ax, free_ax)
+    half = jax.lax.with_sharding_constraint(
+        half, NamedSharding(mesh, half_spec))
+    U = jax.lax.with_sharding_constraint(
+        U, NamedSharding(mesh, band_rotation_spec()))
+
+    if to_qp:
+        # half[...,m,n] = sum_j A[...,m,j] U[j,n]
+        # diag[n] = sum_m conj(U[m,n]) half[...,m,n]
+        diagonal = jnp.einsum(
+            "kmn,k...mn->k...n", jnp.conj(U), half, optimize=True)
+    else:
+        # half[...,n,m] = sum_p A[...,n,p] conj(U[m,p])
+        # diag[m] = sum_n U[m,n] half[...,n,m]
+        diagonal = jnp.einsum(
+            "kmn,k...nm->k...m", U, half, optimize=True)
+    out_spec = P(None, *([None] * (nd - 3)), free_ax)
+    return jax.lax.with_sharding_constraint(
+        diagonal, NamedSharding(mesh, out_spec))
+
+
 def symmetrise_density(rho_r, sym_perm):
     """ρ_sym[r] = (1/n_sym) Σ_s ρ[sym_perm[s, r]] — the star average.
 

@@ -545,6 +545,7 @@ def write_sigma_freq_debug_table(
 	columns: list[tuple[str, np.ndarray]],
 	*,
 	kpoints_crys,
+	metadata: dict[str, str] | None = None,
 ) -> str:
 	"""Write a per-(k, n) decomposition table.
 
@@ -566,6 +567,10 @@ def write_sigma_freq_debug_table(
 	conversion at the seam (consistent with the rule "internals in Ry, eV
 	only at print").
 
+	Optional ``metadata`` is written into this same canonical receipt as stable
+	``# metadata key=value`` lines.  Keys and values must each be single-line;
+	the caller owns their semantics and authentication.
+
 	The first row is a comment header naming all columns; subsequent rows
 	are tab-separated numerical values, one per ``(k, n)`` pair, with k
 	and n as the leading two integer columns.
@@ -576,6 +581,13 @@ def write_sigma_freq_debug_table(
 	"""
 	if not columns:
 		raise ValueError("write_sigma_freq_debug_table: ``columns`` is empty.")
+	metadata = {} if metadata is None else dict(metadata)
+	for key, value in metadata.items():
+		if not isinstance(key, str) or not key or any(c in key for c in "=\r\n"):
+			raise ValueError(f"invalid Sigma debug metadata key {key!r}")
+		if not isinstance(value, str) or any(c in value for c in "\r\n"):
+			raise ValueError(
+				f"invalid Sigma debug metadata value for {key!r}: {value!r}")
 
 	arrays = [(name, np.asarray(arr)) for name, arr in columns]
 	nk, nb = arrays[0][1].shape
@@ -623,6 +635,8 @@ def write_sigma_freq_debug_table(
 			"# Sigma frequency debug decomposition (per-(k, n) diagonals; all "
 			"energies in eV).\n"
 		)
+		for key in sorted(metadata):
+			f.write(f"# metadata {key}={metadata[key]}\n")
 		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")

@@ -229,6 +229,25 @@ def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     return ward_error / scale, max(coordinate_error, lorentz_error) / scale
 
 
+def require_canonical_operator_fingerprint(
+    value: object, *, gate: str = "operator_fingerprint",
+) -> str:
+    """Return one canonical ``sha256:<64 lowercase hex>`` fingerprint.
+
+    This is the single parser for the response transaction and every
+    downstream authenticated receipt.  Callers may add physics-specific
+    context around its error, but must not weaken or respell the token.
+    """
+    fingerprint = str(value).strip()
+    if (not fingerprint.startswith("sha256:")
+            or len(fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
+        raise ValueError(
+            f"GATE {gate}: expected sha256:<64 lowercase hex>; "
+            f"got {fingerprint!r}")
+    return fingerprint
+
+
 def require_static_gauge_head_response(
     response: StaticGaugeHeadResponse, mesh_xy: Mesh,
 ) -> StaticGaugeHeadResponse:
@@ -268,20 +287,10 @@ def require_static_gauge_head_response(
     # Constructs and validates the small Hall tensor; its return is consumed by
     # the mini-BZ stage, so no second Hall spelling exists.
     static_hall_linear_response(response.sigma_H)
-    fingerprint = str(
-        response.hamiltonian_config_operator_fingerprint).strip()
-    if (not fingerprint.startswith("sha256:")
-            or len(fingerprint) != len("sha256:") + 64
-            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
-        raise ValueError(
-            "GATE static_gauge_head_fingerprint: response artifact lacks one "
-            "canonical Hamiltonian/config/operator SHA-256 fingerprint.\n"
-            f"  got:  {fingerprint!r}\n"
-            "  want: sha256:<64 lowercase hex>, shared by sigma.p, the VNL "
-            "contact, and Hall response\n"
-            "  fix:  regenerate all response components in one versioned "
-            "gauged-operator transaction; do not join component stamps in GW\n"
-            "  doc:  docs/input_reference.md, bispinor_gw.")
+    fingerprint = require_canonical_operator_fingerprint(
+        response.hamiltonian_config_operator_fingerprint,
+        gate="static_gauge_head_fingerprint",
+    )
     if not bool(response.operator_current_equivalent):
         raise ValueError(
             "GATE static_gauge_head_operator: the supplied current/multipoles "
@@ -1157,8 +1166,30 @@ def static_slab_photon_head_moment_chunk(
 
 
 @dataclass(frozen=True)
+class StaticPhotonQ0FactorCarrier:
+    """Bounded factors for the exact q=0 updates inserted into V and W.
+
+    The bare pair and nine screened pairs are the completed factors, after
+    the coupled 4x4 Dyson/cubature transaction.  They are retained only so
+    the incumbent Sigma contraction can attribute the FINAL Lorentz blocks
+    linearly; they are not a second response model or a packed-body copy.
+    """
+
+    bare_pair: tuple[jax.Array, jax.Array]
+    screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+
+    def __post_init__(self) -> None:
+        if len(self.bare_pair) != 2:
+            raise ValueError("static photon bare q=0 carrier needs one pair")
+        if len(self.screened_pairs) != 9:
+            raise ValueError(
+                "static photon screened q=0 carrier needs the complete "
+                f"3x3 moment grid (9 pairs); got {len(self.screened_pairs)}")
+
+
+@dataclass(frozen=True)
 class StaticSlabPhotonHeadCompletion:
-    """Small evidence record for one coupled slab q=0 reconstruction."""
+    """Evidence and bounded runtime carrier for one slab q=0 completion."""
 
     bare_D_mean: np.ndarray
     screened_moments: np.ndarray
@@ -1174,6 +1205,7 @@ class StaticSlabPhotonHeadCompletion:
     ward_residual: float
     hermiticity_residual: float
     hamiltonian_config_operator_fingerprint: str
+    q0_factors: StaticPhotonQ0FactorCarrier
 
 
 _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
@@ -1506,6 +1538,7 @@ def complete_static_slab_photon_q0(
         jax.lax.with_sharding_constraint(jnp.swapaxes(WZ_x[1], 0, 1), sh_x),
     )
     right_basis = (g0_Y, YW_y[0], YW_y[1])
+    screened_pairs = []
     for u in range(3):
         for v in range(3):
             with mesh_xy:
@@ -1518,6 +1551,7 @@ def complete_static_slab_photon_q0(
             W_packed = add_photon_q0_low_rank(
                 W_packed, layout, mesh_xy,
                 left_rows_X=left_basis[u], right_rows_Y=right_rows)
+            screened_pairs.append((left_basis[u], right_rows))
 
     evidence = StaticSlabPhotonHeadCompletion(
         bare_D_mean=D_mean,
@@ -1536,6 +1570,9 @@ def complete_static_slab_photon_q0(
             float(response.hermiticity_residual), effective_hermiticity),
         hamiltonian_config_operator_fingerprint=(
             response.hamiltonian_config_operator_fingerprint),
+        q0_factors=StaticPhotonQ0FactorCarrier(
+            bare_pair=(left_bare, right_bare),
+            screened_pairs=tuple(screened_pairs)),
     )
     return V_packed, W_packed, evidence
 
