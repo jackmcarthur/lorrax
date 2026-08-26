@@ -834,6 +834,22 @@ def test_every_module_scope_door_consumer_has_the_bootstrap_before_it():
         f"has gone vacuous.")
 
 
+def test_service_directory_census_runs_once_per_process(monkeypatch):
+    """Repeated transitional door calls do no repeated filesystem census."""
+    monkeypatch.syspath_prepend(_SRC)
+    from ffi import _services
+
+    calls = []
+    monkeypatch.setattr(_services, "_READY", False)
+    monkeypatch.setattr(
+        _services, "service_roots",
+        lambda: calls.append("census") or [],
+    )
+    _services.ensure_on_path()
+    _services.ensure_on_path()
+    assert calls == ["census"]
+
+
 def test_the_census_detector_catches_a_missing_and_a_late_bootstrap(tmp_path):
     """THE RED TWIN for the cell above, on a tree built to be wrong.
 

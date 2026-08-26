@@ -156,7 +156,7 @@ page has to read it from.
 | `wfn_file` | `"WFN.h5"` | BGW-format wavefunction input (WFN.h5). |
 | `kin_ion_file` | `"kin_ion.h5"` | kin_ion.h5 from gw.kin_ion_io: T+V_loc+V_NL matrix (+ stored v_hartree). |
 | `hartree_source` | `"auto"` | The G-space vs ISDF V_H switch: auto (stored -> folded -> isdf) | stored | isdf | gspace. |
-| `report_file` | `"gwjax.out"` | Rank-zero, human-readable GW calculation report: processor architecture, active numerical backends, crystal symmetry and IBZ sampling, band/energy windows, requested-state QP energies, role-labelled paths, warnings, and the major-stage timing summary. Launcher placement and per-rank diagnostics remain in the launcher log; detailed component chatter is enabled only by `LORRAX_DEBUG_PRINT=1`. |
+| `report_file` | `"gwjax.out"` | Rank-zero, human-readable GW calculation report: processor architecture, active numerical backends, crystal symmetry and IBZ sampling, band/energy windows, QP gap relative to DFT, role-labelled paths, warnings, runtime/import attribution, and sequential ζ/V(q)/χ₀/W/Σ timings. Per-state QP energies stay in the named EQP files. Launcher placement and per-rank diagnostics remain in the launcher log; detailed component chatter is enabled only by `LORRAX_DEBUG_PRINT=1`. |
 | `sigma_diag_file` | `"sigma_diag.dat"` | LORRAX-native per-(k,n) Sigma-decomposition text output. |
 | `eqp0_file` | `"eqp0.dat"` | BGW-format zeroth-order QP energies output. |
 | `eqp1_file` | `"eqp1.dat"` | BGW-format Z-linearized QP energies output (Z=1 in static COHSEX). |

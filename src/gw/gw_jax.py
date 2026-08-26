@@ -97,18 +97,12 @@ from .production_report import GWProductionReport
 from runtime.production_stream import ProductionStdout
 from .gw_output import (
 	GWResults,
-	print_banner,
 	print_system_summary,
 	write_freq_debug,
 	write_qp_wfn_oneshot,
 	write_qsgw_qp_ladders,
 	write_results,
 )
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 import symmetry_maps                                            # noqa: E402
 
 
@@ -281,14 +275,6 @@ def main(argv=None):
 	# set of communicators and a second copy of every shape-keyed jit cache.
 	mesh_xy = RUNTIME.mesh
 	_setup_runtime()
-	print_banner(
-		backend=jax.default_backend(),
-		n_devices=len(jax.devices()),
-		grid_x=mesh_xy.devices.shape[0], grid_y=mesh_xy.devices.shape[1],
-		n_procs=jax.process_count(),
-		device_kind=jax.devices()[0].device_kind if jax.devices() else "unknown",
-		print_fn=print0,
-	)
 
 	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
 	# from /proc/self/maps, not asserted (audit A1 fix 3).  Two
@@ -326,8 +312,8 @@ def main(argv=None):
 	                        n_rmu, config.bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma)
-	meta.rank = jax.process_index()
-	meta.n_proc = jax.process_count()
+	meta.rank = RUNTIME.process_index
+	meta.n_proc = RUNTIME.process_count
 	meta.sys_dim = config.sys_dim
 	meta.bispinor = config.bispinor
 	band_slices = BandSlices.from_band_edges(

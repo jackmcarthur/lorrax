@@ -127,6 +127,10 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     report.qp_gap(band_slices=bands, e_dft_ry=energies,
                   e_qp_ry=energies + 0.1 / RYD_TO_EV)
     report.timings([
+        {"name": "gw_jax.runtime_stack.jax_import", "path":
+         ("gw_jax.runtime_stack",), "inclusive": 2.0},
+        {"name": "gw_jax.imports", "path":
+         ("gw_jax.imports",), "inclusive": 1.0},
         {"name": "gw_jax.zeta_fit_chunked", "path":
          ("gw_jax.isdf", "gw_jax.zeta_fit_chunked"), "inclusive": 1.0},
         {"name": "gw_jax.V_q_compute", "path":
@@ -179,8 +183,11 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
                      if line.startswith("  zeta"))
     sigma_line = next(line for line in text.splitlines()
                       if line.startswith("  Sigma"))
-    assert "          1.00" in zeta_line
-    assert "          5.00" in sigma_line
+    assert "      1.00" in zeta_line
+    assert "      5.00" in sigma_line
+    assert "runtime bring-up             2.00" in text
+    assert "pre-main + imports           1.00" in text
+    assert "other driver work            2.00" in text
     assert "HDF5" not in text and "h5py" not in text
 
 

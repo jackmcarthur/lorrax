@@ -298,7 +298,7 @@ stronger instrument than a level ever was.
 | # | violation | why it is still here |
 |---|---|---|
 | **R1** | ~~`file_io.slab_io` → `gw.gw_config` (2 lazy sites)~~ — **CLOSED 2026-08-06 by deletion.** `SlabIOBackend` typed the file-IO service's own `backend` parameter and was defined in the GW driver's deck parser. The request asked where the enum should live, given that `file_io` imports jax and h5py at package scope while `gw_config` is nearly jax-free. The answer was nowhere: with one transport there is no enum, no `backend` parameter, and no uphill import. | — |
-| **R2** | `solvers.sternheimer_solve` → `psp.dft_operators`, plus `STERN_DEBUG` read at module scope as `bool(int(...))` — so a word spelling raises `ValueError` on **import**. | Both are the same question: is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
+| **R2** | `solvers.sternheimer_solve` → `psp.dft_operators`. The former module-scope `STERN_DEBUG` read and its layering exception were deleted with the orphan debug stream on 2026-08-25. | Is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
 | **R3** | ~~`centroid.kmeans_isdf` → `centroid.orbit_syms` (lazy)~~ — **CLOSED 2026-08-07 by the `symmetry_maps` extraction.** `centroid/orbit_syms.py` left `src/` for `services/symmetry_maps/`; the call site is `from symmetry_maps import canonicalize_orbit`, an edge into a service door, and the `_L2_UPWARD_EXCEPTIONS` entry was deleted in the same commit that moved the module — which is what makes this dissolved rather than relabelled. The prescribed fix (inject the orbit map; signature change) is unaffected and stays registered. | — |
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope — a library mutating global jax configuration for whoever imports it. Same class as `centroid/kmeans_isdf.py`'s `config.update`, removed 2026-07-30. | Not free: the only consumer (`gw/sc_iteration.py:577`) is lazy and always post-`bootstrap()`, but a bare `import mixing.acceleration` in a fresh process would then run Anderson/CROP in **f32, silently**. Physics decision. |
 | — | `gw/__init__.py` sets `JAX_ENABLE_X64` | Argued in place, and shown inert for both GW drivers (they call `bootstrap()` then `jax.config.update` explicitly). Kept for import paths with no bootstrap. |
@@ -388,8 +388,8 @@ would test the twin, not the instrument.
 The suite was also seeded with ten deliberate violations injected into a
 throwaway copy of `src/` (2026-07-31) and each went red on the expected test:
 a plumbing import added to `gw_jax`; a plumbing import *removed* from
-`exciton_bands` (slack budget); an env read added to `solvers/davidson.py`; the
-excused `STERN_DEBUG` read deleted while its exception stayed; a lazy
+`exciton_bands` (slack budget); an env read added to `solvers/davidson.py`; a
+stale env-read exception retained after its source read was deleted; a lazy
 `gw.gw_config` import added to `common/collectives.py`; a third
 `slab_io → gw_config` site; a `Mesh(` added to `gw_jax`; a module-scope
 `setdefault` added to `zeta_projection`; a mapped module renamed away; and

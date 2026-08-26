@@ -363,6 +363,10 @@ class GWProductionReport:
                        if predicate(row))
 
         stages = [
+            ("runtime bring-up", total(lambda r: r["name"].startswith(
+                "gw_jax.runtime_stack."))),
+            ("pre-main + imports", total(lambda r: r["name"] ==
+                                          "gw_jax.imports")),
             ("zeta", total(lambda r: r["name"].startswith(
                 "gw_jax.zeta_fit_chunked"))),
             ("V(q)", total(lambda r: r["name"] == "gw_jax.V_q_compute")),
@@ -373,12 +377,14 @@ class GWProductionReport:
             ("Sigma", total(lambda r: r["name"] in
                             ("gw_jax.sigma", "gw_jax.sc_driver"))),
         ]
+        accounted = sum(seconds for _name, seconds in stages)
+        stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")
-        self.emit("  stage             wall (s)     fraction")
+        self.emit("  stage                    wall (s)     fraction")
         for name, seconds in stages:
-            self.emit(f"  {name:<12} {seconds:14.2f}  "
+            self.emit(f"  {name:<22} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<12} {wall:14.2f}  {100.0:9.2f}%")
+        self.emit(f"  {'total run':<22} {wall:10.2f}  {100.0:9.2f}%")
 
     def warnings(self) -> None:
         if self._warnings_emitted:

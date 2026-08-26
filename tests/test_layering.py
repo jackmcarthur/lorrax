@@ -675,12 +675,6 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 # target state.
 
 _L2_ENV_EXCEPTIONS = {
-    # ``bool(int(os.environ.get('STERN_DEBUG', '0')))`` at module scope, so a
-    # word spelling raises ValueError on IMPORT.  This module also imports
-    # ``psp.dft_operators`` (see _L2_UPWARD_EXCEPTIONS) — it is really an L1
-    # physics kernel wrapped around an L2 CG solve, and the two questions
-    # have one answer.  Numbered request.
-    "solvers.sternheimer_solve": {"STERN_DEBUG"},
     # ``os.environ.setdefault("JAX_ENABLE_X64", "1")`` at module scope: a
     # LIBRARY mutating global jax configuration for whoever imports it.  Same
     # class as ``centroid.kmeans_isdf``'s ``config.update`` at module scope,

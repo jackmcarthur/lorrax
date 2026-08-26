@@ -81,7 +81,6 @@ _pkg("ffi", "ffi")
 _pkg("ffi.common", "ffi/common")
 
 gw_config = _load_isolated("gw.gw_config", "gw/gw_config.py")
-gw_output = _load_isolated("gw.gw_output", "gw/gw_output.py")
 gate = _load_isolated("ffi.gate", "ffi/gate.py")
 import runtime as _runtime            # noqa: E402  (os + subprocess only)
 
@@ -921,76 +920,6 @@ def test_classifier_matches_the_measured_signatures():
         assert v.peak_source == "nvidia-smi"
 
 
-def _banner_with_stats(stats, alloc, backend="gpu"):
-    log = _Log()
-
-    class _Dev:
-        def memory_stats(self):
-            return stats
-
-    fake_jax = types.ModuleType("jax")
-    fake_jax.local_devices = lambda: [_Dev()]
-    old = sys.modules.get("jax")
-    sys.modules["jax"] = fake_jax
-    try:
-        with _Env(XLA_PYTHON_CLIENT_ALLOCATOR=alloc):
-            gw_output.print_banner(
-                backend=backend, n_devices=1, grid_x=1, grid_y=1, n_procs=1,
-                device_kind="Quadro RTX 5000", print_fn=log)
-    finally:
-        if old is None:
-            sys.modules.pop("jax", None)
-        else:
-            sys.modules["jax"] = old
-    return log
-
-
-def test_banner_never_prints_a_negative_available_pool():
-    """cuda_async reports ``bytes_limit=0`` with real in_use/peak values.
-
-    ``avail = limit - in_use`` is then negative — a number that cannot
-    exist.  Measured signature, job 7882478.
-    """
-    log = _banner_with_stats(MEASURED_STATS["cuda_async"], "cuda_async")
-    assert "-" not in log.text.split("XLA pool:")[-1].split("\n")[0], log.text
-    assert "peak" in log.text.lower() or "in_use" in log.text, log.text
-
-
-def test_banner_reports_the_peak_when_the_limit_is_unknown():
-    log = _banner_with_stats(MEASURED_STATS["cuda_async"], "cuda_async")
-    assert "2.15" in log.text, (
-        "the measured 2.147 GB peak must still reach the operator:\n%s"
-        % log.text)
-
-
-def test_banner_announces_an_env_client_disagreement():
-    log = _Log()
-
-    class _NoArena:
-        device_kind = "rtx"
-
-        def memory_stats(self):
-            return {"bytes_limit": 0, "bytes_in_use": 0,
-                    "peak_bytes_in_use": 0}
-
-    fake_jax = types.ModuleType("jax")
-    fake_jax.local_devices = lambda: [_NoArena()]
-    old = sys.modules.get("jax")
-    sys.modules["jax"] = fake_jax
-    try:
-        with _Env(XLA_PYTHON_CLIENT_ALLOCATOR=None):
-            gw_output.print_banner(
-                backend="gpu", n_devices=1, grid_x=1, grid_y=1, n_procs=1,
-                device_kind="rtx", print_fn=log)
-    finally:
-        if old is None:
-            sys.modules.pop("jax", None)
-        else:
-            sys.modules["jax"] = old
-    assert "LORRAX SANITY" in log.text, log.text
-    assert "backend init" in log.text, log.text
-
-
 def test_gw_init_corroborates_the_env_against_the_client():
     """Source-level: the ζ-fit peak caption must read the live client."""
     src = _read("gw/gw_init.py")
@@ -1040,7 +969,8 @@ def test_preallocate_flags_the_case_trap():
 def test_mem_fraction_reads_the_current_var_not_only_the_deprecated_one():
     """jaxlib 0.9.1 renamed the knob to ``XLA_CLIENT_MEM_FRACTION``.
 
-    gw_output.py:138 reported only ``XLA_PYTHON_CLIENT_MEM_FRACTION``, so a
+    The former driver-local banner reported only
+    ``XLA_PYTHON_CLIENT_MEM_FRACTION``, so a
     run using the current name showed "mem_fraction: unset" while a
     fraction was in force.
     """
@@ -1059,64 +989,6 @@ def test_mem_fraction_reads_the_current_var_not_only_the_deprecated_one():
               XLA_PYTHON_CLIENT_MEM_FRACTION="0.85"):
         r = gw_config.resolve_xla_gpu_memory_env()
         assert r.mem_fraction_conflict is True
-
-
-def test_banner_labels_gpu_only_knobs_on_a_cpu_backend():
-    """The XLA pool knobs are read ONLY by the CUDA plugin's option builder.
-
-    Printing "XLA preallocate: false" on a CPU run states a GPU fact about
-    a run that has no GPU.
-    """
-    log = _Log()
-    with _Env(XLA_PYTHON_CLIENT_ALLOCATOR="platform",
-              XLA_PYTHON_CLIENT_PREALLOCATE="false"):
-        gw_output.print_banner(
-            backend="cpu", n_devices=2, grid_x=1, grid_y=2, n_procs=2,
-            device_kind="cpu", print_fn=log)
-    assert "preallocate" not in log.text.lower() or "cpu" in log.text.lower(), (
-        "CPU banner printed GPU allocator state unqualified:\n%s" % log.text)
-    assert "not applicable" in log.text.lower() or "ignored" in log.text.lower(), (
-        "CPU banner must say the GPU pool knobs do not apply:\n%s" % log.text)
-
-
-def test_banner_reports_the_allocator_on_gpu():
-    log = _Log()
-    with _Env(XLA_PYTHON_CLIENT_ALLOCATOR="cuda_async",
-              XLA_PYTHON_CLIENT_PREALLOCATE="false"):
-        gw_output.print_banner(
-            backend="gpu", n_devices=1, grid_x=1, grid_y=1, n_procs=1,
-            device_kind="rtx", print_fn=log)
-    assert "cuda_async" in log.text, log.text
-
-
-def test_banner_memory_stats_failure_is_reported_not_swallowed():
-    """``except Exception: pass`` around the pool read hid every failure.
-
-    An operator then sees a banner with no pool line and no reason.
-    """
-    log = _Log()
-    marker = object()
-
-    class _BoomDevice:
-        def memory_stats(self):
-            raise RuntimeError("memory_stats unavailable on this backend")
-
-    fake_jax = types.ModuleType("jax")
-    fake_jax.local_devices = lambda: [_BoomDevice()]
-    old = sys.modules.get("jax")
-    sys.modules["jax"] = fake_jax
-    try:
-        gw_output.print_banner(
-            backend="gpu", n_devices=1, grid_x=1, grid_y=1, n_procs=1,
-            device_kind="rtx", print_fn=log)
-    finally:
-        if old is None:
-            sys.modules.pop("jax", None)
-        else:
-            sys.modules["jax"] = old
-    assert "memory_stats unavailable" in log.text or "pool" in log.text.lower(), (
-        "the pool read failed silently; banner was:\n%s" % log.text)
-    assert marker is marker
 
 
 # ---------------------------------------------------------------------------

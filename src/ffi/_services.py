@@ -35,6 +35,12 @@ import sys
 
 __all__ = ["ensure_on_path", "service_roots"]
 
+# A production process has one immutable checkout.  The old idempotence check
+# rebuilt ``service_roots()`` and re-statted every service directory at every
+# call; gwjax reaches this transitional door through many imported modules.
+# One successful census is therefore the process-wide answer.
+_READY = False
+
 #: ``<repo>/services`` — resolved from this file, not from cwd, so it is
 #: right for a worktree, a bare checkout and an installed copy alike.
 _SERVICES = os.path.join(
@@ -55,8 +61,12 @@ def service_roots() -> list[str]:
 
 
 def ensure_on_path() -> None:
-    """Append the service source roots to ``sys.path``.  Idempotent."""
+    """Append the service source roots to ``sys.path`` once per process."""
+    global _READY
+    if _READY:
+        return
     have = {os.path.abspath(p) for p in sys.path}
     for src in service_roots():
         if src not in have:
             sys.path.append(src)
+    _READY = True
