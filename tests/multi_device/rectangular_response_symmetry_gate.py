@@ -355,6 +355,6 @@ def _main():
 if __name__ == "__main__":
     # Production geometry is one JAX process per GPU.  This must precede
     # _main's first jax.devices() backend touch.
-    from runtime import init_jax_distributed
+    from runtime import init_jax_distributed, run_main_and_finalize
     init_jax_distributed()
-    raise SystemExit(_main())
+    run_main_and_finalize(_main)
