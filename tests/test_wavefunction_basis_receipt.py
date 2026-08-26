@@ -98,6 +98,33 @@ def test_bound_canonical_wfn_fingerprint_is_reused_without_rescan(
             n_rmu_logical=3, n_rmu_padded=4)
 
 
+def test_bound_band_source_authenticates_without_centroid_or_rescan(
+        monkeypatch):
+    import common.parallel_transport as transport
+
+    wfn = _wfn()
+    binding = transport.bind_wfn_fingerprint(wfn)
+    receipt = WavefunctionBasisReceipt.from_bound_source(
+        wfn=wfn, wfn_fingerprint_binding=binding,
+        role="transverse", bispinor=True, band_interval=(1, 5),
+        fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
+        n_rmu_logical=3, n_rmu_padded=4)
+    monkeypatch.setattr(
+        transport, "wfn_fingerprint",
+        lambda _value: pytest.fail("bound band source rescanned its WFN"))
+    receipt.assert_matches_bound_band_source(
+        wfn=wfn, wfn_fingerprint_binding=binding,
+        role="transverse", bispinor=True,
+        band_interval=(1, 5), fft_grid=(4, 4, 4),
+        where="finite contact")
+    with pytest.raises(ValueError, match="different loaded WFN object"):
+        receipt.assert_matches_bound_band_source(
+            wfn=_wfn(), wfn_fingerprint_binding=binding,
+            role="transverse", bispinor=True,
+            band_interval=(1, 5), fft_grid=(4, 4, 4),
+            where="finite contact")
+
+
 def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
     source = Path(__file__).parents[1] / "src" / "gw" / "gw_init.py"
     module = ast.parse(source.read_text(encoding="utf-8"))

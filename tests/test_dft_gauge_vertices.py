@@ -15,6 +15,7 @@ from common import mtxel_sweep
 from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
 from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
+from common.parallel_transport import bind_wfn_fingerprint
 from common.wfn_transforms import gflat_to_rmu
 from file_io.wfn_basis import WavefunctionBasisReceipt
 from gw import w_isdf
@@ -96,10 +97,13 @@ def _setup(
     )
 
 
-def _basis_receipt(wfn, geom, r_mu, band_start, band_stop):
+def _basis_receipt(
+    wfn, wfn_fingerprint_binding, geom, r_mu, band_start, band_stop,
+):
     from runtime.padding import padded_mu_extent
-    return WavefunctionBasisReceipt.from_source(
-        wfn=wfn, role='transverse', bispinor=True,
+    return WavefunctionBasisReceipt.from_bound_source(
+        wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+        role='transverse', bispinor=True,
         band_interval=(band_start, band_stop),
         fft_grid=geom.fft_grid, centroid_fft_idx=r_mu,
         n_rmu_logical=len(r_mu),
@@ -886,11 +890,15 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
     monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
+    wfn_fingerprint_binding = bind_wfn_fingerprint(wfn)
 
     endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
-        psi_4[None], wfn=wfn, band_start=0, band_stop=2,
+        psi_4[None], wfn=wfn,
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=2,
         geom=geom, vnl_setup=setup, r_mu=r_mu,
-        basis_receipt=_basis_receipt(wfn, geom, r_mu, 0, 2), iq_irr=0,
+        basis_receipt=_basis_receipt(
+            wfn, wfn_fingerprint_binding, geom, r_mu, 0, 2), iq_irr=0,
         path_order=8, projector_row_chunk=1, g_chunk=2,
         include_transfer_q2_identity=True)
 
@@ -902,10 +910,12 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         "stale basis receipt reached finite-current construction")
     with pytest.raises(ValueError, match="centroid_table_md5"):
         mtxel_sweep.finite_transfer_current_to_centroids(
-            psi_4[None], wfn=wfn, band_start=0, band_stop=2,
+            psi_4[None], wfn=wfn,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+            band_start=0, band_stop=2,
             geom=geom, vnl_setup=setup, r_mu=r_mu,
             basis_receipt=_basis_receipt(
-                wfn, geom, r_mu[::-1], 0, 2),
+                wfn, wfn_fingerprint_binding, geom, r_mu[::-1], 0, 2),
             iq_irr=0, path_order=8, projector_row_chunk=1, g_chunk=2,
             include_transfer_q2_identity=True)
     wfn.symmetry = symmetry_owner
@@ -937,13 +947,74 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
     np.testing.assert_array_equal(endpoint.g_wrap, [[0, 0, 0]])
 
     uniform = mtxel_sweep.sweep_uniform_gauge_matrix_elements(
-        psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        psi_4[None], wfn=wfn,
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=2, geom=geom,
         bvec=setup.B, blat=1.0, vnl_setup=setup, gvecs=gvecs,
         gmask=gmask, box_index=box_index, kvecs=kvecs,
         include_transfer_q2=True)
     assert (endpoint.hamiltonian_config_operator_fingerprint
             == uniform.hamiltonian_config_operator_fingerprint)
     assert endpoint.vnl_path_operator_fingerprint.startswith('sha256:')
+
+    # The finite-transfer contact shares the exact bound WFN/operator identity
+    # but remains an explicitly positive-energy, non-publishing primitive.
+    wrong_wfn = SimpleNamespace(**vars(wfn))
+    wrong_binding = bind_wfn_fingerprint(wrong_wfn)
+    import common.parallel_transport as transport
+    monkeypatch.setattr(
+        transport, "wfn_fingerprint",
+        lambda _value: pytest.fail(
+            "bound finite-transfer transaction rescanned its WFN"))
+    contact = mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+        psi_4[None], wfn=wfn,
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=2, geom=geom, vnl_setup=setup,
+        basis_receipt=endpoint.basis_receipt, iq_irr=0,
+        path_order=8, projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+    np.testing.assert_allclose(
+        contact.lambda_raw, uniform.lambda_raw,
+        rtol=4.0e-13, atol=4.0e-13)
+    assert (contact.hamiltonian_config_operator_fingerprint
+            == endpoint.hamiltonian_config_operator_fingerprint)
+    assert contact.basis_receipt is endpoint.basis_receipt
+    assert contact.vnl_contact_ward_certified is True
+    assert contact.downfolded_complement is None
+
+    symmetry_owner = wfn.symmetry
+    wfn.symmetry = lambda: pytest.fail(
+        "wrong-object contact binding reached q/array construction")
+    with pytest.raises(ValueError, match="different loaded WFN object"):
+        mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+            psi_4[None], wfn=wfn,
+            wfn_fingerprint_binding=wrong_binding,
+            band_start=0, band_stop=2, geom=geom, vnl_setup=setup,
+            basis_receipt=endpoint.basis_receipt, iq_irr=0,
+            path_order=8, projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True)
+    wfn.symmetry = symmetry_owner
+
+    accepted_contact_owner = vnl_ops.compute_icl_vnl_finite_contact_to_ket
+
+    def force_uncertified(*args, **kwargs):
+        value = accepted_contact_owner(*args, **kwargs)
+        return value._replace(certified=jnp.asarray(False))
+
+    monkeypatch.setattr(
+        vnl_ops, "compute_icl_vnl_finite_contact_to_ket",
+        force_uncertified)
+    with pytest.raises(
+            RuntimeError,
+            match="finite_transfer_contact_icl_ward_uncertified"):
+        mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+            psi_4[None], wfn=wfn,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+            band_start=0, band_stop=2, geom=geom, vnl_setup=setup,
+            basis_receipt=endpoint.basis_receipt, iq_irr=0,
+            path_order=8, path_atol=2.0e-12,
+            projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True)
 
     # The fixed-q body row reuses the canonical face Green builder.  At one
     # k and one tau=0 node its normalization reduces to the explicit ordered
@@ -967,7 +1038,8 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
     endpoint_minus_q = endpoint._replace(
         current_nmu=endpoint.current_nmu + 0.0)
     assert endpoint_minus_q is not endpoint
-    mismatched_receipt = _basis_receipt(wfn, geom, r_mu[::-1], 0, 2)
+    mismatched_receipt = _basis_receipt(
+        wfn, wfn_fingerprint_binding, geom, r_mu[::-1], 0, 2)
     with pytest.raises(ValueError, match="before Green contraction"):
         w_isdf._compute_finite_transfer_current_block_row_unverified(
             endpoint, endpoint_minus_q,
@@ -1037,11 +1109,14 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
     monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
+    wfn_fingerprint_binding = bind_wfn_fingerprint(wfn)
 
     common_kwargs = dict(
-        wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=2, geom=geom,
         vnl_setup=setup, r_mu=r_mu,
-        basis_receipt=_basis_receipt(wfn, geom, r_mu, 0, 2), path_order=8,
+        basis_receipt=_basis_receipt(
+            wfn, wfn_fingerprint_binding, geom, r_mu, 0, 2), path_order=8,
         projector_row_chunk=1, g_chunk=2,
         include_transfer_q2_identity=True)
     endpoint_q0 = mtxel_sweep.finite_transfer_current_to_centroids(

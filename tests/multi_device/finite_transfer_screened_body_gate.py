@@ -1,11 +1,13 @@
-"""Real P4 gate for the exact finite-q current endpoint and private TT oracle.
+"""Real P4 gate for finite-q current/contact and the private TT oracle.
 
 The deterministic single-device cells in ``test_dft_gauge_vertices.py`` own
 the independent numerical oracles.  This cell owns the production layout:
 one 2x2 mesh, non-divisible logical band/centroid extents, WfnLoader-paired
 k/G/box labels, a nonzero q-IBZ row after a same-shape q=0 call, the incumbent
 distributed face Green builder, and the public row's fail-closed identity
-gate.  Endpoint and target faces carry the same immutable basis receipt;
+gate.  The same all-P band sweep contracts the positive-energy straight-path
+contact while preserving its bound source identity and exact-zero band tail.
+Endpoint, contact and target faces carry the same immutable basis receipt;
 production publication remains blocked on the separate C/Z, completion,
 rectangular-IBZ-action, and artifact-provenance work.
 
@@ -57,6 +59,7 @@ def check_finite_transfer_screened_body(mesh):
 
     from common import mtxel_sweep
     from common.bispinor_init import lift_to_4spinor
+    from common.parallel_transport import bind_wfn_fingerprint
     from common.wfn_layout import band_sphere_spec
     from common.wfn_transforms import gflat_to_rmu
     from file_io.wfn_basis import WavefunctionBasisReceipt
@@ -132,11 +135,14 @@ def check_finite_transfer_screened_body(mesh):
     # in-memory fixture supplies the same loader protocol without an HDF5
     # file, so route only this gate's process through the existing owner.
     dft_operators._as_loader = lambda value: value
+    wfn_fingerprint_binding = bind_wfn_fingerprint(wfn)
     endpoint_kwargs = dict(
-        wfn=wfn, band_start=0, band_stop=nb_logical, geom=geom,
+        wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=nb_logical, geom=geom,
         vnl_setup=setup, r_mu=r_mu,
-        basis_receipt=WavefunctionBasisReceipt.from_source(
-            wfn=wfn, role='transverse', bispinor=True,
+        basis_receipt=WavefunctionBasisReceipt.from_bound_source(
+            wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+            role='transverse', bispinor=True,
             band_interval=(0, nb_logical), fft_grid=fft_grid,
             centroid_fft_idx=r_mu, n_rmu_logical=len(r_mu),
             n_rmu_padded=padded_mu_extent(len(r_mu), mesh)),
@@ -154,6 +160,19 @@ def check_finite_transfer_screened_body(mesh):
         psi_4, iq_irr=3, **endpoint_kwargs)
     endpoint.current_nmu.block_until_ready()
     del endpoint_q0
+
+    contact_kwargs = dict(
+        wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+        band_start=0, band_stop=nb_logical, geom=geom,
+        vnl_setup=setup, basis_receipt=endpoint_kwargs["basis_receipt"],
+        projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+    contact = mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+        psi_4, iq_irr=1, **contact_kwargs)
+    contact_minus_q = (
+        mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+            psi_4, iq_irr=3, **contact_kwargs))
+    contact.lambda_raw.block_until_ready()
 
     if endpoint.current_nmu.sharding.spec != P(None, "x", None, None, "y"):
         raise AssertionError(
@@ -173,6 +192,33 @@ def check_finite_transfer_screened_body(mesh):
         raise AssertionError(
             f"endpoint pad is not exact zero: band={band_tail}, "
             f"centroid={centroid_tail}")
+
+    contact_spec = P(None, None, None, "x", "y")
+    if contact.lambda_raw.sharding.spec != contact_spec:
+        raise AssertionError(
+            f"wrong contact sharding {contact.lambda_raw.sharding.spec}")
+    if tuple(contact.lambda_raw.shape) != (nk, 3, 3, 8, 8):
+        raise AssertionError(
+            f"wrong padded contact shape {contact.lambda_raw.shape}")
+    if (contact.hamiltonian_config_operator_fingerprint
+            != endpoint.hamiltonian_config_operator_fingerprint):
+        raise AssertionError("current/contact Hamiltonian identities differ")
+    if contact.basis_receipt is not endpoint.basis_receipt:
+        raise AssertionError("current/contact basis receipt object split")
+    if (not contact.vnl_contact_ward_certified
+            or contact.downfolded_complement is not None):
+        raise AssertionError(
+            "contact Ward/complement state does not remain fail-closed")
+    contact_host = _gather(contact.lambda_raw)
+    contact_minus_host = _gather(contact_minus_q.lambda_raw)
+    contact_tail = max(
+        float(np.max(np.abs(contact_host[..., nb_logical:, :]))),
+        float(np.max(np.abs(contact_host[..., :, nb_logical:]))))
+    if contact_tail != 0.0:
+        raise AssertionError(
+            f"contact band pad is not exact zero: {contact_tail}")
+    np.testing.assert_allclose(
+        contact_host, contact_minus_host, rtol=8.0e-12, atol=8.0e-12)
 
     raw_rmu = gflat_to_rmu(
         psi_4, box_index_dev, r_mu, mesh=mesh, fft_grid=fft_grid,
@@ -241,6 +287,8 @@ def check_finite_transfer_screened_body(mesh):
         "endpoint_shape": tuple(int(v) for v in endpoint.current_nmu.shape),
         "band_pad_max": band_tail,
         "centroid_pad_max": centroid_tail,
+        "contact_shape": tuple(int(v) for v in contact.lambda_raw.shape),
+        "contact_band_pad_max": contact_tail,
         "chi_pad_max": chi_pad,
         "ward_abs_max": ward_abs,
     }
