@@ -71,6 +71,25 @@ dependent), or `apt-get install quantum-espresso` and check `pw2bgw.x`
 exists; if the distro package lacks it, build QE 7.4.1 from source with
 `make pw pp` (~15 min, CPU-only is fine at these deck sizes).
 
+## The GW driver needs BOTH FFI libraries
+
+`gw.gw_jax` refuses to start without a host-platform library beside the CUDA
+one. `build_ffi_host.sh` builds it here: phdf5 + ScaLAPACK (distro netlib
+`libscalapack-openmpi` — exports all eleven required symbols including
+C-BLACS, measured) + CBLAS (distro OpenBLAS). SLATE off, mklfft
+self-disables (DFTI is Intel-only; the XLA FFT lowering stands). `launch.sh`
+exports both `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`.
+
+Verified end-to-end 2026-08-26: the tracked GN-PPM regression deck
+(`tests/regression/gnppm_debug/gnppm_test.in`, `memory_per_device_gb`
+lowered 28→6 for an 8 GB laptop GPU) ran to completion on the RTX 5070 —
+170 s wall, sigma table + `sigma_mnk.h5` written. Against the frozen
+2026-08-09 reference: sigX, VH, Eo **byte-identical**; sigC differs by up
+to 5.5e-2 eV, consistent with the post-freeze head-correction landings on
+main (`f83d5ea7`, `d2d6d521`, `a103f1b0`) — the reference predates them.
+The dirty `mpirun` exit after "process finalized explicitly" is the
+documented deliberate `os._exit`; judge by artifacts.
+
 ## Site facts that differ from Perlmutter, and why
 
 * **cuBLASMp pin.** Perlmutter's lane names 0.10.0.3695; that wheel is on
