@@ -9,8 +9,10 @@ stages and nothing upstream of them.
 Two user-facing drivers in the chain's orbit have **no section here**, which is worth
 knowing before you go looking for them. `gw.eqp_bgw` is the fastloop chain's
 `eqp-convert` stage, named in the smoke-test line below and documented nowhere on this
-page; `postprocess.rotate_wfn_to_qp` is what turns a GW run's `qp_wfn_rotations.h5` into
-the `WFN_qp.h5` that the htransform section tells you to feed it. Deck keys and defaults
+page; `postprocess.rotate_wfn_to_qp` is a thin adapter that turns a GW run's
+`qp_wfn_rotations.h5` into the `WFN_qp.h5` that the htransform section tells you to
+feed it, through the same canonical `file_io.qp_wfn.write_qp_wfn_h5` writer used by
+GW itself. Deck keys and defaults
 are verified against `gw_config._DEFAULTS` as of 2026-08-01; the complete key list is in
 [input_reference.md](input_reference.md).
 
@@ -162,7 +164,12 @@ Computes the GW quasiparticle correction: ISDF ζ-fit + bare Coulomb V_q(μ,ν) 
 Consumes `WFN.h5`, `centroids_frac.txt`, `kin_ion.h5` (+ `centroids_file_current`/`tmp/v_q_bispinor.h5` when bispinor); produces `tmp/zeta_q.h5` (+`zeta_q_mu{1,2,3}.h5`), the restart tensor file `tmp/isdf_tensors_{n_rmu}.h5` (V_qmunu, G0, enk_full, psi_full_y[_transverse], W0 + head scalars for BSE — plus `psi_full_y_mun` under `low_mem_bands = true`, additive to `psi_full_y` and read only by that same key on restart; the schema BSE/downfold read, `psi_full_y`, is unchanged either way), and `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat` and `qp_wfn_rotations.h5` (`eqp_g0w0.dat` in PPM one-shot). `write_eqp2=true` additionally writes `eqp2.dat`: a fixed-Sigma eigenvalue-self-consistent ladder obtained by rotating the one-shot full Sigma(omega) table into each updated QP basis and rediagonalizing until max-|dE| over protected/non-scissored states is at most 1 meV by default. It does not rebuild screening, W, or Sigma diagrams. Protected states must remain covered by the omega grid; optional out-of-grid semicore states preserve `E-E_F`, and optional high conduction states use the in-grid affine scissor. A mandatory final map reapplies both after the putative final QP rotation before the file is accepted.
 
 **k-basis of the energy files — every block states its own k, so join on the coordinate, never on the block position.** `eqp0.dat`/`eqp1.dat` are on the **IBZ wedge** (one block per `wfn.kpoints` entry; the coordinate is the BGW `(3f13.9,i8)` block header, as BerkeleyGW writes it). `sigma_diag.dat` and `eqp_g0w0.dat` are on the **full BZ** (one block per `sym.unfolded_kpts` entry), and each block carries a `# kcrys kx ky kz` line. The bases are deliberate and not interchangeable. Htransform consumes the columnar IBZ `eqp1.dat` directly and routes its unfold through the symmetry service as specified below; it does not require a pre-unfolded positional converter. Pairing LORRAX blocks against BerkeleyGW's IBZ blocks **by position** has produced a wrong answer three times — on Si 4×4×4 the map is `[0,1,2,5,6,7,10,27]`, so positions 0–2 agree and only diverge from position 3, and the worst instance reported 291 meV where the truth was 28 meV. `tests/test_eqp_kpoint_basis.py` pins all of this.
-Two files this list used to name are not written by this driver, measured 2026-08-10 on a COHSEX run of `tests/regression/si_bse_debug`: `sigma_mnk.h5` has its only producer in `ppm_pipeline.py`, so a `compute_mode = cohsex` run writes no such file however `sigma_omega_h5_file` is set; and `WFN_qp.h5` is written by `postprocess.rotate_wfn_to_qp`, a separate driver with no section on this page, which reads the `qp_wfn_rotations.h5` this one does write. The htransform section's `--wfn-file WFN_qp.h5` therefore names a file the documented chain never produces on its own — run `python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5` between the two stages.
+`sigma_mnk.h5` has its only producer in `ppm_pipeline.py`, so a
+`compute_mode = cohsex` run writes no such file however `sigma_omega_h5_file` is set.
+GW's enabled QP-WFN dump and the optional standalone conversion both route through
+`file_io.qp_wfn.write_qp_wfn_h5`; the latter remains useful when an older or
+deliberately rotation-only run has only `qp_wfn_rotations.h5`:
+`python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5`.
 Band windows (`wavefunction_bundle.BandSlices` from `Meta.from_system`): the σ/QP window is always [0, nelec+ncond) — nval moves only the interior edge b1 = nelec−nval, never the window bottom; `nband` sets the χ₀/Σ band-sum top b4 = round_up(nband, world_size) (pads are zeroed).
 
 Invoke: `python -m gw.gw_jax -i gw.in` under the certified Frontera CLX launch block `config/frontera/templates/gw_dev.sbatch` (srun --mpi=pmi2 + apptainer + impl=mpi CPU collectives; typical 8 nodes × 2 ranks × 28 threads = P=16; full-pipeline parity jobs 7884609/7884612). Demonstrated end-to-end by `/scratch2/08271/jackmc/mos2_4x4_test/valsmoke_tmpl.sbatch` and `gw_ht_b300.sbatch` (their explicit `LORRAX_FFT_FFI=1` + `LORRAX_FFT_FFI_FUSED=1` exports are redundant since 2026-08-01 — the FFI stack is the required default).
