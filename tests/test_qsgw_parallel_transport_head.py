@@ -18,7 +18,7 @@ from jax.sharding import Mesh
 import common.parallel_transport as parallel_transport_module
 from common.chi_from_dipole import compute_S_omega
 from common.bispinor_init import HALFALPHA
-from common.mtxel_sweep import UniformGaugeMatrixElements
+from common.mtxel_sweep import UniformGaugeCurrentMatrixElements
 from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
     StaticGaugeHallTransaction,
@@ -847,13 +847,9 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
            + 1j * rng.normal(size=(nk, 3, storage, storage)))
     gamma = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
     fingerprint = "sha256:" + "c" * 64
-    uniform = UniformGaugeMatrixElements(
+    uniform = UniformGaugeCurrentMatrixElements(
         gamma_raw=jnp.asarray(gamma),
-        lambda_raw=jnp.zeros(
-            (nk, 3, 3, storage, storage), dtype=jnp.complex128),
         hamiltonian_config_operator_fingerprint=fingerprint,
-        dgamma_dq_raw=None,
-        d2gamma_dq2_raw=None,
     )
     energies_file = np.asarray([[[-1.1, -0.3, 0.8]]], dtype=np.float64)
     occupations_file = np.asarray([[[1.0, 1.0, 0.0]]], dtype=np.float64)

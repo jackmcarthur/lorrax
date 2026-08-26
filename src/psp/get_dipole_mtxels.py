@@ -46,7 +46,7 @@ from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
                                 blocks_to_host, dipole_operator,
                                 sweep_matrix_elements,
-                                sweep_uniform_gauge_matrix_elements)
+                                sweep_uniform_current_matrix_elements)
 from common.parallel_transport import (
 	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
 )
@@ -1142,12 +1142,12 @@ def main(argv=None):
 			ngkmax=int(psi_G.shape[3]), nb=nb, ns=int(psi_G.shape[2]),
 			nk=nk, cell_volume=float(wfn.cell_volume))
 		with timing.section("static_gauge_uniform_sweep"):
-			uniform_gauge = sweep_uniform_gauge_matrix_elements(
+			uniform_gauge = sweep_uniform_current_matrix_elements(
 				psi_G, wfn=wfn, band_start=0, band_stop=nb, geom=geom,
 				bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(gtab.kvecs), include_transfer_q2=False)
+				kvecs=np.asarray(gtab.kvecs))
 		with timing.section("static_gauge_hall_reduce"):
 			hall = static_gauge_hall_transaction(
 				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
