@@ -98,8 +98,7 @@ class HTransformProductionReport:
             self.emit(line)
 
     def environment(self, *, params, wfn, gram_plan, fine_plan,
-                    fine_enabled: bool, diagnostics_policy: str,
-                    diagnostics_enabled: bool) -> None:
+                    fine_enabled: bool) -> None:
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
@@ -137,9 +136,6 @@ class HTransformProductionReport:
             self.emit("Batched LA     : not used by this calculation")
         self.emit("LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
                   "ScaLAPACK on CPU. Batched LA is a schedule, not a backend")
-        self.emit("fH diagnostics : " + policy(
-            diagnostics_policy, ("auto", "on", "off")) + " -> "
-            + ("on" if diagnostics_enabled else "off"))
         self.emit("Debug stream   : " + (
             "ON via LORRAX_DEBUG_PRINT" if self.debug else
             "OFF (set LORRAX_DEBUG_PRINT=1 for kernel diagnostics)"))
@@ -274,6 +270,10 @@ class HTransformProductionReport:
                        if row["name"] == name)
 
         stages = [
+            ("runtime bring-up", sum(
+                float(row["inclusive"]) for row in records
+                if row["name"].startswith("htransform.runtime_stack."))),
+            ("pre-main + imports", total("htransform.imports")),
             ("input + Galerkin", total("initialize_wfns")),
             ("fH construction", total("ht.build_fH_R")),
             ("path eigensolve", total("ht.kpath_loop")),
@@ -281,6 +281,8 @@ class HTransformProductionReport:
              + total("ht.kpath_host_tail")),
             ("fine-k wavefunctions", total("wfns_fi")),
         ]
+        accounted = sum(seconds for _, seconds in stages)
+        stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")
         self.emit("  stage                    wall (s)     fraction")
         for name, seconds in stages:

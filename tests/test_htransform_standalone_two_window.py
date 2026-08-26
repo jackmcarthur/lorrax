@@ -43,6 +43,7 @@ def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
     pytest.importorskip("jax")
     import numpy as np
     from bandstructure.htransform import write_bands_to_file
+    from common.units import RYD_TO_EV
 
     path = tmp_path / "bandstructure.dat"
     write_bands_to_file(
@@ -52,3 +53,5 @@ def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
     text = path.read_text()
     assert "absolute_band_window=[6,8)" in text
     assert "fit_bands=6 guard_bands=4" in text
+    assert "energy_eV" in text.splitlines()[0]
+    assert f"{2.0 * RYD_TO_EV: .8f}" in text

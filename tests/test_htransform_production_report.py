@@ -45,8 +45,7 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         fine_plan=SimpleNamespace(
             requested="distributed", backend="cusolvermp",
             requested_batched_route="auto", batched_route="scan"),
-        fine_enabled=True,
-        diagnostics_policy="auto", diagnostics_enabled=False)
+        fine_enabled=True)
     centroids = SimpleNamespace(closure=SimpleNamespace(
         closed=False, n_sym=2, n_violating=1, n_centroids=20,
         tol=1.0e-5, worst_residual=0.25, worst_op=1))
@@ -85,7 +84,6 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     report.htransform_quality({
         "row_isometry_max": 2.0e-7,
         "row_isometry_cap": 1.0e-6,
-        "on_grid_error_scale_mev": 1.8e-3,
         "outer_shell_l2_fraction": 0.051,
         "outer_shell_max_over_r0": 0.012,
         "locality_wall_seconds": 0.08,
@@ -93,6 +91,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     report.path_summary(result=result)
     report.progress("Started Hamiltonian interpolation at 12:00:00.")
     report.timings([
+        {"name": "htransform.runtime_stack.jax_import", "inclusive": 1.5},
+        {"name": "htransform.imports", "inclusive": 0.5},
         {"name": "initialize_wfns", "inclusive": 2.0},
         {"name": "ht.build_fH_R", "inclusive": 1.0},
         {"name": "ht.kpath_loop", "inclusive": 3.0},
@@ -136,6 +136,9 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert " Ry" not in text
     assert "auto (other choices:" in text
     assert "Started Hamiltonian interpolation" in text
+    assert "runtime bring-up" in text
+    assert "pre-main + imports" in text
+    assert "other driver work" in text
     assert "OUTPUT FILES AND INPUTS" in text
     assert "calculation report" not in text
     assert "HDF5" not in text and "h5py" not in text

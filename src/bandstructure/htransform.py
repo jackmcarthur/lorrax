@@ -61,10 +61,6 @@ from common.sharding_fit import padded_extent as _pad_to
 from common.sharding_fit import shard_factor as _shard_factor
 from runtime.production_stream import ProductionStdout
 from .production_report import HTransformProductionReport
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
 
 import symmetry_maps                                            # noqa: E402
 
@@ -1533,7 +1529,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         log_fn = lambda *a, **kw: None
 
     f_eps, a_f, n_f, shift = f_transform_eigs(enk_sigma, a_band_index=a_band_index)
-    log_fn(f"  f-transform: a={a_f:.6f} Ry, n={n_f:.2f}, shift={shift:.6f} Ry"
+    log_fn(f"  f-transform: a={a_f * RYD_TO_EV:.5f} eV, n={n_f:.2f}, "
+           f"shift={shift * RYD_TO_EV:.5f} eV"
            + (f" (a from band {a_band_index})" if a_band_index is not None else ""))
 
     flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -1669,10 +1666,6 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         quality_record_fn({
             "row_isometry_max": float(_ortho),
             "row_isometry_cap": float(_tol),
-            # Empirical conversion already used by the production refusal:
-            # measured on the MoS2 capacity ladder documented above.  This is
-            # an on-grid representation screen, never an off-grid estimate.
-            "on_grid_error_scale_mev": float(9.0e3 * _ortho),
             "outer_shell_l2_fraction": float(_shell_fraction),
             "outer_shell_max_over_r0": float(_shell_max_over_r0),
             "outer_shell_vectors": int(np.count_nonzero(_outer_shell)),
@@ -2077,7 +2070,7 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
 
 
 def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
-                a_band_index: int | None = None, diagnostics: bool = True,
+                a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
                 progress_fn=None, quality_record_fn=None):
     from time import perf_counter as _perf   # instrument:
@@ -2119,70 +2112,10 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     _f_shoulder_gate(
         f_eps, 0, nb_keep, shift, log_fn, rank=rank,
         where="htransform")
-
-    # Diagnostics. Split into two small jits:
-    #   _diag_stats_fast  — sharding-respecting reductions on the full fH_k
-    #     (no gather needed; psum on the (x,y) face).
-    #   _diag_eig_at_gamma — eigvalsh on fH_k[0] only. Pull fH_k[0:1] to
-    #     replicated FIRST (7.4 MB at our scale), so the eigvalsh runs
-    #     single-device locally rather than driving an all-gather of the
-    #     full (rank, rank) face inside the eigvalsh module.
-    @jax.jit
-    def _diag_stats_fast(fH_k):
-        return (jnp.min(jnp.real(fH_k)),
-                jnp.max(jnp.real(fH_k)),
-                jnp.max(jnp.abs(jnp.imag(fH_k))))
-
-    # Takes the WHOLE ``f_eps`` and returns the four printed 5-element
-    # windows as well: ``f_eps[:, 0]`` and each ``np.array(x[a:b])`` below
-    # was its own eager ``dynamic_slice``/``squeeze`` module (4 of this
-    # driver's 137, job 7884866).  Slicing is exact, and these values reach
-    # the log only — never ``bandstructure.dat``.
-    @partial(jax.jit, static_argnames=('states',))
-    def _diag_eig_at_gamma(fH_k0_rep, f_eps_in, states):
-        eigs0 = jnp.sort(jnp.linalg.eigvalsh(fH_k0_rep))
-        f_exp0 = jnp.sort(f_eps_in[:, 0])
-        eig_err = jnp.max(jnp.abs(eigs0[:f_exp0.shape[0]] - f_exp0))
-        return (eig_err, f_exp0[:5], eigs0[:5], f_exp0[-5:],
-                eigs0[states - 5:states])
-
-    _t0 = _perf()                                          # instrument:
-    # ── THE DIAGNOSTICS GATE ──────────────────────────────────────────────
-    # This block plus ``_gamma_rt`` below is 1.442 s of the 4.327 s cache-cold
-    # ``h_transform`` stage — 33 %, 7 XLA programs — and 0.120 s warm
-    # (PROFILE_htransform_exciton §1.2).  Every value it computes reaches a
-    # ``log_fn`` line and nothing else; none of them reaches
-    # the interpolated-band table.  Diagnostics now follow the driver's one
-    # ``LORRAX_DEBUG_PRINT`` switch when ``--fh-diagnostics=auto``; without
-    # that switch the old implementation spent a third of the stage computing
-    # numbers it then discarded.
-    #
-    # ``fH_k`` exists ONLY for this block: the kpath solve consumes ``fH_R``
-    # alone.  At the reference shape it is (64, 768, 768) complex128 = 576 MiB
-    # global, held alive across the whole solve for four log lines.  Dropping
-    # the reference right after the block frees it before the kpath batches
-    # allocate their own (bs, rank, rank) temporaries — the two peaks stop
-    # overlapping.  (The buffer is still PRODUCED, because it is an output of
-    # ``build_fH_R``'s single jit and ``fH_R`` is its ifft; only its residency
-    # is at stake here, which is the 576 MiB the profile prices.)
-    if diagnostics:
-        re_min, re_max, im_max = _diag_stats_fast(fH_k)
-        log_fn("fH_k real range: [{:.3e}, {:.3e}], |imag|max={:.3e}".format(
-            float(re_min), float(re_max), float(im_max)))
-        fH_k0_rep = jax.device_put(fH_k[0], rep)  # (rank, rank) replicated, ~7 MB
-        _eig_err, _f_head, _e_head, _f_tail, _e_tail = jax.device_get(
-            _diag_eig_at_gamma(fH_k0_rep, f_eps, int(states)))
-        fH_eig_err = float(_eig_err)
-        log_fn(f"fH(k=0) eigenvalue error vs f(eps): {fH_eig_err:.6f} Ry = {fH_eig_err * 13.6057:.3f} eV")
-        log_fn(f"  f(eps) first 5: {np.asarray(_f_head)}")
-        log_fn(f"  fH eig first 5: {np.asarray(_e_head)}")
-        log_fn(f"  f(eps) last 5:  {np.asarray(_f_tail)}")
-        log_fn(f"  fH eig last 5:  {np.asarray(_e_tail)}")
-    else:
-        log_fn("  [route] fH diagnostics: OFF (fH_k stats, Γ eigen-check and "
-               "the Γ round-trip are not computed; --fh-diagnostics=on "
-               "restores them)")
-    timing.record("ht.diagnostics", _perf() - _t0)         # instrument:
+    # The path solve consumes ``fH_R`` alone.  Release the coarse-grid image
+    # before its q-batched matrices are allocated (576 MiB at the reference
+    # 64 x 768 x 768 complex128 shape).
+    del fH_k
 
     _t0 = _perf()                                          # instrument:
     # ── THE METRIC ROUTE — S is the identity, and the code already knows it ──
@@ -2290,35 +2223,6 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             return jnp.linalg.eigvalsh((z + z.conj().T) * 0.5)
 
         return jax.vmap(_solve_one)(mat)
-
-    # Round-trip diagnostic at Γ — single q, kept (i, j)-sharded (never whole
-    # on any device: rank²·16/ndev instead of rank²·16).
-    # ``q0`` is a numpy constant, not ``jnp.zeros``: eagerly that was two more
-    # single-primitive modules (``convert_element_type``, ``broadcast_in_dim``)
-    # for three zeros that only ever appear as a jit constant anyway.
-    q0 = np.zeros((1, 3), dtype=np.float64)
-    face_one_shard = NamedSharding(mesh_xy, P('x', 'y'))
-
-    # The residual reduction is INSIDE the jit.  Eagerly it was four more
-    # modules (``subtract``, ``abs``, ``_reduce_max``, ``_reduce_min``); the
-    # arithmetic and the shardings of both operands are unchanged, and the
-    # scalar reaches the log only.
-    @jax.jit
-    def _gamma_rt(fH_R, fH_k):
-        phase0 = jnp.exp(-2j * jnp.pi * (q0 @ R_grid.T))
-        m = 0.5 * jnp.einsum('bk,kij->bij', phase0, fH_R)
-        m = jax.lax.with_sharding_constraint(m, face_ij_shard)
-        m = (m + jnp.swapaxes(m, 1, 2).conj())[0]
-        m = jax.lax.with_sharding_constraint(m, face_one_shard)
-        return jnp.min(jnp.max(jnp.abs(fH_k - m), axis=(1, 2)))
-
-    _t0 = _perf()                                          # instrument:
-    if diagnostics:
-        rt_err = float(_gamma_rt(fH_R, fH_k))
-        log_fn(f"FFT Γ round-trip max error: {rt_err:.3e}")
-    timing.record("ht.gamma_roundtrip", _perf() - _t0)     # instrument:
-    # Last reader of ``fH_k``; see the diagnostics-gate block above.
-    del fH_k
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -2465,11 +2369,13 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             gamma_exact = gamma_exact - fermi_energy
         # Recompute path range after shift and report
         path_range = (float(energies_sorted.min()), float(energies_sorted.max()))
-        log_fn(f"Path energy range: {path_range[0]:.6f} to {path_range[1]:.6f} Ry (VBM@0)")
-        # Γ deltas (in mRy) remain unchanged by uniform shift
-        delta = (energies_sorted[gamma_positions[0]] - gamma_exact) * 1000.0
-        log_fn(("Γ Δε (mRy): " if _gamma_is_exact else
-                "nearest-path-point Δε vs Γ source (mRy): ")
+        log_fn(
+            f"Path energy range: {path_range[0] * RYD_TO_EV:.5f} to "
+            f"{path_range[1] * RYD_TO_EV:.5f} eV (VBM@0)")
+        delta = ((energies_sorted[gamma_positions[0]] - gamma_exact)
+                 * RYD_TO_EV * 1000.0)
+        log_fn(("Γ Δε (meV): " if _gamma_is_exact else
+                "nearest-path-point Δε vs Γ source (meV): ")
                + ", ".join(f"{d:+.2f}" for d in delta[:6]))
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
@@ -2514,8 +2420,11 @@ def plot_bands(result):
         raise RuntimeError("matplotlib is required for plotting") from exc
 
     fig, ax = plt.subplots()
+    energies_ev = np.asarray(energies_sorted) * RYD_TO_EV
+    gamma_exact_ev = (None if gamma_exact is None else
+                      np.asarray(gamma_exact) * RYD_TO_EV)
     for band in range(nb_keep):
-        ax.plot(x_path, energies_sorted[:, band], lw=1.0, color='C0', alpha=0.9)
+        ax.plot(x_path, energies_ev[:, band], lw=1.0, color='C0', alpha=0.9)
 
     x_ticks = x_path[np.asarray(node_indices, dtype=int)]
     labels = [(lbl or "") for lbl in node_labels]
@@ -2527,13 +2436,13 @@ def plot_bands(result):
         xpos = x_path[idx]
         label_exact = 'Exact Γ' if pos_idx == 0 else None
         label_ht = 'HT Γ' if pos_idx == 0 else None
-        if gamma_exact is not None:
-            ax.scatter(np.full(nb_keep, xpos), gamma_exact, marker='o', facecolors='none', edgecolors='red', label=label_exact)
-        ax.scatter(np.full(nb_keep, xpos), energies_sorted[idx], marker='x', color='black', label=label_ht)
+        if gamma_exact_ev is not None:
+            ax.scatter(np.full(nb_keep, xpos), gamma_exact_ev, marker='o', facecolors='none', edgecolors='red', label=label_exact)
+        ax.scatter(np.full(nb_keep, xpos), energies_ev[idx], marker='x', color='black', label=label_ht)
 
-    ax.axhline(fermi_energy, color='red', linestyle='--', linewidth=1.0, alpha=0.7, label='$E_F$')
+    ax.axhline(fermi_energy * RYD_TO_EV, color='red', linestyle='--', linewidth=1.0, alpha=0.7, label='$E_F$')
     ax.set_xlabel('k-path arc length (2π-scaled)')
-    ax.set_ylabel('Energy (Ry)')
+    ax.set_ylabel('Energy (eV)')
     ax.set_title('Hamiltonian-transform bands')
     ax.grid(True, which='both', axis='y', linestyle='--', alpha=0.3)
     ax.legend(loc='best', fontsize='small')
@@ -2548,10 +2457,10 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
     # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
     # assume the layout of what it is handed.  ``energies_on_path`` comes
     # straight out of ``_post_kpath`` with the q axis tiled over the mesh.
-    energies = gather_to_host(energies_on_path)
+    energies = gather_to_host(energies_on_path) * RYD_TO_EV
     kpoints = gather_to_host(kpath_frac)
     with open(output_path, 'w', encoding='utf8') as fh:
-        fh.write('# idx_k idx_b kx ky kz s energy\n')
+        fh.write('# idx_k idx_b kx ky kz s energy_eV\n')
         if nb_fit is not None:
             fh.write(
                 f"# absolute_band_window=[{int(band_start)},"
@@ -2614,18 +2523,6 @@ def main(argv=None):
              "window, so standalone output requires interior returned bands. "
              "Default: 4 (the measured shoulder depth). Zero is retained only "
              "as a red/reproduction arm and will normally refuse.")
-    parser.add_argument("--fh-diagnostics", default="auto",
-                        choices=("auto", "on", "off"),
-                        help="fH_k range stats, the Γ eigenvalue check against "
-                             "f(eps) and the Γ round-trip.  They are 33%% of "
-                             "the cache-cold h_transform stage (1.442 s, 7 XLA "
-                             "programs) and hold fH_k — 576 MiB at the "
-                             "reference shape — alive across the whole solve, "
-                             "for four log lines that never reach "
-                             "bandstructure.dat.  auto (default) = follow "
-                             "LORRAX_DEBUG_PRINT, i.e. compute them only if "
-                             "the driver debug stream is enabled; on = always; "
-                             "off = never.")
     parser.add_argument("--eigh-backend", default=None,
                         choices=eigh_backend_choices(),
                         help="Eigensolver for the fH_q eigendecomposition of "
@@ -2668,21 +2565,6 @@ def main(argv=None):
                  energy_source=_energy_source)
     report.architecture()
 
-    # JAX persistent compile cache — the same call/pattern as gw_jax's
-    # _warm_start (and run_nscf / run_sternheimer / kmeans_cli).  This CLI
-    # was the one driver that never enabled it, so every htransform run paid
-    # a cold XLA compile of the Galerkin/G-accum kernels.  It is now safe and
-    # effective at EVERY process count (scorecard AH) — measured at P=8 on the
-    # fixture, a warm run compiles 0 of 152 modules per rank instead of 152.
-    # Opt out with ISDF_JAX_CACHE_DIR="" — that env value is honoured inside
-    # ensure_jax_compile_cache, so nothing here needs to test for it.
-    # Failures are logged and swallowed.
-    try:
-        from common.jax_compile_cache import ensure_jax_compile_cache
-        ensure_jax_compile_cache()
-    except Exception as exc:
-        log(f"WARNING: JAX compile cache unavailable: {exc}")
-
     from gw.gw_init import read_cohsex_input
     params = read_cohsex_input(args.input)
     # Input file is the source of truth; the CLI flag is an override — and
@@ -2724,13 +2606,9 @@ def main(argv=None):
         "eigh", mesh_xy, backend=eigh_backend, n=None,
         batched_route=distrib_la_batched_route)
         if _fine_enabled else None)
-    _diag_on = (_debug if args.fh_diagnostics == "auto"
-                else args.fh_diagnostics == "on")
     report.environment(
         params=params, wfn=wfn, gram_plan=_gram_plan,
-        fine_plan=_fine_plan, fine_enabled=_fine_enabled,
-        diagnostics_policy=args.fh_diagnostics,
-        diagnostics_enabled=_diag_on)
+        fine_plan=_fine_plan, fine_enabled=_fine_enabled)
 
     from common import sanity
 
@@ -2760,21 +2638,21 @@ def main(argv=None):
     # wrong.  Bracket it here, where the file name is still in scope.
     sanity.check_finite("htransform S (ISDF overlap)", S, print_fn=log)
     sanity.check_finite("htransform ctilde", ctilde, print_fn=log)
-    sanity.check_finite("htransform E_nk (Ry)", enk_sigma, print_fn=log)
+    sanity.check_finite("htransform band energies", enk_sigma, print_fn=log)
     # Bandwidth, not absolute energy: the zero of a pseudopotential
     # eigenvalue is convention-dependent, but the *spread* of a Σ-window
-    # band set is not — 20 Ry (272 eV) is far wider than any real
+    # band set is not — 272 eV is far wider than any real
     # semicore-to-conduction window and so only fires on gross
     # corruption.  A subtler check (comparing --eqp-file energies against
     # the DFT ones they replace) is proposed but not implemented here;
     # see the workstream-O report.
     _enk = np.asarray(jax.device_get(enk_sigma), dtype=np.float64)
     if _enk.size:
-        _spread = float(_enk.max() - _enk.min())
-        log(f"  E_nk spread: {_spread:.4f} Ry over {_enk.size} states")
+        _spread = float(_enk.max() - _enk.min()) * RYD_TO_EV
+        log(f"  E_nk spread: {_spread:.4f} eV over {_enk.size} states")
         sanity.check_in_range(
-            "htransform E_nk bandwidth (Ry)", np.array([_spread]),
-            0.0, 20.0, unit="Ry", print_fn=log)
+            "htransform E_nk bandwidth", np.array([_spread]),
+            0.0, 20.0 * RYD_TO_EV, unit="eV", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
     if len(_centroid_records) != 1:
@@ -2793,7 +2671,7 @@ def main(argv=None):
     _quality_records = []
     with mesh_xy, timing.section("h_transform"):
         result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
-                             a_band_index=args.a_band, diagnostics=_diag_on,
+                             a_band_index=args.a_band,
                              band_start=int(wfn.nelec) - int(params["nval"]),
                              n_return_bands=n_return_bands,
                              progress_fn=report.progress,

@@ -215,7 +215,7 @@ Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and w
 ## htransform — `bandstructure.htransform`
 
 Galerkin QP bandstructure interpolation to an arbitrary k-path from coarse-grid data: Galerkin-projects ψ onto the ISDF centroid basis (since 62ba395 a Gram-eigh of A Aᴴ — nk·nb square, N_μ-free, through the `ffi.linalg` eigh plan under the same `eigh_backend` deck key as fH_q — with Vᴴ/`B_at_mu` μ-sharded; rank ≤ nk·nb), builds the f-transformed Hamiltonian fH_k = Σ_n f(ε_nk) c_nk c_nkᴴ, IFFTs to lattice fH_R, then per path-q eigvalsh + Newton inversion of f recovers ε_n(q); with `--eqp-file` the anchoring ε are GW QP energies, giving the QP bandstructure.
-Consumes the same deck as gw_jax ([cohsex] keys + `K_POINTS {crystal_b}` path), `WFN.h5` (or `--wfn-file WFN_qp.h5`), `centroids_file`; writes `bandstructure.dat` (VBM shifted to 0, energies in Ry; rank 0 is the only writer). No restart file of its own — reuse means feeding it the same WFN/centroids/eqp inputs. Distributed-key coverage (`eigh_backend`, `use_low_mem_eigh`) and the per-rank memory story: `docs/dev/large_nmu_operation.md`.
+Consumes the same deck as gw_jax ([cohsex] keys + `K_POINTS {crystal_b}` path), `WFN.h5` (or `--wfn-file WFN_qp.h5`), `centroids_file`; writes `bandstructure.dat` (VBM shifted to 0, energies in eV; rank 0 is the only writer). No restart file of its own — reuse means feeding it the same WFN/centroids/eqp inputs. Distributed-key coverage (`eigh_backend`, `use_low_mem_eigh`) and the per-rank memory story: `docs/dev/large_nmu_operation.md`.
 The RETURNED band window is (nelec−nval, nelec+ncond)
 (`load_wfns_and_enk_for_sigma`) and must contain the VBM; it need not start at
 absolute band zero.  The VBM/Fermi index is resolved relative to that absolute
@@ -275,7 +275,7 @@ at three bands — buying centroids is the wrong repair for that shape, and
 `htransform_rank_multiplier` is the right one.  An `f-shoulder` refusal
 means a requested output band is absent from fH at some coarse k; add guard
 bands, do not disable the gate.  FATAL on `--eqp-file` not found/parsed;
-sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 20 Ry (a garbage GW eqp
+sanity refusals on NaN S/ctilde/E_nk or E_nk spread > 272.11 eV (a garbage GW eqp
 file fed forward).
 
 ## bse — `bse.bse_jax`
