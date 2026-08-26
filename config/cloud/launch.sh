@@ -22,8 +22,11 @@ if [[ "${1:-}" == "-n" ]]; then NP="$2"; shift 2; fi
 
 SO="${LORRAX_FFI_SO:-$LORRAX_CLOUD_BUILD/liblorrax_ffi.so}"
 [[ -e "$SO" ]] || { echo "[cloud launch] REFUSED: no FFI .so at $SO (run build_ffi.sh)" >&2; exit 2; }
+HOST_SO="${LORRAX_FFI_HOST_SO:-$LORRAX_CLOUD_ROOT/src/ffi/cpp/build_host_cloud/liblorrax_ffi_host.so}"
+[[ -e "$HOST_SO" ]] || { echo "[cloud launch] REFUSED: no host .so at $HOST_SO (run build_ffi_host.sh)" >&2; exit 2; }
 
 export LORRAX_FFI_SO="$SO"
+export LORRAX_FFI_HOST_SO="$HOST_SO"
 export LD_LIBRARY_PATH="$(lorrax_cloud_runtime_ld_library_path):${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$(lorrax_cloud_pythonpath)${PYTHONPATH:+:$PYTHONPATH}"
 export PATH="$LORRAX_CLOUD_ENV/bin:$PATH"
