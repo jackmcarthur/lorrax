@@ -46,7 +46,6 @@
 
 #include <complex>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
@@ -197,7 +196,6 @@ static ffi::Error BatchedSolveLuImpl(
         if (h_ws_s_buf) std::free(h_ws_s_buf);
     };
 
-    const bool debug = std::getenv("LORRAX_LU_DEBUG") != nullptr;
     const bool no_pivot = std::getenv("LORRAX_LU_NO_PIVOT") != nullptr;
 
     for (int64_t q = 0; q < nq; ++q) {
@@ -218,15 +216,6 @@ static ffi::Error BatchedSolveLuImpl(
             os << "cusolverMpGetrf (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
         }
-        if (debug) {
-            int info_h = 0;
-            LORRAX_CUDA_CHECK(cudaMemcpyAsync(&info_h, ctx->d_info, sizeof(int),
-                                               cudaMemcpyDeviceToHost, ctx->stream));
-            LORRAX_CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
-            std::fprintf(stderr, "[LU_DEBUG] q=%lld getrf info=%d\n",
-                         (long long)q, info_h);
-        }
-
         mp_st = mp::Getrs<T>(
             ctx->handle, CUBLAS_OP_N, n, nrhs,
             A_slice_ptr, 1, 1, descA,
@@ -240,14 +229,6 @@ static ffi::Error BatchedSolveLuImpl(
             std::ostringstream os;
             os << "cusolverMpGetrs (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-        }
-        if (debug) {
-            int info_h = 0;
-            LORRAX_CUDA_CHECK(cudaMemcpyAsync(&info_h, ctx->d_info, sizeof(int),
-                                               cudaMemcpyDeviceToHost, ctx->stream));
-            LORRAX_CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
-            std::fprintf(stderr, "[LU_DEBUG] q=%lld getrs info=%d\n",
-                         (long long)q, info_h);
         }
     }
 

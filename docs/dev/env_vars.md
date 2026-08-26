@@ -319,8 +319,8 @@ incident instruments, not production results.
 | `LORRAX_EXTRA_MU_PAD` | `""` (→ 0) | **Test-only** extra μ-pad rows to prove pad-extent invariance (`runtime/padding.py`).  Any result that moves under this at fixed P is a defect.  NEVER set in production. |
 | `LORRAX_WRITE_NO_JIT` | unset | Un-jitted Slab-writer path (`_slab_io_ffi.py`); changes execution and is not print verbosity. |
 | `LORRAX_FFI_PROFILE` | off | C++: per-call FFI timing. |
-| `LORRAX_LU_DEBUG` / `LORRAX_LU_NO_PIVOT` / `LORRAX_LU_DEBUG_DUMP` | off | cuSOLVERMp LU diagnostics. |
-| `KP2_DEBUG` / `STERN_DEBUG` | unset / `0` | Sternheimer debug (`psp/run_sternheimer.py`, `solvers/sternheimer_solve.py`). |
+| `LORRAX_LU_NO_PIVOT` | off | Experimental cuSOLVERMp math-path override that disables pivoting; changes the solve and is not print verbosity. |
+| `LORRAX_LU_DEBUG_DUMP` | off | Benchmark-only array sidecar written by `tests/bench/cusolvermp_solve_lu_test.py`; no production source reads it. |
 | `PF_ARTIFACTS_DIR` / `ISDF_JAX_PROFILE_DIR` | `profile` / unset | Trace output dirs (`common/jax_profile.py`, `tests/bench/test_bse.py`). |
 | `ISDF_COHSEX_TEST_PLATFORM` | `auto` | Test harness: force `cpu`/`gpu` for the e2e gates (`tests/harness.py`). |
 

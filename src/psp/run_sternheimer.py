@@ -481,18 +481,6 @@ def compute_kp2_tangent_at_kvec(
             d2u_ij = sternheimer_solve(op_base, b_ij,
                                         tol=tol, max_iter=max_iter,
                                         use_schur=use_schur)
-            # Diagnostic: residual ‖A·d2u + b‖  (solver solves A·d2u = -b).
-            res_ij = _apply_A_inline(op_base, d2u_ij) + b_ij
-            res_norm_ij = jnp.max(jnp.sqrt(jnp.real(
-                jnp.einsum('vsG,vsG->v', jnp.conj(res_ij), res_ij, optimize=True))))
-            b_norm_ij = jnp.max(jnp.sqrt(jnp.real(
-                jnp.einsum('vsG,vsG->v', jnp.conj(b_ij), b_ij, optimize=True))))
-            import os as _os
-            if _os.environ.get('KP2_DEBUG'):
-                print(f"    kp2 (i={i}, j={j}) at kvec_p_base={kvec_p_base_np}: "
-                      f"‖b_ij‖_max = {float(b_norm_ij):.3e}, "
-                      f"‖residual‖_max = {float(res_norm_ij):.3e}, "
-                      f"‖d2u_ij‖ = {float(jnp.sqrt(jnp.sum(jnp.abs(d2u_ij)**2))):.3e}")
             hess[i][j] = d2u_ij
             hess[j][i] = d2u_ij
 

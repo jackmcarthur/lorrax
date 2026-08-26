@@ -34,14 +34,11 @@ Public API
 from __future__ import annotations
 
 import functools
-import os
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import lax
-
-_STERN_DEBUG = bool(int(os.environ.get('STERN_DEBUG', '0')))
 
 from psp.dft_operators import apply_H_k_from_G
 
@@ -298,16 +295,6 @@ def _sternheimer_core(op: SternheimerOp, b: jax.Array,
 
     state0 = (x0, r0, z0, z0, rho0, alive0, jnp.asarray(0, dtype=jnp.int32))
     final_state = lax.while_loop(cond, body, state0)
-    if _STERN_DEBUG:
-        x_f, r_f, _, _, _, alive_f, i_f = final_state
-        jax.debug.print(
-            "  [stern] iter={iters}  alive={n_alive}/{n_tot}  "
-            "max_resid={mr:.2e}  tol*‖b‖={th:.2e}",
-            iters=i_f, n_alive=jnp.sum(alive_f.astype(jnp.int32)),
-            n_tot=alive_f.size,
-            mr=jnp.max(_batched_real_norm(r_f)),
-            th=tol * jnp.max(b_norm_safe),
-        )
     return final_state[0]
 
 
