@@ -169,8 +169,8 @@ class ICLVNLTransferJet:
     """
 
     gamma0_cart_ket: jax.Array
-    dgamma_dq_cart_ket: jax.Array
-    lambda0_cart_ket: jax.Array
+    dgamma_dq_cart_ket: jax.Array | None
+    lambda0_cart_ket: jax.Array | None
     d2gamma_dq2_cart_ket: jax.Array | None = None
 
 
@@ -1438,6 +1438,7 @@ def apply_uniform_vnl_derivatives_to_ket(
     q_cart_bohr_inv=(0.0, 0.0, 0.0),
     projector_row_chunk: int = 64,
     g_chunk: int = 1024,
+    compute_contact: bool = True,
     compute_third: bool = False,
 ) -> VNLGaugeKetDerivatives:
     r"""Apply uniform VNL Gamma/Lambda through the shared bounded core.
@@ -1448,9 +1449,10 @@ def apply_uniform_vnl_derivatives_to_ket(
     """
     require_uniform_gauge_transfer(
         q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
+    contact = bool(compute_contact or compute_third)
     return _apply_vnl_derivatives_between_g_carriers(
         psi_G, G_int, G_int, k_crys, setup, g_mask, g_mask,
-        derivative_order=(3 if bool(compute_third) else 2),
+        derivative_order=(3 if bool(compute_third) else (2 if contact else 1)),
         projector_row_chunk=int(projector_row_chunk), g_chunk=int(g_chunk))
 
 
@@ -1463,6 +1465,7 @@ def apply_icl_vnl_transfer_jet_to_ket(
     *,
     projector_row_chunk: int = 64,
     g_chunk: int = 1024,
+    include_contact: bool = True,
     include_q2: bool = False,
 ) -> ICLVNLTransferJet:
     r"""Apply the canonical ICL straight-segment VNL jet at ``q=0``.
@@ -1491,11 +1494,14 @@ def apply_icl_vnl_transfer_jet_to_ket(
         g_mask,
         projector_row_chunk=projector_row_chunk,
         g_chunk=g_chunk,
+        compute_contact=bool(include_contact),
         compute_third=bool(include_q2),
     )
     return ICLVNLTransferJet(
         gamma0_cart_ket=uniform.gamma_cart_ket,
-        dgamma_dq_cart_ket=-0.5 * uniform.lambda_cart_ket,
+        dgamma_dq_cart_ket=(
+            None if uniform.lambda_cart_ket is None
+            else -0.5 * uniform.lambda_cart_ket),
         lambda0_cart_ket=uniform.lambda_cart_ket,
         d2gamma_dq2_cart_ket=(
             uniform.third_cart_ket / 3.0
