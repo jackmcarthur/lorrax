@@ -780,7 +780,8 @@ def main(argv=None):
 		                    label="fixed-Sigma eigenvalue self-consistency"):
 			eqp2_result = run_fixed_sigma_evsc(
 				sigma_result, kin_ion, enk_dft,
-				config=config, mesh_xy=mesh_xy, print_fn=print0)
+				config=config, meta=meta, band_slices=band_slices, wfn=wfn,
+				mesh_xy=mesh_xy, print_fn=print0)
 
 	# ---- Post-Σ seam: bare locals from the SigmaResult ----
 	# One extraction for SC and one-shot alike; PPM-only fields are None

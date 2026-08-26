@@ -1471,9 +1471,13 @@ def write_results(
                 f"converged in {int(results.eqp2_iterations or 0)} "
                 f"fixed-map evaluations: max|dE|="
                 f"{float(results.eqp2_residual_ev or 0.0) * 1e3:.6f} meV; "
-                f"cutoff={float(results.eqp2_tol_ev or 0.0) * 1e3:.6f} meV",
+                f"cutoff={float(results.eqp2_tol_ev or 0.0) * 1e3:.6f} meV "
+                "over protected/non-scissored states; final post-rotation "
+                "map verified",
                 "off-diagonal Sigma_mn uses "
                 "0.5*[Sigma_mn(E_m)+Sigma_mn(E_n)] in each updated QP basis",
+                "out-of-grid semicore preserves E-E_F; out-of-grid high "
+                "conduction uses the in-grid affine scissor",
             ),
         )
 

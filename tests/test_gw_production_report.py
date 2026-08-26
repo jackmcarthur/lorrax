@@ -211,9 +211,12 @@ def test_report_spells_out_enabled_eqp2_and_convergence(tmp_path):
     report.finish()
     text = path.read_text(encoding="utf-8")
     assert "fixed-Sigma eigenvalue self-consistency" in text
-    assert ("max|dE| cutoff=1.000 meV; accelerator=rcrop(depth=5); "
+    assert ("max|dE| cutoff=1.000 meV (non-scissored); "
+            "accelerator=rcrop(depth=5); "
             "max_iter=20; screening unchanged") in text
     assert "max|dE|=0.700000 meV <= 1.000000 meV" in text
+    assert "final post-rotation map verified" in text
+    assert "semicore preserves E-E_F" in text
     assert "Held fixed      : screening, W, and all self-energy diagrams" in text
 
 
