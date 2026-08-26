@@ -2,11 +2,12 @@
 """
 Rotate DFT wavefunctions to QP basis using rotation matrices from COHSEX.
 
-This script:
-1. Reads WFN.h5 (DFT wavefunctions in reduced BZ)
-2. Reads qp_wfn_rotations.h5 (rotation matrices U and QP energies from COHSEX)
-3. Rotates wavefunction coefficients: c_qp[n,G] = Σ_m U[k,m,n] * c_dft[m,G]
-4. Writes WFN_qp.h5 with rotated coefficients and updated energies
+This is a thin command-line adapter around
+``file_io.qp_wfn.write_qp_wfn_h5``.  The file-format owner performs the
+coefficient rotation, k-streamed WFN read, BGW-compatible write, energy
+replacement, and positive QP-WFN stamping.  This module only authenticates
+the companion artifact and selects its full-BZ rows for the source WFN's
+file wedge.
 
 Usage:
     python rotate_wfn_to_qp.py WFN.h5 qp_wfn_rotations.h5 [--output WFN_qp.h5]
@@ -14,11 +15,8 @@ Usage:
 
 import argparse
 import os
-import shutil
 import numpy as np
 import h5py
-
-from file_io.mf_header import kpt_starts
 
 
 def read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints):
@@ -87,209 +85,60 @@ def read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints):
     return kirr_to_kfull
 
 
-def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True, energy_only=False):
-    """
-    Rotate WFN coefficients from DFT to QP basis.
-    
-    Args:
-        wfn_file: Path to input WFN.h5
-        rot_file: Path to qp_wfn_rotations.h5
-        output_file: Path to output WFN_qp.h5
-        verbose: Print progress information
-        energy_only: If True, only update energies, don't rotate wavefunctions
-    """
-    # Read and authenticate BEFORE copying or mutating an output.  U_mnk is
-    # labelled in a particular DFT-band basis; matching shapes and k-points
-    # cannot make a rotation from a different source WFN safe.
+def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True):
+    """Write one authenticated QP WFN through the canonical format owner."""
     from file_io.qp_wfn import (
         authenticate_qp_rotations_source_wfn,
         read_qp_rotations_artifact,
+        write_qp_wfn_h5,
     )
+    from ffi import _services
+    _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    _arr = read_qp_rotations_artifact(rot_file)
-    with WfnLoader(wfn_file) as _source_wfn:
+
+    artifact = read_qp_rotations_artifact(rot_file)
+    with WfnLoader(wfn_file) as source_wfn:
         authenticate_qp_rotations_source_wfn(
-            _arr, _source_wfn, artifact_path=rot_file)
+            artifact, source_wfn, artifact_path=rot_file)
+        kirr_to_kfull = read_kirr_to_kfull(
+            rot_file, source_wfn.kpoints, artifact["kpoints_crys"])
 
-    # Copy WFN.h5 only after the source-basis contract succeeds.
-    if verbose:
-        print(f"Copying {wfn_file} -> {output_file}")
-    shutil.copy2(wfn_file, output_file)
+        source_kgrid = np.asarray(source_wfn.kgrid, dtype=np.int64)
+        artifact_kgrid = np.asarray(artifact["kgrid"], dtype=np.int64)
+        if not np.array_equal(source_kgrid, artifact_kgrid):
+            raise ValueError(
+                f"QP rotations kgrid {artifact_kgrid.tolist()} does not "
+                f"match source WFN kgrid {source_kgrid.tolist()}.")
 
-    # THE ARRAYS COME BACK THROUGH THE ADAPTER, the
-    # coordinates straight off the file: ``U_mnk`` and ``E_qp_nk_rydberg``
-    # may be stored on the file wedge (``k_storage='ibz'``) and are unfolded
-    # here, while ``kpoints_crys`` and ``kirr_to_kfull`` are ALWAYS full-BZ
-    # and keep their old meaning, so everything below indexes by full-BZ k
-    # exactly as it always did.  A file with no ``k_storage`` attr is read
-    # verbatim, so a pre-format file is untouched by this.
-    U_mnk = _arr['U_mnk']                      # (nk_full, nb, nb)
-    E_qp_ry = _arr['E_qp_nk_rydberg']          # (nk_full, nb) in Rydberg
-    band_range = _arr['band_range']  # [band_start, band_stop]
-    rot_kpoints = _arr['kpoints_crys']  # (nk_full, 3)
-    kgrid = _arr['kgrid']  # [nkx, nky, nkz]
+        band_start, band_stop = (
+            int(x) for x in np.asarray(artifact["band_range"]).tolist())
+        if not (0 <= band_start < band_stop <= int(source_wfn.nbands)):
+            raise ValueError(
+                f"QP rotations band range [{band_start}, {band_stop}) is "
+                f"outside source WFN [0, {int(source_wfn.nbands)}).")
 
-    band_start, band_stop = band_range
-    nb_sigma = band_stop - band_start
+        U_wedge = np.asarray(
+            artifact["U_mnk"][kirr_to_kfull], dtype=np.complex128)
+        E_wedge_ry = np.asarray(
+            artifact["E_qp_nk_rydberg"][kirr_to_kfull], dtype=np.float64)
+        if verbose:
+            print(f"Rotation file: {rot_file}")
+            print(f"  Full-BZ U shape: {artifact['U_mnk'].shape}")
+            print(f"  WFN wedge rows: {len(kirr_to_kfull)}")
+            print(f"  Band range: [{band_start}, {band_stop})")
+            print(f"  K-grid: {artifact_kgrid.tolist()}")
+
+        write_qp_wfn_h5(
+            output_file,
+            wfn=source_wfn,
+            U_kmn=U_wedge,
+            enk_active_qp_ry=E_wedge_ry,
+            band_start=band_start,
+            band_stop=band_stop,
+        )
 
     if verbose:
-        print(f"Rotation file: {rot_file}")
-        print(f"  U_mnk shape: {U_mnk.shape}")
-        print(f"  Band range: [{band_start}, {band_stop})")
-        print(f"  K-grid: {kgrid}")
-        print(f"  Number of full-zone k-points: {len(rot_kpoints)}")
-    
-    # Open WFN file and get k-point info
-    with h5py.File(wfn_file, 'r') as f_wfn:
-        wfn_kpoints = f_wfn['mf_header/kpoints/rk'][:]  # (nk_red, 3) - transposed from file
-        wfn_shift = f_wfn['mf_header/kpoints/shift'][:]
-        wfn_kgrid = f_wfn['mf_header/kpoints/kgrid'][:]
-        nk_red = f_wfn['mf_header/kpoints/nrk'][()]
-        nbands = f_wfn['mf_header/kpoints/mnband'][()]
-        ngk = f_wfn['mf_header/kpoints/ngk'][:]
-        nspin = f_wfn['mf_header/kpoints/nspin'][()]
-        nspinor = f_wfn['mf_header/kpoints/nspinor'][()]
-        
-        if verbose:
-            print(f"\nWFN file: {wfn_file}")
-            print(f"  Number of reduced k-points: {nk_red}")
-            print(f"  Number of bands: {nbands}")
-            print(f"  K-grid: {wfn_kgrid}")
-            print(f"  nspin={nspin}, nspinor={nspinor}")
-    
-    # Find mapping from reduced to full zone k-points
-    kirr_to_kfull = read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints)
-    
-    if verbose:
-        print(f"\nK-point mapping (reduced -> full zone):")
-        for ik in range(min(5, nk_red)):
-            print(f"  k_red[{ik}] = {wfn_kpoints[ik]} -> k_full[{kirr_to_kfull[ik]}]")
-        if nk_red > 5:
-            print(f"  ...")
-    
-    # Calculate k-point starts for indexing into coefficients
-    k_starts = kpt_starts(ngk)
-    
-    # Open output file for modification
-    with h5py.File(output_file, 'r+') as f_out:
-        # Get coefficients dataset - shape is (mnband, nspin*nspinor, ngktot, 2) for complex
-        coeffs = f_out['wfns/coeffs']
-        coeffs_shape = coeffs.shape
-        
-        if verbose:
-            print(f"\nCoefficients shape: {coeffs_shape}")
-            print(f"  (mnband, nspin*nspinor, ngktot, real/imag)")
-        
-        if energy_only:
-            if verbose:
-                print("\n[energy-only mode] Skipping wavefunction rotation")
-        
-        # Process each reduced k-point
-        for ik_red in range(nk_red):
-            if energy_only:
-                continue  # Skip rotation, only update energies below
-            ik_full = kirr_to_kfull[ik_red]
-            U_k = U_mnk[ik_full]  # (nb_sigma, nb_sigma), U[m,n] = <m_DFT|n_QP>
-            
-            # Get slice indices for this k-point's G-vectors
-            start = k_starts[ik_red]
-            end = start + ngk[ik_red]
-            ng_k = ngk[ik_red]
-            
-            # Read DFT coefficients for bands in sigma range
-            # coeffs shape: (mnband, nspin*nspinor, ngktot, 2)
-            # We need bands [band_start:band_stop]
-            c_dft = np.zeros((nb_sigma, nspinor, ng_k), dtype=np.complex128)
-            
-            for ib_local, ib in enumerate(range(band_start, band_stop)):
-                for ispinor in range(nspinor):
-                    c_dft[ib_local, ispinor, :] = (
-                        coeffs[ib, ispinor, start:end, 0] +
-                        1j * coeffs[ib, ispinor, start:end, 1]
-                    )
-            
-            # Rotate: c_qp[n, G] = Σ_m U[m, n] * c_dft[m, G]
-            # U[m, n] = <m_DFT|n_QP>, meaning |n_QP> = Σ_m U[m,n] |m_DFT>
-            # So: c_qp[n,G] = <G|n_QP> = Σ_m U[m,n] <G|m_DFT> = Σ_m U[m,n] c_dft[m,G]
-            # Matrix form: c_qp = U^T @ c_dft  (NOT U^H!)
-            c_qp = np.zeros_like(c_dft)
-            for ispinor in range(nspinor):
-                # c_dft[ib, G] shape (nb_sigma, ng_k)
-                # U_k shape (nb_sigma, nb_sigma)
-                # c_qp[n, G] = sum_m U[m, n] c_dft[m, G] = (U^T @ c_dft)[n, G]
-                c_qp[:, ispinor, :] = U_k.T @ c_dft[:, ispinor, :]
-            
-            # Diagnostic: check unitarity of U and norm preservation
-            if ik_red == 0 and verbose:
-                # U should be unitary: U^H @ U = I
-                UhU = np.conj(U_k.T) @ U_k
-                unitarity_err = np.max(np.abs(UhU - np.eye(nb_sigma)))
-                print(f"  [Diagnostic k=0] U unitarity error: {unitarity_err:.2e}")
-                
-                # Check norm preservation (should be same before/after rotation)
-                dft_norms = np.sum(np.abs(c_dft[:, 0, :])**2, axis=1)
-                qp_norms = np.sum(np.abs(c_qp[:, 0, :])**2, axis=1)
-                norm_diff = np.max(np.abs(dft_norms - qp_norms))
-                print(f"  [Diagnostic k=0] Max norm diff (DFT vs QP): {norm_diff:.2e}")
-                
-                # Check if U is close to identity (small rotation)
-                diag_weight = np.sum(np.abs(np.diag(U_k))**2) / nb_sigma
-                print(f"  [Diagnostic k=0] Avg |U_nn|^2 (1.0 = identity): {diag_weight:.4f}")
-                
-                # Show which DFT bands contribute most to each QP band (top 3)
-                print(f"  [Diagnostic k=0] Band mixing (QP band <- DFT contributions):")
-                for n_qp in range(min(5, nb_sigma)):  # First 5 QP bands
-                    weights = np.abs(U_k[:, n_qp])**2
-                    top_indices = np.argsort(weights)[::-1][:3]
-                    top_str = ", ".join([f"{i}({weights[i]:.2f})" for i in top_indices])
-                    print(f"    QP {n_qp} <- DFT bands: {top_str}")
-            
-            # Write back to file
-            for ib_local, ib in enumerate(range(band_start, band_stop)):
-                for ispinor in range(nspinor):
-                    coeffs[ib, ispinor, start:end, 0] = np.real(c_qp[ib_local, ispinor, :])
-                    coeffs[ib, ispinor, start:end, 1] = np.imag(c_qp[ib_local, ispinor, :])
-            
-            if verbose and (ik_red % 10 == 0 or ik_red == nk_red - 1):
-                print(f"  Rotated k-point {ik_red + 1}/{nk_red}")
-        
-        # Update energies for the sigma bands
-        # Energies in WFN.h5: h5py reads as (nspin, nk_red, nbands)
-        # WFNReader accesses as energies[ispin, ik, ib]
-        el = f_out['mf_header/kpoints/el']
-        el_shape = el.shape
-        
-        if verbose:
-            print(f"\nEnergies shape: {el_shape} (nspin, nk_red, nbands)")
-        
-        # Read current energies
-        energies = el[:]
-        
-        # Update with QP energies for each reduced k-point
-        if verbose:
-            print(f"\n  Energy comparison at k=0 (Rydberg):")
-            print(f"  {'Band':>4s}  {'DFT':>12s}  {'QP':>12s}  {'Diff':>12s}")
-        
-        for ik_red in range(nk_red):
-            ik_full = kirr_to_kfull[ik_red]
-            for ib_local, ib in enumerate(range(band_start, band_stop)):
-                e_dft = energies[0, ik_red, ib]
-                e_qp = E_qp_ry[ik_full, ib_local]
-                # energies[ispin, ik, ib] - update all spins with the same QP energy
-                energies[:, ik_red, ib] = e_qp
-                
-                if ik_red == 0 and verbose and ib_local < 10:
-                    print(f"  {ib:4d}  {e_dft:12.6f}  {e_qp:12.6f}  {e_qp - e_dft:12.6f}")
-        
-        # Write updated energies
-        el[...] = energies
-        
-        if verbose:
-            print(f"\nUpdated energies for bands [{band_start}, {band_stop})")
-    
-    if verbose:
-        print(f"\nWrote {output_file}")
-    
+        print(f"Wrote authenticated QP WFN: {output_file}")
     return kirr_to_kfull
 
 
@@ -301,8 +150,6 @@ def main():
     parser.add_argument('rotation_file', help='QP rotation file (qp_wfn_rotations.h5)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output file (default: WFN_qp.h5 in same directory as WFN.h5)')
-    parser.add_argument('--energy-only', action='store_true',
-                        help='Only update energies, do not rotate wavefunctions (for debugging)')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress progress output')
     
@@ -343,10 +190,8 @@ def main():
     # the symmetry service had already written from sym.kirr_fullids — i.e.
     # it replaced the exact table with an approximation of itself.  Every
     # rotation file the drivers write carries the real one.
-    # Rotate wavefunctions (or just update energies if --energy-only)
     kirr_to_kfull = rotate_wfn_coefficients(
-        wfn_file, rotation_file, output_file, verbose=verbose,
-        energy_only=args.energy_only
+        wfn_file, rotation_file, output_file, verbose=verbose
     )
     
     if verbose:
