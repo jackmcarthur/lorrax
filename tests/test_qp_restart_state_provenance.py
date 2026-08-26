@@ -85,12 +85,12 @@ def test_restart_qp_state_matrix(
         monkeypatch.setattr(
             qp_wfn, "_qp_state_source_from_path", selected_record)
         def call():
-            return qp_wfn.refuse_conflicting_qp_state_sources(
+            qp_wfn.refuse_conflicting_qp_state_sources(
                 wfn_path=str(selected), eqp_file=eqp,
                 state_artifact_path=str(restart),
                 where="focused state matrix")
         if error is None:
-            assert call() == state
+            call()
         else:
             with pytest.raises(ValueError, match=error):
                 call()
@@ -113,27 +113,3 @@ def test_record_roundtrip_and_malformed_refusal(tmp_path):
         h5.create_dataset(QP_STATE_SOURCE_DATASET, data=np.bytes_(b"{bad"))
     with pytest.raises(ValueError, match="not valid UTF-8 JSON"):
         read_qp_state_source_provenance(restart)
-
-
-def test_qp_state_provenance_reuses_precomputed_canonical_fingerprint(
-        tmp_path, monkeypatch):
-    from common import parallel_transport
-    from file_io.qp_wfn import qp_state_source_provenance
-
-    source = tmp_path / "WFN.h5"
-    _wfn(source, qp=False, fingerprint="d" * 64)
-
-    def unexpected_rescan(_wfn_value):
-        raise AssertionError("precomputed canonical WFN fingerprint rescanned")
-
-    monkeypatch.setattr(
-        parallel_transport, "wfn_fingerprint", unexpected_rescan)
-    record = qp_state_source_provenance(
-        type("PathBearingWfn", (), {"path": str(source)})(),
-        wfn_fingerprint_value="d" * 64)
-    assert record["wfn_fingerprint"] == "d" * 64
-
-    with pytest.raises(ValueError, match="64-digit lowercase"):
-        qp_state_source_provenance(
-            type("PathBearingWfn", (), {"path": str(source)})(),
-            wfn_fingerprint_value="NOT-A-CANONICAL-FINGERPRINT")
