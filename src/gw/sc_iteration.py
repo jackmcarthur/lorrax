@@ -4389,6 +4389,12 @@ def run_sc_driver(
                 sigma_result.head_sigma_diag_w_kn_ry, U, mesh=mesh_xy,
                 weight_dft_qp=head_weight_dft_qp)
     sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
+    v_h_scalar = _rotate_to_dft_basis(
+        sigma_result.v_h_scalar_kij_ry, U, mesh=mesh_xy)
+    h_transverse = (
+        _rotate_to_dft_basis(
+            sigma_result.h_transverse_kij_ry, U, mesh=mesh_xy)
+        if sigma_result.h_transverse_kij_ry is not None else None)
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
         sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
@@ -4396,6 +4402,8 @@ def run_sc_driver(
     sigma_result_dft = dataclasses.replace(
         sigma_result,
         v_h_kij_ry=sig_h,
+        v_h_scalar_kij_ry=v_h_scalar,
+        h_transverse_kij_ry=h_transverse,
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_dft,
         sigma_sx_kij_ry=(
@@ -4594,6 +4602,8 @@ def dump_sigma_omega_h5_final(
         sigma_result.sigma_c_omega_kij_ry,
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,
+        v_h_scalar=sigma_result.v_h_scalar_kij_ry,
+        h_transverse=sigma_result.h_transverse_kij_ry,
         config=config, input_dir=input_dir,
         meta=meta, mesh_xy=mesh_xy,
         # THE CONVERGED CUBE'S OWN ω REFERENCE, carried on the result the

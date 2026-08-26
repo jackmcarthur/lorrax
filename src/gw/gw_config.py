@@ -3515,6 +3515,21 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if bool(config.bispinor) and (
+        config.qp_solver is not QPSolver.ONE_SHOT_DFT
+        or bool(config.density_self_consistent)
+    ):
+        raise ValueError(
+            "GATE bispinor_current_hartree_self_consistency_unavailable: "
+            "exact transverse direct Hartree is currently a one-shot "
+            "kin_ion/G-space artifact built from the DFT occupied "
+            "bispinors. QSGW or density_self_consistent would require "
+            "rebuilding the signed current from each iteration's evolving "
+            "orbitals; refusing a frozen or basis-only approximation.\n"
+            f"  got: qp_solver = {config.qp_solver.value}, "
+            f"density_self_consistent = {bool(config.density_self_consistent)}\n"
+            "  want: qp_solver = one_shot_dft, "
+            "density_self_consistent = false")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):

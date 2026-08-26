@@ -191,6 +191,8 @@ def write_sigma_omega(
     sigma_c_omega: jax.Array, *,
     sig_x: jax.Array,
     sig_h: jax.Array,
+    v_h_scalar: jax.Array | None = None,
+    h_transverse: jax.Array | None = None,
     config,
     input_dir: str,
     meta,
@@ -240,6 +242,19 @@ def write_sigma_omega(
     from file_io import write_sigma_omega_h5
     from .ppm_windows import sigma_regularization_for_config
 
+    if v_h_scalar is None:
+        if h_transverse is not None:
+            raise ValueError("write_sigma_omega: H_T requires scalar V_H")
+        v_h_scalar = sig_h
+    hartree_ev = RYD_TO_EV * sig_h
+    if h_transverse is not None:
+        # Component-aware files derive their aggregate in output units from
+        # the two persisted operands.  This makes the receipt identity exact,
+        # rather than relying on floating-point distributivity across a Ry→eV
+        # conversion.  Charge-only retains the historical single multiply.
+        hartree_ev = (
+            RYD_TO_EV * v_h_scalar + RYD_TO_EV * h_transverse)
+
     out_path = sigma_omega_output_path(config, input_dir)
     # RE-DERIVED, not threaded.  ``resolve_sigma_regularization`` is a pure
     # function of the config the driver already ran against, so calling it
@@ -259,21 +274,27 @@ def write_sigma_omega(
     if is_band_sharded_sigma_omega(sigma_c_omega):
         shd = sigma_c_omega.sharding
 
-        def _ev_tensors(c_ry, x_ry, h_ry):
+        def _ev_tensors(c_ry, x_ry, h_ev):
             from file_io.sigma_output import derive_sigma_total
             c_ev = RYD_TO_EV * c_ry
             total = derive_sigma_total(
-                c_ev, RYD_TO_EV * x_ry, RYD_TO_EV * h_ry)
+                c_ev, RYD_TO_EV * x_ry, h_ev)
             return total, c_ev
 
         total_ev, sigma_c_ev = jax.jit(
             _ev_tensors, out_shardings=(shd, shd))(
-                sigma_c_omega, sig_x, sig_h)
+                sigma_c_omega, sig_x, hartree_ev)
         write_sigma_omega_h5(
             out_path, config.omega_grid_ev, total_ev,
             sigma_c_kij_ev=sigma_c_ev,
             sigma_sx_kij_ev=RYD_TO_EV * sig_x,
-            hartree_kij_ev=RYD_TO_EV * sig_h,
+            hartree_kij_ev=hartree_ev,
+            hartree_scalar_kij_ev=(
+                None if h_transverse is None
+                else RYD_TO_EV * v_h_scalar),
+            hartree_transverse_kij_ev=(
+                None if h_transverse is None
+                else RYD_TO_EV * h_transverse),
             mesh=mesh_xy, star=star,
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
@@ -290,7 +311,13 @@ def write_sigma_omega(
         out_path, config.omega_grid_ev, None,
         sigma_c_kij_ev=RYD_TO_EV * sigma_c_omega,
         sigma_sx_kij_ev=RYD_TO_EV * sig_x,
-        hartree_kij_ev=RYD_TO_EV * sig_h,
+        hartree_kij_ev=hartree_ev,
+        hartree_scalar_kij_ev=(
+            None if h_transverse is None
+            else RYD_TO_EV * v_h_scalar),
+        hartree_transverse_kij_ev=(
+            None if h_transverse is None
+            else RYD_TO_EV * h_transverse),
         mesh=mesh_xy, star=star,
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,

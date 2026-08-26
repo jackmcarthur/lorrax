@@ -44,9 +44,12 @@ class GWResults:
     sig_coh : np.ndarray, (nk, nb, nb)
         Static Coulomb-hole Σ_COH (Ry).
     sig_h : np.ndarray, (nk, nb, nb)
-        Source-resolved direct Hartree contribution (Ry).  Its scalar charge
-        part is zero when the exact scalar Hartree is folded into
-        ``kin_ion_ry``; independent non-scalar direct fields may remain.
+        Exact total direct contribution ``V_H + H_T`` (Ry).
+    sig_h_scalar : np.ndarray, (nk, nb, nb)
+        Source-resolved scalar charge Hartree contribution (Ry).
+    h_transverse : np.ndarray or None, (nk, nb, nb)
+        Exact periodic transverse-current Hartree contribution (Ry), absent
+        on charge-only runs.
     sig_x : np.ndarray, (nk, nb, nb)
         Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
         and as a quality-of-fit check in COHSEX mode.
@@ -96,6 +99,8 @@ class GWResults:
     kin_ion_ry: np.ndarray
     band_start: int
     band_stop: int
+    sig_h_scalar: np.ndarray | None = None
+    h_transverse: np.ndarray | None = None
     use_ppm: bool = False
     self_consistent: bool = False
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
@@ -130,6 +135,162 @@ class GWResults:
     eqp2_iterations: int | None = None
     eqp2_residual_ev: float | None = None
     eqp2_tol_ev: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.sig_h_scalar is None:
+            if self.h_transverse is not None:
+                raise ValueError(
+                    "GWResults: H_T requires an explicit scalar V_H component")
+            # Historical charge-only callers: aggregate and scalar are the
+            # same array, so no arithmetic or output byte changes.
+            self.sig_h_scalar = self.sig_h
+        elif self.h_transverse is not None and not np.array_equal(
+            np.asarray(self.sig_h),
+            np.asarray(self.sig_h_scalar) + np.asarray(self.h_transverse),
+        ):
+            raise ValueError(
+                "GWResults: sig_h must equal sig_h_scalar + h_transverse exactly")
+
+
+# ---------------------------------------------------------------------------
+# Banner / summary  (QE ``summary()`` pattern)
+# ---------------------------------------------------------------------------
+
+def print_banner(
+    backend: str,
+    n_devices: int,
+    grid_x: int,
+    grid_y: int,
+    n_procs: int,
+    device_kind: str,
+    print_fn=print,
+):
+    """Print the calculation header — device mesh, XLA pool, etc.
+
+    Corresponds to the "announce what we are about to do" phase that QE's
+    ``summary()`` / ``hp_summary()`` routines handle before any computation.
+    """
+    print_fn("")
+    print_fn("=" * 72)
+    print_fn("  COHSEX-JAX: Self-Energy Calculation")
+    print_fn("=" * 72)
+    print_fn(
+        f"  Backend: {backend.upper():<8}  Devices: {n_devices}"
+        f"  Mesh: {grid_x}×{grid_y}  Processes: {n_procs}"
+    )
+    print_fn(f"  Device type: {device_kind}")
+
+    # ---- XLA GPU pool env -------------------------------------------------
+    # These four variables are read ONLY by the CUDA PJRT plugin's option
+    # builder (jaxlib ``generate_pjrt_gpu_plugin_options``); no CPU code
+    # path consults any of them.  The old banner echoed the RAW strings
+    # unconditionally, which stated a GPU fact on a CPU run and, worse,
+    # printed "XLA preallocate: FALSE" for a value jax resolves as TRUE
+    # (its test is case-sensitive) and "mem_fraction: unset" for a run
+    # using the current variable name.  Report the RESOLVED values, and
+    # qualify them by the live backend.
+    from .gw_config import classify_xla_pool, resolve_xla_gpu_memory_env
+    _xm = resolve_xla_gpu_memory_env()
+    _is_gpu = str(backend).strip().lower() in ("gpu", "cuda", "rocm")
+    if _is_gpu:
+        _alloc = _xm.allocator
+        if _xm.allocator_raw is not None and _xm.allocator_raw != _alloc:
+            _alloc += f" (from {_xm.allocator_raw!r})"
+        _frac = (f"{_xm.mem_fraction} [{_xm.mem_fraction_var}]"
+                 if _xm.mem_fraction else "unset")
+        print_fn(
+            f"  XLA allocator: {_alloc}  preallocate: "
+            f"{'on' if _xm.preallocate else 'off'}  mem_fraction: {_frac}")
+        if not _xm.allocator_is_valid:
+            print_fn(
+                f"  *** LORRAX SANITY: XLA_PYTHON_CLIENT_ALLOCATOR="
+                f"{_xm.allocator_raw!r} is not one of default/platform/bfc/"
+                f"cuda_async — jax raises on this at backend init. ***")
+        if _xm.preallocate_looks_like_a_typo:
+            print_fn(
+                f"  *** LORRAX SANITY: XLA_PYTHON_CLIENT_PREALLOCATE="
+                f"{_xm.preallocate_raw!r} reads as 'off' but jax's test is "
+                f"case-sensitive (only 'false'/'False'/'0' disable), so "
+                f"preallocation is ON. ***")
+        if _xm.mem_fraction_conflict:
+            print_fn(
+                "  *** LORRAX SANITY: XLA_CLIENT_MEM_FRACTION and the "
+                "deprecated XLA_PYTHON_CLIENT_MEM_FRACTION are BOTH set — "
+                "jax raises on this at backend init. ***")
+        elif _xm.mem_fraction_deprecated:
+            print_fn(
+                "  [note] XLA_PYTHON_CLIENT_MEM_FRACTION is deprecated in "
+                "jax 0.9; the current name is XLA_CLIENT_MEM_FRACTION.")
+        if _xm.peak_note:
+            print_fn(f"  [note] {_xm.peak_note}")
+        if _xm.tf_gpu_allocator_raw:
+            print_fn(
+                f"  [note] TF_GPU_ALLOCATOR={_xm.tf_gpu_allocator_raw!r} is "
+                f"set but INERT for jax (a TensorFlow variable); it does not "
+                f"select an allocator here.")
+    else:
+        _gpu_knobs = {n: os.environ.get(n) for n in (
+            "XLA_PYTHON_CLIENT_ALLOCATOR",
+            "XLA_PYTHON_CLIENT_PREALLOCATE",
+            "XLA_CLIENT_MEM_FRACTION",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION")}
+        _set = [n for n, v in _gpu_knobs.items() if v]
+        _tail = (f" (set but ignored: {', '.join(_set)})" if _set else "")
+        print_fn(
+            f"  XLA GPU pool knobs: not applicable on the {backend} "
+            f"backend{_tail}")
+
+    # ---- the CLIENT ------------------------------------------------------
+    # Everything above is what the ENVIRONMENT says.  os.environ is a false
+    # witness for allocator state — the allocator is fixed at backend init,
+    # and bootstrap() reaches backend init via jax.devices() inside
+    # fallback_to_cpu_if_no_gpu_backend(), so any variable set afterwards
+    # changes a string and not the client (measured, job 7882443:
+    # identical os.environ, bytes_limit 11.805 GB vs 0.000 GB).  Read the
+    # device and say so when the two disagree.
+    try:
+        import jax
+        # local_devices(), not devices(): jax.devices() is the GLOBAL list, so
+        # jax.devices()[0] is process 0's device on every rank and the banner
+        # would report another process's pool (or throw) at every P > 1.
+        _stats = jax.local_devices()[0].memory_stats()
+        _pool = classify_xla_pool(_stats, backend=backend, env=_xm)
+        if _pool.accounting_present:
+            _bl = (_stats or {}).get("bytes_limit", 0) / 1e9
+            _bu = (_stats or {}).get("bytes_in_use", 0) / 1e9
+            _pk = (_stats or {}).get("peak_bytes_in_use", 0) / 1e9
+            if _bl > 0:
+                print_fn(
+                    f"  XLA pool: limit={_bl:.2f} GB, in_use={_bu:.2f} GB,"
+                    f" avail={_bl - _bu:.2f} GB, peak={_pk:.2f} GB"
+                )
+            else:
+                # MEASURED (job 7882478): cuda_async populates in_use and
+                # peak_bytes_in_use but reports bytes_limit=0.  The old
+                # ``avail = limit - in_use`` then printed a NEGATIVE
+                # available pool — a number that cannot exist.
+                print_fn(
+                    f"  XLA pool: in_use={_bu:.2f} GB, peak={_pk:.2f} GB"
+                    f"  (this allocator reports no bytes_limit, so there is"
+                    f" no 'available' figure)"
+                )
+        else:
+            # ``None``/``{}``/all-zero is the documented answer on backends
+            # with no arena accounting (the CPU client, and the ``platform``
+            # allocator).  Say so — a missing line with no reason reads as
+            # "nothing to report", which is a different claim.
+            print_fn("  XLA pool: the client reports no arena accounting "
+                     "(bytes_limit=0) — no pool figures available")
+        if _pool.disagreement:
+            print_fn(f"  *** LORRAX SANITY: {_pool.disagreement} ***")
+    except Exception as exc:
+        # Previously ``except Exception: pass``.  A swallowed failure here
+        # deleted the pool line from the banner with no trace, so an
+        # operator could not tell "no pool" from "the probe broke".
+        print_fn(f"  XLA pool: unavailable ({type(exc).__name__}: {exc})")
+
+    print_fn("=" * 72)
+    print_fn("")
 
 
 def print_section(title: str, print_fn=print):
@@ -515,7 +676,16 @@ def write_freq_debug(
     _kin_diag_ev = np.real(
         np.diagonal(np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * RYD_TO_EV
     _v_h_diag_ev = np.real(
-        np.diagonal(np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+        np.diagonal(np.asarray(results.sig_h_scalar), axis1=1, axis2=2)
+    ) * RYD_TO_EV
+    _h_transverse_diag_ev = (
+        None if results.h_transverse is None else np.real(np.diagonal(
+            np.asarray(results.h_transverse), axis1=1, axis2=2)) * RYD_TO_EV)
+    _h_direct_diag_ev = (
+        np.real(np.diagonal(
+            np.asarray(results.sig_h), axis1=1, axis2=2)) * RYD_TO_EV
+        if _h_transverse_diag_ev is None
+        else _v_h_diag_ev + _h_transverse_diag_ev)
     _sig_x_diag_ev = np.real(
         np.diagonal(np.asarray(results.sig_x), axis1=1, axis2=2)) * RYD_TO_EV
     _nk, _nb = _e_dft_ev_full.shape
@@ -535,8 +705,13 @@ def write_freq_debug(
         ("Edft-Ef", _e_dft_ev_full - float(results.efermi_ev or 0.0)),
         ("kin_ion", _kin_diag_ev),
         ("V_H", _v_h_diag_ev),
-        ("x_bare", _sig_x_diag_ev),
     ]
+    if _h_transverse_diag_ev is not None:
+        _cols.append(("H_T", _h_transverse_diag_ev))
+    _cols.extend([
+        ("Hdir", _h_direct_diag_ev),
+        ("x_bare", _sig_x_diag_ev),
+    ])
     if static_head_terms is not None:
         _cols.append((
             "x_head",
@@ -637,7 +812,7 @@ def write_freq_debug(
         _z_factor = None
     _eqp0_ev, _eqp1_ev = compute_eqp_diag(
         kin_ion_diag_ev=_kin_diag_ev,
-        hartree_diag_ev=_v_h_diag_ev,
+        hartree_diag_ev=_h_direct_diag_ev,
         sigma_x_diag_ev=_sig_x_for_eqp,
         sigma_c_at_dft_diag_ev=np.asarray(
             _sigma_c_at_dft_for_eqp, dtype=np.complex128),
@@ -1278,7 +1453,13 @@ def write_results(
 
     sx_out    = r2e * sx_arr
     corr_out  = r2e * corr_arr
-    sig_h_out = r2e * results.sig_h
+    sig_h_scalar_out = r2e * results.sig_h_scalar
+    h_transverse_out = (
+        None if results.h_transverse is None
+        else r2e * results.h_transverse)
+    sig_h_out = (
+        r2e * results.sig_h if h_transverse_out is None
+        else sig_h_scalar_out + h_transverse_out)
     sig_x_out = r2e * results.sig_x  # always populated; needed for eqp{0,1}
 
     # ── THE k-BASIS OF EVERY TEXT FILE THIS FUNCTION WRITES ───────────────
@@ -1360,6 +1541,8 @@ def write_results(
         sx_label="sigX" if results.use_ppm else "sigSX",
         corr_label="sigC" if results.use_ppm else "sigCOH",
         total_label="sigXC" if results.use_ppm else "sigTOT",
+        hartree_label=(
+            "Hdir" if results.h_transverse is not None else "VH"),
     )
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
@@ -1389,6 +1572,11 @@ def write_results(
     # H₀ still reports itself exactly once, with the same wording.
     hartree_diag_ev = np.real(
         np.diagonal(_wedge(sig_h_out), axis1=1, axis2=2))
+    hartree_scalar_diag_ev = np.real(
+        np.diagonal(_wedge(sig_h_scalar_out), axis1=1, axis2=2))
+    hartree_transverse_diag_ev = (
+        None if h_transverse_out is None else np.real(
+            np.diagonal(_wedge(h_transverse_out), axis1=1, axis2=2)))
     # MODE-CORRECT exchange, not the bare one.  ``sx_out`` is already
     # resolved per mode ~50 lines up: results.sig_x under PPM (where Sigma =
     # Sigma_x + Sigma_c and bare X is right), results.sig_sx under static
@@ -1474,6 +1662,8 @@ def write_results(
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
+        hartree_scalar_diag_ev=hartree_scalar_diag_ev,
+        hartree_transverse_diag_ev=hartree_transverse_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
         sigma_c_at_dft_diag_ev=(
             None if sigma_c_omega_diag_ev_irr is not None

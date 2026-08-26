@@ -39,6 +39,8 @@ SIGMA_K_AXIS = {
 	"sigma_c_kij_ev": 1,
 	"sigma_sx_kij_ev": 0,
 	"hartree_kij_ev": 0,
+	"hartree_scalar_kij_ev": 0,
+	"hartree_transverse_kij_ev": 0,
 	"sigma_xc_qsgw_kij_ev": 0,
 	"qp_diag_self_consistent_ev": 0,
 	"qp_omega0_ev": 0,
@@ -216,6 +218,7 @@ def write_sigma_to_file(
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
+	hartree_label: str = "VH",
 ):
 	"""Write self-energy components to file.
 
@@ -236,6 +239,7 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+		hartree_label: Text label for the direct-field column
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -432,7 +436,7 @@ def write_sigma_to_file(
 				if hv_diag is not None:
 					hv_re = float(np.real(hv_diag[k, n]))
 					hv_im = float(np.imag(hv_diag[k, n]))
-					line += f"  VH={hv_re:>12.6f}"
+					line += f"  {hartree_label}={hv_re:>12.6f}"
 					# Padded on the real branch too — it was NOT before, so
 					# the trailing Eo= column moved row to row.
 					line += _im(hv_im, hv_cplx)
@@ -1084,6 +1088,8 @@ def write_sigma_omega_h5(
 	sigma_c_kij_ev=None,
 	sigma_sx_kij_ev=None,
 	hartree_kij_ev=None,
+	hartree_scalar_kij_ev=None,
+	hartree_transverse_kij_ev=None,
 	mesh=None,
 	star=None,
 	omega_reference_ev=None,
@@ -1103,6 +1109,8 @@ def write_sigma_omega_h5(
 	  - sigma_c_kij_ev  (optional): (n_omega, nk, nb, nb)
 	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
 	  - hartree_kij_ev  (optional): (nk, nb, nb)
+	  - hartree_scalar_kij_ev (optional): scalar charge V_H
+	  - hartree_transverse_kij_ev (optional): current H_T
 	  - sigma_c_extrap_*_kn_ev (optional): (nk, nb) — the Σ_c
 	    band-convergence fit, present only when the run extrapolated
 
@@ -1205,6 +1213,8 @@ def write_sigma_omega_h5(
 		"sigma_c_kij_ev": sigma_c_kij_ev,
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
+		"hartree_scalar_kij_ev": hartree_scalar_kij_ev,
+		"hartree_transverse_kij_ev": hartree_transverse_kij_ev,
 	}
 	# INTO THE SAME PAYLOAD as the cubes: the eval spectrum labels the same
 	# (k, n) the cube's band diagonal does, so it must be extracted to the
@@ -1232,6 +1242,15 @@ def write_sigma_omega_h5(
 	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
 	hartree_kij_ev = payload["hartree_kij_ev"]
+	hartree_scalar_kij_ev = payload["hartree_scalar_kij_ev"]
+	hartree_transverse_kij_ev = payload["hartree_transverse_kij_ev"]
+
+	def _direct_attrs(name, semantics):
+		attrs = dict(_attrs(name) or {})
+		attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+		attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+		attrs["direct_field_semantics"] = semantics
+		return attrs
 
 	def _operator_attrs(name):
 		"""k-storage stamps plus the one meaning shared by every raw cube."""
@@ -1298,8 +1317,26 @@ def write_sigma_omega_h5(
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
 				dtype=np.complex128,
-				attrs=_operator_attrs("hartree_kij_ev"))
+				attrs=(
+					_operator_attrs("hartree_kij_ev")
+					if hartree_transverse_kij_ev is None else _direct_attrs(
+						"hartree_kij_ev", "V_H_scalar+H_transverse")))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		if hartree_scalar_kij_ev is not None:
+			io.create_dataset("hartree_scalar_kij_ev",
+				shape=tuple(hartree_scalar_kij_ev.shape),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_scalar_kij_ev", "V_H_scalar"))
+			io.write_slab("hartree_scalar_kij_ev", hartree_scalar_kij_ev)
+		if hartree_transverse_kij_ev is not None:
+			io.create_dataset("hartree_transverse_kij_ev",
+				shape=tuple(hartree_transverse_kij_ev.shape),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_transverse_kij_ev", "H_transverse"))
+			io.write_slab(
+				"hartree_transverse_kij_ev", hartree_transverse_kij_ev)
 		if eval_rel_extracted is not None:
 			# The two facts that make this array usable ride ON it: which
 			# spectrum it is, and how much of it the ω grid could answer

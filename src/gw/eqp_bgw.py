@@ -666,7 +666,8 @@ class EqpAssembly:
 	eqp0_ev: np.ndarray
 	eqp1_ev: np.ndarray
 	kin_ion_diag_ev: np.ndarray
-	hartree_diag_ev: np.ndarray          # post-seam: the V_H actually used
+	hartree_diag_ev: np.ndarray          # post-seam total Hdir = V_H + H_T
+	hartree_scalar_diag_ev: np.ndarray   # scalar V_H used by DFT diagnostics
 	sigma_x_diag_ev: np.ndarray
 	sigma_c_at_dft_diag_ev: np.ndarray
 	#: The exact output-conditioned diagonal curve used to derive both
@@ -676,6 +677,7 @@ class EqpAssembly:
 	z_factor: np.ndarray | None
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
+	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
 	hartree_source: str | None = None
 	kin_ion_has_hartree: bool = False
@@ -719,6 +721,8 @@ def assemble_eqp(
 	kin_ion_has_hartree: bool = False,
 	exact_hartree_diag_ev: np.ndarray | None = None,
 	hartree_already_resolved: bool = False,
+	hartree_scalar_diag_ev: np.ndarray | None = None,
+	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
@@ -764,13 +768,40 @@ def assemble_eqp(
 		hartree_already_resolved=hartree_already_resolved,
 		print_fn=print_fn,
 	)
+	if hartree_scalar_diag_ev is None:
+		if hartree_transverse_diag_ev is not None:
+			raise ValueError(
+				"assemble_eqp: H_T was supplied without its scalar V_H twin; "
+				"component-aware direct fields require scalar, transverse, and "
+				"their aggregate together.")
+		hartree_scalar_used = np.asarray(hartree_used, dtype=np.float64)
+		hartree_transverse_used = None
+	else:
+		if not hartree_already_resolved:
+			raise ValueError(
+				"assemble_eqp: component-aware Hartree input must cross the "
+				"scalar-source seam before assembly; refusing to apply one "
+				"aggregate rule to independently supplied components.")
+		hartree_scalar_used = np.asarray(
+			hartree_scalar_diag_ev, dtype=np.float64)
+		hartree_transverse_used = (
+			None if hartree_transverse_diag_ev is None else np.asarray(
+				hartree_transverse_diag_ev, dtype=np.float64))
+		expected_total = hartree_scalar_used
+		if hartree_transverse_used is not None:
+			expected_total = hartree_scalar_used + hartree_transverse_used
+		if not np.array_equal(
+			np.asarray(hartree_used, dtype=np.float64), expected_total):
+			raise ValueError(
+				"assemble_eqp: direct-field aggregate is not exactly "
+				"V_H_scalar + H_transverse; refusing an unauthenticated Hdir.")
 
 	implied_vxc = None
 	if mean_field_gate:
 		implied_vxc = _warn_on_unphysical_h0(
 			e_dft_ev=e_dft_ev,
 			kin_ion_diag_ev=kin_ion_diag_ev,
-			hartree_diag_ev=hartree_used,
+			hartree_diag_ev=hartree_scalar_used,
 			kin_ion_has_hartree=kin_ion_has_hartree,
 			hartree_source=hartree_source,
 			print_fn=print_fn,
@@ -857,6 +888,7 @@ def assemble_eqp(
 		eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_used,
+		hartree_scalar_diag_ev=hartree_scalar_used,
 		sigma_x_diag_ev=sigma_x_diag_ev,
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
 		sigma_c_omega_diag_ev=(
@@ -865,6 +897,7 @@ def assemble_eqp(
 		z_factor=z_factor,
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
+		hartree_transverse_diag_ev=hartree_transverse_used,
 		nspin=int(nspin),
 		hartree_source=hartree_source,
 		kin_ion_has_hartree=bool(kin_ion_has_hartree),
