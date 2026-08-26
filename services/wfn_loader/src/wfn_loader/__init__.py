@@ -59,15 +59,19 @@ from wfn_loader.loader import (
     IBZRows,
     KSpec,
     WfnLoader,
+    WfnProvenance,
     _bispinor_lift_kernel,
     _get_bispinor_lift_jit,
     _phdf5_unfold_kernel,
     _sharded_zero_proto_fn,
+    read_wfn_provenance,
+    uniform_band_windows,
 )
 
 __all__ = [
     # the class, and the k-spec vocabulary its methods take
-    "WfnLoader", "KSpec", "IBZRows",
+    "WfnLoader", "WfnProvenance", "read_wfn_provenance",
+    "KSpec", "IBZRows", "uniform_band_windows",
     # module-level helpers the in-tree tests pin by name (see above)
     "_phdf5_unfold_kernel",
     "_sharded_zero_proto_fn", "_get_bispinor_lift_jit",

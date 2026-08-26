@@ -72,8 +72,7 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     from common.collectives import single_device_mesh
     from common.wfn_transforms import to_rbox
     from symmetry_maps import fft_grid_pullback_perm, star_tables_of
-    from wfn_loader import IBZRows, WfnLoader
-    from .charge_density import _uniform_band_windows
+    from wfn_loader import IBZRows, WfnLoader, uniform_band_windows
 
     if not isinstance(wfn, WfnLoader):
         raise TypeError(
@@ -102,7 +101,7 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
     chunk = max(1, min(n_occ, (4 * 1024 ** 3) // bytes_per_band))
     windows = [
         (lo, jnp.asarray(mask))
-        for lo, mask in _uniform_band_windows(0, n_occ, chunk)
+        for lo, mask in uniform_band_windows(0, n_occ, chunk)
     ]
 
     t0 = time.perf_counter()

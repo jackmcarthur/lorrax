@@ -1123,6 +1123,7 @@ def make_eqp_bgw(
 	# Only a truly legacy file enters the format owner's diagonal hyperslab
 	# reader, which never materializes a full (nω,nk,nb,nb) cube on rank 0.
 	from file_io.sigma_output import (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION,
 		read_eqp_assembly_receipt,
 		read_sigma_eqp_diagonal_window,
 	)
@@ -1232,8 +1233,33 @@ def make_eqp_bgw(
 	# ``gw.sigma_dispatch`` does) so this module stays importable without
 	# pulling in the jax-dependent file_io stack; the V_H seam below takes
 	# the same import for the same reason and they are one statement.
-	from file_io.kin_ion import (HARTREE_DATASET, kin_ion_hartree_source,
-	                             read_full_bz_dataset)
+	from file_io.kin_ion import (
+		HARTREE_DATASET, read_full_bz_dataset, resolve_hartree_source,
+		authenticate_kin_ion_hartree_wfn_receipt)
+	# A completed receipt names the source the live assembly actually selected,
+	# including an explicit isdf/gspace override on a file that also offers a
+	# stored array.  Ask the format owner's resolver to authenticate that choice.
+	# ``folded`` is a disk state rather than a legal frontend request, so auto is
+	# the canonical way to establish it and the equality below authenticates it.
+	_receipt_source = (None if _receipt is None else _receipt["hartree_source"])
+	_source_request = (
+		"auto" if _receipt_source in (None, "folded") else _receipt_source)
+	_src = resolve_hartree_source(
+		kin_ion_path, _source_request, print_fn=lambda *_args: None)
+	if _receipt_source is not None and _src != _receipt_source:
+		raise ValueError(
+			f"EQP receipt selected Hartree source {_receipt_source!r}, but "
+			f"{os.path.basename(kin_ion_path)} resolves to {_src!r}.")
+	_component_aware_direct = bool(
+		_receipt is not None
+		and int(_receipt["schema_version"])
+		== EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		and _receipt["hartree_transverse_diag_ev"] is not None)
+	authenticate_kin_ion_hartree_wfn_receipt(
+		kin_ion_path, wfn_path,
+		selected_hartree_source=_src,
+		band_stop=band_stop,
+		require_transverse=(_component_aware_direct and _src != "gspace"))
 	kin_full = read_full_bz_dataset(kin_ion_path, "kin_ion")
 	if kin_full.ndim != 3:
 		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")
@@ -1315,7 +1341,6 @@ def make_eqp_bgw(
 	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
 	# kin_ion read above, which is the same lazy import for the same
 	# reason.
-	_src = kin_ion_hartree_source(kin_ion_path)
 	vh_exact = None
 	hartree_already_resolved = False
 	receipt_c_at_dft = None
@@ -1350,12 +1375,6 @@ def make_eqp_bgw(
 				f"{os.path.basename(qp_rotations_path)} requests file-wedge rows "
 				f"{kirr_to_kfull.tolist()}; refusing a shape-compatible k-row "
 				"permutation.  Shape alone is not a k-row identity proof.")
-		if _receipt["hartree_source"] != _src:
-			raise ValueError(
-				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "
-				f"does not match {os.path.basename(kin_ion_path)} source {_src!r}; "
-				"refusing to combine an assembled H from one source policy "
-				"with a different mean-field artifact.")
 		if bool(_receipt["kin_ion_has_hartree"]) != (_src == "folded"):
 			raise ValueError(
 				"EQP receipt and kin_ion disagree about whether scalar Hartree is "

@@ -99,6 +99,7 @@ from .kin_ion import (
     resolve_hartree_source,
     read_kin_ion_provenance,
     validate_kin_ion_against_run,
+    authenticate_kin_ion_hartree_wfn_receipt,
 )
 from .centroids import load_centroids
 from .paths import resolve_input_paths
