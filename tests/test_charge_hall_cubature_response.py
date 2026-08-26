@@ -42,8 +42,8 @@ def test_charge_hall_builder_has_only_declared_support(
     layout = PhotonBasisLayout.from_centroid_extents(3, 2, mesh)
     wfn_sha = "1" * 64
 
-    S = np.asarray([[[2.0, 0.25, 0.0],
-                     [0.25, 1.0, 0.0],
+    S = np.asarray([[[2.0, 0.25 + 0.5j, 0.0],
+                     [0.25 - 0.5j, 1.0, 0.0],
                      [0.0, 0.0, 0.5]]], dtype=np.complex128)
     charge_y = np.asarray(
         [[1.0 + 2.0j, -0.5j, 0.75],
@@ -100,7 +100,14 @@ def test_charge_hall_builder_has_only_declared_support(
     assert pi1[1, 0, 1] == 2.0j
 
     S_got = np.asarray(response.S_direct)
-    np.testing.assert_array_equal(S_got[:, :, 0, 0], S[0, :2, :2])
+    expected_charge = 0.5 * (S[0, :2, :2] + S[0, :2, :2].T)
+    np.testing.assert_array_equal(S_got[:, :, 0, 0], expected_charge)
+    q = np.asarray([0.375, -0.625])
+    np.testing.assert_allclose(
+        q @ S_got[:, :, 0, 0] @ q,
+        q @ S[0, :2, :2] @ q,
+        rtol=0.0, atol=1.0e-15,
+    )
     np.testing.assert_array_equal(S_got[:, :, 0, 1:], 0.0)
     np.testing.assert_array_equal(S_got[:, :, 1:, :], 0.0)
 
