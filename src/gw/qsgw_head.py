@@ -265,10 +265,10 @@ class StaticGaugeHallTransaction:
     """Sealed Hall result from one complete uniform-gauge transaction.
 
     ``sigma_H`` is the three-component real Hall pseudovector consumed by
-    :class:`gw.head_correction.StaticGaugeHeadResponse`.  The fingerprint is
-    copied from the *same* uniform-gauge sweep that supplied ``Gamma_raw``;
-    it therefore remains inseparable from the current/contact/transfer-jet
-    Hamiltonian identity that a complete response artifact must carry.
+    the static response producer.  The fingerprint is copied from the same
+    uniform-gauge sweep that supplied ``Gamma_raw``.  A current-only sweep
+    authenticates the Hall operator without claiming contact or transfer-jet
+    closure; those terms remain an explicit capability decision downstream.
 
     The large ``Gamma_raw`` band matrix remains sharded over both processor
     axes and is not retained here.  The only replicated product is the
@@ -277,6 +277,7 @@ class StaticGaugeHallTransaction:
 
     sigma_H: jax.Array
     hamiltonian_config_operator_fingerprint: str
+    wfn_fingerprint: str
     band_start: int
     band_stop: int
     nk_tot: int
@@ -3227,12 +3228,12 @@ def static_gauge_hall_transaction(
 
     ``uniform_gauge`` must be the result of
     :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements`.  Hall
-    production consumes its current block and authenticates the same-sweep
-    exact contact.  Optional transfer-q1/q2 fields are validated when present,
-    but they are not materialized merely to reduce Hall: on a realistic band
-    manifold that would make a three-number reduction retain 36 unrelated
-    band matrices.  The complete response producer separately consumes those
-    response-jet fields under its own capability gate.
+    production consumes its current block.  Exact contact and optional
+    transfer-q1/q2 fields are validated when present, but they are not
+    materialized merely to reduce Hall: on a realistic band manifold that
+    would make a three-number reduction retain many unrelated band matrices.
+    A complete response producer must separately require those fields under
+    its own capability gate; the charge+Hall model records them as omitted.
 
     Energies and occupations are read from the same ``WfnLoader`` and unfolded
     from its file wedge through :func:`symmetry_maps.unfold_file_wedge_to_full_bz`.
@@ -3243,6 +3244,7 @@ def static_gauge_hall_transaction(
     """
     from common.mtxel_sweep import (
         UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)
+    from common.parallel_transport import wfn_fingerprint
     from symmetry_maps import unfold_file_wedge_to_full_bz
 
     if not isinstance(uniform_gauge, (
@@ -3347,6 +3349,7 @@ def static_gauge_hall_transaction(
     return StaticGaugeHallTransaction(
         sigma_H=sigma_H,
         hamiltonian_config_operator_fingerprint=fingerprint,
+        wfn_fingerprint=wfn_fingerprint(wfn),
         band_start=start,
         band_stop=stop,
         nk_tot=nk_tot,
