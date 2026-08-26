@@ -216,6 +216,27 @@ def _fake_config(*, check_contents):
     return mod
 
 
+@pytest.mark.parametrize("n_proc,max_size,enabled", [
+    (1, -1, True),
+    (4, -1, True),
+    (1, 1024, True),
+    (1, 0, False),
+    (4, 0, False),
+])
+def test_cache_size_policy_keeps_only_safe_arms(n_proc, max_size, enabled):
+    assert jcc._cache_size_policy(n_proc, max_size) is enabled
+
+
+def test_cache_size_policy_refuses_live_lru_eviction_at_pgt1():
+    with pytest.raises(jcc.UnsafeCachePolicy, match="unsafe at P=4"):
+        jcc._cache_size_policy(4, 1024)
+
+
+def test_cache_size_policy_refuses_invalid_negative_limit():
+    with pytest.raises(jcc.UnsafeCachePolicy, match="must be -1"):
+        jcc._cache_size_policy(1, -2)
+
+
 @pytest.mark.parametrize("check_contents,verification,wraps", [
     (None, False, False),    # every NVIDIA container: neither symbol exists
     (False, True, False),    # released wheel, verification off

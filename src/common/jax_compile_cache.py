@@ -57,6 +57,11 @@ Knobs (all optional):
                                           ``_PREFETCH_DEFAULT``), with
                                           ``LORRAX_JAX_CACHE_PREFETCH_THREADS``
                                           workers (16).
+  ``JAX_COMPILATION_CACHE_MAX_SIZE``    — JAX's byte cap. ``0`` disables the
+                                          cache; a positive cap is supported
+                                          only at P=1. Live LRU eviction is
+                                          refused at P>1 because it can
+                                          invalidate the agreed startup set.
 
 Default location (``ISDF_JAX_CACHE_DIR`` unset) is
 ``$SCRATCH/lorrax_jax_cache`` when ``$SCRATCH`` is set, else
@@ -300,6 +305,10 @@ class _KeyEnvMismatch(RuntimeError):
     """The ranks would compute different cache keys — see _key_env_fingerprint."""
 
 
+class UnsafeCachePolicy(RuntimeError):
+    """A requested disk-cache lifecycle would violate the cache contract."""
+
+
 def _truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() not in (
         "", "0", "false", "no", "off")
@@ -310,6 +319,37 @@ def _int_env(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip())
     except (TypeError, ValueError):
         return default
+
+
+def _cache_size_policy(n_proc: int, max_size: int) -> bool:
+    """Whether the persistent cache may run under JAX's size policy.
+
+    JAX's ``0`` spelling is an explicit cache-off request.  A positive limit
+    enables live LRU eviction: safe at P=1, but unsafe after the P>1 agreement
+    freezes the entries every rank is allowed to read.  Rank 0 evicting one
+    of those files before a peer's first lookup invalidates that snapshot and
+    creates the hit/miss divergence this module exists to prevent.
+
+    Returns ``False`` only for the standard cache-off spelling.  Every unsafe
+    or invalid spelling refuses before a cache object is armed.
+    """
+    n_proc = int(n_proc)
+    max_size = int(max_size)
+    if max_size < -1:
+        raise UnsafeCachePolicy(
+            "JAX_COMPILATION_CACHE_MAX_SIZE must be -1 (unlimited), 0 "
+            f"(off), or a positive byte count; got {max_size}.")
+    if max_size == 0:
+        return False
+    if n_proc > 1 and max_size > 0:
+        raise UnsafeCachePolicy(
+            "JAX_COMPILATION_CACHE_MAX_SIZE enables live LRU eviction, which "
+            f"is unsafe at P={n_proc}: LORRAX freezes an all-rank readable-"
+            "entry set at startup, and rank-0 eviction can remove an agreed "
+            "entry before a peer reads it. Use ISDF_JAX_CACHE_DIR=\"\" for "
+            "a one-shot run, or an explicit run-local cache directory that "
+            "the outer launcher removes after every rank has exited.")
+    return True
 
 
 def _say(msg: str) -> None:
@@ -1420,6 +1460,14 @@ def ensure_jax_compile_cache() -> None:
                  f"LORRAX_JAX_CACHE_MULTIPROCESS=0 (scorecard-AG refusal). "
                  f"Every rank compiles from scratch; correct, ~1 min slower. "
                  f"Would have used {cache_dir}/np{n_proc}.")
+        return
+
+    from jax._src import config as _jax_config
+    _max_size = int(_jax_config.compilation_cache_max_size.value)
+    if not _cache_size_policy(n_proc, _max_size):
+        if proc_idx == 0:
+            _say("persistent compile cache OFF "
+                 "(JAX_COMPILATION_CACHE_MAX_SIZE=0).")
         return
 
     # ONE directory per world size, shared by every rank (see docstring).

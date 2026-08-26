@@ -1462,8 +1462,15 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 7 ------------------------------------------------------------------
     cache_error = None
     try:
-        from common.jax_compile_cache import ensure_jax_compile_cache
+        from common.jax_compile_cache import (
+            UnsafeCachePolicy, ensure_jax_compile_cache)
         ensure_jax_compile_cache()
+    except UnsafeCachePolicy:
+        # This is not a cache implementation failure we may safely demote.
+        # The requested lifecycle itself can invalidate the P>1 hit/miss
+        # agreement, so refuse before any physics rather than continuing with
+        # an independently configured JAX cache still live underneath us.
+        raise
     except Exception as exc:                                  # noqa: BLE001
         # Not fatal (the cache is an optimisation), but it must not be
         # SILENT: a run that quietly lost its compile cache looks like a
