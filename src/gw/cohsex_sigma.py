@@ -328,7 +328,7 @@ def make_hartree_projection_kernel(
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
-                             nk_tot: int):
+                             nk_tot: int, *, q0_only: bool = False):
     """Build the one flat-k convolution shared by every static Sigma block.
 
     Scalar COHSEX and photon blocks differ only in their endpoint centroid
@@ -338,23 +338,38 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     """
     from ffi import ffi_dial_key
     cache_key = (
-        id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(), int(nk_tot))
+        id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(), int(nk_tot),
+        bool(q0_only))
     if cache_key in _static_convolution_cache:
         return _static_convolution_cache[cache_key]
 
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+    if q0_only:
+        # Closed form of the SAME normalized flat-k convolution when the
+        # interaction is structurally zero except at q=0:
+        #   -1/Nk sum_q G(k-q)V(q) = -G(k)V(0)/Nk.
+        # This branch is used only for retained head factors and avoids three
+        # extra full-q FFT convolutions per Lorentz block.
+        @jax.jit
+        def _convolve(G_k, V_or_W, prefactor):
+            V0 = V_or_W[0][None, None, :, None, :]
+            return prefactor * G_k * V0 * (-1.0 / float(nk_tot))
+    else:
+        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
 
-    _G_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-    _G_fftn = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-    _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
-    _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
+        _G_ifftn = make_flat_k_ifftn(
+            mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        _G_fftn = make_flat_k_fftn(
+            mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        _V_ifftn = make_flat_k_ifftn(
+            mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+        _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
 
-    @jax.jit
-    def _convolve(G_k, V_or_W, prefactor):
-        """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
-        G_R = _G_ifftn(G_k)
-        V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
-        return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+        @jax.jit
+        def _convolve(G_k, V_or_W, prefactor):
+            """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+            G_R = _G_ifftn(G_k)
+            V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
+            return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
 
     _static_convolution_cache[cache_key] = _convolve
     return _convolve
