@@ -190,7 +190,7 @@ def spin_degeneracy_factor(wfn) -> float:
     return 1.0
 
 
-@partial(jax.jit, static_argnames=("nocc",))
+@partial(jax.jit, static_argnames=("nocc", "include_dirac_current"))
 def _valence_density_kernel(
     psi_k_box: jnp.ndarray,
     weight: jnp.ndarray,
@@ -198,6 +198,7 @@ def _valence_density_kernel(
     spin_degeneracy: jnp.ndarray,
     *,
     nocc: int | None,
+    include_dirac_current: bool,
 ) -> jnp.ndarray:
     """Jitted body of :func:`valence_density_from_kpoint`.
 
@@ -211,8 +212,25 @@ def _valence_density_kernel(
     scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
     psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
     psi_r = local_ifftn3(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
-    return (weight * spin_degeneracy) * jnp.sum(
+    prefactor = weight * spin_degeneracy
+    rho = prefactor * jnp.sum(
         jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+    if not include_dirac_current:
+        return rho
+
+    # The same occupied bispinors, weights, IFFT and normalisation as rho.
+    # These are the signed normalized currents J_i = j_i/c = Psi^dagger
+    # alpha_i Psi.  In particular there is NO 1/alpha_fs rescaling: that
+    # belongs only to centroid selection's squared-current weight.
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    psi_dag = jnp.conj(psi_r)
+    currents = []
+    for mu in (1, 2, 3):
+        perm, phase = gamma_perm_phase(mu)
+        alpha_psi = gamma_apply(psi_r, perm, phase, axis=1)
+        currents.append(prefactor * jnp.sum(
+            jnp.real(psi_dag * alpha_psi), axis=(0, 1)))
+    return jnp.stack((rho, *currents))
 
 
 def valence_density_from_kpoint(
@@ -222,6 +240,7 @@ def valence_density_from_kpoint(
     weight: float,
     cell_volume: float,
     spin_degeneracy: float = 1.0,
+    include_dirac_current: bool = False,
 ) -> jnp.ndarray:
     """One k-point's contribution to ρ_v(r), on the ψ FFT box grid.
 
@@ -246,13 +265,24 @@ def valence_density_from_kpoint(
     (``gw.kin_ion_io.build_valence_density_distributed``) all go
     through this one function.  The arithmetic runs in ONE jitted module
     (:func:`_valence_density_kernel`; ``nocc`` static, scalars traced).
+
+    ``include_dirac_current=True`` requires four-component bispinors and
+    returns ``(rho,Jx,Jy,Jz)`` from that same transform, where
+    ``J_i = Psi^dagger alpha_i Psi = j_i/c``.  The default scalar branch is
+    unchanged and does not trace any gamma operation.
     """
+    include_current = bool(include_dirac_current)
+    if include_current and int(psi_k_box.shape[1]) != 4:
+        raise ValueError(
+            "Dirac current requires four-component kinetic-balance "
+            f"bispinors; got nspinor={int(psi_k_box.shape[1])}")
     return _valence_density_kernel(
         psi_k_box,
         jnp.asarray(float(weight), dtype=jnp.float64),
         jnp.asarray(float(cell_volume), dtype=jnp.float64),
         jnp.asarray(float(spin_degeneracy), dtype=jnp.float64),
-        nocc=None if nocc is None else int(nocc))
+        nocc=None if nocc is None else int(nocc),
+        include_dirac_current=include_current)
 
 
 # ===========================================================================

@@ -485,12 +485,19 @@ def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
                     key=('kinetic', geom.ngkmax, geom.ns))
 
 
-def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
-    """``V ∘ ψ = F[ V(r) · F⁻¹ψ ]`` — the FFT round trip, for V_H and V_loc.
+def local_potential_operator(
+    geom: SweepGeometry, V_r, *, dirac_vector: bool = False,
+) -> Operator:
+    """Local scalar ``V`` or Dirac-vector ``sum_i alpha_i A_i`` operator.
 
-    Term-for-term the normalisation of
+    The default is ``V ∘ ψ = F[V(r) F⁻¹ψ]``, term-for-term the normalisation of
     ``psp.get_DFT_mtxels.compute_local_V_k``, so the two agree to
     round-off and the difference is pure reassociation from the sharding.
+
+    ``dirac_vector=True`` consumes ``V_r.shape == (3,nx,ny,nz)`` and applies
+    ``F[sum_i alpha_i V_i(r) F⁻¹ψ]`` with the canonical monomial gamma
+    tables.  It is the same scatter/IFFT/FFT/gather and the same
+    normalisation, not a parallel band-projection implementation.
 
     The two transforms are built ONCE, here, outside the scan — they are
     pure functions of shape, so nothing about them is per-k.  Only the
@@ -521,7 +528,25 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     scale = float(_sc.scale)
     deltaV = float(_sc.deltaV)
     fft_norm = float(_sc.fft_norm)
+    vector = bool(dirac_vector)
     V_r_j = jnp.asarray(V_r, dtype=jnp.complex128)
+    if vector:
+        if int(geom.ns) != 4:
+            raise ValueError(
+                "Dirac-vector local potential requires four-component "
+                f"bispinors; geom.ns={int(geom.ns)}")
+        expected = (3, *tuple(int(s) for s in geom.fft_grid))
+        if tuple(int(s) for s in V_r_j.shape) != expected:
+            raise ValueError(
+                "Dirac-vector local potential must have shape "
+                f"{expected}; got {tuple(int(s) for s in V_r_j.shape)}")
+        from common.gamma_matrices import gamma_apply, gamma_perm_phase
+        alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    elif tuple(int(s) for s in V_r_j.shape) != tuple(geom.fft_grid):
+        raise ValueError(
+            "scalar local potential must have shape "
+            f"{tuple(geom.fft_grid)}; got "
+            f"{tuple(int(s) for s in V_r_j.shape)}")
 
     def op(psi_n, gvec, gmask, bidx, kvec, V_r_j):
         # sphere → box.  ``_box_kernel`` is reused verbatim: it is pure
@@ -530,7 +555,13 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
         # sentinel index gather exact zero.
         box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
         psi_r = ifftn(box) * scale
-        phi_r = psi_r * V_r_j
+        if vector:
+            phi_r = jnp.zeros_like(psi_r)
+            for i, (perm, phase) in enumerate(alpha_vertices):
+                phi_r = phi_r + V_r_j[i] * gamma_apply(
+                    psi_r, perm, phase, axis=2)
+        else:
+            phi_r = psi_r * V_r_j
         phi_G = fftn(phi_r) * (deltaV * fft_norm)
         # box → sphere.  Advanced indexing on the three replicated FFT
         # axes only, so the band sharding is untouched.
@@ -545,10 +576,16 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     # ties one compiled sweep to one V_H — a full lowering per density-SC
     # step (:func:`_operator_key`).  The scalars above stay literals: they
     # are functions of the geometry and do not move.
-    return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,),
-                    key=('local_potential', geom.fft_grid, geom.ngkmax,
-                         geom.ns, scale, deltaV, fft_norm,
-                         tuple(int(d) for d in V_r_j.shape)))
+    key = (('local_potential', 'dirac_vector', geom.fft_grid, geom.ngkmax,
+            geom.ns, scale, deltaV, fft_norm,
+            tuple(int(d) for d in V_r_j.shape))
+           if vector else
+           # Preserve the historical scalar cache key byte-for-byte: adding
+           # this feature must not invalidate every Vloc/VH executable.
+           ('local_potential', geom.fft_grid, geom.ngkmax, geom.ns,
+            scale, deltaV, fft_norm,
+            tuple(int(d) for d in V_r_j.shape)))
+    return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,), key=key)
 
 
 def _ket(psi_n, gmask):

@@ -97,46 +97,143 @@ class HamiltonianK:
 #  Poisson solver
 # ═══════════════════════════════════════════════════════════════════════
 
+def _poisson_reciprocal_geometry(
+    fft_grid: tuple[int, int, int],
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray | None,
+    blat: float | None,
+    truncation_2d: bool,
+):
+    """One reciprocal-grid/G2 source for scalar and transverse Poisson."""
+    nx2, ny2, nz2 = (int(s) for s in fft_grid)
+    fx = jnp.fft.fftfreq(nx2) * nx2
+    fy = jnp.fft.fftfreq(ny2) * ny2
+    fz = jnp.fft.fftfreq(nz2) * nz2
+    ix, iy, iz = fx[:, None, None], fy[None, :, None], fz[None, None, :]
+    M = jnp.asarray(bdot, dtype=jnp.float64)
+    G2 = (M[0, 0] * ix * ix + M[1, 1] * iy * iy + M[2, 2] * iz * iz
+          + 2 * M[0, 1] * ix * iy + 2 * M[0, 2] * ix * iz
+          + 2 * M[1, 2] * iy * iz)
+    zero_mask = ((jnp.arange(nx2)[:, None, None] == 0)
+                 & (jnp.arange(ny2)[None, :, None] == 0)
+                 & (jnp.arange(nz2)[None, None, :] == 0))
+    G2_safe = jnp.where(zero_mask, 1.0, G2)
+
+    G_cart = None
+    f2d = None
+    if bvec is not None and blat is not None:
+        B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
+        G_cart = jnp.stack(jnp.broadcast_arrays(
+            ix * B[0, 0] + iy * B[1, 0] + iz * B[2, 0],
+            ix * B[0, 1] + iy * B[1, 1] + iz * B[2, 1],
+            ix * B[0, 2] + iy * B[1, 2] + iz * B[2, 2],
+        ))
+        if truncation_2d:
+            zc = jnp.pi / B[2, 2]
+            kxy = jnp.sqrt(G_cart[0] ** 2 + G_cart[1] ** 2)
+            f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(G_cart[2] * zc)
+    return G2_safe, zero_mask, G_cart, f2d
+
+
 def poisson_potential_from_rhoG(
     rho_G: jnp.ndarray,
     bdot: jnp.ndarray,
     bvec: jnp.ndarray | None = None,
     blat: float | None = None,
     truncation_2d: bool = True,
+    *,
+    _geometry=None,
 ) -> jnp.ndarray:
     """Solve Poisson equation: V(G) = 8π ρ(G) / |G|² (G≠0), V(G=0) = 0.
 
     If truncation_2d=True, applies Ismail-Beigi 2D slab truncation:
         v_2D(G) = v_3D(G) × (1 − e^{−|G_xy|·L_z/2} · cos(G_z·L_z/2))
     """
-    nx2, ny2, nz2 = rho_G.shape
-    fx = jnp.fft.fftfreq(nx2) * nx2
-    fy = jnp.fft.fftfreq(ny2) * ny2
-    fz = jnp.fft.fftfreq(nz2) * nz2
-
-    M = jnp.asarray(bdot, dtype=jnp.float64)
-    ix, iy, iz = fx[:, None, None], fy[None, :, None], fz[None, None, :]
-    G2 = (M[0, 0] * ix * ix + M[1, 1] * iy * iy + M[2, 2] * iz * iz
-          + 2 * M[0, 1] * ix * iy + 2 * M[0, 2] * ix * iz + 2 * M[1, 2] * iy * iz)
-    zero_mask = ((jnp.arange(nx2)[:, None, None] == 0)
-                 & (jnp.arange(ny2)[None, :, None] == 0)
-                 & (jnp.arange(nz2)[None, None, :] == 0))
-    G2_safe = jnp.where(zero_mask, 1.0, G2)
+    rho_G = jnp.asarray(rho_G)
+    if rho_G.ndim < 3:
+        raise ValueError(
+            "rho_G must have at least three FFT axes; "
+            f"got shape {tuple(int(s) for s in rho_G.shape)}")
+    fft_grid = tuple(int(s) for s in rho_G.shape[-3:])
+    geometry = (_poisson_reciprocal_geometry(
+        fft_grid, bdot, bvec, blat, truncation_2d)
+        if _geometry is None else _geometry)
+    G2_safe, zero_mask, _G_cart, f2d = geometry
 
     V_G = 8.0 * jnp.pi * rho_G / G2_safe
 
-    if truncation_2d and bvec is not None and blat is not None:
-        B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
-        Gx_c = ix * B[0, 0] + iy * B[1, 0] + iz * B[2, 0]
-        Gy_c = ix * B[0, 1] + iy * B[1, 1] + iz * B[2, 1]
-        Gz_c = ix * B[0, 2] + iy * B[1, 2] + iz * B[2, 2]
-        zc = jnp.pi / B[2, 2]
-        kxy = jnp.sqrt(Gx_c ** 2 + Gy_c ** 2)
-        f2d = 1.0 - jnp.exp(-zc * kxy) * jnp.cos(Gz_c * zc)
+    if f2d is not None:
         V_G = V_G * jnp.where(zero_mask, 0.0, f2d)
 
-    V_G = V_G.at[0, 0, 0].set(0.0)
-    return jnp.real(jnp.fft.ifftn(V_G, norm='ortho'))
+    V_G = V_G.at[..., 0, 0, 0].set(0.0)
+    return jnp.real(local_ifftn3(V_G, axes=(-3, -2, -1), norm='ortho'))
+
+
+def transverse_potential_from_current(
+    current_r: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray,
+    blat: float,
+    truncation_2d: bool,
+    *,
+    tt_metric_sign: float,
+) -> jnp.ndarray:
+    r"""Periodic Coulomb-gauge direct field from ``J = j/c``.
+
+    ``current_r`` has shape ``(3, nx, ny, nz)`` and contains the signed
+    occupied Dirac-current vertices ``Psi^dagger alpha_i Psi``.  The result
+    is the three real-space fields
+
+    ``A_i(G) = s_TT v(G) (delta_ij - G_i G_j/G^2) J_j(G)``.
+
+    The scalar :func:`poisson_potential_from_rhoG` remains the sole owner of
+    ``v(G)``, including the Ry ``8*pi/G^2`` prefactor, the 2-D slab factor,
+    FFT normalisation, and the periodic ``G=0`` zero.  The geometric
+    projector comes from the public ``vcoul.transverse_projector`` SSOT used
+    by finite-q photon tiles.  ``tt_metric_sign`` is required rather than
+    respelled here; the caller passes ``vcoul.COULOMB_GAUGE_TT_SIGN``.
+    Consequently an exchange mini-BZ/head value can never enter this direct
+    periodic solve.
+    """
+    J_r = jnp.asarray(current_r, dtype=jnp.float64)
+    if J_r.ndim != 4 or int(J_r.shape[0]) != 3:
+        raise ValueError(
+            "current_r must have shape (3,nx,ny,nz); "
+            f"got {tuple(int(s) for s in J_r.shape)}")
+    if not np.isfinite(float(tt_metric_sign)):
+        raise ValueError(
+            f"tt_metric_sign must be finite; got {tt_metric_sign!r}")
+
+    geometry = _poisson_reciprocal_geometry(
+        tuple(int(s) for s in J_r.shape[-3:]),
+        bdot, bvec, blat, truncation_2d)
+    G2_safe, zero_mask, G_cart, _f2d = geometry
+    if G_cart is None:
+        raise ValueError(
+            "transverse current requires bvec and blat for its Cartesian "
+            "projector")
+
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import transverse_projector
+    J_G = local_fftn3(J_r, axes=(-3, -2, -1), norm='ortho')
+    projector = transverse_projector(
+        jnp.moveaxis(G_cart, 0, -1),
+        jnp.where(zero_mask, 0.0, G2_safe))
+    # Spell this as an elementwise reduction, not an einsum: a rank-2×rank-1
+    # contraction with a three-wide inner axis is not a GEMM and must not
+    # acquire a cuBLAS autotune/compile family on production FFT grids.
+    J_transverse_G = jnp.moveaxis(jnp.sum(
+        projector * jnp.moveaxis(J_G, 0, -1)[..., None, :], axis=-1),
+        -1, 0)
+    J_transverse_G = jnp.where(
+        (~zero_mask)[None, ...], J_transverse_G,
+        jnp.zeros_like(J_transverse_G))
+
+    sign = jnp.asarray(float(tt_metric_sign), dtype=jnp.float64)
+    return poisson_potential_from_rhoG(
+        sign * J_transverse_G, bdot, bvec, blat, truncation_2d,
+        _geometry=geometry)
 
 
 def _as_loader(wfn):

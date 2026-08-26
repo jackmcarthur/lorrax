@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """kin+ion computation: T + V_loc + V_NL (+ V_H) for all k → kin_ion.h5.
 
-**By default this writes TWO datasets** and never mixes them:
+**By default this writes separate direct-field datasets** and never mixes them:
 
 ``kin_ion``   (nk, nb, nb) — ``T + V_loc + V_NL``, **pristine**.
 ``v_hartree`` (nk, nb, nb) — the exact FFT-grid ⟨mk|V_H|nk⟩, Ry.
+``v_hartree_transverse`` — for kinetic-balance bispinors, the exact
+periodic ``<mk|sum_i alpha_i A_i[J/c]|nk>`` direct operator, Ry.
 
 Keeping them apart is what makes one file serve every consumer: the same
 ``kin_ion.h5`` feeds a run that wants the exact V_H (``hartree_source=
@@ -73,6 +75,7 @@ Usage:
 
 import argparse
 import os
+from typing import NamedTuple
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -164,7 +167,10 @@ _services.ensure_on_path()
 
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
-    HARTREE_DATASET, IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
+    HARTREE_DATASET, TRANSVERSE_HARTREE_DATASET,
+    TRANSVERSE_HARTREE_G0_DIAGNOSTIC, TRANSVERSE_HARTREE_G0_POLICY,
+    TRANSVERSE_HARTREE_PROJECTOR, TRANSVERSE_HARTREE_SYMMETRY,
+    IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
     K_STORAGE_IBZ, K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR,
     N_SYM_SPATIAL_ATTR, SYM_IDX_DATASET,
     broadcast_ibz_to_full_bz as _broadcast_ibz_slab,
@@ -711,6 +717,7 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
                                       mesh=None,
                                       psi_rotation=None,
                                       max_bands_per_item: int | None = None,
+                                      include_dirac_current: bool = False,
                                       print_fn=print) -> np.ndarray:
     """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
 
@@ -759,12 +766,23 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     every P ≤ nk.
 
     Returns the summed ρ(r) as a host array identical on every rank.
+    ``include_dirac_current=True`` returns ``(rho,Jx,Jy,Jz)`` from the
+    same WFN load and IFFT transaction.
     """
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
     nk = int(sym.nk_tot if nk is None else nk)
     nx, ny, nz = (int(s) for s in meta.fft_grid)
     rotated = psi_rotation is not None
+    include_current = bool(include_dirac_current)
+    if include_current and int(meta.nspinor) != 4:
+        raise ValueError(
+            "Dirac-current density requires meta.nspinor=4; got "
+            f"{int(meta.nspinor)}")
+    if include_current and rotated:
+        raise ValueError(
+            "evolving-orbital Dirac-current density is not implemented; "
+            "bispinor self-consistency must fail closed")
     # A supplied rotation couples the whole occupied band manifold.  It
     # deliberately retains the all-band item; making that path bounded needs
     # a distributed rotation, not silently applying independent band slices.
@@ -784,10 +802,13 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     mine = local_share(items)
     f_spin = spin_degeneracy_factor(wfn)
     wk = 1.0 / float(nk)
-    print_fn(f"    rho sweep: {len(items)} (k, band-chunk) items over "
+    print_fn(f"    rho{' + signed J/c' if include_current else ''} sweep: "
+             f"{len(items)} (k, band-chunk) items over "
              f"P={world} ranks; this rank has {len(mine)}"
              f"{'  [rotated ψ: k-partition only]' if rotated else ''}")
-    rho_local = jnp.zeros((nx, ny, nz), dtype=jnp.float64)
+    accumulator_shape = ((4, nx, ny, nz) if include_current
+                         else (nx, ny, nz))
+    rho_local = jnp.zeros(accumulator_shape, dtype=jnp.float64)
     for n_done, (ik, b_lo, b_hi) in enumerate(mine):
         if n_done % 32 == 0:
             print_fn(f"    rho: item {n_done + 1}/{len(mine)} "
@@ -808,6 +829,7 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
         rho_local = rho_local + valence_density_from_kpoint(
             psi_k, nocc=None, weight=wk,
             cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
+            include_dirac_current=include_current,
         )
         # The Python loop is otherwise an asynchronous dispatch queue.  At a
         # large FFT grid, queuing every local item can retain several completed
@@ -821,10 +843,22 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
         return psum_replicate(np.asarray(rho_local), mesh)
 
 
+class ExactHartreeMatrices(NamedTuple):
+    """Exact charge/current direct matrices from one occupied-WFN sweep."""
+
+    charge: object
+    transverse: object
+    current_g0_l2: float
+    current_l2: float
+    current_g0_relative: float
+    tt_metric_sign: float
+
+
 def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            nb: int, mesh=None,
                            psi_rotation=None,
                            band_chunk_size: int | None = None,
+                           include_transverse: bool = False,
                            print_fn=print,
                            owner_only: bool = False,
                            k_set: str = "full"):
@@ -890,6 +924,15 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     _, world = process_rank_world()
     nocc = int(wfn.nelec)
     nk = int(sym.nk_tot)
+    with_transverse = bool(include_transverse)
+    if with_transverse and int(meta.nspinor) != 4:
+        raise ValueError(
+            "transverse direct Hartree requires the canonical four-component "
+            f"kinetic-balance carrier; meta.nspinor={int(meta.nspinor)}")
+    if with_transverse and psi_rotation is not None:
+        raise ValueError(
+            "evolving-orbital transverse Hartree is not implemented; "
+            "bispinor self-consistency must fail closed")
     if nocc > nb:
         raise ValueError(
             f"V_H needs the {nocc} occupied bands but only {nb} were requested")
@@ -907,7 +950,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     if world > 1:
         with timing.section("vh_collective_bootstrap"):
             psum_replicate(
-                np.zeros(tuple(int(s) for s in meta.fft_grid),
+                np.zeros(((4, *tuple(int(s) for s in meta.fft_grid))
+                          if with_transverse
+                          else tuple(int(s) for s in meta.fft_grid)),
                          dtype=np.float64), mesh)
 
     print_fn(f"\nBuilding valence density from {nocc} occupied bands "
@@ -918,7 +963,40 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             wfn, sym, meta, nocc, nk=nk, mesh=mesh,
             psi_rotation=psi_rotation,
             max_bands_per_item=band_chunk_size,
+            include_dirac_current=with_transverse,
             print_fn=print_fn)
+
+    if with_transverse:
+        fields = np.asarray(rho_np, dtype=np.float64)
+        rho_np = fields[0]
+        current_np = fields[1:]
+        ngrid = int(np.prod(current_np.shape[-3:]))
+        current_g0 = np.sum(current_np, axis=(-3, -2, -1)) / np.sqrt(ngrid)
+        current_g0_l2 = float(np.linalg.norm(current_g0))
+        current_l2 = float(np.linalg.norm(current_np))
+        current_g0_relative = current_g0_l2 / max(
+            current_l2, np.finfo(np.float64).tiny)
+        print_fn(
+            "    Dirac-current G=0 diagnostic (J=j/c; gauged V_NL current "
+            "is absent): "
+            f"||J0||={current_g0_l2:.6e}, ||J||={current_l2:.6e}, "
+            f"ratio={current_g0_relative:.6e}; periodic TT sets G=0 to zero")
+        from vcoul import COULOMB_GAUGE_TT_SIGN
+        from psp.dft_operators import transverse_potential_from_current
+        tt_metric_sign = float(COULOMB_GAUGE_TT_SIGN)
+        with timing.section("vh_transverse_field"):
+            V_T_r = transverse_potential_from_current(
+                jnp.asarray(current_np, dtype=jnp.float64),
+                jnp.asarray(wfn.bdot, dtype=jnp.float64),
+                jnp.asarray(wfn.bvec, dtype=jnp.float64),
+                float(wfn.blat), bool(truncation_2d),
+                tt_metric_sign=tt_metric_sign)
+            V_T_r = jnp.asarray(np.asarray(V_T_r, dtype=np.float64),
+                                dtype=jnp.float64)
+        del fields, current_np, current_g0
+    else:
+        V_T_r = None
+        current_g0_l2 = current_l2 = current_g0_relative = 0.0
 
     # ---- 2. Poisson: REPLICATED BY DESIGN ------------------------------
     # Two 3-D FFTs on a 1.4 MB array: 3.1e7 flop against the sweep's
@@ -991,7 +1069,9 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     from common.wfn_layout import band_sphere_spec
     k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
     gtab = padded_gvectors(wfn, k=k_spec)
-    psi_G = wfn.load(bands=(0, nb), k=k_spec, sharding=band_sphere_spec())
+    psi_G = wfn.load(
+        bands=(0, nb), k=k_spec, sharding=band_sphere_spec(),
+        bispinor=(int(meta.nspinor) == 4))
     geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
                          ngkmax=int(psi_G.shape[3]), nb=nb,
                          ns=int(psi_G.shape[2]), nk=nk_irr,
@@ -1022,9 +1102,35 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         # CLI a broadcast it would immediately re-compress is the work this
         # change exists to delete.
         H_host = blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
-        if k_set == "ibz":
-            return H_host
-        return broadcast_ibz_to_full_bz(H_host, sym)
+    del H_vh
+    H_charge = (H_host if k_set == "ibz"
+                else broadcast_ibz_to_full_bz(H_host, sym))
+    if not with_transverse:
+        del psi_G
+        return H_charge
+
+    print_fn(
+        f"\n<m|sum_i alpha_i A_i|n>: same {nk_irr}-point STAR-WEDGE "
+        f"scan, {geom.nb} bands sharded over P={world}...")
+    with timing.section("vh_transverse_matrix"):
+        H_vt = sweep_matrix_elements(
+            psi_G,
+            operator=local_potential_operator(
+                geom, V_T_r, dirac_vector=True),
+            geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
+            box_index=wfn.box_index(k=k_spec), kvecs=gtab.kvecs)
+        H_t_host = blocks_to_host(H_vt, nb=nb, owner_only=owner_only)
+    del H_vt, psi_G, V_T_r
+    H_transverse = (H_t_host if k_set == "ibz"
+                    else broadcast_ibz_to_full_bz(H_t_host, sym))
+    return ExactHartreeMatrices(
+        charge=H_charge,
+        transverse=H_transverse,
+        current_g0_l2=current_g0_l2,
+        current_l2=current_l2,
+        current_g0_relative=current_g0_relative,
+        tt_metric_sign=tt_metric_sign,
+    )
 
 
 def main(argv=None):
@@ -1125,6 +1231,11 @@ def main(argv=None):
     ncond = int(params.get("ncond", 5))
     nband = int(params.get("nband", 100))
     bispinor = bool(params.get("bispinor", False))
+    if bispinor and args.fold_hartree and args.hartree:
+        raise SystemExit(
+            "--fold-hartree is legacy scalar-only storage and is refused "
+            "for kinetic-balance bispinors; write separate scalar and "
+            "transverse direct datasets instead.")
 
     # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
     # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the file below
@@ -1322,18 +1433,27 @@ def main(argv=None):
     # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
     # stays in the legacy layout (see ``store_ibz`` below).
     v_h_all = None
+    v_h_transverse_all = None
+    current_diagnostic = None
     if args.hartree:
         vh_progress = LoopProgress(
             1, report.progress, title="Hartree matrix construction",
             item_name="distributed band-matrix sweep")
         vh_progress.start()
         with timing.section("build_V_H"):
-            v_h_all = compute_hartree_matrix(
+            hartree_result = compute_hartree_matrix(
                 wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
                 mesh=mesh_xy,
                 band_chunk_size=int(params["band_chunk_size"]),
+                include_transverse=bispinor,
                 print_fn=print0, owner_only=True,
                 k_set=("ibz" if store_ibz else "full"))
+            if bispinor:
+                v_h_all = hartree_result.charge
+                v_h_transverse_all = hartree_result.transverse
+                current_diagnostic = hartree_result
+            else:
+                v_h_all = hartree_result
         vh_progress.step()
         vh_progress.finish()
 
@@ -1565,6 +1685,42 @@ def main(argv=None):
                     vh.attrs["truncation_2d"] = bool(ctx.truncation_2d)
                     vh.attrs["nocc"] = int(wfn.nelec)
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
+                    vh.attrs["matrix_nspinor"] = int(meta.nspinor)
+                if v_h_transverse_all is not None:
+                    vht = f.create_dataset(
+                        TRANSVERSE_HARTREE_DATASET,
+                        data=v_h_transverse_all, dtype=np.complex128)
+                    _stamp_k_storage(vht)
+                    vht.attrs["description"] = (
+                        "<mk|sum_i alpha_i A_i[J/c]|nk> (Ry), exact "
+                        "periodic Coulomb-gauge transverse direct Hartree")
+                    vht.attrs["truncation_2d"] = bool(ctx.truncation_2d)
+                    vht.attrs["nocc"] = int(wfn.nelec)
+                    vht.attrs["fft_grid"] = np.asarray(
+                        meta.fft_grid, dtype=np.int32)
+                    vht.attrs["matrix_nspinor"] = int(meta.nspinor)
+                    vht.attrs["source_wfn_nspinor"] = int(wfn.nspinor)
+                    from common.bispinor_init import (
+                        DIRAC_ALPHA_VERTEX_PROVENANCE,
+                        KINETIC_BALANCE_LIFT_PROVENANCE,
+                        NO_PAIR_DIRAC_CURRENT_MODEL,
+                    )
+                    vht.attrs["current_model"] = NO_PAIR_DIRAC_CURRENT_MODEL
+                    vht.attrs["bispinor_lift"] = KINETIC_BALANCE_LIFT_PROVENANCE
+                    vht.attrs["current_vertex"] = DIRAC_ALPHA_VERTEX_PROVENANCE
+                    vht.attrs["tt_metric_sign"] = float(
+                        current_diagnostic.tt_metric_sign)
+                    vht.attrs["tt_projector"] = TRANSVERSE_HARTREE_PROJECTOR
+                    vht.attrs["g0_policy"] = TRANSVERSE_HARTREE_G0_POLICY
+                    vht.attrs["g0_current_diagnostic_policy"] = (
+                        TRANSVERSE_HARTREE_G0_DIAGNOSTIC)
+                    vht.attrs["current_g0_l2"] = float(
+                        current_diagnostic.current_g0_l2)
+                    vht.attrs["current_l2"] = float(
+                        current_diagnostic.current_l2)
+                    vht.attrs["current_g0_relative"] = float(
+                        current_diagnostic.current_g0_relative)
+                    vht.attrs["symmetry_class"] = TRANSVERSE_HARTREE_SYMMETRY
 
     barrier("kin_ion_written")
     write_progress.step()

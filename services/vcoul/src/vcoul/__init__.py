@@ -102,6 +102,7 @@ from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (
     COULOMB_GAUGE_TT_SIGN,
+    transverse_projector,
     build_miniBZ_dq_cart,
     build_v_head_miniBZ_fn_3d,
     minibz_average,
@@ -137,6 +138,7 @@ __all__ = [
     "Bulk3D", "Slab2D", "Box0D",
     # mini-BZ sampling / averaging
     "COULOMB_GAUGE_TT_SIGN",
+    "transverse_projector",
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",

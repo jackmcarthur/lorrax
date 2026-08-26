@@ -86,6 +86,7 @@ import numpy as np
 
 __all__ = [
     "COULOMB_GAUGE_TT_SIGN",
+    "transverse_projector",
     "wrap_points_to_voronoi",
     "minibz_frac_to_cart",
     "minibz_cell_affine",
@@ -428,13 +429,24 @@ def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
     return v, len2
 
 
-def _transverse_projector(K_cart, len2, *, eps_K2: float = 1e-30):
-    """``I - Khat Khat`` on runtime Cartesian directions."""
-    K = np.asarray(K_cart, dtype=np.float64)
-    len2 = np.asarray(len2, dtype=np.float64)
-    len2_safe = np.where(len2 > eps_K2, len2, 1.0)
-    return (np.eye(3)[None, :, :]
-            - K[:, :, None] * K[:, None, :] / len2_safe[:, None, None])
+def transverse_projector(K_cart, len2, *, eps_K2: float = 1e-30):
+    """``I - Khat Khat`` on NumPy or JAX Cartesian directions.
+
+    This is the sole transverse-projector formula shared by finite-q photon
+    tiles, mini-BZ sampling, and the periodic direct-current Hartree solve.
+    The zero-direction row is the identity here; each physical consumer owns
+    its own singular-slot policy (periodic direct sets the entire G=0 field
+    to zero, whereas an exchange head may replace that slot explicitly).
+    """
+    use_jax = isinstance(K_cart, (jax.Array, jax.core.Tracer)) or isinstance(
+        len2, (jax.Array, jax.core.Tracer))
+    xp = jnp if use_jax else np
+    K = xp.asarray(K_cart, dtype=xp.float64)
+    len2 = xp.asarray(len2, dtype=xp.float64)
+    len2_safe = xp.where(len2 > eps_K2, len2, 1.0)
+    return (xp.eye(3)
+            - K[..., :, None] * K[..., None, :]
+            / len2_safe[..., None, None])
 
 
 def _analytic_sphere_bare_head(q0sph2, celvol, n_kpts) -> float:
@@ -568,7 +580,7 @@ def iter_minibz_photon_samples(
                 # the singular bare-kernel call and is therefore inert.
                 v, q2 = _minibz_kernel_bare(
                     np.zeros(3), q_valid, kind=kind, zc=zc)
-                transverse = _transverse_projector(q_valid, q2)
+                transverse = transverse_projector(q_valid, q2)
 
                 q_chunk = np.zeros((int(chunk_size), 3), dtype=np.float64)
                 D_chunk = np.zeros((int(chunk_size), 4, 4), dtype=np.float64)
@@ -826,7 +838,7 @@ def minibz_transverse_head_avg(
         v, len2 = _minibz_kernel_bare(shift, dq, kind=kind,
                                       alpha=alpha, zc=zc)
         K = shift[None, :] + dq                       # (N, 3) full momentum
-        t = _transverse_projector(K, len2, eps_K2=eps_K2)
+        t = transverse_projector(K, len2, eps_K2=eps_K2)
         if head_branch:
             outside = len2 > q0sph2
             w = np.where(outside, v, 0.0)
