@@ -1,34 +1,26 @@
-"""Truthful upstream producers for static long-wave photon response jets.
+"""Inputs for the bounded static charge-plus-Hall response.
 
 ``charge_hall_cubature`` is a deliberately restricted effective response:
-the incumbent authenticated scalar-density head/wings at omega=0 plus the
-separately authenticated Hall Chern--Simons jet.  Ordinary current response,
+the existing scalar-density head/wings at omega=0 plus the separately computed
+Hall Chern--Simons term.  Ordinary current response,
 contact and complement-space closure are omitted *by model*, never stored as
 accidental zeros and never promoted to ``full_static_gauge``.
 
 This module owns no WFN load, symmetry unfold, current, FFT, body-response or
-packing implementation.  It composes their public transactions and retains
+packing implementation.  It composes the existing routines and retains
 only O(N_mu) wing carriers.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import enum
-import hashlib
-import json
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from gw.photon_layout import (
-    PHOTON_BARE_PROPAGATOR,
-    PHOTON_BASIS_ORDERING,
-    PhotonBasisLayout,
-    pack_photon_channel_vectors,
-)
+from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
 
 
 class StaticGaugeResponseCapability(str, enum.Enum):
@@ -102,39 +94,7 @@ def _charge_hall_availability() -> StaticGaugeTermAvailability:
 
 
 CHARGE_HALL_CUBATURE_AVAILABILITY = _charge_hall_availability()
-CHARGE_HALL_Q_CART_UNITS = "bohr^-1"
-CHARGE_HALL_Q_POWERS = (0, 1, 2)
-CHARGE_HALL_SIGN_CONVENTION = (
-    "+i*epsilon[b,a,i]*sigma_H[b]*q[a]")
-CHARGE_HALL_NORMALIZATION_CONVENTION = (
-    "S_CC_includes_1/Omega;Y,Z_unscaled;"
-    "head_Schur_adds_Y*D_body*Z/Omega")
-CHARGE_HALL_CUBATURE_CONVENTION_ID = (
-    "lorrax.static_gauge_response/charge_hall_cubature_v1"
-    "|omega=0_static|energy=Rydberg|length=bohr"
-    f"|lorentz=(C,Jx,Jy,Jz)|q_cart={CHARGE_HALL_Q_CART_UNITS}"
-    "|Pi0=0|Pi1_CT=+i*epsilon[b,a,i]*sigma_H[b]"
-    "|Pi1_TC=Pi1_CT^dagger|S_q2=charge_CC_only"
-    "|ordinary_current_contact_complement=omitted_by_model"
-    f"|normalization={CHARGE_HALL_NORMALIZATION_CONVENTION}"
-    f"|packing={PHOTON_BASIS_ORDERING}|bare={PHOTON_BARE_PROPAGATOR}"
-)
-CHARGE_HALL_WING_DRESSING = (
-    "direct_irreducible_unfolded;single=D_head*Y*D_body;"
-    "double=Y*D_body*Z_in_head_Schur")
-_TRANSACTION_FINGERPRINT_SCHEME = (
-    "lorrax.static_gauge_response.transaction/v1")
-_CHARGE_FINGERPRINT_SCHEME = "lorrax.static_charge_head_response/v1"
-_HALL_FINGERPRINT_SCHEME = "lorrax.static_hall_response/v1"
 _PRODUCER_TOKEN = object()
-
-
-def _canonical_sha256(value, *, gate: str) -> str:
-    # Import lazily: downstream head completion may import the enum/carrier
-    # definitions from this module, so a module-level reverse import would be
-    # a circular dependency.
-    from gw.head_correction import require_canonical_operator_fingerprint
-    return require_canonical_operator_fingerprint(value, gate=gate)
 
 
 def _canonical_wfn_sha256(value) -> str:
@@ -142,52 +102,26 @@ def _canonical_wfn_sha256(value) -> str:
     if (len(value) != 64
             or any(c not in "0123456789abcdef" for c in value)):
         raise ValueError(
-            "canonical charge/Hall WFN fingerprint must be 64 lowercase hex")
+            "charge/Hall WFN identifier must be 64 lowercase hex")
     return value
-
-
-def _digest(payload: dict) -> str:
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=True).encode("ascii")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-
-def _layout_record(layout: PhotonBasisLayout) -> dict:
-    return {
-        "logical_extents": [int(n) for n in layout.logical_extents],
-        "padded_extents": [int(n) for n in layout.padded_extents],
-        "mesh_side": int(layout.mesh_side),
-        "ordering": str(layout.ordering),
-        "bare_propagator": str(layout.bare_propagator),
-    }
 
 
 @dataclass(frozen=True)
 class ChargeHallCubatureResponse:
-    """Sealed direct response usable only under the named truncated model."""
+    r"""Inputs for ``R(q)=q_a H_a(sigma_H)+q_a q_b S_ab``.
+
+    ``S_direct`` and the wings have charge support only.  The Hall tensor is
+    intentionally not stored: :func:`static_hall_linear_response` constructs
+    it from ``sigma_H`` at the numerical kernel that consumes it.
+    """
 
     capability: StaticGaugeResponseCapability
     availability: StaticGaugeTermAvailability
     layout: PhotonBasisLayout
-    Pi0_direct: jax.Array             # (4,4), replicated; exactly zero
-    Pi1_direct: jax.Array             # (2,4,4), replicated Hall CT/TC
     S_direct: jax.Array               # (2,2,4,4), replicated charge CC
     sigma_H: jax.Array                # (3,), replicated real bohr^-1
     Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
     Z_y: jax.Array                    # (2,Npacked,4), P(None,'y',None)
-    charge_response_fingerprint: str
-    hall_response_fingerprint: str
-    response_transaction_fingerprint: str
-    wfn_fingerprint: str
-    band_start: int
-    band_stop: int
-    convention_id: str
-    wing_dressing: str
-    q_cart_units: str
-    q_powers: tuple[int, int, int]
-    hall_sign_convention: str
-    normalization_convention: str
     ward_residual: float
     hermiticity_residual: float
     wing_reciprocity_residual: float
@@ -213,7 +147,7 @@ def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
 def require_charge_hall_cubature_response(
     response: ChargeHallCubatureResponse, mesh_xy: Mesh,
 ) -> ChargeHallCubatureResponse:
-    """Fail closed on capability, provenance, support, dtype and sharding."""
+    """Check the bounded model's support, dtype and sharding."""
     if not isinstance(response, ChargeHallCubatureResponse):
         raise TypeError(
             "charge_hall_cubature requires ChargeHallCubatureResponse; got "
@@ -222,29 +156,9 @@ def require_charge_hall_cubature_response(
         raise ValueError("charge/Hall producer cannot issue a FULL capability")
     response.availability.require_for(response.capability)
     response.layout.assert_mesh(mesh_xy)
-    for value, gate in (
-        (response.charge_response_fingerprint, "charge_response_fingerprint"),
-        (response.hall_response_fingerprint, "hall_response_fingerprint"),
-        (response.response_transaction_fingerprint,
-         "response_transaction_fingerprint"),
-    ):
-        _canonical_sha256(value, gate=gate)
-    _canonical_wfn_sha256(response.wfn_fingerprint)
-    if not (0 <= int(response.band_start) < int(response.band_stop)):
-        raise ValueError("charge/Hall response has an invalid band interval")
-    if (response.convention_id != CHARGE_HALL_CUBATURE_CONVENTION_ID
-            or response.wing_dressing != CHARGE_HALL_WING_DRESSING
-            or response.q_cart_units != CHARGE_HALL_Q_CART_UNITS
-            or tuple(response.q_powers) != CHARGE_HALL_Q_POWERS
-            or response.hall_sign_convention != CHARGE_HALL_SIGN_CONVENTION
-            or response.normalization_convention
-            != CHARGE_HALL_NORMALIZATION_CONVENTION):
-        raise ValueError("charge/Hall response convention record drifted")
 
     n_packed = int(response.layout.packed_extent)
     arrays = (
-        (response.Pi0_direct, "Pi0_direct", (4, 4), np.complex128, P()),
-        (response.Pi1_direct, "Pi1_direct", (2, 4, 4), np.complex128, P()),
         (response.S_direct, "S_direct", (2, 2, 4, 4), np.complex128, P()),
         (response.sigma_H, "sigma_H", (3,), np.float64, P()),
         (response.Y_x, "Y_x", (2, 4, n_packed), np.complex128,
@@ -260,19 +174,13 @@ def require_charge_hall_cubature_response(
         if not _same_mesh_sharding(array, mesh_xy, spec):
             raise ValueError(f"{name} must have production sharding {spec}")
 
-    pi0 = np.asarray(jax.device_get(response.Pi0_direct))
-    pi1 = np.asarray(jax.device_get(response.Pi1_direct))
     S = np.asarray(jax.device_get(response.S_direct))
     sigma = np.asarray(jax.device_get(response.sigma_H))
-    if not np.array_equal(pi0, np.zeros_like(pi0)):
-        raise ValueError("charge_hall_cubature Pi0 must be structurally zero")
+    if not np.all(np.isfinite(sigma)):
+        raise ValueError("charge_hall_cubature sigma_H is not finite")
     if np.any(S[:, :, 0, 1:] != 0.0) or np.any(S[:, :, 1:, :] != 0.0):
         raise ValueError("charge_hall_cubature S has non-charge support")
-    from gw.head_correction import (
-        static_gauge_tensor_residuals, static_hall_linear_response)
-    expected_pi1 = np.asarray(static_hall_linear_response(sigma))
-    if not np.array_equal(pi1, expected_pi1):
-        raise ValueError("Pi1 is not the canonical Hall CT/TC tensor")
+    from gw.head_correction import static_gauge_tensor_residuals
     structural_ward, structural_hermiticity = (
         static_gauge_tensor_residuals(S))
     residuals = np.asarray((
@@ -314,32 +222,27 @@ def build_charge_hall_cubature_response(
     hall_transaction,
     wfn_fingerprint_binding=None,
 ) -> ChargeHallCubatureResponse:
-    r"""Compose authenticated charge CC and Hall CT/TC response at omega=0.
+    r"""Compose charge CC and Hall CT/TC response at omega=0.
 
     The scalar response is evaluated once by
     :func:`gw.qsgw_head.build_dft_head_response`.  Its two in-plane velocity
     rows become the qx/qy derivatives of the charge head and charge-only
     wings.  Three exact-zero transverse vectors are passed to the canonical
-    packer; no current wing is inferred.  The Hall transaction must be the
-    sealed full-BZ result of :func:`gw.qsgw_head.static_gauge_hall_transaction`.
+    packer; no current wing is inferred.  The Hall input must be the full-BZ
+    result of :func:`gw.qsgw_head.static_gauge_hall_transaction`.
     """
     from common.parallel_transport import (
         fingerprint_from_binding, wfn_fingerprint)
-    from gw.head_correction import (
-        static_gauge_tensor_residuals, static_hall_linear_response)
+    from gw.head_correction import static_gauge_tensor_residuals
     from gw.qsgw_head import (
         StaticGaugeHallTransaction, build_dft_head_response)
-    from psp.get_dipole_mtxels import (
-        authenticated_dipole_operator_fingerprint,
-        resolve_vnl_velocity_sign,
-    )
 
     if not isinstance(layout, PhotonBasisLayout):
         raise TypeError("charge/Hall response requires PhotonBasisLayout")
     layout.assert_mesh(mesh)
     if not isinstance(hall_transaction, StaticGaugeHallTransaction):
         raise TypeError(
-            "charge/Hall response requires the sealed full-BZ Hall transaction")
+            "charge/Hall response requires the full-BZ Hall transaction")
 
     wfn_fp = _canonical_wfn_sha256(
         wfn_fingerprint(wfn)
@@ -354,10 +257,6 @@ def build_charge_hall_cubature_response(
             f"{hall_transaction.band_stop})")
     if _canonical_wfn_sha256(hall_transaction.wfn_fingerprint) != wfn_fp:
         raise ValueError("charge and Hall responses use different WFN identities")
-    hall_operator_fp = _canonical_sha256(
-        hall_transaction.hamiltonian_config_operator_fingerprint,
-        gate="hall_operator_fingerprint")
-
     direct = build_dft_head_response(
         wfns, (0.0 + 0.0j,), input_dir=input_dir, mesh=mesh,
         wfn=wfn, meta=meta, config=config,
@@ -395,11 +294,6 @@ def build_charge_hall_cubature_response(
     if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
         raise ValueError("Hall transaction has an invalid sigma_H")
     sigma_H = _replicated(sigma_host, mesh, dtype=np.float64)
-    Pi0_direct = _replicated(np.zeros((4, 4)), mesh, dtype=np.complex128)
-    Pi1_direct = _replicated(
-        np.asarray(static_hall_linear_response(sigma_host)), mesh,
-        dtype=np.complex128)
-
     # At static imaginary frequency the Adler--Wiser weight is real, hence
     # the two incumbent wing orientations obey Z[b,mu]=conj(Y[b,mu]).  Move
     # only this O(N_mu) vector to Y sharding for a scalar certificate.
@@ -413,69 +307,11 @@ def build_charge_hall_cubature_response(
         np.asarray(jax.device_get(wing_delta / wing_scale)))
     ward, hermiticity = static_gauge_tensor_residuals(S_direct)
 
-    dipole_path = str(Path(input_dir) / "dipole.h5")
-    vnl_sign = resolve_vnl_velocity_sign(None, config.vnl_velocity_sign)
-    dipole_fp = authenticated_dipole_operator_fingerprint(
-        dipole_path, wfn=wfn, nval=int(config.nval),
-        ncond=int(config.ncond), nband=int(config.nband),
-        bispinor=bool(int(meta.nspinor) == 4), skip_vnl=False,
-        vnl_mode="analytic", vnl_velocity_sign=vnl_sign,
-        wfn_fingerprint_binding=wfn_fingerprint_binding)
-    charge_fp = _digest({
-        "scheme": _CHARGE_FINGERPRINT_SCHEME,
-        "dipole_operator_fingerprint": dipole_fp,
-        "wfn_fingerprint": wfn_fp,
-        "bands": [start, stop],
-        "omega_ry": "0x0.0p+0",
-        "eta_ry": float(config.head.wcoul0_eta).hex(),
-        "normalization_nspin": int(wfn.nspin),
-        "normalization_nspinor_wfn": int(meta.nspinor_wfnfile),
-        "cell_volume_bohr3": float(meta.cell_volume).hex(),
-        "layout": _layout_record(layout),
-    })
-    hall_fp = _digest({
-        "scheme": _HALL_FINGERPRINT_SCHEME,
-        "producer_id": str(hall_transaction.producer_id),
-        "operator_fingerprint": hall_operator_fp,
-        "wfn_fingerprint": wfn_fp,
-        "bands": [start, stop],
-        "nk_tot": int(hall_transaction.nk_tot),
-        "sigma_H_raw_bohr^-1": [float(value).hex() for value in sigma_host],
-    })
     availability = CHARGE_HALL_CUBATURE_AVAILABILITY
-    transaction_payload = {
-        "scheme": _TRANSACTION_FINGERPRINT_SCHEME,
-        "capability": StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE.value,
-        "convention_id": CHARGE_HALL_CUBATURE_CONVENTION_ID,
-        "charge_response_fingerprint": charge_fp,
-        "hall_response_fingerprint": hall_fp,
-        "wfn_fingerprint": wfn_fp,
-        "bands": [start, stop],
-        "layout": _layout_record(layout),
-        "q_cart_units": CHARGE_HALL_Q_CART_UNITS,
-        "q_powers": {"Pi0_direct": 0, "Pi1_direct": 1, "S_direct": 2,
-                     "Y_x": 1, "Z_y": 1},
-        "hall_sign": CHARGE_HALL_SIGN_CONVENTION,
-        "normalization": CHARGE_HALL_NORMALIZATION_CONVENTION,
-        "availability": availability.as_tokens(),
-        "wing_dressing": CHARGE_HALL_WING_DRESSING,
-    }
     response = ChargeHallCubatureResponse(
         capability=StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE,
         availability=availability, layout=layout,
-        Pi0_direct=Pi0_direct, Pi1_direct=Pi1_direct,
         S_direct=S_direct, sigma_H=sigma_H, Y_x=Y_x, Z_y=Z_y,
-        charge_response_fingerprint=charge_fp,
-        hall_response_fingerprint=hall_fp,
-        response_transaction_fingerprint=_digest(transaction_payload),
-        wfn_fingerprint=wfn_fp,
-        band_start=start, band_stop=stop,
-        convention_id=CHARGE_HALL_CUBATURE_CONVENTION_ID,
-        wing_dressing=CHARGE_HALL_WING_DRESSING,
-        q_cart_units=CHARGE_HALL_Q_CART_UNITS,
-        q_powers=CHARGE_HALL_Q_POWERS,
-        hall_sign_convention=CHARGE_HALL_SIGN_CONVENTION,
-        normalization_convention=CHARGE_HALL_NORMALIZATION_CONVENTION,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),
         wing_reciprocity_residual=wing_reciprocity,
         _producer_token=_PRODUCER_TOKEN,
@@ -492,12 +328,6 @@ def require_full_static_gauge_availability(
 
 __all__ = [
     "CHARGE_HALL_CUBATURE_AVAILABILITY",
-    "CHARGE_HALL_CUBATURE_CONVENTION_ID",
-    "CHARGE_HALL_NORMALIZATION_CONVENTION",
-    "CHARGE_HALL_Q_CART_UNITS",
-    "CHARGE_HALL_Q_POWERS",
-    "CHARGE_HALL_SIGN_CONVENTION",
-    "CHARGE_HALL_WING_DRESSING",
     "ChargeHallCubatureResponse",
     "StaticGaugeResponseCapability",
     "StaticGaugeTermAvailability",

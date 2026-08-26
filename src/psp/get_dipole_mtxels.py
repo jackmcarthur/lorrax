@@ -14,8 +14,6 @@ initializes QE-style projectors so downstream development can fill it in.
 import os
 import argparse
 import functools
-import hashlib
-import json
 import time
 from pathlib import Path
 
@@ -463,8 +461,6 @@ def compute_finite_q_mtxels(
 # ``common.parallel_transport.wfn_fingerprint`` for the exact coverage bound.
 
 _DIPOLE_Q0_OPERATOR_SCHEME = "lorrax.dipole_q0.exact_reduced_origin/v1"
-DIPOLE_OPERATOR_PROVENANCE_FINGERPRINT_SCHEME = (
-    "lorrax.dipole_operator_provenance/v1")
 
 _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nval", "prov_ncond", "prov_nband",
@@ -738,72 +734,6 @@ def check_dipole_provenance(
            if vnl_velocity_sign is not None else "")
         + ")")
     return True
-
-
-def authenticated_dipole_operator_fingerprint(
-    path, *, wfn, nval, ncond, nband,
-    bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
-    wfn_fingerprint_binding=None,
-    print_fn=print,
-) -> str:
-    """Fingerprint the exact provenance already authenticated by this owner.
-
-    This is a lineage fingerprint, not a second checksum of the body-sized
-    matrix.  It hashes the canonical dipole provenance stamps plus the two
-    payload shapes/dtypes after :func:`check_dipole_provenance` has matched
-    them to the selected WFN/window/operator.  The path stamp is deliberately
-    excluded: moving one immutable artifact must not change its identity.
-    """
-    if not check_dipole_provenance(
-            path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-            bispinor=bispinor, skip_vnl=skip_vnl, vnl_mode=vnl_mode,
-            vnl_velocity_sign=vnl_velocity_sign,
-            wfn_fingerprint_binding=wfn_fingerprint_binding,
-            print_fn=print_fn):
-        raise ValueError(
-            "GATE dipole_operator_fingerprint: dipole provenance did not "
-            "authenticate the selected WFN/window/operator")
-
-    required = tuple(name for name in _PROV_ATTRS if name != "prov_wfn_file")
-    with h5py.File(str(path), "r") as h5:
-        missing = [name for name in required if name not in h5.attrs]
-        missing += [name for name in ("dipole_cart", "deltaE") if name not in h5]
-        if missing:
-            raise ValueError(
-                "GATE dipole_operator_fingerprint: canonical dipole artifact "
-                f"is missing {missing}")
-
-        def _scalar(value):
-            value = np.asarray(value)
-            if value.ndim != 0:
-                raise ValueError(
-                    "dipole provenance fingerprint accepts scalar attrs only")
-            value = value.item()
-            if isinstance(value, bytes):
-                return value.decode("utf-8")
-            if isinstance(value, (np.bool_, bool)):
-                return bool(value)
-            if isinstance(value, (np.integer, int)):
-                return int(value)
-            if isinstance(value, (np.floating, float)):
-                return float(value)
-            return str(value)
-
-        payload = {
-            "scheme": DIPOLE_OPERATOR_PROVENANCE_FINGERPRINT_SCHEME,
-            "attrs": {name: _scalar(h5.attrs[name]) for name in required},
-            "datasets": {
-                name: {
-                    "shape": [int(n) for n in h5[name].shape],
-                    "dtype": np.dtype(h5[name].dtype).str,
-                }
-                for name in ("dipole_cart", "deltaE")
-            },
-        }
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=True).encode("ascii")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _prov_ne(got, expected) -> bool:

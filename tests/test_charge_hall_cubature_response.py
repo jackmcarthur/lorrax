@@ -1,4 +1,4 @@
-"""Focused algebra/provenance gate for the truncated charge+Hall producer."""
+"""Focused algebra gate for the truncated charge+Hall producer."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -8,7 +8,6 @@ from types import SimpleNamespace
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-import h5py
 import jax
 import numpy as np
 import pytest
@@ -16,8 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import common.parallel_transport as parallel_transport
 import gw.qsgw_head as qsgw_head
-import gw.static_gauge_response as response_module
-import psp.get_dipole_mtxels as dipole_module
+from gw.head_correction import static_hall_linear_response
 from gw.photon_layout import PhotonBasisLayout
 from gw.static_gauge_response import (
     CHARGE_HALL_CUBATURE_AVAILABILITY,
@@ -38,13 +36,11 @@ def _placed(value, mesh, spec):
     return jax.device_put(np.asarray(value), NamedSharding(mesh, spec))
 
 
-def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
+def test_charge_hall_builder_has_only_declared_support(
         monkeypatch):
     mesh = _mesh()
     layout = PhotonBasisLayout.from_centroid_extents(3, 2, mesh)
     wfn_sha = "1" * 64
-    operator_sha = "sha256:" + "3" * 64
-    dipole_sha = "sha256:" + "4" * 64
 
     S = np.asarray([[[2.0, 0.25, 0.0],
                      [0.25, 1.0, 0.0],
@@ -65,12 +61,6 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
                         lambda *args, **kwargs: direct)
     monkeypatch.setattr(parallel_transport, "wfn_fingerprint",
                         lambda _wfn: wfn_sha)
-    monkeypatch.setattr(
-        dipole_module, "authenticated_dipole_operator_fingerprint",
-        lambda *args, **kwargs: dipole_sha)
-    monkeypatch.setattr(
-        dipole_module, "resolve_vnl_velocity_sign",
-        lambda *args, **kwargs: 1.0)
 
     class Hall:
         pass
@@ -78,7 +68,6 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
     monkeypatch.setattr(qsgw_head, "StaticGaugeHallTransaction", Hall)
     hall = Hall()
     hall.sigma_H = _placed([0.0, 0.0, -2.0], mesh, P())
-    hall.hamiltonian_config_operator_fingerprint = operator_sha
     hall.wfn_fingerprint = wfn_sha
     hall.band_start, hall.band_stop = 0, 2
     hall.nk_tot = 6
@@ -95,18 +84,15 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
         input_dir="/bounded/not-read", mesh=mesh, wfn=wfn, meta=meta,
         config=config, layout=layout, hall_transaction=hall)
     response = build_charge_hall_cubature_response(object(), **kwargs)
-    repeated = build_charge_hall_cubature_response(object(), **kwargs)
 
     assert response.capability is (
         StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE)
     assert response.availability == CHARGE_HALL_CUBATURE_AVAILABILITY
-    assert response.response_transaction_fingerprint == (
-        repeated.response_transaction_fingerprint)
     assert response.ward_residual == 0.0
     assert response.hermiticity_residual == 0.0
     assert response.wing_reciprocity_residual == 0.0
 
-    pi1 = np.asarray(response.Pi1_direct)
+    pi1 = np.asarray(static_hall_linear_response(response.sigma_H))
     np.testing.assert_array_equal(pi1[:, 0, 0], np.zeros(2))
     np.testing.assert_array_equal(pi1[:, 1:, 1:], np.zeros((2, 3, 3)))
     np.testing.assert_array_equal(pi1[:, 1:, 0], np.conj(pi1[:, 0, 1:]))
@@ -127,54 +113,9 @@ def test_charge_hall_builder_has_only_declared_support_and_stable_identity(
     np.testing.assert_array_equal(packed_z[:, :, 1:], 0.0)
     np.testing.assert_array_equal(packed_z[:, 3:, 0], 0.0)
 
-    hall.sigma_H = _placed([0.0, 0.0, -2.5], mesh, P())
-    changed = build_charge_hall_cubature_response(object(), **kwargs)
-    assert changed.hall_response_fingerprint != response.hall_response_fingerprint
-    assert changed.response_transaction_fingerprint != (
-        response.response_transaction_fingerprint)
-
     with pytest.raises(ValueError, match="availability"):
         require_full_static_gauge_availability(response.availability)
     unavailable_charge = replace(
         response.availability, cc_q2=StaticGaugeTermStatus.UNAVAILABLE)
     assert not unavailable_charge.is_complete_for(
         StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE)
-
-
-def test_dipole_operator_fingerprint_is_canonical_and_fail_closed(
-        tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        dipole_module, "check_dipole_provenance",
-        lambda *args, **kwargs: True)
-    path = tmp_path / "dipole.h5"
-    attrs = {
-        "prov_wfn_sha256": "5" * 64,
-        "prov_wfn_fingerprint_scheme": "lorrax.wfn_fingerprint/v1",
-        "prov_nval": 1,
-        "prov_ncond": 2,
-        "prov_nband": 3,
-        "prov_nb_written": 3,
-        "prov_bispinor": True,
-        "prov_skip_vnl": False,
-        "prov_vnl_mode": "analytic",
-        "prov_vnl_velocity_sign": 1.0,
-        "prov_q0_operator_scheme": "lorrax.dipole_q0.exact_reduced_origin/v1",
-    }
-    with h5py.File(path, "w") as h5:
-        for name, value in attrs.items():
-            h5.attrs[name] = value
-        h5.create_dataset("dipole_cart", shape=(3, 2, 3, 3),
-                          dtype=np.complex128)
-        h5.create_dataset("deltaE", shape=(2, 3, 3), dtype=np.float64)
-    kwargs = dict(wfn=object(), nval=1, ncond=2, nband=3)
-    first = dipole_module.authenticated_dipole_operator_fingerprint(
-        path, **kwargs)
-    second = dipole_module.authenticated_dipole_operator_fingerprint(
-        path, **kwargs)
-    assert first == second
-    assert first.startswith("sha256:") and len(first) == 71
-
-    with h5py.File(path, "a") as h5:
-        del h5.attrs["prov_nb_written"]
-    with pytest.raises(ValueError, match="missing"):
-        dipole_module.authenticated_dipole_operator_fingerprint(path, **kwargs)

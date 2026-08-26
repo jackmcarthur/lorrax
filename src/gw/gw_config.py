@@ -296,6 +296,7 @@ class BispinorGWMode(str, enum.Enum):
 
     BARE_TRANSVERSE = "bare_transverse"
     FULL_STATIC_COHSEX = "full_static_cohsex"
+    CHARGE_HALL_CUBATURE = "charge_hall_cubature"
 
 
 def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
@@ -1421,6 +1422,7 @@ _DEFAULTS = {
     # p-matrix velocity stage only, without the links.
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
+    "static_gauge_hall_file": "static_gauge_hall.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -3193,6 +3195,7 @@ class FilePaths:
     centroids_file_current: str | None
     kin_ion_file: str
     parallel_transport_file: str
+    static_gauge_hall_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -3492,27 +3495,24 @@ def refuse_unsupported_low_mem_bands(config) -> None:
             f"low_mem_bands.")
 
 
-def uses_coupled_photon_head(config) -> bool:
-    """Whether this config needs full-BZ four-channel Gamma vectors."""
-    return (
-        coerce_bispinor_gw_mode(getattr(
-            config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-        is BispinorGWMode.FULL_STATIC_COHSEX
-        and config.head.correction is HeadCorrection.FULL
+def uses_static_photon_response(config) -> bool:
+    """Whether screening and Sigma use the packed 4x4 photon response."""
+    mode = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    return mode in (
+        BispinorGWMode.FULL_STATIC_COHSEX,
+        BispinorGWMode.CHARGE_HALL_CUBATURE,
     )
 
 
-def refuse_unsupported_bispinor_gw(config) -> None:
-    """Validate the deliberately narrow first full-photon calculation.
+def uses_coupled_photon_head(config) -> bool:
+    """Whether the packed photon response needs literal-Gamma vectors."""
+    return (uses_static_photon_response(config)
+            and config.head.correction is HeadCorrection.FULL)
 
-    The default ``bare_transverse`` returns before resolving any unrelated
-    axis.  The enabled extension remains an explicitly experimental one-shot
-    insulating full-BZ static COHSEX calculation through the distributed
-    Dyson service when ``head_correction=off``.  Production ``full`` refuses
-    until the preprocessing/runtime contract can load a versioned
-    ``StaticGaugeHeadResponse`` with a current-equivalent operator, exact
-    same-Hamiltonian contact, and separately sourced Hall term.
-    """
+
+def refuse_unsupported_bispinor_gw(config) -> None:
+    """Validate the narrow one-shot static packed-photon modes."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if bool(config.bispinor) and (
@@ -3538,7 +3538,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"{mode.value} requires bispinor = true.  This axis selects "
             "four-current screening; it does not turn four-spinor "
             "wavefunctions on implicitly.")
-    if config.head.correction is HeadCorrection.FULL:
+    if (mode is BispinorGWMode.FULL_STATIC_COHSEX
+            and config.head.correction is HeadCorrection.FULL):
         raise ValueError(
             "GATE full_static_bispinor_gauge_head_unavailable: production "
             "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
@@ -3552,6 +3553,10 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "and its loader, or set head_correction = off for the explicitly "
             "experimental no-pair finite-body calculation\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
+    required_head = (
+        HeadCorrection.FULL
+        if mode is BispinorGWMode.CHARGE_HALL_CUBATURE
+        else HeadCorrection.OFF)
     requirements = (
         (config.compute_mode is ComputeMode.COHSEX,
          f"compute_mode = {config.compute_mode.value}",
@@ -3559,9 +3564,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
-        (config.head.correction is HeadCorrection.OFF,
+        (config.head.correction is required_head,
          f"head_correction = {config.head.correction.value}",
-         "head_correction = off"),
+         f"head_correction = {required_head.value}"),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
@@ -3569,6 +3574,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
+        (mode is BispinorGWMode.FULL_STATIC_COHSEX
+         or int(config.sys_dim) == 2,
+         f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
         (bool(config.memory.low_mem_bands), "low_mem_bands = false",
          "low_mem_bands = true"),
         (str(config.backend.w_dyson_solver) == "distributed",
@@ -3618,15 +3626,15 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         if accepted:
             continue
         raise ValueError(
-            "GATE full_static_bispinor_envelope: "
-            f"bispinor_gw = full_static_cohsex is refused with {got}.\n"
+            "GATE static_bispinor_photon_envelope: "
+            f"bispinor_gw = {mode.value} is refused with {got}.\n"
             f"  got:  {got}\n"
             f"  want: {want}\n"
-            "  why:  the first full-photon mode is an explicitly "
-            "experimental, full-BZ, one-shot insulating static calculation. "
-            "Its singular-cell completion is refused until the versioned "
-            "gauge-response artifact is available.  Photon restart storage, "
-            "bulk coupled heads, "
+            "  why:  the packed-photon modes are deliberately narrow "
+            "full-BZ, one-shot insulating static calculations. "
+            "The charge_hall_cubature mode includes only the explicitly "
+            "declared charge CC and Hall CT/TC long-wave terms. Photon "
+            "restart storage, bulk coupled heads, "
             "self-consistency, and dynamic photon models are not silently "
             "approximated here.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
@@ -4990,6 +4998,7 @@ class LorraxConfig:
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
             parallel_transport_file=str(_g("parallel_transport_file")),
+            static_gauge_hall_file=str(_g("static_gauge_hall_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),

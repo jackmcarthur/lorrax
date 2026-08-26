@@ -98,8 +98,9 @@ from common import Meta, RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 from .gw_config import (
-	BispinorGWMode, HeadCorrection, LorraxConfig, QPSolver,
-	ScreeningDiagrams, refuse_unimplemented_compute_mode)
+	HeadCorrection, LorraxConfig, QPSolver,
+	ScreeningDiagrams, refuse_unimplemented_compute_mode,
+	uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -299,11 +300,17 @@ def main(argv=None):
 			HeadCorrection.OFF: "no special Gamma-cell contribution",
 		}[config.head.correction]))
 	if config.bispinor:
+		_bispinor_note = {
+			"full_static_cohsex": (
+				" (experimental no-pair packed 4x4 static response; "
+				"head_correction=off)"),
+			"charge_hall_cubature": (
+				" (experimental no-pair packed 4x4 body plus charge/Hall "
+				"slab cubature; not FULL)"),
+		}.get(config.bispinor_gw.value, "")
 		print0(
-			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}" +
-				(" (experimental no-pair full four-current static RPA, "
-				 "coupled slab head/wings when head_correction=full)"
-				 if config.bispinor_gw.value == "full_static_cohsex" else ""))
+			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
+			f"{_bispinor_note}")
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -544,6 +551,7 @@ def main(argv=None):
 	if (do_screened
 			and config.head.correction is HeadCorrection.FULL
 			and config.screening.diagrams is ScreeningDiagrams.W_RPA
+			and not uses_static_photon_response(config)
 			# Every self-consistent mode builds its exact frequency plan and
 			# response inside the map.  A pre-map response would exist only to
 			# seed a restart artifact and could be mistaken for final physics.
@@ -577,25 +585,30 @@ def main(argv=None):
 	else:
 		with timing.section("gw_jax.screening", announce=True,
 		                    label="screening (chi0 -> W)"):
-			if config.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
+			if uses_static_photon_response(config):
 				if wfns_transverse is None or bispinor_v_q_path is None:
 					raise RuntimeError(
-						"full_static_cohsex requires the transverse wavefunction "
+						"static packed-photon screening requires the transverse "
+						"wavefunction "
 						"bundle and v_q_bispinor.h5; refusing a charge-only W.")
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
 					wfns, wfns_transverse, quad, bispinor_v_q_path,
 					meta, mesh_xy,
 					wfn=wfn, config=config,
+					photon_g0_vectors=isdf.photon_g0_vectors,
+					wf_binding_charge=isdf.wf_binding_charge,
+					wf_binding_transverse=isdf.wf_binding_transverse,
+					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 					energy_reference=e_ref,
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
 						config.backend.distrib_la_batched_route))
-				# Full Sigma consumes packed block views directly.  Do not extract a
+				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
 				W_by_role = {}
 				print0(
-					"  full photon response: "
+					"  static photon response: "
 					f"approximation={photon_response.approximation}, "
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
@@ -613,7 +626,7 @@ def main(argv=None):
 					print_fn=print0)
 
 	if (oneshot_head_response is not None
-			and config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX):
+			and not uses_static_photon_response(config)):
 		if mode.value == "mpa":
 			final_head = W_by_role.get("iteration_head")
 			if final_head is None:
@@ -646,7 +659,7 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if (config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX
+	if (not uses_static_photon_response(config)
 			and driver_persists_w0(mode, config)
 			and qp_solver is not QPSolver.SELF_CONSISTENT):
 		with timing.section("gw_jax.persist_w0"):
@@ -667,7 +680,7 @@ def main(argv=None):
 	# correlation), so only the X-head survives — which is the piece needed.
 	static_head_terms = None
 	if (config.do_G0
-			and config.bispinor_gw is not BispinorGWMode.FULL_STATIC_COHSEX):
+			and not uses_static_photon_response(config)):
 		# A screened SC+FULL map always builds/folds its own head.  Supplying
 		# and printing a direct DFT seed here would be false provenance even
 		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
