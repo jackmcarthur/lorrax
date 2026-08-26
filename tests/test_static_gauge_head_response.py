@@ -15,7 +15,9 @@ from gw.gw_config import (
 )
 from gw.head_correction import (
     StaticGaugeHeadResponse,
+    _reduce_static_photon_order_diagnostics,
     _require_static_photon_numerical_certificate,
+    _static_photon_mixed_error_ratio,
     complete_static_slab_photon_q0,
     require_static_gauge_head_response,
     static_gauge_tensor_residuals,
@@ -109,7 +111,8 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
 
     weight = np.asarray((1.0, 1.0, 0.0), dtype=np.float64)
     (moments, D_sum, count, residual, sigma_min,
-     condition_max, conditioned_error) = static_slab_photon_head_moment_chunk(
+     condition_max,
+     conditioned_backward) = static_slab_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
 
     H = np.asarray(static_hall_linear_response(sigma))
@@ -127,7 +130,8 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     assert float(np.asarray(residual)) < 1.0e-14
     assert float(np.asarray(sigma_min)) > 0.0
     assert float(np.asarray(condition_max)) >= 1.0
-    assert float(np.asarray(conditioned_error)) >= np.finfo(np.float64).eps
+    assert (float(np.asarray(conditioned_backward))
+            >= np.finfo(np.float64).eps)
 
 
 def test_static_head_moment_applies_deterministic_cubature_weights():
@@ -143,7 +147,8 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
     weight = np.asarray((0.23, 0.77, 0.0), dtype=np.float64)
 
     (moments, D_sum, count, residual, sigma_min,
-     condition_max, conditioned_error) = static_slab_photon_head_moment_chunk(
+     condition_max,
+     conditioned_backward) = static_slab_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
     H = np.asarray(static_hall_linear_response(sigma))
     R = (
@@ -173,21 +178,58 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
         np.linalg.norm(lhs, axis=(-2, -1))
         * np.linalg.norm(W, axis=(-2, -1))
         + np.linalg.norm(D[:2], axis=(-2, -1)))
-    expected_bound = np.max(
+    expected_theta = np.max(
         condition_fro * np.maximum(backward, np.finfo(np.float64).eps))
     np.testing.assert_allclose(
-        np.asarray(conditioned_error), expected_bound, rtol=2e-14)
+        np.asarray(conditioned_backward), expected_theta, rtol=2e-14)
 
 
-def test_static_head_numerical_certificate_conditions_backward_error():
+def test_static_head_numerical_certificate_gates_transformed_forward_bound():
     finite = np.zeros((4, 4), dtype=np.complex128)
-    with pytest.raises(ValueError, match=r"kappa\*max\(backward_error,eps\)"):
+    theta = 0.75e-9
+    with pytest.raises(ValueError, match=r"2\*theta/\(1-theta\)"):
         _require_static_photon_numerical_certificate(
             finite, finite,
             max_backward=2.0e-12,
-            min_sigma=1.0e-6,
-            max_condition=1.0e6,
-            max_conditioned_error=2.0e-6,
+            min_sigma=1.0,
+            max_condition=1.0,
+            # Raw theta is below 1e-9; the rigorous bound is above it.
+            max_conditioned_backward=theta,
+            mixed_error_ratios=(0.2, 0.3))
+    passing_theta = 0.25e-9
+    bound = _require_static_photon_numerical_certificate(
+        finite, finite,
+        max_backward=2.0e-12,
+        min_sigma=1.0,
+        max_condition=1.0,
+        max_conditioned_backward=passing_theta,
+        mixed_error_ratios=(0.2, 0.3))
+    assert bound == pytest.approx(
+        2.0 * passing_theta / (1.0 - passing_theta))
+
+
+def test_static_head_numerical_certificate_refuses_bound_denominator():
+    finite = np.zeros((4, 4), dtype=np.complex128)
+    with pytest.raises(
+            ValueError, match="forward_bound_denominator.*theta < 1"):
+        _require_static_photon_numerical_certificate(
+            finite, finite,
+            max_backward=1.0e-16,
+            min_sigma=1.0,
+            max_condition=1.0,
+            max_conditioned_backward=1.0,
+            mixed_error_ratios=(0.2, 0.3))
+
+
+def test_static_head_numerical_certificate_refuses_nonfinite_theta():
+    finite = np.zeros((4, 4), dtype=np.complex128)
+    with pytest.raises(ValueError, match="static_photon_dyson_nonfinite"):
+        _require_static_photon_numerical_certificate(
+            finite, finite,
+            max_backward=1.0e-16,
+            min_sigma=1.0,
+            max_condition=1.0,
+            max_conditioned_backward=np.nan,
             mixed_error_ratios=(0.2, 0.3))
 
 
@@ -199,8 +241,31 @@ def test_static_head_numerical_certificate_refuses_nonfinite_convergence():
             max_backward=1.0e-16,
             min_sigma=1.0,
             max_condition=1.0,
-            max_conditioned_error=np.finfo(np.float64).eps,
+            max_conditioned_backward=np.finfo(np.float64).eps,
             mixed_error_ratios=(0.2, np.nan))
+
+
+def test_static_head_mixed_error_refuses_nonfinite_nonfirst_block():
+    finite = np.eye(4, dtype=np.complex128)
+    nonfinite = finite.copy()
+    nonfinite[0, 0] = np.nan
+    with pytest.raises(ValueError, match="static_photon_polygon_nonfinite"):
+        _static_photon_mixed_error_ratio(
+            (finite, finite), (finite, nonfinite))
+
+
+@pytest.mark.parametrize("diagnostic_index", range(4))
+def test_static_head_order_reduction_refuses_later_nonfinite_diagnostic(
+        diagnostic_index):
+    diagnostics = [
+        [1.0e-16, 2.0e-16, 3.0e-16],
+        [1.0, 0.9, 0.8],
+        [2.0, 3.0, 4.0],
+        [4.0e-16, 6.0e-16, 8.0e-16],
+    ]
+    diagnostics[diagnostic_index][1] = np.nan
+    with pytest.raises(ValueError, match="static_photon_dyson_nonfinite"):
+        _reduce_static_photon_order_diagnostics(*diagnostics)
 
 
 def test_static_head_completion_has_no_independent_cell_volume_seam():
