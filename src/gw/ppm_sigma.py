@@ -60,6 +60,7 @@ from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
+    GN_PPM_EXTREME_TAIL_DIVISOR,
     MinimaxNodes,
     fit_gn_ppm_from_wc_pair,
 )
@@ -367,6 +368,8 @@ def fit_ppm(
     print_fn=None,
     model_label: str = "PPM",
     n_mu_logical: int,
+    q_neg_index: np.ndarray | None = None,
+    coarsen_extreme_tails: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -381,6 +384,15 @@ def fit_ppm(
     count.  The fitted tensors keep the padded extent, but pad modes are
     born DEAD (Ω = B = 0, valid = False) and the ``unfulfilled``
     fraction counts logical modes only — see ``fit_gn_ppm_from_wc_pair``.
+    ``q_neg_index`` is the public symmetry service's canonical full-grid
+    involution, passed from the driver rather than rebuilt at this layer.  It
+    is required only when ``coarsen_extreme_tails`` is true.
+
+    ``coarsen_extreme_tails=True`` is the fixed user-ruled GN-only policy.  It
+    preserves affected ``Wc(0)`` elements but changes their finite poles and
+    ``1/z^2`` moments, so it is not strict BGW pole parity.  It is explicit
+    here because the same algebra also fits HL poles, whose real-axis
+    two-point model must not silently inherit this GN policy.
     """
     import time as _t
     z = complex(probe_omega)
@@ -388,16 +400,18 @@ def fit_ppm(
 
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    (omega_qmunu, b_qmunu, valid_qmunu, unfulfilled,
-     n_valid, omega_min, omega_max,
-     pair_rel_min) = fit_gn_ppm_from_wc_pair(
+    fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-         n_mu_logical=int(n_mu_logical))
+         n_mu_logical=int(n_mu_logical),
+         q_neg_index=q_neg_index,
+         coarsen_extreme_tails=bool(coarsen_extreme_tails))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
-    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
@@ -429,12 +443,29 @@ def fit_ppm(
         kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
         print_fn(
             f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
-            f"unfulfilled={100.0 * unfulfilled:.2f}%")
+            f"unfulfilled={100.0 * fit.unfulfilled_fraction:.2f}%")
         print_fn(
-            f"  {model_label} pole census: valid={n_valid}, "
-            f"Omega=[{omega_min:.8e}, {omega_max:.8e}] Ry, "
+            f"  {model_label} pole census: valid={fit.n_valid}, "
+            f"Omega=[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] Ry, "
             f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
-            f"{pair_rel_min:.8e}")
+            f"{fit.pair_relative_separation_min:.8e}")
+        if coarsen_extreme_tails:
+            budget = fit.n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
+            print_fn(
+                "  GN user-ruled fitted-pole tail policy: "
+                f"low={fit.n_tail_low}/{budget}, "
+                f"high={fit.n_tail_high}/{budget}; "
+                f"[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] -> "
+                f"[{fit.omega_min_after:.8e}, {fit.omega_max_after:.8e}] Ry; "
+                f"anchor={fit.tail_anchor_omega:.8e} Ry; boundary key groups "
+                "are atomic before orbit closure; physical partner orbits "
+                "remain unsplit and closure may further undershoot"
+            )
+            print_fn(
+                "  GN tail semantics: affected Wc(0) is preserved by "
+                "B'=-Wc(0)*Omega'/2; the 1/z^2 moment changes; this is not "
+                "BGW finite-pole parity; exact panes remain downstream."
+            )
 
     return PPMBuildResult(
         omega_p=probe_mag,
@@ -442,7 +473,7 @@ def fit_ppm(
         B_q=B,
         Omega_q=Omega,
         valid_mask_q=valid_mask,
-        unfulfilled_fraction=unfulfilled,
+        unfulfilled_fraction=fit.unfulfilled_fraction,
         n_nodes_static=n_nodes_static,
     )
 
