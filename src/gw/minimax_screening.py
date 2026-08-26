@@ -58,6 +58,14 @@ _beta_selector = _mm.beta_selector
 
 _TINY = 1.0e-12
 
+#: User-ruled GN-PPM variant: coarsen at most the lowest and highest 0.2%
+#: of successfully fitted logical matrix elements.  This is a fixed physics
+#: policy, not an environment/runtime choice, so its one owner is beside the
+#: GN fit.  It is deliberately not strict BGW finite-positive-pole parity;
+#: exact scalar panes still plan the reduced support downstream.  The integer
+#: form makes both tail budgets exact: ``floor(n_valid / 500)``.
+GN_PPM_EXTREME_TAIL_DIVISOR = 500
+
 
 def _scaled_laplace_error_bound(x_min: float, target_error: float) -> float:
     """Convert a physical Laplace-kernel tolerance to the ``[1, R]`` units.
@@ -261,6 +269,25 @@ class CrossingMinimaxQuadrature:
             self.tau, self.alpha, time_axis=time_axis)
 
 
+@dataclass(frozen=True)
+class GNPPMFitResult:
+    """Fitted pole tensors and their scalar conditioning/cost census."""
+
+    omega_qmunu: jax.Array
+    B_qmunu: jax.Array
+    valid_qmunu: jax.Array
+    unfulfilled_fraction: float
+    n_valid: int
+    omega_min_raw: float
+    omega_max_raw: float
+    pair_relative_separation_min: float
+    n_tail_low: int = 0
+    n_tail_high: int = 0
+    omega_min_after: float = float("nan")
+    omega_max_after: float = float("nan")
+    tail_anchor_omega: float = float("nan")
+
+
 def fit_gn_ppm_from_wc_pair(
     Wc0_qmunu: jax.Array,
     Wc_probe_qmunu: jax.Array,
@@ -268,13 +295,15 @@ def fit_gn_ppm_from_wc_pair(
     *,
     fallback_omega: float,
     n_mu_logical: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, float, int, float, float, float]:
+    q_neg_index: np.ndarray | None = None,
+    coarsen_extreme_tails: bool = False,
+) -> GNPPMFitResult:
     """Fit GN-PPM pole data elementwise on an already-sharded ``(q,mu,nu)`` tensor pair.
 
     Parameters
     ----------
     Wc0_qmunu
-        ``W^c(0)`` in shape ``(nkx,nky,nkz,n_rmu,n_rmu)``.
+        ``W^c(0)`` in shape ``(nq,n_rmu,n_rmu)``.
     Wc_probe_qmunu
         ``W^c(z_probe)`` in the same shape/sharding as ``Wc0_qmunu``.
     probe_omega
@@ -294,17 +323,35 @@ def fit_gn_ppm_from_wc_pair(
         structurally pad-safe: the ``Ω > 1e-14`` mode mask excludes pads with
         no mask argument anywhere downstream.  Pass the padded extent
         (all-true mask) when the inputs are unpadded.
+    q_neg_index
+        Canonical full-grid ``q -> -q`` row permutation from the public
+        ``symmetry_maps.q_negation_index`` service.  Required only when
+        ``coarsen_extreme_tails`` is true; the GN policy uses it together with
+        ``mu <-> nu`` to keep the physical four-lane partner orbit atomic and
+        never reconstructs the q convention locally.
+    coarsen_extreme_tails
+        Apply the user-ruled GN policy to successfully fitted logical modes:
+        replace at most the lowest and highest 0.2% of pole frequencies by
+        ``fallback_omega`` and recompute ``B = -Wc(0) Omega / 2``.  The
+        initial order-statistic boundary is exact-key-group atomic; physical
+        partner-orbit closure can further undershoot the budget and can
+        distinguish unrelated equal-key lanes.  The fitted-valid mask is
+        unchanged.
+        This changes the affected finite poles and their ``1/z^2`` moments,
+        so it is not strict BGW pole parity.  False is required for HL and
+        for low-level parity gates.
 
     Returns
     -------
-    omega_qmunu, B_qmunu, valid_qmunu, unfulfilled_fraction,
-    n_valid, omega_min, omega_max, pair_relative_separation_min
-        Elementwise GN-PPM parameters in the same ``(nkx,nky,nkz,n_rmu,n_rmu)``
+    GNPPMFitResult
+        Elementwise GN-PPM parameters in the same ``(nq,n_rmu,n_rmu)``
         layout; ``unfulfilled_fraction`` and the census count LOGICAL modes
         only.  The extrema are over valid logical modes; the relative
         separation is ``|Wc(0)-Wc(z)| / max(|Wc(0)|, |Wc(z)|)``.  The fit is
         pure local algebra: no tensor host gathers and no communication
-        beyond scalar reductions on the inputs' existing sharding.
+        beyond scalar reductions on the inputs' existing sharding.  When
+        tail coarsening is enabled, its exact distributed order statistics
+        likewise use scalar reductions only.
     """
 
     n_mu = int(jnp.asarray(Wc0_qmunu).shape[-1])
@@ -314,14 +361,38 @@ def fit_gn_ppm_from_wc_pair(
             f"fit_gn_ppm_from_wc_pair: n_mu_logical={n_log} outside "
             f"(0, {n_mu}] for input extent {n_mu}.")
 
+    fallback_host = float(fallback_omega)
+    if not np.isfinite(fallback_host) or fallback_host <= 0.0:
+        raise ValueError(
+            "fit_gn_ppm_from_wc_pair: fallback_omega must be finite and "
+            f"positive; got {fallback_omega!r}.")
     _z = jnp.asarray(probe_omega, dtype=jnp.complex128)
-    _fb = jnp.asarray(fallback_omega, dtype=jnp.float64)
+    _fb = jnp.asarray(fallback_host, dtype=jnp.float64)
     _W0 = jnp.asarray(Wc0_qmunu)
 
     # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
     # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
     # of the LOCAL (already-sharded) tile is what sizes the arena.
     _nq = int(_W0.shape[0])
+    _qneg = None
+    if coarsen_extreme_tails:
+        if q_neg_index is None:
+            raise ValueError(
+                "fit_gn_ppm_from_wc_pair: q_neg_index is required when "
+                "coarsen_extreme_tails=True.")
+        _qneg_raw = np.asarray(q_neg_index)
+        if (_qneg_raw.shape != (_nq,)
+                or not np.all(np.isfinite(_qneg_raw))
+                or not np.array_equal(_qneg_raw, np.rint(_qneg_raw))):
+            raise ValueError(
+                "fit_gn_ppm_from_wc_pair: q_neg_index must be one finite "
+                f"integer row per q; got shape={_qneg_raw.shape} for nq={_nq}.")
+        _qneg = _qneg_raw.astype(np.int32)
+        if (np.any(_qneg < 0) or np.any(_qneg >= _nq)
+                or not np.array_equal(_qneg[_qneg], np.arange(_nq))):
+            raise ValueError(
+                "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
+                f"over [0,{_nq}).")
     _per_q = 1
     for _d in _W0.shape[1:]:
         _per_q *= int(_d)
@@ -370,9 +441,51 @@ def fit_gn_ppm_from_wc_pair(
         pair_rel_min_host = _scalar_to_host_float(pair_rel_min)
     else:
         omega_min_host = omega_max_host = pair_rel_min_host = float("nan")
-    return (
-        omega_vals, B_vals, good, unfulfilled, n_valid,
-        omega_min_host, omega_max_host, pair_rel_min_host,
+
+    n_tail_low = n_tail_high = 0
+    omega_min_after = omega_min_host
+    omega_max_after = omega_max_host
+    tail_anchor = float("nan")
+    if coarsen_extreme_tails:
+        (omega_vals, B_vals, n_low_j, n_high_j,
+         omega_min_after_j, omega_max_after_j,
+         tail_anchor_j) = _coarsen_gn_ppm_extreme_tails(
+             omega_vals, B_vals, good, Wc0_qmunu, _qneg, _fb,
+             tail_divisor=GN_PPM_EXTREME_TAIL_DIVISOR)
+        n_tail_low = int(_scalar_to_host_float(n_low_j))
+        n_tail_high = int(_scalar_to_host_float(n_high_j))
+        if n_valid:
+            omega_min_after = _scalar_to_host_float(omega_min_after_j)
+            omega_max_after = _scalar_to_host_float(omega_max_after_j)
+        tail_anchor = _scalar_to_host_float(tail_anchor_j)
+        budget = n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
+        if n_tail_low > budget or n_tail_high > budget:
+            raise RuntimeError(
+                "GATE gn_ppm_extreme_tail_budget: selected more than the "
+                f"0.2% budget (low={n_tail_low}, high={n_tail_high}, "
+                f"budget={budget}).")
+        if n_valid and (
+                omega_min_after < omega_min_host
+                or omega_max_after > omega_max_host):
+            raise RuntimeError(
+                "GATE gn_ppm_extreme_tail_range: tail coarsening enlarged "
+                f"the fitted support [{omega_min_host}, {omega_max_host}] "
+                f"-> [{omega_min_after}, {omega_max_after}].")
+
+    return GNPPMFitResult(
+        omega_qmunu=omega_vals,
+        B_qmunu=B_vals,
+        valid_qmunu=good,
+        unfulfilled_fraction=unfulfilled,
+        n_valid=n_valid,
+        omega_min_raw=omega_min_host,
+        omega_max_raw=omega_max_host,
+        pair_relative_separation_min=pair_rel_min_host,
+        n_tail_low=n_tail_low,
+        n_tail_high=n_tail_high,
+        omega_min_after=omega_min_after,
+        omega_max_after=omega_max_after,
+        tail_anchor_omega=tail_anchor,
     )
 
 
@@ -426,6 +539,156 @@ def _gn_ppm_fit_q_block(nq: int, tile_bytes_per_q: int) -> int:
     """
     per_q = max(1, int(tile_bytes_per_q) * _GN_PPM_FIT_LIVE_TILES)
     return max(1, min(int(nq), _GN_PPM_FIT_ARENA_BUDGET_BYTES // per_q))
+
+
+@partial(
+    jax.jit,
+    static_argnames=("tail_divisor",),
+    donate_argnums=(0, 1),
+)
+def _coarsen_gn_ppm_extreme_tails(
+    omega_qmunu,
+    B_qmunu,
+    valid_qmunu,
+    Wc0_qmunu,
+    q_neg_index,
+    fallback_omega,
+    *,
+    tail_divisor: int,
+):
+    """Apply the lossy user-ruled GN tail policy without a tensor gather.
+
+    Positive IEEE-754 float64 values have monotonically ordered signed-int64
+    bit patterns.  Two simultaneous 63-step lower-bound searches therefore
+    recover the exact lower/upper order-statistic boundaries using only
+    scalar reductions on the input sharding.  No pole-sized host value or
+    index array is made.  Each exact per-lane candidate mask is then reduced
+    to its group-closure interior over the physical orbit
+    ``(q,mu,nu)``, ``(q,nu,mu)``, ``(-q,mu,nu)``, ``(-q,nu,mu)`` (with the
+    natural collapses on diagonals and self-negative q).  An orbit is changed
+    only if every member was already inside the same tail candidate; a
+    one-ulp boundary split therefore retains the whole orbit.  This can only
+    undershoot the per-tail budget, never exceed it, and all selected lanes
+    share the one replacement anchor below.
+
+    The replacement frequency is the configured fallback clipped into the
+    retained central support.  Thus the operation can never enlarge the
+    fitted Ω range.  Its residue is recomputed from the GN static identity
+
+        Wc(0) = -2 B / Ω,  hence  B' = -Wc(0) Ω' / 2.
+
+    It cannot also preserve the leading high-frequency moment ``2 B Ω``:
+    imposing both identities gives ``Ω'^2 = Ω^2`` for nonzero Wc(0), so any
+    nontrivial real-positive coarsening must choose one.  Static W is the
+    fitted observable and is preserved exactly to the arithmetic precision
+    of the existing fit; the high-frequency moment and strict BGW finite-pole
+    parity are not.  The canonical exact-pane planner remains downstream and
+    partitions this reduced support; this policy does not replace it.
+    """
+    if tail_divisor < 2:
+        raise ValueError("tail_divisor must be an integer >= 2")
+
+    omega = jnp.asarray(omega_qmunu, dtype=jnp.float64)
+    B = jnp.asarray(B_qmunu, dtype=jnp.complex128)
+    valid = jnp.asarray(valid_qmunu, dtype=bool)
+    Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
+    q_neg = jnp.asarray(q_neg_index, dtype=jnp.int32)
+    fallback = jnp.asarray(fallback_omega, dtype=jnp.float64)
+    if omega.ndim != 3 or omega.shape[-2] != omega.shape[-1]:
+        raise ValueError(
+            "GN tail policy requires flat-q square matrix tiles; got "
+            f"shape={omega.shape}.")
+    if q_neg.shape != (omega.shape[0],):
+        raise ValueError(
+            "GN tail policy q_neg_index extent must equal flat q extent; "
+            f"got {q_neg.shape} for shape={omega.shape}.")
+
+    # The valid-fit predicate already proves these are finite and positive.
+    # Re-state it here so this owner remains fail-closed if called directly.
+    eligible = valid & jnp.isfinite(omega) & (omega > 0.0)
+    keys = jax.lax.bitcast_convert_type(omega, jnp.int64)
+    n_valid = jnp.sum(eligible, dtype=jnp.int64)
+    budget = n_valid // jnp.asarray(tail_divisor, dtype=jnp.int64)
+
+    min_key = jnp.min(jnp.where(eligible, keys, jnp.iinfo(jnp.int64).max))
+    max_key = jnp.max(jnp.where(eligible, keys, jnp.asarray(0, jnp.int64)))
+    min_key = jnp.where(n_valid > 0, min_key, jnp.asarray(0, jnp.int64))
+    max_key = jnp.where(n_valid > 0, max_key, jnp.asarray(0, jnp.int64))
+
+    # 1-indexed ascending ranks.  Clamp the zero-budget/empty cases to rank 1;
+    # ``budget > 0`` below keeps their masks empty.
+    targets = jnp.stack((
+        jnp.maximum(budget, jnp.asarray(1, jnp.int64)),
+        jnp.maximum(n_valid - budget + 1, jnp.asarray(1, jnp.int64)),
+    ))
+    lo0 = jnp.full((2,), min_key, dtype=jnp.int64)
+    hi0 = jnp.full((2,), max_key, dtype=jnp.int64)
+
+    def _bisect(_iteration, bounds):
+        lo, hi = bounds
+        mid = lo + (hi - lo) // 2
+        count0 = jnp.sum(eligible & (keys <= mid[0]), dtype=jnp.int64)
+        count1 = jnp.sum(eligible & (keys <= mid[1]), dtype=jnp.int64)
+        counts = jnp.stack((count0, count1))
+        go_left = counts >= targets
+        return (
+            jnp.where(go_left, lo, mid + 1),
+            jnp.where(go_left, mid, hi),
+        )
+
+    boundaries, _ = jax.lax.fori_loop(0, 63, _bisect, (lo0, hi0))
+    lower_key, upper_key = boundaries[0], boundaries[1]
+
+    n_lower_le = jnp.sum(eligible & (keys <= lower_key), dtype=jnp.int64)
+    n_upper_ge = jnp.sum(eligible & (keys >= upper_key), dtype=jnp.int64)
+    lower = eligible & jnp.where(
+        n_lower_le <= budget, keys <= lower_key, keys < lower_key)
+    upper = eligible & jnp.where(
+        n_upper_ge <= budget, keys >= upper_key, keys > upper_key)
+
+    # Imaginary-axis W is Hermitian at fixed q and independently obeys
+    # W[q] = conj(W[-q]).  Keep a candidate only when its entire four-lane
+    # orbit is already present.  This is an interior, never an expansion:
+    # counts cannot grow and no new per-orbit ordering/weight policy appears.
+    def _orbit_interior(mask):
+        mask_mq = jnp.take(mask, q_neg, axis=0)
+        return (
+            mask & jnp.swapaxes(mask, -1, -2) & mask_mq
+            & jnp.swapaxes(mask_mq, -1, -2)
+        )
+
+    lower = _orbit_interior(lower)
+    upper = _orbit_interior(upper)
+    has_budget = budget > 0
+    lower &= has_budget
+    upper &= has_budget
+    tail = lower | upper
+
+    retained = eligible & (~tail)
+    retained_min = jnp.min(jnp.where(retained, omega, jnp.inf))
+    retained_max = jnp.max(jnp.where(retained, omega, -jnp.inf))
+    anchor = jnp.where(
+        jnp.any(retained),
+        jnp.clip(fallback, retained_min, retained_max),
+        fallback,
+    )
+    omega_out = jnp.where(tail, anchor, omega)
+    B_out = jnp.where(
+        tail,
+        -0.5 * Wc0 * anchor.astype(jnp.complex128),
+        B,
+    )
+    omega_min_after = jnp.min(jnp.where(eligible, omega_out, jnp.inf))
+    omega_max_after = jnp.max(jnp.where(eligible, omega_out, -jnp.inf))
+    nan = jnp.asarray(jnp.nan, dtype=jnp.float64)
+    anchor = jnp.where(has_budget & (n_valid > 0), anchor, nan)
+    return (
+        omega_out, B_out,
+        jnp.sum(lower, dtype=jnp.int64),
+        jnp.sum(upper, dtype=jnp.int64),
+        omega_min_after, omega_max_after,
+        anchor,
+    )
 
 @partial(jax.jit, static_argnums=(4,))
 def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
