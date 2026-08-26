@@ -54,6 +54,10 @@ WHO CALLS WHAT
     ``(C,Tx,Ty,Tz)`` basis.  It is the sample provider for a caller that must
     complete a coupled q0 solve before averaging; it contains no screened
     response physics and applies no cell-volume factor.
+``slab_minibz_photon_cubature(kernel, geometry, kgrid)``
+    The production screened-head provider: one authenticated receipt binding
+    the true mini-lattice Wigner--Seitz polygon, fixed 16/24/32 Duffy--Gauss
+    ladder, normalized weights, and physical/padded solve counts.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -102,6 +106,7 @@ from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (
     COULOMB_GAUGE_TT_SIGN,
+    SlabMinibzPhotonReceipt,
     apply_transverse_projector,
     transverse_projector,
     build_miniBZ_dq_cart,
@@ -113,6 +118,7 @@ from vcoul.minibz import (
     minibz_moment_tensor,
     minibz_voronoi_batches,
     iter_minibz_photon_samples,
+    slab_minibz_photon_cubature,
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
@@ -139,12 +145,14 @@ __all__ = [
     "Bulk3D", "Slab2D", "Box0D",
     # mini-BZ sampling / averaging
     "COULOMB_GAUGE_TT_SIGN",
+    "SlabMinibzPhotonReceipt",
     "apply_transverse_projector",
     "transverse_projector",
     "wrap_points_to_voronoi", "minibz_voronoi_batches",
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "iter_minibz_photon_samples",
+    "slab_minibz_photon_cubature",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
