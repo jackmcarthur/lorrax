@@ -289,6 +289,28 @@ class StaticGaugeHallTransaction:
             raise TypeError(
                 "StaticGaugeHallTransaction is issued only by "
                 "static_gauge_hall_transaction")
+        fingerprint = str(
+            self.hamiltonian_config_operator_fingerprint).strip()
+        if (not fingerprint.startswith("sha256:") or len(fingerprint) != 71
+                or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
+            raise ValueError(
+                "StaticGaugeHallTransaction has an invalid operator hash")
+        wfn_sha = str(self.wfn_fingerprint).strip()
+        if (len(wfn_sha) != 64
+                or any(c not in "0123456789abcdef" for c in wfn_sha)):
+            raise ValueError("StaticGaugeHallTransaction has an invalid WFN hash")
+        if (int(self.band_start) != 0 or int(self.band_stop) <= 0
+                or int(self.nk_tot) <= 0):
+            raise ValueError(
+                "StaticGaugeHallTransaction requires bands [0,stop) and "
+                "nk_tot>0")
+        if self.producer_id != _STATIC_GAUGE_HALL_PRODUCER_ID:
+            raise ValueError(
+                "StaticGaugeHallTransaction has an unknown producer")
+        if (tuple(self.sigma_H.shape) != (3,)
+                or np.dtype(self.sigma_H.dtype) != np.dtype(np.float64)):
+            raise ValueError(
+                "StaticGaugeHallTransaction sigma_H must be float64[3]")
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -3358,6 +3380,28 @@ def static_gauge_hall_transaction(
     )
 
 
+def _static_gauge_hall_transaction_from_artifact(
+    *, sigma_H, hamiltonian_config_operator_fingerprint: str,
+    wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
+    mesh: Mesh,
+) -> StaticGaugeHallTransaction:
+    """Place a loader-validated Hall vector on the run mesh."""
+    sigma = jax.device_put(
+        np.asarray(sigma_H, dtype=np.float64),
+        NamedSharding(mesh, P()))
+    return StaticGaugeHallTransaction(
+        sigma_H=sigma,
+        hamiltonian_config_operator_fingerprint=(
+            hamiltonian_config_operator_fingerprint),
+        wfn_fingerprint=wfn_fingerprint,
+        band_start=int(band_start),
+        band_stop=int(band_stop),
+        nk_tot=int(nk_tot),
+        producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
+        _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+    )
+
+
 @dataclass(frozen=True)
 class IterationHeadResponse:
     """Direct head and centroid-sharded wings before the body Schur fold."""
@@ -3857,6 +3901,7 @@ def build_dft_head_response(
     wfn,
     meta,
     config,
+    wfn_fingerprint_binding=None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -3892,7 +3937,8 @@ def build_dft_head_response(
             bispinor=bool(int(meta.nspinor) == 4),
             skip_vnl=False,
             vnl_mode="analytic",
-            vnl_velocity_sign=expected_vnl_sign):
+            vnl_velocity_sign=expected_vnl_sign,
+            wfn_fingerprint_binding=wfn_fingerprint_binding):
         raise ValueError(
             "GATE dft_head_dipole_provenance: head_correction=full refuses "
             "dipole.h5 because its WFN/q→0-coverage/VNL/representation "

@@ -626,6 +626,7 @@ def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
 def check_dipole_provenance(
     path, *, wfn, nval, ncond, nband,
     bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    wfn_fingerprint_binding=None,
     print_fn=print,
 ) -> bool:
     """Does ``path`` match the WFN, window, and requested operator convention?
@@ -638,6 +639,7 @@ def check_dipole_provenance(
     unstamped file predates this guard and cannot be vouched for.
     """
     from common import sanity
+    from common.parallel_transport import fingerprint_from_binding
 
     try:
         with h5py.File(str(path), "r") as h5:
@@ -688,7 +690,10 @@ def check_dipole_provenance(
             "prov_nband": int(nband),
             "prov_q0_operator_scheme": _DIPOLE_Q0_OPERATOR_SCHEME}
     if fingerprint_checkable:
-        want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
+        want["prov_wfn_sha256"] = (
+            wfn_fingerprint(wfn)
+            if wfn_fingerprint_binding is None
+            else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
     optional = {
         "prov_bispinor": bispinor,
         "prov_skip_vnl": skip_vnl,
@@ -738,6 +743,7 @@ def check_dipole_provenance(
 def authenticated_dipole_operator_fingerprint(
     path, *, wfn, nval, ncond, nband,
     bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    wfn_fingerprint_binding=None,
     print_fn=print,
 ) -> str:
     """Fingerprint the exact provenance already authenticated by this owner.
@@ -751,7 +757,9 @@ def authenticated_dipole_operator_fingerprint(
     if not check_dipole_provenance(
             path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
             bispinor=bispinor, skip_vnl=skip_vnl, vnl_mode=vnl_mode,
-            vnl_velocity_sign=vnl_velocity_sign, print_fn=print_fn):
+            vnl_velocity_sign=vnl_velocity_sign,
+            wfn_fingerprint_binding=wfn_fingerprint_binding,
+            print_fn=print_fn):
         raise ValueError(
             "GATE dipole_operator_fingerprint: dipole provenance did not "
             "authenticate the selected WFN/window/operator")
@@ -957,10 +965,15 @@ def main(argv=None):
 	parser.add_argument(
 		"--static-gauge-hall-only",
 		action="store_true",
-		help="Run only the canonical full-BZ uniform current/contact sweep and "
-		     "print its provenance-bound raw Hall pseudovector. "
-		     "This diagnostic does not write dipole.h5 or fabricate the other "
-		     "fields of a StaticGaugeHeadResponse artifact.",
+		help="Run only the canonical full-BZ uniform-current sweep and print "
+		     "its raw Hall pseudovector. This does not write dipole.h5 or "
+		     "fabricate any other static-gauge response term.",
+	)
+	parser.add_argument(
+		"--static-gauge-hall-out",
+		type=str,
+		default=None,
+		help="Optional immutable SlabIO output for --static-gauge-hall-only.",
 	)
 	parser.add_argument(
 		"--iq-list",
@@ -972,6 +985,9 @@ def main(argv=None):
 	args = parser.parse_args(argv)
 	debug = debug_print_enabled()
 
+	if args.static_gauge_hall_out is not None and not args.static_gauge_hall_only:
+		parser.error(
+			"--static-gauge-hall-out requires --static-gauge-hall-only")
 	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
 		parser.error(
 			"--parallel-transport-velocity-only requires "
@@ -1311,6 +1327,12 @@ def main(argv=None):
 				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
 				band_stop=nb, mesh=RUNTIME.mesh)
 			sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
+		if args.static_gauge_hall_out is not None:
+			from file_io.static_gauge_head import (
+				write_static_gauge_hall_artifact)
+			with timing.section("static_gauge_hall_write"):
+				write_static_gauge_hall_artifact(
+					args.static_gauge_hall_out, hall, mesh_xy=RUNTIME.mesh)
 		if jax.process_index() == 0:
 			print(
 				"STATIC_GAUGE_HALL_TRANSACTION "

@@ -179,7 +179,6 @@ class ChargeHallCubatureResponse:
     charge_response_fingerprint: str
     hall_response_fingerprint: str
     response_transaction_fingerprint: str
-    body_response_fingerprint: str
     wfn_fingerprint: str
     band_start: int
     band_stop: int
@@ -228,7 +227,6 @@ def require_charge_hall_cubature_response(
         (response.hall_response_fingerprint, "hall_response_fingerprint"),
         (response.response_transaction_fingerprint,
          "response_transaction_fingerprint"),
-        (response.body_response_fingerprint, "body_response_fingerprint"),
     ):
         _canonical_sha256(value, gate=gate)
     _canonical_wfn_sha256(response.wfn_fingerprint)
@@ -314,7 +312,7 @@ def build_charge_hall_cubature_response(
     config,
     layout: PhotonBasisLayout,
     hall_transaction,
-    body_response_fingerprint: str,
+    wfn_fingerprint_binding=None,
 ) -> ChargeHallCubatureResponse:
     r"""Compose authenticated charge CC and Hall CT/TC response at omega=0.
 
@@ -325,7 +323,8 @@ def build_charge_hall_cubature_response(
     packer; no current wing is inferred.  The Hall transaction must be the
     sealed full-BZ result of :func:`gw.qsgw_head.static_gauge_hall_transaction`.
     """
-    from common.parallel_transport import wfn_fingerprint
+    from common.parallel_transport import (
+        fingerprint_from_binding, wfn_fingerprint)
     from gw.head_correction import (
         static_gauge_tensor_residuals, static_hall_linear_response)
     from gw.qsgw_head import (
@@ -342,9 +341,10 @@ def build_charge_hall_cubature_response(
         raise TypeError(
             "charge/Hall response requires the sealed full-BZ Hall transaction")
 
-    body_fp = _canonical_sha256(
-        body_response_fingerprint, gate="body_response_fingerprint")
-    wfn_fp = _canonical_wfn_sha256(wfn_fingerprint(wfn))
+    wfn_fp = _canonical_wfn_sha256(
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_binding is None
+        else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
     start, stop = int(meta.b_id_0), int(meta.b_id_4_chi_user)
     if (int(hall_transaction.band_start), int(hall_transaction.band_stop)) != (
             start, stop):
@@ -360,7 +360,8 @@ def build_charge_hall_cubature_response(
 
     direct = build_dft_head_response(
         wfns, (0.0 + 0.0j,), input_dir=input_dir, mesh=mesh,
-        wfn=wfn, meta=meta, config=config)
+        wfn=wfn, meta=meta, config=config,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
     if direct.Y_x is None or direct.Z_y is None:
         raise ValueError("incumbent charge response returned no body wings")
     charge_extent = int(layout.padded_extent(0))
@@ -418,11 +419,11 @@ def build_charge_hall_cubature_response(
         dipole_path, wfn=wfn, nval=int(config.nval),
         ncond=int(config.ncond), nband=int(config.nband),
         bispinor=bool(int(meta.nspinor) == 4), skip_vnl=False,
-        vnl_mode="analytic", vnl_velocity_sign=vnl_sign)
+        vnl_mode="analytic", vnl_velocity_sign=vnl_sign,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
     charge_fp = _digest({
         "scheme": _CHARGE_FINGERPRINT_SCHEME,
         "dipole_operator_fingerprint": dipole_fp,
-        "body_response_fingerprint": body_fp,
         "wfn_fingerprint": wfn_fp,
         "bands": [start, stop],
         "omega_ry": "0x0.0p+0",
@@ -448,7 +449,6 @@ def build_charge_hall_cubature_response(
         "convention_id": CHARGE_HALL_CUBATURE_CONVENTION_ID,
         "charge_response_fingerprint": charge_fp,
         "hall_response_fingerprint": hall_fp,
-        "body_response_fingerprint": body_fp,
         "wfn_fingerprint": wfn_fp,
         "bands": [start, stop],
         "layout": _layout_record(layout),
@@ -468,7 +468,7 @@ def build_charge_hall_cubature_response(
         charge_response_fingerprint=charge_fp,
         hall_response_fingerprint=hall_fp,
         response_transaction_fingerprint=_digest(transaction_payload),
-        body_response_fingerprint=body_fp, wfn_fingerprint=wfn_fp,
+        wfn_fingerprint=wfn_fp,
         band_start=start, band_stop=stop,
         convention_id=CHARGE_HALL_CUBATURE_CONVENTION_ID,
         wing_dressing=CHARGE_HALL_WING_DRESSING,
