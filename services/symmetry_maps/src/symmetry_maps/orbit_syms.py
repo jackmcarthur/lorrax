@@ -1350,6 +1350,104 @@ def resolve_qgrid_symmetry(
 # Full FFT-grid orbit permutation — used by ZetaLoader's q='full_bz' unfold.
 # ─────────────────────────────────────────────────────────────────────────
 
+@dataclasses.dataclass(frozen=True)
+class PolarFFTFieldProjection:
+    """A polar FFT field and the measured receipt for its group projection."""
+
+    field: np.ndarray
+    relative_movement: float
+    relative_residual: float
+    relative_residual_tolerance: float
+    n_symmetry_rows: int
+    n_antiunitary_rows: int
+
+
+def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
+    r"""Project a Cartesian polar field on an FFT grid onto crystal symmetry.
+
+    ``field`` is ``(3,nx,ny,nz)``.  Every permitted row acts through the
+    canonical real-space pullback from :func:`fft_grid_pullback_perm` and
+    the forward Cartesian-index action ``SymMaps.R_cart_forward``::
+
+        (g J)_a(r_new) = R_forward[g]_{a b} J_b(r_old).
+
+    The time-reversal half of ``R_cart_forward`` already contains the one
+    minus sign of a time-odd polar current.  Time reversal does not move
+    ``r``, so its row reuses the spatial pullback and no second parity sign
+    is applied.  Antiunitary rows participate only when the live
+    ``SymMaps.trs_allowed`` verdict permits them.
+
+    The receipt measures the raw-to-projected movement and the worst
+    covariance residual of the projected field over those same rows, both
+    relative to the raw-field L2 scale (so a symmetry-required zero field
+    is not divided by its own cancellation noise).  A
+    local ``alpha·A`` operator built from the result is therefore eligible
+    for the incumbent star-wedge matrix sweep without another symmetry rule.
+    """
+    value = np.asarray(field)
+    if value.ndim != 4 or value.shape[0] != 3:
+        raise ValueError(
+            "project_polar_fft_field: field must have shape "
+            f"(3,nx,ny,nz); got {value.shape}.")
+    if not np.all(np.isfinite(value)):
+        raise ValueError("project_polar_fft_field: field contains non-finite values.")
+
+    spatial = np.asarray(sym.sym_matrices, dtype=np.int32)
+    n_spatial = int(spatial.shape[0])
+    if spatial.shape != (n_spatial, 3, 3) or n_spatial < 1:
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.sym_matrices must have shape "
+            f"(n,3,3), n>=1; got {spatial.shape}.")
+    rotations = np.asarray(sym.R_cart_forward, dtype=np.float64)
+    expected_rotations = (2 * n_spatial, 3, 3)
+    if rotations.shape != expected_rotations:
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.R_cart_forward has shape "
+            f"{rotations.shape}, expected {expected_rotations}.")
+    translations = np.asarray(sym.translations, dtype=np.float64)
+    if translations.shape[0] < n_spatial or translations.shape[1:] != (3,):
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.translations must cover every "
+            f"spatial row; got {translations.shape}, need ({n_spatial},3).")
+
+    pullback = fft_grid_pullback_perm(
+        spatial, translations[:n_spatial], value.shape[-3:], validate=True)
+    n_rows = 2 * n_spatial if bool(sym.trs_allowed) else n_spatial
+    flat = value.reshape(3, -1)
+
+    def _act(row, operand):
+        spatial_row = int(row) % n_spatial
+        return rotations[int(row)] @ operand[:, pullback[spatial_row]]
+
+    projected = np.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
+    for row in range(n_rows):
+        projected += _act(row, flat)
+    projected /= float(n_rows)
+
+    tiny = np.finfo(np.float64).tiny
+    raw_norm = max(float(np.linalg.norm(flat)), tiny)
+    movement = float(np.linalg.norm(projected - flat) / raw_norm)
+    residual = max(
+        float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
+        for row in range(n_rows))
+    residual_tolerance = float(
+        64.0 * np.finfo(np.float64).eps * max(n_rows, 1))
+    if not np.isfinite(residual) or residual > residual_tolerance:
+        raise RuntimeError(
+            "project_polar_fft_field: the group-averaged field did not "
+            "close under its own permitted symmetry rows: relative residual "
+            f"{residual:.6e} exceeds the scale-aware floating-point bound "
+            f"{residual_tolerance:.6e} for {n_rows} rows.")
+    return PolarFFTFieldProjection(
+        field=projected.reshape(value.shape),
+        relative_movement=movement,
+        relative_residual=residual,
+        relative_residual_tolerance=residual_tolerance,
+        n_symmetry_rows=n_rows,
+        n_antiunitary_rows=(n_spatial if bool(sym.trs_allowed) else 0),
+    )
+
+
 def fft_grid_pullback_perm(
     sym_matrices: np.ndarray,
     translations: np.ndarray,
