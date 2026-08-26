@@ -6,9 +6,11 @@ from common.gauss_legendre import (
     GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
     gauss_legendre_interval,
 )
+from vcoul import gauss_legendre_interval as provider_interval_rule
 
 
 def test_interval_rule_is_exact_through_the_gauss_degree_and_immutable():
+    assert gauss_legendre_interval is provider_interval_rule
     nodes, weights = gauss_legendre_interval(4, -0.7, 2.3)
     for degree in range(8):
         got = np.sum(weights * nodes**degree)
