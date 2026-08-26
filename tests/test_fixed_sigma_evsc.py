@@ -16,6 +16,7 @@ from gw.sc_iteration import (
     run_fixed_sigma_evsc,
 )
 from gw.sigma_dispatch import SigmaResult
+from gw.wavefunction_bundle import BandSlices
 
 
 def _config(*, tol_ev=1.0e-9, max_iter=30, accelerator="linear"):
@@ -25,6 +26,17 @@ def _config(*, tol_ev=1.0e-9, max_iter=30, accelerator="linear"):
             history_depth=5),
         sc=SimpleNamespace(eigh="native"),
         memory=SimpleNamespace(per_device_gb=4.0),
+    )
+
+
+def _band_context(e_dft_ry, *, n_occ=1):
+    """Minimal canonical active-window metadata for the focused map tests."""
+    nb = int(np.asarray(e_dft_ry).shape[1])
+    return dict(
+        meta=SimpleNamespace(nelec=int(n_occ)),
+        band_slices=BandSlices.from_band_edges(
+            0, 0, int(n_occ), nb, nb),
+        wfn=SimpleNamespace(energies=np.asarray([e_dft_ry])),
     )
 
 
@@ -81,6 +93,7 @@ def _host_reference(kin, vh, sx, sigma_w, omega_ev, e_dft_ry,
     U = np.broadcast_to(np.eye(nb, dtype=complex), (nk, nb, nb)).copy()
     prev = np.asarray(e_dft_ry, dtype=float)
     h0 = kin + vh
+    pending_final_check = False
     for iteration in range(1, max_iter + 1):
         h0_q = np.einsum(
             "kpm,kpq,kqn->kmn", np.conj(U), h0, U, optimize=True)
@@ -109,7 +122,11 @@ def _host_reference(kin, vh, sx, sigma_w, omega_ev, e_dft_ry,
         residual = np.max(np.abs(new - prev)) * RYD_TO_EV
         U = U @ V
         if residual <= tol_ev:
-            return new, U, iteration, residual
+            if pending_final_check:
+                return new, U, iteration, residual
+            pending_final_check = True
+        else:
+            pending_final_check = False
         prev = new
     raise AssertionError("host reference did not converge")
 
@@ -153,7 +170,8 @@ def test_fixed_sigma_evsc_matches_independent_full_matrix_iteration():
     cfg = _config(tol_ev=1.0e-9, max_iter=30)
     got = run_fixed_sigma_evsc(
         result, jnp.asarray(kin), e_dft_ry,
-        config=cfg, mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
+        config=cfg, **_band_context(e_dft_ry),
+        mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
     ref_e, ref_u, ref_n, ref_resid = _host_reference(
         kin, vh, sx, sigma_w, omega_ev, e_dft_ry,
         tol_ev=cfg.eqp2.tol_ev, max_iter=cfg.eqp2.max_iter)
@@ -192,23 +210,68 @@ def test_rcrop_fixed_hamiltonian_map_reaches_same_solution():
     linear = run_fixed_sigma_evsc(
         result, jnp.asarray(kin), e_dft_ry,
         config=_config(tol_ev=1e-8, accelerator="linear"),
+        **_band_context(e_dft_ry),
         mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
     rcrop = run_fixed_sigma_evsc(
         result, jnp.asarray(kin), e_dft_ry,
         config=_config(tol_ev=1e-8, accelerator="rcrop"),
+        **_band_context(e_dft_ry),
         mesh_xy=single_device_mesh(), print_fn=lambda *a: None)
     np.testing.assert_allclose(rcrop.energies_ry, linear.energies_ry,
                                rtol=2e-9, atol=2e-9)
     assert rcrop.residual_ev <= 1e-8
 
 
-def test_fixed_sigma_evsc_refuses_uncovered_energy_before_clamping():
-    omega_ev = np.linspace(-1.0, 1.0, 5)
-    e_dft_ry = np.array([[-2.0, 0.2]]) / RYD_TO_EV
-    zmat = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
+def test_eqp2_reapplies_semicore_and_conduction_scissors_on_final_map():
+    omega_ev = np.linspace(-2.0, 2.0, 9)
+    e_dft_ev = np.array([[-8.0, -1.0, 1.0, 8.0]])
+    e_dft_ry = e_dft_ev / RYD_TO_EV
+    kin = np.diag(e_dft_ry[0])[None].astype(complex)
+    sigma_x = np.zeros((1, 4, 4), dtype=complex)
+    sigma_x[0, 1, 1] = -0.2 / RYD_TO_EV
+    sigma_x[0, 2, 2] = +0.3 / RYD_TO_EV
+    zmat = jnp.zeros((1, 4, 4), dtype=jnp.complex128)
     result = SigmaResult(
         v_h_kij_ry=zmat,
-        sigma_x_kij_ry=zmat,
+        sigma_x_kij_ry=jnp.asarray(sigma_x),
+        sigma_xc_kij_ry=zmat,
+        sigma_c_omega_kij_ry=jnp.zeros(
+            (omega_ev.size, 1, 4, 4), dtype=jnp.complex128),
+        omega_grid_ev=omega_ev,
+        omega_grid_ry=omega_ev / RYD_TO_EV,
+        efermi_dft_ev=0.0,
+    )
+    log = []
+    got = run_fixed_sigma_evsc(
+        result, jnp.asarray(kin), e_dft_ry,
+        config=_config(tol_ev=1e-10, accelerator="linear"),
+        **_band_context(e_dft_ry, n_occ=2),
+        mesh_xy=single_device_mesh(), print_fn=log.append)
+
+    # Protected states set the no-lag midgap to +0.05 eV.  The semicore
+    # keeps E-E_F, while the one-point conduction fit is the +0.3 eV rigid
+    # shift inferred from the protected conduction state.
+    np.testing.assert_allclose(
+        got.energies_ry * RYD_TO_EV,
+        np.array([[-7.95, -1.2, 1.3, 8.3]]), atol=2e-10, rtol=0.0)
+    assert got.iterations >= 3
+    assert any("final post-rotation verification" in line for line in log)
+    assert any("optional out-of-grid" in line for line in log)
+
+
+def test_fixed_sigma_evsc_refuses_uncovered_energy_before_clamping():
+    omega_ev = np.linspace(-1.0, 1.0, 5)
+    # Both DFT states are protected initially.  The first map pushes one
+    # outside the table, so the *next* evaluation must refuse rather than
+    # reclassify that protected state as an optional scissored tail.
+    e_dft_ry = np.array([[-0.2, 0.2]]) / RYD_TO_EV
+    zmat = jnp.zeros((1, 2, 2), dtype=jnp.complex128)
+    kin = jnp.asarray(np.diag(e_dft_ry[0])[None].astype(complex))
+    sigma_x = np.zeros((1, 2, 2), dtype=complex)
+    sigma_x[0, 0, 0] = -2.0 / RYD_TO_EV
+    result = SigmaResult(
+        v_h_kij_ry=zmat,
+        sigma_x_kij_ry=jnp.asarray(sigma_x),
         sigma_xc_kij_ry=zmat,
         sigma_c_omega_kij_ry=jnp.zeros((5, 1, 2, 2), dtype=jnp.complex128),
         omega_grid_ev=omega_ev,
@@ -217,5 +280,6 @@ def test_fixed_sigma_evsc_refuses_uncovered_energy_before_clamping():
     )
     with pytest.raises(ValueError, match="eqp2_omega_coverage"):
         run_fixed_sigma_evsc(
-            result, zmat, e_dft_ry, config=_config(),
+            result, kin, e_dft_ry, config=_config(),
+            **_band_context(e_dft_ry),
             mesh_xy=single_device_mesh(), print_fn=lambda *a: None)

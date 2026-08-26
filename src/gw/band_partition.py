@@ -80,7 +80,7 @@ class BandPartition:
         return cls(protected_mask=ones, in_range_mask=ones)
 
     def report_multiplet_splits(self, enk_full_ry, band_offset, *,
-                                print_fn=print):
+                                label="SC", print_fn=print):
         """Which protected-mask boundaries cut a DEGENERATE MULTIPLET.
 
         Returns ``(n_split, worst_gap_mev)`` and prints one line per split.
@@ -125,12 +125,12 @@ class BandPartition:
             if 0 < b < gaps.size - 1 and gaps[b] <= DEGENERACY_TOL_RY:
                 splits.append((int(a), b, float(gaps[b])))
         if not splits:
-            print_fn(f"  SC partition: {int(mask.sum())}/{mask.size} protected; "
+            print_fn(f"  {label} partition: {int(mask.sum())}/{mask.size} protected; "
                      f"no boundary splits a multiplet")
             return 0, 0.0
         _MEV = 13605.693122994
         print_fn("  " + "=" * 70)
-        print_fn(f"  !!! SC partition: {len(splits)} protected-mask boundary/ies "
+        print_fn(f"  !!! {label} partition: {len(splits)} protected-mask boundary/ies "
                  f"CUT A DEGENERATE MULTIPLET")
         for a, b, g in splits:
             print_fn(f"  !!!   active band {a} (absolute {b}): min gap over k "
@@ -144,7 +144,7 @@ class BandPartition:
         return len(splits), max(g for _, _, g in splits) * _MEV
 
     def promoted_to_multiplets(self, enk_full_ry, band_offset, *,
-                               print_fn=print) -> "BandPartition":
+                               label="SC", print_fn=print) -> "BandPartition":
         """This partition with ``protected_mask`` grown to WHOLE multiplets.
 
         Owner ruling, 2026-08-16: *"I want degenerate spaces degenerate in
@@ -186,7 +186,7 @@ class BandPartition:
                 start = a
         n_added = int(out.sum() - mask.sum())
         if n_added:
-            print_fn(f"  SC partition: promoted {n_added} band(s) into whole "
+            print_fn(f"  {label} partition: promoted {n_added} band(s) into whole "
                      f"multiplets — protected {int(mask.sum())} -> "
                      f"{int(out.sum())} of {nb} "
                      f"(owner ruling: degenerate spaces stay degenerate)")
@@ -213,6 +213,47 @@ class BandPartition:
                 "PROTECTED BAND RANGE.                                  !!!"
             )
             print_fn("=" * 72)
+
+
+def build_omega_band_partition(
+    e_dft_kn_ry,
+    e_dft_full_kn_ry,
+    *,
+    band_offset: int,
+    omega_min_abs_ev: float,
+    omega_max_abs_ev: float,
+    label: str = "SC",
+    print_fn=print,
+) -> BandPartition:
+    """Build the canonical protected/in-range partition for a Sigma grid.
+
+    The window predicate, full-spectrum multiplet audit, outward promotion,
+    and protected-outside-grid warning belong together.  Keeping them in one
+    constructor prevents an additional QP ladder from quietly using a
+    different protected subspace than the main self-consistent driver.
+    """
+    from common.units import RYD_TO_EV
+    from .scissor import classify_bands_in_grid
+
+    e_dft_ev = np.asarray(e_dft_kn_ry, dtype=np.float64) * RYD_TO_EV
+    band_in_grid, _ = classify_bands_in_grid(
+        e_dft_ev, float(omega_min_abs_ev), float(omega_max_abs_ev))
+    in_range = jnp.asarray(band_in_grid, dtype=bool)
+    print_fn(
+        f"  {label} partition: protected/in-range = "
+        f"{int(band_in_grid.sum())}/{int(band_in_grid.size)} bands")
+    partition = BandPartition(
+        protected_mask=in_range, in_range_mask=in_range)
+    partition.report_multiplet_splits(
+        np.asarray(e_dft_full_kn_ry, dtype=np.float64), int(band_offset),
+        label=label, print_fn=print_fn)
+    partition = partition.promoted_to_multiplets(
+        np.asarray(e_dft_full_kn_ry, dtype=np.float64), int(band_offset),
+        label=label, print_fn=print_fn)
+    # Promotion may deliberately grow across the grid edge.  Warn on the
+    # partition that will actually ship, not only on its pre-promotion seed.
+    partition.warn_if_protected_outside_grid(print_fn=print_fn)
+    return partition
 
 
 # ---------------------------------------------------------------------------
@@ -275,4 +316,6 @@ def apply_band_partition(
     return offdiag_part + diag_kept[:, :, None] * eye[None, :, :]
 
 
-__all__ = ["BandPartition", "apply_band_partition"]
+__all__ = [
+    "BandPartition", "apply_band_partition", "build_omega_band_partition",
+]

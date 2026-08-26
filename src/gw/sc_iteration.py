@@ -74,7 +74,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common import timing
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
-from .band_partition import BandPartition, apply_band_partition
+from .band_partition import (
+    BandPartition, apply_band_partition, build_omega_band_partition)
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
 from .gw_config import ComputeMode, HeadCorrection
@@ -1083,6 +1084,9 @@ def run_fixed_sigma_evsc(
     e_dft_kn_ry,
     *,
     config,
+    meta,
+    band_slices: BandSlices,
+    wfn,
     mesh_xy: Mesh,
     print_fn: Callable = print,
 ) -> FixedSigmaEVSCResult:
@@ -1106,13 +1110,15 @@ def run_fixed_sigma_evsc(
     rCROP residual meaningful: eigenvector phases and degenerate-subspace
     gauges never enter the object being mixed.
 
-    The frequency table itself is never recomputed.  Evaluation outside its
-    sampled range, or across a patch hole, is refused: an endpoint clamp is
-    not eigenvalue self-consistency and must not be written as ``eqp2``.
-    Convergence is the maximum absolute eigenvalue difference between
-    ``F(H)`` and ``H`` over every reported state.  ``eqp2_accelerator=rcrop``
-    accelerates that fixed-basis map; ``linear`` is its unaccelerated Picard
-    fallback.
+    The frequency table itself is never recomputed.  Protected/in-range
+    states must remain covered by it; optional out-of-range states are
+    removed from the Sigma Hamiltonian and replaced by the same no-lag
+    semicore/conduction scissor policy as the ordinary SC driver.  Therefore
+    an internal endpoint clamp can occur only in matrix entries that the
+    partition immediately discards.  Convergence is the maximum absolute
+    eigenvalue difference between ``F(H)`` and ``H`` over the protected or
+    otherwise non-scissored states.  ``eqp2_accelerator=rcrop`` accelerates
+    that fixed-basis map; ``linear`` is its unaccelerated Picard fallback.
     """
     from common import sanity
     from .qsgw_utils import (
@@ -1144,6 +1150,18 @@ def run_fixed_sigma_evsc(
             f"run_fixed_sigma_evsc: E_DFT must be (nk,nb), got "
             f"{e_dft_ry.shape}.")
     nk, nb = (int(v) for v in e_dft_ry.shape)
+    b0 = int(band_slices.b0)
+    nb_sigma = int(band_slices.nb_sigma)
+    if nb != nb_sigma:
+        raise ValueError(
+            "run_fixed_sigma_evsc: E_DFT is not the canonical Sigma band "
+            f"window: nb={nb}, BandSlices.sigma has {nb_sigma} bands.")
+    n_occ = int(meta.nelec) - b0
+    if not (0 < n_occ < nb):
+        raise ValueError(
+            "run_fixed_sigma_evsc: the fixed-Sigma ladder needs an occupied "
+            "and an unoccupied frontier inside the active window; got "
+            f"b0={b0}, meta.nelec={int(meta.nelec)}, nb={nb}.")
     expected_cube = (len(np.asarray(omega_ev)), nk, nb, nb)
     if tuple(sigma_c_dft.shape) != expected_cube:
         raise ValueError(
@@ -1161,14 +1179,59 @@ def run_fixed_sigma_evsc(
         np.eye(nb, dtype=np.complex128)[None, :, :], (nk, nb, nb)).copy()
     U_seed = _place(ident, mesh_xy, rotation_spec)
     h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
-    h0_dft = jax.device_put(h0_dft, matrix_sharding)
-    sigma_c_dft = jax.device_put(
-        jnp.asarray(sigma_c_dft),
-        NamedSharding(mesh_xy, P(None, None, "x", "y")))
-    sigma_x_dft = jax.device_put(jnp.asarray(sigma_x_dft), matrix_sharding)
+    h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
+    sigma_c_dft = _place(
+        sigma_c_dft, mesh_xy, P(None, None, "x", "y"))
+    sigma_x_dft = _place(sigma_x_dft, mesh_xy, rotation_spec)
     omega_ev = np.asarray(omega_ev, dtype=np.float64)
     omega_ry = np.asarray(omega_ry, dtype=np.float64)
     efermi_ev = float(efermi_ev)
+    e_dft_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
+    partition = build_omega_band_partition(
+        e_dft_ry, e_dft_full_ry,
+        band_offset=b0,
+        omega_min_abs_ev=float(omega_ev[0]) + efermi_ev,
+        omega_max_abs_ev=float(omega_ev[-1]) + efermi_ev,
+        label="EQP2", print_fn=print_fn)
+    protected = np.asarray(
+        partition.protected_mask, dtype=bool).reshape(-1)
+    in_range = np.asarray(
+        partition.in_range_mask, dtype=bool).reshape(-1)
+    required_kn = np.broadcast_to(
+        (protected | in_range)[None, :], e_dft_ry.shape)
+    valence_mask_kn = np.broadcast_to(
+        (np.arange(nb) + b0 < int(meta.nelec))[None, :],
+        e_dft_ry.shape)
+
+    # EQP2 changes eigenvalues only, but metals still need the same fixed-N
+    # chemical potential and three-way valence/crossing/conduction split as
+    # the main SC map.  On an insulator this closure is never called and the
+    # established fixed-band-cut midgap path remains exact.
+    use_mp1 = bool(getattr(config, "occ_smearing_family", None))
+    if use_mp1:
+        from psp.get_DFT_mtxels import spin_degeneracy_factor
+        from .efermi import solve_mp1_occupations
+
+        _state_capacity = float(spin_degeneracy_factor(wfn))
+        _kweights = np.full(nk, 1.0 / nk, dtype=np.float64)
+
+        def _occupation_state(e_kn_ry):
+            return solve_mp1_occupations(
+                np.asarray(e_kn_ry, dtype=np.float64), _kweights,
+                float(wfn.num_electrons),
+                float(config.occ_broadening_ry),
+                state_capacity=_state_capacity,
+                clamp_tol=float(config.occupation_clamp_tol))
+
+        efermi_dft_scissor_ry, _ = _occupation_state(e_dft_ry)
+    else:
+        efermi_dft_scissor_ry = float(
+            _midgap_efermi(jnp.asarray(e_dft_ry), n_occ))
+
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import KStarMap
+    kstar = KStarMap.identity(nk)
     tol_ev = float(config.eqp2.tol_ev)
     max_iter = int(config.eqp2.max_iter)
     accelerator = str(config.eqp2.accelerator)
@@ -1185,15 +1248,22 @@ def run_fixed_sigma_evsc(
     H_seed = _place(H_seed_host, mesh_xy, rotation_spec)
 
     def _eigh(H):
-        H = jax.device_put(H, matrix_sharding)
+        H = _place(H, mesh_xy, rotation_spec)
         return _sc_eigh_bands(
             H, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
+
+    def _candidate_efermi(H):
+        e_candidate, _ = _eigh(H)
+        if use_mp1:
+            mu_ry, _ = _occupation_state(e_candidate)
+            return float(mu_ry)
+        return float(_midgap_efermi(e_candidate, n_occ))
 
     map_calls = [0]
 
     def _fixed_map(H_dft):
         call_index = map_calls[0]
-        H_dft = jax.device_put(H_dft, matrix_sharding)
+        H_dft = _place(H_dft, mesh_xy, rotation_spec)
         H_dft = 0.5 * (
             H_dft + jnp.conj(jnp.swapaxes(H_dft, -1, -2)))
         if call_index == 0:
@@ -1203,22 +1273,35 @@ def run_fixed_sigma_evsc(
             e_in_j, U_dft_to_qp = _eigh(H_dft)
             e_in_ry = np.asarray(e_in_j, dtype=np.float64)
 
+        if use_mp1:
+            from .scissor import classify_scissor_bands
+            _, f_in = _occupation_state(e_in_ry)
+            band_classes = classify_scissor_bands(f_in)
+            if call_index == 0:
+                print_fn(
+                    f"    EQP2 scissor classes: {band_classes.summary()}")
+        else:
+            band_classes = None
+
         e_rel_ev = e_in_ry * RYD_TO_EV - efermi_ev
-        covered, n_out, frac_out = omega_coverage(omega_ev, e_rel_ev)
-        if n_out:
-            worst = float(e_rel_ev[~covered].flat[
-                int(np.argmax(np.abs(e_rel_ev[~covered])))])
+        covered, n_out, _ = omega_coverage(omega_ev, e_rel_ev)
+        required_out = required_kn & ~covered
+        n_required_out = int(np.count_nonzero(required_out))
+        if n_required_out:
+            bad = e_rel_ev[required_out]
+            worst = float(bad.flat[int(np.argmax(np.abs(bad)))])
             raise ValueError(
                 "GATE eqp2_omega_coverage: fixed-Sigma eigenvalue "
-                f"self-consistency requested Sigma at {n_out}/{e_rel_ev.size} "
-                f"energies ({100.0 * frac_out:.1f}%) outside the sampled "
+                f"self-consistency requested Sigma at {n_required_out}/"
+                f"{int(np.count_nonzero(required_kn))} protected/non-scissored "
+                "energies outside the sampled "
                 f"grid [{omega_ev[0]:+.3f}, {omega_ev[-1]:+.3f}] eV "
                 f"(worst {worst:+.3f} eV).  An endpoint clamp would not be "
                 "Sigma(E), so eqp2 is refused.  Widen "
                 "sigma_omega_min_ev / sigma_omega_max_ev or add a "
                 "sigma_omega_patches_ev patch.")
         assert_omega_grid_covers(
-            e_rel_ev / RYD_TO_EV, covered, omega_ry,
+            e_rel_ev / RYD_TO_EV, required_kn & covered, omega_ry,
             context=f"eqp2 map call {call_index + 1}")
 
         # Both Sigma operands are expressed in the basis whose energies label
@@ -1237,16 +1320,30 @@ def run_fixed_sigma_evsc(
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
             replicated_output=False)
-        if int(diagnostics["n_clipped"]):
+        if int(diagnostics["n_clipped"]) != int(n_out):
             raise RuntimeError(
-                "run_fixed_sigma_evsc: coverage gate/build_qsgw_sigma_xc "
-                f"disagree ({int(diagnostics['n_clipped'])} clipped).")
+                "run_fixed_sigma_evsc: omega_coverage/build_qsgw_sigma_xc "
+                f"disagree ({n_out} outside versus "
+                f"{int(diagnostics['n_clipped'])} clipped).")
+        if call_index == 0 and n_out:
+            print_fn(
+                f"    EQP2: {n_out}/{e_rel_ev.size} optional out-of-grid "
+                "Sigma evaluations are edge-clamped only inside matrix "
+                "entries discarded by the partition, then replaced by the "
+                "semicore/conduction scissor.")
         sigma_xc_dft = _rotate_fixed_matrix(
             sigma_xc_qp, U_dft_to_qp, mesh=mesh_xy, to_qp=False)
-        H_out = h0_dft + sigma_xc_dft
-        H_out = 0.5 * (
-            H_out + jnp.conj(jnp.swapaxes(H_out, -1, -2)))
-        H_out = jax.device_put(H_out, matrix_sharding)
+        H_full = h0_dft + sigma_xc_dft
+        H_full = 0.5 * (
+            H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
+        H_out, _ = _apply_scissor_partition_policy(
+            H_full, e_dft_ry, valence_mask_kn, partition, kstar,
+            efermi_dft_ry=efermi_dft_scissor_ry,
+            n_occ=n_occ,
+            candidate_efermi_fn=_candidate_efermi,
+            band_classes=band_classes,
+            label="EQP2", print_fn=print_fn)
+        H_out = _place(H_out, mesh_xy, rotation_spec)
         sanity.refuse_nonfinite(
             f"eqp2 H map call {call_index + 1}", H_out,
             print_fn=print_fn)
@@ -1256,15 +1353,27 @@ def run_fixed_sigma_evsc(
         sanity.refuse_nonfinite(
             f"eqp2 E map call {call_index + 1}", e_out_ry,
             print_fn=print_fn)
-        residual_ev = float(
-            np.max(np.abs(e_out_ry - e_in_ry)) * RYD_TO_EV)
+        verdict = protected_band_convergence(
+            e_out_ry * RYD_TO_EV, e_in_ry * RYD_TO_EV,
+            protected, in_range, tol_ev)
+        residual_ev = float(verdict.max_abs_ev)
         map_calls[0] += 1
         return H_out, e_out_ry, U_out, residual_ev
 
     print_fn(
         f"[ EQP2 | fixed Sigma(omega), screening unchanged | "
-        f"criterion max|dE| <= {tol_ev * 1e3:.3f} meV | "
+        f"criterion max|dE| over non-scissored states "
+        f"<= {tol_ev * 1e3:.3f} meV | "
         f"accelerator {accelerator} | max_iter {max_iter} ]")
+
+    def _verify_final_map(H, *, source: str):
+        """Evaluate once after the putative final rotation/scissor."""
+        H_check, e_check, U_check, residual_check = _fixed_map(H)
+        print_fn(
+            f"[ EQP2 | final post-rotation verification ({source}) | "
+            f"max|dE| {residual_check * 1e3:.6f} meV | "
+            f"{'VERIFIED' if residual_check <= tol_ev else 'resume'} ]")
+        return H_check, e_check, U_check, residual_check
 
     if accelerator == "linear":
         H = H_seed
@@ -1275,9 +1384,12 @@ def run_fixed_sigma_evsc(
                 f"max|dE| {residual_ev * 1e3:.6f} meV | "
                 f"{'CONVERGED' if residual_ev <= tol_ev else 'continue'} ]")
             if residual_ev <= tol_ev:
-                return FixedSigmaEVSCResult(
-                    energies_ry=e_out_ry, U_dft_to_qp=U_out,
-                    iterations=map_calls[0], residual_ev=residual_ev)
+                H, e_out_ry, U_out, residual_ev = _verify_final_map(
+                    H, source=f"Picard {iteration:02d}")
+                if residual_ev <= tol_ev:
+                    return FixedSigmaEVSCResult(
+                        energies_ry=e_out_ry, U_dft_to_qp=U_out,
+                        iterations=map_calls[0], residual_ev=residual_ev)
     else:
         from mixing.acceleration import rcrop_nojit
 
@@ -1288,23 +1400,30 @@ def run_fixed_sigma_evsc(
                 self.residual = residual
 
         last_accepted_residual = [float("inf")]
+        residual_calls = [0]
 
         def _residual_fn(H):
-            call_index = map_calls[0]
+            call_index = residual_calls[0]
             H_in = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-            H_in = jax.device_put(H_in, matrix_sharding)
+            H_in = _place(H_in, mesh_xy, rotation_spec)
             H_out, e_out, U_out, residual = _fixed_map(H_in)
+            residual_calls[0] += 1
             role = ("initial" if call_index == 0 else
                     "trial" if call_index % 2 else "accepted")
             print_fn(
-                f"[ EQP2 | rCROP map {call_index + 1:02d} | {role} | "
+                f"[ EQP2 | rCROP residual {call_index + 1:02d} | {role} | "
                 f"max|dE| {residual * 1e3:.6f} meV | "
                 f"{'CONVERGED' if residual <= tol_ev else 'continue'} ]")
             if role != "trial":
                 last_accepted_residual[0] = residual
                 if residual <= tol_ev:
-                    raise _EQP2Converged(e_out, U_out, residual)
-            return jax.device_put(H_out - H_in, matrix_sharding)
+                    _, e_check, U_check, residual_check = _verify_final_map(
+                        H_out, source=f"rCROP {role} {call_index + 1:02d}")
+                    last_accepted_residual[0] = residual_check
+                    if residual_check <= tol_ev:
+                        raise _EQP2Converged(
+                            e_check, U_check, residual_check)
+            return _place(H_out - H_in, mesh_xy, rotation_spec)
 
         try:
             rcrop_nojit(
@@ -2440,124 +2559,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         e_dft_act = ks.select(e_dft_act)
         val_mask = ks.select(val_mask)
 
-    # ``ks``, NOT A WEIGHT ARRAY.  The scissor refit is a REDUCTION over k
-    # and the only one in the carry, so it needs star multiplicities, not
-    # just the right k-set (§7 of the scaffold labels operands by k-set;
-    # that rule is incomplete).  Handing the callee the SAME map that did
-    # the ``select`` three lines up is what makes the weights impossible
-    # to get out of step with the rows.  Fit ONCE.  With dE_F=0 the returned
-    # provisional candidates already contain the FINAL affine conduction
-    # law, while valence stays at DFT for the non-circular Fermi probe below.
-    scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
-        H_qp_dft_full, e_dft_act, val_mask,
-        inputs.partition.in_range_mask, ks,
+    # The same no-lag semicore/conduction policy is used by fixed-Sigma
+    # EQP2.  ``ks`` is deliberately passed rather than spelling weights:
+    # the fit is a reduction over k and must use the multiplicities of the
+    # exact rows selected above.
+    H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
+        H_qp_dft_full, e_dft_act, val_mask, inputs.partition, ks,
+        efermi_dft_ry=float(inputs.efermi_dft_ry),
+        n_occ=n_occ,
+        candidate_efermi_fn=lambda H: _partitioned_candidate_efermi(
+            H, inputs=inputs, kstar=ks, n_occ=n_occ,
+            use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
-        fermi_displacement_ry=0.0,
-        print_fn=inputs.print_fn,
-    )
-    scissor_E_qp_kn_ry = scissor_provisional_ry
-
-    # NO-LAG FERMI ANCHOR FOR THE LOW-VALENCE TAIL.  The map must preserve
-    # E_low - E_F against F(H)'s Fermi level, not the ENTRY Fermi that built
-    # this map's W/Sigma: using the latter would leave the scissored valence
-    # one complete map behind whenever the protected gap moves.
-    #
-    # Resolve E_F from a provisional partition in which out-of-range valence
-    # keeps E_DFT and out-of-range conduction ALREADY has the final affine
-    # law.  The valence provisional choice cannot affect E_F under the class
-    # contract: true valence is below the lowest crossing/frontier band, and
-    # the entire frontier is gated in-range below.  Thus replacing only that
-    # deep/full tail afterward leaves the same candidate Fermi.  We recompute
-    # E_F on the final H and enforce this statement rather than assume it.
-    fermi_displacement_ry = 0.0
-    if not bool(np.asarray(inputs.partition.in_range_mask, dtype=bool).all()):
-        in_range_np = np.asarray(
-            inputs.partition.in_range_mask, dtype=bool).reshape(-1)
-        if scissor_classes is not None and scissor_classes.n_crossing:
-            frontier = np.arange(
-                int(scissor_classes.valence_stop),
-                int(scissor_classes.conduction_start))
-        else:
-            # Gapped/fixed occupations: the occupied/unoccupied edge is the
-            # two-band frontier that owns the midgap convention.
-            frontier = np.asarray(
-                [max(0, n_occ - 1), min(n_occ, in_range_np.size - 1)],
-                dtype=np.int64)
-        bad_frontier = frontier[~in_range_np[frontier]]
-        if bad_frontier.size:
-            raise ValueError(
-                "SC low-valence Fermi anchor requires the complete "
-                "Fermi-crossing/frontier manifold inside the Sigma window; "
-                f"out-of-range active band(s) {bad_frontier.tolist()} would "
-                "make E_F(F(H)) depend on the scissor being anchored. Widen "
-                "sigma_omega_min/max_ev (and preserve whole multiplets).")
-        H_fermi_probe = apply_band_partition(
-            H_qp_dft_full,
-            protected_mask=inputs.partition.protected_mask,
-            in_range_mask=inputs.partition.in_range_mask,
-            scissor_E_qp_kn=scissor_provisional_ry,
-        )
-        candidate_efermi_ry = _partitioned_candidate_efermi(
-            H_fermi_probe,
-            inputs=inputs,
-            kstar=ks,
-            n_occ=n_occ,
-            use_mp1=entry_occ_state is not None,
-        )
-        fermi_displacement_ry = (
-            candidate_efermi_ry - float(inputs.efermi_dft_ry))
-
-        # Apply ONLY the newly known valence shift to the provisional table.
-        # qsgw_out_of_range_energies reads the same fitted alpha_c/beta_c, so
-        # the conduction candidates are identical to the probe -- there is no
-        # second fit and no second spelling of its affine law.
-        from .scissor import qsgw_out_of_range_energies
-        e_dft_np = np.asarray(e_dft_act, dtype=np.float64)
-        valence_kn = np.asarray(val_mask, dtype=bool)
-        crossing_kn = None
-        if scissor_classes is not None:
-            valence_kn, crossing_kn = scissor_classes.masks(e_dft_np.shape)
-        scissor_E_qp_kn_ry = jnp.asarray(
-            qsgw_out_of_range_energies(
-                e_dft_np * RYD_TO_EV,
-                scissor_fit,
-                valence_kn,
-                fermi_displacement_ev=(
-                    fermi_displacement_ry * RYD_TO_EV),
-                crossing_mask_kn=crossing_kn,
-            ) / RYD_TO_EV)
-        inputs.print_fn(
-            "    SC low-valence anchor: "
-            f"E_F(DFT)={float(inputs.efermi_dft_ry) * RYD_TO_EV:+.6f} eV, "
-            f"E_F(F(H))={candidate_efermi_ry * RYD_TO_EV:+.6f} eV, "
-            f"dE_F={fermi_displacement_ry * RYD_TO_EV:+.6f} eV")
-
-    H_qp_dft_new = apply_band_partition(
-        H_qp_dft_full,
-        protected_mask=inputs.partition.protected_mask,
-        in_range_mask=inputs.partition.in_range_mask,
-        scissor_E_qp_kn=scissor_E_qp_kn_ry,
-    )
-    if scissor_fit is not None:
-        final_efermi_ry = _partitioned_candidate_efermi(
-            H_qp_dft_new,
-            inputs=inputs,
-            kstar=ks,
-            n_occ=n_occ,
-            use_mp1=entry_occ_state is not None,
-        )
-        if not np.isclose(
-            final_efermi_ry, candidate_efermi_ry,
-            rtol=0.0, atol=1.0e-10,
-        ):
-            raise ValueError(
-                "SC low-valence Fermi anchor became circular: final "
-                f"E_F={final_efermi_ry * RYD_TO_EV:+.9f} eV differs from "
-                f"the provisional anchor "
-                f"{candidate_efermi_ry * RYD_TO_EV:+.9f} eV by "
-                f"{(final_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.3e} "
-                "eV. A scissored tail entered the frontier; widen the Sigma "
-                "window rather than anchoring through it.")
+        label="SC", print_fn=inputs.print_fn)
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
@@ -2747,6 +2761,113 @@ def _scissor_E_qp_for_outofrange(
         crossing_mask_kn=crossing_kn,
     )
     return jnp.asarray(out_ev / RYD_TO_EV), fit
+
+
+def _apply_scissor_partition_policy(
+    H_qp_dft_full: jax.Array,
+    e_dft_kn_ry,
+    valence_mask_kn,
+    partition: BandPartition,
+    kstar,
+    *,
+    efermi_dft_ry: float,
+    n_occ: int,
+    candidate_efermi_fn: Callable[[jax.Array], float],
+    band_classes=None,
+    label: str = "SC",
+    print_fn=print,
+) -> tuple[jax.Array, ScissorFit | None]:
+    """Apply the shared semicore/conduction policy to one full H map.
+
+    In-range states keep their Sigma-derived Hamiltonian.  Out-of-range
+    conduction states take the affine fit derived from those in-range
+    states; out-of-range valence states preserve ``E - E_F`` using this
+    map output's own Fermi level.  The provisional/final Fermi check makes
+    that anchor non-circular.  Both the ordinary SC loop and fixed-Sigma
+    EQP2 call this function on every map evaluation.
+    """
+    scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
+        H_qp_dft_full, e_dft_kn_ry, valence_mask_kn,
+        partition.in_range_mask, kstar,
+        band_classes=band_classes,
+        fermi_displacement_ry=0.0,
+        print_fn=print_fn,
+    )
+    scissor_E_qp_kn_ry = scissor_provisional_ry
+    candidate_efermi_ry = None
+
+    if scissor_fit is not None:
+        in_range_np = np.asarray(
+            partition.in_range_mask, dtype=bool).reshape(-1)
+        if band_classes is not None and band_classes.n_crossing:
+            frontier = np.arange(
+                int(band_classes.valence_stop),
+                int(band_classes.conduction_start))
+        else:
+            frontier = np.asarray(
+                [max(0, n_occ - 1), min(n_occ, in_range_np.size - 1)],
+                dtype=np.int64)
+        bad_frontier = frontier[~in_range_np[frontier]]
+        if bad_frontier.size:
+            raise ValueError(
+                f"{label} low-valence Fermi anchor requires the complete "
+                "Fermi-crossing/frontier manifold inside the Sigma window; "
+                f"out-of-range active band(s) {bad_frontier.tolist()} would "
+                "make E_F(F(H)) depend on the scissor being anchored. Widen "
+                "sigma_omega_min/max_ev (and preserve whole multiplets).")
+
+        H_fermi_probe = apply_band_partition(
+            H_qp_dft_full,
+            protected_mask=partition.protected_mask,
+            in_range_mask=partition.in_range_mask,
+            scissor_E_qp_kn=scissor_provisional_ry,
+        )
+        candidate_efermi_ry = float(candidate_efermi_fn(H_fermi_probe))
+        fermi_displacement_ry = (
+            candidate_efermi_ry - float(efermi_dft_ry))
+
+        from .scissor import qsgw_out_of_range_energies
+        e_dft_np = np.asarray(e_dft_kn_ry, dtype=np.float64)
+        valence_kn = np.asarray(valence_mask_kn, dtype=bool)
+        crossing_kn = None
+        if band_classes is not None:
+            valence_kn, crossing_kn = band_classes.masks(e_dft_np.shape)
+        scissor_E_qp_kn_ry = jnp.asarray(
+            qsgw_out_of_range_energies(
+                e_dft_np * RYD_TO_EV,
+                scissor_fit,
+                valence_kn,
+                fermi_displacement_ev=(
+                    fermi_displacement_ry * RYD_TO_EV),
+                crossing_mask_kn=crossing_kn,
+            ) / RYD_TO_EV)
+        print_fn(
+            f"    {label} low-valence anchor: "
+            f"E_F(DFT)={float(efermi_dft_ry) * RYD_TO_EV:+.6f} eV, "
+            f"E_F(F(H))={candidate_efermi_ry * RYD_TO_EV:+.6f} eV, "
+            f"dE_F={fermi_displacement_ry * RYD_TO_EV:+.6f} eV")
+
+    H_partitioned = apply_band_partition(
+        H_qp_dft_full,
+        protected_mask=partition.protected_mask,
+        in_range_mask=partition.in_range_mask,
+        scissor_E_qp_kn=scissor_E_qp_kn_ry,
+    )
+    if scissor_fit is not None:
+        final_efermi_ry = float(candidate_efermi_fn(H_partitioned))
+        if not np.isclose(
+            final_efermi_ry, candidate_efermi_ry,
+            rtol=0.0, atol=1.0e-10,
+        ):
+            raise ValueError(
+                f"{label} low-valence Fermi anchor became circular: final "
+                f"E_F={final_efermi_ry * RYD_TO_EV:+.9f} eV differs from "
+                f"the provisional anchor "
+                f"{candidate_efermi_ry * RYD_TO_EV:+.9f} eV by "
+                f"{(final_efermi_ry - candidate_efermi_ry) * RYD_TO_EV:+.3e} "
+                "eV. A scissored tail entered the frontier; widen the Sigma "
+                "window rather than anchoring through it.")
+    return H_partitioned, scissor_fit
 
 
 def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
@@ -3790,9 +3911,6 @@ def run_sc_driver(
     """
     import dataclasses
 
-    from .band_partition import BandPartition
-    from .scissor import classify_bands_in_grid
-
     # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
     # module indexes the ACTIVE window with a GLOBAL band count:
     # ``val_mask_active`` below, ``n_occ`` in ``gw_iteration_map``, the
@@ -3860,35 +3978,15 @@ def run_sc_driver(
             _midgap_efermi(e_dft_active_kn_ry, int(meta.nelec)))
     omega_min_ev = float(config.sigma.omega_min_ev) + efermi_ev
     omega_max_ev = float(config.sigma.omega_max_ev) + efermi_ev
-    e_dft_ev = np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV
-    band_in_grid, _ = classify_bands_in_grid(
-        e_dft_ev, omega_min_ev, omega_max_ev)
-    in_range = jnp.asarray(band_in_grid, dtype=bool)
-    # Default protected = in-range: these bands carry full off-diag Σ.
-    # Out-of-range bands take the scissor, no off-diag mixing.
-    print_fn(
-        f"  SC partition: protected/in-range = {int(band_in_grid.sum())}"
-        f"/{int(band_in_grid.size)} bands"
-    )
-    partition = BandPartition(
-        protected_mask=in_range, in_range_mask=in_range)
-    partition.warn_if_protected_outside_grid(print_fn=print_fn)
-    # THE PARTITION'S OWN BOUNDARIES, against the UNTRUNCATED mean field.
-    #
-    # ``classify_bands_in_grid`` is an all-k energy-window predicate, so the
-    # mask is not required to be contiguous and its edges are not required to
-    # fall between multiplets.  Report first — the number of splits and the
-    # gap they cut is what says how big the promotion below is — then promote,
-    # per the owner's ruling that degenerate spaces stay degenerate.
-    #
-    # ``wfn.energies[0]`` and NOT ``e_dft_active_kn_ry``: the active window is
-    # itself a slice, and ``boundary_min_gaps`` returns +inf at its outer edge
-    # by construction, so a window cannot see the cut that produced it.
-    _enk_full_ry = np.asarray(wfn.energies[0], dtype=np.float64)
-    _b0 = int(band_slices.sigma.start)
-    partition.report_multiplet_splits(_enk_full_ry, _b0, print_fn=print_fn)
-    partition = partition.promoted_to_multiplets(
-        _enk_full_ry, _b0, print_fn=print_fn)
+    # One constructor owns the all-k window predicate and whole-multiplet
+    # promotion.  EQP2 uses the same constructor below; neither ladder can
+    # silently invent a different protected subspace.
+    partition = build_omega_band_partition(
+        e_dft_active_kn_ry, np.asarray(wfn.energies[0], dtype=np.float64),
+        band_offset=int(band_slices.b0),
+        omega_min_abs_ev=omega_min_ev,
+        omega_max_abs_ev=omega_max_ev,
+        label="SC", print_fn=print_fn)
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
     # independent jobs and only the first is optional:

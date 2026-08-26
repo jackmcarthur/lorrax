@@ -153,7 +153,10 @@ class GWProductionReport:
         if bool(getattr(eqp2, "enabled", False)):
             self.emit(
                 "EQP2 treatment  : fixed-Sigma eigenvalue self-consistency; "
-                f"max|dE| cutoff={float(eqp2.tol_ev) * 1e3:.3f} meV; "
+                "semicore E-E_F + conduction scissor outside the protected "
+                "window; final post-rotation map required; "
+                f"max|dE| cutoff={float(eqp2.tol_ev) * 1e3:.3f} meV "
+                "(non-scissored); "
                 f"accelerator={eqp2.accelerator}"
                 + (f"(depth={int(eqp2.history_depth)})"
                    if str(eqp2.accelerator) == "rcrop" else "")
@@ -408,10 +411,13 @@ class GWProductionReport:
         self.heading("Fixed-Sigma eigenvalue consistency")
         self.emit(f"Convergence     : {int(iterations)} map evaluations; "
                   f"max|dE|={float(residual_ev) * 1e3:.6f} meV "
-                  f"<= {float(tol_ev) * 1e3:.6f} meV")
+                  f"<= {float(tol_ev) * 1e3:.6f} meV over non-scissored "
+                  "states; final post-rotation map verified")
         self.emit("Updated objects : QP eigenvalues/eigenvectors and the "
                   "basis representation of stored Sigma(omega)")
         self.emit("Held fixed      : screening, W, and all self-energy diagrams")
+        self.emit("Outside grid    : semicore preserves E-E_F; high conduction "
+                  "uses the in-grid affine scissor")
         if e.ndim == 2 and iv >= 0 and ic < e.shape[1]:
             gap = float(np.min(e[:, ic]) - np.max(e[:, iv]))
             state = "insulating" if gap > 0.0 else "metallic/overlapping"
