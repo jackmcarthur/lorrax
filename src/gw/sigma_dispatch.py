@@ -356,7 +356,11 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
             "transverse direct Hartree datasets.")
     key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
            source, require_transverse, _mesh_cache_key(mesh_xy))
-    if key in _hartree_cache:
+    # A gspace result is a functional of the live WFN occupations and gauge,
+    # neither of which belongs to this path/window cache key.  Rebuild it;
+    # stored artifacts already authenticate their WFN at the format gate.
+    cacheable = source != "gspace"
+    if cacheable and key in _hartree_cache:
         return _hartree_cache[key]
 
     v_h = None
@@ -422,7 +426,8 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
         print_fn("  V_H: ISDF V_q[0] quadrature (hartree_source=isdf); H0 "
                  "therefore depends on the centroid count.")
 
-    _hartree_cache[key] = (source, v_h, v_h_t)
+    if cacheable:
+        _hartree_cache[key] = (source, v_h, v_h_t)
     return source, v_h, v_h_t
 
 

@@ -754,9 +754,15 @@ def main(argv=None):
 	from file_io.kin_ion import resolve_hartree_source
 	hartree_source = resolve_hartree_source(
 		config.paths.kin_ion_file, config.hartree_source, print_fn=print0)
+	# The format owner distinguishes exact-integer legacy compatibility from a
+	# fractional stored/folded artifact by the artifact's occupation-policy
+	# marker, then fingerprints THIS exact loader only when that receipt is
+	# required.  No caller-carried ISDF digest can enter this gate.
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
+		wfn=wfn,
+		selected_hartree_source=hartree_source,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,

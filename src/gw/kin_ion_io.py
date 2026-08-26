@@ -102,7 +102,8 @@ _services.ensure_on_path()
 
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
-    HARTREE_DATASET, TRANSVERSE_HARTREE_DATASET,
+    HARTREE_DATASET, HARTREE_OCCUPATION_POLICY,
+    TRANSVERSE_HARTREE_DATASET,
     TRANSVERSE_HARTREE_CURRENT_PROJECTION,
     TRANSVERSE_HARTREE_G0_DIAGNOSTIC, TRANSVERSE_HARTREE_G0_POLICY,
     TRANSVERSE_HARTREE_PROJECTOR, TRANSVERSE_HARTREE_SYMMETRY,
@@ -358,49 +359,9 @@ def _wedge_sweep_kspec(wfn, sym):
 
 # ---- artifact provenance ---------------------------------------------------
 # A kin_ion.h5 with no stamp of WHAT it was made from is how a stale
-# committed fixture survived a month of green tests.  The two stamps below
-# are deliberately BOUNDED (see each docstring) and each says its own scope
-# in a companion attr, so no reader can over-trust them.
-
-_WFN_CHECKSUM_SCOPE = (
-    "md5 over the WFN's /mf_header group ONLY (not the psi coefficients): "
-    "every dataset in sorted-path order contributing 'path|dtype|shape' "
-    "then its C-order raw bytes")
-
-
-def _wfn_checksum(wfn_path: str) -> str:
-    """Content hash of the WFN's ``mf_header`` — ``'md5:<hex>'``.
-
-    SCOPE IS THE HEADER ALONE, and that is a bound, not an oversight:
-    hashing the coefficients means a second full read of the WFN (9 MB on
-    the Si fixture, hundreds of GB in production) for a provenance stamp.
-    The header pins the lattice, the atoms, the FFT grid, the k-set,
-    ngk/ngkmax, the whole G-sphere and every DFT eigenvalue, so every way
-    a consumer's WFN can be a *different calculation* shows up here.  What
-    it does NOT catch is the same calculation rerun to a different ψ
-    gauge.  ``wfn_checksum_scope`` is written beside it so a consumer
-    comparing hashes knows exactly which of those two questions it just
-    answered.  Never raises: a stamp that can abort a 3-hour generator is
-    worse than no stamp.
-    """
-    import hashlib
-    try:
-        h = hashlib.md5()
-        with h5py.File(wfn_path, "r") as f:
-            grp = f["mf_header"]
-            names = []
-            grp.visit(names.append)
-            for name in sorted(names):
-                obj = grp.get(name)
-                if not isinstance(obj, h5py.Dataset):
-                    continue
-                arr = np.ascontiguousarray(obj[()])
-                h.update(f"{name}|{arr.dtype.str}|{arr.shape}".encode())
-                h.update(arr.tobytes())
-        return "md5:" + h.hexdigest()
-    except Exception as exc:                                  # noqa: BLE001
-        return f"unknown:{type(exc).__name__}"
-
+# committed fixture survived a month of green tests.  WFN identity is owned
+# by ``common.parallel_transport.wfn_fingerprint``; this module owns only its
+# generator-commit stamp.
 
 def _generator_commit() -> str:
     """Commit of the SOURCE TREE THIS MODULE RAN FROM — not the cwd's.
@@ -653,7 +614,7 @@ def _load_rotated_occ_fftbox(wfn, meta, ik: int, U_k):
     return box[0]
 
 
-def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
+def build_valence_density_distributed(wfn, sym, meta, *,
                                       nk: int | None = None,
                                       mesh=None,
                                       psi_rotation=None,
@@ -680,9 +641,9 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
     per-k quadrature helper, no second copy of the density math — and
     never holds more than one ``(k, band-chunk)`` of ψ, which is what
     keeps the 144-k / 400-band decks inside a node.  The unfolded full
-    BZ carries uniform weights ``1/nk_tot`` by construction
-    (``SymMaps`` expands the IBZ to the full mesh), so no ``kweights``
-    lookup is needed.
+    BZ carries uniform k weights ``1/nk_tot`` by construction.  WfnLoader
+    supplies the matching full-BZ per-band occupations through the same
+    cached ``irr_idx_k`` source rows used by its ψ unfold.
 
     THE QSGW SEAM — ``psi_rotation``
     --------------------------------
@@ -724,6 +685,20 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
         raise ValueError(
             "evolving-orbital Dirac-current density is not implemented; "
             "bispinor self-consistency must fail closed")
+    nocc = int(wfn.physical_density_band_stop)
+    occupation_weights = wfn.physical_density_occupations(
+        k="full_bz", unit_as_none=True)
+    f_spin = spin_degeneracy_factor(wfn)
+    if occupation_weights is not None:
+        if rotated:
+            raise ValueError(
+                "fractional WFN occupations cannot be attached to rotated "
+                "current-orbital columns; the self-consistent occupation "
+                "state must be supplied explicitly")
+        if occupation_weights.shape != (nk, nocc):
+            raise ValueError(
+                "canonical full-BZ occupations have shape "
+                f"{occupation_weights.shape}, expected ({nk},{nocc})")
     # A supplied rotation couples the whole occupied band manifold.  It
     # deliberately retains the all-band item; making that path bounded needs
     # a distributed rotation, not silently applying independent band slices.
@@ -741,7 +716,6 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
                  nk, int(nocc), world,
                  max_bands_per_item=max_bands_per_item))
     mine = local_share(items)
-    f_spin = spin_degeneracy_factor(wfn)
     wk = 1.0 / float(nk)
     print_fn(f"    rho{' + signed J/c' if include_current else ''} sweep: "
              f"{len(items)} (k, band-chunk) items over "
@@ -767,11 +741,19 @@ def build_valence_density_distributed(wfn, sym, meta, nocc: int, *,
             psi_k = load_kpoint_fftbox_local(
                 wfn, meta, ik, b_hi, b_lo=b_lo,
                 bispinor=(int(meta.nspinor) == 4))
-        rho_local = rho_local + valence_density_from_kpoint(
-            psi_k, nocc=None, weight=wk,
-            cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
-            include_dirac_current=include_current,
-        )
+        if occupation_weights is None:
+            rho_local = rho_local + valence_density_from_kpoint(
+                psi_k, nocc=None, weight=wk,
+                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
+                include_dirac_current=include_current,
+            )
+        else:
+            rho_local = rho_local + valence_density_from_kpoint(
+                psi_k, nocc=None, weight=wk,
+                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
+                band_occupations=occupation_weights[ik, b_lo:b_hi],
+                include_dirac_current=include_current,
+            )
         # The Python loop is otherwise an asynchronous dispatch queue.  At a
         # large FFT grid, queuing every local item can retain several completed
         # box/workspace families until the final np.asarray synchronisation.
@@ -871,6 +853,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
     nocc = int(wfn.nelec)
+    exact_unit_occupations = bool(wfn.occupations_are_exact_integer)
+    density_band_stop = int(wfn.physical_density_band_stop)
     nk = int(sym.nk_tot)
     with_transverse = bool(include_transverse)
     if with_transverse and int(meta.nspinor) != 4:
@@ -881,7 +865,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         raise ValueError(
             "evolving-orbital transverse Hartree is not implemented; "
             "bispinor self-consistency must fail closed")
-    if nocc > nb:
+    if exact_unit_occupations and nocc > nb:
         raise ValueError(
             f"V_H needs the {nocc} occupied bands but only {nb} were requested")
 
@@ -903,12 +887,14 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                           else tuple(int(s) for s in meta.fft_grid)),
                          dtype=np.float64), mesh)
 
-    print_fn(f"\nBuilding valence density from {nocc} occupied bands "
-             f"(P={world}, {nk} k-points)...")
+    density_label = ("occupied bands" if exact_unit_occupations else
+                     "WFN bands with canonical fractional occupations")
+    print_fn(f"\nBuilding valence density from {density_band_stop} "
+             f"{density_label} (P={world}, {nk} k-points)...")
     f_spin = spin_degeneracy_factor(wfn)
     with timing.section("vh_rho"):
         rho_np = build_valence_density_distributed(
-            wfn, sym, meta, nocc, nk=nk, mesh=mesh,
+            wfn, sym, meta, nk=nk, mesh=mesh,
             psi_rotation=psi_rotation,
             max_bands_per_item=band_chunk_size,
             include_dirac_current=with_transverse,
@@ -971,10 +957,12 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # replicated ρ and gets bit-identical V_H(r) — which is also what
     # makes the k-partitioned matrix-element sweep below trivially
     # rank-invariant.  Revisit only above N_r ≈ 1e8.
+    expected_electrons = (f_spin * float(nocc) if exact_unit_occupations
+                          else float(wfn.num_electrons))
     V_H_r = build_hartree_potential(
         jnp.asarray(rho_np), wfn,
         truncation_2d=bool(truncation_2d),
-        expected_electrons=f_spin * float(nocc),
+        expected_electrons=expected_electrons,
         print_fn=print_fn,
     )
     # V_H(r) is replicated (step 2), so it is closed over by the operator
@@ -1462,6 +1450,9 @@ def main(argv=None):
     # question — that flag exists ONLY to reproduce pre-``v_hartree``
     # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
     # stays in the legacy layout (see ``store_ibz`` below).
+    fractional_hartree_occupations = not bool(
+        wfn.occupations_are_exact_integer)
+    hartree_density_band_stop = int(wfn.physical_density_band_stop)
     v_h_all = None
     v_h_transverse_all = None
     current_diagnostic = None
@@ -1657,6 +1648,13 @@ def main(argv=None):
                 ds.attrs["has_hartree"] = folded
                 ds.attrs["hartree_truncation_2d"] = bool(
                     ctx.truncation_2d) if folded else False
+                if args.hartree and fractional_hartree_occupations:
+                    ds.attrs["exact_hartree_occupation_policy"] = (
+                        HARTREE_OCCUPATION_POLICY)
+                    ds.attrs["exact_hartree_expected_electrons"] = float(
+                        wfn.num_electrons)
+                    ds.attrs["exact_hartree_density_band_stop"] = (
+                        hartree_density_band_stop)
                 ds.attrs["input_file"] = os.path.basename(args.input)
                 ds.attrs["wfn_file"] = os.path.basename(wfn_path)
                 ds.attrs["nval"] = nval
@@ -1687,8 +1685,10 @@ def main(argv=None):
                 # the WFN rather than the deck, so a mismatch localises a
                 # wrong-WFN diagnosis immediately.
                 ds.attrs["ngkmax"] = int(wfn.ngkmax)
-                ds.attrs["wfn_checksum"] = _wfn_checksum(wfn_path)
-                ds.attrs["wfn_checksum_scope"] = _WFN_CHECKSUM_SCOPE
+                from common.parallel_transport import (
+                    WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+                ds.attrs["wfn_fingerprint"] = wfn_fingerprint(wfn)
+                ds.attrs["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
                 ds.attrs["generator_commit"] = _generator_commit()
                 # The k-set actually COMPUTED — always the STAR wedge, and
                 # now always the one stored too except under
@@ -1714,6 +1714,8 @@ def main(argv=None):
                         "NOT included in the 'kin_ion' dataset")
                     vh.attrs["truncation_2d"] = bool(ctx.truncation_2d)
                     vh.attrs["nocc"] = int(wfn.nelec)
+                    vh.attrs["density_band_stop"] = (
+                        hartree_density_band_stop)
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
                     vh.attrs["matrix_nspinor"] = int(meta.nspinor)
                 if v_h_transverse_all is not None:
@@ -1726,6 +1728,8 @@ def main(argv=None):
                         "periodic Coulomb-gauge transverse direct Hartree")
                     vht.attrs["truncation_2d"] = bool(ctx.truncation_2d)
                     vht.attrs["nocc"] = int(wfn.nelec)
+                    vht.attrs["density_band_stop"] = (
+                        hartree_density_band_stop)
                     vht.attrs["fft_grid"] = np.asarray(
                         meta.fft_grid, dtype=np.int32)
                     vht.attrs["matrix_nspinor"] = int(meta.nspinor)

@@ -276,6 +276,9 @@ TOL_SPATIAL = 1.0e-4
 # (2.5e-13 → 3.1e-14, both ~7 orders under the gate), while the cost is
 # linear in k (~0.4 s/k warm on a 36x36x135 box with 26 occupied bands).
 MAX_K_DEFAULT = 12
+# Bound fractional diagnostics to one small band slab per sampled k; the
+# exact-integer path below keeps its incumbent single occupied-window load.
+FRACTIONAL_BAND_CHUNK = 16
 
 
 # ----------------------------------------------------------------------
@@ -577,8 +580,8 @@ def _select_kpoints(kint: np.ndarray, weights: np.ndarray,
 # ----------------------------------------------------------------------
 # Raw IBZ ψ → spin-resolved density
 # ----------------------------------------------------------------------
-def _raw_ibz_psi_k(loader, ik: int, nb: int) -> np.ndarray:
-    """Raw ``(nb, nspinor, ngk)`` complex coefficients for IBZ k ``ik``.
+def _raw_ibz_psi_k(loader, ik: int, nb: int, *, b_lo: int = 0) -> np.ndarray:
+    """Raw ``(nb-b_lo, nspinor, ngk)`` coefficients for IBZ k ``ik``.
 
     Deliberately reads ``wfns/coeffs`` directly rather than going through
     ``loader.load(k='ibz')``: the check must be independent of every
@@ -591,7 +594,7 @@ def _raw_ibz_psi_k(loader, ik: int, nb: int) -> np.ndarray:
     ds = loader._file["wfns/coeffs"]
     start = int(loader._kpt_starts[int(ik)])
     ngk = int(loader.ngk[int(ik)])
-    raw = ds[:int(nb), :, start:start + ngk, :]      # (nb, ns, ngk, 2)
+    raw = ds[int(b_lo):int(nb), :, start:start + ngk, :]
     return raw[..., 0] + 1j * raw[..., 1]
 
 
@@ -614,6 +617,7 @@ def _to_box(psi_k: np.ndarray, g_index_k: np.ndarray,
 
 def _spin_resolved_density(psi_box: np.ndarray, *, nocc: int, weight: float,
                            cell_volume: float, spin_degeneracy: float,
+                           band_occupations: np.ndarray | None,
                            want_transverse: bool,
                            valence_density_fn=None):
     """``(ρ_k, m_k)`` for one k, both weighted by ``weight``.
@@ -660,10 +664,12 @@ def _spin_resolved_density(psi_box: np.ndarray, *, nocc: int, weight: float,
         _D = valence_density_fn
 
     def dens(arr) -> np.ndarray:
-        return np.asarray(_D(arr, nocc=nocc, weight=weight,
-                             cell_volume=cell_volume,
-                             spin_degeneracy=spin_degeneracy),
-                          dtype=np.float64)
+        kwargs = dict(nocc=nocc, weight=weight,
+                      cell_volume=cell_volume,
+                      spin_degeneracy=spin_degeneracy)
+        if band_occupations is not None:
+            kwargs["band_occupations"] = band_occupations
+        return np.asarray(_D(arr, **kwargs), dtype=np.float64)
 
     ns = int(psi_box.shape[1])
     if ns == 1:
@@ -755,8 +761,12 @@ def check_density_symmetries(
     f_spin = float(spin_degeneracy_factor(loader))
     nb_file = int(loader.nbands)
     if nocc is None:
-        nocc = int(loader.nelec)
+        nocc = int(loader.physical_density_band_stop)
     nocc = max(1, min(int(nocc), nb_file))
+    occupation_weights = loader.physical_density_occupations(
+        k="file", unit_as_none=True)
+    if occupation_weights is not None:
+        occupation_weights = occupation_weights[:, :nocc]
 
     fft_grid = tuple(int(s) for s in loader.fft_grid)
     kpoints = np.asarray(loader.kpoints, dtype=np.float64)
@@ -802,6 +812,36 @@ def check_density_symmetries(
     m_k: dict[int, np.ndarray] = {}
     t_io = t_quad = 0.0
     for j, ik in enumerate(sel):
+        if occupation_weights is not None:
+            r = np.zeros(fft_grid, dtype=np.float64)
+            m = None
+            windows = loader.uniform_band_windows(
+                0, nocc, FRACTIONAL_BAND_CHUNK)
+            for b_lo, band_mask in windows:
+                b_hi = b_lo + int(band_mask.size)
+                t = time.perf_counter()
+                psi = _raw_ibz_psi_k(
+                    loader, int(ik), b_hi, b_lo=b_lo)
+                box = _to_box(psi, g_index[int(ik)], ngkmax)
+                t_io += time.perf_counter() - t
+                t = time.perf_counter()
+                r_chunk, m_chunk = _spin_resolved_density(
+                    box, nocc=b_hi - b_lo, weight=float(w_sel[j]),
+                    cell_volume=cell_volume, spin_degeneracy=f_spin,
+                    band_occupations=(occupation_weights[
+                        int(ik), b_lo:b_hi] * band_mask),
+                    want_transverse=want_transverse,
+                    valence_density_fn=valence_density_fn)
+                t_quad += time.perf_counter() - t
+                r += r_chunk
+                if m_chunk is not None:
+                    if m is None:
+                        m = np.zeros_like(m_chunk)
+                    m += m_chunk
+            rho_k[int(ik)] = r
+            if m is not None:
+                m_k[int(ik)] = m
+            continue
         t = time.perf_counter()
         psi = _raw_ibz_psi_k(loader, int(ik), nocc)
         box = _to_box(psi, g_index[int(ik)], ngkmax)
@@ -810,6 +850,7 @@ def check_density_symmetries(
         r, m = _spin_resolved_density(
             box, nocc=nocc, weight=float(w_sel[j]),
             cell_volume=cell_volume, spin_degeneracy=f_spin,
+            band_occupations=None,
             want_transverse=want_transverse,
             valence_density_fn=valence_density_fn)
         t_quad += time.perf_counter() - t
@@ -825,7 +866,11 @@ def check_density_symmetries(
     # --- 3. basic invariants ------------------------------------------
     ngrid = int(np.prod(fft_grid))
     charge = float(np.sum(rho)) * cell_volume / ngrid
-    charge_expected = f_spin * float(nocc)
+    if occupation_weights is None:
+        charge_expected = f_spin * float(nocc)
+    else:
+        charge_expected = f_spin * float(np.einsum(
+            "k,kb->", w_sel, occupation_weights[sel], optimize=True))
     charge_rel = abs(charge - charge_expected) / max(1.0, abs(charge_expected))
     rho_min_rel = float(np.min(rho)) / rho_scale
     invariants_ok = bool(charge_rel < 1.0e-6 and rho_min_rel > -1.0e-8)
@@ -1069,7 +1114,7 @@ def cached_density_symmetry_check(
     tol_trs = _env_float("LORRAX_TRS_TOL", TOL_TRS)
     tol_spatial = _env_float("LORRAX_TRS_SPATIAL_TOL", TOL_SPATIAL)
     max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
-    nocc = int(getattr(loader, "nelec", 0) or 0)
+    nocc = int(loader.physical_density_band_stop)
 
     key = _cache_key(loader, nocc, tol_trs, tol_spatial, max_k)
     hit = _CACHE.get(key)

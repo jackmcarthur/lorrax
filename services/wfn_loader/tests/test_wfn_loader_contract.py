@@ -49,7 +49,7 @@ import h5py
 import numpy as np
 import pytest
 
-from wfn_loader import WfnLoader
+from wfn_loader import WfnLoader, read_wfn_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,69 @@ def _synth_wfn(tmp_path) -> str:
 @pytest.fixture
 def synth_wfn_path(tmp_path):
     return _synth_wfn(tmp_path)
+
+
+def test_physical_density_occupations_keep_signed_tails_and_explicit_k_map(
+        tmp_path, monkeypatch):
+    path = _synth_wfn(tmp_path)
+    occs = np.asarray([[[1.0, 0.8, 0.2, -0.05, 0.0, 0.0],
+                        [1.0, 0.6, 0.4, -0.02, 0.01, 0.0]]])
+    with h5py.File(path, "r+") as h5:
+        h5["mf_header/kpoints/occ"][...] = occs
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
+    loader = WfnLoader(path)
+    assert not loader.occupations_are_exact_integer
+    assert loader.physical_density_band_stop == 5
+    assert loader.occupation_state_capacity == 1.0
+    assert loader.num_electrons == pytest.approx(
+        0.5 * float(np.sum(occs[0, 0]) + np.sum(occs[0, 1])))
+
+    from types import SimpleNamespace
+    loader._sym = SimpleNamespace(
+        nk_tot=4, irr_idx_k=np.asarray([1, 0, 1, 0], dtype=np.int32))
+    got = loader.physical_density_occupations(
+        k="full_bz", unit_as_none=True)
+    assert np.array_equal(got, occs[0, [1, 0, 1, 0], :5])
+    assert float(got[:, 3:].min()) < 0.0
+    loader.close()
+
+
+def test_path_authentication_uses_header_view_not_full_loader(
+        tmp_path, monkeypatch):
+    """Post-hoc provenance must not initialize G/psi or the FFT diagnostic."""
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+    from file_io.kin_ion import authenticate_kin_ion_hartree_wfn_receipt
+
+    wfn_path = _synth_wfn(tmp_path)
+    occs = np.asarray([[[1.0, 0.8, 0.2, -0.05, 0.0, 0.0],
+                        [1.0, 0.6, 0.4, -0.02, 0.01, 0.0]]])
+    with h5py.File(wfn_path, "r+") as h5:
+        h5["mf_header/kpoints/occ"][...] = occs
+
+    provenance = read_wfn_provenance(wfn_path)
+    assert provenance.physical_density_band_stop == 5
+    assert not provenance.occupations_are_exact_integer
+    fingerprint = wfn_fingerprint(provenance)
+
+    kin_path = str(tmp_path / "kin_ion.h5")
+    with h5py.File(kin_path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((2, 6, 6), dtype=np.complex128))
+        ds.attrs["bispinor"] = False
+        ds.attrs["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
+        ds.attrs["wfn_fingerprint"] = fingerprint
+
+    def _forbid_full_loader(*_args, **_kwargs):
+        raise AssertionError("post-hoc authentication constructed WfnLoader")
+
+    monkeypatch.setattr(WfnLoader, "__init__", _forbid_full_loader)
+    monkeypatch.setattr(
+        WfnLoader, "_run_density_symmetry_check", _forbid_full_loader)
+    attrs = authenticate_kin_ion_hartree_wfn_receipt(
+        kin_path, wfn_path, selected_hartree_source="isdf",
+        band_stop=6)
+    assert attrs["wfn_fingerprint"] == fingerprint
 
 
 #: The ``/pscratch`` deck the moved cells used to name.  Its machine is
