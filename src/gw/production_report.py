@@ -450,8 +450,10 @@ class GWProductionReport:
             ("result writes", top_level("gw_jax.output")),
         ]
         # A stage absent in a mode should not occupy a zero-valued report row.
+        # Use the table's two-decimal display threshold so a floating-point
+        # subtraction residual cannot survive the filter as ``0.00 s``.
         stages = [(name, seconds) for name, seconds in stages
-                  if seconds > 0.0]
+                  if seconds >= 0.005]
         accounted = sum(seconds for _name, seconds in stages)
         stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")

@@ -263,6 +263,25 @@ def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
     assert "LORRAX_OMEGA_OUT_OF_RANGE=refuse" in text
 
 
+def test_timing_report_hides_sub_display_precision_residuals(tmp_path):
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    report.timings([
+        {"name": "gw_jax.isdf", "path": ("gw_jax.isdf",),
+         "inclusive": 1.000001},
+        {"name": "gw_jax.restart_load",
+         "path": ("gw_jax.isdf", "gw_jax.restart_load"),
+         "inclusive": 1.0},
+    ], wall=1.5)
+    report.finish()
+
+    text = path.read_text(encoding="utf-8")
+    assert "restart load                 1.00" in text
+    assert "ISDF setup + I/O" not in text
+    assert "other driver work            0.50" in text
+
+
 def test_report_collapses_minimax_catalog_receipts(tmp_path):
     path = tmp_path / "gwjax.out"
     report = GWProductionReport(
