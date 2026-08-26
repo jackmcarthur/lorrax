@@ -100,9 +100,10 @@ class GWResults:
     self_consistent: bool = False
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
     sigma_xc_at_dft_ev: np.ndarray | None = None
-    # Full ω-grid Σ_c diagonal (PPM modes only) — drives the Z-factor in
-    # the BGW eqp1.dat writer.  Shape (n_omega, nk, nb_sigma), eV; ω is
-    # relative to the DFT mid-gap E_F.  None in static modes ⇒ Z=1.
+    # Output-conditioned ω-grid Σ_c diagonal (PPM modes only).  The live
+    # assembler derives BOTH C(E_DFT) and Z from this one curve; the persisted
+    # full operator cube remains raw.  Shape (n_omega, nk, nb_sigma), eV; ω
+    # is relative to the run's stamped reference.  None in static modes ⇒ Z=1.
     sigma_c_omega_diag_ev: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
@@ -1151,6 +1152,8 @@ def write_results(
     print_fn=print,
     *,
     eqp2_file: str | None = None,
+    degeneracy_policy: str,
+    degeneracy_tol_ry: float,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
@@ -1180,7 +1183,11 @@ def write_results(
 
     BGW-style degenerate-set averaging is applied **upstream** at the
     H-build seam in :mod:`gw.gw_jax`, so the writer just serializes
-    whatever ``GWResults`` carries — no re-averaging here.
+    whatever ``GWResults`` carries — no re-averaging here.  For a dynamic
+    run it first completes the shared EQP assembly and then persists that
+    assembly's exact H/X/C(E_DFT) plus its conditioned C(omega) curve beside
+    the raw ``sigma_mnk.h5`` operators.  A post-hoc rebuild therefore consumes
+    the exact live value-and-derivative operand rather than reconstructing it.
 
     Parameters
     ----------
@@ -1212,6 +1219,10 @@ def write_results(
         rotations writer fingerprints it through the canonical provenance
         owner; it is not loaded again and no bispinor representation is
         constructed.
+    degeneracy_policy, degeneracy_tol_ry
+        The already-applied output conditioning (``"bgw_average"`` or
+        ``"disabled"``) and its tolerance.  These are receipt provenance,
+        not instructions: this function never applies the projection itself.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
@@ -1433,14 +1444,26 @@ def write_results(
                     "driver's full-BZ k-set and the sigma band window.")
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
-    assemble_eqp(
+    if results.self_consistent and sigma_c_omega_diag_ev_irr is not None:
+        raise ValueError(
+            "write_results refuses self-consistent dynamic EQP assembly: "
+            "H/X are dft_band while the full C(omega) operator is qp_band. "
+            "Rotate the full correlation operator before combining them.")
+
+    # Assemble FIRST.  This object is now the one producer of the exact H/X,
+    # derived C(E_DFT), conditioned C(omega), and Z that live output used.
+    # A dynamic call deliberately supplies no independent C(E_DFT): both that
+    # value and its derivative come from the same conditioned diagonal curve.
+    assembly = assemble_eqp(
         kpoints_irr_frac=kpts_irr,
         band_offset=results.band_start,
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
-        sigma_c_at_dft_diag_ev=sigma_c_at_dft_diag_ev,
+        sigma_c_at_dft_diag_ev=(
+            None if sigma_c_omega_diag_ev_irr is not None
+            else sigma_c_at_dft_diag_ev),
         sigma_c_omega_diag_ev=sigma_c_omega_diag_ev_irr,
         omega_rel_ev=results.omega_rel_ev,
         e_dft_rel_ev=e_dft_rel_ev_irr,
@@ -1452,7 +1475,23 @@ def write_results(
         kin_ion_has_hartree=results.kin_ion_has_hartree,
         hartree_already_resolved=True,
         print_fn=print_fn,
-    ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
+    )
+
+    # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
+    # their diagonals in place would alter QSGW/SC semantics.  Persist only
+    # the completed EqpAssembly through the format owner, never a parallel set
+    # of pre-assembly operand arguments.
+    if results.sigma_omega_h5_path is not None:
+        from file_io import append_eqp_assembly_receipt_h5
+        append_eqp_assembly_receipt_h5(
+            results.sigma_omega_h5_path,
+            assembly=assembly,
+            degeneracy_policy=degeneracy_policy,
+            degeneracy_tol_ry=degeneracy_tol_ry,
+            print_fn=print_fn,
+        )
+
+    assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
     # ── eqp2.dat: fixed-Sigma eigenvalue self-consistency ─────────────────
     if results.E_eqp2_ry is not None:
