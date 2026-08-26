@@ -1,7 +1,9 @@
 """Focused algebra/source gates for the immutable centroid-WFN receipt."""
 from __future__ import annotations
 
+import ast
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -54,6 +56,64 @@ def test_receipt_is_immutable_and_reuses_the_restart_centroid_digest():
     assert receipt.centroid_table_md5 == centroid_table_md5(CENTROIDS)
     with pytest.raises(FrozenInstanceError):
         receipt.role = "charge"
+
+
+def test_precomputed_canonical_wfn_fingerprint_is_reused_without_rescan(
+        monkeypatch):
+    import common.parallel_transport as transport
+
+    canonical = transport.wfn_fingerprint(_wfn())
+
+    def unexpected_rescan(_wfn_value):
+        raise AssertionError("precomputed canonical WFN fingerprint rescanned")
+
+    monkeypatch.setattr(transport, "wfn_fingerprint", unexpected_rescan)
+    charge = WavefunctionBasisReceipt.from_source(
+        wfn=_wfn(), wfn_fingerprint_value=canonical,
+        role="charge", bispinor=True, band_interval=(1, 5),
+        fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
+        n_rmu_logical=3, n_rmu_padded=4)
+    transverse = WavefunctionBasisReceipt.from_source(
+        wfn=_wfn(), wfn_fingerprint_value=canonical,
+        role="transverse", bispinor=True, band_interval=(1, 5),
+        fft_grid=(4, 4, 4), centroid_fft_idx=CENTROIDS,
+        n_rmu_logical=3, n_rmu_padded=4)
+    assert charge.wfn_fingerprint == transverse.wfn_fingerprint == canonical
+
+
+def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
+    source = Path(__file__).parents[1] / "src" / "gw" / "gw_init.py"
+    module = ast.parse(source.read_text(encoding="utf-8"))
+    prepare = next(
+        node for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "prepare_isdf_and_wavefunctions")
+    assert prepare.decorator_list == []
+
+    receipt_calls = [
+        node for node in ast.walk(prepare)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "WavefunctionBasisReceipt"
+        and node.func.attr == "from_source"
+    ]
+    assert len(receipt_calls) == 4
+    assert all(
+        any(keyword.arg == "wfn_fingerprint_value"
+            for keyword in call.keywords)
+        for call in receipt_calls)
+
+    canonical_scans = [
+        node for node in ast.walk(prepare)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "wfn_fingerprint"
+    ]
+    assert len(canonical_scans) == 1
+    assert (len(canonical_scans[0].args) == 1
+            and isinstance(canonical_scans[0].args[0], ast.Name)
+            and canonical_scans[0].args[0].id == "wfn")
 
 
 def test_fresh_and_restart_face_builders_validate_host_receipt():
@@ -194,6 +254,12 @@ def test_receipt_is_host_only_and_does_not_split_jit_cache_family():
     np.testing.assert_array_equal(orchestrate(first), np.ones((1, 4)))
     np.testing.assert_array_equal(orchestrate(second), np.ones((1, 4)))
     assert python_traces == ["face"]
+    assert numerical_kernel._cache_size() == 1
+    hlo_first = numerical_kernel.lower(first.wavefunctions).as_text()
+    hlo_second = numerical_kernel.lower(second.wavefunctions).as_text()
+    assert hlo_first == hlo_second
+    assert first_receipt.wfn_fingerprint not in hlo_first
+    assert second_receipt.wfn_fingerprint not in hlo_second
 
     # A whole-carrier JIT round-trip cannot silently erase provenance because
     # provenance was never embedded in the numerical pytree.  Its explicit
