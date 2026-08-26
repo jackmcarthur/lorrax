@@ -1118,7 +1118,7 @@ def make_eqp_bgw(
 		)
 
 	# Decide the format BEFORE touching any raw operator payload.  A complete
-	# schema-v3 artifact is served entirely by its small completed-assembly
+	# schema-v3/v4 artifact is served entirely by its small completed-assembly
 	# receipt plus omega/evaluation metadata from the same owner-routed open.
 	# Only a truly legacy file enters the format owner's diagonal hyperslab
 	# reader, which never materializes a full (nω,nk,nb,nb) cube on rank 0.
@@ -1241,7 +1241,7 @@ def make_eqp_bgw(
 	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * RYD_TO_EV
 
 	# Sigma payload selection already happened above, before this unrelated
-	# mean-field read: schema v3 supplied only its small receipt, while the
+	# mean-field read: schema v3/v4 supplied only its small receipt, while the
 	# legacy route supplied exact requested diagonals through the format-owned
 	# row/window hyperslab reader.
 	# ── THE LINEARIZATION POINT, FROM THE FILE'S OWN STAMP ────────────
@@ -1319,6 +1319,8 @@ def make_eqp_bgw(
 	vh_exact = None
 	hartree_already_resolved = False
 	receipt_c_at_dft = None
+	receipt_hartree_scalar = None
+	receipt_hartree_transverse = None
 	if _receipt is not None:
 		if (_receipt["band_start"], _receipt["band_stop"]) != (
 				band_start, band_stop):
@@ -1359,6 +1361,9 @@ def make_eqp_bgw(
 				"EQP receipt and kin_ion disagree about whether scalar Hartree is "
 				"folded into kin_ion.")
 		hartree_diag = _receipt["hartree_diag_ev"]
+		receipt_hartree_scalar = _receipt["hartree_scalar_diag_ev"]
+		receipt_hartree_transverse = _receipt[
+			"hartree_transverse_diag_ev"]
 		sigma_x_diag = _receipt["sigma_x_diag_ev"]
 		receipt_c_at_dft = _receipt["sigma_c_at_dft_diag_ev"]
 		# The receipt curve, not the raw operator diagonal, is the exact
@@ -1368,7 +1373,8 @@ def make_eqp_bgw(
 		sigma_c_omega_diag = _receipt["sigma_c_omega_diag_ev"]
 		hartree_already_resolved = True
 		print(
-			f"  EQP assembly receipt: assembled file-wedge H/X/C(E_DFT) "
+			f"  EQP assembly receipt: schema v{_receipt['schema_version']}, "
+			f"assembled file-wedge H/X/C(E_DFT) "
 			f"plus conditioned C(omega), "
 			f"bases={_receipt['hartree_exchange_basis']}/"
 			f"{_receipt['correlation_basis']}, "
@@ -1407,6 +1413,8 @@ def make_eqp_bgw(
 		hartree_source=_src,
 		exact_hartree_diag_ev=vh_exact,
 		hartree_already_resolved=hartree_already_resolved,
+		hartree_scalar_diag_ev=receipt_hartree_scalar,
+		hartree_transverse_diag_ev=receipt_hartree_transverse,
 	)
 	if (receipt_c_at_dft is not None
 			and not np.array_equal(
