@@ -125,7 +125,6 @@ def test_streamed_photon_samples_apply_the_spatial_metric_once():
 
 
 def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
-    from dataclasses import replace
     import vcoul
 
     receipt = vcoul.slab_minibz_photon_cubature(
@@ -134,6 +133,11 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
         SLAB_KGRID)
     assert receipt.method == "true_ws_polygon_duffy_gauss_legendre_v1"
     assert receipt.orders == (16, 24, 32)
+    assert receipt.kgrid == SLAB_KGRID
+    assert receipt.cell_volume == HEX_CELVOL
+    np.testing.assert_array_equal(
+        np.asarray(receipt.reciprocal_lattice_rows), HEX_BVEC)
+    assert vcoul.validate_slab_minibz_photon_receipt(receipt) is receipt
     polygon = np.asarray(receipt.polygon_vertices)
     assert polygon.shape == (6, 2)
     mini = np.asarray(receipt.mini_lattice_rows)
@@ -168,15 +172,73 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
         abs(np.linalg.det(np.asarray(anisotropic.mini_lattice_rows))),
         rtol=2e-12)
 
-    with pytest.raises(ValueError, match="fixed 16/24/32 ladder"):
-        replace(receipt, orders=(8, 16, 24)).require_integrity()
-
     with pytest.raises(ValueError, match="unsupported"):
         next(vcoul.iter_minibz_photon_samples(
             vcoul.get_kernel(2),
             vcoul.CoulombGeometry(
                 bvec=HEX_BVEC, cell_volume=HEX_CELVOL),
             SLAB_KGRID, method="polygon_gl"))
+
+
+def _slab_photon_receipt():
+    import vcoul
+
+    return vcoul.slab_minibz_photon_cubature(
+        vcoul.get_kernel(2),
+        vcoul.CoulombGeometry(bvec=HEX_BVEC, cell_volume=HEX_CELVOL),
+        SLAB_KGRID)
+
+
+def test_polygon_photon_receipt_validation_is_exact_type_and_rechecks_token():
+    from dataclasses import replace
+    import vcoul
+
+    receipt = _slab_photon_receipt()
+    with pytest.raises(TypeError, match="issued only"):
+        replace(receipt, orders=(8, 16, 24))
+
+    class ForgedReceipt(vcoul.SlabMinibzPhotonReceipt):
+        def require_integrity(self):  # A virtual check would accept this.
+            return self
+
+    forged = object.__new__(ForgedReceipt)
+    for name, value in vars(receipt).items():
+        object.__setattr__(forged, name, value)
+    with pytest.raises(TypeError, match="exact provider receipt type"):
+        vcoul.validate_slab_minibz_photon_receipt(forged)
+
+    object.__setattr__(receipt, "_provider_token", object())
+    with pytest.raises(TypeError, match="not issued"):
+        vcoul.validate_slab_minibz_photon_receipt(receipt)
+
+
+@pytest.mark.parametrize("payload_name", ("q_cart", "D_raw", "sample_weight"))
+def test_polygon_photon_receipt_detects_mutation_despite_reversible_write_flag(
+        payload_name):
+    import vcoul
+
+    receipt = _slab_photon_receipt()
+    payload = getattr(receipt.chunks[0], payload_name)
+    assert not payload.flags.writeable
+    # ``write=False`` is intentionally not the integrity argument: these
+    # provider-owned ndarrays can be made writeable again by their holder.
+    payload.setflags(write=True)
+    payload.flat[0] = np.nextafter(payload.flat[0], np.inf)
+    with pytest.raises(ValueError, match="payload or metadata changed"):
+        vcoul.validate_slab_minibz_photon_receipt(receipt)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("cell_volume", HEX_CELVOL * 1.01), ("kgrid", (5, 4, 1))),
+)
+def test_polygon_photon_receipt_detects_bound_geometry_mutation(field, value):
+    import vcoul
+
+    receipt = _slab_photon_receipt()
+    object.__setattr__(receipt, field, value)
+    with pytest.raises(ValueError):
+        vcoul.validate_slab_minibz_photon_receipt(receipt)
 
 
 def test_slab_polygon_refuses_nonplanar_or_three_dimensional_cells():
@@ -203,10 +265,18 @@ def test_slab_polygon_refuses_nonplanar_or_three_dimensional_cells():
             SLAB_KGRID)
     zero_b3 = HEX_BVEC.copy()
     zero_b3[2] = 0.0
-    with pytest.raises(ValueError, match="nonzero b3 directed"):
+    with pytest.raises(ValueError, match=r"b3 directed along Cartesian \+z"):
         vcoul.slab_minibz_photon_cubature(
             vcoul.get_kernel(2),
             vcoul.CoulombGeometry(bvec=zero_b3, cell_volume=HEX_CELVOL),
+            SLAB_KGRID)
+    reversed_b3 = HEX_BVEC.copy()
+    reversed_b3[2, 2] *= -1.0
+    with pytest.raises(ValueError, match="reversed or tilted"):
+        vcoul.slab_minibz_photon_cubature(
+            vcoul.get_kernel(2),
+            vcoul.CoulombGeometry(
+                bvec=reversed_b3, cell_volume=HEX_CELVOL),
             SLAB_KGRID)
 
 
