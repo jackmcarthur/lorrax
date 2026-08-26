@@ -85,8 +85,13 @@ Verified end-to-end 2026-08-26: the tracked GN-PPM regression deck
 lowered 28→6 for an 8 GB laptop GPU) ran to completion on the RTX 5070 —
 170 s wall, sigma table + `sigma_mnk.h5` written. Against the frozen
 2026-08-09 reference: sigX, VH, Eo **byte-identical**; sigC differs by up
-to 5.5e-2 eV, consistent with the post-freeze head-correction landings on
-main (`f83d5ea7`, `d2d6d521`, `a103f1b0`) — the reference predates them.
+to 5.525e-2 eV in 828/2898 cells. A same-box CPU A/B (`JAX_PLATFORMS=cpu`,
+host FFI leg: OpenBLAS + netlib ScaLAPACK) agrees with the GPU run
+**exactly — max |Δ| = 0.0 over every cell** — so the delta is not this
+stack: it is main-tip code vs a reference frozen before the
+head-correction landings (`f83d5ea7`, `d2d6d521`, `a103f1b0`).
+`sigma_diag_gnppm_ref.dat` is due a re-freeze on current main; until then
+expect the Tier-1 gnppm frozen gate red at main tip.
 The dirty `mpirun` exit after "process finalized explicitly" is the
 documented deliberate `os._exit`; judge by artifacts.
 
