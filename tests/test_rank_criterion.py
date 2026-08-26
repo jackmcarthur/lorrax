@@ -244,6 +244,21 @@ def test_describe_is_loggable_and_names_every_required_field():
     assert not math.isnan(r.kappa_eff)
 
 
+def test_singular_value_compression_reports_the_two_best_rank_residuals():
+    metrics = rc.singular_value_compression([4.0, 3.0, 0.0], 1)
+    assert metrics.relative_operator_tail == pytest.approx(3.0 / 4.0)
+    assert metrics.relative_frobenius_tail == pytest.approx(3.0 / 5.0)
+    assert metrics.retained_frobenius_weight == pytest.approx(16.0 / 25.0)
+    assert metrics.kappa_eff == pytest.approx(1.0)
+
+
+def test_singular_value_compression_refuses_an_invalid_receipt():
+    with pytest.raises(ValueError, match="outside"):
+        rc.singular_value_compression([1.0, 0.1], 3)
+    with pytest.raises(ValueError, match="NaN/Inf"):
+        rc.singular_value_compression([1.0, float("nan")], 1)
+
+
 # ---------------------------------------------------------------------------
 # 6. The STRUCTURAL rank ceiling — a Gram route counts null-space round-off
 # ---------------------------------------------------------------------------

@@ -487,6 +487,7 @@ def _interpolate_bse_data_to_grid(
     head_channel: dict | None = None,
     distrib_la_batched_route: str | None = None,
     htransform_a_band: int | None = None,
+    htransform_rank_record_fn=None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -600,7 +601,8 @@ def _interpolate_bse_data_to_grid(
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
-         centroid_subset_idx=_fit_subset)
+         centroid_subset_idx=_fit_subset,
+         rank_record_fn=htransform_rank_record_fn)
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond

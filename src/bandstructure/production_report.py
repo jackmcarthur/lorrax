@@ -17,6 +17,7 @@ from common.scientific_output import (
     file_table_lines,
     numerical_environment_lines,
     policy,
+    spectral_compression_lines,
     symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
@@ -96,23 +97,39 @@ class HTransformProductionReport:
                 self.runtime, mesh_role="Galerkin matrix axes X x Y"):
             self.emit(line)
 
-    def environment(self, *, params, wfn, eigh_backend: str,
+    def environment(self, *, params, wfn, gram_plan,
+                    fine_eigh_backend: str, fine_enabled: bool,
                     batched_route: str, diagnostics_policy: str,
                     diagnostics_enabled: bool) -> None:
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        requested_eigh = resolve_text(params.get("eigh_backend", eigh_backend))
+        requested_eigh = resolve_text(params.get("eigh_backend", "auto"))
         eigh_text = policy(
             requested_eigh,
             ("auto", "off", "distributed", "cusolvermp", "slate",
              "scalapack"))
-        if requested_eigh.strip().lower() != str(eigh_backend).strip().lower():
-            eigh_text += f" -> {eigh_backend}"
-        self.emit("Gram eigensolve: " + eigh_text)
-        self.emit("Batched LA     : " + policy(
-            batched_route, ("auto", "batch_reshard")))
+        if requested_eigh.strip().lower() != str(gram_plan.requested).lower():
+            eigh_text += f" -> {gram_plan.requested}"
+        if str(gram_plan.requested).lower() != str(gram_plan.backend).lower():
+            eigh_text += f" -> {gram_plan.backend}"
+        geometry = ("replicated native JAX" if gram_plan.is_native else
+                    f"one matrix tile over {int(gram_plan.mesh.shape['x'])} x "
+                    f"{int(gram_plan.mesh.shape['y'])} ranks")
+        self.emit(f"Gram eigensolve: {eigh_text}; {geometry}; n={int(gram_plan.n)}")
+        if fine_enabled:
+            self.emit("Fine-k eigensolve: " + policy(
+                fine_eigh_backend,
+                ("auto", "off", "distributed", "cusolvermp", "slate",
+                 "scalapack")) + "; concrete plan resolves after Galerkin rank")
+            self.emit("Batched LA     : " + policy(
+                batched_route, ("auto", "batch_reshard")))
+        else:
+            self.emit("Fine-k eigensolve: not used (get_centroids_fi = false)")
+            self.emit("Batched LA     : not used by this calculation")
+        self.emit("LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
+                  "ScaLAPACK on CPU. Batched LA is a schedule, not a backend")
         self.emit("fH diagnostics : " + policy(
             diagnostics_policy, ("auto", "on", "off")) + " -> "
             + ("on" if diagnostics_enabled else "off"))
@@ -129,7 +146,7 @@ class HTransformProductionReport:
 
     def interpolation_space(self, *, params, wfn, meta, result,
                             enk_sigma_ry, ctilde, centroid_file: str,
-                            energy_source: str) -> None:
+                            energy_source: str, centroids=None) -> None:
         start = int(result["band_start"])
         keep = int(result["nb_keep"])
         fit = int(result["nb_fit"])
@@ -149,15 +166,55 @@ class HTransformProductionReport:
             self.emit(f"Source E range : [{float(np.min(finite)):.5f}, "
                       f"{float(np.max(finite)):.5f}] Ry; span "
                       f"{float(np.ptp(finite)) * RYD_TO_EV:.5f} eV")
+        if fit > keep and energies.ndim == 2 and energies.shape[0] >= fit:
+            requested_top = energies[keep - 1]
+            fitted_top = energies[fit - 1]
+            guard_ev = (
+                float(np.min(fitted_top)) - float(np.max(requested_top))) \
+                * RYD_TO_EV
+            headroom_ev = (
+                float(np.max(fitted_top)) - float(np.max(requested_top))) \
+                * RYD_TO_EV
+            self.emit(
+                f"Guard buffer   : {guard_ev:+.5f} eV = min E(band "
+                f"{start + fit}) - max E(band {start + keep}); "
+                f"top-edge headroom={headroom_ev:.5f} eV")
         self.emit(f"Centroid file  : {abs_path(centroid_file)}")
-        self.emit(f"Centroid sites : {int(meta.n_rmu)} logical; "
-                  f"{int(meta.n_rmu_padded)} mesh-padded")
+        if centroids is None:
+            self.emit(f"Centroid sites : {int(meta.n_rmu)} requested/loaded; "
+                      f"{int(meta.n_rmu_padded)} mesh-padded")
+        elif int(centroids.source_n_rmu) == int(centroids.n_rmu):
+            self.emit(
+                f"Centroid sites : {int(centroids.n_rmu)} requested from "
+                f"the full table; {int(meta.n_rmu_padded)} mesh-padded")
+        else:
+            self.emit(
+                f"Centroid sites : requested subset {int(centroids.n_rmu)} "
+                f"of {int(centroids.source_n_rmu)} source rows; "
+                f"{int(meta.n_rmu_padded)} mesh-padded")
         self.emit(f"Galerkin basis : rank {int(ctilde.shape[2])} shared across "
                   f"{int(result['nk_total'])} coarse-grid k points")
         multiplier = float(params.get("htransform_rank_multiplier", 0.0))
         self.emit("Rank policy    : " + (
             "full numerical span" if multiplier == 0.0 else
             f"reduced target {multiplier:.5f} x bands"))
+        transform = result.get("f_transform")
+        if transform is not None:
+            scale_band = start + int(transform["scale_band_local"]) + 1
+            shoulder_band = start + int(transform["shoulder_band_local"]) + 1
+            self.emit(
+                f"f-transform    : a={float(transform['a_ry']):.5f} Ry "
+                f"(4 x bandwidth of band {scale_band}); "
+                f"n={float(transform['n']):.2f}")
+            self.emit(
+                f"Zero shoulder  : max E(band {shoulder_band}) = "
+                f"{float(transform['shift_ry']):.5f} Ry; the full top-band "
+                "dispersion lies at or below the cutoff")
+
+    def spectral_compression(self, receipt) -> None:
+        self.heading("Spectral compression and validation")
+        for line in spectral_compression_lines(receipt):
+            self.emit(line)
 
     def path_summary(self, *, result) -> None:
         kpath, _, node_indices, node_labels, _ = result["kpath_data"]
@@ -175,12 +232,34 @@ class HTransformProductionReport:
             self.emit(f"  N{number:02d}  {label or '-':>3}  "
                       f"k=({point[0]: .5f} {point[1]: .5f} "
                       f"{point[2]: .5f})  path index {int(idx) + 1}")
+        for number in range(len(node_indices) - 1):
+            lo = int(node_indices[number])
+            hi = int(node_indices[number + 1])
+            intervals = hi - lo
+            left = node_labels[number] or f"N{number + 1}"
+            right = node_labels[number + 1] or f"N{number + 2}"
+            self.emit(
+                f"  L{number + 1:02d}  {left} -> {right}: {intervals} "
+                f"intervals; {intervals + 1} endpoint-inclusive points")
         path_range = result.get("path_range")
         if path_range is not None:
             self.emit(f"Energy range   : [{float(path_range[0]):+.5f}, "
                       f"{float(path_range[1]):+.5f}] Ry relative to VBM "
                       f"([{float(path_range[0]) * RYD_TO_EV:+.5f}, "
                       f"{float(path_range[1]) * RYD_TO_EV:+.5f}] eV)")
+        checkpoint = result.get("gamma_energy_checkpoint")
+        if checkpoint is None:
+            self.emit("Energy checkpoint: unavailable; Gamma is not an exact "
+                      "point on this interpolation path")
+        else:
+            self.emit(
+                f"Energy checkpoint: Gamma max |Delta E|="
+                f"{float(checkpoint['max_abs_ev']):.5e} eV; RMS="
+                f"{float(checkpoint['rms_ev']):.5e} eV over "
+                f"{int(checkpoint['n_bands'])} returned bands")
+            self.emit(
+                "Checkpoint scope: measured at Gamma against the source "
+                "coarse-grid bands; this is not a global path-error bound")
 
     def timings(self, records, *, wall: float) -> None:
         def total(name: str) -> float:

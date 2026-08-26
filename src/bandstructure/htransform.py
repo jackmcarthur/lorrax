@@ -477,8 +477,9 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              return_full_proj: bool = False,
                              eigh_backend: str = "auto",
+                             eigh_plan=None,
                              rank_multiplier: float = 0.0,
-                             progress_fn=None):
+                             progress_fn=None, rank_record_fn=None):
     """Galerkin projection using gw_jax shared loaders.
 
     Single ('x','y') mesh throughout. ψ at centroids comes from
@@ -666,10 +667,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     M = _gram(psi_rmu_Y)
 
-    from ffi import _services
-    _services.ensure_on_path()
-    from distrib_la import plan as linalg_plan
-    eigh_plan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=m_states)
+    if eigh_plan is None:
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import plan as linalg_plan
+        eigh_plan = linalg_plan(
+            "eigh", mesh_xy, backend=eigh_backend, n=m_states)
+    elif eigh_plan.op != "eigh" or int(eigh_plan.n) != int(m_states):
+        raise ValueError(
+            "streaming_galerkin_solve: the pre-resolved distrib_la plan "
+            f"is {eigh_plan.op}/n={eigh_plan.n}, expected eigh/n={m_states}.")
     if eigh_plan.is_native:
         @partial(jax.jit, out_shardings=(rep, rep))
         def _eigh_native(M_):
@@ -960,6 +967,22 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         raise ValueError(
             "streaming_galerkin_solve: the ψ-at-centroids truncation is not "
             "self-consistent — " + "  ".join(_bad))
+    if rank_record_fn is not None:
+        rank_record_fn({
+            "stacked_states": int(nk * nb),
+            "site_spin_columns": int(nspinor * n_mu),
+            "structural_ceiling": int(_rank_ceiling),
+            "numerical_rank": int(rank_numerical),
+            "retained_rank": int(rank_phys),
+            "carried_rank": int(rank),
+            "null_padding": int(n_pad),
+            "rank_multiplier": float(rank_multiplier),
+            "numerical_report": _numerical_report,
+            "compression": rank_criterion.singular_value_compression(
+                s_host, rank_phys),
+            "numerical_closure": _sc_numerical,
+            "model_closure": _sc_model,
+        })
     if rank_numerical < nk * nb:
         log_fn(f"  [warn] ψ-at-centroids is NUMERICALLY RANK-DEFICIENT: "
                f"{nk*nb} states vs numerical rank {rank_numerical} "
@@ -1777,7 +1800,9 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None, return_full_proj: bool = False,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
-                    progress_fn=None, centroid_record_fn=None):
+                    progress_fn=None, centroid_record_fn=None,
+                    rank_record_fn=None, wfn_sym=None,
+                    galerkin_eigh_plan=None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1814,7 +1839,10 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     if mesh_xy is None:
         mesh_xy = _build_mesh_xy()
     wfn_file = _resolve(params["wfn_file"])
-    wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
+    if wfn_sym is None:
+        wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
+    else:
+        wfn, sym = wfn_sym
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
     centroid_basis = load_centroid_basis(
         centroid_path, tuple(int(x) for x in wfn.fft_grid), sym=sym,
@@ -1940,8 +1968,10 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             # got the native replicated Gram eigh anyway — the key was
             # parsed, defaulted, stored and read by nobody on this driver.
             eigh_backend=resolve_eigh_backend(params),
+            eigh_plan=galerkin_eigh_plan,
             rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
             progress_fn=progress_fn,
+            rank_record_fn=rank_record_fn,
         )
     S, ctilde, B_at_mu = out[:3]
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
@@ -2234,6 +2264,7 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     energies_sorted = None
     path_range = None
     gamma_exact = None
+    gamma_energy_checkpoint = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -2353,13 +2384,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # absolute electron count here silently selected a conduction level
         # whenever the window started above band zero.
         fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
+        _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
         if not gamma_positions:
             # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
             # rows (they are exact zeros and would win the tie on any path
             # that does not start at Γ).  Host numpy — two values for a log
             # line and the plot markers, no reason for two eager XLA modules.
-            _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
             gamma_positions = [int(np.argmin(np.linalg.norm(_k_np, axis=1)))]
+        _gamma_position = int(gamma_positions[0])
+        _gamma_is_exact = bool(
+            np.linalg.norm(_k_np[_gamma_position]) <= 1.0e-10)
         gamma_exact = np.sort(np.asarray(enk_sigma[:, 0]))[:nb_keep]
         # Shift all reported energies so VBM is at 0
         if energies_on_path is not None:
@@ -2373,7 +2407,17 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         log_fn(f"Path energy range: {path_range[0]:.6f} to {path_range[1]:.6f} Ry (VBM@0)")
         # Γ deltas (in mRy) remain unchanged by uniform shift
         delta = (energies_sorted[gamma_positions[0]] - gamma_exact) * 1000.0
-        log_fn("Γ Δε (mRy): " + ", ".join(f"{d:+.2f}" for d in delta[:6]))
+        log_fn(("Γ Δε (mRy): " if _gamma_is_exact else
+                "nearest-path-point Δε vs Γ source (mRy): ")
+               + ", ".join(f"{d:+.2f}" for d in delta[:6]))
+        if _gamma_is_exact:
+            _delta_ev = ((energies_sorted[_gamma_position] - gamma_exact)
+                         * RYD_TO_EV)
+            gamma_energy_checkpoint = {
+                "max_abs_ev": float(np.max(np.abs(_delta_ev))),
+                "rms_ev": float(np.sqrt(np.mean(np.square(_delta_ev)))),
+                "n_bands": int(_delta_ev.size),
+            }
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
         timing.record("ht.kpath_host_tail", _perf() - _t0)  # instrument:
@@ -2389,6 +2433,15 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         "energies_sorted": energies_sorted,
         "path_range": path_range,
         "gamma_exact": gamma_exact,
+        "gamma_energy_checkpoint": gamma_energy_checkpoint,
+        "f_transform": {
+            "a_ry": float(a_f),
+            "n": float(n_f),
+            "shift_ry": float(shift),
+            "scale_band_local": int(
+                states - 1 if a_band_index is None else a_band_index),
+            "shoulder_band_local": int(states - 1),
+        },
         "kpath_data": (kpath_frac, x_path, node_indices, node_labels, gamma_positions),
     }
 
@@ -2599,6 +2652,31 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
+    # Resolve the concrete Gram plan before the first setup/progress line.
+    # The same Plan object is executed below, so the numerical-environment
+    # block describes what this run actually uses rather than re-deriving a
+    # backend name from policy text after the calculation has started.
+    mesh_xy = _build_mesh_xy()
+    _wfn_path = params["wfn_file"]
+    if not os.path.isabs(_wfn_path):
+        _wfn_path = os.path.join(input_dir, _wfn_path)
+    wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
+    from distrib_la import plan as _linalg_plan
+    _gram_backend = resolve_eigh_backend(params)
+    _n_fit_bands = n_return_bands + int(args.guard_bands)
+    _gram_plan = _linalg_plan(
+        "eigh", mesh_xy, backend=_gram_backend,
+        n=int(sym.nk_tot) * _n_fit_bands)
+    _diag_on = (_debug if args.fh_diagnostics == "auto"
+                else args.fh_diagnostics == "on")
+    report.environment(
+        params=params, wfn=wfn, gram_plan=_gram_plan,
+        fine_eigh_backend=eigh_backend,
+        fine_enabled=bool(params.get("get_centroids_fi", False)),
+        batched_route=distrib_la_batched_route,
+        diagnostics_policy=args.fh_diagnostics,
+        diagnostics_enabled=_diag_on)
+
     from common import sanity
 
     from common.progress import LoopProgress
@@ -2606,11 +2684,15 @@ def main(argv=None):
         1, report.progress, title="wavefunction and Galerkin setup",
         item_name="stage", max_updates=1).start()
     _centroid_records = []
+    _rank_records = []
     with timing.section("initialize_wfns"):
         wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
+            mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
+            galerkin_eigh_plan=_gram_plan,
             n_guard_bands=args.guard_bands, progress_fn=report.progress,
-            centroid_record_fn=_centroid_records.append)
+            centroid_record_fn=_centroid_records.append,
+            rank_record_fn=_rank_records.append)
     _setup_progress.step()
     _setup_progress.finish()
     # ── Galerkin-input gate ───────────────────────────────────────────
@@ -2640,17 +2722,14 @@ def main(argv=None):
             0.0, 20.0, unit="Ry", print_fn=log)
 
     kpath_data = initialize_kpath(wfn, params)
-    _diag_on = (_debug if args.fh_diagnostics == "auto"
-                else args.fh_diagnostics == "on")
-    report.environment(
-        params=params, wfn=wfn, eigh_backend=eigh_backend,
-        batched_route=distrib_la_batched_route,
-        diagnostics_policy=args.fh_diagnostics,
-        diagnostics_enabled=_diag_on)
     if len(_centroid_records) != 1:
         raise RuntimeError(
             "htransform initialize_wfns did not return exactly one centroid "
             f"closure record; got {len(_centroid_records)}.")
+    if len(_rank_records) != 1:
+        raise RuntimeError(
+            "htransform initialize_wfns did not return exactly one Galerkin "
+            f"rank record; got {len(_rank_records)}.")
     report.sampling(
         wfn=wfn, sym=sym, centroids=_centroid_records[0])
     _transform_progress = LoopProgress(
@@ -2671,7 +2750,9 @@ def main(argv=None):
     report.interpolation_space(
         params=params, wfn=wfn, meta=meta, result=result,
         enk_sigma_ry=enk_sigma, ctilde=ctilde,
-        centroid_file=_centroid_path, energy_source=_energy_source)
+        centroid_file=_centroid_path, energy_source=_energy_source,
+        centroids=_centroid_records[0])
+    report.spectral_compression(_rank_records[0])
     report.path_summary(result=result)
 
     # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.

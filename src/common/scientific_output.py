@@ -65,6 +65,86 @@ def centroid_orbit_line(loaded_centroids) -> str:
         f"(tol={tol:.5e})")
 
 
+def spectral_compression_lines(receipt, *,
+                               label: str = "Galerkin basis") -> list[str]:
+    """Render the canonical htransform spectral-compression receipt.
+
+    The receipt is produced at the one truncation site in
+    ``streaming_galerkin_solve``.  This helper only presents that decision;
+    it neither selects a rank nor repeats the degeneracy test.  Consequently
+    htransform, BSE and exciton-band drivers cannot drift onto different
+    explanations of the same retained subspace.
+    """
+    report = receipt["numerical_report"]
+    metrics = receipt["compression"]
+    numerical_closure = receipt.get("numerical_closure")
+    model_closure = receipt.get("model_closure")
+    retained = int(receipt["retained_rank"])
+    numerical = int(receipt["numerical_rank"])
+    carried = int(receipt["carried_rank"])
+    n_pad = int(receipt["null_padding"])
+    multiplier = float(receipt["rank_multiplier"])
+
+    lines = [
+        f"{label:<16}: {int(receipt['stacked_states'])} stacked states x "
+        f"{int(receipt['site_spin_columns'])} site-spin samples; structural "
+        f"ceiling {int(receipt['structural_ceiling'])}",
+        f"Numerical cut   : rtol={float(report.rtol):.5e} "
+        f"(amplification cap {float(report.kappa_cap):.5e}) -> rank "
+        f"{numerical}",
+    ]
+    if multiplier == 0.0:
+        lines.append(f"Model order     : full numerical span; retained rank {retained}")
+    else:
+        lines.append(
+            f"Model order     : requested {multiplier:.5f} x fitted bands; "
+            f"retained rank {retained} of numerical rank {numerical}")
+
+    def _closure_line(name: str, info) -> str | None:
+        if info is None:
+            return None
+        direction = str(info["direction"])
+        if bool(info["fired"]):
+            moved = int(info["n_keep"]) - int(info["n_keep_closed"])
+            action = "dropped" if direction == "drop_block" else "kept"
+            return (
+                f"{name:<16}: whole-block {direction}; cut "
+                f"{int(info['n_keep'])} -> {int(info['n_keep_closed'])}; "
+                f"{action} {abs(moved)} direction(s) from a "
+                f"{len(info['members'])}-value degenerate block "
+                f"(relative span {float(info['span_rel']):.5e})")
+        gap = float(info["gap_rel"])
+        gap_text = "spectrum edge" if not np.isfinite(gap) else f"gap {gap:.5e}"
+        return (
+            f"{name:<16}: whole-block {direction}; unchanged at rank "
+            f"{int(info['n_keep_closed'])} ({gap_text})")
+
+    for closure_name, closure in (
+            ("Numerical block", numerical_closure),
+            ("Model block", model_closure)):
+        line = _closure_line(closure_name, closure)
+        if line is not None:
+            lines.append(line)
+
+    kappa = ("n/a" if metrics.kappa_eff is None
+             else f"{float(metrics.kappa_eff):.5e}")
+    sigma_min = ("n/a" if metrics.sigma_min_kept is None
+                 else f"{float(metrics.sigma_min_kept):.5e}")
+    lines.extend((
+        f"Conditioning     : sigma_max={float(metrics.sigma_max):.5e}; "
+        f"sigma_min(kept)={sigma_min}; kappa_eff={kappa}",
+        f"Sampled-psi tail: best-rank relative residual "
+        f"{float(metrics.relative_operator_tail):.5e} (operator norm), "
+        f"{float(metrics.relative_frobenius_tail):.5e} (Frobenius norm); "
+        f"retained weight {100.0 * float(metrics.retained_frobenius_weight):.2f}%",
+        "Error meaning     : residuals above quantify compression of the "
+        "sampled wavefunction matrix; they are not a band-energy error bound",
+        f"Distributed carry: rank {carried} = {retained} physical + {n_pad} "
+        "exact-null mesh pad; no rank was dropped for device alignment",
+    ))
+    return lines
+
+
 def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
     """Compact rank/device/thread geometry from the canonical runtime facts."""
     facts = runtime.facts
@@ -163,7 +243,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         lines.append(
             f"Time reversal  : {'HOLDS' if receipt.trs_holds else 'BROKEN'} "
             f"({receipt.trs_basis}; |m|/|rho|={m_rel}; "
-            f"coverage={100.0 * float(receipt.trs_coverage):.{digits}f}%; "
+            f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
             f"mesh requires it={mesh_implies})")
         lines.append(
             f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
@@ -237,4 +317,5 @@ __all__ = [
     "policy",
     "pseudopotential_file_rows",
     "symmetry_sampling_lines",
+    "spectral_compression_lines",
 ]

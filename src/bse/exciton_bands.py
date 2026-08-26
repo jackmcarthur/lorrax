@@ -1482,11 +1482,6 @@ def main(argv=None):
             if rerun_check_enabled(args) else
             "off (pass --rerun-check to enable)"),
     ))
-    stage_progress = LoopProgress(
-        7, report.progress, title="exciton-band calculation",
-        item_name="major stage", max_updates=7)
-    stage_progress.start()
-
     # ---- Stage timing -----------------------------------------------------
     # DELIBERATELY a driver-local two-column table (``name  seconds``) and NOT
     # ``common.timing.report``: eight live campaign harnesses parse this table
@@ -1568,6 +1563,44 @@ def main(argv=None):
     # apply_q_per_segment for why this is a floor and not an override.
     apply_q_per_segment(params, args.q_per_segment, log=log)
 
+    # Resolve and print the numerical environment before either htransform
+    # Galerkin setup can emit progress.  The pre-resolved Gram Plan is reused
+    # by the explicit exciton-path fit below, so this is the concrete backend
+    # in execution rather than a policy guess.
+    _wfn_name = str(params["wfn_file"])
+    if not os.path.isabs(_wfn_name):
+        _wfn_name = os.path.join(
+            os.path.dirname(os.path.abspath(args.input)), _wfn_name)
+    wfn, sym = ht.setup_wfn_and_sym(_wfn_name, mesh_xy=mesh_xy)
+    from distrib_la import plan as _linalg_plan
+    _gram_plan = _linalg_plan(
+        "eigh", mesh_xy, backend=resolve_eigh_backend(params),
+        n=int(sym.nk_tot) * (int(params["nval"]) + int(params["ncond"])))
+    _gram_geometry = (
+        "replicated native JAX" if _gram_plan.is_native else
+        f"one matrix tile over {int(mesh_xy.shape['x'])} x "
+        f"{int(mesh_xy.shape['y'])} ranks")
+    restart_file = _find_restart_file(args.input)
+    report.environment(wfn=wfn, lines=(
+        f"Restart tensors: {abs_path(restart_file)}",
+        "Transition data: distributed band and centroid blocks on X x Y",
+        f"Gram eigensolve: {_gram_plan.requested} -> {_gram_plan.backend}; "
+        f"{_gram_geometry}; n={int(_gram_plan.n)}",
+        "Fine-k eigensolve: " + policy(
+            args.eigh_backend,
+            ("auto", "off", "distributed", "cusolvermp", "slate",
+             "scalapack")),
+        "Batched LA schedule: " + policy(
+            args.distrib_la_batched_route, ("auto", "batch_reshard")),
+        "LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
+        "ScaLAPACK on CPU. Batched LA is a schedule, not a backend",
+    ))
+    report.sampling(wfn=wfn, sym=sym)
+    stage_progress = LoopProgress(
+        7, report.progress, title="exciton-band calculation",
+        item_name="major stage", max_updates=7)
+    stage_progress.start()
+
     # Everything above — the startup call, jax.distributed, mesh creation and its
     # MPI clique warm-up, the input parse — is the driver prologue.  Named
     # rather than left in the residual: at P=16 ``jax.distributed`` init alone
@@ -1577,7 +1610,7 @@ def main(argv=None):
 
     # ── load the Q-independent BSE data (production loader) ──────────────
     t0 = time.time()
-    restart_file = _find_restart_file(args.input)
+    _bse_grid_rank_records = []
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=args.n_val, n_cond=args.n_cond,
         mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
@@ -1594,7 +1627,8 @@ def main(argv=None):
         degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry,
         distrib_la_batched_route=args.distrib_la_batched_route,
-        htransform_a_band=args.a_band)
+        htransform_a_band=args.a_band,
+        htransform_rank_record_fn=_bse_grid_rank_records.append)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
@@ -1680,6 +1714,9 @@ def main(argv=None):
                 f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
     tick("load_bse", t0)
     stage_progress.step()
+    for receipt in _bse_grid_rank_records:
+        report.spectral_compression(
+            receipt, title="BSE-grid htransform spectral compression")
 
     # ── which ISDF basis the htransform fits in ──────────────────────────
     # BEFORE initialize_wfns, because that call is the one that reads the
@@ -1702,10 +1739,13 @@ def main(argv=None):
     # projected wavefunction cache.
     _fit_subset = keep_idx if _rank_multiplier > 0.0 else None
     _output_keep = None if _fit_subset is not None else keep_idx
+    _path_rank_records = []
     (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
      enk_sigma) = ht.initialize_wfns(
          args.input, params, log, mesh_xy=mesh_xy,
-         centroid_subset_idx=_fit_subset)
+         centroid_subset_idx=_fit_subset, wfn_sym=(wfn, sym),
+         galerkin_eigh_plan=_gram_plan,
+         rank_record_fn=_path_rank_records.append)
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
         # its ``htransform.read_eqp_energies`` expects the "k-point N:" /
@@ -1739,17 +1779,13 @@ def main(argv=None):
         f"{list(map(int, node_idx))} labels {node_labels}")
     tick("htransform_setup", t0)
     stage_progress.step()
-    report.environment(wfn=wfn, lines=(
-        f"Restart tensors: {abs_path(restart_file)}",
-        "Transition data: distributed band and centroid blocks on X x Y",
-        "Gram eigensolve: " + policy(
-            args.eigh_backend,
-            ("auto", "off", "distributed", "cusolvermp", "slate",
-             "scalapack")),
-        "Batched LA     : " + policy(
-            args.distrib_la_batched_route, ("auto", "batch_reshard")),
-    ))
-    report.sampling(wfn=wfn, sym=sym)
+    if len(_path_rank_records) != 1:
+        raise RuntimeError(
+            "exciton_bands htransform returned "
+            f"{len(_path_rank_records)} spectral receipts; expected one")
+    report.spectral_compression(
+        _path_rank_records[0],
+        title="Exciton-path htransform spectral compression")
     report.heading("Exciton momentum path")
     report.emit(f"Path sampling  : {int(nQ_path)} plotted Q points; "
                 f"{int(nQ - nQ_path)} extra diagnostic points")

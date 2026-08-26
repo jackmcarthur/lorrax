@@ -16,6 +16,7 @@ from common.scientific_output import (
     architecture_lines,
     file_table_lines,
     numerical_environment_lines,
+    spectral_compression_lines,
     symmetry_sampling_lines,
 )
 
@@ -131,6 +132,13 @@ class ScientificProductionReport:
         self.heading("Electronic and band spaces")
         for line in lines:
             self.emit(str(line))
+
+    def spectral_compression(self, receipt, *,
+                             title: str = "Htransform spectral compression") -> None:
+        """Print the one shared Galerkin truncation/compression receipt."""
+        self.heading(title)
+        for line in spectral_compression_lines(receipt):
+            self.emit(line)
 
     def timings(self, stages: Iterable[tuple[str, float]], *, wall: float) -> None:
         self.heading("Major-stage timing")

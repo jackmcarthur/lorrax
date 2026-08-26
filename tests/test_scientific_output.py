@@ -77,6 +77,7 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
     assert "fractional tau" not in text
     assert "tau=(" in text
     assert "Time reversal  : HOLDS (measured" in text
+    assert "coverage=100.00%" in text
     assert "TRS unfolding  : enabled from the measured density verdict" in text
     assert " 0.25000   0.25000   0.25000   0.75000" in text
     assert ".250000" not in text

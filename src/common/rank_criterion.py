@@ -169,12 +169,15 @@ Full derivation, the site register and the two dials:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 __all__ = [
     "select_rank",
     "noise_floor_rtol",
     "RankReport",
     "rank_report",
+    "SingularValueCompression",
+    "singular_value_compression",
     # The gate.
     "POLICY_MODES",
     "DEFAULT_POLICY_MODE",
@@ -273,6 +276,70 @@ def noise_floor_rtol(n_rows, n_cols=None):
     """
     n = int(n_rows) if n_cols is None else max(int(n_rows), int(n_cols))
     return _EPS64 * math.sqrt(max(n, 1))
+
+
+@dataclass(frozen=True)
+class SingularValueCompression:
+    """Best-rank residuals for one truncated singular-value spectrum.
+
+    These are exact properties of the sampled matrix represented by
+    ``spectrum``: Eckart--Young gives ``sigma[r]`` as the best rank-``r``
+    spectral-norm error and the squared tail sum as the best Frobenius-norm
+    error.  They are deliberately *not* an error estimate for a downstream
+    observable such as an interpolated band energy; that needs an independent
+    a-posteriori checkpoint.
+    """
+
+    n_total: int
+    rank: int
+    sigma_max: float
+    sigma_min_kept: float | None
+    sigma_first_dropped: float | None
+    kappa_eff: float | None
+    relative_operator_tail: float
+    relative_frobenius_tail: float
+    retained_frobenius_weight: float
+
+
+def singular_value_compression(spectrum, rank: int) -> SingularValueCompression:
+    """Return scale-free best-rank residuals for singular values.
+
+    ``spectrum`` may be in either order; magnitudes are sorted descending.
+    A non-finite spectrum or a rank outside ``[0, len(spectrum)]`` refuses so
+    a production report cannot turn an invalid decomposition into plausible
+    percentages.
+    """
+    vals = sorted((abs(float(v)) for v in spectrum), reverse=True)
+    if any(not math.isfinite(v) for v in vals):
+        raise ValueError("singular_value_compression: spectrum contains NaN/Inf")
+    r = int(rank)
+    if r < 0 or r > len(vals):
+        raise ValueError(
+            f"singular_value_compression: rank {r} is outside [0, {len(vals)}]")
+    sigma_max = vals[0] if vals else 0.0
+    sigma_min_kept = vals[r - 1] if r else None
+    sigma_first_dropped = vals[r] if r < len(vals) else None
+    kappa_eff = (
+        sigma_max / sigma_min_kept
+        if sigma_max > 0.0 and sigma_min_kept not in (None, 0.0) else None)
+    total_sq = math.fsum(v * v for v in vals)
+    tail_sq = math.fsum(v * v for v in vals[r:])
+    relative_frobenius_tail = (
+        math.sqrt(max(0.0, tail_sq / total_sq)) if total_sq > 0.0 else 0.0)
+    relative_operator_tail = (
+        float(sigma_first_dropped) / sigma_max
+        if sigma_max > 0.0 and sigma_first_dropped is not None else 0.0)
+    retained_weight = (
+        max(0.0, min(1.0, 1.0 - tail_sq / total_sq))
+        if total_sq > 0.0 else 0.0)
+    return SingularValueCompression(
+        n_total=len(vals), rank=r, sigma_max=sigma_max,
+        sigma_min_kept=sigma_min_kept,
+        sigma_first_dropped=sigma_first_dropped,
+        kappa_eff=kappa_eff,
+        relative_operator_tail=relative_operator_tail,
+        relative_frobenius_tail=relative_frobenius_tail,
+        retained_frobenius_weight=retained_weight)
 
 
 class RankReport(object):
