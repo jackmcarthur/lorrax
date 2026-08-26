@@ -81,6 +81,8 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     repo = Path(__file__).resolve().parents[1]
     gw_tree = ast.parse((repo / "src/gw/gw_init.py").read_text())
     wfn_tree = ast.parse((repo / "src/common/wfn_transforms.py").read_text())
+    pivot_tree = ast.parse(
+        (repo / "src/centroid/pivoted_cholesky.py").read_text())
 
     planner = _function(gw_tree, "_plan_gflat_chunks_for_channel")
     planner_dicts = [
@@ -131,6 +133,9 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     assert ast.unparse(contract_k) == "loader_k_chunk"
 
     loader = _function(wfn_tree, "load_centroids_band_chunked")
+    gram = _function(pivot_tree, "build_gram_q0_via_loadwfns")
+    assert len(_calls(loader, "worst_process_resident_bytes")) == 1
+    assert len(_calls(gram, "worst_process_resident_bytes")) == 1
     pad_inputs = {
         ast.unparse(call.args[0])
         for call in _calls(loader, "pad_axis")
@@ -150,4 +155,7 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         for target in node.targets
         if isinstance(target, ast.Name)
     }
+    assert assignments["existing_live_bytes"] == (
+        "worst_process_resident_bytes(existing_live_local_bytes)"
+    )
     assert assignments["nk_accum"] == "round_up(nk_tot, k_tile)"

@@ -50,6 +50,7 @@ from runtime.padding import round_up, pad_axis, spec_divisor
 from common.shard_map import shard_map
 from common.staged_reshard import band_to_product_r_reshard
 from common.wfn_layout import band_sphere_spec
+from common.gpu_utils import worst_process_resident_bytes
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -2503,12 +2504,17 @@ def load_centroids_band_chunked(
         + tile_band_output_local_bytes + tile_face_local_bytes
     )
     min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
-    existing_live_bytes = 0
+    existing_live_local_bytes = 0
     for device in jax.local_devices():
         stats = device.memory_stats() or {}
-        existing_live_bytes = max(
-            existing_live_bytes, int(stats.get("bytes_in_use") or 0),
+        existing_live_local_bytes = max(
+            existing_live_local_bytes, int(stats.get("bytes_in_use") or 0),
         )
+    # ``cs`` below is a static scan shape and cache-key component.  Allocator
+    # residency can differ by process after asynchronous Lloyd/JIT teardown;
+    # use one shared worst-rank floor so every process compiles the same scan.
+    existing_live_bytes = worst_process_resident_bytes(
+        existing_live_local_bytes)
     scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
                          - persistent_bytes)
     if scan_budget_bytes < min_scan_bytes:
