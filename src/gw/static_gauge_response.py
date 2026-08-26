@@ -233,7 +233,10 @@ def build_charge_hall_cubature_response(
     """
     from common.parallel_transport import (
         fingerprint_from_binding, wfn_fingerprint)
-    from gw.head_correction import static_gauge_tensor_residuals
+    from gw.head_correction import (
+        canonicalize_static_gauge_q2_tensor,
+        static_gauge_tensor_residuals,
+    )
     from gw.qsgw_head import (
         StaticGaugeHallTransaction, build_dft_head_response)
 
@@ -288,13 +291,9 @@ def build_charge_hall_cubature_response(
     S_host = np.zeros((2, 2, 4, 4), dtype=np.complex128)
     charge_S = np.asarray(
         jax.device_get(direct.S_direct[0, :2, :2]), dtype=np.complex128)
-    # Only q_a q_b S_ab enters the charge response.  A broken-TRS velocity
-    # bubble may also contain an imaginary coordinate-antisymmetric part;
-    # that part cancels identically in the quadratic form and belongs to the
-    # separately constructed Hall response.  Store the unique symmetric
-    # representative required by static_gauge_tensor_residuals.
-    S_host[:, :, 0, 0] = 0.5 * (charge_S + charge_S.T)
-    S_direct = _replicated(S_host, mesh, dtype=np.complex128)
+    S_host[:, :, 0, 0] = charge_S
+    S_direct = canonicalize_static_gauge_q2_tensor(
+        _replicated(S_host, mesh, dtype=np.complex128))
     sigma_host = np.asarray(
         jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
     if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
