@@ -97,7 +97,8 @@ TRANSVERSE_HARTREE_G0_DIAGNOSTIC = (
 TRANSVERSE_HARTREE_SYMMETRY = "crystal_scalar_time_reversal_even"
 TRANSVERSE_HARTREE_CURRENT_PROJECTION = (
 	"symmetry_maps.project_polar_fft_field:fft_grid_pullback_perm+"
-	"SymMaps.R_cart_forward:measured_trs_policy:residual_over_raw_J_l2")
+	"SymMaps.R_cart_forward:measured_trs_policy:residual_over_raw_J_l2:"
+	"affine_rotation_closure_bound_v2")
 
 #: Legal values of the ``hartree_source`` input key.
 HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
@@ -719,6 +720,8 @@ def validate_kin_ion_against_run(
 			"current_g0_l2", "current_l2", "current_g0_relative",
 			"current_symmetry_relative_movement",
 			"current_symmetry_relative_residual",
+			"current_symmetry_rotation_table_closure_defect",
+			"current_symmetry_floating_point_residual_bound",
 			"current_symmetry_relative_residual_tolerance",
 		):
 			value = attrs.get(f"transverse_hartree_{name}")
@@ -728,12 +731,30 @@ def validate_kin_ion_against_run(
 					f"{name}={value!r}.")
 		residual = float(attrs[
 			"transverse_hartree_current_symmetry_relative_residual"])
-		tolerance = float(attrs[
+		stored_tolerance = float(attrs[
 			"transverse_hartree_current_symmetry_relative_residual_tolerance"])
-		if tolerance <= 0 or residual > tolerance:
+		rotation_defect = float(attrs[
+			"transverse_hartree_current_symmetry_rotation_table_closure_defect"])
+		floating_bound = float(attrs[
+			"transverse_hartree_current_symmetry_floating_point_residual_bound"])
+		derived_tolerance = rotation_defect + floating_bound
+		sum_roundoff = (
+			8.0 * np.finfo(np.float64).eps
+			* max(abs(rotation_defect), abs(floating_bound),
+			      abs(stored_tolerance), np.finfo(np.float64).tiny))
+		if abs(stored_tolerance - derived_tolerance) > sum_roundoff:
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} carries an unauthenticated "
+				"current-symmetry tolerance: stored total="
+				f"{stored_tolerance:.6e}, but rotation-table closure defect "
+				f"{rotation_defect:.6e} + floating reduction bound "
+				f"{floating_bound:.6e} = {derived_tolerance:.6e}.")
+		if derived_tolerance <= 0 or residual > derived_tolerance:
 			raise ValueError(
 				f"{TRANSVERSE_HARTREE_DATASET} does not certify its star-wedge "
-				f"projection: residual={residual:.6e}, tolerance={tolerance:.6e}.")
+				f"projection: residual={residual:.6e}, derived tolerance="
+				f"{derived_tolerance:.6e} (delta_R={rotation_defect:.6e}, "
+				f"floating={floating_bound:.6e}).")
 		for name in ("current_symmetry_rows",
 		             "current_symmetry_antiunitary_rows"):
 			value = attrs.get(f"transverse_hartree_{name}")
@@ -757,7 +778,10 @@ def validate_kin_ion_against_run(
 			f"  kin_ion: exact transverse direct Hartree {tuple(shape)}; "
 			f"||J(G=0)||2/||J(r)||2="
 			f"{float(attrs['transverse_hartree_current_g0_relative']):.3e}, "
-			"periodic TT G=0 is structurally zero (no miniBZ head).")
+			"periodic TT G=0 is structurally zero (no miniBZ head); "
+			f"current covariance residual={residual:.3e} <= "
+			f"{derived_tolerance:.3e} (delta_R={rotation_defect:.3e}, "
+			f"floating={floating_bound:.3e}).")
 	return attrs
 
 

@@ -794,6 +794,8 @@ class ExactHartreeMatrices(NamedTuple):
     current_g0_relative: float
     current_symmetry_relative_movement: float
     current_symmetry_relative_residual: float
+    current_symmetry_rotation_table_closure_defect: float
+    current_symmetry_floating_point_residual_bound: float
     current_symmetry_relative_residual_tolerance: float
     current_symmetry_rows: int
     current_symmetry_antiunitary_rows: int
@@ -936,7 +938,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             f"(antiunitary={current_projection.n_antiunitary_rows}), "
             f"movement={current_projection.relative_movement:.6e}, "
             f"residual={current_projection.relative_residual:.6e} <= "
-            f"{current_projection.relative_residual_tolerance:.6e}; "
+            f"{current_projection.relative_residual_tolerance:.6e} "
+            f"(delta_R="
+            f"{current_projection.rotation_table_closure_defect:.6e} + "
+            f"floating="
+            f"{current_projection.floating_point_residual_bound:.6e}); "
             "alpha.A matrix remains on the authenticated star wedge")
         from vcoul import COULOMB_GAUGE_TT_SIGN
         from psp.dft_operators import transverse_potential_from_current
@@ -1091,6 +1097,10 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             current_projection.relative_movement),
         current_symmetry_relative_residual=(
             current_projection.relative_residual),
+        current_symmetry_rotation_table_closure_defect=(
+            current_projection.rotation_table_closure_defect),
+        current_symmetry_floating_point_residual_bound=(
+            current_projection.floating_point_residual_bound),
         current_symmetry_relative_residual_tolerance=(
             current_projection.relative_residual_tolerance),
         current_symmetry_rows=current_projection.n_symmetry_rows,
@@ -1747,6 +1757,14 @@ def main(argv=None):
                         current_diagnostic.current_symmetry_relative_movement)
                     vht.attrs["current_symmetry_relative_residual"] = float(
                         current_diagnostic.current_symmetry_relative_residual)
+                    vht.attrs[
+                        "current_symmetry_rotation_table_closure_defect"] = float(
+                            current_diagnostic.
+                            current_symmetry_rotation_table_closure_defect)
+                    vht.attrs[
+                        "current_symmetry_floating_point_residual_bound"] = float(
+                            current_diagnostic.
+                            current_symmetry_floating_point_residual_bound)
                     vht.attrs[
                         "current_symmetry_relative_residual_tolerance"] = float(
                             current_diagnostic.
