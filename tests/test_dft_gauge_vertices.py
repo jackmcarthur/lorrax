@@ -1,6 +1,7 @@
 """Deterministic first-principles gates for uniform VNL gauge actions."""
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +109,54 @@ def _basis_receipt(
         fft_grid=geom.fft_grid, centroid_fft_idx=r_mu,
         n_rmu_logical=len(r_mu),
         n_rmu_padded=padded_mu_extent(len(r_mu), geom.mesh))
+
+
+def test_contact_action_ssot_and_symmetry_bootstrap_source_contract():
+    source = Path(mtxel_sweep.__file__)
+    module = ast.parse(source.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    helper_name = "_assemble_pauli_contact_to_ket"
+    helper = functions[helper_name]
+    assert helper.decorator_list == []
+
+    exports_node = next(
+        node for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets))
+    assert helper_name not in ast.literal_eval(exports_node.value)
+
+    def named_calls(node, name):
+        return [
+            item for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == name
+        ]
+
+    assert len(named_calls(helper, "apply_kinetic_contact_to_ket")) == 1
+    assert len(named_calls(
+        functions["uniform_gauge_operator"], helper_name)) == 1
+    assert len(named_calls(
+        functions["finite_transfer_contact_operator"], helper_name)) == 1
+    assert sum(
+        len(named_calls(function, "apply_kinetic_contact_to_ket"))
+        for function in functions.values()) == 1
+
+    resolver = functions["_resolve_finite_transfer_q_identity"]
+    symmetry_import = next(
+        index for index, node in enumerate(resolver.body)
+        if isinstance(node, ast.ImportFrom) and node.module == "symmetry_maps")
+    bootstrap = resolver.body[symmetry_import - 1]
+    assert isinstance(bootstrap, ast.Expr)
+    assert isinstance(bootstrap.value, ast.Call)
+    assert isinstance(bootstrap.value.func, ast.Attribute)
+    assert isinstance(bootstrap.value.func.value, ast.Name)
+    assert bootstrap.value.func.value.id == "_services"
+    assert bootstrap.value.func.attr == "ensure_on_path"
 
 
 def _states():

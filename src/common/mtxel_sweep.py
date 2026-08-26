@@ -901,6 +901,30 @@ class FiniteTransferContactMatrixElements(NamedTuple):
     downfolded_complement: None = None
 
 
+def _assemble_pauli_contact_to_ket(psi_4, vnl_contact):
+    r"""Return the canonical positive-energy Pauli contact action.
+
+    Both the uniform and finite-transfer operators require exactly
+
+    ``(alpha_FS/2) * (d2T/dK2 + d2V_NL/dK2)``
+
+    on the two-component large field, followed by zero-padding back to the
+    input kinetic-balance spinor extent.  This pure-JAX leaf owns the single
+    HALFALPHA multiplication, its carrier-real-dtype cast, the incumbent
+    kinetic-contact call, and spinor padding.  It is intentionally private and
+    undecorated: enclosing operator JITs inline it without creating another
+    executable family.
+    """
+    from common.bispinor_init import HALFALPHA
+    from psp.dft_operators import apply_kinetic_contact_to_ket
+
+    psi_L = psi_4[:, :2, :]
+    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    contact_large = halfalpha.astype(psi_4.real.dtype) * (
+        apply_kinetic_contact_to_ket(psi_L) + vnl_contact)
+    return _pad_spinor(contact_large, int(psi_4.shape[1]))
+
+
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                            vnl_setup,
                            include_transfer_q2: bool = False) -> Operator:
@@ -963,7 +987,6 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
     from common.bispinor_init import HALFALPHA, kinetic_balance_lift_jet
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from psp.dft_operators import apply_kinetic_contact_to_ket
     from psp import vnl_ops
 
     B_host = np.asarray(bvec, dtype=np.float64) * float(blat)
@@ -996,10 +1019,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             int(psi_4.shape[1]))
         gamma = gamma_kin + gamma_vnl
 
-        lambda_kin = apply_kinetic_contact_to_ket(psi_L)
-        lambda_large = halfalpha.astype(psi_4.real.dtype) * (
-            lambda_kin + vnl.lambda0_cart_ket)
-        contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
+        contact = _assemble_pauli_contact_to_ket(
+            psi_4, vnl.lambda0_cart_ket)
 
         fields = [gamma, contact.reshape(9, *contact.shape[2:])]
         if transfer_q2:
@@ -1048,6 +1069,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 def _resolve_finite_transfer_q_identity(wfn, geom: SweepGeometry,
                                         iq_irr: int, *, where: str):
     """Resolve one symmetry-owned q row for all finite-transfer producers."""
+    from ffi import _services
+    _services.ensure_on_path()
     from symmetry_maps import bgw_integer_q_to_fractional
 
     symmetry_owner = getattr(wfn, "symmetry", None)
@@ -1120,31 +1143,25 @@ def finite_transfer_contact_operator(
             "finite-transfer contact requires VNLSetup built with "
             "compute_contact=True")
 
-    from common.bispinor_init import HALFALPHA
     from psp import vnl_ops
-    from psp.dft_operators import apply_kinetic_contact_to_ket
 
     q_value = jnp.asarray(q_crys, dtype=jnp.float64)
     if q_value.shape != (3,):
         raise ValueError(
             f"finite-transfer contact q_crys must have shape (3,); got "
             f"{q_value.shape}")
-    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
-
     def op(psi_n, gvec, gmask, bidx, kvec, q_runtime):
         del bidx
         psi_4 = _ket(psi_n, gmask)
         psi_L = psi_4[:, :2, :]
-        kinetic = apply_kinetic_contact_to_ket(psi_L)
         finite = vnl_ops.compute_icl_vnl_finite_contact_to_ket(
             psi_L, gvec, kvec, q_runtime, vnl_setup, gmask,
             path_order=int(path_order), path_rtol=float(path_rtol),
             path_atol=float(path_atol),
             projector_row_chunk=int(projector_row_chunk),
             g_chunk=int(g_chunk))
-        total_large = halfalpha.astype(psi_4.real.dtype) * (
-            kinetic + finite.lambda_cart_ket)
-        total = _pad_spinor(total_large, int(psi_4.shape[1]))
+        total = _assemble_pauli_contact_to_ket(
+            psi_4, finite.lambda_cart_ket)
         total = jnp.where(
             finite.certified, total,
             jnp.asarray(jnp.nan + 1j * jnp.nan, dtype=total.dtype))
