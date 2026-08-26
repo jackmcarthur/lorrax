@@ -153,6 +153,54 @@ def test_htransform_runtime_startup_uses_the_one_debug_stream():
     assert "RUNTIME = initialize_communicator_stack()" not in source
 
 
+def test_basis_input_emits_exactly_one_canonical_rank_receipt(
+        tmp_path, monkeypatch):
+    import inspect
+    import bandstructure.htransform as htransform
+    from isdf import galerkin
+
+    basis = galerkin.GalerkinBasis(
+        ctilde=np.eye(2, dtype=np.complex128)[None],
+        basis_at_nodes=np.ones((2, 1, 1), dtype=np.complex128),
+        rank_physical=2,
+        band_range=(3, 5),
+        selected_state_indices=(0, 1),
+        selection_factor=np.eye(2, dtype=np.complex128),
+        qrcp_seed=7,
+        qrcp_eps=1.0e-3,
+        qrcp_raw_rank=2,
+        qrcp_search_rank=2,
+        candidate_hash="a" * 64,
+        pivot_hash="b" * 64,
+    )
+    basis_path = tmp_path / "basis.h5"
+    basis_path.touch()
+    monkeypatch.setattr(
+        htransform, "read_galerkin_basis", lambda *args, **kwargs: basis)
+    records = []
+    restored = htransform.streaming_galerkin_solve(
+        object(), object(), SimpleNamespace(nspinor=1, n_rtot=2),
+        np.zeros((1, 3), dtype=np.int32), object(), (3, 5),
+        basis_input=str(basis_path), rank_record_fn=records.append,
+        rank_multiplier=20.0, qr_eps=1.0e-3, qrcp_seed=7,
+    )
+
+    assert restored is basis
+    assert len(records) == 1
+    record = records[0]
+    assert (record["method"], record["stacked_states"],
+            record["state_dimension"]) == (
+                "whole_state_randomized_qrcp", 2, 2)
+    assert (record["raw_rank"], record["retained_rank"],
+            record["carried_rank"], record["null_padding"]) == (2, 2, 2, 0)
+    assert record["min_cholesky_diagonal"] == 1.0
+    assert record["coefficient_orthogonality_error"] == 0.0
+    assert record["relative_frobenius_residual"] == 0.0
+    fit_source = inspect.getsource(galerkin.fit_galerkin_basis)
+    assert "rank_record = galerkin_rank_record(" in fit_source
+    assert '"method": "whole_state_randomized_qrcp"' not in fit_source
+
+
 def test_outer_r_shell_mask_handles_even_odd_and_singleton_axes():
     from bandstructure.htransform import build_R_grid_np, outer_r_shell_mask
 
