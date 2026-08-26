@@ -47,7 +47,7 @@ class StaticPhotonHeadSigmaDiagnostics:
 
     components_tskn_ry: jax.Array
     max_closure_residual_ry: float
-    hamiltonian_config_operator_fingerprint: str
+    hamiltonian_config_operator_fingerprint: str | None
     output_basis: str
 
     def __post_init__(self) -> None:
@@ -56,13 +56,14 @@ class StaticPhotonHeadSigmaDiagnostics:
             raise ValueError(
                 "static photon head diagnostics must be (3 terms,3 sectors,"
                 f"nk,nb); got {shape}")
-        from .head_correction import require_canonical_operator_fingerprint
-        fingerprint = require_canonical_operator_fingerprint(
-            self.hamiltonian_config_operator_fingerprint,
-            gate="static_photon_head_sigma_fingerprint",
-        )
-        object.__setattr__(
-            self, "hamiltonian_config_operator_fingerprint", fingerprint)
+        if self.hamiltonian_config_operator_fingerprint is not None:
+            from .head_correction import require_canonical_operator_fingerprint
+            fingerprint = require_canonical_operator_fingerprint(
+                self.hamiltonian_config_operator_fingerprint,
+                gate="static_photon_head_sigma_fingerprint",
+            )
+            object.__setattr__(
+                self, "hamiltonian_config_operator_fingerprint", fingerprint)
         if self.output_basis != "dft":
             raise ValueError(
                 "static photon head Sigma diagnostics must be stamped in "
@@ -315,7 +316,7 @@ def compute_static_photon_sigma(
         else getattr(head_completion, "q0_factors", None))
     if head_completion is not None and q0_factors is None:
         raise ValueError(
-            "full photon head completion lacks its bounded q0 factor "
+            "packed photon head completion lacks its bounded q0 factor "
             "carrier; refusing a decomposition inferred from the packed body")
     if q0_factors is not None:
         if diagnostic_input_basis not in ("dft", "qp"):
@@ -425,7 +426,7 @@ def compute_static_photon_sigma(
             # from coexisting through asynchronous dispatch.
             sig_coh.block_until_ready()
             if verbose and jax.process_index() == 0:
-                print_fn(f"  full photon COHSEX block ({A},{B}) complete")
+                print_fn(f"  packed photon COHSEX block ({A},{B}) complete")
 
     from .cohsex_sigma import _replicate_band_sigma
     sig_x = _replicate_band_sigma(sig_x, mesh_xy)

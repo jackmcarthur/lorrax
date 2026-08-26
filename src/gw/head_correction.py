@@ -1204,7 +1204,7 @@ class StaticSlabPhotonHeadCompletion:
     mixed_convergence_error_ratios: tuple[float, float]
     ward_residual: float
     hermiticity_residual: float
-    hamiltonian_config_operator_fingerprint: str
+    hamiltonian_config_operator_fingerprint: str | None
     q0_factors: StaticPhotonQ0FactorCarrier
 
 
@@ -1355,7 +1355,7 @@ def _require_static_photon_numerical_certificate(
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
     W_packed: jax.Array,
-    response: StaticGaugeHeadResponse,
+    response,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     cubature_receipt,
@@ -1375,7 +1375,23 @@ def complete_static_slab_photon_q0(
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
 
-    response = require_static_gauge_head_response(response, mesh_xy)
+    # The exact/full response and the deliberately truncated charge+Hall
+    # response share this numerical path.  The bounded response stores only
+    # the independent inputs; the kernel below constructs its Hall tensor
+    # directly from sigma_H.
+    from .static_gauge_response import (
+        ChargeHallCubatureResponse,
+        require_charge_hall_cubature_response,
+    )
+    if isinstance(response, ChargeHallCubatureResponse):
+        response = require_charge_hall_cubature_response(response, mesh_xy)
+        # The Hall identifier says nothing about the independently built
+        # charge S/Y/Z response.  Do not publish it as a whole-head identity.
+        operator_fingerprint = None
+    else:
+        response = require_static_gauge_head_response(response, mesh_xy)
+        operator_fingerprint = (
+            response.hamiltonian_config_operator_fingerprint)
     layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
@@ -1569,7 +1585,7 @@ def complete_static_slab_photon_q0(
         hermiticity_residual=max(
             float(response.hermiticity_residual), effective_hermiticity),
         hamiltonian_config_operator_fingerprint=(
-            response.hamiltonian_config_operator_fingerprint),
+            operator_fingerprint),
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
             screened_pairs=tuple(screened_pairs)),

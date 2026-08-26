@@ -139,8 +139,8 @@ class GWResults:
     #: (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).  ``None`` is accepted
     #: for historical constructors; the debug writer emits exact-zero columns.
     photon_head_sigma_diag_tskn_ry: np.ndarray | None = None
-    #: Exact completion provenance.  A non-None fingerprint auto-arms the
-    #: canonical receipt, and is accepted only with an explicit DFT stamp.
+    #: Optional whole-response identity.  The bounded charge+Hall mode leaves
+    #: this unset because its Hall identifier does not identify charge S/Y/Z.
     photon_head_sigma_operator_fingerprint: str | None = None
     photon_head_sigma_basis: str | None = None
 
@@ -665,12 +665,11 @@ def write_freq_debug(
     (static, screened mode).
 
     No-op unless ``config.debug.sigma_freq_debug_output`` is set or an actual
-    coupled-photon q=0 completion is present.  FULL completion therefore
+    coupled-photon q=0 completion is present.  Packed completion therefore
     always leaves this canonical parseable receipt; ordinary modes retain the
     established opt-in behavior and write exact-zero photon-sector columns.
     """
-    _has_photon_head = (
-        results.photon_head_sigma_operator_fingerprint is not None)
+    _has_photon_head = results.photon_head_sigma_basis is not None
     if not (config.debug.sigma_freq_debug_output or _has_photon_head):
         return
     from file_io import write_sigma_freq_debug_table
@@ -720,7 +719,7 @@ def write_freq_debug(
         ("x_bare", _sig_x_diag_ev),
     ])
 
-    # Full coupled-photon q=0 decomposition.  The carrier was contracted in
+    # Packed coupled-photon q=0 decomposition.  The carrier was contracted in
     # ``gw.photon_sigma`` through the same band-Sigma kernel as the completed
     # packed V/W.  Axes are term=(X,SX,COH), sector=(CC,CT+TC,TT).  Historical
     # and non-full modes normalize to exact zeros so this debug table has one
@@ -732,26 +731,27 @@ def write_freq_debug(
     if _has_photon_head:
         if results.photon_head_sigma_basis != "dft":
             raise ValueError(
-                "authenticated photon head Sigma diagnostics must be in "
+                "photon head Sigma diagnostics must be in "
                 f"basis='dft'; got {results.photon_head_sigma_basis!r}")
-        from .head_correction import require_canonical_operator_fingerprint
-        _fingerprint = require_canonical_operator_fingerprint(
-            results.photon_head_sigma_operator_fingerprint,
-            gate="photon_head_sigma_receipt_fingerprint",
-        )
         if _photon_head is None:
             raise ValueError(
-                "authenticated photon head Sigma receipt has no components")
+                "photon head Sigma diagnostics have no components")
         _photon_head_metadata = {
             "photon_head_basis": "dft",
-            "photon_head_operator_fingerprint": _fingerprint,
             "photon_head_sector_convention": (
                 "final_post_dyson_lorentz_blocks"),
         }
-    elif results.photon_head_sigma_basis is not None:
+        if results.photon_head_sigma_operator_fingerprint is not None:
+            from .head_correction import require_canonical_operator_fingerprint
+            _fingerprint = require_canonical_operator_fingerprint(
+                results.photon_head_sigma_operator_fingerprint,
+                gate="photon_head_sigma_receipt_fingerprint",
+            )
+            _photon_head_metadata[
+                "photon_head_operator_fingerprint"] = _fingerprint
+    elif results.photon_head_sigma_operator_fingerprint is not None:
         raise ValueError(
-            "photon head Sigma basis stamp exists without an operator "
-            "fingerprint")
+            "photon head Sigma operator identity exists without a basis")
     if _photon_head is None:
         _photon_head = np.zeros(
             (3, 3, _nk, _nb), dtype=np.complex128)

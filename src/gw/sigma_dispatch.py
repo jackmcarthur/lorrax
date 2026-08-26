@@ -51,7 +51,7 @@ from .gw_config import (
     band_extrapolation_is_consumable,
     mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
     refuse_unimplemented_compute_mode,
-    sigma_stage_modes)
+    sigma_stage_modes, uses_static_photon_response)
 
 
 # ---------------------------------------------------------------------------
@@ -927,26 +927,25 @@ def compute_sigma_xc(
     W_static = W_by_role.get("static", V_q)
     builds_static_screened = mode_builds_channels(
         mode, SigmaChannel.SX, SigmaChannel.COH)
-    from .gw_config import BispinorGWMode, coerce_bispinor_gw_mode
-    bispinor_gw = coerce_bispinor_gw_mode(getattr(
-        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     photon_head_sigma_diag = None
     photon_head_sigma_operator_fingerprint = None
     photon_head_sigma_basis = None
-    if bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
+    if uses_static_photon_response(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
-                "full_static_cohsex reached Sigma outside compute_mode=cohsex; "
+                "static packed-photon mode reached Sigma outside "
+                "compute_mode=cohsex; "
                 "the config/driver envelope should have refused this before "
                 "screening allocation.")
         if photon_response is None:
             raise RuntimeError(
-                "bispinor_gw=full_static_cohsex reached Sigma without the "
+                "static packed-photon mode reached Sigma without the "
                 "packed static photon response.  Refusing instead of "
                 "falling back to charge-only screened COHSEX.")
         if static_head_terms is not None:
             raise ValueError(
-                "full_static_cohsex received scalar static_head_terms.  Its "
+                "static packed-photon mode received scalar static_head_terms. "
+                "Its "
                 "q->0 policy already lives in the packed four-current V/W; "
                 "a scalar correction would double count the charge sector "
                 "and omit coupled current wings.")
@@ -1086,7 +1085,7 @@ def compute_sigma_xc(
         # potential.  The exact periodic G-space current artifact is a
         # separate operator, so append it independently after the scalar
         # replacement rather than letting hartree_source erase it.  It is the
-        # SSOT for BOTH BARE_TRANSVERSE and FULL_STATIC_COHSEX; no centroid
+        # SSOT for every bispinor_gw mode; no centroid
         # direct contraction or exchange q->0 head reaches this seam.
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
