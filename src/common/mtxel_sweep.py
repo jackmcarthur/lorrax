@@ -293,9 +293,11 @@ __all__ = [
     "uniform_gauge_operator",
     "sum_operators",
     "sweep_matrix_elements",
+    "sweep_uniform_current_matrix_elements",
     "sweep_uniform_gauge_matrix_elements",
     "finite_transfer_current_to_centroids",
     "UniformGaugeMatrixElements",
+    "UniformGaugeCurrentMatrixElements",
     "FiniteTransferCurrentEndpoint",
     "blocks_to_host",
 ]
@@ -796,6 +798,20 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                          sign))
 
 
+class UniformGaugeCurrentMatrixElements(NamedTuple):
+    r"""Band-sharded uniform current action without unrelated response jets.
+
+    This is a component-selection view of :func:`uniform_gauge_operator`, not
+    a second current implementation.  It exists for Hall consumers, which
+    need only ``Gamma_raw`` and the exact Hamiltonian/operator fingerprint;
+    retaining contact and transfer jets for that terminal three-number
+    reduction is prohibitive on a production band manifold.
+    """
+
+    gamma_raw: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+
+
 class UniformGaugeMatrixElements(NamedTuple):
     r"""Band-sharded uniform gauge action and optional transfer jet.
 
@@ -806,8 +822,9 @@ class UniformGaugeMatrixElements(NamedTuple):
     two-dimensional band sharding.  With the separately priced transfer-q2
     capability, ``dgamma_dq_raw`` and ``d2gamma_dq2_raw`` have shapes
     ``(nk,3,3,nb,nb)`` and ``(nk,3,3,3,nb,nb)``.  They are deliberately one
-    transaction: Hall, response-jet, and contact consumers must not reopen
-    the WFN or rebuild projectors.
+    transaction: response-jet and contact consumers must not reopen the WFN
+    or rebuild projectors.  Hall's current-only component selection is the
+    smaller sibling above and calls the same operator/sweep owners.
     """
 
     gamma_raw: jax.Array
@@ -874,7 +891,7 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
-                           vnl_setup,
+                           vnl_setup, include_contact: bool = True,
                            include_transfer_q2: bool = False) -> Operator:
     r"""One apply-to-ket owner for raw current and exact uniform contact.
 
@@ -884,7 +901,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
     on the kinetic-balance bispinor.  Contracting the ``alpha_i`` term with
     that bispinor is identically ``(alpha_FS/2) dT/dK_i``; no second
-    sigma.p spelling is introduced here.  The final nine components are
+    sigma.p spelling is introduced here.  With ``include_contact=True``
+    (the default), the final nine components are
 
     ``Lambda_ab = (alpha_FS/2) d2(T+V_NL)/dK_a dK_b``.
 
@@ -923,11 +941,12 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         raise ValueError(
             "uniform_gauge_operator requires a two-component Pauli VNLSetup; "
             f"got nspinor={int(vnl_setup.nspinor)}")
-    if vnl_setup.Gpp_table is None:
+    transfer_q2 = bool(include_transfer_q2)
+    contact_enabled = bool(include_contact or transfer_q2)
+    if contact_enabled and vnl_setup.Gpp_table is None:
         raise ValueError(
             "uniform_gauge_operator requires VNLSetup built with "
             "compute_contact=True")
-    transfer_q2 = bool(include_transfer_q2)
     if transfer_q2 and vnl_setup.Gppp_table is None:
         raise ValueError(
             "uniform_gauge_operator transfer q2 requires VNLSetup built "
@@ -968,12 +987,13 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             int(psi_4.shape[1]))
         gamma = gamma_kin + gamma_vnl
 
-        lambda_kin = apply_kinetic_contact_to_ket(psi_L)
-        lambda_large = halfalpha.astype(psi_4.real.dtype) * (
-            lambda_kin + vnl.lambda0_cart_ket)
-        contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
-
-        fields = [gamma, contact.reshape(9, *contact.shape[2:])]
+        fields = [gamma]
+        if contact_enabled:
+            lambda_kin = apply_kinetic_contact_to_ket(psi_L)
+            lambda_large = halfalpha.astype(psi_4.real.dtype) * (
+                lambda_kin + vnl.lambda0_cart_ket)
+            contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
+            fields.append(contact.reshape(9, *contact.shape[2:]))
         if transfer_q2:
             # dPsi/dK is independent of K.  Evaluating the canonical lift
             # jet at zero avoids threading a second reciprocal-lattice
@@ -1008,12 +1028,14 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         return jnp.moveaxis(packed, 0, -1)[None]
 
     operator_key = (
-        "uniform_gauge_current_contact", geom.ngkmax, geom.ns,
+        ("uniform_gauge_current_contact" if contact_enabled
+         else "uniform_gauge_current"), geom.ngkmax, geom.ns,
         float(blat), id(vnl_setup))
     if transfer_q2:
         operator_key += ("explicit_transfer_q2",)
     return Operator(
-        apply=op, post=1.0, ncomp=(48 if transfer_q2 else 12),
+        apply=op, post=1.0,
+        ncomp=(48 if transfer_q2 else (12 if contact_enabled else 3)),
         key=operator_key)
 
 
@@ -1066,6 +1088,68 @@ def _gauge_hamiltonian_operator_fingerprint(
     return "sha256:" + digest.hexdigest()
 
 
+def _uniform_gauge_sweep_fingerprint(
+    *, wfn, vnl_setup, band_start: int, band_stop: int,
+    geom: SweepGeometry, include_transfer_q2: bool,
+) -> str:
+    """Validate one uniform sweep manifold and return its sole identity."""
+    start, stop = int(band_start), int(band_stop)
+    if start < 0 or stop <= start or stop > int(wfn.nbands):
+        raise ValueError(
+            "uniform gauge band interval must satisfy "
+            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
+    if stop - start != int(geom.nb_logical):
+        raise ValueError(
+            "uniform gauge band interval does not match SweepGeometry: "
+            f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
+    return _gauge_hamiltonian_operator_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
+        geom=geom, include_transfer_q2=bool(include_transfer_q2))
+
+
+def sweep_uniform_current_matrix_elements(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    bvec,
+    blat,
+    vnl_setup,
+    gvecs,
+    gmask,
+    box_index,
+    kvecs,
+    use_scan: bool = True,
+) -> UniformGaugeCurrentMatrixElements:
+    """Select only ``Gamma_raw`` from the canonical uniform-gauge sweep.
+
+    The operator closure, band reshard, VNL action and fingerprint owner are
+    exactly those used by :func:`sweep_uniform_gauge_matrix_elements`.
+    Only its static output component set differs, so a Hall-only producer
+    does not retain contact/response matrices that it cannot consume.
+    """
+    fingerprint = _uniform_gauge_sweep_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
+        band_stop=band_stop, geom=geom, include_transfer_q2=False)
+    gamma_raw = sweep_matrix_elements(
+        psi_G,
+        geom=geom,
+        operator=uniform_gauge_operator(
+            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
+            include_contact=False, include_transfer_q2=False),
+        gvecs=gvecs,
+        gmask=gmask,
+        box_index=box_index,
+        kvecs=kvecs,
+        use_scan=use_scan,
+    )
+    return UniformGaugeCurrentMatrixElements(
+        gamma_raw=gamma_raw,
+        hamiltonian_config_operator_fingerprint=fingerprint)
+
+
 def sweep_uniform_gauge_matrix_elements(
     psi_G,
     *,
@@ -1092,18 +1176,10 @@ def sweep_uniform_gauge_matrix_elements(
     and geometry.  This is the Hamiltonian/operator identity, deliberately
     separate from the artifact-format convention stamped by its writer.
     """
-    start, stop = int(band_start), int(band_stop)
-    if start < 0 or stop <= start or stop > int(wfn.nbands):
-        raise ValueError(
-            "uniform gauge band interval must satisfy "
-            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
-    if stop - start != int(geom.nb_logical):
-        raise ValueError(
-            "uniform gauge band interval does not match SweepGeometry: "
-            f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
-    fingerprint = _gauge_hamiltonian_operator_fingerprint(
-        wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
-        geom=geom, include_transfer_q2=bool(include_transfer_q2))
+    fingerprint = _uniform_gauge_sweep_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
+        band_stop=band_stop, geom=geom,
+        include_transfer_q2=bool(include_transfer_q2))
 
     packed = sweep_matrix_elements(
         psi_G,
