@@ -852,10 +852,8 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
         lambda_raw=jnp.zeros(
             (nk, 3, 3, storage, storage), dtype=jnp.complex128),
         hamiltonian_config_operator_fingerprint=fingerprint,
-        dgamma_dq_raw=jnp.zeros(
-            (nk, 3, 3, storage, storage), dtype=jnp.complex128),
-        d2gamma_dq2_raw=jnp.zeros(
-            (nk, 3, 3, 3, storage, storage), dtype=jnp.complex128),
+        dgamma_dq_raw=None,
+        d2gamma_dq2_raw=None,
     )
     energies_file = np.asarray([[[-1.1, -0.3, 0.8]]], dtype=np.float64)
     occupations_file = np.asarray([[[1.0, 1.0, 0.0]]], dtype=np.float64)

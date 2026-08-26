@@ -3226,11 +3226,13 @@ def static_gauge_hall_transaction(
     r"""Produce the artifact-ready Hall term from one canonical transaction.
 
     ``uniform_gauge`` must be the result of
-    :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements` with its
-    transfer-q2 capability enabled.  That requirement is provenance, not a
-    Hall-algebra dependency: it guarantees that the returned fingerprint is
-    also the identity of the current/contact/response-jet transaction a
-    complete :class:`gw.head_correction.StaticGaugeHeadResponse` will use.
+    :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements`.  Hall
+    production consumes its current block and authenticates the same-sweep
+    exact contact.  Optional transfer-q1/q2 fields are validated when present,
+    but they are not materialized merely to reduce Hall: on a realistic band
+    manifold that would make a three-number reduction retain 36 unrelated
+    band matrices.  The complete response producer separately consumes those
+    response-jet fields under its own capability gate.
 
     Energies and occupations are read from the same ``WfnLoader`` and unfolded
     from its file wedge through :func:`symmetry_maps.unfold_file_wedge_to_full_bz`.
@@ -3246,13 +3248,11 @@ def static_gauge_hall_transaction(
         raise TypeError(
             "static gauge Hall production requires the canonical "
             "UniformGaugeMatrixElements transaction")
-    if (uniform_gauge.dgamma_dq_raw is None
-            or uniform_gauge.d2gamma_dq2_raw is None):
+    if ((uniform_gauge.dgamma_dq_raw is None)
+            != (uniform_gauge.d2gamma_dq2_raw is None)):
         raise ValueError(
-            "GATE static_gauge_hall_incomplete_transaction: Hall artifact "
-            "provenance requires a uniform-gauge sweep with "
-            "include_transfer_q2=True so its fingerprint also binds the "
-            "response jet")
+            "uniform-gauge Hall transaction has only one of its optional "
+            "first/second transfer-jet fields")
 
     start, stop = int(band_start), int(band_stop)
     logical = stop - start
@@ -3282,13 +3282,15 @@ def static_gauge_hall_transaction(
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid exact-contact "
             f"shape {uniform_gauge.lambda_raw.shape}")
-    if tuple(uniform_gauge.dgamma_dq_raw.shape) != (
-            nk_tot, 3, 3, storage, storage):
+    if (uniform_gauge.dgamma_dq_raw is not None
+            and tuple(uniform_gauge.dgamma_dq_raw.shape) != (
+                nk_tot, 3, 3, storage, storage)):
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid first transfer "
             f"jet shape {uniform_gauge.dgamma_dq_raw.shape}")
-    if tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
-            nk_tot, 3, 3, 3, storage, storage):
+    if (uniform_gauge.d2gamma_dq2_raw is not None
+            and tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
+                nk_tot, 3, 3, 3, storage, storage)):
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid second transfer "
             f"jet shape {uniform_gauge.d2gamma_dq2_raw.shape}")
