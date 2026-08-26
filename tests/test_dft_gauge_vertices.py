@@ -321,6 +321,13 @@ def test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly():
         icl.dgamma_dq_cart_ket,
         -0.5 * uniform.lambda_cart_ket,
         rtol=0.0, atol=0.0)
+    current_only = apply_icl_vnl_transfer_jet_to_ket(
+        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2,
+        include_contact=False)
+    np.testing.assert_array_equal(
+        current_only.gamma0_cart_ket, uniform.gamma_cart_ket)
+    assert current_only.lambda0_cart_ket is None
+    assert current_only.dgamma_dq_cart_ket is None
 
 
 def test_icl_kminusq_taylor_ward_and_transfer_hermiticity():
