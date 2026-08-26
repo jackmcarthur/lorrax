@@ -366,6 +366,7 @@ def _compute_V_q_g_flat_one_tile(
     kgrid, fft_grid, mesh_xy,
     g_chunk: int | None,
     sym, centroid_indices,             # IBZ closure check is on the L centroids
+    is_charge_cc: bool,
     write_g0: bool,
     one_leg_action: str,
     qgrid_policy=None,
@@ -615,7 +616,7 @@ def _compute_V_q_g_flat_one_tile(
         # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
         # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-        if timing_label == "CC":
+        if is_charge_cc:
             # TIME REVERSAL IS MEASURED, NEVER ASSUMED.  This block used to
             # compose q with −q through Θ and project the self-negative
             # rows unconditionally; on a ferromagnet that fabricates a
@@ -650,7 +651,7 @@ def _compute_V_q_g_flat_one_tile(
         # compute path takes no restart decision and this line costs a list
         # check on every other run.  Only the CC tile is offered: the
         # bispinor CT/TT tiles are not restart tensors.
-        if timing_label == "CC":
+        if is_charge_cc:
             from .restart_q_storage import deposit_pre_unfold
             deposit_pre_unfold(
                 "V_qmunu", V_acc,
@@ -765,6 +766,7 @@ def compute_all_V_q_g_flat(
         mesh_xy=mesh_xy,
         g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices,
+        is_charge_cc=True,
         write_g0=True,
         one_leg_action="scalar",
         timing_label='CC',

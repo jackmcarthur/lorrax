@@ -452,6 +452,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
             mesh_xy=mesh_xy,
             g_chunk=g_chunk,
             sym=_tile_sym, centroid_indices=_tile_cent,
+            is_charge_cc=is_CC,
             write_g0=write_g0,
             qgrid_policy=qgrid_policy,
             one_leg_action=(
