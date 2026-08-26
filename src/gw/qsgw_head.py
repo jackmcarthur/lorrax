@@ -180,6 +180,7 @@ __all__ = [
     "IterationHeadSamples",
     "ParallelTransportHeadData",
     "StaticGaugeFirstOrderComponent",
+    "StaticGaugeHallTransaction",
     "StaticGaugeSecondOrderComponent",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
@@ -190,6 +191,7 @@ __all__ = [
     "head_s_tensor_sharded",
     "head_wings_sharded",
     "raw_hall_pseudovector_sharded",
+    "static_gauge_hall_transaction",
     "static_gauge_first_order_component_sharded",
     "static_gauge_second_order_component_sharded",
     "static_head_wings_sharded",
@@ -251,6 +253,41 @@ _HEAD_WING_MU_BLOCK = 64
 # second jets, response-weight derivatives and contact terms are assembled by
 # the producer, not inferred here.
 _HEAD_VERTEX_WIDTHS = (3, 8)
+
+
+_STATIC_GAUGE_HALL_PRODUCER_ID = (
+    "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1")
+_STATIC_GAUGE_HALL_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class StaticGaugeHallTransaction:
+    """Sealed Hall result from one complete uniform-gauge transaction.
+
+    ``sigma_H`` is the three-component real Hall pseudovector consumed by
+    :class:`gw.head_correction.StaticGaugeHeadResponse`.  The fingerprint is
+    copied from the *same* uniform-gauge sweep that supplied ``Gamma_raw``;
+    it therefore remains inseparable from the current/contact/transfer-jet
+    Hamiltonian identity that a complete response artifact must carry.
+
+    The large ``Gamma_raw`` band matrix remains sharded over both processor
+    axes and is not retained here.  The only replicated product is the
+    three-component Hall vector.
+    """
+
+    sigma_H: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+    band_start: int
+    band_stop: int
+    nk_tot: int
+    producer_id: str
+    _producer_token: object
+
+    def __post_init__(self) -> None:
+        if self._producer_token is not _STATIC_GAUGE_HALL_TOKEN:
+            raise TypeError(
+                "StaticGaugeHallTransaction is issued only by "
+                "static_gauge_hall_transaction")
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -3116,11 +3153,13 @@ def raw_hall_pseudovector_sharded(
             f"sweep_uniform_gauge_matrix_elements; got {gamma.shape}")
     if gamma.shape[2] != gamma.shape[3]:
         raise ValueError("gamma_raw band matrices must be square")
-    if e.shape != f.shape or tuple(e.shape) != (
-            int(gamma.shape[0]), int(gamma.shape[2])):
+    if e.shape != f.shape or tuple(e.shape) not in (
+            (int(gamma.shape[0]), int(nb_logical)),
+            (int(gamma.shape[0]), int(gamma.shape[2]))):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
-            f"gamma_raw {gamma.shape}")
+            "the logical or stored band extent of gamma_raw "
+            f"{gamma.shape} (nb_logical={int(nb_logical)})")
     if not (0 < int(nb_logical) <= int(gamma.shape[2])):
         raise ValueError(
             f"need 0 < nb_logical <= stored nb={gamma.shape[2]}; "
@@ -3137,6 +3176,16 @@ def raw_hall_pseudovector_sharded(
             "before the 1/Nk normalization is applied")
     if float(degeneracy_tolerance_ry) <= 0.0:
         raise ValueError("degeneracy_tolerance_ry must be positive")
+
+    # ``sweep_uniform_gauge_matrix_elements`` stores both band axes at the
+    # mesh-divisible carrier extent, while WFN energies/occupations are the
+    # logical file manifold.  Use the repository padding owner rather than
+    # forcing a producer to manufacture padded electronic states.  The
+    # kernel's explicit ``nb_logical`` mask makes these storage rows inert.
+    if int(e.shape[1]) != int(gamma.shape[2]):
+        from runtime.padding import pad_axis
+        e = pad_axis(e, int(gamma.shape[2]), axis=1).array
+        f = pad_axis(f, int(gamma.shape[2]), axis=1).array
 
     # Reuse the incumbent head manifold's one padding/sharding owner.  The
     # transpose is a view putting the replicated component axis first.
@@ -3162,6 +3211,142 @@ def raw_hall_pseudovector_sharded(
         float(cell_volume) * float(nk_tot) * float(HALFALPHA))
     return jnp.asarray(
         prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
+
+
+def static_gauge_hall_transaction(
+    uniform_gauge,
+    *,
+    wfn,
+    sym,
+    band_start: int,
+    band_stop: int,
+    mesh: Mesh,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+) -> StaticGaugeHallTransaction:
+    r"""Produce the artifact-ready Hall term from one canonical transaction.
+
+    ``uniform_gauge`` must be the result of
+    :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements` with its
+    transfer-q2 capability enabled.  That requirement is provenance, not a
+    Hall-algebra dependency: it guarantees that the returned fingerprint is
+    also the identity of the current/contact/response-jet transaction a
+    complete :class:`gw.head_correction.StaticGaugeHeadResponse` will use.
+
+    Energies and occupations are read from the same ``WfnLoader`` and unfolded
+    from its file wedge through :func:`symmetry_maps.unfold_file_wedge_to_full_bz`.
+    Consequently ``Gamma_raw``, energies and occupations all have one row per
+    physical full-BZ k before the sole ``1/Nk`` normalization is applied.  No
+    driver-local star reconstruction, wavefunction reopen, band-matrix gather,
+    FFT, current operator, or second Hall contraction is introduced here.
+    """
+    from common.mtxel_sweep import UniformGaugeMatrixElements
+    from symmetry_maps import unfold_file_wedge_to_full_bz
+
+    if not isinstance(uniform_gauge, UniformGaugeMatrixElements):
+        raise TypeError(
+            "static gauge Hall production requires the canonical "
+            "UniformGaugeMatrixElements transaction")
+    if (uniform_gauge.dgamma_dq_raw is None
+            or uniform_gauge.d2gamma_dq2_raw is None):
+        raise ValueError(
+            "GATE static_gauge_hall_incomplete_transaction: Hall artifact "
+            "provenance requires a uniform-gauge sweep with "
+            "include_transfer_q2=True so its fingerprint also binds the "
+            "response jet")
+
+    start, stop = int(band_start), int(band_stop)
+    logical = stop - start
+    if start != 0 or logical <= 0 or stop > int(wfn.nbands):
+        raise ValueError(
+            "static gauge Hall band interval must start at band zero and "
+            f"satisfy 0 < stop <= WFN.nbands; got [{start},{stop})")
+    if int(wfn.nspin) != 1:
+        raise ValueError(
+            "static gauge Hall transaction currently requires nspin=1: "
+            "Gamma_raw has no explicit spin-channel axis")
+
+    gamma = uniform_gauge.gamma_raw
+    nk_tot = int(sym.nk_tot)
+    if (gamma.ndim != 4 or int(gamma.shape[0]) != nk_tot
+            or int(gamma.shape[1]) != 3
+            or int(gamma.shape[2]) != int(gamma.shape[3])
+            or int(gamma.shape[2]) < logical):
+        raise ValueError(
+            "canonical static gauge Hall transaction requires full-BZ "
+            "Gamma_raw[nk,3,nb,nb] with both band carriers covering the "
+            f"logical interval: got {gamma.shape}, nk_tot={nk_tot}, "
+            f"logical bands={logical}")
+    storage = int(gamma.shape[2])
+    if tuple(uniform_gauge.lambda_raw.shape) != (
+            nk_tot, 3, 3, storage, storage):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid exact-contact "
+            f"shape {uniform_gauge.lambda_raw.shape}")
+    if tuple(uniform_gauge.dgamma_dq_raw.shape) != (
+            nk_tot, 3, 3, storage, storage):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid first transfer "
+            f"jet shape {uniform_gauge.dgamma_dq_raw.shape}")
+    if tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
+            nk_tot, 3, 3, 3, storage, storage):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid second transfer "
+            f"jet shape {uniform_gauge.d2gamma_dq2_raw.shape}")
+
+    fingerprint = str(
+        uniform_gauge.hamiltonian_config_operator_fingerprint).strip()
+    if (not fingerprint.startswith("sha256:")
+            or len(fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
+        raise ValueError(
+            "uniform-gauge Hall transaction lacks the canonical "
+            "Hamiltonian/config/operator SHA-256 fingerprint")
+
+    energies_file = np.asarray(
+        wfn.energies[0, :, start:stop], dtype=np.float64)
+    occupations_file = np.asarray(
+        wfn.occs[0, :, start:stop], dtype=np.float64)
+    if (energies_file.shape != (int(sym.nk_red), logical)
+            or occupations_file.shape != energies_file.shape):
+        raise ValueError(
+            "WFN energy/occupation file-wedge tables do not match the "
+            f"requested Hall manifold: {energies_file.shape}/"
+            f"{occupations_file.shape}, expected "
+            f"{(int(sym.nk_red), logical)}")
+    if np.any((occupations_file != 0.0) & (occupations_file != 1.0)):
+        raise ValueError(
+            "static gauge Hall artifact production is insulating-only and "
+            "requires exact 0/1 occupations")
+    occupations_above = np.asarray(
+        wfn.occs[0, :, stop:], dtype=np.float64)
+    if np.any(occupations_above != 0.0):
+        raise ValueError(
+            "static gauge Hall band interval omits occupied WFN states; "
+            "increase band_stop")
+
+    energies_full = unfold_file_wedge_to_full_bz(sym, energies_file)
+    occupations_full = unfold_file_wedge_to_full_bz(sym, occupations_file)
+    sigma_H = raw_hall_pseudovector_sharded(
+        gamma,
+        energies_full,
+        occupations_full,
+        mesh=mesh,
+        nb_logical=logical,
+        cell_volume=float(wfn.cell_volume),
+        nk_tot=nk_tot,
+        nspin=int(wfn.nspin),
+        nspinor_wfn=int(wfn.nspinor),
+        degeneracy_tolerance_ry=float(degeneracy_tolerance_ry),
+    )
+    return StaticGaugeHallTransaction(
+        sigma_H=sigma_H,
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        band_start=start,
+        band_stop=stop,
+        nk_tot=nk_tot,
+        producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
+        _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+    )
 
 
 @dataclass(frozen=True)
