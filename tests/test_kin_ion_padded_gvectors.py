@@ -101,20 +101,103 @@ def test_kin_ion_provenance_refuses_wrong_or_missing_bispinor_before_read(
         return original_getitem(dataset, key)
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", record_payload_read)
+    import pytest
+    with pytest.raises(ValueError, match="requires a resolved Hartree source"):
+        owner.validate_kin_ion_against_run(
+            true_path, expected_bispinor=True,
+            selected_hartree_source="auto",
+            print_fn=lambda *_args: None)
     assert owner.validate_kin_ion_against_run(
         true_path, expected_bispinor=True,
+        selected_hartree_source="isdf",
         print_fn=lambda *_args: None)["bispinor"]
 
-    import pytest
     with pytest.raises(ValueError, match="bispinor=False.*bispinor=True"):
         owner.validate_kin_ion_against_run(
             false_path, expected_bispinor=True,
+            selected_hartree_source="isdf",
             print_fn=lambda *_args: None)
     with pytest.raises(ValueError, match="no bispinor provenance stamp"):
         owner.validate_kin_ion_against_run(
             legacy_path, expected_bispinor=True,
+            selected_hartree_source="isdf",
             print_fn=lambda *_args: None)
     assert reads == [], "provenance gate read a kin_ion matrix payload"
+
+
+def test_fractional_hartree_receipt_checks_support_and_wfn_both_directions(
+        tmp_path, monkeypatch):
+    import h5py
+    import pytest
+    from types import SimpleNamespace
+    from common import parallel_transport
+    from file_io import kin_ion as owner
+
+    path = tmp_path / "kin_ion_fractional.h5"
+    current_fingerprint = "a" * 64
+    monkeypatch.setattr(
+        parallel_transport, "wfn_fingerprint",
+        lambda _wfn: current_fingerprint)
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
+        ds.attrs["bispinor"] = False
+        ds.attrs["wfn_fingerprint_scheme"] = (
+            parallel_transport.WFN_FINGERPRINT_SCHEME)
+        ds.attrs["wfn_fingerprint"] = current_fingerprint
+        ds.attrs["exact_hartree_occupation_policy"] = (
+            owner.HARTREE_OCCUPATION_POLICY)
+        ds.attrs["exact_hartree_expected_electrons"] = 1.25
+        ds.attrs["exact_hartree_density_band_stop"] = 4
+        vh = h5.create_dataset(
+            owner.HARTREE_DATASET,
+            data=np.zeros((1, 2, 2), dtype=np.complex128))
+        vh.attrs["density_band_stop"] = 4
+
+    wfn = SimpleNamespace(
+        occupations_are_exact_integer=False,
+        num_electrons=1.25,
+        physical_density_band_stop=4)
+    owner.validate_kin_ion_against_run(
+        path, expected_bispinor=False, selected_hartree_source="stored",
+        wfn=wfn, print_fn=lambda *_args: None)
+
+    with h5py.File(path, "r+") as h5:
+        del h5["kin_ion"].attrs["exact_hartree_expected_electrons"]
+    with pytest.raises(ValueError, match="atomically"):
+        owner.validate_kin_ion_against_run(
+            path, expected_bispinor=False,
+            selected_hartree_source="stored", wfn=wfn,
+            print_fn=lambda *_args: None)
+
+    with h5py.File(path, "r+") as h5:
+        h5["kin_ion"].attrs["exact_hartree_expected_electrons"] = 1.25
+        h5[owner.HARTREE_DATASET].attrs["density_band_stop"] = 3
+    with pytest.raises(ValueError, match="density support"):
+        owner.validate_kin_ion_against_run(
+            path, expected_bispinor=False,
+            selected_hartree_source="stored", wfn=wfn,
+            print_fn=lambda *_args: None)
+
+    with h5py.File(path, "r+") as h5:
+        h5[owner.HARTREE_DATASET].attrs["density_band_stop"] = 4
+        h5["kin_ion"].attrs["wfn_fingerprint"] = "b" * 64
+    wfn.occupations_are_exact_integer = True
+    with pytest.raises(ValueError, match="different WFN fingerprint"):
+        owner.validate_kin_ion_against_run(
+            path, expected_bispinor=False,
+            selected_hartree_source="stored", wfn=wfn,
+            print_fn=lambda *_args: None)
+
+    with h5py.File(path, "r+") as h5:
+        for name in ("occupation_policy", "expected_electrons",
+                     "density_band_stop"):
+            del h5["kin_ion"].attrs[f"exact_hartree_{name}"]
+    with pytest.raises(ValueError, match="different WFN fingerprint"):
+        owner.validate_kin_ion_against_run(
+            path, expected_bispinor=False,
+            selected_hartree_source="isdf", wfn=wfn,
+            print_fn=lambda *_args: None)
 
 
 # D10's gate.  Bit-exactness is explicitly NOT required: appending exact

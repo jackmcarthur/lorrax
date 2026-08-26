@@ -100,8 +100,17 @@ TRANSVERSE_HARTREE_CURRENT_PROJECTION = (
 	"SymMaps.R_cart_forward:measured_trs_policy:residual_over_raw_J_l2:"
 	"affine_rotation_closure_bound_v2")
 
+#: Fractional exact-Hartree artifacts must name the quadrature that produced
+#: BOTH rho and J.  Exact integer-occupation files deliberately omit this
+#: marker and remain compatible: their incumbent band sum is the same algebra.
+#: A fractional file without it is ambiguous with the old, silently
+#: unit-weighted producer.
+HARTREE_OCCUPATION_POLICY = (
+	"wfn_loader.occs:full_bz_irr_idx_k:per_k_per_band_rho_and_J:v1")
+
 #: Legal values of the ``hartree_source`` input key.
 HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
+_RESOLVED_HARTREE_SOURCES = ("stored", "folded", "isdf", "gspace")
 
 #: Per-dataset attr naming the k-set the array is STORED on.  **Absent
 #: means** :data:`K_STORAGE_FULL` — see the module docstring for why that
@@ -543,10 +552,108 @@ def load_transverse_hartree_submatrix(
 		band_start, band_stop, mesh=mesh)
 
 
+def _validate_hartree_occupation_receipt(attrs, components, wfn) -> None:
+	"""Authenticate one file-wide fractional rho/J receipt."""
+	scheme = attrs.get("wfn_fingerprint_scheme")
+	fingerprint = attrs.get("wfn_fingerprint")
+	if (scheme is None) != (fingerprint is None):
+		raise ValueError("kin_ion WFN fingerprint scheme/value must be atomic.")
+	has_fingerprint = scheme is not None
+	if has_fingerprint:
+		from common.parallel_transport import (
+			WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+		if isinstance(scheme, (bytes, np.bytes_)):
+			scheme = scheme.decode("ascii")
+		if isinstance(fingerprint, (bytes, np.bytes_)):
+			fingerprint = fingerprint.decode("ascii")
+		if str(scheme) != WFN_FINGERPRINT_SCHEME:
+			raise ValueError("kin_ion has an unknown WFN fingerprint scheme.")
+		if wfn is None:
+			raise ValueError(
+				"kin_ion WFN fingerprint validation requires its canonical "
+				"WFN provenance view.")
+		if str(fingerprint) != str(wfn_fingerprint(wfn)):
+			raise ValueError("kin_ion has a different WFN fingerprint.")
+	if not components:
+		return
+	triple = tuple(attrs.get(f"exact_hartree_{name}") for name in (
+		"occupation_policy", "expected_electrons", "density_band_stop"))
+	if all(value is None for value in triple):
+		if wfn is None:
+			return  # pre-occupation-schema legacy WFN/artifact pair
+		current_fractional = not bool(wfn.occupations_are_exact_integer)
+		if current_fractional:
+			raise ValueError(
+				"fractional exact Hartree lacks a complete-WFN occupation "
+				"receipt; regenerate with all smearing tails weighted.")
+		return  # explicit exact-integer legacy compatibility
+	if any(value is None for value in triple):
+		raise ValueError(
+			"exact-Hartree occupation receipt must contain policy, fixed-N, "
+			"and density support atomically.")
+	if not has_fingerprint:
+		raise ValueError(
+			"weighted exact Hartree lacks its canonical WFN fingerprint.")
+	if wfn is None:
+		raise ValueError(
+			"weighted exact-Hartree validation requires its canonical WFN "
+			"provenance view.")
+	current_fractional = not bool(wfn.occupations_are_exact_integer)
+	policy, expected, support = triple
+	if isinstance(policy, (bytes, np.bytes_)):
+		policy = policy.decode("ascii")
+	if (str(policy) != HARTREE_OCCUPATION_POLICY
+			or not np.isfinite(float(expected)) or int(support) <= 0):
+		raise ValueError("exact Hartree has an invalid occupation receipt.")
+	receipt = (float(expected), int(support))
+	target = (float(wfn.num_electrons),
+	          int(wfn.physical_density_band_stop))
+	if receipt != target:
+		raise ValueError(
+			f"exact-Hartree receipt {receipt!r} differs from current WFN "
+			f"target/support {target!r}.")
+	for prefix, label in components:
+		if prefix is None:  # folded scalar has no separate component dataset
+			continue
+		component_support = attrs.get(f"{prefix}_density_band_stop")
+		if component_support is None or int(component_support) != receipt[1]:
+			raise ValueError(
+				f"{label} density support differs from the rho/J receipt.")
+
+	if not current_fractional:
+		raise ValueError(
+			"fractional exact-Hartree artifact cannot feed an integer WFN.")
+
+
+def _hartree_receipt_components(attrs, selected_hartree_source,
+								require_transverse):
+	"""Resolve which exact-Hartree components this consumer selected."""
+	if selected_hartree_source not in _RESOLVED_HARTREE_SOURCES:
+		raise ValueError(
+			"exact-Hartree authentication requires a resolved Hartree source "
+			f"in {_RESOLVED_HARTREE_SOURCES}; got "
+			f"{selected_hartree_source!r}.")
+	components = []
+	if selected_hartree_source == "stored":
+		components.append(("hartree", "selected scalar exact Hartree"))
+	elif selected_hartree_source == "folded":
+		components.append((None, "selected folded exact Hartree"))
+	if require_transverse:
+		if not attrs.get("_has_v_hartree_transverse"):
+			raise ValueError(
+				"the independently authenticated direct-field receipt requires "
+				f"{TRANSVERSE_HARTREE_DATASET!r}, but kin_ion.h5 has no such "
+				"dataset.")
+		components.append(("transverse_hartree", TRANSVERSE_HARTREE_DATASET))
+	return components
+
+
 def validate_kin_ion_against_run(
 	h5_path: str,
 	*,
 	expected_bispinor: bool,
+	selected_hartree_source: str,
+	wfn=None,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
@@ -566,9 +673,15 @@ def validate_kin_ion_against_run(
 	loudly, at load time.  Legacy files (no provenance attrs) are
 	accepted with a note for older optional fields; representation is the one
 	fail-closed exception because the writer already stamps it and there is no
-	safe legacy default.
+	safe legacy default.  Fractional stored/folded Hartree is the second
+	fail-closed exception: its canonical WFN fingerprint includes the complete
+	occupation table, and its policy marker distinguishes the weighted producer
+	from older artifacts that silently summed every support band with weight 1.
 	"""
 	attrs = read_kin_ion_provenance(h5_path)
+	components = _hartree_receipt_components(
+		attrs, selected_hartree_source, require_transverse)
+	_validate_hartree_occupation_receipt(attrs, components, wfn)
 	stored_bispinor = attrs.get("bispinor")
 	if stored_bispinor is None:
 		raise ValueError(
@@ -647,13 +760,6 @@ def validate_kin_ion_against_run(
 		)
 
 	if require_transverse:
-		if not attrs.get("_has_v_hartree_transverse"):
-			raise ValueError(
-				"this kinetic-balance bispinor run requires exact transverse "
-				"direct Hartree, but kin_ion.h5 has no "
-				f"{TRANSVERSE_HARTREE_DATASET!r} dataset. Regenerate the artifact "
-				"with the current `python -m gw.kin_ion_io`; centroid Hartree is "
-				"not a permitted fallback.")
 		# Authenticate this dataset's own storage receipt before any SlabIO
 		# payload read.  It may not inherit a sibling dataset's k-set claim.
 		read_star_map(h5_path, TRANSVERSE_HARTREE_DATASET)
@@ -782,6 +888,51 @@ def validate_kin_ion_against_run(
 			f"current covariance residual={residual:.3e} <= "
 			f"{derived_tolerance:.3e} (delta_R={rotation_defect:.3e}, "
 			f"floating={floating_bound:.3e}).")
+	return attrs
+
+
+def authenticate_kin_ion_hartree_wfn_receipt(
+	h5_path: str,
+	wfn_path: str,
+	*,
+	selected_hartree_source: str,
+	band_stop: int | None = None,
+	require_transverse: bool = False,
+) -> dict:
+	"""Authenticate post-hoc Hartree/WFN provenance before a matrix read.
+
+	This deliberately does not validate representation: the EQP-facing door
+	has no independent run configuration from which to establish it, and a v3
+	charge-only receipt does not prove non-bispinor.  ``require_transverse`` may
+	only be set from independent component-aware receipt evidence (v4 today).
+	The live GW path uses :func:`validate_kin_ion_against_run` with its parsed
+	``config.bispinor`` for the independent representation check.
+	A pre-occupation-schema artifact paired with a similarly old WFN lacking
+	``mf_header/kpoints/occ`` retains the explicit legacy compatibility branch;
+	any modern WFN or artifact marker takes the canonical provenance path.
+	"""
+	attrs = read_kin_ion_provenance(h5_path)
+	markers = (
+		"wfn_fingerprint_scheme", "wfn_fingerprint",
+		"exact_hartree_occupation_policy",
+		"exact_hartree_expected_electrons",
+		"exact_hartree_density_band_stop",
+	)
+	needs_provenance = any(attrs.get(name) is not None for name in markers)
+	if not needs_provenance:
+		with h5py.File(wfn_path, "r") as h5:
+			needs_provenance = "mf_header/kpoints/occ" in h5
+	wfn = None
+	if needs_provenance:
+		from wfn_loader import read_wfn_provenance
+		wfn = read_wfn_provenance(wfn_path)
+	components = _hartree_receipt_components(
+		attrs, selected_hartree_source, bool(require_transverse))
+	_validate_hartree_occupation_receipt(attrs, components, wfn)
+	if band_stop is not None and int(attrs["_shape"][1]) < int(band_stop):
+		raise ValueError(
+			f"kin_ion.h5 has {int(attrs['_shape'][1])} bands but the EQP "
+			f"window needs {int(band_stop)}.")
 	return attrs
 
 

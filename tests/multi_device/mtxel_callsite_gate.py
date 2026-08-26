@@ -209,7 +209,7 @@ def main():
     nocc = int(wfn.nelec)
     f_spin = spin_degeneracy_factor(wfn)
     rho_np = build_valence_density_distributed(
-        wfn, sym, meta, nocc, nk=nk, mesh=mesh, print_fn=p0)
+        wfn, sym, meta, nk=nk, mesh=mesh, print_fn=p0)
     V_H_r = build_hartree_potential(
         jnp.asarray(rho_np), wfn, truncation_2d=truncation_2d,
         expected_electrons=f_spin * float(nocc), print_fn=p0)
