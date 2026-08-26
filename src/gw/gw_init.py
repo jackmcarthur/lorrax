@@ -2658,17 +2658,10 @@ def prepare_isdf_and_wavefunctions(
 		int(band_slices.b0), int(meta.b_id_4_user))
 	charge_basis_receipt = None
 	transverse_basis_receipt = None
-	basis_wfn_fingerprint = None
 
 	if not cfg.restart:
-		# One bounded canonical HDF5 scan supplies every receipt for this
-		# loaded source.  In particular a bispinor run must not reopen/sample
-		# the WFN independently for its charge and transverse identities.
-		from common.parallel_transport import wfn_fingerprint
-		basis_wfn_fingerprint = wfn_fingerprint(wfn)
 		charge_basis_receipt = WavefunctionBasisReceipt.from_source(
-			wfn=wfn, wfn_fingerprint_value=basis_wfn_fingerprint,
-			role='charge', bispinor=bool(cfg.bispinor),
+			wfn=wfn, role='charge', bispinor=bool(cfg.bispinor),
 			band_interval=_basis_band_interval,
 			fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
 			n_rmu_logical=int(meta.n_rmu),
@@ -2766,9 +2759,7 @@ def prepare_isdf_and_wavefunctions(
 				_meta_receipt_T = transverse_wfn_data['meta']
 				transverse_basis_receipt = (
 					WavefunctionBasisReceipt.from_source(
-						wfn=wfn,
-						wfn_fingerprint_value=basis_wfn_fingerprint,
-						role='transverse', bispinor=True,
+						wfn=wfn, role='transverse', bispinor=True,
 						band_interval=_basis_band_interval,
 						fft_grid=_meta_receipt_T.fft_grid,
 						centroid_fft_idx=(
@@ -2945,9 +2936,7 @@ def prepare_isdf_and_wavefunctions(
 					V_qmunu=V_qmunu, G0_mu_nu=G0, enk_full=enk_full,
 					init_W0=True, mesh=mesh_xy,
 					mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
-					qp_state_source_record=qp_state_source_provenance(
-						wfn,
-						wfn_fingerprint_value=basis_wfn_fingerprint),
+					qp_state_source_record=qp_state_source_provenance(wfn),
 					# Stamp the band window + n_rmu so a later restart
 					# under a CHANGED window fails loudly instead of
 					# silently misindexing Sigma (job 7874375).
@@ -3092,29 +3081,24 @@ def prepare_isdf_and_wavefunctions(
 		# branch.  The entry resolver above is a centralized compatibility
 		# hook whose current deck-key refusal table is empty.
 		from file_io import load_restart_state_from_h5
-		from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+		from file_io.qp_wfn import (
+			read_qp_state_source_provenance,
+			refuse_conflicting_qp_state_sources,
+		)
 		_qp_state_wfn = getattr(wfn, 'path', None)
 		if not _qp_state_wfn:
 			raise ValueError(
 				"gw_jax restart consumer cannot identify the selected WFN "
 				"path, so restart psi/E compatibility cannot be checked.")
-		_restart_source_record = refuse_conflicting_qp_state_sources(
+		refuse_conflicting_qp_state_sources(
 			wfn_path=_qp_state_wfn,
 			state_artifact_path=tensors_filename,
 			where="gw_jax restart")
-		# The owner above returns the exact record it read and authenticated;
-		# do not reopen the artifact across that trust boundary.  Absence remains
+		# The owner above authenticates a present record.  Absence remains
 		# usable by legacy GW paths, but cannot support a new immutable basis
 		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
 		_restart_wfn_provenance_complete = (
-			_restart_source_record is not None)
-		if _restart_wfn_provenance_complete:
-			# ``refuse_conflicting_qp_state_sources`` authenticated this exact
-			# record against the selected WFN above.  Reuse that canonical
-			# fingerprint for both restart receipts instead of repeating the
-			# bounded WFN scan once per channel.
-			basis_wfn_fingerprint = (
-				_restart_source_record['wfn_fingerprint'])
+			read_qp_state_source_provenance(tensors_filename) is not None)
 		with timing.section("gw_jax.restart_load"):
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
@@ -3202,9 +3186,7 @@ def prepare_isdf_and_wavefunctions(
 					f"construction will refuse. ***")
 			else:
 				charge_basis_receipt = WavefunctionBasisReceipt.from_source(
-					wfn=wfn,
-					wfn_fingerprint_value=basis_wfn_fingerprint,
-					role='charge', bispinor=bool(cfg.bispinor),
+					wfn=wfn, role='charge', bispinor=bool(cfg.bispinor),
 					band_interval=_basis_band_interval,
 					fft_grid=meta.fft_grid,
 					centroid_fft_idx=centroid_indices,
@@ -3340,9 +3322,7 @@ def prepare_isdf_and_wavefunctions(
 						int(rs.psi_rmu_Y_transverse.shape[-1]))
 					transverse_basis_receipt = (
 						WavefunctionBasisReceipt.from_source(
-							wfn=wfn,
-							wfn_fingerprint_value=basis_wfn_fingerprint,
-							role='transverse', bispinor=True,
+							wfn=wfn, role='transverse', bispinor=True,
 							band_interval=_basis_band_interval,
 							fft_grid=meta.fft_grid,
 							centroid_fft_idx=_cent_T_idx_now,
