@@ -76,7 +76,9 @@ import subprocess
 # ``ModuleNotFoundError: No module named 'runtime.jax_support'`` from the
 # other tree.
 from .jax_support import enforce as _enforce_jax_support
-from .pjrt_log_filter import (install_pjrt_log_filter as
+from .pjrt_log_filter import (begin_clean_shutdown_log_filter as
+                              _begin_clean_shutdown_log_filter,
+                              install_pjrt_log_filter as
                               _install_pjrt_log_filter,
                               stop_pjrt_log_filter as _stop_pjrt_log_filter)
 
@@ -1595,12 +1597,14 @@ def finalize_process(rc: int = 0):
     1. ``jax.effects_barrier()`` — drains the runtime tokens that jax's own
        ``wait_for_tokens`` atexit would have drained.
     2. ``atexit.unregister(jax._src.api.clean_up)`` — the deadlocking hook.
-    3. ``jax.distributed.shutdown()`` — the piece of ``clean_up`` that must
+    3. One named process barrier — no rank may tear down the coordination
+       service while a peer is still draining effects or writing its report.
+    4. ``jax.distributed.shutdown()`` — the piece of ``clean_up`` that must
        still happen (P>1 coordination service; a no-op at P=1).
-    4. ``atexit._run_exitfuncs()`` — every remaining registered duty runs
+    5. ``atexit._run_exitfuncs()`` — every remaining registered duty runs
        NOW: the compile-cache report, the ``impl=mpi`` collectives
        ``Finalize``, h5py cleanup.  Nothing is silently skipped.
-    5. One rank-0 line stating what happened, flush, ``os._exit(rc)``.
+    6. One rank-0 line stating what happened, flush, ``os._exit(rc)``.
 
     The hard exit is not a workaround bolted on a mystery: the same
     mechanism (``os._exit`` after ``main()``) is what the fastloop's interim
@@ -1628,6 +1632,23 @@ def finalize_process(rc: int = 0):
                          f"below still prevents the interpreter-teardown "
                          f"path")
         try:
+            # ``jax.distributed.shutdown`` is process-local: rank zero also
+            # owns the coordination service and can remove it as soon as its
+            # own client is closed.  Synchronize immediately beforehand so a
+            # fast rank cannot strand a peer in report/effect completion and
+            # provoke WatchJobStateAsync connection-refused noise during an
+            # otherwise clean production shutdown.  This is the shared
+            # collective seam, not a driver-specific sleep or stderr filter.
+            from common.collectives import barrier as _barrier
+            _finalize_barrier_ran = _barrier("runtime.finalize")
+            if _finalize_barrier_ran:
+                # From this point the coordinator cancellation is rank zero
+                # closing its own service, not a peer disappearing mid-run.
+                _begin_clean_shutdown_log_filter()
+        except Exception as exc:                          # noqa: BLE001
+            _print_rank0(f"  [finalize] process barrier failed "
+                         f"({type(exc).__name__}: {exc}); continuing")
+        try:
             jax.distributed.shutdown()
         except Exception as exc:                          # noqa: BLE001
             _print_rank0(f"  [finalize] jax.distributed.shutdown failed "
@@ -1642,8 +1663,8 @@ def finalize_process(rc: int = 0):
     pjrt_notices = _stop_pjrt_log_filter()
     if pjrt_notices:
         debug_print(
-            f"[runtime] filtered {pjrt_notices} repetition(s) on rank 0 of "
-            "the upstream-removed PjRt-IFRT cache-deserialization notice; "
+            f"[runtime] filtered {pjrt_notices} exact known-benign JAX "
+            "runtime notice line(s) on rank 0; "
             "all other stderr was forwarded unchanged.")
     debug_print(
         "[runtime] process finalized explicitly (effects barrier, "
