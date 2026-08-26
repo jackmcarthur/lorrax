@@ -799,6 +799,7 @@ def main(argv=None):
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
 		wfn=wfn,
+		wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 		selected_hartree_source=hartree_source,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,

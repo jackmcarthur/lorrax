@@ -552,7 +552,13 @@ def load_transverse_hartree_submatrix(
 		band_start, band_stop, mesh=mesh)
 
 
-def _validate_hartree_occupation_receipt(attrs, components, wfn) -> None:
+def _validate_hartree_occupation_receipt(
+	attrs,
+	components,
+	wfn,
+	*,
+	wfn_fingerprint_binding=None,
+) -> None:
 	"""Authenticate one file-wide fractional rho/J receipt."""
 	scheme = attrs.get("wfn_fingerprint_scheme")
 	fingerprint = attrs.get("wfn_fingerprint")
@@ -561,7 +567,8 @@ def _validate_hartree_occupation_receipt(attrs, components, wfn) -> None:
 	has_fingerprint = scheme is not None
 	if has_fingerprint:
 		from common.parallel_transport import (
-			WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+			WFN_FINGERPRINT_SCHEME, fingerprint_from_binding,
+			wfn_fingerprint)
 		if isinstance(scheme, (bytes, np.bytes_)):
 			scheme = scheme.decode("ascii")
 		if isinstance(fingerprint, (bytes, np.bytes_)):
@@ -572,7 +579,11 @@ def _validate_hartree_occupation_receipt(attrs, components, wfn) -> None:
 			raise ValueError(
 				"kin_ion WFN fingerprint validation requires its canonical "
 				"WFN provenance view.")
-		if str(fingerprint) != str(wfn_fingerprint(wfn)):
+		current_fingerprint = (
+			wfn_fingerprint(wfn)
+			if wfn_fingerprint_binding is None else
+			fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+		if str(fingerprint) != str(current_fingerprint):
 			raise ValueError("kin_ion has a different WFN fingerprint.")
 	if not components:
 		return
@@ -654,6 +665,7 @@ def validate_kin_ion_against_run(
 	expected_bispinor: bool,
 	selected_hartree_source: str,
 	wfn=None,
+	wfn_fingerprint_binding=None,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
@@ -681,7 +693,9 @@ def validate_kin_ion_against_run(
 	attrs = read_kin_ion_provenance(h5_path)
 	components = _hartree_receipt_components(
 		attrs, selected_hartree_source, require_transverse)
-	_validate_hartree_occupation_receipt(attrs, components, wfn)
+	_validate_hartree_occupation_receipt(
+		attrs, components, wfn,
+		wfn_fingerprint_binding=wfn_fingerprint_binding)
 	stored_bispinor = attrs.get("bispinor")
 	if stored_bispinor is None:
 		raise ValueError(

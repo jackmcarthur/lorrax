@@ -3383,6 +3383,11 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		# The exact loaded-WFN identity was already scanned while binding the
+		# charge/transverse basis receipts.  Keep that opaque host proof at the
+		# orchestration seam so later artifact gates cannot reopen/resample the
+		# same WFN.  Legacy restart bundles legitimately carry ``None``.
+		wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
 		# Host-only provenance stays in these orchestration bindings rather
 		# than entering Wavefunctions' JAX pytree.  QP rotation returns only a
 		# numerical carrier, so it cannot accidentally inherit a DFT binding.
