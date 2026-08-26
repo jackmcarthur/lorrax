@@ -1576,6 +1576,9 @@ def main(argv=None):
     _gram_plan = _linalg_plan(
         "eigh", mesh_xy, backend=resolve_eigh_backend(params),
         n=int(sym.nk_tot) * (int(params["nval"]) + int(params["ncond"])))
+    _fine_plan = _linalg_plan(
+        "eigh", mesh_xy, backend=args.eigh_backend, n=None,
+        batched_route=args.distrib_la_batched_route)
     _gram_geometry = (
         "replicated native JAX" if _gram_plan.is_native else
         f"one matrix tile over {int(mesh_xy.shape['x'])} x "
@@ -1586,12 +1589,10 @@ def main(argv=None):
         "Transition data: distributed band and centroid blocks on X x Y",
         f"Gram eigensolve: {_gram_plan.requested} -> {_gram_plan.backend}; "
         f"{_gram_geometry}; n={int(_gram_plan.n)}",
-        "Fine-k eigensolve: " + policy(
-            args.eigh_backend,
-            ("auto", "off", "distributed", "cusolvermp", "slate",
-             "scalapack")),
-        "Batched LA schedule: " + policy(
-            args.distrib_la_batched_route, ("auto", "batch_reshard")),
+        f"Fine-k eigensolve: {_fine_plan.requested} -> "
+        f"{_fine_plan.backend}; matrix extent follows retained Galerkin rank",
+        f"Batched LA schedule: {_fine_plan.requested_batched_route} -> "
+        f"{_fine_plan.batched_route}",
         "LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
         "ScaLAPACK on CPU. Batched LA is a schedule, not a backend",
     ))

@@ -42,7 +42,10 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         gram_plan=SimpleNamespace(
             requested="auto", backend="native", is_native=True, n=48,
             mesh=SimpleNamespace(shape={"x": 2, "y": 2})),
-        fine_eigh_backend="auto", fine_enabled=False, batched_route="auto",
+        fine_plan=SimpleNamespace(
+            requested="distributed", backend="cusolvermp",
+            requested_batched_route="auto", batched_route="scan"),
+        fine_enabled=True,
         diagnostics_policy="auto", diagnostics_enabled=False)
     centroids = SimpleNamespace(closure=SimpleNamespace(
         closed=False, n_sym=2, n_violating=1, n_centroids=20,
@@ -115,8 +118,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "L01  Γ -> X: 1 intervals; 2 endpoint-inclusive points" in text
     assert "Gram eigensolve: auto (other choices:" in text
     assert "-> native; replicated native JAX; n=48" in text
-    assert "Fine-k eigensolve: not used" in text
-    assert "Batched LA     : not used" in text
+    assert "Fine-k eigensolve: distributed -> cusolvermp" in text
+    assert "Batched LA     : auto (other choices: batch_reshard) -> scan" in text
     assert "Energy checkpoint: Gamma max |Delta E|=1.20000e-03 eV" in text
     assert "not a global path-error bound" in text
     assert "auto (other choices:" in text

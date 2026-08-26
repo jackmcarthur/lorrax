@@ -2667,13 +2667,16 @@ def main(argv=None):
     _gram_plan = _linalg_plan(
         "eigh", mesh_xy, backend=_gram_backend,
         n=int(sym.nk_tot) * _n_fit_bands)
+    _fine_enabled = bool(params.get("get_centroids_fi", False))
+    _fine_plan = (_linalg_plan(
+        "eigh", mesh_xy, backend=eigh_backend, n=None,
+        batched_route=distrib_la_batched_route)
+        if _fine_enabled else None)
     _diag_on = (_debug if args.fh_diagnostics == "auto"
                 else args.fh_diagnostics == "on")
     report.environment(
         params=params, wfn=wfn, gram_plan=_gram_plan,
-        fine_eigh_backend=eigh_backend,
-        fine_enabled=bool(params.get("get_centroids_fi", False)),
-        batched_route=distrib_la_batched_route,
+        fine_plan=_fine_plan, fine_enabled=_fine_enabled,
         diagnostics_policy=args.fh_diagnostics,
         diagnostics_enabled=_diag_on)
 

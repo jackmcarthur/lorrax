@@ -97,9 +97,8 @@ class HTransformProductionReport:
                 self.runtime, mesh_role="Galerkin matrix axes X x Y"):
             self.emit(line)
 
-    def environment(self, *, params, wfn, gram_plan,
-                    fine_eigh_backend: str, fine_enabled: bool,
-                    batched_route: str, diagnostics_policy: str,
+    def environment(self, *, params, wfn, gram_plan, fine_plan,
+                    fine_enabled: bool, diagnostics_policy: str,
                     diagnostics_enabled: bool) -> None:
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
@@ -119,12 +118,20 @@ class HTransformProductionReport:
                     f"{int(gram_plan.mesh.shape['y'])} ranks")
         self.emit(f"Gram eigensolve: {eigh_text}; {geometry}; n={int(gram_plan.n)}")
         if fine_enabled:
-            self.emit("Fine-k eigensolve: " + policy(
-                fine_eigh_backend,
+            fine_text = policy(
+                fine_plan.requested,
                 ("auto", "off", "distributed", "cusolvermp", "slate",
-                 "scalapack")) + "; concrete plan resolves after Galerkin rank")
-            self.emit("Batched LA     : " + policy(
-                batched_route, ("auto", "batch_reshard")))
+                 "scalapack"))
+            if str(fine_plan.requested) != str(fine_plan.backend):
+                fine_text += f" -> {fine_plan.backend}"
+            self.emit("Fine-k eigensolve: " + fine_text
+                      + "; matrix extent follows retained Galerkin rank")
+            batch_text = policy(
+                fine_plan.requested_batched_route,
+                ("auto", "batch_reshard"))
+            if str(fine_plan.requested_batched_route) != str(fine_plan.batched_route):
+                batch_text += f" -> {fine_plan.batched_route}"
+            self.emit("Batched LA     : " + batch_text)
         else:
             self.emit("Fine-k eigensolve: not used (get_centroids_fi = false)")
             self.emit("Batched LA     : not used by this calculation")
@@ -172,13 +179,15 @@ class HTransformProductionReport:
             guard_ev = (
                 float(np.min(fitted_top)) - float(np.max(requested_top))) \
                 * RYD_TO_EV
-            headroom_ev = (
-                float(np.max(fitted_top)) - float(np.max(requested_top))) \
-                * RYD_TO_EV
+            vertical_ev = float(np.min(fitted_top - requested_top)) * RYD_TO_EV
+            relation = "separated" if guard_ev >= 0.0 else "ranges overlap"
             self.emit(
-                f"Guard buffer   : {guard_ev:+.5f} eV = min E(band "
-                f"{start + fit}) - max E(band {start + keep}); "
-                f"top-edge headroom={headroom_ev:.5f} eV")
+                f"Guard buffer   : {vertical_ev:.5f} eV minimum same-k "
+                f"separation, E(band {start + fit}) - E(band "
+                f"{start + keep})")
+            self.emit(
+                f"Global guard   : {guard_ev:+.5f} eV = min E(band "
+                f"{start + fit}) - max E(band {start + keep}); {relation}")
         self.emit(f"Centroid file  : {abs_path(centroid_file)}")
         if centroids is None:
             self.emit(f"Centroid sites : {int(meta.n_rmu)} requested/loaded; "
