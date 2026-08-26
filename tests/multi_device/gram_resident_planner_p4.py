@@ -32,9 +32,9 @@ def _fail(message: str) -> None:
 def main() -> None:
     from centroid.pivoted_cholesky import (
         _auto_gram_width_from_compiled_peaks,
-        _worst_process_resident_bytes,
     )
     from common.collectives import all_gather_processes
+    from common.gpu_utils import worst_process_resident_bytes
 
     if jax.process_count() != 4 or jax.device_count() != 4:
         _fail(
@@ -63,7 +63,7 @@ def main() -> None:
     if np.array_equal(naive_widths, np.full(4, naive_widths[0])):
         _fail(f"negative control did not diverge: {naive_widths.tolist()}")
 
-    shared_resident = _worst_process_resident_bytes(local_resident)
+    shared_resident = worst_process_resident_bytes(local_resident)
     fixed_width = choose(shared_resident)
     fixed_widths = np.asarray(
         all_gather_processes(np.asarray(fixed_width, dtype=np.int32))

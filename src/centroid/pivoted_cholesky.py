@@ -68,16 +68,14 @@ _services.ensure_on_path()
 if TYPE_CHECKING:                                                   # pragma: no cover
     from wfn_loader import WfnLoader
 from common import timing
-from common.collectives import all_gather_processes, device_put_process_local
+from common.collectives import device_put_process_local
+from common.gpu_utils import worst_process_resident_bytes
 from common.pivoted_cholesky import (
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
 )
+from runtime.padding import round_up
 
 from . import distribution as dist
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
 
 import symmetry_maps                                            # noqa: E402
 
@@ -86,28 +84,6 @@ _GRAM_MIN_COL_BLOCK = 256
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
-
-
-def _worst_process_resident_bytes(local_bytes: int) -> int:
-    """Return the rank-invariant resident floor used by the host planner.
-
-    Allocator residency is process-local and can differ because JIT arenas are
-    released asynchronously.  A static tile width is shared control flow, so
-    every process must price it from the same worst-rank floor.  Keep the
-    communication in the canonical process-collective service.
-    """
-    local_i = int(local_bytes)
-    if local_i < 0:
-        raise ValueError(f"resident bytes must be nonnegative, got {local_i}")
-    gathered = np.asarray(
-        all_gather_processes(np.asarray(local_i, dtype=np.int64)),
-        dtype=np.int64,
-    )
-    if gathered.size == 0 or np.any(gathered < 0):
-        raise ValueError(
-            "process residency gather returned no values or a negative value"
-        )
-    return int(np.max(gathered))
 
 
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
@@ -1245,8 +1221,7 @@ def build_gram_q0_via_loadwfns(
         # A manual width keeps its historical floor and is rounded UP so the
         # now-square tile divides BOTH mesh axes.  It is an explicit override,
         # so it may exceed auto's target and the diagnostic below says so.
-        col_block = ((col_block + tile_divisor - 1)
-                     // tile_divisor) * tile_divisor
+        col_block = round_up(col_block, tile_divisor)
     else:
         if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
             col_block = M_cols
@@ -1299,7 +1274,7 @@ def build_gram_q0_via_loadwfns(
         # The selected width controls static executable shapes and loop counts
         # on every process.  Allocator residency itself is rank-local, so price
         # from one shared worst-rank value before entering that host branch.
-        resident_bytes = _worst_process_resident_bytes(resident_local_bytes)
+        resident_bytes = worst_process_resident_bytes(resident_local_bytes)
 
         target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
         gram_local_bytes = (

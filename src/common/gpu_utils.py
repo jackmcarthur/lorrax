@@ -2,7 +2,9 @@
 
 Used by ``gw.gw_init`` and ``gw.gw_config`` to size chunking parameters.
 This module also owns the one BFC fragmentation target shared by planners
-whose large stage allocations scale with a small field-width factor.
+whose large stage allocations scale with a small field-width factor, and the
+worst-process residency reduction required when allocator state sizes static
+multi-process control flow.
 """
 
 import os
@@ -42,6 +44,34 @@ def bfc_fragmentation_target_utilization(width_factor: int) -> float:
     if factor == 2:
         return 0.85
     return 0.90
+
+
+def worst_process_resident_bytes(local_bytes: int) -> int:
+    """Return one rank-invariant allocator-residency floor.
+
+    Allocator residency is process-local and can differ because JIT arenas are
+    released asynchronously.  Any value that sizes a static executable or
+    host-loop shape must therefore be derived from the same worst-process
+    floor on every rank.  Keep the communication in the canonical process-
+    collective service and the memory policy here.
+    """
+    import numpy as np
+
+    from common.collectives import all_gather_processes
+
+    local_i = int(local_bytes)
+    if local_i < 0:
+        raise ValueError(f"resident bytes must be nonnegative, got {local_i}")
+    gathered = np.asarray(
+        all_gather_processes(np.asarray(local_i, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if gathered.size == 0 or np.any(gathered < 0):
+        raise ValueError(
+            "process residency gather returned no values or a negative value"
+        )
+    return int(np.max(gathered))
+
 
 def _query_nvidia_smi_memory(field: str) -> float | None:
     """Query a single GPU memory field (in MiB) from nvidia-smi."""
@@ -225,4 +255,5 @@ def get_device_memory_info() -> dict:
 
 __all__ = ["bfc_fragmentation_target_utilization",
            "get_device_memory_gb", "get_device_memory_info",
-           "get_gpu_memory_nvidia_smi", "get_cpu_memory_total"]
+           "get_gpu_memory_nvidia_smi", "get_cpu_memory_total",
+           "worst_process_resident_bytes"]
