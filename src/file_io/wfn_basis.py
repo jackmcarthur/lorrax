@@ -157,7 +157,6 @@ class WavefunctionBasisReceipt:
         cls,
         *,
         wfn,
-        wfn_fingerprint_value: str | None = None,
         role: str,
         bispinor: bool,
         band_interval,
@@ -166,18 +165,55 @@ class WavefunctionBasisReceipt:
         n_rmu_logical: int,
         n_rmu_padded: int,
     ) -> "WavefunctionBasisReceipt":
-        """Build the receipt from the canonical WFN/transform/hash owners.
+        """Build the receipt from the canonical WFN/transform/hash owners."""
+        return cls._from_source(
+            wfn=wfn, wfn_fingerprint_binding=None,
+            role=role, bispinor=bispinor, band_interval=band_interval,
+            fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
 
-        ``wfn_fingerprint_value`` is only for host orchestration that already
-        evaluated :func:`common.parallel_transport.wfn_fingerprint` for this
-        exact ``wfn``.  The GW initializer uses it to share one bounded HDF5
-        fingerprint scan across the charge/transverse receipts (and the
-        restart provenance writer).  Omitting it preserves the self-contained
-        constructor used by standalone producers and tests.
-        """
+    @classmethod
+    def from_bound_source(
+        cls,
+        *,
+        wfn,
+        wfn_fingerprint_binding,
+        role: str,
+        bispinor: bool,
+        band_interval,
+        fft_grid,
+        centroid_fft_idx,
+        n_rmu_logical: int,
+        n_rmu_padded: int,
+    ) -> "WavefunctionBasisReceipt":
+        """Build from a canonical digest bound to this exact loaded WFN."""
+        return cls._from_source(
+            wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+            role=role, bispinor=bispinor, band_interval=band_interval,
+            fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
+
+    @classmethod
+    def _from_source(
+        cls,
+        *,
+        wfn,
+        wfn_fingerprint_binding,
+        role: str,
+        bispinor: bool,
+        band_interval,
+        fft_grid,
+        centroid_fft_idx,
+        n_rmu_logical: int,
+        n_rmu_padded: int,
+    ) -> "WavefunctionBasisReceipt":
+        """Shared receipt construction after canonical source identity."""
         from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
         from common.parallel_transport import (
-            WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+            WFN_FINGERPRINT_SCHEME,
+            fingerprint_from_binding,
+            wfn_fingerprint,
+        )
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 
         start, stop = (int(v) for v in band_interval)
@@ -217,8 +253,8 @@ class WavefunctionBasisReceipt:
                 f"fft_grid={grid}")
         fingerprint = (
             wfn_fingerprint(wfn)
-            if wfn_fingerprint_value is None
-            else str(wfn_fingerprint_value))
+            if wfn_fingerprint_binding is None
+            else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
         return cls(
             role=str(role),
             wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME,

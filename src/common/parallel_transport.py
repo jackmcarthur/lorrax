@@ -42,6 +42,8 @@ __all__ = [
     "MIN_STENCIL_POINTS",
     "undersampled_link_axes",
     "WFN_FINGERPRINT_SCHEME",
+    "bind_wfn_fingerprint",
+    "fingerprint_from_binding",
     "fingerprint_update_value",
     "wfn_fingerprint",
 ]
@@ -243,6 +245,47 @@ def wfn_fingerprint(wfn) -> str:
     if path is not None:
         _fingerprint_wfn_file(digest, path)
     return digest.hexdigest()
+
+
+class _BoundWfnFingerprint:
+    """Host-only proof that one digest was computed from one loaded WFN."""
+
+    __slots__ = ("_source", "_fingerprint")
+
+    def __init__(self, source) -> None:
+        object.__setattr__(self, "_source", source)
+        object.__setattr__(self, "_fingerprint", wfn_fingerprint(source))
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("WFN fingerprint bindings are immutable")
+
+    def __reduce__(self):
+        raise TypeError("WFN fingerprint bindings are host-only and transient")
+
+
+def bind_wfn_fingerprint(wfn):
+    """Scan ``wfn`` once and bind the canonical digest to that exact object.
+
+    The opaque host-only result is an orchestration proof, not a numerical
+    JAX operand or a serializable artifact.  Consumers must extract its digest
+    through :func:`fingerprint_from_binding`, which refuses a different
+    loaded WFN even when it has the same path or array shapes.
+    """
+    return _BoundWfnFingerprint(wfn)
+
+
+def fingerprint_from_binding(binding, wfn) -> str:
+    """Return a bound canonical digest for the exact loaded ``wfn``."""
+    if not isinstance(binding, _BoundWfnFingerprint):
+        raise TypeError(
+            "expected the host-only result of bind_wfn_fingerprint; got "
+            f"{type(binding).__name__}")
+    if binding._source is not wfn:
+        raise ValueError(
+            "canonical WFN fingerprint binding belongs to a different "
+            "loaded WFN object; path or shape equality is not source "
+            "identity")
+    return binding._fingerprint
 
 
 def build_neighbor_table(
