@@ -127,7 +127,7 @@ Two rules follow, and both are enforced:
 ## 3. L3 — substrate
 
 **Process bootstrap** — `runtime/` (`__init__`, `aot_memory`, `padding`,
-`xla_memory`, `jax_support`, `pjrt_log_filter`).
+`production_stream`, `xla_memory`, `jax_support`, `pjrt_log_filter`).
 `initialize_communicator_stack()` is the single startup entry point: env
 before `import jax`, failfast excepthook, CPU-collectives transport,
 `jax.distributed`, GPU-or-CPU, the run's mesh with every communicator already

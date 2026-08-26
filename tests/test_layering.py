@@ -103,7 +103,8 @@ _L3_MODULES = frozenset({
     # R9) -- ``runtime`` was reaching UP into it through a function-local
     # import, and a startup fact that only ``runtime`` consumes is a sibling
     # of ``runtime``, not something above it.
-    "runtime", "runtime.aot_memory", "runtime.padding", "runtime.xla_memory",
+    "runtime", "runtime.aot_memory", "runtime.padding",
+    "runtime.production_stream", "runtime.xla_memory",
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
     # whole reason it is here rather than in ``gw.gw_config``.  The parsers
