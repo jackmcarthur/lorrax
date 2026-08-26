@@ -57,7 +57,8 @@ WHO CALLS WHAT
 ``slab_minibz_photon_cubature(kernel, geometry, kgrid)``
     The production screened-head provider: one authenticated receipt binding
     the true mini-lattice Wigner--Seitz polygon, fixed 16/24/32 Duffy--Gauss
-    ladder, normalized weights, and physical/padded solve counts.
+    ladder, cell volume, reciprocal lattice/k-grid identity, normalized
+    weights, and physical/padded solve counts.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -119,6 +120,7 @@ from vcoul.minibz import (
     minibz_voronoi_batches,
     iter_minibz_photon_samples,
     slab_minibz_photon_cubature,
+    validate_slab_minibz_photon_receipt,
     sample_minibz_qpoints,
     wrap_points_to_voronoi,
 )
@@ -153,6 +155,7 @@ __all__ = [
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "iter_minibz_photon_samples",
     "slab_minibz_photon_cubature",
+    "validate_slab_minibz_photon_receipt",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate

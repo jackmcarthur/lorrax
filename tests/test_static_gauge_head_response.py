@@ -1,6 +1,7 @@
 """Focused algebra and fail-closed gates for the static photon q=0 schema."""
 
 from dataclasses import replace
+import inspect
 from types import SimpleNamespace
 
 import jax
@@ -14,6 +15,8 @@ from gw.gw_config import (
 )
 from gw.head_correction import (
     StaticGaugeHeadResponse,
+    _require_static_photon_numerical_certificate,
+    complete_static_slab_photon_q0,
     require_static_gauge_head_response,
     static_gauge_tensor_residuals,
     static_hall_linear_response,
@@ -106,7 +109,7 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
 
     weight = np.asarray((1.0, 1.0, 0.0), dtype=np.float64)
     (moments, D_sum, count, residual, sigma_min,
-     condition_max) = static_slab_photon_head_moment_chunk(
+     condition_max, conditioned_error) = static_slab_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
 
     H = np.asarray(static_hall_linear_response(sigma))
@@ -124,6 +127,7 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     assert float(np.asarray(residual)) < 1.0e-14
     assert float(np.asarray(sigma_min)) > 0.0
     assert float(np.asarray(condition_max)) >= 1.0
+    assert float(np.asarray(conditioned_error)) >= np.finfo(np.float64).eps
 
 
 def test_static_head_moment_applies_deterministic_cubature_weights():
@@ -139,7 +143,7 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
     weight = np.asarray((0.23, 0.77, 0.0), dtype=np.float64)
 
     (moments, D_sum, count, residual, sigma_min,
-     condition_max) = static_slab_photon_head_moment_chunk(
+     condition_max, conditioned_error) = static_slab_photon_head_moment_chunk(
         q, D, sigma, S, 2, weight)
     H = np.asarray(static_hall_linear_response(sigma))
     R = (
@@ -157,11 +161,51 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
     assert int(np.asarray(count)) == 2
     assert float(np.asarray(residual)) < 1.0e-14
     singular_values = np.linalg.svd(lhs, compute_uv=False)
+    condition_fro = (
+        np.linalg.norm(lhs, axis=(-2, -1))
+        * np.linalg.norm(np.linalg.inv(lhs), axis=(-2, -1)))
     np.testing.assert_allclose(
         np.asarray(sigma_min), singular_values[:, -1].min(), rtol=2e-14)
     np.testing.assert_allclose(
-        np.asarray(condition_max),
-        np.max(singular_values[:, 0] / singular_values[:, -1]), rtol=2e-14)
+        np.asarray(condition_max), np.max(condition_fro), rtol=2e-14)
+    residual_matrix = lhs @ W - D[:2]
+    backward = np.linalg.norm(residual_matrix, axis=(-2, -1)) / (
+        np.linalg.norm(lhs, axis=(-2, -1))
+        * np.linalg.norm(W, axis=(-2, -1))
+        + np.linalg.norm(D[:2], axis=(-2, -1)))
+    expected_bound = np.max(
+        condition_fro * np.maximum(backward, np.finfo(np.float64).eps))
+    np.testing.assert_allclose(
+        np.asarray(conditioned_error), expected_bound, rtol=2e-14)
+
+
+def test_static_head_numerical_certificate_conditions_backward_error():
+    finite = np.zeros((4, 4), dtype=np.complex128)
+    with pytest.raises(ValueError, match=r"kappa\*max\(backward_error,eps\)"):
+        _require_static_photon_numerical_certificate(
+            finite, finite,
+            max_backward=2.0e-12,
+            min_sigma=1.0e-6,
+            max_condition=1.0e6,
+            max_conditioned_error=2.0e-6,
+            mixed_error_ratios=(0.2, 0.3))
+
+
+def test_static_head_numerical_certificate_refuses_nonfinite_convergence():
+    finite = np.zeros((4, 4), dtype=np.complex128)
+    with pytest.raises(ValueError, match="static_photon_polygon_nonfinite"):
+        _require_static_photon_numerical_certificate(
+            finite, finite,
+            max_backward=1.0e-16,
+            min_sigma=1.0,
+            max_condition=1.0,
+            max_conditioned_error=np.finfo(np.float64).eps,
+            mixed_error_ratios=(0.2, np.nan))
+
+
+def test_static_head_completion_has_no_independent_cell_volume_seam():
+    assert "cell_volume" not in inspect.signature(
+        complete_static_slab_photon_q0).parameters
 
 
 def test_static_gauge_response_accepts_a_nonzero_ward_closed_tensor():
