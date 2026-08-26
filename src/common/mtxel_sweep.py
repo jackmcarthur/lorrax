@@ -980,7 +980,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
         vnl = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
             psi_L, gvec, kvec, vnl_setup, gmask,
-            include_q2=transfer_q2)
+            include_contact=contact_enabled, include_q2=transfer_q2)
         gamma_vnl = _pad_spinor(
             halfalpha.astype(psi_4.real.dtype)
             * vnl.gamma0_cart_ket,
