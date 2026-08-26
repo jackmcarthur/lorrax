@@ -349,6 +349,11 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
     requested = getattr(config, "hartree_source", "auto")
     source = resolve_hartree_source(path, requested, print_fn=print_fn)
     require_transverse = bool(config.bispinor)
+    if require_transverse and source == "folded":
+        raise ValueError(
+            "kinetic-balance bispinor GW refuses a legacy folded kin_ion "
+            "artifact; regenerate separate authenticated scalar and "
+            "transverse direct Hartree datasets.")
     key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
            source, require_transverse, _mesh_cache_key(mesh_xy))
     if key in _hartree_cache:

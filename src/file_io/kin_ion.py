@@ -95,6 +95,9 @@ TRANSVERSE_HARTREE_G0_POLICY = "periodic_zero_no_minibz_or_exchange_head"
 TRANSVERSE_HARTREE_G0_DIAGNOSTIC = (
 	"report_only_partial_dirac_current_omits_gauged_vnl")
 TRANSVERSE_HARTREE_SYMMETRY = "crystal_scalar_time_reversal_even"
+TRANSVERSE_HARTREE_CURRENT_PROJECTION = (
+	"symmetry_maps.project_polar_fft_field:fft_grid_pullback_perm+"
+	"SymMaps.R_cart_forward:measured_trs_policy:residual_over_raw_J_l2")
 
 #: Legal values of the ``hartree_source`` input key.
 HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
@@ -624,6 +627,12 @@ def validate_kin_ion_against_run(
 			f"{bool(attrs.get('hartree_truncation_2d', False))})."
 		)
 	elif bool(attrs.get("has_hartree", False)):
+		if expected_bispinor:
+			raise ValueError(
+				"a kinetic-balance bispinor run cannot consume a legacy folded "
+				"kin_ion artifact: scalar V_H is inseparable from kin_ion and the "
+				"exact transverse direct component has no authenticated seam. "
+				"Regenerate separate scalar and transverse Hartree datasets.")
 		print_fn(
 			"  kin_ion: LEGACY folded file — exact FFT-grid V_H is inside the "
 			f"kin_ion values (truncation_2d="
@@ -657,6 +666,8 @@ def validate_kin_ion_against_run(
 			"g0_policy": TRANSVERSE_HARTREE_G0_POLICY,
 			"g0_current_diagnostic_policy": TRANSVERSE_HARTREE_G0_DIAGNOSTIC,
 			"symmetry_class": TRANSVERSE_HARTREE_SYMMETRY,
+			"current_symmetry_projection":
+				TRANSVERSE_HARTREE_CURRENT_PROJECTION,
 		}
 		from common.bispinor_init import (
 			DIRAC_ALPHA_VERTEX_PROVENANCE,
@@ -705,13 +716,43 @@ def validate_kin_ion_against_run(
 				f"{source_nspinor!r} disagrees with the authenticated kin_ion "
 				f"WFN basis nspinor={artifact_nspinor!r}.")
 		for name in (
-			"current_g0_l2", "current_l2", "current_g0_relative"
+			"current_g0_l2", "current_l2", "current_g0_relative",
+			"current_symmetry_relative_movement",
+			"current_symmetry_relative_residual",
+			"current_symmetry_relative_residual_tolerance",
 		):
 			value = attrs.get(f"transverse_hartree_{name}")
 			if value is None or not np.isfinite(float(value)) or float(value) < 0:
 				raise ValueError(
 					f"{TRANSVERSE_HARTREE_DATASET} carries invalid diagnostic "
 					f"{name}={value!r}.")
+		residual = float(attrs[
+			"transverse_hartree_current_symmetry_relative_residual"])
+		tolerance = float(attrs[
+			"transverse_hartree_current_symmetry_relative_residual_tolerance"])
+		if tolerance <= 0 or residual > tolerance:
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} does not certify its star-wedge "
+				f"projection: residual={residual:.6e}, tolerance={tolerance:.6e}.")
+		for name in ("current_symmetry_rows",
+		             "current_symmetry_antiunitary_rows"):
+			value = attrs.get(f"transverse_hartree_{name}")
+			if value is None or int(value) < 0:
+				raise ValueError(
+					f"{TRANSVERSE_HARTREE_DATASET} carries invalid projection "
+					f"receipt {name}={value!r}.")
+		n_spatial = attrs.get(
+			f"transverse_hartree_{N_SYM_SPATIAL_ATTR}")
+		n_rows = int(attrs["transverse_hartree_current_symmetry_rows"])
+		n_anti = int(attrs[
+			"transverse_hartree_current_symmetry_antiunitary_rows"])
+		if (n_spatial is None or int(n_spatial) < 1
+				or n_anti not in (0, int(n_spatial))
+				or n_rows != int(n_spatial) + n_anti):
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} projection rows do not match its "
+				f"authenticated star table: n_sym_spatial={n_spatial!r}, "
+				f"rows={n_rows}, antiunitary_rows={n_anti}.")
 		print_fn(
 			f"  kin_ion: exact transverse direct Hartree {tuple(shape)}; "
 			f"||J(G=0)||2/||J(r)||2="
