@@ -599,6 +599,19 @@ def _det2(left: np.ndarray, right: np.ndarray) -> float:
     return float(left[0] * right[1] - left[1] * right[0])
 
 
+def _polygon_signed_twice_area(polygon: np.ndarray) -> float:
+    """One deterministic reduction for issuing and authenticating an area.
+
+    Exact receipt validation compares the issued float bit-for-bit.  Using a
+    Python scalar reduction while issuing and ``np.sum`` while validating can
+    differ by one rounding bit on an otherwise valid oblique cell (CrI3 is a
+    concrete example), so both sites must call this owner.
+    """
+    return float(sum(
+        _det2(left, right)
+        for left, right in zip(polygon, np.roll(polygon, -1, axis=0))))
+
+
 def _clip_polygon_half_plane(
     polygon: np.ndarray, normal: np.ndarray, offset: float, *,
     inside_tol: float, point_tol: float,
@@ -682,9 +695,7 @@ def _slab_minibz_wigner_seitz_polygon(bvec, kgrid):
         raise RuntimeError(
             "a nonsingular 2-D lattice Voronoi cell must have four or six "
             f"vertices after clipping +/-u,+/-v,+/-w; got {polygon.shape[0]}")
-    signed_twice_area = sum(
-        _det2(left, right)
-        for left, right in zip(polygon, np.roll(polygon, -1, axis=0)))
+    signed_twice_area = _polygon_signed_twice_area(polygon)
     if signed_twice_area < 0.0:
         polygon = polygon[::-1].copy()
         signed_twice_area = -signed_twice_area
@@ -949,7 +960,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
     crosses = np.asarray([
         _det2(left, right)
         for left, right in zip(polygon, np.roll(polygon, -1, axis=0))])
-    polygon_area = 0.5 * float(np.sum(crosses))
+    polygon_area = 0.5 * _polygon_signed_twice_area(polygon)
     lattice_area = abs(_det2(mini[0], mini[1]))
     if (np.any(crosses <= 0.0)
             or not np.isfinite(receipt.polygon_area)
