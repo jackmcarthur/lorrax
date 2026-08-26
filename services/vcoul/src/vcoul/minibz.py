@@ -77,8 +77,9 @@ and the only thing it provides is the scrambled-Sobol generator.  See
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import functools
+import hashlib
 from typing import NamedTuple
 import warnings
 
@@ -101,6 +102,7 @@ __all__ = [
     "minibz_transverse_head_avg",
     "SlabMinibzPhotonReceipt",
     "slab_minibz_photon_cubature",
+    "validate_slab_minibz_photon_receipt",
     "iter_minibz_photon_samples",
     "build_miniBZ_dq_cart",
     "build_v_head_miniBZ_fn_3d",
@@ -144,28 +146,40 @@ class SlabMinibzPhotonReceipt:
 
     method: str
     orders: tuple[int, int, int]
+    reciprocal_lattice_rows: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+    kgrid: tuple[int, int, int]
     mini_lattice_rows: tuple[tuple[float, float], tuple[float, float]]
     polygon_vertices: tuple[tuple[float, float], ...]
     polygon_area: float
     slab_zc: float
+    cell_volume: float
     physical_counts: tuple[int, int, int]
     padded_counts: tuple[int, int, int]
     weight_sum_defects: tuple[float, float, float]
     weighted_q_centroids: tuple[tuple[float, float, float], ...]
     chunks: tuple[_SlabMinibzPhotonChunk, ...] = field(
         repr=False, compare=False)
-    _provider_token: object = field(repr=False, compare=False)
+    _issue_token: InitVar[object] = None
+    # ``init=False`` is load-bearing: dataclasses.replace() does not copy the
+    # stored issuance token or digest, and its default ``_issue_token=None``
+    # is refused by __post_init__.  The ndarray write flags below are only
+    # accidental-mutation friction; validation rechecks the stored token, a
+    # digest, and every regenerated payload before production consumption.
+    _provider_token: object = field(
+        init=False, default=None, repr=False, compare=False)
+    _provider_digest: str = field(
+        init=False, default="", repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if self._provider_token is not _SLAB_MINIBZ_RECEIPT_TOKEN:
+    def __post_init__(self, _issue_token) -> None:
+        if _issue_token is not _SLAB_MINIBZ_RECEIPT_TOKEN:
             raise TypeError(
                 "SlabMinibzPhotonReceipt is issued only by "
                 "slab_minibz_photon_cubature")
-
-    def require_integrity(self) -> "SlabMinibzPhotonReceipt":
-        """Recheck the bound metadata before a production consumer runs."""
-        _require_slab_minibz_photon_receipt(self)
-        return self
+        object.__setattr__(self, "_provider_token", _issue_token)
 
 
 def minibz_frac_to_cart(U, bvec):
@@ -770,6 +784,39 @@ def _photon_D_raw(q_cart, *, kind, zc):
     return D_raw, q2
 
 
+def _slab_minibz_receipt_digest(receipt) -> str:
+    """Digest every receipt field and payload; ndarray flags are not trust."""
+    digest = hashlib.sha256()
+
+    def _add_array(name, value):
+        array = np.asarray(value)
+        digest.update(name.encode("ascii") + b"\0")
+        digest.update(array.dtype.str.encode("ascii") + b"\0")
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        digest.update(np.ascontiguousarray(array).tobytes())
+
+    digest.update(receipt.method.encode("utf-8") + b"\0")
+    _add_array("orders", receipt.orders)
+    _add_array("reciprocal_lattice_rows", receipt.reciprocal_lattice_rows)
+    _add_array("kgrid", receipt.kgrid)
+    _add_array("mini_lattice_rows", receipt.mini_lattice_rows)
+    _add_array("polygon_vertices", receipt.polygon_vertices)
+    _add_array("polygon_area", receipt.polygon_area)
+    _add_array("slab_zc", receipt.slab_zc)
+    _add_array("cell_volume", receipt.cell_volume)
+    _add_array("physical_counts", receipt.physical_counts)
+    _add_array("padded_counts", receipt.padded_counts)
+    _add_array("weight_sum_defects", receipt.weight_sum_defects)
+    _add_array("weighted_q_centroids", receipt.weighted_q_centroids)
+    for index, chunk in enumerate(receipt.chunks):
+        _add_array(f"chunk_{index}_order", chunk.order)
+        _add_array(f"chunk_{index}_physical_count", chunk.physical_count)
+        _add_array(f"chunk_{index}_q_cart", chunk.q_cart)
+        _add_array(f"chunk_{index}_D_raw", chunk.D_raw)
+        _add_array(f"chunk_{index}_sample_weight", chunk.sample_weight)
+    return digest.hexdigest()
+
+
 def slab_minibz_photon_cubature(
     kernel, geometry, kgrid,
 ) -> SlabMinibzPhotonReceipt:
@@ -781,24 +828,24 @@ def slab_minibz_photon_cubature(
     ladder, and binds the normalized weights and padded/physical solve counts
     into one provider-issued result.  Raw ``D`` carries no cell-volume factor.
     """
-    try:
-        sys_dim = int(kernel.sys_dim)
-    except (AttributeError, TypeError, ValueError) as exc:
+    from vcoul.slab_2d import Slab2D
+    if type(kernel) is not Slab2D:
         raise TypeError(
-            "slab_minibz_photon_cubature needs a vcoul kernel from "
-            "get_kernel(sys_dim)") from exc
-    if sys_dim != 2:
-        raise ValueError(
-            "exact Wigner-Seitz photon cubature is defined only for a "
-            f"2-D slab; got sys_dim={sys_dim}")
+            "slab_minibz_photon_cubature needs the exact Slab2D kernel "
+            "returned by get_kernel(2)")
 
     bvec = np.asarray(geometry.bvec, dtype=np.float64)
     kg = tuple(int(v) for v in kgrid)
+    zc = kernel.truncation_half_height(geometry)
+    cell_volume = float(geometry.cell_volume)
+    if not np.isfinite(cell_volume) or cell_volume <= 0.0:
+        raise ValueError(
+            "slab photon cubature requires a finite positive cell_volume; "
+            f"got {cell_volume}")
     polygon, mini_lattice, polygon_area = (
         _slab_minibz_wigner_seitz_polygon(bvec, kg))
     padded_count = int(polygon.shape[0]) * max(
         _SLAB_MINIBZ_PHOTON_ORDERS) ** 2
-    zc = float(np.pi / abs(bvec[2, 2]))
 
     chunks = []
     physical_counts = []
@@ -833,18 +880,40 @@ def slab_minibz_photon_cubature(
     receipt = SlabMinibzPhotonReceipt(
         method=_SLAB_MINIBZ_PHOTON_METHOD,
         orders=_SLAB_MINIBZ_PHOTON_ORDERS,
+        reciprocal_lattice_rows=_rows(bvec),
+        kgrid=kg,
         mini_lattice_rows=_rows(mini_lattice),
         polygon_vertices=_rows(polygon),
         polygon_area=polygon_area,
         slab_zc=zc,
+        cell_volume=cell_volume,
         physical_counts=tuple(physical_counts),
         padded_counts=(padded_count,) * len(_SLAB_MINIBZ_PHOTON_ORDERS),
         weight_sum_defects=tuple(weight_defects),
         weighted_q_centroids=tuple(weighted_centroids),
         chunks=tuple(chunks),
-        _provider_token=_SLAB_MINIBZ_RECEIPT_TOKEN,
+        _issue_token=_SLAB_MINIBZ_RECEIPT_TOKEN,
     )
-    return receipt.require_integrity()
+    object.__setattr__(
+        receipt, "_provider_digest", _slab_minibz_receipt_digest(receipt))
+    return validate_slab_minibz_photon_receipt(receipt)
+
+
+def validate_slab_minibz_photon_receipt(
+    receipt,
+) -> SlabMinibzPhotonReceipt:
+    """Non-virtual validation of an exact provider-issued receipt."""
+    if type(receipt) is not SlabMinibzPhotonReceipt:
+        raise TypeError(
+            "production slab photon cubature requires the exact provider "
+            "receipt type SlabMinibzPhotonReceipt; subclasses, proxies, and "
+            f"caller-labelled payloads are refused (got {type(receipt).__name__})")
+    if receipt._provider_token is not _SLAB_MINIBZ_RECEIPT_TOKEN:
+        raise TypeError(
+            "SlabMinibzPhotonReceipt was not issued by "
+            "slab_minibz_photon_cubature")
+    _require_slab_minibz_photon_receipt(receipt)
+    return receipt
 
 
 def _require_slab_minibz_photon_receipt(receipt) -> None:
@@ -855,24 +924,34 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
     if receipt.orders != _SLAB_MINIBZ_PHOTON_ORDERS:
         raise ValueError(
             "exact slab photon receipt must carry the fixed 16/24/32 ladder")
+    bvec = np.asarray(receipt.reciprocal_lattice_rows, dtype=np.float64)
     mini = np.asarray(receipt.mini_lattice_rows, dtype=np.float64)
     polygon = np.asarray(receipt.polygon_vertices, dtype=np.float64)
-    if (mini.shape != (2, 2)
+    kg = receipt.kgrid
+    if (type(kg) is not tuple or len(kg) != 3
+            or any(type(value) is not int or value <= 0 for value in kg)
+            or kg[2] != 1
+            or bvec.shape != (3, 3)
+            or mini.shape != (2, 2)
             or polygon.ndim != 2 or polygon.shape[1] != 2
             or polygon.shape[0] not in (4, 6)
+            or not np.all(np.isfinite(bvec))
             or not np.all(np.isfinite(mini))
             or not np.all(np.isfinite(polygon))
             or not np.isfinite(receipt.slab_zc)
-            or receipt.slab_zc <= 0.0):
+            or receipt.slab_zc <= 0.0
+            or not np.isfinite(receipt.cell_volume)
+            or receipt.cell_volume <= 0.0):
         raise ValueError(
             "exact slab photon receipt carries invalid lattice/polygon rows")
-    bvec = np.asarray((
-        (mini[0, 0], mini[0, 1], 0.0),
-        (mini[1, 0], mini[1, 1], 0.0),
-        (0.0, 0.0, np.pi / receipt.slab_zc)), dtype=np.float64)
+    from vcoul.geometry import CoulombGeometry
+    from vcoul.slab_2d import Slab2D
+    expected_zc = Slab2D.truncation_half_height(CoulombGeometry(
+        bvec=bvec, cell_volume=receipt.cell_volume))
     expected_polygon, expected_mini, expected_area = (
-        _slab_minibz_wigner_seitz_polygon(bvec, (1, 1, 1)))
-    if (not np.array_equal(mini, expected_mini)
+        _slab_minibz_wigner_seitz_polygon(bvec, kg))
+    if (receipt.slab_zc != expected_zc
+            or not np.array_equal(mini, expected_mini)
             or not np.array_equal(polygon, expected_polygon)):
         raise ValueError(
             "exact slab photon receipt geometry differs from the service "
@@ -898,6 +977,21 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
     if any(len(values) != n_orders for values in fields):
         raise ValueError(
             "exact slab photon receipt does not contain three complete rules")
+    for chunk in receipt.chunks:
+        if (type(chunk) is not _SlabMinibzPhotonChunk
+                or type(chunk.q_cart) is not np.ndarray
+                or type(chunk.D_raw) is not np.ndarray
+                or type(chunk.sample_weight) is not np.ndarray):
+            raise TypeError(
+                "exact slab photon receipt chunks require the provider's "
+                "exact chunk and ndarray payload types")
+    if (type(receipt._provider_digest) is not str
+            or len(receipt._provider_digest) != 64
+            or receipt._provider_digest
+            != _slab_minibz_receipt_digest(receipt)):
+        raise ValueError(
+            "exact slab photon receipt payload or metadata changed after "
+            "provider issuance")
     expected_physical = tuple(
         int(polygon.shape[0]) * order * order
         for order in _SLAB_MINIBZ_PHOTON_ORDERS)
@@ -923,6 +1017,9 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
                 or q.shape != (padded, 3)
                 or D.shape != (padded, 4, 4)
                 or weight.shape != (padded,)
+                or q.dtype != np.dtype(np.float64)
+                or D.dtype != np.dtype(np.float64)
+                or weight.dtype != np.dtype(np.float64)
                 or not np.array_equal(q[:physical], expected_q)
                 or not np.array_equal(D[:physical], expected_D)
                 or not np.array_equal(weight[:physical], expected_weight)
@@ -1031,7 +1128,7 @@ def iter_minibz_photon_samples(
         raise ValueError(
             f"iter_minibz_photon_samples: geometry.bvec shape={bvec.shape}; "
             "expected (3, 3)")
-    zc = float(np.pi / bvec[2, 2]) if is_2d else None
+    zc = kernel.truncation_half_height(geometry) if is_2d else None
     kind = "slab" if is_2d else "bulk_3d"
     q0sph2 = minibz_inscribed_sphere_r2(bvec, kg, is_2d=is_2d)
 

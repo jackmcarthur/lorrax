@@ -1078,13 +1078,23 @@ def _static_slab_photon_head_moment_chunk(
         jnp.asarray(1.0e-300, dtype=jnp.float64))
     singular_values = jnp.linalg.svd(lhs, compute_uv=False)
     sigma_min = singular_values[:, -1]
-    condition = singular_values[:, 0] / jnp.maximum(
-        sigma_min, jnp.asarray(1.0e-300, dtype=jnp.float64))
+    # Frobenius throughout: the backward error above and this kappa use the
+    # same submultiplicative norm, so kappa*eta is a real forward-error bound
+    # rather than a mix of independently convenient diagnostics.
+    inverse_lhs_norm = jnp.linalg.norm(
+        1.0 / jnp.maximum(
+            singular_values, jnp.asarray(1.0e-300, dtype=jnp.float64)),
+        axis=-1)
+    condition = lhs_norm * inverse_lhs_norm
+    conditioned_error = condition * jnp.maximum(
+        backward, jnp.asarray(np.finfo(np.float64).eps, dtype=jnp.float64))
     max_backward = jnp.max(jnp.where(valid, backward, 0.0))
     min_sigma = jnp.min(jnp.where(valid, sigma_min, jnp.inf))
     max_condition = jnp.max(jnp.where(valid, condition, 0.0))
+    max_conditioned_error = jnp.max(
+        jnp.where(valid, conditioned_error, 0.0))
     return (moments, D_sum, valid_count, max_backward, min_sigma,
-            max_condition)
+            max_condition, max_conditioned_error)
 
 
 def static_slab_photon_head_moment_chunk(
@@ -1101,9 +1111,8 @@ def static_slab_photon_head_moment_chunk(
     ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
     units (no cell-volume factor), ``sigma_H`` is the separately sourced real
     Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
-    averages these sums per
-    independent mini-BZ repetition, then across repetitions; it applies the
-    one and only ``1/Vcell`` while rebuilding the packed q=Gamma row.
+    normalizes each provider-issued weighted rule and applies the one and only
+    ``1/Vcell`` while rebuilding the packed q=Gamma row.
 
     The function is intentionally slab/static-only.  A bulk analytic-sphere
     correction cannot be added after this nonlinear coupled solve, and must
@@ -1158,7 +1167,7 @@ class StaticSlabPhotonHeadCompletion:
     max_backward_residual: float
     min_dyson_singular_value: float
     max_dyson_condition_number: float
-    dyson_condition_roundoff_bound: float
+    max_dyson_conditioned_error_bound: float
     mixed_scale_qstar: float
     mixed_convergence_error_ratios: tuple[float, float]
     ward_residual: float
@@ -1171,6 +1180,49 @@ _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL = 1.0e-8
 _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL = 1.0e-12
 
 
+def _require_static_photon_numerical_certificate(
+    D_mean,
+    moments_mean,
+    *,
+    max_backward: float,
+    min_sigma: float,
+    max_condition: float,
+    max_conditioned_error: float,
+    mixed_error_ratios,
+) -> None:
+    """Refuse an unconditioned solve or non-finite cubature convergence."""
+    diagnostics = (
+        max_backward, min_sigma, max_condition, max_conditioned_error)
+    if (not np.all(np.isfinite(D_mean))
+            or not np.all(np.isfinite(moments_mean))
+            or not np.all(np.isfinite(diagnostics))
+            or min_sigma <= 0.0):
+        raise ValueError("coupled photon mini-BZ average is non-finite")
+    if max_conditioned_error > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
+        raise ValueError(
+            "GATE static_photon_dyson_conditioning: the observed 4x4 "
+            "Dyson solve cannot keep its condition-amplified numerical "
+            "error inside the budget: "
+            "kappa*max(backward_error,eps)="
+            f"{max_conditioned_error:.3e} > "
+            f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}, "
+            f"backward_error={max_backward:.3e}, "
+            f"min_sigma={min_sigma:.3e}, kappa={max_condition:.3e}")
+    convergence = np.asarray(mixed_error_ratios, dtype=np.float64)
+    if (convergence.shape != (2,) or not np.all(np.isfinite(convergence))):
+        raise ValueError(
+            "GATE static_photon_polygon_nonfinite: the fixed 16/24/32 "
+            "cubature ladder produced non-finite convergence diagnostics")
+    if convergence[-1] > 1.0:
+        raise ValueError(
+            "GATE static_photon_polygon_not_converged: the final polygon "
+            "Duffy--Gauss order pair did not converge every dimensionless "
+            "bare/screened moment under the mixed absolute+relative budget: "
+            f"error_ratio={convergence[-1]:.3e} > 1.  The provider ladder "
+            "is fixed; refusing insertion rather than accepting a caller "
+            "dial.")
+
+
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
     W_packed: jax.Array,
@@ -1179,13 +1231,13 @@ def complete_static_slab_photon_q0(
     g0_Y: jax.Array,
     cubature_receipt,
     *,
-    cell_volume: float,
     mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
     ``cubature_receipt`` is the sole vcoul provider's authenticated exact
-    Wigner--Seitz/Duffy ladder.  Each sample first solves the coupled
+    Wigner--Seitz/Duffy ladder and the sole cell-volume source for the
+    completion.  Each sample first solves the coupled
     four-field head Dyson
     equation; only its ``(1,qx,qy)`` moments survive.  The packed body is
     then updated by one bare and nine screened rank-four outer products.
@@ -1208,16 +1260,10 @@ def complete_static_slab_photon_q0(
         raise ValueError(
             f"packed Γ vectors must both be {factor_shape}; got "
             f"{g0_X.shape}/{g0_Y.shape}")
-    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
-        raise ValueError(f"cell_volume must be positive; got {cell_volume}")
-    from vcoul import SlabMinibzPhotonReceipt
-    if not isinstance(cubature_receipt, SlabMinibzPhotonReceipt):
-        raise TypeError(
-            "production coupled photon completion requires the provider-"
-            "issued exact Wigner-Seitz SlabMinibzPhotonReceipt; Sobol, "
-            "equal-replicate, and caller-labelled chunk iterators are "
-            f"refused (got {type(cubature_receipt).__name__})")
-    cubature_receipt.require_integrity()
+    from vcoul import validate_slab_minibz_photon_receipt
+    cubature_receipt = validate_slab_minibz_photon_receipt(
+        cubature_receipt)
+    cell_volume = float(cubature_receipt.cell_volume)
 
     # The headless Gamma body remains resident and 2-D sharded.  Four calls
     # reuse the sole bounded Schur-fold graph; broadcasting W over the two
@@ -1256,6 +1302,7 @@ def complete_static_slab_photon_q0(
     residuals = []
     min_sigmas = []
     max_conditions = []
+    conditioned_errors = []
     observed_physical = []
     observed_padded = []
     for chunk in cubature_receipt.chunks:
@@ -1263,13 +1310,15 @@ def complete_static_slab_photon_q0(
         weight = np.asarray(chunk.sample_weight, dtype=np.float64)
         n_valid = int(chunk.physical_count)
         (moments, bare_sum, returned_count, backward, chunk_sigma_min,
-         chunk_condition_max) = static_slab_photon_head_moment_chunk(
+         chunk_condition_max,
+         chunk_conditioned_error) = static_slab_photon_head_moment_chunk(
             q_host, chunk.D_raw, response.sigma_H, S_effective,
             n_valid, weight)
         (moment_host, D_host, count_host, residual_host, sigma_host,
-         condition_host) = jax.device_get((
+         condition_host, conditioned_error_host) = jax.device_get((
              moments, bare_sum, returned_count, backward,
-             chunk_sigma_min, chunk_condition_max))
+             chunk_sigma_min, chunk_condition_max,
+             chunk_conditioned_error))
         returned = int(np.asarray(count_host))
         if returned != n_valid:
             raise RuntimeError(
@@ -1285,6 +1334,8 @@ def complete_static_slab_photon_q0(
         residuals.append(float(np.asarray(residual_host)))
         min_sigmas.append(float(np.asarray(sigma_host)))
         max_conditions.append(float(np.asarray(condition_host)))
+        conditioned_errors.append(
+            float(np.asarray(conditioned_error_host)))
         observed_physical.append(returned)
         observed_padded.append(int(q_host.shape[0]))
 
@@ -1335,34 +1386,14 @@ def complete_static_slab_photon_q0(
     max_residual = float(max(residuals))
     min_sigma = float(min(min_sigmas))
     max_condition = float(max(max_conditions))
-    condition_roundoff = max_condition * np.finfo(np.float64).eps
-    if (not np.all(np.isfinite(D_mean))
-            or not np.all(np.isfinite(moments_mean))
-            or not np.isfinite(max_residual)
-            or not np.isfinite(min_sigma) or min_sigma <= 0.0
-            or not np.isfinite(max_condition)
-            or not np.isfinite(condition_roundoff)):
-        raise ValueError("coupled photon mini-BZ average is non-finite")
-    if max_residual > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
-        raise ValueError(
-            "coupled photon mini-BZ Dyson solve failed its backward-error "
-            f"gate: {max_residual:.3e} > "
-            f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}")
-    if condition_roundoff > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
-        raise ValueError(
-            "GATE static_photon_dyson_conditioning: the observed 4x4 "
-            "Dyson condition number cannot keep float64 roundoff inside "
-            f"the numerical error budget: cond*eps={condition_roundoff:.3e} "
-            f"> {_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}, "
-            f"min_sigma={min_sigma:.3e}, cond={max_condition:.3e}")
-    if mixed_error_ratios[-1] > 1.0:
-        raise ValueError(
-            "GATE static_photon_polygon_not_converged: the final polygon "
-            "Duffy--Gauss order pair did not converge every dimensionless "
-            "bare/screened moment under the mixed absolute+relative budget: "
-            f"orders={cubature_receipt.orders[-2:]}, error_ratio="
-            f"{mixed_error_ratios[-1]:.3e} > 1.  The provider ladder is "
-            "fixed; refusing insertion rather than accepting a caller dial.")
+    max_conditioned_error = float(max(conditioned_errors))
+    _require_static_photon_numerical_certificate(
+        D_mean, moments_mean,
+        max_backward=max_residual,
+        min_sigma=min_sigma,
+        max_condition=max_condition,
+        max_conditioned_error=max_conditioned_error,
+        mixed_error_ratios=mixed_error_ratios)
 
     dtype = V_packed.dtype
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
@@ -1408,7 +1439,7 @@ def complete_static_slab_photon_q0(
         max_backward_residual=max_residual,
         min_dyson_singular_value=min_sigma,
         max_dyson_condition_number=max_condition,
-        dyson_condition_roundoff_bound=condition_roundoff,
+        max_dyson_conditioned_error_bound=max_conditioned_error,
         mixed_scale_qstar=qstar,
         mixed_convergence_error_ratios=mixed_error_ratios,
         ward_residual=max(float(response.ward_residual), effective_ward),
