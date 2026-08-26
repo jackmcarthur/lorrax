@@ -330,13 +330,11 @@ def run_gate(mesh, wfn_path, output_dir):
     packed_sharding = NamedSharding(mesh, P(None, "x", "y"))
     x_sharding = NamedSharding(mesh, P(None, "x"))
     y_sharding = NamedSharding(mesh, P(None, "y"))
-    def packed_vertex(axis_name, conjugate=False):
+    def packed_vertex(axis_name):
         sharding = x_sharding if axis_name == "x" else y_sharding
         vectors = []
         for row in range(4):
             value = 1.0 + 0.07j * (row + 1)
-            if conjugate:
-                value = np.conj(value)
             vector = np.zeros(
                 (1, layout.padded_extent(row)), dtype=np.complex128)
             vector[0, 0] = value
@@ -347,7 +345,7 @@ def run_gate(mesh, wfn_path, output_dir):
     # Use the canonical mesh-interleaved packer; hand-addressing padded
     # channels here would create a second layout convention in the gate.
     g0_x = packed_vertex("x")
-    g0_y = packed_vertex("y", conjugate=True)
+    g0_y = packed_vertex("y")
 
     rng = np.random.default_rng(2026082607)
     nk, nb, ns, mu = nq, 4, 4, layout.padded_extent(0)
@@ -399,6 +397,10 @@ def run_gate(mesh, wfn_path, output_dir):
         V, W, completion = complete_static_slab_photon_q0(
             V, W, _response(mesh, layout, sigma_h), g0_x, g0_y, receipt,
             mesh_xy=mesh)
+        bare_v_q0 = _gather(V[0])
+        bare_v_hermiticity_residual = float(np.max(np.abs(
+            bare_v_q0 - np.conj(bare_v_q0.T))))
+        bare_v_scale = float(np.max(np.abs(bare_v_q0)))
         sig_x, sig_sx, sig_coh, diagnostics = compute_static_photon_sigma(
             wfns_charge=wfns_c,
             wfns_transverse=wfns_t,
@@ -445,6 +447,8 @@ def run_gate(mesh, wfn_path, output_dir):
             "block_error": max(block_errors),
             "closure_error": max(closure_errors),
             "internal_closure": diagnostics.max_closure_residual_ry,
+            "bare_v_hermiticity_residual": bare_v_hermiticity_residual,
+            "bare_v_scale": bare_v_scale,
         }
 
     # Scale the Hall coefficient so max ||D Pi_H|| is 0.05: visibly nonzero
@@ -475,6 +479,11 @@ def run_gate(mesh, wfn_path, output_dir):
     oracle_error = max(oracle_errors)
     block_error = max(case["block_error"] for case in (plus, zero, minus))
     closure_error = max(case["closure_error"] for case in (plus, zero, minus))
+    bare_v_hermiticity_residual = max(
+        case["bare_v_hermiticity_residual"]
+        for case in (plus, zero, minus))
+    bare_v_scale = max(
+        case["bare_v_scale"] for case in (plus, zero, minus))
     scale = max(float(np.max(np.abs(x)))
                 for case in (plus, zero, minus)
                 for x in case["aggregate"])
@@ -496,6 +505,11 @@ def run_gate(mesh, wfn_path, output_dir):
         raise AssertionError(
             f"head sector sum does not close to aggregate Sigma: "
             f"{closure_error:.3e}")
+    if bare_v_hermiticity_residual > 2.0e-10 * max(1.0, bare_v_scale):
+        raise AssertionError(
+            "completed bare q=0 photon operator is not Hermitian: "
+            f"residual={bare_v_hermiticity_residual:.3e}, "
+            f"scale={bare_v_scale:.3e}")
     if hall_signal <= 1.0e-12:
         raise AssertionError(
             f"nonzero Hall response produced no CT/TC band Sigma: "
@@ -526,6 +540,7 @@ def run_gate(mesh, wfn_path, output_dir):
         "numpy_4x4_oracle_max_abs": oracle_error,
         "block_oracle_max_abs": block_error,
         "sigma_closure_max_abs": closure_error,
+        "bare_v_hermiticity_max_abs": bare_v_hermiticity_residual,
         "internal_closure_max_abs": max(
             case["internal_closure"] for case in (plus, zero, minus)),
         "cttc_sigma_signal": hall_signal,
