@@ -97,6 +97,7 @@ _services.ensure_on_path()
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
     HARTREE_DATASET, TRANSVERSE_HARTREE_DATASET,
+    TRANSVERSE_HARTREE_CURRENT_PROJECTION,
     TRANSVERSE_HARTREE_G0_DIAGNOSTIC, TRANSVERSE_HARTREE_G0_POLICY,
     TRANSVERSE_HARTREE_PROJECTOR, TRANSVERSE_HARTREE_SYMMETRY,
     IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
@@ -785,6 +786,11 @@ class ExactHartreeMatrices(NamedTuple):
     current_g0_l2: float
     current_l2: float
     current_g0_relative: float
+    current_symmetry_relative_movement: float
+    current_symmetry_relative_residual: float
+    current_symmetry_relative_residual_tolerance: float
+    current_symmetry_rows: int
+    current_symmetry_antiunitary_rows: int
     tt_metric_sign: float
 
 
@@ -915,6 +921,17 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             "is absent): "
             f"||J0||={current_g0_l2:.6e}, ||J||={current_l2:.6e}, "
             f"ratio={current_g0_relative:.6e}; periodic TT sets G=0 to zero")
+        current_projection = symmetry_maps.project_polar_fft_field(
+            current_np, sym)
+        current_np = np.asarray(current_projection.field, dtype=np.float64)
+        print_fn(
+            "    Dirac-current symmetry projection: "
+            f"rows={current_projection.n_symmetry_rows} "
+            f"(antiunitary={current_projection.n_antiunitary_rows}), "
+            f"movement={current_projection.relative_movement:.6e}, "
+            f"residual={current_projection.relative_residual:.6e} <= "
+            f"{current_projection.relative_residual_tolerance:.6e}; "
+            "alpha.A matrix remains on the authenticated star wedge")
         from vcoul import COULOMB_GAUGE_TT_SIGN
         from psp.dft_operators import transverse_potential_from_current
         tt_metric_sign = float(COULOMB_GAUGE_TT_SIGN)
@@ -931,6 +948,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     else:
         V_T_r = None
         current_g0_l2 = current_l2 = current_g0_relative = 0.0
+        current_projection = None
 
     # ---- 2. Poisson: REPLICATED BY DESIGN ------------------------------
     # Two 3-D FFTs on a 1.4 MB array: 3.1e7 flop against the sweep's
@@ -1063,6 +1081,15 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         current_g0_l2=current_g0_l2,
         current_l2=current_l2,
         current_g0_relative=current_g0_relative,
+        current_symmetry_relative_movement=(
+            current_projection.relative_movement),
+        current_symmetry_relative_residual=(
+            current_projection.relative_residual),
+        current_symmetry_relative_residual_tolerance=(
+            current_projection.relative_residual_tolerance),
+        current_symmetry_rows=current_projection.n_symmetry_rows,
+        current_symmetry_antiunitary_rows=(
+            current_projection.n_antiunitary_rows),
         tt_metric_sign=tt_metric_sign,
     )
 
@@ -1200,7 +1227,7 @@ def main(argv=None):
     ncond = int(params.get("ncond", 5))
     nband = int(params.get("nband", 100))
     bispinor = bool(params.get("bispinor", False))
-    if bispinor and args.fold_hartree and args.hartree:
+    if bispinor and args.fold_hartree:
         raise SystemExit(
             "--fold-hartree is legacy scalar-only storage and is refused "
             "for kinetic-balance bispinors; write separate scalar and "
@@ -1618,6 +1645,20 @@ def main(argv=None):
                     vht.attrs["current_g0_relative"] = float(
                         current_diagnostic.current_g0_relative)
                     vht.attrs["symmetry_class"] = TRANSVERSE_HARTREE_SYMMETRY
+                    vht.attrs["current_symmetry_projection"] = (
+                        TRANSVERSE_HARTREE_CURRENT_PROJECTION)
+                    vht.attrs["current_symmetry_relative_movement"] = float(
+                        current_diagnostic.current_symmetry_relative_movement)
+                    vht.attrs["current_symmetry_relative_residual"] = float(
+                        current_diagnostic.current_symmetry_relative_residual)
+                    vht.attrs[
+                        "current_symmetry_relative_residual_tolerance"] = float(
+                            current_diagnostic.
+                            current_symmetry_relative_residual_tolerance)
+                    vht.attrs["current_symmetry_rows"] = int(
+                        current_diagnostic.current_symmetry_rows)
+                    vht.attrs["current_symmetry_antiunitary_rows"] = int(
+                        current_diagnostic.current_symmetry_antiunitary_rows)
 
     barrier("kin_ion_written")
 

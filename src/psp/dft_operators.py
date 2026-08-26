@@ -103,6 +103,8 @@ def _poisson_reciprocal_geometry(
     bvec: jnp.ndarray | None,
     blat: float | None,
     truncation_2d: bool,
+    *,
+    need_g_cart: bool = False,
 ):
     """One reciprocal-grid/G2 source for scalar and transverse Poisson."""
     nx2, ny2, nz2 = (int(s) for s in fft_grid)
@@ -121,7 +123,7 @@ def _poisson_reciprocal_geometry(
 
     G_cart = None
     f2d = None
-    if bvec is not None and blat is not None:
+    if (truncation_2d or need_g_cart) and bvec is not None and blat is not None:
         B = jnp.asarray(bvec, dtype=jnp.float64) * float(blat)
         G_cart = jnp.stack(jnp.broadcast_arrays(
             ix * B[0, 0] + iy * B[1, 0] + iz * B[2, 0],
@@ -189,9 +191,11 @@ def transverse_potential_from_current(
     The scalar :func:`poisson_potential_from_rhoG` remains the sole owner of
     ``v(G)``, including the Ry ``8*pi/G^2`` prefactor, the 2-D slab factor,
     FFT normalisation, and the periodic ``G=0`` zero.  The geometric
-    projector comes from the public ``vcoul.transverse_projector`` SSOT used
-    by finite-q photon tiles.  ``tt_metric_sign`` is required rather than
-    respelled here; the caller passes ``vcoul.COULOMB_GAUGE_TT_SIGN``.
+    projector comes from the public matrix-free
+    ``vcoul.apply_transverse_projector`` SSOT; its tensor API serves finite-q
+    photon tiles through that same formula.  ``tt_metric_sign`` is required
+    rather than respelled here; the caller passes
+    ``vcoul.COULOMB_GAUGE_TT_SIGN``.
     Consequently an exchange mini-BZ/head value can never enter this direct
     periodic solve.
     """
@@ -206,7 +210,7 @@ def transverse_potential_from_current(
 
     geometry = _poisson_reciprocal_geometry(
         tuple(int(s) for s in J_r.shape[-3:]),
-        bdot, bvec, blat, truncation_2d)
+        bdot, bvec, blat, truncation_2d, need_g_cart=True)
     G2_safe, zero_mask, G_cart, _f2d = geometry
     if G_cart is None:
         raise ValueError(
@@ -215,17 +219,11 @@ def transverse_potential_from_current(
 
     from ffi import _services
     _services.ensure_on_path()
-    from vcoul import transverse_projector
+    from vcoul import apply_transverse_projector
     J_G = local_fftn3(J_r, axes=(-3, -2, -1), norm='ortho')
-    projector = transverse_projector(
-        jnp.moveaxis(G_cart, 0, -1),
-        jnp.where(zero_mask, 0.0, G2_safe))
-    # Spell this as an elementwise reduction, not an einsum: a rank-2×rank-1
-    # contraction with a three-wide inner axis is not a GEMM and must not
-    # acquire a cuBLAS autotune/compile family on production FFT grids.
-    J_transverse_G = jnp.moveaxis(jnp.sum(
-        projector * jnp.moveaxis(J_G, 0, -1)[..., None, :], axis=-1),
-        -1, 0)
+    J_transverse_G = jnp.moveaxis(apply_transverse_projector(
+        jnp.moveaxis(G_cart, 0, -1), jnp.moveaxis(J_G, 0, -1),
+        jnp.where(zero_mask, 0.0, G2_safe)), -1, 0)
     J_transverse_G = jnp.where(
         (~zero_mask)[None, ...], J_transverse_G,
         jnp.zeros_like(J_transverse_G))
