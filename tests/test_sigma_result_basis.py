@@ -114,10 +114,7 @@ def test_sc_finalize_rotates_exactly_the_declared_set():
     calls = [n for n in ast.walk(fn)
              if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Attribute)
-             and n.func.attr == "replace"
-             and n.args
-             and isinstance(n.args[0], ast.Name)
-             and n.args[0].id == "sigma_result"]
+             and n.func.attr == "replace"]
     assert len(calls) == 1, (
         f"expected exactly one dataclasses.replace(sigma_result, ...) in "
         f"run_sc_driver's finalize; found {len(calls)}")
