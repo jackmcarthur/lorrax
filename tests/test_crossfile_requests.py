@@ -886,16 +886,24 @@ def test_package_init_runs_before_submodule_body_under_dash_m():
 
 
 def test_gw_package_init_no_longer_claims_to_be_the_guarantee():
-    """The comment was the defect, not the statement.  It must no longer
-    promise "before any module in this package imports JAX" — a promise it
-    cannot keep for an entry point that imported jax first — and must name
-    the canonical setter."""
+    """The package stays JAX-free until a lazy compatibility export is used."""
     src = _read("gw/__init__.py")
     assert 'os.environ.setdefault("JAX_ENABLE_X64", "1")' in src
     assert "runtime.set_default_env" in src, (
         "gw/__init__ must point at the canonical setter")
-    assert "Ensure double precision is enabled before any module in this " \
-           "package imports JAX." not in src
+    assert "def __getattr__" in src
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.join(_REPO, "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, gw; "
+         "print(int('jax' in sys.modules), "
+         "int('gw.gw_config' in sys.modules))"],
+        cwd=_REPO, env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "0 0", probe.stdout
 
 
 # ===========================================================================

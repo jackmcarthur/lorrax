@@ -36,9 +36,9 @@ Plus the classifier's own conventions: MP1 overshoot (``f`` is never
 clipped, so occupied bands carry ``f > 1``), the mixed full/empty band, and
 the refusal on a band axis that is not energy-sorted.
 
-``src/gw/scissor.py`` is loaded FROM ITS PATH for the same reason
-``test_scissor_weights.py`` gives: ``gw/__init__`` pulls in jax, which is
-not importable on a login node, while this module needs only numpy.
+``src/gw/scissor.py`` is loaded FROM ITS PATH for the same isolation reason
+``test_scissor_weights.py`` gives: this module needs only numpy and the test
+does not need the rest of the GW package.
 """
 import importlib.util
 import pathlib

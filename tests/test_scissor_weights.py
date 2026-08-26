@@ -24,10 +24,9 @@ The energy-only sum-band seam is also pinned here: an identity conduction
 fit is bit-exact, an affine fit touches only ``[b3,b4_user)``, and padded
 band slots beyond ``b4_user`` never enter the fit or update.
 
-``src/gw/scissor.py`` is loaded FROM ITS PATH, not as ``gw.scissor``:
-``gw/__init__.py`` imports ``common.meta``, which imports jax, and jax is
-not importable on a login node.  The module itself needs only numpy, so
-loading it directly keeps this suite runnable everywhere — the same
+``src/gw/scissor.py`` is loaded FROM ITS PATH, not as ``gw.scissor``.  The
+package initializer is JAX-free now; retaining the isolated loader keeps this
+numpy-only suite independent of every other GW package import — the same
 reason ``test_layering.py`` is pure AST.
 """
 import importlib.util

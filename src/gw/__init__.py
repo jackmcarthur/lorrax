@@ -8,16 +8,23 @@ import os
 # setdefault only bites while jax is still unimported.
 #
 # NOT the canonical setter, and not load-bearing for the drivers.  Under
-# ``python -m gw.gw_jax`` Python imports the PACKAGE before the module, so
-# this line does run first — but ``gw_jax`` then calls
-# ``runtime.bootstrap()`` (which setdefaults the same variable) before its
-# own ``import jax``, and follows it with an explicit
-# ``jax.config.update("jax_enable_x64", True)``.  Same for
-# ``gw.kin_ion_io``.  Deleting this line would therefore change nothing
-# for either driver; it is kept for the import paths that have no
-# bootstrap at all.  ``runtime.set_default_env`` is the one to edit.
+# ``python -m gw.gw_jax`` Python imports this package before the module, so
+# the package must remain JAX-FREE: the driver's runtime initialization owns
+# the first JAX import, backend selection and timing.  The lazy compatibility
+# exports below keep this boundary while preserving ``from gw import
+# read_lorrax_input`` for external callers.  ``runtime.set_default_env`` is
+# the canonical setter.
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
-from .gw_config import read_lorrax_input, read_cohsex_input
-
 __all__ = ["read_lorrax_input", "read_cohsex_input"]
+
+
+def __getattr__(name):
+    if name in __all__:
+        from . import gw_config
+        return getattr(gw_config, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
