@@ -1,4 +1,4 @@
-"""Remove one upstream-spurious PjRt-IFRT notice from process stderr.
+"""Remove exact, known-benign JAX runtime notices from process stderr.
 
 JAX persistent-cache hits deserialize an XLA executable through PjRt-IFRT.
 In the XLA revision bundled with jaxlib 0.9.1,
@@ -13,8 +13,13 @@ The message is an absl C++ ``LOG(WARNING)`` written directly to file
 descriptor 2.  ``warnings.filterwarnings`` and replacing ``sys.stderr``
 cannot see it; raising ``TF_CPP_MIN_LOG_LEVEL`` would hide every C++ warning.
 This module instead forwards fd 2 through a small line filter and discards
-only the exact upstream-removed notice.  Every other byte is passed to the
-original descriptor unchanged.
+only the exact upstream-removed notice.  After every process has passed the
+explicit finalization barrier, it may additionally discard JAX 0.9.1's
+three-line ``WatchJobStateAsync`` shutdown receipt: rank zero emits
+``CANCELLED`` or an ``UNAVAILABLE`` connection-close variant when it
+deliberately closes the coordination service it owns.  The shutdown gate
+matters—an identical message during calculation is still forwarded.
+Every other byte is passed to the original descriptor unchanged.
 """
 from __future__ import annotations
 
@@ -31,10 +36,43 @@ _SPURIOUS_PJRT_LINE = re.compile(
     rb"executable versions\.\r?\n?\Z"
 )
 
+_CONNECTION_REFUSED = (
+    rb"failed to connect to all addresses; last error: UNKNOWN: "
+    rb"ipv4:[0-9.]+:\d+: Failed to connect to remote host: Connection refused"
+)
+_CANCELLING_ALL_CALLS = rb"Cancelling all calls"
+_CLEAN_SHUTDOWN_HEAD_LINE = re.compile(
+    rb"W\d{4} \d{2}:\d{2}:\d{2}\.\d+ +\d+ "
+    rb"pjrt_client\.cc:\d+\] WatchJobStateAsync failed for task \d+: "
+    rb"(?:CANCELLED: CANCELLED|UNAVAILABLE: (?:" + _CONNECTION_REFUSED +
+    rb"|" + _CANCELLING_ALL_CALLS + rb"))\r?\n?\Z"
+)
+_CLEAN_SHUTDOWN_CONTEXT_LINE = (
+    b"Additional GRPC error information from remote target "
+    b"coordination_service while calling "
+    b"/tensorflow.CoordinationService/WatchJobState:"
+)
+
 
 def is_spurious_pjrt_version_notice(line: bytes) -> bool:
     """Return whether *line* is exactly the upstream-removed PJRT notice."""
     return _SPURIOUS_PJRT_LINE.fullmatch(line) is not None
+
+
+def is_clean_shutdown_notice(line: bytes) -> bool:
+    """Match one line of JAX's expected coordinator-close receipts."""
+    stripped = line.rstrip(b"\r\n")
+    if (_CLEAN_SHUTDOWN_HEAD_LINE.fullmatch(line)
+            or stripped == _CLEAN_SHUTDOWN_CONTEXT_LINE):
+        return True
+    if not stripped.startswith(b":UNKNOWN:Error received from peer  {"):
+        return False
+    cancelled = (b"grpc_status:1" in stripped
+                 and b'grpc_message:"CANCELLED"' in stripped)
+    unavailable = (b"grpc_status:14" in stripped and (
+        re.search(_CONNECTION_REFUSED, stripped) is not None
+        or b'grpc_message:"Cancelling all calls"' in stripped))
+    return cancelled or unavailable
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -51,7 +89,7 @@ def _write_all(fd: int, payload: bytes) -> None:
 
 
 class ExactPjrtNoticeFilter:
-    """A start/stop fd filter for the one known-spurious PJRT notice.
+    """A start/stop fd filter for exact known-benign PJRT notices.
 
     ``target_fd`` is injectable so unit tests do not disturb pytest's own
     stderr capture.  Production always uses fd 2 through the module-level
@@ -66,6 +104,7 @@ class ExactPjrtNoticeFilter:
         self._thread: threading.Thread | None = None
         self._started = False
         self._suppressed = 0
+        self._clean_shutdown = False
 
     @property
     def suppressed(self) -> int:
@@ -107,6 +146,17 @@ class ExactPjrtNoticeFilter:
             os.close(write_fd)
             self._started = True
 
+    def begin_clean_shutdown(self) -> None:
+        """Permit exact coordinator-cancel receipts after the final barrier."""
+        with self._lock:
+            if self._started:
+                self._clean_shutdown = True
+
+    def _is_suppressed(self, line: bytes) -> bool:
+        return (is_spurious_pjrt_version_notice(line)
+                or (self._clean_shutdown
+                    and is_clean_shutdown_notice(line)))
+
     def _forward(self, read_fd: int, saved_fd: int) -> None:
         pending = bytearray()
         try:
@@ -124,7 +174,7 @@ class ExactPjrtNoticeFilter:
                         break
                     line = bytes(pending[:newline + 1])
                     del pending[:newline + 1]
-                    if is_spurious_pjrt_version_notice(line):
+                    if self._is_suppressed(line):
                         self._suppressed += 1
                     else:
                         _write_all(saved_fd, line)
@@ -136,7 +186,7 @@ class ExactPjrtNoticeFilter:
                     pending.clear()
             if pending:
                 line = bytes(pending)
-                if is_spurious_pjrt_version_notice(line):
+                if self._is_suppressed(line):
                     self._suppressed += 1
                 else:
                     _write_all(saved_fd, line)
@@ -187,3 +237,8 @@ def install_pjrt_log_filter() -> None:
 def stop_pjrt_log_filter() -> int:
     """Stop the process-wide filter, returning its cumulative drop count."""
     return _PROCESS_FILTER.stop()
+
+
+def begin_clean_shutdown_log_filter() -> None:
+    """Enable exact clean-shutdown cancellation filtering process-wide."""
+    _PROCESS_FILTER.begin_clean_shutdown()
