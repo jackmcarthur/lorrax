@@ -64,7 +64,11 @@ class SigmaResult:
 
     Always populated
     ----------------
-    v_h_kij_ry           : (nk, nb, nb)   Hartree (replicated)
+    v_h_kij_ry           : (nk, nb, nb)   Total direct field
+                                          ``V_H + H_T`` (replicated)
+    v_h_scalar_kij_ry    : (nk, nb, nb)   Scalar charge Hartree only
+    h_transverse_kij_ry  : (nk, nb, nb)   Transverse current Hartree, or
+                                          None for charge-only runs
     sigma_x_kij_ry       : (nk, nb, nb)   Bare exchange (replicated)
     sigma_xc_kij_ry      : (nk, nb, nb)   Exchange-correlation total going
                                           into ``H_QP = kin_ion + V_H + Σ_xc``.
@@ -105,6 +109,8 @@ class SigmaResult:
     v_h_kij_ry: jax.Array
     sigma_x_kij_ry: jax.Array
     sigma_xc_kij_ry: jax.Array
+    v_h_scalar_kij_ry: jax.Array | None = None
+    h_transverse_kij_ry: jax.Array | None = None
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
     #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
@@ -143,6 +149,15 @@ class SigmaResult:
     band_extrapolation_estimator: str | None = None
     band_extrapolation_scheme: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.v_h_scalar_kij_ry is None:
+            if self.h_transverse_kij_ry is not None:
+                raise ValueError(
+                    "SigmaResult: H_T requires an explicit scalar V_H component")
+            # Compatibility for charge-only constructors: the historical
+            # aggregate is exactly the scalar component in that sector.
+            object.__setattr__(self, "v_h_scalar_kij_ry", self.v_h_kij_ry)
+
 
 # ---------------------------------------------------------------------------
 # Which basis each field is in
@@ -167,6 +182,8 @@ class SigmaResult:
 #: bases agree by construction).
 ROTATED_TO_DFT_FIELDS = (
     "v_h_kij_ry",
+    "v_h_scalar_kij_ry",
+    "h_transverse_kij_ry",
     "sigma_x_kij_ry",
     "sigma_xc_kij_ry",
     # The un-extrapolated N₃ twin of ``sigma_xc_kij_ry``, present only when
@@ -313,24 +330,38 @@ def invalidate_hartree_cache() -> None:
 
 def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
                              wfn=None, sym=None, print_fn=print):
-    """``(source, V_H_kij_ry | None)`` for this run's ``hartree_source``.
+    """``(source, V_H | None, V_H_T | None)`` for this run.
 
     ``source`` is one of ``'stored' | 'folded' | 'isdf' | 'gspace'``.
-    The array is returned only for ``stored`` / ``gspace``; ``folded``
+    The scalar array is returned only for ``stored`` / ``gspace``; ``folded``
     means "V_H is inside kin_ion's values, add nothing", and ``isdf``
-    means "keep the ISDF quadrature".
+    means "keep the ISDF quadrature".  A bispinor run additionally receives
+    the exact transverse direct matrix, independently of the scalar source:
+    read from its separate kin_ion dataset except when ``gspace`` builds both
+    fields in one occupied-WFN transaction.
     """
-    from file_io.kin_ion import resolve_hartree_source, load_hartree_submatrix
+    from file_io.kin_ion import (
+        load_hartree_submatrix, load_transverse_hartree_submatrix,
+        resolve_hartree_source,
+    )
 
     path = config.paths.kin_ion_file
     requested = getattr(config, "hartree_source", "auto")
     source = resolve_hartree_source(path, requested, print_fn=print_fn)
+    require_transverse = bool(config.bispinor)
     key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
-           source, _mesh_cache_key(mesh_xy))
+           source, require_transverse, _mesh_cache_key(mesh_xy))
     if key in _hartree_cache:
         return _hartree_cache[key]
 
     v_h = None
+    v_h_t = None
+    if require_transverse and source != "gspace":
+        v_h_t = load_transverse_hartree_submatrix(
+            path, band_slices.b0, band_slices.b3, mesh=mesh_xy)
+        print_fn(
+            "  V_H^T: exact periodic G-space Dirac-current matrix read "
+            "from kin_ion.h5; G=0 is zero and no exchange head enters.")
     if source == "stored":
         v_h = load_hartree_submatrix(
             path, band_slices.b0, band_slices.b3,
@@ -353,12 +384,15 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
         # module depend on a CLI for a collective helper.
         from common.collectives import replicate_to_mesh
         from gw.kin_ion_io import compute_hartree_matrix
-        v_h_np = compute_hartree_matrix(
+        exact_hartree = compute_hartree_matrix(
             wfn, sym, meta,
             truncation_2d=(int(config.sys_dim) == 2),
             nb=int(band_slices.b3), mesh=mesh_xy,
             band_chunk_size=int(config.memory.band_chunk_size),
+            include_transverse=require_transverse,
             print_fn=print_fn)
+        v_h_np = (exact_hartree.charge if require_transverse
+                  else exact_hartree)
         # ``compute_hartree_matrix`` hands every rank the same host array;
         # publish it as a genuinely REPLICATED global array so it composes
         # with the (global) ``sig_h`` it replaces.  ``jnp.asarray`` here
@@ -369,6 +403,13 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
                 v_h_np[:, band_slices.b0:band_slices.b3,
                        band_slices.b0:band_slices.b3]),
             mesh_xy)
+        if require_transverse:
+            v_h_t = replicate_to_mesh(
+                np.ascontiguousarray(
+                    exact_hartree.transverse[
+                        :, band_slices.b0:band_slices.b3,
+                        band_slices.b0:band_slices.b3]),
+                mesh_xy)
     elif source == "folded":
         print_fn("  V_H: LEGACY folded kin_ion.h5 — V_H is inside its values; "
                  "the ISDF sig_h is suppressed to avoid double counting.")
@@ -376,8 +417,8 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
         print_fn("  V_H: ISDF V_q[0] quadrature (hartree_source=isdf); H0 "
                  "therefore depends on the centroid count.")
 
-    _hartree_cache[key] = (source, v_h)
-    return source, v_h
+    _hartree_cache[key] = (source, v_h, v_h_t)
+    return source, v_h, v_h_t
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +431,8 @@ def finalize_dynamic_sigma(
     *,
     sig_x: jax.Array,
     sig_h: jax.Array,
+    v_h_scalar: jax.Array | None = None,
+    h_transverse: jax.Array | None = None,
     e_qp_ev: np.ndarray,
     config,
     meta,
@@ -432,6 +475,12 @@ def finalize_dynamic_sigma(
     )
     from .qsgw_utils import build_qsgw_sigma_xc
 
+    if v_h_scalar is None:
+        if h_transverse is not None:
+            raise ValueError(
+                "finalize_dynamic_sigma: H_T requires scalar V_H")
+        v_h_scalar = sig_h
+
     with timing.section("gw_jax.dynamic_sigma_finalize"):
         sigma_c_omega = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry)
@@ -461,6 +510,8 @@ def finalize_dynamic_sigma(
             sigma_omega_h5_path = write_sigma_omega(
                 sigma_c_omega,
                 sig_x=sig_x, sig_h=sig_h,
+                v_h_scalar=v_h_scalar,
+                h_transverse=h_transverse,
                 config=config, input_dir=input_dir,
                 meta=meta, mesh_xy=mesh_xy,
                 omega_reference_ev=efermi_dft_ev,
@@ -538,6 +589,8 @@ def finalize_dynamic_sigma(
 
     return SigmaResult(
         v_h_kij_ry=sig_h,
+        v_h_scalar_kij_ry=v_h_scalar,
+        h_transverse_kij_ry=h_transverse,
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
@@ -858,7 +911,6 @@ def compute_sigma_xc(
     from .gw_config import BispinorGWMode, coerce_bispinor_gw_mode
     bispinor_gw = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    photon_h_t = None
     if bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX:
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
             raise ValueError(
@@ -890,18 +942,7 @@ def compute_sigma_xc(
             occupation_state=None,
             compute_bare_x=False,
         )
-        from .photon_sigma import (
-            compute_static_photon_hartree, compute_static_photon_sigma,
-        )
-        photon_h_t = compute_static_photon_hartree(
-            wfns_transverse=wfns_transverse,
-            Gij=photon_Gij,
-            V_packed=photon_response.V_packed,
-            photon_layout=photon_response.layout,
-            meta=meta,
-            mesh_xy=mesh_xy,
-            print_fn=print_fn,
-        )
+        from .photon_sigma import compute_static_photon_sigma
         photon_x, photon_sx, photon_coh = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
@@ -955,7 +996,7 @@ def compute_sigma_xc(
     # against Σ's 28.6% at Si 4x4x4, and 27.7% against 41.8% at Si 6x6x6 — so
     # "cheap next to Σ" holds where it matters and INVERTS on the gnppm_debug
     # fixture (23.7% against 5.2%), which is a bring-up-dominated gate deck.
-    source, v_h_ext = resolve_external_hartree(
+    source, v_h_ext, h_transverse = resolve_external_hartree(
         config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
     if omit_v_h:
         # DENSITY SELF-CONSISTENCY.  V_H is supplied by the caller in the
@@ -999,13 +1040,21 @@ def compute_sigma_xc(
                                      sig_h.dtype),
                 mesh=mesh_xy)
         sig_h = v_h_ext
-    if photon_h_t is not None:
+    v_h_scalar = sig_h
+    if h_transverse is not None and hartree_basis_rotation is not None:
+        h_transverse = _rotate_v_h_to_qp(
+            jnp.asarray(h_transverse, dtype=sig_h.dtype),
+            _place_band_rotation(
+                hartree_basis_rotation, mesh_xy, sig_h.dtype),
+            mesh=mesh_xy)
+    if h_transverse is not None:
         # ``hartree_source`` and ``omit_v_h`` own only the scalar charge
-        # potential.  A stored/gspace replacement (or kin_ion fold) contains
-        # no transverse Breit direct field, so append that independently
-        # after the scalar source seam rather than letting the replacement
-        # erase it.
-        sig_h = sig_h + photon_h_t
+        # potential.  The exact periodic G-space current artifact is a
+        # separate operator, so append it independently after the scalar
+        # replacement rather than letting hartree_source erase it.  It is the
+        # SSOT for BOTH BARE_TRANSVERSE and FULL_STATIC_COHSEX; no centroid
+        # direct contraction or exchange q->0 head reaches this seam.
+        sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
     sig_coh = cohsex["sig_coh"]
@@ -1016,6 +1065,8 @@ def compute_sigma_xc(
         # zeros; sigTOT = sigSX + sigCOH stays consistent.
         return SigmaResult(
             v_h_kij_ry=sig_h,
+            v_h_scalar_kij_ry=v_h_scalar,
+            h_transverse_kij_ry=h_transverse,
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sig_x,
             sigma_sx_kij_ry=sig_x,
@@ -1025,6 +1076,8 @@ def compute_sigma_xc(
         sigma_xc = sig_sx + sig_coh
         return SigmaResult(
             v_h_kij_ry=sig_h,
+            v_h_scalar_kij_ry=v_h_scalar,
+            h_transverse_kij_ry=h_transverse,
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sigma_xc,
             sigma_sx_kij_ry=sig_sx,
@@ -1190,7 +1243,9 @@ def compute_sigma_xc(
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
         return finalize_dynamic_sigma(
             body.sigma_c_kij, head_diag,
-            sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
+            sig_x=sig_x, sig_h=sig_h,
+            v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+            e_qp_ev=e_qp_ev,
             config=config, meta=meta, mesh_xy=mesh_xy,
             sym=sym, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir,
@@ -1249,7 +1304,9 @@ def compute_sigma_xc(
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
-        sig_x=sig_x, sig_h=sig_h, e_qp_ev=e_qp_ev,
+        sig_x=sig_x, sig_h=sig_h,
+        v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+        e_qp_ev=e_qp_ev,
         config=config, meta=meta, mesh_xy=mesh_xy,
         sym=sym, wfn=wfn, band_slices=band_slices,
         input_dir=input_dir,
