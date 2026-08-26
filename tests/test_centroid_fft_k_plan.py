@@ -155,7 +155,91 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
         for target in node.targets
         if isinstance(target, ast.Name)
     }
-    assert assignments["existing_live_bytes"] == (
-        "worst_process_resident_bytes(existing_live_local_bytes)"
-    )
+    existing_live_assignments = [
+        ast.unparse(node.value)
+        for node in ast.walk(loader)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name)
+                and target.id == "existing_live_bytes"
+                for target in node.targets)
+    ]
+    assert "worst_process_resident_bytes(existing_live_local_bytes)" in (
+        existing_live_assignments)
     assert assignments["nk_accum"] == "round_up(nk_tot, k_tile)"
+
+
+def test_cold_fft_index_is_synchronized_before_residency_and_gpu_fails_closed():
+    """Static scan/Gram shapes cannot use a pre-index or unknown GPU floor."""
+    repo = Path(__file__).resolve().parents[1]
+    wfn_tree = ast.parse((repo / "src/common/wfn_transforms.py").read_text())
+    pivot_tree = ast.parse(
+        (repo / "src/centroid/pivoted_cholesky.py").read_text())
+    loader = _function(wfn_tree, "load_centroids_band_chunked")
+    gram = _function(pivot_tree, "build_gram_q0_via_loadwfns")
+
+    box_calls = [
+        node for node in ast.walk(loader)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "box_index_dev"
+    ]
+    ready_calls = [
+        node for node in ast.walk(loader)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "jax.block_until_ready"
+        and node.args and ast.unparse(node.args[0]) == "g_index_full"
+    ]
+    memory_calls = _calls(loader, "_get_jax_gpu_memory_bytes")
+    cs_assign = next(
+        node for node in ast.walk(loader)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "cs_budget"
+                for target in node.targets)
+    )
+    assert len(box_calls) == len(ready_calls) == len(memory_calls) == 1
+    assert box_calls[0].lineno < ready_calls[0].lineno < \
+        memory_calls[0].lineno < cs_assign.lineno
+    assert not [
+        node for node in ast.walk(loader)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "memory_stats"
+    ], "centroid planner bypassed the canonical allocator-query owner"
+
+    loader_source = ast.unparse(loader)
+    gram_source = ast.unparse(gram)
+    for source, refusal in (
+        (loader_source, "load_centroids_band_chunked planner refuses"),
+        (gram_source, "blocked Gram planner refuses"),
+    ):
+        assert "jax.default_backend()" in source
+        assert "('gpu', 'cuda', 'rocm')" in source
+        assert refusal in source
+        assert source.index("worst_process_resident_bytes") < source.index(
+            refusal)
+    assert "CPU/emulated test backend" in gram_source
+
+
+def test_allocator_query_distinguishes_missing_residency_from_zero(monkeypatch):
+    """An absent bytes_in_use field cannot become a zero planner floor."""
+    import jax
+
+    from common import gpu_utils
+
+    class _Device:
+        def __init__(self, stats):
+            self._stats = stats
+
+        def memory_stats(self):
+            return self._stats
+
+    monkeypatch.setattr(
+        jax, "local_devices", lambda: [_Device({"bytes_limit": 1024})])
+    assert gpu_utils._get_jax_gpu_memory_bytes() == (None, None, None)
+
+    monkeypatch.setattr(
+        jax, "local_devices", lambda: [_Device({
+            "bytes_limit": 1024,
+            "bytes_in_use": 0,
+        })])
+    assert gpu_utils._get_jax_gpu_memory_bytes() == (1024.0, 0.0, 1024.0)

@@ -557,6 +557,83 @@ def test_streamed_centroid_transfer_matches_bulk(synth_loader):
     assert len(families) == 1
 
 
+def test_centroid_planner_prices_fft_index_before_cold_and_warm_scan(
+        synth_loader, monkeypatch):
+    """Cold and warm scan planning both observe the one cached FFT index.
+
+    The allocator sample is replaced by a deterministic observation seam:
+    it refuses unless ``box_index_dev`` has already returned its device
+    buffer.  The transform spy then proves that the same object, rather than
+    a separately built index, is passed onward.  Running the complete loader
+    twice distinguishes the cold allocation from the warm cache hit.
+    """
+    sym = synth_loader.symmetry()
+    nb = min(4, int(synth_loader.nbands))
+    nx, ny, nz = (int(s) for s in synth_loader.fft_grid)
+    r_mu = jnp.asarray([
+        [0, 0, 0],
+        [min(1, nx - 1), min(2, ny - 1), min(3, nz - 1)],
+    ], dtype=jnp.int32)
+    meta = Meta.from_system(
+        synth_loader, sym, nval=2, ncond=1, nband=nb,
+        n_rmu=int(r_mu.shape[0]), bispinor=False)
+    meta.memory_per_device_gb = 1000.0
+
+    events = []
+
+    class _IndexSpy:
+        def __init__(self, base):
+            self._base = base
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+        def box_index_dev(self, *, k, mesh):
+            index = self._base.box_index_dev(k=k, mesh=mesh)
+            events.append(("box", index, None))
+            return index
+
+    loader = _IndexSpy(synth_loader)
+
+    def _allocator_after_index():
+        assert events and events[-1][0] == "box", (
+            "allocator residency was sampled before box_index_dev returned")
+        index = events[-1][1]
+        events.append(("memory", index, None))
+        live = 4096
+        limit = 10 * 2**30
+        return float(limit), float(live), float(limit - live)
+
+    real_gflat_to_rmu = _wfn_transforms.gflat_to_rmu
+
+    def _gflat_after_plan(psi_G, g_index, *args, **kwargs):
+        events.append(("transform", g_index, int(kwargs["chunk_size"])))
+        return real_gflat_to_rmu(psi_G, g_index, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _wfn_transforms, "_get_jax_gpu_memory_bytes",
+        _allocator_after_index)
+    monkeypatch.setattr(
+        _wfn_transforms, "gflat_to_rmu", _gflat_after_plan)
+
+    for _ in range(2):
+        out_y, out_x = load_centroids_band_chunked(
+            loader, sym, meta, r_mu, False, MESH, (0, nb),
+            band_chunk_size=nb)
+        jax.block_until_ready((out_y, out_x))
+        out_y.delete()
+        out_x.delete()
+
+    assert [event[0] for event in events] == [
+        "box", "memory", "transform", "box", "memory", "transform",
+    ]
+    index_objects = [event[1] for event in events]
+    assert all(index is index_objects[0] for index in index_objects), (
+        "cold/warm planning or the transform did not share one cached index")
+    assert events[2][2] == events[5][2], (
+        "identical cold/warm resident floors chose different scan widths")
+
+
 # ---------------------------------------------------------------------------
 # Pad-row hygiene: pad ψ rows of zero must NOT corrupt the box
 # (the gather contract guarantees this — pad indices in g_index would

@@ -1251,9 +1251,12 @@ def build_gram_q0_via_loadwfns(
         gc.collect()
         from common.gpu_utils import _get_jax_gpu_memory_bytes
         _, live_now, _ = _get_jax_gpu_memory_bytes()
-        if live_now is None:
-            # CPU/fallback accounting: sum the returned WFN shards.  Announce
-            # that this is weaker because it cannot see service tables.
+        backend = str(jax.default_backend()).strip().lower()
+        using_test_fallback = False
+        if live_now is None and backend == "cpu":
+            # CPU/emulated-device tests have no GPU allocator.  Sum exactly
+            # the four fixture-bounded WFN output shards so those numerical
+            # tests retain a plainly scoped, announced lower-bound fallback.
             resident_local_bytes = 0
             for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
                         psi_r_rmu_Y, psi_r_rmuT_X):
@@ -1261,20 +1264,38 @@ def build_gram_q0_via_loadwfns(
                     int(np.asarray(sh.data).nbytes)
                     for sh in arr.addressable_shards
                 )
+            using_test_fallback = True
+        else:
+            # ``None`` is a deliberate sentinel on GPU.  The canonical
+            # worst-process owner propagates one rank's missing sample to all
+            # ranks before any rank takes the refusal branch below.
+            resident_local_bytes = (
+                None if live_now is None else int(live_now))
+
+        resident_bytes = worst_process_resident_bytes(resident_local_bytes)
+        if resident_bytes is None:
+            backend_scope = (
+                "production GPU" if backend in ("gpu", "cuda", "rocm")
+                else "non-CPU")
+            raise MemoryError(
+                "blocked Gram planner refuses before compiling a pair "
+                f"tile: allocator bytes_in_use is unavailable on at least "
+                f"one rank of the {backend_scope} {backend} backend after "
+                "both canonical WFN windows were synchronized. The four "
+                "returned WFN faces are a known-low floor that omits loader "
+                "tables and JIT arenas; use the certified BFC "
+                "allocator/accounting lane."
+            )
+
+        if using_test_fallback:
             from runtime.aot_memory import announce_once
             announce_once(
                 "gram-live-allocator-unavailable",
-                "allocator bytes_in_use unavailable for the Gram planner; "
-                "using the four canonical WFN output shards as a KNOWN-LOW "
-                "resident floor",
+                "allocator bytes_in_use unavailable on the non-GPU "
+                "CPU/emulated test backend; using the four fixture-bounded "
+                "canonical WFN output shards as a KNOWN-LOW resident floor "
+                "without making a production capacity claim",
             )
-        else:
-            resident_local_bytes = int(live_now)
-
-        # The selected width controls static executable shapes and loop counts
-        # on every process.  Allocator residency itself is rank-local, so price
-        # from one shared worst-rank value before entering that host branch.
-        resident_bytes = worst_process_resident_bytes(resident_local_bytes)
 
         target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
         gram_local_bytes = (

@@ -46,30 +46,39 @@ def bfc_fragmentation_target_utilization(width_factor: int) -> float:
     return 0.90
 
 
-def worst_process_resident_bytes(local_bytes: int) -> int:
-    """Return one rank-invariant allocator-residency floor.
+def worst_process_resident_bytes(local_bytes: int | None) -> int | None:
+    """Return one rank-invariant allocator-residency floor or ``None``.
 
     Allocator residency is process-local and can differ because JIT arenas are
     released asynchronously.  Any value that sizes a static executable or
     host-loop shape must therefore be derived from the same worst-process
     floor on every rank.  Keep the communication in the canonical process-
-    collective service and the memory policy here.
+    collective service and the memory policy here.  ``None`` is gathered as
+    an unavailable sentinel; if ANY process lacks allocator accounting, every
+    process receives ``None`` and can take the same fail-closed or bounded
+    test-only branch without stranding peers in a later collective.
     """
     import numpy as np
 
     from common.collectives import all_gather_processes
 
-    local_i = int(local_bytes)
-    if local_i < 0:
-        raise ValueError(f"resident bytes must be nonnegative, got {local_i}")
+    if local_bytes is None:
+        local_i = -1
+    else:
+        local_i = int(local_bytes)
+        if local_i < 0:
+            raise ValueError(
+                f"resident bytes must be nonnegative, got {local_i}")
     gathered = np.asarray(
         all_gather_processes(np.asarray(local_i, dtype=np.int64)),
         dtype=np.int64,
     )
-    if gathered.size == 0 or np.any(gathered < 0):
-        raise ValueError(
-            "process residency gather returned no values or a negative value"
-        )
+    if gathered.size == 0:
+        raise ValueError("process residency gather returned no values")
+    if np.any(gathered < -1):
+        raise ValueError("process residency gather returned a negative value")
+    if np.any(gathered == -1):
+        return None
     return int(np.max(gathered))
 
 
@@ -112,9 +121,15 @@ def _get_jax_gpu_memory_bytes() -> tuple[float | None, float | None, float | Non
         devices = jax.local_devices()
         if not devices or not hasattr(devices[0], 'memory_stats'):
             return None, None, None
-        stats = devices[0].memory_stats()
-        bytes_limit = float(stats.get('bytes_limit', 0.0))
-        bytes_in_use = float(stats.get('bytes_in_use', 0.0))
+        stats = devices[0].memory_stats() or {}
+        # ``bytes_in_use=0`` is a valid empty-pool observation; a missing key
+        # is not.  Do not silently turn an allocator without live-residency
+        # accounting into the zero floor that sizes static programs.
+        if stats.get('bytes_limit') is None or \
+                stats.get('bytes_in_use') is None:
+            return None, None, None
+        bytes_limit = float(stats['bytes_limit'])
+        bytes_in_use = float(stats['bytes_in_use'])
         if bytes_limit <= 0.0:
             return None, None, None
         bytes_available = max(0.0, bytes_limit - max(0.0, bytes_in_use))

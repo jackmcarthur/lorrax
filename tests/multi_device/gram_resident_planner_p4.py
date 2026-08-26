@@ -64,12 +64,18 @@ def main() -> None:
         _fail(f"negative control did not diverge: {naive_widths.tolist()}")
 
     shared_resident = worst_process_resident_bytes(local_resident)
+    shared_missing = worst_process_resident_bytes(
+        None if rank == 3 else local_resident)
     fixed_width = choose(shared_resident)
     fixed_widths = np.asarray(
         all_gather_processes(np.asarray(fixed_width, dtype=np.int32))
     ).reshape(-1)
     if shared_resident != 700:
         _fail(f"shared resident is {shared_resident}, expected worst rank 700")
+    if shared_missing is not None:
+        _fail(
+            "one rank's missing allocator sample did not propagate to all "
+            f"ranks: {shared_missing}")
     if not np.array_equal(fixed_widths, np.full(4, 256, dtype=np.int32)):
         _fail(f"fixed widths differ or select the wrong rung: {fixed_widths.tolist()}")
 
@@ -77,6 +83,7 @@ def main() -> None:
         print(
             "[gram-resident-planner-p4] negative-control widths="
             f"{naive_widths.tolist()} shared-resident={shared_resident} "
+            f"shared-missing={shared_missing} "
             f"fixed-widths={fixed_widths.tolist()}",
             flush=True,
         )

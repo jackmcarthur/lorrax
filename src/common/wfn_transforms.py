@@ -50,7 +50,10 @@ from runtime.padding import round_up, pad_axis, spec_divisor
 from common.shard_map import shard_map
 from common.staged_reshard import band_to_product_r_reshard
 from common.wfn_layout import band_sphere_spec
-from common.gpu_utils import worst_process_resident_bytes
+from common.gpu_utils import (
+    _get_jax_gpu_memory_bytes,
+    worst_process_resident_bytes,
+)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
@@ -2504,17 +2507,42 @@ def load_centroids_band_chunked(
         + tile_band_output_local_bytes + tile_face_local_bytes
     )
     min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
-    existing_live_local_bytes = 0
-    for device in jax.local_devices():
-        stats = device.memory_stats() or {}
-        existing_live_local_bytes = max(
-            existing_live_local_bytes, int(stats.get("bytes_in_use") or 0),
-        )
+
+    # The full-BZ FFT index is a loader-cached, replicated device buffer.
+    # Materialize that ONE canonical object before reading allocator
+    # residency: on a cold call it did not previously exist at the sample,
+    # so the static scan width omitted the table that was allocated moments
+    # later.  Warm calls already had it and therefore used a different live
+    # floor.  Synchronization makes the allocation visible to memory_stats().
+    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
+    jax.block_until_ready(g_index_full)
+
+    _, existing_live_local_bytes, _ = _get_jax_gpu_memory_bytes()
+    # Agree on availability before branching.  A process-local refusal here
+    # would strand peers in the later worst-rank collective.
+    existing_live_bytes = worst_process_resident_bytes(
+        existing_live_local_bytes)
+    if existing_live_bytes is None:
+        backend = str(jax.default_backend()).strip().lower()
+        if backend != "cpu":
+            backend_scope = (
+                "production GPU" if backend in ("gpu", "cuda", "rocm")
+                else "non-CPU")
+            raise MemoryError(
+                "load_centroids_band_chunked planner refuses before WFN "
+                "allocation: allocator bytes_in_use is unavailable on the "
+                f"{backend_scope} {backend} backend after the canonical "
+                "full-BZ FFT index was synchronized. A zero resident floor "
+                "would underprice the static scan shape; use the certified "
+                "BFC allocator/accounting lane."
+            )
+        # CPU and emulated-device tests do not expose a device allocator.
+        # Their tensor sizes are fixture-bounded and no GPU-capacity claim is
+        # made, so zero is the explicit test-only residency floor.
+        existing_live_bytes = 0
     # ``cs`` below is a static scan shape and cache-key component.  Allocator
     # residency can differ by process after asynchronous Lloyd/JIT teardown;
     # use one shared worst-rank floor so every process compiles the same scan.
-    existing_live_bytes = worst_process_resident_bytes(
-        existing_live_local_bytes)
     scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
                          - persistent_bytes)
     if scan_budget_bytes < min_scan_bytes:
@@ -2551,11 +2579,10 @@ def load_centroids_band_chunked(
         f"stream={'on' if stream_tiles else 'off'}, "
         f"k_tile={k_tile}, band_tile={band_tile}"
     )
-    # Pass the loader-cached device-resident sphere index directly to
-    # gflat_to_rmu.  It is a runtime operand shared with psi_G_store's
-    # _g_index_dev, so streaming neither retains a per-tile constant nor
-    # constructs a duplicate device buffer.
-    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
+    # Pass the same loader-cached device-resident sphere index priced above
+    # directly to gflat_to_rmu.  It is a runtime operand shared with
+    # psi_G_store's _g_index_dev, so streaming neither retains a per-tile
+    # constant nor constructs a duplicate device buffer.
     # Use the k representatives paired with this loader's full-BZ G table;
     # see the identical streamed-r door above.
     kvecs_frac_full = loader.kvecs(k="full_bz")
