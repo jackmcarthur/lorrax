@@ -156,15 +156,12 @@ def htransform_quality_lines(receipt) -> list[str]:
     """
     isometry = float(receipt["row_isometry_max"])
     cap = float(receipt["row_isometry_cap"])
-    estimate = float(receipt["on_grid_error_scale_mev"])
     shell = 100.0 * float(receipt["outer_shell_l2_fraction"])
     shell_max = 100.0 * float(receipt["outer_shell_max_over_r0"])
     wall = float(receipt["locality_wall_seconds"])
     return [
         f"Row isometry   : max |C C^H - I|={isometry:.5e} "
         f"(acceptance cap {cap:.5e})",
-        f"On-grid screen : empirical max-energy scale ~{estimate:.5e} meV "
-        "from the row-isometry residual (MoS2 calibration; not a bound)",
         f"f(H)_R locality: outer-shell ||f(H)_R||_F / total = {shell:.2f}%; "
         f"largest shell ||f(H)_R||_F / R=0 = {shell_max:.2f}%",
         "Error meaning  : the locality receipt diagnoses finite-supercell "

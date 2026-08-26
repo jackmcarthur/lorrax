@@ -128,7 +128,7 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Fine-k eigensolve: distributed -> cusolvermp" in text
     assert "Batched LA     : auto (other choices: batch_reshard) -> scan" in text
     assert "Row isometry   : max |C C^H - I|=2.00000e-07" in text
-    assert "On-grid screen : empirical max-energy scale ~1.80000e-03 meV" in text
+    assert "On-grid screen" not in text
     assert "f(H)_R locality: outer-shell ||f(H)_R||_F / total = 5.10%" in text
     assert "Fine-k error   : unavailable without an independent" in text
     assert "Energy checkpoint" not in text
