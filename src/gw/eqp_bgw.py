@@ -725,9 +725,7 @@ def assemble_eqp(
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
-	3. output-conditioned Σ_c at E_DFT when supplied (otherwise interpolate
-	   the legacy raw cube) — it is what eqp0 means — while Z and its
-	   derivative always come from the raw ω cube; when the
+	3. Σ_c at E_DFT — always, it is what eqp0 means — and, when the
 	   caller says the Σ spectrum was evaluated somewhere else
 	   (``e_eval_ev``), a SECOND interpolation and central-difference
 	   Z there, which is where eqp1 is linearized
@@ -797,32 +795,19 @@ def assemble_eqp(
 		if omega_rel_ev is None or e_dft_rel_ev is None:
 			raise ValueError(
 				"sigma_c_omega_diag_ev requires omega_rel_ev and e_dft_rel_ev")
-		# The raw omega cube remains the sole owner of Z and its derivative.
-		# The live driver may, however, have output-conditioned C(E_DFT)
-		# after interpolation (BGW degenerate-set averaging).  Keep that
-		# authoritative value when supplied; otherwise the grid interpolation
-		# is the legacy/post-hoc value.  Before this split, passing the
-		# conditioned array alongside the cube was a silent no-op.
-		sigma_c_grid_at_dft, z_factor = compute_z_factor_from_omega_grid(
+		# Re-derive σ_c at E_DFT from the full ω-grid for self-consistency
+		# with the Z-factor central difference.
+		sigma_c_at_dft, z_factor = compute_z_factor_from_omega_grid(
 			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
 			omega_rel_ev=omega_rel_ev,
 			e_dft_rel_ev=e_dft_rel_ev,
 			dE_ev=dE_ev,
 		)
-		if sigma_c_at_dft_diag_ev is None:
-			sigma_c_at_dft = sigma_c_grid_at_dft
-		else:
-			sigma_c_at_dft = np.asarray(
-				sigma_c_at_dft_diag_ev, dtype=np.complex128)
-			if sigma_c_at_dft.shape != e_dft_ev.shape:
-				raise ValueError(
-					"conditioned sigma_c_at_dft_diag_ev has shape "
-					f"{sigma_c_at_dft.shape}; expected {e_dft_ev.shape}.")
 		# THE SECOND CENTRE, and only when it is a different one.  The
 		# equality test is what keeps every one-shot run — where the Σ
 		# spectrum IS evaluated at E_DFT, so the caller passes the same
-		# numbers — on the single-centre code above.  It is an
-		# ``array_equal``, not a tolerance:
+		# numbers — on exactly the code above, hence bit-for-bit on the
+		# historical answer.  It is an ``array_equal``, not a tolerance:
 		# these arrays are either literally the same energies or a
 		# different spectrum.
 		if e_eval_rel_ev is not None and not np.array_equal(
@@ -1144,21 +1129,6 @@ def make_eqp_bgw(
 			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
 		)
 
-	# Decode the live-assembly receipt as soon as its band/window identity can
-	# be checked.  In particular, a self-consistent receipt carries C(E_DFT)
-	# in the QP-band basis, while this post-hoc assembler is DFT-basis.  That
-	# is a provenance refusal, so it must happen before touching the potentially
-	# enormous raw operator cubes needed only by an otherwise admissible path.
-	from file_io.sigma_output import read_eqp_assembly_receipt
-	_receipt = read_eqp_assembly_receipt(sigma_mnk_path)
-	if _receipt is not None and _receipt["correlation_basis"] != "dft_band":
-		raise ValueError(
-			f"{os.path.basename(sigma_mnk_path)}'s EQP receipt carries "
-			f"C(E_DFT) in {_receipt['correlation_basis']!r}, while post-hoc "
-			"make_eqp_bgw assembles DFT-basis H/X/E_DFT.  A canonical QP-to-DFT "
-			"conversion does not yet exist at this seam; refusing the known SC "
-			"mixed-basis sum instead of treating a provenance stamp as parity.")
-
 	# ── THE ω REFERENCE: the file's stamp first, midgap only as a legacy
 	#    fallback on a file that is demonstrably insulating (audit A2) ──
 	#
@@ -1340,20 +1310,14 @@ def make_eqp_bgw(
 			      f"{_eval_cov['policy']}.  Those states' sigC is an "
 			      f"endpoint value, not Sigma at their own energy.")
 
-	# ── The persisted live-assembly receipt, or the legacy raw seam ─────
-	# New sigma_mnk.h5 files keep the full H/X/C(omega) operator cubes RAW
-	# (complete off-diagonals, pre-output conditioning) and carry a receipt with
-	# the exact conditioned H/X/C(E_DFT) diagonals the live writer handed
-	# assemble_eqp.
-	# Consume that receipt as data; do NOT re-run degenerate-set averaging
-	# here, which would be a second physics owner and is impossible to do
-	# correctly for every SC basis from this file alone.
+	# ── The V_H seam's ONE extra input on this path ───────────────────
+	# ``gw.sigma_dispatch`` applies the source rule at the single point
+	# V_H enters ``SigmaResult`` — but that covers the live driver only.
+	# This CLI rebuilds eqp{0,1} straight from files, so it has to look
+	# the source up itself and hand the seam its operand.  Everything
+	# after that is :func:`assemble_eqp`, byte-for-byte the live path.
 	#
-	# A file with no receipt is deliberately legacy: its Hartree column is
-	# interpreted by the historical raw-scalar rule below.  Partial/unknown
-	# new schemas already refused inside sigma_output's one reader.
-	#
-	# The mixed legacy case is normal, not an edge case: a
+	# The mixed case is the *normal* one here, not an edge case: a
 	# ``sigma_mnk.h5`` written by an older run carries a non-zero ISDF
 	# V_H, and pointing this CLI at a regenerated ``kin_ion.h5`` is
 	# exactly how one re-derives QP energies without re-running Σ (Σ_xc
@@ -1368,57 +1332,7 @@ def make_eqp_bgw(
 	# reason.
 	_src = kin_ion_hartree_source(kin_ion_path)
 	vh_exact = None
-	hartree_already_resolved = False
-	sigma_c_at_dft_receipt = None
-	if _receipt is not None:
-		if (_receipt["band_start"], _receipt["band_stop"]) != (
-				band_start, band_stop):
-			raise ValueError(
-				f"{os.path.basename(sigma_mnk_path)}'s EQP assembly receipt "
-				f"covers [{_receipt['band_start']},{_receipt['band_stop']}) but "
-				f"the QP rotations request [{band_start},{band_stop}).")
-		expect_shape = (nk_irr, nb_window)
-		if (_receipt["hartree_diag_ev"].shape != expect_shape
-				or _receipt["sigma_x_diag_ev"].shape != expect_shape
-				or _receipt["sigma_c_at_dft_diag_ev"].shape != expect_shape):
-			raise ValueError(
-				f"{os.path.basename(sigma_mnk_path)}'s EQP assembly receipt has "
-				f"H {_receipt['hartree_diag_ev'].shape}, X "
-				f"{_receipt['sigma_x_diag_ev'].shape}, C(E_DFT) "
-				f"{_receipt['sigma_c_at_dft_diag_ev'].shape}; expected file-wedge "
-				f"shape {expect_shape}.")
-		if not np.array_equal(
-				_receipt["file_wedge_full_bz_rows"], kirr_to_kfull):
-			raise ValueError(
-				f"{os.path.basename(sigma_mnk_path)}'s EQP receipt names full-BZ "
-				f"rows {_receipt['file_wedge_full_bz_rows'].tolist()}, but "
-				f"{os.path.basename(qp_rotations_path)} requests file-wedge rows "
-				f"{kirr_to_kfull.tolist()}; refusing a shape-compatible k-row "
-				"permutation.  The raw cube's requested rows were independently "
-				"validated against its star table above.")
-		if _receipt["hartree_source"] != _src:
-			raise ValueError(
-				f"EQP receipt Hartree source {_receipt['hartree_source']!r} "
-				f"does not match {os.path.basename(kin_ion_path)} source {_src!r}; "
-				"refusing to combine an assembler-ready H from one source policy "
-				"with a different mean-field artifact.")
-		if bool(_receipt["kin_ion_has_hartree"]) != (_src == "folded"):
-			raise ValueError(
-				"EQP receipt and kin_ion disagree about whether scalar Hartree is "
-				"folded into kin_ion.")
-		hartree_diag = _receipt["hartree_diag_ev"]
-		sigma_x_diag = _receipt["sigma_x_diag_ev"]
-		sigma_c_at_dft_receipt = _receipt["sigma_c_at_dft_diag_ev"]
-		hartree_already_resolved = True
-		print(
-			f"  EQP assembly receipt: file-wedge H/X/C(E_DFT), "
-			f"bases={_receipt['hartree_exchange_basis']}/"
-			f"{_receipt['correlation_basis']}, "
-			f"policy={_receipt['degeneracy_policy']}, "
-			f"tol={_receipt['degeneracy_tol_ry']:.3e} Ry; preserving the "
-			"conditioned assembly diagonals as written; Z remains from the raw "
-			"omega cube.")
-	elif _src == "stored":
+	if _src == "stored":
 		vh_full = read_full_bz_dataset(kin_ion_path, HARTREE_DATASET)
 		if vh_full.shape[1] < band_stop:
 			raise ValueError(
@@ -1439,7 +1353,6 @@ def make_eqp_bgw(
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=np.real(hartree_diag),
 		sigma_x_diag_ev=np.real(sigma_x_diag),
-		sigma_c_at_dft_diag_ev=sigma_c_at_dft_receipt,
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
@@ -1449,7 +1362,6 @@ def make_eqp_bgw(
 		nspin=1,
 		hartree_source=_src,
 		exact_hartree_diag_ev=vh_exact,
-		hartree_already_resolved=hartree_already_resolved,
 	).write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 

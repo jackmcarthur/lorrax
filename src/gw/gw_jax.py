@@ -1025,9 +1025,6 @@ def main(argv=None):
 			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
 			sym=sym,
 			wfn=wfn,
-			degeneracy_policy=(
-				"disabled" if config.no_degen_averaging else "bgw_average"),
-			degeneracy_tol_ry=float(config.degen_avg_tol_ry),
 			write_qp_rotations=not rotations_written,
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
 			print_fn=print0,
