@@ -192,6 +192,33 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
             SLAB_KGRID, method="polygon_gl"))
 
 
+def test_polygon_photon_receipt_uses_one_area_reduction_on_cri3_geometry():
+    """The real CrI3 cell distinguishes Python and NumPy sum rounding."""
+    import vcoul
+
+    bvec = np.asarray([
+        [0.4820307462398321, -0.2783005810992434, 0.0],
+        [0.0, 0.5566011621984867, 0.0],
+        [0.0, 0.0, 0.14601087526378126],
+    ])
+    receipt = vcoul.slab_minibz_photon_cubature(
+        vcoul.get_kernel(2),
+        vcoul.CoulombGeometry(
+            bvec=bvec, cell_volume=6331.9219276452886),
+        (6, 6, 1))
+    assert vcoul.validate_slab_minibz_photon_receipt(receipt) is receipt
+
+    polygon = np.asarray(receipt.polygon_vertices)
+    crosses = [
+        float(left[0] * right[1] - left[1] * right[0])
+        for left, right in zip(polygon, np.roll(polygon, -1, axis=0))
+    ]
+    issued_order = 0.5 * float(sum(crosses))
+    old_validator_order = 0.5 * float(np.sum(np.asarray(crosses)))
+    assert issued_order != old_validator_order
+    assert receipt.polygon_area == issued_order
+
+
 def _slab_photon_receipt():
     import vcoul
 
