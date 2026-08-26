@@ -26,8 +26,14 @@ loaders and `Meta` stay on the LORRAX side of the door; the service speaks
 ## API
 
 The door is the top-level package; LORRAX imports `vcoul` public names and
-never a submodule. The surface is 30 names; the ones that carry the
+never a submodule. The surface is 42 names; the ones that carry the
 architecture are these.
+
+`gauss_legendre_interval(order, left, right)` is the standalone host owner
+for immutable float64 Gauss--Legendre rules on finite intervals.  The exact
+Wigner--Seitz photon cubature and LORRAX's MPA/VNL consumers share this one
+arithmetic implementation through the service door; `common.gauss_legendre`
+is retained only as a compatibility re-export.
 
 `CoulombGeometry` is a frozen dataclass of the four things every kernel
 needs: the Cartesian reciprocal rows with `blat` already folded in, the

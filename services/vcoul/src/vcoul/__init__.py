@@ -105,6 +105,10 @@ from vcoul.box_fft import (
 )
 from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
+from vcoul.quadrature import (
+    GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
+    gauss_legendre_interval,
+)
 from vcoul.minibz import (
     COULOMB_GAUGE_TT_SIGN,
     SlabMinibzPhotonReceipt,
@@ -145,6 +149,8 @@ __all__ = [
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
     "HeadSlotTable", "head_slot_table",
     "Bulk3D", "Slab2D", "Box0D",
+    # standalone host quadrature owner
+    "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging
     "COULOMB_GAUGE_TT_SIGN",
     "SlabMinibzPhotonReceipt",

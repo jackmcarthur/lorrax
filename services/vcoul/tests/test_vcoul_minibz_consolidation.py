@@ -52,6 +52,18 @@ ANISOTROPIC_SLAB_KGRID = (3, 5, 1)
 HEX_CELVOL = abs(8.0 * np.pi ** 3 / np.linalg.det(HEX_BVEC))
 
 
+def test_vcoul_owns_the_immutable_finite_interval_rule():
+    import vcoul
+
+    nodes, weights = vcoul.gauss_legendre_interval(4, 0.0, 1.0)
+    for degree in range(8):
+        np.testing.assert_allclose(
+            np.sum(weights * nodes**degree), 1.0 / (degree + 1),
+            rtol=2.0e-14, atol=2.0e-14)
+    assert not nodes.flags.writeable and not weights.flags.writeable
+    assert "leggauss" in vcoul.GAUSS_LEGENDRE_INTERVAL_PROVENANCE
+
+
 def _q_cart(ix, kgrid=HEX_KGRID, bvec=HEX_BVEC):
     """BGW-wrapped grid index → Cartesian q, the convention the retired
     per-q table was indexed in.  Kept so the golden rows below name the
