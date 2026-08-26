@@ -295,8 +295,10 @@ __all__ = [
     "sweep_matrix_elements",
     "sweep_uniform_gauge_matrix_elements",
     "finite_transfer_current_to_centroids",
+    "sweep_finite_transfer_contact_matrix_elements",
     "UniformGaugeMatrixElements",
     "FiniteTransferCurrentEndpoint",
+    "FiniteTransferContactMatrixElements",
     "blocks_to_host",
 ]
 
@@ -836,6 +838,33 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     basis_receipt: object = None
 
 
+class FiniteTransferContactMatrixElements(NamedTuple):
+    r"""Raw positive-energy ``q,-q`` contact on one authenticated basis.
+
+    ``lambda_raw`` is
+    ``(alpha_FS/2)<m,k|d2(T+V_NL)/dK_a dK_b|n,k>`` with shape
+    ``(nk,3,3,nb,nb)`` and band sharding
+    ``P(None,None,None,'x','y')``.  It is the exact straight-path Pauli
+    contact for the selected photon row, not a completed static response.
+
+    In particular, this transaction contains only the explicitly loaded
+    positive-energy/no-pair band space.  ``downfolded_complement`` is typed
+    as and fixed to ``None`` so a response constructor cannot mistake this
+    matrix for the omitted negative-energy/downfolded complement required by
+    :class:`gw.head_correction.StaticGaugeHeadResponse`.
+    """
+
+    lambda_raw: jax.Array
+    iq_irr: int
+    q_irr_kgrid_int: np.ndarray
+    q_crys: np.ndarray
+    hamiltonian_config_operator_fingerprint: str
+    vnl_path_operator_fingerprint: str
+    basis_receipt: object
+    vnl_contact_ward_certified: bool
+    downfolded_complement: None = None
+
+
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                            vnl_setup,
                            include_transfer_q2: bool = False) -> Operator:
@@ -980,9 +1009,123 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         key=operator_key)
 
 
+def _resolve_finite_transfer_q_identity(wfn, geom: SweepGeometry,
+                                        iq_irr: int, *, where: str):
+    """Resolve one symmetry-owned q row for all finite-transfer producers."""
+    from symmetry_maps import bgw_integer_q_to_fractional
+
+    symmetry_owner = getattr(wfn, "symmetry", None)
+    if not callable(symmetry_owner):
+        raise TypeError(
+            f"{where} requires one canonical WfnLoader with callable "
+            "symmetry()")
+    sym = symmetry_owner()
+    q_rows_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
+    q_full_rows = np.asarray(sym.q_irr_full_idx, dtype=np.int32)
+    if q_rows_int.ndim != 2 or q_rows_int.shape[1] != 3:
+        raise ValueError(
+            f"{where} requires SymMaps.q_irr_kgrid_int with shape "
+            f"(nq_irr,3); got {q_rows_int.shape}")
+    if q_full_rows.shape != (int(q_rows_int.shape[0]),):
+        raise ValueError(
+            f"{where} q-IBZ rows/full-row labels disagree: "
+            f"{q_rows_int.shape} vs {q_full_rows.shape}")
+    iq = int(iq_irr)
+    if iq < 0 or iq >= int(q_rows_int.shape[0]):
+        raise ValueError(
+            f"{where} iq_irr={iq} outside symmetry-owned q-IBZ rows "
+            f"[0,{int(q_rows_int.shape[0])})")
+    kgrid_host = np.asarray(wfn.kgrid, dtype=np.int64)
+    if kgrid_host.shape != (3,) or np.any(kgrid_host <= 0):
+        raise ValueError(
+            f"{where} requires WfnLoader.kgrid with three positive "
+            f"entries; got {kgrid_host}")
+    if np.any(q_rows_int < 0) or np.any(q_rows_int >= kgrid_host[None, :]):
+        raise ValueError(
+            f"{where} SymMaps q-IBZ integer rows must lie inside "
+            f"WfnLoader.kgrid={kgrid_host.tolist()}")
+    iq_full = int(q_full_rows[iq])
+    if iq_full < 0 or iq_full >= int(geom.nk):
+        raise ValueError(
+            f"{where} q-IBZ full-row label {iq_full} is outside "
+            f"[0,{int(geom.nk)})")
+    q_crys = bgw_integer_q_to_fractional(q_rows_int[iq], kgrid_host)
+    return sym, iq, q_rows_int, np.asarray(q_crys, dtype=np.float64), iq_full
+
+
+def finite_transfer_contact_operator(
+    geom: SweepGeometry,
+    *,
+    vnl_setup,
+    q_crys,
+    path_order: int = 12,
+    path_rtol: float = 1.0e-10,
+    path_atol: float = 1.0e-12,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+) -> Operator:
+    r"""All-P ket owner for the exact finite ``q,-q`` Pauli contact.
+
+    Kinetic and finite-path VNL actions are added before the only
+    ``alpha_FS/2`` multiplication.  A failed path Ward certificate poisons
+    the numerical action; the host gateway below refuses the resulting
+    matrix before it can be published.
+    """
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "finite-transfer contact requires the canonical four-component "
+            f"kinetic-balance WFN carrier; geom.ns={int(geom.ns)}")
+    if vnl_setup is None or int(vnl_setup.nspinor) != 2:
+        raise ValueError(
+            "finite-transfer contact requires the canonical two-component "
+            "Pauli VNLSetup")
+    if vnl_setup.Gpp_table is None:
+        raise ValueError(
+            "finite-transfer contact requires VNLSetup built with "
+            "compute_contact=True")
+
+    from common.bispinor_init import HALFALPHA
+    from psp import vnl_ops
+    from psp.dft_operators import apply_kinetic_contact_to_ket
+
+    q_value = jnp.asarray(q_crys, dtype=jnp.float64)
+    if q_value.shape != (3,):
+        raise ValueError(
+            f"finite-transfer contact q_crys must have shape (3,); got "
+            f"{q_value.shape}")
+    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+
+    def op(psi_n, gvec, gmask, bidx, kvec, q_runtime):
+        del bidx
+        psi_4 = _ket(psi_n, gmask)
+        psi_L = psi_4[:, :2, :]
+        kinetic = apply_kinetic_contact_to_ket(psi_L)
+        finite = vnl_ops.compute_icl_vnl_finite_contact_to_ket(
+            psi_L, gvec, kvec, q_runtime, vnl_setup, gmask,
+            path_order=int(path_order), path_rtol=float(path_rtol),
+            path_atol=float(path_atol),
+            projector_row_chunk=int(projector_row_chunk),
+            g_chunk=int(g_chunk))
+        total_large = halfalpha.astype(psi_4.real.dtype) * (
+            kinetic + finite.lambda_cart_ket)
+        total = _pad_spinor(total_large, int(psi_4.shape[1]))
+        total = jnp.where(
+            finite.certified, total,
+            jnp.asarray(jnp.nan + 1j * jnp.nan, dtype=total.dtype))
+        packed = total.reshape(9, *total.shape[2:])
+        return jnp.moveaxis(packed, 0, -1)[None]
+
+    return Operator(
+        apply=op, post=1.0, ncomp=9, consts=(q_value,),
+        key=("finite_transfer_contact", geom.ngkmax, geom.ns,
+             id(vnl_setup), int(path_order), float(path_rtol),
+             float(path_atol), int(projector_row_chunk), int(g_chunk)))
+
+
 def _gauge_hamiltonian_operator_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
     geom: SweepGeometry, include_transfer_q2: bool,
+    wfn_fingerprint_value: str | None = None,
 ) -> str:
     """Compose the one uniform/finite-q Hamiltonian operator identity.
 
@@ -1014,7 +1157,8 @@ def _gauge_hamiltonian_operator_fingerprint(
     digest.update(b"lorrax.uniform_gauge_operator/v1\0")
     for label, value in (
         ("wfn_scheme", WFN_FINGERPRINT_SCHEME),
-        ("wfn", wfn_fingerprint(wfn)),
+        ("wfn", (wfn_fingerprint(wfn) if wfn_fingerprint_value is None
+                 else str(wfn_fingerprint_value))),
         ("vnl", vnl_fingerprint),
         ("vnl_gauge_path", vnl_ops.ICL_STRAIGHT_GAUGE_PATH),
         ("kinetic_balance", KINETIC_BALANCE_LIFT_PROVENANCE),
@@ -1100,6 +1244,165 @@ def sweep_uniform_gauge_matrix_elements(
     )
 
 
+def sweep_finite_transfer_contact_matrix_elements(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    vnl_setup,
+    basis_receipt,
+    wfn_fingerprint_value: str,
+    iq_irr: int,
+    path_order: int = 12,
+    path_rtol: float = 1.0e-10,
+    path_atol: float = 1.0e-12,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+    use_scan: bool = True,
+    include_transfer_q2_identity: bool = True,
+) -> FiniteTransferContactMatrixElements:
+    r"""Contract the exact finite ``q,-q`` contact on all processors.
+
+    WFN/G-vector/FFT, q-row and sampled-basis identities are resolved from
+    their incumbent owners before the numerical sweep.  The returned raw
+    matrix deliberately carries no downfolded complement and cannot lift a
+    FULL/head/body refusal by itself.
+
+    ``wfn_fingerprint_value`` is the canonical token already computed by GW
+    preparation for this exact ``wfn``.  It authenticates both the supplied
+    receipt and the shared Hamiltonian fingerprint without reopening HDF5;
+    this production-facing boundary intentionally has no rescan fallback.
+    """
+    from file_io.wfn_basis import WavefunctionBasisReceipt
+    from psp import vnl_ops
+    from psp.dft_operators import padded_gvectors
+
+    start, stop = int(band_start), int(band_stop)
+    if start < 0 or stop <= start or stop > int(wfn.nbands):
+        raise ValueError(
+            "finite-transfer contact band interval must satisfy "
+            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
+    if stop - start != int(geom.nb_logical):
+        raise ValueError(
+            "finite-transfer contact band interval does not match "
+            f"SweepGeometry: [{start},{stop}) vs "
+            f"nb_logical={int(geom.nb_logical)}")
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "finite-transfer contact requires the canonical four-component "
+            f"kinetic-balance carrier; geom.ns={int(geom.ns)}")
+    if vnl_setup is None or int(vnl_setup.nspinor) != 2:
+        raise ValueError(
+            "finite-transfer contact requires the canonical two-component "
+            "Pauli VNLSetup")
+    if (bool(include_transfer_q2_identity)
+            and vnl_setup.Gppp_table is None):
+        raise ValueError(
+            "finite-transfer contact FULL-body identity requires VNLSetup "
+            "built with compute_transfer_q2=True so it exactly matches the "
+            "uniform head/current transaction")
+    mesh_shape = tuple(int(v) for v in geom.mesh.devices.shape)
+    if (tuple(geom.mesh.axis_names) != ("x", "y")
+            or len(mesh_shape) != 2 or mesh_shape[0] != mesh_shape[1]):
+        raise ValueError(
+            "finite-transfer contact requires the canonical square (x,y) "
+            f"processor mesh; got axes={tuple(geom.mesh.axis_names)}, "
+            f"shape={mesh_shape}")
+
+    required_loader_api = ("symmetry", "box_index_dev")
+    missing_loader_api = tuple(
+        name for name in required_loader_api
+        if not callable(getattr(wfn, name, None)))
+    if missing_loader_api:
+        raise TypeError(
+            "finite-transfer contact requires one canonical WfnLoader; "
+            f"missing callable API {missing_loader_api}")
+    if tuple(int(v) for v in wfn.fft_grid) != tuple(geom.fft_grid):
+        raise ValueError(
+            "finite-transfer contact SweepGeometry.fft_grid must match "
+            f"WfnLoader.fft_grid exactly; got {tuple(geom.fft_grid)} vs "
+            f"{tuple(int(v) for v in wfn.fft_grid)}")
+    if int(wfn.ngkmax) != int(geom.ngkmax):
+        raise ValueError(
+            "finite-transfer contact SweepGeometry.ngkmax must match "
+            f"WfnLoader.ngkmax exactly; got {int(geom.ngkmax)} vs "
+            f"{int(wfn.ngkmax)}")
+    if not isinstance(basis_receipt, WavefunctionBasisReceipt):
+        raise TypeError(
+            "finite-transfer contact requires the canonical immutable "
+            "WavefunctionBasisReceipt from its response orchestration; "
+            f"got {type(basis_receipt)!r}")
+    basis_receipt.assert_matches_band_source(
+        wfn=wfn, role="transverse", bispinor=True,
+        band_interval=(start, stop), fft_grid=geom.fft_grid,
+        wfn_fingerprint_value=wfn_fingerprint_value,
+        where="finite-transfer contact matrix")
+
+    # Only after provenance authentication may loader-owned arrays enter the
+    # all-P sweep.  The contact has zero net transfer, so one paired k/G table
+    # serves both faces; no q-reordered G carrier is constructed.
+    gtab = padded_gvectors(wfn, k="full_bz")
+    gvecs_host = np.ascontiguousarray(gtab.gvecs, dtype=np.int32)
+    gmask_host = np.ascontiguousarray(gtab.mask, dtype=np.float64)
+    kvecs_host = np.ascontiguousarray(gtab.kvecs, dtype=np.float64)
+    box_index = wfn.box_index_dev(k="full_bz", mesh=geom.mesh)
+    expected_g = (int(geom.nk), int(geom.ngkmax), 3)
+    if gvecs_host.shape != expected_g:
+        raise ValueError(
+            f"finite-transfer contact paired G table must be {expected_g}; "
+            f"got {gvecs_host.shape}")
+    _sym, iq, q_rows_int, q_crys, _iq_full = (
+        _resolve_finite_transfer_q_identity(
+            wfn, geom, iq_irr, where="finite-transfer contact"))
+
+    fingerprint = _gauge_hamiltonian_operator_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
+        geom=geom,
+        include_transfer_q2=bool(include_transfer_q2_identity),
+        wfn_fingerprint_value=wfn_fingerprint_value)
+    path_fingerprint = vnl_ops.icl_vnl_finite_contact_operator_fingerprint(
+        vnl_setup, path_order=int(path_order), path_rtol=float(path_rtol),
+        path_atol=float(path_atol))
+    packed = sweep_matrix_elements(
+        psi_G,
+        geom=geom,
+        operator=finite_transfer_contact_operator(
+            geom, vnl_setup=vnl_setup, q_crys=q_crys,
+            path_order=path_order, path_rtol=path_rtol,
+            path_atol=path_atol,
+            projector_row_chunk=projector_row_chunk, g_chunk=g_chunk),
+        gvecs=gvecs_host, gmask=gmask_host, box_index=box_index,
+        kvecs=kvecs_host, use_scan=use_scan)
+    # Reduce while the band matrix remains distributed; only one scalar
+    # certificate reaches the host.  Materializing ``packed`` here would
+    # violate the all-P lifetime this transaction exists to preserve.
+    certified = bool(np.asarray(jax.device_get(
+        jnp.all(jnp.isfinite(packed)))))
+    if not certified:
+        raise RuntimeError(
+            "GATE finite_transfer_contact_icl_ward_uncertified: exact "
+            f"q,-q contact failed its path Ward certificate for iq_irr={iq}; "
+            f"path_order={int(path_order)}, "
+            f"rtol={float(path_rtol):.3e}, "
+            f"atol={float(path_atol):.3e}")
+    lambda_raw = packed.reshape(
+        int(packed.shape[0]), 3, 3,
+        int(packed.shape[-2]), int(packed.shape[-1]))
+    return FiniteTransferContactMatrixElements(
+        lambda_raw=lambda_raw,
+        iq_irr=iq,
+        q_irr_kgrid_int=np.ascontiguousarray(
+            q_rows_int[iq], dtype=np.int32),
+        q_crys=np.ascontiguousarray(q_crys, dtype=np.float64),
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        vnl_path_operator_fingerprint=path_fingerprint,
+        basis_receipt=basis_receipt,
+        vnl_contact_ward_certified=True,
+        downfolded_complement=None)
+
+
 def finite_transfer_current_to_centroids(
     psi_G,
     *,
@@ -1163,7 +1466,6 @@ def finite_transfer_current_to_centroids(
     from common.wfn_transforms import gflat_to_rmu
     from psp import vnl_ops
     from psp.dft_operators import padded_gvectors
-    from symmetry_maps import bgw_integer_q_to_fractional
 
     start, stop = int(band_start), int(band_stop)
     if start < 0 or stop <= start or stop > int(wfn.nbands):
@@ -1252,7 +1554,6 @@ def finite_transfer_current_to_centroids(
             f"(nk,nb,4,ngkmax)=({int(geom.nk)},nb,4,"
             f"{int(geom.ngkmax)}); got {tuple(psi.shape)}")
     psi = pad_axis(psi, geom.p_prod, axis=1).array
-    sym = wfn.symmetry()
     gtab = padded_gvectors(wfn, k="full_bz")
     gvecs_host = np.ascontiguousarray(gtab.gvecs, dtype=np.int32)
     ngk_valid_host = np.ascontiguousarray(gtab.ngk, dtype=np.int32)
@@ -1264,42 +1565,15 @@ def finite_transfer_current_to_centroids(
         raise ValueError(
             f"finite-transfer current paired G table must be {expected_g}; "
             f"got {gvecs_host.shape}")
-    iq = int(iq_irr)
-    q_rows_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
-    q_full_rows = np.asarray(sym.q_irr_full_idx, dtype=np.int32)
-    if q_rows_int.ndim != 2 or q_rows_int.shape[1] != 3:
-        raise ValueError(
-            "finite-transfer current requires SymMaps.q_irr_kgrid_int "
-            f"with shape (nq_irr,3); got {q_rows_int.shape}")
-    if q_full_rows.shape != (int(q_rows_int.shape[0]),):
-        raise ValueError(
-            "finite-transfer current q-IBZ rows/full-row labels disagree: "
-            f"{q_rows_int.shape} vs {q_full_rows.shape}")
-    if iq < 0 or iq >= int(q_rows_int.shape[0]):
-        raise ValueError(
-            f"finite-transfer current iq_irr={iq} outside symmetry-owned "
-            f"q-IBZ rows [0,{int(q_rows_int.shape[0])})")
-    kgrid_host = np.asarray(wfn.kgrid, dtype=np.int64)
-    if kgrid_host.shape != (3,) or np.any(kgrid_host <= 0):
-        raise ValueError(
-            "finite-transfer current requires WfnLoader.kgrid with three "
-            f"positive entries; got {kgrid_host}")
-    if np.any(q_rows_int < 0) or np.any(q_rows_int >= kgrid_host[None, :]):
-        raise ValueError(
-            "finite-transfer current SymMaps q-IBZ integer rows must lie "
-            f"inside WfnLoader.kgrid={kgrid_host.tolist()}")
-    q_crys = bgw_integer_q_to_fractional(q_rows_int[iq], kgrid_host)
-    iq_full = int(q_full_rows[iq])
+    sym, iq, q_rows_int, q_crys, iq_full = (
+        _resolve_finite_transfer_q_identity(
+            wfn, geom, iq_irr, where="finite-transfer current"))
     kqfull = np.asarray(sym.kqfull_map, dtype=np.int32)
     if kqfull.shape != (int(geom.nk), int(geom.nk)):
         raise ValueError(
             "finite-transfer current requires the symmetry-owned full "
             f"k-q map with shape ({int(geom.nk)},{int(geom.nk)}); got "
             f"{kqfull.shape}")
-    if iq_full < 0 or iq_full >= int(geom.nk):
-        raise ValueError(
-            f"finite-transfer q-IBZ full-row label {iq_full} is outside "
-            f"[0,{int(geom.nk)})")
     kminq_idx = np.ascontiguousarray(
         kqfull[:, iq_full], dtype=np.int32)
     if kminq_idx.shape != (int(geom.nk),):

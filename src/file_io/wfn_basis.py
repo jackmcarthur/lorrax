@@ -41,6 +41,68 @@ def centroid_table_md5(centroid_fft_idx) -> str:
     return hashlib.md5(table.tobytes()).hexdigest()
 
 
+def _canonical_band_source_fields(
+    *, wfn, wfn_fingerprint_value: str | None, role: str, bispinor: bool,
+    band_interval, fft_grid,
+) -> dict[str, object]:
+    """Build and validate the non-centroid half of one basis receipt."""
+    from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+    from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
+
+    start, stop = (int(v) for v in band_interval)
+    if start < 0 or stop <= start:
+        raise ValueError(
+            "WavefunctionBasisReceipt.band_interval must satisfy "
+            f"0 <= start < stop; got [{start},{stop})")
+    nbands = getattr(wfn, "nbands", None)
+    if nbands is not None and stop > int(nbands):
+        raise ValueError(
+            "WavefunctionBasisReceipt band interval exceeds the source "
+            f"WFN: stop={stop}, WFN.nbands={int(nbands)}")
+    source_nspinor = int(getattr(wfn, "nspinor", 0))
+    use_bispinor = bool(bispinor)
+    if use_bispinor and source_nspinor != 2:
+        raise ValueError(
+            "WavefunctionBasisReceipt bispinor source must carry two "
+            f"Pauli spinor components; WFN.nspinor={source_nspinor}")
+    if not use_bispinor and source_nspinor <= 0:
+        raise ValueError(
+            "WavefunctionBasisReceipt source has no positive spinor "
+            f"extent; WFN.nspinor={source_nspinor}")
+    grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(3))
+    if any(v <= 0 for v in grid):
+        raise ValueError(
+            "WavefunctionBasisReceipt.fft_grid must contain three "
+            f"positive integers; got {grid!r}")
+    role_value = str(role)
+    if role_value not in ("charge", "transverse"):
+        raise ValueError(
+            "WavefunctionBasisReceipt.role must be 'charge' or "
+            f"'transverse'; got {role!r}")
+    fingerprint = (
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_value is None
+        else str(wfn_fingerprint_value))
+    if (len(fingerprint) != 64
+            or any(c not in "0123456789abcdef" for c in fingerprint)):
+        raise ValueError(
+            "WavefunctionBasisReceipt.wfn_fingerprint must be a "
+            "64-digit lowercase hexadecimal SHA-256")
+    return {
+        "role": role_value,
+        "wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
+        "wfn_fingerprint": fingerprint,
+        "band_interval": (start, stop),
+        "fft_grid": grid,
+        "source_identity": FULL_BLOCH_TRANSFORM_SCHEME,
+        "nspinor_sampled": 4 if use_bispinor else source_nspinor,
+        "bispinor_lift_provenance": (
+            KINETIC_BALANCE_LIFT_PROVENANCE if use_bispinor else None),
+    }
+
+
 @dataclass(frozen=True)
 class WavefunctionBasisReceipt:
     """Immutable identity of psi sampled at one ordered centroid table.
@@ -175,28 +237,11 @@ class WavefunctionBasisReceipt:
         restart provenance writer).  Omitting it preserves the self-contained
         constructor used by standalone producers and tests.
         """
-        from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
-        from common.parallel_transport import (
-            WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
-        from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
-
-        start, stop = (int(v) for v in band_interval)
-        nbands = getattr(wfn, "nbands", None)
-        if nbands is not None and stop > int(nbands):
-            raise ValueError(
-                "WavefunctionBasisReceipt band interval exceeds the source "
-                f"WFN: stop={stop}, WFN.nbands={int(nbands)}")
-        source_nspinor = int(getattr(wfn, "nspinor", 0))
-        use_bispinor = bool(bispinor)
-        if use_bispinor and source_nspinor != 2:
-            raise ValueError(
-                "WavefunctionBasisReceipt bispinor source must carry two "
-                f"Pauli spinor components; WFN.nspinor={source_nspinor}")
-        if not use_bispinor and source_nspinor <= 0:
-            raise ValueError(
-                "WavefunctionBasisReceipt source has no positive spinor "
-                f"extent; WFN.nspinor={source_nspinor}")
-        grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(3))
+        band_fields = _canonical_band_source_fields(
+            wfn=wfn, wfn_fingerprint_value=wfn_fingerprint_value,
+            role=role, bispinor=bispinor, band_interval=band_interval,
+            fft_grid=fft_grid)
+        grid = band_fields["fft_grid"]
         import jax
         centroids = np.ascontiguousarray(np.asarray(
             jax.device_get(centroid_fft_idx), dtype=np.int64))
@@ -215,24 +260,12 @@ class WavefunctionBasisReceipt:
             raise ValueError(
                 "WavefunctionBasisReceipt centroid indices must lie inside "
                 f"fft_grid={grid}")
-        fingerprint = (
-            wfn_fingerprint(wfn)
-            if wfn_fingerprint_value is None
-            else str(wfn_fingerprint_value))
         return cls(
-            role=str(role),
-            wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME,
-            wfn_fingerprint=fingerprint,
-            band_interval=(start, stop),
-            fft_grid=grid,
+            **band_fields,
             centroid_fingerprint_scheme=CENTROID_TABLE_FINGERPRINT_SCHEME,
             centroid_table_md5=centroid_table_md5(centroids),
             n_rmu_logical=logical,
             n_rmu_padded=int(n_rmu_padded),
-            source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
-            nspinor_sampled=4 if use_bispinor else source_nspinor,
-            bispinor_lift_provenance=(
-                KINETIC_BALANCE_LIFT_PROVENANCE if use_bispinor else None),
         )
 
     def assert_matches_source(
@@ -261,6 +294,43 @@ class WavefunctionBasisReceipt:
             raise ValueError(
                 f"{where}: supplied WavefunctionBasisReceipt disagrees "
                 f"with the canonical source in fields {differing}")
+
+    def assert_matches_band_source(
+        self,
+        *,
+        wfn,
+        role: str,
+        bispinor: bool,
+        band_interval,
+        fft_grid,
+        wfn_fingerprint_value: str | None = None,
+        where: str,
+    ) -> None:
+        """Authenticate the WFN/band/FFT half of this sampled basis.
+
+        Some operators consume the same loaded band carrier but never sample
+        it at centroids.  They must still bind to the orchestration receipt;
+        requiring a second centroid argument at such a boundary would make
+        an irrelevant table a numerical input.  This owner therefore checks
+        exactly the fields fixed before centroid sampling and deliberately
+        leaves the receipt's ordered centroid identity untouched.
+
+        ``wfn_fingerprint_value`` is the prepare-time host token for callers
+        that already authenticated this exact loaded WFN.  Supplying it
+        shares that one bounded HDF5 scan; omitting it keeps standalone
+        checks self-contained.
+        """
+        expected = _canonical_band_source_fields(
+            wfn=wfn, wfn_fingerprint_value=wfn_fingerprint_value, role=role,
+            bispinor=bispinor, band_interval=band_interval,
+            fft_grid=fft_grid)
+        differing = [
+            name for name, value in expected.items()
+            if getattr(self, name) != value]
+        if differing:
+            raise ValueError(
+                f"{where}: supplied WavefunctionBasisReceipt disagrees "
+                f"with the canonical band source in fields {differing}")
 
     def assert_same_source(
         self, other: "WavefunctionBasisReceipt", *, where: str,

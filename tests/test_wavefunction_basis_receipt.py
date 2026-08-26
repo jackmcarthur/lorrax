@@ -155,6 +155,45 @@ def test_physical_source_identity_is_layout_and_device_count_independent():
         p4.assert_same_carrier(p16, where="same-runtime carrier")
 
 
+def test_band_source_authentication_reuses_receipt_without_centroid_input():
+    receipt = _receipt(role="transverse", bispinor=True)
+    receipt.assert_matches_band_source(
+        wfn=_wfn(), role="transverse", bispinor=True,
+        band_interval=(1, 5), fft_grid=(4, 4, 4),
+        where="finite contact")
+    with pytest.raises(ValueError, match="wfn_fingerprint"):
+        receipt.assert_matches_band_source(
+            wfn=_wfn(shift=1.0e-3), role="transverse", bispinor=True,
+            band_interval=(1, 5), fft_grid=(4, 4, 4),
+            where="finite contact")
+    with pytest.raises(ValueError, match="band_interval"):
+        receipt.assert_matches_band_source(
+            wfn=_wfn(), role="transverse", bispinor=True,
+            band_interval=(0, 4), fft_grid=(4, 4, 4),
+            where="finite contact")
+    with pytest.raises(ValueError, match="0 <= start < stop"):
+        receipt.assert_matches_band_source(
+            wfn=_wfn(), role="transverse", bispinor=True,
+            band_interval=(-1, 4), fft_grid=(4, 4, 4),
+            where="finite contact")
+
+
+def test_band_source_authentication_reuses_prepared_wfn_token(monkeypatch):
+    import common.parallel_transport as transport
+
+    receipt = _receipt(role="transverse", bispinor=True)
+
+    def unexpected_rescan(_wfn_value):
+        raise AssertionError("prepared WFN fingerprint rescanned")
+
+    monkeypatch.setattr(transport, "wfn_fingerprint", unexpected_rescan)
+    receipt.assert_matches_band_source(
+        wfn=_wfn(), role="transverse", bispinor=True,
+        band_interval=(1, 5), fft_grid=(4, 4, 4),
+        wfn_fingerprint_value=receipt.wfn_fingerprint,
+        where="finite contact")
+
+
 def test_charge_and_transverse_are_distinct_even_on_the_same_points():
     charge = _receipt(role="charge")
     transverse = _receipt(role="transverse")

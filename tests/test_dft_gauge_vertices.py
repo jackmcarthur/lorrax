@@ -15,6 +15,7 @@ from common import mtxel_sweep
 from common.bispinor_init import ALPHA_FS, HALFALPHA, lift_to_4spinor
 from common.collectives import single_device_mesh
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
+from common.parallel_transport import wfn_fingerprint
 from common.wfn_transforms import gflat_to_rmu
 from file_io.wfn_basis import WavefunctionBasisReceipt
 from gw import w_isdf
@@ -886,6 +887,7 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
     monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
+    basis_wfn_fingerprint = wfn_fingerprint(wfn)
 
     endpoint = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4[None], wfn=wfn, band_start=0, band_stop=2,
@@ -944,6 +946,83 @@ def test_finite_transfer_current_endpoint_q0_prefactor_and_shared_identity(
     assert (endpoint.hamiltonian_config_operator_fingerprint
             == uniform.hamiltonian_config_operator_fingerprint)
     assert endpoint.vnl_path_operator_fingerprint.startswith('sha256:')
+
+    stale_source = SimpleNamespace(**vars(wfn))
+    stale_source.energies = np.asarray(wfn.energies) + 1.0e-3
+    stale_receipt = _basis_receipt(stale_source, geom, r_mu, 0, 2)
+    symmetry_owner = wfn.symmetry
+    wfn.symmetry = lambda: pytest.fail(
+        "stale contact receipt reached q/array construction")
+    with pytest.raises(ValueError, match="wfn_fingerprint"):
+        mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+            psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+            vnl_setup=setup, basis_receipt=stale_receipt,
+            wfn_fingerprint_value=basis_wfn_fingerprint, iq_irr=0,
+            path_order=8, projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True)
+    wfn.symmetry = symmetry_owner
+
+    import common.parallel_transport as transport
+    monkeypatch.setattr(
+        transport, "wfn_fingerprint",
+        lambda _value: pytest.fail(
+            "contact transaction rescanned prepare-authenticated WFN"))
+
+    contact = mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+        psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        vnl_setup=setup, basis_receipt=endpoint.basis_receipt,
+        wfn_fingerprint_value=basis_wfn_fingerprint, iq_irr=0,
+        path_order=8, projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+    np.testing.assert_allclose(
+        contact.lambda_raw, uniform.lambda_raw,
+        rtol=4.0e-13, atol=4.0e-13)
+    assert (contact.hamiltonian_config_operator_fingerprint
+            == endpoint.hamiltonian_config_operator_fingerprint)
+    assert contact.basis_receipt is endpoint.basis_receipt
+    assert contact.vnl_contact_ward_certified is True
+    assert contact.downfolded_complement is None
+    finite_contact = compute_icl_vnl_finite_contact_to_ket(
+        psi_L, G, k, np.zeros(3), setup, mask, path_order=8,
+        projector_row_chunk=1, g_chunk=2)
+    large_contact = HALFALPHA * (
+        np.asarray(dft_operators.apply_kinetic_contact_to_ket(psi_L))
+        + np.asarray(finite_contact.lambda_cart_ket))
+    expected_contact_ket = np.zeros(
+        (3, 3, 2, 4, G.shape[0]), dtype=np.complex128)
+    expected_contact_ket[:, :, :, :2] = large_contact
+    expected_contact = np.einsum(
+        'msG,abnsG->abmn', np.conj(np.asarray(psi_4)),
+        expected_contact_ket, optimize=True)
+    np.testing.assert_allclose(
+        contact.lambda_raw[0], expected_contact,
+        rtol=4.0e-13, atol=4.0e-13)
+    wrong_prefactor = np.einsum(
+        'msG,abnsG->abmn', np.conj(np.asarray(psi_4)),
+        expected_contact_ket / HALFALPHA, optimize=True)
+    assert not np.allclose(
+        contact.lambda_raw[0], wrong_prefactor,
+        rtol=1.0e-8, atol=1.0e-10)
+
+    accepted_contact_owner = vnl_ops.compute_icl_vnl_finite_contact_to_ket
+
+    def force_uncertified(*args, **kwargs):
+        value = accepted_contact_owner(*args, **kwargs)
+        return value._replace(certified=jnp.asarray(False))
+
+    monkeypatch.setattr(
+        vnl_ops, "compute_icl_vnl_finite_contact_to_ket",
+        force_uncertified)
+    with pytest.raises(
+            RuntimeError,
+            match="finite_transfer_contact_icl_ward_uncertified"):
+        mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+            psi_4[None], wfn=wfn, band_start=0, band_stop=2, geom=geom,
+            vnl_setup=setup, basis_receipt=endpoint.basis_receipt,
+            wfn_fingerprint_value=basis_wfn_fingerprint, iq_irr=0,
+            path_order=8, path_atol=2.0e-12,
+            projector_row_chunk=1, g_chunk=2,
+            include_transfer_q2_identity=True)
 
     # The fixed-q body row reuses the canonical face Green builder.  At one
     # k and one tau=0 node its normalization reduces to the explicit ordered
@@ -1037,6 +1116,7 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         kvecs=lambda *, k: kvecs,
         box_index_dev=lambda *, k, mesh: jnp.asarray(box_index))
     monkeypatch.setattr(dft_operators, "_as_loader", lambda value: value)
+    basis_wfn_fingerprint = wfn_fingerprint(wfn)
 
     common_kwargs = dict(
         wfn=wfn, band_start=0, band_stop=2, geom=geom,
@@ -1050,6 +1130,56 @@ def test_finite_transfer_current_endpoint_nonzero_q_uses_runtime_q_and_wrap(
         psi_4, iq_irr=1, **common_kwargs)
     endpoint_q3 = mtxel_sweep.finite_transfer_current_to_centroids(
         psi_4, iq_irr=3, **common_kwargs)
+
+    contact_setup = replace(
+        _setup(curved=True, third_derivatives=True),
+        uniform_gauge_fingerprint="sha256:" + "6" * 64)
+    psi_4_contact = lift_to_4spinor(
+        psi_L, np.broadcast_to(G, (4, 4, 3)), kvecs,
+        jnp.asarray(contact_setup.B))
+    contact_kwargs = dict(
+        wfn=wfn, band_start=0, band_stop=2, geom=geom,
+        vnl_setup=contact_setup,
+        basis_receipt=common_kwargs['basis_receipt'],
+        wfn_fingerprint_value=basis_wfn_fingerprint,
+        projector_row_chunk=1, g_chunk=2,
+        include_transfer_q2_identity=True)
+    contact_q1 = mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+        psi_4_contact, iq_irr=1, **contact_kwargs)
+    contact_q3 = mtxel_sweep.sweep_finite_transfer_contact_matrix_elements(
+        psi_4_contact, iq_irr=3, **contact_kwargs)
+    expected_contact = []
+    for ik in range(4):
+        finite_contact = compute_icl_vnl_finite_contact_to_ket(
+            psi_L[ik], G, kvecs[ik], np.asarray([0.25, 0.0, 0.0]),
+            contact_setup, mask,
+            projector_row_chunk=1, g_chunk=2)
+        assert bool(np.asarray(finite_contact.certified))
+        large_contact = HALFALPHA * (
+            np.asarray(dft_operators.apply_kinetic_contact_to_ket(
+                psi_L[ik]))
+            + np.asarray(finite_contact.lambda_cart_ket))
+        contact_ket = np.zeros(
+            (3, 3, 2, 4, 4), dtype=np.complex128)
+        contact_ket[:, :, :, :2] = large_contact
+        expected_contact.append(np.einsum(
+            'msG,abnsG->abmn',
+            np.conj(np.asarray(psi_4_contact[ik])),
+            contact_ket, optimize=True))
+    np.testing.assert_allclose(
+        contact_q1.lambda_raw, np.asarray(expected_contact),
+        rtol=8.0e-12, atol=8.0e-12)
+    np.testing.assert_allclose(
+        contact_q1.lambda_raw, contact_q3.lambda_raw,
+        rtol=8.0e-12, atol=8.0e-12)
+    assert contact_q1.iq_irr == 1
+    np.testing.assert_array_equal(contact_q1.q_irr_kgrid_int, [1, 0, 0])
+    np.testing.assert_array_equal(contact_q1.q_crys, [0.25, 0.0, 0.0])
+    assert contact_q1.hamiltonian_config_operator_fingerprint.startswith(
+        'sha256:')
+    assert (contact_q1.vnl_path_operator_fingerprint
+            == contact_q3.vnl_path_operator_fingerprint)
+    assert contact_q1.downfolded_complement is None
 
     q = np.asarray([0.25, 0.0, 0.0])
     target_rows = kqfull[:, 1]
