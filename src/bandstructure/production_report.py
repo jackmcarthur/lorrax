@@ -144,7 +144,8 @@ class HTransformProductionReport:
 
     def interpolation_space(self, *, params, wfn, meta, result,
                             enk_sigma_ry, ctilde, centroid_file: str,
-                            energy_source: str, centroids=None) -> None:
+                            energy_source: str, centroids=None,
+                            qp_state=None) -> None:
         start = int(result["band_start"])
         keep = int(result["nb_keep"])
         fit = int(result["nb_fit"])
@@ -158,6 +159,24 @@ class HTransformProductionReport:
         self.emit(f"Returned bands : {band_range(start, start + keep)}")
         self.emit(f"Fitted bands   : {band_range(start, start + fit)} "
                   f"({int(result['n_guard_bands'])} upper guard bands)")
+        windows = result.get("state_windows") or {}
+        qp_window = windows.get("qp_corrected")
+        if qp_window is not None:
+            margin = windows["corrected_margin"]
+            dft_guard = windows["dft_guard"]
+            self.emit(f"QP-corrected   : {band_range(*qp_window)}")
+            self.emit(
+                f"Corrected margin: {band_range(*margin)} "
+                f"({int(margin[1] - margin[0])} bands above publication)")
+            self.emit(
+                f"Outer DFT guard: {band_range(*dft_guard)} "
+                f"({int(dft_guard[1] - dft_guard[0])} fitted bands)")
+        if qp_state is not None:
+            self.emit(f"QP artifact    : {abs_path(qp_state.artifact_path)}")
+            self.emit(
+                "QP source WFN  : "
+                f"{qp_state.source_wfn_fingerprint_scheme}:"
+                f"{qp_state.source_wfn_fingerprint}")
         self.emit(f"Source states  : {energy_source}; "
                   f"{int(energies.size)} k-resolved band energies")
         if finite.size:
@@ -258,6 +277,26 @@ class HTransformProductionReport:
                 f"Energy range   : "
                 f"[{float(path_range[0]) * RYD_TO_EV:+.5f}, "
                 f"{float(path_range[1]) * RYD_TO_EV:+.5f}] eV relative to VBM")
+        coincident = np.asarray(
+            result.get("coincident_path_indices", ()), dtype=np.int64)
+        if coincident.size:
+            self.emit(
+                f"Coarse closure : {int(coincident.size)} exact path/coarse "
+                f"point(s); max |Delta E|="
+                f"{float(result['coincident_max_abs_ry']) * RYD_TO_EV * 1000.0:.5f} "
+                f"meV; RMS="
+                f"{float(result['coincident_rms_ry']) * RYD_TO_EV * 1000.0:.5f} meV")
+        active = result.get("active_character_gate")
+        if active is not None:
+            self.emit(
+                "Active-state gate: min character gap="
+                f"{float(active['min_score_gap']):.5e}; numerical floor="
+                f"{float(active['max_score_tolerance']):.5e}; ambiguous q="
+                f"{int(active['n_ambiguous'])}, safe degenerate="
+                f"{int(active['n_degenerate_safe'])}")
+            self.emit(
+                "QP interior    : min separation from nonreturned fitted "
+                f"state={float(active['min_returned_interior_margin_ry']) * RYD_TO_EV:.5f} eV")
 
     def timings(self, records, *, wall: float) -> None:
         def total(name: str) -> float:

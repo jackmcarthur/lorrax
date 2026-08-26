@@ -46,12 +46,25 @@ def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
     from common.units import RYD_TO_EV
 
     path = tmp_path / "bandstructure.dat"
+    from types import SimpleNamespace
     write_bands_to_file(
         str(path), np.asarray([[1.0, 2.0]]),
         np.asarray([[0.0, 0.0, 0.0]]), np.asarray([0.0]),
-        band_start=6, nb_fit=6)
+        band_start=6, nb_fit=6,
+        state_windows={
+            "returned": (6, 8), "qp_corrected": (6, 10),
+            "corrected_margin": (8, 10), "dft_guard": (10, 12),
+            "fitted": (6, 12),
+        },
+        qp_state=SimpleNamespace(
+            artifact_path=str(tmp_path / "qp_wfn_rotations.h5"),
+            source_wfn_fingerprint_scheme="lorrax-wfn-v1",
+            source_wfn_fingerprint="b" * 64))
     text = path.read_text()
     assert "absolute_band_window=[6,8)" in text
     assert "fit_bands=6 guard_bands=4" in text
+    assert "returned=[6,8) qp_corrected=[6,10)" in text
+    assert "corrected_margin=[8,10) dft_guard=[10,12)" in text
+    assert "source_wfn_fingerprint=" + "b" * 64 in text
     assert "energy_eV" in text.splitlines()[0]
     assert f"{2.0 * RYD_TO_EV: .8f}" in text

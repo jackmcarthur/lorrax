@@ -10,6 +10,13 @@ import pytest
 _DEFAULT_KPOINTS = np.asarray([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
 
 
+def test_selected_htransform_source_is_this_worktree():
+    import bandstructure.htransform as htransform
+
+    source_root = Path(__file__).resolve().parents[1]
+    assert Path(htransform.__file__).resolve().is_relative_to(source_root)
+
+
 def _source_wfn(*, energies=None):
     if energies is None:
         energies = np.linspace(-1.0, 1.0, 64, dtype=np.float64).reshape(
@@ -104,12 +111,20 @@ def test_compact_rotation_is_u_f_u_dagger_and_keeps_dft_guards(tmp_path):
     path = tmp_path / "qp_wfn_rotations.h5"
     _write_rotations(path, U, E, qp_range)
 
+    receipts = []
     C_qp_dev, enk_qp_dev, authenticated_range = resolve_qp_hamiltonian_state(
         **_state(C, enk, band_range=fit_range),
-        qp_rotations_file=str(path))
+        qp_rotations_file=str(path), receipt_fn=receipts.append)
     C_qp = np.asarray(C_qp_dev)
     enk_qp = np.asarray(enk_qp_dev)
     assert authenticated_range == qp_range
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt.artifact_path == str(path.resolve())
+    assert receipt.band_range == qp_range
+    assert receipt.kgrid == (2, 1, 1)
+    assert receipt.source_wfn_fingerprint_scheme
+    assert len(receipt.source_wfn_fingerprint) == 64
 
     # The canonical QP-WFN convention has no conjugation on U here.
     C_block = C[:, 1:4]

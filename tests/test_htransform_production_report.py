@@ -51,6 +51,22 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         "band_start": 2, "nb_keep": 4, "nb_fit": 6,
         "n_guard_bands": 2, "nk_total": 8,
         "path_range": (-0.2, 0.4),
+        "state_windows": {
+            "returned": (2, 6), "qp_corrected": (2, 7),
+            "corrected_margin": (6, 7), "dft_guard": (7, 8),
+            "fitted": (2, 8),
+        },
+        "coincident_path_indices": np.array([0, 1]),
+        "coincident_max_abs_ry": 1.0e-5,
+        "coincident_rms_ry": 2.0e-6,
+        "active_character_gate": {
+            "min_score_gap": 0.4, "max_score_tolerance": 1.0e-8,
+            "min_selected_character": 0.9,
+            "max_rejected_character": 0.1,
+            "n_ambiguous": 1, "n_degenerate_safe": 1,
+            "max_unsafe_energy_span_ry": 0.0,
+            "min_returned_interior_margin_ry": 0.02,
+        },
         "f_transform": {
             "a_ry": 0.4, "n": 3.0, "shift_ry": 0.47,
             "scale_band_local": 5, "shoulder_band_local": 5,
@@ -65,7 +81,11 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         enk_sigma_ry=np.arange(48, dtype=float).reshape(6, 8) / 100.0,
         ctilde=np.zeros((8, 6, 12)), centroid_file="centroids_frac.txt",
         energy_source="DFT eigenvalues from the WFN",
-        centroids=SimpleNamespace(n_rmu=20, source_n_rmu=20))
+        centroids=SimpleNamespace(n_rmu=20, source_n_rmu=20),
+        qp_state=SimpleNamespace(
+            artifact_path=str(tmp_path / "qp_wfn_rotations.h5"),
+            source_wfn_fingerprint_scheme="lorrax-wfn-v1",
+            source_wfn_fingerprint="a" * 64))
     spectrum = [1.0, 0.5, 0.1, 0.01]
     numerical_report = rank_criterion.rank_report(
         spectrum, 0.05, rank_used=3, rank_ceiling=4)
@@ -109,6 +129,11 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert text == "\n".join(output) + "\n"
     assert "Returned bands : 3-6" in text
     assert "Fitted bands   : 3-8 (2 upper guard bands)" in text
+    assert "QP-corrected   : 3-7" in text
+    assert "Corrected margin: 7" in text
+    assert "Outer DFT guard: 8" in text
+    assert "QP artifact    :" in text
+    assert "lorrax-wfn-v1:" + "a" * 64 in text
     assert "Centroid sites : 20 requested from the full table" in text
     assert "mesh-padded" not in text
     assert "Centroid orbit: NOT CLOSED : 1/2 spatial operations" in text
@@ -125,6 +150,9 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Zero shoulder  : max E(band 8) = 6.39468 eV" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
     assert "L01  Γ -> X: 1 intervals; 2 endpoint-inclusive points" in text
+    assert "Coarse closure : 2 exact path/coarse point(s)" in text
+    assert "Active-state gate: min character gap=4.00000e-01" in text
+    assert "QP interior    : min separation" in text
     assert "whole-state randomized QRCP" in text
     assert "no Gram eigensolve" in text
     assert "Fine-k eigensolve: distributed -> cusolvermp" in text

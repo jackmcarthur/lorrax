@@ -1,5 +1,7 @@
-import os
 import argparse
+from dataclasses import dataclass
+import os
+
 import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, fail-fast
@@ -821,10 +823,21 @@ def _apply_qp_block_to_compact_state(
     return ctilde_out, enk_out
 
 
+@dataclass(frozen=True)
+class QPStateReceipt:
+    """Authenticated identity carried from the sole QP-artifact reader."""
+
+    artifact_path: str
+    band_range: tuple[int, int]
+    kgrid: tuple[int, int, int]
+    source_wfn_fingerprint_scheme: str
+    source_wfn_fingerprint: str
+
+
 def resolve_qp_hamiltonian_state(
         *, basis, enk_sigma, sym, meta, wfn, wfn_path: str,
         qp_rotations_file: str, eqp_file: str | None = None,
-        log_fn=None):
+        log_fn=None, receipt_fn=None):
     """Overlay a matched QP block on a reusable mean-field Galerkin fit.
 
     ``basis`` remains the immutable fit artifact.  Only its compact state
@@ -865,7 +878,7 @@ def resolve_qp_hamiltonian_state(
         read_qp_rotations_artifact,
     )
     artifact = read_qp_rotations_artifact(path)
-    authenticate_qp_rotations_source_wfn(
+    source_wfn_fingerprint = authenticate_qp_rotations_source_wfn(
         artifact, wfn, artifact_path=path)
     U = np.asarray(artifact["U_mnk"])
     E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
@@ -961,6 +974,15 @@ def resolve_qp_hamiltonian_state(
         "kgrid and full-BZ k coordinates all match the selected mean-field "
         "WFN; the QP artifact carries energies/rotations only, so no "
         "bispinor WFN is loaded or constructed")
+    if receipt_fn is not None:
+        receipt_fn(QPStateReceipt(
+            artifact_path=os.path.abspath(path),
+            band_range=(q0, q1),
+            kgrid=tuple(int(v) for v in rot_grid),
+            source_wfn_fingerprint_scheme=str(
+                artifact["source_wfn_fingerprint_scheme"]),
+            source_wfn_fingerprint=str(source_wfn_fingerprint),
+        ))
     # This exact range comes from the authenticated artifact metadata above;
     # the standalone driver carries it to the active/projected output seam.
     # Do not reconstruct it later from a deck count or an array shape.
@@ -1537,6 +1559,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     coincident_exact = None
     coincident_max_abs_ry = None
     coincident_rms_ry = None
+    active_character_gate = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -1726,6 +1749,17 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
              max_unsafe_energy_span,
              min_returned_interior_margin) = map(
                  float, selection_diagnostics)
+            active_character_gate = {
+                "min_score_gap": min_score_gap,
+                "max_score_tolerance": max_score_tol,
+                "min_selected_character": min_selected_character,
+                "max_rejected_character": max_rejected_character,
+                "n_ambiguous": int(n_ambiguous),
+                "n_degenerate_safe": int(n_degenerate_safe),
+                "max_unsafe_energy_span_ry": max_unsafe_energy_span,
+                "min_returned_interior_margin_ry": (
+                    min_returned_interior_margin),
+            }
             log_fn(
                 "  [gate] active/guard character selection: "
                 f"min score gap={min_score_gap:.6e} (max numerical floor "
@@ -1912,6 +1946,19 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         "nb_fit": int(states),
         "band_start": int(band_start),
         "n_guard_bands": n_guard_bands,
+        "state_windows": {
+            "returned": (fit_start, return_stop),
+            "qp_corrected": (None if qp_corrected_band_range is None else
+                             tuple(map(int, qp_corrected_band_range))),
+            "corrected_margin": (
+                None if qp_corrected_band_range is None else
+                (return_stop, int(qp_corrected_band_range[1]))),
+            "dft_guard": (
+                None if qp_corrected_band_range is None else
+                (int(qp_corrected_band_range[1]), fit_stop)),
+            "fitted": (fit_start, fit_stop),
+        },
+        "active_character_gate": active_character_gate,
         "fermi_energy": fermi_energy,
         "energies_on_path": energies_on_path,
         "energies_sorted": energies_sorted,
@@ -1986,7 +2033,8 @@ def plot_bands(result):
 
 
 def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
-                        *, band_start: int = 0, nb_fit: int | None = None):
+                        *, band_start: int = 0, nb_fit: int | None = None,
+                        state_windows=None, qp_state: QPStateReceipt | None = None):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
     # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
@@ -2002,6 +2050,23 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
                 f"{int(band_start) + energies.shape[1]}) "
                 f"fit_bands={int(nb_fit)} "
                 f"guard_bands={int(nb_fit) - energies.shape[1]}\n")
+        if state_windows is not None:
+            def _window(name):
+                value = state_windows.get(name)
+                return "none" if value is None else f"[{value[0]},{value[1]})"
+            fh.write(
+                "# state_windows "
+                f"returned={_window('returned')} "
+                f"qp_corrected={_window('qp_corrected')} "
+                f"corrected_margin={_window('corrected_margin')} "
+                f"dft_guard={_window('dft_guard')} "
+                f"fitted={_window('fitted')}\n")
+        if qp_state is not None:
+            fh.write(
+                "# qp_state_artifact=" + qp_state.artifact_path + " "
+                f"source_wfn_fingerprint_scheme="
+                f"{qp_state.source_wfn_fingerprint_scheme} "
+                f"source_wfn_fingerprint={qp_state.source_wfn_fingerprint}\n")
         for ik in range(energies.shape[0]):
             for ib in range(energies.shape[1]):
                 kx, ky, kz = kpoints[ik]
@@ -2197,13 +2262,20 @@ def main(argv=None):
     _setup_progress.finish()
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     qp_corrected_band_range = None
+    _qp_state_records = []
     if _qp_rotations_path is not None:
         (ctilde, enk_sigma,
          qp_corrected_band_range) = resolve_qp_hamiltonian_state(
             basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta,
             wfn=wfn,
             wfn_path=_wfn_path, qp_rotations_file=_qp_rotations_path,
-            eqp_file=args.eqp_file, log_fn=log)
+            eqp_file=args.eqp_file, log_fn=log,
+            receipt_fn=_qp_state_records.append)
+        if len(_qp_state_records) != 1:
+            raise RuntimeError(
+                "htransform QP resolver did not return exactly one "
+                f"authenticated state receipt; got {len(_qp_state_records)}")
+    qp_state_receipt = (_qp_state_records[0] if _qp_state_records else None)
     # ── Galerkin-input gate ───────────────────────────────────────────
     # ``ctilde`` is the compact Galerkin coefficient table and ``enk_sigma``
     # is the band energies the whole
@@ -2263,7 +2335,7 @@ def main(argv=None):
         params=params, wfn=wfn, meta=meta, result=result,
         enk_sigma_ry=enk_sigma, ctilde=ctilde,
         centroid_file=_centroid_path, energy_source=_energy_source,
-        centroids=_centroid_records[0])
+        centroids=_centroid_records[0], qp_state=qp_state_receipt)
     report.spectral_compression(_rank_records[0])
     if len(_quality_records) != 1:
         raise RuntimeError(
@@ -2343,6 +2415,8 @@ def main(argv=None):
             kpath_data[1],
             band_start=result["band_start"],
             nb_fit=result["nb_fit"],
+            state_windows=result["state_windows"],
+            qp_state=qp_state_receipt,
         )
     _write_progress.step()
     _write_progress.finish()
@@ -2419,6 +2493,14 @@ def main(argv=None):
         _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file) else
                      os.path.join(input_dir, args.eqp_file))
         _file_rows.append(("QP energies", "read", _eqp_path))
+    if _qp_rotations_path is not None:
+        _file_rows.append(("QP Hamiltonian U/E", "read", _qp_rotations_path))
+    if args.basis_input:
+        _file_rows.append(
+            ("Galerkin basis", "read", _output_path(args.basis_input)))
+    if args.basis_output:
+        _file_rows.append(
+            ("Galerkin basis", "written", _output_path(args.basis_output)))
     _file_rows.extend([
         ("interpolated bands",
          "written" if os.path.exists(output_path) else "absent", output_path),
