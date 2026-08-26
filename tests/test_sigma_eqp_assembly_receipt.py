@@ -51,6 +51,31 @@ def _append(path, h, x, c=None, *, source="stored", c_basis="dft_band"):
     return read_eqp_assembly_receipt(path)
 
 
+def test_receipt_h5py_opens_route_through_the_existing_owner(
+    tmp_path, monkeypatch,
+):
+    """Both new HDF5 opens declare themselves at the incumbent owner door."""
+    from file_io import hdf5_owner
+
+    seen = []
+    incumbent = hdf5_owner.open_scope
+
+    def _record(path, stack, mode, *, where):
+        seen.append((stack, mode, where))
+        return incumbent(path, stack, mode, where=where)
+
+    monkeypatch.setattr(hdf5_owner, "open_scope", _record)
+    path = _sigma_file(tmp_path / "sigma_mnk.h5")
+    _append(path, [[11.0, 11.0]], [[-3.0, -3.0]])
+
+    assert seen == [
+        (hdf5_owner.STACK_H5PY, "a",
+         "file_io.sigma_output.append_eqp_assembly_receipt_h5"),
+        (hdf5_owner.STACK_H5PY, "r",
+         "file_io.sigma_output.read_eqp_assembly_receipt"),
+    ]
+
+
 def test_legacy_raw_scalar_and_two_resolved_receipts_are_distinct(tmp_path):
     path = _sigma_file(tmp_path / "sigma_mnk.h5")
     assert read_eqp_assembly_receipt(path) is None

@@ -1492,7 +1492,11 @@ def append_eqp_assembly_receipt_h5(
 			f"{EQP_ASSEMBLY_C_BASES}.")
 
 	values = np.stack((h, x, c), axis=0)
-	with h5py.File(abs_path, "a") as h5:
+	from .hdf5_owner import STACK_H5PY, open_scope
+	with open_scope(
+		abs_path, STACK_H5PY, "a",
+		where="file_io.sigma_output.append_eqp_assembly_receipt_h5",
+	), h5py.File(abs_path, "a") as h5:
 		if not any(name in h5 for name in SIGMA_CUBE_DATASETS):
 			raise ValueError(
 				f"{os.path.basename(abs_path)} contains none of "
@@ -1559,11 +1563,15 @@ def read_eqp_assembly_receipt(filepath):
 	unknown/partial canonical schema refuses rather than falling back to raw.
 	"""
 	abs_path = os.path.abspath(filepath)
+	from .hdf5_owner import STACK_H5PY, open_scope
 
 	def _text(value):
 		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
-	with h5py.File(abs_path, "r") as h5:
+	with open_scope(
+		abs_path, STACK_H5PY, "r",
+		where="file_io.sigma_output.read_eqp_assembly_receipt",
+	), h5py.File(abs_path, "r") as h5:
 		expected = _read_eqp_assembly_expectation(h5)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
 		candidate_present = EQP_ASSEMBLY_CANDIDATE_DATASET in h5
