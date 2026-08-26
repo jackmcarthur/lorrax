@@ -1079,22 +1079,23 @@ def _static_slab_photon_head_moment_chunk(
     singular_values = jnp.linalg.svd(lhs, compute_uv=False)
     sigma_min = singular_values[:, -1]
     # Frobenius throughout: the backward error above and this kappa use the
-    # same submultiplicative norm, so kappa*eta is a real forward-error bound
-    # rather than a mix of independently convenient diagnostics.
+    # same submultiplicative norm.  Their product theta is the conditioned
+    # backward error entering the rigorous 2*theta/(1-theta) forward bound;
+    # theta itself is not that bound.
     inverse_lhs_norm = jnp.linalg.norm(
         1.0 / jnp.maximum(
             singular_values, jnp.asarray(1.0e-300, dtype=jnp.float64)),
         axis=-1)
     condition = lhs_norm * inverse_lhs_norm
-    conditioned_error = condition * jnp.maximum(
+    conditioned_backward = condition * jnp.maximum(
         backward, jnp.asarray(np.finfo(np.float64).eps, dtype=jnp.float64))
     max_backward = jnp.max(jnp.where(valid, backward, 0.0))
     min_sigma = jnp.min(jnp.where(valid, sigma_min, jnp.inf))
     max_condition = jnp.max(jnp.where(valid, condition, 0.0))
-    max_conditioned_error = jnp.max(
-        jnp.where(valid, conditioned_error, 0.0))
+    max_conditioned_backward = jnp.max(
+        jnp.where(valid, conditioned_backward, 0.0))
     return (moments, D_sum, valid_count, max_backward, min_sigma,
-            max_condition, max_conditioned_error)
+            max_condition, max_conditioned_backward)
 
 
 def static_slab_photon_head_moment_chunk(
@@ -1167,7 +1168,7 @@ class StaticSlabPhotonHeadCompletion:
     max_backward_residual: float
     min_dyson_singular_value: float
     max_dyson_condition_number: float
-    max_dyson_conditioned_error_bound: float
+    max_dyson_forward_error_bound: float
     mixed_scale_qstar: float
     mixed_convergence_error_ratios: tuple[float, float]
     ward_residual: float
@@ -1180,6 +1181,96 @@ _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL = 1.0e-8
 _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL = 1.0e-12
 
 
+def _finite_static_photon_values(values, *, gate: str, label: str):
+    """Return one finite nonempty float64 vector before any host reduction."""
+    array = np.asarray(values, dtype=np.float64)
+    if (array.ndim != 1 or array.size == 0
+            or not np.all(np.isfinite(array))):
+        raise ValueError(
+            f"GATE {gate}: {label} contains non-finite or empty diagnostics")
+    return array
+
+
+def _static_photon_mixed_error_ratio(previous_blocks, current_blocks) -> float:
+    """Return one finite mixed-error maximum without Python NaN swallowing."""
+    if len(previous_blocks) != len(current_blocks) or not previous_blocks:
+        raise ValueError(
+            "GATE static_photon_polygon_nonfinite: cubature comparison "
+            "requires equal nonempty block lists")
+    ratios = []
+    for block_index, (previous, current) in enumerate(
+            zip(previous_blocks, current_blocks)):
+        delta = float(np.linalg.norm(current - previous))
+        norms = _finite_static_photon_values(
+            (delta, float(np.linalg.norm(previous)),
+             float(np.linalg.norm(current))),
+            gate="static_photon_polygon_nonfinite",
+            label=f"cubature block {block_index} norms")
+        scale = float(np.max(norms[1:]))
+        limit = (
+            _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL
+            + _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL * scale)
+        ratio = delta / limit
+        ratios.append(ratio)
+    ratio_array = _finite_static_photon_values(
+        ratios, gate="static_photon_polygon_nonfinite",
+        label="cubature mixed-error ratios")
+    return float(np.max(ratio_array))
+
+
+def _reduce_static_photon_order_diagnostics(
+    residuals,
+    min_sigmas,
+    max_conditions,
+    conditioned_backward_errors,
+) -> tuple[float, float, float, float]:
+    """Check every order diagnostic finite, then reduce with NumPy."""
+    vectors = tuple(
+        _finite_static_photon_values(
+            values, gate="static_photon_dyson_nonfinite", label=label)
+        for values, label in (
+            (residuals, "per-order backward errors"),
+            (min_sigmas, "per-order minimum singular values"),
+            (max_conditions, "per-order condition numbers"),
+            (conditioned_backward_errors,
+             "per-order conditioned backward errors"),
+        )
+    )
+    if any(vector.shape != vectors[0].shape for vector in vectors[1:]):
+        raise ValueError(
+            "GATE static_photon_dyson_nonfinite: per-order diagnostic "
+            "vectors have inconsistent lengths")
+    return (
+        float(np.max(vectors[0])),
+        float(np.min(vectors[1])),
+        float(np.max(vectors[2])),
+        float(np.max(vectors[3])),
+    )
+
+
+def _static_photon_dyson_forward_error_bound(
+    max_conditioned_backward: float,
+) -> float:
+    r"""Return ``2 theta/(1-theta)`` for finite ``0 <= theta < 1``."""
+    theta = float(max_conditioned_backward)
+    if not np.isfinite(theta) or theta < 0.0:
+        raise ValueError(
+            "GATE static_photon_dyson_nonfinite: conditioned backward "
+            f"error theta is invalid ({theta!r})")
+    if theta >= 1.0:
+        raise ValueError(
+            "GATE static_photon_dyson_forward_bound_denominator: the rigorous "
+            "forward-error inequality requires theta < 1, where "
+            "theta=kappa_F*max(backward_error,eps); "
+            f"got theta={theta:.6e}")
+    bound = float(2.0 * theta / (1.0 - theta))
+    if not np.isfinite(bound):
+        raise ValueError(
+            "GATE static_photon_dyson_nonfinite: transformed forward-error "
+            f"bound is non-finite ({bound!r})")
+    return bound
+
+
 def _require_static_photon_numerical_certificate(
     D_mean,
     moments_mean,
@@ -1187,25 +1278,30 @@ def _require_static_photon_numerical_certificate(
     max_backward: float,
     min_sigma: float,
     max_condition: float,
-    max_conditioned_error: float,
+    max_conditioned_backward: float,
     mixed_error_ratios,
-) -> None:
+) -> float:
     """Refuse an unconditioned solve or non-finite cubature convergence."""
     diagnostics = (
-        max_backward, min_sigma, max_condition, max_conditioned_error)
+        max_backward, min_sigma, max_condition, max_conditioned_backward)
     if (not np.all(np.isfinite(D_mean))
             or not np.all(np.isfinite(moments_mean))
             or not np.all(np.isfinite(diagnostics))
             or min_sigma <= 0.0):
-        raise ValueError("coupled photon mini-BZ average is non-finite")
-    if max_conditioned_error > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
+        raise ValueError(
+            "GATE static_photon_dyson_nonfinite: coupled photon mini-BZ "
+            "average or solve diagnostic is non-finite")
+    max_forward_error_bound = _static_photon_dyson_forward_error_bound(
+        max_conditioned_backward)
+    if max_forward_error_bound > _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:
         raise ValueError(
             "GATE static_photon_dyson_conditioning: the observed 4x4 "
-            "Dyson solve cannot keep its condition-amplified numerical "
-            "error inside the budget: "
-            "kappa*max(backward_error,eps)="
-            f"{max_conditioned_error:.3e} > "
+            "Dyson solve cannot keep its rigorous forward-error bound "
+            "inside the budget: 2*theta/(1-theta)="
+            f"{max_forward_error_bound:.3e} > "
             f"{_STATIC_PHOTON_DYSON_NUMERICAL_BUDGET:.1e}, "
+            "theta=kappa_F*max(backward_error,eps)="
+            f"{max_conditioned_backward:.3e}, "
             f"backward_error={max_backward:.3e}, "
             f"min_sigma={min_sigma:.3e}, kappa={max_condition:.3e}")
     convergence = np.asarray(mixed_error_ratios, dtype=np.float64)
@@ -1221,6 +1317,7 @@ def _require_static_photon_numerical_certificate(
             f"error_ratio={convergence[-1]:.3e} > 1.  The provider ladder "
             "is fixed; refusing insertion rather than accepting a caller "
             "dial.")
+    return max_forward_error_bound
 
 
 def complete_static_slab_photon_q0(
@@ -1302,7 +1399,7 @@ def complete_static_slab_photon_q0(
     residuals = []
     min_sigmas = []
     max_conditions = []
-    conditioned_errors = []
+    conditioned_backward_errors = []
     observed_physical = []
     observed_padded = []
     for chunk in cubature_receipt.chunks:
@@ -1311,14 +1408,14 @@ def complete_static_slab_photon_q0(
         n_valid = int(chunk.physical_count)
         (moments, bare_sum, returned_count, backward, chunk_sigma_min,
          chunk_condition_max,
-         chunk_conditioned_error) = static_slab_photon_head_moment_chunk(
+         chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
             q_host, chunk.D_raw, response.sigma_H, S_effective,
             n_valid, weight)
         (moment_host, D_host, count_host, residual_host, sigma_host,
-         condition_host, conditioned_error_host) = jax.device_get((
+         condition_host, conditioned_backward_host) = jax.device_get((
              moments, bare_sum, returned_count, backward,
              chunk_sigma_min, chunk_condition_max,
-             chunk_conditioned_error))
+             chunk_conditioned_backward))
         returned = int(np.asarray(count_host))
         if returned != n_valid:
             raise RuntimeError(
@@ -1334,8 +1431,8 @@ def complete_static_slab_photon_q0(
         residuals.append(float(np.asarray(residual_host)))
         min_sigmas.append(float(np.asarray(sigma_host)))
         max_conditions.append(float(np.asarray(condition_host)))
-        conditioned_errors.append(
-            float(np.asarray(conditioned_error_host)))
+        conditioned_backward_errors.append(
+            float(np.asarray(conditioned_backward_host)))
         observed_physical.append(returned)
         observed_padded.append(int(q_host.shape[0]))
 
@@ -1369,30 +1466,22 @@ def complete_static_slab_photon_q0(
             for v in range(3):
                 previous_blocks.append(previous_scaled[u, v])
                 current_blocks.append(current_scaled[u, v])
-        ratios = []
-        for previous, current in zip(previous_blocks, current_blocks):
-            delta = float(np.linalg.norm(current - previous))
-            scale = max(float(np.linalg.norm(previous)),
-                        float(np.linalg.norm(current)))
-            limit = (
-                _STATIC_PHOTON_POLYGON_CONVERGENCE_ATOL
-                + _STATIC_PHOTON_POLYGON_CONVERGENCE_RTOL * scale)
-            ratios.append(delta / limit)
-        return max(ratios)
+        return _static_photon_mixed_error_ratio(
+            previous_blocks, current_blocks)
 
     mixed_error_ratios = tuple(
         _mixed_error_ratio(index)
         for index in range(1, len(per_order_D)))
-    max_residual = float(max(residuals))
-    min_sigma = float(min(min_sigmas))
-    max_condition = float(max(max_conditions))
-    max_conditioned_error = float(max(conditioned_errors))
-    _require_static_photon_numerical_certificate(
+    (max_residual, min_sigma, max_condition,
+     max_conditioned_backward) = _reduce_static_photon_order_diagnostics(
+         residuals, min_sigmas, max_conditions,
+         conditioned_backward_errors)
+    max_forward_error_bound = _require_static_photon_numerical_certificate(
         D_mean, moments_mean,
         max_backward=max_residual,
         min_sigma=min_sigma,
         max_condition=max_condition,
-        max_conditioned_error=max_conditioned_error,
+        max_conditioned_backward=max_conditioned_backward,
         mixed_error_ratios=mixed_error_ratios)
 
     dtype = V_packed.dtype
@@ -1439,7 +1528,7 @@ def complete_static_slab_photon_q0(
         max_backward_residual=max_residual,
         min_dyson_singular_value=min_sigma,
         max_dyson_condition_number=max_condition,
-        max_dyson_conditioned_error_bound=max_conditioned_error,
+        max_dyson_forward_error_bound=max_forward_error_bound,
         mixed_scale_qstar=qstar,
         mixed_convergence_error_ratios=mixed_error_ratios,
         ward_residual=max(float(response.ward_residual), effective_ward),
