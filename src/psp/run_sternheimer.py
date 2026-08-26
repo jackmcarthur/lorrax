@@ -91,7 +91,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1108,7 +1107,7 @@ def run_sternheimer(
     # ── Load WFN + SymMaps + Meta ──────────────────────────────────────
     t_setup = time.perf_counter()
     wfn = WfnLoader(wfn_path)
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
     nspinor = int(wfn.nspinor)
 
     # Occupied count per k (insulator).  wfn.nelec is ifmax — total occupied

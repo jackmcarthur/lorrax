@@ -26,6 +26,7 @@ from jax.scipy import linalg as jsp_linalg
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.gpu_utils import bfc_fragmentation_target_utilization
+from common.collectives import device_put_process_local
 from common.psi_G_store import build_psi_G_store
 from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
 from common.shard_map import shard_map
@@ -845,10 +846,9 @@ def fit_galerkin_basis(
         log_fn(
             f"  [qrcp] sketch column norm min/max before normalization="
             f"{float(sketch_norm_min):.6e}/{float(sketch_norm_max):.6e}")
-        sketch_gram_row = jax.device_put(sketch_gram, row)
+        sketch_gram_row = device_put_process_local(sketch_gram, row)
         del sketch_gram
 
-        from common.collectives import device_put_process_local
         active_np = np.zeros(candidate_carrier, dtype=bool)
         active_np[:n_candidates] = True
         active = device_put_process_local(

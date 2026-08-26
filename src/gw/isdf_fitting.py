@@ -432,7 +432,7 @@ def fit_zeta_to_h5(
             print_fn(f"  X-forms: never built (low_mem_bands: STEP 6 reads "
                      f"psi_mun_fresh directly, one band-chunk at a time; "
                      f"CCT reads the face carrier, STEP 2 below)")
-            if env_bool("LORRAX_MEM_DEBUG", False) and jax.process_index() == 0:
+            if debug_print_enabled() and jax.process_index() == 0:
                 # PER-RANK BYTES, not global shape (KNOWN_LORRAX_ISSUES.md's
                 # mem_probe row: two arrays with the same GLOBAL shape print
                 # the identical figure whether one is genuinely 2-D sharded

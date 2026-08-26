@@ -171,6 +171,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from common.shard_map import shard_map
 
 
@@ -343,9 +344,9 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
     fresh zeta fit or a restart load -- the restart loader's ψ contract is
     not at fault; the fresh path only avoids it because the ISDF zeta fit
     upstream OOMs first at production scale, on a different binder, so it
-    never reaches this call.  ``jax.device_put`` here places ``v`` on the
-    mesh directly from its single source device, before it ever reaches a
-    kernel, so no jit call in this module dispatches a foreign sharding.
+    never reaches this call.  The canonical process-local placement helper
+    puts ``v`` on the mesh before it reaches a kernel, so no jit call in this
+    module dispatches a foreign sharding or invents a second placement path.
     """
     nb = int(v.shape[-1])
     alignment = lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
@@ -356,7 +357,8 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
         e = jnp.pad(e, ((0, 0), (0, pad)))
         f = jnp.pad(f, ((0, 0), (0, pad)))
         surface = jnp.pad(surface, ((0, 0), (0, pad)))
-    v = jax.device_put(v, NamedSharding(mesh, P(None, None, "x", "y")))
+    v = device_put_process_local(
+        v, NamedSharding(mesh, P(None, None, "x", "y")))
     return v, e, f, surface
 
 
@@ -1723,7 +1725,8 @@ def _head_wing_kernel_face(
     input (a full band-replicated copy) to reproduce, so it CANNOT recur
     here even in principle: this kernel never holds anything psi-shaped
     that is band-replicated, and every operand it builds is explicitly
-    ``jax.device_put`` onto its declared ``NamedSharding`` before use (see
+    the canonical process-local placement helper onto its declared
+    ``NamedSharding`` before use (see
     ``_pad_head_band_manifold_to`` below) — the exact discipline whose
     absence caused that legacy defect.  The residency bound below is
     therefore independent of, not a fix for, that open legacy row.
@@ -1959,10 +1962,11 @@ def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
     needed here.
 
     Also applies the fix registered in ``KNOWN_LORRAX_ISSUES.md`` (the
-    v-sharding-commit defect on the legacy path): every returned array is
-    explicitly ``jax.device_put`` onto its declared mesh sharding before
-    any kernel sees it, so a foreign ``SingleDeviceSharding`` operand
-    never reaches this kernel's ``shard_map``.
+    v-sharding-commit defect on the legacy path): every returned array goes
+    through the canonical process-local placement helper onto its declared
+    mesh sharding before any kernel sees it, so a foreign
+    ``SingleDeviceSharding`` operand never reaches this kernel's
+    ``shard_map``.
     """
     nb = int(v.shape[-1])
     if width < nb:
@@ -1975,10 +1979,12 @@ def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
         e = jnp.pad(e, ((0, 0), (0, pad)))
         f = jnp.pad(f, ((0, 0), (0, pad)))
         surface = jnp.pad(surface, ((0, 0), (0, pad)))
-    v = jax.device_put(v, NamedSharding(mesh, P(None, None, "x", "y")))
-    e = jax.device_put(e, NamedSharding(mesh, P(None, None)))
-    f = jax.device_put(f, NamedSharding(mesh, P(None, None)))
-    surface = jax.device_put(surface, NamedSharding(mesh, P(None, None)))
+    v = device_put_process_local(
+        v, NamedSharding(mesh, P(None, None, "x", "y")))
+    e = device_put_process_local(e, NamedSharding(mesh, P(None, None)))
+    f = device_put_process_local(f, NamedSharding(mesh, P(None, None)))
+    surface = device_put_process_local(
+        surface, NamedSharding(mesh, P(None, None)))
     return v, e, f, surface
 
 
@@ -2361,7 +2367,7 @@ def _static_head_wings_sharded_face(
     if width < nb_full:
         surface = jnp.pad(surface, ((0, 0), (0, nb_full - width)))
     logical = jnp.arange(nb_full)[None, :] < int(nb_logical)
-    weight = jax.device_put(
+    weight = device_put_process_local(
         jnp.where(logical, surface, 0.0),
         NamedSharding(mesh, P(None, None)))
     prefactor = -2.0 / (
@@ -3386,7 +3392,7 @@ def _static_gauge_hall_transaction_from_artifact(
     mesh: Mesh,
 ) -> StaticGaugeHallTransaction:
     """Place a loader-validated Hall vector on the run mesh."""
-    sigma = jax.device_put(
+    sigma = device_put_process_local(
         np.asarray(sigma_H, dtype=np.float64),
         NamedSharding(mesh, P()))
     return StaticGaugeHallTransaction(

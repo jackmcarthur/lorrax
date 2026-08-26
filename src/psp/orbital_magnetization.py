@@ -70,7 +70,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
 
 RY2EV = 13.605693122994
 MU_B_PREFACTOR = 0.5  # |m_e/hbar^2| in Ry-a0^2 units (magnitude; sign handled below)
@@ -498,7 +497,7 @@ def main(argv=None):
     wfn_path = Path(args.wfn).resolve()
     print(f"\n[orbmag] WFN: {wfn_path}")
     wfn = WfnLoader(str(wfn_path))
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
 
     nspinor = int(wfn.nspinor)
     if nspinor != 2:

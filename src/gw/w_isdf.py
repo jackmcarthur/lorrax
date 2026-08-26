@@ -67,6 +67,7 @@ import numpy as np
 
 from common import Meta, jax_profile
 from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
+from common.collectives import device_put_process_local
 from common.jax_compile_cache import ensure_jax_compile_cache
 from runtime.padding import round_up, solve_at_logical
 from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
@@ -2243,7 +2244,7 @@ def compute_static_photon_response(
             tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
         y_sharding = NamedSharding(mesh_xy, P(None, "y"))
         g0_Y = pack_photon_channel_vectors(
-            tuple(jax.device_put(vector, y_sharding)
+            tuple(device_put_process_local(vector, y_sharding)
                   for vector in photon_g0_vectors),
             layout, mesh_xy, axis_name="y")[0]
         geometry = CoulombGeometry.from_wfn(wfn)

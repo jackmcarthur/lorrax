@@ -780,9 +780,8 @@ def _symmetry_tables(input_file: str):
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
-    from symmetry_maps import SymMaps
     from .bse_io import _parse_wfn_path
-    return SymMaps(WfnLoader(_parse_wfn_path(input_file)))
+    return WfnLoader(_parse_wfn_path(input_file)).symmetry()
 
 
 def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
