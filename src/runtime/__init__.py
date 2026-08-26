@@ -395,8 +395,18 @@ def install_failfast_excepthook() -> None:
             f"the job's exit code.  Peer ranks are blocked in a "
             f"collective this rank will never join; srun will now kill "
             f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
-        from .production_stream import emergency_stdout
-        for stream in (emergency_stdout(), sys.stderr):
+        # Production drivers intentionally route ordinary ``sys.stdout`` to
+        # /dev/null.  Ask that runtime boundary for the original launcher
+        # stream so the redundant stdout copy remains real; this is lazy to
+        # preserve runtime's no-JAX, import-order-safe bootstrap contract.
+        try:
+            from .production_stream import failure_output_streams
+            streams = failure_output_streams()
+        except (ImportError, AttributeError):
+            # A fatal path must not lose its diagnostic because importing the
+            # optional stream helper itself failed.
+            streams = (sys.stdout, sys.stderr)
+        for stream in streams:
             try:
                 stream.write(text)
                 stream.flush()

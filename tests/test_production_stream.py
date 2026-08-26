@@ -1,9 +1,12 @@
 """The production driver owns stdout even when a component calls print."""
 
-import warnings
+import os
 import sys
+import warnings
 
-from runtime.production_stream import ProductionStdout, emergency_stdout
+import pytest
+
+from runtime.production_stream import ProductionStdout
 
 
 def test_production_discards_incidental_stdout_but_emits_report(capsys):
@@ -73,12 +76,50 @@ def test_production_hides_jax_donation_hint(capsys):
     assert retained == []
 
 
-def test_failfast_stdout_bypasses_the_production_sink(capsys):
+def test_failfast_survives_production_stdout_redirection(monkeypatch, capsys):
+    """The fatal traceback reaches launcher stdout while normal prints do not.
+
+    This is the exact ordering in ``gw_jax``: fail-fast is installed during
+    bootstrap, then :class:`ProductionStdout` redirects ``sys.stdout``.  Run
+    51's missing-restart leg exited every rank nonzero yet retained no Python
+    exception because stderr vanished under srun and the redundant stdout
+    copy went to ``/dev/null``.
+    """
+    import runtime
+
+    class _ExitCalled(Exception):
+        pass
+
+    previous_hook = sys.excepthook
+    had_sentinel = getattr(sys, "_lorrax_failfast_installed", False)
     stream = ProductionStdout(debug=False, rank=0)
     stream.install()
-    assert emergency_stdout() is not sys.stdout
-    emergency_stdout().write("fatal refusal survives\n")
-    emergency_stdout().flush()
-    stream.close()
+    monkeypatch.setattr(runtime, "_resolve_proc_count", lambda: 4)
+    monkeypatch.setattr(runtime, "_resolve_proc_id", lambda: 2)
+    monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(
+        _ExitCalled(code)))
+    if had_sentinel:
+        del sys._lorrax_failfast_installed
+    try:
+        runtime.install_failfast_excepthook()
+        try:
+            raise RuntimeError("restart tensor is missing")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        with pytest.raises(_ExitCalled, match="1"):
+            sys.excepthook(*exc_info)
+        print("ordinary component chatter")
+    finally:
+        sys.excepthook = previous_hook
+        if had_sentinel:
+            sys._lorrax_failfast_installed = True
+        elif hasattr(sys, "_lorrax_failfast_installed"):
+            del sys._lorrax_failfast_installed
+        stream.close()
 
-    assert capsys.readouterr().out == "fatal refusal survives\n"
+    captured = capsys.readouterr()
+    assert "RuntimeError: restart tensor is missing" in captured.out
+    assert "LORRAX FAIL-FAST: rank 2/4" in captured.out
+    assert "ordinary component chatter" not in captured.out
+    # Keep stderr redundancy too; either capture may disappear at launch.
+    assert "LORRAX FAIL-FAST: rank 2/4" in captured.err

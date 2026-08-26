@@ -128,20 +128,42 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
                   e_qp_ry=energies + 0.1 / RYD_TO_EV)
     report.timings([
         {"name": "gw_jax.runtime_stack.jax_import", "path":
-         ("gw_jax.runtime_stack",), "inclusive": 2.0},
+         ("gw_jax.runtime_stack.jax_import",), "inclusive": 2.0},
         {"name": "gw_jax.imports", "path":
          ("gw_jax.imports",), "inclusive": 1.0},
+        {"name": "gw_jax.startup", "path":
+         ("gw_jax.startup",), "inclusive": 1.5},
+        {"name": "gw_jax.isdf", "path":
+         ("gw_jax.isdf",), "inclusive": 4.5},
         {"name": "gw_jax.zeta_fit_chunked", "path":
          ("gw_jax.isdf", "gw_jax.zeta_fit_chunked"), "inclusive": 1.0},
         {"name": "gw_jax.V_q_compute", "path":
          ("gw_jax.isdf", "gw_jax.V_q_compute"), "inclusive": 2.0},
+        {"name": "gw_jax.restart_load", "path":
+         ("gw_jax.isdf", "gw_jax.restart_load"), "inclusive": 0.5},
+        {"name": "gw_jax.minimax_quadrature", "path":
+         ("gw_jax.minimax_quadrature",), "inclusive": 0.5},
+        {"name": "gw_jax.screening", "path":
+         ("gw_jax.screening",), "inclusive": 8.0},
         {"name": "chi.exec", "path":
          ("gw_jax.screening", "chi.exec"), "inclusive": 3.0},
         {"name": "W.exec", "path":
          ("gw_jax.screening", "W.exec"), "inclusive": 4.0},
+        {"name": "gw_jax.persist_w0", "path":
+         ("gw_jax.persist_w0",), "inclusive": 0.25},
+        {"name": "gw_jax.static_head", "path":
+         ("gw_jax.static_head",), "inclusive": 0.25},
         {"name": "gw_jax.sigma", "path": ("gw_jax.sigma",),
          "inclusive": 5.0},
-    ], wall=20.0)
+        {"name": "gw_jax.kin_ion_load", "path":
+         ("gw_jax.kin_ion_load",), "inclusive": 0.25},
+        {"name": "gw_jax.solve_qp", "path":
+         ("gw_jax.solve_qp",), "inclusive": 0.5},
+        {"name": "gw_jax.qp_eigh", "path":
+         ("gw_jax.qp_eigh",), "inclusive": 0.25},
+        {"name": "gw_jax.output", "path":
+         ("gw_jax.output",), "inclusive": 0.5},
+    ], wall=26.5)
     report.finish()
 
     text = report_path.read_text(encoding="utf-8")
@@ -190,6 +212,13 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "      5.00" in sigma_line
     assert "runtime bring-up             2.00" in text
     assert "pre-main + imports           1.00" in text
+    assert "input + run setup            1.50" in text
+    assert "restart load                 0.50" in text
+    assert "ISDF setup + I/O             1.00" in text
+    assert "screening support            1.00" in text
+    assert "W persist + q0 head          0.50" in text
+    assert "QP solve + diagonalize       0.75" in text
+    assert "result writes                0.50" in text
     assert "other driver work            2.00" in text
     assert "HDF5" not in text and "h5py" not in text
 
@@ -218,6 +247,49 @@ def test_report_spells_out_enabled_eqp2_and_convergence(tmp_path):
     assert "final post-rotation map verified" in text
     assert "semicore preserves E-E_F" in text
     assert "Held fixed      : screening, W, and all self-energy diagrams" in text
+
+
+def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    config = _config()
+    config.sigma.omega_min_ev = -0.15
+    config.sigma.omega_max_ev = 0.25
+    config.sigma.omega_step_ev = 0.05
+    bands = SimpleNamespace(
+        b0=0, b1=1, b2=2, b3=3, b4=4, b4_chi=4, b4_sigma=4)
+    energies = np.array([
+        [-2.0, -0.2, 0.3],
+        [-1.8, -0.1, 0.4],
+    ]) / RYD_TO_EV
+    coverage = SimpleNamespace(
+        mask_kn=np.array([[False, True, False], [False, True, False]]),
+        n_uncovered=4, policy="clamp")
+    sigma_result = SimpleNamespace(
+        efermi_dft_ev=0.0, omega_reference_provenance="midgap",
+        omega_grid_ev=np.linspace(-0.15, 0.25, 9),
+        omega_coverage=coverage,
+        band_extrapolation_counts=None,
+        band_extrapolation_estimator="spectral_shell",
+        band_extrapolation_scheme="total_fractions",
+    )
+
+    report.sigma_coverage(
+        config=config, band_slices=bands, enk_dft_ry=energies,
+        sigma_result=sigma_result)
+    report.finish()
+
+    text = path.read_text(encoding="utf-8")
+    assert "Coverage status : INCOMPLETE" in text
+    assert "Grid shortfall  : 0.05000 eV below; 0.15000 eV above" in text
+    assert "WARNINGS" in text
+    assert "dynamic Sigma grid is incomplete for protected DFT states" in text
+    assert "Sigma(E_DFT) has 4/6 out-of-grid cells" in text
+    assert "out-of-range policy=clamp" in text
+    assert "sigma_omega_min_ev / sigma_omega_max_ev" in text
+    assert "sigma_omega_patches_ev" in text
+    assert "LORRAX_OMEGA_OUT_OF_RANGE=refuse" in text
 
 
 def test_report_collapses_minimax_catalog_receipts(tmp_path):
