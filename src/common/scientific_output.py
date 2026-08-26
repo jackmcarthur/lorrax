@@ -86,7 +86,7 @@ def spectral_compression_lines(receipt, *,
     multiplier = float(receipt["rank_multiplier"])
 
     lines = [
-        f"{label:<16}: {int(receipt['stacked_states'])} stacked states x "
+        f"{label:<15}: {int(receipt['stacked_states'])} stacked states x "
         f"{int(receipt['site_spin_columns'])} site-spin samples; structural "
         f"ceiling {int(receipt['structural_ceiling'])}",
         f"Numerical cut   : rtol={float(report.rtol):.5e} "
@@ -108,7 +108,7 @@ def spectral_compression_lines(receipt, *,
             moved = int(info["n_keep"]) - int(info["n_keep_closed"])
             action = "dropped" if direction == "drop_block" else "kept"
             return (
-                f"{name:<16}: whole-block {direction}; cut "
+                f"{name:<15}: whole-block {direction}; cut "
                 f"{int(info['n_keep'])} -> {int(info['n_keep_closed'])}; "
                 f"{action} {abs(moved)} direction(s) from a "
                 f"{len(info['members'])}-value degenerate block "
@@ -116,7 +116,7 @@ def spectral_compression_lines(receipt, *,
         gap = float(info["gap_rel"])
         gap_text = "spectrum edge" if not np.isfinite(gap) else f"gap {gap:.5e}"
         return (
-            f"{name:<16}: whole-block {direction}; unchanged at rank "
+            f"{name:<15}: whole-block {direction}; unchanged at rank "
             f"{int(info['n_keep_closed'])} ({gap_text})")
 
     for closure_name, closure in (
