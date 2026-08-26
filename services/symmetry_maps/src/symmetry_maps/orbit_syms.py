@@ -1357,6 +1357,8 @@ class PolarFFTFieldProjection:
     field: np.ndarray
     relative_movement: float
     relative_residual: float
+    rotation_table_closure_defect: float
+    floating_point_residual_bound: float
     relative_residual_tolerance: float
     n_symmetry_rows: int
     n_antiunitary_rows: int
@@ -1380,7 +1382,27 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     The receipt measures the raw-to-projected movement and the worst
     covariance residual of the projected field over those same rows, both
     relative to the raw-field L2 scale (so a symmetry-required zero field
-    is not divided by its own cancellation noise).  A
+    is not divided by its own cancellation noise).
+
+    The covariance acceptance bar is derived from the representation table,
+    not chosen independently.  For the pullback composition ``g`` after
+    ``h``, the exact affine product is
+
+    ``S_gh = S_h @ S_g`` and
+    ``tau_gh = tau_g + inv(S_g) @ tau_h (mod Z)``.
+
+    The spatial row is identified by those two exact integer certificates;
+    the antiunitary bit is the XOR.  If ``R`` were an exact representation,
+    reindexing the group average would give zero covariance residual.  The
+    rounded canonical Cartesian table instead gives the measured bound
+
+    ``delta_R = max_(g,h) ||R_g @ R_h - R_gh||_2``.
+
+    Because every pullback is a permutation, its contribution relative to
+    the raw-field L2 norm is at most ``delta_R``.  The remaining group
+    reduction is bounded by
+    ``64 eps n_rows max(1, max_g(||R_g||_2)^2)``.  Their sum is the returned
+    tolerance.  A
     local ``alpha·A`` operator built from the result is therefore eligible
     for the incumbent star-wedge matrix sweep without another symmetry rule.
     """
@@ -1392,7 +1414,13 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     if not np.all(np.isfinite(value)):
         raise ValueError("project_polar_fft_field: field contains non-finite values.")
 
-    spatial = np.asarray(sym.sym_matrices, dtype=np.int32)
+    spatial_raw = np.asarray(sym.sym_matrices)
+    if (not np.all(np.isfinite(spatial_raw))
+            or not np.array_equal(spatial_raw, np.rint(spatial_raw))):
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.sym_matrices must contain "
+            "finite exact integers.")
+    spatial = np.rint(spatial_raw).astype(np.int64)
     n_spatial = int(spatial.shape[0])
     if spatial.shape != (n_spatial, 3, 3) or n_spatial < 1:
         raise ValueError(
@@ -1404,16 +1432,132 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         raise ValueError(
             "project_polar_fft_field: SymMaps.R_cart_forward has shape "
             f"{rotations.shape}, expected {expected_rotations}.")
+    if not np.all(np.isfinite(rotations)):
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.R_cart_forward contains "
+            "non-finite values.")
     translations = np.asarray(sym.translations, dtype=np.float64)
     if translations.shape[0] < n_spatial or translations.shape[1:] != (3,):
         raise ValueError(
             "project_polar_fft_field: SymMaps.translations must cover every "
             f"spatial row; got {translations.shape}, need ({n_spatial},3).")
+    if not np.all(np.isfinite(translations[:n_spatial])):
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.translations contains "
+            "non-finite values.")
 
-    pullback = fft_grid_pullback_perm(
-        spatial, translations[:n_spatial], value.shape[-3:], validate=True)
+    fft_grid = np.asarray(value.shape[-3:], dtype=np.int64)
     n_rows = 2 * n_spatial if bool(sym.trs_allowed) else n_spatial
     flat = value.reshape(3, -1)
+
+    # Build an exact affine-group product table without comparing the full
+    # O(N_grid) permutations pairwise.  BGW translations are commensurate
+    # with the FFT grid.  Lift their per-axis grid integers to one common
+    # denominator so operations with the same S but different tau remain
+    # distinct and every product lookup is integer-only.
+    tau_frac = translations[:n_spatial] / (2.0 * np.pi)
+    tau_scaled = tau_frac * fft_grid[None, :]
+    tau_grid = np.rint(tau_scaled).astype(np.int64)
+    tau_off_grid = float(np.max(np.abs(tau_scaled - tau_grid)))
+    if tau_off_grid > _GRID_COMMENSURATE_TOL:
+        raise RuntimeError(
+            "project_polar_fft_field: SymMaps.translations are not "
+            f"commensurate with FFT grid {fft_grid.tolist()}; worst offset "
+            f"is {tau_off_grid:.6e} of a grid step.  An exact affine "
+            "closure certificate cannot be constructed.")
+
+    # The pullback/source action is p_s(r) = S_s (r - tau_s).  On an
+    # anisotropic grid, an integer S does not by itself prove that this maps
+    # grid points to grid points: coefficient S[a,b]/N_b must be an integer
+    # multiple of 1/N_a.  Certify N_a*S[a,b] divisible by N_b exactly.  With
+    # tau on-grid above, snapping in fft_grid_pullback_perm is then lossless,
+    # so affine closure below proves pullback[h][pullback[g]] == pullback[k]
+    # without an O(n_sym^2*N_grid) comparison.
+    grid_action_numerator = (
+        fft_grid[None, :, None] * spatial)
+    grid_action_remainder = (
+        grid_action_numerator % fft_grid[None, None, :])
+    incompatible = np.argwhere(grid_action_remainder != 0)
+    if incompatible.size:
+        row, out_axis, in_axis = (int(x) for x in incompatible[0])
+        raise RuntimeError(
+            "project_polar_fft_field: spatial row "
+            f"{row} does not map anisotropic FFT grid "
+            f"{fft_grid.tolist()} exactly under the source pullback "
+            "S(r-tau): N_a*S[a,b] must be divisible by N_b, but "
+            f"N[{out_axis}]*S[{out_axis},{in_axis}]="
+            f"{int(grid_action_numerator[row, out_axis, in_axis])} is not "
+            f"divisible by N[{in_axis}]={int(fft_grid[in_axis])}.")
+
+    pullback = fft_grid_pullback_perm(
+        spatial, translations[:n_spatial], fft_grid, validate=True)
+    common_denominator = int(np.lcm.reduce(fft_grid))
+    tau_common = (
+        (tau_grid % fft_grid[None, :])
+        * (common_denominator // fft_grid)[None, :]
+    ) % common_denominator
+
+    inverse_spatial = np.rint(np.linalg.inv(spatial)).astype(np.int64)
+    identity = np.eye(3, dtype=np.int64)
+    for row in range(n_spatial):
+        if (not np.array_equal(spatial[row] @ inverse_spatial[row], identity)
+                or not np.array_equal(
+                    inverse_spatial[row] @ spatial[row], identity)):
+            raise RuntimeError(
+                "project_polar_fft_field: SymMaps.sym_matrices row "
+                f"{row} has no exact integer inverse, so its affine group "
+                "product cannot be certified.")
+
+    affine_rows = {}
+    for row in range(n_spatial):
+        key = (tuple(int(x) for x in spatial[row].ravel()),
+               tuple(int(x) for x in tau_common[row]))
+        if key in affine_rows:
+            raise RuntimeError(
+                "project_polar_fft_field: spatial rows "
+                f"{affine_rows[key]} and {row} encode the same exact affine "
+                "operation; product-row authentication would be ambiguous.")
+        affine_rows[key] = row
+
+    rotation_table_closure_defect = 0.0
+    for g in range(n_rows):
+        g_spatial = g % n_spatial
+        g_antiunitary = int(g >= n_spatial)
+        for h in range(n_rows):
+            h_spatial = h % n_spatial
+            h_antiunitary = int(h >= n_spatial)
+            product_spatial = spatial[h_spatial] @ spatial[g_spatial]
+            product_tau = (
+                tau_common[g_spatial]
+                + inverse_spatial[g_spatial] @ tau_common[h_spatial]
+            ) % common_denominator
+            product_key = (
+                tuple(int(x) for x in product_spatial.ravel()),
+                tuple(int(x) for x in product_tau),
+            )
+            product_spatial_row = affine_rows.get(product_key)
+            if product_spatial_row is None:
+                raise RuntimeError(
+                    "project_polar_fft_field: permitted symmetry rows do not "
+                    "close under their exact affine action: product "
+                    f"g={g}, h={h} has S={product_spatial.tolist()}, "
+                    f"tau_numerator={product_tau.tolist()} modulo "
+                    f"{common_denominator}, with no matching spatial row.")
+            product_row = product_spatial_row + (
+                (g_antiunitary ^ h_antiunitary) * n_spatial)
+            defect = float(np.linalg.norm(
+                rotations[g] @ rotations[h] - rotations[product_row], ord=2))
+            rotation_table_closure_defect = max(
+                rotation_table_closure_defect, defect)
+
+    max_rotation_norm = max(
+        float(np.linalg.norm(rotations[row], ord=2))
+        for row in range(n_rows))
+    floating_point_residual_bound = float(
+        64.0 * np.finfo(np.float64).eps * max(n_rows, 1)
+        * max(1.0, max_rotation_norm ** 2))
+    residual_tolerance = float(
+        rotation_table_closure_defect + floating_point_residual_bound)
 
     def _act(row, operand):
         spatial_row = int(row) % n_spatial
@@ -1430,18 +1574,20 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     residual = max(
         float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
         for row in range(n_rows))
-    residual_tolerance = float(
-        64.0 * np.finfo(np.float64).eps * max(n_rows, 1))
     if not np.isfinite(residual) or residual > residual_tolerance:
         raise RuntimeError(
             "project_polar_fft_field: the group-averaged field did not "
             "close under its own permitted symmetry rows: relative residual "
-            f"{residual:.6e} exceeds the scale-aware floating-point bound "
-            f"{residual_tolerance:.6e} for {n_rows} rows.")
+            f"{residual:.6e} exceeds the derived representation bound "
+            f"{residual_tolerance:.6e} = rotation-table closure defect "
+            f"{rotation_table_closure_defect:.6e} + floating reduction "
+            f"{floating_point_residual_bound:.6e} for {n_rows} rows.")
     return PolarFFTFieldProjection(
         field=projected.reshape(value.shape),
         relative_movement=movement,
         relative_residual=residual,
+        rotation_table_closure_defect=rotation_table_closure_defect,
+        floating_point_residual_bound=floating_point_residual_bound,
         relative_residual_tolerance=residual_tolerance,
         n_symmetry_rows=n_rows,
         n_antiunitary_rows=(n_spatial if bool(sym.trs_allowed) else 0),
