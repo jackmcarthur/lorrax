@@ -171,8 +171,11 @@ static const char* cufft_err_name(cufftResult r) {
         case CUFFT_EXEC_FAILED: return "CUFFT_EXEC_FAILED";
         case CUFFT_SETUP_FAILED: return "CUFFT_SETUP_FAILED";
         case CUFFT_INVALID_SIZE: return "CUFFT_INVALID_SIZE";
+#if CUFFT_VERSION < 12000
+        // Removed from the public result enum in cuFFT 12 (CUDA 13).
         case CUFFT_INCOMPLETE_PARAMETER_LIST:
             return "CUFFT_INCOMPLETE_PARAMETER_LIST";
+#endif
         case CUFFT_INVALID_DEVICE: return "CUFFT_INVALID_DEVICE";
         case CUFFT_NO_WORKSPACE: return "CUFFT_NO_WORKSPACE";
         case CUFFT_NOT_IMPLEMENTED: return "CUFFT_NOT_IMPLEMENTED";
