@@ -365,15 +365,33 @@ def unfold_isdf_operator(
     mesh_xy,
     n_sym_spatial,
     trs_rule="conj",
+    right_sym_perm=None,
+    right_L_table=None,
+    left_logical_extent=None,
+    right_logical_extent=None,
+    trs_pair_q_ibz=None,
 ):
     """Expand ``V_q_ibz`` over the IBZ to the full BZ.
 
     The mapping is a centroid-axis double-gather (using the **source-map**
     ``α(μ) = sym_perm[s, μ]`` returned by ``centroid_source_map_and_wrap``)
-    plus a per-centroid umklapp phase from the real-space lattice wrap:
+    plus a per-centroid umklapp phase from the real-space lattice wrap.  The
+    historical square form is
 
         V_full[q, μ', ν'] = exp(2π i q_irr · (L_{s,μ'} − L_{s,ν'}))
                             · V_ibz[i(q), α_{s}(μ'), α_{s}(ν')]
+
+    and is exactly the ``right_* is None`` specialization of the rectangular
+    response action
+
+        X_full[q, μ_L, ν_R]
+          = exp(2π i q_irr · (L^L_{s,μ_L} - L^R_{s,ν_R}))
+            X_ibz[i(q), α^L_s(μ_L), α^R_s(ν_R)].
+
+    Distinct left/right tables are required for CT/TC response tiles whose
+    charge and transverse centroid bases differ.  Each padded endpoint stays
+    on its native processor axis, ``P(None,'x','y')``; neither open centroid
+    axis is gathered onto one rank.
 
     where ``i(q) = irr_idx[q]``, ``s(q) = sym_idx[q]``,
     ``q_irr = q_irr_frac[i(q)]`` is the IBZ parent q in fractional
@@ -399,7 +417,10 @@ def unfold_isdf_operator(
 
     For Hermitian V_q the conj equals the ν↔μ transpose; we implement
     conj for clarity (and to keep the helper correct for any future
-    non-Hermitian channels).  The centroid permutation itself is
+    non-Hermitian channels).  For a rectangular general operator,
+    ``trs_pair_q_ibz`` is the reversed-axis partner ``(q,ν_R,μ_L)``;
+    time reversal uses its transpose.  This is the exact CT↔TC pair action,
+    not a shape-based transpose of CT itself.  The centroid permutation is
     unchanged under TRS (r is fixed); ``sym_perm`` rows ``[ntran:]``
     duplicate ``[:ntran]``.  Callers build ``sym_perm`` via
     ``centroid_source_map_and_wrap(..., extend_trs=True)`` and pass
@@ -437,11 +458,22 @@ def unfold_isdf_operator(
         ``"pair_transpose"`` for a general complex-frequency operator.
         Time reversal transposes its centroid pair without conjugating its
         frequency dependence.
-
+    right_sym_perm, right_L_table
+        Optional right-endpoint source-map/wrap tables.  Both must be supplied
+        together.  Omission preserves the historical square same-basis action.
+    left_logical_extent, right_logical_extent
+        Physical endpoint extents inside the padded array.  Padding is
+        required to form an invariant tail under every used source map and is
+        zeroed structurally in the result.  Defaults are the full stored axes.
+    trs_pair_q_ibz
+        Reversed-axis partner ``(n_q_ibz,n_right,n_left)`` for rectangular
+        ``trs_rule='pair_transpose'``.  Square callers retain the historical
+        self-transpose default.
     Returns
     -------
     V_q_full
-        ``(n_q_full, n_rmu, n_rmu)`` complex, sharded ``P(None,'x','y')``.
+        ``(n_q_full, n_left, n_right)`` complex, sharded
+        ``P(None,'x','y')``.
     """
     # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
     # already the full BZ — irr_idx is identity, sym_idx is all zeros,
@@ -451,20 +483,58 @@ def unfold_isdf_operator(
     # mesh), so bypass it entirely.
     idx_np = np.asarray(irr_idx)
     sym_np = np.asarray(sym_idx)
-    if (idx_np.shape[0] == int(V_q_ibz.shape[0])
+    square_defaults = (
+        right_sym_perm is None and right_L_table is None
+        and left_logical_extent is None and right_logical_extent is None
+        and trs_pair_q_ibz is None)
+    if (square_defaults
+            and idx_np.shape[0] == int(V_q_ibz.shape[0])
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
             and np.all(sym_np == 0)):
         return V_q_ibz
 
-    n_sym_perm = int(np.asarray(sym_perm).shape[0])
+    same_basis_tables = right_sym_perm is None and right_L_table is None
+    if (right_sym_perm is None) != (right_L_table is None):
+        raise ValueError(
+            "unfold_isdf_operator: right_sym_perm and right_L_table must "
+            "be supplied together for a rectangular endpoint action")
+    left_perm = np.asarray(sym_perm, dtype=np.int32)
+    right_perm = (left_perm if right_sym_perm is None else
+                  np.asarray(right_sym_perm, dtype=np.int32))
+    left_L = np.asarray(L_table, dtype=np.float64)
+    right_L = (left_L if right_L_table is None else
+               np.asarray(right_L_table, dtype=np.float64))
+    if left_perm.ndim != 2 or right_perm.ndim != 2:
+        raise ValueError(
+            "unfold_isdf_operator: left/right sym_perm tables must both be "
+            "rank 2")
+    if (left_L.ndim != 3 or left_L.shape[-1] != 3
+            or right_L.ndim != 3 or right_L.shape[-1] != 3):
+        raise ValueError(
+            "unfold_isdf_operator: left/right L_table arrays must both have "
+            "shape (n_sym_rows,n_endpoint,3)")
+    if getattr(V_q_ibz, "ndim", None) != 3:
+        raise ValueError(
+            "unfold_isdf_operator: V_q_ibz must have rank 3 "
+            "(n_q_ibz,n_left,n_right)")
+    n_sym_perm = int(left_perm.shape[0])
+    n_sym_perm_right = int(right_perm.shape[0])
     max_sym = int(sym_np.max()) if sym_np.size else -1
-    if max_sym >= n_sym_perm:
+    if max_sym >= n_sym_perm or max_sym >= n_sym_perm_right:
+        if same_basis_tables:
+            raise ValueError(
+                f"unfold_isdf_operator: sym_idx contains value {max_sym} "
+                f"but sym_perm has only {n_sym_perm} rows.  Build it via "
+                "``centroid_source_map_and_wrap(..., extend_trs=True)`` so "
+                "it covers the TRS-augmented half of ``sym_mats_k``.")
         raise ValueError(
             f"unfold_isdf_operator: sym_idx contains value {max_sym} "
-            f"but sym_perm has only {n_sym_perm} rows.  Build it via "
-            f"``centroid_source_map_and_wrap(..., extend_trs=True)`` so it "
-            f"covers the TRS-augmented half of ``sym_mats_k``.")
-    if trs_rule not in ("conj", "pair_transpose"):
+            "but the left/right sym_perm tables have only "
+            f"{n_sym_perm}/{n_sym_perm_right} rows.  Build them via "
+            "``centroid_source_map_and_wrap(..., extend_trs=True)`` so they "
+            "cover the TRS-augmented half of ``sym_mats_k``.")
+    requested_trs_rule = trs_rule
+    if requested_trs_rule not in ("conj", "pair_transpose"):
         raise ValueError(
             "unfold_isdf_operator: trs_rule must be 'conj' for a Hermitian "
             "operator or 'pair_transpose' for a general operator")
@@ -472,13 +542,22 @@ def unfold_isdf_operator(
     if not trs_used:
         # Keep centrosymmetric inputs on the historical compiled module.
         trs_rule = "conj"
-    if trs_used and int(n_sym_spatial) * 2 != n_sym_perm:
+    if (trs_used and (int(n_sym_spatial) * 2 != n_sym_perm
+                     or int(n_sym_spatial) * 2 != n_sym_perm_right)):
+        if same_basis_tables:
+            raise ValueError(
+                f"unfold_isdf_operator: sym_idx uses TRS-augmented rows "
+                f"(max={max_sym} ≥ n_sym_spatial={n_sym_spatial}) but "
+                f"sym_perm.shape[0]={n_sym_perm} ≠ 2·n_sym_spatial.  "
+                "Build sym_perm via ``centroid_source_map_and_wrap(..., "
+                "extend_trs=True)``.")
         raise ValueError(
             f"unfold_isdf_operator: sym_idx uses TRS-augmented rows "
             f"(max={max_sym} ≥ n_sym_spatial={n_sym_spatial}) but "
-            f"sym_perm.shape[0]="
-            f"{n_sym_perm} ≠ 2·n_sym_spatial.  Build sym_perm via "
-            f"``centroid_source_map_and_wrap(..., extend_trs=True)``.")
+            "left/right sym_perm row counts are "
+            f"{n_sym_perm}/{n_sym_perm_right}, not both 2·n_sym_spatial.  "
+            "Build both via ``centroid_source_map_and_wrap(..., "
+            "extend_trs=True)``.")
 
     # Forward permutation: gather V_ibz at indices sym_perm[s, μ'] — i.e.,
     # at the FORWARD image of each full-BZ centroid μ' under sym s.
@@ -496,26 +575,95 @@ def unfold_isdf_operator(
     # out-of-range indices and clip SILENTLY (the TRS-bug failure
     # shape).  Logical/logical callers (tests, unpadded runs) match
     # trivially.
-    fwd_perm = np.asarray(sym_perm, dtype=np.int32)
-    if int(V_q_ibz.shape[-1]) != int(fwd_perm.shape[-1]):
+    fwd_perm = left_perm
+    fwd_perm_right = right_perm
+    n_left = int(V_q_ibz.shape[-2])
+    n_right = int(V_q_ibz.shape[-1])
+    if n_left != int(fwd_perm.shape[-1]):
+        if same_basis_tables:
+            raise ValueError(
+                f"unfold_isdf_operator: V_q_ibz μ-extent {n_left} != "
+                f"sym_perm extent {int(fwd_perm.shape[-1])}.  Tables carry "
+                "the μ pad from construction (_resolve_ibz_q_list); pass V "
+                "at the same (padded) extent.")
         raise ValueError(
-            f"unfold_isdf_operator: V_q_ibz μ-extent "
-            f"{int(V_q_ibz.shape[-1])} != sym_perm extent "
+            f"unfold_isdf_operator: V_q_ibz left extent {n_left} != "
+            "left sym_perm extent "
             f"{int(fwd_perm.shape[-1])}.  Tables carry "
-            f"the μ pad from construction (_resolve_ibz_q_list); pass V "
+            "the endpoint pad from construction (_resolve_ibz_q_list); pass V "
             f"at the same (padded) extent.")
+    if n_right != int(fwd_perm_right.shape[-1]):
+        raise ValueError(
+            f"unfold_isdf_operator: V_q_ibz right extent {n_right} != "
+            f"right sym_perm extent {int(fwd_perm_right.shape[-1])}.")
     # Per-(q_full, μ) umklapp phase factor exp(2π i q_irr · L_μ).
     # ``L_table`` is shape (2·ntran, n_rmu, 3) int (any width); promote
     # to float64 then gather to (n_q_full, n_rmu, 3).  ``q_irr_frac`` is
     # (n_q_ibz, 3); we gather to (n_q_full, 3) via ``irr_idx``.  The
     # product qL = q_irr · L is (n_q_full, n_rmu), then the bilinear
     # phase is qL[μ] − qL[ν] (per-q, outer-diff).
-    L_arr = np.asarray(L_table, dtype=np.float64)
-    if int(L_arr.shape[1]) != int(V_q_ibz.shape[-1]):
+    L_arr = left_L
+    L_arr_right = right_L
+    if (int(L_arr.shape[0]) != n_sym_perm
+            or int(L_arr_right.shape[0]) != n_sym_perm_right):
         raise ValueError(
-            f"unfold_isdf_operator: L_table μ-extent {int(L_arr.shape[1])} != "
-            f"V_q_ibz μ-extent {int(V_q_ibz.shape[-1])}; tables and V "
-            f"must share one (padded) extent.")
+            "unfold_isdf_operator: each L_table must have the same symmetry "
+            "row count as its endpoint sym_perm table")
+    if int(L_arr.shape[1]) != n_left:
+        if same_basis_tables:
+            raise ValueError(
+                f"unfold_isdf_operator: L_table μ-extent "
+                f"{int(L_arr.shape[1])} != V_q_ibz μ-extent {n_left}; "
+                "tables and V must share one (padded) extent.")
+        raise ValueError(
+            "unfold_isdf_operator: left L_table extent "
+            f"{int(L_arr.shape[1])} != V_q_ibz left extent {n_left}.")
+    if int(L_arr_right.shape[1]) != n_right:
+        raise ValueError(
+            "unfold_isdf_operator: right L_table extent "
+            f"{int(L_arr_right.shape[1])} != V_q_ibz right extent {n_right}.")
+
+    logical_left = n_left if left_logical_extent is None else int(
+        left_logical_extent)
+    logical_right = n_right if right_logical_extent is None else int(
+        right_logical_extent)
+    if not 0 < logical_left <= n_left or not 0 < logical_right <= n_right:
+        raise ValueError(
+            "unfold_isdf_operator: logical left/right extents must be positive "
+            f"and within padded {(n_left, n_right)}; got "
+            f"{(logical_left, logical_right)}")
+    for label, perm, logical, padded in (
+            ("left", fwd_perm, logical_left, n_left),
+            ("right", fwd_perm_right, logical_right, n_right)):
+        used = perm[sym_np] if sym_np.size else perm[:0]
+        if (np.any(used[:, :logical] >= logical)
+                or np.any(used[:, logical:] < logical)):
+            raise ValueError(
+                f"unfold_isdf_operator: {label} source maps do not preserve "
+                f"the logical/padded split at {logical}/{padded}; regenerate "
+                "the authenticated centroid tables with an identity tail")
+
+    pair_source = None
+    if requested_trs_rule == "pair_transpose":
+        if trs_pair_q_ibz is None:
+            if trs_used and (n_left != n_right or not same_basis_tables):
+                raise ValueError(
+                    "unfold_isdf_operator: rectangular pair_transpose requires "
+                    "trs_pair_q_ibz with reversed endpoint axes")
+            if trs_used:
+                pair_source = V_q_ibz
+        else:
+            expected_pair = (int(V_q_ibz.shape[0]), n_right, n_left)
+            if tuple(int(v) for v in trs_pair_q_ibz.shape) != expected_pair:
+                raise ValueError(
+                    "unfold_isdf_operator: trs_pair_q_ibz must have reversed "
+                    f"shape {expected_pair}; got {trs_pair_q_ibz.shape}")
+            if trs_used:
+                pair_source = trs_pair_q_ibz
+    elif trs_pair_q_ibz is not None:
+        raise ValueError(
+            "unfold_isdf_operator: trs_pair_q_ibz is valid only with "
+            "trs_rule='pair_transpose'")
 
     # Sym tables are baked into the jit closure as constants — XLA folds
     # them into the HLO, which is materially faster per call than
@@ -531,23 +679,29 @@ def unfold_isdf_operator(
     fn = _get_unfold_isdf_operator_jit(
         V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
         fwd_perm_arr=fwd_perm,
+        fwd_perm_right_arr=fwd_perm_right,
         idx_arr=idx_arr,
         sym_arr=sym_arr,
         L_arr=L_arr,
+        L_right_arr=L_arr_right,
         q_irr_arr=q_irr_arr,
         trs_mask_arr=trs_mask_arr,
+        logical_left=logical_left,
+        logical_right=logical_right,
         n_sym_spatial=int(n_sym_spatial),
         trs_rule=trs_rule,
         mesh_xy=mesh_xy)
-    return fn(V_q_ibz)
+    return fn(V_q_ibz, pair_source) if pair_source is not None else fn(V_q_ibz)
 
 
 _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 
 
 def _get_unfold_isdf_operator_jit(
-    *, V_q_shape, fwd_perm_arr, idx_arr, sym_arr, L_arr, q_irr_arr,
-    trs_mask_arr, n_sym_spatial, mesh_xy, trs_rule="conj",
+    *, V_q_shape, fwd_perm_arr, fwd_perm_right_arr, idx_arr, sym_arr,
+    L_arr, L_right_arr, q_irr_arr, trs_mask_arr, logical_left,
+    logical_right, n_sym_spatial, mesh_xy,
+    trs_rule="conj",
 ):
     """Cache the inner ``_do_unfold`` jit by (shape, sym table content).
 
@@ -560,11 +714,14 @@ def _get_unfold_isdf_operator_jit(
     key = (
         V_q_shape,
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
+        fwd_perm_right_arr.shape, fwd_perm_right_arr.tobytes(),
         idx_arr.tobytes(),
         sym_arr.tobytes(),
         L_arr.shape, L_arr.tobytes(),
+        L_right_arr.shape, L_right_arr.tobytes(),
         q_irr_arr.tobytes(),
         trs_mask_arr.tobytes(),
+        int(logical_left), int(logical_right),
         int(n_sym_spatial),
         str(trs_rule),
         id(mesh_xy),
@@ -576,9 +733,11 @@ def _get_unfold_isdf_operator_jit(
     # Promote to jax arrays once at trace-build time.  Closure capture
     # makes these constants in the compiled HLO.
     fwd_perm_j = jnp.asarray(fwd_perm_arr)
+    fwd_perm_right_j = jnp.asarray(fwd_perm_right_arr)
     idx_j = jnp.asarray(idx_arr)
     sym_j = jnp.asarray(sym_arr)
     L_j = jnp.asarray(L_arr)
+    L_right_j = jnp.asarray(L_right_arr)
     q_irr_j = jnp.asarray(q_irr_arr)
     trs_mask_j = jnp.asarray(trs_mask_arr)
     # Memory contract: never exceed 1× single-tile per rank.  Use
@@ -588,114 +747,144 @@ def _get_unfold_isdf_operator_jit(
     # memory).  The all_to_all calls split the OTHER big spatial axis
     # (ν during the μ-permute step, μ during the ν-permute step), so
     # this works for arbitrary Px·Py even when n_q < Px·Py.
-    n_rmu_padded = int(V_q_shape[-1])
+    n_left_padded = int(V_q_shape[-2])
+    n_right_padded = int(V_q_shape[-1])
     Px = int(mesh_xy.shape['x'])
     Py = int(mesh_xy.shape['y'])
-    if n_rmu_padded % (Px * Py) != 0:
+    if (n_left_padded % (Px * Py) != 0
+            or n_right_padded % (Px * Py) != 0):
+        if n_left_padded == n_right_padded:
+            raise ValueError(
+                f"unfold_isdf_operator: n_rmu_padded={n_left_padded} must be "
+                f"divisible by Px*Py={Px*Py} for the all_to_all "
+                "redistribution.  The μ-padding in Meta should already "
+                "enforce this — check that meta.n_rmu_padded is "
+                "mesh-divisible.")
         raise ValueError(
-            f"unfold_isdf_operator: n_rmu_padded={n_rmu_padded} must be "
-            f"divisible by Px*Py={Px*Py} for the all_to_all "
-            f"redistribution.  The "
-            f"μ-padding in Meta should already enforce this — check "
-            f"that meta.n_rmu_padded is mesh-divisible.")
+            "unfold_isdf_operator: left/right padded extents "
+            f"{n_left_padded}/{n_right_padded} must each be divisible by "
+            f"Px*Py={Px*Py} for the all_to_all redistribution.  Endpoint "
+            "padding should already enforce this; check both authenticated "
+            "basis receipts.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     pair_transpose = (trs_rule == "pair_transpose")
     in_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
                 else P(None, 'x', 'y'))
 
-    @partial(jax.jit, out_shardings=V_sh)
-    def _do_unfold(V_ibz):
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=in_specs,
-                 out_specs=P(None, 'x', 'y'),
-                 check_vma=False)
-        def _kernel(*operands):
-            # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
-            V_ibz_local = operands[0]
-            perm_q = fwd_perm_j[sym_j]                      # (n_q_full, n_rmu)
-            # Gather q axis (replicated → local concat via idx_j).
-            if pair_transpose:
-                source = jnp.concatenate((V_ibz_local, operands[1]), axis=0)
-                pick = idx_j + trs_mask_j.astype(idx_j.dtype) * V_q_shape[0]
-                V_at_irr = source[pick]
-            else:
-                V_at_irr = V_ibz_local[idx_j]
-
-            # μ permute on 'x'.  all_to_all redistributes:
-            #   split  ν (local, /Py)  → ν / (Py·Px)
-            #   concat μ (/Px sharded) → full μ
-            # Volume per rank: n_q · μ · ν / (Px·Py) — unchanged from 1× tile.
-            # Required: ν/Py divisible by Px (ensured by n_rmu_padded mod (Px·Py)=0).
-            if Px > 1:
-                V_x = jax.lax.all_to_all(
-                    V_at_irr, 'x', split_axis=2, concat_axis=1, tiled=True)
-                # (n_q_full, μ, ν/(Px·Py))
-                V_x_perm = jnp.take_along_axis(
-                    V_x, perm_q[:, :, None], axis=1,
-                    mode='promise_in_bounds')
-                V_perm_mu = jax.lax.all_to_all(
-                    V_x_perm, 'x', split_axis=1, concat_axis=2, tiled=True)
-                # (n_q_full, μ/Px, ν/Py)  — back to canonical
-            else:
-                V_perm_mu = jnp.take_along_axis(
-                    V_at_irr, perm_q[:, :, None], axis=1,
-                    mode='promise_in_bounds')
-
-            # ν permute on 'y'.  Mirror trick on the 'y' axis.
-            # Required: μ/Px divisible by Py.
-            if Py > 1:
-                V_y = jax.lax.all_to_all(
-                    V_perm_mu, 'y', split_axis=1, concat_axis=2, tiled=True)
-                # (n_q_full, μ/(Px·Py), ν)
-                V_y_perm = jnp.take_along_axis(
-                    V_y, perm_q[:, None, :], axis=2,
-                    mode='promise_in_bounds')
-                V_full_local = jax.lax.all_to_all(
-                    V_y_perm, 'y', split_axis=2, concat_axis=1, tiled=True)
-                # (n_q_full, μ/Px, ν/Py)  — back to canonical
-            else:
-                V_full_local = jnp.take_along_axis(
-                    V_perm_mu, perm_q[:, None, :], axis=2,
-                    mode='promise_in_bounds')
-
-            # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
-            # is L_table[s(q), μ] — wrap of centroid μ under sym op
-            # s(q) (NOT permuted).  See
-            # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``.
-            # Phase tables are small (~n_q · n_rmu c128 bytes); compute
-            # replicated and slice this rank's μ_local / ν_local extent.
-            L_per_q = L_j[sym_j]                            # (n_q_full, n_rmu, 3)
-            q_per_q = q_irr_j[idx_j]                        # (n_q_full, 3)
-            qL = jnp.einsum('qi,qmi->qm', q_per_q, L_per_q) # (n_q_full, n_rmu)
-            phase = jnp.exp(2j * jnp.pi * qL.astype(jnp.complex128))
-            mu_local = n_rmu_padded // Px
-            nu_local = n_rmu_padded // Py
-            x_idx = jax.lax.axis_index('x')
-            y_idx = jax.lax.axis_index('y')
-            phase_mu = jax.lax.dynamic_slice_in_dim(
-                phase, x_idx * mu_local, mu_local, axis=1)  # (n_q, μ/Px)
-            phase_nu = jax.lax.dynamic_slice_in_dim(
-                phase, y_idx * nu_local, nu_local, axis=1)  # (n_q, ν/Py)
-            if pair_transpose:
-                mu_phase = jnp.where(trs_mask_j[:, None],
-                                     jnp.conj(phase_mu), phase_mu)
-                nu_phase = jnp.where(trs_mask_j[:, None],
-                                     phase_nu, jnp.conj(phase_nu))
-                V_full_local = (mu_phase[:, :, None] * V_full_local
-                                * nu_phase[:, None, :])
-            else:
-                V_full_local = (phase_mu[:, :, None] * V_full_local
-                                * jnp.conj(phase_nu)[:, None, :])
-                V_full_local = jnp.where(
-                    trs_mask_j[:, None, None],
-                    jnp.conj(V_full_local), V_full_local)
-            return V_full_local
-
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=in_specs,
+             out_specs=P(None, 'x', 'y'),
+             check_vma=False)
+    def _kernel(*operands):
+        # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
+        V_ibz_local = operands[0]
+        perm_left_q = fwd_perm_j[sym_j]
+        perm_right_q = fwd_perm_right_j[sym_j]
+        # Gather q axis (replicated → local selection via idx_j).
         if pair_transpose:
+            forward_at_irr = V_ibz_local[idx_j]
+            partner_at_irr = operands[1][idx_j]
+            V_at_irr = jnp.where(
+                trs_mask_j[:, None, None], partner_at_irr, forward_at_irr)
+        else:
+            V_at_irr = V_ibz_local[idx_j]
+
+        # μ permute on 'x'.  all_to_all redistributes:
+        #   split  ν (local, /Py)  → ν / (Py·Px)
+        #   concat μ (/Px sharded) → full μ
+        # Volume per rank: n_q · μ · ν / (Px·Py) — unchanged from 1× tile.
+        # Required: ν/Py divisible by Px (ensured by the right pad).
+        if Px > 1:
+            V_x = jax.lax.all_to_all(
+                V_at_irr, 'x', split_axis=2, concat_axis=1, tiled=True)
+            # (n_q_full, μ, ν/(Px·Py))
+            V_x_perm = jnp.take_along_axis(
+                V_x, perm_left_q[:, :, None], axis=1,
+                mode='promise_in_bounds')
+            V_perm_mu = jax.lax.all_to_all(
+                V_x_perm, 'x', split_axis=1, concat_axis=2, tiled=True)
+            # (n_q_full, μ/Px, ν/Py)  — back to canonical
+        else:
+            V_perm_mu = jnp.take_along_axis(
+                V_at_irr, perm_left_q[:, :, None], axis=1,
+                mode='promise_in_bounds')
+
+        # ν permute on 'y'.  Mirror trick on the 'y' axis.
+        # Required: μ/Px divisible by Py (ensured by the left pad).
+        if Py > 1:
+            V_y = jax.lax.all_to_all(
+                V_perm_mu, 'y', split_axis=1, concat_axis=2, tiled=True)
+            # (n_q_full, μ/(Px·Py), ν)
+            V_y_perm = jnp.take_along_axis(
+                V_y, perm_right_q[:, None, :], axis=2,
+                mode='promise_in_bounds')
+            V_full_local = jax.lax.all_to_all(
+                V_y_perm, 'y', split_axis=2, concat_axis=1, tiled=True)
+            # (n_q_full, μ/Px, ν/Py)  — back to canonical
+        else:
+            V_full_local = jnp.take_along_axis(
+                V_perm_mu, perm_right_q[:, None, :], axis=2,
+                mode='promise_in_bounds')
+
+        # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
+        # is L_table[s(q), μ] — wrap of centroid μ under sym op
+        # s(q) (NOT permuted).  See
+        # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``.
+        # Phase tables are small (~n_q · n_rmu c128 bytes); compute
+        # replicated and slice this rank's μ_local / ν_local extent.
+        L_left_per_q = L_j[sym_j]
+        L_right_per_q = L_right_j[sym_j]
+        q_per_q = q_irr_j[idx_j]                        # (n_q_full, 3)
+        qL_left = jnp.einsum(
+            'qi,qmi->qm', q_per_q, L_left_per_q)
+        qL_right = jnp.einsum(
+            'qi,qmi->qm', q_per_q, L_right_per_q)
+        phase_left = jnp.exp(
+            2j * jnp.pi * qL_left.astype(jnp.complex128))
+        phase_right = jnp.exp(
+            2j * jnp.pi * qL_right.astype(jnp.complex128))
+        mu_local = n_left_padded // Px
+        nu_local = n_right_padded // Py
+        x_idx = jax.lax.axis_index('x')
+        y_idx = jax.lax.axis_index('y')
+        phase_mu = jax.lax.dynamic_slice_in_dim(
+            phase_left, x_idx * mu_local, mu_local, axis=1)
+        phase_nu = jax.lax.dynamic_slice_in_dim(
+            phase_right, y_idx * nu_local, nu_local, axis=1)
+        if pair_transpose:
+            mu_phase = jnp.where(trs_mask_j[:, None],
+                                 jnp.conj(phase_mu), phase_mu)
+            nu_phase = jnp.where(trs_mask_j[:, None],
+                                 phase_nu, jnp.conj(phase_nu))
+            V_full_local = (mu_phase[:, :, None] * V_full_local
+                            * nu_phase[:, None, :])
+        else:
+            V_full_local = (phase_mu[:, :, None] * V_full_local
+                            * jnp.conj(phase_nu)[:, None, :])
+            V_full_local = jnp.where(
+                trs_mask_j[:, None, None],
+                jnp.conj(V_full_local), V_full_local)
+        if (int(logical_left) != n_left_padded
+                or int(logical_right) != n_right_padded):
+            global_left = x_idx * mu_local + jnp.arange(mu_local)
+            global_right = y_idx * nu_local + jnp.arange(nu_local)
+            valid = ((global_left[:, None] < int(logical_left))
+                     & (global_right[None, :] < int(logical_right)))
+            V_full_local = jnp.where(valid[None], V_full_local, 0)
+        return V_full_local
+
+    if pair_transpose:
+        partner_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+        @partial(jax.jit, in_shardings=(V_sh, partner_sh), out_shardings=V_sh)
+        def _do_unfold(V_ibz, pair_ibz):
             transposed = jax.lax.with_sharding_constraint(
-                jnp.swapaxes(V_ibz, -2, -1), V_sh)
+                jnp.swapaxes(pair_ibz, -2, -1), V_sh)
             return _kernel(V_ibz, transposed)
-        return _kernel(V_ibz)
+    else:
+        @partial(jax.jit, in_shardings=V_sh, out_shardings=V_sh)
+        def _do_unfold(V_ibz):
+            return _kernel(V_ibz)
 
     _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
     return _do_unfold
