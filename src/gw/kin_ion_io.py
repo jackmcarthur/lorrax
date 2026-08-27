@@ -149,6 +149,13 @@ import jax.numpy as jnp
 import h5py
 
 from common import Meta
+from common.four_current_model import (
+    is_pauli_reference_model,
+    PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
+    RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+    RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+    SOURCE_WFN_CHARGE_REPRESENTATION,
+)
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import (barrier, local_share, process_rank_world,
                                 psum_replicate, resolve_mesh)
@@ -177,7 +184,12 @@ from file_io.kin_ion import (
     N_SYM_SPATIAL_ATTR, SYM_IDX_DATASET,
     broadcast_ibz_to_full_bz as _broadcast_ibz_slab,
 )
-from gw.gw_config import read_lorrax_input as read_cohsex_input
+from gw.gw_config import (
+    BispinorGWMode,
+    coerce_bispinor_gw_mode,
+    read_lorrax_input as read_cohsex_input,
+    uses_raw_kinetic_balance_charge,
+)
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
 from psp.dft_operators import padded_gvectors, vnl_matrix_from_kdata
 from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
@@ -680,6 +692,7 @@ def build_valence_density_distributed(wfn, sym, meta, *,
                                       psi_rotation=None,
                                       max_bands_per_item: int | None = None,
                                       include_dirac_current: bool = False,
+                                      charge_nspinor: int | None = None,
                                       print_fn=print) -> np.ndarray:
     """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
 
@@ -729,7 +742,9 @@ def build_valence_density_distributed(wfn, sym, meta, *,
 
     Returns the summed ρ(r) as a host array identical on every rank.
     ``include_dirac_current=True`` returns ``(rho,Jx,Jy,Jz)`` from the
-    same WFN load and IFFT transaction.
+    same WFN load and IFFT transaction.  ``charge_nspinor=2`` keeps those
+    currents on the raw four-spinor carrier while forming rho from its
+    normalized upper/source Pauli two-spinor block.
     """
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
@@ -806,6 +821,7 @@ def build_valence_density_distributed(wfn, sym, meta, *,
                 psi_k, nocc=None, weight=wk,
                 cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
                 include_dirac_current=include_current,
+                charge_nspinor=charge_nspinor,
             )
         else:
             rho_local = rho_local + valence_density_from_kpoint(
@@ -813,6 +829,7 @@ def build_valence_density_distributed(wfn, sym, meta, *,
                 cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
                 band_occupations=occupation_weights[ik, b_lo:b_hi],
                 include_dirac_current=include_current,
+                charge_nspinor=charge_nspinor,
             )
         # The Python loop is otherwise an asynchronous dispatch queue.  At a
         # large FFT grid, queuing every local item can retain several completed
@@ -849,6 +866,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            psi_rotation=None,
                            band_chunk_size: int | None = None,
                            include_transverse: bool = False,
+                           charge_nspinor: int | None = None,
                            print_fn=print,
                            owner_only: bool = False,
                            k_set: str = "full"):
@@ -917,6 +935,12 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     density_band_stop = int(wfn.physical_density_band_stop)
     nk = int(sym.nk_tot)
     with_transverse = bool(include_transverse)
+    charge_ns = (int(meta.nspinor) if charge_nspinor is None
+                 else int(charge_nspinor))
+    if not 0 < charge_ns <= int(meta.nspinor):
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_ns} for meta.nspinor={int(meta.nspinor)}")
     if with_transverse and int(meta.nspinor) != 4:
         raise ValueError(
             "transverse direct Hartree requires the canonical four-component "
@@ -958,6 +982,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             psi_rotation=psi_rotation,
             max_bands_per_item=band_chunk_size,
             include_dirac_current=with_transverse,
+            charge_nspinor=(None if charge_nspinor is None else charge_ns),
             print_fn=print_fn)
 
     if with_transverse:
@@ -1084,16 +1109,22 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     psi_G = wfn.load(
         bands=(0, nb), k=k_spec, sharding=band_sphere_spec(),
         bispinor=(int(meta.nspinor) == 4))
-    geom = SweepGeometry(mesh=mesh, fft_grid=meta.fft_grid,
-                         ngkmax=int(psi_G.shape[3]), nb=nb,
-                         ns=int(psi_G.shape[2]), nk=nk_irr,
-                         cell_volume=float(wfn.cell_volume))
+    psi_charge = psi_G if charge_ns == int(psi_G.shape[2]) \
+        else psi_G[:, :, :charge_ns, :]
+    geom_charge = SweepGeometry(
+        mesh=mesh, fft_grid=meta.fft_grid,
+        ngkmax=int(psi_charge.shape[3]), nb=nb,
+        ns=int(psi_charge.shape[2]), nk=nk_irr,
+        cell_volume=float(wfn.cell_volume))
     print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk_irr} STAR-WEDGE k-points "
              f"(broadcast to {nk} full-BZ k), "
-             f"{geom.nb} bands sharded over P={world}...")
+             f"{geom_charge.nb} bands sharded over P={world}; "
+             f"charge nspinor={charge_ns}...")
     with timing.section("vh_matrix"):
         H_vh = sweep_matrix_elements(
-            psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
+            psi_charge,
+            operator=local_potential_operator(geom_charge, V_H_r),
+            geom=geom_charge,
             gvecs=gtab.gvecs, gmask=gtab.mask,
             box_index=wfn.box_index(k=k_spec),
             # The WFN loader's paired k representative for these exact G rows,
@@ -1118,21 +1149,26 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     H_charge = (H_host if k_set == "ibz"
                 else broadcast_ibz_to_full_bz(H_host, sym))
     if not with_transverse:
-        del psi_G
+        del psi_G, psi_charge
         return H_charge
 
+    geom_current = SweepGeometry(
+        mesh=mesh, fft_grid=meta.fft_grid,
+        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ns=int(psi_G.shape[2]), nk=nk_irr,
+        cell_volume=float(wfn.cell_volume))
     print_fn(
         f"\n<m|sum_i alpha_i A_i|n>: same {nk_irr}-point STAR-WEDGE "
-        f"scan, {geom.nb} bands sharded over P={world}...")
+        f"scan, {geom_current.nb} bands sharded over P={world}...")
     with timing.section("vh_transverse_matrix"):
         H_vt = sweep_matrix_elements(
             psi_G,
             operator=local_potential_operator(
-                geom, V_T_r, dirac_vector=True),
-            geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
+                geom_current, V_T_r, dirac_vector=True),
+            geom=geom_current, gvecs=gtab.gvecs, gmask=gtab.mask,
             box_index=wfn.box_index(k=k_spec), kvecs=gtab.kvecs)
         H_t_host = blocks_to_host(H_vt, nb=nb, owner_only=owner_only)
-    del H_vt, psi_G, V_T_r
+    del H_vt, psi_G, psi_charge, V_T_r
     H_transverse = (H_t_host if k_set == "ibz"
                     else broadcast_ibz_to_full_bz(H_t_host, sym))
     return ExactHartreeMatrices(
@@ -1256,6 +1292,24 @@ def main(argv=None):
     ncond = int(params.get("ncond", 5))
     nband = int(params.get("nband", 100))
     bispinor = bool(params.get("bispinor", False))
+    bispinor_gw_mode = coerce_bispinor_gw_mode(
+        params.get("bispinor_gw", "bare_transverse"))
+    if (bispinor_gw_mode is
+            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE and not bispinor):
+        raise SystemExit(
+            "bispinor_gw=pauli_reference_bare_transverse requires "
+            "bispinor=true; the selector does not enable spatial-current "
+            "channels implicitly.")
+    charge_bispinor = uses_raw_kinetic_balance_charge(
+        bispinor, bispinor_gw_mode)
+    pauli_reference = bispinor and is_pauli_reference_model(bispinor_gw_mode)
+    # ``None`` is load-bearing for byte compatibility: every historical
+    # bare_transverse/non-bispinor density follows the old unsliced kernel.
+    charge_nspinor = int(wfn.nspinor) if pauli_reference else None
+    charge_representation = (
+        RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION if charge_bispinor else
+        PAULI_TWO_SPINOR_CHARGE_REPRESENTATION if bispinor else
+        SOURCE_WFN_CHARGE_REPRESENTATION)
     if bispinor and args.fold_hartree:
         raise SystemExit(
             "--fold-hartree is legacy scalar-only storage and is refused "
@@ -1280,6 +1334,12 @@ def main(argv=None):
             f"the deck's sigma window needs {nb_window}."
         )
     meta = Meta.from_system(wfn, sym, nval, ncond, nb_eff, 0, bispinor)
+    # Historical ``bare_transverse`` matrices are evaluated on Meta's raw4
+    # kinetic-balance carrier even though the source WFN itself stores only
+    # the normalized QE two-spinor.  Stamp the matrix carrier, not the file
+    # carrier; the Pauli-reference selector deliberately chooses the latter.
+    charge_matrix_nspinor = (
+        int(meta.nspinor) if charge_nspinor is None else charge_nspinor)
     nx, ny, nz = meta.fft_grid
     # ρ (and hence V_H) lives on the ψ FFT box, which for a BGW WFN is
     # already the ecutrho grid — do NOT let a stale ``grid_rho`` attribute
@@ -1298,7 +1358,10 @@ def main(argv=None):
     print0(f"Bands: {nb_eff} (deck nband={nband}, sigma window needs {nb_window}), "
           f"FFT grid: {meta.fft_grid}, k-points: {sym.nk_tot}")
     print0(f"sys_dim: {sys_dim}   bispinor: {bispinor}   "
+          f"bispinor_gw: {bispinor_gw_mode.value}   "
           f"nspin/nspinor: {int(getattr(wfn, 'nspin', 1))}/{int(wfn.nspinor)}")
+    print0(f"scalar charge: {charge_representation} "
+          f"(matrix nspinor={charge_matrix_nspinor})")
     print0(f"nval={nval} ncond={ncond} nelec(bands)={int(wfn.nelec)}")
     print0(f"Hartree folded in: {args.hartree}")
 
@@ -1474,6 +1537,7 @@ def main(argv=None):
                 mesh=mesh_xy,
                 band_chunk_size=int(params["band_chunk_size"]),
                 include_transverse=bispinor,
+                charge_nspinor=charge_nspinor,
                 print_fn=print0, owner_only=True,
                 k_set=("ibz" if store_ibz else "full"))
             if bispinor:
@@ -1669,6 +1733,11 @@ def main(argv=None):
                 ds.attrs["nband_input"] = nband
                 ds.attrs["nelec_bands"] = int(wfn.nelec)
                 ds.attrs["bispinor"] = bool(bispinor)
+                if pauli_reference:
+                    ds.attrs["bispinor_gw_mode"] = bispinor_gw_mode.value
+                    ds.attrs["charge_representation"] = charge_representation
+                    ds.attrs["spatial_current_representation"] = (
+                        RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
                 ds.attrs["nspinor"] = int(wfn.nspinor)
                 # WHICH V_NL PROJECTORS.  ``nspinor`` alone does NOT say:
                 # noncollinear is not spin-orbit, and a file written with
@@ -1724,7 +1793,10 @@ def main(argv=None):
                     vh.attrs["density_band_stop"] = (
                         hartree_density_band_stop)
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
-                    vh.attrs["matrix_nspinor"] = int(meta.nspinor)
+                    vh.attrs["matrix_nspinor"] = charge_matrix_nspinor
+                    if pauli_reference:
+                        vh.attrs["charge_representation"] = (
+                            charge_representation)
                 if v_h_transverse_all is not None:
                     vht = f.create_dataset(
                         TRANSVERSE_HARTREE_DATASET,
@@ -1740,6 +1812,9 @@ def main(argv=None):
                     vht.attrs["fft_grid"] = np.asarray(
                         meta.fft_grid, dtype=np.int32)
                     vht.attrs["matrix_nspinor"] = int(meta.nspinor)
+                    if pauli_reference:
+                        vht.attrs["spatial_current_representation"] = (
+                            RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
                     vht.attrs["source_wfn_nspinor"] = int(wfn.nspinor)
                     from common.bispinor_init import (
                         DIRAC_ALPHA_VERTEX_PROVENANCE,

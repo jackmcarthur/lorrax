@@ -662,18 +662,33 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     for nothing.
     """
     from common import sanity
+    from common.four_current_model import is_pauli_reference_model
 
-    if not sanity.sanity_enabled():
+    pauli_reference = is_pauli_reference_model(params.get("bispinor_gw"))
+    if not sanity.sanity_enabled() and not pauli_reference:
         return
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
     try:
         from psp.get_dipole_mtxels import check_dipole_provenance
     except Exception as exc:            # psp stack unavailable (h5py-less env)
+        if pauli_reference:
+            raise ValueError(
+                "GATE pauli_reference_charge_dipole_provenance: the "
+                "dipole provenance checker is unavailable, so the explicit "
+                "Pauli charge representation cannot be authenticated.") from exc
         print_fn(f"  [dipole provenance] check unavailable "
                  f"({type(exc).__name__}: {exc})")
         return
-    check_dipole_provenance(dipole_path, wfn=wfn, nval=nval, ncond=ncond,
-                            nband=nband, print_fn=print_fn)
+    expected_bispinor = params.get("_charge_bispinor")
+    authenticated = check_dipole_provenance(
+        dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
+        bispinor=expected_bispinor, print_fn=print_fn)
+    if pauli_reference and not authenticated:
+        raise ValueError(
+            "GATE pauli_reference_charge_dipole_provenance: the explicit "
+            "Pauli-reference comparison refuses a dipole/head artifact that "
+            "does not authenticate prov_bispinor=false. Regenerate dipole.h5 "
+            "from this exact deck.")
 
 
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
@@ -1698,6 +1713,11 @@ class HeadResolver:
             "nval": config.nval,
             "ncond": config.ncond,
             "nband": config.nband,
+            "bispinor_gw": getattr(
+                getattr(config, "bispinor_gw", "bare_transverse"),
+                "value", getattr(config, "bispinor_gw", "bare_transverse")),
+            "_charge_bispinor": bool(
+                int(getattr(meta, "nspinor", 1)) == 4),
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
             "vhead": head.vhead,

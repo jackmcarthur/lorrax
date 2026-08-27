@@ -63,7 +63,11 @@ from common.bispinor_init import (
 )
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
-from gw.gw_config import read_lorrax_input as read_cohsex_input
+from gw.gw_config import (
+	BispinorGWMode, coerce_bispinor_gw_mode,
+	read_lorrax_input as read_cohsex_input,
+	uses_raw_kinetic_balance_charge,
+)
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
@@ -1039,11 +1043,32 @@ def main(argv=None):
 			nband = int(nband_param)
 	except Exception:
 		nband = max(int(wfn.nbands), int(wfn.nelec) + int(ncond))
-	bispinor = bool(params.get("bispinor", False))
-	if args.static_gauge_hall_only and not bispinor:
+	four_current_bispinor = bool(params.get("bispinor", False))
+	bispinor_gw_mode = coerce_bispinor_gw_mode(
+		params.get("bispinor_gw", "bare_transverse"))
+	if (bispinor_gw_mode is
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
+			and not four_current_bispinor):
+		parser.error(
+			"bispinor_gw=pauli_reference_bare_transverse requires "
+			"bispinor=true; the selector does not enable spatial-current "
+			"channels implicitly")
+	if (args.static_gauge_hall_only and bispinor_gw_mode is
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE):
+		parser.error(
+			"bispinor_gw=pauli_reference_bare_transverse is a bare-TT "
+			"current-only comparison and does not define the FULL/static-Hall "
+			"response requested by --static-gauge-hall-only")
+	if args.static_gauge_hall_only and not four_current_bispinor:
 		parser.error(
 			"--static-gauge-hall-only requires bispinor=true so the canonical "
 			"kinetic-balance four-current is present")
+	# This producer owns the scalar charge/head vertex.  The comparison mode
+	# therefore loads the normalized QE two-spinor carrier here; the accepted
+	# raw four-spinor spatial-current vertices live only in the transverse
+	# Hartree and bare-TT exchange owners.
+	bispinor = uses_raw_kinetic_balance_charge(
+		four_current_bispinor, bispinor_gw_mode)
 
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``

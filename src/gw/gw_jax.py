@@ -100,7 +100,7 @@ import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
 	ScreeningDiagrams, refuse_unimplemented_compute_mode,
-	uses_static_photon_response)
+	uses_raw_kinetic_balance_charge, uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -300,6 +300,9 @@ def main(argv=None):
 		}[config.head.correction]))
 	if config.bispinor:
 		_bispinor_note = {
+			"pauli_reference_bare_transverse": (
+				" (normalized Pauli two-spinor charge/CC reference; raw "
+				"kinetic-balance only at spatial-current vertices)"),
 			"full_static_cohsex": (
 				" (experimental no-pair packed 4x4 static response; "
 				"head_correction=off)"),
@@ -366,14 +369,18 @@ def main(argv=None):
 		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
 
+	charge_bispinor = uses_raw_kinetic_balance_charge(
+		config.bispinor, config.bispinor_gw)
 	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband,
-	                        n_rmu, config.bispinor,
+	                        n_rmu, charge_bispinor,
 	                        nband_chi=config.bands.chi,
 	                        nband_sigma=config.bands.sigma)
 	meta.rank = RUNTIME.process_index
 	meta.n_proc = RUNTIME.process_count
 	meta.sys_dim = config.sys_dim
-	meta.bispinor = config.bispinor
+	# ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
+	# remains the independently parsed ``config.bispinor`` policy.
+	meta.bispinor = charge_bispinor
 	band_slices = BandSlices.from_band_edges(
 		*meta.band_edges, b4_chi=meta.b_id_4_chi, b4_sigma=meta.b_id_4_sigma)
 	# THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
@@ -810,6 +817,7 @@ def main(argv=None):
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
+		expected_bispinor_gw_mode=config.bispinor_gw.value,
 		wfn=wfn,
 		wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 		selected_hartree_source=hartree_source,

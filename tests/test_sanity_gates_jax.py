@@ -985,6 +985,37 @@ def test_fractional_weights_apply_identically_to_charge_and_dirac_current():
     assert float(np.max(np.abs(got - expected))) < 2.0e-13 * scale
 
 
+def test_pauli_reference_removes_only_small_component_charge():
+    """The comparison changes j0/electron count, never raw4 spatial J."""
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
+    rng = np.random.default_rng(20260826)
+    upper = (rng.standard_normal((1, 2, 3, 4, 5))
+             + 1j * rng.standard_normal((1, 2, 3, 4, 5)))
+    upper /= np.linalg.norm(upper)
+    lower = 0.02 * (
+        rng.standard_normal((1, 2, 3, 4, 5))
+        + 1j * rng.standard_normal((1, 2, 3, 4, 5)))
+    box4 = jnp.asarray(np.concatenate((upper, lower), axis=1),
+                       dtype=jnp.complex128)
+    kwargs = dict(nocc=None, weight=1.0, cell_volume=17.0,
+                  spin_degeneracy=1.0, include_dirac_current=True)
+    raw4 = np.asarray(valence_density_from_kpoint(box4, **kwargs))
+    split = np.asarray(valence_density_from_kpoint(
+        box4, charge_nspinor=2, **kwargs))
+    pauli2 = np.asarray(valence_density_from_kpoint(
+        box4[:, :2], nocc=None, weight=1.0, cell_volume=17.0,
+        spin_degeneracy=1.0))
+
+    # IFFT normalization gives integral rho = reciprocal-space norm.
+    dvol = 17.0 / float(np.prod(box4.shape[-3:]))
+    assert abs(float(split[0].sum()) * dvol - 1.0) < 2.0e-13
+    expected_excess = float(np.vdot(lower, lower).real)
+    assert abs(float((raw4[0] - split[0]).sum()) * dvol
+               - expected_excess) < 2.0e-13
+    assert np.array_equal(split[0], pauli2)
+    assert np.array_equal(split[1:], raw4[1:])
+
+
 def test_collective_helpers_are_the_identity_at_P1():
     """P=1 must not go anywhere near a collective — that is what makes
     the single-node CLI bit-identical to its pre-distribution self."""

@@ -39,6 +39,7 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.four_current_model import PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
 
 # The estimator vocabulary lives with the estimators, not here: a second copy
 # of the value list is a second thing to keep in step.  ``band_extrapolation``
@@ -295,6 +296,7 @@ class BispinorGWMode(str, enum.Enum):
     """
 
     BARE_TRANSVERSE = "bare_transverse"
+    PAULI_REFERENCE_BARE_TRANSVERSE = PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
     FULL_STATIC_COHSEX = "full_static_cohsex"
     CHARGE_HALL_CUBATURE = "charge_hall_cubature"
 
@@ -310,6 +312,25 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
             f"bispinor_gw={raw!r} is not a known mode; expected one of: "
             f"{', '.join(v.value for v in BispinorGWMode)}."
         ) from exc
+
+
+def uses_raw_kinetic_balance_charge(
+    bispinor: bool,
+    bispinor_gw,
+) -> bool:
+    """Whether scalar charge channels use the raw four-spinor carrier.
+
+    ``bispinor`` continues to mean that spatial-current channels are enabled.
+    The explicitly named Pauli-reference comparison is the sole exception to
+    the historical rule that the same raw kinetic-balance carrier also enters
+    charge density, scalar screening, and scalar self-energy.  Keeping this
+    decision here prevents preprocessing, charge ISDF, and the live driver
+    from deriving the representation split independently.
+    """
+    if not bool(bispinor):
+        return False
+    mode = coerce_bispinor_gw_mode(bispinor_gw)
+    return mode is not BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
 
 
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
@@ -3538,6 +3559,24 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"{mode.value} requires bispinor = true.  This axis selects "
             "four-current screening; it does not turn four-spinor "
             "wavefunctions on implicitly.")
+    if mode is BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE:
+        if bool(config.restart):
+            raise ValueError(
+                "GATE pauli_reference_restart_unavailable: "
+                "bispinor_gw = pauli_reference_bare_transverse requires "
+                "restart = false. Existing restart tensors do not carry "
+                "an authenticated scalar-carrier representation and could "
+                "silently substitute raw4 charge tensors for the normalized "
+                "Pauli reference. Fresh runs may still reuse each zeta file "
+                "through its carrier-specific provenance.")
+        if bool(config.write_restart_tensors):
+            raise ValueError(
+                "GATE pauli_reference_restart_write_unavailable: "
+                "bispinor_gw = pauli_reference_bare_transverse requires "
+                "write_restart_tensors = false. The current restart schema "
+                "cannot authenticate this mixed Pauli-charge/raw4-current "
+                "representation for a later consumer.")
+        return
     if (mode is BispinorGWMode.FULL_STATIC_COHSEX
             and config.head.correction is HeadCorrection.FULL):
         raise ValueError(

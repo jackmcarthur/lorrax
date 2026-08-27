@@ -686,6 +686,29 @@ def test_a_non_default_window_dipole_passes_its_own_provenance_guard(tmp_path):
     assert not any("DIFFERENT DFT solution" in ln for ln in lines), lines
 
 
+def test_pauli_reference_head_refuses_raw_lift_dipole_receipt(tmp_path):
+    import h5py
+    import pytest
+    from common.four_current_model import (
+        PAULI_REFERENCE_BARE_TRANSVERSE_MODEL)
+    from gw.head_correction import _check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole_raw4.h5"
+    _write_stamped(p, wfn, **_NONDEFAULT_WINDOW)
+    with h5py.File(p, "r+") as h5:
+        h5.attrs["prov_bispinor"] = True
+    params = _head_params(**_NONDEFAULT_WINDOW)
+    params.update({
+        "bispinor_gw": PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+        "_charge_bispinor": False,
+    })
+    with pytest.raises(
+            ValueError, match="pauli_reference_charge_dipole_provenance"):
+        _check_dipole_provenance(
+            p, params=params, wfn=wfn, print_fn=lambda *_args: None)
+
+
 def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):
     """RED arm: the guard has not been muted, only aimed.
 

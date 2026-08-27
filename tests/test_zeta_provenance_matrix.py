@@ -82,6 +82,7 @@ def _tid(cfg, cents_T=CENTS_T, solver_kind="lu"):
 
 
 def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
+          carrier_bispinor=None,
           cents_T=CENTS_T, solver_kind="lu", wfn_path="",
           band_range_left=(0, 26), band_range_right=(1, 128),
           logical_band_stop=128):
@@ -99,6 +100,7 @@ def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
         zeta_cutoff=30.0, zeta_vcoul_cutoff=30.0,
         write_ibz_only=True, band_norms=None,
         vertex_mu_L=vertex_mu_L,
+        carrier_bispinor=carrier_bispinor,
         transverse_identity=transverse_identity)
 
 
@@ -293,6 +295,22 @@ def test_provenance_collapse_nonbispinor_and_ridge_tau():
     d = json.loads(_prov(_cfg(bispinor=True, family="rank_truncate",
                               tau=1e-6)))
     assert d["transverse_zeta_rcond"] == 1e-6
+
+
+def test_pauli_charge_reuses_off_charge_stamp_but_raw4_tt_stays_pinned():
+    """Carrier identity, not the enclosing four-current policy, owns zeta."""
+    off_charge = _prov(_cfg(bispinor=False))
+    four_current_cfg = _cfg(bispinor=True)
+    pauli_charge = _prov(four_current_cfg, carrier_bispinor=False)
+    assert pauli_charge == off_charge
+
+    raw4_tt = json.loads(_prov(
+        four_current_cfg, vertex_mu_L=1, n_rmu=CENTS_T.shape[0],
+        carrier_bispinor=True))
+    assert raw4_tt["bispinor"] is True
+    assert raw4_tt["n_rmu_transverse"] == CENTS_T.shape[0]
+    assert raw4_tt["centroids_transverse_md5"] == \
+        gw_init._centroid_table_md5(CENTS_T)
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,10 @@ from __future__ import annotations
 import pathlib
 import pytest
 
-from gw.gw_config import LorraxConfig, QPSolver, qp_solver_semantics
+from gw.gw_config import (
+    BispinorGWMode, LorraxConfig, QPSolver,
+    qp_solver_semantics, uses_raw_kinetic_balance_charge,
+)
 
 
 BASE_INPUT = """\
@@ -119,6 +122,64 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
             tmp_path,
             "compute_mode = cohsex\nqp_solver = self_consistent\n"
             "sigma_omega_accumulation = kij_stream\n")
+
+
+def test_pauli_reference_selector_splits_charge_from_current(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = pauli_reference_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n")
+    assert cfg.bispinor_gw is (
+        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE)
+    assert not uses_raw_kinetic_balance_charge(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
+
+
+def test_pauli_reference_refuses_self_consistency(tmp_path):
+    with pytest.raises(
+            ValueError,
+            match="bispinor_current_hartree_self_consistency_unavailable"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n"
+            "qp_solver = self_consistent\n")
+
+
+def test_pauli_reference_requires_four_current_enablement(tmp_path):
+    with pytest.raises(ValueError, match="bispinor_gw_requires_bispinor"):
+        _config(
+            tmp_path,
+            "bispinor = false\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n")
+
+
+def test_pauli_reference_refuses_restart_read(tmp_path):
+    with pytest.raises(ValueError, match="pauli_reference_restart_unavailable"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = true\n"
+            "write_restart_tensors = false\n")
+
+
+def test_pauli_reference_refuses_restart_write(tmp_path):
+    with pytest.raises(
+            ValueError, match="pauli_reference_restart_write_unavailable"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = true\n")
 
 
 # ---------------------------------------------------------------------------
