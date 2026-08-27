@@ -1654,6 +1654,7 @@ def _plan_gflat_chunks_for_channel(
 		'gflat_chunk_size': int(gflat_plan.gflat_chunk_size),
 		'cache_psi_r': bool(gflat_plan.cache_psi_r),
 		'cache_face_y_blocks': bool(gflat_plan.cache_face_y_blocks),
+		'face_y_cache_r_tile': int(gflat_plan.face_y_cache_r_tile),
 		'gflat_hwm_gb': gflat_plan.hwm_bytes / 1e9,
 		'memory_estimate': {
 			'peak_estimate_gb': gflat_plan.hwm_bytes / 1e9,
@@ -1900,6 +1901,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				cache_psi_r=bool(chunks.get('cache_psi_r', True)),
 				cache_face_y_blocks=bool(
 					chunks.get('cache_face_y_blocks', False)),
+				face_y_cache_r_tile=int(
+					chunks.get('face_y_cache_r_tile', 0)),
 				write_ibz_only=_write_ibz_only_charge,
 				zeta_cutoff_ry=_zeta_cutoff,
 				print_fn=print_fn,
@@ -2130,6 +2133,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
 					cache_face_y_blocks=bool(
 						_chunks_T.get('cache_face_y_blocks', False)),
+					face_y_cache_r_tile=int(
+						_chunks_T.get('face_y_cache_r_tile', 0)),
 					vertex_mu_L=mu_L,
 					bispinor_lift=(representation.current_lift or "raw"),
 					# Transverse ζ IBZ-write activates whenever the

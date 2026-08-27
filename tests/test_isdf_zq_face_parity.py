@@ -323,6 +323,19 @@ def _worker(case_name: str) -> int:
         gamma_L=gamma_L, gamma_R=gamma_R,
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
         cache_face_y_blocks=True))
+    # Two equal global-r cache transactions (local width 3 on Py=2).  This
+    # is the performance-cliff repair: the outer 12-cell solve carrier stays
+    # unchanged, while each 6-cell Y cache is reused across every spin pair.
+    Z_face_streamed_tiled = jax.block_until_ready(z_q_from_psi_sm(
+        psi_G_store=streamed_store, psi_r_cache=None,
+        band_chunk_ranges=band_chunk_ranges,
+        r_start_dyn=r_start, r_chunk_size=n_zchunk,
+        kgrid=kgrid, mesh_xy=mesh,
+        layout="face",
+        psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
+        gamma_L=gamma_L, gamma_R=gamma_R,
+        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
+        cache_face_y_blocks=True, face_y_cache_r_tile=6))
     Z_face_streamed_repeated = jax.block_until_ready(z_q_from_psi_sm(
         psi_G_store=streamed_store, psi_r_cache=None,
         band_chunk_ranges=band_chunk_ranges,
@@ -361,7 +374,7 @@ def _worker(case_name: str) -> int:
             lq_shard)
         vertex_mu = gamma_mu_L if gamma_mu_L == gamma_nu_L else 0
 
-        def _fit(cache_y):
+        def _fit(cache_y, cache_r_tile=0):
             return jax.block_until_ready(fit_one_rchunk(
                 psi_G_store=cached_store, psi_r_cache=psi_r_cache, L_q=L_q,
                 r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
@@ -375,9 +388,10 @@ def _worker(case_name: str) -> int:
                 zeta_gather="distributed", layout="face",
                 psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
                 weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
-                cache_face_y_blocks=cache_y))
+                cache_face_y_blocks=cache_y,
+                face_y_cache_r_tile=cache_r_tile))
 
-        fit_outputs = (_fit(True), _fit(False))
+        fit_outputs = (_fit(True), _fit(True, 6), _fit(False))
 
     # process_allgather, NOT device_get: both are genuinely multi-process
     # sharded (P(None,'x','y')) under a REAL multi-process mesh (the
@@ -390,6 +404,8 @@ def _worker(case_name: str) -> int:
     Zf = np.asarray(_mhu.process_allgather(Z_face, tiled=True))
     Zfsc = np.asarray(_mhu.process_allgather(
         Z_face_streamed_cached, tiled=True))
+    Zfst = np.asarray(_mhu.process_allgather(
+        Z_face_streamed_tiled, tiled=True))
     Zfsr = np.asarray(_mhu.process_allgather(
         Z_face_streamed_repeated, tiled=True))
     fit_outputs_np = tuple(
@@ -397,7 +413,7 @@ def _worker(case_name: str) -> int:
         for value in fit_outputs)
     Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
-        comparisons = (Zf, Zfsc, Zfsr, *fit_outputs_np)
+        comparisons = (Zf, Zfsc, Zfst, Zfsr, *fit_outputs_np)
     else:
         # Independent-width reference: the full-grid face evaluation has
         # no out-of-range slice.  Its final logical cells must be retained
@@ -419,7 +435,7 @@ def _worker(case_name: str) -> int:
             axis=-1)
         Zls = np.asarray(_mhu.process_allgather(
             Z_legacy_streamed, tiled=True))
-        comparisons = (Zf, Zfsc, Zfsr, Zl, Zls, *fit_outputs_np)
+        comparisons = (Zf, Zfsc, Zfst, Zfsr, Zl, Zls, *fit_outputs_np)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -438,6 +454,10 @@ def _worker(case_name: str) -> int:
     max_abs = max(float(np.abs(value - reference).max())
                   for value in comparisons)
     max_rel = max_abs / max(ref_scale, 1e-300)
+    route_max_abs = max(
+        float(np.abs(Zfst - Zfsc).max()),
+        float(np.abs(Zfst - Zfsr).max()))
+    route_max_rel = route_max_abs / max(float(np.abs(Zfsc).max()), 1e-300)
     for store in (cached_store, streamed_store):
         store.close()
         for attr, expected in (
@@ -458,6 +478,8 @@ def _worker(case_name: str) -> int:
         "gamma_mu_L": gamma_mu_L, "gamma_nu_L": gamma_nu_L,
         "tail_logical": tail_logical, "r_start": r_start,
         "fit_one_rchunk_routes": len(fit_outputs_np),
+        "cache_route_max_abs": route_max_abs,
+        "cache_route_max_rel": route_max_rel,
     }))
     return 0
 
@@ -501,6 +523,25 @@ def test_zq_face_layout_matches_legacy(name, kwargs):
     assert out["max_rel"] < _TOL, (
         f"z_q_from_psi_sm layout='face' vs 'legacy' parity FAILED: "
         f"max relative diff {out['max_rel']:.3e} (case {name})")
+    assert out["cache_route_max_rel"] < _TOL, (
+        "full-cache vs two-tile-cache vs repeated-route parity FAILED: "
+        f"max relative diff {out['cache_route_max_rel']:.3e} (case {name})")
+
+
+def test_local_y_shard_tile_reconstruction_order_complex128():
+    """The tile scan's transpose/reshape restores each local y-shard exactly."""
+    import numpy as np
+
+    rng = np.random.default_rng(20260827)
+    # Z_R local shape is (kx,ky,kz,r_loc,mu); scan prepends ntiles.
+    local = _crand(rng, 2, 2, 1, 10, 3)
+    scan_tiles = np.stack(np.split(local, 2, axis=3), axis=0)
+    restored = np.transpose(scan_tiles, (1, 2, 3, 0, 4, 5)).reshape(
+        local.shape)
+    assert restored.dtype == np.complex128
+    np.testing.assert_array_equal(restored, local)
+    # A raw reshape would interleave k/r axes and is a discriminating oracle.
+    assert not np.array_equal(scan_tiles.reshape(local.shape), local)
 
 
 def test_band_chunks_must_complete_before_pair_product():
@@ -532,6 +573,9 @@ def _cli_main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--mesh", default="2x2", help="PxQ process mesh")
+    ap.add_argument(
+        "--case", choices=tuple(_CASES_BY_NAME), default=None,
+        help="Run one focused case (default: the complete parity sweep)")
     args = ap.parse_args()
     px, py = (int(v) for v in args.mesh.lower().split("x"))
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
@@ -549,7 +593,9 @@ def _cli_main():
 
     os.environ["XLA_FLAGS"] = os.environ.get("XLA_FLAGS", "")
     failures = 0
-    for name, _kwargs in _ALL_CASES:
+    selected_cases = (_ALL_CASES if args.case is None else
+                      ((args.case, _CASES_BY_NAME[args.case]),))
+    for name, _kwargs in selected_cases:
         try:
             rc = _worker_inline(name)
         except Exception as exc:  # noqa: BLE001 -- report, don't crash the sweep
@@ -583,7 +629,8 @@ def _cli_main():
         "runtime_hbm_bytes_limit_min": int(gathered_hbm[:, 2].min()),
         "runtime_hbm_ranks": int(gathered_hbm.shape[0]),
     }))
-    p0(f"done: {len(_ALL_CASES) - failures}/{len(_ALL_CASES)} cases passed")
+    p0(f"done: {len(selected_cases) - failures}/"
+       f"{len(selected_cases)} cases passed")
     return 1 if failures else 0
 
 

@@ -49,6 +49,36 @@ def round_up(n: int, divisor: int) -> int:
     return ((int(n) + d - 1) // d) * d
 
 
+def bounded_partition_tile(extent: int, max_tile: int, alignment: int) -> int:
+    """Largest equal-partition tile not exceeding ``max_tile``.
+
+    Returns a positive tile that divides ``extent`` exactly and is itself a
+    multiple of ``alignment``.  The helper is for a sharded outer extent that
+    must be processed as equal static-shape internal tiles: exact division
+    avoids a second remainder executable, while alignment preserves the
+    sharding contract of every tile.  Returns 0 when no positive aligned tile
+    can fit under the cap.
+
+    This is selection arithmetic only; it neither pads nor changes the outer
+    logical extent.  In particular, an explicit outer chunk remains exactly
+    the size the caller requested.
+    """
+    n = int(extent)
+    cap = int(max_tile)
+    align = max(int(alignment), 1)
+    if n <= 0 or cap < align or n % align:
+        return 0
+    units = n // align
+    cap_units = min(units, cap // align)
+    if cap_units <= 0:
+        return 0
+    min_tiles = (units + cap_units - 1) // cap_units
+    for ntiles in range(min_tiles, units + 1):
+        if units % ntiles == 0:
+            return (units // ntiles) * align
+    return 0
+
+
 def extra_mu_pad() -> int:
     """TEST-ONLY: extra μ-pad rows requested via ``LORRAX_EXTRA_MU_PAD``.
 

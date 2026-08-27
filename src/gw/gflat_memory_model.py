@@ -98,7 +98,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.gpu_utils import bfc_fragmentation_target_utilization
-from runtime.padding import round_up
+from runtime.padding import bounded_partition_tile, round_up
 
 # The planner's ONE printing path: every fallback below announces its demotion
 # through this, once per process, tagged with the rank it happened on.  (Safe
@@ -469,6 +469,11 @@ class GFlatChunkPlan:
     #: spin pair; False repeats one bounded transform/scatter and is the
     #: always-valid large-band fallback.  Planner-owned, never a knob.
     cache_face_y_blocks: bool = False
+    #: Global-r width of one internal Y-cache tile.  Equal to ``r_chunk``
+    #: for the original one-pass cache.  Smaller means the explicit outer
+    #: chunk is partitioned into equal cache-sized transactions, preserving
+    #: solve amortization without crossing into the ns² repeated route.
+    face_y_cache_r_tile: int = 0
     #: Per-rank bytes in the selected face Y cache at resolved r width.
     face_y_cache_bytes: float = 0.0
 
@@ -488,7 +493,10 @@ class GFlatChunkPlan:
                 "hoisted all-band cache" if self.cache_psi_r else
                 "streamed band-chunk FFT (low-memory fallback)"),
             "    face Y route  = " + (
-                "current-r cache" if self.cache_face_y_blocks else
+                (("current-r cache" if self.face_y_cache_r_tile == self.r_chunk
+                  else f"tiled current-r cache ({self.r_chunk // max(self.face_y_cache_r_tile, 1)}"
+                       f" x {self.face_y_cache_r_tile})"))
+                if self.cache_face_y_blocks else
                 ("repeated bounded transform" if self.psi_layout == "face"
                  else "n/a (legacy layout)")),
             *([f"    face Y cache = "
@@ -838,6 +846,7 @@ def plan_gflat_chunks(
     # build, scalar-pair accumulation/final k FFT, and the all-P-aligned
     # solve seam.  Keep them separate; adding them invents a live set.
     cache_face_y_blocks = False
+    face_y_cache_r_tile = 0
     face_terms = None
     face_cache_build_t = 0.0
     face_y_cache_bytes = 0.0
@@ -885,7 +894,16 @@ def plan_gflat_chunks(
         route_width = max(
             r_alignment,
             route_width - route_width % max(r_alignment, 1))
-        cache_face_y_blocks = bool(ns > 1 and cache_cap >= route_width)
+        route_tile = bounded_partition_tile(
+            route_width, cache_cap, r_alignment)
+        route_tiles = (route_width // route_tile) if route_tile else 0
+        # The bounded fallback executes one transform per scalar spin pair.
+        # A tiled cache is useful only while it executes strictly fewer
+        # transforms than that fallback; otherwise retain the smaller-memory
+        # incumbent.  The outer r chunk is unchanged either way.
+        cache_face_y_blocks = bool(
+            ns > 1 and route_tile > 0 and route_tiles < ns * ns)
+        face_y_cache_r_tile = route_tile if cache_face_y_blocks else 0
         if cache_face_y_blocks:
             C_slope = face_terms["cache_pair_slope"]
             C_constant = face_terms["constant"]
@@ -950,6 +968,17 @@ def plan_gflat_chunks(
         r_chunk = max(
             r_alignment, r_chunk - r_chunk % r_alignment)
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
+    if cache_face_y_blocks:
+        face_y_cache_r_tile = bounded_partition_tile(
+            r_chunk, cache_cap, r_alignment)
+        if (face_y_cache_r_tile <= 0
+                or r_chunk // face_y_cache_r_tile >= ns * ns):
+            # This can only differ from ``route_width`` on an auto-selected
+            # outer extent.  Fail back to the always-valid bounded route; do
+            # not pretend a cache transaction exists when its equal static
+            # tiles would execute no fewer transforms.
+            cache_face_y_blocks = False
+            face_y_cache_r_tile = 0
 
     # ---- gflat_chunk_size (Stage D FFT box) ----------------------------
     fft_per_row = _c128(n_rtot) * 2.0   # accumulate box has no ns axis
@@ -1034,13 +1063,24 @@ def plan_gflat_chunks(
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
     if low_mem_bands:
-        C_fit_t = C_constant + C_slope * r_chunk
         if cache_face_y_blocks:
-            face_y_cache_bytes = face_terms["y_cache_slope"] * r_chunk
+            _cache_tile = face_y_cache_r_tile
+            C_fit_t = (face_terms["constant"]
+                       + face_terms["cache_pair_slope"] * _cache_tile)
+            face_y_cache_bytes = (
+                face_terms["y_cache_slope"] * _cache_tile)
+            # Each tile's canonical transform still sees the full OUTER
+            # chunk before selecting this rank's local-r tile.  Price that
+            # one-block transient at r_chunk, while only the stacked cache
+            # scales with the internal tile.
             face_cache_build_t = (
                 face_terms["constant"]
                 + (0.0 if cache_psi_r else fft_box_zeta_transform)
-                + face_terms["cache_build_slope"] * r_chunk)
+                + face_terms["y_cache_slope"] * _cache_tile
+                + (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+                   + face_terms["y_source_slope"]) * r_chunk)
+        else:
+            C_fit_t = C_constant + C_slope * r_chunk
     else:
         C_fit_t = C_slope * r_chunk
         if not cache_psi_r:
@@ -1170,5 +1210,6 @@ def plan_gflat_chunks(
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),
         cache_face_y_blocks=bool(cache_face_y_blocks),
+        face_y_cache_r_tile=int(face_y_cache_r_tile),
         face_y_cache_bytes=float(face_y_cache_bytes),
     )
