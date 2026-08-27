@@ -172,6 +172,7 @@ class PsiGStore:
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
         band_pad_to: int | None = None,
     ):
         self.loader = loader
@@ -179,6 +180,7 @@ class PsiGStore:
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
         self.bispinor = bool(bispinor)
+        self.bispinor_lift = str(bispinor_lift)
 
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
@@ -313,7 +315,8 @@ class PsiGStore:
                 psi_G_bc = load_psi_gflat_padded(
                     self.loader, (bc_start, bc_end), mesh_xy=self.mesh,
                     bispinor=self.bispinor, k="full_bz",
-                    pad_to=self._band_pad_to, sharding=sharding_spec)
+                    pad_to=self._band_pad_to, sharding=sharding_spec,
+                    bispinor_lift=self.bispinor_lift)
                 if psi_G_bc is not None:
                     jax.block_until_ready(psi_G_bc)
             if psi_G_bc is None:
@@ -605,6 +608,7 @@ def build_psi_G_store(
     meta,
     band_chunk_ranges,
     bispinor: bool = False,
+    bispinor_lift: str = "raw",
     band_pad_to: int | None = None,
 ) -> PsiGStore:
     """Construct the one ψ(G-flat) host store.
@@ -624,4 +628,5 @@ def build_psi_G_store(
     return PsiGStore(
         loader=loader, mesh_xy=mesh_xy,
         band_chunk_ranges=band_chunk_ranges, meta=meta,
-        bispinor=bispinor, band_pad_to=band_pad_to)
+        bispinor=bispinor, bispinor_lift=bispinor_lift,
+        band_pad_to=band_pad_to)

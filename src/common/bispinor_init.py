@@ -34,9 +34,27 @@ NO_PAIR_DIRAC_CURRENT_MODEL = (
 KINETIC_BALANCE_LIFT_PROVENANCE = (
     "psi_S=(alpha_fs/2)*sigma.p*psi_L"
 )
+ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
+    "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
+)
+RAW_KINETIC_BALANCE_LIFT = "raw"
+ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
 )
+
+
+def kinetic_balance_lift_provenance(representation: str) -> str:
+    """Return the authenticated provenance for one lift selector."""
+    mode = str(representation).strip().lower()
+    if mode == RAW_KINETIC_BALANCE_LIFT:
+        return KINETIC_BALANCE_LIFT_PROVENANCE
+    if mode == ISOMETRIC_KINETIC_BALANCE_LIFT:
+        return ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE
+    raise ValueError(
+        f"unknown kinetic-balance representation {representation!r}; "
+        f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
+        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
 
 
 def sigma_dot_cartesian(psi_L, vector_cart):
@@ -130,13 +148,22 @@ def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
     )[0, :, 2:4, :]
 
 
-def lift_to_4spinor(psi_2, gvecs, kvecs, bvec_cart_bohr):
+def lift_to_4spinor(
+    psi_2, gvecs, kvecs, bvec_cart_bohr, *,
+    representation: str = RAW_KINETIC_BALANCE_LIFT,
+):
     """k-batched 2-spinor ψ → 4-spinor ψ via the small-component lift.
 
-    Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components: the same
-    physics as :func:`get_small_psi_component`, vectorised across a leading
-    k-axis and concatenated into a 4-spinor.  Pure ``jnp`` (no jit / sharding
-    here — the caller wraps it; see ``WfnLoader._get_bispinor_lift_jit``).
+    Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
+    The default ``representation='raw'`` is the historical map, unchanged.
+    ``representation='isometric'`` applies the pointwise scalar
+
+    ``r(G) = 1/sqrt(1 + [(α/2)|k+G|]^2)``
+
+    to both upper and lower blocks.  Since ``(σ·K)†(σ·K)=|K|² I``, this is
+    exactly ``[I;X](I+X†X)^(-1/2)`` without a redundant 2×2 matrix inverse.
+    Pure ``jnp`` (no jit / sharding here — the caller wraps it; see
+    ``WfnLoader._get_bispinor_lift_jit``).
 
     This is the single home of the k-batched lift, imported by
     ``wfn_loader``; do not re-copy the constant + σ·p block there.
@@ -165,4 +192,15 @@ def lift_to_4spinor(psi_2, gvecs, kvecs, bvec_cart_bohr):
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
     psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
         psi_2, p_cart)
-    return jnp.concatenate([psi_2, psi_S], axis=2)           # (n_k, nb, 4, ngkmax)
+    lifted = jnp.concatenate([psi_2, psi_S], axis=2)
+    mode = str(representation).strip().lower()
+    if mode == RAW_KINETIC_BALANCE_LIFT:
+        return lifted
+    if mode != ISOMETRIC_KINETIC_BALANCE_LIFT:
+        raise ValueError(
+            f"unknown kinetic-balance representation {representation!r}; "
+            f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
+            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
+    x2 = jnp.float64(HALFALPHA) ** 2 * jnp.sum(p_cart * p_cart, axis=-1)
+    r = jnp.reciprocal(jnp.sqrt(jnp.float64(1.0) + x2))
+    return lifted * r[:, None, None, :]

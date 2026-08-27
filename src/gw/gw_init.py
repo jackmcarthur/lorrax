@@ -26,10 +26,13 @@ from common import jax_profile
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
 from common.four_current_model import (
+	ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+	ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
 	is_pauli_reference_model,
 	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
 	PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
 	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+	resolve_four_current_representation,
 )
 from runtime import debug_print_enabled
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
@@ -45,6 +48,7 @@ from .gw_config import (
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
 	refuse_unsupported_bispinor_tt_head_correction,
+	refuse_unsupported_bispinor_gw,
 	refuse_unsupported_low_mem_bands,
 	resolve_xla_gpu_memory_env,
 	uses_coupled_photon_head,
@@ -177,7 +181,8 @@ _ZETA_PROVENANCE_SCHEMA = 2
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
                          write_ibz_only, band_norms, vertex_mu_L=0,
-                         carrier_bispinor=None, transverse_identity=None):
+                         carrier_bispinor=None, carrier_lift=None,
+                         transverse_identity=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -389,6 +394,10 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
+	# Additive only for the new normalized carrier.  Historical raw4 and
+	# Pauli-reference stamps remain byte-for-byte reusable.
+	if carrier_lift is not None:
+		prov['bispinor_lift'] = str(carrier_lift)
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
 	# every transverse fit retain their byte-identical schema-1 provenance;
 	# an old asymmetric LR-only stamp lacks this non-legacy key and therefore
@@ -776,12 +785,15 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	``psi_mun_fresh``/``psi_nmu_fresh`` carry the face arrays instead.
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked
+	representation = resolve_four_current_representation(
+		cfg.bispinor, cfg.bispinor_gw)
 	with timing.section("gw_jax.load_centroid_wfns_current"):
 		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
 			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
 			band_range=band_slices.full_range,
 			band_chunk_size=int(band_chunk_size),
 			k_chunk_size=k_chunk_size,
+			bispinor_lift=representation.current_lift,
 		)
 	psi_mun_fresh_T = None
 	psi_nmu_fresh_T = None
@@ -1433,6 +1445,16 @@ def _resolve_zeta_fit_contract(
 			os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
 			for mu_L in (1, 2, 3))
 
+	representation = resolve_four_current_representation(
+		cfg.bispinor, cfg.bispinor_gw)
+	_normalized_charge_lift = (
+		representation.charge_lift
+		if representation.charge_representation ==
+		ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION else None)
+	_normalized_current_lift = (
+		representation.current_lift
+		if representation.spatial_current_representation ==
+		ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION else None)
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
@@ -1443,6 +1465,7 @@ def _resolve_zeta_fit_contract(
 		write_ibz_only=write_ibz_only_charge,
 		band_norms=band_norms,
 		carrier_bispinor=bool(int(meta.nspinor) == 4),
+		carrier_lift=_normalized_charge_lift,
 		vertex_mu_L=0, transverse_identity=transverse_identity)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
@@ -1454,6 +1477,7 @@ def _resolve_zeta_fit_contract(
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
+			carrier_lift=_normalized_current_lift,
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
@@ -1740,6 +1764,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	"""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
+	representation = resolve_four_current_representation(
+		cfg.bispinor, cfg.bispinor_gw)
 	# Honour cohsex.in ``gamma_contract_mode`` for the γ̃·γ̃ kernel
 	# inside the monolithic pair pipeline.  Mode is module-level (the
 	# γ̃ contract sits inside shard_map bodies so threading a kwarg
@@ -1877,6 +1903,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				low_mem_bands=bool(cfg.memory.low_mem_bands),
 				psi_nmu_fresh=psi_nmu_fresh,
 				psi_mun_fresh=psi_mun_fresh,
+				bispinor_lift=(representation.charge_lift or "raw"),
 			)
 
 	# Device kernels can only record closure/certification findings.  The
@@ -2101,6 +2128,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					cache_face_y_blocks=bool(
 						_chunks_T.get('cache_face_y_blocks', False)),
 					vertex_mu_L=mu_L,
+					bispinor_lift=(representation.current_lift or "raw"),
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
 					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off),
@@ -2375,6 +2403,12 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		with timing.section("gw_jax.V_q_compute"), \
 		     jax_profile.trace_section("V_q_compute_bispinor"):
 			_pauli_reference = is_pauli_reference_model(cfg.bispinor_gw)
+			_representation = resolve_four_current_representation(
+				cfg.bispinor, cfg.bispinor_gw)
+			_explicit_representation = bool(
+				_pauli_reference
+				or _representation.charge_representation ==
+				ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION)
 			# G-flat path: per-q + G-chunked, one orchestrator per
 			# four ζ files.  No legacy compute_V_q_tile chooser /
 			# μ × ν tiling / in-V_q FFT — see
@@ -2411,14 +2445,14 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						tt_head_correction=bool(
 							cfg.head.bispinor_tt_head_correction),
 						bispinor_gw_mode=(
-							PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
-							if _pauli_reference else None),
+							str(getattr(cfg.bispinor_gw, "value", cfg.bispinor_gw))
+							if _explicit_representation else None),
 						charge_representation=(
-							PAULI_TWO_SPINOR_CHARGE_REPRESENTATION
-							if _pauli_reference else None),
+							_representation.charge_representation
+							if _explicit_representation else None),
 						spatial_current_representation=(
-							RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION
-							if _pauli_reference else None),
+							_representation.spatial_current_representation
+							if _explicit_representation else None),
 					)
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
@@ -2670,10 +2704,13 @@ def prepare_isdf_and_wavefunctions(
 	# retaining the one centralized call keeps future capability rows from
 	# growing ad-hoc guards in either branch.
 	refuse_unsupported_low_mem_bands(cfg)
+	refuse_unsupported_bispinor_gw(cfg)
 	# Same shape, same two-call-site reason: parser-altitude coverage is
 	# duplicated here for a hand-built cfg.  No-op at the default (false).
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
 	from file_io.wfn_basis import WavefunctionBasisReceipt
+	representation = resolve_four_current_representation(
+		cfg.bispinor, cfg.bispinor_gw)
 	# The receipt's band interval is PHYSICAL, not the mesh-padded carrier
 	# edge.  ``b_id_4_user`` is the exact loaded WFN boundary; ``b4`` may be
 	# rounded past WFN.nbands and names allocation only.
@@ -2694,6 +2731,7 @@ def prepare_isdf_and_wavefunctions(
 			wfn=wfn,
 			wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
 			role='charge', bispinor=bool(int(meta.nspinor) == 4),
+			bispinor_lift=(representation.charge_lift or "raw"),
 			band_interval=_basis_band_interval,
 			fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
 			n_rmu_logical=int(meta.n_rmu),
@@ -2742,6 +2780,7 @@ def prepare_isdf_and_wavefunctions(
 						chunks['centroid_k_chunk']
 						if chunks is not None
 						else zeta_contract.loader_k_chunk),
+					bispinor_lift=(representation.charge_lift or "raw"),
 				)
 
 			# ``low_mem_bands = true``: convert to the two-face carrier
@@ -2797,6 +2836,7 @@ def prepare_isdf_and_wavefunctions(
 						wfn_fingerprint_binding=(
 							basis_wfn_fingerprint_binding),
 						role='transverse', bispinor=True,
+						bispinor_lift=(representation.current_lift or "raw"),
 						band_interval=_basis_band_interval,
 						fft_grid=_meta_receipt_T.fft_grid,
 						centroid_fft_idx=(

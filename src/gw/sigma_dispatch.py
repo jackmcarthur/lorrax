@@ -358,9 +358,10 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
     requested = getattr(config, "hartree_source", "auto")
     source = resolve_hartree_source(path, requested, print_fn=print_fn)
     require_transverse = bool(config.bispinor)
-    from .gw_config import uses_raw_kinetic_balance_charge
-    charge_bispinor = uses_raw_kinetic_balance_charge(
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
         config.bispinor, config.bispinor_gw)
+    charge_bispinor = representation.charge_bispinor
     if require_transverse and source == "folded":
         raise ValueError(
             "kinetic-balance bispinor GW refuses a legacy folded kin_ion "
@@ -418,6 +419,7 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
             charge_nspinor=(
                 int(wfn.nspinor)
                 if require_transverse and not charge_bispinor else None),
+            bispinor_lift=(representation.current_lift or "raw"),
             print_fn=print_fn)
         v_h_np = (exact_hartree.charge if require_transverse
                   else exact_hartree)

@@ -73,7 +73,7 @@ import common.timing as timing
 from .gw_config import (
 	HeadCorrection, LorraxConfig, QPSolver,
 	ScreeningDiagrams, refuse_unimplemented_compute_mode,
-	uses_raw_kinetic_balance_charge, uses_static_photon_response)
+	uses_four_spinor_finite_q_charge, uses_static_photon_response)
 from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
@@ -334,7 +334,7 @@ def main(argv=None):
 		cell_volume=wfn.cell_volume, print_fn=print0,
 	)
 
-	charge_bispinor = uses_raw_kinetic_balance_charge(
+	charge_bispinor = uses_four_spinor_finite_q_charge(
 		config.bispinor, config.bispinor_gw)
 	meta = Meta.from_system(wfn, sym, config.nval, config.ncond, config.nband,
 	                        n_rmu, charge_bispinor,

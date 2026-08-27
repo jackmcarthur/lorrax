@@ -13,6 +13,7 @@ import common.bispinor_init as bispinor_init
 from common.bispinor_init import (
     ALPHA_FS,
     HALFALPHA,
+    ISOMETRIC_KINETIC_BALANCE_LIFT,
     kinetic_balance_lift_jet,
     lift_to_4spinor,
     sigma_dot_cartesian,
@@ -56,6 +57,23 @@ def test_sigma_dot_matches_independent_cartesian_pauli_matrices():
         "aij,kga,kbjg->kbig", _PAULI, vector, psi, optimize=True)
     got = sigma_dot_cartesian(jnp.asarray(psi), jnp.asarray(vector))
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=2.0e-15)
+
+
+def test_isometric_lift_preserves_each_g_point_norm():
+    psi = _large_spinors()
+    gvecs = np.asarray([
+        [[0, 0, 0], [1, 0, 0], [0, -1, 1]],
+        [[0, 0, 0], [-1, 1, 0], [1, 1, -1]],
+    ], dtype=np.float64)
+    kvecs = np.asarray([[0.19, -0.17, 0.12], [-0.08, 0.11, 0.21]])
+    bvec = np.asarray([
+        [1.10, 0.18, 0.02], [0.00, 0.93, 0.16], [0.07, 0.00, 1.04]])
+    lifted = lift_to_4spinor(
+        jnp.asarray(psi), jnp.asarray(gvecs), jnp.asarray(kvecs),
+        jnp.asarray(bvec), representation=ISOMETRIC_KINETIC_BALANCE_LIFT)
+    source_norm = np.sum(np.abs(psi) ** 2, axis=2)
+    lifted_norm = np.sum(np.abs(np.asarray(lifted)) ** 2, axis=2)
+    np.testing.assert_allclose(lifted_norm, source_norm, rtol=3e-15, atol=3e-15)
 
 
 @pytest.mark.parametrize("at_origin", [False, True])
