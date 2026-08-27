@@ -105,16 +105,6 @@ from .gw_output import (
 	write_results,
 )
 
-# A replicated dynamic-Sigma cube larger than this is not a production
-# multi-rank layout.  This is a cap on ONE c128 producer, not a claim about
-# the total device budget: output scaling, total-Sigma assembly and the
-# symmetry diagnostic each demand that producer after the physics kernels.
-# JID 57638248.29 failed on exactly that demand at 4.28 GiB/rank; the
-# ceiling is placed below that measured red point.  Larger objects belong
-# on the distributed route.
-_REPLICATED_SIGMA_CUBE_CAP_BYTES = 4 * 2**30
-
-
 def _setup_runtime() -> None:
 	"""Pre-init MPI for the one parallel-HDF5 transport.
 
@@ -403,10 +393,20 @@ def main(argv=None):
 	if (mode.is_dynamic
 			and not _wants_sharded_cube
 			and int(RUNTIME.process_count) > 1):
+		# The cube is an additional late-stage BFC producer, after the memory
+		# planners have spent their stage budgets.  Price it against the
+		# canonical retained headroom rather than a GPU-model-specific byte
+		# constant.  This leaves the same 10% reserve on a 40- or 80-GB lane;
+		# JID 57638248.29 crossed it at 4.28 GiB against a 35-GB deck budget.
+		from common.gpu_utils import bfc_fragmentation_target_utilization
+		_headroom_fraction = (
+			1.0 - bfc_fragmentation_target_utilization(width_factor=1))
+		_budget_bytes = float(config.memory.per_device_gb) * 1.0e9
+		_replicated_cap_bytes = int(_headroom_fraction * _budget_bytes)
 		_nw = int(np.asarray(config.sigma.omega_grid_ev).size)
 		_nk = int(meta.nk_tot)
 		_cube_bytes = _nw * _nk * _nbs * _nbs * np.dtype(np.complex128).itemsize
-		if _cube_bytes > _REPLICATED_SIGMA_CUBE_CAP_BYTES:
+		if _cube_bytes > _replicated_cap_bytes:
 			_mesh_multiple = int(np.lcm(_p_x, _p_y))
 			_next_nb = -(-_nbs // _mesh_multiple) * _mesh_multiple
 			raise ValueError(
@@ -415,8 +415,10 @@ def main(argv=None):
 				f"complex128 Sigma_c[{_nw},{_nk},{_nbs},{_nbs}] = "
 				f"{_cube_bytes / 2**30:.2f} GiB on every one of "
 				f"{int(RUNTIME.process_count)} ranks, above the "
-				f"{_REPLICATED_SIGMA_CUBE_CAP_BYTES / 2**30:.2f}-GiB "
-				f"multi-rank replicated-cube ceiling.  The output expressions "
+				f"{_replicated_cap_bytes / 2**30:.2f}-GiB retained headroom "
+				f"({_headroom_fraction:.0%} of the "
+				f"{float(config.memory.per_device_gb):.1f}-GB/device budget).  "
+				f"The output expressions "
 				f"must materialize that lazy producer after the physics kernels; "
 				f"SlabIO can bound file slabs but cannot bound the producer.  Set "
 				f"sigma_omega_layout = sharded and choose nval+ncond divisible "
