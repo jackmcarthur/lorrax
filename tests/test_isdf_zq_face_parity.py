@@ -80,6 +80,7 @@ def _crand(rng, *shape):
 _CASES = (
     ("ns1_asym",       dict(ns=1, l_range=(0, 21), r_range=(9, 36), seed=1)),
     ("ns2_spinor",     dict(ns=2, l_range=(0, 21), r_range=(9, 36), seed=2)),
+    ("ns4_charge",     dict(ns=4, l_range=(0, 21), r_range=(9, 36), seed=5)),
     ("ns1_lower_asym", dict(ns=1, l_range=(5, 30), r_range=(0, 36), seed=3)),
 )
 
@@ -106,6 +107,17 @@ _TAIL_CASES = (
      dict(ns=2, l_range=(0, 21), r_range=(9, 36), seed=4,
           tail_logical=11)),
 )
+
+# Focused acceptance set for the experimental band-major/open-spin route:
+# identity at the production ns=4 spin extent, all three physical diagonal
+# current vertices, and the padded r-tail.  Every case shares the short final
+# band chunk (24 + 12 with bpd_max carrier 24), and each is evaluated both as
+# one 12-cell r transaction and as two 6-cell global tiles.
+_OPEN_SPIN_CASES = frozenset({
+    "ns4_charge",
+    "gamma_mu1_nu1", "gamma_mu2_nu2", "gamma_mu3_nu3",
+    "face_tail_r11",
+})
 
 
 def _worker(case_name: str) -> int:
@@ -347,6 +359,33 @@ def _worker(case_name: str) -> int:
         weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
         cache_face_y_blocks=False))
 
+    # Band-major/open-spin kernel control.  These direct calls isolate its
+    # algebra; the gamma_mu1 closure below separately proves the explicit
+    # planner bit crosses fit_one_rchunk's production cache/factory seam.
+    # Both calls use the production streamed source
+    # (psi_r_cache=None); the second additionally proves that the accepted
+    # outer global-r tiler forwards the static route bit into every leaf.
+    open_spin_outputs = ()
+    if case_name in _OPEN_SPIN_CASES:
+        from isdf.core import _z_q_face
+
+        psi_mun_dev = jax.device_put(jnp.asarray(psi_mun_np), mun_spec)
+
+        def _open_spin(cache_y_r_tile):
+            return jax.block_until_ready(_z_q_face(
+                psi_mun_dev, streamed_store, None,
+                jnp.asarray(w_l), jnp.asarray(w_r), gamma_L, gamma_R,
+                band_chunk_ranges=band_chunk_ranges,
+                r_start_dyn=r_start, r_chunk_size=n_zchunk,
+                kgrid=kgrid, mesh_xy=mesh,
+                cache_y_blocks=False,
+                cache_y_r_tile=cache_y_r_tile,
+                band_major_open_spin=True))
+
+        open_spin_outputs = (_open_spin(0), _open_spin(6))
+        assert all(value.dtype == jnp.complex128
+                   for value in open_spin_outputs)
+
     # Production-closure seam: direct z_q parity alone does not prove the
     # planner-owned structural bit reaches ``fit_one_rchunk``'s factory/cache
     # key.  Run the full z_q -> solve closure for charge ns=1/2, the short-r
@@ -374,7 +413,7 @@ def _worker(case_name: str) -> int:
             lq_shard)
         vertex_mu = gamma_mu_L if gamma_mu_L == gamma_nu_L else 0
 
-        def _fit(cache_y, cache_r_tile=0):
+        def _fit(cache_y, cache_r_tile=0, band_major_open_spin=False):
             return jax.block_until_ready(fit_one_rchunk(
                 psi_G_store=cached_store, psi_r_cache=psi_r_cache, L_q=L_q,
                 r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
@@ -389,9 +428,14 @@ def _worker(case_name: str) -> int:
                 psi_mun=jax.device_put(jnp.asarray(psi_mun_np), mun_spec),
                 weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r),
                 cache_face_y_blocks=cache_y,
-                face_y_cache_r_tile=cache_r_tile))
+                face_y_cache_r_tile=cache_r_tile,
+                band_major_open_spin=band_major_open_spin))
 
         fit_outputs = (_fit(True), _fit(True, 6), _fit(False))
+        if case_name == "gamma_mu1_nu1":
+            # Load-bearing production seam: explicit planner bit traverses
+            # fit_one_rchunk's cache key/factory into the transverse owner.
+            fit_outputs += (_fit(False, 6, True),)
 
     # process_allgather, NOT device_get: both are genuinely multi-process
     # sharded (P(None,'x','y')) under a REAL multi-process mesh (the
@@ -411,9 +455,13 @@ def _worker(case_name: str) -> int:
     fit_outputs_np = tuple(
         np.asarray(_mhu.process_allgather(value, tiled=True))
         for value in fit_outputs)
+    open_spin_outputs_np = tuple(
+        np.asarray(_mhu.process_allgather(value, tiled=True))
+        for value in open_spin_outputs)
     Zl = np.asarray(_mhu.process_allgather(Z_legacy, tiled=True))
     if tail_logical is None:
-        comparisons = (Zf, Zfsc, Zfst, Zfsr, *fit_outputs_np)
+        comparisons = (
+            Zf, Zfsc, Zfst, Zfsr, *fit_outputs_np, *open_spin_outputs_np)
     else:
         # Independent-width reference: the full-grid face evaluation has
         # no out-of-range slice.  Its final logical cells must be retained
@@ -435,7 +483,9 @@ def _worker(case_name: str) -> int:
             axis=-1)
         Zls = np.asarray(_mhu.process_allgather(
             Z_legacy_streamed, tiled=True))
-        comparisons = (Zf, Zfsc, Zfst, Zfsr, Zl, Zls, *fit_outputs_np)
+        comparisons = (
+            Zf, Zfsc, Zfst, Zfsr, Zl, Zls,
+            *fit_outputs_np, *open_spin_outputs_np)
     if os.environ.get("LORRAX_ZQ_PARITY_DEBUG"):
         print(f"[shapes] Zl={Zl.shape} Zf={Zf.shape} "
               f"nan_l={int(np.isnan(Zl).sum())} nan_f={int(np.isnan(Zf).sum())} "
@@ -450,6 +500,9 @@ def _worker(case_name: str) -> int:
         reference = Zl
     else:
         reference = Z_expected
+    nonfinite = sum(
+        int(np.count_nonzero(~np.isfinite(value)))
+        for value in (reference, *comparisons))
     ref_scale = float(np.abs(reference).max())
     max_abs = max(float(np.abs(value - reference).max())
                   for value in comparisons)
@@ -458,6 +511,16 @@ def _worker(case_name: str) -> int:
         float(np.abs(Zfst - Zfsc).max()),
         float(np.abs(Zfst - Zfsr).max()))
     route_max_rel = route_max_abs / max(float(np.abs(Zfsc).max()), 1e-300)
+    if open_spin_outputs_np:
+        open_spin_max_abs = max(
+            *(float(np.abs(value - Zfsc).max())
+              for value in open_spin_outputs_np),
+            float(np.abs(open_spin_outputs_np[0]
+                         - open_spin_outputs_np[1]).max()))
+        open_spin_max_rel = (
+            open_spin_max_abs / max(float(np.abs(Zfsc).max()), 1e-300))
+    else:
+        open_spin_max_abs = open_spin_max_rel = 0.0
     for store in (cached_store, streamed_store):
         store.close()
         for attr, expected in (
@@ -480,6 +543,12 @@ def _worker(case_name: str) -> int:
         "fit_one_rchunk_routes": len(fit_outputs_np),
         "cache_route_max_abs": route_max_abs,
         "cache_route_max_rel": route_max_rel,
+        "open_spin_routes": len(open_spin_outputs_np),
+        "open_spin_dtypes": [str(value.dtype)
+                             for value in open_spin_outputs_np],
+        "open_spin_max_abs": open_spin_max_abs,
+        "open_spin_max_rel": open_spin_max_rel,
+        "nonfinite": nonfinite,
     }))
     return 0
 
@@ -520,12 +589,24 @@ def test_zq_face_layout_matches_legacy(name, kwargs):
     if "skip" in out:
         pytest.skip(f"z_q face-layout parity gate: {out['skip']}")
     assert "error" not in out, out.get("error")
+    assert out["nonfinite"] == 0, (
+        f"z_q face-layout parity produced {out['nonfinite']} nonfinite "
+        f"values (case {name})")
     assert out["max_rel"] < _TOL, (
         f"z_q_from_psi_sm layout='face' vs 'legacy' parity FAILED: "
         f"max relative diff {out['max_rel']:.3e} (case {name})")
     assert out["cache_route_max_rel"] < _TOL, (
         "full-cache vs two-tile-cache vs repeated-route parity FAILED: "
         f"max relative diff {out['cache_route_max_rel']:.3e} (case {name})")
+    if name in _OPEN_SPIN_CASES:
+        assert out["open_spin_routes"] == 2
+        assert out["open_spin_dtypes"] == ["complex128", "complex128"]
+        assert out["open_spin_max_rel"] < _TOL, (
+            "band-major/open-spin vs incumbent full-cache/tiled parity "
+            f"FAILED: max relative diff {out['open_spin_max_rel']:.3e} "
+            f"(case {name})")
+    else:
+        assert out["open_spin_routes"] == 0
 
 
 def test_global_tile_concat_restores_outer_y_shard_order_complex128():
@@ -571,6 +652,85 @@ def test_band_chunks_must_complete_before_pair_product():
         completed_then_product - product_per_chunk, cross_terms,
         rtol=0.0, atol=1e-15)
     assert not np.isclose(completed_then_product, product_per_chunk)
+
+
+def test_band_major_open_spin_route_is_structurally_isolated():
+    """The static route is cache-keyed and bypasses the stacked Y cache."""
+    import ast
+    from pathlib import Path
+
+    core_path = Path(__file__).parents[1] / "src" / "isdf" / "core.py"
+    module = ast.parse(core_path.read_text())
+    face = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_z_q_face")
+
+    kw_defaults = dict(zip(face.args.kwonlyargs, face.args.kw_defaults))
+    route_default = next(
+        default for arg, default in kw_defaults.items()
+        if arg.arg == "band_major_open_spin")
+    assert isinstance(route_default, ast.Constant)
+    assert route_default.value is False
+
+    helper = next(
+        node for node in ast.walk(face)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "accumulate_open_spin_band_major")
+    helper_nodes = tuple(ast.walk(helper))
+    assert sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "load_y_block_full"
+        for node in helper_nodes) == 1
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "psi_Y_blocks"
+        for node in helper_nodes)
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "scan"
+        and any(
+            kw.arg == "unroll"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == 1
+            for kw in node.keywords)
+        for node in helper_nodes)
+
+    route_ifs = [
+        node for node in ast.walk(face)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(part, ast.Name)
+            and part.id == "band_major_open_spin"
+            for part in ast.walk(node.test))]
+    assert any(
+        isinstance(part, ast.Call)
+        and isinstance(part.func, ast.Name)
+        and part.func.id == "accumulate_open_spin_band_major"
+        for route_if in route_ifs
+        for statement in route_if.body
+        for part in ast.walk(statement))
+
+    cache_keys = [
+        node for node in ast.walk(face)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "cache_key"
+            for target in node.targets)]
+    assert any(
+        isinstance(part, ast.Name) and part.id == "band_major_open_spin"
+        for assignment in cache_keys for part in ast.walk(assignment.value))
+
+    recursive_calls = [
+        node for node in ast.walk(face)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_z_q_face"]
+    assert any(
+        kw.arg == "band_major_open_spin"
+        and isinstance(kw.value, ast.Name)
+        and kw.value.id == "band_major_open_spin"
+        for call in recursive_calls for kw in call.keywords)
 
 
 # ---------------------------------------------------------------------------
@@ -622,11 +782,21 @@ def _cli_main():
             failures += 1
             p0(f"FAIL {name}: {rc['error']}")
             continue
-        ok = rc["max_rel"] < _TOL
+        open_spin_ok = (
+            name not in _OPEN_SPIN_CASES
+            or (rc["open_spin_routes"] == 2
+                and rc["open_spin_dtypes"] == ["complex128", "complex128"]
+                and rc["open_spin_max_rel"] < _TOL))
+        ok = rc["nonfinite"] == 0 and rc["max_rel"] < _TOL and open_spin_ok
         if not ok:
             failures += 1
         p0(f"{'PASS' if ok else 'FAIL'} {name}: max|diff|={rc['max_abs']:.3e} "
            f"(ref scale {rc['ref_scale']:.3e}) max|rel diff|={rc['max_rel']:.3e}")
+        if name in _OPEN_SPIN_CASES:
+            p0("BAND_MAJOR_SCAN route=band_major_open_spin unroll=1 "
+               f"routes={rc['open_spin_routes']} "
+               f"dtype={','.join(rc['open_spin_dtypes'])} "
+               f"max_rel={rc['open_spin_max_rel']:.3e}")
     stats = jax.local_devices()[0].memory_stats() or {}
     local_hbm = np.asarray([
         int(stats.get("bytes_in_use", 0) or 0),

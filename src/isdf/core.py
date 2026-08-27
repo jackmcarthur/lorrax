@@ -957,6 +957,7 @@ def z_q_from_psi_sm(
 	weight_r: jax.Array | None = None,
 	cache_face_y_blocks: bool = False,
 	face_y_cache_r_tile: int = 0,
+	band_major_open_spin: bool = False,
 ) -> jax.Array:
 	"""Z_q, the ζ fit's r-chunk pair-density RHS (band contraction + IFFT/γ̃/FFT,
 	streamed over r-chunks).
@@ -976,7 +977,10 @@ def z_q_from_psi_sm(
 	current vertices.  ``cache_face_y_blocks`` is an internal structural
 	memory-plan decision: true caches the bounded current-rchunk Y slabs once;
 	false repeats their canonical transform per scalar spin pair and is the
-	always-valid bounded fallback.  It is not a deck or environment knob.
+	always-valid bounded fallback.  ``band_major_open_spin`` is the separate
+	transverse-only planner route that streams Y once per band chunk into two
+	bounded full-open-spin local-GEMM carries.  Neither is a deck or environment
+	knob.
 	See ``docs/architecture/zeta_fit_face_psi_cct.md``'s r-chunk section for
 	the derivation and the ``all_to_all('y')`` collision this design avoids.
 	"""
@@ -1014,7 +1018,8 @@ def z_q_from_psi_sm(
 		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
 		kgrid=kgrid, mesh_xy=mesh_xy,
 		cache_y_blocks=bool(cache_face_y_blocks),
-		cache_y_r_tile=int(face_y_cache_r_tile))
+		cache_y_r_tile=int(face_y_cache_r_tile),
+		band_major_open_spin=bool(band_major_open_spin))
 
 
 def _z_q_legacy(
@@ -1563,6 +1568,7 @@ def _z_q_face(
 	mesh_xy: Mesh,
 	cache_y_blocks: bool = False,
 	cache_y_r_tile: int = 0,
+	band_major_open_spin: bool = False,
 ) -> jax.Array:
 	"""Face-layout Z_q: the same canonical io_callback/``psi_r_cache``
 	read, ``all_to_all('y')`` r-scatter + ``all_gather('x')`` band
@@ -1625,6 +1631,16 @@ def _z_q_face(
 	it is retained as the fail-safe route for cache-infeasible large-N/P
 	geometries and for ``ns=1`` where stacking has no reuse benefit.
 
+	``band_major_open_spin=True`` is an internal, statically traced,
+	transverse-only planner route.  It keeps the same Y transform/scatter and selective
+	X owner-broadcast, but makes the band-chunk scan outermost: every chunk
+	updates two bounded ``(spin,spin,r,mu)`` carries with local GEMMs.  Thus
+	the expensive transform and collectives run once per chunk without the
+	``O(bands*r/Py)`` stacked Y cache.  The flag is intentionally not a deck
+	or environment knob: the planner prices three carry arenas conservatively
+	before selecting its internal ``cache_y_r_tile`` transaction.  Charge keeps
+	the incumbent route.
+
 	``weight_l``/``weight_r``: ``(nb_face,)`` real, 1.0 inside the L/R
 	band window and 0.0 outside — the SAME "weight, don't window"
 	convention :func:`_c_q_face` uses for the CCT Gram (the L/R sigma-
@@ -1663,14 +1679,15 @@ def _z_q_face(
 			f"psi_mun spans the fit's FULL [b0,b4) load extent).")
 	r_loc = n_zchunk // p_y
 	cache_y_r_tile = int(cache_y_r_tile)
-	if cache_y_blocks:
+	tiled_face_route = bool(cache_y_blocks or band_major_open_spin)
+	if tiled_face_route:
 		if cache_y_r_tile <= 0:
 			cache_y_r_tile = n_zchunk
 		if (cache_y_r_tile > n_zchunk
 				or cache_y_r_tile % p_y
 				or n_zchunk % cache_y_r_tile):
 			raise ValueError(
-				"_z_q_face: cache_y_r_tile must be a positive, p_y-aligned "
+				"_z_q_face: face r tile must be a positive, p_y-aligned "
 				"exact divisor of r_chunk_size; got "
 				f"tile={cache_y_r_tile}, r_chunk_size={n_zchunk}, p_y={p_y}")
 	else:
@@ -1678,7 +1695,7 @@ def _z_q_face(
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
 
-	if cache_y_blocks and cache_y_r_tile < n_zchunk:
+	if tiled_face_route and cache_y_r_tile < n_zchunk:
 		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
 		# the same full-cache owner at the tile width bounds its Y
 		# all_to_all/all_gather bytes; concatenating here, OUTSIDE manual
@@ -1695,8 +1712,9 @@ def _z_q_face(
 				r_start_dyn=r_start_dyn + tile_idx * cache_y_r_tile,
 				r_chunk_size=cache_y_r_tile,
 				kgrid=kgrid, mesh_xy=mesh_xy,
-				cache_y_blocks=True,
-				cache_y_r_tile=cache_y_r_tile)
+				cache_y_blocks=cache_y_blocks,
+				cache_y_r_tile=cache_y_r_tile,
+				band_major_open_spin=band_major_open_spin)
 			for tile_idx in range(n_cache_tiles)
 		)
 		Z_q = jnp.concatenate(Z_q_tiles, axis=-1)
@@ -1792,6 +1810,7 @@ def _z_q_face(
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
 		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
+		bool(band_major_open_spin),
 		lhs_id, rhs_id,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
@@ -1950,7 +1969,94 @@ def _z_q_face(
 					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
 				return Z_R
 
-			if cache_y_blocks:
+			def accumulate_open_spin_band_major():
+				"""Complete all raw spin pairs in one band-major local-GEMM scan."""
+				# P_{L/R}[k,a,b,r_y,mu_x].  Keeping both open-spin band sums is
+				# the minimum steady carrier that permits the nonlinear
+				# conj(sum_n P_l[n]) * sum_m P_r[m] product after the scan while
+				# avoiding an S^2 repetition of the WFN transform/collectives.
+				P_shape = (nk, ns, ns, r_loc, mu_loc)
+				P_l_init = jnp.zeros(P_shape, dtype=jnp.complex128)
+				P_r_init = jnp.zeros(P_shape, dtype=jnp.complex128)
+
+				def band_body(carry, bc_idx):
+					P_l_acc, P_r_acc = carry
+					# The canonical FFT -> all_to_all('y') -> all_gather('x')
+					# transaction runs exactly once for this band chunk.
+					psi_Y_bc = load_y_block_full(bc_idx)
+
+					# Selectively broadcast ALL raw spin rows once.  Spin is not a
+					# mesh axis, so this is the incumbent per-position owner mask and
+					# psum with a larger local row batch, not a new communication path.
+					p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
+					global_band = b_lo_rel_arr[bc_idx] + p_arr
+					owner_y = global_band // shard_w
+					owns = owner_y == y_idx
+					local_idx = jnp.clip(
+						global_band - y_idx * shard_w, 0, shard_w - 1)
+					gathered = jnp.take(psi_mun_conj, local_idx, axis=3)
+					gathered = jnp.where(
+						owns[None, None, None, :], gathered, 0)
+					x_rows_bc = jax.lax.psum(gathered, 'y')
+
+					bc_valid = global_band < b_hi_rel_arr[bc_idx]
+					g_clamped = jnp.clip(global_band, 0, nb_face - 1)
+					w_l_bc = jnp.where(
+						bc_valid, jnp.take(w_l_, g_clamped), 0.0)
+					w_r_bc = jnp.where(
+						bc_valid, jnp.take(w_r_, g_clamped), 0.0)
+
+					# One high-intensity LOCAL GEMM per endpoint.  Flattening preserves
+					# the explicit [spin,mu] X-row and [spin,r] Y-column orders;
+					# reshape+transpose restores P[k,a,b,r_y,mu_x] exactly.
+					y_gemm = psi_Y_bc.reshape(
+						nk, bpd_max_global, ns * r_loc)
+
+					def open_spin_delta(weight_bc):
+						x_weighted = x_rows_bc * weight_bc[
+							None, None, None, :].astype(x_rows_bc.dtype)
+						x_gemm = x_weighted.reshape(
+							nk, ns * mu_loc, bpd_max_global)
+						delta = jnp.matmul(x_gemm, y_gemm)
+						return jnp.transpose(
+							delta.reshape(nk, ns, mu_loc, ns, r_loc),
+							(0, 1, 3, 4, 2))
+
+					return (
+						P_l_acc + open_spin_delta(w_l_bc),
+						P_r_acc + open_spin_delta(w_r_bc)), None
+
+				(P_l, P_r_raw), _ = jax.lax.scan(
+					band_body, (P_l_init, P_r_init),
+					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+
+				# gamma_apply's monomial convention is
+				# out[a,b] = phase_L[a]*phase_R[b]
+				#            * raw[perm_L[a],perm_R[b]].
+				# Apply it after the linear band sum.  The bra input was already
+				# conjugated, so the phases deliberately remain unconjugated.
+				pair_perm = (
+					perm_L_[:, None] * ns + perm_R_[None, :]).reshape(ns * ns)
+				P_r = jnp.take(
+					P_r_raw.reshape(nk, ns * ns, r_loc, mu_loc),
+					pair_perm, axis=1).reshape(P_shape)
+				P_r = P_r * (
+					phase_L_[None, :, None, None, None]
+					* phase_R_[None, None, :, None, None])
+
+				P_l_3d = P_l.reshape(
+					nkx, nky, nkz, ns, ns, r_loc, mu_loc)
+				P_r_3d = P_r.reshape(
+					nkx, nky, nkz, ns, ns, r_loc, mu_loc)
+				P_l_R = local_ifftn3(
+					P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_r_R = local_ifftn3(
+					P_r_3d, axes=(0, 1, 2), norm='forward')
+				return jnp.sum(jnp.conj(P_l_R) * P_r_R, axis=(3, 4))
+
+			if band_major_open_spin:
+				Z_R = accumulate_open_spin_band_major()
+			elif cache_y_blocks:
 				def build_y_block(_unused, bc_idx):
 					return _unused, load_y_block_full(bc_idx)
 
@@ -5812,6 +5918,7 @@ def _make_fit_one_rchunk_kernel(
     layout: str = "legacy",
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    band_major_open_spin: bool = False,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` carrying
@@ -5855,7 +5962,9 @@ def _make_fit_one_rchunk_kernel(
     ``cache_face_y_blocks`` is the memory planner's internal face-route
     decision; it is static, cache-keyed, and has no frontend/env spelling.
     ``face_y_cache_r_tile`` is its bounded internal global-r tile; zero means
-    the full outer chunk for compatibility.
+    the full outer chunk for compatibility.  ``band_major_open_spin`` is the
+    separately priced transverse-only local-GEMM route; it is likewise
+    static and cache-keyed.
     """
     if layout not in ("legacy", "face"):
         raise ValueError(
@@ -5936,6 +6045,7 @@ def _make_fit_one_rchunk_kernel(
                 weight_l=weight_l, weight_r=weight_r,
                 cache_face_y_blocks=bool(cache_face_y_blocks),
                 face_y_cache_r_tile=int(face_y_cache_r_tile),
+                band_major_open_spin=bool(band_major_open_spin),
             )
         else:
             # Pre-multiply by 1/norms so the pair-density einsum sees the
@@ -6067,6 +6177,7 @@ def fit_one_rchunk(
     weight_r: jax.Array | None = None,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    band_major_open_spin: bool = False,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -6107,10 +6218,20 @@ def fit_one_rchunk(
     # the factory's closure-captured values; μ=1/2/3 therefore compile
     # separately instead of trying to turn tracers into host attributes.
     is_charge = (int(vertex_mu_L) == 0)
+    if band_major_open_spin and (layout != "face" or is_charge):
+        raise ValueError(
+            "fit_one_rchunk: band_major_open_spin is a planner-owned "
+            "transverse face route (requires layout='face' and "
+            "vertex_mu_L in 1..3)")
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
     _cache_y_r_tile = 0
     _cache_y_blocks = bool(cache_face_y_blocks)
-    if _cache_y_blocks:
+    _band_major_open_spin = bool(band_major_open_spin)
+    if _cache_y_blocks and _band_major_open_spin:
+        raise ValueError(
+            "fit_one_rchunk: cache_face_y_blocks and "
+            "band_major_open_spin are mutually exclusive planner routes")
+    if _cache_y_blocks or _band_major_open_spin:
         _cap = int(face_y_cache_r_tile) or int(actual_n_rchunk)
         _cache_y_r_tile = bounded_partition_tile(
             int(actual_n_rchunk), _cap, int(mesh_xy.shape['y']))
@@ -6118,6 +6239,7 @@ def fit_one_rchunk(
                 or int(actual_n_rchunk) // _cache_y_r_tile
                 >= int(meta.nspinor) ** 2):
             _cache_y_blocks = False
+            _band_major_open_spin = False
             _cache_y_r_tile = 0
     cache_key = (
         id(mesh_xy),
@@ -6139,6 +6261,7 @@ def fit_one_rchunk(
         str(layout),
         bool(_cache_y_blocks),
         int(_cache_y_r_tile),
+        bool(_band_major_open_spin),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -6168,6 +6291,7 @@ def fit_one_rchunk(
             layout=str(layout),
             cache_face_y_blocks=bool(_cache_y_blocks),
             face_y_cache_r_tile=int(_cache_y_r_tile),
+            band_major_open_spin=bool(_band_major_open_spin),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -6185,6 +6309,14 @@ def fit_one_rchunk(
     # microseconds on small kernels, dominated by the per-phase work.
     # Same canonical driver-debug switch as gw/isdf_fitting.py.
     _dbg = debug_print_enabled()
+    if _dbg and jax.process_index() == 0 and layout == "face":
+        print(
+            "[zq_face_route] "
+            f"band_major_open_spin={_band_major_open_spin} "
+            f"cache_y_blocks={_cache_y_blocks} "
+            f"face_r_tile={_cache_y_r_tile} "
+            f"outer_r_chunk={actual_n_rchunk}",
+            flush=True)
     # Per-phase host-RSS deltas: on CPU the XLA arena is invisible to
     # ``memory_stats()``, so attributing the per-r-chunk anonymous ramp
     # to z_q_build vs solve needs the kernel's own accounting.

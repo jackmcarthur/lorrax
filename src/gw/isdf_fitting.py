@@ -181,6 +181,7 @@ def fit_zeta_to_h5(
     cache_psi_r: bool = True,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    band_major_open_spin: bool = False,
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
     bispinor_lift: str = "raw",
@@ -268,6 +269,10 @@ def fit_zeta_to_h5(
                     cache transaction.  Equal to ``chunk_r`` for the original
                     full-current-r cache; a smaller exact divisor tiles only
                     the cache while preserving the outer solve chunk.
+        band_major_open_spin: Planner-owned transverse-only face route.  True
+                    streams each Y band block once into bounded full-open-spin
+                    local-GEMM carries.  Static/internal; never a deck or env
+                    knob, and False for the charge fit.
         psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
                     ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
                     ``PSI_MUN_SPEC``), spanning the SAME [b0, b4) range
@@ -1430,6 +1435,7 @@ def fit_zeta_to_h5(
                     weight_r=(weight_r_face if low_mem_bands else None),
                     cache_face_y_blocks=bool(cache_face_y_blocks),
                     face_y_cache_r_tile=int(face_y_cache_r_tile),
+                    band_major_open_spin=bool(band_major_open_spin),
                 )
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]

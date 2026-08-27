@@ -55,8 +55,8 @@ def _run50_plan():
     return plan
 
 
-def _profile_cliff_plan(r_chunk):
-    """Exact run158 current-channel geometry, with analytic FFT fallback."""
+def _profile_geometry_plan(r_chunk, *, current_vertex=False):
+    """Exact run158 geometry, with analytic FFT fallback."""
     return plan_gflat_chunks(
         meta=_meta(ns=4, mu=800, ngkmax=76_551),
         mesh_xy=SimpleNamespace(shape={'x': 4, 'y': 4}),
@@ -65,7 +65,7 @@ def _profile_cliff_plan(r_chunk):
         target_utilization=0.78, band_chunk_override=16,
         r_chunk_override=r_chunk,
         distributed_zeta_solve="distributed", low_mem_bands=True,
-        face_current_vertex=True)
+        face_current_vertex=bool(current_vertex))
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
@@ -173,8 +173,9 @@ def test_bounded_partition_tile_preserves_outer_extent_and_alignment():
 
 
 def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
-    full = _profile_cliff_plan(41_472)
-    tiled = _profile_cliff_plan(82_944)
+    # Charge keeps the accepted scalar-pair/Y-cache implementation.
+    full = _profile_geometry_plan(41_472)
+    tiled = _profile_geometry_plan(82_944)
     assert full.face_y_cache_r_tile == 41_472
     assert tiled.r_chunk == 82_944
     assert tiled.face_y_cache_r_tile == 41_472
@@ -195,3 +196,51 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_699_800_800
     assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
     assert tiled.hwm_bytes == 28_990_135_008
+
+
+def test_transverse_open_spin_uses_conservative_three_arena_exact_tile():
+    plan = _profile_geometry_plan(82_944, current_vertex=True)
+    charge = _profile_geometry_plan(82_944, current_vertex=False)
+
+    assert plan.band_major_open_spin
+    assert not plan.cache_face_y_blocks
+    assert charge.cache_face_y_blocks
+    assert not charge.band_major_open_spin
+    assert plan.face_y_cache_bytes == 0
+    # This source-only fixture uses the planner's announced analytic
+    # 12.96-GB full-k FFT fallback, so the largest exact divisor under the
+    # 54.6-GB target is 20,736.  The measured production FFT is 9.72 GB and
+    # consequently selects 27,648; both choices use the same price formula.
+    assert plan.face_y_cache_r_tile == 20_736
+    one_carry = 36 * 4 * 4 * (20_736 // 4) * (800 // 4) * 16
+    assert one_carry == 9_555_148_800
+    assert plan.face_open_spin_bytes == 3 * one_carry
+    assert plan.r_chunk // plan.face_y_cache_r_tile == 4 < 4 * 4
+    assert plan.hwm_bytes <= plan.budget_bytes * plan.target_utilization
+    text = plan.format()
+    assert "tiled band-major open-spin (4 x 20736)" in text
+    assert "open-spin 3-arena = 28.665 GB/dev" in text
+
+
+def test_open_spin_plan_bit_is_explicitly_propagated_and_guarded():
+    root = Path(__file__).resolve().parents[1]
+    core_tree = ast.parse((root / "src/isdf/core.py").read_text())
+    for function_name in (
+            "z_q_from_psi_sm", "_z_q_face",
+            "_make_fit_one_rchunk_kernel", "fit_one_rchunk"):
+        function = next(
+            node for node in core_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == function_name)
+        assert "band_major_open_spin" in {
+            arg.arg for arg in (
+                list(function.args.args) + list(function.args.kwonlyargs))}
+
+    planner_source = (root / "src/gw/gflat_memory_model.py").read_text()
+    assert "if bool(face_current_vertex) and ns > 1:" in planner_source
+    assert '3.0 * open_spin_carry' in planner_source
+
+    fitting_source = (root / "src/gw/isdf_fitting.py").read_text()
+    assert fitting_source.count("band_major_open_spin") >= 3
+    init_source = (root / "src/gw/gw_init.py").read_text()
+    assert init_source.count("band_major_open_spin") >= 3

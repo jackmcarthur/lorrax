@@ -368,16 +368,31 @@ def _stage_C_face_terms(
     x_rows = 1 if int(ns) == 1 else 2
     face_conj = _c128(nk, ns, mu, face_nb, shard=p_xy)
     x_block = _c128(nk, x_rows, max(1, mu // p_x), band_chunk)
+    open_spin_x_block = _c128(
+        nk, ns, max(1, mu // p_x), band_chunk)
     pair_rank3 = _c128(nk, mu, shard=p_xy)
     pair_peak = float(slots) * pair_rank3
+    # One full-open-spin carry has local shape
+    # (nk,ns,ns,r/Py,mu/Px).  Three arenas conservatively price the two
+    # scan carries plus one GEMM/update or k-IFFT output; do not assume
+    # donation/aliasing before optimized-HLO evidence proves it.
+    open_spin_carry = float(ns * ns) * pair_rank3
     y_block = _c128(nk, band_chunk, ns, shard=p_y)
     y_source = _c128(nk, max(1, band_chunk // p_xy), ns)
     y_cache = float(n_band_chunks) * y_block
     return {
         # psi_mun_conj plus the selected-row gather and psum result.
         "constant": face_conj + 2.0 * x_block,
+        # The band-major route gathers all spin rows once per band chunk.
+        "open_spin_constant": face_conj + 2.0 * open_spin_x_block,
         # Complete executable-specific rank-3-equivalent arena.
         "pair_arena_slope": pair_peak,
+        "open_spin_carry_slope": open_spin_carry,
+        # Conservative three-carry arena plus the gathered/compacted Y block
+        # and its all-to-all source.  This route never stacks all band chunks.
+        "open_spin_slope": (
+            3.0 * open_spin_carry
+            + _GATHERED_PSI_SLOTS * y_block + y_source),
         "y_block_slope": y_block,
         "y_source_slope": y_source,
         "y_cache_slope": y_cache,
@@ -469,13 +484,20 @@ class GFlatChunkPlan:
     #: spin pair; False repeats one bounded transform/scatter and is the
     #: always-valid large-band fallback.  Planner-owned, never a knob.
     cache_face_y_blocks: bool = False
-    #: Global-r width of one internal Y-cache tile.  Equal to ``r_chunk``
-    #: for the original one-pass cache.  Smaller means the explicit outer
-    #: chunk is partitioned into equal cache-sized transactions, preserving
-    #: solve amortization without crossing into the ns² repeated route.
+    #: Transverse-only face route: stream each Y band block once and update
+    #: two full-open-spin local-GEMM carries.  Planner-owned and static;
+    #: charge retains the incumbent scalar-pair/cache implementation.
+    band_major_open_spin: bool = False
+    #: Global-r width of one internal face transaction: a Y-cache tile on
+    #: the incumbent route or an open-spin carry tile on the band-major
+    #: route.  Equal to ``r_chunk`` for one pass; smaller preserves outer
+    #: solve amortization through equal static transactions.
     face_y_cache_r_tile: int = 0
     #: Per-rank bytes in the selected face Y cache at resolved r width.
     face_y_cache_bytes: float = 0.0
+    #: Conservative bytes of the three full-open-spin carry arenas at the
+    #: selected internal r tile (two scan carries plus one update/FFT arena).
+    face_open_spin_bytes: float = 0.0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -493,15 +515,24 @@ class GFlatChunkPlan:
                 "hoisted all-band cache" if self.cache_psi_r else
                 "streamed band-chunk FFT (low-memory fallback)"),
             "    face Y route  = " + (
-                (("current-r cache" if self.face_y_cache_r_tile == self.r_chunk
+                (("band-major open-spin"
+                  if self.face_y_cache_r_tile == self.r_chunk else
+                  f"tiled band-major open-spin "
+                  f"({self.r_chunk // max(self.face_y_cache_r_tile, 1)}"
+                       f" x {self.face_y_cache_r_tile})")
+                 if self.band_major_open_spin else
+                 (("current-r cache" if self.face_y_cache_r_tile == self.r_chunk
                   else f"tiled current-r cache ({self.r_chunk // max(self.face_y_cache_r_tile, 1)}"
                        f" x {self.face_y_cache_r_tile})"))
                 if self.cache_face_y_blocks else
                 ("repeated bounded transform" if self.psi_layout == "face"
-                 else "n/a (legacy layout)")),
+                 else "n/a (legacy layout)"))),
             *([f"    face Y cache = "
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
-              if self.psi_layout == "face" else []),
+              if self.cache_face_y_blocks else []),
+            *([f"    open-spin 3-arena = "
+               f"{self.face_open_spin_bytes / 1e9:.3f} GB/dev"]
+              if self.band_major_open_spin else []),
             f"    band_chunk    = {self.band_chunk}",
             f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
             f"{self.centroid_fft_rows_local} local rows, "
@@ -582,9 +613,9 @@ def plan_gflat_chunks(
     all-band ψ(r) hoist does not, it also selects the canonical streamed
     band-chunk FFT route.  The legacy/default route retains the hoist.
 
-    ``face_current_vertex`` selects the nonidentity-current face executable's
-    measured ``ns²`` arena.  False preserves the independently calibrated
-    four-slot identity/charge executable.
+    ``face_current_vertex`` selects the transverse-only band-major/open-spin
+    route when its conservative three-arena exact tile fits.  False preserves
+    the independently calibrated identity/charge cache executable.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -846,11 +877,14 @@ def plan_gflat_chunks(
     # build, scalar-pair accumulation/final k FFT, and the all-P-aligned
     # solve seam.  Keep them separate; adding them invents a live set.
     cache_face_y_blocks = False
+    band_major_open_spin = False
     face_y_cache_r_tile = 0
     face_terms = None
     face_cache_build_t = 0.0
     face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
+    face_open_spin_bytes = 0.0
+    open_spin_cap = 0
     if low_mem_bands:
         face_terms = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
@@ -905,7 +939,41 @@ def plan_gflat_chunks(
         cache_face_y_blocks = bool(
             ns > 1 and route_tile > 0 and route_tiles < ns * ns)
         face_y_cache_r_tile = route_tile if cache_face_y_blocks else 0
-        if cache_face_y_blocks:
+
+        # Transverse-only band-major route.  Price the conservative live set
+        # before selecting an exact equal tile: streamed full-grid FFT,
+        # three open-spin arenas, one gathered/compacted Y block + source,
+        # and a full outer compact-Z stack.  Charging the whole Z stack here
+        # (rather than only previously completed tiles) makes the cap safely
+        # usable before the final outer r width is resolved.
+        if bool(face_current_vertex) and ns > 1:
+            _open_z_outer = (
+                _c128(nq, mu, shard=p_xy) * route_width)
+            _open_headroom = max(
+                target - persistent_total
+                - face_terms["open_spin_constant"]
+                - streamed_fft - _open_z_outer,
+                0.0)
+            open_spin_cap = int(
+                _open_headroom / face_terms["open_spin_slope"])
+            _open_tile = bounded_partition_tile(
+                route_width, open_spin_cap, r_alignment)
+            _open_tiles = (
+                route_width // _open_tile if _open_tile else 0)
+            band_major_open_spin = bool(
+                _open_tile > 0 and _open_tiles < ns * ns)
+            if band_major_open_spin:
+                cache_face_y_blocks = False
+                face_y_cache_r_tile = _open_tile
+
+        if band_major_open_spin:
+            C_slope = face_terms["open_spin_slope"]
+            C_constant = (
+                face_terms["open_spin_constant"] + streamed_fft)
+            r_from_budget = open_spin_cap
+            r_from_arena = open_spin_cap
+            r_budget_cap = open_spin_cap
+        elif cache_face_y_blocks:
             C_slope = face_terms["cache_pair_slope"]
             C_constant = face_terms["constant"]
             r_from_budget = min(cache_pair_cap, cache_build_cap)
@@ -969,7 +1037,21 @@ def plan_gflat_chunks(
         r_chunk = max(
             r_alignment, r_chunk - r_chunk % r_alignment)
     n_r_chunks = max(1, math.ceil(n_rtot / r_chunk))
-    if cache_face_y_blocks:
+    if band_major_open_spin:
+        face_y_cache_r_tile = bounded_partition_tile(
+            r_chunk, open_spin_cap, r_alignment)
+        if (face_y_cache_r_tile <= 0
+                or r_chunk // face_y_cache_r_tile >= ns * ns):
+            # Retain the always-valid scalar-pair route if the final auto
+            # outer extent cannot usefully partition under the conservative
+            # open-spin cap.  The open-spin cap is no larger than the
+            # repeated route's one-pair arena cap, so this fallback remains
+            # memory-safe at the already resolved outer width.
+            band_major_open_spin = False
+            face_y_cache_r_tile = 0
+            C_slope = face_terms["repeated_pair_slope"]
+            C_constant = face_terms["constant"] + streamed_fft
+    elif cache_face_y_blocks:
         face_y_cache_r_tile = bounded_partition_tile(
             r_chunk, cache_cap, r_alignment)
         if (face_y_cache_r_tile <= 0
@@ -1064,7 +1146,21 @@ def plan_gflat_chunks(
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
     if low_mem_bands:
-        if cache_face_y_blocks:
+        if band_major_open_spin:
+            _open_tile = face_y_cache_r_tile
+            _completed_tile_z = (
+                _c128(nq, mu, shard=p_xy) * (r_chunk - _open_tile))
+            face_open_spin_bytes = (
+                3.0 * face_terms["open_spin_carry_slope"] * _open_tile)
+            C_fit_t = (
+                face_terms["open_spin_constant"]
+                + (0.0 if cache_psi_r else fft_box_zeta_transform)
+                + face_terms["open_spin_slope"] * _open_tile
+                + _completed_tile_z)
+            if _open_tile < r_chunk:
+                face_tile_concat_t = 2.0 * _c128(
+                    nq, mu, r_chunk, shard=p_xy)
+        elif cache_face_y_blocks:
             _cache_tile = face_y_cache_r_tile
             _completed_tile_z = (
                 _c128(nq, mu, shard=p_xy) * (r_chunk - _cache_tile))
@@ -1150,13 +1246,21 @@ def plan_gflat_chunks(
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
     if low_mem_bands:
-        if cache_face_y_blocks:
+        if band_major_open_spin:
+            face_y_route_bytes = (
+                (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+                 + face_terms["y_source_slope"])
+                * face_y_cache_r_tile)
+            stage_cd_psi_bytes = (
+                face_terms["open_spin_constant"] + face_y_route_bytes)
+        elif cache_face_y_blocks:
             face_y_route_bytes = face_y_cache_bytes
+            stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
         else:
             face_y_route_bytes = (
                 (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
                  + face_terms["y_source_slope"]) * r_chunk)
-        stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
+            stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
     else:
         stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
@@ -1194,9 +1298,9 @@ def plan_gflat_chunks(
     if cache_face_y_blocks:
         peaks["C_face_y_cache_build"] = (
             persistent_total + face_cache_build_t)
-        if face_tile_concat_t:
-            peaks["C_face_tile_concat"] = (
-                persistent_total + face_tile_concat_t)
+    if face_tile_concat_t:
+        peaks["C_face_tile_concat"] = (
+            persistent_total + face_tile_concat_t)
     bottleneck = max(peaks, key=peaks.get)
     hwm = peaks[bottleneck]
 
@@ -1223,6 +1327,8 @@ def plan_gflat_chunks(
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),
         cache_face_y_blocks=bool(cache_face_y_blocks),
+        band_major_open_spin=bool(band_major_open_spin),
         face_y_cache_r_tile=int(face_y_cache_r_tile),
         face_y_cache_bytes=float(face_y_cache_bytes),
+        face_open_spin_bytes=float(face_open_spin_bytes),
     )
