@@ -1568,7 +1568,7 @@ def _prepare_zq_face_local_transaction(
 	col_swap_spec = P(None, None, 'y', None, 'x')
 	y_full_spec = P(None, None, None, None, 'x')
 	mun_spec = P(None, None, 'x', 'y')
-	mun_swap_spec = P(None, None, 'y', 'x')
+	mun_full_x_spec = P(None, None, 'x', None)
 	x_full_spec = P(None, None, 'y', None)
 	key = (
 		id(mesh_xy), tuple(int(v) for v in psi_mun.shape),
@@ -1618,24 +1618,23 @@ def _prepare_zq_face_local_transaction(
 			return blocks
 
 		gather_y_cols = jax.jit(_gather_y_cols)
-		swap_x_face = mesh_axis_swap_reshard(
-			mesh_xy, in_spec=mun_spec, out_spec=mun_swap_spec)
-
-		@partial(shard_map, mesh=mesh_xy, in_specs=(mun_swap_spec,),
-		         out_specs=x_full_spec, check_vma=False)
+		@partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec,),
+		         out_specs=mun_full_x_spec, check_vma=False)
 		def _gather_x_face(face_):
 			return jax.lax.all_gather(
-				face_, 'x', axis=3, tiled=True)
+				face_, 'y', axis=3, tiled=True)
 
 		gather_x_face = jax.jit(_gather_x_face)
+		swap_x_face = mesh_axis_swap_reshard(
+			mesh_xy, in_spec=mun_full_x_spec, out_spec=x_full_spec)
 		fns = (build_y_cols, swap_y_cols, gather_y_cols,
-		       swap_x_face, gather_x_face)
+		       gather_x_face, swap_x_face)
 		_zq_face_local_comm_cache[key] = fns
 
-	build_y_cols, swap_y_cols, gather_y_cols, swap_x_face, gather_x_face = fns
+	build_y_cols, swap_y_cols, gather_y_cols, gather_x_face, swap_x_face = fns
 	y_cols = build_y_cols(psi_r_cache, r_start_dyn)
 	y_blocks = gather_y_cols(swap_y_cols(y_cols))
-	x_face = gather_x_face(swap_x_face(psi_mun))
+	x_face = swap_x_face(gather_x_face(psi_mun))
 	return x_face, y_blocks
 
 def _z_q_face(
