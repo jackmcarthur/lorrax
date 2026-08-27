@@ -186,7 +186,14 @@ def _decks_enabled() -> bool:
 def _deck_env(cache_dir) -> dict:
     import os
     env = dict(os.environ)
+    env.pop("JAX_COMPILATION_CACHE_DIR", None)
     env["ISDF_JAX_CACHE_DIR"] = str(cache_dir)
+    # This is a cache-CONTRACT experiment, not production policy: persist even
+    # the tiny clean/red probes so run 2 can falsify warm reuse deterministically.
+    env["JAX_ENABLE_COMPILATION_CACHE"] = "1"
+    env["JAX_COMPILATION_CACHE_MAX_SIZE"] = "-1"
+    env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+    env["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
     env["JAX_ENABLE_X64"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     src = str(REPO_ROOT / "src")
@@ -202,7 +209,12 @@ def _run_probe(kind: str, tmp_path, mode):
     """Two warm P=4 runs of one probe; the verdict on the second."""
     import os
     env = dict(os.environ)
+    env.pop("JAX_COMPILATION_CACHE_DIR", None)
     env["ISDF_JAX_CACHE_DIR"] = str(tmp_path / f"cache_{kind}")
+    env["JAX_ENABLE_COMPILATION_CACHE"] = "1"
+    env["JAX_COMPILATION_CACHE_MAX_SIZE"] = "-1"
+    env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"
+    env["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     argv = [sys.executable,
