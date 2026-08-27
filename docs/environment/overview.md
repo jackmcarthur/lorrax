@@ -403,7 +403,8 @@ rest.
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
-There is one LORRAX compile-cache owner: `ISDF_JAX_CACHE_DIR`, with
+There is one repository-configured LORRAX compile-cache owner:
+`ISDF_JAX_CACHE_DIR`, with
 `LORRAX_RUN_DIR` providing the preferred workflow-local path.  Launchers that
 set neither retain the legacy scratch/home fallback pending its required P=4
 A/B.  The modulefile no longer exports JAX's independent
