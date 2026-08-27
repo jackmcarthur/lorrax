@@ -2195,7 +2195,7 @@ def compute_static_photon_response(
             from file_io.static_gauge_head import (
                 load_isometric_retained_bubble_source_artifact)
             head_source = load_isometric_retained_bubble_source_artifact(
-                config.paths.static_gauge_hall_file,
+                config.paths.static_gauge_retained_source_file,
                 mesh_xy=mesh_xy,
                 wfn=wfn,
                 expected_band_start=int(meta.b_id_0),
@@ -2299,6 +2299,16 @@ def compute_static_photon_response(
             complete_static_slab_photon_q0(
                 V_packed, W_packed, response, g0_X, g0_Y, cubature,
                 mesh_xy=mesh_xy))
+        if (photon_mode is BispinorGWMode.FULL_STATIC_COHSEX
+                and jax.process_index() == 0):
+            print(
+                "  [photon response] BOUNDED retained Ward diagnostics "
+                f"direct={float(response.ward_residual):.6e}; "
+                f"direct_or_folded_max="
+                f"{float(head_completion.ward_residual):.6e}; "
+                f"capability={response.capability.value}; "
+                f"approximation={response.approximation}",
+                flush=True)
         jax.block_until_ready((V_packed, W_packed))
         sanity.refuse_nonfinite(
             "bounded completed static photon V", V_packed)
@@ -2311,7 +2321,10 @@ def compute_static_photon_response(
         head_completion=head_completion,
         current_model=current_model,
         approximation=(
-            (response.approximation + "_on_isometric_finite_q_body")
+            ((response.approximation + "_on_isometric_finite_q_body")
+             if photon_mode is BispinorGWMode.FULL_STATIC_COHSEX
+             else (response.approximation +
+                   "_on_experimental_no_pair_finite_q_body"))
             if coupled_head
             else (
                 "experimental_isometric_kinetic_balance_full_packed_"

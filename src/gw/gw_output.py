@@ -142,6 +142,13 @@ class GWResults:
     #: Optional whole-response identity.  The bounded charge+Hall mode leaves
     #: this unset because its Hall identifier does not identify charge S/Y/Z.
     photon_head_sigma_operator_fingerprint: str | None = None
+    #: Derived identity for a bounded response whose approximation is not an
+    #: exact ``StaticGaugeHeadResponse``.  Charge+Hall intentionally leaves
+    #: this triplet unset; the normalized retained-bubble producer fills all
+    #: three fields or none.
+    photon_head_sigma_response_fingerprint: str | None = None
+    photon_head_sigma_response_capability: str | None = None
+    photon_head_sigma_response_approximation: str | None = None
     photon_head_sigma_basis: str | None = None
 
     def __post_init__(self) -> None:
@@ -158,6 +165,21 @@ class GWResults:
         ):
             raise ValueError(
                 "GWResults: sig_h must equal sig_h_scalar + h_transverse exactly")
+        bounded = (
+            self.photon_head_sigma_response_fingerprint,
+            self.photon_head_sigma_response_capability,
+            self.photon_head_sigma_response_approximation,
+        )
+        if any(value is not None for value in bounded) and not all(
+                value is not None for value in bounded):
+            raise ValueError(
+                "GWResults: bounded photon-head response identity requires "
+                "fingerprint, capability, and approximation together")
+        if any(value is not None for value in bounded) \
+                and self.photon_head_sigma_basis is None:
+            raise ValueError(
+                "GWResults: bounded photon-head response identity exists "
+                "without a basis")
 
 
 # ---------------------------------------------------------------------------
@@ -755,9 +777,25 @@ def write_freq_debug(
             )
             _photon_head_metadata[
                 "photon_head_operator_fingerprint"] = _fingerprint
-    elif results.photon_head_sigma_operator_fingerprint is not None:
+        _bounded_fingerprint = (
+            results.photon_head_sigma_response_fingerprint)
+        _bounded_capability = results.photon_head_sigma_response_capability
+        _bounded_approximation = (
+            results.photon_head_sigma_response_approximation)
+        if _bounded_fingerprint is not None:
+            from .head_correction import require_canonical_operator_fingerprint
+            _photon_head_metadata["photon_head_response_fingerprint"] = (
+                require_canonical_operator_fingerprint(
+                    _bounded_fingerprint,
+                    gate="photon_head_sigma_bounded_response_fingerprint"))
+            _photon_head_metadata["photon_head_response_capability"] = str(
+                _bounded_capability)
+            _photon_head_metadata["photon_head_response_approximation"] = str(
+                _bounded_approximation)
+    elif (results.photon_head_sigma_operator_fingerprint is not None
+          or results.photon_head_sigma_response_fingerprint is not None):
         raise ValueError(
-            "photon head Sigma operator identity exists without a basis")
+            "photon head Sigma identity exists without a basis")
     if _photon_head is None:
         _photon_head = np.zeros(
             (3, 3, _nk, _nb), dtype=np.complex128)

@@ -63,10 +63,10 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
     "|dtype=S,Y,Z:complex128;sigma_H:float64"
 )
 
-STATIC_GAUGE_HALL_SCHEMA_VERSION = 1
-ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 1
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 2
+ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 3
 ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID = (
-    "lorrax.isometric_retained_bubble_source/v1"
+    "lorrax.isometric_retained_bubble_source/v3"
     "|payload=energy_scaled_d1_raw+S_direct_cart+sigma_H_cart"
     "|sharding=P(None,None,None,x,y)+replicated"
     "|contact=omitted_by_model|complement=omitted_by_model")
@@ -236,6 +236,9 @@ def write_static_gauge_hall_artifact(
         io.write_attr("band_stop", np.int32(stop))
         io.write_attr("nk_tot", np.int32(nk_tot))
         io.write_attr("sigma_H_cart", sigma_H)
+        io.write_attr(
+            "hall_antisymmetry_residual",
+            np.float64(hall_transaction.antisymmetry_residual))
 
     _publish_completed_partial(
         partial_path, final_path, artifact_name="StaticGaugeHall",
@@ -292,6 +295,8 @@ def load_static_gauge_hall_artifact(
         nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
         sigma_H = np.asarray(
             _read_required_small(io, "sigma_H_cart"), dtype=np.float64)
+        hall_residual = float(np.asarray(_read_required_small(
+            io, "hall_antisymmetry_residual")))
 
     if complete != 1:
         raise ValueError(
@@ -312,6 +317,8 @@ def load_static_gauge_hall_artifact(
     if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
         raise ValueError(
             "StaticGaugeHall sigma_H_cart must contain three finite values")
+    if not np.isfinite(hall_residual) or hall_residual < 0.0:
+        raise ValueError("StaticGaugeHall antisymmetry residual is invalid")
     operator_fingerprint = _require_prefixed_sha256(
         operator_fingerprint,
         field_name="Hall Hamiltonian/config/operator fingerprint")
@@ -323,6 +330,7 @@ def load_static_gauge_hall_artifact(
         band_start=expected_start,
         band_stop=stop,
         nk_tot=nk_tot,
+        antisymmetry_residual=hall_residual,
         mesh=mesh_xy,
     )
 
@@ -341,8 +349,8 @@ def write_isometric_retained_bubble_source_artifact(
     source = require_isometric_retained_bubble_source(source, mesh_xy)
     final_path, partial_path = _immutable_partial_paths(
         path, artifact_name="IsometricRetainedBubbleSource")
-    storage = int(source.energy_scaled_d1_raw.shape[-1])
-    p_shape = (2, 4, int(source.nk_tot), storage, storage)
+    logical = int(source.band_stop) - int(source.band_start)
+    p_shape = (2, 4, int(source.nk_tot), logical, logical)
     availability_json = json.dumps(
         source.availability.as_tokens(), sort_keys=True, separators=(",", ":"))
     with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
@@ -350,6 +358,9 @@ def write_isometric_retained_bubble_source_artifact(
             _P_SOURCE_DATASET, shape=p_shape, dtype=np.complex128)
         io.create_dataset(
             _S_SOURCE_DATASET, shape=(2, 2, 4, 4), dtype=np.complex128)
+        # SlabIO clips the producer's mesh padding to this logical dataset.
+        # A consumer on a different mesh reads the same logical bytes into
+        # its own padded carrier; processor count is not artifact semantics.
         io.write_slab(_P_SOURCE_DATASET, source.energy_scaled_d1_raw)
         io.write_slab(_S_SOURCE_DATASET, source.S_direct)
         io.write_attr(
@@ -379,12 +390,28 @@ def write_isometric_retained_bubble_source_artifact(
         io.write_attr("band_start", np.int32(source.band_start))
         io.write_attr("band_stop", np.int32(source.band_stop))
         io.write_attr("nk_tot", np.int32(source.nk_tot))
-        io.write_attr("band_storage", np.int32(storage))
+        io.write_attr("band_extent", np.int32(logical))
+        io.write_attr(
+            "parallel_transport_schema_version",
+            np.int32(source.parallel_transport_schema_version))
+        io.write_attr(
+            "parallel_transport_polar_rcond",
+            np.float64(source.parallel_transport_polar_rcond))
+        io.write_attr(
+            "parallel_transport_derivative_axes",
+            np.asarray(
+                source.parallel_transport_derivative_axes, dtype=np.int32))
+        io.write_attr(
+            "parallel_transport_coefficient_frame_i32",
+            _text_i32(
+                source.parallel_transport_coefficient_frame,
+                encoding="ascii"))
         io.write_attr("sigma_H_cart", np.asarray(
             jax.device_get(source.sigma_H), dtype=np.float64))
         for name in (
             "charge_ward_residual", "ward_residual", "hermiticity_residual",
             "ordered_curvature_residual", "q2_symmetry_residual",
+            "hall_antisymmetry_residual",
         ):
             io.write_attr(name, np.float64(getattr(source, name)))
 
@@ -456,13 +483,22 @@ def load_isometric_retained_bubble_source_artifact(
         start = int(np.asarray(_read_required_small(io, "band_start")))
         stop = int(np.asarray(_read_required_small(io, "band_stop")))
         nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
-        storage = int(np.asarray(_read_required_small(io, "band_storage")))
+        band_extent = int(np.asarray(_read_required_small(io, "band_extent")))
+        pt_schema = int(np.asarray(_read_required_small(
+            io, "parallel_transport_schema_version")))
+        pt_rcond = float(np.asarray(_read_required_small(
+            io, "parallel_transport_polar_rcond")))
+        pt_axes = tuple(int(axis) for axis in np.asarray(
+            _read_required_small(io, "parallel_transport_derivative_axes"),
+            dtype=np.int32).reshape(-1))
+        pt_frame = text_field("parallel_transport_coefficient_frame_i32")
         sigma_H = _read_required_small(io, "sigma_H_cart")
         residuals = {name: float(np.asarray(_read_required_small(io, name)))
                      for name in (
                          "charge_ward_residual", "ward_residual",
                          "hermiticity_residual", "ordered_curvature_residual",
-                         "q2_symmetry_residual")}
+                         "q2_symmetry_residual",
+                         "hall_antisymmetry_residual")}
 
         refusals = []
         if complete != 1:
@@ -490,17 +526,17 @@ def load_isometric_retained_bubble_source_artifact(
                 f"[{expected_start},{expected_stop})")
         if nk_tot != expected_nk:
             refusals.append(f"nk_tot={nk_tot}, expected {expected_nk}")
-        if storage < stop - start:
-            refusals.append("stored band carrier is shorter than the manifold")
+        if band_extent != stop - start:
+            refusals.append(
+                f"stored logical band extent {band_extent} != {stop-start}")
         if refusals:
             raise ValueError(
                 "GATE isometric_retained_bubble_artifact_mismatch:\n  - "
                 + "\n  - ".join(refusals))
 
-        p_shape = (2, 4, nk_tot, storage, storage)
         try:
             energy_scaled_d1_raw = io.read_slab(
-                _P_SOURCE_DATASET, shape=p_shape,
+                _P_SOURCE_DATASET,
                 partition_spec=P(None, None, None, "x", "y"))
             S_direct = io.read_slab(
                 _S_SOURCE_DATASET, shape=(2, 2, 4, 4), partition_spec=P())
@@ -523,6 +559,10 @@ def load_isometric_retained_bubble_source_artifact(
         endpoint_jet_convention=endpoint_convention,
         hamiltonian_config_operator_fingerprint=operator_fingerprint,
         source_fingerprint=source_fingerprint,
+        parallel_transport_schema_version=pt_schema,
+        parallel_transport_polar_rcond=pt_rcond,
+        parallel_transport_coefficient_frame=pt_frame,
+        parallel_transport_derivative_axes=pt_axes,
         wfn_fingerprint=artifact_wfn,
         band_start=start, band_stop=stop, nk_tot=nk_tot,
         approximation=approximation,

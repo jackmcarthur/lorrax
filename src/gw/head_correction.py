@@ -1419,6 +1419,7 @@ def complete_static_slab_photon_q0(
     # response's provenance flags.
     from .static_gauge_response import (
         StaticGaugeCubatureResponse,
+        StaticGaugeResponseCapability,
         require_static_gauge_cubature_response,
     )
     if isinstance(response, StaticGaugeCubatureResponse):
@@ -1427,9 +1428,17 @@ def complete_static_slab_photon_q0(
         # it is not a complete Hamiltonian/current/contact identity.  Do not
         # publish it in the exact-response Sigma receipt.
         operator_fingerprint = None
-        bounded_response_fingerprint = response.response_fingerprint
-        bounded_response_capability = response.capability.value
-        bounded_response_approximation = response.approximation
+        bounded_retained = (
+            response.capability is
+            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE)
+        if response.response_fingerprint is None:
+            bounded_response_fingerprint = None
+            bounded_response_capability = None
+            bounded_response_approximation = None
+        else:
+            bounded_response_fingerprint = response.response_fingerprint
+            bounded_response_capability = response.capability.value
+            bounded_response_approximation = response.approximation
     else:
         response = require_static_gauge_head_response(response, mesh_xy)
         operator_fingerprint = (
@@ -1437,6 +1446,7 @@ def complete_static_slab_photon_q0(
         bounded_response_fingerprint = None
         bounded_response_capability = None
         bounded_response_approximation = None
+        bounded_retained = False
     layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
@@ -1473,7 +1483,8 @@ def complete_static_slab_photon_q0(
     jax.block_until_ready((S_effective, YW_y, WZ_x))
     effective_ward, effective_hermiticity = static_gauge_tensor_residuals(
         S_effective)
-    if effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX:
+    if (not bounded_retained
+            and effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX):
         raise ValueError(
             "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
             f"response violates the Ward identity: {effective_ward:.6e} > "

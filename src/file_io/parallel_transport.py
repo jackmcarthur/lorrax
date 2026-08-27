@@ -35,7 +35,7 @@ from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -45,6 +45,17 @@ ENERGIES_DATASET = "dft_energies_ry_full"
 W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
 OCCUPATIONS_DATASET = "dft_occupations_full"
+
+
+def _normalize_derivative_axes(derivative_axes) -> tuple[int, ...]:
+    axes = tuple(int(axis) for axis in derivative_axes)
+    if (not axes or len(set(axes)) != len(axes)
+            or any(axis not in (0, 1, 2) for axis in axes)
+            or tuple(sorted(axes)) != axes):
+        raise ValueError(
+            "parallel-transport derivative_axes must be a nonempty ordered "
+            f"subset of (0,1,2); got {axes}")
+    return axes
 
 def link_symmetry_reduction_applies(sym, kgrid) -> bool:
     """Whether the IBZ link stream + directed-edge unfold is DEFINED here.
@@ -397,6 +408,7 @@ def initialize_parallel_transport_artifact(
     wfn_path: str,
     wfn_fingerprint: str,
     rcond: float = 1.0e-10,
+    derivative_axes=(0, 1, 2),
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
 
@@ -425,6 +437,8 @@ def initialize_parallel_transport_artifact(
     that carries no stencil requirement at all -- was ever written.
     """
     nb = int(nbands)
+    axes = _normalize_derivative_axes(derivative_axes)
+    n_axes = len(axes)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
     reduced = link_symmetry_reduction_applies(sym, kgrid)
     nk = int(sym.nk_tot)
@@ -442,7 +456,7 @@ def initialize_parallel_transport_artifact(
 
     with SlabIO(str(path), mode="w", mesh=mesh) as io:
         io.create_dataset(
-            LINKS_DATASET, shape=(nrk, 3, nb, nb), dtype=np.complex128,
+            LINKS_DATASET, shape=(nrk, n_axes, nb, nb), dtype=np.complex128,
             attrs={
                 "k_storage": ("ibz_source_edges" if reduced
                               else "full_bz_source_edges"),
@@ -452,7 +466,8 @@ def initialize_parallel_transport_artifact(
                 "gauge": "WfnLoader generated full-BZ gauge",
             })
         io.create_dataset(
-            SINGULAR_VALUES_DATASET, shape=(nrk, 3, nb), dtype=np.float64,
+            SINGULAR_VALUES_DATASET,
+            shape=(nrk, n_axes, nb), dtype=np.float64,
             attrs={
                 "k_storage": ("ibz_source_edges" if reduced
                               else "full_bz_source_edges"),
@@ -471,7 +486,7 @@ def initialize_parallel_transport_artifact(
                 "manifold": "bands [band_start, band_stop)",
             })
         io.create_dataset(
-            CONNECTION_REDUCED_DATASET, shape=(3, nk, nb, nb),
+            CONNECTION_REDUCED_DATASET, shape=(n_axes, nk, nb, nb),
             dtype=np.complex128,
             attrs={
                 "k_storage": "full_bz",
@@ -481,7 +496,7 @@ def initialize_parallel_transport_artifact(
                 "finite_difference_order": 4,
             })
         io.create_dataset(
-            CONNECTION_CART_DATASET, shape=(3, nk, nb, nb),
+            CONNECTION_CART_DATASET, shape=(n_axes, nk, nb, nb),
             dtype=np.complex128,
             attrs={
                 "k_storage": "full_bz",
@@ -498,6 +513,7 @@ def initialize_parallel_transport_artifact(
         io.write_attr(ENERGIES_DATASET, energies)
         io.write_attr(OCCUPATIONS_DATASET, occupations)
         io.write_attr("schema_version", np.int32(SCHEMA_VERSION))
+        io.write_attr("derivative_axes", np.asarray(axes, dtype=np.int32))
         io.write_attr("band_start", np.int32(0))
         io.write_attr("band_stop", np.int32(nb))
         io.write_attr("spin_channel", np.int32(0))
@@ -547,6 +563,7 @@ def _write_link_stage(
     nbands: int,
     bispinor: bool,
     polar_plan,
+    derivative_axes: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Stream IBZ wavefunctions and write links plus fixed-reference data."""
     from wfn_loader import IBZRows
@@ -562,12 +579,14 @@ def _write_link_stage(
     source_full = (np.asarray(sym.kirr_fullids, dtype=np.int32) if reduced
                    else np.arange(int(sym.nk_tot), dtype=np.int32))
     nrk = int(source_full.size)
-    full_plus = build_forward_neighbor_table(sym.kvecs_asints, wfn.kgrid)
+    axes = _normalize_derivative_axes(derivative_axes)
+    source_steps = np.eye(3, dtype=np.int32)[np.asarray(axes)]
+    full_plus = build_neighbor_table(
+        sym.kvecs_asints, wfn.kgrid, source_steps)
     source_plus = full_plus[source_full]
-    wraps = np.empty((nrk, 3, 3), dtype=np.int32)
+    wraps = np.empty((nrk, len(axes), 3), dtype=np.int32)
     singular_values = []
     center_on_x, link_kernel = make_cross_k_link(mesh, polar_plan)
-    source_steps = np.eye(3, dtype=np.int32)
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         for ik_irr, center_full in enumerate(source_full):
@@ -580,12 +599,12 @@ def _write_link_stage(
             g_center = wfn.gvecs(k=center_ids)[0]
             ngk_center = int(wfn.ngk_valid(k=center_ids)[0])
 
-            for idir in range(3):
+            for idir, axis in enumerate(axes):
                 neighbor_full = int(source_plus[ik_irr, idir])
                 neighbor_ids = [neighbor_full]
                 wrap = g_wrap_for_forward_step(
                     sym.unfolded_kpts, int(center_full), neighbor_full,
-                    idir, wfn.kgrid)
+                    axis, wfn.kgrid)
                 wraps[ik_irr, idir] = wrap
                 g_neighbor = wfn.gvecs(k=neighbor_ids)[0]
                 ngk_neighbor = int(wfn.ngk_valid(k=neighbor_ids)[0])
@@ -605,7 +624,7 @@ def _write_link_stage(
                 io.write_slab(
                     LINKS_DATASET, link[None, None, :, :],
                     offset=(ik_irr, idir, 0, 0),
-                    global_shape=(nrk, 3, nb, nb))
+                    global_shape=(nrk, len(axes), nb, nb))
                 # WfnLoader owns a second collective HDF5 handle.  Finish
                 # this asynchronous append before its next streamed read.
                 io.sync_writes()
@@ -617,12 +636,12 @@ def _write_link_stage(
             del center_xy, center_x
 
         singular_values_device = jnp.stack(singular_values).reshape(
-            nrk, 3, nb)
+            nrk, len(axes), nb)
         singular_values_device = jax.lax.with_sharding_constraint(
             singular_values_device, NamedSharding(mesh, P()))
         io.write_slab(
             SINGULAR_VALUES_DATASET, singular_values_device,
-            global_shape=(nrk, 3, nb))
+            global_shape=(nrk, len(axes), nb))
         io.write_attr("source_steps", source_steps)
         io.write_attr("source_full_ids", source_full)
         io.write_attr("source_neighbor_full_ids", source_plus)
@@ -641,11 +660,14 @@ def _write_connection_stage(
     full_plus: np.ndarray,
     source_full: np.ndarray,
     source_steps: np.ndarray,
+    derivative_axes: tuple[int, ...],
     directed_edge_orbit_table,
     apply_band_matrix_symmetry,
 ) -> None:
     """Read compact links, unfold through SymMaps, and write A once."""
     nb = int(nbands)
+    axes = _normalize_derivative_axes(derivative_axes)
+    n_axes = len(axes)
     nb_storage = band_storage_extent(mesh, nb)
     reduced = link_symmetry_reduction_applies(
         sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)))
@@ -660,7 +682,7 @@ def _write_connection_stage(
             source_full_ids=source_full,
             source_steps=source_steps,
             n_sym_spatial=int(wfn.ntran),
-            target_steps=np.eye(3, dtype=np.int32),
+            target_steps=np.asarray(source_steps, dtype=np.int32),
         )
     elif int(source_full.size) != int(sym.nk_tot):
         raise ValueError(
@@ -680,12 +702,12 @@ def _write_connection_stage(
         # and leaves its contents untouched.
         io.create_dataset(
             LINKS_DATASET,
-            shape=(int(source_full.size), 3, nb, nb),
+            shape=(int(source_full.size), n_axes, nb, nb),
             dtype=np.complex128,
         )
         source_links = io.read_slab(
             LINKS_DATASET,
-            shape=(int(source_full.size), 3, nb_storage, nb_storage),
+            shape=(int(source_full.size), n_axes, nb_storage, nb_storage),
             partition_spec=block_spec)
         if table is None:
             # The source rows ARE the targets, in full-BZ id order, and each
@@ -710,7 +732,8 @@ def _write_connection_stage(
         @jax.jit
         def _connection(links):
             return fourth_order_connection(
-                links, full_plus, spacing, band_matmul=band_matmul)
+                links, full_plus, spacing, band_matmul=band_matmul,
+                derivative_axes=axes)
 
         connection_reduced = _connection(full_links)
         connection_reduced = jax.lax.with_sharding_constraint(
@@ -728,7 +751,9 @@ def _write_connection_stage(
 
         @jax.jit
         def _to_cart(A):
-            out = reduced_covector_to_cartesian(A, reciprocal)
+            out = reduced_covector_to_cartesian(
+                A, reciprocal, derivative_axes=axes,
+                cartesian_axes=axes)
             out = 0.5 * (out + jnp.swapaxes(jnp.conj(out), -1, -2))
             return jax.lax.with_sharding_constraint(out, block_sharding)
 
@@ -761,7 +786,7 @@ def _write_connection_stage(
                 "link_symmetry_reduction_applies) before re-running the "
                 "connection stage.  doc: "
                 "docs/architecture/symmetry_register.md")
-        connection_shape = (3, int(sym.nk_tot), nb, nb)
+        connection_shape = (n_axes, int(sym.nk_tot), nb, nb)
         io.write_slab(
             CONNECTION_REDUCED_DATASET, connection_reduced,
             global_shape=connection_shape)
@@ -1097,6 +1122,7 @@ def write_parallel_transport_artifact(
     rcond: float = 1.0e-10,
     w_av_first_neighbors: bool = False,
     w_av_second_neighbors: bool = False,
+    derivative_axes=(0, 1, 2),
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
 
@@ -1110,18 +1136,27 @@ def write_parallel_transport_artifact(
     ``get_dipole_mtxels.py:1309-1317``, fix note).
     """
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
-    bad_axes = undersampled_link_axes(kgrid)
+    axes = _normalize_derivative_axes(derivative_axes)
+    with SlabIO(str(path), mode="r", mesh=mesh) as io:
+        stored_axes = tuple(int(axis) for axis in np.asarray(
+            io.read_small("derivative_axes", dtype=np.int32)).reshape(-1))
+    if stored_axes != axes:
+        raise ValueError(
+            "parallel-transport link-stage derivative axes differ from "
+            f"initialized artifact: requested={axes}, stored={stored_axes}")
+    bad_axes = ["xyz"[axis] for axis in axes
+                if kgrid[axis] < MIN_STENCIL_POINTS]
     if bad_axes:
         raise ValueError(
             "PT-LINK-STENCIL-UNSUPPORTED refusal: the nearest-neighbour "
             "link stage and its fourth-order +/-2 connection stencil "
             "require at least "
             f"{MIN_STENCIL_POINTS} distinct mesh points along every "
-            "Cartesian mesh direction.\n"
+            "requested derivative direction.\n"
             f"  got:  kgrid={kgrid}, undersampled axes "
             f"{', '.join(bad_axes)} "
             f"({'; '.join(f'{a}: {n} point(s)' for a, n in zip('xyz', kgrid) if a in bad_axes)})\n"
-            "  want: >=5 mesh points on every axis that carries dispersion, "
+            "  want: >=5 mesh points on every requested derivative axis, "
             "or no request for the link/connection stage at all\n"
             "  fix:  for a genuinely lower-dimensional deck (a collapsed "
             "axis with kgrid[i]=1, e.g. a 9x9x1 slab), request only the "
@@ -1138,11 +1173,13 @@ def write_parallel_transport_artifact(
         mesh, n=nb_padded, backend="distributed", rcond=float(rcond))
     full_plus, source_full, source_steps = _write_link_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
-        bispinor=bool(bispinor), polar_plan=polar_plan)
+        bispinor=bool(bispinor), polar_plan=polar_plan,
+        derivative_axes=axes)
     _write_connection_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
         full_plus=full_plus, source_full=source_full,
         source_steps=source_steps,
+        derivative_axes=axes,
         directed_edge_orbit_table=edge_table,
         apply_band_matrix_symmetry=apply_symmetry)
 
@@ -1308,6 +1345,7 @@ def complete_velocity_validation(
     atol: float,
     rtol: float,
     scope_blocks=(),
+    derivative_axes=(0, 1, 2),
 ) -> dict[str, object]:
     """Run and stamp the finite-link DFT head-velocity gate.
 
@@ -1334,6 +1372,8 @@ def complete_velocity_validation(
     occupations = jnp.asarray(occupations_full)
     exact = jnp.asarray(velocity_exact_cart)
     links = jnp.asarray(links_full)
+    axes = _normalize_derivative_axes(derivative_axes)
+    n_axes = len(axes)
     grid = tuple(int(x) for x in kgrid)
     reciprocal = np.asarray(bvec_cart, dtype=np.float64)
     if energies.ndim != 2:
@@ -1347,14 +1387,14 @@ def complete_velocity_validation(
     if tuple(exact.shape) != (3, nk, nb, nb):
         raise ValueError(
             f"exact velocity must be (3,{nk},{nb},{nb}); got {exact.shape}")
-    if tuple(links.shape) != (3, nk, nb, nb):
+    if tuple(links.shape) != (n_axes, nk, nb, nb):
         raise ValueError(
-            f"links_full must be (3, {nk}, {nb}, {nb}); got "
+            f"links_full must be ({n_axes}, {nk}, {nb}, {nb}); got "
             f"{tuple(links.shape)}")
     plus = np.asarray(forward_neighbors, dtype=np.int64)
-    if plus.shape != (nk, 3):
+    if plus.shape != (nk, n_axes):
         raise ValueError(
-            f"forward_neighbors must be ({nk}, 3); got {plus.shape}")
+            f"forward_neighbors must be ({nk}, {n_axes}); got {plus.shape}")
     h_sharding = NamedSharding(mesh, P(None, "x", "y"))
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
     spacing = 1.0 / np.asarray(grid, dtype=np.float64)
@@ -1366,11 +1406,15 @@ def complete_velocity_validation(
         _diagonal_hamiltonian, out_shardings=h_sharding)
     H = _diagonal_hamiltonian(energies.astype(links.real.dtype))
     reduced = fourth_order_covariant_derivative(
-        H, links, plus, spacing, band_matmul=band_matmul)
-    reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
+        H, links, plus, spacing, band_matmul=band_matmul,
+        derivative_axes=axes)
+    reconstructed = reduced_covector_to_cartesian(
+        reduced, reciprocal, derivative_axes=axes, cartesian_axes=axes)
+    exact = exact[np.asarray(axes, dtype=np.int32)]
 
     metrics = _velocity_error_metrics(
         reconstructed, exact, atol=float(atol), rtol=float(rtol))
+    metrics["derivative_axes"] = axes
     metrics["entrywise_passed"] = bool(metrics["passed"])
 
     delta_e = energies[:, :, None] - energies[:, None, :]
@@ -1403,11 +1447,23 @@ def complete_velocity_validation(
         nspinor=1,
         eta_ry=0.0,
     )
+    # Reuse the incumbent width-three head executable.  The geometry gate in
+    # reduced_covector_to_cartesian above has already proved omitted reduced
+    # directions cannot mix into the requested Cartesian rows; these equal
+    # zero pads exist only in the validation bilinear and are not persisted
+    # as a link or derivative.
+    response_exact = jnp.zeros((3,) + tuple(exact.shape[1:]), exact.dtype)
+    response_reconstructed = jnp.zeros(
+        (3,) + tuple(reconstructed.shape[1:]), reconstructed.dtype)
+    response_exact = response_exact.at[np.asarray(axes, dtype=np.int32)].set(
+        exact)
+    response_reconstructed = response_reconstructed.at[
+        np.asarray(axes, dtype=np.int32)].set(reconstructed)
     exact_response = head_s_tensor_sharded(
-        exact, energies, occupations, jnp.asarray([0.0 + 0.0j]),
+        response_exact, energies, occupations, jnp.asarray([0.0 + 0.0j]),
         **response_kwargs)[0]
     reconstructed_response = head_s_tensor_sharded(
-        reconstructed, energies, occupations,
+        response_reconstructed, energies, occupations,
         jnp.asarray([0.0 + 0.0j]), **response_kwargs)[0]
     response_norm = jnp.linalg.norm(exact_response)
     response_relative = (
@@ -1470,8 +1526,9 @@ def load_full_bz_links(
     nk: int,
     nb_storage: int,
     nb_logical: int,
+    derivative_axes=(0, 1, 2),
 ):
-    """Read the stored links and return them as ``(3, nk, nb, nb)``.
+    """Read stored links as ``(n_axes, nk, nb, nb)``.
 
     The link stage stores either one row per full-BZ point (bcc/fcc, where
     ``link_symmetry_reduction_applies`` is false) or one row per IBZ point
@@ -1480,11 +1537,13 @@ def load_full_bz_links(
     than rebuilding the table from a SymMaps it does not own.
     """
     block_spec = P(None, None, "x", "y")
+    axes = _normalize_derivative_axes(derivative_axes)
+    n_axes = len(axes)
     source_full = np.asarray(io.read_slab(
         "source_full_ids", partition_spec=P(None), as_numpy=True))
     n_source = int(source_full.size)
     stored = io.read_slab(
-        LINKS_DATASET, shape=(n_source, 3, nb_storage, nb_storage),
+        LINKS_DATASET, shape=(n_source, n_axes, nb_storage, nb_storage),
         partition_spec=block_spec)
     if n_source == nk:
         links = jnp.moveaxis(stored, 1, 0)
@@ -1499,7 +1558,7 @@ def load_full_bz_links(
 
         def _table(name):
             return np.asarray(io.read_slab(
-                f"directed_edge_{name}", shape=(nk, 3),
+                f"directed_edge_{name}", shape=(nk, n_axes),
                 partition_spec=P(None, None), as_numpy=True))
 
         selected = stored[_table("source_row"), _table("source_direction")]
@@ -1527,10 +1586,12 @@ def load_full_bz_links(
     return links
 
 
-def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
+def load_link_singular_values(
+    io, *, nb_logical: int, derivative_axes=(0, 1, 2),
+) -> np.ndarray:
     """Read the per-source-k, per-direction link overlap singular values.
 
-    Returns ``(n_source, 3, nb_logical)``, descending along the last axis
+    Returns ``(n_source, n_axes, nb_logical)``, descending along the last axis
     (the dataset's own ``ordering`` attribute; see
     :data:`SINGULAR_VALUES_DATASET`'s ``create_dataset`` call).  ``n_source``
     is the IBZ row count on a symmetry-reduced deck or ``nk_tot`` on an
@@ -1549,11 +1610,12 @@ def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
     consumer needs that today.
     """
     nb = int(nb_logical)
+    axes = _normalize_derivative_axes(derivative_axes)
     source_full = np.asarray(io.read_slab(
         "source_full_ids", partition_spec=P(None), as_numpy=True))
     n_source = int(source_full.size)
     values = io.read_slab(
-        SINGULAR_VALUES_DATASET, shape=(n_source, 3, nb),
+        SINGULAR_VALUES_DATASET, shape=(n_source, len(axes), nb),
         partition_spec=P(None, None, None), as_numpy=True)
     return np.asarray(values, dtype=np.float64)
 
@@ -1568,13 +1630,21 @@ def validate_parallel_transport_artifact(
     atol: float,
     rtol: float,
     scope_blocks=None,
+    derivative_axes=(0, 1, 2),
 ) -> dict[str, object]:
     """Read the artifact through SlabIO and execute its mandatory gate."""
     nb = int(nbands)
     nb_storage = band_storage_extent(mesh, nb)
     grid = tuple(int(x) for x in kgrid)
+    axes = _normalize_derivative_axes(derivative_axes)
     nk = int(np.prod(grid))
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
+        stored_axes = tuple(int(axis) for axis in np.asarray(
+            io.read_small("derivative_axes", dtype=np.int32)).reshape(-1))
+        if stored_axes != axes:
+            raise ValueError(
+                "parallel-transport validation derivative axes differ from "
+                f"artifact: requested={axes}, stored={stored_axes}")
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET,
             shape=(3, nk, nb_storage, nb_storage),
@@ -1588,11 +1658,11 @@ def validate_parallel_transport_artifact(
             shape=(nk, nb_storage),
             partition_spec=P(None, ("x", "y")))
         forward_neighbors = np.asarray(io.read_slab(
-            "full_forward_neighbors", shape=(nk, 3),
+            "full_forward_neighbors", shape=(nk, len(axes)),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
             io, mesh=mesh, nk=nk, nb_storage=nb_storage,
-            nb_logical=nb)
+            nb_logical=nb, derivative_axes=axes)
     if nb <= 0 or nb > int(np.shape(energies)[1]):
         raise ValueError(
             f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")
@@ -1605,6 +1675,7 @@ def validate_parallel_transport_artifact(
         velocity_exact_cart=velocity,
         links_full=links,
         forward_neighbors=forward_neighbors,
+        derivative_axes=axes,
         atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks)
 
 
@@ -1705,7 +1776,7 @@ def write_velocity_validation(
     metrics: dict[str, object],
 ) -> None:
     """Stamp mandatory DFT reconstruction gate metrics through SlabIO."""
-    required = set(_VELOCITY_GATE_KEYS) | {"passed"}
+    required = set(_VELOCITY_GATE_KEYS) | {"passed", "derivative_axes"}
     missing = required.difference(metrics)
     if missing:
         raise ValueError(f"velocity validation metrics missing {sorted(missing)}")
@@ -1713,6 +1784,10 @@ def write_velocity_validation(
         io.write_attr("velocity_validation_complete", np.int32(1))
         io.write_attr(
             "velocity_validation_passed", np.int32(bool(metrics["passed"])))
+        io.write_attr(
+            "velocity_validation_derivative_axes",
+            np.asarray(_normalize_derivative_axes(
+                metrics["derivative_axes"]), dtype=np.int32))
         for name in _VELOCITY_GATE_KEYS:
             io.write_attr(
                 f"velocity_validation_{name}", np.float64(metrics[name]))

@@ -137,11 +137,15 @@ _SOURCE_TOKEN = object()
 ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION = (
     "isometric_retained_bubble_no_contact_no_complement_v1")
 ISOMETRIC_ENDPOINT_JET_CONVENTION = (
-    "uniform_gauge_endpoint_jet/v1"
+    "uniform_gauge_endpoint_jet/v3"
     "|kinetic_balance_lift=isometric"
     "|bra_K=k-q:q1=-dK,q2=+d2K"
     "|transfer_axes=cartesian"
-    "|q2=analytic_isometric_plus_icl_vnl")
+    "|q2=analytic_isometric_plus_icl_vnl"
+    "|charge_q1_q2=analytic_isometric_lift"
+    "|energy_q1_q2=source_pauli_pt_velocity"
+    "|hall=P_charge_x_Gamma_conj/deltaE2"
+    "|vnl_velocity_sign=+1")
 DISTINCT_BODY_LEG_PLACEMENT = (
     "head_wings_distinct_faces/v1|Y=bra_vertex(B,0)|Z=ket_vertex(0,B)")
 
@@ -214,6 +218,10 @@ class IsometricRetainedBubbleSource:
     endpoint_jet_convention: str
     hamiltonian_config_operator_fingerprint: str
     source_fingerprint: str
+    parallel_transport_schema_version: int
+    parallel_transport_polar_rcond: float
+    parallel_transport_coefficient_frame: str
+    parallel_transport_derivative_axes: tuple[int, ...]
     wfn_fingerprint: str
     band_start: int
     band_stop: int
@@ -223,6 +231,7 @@ class IsometricRetainedBubbleSource:
     hermiticity_residual: float
     ordered_curvature_residual: float
     q2_symmetry_residual: float
+    hall_antisymmetry_residual: float
     approximation: str
     _source_token: object
 
@@ -236,18 +245,30 @@ class IsometricRetainedBubbleSource:
 def _source_fingerprint(
     *, operator_fingerprint: str, wfn_fingerprint: str,
     band_start: int, band_stop: int, nk_tot: int,
+    parallel_transport_schema_version: int,
+    parallel_transport_polar_rcond: float,
+    parallel_transport_coefficient_frame: str,
+    parallel_transport_derivative_axes: tuple[int, ...],
 ) -> str:
     """Bind the endpoint representation/jet semantics before persistence."""
     import hashlib
     from common.parallel_transport import fingerprint_update_value
 
     digest = hashlib.sha256()
-    digest.update(b"lorrax.isometric_retained_bubble_source/v1\0")
+    digest.update(b"lorrax.isometric_retained_bubble_source/v3\0")
     for label, value in (
         ("operator", operator_fingerprint),
         ("wfn", wfn_fingerprint),
         ("band_interval", f"{int(band_start)}:{int(band_stop)}"),
         ("nk_tot", str(int(nk_tot))),
+        ("parallel_transport_schema_version",
+         str(int(parallel_transport_schema_version))),
+        ("parallel_transport_polar_rcond",
+         float(parallel_transport_polar_rcond).hex()),
+        ("parallel_transport_coefficient_frame",
+         str(parallel_transport_coefficient_frame)),
+        ("parallel_transport_derivative_axes",
+         tuple(int(axis) for axis in parallel_transport_derivative_axes)),
         ("endpoint_jet", ISOMETRIC_ENDPOINT_JET_CONVENTION),
         ("approximation", ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION),
     ):
@@ -299,11 +320,33 @@ def require_isometric_retained_bubble_source(
         operator_fingerprint=source.hamiltonian_config_operator_fingerprint,
         wfn_fingerprint=source.wfn_fingerprint,
         band_start=int(source.band_start), band_stop=int(source.band_stop),
-        nk_tot=int(source.nk_tot))
+        nk_tot=int(source.nk_tot),
+        parallel_transport_schema_version=(
+            int(source.parallel_transport_schema_version)),
+        parallel_transport_polar_rcond=(
+            float(source.parallel_transport_polar_rcond)),
+        parallel_transport_coefficient_frame=(
+            source.parallel_transport_coefficient_frame),
+        parallel_transport_derivative_axes=(
+            tuple(source.parallel_transport_derivative_axes)))
     if source.source_fingerprint != expected_source_fingerprint:
         raise ValueError(
             "retained-bubble source fingerprint does not bind its current "
             "endpoint-jet fields")
+    from file_io.parallel_transport import SCHEMA_VERSION as PT_SCHEMA_VERSION
+    if int(source.parallel_transport_schema_version) != int(PT_SCHEMA_VERSION):
+        raise ValueError(
+            "retained-bubble source PT schema differs from the current "
+            f"owner: {source.parallel_transport_schema_version} != "
+            f"{PT_SCHEMA_VERSION}")
+    if source.parallel_transport_coefficient_frame != (
+            "source_pauli_coefficient_frame_v1"):
+        raise ValueError("retained-bubble source has a non-Pauli PT frame")
+    if tuple(source.parallel_transport_derivative_axes) != (0, 1):
+        raise ValueError("retained-bubble source PT coverage is not in-plane")
+    if (not np.isfinite(source.parallel_transport_polar_rcond)
+            or float(source.parallel_transport_polar_rcond) <= 0.0):
+        raise ValueError("retained-bubble source has invalid PT polar_rcond")
 
     logical = int(source.band_stop) - int(source.band_start)
     if int(source.band_start) != 0 or logical <= 0 or int(source.nk_tot) <= 0:
@@ -334,7 +377,8 @@ def require_isometric_retained_bubble_source(
     residuals = np.asarray((
         source.charge_ward_residual, source.ward_residual,
         source.hermiticity_residual, source.ordered_curvature_residual,
-        source.q2_symmetry_residual), dtype=np.float64)
+        source.q2_symmetry_residual, source.hall_antisymmetry_residual),
+        dtype=np.float64)
     if np.any(~np.isfinite(residuals)) or np.any(residuals < 0.0):
         raise ValueError("retained-bubble source has invalid residuals")
     return source
@@ -373,9 +417,12 @@ def build_isometric_retained_bubble_source(
             "retained-bubble source requires the complete uniform-gauge "
             "endpoint transaction")
     if (uniform_gauge.dgamma_dq_raw is None
-            or uniform_gauge.d2gamma_dq2_raw is None):
+            or uniform_gauge.d2gamma_dq2_raw is None
+            or uniform_gauge.dcharge_dq_raw is None
+            or uniform_gauge.d2charge_dq2_raw is None):
         raise ValueError(
-            "retained-bubble source requires canonical q1 and q2 endpoint jets")
+            "retained-bubble source requires canonical charge and current "
+            "q1/q2 endpoint jets")
     if not isinstance(parallel_transport, ParallelTransportHeadData):
         raise TypeError(
             "retained-bubble source requires the canonical PT link artifact")
@@ -385,6 +432,14 @@ def build_isometric_retained_bubble_source(
             "retained-bubble source requires source-Pauli coefficient-frame "
             "links; isometric endpoint q1/q2 already contains dU/dK and an "
             "isometric-link connection would double count it")
+    if tuple(parallel_transport.derivative_axes) != (0, 1):
+        raise ValueError(
+            "retained-bubble source requires exact in-plane PT derivative "
+            f"coverage (0,1); got {parallel_transport.derivative_axes}")
+    if parallel_transport.velocity_dft_cart is None:
+        raise ValueError(
+            "retained-bubble source requires the PT source-Hamiltonian "
+            "velocity for QE energy q1/q2")
     start, stop = int(band_start), int(band_stop)
     logical = stop - start
     if start != 0 or logical <= 0:
@@ -420,10 +475,15 @@ def build_isometric_retained_bubble_source(
         nspin=int(wfn.nspin),
         nspinor=int(wfn.nspinor),
         eta_ry=0.0,
+        charge_dq_raw=uniform_gauge.dcharge_dq_raw,
+        charge_dq2_raw=uniform_gauge.d2charge_dq2_raw,
+        hamiltonian_velocity_cart=parallel_transport.velocity_dft_cart,
     )
     hall = static_gauge_hall_transaction(
         uniform_gauge, wfn=wfn, sym=sym, band_start=start,
-        band_stop=stop, mesh=mesh)
+        band_stop=stop, mesh=mesh,
+        charge_energy_scaled_d1_raw=(
+            second.first_order.energy_scaled_d1_raw[:, 0]))
     operator_fingerprint = require_canonical_operator_fingerprint(
         uniform_gauge.hamiltonian_config_operator_fingerprint,
         gate="isometric_retained_bubble_uniform_operator")
@@ -458,7 +518,21 @@ def build_isometric_retained_bubble_source(
         source_fingerprint=_source_fingerprint(
             operator_fingerprint=operator_fingerprint,
             wfn_fingerprint=wfn_fp, band_start=start, band_stop=stop,
-            nk_tot=int(sym.nk_tot)),
+            nk_tot=int(sym.nk_tot),
+            parallel_transport_schema_version=(
+                int(parallel_transport.schema_version)),
+            parallel_transport_polar_rcond=(
+                float(parallel_transport.polar_rcond)),
+            parallel_transport_coefficient_frame=(
+                parallel_transport.coefficient_frame),
+            parallel_transport_derivative_axes=(
+                tuple(parallel_transport.derivative_axes))),
+        parallel_transport_schema_version=int(parallel_transport.schema_version),
+        parallel_transport_polar_rcond=float(parallel_transport.polar_rcond),
+        parallel_transport_coefficient_frame=(
+            parallel_transport.coefficient_frame),
+        parallel_transport_derivative_axes=tuple(
+            parallel_transport.derivative_axes),
         wfn_fingerprint=wfn_fp,
         band_start=start, band_stop=stop, nk_tot=int(sym.nk_tot),
         charge_ward_residual=float(np.asarray(values[0])),
@@ -466,6 +540,7 @@ def build_isometric_retained_bubble_source(
         hermiticity_residual=float(hermiticity),
         ordered_curvature_residual=float(np.asarray(values[1])),
         q2_symmetry_residual=float(np.asarray(values[2])),
+        hall_antisymmetry_residual=float(hall.antisymmetry_residual),
         approximation=ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION,
     )
     return require_isometric_retained_bubble_source(source, mesh)
@@ -559,7 +634,9 @@ def require_static_gauge_cubature_response(
         structural_ward, structural_hermiticity), dtype=np.float64)
     if np.any(~np.isfinite(residuals)) or np.any(residuals < 0.0):
         raise ValueError("charge/Hall response has invalid residuals")
-    if max(response.ward_residual, structural_ward) > 1.0e-8:
+    if (response.capability is
+            StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE
+            and max(response.ward_residual, structural_ward) > 1.0e-8):
         raise ValueError("charge/Hall response violates the static Ward gate")
     if max(response.hermiticity_residual,
            structural_hermiticity) > 1.0e-10:
@@ -727,6 +804,10 @@ def build_isometric_retained_bubble_response(
             body_bra_wfns=bra,
             body_ket_wfns=ket,
         )
+        # Serialize the four body-channel dispatches at this seam.  Without
+        # the wait, all four distinct-face operator applications can remain
+        # live until the packing loop and defeat the low-memory contract.
+        jax.block_until_ready((Y_B, Z_B))
         extent = int(layout.padded_extent(B))
         Y_by_channel.append(Y_B[0].reshape(2, 4, extent))
         Z_by_channel.append(Z_B[0].reshape(extent, 2, 4))

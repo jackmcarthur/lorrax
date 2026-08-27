@@ -1467,6 +1467,7 @@ _DEFAULTS = {
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
     "static_gauge_hall_file": "static_gauge_hall.h5",
+    "static_gauge_retained_source_file": "static_gauge_retained_source.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -3240,6 +3241,7 @@ class FilePaths:
     kin_ion_file: str
     parallel_transport_file: str
     static_gauge_hall_file: str
+    static_gauge_retained_source_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -3663,6 +3665,13 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
+        (mode is not BispinorGWMode.FULL_STATIC_COHSEX
+         or config.head.correction is HeadCorrection.OFF
+         or int(config.bands.chi) == int(config.bands.sigma),
+         ("number_bands_chi = "
+          f"{int(config.bands.chi)}, number_bands_sigma = "
+          f"{int(config.bands.sigma)}"),
+         "number_bands_chi = number_bands_sigma"),
         (mode not in (
              BispinorGWMode.FULL_STATIC_COHSEX,
              BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC)
@@ -5095,6 +5104,8 @@ class LorraxConfig:
             kin_ion_file=str(_g("kin_ion_file")),
             parallel_transport_file=str(_g("parallel_transport_file")),
             static_gauge_hall_file=str(_g("static_gauge_hall_file")),
+            static_gauge_retained_source_file=str(
+                _g("static_gauge_retained_source_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),

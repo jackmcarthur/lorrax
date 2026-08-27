@@ -975,6 +975,12 @@ def main(argv=None):
 		sigma_result.photon_head_sigma_diag_tskn_ry)
 	photon_head_sigma_operator_fingerprint = (
 		sigma_result.photon_head_sigma_operator_fingerprint)
+	photon_head_sigma_response_fingerprint = (
+		sigma_result.photon_head_sigma_response_fingerprint)
+	photon_head_sigma_response_capability = (
+		sigma_result.photon_head_sigma_response_capability)
+	photon_head_sigma_response_approximation = (
+		sigma_result.photon_head_sigma_response_approximation)
 	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
 	if photon_head_sigma_diag_tskn_ry is None:
 		photon_head_sigma_diag_tskn_ry = np.zeros(
@@ -1181,6 +1187,12 @@ def main(argv=None):
 			photon_head_sigma_diag_tskn_ry),
 		photon_head_sigma_operator_fingerprint=(
 			photon_head_sigma_operator_fingerprint),
+		photon_head_sigma_response_fingerprint=(
+			photon_head_sigma_response_fingerprint),
+		photon_head_sigma_response_capability=(
+			photon_head_sigma_response_capability),
+		photon_head_sigma_response_approximation=(
+			photon_head_sigma_response_approximation),
 		photon_head_sigma_basis=photon_head_sigma_basis,
 	)
 	if meta.rank == 0:
