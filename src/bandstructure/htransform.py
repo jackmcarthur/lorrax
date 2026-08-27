@@ -850,9 +850,12 @@ def resolve_qp_hamiltonian_state(
     ``f(H_QP) = U f(E_QP) U^H`` without a second Hamiltonian, WFN or FFT
     implementation.  A wider fitted window is supported exactly as the
     canonical QP-WFN writer supports it: the complete QP block is replaced,
-    while rows outside it remain the original DFT states and energies (an
-    implicit block-identity extension).  Cutting through the QP block is
-    refused because a sliced eigenvector matrix is not unitary.
+    while rows outside it remain available solely as the immutable Galerkin
+    conditioning basis.  :func:`h_transform` restricts its physical
+    Hamiltonian to the authenticated QP prefix; inserting the outer DFT rows
+    into that Hamiltonian would mix two spectra and can interleave guards
+    below returned QP states.  Cutting through the QP block is refused because
+    a sliced eigenvector matrix is not unitary.
 
     Scaling is ``O(nk * nb_qp^2 * rank)`` work.  Persistent output has the
     same shape as ``basis.ctilde``; the only additional inputs are the
@@ -1387,21 +1390,22 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 progress_fn=None, quality_record_fn=None, sym=None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
-    states = ctilde.shape[1]
+    ambient_states = int(ctilde.shape[1])
     rank = ctilde.shape[2]
     kgrid = (meta.nkx, meta.nky, meta.nkz)
-    nb_keep = states if n_return_bands is None else int(n_return_bands)
-    if nb_keep <= 0 or nb_keep > states:
+    nb_keep = (ambient_states if n_return_bands is None
+               else int(n_return_bands))
+    if nb_keep <= 0 or nb_keep > ambient_states:
         raise ValueError(
-            f"htransform: n_return_bands={nb_keep} must be in [1, {states}] "
+            f"htransform: n_return_bands={nb_keep} must be in "
+            f"[1, {ambient_states}] "
             "for the fitted Galerkin window.")
     fermi_band_idx = resolve_local_vbm_index(
         int(wfn.nelec), int(band_start), nb_keep)
-    n_guard_bands = int(states) - nb_keep
+    n_guard_bands = ambient_states - nb_keep
     fit_start = int(band_start)
-    fit_stop = fit_start + int(states)
+    fit_stop = fit_start + ambient_states
     return_stop = fit_start + nb_keep
-    require_qp_interior_margin = False
     if qp_corrected_band_range is not None:
         qp_start, qp_stop = map(int, qp_corrected_band_range)
         if qp_start != fit_start:
@@ -1425,37 +1429,46 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 "U/E or return fewer bands; a DFT guard boundary may not "
                 "coincide with the published boundary.")
         n_qp_corrected = qp_stop - qp_start
+        if nb_keep > n_qp_corrected:
+            raise ValueError(
+                "htransform: returned window width "
+                f"{nb_keep} exceeds the authenticated QP Hamiltonian width "
+                f"{n_qp_corrected} from [{qp_start},{qp_stop}).")
         n_corrected_margin = qp_stop - return_stop
         n_dft_guards = fit_stop - qp_stop
-        # If every fitted state is QP corrected there is no active/DFT-guard
-        # boundary: the incumbent full-H energy ordering is exact.  Otherwise
-        # the same compact projector/FFT path selects the complete corrected
-        # block and the returned interior is gated below.
-        active_band_range = (
-            None if qp_stop == fit_stop else
-            (qp_start - fit_start, qp_stop - fit_start))
-        require_qp_interior_margin = active_band_range is not None
+        # The wider immutable Galerkin fit conditions the ambient alpha basis;
+        # it is not a license to append uncorrected DFT rows to a QP
+        # Hamiltonian.  Use the complete authenticated prefix, including all
+        # of U, as the sole physical state table.  This is the same f(H) path
+        # as the full-fit case, only with basis-conditioning rows absent from
+        # the state sum.
+        hamiltonian_states = n_qp_corrected
+        active_band_range = None
         log_fn(
             f"  [three-window] standalone htransform returns {nb_keep} "
             f"band(s) from [{fit_start},{return_stop}), authenticates "
             f"{n_qp_corrected} QP-corrected band(s) from "
             f"[{qp_start},{qp_stop}) ({n_corrected_margin} corrected "
             f"interior margin), and fits [{fit_start},{fit_stop}) "
-            f"({n_dft_guards} outer DFT guard band(s)).")
+            f"({n_dft_guards} outer DFT Galerkin-conditioning guard "
+            "band(s), excluded from the physical QP Hamiltonian).")
     else:
+        hamiltonian_states = ambient_states
         n_qp_corrected = nb_keep
         active_band_range = ((0, nb_keep) if n_guard_bands else None)
         log_fn(
             f"  [two-window] standalone htransform returns {nb_keep} band(s) "
             f"from absolute window [{fit_start}, {return_stop}) and fits "
-            f"{states} band(s) ({n_guard_bands} guard band(s) above).")
+            f"{ambient_states} band(s) ({n_guard_bands} guard band(s) above).")
 
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
     _t0 = _perf()                                          # instrument:
-    coeffs = ctilde.reshape(nk, states, rank)
+    coeffs = ctilde.reshape(nk, ambient_states, rank)
+    hamiltonian_coeffs = coeffs[:, :hamiltonian_states, :]
+    hamiltonian_enk = enk_sigma[:hamiltonian_states, :]
     fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
-        coeffs, enk_sigma, kgrid, mesh_xy,
+        hamiltonian_coeffs, hamiltonian_enk, kgrid, mesh_xy,
         a_band_index=a_band_index,
         active_band_range=active_band_range, log_fn=log_fn,
         quality_record_fn=quality_record_fn)
@@ -1544,7 +1557,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
              cluster_values, cluster_mask,
              min_nonreturned_value) = select_active_eigenpairs(
                  values, vectors, active_mat, n_qp_corrected,
-                 n_physical=states, n_return=nb_keep)
+                 n_physical=hamiltonian_states, n_return=nb_keep)
             return (selected_values, selected_scores, score_gap, score_tol,
                     cluster_values, cluster_mask, min_nonreturned_value)
 
@@ -1669,9 +1682,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
                      out_shardings=(rep, rep))
             def _post_kpath(batches, nq, nb_keep):
-                # With no wider fitted guard window, the archived lowest-state
-                # selection remains the complete physical output contract.
-                lambda_q = jnp.concatenate(batches, axis=0)[:nq, :states]
+                # Every row present in fH is part of one physical Hamiltonian:
+                # either the full DFT fit or the authenticated QP prefix.
+                lambda_q = jnp.concatenate(
+                    batches, axis=0)[:nq, :hamiltonian_states]
                 energies, inverse_residual = newton_inv(
                     a_f, n_f, shift, lambda_q.real)
                 energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
@@ -1768,13 +1782,6 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 f"character={max_rejected_character:.6e}; "
                 f"numerically tied q={int(n_ambiguous)}, of which "
                 f"energy-degenerate-safe={int(n_degenerate_safe)}")
-            if require_qp_interior_margin:
-                log_fn(
-                    "  [gate] authenticated QP returned-interior margin: "
-                    f"min(nonreturned fitted energy) - max(returned energy)="
-                    f"{min_returned_interior_margin:.6e} Ry (must exceed "
-                    f"{DEGENERACY_TOL_RY:.6e} Ry); corrected="
-                    f"{n_qp_corrected}, returned={nb_keep}, fitted={states}")
             if max_unsafe_energy_span > DEGENERACY_TOL_RY:
                 raise ValueError(
                     "htransform active-subspace selection is numerically "
@@ -1786,17 +1793,6 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     "Supply QP U/E through every interleaving guard or widen "
                     "the active state block; do not publish a round-off-chosen "
                     "band assignment.")
-            if (require_qp_interior_margin
-                    and min_returned_interior_margin <= DEGENERACY_TOL_RY):
-                raise ValueError(
-                    "htransform authenticated QP corrected extent does not "
-                    "protect the returned interior: the minimum energy "
-                    "separation from every nonreturned fitted state is "
-                    f"{min_returned_interior_margin:.6e} Ry, not above the "
-                    f"canonical multiplet tolerance {DEGENERACY_TOL_RY:.6e} "
-                    "Ry.  Produce canonical QP U/E for a wider corrected "
-                    "block or return fewer bands; do not track branches "
-                    "along this plotting path.")
         energies_on_path = energies_sorted_jax
         require_newton_converged(
             float(inverse_residual), where="htransform path")
@@ -1860,13 +1856,14 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 coarse_rows, dtype=np.int32)
 
         if coincident_path_indices.size:
-            enk_host = np.asarray(gather_to_host(enk_sigma), dtype=np.float64)
-            # Match the publication route exactly.  With an active/DFT-guard
-            # boundary it selects the COMPLETE authenticated corrected block
-            # before returning its lowest interior; without that boundary it
-            # energy-orders the whole fitted Hamiltonian.
+            enk_host = np.asarray(
+                gather_to_host(hamiltonian_enk), dtype=np.float64)
+            # Match the publication route exactly.  The QP route contains
+            # only the complete authenticated prefix; the DFT route may use
+            # active character to keep a requested subset of its wider
+            # physical fit.
             n_reference_candidates = (
-                states if active_R is None else n_qp_corrected)
+                hamiltonian_states if active_R is None else n_qp_corrected)
             candidate = enk_host[
                 :n_reference_candidates, coincident_coarse_indices].T
             coincident_exact = np.sort(candidate, axis=1)[:, :nb_keep]
@@ -1943,7 +1940,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     return {
         "nk_total": nk,
         "nb_keep": nb_keep,
-        "nb_fit": int(states),
+        "nb_fit": ambient_states,
+        "nb_hamiltonian": hamiltonian_states,
         "band_start": int(band_start),
         "n_guard_bands": n_guard_bands,
         "state_windows": {
@@ -1969,8 +1967,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             "n": float(n_f),
             "shift_ry": float(shift),
             "scale_band_local": int(
-                states - 1 if a_band_index is None else a_band_index),
-            "shoulder_band_local": int(states - 1),
+                hamiltonian_states - 1
+                if a_band_index is None else a_band_index),
+            "shoulder_band_local": int(hamiltonian_states - 1),
         },
         "coincident_path_indices": coincident_path_indices,
         "coincident_coarse_indices": coincident_coarse_indices,

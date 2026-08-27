@@ -265,13 +265,10 @@ def test_htransform_active_window_beats_lower_guard_on_the_path():
     assert "path/coarse coincidences: 1 path row" in " ".join(lines)
 
 
-@pytest.mark.parametrize(("first_dft_guard", "must_refuse"), (
-    (2.0, False),
-    (-1.5, True),
-))
-def test_authenticated_qp_corrected_margin_protects_returned_interior(
-        first_dft_guard, must_refuse):
-    """A wider authenticated QP block is required and its energy margin gates."""
+@pytest.mark.parametrize("first_dft_guard", (2.0, -1.5))
+def test_authenticated_qp_hamiltonian_excludes_outer_dft_basis_guards(
+        first_dft_guard):
+    """Outer fit guards condition the basis but never enter the QP spectrum."""
     pytest.importorskip("jax")
     import jax.numpy as jnp
     from types import SimpleNamespace
@@ -282,9 +279,9 @@ def test_authenticated_qp_corrected_margin_protects_returned_interior(
     ctilde = np.broadcast_to(
         np.eye(states, rank, dtype=np.complex128),
         (nk, states, rank)).copy()
-    # [0,4) is the authenticated QP block; [0,3) is returned.  A DFT guard
-    # below band 2 makes a future active/guard character swap observable and
-    # must refuse even though the pointwise character order itself is exact.
+    # [0,4) is the authenticated QP Hamiltonian; [0,3) is returned.  Moving
+    # an outer DFT conditioning row below the returned energies must not alter
+    # that physical Hamiltonian or its spectrum.
     energies = np.broadcast_to(
         np.asarray([-3.0, -2.0, -1.0, 1.0,
                     first_dft_guard, 3.0, 4.0])[:, None],
@@ -303,12 +300,11 @@ def test_authenticated_qp_corrected_margin_protects_returned_interior(
                 band_start=0, n_return_bands=3,
                 qp_corrected_band_range=(0, 4))
 
-    if must_refuse:
-        with pytest.raises(ValueError, match="protect the returned interior"):
-            run()
-    else:
-        result = run()
-        np.testing.assert_allclose(
-            result["energies_sorted"], [[-1.0, 0.0, 1.0]] * 2,
-            rtol=0.0, atol=2.0e-11)
-        assert "corrected interior margin" in " ".join(lines)
+    result = run()
+    np.testing.assert_allclose(
+        result["energies_sorted"], [[-1.0, 0.0, 1.0]] * 2,
+        rtol=0.0, atol=2.0e-11)
+    assert result["nb_fit"] == 7
+    assert result["nb_hamiltonian"] == 4
+    assert result["active_character_gate"] is None
+    assert "excluded from the physical QP Hamiltonian" in " ".join(lines)
