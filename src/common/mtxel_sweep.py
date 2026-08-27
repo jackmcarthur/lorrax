@@ -892,8 +892,9 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                            vnl_setup, include_contact: bool = True,
-                           include_transfer_q2: bool = False) -> Operator:
-    r"""One apply-to-ket owner for raw current and exact uniform contact.
+                           include_transfer_q2: bool = False,
+                           kinetic_balance_lift: str = "raw") -> Operator:
+    r"""One apply-to-ket owner for current and exact uniform contact.
 
     The first three packed components are
 
@@ -912,18 +913,23 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     so the WFN bra reshard and projector coefficient pass are not paid by
     separate current/contact drivers.
 
-    ``include_transfer_q2=True`` extends the SAME transaction with the
-    explicit ICL transfer derivatives at fixed large-component coefficients.
-    For the repository's bra ``k-q`` orientation,
+    ``kinetic_balance_lift`` names the representation already carried by
+    ``psi_n``.  The historical default is raw and remains on its old exact
+    operations and cache key.  ``include_transfer_q2=True`` extends the SAME
+    transaction with the explicit ICL transfer derivatives.  For the raw
+    representation and repository's bra ``k-q`` orientation,
 
     ``Q_raw[i,a] = -(alpha/2) sigma_a sigma_i
                     -(alpha/4) V_NL,ia``
 
-    and ``Q2_raw[i,a,b] = (alpha/6) V_NL,iab``.  The Pauli ordering comes
-    from differentiating the BRA kinetic-balance endpoint.  It is formed by
-    sweeping ``alpha_i dPsi_a`` and taking its negative band-space adjoint,
-    thereby reusing :func:`common.bispinor_init.kinetic_balance_lift_jet`
-    instead of spelling a second sigma-product kernel.
+    and ``Q2_raw[i,a,b] = (alpha/6) V_NL,iab``.  For the isometric
+    representation the same product rule additionally contains the analytic
+    first/second derivatives of the normalized bra endpoint, including their
+    cross terms with the ICL path derivative.  Derivative families are
+    consumed one Cartesian row at a time inside this operator; no three- or
+    nine-WFN jet escapes it.  Both branches reuse
+    :func:`common.bispinor_init.kinetic_balance_lift_jet` rather than spelling
+    a second sigma-product or normalization derivative.
 
     These are explicit vertex derivatives only.  They do not include
     eigenstate, energy, occupation, or response-weight derivatives and are
@@ -952,7 +958,13 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             "uniform_gauge_operator transfer q2 requires VNLSetup built "
             "with compute_transfer_q2=True")
 
-    from common.bispinor_init import HALFALPHA, kinetic_balance_lift_jet
+    from common.bispinor_init import (
+        HALFALPHA,
+        ISOMETRIC_KINETIC_BALANCE_LIFT,
+        RAW_KINETIC_BALANCE_LIFT,
+        kinetic_balance_lift_jet,
+        kinetic_balance_lift_provenance,
+    )
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
     from psp.dft_operators import apply_kinetic_contact_to_ket
     from psp import vnl_ops
@@ -964,6 +976,13 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             "VNLSetup used to differentiate the Hamiltonian")
     alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
     halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    lift_mode = str(kinetic_balance_lift).strip().lower()
+    lift_provenance = kinetic_balance_lift_provenance(lift_mode)
+    isometric_lift = lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
+    if lift_mode not in (
+            RAW_KINETIC_BALANCE_LIFT, ISOMETRIC_KINETIC_BALANCE_LIFT):
+        raise AssertionError("kinetic-balance lift owner admitted a bad mode")
+    B = jnp.asarray(B_host, dtype=jnp.float64)
 
     def op(psi_n, gvec, gmask, bidx, kvec):
         del bidx
@@ -995,33 +1014,105 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
             fields.append(contact.reshape(9, *contact.shape[2:]))
         if transfer_q2:
-            # dPsi/dK is independent of K.  Evaluating the canonical lift
-            # jet at zero avoids threading a second reciprocal-lattice
-            # operand through this already k-resolved operator.
-            _lifted_zero, dpsi_dK = kinetic_balance_lift_jet(
-                psi_L,
-                jnp.zeros((int(psi_L.shape[-1]), 3),
-                          dtype=psi_4.real.dtype))
-            del _lifted_zero
-            # This is B[i,a]=<Psi|alpha_i dPsi_a>.  The physical bra k-q
-            # derivative is -B^dagger, preserving sigma_a sigma_i ordering.
-            kinetic_q1_source = jnp.stack([
-                gamma_apply(dpsi_dK, perm, phase, axis=2)
-                for perm, phase in alpha_vertices
-            ], axis=0)
-            vnl_q1 = _pad_spinor(
-                halfalpha.astype(psi_4.real.dtype)
-                * vnl.dgamma_dq_cart_ket,
-                int(psi_4.shape[1]))
-            q1_adjoint_source = kinetic_q1_source - vnl_q1
-            q2 = _pad_spinor(
-                halfalpha.astype(psi_4.real.dtype)
-                * vnl.d2gamma_dq2_cart_ket,
-                int(psi_4.shape[1]))
+            if not isometric_lift:
+                # Historical raw action, byte-for-byte: dPsi/dK is
+                # independent of K, so the zero endpoint avoids another
+                # reciprocal-lattice operand.  q2 is now named uniformly as
+                # an adjoint source; Hermiticity makes its physical value
+                # unchanged at the sole post-sweep orientation boundary.
+                _lifted_zero, dpsi_dK = kinetic_balance_lift_jet(
+                    psi_L,
+                    jnp.zeros((int(psi_L.shape[-1]), 3),
+                              dtype=psi_4.real.dtype))
+                del _lifted_zero
+                kinetic_q1_source = jnp.stack([
+                    gamma_apply(dpsi_dK, perm, phase, axis=2)
+                    for perm, phase in alpha_vertices
+                ], axis=0)
+                vnl_q1 = _pad_spinor(
+                    halfalpha.astype(psi_4.real.dtype)
+                    * vnl.dgamma_dq_cart_ket,
+                    int(psi_4.shape[1]))
+                q1_adjoint_source = kinetic_q1_source - vnl_q1
+                q2_sweep_source = _pad_spinor(
+                    halfalpha.astype(psi_4.real.dtype)
+                    * vnl.d2gamma_dq2_cart_ket,
+                    int(psi_4.shape[1]))
+            else:
+                # The input already carries r(K).  Build each analytic
+                # endpoint family from that carrier, consume it immediately,
+                # and retain only the incumbent packed vertex action.
+                K_cart = (
+                    gvec.astype(jnp.float64) + kvec[None, :]) @ B
+                dpsi_vnl_qderivative = []
+                q1_rows = []
+                for a in range(3):
+                    dpsi_a = kinetic_balance_lift_jet(
+                        psi_L, K_cart, representation=lift_mode,
+                        cartesian_K_derivative_axes=(a,))
+                    vnl_a = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
+                        dpsi_a[:, :2], gvec, kvec, vnl_setup, gmask,
+                        include_contact=True, include_q2=False)
+                    alpha_a = jnp.stack([
+                        gamma_apply(dpsi_a, perm, phase, axis=1)
+                        for perm, phase in alpha_vertices
+                    ], axis=0)
+                    endpoint_vnl_a = _pad_spinor(
+                        halfalpha.astype(psi_4.real.dtype)
+                        * vnl_a.gamma0_cart_ket,
+                        int(psi_4.shape[1]))
+                    q1_rows.append(alpha_a + endpoint_vnl_a)
+                    # Only this q-derivative is needed by the symmetric q2
+                    # cross terms.  Do not retain the full VNL result (or the
+                    # consumed derivative WFN) across families.
+                    dpsi_vnl_qderivative.append(
+                        vnl_a.dgamma_dq_cart_ket)
+                kinetic_q1_source = jnp.stack(q1_rows, axis=1)
+                vnl_q1 = _pad_spinor(
+                    halfalpha.astype(psi_4.real.dtype)
+                    * vnl.dgamma_dq_cart_ket,
+                    int(psi_4.shape[1]))
+                q1_adjoint_source = kinetic_q1_source - vnl_q1
+
+                q2_families = {}
+                for a in range(3):
+                    for b in range(a, 3):
+                        d2psi_ab = kinetic_balance_lift_jet(
+                            psi_L, K_cart, representation=lift_mode,
+                            cartesian_K_derivative_axes=(a, b))
+                        vnl_ab = (
+                            vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
+                                d2psi_ab[:, :2], gvec, kvec, vnl_setup,
+                                gmask, include_contact=False,
+                                include_q2=False))
+                        alpha_ab = jnp.stack([
+                            gamma_apply(
+                                d2psi_ab, perm, phase, axis=1)
+                            for perm, phase in alpha_vertices
+                        ], axis=0)
+                        endpoint_vnl_ab = _pad_spinor(
+                            halfalpha.astype(psi_4.real.dtype)
+                            * (vnl_ab.gamma0_cart_ket
+                               - dpsi_vnl_qderivative[a][:, b]
+                               - dpsi_vnl_qderivative[b][:, a]
+                               + vnl.d2gamma_dq2_cart_ket[:, a, b]),
+                            int(psi_4.shape[1]))
+                        q2_families[a, b] = alpha_ab + endpoint_vnl_ab
+                q2_sweep_source = jnp.stack(tuple(
+                    jnp.stack(tuple(
+                        q2_families[min(a, b), max(a, b)]
+                        for b in range(3)), axis=1)
+                    for a in range(3)), axis=1)
+                # This is an adjoint source: the physical bra-endpoint q2 is
+                # its band-space adjoint after the sole m/n contraction,
+                # exactly as q1 is minus the adjoint of its source.  That
+                # orientation cannot be performed here without materializing
+                # an nb-by-nb object inside the apply-to-ket operator.
             fields.extend((
                 q1_adjoint_source.reshape(
                     9, *q1_adjoint_source.shape[2:]),
-                q2.reshape(27, *q2.shape[3:]),
+                q2_sweep_source.reshape(
+                    27, *q2_sweep_source.shape[3:]),
             ))
 
         packed = jnp.concatenate(tuple(fields), axis=0)
@@ -1033,6 +1124,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         float(blat), id(vnl_setup))
     if transfer_q2:
         operator_key += ("explicit_transfer_q2",)
+    if isometric_lift:
+        operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
         apply=op, post=1.0,
         ncomp=(48 if transfer_q2 else (12 if contact_enabled else 3)),
@@ -1042,6 +1135,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 def _gauge_hamiltonian_operator_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
     geom: SweepGeometry, include_transfer_q2: bool,
+    kinetic_balance_lift: str = "raw",
 ) -> str:
     """Compose the one uniform/finite-q Hamiltonian operator identity.
 
@@ -1064,10 +1158,16 @@ def _gauge_hamiltonian_operator_fingerprint(
             "compute_contact=True)")
 
     import hashlib
-    from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+    from common.bispinor_init import (
+        ISOMETRIC_KINETIC_BALANCE_LIFT,
+        kinetic_balance_lift_provenance,
+    )
     from common.parallel_transport import (
         WFN_FINGERPRINT_SCHEME, fingerprint_update_value, wfn_fingerprint)
     from psp import vnl_ops
+
+    lift_mode = str(kinetic_balance_lift).strip().lower()
+    lift_provenance = kinetic_balance_lift_provenance(lift_mode)
 
     digest = hashlib.sha256()
     digest.update(b"lorrax.uniform_gauge_operator/v1\0")
@@ -1076,7 +1176,7 @@ def _gauge_hamiltonian_operator_fingerprint(
         ("wfn", wfn_fingerprint(wfn)),
         ("vnl", vnl_fingerprint),
         ("vnl_gauge_path", vnl_ops.ICL_STRAIGHT_GAUGE_PATH),
-        ("kinetic_balance", KINETIC_BALANCE_LIFT_PROVENANCE),
+        ("kinetic_balance", lift_provenance),
         ("band_interval", f"{start}:{stop}"),
         ("nk", str(int(geom.nk))),
         ("cell_volume", float(geom.cell_volume).hex()),
@@ -1084,13 +1184,17 @@ def _gauge_hamiltonian_operator_fingerprint(
         fingerprint_update_value(digest, label, value)
     if bool(include_transfer_q2):
         fingerprint_update_value(
-            digest, "transfer_jet", "explicit_q2_fixed_large_component_v1")
+            digest, "transfer_jet",
+            ("explicit_q2_isometric_endpoint_v1"
+             if lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
+             else "explicit_q2_fixed_large_component_v1"))
     return "sha256:" + digest.hexdigest()
 
 
 def _uniform_gauge_sweep_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
     geom: SweepGeometry, include_transfer_q2: bool,
+    kinetic_balance_lift: str = "raw",
 ) -> str:
     """Validate one uniform sweep manifold and return its sole identity."""
     start, stop = int(band_start), int(band_stop)
@@ -1104,7 +1208,8 @@ def _uniform_gauge_sweep_fingerprint(
             f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
     return _gauge_hamiltonian_operator_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
-        geom=geom, include_transfer_q2=bool(include_transfer_q2))
+        geom=geom, include_transfer_q2=bool(include_transfer_q2),
+        kinetic_balance_lift=kinetic_balance_lift)
 
 
 def sweep_uniform_current_matrix_elements(
@@ -1122,6 +1227,7 @@ def sweep_uniform_current_matrix_elements(
     box_index,
     kvecs,
     use_scan: bool = True,
+    kinetic_balance_lift: str = "raw",
 ) -> UniformGaugeCurrentMatrixElements:
     """Select only ``Gamma_raw`` from the canonical uniform-gauge sweep.
 
@@ -1132,13 +1238,15 @@ def sweep_uniform_current_matrix_elements(
     """
     fingerprint = _uniform_gauge_sweep_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
-        band_stop=band_stop, geom=geom, include_transfer_q2=False)
+        band_stop=band_stop, geom=geom, include_transfer_q2=False,
+        kinetic_balance_lift=kinetic_balance_lift)
     gamma_raw = sweep_matrix_elements(
         psi_G,
         geom=geom,
         operator=uniform_gauge_operator(
             geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
-            include_contact=False, include_transfer_q2=False),
+            include_contact=False, include_transfer_q2=False,
+            kinetic_balance_lift=kinetic_balance_lift),
         gvecs=gvecs,
         gmask=gmask,
         box_index=box_index,
@@ -1166,6 +1274,7 @@ def sweep_uniform_gauge_matrix_elements(
     kvecs,
     use_scan: bool = True,
     include_transfer_q2: bool = False,
+    kinetic_balance_lift: str = "raw",
 ) -> UniformGaugeMatrixElements:
     """Run the canonical uniform current/contact transaction once.
 
@@ -1179,14 +1288,16 @@ def sweep_uniform_gauge_matrix_elements(
     fingerprint = _uniform_gauge_sweep_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
         band_stop=band_stop, geom=geom,
-        include_transfer_q2=bool(include_transfer_q2))
+        include_transfer_q2=bool(include_transfer_q2),
+        kinetic_balance_lift=kinetic_balance_lift)
 
     packed = sweep_matrix_elements(
         psi_G,
         geom=geom,
         operator=uniform_gauge_operator(
             geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
-            include_transfer_q2=bool(include_transfer_q2)),
+            include_transfer_q2=bool(include_transfer_q2),
+            kinetic_balance_lift=kinetic_balance_lift),
         gvecs=gvecs,
         gmask=gmask,
         box_index=box_index,
@@ -1202,6 +1313,13 @@ def sweep_uniform_gauge_matrix_elements(
         q2_raw = packed[:, 21:48].reshape(
             int(packed.shape[0]), 3, 3, 3,
             int(packed.shape[-2]), int(packed.shape[-1]))
+        # Both transfer jets are source-oriented inside Operator.apply.
+        # This is the sole band-adjoint owner: q1=-source^dagger and
+        # q2=+source^dagger for K_bra=k-q.  Orienting either in the operator
+        # would materialize an nb-by-nb object inside its apply-to-ket
+        # contract.  The raw q2 source is Hermitian, so this retains its
+        # physical value while removing a representation-specific rule.
+        q2_raw = jnp.swapaxes(jnp.conj(q2_raw), -1, -2)
     return UniformGaugeMatrixElements(
         gamma_raw=packed[:, :3],
         lambda_raw=packed[:, 3:12].reshape(
@@ -1231,6 +1349,7 @@ def finite_transfer_current_to_centroids(
     g_chunk: int = 1024,
     fft_chunk_size: int | None = None,
     include_transfer_q2_identity: bool = True,
+    kinetic_balance_lift: str = "raw",
 ) -> FiniteTransferCurrentEndpoint:
     r"""Build the exact ICL finite-q current ket at current centroids.
 
@@ -1269,7 +1388,8 @@ def finite_transfer_current_to_centroids(
     exact contact/downfolded completion, symmetry processing, and artifact
     identity propagation exist.
     """
-    from common.bispinor_init import HALFALPHA
+    from common.bispinor_init import (
+        HALFALPHA, kinetic_balance_lift_provenance)
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
     from common.kq_mapping import umklapp_G_wrap
     from common.parallel_transport import build_g_wrap_lookup
@@ -1279,6 +1399,8 @@ def finite_transfer_current_to_centroids(
     from symmetry_maps import bgw_integer_q_to_fractional
 
     start, stop = int(band_start), int(band_stop)
+    lift_mode = str(kinetic_balance_lift).strip().lower()
+    kinetic_balance_lift_provenance(lift_mode)
     if start < 0 or stop <= start or stop > int(wfn.nbands):
         raise ValueError(
             "finite-transfer current band interval must satisfy "
@@ -1343,6 +1465,7 @@ def finite_transfer_current_to_centroids(
         int(r_mu_host.shape[0]), geom.mesh)
     basis_receipt.assert_matches_source(
         wfn=wfn, role="transverse", bispinor=True,
+        bispinor_lift=lift_mode,
         band_interval=(start, stop),
         fft_grid=geom.fft_grid,
         centroid_fft_idx=r_mu_host,
@@ -1576,7 +1699,8 @@ def finite_transfer_current_to_centroids(
     fingerprint = _gauge_hamiltonian_operator_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
         geom=geom,
-        include_transfer_q2=bool(include_transfer_q2_identity))
+        include_transfer_q2=bool(include_transfer_q2_identity),
+        kinetic_balance_lift=lift_mode)
     path_fingerprint = vnl_ops.icl_vnl_finite_transfer_operator_fingerprint(
         vnl_setup, path_order=int(path_order), path_rtol=float(path_rtol),
         path_atol=float(path_atol))
