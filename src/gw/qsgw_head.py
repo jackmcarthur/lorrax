@@ -3629,8 +3629,7 @@ def raw_hall_pseudovector_sharded(
     directly, so ``cB_raw=(alpha_FS/2)^2 cB`` and the applied prefactor is
     equivalently ``-C/(Omega_cell*Nk*(alpha_FS/2))``.  The minus sign is the
     documented occupied-Berry/Hall sign; ``static_hall_linear_response``
-    later inserts the independently audited ``-i epsilon[b,a,i]`` CT
-    convention required by the live ``P=-Delta*D`` band orientation.
+    later inserts the independent ``+i epsilon[b,a,i]`` CT convention.
     """
     sigma, _residual = _hall_pseudovector_sharded(
         gamma_raw, energies_kn_ry, occupations_kn,
