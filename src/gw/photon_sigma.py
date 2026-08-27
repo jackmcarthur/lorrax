@@ -50,6 +50,9 @@ class StaticPhotonHeadSigmaDiagnostics:
     components_tskn_ry: jax.Array
     max_closure_residual_ry: float
     hamiltonian_config_operator_fingerprint: str | None
+    bounded_response_fingerprint: str | None
+    bounded_response_capability: str | None
+    bounded_response_approximation: str | None
     output_basis: str
 
     def __post_init__(self) -> None:
@@ -66,6 +69,23 @@ class StaticPhotonHeadSigmaDiagnostics:
             )
             object.__setattr__(
                 self, "hamiltonian_config_operator_fingerprint", fingerprint)
+        if self.bounded_response_fingerprint is not None:
+            from .head_correction import require_canonical_operator_fingerprint
+            fingerprint = require_canonical_operator_fingerprint(
+                self.bounded_response_fingerprint,
+                gate="static_photon_head_sigma_bounded_fingerprint",
+            )
+            object.__setattr__(
+                self, "bounded_response_fingerprint", fingerprint)
+            if (not self.bounded_response_capability
+                    or not self.bounded_response_approximation):
+                raise ValueError(
+                    "bounded photon response fingerprint requires explicit "
+                    "capability and approximation")
+        elif (self.bounded_response_capability is not None
+              or self.bounded_response_approximation is not None):
+            raise ValueError(
+                "bounded photon response status exists without a fingerprint")
         if self.output_basis != "dft":
             raise ValueError(
                 "static photon head Sigma diagnostics must be stamped in "
@@ -477,6 +497,9 @@ def compute_static_photon_sigma(
             components,
             closure_abs,
             head_completion.hamiltonian_config_operator_fingerprint,
+            head_completion.bounded_response_fingerprint,
+            head_completion.bounded_response_capability,
+            head_completion.bounded_response_approximation,
             "dft",
         ),
     )

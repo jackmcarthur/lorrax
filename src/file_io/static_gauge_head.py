@@ -64,10 +64,18 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
 )
 
 STATIC_GAUGE_HALL_SCHEMA_VERSION = 1
+ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 1
+ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID = (
+    "lorrax.isometric_retained_bubble_source/v1"
+    "|payload=energy_scaled_d1_raw+S_direct_cart+sigma_H_cart"
+    "|sharding=P(None,None,None,x,y)+replicated"
+    "|contact=omitted_by_model|complement=omitted_by_model")
 
 _S_DATASET = "S_direct_cart"
 _Y_DATASET = "Y_cart_x"
 _Z_DATASET = "Z_cart_y"
+_P_SOURCE_DATASET = "energy_scaled_d1_raw"
+_S_SOURCE_DATASET = "S_direct_cart"
 _LOADER_TOKEN = object()
 
 
@@ -317,6 +325,210 @@ def load_static_gauge_hall_artifact(
         nk_tot=nk_tot,
         mesh=mesh_xy,
     )
+
+
+def write_isometric_retained_bubble_source_artifact(
+    path: str | Path,
+    source,
+    *,
+    mesh_xy: Mesh,
+) -> None:
+    """Persist the bounded normalized source without q2/link/WFN replicas."""
+    import json
+    from gw.static_gauge_response import (
+        require_isometric_retained_bubble_source)
+
+    source = require_isometric_retained_bubble_source(source, mesh_xy)
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="IsometricRetainedBubbleSource")
+    storage = int(source.energy_scaled_d1_raw.shape[-1])
+    p_shape = (2, 4, int(source.nk_tot), storage, storage)
+    availability_json = json.dumps(
+        source.availability.as_tokens(), sort_keys=True, separators=(",", ":"))
+    with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
+        io.create_dataset(
+            _P_SOURCE_DATASET, shape=p_shape, dtype=np.complex128)
+        io.create_dataset(
+            _S_SOURCE_DATASET, shape=(2, 2, 4, 4), dtype=np.complex128)
+        io.write_slab(_P_SOURCE_DATASET, source.energy_scaled_d1_raw)
+        io.write_slab(_S_SOURCE_DATASET, source.S_direct)
+        io.write_attr(
+            "schema_version",
+            np.int32(ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION))
+        io.write_attr("complete", np.int32(1))
+        io.write_attr(
+            "artifact_kind_i32",
+            _text_i32("isometric_retained_bubble_source", encoding="ascii"))
+        io.write_attr(
+            "convention_id_i32",
+            _text_i32(ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID))
+        io.write_attr(
+            "availability_json_i32", _text_i32(availability_json))
+        for name, value in (
+            ("charge_representation_i32", source.charge_representation),
+            ("spatial_current_representation_i32",
+             source.spatial_current_representation),
+            ("endpoint_jet_convention_i32", source.endpoint_jet_convention),
+            ("hamiltonian_config_operator_fingerprint_i32",
+             source.hamiltonian_config_operator_fingerprint),
+            ("source_fingerprint_i32", source.source_fingerprint),
+            ("wfn_fingerprint_i32", source.wfn_fingerprint),
+            ("approximation_i32", source.approximation),
+        ):
+            io.write_attr(name, _text_i32(value, encoding="ascii"))
+        io.write_attr("band_start", np.int32(source.band_start))
+        io.write_attr("band_stop", np.int32(source.band_stop))
+        io.write_attr("nk_tot", np.int32(source.nk_tot))
+        io.write_attr("band_storage", np.int32(storage))
+        io.write_attr("sigma_H_cart", np.asarray(
+            jax.device_get(source.sigma_H), dtype=np.float64))
+        for name in (
+            "charge_ward_residual", "ward_residual", "hermiticity_residual",
+            "ordered_curvature_residual", "q2_symmetry_residual",
+        ):
+            io.write_attr(name, np.float64(getattr(source, name)))
+
+    _publish_completed_partial(
+        partial_path, final_path,
+        artifact_name="IsometricRetainedBubbleSource",
+        barrier_name="isometric_retained_bubble_source_published")
+
+
+def load_isometric_retained_bubble_source_artifact(
+    path: str | Path,
+    *,
+    mesh_xy: Mesh,
+    wfn,
+    expected_band_start: int,
+    expected_band_stop: int,
+    expected_nk_tot: int,
+    wfn_fingerprint_binding=None,
+):
+    """Load the immutable normalized source onto its native shardings."""
+    import json
+    from gw.static_gauge_response import (
+        ISOMETRIC_ENDPOINT_JET_CONVENTION,
+        ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION,
+        ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
+        _issue_isometric_retained_bubble_source,
+        require_isometric_retained_bubble_source,
+    )
+
+    artifact_path = Path(path)
+    if artifact_path.name.endswith(".partial"):
+        raise ValueError(
+            "GATE isometric_retained_bubble_partial: refusing a partial path")
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            "GATE isometric_retained_bubble_artifact_absent: no completed "
+            f"artifact exists at {artifact_path}")
+    expected_wfn = _require_wfn_sha256(
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_binding is None
+        else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    expected_start, expected_stop, expected_nk = (
+        int(expected_band_start), int(expected_band_stop),
+        int(expected_nk_tot))
+    expected_availability = json.dumps(
+        ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY.as_tokens(),
+        sort_keys=True, separators=(",", ":"))
+
+    with SlabIO(str(artifact_path), mode="r", mesh=mesh_xy) as io:
+        def text_field(name: str) -> str:
+            return _decode_i32_text(
+                _read_required_small(io, name), field_name=name,
+                encoding="ascii")
+
+        complete = int(np.asarray(_read_required_small(io, "complete")))
+        schema = int(np.asarray(_read_required_small(io, "schema_version")))
+        kind = text_field("artifact_kind_i32")
+        convention = text_field("convention_id_i32")
+        availability_json = text_field("availability_json_i32")
+        charge_representation = text_field("charge_representation_i32")
+        current_representation = text_field(
+            "spatial_current_representation_i32")
+        endpoint_convention = text_field("endpoint_jet_convention_i32")
+        operator_fingerprint = text_field(
+            "hamiltonian_config_operator_fingerprint_i32")
+        source_fingerprint = text_field("source_fingerprint_i32")
+        artifact_wfn = text_field("wfn_fingerprint_i32")
+        approximation = text_field("approximation_i32")
+        start = int(np.asarray(_read_required_small(io, "band_start")))
+        stop = int(np.asarray(_read_required_small(io, "band_stop")))
+        nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
+        storage = int(np.asarray(_read_required_small(io, "band_storage")))
+        sigma_H = _read_required_small(io, "sigma_H_cart")
+        residuals = {name: float(np.asarray(_read_required_small(io, name)))
+                     for name in (
+                         "charge_ward_residual", "ward_residual",
+                         "hermiticity_residual", "ordered_curvature_residual",
+                         "q2_symmetry_residual")}
+
+        refusals = []
+        if complete != 1:
+            refusals.append(f"complete={complete}, expected 1")
+        if schema != ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION:
+            refusals.append(
+                f"schema_version={schema}, expected "
+                f"{ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION}")
+        if kind != "isometric_retained_bubble_source":
+            refusals.append(
+                f"artifact kind {kind!r} is not a normalized response source")
+        if convention != ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID:
+            refusals.append("source Fourier/unit/payload convention differs")
+        if availability_json != expected_availability:
+            refusals.append("explicit term availability differs")
+        if endpoint_convention != ISOMETRIC_ENDPOINT_JET_CONVENTION:
+            refusals.append("endpoint-jet representation/convention differs")
+        if approximation != ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION:
+            refusals.append("approximation declaration differs")
+        if artifact_wfn != expected_wfn:
+            refusals.append("WFN fingerprint differs")
+        if (start, stop) != (expected_start, expected_stop):
+            refusals.append(
+                f"band interval [{start},{stop}) != expected "
+                f"[{expected_start},{expected_stop})")
+        if nk_tot != expected_nk:
+            refusals.append(f"nk_tot={nk_tot}, expected {expected_nk}")
+        if storage < stop - start:
+            refusals.append("stored band carrier is shorter than the manifold")
+        if refusals:
+            raise ValueError(
+                "GATE isometric_retained_bubble_artifact_mismatch:\n  - "
+                + "\n  - ".join(refusals))
+
+        p_shape = (2, 4, nk_tot, storage, storage)
+        try:
+            energy_scaled_d1_raw = io.read_slab(
+                _P_SOURCE_DATASET, shape=p_shape,
+                partition_spec=P(None, None, None, "x", "y"))
+            S_direct = io.read_slab(
+                _S_SOURCE_DATASET, shape=(2, 2, 4, 4), partition_spec=P())
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                "GATE isometric_retained_bubble_schema: missing or unreadable "
+                "P/S dataset") from exc
+
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding
+    sigma_H = device_put_process_local(
+        np.asarray(sigma_H, dtype=np.float64), NamedSharding(mesh_xy, P()))
+    source = _issue_isometric_retained_bubble_source(
+        energy_scaled_d1_raw=energy_scaled_d1_raw,
+        S_direct=S_direct,
+        sigma_H=sigma_H,
+        availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
+        charge_representation=charge_representation,
+        spatial_current_representation=current_representation,
+        endpoint_jet_convention=endpoint_convention,
+        hamiltonian_config_operator_fingerprint=operator_fingerprint,
+        source_fingerprint=source_fingerprint,
+        wfn_fingerprint=artifact_wfn,
+        band_start=start, band_stop=stop, nk_tot=nk_tot,
+        approximation=approximation,
+        **residuals,
+    )
+    return require_isometric_retained_bubble_source(source, mesh_xy)
 
 
 def write_static_gauge_head_artifact(
@@ -628,12 +840,16 @@ def load_static_gauge_head_artifact(
 
 
 __all__ = [
+    "ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID",
+    "ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION",
     "LoadedStaticGaugeHeadResponse",
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
     "STATIC_GAUGE_HEAD_CONVENTION_ID",
     "STATIC_GAUGE_HEAD_SCHEMA_VERSION",
+    "load_isometric_retained_bubble_source_artifact",
     "load_static_gauge_hall_artifact",
     "load_static_gauge_head_artifact",
+    "write_isometric_retained_bubble_source_artifact",
     "write_static_gauge_hall_artifact",
     "write_static_gauge_head_artifact",
 ]
