@@ -80,7 +80,11 @@ from psp.h_dft import make_apply_H
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials, build_rho_val_from_wfn
 from psp.vnl_ops import _build_vnl_kdata_core
-from solvers.projectors import make_Q_kminq
+from solvers.projectors import (
+    expand_subspace,
+    make_Q_kminq,
+    subspace_coefficients,
+)
 from solvers.sternheimer_precond import (
     compute_per_band_kinetic,
     tpa_preconditioner_diag,
@@ -346,8 +350,8 @@ def compute_kp_tangent_at_kvec(
 
     # Q_{kvec_p} projector for the source.
     def Q_of(x):
-        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
-        return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+        return x - expand_subspace(
+            U_val_G, subspace_coefficients(U_val_G, x))
 
     # 3 cartesian directions stacked as a leading batch dim then solved as
     # one batched CG: build the 3 RHS vectors in parallel via vmap, then
@@ -444,8 +448,8 @@ def compute_kp2_tangent_at_kvec(
     op_base = _op_at(kvec_p_base)
 
     def Q_of(x):
-        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
-        return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+        return x - expand_subspace(
+            U_val_G, subspace_coefficients(U_val_G, x))
 
     def e_vec(k):
         return jnp.zeros(3, dtype=jnp.float64).at[k].set(1.0)
@@ -493,8 +497,8 @@ def compute_kp2_tangent_at_kvec(
 
 def _q_project(U_val_G: jax.Array, x: jax.Array) -> jax.Array:
     """Q_{k-q}(x) = x - Σ_m U_val[m]·<U_val[m]|x>."""
-    coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
-    return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
+    return x - expand_subspace(
+        U_val_G, subspace_coefficients(U_val_G, x))
 
 
 def compute_s_tensor_contrib_at_q0(
@@ -780,8 +784,8 @@ def chi_col_contrib_at_kvec_traced(
     # back to the frozen-source path for backward compatibility.
     if Vu_G_preQ is not None:
         # Q_{k-q}(x) = x − U_val_eff · (U_val_eff^† x)
-        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_eff), Vu_G_preQ, optimize=True)
-        b_eff = Vu_G_preQ - jnp.einsum('vm,msG->vsG', coefs, U_val_eff, optimize=True)
+        coefs = subspace_coefficients(U_val_eff, Vu_G_preQ)
+        b_eff = Vu_G_preQ - expand_subspace(U_val_eff, coefs)
     else:
         b_eff = b
 

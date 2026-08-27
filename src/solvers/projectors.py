@@ -1,6 +1,6 @@
 """solvers/projectors.py — Jitted subspace projectors used by the Sternheimer solver.
 
-Four factories, each returning a ``jax.jit``'d callable of shape
+Two shared contractions and four factories returning callables of shape
 ``(batch, nspinor, nG) → (batch, nspinor, nG)``.  Closure-captured
 subspace bases ``U`` are static JAX arrays, so the compiled kernel is
 reusable across Sternheimer iterations on the same (k, k−q) pair.
@@ -35,16 +35,26 @@ import jax.numpy as jnp
 # ═══════════════════════════════════════════════════════════════════════
 
 @jax.jit
+def subspace_coefficients(U: jax.Array, x: jax.Array) -> jax.Array:
+    """Return ``c[b,m] = <U_m|x_b>`` for an orthonormal basis block."""
+    return jnp.einsum('msG,bsG->bm', jnp.conj(U), x, optimize=True)
+
+
+@jax.jit
+def expand_subspace(U: jax.Array, coefficients: jax.Array) -> jax.Array:
+    """Return ``sum_m coefficients[b,m] U[m]`` on the ket carrier."""
+    return jnp.einsum(
+        'bm,msG->bsG', coefficients, U, optimize=True)
+
+
+@jax.jit
 def _apply_P_U(U: jax.Array, x: jax.Array) -> jax.Array:
     """Return  P_U x = U · (U^† x).
 
     U : (m, nspinor, nG)    basis block, orthonormal
     x : (batch, nspinor, nG)
     """
-    # coefs[b, m] = <U_m | x_b> = sum_{s,G} conj(U[m,s,G]) · x[b,s,G]
-    coefs = jnp.einsum('msG,bsG->bm', jnp.conj(U), x, optimize=True)
-    # P_U x[b,s,G] = sum_m coefs[b,m] · U[m,s,G]
-    return jnp.einsum('bm,msG->bsG', coefs, U, optimize=True)
+    return expand_subspace(U, subspace_coefficients(U, x))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -109,6 +119,8 @@ def make_Q_kminq(U_val_kminq: jax.Array) -> Callable[[jax.Array], jax.Array]:
 
 
 __all__ = [
+    "subspace_coefficients",
+    "expand_subspace",
     "make_P_val",
     "make_P_precond",
     "make_P_rest",

@@ -41,6 +41,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from psp.dft_operators import apply_H_k_from_G
+from solvers.projectors import expand_subspace, subspace_coefficients
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -143,8 +144,8 @@ def _apply_A_inline(op: SternheimerOp, x: jax.Array) -> jax.Array:
     # H·x − ε_v·x
     shifted = Hx - op.eps_v[:, None, None].astype(x.dtype) * x
     # α_pv · P_val(x)
-    coefs = jnp.einsum('msG,bsG->bm', jnp.conj(op.U_val), x, optimize=True)
-    Pv_x = jnp.einsum('bm,msG->bsG', coefs, op.U_val, optimize=True)
+    coefs = subspace_coefficients(op.U_val, x)
+    Pv_x = expand_subspace(op.U_val, coefs)
     return shifted + op.alpha_pv * Pv_x
 
 
@@ -202,7 +203,7 @@ def _schur_initial_guess(op: SternheimerOp, b: jax.Array) -> jax.Array:
     handled explicitly.
     """
     # coefs[v, m] = ⟨U_m | b_v⟩_cell = Σ_{s,G} conj(U_extra[m,s,G]) · b[v,s,G]
-    coefs = jnp.einsum('msG,vsG->vm', jnp.conj(op.U_extra), b, optimize=True)
+    coefs = subspace_coefficients(op.U_extra, b)
     # Energy denominator  (eps_extra[m] − eps_v[v])   (M, ) − (v,) → (v, M)
     denom = op.eps_extra[None, :] - op.eps_v[:, None]                 # (batch, M)
     # Guard against near-zero denominator (crossings between extra-Ritz
@@ -211,7 +212,7 @@ def _schur_initial_guess(op: SternheimerOp, b: jax.Array) -> jax.Array:
     denom_safe = jnp.where(jnp.abs(denom) > 1e-8, denom, 1.0)
     y = jnp.where(jnp.abs(denom) > 1e-8, -coefs / denom_safe, 0.0)     # (batch, M)
     # x0[v,s,G] = Σ_m y[v,m] · U_m[s,G]
-    return jnp.einsum('vm,msG->vsG', y, op.U_extra, optimize=True)
+    return expand_subspace(op.U_extra, y)
 
 
 @functools.partial(jax.jit, static_argnames=('max_iter', 'use_schur'))
