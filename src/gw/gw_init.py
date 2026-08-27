@@ -3446,6 +3446,62 @@ def prepare_isdf_and_wavefunctions(
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
 
+	# The normalized finite-q carrier has no normalized endpoint jet.  Build
+	# the scalar FULL-head wings on the source QE two-spinor at the SAME charge
+	# centroids, through the existing loader and bundle constructors.  This is
+	# head-only and fresh-only (the mode's restart gate fired above); H0 and the
+	# finite-q normalized body remain untouched.
+	wfns_scalar_head = None
+	if (representation.charge_representation ==
+			ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION
+			and bool(cfg.compute_mode.needs_screening)
+			and str(getattr(cfg.head.correction, "value", cfg.head.correction)) ==
+			"full"):
+		meta_head = replace(
+			meta, nspinor=int(wfn.nspinor), npol=int(wfn.nspinor))
+		meta_head.sys_dim = meta.sys_dim
+		meta_head.bispinor = False
+		with timing.section("gw_jax.load_scalar_head_wfns"):
+			psi_head_y, psi_head_x = load_centroids_band_chunked(
+				wfn, sym, meta_head, centroid_indices, False, mesh_xy,
+				band_range=band_slices.full_range,
+				band_chunk_size=load_band_chunk,
+				k_chunk_size=(
+					chunks['centroid_k_chunk'] if chunks is not None
+					else zeta_contract.loader_k_chunk))
+		head_receipt = WavefunctionBasisReceipt.from_bound_source(
+			wfn=wfn,
+			wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+			role='charge', bispinor=False,
+			band_interval=_basis_band_interval,
+			fft_grid=meta.fft_grid,
+			centroid_fft_idx=centroid_indices,
+			n_rmu_logical=int(meta.n_rmu),
+			n_rmu_padded=int(meta.n_rmu_padded))
+		if cfg.memory.low_mem_bands:
+			from jax.sharding import NamedSharding
+			from .wavefunction_bundle import (
+				PSI_MUN_SPEC, PSI_NMU_SPEC, wavefunctions_face_from_restart)
+			with mesh_xy:
+				psi_head_nmu = jax.lax.with_sharding_constraint(
+					psi_head_y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+				psi_head_mun = jax.lax.with_sharding_constraint(
+					jnp.conj(psi_head_x).transpose(0, 3, 1, 2),
+					NamedSharding(mesh_xy, PSI_MUN_SPEC))
+			wfns_scalar_head = wavefunctions_face_from_restart(
+				psi_head_nmu, psi_head_mun, enk_full=enk_full,
+				slices=band_slices, mesh_xy=mesh_xy,
+				basis_receipt=head_receipt)
+			del psi_head_y, psi_head_x
+		else:
+			wfns_scalar_head = build_wavefunction_bundle(
+				wfn, sym, meta_head, band_slices, mesh_xy,
+				psi_rmu_Y=psi_head_y, psi_rmuT_X=psi_head_x,
+				basis_receipt=head_receipt, enk_full=enk_full,
+				print_fn=print0)
+		print0("  normalized kinetic balance: scalar q->0 head/wings use "
+		       "a separate canonical QE two-spinor centroid bundle")
+
 	from .wavefunction_bundle import AuthenticatedWavefunctions
 	charge_basis_binding = (
 		None if charge_basis_receipt is None else
@@ -3458,6 +3514,7 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		wf_bundle_scalar_head=wfns_scalar_head,
 		# The exact loaded-WFN identity was already scanned while binding the
 		# charge/transverse basis receipts.  Keep that opaque host proof at the
 		# orchestration seam so later artifact gates cannot reopen/resample the

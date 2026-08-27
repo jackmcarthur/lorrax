@@ -3608,6 +3608,15 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "endpoint jets. Set bispinor_tt_head_correction = false; "
                 "the ordinary scalar q->0 head remains available from the "
                 "canonical QE two-spinor dipole artifact.")
+        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
+                and config.head.correction is HeadCorrection.FULL
+                and config.screening.diagrams is not ScreeningDiagrams.W_RPA):
+            raise ValueError(
+                "GATE isometric_kinetic_balance_ladder_head_unavailable: "
+                "the ladder-screening facade does not accept the separate "
+                "source-Pauli centroid bundle required by the normalized "
+                "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
+                "or head_correction = off.")
         return
     if (mode is BispinorGWMode.FULL_STATIC_COHSEX
             and config.head.correction is HeadCorrection.FULL):

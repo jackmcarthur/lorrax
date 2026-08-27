@@ -501,6 +501,7 @@ def main(argv=None):
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
 	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
+	wfns_scalar_head = getattr(isdf, 'wf_bundle_scalar_head', None)
 	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
 	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
 	# None — a bispinor run reaching Σ without them would exit rc=0 with
@@ -576,12 +577,20 @@ def main(argv=None):
 				dtype=np.complex128)
 		if oneshot_omegas.size:
 			oneshot_head_response = build_dft_head_response(
-				wfns, oneshot_omegas, input_dir=input_dir, mesh=mesh_xy,
+				(wfns if wfns_scalar_head is None else wfns_scalar_head),
+				oneshot_omegas,
+				input_dir=input_dir, mesh=mesh_xy,
 				wfn=wfn, meta=meta, config=config)
 			print0(
 				"  head_correction=full: built direct DFT response and "
 				"head/body wings on the chi0 transition manifold; finalizing "
 				"once against the resident W(Gamma).")
+			if wfns_scalar_head is not None:
+				# The source-Pauli comparison bundle has no consumer after its
+				# scalar Y/Z wings are materialized and synchronized above.
+				isdf.wf_bundle_scalar_head = None
+				wfns_scalar_head = None
+				gc.collect()
 	# SC solves W inside each map and persists only the final accepted map.
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.

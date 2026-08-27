@@ -3934,13 +3934,16 @@ def build_dft_head_response(
         check_dipole_provenance, resolve_vnl_velocity_sign)
     expected_vnl_sign = resolve_vnl_velocity_sign(
         None, config.vnl_velocity_sign)
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        config.bispinor, config.bispinor_gw)
     if not check_dipole_provenance(
             dipole_path,
             wfn=wfn,
             nval=int(config.nval),
             ncond=int(config.ncond),
             nband=int(config.nband),
-            bispinor=bool(int(meta.nspinor) == 4),
+            bispinor=representation.scalar_head_bispinor,
             skip_vnl=False,
             vnl_mode="analytic",
             vnl_velocity_sign=expected_vnl_sign,
