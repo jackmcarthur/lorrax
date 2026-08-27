@@ -105,6 +105,15 @@ from .gw_output import (
 	write_results,
 )
 
+# A replicated dynamic-Sigma cube larger than this is not a production
+# multi-rank layout.  This is a cap on ONE c128 producer, not a claim about
+# the total device budget: output scaling, total-Sigma assembly and the
+# symmetry diagnostic each demand that producer after the physics kernels.
+# JID 57638248.29 failed on exactly that demand at 4.28 GiB/rank; the
+# ceiling is placed below that measured red point.  Larger objects belong
+# on the distributed route.
+_REPLICATED_SIGMA_CUBE_CAP_BYTES = 4 * 2**30
+
 
 def _setup_runtime() -> None:
 	"""Pre-init MPI for the one parallel-HDF5 transport.
@@ -370,7 +379,7 @@ def main(argv=None):
 		       f"(padded from {meta.b_id_4_user} to the world size).")
 	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
 
-	# ---- sigma_omega_layout=sharded: resolve-time geometry/backend gate ----
+	# ---- dynamic-Sigma layout: resolve-time capacity/geometry gate ----
 	# The config-level axis checks (self_consistent) already ran
 	# in ``config.qp_solver``; the two conditions below need the mesh and the
 	# σ window, known only here.  Refusing NOW costs seconds; refusing at the
@@ -385,14 +394,37 @@ def main(argv=None):
 	# ``compute_mode = mpa`` reaches it whatever the deck says about the
 	# layout, because the MPA executor emits the sharded cube unconditionally
 	# (the dispatch refuses ``replicated`` by name for that reason).
+	_p_x = int(mesh_xy.devices.shape[0])
+	_p_y = int(mesh_xy.devices.shape[1])
+	_nbs = int(meta.nb_sigma)
 	_wants_sharded_cube = (
 		config.sigma.omega_layout == "sharded"
 		or getattr(mode, "value", str(mode)) == "mpa")
+	if (mode.is_dynamic
+			and not _wants_sharded_cube
+			and int(RUNTIME.process_count) > 1):
+		_nw = int(np.asarray(config.sigma.omega_grid_ev).size)
+		_nk = int(meta.nk_tot)
+		_cube_bytes = _nw * _nk * _nbs * _nbs * np.dtype(np.complex128).itemsize
+		if _cube_bytes > _REPLICATED_SIGMA_CUBE_CAP_BYTES:
+			_mesh_multiple = int(np.lcm(_p_x, _p_y))
+			_next_nb = -(-_nbs // _mesh_multiple) * _mesh_multiple
+			raise ValueError(
+				f"compute_mode = {getattr(mode, 'value', mode)}: "
+				f"sigma_omega_layout = replicated would create "
+				f"complex128 Sigma_c[{_nw},{_nk},{_nbs},{_nbs}] = "
+				f"{_cube_bytes / 2**30:.2f} GiB on every one of "
+				f"{int(RUNTIME.process_count)} ranks, above the "
+				f"{_REPLICATED_SIGMA_CUBE_CAP_BYTES / 2**30:.2f}-GiB "
+				f"multi-rank replicated-cube ceiling.  The output expressions "
+				f"must materialize that lazy producer after the physics kernels; "
+				f"SlabIO can bound file slabs but cannot bound the producer.  Set "
+				f"sigma_omega_layout = sharded and choose nval+ncond divisible "
+				f"by both mesh axes.  On this {_p_x}x{_p_y} mesh the next "
+				f"compatible window is {_next_nb} bands.  The driver will not "
+				f"silently change an explicit layout or band window.")
 	if mode.is_dynamic and _wants_sharded_cube:
 		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
-		_p_x = int(mesh_xy.devices.shape[0])
-		_p_y = int(mesh_xy.devices.shape[1])
-		_nbs = int(meta.nb_sigma)
 		assert_sharded_sigma_window_divides_mesh(
 			_nbs, mesh_xy,
 			ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
