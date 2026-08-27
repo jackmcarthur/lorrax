@@ -822,9 +822,11 @@ class UniformGaugeMatrixElements(NamedTuple):
     two-dimensional band sharding.  With the separately priced transfer-q2
     capability, ``dgamma_dq_raw`` and ``d2gamma_dq2_raw`` have shapes
     ``(nk,3,3,nb,nb)`` and ``(nk,3,3,3,nb,nb)``.  They are deliberately one
-    transaction: response-jet and contact consumers must not reopen the WFN
-    or rebuild projectors.  Hall's current-only component selection is the
-    smaller sibling above and calls the same operator/sweep owners.
+    transaction and, after their physical band adjoint, are committed back to
+    the same trailing ``('x','y')`` band layout.  Response-jet and contact
+    consumers must not reopen the WFN or rebuild projectors.  Hall's
+    current-only component selection is the smaller sibling above and calls
+    the same operator/sweep owners.
     """
 
     gamma_raw: jax.Array
@@ -1341,15 +1343,13 @@ def sweep_uniform_gauge_matrix_elements(
             q1_four_source = packed[:, 12:24].reshape(
                 int(packed.shape[0]), 4, 3,
                 int(packed.shape[-2]), int(packed.shape[-1]))
-            q1_four_raw = -jnp.swapaxes(
+            q1_raw = -jnp.swapaxes(
                 jnp.conj(q1_four_source), -1, -2)
             q2_four_source = packed[:, 24:60].reshape(
                 int(packed.shape[0]), 4, 3, 3,
                 int(packed.shape[-2]), int(packed.shape[-1]))
-            q2_four_raw = jnp.swapaxes(
+            q2_raw = jnp.swapaxes(
                 jnp.conj(q2_four_source), -1, -2)
-            charge_q1_raw, q1_raw = q1_four_raw[:, 0], q1_four_raw[:, 1:]
-            charge_q2_raw, q2_raw = q2_four_raw[:, 0], q2_four_raw[:, 1:]
         else:
             q1_source = packed[:, 12:21].reshape(
                 int(packed.shape[0]), 3, 3,
@@ -1365,6 +1365,24 @@ def sweep_uniform_gauge_matrix_elements(
         # contract.  The raw q2 source is Hermitian, so this retains its
         # physical value while removing a representation-specific rule.
             q2_raw = jnp.swapaxes(jnp.conj(q2_raw), -1, -2)
+        # The physical adjoint swaps the two band mesh axes.  Commit both
+        # jets back to the public trailing (x,y) carrier before they meet PT
+        # matrices; leaving yx there makes eager JAX replicate the band square.
+        q1_sharding = NamedSharding(
+            geom.mesh, P(*((None,) * (q1_raw.ndim - 2)), "x", "y"))
+        q2_sharding = NamedSharding(
+            geom.mesh, P(*((None,) * (q2_raw.ndim - 2)), "x", "y"))
+        commit_adjoint = _cached_jit(
+            "uniform_gauge_adjoint_xy",
+            (tuple(q1_raw.shape), str(q1_raw.dtype), _sharding_key(q1_raw),
+             tuple(q2_raw.shape), str(q2_raw.dtype), _sharding_key(q2_raw)),
+            lambda: jax.jit(
+                lambda q1, q2: (jnp.copy(q1), jnp.copy(q2)),
+                out_shardings=(q1_sharding, q2_sharding)))
+        q1_raw, q2_raw = commit_adjoint(q1_raw, q2_raw)
+        if isometric_lift:
+            charge_q1_raw, q1_raw = q1_raw[:, 0], q1_raw[:, 1:]
+            charge_q2_raw, q2_raw = q2_raw[:, 0], q2_raw[:, 1:]
     return UniformGaugeMatrixElements(
         gamma_raw=packed[:, :3],
         lambda_raw=packed[:, 3:12].reshape(
