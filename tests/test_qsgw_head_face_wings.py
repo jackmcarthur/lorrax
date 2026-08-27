@@ -15,6 +15,7 @@ kernels would still be caught.
 """
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,7 +31,9 @@ from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
     build_wavefunctions,
     build_wavefunctions_face,
+    with_lorentz_vertices,
 )
+from common.gamma_matrices import gammas  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
 from gw.qsgw_head import (  # noqa: E402
     _pad_head_band_manifold_to,
@@ -92,7 +95,8 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
-                  omega, eta):
+                  omega, eta, psi_y_bra=None, psi_y_ket=None,
+                  psi_z_bra=None, psi_z_ket=None):
     """Independent O(nk*nb^2*n_omega) oracle straight from
     ``head_wings_sharded``'s own docstring formula -- no ring, no gather,
     no einsum-string reuse with either kernel under test."""
@@ -100,6 +104,10 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
     mu = psi.shape[-1]
     n_omega = len(omega)
     n_vertex = int(v.shape[0])
+    psi_y_bra = psi if psi_y_bra is None else psi_y_bra
+    psi_y_ket = psi if psi_y_ket is None else psi_y_ket
+    psi_z_bra = psi if psi_z_bra is None else psi_z_bra
+    psi_z_ket = psi if psi_z_ket is None else psi_z_ket
     Y = np.zeros((n_omega, n_vertex, mu), dtype=np.complex128)
     Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
@@ -111,16 +119,31 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
                 if dE <= 0.0:
                     continue
                 fdiff = f[k, j] - f[k, i]
-                bij = np.einsum("sm,sm->m", np.conj(psi[k, i]), psi[k, j])
+                bij_y = np.einsum(
+                    "sm,sm->m", np.conj(psi_y_bra[k, i]),
+                    psi_y_ket[k, j])
+                bij_z_conj = np.einsum(
+                    "sm,sm->m", psi_z_bra[k, i],
+                    np.conj(psi_z_ket[k, j]))
                 for iw, om in enumerate(omega):
                     z = om + 1j * eta
                     denom = z * z - dE * dE
                     if abs(denom) <= 1.0e-16:
                         continue
                     w = pref * fdiff / denom
-                    Y[iw] += np.conj(v[:, k, i, j])[:, None] * w * bij[None, :]
-                    Z[iw] += np.conj(bij)[:, None] * w * v[:, k, i, j][None, :]
+                    Y[iw] += (
+                        np.conj(v[:, k, i, j])[:, None] * w
+                        * bij_y[None, :])
+                    Z[iw] += (
+                        bij_z_conj[:, None] * w
+                        * v[:, k, i, j][None, :])
     return Y, Z
+
+
+def _host_gamma_apply(mu_lorentz, psi):
+    """Dense host oracle for the bundle-owned monomial gamma apply."""
+    gamma = np.asarray(jax.device_get(gammas[int(mu_lorentz)]))
+    return np.einsum("st,kntm->knsm", gamma, psi, optimize=True)
 
 
 def _numpy_static_wings(psi, surface, *, nb_logical, nk_tot, nspin, nspinor):
@@ -265,6 +288,85 @@ def test_head_wings_face_mu_blocking_exercised(monkeypatch):
     qsgw_head._KERNEL_CACHE.clear()
 
 
+def test_head_wings_face_separate_lorentz_endpoints_preserve_order():
+    """The one face kernel must distinguish CC/TC/CT/TT endpoint algebra.
+
+    ``with_lorentz_vertices(A,0)`` owns the Y/bra face and
+    ``with_lorentz_vertices(0,B)`` owns the Z/ket face.  Gamma-2 makes the
+    CT reference explicitly complex.  The phase twins below are the sharper
+    placement discriminator: bra-only and ket-only multiplication by ``i``
+    have opposite signs in both Y and Z, so an implementation that aliases
+    either endpoint (the old gamma^dagger gamma cancellation) cannot pass.
+    """
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260827)
+    nk, nb, ns, nmu = 2, 4, 4, 8
+    _legacy, face, psi, enk, occ = _build_pair(
+        rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    v = (rng.standard_normal((3, nk, nb, nb))
+         + 1j * rng.standard_normal((3, nk, nb, nb)))
+    omega = np.asarray([0.17 + 0.03j])
+    common = dict(
+        energies_kn_ry=enk, occupations_kn=occ, omegas_ry=omega,
+        mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
+        eta_ry=0.01)
+
+    left_T = with_lorentz_vertices(face, 1, 0)
+    right_T = with_lorentz_vertices(face, 0, 2)
+    gamma1_psi = _host_gamma_apply(1, psi)
+    gamma2_psi = _host_gamma_apply(2, psi)
+
+    cases = (
+        ("CC", {}, {}),
+        ("TC", {"body_bra_wfns": left_T},
+         {"psi_y_bra": gamma1_psi}),
+        ("CT", {"body_ket_wfns": right_T},
+         {"psi_z_ket": gamma2_psi}),
+        ("TT", {"body_bra_wfns": left_T, "body_ket_wfns": right_T},
+         {"psi_y_bra": gamma1_psi, "psi_z_ket": gamma2_psi}),
+    )
+    outputs = {}
+    for name, endpoint_kwargs, oracle_kwargs in cases:
+        Y, Z = head_wings_sharded(v, face, **common, **endpoint_kwargs)
+        wanted_y = NamedSharding(mesh, P(None, None, "x"))
+        wanted_z = NamedSharding(mesh, P(None, "y", None))
+        assert Y.sharding.is_equivalent_to(wanted_y, Y.ndim)
+        assert Z.sharding.is_equivalent_to(wanted_z, Z.ndim)
+        Y_ref, Z_ref = _numpy_wings(
+            v, enk, occ, psi, nb_logical=nb, nk_tot=nk, nspin=1,
+            nspinor=ns, omega=omega, eta=0.01, **oracle_kwargs)
+        Y, Z = _gather(Y), _gather(Z)
+        scale = max(1.0, float(np.max(np.abs(Y_ref))),
+                    float(np.max(np.abs(Z_ref))))
+        np.testing.assert_allclose(Y, Y_ref, rtol=0.0,
+                                   atol=64.0 * np.finfo(float).eps * scale)
+        np.testing.assert_allclose(Z, Z_ref, rtol=0.0,
+                                   atol=64.0 * np.finfo(float).eps * scale)
+        outputs[name] = (Y, Z)
+
+    # TC changes only Y; CT changes only Z.  These are direction/order
+    # assertions, not a weak non-zero-magnitude check.
+    np.testing.assert_array_equal(outputs["TC"][1], outputs["CC"][1])
+    np.testing.assert_array_equal(outputs["CT"][0], outputs["CC"][0])
+    assert np.max(np.abs(outputs["TC"][0] - outputs["CC"][0])) > 1.0e-6
+    assert np.max(np.abs(outputs["CT"][1] - outputs["CC"][1])) > 1.0e-6
+
+    phase_face = dataclasses.replace(
+        face, psi_mun=1j * face.psi_mun, psi_nmu=1j * face.psi_nmu)
+    Y_bra, Z_bra = map(_gather, head_wings_sharded(
+        v, face, **common, body_bra_wfns=phase_face))
+    Y_ket, Z_ket = map(_gather, head_wings_sharded(
+        v, face, **common, body_ket_wfns=phase_face))
+    Y_cc, Z_cc = outputs["CC"]
+    scale = max(1.0, float(np.max(np.abs(Y_cc))),
+                float(np.max(np.abs(Z_cc))))
+    atol = 64.0 * np.finfo(float).eps * scale
+    np.testing.assert_allclose(Y_bra, -1j * Y_cc, rtol=0.0, atol=atol)
+    np.testing.assert_allclose(Z_bra, +1j * Z_cc, rtol=0.0, atol=atol)
+    np.testing.assert_allclose(Y_ket, +1j * Y_cc, rtol=0.0, atol=atol)
+    np.testing.assert_allclose(Z_ket, -1j * Z_cc, rtol=0.0, atol=atol)
+
+
 # ---------------------------------------------------------------------------
 # Static wings: legacy vs face vs numpy oracle
 # ---------------------------------------------------------------------------
@@ -359,7 +461,7 @@ def test_head_wings_sharded_face_requires_face_psi_fields():
     mesh = _mesh_xy()
     rng = np.random.default_rng(1)
     nk, nb, ns, nmu = 1, 2, 1, 2
-    _legacy, face, _psi, enk, occ = _build_pair(
+    legacy, face, _psi, enk, occ = _build_pair(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     broken = face.__class__(
         enk=face.enk, occ=face.occ, slices=face.slices, layout="face")
@@ -369,3 +471,8 @@ def test_head_wings_sharded_face_requires_face_psi_fields():
         head_wings_sharded(
             v, broken, jnp.asarray(enk), jnp.asarray(occ), omega,
             mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1)
+    with pytest.raises(ValueError, match="face-layout only"):
+        head_wings_sharded(
+            v, legacy, jnp.asarray(enk), jnp.asarray(occ), omega,
+            mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1,
+            body_bra_wfns=face)
