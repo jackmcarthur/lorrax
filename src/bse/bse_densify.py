@@ -308,7 +308,7 @@ def resolve_w_head_densify(mode, params=None) -> str:
     val = str(val).strip().lower()
     if val not in W_HEAD_DENSIFY_MODES:
         raise ValueError(
-            f"w_head_densify = {mode!r} is not one of {W_HEAD_DENSIFY_MODES}. "
+            f"w_head_densify = {val!r} is not one of {W_HEAD_DENSIFY_MODES}. "
             f"'c1' splits the Γ head off before the densifier and re-attaches "
             f"it per fine q; 'legacy' trigonometrically interpolates it, which "
             f"is the documented defect and is kept only as an A/B control.")
