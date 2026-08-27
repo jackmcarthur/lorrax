@@ -6,12 +6,15 @@ from types import SimpleNamespace
 import numpy as np
 
 from gw.gflat_memory_model import (
+    _GATHERED_PSI_SLOTS,
     _face_pair_density_slots,
     _fft_box_bytes,
+    _stage_C_face_terms,
     plan_gflat_chunks,
 )
 from gw.gw_init import _plan_gflat_chunks_for_channel
 from gw.wavefunction_bundle import BandSlices
+from runtime.padding import bounded_partition_tile
 
 
 def _meta(*, ns=4, mu=2400, nr=75 * 75 * 250, ngkmax=None):
@@ -52,6 +55,19 @@ def _run50_plan():
         meta=_meta(), cfg=cfg, band_slices=bands, mesh_xy=mesh,
         is_bispinor=True, print_fn=lambda *_: None)
     return plan
+
+
+def _profile_cliff_plan(r_chunk):
+    """Exact run158 current-channel geometry, with analytic FFT fallback."""
+    return plan_gflat_chunks(
+        meta=_meta(ns=4, mu=800, ngkmax=76_551),
+        mesh_xy=SimpleNamespace(shape={'x': 4, 'y': 4}),
+        nb_total=380, face_nb_total=256, fit_nb_total=250,
+        ngkmax=76_551, n_q_disk=36, budget_gb=70.0,
+        target_utilization=0.78, band_chunk_override=16,
+        r_chunk_override=r_chunk,
+        distributed_zeta_solve="distributed", low_mem_bands=True,
+        face_current_vertex=True)
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
@@ -130,11 +146,16 @@ def test_face_pair_arena_distinguishes_charge_and_current_executables():
     assert 'kfft_scratch_slope' not in source
 
 
-def test_ns1_and_large_band_envelope_keep_repeated_fallback():
+def test_ns1_falls_back_and_large_band_selects_cache_feasible_outer_chunk():
     assert not _synthetic_plan(ns=1).cache_face_y_blocks
     large = _synthetic_plan(face_nb=4096, fit_nb=4096, budget=80.0)
-    assert not large.cache_face_y_blocks
-    assert large.face_y_cache_bytes == 0
+    assert large.cache_face_y_blocks
+    assert large.face_y_cache_r_tile == large.r_chunk
+    assert large.r_chunk % large.face_y_cache_r_tile == 0
+    # Auto planning prefers the largest cache-feasible outer chunk to the
+    # larger repeated-transform route.  Explicit larger chunks can instead
+    # keep their solve width through the tiled-cache path tested below.
+    assert large.face_y_cache_bytes > 0
 
 
 def test_face_uses_exact_carrier_inventory_and_only_py_r_alignment():
@@ -143,3 +164,40 @@ def test_face_uses_exact_carrier_inventory_and_only_py_r_alignment():
     expected = 2 * 36 * 4 * 2400 * 128 * 16 / 8
     assert plan.psi_layout_bytes == expected
     assert plan.r_chunk == 1028  # divisible by Py=4, deliberately not P=8
+
+
+def test_bounded_partition_tile_preserves_outer_extent_and_alignment():
+    assert bounded_partition_tile(82_944, 41_472, 4) == 41_472
+    assert bounded_partition_tile(60, 16, 4) == 12
+    assert bounded_partition_tile(44, 7, 4) == 4
+    assert bounded_partition_tile(44, 3, 4) == 0
+    assert bounded_partition_tile(45, 16, 4) == 0
+
+
+def test_run158_cliff_uses_two_41472_tiles_and_prices_full_outer_transform():
+    full = _profile_cliff_plan(41_472)
+    tiled = _profile_cliff_plan(82_944)
+    assert full.face_y_cache_r_tile == 41_472
+    assert tiled.r_chunk == 82_944
+    assert tiled.face_y_cache_r_tile == 41_472
+    assert tiled.cache_face_y_blocks
+    assert tiled.face_y_cache_bytes == full.face_y_cache_bytes == 6_115_295_232
+    # Pair/cache HWM is tile-sized, so it equals the established 41,472 arm.
+    assert (tiled.peak_breakdown["C_fit_one_rchunk"]
+            == full.peak_breakdown["C_fit_one_rchunk"])
+
+    terms = _stage_C_face_terms(
+        nk=36, ns=4, mu=800, face_nb=256, slots=16,
+        p_x=4, p_y=4, p_xy=16, band_chunk=16, n_band_chunks=16)
+    outer_transform_slope = (
+        _GATHERED_PSI_SLOTS * terms["y_block_slope"]
+        + terms["y_source_slope"])
+    # The two-tile cache still builds from one full-outer Y block at a time.
+    # Its build HWM must therefore grow by one 41,472-wide full-block
+    # transform relative to the 41,472 outer arm, rather than being falsely
+    # priced only at the cache tile width.
+    assert (tiled.peak_breakdown["C_face_y_cache_build"]
+            - full.peak_breakdown["C_face_y_cache_build"]
+            == outer_transform_slope * 41_472)
+    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_365_370_592
+    assert tiled.hwm_bytes == 27_795_741_408
