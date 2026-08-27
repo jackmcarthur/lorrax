@@ -66,7 +66,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
-from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
+from common.bispinor_init import (
+    NO_PAIR_DIRAC_CURRENT_MODEL, kinetic_balance_lift_provenance)
+from common.four_current_model import resolve_four_current_representation
 from common.collectives import device_put_process_local
 from common.jax_compile_cache import ensure_jax_compile_cache
 from runtime.padding import round_up, solve_at_logical
@@ -2093,7 +2095,8 @@ def compute_static_photon_response(
 ) -> StaticPhotonResponse:
     """Build the packed static photon body and its selected q=0 model.
 
-    ``full_static_cohsex`` remains headless and experimental.
+    ``full_static_cohsex`` and its explicitly normalized diagnostic remain
+    headless and experimental.
     ``charge_hall_cubature`` adds only the declared charge and Hall response
     through the existing exact slab cubature.  Neither mode claims the
     missing ordinary-current/contact/complement terms.
@@ -2122,6 +2125,7 @@ def compute_static_photon_response(
         else coerce_bispinor_gw_mode(config.bispinor_gw))
     if photon_mode not in (
             BispinorGWMode.FULL_STATIC_COHSEX,
+            BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC,
             BispinorGWMode.CHARGE_HALL_CUBATURE):
         raise ValueError(
             "packed static photon response received bispinor_gw="
@@ -2142,6 +2146,14 @@ def compute_static_photon_response(
             "caller-provided StaticGaugeHeadResponse cannot certify that "
             "missing wiring; head_correction=off retains only the "
             "experimental no-pair finite-body diagnostic")
+
+    representation = resolve_four_current_representation(True, photon_mode)
+    current_model = STATIC_PHOTON_NO_PAIR_MODEL
+    if photon_mode is (
+            BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC):
+        current_model = (
+            f"{representation.spatial_current_representation};"
+            f"{STATIC_PHOTON_NO_PAIR_MODEL}")
     if coupled_head:
         if gauge_head_response is not None:
             raise ValueError(
@@ -2186,7 +2198,7 @@ def compute_static_photon_response(
     if jax.process_index() == 0:
         print(
             "  [photon response] DECLARED no-pair model "
-            "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
+            f"{kinetic_balance_lift_provenance(representation.current_lift)}, "
             "j=c*Psi^dagger*alpha*Psi; bubble-screened "
             f"Breit; current_contact={current_contact}; "
             f"head_correction={head_policy.value}",
@@ -2264,11 +2276,16 @@ def compute_static_photon_response(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=current_contact,
         head_completion=head_completion,
-        current_model=STATIC_PHOTON_NO_PAIR_MODEL,
+        current_model=current_model,
         approximation=(
             "charge_hall_cubature_on_experimental_no_pair_body_v1"
             if coupled_head
-            else "experimental_no_pair_bubble_screened_breit_v1"),
+            else (
+                "experimental_isometric_kinetic_balance_full_packed_"
+                "finite_q_screening_headless_v1"
+                if photon_mode is
+                BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC
+                else "experimental_no_pair_bubble_screened_breit_v1")),
     )
 
 

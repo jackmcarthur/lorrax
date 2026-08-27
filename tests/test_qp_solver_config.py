@@ -24,6 +24,7 @@ import pytest
 from gw.gw_config import (
     BispinorGWMode, LorraxConfig, QPSolver,
     uses_four_spinor_finite_q_charge, uses_raw_kinetic_balance_charge,
+    uses_static_photon_response,
 )
 from common.four_current_model import resolve_four_current_representation
 
@@ -190,6 +191,33 @@ def test_isometric_selector_splits_finite_q_from_scalar_head(tmp_path):
     assert rep.charge_bispinor and rep.current_bispinor
     assert rep.charge_lift == rep.current_lift == "isometric"
     assert not rep.scalar_head_bispinor
+
+
+def test_isometric_full_static_diagnostic_is_explicitly_headless(tmp_path):
+    extra = (
+        "bispinor = true\n"
+        "bispinor_gw = "
+        "isometric_kinetic_balance_full_static_cohsex_headless_diagnostic\n"
+        "compute_mode = cohsex\n"
+        "head_correction = off\n"
+        "low_mem_bands = true\n"
+        "w_dyson_solver = distributed\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n"
+        "sys_dim = 2\n")
+    cfg = _config(tmp_path, extra)
+    assert cfg.bispinor_gw is (
+        BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC)
+    assert uses_static_photon_response(cfg)
+    rep = resolve_four_current_representation(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert rep.charge_lift == rep.current_lift == "isometric"
+
+    with pytest.raises(
+            ValueError, match="full_static_bispinor_gauge_head_unavailable"):
+        _config(tmp_path, extra.replace(
+            "head_correction = off", "head_correction = full"),
+            name="normalized_full_head_refused.in")
 
 
 # ---------------------------------------------------------------------------

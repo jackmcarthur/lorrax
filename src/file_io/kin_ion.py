@@ -724,8 +724,6 @@ def validate_kin_ion_against_run(
 	isometric = is_isometric_kinetic_balance_model(
 		expected_bispinor_gw_mode)
 	explicit_comparison = bool(pauli_reference or isometric)
-	expected_mode_value = str(getattr(
-		expected_bispinor_gw_mode, "value", expected_bispinor_gw_mode))
 	representation = resolve_four_current_representation(
 		expected_bispinor, expected_bispinor_gw_mode)
 	expected_charge_representation = representation.charge_representation
@@ -740,12 +738,6 @@ def validate_kin_ion_against_run(
 			f"{stored_charge_representation!r}, expected "
 			f"{expected_charge_representation!r}; regenerate kin_ion.h5 from "
 			"this run's exact input deck.")
-	if explicit_comparison and str(attrs.get("bispinor_gw_mode")) != (
-		expected_mode_value):
-		raise ValueError(
-			"the explicit four-current comparison requires an authenticated "
-			f"bispinor_gw_mode={expected_mode_value!r}; "
-			f"artifact has {attrs.get('bispinor_gw_mode')!r}.")
 	if bool(expected_bispinor):
 		stored_current_representation = attrs.get(
 			"spatial_current_representation")

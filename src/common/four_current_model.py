@@ -5,6 +5,8 @@ from dataclasses import dataclass
 PAULI_REFERENCE_BARE_TRANSVERSE_MODEL = "pauli_reference_bare_transverse"
 ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL = (
     "isometric_kinetic_balance_bare_transverse")
+ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL = (
+    "isometric_kinetic_balance_full_static_cohsex_headless_diagnostic")
 
 
 def is_pauli_reference_model(value) -> bool:
@@ -14,9 +16,11 @@ def is_pauli_reference_model(value) -> bool:
 
 
 def is_isometric_kinetic_balance_model(value) -> bool:
-    """Recognize the normalized kinetic-balance comparison selector."""
-    return str(getattr(value, "value", value)).strip().lower() == (
-        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
+    """Recognize selectors that share the normalized four-current carrier."""
+    return str(getattr(value, "value", value)).strip().lower() in {
+        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
+        ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL,
+    }
 
 
 RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION = (
