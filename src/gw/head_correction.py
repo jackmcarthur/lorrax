@@ -159,6 +159,34 @@ class StaticGaugeHeadResponse:
     hermiticity_residual: float
 
 
+def static_mixed_linear_response(mixed_tensor) -> jax.Array:
+    r"""Embed one real in-plane charge-current tensor into CT/TC blocks.
+
+    ``mixed_tensor[a,i]`` uses the occupied-bra convention of the static
+    transition kernel.  The live energy-ordered Adler--Wiser response has
+    ``CT=-i*mixed_tensor``; TC is its Hermitian conjugate.  Keeping this sign
+    and conjugation in one owner lets Hall-only and bounded full-CT responses
+    share the same numerical convention.
+    """
+    tensor_raw = np.asarray(mixed_tensor)
+    if tensor_raw.shape != (2, 3):
+        raise ValueError(
+            "static mixed tensor must have shape (2,3); got "
+            f"{tensor_raw.shape}")
+    if not np.all(np.isfinite(tensor_raw)):
+        raise ValueError("static mixed tensor contains non-finite values")
+    if np.any(np.imag(tensor_raw) != 0.0):
+        raise ValueError(
+            "static mixed tensor must be explicitly real; refusing to "
+            "discard an imaginary component")
+    tensor = np.asarray(np.real(tensor_raw), dtype=np.float64)
+    ct = -1j * tensor
+    linear = np.zeros((2, 4, 4), dtype=np.complex128)
+    linear[:, 0, 1:] = ct
+    linear[:, 1:, 0] = np.conj(ct)
+    return jnp.asarray(linear)
+
+
 def static_hall_linear_response(sigma_H) -> jax.Array:
     r"""Return the unique static Hall-only linear CT/TC tensor.
 
@@ -185,11 +213,8 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
     # live band orientation P=-Delta*D: direct Adler--Wiser gives
     # Im Pi_CT=+F/h Im(Gamma_a Gamma_i*)/Delta^2, whereas the persisted
     # occupied-Berry convention stores sigma_H with the opposite sign.
-    ct = -1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
-    linear = np.zeros((2, 4, 4), dtype=np.complex128)
-    linear[:, 0, 1:] = ct
-    linear[:, 1:, 0] = np.conj(ct)
-    return jnp.asarray(linear)
+    tensor = np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
+    return static_mixed_linear_response(tensor)
 
 
 def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
@@ -1148,7 +1173,7 @@ def _static_slab_photon_head_moment_chunk(
 def static_slab_photon_head_moment_chunk(
     q_cart,
     D_raw,
-    sigma_H,
+    H_linear,
     S_quadratic,
     valid_count,
     sample_weight,
@@ -1157,8 +1182,8 @@ def static_slab_photon_head_moment_chunk(
 
     Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
     ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
-    units (no cell-volume factor), ``sigma_H`` is the separately sourced real
-    Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
+    units (no cell-volume factor), ``H_linear`` is the validated
+    ``(2,4,4)`` CT/TC response, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
     normalizes each provider-issued weighted rule and applies the one and only
     ``1/Vcell`` while rebuilding the packed q=Gamma row.
 
@@ -1168,17 +1193,17 @@ def static_slab_photon_head_moment_chunk(
     """
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
-    sigma_shape = tuple(np.shape(sigma_H))
+    h_shape = tuple(np.shape(H_linear))
     S_shape = tuple(np.shape(S_quadratic))
     if len(q_shape) != 2 or q_shape[1] != 3:
         raise ValueError(f"q_cart must be (chunk,3), got {q_shape}")
     expected_D = (q_shape[0], 4, 4)
     if d_shape != expected_D:
         raise ValueError(f"D_raw must be {expected_D}, got {d_shape}")
-    if sigma_shape != (3,) or S_shape != (2, 2, 4, 4):
+    if h_shape != (2, 4, 4) or S_shape != (2, 2, 4, 4):
         raise ValueError(
-            "static slab response requires sigma_H=(3,) and "
-            f"S_quadratic=(2,2,4,4); got {sigma_shape}/{S_shape}")
+            "static slab response requires H_linear=(2,4,4) and "
+            f"S_quadratic=(2,2,4,4); got {h_shape}/{S_shape}")
     n_valid = int(valid_count)
     if not 0 <= n_valid <= q_shape[0]:
         raise ValueError(
@@ -1192,13 +1217,13 @@ def static_slab_photon_head_moment_chunk(
         raise ValueError(
             "sample_weight must be finite and nonnegative on valid rows, "
             "with exact zeros on padded rows")
-    H_hall = static_hall_linear_response(sigma_H)
+    H = jnp.asarray(H_linear, dtype=jnp.complex128)
     S_sharding = getattr(S_quadratic, "sharding", None)
     if isinstance(S_sharding, NamedSharding):
-        H_hall = device_put_process_local(
-            H_hall, NamedSharding(S_sharding.mesh, P()))
+        H = device_put_process_local(
+            H, NamedSharding(S_sharding.mesh, P()))
     result = _static_slab_photon_head_moment_chunk(
-        q_cart, D_raw, H_hall, S_quadratic,
+        q_cart, D_raw, H, S_quadratic,
         jnp.asarray(n_valid, dtype=jnp.int32), jnp.asarray(weight))
     return result
 
@@ -1427,6 +1452,7 @@ def complete_static_slab_photon_q0(
     )
     if isinstance(response, StaticGaugeCubatureResponse):
         response = require_static_gauge_cubature_response(response, mesh_xy)
+        H_linear = response.H_linear
         # A bounded response fingerprint authenticates that model's inputs;
         # it is not a complete Hamiltonian/current/contact identity.  Do not
         # publish it in the exact-response Sigma receipt.
@@ -1444,6 +1470,7 @@ def complete_static_slab_photon_q0(
             bounded_response_approximation = response.approximation
     else:
         response = require_static_gauge_head_response(response, mesh_xy)
+        H_linear = static_hall_linear_response(response.sigma_H)
         operator_fingerprint = (
             response.hamiltonian_config_operator_fingerprint)
         bounded_response_fingerprint = None
@@ -1517,7 +1544,7 @@ def complete_static_slab_photon_q0(
         (moments, bare_sum, returned_count, backward, chunk_sigma_min,
          chunk_condition_max,
          chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
-            q_host, chunk.D_raw, response.sigma_H, S_effective,
+            q_host, chunk.D_raw, H_linear, S_effective,
             n_valid, weight)
         (moment_host, D_host, count_host, residual_host, sigma_host,
          condition_host, conditioned_backward_host) = jax.device_get((

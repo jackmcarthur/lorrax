@@ -22,6 +22,7 @@ from gw.head_correction import (
     require_static_gauge_head_response,
     static_gauge_tensor_residuals,
     static_hall_linear_response,
+    static_mixed_linear_response,
     static_slab_photon_head_moment_chunk,
 )
 from gw.photon_layout import PhotonBasisLayout
@@ -98,6 +99,16 @@ def test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign():
     np.testing.assert_allclose(Pi[:, 1:3] @ q, 0.0, atol=1.0e-15)
 
 
+def test_full_mixed_builder_preserves_ct_sign_and_hermiticity():
+    tensor = np.asarray(((0.7, -0.2, 0.4), (0.3, -0.6, 0.9)))
+    H = np.asarray(static_mixed_linear_response(tensor))
+    np.testing.assert_array_equal(H[:, 0, 1:], -1j * tensor)
+    np.testing.assert_array_equal(H[:, 1:, 0], 1j * tensor)
+    np.testing.assert_array_equal(H[:, 0, 0], 0.0)
+    np.testing.assert_array_equal(H[:, 1:, 1:], 0.0)
+    np.testing.assert_array_equal(H, np.conj(np.swapaxes(H, 1, 2)))
+
+
 def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     q = np.asarray(
         ((0.17, -0.09, 0.0), (-0.12, 0.21, 0.0), (0.0, 0.0, 0.0)),
@@ -107,15 +118,15 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     D[0] = np.diag((2.0, -0.7, -0.9, -0.4))
     D[1] = np.diag((1.6, -0.8, -0.6, -0.3))
     sigma = np.asarray((0.0, 0.0, 0.11), dtype=np.float64)
+    H = np.asarray(static_hall_linear_response(sigma))
     S = _ward_closed_S()
 
     weight = np.asarray((1.0, 1.0, 0.0), dtype=np.float64)
     (moments, D_sum, count, residual, sigma_min,
      condition_max,
      conditioned_backward) = static_slab_photon_head_moment_chunk(
-        q, D, sigma, S, 2, weight)
+        q, D, H, S, 2, weight)
 
-    H = np.asarray(static_hall_linear_response(sigma))
     R = (
         np.einsum("sa,aij->sij", q[:2, :2], H)
         + np.einsum("sa,sb,abij->sij", q[:2, :2], q[:2, :2], S)
@@ -143,14 +154,14 @@ def test_static_head_moment_applies_deterministic_cubature_weights():
     D[0] = np.diag((2.0, -0.7, -0.9, -0.4))
     D[1] = np.diag((1.6, -0.8, -0.6, -0.3))
     sigma = np.asarray((0.0, 0.0, 0.11), dtype=np.float64)
+    H = np.asarray(static_hall_linear_response(sigma))
     S = _ward_closed_S()
     weight = np.asarray((0.23, 0.77, 0.0), dtype=np.float64)
 
     (moments, D_sum, count, residual, sigma_min,
      condition_max,
      conditioned_backward) = static_slab_photon_head_moment_chunk(
-        q, D, sigma, S, 2, weight)
-    H = np.asarray(static_hall_linear_response(sigma))
+        q, D, H, S, 2, weight)
     R = (
         np.einsum("sa,aij->sij", q[:2, :2], H)
         + np.einsum("sa,sb,abij->sij", q[:2, :2], q[:2, :2], S)

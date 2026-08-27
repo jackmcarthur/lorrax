@@ -15,7 +15,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import common.parallel_transport as parallel_transport
 import gw.qsgw_head as qsgw_head
-from gw.head_correction import static_hall_linear_response
 from gw.photon_layout import PhotonBasisLayout
 from gw.static_gauge_response import (
     CHARGE_HALL_CUBATURE_AVAILABILITY,
@@ -92,7 +91,7 @@ def test_charge_hall_builder_has_only_declared_support(
     assert response.hermiticity_residual == 0.0
     assert response.wing_reciprocity_residual == 0.0
 
-    pi1 = np.asarray(static_hall_linear_response(response.sigma_H))
+    pi1 = np.asarray(response.H_linear)
     np.testing.assert_array_equal(pi1[:, 0, 0], np.zeros(2))
     np.testing.assert_array_equal(pi1[:, 1:, 1:], np.zeros((2, 3, 3)))
     np.testing.assert_array_equal(pi1[:, 1:, 0], np.conj(pi1[:, 0, 1:]))
