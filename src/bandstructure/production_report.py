@@ -149,18 +149,34 @@ class HTransformProductionReport:
         start = int(result["band_start"])
         keep = int(result["nb_keep"])
         fit = int(result["nb_fit"])
+        physical = int(result.get("nb_hamiltonian", fit))
+        if not (keep <= physical <= fit):
+            raise ValueError(
+                "htransform report: expected returned <= physical "
+                f"Hamiltonian <= Galerkin fit, found {keep} <= {physical} "
+                f"<= {fit}")
         energies = np.asarray(enk_sigma_ry, dtype=np.float64)
-        finite = energies[np.isfinite(energies)]
+        physical_energies = energies[:physical]
+        finite = physical_energies[np.isfinite(physical_energies)]
         n_electrons = float(getattr(
             wfn, "num_electrons", getattr(wfn, "nelec", np.nan)))
         self.heading("Interpolation and band spaces")
         self.emit(f"Electrons      : {n_electrons:.5f}; "
                   f"occupied-band boundary = {int(getattr(wfn, 'nelec', 0))}")
         self.emit(f"Returned bands : {band_range(start, start + keep)}")
-        self.emit(f"Fitted bands   : {band_range(start, start + fit)} "
-                  f"({int(result['n_guard_bands'])} upper guard bands)")
         windows = result.get("state_windows") or {}
         qp_window = windows.get("qp_corrected")
+        if qp_window is None:
+            self.emit(f"Fitted bands   : {band_range(start, start + fit)} "
+                      f"({fit - keep} upper guard bands)")
+        else:
+            self.emit(
+                f"Galerkin fit   : {band_range(start, start + fit)} "
+                f"({fit - keep} conditioning bands above publication)")
+            self.emit(
+                f"Physical QP H  : {band_range(start, start + physical)} "
+                f"({physical - keep} corrected guard bands above "
+                "publication)")
         if qp_window is not None:
             margin = windows["corrected_margin"]
             dft_guard = windows["dft_guard"]
@@ -169,8 +185,9 @@ class HTransformProductionReport:
                 f"Corrected margin: {band_range(*margin)} "
                 f"({int(margin[1] - margin[0])} bands above publication)")
             self.emit(
-                f"Outer DFT guard: {band_range(*dft_guard)} "
-                f"({int(dft_guard[1] - dft_guard[0])} fitted bands)")
+                f"Outer basis guard: {band_range(*dft_guard)} "
+                f"({int(dft_guard[1] - dft_guard[0])} conditioning rows; "
+                "excluded from physical QP H)")
         if qp_state is not None:
             self.emit(f"QP artifact    : {abs_path(qp_state.artifact_path)}")
             self.emit(
@@ -178,33 +195,39 @@ class HTransformProductionReport:
                 f"{qp_state.source_wfn_fingerprint_scheme}:"
                 f"{qp_state.source_wfn_fingerprint}")
         self.emit(f"Source states  : {energy_source}; "
-                  f"{int(energies.size)} k-resolved band energies")
+                  f"{int(physical_energies.size)} physical k-resolved band "
+                  "energies")
         if finite.size:
             finite_ev = finite * RYD_TO_EV
             self.emit(f"Source E range : [{float(np.min(finite_ev)):.5f}, "
                       f"{float(np.max(finite_ev)):.5f}] eV; span "
                       f"{float(np.ptp(finite_ev)):.5f} eV")
-        if fit > keep and energies.ndim == 2 and energies.shape[0] >= fit:
-            guard_block_ev = energies[keep:fit] * RYD_TO_EV
+        if (physical > keep and energies.ndim == 2
+                and energies.shape[0] >= physical):
+            guard_block_ev = energies[keep:physical] * RYD_TO_EV
+            guard_name = "Corrected guard" if qp_window is not None else "Guard bands"
             self.emit(
-                f"Guard bands    : {band_range(start + keep, start + fit)}; "
+                f"{guard_name:<15}: "
+                f"{band_range(start + keep, start + physical)}; "
                 f"E range [{float(np.min(guard_block_ev)):.5f}, "
                 f"{float(np.max(guard_block_ev)):.5f}] eV; span "
                 f"{float(np.ptp(guard_block_ev)):.5f} eV")
             requested_top = energies[keep - 1]
-            fitted_top = energies[fit - 1]
+            physical_top = energies[physical - 1]
             guard_ev = (
-                float(np.min(fitted_top)) - float(np.max(requested_top))) \
+                float(np.min(physical_top)) - float(np.max(requested_top))) \
                 * RYD_TO_EV
-            vertical_ev = float(np.min(fitted_top - requested_top)) * RYD_TO_EV
+            vertical_ev = float(
+                np.min(physical_top - requested_top)) * RYD_TO_EV
             relation = "separated" if guard_ev >= 0.0 else "ranges overlap"
             self.emit(
                 f"Guard buffer   : {vertical_ev:.5f} eV minimum same-k "
-                f"separation, E(band {start + fit}) - E(band "
+                f"separation, E(band {start + physical}) - E(band "
                 f"{start + keep})")
             self.emit(
                 f"Global guard   : {guard_ev:+.5f} eV = min E(band "
-                f"{start + fit}) - max E(band {start + keep}); {relation}")
+                f"{start + physical}) - max E(band {start + keep}); "
+                f"{relation}")
         self.emit(f"Centroid file  : {abs_path(centroid_file)}")
         if centroids is None:
             self.emit(f"Centroid sites : {int(meta.n_rmu)} requested/loaded")

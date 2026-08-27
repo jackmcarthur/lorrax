@@ -49,6 +49,7 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     report.sampling(wfn=wfn, sym=sym, centroids=centroids)
     result = {
         "band_start": 2, "nb_keep": 4, "nb_fit": 6,
+        "nb_hamiltonian": 5,
         "n_guard_bands": 2, "nk_total": 8,
         "path_range": (-0.2, 0.4),
         "state_windows": {
@@ -69,7 +70,7 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
         },
         "f_transform": {
             "a_ry": 0.4, "n": 3.0, "shift_ry": 0.47,
-            "scale_band_local": 5, "shoulder_band_local": 5,
+            "scale_band_local": 4, "shoulder_band_local": 4,
         },
         "kpath_data": (
             np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]), None,
@@ -128,10 +129,11 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert text == "\n".join(output) + "\n"
     assert "Returned bands : 3-6" in text
-    assert "Fitted bands   : 3-8 (2 upper guard bands)" in text
+    assert "Galerkin fit   : 3-8 (2 conditioning bands" in text
+    assert "Physical QP H  : 3-7 (1 corrected guard bands" in text
     assert "QP-corrected   : 3-7" in text
     assert "Corrected margin: 7" in text
-    assert "Outer DFT guard: 8" in text
+    assert "Outer basis guard: 8" in text
     assert "QP artifact    :" in text
     assert "lorrax-wfn-v1:" + "a" * 64 in text
     assert "Centroid sites : 20 requested from the full table" in text
@@ -145,9 +147,10 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "not a fine-k band-energy error bound" in text
     assert "rank 4 = 3 physical + 1 exact-null mesh pad" in text
     assert "Guard buffer   :" in text
-    assert "Guard bands    : 7-8; E range" in text
-    assert "f-transform    : a=5.44228 eV (4 x bandwidth of band 8); n=3.00" in text
-    assert "Zero shoulder  : max E(band 8) = 6.39468 eV" in text
+    assert "Corrected guard: 7; E range" in text
+    assert "Source states  : DFT eigenvalues from the WFN; 40 physical" in text
+    assert "f-transform    : a=5.44228 eV (4 x bandwidth of band 7); n=3.00" in text
+    assert "Zero shoulder  : max E(band 7) = 6.39468 eV" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
     assert "L01  Γ -> X: 1 intervals; 2 endpoint-inclusive points" in text
     assert "Coarse closure : 2 exact path/coarse point(s)" in text

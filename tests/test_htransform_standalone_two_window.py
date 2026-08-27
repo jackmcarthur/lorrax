@@ -36,7 +36,7 @@ def test_standalone_htransform_reuses_the_f_shoulder_gate():
     assert "from .bse_setup import _f_shoulder_gate" in src
     assert "f_eps, 0, nb_keep" in src
     assert 'where="htransform"' in src
-    assert "nb_keep = states if n_return_bands is None" in src
+    assert "ambient_states if n_return_bands is None" in src
 
 
 def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
@@ -50,7 +50,7 @@ def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
     write_bands_to_file(
         str(path), np.asarray([[1.0, 2.0]]),
         np.asarray([[0.0, 0.0, 0.0]]), np.asarray([0.0]),
-        band_start=6, nb_fit=6,
+        band_start=6, nb_fit=6, nb_hamiltonian=4,
         state_windows={
             "returned": (6, 8), "qp_corrected": (6, 10),
             "corrected_margin": (8, 10), "dft_guard": (10, 12),
@@ -62,7 +62,8 @@ def test_output_writer_stamps_fit_and_guard_windows(tmp_path):
             source_wfn_fingerprint="b" * 64))
     text = path.read_text()
     assert "absolute_band_window=[6,8)" in text
-    assert "fit_bands=6 guard_bands=4" in text
+    assert ("fit_bands=6 conditioning_guard_bands=4 "
+            "hamiltonian_bands=4 physical_guard_bands=2") in text
     assert "returned=[6,8) qp_corrected=[6,10)" in text
     assert "corrected_margin=[8,10) dft_guard=[10,12)" in text
     assert "source_wfn_fingerprint=" + "b" * 64 in text

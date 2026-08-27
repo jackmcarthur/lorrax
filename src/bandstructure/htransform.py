@@ -2033,6 +2033,7 @@ def plot_bands(result):
 
 def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
                         *, band_start: int = 0, nb_fit: int | None = None,
+                        nb_hamiltonian: int | None = None,
                         state_windows=None, qp_state: QPStateReceipt | None = None):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
@@ -2044,11 +2045,16 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
     with open(output_path, 'w', encoding='utf8') as fh:
         fh.write('# idx_k idx_b kx ky kz s energy_eV\n')
         if nb_fit is not None:
+            physical = (int(nb_fit) if nb_hamiltonian is None
+                        else int(nb_hamiltonian))
             fh.write(
                 f"# absolute_band_window=[{int(band_start)},"
                 f"{int(band_start) + energies.shape[1]}) "
                 f"fit_bands={int(nb_fit)} "
-                f"guard_bands={int(nb_fit) - energies.shape[1]}\n")
+                f"conditioning_guard_bands="
+                f"{int(nb_fit) - energies.shape[1]} "
+                f"hamiltonian_bands={physical} "
+                f"physical_guard_bands={physical - energies.shape[1]}\n")
         if state_windows is not None:
             def _window(name):
                 value = state_windows.get(name)
@@ -2414,6 +2420,7 @@ def main(argv=None):
             kpath_data[1],
             band_start=result["band_start"],
             nb_fit=result["nb_fit"],
+            nb_hamiltonian=result["nb_hamiltonian"],
             state_windows=result["state_windows"],
             qp_state=qp_state_receipt,
         )
