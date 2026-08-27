@@ -186,6 +186,7 @@ __all__ = [
     "assemble_head_manifold",
     "build_iteration_head_samples",
     "build_iteration_head_response",
+    "build_covariant_qsgw_velocity",
     "build_dft_head_response",
     "covariant_link_derivative",
     "head_s_tensor_sharded",
@@ -1056,6 +1057,84 @@ def rotate_velocity_active_to_qp(velocity_cart, U_active, *, mesh: Mesh):
     if U_active.shape[-2] != na:
         raise ValueError("U_active must be square on its band axes")
     return _active_rotation_kernel(mesh, na)(velocity_cart, U_active)
+
+
+def build_covariant_qsgw_velocity(
+    delta_h_dft,
+    forward_links,
+    forward_neighbors,
+    velocity_dft_cart,
+    U_dft_to_qp,
+    *,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+):
+    """Build the finite-link QSGW velocity in the current QP basis.
+
+    This is the one reusable owner of
+
+    ``U^H [v_DFT + D_link(H_QP - H_DFT)] U``.
+
+    Unlike :func:`build_iteration_head_response`, this function has no
+    DFT-velocity fallback: all three finite-link operands are required.  A
+    consumer asking for a QSGW operator (for example an orbital-moment
+    contraction) must therefore fail instead of silently evaluating a hybrid
+    quantity with QP energies and DFT velocities.
+
+    Parameters
+    ----------
+    delta_h_dft : (nk, nb, nb) complex
+        ``H_QP - H_DFT`` in the stored DFT band bundle, in Ry.
+    forward_links : (3, nk, nb, nb) complex
+        Nearest-neighbour parallel-transport links in the same bundle.
+    forward_neighbors : (nk, 3) integer
+        Positive neighbour table for the reduced-coordinate mesh.
+    velocity_dft_cart : (3, nk, nb, nb) complex
+        Exact DFT Cartesian ``dH/dk`` matrix, in Ry*bohr.
+    U_dft_to_qp : (nk, na, na) complex
+        Active QSGW rotation, ``<DFT_m|QP_n>``.  Bands beyond ``na`` retain
+        the identity rotation.
+    mesh : Mesh
+        Square two-dimensional processor mesh.  Both band axes of the
+        returned velocity remain distributed over it.
+    kgrid : (3,) integer tuple
+        Uniform full-BZ mesh used by the fourth-order link derivative.
+    bvec_cart : (3, 3) float
+        Reciprocal lattice vectors as rows, in 1/bohr.
+
+    Returns
+    -------
+    (3, nk, nb, nb) complex
+        Cartesian QSGW velocity in the QP basis, with the same two-band-axis
+        mesh distribution as the head pipeline.
+    """
+    missing = [
+        name for name, value in (
+            ("delta_h_dft", delta_h_dft),
+            ("forward_links", forward_links),
+            ("forward_neighbors", forward_neighbors),
+        ) if value is None
+    ]
+    if missing:
+        raise ValueError(
+            "build_covariant_qsgw_velocity requires the finite-link QSGW "
+            "correction; missing " + ", ".join(missing)
+            + ". The DFT-velocity fallback is not a QSGW orbital operator."
+        )
+    corrected_dft_basis = (
+        jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+        + covariant_link_derivative(
+            delta_h_dft,
+            forward_links,
+            forward_neighbors,
+            mesh=mesh,
+            kgrid=kgrid,
+            bvec_cart=bvec_cart,
+        )
+    )
+    return rotate_velocity_active_to_qp(
+        corrected_dft_basis, U_dft_to_qp, mesh=mesh)
 
 
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
@@ -3784,21 +3863,26 @@ def build_iteration_head_response(
     the per-iteration rotation into the QP basis, S(z), the Drude term, the
     ISDF wings, the static κ² — is the SAME code on both routes.
     """
-    v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     if forward_links is not None:
-        if forward_neighbors is None:
-            raise ValueError(
-                "forward_neighbors are required when forward_links are present"
-            )
-        v_dft_basis = v_dft_basis + covariant_link_derivative(
+        v_qp = build_covariant_qsgw_velocity(
             delta_h_dft,
             forward_links,
             forward_neighbors,
+            velocity_dft_cart,
+            U_dft_to_qp,
             mesh=mesh,
             kgrid=kgrid,
             bvec_cart=bvec_cart,
         )
-    v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
+    else:
+        # Deliberate ``sc_head_update=dft_velocity`` route.  QSGW orbital
+        # consumers call ``build_covariant_qsgw_velocity`` directly and
+        # cannot reach this fallback.
+        v_qp = rotate_velocity_active_to_qp(
+            jnp.asarray(velocity_dft_cart, dtype=jnp.complex128),
+            U_dft_to_qp,
+            mesh=mesh,
+        )
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)

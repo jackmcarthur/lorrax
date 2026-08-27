@@ -23,6 +23,7 @@ from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
     StaticGaugeHallTransaction,
     assemble_head_manifold,
+    build_covariant_qsgw_velocity,
     covariant_link_derivative,
     head_wings_sharded,
     head_s_tensor_sharded,
@@ -1115,6 +1116,168 @@ def test_active_rotation_matches_dense_block_diagonal_rotation():
         "kmi,akmn,knj->akij", U_full.conj(), velocity, U_full, optimize=True
     )
     np.testing.assert_allclose(got, ref, rtol=3e-14, atol=3e-14)
+
+
+def test_covariant_qsgw_velocity_is_the_one_head_orbital_operator():
+    """The reusable QSGW velocity is link derivative plus one QP rotation."""
+    rng = np.random.default_rng(202608261)
+    grid = (5, 5, 5)
+    nk, nb, na = int(np.prod(grid)), 6, 3
+    coords = np.stack(
+        np.meshgrid(*(np.arange(n) for n in grid), indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    neighbors = build_forward_neighbor_table(coords, grid)
+    links = np.broadcast_to(
+        np.eye(nb, dtype=np.complex128), (3, nk, nb, nb)).copy()
+    raw_delta = (rng.normal(size=(nk, nb, nb))
+                 + 1j * rng.normal(size=(nk, nb, nb)))
+    delta = 0.5 * (raw_delta + np.swapaxes(raw_delta.conj(), -1, -2))
+    raw_velocity = (rng.normal(size=(3, nk, nb, nb))
+                    + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity_dft = 0.5 * (
+        raw_velocity + np.swapaxes(raw_velocity.conj(), -1, -2))
+    U = np.stack([_haar(rng, na) for _ in range(nk)])
+    bvec = np.asarray(
+        [[1.7, 0.1, 0.0], [0.0, 1.2, 0.2], [0.1, 0.0, 0.9]])
+    mesh = _mesh()
+    kwargs = dict(mesh=mesh, kgrid=grid, bvec_cart=bvec)
+
+    correction = covariant_link_derivative(
+        jnp.asarray(delta), jnp.asarray(links), neighbors, **kwargs)
+    expected = rotate_velocity_active_to_qp(
+        jnp.asarray(velocity_dft) + correction, jnp.asarray(U), mesh=mesh)
+    got = build_covariant_qsgw_velocity(
+        jnp.asarray(delta), jnp.asarray(links), neighbors,
+        jnp.asarray(velocity_dft), jnp.asarray(U), **kwargs)
+    np.testing.assert_allclose(
+        np.asarray(got), np.asarray(expected), rtol=3e-14, atol=3e-14)
+
+
+@pytest.mark.parametrize(
+    "missing_index, missing_name",
+    [(0, "delta_h_dft"), (1, "forward_links"), (2, "forward_neighbors")],
+)
+def test_covariant_qsgw_velocity_has_no_dft_fallback(
+        missing_index, missing_name):
+    grid = (5, 5, 5)
+    nk, nb = int(np.prod(grid)), 2
+    coords = np.stack(
+        np.meshgrid(*(np.arange(n) for n in grid), indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    values = [
+        jnp.zeros((nk, nb, nb), dtype=jnp.complex128),
+        jnp.broadcast_to(
+            jnp.eye(nb, dtype=jnp.complex128), (3, nk, nb, nb)),
+        build_forward_neighbor_table(coords, grid),
+    ]
+    values[missing_index] = None
+    with pytest.raises(ValueError, match=missing_name):
+        build_covariant_qsgw_velocity(
+            *values,
+            jnp.zeros((3, nk, nb, nb), dtype=jnp.complex128),
+            jnp.broadcast_to(
+                jnp.eye(nb, dtype=jnp.complex128), (nk, nb, nb)),
+            mesh=_mesh(), kgrid=grid, bvec_cart=np.eye(3),
+        )
+
+
+def test_controlled_band_dpsi_vpsi_matches_the_existing_local_moment():
+    """Contraction and incumbent SOS algebra are the same finite-band sum."""
+    from psp.orbital_magnetization import orbital_pieces_at_k
+    from psp.orbital_response import (
+        band_orbital_moment_mu_b,
+        controlled_band_orbital_contraction,
+    )
+
+    rng = np.random.default_rng(202608262)
+    nk, nb = 3, 7
+    energies = np.stack([
+        np.arange(nb, dtype=np.float64) * 0.37 + 0.03 * k
+        for k in range(nk)
+    ])
+    raw = (rng.normal(size=(3, nk, nb, nb))
+           + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    tol = 1.0e-10
+
+    contraction = controlled_band_orbital_contraction(
+        jnp.asarray(velocity), jnp.asarray(energies),
+        mesh=_mesh(),
+        degeneracy_tolerance_ry=tol)
+    got = np.asarray(band_orbital_moment_mu_b(contraction))
+
+    # The incumbent total-M owner becomes the LOCAL/self-rotation term when
+    # its chemical potential is set to E_n separately on each outer band.
+    expected = np.empty((nk, nb, 3), dtype=np.float64)
+    for k in range(nk):
+        pa, pb = orbital_pieces_at_k(
+            velocity[:, k], energies[k], nb, tol)
+        local = pa - 2.0 * energies[k][None, :, None] * pb
+        expected[k] = (-0.5 * np.imag(local.sum(axis=2))).T
+    np.testing.assert_allclose(got, expected, rtol=3e-13, atol=3e-13)
+
+
+def test_controlled_band_dpsi_vpsi_is_phase_gauge_invariant():
+    from psp.orbital_response import controlled_band_orbital_contraction
+
+    rng = np.random.default_rng(202608263)
+    nk, nb = 2, 6
+    energies = np.stack([
+        np.arange(nb, dtype=np.float64) * 0.43 + 0.02 * k
+        for k in range(nk)
+    ])
+    raw = (rng.normal(size=(3, nk, nb, nb))
+           + 1j * rng.normal(size=(3, nk, nb, nb)))
+    velocity = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    phases = np.exp(1j * rng.uniform(-np.pi, np.pi, size=(nk, nb)))
+    velocity_gauge = np.einsum(
+        "km,akmn,kn->akmn",
+        phases.conj(), velocity, phases, optimize=True)
+
+    kwargs = dict(mesh=_mesh(), degeneracy_tolerance_ry=1.0e-10)
+    reference = np.asarray(controlled_band_orbital_contraction(
+        jnp.asarray(velocity), jnp.asarray(energies), **kwargs))
+    got = np.asarray(controlled_band_orbital_contraction(
+        jnp.asarray(velocity_gauge), jnp.asarray(energies), **kwargs))
+    np.testing.assert_allclose(got, reference, rtol=3e-13, atol=3e-13)
+
+
+def test_controlled_band_dpsi_vpsi_ignores_band_storage_padding():
+    from psp.orbital_response import controlled_band_orbital_contraction
+
+    rng = np.random.default_rng(202608265)
+    nk, nb_logical, nb_storage = 2, 5, 8
+    energies = np.stack([
+        np.arange(nb_logical, dtype=np.float64) * 0.39 + 0.01 * k
+        for k in range(nk)
+    ])
+    raw = (rng.normal(size=(3, nk, nb_storage, nb_storage))
+           + 1j * rng.normal(size=(3, nk, nb_storage, nb_storage)))
+    velocity = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    # A canonical storage pad is not a physical high-energy complement.  Make
+    # its entries enormous so any missing logical-band mask is unmistakable.
+    velocity[:, :, nb_logical:, :] *= 1.0e12
+    velocity[:, :, :, nb_logical:] *= 1.0e12
+    kwargs = dict(mesh=_mesh(), degeneracy_tolerance_ry=1.0e-10)
+    padded = np.asarray(controlled_band_orbital_contraction(
+        jnp.asarray(velocity), jnp.asarray(energies), **kwargs))
+    cropped = np.asarray(controlled_band_orbital_contraction(
+        jnp.asarray(velocity[:, :, :nb_logical, :nb_logical]),
+        jnp.asarray(energies), **kwargs))
+    assert padded.shape == (nk, nb_logical, 3, 3)
+    np.testing.assert_allclose(padded, cropped, rtol=0.0, atol=0.0)
+
+
+def test_controlled_band_dpsi_vpsi_refuses_an_individual_degenerate_band():
+    from psp.orbital_response import controlled_band_orbital_contraction
+
+    energies = np.asarray([[-0.8, -0.2, -0.2, 0.7]], dtype=np.float64)
+    velocity = np.zeros((3, 1, 4, 4), dtype=np.complex128)
+    with pytest.raises(ValueError, match="whole-degenerate-block"):
+        controlled_band_orbital_contraction(
+            jnp.asarray(velocity), jnp.asarray(energies),
+            mesh=_mesh(),
+            degeneracy_tolerance_ry=1.0e-8)
 
 
 def test_s_tensor_uses_k_dependent_occupations_not_band_cut():
