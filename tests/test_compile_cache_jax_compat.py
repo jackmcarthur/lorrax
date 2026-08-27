@@ -131,18 +131,19 @@ def test_invariant_key_patch_is_silent_on_a_supported_jax(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # the lookup hook — forwards without interpreting
 # ---------------------------------------------------------------------------
-def _fake_compilation_cache(n_get_params: int, *, verification: bool):
+def _fake_compilation_cache(n_get_params: int, *, verification: bool,
+                            result=("executable", 1.0)):
     seen = []
 
     if n_get_params == 3:
         def _get(cache_key, compile_options, backend):
             seen.append((cache_key, compile_options, backend))
-            return "executable", 1.0
+            return result
     else:
         def _get(cache_key, compile_options, backend, executable_devices):
             seen.append((cache_key, compile_options, backend,
                          executable_devices))
-            return "executable", 1.0
+            return result
 
     def _in_cache(backend, cache_key):
         return True
@@ -152,6 +153,90 @@ def _fake_compilation_cache(n_get_params: int, *, verification: bool):
     if verification:
         mod.VerificationCache = lambda base: ("verified", base)
     return mod, seen
+
+
+@pytest.mark.parametrize("result,want_hits", [
+    (("executable", 1.0), 1),
+    ((None, None), 0),
+])
+def test_p1_observer_counts_lookups_without_changing_jaxs_answer(
+        monkeypatch, result, want_hits):
+    """The P=1 instrument observes both a hit and its red-twin miss.
+
+    An empty agreed set is deliberate: if the observer accidentally inherits
+    the P>1 veto, neither call reaches JAX and the ``seen`` assertion fails.
+    The returned tuple is asserted verbatim so telemetry cannot become policy.
+    """
+    mod, seen = _fake_compilation_cache(
+        4, verification=True, result=result)
+    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+    monkeypatch.setattr(jcc._STATE, "agreed", frozenset())
+    monkeypatch.setattr(jcc._STATE, "probes", 0)
+    monkeypatch.setattr(jcc._STATE, "hits", 0)
+    monkeypatch.setattr(jcc._STATE, "blocked", 0)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 0.0)
+    monkeypatch.setattr(jcc._STATE, "probe_keys", set())
+
+    jcc._install_observation_patch()
+    got = mod.get_executable_and_time(
+        "p1-key", "opts", "backend", "devices")
+
+    assert got == result
+    assert seen == [("p1-key", "opts", "backend", "devices")]
+    assert jcc._STATE.probes == 1
+    assert jcc._STATE.hits == want_hits
+    assert jcc._STATE.blocked == 0
+    assert jcc._STATE.probe_keys == {"p1-key"}
+
+
+def test_p1_observer_preserves_a_cache_read_exception(monkeypatch):
+    """RED arm: observation must not demote a corrupt read to a miss."""
+    mod, _seen = _fake_compilation_cache(4, verification=True)
+
+    def _raises(*_args):
+        raise OSError("constructed corrupt cache entry")
+
+    mod.get_executable_and_time = _raises
+    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+    monkeypatch.setattr(jcc._STATE, "probes", 0)
+    monkeypatch.setattr(jcc._STATE, "hits", 0)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 0.0)
+    monkeypatch.setattr(jcc._STATE, "probe_keys", set())
+
+    jcc._install_observation_patch()
+    with pytest.raises(OSError, match="constructed corrupt cache entry"):
+        mod.get_executable_and_time(
+            "broken", "opts", "backend", "devices")
+    assert jcc._STATE.probes == 1
+    assert jcc._STATE.hits == 0
+
+
+def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):
+    """The P=1 early return cannot bypass the observation hook again."""
+    calls = []
+    monkeypatch.setattr(jcc, "_COMPILATION_CACHE_READY", False)
+    for name in ("enabled", "dir", "n_proc", "proc_idx"):
+        monkeypatch.setattr(jcc._STATE, name, getattr(jcc._STATE, name))
+    monkeypatch.setattr(jax, "process_count", lambda: 1)
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(jcc, "_install_compile_counter", lambda: None)
+    monkeypatch.setattr(jcc.atexit, "register", lambda _fn: None)
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(jax.config, "update", lambda *_args: None)
+    monkeypatch.setattr(jcc, "_install_atomic_put_patch", lambda: None)
+    monkeypatch.setattr(jcc, "bound_cache_dir", lambda: "")
+    monkeypatch.setattr(
+        jcc, "_install_observation_patch",
+        lambda: calls.append("observation"))
+    monkeypatch.setattr(
+        jcc, "_install_agreement_patch",
+        lambda: pytest.fail("P=1 installed the agreement policy"))
+
+    jcc.ensure_jax_compile_cache()
+
+    assert calls == ["observation"]
+    assert jcc._STATE.n_proc == 1
+    assert jcc._STATE.enabled is True
 
 
 @pytest.mark.parametrize("n_params", [3, 4])
