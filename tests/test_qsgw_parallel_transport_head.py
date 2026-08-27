@@ -254,7 +254,7 @@ def test_static_gauge_second_order_retained_jet_and_weight_hessian(
         jnp.asarray(occupations), omegas,
         mesh=mesh, kgrid=kgrid, bvec_cart=np.eye(3), nb_logical=nb,
         cell_volume=7.0, nk_tot=nk, nspin=1, nspinor=2)
-    assert matmul_widths == [(6, 6)] * 6
+    assert matmul_widths == [(6, 6)] * 8
 
     def covariant_derivative_const(operator, axis):
         h = 1.0 / kgrid[axis]
@@ -291,11 +291,15 @@ def test_static_gauge_second_order_retained_jet_and_weight_hessian(
     np.testing.assert_allclose(
         got.transition_d2_raw, expected_e2, rtol=3e-13, atol=3e-13)
 
-    velocity_hessian = np.asarray([
-        [0.5 * (
-            covariant_derivative_const(velocity[a, 0], b)
-            + covariant_derivative_const(velocity[b, 0], a))
+    ordinary_velocity_derivative = np.asarray([
+        [covariant_derivative_const(velocity[a, 0], b)
+         + 1.0j * (
+             connections[b] @ velocity[a, 0]
+             - velocity[a, 0] @ connections[b])
          for b in range(2)] for a in range(2)])
+    velocity_hessian = 0.5 * (
+        ordinary_velocity_derivative
+        + np.swapaxes(ordinary_velocity_derivative, 0, 1))
     expected_energy_d2 = np.broadcast_to(np.asarray([
         np.real(np.diag(velocity_hessian[a, b])) for a, b in pairs
     ])[:, None, :], (3, nk, nb))
@@ -892,6 +896,20 @@ def test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint()
     )
     assert isinstance(got, StaticGaugeHallTransaction)
     np.testing.assert_allclose(got.sigma_H, expected, rtol=0.0, atol=0.0)
+    ward_limit = static_gauge_hall_transaction(
+        uniform,
+        wfn=wfn,
+        sym=sym,
+        band_start=0,
+        band_stop=logical,
+        mesh=_mesh(),
+        charge_energy_scaled_d1_raw=(
+            jnp.transpose(uniform.gamma_raw, (1, 0, 2, 3))[:2]
+            / HALFALPHA),
+    )
+    np.testing.assert_allclose(
+        ward_limit.sigma_H, got.sigma_H, rtol=0.0, atol=0.0)
+    assert ward_limit.antisymmetry_residual == got.antisymmetry_residual
     assert got.hamiltonian_config_operator_fingerprint == fingerprint
     assert (got.band_start, got.band_stop, got.nk_tot) == (0, logical, nk)
     assert got.producer_id == "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1"

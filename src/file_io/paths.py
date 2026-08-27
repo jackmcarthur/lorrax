@@ -20,6 +20,7 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 	path_keys = [
 		"wfn_file", "centroids_file", "kin_ion_file",
 		"parallel_transport_file", "static_gauge_hall_file",
+		"static_gauge_retained_source_file",
 		"sigma_diag_file", "eqp0_file", "eqp1_file", "report_file",
 	]
 	for key in path_keys:

@@ -260,6 +260,7 @@ _HEAD_VERTEX_WIDTHS = (3, 8)
 _STATIC_GAUGE_HALL_PRODUCER_ID = (
     "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1")
 _STATIC_GAUGE_HALL_TOKEN = object()
+_STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX = 1.0e-8
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,7 @@ class StaticGaugeHallTransaction:
     band_start: int
     band_stop: int
     nk_tot: int
+    antisymmetry_residual: float
     producer_id: str
     _producer_token: object
 
@@ -309,6 +311,11 @@ class StaticGaugeHallTransaction:
         if self.producer_id != _STATIC_GAUGE_HALL_PRODUCER_ID:
             raise ValueError(
                 "StaticGaugeHallTransaction has an unknown producer")
+        if (not np.isfinite(float(self.antisymmetry_residual))
+                or float(self.antisymmetry_residual) < 0.0):
+            raise ValueError(
+                "StaticGaugeHallTransaction has an invalid antisymmetry "
+                "residual")
         if (tuple(self.sigma_H.shape) != (3,)
                 or np.dtype(self.sigma_H.dtype) != np.dtype(np.float64)):
             raise ValueError(
@@ -381,6 +388,9 @@ class ParallelTransportHeadData:
     #: ``file_io.parallel_transport.load_link_singular_values``.
     singular_values: np.ndarray
     coefficient_frame: str
+    derivative_axes: tuple[int, ...]
+    schema_version: int
+    polar_rcond: float
 
 
 @dataclass(frozen=True)
@@ -535,6 +545,7 @@ def load_parallel_transport_head(
     wfn,
     meta,
     expected_coefficient_frame: str | None = None,
+    expected_derivative_axes=(0, 1, 2),
 ) -> ParallelTransportHeadData:
     """Load and validate the preprocessing artifact without mixed ownership.
 
@@ -603,6 +614,8 @@ def load_parallel_transport_head(
             io, path, "wfn_fingerprint_utf8")
         coefficient_frame = _ascii_stamp(
             io, path, "coefficient_frame_utf8")
+        available_axes = tuple(int(axis) for axis in np.asarray(
+            io.read_small("derivative_axes", dtype=np.int32)).reshape(-1))
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -657,6 +670,15 @@ def load_parallel_transport_head(
             )
         if bool(ints["bispinor"]) != expected_bispinor:
             refusals.append("bispinor convention differs from coefficient frame")
+        expected_axes = tuple(int(axis) for axis in expected_derivative_axes)
+        if (not expected_axes or len(set(expected_axes)) != len(expected_axes)
+                or any(axis not in (0, 1, 2) for axis in expected_axes)):
+            refusals.append(
+                f"invalid requested derivative axis coverage {expected_axes}")
+        if any(axis not in available_axes for axis in expected_axes):
+            refusals.append(
+                f"derivative_axes={available_axes} do not cover requested "
+                f"axes {expected_axes}")
         if not np.array_equal(kgrid, expected_kgrid):
             refusals.append(
                 f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
@@ -700,39 +722,61 @@ def load_parallel_transport_head(
                 f"{path}: refusing QSGW parallel-transport head:\n  - "
                 + "\n  - ".join(refusals)
             )
+        validated_axes = tuple(int(axis) for axis in np.asarray(
+            io.read_small(
+                "velocity_validation_derivative_axes",
+                dtype=np.int32)).reshape(-1))
+        if validated_axes != available_axes:
+            raise ValueError(
+                f"{path}: velocity validation covers axes "
+                f"{validated_axes}, not stored link axes {available_axes}")
         validation = {
             key: float(io.read_small(f"velocity_validation_{key}",
                                      dtype=np.float64))
             for key in validation_names
         }
+        polar_rcond = float(io.read_small("polar_rcond", dtype=np.float64))
+        if not np.isfinite(polar_rcond) or polar_rcond <= 0.0:
+            raise ValueError(
+                f"{path}: polar_rcond must be finite and positive; got "
+                f"{polar_rcond}")
 
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
+        n_available_axes = len(available_axes)
         large_shape = (3, int(meta.nk_tot), nb_storage, nb_storage)
         forward_neighbors = np.asarray(io.read_slab(
-            "full_forward_neighbors", shape=(int(meta.nk_tot), 3),
+            "full_forward_neighbors",
+            shape=(int(meta.nk_tot), n_available_axes),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
             io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=nb_storage,
-            nb_logical=expected_nb,
+            nb_logical=expected_nb, derivative_axes=available_axes,
         )
         velocity = io.read_slab(
-            VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
-        )
+            VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec)
         # Small (O(nk*nb) real) host-resident diagnostic, read in the SAME
         # handle as everything above -- one owner, one open, per this
         # loader's own docstring.  Not consulted here; the D3(a) window
         # preflight in ``sc_iteration.load_head_velocity_source`` reads it
         # off the returned object.
-        singular_values = load_link_singular_values(io, nb_logical=expected_nb)
+        singular_values = load_link_singular_values(
+            io, nb_logical=expected_nb, derivative_axes=available_axes)
 
-    expected_prefix = (3, int(meta.nk_tot))
+    if expected_axes != available_axes:
+        selected = tuple(available_axes.index(axis) for axis in expected_axes)
+        links = links[np.asarray(selected, dtype=np.int32)]
+        forward_neighbors = forward_neighbors[:, selected]
+        singular_values = singular_values[:, selected]
+
+    expected_prefix = (len(expected_axes), int(meta.nk_tot))
     if (
         tuple(links.shape[:2]) != expected_prefix
-        or links.shape != velocity.shape
+        or links.shape[0] != len(expected_axes)
+        or links.shape[-2:] != velocity.shape[-2:]
         or links.shape[-2] != links.shape[-1]
         or int(links.shape[-1]) < expected_nb
-        or forward_neighbors.shape != (int(meta.nk_tot), 3)
+        or forward_neighbors.shape != (int(meta.nk_tot), len(expected_axes))
     ):
         raise ValueError(
             f"{path}: large PT dataset shapes are inconsistent: "
@@ -766,6 +810,9 @@ def load_parallel_transport_head(
         validation=validation,
         singular_values=singular_values,
         coefficient_frame=coefficient_frame,
+        derivative_axes=expected_axes,
+        schema_version=int(ints["schema_version"]),
+        polar_rcond=polar_rcond,
     )
 
 
@@ -893,7 +940,13 @@ def _cartesian_fft_multipliers(
     return 2.0 * np.pi * (np.linalg.inv(B) @ _signed_fft_rows(kgrid).T)
 
 
-def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
+def reduced_covector_to_cartesian(
+    covector_reduced,
+    bvec_cart,
+    *,
+    derivative_axes=(0, 1, 2),
+    cartesian_axes=(0, 1, 2),
+):
     """Convert a reduced-k covector using LORRAX's row-vector B convention.
 
     ``k_cart = kappa @ B`` because WFN reciprocal vectors are rows.  Thus
@@ -905,13 +958,34 @@ def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
         raise ValueError(
             f"bvec_cart must be a nonsingular (3,3) matrix, got {B.shape}."
         )
+    axes = tuple(int(axis) for axis in derivative_axes)
+    targets = tuple(int(axis) for axis in cartesian_axes)
+    if (not axes or len(set(axes)) != len(axes)
+            or any(axis not in (0, 1, 2) for axis in axes)):
+        raise ValueError(f"invalid reduced derivative axes {axes}")
+    if (not targets or len(set(targets)) != len(targets)
+            or any(axis not in (0, 1, 2) for axis in targets)):
+        raise ValueError(f"invalid Cartesian output axes {targets}")
     A = jnp.asarray(covector_reduced)
-    if A.ndim < 1 or int(A.shape[0]) != 3:
+    if A.ndim < 1 or int(A.shape[0]) != len(axes):
         raise ValueError(
-            "reduced covector must have a leading Cartesian-component "
-            f"axis of extent 3, got {A.shape}."
+            "reduced covector leading axis must match derivative_axes; "
+            f"got shape {A.shape}, derivative_axes={axes}."
         )
-    return jnp.einsum("ij,j...->i...", np.linalg.inv(B), A, optimize=True)
+    inverse = np.linalg.inv(B)
+    omitted = tuple(axis for axis in (0, 1, 2) if axis not in axes)
+    mixing = inverse[np.ix_(np.asarray(targets), np.asarray(omitted))]
+    tolerance = 256.0 * np.finfo(np.float64).eps * max(
+        1.0, float(np.max(np.abs(inverse))))
+    if omitted and float(np.max(np.abs(mixing))) > tolerance:
+        raise ValueError(
+            "reduced-to-Cartesian conversion cannot omit derivative axes "
+            f"{omitted}: inverse reciprocal-lattice mixing into requested "
+            f"Cartesian axes {targets} is {float(np.max(np.abs(mixing))):.6e} "
+            f"> {tolerance:.6e}")
+    return jnp.einsum(
+        "ij,j...->i...", inverse[np.ix_(targets, axes)], A,
+        optimize=True)
 
 
 def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
@@ -2717,21 +2791,22 @@ def static_gauge_first_order_component_sharded(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    charge_dq_raw=None,
+    hamiltonian_velocity_cart=None,
 ) -> StaticGaugeFirstOrderComponent:
     r"""Build the insulating retained-manifold ``D1*D1`` gauge component.
 
     For band-matrix order ``(bra=m, ket=n)``, Berry connection
     ``A_a=i<u_m|d_a u_n>`` and the repository's bra ``k-q`` orientation,
 
-    ``D_a^0=-i A_a`` and
+    ``D_a^0=-i A_a + Q_{0,a}`` and
     ``D_a^i=-i (A_a Gamma_i) + Q_{i,a}``.
 
     The shared width-eight head kernel consumes
-    ``P_a^I=-Delta_mn D_a^I``, not ``D``.  Its charge column is populated by
-    the exact Ward reduction ``P_a^0=v_a=Gamma_a/(alpha_FS/2)``; the
-    finite-link value ``-Delta D_a^0`` is retained only in the reported
-    closure residual.  This makes the charge-charge block reduce to the
-    incumbent dipole S tensor without inheriting finite-link truncation.
+    ``P_a^I=-Delta_mn D_a^I``, not ``D``.  The normalized lane supplies the
+    analytic isometric charge endpoint ``Q_0`` and applies this rule to all
+    four Lorentz columns.  The default, source-only lane retains the incumbent
+    Ward-reduced charge column for compatibility.
 
     This first bounded lane is insulating.  Its occupation-difference jet is
     exactly zero.  A metallic ``-df/dE`` table is refused because the current
@@ -2756,6 +2831,19 @@ def static_gauge_first_order_component_sharded(
 
     gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
     q1 = jnp.asarray(dgamma_dq_raw, dtype=jnp.complex128)
+    normalized_charge = (
+        charge_dq_raw is not None or hamiltonian_velocity_cart is not None)
+    if normalized_charge and (
+            charge_dq_raw is None or hamiltonian_velocity_cart is None):
+        raise ValueError(
+            "normalized static-gauge charge requires both its endpoint q1 "
+            "and the source-Hamiltonian velocity")
+    charge_q1 = (
+        None if charge_dq_raw is None
+        else jnp.asarray(charge_dq_raw, dtype=jnp.complex128))
+    hamiltonian_velocity = (
+        None if hamiltonian_velocity_cart is None
+        else jnp.asarray(hamiltonian_velocity_cart, dtype=jnp.complex128))
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     occupations = jnp.asarray(occupations_kn, dtype=jnp.float64)
@@ -2772,14 +2860,33 @@ def static_gauge_first_order_component_sharded(
         raise ValueError(
             "dgamma_dq_raw must be (nk,current,transfer,band,band) with "
             f"shape {(nk, 3, 3, storage, storage)}; got {q1.shape}")
-    if links.shape != (3, nk, storage, storage):
+    if normalized_charge:
+        if charge_q1.shape != (nk, 3, storage, storage):
+            raise ValueError(
+                "charge_dq_raw must be (nk,transfer,band,band); got "
+                f"{charge_q1.shape}")
+        if hamiltonian_velocity.shape != (3, nk, storage, storage):
+            raise ValueError(
+                "hamiltonian_velocity_cart must be (3,nk,band,band); got "
+                f"{hamiltonian_velocity.shape}")
+    derivative_axes = (0, 1)
+    if links.shape not in (
+            (2, nk, storage, storage), (3, nk, storage, storage)):
         raise ValueError(
             "forward_links must share the uniform-gauge band manifold; "
-            f"expected {(3, nk, storage, storage)}, got {links.shape}")
-    if np.shape(forward_neighbors) != (nk, 3):
+            "expected in-plane or default xyz coverage "
+            f"{(2, nk, storage, storage)}|{(3, nk, storage, storage)}, got "
+            f"{links.shape}")
+    if np.shape(forward_neighbors) not in ((nk, 2), (nk, 3)):
         raise ValueError(
-            f"forward_neighbors must be {(nk, 3)}; got "
+            f"forward_neighbors must cover xy or xyz; got "
             f"{np.shape(forward_neighbors)}")
+    if int(links.shape[0]) != int(np.shape(forward_neighbors)[1]):
+        raise ValueError("forward link and neighbor axis coverage differs")
+    # The static slab jet is explicitly in-plane.  A default xyz artifact is
+    # accepted for compatibility but its unused z row is not differentiated.
+    links = links[:2]
+    forward_neighbors = np.asarray(forward_neighbors)[:, :2]
     if int(np.prod(grid)) != nk:
         raise ValueError(f"kgrid product {int(np.prod(grid))} != nk_tot {nk}")
     short_in_plane = tuple(
@@ -2816,9 +2923,11 @@ def static_gauge_first_order_component_sharded(
         np.asarray(forward_neighbors, dtype=np.int64),
         spacing,
         band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+        derivative_axes=derivative_axes,
     )
     connection_cart = reduced_covector_to_cartesian(
-        connection_reduced, bvec_cart)[:2]
+        connection_reduced, bvec_cart,
+        derivative_axes=derivative_axes, cartesian_axes=(0, 1))
 
     # One batched distributed product for all (a,i), not six new kernels.
     gamma_dir = jnp.moveaxis(gamma, 1, 0)
@@ -2835,12 +2944,26 @@ def static_gauge_first_order_component_sharded(
 
     delta = energies[:, :, None] - energies[:, None, :]
     velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
-    p_charge = velocity[:2]
-    p_current = -delta[None, None] * d_current
-    p = jnp.concatenate((p_charge[:, None], p_current), axis=1)
-
     d_charge_state = -1.0j * connection_cart
     p_charge_state = -delta[None] * d_charge_state
+    if normalized_charge:
+        q_charge = jnp.moveaxis(charge_q1, 1, 0)[:2]
+        d_charge = d_charge_state + q_charge
+        d_all = jnp.concatenate((d_charge[:, None], d_current), axis=1)
+        p = -delta[None, None] * d_all
+        p_charge = p[:, 0]
+        # This is the physical alpha-current comparison, not the
+        # source-Hamiltonian endpoint identity.  Under the K-dependent
+        # isometry the latter is P_charge=v_source-DeltaE*Q_charge; comparing
+        # P directly with v_source would mislabel the endpoint correction as
+        # a Ward failure.  Gamma/HALFALPHA is the distinct finite-body current
+        # whose mismatch this diagnostic is intended to expose.
+        closure_reference = velocity[:2]
+    else:
+        p_charge = velocity[:2]
+        p_current = -delta[None, None] * d_current
+        p = jnp.concatenate((p_charge[:, None], p_current), axis=1)
+        closure_reference = p_charge_state
     f_diff = occupations[:, None, :] - occupations[:, :, None]
     band = jnp.arange(storage)
     transition = (
@@ -2850,7 +2973,7 @@ def static_gauge_first_order_component_sharded(
         & (band[None, :] < logical)
     )
     charge_error = jnp.max(jnp.where(
-        transition[None], jnp.abs(p_charge_state - p_charge), 0.0))
+        transition[None], jnp.abs(p_charge - closure_reference), 0.0))
     charge_scale = jnp.max(jnp.where(
         transition[None], jnp.abs(p_charge), 0.0))
     charge_ward_residual = jnp.where(
@@ -2874,8 +2997,10 @@ def static_gauge_first_order_component_sharded(
         s_flat.reshape(int(s_flat.shape[0]), 2, 4, 2, 4),
         (0, 1, 3, 2, 4),
     )
+    energy_velocity = (
+        hamiltonian_velocity if normalized_charge else velocity)
     bra_energy_dq = -jnp.real(jnp.diagonal(
-        velocity[:2], axis1=-2, axis2=-1))
+        energy_velocity[:2], axis1=-2, axis2=-1))
     return StaticGaugeFirstOrderComponent(
         energy_scaled_d1_raw=p,
         S_first_first=s_first_first,
@@ -2907,6 +3032,9 @@ def static_gauge_second_order_component_sharded(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    charge_dq_raw=None,
+    charge_dq2_raw=None,
+    hamiltonian_velocity_cart=None,
 ) -> StaticGaugeSecondOrderComponent:
     r"""Build the insulating retained-manifold bubble through second q order.
 
@@ -2929,9 +3057,9 @@ def static_gauge_second_order_component_sharded(
     The response is analytic AD of the exact incumbent head-weight kernel.
     This preserves its transition mask, prefactor, frequency blocking,
     two-axis band tiling, and sole psum implementation.  Only ``(xx,xy,yy)``
-    is streamed.  Exact charge ``P=v`` from the first-order Ward reduction is
-    retained in the first jet; the finite-link ``T_ab`` remains the explicit
-    retained-manifold second charge jet.
+    is streamed.  The normalized lane retains the explicit isometric charge
+    endpoint jet; it never substitutes the inequivalent Dirac current or
+    source-QE velocity for that charge derivative.
 
     This API is insulating and bubble-only.  It neither consumes metallic
     surface weights nor supplies complement-space, contact, body, or FULL
@@ -2952,6 +3080,22 @@ def static_gauge_second_order_component_sharded(
     gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
     q1 = jnp.asarray(dgamma_dq_raw, dtype=jnp.complex128)
     q2 = jnp.asarray(d2gamma_dq2_raw, dtype=jnp.complex128)
+    normalized_charge = any(value is not None for value in (
+        charge_dq_raw, charge_dq2_raw, hamiltonian_velocity_cart))
+    if normalized_charge and any(value is None for value in (
+            charge_dq_raw, charge_dq2_raw, hamiltonian_velocity_cart)):
+        raise ValueError(
+            "normalized static-gauge charge requires q1, q2, and the "
+            "source-Hamiltonian velocity together")
+    charge_q1 = (
+        None if charge_dq_raw is None
+        else jnp.asarray(charge_dq_raw, dtype=jnp.complex128))
+    charge_q2 = (
+        None if charge_dq2_raw is None
+        else jnp.asarray(charge_dq2_raw, dtype=jnp.complex128))
+    hamiltonian_velocity = (
+        None if hamiltonian_velocity_cart is None
+        else jnp.asarray(hamiltonian_velocity_cart, dtype=jnp.complex128))
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     occupations = jnp.asarray(occupations_kn, dtype=jnp.float64)
@@ -2970,9 +3114,46 @@ def static_gauge_second_order_component_sharded(
             "(nk,current,transfer,transfer,band,band) with shape "
             f"{expected_q2}; got {q2.shape}")
 
+    if normalized_charge:
+        if charge_q1.shape != (nk, 3, storage, storage):
+            raise ValueError(
+                "charge_dq_raw must be (nk,transfer,band,band); got "
+                f"{charge_q1.shape}")
+        if charge_q2.shape != (nk, 3, 3, storage, storage):
+            raise ValueError(
+                "charge_dq2_raw must be (nk,transfer,transfer,band,band); "
+                f"got {charge_q2.shape}")
+        if hamiltonian_velocity.shape != (3, nk, storage, storage):
+            raise ValueError(
+                "hamiltonian_velocity_cart must be (3,nk,band,band); got "
+                f"{hamiltonian_velocity.shape}")
+
+    if links.shape not in (
+            (2, nk, storage, storage), (3, nk, storage, storage)):
+        raise ValueError(
+            "second-order forward links must cover xy or xyz; got "
+            f"{links.shape}")
+    if np.shape(forward_neighbors) not in ((nk, 2), (nk, 3)):
+        raise ValueError(
+            "second-order forward neighbors must cover xy or xyz; got "
+            f"{np.shape(forward_neighbors)}")
+    if int(links.shape[0]) != int(np.shape(forward_neighbors)[1]):
+        raise ValueError("second-order link/neighbor axis coverage differs")
+    links = links[:2]
+    forward_neighbors = np.asarray(forward_neighbors)[:, :2]
+
     q2_cart = jnp.transpose(q2, (2, 3, 1, 0, 4, 5))[:2, :2]
-    q2_asymmetry = jnp.max(jnp.abs(q2_cart - jnp.swapaxes(q2_cart, 0, 1)))
-    q2_scale = jnp.max(jnp.abs(q2_cart))
+    if normalized_charge:
+        charge_q2_cart = jnp.transpose(
+            charge_q2, (1, 2, 0, 3, 4))[:2, :2]
+        q2_all_cart = jnp.concatenate(
+            (charge_q2_cart[:, :, None], q2_cart), axis=2)
+    else:
+        charge_q2_cart = None
+        q2_all_cart = q2_cart
+    q2_asymmetry = jnp.max(jnp.abs(
+        q2_all_cart - jnp.swapaxes(q2_all_cart, 0, 1)))
+    q2_scale = jnp.max(jnp.abs(q2_all_cart))
     q2_symmetry_residual = jnp.where(
         q2_scale > 0.0, q2_asymmetry / q2_scale, 0.0)
     q2_error_host, q2_scale_host = (
@@ -3003,6 +3184,8 @@ def static_gauge_second_order_component_sharded(
         nspin=int(nspin),
         nspinor=int(nspinor),
         eta_ry=float(eta_ry),
+        charge_dq_raw=charge_q1,
+        hamiltonian_velocity_cart=hamiltonian_velocity,
     )
 
     if int(energies.shape[1]) == logical:
@@ -3046,9 +3229,11 @@ def static_gauge_second_order_component_sharded(
                 plus,
                 spacing,
                 band_matmul=multiply_one,
+                derivative_axes=(0, 1),
             )
             rows.append(reduced_covector_to_cartesian(
-                reduced, bvec_cart)[:2])
+                reduced, bvec_cart,
+                derivative_axes=(0, 1), cartesian_axes=(0, 1)))
         return jnp.stack(rows, axis=0)
 
     connection = first.retained_connection_cart
@@ -3073,37 +3258,86 @@ def static_gauge_second_order_component_sharded(
     q_current = jnp.transpose(q1, (2, 1, 0, 3, 4))[:2]
     pair_axes = ((0, 0), (0, 1), (1, 1))
     t_pair = jnp.stack(tuple(retained_t[a, b] for a, b in pair_axes))
+    identity = jnp.broadcast_to(
+        jnp.eye(storage, dtype=jnp.complex128)[None],
+        (nk, storage, storage),
+    )
+    m0 = jnp.concatenate((identity[None], gamma_dir), axis=0)
 
-    # One existing distributed-matmul family owns every T*Gamma and A*Q
-    # product.  Stream one retained pair at a time: the first block holds
-    # [T_ab*Gamma_i, A_a*Q_i,b], the diagonal reuses its A*Q half, and only
-    # xy needs a second (three-valid, six-wide padded) A_b*Q_i,a block.
-    # No 21-component band-square input or product carrier is materialized.
-    current_d2_rows = []
-    for p, (a, b) in enumerate(pair_axes):
-        primary_left = jnp.concatenate((
-            jnp.broadcast_to(
-                t_pair[p][None], (3, nk, storage, storage)),
-            jnp.broadcast_to(
-                connection[a][None], (3, nk, storage, storage)),
-        ), axis=0)
-        primary_right = jnp.concatenate((gamma_dir, q_current[b]), axis=0)
-        primary = _multiply_in_six(primary_left, primary_right)
-        current = primary[:3] - 1.0j * primary[3:]
-        if a == b:
-            current = current - 1.0j * primary[3:]
-        else:
-            secondary_left = jnp.broadcast_to(
-                connection[b][None], (3, nk, storage, storage))
-            secondary = _multiply_in_six(
-                secondary_left, q_current[a])
-            current = current - 1.0j * secondary
-        current_d2_rows.append(current + q2_cart[a, b])
-    current_d2 = jnp.stack(current_d2_rows)
-    transition_d2 = jnp.concatenate((t_pair[:, None], current_d2), axis=1)
+    if normalized_charge:
+        q_charge = jnp.moveaxis(charge_q1, 1, 0)[:2]
+        q_all = jnp.concatenate((q_charge[:, None], q_current), axis=1)
+        transition_d2_rows = []
+        for p, (a, b) in enumerate(pair_axes):
+            t_m0 = _multiply_in_six(
+                jnp.broadcast_to(
+                    t_pair[p][None], (4, nk, storage, storage)),
+                m0)
+            a_qb = _multiply_in_six(
+                jnp.broadcast_to(
+                    connection[a][None], (4, nk, storage, storage)),
+                q_all[b])
+            if a == b:
+                b_qa = a_qb
+            else:
+                b_qa = _multiply_in_six(
+                    jnp.broadcast_to(
+                        connection[b][None], (4, nk, storage, storage)),
+                    q_all[a])
+            transition_d2_rows.append(
+                t_m0 - 1.0j * (a_qb + b_qa)
+                + q2_all_cart[a, b])
+        transition_d2 = jnp.stack(transition_d2_rows)
+    else:
+        # Default/source-only compatibility: the historical charge second
+        # jet is T_ab and the three current columns use their explicit Q/Q2.
+        current_d2_rows = []
+        for p, (a, b) in enumerate(pair_axes):
+            primary_left = jnp.concatenate((
+                jnp.broadcast_to(
+                    t_pair[p][None], (3, nk, storage, storage)),
+                jnp.broadcast_to(
+                    connection[a][None], (3, nk, storage, storage)),
+            ), axis=0)
+            primary_right = jnp.concatenate(
+                (gamma_dir, q_current[b]), axis=0)
+            primary = _multiply_in_six(primary_left, primary_right)
+            current = primary[:3] - 1.0j * primary[3:]
+            if a == b:
+                current = current - 1.0j * primary[3:]
+            else:
+                secondary_left = jnp.broadcast_to(
+                    connection[b][None], (3, nk, storage, storage))
+                secondary = _multiply_in_six(
+                    secondary_left, q_current[a])
+                current = current - 1.0j * secondary
+            current_d2_rows.append(current + q2_cart[a, b])
+        current_d2 = jnp.stack(current_d2_rows)
+        transition_d2 = jnp.concatenate(
+            (t_pair[:, None], current_d2), axis=1)
 
-    velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
-    velocity_derivative = _cartesian_covariant_derivatives(velocity[:2])
+    energy_velocity = (
+        hamiltonian_velocity if normalized_charge
+        else gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64))
+    velocity_xy = energy_velocity[:2]
+    velocity_derivative = _cartesian_covariant_derivatives(velocity_xy)
+    # C_b(v_a)=d_b v_a-i[A_b,v_a].  The bra-energy Hessian requires the
+    # ordinary derivative d_b E_{n,a}, so restore +i[A_b,v_a] before taking
+    # the diagonal.  Omitting this commutator gives <H_ab> instead and fails
+    # even a rotating two-level Hamiltonian with constant eigenvalues.
+    connection_b = jnp.broadcast_to(
+        connection[None], (2, 2, nk, storage, storage))
+    velocity_a = jnp.broadcast_to(
+        velocity_xy[:, None], (2, 2, nk, storage, storage))
+    a_v = _multiply_in_six(
+        connection_b.reshape(4, nk, storage, storage),
+        velocity_a.reshape(4, nk, storage, storage),
+    ).reshape(2, 2, nk, storage, storage)
+    v_a = _multiply_in_six(
+        velocity_a.reshape(4, nk, storage, storage),
+        connection_b.reshape(4, nk, storage, storage),
+    ).reshape(2, 2, nk, storage, storage)
+    velocity_derivative = velocity_derivative + 1.0j * (a_v - v_a)
     velocity_hessian = 0.5 * (
         velocity_derivative + jnp.swapaxes(velocity_derivative, 0, 1))
     energy_d2 = jnp.stack(tuple(jnp.real(jnp.diagonal(
@@ -3119,12 +3353,6 @@ def static_gauge_second_order_component_sharded(
         )[None, None],
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
-    identity = jnp.broadcast_to(
-        jnp.eye(storage, dtype=jnp.complex128)[None],
-        (nk, storage, storage),
-    )
-    m0 = jnp.concatenate((identity[None], gamma_dir), axis=0)
-
     prefactor = jnp.asarray(
         4.0
         / (
@@ -3181,21 +3409,24 @@ def static_gauge_second_order_component_sharded(
     )
 
 
-def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    """Distributed occupied-state Berry-overlap contraction.
+def _hall_transition_tensor_kernel(
+    mesh: Mesh, *, nb_logical: int,
+) -> Callable:
+    """Distributed occupied-state Hall transition-tensor contraction.
 
-    This is the band-tiled form of ``orbital_magnetization.cB``.  It returns
-    the axial cross product before physical prefactors; no band matrix is
-    gathered and only the three-component reduction is replicated.
+    The five-component vertex carrier is ``(left_x,left_y,Gamma_x,y,z)``.
+    It returns ``sum f_n left_a[nm] conj(Gamma_i[nm])/Delta_nm**2``
+    before physical prefactors.  No band matrix is gathered and only the
+    2x3 transition tensor is replicated.
     """
-    key = ("static_gauge_raw_hall", id(mesh), int(nb_logical))
+    key = ("static_gauge_hall_transition", id(mesh), int(nb_logical))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(gamma_local, e_bra, e_ket, f_bra, f_ket, deps_tol):
-        nx, ny = gamma_local.shape[-2:]
+    def _local(vertices_local, e_bra, e_ket, f_bra, f_ket, deps_tol):
+        nx, ny = vertices_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
         logical = (
@@ -3204,23 +3435,18 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         )[None, :, :]
         dE = e_bra[:, :, None] - e_ket[:, None, :]
         separated = jnp.abs(dE) > deps_tol
-        inv_dE2 = jnp.where(
+        denominator = jnp.where(
+            separated, dE, jnp.asarray(1.0, dtype=dE.dtype))
+        inverse = jnp.where(
             logical & separated,
-            1.0 / jnp.square(jnp.where(separated, dE, 1.0)),
+            1.0 / jnp.square(denominator),
             0.0,
         )
-        weight = f_bra[:, :, None] * inv_dE2
-
-        gx, gy, gz = gamma_local
-        # Hermiticity gives Gamma_b[m,n] = conj(Gamma_b[n,m]), avoiding a
-        # transpose/all-to-all of the band tile.  This is exactly the axial
-        # product used by psp.orbital_magnetization.orbital_pieces_at_k.
-        cross = jnp.stack((
-            gy * jnp.conj(gz) - gz * jnp.conj(gy),
-            gz * jnp.conj(gx) - gx * jnp.conj(gz),
-            gx * jnp.conj(gy) - gy * jnp.conj(gx),
-        ))
-        cB_raw = jnp.einsum("akij,kij->a", cross, weight, optimize=True)
+        weight = f_bra[:, :, None] * inverse
+        left, gamma = vertices_local[:2], vertices_local[2:]
+        transition = jnp.einsum(
+            "akij,ckij,kij->ac", left, jnp.conj(gamma), weight,
+            optimize=True)
 
         # A degeneracy joining differently occupied states invalidates the
         # ordinary insulating SOS expression; report one small flag rather
@@ -3230,7 +3456,7 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             & (~separated)
             & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
         return (
-            jax.lax.psum(cB_raw, (ax_x, ax_y)),
+            jax.lax.psum(transition, (ax_x, ax_y)),
             jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
         )
 
@@ -3251,6 +3477,126 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     kernel = jax.jit(sm)
     _KERNEL_CACHE[key] = kernel
     return kernel
+
+
+def _hall_pseudovector_sharded(
+    gamma_raw,
+    energies_kn_ry,
+    occupations_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor_wfn: int,
+    charge_energy_scaled_d1_raw=None,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+) -> tuple[jax.Array, float]:
+    r"""Derive raw or normalized Hall from one transition-tensor owner.
+
+    With no explicit normalized charge jet, the incumbent raw formula passes
+    ``left=Gamma[:2]/HALFALPHA``.  The normalized lane passes its authentic
+    ``P_charge=-Delta*D_charge``.  Both then use the exact incumbent
+    denominator/mask and common prefactor ``-2*C/(Omega*Nk)``.  In the raw
+    Ward limit ``P_charge=Gamma/HALFALPHA`` they are bitwise the same input.
+
+    The 2x3 tensor must itself be antisymmetric; projection to the three Hall
+    components is refused if symmetric or diagonal contamination exceeds the
+    fixed residual budget.
+    """
+    from common.bispinor_init import HALFALPHA
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    normalized = charge_energy_scaled_d1_raw is not None
+    left = (jnp.asarray(
+        charge_energy_scaled_d1_raw, dtype=jnp.complex128)
+        if normalized else
+        jnp.transpose(gamma, (1, 0, 2, 3))[:2]
+        / jnp.asarray(HALFALPHA, dtype=jnp.float64))
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    if gamma.ndim != 4 or gamma.shape[1] != 3:
+        raise ValueError(
+            "gamma_raw must be (nk,3,nb,nb) from "
+            f"sweep_uniform_gauge_matrix_elements; got {gamma.shape}")
+    if gamma.shape[2] != gamma.shape[3]:
+        raise ValueError("gamma_raw band matrices must be square")
+    expected_left = (2, int(gamma.shape[0]), int(gamma.shape[2]),
+                     int(gamma.shape[3]))
+    if left.shape != expected_left:
+        raise ValueError(
+            "normalized charge energy-scaled d1 must be in-plane "
+            f"{expected_left}; got {left.shape}")
+    if e.shape != f.shape or tuple(e.shape) not in (
+            (int(gamma.shape[0]), int(nb_logical)),
+            (int(gamma.shape[0]), int(gamma.shape[2]))):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            "the logical or stored band extent of gamma_raw "
+            f"{gamma.shape} (nb_logical={int(nb_logical)})")
+    if not (0 < int(nb_logical) <= int(gamma.shape[2])):
+        raise ValueError(
+            f"need 0 < nb_logical <= stored nb={gamma.shape[2]}; "
+            f"got {nb_logical}")
+    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
+        raise ValueError("cell_volume must be positive")
+    if int(nk_tot) <= 0 or int(nspin) <= 0 or int(nspinor_wfn) <= 0:
+        raise ValueError("nk_tot, nspin, and nspinor_wfn must be positive")
+    if int(gamma.shape[0]) != int(nk_tot):
+        raise ValueError(
+            "Hall requires one vertex row per full-BZ k point: "
+            f"gamma_raw nk={int(gamma.shape[0])}, nk_tot={int(nk_tot)}. "
+            "IBZ/subset rows must be unfolded through the symmetry service "
+            "before the 1/Nk normalization is applied")
+    if float(degeneracy_tolerance_ry) <= 0.0:
+        raise ValueError("degeneracy_tolerance_ry must be positive")
+
+    if int(e.shape[1]) != int(gamma.shape[2]):
+        from runtime.padding import pad_axis
+        e = pad_axis(e, int(gamma.shape[2]), axis=1).array
+        f = pad_axis(f, int(gamma.shape[2]), axis=1).array
+
+    gamma_dir = jnp.transpose(gamma, (1, 0, 2, 3))
+    vertices = jnp.concatenate((left, gamma_dir), axis=0)
+    vertices, e, f, _ = _pad_head_band_manifold(
+        vertices, e, f, jnp.zeros_like(e), mesh=mesh)
+    transition, unsafe = _hall_transition_tensor_kernel(
+        mesh, nb_logical=int(nb_logical))(
+            vertices, e, e, f, f,
+            jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64))
+    if int(np.asarray(unsafe)):
+        raise ValueError(
+            "GATE static_gauge_hall_degenerate: differently occupied states "
+            "are degenerate within degeneracy_tolerance_ry; the insulating "
+            "occupied-state Hall SOS formula is undefined")
+    capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
+    prefactor = -2.0 * capacity / (
+        float(cell_volume) * float(nk_tot))
+    tensor = jnp.asarray(prefactor * jnp.imag(transition), dtype=jnp.float64)
+    sigma = jnp.stack((
+        tensor[1, 2],
+        -tensor[0, 2],
+        0.5 * (tensor[0, 1] - tensor[1, 0]),
+    ))
+    projected = jnp.stack((
+        jnp.stack((0.0 * sigma[0], sigma[2], -sigma[1])),
+        jnp.stack((-sigma[2], 0.0 * sigma[0], sigma[0])),
+    ))
+    scale = jnp.max(jnp.abs(tensor))
+    residual_array = jnp.where(
+        scale > 0.0,
+        jnp.max(jnp.abs(tensor - projected)) / scale,
+        jnp.asarray(0.0, dtype=jnp.float64))
+    residual = float(np.asarray(jax.device_get(residual_array)))
+    if (not np.isfinite(residual)
+            or residual > _STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX):
+        raise ValueError(
+            "GATE static_gauge_hall_antisymmetry: normalized/raw transition "
+            "tensor contains symmetric or diagonal contamination; "
+            f"residual={residual:.6e}, limit="
+            f"{_STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX:.6e}")
+    return sigma, residual
 
 
 def raw_hall_pseudovector_sharded(
@@ -3285,75 +3631,13 @@ def raw_hall_pseudovector_sharded(
     documented occupied-Berry/Hall sign; ``static_hall_linear_response``
     later inserts the independent ``+i epsilon[b,a,i]`` CT convention.
     """
-    from common.bispinor_init import HALFALPHA
-
-    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
-    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
-    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
-    if gamma.ndim != 4 or gamma.shape[1] != 3:
-        raise ValueError(
-            "gamma_raw must be (nk,3,nb,nb) from "
-            f"sweep_uniform_gauge_matrix_elements; got {gamma.shape}")
-    if gamma.shape[2] != gamma.shape[3]:
-        raise ValueError("gamma_raw band matrices must be square")
-    if e.shape != f.shape or tuple(e.shape) not in (
-            (int(gamma.shape[0]), int(nb_logical)),
-            (int(gamma.shape[0]), int(gamma.shape[2]))):
-        raise ValueError(
-            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
-            "the logical or stored band extent of gamma_raw "
-            f"{gamma.shape} (nb_logical={int(nb_logical)})")
-    if not (0 < int(nb_logical) <= int(gamma.shape[2])):
-        raise ValueError(
-            f"need 0 < nb_logical <= stored nb={gamma.shape[2]}; "
-            f"got {nb_logical}")
-    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
-        raise ValueError("cell_volume must be positive")
-    if int(nk_tot) <= 0 or int(nspin) <= 0 or int(nspinor_wfn) <= 0:
-        raise ValueError("nk_tot, nspin, and nspinor_wfn must be positive")
-    if int(gamma.shape[0]) != int(nk_tot):
-        raise ValueError(
-            "raw Hall requires one Gamma_raw row per full-BZ k point: "
-            f"gamma_raw nk={int(gamma.shape[0])}, nk_tot={int(nk_tot)}. "
-            "IBZ/subset rows must be unfolded through the symmetry service "
-            "before the 1/Nk normalization is applied")
-    if float(degeneracy_tolerance_ry) <= 0.0:
-        raise ValueError("degeneracy_tolerance_ry must be positive")
-
-    # ``sweep_uniform_gauge_matrix_elements`` stores both band axes at the
-    # mesh-divisible carrier extent, while WFN energies/occupations are the
-    # logical file manifold.  Use the repository padding owner rather than
-    # forcing a producer to manufacture padded electronic states.  The
-    # kernel's explicit ``nb_logical`` mask makes these storage rows inert.
-    if int(e.shape[1]) != int(gamma.shape[2]):
-        from runtime.padding import pad_axis
-        e = pad_axis(e, int(gamma.shape[2]), axis=1).array
-        f = pad_axis(f, int(gamma.shape[2]), axis=1).array
-
-    # Reuse the incumbent head manifold's one padding/sharding owner.  The
-    # transpose is a view putting the replicated component axis first.
-    vertex = jnp.transpose(gamma, (1, 0, 2, 3))
-    vertex, e, f, _ = _pad_head_band_manifold(
-        vertex, e, f, jnp.zeros_like(e), mesh=mesh)
-    cB_raw, unsafe = _raw_hall_kernel(
-        mesh, nb_logical=int(nb_logical))(
-            vertex,
-            e,
-            e,
-            f,
-            f,
-            jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64),
-        )
-    if int(np.asarray(unsafe)):
-        raise ValueError(
-            "GATE static_gauge_raw_hall_degenerate: differently occupied "
-            "states are degenerate within degeneracy_tolerance_ry; the "
-            "insulating occupied-state Berry SOS formula is undefined")
-    capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
-    prefactor = -capacity / (
-        float(cell_volume) * float(nk_tot) * float(HALFALPHA))
-    return jnp.asarray(
-        prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
+    sigma, _residual = _hall_pseudovector_sharded(
+        gamma_raw, energies_kn_ry, occupations_kn,
+        mesh=mesh, nb_logical=int(nb_logical),
+        cell_volume=float(cell_volume), nk_tot=int(nk_tot),
+        nspin=int(nspin), nspinor_wfn=int(nspinor_wfn),
+        degeneracy_tolerance_ry=float(degeneracy_tolerance_ry))
+    return sigma
 
 
 def static_gauge_full_bz_state_tables(
@@ -3408,13 +3692,18 @@ def static_gauge_hall_transaction(
     band_start: int,
     band_stop: int,
     mesh: Mesh,
+    charge_energy_scaled_d1_raw=None,
     degeneracy_tolerance_ry: float = 1.0e-10,
 ) -> StaticGaugeHallTransaction:
     r"""Produce the artifact-ready Hall term from one canonical transaction.
 
     ``uniform_gauge`` must be the result of
     :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements`.  Hall
-    production consumes its current block.  Exact contact and optional
+    production consumes its current block.  The normalized retained producer
+    additionally supplies its explicit ``P_charge=-DeltaE*D_charge`` from the
+    same endpoint transaction; the raw lane defaults to
+    ``Gamma[:2]/HALFALPHA`` and therefore retains exact incumbent parity.
+    Exact contact and optional
     transfer-q1/q2 fields are validated when present, but they are not
     materialized merely to reduce Hall: on a realistic band manifold that
     would make a three-number reduction retain many unrelated band matrices.
@@ -3497,7 +3786,7 @@ def static_gauge_hall_transaction(
 
     energies_full, occupations_full = static_gauge_full_bz_state_tables(
         wfn=wfn, sym=sym, band_start=start, band_stop=stop)
-    sigma_H = raw_hall_pseudovector_sharded(
+    sigma_H, hall_residual = _hall_pseudovector_sharded(
         gamma,
         energies_full,
         occupations_full,
@@ -3507,6 +3796,7 @@ def static_gauge_hall_transaction(
         nk_tot=nk_tot,
         nspin=int(wfn.nspin),
         nspinor_wfn=int(wfn.nspinor),
+        charge_energy_scaled_d1_raw=charge_energy_scaled_d1_raw,
         degeneracy_tolerance_ry=float(degeneracy_tolerance_ry),
     )
     return StaticGaugeHallTransaction(
@@ -3516,6 +3806,7 @@ def static_gauge_hall_transaction(
         band_start=start,
         band_stop=stop,
         nk_tot=nk_tot,
+        antisymmetry_residual=hall_residual,
         producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
         _producer_token=_STATIC_GAUGE_HALL_TOKEN,
     )
@@ -3524,6 +3815,7 @@ def static_gauge_hall_transaction(
 def _static_gauge_hall_transaction_from_artifact(
     *, sigma_H, hamiltonian_config_operator_fingerprint: str,
     wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
+    antisymmetry_residual: float,
     mesh: Mesh,
 ) -> StaticGaugeHallTransaction:
     """Place a loader-validated Hall vector on the run mesh."""
@@ -3538,6 +3830,7 @@ def _static_gauge_hall_transaction_from_artifact(
         band_start=int(band_start),
         band_stop=int(band_stop),
         nk_tot=int(nk_tot),
+        antisymmetry_residual=float(antisymmetry_residual),
         producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
         _producer_token=_STATIC_GAUGE_HALL_TOKEN,
     )

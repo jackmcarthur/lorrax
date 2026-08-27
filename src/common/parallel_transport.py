@@ -341,15 +341,16 @@ def build_forward_neighbor_table(
 
 
 def inverse_neighbor_table(forward: np.ndarray) -> np.ndarray:
-    """Invert a ``(nk, 3)`` forward-neighbour permutation table."""
+    """Invert an ``(nk, n_axes)`` forward-neighbour permutation table."""
     plus = np.asarray(forward, dtype=np.int64)
-    if plus.ndim != 2 or plus.shape[1] != 3:
+    if plus.ndim != 2 or plus.shape[1] < 1:
         raise ValueError(
-            f"forward neighbour table must be (nk, 3); got {plus.shape}")
+            "forward neighbour table must be (nk, n_axes) with at least "
+            f"one derivative axis; got {plus.shape}")
     nk = plus.shape[0]
     minus = np.empty_like(plus, dtype=np.int32)
     want = np.arange(nk, dtype=np.int64)
-    for idir in range(3):
+    for idir in range(int(plus.shape[1])):
         col = plus[:, idir]
         if np.any(col < 0) or np.any(col >= nk) \
                 or not np.array_equal(np.sort(col), want):
@@ -564,10 +565,11 @@ def fourth_order_connection(
     reduced_spacing: Sequence[float],
     *,
     band_matmul,
+    derivative_axes: Sequence[int] | None = None,
 ) -> jax.Array:
     """Construct the Hermitian fourth-order reduced-coordinate connection.
 
-    ``forward_links`` is ``(3, nk, nb, nb)`` and may be tiled
+    ``forward_links`` is ``(n_axes, nk, nb, nb)`` and may be tiled
     ``P(None,None,'x','y')``. The result has the same shape and is
     value-level fourth-order finite-difference parity, not bit parity with a
     continuum derivative.
@@ -575,20 +577,29 @@ def fourth_order_connection(
     links = jnp.asarray(forward_links)
     plus = np.asarray(forward_neighbors, dtype=np.int32)
     spacing = np.asarray(reduced_spacing, dtype=np.float64)
-    if links.ndim != 4 or links.shape[0] != 3 \
+    if links.ndim != 4 or int(links.shape[0]) < 1 \
             or links.shape[-2] != links.shape[-1]:
         raise ValueError(
-            "forward_links must be (3, nk, nb, nb); "
+            "forward_links must be (n_axes, nk, nb, nb); "
             f"got {tuple(links.shape)}")
-    if plus.shape != (links.shape[1], 3):
+    n_axes = int(links.shape[0])
+    axes = tuple(range(3)) if derivative_axes is None else tuple(
+        int(axis) for axis in derivative_axes)
+    if (len(axes) != n_axes or len(set(axes)) != n_axes
+            or any(axis not in (0, 1, 2) for axis in axes)):
         raise ValueError(
-            f"forward_neighbors must be ({links.shape[1]}, 3); got {plus.shape}")
+            f"derivative_axes={axes} does not identify {n_axes} distinct "
+            "Cartesian mesh axes")
+    if plus.shape != (links.shape[1], n_axes):
+        raise ValueError(
+            f"forward_neighbors must be ({links.shape[1]}, {n_axes}); "
+            f"got {plus.shape}")
     if spacing.shape != (3,) or np.any(spacing <= 0.0):
         raise ValueError(
             f"reduced_spacing must be three positive values; got {spacing}")
     minus = inverse_neighbor_table(plus)
     components = []
-    for idir in range(3):
+    for idir, axis in enumerate(axes):
         lp1 = links[idir]
         km1 = minus[:, idir]
         km2 = minus[km1, idir]
@@ -596,7 +607,7 @@ def fourth_order_connection(
         lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
         lm2 = band_matmul(
             lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
-        A = (1.0j / (12.0 * float(spacing[idir]))) * (
+        A = (1.0j / (12.0 * float(spacing[axis]))) * (
             -lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
         A = 0.5 * (A + jnp.swapaxes(jnp.conj(A), -1, -2))
         components.append(A)
@@ -610,6 +621,7 @@ def fourth_order_covariant_derivative(
     reduced_spacing: Sequence[float],
     *,
     band_matmul,
+    derivative_axes: Sequence[int] | None = None,
 ) -> jax.Array:
     r"""Differentiate a band operator after finite-link parallel transport.
 
@@ -628,10 +640,10 @@ def fourth_order_covariant_derivative(
     operator_k
         ``(nk, nb, nb)`` complex band operator at ``P(None,'x','y')``.
     forward_links
-        ``(3, nk, nb, nb)`` polar links at
+        ``(n_axes, nk, nb, nb)`` polar links at
         ``P(None,None,'x','y')``.
     forward_neighbors
-        Host ``(nk,3)`` table of the positive mesh neighbours.
+        Host ``(nk,n_axes)`` table of the positive mesh neighbours.
     reduced_spacing
         Three positive reduced-coordinate mesh spacings.
     band_matmul
@@ -640,7 +652,7 @@ def fourth_order_covariant_derivative(
     Returns
     -------
     jax.Array
-        ``(3,nk,nb,nb)`` reduced-coordinate covariant derivative, retaining
+        ``(n_axes,nk,nb,nb)`` reduced-coordinate covariant derivative, retaining
         the input's two-dimensional band tiling.
     """
     operator = jnp.asarray(operator_k)
@@ -651,14 +663,22 @@ def fourth_order_covariant_derivative(
         raise ValueError(
             "operator_k must be (nk,nb,nb); "
             f"got {tuple(operator.shape)}")
-    expected_links = (3,) + tuple(operator.shape)
+    n_axes = int(links.shape[0]) if links.ndim >= 1 else 0
+    axes = tuple(range(3)) if derivative_axes is None else tuple(
+        int(axis) for axis in derivative_axes)
+    if (len(axes) != n_axes or len(set(axes)) != n_axes
+            or any(axis not in (0, 1, 2) for axis in axes)):
+        raise ValueError(
+            f"derivative_axes={axes} does not identify {n_axes} distinct "
+            "Cartesian mesh axes")
+    expected_links = (n_axes,) + tuple(operator.shape)
     if tuple(links.shape) != expected_links:
         raise ValueError(
             f"forward_links must have shape {expected_links}; "
             f"got {tuple(links.shape)}")
-    if plus.shape != (operator.shape[0], 3):
+    if plus.shape != (operator.shape[0], n_axes):
         raise ValueError(
-            f"forward_neighbors must be ({operator.shape[0]},3); "
+            f"forward_neighbors must be ({operator.shape[0]},{n_axes}); "
             f"got {plus.shape}")
     if spacing.shape != (3,) or np.any(spacing <= 0.0):
         raise ValueError(
@@ -673,7 +693,7 @@ def fourth_order_covariant_derivative(
         )
 
     rows = []
-    for idir in range(3):
+    for idir, axis in enumerate(axes):
         lp1 = links[idir]
         kp1 = plus[:, idir]
         kp2 = plus[kp1, idir]
@@ -689,5 +709,5 @@ def fourth_order_covariant_derivative(
         tm2 = _transport(lm2, operator[km2])
         rows.append(
             (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2)
-            / (12.0 * float(spacing[idir])))
+            / (12.0 * float(spacing[axis])))
     return jnp.stack(rows, axis=0)

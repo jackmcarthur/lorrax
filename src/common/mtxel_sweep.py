@@ -832,6 +832,8 @@ class UniformGaugeMatrixElements(NamedTuple):
     hamiltonian_config_operator_fingerprint: str
     dgamma_dq_raw: jax.Array | None = None
     d2gamma_dq2_raw: jax.Array | None = None
+    dcharge_dq_raw: jax.Array | None = None
+    d2charge_dq2_raw: jax.Array | None = None
 
 
 class FiniteTransferCurrentEndpoint(NamedTuple):
@@ -1014,6 +1016,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
             fields.append(contact.reshape(9, *contact.shape[2:]))
         if transfer_q2:
+            charge_q1_source = None
+            charge_q2_source = None
             if not isometric_lift:
                 # Historical raw action, byte-for-byte: dPsi/dK is
                 # independent of K, so the zero endpoint avoids another
@@ -1046,6 +1050,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                     gvec.astype(jnp.float64) + kvec[None, :]) @ B
                 dpsi_vnl_qderivative = []
                 q1_rows = []
+                charge_q1_rows = []
                 for a in range(3):
                     dpsi_a = kinetic_balance_lift_jet(
                         psi_L, K_cart, representation=lift_mode,
@@ -1062,6 +1067,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                         * vnl_a.gamma0_cart_ket,
                         int(psi_4.shape[1]))
                     q1_rows.append(alpha_a + endpoint_vnl_a)
+                    charge_q1_rows.append(dpsi_a)
                     # Only this q-derivative is needed by the symmetric q2
                     # cross terms.  Do not retain the full VNL result (or the
                     # consumed derivative WFN) across families.
@@ -1073,8 +1079,10 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                     * vnl.dgamma_dq_cart_ket,
                     int(psi_4.shape[1]))
                 q1_adjoint_source = kinetic_q1_source - vnl_q1
+                charge_q1_source = jnp.stack(charge_q1_rows, axis=0)
 
                 q2_families = {}
+                charge_q2_families = {}
                 for a in range(3):
                     for b in range(a, 3):
                         d2psi_ab = kinetic_balance_lift_jet(
@@ -1098,22 +1106,40 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                                + vnl.d2gamma_dq2_cart_ket[:, a, b]),
                             int(psi_4.shape[1]))
                         q2_families[a, b] = alpha_ab + endpoint_vnl_ab
+                        charge_q2_families[a, b] = d2psi_ab
                 q2_sweep_source = jnp.stack(tuple(
                     jnp.stack(tuple(
                         q2_families[min(a, b), max(a, b)]
                         for b in range(3)), axis=1)
                     for a in range(3)), axis=1)
+                charge_q2_source = jnp.stack(tuple(
+                    jnp.stack(tuple(
+                        charge_q2_families[min(a, b), max(a, b)]
+                        for b in range(3)), axis=0)
+                    for a in range(3)), axis=0)
                 # This is an adjoint source: the physical bra-endpoint q2 is
                 # its band-space adjoint after the sole m/n contraction,
                 # exactly as q1 is minus the adjoint of its source.  That
                 # orientation cannot be performed here without materializing
                 # an nb-by-nb object inside the apply-to-ket operator.
-            fields.extend((
-                q1_adjoint_source.reshape(
-                    9, *q1_adjoint_source.shape[2:]),
-                q2_sweep_source.reshape(
-                    27, *q2_sweep_source.shape[3:]),
-            ))
+            if isometric_lift:
+                q1_four_source = jnp.concatenate(
+                    (charge_q1_source[None], q1_adjoint_source), axis=0)
+                q2_four_source = jnp.concatenate(
+                    (charge_q2_source[None], q2_sweep_source), axis=0)
+                fields.extend((
+                    q1_four_source.reshape(
+                        12, *q1_four_source.shape[2:]),
+                    q2_four_source.reshape(
+                        36, *q2_four_source.shape[3:]),
+                ))
+            else:
+                fields.extend((
+                    q1_adjoint_source.reshape(
+                        9, *q1_adjoint_source.shape[2:]),
+                    q2_sweep_source.reshape(
+                        27, *q2_sweep_source.shape[3:]),
+                ))
 
         packed = jnp.concatenate(tuple(fields), axis=0)
         return jnp.moveaxis(packed, 0, -1)[None]
@@ -1128,7 +1154,8 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
         apply=op, post=1.0,
-        ncomp=(48 if transfer_q2 else (12 if contact_enabled else 3)),
+        ncomp=((60 if isometric_lift else 48)
+               if transfer_q2 else (12 if contact_enabled else 3)),
         key=operator_key)
 
 
@@ -1185,7 +1212,7 @@ def _gauge_hamiltonian_operator_fingerprint(
     if bool(include_transfer_q2):
         fingerprint_update_value(
             digest, "transfer_jet",
-            ("explicit_q2_isometric_endpoint_v1"
+            ("explicit_q2_isometric_charge_current_endpoint_v2"
              if lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
              else "explicit_q2_fixed_large_component_v1"))
     return "sha256:" + digest.hexdigest()
@@ -1304,22 +1331,40 @@ def sweep_uniform_gauge_matrix_elements(
         kvecs=kvecs,
         use_scan=use_scan,
     )
-    q1_raw = q2_raw = None
+    q1_raw = q2_raw = charge_q1_raw = charge_q2_raw = None
     if bool(include_transfer_q2):
-        q1_source = packed[:, 12:21].reshape(
-            int(packed.shape[0]), 3, 3,
-            int(packed.shape[-2]), int(packed.shape[-1]))
-        q1_raw = -jnp.swapaxes(jnp.conj(q1_source), -1, -2)
-        q2_raw = packed[:, 21:48].reshape(
-            int(packed.shape[0]), 3, 3, 3,
-            int(packed.shape[-2]), int(packed.shape[-1]))
+        from common.bispinor_init import ISOMETRIC_KINETIC_BALANCE_LIFT
+        isometric_lift = (
+            str(kinetic_balance_lift).strip().lower()
+            == ISOMETRIC_KINETIC_BALANCE_LIFT)
+        if isometric_lift:
+            q1_four_source = packed[:, 12:24].reshape(
+                int(packed.shape[0]), 4, 3,
+                int(packed.shape[-2]), int(packed.shape[-1]))
+            q1_four_raw = -jnp.swapaxes(
+                jnp.conj(q1_four_source), -1, -2)
+            q2_four_source = packed[:, 24:60].reshape(
+                int(packed.shape[0]), 4, 3, 3,
+                int(packed.shape[-2]), int(packed.shape[-1]))
+            q2_four_raw = jnp.swapaxes(
+                jnp.conj(q2_four_source), -1, -2)
+            charge_q1_raw, q1_raw = q1_four_raw[:, 0], q1_four_raw[:, 1:]
+            charge_q2_raw, q2_raw = q2_four_raw[:, 0], q2_four_raw[:, 1:]
+        else:
+            q1_source = packed[:, 12:21].reshape(
+                int(packed.shape[0]), 3, 3,
+                int(packed.shape[-2]), int(packed.shape[-1]))
+            q1_raw = -jnp.swapaxes(jnp.conj(q1_source), -1, -2)
+            q2_raw = packed[:, 21:48].reshape(
+                int(packed.shape[0]), 3, 3, 3,
+                int(packed.shape[-2]), int(packed.shape[-1]))
         # Both transfer jets are source-oriented inside Operator.apply.
         # This is the sole band-adjoint owner: q1=-source^dagger and
         # q2=+source^dagger for K_bra=k-q.  Orienting either in the operator
         # would materialize an nb-by-nb object inside its apply-to-ket
         # contract.  The raw q2 source is Hermitian, so this retains its
         # physical value while removing a representation-specific rule.
-        q2_raw = jnp.swapaxes(jnp.conj(q2_raw), -1, -2)
+            q2_raw = jnp.swapaxes(jnp.conj(q2_raw), -1, -2)
     return UniformGaugeMatrixElements(
         gamma_raw=packed[:, :3],
         lambda_raw=packed[:, 3:12].reshape(
@@ -1328,6 +1373,8 @@ def sweep_uniform_gauge_matrix_elements(
         hamiltonian_config_operator_fingerprint=fingerprint,
         dgamma_dq_raw=q1_raw,
         d2gamma_dq2_raw=q2_raw,
+        dcharge_dq_raw=charge_q1_raw,
+        d2charge_dq2_raw=charge_q2_raw,
     )
 
 
