@@ -168,6 +168,36 @@ def test_pauli_reference_hartree_requires_explicit_two_plus_four_receipts(
             selected_hartree_source="stored", print_fn=lambda *_args: None)
 
 
+def test_kin_ion_representation_is_reusable_across_screening_topology(tmp_path):
+    """Mean-field artifacts authenticate carriers, not the later W topology."""
+    import h5py
+    from common.four_current_model import (
+        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
+        ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+        ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL,
+        ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+    )
+    from file_io import kin_ion as owner
+
+    path = tmp_path / "kin_ion_isometric_bare.h5"
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
+        ds.attrs["bispinor"] = True
+        ds.attrs["bispinor_gw_mode"] = (
+            ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
+        ds.attrs["charge_representation"] = (
+            ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION)
+        ds.attrs["spatial_current_representation"] = (
+            ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
+
+    owner.validate_kin_ion_against_run(
+        path, expected_bispinor=True,
+        expected_bispinor_gw_mode=(
+            ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL),
+        selected_hartree_source="isdf", print_fn=lambda *_args: None)
+
+
 def test_fractional_hartree_receipt_checks_support_and_wfn_both_directions(
         tmp_path, monkeypatch):
     import h5py

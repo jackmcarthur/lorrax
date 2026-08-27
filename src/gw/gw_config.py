@@ -41,6 +41,7 @@ import numpy as np
 from common.units import RYD_TO_EV
 from common.four_current_model import (
     ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
+    ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL,
     PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
     resolve_four_current_representation,
 )
@@ -303,6 +304,8 @@ class BispinorGWMode(str, enum.Enum):
     PAULI_REFERENCE_BARE_TRANSVERSE = PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
     ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE = (
         ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
+    ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC = (
+        ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL)
     FULL_STATIC_COHSEX = "full_static_cohsex"
     CHARGE_HALL_CUBATURE = "charge_hall_cubature"
 
@@ -3539,6 +3542,7 @@ def uses_static_photon_response(config) -> bool:
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     return mode in (
         BispinorGWMode.FULL_STATIC_COHSEX,
+        BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC,
         BispinorGWMode.CHARGE_HALL_CUBATURE,
     )
 
@@ -3618,13 +3622,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
                 "or head_correction = off.")
         return
-    if (mode is BispinorGWMode.FULL_STATIC_COHSEX
+    if (mode in (
+            BispinorGWMode.FULL_STATIC_COHSEX,
+            BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC)
             and config.head.correction is HeadCorrection.FULL):
         raise ValueError(
             "GATE full_static_bispinor_gauge_head_unavailable: production "
             "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
-            "  got:  bispinor_gw = full_static_cohsex, "
-            "head_correction = full\n"
+            f"  got:  bispinor_gw = {mode.value}, head_correction = full\n"
             "  want: a versioned StaticGaugeHeadResponse carrying "
             "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
             "contact/operator provenance, and certified Ward/Hermiticity "
