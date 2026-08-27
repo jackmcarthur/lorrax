@@ -191,11 +191,85 @@ __all__ = [
     "band_to_product_r_reshard",
     "face_to_batch_reshard",
     "face_to_batch_reshard_supported",
+    "mesh_axis_swap_reshard",
     "shard_local_slice_pad",
     "shard_local_update",
     "ROUTES",
     "DEFAULT_ROUTE",
 ]
+
+
+_MESH_AXIS_SWAP_CACHE: dict[tuple, Callable] = {}
+
+
+def mesh_axis_swap_reshard(mesh: Mesh, *, in_spec: P, out_spec: P) -> Callable:
+    """Value-preserving coordinate transpose on a square ``('x','y')`` mesh.
+
+    ``out_spec`` must be exactly ``in_spec`` with every scalar ``'x'`` and
+    ``'y'`` assignment exchanged.  No array axis is gathered or replicated:
+    the per-device tile shape is unchanged and only rank ``(x,y)`` ownership
+    moves to rank ``(y,x)``.  The optimized-HLO gate for a consumer must still
+    prove that its JAX generation lowered this identity reshard as a bounded
+    coordinate permutation rather than a gather-class fallback.
+
+    This is a top-level sharding transaction, not a helper for an existing
+    manual-mode ``shard_map`` body.  That distinction is deliberate: a pair
+    of local ``all_to_all`` calls changes hierarchical block order and is not
+    the same value-preserving coordinate transpose.
+    """
+    if tuple(mesh.axis_names) != ("x", "y"):
+        raise ValueError(
+            "mesh_axis_swap_reshard requires mesh axes ('x','y'); got "
+            f"{tuple(mesh.axis_names)!r}")
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    if px != py:
+        raise ValueError(
+            "mesh_axis_swap_reshard is a coordinate transpose and requires "
+            f"a square mesh; got {px}x{py}")
+    src = tuple(in_spec)
+    dst = tuple(out_spec)
+    rank = max(len(src), len(dst))
+    src += (None,) * (rank - len(src))
+    dst += (None,) * (rank - len(dst))
+    swapped = tuple("y" if a == "x" else "x" if a == "y" else a
+                    for a in src)
+    if dst != swapped:
+        raise ValueError(
+            "mesh_axis_swap_reshard out_spec must exchange every scalar x/y "
+            f"assignment exactly; got in={P(*src)}, out={P(*dst)}, expected "
+            f"{P(*swapped)}")
+    if any(isinstance(a, tuple) for a in src):
+        raise ValueError(
+            "mesh_axis_swap_reshard serves scalar x/y assignments only; "
+            f"got {P(*src)}")
+
+    key = (id(mesh), src, dst)
+    compiled = _MESH_AXIS_SWAP_CACHE.get(key)
+    if compiled is None:
+        in_sh = NamedSharding(mesh, P(*src))
+        out_sh = NamedSharding(mesh, P(*dst))
+        compiled = jax.jit(
+            lambda a: a, in_shardings=in_sh, out_shardings=out_sh)
+        _MESH_AXIS_SWAP_CACHE[key] = compiled
+
+    def _reshard(a):
+        if a.ndim != rank:
+            raise ValueError(
+                f"mesh_axis_swap_reshard expected rank {rank}, got "
+                f"shape={tuple(a.shape)}")
+        sharding = getattr(a, "sharding", None)
+        actual = (tuple(sharding.spec)
+                  if isinstance(sharding, NamedSharding) else ())
+        actual += (None,) * (rank - len(actual))
+        if (not isinstance(sharding, NamedSharding)
+                or sharding.mesh is not mesh or actual != src):
+            raise ValueError(
+                "mesh_axis_swap_reshard requires its input already committed "
+                f"to {P(*src)} on the supplied Mesh; got {sharding!r}")
+        return compiled(a)
+
+    _reshard.lower = compiled.lower
+    return _reshard
 
 
 _DIVISIBILITY_MSG = (

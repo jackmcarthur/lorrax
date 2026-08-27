@@ -35,6 +35,7 @@ from common.gamma_matrices import (
 )
 from common.fft_helpers import compute_block_size_for_2d_cholesky, local_fftn3, local_ifftn3
 from common.wfn_transforms import take_rchunk_padded, to_rchunk_inner
+from common.staged_reshard import mesh_axis_swap_reshard
 # Face-layout CCT (low_mem_bands=True): the (s,mu) GEMM-seam merge/split the
 # two-face carrier and the face G-build already use.  ``common/`` layer,
 # same as everything else this module imports -- no ``gw`` dependency.
@@ -115,6 +116,7 @@ def host_rss_gb() -> float:
 _pair_density_cache = {}  # pair-density kernel
 _pair_pipeline_sm_cache = {}  # pair-density shard_map pipeline kernel
 _psi_r_cache_sm_cache = {}    # one-time ψ(G)->ψ(r) cache builders
+_zq_face_local_comm_cache = {}  # bounded face-local axis transactions
 
 
 @partial(jax.jit, donate_argnums=(0,))
@@ -1540,6 +1542,102 @@ def _z_q_legacy(
 # mirrors the `_c_q_legacy` / `_c_q_face` split above.
 # ============================================================================
 
+def _prepare_zq_face_local_transaction(
+	psi_mun: jax.Array,
+	psi_r_cache: jax.Array,
+	r_start_dyn,
+	*,
+	mesh_xy: Mesh,
+	n_zchunk: int,
+	n_bc: int,
+	bpd_max_global: int,
+	y_compact_idx_np: np.ndarray,
+	y_compact_identity: bool,
+) -> tuple[jax.Array, jax.Array]:
+	"""Prepare the topology-local X face and cached Y blocks for ``z_q``.
+
+	The canonical cache read and first ``all_to_all('y')`` are unchanged.
+	Only their output's shard assignment is coordinate-transposed, so the
+	large band gather runs over the mesh-minor Y groups.  The persistent X
+	face takes the same value-preserving coordinate transaction once.  Both
+	arrays remain bounded and the caller returns ``Z_q`` to its incumbent
+	``mu_X,r_Y`` carrier before the solve.
+	"""
+	cache_spec = P(None, None, ('x', 'y'), None, None)
+	col_spec = P(None, None, 'x', None, 'y')
+	col_swap_spec = P(None, None, 'y', None, 'x')
+	y_full_spec = P(None, None, None, None, 'x')
+	mun_spec = P(None, None, 'x', 'y')
+	mun_swap_spec = P(None, None, 'y', 'x')
+	x_full_spec = P(None, None, 'y', None)
+	key = (
+		id(mesh_xy), tuple(int(v) for v in psi_mun.shape),
+		tuple(int(v) for v in psi_r_cache.shape), int(n_zchunk), int(n_bc),
+		int(bpd_max_global), bool(y_compact_identity),
+		hash(np.asarray(y_compact_idx_np, dtype=np.int32).tobytes()),
+	)
+	fns = _zq_face_local_comm_cache.get(key)
+	if fns is None:
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(cache_spec, P()), out_specs=col_spec,
+		         check_vma=False)
+		def _build_y_cols(cache_, r_start_):
+			def body(_unused, bc_idx):
+				block = take_rchunk_padded(
+					cache_[bc_idx], r_start_, int(n_zchunk))
+				col = jax.lax.all_to_all(
+					block, 'y', split_axis=3, concat_axis=1, tiled=True)
+				return _unused, col
+
+			_, cols = jax.lax.scan(
+				body, jnp.zeros((), dtype=jnp.int32),
+				jnp.arange(int(n_bc), dtype=jnp.int32), unroll=1)
+			return cols
+
+		build_y_cols = jax.jit(_build_y_cols)
+		swap_y_cols = mesh_axis_swap_reshard(
+			mesh_xy, in_spec=col_spec, out_spec=col_swap_spec)
+
+		@partial(shard_map, mesh=mesh_xy, in_specs=(col_swap_spec,),
+		         out_specs=y_full_spec, check_vma=False)
+		def _gather_y_cols(cols_):
+			if not y_compact_identity:
+				compact_idx = jnp.asarray(y_compact_idx_np, dtype=jnp.int32)
+
+			def body(_unused, bc_idx):
+				block = jax.lax.all_gather(
+					cols_[bc_idx], 'y', axis=1, tiled=True)
+				assert block.shape[1] == int(bpd_max_global)
+				if not y_compact_identity:
+					block = jnp.take(block, compact_idx[bc_idx], axis=1)
+				return _unused, block
+
+			_, blocks = jax.lax.scan(
+				body, jnp.zeros((), dtype=jnp.int32),
+				jnp.arange(int(n_bc), dtype=jnp.int32), unroll=1)
+			return blocks
+
+		gather_y_cols = jax.jit(_gather_y_cols)
+		swap_x_face = mesh_axis_swap_reshard(
+			mesh_xy, in_spec=mun_spec, out_spec=mun_swap_spec)
+
+		@partial(shard_map, mesh=mesh_xy, in_specs=(mun_swap_spec,),
+		         out_specs=x_full_spec, check_vma=False)
+		def _gather_x_face(face_):
+			return jax.lax.all_gather(
+				face_, 'x', axis=3, tiled=True)
+
+		gather_x_face = jax.jit(_gather_x_face)
+		fns = (build_y_cols, swap_y_cols, gather_y_cols,
+		       swap_x_face, gather_x_face)
+		_zq_face_local_comm_cache[key] = fns
+
+	build_y_cols, swap_y_cols, gather_y_cols, swap_x_face, gather_x_face = fns
+	y_cols = build_y_cols(psi_r_cache, r_start_dyn)
+	y_blocks = gather_y_cols(swap_y_cols(y_cols))
+	x_face = gather_x_face(swap_x_face(psi_mun))
+	return x_face, y_blocks
+
 def _z_q_face(
 	psi_mun: jax.Array,
 	psi_G_store,
@@ -1723,6 +1821,25 @@ def _z_q_face(
 	# NaN, all three parity cases, before this fix).
 	_b_hi_rel_np = np.asarray(
 		[hi - _bfs for (_lo, hi) in bcr], dtype=np.int32)
+	r_start_arg = (jnp.int32(int(r_start_dyn))
+	               if isinstance(r_start_dyn, (int, np.integer))
+	               else r_start_dyn)
+	# The topology-local transaction is deliberately tied to the planner's
+	# bounded Y cache.  The cache-free route remains the always-valid fallback;
+	# a rectangular mesh likewise retains the incumbent movement because a
+	# coordinate transpose would change per-rank tile shapes.
+	use_local_axis_transaction = bool(
+		cache_y_blocks and use_psi_r_cache and p_x == p_y and p_x > 1)
+	if use_local_axis_transaction:
+		psi_mun_kernel, psi_Y_blocks_arg = _prepare_zq_face_local_transaction(
+			psi_mun, psi_r_cache, r_start_arg,
+			mesh_xy=mesh_xy, n_zchunk=n_zchunk, n_bc=n_bc,
+			bpd_max_global=bpd_max_global,
+			y_compact_idx_np=_y_compact_idx_np,
+			y_compact_identity=_y_compact_identity)
+	else:
+		psi_mun_kernel = psi_mun
+		psi_Y_blocks_arg = jnp.zeros((), dtype=jnp.complex128)
 
 	ngkmax = int(local_band_chunk_shape[3])
 	_per_rank_bc_shape = (nk, bpd_max, ns, ngkmax)
@@ -1731,18 +1848,24 @@ def _z_q_face(
 	def _slicer_host(x_idx, y_idx, bc_idx):
 		return psi_G_store.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
-	mun_spec = P(None, None, 'x', 'y')
+	mun_spec = (P(None, None, 'y', None) if use_local_axis_transaction
+	            else P(None, None, 'x', 'y'))
 	out_spec = P(None, 'x', 'y')
+	local_out_spec = (P(None, 'y', 'x') if use_local_axis_transaction
+	                  else out_spec)
 	w_spec = P(None)
 	g_index_spec = P(None, None, None, None)
 	kvecs_frac_spec = P(None, None)
 	cache_spec = P(None, None, ('x', 'y'), None, None)
+	y_blocks_spec = (P(None, None, None, None, 'x')
+	                 if use_local_axis_transaction else P())
 	fft_grid_t = tuple(int(s) for s in fft_grid)
 
 	cache_key = (
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
-		bcr, use_psi_r_cache, bool(cache_y_blocks), lhs_id, rhs_id,
+		bcr, use_psi_r_cache, bool(cache_y_blocks),
+		bool(use_local_axis_transaction), lhs_id, rhs_id,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -1750,10 +1873,12 @@ def _z_q_face(
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(), P(), P(),
-		                   g_index_spec, kvecs_frac_spec, cache_spec),
-		         out_specs=out_spec, check_vma=False)
+		                   g_index_spec, kvecs_frac_spec, cache_spec,
+		                   y_blocks_spec),
+		         out_specs=local_out_spec, check_vma=False)
 		def _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
-		           r_start_, g_index_dev, kvecs_frac_dev, psi_r_cache_):
+		           r_start_, g_index_dev, kvecs_frac_dev, psi_r_cache_,
+		           psi_Y_blocks_):
 			x_idx = jax.lax.axis_index('x')
 			y_idx = jax.lax.axis_index('y')
 			mu_loc = psi_mun_.shape[2]
@@ -1800,12 +1925,15 @@ def _z_q_face(
 				return psi_Y_bc
 
 			if cache_y_blocks:
-				def build_y_block(_unused, bc_idx):
-					return _unused, load_y_block(bc_idx)
+				if use_local_axis_transaction:
+					psi_Y_blocks = psi_Y_blocks_
+				else:
+					def build_y_block(_unused, bc_idx):
+						return _unused, load_y_block(bc_idx)
 
-				_, psi_Y_blocks = jax.lax.scan(
-					build_y_block, jnp.zeros((), dtype=jnp.int32),
-					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+					_, psi_Y_blocks = jax.lax.scan(
+						build_y_block, jnp.zeros((), dtype=jnp.int32),
+						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
 				# (n_bc, nk, bpd_max_global, ns, r_loc), resident only
 				# when the memory planner selected this structural route.
 
@@ -1837,25 +1965,34 @@ def _z_q_face(
 						# only one band chunk rather than the stacked Y cache.
 						psi_Y_bc = load_y_block(bc_idx)
 
-					# Selectively broadcast this band chunk from psi_mun's
-					# owning y-rank.  The collective and its physical band order
-					# are unchanged from the pre-streaming face kernel.
+					# The incumbent route selectively broadcasts this band chunk
+					# from psi_mun's owning y-rank.  The topology-local route has
+					# already coordinate-transposed the bounded face once and
+					# gathered its smaller band axis, so this slice is local.
 					p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
 					global_band = b_lo_rel_arr[bc_idx] + p_arr
-					owner_y = global_band // shard_w
-					owns = (owner_y == y_idx)
 					if lhs_id:
 						x_rows_local = jax.lax.dynamic_slice_in_dim(
 							psi_mun_conj, a, 1, axis=1)
 					else:
 						x_rows_local = jnp.take(
 							psi_mun_conj, jnp.stack((a, perm_L_[a])), axis=1)
-					local_idx = jnp.clip(
-						global_band - y_idx * shard_w, 0, shard_w - 1)
-					gathered = jnp.take(x_rows_local, local_idx, axis=3)
-					gathered = jnp.where(
-						owns[None, None, None, :], gathered, 0)
-					x_rows_bc = jax.lax.psum(gathered, 'y')
+					if use_local_axis_transaction:
+						local_idx = jnp.clip(global_band, 0, nb_face - 1)
+						x_rows_bc = jnp.take(
+							x_rows_local, local_idx, axis=3)
+						x_valid = global_band < b_hi_rel_arr[bc_idx]
+						x_rows_bc = jnp.where(
+							x_valid[None, None, None, :], x_rows_bc, 0)
+					else:
+						owner_y = global_band // shard_w
+						owns = (owner_y == y_idx)
+						local_idx = jnp.clip(
+							global_band - y_idx * shard_w, 0, shard_w - 1)
+						gathered = jnp.take(x_rows_local, local_idx, axis=3)
+						gathered = jnp.where(
+							owns[None, None, None, :], gathered, 0)
+						x_rows_bc = jax.lax.psum(gathered, 'y')
 
 					# A short final chunk can extend past both its true edge and
 					# the face carrier.  Clip every take and zero the inert lanes
@@ -1910,10 +2047,10 @@ def _z_q_face(
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
-		        r_start_, g_index_, kvecs_frac_, psi_r_cache_):
+		        r_start_, g_index_, kvecs_frac_, psi_r_cache_, psi_Y_blocks_):
 			return _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_,
 			              perm_R_, phase_R_, r_start_, g_index_,
-			              kvecs_frac_, psi_r_cache_)
+			              kvecs_frac_, psi_r_cache_, psi_Y_blocks_)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
 
@@ -1928,17 +2065,20 @@ def _z_q_face(
 	else:
 		perm_R, phase_R = gamma_R
 
-	r_start_arg = (jnp.int32(int(r_start_dyn))
-	                if isinstance(r_start_dyn, (int, np.integer))
-	                else r_start_dyn)
 	if psi_r_cache is None:
 		psi_r_cache = jnp.zeros(
 			(1, 1, p_x * p_y, 1, 1), dtype=jnp.complex128)
-	return _pair_pipeline_sm_cache[cache_key](
-		psi_mun, weight_l.astype(jnp.float64), weight_r.astype(jnp.float64),
+	Z_q = _pair_pipeline_sm_cache[cache_key](
+		psi_mun_kernel,
+		weight_l.astype(jnp.float64), weight_r.astype(jnp.float64),
 		perm_L, phase_L, perm_R, phase_R,
 		r_start_arg, psi_G_store.g_index, psi_G_store.kvecs_frac,
-		psi_r_cache)
+		psi_r_cache, psi_Y_blocks_arg)
+	if use_local_axis_transaction:
+		Z_q = mesh_axis_swap_reshard(
+			mesh_xy, in_spec=P(None, 'y', 'x'),
+			out_spec=P(None, 'x', 'y'))(Z_q)
+	return Z_q
 
 
 # Backward-compat shim removed — old z_q_from_psi_sm signature
