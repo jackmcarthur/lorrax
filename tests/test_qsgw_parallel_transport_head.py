@@ -35,7 +35,10 @@ from gw.qsgw_head import (
     static_gauge_first_order_component_sharded,
     static_gauge_second_order_component_sharded,
 )
-from gw.head_correction import static_hall_linear_response
+from gw.head_correction import (
+    static_hall_linear_response,
+    static_mixed_linear_response,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -811,6 +814,9 @@ def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
         [np.cross(got, axis) for axis in axes], axis=0)
     np.testing.assert_allclose(
         hall_from_sigma, hall_occupied_bra, rtol=3e-14, atol=3e-14)
+    np.testing.assert_allclose(
+        static_mixed_linear_response(hall_occupied_bra),
+        static_hall_linear_response(got), rtol=3e-14, atol=3e-14)
 
     f_diff = occupations[:, None, :] - occupations[:, :, None]
     energy_ordered = delta > 0.0

@@ -3521,7 +3521,8 @@ def _hall_pseudovector_sharded(
     nspinor_wfn: int,
     charge_energy_scaled_d1_raw=None,
     degeneracy_tolerance_ry: float = 1.0e-10,
-) -> tuple[jax.Array, float]:
+    require_antisymmetry: bool = True,
+) -> tuple[jax.Array, float, jax.Array]:
     r"""Derive raw or normalized Hall from one transition-tensor owner.
 
     With no explicit normalized charge jet, the incumbent raw formula passes
@@ -3530,9 +3531,10 @@ def _hall_pseudovector_sharded(
     denominator/mask and common prefactor ``-2*C/(Omega*Nk)``.  In the raw
     Ward limit ``P_charge=Gamma/HALFALPHA`` they are bitwise the same input.
 
-    The 2x3 tensor must itself be antisymmetric; projection to the three Hall
-    components is refused if symmetric or diagonal contamination exceeds the
-    fixed residual budget.
+    The returned 2x3 tensor is the authentic occupied-bra mixed response.
+    Raw Hall requires that tensor to lie in the antisymmetric three-parameter
+    subspace.  The explicitly bounded normalized producer retains the full
+    tensor instead and records the same residual as a finite diagnostic.
     """
     from common.bispinor_init import HALFALPHA
 
@@ -3618,14 +3620,18 @@ def _hall_pseudovector_sharded(
         jnp.max(jnp.abs(tensor - projected)) / scale,
         jnp.asarray(0.0, dtype=jnp.float64))
     residual = float(np.asarray(jax.device_get(residual_array)))
-    if (not np.isfinite(residual)
-            or residual > _STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX):
+    if not np.isfinite(residual):
+        raise ValueError(
+            "GATE static_gauge_hall_antisymmetry: transition tensor has a "
+            "non-finite projection residual")
+    if (bool(require_antisymmetry)
+            and residual > _STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX):
         raise ValueError(
             "GATE static_gauge_hall_antisymmetry: normalized/raw transition "
             "tensor contains symmetric or diagonal contamination; "
             f"residual={residual:.6e}, limit="
             f"{_STATIC_GAUGE_HALL_ANTISYMMETRY_RESIDUAL_MAX:.6e}")
-    return sigma, residual
+    return sigma, residual, tensor
 
 
 def raw_hall_pseudovector_sharded(
@@ -3661,7 +3667,7 @@ def raw_hall_pseudovector_sharded(
     later inserts the independently audited ``-i epsilon[b,a,i]`` CT
     convention required by the live ``P=-Delta*D`` band orientation.
     """
-    sigma, _residual = _hall_pseudovector_sharded(
+    sigma, _residual, _tensor = _hall_pseudovector_sharded(
         gamma_raw, energies_kn_ry, occupations_kn,
         mesh=mesh, nb_logical=int(nb_logical),
         cell_volume=float(cell_volume), nk_tot=int(nk_tot),
@@ -3816,7 +3822,7 @@ def static_gauge_hall_transaction(
 
     energies_full, occupations_full = static_gauge_full_bz_state_tables(
         wfn=wfn, sym=sym, band_start=start, band_stop=stop)
-    sigma_H, hall_residual = _hall_pseudovector_sharded(
+    sigma_H, hall_residual, _tensor = _hall_pseudovector_sharded(
         gamma,
         energies_full,
         occupations_full,

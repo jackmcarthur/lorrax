@@ -135,16 +135,16 @@ _PRODUCER_TOKEN = object()
 _SOURCE_TOKEN = object()
 
 ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION = (
-    "isometric_retained_bubble_no_contact_no_complement_v1")
+    "isometric_retained_bubble_full_mixed_ct_no_contact_no_complement_v2")
 ISOMETRIC_ENDPOINT_JET_CONVENTION = (
-    "uniform_gauge_endpoint_jet/v3"
+    "uniform_gauge_endpoint_jet/v4"
     "|kinetic_balance_lift=isometric"
     "|bra_K=k-q:q1=-dK,q2=+d2K"
     "|transfer_axes=cartesian"
     "|q2=analytic_isometric_plus_icl_vnl"
     "|charge_q1_q2=analytic_isometric_lift"
     "|energy_q1_q2=source_pauli_pt_velocity"
-    "|hall=P_charge_x_Gamma_conj/deltaE2"
+    "|mixed_CT=P_charge_x_Gamma_conj/deltaE2;CT=-i*T;TC=CT^dagger"
     "|vnl_velocity_sign=+1")
 DISTINCT_BODY_LEG_PLACEMENT = (
     "head_wings_distinct_faces/v1|Y=bra_vertex(B,0)|Z=ket_vertex(0,B)")
@@ -161,20 +161,21 @@ def _canonical_wfn_sha256(value) -> str:
 
 @dataclass(frozen=True)
 class StaticGaugeCubatureResponse:
-    r"""Inputs for ``R(q)=q_a H_a(sigma_H)+q_a q_b S_ab``.
+    r"""Inputs for ``R(q)=q_a H_linear[a]+q_a q_b S_ab``.
 
     Capability declares the support of ``S_direct`` and the wings.  Charge+
     Hall has charge-only S/Y/Z; the isometric retained bubble has all four
-    Lorentz fields but explicitly omits contact and complement closure.  The
-    Hall tensor is intentionally not stored: :func:`static_hall_linear_response`
-    constructs it from ``sigma_H`` at the numerical kernel that consumes it.
+    Lorentz fields but explicitly omits contact and complement closure.
+    ``H_linear`` is the single bounded CT/TC carrier: charge+Hall derives it
+    from its sealed pseudovector, while retained FULL-CT keeps the authentic
+    normalized mixed tensor without a lossy Hall projection.
     """
 
     capability: StaticGaugeResponseCapability
     availability: StaticGaugeTermAvailability
     layout: PhotonBasisLayout
     S_direct: jax.Array               # (2,2,4,4), replicated charge CC
-    sigma_H: jax.Array                # (3,), replicated real bohr^-1
+    H_linear: jax.Array               # (2,4,4), replicated CT/TC
     Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
     Z_y: jax.Array                    # (2,Npacked,4), P(None,'y',None)
     ward_residual: float
@@ -211,7 +212,7 @@ class IsometricRetainedBubbleSource:
 
     energy_scaled_d1_raw: jax.Array  # (2,4,nk,nb,nb), P(None,None,None,x,y)
     S_direct: jax.Array              # (2,2,4,4), replicated
-    sigma_H: jax.Array               # (3,), replicated
+    mixed_transition_tensor: jax.Array  # (2,3), replicated real
     availability: StaticGaugeTermAvailability
     charge_representation: str
     spatial_current_representation: str
@@ -255,7 +256,7 @@ def _source_fingerprint(
     from common.parallel_transport import fingerprint_update_value
 
     digest = hashlib.sha256()
-    digest.update(b"lorrax.isometric_retained_bubble_source/v3\0")
+    digest.update(b"lorrax.isometric_retained_bubble_source/v4\0")
     for label, value in (
         ("operator", operator_fingerprint),
         ("wfn", wfn_fingerprint),
@@ -363,12 +364,15 @@ def require_isometric_retained_bubble_source(
         (source.energy_scaled_d1_raw, "energy_scaled_d1_raw",
          np.complex128, P(None, None, None, "x", "y")),
         (source.S_direct, "S_direct", np.complex128, P()),
-        (source.sigma_H, "sigma_H", np.float64, P()),
+        (source.mixed_transition_tensor, "mixed_transition_tensor",
+         np.float64, P()),
     )
     if tuple(source.S_direct.shape) != (2, 2, 4, 4):
         raise ValueError(f"S_direct shape {source.S_direct.shape} != (2,2,4,4)")
-    if tuple(source.sigma_H.shape) != (3,):
-        raise ValueError(f"sigma_H shape {source.sigma_H.shape} != (3,)")
+    if tuple(source.mixed_transition_tensor.shape) != (2, 3):
+        raise ValueError(
+            "mixed_transition_tensor shape "
+            f"{source.mixed_transition_tensor.shape} != (2,3)")
     for array, name, dtype, spec in arrays:
         if np.dtype(array.dtype) != np.dtype(dtype):
             raise TypeError(f"{name} dtype {array.dtype} != {np.dtype(dtype)}")
@@ -392,8 +396,8 @@ def build_isometric_retained_bubble_source(
 
     WFN/VNL/FFT work remains in the preprocessing driver.  This function
     consumes its sealed uniform-gauge result plus the existing PT owner and
-    persists only the width-eight first jet, small q2 coefficient and Hall
-    vector needed later by the centroid-wing producer.
+    persists only the width-eight first jet, small q2 coefficient and full
+    mixed CT tensor needed later by the centroid-wing producer.
     """
     from common.bispinor_init import ISOMETRIC_KINETIC_BALANCE_LIFT
     from common.four_current_model import resolve_four_current_representation
@@ -407,8 +411,8 @@ def build_isometric_retained_bubble_source(
     )
     from gw.qsgw_head import (
         ParallelTransportHeadData,
+        _hall_pseudovector_sharded,
         static_gauge_full_bz_state_tables,
-        static_gauge_hall_transaction,
         static_gauge_second_order_component_sharded,
     )
 
@@ -479,21 +483,19 @@ def build_isometric_retained_bubble_source(
         charge_dq2_raw=uniform_gauge.d2charge_dq2_raw,
         hamiltonian_velocity_cart=parallel_transport.velocity_dft_cart,
     )
-    hall = static_gauge_hall_transaction(
-        uniform_gauge, wfn=wfn, sym=sym, band_start=start,
-        band_stop=stop, mesh=mesh,
+    _hall_projection, hall_residual, mixed_transition_tensor = (
+        _hall_pseudovector_sharded(
+        uniform_gauge.gamma_raw, energies, occupations,
+        mesh=mesh, nb_logical=logical,
+        cell_volume=float(wfn.cell_volume), nk_tot=int(sym.nk_tot),
+        nspin=int(wfn.nspin), nspinor_wfn=int(wfn.nspinor),
         charge_energy_scaled_d1_raw=(
-            second.first_order.energy_scaled_d1_raw[:, 0]))
+            second.first_order.energy_scaled_d1_raw[:, 0]),
+        require_antisymmetry=False))
     operator_fingerprint = require_canonical_operator_fingerprint(
         uniform_gauge.hamiltonian_config_operator_fingerprint,
         gate="isometric_retained_bubble_uniform_operator")
-    if hall.hamiltonian_config_operator_fingerprint != operator_fingerprint:
-        raise ValueError(
-            "Hall and endpoint-jet transactions have different operator "
-            "fingerprints")
     wfn_fp = _canonical_wfn_sha256(wfn_fingerprint(wfn))
-    if hall.wfn_fingerprint != wfn_fp:
-        raise ValueError("Hall and endpoint-jet transactions use different WFN")
 
     S_direct = canonicalize_static_gauge_q2_tensor(
         second.S_bubble_q2_coefficient_cart[0])
@@ -508,7 +510,8 @@ def build_isometric_retained_bubble_source(
             second.first_order.energy_scaled_d1_raw,
             dtype=jnp.complex128),
         S_direct=jnp.asarray(S_direct, dtype=jnp.complex128),
-        sigma_H=jnp.asarray(hall.sigma_H, dtype=jnp.float64),
+        mixed_transition_tensor=jnp.asarray(
+            mixed_transition_tensor, dtype=jnp.float64),
         availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
         charge_representation=representation.charge_representation,
         spatial_current_representation=(
@@ -540,7 +543,7 @@ def build_isometric_retained_bubble_source(
         hermiticity_residual=float(hermiticity),
         ordered_curvature_residual=float(np.asarray(values[1])),
         q2_symmetry_residual=float(np.asarray(values[2])),
-        hall_antisymmetry_residual=float(hall.antisymmetry_residual),
+        hall_antisymmetry_residual=float(hall_residual),
         approximation=ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION,
     )
     return require_isometric_retained_bubble_source(source, mesh)
@@ -602,7 +605,7 @@ def require_static_gauge_cubature_response(
     n_packed = int(response.layout.packed_extent)
     arrays = (
         (response.S_direct, "S_direct", (2, 2, 4, 4), np.complex128, P()),
-        (response.sigma_H, "sigma_H", (3,), np.float64, P()),
+        (response.H_linear, "H_linear", (2, 4, 4), np.complex128, P()),
         (response.Y_x, "Y_x", (2, 4, n_packed), np.complex128,
          P(None, None, "x")),
         (response.Z_y, "Z_y", (2, n_packed, 4), np.complex128,
@@ -617,9 +620,14 @@ def require_static_gauge_cubature_response(
             raise ValueError(f"{name} must have production sharding {spec}")
 
     S = np.asarray(jax.device_get(response.S_direct))
-    sigma = np.asarray(jax.device_get(response.sigma_H))
-    if not np.all(np.isfinite(sigma)):
-        raise ValueError("charge_hall_cubature sigma_H is not finite")
+    H = np.asarray(jax.device_get(response.H_linear))
+    if not np.all(np.isfinite(H)):
+        raise ValueError("bounded static H_linear is not finite")
+    if (np.any(H[:, 0, 0] != 0.0)
+            or np.any(H[:, 1:, 1:] != 0.0)
+            or np.any(H - np.conj(np.swapaxes(H, -1, -2)) != 0.0)):
+        raise ValueError(
+            "bounded static H_linear must contain Hermitian CT/TC only")
     if (response.capability is
             StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE
             and (np.any(S[:, :, 0, 1:] != 0.0)
@@ -701,6 +709,8 @@ def build_isometric_retained_bubble_response(
     meta,
 ) -> StaticGaugeCubatureResponse:
     """Attach canonical distinct-face body wings to the persisted head jet."""
+    from gw.head_correction import static_mixed_linear_response
+
     source = require_isometric_retained_bubble_source(source, mesh)
     if not isinstance(layout, PhotonBasisLayout):
         raise TypeError("retained-bubble response requires PhotonBasisLayout")
@@ -846,7 +856,9 @@ def build_isometric_retained_bubble_response(
         availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
         layout=layout,
         S_direct=source.S_direct,
-        sigma_H=source.sigma_H,
+        H_linear=_replicated(
+            static_mixed_linear_response(source.mixed_transition_tensor),
+            mesh, dtype=np.complex128),
         Y_x=Y_x,
         Z_y=Z_y,
         ward_residual=float(source.ward_residual),
@@ -962,6 +974,9 @@ def build_charge_hall_cubature_response(
     if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):
         raise ValueError("Hall transaction has an invalid sigma_H")
     sigma_H = _replicated(sigma_host, mesh, dtype=np.float64)
+    from gw.head_correction import static_hall_linear_response
+    H_linear = _replicated(
+        static_hall_linear_response(sigma_H), mesh, dtype=np.complex128)
     # At static imaginary frequency the Adler--Wiser weight is real, hence
     # the two incumbent wing orientations obey Z[b,mu]=conj(Y[b,mu]).  Move
     # only this O(N_mu) vector to Y sharding for a scalar certificate.
@@ -982,7 +997,7 @@ def build_charge_hall_cubature_response(
     response = StaticGaugeCubatureResponse(
         capability=StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE,
         availability=availability, layout=layout,
-        S_direct=S_direct, sigma_H=sigma_H, Y_x=Y_x, Z_y=Z_y,
+        S_direct=S_direct, H_linear=H_linear, Y_x=Y_x, Z_y=Z_y,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),
         wing_reciprocity_residual=wing_reciprocity,
         charge_representation=representation.charge_representation,

@@ -64,11 +64,12 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
 )
 
 STATIC_GAUGE_HALL_SCHEMA_VERSION = 2
-ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 3
+ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 4
 ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID = (
-    "lorrax.isometric_retained_bubble_source/v3"
-    "|payload=energy_scaled_d1_raw+S_direct_cart+sigma_H_cart"
+    "lorrax.isometric_retained_bubble_source/v4"
+    "|payload=energy_scaled_d1_raw+S_direct_cart+mixed_transition_tensor_cart"
     "|sharding=P(None,None,None,x,y)+replicated"
+    "|mixed_CT=occupied_bra_real_2x3;CT=-i*T;TC=CT^dagger"
     "|contact=omitted_by_model|complement=omitted_by_model")
 
 _S_DATASET = "S_direct_cart"
@@ -406,8 +407,9 @@ def write_isometric_retained_bubble_source_artifact(
             _text_i32(
                 source.parallel_transport_coefficient_frame,
                 encoding="ascii"))
-        io.write_attr("sigma_H_cart", np.asarray(
-            jax.device_get(source.sigma_H), dtype=np.float64))
+        io.write_attr("mixed_transition_tensor_cart", np.asarray(
+            jax.device_get(source.mixed_transition_tensor),
+            dtype=np.float64))
         for name in (
             "charge_ward_residual", "ward_residual", "hermiticity_residual",
             "ordered_curvature_residual", "q2_symmetry_residual",
@@ -492,7 +494,8 @@ def load_isometric_retained_bubble_source_artifact(
             _read_required_small(io, "parallel_transport_derivative_axes"),
             dtype=np.int32).reshape(-1))
         pt_frame = text_field("parallel_transport_coefficient_frame_i32")
-        sigma_H = _read_required_small(io, "sigma_H_cart")
+        mixed_transition_tensor = _read_required_small(
+            io, "mixed_transition_tensor_cart")
         residuals = {name: float(np.asarray(_read_required_small(io, name)))
                      for name in (
                          "charge_ward_residual", "ward_residual",
@@ -547,12 +550,13 @@ def load_isometric_retained_bubble_source_artifact(
 
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding
-    sigma_H = device_put_process_local(
-        np.asarray(sigma_H, dtype=np.float64), NamedSharding(mesh_xy, P()))
+    mixed_transition_tensor = device_put_process_local(
+        np.asarray(mixed_transition_tensor, dtype=np.float64),
+        NamedSharding(mesh_xy, P()))
     source = _issue_isometric_retained_bubble_source(
         energy_scaled_d1_raw=energy_scaled_d1_raw,
         S_direct=S_direct,
-        sigma_H=sigma_H,
+        mixed_transition_tensor=mixed_transition_tensor,
         availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
         charge_representation=charge_representation,
         spatial_current_representation=current_representation,
