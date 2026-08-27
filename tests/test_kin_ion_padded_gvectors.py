@@ -125,6 +125,49 @@ def test_kin_ion_provenance_refuses_wrong_or_missing_bispinor_before_read(
     assert reads == [], "provenance gate read a kin_ion matrix payload"
 
 
+def test_pauli_reference_hartree_requires_explicit_two_plus_four_receipts(
+        tmp_path):
+    import h5py
+    import pytest
+    from common.four_current_model import (
+        PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+        PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
+        RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+    )
+    from file_io import kin_ion as owner
+
+    path = tmp_path / "kin_ion_pauli_reference.h5"
+    with h5py.File(path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
+        ds.attrs["bispinor"] = True
+        ds.attrs["bispinor_gw_mode"] = (
+            PAULI_REFERENCE_BARE_TRANSVERSE_MODEL)
+        ds.attrs["charge_representation"] = (
+            PAULI_TWO_SPINOR_CHARGE_REPRESENTATION)
+        ds.attrs["spatial_current_representation"] = (
+            RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
+        vh = h5.create_dataset(
+            owner.HARTREE_DATASET,
+            data=np.zeros((1, 2, 2), dtype=np.complex128))
+        vh.attrs["matrix_nspinor"] = 2
+        vh.attrs["charge_representation"] = (
+            PAULI_TWO_SPINOR_CHARGE_REPRESENTATION)
+
+    owner.validate_kin_ion_against_run(
+        path, expected_bispinor=True,
+        expected_bispinor_gw_mode=PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+        selected_hartree_source="stored", print_fn=lambda *_args: None)
+    with h5py.File(path, "r+") as h5:
+        h5[owner.HARTREE_DATASET].attrs["matrix_nspinor"] = 4
+    with pytest.raises(ValueError, match="requires matrix_nspinor=2"):
+        owner.validate_kin_ion_against_run(
+            path, expected_bispinor=True,
+            expected_bispinor_gw_mode=(
+                PAULI_REFERENCE_BARE_TRANSVERSE_MODEL),
+            selected_hartree_source="stored", print_fn=lambda *_args: None)
+
+
 def test_fractional_hartree_receipt_checks_support_and_wfn_both_directions(
         tmp_path, monkeypatch):
     import h5py

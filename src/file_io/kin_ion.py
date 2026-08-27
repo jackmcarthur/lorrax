@@ -83,6 +83,14 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.four_current_model import (
+	is_pauli_reference_model,
+	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+	PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
+	RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+)
+
 from .slab_io import SlabIO
 
 #: Name of the separate exact-V_H dataset inside ``kin_ion.h5``.
@@ -664,6 +672,7 @@ def validate_kin_ion_against_run(
 	*,
 	expected_bispinor: bool,
 	selected_hartree_source: str,
+	expected_bispinor_gw_mode: str | None = None,
 	wfn=None,
 	wfn_fingerprint_binding=None,
 	sys_dim: int | None = None,
@@ -674,11 +683,12 @@ def validate_kin_ion_against_run(
 ) -> dict:
 	"""Refuse a ``kin_ion.h5`` that disagrees with the run it feeds.
 
-	``kin_ion`` fixes the Coulomb truncation convention and the band
-	window and wavefunction representation for the whole mean-field side of H₀.
-	A two-spinor and kinetic-balance four-spinor file have identical shapes but
-	different matrix elements, so ``bispinor`` is required provenance: a missing
-	or unequal stamp refuses before any matrix payload is read.  A file generated under
+	``kin_ion`` fixes the Coulomb truncation convention, band window, and
+	four-current policy for the whole mean-field side of H₀.  Its component
+	receipts separately authenticate the scalar-charge and spatial-current
+	representations because their band matrices have identical shapes.  Thus
+	``bispinor`` is required provenance: a missing or unequal stamp refuses
+	before any matrix payload is read.  A file generated under
 	``sys_dim=3`` silently consumed by a ``sys_dim=2`` run puts a large
 	*systematic* error into a ~500 eV cancellation — indistinguishable,
 	from the outside, from a basis-convergence problem.  Check it once,
@@ -707,10 +717,43 @@ def validate_kin_ion_against_run(
 		raise ValueError(
 			f"kin_ion.h5 was generated with bispinor="
 			f"{bool(stored_bispinor)} but this run uses bispinor="
-			f"{bool(expected_bispinor)}. The mean-field matrix must use the "
-			"same wavefunction representation as the GW body; regenerate "
+			f"{bool(expected_bispinor)}. The mean-field artifact must use the "
+			"same four-current policy as the GW run; regenerate "
 			"kin_ion.h5 from this run's exact input deck."
 		)
+	pauli_reference = is_pauli_reference_model(expected_bispinor_gw_mode)
+	expected_charge_representation = (
+		PAULI_TWO_SPINOR_CHARGE_REPRESENTATION
+		if pauli_reference else RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION)
+	stored_charge_representation = attrs.get("charge_representation")
+	if bool(expected_bispinor) and (
+		stored_charge_representation is None and pauli_reference
+		or stored_charge_representation is not None
+		and str(stored_charge_representation) != expected_charge_representation
+	):
+		raise ValueError(
+			"kin_ion scalar charge representation is "
+			f"{stored_charge_representation!r}, expected "
+			f"{expected_charge_representation!r}; regenerate kin_ion.h5 from "
+			"this run's exact input deck.")
+	if pauli_reference and str(attrs.get("bispinor_gw_mode")) != (
+		PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
+	):
+		raise ValueError(
+			"the Pauli-reference comparison requires an explicitly stamped "
+			f"bispinor_gw_mode={PAULI_REFERENCE_BARE_TRANSVERSE_MODEL!r}; "
+			f"artifact has {attrs.get('bispinor_gw_mode')!r}.")
+	if bool(expected_bispinor):
+		stored_current_representation = attrs.get(
+			"spatial_current_representation")
+		if (stored_current_representation is None and pauli_reference
+				or stored_current_representation is not None
+				and str(stored_current_representation) !=
+				RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
+			raise ValueError(
+				"kin_ion spatial-current representation is "
+				f"{stored_current_representation!r}, expected "
+				f"{RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION!r}.")
 	stored_sys_dim = attrs.get("sys_dim")
 	if sys_dim is not None and stored_sys_dim is not None and (
 		int(stored_sys_dim) != int(sys_dim)
@@ -743,12 +786,24 @@ def validate_kin_ion_against_run(
 				"cover the same window — regenerate with a larger -n.")
 		if expected_bispinor:
 			matrix_nspinor = attrs.get("hartree_matrix_nspinor")
-			if matrix_nspinor is None or int(matrix_nspinor) != 4:
+			expected_matrix_nspinor = 2 if pauli_reference else 4
+			if (matrix_nspinor is None
+					or int(matrix_nspinor) != expected_matrix_nspinor):
 				raise ValueError(
 					f"{HARTREE_DATASET} matrix_nspinor={matrix_nspinor!r}; "
-					"an exact scalar Hartree consumed by a kinetic-balance "
-					"bispinor run must be projected in the authenticated "
-					"four-component matrix basis. Regenerate kin_ion.h5.")
+					"the selected scalar charge representation requires "
+					f"matrix_nspinor={expected_matrix_nspinor}. Regenerate "
+					"kin_ion.h5.")
+			component_representation = attrs.get(
+				"hartree_charge_representation")
+			if (component_representation is None and pauli_reference
+					or component_representation is not None
+					and str(component_representation) !=
+					expected_charge_representation):
+				raise ValueError(
+					f"{HARTREE_DATASET} charge representation is "
+					f"{component_representation!r}, expected "
+					f"{expected_charge_representation!r}.")
 		print_fn(
 			f"  kin_ion: pristine T+V_loc+V_NL, plus a stored exact V_H array "
 			f"{tuple(hs)} (truncation_2d="
@@ -828,6 +883,16 @@ def validate_kin_ion_against_run(
 				f"{TRANSVERSE_HARTREE_DATASET} matrix_nspinor="
 				f"{matrix_nspinor!r}; exact alpha.A projection requires the "
 				"canonical four-component kinetic-balance matrix basis.")
+		component_current_representation = attrs.get(
+			"transverse_hartree_spatial_current_representation")
+		if (component_current_representation is None and pauli_reference
+				or component_current_representation is not None
+				and str(component_current_representation) !=
+				RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
+			raise ValueError(
+				f"{TRANSVERSE_HARTREE_DATASET} spatial-current "
+				f"representation is {component_current_representation!r}, "
+				"expected the canonical raw kinetic-balance spatial current.")
 		source_nspinor = attrs.get("transverse_hartree_source_wfn_nspinor")
 		artifact_nspinor = attrs.get("nspinor")
 		if (source_nspinor is None or artifact_nspinor is None

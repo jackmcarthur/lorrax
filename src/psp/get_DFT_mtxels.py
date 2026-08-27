@@ -74,6 +74,7 @@ from psp.radial.build_projectors_qe import (
 )
 from psp.dft_operators import vnl_matrix_from_kdata
 from common.collectives import prepare_mesh, shard_over_k
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from dataclasses import dataclass
 import h5py
 import psp.vnl_ops as vnl_ops
@@ -161,7 +162,10 @@ def spin_degeneracy_factor(wfn) -> float:
     return float(wfn.occupation_state_capacity)
 
 
-@partial(jax.jit, static_argnames=("nocc", "include_dirac_current"))
+@partial(
+    jax.jit,
+    static_argnames=("nocc", "include_dirac_current", "charge_nspinor"),
+)
 def _valence_density_kernel(
     psi_k_box: jnp.ndarray,
     weight: jnp.ndarray,
@@ -171,6 +175,7 @@ def _valence_density_kernel(
     *,
     nocc: int | None,
     include_dirac_current: bool,
+    charge_nspinor: int | None,
 ) -> jnp.ndarray:
     """Jitted body of :func:`valence_density_from_kpoint`.
 
@@ -184,16 +189,18 @@ def _valence_density_kernel(
     scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
     psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
     psi_r = local_ifftn3(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
+    psi_charge = (psi_r if charge_nspinor is None
+                  else psi_r[:, :int(charge_nspinor)])
     prefactor = weight * spin_degeneracy
     if band_occupations is None:
         # Keep the exact-unit insulating path's incumbent arithmetic: no
         # multiply-by-one is inserted into its band/spinor reduction.
         rho = prefactor * jnp.sum(
-            jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+            jnp.real(jnp.conj(psi_charge) * psi_charge), axis=(0, 1))
     else:
         occ = band_occupations[:, None, None, None, None]
         rho = prefactor * jnp.sum(
-            occ * jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+            occ * jnp.real(jnp.conj(psi_charge) * psi_charge), axis=(0, 1))
     if not include_dirac_current:
         return rho
 
@@ -201,7 +208,6 @@ def _valence_density_kernel(
     # These are the signed normalized currents J_i = j_i/c = Psi^dagger
     # alpha_i Psi.  In particular there is NO 1/alpha_fs rescaling: that
     # belongs only to centroid selection's squared-current weight.
-    from common.gamma_matrices import gamma_apply, gamma_perm_phase
     psi_dag = jnp.conj(psi_r)
     currents = []
     for mu in (1, 2, 3):
@@ -225,6 +231,7 @@ def valence_density_from_kpoint(
     spin_degeneracy: float = 1.0,
     band_occupations: jnp.ndarray | np.ndarray | None = None,
     include_dirac_current: bool = False,
+    charge_nspinor: int | None = None,
 ) -> jnp.ndarray:
     """One k-point's contribution to ρ_v(r), on the ψ FFT box grid.
 
@@ -261,8 +268,20 @@ def valence_density_from_kpoint(
     returns ``(rho,Jx,Jy,Jz)`` from that same transform, where
     ``J_i = Psi^dagger alpha_i Psi = j_i/c``.  The default scalar branch is
     unchanged and does not trace any gamma operation.
+
+    ``charge_nspinor=2`` is the explicit Pauli-reference/current-only
+    comparison: the one resident raw four-spinor transform still supplies all
+    spatial currents, while rho sums only its normalized upper/source
+    two-spinor block.  ``None`` preserves the historical all-component charge
+    convention byte-for-byte.
     """
     include_current = bool(include_dirac_current)
+    if charge_nspinor is not None and not (
+        0 < int(charge_nspinor) <= int(psi_k_box.shape[1])
+    ):
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_nspinor} for nspinor={int(psi_k_box.shape[1])}")
     if include_current and int(psi_k_box.shape[1]) != 4:
         raise ValueError(
             "Dirac current requires four-component kinetic-balance "
@@ -284,7 +303,9 @@ def valence_density_from_kpoint(
         jnp.asarray(float(spin_degeneracy), dtype=jnp.float64),
         occupations,
         nocc=None if nocc is None else int(nocc),
-        include_dirac_current=include_current)
+        include_dirac_current=include_current,
+        charge_nspinor=(None if charge_nspinor is None
+                        else int(charge_nspinor)))
 
 
 # ===========================================================================

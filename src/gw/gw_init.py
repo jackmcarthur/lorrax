@@ -25,6 +25,12 @@ from common import jax_profile
 # being attribute-reachable off a bare ``import jax`` (an import-order
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
+from common.four_current_model import (
+	is_pauli_reference_model,
+	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+	PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
+	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+)
 from runtime import debug_print_enabled
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
@@ -171,7 +177,7 @@ _ZETA_PROVENANCE_SCHEMA = 2
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
                          write_ibz_only, band_norms, vertex_mu_L=0,
-                         transverse_identity=None):
+                         carrier_bispinor=None, transverse_identity=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -227,16 +233,14 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	storage ranges and cannot prove whether its last rows were padding or
 	physical bands; :func:`_zeta_reuse_ok` therefore fails it closed.
 
-	``transverse_identity`` pins the transverse CHANNEL on every stamp,
-	including the charge one: the transverse centroid count, that
-	table's content hash, and the two knobs that set the transverse
-	solve gauge (``distributed_lu`` and the resolved transverse solver
-	kind).  It is REQUIRED for a bispinor run — a bispinor ζ set whose
-	stamp did not name its transverse basis could be reused by a rerun
-	that changed ``centroids_file_current``, which is the σ^B analogue
-	of pattern #10.  It is ignored (all four keys collapse to ``None``)
-	for a non-bispinor run, where no transverse channel exists and the
-	keys must not force a spurious refit of any existing charge-only ζ.
+	``transverse_identity`` pins every raw-four-spinor ζ set to its transverse
+	centroid table and solve gauge.  The explicit Pauli-reference charge fit is
+	the one exception: that vertex consumes the same normalized two-spinor
+	carrier as a scalar OFF run, so its transverse fields collapse to the OFF
+	values and the bit-identical OFF charge ζ can be reused.  The three raw4
+	transverse ζ receipts still pin the current basis independently.  Historical
+	raw-charge stamps remain unchanged.  The identity is therefore still
+	REQUIRED for a bispinor run even when this one charge stamp ignores it.
 	"""
 	import json
 	if bool(cfg.bispinor) and not transverse_identity:
@@ -247,7 +251,12 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 			"let a rerun with a DIFFERENT centroids_file_current reuse "
 			"this fit (Σ^B evaluated at the wrong r_μ).  Pass the dict "
 			"built in fit_zeta's bispinor pre-flight.")
-	_ti = dict(transverse_identity or {}) if bool(cfg.bispinor) else {}
+	_carrier_bispinor = bool(
+		cfg.bispinor if carrier_bispinor is None else carrier_bispinor)
+	_couple_transverse = bool(
+		cfg.bispinor
+		and not (int(vertex_mu_L) == 0 and not _carrier_bispinor))
+	_ti = dict(transverse_identity or {}) if _couple_transverse else {}
 	from isdf.core import deprecated_env_record as _dep_env_record
 	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
 	# mf_header from — the authoritative identity of the ζ's input WFN.
@@ -278,7 +287,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'n_rmu':                int(meta.n_rmu),
 		'band_range_left_logical':  logical_left,
 		'band_range_right_logical': logical_right,
-		'bispinor':             bool(cfg.bispinor),
+		'bispinor':             _carrier_bispinor,
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
 		# EFFECTIVE (env-overridden) values, recorded via the SAME
@@ -323,10 +332,10 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		# refits on a real family mismatch.
 		'transverse_zeta_solve': (
 			str(cfg.backend.transverse_zeta_solve).strip().lower()
-			if cfg.bispinor else 'ridge'),
+			if _couple_transverse else 'ridge'),
 		'transverse_zeta_rcond': (
 			float(cfg.backend.transverse_zeta_rcond)
-			if (cfg.bispinor
+			if (_couple_transverse
 			    and str(cfg.backend.transverse_zeta_solve).strip().lower()
 			    == 'rank_truncate') else None),
 		# TRANSVERSE CHANNEL identity (2026-08-04, same reader-matrix
@@ -769,7 +778,7 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	from common.wfn_transforms import load_centroids_band_chunked
 	with timing.section("gw_jax.load_centroid_wfns_current"):
 		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
-			wfn, sym, meta_T, cent_T_idx, cfg.bispinor, mesh_xy,
+			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
 			band_range=band_slices.full_range,
 			band_chunk_size=int(band_chunk_size),
 			k_chunk_size=k_chunk_size,
@@ -1408,10 +1417,11 @@ def _resolve_zeta_fit_contract(
 		# that a fit or downstream Sigma sampling is actually required.
 		centroids_transverse = np.asarray(cent_T_np, dtype=np.int32)
 		meta_transverse = replace(
-			meta, n_rmu=int(n_rmu_T),
+			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4,
 			n_rmu_padded=int(padded_mu_extent(int(n_rmu_T),
 			                                  int(jax.device_count()))))
 		meta_transverse.sys_dim = meta.sys_dim
+		meta_transverse.bispinor = True
 		transverse_identity = {
 			"n_rmu": int(n_rmu_T),
 			"centroids_md5": _centroid_table_md5(cent_T_np),
@@ -1432,6 +1442,7 @@ def _resolve_zeta_fit_contract(
 		zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 		write_ibz_only=write_ibz_only_charge,
 		band_norms=band_norms,
+		carrier_bispinor=bool(int(meta.nspinor) == 4),
 		vertex_mu_L=0, transverse_identity=transverse_identity)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
@@ -1442,7 +1453,7 @@ def _resolve_zeta_fit_contract(
 			zeta_cutoff=zeta_cutoff,
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
-			band_norms=band_norms,
+			band_norms=band_norms, carrier_bispinor=True,
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
@@ -1845,7 +1856,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 				band_chunk_size=chunks['band_chunk'],
 				q_chunk_size=chunks['q_chunk'],
-				bispinor=cfg.bispinor,
+				bispinor=bool(int(meta.nspinor) == 4),
 				band_range_left=band_range_left,
 				band_range_right=band_range_right,
 				band_norms=_band_norms,
@@ -2074,7 +2085,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					psi_nmu_fresh=psi_nmu_fresh_T,
 					band_chunk_size=_chunks_T['band_chunk'],
 					q_chunk_size=_chunks_T['q_chunk'],
-					bispinor=cfg.bispinor,
+					bispinor=True,
 					band_range_left=band_range_left,
 					band_range_right=band_range_right,
 					band_norms=_band_norms,
@@ -2363,6 +2374,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 		with timing.section("gw_jax.V_q_compute"), \
 		     jax_profile.trace_section("V_q_compute_bispinor"):
+			_pauli_reference = is_pauli_reference_model(cfg.bispinor_gw)
 			# G-flat path: per-q + G-chunked, one orchestrator per
 			# four ζ files.  No legacy compute_V_q_tile chooser /
 			# μ × ν tiling / in-V_q FFT — see
@@ -2398,6 +2410,15 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						use_ibz=_use_ibz_bispinor,
 						tt_head_correction=bool(
 							cfg.head.bispinor_tt_head_correction),
+						bispinor_gw_mode=(
+							PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
+							if _pauli_reference else None),
+						charge_representation=(
+							PAULI_TWO_SPINOR_CHARGE_REPRESENTATION
+							if _pauli_reference else None),
+						spatial_current_representation=(
+							RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION
+							if _pauli_reference else None),
 					)
 
 		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
@@ -2672,7 +2693,7 @@ def prepare_isdf_and_wavefunctions(
 		charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
 			wfn=wfn,
 			wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-			role='charge', bispinor=bool(cfg.bispinor),
+			role='charge', bispinor=bool(int(meta.nspinor) == 4),
 			band_interval=_basis_band_interval,
 			fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
 			n_rmu_logical=int(meta.n_rmu),
@@ -2699,7 +2720,8 @@ def prepare_isdf_and_wavefunctions(
 			if not charge_zeta_reused:
 				chunks, gflat_plan = _plan_gflat_chunks_for_channel(
 					meta=meta, cfg=cfg, band_slices=band_slices,
-					mesh_xy=mesh_xy, is_bispinor=bool(cfg.bispinor),
+					mesh_xy=mesh_xy,
+					is_bispinor=bool(int(meta.nspinor) == 4),
 					print_fn=print0)
 
 			# Load centroid ψ once for the full [b0, b4) range; reused by
@@ -2712,7 +2734,8 @@ def prepare_isdf_and_wavefunctions(
 				else zeta_contract.loader_band_chunk)
 			with timing.section("gw_jax.load_centroid_wfns"):
 				psi_rmu_Y, psi_rmuT_X = load_centroids_band_chunked(
-					wfn, sym, meta, centroid_indices, cfg.bispinor, mesh_xy,
+					wfn, sym, meta, centroid_indices,
+					bool(int(meta.nspinor) == 4), mesh_xy,
 					band_range=band_slices.full_range,
 					band_chunk_size=load_band_chunk,
 					k_chunk_size=(
@@ -3204,7 +3227,8 @@ def prepare_isdf_and_wavefunctions(
 					wfn=wfn,
 					wfn_fingerprint_binding=(
 						basis_wfn_fingerprint_binding),
-					role='charge', bispinor=bool(cfg.bispinor),
+					role='charge',
+					bispinor=bool(int(meta.nspinor) == 4),
 					band_interval=_basis_band_interval,
 					fft_grid=meta.fft_grid,
 					centroid_fft_idx=centroid_indices,
@@ -3301,6 +3325,15 @@ def prepare_isdf_and_wavefunctions(
 				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
 				_have_t = _stamped.get('centroids_transverse_md5')
 				transverse_basis_receipt = None
+				_n_rmu_T_padded = (
+					int(rs.psi_nmu_transverse.shape[-1])
+					if cfg.memory.low_mem_bands else
+					int(rs.psi_rmu_Y_transverse.shape[-1]))
+				meta_restart_transverse = replace(
+					meta, n_rmu=int(_n_rmu_curr_now),
+					n_rmu_padded=_n_rmu_T_padded, nspinor=4, npol=4)
+				meta_restart_transverse.sys_dim = meta.sys_dim
+				meta_restart_transverse.bispinor = True
 				if _have_t is None:
 					print0(
 						f"  *** LORRAX SANITY: {tensors_filename} carries "
@@ -3334,10 +3367,6 @@ def prepare_isdf_and_wavefunctions(
 						f"bundle carries NO WavefunctionBasisReceipt; "
 						f"finite-transfer current construction will refuse. ***")
 				else:
-					_n_rmu_T_padded = (
-						int(rs.psi_nmu_transverse.shape[-1])
-						if cfg.memory.low_mem_bands else
-						int(rs.psi_rmu_Y_transverse.shape[-1]))
 					transverse_basis_receipt = (
 						WavefunctionBasisReceipt.from_bound_source(
 							wfn=wfn,
@@ -3365,7 +3394,8 @@ def prepare_isdf_and_wavefunctions(
 						"restart transverse ψ (psi_full_y_transverse)",
 						rs.psi_rmu_Y_transverse, print_fn=print0)
 					wfns_transverse = build_wavefunction_bundle(
-						wfn, sym, meta, band_slices, mesh_xy,
+						wfn, sym, meta_restart_transverse,
+						band_slices, mesh_xy,
 						psi_rmu_Y=rs.psi_rmu_Y_transverse,
 						psi_rmuT_X=rs.psi_rmuT_X_transverse,
 						basis_receipt=transverse_basis_receipt,

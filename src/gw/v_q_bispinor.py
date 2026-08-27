@@ -286,6 +286,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # (default off — every existing deck's TT tiles are byte-identical).
     # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
     tt_head_correction: bool = False,
+    # Present only for the explicit mixed-representation comparison.  Leaving
+    # these unset preserves the historical bare_transverse artifact exactly.
+    bispinor_gw_mode: str | None = None,
+    charge_representation: str | None = None,
+    spatial_current_representation: str | None = None,
 ) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -558,6 +563,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 [list(t) for t in sorted(ZERO_TILES)])
             f.attrs["hermitian_pairs"] = json.dumps(
                 [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
+            if bispinor_gw_mode is not None:
+                f.attrs["bispinor_gw_mode"] = str(bispinor_gw_mode)
+            if charge_representation is not None:
+                f.attrs["charge_representation"] = str(
+                    charge_representation)
+            if spatial_current_representation is not None:
+                f.attrs["spatial_current_representation"] = str(
+                    spatial_current_representation)
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
     if any(vector is None for vector in g0_by_channel):
         missing = [i for i, vector in enumerate(g0_by_channel)
