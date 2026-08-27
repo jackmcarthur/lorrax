@@ -24,7 +24,7 @@ def _meta(*, ns=4, mu=2400, nr=75 * 75 * 250, ngkmax=None):
 
 
 def _synthetic_plan(*, ns=4, face_nb=256, fit_nb=250, budget=80.0,
-                    r_override=None, mesh=(4, 4)):
+                    r_override=None, mesh=(4, 4), current_vertex=False):
     return plan_gflat_chunks(
         meta=_meta(ns=ns, ngkmax=30_000),
         mesh_xy=SimpleNamespace(shape={'x': mesh[0], 'y': mesh[1]}),
@@ -32,7 +32,8 @@ def _synthetic_plan(*, ns=4, face_nb=256, fit_nb=250, budget=80.0,
         ngkmax=30_000, n_q_disk=36, budget_gb=budget,
         target_utilization=0.80, band_chunk_override=16,
         r_chunk_override=r_override,
-        distributed_zeta_solve="distributed", low_mem_bands=True)
+        distributed_zeta_solve="distributed", low_mem_bands=True,
+        face_current_vertex=current_vertex)
 
 
 def _run50_plan():
@@ -100,8 +101,15 @@ def test_cri3_prices_bounded_centroid_and_full_k_zeta_ffts_separately():
             - hoisted.persistent_bytes) == 12_960_000_000
 
 
-def test_four_total_rank3_slots_have_one_owner_and_no_double_charge():
-    assert _face_pair_density_slots() == 4
+def test_face_pair_arena_distinguishes_charge_and_current_executables():
+    assert _face_pair_density_slots(ns=4, current_vertex=False) == 4
+    assert _face_pair_density_slots(ns=4, current_vertex=True) == 16
+    charge = _synthetic_plan(
+        current_vertex=False, r_override=16_000, budget=200.0)
+    current = _synthetic_plan(
+        current_vertex=True, r_override=16_000, budget=200.0)
+    assert (current.peak_breakdown["C_fit_one_rchunk"]
+            > charge.peak_breakdown["C_fit_one_rchunk"])
     tree = ast.parse(
         (Path(__file__).resolve().parents[1]
          / "src/gw/gflat_memory_model.py").read_text())

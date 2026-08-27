@@ -1535,7 +1535,8 @@ def _resolve_zeta_fit_contract(
 
 
 def _plan_gflat_chunks_for_channel(
-		*, meta, cfg, band_slices, mesh_xy, is_bispinor, print_fn=print):
+		*, meta, cfg, band_slices, mesh_xy, is_bispinor,
+		face_current_vertex=False, print_fn=print):
 	"""Chunk-plan ONE ISDF centroid channel: the charge channel
 	(``meta.n_rmu``) or one transverse channel (``meta.n_rmu`` — μ_T is
 	typically ≈ μ_C/3).
@@ -1598,6 +1599,7 @@ def _plan_gflat_chunks_for_channel(
 		                           if mem.gflat_chunk_size > 0 else None),
 		distributed_zeta_solve=str(cfg.backend.distributed_zeta_solve),
 		low_mem_bands=bool(mem.low_mem_bands),
+		face_current_vertex=bool(face_current_vertex),
 		# Stage F writes per-rank hyperslabs; the planner therefore
 		# charges only the local sharded tile.
 	)
@@ -1852,7 +1854,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		if not all(_reuse_T):
 			_chunks_T, _ = _plan_gflat_chunks_for_channel(
 				meta=_meta_T, cfg=cfg, band_slices=band_slices,
-				mesh_xy=mesh_xy, is_bispinor=True, print_fn=print_fn)
+				mesh_xy=mesh_xy, is_bispinor=True,
+				face_current_vertex=True, print_fn=print_fn)
 	# Fresh writers and provenance stamps consume exactly the identity that
 	# was tested before planning; there is no second reconstruction here.
 	_provenance = zeta_contract.provenance
