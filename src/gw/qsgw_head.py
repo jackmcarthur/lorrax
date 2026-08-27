@@ -3242,8 +3242,16 @@ def static_gauge_second_order_component_sharded(
         return multiply_six(left, right)[:count]
 
     def _cartesian_covariant_derivatives(operators):
+        if operators.shape[0] != 2:
+            raise ValueError(
+                "static-gauge Cartesian derivatives require exactly the "
+                f"in-plane x/y operators; got shape {operators.shape}")
         rows = []
-        for operator in operators:
+        # Global jax.Array objects cannot be Python-iterated when their band
+        # matrix axes span hosts.  The Cartesian axis is statically replicated,
+        # so select its two components without gathering the distributed body.
+        for component in range(2):
+            operator = operators[component]
             reduced = fourth_order_covariant_derivative(
                 operator,
                 links,
