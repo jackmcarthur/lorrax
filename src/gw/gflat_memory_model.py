@@ -45,11 +45,13 @@ not sum); the full-BZ ``Z_q`` is charged as LIVE ACROSS the solve seam
 outranks the μ-wide performance floor.  ``r_chunk_override`` still wins
 over all of it — the register-documented run-level workaround.
 
-Bispinor (§1b): charge and the 3 transverse fits are exactly parallel with
-``mu_T <= mu_C``, so the charge shape remains the planning binder.  Legacy
-uses the calibrated open-spin ``ns²`` pair density.  Face layout completes
-one scalar spin pair's full band sum before its k-IFFTs and prices the cold-
-HLO four-total rank-3 live set; it never imports the legacy ``ns²`` carrier.
+Bispinor (§1b): charge and the 3 transverse fits share one planner but not
+one arena count.  Legacy uses the calibrated open-spin ``ns²`` pair density.
+Face source completes one scalar spin pair's band sum before its k-IFFTs;
+the identity executable retains four rank-3 buffers, while XLA places the
+nonidentity-current loop in one ``ns²``-wide arena.  The caller states which
+executable it will run so a smaller transverse ``mu_T`` cannot hide that
+different placement.
 
 SCOPE, STATED SO IT IS NOT ASSUMED: this model prices Stages A-F — the
 ISDF ζ fit through the V_q tensor write — and NOTHING PAST IT.  The
@@ -130,15 +132,24 @@ def _pair_density_slots() -> int:
         return 3
 
 
-def _face_pair_density_slots() -> int:
-    """Total rank-3 equivalents live at the face pair-accumulation peak.
+def _face_pair_density_slots(*, ns: int, current_vertex: bool) -> int:
+    """Rank-3 equivalents in the face pair executable's one HLO arena.
 
-    The exact cold P4 production closure at ``49d0b405`` retains four:
-    old ``Z_R``, the two k-IFFT outputs, and new ``Z_R``.  This is the sole
-    slot-count owner for the scalar-pair face executable; accumulated-Z and
-    k-FFT terms must not be charged again beside it.
+    The identity/charge executable retains four at its calibrated peak:
+    old ``Z_R``, the two k-IFFT outputs, and new ``Z_R``.  The nonidentity
+    current executable is different: XLA places its scalar-spin-pair loop as
+    one open-spin ``(nk, ns, ns, mu/Px, r/Py)`` temporary arena, i.e.
+    ``ns**2`` rank-3 equivalents.  Run153 measured the exact ns=4 shape
+    ``(36,4,4,200,10368)c128`` (19,110,297,600 B before BFC rounding).
+
+    This function is the sole slot-count owner for both executables.  Keep
+    the distinction structural; applying the current count to charge would
+    discard the independently measured four-slot charge route.
     """
-    return 4
+    ns = int(ns)
+    if ns <= 0:
+        raise ValueError(f"ns must be positive, got {ns}")
+    return ns * ns if bool(current_vertex) else 4
 
 
 # Analytic FALLBACK factor for the FFT box, used only when it cannot be
@@ -343,11 +354,11 @@ def _stage_C_face_terms(
         band_chunk, n_band_chunks) -> dict[str, float]:
     """Analytic live-shape census for the scalar-pair face kernel.
 
-    No term carries an open ``ns²`` axis.  One scalar spin pair completes
-    its full band sum before either k-IFFT, so the pair peak is a fixed count
-    of rank-3 ``(nk, mu/Px, r/Py)`` equivalents.  ``slots`` is already the
-    *total* cold-HLO count from :func:`_face_pair_density_slots`; accumulated
-    Z and k-IFFT outputs are included there and are not additional terms.
+    Source evaluates one scalar spin pair at a time, but the executable's
+    allocation may still be placed as an ``ns²``-wide arena.  Express both
+    cases as a count of rank-3 ``(nk, mu/Px, r/Py)`` equivalents.  ``slots``
+    is the *total* count from :func:`_face_pair_density_slots`; accumulated Z
+    and k-IFFT outputs are included there and are not additional terms.
 
     ``face_nb`` is the exact ``psi_mun[..., b0:b4]`` carrier width, distinct
     from both the legacy inventory and a possibly narrowed zeta-fit union.
@@ -365,7 +376,7 @@ def _stage_C_face_terms(
     return {
         # psi_mun_conj plus the selected-row gather and psum result.
         "constant": face_conj + 2.0 * x_block,
-        # Four total rank-3 equivalents at the calibrated pair peak.
+        # Complete executable-specific rank-3-equivalent arena.
         "pair_arena_slope": pair_peak,
         "y_block_slope": y_block,
         "y_source_slope": y_source,
@@ -531,6 +542,7 @@ def plan_gflat_chunks(
     pair_density_slots: int | None = None,
     distributed_zeta_solve: str = "auto",
     low_mem_bands: bool = False,
+    face_current_vertex: bool = False,
 ) -> GFlatChunkPlan:
     """Pick ``(band_chunk, centroid_k_chunk, r_chunk, q_chunk,
     gflat_chunk_size)`` so the
@@ -561,6 +573,10 @@ def plan_gflat_chunks(
     :func:`_persistent_bytes`.  When that face inventory fits but the
     all-band ψ(r) hoist does not, it also selects the canonical streamed
     band-chunk FFT route.  The legacy/default route retains the hoist.
+
+    ``face_current_vertex`` selects the nonidentity-current face executable's
+    measured ``ns²`` arena.  False preserves the independently calibrated
+    four-slot identity/charge executable.
     """
     p_x = int(mesh_xy.shape['x'])
     p_y = int(mesh_xy.shape['y'])
@@ -594,7 +610,8 @@ def plan_gflat_chunks(
         target_utilization = bfc_fragmentation_target_utilization(ns)
     slots = pair_density_slots if pair_density_slots is not None \
         else _pair_density_slots()
-    face_slots = _face_pair_density_slots()
+    face_slots = _face_pair_density_slots(
+        ns=ns, current_vertex=bool(face_current_vertex))
 
     budget = budget_gb * 1e9
     target = budget * target_utilization
