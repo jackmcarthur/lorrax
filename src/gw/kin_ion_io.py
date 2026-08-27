@@ -107,6 +107,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
+import symmetry_maps                                           # noqa: E402
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
     HARTREE_DATASET, HARTREE_OCCUPATION_POLICY,
