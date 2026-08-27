@@ -40,7 +40,6 @@ Overrides (set before `module load`)
   LORRAX_SLATE_INSTALL_DIR  default @LORRAX_SLATE_INSTALL_DIR_DEFAULT@
   LORRAX_MPI_TYPE           default @LORRAX_MPI_TYPE_DEFAULT@ (|none|pmi2|pmix)
   LORRAX_NGPU               default 4 for lxrun, 1 for lxshell
-  JAX_COMPILATION_CACHE_DIR default $SCRATCH/.jax_cache
 
 Do NOT use bare `python` / `python3` — the module configures a Shifter
 container, not the host Python.  For non-Shifter local dev, use `uv run`.
@@ -112,11 +111,6 @@ local phdf5_host         = env_or("LORRAX_FFI_PHDF5_DIR",     default_phdf5_host
 local slate_host         = env_or("LORRAX_FFI_SLATE_DIR",     default_slate_host)
 local fftw_host          = env_or("LORRAX_FFI_FFTW_DIR",      default_fftw_host)
 local slate_install_host = env_or("LORRAX_SLATE_INSTALL_DIR", default_slate_install)
-
--- XLA persistent compile cache.  Amortises PTX JIT across JAX processes;
--- does NOT cut the CUDA backend init itself.
-local jax_cache_dir = env_or("JAX_COMPILATION_CACHE_DIR",
-    pathJoin(env_or("SCRATCH", os.getenv("HOME")), ".jax_cache"))
 
 -- =========================================================================
 --  Performance env (inside and outside container)
@@ -194,7 +188,6 @@ local shifter_env_parts = {
     -- re-asserts it inside, but passing via --env also covers one-off
     -- invocations that don't use in_container.sh (e.g. lxshell).
     "--env=MPICH_GPU_SUPPORT_ENABLED=1",
-    "--env=JAX_COMPILATION_CACHE_DIR=" .. jax_cache_dir,
     "--env=LORRAX_MPI_INCLUDE_DIR=/lorrax_phdf5/include",
     "--env=LORRAX_MPICH_LIB_DIR=" .. mpich_container_dir,
 }
@@ -237,7 +230,6 @@ setenv("LORRAX_FFI_PHDF5_HOST",    phdf5_host)
 setenv("LORRAX_FFI_SLATE_HOST",    slate_host)
 setenv("LORRAX_FFI_FFTW_HOST",     fftw_host)
 setenv("LORRAX_SLATE_INSTALL_DIR", slate_install_host)
-setenv("JAX_COMPILATION_CACHE_DIR", jax_cache_dir)
 
 -- =========================================================================
 --  Shell functions

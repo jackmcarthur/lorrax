@@ -144,6 +144,11 @@ def _nvsmi_used_mb_local_gpu():
         return 0
 
 
+def _collect_fit_setup_garbage():
+    """Collect dead setup arrays without flushing process-wide JIT caches."""
+    gc.collect()
+
+
 def fit_zeta_to_h5(
     wfn,
     sym,
@@ -610,8 +615,7 @@ def fit_zeta_to_h5(
     # This is critical for fitting within memory budget
     del C_q, C_q_flat
     with timing.section("zeta_fit.gc_pre_chunk_loop"):
-        gc.collect()
-        jax.clear_caches()  # Clear JAX function caches that may hold array refs
+        _collect_fit_setup_garbage()
 
     # ========== STEP 4a: q-IBZ reduction + header writes (rank 0) ==========
     # When ``write_ibz_only=True`` (default), ζ is written for IBZ q's

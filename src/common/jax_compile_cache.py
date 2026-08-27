@@ -12,6 +12,9 @@ Knobs (all optional):
 
   ``ISDF_JAX_CACHE_DIR=/some/path``    — override cache location.
   ``ISDF_JAX_CACHE_DIR=""``             — opt out entirely.
+  ``LORRAX_RUN_DIR=/some/run``         — when the cache knob is unset, share
+                                          ``.lorrax_jax_cache`` only among
+                                          processes/drivers in this workflow.
   ``LORRAX_JAX_CACHE_MULTIPROCESS=0``   — restore the scorecard-AG refusal
                                           (no cache at all when P > 1).
   ``LORRAX_JAX_CACHE_AGREE_TIMEOUT_S``  — agreement timeout, default 300.
@@ -62,22 +65,24 @@ Knobs (all optional):
                                           only at P=1. Live LRU eviction is
                                           refused at P>1 because it can
                                           invalidate the agreed startup set.
+  ``JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS`` — standard JAX write
+                                          threshold (default 1 second).  LORRAX
+                                          does not lower it: cheap compiles are
+                                          cheaper than a Lustre entry.
 
-Default location (``ISDF_JAX_CACHE_DIR`` unset) is
-``$SCRATCH/lorrax_jax_cache`` when ``$SCRATCH`` is set, else
-``$XDG_CACHE_HOME``/``~/.cache`` + ``/isdf_jax_compilation`` — the resolved
-default is announced once at init.  Entries live in ``{base}/np{N_proc}/``
-— ONE directory shared by every rank of a world size (the old ``rank{i}/``
-partitioning is gone; see below).
+Default policy (``ISDF_JAX_CACHE_DIR`` unset) prefers the workflow: when
+``LORRAX_RUN_DIR`` is set, entries live in
+``$LORRAX_RUN_DIR/.lorrax_jax_cache/np{N_proc}/``.  Launchers without an
+explicit run directory retain the legacy ``$SCRATCH/lorrax_jax_cache`` (or
+``$XDG_CACHE_HOME``/``~/.cache``) fallback until the required P=4 default-flip
+A/B is available.  The workflow path avoids a cross-material cache that grows
+by tens of thousands of small files for the usual one-shot calculation while
+allowing kmeans/dipole/kin-ion/GW processes in one named workflow to reuse
+compatible entries.  An explicit ``ISDF_JAX_CACHE_DIR`` still overrides or
+opts out.  JAX's in-process executable cache is active in every case.
 
-**Why ``$SCRATCH`` comes first.**  One entry is one small file, and a
-populated world size is several hundred of them (301 for the gw fixture at
-P=8, 886 measured for a big deck), so a default under ``/home1`` eats inodes
-on the filesystem whose *inode* quota locks you out of the machine (ADVICE
-section 2).  The cache is enabled by default, so the safe location has to be
-the code's default rather than shell-alias advice.  Correctness does not
-depend on this — the directory only has to be visible to every rank, which
-``$SCRATCH`` and ``$WORK`` both are and ``/tmp`` is NOT.
+Within an enabled base, ``np{N_proc}`` is ONE directory shared by every rank
+of that world size (the old ``rank{i}/`` partitioning is gone; see below).
 
 The ``ISDF_*`` env-var naming is legacy — historically this was for ISDF
 kernels only, now it caches the whole run.  Left as-is for backward
@@ -249,6 +254,7 @@ import atexit
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 import warnings
@@ -275,6 +281,7 @@ class _CacheState:
     """Per-process bookkeeping for the agreed cache (also the atexit report)."""
 
     def __init__(self) -> None:
+        self._write_lock = threading.Lock()
         self.enabled = False
         self.dir = ""
         self.n_proc = 1
@@ -288,6 +295,13 @@ class _CacheState:
         self.compile_secs = 0.0
         self.read_secs = 0.0   # time spent loading executables from disk
         self.prefetch_secs = 0.0
+        # JAX calls the file-cache writer on process 0 only.  Keep these
+        # explicitly process-local: summing them across ranks would turn one
+        # physical write into a fictitious P writes.  The atomic, unlimited
+        # path below is the only path whose successful writes and exact
+        # payload bytes we can observe without changing JAX's LRU policy.
+        self.write_metrics_available = False
+        self.reset_write_metrics()
         self.agreed: frozenset[str] = frozenset()
         # THE KEY SET.  Every persistent-cache key this rank asked about,
         # hit or miss.  The counters above cannot express the invariant the
@@ -296,6 +310,42 @@ class _CacheState:
         # which is the state that precedes the collective-compile deadlock.
         # A set of keys is the only observable that separates those.
         self.probe_keys: set[str] = set()
+
+    def reset_write_metrics(self) -> None:
+        """Reset this process's successful-write receipt deterministically."""
+        with self._write_lock:
+            self.local_writes = 0
+            self.local_write_bytes = 0
+            self.local_write_secs = 0.0
+
+    def set_write_metrics_available(self, available: bool) -> None:
+        """Record whether this cache policy has an observable write boundary."""
+        with self._write_lock:
+            self.write_metrics_available = bool(available)
+
+    def record_write(self, nbytes: int, elapsed_s: float) -> None:
+        """Record one completed local write; callers hold no state lock."""
+        with self._write_lock:
+            # The actual instrumented boundary is stronger evidence than an
+            # earlier setup-time guess (JAX may have constructed its cache
+            # lazily before LORRAX initialization).
+            self.write_metrics_available = True
+            self.local_writes += 1
+            self.local_write_bytes += int(nbytes)
+            self.local_write_secs += max(0.0, float(elapsed_s))
+
+    def write_metrics(self) -> dict:
+        """Snapshot process-local write metrics without torn counter reads."""
+        with self._write_lock:
+            available = self.write_metrics_available
+            return {
+                "write_metrics_available": available,
+                "local_writes": self.local_writes if available else None,
+                "local_write_bytes": (
+                    self.local_write_bytes if available else None),
+                "local_write_secs": (
+                    self.local_write_secs if available else None),
+            }
 
 
 _STATE = _CacheState()
@@ -1127,6 +1177,10 @@ def _install_atomic_put_patch() -> None:
     class _AtomicLRUCache(_lru.LRUCache):
         def put(self, key: str, val: bytes) -> None:
             if self.eviction_enabled:
+                # Stock LRUCache.put returns None for both a write and a
+                # pre-existing entry, and may evict under its file lock.  Do
+                # not manufacture write/eviction numbers for that opaque P=1
+                # policy path.
                 return super().put(key, val)
             if not key:
                 raise ValueError("key cannot be empty")
@@ -1135,6 +1189,7 @@ def _install_atomic_put_patch() -> None:
                 return
             tmp = self.path / (f".{key}{_lru._CACHE_SUFFIX}.tmp."
                                f"{os.getpid()}.{uuid.uuid4().hex[:8]}")
+            t0 = time.monotonic()
             try:
                 tmp.write_bytes(val)
                 os.replace(str(tmp), str(final))
@@ -1144,6 +1199,10 @@ def _install_atomic_put_patch() -> None:
                 except OSError:
                     pass
                 raise
+            # ``val`` is the serialized/compressed payload JAX hands to the
+            # file cache.  Count only after the atomic rename succeeds: a
+            # failed write remains an exception and never becomes a receipt.
+            _STATE.record_write(len(val), time.monotonic() - t0)
 
     # THE SURVIVING SHIM — and the reason it survives is NOT a jax version.
     #
@@ -1187,6 +1246,7 @@ def _install_atomic_put_patch() -> None:
     def _atomic_get_file_cache(path: str):
         cache = _AtomicLRUCache(
             path, max_size=_cfg.compilation_cache_max_size.value)
+        _STATE.set_write_metrics_available(not cache.eviction_enabled)
         if (_verification_cache is not None and _check_contents is not None
                 and _check_contents.value):
             return _verification_cache(cache), path
@@ -1281,6 +1341,7 @@ def _dump_keys() -> None:
     if not dest:
         return
     s = _STATE
+    writes = s.write_metrics()
     path = Path(dest)
     path.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1295,6 +1356,12 @@ def _dump_keys() -> None:
         "vetoed": s.blocked,
         "n_seen": s.n_seen,
         "n_agreed": s.n_agreed,
+        # These are THIS PROCESS'S completed writes.  JAX invokes its
+        # persistent-cache writer on process 0 only, so peers correctly
+        # report zero rather than duplicating p0's work.
+        **writes,
+        "is_cache_writer": s.proc_idx == 0,
+        "write_scope": "process-local; JAX writes on process 0 only",
         # SORTED, so a reader diffing two ranks' files sees the divergence
         # and not an iteration order.
         "keys": sorted(s.probe_keys),
@@ -1336,16 +1403,27 @@ def bound_cache_dir() -> str:
 
 def _report_impl() -> None:
     s = _STATE
+    writes = s.write_metrics()
     bound = bound_cache_dir()
     # Only spelled out when it DISAGREES with what we asked for: the
     # agreement, the veto and the writes all key off the asked-for
     # directory, so a disagreement means the cache is inert in a way no
     # other number on this line shows.
     where = "" if (not bound or bound == s.dir) else f" BOUND-ELSEWHERE={bound}"
+    if writes["write_metrics_available"]:
+        write_receipt = (
+            f"cache_writes_local={writes['local_writes']} "
+            f"bytes={writes['local_write_bytes']} "
+            f"({writes['local_write_secs']:.2f}s; JAX p0-only)  ")
+    else:
+        write_receipt = (
+            "cache_writes_local=unmeasured "
+            "(cache off or capped-LRU path; JAX p0-only)  ")
     msg = (f"rank {s.proc_idx}/{s.n_proc} summary: "
            f"xla_compiles={s.compiles} ({s.compile_secs:.2f}s)  "
            f"cache_probes={s.probes} hits={s.hits} "
            f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
+           f"{write_receipt}"
            f"agreed={s.n_agreed}/{s.n_seen} "
            f"prefetch={s.prefetch_secs:.2f}s  enabled={s.enabled}{where}")
     # A healthy per-rank performance receipt is forensic detail.  Binding to
@@ -1355,17 +1433,46 @@ def _report_impl() -> None:
 
 
 def compile_cache_stats() -> dict:
-    """Snapshot of this rank's compile/cache counters (for tests + probes)."""
+    """Snapshot this rank's cache counters; unavailable writes are ``None``."""
     s = _STATE
+    writes = s.write_metrics()
     return {
         "enabled": s.enabled, "dir": s.dir, "n_proc": s.n_proc,
         "proc_idx": s.proc_idx, "n_seen": s.n_seen, "n_agreed": s.n_agreed,
         "probes": s.probes, "hits": s.hits, "vetoed": s.blocked,
         "compiles": s.compiles, "compile_secs": s.compile_secs,
         "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
+        **writes,
+        "is_cache_writer": s.proc_idx == 0,
+        "write_scope": "process-local; JAX writes on process 0 only",
         "bound_dir": bound_cache_dir(),
         "keys": sorted(s.probe_keys),
     }
+
+
+def _resolve_cache_base_dir() -> tuple[str, str]:
+    """Resolve the one persistent-cache owner without inventing global state.
+
+    ``ISDF_JAX_CACHE_DIR`` is the explicit expert control, including its empty
+    opt-out.  Otherwise ``LORRAX_RUN_DIR`` scopes reuse to one workflow.  With
+    neither set, retain the legacy scratch/home fallback until the separately
+    required P=4 default-flip experiment can be run.
+    """
+    explicit = os.environ.get("ISDF_JAX_CACHE_DIR")
+    if explicit is not None:
+        return explicit.strip(), "explicit"
+
+    run_dir = os.environ.get("LORRAX_RUN_DIR", "").strip()
+    if run_dir:
+        return os.path.join(run_dir, ".lorrax_jax_cache"), "LORRAX_RUN_DIR"
+
+    scratch = os.environ.get("SCRATCH", "").strip()
+    if scratch:
+        return os.path.join(scratch, "lorrax_jax_cache"), "$SCRATCH fallback"
+
+    base_cache = os.environ.get(
+        "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+    return os.path.join(base_cache, "isdf_jax_compilation"), "home fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1508,8 @@ def ensure_jax_compile_cache() -> None:
         proc_idx = 0
     _STATE.n_proc = n_proc
     _STATE.proc_idx = proc_idx
+    _STATE.reset_write_metrics()
+    _STATE.set_write_metrics_available(False)
 
     # Legacy shared caches (pre-AH) can still be on disk with entries whose
     # device binding does not match; JAX warns once per primitive per jit.
@@ -1439,53 +1548,24 @@ def ensure_jax_compile_cache() -> None:
                  f"will read 0 no matter what this run compiles — do not "
                  f"read that as a cache hit.")
 
-    cache_dir = os.environ.get("ISDF_JAX_CACHE_DIR")
-    default_note = None
-    if cache_dir is None:
-        # Default chain (announced once, rank 0, below): $SCRATCH first.
-        # A populated world size is several hundred small files (886
-        # measured for a big deck), and this module's own docstring has
-        # always said the default under /home1 eats the inode quota that
-        # locks a user out of the machine.  With the cache now enabled by
-        # default at all P, the safe location must be the CODE's default,
-        # not a docstring plea (release audit 2026-07-28).
-        scratch = os.environ.get("SCRATCH", "").strip()
-        if scratch:
-            cache_dir = os.path.join(scratch, "lorrax_jax_cache")
-            default_note = "$SCRATCH default"
-        else:
-            base_cache = os.environ.get(
-                "XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-            cache_dir = os.path.join(base_cache, "isdf_jax_compilation")
-            default_note = ("no $SCRATCH in the environment — falling back "
-                            "under the home filesystem; several hundred "
-                            "small files per world size, WATCH THE INODE "
-                            "QUOTA or set ISDF_JAX_CACHE_DIR")
-    else:
-        # A whitespace-only value is the ""-opt-out, not a real path.
-        cache_dir = cache_dir.strip()
-    if not cache_dir:  # explicit opt-out via ISDF_JAX_CACHE_DIR=""
-        # Announce the opt-out (workstream AT).  This used to be silent, and
-        # the production harnesses kept exporting ISDF_JAX_CACHE_DIR="" for a
-        # reason that STOPPED being true when the AH agreement layer landed
-        # ("the shared cache deadlocks at P>1" — it no longer can, by
-        # construction).  An env var that silently disables a measured win is
-        # exactly the env-coupled-behavior class (quality-pattern #8): say it
-        # once, on rank 0, so a stale harness line is visible in every log.
+    cache_dir, cache_source = _resolve_cache_base_dir()
+    if not cache_dir:  # only the explicit empty/whitespace opt-out reaches here
         if proc_idx == 0:
             _say(f"persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" "
-                 f"opt-out): every rank compiles every module, every run. "
-                 f"Safe at any P since the AH agreement layer; to enable, "
-                 f"unset ISDF_JAX_CACHE_DIR (the default resolves under "
-                 f"$SCRATCH) or point it at any rank-visible directory.")
+                 f"opt-out). JAX's in-process "
+                 f"executable cache remains active. For reuse among "
+                 f"sequential drivers in one workflow, set LORRAX_RUN_DIR; "
+                 f"for a deliberate restart campaign, set "
+                 f"ISDF_JAX_CACHE_DIR to a rank-visible directory.")
         return
 
-    if default_note is not None and proc_idx == 0:
-        # Announce the resolved default exactly once — a location the user
-        # never chose must be visible in the log (quality-pattern #8).
+    if cache_source != "explicit" and proc_idx == 0:
+        # A derived location must be visible in the log (quality-pattern #8).
+        label = ("workflow-local" if cache_source == "LORRAX_RUN_DIR"
+                 else "legacy fallback")
         _debug_say(
-            f"cache dir (default): {cache_dir} ({default_note}; override "
-            f"with ISDF_JAX_CACHE_DIR, \"\" opts out).")
+            f"cache dir ({label}): {cache_dir} ({cache_source}; "
+            f"ISDF_JAX_CACHE_DIR overrides, \"\" opts out).")
 
     # ---- back-compat escape hatch: the scorecard-AG refusal --------------
     if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS", "1"):
@@ -1503,7 +1583,6 @@ def ensure_jax_compile_cache() -> None:
             _say("persistent compile cache OFF "
                  "(JAX_COMPILATION_CACHE_MAX_SIZE=0).")
         return
-
     # ONE directory per world size, shared by every rank (see docstring).
     cache_path = Path(cache_dir).expanduser() / f"np{n_proc}"
     _STATE.dir = str(cache_path)
@@ -1518,7 +1597,10 @@ def ensure_jax_compile_cache() -> None:
     try:
         import jax as _jax
         _jax.config.update("jax_compilation_cache_dir", str(cache_path))
-        _jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+        # Keep JAX's standard one-second write threshold (or the user's
+        # JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS override).  Forcing zero
+        # here created one Lustre file for every trivial compile and defeated
+        # the purpose of a run-local cache.
         if n_proc > 1:
             # See docstring §4: JAX would otherwise auto-enable XLA's own
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
@@ -1542,10 +1624,9 @@ def ensure_jax_compile_cache() -> None:
     # `jax._src.compilation_cache._cache` is built ONCE, lazily, at the first
     # compile that consults the cache, from `jax_compilation_cache_dir` AS IT
     # READ THEN — and `reset_cache()` is the only way to rebind it; a later
-    # `config.update` does not.  The retired `lorrax_J070` modulefile exported
-    # `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` and passes it into the
-    # Shifter container (`0.1.0.lua:312` and the `--env=` at `:252`), JAX picks
-    # that up at import, and the mesh warm-up in
+    # `config.update` does not.  Older deployed modulefiles exported
+    # `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` into the Shifter
+    # container, JAX picked that up at import, and the mesh warm-up in
     # `runtime.initialize_communicator_stack` compiles before this function is
     # reached.  So by the time we get here the cache is already bound to
     # `.jax_cache` (19950 entries, actively written) while everything in THIS
@@ -1585,8 +1666,8 @@ def ensure_jax_compile_cache() -> None:
             if proc_idx == 0:
                 _debug_say(
                     f"rebound JAX's compile cache from {_prev_bound} "
-                    f"(inherited, usually JAX_COMPILATION_CACHE_DIR from the "
-                    f"module) to {cache_path}.  The inherited directory is "
+                    f"(inherited through JAX_COMPILATION_CACHE_DIR) to "
+                    f"{cache_path}.  The inherited directory is "
                     f"not per-world-size, so the P>1 agreement cannot be "
                     f"taken over it.")
 
