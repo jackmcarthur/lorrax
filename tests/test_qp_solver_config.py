@@ -202,6 +202,22 @@ def test_isometric_selector_splits_finite_q_from_scalar_head(tmp_path):
     assert not rep.scalar_head_bispinor
 
 
+def test_isometric_full_static_diagnostic_refuses_restart_write_default(
+        tmp_path):
+    with pytest.raises(ValueError, match="write_restart_tensors = true"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = "
+            "isometric_kinetic_balance_full_static_cohsex_headless_diagnostic\n"
+            "compute_mode = cohsex\n"
+            "head_correction = off\n"
+            "low_mem_bands = true\n"
+            "w_dyson_solver = distributed\n"
+            "restart = false\n"
+            "sys_dim = 2\n")
+
+
 def test_isometric_full_static_diagnostic_is_explicitly_headless(tmp_path):
     extra = (
         "bispinor = true\n"
