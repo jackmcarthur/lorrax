@@ -93,7 +93,13 @@ from .head_correction import (
 	format_static_head_diagnostics,
 )
 from .wavefunction_bundle import BandSlices
-from .production_report import GWProductionReport
+from .production_report import (
+	EQP0_FILE_ROLE,
+	EQP1_FILE_ROLE,
+	QP_ROTATIONS_FILE_ROLE,
+	QP_WFN_FILE_ROLE,
+	GWProductionReport,
+)
 from runtime.production_stream import ProductionStdout
 from .gw_output import (
 	GWResults,
@@ -609,7 +615,9 @@ def main(argv=None):
 	# step — static COHSEX kernels for X_ONLY/COHSEX, the PPM pipeline
 	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
 	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
-	# E_DFT (textbook G0W0; ``solve_qp`` re-evaluates for fixed_point).
+	# E_DFT (a one-shot full-matrix effective Hamiltonian, distinct from the
+	# fixed-state diagonal G0W0 output; ``solve_qp`` re-evaluates for
+	# fixed_point).
 	# SC-iteration-1 ≡ this call, pinned by tests/test_invariance_gates.py
 	# ::test_sc_iteration1_equals_one_shot.
 	# SC runs skip it — the iteration map would re-do this work on iter 1.
@@ -931,7 +939,7 @@ def main(argv=None):
 	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
 		write_qp_wfn_oneshot(
 			U_full, E_full, wfn=wfn, band_slices=band_slices,
-			input_dir=input_dir, print_fn=print0)
+			input_dir=input_dir, qp_solver=qp_solver, print_fn=print0)
 
 	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
@@ -1032,6 +1040,7 @@ def main(argv=None):
 			sym=sym,
 			write_qp_rotations=not rotations_written,
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
+			qp_solver=qp_solver,
 			print_fn=print0,
 		)
 		timing.record("gw_jax.output", time.perf_counter() - _t_out)
@@ -1084,10 +1093,18 @@ def main(argv=None):
 		("self-energy table", "written" if os.path.exists(
 			config.paths.sigma_diag_file) else "absent",
 		 config.paths.sigma_diag_file),
-		("G0W0 energies", "written" if os.path.exists(config.paths.eqp0_file)
+		(EQP0_FILE_ROLE,
+		 "written" if os.path.exists(config.paths.eqp0_file)
 		 else "absent", config.paths.eqp0_file),
-		("linearized energies", "written" if os.path.exists(
+		(EQP1_FILE_ROLE,
+		 "written" if os.path.exists(
 			config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
+		(QP_ROTATIONS_FILE_ROLE, "written" if os.path.exists(
+			os.path.join(input_dir, "qp_wfn_rotations.h5")) else "absent",
+		 os.path.join(input_dir, "qp_wfn_rotations.h5")),
+		(QP_WFN_FILE_ROLE, "written" if os.path.exists(
+			os.path.join(input_dir, "WFN_qp.h5")) else "absent",
+		 os.path.join(input_dir, "WFN_qp.h5")),
 	]
 	if config.eqp2.enabled:
 		_file_rows.append((

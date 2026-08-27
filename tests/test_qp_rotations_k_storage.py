@@ -19,10 +19,12 @@ from file_io.kin_ion import (                                    # noqa: E402
     SYM_IDX_DATASET,
 )
 from file_io.qp_wfn import (                                     # noqa: E402
-    QP_ROT_FULL_BZ_DATASETS, QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE,
+    QP_ENERGY_DEFINITION_ATTR, QP_ROT_FULL_BZ_DATASETS,
+    QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE, QP_SOLVER_ATTR,
     qp_rotations_k_storage, read_qp_rotations_full_bz,
     write_qp_rotations_h5,
 )
+from file_io.sigma_output import SIGMA_EVAL_PROVENANCE_ATTR       # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +168,24 @@ def test_an_unstamped_file_is_read_as_full_bz_and_never_reinterpreted(tmp_path):
         assert IRR_IDX_DATASET not in f and SYM_IDX_DATASET not in f
 
     assert qp_rotations_k_storage(path) == K_STORAGE_FULL
+    got = read_qp_rotations_full_bz(path)
+    assert np.array_equal(got["U_mnk"], U)
+    assert np.array_equal(got["E_qp_nk_hartree"], E)
+
+
+def test_rotations_carry_additive_one_shot_method_provenance(tmp_path):
+    U, E, kpts = _star_consistent_payload()
+    path, _ = _write(
+        tmp_path, "provenance.h5", U, E, kpts,
+        qp_solver="one_shot_dft",
+        qp_energy_definition=(
+            "full_matrix_effective_hamiltonian_sigma_at_e_dft"),
+        sigma_eval_provenance="at_e_dft")
+    with h5py.File(path, "r") as f:
+        assert f.attrs[QP_SOLVER_ATTR] == "one_shot_dft"
+        assert f.attrs[QP_ENERGY_DEFINITION_ATTR] == (
+            "full_matrix_effective_hamiltonian_sigma_at_e_dft")
+        assert f.attrs[SIGMA_EVAL_PROVENANCE_ATTR] == "at_e_dft"
     got = read_qp_rotations_full_bz(path)
     assert np.array_equal(got["U_mnk"], U)
     assert np.array_equal(got["E_qp_nk_hartree"], E)

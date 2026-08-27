@@ -3,7 +3,8 @@
 Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 (G0W0_SC_TOGGLE_DESIGN.md §2a):
 
-1. Default → ``ONE_SHOT_DFT`` (standard G0W0).
+1. Default → ``ONE_SHOT_DFT`` (one-shot full-matrix effective H at
+   E_DFT, distinct from fixed-state diagonal G0W0).
 2. Legacy ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated,
    honored).
 3. Legacy ``sigma_at_dft_energies = true`` → ``ONE_SHOT_DFT`` (the orphan
@@ -21,7 +22,7 @@ from __future__ import annotations
 import pathlib
 import pytest
 
-from gw.gw_config import LorraxConfig, QPSolver
+from gw.gw_config import LorraxConfig, QPSolver, qp_solver_semantics
 
 
 BASE_INPUT = """\
@@ -46,6 +47,16 @@ def _config(tmp_path, extra: str = "", name: str = "cohsex_qp.in"):
 def test_default_is_one_shot_dft(tmp_path):
     cfg = _config(tmp_path)
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
+
+
+def test_one_shot_semantics_name_the_full_matrix_not_textbook_g0w0():
+    semantics = qp_solver_semantics(QPSolver.ONE_SHOT_DFT)
+    assert "one-shot full-matrix effective Hamiltonian" in semantics.description
+    assert "fixed-DFT-state diagonal G0W0" in semantics.description
+    assert "textbook" not in semantics.description
+    assert semantics.energy_definition == (
+        "full_matrix_effective_hamiltonian_sigma_at_e_dft")
+    assert semantics.sigma_evaluation_provenance == "at_e_dft"
 
 
 def test_legacy_self_consistent_resolves_and_warns(tmp_path):
@@ -74,9 +85,8 @@ def test_explicit_fixed_point_dynamic(tmp_path):
 
 
 def test_unknown_value_raises(tmp_path):
-    cfg = _config(tmp_path, "qp_solver = bogus\n")
     with pytest.raises(ValueError, match="qp_solver"):
-        cfg.qp_solver
+        _config(tmp_path, "qp_solver = bogus\n")
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +94,9 @@ def test_unknown_value_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_fixed_point_static_mode_rejected(tmp_path):
-    cfg = _config(
-        tmp_path, "compute_mode = cohsex\nqp_solver = fixed_point\n")
     with pytest.raises(ValueError, match="fixed_point"):
-        cfg.qp_solver
+        _config(
+            tmp_path, "compute_mode = cohsex\nqp_solver = fixed_point\n")
 
 
 def test_kij_stream_refused_at_parse(tmp_path):
