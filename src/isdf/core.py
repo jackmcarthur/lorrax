@@ -3681,10 +3681,10 @@ def _factor_c_q_replicated_qparallel(
 #   back to back), so this differs from the fused path only in WHEN the
 #   factor work happens.
 #
-# 'cusolvermp_lu' (CUDA mesh) keeps the FUSED per-r-chunk getrf+getrs
-# path for now: splitting its FFI handler is mechanical but cannot be
-# validated on the Frontera CPU stage — factor_c_q returns the CCT
-# passthrough with piv=None and solve_zeta dispatches as before.
+# Both distributed LU providers now use the same opaque factor token:
+# ScaLAPACK pXgetrf/pXgetrs on host and cuSOLVERMp getrf/getrs on CUDA.
+# The service owns each provider's pivot dtype and rank-private layout;
+# this physics module never sees or reshards a pivot vector.
 
 # The per-q diagonal ridge for the indefinite transverse LU:
 # eps·|tr(C_log)|/n_log lifts TRS-paired near-zero modes above the
@@ -3694,7 +3694,7 @@ def _factor_c_q_replicated_qparallel(
 _TRANSVERSE_LU_RIDGE = 1e-12
 
 _transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
-_transverse_scalapack_cache: dict = {}  # hoisted distributed getrf kernels
+_transverse_distributed_lu_cache: dict = {}  # ridged inputs to service getrf
 
 
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
@@ -4001,18 +4001,17 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
               flush=True)
 
 
-def _factor_c_q_transverse_scalapack(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
+def _factor_c_q_transverse_distributed_lu(
+    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, *, backend: str,
 ) -> FactorToken:
-    """DISTRIBUTED-plan hoisted transverse factor: per-q ScaLAPACK
-    ``pXgetrf`` on the ridged LOGICAL block, once per channel, factors
-    kept 2-D block-cyclic.
+    """DISTRIBUTED-plan hoisted transverse LU on the ridged logical block.
 
     Returns a :class:`distrib_la.FactorToken` at ``n = n_log``, the
     LOGICAL extent (the resolve contract guarantees
     ``n_log % px == n_log % py == 0`` on this path).  Inside it are the
-    block-cyclic ``pXgetrf`` factors — each rank's shard IS its local
-    block — and the per-rank ``ipiv`` rows at ``P(None,('x','y'))`` i32.
+    block-cyclic provider factors — each rank's shard IS its local block —
+    and the provider-native, per-rank pivot rows.  ScaLAPACK uses i32;
+    cuSOLVERMp uses i64.  Both remain private to the service token.
 
     THE TOKEN IS WHY THIS SIGNATURE CHANGED.  It used to hand back
     ``(LU_q, ipiv_q)`` with "never reshard it, feed it back verbatim"
@@ -4034,8 +4033,8 @@ def _factor_c_q_transverse_scalapack(
     n_log = int(n_rmu_logical)
     xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log)
-    if key not in _transverse_scalapack_cache:
+    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
+    if key not in _transverse_distributed_lu_cache:
         @jax.jit
         def _prep(C):
             # Slice to the LOGICAL extent (load-bearing: pad-extent LU
@@ -4049,13 +4048,13 @@ def _factor_c_q_transverse_scalapack(
             eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
             return jax.lax.with_sharding_constraint(
                 C_log + ridge * eye_n, xy_shard)
-        _transverse_scalapack_cache[key] = _prep
-    C_reg = _transverse_scalapack_cache[key](C_q)
+        _transverse_distributed_lu_cache[key] = _prep
+    C_reg = _transverse_distributed_lu_cache[key](C_q)
     # ``n=n_log`` is redundant with C_reg's own extent and passed anyway:
     # it is what makes the divisibility guard fire HERE rather than inside
     # the descriptor build.
     return linalg_factor('solve_lu', C_reg, mesh_xy,
-                         backend='scalapack', n=n_log)
+                         backend=backend, n=n_log)
 
 
 # =============================================================================
@@ -4614,9 +4613,8 @@ def factor_c_q(
     ``(factor, piv)``: the local plan stores ``(LU, perm)`` for
     ``lax.linalg.lu_solve`` (bit-identical to the fused per-r-chunk
     ``jnp.linalg.solve`` it replaced), the scalapack plan stores the
-    block-cyclic ``pXgetrf`` factors + per-rank ``ipiv`` for ``pXgetrs``
-    per r-chunk, and the cusolvermp plan still passes the CCT through
-    (fused per-r-chunk getrf+getrs; hoist not yet ported to CUDA).
+    block-cyclic provider factors + private per-rank pivots for one
+    provider back-solve per r-chunk.
 
     Padded-input path (``n_rmu_logical < C_q.shape[-1]``):
     n_rmu may be padded to mesh divisibility at the boundary so the
@@ -4714,8 +4712,7 @@ def factor_c_q(
     # Returns a (factor, piv) PAIR:
     #   'lu'           -> (LU embedded at padded extent, perm)  [local]
     #   'scalapack_lu' -> (FactorToken, None)   [the ipiv is INSIDE it]
-    #   'cusolvermp_lu'-> (identity-padded CCT passthrough, None)
-    #                     [fused per-r-chunk getrf+getrs kept on CUDA]
+    #   'cusolvermp_lu'-> (FactorToken, None)   [CUDA pivots INSIDE it]
     #   'transverse_rank_truncate'             -> (C⁺ at padded extent
     #                     via the replicated scaffolding, None)
     #   'distributed_transverse_rank_truncate' -> (C⁺ kept 2D-sharded
@@ -4747,29 +4744,23 @@ def factor_c_q(
                 zeta_rcond=float(transverse_zeta_rcond),
                 indefinite=True,
                 distrib_la_batched_route=distrib_la_batched_route), None
-        if t_kind == 'scalapack_lu':
+        if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
             # The factor is an opaque FactorToken with no public buffer, so
             # the |diag U| instrument cannot reach it.  Say that rather than
             # skipping silently: an unmeasured path and a clean one must not
             # look alike in a log.
             if jax.process_index() == 0:
-                print("  [zeta transverse ridge (scalapack_lu)] conditioning "
-                      "NOT MEASURED: the block-cyclic pXgetrf factor is "
+                print(f"  [zeta transverse ridge ({t_kind})] conditioning "
+                      "NOT MEASURED: the block-cyclic provider LU factor is "
                       "inside a FactorToken with no public buffer, so the "
                       "|diag U| kappa bound is unreachable here.  That is an "
                       "absence, not a pass — use transverse_zeta_solve = "
                       "rank_truncate for a route whose conditioning is "
                       "bounded by construction.", flush=True)
-            return _factor_c_q_transverse_scalapack(
-                C_q, mesh_xy, n_rmu_logical), None
-        if t_kind == 'cusolvermp_lu':
-            if jax.process_index() == 0:
-                print("  [zeta transverse factor] cusolvermp_lu keeps the "
-                      "fused per-r-chunk getrf+getrs (factor hoist not yet "
-                      "ported to the CUDA backend); its conditioning is "
-                      "likewise NOT MEASURED — the factor never reaches this "
-                      "seam.  An absence, not a pass.", flush=True)
-            return C_q, None
+            return _factor_c_q_transverse_distributed_lu(
+                C_q, mesh_xy, n_rmu_logical,
+                backend=('scalapack' if t_kind == 'scalapack_lu'
+                         else 'cusolvermp')), None
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
@@ -5131,11 +5122,12 @@ def solve_zeta(
     solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
 
     if isinstance(L_q, FactorToken):
-        # THE THREE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
+        # THE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
         # made this token on this mesh at these extents; ``distrib_la.solve``
         # feeds it back verbatim to the matching back-solve entry point —
-        # cuSOLVERMp ``potrs``, SLATE's two ``trsm`` passes, or ScaLAPACK
-        # ``pXgetrs`` with its own ipiv.  Z stays at P(None,'x','y'): no
+        # cuSOLVERMp ``potrs``/``getrs``, SLATE's two ``trsm`` passes, or
+        # ScaLAPACK ``pXgetrs`` with its own ipiv.  Z stays at
+        # P(None,'x','y'): no
         # input reshard, no all-gather of a factor, and — the part that used
         # to be a comment — no way for this file to touch a pivot vector.
         #
@@ -5202,9 +5194,8 @@ def solve_zeta(
             lambda Z: _distributed_pinv_apply(L_q, Z, mesh_xy, n_log))
 
     if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
-        # FUSED distributed getrf+getrs for the transverse channels
-        # (cusolvermp always — factor hoist not yet ported to CUDA — and
-        # scalapack only for legacy callers that passed the raw CCT).
+        # FUSED distributed getrf+getrs for legacy callers that pass the
+        # raw CCT instead of factor_c_q's opaque FactorToken.
         # L_q here is the *unfactored* CCT^μ (Hermitian indefinite) —
         # factor_c_q passes it through.  Same input sharding, output
         # reshard, and column padding pattern as the cholesky branch.

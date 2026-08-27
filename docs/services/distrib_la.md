@@ -254,9 +254,9 @@ the batch route.
 * **`solve()` checks `B` against the token's `n` and `nbatch`**, so a
   mismatched RHS refuses instead of corrupting a solve or hanging in a
   collective.
-* **`factor`/`solve` is not the fused route.** `factor('solve_lu', …)`
-  raises `NotImplementedError` for any backend but ScaLAPACK; one factor per
-  solve is `plan('solve_lu', mesh, backend=…).batched(A, B)`.
+* **`factor`/`solve` is not the fused route.** ScaLAPACK and cuSOLVERMp LU
+  both expose split getrf/getrs through the opaque token. One factor per solve
+  remains available as `plan('solve_lu', mesh, backend=…).batched(A, B)`.
 * **Env grants capability, never selects a backend.** `LORRAX_FFI_SO` /
   `LORRAX_FFI_HOST_SO` pin which `.so` to open. `distrib_la.resolve` reads
   no environment at all. An explicit pin that cannot be honoured is a

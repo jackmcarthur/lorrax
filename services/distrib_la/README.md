@@ -3,7 +3,8 @@
 `distrib_la` is an independently installable Python package for dense linear
 algebra on a JAX `Mesh` with axes `('x', 'y')`. Its public operations are
 Hermitian eigendecomposition, Cholesky factorization, LU solve, distributed
-GEMM, and opaque factor/solve. Native JAX kernels are always available;
+GEMM, and opaque factor/solve (including split ScaLAPACK and cuSOLVERMp LU).
+Native JAX kernels are always available;
 optional ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp handlers are
 discovered at runtime through a compatible FFI provider shared library.
 

@@ -33,7 +33,10 @@ from distrib_la.resolve import mesh_key
 
 __all__ = [
     "CusolverMpBatchedLowerL",
+    "CusolverMpBatchedLU",
     "batched_distributed_cholesky",
+    "batched_distributed_getrf",
+    "batched_distributed_getrs",
     "batched_distributed_potrs",
     "batched_distributed_solve_lu",
     "cholesky_handle_to_natural_L",
@@ -179,6 +182,8 @@ _EIGH_TARGET = "lorrax_cusolvermp_eigh"
 _POTRF_TARGET = "lorrax_cusolvermp_batched_potrf"
 _POTRS_TARGET = "lorrax_cusolvermp_batched_potrs"
 _SOLVE_LU_TARGET = "lorrax_cusolvermp_batched_solve_lu"
+_GETRF_TARGET = "lorrax_cusolvermp_batched_getrf"
+_GETRS_TARGET = "lorrax_cusolvermp_batched_getrs"
 
 # jit(shard_map(...)) cache per signature: eager shard_map re-traces per
 # call; wrapping in jax.jit once amortises it.
@@ -392,6 +397,131 @@ class CusolverMpBatchedLowerL:
     mb: int
     nb: int
     nbatch: int
+
+
+@dataclass(frozen=True)
+class CusolverMpBatchedLU:
+    """Opaque cuSOLVERMp LU factors and their per-rank pivot rows.
+
+    ``raw`` contains the col-major block-cyclic LU bytes at
+    ``P(None, 'y', 'x')``.  ``ipiv`` is sharded over the flattened
+    ``('x','y')`` mesh so every process retains only the pivot row written
+    by cuSOLVERMp.  Neither member leaves :class:`distrib_la.FactorToken`.
+    """
+    raw: jax.Array
+    ipiv: jax.Array
+    mesh: Mesh
+    n: int
+    mb: int
+    nb: int
+    nbatch: int
+
+
+def batched_distributed_getrf(
+    A: jax.Array,
+    *,
+    mesh: Mesh,
+) -> CusolverMpBatchedLU:
+    """Factor ``A[q]`` once via cuSOLVERMp ``getrf``.
+
+    ``A`` is ``P(None,'x','y')`` and donated.  The returned handle keeps
+    the factors and pivots in their native per-rank layouts; callers use
+    :func:`batched_distributed_getrs` rather than inspecting either.
+    """
+    if A.ndim != 3 or A.shape[1] != A.shape[2]:
+        raise ValueError(
+            f"batched_distributed_getrf: expected (Nq, N, N); got {A.shape}")
+    Px, Py = _validate_mesh(mesh)
+    nq, n = int(A.shape[0]), int(A.shape[1])
+    if n % Px != 0 or n % Py != 0:
+        raise ValueError(
+            f"N={n} must be divisible by Px={Px} and Py={Py}.")
+
+    loader.get_lib("CUDA")
+    ctx_handle = get_or_init_context(mesh, col_major=False)
+    mb, nb = n // Px, n // Py
+    ipiv_len = nb
+    key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb,
+           int(ctx_handle))
+    jit_getrf = _JIT_CACHE.get(key)
+    if jit_getrf is None:
+        LU_local_T = jax.ShapeDtypeStruct((nq, nb, mb), A.dtype)
+        ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int64)
+        attrs = dict(nq=nq, n=n, mb=mb, nb=nb,
+                     ipiv_len=ipiv_len, ctx_handle=int(ctx_handle))
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=P(None, "x", "y"),
+                 out_specs=(P(None, "y", "x"), P(None, ("x", "y"))),
+                 check_vma=False)
+        def _getrf(local_A):
+            local_A_T = jnp.transpose(local_A, (0, 2, 1))
+            return jax.ffi.ffi_call(
+                _GETRF_TARGET, (LU_local_T, ipiv_local),
+                input_output_aliases={0: 0},
+            )(local_A_T, **attrs)
+
+        jit_getrf = jax.jit(_getrf, donate_argnums=(0,))
+        _JIT_CACHE[key] = jit_getrf
+
+    LU_raw_T, ipiv = jit_getrf(A)
+    return CusolverMpBatchedLU(
+        raw=LU_raw_T, ipiv=ipiv, mesh=mesh, n=n, mb=mb, nb=nb,
+        nbatch=nq)
+
+
+def batched_distributed_getrs(
+    LU: CusolverMpBatchedLU,
+    B: jax.Array,
+    *,
+    mesh: Mesh,
+) -> jax.Array:
+    """Back-solve ``A[q] X[q] = B[q]`` from a split CUDA LU handle."""
+    Px, Py = _validate_mesh(mesh)
+    if mesh.axis_names != LU.mesh.axis_names:
+        raise ValueError("getrs mesh axis names don't match the LU handle.")
+    if (B.ndim != 3 or int(B.shape[0]) != LU.nbatch
+            or int(B.shape[1]) != LU.n):
+        raise ValueError(
+            f"batched_distributed_getrs: B must be ({LU.nbatch}, {LU.n}, "
+            f"NRHS); got {B.shape}")
+    if LU.raw.dtype != B.dtype:
+        raise ValueError(f"LU.dtype {LU.raw.dtype} != B.dtype {B.dtype}")
+    nrhs = int(B.shape[2])
+    if nrhs % Py != 0:
+        raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
+
+    loader.get_lib("CUDA")
+    ctx_handle = get_or_init_context(mesh, col_major=False)
+    mb_b, nb_b = LU.mb, nrhs // Py
+    ipiv_len = LU.nb
+    key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, nrhs,
+           LU.mb, LU.nb, mb_b, nb_b, int(ctx_handle))
+    jit_getrs = _JIT_CACHE.get(key)
+    if jit_getrs is None:
+        X_local_T = jax.ShapeDtypeStruct(
+            (LU.nbatch, nrhs // Py, LU.n // Px), B.dtype)
+        attrs = dict(nq=LU.nbatch, n=LU.n, nrhs=nrhs,
+                     mb_a=LU.mb, nb_a=LU.nb, mb_b=mb_b, nb_b=nb_b,
+                     ipiv_len=ipiv_len, ctx_handle=int(ctx_handle))
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "y", "x"), P(None, ("x", "y")),
+                           P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"),
+                 check_vma=False)
+        def _getrs(local_LU, local_ipiv, local_B):
+            local_B_T = jnp.transpose(local_B, (0, 2, 1))
+            X_T = jax.ffi.ffi_call(
+                _GETRS_TARGET, X_local_T,
+                input_output_aliases={2: 0},
+            )(local_LU, local_ipiv, local_B_T, **attrs)
+            return jnp.transpose(X_T, (0, 2, 1))
+
+        jit_getrs = jax.jit(_getrs, donate_argnums=(2,))
+        _JIT_CACHE[key] = jit_getrs
+
+    return jit_getrs(LU.raw, LU.ipiv, B)
 
 
 def batched_distributed_cholesky(
@@ -611,9 +741,10 @@ def batched_distributed_solve_lu(
     Used by the ζ-fit transverse channels (indefinite CCT^μ) and — via the
     plan facade on CUDA meshes — by the W Dyson ``w_dyson_solver =
     distributed`` plan for the general (non-Hermitian) ``I - V χ`` system.
-    Pivot vectors are allocated per call inside the FFI and never surfaced
-    to Python; there is no split factor/solve pair for this route, so
-    :func:`distrib_la.factor` refuses it and names this function.
+    This fused entry remains for one-shot callers.  Repeated-RHS consumers
+    use :func:`batched_distributed_getrf` plus
+    :func:`batched_distributed_getrs` through the opaque top-level
+    :func:`distrib_la.factor` / :func:`distrib_la.solve` token surface.
 
     Input sharding: both ``A`` and ``B`` in ``P(None, 'x', 'y')``.  Output
     has the same shape and sharding as ``B``.  ``A`` is donated — XLA may
