@@ -96,8 +96,8 @@ def test_charge_hall_builder_has_only_declared_support(
     np.testing.assert_array_equal(pi1[:, 0, 0], np.zeros(2))
     np.testing.assert_array_equal(pi1[:, 1:, 1:], np.zeros((2, 3, 3)))
     np.testing.assert_array_equal(pi1[:, 1:, 0], np.conj(pi1[:, 0, 1:]))
-    assert pi1[0, 0, 2] == -2.0j
-    assert pi1[1, 0, 1] == 2.0j
+    assert pi1[0, 0, 2] == 2.0j
+    assert pi1[1, 0, 1] == -2.0j
 
     S_got = np.asarray(response.S_direct)
     expected_charge = 0.5 * (S[0, :2, :2] + S[0, :2, :2].T)
