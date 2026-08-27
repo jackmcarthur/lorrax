@@ -346,16 +346,28 @@ def unpack_photon_response_tiles(
         for A in range(N_LORENTZ))
 
 
-def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
-    """One local graph for embedding four channel vectors in packed space."""
+def _vector_pack_program(
+    layout, mesh_xy, nq, dtype, axis_name, *, preserve_head_rows=False,
+):
+    """One local graph for embedding channel vectors in packed space.
+
+    ``preserve_head_rows=False`` is the incumbent diagonal-channel carrier:
+    each rank-2 input is written only to its same-numbered Lorentz row.
+    ``True`` accepts a rank-3 ``(nq,4,mu_B)`` input for each body channel B
+    and preserves every head row while concatenating the body segments.  The
+    ordering, internal-padding mask, and compile owner remain common.
+    """
     padded = tuple(int(n) for n in layout.padded_extents)
-    key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
+    keep_rows = bool(preserve_head_rows)
+    key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name,
+           keep_rows)
     if key in _vector_pack_cache:
         return _vector_pack_cache[key]
     from common.shard_map import shard_map
 
     side = layout.mesh_side
-    vector_spec = P(None, axis_name)
+    vector_spec = (
+        P(None, None, axis_name) if keep_rows else P(None, axis_name))
     packed_spec = P(None, None, axis_name)
     logical_spec = P()
     vector_sharding = NamedSharding(mesh_xy, vector_spec)
@@ -378,9 +390,14 @@ def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
             valid = (
                 shard * n_local + jnp.arange(n_local)
                 < logical_extents[channel])
-            vector = jnp.where(valid[None, :], vector, 0)
-            out = jax.lax.dynamic_update_slice(
-                out, vector[:, None, :], (0, channel, offset))
+            if keep_rows:
+                vector = jnp.where(valid[None, None, :], vector, 0)
+                out = jax.lax.dynamic_update_slice(
+                    out, vector, (0, 0, offset))
+            else:
+                vector = jnp.where(valid[None, :], vector, 0)
+                out = jax.lax.dynamic_update_slice(
+                    out, vector[:, None, :], (0, channel, offset))
             offset += n_local
         return out
 
@@ -444,6 +461,57 @@ def pack_photon_channel_vectors(
     return _vector_pack_program(
         layout, mesh_xy, nq, dtype, axis_name)(
             *vectors_by_channel, logical)
+
+
+def pack_photon_head_body_vectors(
+    vectors_by_body_channel:
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    layout: PhotonBasisLayout,
+    mesh_xy: Mesh,
+    *,
+    axis_name: str,
+) -> jax.Array:
+    """Pack all four body channels while preserving four head rows.
+
+    Input ``B`` has shape ``(nq,4,layout.padded_extent(B))`` and sharding
+    ``P(None,None,axis_name)``.  The result ``(nq,4,Npacked)`` has the same
+    sharding and stores every head row over the mesh-interleaved direct sum
+    of body channels.  This is the Y/Z carrier counterpart of
+    :func:`pack_photon_channel_vectors`; no conjugation, response completion,
+    or capability promotion is implicit.
+    """
+    layout.assert_mesh(mesh_xy)
+    if axis_name not in ('x', 'y'):
+        raise ValueError(
+            f"packed photon-vector axis must be 'x' or 'y'; got {axis_name!r}")
+    if len(vectors_by_body_channel) != N_LORENTZ:
+        raise ValueError(
+            "packed photon head/body vectors require four body channels; "
+            f"got {len(vectors_by_body_channel)}")
+
+    nq = int(vectors_by_body_channel[0].shape[0])
+    dtype = np.dtype(vectors_by_body_channel[0].dtype)
+    wanted = NamedSharding(mesh_xy, P(None, None, axis_name))
+    for channel, vector in enumerate(vectors_by_body_channel):
+        expected = (nq, N_LORENTZ, layout.padded_extent(channel))
+        if tuple(vector.shape) != expected:
+            raise ValueError(
+                f"photon body channel {channel} head-vector shape "
+                f"{vector.shape} != {expected}")
+        if np.dtype(vector.dtype) != dtype:
+            raise TypeError(
+                "all packed photon head/body vectors must have one dtype; "
+                f"got {dtype} and {vector.dtype} for channel {channel}")
+        sharding = getattr(vector, 'sharding', None)
+        if sharding is None or not sharding.is_equivalent_to(wanted, 3):
+            raise ValueError(
+                f"photon body channel {channel} head-vector must already "
+                f"have sharding P(None,None,{axis_name!r}); got {sharding}")
+
+    logical = jnp.asarray(layout.logical_extents, dtype=jnp.int32)
+    return _vector_pack_program(
+        layout, mesh_xy, nq, dtype, axis_name,
+        preserve_head_rows=True)(*vectors_by_body_channel, logical)
 
 
 def _q0_local_factor_piece(rows, *, axis_name, local_extent, local_offset,
@@ -708,6 +776,7 @@ __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
     "pack_photon_response_tiles", "unpack_photon_response_tiles",
-    "pack_photon_channel_vectors", "add_photon_q0_low_rank",
+    "pack_photon_channel_vectors", "pack_photon_head_body_vectors",
+    "add_photon_q0_low_rank",
     "photon_q0_low_rank_block",
 ]

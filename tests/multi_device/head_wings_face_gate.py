@@ -107,14 +107,17 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
-                 omega, eta):
+                 omega, eta, body_lorentz_channel=0):
     nk, nb = e.shape
     mu = psi.shape[-1]
     n_omega = len(omega)
-    Y = np.zeros((n_omega, 3, mu), dtype=np.complex128)
-    Z = np.zeros((n_omega, mu, 3), dtype=np.complex128)
+    n_vertex = int(v.shape[0])
+    Y = np.zeros((n_omega, n_vertex, mu), dtype=np.complex128)
+    Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
     pref = 4.0 / (float(nk_tot) * spin_denom)
+    from common.gamma_matrices import gammas
+    gamma = np.asarray(gammas[int(body_lorentz_channel)])
     for k in range(nk):
         for i in range(nb_logical):
             for j in range(nb_logical):
@@ -122,7 +125,8 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
                 if dE <= 0.0:
                     continue
                 fdiff = f[k, j] - f[k, i]
-                bij = np.einsum("sm,sm->m", np.conj(psi[k, i]), psi[k, j])
+                bij = np.einsum(
+                    "sm,st,tm->m", np.conj(psi[k, i]), gamma, psi[k, j])
                 for iw, om in enumerate(omega):
                     z = om + 1j * eta
                     denom = z * z - dE * dE
@@ -182,6 +186,72 @@ def check_dynamic_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
     for k, val in r.items():
         assert val < RTOL, f"{k} rel err {val:.3e}"
     return r
+
+
+def check_current_wings(mesh, dtype="complex128"):
+    """P=4 alpha-current vertices, packed wings, and a direct oracle."""
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.photon_layout import (
+        PhotonBasisLayout, pack_photon_head_body_vectors)
+    from gw.qsgw_head import head_wings_sharded
+
+    rng = np.random.default_rng(2026082604)
+    nk, nb, ns, nmu = 2, 4, 4, 8
+    legacy, face, psi, enk, occ = _build_pair(
+        rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    p8 = (rng.standard_normal((8, nk, nb, nb))
+          + 1j * rng.standard_normal((8, nk, nb, nb)))
+    omega = np.asarray([0.17 + 0.03j])
+    eta = 0.02
+    errors = {}
+    face_y = []
+    face_z = []
+    for body_channel in range(4):
+        y_ref, z_ref = _numpy_wings(
+            p8, enk, occ, psi, nb_logical=nb, nk_tot=nk,
+            nspin=1, nspinor=2, omega=omega, eta=eta,
+            body_lorentz_channel=body_channel)
+        for label, wfns in (("legacy", legacy), ("face", face)):
+            y_got, z_got = head_wings_sharded(
+                p8, wfns, jnp.asarray(enk), jnp.asarray(occ), omega,
+                mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1,
+                nspinor=2, eta_ry=eta,
+                body_lorentz_channel=body_channel)
+            y_error = _rel(_gather(y_got), y_ref)
+            z_error = _rel(_gather(z_got), z_ref)
+            errors[f"{label}_Y_B{body_channel}"] = y_error
+            errors[f"{label}_Z_B{body_channel}"] = z_error
+            assert y_error < RTOL, (
+                f"{label} Y body channel {body_channel} rel {y_error:.3e}")
+            assert z_error < RTOL, (
+                f"{label} Z body channel {body_channel} rel {z_error:.3e}")
+            if label == "face":
+                face_y.append(y_got.reshape(2, 4, nmu))
+                face_z.append(jnp.transpose(
+                    z_got.reshape(nmu, 2, 4), (1, 2, 0)))
+
+    # The shape-only transformations used by the authenticated composer must
+    # preserve the incumbent x/y wing shardings.  Exercise the canonical
+    # mesh-interleaved packer directly; no O(Nmu) device_put is permitted at
+    # this seam.
+    layout = PhotonBasisLayout.from_centroid_extents(nmu, nmu, mesh)
+    packed_y = pack_photon_head_body_vectors(
+        tuple(face_y), layout, mesh, axis_name="x")
+    packed_z = pack_photon_head_body_vectors(
+        tuple(face_z), layout, mesh, axis_name="y")
+    Y = packed_y.reshape(1, 2, 4, layout.packed_extent)
+    Z = jnp.transpose(
+        packed_z.reshape(1, 2, 4, layout.packed_extent), (0, 1, 3, 2))
+    wanted_y = NamedSharding(mesh, P(None, None, None, "x"))
+    wanted_z = NamedSharding(mesh, P(None, None, "y", None))
+    if not Y.sharding.is_equivalent_to(wanted_y, Y.ndim):
+        raise AssertionError(f"wrong packed Y sharding {Y.sharding.spec}")
+    if not Z.sharding.is_equivalent_to(wanted_z, Z.ndim):
+        raise AssertionError(f"wrong packed Z sharding {Z.sharding.spec}")
+    errors["packed_Y_finite"] = float(not np.all(np.isfinite(_gather(Y))))
+    errors["packed_Z_finite"] = float(not np.all(np.isfinite(_gather(Z))))
+    return errors
 
 
 def check_static_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
@@ -303,6 +373,7 @@ def check_bounded_residency(mesh, dtype="complex128"):
 _CLI_CELLS = [
     ("dynamic_wings_ns1", lambda mesh, dt: check_dynamic_wings(mesh, dt, ns=1)),
     ("dynamic_wings_ns2", lambda mesh, dt: check_dynamic_wings(mesh, dt, ns=2)),
+    ("dynamic_current_wings", check_current_wings),
     ("static_wings_ns1", lambda mesh, dt: check_static_wings(mesh, dt, ns=1)),
     ("static_wings_ns2", lambda mesh, dt: check_static_wings(mesh, dt, ns=2)),
     ("bounded_residency", lambda mesh, dt: check_bounded_residency(mesh, dt)),

@@ -92,7 +92,7 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
-                  omega, eta):
+                  omega, eta, body_lorentz_channel=0):
     """Independent O(nk*nb^2*n_omega) oracle straight from
     ``head_wings_sharded``'s own docstring formula -- no ring, no gather,
     no einsum-string reuse with either kernel under test."""
@@ -104,6 +104,8 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
     Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
     pref = 4.0 / (float(nk_tot) * spin_denom)
+    from common.gamma_matrices import gammas
+    gamma = np.asarray(gammas[int(body_lorentz_channel)])
     for k in range(nk):
         for i in range(nb_logical):
             for j in range(nb_logical):
@@ -111,7 +113,8 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
                 if dE <= 0.0:
                     continue
                 fdiff = f[k, j] - f[k, i]
-                bij = np.einsum("sm,sm->m", np.conj(psi[k, i]), psi[k, j])
+                bij = np.einsum(
+                    "sm,st,tm->m", np.conj(psi[k, i]), gamma, psi[k, j])
                 for iw, om in enumerate(omega):
                     z = om + 1j * eta
                     denom = z * z - dE * dE
@@ -228,6 +231,47 @@ def test_packed_vertex_wings_preserve_three_axis_bits_legacy_and_face():
         np.testing.assert_array_equal(z8[..., 3:], 0.0)
         with pytest.raises(ValueError, match="canonical n_vertex"):
             head_wings_sharded(v8[:4], wfns, **kwargs)
+
+
+def test_width8_all_body_lorentz_channels_match_oracle_both_layouts():
+    """Gamma acts on one body leg; alpha_y pins the conjugation sign."""
+    # The focused source gate also runs under the deployed CUDA-only module;
+    # use one available device here.  The real P=4 NCCL sibling lives in
+    # tests/multi_device/head_wings_face_gate.py.
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    rng = np.random.default_rng(2026082604)
+    nk, nb, ns, nmu = 2, 4, 4, 8
+    legacy, face, psi, enk, occ = _build_pair(
+        rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    p8 = (rng.standard_normal((8, nk, nb, nb))
+          + 1j * rng.standard_normal((8, nk, nb, nb)))
+    omega = np.asarray([0.17 + 0.03j])
+    kwargs = dict(
+        energies_kn_ry=enk, occupations_kn=occ, omegas_ry=omega,
+        mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=2,
+        eta_ry=0.02,
+    )
+
+    for body_channel in range(4):
+        y_ref, z_ref = _numpy_wings(
+            p8, enk, occ, psi,
+            nb_logical=nb, nk_tot=nk, nspin=1, nspinor=2,
+            omega=omega, eta=0.02,
+            body_lorentz_channel=body_channel,
+        )
+        for label, wfns in (("legacy", legacy), ("face", face)):
+            y_got, z_got = head_wings_sharded(
+                p8, wfns, body_lorentz_channel=body_channel, **kwargs)
+            np.testing.assert_allclose(
+                _gather(y_got), y_ref, rtol=2.0e-13, atol=2.0e-13,
+                err_msg=f"{label} Y body channel {body_channel}")
+            np.testing.assert_allclose(
+                _gather(z_got), z_ref, rtol=2.0e-13, atol=2.0e-13,
+                err_msg=f"{label} Z body channel {body_channel}")
+
+    with pytest.raises(ValueError, match="width-eight"):
+        head_wings_sharded(
+            p8[:3], legacy, body_lorentz_channel=1, **kwargs)
 
 
 def test_head_wings_face_mu_blocking_exercised(monkeypatch):

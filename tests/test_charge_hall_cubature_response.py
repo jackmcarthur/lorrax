@@ -22,6 +22,7 @@ from gw.static_gauge_response import (
     StaticGaugeResponseCapability,
     StaticGaugeTermStatus,
     build_charge_hall_cubature_response,
+    build_retained_alpha_first_order_head_wings,
     require_full_static_gauge_availability,
 )
 
@@ -126,3 +127,125 @@ def test_charge_hall_builder_has_only_declared_support(
         response.availability, cc_q2=StaticGaugeTermStatus.UNAVAILABLE)
     assert not unavailable_charge.is_complete_for(
         StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE)
+
+
+def _basis_wfn(shift=0.0):
+    return SimpleNamespace(
+        nbands=2, nelec=2, nspinor=2,
+        energies=np.asarray([[[0.1 + shift, 0.7]]]),
+        kpoints=np.asarray([[0.0, 0.0, 0.0]]),
+    )
+
+
+def _head_wing_binding(mesh, *, role, centroids, wfn):
+    from file_io.wfn_basis import WavefunctionBasisReceipt
+    from gw.wavefunction_bundle import (
+        AuthenticatedWavefunctions, BandSlices, Wavefunctions)
+
+    centroids = np.asarray(centroids, dtype=np.int32)
+    nmu = int(centroids.shape[0])
+    slices = BandSlices.from_band_edges(0, 0, 1, 2, 2)
+    psi_nmu = _placed(
+        np.zeros((1, 2, 4, nmu), dtype=np.complex128),
+        mesh, P(None, "x", None, "y"))
+    psi_mun = _placed(
+        np.zeros((1, 4, nmu, 2), dtype=np.complex128),
+        mesh, P(None, None, "x", "y"))
+    carrier = Wavefunctions(
+        enk=_placed([[0.1, 0.7]], mesh, P(None, None)),
+        occ=_placed([[1.0, 0.0]], mesh, P(None, None)),
+        slices=slices, psi_nmu=psi_nmu, psi_mun=psi_mun, layout="face")
+    receipt = WavefunctionBasisReceipt.from_source(
+        wfn=wfn, role=role, bispinor=True, band_interval=(0, 2),
+        fft_grid=(4, 4, 4), centroid_fft_idx=centroids,
+        n_rmu_logical=nmu, n_rmu_padded=nmu)
+    return AuthenticatedWavefunctions(carrier, receipt)
+
+
+def test_first_order_head_wings_pack_four_authenticated_body_channels(
+        monkeypatch):
+    """One contract cell: basis choice, (a,I) order, packing, refusal state."""
+    from gw.qsgw_head import StaticGaugeFirstOrderComponent
+    import gw.qsgw_head as qsgw_head
+
+    mesh = _mesh()
+    layout = PhotonBasisLayout.from_centroid_extents(3, 2, mesh)
+    wfn = _basis_wfn()
+    charge = _head_wing_binding(
+        mesh, role="charge",
+        centroids=((0, 0, 0), (1, 0, 0), (2, 0, 0)), wfn=wfn)
+    transverse = _head_wing_binding(
+        mesh, role="transverse",
+        centroids=((0, 1, 0), (1, 1, 0)), wfn=wfn)
+    first = StaticGaugeFirstOrderComponent(
+        energy_scaled_d1_raw=_placed(
+            np.zeros((2, 4, 1, 2, 2), dtype=np.complex128),
+            mesh, P(None, None, None, "x", "y")),
+        S_first_first=_placed(
+            np.zeros((1, 2, 2, 4, 4), dtype=np.complex128), mesh, P()),
+        bra_energy_dq_ry=_placed(np.zeros((2, 1, 2)), mesh, P()),
+        occupation_difference_dq=_placed(np.zeros((2, 1, 2)), mesh, P()),
+        charge_ward_residual=_placed(0.0, mesh, P()),
+        retained_connection_cart=_placed(
+            np.zeros((2, 1, 2, 2), dtype=np.complex128), mesh, P()),
+        nb_logical=2,
+        omegas_ry=_placed([0.0j], mesh, P(None)),
+        nk_tot=1, nspin=1, normalization_nspinor=2, eta_ry=0.0,
+    )
+
+    calls = []
+
+    def fake_wings(_p, wfns, _e, _f, omega, *, body_lorentz_channel,
+                   **_kwargs):
+        body = int(body_lorentz_channel)
+        calls.append((body, wfns))
+        extent = layout.padded_extent(body)
+        y = np.empty((len(omega), 8, extent), dtype=np.complex128)
+        z = np.empty((len(omega), extent, 8), dtype=np.complex128)
+        for vertex in range(8):
+            for mu in range(extent):
+                y[:, vertex, mu] = 1000 * body + 10 * vertex + mu + 1j
+                z[:, mu, vertex] = -1000 * body - 10 * vertex - mu + 2j
+        return (
+            _placed(y, mesh, P(None, None, "x")),
+            _placed(z, mesh, P(None, "y", None)),
+        )
+
+    monkeypatch.setattr(qsgw_head, "head_wings_sharded", fake_wings)
+    carriers = build_retained_alpha_first_order_head_wings(
+        first, charge, transverse, layout=layout, mesh=mesh)
+
+    assert [item[0] for item in calls] == [0, 1, 2, 3]
+    assert calls[0][1] is charge.wavefunctions
+    assert all(item[1] is transverse.wavefunctions for item in calls[1:])
+    Y, Z = np.asarray(carriers.Y_x), np.asarray(carriers.Z_y)
+    offset = 0
+    for body in range(4):
+        extent = layout.padded_extent(body)
+        for a in range(2):
+            for head in range(4):
+                vertex = 4 * a + head
+                mu = np.arange(extent)
+                np.testing.assert_array_equal(
+                    Y[0, a, head, offset:offset + extent],
+                    1000 * body + 10 * vertex + mu + 1j)
+                np.testing.assert_array_equal(
+                    Z[0, a, offset:offset + extent, head],
+                    -1000 * body - 10 * vertex - mu + 2j)
+        offset += extent
+
+    # This slice must not turn the existing restricted model into FULL.
+    assert (CHARGE_HALL_CUBATURE_AVAILABILITY.y_current
+            is StaticGaugeTermStatus.OMITTED_BY_MODEL)
+    with pytest.raises(ValueError, match="availability"):
+        require_full_static_gauge_availability(
+            CHARGE_HALL_CUBATURE_AVAILABILITY)
+
+    stale_transverse = _head_wing_binding(
+        mesh, role="transverse",
+        centroids=((0, 1, 0), (1, 1, 0)), wfn=_basis_wfn(1.0e-3))
+    calls.clear()
+    with pytest.raises(ValueError, match="wfn_fingerprint"):
+        build_retained_alpha_first_order_head_wings(
+            first, charge, stale_transverse, layout=layout, mesh=mesh)
+    assert calls == []

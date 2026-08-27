@@ -6,9 +6,15 @@ Hall Chern--Simons term.  Ordinary current response,
 contact and complement-space closure are omitted *by model*, never stored as
 accidental zeros and never promoted to ``full_static_gauge``.
 
+This module also composes the retained width-eight first jet with the
+authenticated charge/transverse centroid bases to issue the local-alpha Y/Z
+first-order one-leg algebra carriers.  That object is deliberately not a
+response: exact gauged-VNL current wings, weight/state second jets, contact,
+and complement closure remain absent.
+
 This module owns no WFN load, symmetry unfold, current, FFT, body-response or
-packing implementation.  It composes the existing routines and retains
-only O(N_mu) wing carriers.
+packing implementation.  It composes the existing routines and retains only
+O(N_mu) wing carriers.
 """
 from __future__ import annotations
 
@@ -20,7 +26,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
+from gw.photon_layout import (
+    PhotonBasisLayout,
+    pack_photon_channel_vectors,
+    pack_photon_head_body_vectors,
+)
 
 
 class StaticGaugeResponseCapability(str, enum.Enum):
@@ -95,6 +105,7 @@ def _charge_hall_availability() -> StaticGaugeTermAvailability:
 
 CHARGE_HALL_CUBATURE_AVAILABILITY = _charge_hall_availability()
 _PRODUCER_TOKEN = object()
+_RETAINED_ALPHA_HEAD_WING_TOKEN = object()
 
 
 def _canonical_wfn_sha256(value) -> str:
@@ -134,6 +145,42 @@ class ChargeHallCubatureResponse:
                 "build_charge_hall_cubature_response")
 
 
+@dataclass(frozen=True)
+class RetainedAlphaFirstOrderHeadWingCarriers:
+    r"""Basis-authenticated ``D1(head) * alpha(body)`` algebra carriers.
+
+    ``Y_x[omega,a,I,body]`` and ``Z_y[omega,a,body,I]`` contain all four
+    body Lorentz channels in the canonical packed photon basis.  The charge
+    body channel uses the authenticated charge centroid basis; T1/T2/T3 use
+    the one authenticated transverse basis and canonical local alpha-current
+    insertion inside :func:`gw.qsgw_head.head_wings_sharded`.
+
+    This is only retained-bubble algebra produced by the in-memory width-eight
+    energy-scaled jet.  The receipts authenticate the two centroid bases to
+    one WFN manifold; they do not authenticate that jet as a persisted
+    same-Hamiltonian artifact.  The exact finite-transfer gauged-VNL body
+    current, current-wing reciprocity/symmetry action, response-weight/state
+    derivatives, contact, and complement closure are absent.  Consequently
+    this is not a :class:`ChargeHallCubatureResponse`, carries no capability,
+    and does not change :class:`StaticGaugeTermAvailability`.
+    """
+
+    layout: PhotonBasisLayout
+    Y_x: jax.Array                 # (nw,2,4,Npacked), last axis x-sharded
+    Z_y: jax.Array                 # (nw,2,Npacked,4), body axis y-sharded
+    charge_basis_receipt: object
+    transverse_basis_receipt: object
+    nb_logical: int
+    n_omega: int
+    _producer_token: object
+
+    def __post_init__(self) -> None:
+        if self._producer_token is not _RETAINED_ALPHA_HEAD_WING_TOKEN:
+            raise TypeError(
+                "RetainedAlphaFirstOrderHeadWingCarriers is issued only by "
+                "build_retained_alpha_first_order_head_wings")
+
+
 def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
     sharding = getattr(array, "sharding", None)
     return (
@@ -142,6 +189,216 @@ def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
         and np.array_equal(sharding.mesh.devices, mesh.devices)
         and sharding.is_equivalent_to(NamedSharding(mesh, spec), array.ndim)
     )
+
+
+def _require_head_wing_basis_pair(
+    charge_binding, transverse_binding, layout: PhotonBasisLayout,
+):
+    """Authenticate the two existing bases before numerical extraction."""
+    from gw.wavefunction_bundle import AuthenticatedWavefunctions
+
+    for binding, role, channel in (
+            (charge_binding, "charge", 0),
+            (transverse_binding, "transverse", 1)):
+        if not isinstance(binding, AuthenticatedWavefunctions):
+            raise TypeError(
+                "static gauge head wings require host-only "
+                f"AuthenticatedWavefunctions for {role}; got "
+                f"{type(binding).__name__}")
+        receipt = binding.receipt
+        if receipt.role != role:
+            raise ValueError(
+                f"static gauge {role} binding carries role={receipt.role!r}")
+        receipt.assert_matches_carrier(
+            binding.wavefunctions,
+            where=f"static gauge {role} head-wing basis")
+        if (int(receipt.n_rmu_logical) != layout.logical_extent(channel)
+                or int(receipt.n_rmu_padded) != layout.padded_extent(channel)):
+            raise ValueError(
+                f"static gauge {role} basis extent logical/padded="
+                f"{receipt.n_rmu_logical}/{receipt.n_rmu_padded} does not "
+                f"match photon layout {layout.logical_extent(channel)}/"
+                f"{layout.padded_extent(channel)}")
+    charge_binding.receipt.assert_same_wfn_manifold(
+        transverse_binding.receipt,
+        where="static gauge charge/transverse head-wing bases")
+    if (charge_binding.wavefunctions.layout
+            != transverse_binding.wavefunctions.layout):
+        raise ValueError(
+            "static gauge charge/transverse head-wing bases use different "
+            f"carrier layouts: {charge_binding.wavefunctions.layout!r} vs "
+            f"{transverse_binding.wavefunctions.layout!r}")
+    return charge_binding.wavefunctions, transverse_binding.wavefunctions
+
+
+def require_retained_alpha_first_order_head_wings(
+    carriers: RetainedAlphaFirstOrderHeadWingCarriers,
+    mesh_xy: Mesh,
+) -> RetainedAlphaFirstOrderHeadWingCarriers:
+    """Validate the bounded carrier's receipts, shape, dtype, and sharding."""
+    if not isinstance(carriers, RetainedAlphaFirstOrderHeadWingCarriers):
+        raise TypeError(
+            "first-order head wings require "
+            "RetainedAlphaFirstOrderHeadWingCarriers; got "
+            f"{type(carriers).__name__}")
+    carriers.layout.assert_mesh(mesh_xy)
+    n_omega = int(carriers.n_omega)
+    n_packed = int(carriers.layout.packed_extent)
+    if n_omega < 1 or int(carriers.nb_logical) < 1:
+        raise ValueError("first-order head-wing extents must be positive")
+    arrays = (
+        (carriers.Y_x, "Y_x", (n_omega, 2, 4, n_packed),
+         P(None, None, None, "x")),
+        (carriers.Z_y, "Z_y", (n_omega, 2, n_packed, 4),
+         P(None, None, "y", None)),
+    )
+    for array, name, shape, spec in arrays:
+        if tuple(array.shape) != shape:
+            raise ValueError(f"{name} shape {array.shape} != {shape}")
+        if np.dtype(array.dtype) != np.dtype(np.complex128):
+            raise TypeError(f"{name} dtype {array.dtype} != complex128")
+        if not _same_mesh_sharding(array, mesh_xy, spec):
+            raise ValueError(f"{name} must have production sharding {spec}")
+
+    from file_io.wfn_basis import WavefunctionBasisReceipt
+    charge = carriers.charge_basis_receipt
+    transverse = carriers.transverse_basis_receipt
+    if (not isinstance(charge, WavefunctionBasisReceipt)
+            or not isinstance(transverse, WavefunctionBasisReceipt)):
+        raise TypeError("first-order head-wing carriers require basis receipts")
+    if charge.role != "charge" or transverse.role != "transverse":
+        raise ValueError("first-order head-wing basis roles are inconsistent")
+    charge.assert_same_wfn_manifold(
+        transverse, where="issued static gauge head-wing carriers")
+    for receipt, channel in ((charge, 0), (transverse, 1)):
+        if (int(receipt.n_rmu_logical)
+                != carriers.layout.logical_extent(channel)
+                or int(receipt.n_rmu_padded)
+                != carriers.layout.padded_extent(channel)):
+            raise ValueError(
+                "issued static gauge head-wing receipt/layout extents differ")
+    return carriers
+
+
+def build_retained_alpha_first_order_head_wings(
+    first_order,
+    charge_binding,
+    transverse_binding,
+    *,
+    layout: PhotonBasisLayout,
+    mesh: Mesh,
+) -> RetainedAlphaFirstOrderHeadWingCarriers:
+    r"""Populate local-alpha Y/Z algebra from the width-eight retained jet.
+
+    The function consumes existing authenticated centroid bundles.  It does
+    not load a WFN, unfold symmetry, perform an FFT, rebuild a centroid basis,
+    or transform an entire wavefunction bundle for a gamma vertex.  It also
+    does not replace the exact finite-transfer current endpoint or claim that
+    the local alpha insertion is a complete same-Hamiltonian current wing.
+    """
+    from gw.qsgw_head import (
+        StaticGaugeFirstOrderComponent, head_wings_sharded)
+
+    if not isinstance(layout, PhotonBasisLayout):
+        raise TypeError("first-order head wings require PhotonBasisLayout")
+    layout.assert_mesh(mesh)
+    if not isinstance(first_order, StaticGaugeFirstOrderComponent):
+        raise TypeError(
+            "first-order head wings require StaticGaugeFirstOrderComponent; "
+            f"got {type(first_order).__name__}")
+    wfns_charge, wfns_transverse = _require_head_wing_basis_pair(
+        charge_binding, transverse_binding, layout)
+
+    p = jnp.asarray(first_order.energy_scaled_d1_raw, dtype=jnp.complex128)
+    if (p.ndim != 5 or tuple(p.shape[:2]) != (2, 4)
+            or p.shape[-2] != p.shape[-1]):
+        raise ValueError(
+            "first-order energy-scaled jet must be "
+            f"(2,4,nk,nb,nb); got {p.shape}")
+    nk, storage = int(p.shape[2]), int(p.shape[-1])
+    logical = int(first_order.nb_logical)
+    omega = jnp.atleast_1d(jnp.asarray(
+        first_order.omegas_ry, dtype=jnp.complex128))
+    n_omega = int(omega.shape[0])
+    if not (0 < logical <= storage):
+        raise ValueError(
+            f"first-order head manifold logical/storage={logical}/{storage}")
+    if (int(first_order.nk_tot) != nk or int(first_order.nspin) < 1
+            or int(first_order.normalization_nspinor) < 1):
+        raise ValueError(
+            "first-order head normalization metadata is invalid: "
+            f"nk={nk}/{first_order.nk_tot}, nspin={first_order.nspin}, "
+            "normalization_nspinor="
+            f"{first_order.normalization_nspinor}")
+    if tuple(first_order.S_first_first.shape) != (n_omega, 2, 2, 4, 4):
+        raise ValueError(
+            "first-order S/omega axes disagree: "
+            f"S={first_order.S_first_first.shape}, n_omega={n_omega}")
+
+    for role, binding, wfns in (
+            ("charge", charge_binding, wfns_charge),
+            ("transverse", transverse_binding, wfns_transverse)):
+        start, stop = binding.receipt.band_interval
+        if start != 0 or stop < logical:
+            raise ValueError(
+                f"static gauge {role} basis band interval [{start},{stop}) "
+                f"does not cover head manifold [0,{logical})")
+        if (int(wfns.enk.shape[0]) != nk
+                or int(wfns.enk.shape[1]) < storage
+                or tuple(wfns.occ.shape) != tuple(wfns.enk.shape)):
+            raise ValueError(
+                f"static gauge {role} carrier energy/occupation shape "
+                f"{wfns.enk.shape}/{wfns.occ.shape} does not cover "
+                f"({nk},{storage})")
+    energies = wfns_charge.enk[:, :storage]
+    occupations = wfns_charge.occ[:, :storage]
+    p_flat = p.reshape(8, nk, storage, storage)
+
+    native_y = []
+    native_z = []
+    families = (wfns_charge, wfns_transverse,
+                wfns_transverse, wfns_transverse)
+    for body_channel, wfns in enumerate(families):
+        y_raw, z_raw = head_wings_sharded(
+            p_flat, wfns, energies, occupations, omega,
+            mesh=mesh, nb_logical=logical,
+            nk_tot=int(first_order.nk_tot),
+            nspin=int(first_order.nspin),
+            nspinor=int(first_order.normalization_nspinor),
+            eta_ry=float(first_order.eta_ry),
+            body_lorentz_channel=body_channel,
+        )
+        extent = layout.padded_extent(body_channel)
+        if (tuple(y_raw.shape) != (n_omega, 8, extent)
+                or tuple(z_raw.shape) != (n_omega, extent, 8)):
+            raise ValueError(
+                f"head-wing channel {body_channel} returned Y/Z shapes "
+                f"{y_raw.shape}/{z_raw.shape}, expected "
+                f"{(n_omega, 8, extent)}/{(n_omega, extent, 8)}")
+        y_head_rows = y_raw.reshape(n_omega, 2, 4, extent)
+        y_head_rows = y_head_rows.reshape(n_omega * 2, 4, extent)
+        z_head_rows = z_raw.reshape(n_omega, extent, 2, 4)
+        z_head_rows = jnp.transpose(z_head_rows, (0, 2, 3, 1))
+        z_head_rows = z_head_rows.reshape(n_omega * 2, 4, extent)
+        native_y.append(y_head_rows)
+        native_z.append(z_head_rows)
+
+    packed_y = pack_photon_head_body_vectors(
+        tuple(native_y), layout, mesh, axis_name="x")
+    packed_z = pack_photon_head_body_vectors(
+        tuple(native_z), layout, mesh, axis_name="y")
+    Y_x = packed_y.reshape(n_omega, 2, 4, layout.packed_extent)
+    Z_y = packed_z.reshape(n_omega, 2, 4, layout.packed_extent)
+    Z_y = jnp.transpose(Z_y, (0, 1, 3, 2))
+
+    carriers = RetainedAlphaFirstOrderHeadWingCarriers(
+        layout=layout, Y_x=Y_x, Z_y=Z_y,
+        charge_basis_receipt=charge_binding.receipt,
+        transverse_basis_receipt=transverse_binding.receipt,
+        nb_logical=logical, n_omega=n_omega,
+        _producer_token=_RETAINED_ALPHA_HEAD_WING_TOKEN,
+    )
+    return require_retained_alpha_first_order_head_wings(carriers, mesh)
 
 
 def require_charge_hall_cubature_response(
@@ -334,10 +591,13 @@ def require_full_static_gauge_availability(
 __all__ = [
     "CHARGE_HALL_CUBATURE_AVAILABILITY",
     "ChargeHallCubatureResponse",
+    "RetainedAlphaFirstOrderHeadWingCarriers",
     "StaticGaugeResponseCapability",
     "StaticGaugeTermAvailability",
     "StaticGaugeTermStatus",
     "build_charge_hall_cubature_response",
+    "build_retained_alpha_first_order_head_wings",
     "require_charge_hall_cubature_response",
     "require_full_static_gauge_availability",
+    "require_retained_alpha_first_order_head_wings",
 ]

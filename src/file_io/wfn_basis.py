@@ -328,6 +328,35 @@ class WavefunctionBasisReceipt:
                 f"{where}: receipt padded centroid extents differ: "
                 f"{int(self.n_rmu_padded)} vs {int(other.n_rmu_padded)}")
 
+    def assert_same_wfn_manifold(
+        self, other: "WavefunctionBasisReceipt", *, where: str,
+    ) -> None:
+        """Refuse unless distinct centroid bases sample one WFN manifold.
+
+        Charge and transverse bases intentionally differ in role, centroid
+        table, and centroid extent.  Everything else -- canonical WFN
+        identity, physical band interval, FFT grid, Bloch transform, sampled
+        spinor representation, and kinetic-balance lift -- must agree before
+        the two can enter one Lorentz response.  Deriving the comparison from
+        the dataclass schema keeps any future physical field fail-closed.
+        """
+        if not isinstance(other, WavefunctionBasisReceipt):
+            raise TypeError(
+                f"{where}: expected WavefunctionBasisReceipt, got "
+                f"{type(other).__name__}")
+        basis_specific = {
+            "role", "centroid_fingerprint_scheme", "centroid_table_md5",
+            "n_rmu_logical", "n_rmu_padded",
+        }
+        differing = [
+            item.name for item in fields(self)
+            if item.name not in basis_specific
+            and getattr(self, item.name) != getattr(other, item.name)]
+        if differing:
+            raise ValueError(
+                f"{where}: centroid bases differ in shared WFN-manifold "
+                f"fields {differing}")
+
     def assert_matches_carrier(self, carrier, *, where: str) -> None:
         """Authenticate one numerical Wavefunctions carrier on the host.
 

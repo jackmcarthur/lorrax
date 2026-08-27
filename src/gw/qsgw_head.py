@@ -428,6 +428,8 @@ class StaticGaugeFirstOrderComponent:
     ``retained_connection_cart`` is the same in-plane connection already
     formed for the first jet.  Returning that live value lets the opt-in
     second-order component reuse it without a second link-stencil pass.
+    ``normalization_nspinor`` is the physical source-WFN state multiplicity,
+    not the four-component extent of the kinetic-balance carrier.
     """
 
     energy_scaled_d1_raw: jax.Array
@@ -437,6 +439,11 @@ class StaticGaugeFirstOrderComponent:
     charge_ward_residual: jax.Array
     retained_connection_cart: jax.Array
     nb_logical: int
+    omegas_ry: jax.Array
+    nk_tot: int
+    nspin: int
+    normalization_nspinor: int
+    eta_ry: float
 
 
 @dataclass(frozen=True)
@@ -1412,6 +1419,7 @@ def _head_wing_kernel(
     nb_logical: int,
     include_surface: bool,
     layout: str = "legacy",
+    body_current_vertex: bool = False,
 ) -> Callable:
     """Layout dispatcher.  ``layout='legacy'`` (default) returns the exact
     pre-``low_mem_bands`` kernel, unmoved; ``layout='face'`` returns the
@@ -1422,11 +1430,13 @@ def _head_wing_kernel(
     if layout == "legacy":
         return _head_wing_kernel_legacy(
             mesh, nb_logical=int(nb_logical),
-            include_surface=bool(include_surface))
+            include_surface=bool(include_surface),
+            body_current_vertex=bool(body_current_vertex))
     if layout == "face":
         return _head_wing_kernel_face(
             mesh, nb_logical=int(nb_logical),
-            include_surface=bool(include_surface))
+            include_surface=bool(include_surface),
+            body_current_vertex=bool(body_current_vertex))
     raise ValueError(
         f"_head_wing_kernel: layout must be 'legacy' or 'face', got "
         f"{layout!r}")
@@ -1437,6 +1447,7 @@ def _head_wing_kernel_legacy(
     *,
     nb_logical: int,
     include_surface: bool,
+    body_current_vertex: bool = False,
 ) -> Callable:
     r"""Return the cached all-band q-linear wing contraction.
 
@@ -1450,7 +1461,8 @@ def _head_wing_kernel_legacy(
     UNTOUCHED by ``low_mem_bands`` — this is the exact pre-existing body,
     unmoved; see ``_head_wing_kernel_face`` for the two-face sibling.
     """
-    key = ("head_wings", id(mesh), int(nb_logical), bool(include_surface))
+    key = ("head_wings", id(mesh), int(nb_logical), bool(include_surface),
+           bool(body_current_vertex))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1459,6 +1471,8 @@ def _head_wing_kernel_legacy(
     py = int(mesh.shape[ax_y])
     perm_x = tuple((i, (i + 1) % px) for i in range(px))
     perm_y = tuple((i, (i + 1) % py) for i in range(py))
+    if body_current_vertex:
+        from common.gamma_matrices import gamma_apply
 
     def _frequency_layout(n_omega):
         block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
@@ -1476,6 +1490,8 @@ def _head_wing_kernel_legacy(
         pref_inter,
         pref_surface,
         eta,
+        body_perm,
+        body_phase,
     ):
         nk = v_local.shape[1]
         nx, ny = v_local.shape[-2:]
@@ -1549,6 +1565,12 @@ def _head_wing_kernel_legacy(
             occupations, (zero, y_start), (nk, ny))
         psi_low_x = jax.lax.dynamic_slice(
             psi_xn_local, (zero, zero, zero, y_start), (nk, ns, nmu_x, ny))
+        if body_current_vertex:
+            # b^B_ij(mu)=psi_i^dagger Gamma_B psi_j: Gamma acts on the
+            # ket/low-band leg only.  This factory-time branch leaves the
+            # incumbent charge graph free of a gather or multiply.
+            psi_low_x = gamma_apply(
+                psi_low_x, body_perm, body_phase, axis=1)
 
         n_vertex = int(v_local.shape[0])
         y0 = jnp.zeros(
@@ -1613,6 +1635,12 @@ def _head_wing_kernel_legacy(
             occupations, (zero, x_start), (nk, nx))
         psi_high_y = jax.lax.dynamic_slice(
             psi_yn_local, (zero, zero, zero, x_start), (nk, ns, nmu_y, nx))
+        if body_current_vertex:
+            # Z contains conj(b^B_ij).  Gamma_B is Hermitian, so applying it
+            # to the unconjugated high-band leg gives exactly that quantity,
+            # including the imaginary alpha_y convention.
+            psi_high_y = gamma_apply(
+                psi_high_y, body_perm, body_phase, axis=1)
         z0 = jnp.zeros(
             (n_omega_padded, nmu_y, n_vertex), dtype=jnp.complex128)
 
@@ -1682,6 +1710,8 @@ def _head_wing_kernel_legacy(
             P(),
             P(),
             P(),
+            P(None),
+            P(None),
         ),
         out_specs=(P(None, None, "x"), P(None, "y", None)),
         check_vma=False,
@@ -1696,6 +1726,7 @@ def _head_wing_kernel_face(
     *,
     nb_logical: int,
     include_surface: bool,
+    body_current_vertex: bool = False,
 ) -> Callable:
     r"""Two-face-carrier q-linear wing contraction (audit report §"Full
     q->0 head/body wings", census rows 6/7).
@@ -1776,11 +1807,14 @@ def _head_wing_kernel_face(
     the gathered psi block (``nk*ns*nb_full*mu_block``, small).  None of
     these three terms contains ``mu_local`` or ``mu_pad``.
     """
-    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface))
+    key = ("head_wings_face", id(mesh), int(nb_logical),
+           bool(include_surface), bool(body_current_vertex))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
+    if body_current_vertex:
+        from common.gamma_matrices import gamma_apply
 
     def _local(
         v_local,
@@ -1793,6 +1827,8 @@ def _head_wing_kernel_face(
         pref_inter,
         pref_surface,
         eta,
+        body_perm,
+        body_phase,
     ):
         nk = v_local.shape[1]
         v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
@@ -1865,12 +1901,15 @@ def _head_wing_kernel_face(
                 psi_mun_padded, (zero, zero, start, zero),
                 (nk, ns, mu_x_block, psi_mun_padded.shape[-1]))
             psi_full = jax.lax.all_gather(tile, ax_y, axis=3, tiled=True)
+            psi_low_vertex = (
+                gamma_apply(psi_full, body_perm, body_phase, axis=1)
+                if body_current_vertex else psi_full)
 
             def _contract_left(weight):
                 return jnp.einsum(
                     "akij,wkij,ksmi,ksmj->wam",
                     jnp.conj(v_full), weight,
-                    jnp.conj(psi_full), psi_full,
+                    jnp.conj(psi_full), psi_low_vertex,
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_left)
@@ -1900,11 +1939,14 @@ def _head_wing_kernel_face(
                 (nk, psi_nmu_padded.shape[1], ns, mu_y_block))
             gathered = jax.lax.all_gather(tile, ax_x, axis=1, tiled=True)
             psi_full = jnp.transpose(gathered, (0, 2, 3, 1))
+            psi_high_vertex = (
+                gamma_apply(psi_full, body_perm, body_phase, axis=1)
+                if body_current_vertex else psi_full)
 
             def _contract_right(weight):
                 return jnp.einsum(
                     "ksmi,ksmj,wkij,bkij->wmb",
-                    psi_full, jnp.conj(psi_full), weight, v_full,
+                    psi_high_vertex, jnp.conj(psi_full), weight, v_full,
                     optimize=True,
                 )
             blocks = _weighted_stack(_contract_right)
@@ -1933,6 +1975,8 @@ def _head_wing_kernel_face(
             P(),
             P(),
             P(),
+            P(None),
+            P(None),
         ),
         out_specs=(P(None, None, "x"), P(None, "y", None)),
         check_vma=False,
@@ -1996,14 +2040,16 @@ def head_wings_sharded(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    body_lorentz_channel: int = 0,
 ):
     r"""Build q-linear head/body wings in the current band basis.
 
     For every energy-ordered interband pair, with
-    ``b_ij(mu)=sum_s psi_i(mu)^* psi_j(mu)``, this evaluates
+    ``b^B_ij(mu)=sum_st psi_i(mu,s)^* Gamma_B[s,t] psi_j(mu,t)``, this
+    evaluates
 
-    ``Y[a,mu] = sum conj(v[a,ij]) F_ij b_ij(mu)`` and
-    ``Z[mu,b] = sum conj(b_ij(mu)) F_ij v[b,ij]``,
+    ``Y[a,mu] = sum conj(v[a,ij]) F_ij b^B_ij(mu)`` and
+    ``Z[mu,b] = sum conj(b^B_ij(mu)) F_ij v[b,ij]``,
 
     where ``F_ij = 4(f_j-f_i)/(Nk*nspin*nspinor*(z^2-dE^2))``.  This is
     exactly the normalization paired with ``head_s_tensor_sharded``:
@@ -2040,14 +2086,43 @@ def head_wings_sharded(
     CT/TT response needs no response-weight, second-jet, or contact terms.
     Keeping that boundary closed gives the shared kernel exactly two XLA
     shapes, rather than one compile for every caller-chosen width.
+
+    ``body_lorentz_channel=0`` is the incumbent charge overlap and leaves
+    its compiled algebra unchanged.  Channels 1--3 insert the canonical
+    Hermitian alpha-current matrix on only the appropriate body leg.  They
+    are admitted only for the width-eight four-spinor jet and share one
+    compiled current-kernel shape; the channel permutation/phase is a tiny
+    replicated runtime operand.  No transformed wavefunction bundle or
+    additional centroid carrier is materialized.  As elsewhere in this
+    module, ``nspinor`` remains the physical source-WFN normalization; the
+    carrier's required four-component representation is checked from its
+    wavefunction fields.
     """
+    if not isinstance(body_lorentz_channel, (int, np.integer)):
+        raise TypeError(
+            "body_lorentz_channel must be an integer in {0,1,2,3}")
+    body_channel = int(body_lorentz_channel)
+    if body_channel not in (0, 1, 2, 3):
+        raise ValueError(
+            "body_lorentz_channel must be in {0,1,2,3}; got "
+            f"{body_channel}")
+    from common.gamma_matrices import gamma_perm_phase
+    body_perm, body_phase = gamma_perm_phase(body_channel)
+    # These are four-entry constants every rank derives identically.  Route
+    # them through the cross-process placement owner rather than introducing
+    # a driver-local device_put spelling.
+    from common.collectives import replicate_to_mesh
+    body_perm = replicate_to_mesh(np.asarray(body_perm), mesh)
+    body_phase = replicate_to_mesh(np.asarray(body_phase), mesh)
     layout = getattr(wfns, "layout", "legacy")
     if layout == "face":
         return _head_wings_sharded_face(
             velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
             mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
             nspinor=nspinor, eta_ry=eta_ry,
-            surface_weight_kn=surface_weight_kn)
+            surface_weight_kn=surface_weight_kn,
+            body_lorentz_channel=body_channel,
+            body_perm=body_perm, body_phase=body_phase)
     if layout != "legacy":
         raise ValueError(
             f"head_wings_sharded: wfns.layout must be 'legacy' or 'face', "
@@ -2061,6 +2136,10 @@ def head_wings_sharded(
         raise ValueError(
             "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
             f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
+    if body_channel and int(v.shape[0]) != 8:
+        raise ValueError(
+            "current body Lorentz channels require the canonical width-eight "
+            f"head jet; got n_vertex={int(v.shape[0])}")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -2072,6 +2151,10 @@ def head_wings_sharded(
     ):
         raise ValueError(
             "centroid wavefunction k/spinor axes do not match the velocity")
+    if body_channel and int(wfns.psi_xn.shape[1]) != 4:
+        raise ValueError(
+            "current body Lorentz channels require four-component centroid "
+            f"wavefunctions; got spin extent {wfns.psi_xn.shape[1]}")
     if (
         int(wfns.psi_xn.shape[-1]) < int(v.shape[-1])
         or int(wfns.psi_yn.shape[-1]) < int(v.shape[-1])
@@ -2098,11 +2181,13 @@ def head_wings_sharded(
     pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
-        include_surface=bool(include_surface))(
+        include_surface=bool(include_surface),
+        body_current_vertex=bool(body_channel))(
             v, psi_xn, psi_yn, e, f, surface, omega,
             jnp.asarray(pref_inter, dtype=jnp.complex128),
             jnp.asarray(pref_surface, dtype=jnp.complex128),
             jnp.asarray(float(eta_ry), dtype=jnp.float64),
+            body_perm, body_phase,
         )
 
 
@@ -2120,6 +2205,9 @@ def _head_wings_sharded_face(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    body_lorentz_channel: int = 0,
+    body_perm=None,
+    body_phase=None,
 ):
     """``layout='face'`` body of :func:`head_wings_sharded`.  Same physics
     and normalization as the legacy body's docstring; only the carrier and
@@ -2139,6 +2227,11 @@ def _head_wings_sharded_face(
         raise ValueError(
             "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
             f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
+    body_channel = int(body_lorentz_channel)
+    if body_channel and int(v.shape[0]) != 8:
+        raise ValueError(
+            "current body Lorentz channels require the canonical width-eight "
+            f"head jet; got n_vertex={int(v.shape[0])}")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -2156,6 +2249,10 @@ def _head_wings_sharded_face(
     if s_mun != s_nmu:
         raise ValueError(
             f"psi_mun/psi_nmu spinor axes disagree: {s_mun} vs {s_nmu}")
+    if body_channel and int(s_mun) != 4:
+        raise ValueError(
+            "current body Lorentz channels require four-component centroid "
+            f"wavefunctions; got spin extent {s_mun}")
     if n_mun != n_nmu:
         raise ValueError(
             f"psi_mun/psi_nmu band extents disagree: {n_mun} vs {n_nmu}")
@@ -2175,13 +2272,19 @@ def _head_wings_sharded_face(
         float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
     pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
+    if body_perm is None or body_phase is None:
+        raise ValueError(
+            "_head_wings_sharded_face requires the canonical body-vertex "
+            "permutation/phase resolved by head_wings_sharded")
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
-        include_surface=bool(include_surface), layout="face")(
+        include_surface=bool(include_surface), layout="face",
+        body_current_vertex=bool(body_channel))(
             v, wfns.psi_mun, wfns.psi_nmu, e, f, surface, omega,
             jnp.asarray(pref_inter, dtype=jnp.complex128),
             jnp.asarray(pref_surface, dtype=jnp.complex128),
             jnp.asarray(float(eta_ry), dtype=jnp.float64),
+            body_perm, body_phase,
         )
 
 
@@ -2736,12 +2839,18 @@ def static_gauge_first_order_component_sharded(
     charge_ward_residual = jnp.where(
         charge_scale > 0.0, charge_error / charge_scale, 0.0)
 
+    # Frequencies are a bounded replicated input, identical on every rank.
+    # Use the common cross-process placement owner so this retained carrier
+    # has an explicit P(None) identity at P>1 without a local device_put.
+    from common.collectives import replicate_to_mesh
+    omega = replicate_to_mesh(
+        np.atleast_1d(np.asarray(omegas_ry, dtype=np.complex128)), mesh)
     p_flat = p.reshape(8, nk, storage, storage)
     s_flat = head_s_tensor_sharded(
         p_flat,
         energies,
         occupations,
-        omegas_ry,
+        omega,
         mesh=mesh,
         nb_logical=logical,
         cell_volume=float(cell_volume),
@@ -2764,6 +2873,11 @@ def static_gauge_first_order_component_sharded(
         charge_ward_residual=charge_ward_residual,
         retained_connection_cart=connection_cart,
         nb_logical=logical,
+        omegas_ry=omega,
+        nk_tot=nk,
+        nspin=int(nspin),
+        normalization_nspinor=int(nspinor),
+        eta_ry=float(eta_ry),
     )
 
 

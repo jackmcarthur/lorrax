@@ -178,6 +178,17 @@ def test_charge_and_transverse_are_distinct_even_on_the_same_points():
     transverse = _receipt(role="transverse")
     with pytest.raises(ValueError, match="role"):
         charge.assert_same_source(transverse, where="Lorentz channel")
+    charge.assert_same_wfn_manifold(
+        transverse, where="distinct Lorentz centroid bases")
+
+    transverse_other_points = _receipt(
+        role="transverse", centroids=CENTROIDS[::-1], pad=8)
+    charge.assert_same_wfn_manifold(
+        transverse_other_points, where="distinct Lorentz centroid bases")
+    with pytest.raises(ValueError, match="wfn_fingerprint"):
+        charge.assert_same_wfn_manifold(
+            _receipt(role="transverse", wfn=_wfn(shift=1.0e-3)),
+            where="stale transverse WFN")
 
 
 def test_scalar_spinor_and_kinetic_balance_lift_are_distinct_sources():
