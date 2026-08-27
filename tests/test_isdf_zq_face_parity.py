@@ -528,20 +528,33 @@ def test_zq_face_layout_matches_legacy(name, kwargs):
         f"max relative diff {out['cache_route_max_rel']:.3e} (case {name})")
 
 
-def test_local_y_shard_tile_reconstruction_order_complex128():
-    """The tile scan's transpose/reshape restores each local y-shard exactly."""
+def test_global_tile_concat_restores_outer_y_shard_order_complex128():
+    """Global concat, not local concat, restores the outer y-shard order."""
     import numpy as np
 
     rng = np.random.default_rng(20260827)
-    # Z_R local shape is (kx,ky,kz,r_loc,mu); scan prepends ntiles.
-    local = _crand(rng, 2, 2, 1, 10, 3)
-    scan_tiles = np.stack(np.split(local, 2, axis=3), axis=0)
-    restored = np.transpose(scan_tiles, (1, 2, 3, 0, 4, 5)).reshape(
-        local.shape)
-    assert restored.dtype == np.complex128
-    np.testing.assert_array_equal(restored, local)
-    # A raw reshape would interleave k/r axes and is a discriminating oracle.
-    assert not np.array_equal(scan_tiles.reshape(local.shape), local)
+    py = 4
+    outer = _crand(rng, 2, 3, 16)
+    global_tiles = np.split(outer, 2, axis=-1)
+    tile_y_shards = tuple(
+        np.split(tile, py, axis=-1) for tile in global_tiles)
+
+    # Production composition: each tile is a semantically complete GLOBAL
+    # P(...,'y') array; concatenate globally, then redistribute once into the
+    # incumbent outer P(...,'y') shards.
+    restored_global = np.concatenate(global_tiles, axis=-1)
+    restored_y_shards = np.split(restored_global, py, axis=-1)
+    assert restored_global.dtype == np.complex128
+    np.testing.assert_array_equal(restored_global, outer)
+    np.testing.assert_array_equal(
+        np.concatenate(restored_y_shards, axis=-1), outer)
+
+    # The tempting manual-shard concat is wrong and this fixture discriminates
+    # it: tile0/rank0 followed by tile1/rank0 is not outer/rank0's contiguous
+    # slab (which spans tile0/ranks0+1 for ntiles=2, Py=4).
+    wrong_rank0 = np.concatenate(
+        (tile_y_shards[0][0], tile_y_shards[1][0]), axis=-1)
+    assert not np.array_equal(wrong_rank0, restored_y_shards[0])
 
 
 def test_band_chunks_must_complete_before_pair_product():

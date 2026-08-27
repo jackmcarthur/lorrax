@@ -6,10 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from gw.gflat_memory_model import (
-    _GATHERED_PSI_SLOTS,
     _face_pair_density_slots,
     _fft_box_bytes,
-    _stage_C_face_terms,
     plan_gflat_chunks,
 )
 from gw.gw_init import _plan_gflat_chunks_for_channel
@@ -174,7 +172,7 @@ def test_bounded_partition_tile_preserves_outer_extent_and_alignment():
     assert bounded_partition_tile(45, 16, 4) == 0
 
 
-def test_run158_cliff_uses_two_41472_tiles_and_prices_full_outer_transform():
+def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     full = _profile_cliff_plan(41_472)
     tiled = _profile_cliff_plan(82_944)
     assert full.face_y_cache_r_tile == 41_472
@@ -182,22 +180,18 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_full_outer_transform():
     assert tiled.face_y_cache_r_tile == 41_472
     assert tiled.cache_face_y_blocks
     assert tiled.face_y_cache_bytes == full.face_y_cache_bytes == 6_115_295_232
-    # Pair/cache HWM is tile-sized, so it equals the established 41,472 arm.
+    completed_z_tile = 1_194_393_600
+    # Pair/cache work is tile-sized.  The only incremental live set while
+    # tile 1 runs is tile 0's completed all-P compact Z_q output.
     assert (tiled.peak_breakdown["C_fit_one_rchunk"]
-            == full.peak_breakdown["C_fit_one_rchunk"])
-
-    terms = _stage_C_face_terms(
-        nk=36, ns=4, mu=800, face_nb=256, slots=16,
-        p_x=4, p_y=4, p_xy=16, band_chunk=16, n_band_chunks=16)
-    outer_transform_slope = (
-        _GATHERED_PSI_SLOTS * terms["y_block_slope"]
-        + terms["y_source_slope"])
-    # The two-tile cache still builds from one full-outer Y block at a time.
-    # Its build HWM must therefore grow by one 41,472-wide full-block
-    # transform relative to the 41,472 outer arm, rather than being falsely
-    # priced only at the cache tile width.
+            - full.peak_breakdown["C_fit_one_rchunk"]
+            == completed_z_tile)
+    # The canonical Y source/scatter/cache transaction is also tile-sized:
+    # relative to the one-tile arm, the build peak grows only by completed
+    # compact Z—not by another outer-width Y block.
     assert (tiled.peak_breakdown["C_face_y_cache_build"]
             - full.peak_breakdown["C_face_y_cache_build"]
-            == outer_transform_slope * 41_472)
-    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_365_370_592
-    assert tiled.hwm_bytes == 27_795_741_408
+            == completed_z_tile)
+    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_699_800_800
+    assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
+    assert tiled.hwm_bytes == 28_990_135_008

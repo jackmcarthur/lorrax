@@ -1675,10 +1675,33 @@ def _z_q_face(
 				f"tile={cache_y_r_tile}, r_chunk_size={n_zchunk}, p_y={p_y}")
 	else:
 		cache_y_r_tile = 0
-	cache_r_loc = (cache_y_r_tile // p_y
-	               if cache_y_blocks else r_loc)
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+
+	if cache_y_blocks and cache_y_r_tile < n_zchunk:
+		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
+		# the same full-cache owner at the tile width bounds its Y
+		# all_to_all/all_gather bytes; concatenating here, OUTSIDE manual
+		# shard_map, lets JAX perform the required compact-Z redistribution.
+		# Concatenating the LOCAL y shards inside `_local` would be wrong:
+		# tile t / rank y owns global segment (t*tile + y*tile/Py), whereas
+		# the outer carrier assigns each rank one contiguous r_chunk/Py slab.
+		n_cache_tiles = n_zchunk // cache_y_r_tile
+		Z_q_tiles = tuple(
+			_z_q_face(
+				psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
+				gamma_L=gamma_L, gamma_R=gamma_R,
+				band_chunk_ranges=band_chunk_ranges,
+				r_start_dyn=r_start_dyn + tile_idx * cache_y_r_tile,
+				r_chunk_size=cache_y_r_tile,
+				kgrid=kgrid, mesh_xy=mesh_xy,
+				cache_y_blocks=True,
+				cache_y_r_tile=cache_y_r_tile)
+			for tile_idx in range(n_cache_tiles)
+		)
+		Z_q = jnp.concatenate(Z_q_tiles, axis=-1)
+		return jax.lax.with_sharding_constraint(
+			Z_q, NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
 	if not bcr:
@@ -1927,7 +1950,7 @@ def _z_q_face(
 					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
 				return Z_R
 
-			if cache_y_blocks and cache_y_r_tile == n_zchunk:
+			if cache_y_blocks:
 				def build_y_block(_unused, bc_idx):
 					return _unused, load_y_block_full(bc_idx)
 
@@ -1937,35 +1960,6 @@ def _z_q_face(
 				# Original one-pass cache: one canonical transform per band
 				# chunk, then read-only reuse across every spin pair.
 				Z_R = accumulate_spin_pairs(psi_Y_blocks, r_loc)
-			elif cache_y_blocks:
-				n_cache_tiles = n_zchunk // cache_y_r_tile
-
-				def cache_tile_body(_unused, cache_tile_idx):
-					def build_y_tile(_build_unused, bc_idx):
-						psi_Y_bc_full = load_y_block_full(bc_idx)
-						psi_Y_bc_tile = jax.lax.dynamic_slice_in_dim(
-							psi_Y_bc_full,
-							cache_tile_idx * cache_r_loc,
-							cache_r_loc,
-							axis=3)
-						return _build_unused, psi_Y_bc_tile
-
-					_, psi_Y_tile_blocks = jax.lax.scan(
-						build_y_tile, jnp.zeros((), dtype=jnp.int32),
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-					Z_R_tile = accumulate_spin_pairs(
-						psi_Y_tile_blocks, cache_r_loc)
-					return _unused, Z_R_tile
-
-				_, Z_R_tiles = jax.lax.scan(
-					cache_tile_body, jnp.zeros((), dtype=jnp.int32),
-					jnp.arange(n_cache_tiles, dtype=jnp.int32), unroll=1)
-				# Tile each rank's contiguous local y-shard, then restore its
-				# original local order.  The global P(None,'x','y') ownership is
-				# unchanged; no gather or less-than-all-P materialization occurs.
-				Z_R = jnp.transpose(
-					Z_R_tiles, (1, 2, 3, 0, 4, 5)).reshape(
-						(nkx, nky, nkz, r_loc, mu_loc))
 			else:
 				# Dummy is dead after tracing the static repeated-route branch.
 				Z_R = accumulate_spin_pairs(

@@ -849,6 +849,7 @@ def plan_gflat_chunks(
     face_y_cache_r_tile = 0
     face_terms = None
     face_cache_build_t = 0.0
+    face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
     if low_mem_bands:
         face_terms = _stage_C_face_terms(
@@ -1065,20 +1066,29 @@ def plan_gflat_chunks(
     if low_mem_bands:
         if cache_face_y_blocks:
             _cache_tile = face_y_cache_r_tile
+            _completed_tile_z = (
+                _c128(nq, mu, shard=p_xy) * (r_chunk - _cache_tile))
             C_fit_t = (face_terms["constant"]
-                       + face_terms["cache_pair_slope"] * _cache_tile)
+                       + face_terms["cache_pair_slope"] * _cache_tile
+                       + _completed_tile_z)
             face_y_cache_bytes = (
                 face_terms["y_cache_slope"] * _cache_tile)
-            # Each tile's canonical transform still sees the full OUTER
-            # chunk before selecting this rank's local-r tile.  Price that
-            # one-block transient at r_chunk, while only the stacked cache
-            # scales with the internal tile.
+            # Every tile invokes the SAME canonical face owner at tile width,
+            # so the source/all_to_all/all_gather transaction and stacked
+            # cache are both tile-sized.  Previously completed compact Z_q
+            # tiles stay live while the next tile is built/contracted.
             face_cache_build_t = (
                 face_terms["constant"]
                 + (0.0 if cache_psi_r else fft_box_zeta_transform)
-                + face_terms["y_cache_slope"] * _cache_tile
-                + (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
-                   + face_terms["y_source_slope"]) * r_chunk)
+                + face_terms["cache_build_slope"] * _cache_tile
+                + _completed_tile_z)
+            if _cache_tile < r_chunk:
+                # Global tile arrays are concatenated outside manual
+                # shard_map, then constrained once to the incumbent outer
+                # P(None,'x','y') carrier.  Conservatively price live tile
+                # inputs plus the redistributed output as two all-P Z stacks.
+                face_tile_concat_t = 2.0 * _c128(
+                    nq, mu, r_chunk, shard=p_xy)
         else:
             C_fit_t = C_constant + C_slope * r_chunk
     else:
@@ -1184,6 +1194,9 @@ def plan_gflat_chunks(
     if cache_face_y_blocks:
         peaks["C_face_y_cache_build"] = (
             persistent_total + face_cache_build_t)
+        if face_tile_concat_t:
+            peaks["C_face_tile_concat"] = (
+                persistent_total + face_tile_concat_t)
     bottleneck = max(peaks, key=peaks.get)
     hwm = peaks[bottleneck]
 
