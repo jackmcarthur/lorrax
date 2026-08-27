@@ -24,7 +24,7 @@ question without a deck:
 
 Cache-cold is FORCED, both variables (INVARIANTS row 4 + the 2026-08-16
 finding that ``ISDF_JAX_CACHE_DIR=""`` alone is not cold under ``lx``, which
-exports ``JAX_COMPILATION_CACHE_DIR``).
+may inherit a persistent JAX cache from an older environment).
 
 Run (Perlmutter, one GPU is enough — this is an exploration leg, not a
 verification one; the four-GPU rule governs verification):

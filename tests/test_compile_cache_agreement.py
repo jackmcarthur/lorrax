@@ -264,30 +264,47 @@ def test_bound_cache_dir_reports_the_directory_jax_actually_uses(
     assert jcc.bound_cache_dir() == ""
 
 
-def test_an_inherited_binding_is_dropped_so_the_next_compile_rebinds(
-        monkeypatch, tmp_path):
-    """THE FIX, and its RED TWIN in the same cell.
+@pytest.mark.parametrize("bound_name", ["elsewhere", "ours"])
+def test_any_inherited_binding_is_rebuilt_through_the_atomic_factory(
+        monkeypatch, tmp_path, bound_name):
+    """THE FIX, including the same-path stock-cache red twin.
 
     `reset_cache()` is the only thing that makes JAX rebuild its cache object
-    against the directory we chose.  The twin is the `reset_cache` that is
-    never called: the binding survives, which is exactly the measured defect.
+    through the patched ``get_file_cache`` factory.  A same-path object must be
+    reset too: otherwise its directory looks correct while its writes remain
+    stock-JAX non-atomic and unmeasured.
     """
     inherited = str(tmp_path / ".jax_cache")
     ours = str(tmp_path / "lorrax_jax_cache" / "np4")
+    bound_to = ours if bound_name == "ours" else inherited
 
-    # RED TWIN FIRST: no rebind -> the stale binding survives, and it does NOT
-    # agree with the directory the agreement is about.  If this assertion ever
-    # fails, the cell below has stopped proving anything.
-    cc = _fake_cc(monkeypatch, inherited)
-    assert jcc.bound_cache_dir() == inherited != ours
+    # RED TWIN FIRST: without a reset the stale binding survives and does NOT
+    # pass through the patched atomic factory.  The same-path arm is the subtle
+    # case: path equality cannot prove which cache class owns writes.
+    _fake_cc(monkeypatch, bound_to)
+    assert jcc.bound_cache_dir() == bound_to
 
-    # THE FIX: reset, and the binding is gone so the next `_get_cache` rebuilds
-    # it from `jax_compilation_cache_dir` (which ensure_jax_compile_cache has
-    # already pointed at `ours`).  `reset_cache` is jax's own API and is what
-    # ensure_jax_compile_cache calls; a jax without it is a refusal, not a
-    # silent no-op, which is why this cell names it directly.
-    cc.reset_cache()
+    # THE FIX: production resets both arms.  The next `_get_cache` rebuilds
+    # from `jax_compilation_cache_dir`, after ensure has pointed it at ours,
+    # and therefore invokes LORRAX's patched factory.
+    jcc._reset_bound_cache_for_atomic_writer(tmp_path / "lorrax_jax_cache" /
+                                              "np4", proc_idx=1)
     assert jcc.bound_cache_dir() == ""
+
+
+def test_bound_stock_cache_reset_failure_is_loud(monkeypatch, tmp_path):
+    """Atomicity cannot degrade to a healthy-looking stock cache object."""
+    ours = str(tmp_path / "lorrax_jax_cache" / "np4")
+    cc = _fake_cc(monkeypatch, ours)
+
+    def _fail_reset():
+        raise RuntimeError("constructed reset failure")
+
+    monkeypatch.setattr(cc, "reset_cache", _fail_reset)
+    with pytest.raises(RuntimeError, match="stock non-atomic writes"):
+        jcc._reset_bound_cache_for_atomic_writer(
+            tmp_path / "lorrax_jax_cache" / "np4", proc_idx=0)
+    assert jcc.bound_cache_dir() == ours
 
 
 def test_the_summary_line_names_a_disagreeing_binding(monkeypatch, tmp_path,

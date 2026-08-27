@@ -1401,6 +1401,44 @@ def bound_cache_dir() -> str:
         return ""
 
 
+def _reset_bound_cache_for_atomic_writer(cache_path: Path,
+                                         proc_idx: int) -> None:
+    """Rebuild any live stock-JAX cache through LORRAX's patched factory.
+
+    Patching ``get_file_cache`` only affects future cache objects.  Even when
+    JAX is already bound to the requested path, keeping that object would keep
+    stock non-atomic writes and make write telemetry unavailable.  Reset the
+    object unconditionally; persistent files at the path are not removed.
+    """
+    previous = bound_cache_dir()
+    if not previous:
+        return
+
+    same_path = (os.path.realpath(previous)
+                 == os.path.realpath(str(cache_path)))
+    try:
+        from jax._src import compilation_cache as _cc_rebind
+        _cc_rebind.reset_cache()
+    except Exception as exc:                                   # noqa: BLE001
+        raise RuntimeError(
+            "LORRAX patched JAX's cache factory for atomic writes but could "
+            f"not reset the already-bound cache object at {previous}; "
+            "continuing would silently retain stock non-atomic writes"
+        ) from exc
+
+    if proc_idx == 0:
+        if same_path:
+            _debug_say(
+                f"rebuilt JAX's cache object at {cache_path} through the "
+                f"atomic LORRAX writer; persistent entries were retained.")
+        else:
+            _debug_say(
+                f"rebound JAX's compile cache from {previous} "
+                f"(inherited through JAX_COMPILATION_CACHE_DIR) to "
+                f"{cache_path}.  The inherited directory is not "
+                f"per-world-size, so the P>1 agreement cannot use it.")
+
+
 def _report_impl() -> None:
     s = _STATE
     writes = s.write_metrics()
@@ -1599,8 +1637,8 @@ def ensure_jax_compile_cache() -> None:
         _jax.config.update("jax_compilation_cache_dir", str(cache_path))
         # Keep JAX's standard one-second write threshold (or the user's
         # JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS override).  Forcing zero
-        # here created one Lustre file for every trivial compile and defeated
-        # the purpose of a run-local cache.
+        # here made every persistable compilation eligible regardless of its
+        # compile time, creating a Lustre-file storm of cheap entries.
         if n_proc > 1:
             # See docstring §4: JAX would otherwise auto-enable XLA's own
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
@@ -1649,27 +1687,7 @@ def ensure_jax_compile_cache() -> None:
     # seeing the same set), and `.jax_cache` is one flat directory shared by
     # every world size, so adopting it would put P=1 and P=16 entries in one
     # namespace and hand the agreement a set that changes under it.
-    _prev_bound = bound_cache_dir()
-    if _prev_bound and (os.path.realpath(_prev_bound)
-                        != os.path.realpath(str(cache_path))):
-        try:
-            from jax._src import compilation_cache as _cc_rebind
-            _cc_rebind.reset_cache()
-        except Exception as exc:                               # noqa: BLE001
-            if proc_idx == 0:
-                _say(f"could not rebind JAX's compile cache off "
-                     f"{_prev_bound} ({type(exc).__name__}: {exc}); it will "
-                     f"keep reading and writing there while this module's "
-                     f"agreement is about {cache_path}.  Expect hits=0 at "
-                     f"P>1.  Unset JAX_COMPILATION_CACHE_DIR to avoid it.")
-        else:
-            if proc_idx == 0:
-                _debug_say(
-                    f"rebound JAX's compile cache from {_prev_bound} "
-                    f"(inherited through JAX_COMPILATION_CACHE_DIR) to "
-                    f"{cache_path}.  The inherited directory is "
-                    f"not per-world-size, so the P>1 agreement cannot be "
-                    f"taken over it.")
+    _reset_bound_cache_for_atomic_writer(cache_path, proc_idx)
 
     if n_proc == 1:
         # There is no all-rank agreement to enforce, but the exit receipt and
