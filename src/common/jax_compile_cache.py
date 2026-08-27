@@ -1016,12 +1016,29 @@ def _install_shard_slice_patch() -> None:
     ArrayImpl._lorrax_shard_slice_installed = True
 
 
-def _install_agreement_patch() -> None:
-    """Answer every persistent-cache lookup from the agreed set."""
+def _install_lookup_patch(*, enforce_agreement: bool) -> None:
+    """Instrument cache lookups, optionally enforcing the all-rank set.
+
+    ``P == 1`` needs the counters but not the policy: JAX's answer is returned
+    unchanged, including an ordinary cache miss.  ``P > 1`` additionally
+    vetoes keys outside :attr:`_CacheState.agreed` and treats disappearance of
+    an agreed entry as fatal.  Keeping both modes in this one wrapper prevents
+    the observation-only path from drifting away from the lookup surface whose
+    multi-process twin it is measuring.
+    """
     from jax._src import compilation_cache as _cc
 
-    if getattr(_cc, "_lorrax_agreement_installed", False):
+    marker = ("_lorrax_agreement_installed" if enforce_agreement
+              else "_lorrax_observer_installed")
+    other = ("_lorrax_observer_installed" if enforce_agreement
+             else "_lorrax_agreement_installed")
+    if getattr(_cc, marker, False):
         return
+    if getattr(_cc, other, False):
+        raise RuntimeError(
+            "the JAX persistent-cache lookup hook is already installed in "
+            f"{'observation' if enforce_agreement else 'agreement'} mode; "
+            "jax.process_count() cannot change within one process")
     _orig_get = _cc.get_executable_and_time
     _orig_in_cache = _cc.is_executable_in_cache
 
@@ -1037,35 +1054,52 @@ def _install_agreement_patch() -> None:
     # naming three arguments it never interprets would be a claim about their
     # meaning that this file has no reason to make.  It forwards them
     # untouched, which is exact for any arity.
-    def _agreed_get(cache_key, *passthrough):
+    def _observed_get(cache_key, *passthrough):
         _STATE.probes += 1
         _STATE.probe_keys.add(cache_key)
-        if cache_key not in _STATE.agreed:
+        if enforce_agreement and cache_key not in _STATE.agreed:
             _STATE.blocked += 1
             return None, None
         t0 = time.monotonic()
         try:
             executable, compile_time = _orig_get(cache_key, *passthrough)
         except BaseException as exc:  # noqa: BLE001 - deliberate
-            _fatal(cache_key, f"{type(exc).__name__}: {exc}")
-            return None, None
+            if enforce_agreement:
+                _fatal(cache_key, f"{type(exc).__name__}: {exc}")
+                return None, None
+            # Observation at P=1 is transparent: JAX still owns the error
+            # policy, so an instrument must not turn a failing read into a
+            # cache miss (or vice versa).
+            raise
         finally:
             _STATE.read_secs += time.monotonic() - t0
         if executable is None:
-            _fatal(cache_key, "entry disappeared between agreement and read")
-            return None, None
+            if enforce_agreement:
+                _fatal(cache_key, "entry disappeared between agreement and read")
+                return None, None
+            return executable, compile_time
         _STATE.hits += 1
         return executable, compile_time
 
-    def _agreed_in_cache(backend, cache_key):
+    def _observed_in_cache(backend, cache_key):
         _STATE.probe_keys.add(cache_key)
-        if cache_key not in _STATE.agreed:
+        if enforce_agreement and cache_key not in _STATE.agreed:
             return False
         return _orig_in_cache(backend, cache_key)
 
-    _cc.get_executable_and_time = _agreed_get
-    _cc.is_executable_in_cache = _agreed_in_cache
-    _cc._lorrax_agreement_installed = True
+    _cc.get_executable_and_time = _observed_get
+    _cc.is_executable_in_cache = _observed_in_cache
+    setattr(_cc, marker, True)
+
+
+def _install_observation_patch() -> None:
+    """Count P=1 cache probes/hits without changing JAX's decision."""
+    _install_lookup_patch(enforce_agreement=False)
+
+
+def _install_agreement_patch() -> None:
+    """Answer every P>1 persistent-cache lookup from the agreed set."""
+    _install_lookup_patch(enforce_agreement=True)
 
 
 def _install_atomic_put_patch() -> None:
@@ -1557,6 +1591,12 @@ def ensure_jax_compile_cache() -> None:
                     f"taken over it.")
 
     if n_proc == 1:
+        # There is no all-rank agreement to enforce, but the exit receipt and
+        # optional key dump still promise real probe/hit counts.  The old early
+        # return left those counters at their initial zeros even on a warm run
+        # that deserialized hundreds of executables.  This wrapper delegates
+        # every decision unchanged and observes only JAX's actual answer.
+        _install_observation_patch()
         _STATE.enabled = True
         return
 
