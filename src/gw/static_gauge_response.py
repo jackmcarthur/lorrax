@@ -505,13 +505,22 @@ def build_isometric_retained_bubble_source(
         second.ordered_curvature_residual,
         second.q2_symmetry_residual,
     ))
+    # Eager composition is free to choose a different output sharding after
+    # the charge/current concatenate and response contractions.  Commit the
+    # three persisted fields to the artifact contract once, at this owner.
+    # The large jet is already global, so the sanctioned placement service
+    # performs a device-to-device reshard without gathering it on a process.
+    energy_scaled_d1_raw = device_put_process_local(
+        second.first_order.energy_scaled_d1_raw,
+        NamedSharding(mesh, P(None, None, None, "x", "y")))
+    S_direct = device_put_process_local(
+        S_direct, NamedSharding(mesh, P()))
+    mixed_transition_tensor = device_put_process_local(
+        mixed_transition_tensor, NamedSharding(mesh, P()))
     source = _issue_isometric_retained_bubble_source(
-        energy_scaled_d1_raw=jnp.asarray(
-            second.first_order.energy_scaled_d1_raw,
-            dtype=jnp.complex128),
-        S_direct=jnp.asarray(S_direct, dtype=jnp.complex128),
-        mixed_transition_tensor=jnp.asarray(
-            mixed_transition_tensor, dtype=jnp.float64),
+        energy_scaled_d1_raw=energy_scaled_d1_raw,
+        S_direct=S_direct,
+        mixed_transition_tensor=mixed_transition_tensor,
         availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
         charge_representation=representation.charge_representation,
         spatial_current_representation=(
