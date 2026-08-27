@@ -1461,6 +1461,15 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             f"from absolute window [{fit_start}, {return_stop}) and fits "
             f"{ambient_states} band(s) ({n_guard_bands} guard band(s) above).")
 
+    if a_band_index is not None:
+        a_band_index = int(a_band_index)
+        if not 0 <= a_band_index < hamiltonian_states:
+            raise ValueError(
+                f"htransform: --a-band={a_band_index} is outside the "
+                f"physical Hamiltonian width {hamiltonian_states}; valid "
+                f"local indices are [0, {hamiltonian_states}). Outer DFT "
+                "Galerkin-conditioning rows cannot set the f-transform scale.")
+
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
     _t0 = _perf()                                          # instrument:

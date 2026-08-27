@@ -308,3 +308,34 @@ def test_authenticated_qp_hamiltonian_excludes_outer_dft_basis_guards(
     assert result["nb_hamiltonian"] == 4
     assert result["active_character_gate"] is None
     assert "excluded from the physical QP Hamiltonian" in " ".join(lines)
+
+
+def test_qp_hamiltonian_refuses_a_band_in_outer_conditioning_rows():
+    """The f-transform scale must be selected inside the physical QP block."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from types import SimpleNamespace
+    from bandstructure.htransform import h_transform
+
+    mesh = _mesh(1)
+    nk, states, rank = 2, 7, 8
+    ctilde = np.broadcast_to(
+        np.eye(states, rank, dtype=np.complex128),
+        (nk, states, rank)).copy()
+    energies = np.broadcast_to(
+        np.asarray([-3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0])[:, None],
+        (states, nk)).copy()
+    meta = SimpleNamespace(nkx=2, nky=1, nkz=1)
+    wfn = SimpleNamespace(efermi=0.0, nelec=2)
+    kpath_data = (
+        np.asarray([[0.0, 0.0, 0.0]]), np.asarray([0.0]),
+        [0], ["Gamma"], [0])
+
+    with mesh, pytest.raises(
+            ValueError,
+            match=r"--a-band=4 is outside the physical Hamiltonian width 4"):
+        h_transform(
+            meta, jnp.asarray(ctilde), jnp.asarray(energies), wfn,
+            kpath_data, lambda _msg: None, mesh,
+            band_start=0, n_return_bands=3,
+            qp_corrected_band_range=(0, 4), a_band_index=4)

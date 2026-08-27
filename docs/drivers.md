@@ -230,24 +230,18 @@ Does NOT apply to plasmon-pole or multipole reductions: `B_q` is a residue and w
 
 Hamiltonian-transformation bandstructure interpolation to an arbitrary k-path from coarse-grid data. `isdf.galerkin` selects the published shared whole-state basis from stacked full-Bloch states with deterministic randomized QRCP, factors the selected physical states exactly, and projects all states into that one alpha gauge. The canonical `PsiGStore` and WFN transforms stream the G-flat→real-space work; centroids are only registered evaluation points for the fitted basis. The driver forms `fH_k = Σ_n f(ε_nk)c_nk c_nkᴴ`, applies the canonical flat-k IFFT to obtain `fH_R`, and recovers path energies with the existing batched eigensolver plus the archived Newton inverse. `--qp-rotations qp_wfn_rotations.h5` is the full quasiparticle-Hamiltonian path: it consumes the matched `U_mnk,E_qp` artifact through `file_io.qp_wfn` and rotates only the compact Galerkin state rows, so the unchanged builder represents `f(H_QP)=U f(E_QP) Uᴴ`. `--eqp-file` is deliberately the cheaper diagonal approximation: it changes energies in the current WFN band labels and cannot represent off-diagonal QP mixing.
 
-When the fitted window contains outer DFT guards, the authenticated QP block
-must extend strictly above the returned window: `n_qp_corrected > n_return`.
-The exact corrected range comes from the canonical rotation artifact's
-`band_range`, never from a deck count or an array-shape guess.  From those
-corrected compact rows and the same flat-k transform, the driver forms
-`P_A(k)=Σ_{n<n_qp_corrected}|c_nk><c_nk|` and its Fourier interpolant
-`P_A(q)`.  For `fH(q) u_j(q)=λ_j(q)u_j(q)`, it selects the complete corrected
-block by active character `p_j=<u_j|P_A(q)|u_j>`, energy-orders that block,
-and publishes only its lowest `n_return` interior states.  Every path point
-must have a positive physical-energy separation, above the canonical
-multiplet tolerance, between the returned top and every nonreturned fitted
-state.  Otherwise the run refuses: a merely positive character gap makes a
-pointwise assignment deterministic but does not make active/guard switches
-path-continuous.  If the artifact corrects the complete fitted window there is
-no active/DFT boundary and the ordinary full-H energy ordering remains the
-exact path.  Eigenvector phase cannot reach the file; the character operator
-is face-sharded like `fH_R`, and no rank-squared object is gathered or
-replicated.
+When the fitted window contains outer DFT conditioning rows, the canonical
+rotation artifact's authenticated `band_range` defines the complete physical
+QP prefix.  The driver rotates that prefix and forms `f(H_QP)` from those rows
+only.  The wider immutable Galerkin fit still defines and conditions the one
+ambient alpha gauge, but its outer DFT rows do not enter the physical
+Hamiltonian, state selection, or f-transform scale.  This is the ordinary
+full-H energy-ordering path on a smaller physical state table; there is no
+active-projector interpolation or corrected/DFT boundary to track.  The QP
+prefix must begin at the fitted-window start, contain every returned state,
+and, when the fit is wider, extend strictly above the returned window so the
+shared f-shoulder gate sees a corrected guard.  The exact prefix comes from
+artifact provenance, never from a deck count or an array-shape guess.
 At the host publication seam the driver asks the symmetry service to identify
 every path point that is periodically identical to a coarse-grid row.  It
 reports max/RMS returned-spectrum differences and the worst path/coarse/band
@@ -263,10 +257,12 @@ consumers retain explicit partial-window contracts. The VBM/Fermi index is
 resolved relative to the absolute window start. Standalone htransform fits
 `--guard-bands` additional conduction
 bands above the returned window, because the top of the fit window lies on the
-f-transform's zero shoulder and is not a valid output band.  The eqp override
-must supply every returned and guard band at every k.  `bandstructure.dat`
-records both the returned absolute window and the wider fit window in its
-header.
+f-transform's zero shoulder and is not a valid output band.  A diagonal
+`--eqp-file` must supply every returned and guard band at every k.  A
+`--qp-rotations` artifact must instead supply the complete authenticated
+physical prefix, including its corrected guard; any still-wider fitted DFT
+rows remain Galerkin conditioning only.  `bandstructure.dat` records the
+returned, physical-Hamiltonian, and wider Galerkin-fit widths in its header.
 
 Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat]`; the production scientific report is `htransform.out` and the interpolated table is `bandstructure.dat` (override with `--report-file` / `--output-file`). Kernel diagnostics use the driver-wide `LORRAX_DEBUG_PRINT=1` switch. The whole-state memory ledger prints and checks the exact mesh-dependent live set before compilation; do not reuse performance or rank expectations from the deleted centroid-Gram implementation.
 
@@ -288,7 +284,7 @@ Choose the per-segment counts with the consuming driver in mind: `bse.exciton_ba
 
 `--eqp-file` format (`read_eqp_energies`): **LORRAX's own `eqp1.dat`, passed directly.** BerkeleyGW columns on the **irreducible wedge** — one `(3f13.9,i8)` crystal-coordinate header per `wfn.kpoints` entry (10 blocks, not 16), each followed by that many `(2i8,2f15.9)` band rows in eV. The block coordinates are checked against the deck's own wedge (a file from another deck, or in another k-order, is refused rather than landing its energies on the wrong k), the absolute band labels place the columns in the sigma window, and the **unfold to the full BZ happens inside the driver through the symmetry service** (`symmetry_maps.star_broadcast`, via its single adapter `file_io.kin_ion.broadcast_ibz_to_full_bz`). eV→Ry conversion is the reader's. A missing or unparseable `--eqp-file` is a FATAL SystemExit, never a silent DFT fallback.
 
-`--qp-rotations` format: the canonical `qp_wfn_rotations.h5` written by GW, including full-BZ (or symmetry-service-unfoldable wedge) `U_mnk`, matched `E_qp_nk_rydberg`, absolute `band_range`, `kgrid`, full-BZ crystal coordinates, and the canonical source-WFN content fingerprint/scheme for the DFT-band basis in which `U_mnk` is expressed. The artifact's complete QP block must lie inside the fitted htransform window and, when outer DFT guards remain, must extend above the returned window so the returned-interior gate can be evaluated. Wider fitted rows remain DFT states/energies, matching the canonical QP-WFN writer's block-identity convention; a partial overlap is refused because slicing `U_mnk` is not unitary. `--qp-rotations`, `--eqp-file`, and an already-stamped `WFN_qp.h5` are alternate state descriptions, never layers to stack. Association is content-authenticated: legacy unstamped artifacts, another WFN with the same shapes/grid, and an unknown fingerprint scheme all refuse before `U_mnk` is applied. The fingerprint is taken from the ordinary mean-field WFN; bispinor QP energies do not require loading or constructing a bispinor WFN.
+`--qp-rotations` format: the canonical `qp_wfn_rotations.h5` written by GW, including full-BZ (or symmetry-service-unfoldable wedge) `U_mnk`, matched `E_qp_nk_rydberg`, absolute `band_range`, `kgrid`, full-BZ crystal coordinates, and the canonical source-WFN content fingerprint/scheme for the DFT-band basis in which `U_mnk` is expressed. The artifact's complete QP block must be a prefix of the fitted htransform window and, when the fit is wider, must extend above the returned window to supply the corrected f-shoulder guard. Wider fitted DFT rows condition the common Galerkin basis but are excluded from the physical QP Hamiltonian; a partial overlap is refused because slicing `U_mnk` is not unitary. `--qp-rotations`, `--eqp-file`, and an already-stamped `WFN_qp.h5` are alternate state descriptions, never layers to stack. Association is content-authenticated: legacy unstamped artifacts, another WFN with the same shapes/grid, and an unknown fingerprint scheme all refuse before `U_mnk` is applied. The fingerprint is taken from the ordinary mean-field WFN; bispinor QP energies do not require loading or constructing a bispinor WFN.
 
 Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.nk_tot`) whose `k-point <K>:` blocks were paired to k **by position**, produced by an out-of-tree `make_eqp_htformat.py` that did the IBZ→full unfold by hand. Both the positional pairing and that converter are gone — the converter has no job left, and hand-rolled unfolding is not permitted outside the symmetry service.
 
@@ -302,7 +298,7 @@ Before 2026-08-15 this required a *pre-unfolded* full-BZ text file (`nk == sym.n
 | `get_centroids_fi` | false | BSE handoff: also compute fine-grid ψ at coarse centroids via `bse_setup.compute_wfns_fi` |
 | `kgrid_fi` / `wfn_fi_min` / `wfn_fi_max` | "" / 0 / 0 | fine k-grid "nx ny nz"; sub-window on the htransform band axis (0 = full window) |
 | `wfn_fi_q_chunk` | 0 = N_q_coarse | fine-q chunk per f(H(q)) build; floor, rounded to device count |
-| `--a-band` | top band | band whose bandwidth sets the f-transform scale a |
+| `--a-band` | top band | local index in the physical Hamiltonian whose bandwidth sets the f-transform scale a; an outer Galerkin-conditioning row refuses |
 | `--guard-bands` | 4 | fit this many extra conduction bands above the returned `nval+ncond` window; the returned bands must pass the shared f-shoulder gate, while the guards absorb the transform's exact-zero top edge |
 | env `LORRAX_GALERKIN_CHUNK_GIB` | 6 | bounded whole-state r-stream tile budget; changes chunk count, never fitted basis semantics |
 
