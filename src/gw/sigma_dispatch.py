@@ -118,6 +118,9 @@ class SigmaResult:
     #: Non-full modes carry None; the debug writer supplies schema zeros.
     photon_head_sigma_diag_tskn_ry: jax.Array | None = None
     photon_head_sigma_operator_fingerprint: str | None = None
+    photon_head_sigma_response_fingerprint: str | None = None
+    photon_head_sigma_response_capability: str | None = None
+    photon_head_sigma_response_approximation: str | None = None
     photon_head_sigma_basis: str | None = None
     #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
     #: when ``use_band_extrapolation`` is driving this stage.  ``sigma_xc_
@@ -243,6 +246,9 @@ BASIS_FREE_FIELDS = (
     "omega_grid_ry",
     "sigma_omega_h5_path",
     "photon_head_sigma_operator_fingerprint",
+    "photon_head_sigma_response_fingerprint",
+    "photon_head_sigma_response_capability",
+    "photon_head_sigma_response_approximation",
     "photon_head_sigma_basis",
     "efermi_dft_ev",
     "omega_reference_provenance",
@@ -948,6 +954,9 @@ def compute_sigma_xc(
         mode, SigmaChannel.SX, SigmaChannel.COH)
     photon_head_sigma_diag = None
     photon_head_sigma_operator_fingerprint = None
+    photon_head_sigma_response_fingerprint = None
+    photon_head_sigma_response_capability = None
+    photon_head_sigma_response_approximation = None
     photon_head_sigma_basis = None
     if uses_static_photon_response(config):
         if not builds_static_screened or mode is not ComputeMode.COHSEX:
@@ -1005,6 +1014,12 @@ def compute_sigma_xc(
             photon_head_sigma_operator_fingerprint = (
                 photon_head_diagnostics
                 .hamiltonian_config_operator_fingerprint)
+            photon_head_sigma_response_fingerprint = (
+                photon_head_diagnostics.bounded_response_fingerprint)
+            photon_head_sigma_response_capability = (
+                photon_head_diagnostics.bounded_response_capability)
+            photon_head_sigma_response_approximation = (
+                photon_head_diagnostics.bounded_response_approximation)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
         cohsex["sig_x"] = photon_x
         cohsex["sig_sx"] = photon_sx
@@ -1125,6 +1140,12 @@ def compute_sigma_xc(
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
             photon_head_sigma_operator_fingerprint=(
                 photon_head_sigma_operator_fingerprint),
+            photon_head_sigma_response_fingerprint=(
+                photon_head_sigma_response_fingerprint),
+            photon_head_sigma_response_capability=(
+                photon_head_sigma_response_capability),
+            photon_head_sigma_response_approximation=(
+                photon_head_sigma_response_approximation),
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
     if mode is ComputeMode.COHSEX:
@@ -1140,6 +1161,12 @@ def compute_sigma_xc(
             photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag,
             photon_head_sigma_operator_fingerprint=(
                 photon_head_sigma_operator_fingerprint),
+            photon_head_sigma_response_fingerprint=(
+                photon_head_sigma_response_fingerprint),
+            photon_head_sigma_response_capability=(
+                photon_head_sigma_response_capability),
+            photon_head_sigma_response_approximation=(
+                photon_head_sigma_response_approximation),
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
 

@@ -40,6 +40,7 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 from common.four_current_model import (
+    FULL_STATIC_COHSEX_MODEL,
     ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
     ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL,
     PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
@@ -306,7 +307,7 @@ class BispinorGWMode(str, enum.Enum):
         ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
     ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC = (
         ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL)
-    FULL_STATIC_COHSEX = "full_static_cohsex"
+    FULL_STATIC_COHSEX = FULL_STATIC_COHSEX_MODEL
     CHARGE_HALL_CUBATURE = "charge_hall_cubature"
 
 
@@ -330,18 +331,20 @@ def uses_raw_kinetic_balance_charge(
     """Whether scalar charge channels use the raw four-spinor carrier.
 
     ``bispinor`` continues to mean that spatial-current channels are enabled.
-    The explicitly named Pauli-reference comparison is the sole exception to
-    the historical rule that the same raw kinetic-balance carrier also enters
-    charge density, scalar screening, and scalar self-energy.  Keeping this
-    decision here prevents preprocessing, charge ISDF, and the live driver
-    from deriving the representation split independently.
+    Explicit Pauli-reference and isometric modes are exceptions to the
+    historical rule that the same raw kinetic-balance carrier enters charge
+    density, scalar screening, and scalar self-energy.  In particular the
+    production ``full_static_cohsex`` selector now resolves the normalized
+    isometric four-current carrier; the separately named raw/bare policies
+    retain their diagnostic/reference meanings.  Keeping this decision here
+    prevents preprocessing, charge ISDF, and the live driver from deriving
+    the representation split independently.
     """
     if not bool(bispinor):
         return False
     mode = coerce_bispinor_gw_mode(bispinor_gw)
     return mode in (
         BispinorGWMode.BARE_TRANSVERSE,
-        BispinorGWMode.FULL_STATIC_COHSEX,
         BispinorGWMode.CHARGE_HALL_CUBATURE,
     )
 
@@ -3622,26 +3625,27 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
                 "or head_correction = off.")
         return
-    if (mode in (
-            BispinorGWMode.FULL_STATIC_COHSEX,
-            BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC)
+    if (mode is BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC
             and config.head.correction is HeadCorrection.FULL):
         raise ValueError(
-            "GATE full_static_bispinor_gauge_head_unavailable: production "
-            "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
+            "GATE diagnostic_static_bispinor_gauge_head_unavailable: the "
+            "explicit headless diagnostic cannot enable q=0 completion.\n"
             f"  got:  bispinor_gw = {mode.value}, head_correction = full\n"
-            "  want: a versioned StaticGaugeHeadResponse carrying "
-            "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
-            "contact/operator provenance, and certified Ward/Hermiticity "
-            "residuals\n"
-            "  fix:  complete the gauged VNL/downfolded operator artifact "
-            "and its loader, or set head_correction = off for the explicitly "
-            "experimental no-pair finite-body calculation\n"
+            "  want: head_correction = off\n"
+            "  fix: use bispinor_gw = full_static_cohsex for the bounded "
+            "isometric retained-bubble q=0 producer, or keep this diagnostic "
+            "headless\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
-    required_head = (
-        HeadCorrection.FULL
-        if mode is BispinorGWMode.CHARGE_HALL_CUBATURE
-        else HeadCorrection.OFF)
+    if mode is BispinorGWMode.CHARGE_HALL_CUBATURE:
+        accepted_head = config.head.correction is HeadCorrection.FULL
+        wanted_head = "head_correction = full"
+    elif mode is BispinorGWMode.FULL_STATIC_COHSEX:
+        accepted_head = config.head.correction in (
+            HeadCorrection.OFF, HeadCorrection.FULL)
+        wanted_head = "head_correction = off or full"
+    else:
+        accepted_head = config.head.correction is HeadCorrection.OFF
+        wanted_head = "head_correction = off"
     requirements = (
         (config.compute_mode is ComputeMode.COHSEX,
          f"compute_mode = {config.compute_mode.value}",
@@ -3649,9 +3653,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         (config.screening.diagrams is ScreeningDiagrams.W_RPA,
          f"screening_diagrams = {config.screening.diagrams.value}",
          "screening_diagrams = w_rpa"),
-        (config.head.correction is required_head,
+        (accepted_head,
          f"head_correction = {config.head.correction.value}",
-         f"head_correction = {required_head.value}"),
+         wanted_head),
         (config.qp_solver is QPSolver.ONE_SHOT_DFT,
          f"qp_solver = {config.qp_solver.value}",
          "qp_solver = one_shot_dft"),
@@ -3659,13 +3663,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
-        (mode is not
-         BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC
+        (mode not in (
+             BispinorGWMode.FULL_STATIC_COHSEX,
+             BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC)
          or not bool(config.write_restart_tensors),
          ("write_restart_tensors = "
           f"{str(bool(config.write_restart_tensors)).lower()}"),
          "write_restart_tensors = false"),
-        (mode is BispinorGWMode.FULL_STATIC_COHSEX
+        (config.head.correction is HeadCorrection.OFF
          or int(config.sys_dim) == 2,
          f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
         (bool(config.memory.low_mem_bands), "low_mem_bands = false",

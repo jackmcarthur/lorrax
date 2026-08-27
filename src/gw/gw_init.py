@@ -44,6 +44,7 @@ from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 # ``isdf.core`` (which imports jax) — and for the drift gate that keeps the
 # copies identical.
 from .gw_config import (
+	BispinorGWMode,
 	env_bool,
 	active_zeta_truncating_knobs,
 	classify_xla_pool,
@@ -3457,6 +3458,8 @@ def prepare_isdf_and_wavefunctions(
 	wfns_scalar_head = None
 	if (representation.charge_representation ==
 			ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION
+			and cfg.bispinor_gw is
+			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
 			and bool(cfg.compute_mode.needs_screening)
 			and str(getattr(cfg.head.correction, "value", cfg.head.correction)) ==
 			"full"):

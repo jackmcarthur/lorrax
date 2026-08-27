@@ -35,7 +35,7 @@ from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -503,6 +503,12 @@ def initialize_parallel_transport_artifact(
         io.write_attr("spin_channel", np.int32(0))
         io.write_attr("effective_nspinor", np.int32(effective_nspinor))
         io.write_attr("bispinor", np.int32(bool(bispinor)))
+        coefficient_frame = (
+            "raw_kinetic_balance_coefficient_frame_v1"
+            if bool(bispinor) else "source_pauli_coefficient_frame_v1")
+        io.write_attr(
+            "coefficient_frame_utf8",
+            np.frombuffer(coefficient_frame.encode("ascii"), dtype=np.uint8))
         io.write_attr("kgrid", np.asarray(wfn.kgrid, dtype=np.int32))
         io.write_attr("kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
         io.write_attr("reduced_spacing",

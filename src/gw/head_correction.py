@@ -1241,6 +1241,9 @@ class StaticSlabPhotonHeadCompletion:
     hermiticity_residual: float
     hamiltonian_config_operator_fingerprint: str | None
     q0_factors: StaticPhotonQ0FactorCarrier
+    bounded_response_fingerprint: str | None = None
+    bounded_response_capability: str | None = None
+    bounded_response_approximation: str | None = None
 
 
 _STATIC_PHOTON_DYSON_NUMERICAL_BUDGET = 1.0e-9
@@ -1410,23 +1413,30 @@ def complete_static_slab_photon_q0(
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
 
-    # The exact/full response and the deliberately truncated charge+Hall
-    # response share this numerical path.  The bounded response stores only
-    # the independent inputs; the kernel below constructs its Hall tensor
-    # directly from sigma_H.
+    # The exact/full response and every deliberately bounded cubature model
+    # share this numerical path.  A bounded response stores only independent
+    # inputs and explicit term availability; it never inherits the exact
+    # response's provenance flags.
     from .static_gauge_response import (
-        ChargeHallCubatureResponse,
-        require_charge_hall_cubature_response,
+        StaticGaugeCubatureResponse,
+        require_static_gauge_cubature_response,
     )
-    if isinstance(response, ChargeHallCubatureResponse):
-        response = require_charge_hall_cubature_response(response, mesh_xy)
-        # The Hall identifier says nothing about the independently built
-        # charge S/Y/Z response.  Do not publish it as a whole-head identity.
+    if isinstance(response, StaticGaugeCubatureResponse):
+        response = require_static_gauge_cubature_response(response, mesh_xy)
+        # A bounded response fingerprint authenticates that model's inputs;
+        # it is not a complete Hamiltonian/current/contact identity.  Do not
+        # publish it in the exact-response Sigma receipt.
         operator_fingerprint = None
+        bounded_response_fingerprint = response.response_fingerprint
+        bounded_response_capability = response.capability.value
+        bounded_response_approximation = response.approximation
     else:
         response = require_static_gauge_head_response(response, mesh_xy)
         operator_fingerprint = (
             response.hamiltonian_config_operator_fingerprint)
+        bounded_response_fingerprint = None
+        bounded_response_capability = None
+        bounded_response_approximation = None
     layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
@@ -1625,6 +1635,9 @@ def complete_static_slab_photon_q0(
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
             screened_pairs=tuple(screened_pairs)),
+        bounded_response_fingerprint=bounded_response_fingerprint,
+        bounded_response_capability=bounded_response_capability,
+        bounded_response_approximation=bounded_response_approximation,
     )
     return V_packed, W_packed, evidence
 

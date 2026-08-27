@@ -193,6 +193,7 @@ __all__ = [
     "head_wings_sharded",
     "raw_hall_pseudovector_sharded",
     "static_gauge_hall_transaction",
+    "static_gauge_full_bz_state_tables",
     "static_gauge_first_order_component_sharded",
     "static_gauge_second_order_component_sharded",
     "static_head_wings_sharded",
@@ -379,6 +380,7 @@ class ParallelTransportHeadData:
     #: refuse a window edge that cuts a hybridized manifold.  See
     #: ``file_io.parallel_transport.load_link_singular_values``.
     singular_values: np.ndarray
+    coefficient_frame: str
 
 
 @dataclass(frozen=True)
@@ -532,6 +534,7 @@ def load_parallel_transport_head(
     mesh: Mesh,
     wfn,
     meta,
+    expected_coefficient_frame: str | None = None,
 ) -> ParallelTransportHeadData:
     """Load and validate the preprocessing artifact without mixed ownership.
 
@@ -598,6 +601,8 @@ def load_parallel_transport_head(
         )
         fingerprint = _ascii_stamp(
             io, path, "wfn_fingerprint_utf8")
+        coefficient_frame = _ascii_stamp(
+            io, path, "coefficient_frame_utf8")
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -624,13 +629,34 @@ def load_parallel_transport_head(
                 f"band manifold [{ints['band_start']},{ints['band_stop']}) != "
                 f"current full head manifold [0,{expected_nb})"
             )
-        if ints["effective_nspinor"] != int(meta.nspinor):
+        expected_frame = (
+            ("raw_kinetic_balance_coefficient_frame_v1"
+             if bool(int(meta.nspinor) == 4)
+             else "source_pauli_coefficient_frame_v1")
+            if expected_coefficient_frame is None
+            else str(expected_coefficient_frame))
+        if expected_frame not in (
+                "source_pauli_coefficient_frame_v1",
+                "raw_kinetic_balance_coefficient_frame_v1"):
+            refusals.append(
+                f"unsupported expected coefficient frame {expected_frame!r}")
+        if coefficient_frame != expected_frame:
+            refusals.append(
+                f"coefficient_frame={coefficient_frame!r} != expected "
+                f"{expected_frame!r}")
+        expected_nspinor = (
+            int(wfn.nspinor)
+            if expected_frame == "source_pauli_coefficient_frame_v1"
+            else int(meta.nspinor))
+        expected_bispinor = (
+            expected_frame == "raw_kinetic_balance_coefficient_frame_v1")
+        if ints["effective_nspinor"] != expected_nspinor:
             refusals.append(
                 f"effective_nspinor={ints['effective_nspinor']} != current "
-                f"{int(meta.nspinor)}"
+                f"coefficient frame {expected_nspinor}"
             )
-        if bool(ints["bispinor"]) != bool(int(meta.nspinor) == 4):
-            refusals.append("bispinor convention differs from current run")
+        if bool(ints["bispinor"]) != expected_bispinor:
+            refusals.append("bispinor convention differs from coefficient frame")
         if not np.array_equal(kgrid, expected_kgrid):
             refusals.append(
                 f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
@@ -739,6 +765,7 @@ def load_parallel_transport_head(
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
         singular_values=singular_values,
+        coefficient_frame=coefficient_frame,
     )
 
 
@@ -3329,6 +3356,50 @@ def raw_hall_pseudovector_sharded(
         prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
 
 
+def static_gauge_full_bz_state_tables(
+    *, wfn, sym, band_start: int, band_stop: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one symmetry-owned insulating full-BZ state table.
+
+    Static Hall and retained-bubble producers must use identical energy and
+    occupation rows.  This helper owns the file-wedge validation, insulating
+    gate and sole symmetry unfold so those producers cannot drift.
+    """
+    from symmetry_maps import unfold_file_wedge_to_full_bz
+
+    start, stop = int(band_start), int(band_stop)
+    logical = stop - start
+    if start != 0 or logical <= 0 or stop > int(wfn.nbands):
+        raise ValueError(
+            "static gauge state interval must start at band zero and satisfy "
+            f"0 < stop <= WFN.nbands; got [{start},{stop})")
+    energies_file = np.asarray(
+        wfn.energies[0, :, start:stop], dtype=np.float64)
+    occupations_file = np.asarray(
+        wfn.occs[0, :, start:stop], dtype=np.float64)
+    if (energies_file.shape != (int(sym.nk_red), logical)
+            or occupations_file.shape != energies_file.shape):
+        raise ValueError(
+            "WFN energy/occupation file-wedge tables do not match the "
+            f"requested static-gauge manifold: {energies_file.shape}/"
+            f"{occupations_file.shape}, expected "
+            f"{(int(sym.nk_red), logical)}")
+    if np.any((occupations_file != 0.0) & (occupations_file != 1.0)):
+        raise ValueError(
+            "static gauge response production is insulating-only and "
+            "requires exact 0/1 occupations")
+    occupations_above = np.asarray(
+        wfn.occs[0, :, stop:], dtype=np.float64)
+    if np.any(occupations_above != 0.0):
+        raise ValueError(
+            "static gauge band interval omits occupied WFN states; "
+            "increase band_stop")
+    return (
+        unfold_file_wedge_to_full_bz(sym, energies_file),
+        unfold_file_wedge_to_full_bz(sym, occupations_file),
+    )
+
+
 def static_gauge_hall_transaction(
     uniform_gauge,
     *,
@@ -3360,7 +3431,6 @@ def static_gauge_hall_transaction(
     from common.mtxel_sweep import (
         UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)
     from common.parallel_transport import wfn_fingerprint
-    from symmetry_maps import unfold_file_wedge_to_full_bz
 
     if not isinstance(uniform_gauge, (
             UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)):
@@ -3425,30 +3495,8 @@ def static_gauge_hall_transaction(
             "uniform-gauge Hall transaction lacks the canonical "
             "Hamiltonian/config/operator SHA-256 fingerprint")
 
-    energies_file = np.asarray(
-        wfn.energies[0, :, start:stop], dtype=np.float64)
-    occupations_file = np.asarray(
-        wfn.occs[0, :, start:stop], dtype=np.float64)
-    if (energies_file.shape != (int(sym.nk_red), logical)
-            or occupations_file.shape != energies_file.shape):
-        raise ValueError(
-            "WFN energy/occupation file-wedge tables do not match the "
-            f"requested Hall manifold: {energies_file.shape}/"
-            f"{occupations_file.shape}, expected "
-            f"{(int(sym.nk_red), logical)}")
-    if np.any((occupations_file != 0.0) & (occupations_file != 1.0)):
-        raise ValueError(
-            "static gauge Hall artifact production is insulating-only and "
-            "requires exact 0/1 occupations")
-    occupations_above = np.asarray(
-        wfn.occs[0, :, stop:], dtype=np.float64)
-    if np.any(occupations_above != 0.0):
-        raise ValueError(
-            "static gauge Hall band interval omits occupied WFN states; "
-            "increase band_stop")
-
-    energies_full = unfold_file_wedge_to_full_bz(sym, energies_file)
-    occupations_full = unfold_file_wedge_to_full_bz(sym, occupations_file)
+    energies_full, occupations_full = static_gauge_full_bz_state_tables(
+        wfn=wfn, sym=sym, band_start=start, band_stop=stop)
     sigma_H = raw_hall_pseudovector_sharded(
         gamma,
         energies_full,

@@ -7,6 +7,7 @@ ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL = (
     "isometric_kinetic_balance_bare_transverse")
 ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL = (
     "isometric_kinetic_balance_full_static_cohsex_headless_diagnostic")
+FULL_STATIC_COHSEX_MODEL = "full_static_cohsex"
 
 
 def is_pauli_reference_model(value) -> bool:
@@ -20,6 +21,7 @@ def is_isometric_kinetic_balance_model(value) -> bool:
     return str(getattr(value, "value", value)).strip().lower() in {
         ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
         ISOMETRIC_KINETIC_BALANCE_FULL_STATIC_HEADLESS_DIAGNOSTIC_MODEL,
+        FULL_STATIC_COHSEX_MODEL,
     }
 
 
