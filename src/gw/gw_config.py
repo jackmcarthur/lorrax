@@ -39,7 +39,11 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
-from common.four_current_model import PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
+from common.four_current_model import (
+    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
+    PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+    resolve_four_current_representation,
+)
 
 # The estimator vocabulary lives with the estimators, not here: a second copy
 # of the value list is a second thing to keep in step.  ``band_extrapolation``
@@ -297,6 +301,8 @@ class BispinorGWMode(str, enum.Enum):
 
     BARE_TRANSVERSE = "bare_transverse"
     PAULI_REFERENCE_BARE_TRANSVERSE = PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
+    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE = (
+        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
     FULL_STATIC_COHSEX = "full_static_cohsex"
     CHARGE_HALL_CUBATURE = "charge_hall_cubature"
 
@@ -330,7 +336,18 @@ def uses_raw_kinetic_balance_charge(
     if not bool(bispinor):
         return False
     mode = coerce_bispinor_gw_mode(bispinor_gw)
-    return mode is not BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
+    return mode in (
+        BispinorGWMode.BARE_TRANSVERSE,
+        BispinorGWMode.FULL_STATIC_COHSEX,
+        BispinorGWMode.CHARGE_HALL_CUBATURE,
+    )
+
+
+def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
+    """Whether finite-q scalar channels use a four-spinor carrier."""
+    return resolve_four_current_representation(
+        bool(bispinor), coerce_bispinor_gw_mode(bispinor_gw)
+    ).charge_bispinor
 
 
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
@@ -3559,23 +3576,38 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             f"{mode.value} requires bispinor = true.  This axis selects "
             "four-current screening; it does not turn four-spinor "
             "wavefunctions on implicitly.")
-    if mode is BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE:
+    if mode in (
+        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE,
+    ):
+        gate_prefix = (
+            "pauli_reference" if mode is
+            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
+            else "isometric_kinetic_balance")
         if bool(config.restart):
             raise ValueError(
-                "GATE pauli_reference_restart_unavailable: "
-                "bispinor_gw = pauli_reference_bare_transverse requires "
+                f"GATE {gate_prefix}_restart_unavailable: "
+                f"bispinor_gw = {mode.value} requires "
                 "restart = false. Existing restart tensors do not carry "
-                "an authenticated scalar-carrier representation and could "
-                "silently substitute raw4 charge tensors for the normalized "
-                "Pauli reference. Fresh runs may still reuse each zeta file "
+                "an authenticated carrier representation and could silently "
+                "substitute a different four-current basis. Fresh runs may "
+                "still reuse each zeta file "
                 "through its carrier-specific provenance.")
         if bool(config.write_restart_tensors):
             raise ValueError(
-                "GATE pauli_reference_restart_write_unavailable: "
-                "bispinor_gw = pauli_reference_bare_transverse requires "
+                f"GATE {gate_prefix}_restart_write_unavailable: "
+                f"bispinor_gw = {mode.value} requires "
                 "write_restart_tensors = false. The current restart schema "
-                "cannot authenticate this mixed Pauli-charge/raw4-current "
+                "cannot authenticate this explicit comparison "
                 "representation for a later consumer.")
+        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
+                and bool(config.head.bispinor_tt_head_correction)):
+            raise ValueError(
+                "GATE isometric_kinetic_balance_current_head_unavailable: "
+                "the normalized finite-q carrier has no authenticated "
+                "endpoint jets. Set bispinor_tt_head_correction = false; "
+                "the ordinary scalar q->0 head remains available from the "
+                "canonical QE two-spinor dipole artifact.")
         return
     if (mode is BispinorGWMode.FULL_STATIC_COHSEX
             and config.head.correction is HeadCorrection.FULL):

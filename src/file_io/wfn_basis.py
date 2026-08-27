@@ -69,7 +69,10 @@ class WavefunctionBasisReceipt:
     bispinor_lift_provenance: str | None
 
     def __post_init__(self) -> None:
-        from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+        from common.bispinor_init import (
+            ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
+            KINETIC_BALANCE_LIFT_PROVENANCE,
+        )
         from common.parallel_transport import WFN_FINGERPRINT_SCHEME
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 
@@ -125,7 +128,11 @@ class WavefunctionBasisReceipt:
         lift = self.bispinor_lift_provenance
         if lift is not None:
             lift = str(lift)
-        if lift not in (None, KINETIC_BALANCE_LIFT_PROVENANCE):
+        if lift not in (
+            None,
+            KINETIC_BALANCE_LIFT_PROVENANCE,
+            ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
+        ):
             raise ValueError(
                 "WavefunctionBasisReceipt has an unknown sampled-spinor "
                 f"transform {lift!r}")
@@ -159,6 +166,7 @@ class WavefunctionBasisReceipt:
         wfn,
         role: str,
         bispinor: bool,
+        bispinor_lift: str = "raw",
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -169,6 +177,7 @@ class WavefunctionBasisReceipt:
         return cls._from_source(
             wfn=wfn, wfn_fingerprint_binding=None,
             role=role, bispinor=bispinor, band_interval=band_interval,
+            bispinor_lift=bispinor_lift,
             fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
             n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
 
@@ -180,6 +189,7 @@ class WavefunctionBasisReceipt:
         wfn_fingerprint_binding,
         role: str,
         bispinor: bool,
+        bispinor_lift: str = "raw",
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -190,6 +200,7 @@ class WavefunctionBasisReceipt:
         return cls._from_source(
             wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
             role=role, bispinor=bispinor, band_interval=band_interval,
+            bispinor_lift=bispinor_lift,
             fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
             n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
 
@@ -201,6 +212,7 @@ class WavefunctionBasisReceipt:
         wfn_fingerprint_binding,
         role: str,
         bispinor: bool,
+        bispinor_lift: str,
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -208,7 +220,7 @@ class WavefunctionBasisReceipt:
         n_rmu_padded: int,
     ) -> "WavefunctionBasisReceipt":
         """Shared receipt construction after canonical source identity."""
-        from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+        from common.bispinor_init import kinetic_balance_lift_provenance
         from common.parallel_transport import (
             WFN_FINGERPRINT_SCHEME,
             fingerprint_from_binding,
@@ -268,7 +280,8 @@ class WavefunctionBasisReceipt:
             source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
             nspinor_sampled=4 if use_bispinor else source_nspinor,
             bispinor_lift_provenance=(
-                KINETIC_BALANCE_LIFT_PROVENANCE if use_bispinor else None),
+                kinetic_balance_lift_provenance(bispinor_lift)
+                if use_bispinor else None),
         )
 
     def assert_matches_source(
@@ -277,6 +290,7 @@ class WavefunctionBasisReceipt:
         wfn,
         role: str,
         bispinor: bool,
+        bispinor_lift: str = "raw",
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -287,6 +301,7 @@ class WavefunctionBasisReceipt:
         """Refuse unless current source inputs reproduce this receipt."""
         expected = type(self).from_source(
             wfn=wfn, role=role, bispinor=bispinor,
+            bispinor_lift=bispinor_lift,
             band_interval=band_interval, fft_grid=fft_grid,
             centroid_fft_idx=centroid_fft_idx,
             n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)

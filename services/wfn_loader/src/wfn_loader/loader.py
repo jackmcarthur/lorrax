@@ -1363,6 +1363,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> jax.Array:
         """ψ(G) for a (band_range, k-set) window.
 
@@ -1381,8 +1382,8 @@ class WfnLoader:
           τ-phase + TR conjugation applied internally.
         * For ``k='ibz'``: raw WFN-file IBZ slab; no unfold.
 
-        ``bispinor=True`` lifts the small spinor components via
-        ``(α/2) σ·(k+G) ψ_L``.  ``nspinor_out`` is then 4; else 2 (or
+        ``bispinor=True`` lifts the small spinor components via the selected
+        canonical ``bispinor_lift`` representation. ``nspinor_out`` is then 4; else 2 (or
         the file's ``nspinor``).  Requires the WFN file to have
         ``nspinor == 2`` (BGW Pauli convention); ``ValueError``
         otherwise.
@@ -1391,6 +1392,10 @@ class WfnLoader:
             raise ValueError(
                 f"WfnLoader.load(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
+        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
+            raise ValueError(
+                "bispinor_lift selects a four-spinor transform and requires "
+                "bispinor=True")
 
         b_lo, b_hi = int(bands[0]), int(bands[1])
         nb_logical = b_hi - b_lo
@@ -1434,7 +1439,8 @@ class WfnLoader:
                 nb_padded=nb_padded, out_sharding=named_sharding)
             if bispinor:
                 psi = self._apply_bispinor_lift(
-                    psi, k=k, sharding=named_sharding)
+                    psi, k=k, sharding=named_sharding,
+                    representation=bispinor_lift)
             return psi
 
         if bispinor:
@@ -1445,7 +1451,8 @@ class WfnLoader:
                 nb_padded=nb_padded)
             psi_j = jnp.asarray(psi_np)
             psi_j = self._apply_bispinor_lift(
-                psi_j, k=k, sharding=None)
+                psi_j, k=k, sharding=None,
+                representation=bispinor_lift)
             if named_sharding is None:
                 return psi_j
             # Process-local shard-out.  ``jax.device_put`` of an
@@ -1479,6 +1486,7 @@ class WfnLoader:
         bands: tuple[int, int],
         k: KSpec = "full_bz",
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> jax.Array:
         """ψ(G) for THIS PROCESS ALONE — a **single-device** ``jax.Array``.
 
@@ -1519,6 +1527,10 @@ class WfnLoader:
             raise ValueError(
                 f"load_process_local(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
+        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
+            raise ValueError(
+                "bispinor_lift selects a four-spinor transform and requires "
+                "bispinor=True")
         b_lo, b_hi = int(bands[0]), int(bands[1])
         if b_hi <= b_lo:
             raise ValueError(f"empty band range: {bands}")
@@ -1540,7 +1552,8 @@ class WfnLoader:
         psi = jax.device_put(psi_np, jax.local_devices()[0])
         if bispinor:
             psi = self._apply_bispinor_lift(
-                psi, k=k, sharding=None)
+                psi, k=k, sharding=None,
+                representation=bispinor_lift)
         return psi
 
     def _eager_build_process_local(
@@ -1602,6 +1615,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> Iterator[tuple[tuple[int, int], jax.Array]]:
         """Yield ``((bc_lo, bc_hi), psi)`` for a chunked sweep over bands."""
         if chunk <= 0:
@@ -1610,7 +1624,7 @@ class WfnLoader:
             bc_hi = min(bc_lo + int(chunk), int(b_hi))
             yield (bc_lo, bc_hi), self.load(
                 bands=(bc_lo, bc_hi), k=k, sharding=sharding,
-                bispinor=bispinor)
+                bispinor=bispinor, bispinor_lift=bispinor_lift)
 
     # ------------------------------------------------------------------
     # Bispinor lift (G-flat)
@@ -1621,6 +1635,7 @@ class WfnLoader:
         *,
         k: KSpec,
         sharding: NamedSharding | None,
+        representation: str = "raw",
     ) -> jax.Array:
         """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
 
@@ -1649,7 +1664,7 @@ class WfnLoader:
             jnp.asarray(gvecs, dtype=jnp.float64),
             jnp.asarray(kvecs_np),
             jnp.asarray(bvec_cart_bohr),
-            sharding=sharding,
+            sharding=sharding, representation=representation,
         )
 
     # ------------------------------------------------------------------
@@ -1734,7 +1749,10 @@ class WfnLoader:
 
 
 @functools.lru_cache(maxsize=None)
-def _get_bispinor_lift_jit(sharding: NamedSharding | None):
+def _get_bispinor_lift_jit(
+    sharding: NamedSharding | None,
+    representation: str = "raw",
+):
     """Cache one jit'd copy of the bispinor lift per output sharding.
 
     Without this, each call to ``_bispinor_lift_kernel`` traces every
@@ -1749,7 +1767,8 @@ def _get_bispinor_lift_jit(sharding: NamedSharding | None):
     @jax.jit
     def _kernel(psi_2, gvecs, kvecs, bvec_cart_bohr):
         out = lift_to_4spinor(
-            psi_2, gvecs, kvecs, bvec_cart_bohr)
+            psi_2, gvecs, kvecs, bvec_cart_bohr,
+            representation=representation)
         if sharding is not None:
             out = jax.lax.with_sharding_constraint(out, sharding)
         return out
@@ -1763,6 +1782,7 @@ def _bispinor_lift_kernel(
     bvec_cart_bohr: jax.Array,
     *,
     sharding: NamedSharding | None,
+    representation: str = "raw",
 ) -> jax.Array:
     """Append small components → 4-spinor ψ.
 
@@ -1771,7 +1791,7 @@ def _bispinor_lift_kernel(
     kvecs: (n_k, 3)          float64
     bvec_cart_bohr : (3, 3)  float64, reciprocal rows in bohr⁻¹
     """
-    return _get_bispinor_lift_jit(sharding)(
+    return _get_bispinor_lift_jit(sharding, str(representation).strip().lower())(
         psi_2, gvecs, kvecs, bvec_cart_bohr)
 
 

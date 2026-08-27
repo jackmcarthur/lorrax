@@ -662,18 +662,22 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     for nothing.
     """
     from common import sanity
-    from common.four_current_model import is_pauli_reference_model
+    from common.four_current_model import resolve_four_current_representation
 
-    pauli_reference = is_pauli_reference_model(params.get("bispinor_gw"))
-    if not sanity.sanity_enabled() and not pauli_reference:
+    representation = resolve_four_current_representation(
+        bool(params.get("_four_current_bispinor", False)),
+        params.get("bispinor_gw"))
+    explicit_comparison = bool(params.get("_four_current_bispinor", False)) and (
+        not representation.scalar_head_bispinor)
+    if not sanity.sanity_enabled() and not explicit_comparison:
         return
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
     try:
         from psp.get_dipole_mtxels import check_dipole_provenance
     except Exception as exc:            # psp stack unavailable (h5py-less env)
-        if pauli_reference:
+        if explicit_comparison:
             raise ValueError(
-                "GATE pauli_reference_charge_dipole_provenance: the "
+                "GATE comparison_charge_dipole_provenance: the "
                 "dipole provenance checker is unavailable, so the explicit "
                 "Pauli charge representation cannot be authenticated.") from exc
         print_fn(f"  [dipole provenance] check unavailable "
@@ -683,10 +687,10 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     authenticated = check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
         bispinor=expected_bispinor, print_fn=print_fn)
-    if pauli_reference and not authenticated:
+    if explicit_comparison and not authenticated:
         raise ValueError(
-            "GATE pauli_reference_charge_dipole_provenance: the explicit "
-            "Pauli-reference comparison refuses a dipole/head artifact that "
+            "GATE comparison_charge_dipole_provenance: the explicit "
+            "four-current comparison refuses a dipole/head artifact that "
             "does not authenticate prov_bispinor=false. Regenerate dipole.h5 "
             "from this exact deck.")
 
@@ -1706,6 +1710,10 @@ class HeadResolver:
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn):
         head = config.head
+        from common.four_current_model import (
+            resolve_four_current_representation)
+        representation = resolve_four_current_representation(
+            bool(config.bispinor), config.bispinor_gw)
         self._params = {
             # These are GW-run controls, not head sub-config fields.  The
             # dipole provenance reader must compare against the consumer's
@@ -1716,8 +1724,8 @@ class HeadResolver:
             "bispinor_gw": getattr(
                 getattr(config, "bispinor_gw", "bare_transverse"),
                 "value", getattr(config, "bispinor_gw", "bare_transverse")),
-            "_charge_bispinor": bool(
-                int(getattr(meta, "nspinor", 1)) == 4),
+            "_four_current_bispinor": bool(config.bispinor),
+            "_charge_bispinor": representation.scalar_head_bispinor,
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
             "vhead": head.vhead,

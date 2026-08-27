@@ -1877,7 +1877,8 @@ def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
 
 
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
-                             bispinor: bool = False):
+                             bispinor: bool = False,
+                             bispinor_lift: str = "raw"):
     """One k-point's ψ in the FFT box, **process-local**.
 
     Returns ``(nb - b_lo, nspinor, nx, ny, nz)`` c128 on
@@ -1897,7 +1898,8 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
     """
     loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
     psi = loader.load_process_local(
-        bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor))
+        bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor),
+        bispinor_lift=bispinor_lift)
     ns_have = int(psi.shape[2])
     if int(meta.nspinor) > ns_have:
         _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
@@ -2004,6 +2006,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
 def read_Gvecs_to_devices(
     wfn, sym, bandrange, meta: "Meta", bispinor: bool, mesh_xy: Mesh,
     k_range: tuple[int, int] | None = None,
+    *, bispinor_lift: str = "raw",
 ):
     """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box.
 
@@ -2035,7 +2038,7 @@ def read_Gvecs_to_devices(
     loader = wfn  # reuse top-level WfnLoader
     psi_G_flat = loader.load(
         bands=(b_lo, b_hi), k=k, sharding=sharding,
-        bispinor=bool(bispinor),
+        bispinor=bool(bispinor), bispinor_lift=bispinor_lift,
     )
     ns_after_lift = 4 if bispinor else int(loader.nspinor)
     if int(meta.nspinor) > ns_after_lift:
@@ -2056,6 +2059,7 @@ def load_psi_gflat_padded(
     pad_to: int | None = None,
     k="full_bz",
     sharding: P = band_sphere_spec(),
+    bispinor_lift: str = "raw",
 ) -> "jax.Array | None":
     """One capped + zero-padded ψ(G-flat) load — THE shared load dance.
 
@@ -2087,7 +2091,7 @@ def load_psi_gflat_padded(
         return None
     psi = loader.load(
         bands=(b_lo, b_hi_in_file), k=k, sharding=sharding,
-        bispinor=bool(bispinor))
+        bispinor=bool(bispinor), bispinor_lift=bispinor_lift)
     nb_loaded = int(psi.shape[1])
     if nb_loaded < target:
         psi = jnp.concatenate(
@@ -2183,6 +2187,7 @@ def iter_psi_rchunk_bandwise(
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
     product_r_spec: P | None = None,
+    bispinor_lift: str = "raw",
 ):
     """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time.
 
@@ -2276,7 +2281,8 @@ def iter_psi_rchunk_bandwise(
             # zero-padded UH slice).
             psi_G_bc = load_psi_gflat_padded(
                 loader, bc_range, mesh_xy=mesh_xy, bispinor=bispinor,
-                pad_to=band_pad_to, k="full_bz", sharding=sharding_load)
+                pad_to=band_pad_to, k="full_bz", sharding=sharding_load,
+                bispinor_lift=bispinor_lift)
             if psi_G_bc is None:
                 raise ValueError(
                     f"iter_psi_rchunk_bandwise: band chunk {bc_range} lies "
@@ -2300,7 +2306,8 @@ def iter_psi_rchunk_bandwise(
                 k_ids = list(range(k0, k1))
                 psi_G_flat = loader.load(
                     bands=bc_range, k=k_ids,
-                    sharding=sharding_load, bispinor=bispinor)
+                    sharding=sharding_load, bispinor=bispinor,
+                    bispinor_lift=bispinor_lift)
                 psi_k_chunk = to_rchunk(
                     psi_G_flat,
                     g_index_full[k0:k1],
@@ -2332,6 +2339,7 @@ def load_centroids_band_chunked(
     k_chunk_size: int | None = None,
     *,
     psi_G_flat: jax.Array | None = None,
+    bispinor_lift: str = "raw",
 ) -> tuple[jax.Array, jax.Array]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
@@ -2646,7 +2654,8 @@ def load_centroids_band_chunked(
                     psi_G_tile = load_psi_gflat_padded(
                         loader, band_window, mesh_xy=mesh_xy,
                         bispinor=bispinor, pad_to=band_tile, k=k_ids,
-                        sharding=sharding_load)
+                        sharding=sharding_load,
+                        bispinor_lift=bispinor_lift)
                     # A terminal band tile can lie wholly beyond mnband when
                     # Meta rounded the user's logical edge to the mesh.  The
                     # accumulator is already exact zero there.
@@ -2707,7 +2716,8 @@ def load_centroids_band_chunked(
         with timing.section("load_centroids.loader_load"):
             psi_G_flat = load_psi_gflat_padded(
                 loader, (b_start, b_end), mesh_xy=mesh_xy,
-                bispinor=bispinor, k="full_bz", sharding=sharding_load)
+                bispinor=bispinor, k="full_bz", sharding=sharding_load,
+                bispinor_lift=bispinor_lift)
             if psi_G_flat is None:
                 raise ValueError(
                     f"load_centroids_band_chunked: band window "

@@ -66,8 +66,8 @@ from common import Meta
 from gw.gw_config import (
 	BispinorGWMode, coerce_bispinor_gw_mode,
 	read_lorrax_input as read_cohsex_input,
-	uses_raw_kinetic_balance_charge,
 )
+from common.four_current_model import resolve_four_current_representation
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
@@ -1046,17 +1046,19 @@ def main(argv=None):
 	four_current_bispinor = bool(params.get("bispinor", False))
 	bispinor_gw_mode = coerce_bispinor_gw_mode(
 		params.get("bispinor_gw", "bare_transverse"))
-	if (bispinor_gw_mode is
-			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
+	if (bispinor_gw_mode in (
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
 			and not four_current_bispinor):
 		parser.error(
-			"bispinor_gw=pauli_reference_bare_transverse requires "
+			f"bispinor_gw={bispinor_gw_mode.value} requires "
 			"bispinor=true; the selector does not enable spatial-current "
 			"channels implicitly")
-	if (args.static_gauge_hall_only and bispinor_gw_mode is
-			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE):
+	if (args.static_gauge_hall_only and bispinor_gw_mode in (
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)):
 		parser.error(
-			"bispinor_gw=pauli_reference_bare_transverse is a bare-TT "
+			f"bispinor_gw={bispinor_gw_mode.value} is a bare-TT "
 			"current-only comparison and does not define the FULL/static-Hall "
 			"response requested by --static-gauge-hall-only")
 	if args.static_gauge_hall_only and not four_current_bispinor:
@@ -1067,8 +1069,8 @@ def main(argv=None):
 	# therefore loads the normalized QE two-spinor carrier here; the accepted
 	# raw four-spinor spatial-current vertices live only in the transverse
 	# Hartree and bare-TT exchange owners.
-	bispinor = uses_raw_kinetic_balance_charge(
-		four_current_bispinor, bispinor_gw_mode)
+	bispinor = resolve_four_current_representation(
+		four_current_bispinor, bispinor_gw_mode).scalar_head_bispinor
 
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``

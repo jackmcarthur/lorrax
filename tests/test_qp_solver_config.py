@@ -24,8 +24,10 @@ import pytest
 
 from gw.gw_config import (
     BispinorGWMode, LorraxConfig, QPSolver,
-    qp_solver_semantics, uses_raw_kinetic_balance_charge,
+    qp_solver_semantics, uses_four_spinor_finite_q_charge,
+    uses_raw_kinetic_balance_charge,
 )
+from common.four_current_model import resolve_four_current_representation
 
 
 BASE_INPUT = """\
@@ -180,6 +182,24 @@ def test_pauli_reference_refuses_restart_write(tmp_path):
             "bispinor_gw = pauli_reference_bare_transverse\n"
             "restart = false\n"
             "write_restart_tensors = true\n")
+
+
+def test_isometric_selector_splits_finite_q_from_scalar_head(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = isometric_kinetic_balance_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n")
+    rep = resolve_four_current_representation(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert cfg.bispinor_gw is (
+        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+    assert uses_four_spinor_finite_q_charge(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert rep.charge_bispinor and rep.current_bispinor
+    assert rep.charge_lift == rep.current_lift == "isometric"
+    assert not rep.scalar_head_bispinor
 
 
 # ---------------------------------------------------------------------------

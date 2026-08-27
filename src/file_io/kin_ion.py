@@ -85,10 +85,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.four_current_model import (
 	is_pauli_reference_model,
+	is_isometric_kinetic_balance_model,
 	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
-	PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
-	RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION,
-	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+	resolve_four_current_representation,
 )
 
 from .slab_io import SlabIO
@@ -722,12 +721,17 @@ def validate_kin_ion_against_run(
 			"kin_ion.h5 from this run's exact input deck."
 		)
 	pauli_reference = is_pauli_reference_model(expected_bispinor_gw_mode)
-	expected_charge_representation = (
-		PAULI_TWO_SPINOR_CHARGE_REPRESENTATION
-		if pauli_reference else RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION)
+	isometric = is_isometric_kinetic_balance_model(
+		expected_bispinor_gw_mode)
+	explicit_comparison = bool(pauli_reference or isometric)
+	expected_mode_value = str(getattr(
+		expected_bispinor_gw_mode, "value", expected_bispinor_gw_mode))
+	representation = resolve_four_current_representation(
+		expected_bispinor, expected_bispinor_gw_mode)
+	expected_charge_representation = representation.charge_representation
 	stored_charge_representation = attrs.get("charge_representation")
 	if bool(expected_bispinor) and (
-		stored_charge_representation is None and pauli_reference
+		stored_charge_representation is None and explicit_comparison
 		or stored_charge_representation is not None
 		and str(stored_charge_representation) != expected_charge_representation
 	):
@@ -736,24 +740,23 @@ def validate_kin_ion_against_run(
 			f"{stored_charge_representation!r}, expected "
 			f"{expected_charge_representation!r}; regenerate kin_ion.h5 from "
 			"this run's exact input deck.")
-	if pauli_reference and str(attrs.get("bispinor_gw_mode")) != (
-		PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
-	):
+	if explicit_comparison and str(attrs.get("bispinor_gw_mode")) != (
+		expected_mode_value):
 		raise ValueError(
-			"the Pauli-reference comparison requires an explicitly stamped "
-			f"bispinor_gw_mode={PAULI_REFERENCE_BARE_TRANSVERSE_MODEL!r}; "
+			"the explicit four-current comparison requires an authenticated "
+			f"bispinor_gw_mode={expected_mode_value!r}; "
 			f"artifact has {attrs.get('bispinor_gw_mode')!r}.")
 	if bool(expected_bispinor):
 		stored_current_representation = attrs.get(
 			"spatial_current_representation")
-		if (stored_current_representation is None and pauli_reference
+		if (stored_current_representation is None and explicit_comparison
 				or stored_current_representation is not None
 				and str(stored_current_representation) !=
-				RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
+				representation.spatial_current_representation):
 			raise ValueError(
 				"kin_ion spatial-current representation is "
 				f"{stored_current_representation!r}, expected "
-				f"{RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION!r}.")
+				f"{representation.spatial_current_representation!r}.")
 	stored_sys_dim = attrs.get("sys_dim")
 	if sys_dim is not None and stored_sys_dim is not None and (
 		int(stored_sys_dim) != int(sys_dim)
@@ -786,7 +789,8 @@ def validate_kin_ion_against_run(
 				"cover the same window — regenerate with a larger -n.")
 		if expected_bispinor:
 			matrix_nspinor = attrs.get("hartree_matrix_nspinor")
-			expected_matrix_nspinor = 2 if pauli_reference else 4
+			expected_matrix_nspinor = (
+				4 if representation.charge_bispinor else 2)
 			if (matrix_nspinor is None
 					or int(matrix_nspinor) != expected_matrix_nspinor):
 				raise ValueError(
@@ -796,7 +800,7 @@ def validate_kin_ion_against_run(
 					"kin_ion.h5.")
 			component_representation = attrs.get(
 				"hartree_charge_representation")
-			if (component_representation is None and pauli_reference
+			if (component_representation is None and explicit_comparison
 					or component_representation is not None
 					and str(component_representation) !=
 					expected_charge_representation):
@@ -847,12 +851,13 @@ def validate_kin_ion_against_run(
 		}
 		from common.bispinor_init import (
 			DIRAC_ALPHA_VERTEX_PROVENANCE,
-			KINETIC_BALANCE_LIFT_PROVENANCE,
+			kinetic_balance_lift_provenance,
 			NO_PAIR_DIRAC_CURRENT_MODEL,
 		)
 		required.update({
 			"current_model": NO_PAIR_DIRAC_CURRENT_MODEL,
-			"bispinor_lift": KINETIC_BALANCE_LIFT_PROVENANCE,
+			"bispinor_lift": kinetic_balance_lift_provenance(
+				representation.current_lift or "raw"),
 			"current_vertex": DIRAC_ALPHA_VERTEX_PROVENANCE,
 		})
 		for name, expected in required.items():
@@ -885,10 +890,10 @@ def validate_kin_ion_against_run(
 				"canonical four-component kinetic-balance matrix basis.")
 		component_current_representation = attrs.get(
 			"transverse_hartree_spatial_current_representation")
-		if (component_current_representation is None and pauli_reference
+		if (component_current_representation is None and explicit_comparison
 				or component_current_representation is not None
 				and str(component_current_representation) !=
-				RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
+				representation.spatial_current_representation):
 			raise ValueError(
 				f"{TRANSVERSE_HARTREE_DATASET} spatial-current "
 				f"representation is {component_current_representation!r}, "

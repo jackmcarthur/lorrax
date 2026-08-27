@@ -150,11 +150,9 @@ import h5py
 
 from common import Meta
 from common.four_current_model import (
+    is_isometric_kinetic_balance_model,
     is_pauli_reference_model,
-    PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
-    RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION,
-    RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
-    SOURCE_WFN_CHARGE_REPRESENTATION,
+    resolve_four_current_representation,
 )
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import (barrier, local_share, process_rank_world,
@@ -189,7 +187,6 @@ from gw.gw_config import (
     BispinorGWMode,
     coerce_bispinor_gw_mode,
     read_lorrax_input as read_cohsex_input,
-    uses_raw_kinetic_balance_charge,
 )
 from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
 from psp.dft_operators import padded_gvectors, vnl_matrix_from_kdata
@@ -694,6 +691,7 @@ def build_valence_density_distributed(wfn, sym, meta, *,
                                       max_bands_per_item: int | None = None,
                                       include_dirac_current: bool = False,
                                       charge_nspinor: int | None = None,
+                                      bispinor_lift: str = "raw",
                                       print_fn=print) -> np.ndarray:
     """ρ_v(r) on the ψ FFT box grid — k/band-partitioned, ONE psum.
 
@@ -816,7 +814,8 @@ def build_valence_density_distributed(wfn, sym, meta, *,
             # unreachable, by LIFTING the small components instead.
             psi_k = load_kpoint_fftbox_local(
                 wfn, meta, ik, b_hi, b_lo=b_lo,
-                bispinor=(int(meta.nspinor) == 4))
+                bispinor=(int(meta.nspinor) == 4),
+                bispinor_lift=bispinor_lift)
         if occupation_weights is None:
             rho_local = rho_local + valence_density_from_kpoint(
                 psi_k, nocc=None, weight=wk,
@@ -868,6 +867,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            band_chunk_size: int | None = None,
                            include_transverse: bool = False,
                            charge_nspinor: int | None = None,
+                           bispinor_lift: str = "raw",
                            print_fn=print,
                            owner_only: bool = False,
                            k_set: str = "full"):
@@ -984,6 +984,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
             max_bands_per_item=band_chunk_size,
             include_dirac_current=with_transverse,
             charge_nspinor=(None if charge_nspinor is None else charge_ns),
+            bispinor_lift=bispinor_lift,
             print_fn=print_fn)
 
     if with_transverse:
@@ -1109,7 +1110,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     gtab = padded_gvectors(wfn, k=k_spec)
     psi_G = wfn.load(
         bands=(0, nb), k=k_spec, sharding=band_sphere_spec(),
-        bispinor=(int(meta.nspinor) == 4))
+        bispinor=(int(meta.nspinor) == 4),
+        bispinor_lift=bispinor_lift)
     psi_charge = psi_G if charge_ns == int(psi_G.shape[2]) \
         else psi_G[:, :, :charge_ns, :]
     geom_charge = SweepGeometry(
@@ -1295,22 +1297,25 @@ def main(argv=None):
     bispinor = bool(params.get("bispinor", False))
     bispinor_gw_mode = coerce_bispinor_gw_mode(
         params.get("bispinor_gw", "bare_transverse"))
-    if (bispinor_gw_mode is
-            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE and not bispinor):
+    if (bispinor_gw_mode in (
+            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+            BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+            and not bispinor):
         raise SystemExit(
-            "bispinor_gw=pauli_reference_bare_transverse requires "
+            f"bispinor_gw={bispinor_gw_mode.value} requires "
             "bispinor=true; the selector does not enable spatial-current "
             "channels implicitly.")
-    charge_bispinor = uses_raw_kinetic_balance_charge(
+    representation = resolve_four_current_representation(
         bispinor, bispinor_gw_mode)
+    charge_bispinor = representation.charge_bispinor
     pauli_reference = bispinor and is_pauli_reference_model(bispinor_gw_mode)
     # ``None`` is load-bearing for byte compatibility: every historical
     # bare_transverse/non-bispinor density follows the old unsliced kernel.
     charge_nspinor = int(wfn.nspinor) if pauli_reference else None
-    charge_representation = (
-        RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION if charge_bispinor else
-        PAULI_TWO_SPINOR_CHARGE_REPRESENTATION if bispinor else
-        SOURCE_WFN_CHARGE_REPRESENTATION)
+    charge_representation = representation.charge_representation
+    explicit_comparison = bool(
+        pauli_reference
+        or is_isometric_kinetic_balance_model(bispinor_gw_mode))
     if bispinor and args.fold_hartree:
         raise SystemExit(
             "--fold-hartree is legacy scalar-only storage and is refused "
@@ -1539,6 +1544,7 @@ def main(argv=None):
                 band_chunk_size=int(params["band_chunk_size"]),
                 include_transverse=bispinor,
                 charge_nspinor=charge_nspinor,
+                bispinor_lift=(representation.current_lift or "raw"),
                 print_fn=print0, owner_only=True,
                 k_set=("ibz" if store_ibz else "full"))
             if bispinor:
@@ -1734,11 +1740,11 @@ def main(argv=None):
                 ds.attrs["nband_input"] = nband
                 ds.attrs["nelec_bands"] = int(wfn.nelec)
                 ds.attrs["bispinor"] = bool(bispinor)
-                if pauli_reference:
+                if explicit_comparison:
                     ds.attrs["bispinor_gw_mode"] = bispinor_gw_mode.value
                     ds.attrs["charge_representation"] = charge_representation
                     ds.attrs["spatial_current_representation"] = (
-                        RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
+                        representation.spatial_current_representation)
                 ds.attrs["nspinor"] = int(wfn.nspinor)
                 # WHICH V_NL PROJECTORS.  ``nspinor`` alone does NOT say:
                 # noncollinear is not spin-orbit, and a file written with
@@ -1795,7 +1801,7 @@ def main(argv=None):
                         hartree_density_band_stop)
                     vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
                     vh.attrs["matrix_nspinor"] = charge_matrix_nspinor
-                    if pauli_reference:
+                    if explicit_comparison:
                         vh.attrs["charge_representation"] = (
                             charge_representation)
                 if v_h_transverse_all is not None:
@@ -1813,17 +1819,19 @@ def main(argv=None):
                     vht.attrs["fft_grid"] = np.asarray(
                         meta.fft_grid, dtype=np.int32)
                     vht.attrs["matrix_nspinor"] = int(meta.nspinor)
-                    if pauli_reference:
+                    if explicit_comparison:
                         vht.attrs["spatial_current_representation"] = (
-                            RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
+                            representation.spatial_current_representation)
                     vht.attrs["source_wfn_nspinor"] = int(wfn.nspinor)
                     from common.bispinor_init import (
                         DIRAC_ALPHA_VERTEX_PROVENANCE,
-                        KINETIC_BALANCE_LIFT_PROVENANCE,
+                        kinetic_balance_lift_provenance,
                         NO_PAIR_DIRAC_CURRENT_MODEL,
                     )
                     vht.attrs["current_model"] = NO_PAIR_DIRAC_CURRENT_MODEL
-                    vht.attrs["bispinor_lift"] = KINETIC_BALANCE_LIFT_PROVENANCE
+                    vht.attrs["bispinor_lift"] = (
+                        kinetic_balance_lift_provenance(
+                            representation.current_lift or "raw"))
                     vht.attrs["current_vertex"] = DIRAC_ALPHA_VERTEX_PROVENANCE
                     vht.attrs["tt_metric_sign"] = float(
                         current_diagnostic.tt_metric_sign)

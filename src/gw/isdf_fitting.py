@@ -187,6 +187,7 @@ def fit_zeta_to_h5(
     cache_face_y_blocks: bool = False,
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
+    bispinor_lift: str = "raw",
     print_fn=print,
 ):
     """
@@ -1212,6 +1213,7 @@ def fit_zeta_to_h5(
         wfn=wfn, mesh_xy=mesh_xy, meta=meta,
         band_chunk_ranges=band_chunk_ranges,
         bispinor=bispinor,
+        bispinor_lift=bispinor_lift,
     )
 
     # Hoist the full-grid ψ(G)->ψ(r) transforms when the memory plan admits
