@@ -3608,6 +3608,12 @@ def refuse_unsupported_bispinor_gw(config) -> None:
          f"mpa_material_class = {config.mpa.material_class}",
          "mpa_material_class = insulator"),
         (not bool(config.restart), "restart = true", "restart = false"),
+        (mode is not
+         BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC
+         or not bool(config.write_restart_tensors),
+         ("write_restart_tensors = "
+          f"{str(bool(config.write_restart_tensors)).lower()}"),
+         "write_restart_tensors = false"),
         (mode is BispinorGWMode.FULL_STATIC_COHSEX
          or int(config.sys_dim) == 2,
          f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
