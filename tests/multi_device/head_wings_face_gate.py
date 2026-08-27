@@ -123,7 +123,7 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
     Y = np.zeros((n_omega, n_vertex, mu), dtype=np.complex128)
     Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
-    pref = 4.0 / (float(nk_tot) * spin_denom)
+    pref = -4.0 / (float(nk_tot) * spin_denom)
     for k in range(nk):
         for i in range(nb_logical):
             for j in range(nb_logical):
