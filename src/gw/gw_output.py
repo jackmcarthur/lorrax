@@ -424,6 +424,7 @@ def write_qp_wfn_oneshot(
     wfn,
     band_slices,
     input_dir: str,
+    qp_solver,
     print_fn=print,
 ):
     """One-shot WFN_qp.h5 dump (drop-in BSE / restart input).
@@ -444,6 +445,8 @@ def write_qp_wfn_oneshot(
             f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
         return
     from file_io.qp_wfn import write_qp_wfn_h5
+    from .gw_config import qp_solver_semantics
+    semantics = qp_solver_semantics(qp_solver)
     _qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
     if jax.process_index() == 0:
         write_qp_wfn_h5(
@@ -451,6 +454,9 @@ def write_qp_wfn_oneshot(
             U_kmn=np.asarray(U_full, dtype=np.complex128),
             enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
             band_start=band_slices.b0, band_stop=band_slices.b3,
+            qp_solver=getattr(qp_solver, "value", qp_solver),
+            qp_energy_definition=semantics.energy_definition,
+            sigma_eval_provenance=semantics.sigma_evaluation_provenance,
         )
     try:
         from jax.experimental import multihost_utils as _mh
@@ -717,9 +723,10 @@ def write_qsgw_qp_ladders(
 
     ``e_qp_ry`` is the driver's own QP ladder (the eigh of
     ``½(H + H†)``, ``H = kin_ion + Σ_xc + V_H``) — passed rather than
-    recomputed so the file cannot disagree with ``eqp0.dat`` about what
-    this run's QP energies were.  It is not itself one of the three; it
-    is the reference the three are read against.
+    recomputed so the file cannot disagree with the run's full-matrix
+    effective-H spectrum.  This spectrum is distinct from the fixed-state
+    diagonal result in ``eqp0.dat``; it is the reference the optional
+    plotting ladders are read against.
     """
     if not bool(getattr(config, "write_qsgw_datasets", False)):
         return []
@@ -837,9 +844,10 @@ def write_qsgw_qp_ladders(
     # AGAINST THE RUN'S OWN LADDER, which is what makes the log line
     # readable without opening the file: each approximation is reported by
     # how far it sits from the E_qp this run actually used (the eigh of
-    # kin_ion + Σ_xc + V_H, the same array eqp0.dat is built from).  Both
-    # sides are per-k ascending eigenvalues, so the elementwise difference
-    # is band-for-band.  Taken BEFORE the append, on the full-BZ arrays,
+    # kin_ion + Σ_xc + V_H, distinct from the fixed-state diagonal array
+    # written to eqp0.dat).  Both sides are per-k ascending eigenvalues, so
+    # the elementwise difference is positional.  Taken BEFORE the append,
+    # on the full-BZ arrays,
     # because after it the ladders are one row per star.
     ref_ev = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
     deltas = {
@@ -1150,6 +1158,7 @@ def write_results(
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
+    qp_solver=None,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1209,6 +1218,9 @@ def write_results(
         Write ``qp_wfn_rotations.h5`` here.  Self-consistent runs that
         already wrote the converged SC rotation pass ``False`` so this
         post-Sigma eigensolve cannot overwrite the authoritative file.
+    qp_solver : QPSolver or str, optional
+        Resolved solver whose canonical method provenance is stamped on the
+        rotations artifact.  Omission preserves legacy unstamped behavior.
     """
     from file_io import (
         write_sigma_to_file,
@@ -1511,6 +1523,16 @@ def write_results(
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
+        provenance = {}
+        if qp_solver is not None:
+            from .gw_config import qp_solver_semantics
+            semantics = qp_solver_semantics(qp_solver)
+            provenance = {
+                "qp_solver": getattr(qp_solver, "value", qp_solver),
+                "qp_energy_definition": semantics.energy_definition,
+                "sigma_eval_provenance": (
+                    semantics.sigma_evaluation_provenance),
+            }
         nkx, nky, nkz = kgrid
         # The service owns the (irr_idx_k, sym_idx_k, n_sym_spatial) triple
         # — ``n_sym_spatial`` from ``sym_mats_k``, not from the WFN header,
@@ -1531,6 +1553,7 @@ def write_results(
             k_storage=str(qp_rotations_k_storage),
             star_tables=_sm.star_tables_of(sym),
             print_fn=print_fn,
+            **provenance,
         )
 
     # ── Status summary ────────────────────────────────────────────────────
