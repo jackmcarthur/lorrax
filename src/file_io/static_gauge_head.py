@@ -38,9 +38,9 @@ from gw.photon_layout import (
 )
 
 
-STATIC_GAUGE_HEAD_SCHEMA_VERSION = 2
+STATIC_GAUGE_HEAD_SCHEMA_VERSION = 3
 STATIC_GAUGE_HEAD_CONVENTION_ID = (
-    "lorrax.static_gauge_head/v2"
+    "lorrax.static_gauge_head/v3"
     "|omega=0_static"
     "|energy=Rydberg"
     "|length=bohr"
@@ -51,7 +51,7 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
     "|lorentz=(C,Jx,Jy,Jz)"
     "|q_cart=bohr^-1"
     "|head=Pi_reg(q):q_a*q_b*S_direct[a,b]"
-    "|hall_CT=+i*epsilon[b,a,i]*sigma_H[b]*q[a]"
+    "|hall_CT=-i*epsilon[b,a,i]*sigma_H[b]*q[a]"
     "|hall_TC=CT^dagger"
     "|sigma_H_raw=-(alpha_FS*C/(2*Omega_cell))*Im(cB);"
     "C=2/(nspin*nspinor_wfn)"
