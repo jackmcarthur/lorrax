@@ -129,7 +129,7 @@ class StaticGaugeHeadResponse:
     The only admitted linear CT/TC term is generated structurally from the
     separately sourced Hall pseudovector ``sigma_H`` by
 
-    ``Pi_H[0,i](q) = i epsilon[b,a,i] sigma_H[b] q[a]``.
+    ``Pi_H[0,i](q) = -i epsilon[b,a,i] sigma_H[b] q[a]``.
 
     Thus this record has no arbitrary ``H_direct`` field.  ``Y_x`` and ``Z_y``
     are the incumbent qsgw-head one-leg orientations and remain sharded on the
@@ -181,8 +181,11 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
             "imaginary component")
     sigma = np.asarray(np.real(sigma_raw), dtype=np.float64)
     axes = np.eye(3, dtype=np.float64)[:2]
-    # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].
-    ct = 1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
+    # epsilon[b,a,i] sigma[b] = (sigma x e_a)[i].  The minus is fixed by the
+    # live band orientation P=-Delta*D: direct Adler--Wiser gives
+    # Im Pi_CT=+F/h Im(Gamma_a Gamma_i*)/Delta^2, whereas the persisted
+    # occupied-Berry convention stores sigma_H with the opposite sign.
+    ct = -1j * np.stack([np.cross(sigma, axis) for axis in axes], axis=0)
     linear = np.zeros((2, 4, 4), dtype=np.complex128)
     linear[:, 0, 1:] = ct
     linear[:, 1:, 0] = np.conj(ct)

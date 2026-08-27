@@ -35,6 +35,7 @@ from gw.qsgw_head import (
     static_gauge_first_order_component_sharded,
     static_gauge_second_order_component_sharded,
 )
+from gw.head_correction import static_hall_linear_response
 
 jax.config.update("jax_enable_x64", True)
 
@@ -789,6 +790,25 @@ def test_raw_hall_matches_orbital_cB_owner_and_documented_sign():
     np.testing.assert_allclose(got, expected, rtol=3e-14, atol=3e-14)
     # Red twin: omitting the occupied-Berry minus is an observable sign flip.
     assert np.max(np.abs(got - (-expected))) > 1.0e-10
+
+    # The persisted sigma convention carries the occupied-Berry minus.  Its
+    # CT insertion must carry the second minus: direct Adler--Wiser in the
+    # live P=-Delta*D band orientation is +2C/(Omega*Nk*h) times
+    # Im(Gamma_a Gamma_i*)/Delta^2.
+    delta = energies[:, :, None] - energies[:, None, :]
+    separated = np.abs(delta) > 1.0e-10
+    weight = occupations[:, :, None] * np.where(
+        separated, 1.0 / np.square(np.where(separated, delta, 1.0)), 0.0)
+    gamma_dir = np.transpose(gamma_raw, (1, 0, 2, 3))
+    direct_aw = (
+        2.0 * capacity / (volume * nk * HALFALPHA)
+        * np.imag(np.einsum(
+            "aknm,iknm,knm->ai", gamma_dir[:2],
+            np.conj(gamma_dir), weight, optimize=True)))
+    inserted = np.asarray(static_hall_linear_response(got))[:, 0, 1:].imag
+    np.testing.assert_allclose(
+        inserted, direct_aw, rtol=3e-14, atol=3e-14)
+    assert np.max(np.abs((-inserted) - direct_aw)) > 1.0e-10
 
 
 def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
