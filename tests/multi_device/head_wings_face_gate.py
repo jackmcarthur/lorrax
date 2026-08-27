@@ -33,6 +33,9 @@ Checks:
      allocator peak delta does NOT scale with the mu ratio -- the
      positive claim this task exists to make, measured, not asserted by
      construction.
+  4. lorentz_endpoints -- separate operator-applied face endpoints match
+     independent CC/TC/CT/TT host algebra, including endpoint order and
+     complex-conjugation signs, with the native Y_x/Z_y shardings.
 
 Run:
     lx run -G 4 -n 4 env PYTHONPATH=... python3 -u \\
@@ -107,12 +110,18 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
-                 omega, eta):
+                 omega, eta, psi_y_bra=None, psi_y_ket=None,
+                 psi_z_bra=None, psi_z_ket=None):
     nk, nb = e.shape
     mu = psi.shape[-1]
     n_omega = len(omega)
-    Y = np.zeros((n_omega, 3, mu), dtype=np.complex128)
-    Z = np.zeros((n_omega, mu, 3), dtype=np.complex128)
+    n_vertex = int(v.shape[0])
+    psi_y_bra = psi if psi_y_bra is None else psi_y_bra
+    psi_y_ket = psi if psi_y_ket is None else psi_y_ket
+    psi_z_bra = psi if psi_z_bra is None else psi_z_bra
+    psi_z_ket = psi if psi_z_ket is None else psi_z_ket
+    Y = np.zeros((n_omega, n_vertex, mu), dtype=np.complex128)
+    Z = np.zeros((n_omega, mu, n_vertex), dtype=np.complex128)
     spin_denom = max(int(nspin), 1) * max(int(nspinor), 1)
     pref = 4.0 / (float(nk_tot) * spin_denom)
     for k in range(nk):
@@ -122,15 +131,24 @@ def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
                 if dE <= 0.0:
                     continue
                 fdiff = f[k, j] - f[k, i]
-                bij = np.einsum("sm,sm->m", np.conj(psi[k, i]), psi[k, j])
+                bij_y = np.einsum(
+                    "sm,sm->m", np.conj(psi_y_bra[k, i]),
+                    psi_y_ket[k, j])
+                bij_z_conj = np.einsum(
+                    "sm,sm->m", psi_z_bra[k, i],
+                    np.conj(psi_z_ket[k, j]))
                 for iw, om in enumerate(omega):
                     z = om + 1j * eta
                     denom = z * z - dE * dE
                     if abs(denom) <= 1.0e-16:
                         continue
                     w = pref * fdiff / denom
-                    Y[iw] += np.conj(v[:, k, i, j])[:, None] * w * bij[None, :]
-                    Z[iw] += np.conj(bij)[:, None] * w * v[:, k, i, j][None, :]
+                    Y[iw] += (
+                        np.conj(v[:, k, i, j])[:, None] * w
+                        * bij_y[None, :])
+                    Z[iw] += (
+                        bij_z_conj[:, None] * w
+                        * v[:, k, i, j][None, :])
     return Y, Z
 
 
@@ -215,6 +233,92 @@ def check_static_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
     for k, val in r.items():
         assert val < RTOL, f"{k} rel err {val:.3e}"
     return r
+
+
+def check_lorentz_endpoints(mesh, dtype="complex128"):
+    """Real-mesh endpoint-order and conjugation discriminator."""
+    import dataclasses
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.gamma_matrices import gammas
+    import gw.qsgw_head as qsgw_head
+    from gw.qsgw_head import head_wings_sharded
+    from gw.wavefunction_bundle import with_lorentz_vertices
+
+    rng = np.random.default_rng(20260827)
+    nk, nb, ns, nmu = 2, 4, 4, 8
+    _legacy, face, psi, enk, occ = _build_pair(
+        rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    v = (rng.standard_normal((3, nk, nb, nb))
+         + 1j * rng.standard_normal((3, nk, nb, nb)))
+    omega = np.asarray([0.17 + 0.03j])
+    common = dict(
+        energies_kn_ry=enk, occupations_kn=occ, omegas_ry=omega,
+        mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
+        eta_ry=0.01)
+    gamma1_psi = np.einsum(
+        "st,kntm->knsm", np.asarray(jax.device_get(gammas[1])), psi,
+        optimize=True)
+    gamma2_psi = np.einsum(
+        "st,kntm->knsm", np.asarray(jax.device_get(gammas[2])), psi,
+        optimize=True)
+    left_T = with_lorentz_vertices(face, 1, 0)
+    right_T = with_lorentz_vertices(face, 0, 2)
+    cases = (
+        ("CC", {}, {}),
+        ("TC", {"body_bra_wfns": left_T},
+         {"psi_y_bra": gamma1_psi}),
+        ("CT", {"body_ket_wfns": right_T},
+         {"psi_z_ket": gamma2_psi}),
+        ("TT", {"body_bra_wfns": left_T, "body_ket_wfns": right_T},
+         {"psi_y_bra": gamma1_psi, "psi_z_ket": gamma2_psi}),
+    )
+    outputs = {}
+    max_abs_error = 0.0
+    for name, endpoint_kwargs, oracle_kwargs in cases:
+        Y, Z = head_wings_sharded(v, face, **common, **endpoint_kwargs)
+        assert Y.sharding.is_equivalent_to(
+            NamedSharding(mesh, P(None, None, "x")), Y.ndim)
+        assert Z.sharding.is_equivalent_to(
+            NamedSharding(mesh, P(None, "y", None)), Z.ndim)
+        Y_ref, Z_ref = _numpy_wings(
+            v, enk, occ, psi, nb_logical=nb, nk_tot=nk, nspin=1,
+            nspinor=ns, omega=omega, eta=0.01, **oracle_kwargs)
+        Y, Z = _gather(Y), _gather(Z)
+        err = max(float(np.max(np.abs(Y - Y_ref))),
+                  float(np.max(np.abs(Z - Z_ref))))
+        scale = max(1.0, float(np.max(np.abs(Y_ref))),
+                    float(np.max(np.abs(Z_ref))))
+        assert err <= 64.0 * np.finfo(float).eps * scale, (
+            f"{name} endpoint oracle abs error {err:.3e}")
+        max_abs_error = max(max_abs_error, err)
+        outputs[name] = (Y, Z)
+
+    np.testing.assert_array_equal(outputs["TC"][1], outputs["CC"][1])
+    np.testing.assert_array_equal(outputs["CT"][0], outputs["CC"][0])
+    assert np.max(np.abs(outputs["TC"][0] - outputs["CC"][0])) > 1.0e-6
+    assert np.max(np.abs(outputs["CT"][1] - outputs["CC"][1])) > 1.0e-6
+
+    phase_face = dataclasses.replace(
+        face, psi_mun=1j * face.psi_mun, psi_nmu=1j * face.psi_nmu)
+    Y_bra, Z_bra = map(_gather, head_wings_sharded(
+        v, face, **common, body_bra_wfns=phase_face))
+    Y_ket, Z_ket = map(_gather, head_wings_sharded(
+        v, face, **common, body_ket_wfns=phase_face))
+    Y_cc, Z_cc = outputs["CC"]
+    phase_error = max(
+        float(np.max(np.abs(Y_bra + 1j * Y_cc))),
+        float(np.max(np.abs(Z_bra - 1j * Z_cc))),
+        float(np.max(np.abs(Y_ket - 1j * Y_cc))),
+        float(np.max(np.abs(Z_ket + 1j * Z_cc))),
+    )
+    phase_scale = max(1.0, float(np.max(np.abs(Y_cc))),
+                      float(np.max(np.abs(Z_cc))))
+    assert phase_error <= 64.0 * np.finfo(float).eps * phase_scale, (
+        f"bra/ket phase placement error {phase_error:.3e}")
+    return {"max_abs_oracle_error": max_abs_error,
+            "phase_placement_error": phase_error,
+            "qsgw_head_source": qsgw_head.__file__}
 
 
 def check_bounded_residency(mesh, dtype="complex128"):
@@ -305,6 +409,7 @@ _CLI_CELLS = [
     ("dynamic_wings_ns2", lambda mesh, dt: check_dynamic_wings(mesh, dt, ns=2)),
     ("static_wings_ns1", lambda mesh, dt: check_static_wings(mesh, dt, ns=1)),
     ("static_wings_ns2", lambda mesh, dt: check_static_wings(mesh, dt, ns=2)),
+    ("lorentz_endpoints", check_lorentz_endpoints),
     ("bounded_residency", lambda mesh, dt: check_bounded_residency(mesh, dt)),
 ]
 
