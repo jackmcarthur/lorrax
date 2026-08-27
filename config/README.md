@@ -217,7 +217,8 @@ itself is *not* the bottleneck — everything above it is.
   etc. back-to-back. Saves the ~5 s shifter bring-up per invocation.
   (Python still cold-starts each call inside the shell — the real 100×
   win is keeping one Python REPL alive.)
-- Compile-cache policy is owned by `ISDF_JAX_CACHE_DIR` / `LORRAX_RUN_DIR` in
+- Repository compile-cache policy is owned by `ISDF_JAX_CACHE_DIR` /
+  `LORRAX_RUN_DIR` in
   [`docs/dev/env_vars.md`](../docs/dev/env_vars.md).  The module does not arm a
   second, process-global JAX cache before LORRAX's multi-rank agreement layer.
 - For multi-rank MPI runs, `lxrun` is still required — shifter's
