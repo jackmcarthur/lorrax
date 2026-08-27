@@ -1068,7 +1068,7 @@ def test_frequency_blocked_isdf_wings_match_direct_transition_sum():
         surface_weight_kn=surface,
     )
 
-    pref_inter = 4.0 / (nk * 2.0)
+    pref_inter = -4.0 / (nk * 2.0)
     pref_surface = 2.0 / (nk * 2.0)
     Y_ref = np.zeros((nw, 3, nmu), dtype=np.complex128)
     Z_ref = np.zeros((nw, nmu, 3), dtype=np.complex128)
@@ -1104,6 +1104,53 @@ def test_frequency_blocked_isdf_wings_match_direct_transition_sum():
                     * velocity[:, k, i, j][None, None, :])
     np.testing.assert_allclose(np.asarray(Y), Y_ref, rtol=8e-14, atol=8e-14)
     np.testing.assert_allclose(np.asarray(Z), Z_ref, rtol=8e-14, atol=8e-14)
+
+
+def test_head_wing_interband_sign_matches_direct_adler_wiser_density_jet():
+    """Two-level direct-AW oracle for the one-leg ``D -> P`` sign.
+
+    Use the energy-ordered pair ``(c,v)`` with ``Delta=2``, ``P_cv=b_cv=1``
+    and therefore ``D_cv=-P_cv/Delta=-1/2``.  At ``z=0`` the mixed
+    density-jet Adler--Wiser coefficient is
+
+        F * Delta * conj(D) * b / (z**2 - Delta**2) = +F/4.
+
+    The old positive interband kernel prefactor returned ``-F/4``.  This
+    oracle names both representations so neither band orientation nor the
+    defining ``P=-Delta*D`` minus can be hidden in a copied kernel formula.
+    """
+    delta = 2.0
+    energies = np.asarray([[delta, 0.0]])
+    occupations = np.asarray([[0.0, 1.0]])
+    P_head = np.zeros((3, 1, 2, 2), dtype=np.complex128)
+    P_head[0, 0, 0, 1] = 1.0
+    body = np.ones((1, 1, 1, 2), dtype=np.complex128)
+    omega = np.asarray([0.0 + 0.0j])
+
+    Y, Z = head_wings_sharded(
+        P_head,
+        SimpleNamespace(psi_xn=jnp.asarray(body), psi_yn=jnp.asarray(body)),
+        energies,
+        occupations,
+        omega,
+        mesh=_mesh(),
+        nb_logical=2,
+        nk_tot=1,
+        nspin=1,
+        nspinor=1,
+    )
+
+    prefactor = 4.0
+    p_cv = P_head[0, 0, 0, 1]
+    d_cv = -p_cv / delta
+    b_cv = 1.0 + 0.0j
+    denom = omega[0] ** 2 - delta ** 2
+    direct_aw = prefactor * delta * np.conj(d_cv) * b_cv / denom
+    assert direct_aw == prefactor / 4.0
+    np.testing.assert_allclose(np.asarray(Y)[0, 0, 0], direct_aw,
+                               rtol=0.0, atol=1.0e-14)
+    np.testing.assert_allclose(np.asarray(Z)[0, 0, 0], direct_aw,
+                               rtol=0.0, atol=1.0e-14)
 
 
 def test_finite_link_derivative_is_exactly_gauge_covariant():
