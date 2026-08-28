@@ -59,3 +59,37 @@ def test_coupled_coordinator_builds_once_and_orders_consumers_and_finalizers():
     assert [event for event in events if event[0] == "finalize"] == [
         ("finalize", 1), ("finalize", 2), ("finalize", 3)]
 
+
+def test_final_write_turn_waits_for_all_channel_loops():
+    coordinator = _CoupledMu123ZqCoordinator()
+    entered = {mu: threading.Event() for mu in (1, 2, 3)}
+    release = {mu: threading.Event() for mu in (1, 2, 3)}
+
+    def worker(mu):
+        coordinator.wait_finalize(mu)
+        entered[mu].set()
+        assert release[mu].wait(timeout=5)
+        coordinator.finish_channel(mu)
+
+    first = threading.Thread(target=worker, args=(1,))
+    first.start()
+    # μ=1 owns the first write turn, but it must not enter that turn until
+    # μ=2 and μ=3 have both reported that their r-chunk loops are complete.
+    assert not entered[1].wait(timeout=0.1)
+
+    second = threading.Thread(target=worker, args=(2,))
+    third = threading.Thread(target=worker, args=(3,))
+    second.start()
+    third.start()
+    assert entered[1].wait(timeout=5)
+    assert not entered[2].is_set()
+    assert not entered[3].is_set()
+    release[1].set()
+    assert entered[2].wait(timeout=5)
+    assert not entered[3].is_set()
+    release[2].set()
+    assert entered[3].wait(timeout=5)
+    release[3].set()
+    for thread in (first, second, third):
+        thread.join(timeout=5)
+        assert not thread.is_alive()

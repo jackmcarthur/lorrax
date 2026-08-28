@@ -1754,6 +1754,7 @@ class _CoupledMu123ZqCoordinator:
 		self._arrived = set()
 		self._z_stack = None
 		self._turn = 1
+		self._final_ready = set()
 		self._final_turn = 1
 
 	def _raise_if_aborted(self):
@@ -1852,8 +1853,14 @@ class _CoupledMu123ZqCoordinator:
 			self._cv.notify_all()
 
 	def wait_finalize(self, mu):
+		mu = int(mu)
 		with self._cv:
-			while self._final_turn != int(mu):
+			if mu not in self._CHANNELS or mu in self._final_ready:
+				raise ValueError(f"invalid/duplicate final-ready channel mu={mu}")
+			self._final_ready.add(mu)
+			self._cv.notify_all()
+			while (self._final_ready != set(self._CHANNELS)
+			       or self._final_turn != mu):
 				self._raise_if_aborted()
 				self._cv.wait()
 			self._raise_if_aborted()
