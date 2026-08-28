@@ -240,6 +240,133 @@ def test_the_serial_tier_refuses_above_one_process(tmp_path, monkeypatch):
     assert "phdf5" in msg, msg
 
 
+class _FakeGpuDevice:
+    """A device that says ``gpu``, and nothing else.
+
+    ``ffi.gate.mesh_ffi_platform`` reads exactly one attribute
+    (``mesh.devices.flat[0].platform``), so this is the whole of what a GPU
+    looks like to the guard under test — and the guard is exercised through
+    the REAL helper and the REAL predicate rather than a stub of either.
+    """
+
+    platform = "gpu"
+
+    def __repr__(self) -> str:                          # pragma: no cover
+        return "<FakeGpuDevice>"
+
+
+class _FakeGpuMesh:
+    """A 2x2 mesh of them: single-process, multi-GPU — the deleted arm."""
+
+    def __init__(self) -> None:
+        self.devices = np.empty((2, 2), dtype=object)
+        for i in range(2):
+            for j in range(2):
+                self.devices[i, j] = _FakeGpuDevice()
+        self.axis_names = ("x", "y")
+        self.shape = {"x": 2, "y": 2}
+
+
+@pytest.mark.mesh(4)
+def test_the_serial_tier_refuses_a_single_process_multi_gpu_mesh(tmp_path):
+    """The geometry TASTE rule 10 calls DELETED must not come back here.
+
+    ``mesh_is_emulated`` reads only ``devices.size`` against
+    ``process_count()`` and is platform-BLIND — asserted below on the very
+    object, so this is not a claim about the predicate but an observation of
+    it.  A single-process multi-GPU mesh therefore satisfies it: that is
+    ``resolve_mesh()`` on a 4-GPU box, and the mesh harness child that hands
+    one process all four GPUs.
+
+    ON BASE that geometry hit ``ffi.io.open_file``'s ``p*q !=
+    process_count()`` and refused.  Adding a serial tier keyed on the
+    predicate alone would have re-opened it through a route nobody chose —
+    a deleted arm DOWNGRADING instead of refusing, which is the one thing
+    the rule forbids.  The guard is what keeps the tier CPU-emulation-only,
+    and this cell is its false case: without it, the construction below
+    succeeds and writes an HDF5 file.
+    """
+    from ffi.gate import mesh_ffi_platform
+
+    fake = _FakeGpuMesh()
+    # The two premises, observed rather than asserted in prose.
+    assert mesh_is_emulated(fake), "the predicate is platform-blind"
+    assert mesh_ffi_platform(fake) == "CUDA"
+
+    path = tmp_path / "gpu_emulated.h5"
+    with pytest.raises(RuntimeError) as ei:
+        _SerialBackend(str(path), mesh=fake, mode="w")
+    msg = str(ei.value)
+    assert "multi-GPU" in msg, msg
+    assert "src/ffi/io.py" in msg, msg
+    # ...and it refused BEFORE making an inode, like the phdf5 door above.
+    assert not path.exists()
+
+
+@pytest.mark.mesh(4)
+@pytest.mark.parametrize("mode", ["r+", "x", "w-", "bogus"])
+def test_the_serial_tier_refuses_a_mode_outside_w_a_r(tmp_path, mode):
+    """The mode vocabulary is the TRANSPORT's, not h5py's.
+
+    ``ffi.io.open_file`` refuses anything outside ``w``/``a``/``r``
+    (``src/ffi/io.py``), and h5py accepts six modes.  Left to h5py, an
+    emulated run would ACCEPT ``r+``, and would accept ``x`` and ``w-``
+    while creating a file that skipped ``_replace_inode_for_write`` — so
+    ``mode`` would mean different things depending on the device geometry,
+    and only the emulated tier would say so in h5py's words, naming modes
+    SlabIO does not have.
+
+    ``bogus`` is in the list on purpose: it used to refuse too, but with
+    h5py's text ("Invalid mode; must be one of r, r+, w, w-, x, a"), which
+    advertises the wrong vocabulary and no LORRAX rule.  All four must now
+    refuse the same way, from the same door.
+    """
+    mesh = _mesh(2, 2)
+    path = tmp_path / f"mode_{mode.replace('+', 'p').replace('-', 'm')}.h5"
+    with pytest.raises(ValueError) as ei:
+        _SerialBackend(str(path), mesh=mesh, mode=mode)
+    msg = str(ei.value)
+    assert "mode must be w/a/r" in msg, msg
+    assert repr(mode) in msg, msg
+    assert not path.exists(), "a refused mode must not have made an inode"
+
+
+@pytest.mark.mesh(4)
+def test_a_close_that_raises_still_releases_the_owner_claim(tmp_path):
+    """``note_close`` in a ``finally``, not after a close that returned.
+
+    A leaked claim is worse than the failed close that caused it: the path
+    stays owned in ``file_io.hdf5_owner`` for the life of the process, and
+    the next open of it — by either library — is refused by a claim whose
+    owner is gone.  The FFI tier releases unconditionally and documents
+    why; a tier whose thesis is contract-parity with it must not diverge.
+
+    Reached by breaking the handle, which is the only input the branch has.
+    THE FALSE CASE: with the release outside the ``finally`` the assertion
+    below fails, because ``_owner_token`` is still an int.
+    """
+    from file_io import hdf5_owner
+
+    mesh = _mesh(2, 2)
+    path = tmp_path / "raises.h5"
+    be = _SerialBackend(str(path), mesh=mesh, mode="w")
+    assert be._owner_token is not None
+
+    class _Boom:
+        def close(self):
+            raise OSError("H5Fclose blew up")
+
+    be._h5 = _Boom()
+    with pytest.raises(OSError):
+        be.close()
+    assert be._owner_token is None, "the hdf5_owner claim leaked"
+    # The registry agrees, which is the fact that matters: a fresh open of
+    # the same path must not be refused by the dead handle's claim.
+    tok = hdf5_owner.note_open(str(path), hdf5_owner.STACK_H5PY, "r",
+                               where="test: the path must be re-openable")
+    hdf5_owner.note_close(str(path), tok)
+
+
 # ---------------------------------------------------------------------------
 # Round trips, judged against plain h5py
 # ---------------------------------------------------------------------------
@@ -291,6 +418,103 @@ def test_a_replicated_write_lands_once_and_correctly(tmp_path):
 
     with h5py.File(path, "r") as f:
         assert np.array_equal(np.asarray(f["R"][:]), host)
+
+
+def _counting_dataset_io(monkeypatch):
+    """Count real ``h5py.Dataset`` element writes and reads.
+
+    Counted at h5py's own door rather than at ``_SerialBackend``'s ``seen``
+    set: the ``seen`` set is the mechanism under test, and a counter built
+    on it would agree with it by construction.
+    """
+    counts = {"write": 0, "read": 0}
+    real_set = h5py.Dataset.__setitem__
+    real_get = h5py.Dataset.__getitem__
+
+    def counting_set(self, key, value):
+        counts["write"] += 1
+        return real_set(self, key, value)
+
+    def counting_get(self, key):
+        counts["read"] += 1
+        return real_get(self, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__setitem__", counting_set)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", counting_get)
+    return counts
+
+
+@pytest.mark.mesh(4)
+def test_a_replicated_write_costs_exactly_ONE_h5py_write(tmp_path,
+                                                         monkeypatch):
+    """The de-duplication, COUNTED — the cell above cannot see it.
+
+    ``test_a_replicated_write_lands_once_and_correctly`` asserts only that
+    the bytes are right, and four identical writes of identical bytes leave
+    a file indistinguishable from one.  FALSIFIED: disabling the ``seen``
+    check in ``_SerialBackend.write_slab`` left that cell — and the whole
+    file — green.  This one counts, so it goes red at 4.
+
+    Four devices, a fully replicated spec, one dataset: one ``__setitem__``.
+    """
+    mesh = _mesh(2, 2)
+    path = tmp_path / "dedup_w.h5"
+    host = np.arange(4 * 3, dtype=np.float64).reshape(4, 3)
+    A = _sharded(host, mesh, P(None, None))
+
+    counts = _counting_dataset_io(monkeypatch)
+    with SlabIO(path, mode="w", mesh=mesh) as io:
+        io.create_dataset("R", shape=host.shape, dtype=np.float64)
+        io.write_slab("R", A)
+    assert counts["write"] == 1, (
+        f"a replicated 4-device write issued {counts['write']} h5py writes; "
+        f"the replica de-duplication by shard index is not firing")
+
+    with h5py.File(path, "r") as f:                     # still correct
+        assert np.array_equal(np.asarray(f["R"][:]), host)
+
+
+@pytest.mark.mesh(4)
+@pytest.mark.parametrize("spec, want_reads", [
+    (P(None, None), 1),        # jax itself calls the callback once here
+    (P("x", None), 2),         # two distinct row blocks, two devices each
+    (P(None, "y"), 2),         # ...and the ALTERNATING order, which a
+                               #    one-entry memo would miss entirely
+    (P("x", "y"), 4),          # four distinct shards — the floor, no cache
+])
+def test_a_sharded_read_issues_one_h5py_read_per_DISTINCT_shard(
+        tmp_path, monkeypatch, spec, want_reads):
+    """``read_slab``'s replica memo, counted.  It had no cell at all.
+
+    The memo exists so a 4-device REPLICATED read is one ``H5Dread`` and
+    not four.  That is invisible to every other cell in this file, all of
+    which judge values — and identical bytes read four times are the same
+    bytes.  The three rows are the whole trade: the floor is one read per
+    distinct shard, and the memo reaches it.
+
+    ``P(None,'y')`` IS THE ROW THAT EARNS ITS PLACE: its indices arrive
+    alternating (col0, col1, col0, col1), so a cache holding only the last
+    block hits zero times and reads 4.  A one-entry memo was written here
+    first and this row is what caught it; without it the suite would have
+    accepted a 2x regression in read count on half the partially-replicated
+    specs.
+
+    THE FALSE CASE for the replicated rows is a cache that never hits (4
+    reads); for the fully sharded row it is a cache that hits when it must
+    not (a wrong-shard read, which the value assertion below then catches).
+    """
+    mesh = _mesh(2, 2)
+    path = tmp_path / "dedup_r.h5"
+    host = np.arange(4 * 4, dtype=np.float64).reshape(4, 4)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("Z", data=host)
+
+    counts = _counting_dataset_io(monkeypatch)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        got = io.read_slab("Z", partition_spec=spec)
+    assert counts["read"] == want_reads, (
+        f"{spec} issued {counts['read']} h5py reads, expected {want_reads}")
+    assert np.array_equal(np.asarray(jax.device_get(got)), host)
 
 
 @pytest.mark.mesh(4)
@@ -567,7 +791,8 @@ def test_read_slabs_at_the_production_geometry(tmp_path):
 
 @pytest.mark.mesh(4)
 def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
-                                                              monkeypatch):
+                                                              monkeypatch,
+                                                              request):
     """``stack=h5py``, never ``stack=ffi``, on an emulated open.
 
     The journal's whole subject is WHICH HDF5 LIBRARY INSTANCE touched a
@@ -582,8 +807,12 @@ def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
     attribute is what the fix changed, so asserting on it would test the
     fix against itself.
     """
+    from file_io import h5_journal as J
+
     monkeypatch.setenv("LORRAX_H5_JOURNAL", "1")
     monkeypatch.chdir(tmp_path)          # the journal lands in the cwd
+    J.reset_for_test()                   # ...and only if no stream is cached
+    request.addfinalizer(J.reset_for_test)
     mesh = _mesh(2, 2)
     with SlabIO(tmp_path / "j.h5", mode="w", mesh=mesh) as io:
         io.create_dataset("A", shape=(4, 4), dtype=np.float64)
@@ -597,3 +826,106 @@ def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
     assert all("stack=h5py" in ln for ln in lines), (
         "an emulated-tier operation was journaled under the FFI library:\n"
         + "\n".join(ln for ln in lines if "stack=h5py" not in ln))
+
+
+@pytest.mark.mesh(4)
+def test_one_slab_write_is_ONE_journal_line_on_this_tier_too(tmp_path,
+                                                             monkeypatch,
+                                                             request):
+    """``docs/architecture/slab_io.md``: "one slab read or write is **one**
+    line".  The serial tier emitted TWO.
+
+    The seam (``SlabIO.write_slab``) opens an ``op_scope`` for every op on
+    both tiers; ``_SerialBackend`` opened a second one of its own for
+    ``write``, ``read_slab`` and ``read_slabs``, so the same op appeared
+    twice — once with ``off=-`` from the door and once with ``off=(0,0)``
+    from the backend.  The FFI backend journals no write or read of its
+    own, which is what makes the two tiers' logs comparable line for line.
+
+    Counted from the FILE, and counted for BOTH directions.  The false case
+    is the backend re-opening its own scope: the counts go to 2.
+    """
+    from file_io import h5_journal as J
+
+    monkeypatch.setenv("LORRAX_H5_JOURNAL", "1")
+    monkeypatch.chdir(tmp_path)
+    # The journal opens its stream ONCE per process and caches the path, so a
+    # cell that runs after another journal cell would append to that one's
+    # tmp_path and read an empty log here.  Reset both ways round.
+    J.reset_for_test()
+    request.addfinalizer(J.reset_for_test)
+    mesh = _mesh(2, 2)
+    with SlabIO(tmp_path / "lines.h5", mode="w", mesh=mesh) as io:
+        io.create_dataset("A", shape=(4, 4), dtype=np.float64)
+        io.write_slab("A", _sharded(np.ones((4, 4)), mesh, P("x", "y")))
+    with SlabIO(tmp_path / "lines.h5", mode="r", mesh=mesh) as io:
+        io.read_slab("A", partition_spec=P("x", "y"))
+
+    lines = [ln for log in sorted(tmp_path.glob("h5_journal.rank*.log"))
+             for ln in log.read_text().splitlines() if "/lines.h5" in ln]
+    assert lines, "journal has no lines for the file under test"
+    n_write = sum(1 for ln in lines if "op=write" in ln)
+    n_read = sum(1 for ln in lines if "op=read" in ln)
+    assert n_write == 1, (
+        f"one write_slab produced {n_write} op=write lines:\n"
+        + "\n".join(ln for ln in lines if "op=write" in ln))
+    assert n_read == 1, (
+        f"one read_slab produced {n_read} op=read lines:\n"
+        + "\n".join(ln for ln in lines if "op=read" in ln))
+
+
+@pytest.mark.mesh(4)
+def test_the_journal_receipt_survives_the_production_stdout_sink(tmp_path,
+                                                                 monkeypatch,
+                                                                 request):
+    """The route receipt a PRODUCTION parity claim can actually quote.
+
+    ``test_the_receipt_is_discarded_by_the_production_stdout_sink`` pins the
+    bad news: the printed ``transport = serial`` line does not reach a
+    production log.  This is the good news, and it has to be executed for
+    the same reason that one did — the tier's docstring now points a reader
+    at this receipt, so "the journal survives the sink" is a claim about
+    where output lands, and those are claims that get run.
+
+    The journal writes to a FILE through a stream ``file_io.h5_journal``
+    owns; ``ProductionStdout`` replaces ``sys.stdout`` only.  So with
+    ``LORRAX_H5_JOURNAL=1`` the ``stack=h5py op=open`` line is there even
+    on a run whose printed receipt was swallowed — both facts asserted in
+    the same block, so they cannot drift apart.
+    """
+    import io as _io
+    import sys
+
+    import file_io._slab_io_serial as serial
+    from file_io import h5_journal as J
+    from runtime.production_stream import ProductionStdout
+
+    monkeypatch.setenv("LORRAX_H5_JOURNAL", "1")
+    monkeypatch.chdir(tmp_path)
+    J.reset_for_test()                       # see the cell above for why
+    request.addfinalizer(J.reset_for_test)
+    mesh = _mesh(2, 2)
+    serial._ANNOUNCED.clear()
+
+    cap = _io.StringIO()
+    real, sys.stdout = sys.stdout, cap
+    ps = ProductionStdout(debug=False, rank=0)
+    ps.install()
+    try:
+        with SlabIO(tmp_path / "prod.h5", mode="w", mesh=mesh) as io:
+            io.create_dataset("A", shape=(4, 4), dtype=np.float64)
+    finally:
+        ps.close()
+        sys.stdout = real
+
+    assert "transport = serial" not in cap.getvalue(), (
+        "the printed receipt reached production stdout; if that is now "
+        "intended, the tier's docstring table is the record to change")
+    lines = [ln for log in sorted(tmp_path.glob("h5_journal.rank*.log"))
+             for ln in log.read_text().splitlines() if "/prod.h5" in ln]
+    opens = [ln for ln in lines if "op=open" in ln and "stack=h5py" in ln]
+    assert opens, (
+        "no `stack=h5py op=open` line survived the production sink — the "
+        "tier's docstring names this as THE production-visible receipt, so "
+        "either the journal or that paragraph is now wrong:\n"
+        + "\n".join(lines))
