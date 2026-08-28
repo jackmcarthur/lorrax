@@ -14,60 +14,7 @@ Device meshes, sharding and placement live in :mod:`centroid.distribution`.
 """
 from __future__ import annotations
 
-# THE startup call (runtime module docstring): env defaults, fail-fast
-# hook, jax.distributed, GPU-or-CPU resolution, the run's clique-warmed
-# ('x','y') mesh, compile cache, rank-0 report.  MUST precede any import
-# that pulls in jax, so JAX_ENABLE_X64 etc. take effect.  This driver's
-# mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
-# floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
-# back this same startup mesh, not a second one.
-from runtime import (
-    debug_print,
-    debug_print_enabled,
-    initialize_communicator_stack,
-    rank0_print,
-)
-RUNTIME = initialize_communicator_stack(print_fn=debug_print)
-
-# Historical progress messages are forensic detail.  The one driver-wide
-# switch owns all of them; the concise production report uses rank0_print.
-print0 = debug_print
-
 import argparse
-import os
-import time
-
-import numpy as np
-
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
-from wfn_loader import WfnLoader                                    # noqa: E402
-from common import timing
-from common.collectives import process_rank
-from runtime.production_stream import ProductionStdout
-
-from . import distribution as dist
-from .charge_density import get_charge_density
-from .kmeans_isdf import (
-    BOHR_TO_ANG,
-    _decide_init_method,
-    _warn_dense_grid_regime,
-    weighted_kmeans_jax,
-    snap_centroids_to_grid,
-    ensure_unique_centroids,
-)
-from .production_output import (
-    format_centroid_header,
-    format_kmeans_report,
-    prune_band_ranges,
-)
-import symmetry_maps                                            # noqa: E402
-                                 # reachable because of the ONE service-path
-                                 # bootstrap at :42-45 above
-
 
 # ─────────────────────────────────────────────────────────────────────────
 # Arg parser
@@ -193,6 +140,66 @@ def build_parser() -> argparse.ArgumentParser:
                         "override (e.g. multiple current-mode runs at "
                         "different N_c).")
     return p
+
+
+if __name__ == "__main__":
+    # Argv is answered before any runtime exists — runtime/cli_seam.py.
+    from runtime.cli_seam import refuse_bad_argv_before_startup
+    refuse_bad_argv_before_startup(build_parser())
+
+
+# THE startup call (runtime module docstring): env defaults, fail-fast
+# hook, jax.distributed, GPU-or-CPU resolution, the run's clique-warmed
+# ('x','y') mesh, compile cache, rank-0 report.  MUST precede any import
+# that pulls in jax, so JAX_ENABLE_X64 etc. take effect.  This driver's
+# mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
+# floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
+# back this same startup mesh, not a second one.
+from runtime import (
+    debug_print,
+    debug_print_enabled,
+    initialize_communicator_stack,
+    rank0_print,
+)
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
+
+# Historical progress messages are forensic detail.  The one driver-wide
+# switch owns all of them; the concise production report uses rank0_print.
+print0 = debug_print
+
+import os
+import time
+
+import numpy as np
+
+from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+                                 # owner's workspace fix -- see _services.py)
+
+_services.ensure_on_path()
+
+from wfn_loader import WfnLoader                                    # noqa: E402
+from common import timing
+from common.collectives import process_rank
+from runtime.production_stream import ProductionStdout
+
+from . import distribution as dist
+from .charge_density import get_charge_density
+from .kmeans_isdf import (
+    BOHR_TO_ANG,
+    _decide_init_method,
+    _warn_dense_grid_regime,
+    weighted_kmeans_jax,
+    snap_centroids_to_grid,
+    ensure_unique_centroids,
+)
+from .production_output import (
+    format_centroid_header,
+    format_kmeans_report,
+    prune_band_ranges,
+)
+import symmetry_maps                                            # noqa: E402
+                                 # reachable because of the ONE service-path
+                                 # bootstrap above (the `_services` block)
 
 
 # ─────────────────────────────────────────────────────────────────────────

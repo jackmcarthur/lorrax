@@ -50,20 +50,7 @@ command, with this run's own paths in it, at the end of every run.
 """
 from __future__ import annotations
 
-from runtime import initialize_communicator_stack
-
-RUNTIME = initialize_communicator_stack()
-
-import argparse                                              # noqa: E402
-import os                                                    # noqa: E402
-
-from common import timing                                    # noqa: E402
-from common.collectives import barrier, process_rank         # noqa: E402
-from gw.downfold_config import (                             # noqa: E402
-    DOWNFOLD_DEFAULTS, DownfoldConfig,
-)
-
-__all__ = ["build_parser", "main"]
+import argparse
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +74,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-schema", action="store_true",
                    help="list every input-file key with its default and exit")
     return p
+
+
+if __name__ == "__main__":
+    # Argv is answered before any runtime exists — runtime/cli_seam.py.
+    from runtime.cli_seam import refuse_bad_argv_before_startup
+    refuse_bad_argv_before_startup(build_parser())
+
+from runtime import initialize_communicator_stack
+
+RUNTIME = initialize_communicator_stack()
+
+import os                                                    # noqa: E402
+
+from common import timing                                    # noqa: E402
+from common.collectives import barrier, process_rank         # noqa: E402
+from gw.downfold_config import (                             # noqa: E402
+    DOWNFOLD_DEFAULTS, DownfoldConfig,
+)
+
+__all__ = ["build_parser", "main"]
 
 
 def _run_dir_of(h5_path: str) -> str:

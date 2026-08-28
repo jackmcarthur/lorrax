@@ -59,7 +59,62 @@ Usage:
   python -m gw.kin_ion_io -i cohsex.in -o kin_ion.h5 [-n NB] [--no-hartree]
 """
 
+import argparse
 import os
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    """The CLI's argument parser.
+
+    Split out of :func:`main` so the V_H defaults are pinnable by a unit
+    test without running the generator, and kept ABOVE the startup call
+    so ``--help`` can reach it without one (:mod:`runtime.cli_seam`).
+    """
+    argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
+    argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
+    argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
+    argp.add_argument("--report-file", default=None,
+                      help="human-readable report (default: kin_ion.out beside output)")
+    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
+    argp.add_argument("--sys_dim", type=int, default=None,
+                      help="system dimensionality: 0, 2, or 3.  Must AGREE with "
+                           "the input file when the file specifies it.")
+    argp.add_argument("--pseudo_dir", default=None,
+                      help="directory containing *.upf files (default: input file dir)")
+    argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
+                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
+                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
+                           "itself stays pristine T+V_loc+V_NL)")
+    argp.add_argument("--no-hartree", dest="hartree", action="store_false",
+                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
+                           "the GW run must supply V_H from the ISDF V_q[0] tile")
+    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
+                      default=False,
+                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
+                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
+                           "reproducing old artifacts — the stored-array default is "
+                           "strictly better (kin_ion stays reusable, QSGW gets the "
+                           "full matrix, and the VH column stops reading 0.000).")
+    argp.add_argument("--soc", choices=("auto", "true", "false"), default="auto",
+                      help="which V_NL projectors to build from a FULLY-RELATIVISTIC "
+                           "pseudopotential.  'true' = j-resolved (spin-orbit ON, the "
+                           "historical behaviour, correct for lspinorb=.true. "
+                           "wavefunctions).  'false' = j-averaged scalar-relativistic "
+                           "V_NL ⊗ 1_spin, reproducing QE average_pp — correct for "
+                           "noncolin=.true., lspinorb=.false. wavefunctions.  'auto' "
+                           "(default) reads QE's <spinorbit> when the structure came "
+                           "from a .save and otherwise ANNOUNCES that it is assuming "
+                           "spin-orbit.  nspinor=2 means noncollinear, which does NOT "
+                           "imply spin-orbit; a BerkeleyGW WFN.h5 records nspinor and "
+                           "nothing else, so on that input this cannot be inferred.")
+    return argp
+
+
+if __name__ == "__main__":
+    # Argv is answered before any runtime exists — runtime/cli_seam.py.
+    from runtime.cli_seam import refuse_bad_argv_before_startup
+    refuse_bad_argv_before_startup(build_argparser())
+
 
 # ---- join the distributed world BEFORE anything touches XLA ------------
 # THE startup call (runtime module docstring): env defaults, fail-fast
@@ -73,8 +128,6 @@ import os
 from runtime import (debug_print, debug_print_enabled,         # noqa: E402
                      initialize_communicator_stack, rank0_print)
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
-
-import argparse                                               # noqa: E402
 
 import numpy as np
 import jax.numpy as jnp
@@ -917,52 +970,6 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         if k_set == "ibz":
             return H_host
         return broadcast_ibz_to_full_bz(H_host, sym)
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    """The CLI's argument parser.
-
-    Split out of :func:`main` so the V_H defaults are pinnable by a unit
-    test without running the generator.
-    """
-    argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
-    argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
-    argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
-    argp.add_argument("--report-file", default=None,
-                      help="human-readable report (default: kin_ion.out beside output)")
-    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
-    argp.add_argument("--sys_dim", type=int, default=None,
-                      help="system dimensionality: 0, 2, or 3.  Must AGREE with "
-                           "the input file when the file specifies it.")
-    argp.add_argument("--pseudo_dir", default=None,
-                      help="directory containing *.upf files (default: input file dir)")
-    argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
-                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
-                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
-                           "itself stays pristine T+V_loc+V_NL)")
-    argp.add_argument("--no-hartree", dest="hartree", action="store_false",
-                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
-                           "the GW run must supply V_H from the ISDF V_q[0] tile")
-    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
-                      default=False,
-                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
-                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
-                           "reproducing old artifacts — the stored-array default is "
-                           "strictly better (kin_ion stays reusable, QSGW gets the "
-                           "full matrix, and the VH column stops reading 0.000).")
-    argp.add_argument("--soc", choices=("auto", "true", "false"), default="auto",
-                      help="which V_NL projectors to build from a FULLY-RELATIVISTIC "
-                           "pseudopotential.  'true' = j-resolved (spin-orbit ON, the "
-                           "historical behaviour, correct for lspinorb=.true. "
-                           "wavefunctions).  'false' = j-averaged scalar-relativistic "
-                           "V_NL ⊗ 1_spin, reproducing QE average_pp — correct for "
-                           "noncolin=.true., lspinorb=.false. wavefunctions.  'auto' "
-                           "(default) reads QE's <spinorbit> when the structure came "
-                           "from a .save and otherwise ANNOUNCES that it is assuming "
-                           "spin-orbit.  nspinor=2 means noncollinear, which does NOT "
-                           "imply spin-orbit; a BerkeleyGW WFN.h5 records nspinor and "
-                           "nothing else, so on that input this cannot be inferred.")
-    return argp
 
 
 def main(argv=None):
