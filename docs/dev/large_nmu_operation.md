@@ -169,9 +169,10 @@ until fixed.  File:line references as of this page's commit.
 7. **eigenvalue vectors** — `lambda (nq, mu)` replicated in the
    distributed zeta tier (ScaLAPACK's own contract); `Sigma_c(omega,k,m,n)`
    cube replicated under the default `sigma_omega_layout = replicated`.
-   `sharded` removes that residency for every `qp_solver` (the
-   `self_consistent` refusal was deleted 2026-08-05); under SC the gather
-   it elides runs once per Sigma evaluation, not once per run.
+   `sharded` removes that residency (the layout's own `self_consistent`
+   refusal was deleted 2026-08-05; since 2026-08-27 `self_consistent`
+   itself is refused at driver entry beside a dynamic `compute_mode`, so
+   the cube pairs with `one_shot_dft` / `fixed_point` only).
 
    IF A CUBE ROTATION IS EVER ADDED (e.g. to put `sigma_mnk.h5` and
    `WFN_qp.h5` in one basis), the sharded layout does NOT force the cube

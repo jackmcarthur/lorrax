@@ -398,7 +398,7 @@ rest.
 
 | variable | value | purpose |
 |---|---|---|
-| `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW) |
+| `JAX_ENABLE_X64` | `1` | 64-bit precision (required for GW).  Runtime-owned: applied even when jax was imported first, and a resolved `False` refuses at startup (`LORRAX_ALLOW_X64_OFF=1` continues, announced uncertified) |
 | `JAX_PLATFORMS` | `cuda,cpu` (GPU) / `cpu` (CPU runs) | an explicit `cpu` also arms the CUDA-plugin-skip (below) |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
