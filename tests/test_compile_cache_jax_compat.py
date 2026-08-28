@@ -565,11 +565,11 @@ def test_capped_lru_write_cost_is_explicitly_unmeasured(monkeypatch,
                                                         tmp_path):
     """The delegated P=1 eviction path must not publish numeric zeros.
 
-    This is the ONE cell in this file that reaches jax's real
+    This is the one cell in this file that reaches jax's real
     ``lru_cache.LRUCache``, so it is the one cell with a dependency the rest
     of the module does not have.  See the guard below.
     """
-    # CANNOT-RUN, WHICH IS NOT A PASS.
+    # CANNOT-RUN, which is not a pass.
     #
     # Setting ``compilation_cache_max_size`` to a finite 1024 is exactly what
     # this test is about: a finite cap is what puts ``_AtomicLRUCache`` on its
@@ -583,12 +583,12 @@ def test_capped_lru_write_cost_is_explicitly_unmeasured(monkeypatch,
     # ``filelock`` is not a declared dependency of this tree (pyproject lists
     # h5py, jax, jaxlib, matplotlib, numpy, scipy, xmlschema, xsdata) and jax
     # itself treats it as optional, so on a bare environment this cell was a
-    # deterministic hard FAIL that said nothing whatever about the code under
+    # deterministic hard fail that said nothing whatever about the code under
     # test — the kind of standing red everybody learns to scroll past, which
     # is how a real regression gets to hide behind it.
     #
-    # Skipping is therefore the honest report and NOT a pass: a skip here
-    # means the delegated-eviction receipt went UNVERIFIED on this machine.
+    # Skipping is therefore the honest report and not a pass: a skip here
+    # means the delegated-eviction receipt went unverified on this machine.
     # The fix is to install ``filelock`` and re-run, not to read the green.
     pytest.importorskip(
         "filelock",

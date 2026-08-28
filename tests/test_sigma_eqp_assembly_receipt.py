@@ -65,10 +65,10 @@ def _assembly(h, x, c=None, *, curve=None, source="stored"):
 
 def _append(path, h, x, c=None, *, rows=None, source="stored",
             policy="bgw_average"):
-    """Append with the FILE-wedge rows the call site resolved.
+    """Append with the file-wedge rows the call site resolved.
 
     ``rows`` defaults to ``arange(nk)`` because the synthetic files here
-    store the full BZ, where the file wedge IS every row.  The cells that
+    store the full BZ, where the file wedge is every row.  The cells that
     exercise a real IBZ-stored cube pass their own.
     """
     assembly = _assembly(h, x, c, source=source)
@@ -336,7 +336,7 @@ GNPPM_NK_RED = 9
 
 
 def _gnppm_topology_cube(path, nb=2):
-    """A tiny cube carrying the REAL gnppm_debug star tables."""
+    """A tiny cube carrying the real gnppm_debug star tables."""
     with h5py.File(path, "w") as h5:
         h5.create_dataset("omega_ev", data=OMEGA)
         ds = h5.create_dataset(
