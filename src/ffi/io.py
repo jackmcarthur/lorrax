@@ -760,7 +760,7 @@ def _read_kchunk_union_sharded_cached(
 Preferred public entry point for gw_jax / isdf / etc. is
 :mod:`file_io.slab_io`, whose collective transport is this one — the only
 other backend it has is ``file_io._slab_io_serial``, which serves the
-EMULATED-mesh geometry that ``open_file`` below refuses (P=1, D>1) and is
+emulated-mesh geometry that ``open_file`` below refuses (P=1, D>1) and is
 chosen from a mesh predicate rather than from any caller-facing dial.  The
 sentence that used to sit here still offered a choice between "the
 allgather-and-rank-0-h5py backend (default)" and the FFI backend; both

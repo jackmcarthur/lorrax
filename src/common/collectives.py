@@ -371,38 +371,38 @@ def mesh_is_emulated(mesh) -> bool:
     ``--xla_force_host_platform_device_count=N`` produces and what a real
     ``srun -n N`` never does.
 
-    THE PREDICATE READS ``process_count()``, NOT THE XLA FLAG, and that is
+    The predicate reads ``process_count()``, not the XLA flag, and that is
     load-bearing in both directions: a real ``-n 4`` leg sets no flag and
     must never be labelled emulated, and a flagged single-process run must
     never be labelled real.  Same spelling as
     ``services/symmetry_maps/bench/bench_symmetry_maps.py``, whose ``emulated``
     column states it per row for the same reason.
 
-    IT IS ALSO PLATFORM-BLIND, WHICH IS THE THIRD DIRECTION AND THE ONE
-    THAT BITES.  It reads ``devices.size`` and ``process_count()`` and
-    nothing else, so it is equally true of a SINGLE-PROCESS MULTI-GPU mesh
+    It is also platform-blind, which is the third direction and the one
+    that bites.  It reads ``devices.size`` and ``process_count()`` and
+    nothing else, so it is equally true of a single-process multi-GPU mesh
     — ``resolve_mesh()`` on a 4-GPU box, or a test harness child handed all
     four GPUs.  That geometry is not an emulation; it is the arm deleted
     with the cuSOLVERMg backend (``src/bse/STATUS.md``), and every FFI
-    transport refuses it.  So a consumer that TIERS DOWN on this predicate
+    transport refuses it.  So a consumer that tiers down on this predicate
     must add its own platform guard, or it will serve a deleted geometry
     through a path nobody chose.  ``file_io._slab_io_serial`` does exactly
     that (``ffi.gate.mesh_ffi_platform(mesh) != "cpu"`` → refuse), and
     ``tests/test_slab_io_emulated_mesh.py`` has the false case.  Widening
     this predicate to read the platform itself would be wrong: "more
     devices than processes" is a true statement about that mesh, and the
-    consumers that only ASK the question (rather than tiering down on it)
+    consumers that only ask the question (rather than tiering down on it)
     want the honest answer.
 
-    WHAT IT IS FOR.  A mesh cell is a per-DEVICE thing; an MPI/NCCL/HDF5
-    context is a per-PROCESS thing.  Every transport that bootstraps one
+    What it is for.  A mesh cell is a per-device thing; an MPI/NCCL/HDF5
+    context is a per-process thing.  Every transport that bootstraps one
     context per mesh cell (``ffi.io.open_file``, ``ffi.cublasmp.batched``,
     ``distrib_la._slate``) therefore requires ``p*q == process_count()`` and
-    REFUSES an emulated mesh — correctly, since all N devices would share
+    refuses an emulated mesh — correctly, since all N devices would share
     rank 0's hyperslab or communicator.  A component with a serial tier
     (``wfn_loader``'s ``eager``, ``file_io._slab_io_serial``) asks this
     instead, and selects the tier that needs no per-cell context.  It is a
-    tier PREDICATE, never a fallback trigger: nothing may call it after a
+    tier predicate, never a fallback trigger: nothing may call it after a
     transport has failed.
 
     ``False`` at ``P=1/D=1`` (nothing to emulate) and at every ``P>1``,

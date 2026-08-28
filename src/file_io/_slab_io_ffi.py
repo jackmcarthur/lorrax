@@ -968,20 +968,20 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
 
 
 # ``_local_shard_and_global_offset`` — "one addressable shard per process,
-# and here is its global offset" — was DELETED on 2026-08-27, for the same
+# and here is its global offset" — was deleted on 2026-08-27, for the same
 # reason as ``_shard_read_plan`` below and with the same evidence.  A
 # repo-wide grep at a28b9daa over src/ services/ tests/ tools/ config/
-# docs/ found the definition here and NO call site: the only live copy is
+# docs/ found the definition here and no call site: the only live copy is
 # ``wfn_loader._collectives._local_shard_and_global_offset``, whose own
 # docstring records that it was ported from this file verbatim, and which
 # ``wfn_loader.loader`` does call.
 #
 # It had to go now rather than later because it was actively misleading
-# about THIS module.  Its refusal read "SlabIO expects 1 addressable shard
+# about this module.  Its refusal read "SlabIO expects 1 addressable shard
 # per process; got N ... Did you set
 # --xla_force_host_platform_device_count > 1 on a multi-process run?",
 # sitting in the transport that ``file_io._slab_io_serial`` extends —
-# where four addressable shards in one process is now the SUPPORTED
+# where four addressable shards in one process is now the supported
 # geometry and is exactly what the serial tier iterates.  A dead helper
 # stating a constraint the live code does not have is worse than no
 # helper: the next reader has to prove it is dead before trusting the
@@ -1409,7 +1409,7 @@ class _DatasetGeometry:
     collectively on every rank, which is where it has to be — a Python
     twin can only see the ranks that reach it, and the two could disagree.
 
-    THE EMULATED TIER HAS ITS OWN PYTHON TWIN OF THAT RULE, and it is not
+    The emulated tier has its own Python twin of that rule, and it is not
     the one deleted above: ``_slab_io_serial._SerialBackend.create_dataset``
     restates reuse-or-refuse in Python because it never calls
     ``lrx_phdf5_ensure_dataset`` at all — there is no C handler on that
@@ -1419,7 +1419,7 @@ class _DatasetGeometry:
     without a difference.  If the two wordings ever have to say the same
     thing, they are ``_slab_io_ffi``'s C call and that method.
 
-    THE GEOMETRY AND NORMALISATION HELPERS BELOW ARE SHARED, not private
+    The geometry and normalisation helpers below are shared, not private
     to this transport: ``_slab_io_serial`` imports ``_DatasetGeometry``,
     ``_normalize_slab_request``, ``_normalize_valid_shape``,
     ``_normalize_window_tables``, ``_replace_inode_for_write``,
@@ -1674,7 +1674,7 @@ def _apply_dataset_attrs(h5, pending) -> None:
 class _FfiBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO backend."""
 
-    #: WHICH HDF5 LIBRARY INSTANCE this backend's operations go through, in
+    #: Which HDF5 library instance this backend's operations go through, in
     #: the vocabulary ``file_io.hdf5_owner`` and ``file_io.h5_journal``
     #: share.  ``file_io.slab_io`` stamps its own journal lines with this
     #: rather than with a module constant of its own — a door that names a

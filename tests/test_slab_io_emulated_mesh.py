@@ -1,20 +1,20 @@
-"""SlabIO on an EMULATED mesh: four devices, one process, no MPI.
+"""SlabIO on an emulated mesh: four devices, one process, no MPI.
 
 Layer L-b for the sharded-HDF5 transport, in the sense
 ``services/distrib_la/tests/test_distrib_la_emulated_mesh.py`` and
 ``services/wfn_loader/tests/test_wfn_loader_emulated_mesh.py`` already use:
-four host devices in ONE process, a real 2x2 ``('x','y')`` mesh, real
+four host devices in one process, a real 2x2 ``('x','y')`` mesh, real
 sharded arrays, real HDF5 files.
 
-WHAT IS UNDER TEST is ``file_io._slab_io_serial._SerialBackend``, the tier
+Under test is ``file_io._slab_io_serial._SerialBackend``, the tier
 ``file_io.slab_io.SlabIO`` selects when ``common.collectives.
 mesh_is_emulated(mesh)`` holds.  The tier exists because the phdf5
-transport CANNOT serve this geometry: its C++ handler derives every
-hyperslab from ``ctx->rank``, a per-PROCESS scalar, so four devices in one
+transport cannot serve this geometry: its C++ handler derives every
+hyperslab from ``ctx->rank``, a per-process scalar, so four devices in one
 process would all read and write shard (0, 0).  ``ffi.io.open_file``
 refuses ``p*q != jax.process_count()`` for exactly that reason.
 
-THE FIRST CELL IS THE RED TWIN AND IT IS THE POINT OF THE FILE.  A serial
+The first cell is the red twin and it is the point of the file.  A serial
 tier added beside a refusal is indistinguishable, from a green suite
 alone, from a refusal that was quietly weakened —
 ``test_the_phdf5_transport_still_refuses_an_emulated_mesh`` is the cell
@@ -22,13 +22,13 @@ that tells them apart, and it fails the moment someone "fixes"
 ``ffi/io.py`` instead.  The two doors are then shown to be different doors
 by ``test_slab_io_selects_the_serial_tier_on_an_emulated_mesh``.
 
-EVERY ROUND TRIP IS JUDGED AGAINST PLAIN h5py, not against another SlabIO
+Every round trip is judged against plain h5py, not against another SlabIO
 call: a transport compared only with itself agrees with its own bugs.  The
-h5py handle is always opened AFTER SlabIO has closed, which is the
+h5py handle is always opened after SlabIO has closed, which is the
 one-owner ordering ``file_io.hdf5_owner`` enforces
 (``docs/architecture/slab_io.md#one-owner``).
 
-WHAT THIS FILE CANNOT SEE.  It is single-process by construction, so it
+What this file cannot see.  It is single-process by construction, so it
 says nothing about the collective transport's own correctness, nothing
 about P>1, and nothing about performance — an emulated run serialises the
 process-parallel k sweep (``common.collectives.local_share``) onto one
@@ -53,11 +53,11 @@ from file_io._slab_io_serial import _SerialBackend       # noqa: E402
 
 
 def _mesh(px: int = 2, py: int = 2) -> Mesh:
-    """A ``px x py`` mesh of HOST devices, or a skip.
+    """A ``px x py`` mesh of host devices, or a skip.
 
     ``jax.devices("cpu")`` explicitly and not ``jax.devices()``: the
     emulation knob is ``--xla_force_host_platform_device_count``, which
-    creates HOST devices, so on a box whose default backend is CUDA the
+    creates host devices, so on a box whose default backend is CUDA the
     default device list answers 1 and these cells would skip on the very
     machine where the flag worked (the reasoning
     ``test_distrib_la_emulated_mesh._mesh`` records).
@@ -86,15 +86,15 @@ def _sharded(host: np.ndarray, mesh: Mesh, spec: P):
 def test_the_phdf5_transport_still_refuses_an_emulated_mesh(monkeypatch, tmp_path):
     """``ffi.io.open_file`` refuses ``p*q != process_count()``, observed.
 
-    WITHOUT THIS CELL the serial tier is unfalsifiable: a suite that only
+    Without this cell the serial tier is unfalsifiable: a suite that only
     shows SlabIO working on an emulated mesh looks identical whether the
     tier was added beside the refusal or the refusal was deleted.
 
-    ``ffi_loader.get_lib`` is stubbed because it runs FIRST
+    ``ffi_loader.get_lib`` is stubbed because it runs first
     (``ffi/io.py``, the line above the check), so on a machine with no
     ``.so`` the library error would arrive instead and this cell would pass
     for the wrong reason — which is a cell that cannot fail.  The stub is
-    the library-PRESENCE probe only; the refusal under test is untouched.
+    the library-presence probe only; the refusal under test is untouched.
     """
     from ffi import io as ffi_io
     from ffi.common import ffi_loader
@@ -116,7 +116,7 @@ def test_the_phdf5_transport_still_refuses_an_emulated_mesh(monkeypatch, tmp_pat
 
 @pytest.mark.mesh(4)
 def test_slab_io_selects_the_serial_tier_on_an_emulated_mesh(tmp_path):
-    """The door SlabIO walks through is the OTHER one — checked by type.
+    """The door SlabIO walks through is the other one — checked by type.
 
     Not by "it worked": the FFI tier could also work on some machine at
     some geometry, and then a silent relaxation of ``ffi/io.py`` would look
@@ -131,11 +131,11 @@ def test_slab_io_selects_the_serial_tier_on_an_emulated_mesh(tmp_path):
 
 @pytest.mark.mesh(4)
 def test_the_tier_announces_itself_in_the_log(tmp_path, capsys):
-    """The route receipt, observed in stdout rather than assumed.
+    """The transport line, observed in stdout rather than assumed.
 
     A parity claim made from an emulated arm has to quote the transport
     that moved its bytes (TASTE rule 15), and a reader must not have to
-    infer it from the device count.  The line is UNCONDITIONAL — this
+    infer it from the device count.  The line is unconditional — this
     tier prints on exactly the runs that did not go through collective
     MPI-IO, so it cannot become noise — and once per (devices, processes)
     geometry, not once per file.
@@ -157,13 +157,13 @@ def test_the_tier_announces_itself_in_the_log(tmp_path, capsys):
 
 @pytest.mark.mesh(4)
 def test_the_receipt_is_discarded_by_the_production_stdout_sink(tmp_path):
-    """…and a production DRIVER run does not show it.  Measured, not assumed.
+    """…and a production driver run does not show it.  Measured, not assumed.
 
     ``runtime.production_stream.ProductionStdout`` — installed by
     ``gw.gw_jax`` and every other driver — points ``sys.stdout`` at
     ``/dev/null`` so that "ordinary component chatter is discarded".  The
     announcement above is ordinary component chatter by that definition,
-    so it does NOT reach a production log; it reappears under
+    so it does not reach a production log; it reappears under
     ``LORRAX_DEBUG_PRINT=1`` (``debug=True`` here).
 
     This cell exists because the tier's first docstring claimed the line
@@ -206,7 +206,7 @@ def test_the_receipt_is_discarded_by_the_production_stdout_sink(tmp_path):
 
 @pytest.mark.mesh(4)
 def test_the_serial_tier_refuses_a_non_emulated_mesh(tmp_path):
-    """A 1x1 at one process is NOT emulated and must not reach this tier.
+    """A 1x1 at one process is not emulated and must not reach this tier.
 
     The tier is selected from a predicate, and the predicate is false here;
     a tier that accepted the geometry anyway would be a second transport
@@ -222,7 +222,7 @@ def test_the_serial_tier_refuses_a_non_emulated_mesh(tmp_path):
 
 @pytest.mark.mesh(4)
 def test_the_serial_tier_refuses_above_one_process(tmp_path, monkeypatch):
-    """P > 1 REFUSES rather than demoting — reached by stubbing the count.
+    """P > 1 refuses rather than demoting — reached by stubbing the count.
 
     This branch cannot be entered by a single-process suite, and a refusal
     no test can reach is a refusal nobody has read.  ``process_count`` is
@@ -246,7 +246,7 @@ class _FakeGpuDevice:
     ``ffi.gate.mesh_ffi_platform`` reads exactly one attribute
     (``mesh.devices.flat[0].platform``), so this is the whole of what a GPU
     looks like to the guard under test — and the guard is exercised through
-    the REAL helper and the REAL predicate rather than a stub of either.
+    the real helper and the real predicate rather than a stub of either.
     """
 
     platform = "gpu"
@@ -269,19 +269,19 @@ class _FakeGpuMesh:
 
 @pytest.mark.mesh(4)
 def test_the_serial_tier_refuses_a_single_process_multi_gpu_mesh(tmp_path):
-    """The geometry TASTE rule 10 calls DELETED must not come back here.
+    """The geometry TASTE rule 10 calls deleted must not come back here.
 
     ``mesh_is_emulated`` reads only ``devices.size`` against
-    ``process_count()`` and is platform-BLIND — asserted below on the very
+    ``process_count()`` and is platform-blind — asserted below on the very
     object, so this is not a claim about the predicate but an observation of
     it.  A single-process multi-GPU mesh therefore satisfies it: that is
     ``resolve_mesh()`` on a 4-GPU box, and the mesh harness child that hands
     one process all four GPUs.
 
-    ON BASE that geometry hit ``ffi.io.open_file``'s ``p*q !=
+    On base that geometry hit ``ffi.io.open_file``'s ``p*q !=
     process_count()`` and refused.  Adding a serial tier keyed on the
     predicate alone would have re-opened it through a route nobody chose —
-    a deleted arm DOWNGRADING instead of refusing, which is the one thing
+    a deleted arm downgrading instead of refusing, which is the one thing
     the rule forbids.  The guard is what keeps the tier CPU-emulation-only,
     and this cell is its false case: without it, the construction below
     succeeds and writes an HDF5 file.
@@ -299,18 +299,18 @@ def test_the_serial_tier_refuses_a_single_process_multi_gpu_mesh(tmp_path):
     msg = str(ei.value)
     assert "multi-GPU" in msg, msg
     assert "src/ffi/io.py" in msg, msg
-    # ...and it refused BEFORE making an inode, like the phdf5 door above.
+    # ...and it refused before making an inode, like the phdf5 door above.
     assert not path.exists()
 
 
 @pytest.mark.mesh(4)
 @pytest.mark.parametrize("mode", ["r+", "x", "w-", "bogus"])
 def test_the_serial_tier_refuses_a_mode_outside_w_a_r(tmp_path, mode):
-    """The mode vocabulary is the TRANSPORT's, not h5py's.
+    """The mode vocabulary is the transport's, not h5py's.
 
     ``ffi.io.open_file`` refuses anything outside ``w``/``a``/``r``
     (``src/ffi/io.py``), and h5py accepts six modes.  Left to h5py, an
-    emulated run would ACCEPT ``r+``, and would accept ``x`` and ``w-``
+    emulated run would accept ``r+``, and would accept ``x`` and ``w-``
     while creating a file that skipped ``_replace_inode_for_write`` — so
     ``mode`` would mean different things depending on the device geometry,
     and only the emulated tier would say so in h5py's words, naming modes
@@ -342,7 +342,7 @@ def test_a_close_that_raises_still_releases_the_owner_claim(tmp_path):
     why; a tier whose thesis is contract-parity with it must not diverge.
 
     Reached by breaking the handle, which is the only input the branch has.
-    THE FALSE CASE: with the release outside the ``finally`` the assertion
+    The false case: with the release outside the ``finally`` the assertion
     below fails, because ``_owner_token`` is still an int.
     """
     from file_io import hdf5_owner
@@ -447,11 +447,11 @@ def _counting_dataset_io(monkeypatch):
 @pytest.mark.mesh(4)
 def test_a_replicated_write_costs_exactly_ONE_h5py_write(tmp_path,
                                                          monkeypatch):
-    """The de-duplication, COUNTED — the cell above cannot see it.
+    """The de-duplication, counted — the cell above cannot see it.
 
     ``test_a_replicated_write_lands_once_and_correctly`` asserts only that
     the bytes are right, and four identical writes of identical bytes leave
-    a file indistinguishable from one.  FALSIFIED: disabling the ``seen``
+    a file indistinguishable from one.  Falsified: disabling the ``seen``
     check in ``_SerialBackend.write_slab`` left that cell — and the whole
     file — green.  This one counts, so it goes red at 4.
 
@@ -478,7 +478,7 @@ def test_a_replicated_write_costs_exactly_ONE_h5py_write(tmp_path,
 @pytest.mark.parametrize("spec, want_reads", [
     (P(None, None), 1),        # jax itself calls the callback once here
     (P("x", None), 2),         # two distinct row blocks, two devices each
-    (P(None, "y"), 2),         # ...and the ALTERNATING order, which a
+    (P(None, "y"), 2),         # ...and the alternating order, which a
                                #    one-entry memo would miss entirely
     (P("x", "y"), 4),          # four distinct shards — the floor, no cache
 ])
@@ -486,20 +486,20 @@ def test_a_sharded_read_issues_one_h5py_read_per_DISTINCT_shard(
         tmp_path, monkeypatch, spec, want_reads):
     """``read_slab``'s replica memo, counted.  It had no cell at all.
 
-    The memo exists so a 4-device REPLICATED read is one ``H5Dread`` and
+    The memo exists so a 4-device replicated read is one ``H5Dread`` and
     not four.  That is invisible to every other cell in this file, all of
     which judge values — and identical bytes read four times are the same
     bytes.  The three rows are the whole trade: the floor is one read per
     distinct shard, and the memo reaches it.
 
-    ``P(None,'y')`` IS THE ROW THAT EARNS ITS PLACE: its indices arrive
+    ``P(None,'y')`` is the row that earns its place: its indices arrive
     alternating (col0, col1, col0, col1), so a cache holding only the last
     block hits zero times and reads 4.  A one-entry memo was written here
     first and this row is what caught it; without it the suite would have
     accepted a 2x regression in read count on half the partially-replicated
     specs.
 
-    THE FALSE CASE for the replicated rows is a cache that never hits (4
+    The false case for the replicated rows is a cache that never hits (4
     reads); for the fully sharded row it is a cache that hits when it must
     not (a wrong-shard read, which the value assertion below then catches).
     """
@@ -610,7 +610,7 @@ def test_an_offset_read_of_a_sub_block_matches_h5py(tmp_path):
 
 @pytest.mark.mesh(4)
 def test_write_then_read_round_trips_through_the_same_handle(tmp_path):
-    """A read after a write on ONE handle sees the written bytes.
+    """A read after a write on one handle sees the written bytes.
 
     On the collective tier this is the read-after-write hazard the
     unconditional drain exists for; here the writes are synchronous, so the
@@ -694,7 +694,7 @@ def test_read_slabs_packs_n_windows_exactly_as_n_read_slab_calls_would(tmp_path)
 
     ``read_slabs`` exists on the collective tier because n per-window
     collectives cost 1.4 s of rendezvous at the production deck; the
-    serial tier owes the same ANSWER, not the same mechanism.  The
+    serial tier owes the same answer, not the same mechanism.  The
     fold-down is the reference precisely because it shares no code with
     the window loop under test.
     """
@@ -728,7 +728,7 @@ def test_read_slabs_packs_n_windows_exactly_as_n_read_slab_calls_would(tmp_path)
 
 @pytest.mark.mesh(4)
 def test_mode_w_replaces_the_file_rather_than_appending_to_it(tmp_path):
-    """``mode='w'`` is a REPLACE contract on both tiers."""
+    """``mode='w'`` is a replace contract on both tiers."""
     mesh = _mesh(2, 2)
     path = tmp_path / "replace.h5"
     with h5py.File(path, "w") as f:
@@ -750,7 +750,7 @@ def test_read_slabs_at_the_production_geometry(tmp_path):
     ``services/wfn_loader/src/wfn_loader/loader.py`` reads ``wfns/coeffs``
     as a 4-D slab with ``window_axis=2`` and
     ``partition_spec=P(('x','y'), None, None, None)`` — a window axis that
-    is NOT zero, and one dim sharded by BOTH mesh axes.  The cell above
+    is not zero, and one dim sharded by both mesh axes.  The cell above
     exercises neither: at ``window_axis=0`` the ``PartitionSpec`` split
     around the window is trivial, and a single-axis spec never reaches
     ``_sharding_to_axis_info``'s tuple branch.  A tier tested only on the
@@ -795,7 +795,7 @@ def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
                                                               request):
     """``stack=h5py``, never ``stack=ffi``, on an emulated open.
 
-    The journal's whole subject is WHICH HDF5 LIBRARY INSTANCE touched a
+    The journal's whole subject is which HDF5 library instance touched a
     file — it is read beside ``file_io.hdf5_owner``'s verdict, which is
     keyed on the same two names.  ``slab_io`` used to stamp a module
     constant ``_STACK = "ffi"``, true while there was one transport; the
@@ -803,7 +803,7 @@ def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
     ``stack=h5py op=open`` from the serial backend and ``stack=ffi
     op=open`` from the door, on the same file in the same millisecond.
 
-    Read out of the journal FILE rather than off the class attribute: the
+    Read out of the journal file rather than off the class attribute: the
     attribute is what the fix changed, so asserting on it would test the
     fix against itself.
     """
@@ -833,7 +833,7 @@ def test_one_slab_write_is_ONE_journal_line_on_this_tier_too(tmp_path,
                                                              monkeypatch,
                                                              request):
     """``docs/architecture/slab_io.md``: "one slab read or write is **one**
-    line".  The serial tier emitted TWO.
+    line".  The serial tier emitted two.
 
     The seam (``SlabIO.write_slab``) opens an ``op_scope`` for every op on
     both tiers; ``_SerialBackend`` opened a second one of its own for
@@ -842,14 +842,14 @@ def test_one_slab_write_is_ONE_journal_line_on_this_tier_too(tmp_path,
     from the backend.  The FFI backend journals no write or read of its
     own, which is what makes the two tiers' logs comparable line for line.
 
-    Counted from the FILE, and counted for BOTH directions.  The false case
+    Counted from the file, and counted for both directions.  The false case
     is the backend re-opening its own scope: the counts go to 2.
     """
     from file_io import h5_journal as J
 
     monkeypatch.setenv("LORRAX_H5_JOURNAL", "1")
     monkeypatch.chdir(tmp_path)
-    # The journal opens its stream ONCE per process and caches the path, so a
+    # The journal opens its stream once per process and caches the path, so a
     # cell that runs after another journal cell would append to that one's
     # tmp_path and read an empty log here.  Reset both ways round.
     J.reset_for_test()
@@ -878,7 +878,7 @@ def test_one_slab_write_is_ONE_journal_line_on_this_tier_too(tmp_path,
 def test_the_journal_receipt_survives_the_production_stdout_sink(tmp_path,
                                                                  monkeypatch,
                                                                  request):
-    """The route receipt a PRODUCTION parity claim can actually quote.
+    """The journal line a production parity claim can actually quote.
 
     ``test_the_receipt_is_discarded_by_the_production_stdout_sink`` pins the
     bad news: the printed ``transport = serial`` line does not reach a
@@ -887,7 +887,7 @@ def test_the_journal_receipt_survives_the_production_stdout_sink(tmp_path,
     at this receipt, so "the journal survives the sink" is a claim about
     where output lands, and those are claims that get run.
 
-    The journal writes to a FILE through a stream ``file_io.h5_journal``
+    The journal writes to a file through a stream ``file_io.h5_journal``
     owns; ``ProductionStdout`` replaces ``sys.stdout`` only.  So with
     ``LORRAX_H5_JOURNAL=1`` the ``stack=h5py op=open`` line is there even
     on a run whose printed receipt was swallowed — both facts asserted in

@@ -93,7 +93,7 @@ class FakeBackend:
     this suite is about stops being two-stack.
 
     For the same reason it declares ``journal_stack``: since 2026-08-27
-    ``SlabIO`` stamps its journal lines with the BACKEND's library name
+    ``SlabIO`` stamps its journal lines with the backend's library name
     rather than a module constant of its own (there are two backends now,
     and the constant became a lie for one of them).  A stand-in that
     omitted it would either crash the door or need a default there — and a
@@ -140,7 +140,7 @@ class Boom(RuntimeError):
 
 
 def _one_by_one_mesh():
-    """A REAL 1x1 ``('x','y')`` mesh, where an ``object()`` used to do.
+    """A real 1x1 ``('x','y')`` mesh, where an ``object()`` used to do.
 
     ``SlabIO`` reads the mesh at construction now — ``common.collectives.
     mesh_is_emulated`` picks the tier from it — so a sentinel is refused by

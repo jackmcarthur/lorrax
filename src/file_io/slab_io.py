@@ -44,12 +44,12 @@ There used to be three, selected by a ``slab_io`` deck key through an
   fallback — the correct response to a stale ``.so`` is a refusal naming
   it, which is the repo-wide contract (CLAIMS 81).  DELETED.
 
-THE ONE EXCEPTION, AND IT IS NOT A CHOICE (2026-08-27).  An EMULATED mesh
+The one exception, and it is not a choice (2026-08-27).  An emulated mesh
 — ``common.collectives.mesh_is_emulated``: more mesh cells than processes,
 i.e. ``P == 1`` under ``--xla_force_host_platform_device_count`` — has no
 per-process MPI world for the phdf5 transport to derive a per-rank
 hyperslab from, so ``ffi.io.open_file`` refuses it by name and must keep
-doing so.  For that ONE geometry :meth:`SlabIO.__init__` constructs
+doing so.  For that one geometry :meth:`SlabIO.__init__` constructs
 ``_slab_io_serial._SerialBackend`` instead: single-process h5py, one shard
 at a time, selectable only at ``P == 1`` and refusing above it.  Read
 ``file_io._slab_io_serial`` for why that is not the allgather tier coming
@@ -128,14 +128,14 @@ __all__ = ["SlabIO", "assert_available", "mesh_divisible_shape",
 #: the whole instrument, given that all three failure signatures in
 #: ``SLAB_IO_ROOT_CAUSE_AUDIT.md`` are native deaths.
 #:
-#: THE STACK NAME IS THE BACKEND'S, NOT THIS MODULE'S.  It used to be the
+#: The stack name is the backend's, not this module's.  It used to be the
 #: module constant ``_STACK = "ffi"``, which was true while there was one
-#: transport and became a LIE the moment the emulated tier landed: the
+#: transport and became a lie the moment the emulated tier landed: the
 #: journal showed ``stack=h5py op=open`` from ``_SerialBackend`` and
 #: ``stack=ffi op=open`` from this class, on the same file, in the same
 #: millisecond (measured in the gnppm_debug emulated arm's
-#: ``h5_journal.rank0.log``).  The journal's whole subject is WHICH HDF5
-#: LIBRARY INSTANCE touched a file — it is read alongside
+#: ``h5_journal.rank0.log``).  The journal's whole subject is which HDF5
+#: library instance touched a file — it is read alongside
 #: ``file_io.hdf5_owner``'s verdict, which is keyed on the same names — so
 #: a door that stamps the wrong library defeats the instrument.  Each
 #: backend now declares its own; see ``_FfiBackend.journal_stack`` and
@@ -165,7 +165,7 @@ class SlabIO:
     * :func:`assert_available` — a deployment that cannot serve the tile
       path refuses HERE, naming the probe that declined.  It is called
       for you; a caller invoking it directly is doing a pre-flight, not
-      meeting a requirement.  On an EMULATED mesh the serial tier is
+      meeting a requirement.  On an emulated mesh the serial tier is
       constructed instead and this probe is not reached: that tier needs
       no phdf5 library because it opens no collective handle.  Which tier
       you got is one line in the log (``debug_print_enabled``), and the
@@ -202,7 +202,7 @@ class SlabIO:
         # ``_slab_io_ffi`` around ``open_file`` itself, and the registry
         # writes a third naming the ownership verdict the open walked
         # into.  Three facts, three lines, one per choke point.
-        # THE ONE TIER DECISION, taken from a PREDICATE before any transport
+        # The one tier decision, taken from a predicate before any transport
         # runs — never from a transport that failed.  An emulated mesh
         # (P == 1, more mesh cells than processes) has no per-process MPI
         # world to derive a per-rank hyperslab from, so ``ffi.io.open_file``
@@ -212,8 +212,8 @@ class SlabIO:
         # deleted in 2026-08-06, and ``tests/test_slab_io_emulated_mesh.py``
         # for the cell proving the FFI door still refuses.
         #
-        # The CLASS is chosen before it is constructed so the journal's stack
-        # name is known even for an open that RAISES: a failed open is the
+        # The class is chosen before it is constructed so the journal's stack
+        # name is known even for an open that raises: a failed open is the
         # line most worth having, and it must still name the right library.
         if mesh_is_emulated(mesh):
             from ._slab_io_serial import _SerialBackend
