@@ -105,6 +105,36 @@ from .gw_output import (
 	write_results,
 )
 
+
+def _persist_static_photon_head_completion(
+		input_dir, completion, *, head_correction, mesh):
+	"""Apply the fail-closed FULL/OFF completion-receipt contract."""
+	if head_correction is HeadCorrection.FULL:
+		if completion is None:
+			raise RuntimeError(
+				"static photon response returned no q=0 completion receipt")
+	elif head_correction is HeadCorrection.OFF:
+		if completion is not None:
+			raise RuntimeError(
+				"head_correction=off static photon response returned an "
+				"unexpected q=0 completion receipt")
+		return None, None
+	else:
+		raise RuntimeError(
+			"static photon completion persistence accepts only "
+			f"head_correction=full or off; got {head_correction!r}")
+
+	from file_io.static_gauge_head import (
+		STATIC_PHOTON_HEAD_COMPLETION_FILENAME,
+		write_static_photon_head_completion_receipt_h5,
+	)
+	completion_path = os.path.join(
+		input_dir, STATIC_PHOTON_HEAD_COMPLETION_FILENAME)
+	metadata = write_static_photon_head_completion_receipt_h5(
+		completion_path, completion, mesh=mesh)
+	return metadata, completion_path
+
+
 def _setup_runtime() -> None:
 	"""Pre-init MPI for the one parallel-HDF5 transport.
 
@@ -620,18 +650,10 @@ def main(argv=None):
 					distrib_la_batched_route=(
 						config.backend.distrib_la_batched_route))
 				completion = photon_response.head_completion
-				if completion is None:
-					raise RuntimeError(
-						"static photon response returned no q=0 completion receipt")
-				from file_io.static_gauge_head import (
-					STATIC_PHOTON_HEAD_COMPLETION_FILENAME,
-					write_static_photon_head_completion_receipt_h5,
-				)
-				completion_path = os.path.join(
-					input_dir, STATIC_PHOTON_HEAD_COMPLETION_FILENAME)
-				photon_completion_metadata = (
-					write_static_photon_head_completion_receipt_h5(
-						completion_path, completion, mesh=mesh_xy))
+				(photon_completion_metadata,
+				 completion_path) = _persist_static_photon_head_completion(
+					input_dir, completion,
+					head_correction=config.head.correction, mesh=mesh_xy)
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
 				W_by_role = {}
@@ -641,9 +663,14 @@ def main(argv=None):
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
-				print0(
-					"  static photon head completion receipt: "
-					f"{completion_path}")
+				if completion_path is None:
+					print0(
+						"  static photon head completion receipt: none "
+						"(head_correction=off)")
+				else:
+					print0(
+						"  static photon head completion receipt: "
+						f"{completion_path}")
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
