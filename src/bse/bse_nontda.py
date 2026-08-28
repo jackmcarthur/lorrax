@@ -548,8 +548,10 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
             "exactly that pair of conditions, so this number is the operator's "
             "integrity, not the solver's convergence.  KNOWN CAUSE: the "
             "coupling block's screened-direct term K^d_B is wrong when the "
-            "zeta axis is sharded (px*py > 1) — see SDY_SOLVER.md.  Re-run at "
-            "px = py = 1, or use the dense route, until that is fixed.")
+            "zeta axis is sharded (px*py > 1) — see SDY_SOLVER.md.  Re-run "
+            "on a single process (a multi-process job cannot use a 1x1 mesh: "
+            "resolve_mesh refuses a mesh that leaves any rank without a "
+            "device), or use the dense route, until that is fixed.")
 
     Z = np.concatenate([X.T, Y.T], axis=0)          # (2N, n_eig)
     order = np.argsort(omega)
