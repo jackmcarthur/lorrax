@@ -519,15 +519,19 @@ def scan_module_scope_env_writes(source: str):
 def scan_mesh_construction(source: str):
     """Every call to a name/attribute ``Mesh``. ``[line, ...]``.
 
-    Also counts calls through an alias bound by
-    ``from jax.sharding import Mesh as X`` (module- or function-level), so
-    renaming at import does not evade the scan.  Dynamic forms (getattr,
-    importlib) are outside AST scope and are not chased here.
+    Also counts calls through an alias bound by ``from <any module> import
+    Mesh as X`` (module- or function-level).  The origin module is
+    deliberately not checked: ``jax._src.mesh.Mesh is jax.sharding.Mesh``
+    (measured, jax 0.9.1), so filtering on ``jax.sharding`` left the same
+    class open through the private path, and no module under src/ imports a
+    Mesh of any other origin under an alias — so the wider net flags nothing
+    extra today.  Rebinding by assignment (``M2 = Mesh``) and dynamic forms
+    (getattr, importlib) are outside AST scope and are not chased here.
     """
     tree = ast.parse(source)
     aliases = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "jax.sharding":
+        if isinstance(node, ast.ImportFrom):
             for a in node.names:
                 if a.name == "Mesh" and a.asname:
                     aliases.add(a.asname)
@@ -1238,14 +1242,20 @@ def test_the_mesh_owners_all_still_build_one(sources):
 def test_the_mesh_scan_can_fail():
     """RED TWIN for rule 4, including the attribute and asname spellings.
 
-    The two asname snippets scanned CLEAN before 2026-08-28 (measured on the
-    pre-fix checker at a6c57166: both returned ``[]``) — renaming at import
-    was the one static spelling the scan missed.
+    The asname snippets scanned CLEAN before their fixes (measured: the
+    ``jax.sharding`` pair returned ``[]`` on the pre-fix checker at a6c57166,
+    and the ``jax._src.mesh`` one still returned ``[]`` after the first fix,
+    which filtered on the module string).  Renaming at import was not the
+    only static spelling the scan missed: assignment rebinding
+    (``M2 = Mesh; M2(d, ())``) also scans clean, and still does — it is
+    documented as out of scope in :func:`scan_mesh_construction`, not
+    covered here.
     """
     for src in ("m = Mesh(devs.reshape(2, 2), ('x', 'y'))\n",
                 "m = jax.sharding.Mesh(d, ('x','y'))\n",
                 "def f():\n    return Mesh(np.asarray(jax.devices()[:1]), ())\n",
                 "from jax.sharding import Mesh as _M\nm = _M(d, ('x','y'))\n",
+                "from jax._src.mesh import Mesh as _M\nm = _M(d, ('x','y'))\n",
                 "def f(d):\n"
                 "    from jax.sharding import Mesh as MM\n"
                 "    return MM(d, ('x','y'))\n"):
