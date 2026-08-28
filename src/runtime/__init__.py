@@ -1429,10 +1429,9 @@ class RuntimeStack:
         reshapes.
 
         The BSE family now depends on staying out of here.  This swaps
-        ``self.mesh`` without touching ``collectives._CANONICAL_MESHES`` (or
-        ``self.facts``), so after a reshape a bare ``resolve_mesh()`` still
-        returns the startup mesh and the startup facts still name the old
-        shape.  ``create_mesh_xy_from_flags``'s omitted arm goes through
+        ``self.mesh`` without touching ``collectives._CANONICAL_MESHES``, so
+        after a reshape a bare ``resolve_mesh()`` still returns the startup
+        mesh.  ``create_mesh_xy_from_flags``'s omitted arm goes through
         ``create_mesh_2d`` -> ``resolve_mesh``, so a BSE driver that reshaped
         would be handed a mesh that is not ``RUNTIME.mesh``.  Unreachable
         today only because no BSE driver reshapes.
@@ -1468,6 +1467,17 @@ class RuntimeStack:
                       axis_names=tuple(self.mesh.axis_names))
         self.mesh = prepare_mesh(wanted, axis_names=tuple(self.mesh.axis_names),
                                  print_fn=say)
+        # facts and report still describe the old mesh.  Refresh every
+        # mesh-derived facts entry (collect_startup_facts reads the mesh in
+        # exactly these three), then rebuild the report — both formatters
+        # are pure functions of facts, so this keeps report == f(facts).
+        # common.scientific_output.architecture_lines reads both.
+        self.facts["mesh_shape"] = self.mesh_shape
+        self.facts["mesh_axes"] = tuple(self.mesh.axis_names)
+        self.facts["linalg"] = _linalg_facts(self.mesh)
+        self.report = tuple(
+            format_startup_report(self.facts) if debug_print_enabled()
+            else format_production_startup_report(self.facts))
         say(f"  The startup mesh {old[0]}x{old[1]} was replaced by the "
             f"{int(px)}x{int(py)} mesh this driver's arguments asked for, and "
             f"the new mesh's communicator cliques were warmed before the "
