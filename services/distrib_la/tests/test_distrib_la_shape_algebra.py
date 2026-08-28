@@ -21,7 +21,7 @@ import pytest
 from lxkit.testing import hostile_extents
 
 from distrib_la._native2d import block_size_for
-from distrib_la._cusolvermp import _ipiv_local_len as _cusolvermp_ipiv_local_len
+from distrib_la._shape import ipiv_local_len
 
 
 def _mesh_shapes():
@@ -93,7 +93,7 @@ def test_cusolvermp_pivot_extent_includes_the_required_extra_block(
     The production-shape row is the regression: the old ``LOCc(N)``
     formula returned 200 instead of 400 on the 4x4, N=800 solve.
     """
-    assert _cusolvermp_ipiv_local_len(n, px, mb) == want
+    assert ipiv_local_len(n, px, mb) == want
 
 
 def test_dense_to_tiles_round_trips_on_the_lower_triangle():
