@@ -1,12 +1,20 @@
 """JAX persistent compile cache — SAFE and EFFECTIVE at ``process_count() > 1``.
 
-Every LORRAX driver that does a meaningful amount of ``jax.jit``
-compile (gw.gw_jax, psp.run_nscf, centroid.kmeans_isdf, bse.bse_jax,
-bandstructure.htransform, ...) should call
-:func:`ensure_jax_compile_cache` near the top of its ``main()`` — right
-after ``jax.distributed.initialize`` (i.e. after ``runtime.bootstrap()``)
-and BEFORE any jit.  Calling it late means the expensive compiles that
-happen early in the pipeline miss the cache.
+DRIVERS MUST NOT CALL :func:`ensure_jax_compile_cache`.  Arming it is
+owned by ``runtime.initialize_communicator_stack`` (step 7), which every
+driver already runs at module scope — above its own ``import jax`` and
+therefore above every jit in the process.  That ordering is the whole
+requirement: arming late means the expensive early compiles miss the
+cache.  A driver-local second call cannot advance that moment, so it buys
+nothing and its error handling is unreachable; a driver that needs the
+cache earlier needs the startup call earlier, not a second arming.
+
+Two callers are deliberately NOT drivers and are not covered by the
+above: kernel factories that arm the cache for callers arriving without
+a driver (``gw.w_isdf``, ``gw.ppm_tau_kernel``), and the drivers that run
+bare ``runtime.bootstrap()`` rather than the full startup call
+(``psp.run_nscf``, ``psp.run_sternheimer``, ``bse.bse_feast``), where
+nothing else arms it.
 
 Knobs (all optional):
 
@@ -1350,8 +1358,11 @@ def ensure_jax_compile_cache() -> None:
     Set ``LORRAX_JAX_CACHE_MULTIPROCESS=0`` to fall back to the scorecard-AG
     behaviour (no cache at all when P > 1).
 
-    Idempotent: safe to call multiple times, and from several drivers in the
-    same process.
+    ONE caller owns this: ``runtime.initialize_communicator_stack`` step 7.
+    Idempotence is not a licence for a second call site — it is what makes a
+    stray re-entry through an unlucky import order harmless rather than a
+    second, differently-configured cache.  See the module docstring for the
+    two non-driver exceptions.
     """
     global _COMPILATION_CACHE_READY
     if _COMPILATION_CACHE_READY:
