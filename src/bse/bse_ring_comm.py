@@ -1,6 +1,7 @@
 """Distributed BSE kernels (ring collectives and sharded matvecs)."""
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Optional
 
@@ -49,10 +50,20 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     exactly this rule; the two now cannot drift.  With the equality enforced,
     the ``devices[: px * py]`` slice below is the identity on the list it was
     handed.  The comparison is against the list IN PLAY, not against
-    ``jax.devices()``: a caller that deliberately passes a sub-list (the
-    process-local 1x1 controls in ``tests/``, ``create_mesh_2d([dev0])``) is
-    asserting a different job, and that is a greppable act rather than a
-    default.  A CLI never does it — its ``devices`` is ``None``.
+    ``jax.devices()``: a caller that deliberately passes a sub-list
+    (``create_mesh_2d([dev0])``, the 1x1 control leg of a 1x1/2x2 mesh
+    parametrization) is asserting a different job, and that is a greppable
+    act rather than a default.  A CLI never does it — its ``devices`` is
+    ``None``.
+
+    NOT the factory for a process-local 1x1: use
+    ``common.collectives.single_device_mesh``.  Passing ``devices[:1]`` here
+    LOOKS device-count independent and is not — the canonical-reuse branch
+    below calls ``resolve_mesh``, which refuses outright on a device count
+    that is not a perfect square (measured 2026-08-27: ``create_mesh_xy(1, 1,
+    jax.local_devices()[:1])`` raises ``resolve_mesh: this run has 5 devices
+    ... not a perfect square`` at ``--xla_force_host_platform_device_count=5``,
+    while ``single_device_mesh()`` returns a 1x1 at every count).
 
     WHY THIS FUNCTION EXISTS AT ALL.  Four byte-identical
     ``_create_mesh_xy(px, py)`` bodies used to live in ``bse_w_exact``,
@@ -93,8 +104,23 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
         raise ValueError(
             f"Requested px*py={px*py} devices, only {len(devices)} available")
     if px * py < len(devices):
-        import math
+        # THE FIX FIELD HAS TO BE A FIX.  ``isqrt`` always returns something,
+        # so an unguarded "request --px s --py s" tells a user on 8 devices to
+        # type the 2x2 they just typed, and "or omit --px/--py" routes to
+        # :func:`create_mesh_2d`, which refuses in DIFFERENT words.  Only a
+        # perfect square has a square mesh to offer at all.
         s = math.isqrt(len(devices))
+        if s * s == len(devices):
+            fix = (f"Request --px {s} --py {s}, or omit --px/--py and get "
+                   f"that mesh by default "
+                   f"(:func:`create_mesh_xy_from_flags`).")
+        else:
+            fix = (f"{len(devices)} is not a perfect square, so NO --px/--py "
+                   f"names a square mesh over this list and omitting them "
+                   f"refuses too: relaunch on {s * s} devices (a {s}x{s} "
+                   f"mesh) or {(s + 1) * (s + 1)} (a {s + 1}x{s + 1} mesh).  "
+                   f"That is :func:`create_mesh_2d`'s refusal, and it is the "
+                   f"one that applies here.")
         raise ValueError(
             f"create_mesh_xy: a {px}x{py} mesh was requested, but the device "
             f"list in play has {len(devices)} device(s) over "
@@ -107,9 +133,7 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
             f"MPI_COMM_WORLD — so an out-of-mesh rank that never runs the "
             f"warm-up jits leaves every in-mesh rank blocked in the split, "
             f"and psum_replicate / the k-sweep gathers assume mesh size == "
-            f"process count.  Request --px {s} --py {s}, or omit --px/--py "
-            f"and get that mesh by default "
-            f"(:func:`create_mesh_xy_from_flags`).")
+            f"process count.  " + fix)
     # Reuse the run's canonical mesh when the request IS that mesh: since
     # the BSE drivers start with ``runtime.initialize_communicator_stack``
     # (2026-08-01), the canonical square ('x','y') mesh already exists — an
@@ -195,8 +219,6 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
     count to request (the refusal fires in ``resolve_mesh``'s vocabulary
     via :func:`create_mesh_xy`'s canonical-mesh reuse, or here).
     """
-    import math
-
     if devices is None:
         devices = jax.devices()
 
@@ -218,8 +240,11 @@ def create_mesh_xy_from_flags(px: Optional[int],
     """THE ``--px/--py`` resolution, for every BSE driver's ``main()``.
 
     OMITTED MEANS THE RUN'S MESH.  ``px is None and py is None`` — the
-    argparse default in all five bse-family drivers since 2026-08-27 — is a
-    request for the job's canonical square mesh, i.e. exactly what
+    argparse default in all SIX bse-family drivers since 2026-08-27
+    (``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
+    ``bse_w_exact``, ``exciton_bands``: 12 declarations, gated by
+    ``tests/test_layering.py::test_no_bse_driver_defaults_its_mesh_shape``) —
+    is a request for the job's canonical square mesh, i.e. exactly what
     ``runtime.initialize_communicator_stack`` already built and announced in
     the startup receipt.  It used to mean ``1x1``: ``--px``/``--py``
     defaulted to ``1``, so ``python -m bse.bse_jax -i deck.in`` with no flags
@@ -1591,17 +1616,18 @@ def build_density_readout_operator_full(mesh_xy, nkx, nky, nkz):
     return _readout
 
 
-def ring_matvec_smoke_test(px: int = 2, py: int = 2) -> None:
-    devices = jax.devices()
-    if len(devices) < px * py:
-        raise RuntimeError(
-            f"Need {px*py} devices, found {len(devices)}. "
-            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
-        )
-    # ONE mesh factory (create_mesh_xy): these two smoke drivers used to
-    # build their own, so they were the last un-warmed constructors left
-    # in src/bse/ after the four _create_mesh_xy copies were folded in.
-    mesh = create_mesh_xy(px, py, devices)
+def ring_matvec_smoke_test(px: Optional[int] = None,
+                           py: Optional[int] = None) -> None:
+    # OMITTED px/py = THE RUN'S MESH, the same resolution every bse driver's
+    # main() does.  It was ``px = py = 2`` against the FULL ``jax.devices()``
+    # list, which the equality guard in create_mesh_xy makes a refusal at
+    # every count but exactly 4 — and `python -m bse.bse_jax --ring-test`
+    # (bse_jax.py, no arguments) is precisely that call, so on a 9- or
+    # 16-device job the driver went from "runs 2x2 on 4 of 16" to "refuses".
+    # A shape default that is not the run's mesh is the defect this module
+    # removed from the six CLIs; it does not get to stay in the owner.
+    mesh = create_mesh_xy_from_flags(px, py)
+    px, py = (int(n) for n in mesh.devices.shape)
     sh = make_bse_shardings(mesh)
 
     nkx, nky, nkz = 2, 2, 1
@@ -1648,21 +1674,18 @@ def ring_matvec_correctness_check(
     input_file: str,
     n_val: int = 4,
     n_cond: int = 4,
-    px: int = 2,
-    py: int = 2,
+    px: Optional[int] = None,
+    py: Optional[int] = None,
     component_check: bool = False,
 ) -> None:
     restart_file = _find_restart_file(input_file)
-    devices = jax.devices()
-    if len(devices) < px * py:
-        raise RuntimeError(
-            f"Need {px*py} devices, found {len(devices)}. "
-            "Set XLA_FLAGS=--xla_force_host_platform_device_count=... before running."
-        )
-    # ONE mesh factory (create_mesh_xy): these two smoke drivers used to
-    # build their own, so they were the last un-warmed constructors left
-    # in src/bse/ after the four _create_mesh_xy copies were folded in.
-    mesh = create_mesh_xy(px, py, devices)
+    # Same resolution as ring_matvec_smoke_test above, and for the same
+    # reason.  This one happened to be safe TODAY only because its single
+    # caller (bse_jax.main) overwrites args.px/args.py with the resolved
+    # shape first — an accident of one caller, not a property of the
+    # function, and the signature is public (bse_jax re-exports it).
+    mesh = create_mesh_xy_from_flags(px, py)
+    px, py = (int(n) for n in mesh.devices.shape)
     sh = make_bse_shardings(mesh)
 
     payload = _load_ring_subset(restart_file, n_val, n_cond, px, py,
