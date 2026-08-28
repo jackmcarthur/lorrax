@@ -1616,7 +1616,12 @@ def _z_q_face(
 
 	``cache_y_blocks=True`` builds the canonical Y-side r-scatter once for
 	each bounded cache tile and stacks ``(n_bc,nk,bc,ns,r_tile/Py)`` for
-	reuse by the scalar-pair scan.  ``cache_y_r_tile == r_chunk_size`` is the
+	reuse by the scalar-pair scan.  On a non-identity left endpoint it also
+	stacks the small owner-broadcast X blocks
+	``(n_bc,nk,ns,mu/Px,bc)`` once; the scalar ``(a,b)`` and band scans then
+	select the same raw rows from that cache without repeating ``psum('y')``.
+	The identity/charge and cache-free fallback paths retain their original
+	per-pair broadcast body.  ``cache_y_r_tile == r_chunk_size`` is the
 	original one-pass cache; a smaller exact divisor repeats the canonical
 	transform once per tile while keeping the outer solve chunk unchanged.
 	``False`` calls that same transform/scatter owner
@@ -1677,6 +1682,11 @@ def _z_q_face(
 		cache_y_r_tile = 0
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	# The production transverse channel supplies the same non-identity
+	# monomial at both endpoints.  Hoist its owner broadcast only on the
+	# accepted cached-Y route: charge/identity and the bounded repeated-Y
+	# fallback remain structurally identical to the incumbent.
+	cache_x_owner_blocks = bool(cache_y_blocks and not lhs_id)
 
 	if cache_y_blocks and cache_y_r_tile < n_zchunk:
 		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
@@ -1792,7 +1802,7 @@ def _z_q_face(
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
 		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
-		lhs_id, rhs_id,
+		lhs_id, rhs_id, cache_x_owner_blocks,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -1849,6 +1859,19 @@ def _z_q_face(
 				assert psi_Y_bc.shape[3] == r_loc
 				return psi_Y_bc
 
+			def load_x_owner_block(bc_idx):
+				"""Broadcast every raw spin row for one bounded band chunk."""
+				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
+				global_band = b_lo_rel_arr[bc_idx] + p_arr
+				owner_y = global_band // shard_w
+				owns = owner_y == y_idx
+				local_idx = jnp.clip(
+					global_band - y_idx * shard_w, 0, shard_w - 1)
+				gathered = jnp.take(psi_mun_conj, local_idx, axis=3)
+				gathered = jnp.where(
+					owns[None, None, None, :], gathered, 0)
+				return jax.lax.psum(gathered, 'y')
+
 			# The response is nonlinear in the completed band sums:
 			#   conj(sum_n P_l[n]) * sum_m P_r[m].
 			# Therefore the inner scan completes ALL band chunks for one raw
@@ -1856,7 +1879,8 @@ def _z_q_face(
 			# pair's contribution enter Z_R.  The outer scan partitions the
 			# exact Frobenius spin sum into ns^2 scalar terms and retains only
 			# two rank-3 P carries instead of two rank-5 open-spin carries.
-			def accumulate_spin_pairs(psi_Y_blocks, active_r_loc):
+			def accumulate_spin_pairs(
+					psi_Y_blocks, psi_X_owner_blocks, active_r_loc):
 				"""Complete every spin pair for one local-r cache transaction."""
 				Z_R_init = jnp.zeros(
 					(nkx, nky, nkz, active_r_loc, mu_loc),
@@ -1881,24 +1905,34 @@ def _z_q_face(
 							psi_Y_bc = load_y_block_full(bc_idx)
 
 						# Selectively broadcast this band chunk from psi_mun's
-						# owning y-rank.  The collective and its physical band order
-						# are unchanged from the pre-streaming face kernel.
+						# owning y-rank.  The accepted transverse/cache route reuses
+						# the full-spin owner block built once above; charge and the
+						# bounded fallback retain this exact per-pair collective.
 						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
 						global_band = b_lo_rel_arr[bc_idx] + p_arr
-						owner_y = global_band // shard_w
-						owns = (owner_y == y_idx)
-						if lhs_id:
-							x_rows_local = jax.lax.dynamic_slice_in_dim(
-								psi_mun_conj, a, 1, axis=1)
+						if cache_x_owner_blocks:
+							x_rows_all = psi_X_owner_blocks[bc_idx]
+							x_l = jax.lax.dynamic_index_in_dim(
+								x_rows_all, a, axis=1, keepdims=False)
+							x_r = jax.lax.dynamic_index_in_dim(
+								x_rows_all, perm_L_[a], axis=1, keepdims=False)
 						else:
-							x_rows_local = jnp.take(
-								psi_mun_conj, jnp.stack((a, perm_L_[a])), axis=1)
-						local_idx = jnp.clip(
-							global_band - y_idx * shard_w, 0, shard_w - 1)
-						gathered = jnp.take(x_rows_local, local_idx, axis=3)
-						gathered = jnp.where(
-							owns[None, None, None, :], gathered, 0)
-						x_rows_bc = jax.lax.psum(gathered, 'y')
+							owner_y = global_band // shard_w
+							owns = (owner_y == y_idx)
+							if lhs_id:
+								x_rows_local = jax.lax.dynamic_slice_in_dim(
+									psi_mun_conj, a, 1, axis=1)
+							else:
+								x_rows_local = jnp.take(
+									psi_mun_conj, jnp.stack((a, perm_L_[a])), axis=1)
+							local_idx = jnp.clip(
+								global_band - y_idx * shard_w, 0, shard_w - 1)
+							gathered = jnp.take(x_rows_local, local_idx, axis=3)
+							gathered = jnp.where(
+								owns[None, None, None, :], gathered, 0)
+							x_rows_bc = jax.lax.psum(gathered, 'y')
+							x_l = x_rows_bc[:, 0, :, :]
+							x_r = (x_l if lhs_id else x_rows_bc[:, 1, :, :])
 
 						# A short final chunk can extend past both its true edge and
 						# the face carrier.  Clip every take and zero the inert lanes
@@ -1915,10 +1949,8 @@ def _z_q_face(
 						# The bra source is already conjugated above, so retain the
 						# ORIGINAL phase (never conj(phase)).  The charge channel's
 						# canonical identity perm/phase makes these the same raw rows.
-						x_l = x_rows_bc[:, 0, :, :]
 						y_l = jax.lax.dynamic_index_in_dim(
 							psi_Y_bc, b, axis=2, keepdims=False)
-						x_r = (x_l if lhs_id else x_rows_bc[:, 1, :, :])
 						x_r = phase_L_[a] * x_r
 						y_r = jax.lax.dynamic_index_in_dim(
 							psi_Y_bc, perm_R_[b], axis=2, keepdims=False)
@@ -1951,6 +1983,18 @@ def _z_q_face(
 				return Z_R
 
 			if cache_y_blocks:
+				if cache_x_owner_blocks:
+					def build_x_owner_block(_unused, bc_idx):
+						return _unused, load_x_owner_block(bc_idx)
+
+					_, psi_X_owner_blocks = jax.lax.scan(
+						build_x_owner_block, jnp.zeros((), dtype=jnp.int32),
+						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+				else:
+					# Structurally dead for charge/identity; keep one scalar dummy
+					# rather than materialising a resident single-axis X copy.
+					psi_X_owner_blocks = jnp.zeros((), dtype=jnp.int32)
+
 				def build_y_block(_unused, bc_idx):
 					return _unused, load_y_block_full(bc_idx)
 
@@ -1959,10 +2003,12 @@ def _z_q_face(
 					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
 				# Original one-pass cache: one canonical transform per band
 				# chunk, then read-only reuse across every spin pair.
-				Z_R = accumulate_spin_pairs(psi_Y_blocks, r_loc)
+				Z_R = accumulate_spin_pairs(
+					psi_Y_blocks, psi_X_owner_blocks, r_loc)
 			else:
 				# Dummy is dead after tracing the static repeated-route branch.
 				Z_R = accumulate_spin_pairs(
+					jnp.zeros((), dtype=jnp.int32),
 					jnp.zeros((), dtype=jnp.int32), r_loc)
 			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
 			return jnp.transpose(

@@ -122,6 +122,8 @@ def test_face_pair_arena_distinguishes_charge_and_current_executables():
         current_vertex=False, r_override=16_000, budget=200.0)
     current = _synthetic_plan(
         current_vertex=True, r_override=16_000, budget=200.0)
+    assert charge.face_x_owner_cache_bytes == 0
+    assert current.face_x_owner_cache_bytes > 0
     assert (current.peak_breakdown["C_fit_one_rchunk"]
             > charge.peak_breakdown["C_fit_one_rchunk"])
     tree = ast.parse(
@@ -142,6 +144,32 @@ def test_face_pair_arena_distinguishes_charge_and_current_executables():
     assert 'pair_peak = float(slots) * pair_rank3' in source
     assert 'z_slope' not in source
     assert 'kfft_scratch_slope' not in source
+
+
+def test_x_owner_cache_is_current_cached_route_only():
+    current = _profile_cliff_plan(41_472)
+    # The helper above is the accepted current geometry; independently price
+    # an otherwise matched charge executable to prove identity stays at zero.
+    charge = plan_gflat_chunks(
+        meta=_meta(ns=4, mu=800, ngkmax=76_551),
+        mesh_xy=SimpleNamespace(shape={'x': 4, 'y': 4}),
+        nb_total=380, face_nb_total=256, fit_nb_total=250,
+        ngkmax=76_551, n_q_disk=36, budget_gb=70.0,
+        target_utilization=0.78, band_chunk_override=16,
+        r_chunk_override=41_472,
+        distributed_zeta_solve="distributed", low_mem_bands=True,
+        face_current_vertex=False)
+    assert charge.cache_face_y_blocks
+    assert current.cache_face_y_blocks
+    assert charge.face_x_owner_cache_bytes == 0
+    assert current.face_x_owner_cache_bytes == 117_964_800
+
+    core_source = (
+        Path(__file__).resolve().parents[1] / "src/isdf/core.py").read_text()
+    assert (
+        "cache_x_owner_blocks = bool(cache_y_blocks and not lhs_id)"
+        in core_source)
+    assert "def load_x_owner_block(bc_idx):" in core_source
 
 
 def test_ns1_falls_back_and_large_band_selects_cache_feasible_outer_chunk():
@@ -192,6 +220,6 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     assert (tiled.peak_breakdown["C_face_y_cache_build"]
             - full.peak_breakdown["C_face_y_cache_build"]
             == completed_z_tile)
-    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_699_800_800
+    assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_817_765_600
     assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
-    assert tiled.hwm_bytes == 28_990_135_008
+    assert tiled.hwm_bytes == 29_108_099_808

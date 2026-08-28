@@ -351,7 +351,8 @@ def _stage_C_slope(*, nk, ns, nq, mu, slots, p_xy, band_chunk, p_y) -> float:
 
 def _stage_C_face_terms(
         *, nk, ns, mu, face_nb, slots, p_x, p_y, p_xy,
-        band_chunk, n_band_chunks) -> dict[str, float]:
+        band_chunk, n_band_chunks, current_vertex: bool = False
+        ) -> dict[str, float]:
     """Analytic live-shape census for the scalar-pair face kernel.
 
     Source evaluates one scalar spin pair at a time, but the executable's
@@ -363,7 +364,9 @@ def _stage_C_face_terms(
     ``face_nb`` is the exact ``psi_mun[..., b0:b4]`` carrier width, distinct
     from both the legacy inventory and a possibly narrowed zeta-fit union.
     The cached route retains one current-r Y slab per padded fit-band chunk;
-    the repeated-transform fallback retains one slab and its source.
+    the nonidentity-current executable also retains one full-spin X owner
+    broadcast per chunk.  The charge and repeated-transform routes retain
+    the incumbent per-pair X broadcast instead.
     """
     x_rows = 1 if int(ns) == 1 else 2
     face_conj = _c128(nk, ns, mu, face_nb, shard=p_xy)
@@ -373,9 +376,24 @@ def _stage_C_face_terms(
     y_block = _c128(nk, band_chunk, ns, shard=p_y)
     y_source = _c128(nk, max(1, band_chunk // p_xy), ns)
     y_cache = float(n_band_chunks) * y_block
+    x_owner_block = _c128(
+        nk, ns, max(1, mu // p_x), band_chunk)
+    x_owner_cache = (
+        float(n_band_chunks) * x_owner_block if current_vertex else 0.0)
+    constant = face_conj + 2.0 * x_block
     return {
         # psi_mun_conj plus the selected-row gather and psum result.
-        "constant": face_conj + 2.0 * x_block,
+        "constant": constant,
+        # Accepted current/cache route: all raw spin rows are broadcast once
+        # and remain resident while the scalar pair/band scans preserve their
+        # exact incumbent accumulation order.
+        "x_owner_cache": x_owner_cache,
+        "cache_constant": constant + x_owner_cache,
+        # During the X-cache scan the completed stack coexists with the
+        # current full-spin gather and psum result.
+        "x_cache_build_constant": (
+            face_conj + x_owner_cache + 2.0 * x_owner_block
+            if current_vertex else 0.0),
         # Complete executable-specific rank-3-equivalent arena.
         "pair_arena_slope": pair_peak,
         "y_block_slope": y_block,
@@ -476,6 +494,9 @@ class GFlatChunkPlan:
     face_y_cache_r_tile: int = 0
     #: Per-rank bytes in the selected face Y cache at resolved r width.
     face_y_cache_bytes: float = 0.0
+    #: Per-rank bytes in the accepted current route's stacked full-spin X
+    #: owner broadcasts.  Zero for charge and the repeated-Y fallback.
+    face_x_owner_cache_bytes: float = 0.0
 
     def format(self) -> str:
         bg = self.budget_bytes / 1e9
@@ -501,6 +522,9 @@ class GFlatChunkPlan:
                  else "n/a (legacy layout)")),
             *([f"    face Y cache = "
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
+              if self.psi_layout == "face" else []),
+            *([f"    face X cache = "
+               f"{self.face_x_owner_cache_bytes / 1e9:.3f} GB/dev"]
               if self.psi_layout == "face" else []),
             f"    band_chunk    = {self.band_chunk}",
             f"    centroid FFT = k_tile {self.centroid_k_chunk}, "
@@ -658,7 +682,8 @@ def plan_gflat_chunks(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
             band_chunk=_cache_probe_bc,
-            n_band_chunks=math.ceil(fit_nb / _cache_probe_bc))
+            n_band_chunks=math.ceil(fit_nb / _cache_probe_bc),
+            current_vertex=bool(face_current_vertex))
         _cache_probe_peak += (
             _cache_probe_face["constant"]
             + _cache_probe_face["repeated_pair_slope"] * _cache_probe_r)
@@ -702,7 +727,8 @@ def plan_gflat_chunks(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb_pp,
                 slots=face_slots, p_x=px, p_y=py, p_xy=pp,
                 band_chunk=floor_bc,
-                n_band_chunks=math.ceil(fit_nb / floor_bc))
+                n_band_chunks=math.ceil(fit_nb / floor_bc),
+                current_vertex=bool(face_current_vertex))
             fft_floor = (_c128(
                 nk, floor_bc, ns, n_rtot, shard=pp)
                 * _FFT_CUFFT_FACTOR)
@@ -782,7 +808,8 @@ def plan_gflat_chunks(
             face = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb,
                 slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-                band_chunk=bc, n_band_chunks=n_bc)
+                band_chunk=bc, n_band_chunks=n_bc,
+                current_vertex=bool(face_current_vertex))
             fit_t = (face["constant"]
                      + face["repeated_pair_slope"] * r_for_band_guard)
         else:
@@ -851,32 +878,37 @@ def plan_gflat_chunks(
     face_cache_build_t = 0.0
     face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
+    face_x_owner_cache_bytes = 0.0
+    face_x_cache_build_t = 0.0
     if low_mem_bands:
         face_terms = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-            band_chunk=band_chunk, n_band_chunks=_cache_n_bc)
+            band_chunk=band_chunk, n_band_chunks=_cache_n_bc,
+            current_vertex=bool(face_current_vertex))
         # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
         # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
         streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
-        face_headroom = max(
+        cache_face_headroom = max(
+            target - persistent_total - face_terms["cache_constant"], 0.0)
+        repeated_face_headroom = max(
             target - persistent_total - face_terms["constant"], 0.0)
 
         cache_pair_cap = int(
-            face_headroom / face_terms["cache_pair_slope"])
-        cache_build_headroom = max(face_headroom - streamed_fft, 0.0)
+            cache_face_headroom / face_terms["cache_pair_slope"])
+        cache_build_headroom = max(cache_face_headroom - streamed_fft, 0.0)
         cache_build_cap = int(
             cache_build_headroom / face_terms["cache_build_slope"])
         # The calibrated four-slot arena already contains old/new Z and both
         # k-IFFT outputs.  Only the Y cache sits outside its placement bound.
         cache_other_slope = face_terms["y_cache_slope"]
         cache_arena_cap = int(
-            _ARENA_PLACEMENT_FRAC * face_headroom
+            _ARENA_PLACEMENT_FRAC * cache_face_headroom
             / (face_terms["pair_arena_slope"]
                + _ARENA_PLACEMENT_FRAC * cache_other_slope))
         cache_cap = min(cache_pair_cap, cache_build_cap, cache_arena_cap)
 
-        repeated_headroom = max(face_headroom - streamed_fft, 0.0)
+        repeated_headroom = max(repeated_face_headroom - streamed_fft, 0.0)
         repeated_pair_cap = int(
             repeated_headroom / face_terms["repeated_pair_slope"])
         repeated_other_slope = (
@@ -898,16 +930,21 @@ def plan_gflat_chunks(
         route_tile = bounded_partition_tile(
             route_width, cache_cap, r_alignment)
         route_tiles = (route_width // route_tile) if route_tile else 0
+        x_cache_build_fits = bool(
+            not face_terms["x_owner_cache"]
+            or persistent_total + face_terms["x_cache_build_constant"]
+            <= target)
         # The bounded fallback executes one transform per scalar spin pair.
         # A tiled cache is useful only while it executes strictly fewer
         # transforms than that fallback; otherwise retain the smaller-memory
         # incumbent.  The outer r chunk is unchanged either way.
         cache_face_y_blocks = bool(
-            ns > 1 and route_tile > 0 and route_tiles < ns * ns)
+            ns > 1 and x_cache_build_fits
+            and route_tile > 0 and route_tiles < ns * ns)
         face_y_cache_r_tile = route_tile if cache_face_y_blocks else 0
         if cache_face_y_blocks:
             C_slope = face_terms["cache_pair_slope"]
-            C_constant = face_terms["constant"]
+            C_constant = face_terms["cache_constant"]
             r_from_budget = min(cache_pair_cap, cache_build_cap)
             r_from_arena = cache_arena_cap
             r_budget_cap = cache_cap
@@ -980,6 +1017,8 @@ def plan_gflat_chunks(
             # tiles would execute no fewer transforms.
             cache_face_y_blocks = False
             face_y_cache_r_tile = 0
+            C_slope = face_terms["repeated_pair_slope"]
+            C_constant = face_terms["constant"] + streamed_fft
 
     # ---- gflat_chunk_size (Stage D FFT box) ----------------------------
     fft_per_row = _c128(n_rtot) * 2.0   # accumulate box has no ns axis
@@ -1068,20 +1107,22 @@ def plan_gflat_chunks(
             _cache_tile = face_y_cache_r_tile
             _completed_tile_z = (
                 _c128(nq, mu, shard=p_xy) * (r_chunk - _cache_tile))
-            C_fit_t = (face_terms["constant"]
+            C_fit_t = (face_terms["cache_constant"]
                        + face_terms["cache_pair_slope"] * _cache_tile
                        + _completed_tile_z)
             face_y_cache_bytes = (
                 face_terms["y_cache_slope"] * _cache_tile)
+            face_x_owner_cache_bytes = face_terms["x_owner_cache"]
             # Every tile invokes the SAME canonical face owner at tile width,
             # so the source/all_to_all/all_gather transaction and stacked
             # cache are both tile-sized.  Previously completed compact Z_q
             # tiles stay live while the next tile is built/contracted.
             face_cache_build_t = (
-                face_terms["constant"]
+                face_terms["cache_constant"]
                 + (0.0 if cache_psi_r else fft_box_zeta_transform)
                 + face_terms["cache_build_slope"] * _cache_tile
                 + _completed_tile_z)
+            face_x_cache_build_t = face_terms["x_cache_build_constant"]
             if _cache_tile < r_chunk:
                 # Global tile arrays are concatenated outside manual
                 # shard_map, then constrained once to the incumbent outer
@@ -1156,7 +1197,10 @@ def plan_gflat_chunks(
             face_y_route_bytes = (
                 (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
                  + face_terms["y_source_slope"]) * r_chunk)
-        stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
+        face_route_constant = (
+            face_terms["cache_constant"] if cache_face_y_blocks
+            else face_terms["constant"])
+        stage_cd_psi_bytes = face_route_constant + face_y_route_bytes
     else:
         stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
@@ -1192,6 +1236,9 @@ def plan_gflat_chunks(
         peaks["A_psi_r_cache_build"] = (
             persistent_total + A_psi_r_cache_t)
     if cache_face_y_blocks:
+        if face_x_owner_cache_bytes:
+            peaks["C_face_x_cache_build"] = (
+                persistent_total + face_x_cache_build_t)
         peaks["C_face_y_cache_build"] = (
             persistent_total + face_cache_build_t)
         if face_tile_concat_t:
@@ -1225,4 +1272,5 @@ def plan_gflat_chunks(
         cache_face_y_blocks=bool(cache_face_y_blocks),
         face_y_cache_r_tile=int(face_y_cache_r_tile),
         face_y_cache_bytes=float(face_y_cache_bytes),
+        face_x_owner_cache_bytes=float(face_x_owner_cache_bytes),
     )

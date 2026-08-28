@@ -55,6 +55,9 @@ above, proves nothing: ``gamma_apply`` is a no-op under identity, so it
 never exercises ``isdf.core._z_q_face``'s post-collective endpoint
 transform).  Same bit-exact-class tolerance as the identity cases (the
 masked-``psum`` mechanism is a select either way, gamma or no gamma).
+The cached gamma arms specifically exercise the hoisted full-spin X owner
+broadcast; their repeated-route comparisons retain the incumbent per-pair
+broadcast, while the identity cases certify that charge remains unchanged.
 """
 from __future__ import annotations
 
