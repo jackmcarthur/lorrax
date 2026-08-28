@@ -802,7 +802,17 @@ def test_w_ladder_matches_dense_oracle_on_a_mesh(px, py):
     if px * py > jax.device_count():
         pytest.skip(f"needs {px * py} devices; have {jax.device_count()}")
     from bse.bse_ring_comm import create_mesh_xy
-    mesh = create_mesh_xy(px, py)
+    # The device list is passed EXPLICITLY because this cell's 1x1 leg is a
+    # process-local control inside a process that has four devices visible
+    # (the LORRAX_MESH_CELL=1 recipe above).  Since 2026-08-27 create_mesh_xy
+    # refuses a shape that does not consume the list it is handed — the guard
+    # that stops ``--px 2 --py 2`` from stranding ranks 4..15 on a 16-device
+    # job — so ``create_mesh_xy(1, 1)`` inside a four-device process is now,
+    # correctly, a refusal.  Handing it the devices the leg is meant to use
+    # says which job is being asserted about and is behaviour-identical to
+    # what this line did before: the mesh built is the same one, over the
+    # same devices, in both legs and in both process widths.
+    mesh = create_mesh_xy(px, py, jax.devices()[: px * py])
     data = _synthetic_payload(mesh)
     cols = np.array([0, 3, 5], dtype=int)
     A, B, Mmat, N, row = _dense_ladder_blocks(data, with_row=True)
