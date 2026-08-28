@@ -6,11 +6,12 @@ Fails hard on malformed UPF — that's a pseudopotential bug, not ours.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from psp.pseudos import symbol_to_Z
+from psp.upf.upf_model_2_0_1 import UpfLogical
 
 
 # ---------------------------------------------------------------------------
@@ -19,7 +20,14 @@ from psp.pseudos import symbol_to_Z
 
 @dataclass
 class SpeciesData:
-    """All radial data for one atomic species, ready for Hankel transforms."""
+    """All radial data for one atomic species, ready for Hankel transforms.
+
+    Deliberately carries NO spin fields: every array here is a radial
+    function or an ℓ label, identical for nspinor=1 and nspinor=2 runs.
+    The spin structure (j resolution, E^{σσ'} blocks) is owned by
+    ``psp.radial.build_projectors_qe`` / ``psp.vnl_ops``, which read j
+    from the UPF itself (``beta.jjj``) rather than from a stored copy.
+    """
     element: str
     z_valence: float
     z_atomic: int
@@ -37,18 +45,15 @@ class SpeciesData:
     n_proj: int
     beta_r: np.ndarray      # (n_proj, n_r) β(r)/r radial functions
     proj_l: np.ndarray      # (n_proj,) int — angular momentum per projector
-    proj_j: np.ndarray      # (n_proj,) float — total angular momentum (SO)
     dij: np.ndarray         # (n_proj, n_proj) D-matrix in Ry
-    nspinor: int            # 1 (scalar) or 2 (FR with SOC)
 
 
-def extract_species(pseudos: dict, nspinor: int = 2) -> list[SpeciesData]:
+def extract_species(pseudos: dict) -> list[SpeciesData]:
     """Extract SpeciesData from all loaded pseudopotentials.
 
     Parameters
     ----------
     pseudos : dict from load_pseudopotentials (element → UPF object)
-    nspinor : 1 for scalar-relativistic, 2 for fully-relativistic (SOC)
     """
     species = []
     for element, pseudo in pseudos.items():
@@ -63,8 +68,11 @@ def extract_species(pseudos: dict, nspinor: int = 2) -> list[SpeciesData]:
         # Local potential
         vloc_r = np.asarray(pseudo.pp_local.value, dtype=np.float64)
 
-        # NLCC core charge
-        has_nlcc = bool(getattr(hdr, "core_correction", False))
+        # NLCC core charge.  ``core_correction`` is an Optional[UpfLogical]
+        # Enum — bool() on ANY member, FALSE included, is True, so the flag
+        # must be compared by member.  The PP_NLCC payload must also exist:
+        # the flag cannot supply a radial grid.
+        has_nlcc = hdr.core_correction in (UpfLogical.TRUE, UpfLogical.T)
         if has_nlcc and hasattr(pseudo, "pp_nlcc") and pseudo.pp_nlcc is not None:
             rho_core_r = np.asarray(pseudo.pp_nlcc.value, dtype=np.float64)
         else:
@@ -76,7 +84,6 @@ def extract_species(pseudos: dict, nspinor: int = 2) -> list[SpeciesData]:
         n_proj = int(hdr.number_of_proj)
         beta_r = np.zeros((n_proj, len(r)), dtype=np.float64)
         proj_l = np.zeros(n_proj, dtype=np.int32)
-        proj_j = np.zeros(n_proj, dtype=np.float64)
 
         for ip in range(n_proj):
             beta_obj = pp_nl.pp_beta[ip]
@@ -85,8 +92,6 @@ def extract_species(pseudos: dict, nspinor: int = 2) -> list[SpeciesData]:
             safe_r = np.where(r > 0, r, 1.0)
             beta_r[ip] = np.where(r > 0, raw / safe_r, 0.0)
             proj_l[ip] = int(beta_obj.angular_momentum)
-            proj_j[ip] = float(getattr(beta_obj, "total_angular_momentum",
-                                        proj_l[ip] + 0.5))
 
         # D-matrix
         dij_flat = np.asarray(pp_nl.pp_dij.value, dtype=np.float64)
@@ -96,8 +101,8 @@ def extract_species(pseudos: dict, nspinor: int = 2) -> list[SpeciesData]:
             element=element, z_valence=z_val, z_atomic=z_at,
             r=r, rab=rab,
             vloc_r=vloc_r, rho_core_r=rho_core_r, has_nlcc=has_nlcc,
-            n_proj=n_proj, beta_r=beta_r, proj_l=proj_l, proj_j=proj_j,
-            dij=dij, nspinor=nspinor,
+            n_proj=n_proj, beta_r=beta_r, proj_l=proj_l,
+            dij=dij,
         ))
     return species
 

@@ -982,9 +982,14 @@ def _build_reduced_tables(tab: RadialTable, l: int) -> tuple[np.ndarray, np.ndar
 
 def extract_vnl_channel_data(
     plan: dict,
-    nspinor: int = 2,
+    nspinor: int,
 ) -> list[VNLChannelData]:
-    """Extract all VNL channels from a projector plan into autodiff-ready form."""
+    """Extract all VNL channels from a projector plan into autodiff-ready form.
+
+    ``nspinor`` is required: it slices E^{σσ'} to the run's spin dimension,
+    and a defaulted value here would silently build the wrong operator for
+    the other spin structure.
+    """
     channels = []
     for _key, sp in plan.items():
         tau = np.asarray(sp['atoms']['tau'], dtype=np.float64)

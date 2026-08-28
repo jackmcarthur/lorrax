@@ -557,7 +557,8 @@ def compute_finite_q_mtxels(
 _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nval", "prov_ncond", "prov_nband",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
-               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign")
+               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign",
+               "prov_nspinor", "prov_soc")
 
 #: Word spellings of the two arms, so a deck can say which one it means
 #: rather than carrying a bare ``-1`` whose meaning is a source comment.
@@ -610,7 +611,8 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
 
 def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
                              nb_written, bispinor, skip_vnl, vnl_mode,
-                             vnl_velocity_sign=None) -> None:
+                             vnl_velocity_sign=None, nspinor=None,
+                             soc=None) -> None:
     """Record what this ``dipole.h5`` was built from.
 
     ``vnl_velocity_sign`` is the RESOLVED relative sign of the nonlocal
@@ -622,6 +624,14 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     right -- one global scale of 1.377 on (eps - 1) leaves a 0.3 %
     median residual ON THE IMAGINARY AXIS -- so nothing downstream will
     notice which arm it was handed.
+
+    ``nspinor`` (the WFN's spin representation) and ``soc`` (the RESOLVED
+    j-resolved/j-averaged V_NL choice, ``vnl_setup.soc``) follow the same
+    ``None`` = pre-knob-caller reading.  ``prov_nspinor`` is enforced by
+    ``check_dipole_provenance`` (INVARIANTS row 3: representation is part
+    of the reuse contract); ``prov_soc`` is record-only, because the
+    consuming run cannot derive its own value from a BerkeleyGW WFN.h5
+    (nothing in that file records lspinorb).
     """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     h5.attrs["prov_wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
@@ -635,6 +645,10 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
     if vnl_velocity_sign is not None:
         h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
+    if nspinor is not None:
+        h5.attrs["prov_nspinor"] = int(nspinor)
+    if soc is not None:
+        h5.attrs["prov_soc"] = bool(soc)
 
 
 def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
@@ -682,8 +696,13 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
             "regenerate dipole.h5 with `python -m psp.get_dipole_mtxels` "
             "to make it checkable.")
 
+    # ``prov_nspinor`` rides the present-key filter below: a legacy file
+    # that predates the stamp is accepted (same reading as every other
+    # prov_* attr), while a STAMPED mismatch refuses — a dipole.h5 built
+    # from an nspinor=1 WFN has the right shape for an nspinor=2 run of
+    # the same crystal and vice versa (INVARIANTS row 3: representation).
     want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
-            "prov_nband": int(nband)}
+            "prov_nband": int(nband), "prov_nspinor": int(wfn.nspinor)}
     if fingerprint_checkable:
         want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     bad = [(k, attrs[k], v) for k, v in want.items()
@@ -692,7 +711,8 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
         sanity.warn(
-            f"{path} was generated from a DIFFERENT DFT solution or band "
+            f"{path} was generated from a DIFFERENT DFT solution, spin "
+            f"representation, or band "
             f"window than this run ({detail}).  dipole.h5 has the right "
             f"shape either way, so nothing downstream will notice: the q→0 "
             f"head S(ω), and every Σ_SX/Σ_COH correction built from it, "
@@ -782,6 +802,18 @@ def main(argv=None):
 		     "THE FOUR tests/regression decks do not carry their UPFs (only "
 		     "cohsex_debug does), so a fixture re-cut from a clean checkout "
 		     "needs this flag — see gw.kin_ion_io, which has had it all along.",
+	)
+	parser.add_argument(
+		"--soc",
+		choices=("auto", "true", "false"),
+		default="auto",
+		help="Which V_NL projectors to build from a FULLY-RELATIVISTIC "
+		     "pseudopotential: 'true' = j-resolved (spin-orbit ON), "
+		     "'false' = j-averaged scalar-relativistic (QE average_pp), "
+		     "'auto' (default) reads QE's <spinorbit> when available and "
+		     "otherwise announces its resolution.  Same contract as "
+		     "gw.kin_ion_io --soc; nspinor=2 (noncollinear) does NOT imply "
+		     "spin-orbit and a BerkeleyGW WFN.h5 records nspinor only.",
 	)
 	parser.add_argument(
 		"--vnl-velocity-sign",
@@ -1107,6 +1139,7 @@ def main(argv=None):
 		meta,
 		pseudos,
 		nspinor=int(wfn.nspinor),
+		soc={"auto": None, "true": True, "false": False}[args.soc],
 	)
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
@@ -1541,7 +1574,8 @@ def main(argv=None):
 				h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
 				nband=nband, nb_written=nb, bispinor=bispinor,
 				skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
-				vnl_velocity_sign=vnl_velocity_sign)
+				vnl_velocity_sign=vnl_velocity_sign,
+				nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc))
 			if rho_cvkq is not None:
 				fq = h5.create_group('finite_q')
 				fq.create_dataset('rho_cvkq', data=rho_cvkq)

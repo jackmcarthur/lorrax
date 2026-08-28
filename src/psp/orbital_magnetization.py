@@ -456,6 +456,11 @@ def main(argv=None):
     p.add_argument("--vnl-sign", choices=["auto", "plus", "minus"], default="auto",
                    help="Kinetic/nonlocal relative sign: 'auto' uses the "
                         "Hellmann-Feynman group-velocity check (recommended)")
+    p.add_argument("--soc", choices=("auto", "true", "false"), default="auto",
+                   help="V_NL from an FR pseudo: j-resolved (true) / j-averaged "
+                        "average_pp (false) / announced assumption (auto; a "
+                        "BGW WFN.h5 records nspinor only, never lspinorb).  "
+                        "Same contract as gw.kin_ion_io --soc.")
     p.add_argument("--skip-vnl", action="store_true",
                    help="DIAGNOSTIC: kinetic-only velocity (physically incomplete)")
     p.add_argument("--ibz", action="store_true",
@@ -534,7 +539,9 @@ def main(argv=None):
 
     vnl_setup = None
     if not args.skip_vnl:
-        vnl_setup = vnl_ops.build_vnl_setup(wfn, sym, meta, pseudos, nspinor=nspinor)
+        vnl_setup = vnl_ops.build_vnl_setup(
+            wfn, sym, meta, pseudos, nspinor=nspinor,
+            soc={"auto": None, "true": True, "false": False}[args.soc])
 
     nrk = int(wfn.nkpts)
     if not args.ibz and nrk < int(sym.nk_tot):

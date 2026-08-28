@@ -165,7 +165,7 @@ def build_ionic_and_core(
     q_max = float(np.max(G_norm_flat))
 
     # ── Species data + radial tables (all CPU, one pass) ──
-    species_list = extract_species(pseudos, nspinor=int(getattr(wfn, 'nspinor', 2)))
+    species_list = extract_species(pseudos)
     tables = build_all_tables(species_list, q_max, n_q)
     species_natoms, species_tau, max_atoms = build_atom_species_map(wfn, species_list)
     n_sp = len(species_list)

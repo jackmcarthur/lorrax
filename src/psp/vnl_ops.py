@@ -110,7 +110,7 @@ class VNLKData:
 SOC_BANNER = "=" * 78
 
 
-def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor=1,
+def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor,
                      caller: str = "", print_fn=print) -> bool:
     """Decide j-RESOLVED vs j-AVERAGED projectors, and SAY SO.
 
@@ -126,15 +126,22 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor=1,
     2. ``wfn.spinorbit`` — QE's ``<spinorbit>`` from ``data-file-schema.xml``,
        present when the structure came from a QE ``.save`` (see
        ``file_io.qe_save_reader``).  AUTHORITATIVE.
-    3. Nothing.  UNDETERMINED → keep the historical j-resolved default and
-       print the banner below.
+    3. Nothing.  UNDETERMINED → nspinor=2 keeps the historical j-resolved
+       default and prints the banner below; nspinor=1 is FORCED to the
+       j-averaged operator (announced) — a j-resolved V_NL needs 2-component
+       spinors, so there is only one representable choice.  This matches QE,
+       which runs ``average_pp`` for any lspinorb=.false. start.
+
+    RAISES ``ValueError`` for soc=True (from either authoritative source)
+    with nspinor=1: a j-resolved V_NL has no representation on one-component
+    wavefunctions, and truncating it to the E^{↑↑} block is m-dependent and
+    is NOT the scalar-relativistic operator.
 
     Returns the resolved ``soc`` bool to hand to ``build_E_blocks_full``.
 
     WHEN THIS RETURNS QUIETLY (the FALSE branch, i.e. no announcement):
       * no pseudo resolves j (scalar-relativistic UPF, or ℓ=0 only) — there is
         no choice to make, both paths build the same operator;
-      * nspinor == 1 and no pseudo resolves j — same;
       * an authoritative signal exists and it agrees with what will be built.
     Those are real cases that occur in this repo's own fixtures, so the check
     is not vacuously loud.
@@ -161,6 +168,16 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor=1,
     worst_ev = worst_ry * 13.605693122994
 
     if declared is None:
+        if nspinor == 1:
+            # FORCED, not assumed: one-component wavefunctions admit only
+            # the j-averaged operator, so the undetermined case has a
+            # unique representable resolution (= QE average_pp).
+            print_fn(f"{tag}V_NL: j-AVERAGED (scalar-relativistic, QE "
+                     f"average_pp), forced by nspinor=1.  FR pseudos "
+                     f"{sorted(j_pseudos)}, discarding "
+                     f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
+                     f"spin-orbit.")
+            return False
         # ── UNDETERMINED.  Announce; do not decide silently. ──
         print_fn(f"\n{SOC_BANNER}")
         print_fn(f"{tag}SPIN-ORBIT MODE UNDETERMINED — assuming lspinorb=.TRUE.")
@@ -185,18 +202,21 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor=1,
 
     declared = bool(declared)
     if declared:
+        if nspinor == 1:
+            raise ValueError(
+                f"{tag}soc=True (from {source}) is impossible with nspinor=1: "
+                f"a j-resolved V_NL has no representation on one-component "
+                f"wavefunctions — truncating it to the E^{{↑↑}} block is "
+                f"m-dependent and is NOT the scalar-relativistic operator.  "
+                f"got: soc=True, nspinor=1 (FR pseudos {sorted(j_pseudos)}, "
+                f"ΔD = {worst_ry:.6f} Ry at stake); "
+                f"want: soc=False (j-averaged, QE average_pp) with nspinor=1, "
+                f"or soc=True with an nspinor=2 WFN; "
+                f"fix: pass soc=False / --soc false for a scalar-relativistic "
+                f"run, or supply the 2-component wavefunctions.")
         print_fn(f"{tag}V_NL: j-RESOLVED (spin-orbit ON), from {source}.  "
                  f"FR pseudos {sorted(j_pseudos)}, "
                  f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV.")
-        if nspinor == 1:
-            print_fn(f"\n{SOC_BANNER}")
-            print_fn(f"{tag}MISMATCH: spin-orbit requested with nspinor=1.")
-            print_fn(SOC_BANNER)
-            print_fn("  A j-resolved V_NL has no representation on one-component")
-            print_fn("  wavefunctions: only the E^{↑↑} block is retained, which is")
-            print_fn("  m-dependent and is NOT the scalar-relativistic operator.")
-            print_fn("  Pass soc=False for a scalar-relativistic run.")
-            print_fn(SOC_BANNER + "\n")
         return True
 
     # declared False, and the pseudos DO resolve j → the averaged path
@@ -227,8 +247,9 @@ def build_vnl_setup(
     soc : bool, optional — j-RESOLVED (True) vs j-AVERAGED (False) projectors.
         ``None`` (default) means "not declared": ``resolve_soc_mode`` looks for
         a QE ``<spinorbit>`` flag and, failing that, keeps the historical
-        j-resolved behaviour and ANNOUNCES the assumption.  See
-        ``psp.radial.build_projectors_qe`` for why noncolin ≠ lspinorb.
+        j-resolved behaviour and ANNOUNCES the assumption (nspinor=2), or is
+        FORCED to j-averaged (nspinor=1).  ``soc=True`` with nspinor=1 raises.
+        See ``psp.radial.build_projectors_qe`` for why noncolin ≠ lspinorb.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables
@@ -267,7 +288,7 @@ def build_vnl_setup(
     q_max *= 1.01
 
     # Extract species data and projector tables
-    species_list = extract_species(pseudos, nspinor=nspinor)
+    species_list = extract_species(pseudos)
     tables = build_all_tables(species_list, q_max, n_q)
     species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
     q_grid = tables["q"]
