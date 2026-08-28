@@ -1015,15 +1015,14 @@ def main(argv=None):
     report.begin(input_file=args.input)
     report.architecture(mesh_role="band-matrix axes X x Y")
 
-    # Persistent compile cache — same call, same position (after the
-    # distributed init, before any jit) as gw.gw_jax:145.  Without it this
-    # CLI re-lowers every kernel on every invocation, which at nb=256 is
-    # most of the wall: 40 s of recorded sections inside a 124 s run.  The
-    # per-k kernels here recompile once per DISTINCT ngk (see the COMPILE
-    # NOTE in compute_hartree_matrix), so the miss count is the IBZ k-count,
-    # not one.
-    from common.jax_compile_cache import ensure_jax_compile_cache
-    ensure_jax_compile_cache()
+    # Persistent compile cache: already armed at import, by step 7 of this
+    # module's ``initialize_communicator_stack`` (runtime/__init__.py:1491),
+    # which is above every jit here.  It is not optional for this CLI —
+    # without a cache it re-lowers every kernel on every invocation, which
+    # at nb=256 is most of the wall: 40 s of recorded sections inside a
+    # 124 s run.  The per-k kernels recompile once per DISTINCT ngk (see
+    # the COMPILE NOTE in compute_hartree_matrix), so the miss count is the
+    # IBZ k-count, not one.
 
     # ---- the multi-rank contract: DISTRIBUTE, then write once -----------
     # This used to refuse ``srun -n P`` outright, because every rank redid

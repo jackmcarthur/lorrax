@@ -442,12 +442,8 @@ def main():
         warning_fn=production_warnings.append)
     production_stdout.install()
 
-    try:
-        from common.jax_compile_cache import ensure_jax_compile_cache
-        ensure_jax_compile_cache()
-    except Exception as e:
-        print0(f"  [jax compile cache] skipped: {e}")
-
+    # (the compile cache was armed at import, by step 7 of this module's
+    # ``initialize_communicator_stack`` -- runtime/__init__.py:1491)
     print0(f"✓ JAX initialized: {dist.device_summary()}")
 
     timing.reset()
