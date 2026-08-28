@@ -967,39 +967,25 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
     return tuple(out)
 
 
-def _local_shard_and_global_offset(
-    A: jax.Array,
-) -> tuple[np.ndarray, tuple[int, ...]]:
-    """Return ``(local_numpy, global_offset)`` for the process-local shard.
-
-    LORRAX runs one JAX device per process under multi-process (mesh on
-    ``mesh_xy``), so each process has exactly one addressable shard.
-
-    The shard's ``.index`` is a tuple of ``slice`` objects giving the
-    GLOBAL start/stop along each axis.  Slabs are always contiguous
-    along each axis (no broadcast tiling) so ``.start`` is the offset
-    within A.shape.  Replicated axes give ``slice(0, A.shape[ax])`` —
-    every process holds the full axis and writes the same overlapping
-    rows; under independent MPI-IO that's a redundant write but
-    semantically correct (every rank writes identical bytes).
-    """
-    shards = A.addressable_shards
-    if len(shards) != 1:
-        # Multi-device-per-process (e.g. GPU with N visible devices
-        # under a single process).  Not the LORRAX CPU mesh-xy regime
-        # but worth a clear error rather than silent wrong data.
-        raise RuntimeError(
-            f"SlabIO expects 1 addressable shard per process; "
-            f"got {len(shards)} for A.shape={tuple(A.shape)}.  Did you "
-            f"set --xla_force_host_platform_device_count > 1 on a "
-            f"multi-process run?")
-    shard = shards[0]
-    local = np.asarray(shard.data)
-    # Replicated axes have ``slice(None, None)`` (no explicit bounds);
-    # treat ``start=None`` as 0 (the full-axis slab starts at 0).
-    offset = tuple(int(s.start) if s.start is not None else 0
-                   for s in shard.index)
-    return local, offset
+# ``_local_shard_and_global_offset`` — "one addressable shard per process,
+# and here is its global offset" — was DELETED on 2026-08-27, for the same
+# reason as ``_shard_read_plan`` below and with the same evidence.  A
+# repo-wide grep at a28b9daa over src/ services/ tests/ tools/ config/
+# docs/ found the definition here and NO call site: the only live copy is
+# ``wfn_loader._collectives._local_shard_and_global_offset``, whose own
+# docstring records that it was ported from this file verbatim, and which
+# ``wfn_loader.loader`` does call.
+#
+# It had to go now rather than later because it was actively misleading
+# about THIS module.  Its refusal read "SlabIO expects 1 addressable shard
+# per process; got N ... Did you set
+# --xla_force_host_platform_device_count > 1 on a multi-process run?",
+# sitting in the transport that ``file_io._slab_io_serial`` extends —
+# where four addressable shards in one process is now the SUPPORTED
+# geometry and is exactly what the serial tier iterates.  A dead helper
+# stating a constraint the live code does not have is worse than no
+# helper: the next reader has to prove it is dead before trusting the
+# tier beside it.
 
 
 # ``_shard_read_plan`` — the per-device (local_shape, dst, disk) hyperslab
