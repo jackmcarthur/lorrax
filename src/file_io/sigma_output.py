@@ -4,6 +4,7 @@ import numpy as np
 import h5py
 
 from common.provenance import provenance_header
+from .hdf5_owner import STACK_H5PY, open_scope
 
 # THE STAMP CONTRACT IS ``kin_ion``'s, IMPORTED RATHER THAN RESTATED.
 # ``sigma_mnk.h5`` and ``kin_ion.h5`` now both store a k axis that may be
@@ -129,6 +130,61 @@ SIGMA_CUBE_DATASETS = (
 	"sigma_sx_kij_ev",
 	"hartree_kij_ev",
 )
+
+#: Meaning of the four operator cubes above.  They are deliberately the
+#: unconditioned operators produced by the Sigma kernel: full off-diagonals
+#: intact, before the output-side BGW degenerate-set projection.  Changing
+#: those arrays in place would silently change the QSGW/SC artifact and every
+#: operator consumer merely to repair a band-diagonal text reconstruction.
+#: The small :data:`EQP_ASSEMBLY_DATASET` receipt below owns the completed
+#: output assembly meaning instead.
+SIGMA_OPERATOR_STATE_ATTR = "sigma_operator_state"
+SIGMA_OPERATOR_STATE_VERSION_ATTR = "sigma_operator_state_version"
+SIGMA_OPERATOR_STATE_VERSION = 1
+SIGMA_OPERATOR_STATE_RAW = "raw_pre_output_conditioning"
+
+#: Canonical receipt persisted only AFTER live :func:`assemble_eqp` returns.
+#: The full cubes remain raw; the primary dataset holds the exact
+#: source-resolved H, X, and derived C(E_DFT) carried by that EqpAssembly.
+#: Its small companion holds the output-conditioned C(omega) diagonal curve
+#: from which the same assembler derived both C(E_DFT) and Z.  H/X/C are all
+#: DFT-band basis; dynamic SC refuses until its full C(omega) operator is
+#: consistently rotated instead of stamping a mixed-basis sum as usable.
+#: A post-hoc reader therefore consumes the receipt rather than attempting to
+#: reconstruct the projection from energies or deck settings it may not own.
+EQP_ASSEMBLY_DATASET = "eqp_assembly_conditioned_diagonals_ev"
+EQP_ASSEMBLY_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_diagonals_ev_candidate")
+EQP_ASSEMBLY_C_OMEGA_DATASET = "eqp_assembly_conditioned_sigma_c_omega_diag_ev"
+EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_sigma_c_omega_diag_ev_candidate")
+EQP_ASSEMBLY_EXPECTED_DATASET = "eqp_assembly_receipt_expected"
+EQP_ASSEMBLY_SCHEMA_VERSION_ATTR = "schema_version"
+# v1 lacked final H/X/C and fail-closed creation semantics.  v2 was the
+# pushed-but-held intermediate that persisted pre-assembly C(E_DFT) while
+# deriving Z from the raw curve.  Neither byte meaning may collide with this
+# post-assembly, one-conditioned-curve schema.
+EQP_ASSEMBLY_SCHEMA_VERSION = 3
+EQP_ASSEMBLY_STATE_ATTR = "state"
+EQP_ASSEMBLY_STATE_READY = "assembled"
+EQP_ASSEMBLY_HX_BASIS_ATTR = "hartree_exchange_basis"
+EQP_ASSEMBLY_C_BASIS_ATTR = "correlation_basis"
+EQP_ASSEMBLY_DFT_BAND_BASIS = "dft_band"
+EQP_ASSEMBLY_K_STORAGE_ATTR = "k_storage"
+EQP_ASSEMBLY_K_STORAGE_WEDGE = "file_wedge"
+EQP_ASSEMBLY_FILE_ROWS_ATTR = "file_wedge_full_bz_rows"
+EQP_ASSEMBLY_HARTREE_STATE_ATTR = "hartree_state"
+EQP_ASSEMBLY_HARTREE_STATE_RESOLVED = "source_resolved"
+EQP_ASSEMBLY_BAND_START_ATTR = "band_start"
+EQP_ASSEMBLY_BAND_STOP_ATTR = "band_stop"
+EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR = "degeneracy_policy"
+EQP_ASSEMBLY_DEGENERACY_TOL_ATTR = "degeneracy_tol_ry"
+EQP_ASSEMBLY_DEGENERACY_POLICIES = (
+	"bgw_average",
+	"disabled",
+)
+EQP_ASSEMBLY_HARTREE_SOURCE_ATTR = "hartree_source"
+EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR = "kin_ion_has_hartree"
 
 #: The datasets the OPT-IN ``write_qsgw_datasets`` deck key adds, in the
 #: order a reader meets them.  They are the plotting payload: the static
@@ -1177,7 +1233,21 @@ def write_sigma_omega_h5(
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
 	hartree_kij_ev = payload["hartree_kij_ev"]
 
+	def _operator_attrs(name):
+		"""k-storage stamps plus the one meaning shared by every raw cube."""
+		at = dict(_attrs(name) or {})
+		at[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+		at[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+		return at
+
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
+		# Creation-time promise, before the later live assemble_eqp append.
+		# If the run stops after this writer closes but before that append, a
+		# reader sees an expected-receipt artifact with no receipt and fails closed.
+		io.write_attr(
+			EQP_ASSEMBLY_EXPECTED_DATASET,
+			np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, dtype=np.int32),
+		)
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
 		# The ω axis's own reference, stamped ON the ω axis — one place to
 		# look, and it cannot drift away from the array it describes.
@@ -1211,24 +1281,24 @@ def write_sigma_omega_h5(
 				np.asarray(sym_idx_k, dtype=np.int32))
 		io.create_dataset("sigma_total_kij_ev",
 			shape=shape_ref, dtype=np.complex128,
-			attrs=_attrs("sigma_total_kij_ev"))
+			attrs=_operator_attrs("sigma_total_kij_ev"))
 		io.write_slab("sigma_total_kij_ev", total)
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
 				shape=shape_ref, dtype=np.complex128,
-				attrs=_attrs("sigma_c_kij_ev"))
+				attrs=_operator_attrs("sigma_c_kij_ev"))
 			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=tuple(sigma_sx_kij_ev.shape),
 				dtype=np.complex128,
-				attrs=_attrs("sigma_sx_kij_ev"))
+				attrs=_operator_attrs("sigma_sx_kij_ev"))
 			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
 		if hartree_kij_ev is not None:
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
 				dtype=np.complex128,
-				attrs=_attrs("hartree_kij_ev"))
+				attrs=_operator_attrs("hartree_kij_ev"))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
 		if eval_rel_extracted is not None:
 			# The two facts that make this array usable ride ON it: which
@@ -1267,6 +1337,43 @@ def write_sigma_omega_h5(
 	return abs_path
 
 
+def _omega_metadata_from_open_h5(h5):
+	"""Return the small omega axis plus its optional reference stamps."""
+	if OMEGA_DATASET not in h5:
+		return None, None, None
+	ds = h5[OMEGA_DATASET]
+	omega = np.asarray(ds[()], dtype=np.float64)
+	if OMEGA_REFERENCE_ATTR not in ds.attrs:
+		return omega, None, None
+	ref = float(ds.attrs[OMEGA_REFERENCE_ATTR])
+	prov = ds.attrs.get(OMEGA_REFERENCE_PROVENANCE_ATTR, "unstated")
+	if isinstance(prov, bytes):
+		prov = prov.decode("utf-8")
+	return omega, ref, str(prov)
+
+
+def _eval_metadata_from_open_h5(h5):
+	"""Return the small evaluation-energy stamp from an already-open file."""
+	if SIGMA_EVAL_DATASET not in h5:
+		return None, None, None
+	ds = h5[SIGMA_EVAL_DATASET]
+	arr = np.asarray(ds[()], dtype=np.float64)
+	prov = ds.attrs.get(SIGMA_EVAL_PROVENANCE_ATTR, "unstated")
+	cov = None
+	if OMEGA_COVERAGE_N_ATTR in ds.attrs:
+		pol = ds.attrs.get(OMEGA_COVERAGE_POLICY_ATTR, "unstated")
+		cov = {
+			"n_uncovered": int(ds.attrs[OMEGA_COVERAGE_N_ATTR]),
+			"fraction_uncovered": float(
+				ds.attrs.get(OMEGA_COVERAGE_FRAC_ATTR, 0.0)),
+			"policy": (pol.decode("utf-8")
+			           if isinstance(pol, bytes) else str(pol)),
+		}
+	if isinstance(prov, bytes):
+		prov = prov.decode("utf-8")
+	return arr, str(prov), cov
+
+
 def read_omega_reference(filepath):
 	"""``(reference_ev, provenance)`` off a ``sigma_mnk.h5``, or ``(None, None)``.
 
@@ -1277,17 +1384,11 @@ def read_omega_reference(filepath):
 	made silently, is the defect the stamp exists to close.
 	"""
 	abs_path = os.path.abspath(filepath)
-	with h5py.File(abs_path, "r") as h5:
-		if OMEGA_DATASET not in h5:
-			return None, None
-		attrs = h5[OMEGA_DATASET].attrs
-		if OMEGA_REFERENCE_ATTR not in attrs:
-			return None, None
-		ref = float(attrs[OMEGA_REFERENCE_ATTR])
-		prov = attrs.get(OMEGA_REFERENCE_PROVENANCE_ATTR, "unstated")
-	if isinstance(prov, bytes):
-		prov = prov.decode("utf-8")
-	return ref, str(prov)
+	with open_scope(
+			abs_path, STACK_H5PY, "r", where="read_omega_reference"), \
+			h5py.File(abs_path, "r") as h5:
+		_omega, ref, prov = _omega_metadata_from_open_h5(h5)
+	return ref, prov
 
 
 def read_eval_energies(filepath):
@@ -1307,25 +1408,565 @@ def read_eval_energies(filepath):
 	through the same ``k_irr_rows_for`` it uses for the cubes.
 	"""
 	abs_path = os.path.abspath(filepath)
-	with h5py.File(abs_path, "r") as h5:
-		if SIGMA_EVAL_DATASET not in h5:
-			return None, None, None
-		ds = h5[SIGMA_EVAL_DATASET]
-		arr = np.asarray(ds[()], dtype=np.float64)
-		prov = ds.attrs.get(SIGMA_EVAL_PROVENANCE_ATTR, "unstated")
-		cov = None
-		if OMEGA_COVERAGE_N_ATTR in ds.attrs:
-			pol = ds.attrs.get(OMEGA_COVERAGE_POLICY_ATTR, "unstated")
-			cov = {
-				"n_uncovered": int(ds.attrs[OMEGA_COVERAGE_N_ATTR]),
-				"fraction_uncovered": float(
-					ds.attrs.get(OMEGA_COVERAGE_FRAC_ATTR, 0.0)),
-				"policy": (pol.decode("utf-8")
-				           if isinstance(pol, bytes) else str(pol)),
-			}
-	if isinstance(prov, bytes):
-		prov = prov.decode("utf-8")
-	return arr, str(prov), cov
+	with open_scope(
+			abs_path, STACK_H5PY, "r", where="read_eval_energies"), \
+			h5py.File(abs_path, "r") as h5:
+		return _eval_metadata_from_open_h5(h5)
+
+
+def read_sigma_eqp_diagonal_window(
+	filepath, *, full_bz_rows, band_start: int, band_stop: int,
+):
+	"""Read only the legacy EQP diagonals and their small axis metadata.
+
+	This is the sole legacy raw-operator reader for post-hoc EQP assembly.
+	It resolves file-wedge rows through :func:`read_star_map` and
+	:func:`k_irr_rows_for`, then issues scalar/vector diagonal hyperslabs;
+	neither a full ``(nω,nk,nb,nb)`` cube nor a full ``(nk,nb,nb)`` matrix
+	is ever materialized on rank 0.  New schema-v3 artifacts do not call this
+	function at all: they are served by their small completed-assembly receipt.
+	"""
+	abs_path = os.path.abspath(filepath)
+	b0, b1 = int(band_start), int(band_stop)
+	if b0 < 0 or b1 <= b0:
+		raise ValueError(f"invalid EQP band window [{b0},{b1}).")
+	requested_rows = np.asarray(full_bz_rows, dtype=np.int64)
+	if requested_rows.ndim != 1:
+		raise ValueError(
+			f"full_bz_rows must be one-dimensional; got {requested_rows.shape}.")
+
+	# The outer owner claim protects both the canonical star-map reader's
+	# nested h5py open and the diagonal hyperslab open below.  Same-stack
+	# nesting is legal; an overlapping FFI writer refuses at this one door.
+	with open_scope(
+			abs_path, STACK_H5PY, "r",
+			where="read_sigma_eqp_diagonal_window"):
+		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
+		if star is None:
+			k_rows = requested_rows
+		else:
+			k_rows = k_irr_rows_for(
+				requested_rows, star[0],
+				what=f"{os.path.basename(abs_path)} (legacy EQP diagonal reader)")
+		with h5py.File(abs_path, "r") as h5:
+			missing = [name for name in (
+				"sigma_sx_kij_ev", "hartree_kij_ev", "sigma_c_kij_ev")
+				if name not in h5]
+			if missing:
+				raise KeyError(
+					f"{os.path.basename(abs_path)} lacks legacy Sigma datasets "
+					f"{missing}.")
+			x_ds = h5["sigma_sx_kij_ev"]
+			h_ds = h5["hartree_kij_ev"]
+			c_ds = h5["sigma_c_kij_ev"]
+			omega, omega_ref, omega_prov = _omega_metadata_from_open_h5(h5)
+			if omega is None:
+				raise KeyError(f"{os.path.basename(abs_path)} lacks {OMEGA_DATASET!r}.")
+			if (x_ds.ndim != 3 or h_ds.shape != x_ds.shape
+					or c_ds.ndim != 4 or c_ds.shape[1:] != x_ds.shape
+					or x_ds.shape[1] != x_ds.shape[2]
+					or c_ds.shape[0] != omega.size
+					or b1 > x_ds.shape[1]):
+				raise ValueError(
+					f"malformed legacy Sigma shapes: omega={omega.shape}, "
+					f"X={x_ds.shape}, H={h_ds.shape}, C={c_ds.shape}, "
+					f"requested bands=[{b0},{b1}).")
+			if k_rows.size and (
+					int(np.min(k_rows)) < 0 or int(np.max(k_rows)) >= x_ds.shape[0]):
+				raise ValueError(
+					f"legacy Sigma row request {k_rows.tolist()} exceeds "
+					f"{x_ds.shape[0]} stored rows.")
+			nk, nb = requested_rows.size, b1 - b0
+			x_diag = np.empty((nk, nb), dtype=np.complex128)
+			h_diag = np.empty((nk, nb), dtype=np.complex128)
+			c_diag = np.empty((omega.size, nk, nb), dtype=np.complex128)
+			for ik, row in enumerate(k_rows):
+				for ib, band in enumerate(range(b0, b1)):
+					x_diag[ik, ib] = x_ds[int(row), band, band]
+					h_diag[ik, ib] = h_ds[int(row), band, band]
+					c_diag[:, ik, ib] = c_ds[:, int(row), band, band]
+			eval_rel, eval_prov, eval_cov = _eval_metadata_from_open_h5(h5)
+			if eval_rel is not None:
+				if (eval_rel.ndim != 2 or b1 > eval_rel.shape[1]
+						or (k_rows.size and int(np.max(k_rows)) >= eval_rel.shape[0])):
+					raise ValueError(
+						f"{SIGMA_EVAL_DATASET} has shape {eval_rel.shape}; "
+						f"cannot select file rows {k_rows.tolist()} and bands "
+						f"[{b0},{b1}).")
+				eval_rel = np.asarray(
+					eval_rel[k_rows, b0:b1], dtype=np.float64)
+	return {
+		"omega_rel_ev": omega,
+		"omega_reference_ev": omega_ref,
+		"omega_reference_provenance": omega_prov,
+		"sigma_x_diag_ev": x_diag,
+		"hartree_diag_ev": h_diag,
+		"sigma_c_omega_diag_ev": c_diag,
+		"eval_energies_rel_ev": eval_rel,
+		"eval_energies_provenance": eval_prov,
+		"eval_coverage": eval_cov,
+		"file_rows": np.asarray(k_rows, dtype=np.int64),
+	}
+
+
+def _raw_operator_stamp_errors(h5):
+	"""Return ``(present, bad)`` for the exact raw-operator contract."""
+	def _text(value):
+		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+	present = [name for name in SIGMA_CUBE_DATASETS if name in h5]
+	bad = []
+	for name in present:
+		attrs = h5[name].attrs
+		try:
+			version = int(attrs.get(SIGMA_OPERATOR_STATE_VERSION_ATTR, -1))
+		except (TypeError, ValueError):
+			version = -1
+		if (_text(attrs.get(SIGMA_OPERATOR_STATE_ATTR, "missing"))
+				!= SIGMA_OPERATOR_STATE_RAW
+				or version != SIGMA_OPERATOR_STATE_VERSION):
+			bad.append(name)
+	return present, bad
+
+
+def append_eqp_assembly_receipt_h5(
+	filepath, *,
+	assembly,
+	file_wedge_full_bz_rows,
+	degeneracy_policy: str,
+	degeneracy_tol_ry: float,
+	print_fn=None,
+):
+	"""Persist one completed ``EqpAssembly`` beside the raw Sigma operators.
+
+	The assembler, not this format owner, produces H/X/C(E_DFT) and the
+	conditioned C(omega) curve.  This function validates and transcribes that
+	completed payload; it never accepts independent operand arrays that could
+	drift from what live eqp0/eqp1 used.  The full operator cubes remain raw.
+	Call on rank 0 after collective cube close and after ``assemble_eqp``.
+
+	The k rows come from the caller, not from the file, because two
+	different k-sets meet here.  ``sigma_mnk.h5`` stores the STAR wedge
+	(one row per symmetry orbit, what :func:`extract_and_stamp_k_irr`
+	keeps).  The completed assembly is on the FILE wedge (``wfn.kpoints``,
+	the rows eqp0/eqp1 are written on, which is what
+	:attr:`EQP_ASSEMBLY_FILE_ROWS_ATTR` names).  They have the same length
+	only when nk_red == n_orbits: gnppm_debug is 9 and 5, bispinor_debug 9
+	and 5, cohsex_debug 4 and 3, while si_cohsex_debug, si_bse_debug and
+	hbn_cohsex_debug coincide.  Deriving one from the other refused correct
+	assemblies on the first group until 2026-08-27, and the star map cannot
+	supply the file wedge: it labels each full-BZ k with its orbit and says
+	nothing about which k the WFN stored.
+
+	``file_wedge_full_bz_rows`` is checked, not trusted: one row per
+	assembly row, distinct, in range for the cube's mesh, and every stored
+	star reached by at least one row.  The last is the part with content —
+	a file wedge reaches the whole zone under the group, so an assembly
+	short a star, or on another deck's k-set, fails it.
+	"""
+	abs_path = os.path.abspath(filepath)
+	if not os.path.isfile(abs_path):
+		raise FileNotFoundError(
+			f"append_eqp_assembly_receipt_h5: {abs_path} does not exist; the "
+			"receipt belongs to an existing sigma_mnk.h5 and never creates one.")
+
+	if assembly.sigma_c_omega_diag_ev is None:
+		raise ValueError(
+			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly carrying "
+			"its conditioned C(omega) curve.")
+	h = np.asarray(assembly.hartree_diag_ev, dtype=np.float64)
+	x = np.asarray(assembly.sigma_x_diag_ev, dtype=np.float64)
+	c = np.asarray(assembly.sigma_c_at_dft_diag_ev, dtype=np.complex128)
+	c_omega = np.asarray(
+		assembly.sigma_c_omega_diag_ev, dtype=np.complex128)
+	if h.ndim != 2 or x.shape != h.shape or c.shape != h.shape:
+		raise ValueError(
+			"EQP assembly receipt needs matching (nk_file_wedge, nb_window) "
+			f"H/X/C(E_DFT) diagonals; got H {h.shape}, X {x.shape}, C {c.shape}.")
+	if c_omega.ndim != 3 or c_omega.shape[1:] != h.shape:
+		raise ValueError(
+			"EQP assembly receipt needs the completed assembly's conditioned "
+			f"C(omega) curve with shape (n_omega,{h.shape[0]},{h.shape[1]}); "
+			f"got {c_omega.shape}.")
+	if assembly.z_factor is None:
+		raise ValueError(
+			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly with Z "
+			"derived from its conditioned C(omega) curve.")
+	b0, b1 = int(assembly.band_offset), int(assembly.band_offset + h.shape[1])
+	if b0 < 0 or b1 <= b0 or h.shape[1] != b1 - b0:
+		raise ValueError(
+			f"EQP assembly receipt band window [{b0},{b1}) has width {b1-b0}, "
+			f"but the arrays have width {h.shape[1]}.")
+	if not all(np.all(np.isfinite(a)) for a in (h, x, c, c_omega)):
+		raise ValueError(
+			"EQP assembly receipt refuses non-finite H/X/C/C(omega) diagonals.")
+	policy = str(degeneracy_policy)
+	if policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES:
+		raise ValueError(
+			f"unknown EQP degeneracy policy {policy!r}; expected one of "
+			f"{EQP_ASSEMBLY_DEGENERACY_POLICIES}.")
+	tol_ry = float(degeneracy_tol_ry)
+	if not np.isfinite(tol_ry) or tol_ry < 0.0:
+		raise ValueError(
+			"EQP degeneracy tolerance must be finite and non-negative; got "
+			f"{degeneracy_tol_ry!r}.")
+	if assembly.hartree_rule not in ("suppressed", "substituted", "as-given"):
+		raise ValueError(
+			f"unknown completed EqpAssembly Hartree rule "
+			f"{assembly.hartree_rule!r}.")
+	if bool(assembly.kin_ion_has_hartree) != (
+			assembly.hartree_source == "folded"):
+		raise ValueError(
+			"completed EqpAssembly Hartree provenance disagrees: "
+			f"source={assembly.hartree_source!r}, "
+			f"kin_ion_has_hartree={assembly.kin_ion_has_hartree!r}.")
+	c_basis = EQP_ASSEMBLY_DFT_BAND_BASIS
+
+	values = np.stack((h, x, c), axis=0)
+	with open_scope(
+			abs_path, STACK_H5PY, "r",
+			where="append_eqp_assembly_receipt_h5 star-map read"):
+		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
+		with h5py.File(abs_path, "r") as raw_h5:
+			nk_raw = int(raw_h5["sigma_c_kij_ev"].shape[1])
+	file_rows = np.asarray(file_wedge_full_bz_rows, dtype=np.int64)
+	if file_rows.ndim != 1 or file_rows.shape != (h.shape[0],):
+		raise ValueError(
+			"EQP assembly receipt file-wedge rows: got shape "
+			f"{file_rows.shape}, want one full-BZ row index per assembly k "
+			f"row, i.e. ({h.shape[0]},).  Fix: pass the same reduction the "
+			"assembly's rows came from, "
+			"symmetry_maps.reduce_full_bz_to_file_wedge(sym, arange(nk_full)), "
+			"never a table the writer holds separately.")
+	if file_rows.size and (int(file_rows.min()) < 0
+			or np.unique(file_rows).size != file_rows.size):
+		raise ValueError(
+			"EQP assembly receipt file-wedge rows must be distinct "
+			f"non-negative full-BZ indices; got {file_rows.tolist()}.")
+	# The mesh the cube's tables describe: without a star map the cube is
+	# the full BZ, with one the tables are (nk_full,).
+	compact = None if star is None else np.asarray(star[0])
+	nk_full = nk_raw if compact is None else int(compact.size)
+	if file_rows.size and int(file_rows.max()) >= nk_full:
+		raise ValueError(
+			"EQP assembly receipt file-wedge row "
+			f"{int(file_rows.max())} is out of range for the "
+			f"{nk_full}-k mesh {os.path.basename(abs_path)} describes; the "
+			"assembly and the cube are not from the same run.")
+	if compact is not None:
+		covered = np.unique(compact[file_rows])
+		if covered.size != nk_raw:
+			raise ValueError(
+				"EQP assembly receipt k-set does not cover the raw cube: "
+				f"{file_rows.size} file-wedge rows reach {covered.size} of "
+				f"the {nk_raw} stars {os.path.basename(abs_path)} stores "
+				f"(stars {covered.tolist()}).  Every stored star must be the "
+				"orbit of at least one row.  Fix: assemble on the run's own "
+				"wfn.kpoints set.")
+	with open_scope(
+			abs_path, STACK_H5PY, "a",
+			where="append_eqp_assembly_receipt_h5"), \
+			h5py.File(abs_path, "a") as h5:
+		present, bad = _raw_operator_stamp_errors(h5)
+		if not present:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} contains none of "
+				f"{list(SIGMA_CUBE_DATASETS)}; refusing to attach an EQP receipt "
+				"to a file that is not a sigma_mnk.h5 artifact.")
+		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
+			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
+		if expected is None:
+			# A truly legacy raw file may be upgraded by this explicit appender.
+			# A new raw-stamped file without the creation marker is instead partial:
+			# accepting it would let an interrupted creation heal itself silently.
+			tagged = [name for name in SIGMA_CUBE_DATASETS if (
+				name in h5 and (
+					SIGMA_OPERATOR_STATE_ATTR in h5[name].attrs
+					or SIGMA_OPERATOR_STATE_VERSION_ATTR in h5[name].attrs))]
+			if tagged:
+				raise ValueError(
+					f"{os.path.basename(abs_path)} has new raw-operator stamps "
+					f"on {tagged} but no {EQP_ASSEMBLY_EXPECTED_DATASET!r} "
+					"marker; refusing a partial creation artifact.")
+			# Explicitly upgrading a truly legacy file also upgrades every
+			# present raw cube to the exact state contract required on all future
+			# new-schema reads.
+			for name in present:
+				h5[name].attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+				h5[name].attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = (
+					SIGMA_OPERATOR_STATE_VERSION)
+			h5.create_dataset(
+				EQP_ASSEMBLY_EXPECTED_DATASET,
+				data=np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, dtype=np.int32))
+		else:
+			try:
+				expected_version = int(expected)
+			except (TypeError, ValueError):
+				expected_version = -1
+		if expected is not None and expected_version != EQP_ASSEMBLY_SCHEMA_VERSION:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} expects EQP receipt schema "
+				f"{expected!r}; this writer only appends schema "
+				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+		if expected is not None and bad:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has partial/unknown raw operator "
+				f"state on {bad}; refusing to append schema "
+				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+		for name in (
+				EQP_ASSEMBLY_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET):
+			if name in h5:
+				del h5[name]
+		ds = h5.create_dataset(EQP_ASSEMBLY_CANDIDATE_DATASET, data=values)
+		h5.create_dataset(
+			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET, data=c_omega)
+		ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR] = EQP_ASSEMBLY_SCHEMA_VERSION
+		ds.attrs[EQP_ASSEMBLY_STATE_ATTR] = EQP_ASSEMBLY_STATE_READY
+		ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR] = EQP_ASSEMBLY_DFT_BAND_BASIS
+		ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR] = c_basis
+		ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR] = EQP_ASSEMBLY_K_STORAGE_WEDGE
+		ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR] = file_rows
+		ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR] = (
+			EQP_ASSEMBLY_HARTREE_STATE_RESOLVED)
+		ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR] = b0
+		ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR] = b1
+		ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR] = policy
+		ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR] = tol_ry
+		ds.attrs[EQP_ASSEMBLY_HARTREE_SOURCE_ATTR] = str(
+			assembly.hartree_source
+			if assembly.hartree_source is not None else "unstated")
+		ds.attrs[EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR] = bool(
+			assembly.kin_ion_has_hartree)
+		h5.flush()
+		for name in (EQP_ASSEMBLY_DATASET, EQP_ASSEMBLY_C_OMEGA_DATASET):
+			if name in h5:
+				del h5[name]
+		h5.move(EQP_ASSEMBLY_CANDIDATE_DATASET, EQP_ASSEMBLY_DATASET)
+		h5.move(
+			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
+			EQP_ASSEMBLY_C_OMEGA_DATASET)
+		h5.flush()
+
+	if print_fn is not None:
+		print_fn(
+			f"  EQP assembly receipt -> {os.path.basename(abs_path)}: "
+			f"assembled H/X/C(E_DFT) {h.shape} + conditioned C(omega) "
+			f"{c_omega.shape}, DFT H/X/C, "
+			f"file wedge, {policy}, "
+			"source-resolved H; C(E_DFT) and Z share the conditioned curve")
+	return abs_path
+
+
+def read_eqp_assembly_receipt(filepath):
+	"""Read and validate the completed H/X/C + conditioned-curve receipt.
+
+	No canonical/candidate dataset means a legacy artifact.  A candidate or
+	unknown/partial canonical schema refuses rather than falling back to raw.
+	"""
+	abs_path = os.path.abspath(filepath)
+
+	def _text(value):
+		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+	with open_scope(
+			abs_path, STACK_H5PY, "r",
+			where="read_eqp_assembly_receipt"), \
+			h5py.File(abs_path, "r") as h5:
+		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
+			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
+		canonical_present = EQP_ASSEMBLY_DATASET in h5
+		curve_present = EQP_ASSEMBLY_C_OMEGA_DATASET in h5
+		candidate_names = [name for name in (
+			EQP_ASSEMBLY_CANDIDATE_DATASET,
+			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET) if name in h5]
+		new_schema = bool(
+			expected is not None or canonical_present or curve_present
+			or candidate_names)
+		present, bad = _raw_operator_stamp_errors(h5)
+		if new_schema:
+			# Every read that claims any new-schema state validates EVERY raw
+			# operator cube first.  A complete receipt never blesses a missing,
+			# unknown, or partially stamped operator payload.
+			if not present or bad:
+				raise ValueError(
+					f"{os.path.basename(abs_path)} has a new EQP schema but "
+					f"partial/unknown raw operator state on {bad or 'no cubes'}.")
+		else:
+			# New creating writers stamp every raw operator cube.  That state
+			# makes the receipt mandatory, so a crash between cube close and the
+			# output append refuses instead of masquerading as a legacy file.
+			tagged = [name for name in present if (
+				SIGMA_OPERATOR_STATE_ATTR in h5[name].attrs
+				or SIGMA_OPERATOR_STATE_VERSION_ATTR in h5[name].attrs)]
+			if tagged:
+				if bad:
+					raise ValueError(
+						f"{os.path.basename(abs_path)} has partial/unknown raw "
+						f"operator-state stamps on {bad}.")
+				raise ValueError(
+					f"{os.path.basename(abs_path)} is a new raw-operator artifact "
+					f"but {EQP_ASSEMBLY_DATASET} is missing; the run stopped "
+					"before its live EQP assembly receipt closed.")
+			return None
+		try:
+			expected_version = int(expected)
+		except (TypeError, ValueError):
+			expected_version = -1
+		if expected is None or expected_version != EQP_ASSEMBLY_SCHEMA_VERSION:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has unknown/partial EQP receipt "
+				f"expectation {expected!r}; expected "
+				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+		if candidate_names:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has an interrupted "
+				f"candidate write {candidate_names}; refusing a stale or "
+				"partial EQP reconstruction.")
+		if not canonical_present or not curve_present:
+			missing = [name for name, there in (
+				(EQP_ASSEMBLY_DATASET, canonical_present),
+				(EQP_ASSEMBLY_C_OMEGA_DATASET, curve_present)) if not there]
+			raise ValueError(
+				f"{os.path.basename(abs_path)} expects an EQP assembly receipt "
+				f"but {missing} is missing.")
+		ds = h5[EQP_ASSEMBLY_DATASET]
+		if not isinstance(ds, h5py.Dataset):
+			raise ValueError(f"{EQP_ASSEMBLY_DATASET} is not an HDF5 dataset.")
+		required_attrs = (
+			EQP_ASSEMBLY_SCHEMA_VERSION_ATTR,
+			EQP_ASSEMBLY_STATE_ATTR,
+			EQP_ASSEMBLY_HX_BASIS_ATTR,
+			EQP_ASSEMBLY_C_BASIS_ATTR,
+			EQP_ASSEMBLY_K_STORAGE_ATTR,
+			EQP_ASSEMBLY_FILE_ROWS_ATTR,
+			EQP_ASSEMBLY_HARTREE_STATE_ATTR,
+			EQP_ASSEMBLY_BAND_START_ATTR,
+			EQP_ASSEMBLY_BAND_STOP_ATTR,
+			EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR,
+			EQP_ASSEMBLY_DEGENERACY_TOL_ATTR,
+			EQP_ASSEMBLY_HARTREE_SOURCE_ATTR,
+			EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR,
+		)
+		missing_attrs = [name for name in required_attrs if name not in ds.attrs]
+		if missing_attrs:
+			raise ValueError(
+				f"partial {EQP_ASSEMBLY_DATASET}: missing attrs {missing_attrs}.")
+		version = int(ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR])
+		state = _text(ds.attrs[EQP_ASSEMBLY_STATE_ATTR])
+		hx_basis = _text(ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR])
+		c_basis = _text(ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR])
+		k_storage = _text(ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR])
+		hartree_state = _text(ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR])
+		policy = _text(ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR])
+		if version != EQP_ASSEMBLY_SCHEMA_VERSION:
+			raise ValueError(
+				f"unsupported {EQP_ASSEMBLY_DATASET} schema {version}; expected "
+				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+		if (state != EQP_ASSEMBLY_STATE_READY
+				or hx_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
+				or c_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
+				or k_storage != EQP_ASSEMBLY_K_STORAGE_WEDGE
+				or hartree_state != EQP_ASSEMBLY_HARTREE_STATE_RESOLVED
+				or policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES):
+			raise ValueError(
+				f"unsupported {EQP_ASSEMBLY_DATASET} semantics: state={state!r}, "
+				f"H/X basis={hx_basis!r}, C basis={c_basis!r}, "
+				f"k_storage={k_storage!r}, "
+				f"hartree_state={hartree_state!r}, policy={policy!r}.")
+		values = np.asarray(ds[()], dtype=np.complex128)
+		c_omega = np.asarray(
+			h5[EQP_ASSEMBLY_C_OMEGA_DATASET][()], dtype=np.complex128)
+		file_rows = np.asarray(
+			ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR], dtype=np.int64)
+		b0 = int(ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR])
+		b1 = int(ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR])
+		if (b0 < 0 or b1 <= b0 or values.ndim != 3 or values.shape[0] != 3
+				or values.shape[2] != b1 - b0):
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_DATASET} shape {values.shape} "
+				f"for band window [{b0},{b1}).")
+		if not np.all(np.isfinite(values)):
+			raise ValueError(f"{EQP_ASSEMBLY_DATASET} contains non-finite values.")
+		if np.any(np.imag(values[:2]) != 0.0):
+			raise ValueError(
+				f"{EQP_ASSEMBLY_DATASET} H/X rows must be exactly real.")
+		if (c_omega.ndim != 3 or c_omega.shape[1:] != values.shape[1:]
+				or not np.all(np.isfinite(c_omega))):
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_C_OMEGA_DATASET} shape "
+				f"{c_omega.shape} for H/X/C {values.shape}, or non-finite values.")
+		omega_rel_ev, omega_reference_ev, omega_reference_provenance = (
+			_omega_metadata_from_open_h5(h5))
+		if omega_rel_ev is None or omega_rel_ev.shape != (c_omega.shape[0],):
+			raise ValueError(
+				f"{EQP_ASSEMBLY_C_OMEGA_DATASET} has {c_omega.shape[0]} omega "
+				f"rows but {OMEGA_DATASET!r} is absent or has shape "
+				f"{None if omega_rel_ev is None else omega_rel_ev.shape}.")
+		if (file_rows.ndim != 1 or file_rows.shape[0] != values.shape[1]
+				or (file_rows.size and np.min(file_rows) < 0)
+				or np.unique(file_rows).size != file_rows.size):
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_FILE_ROWS_ATTR} {file_rows.tolist()} "
+				f"for {values.shape[1]} file-wedge rows.")
+		tol_ry = float(ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR])
+		if not np.isfinite(tol_ry) or tol_ry < 0.0:
+			raise ValueError(
+				f"malformed {EQP_ASSEMBLY_DEGENERACY_TOL_ATTR}={tol_ry!r}.")
+		hartree_source = _text(
+			ds.attrs[EQP_ASSEMBLY_HARTREE_SOURCE_ATTR])
+		kin_ion_has_hartree = bool(
+			ds.attrs[EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR])
+		if kin_ion_has_hartree != (hartree_source == "folded"):
+			raise ValueError(
+				"EQP receipt Hartree provenance disagrees: "
+				f"source={hartree_source!r}, "
+				f"kin_ion_has_hartree={kin_ion_has_hartree!r}.")
+		eval_rel_ev, eval_provenance, eval_coverage = (
+			_eval_metadata_from_open_h5(h5))
+		if eval_rel_ev is not None and eval_rel_ev.shape != values.shape[1:]:
+			# The stamp is on the star wedge (the cube writer put it there);
+			# the receipt is on the file wedge.  Pairing them would hand a
+			# star parent's evaluation energies to another member of that
+			# star, which k_irr_rows_for refuses, so this refuses and names
+			# which mismatch it is.
+			diagnosis = ""
+			nk_receipt, nk_eval = int(values.shape[1]), int(eval_rel_ev.shape[0])
+			if nk_eval != nk_receipt:
+				diagnosis = (
+					f"  The stamp has {nk_eval} k rows against the receipt's "
+					f"{nk_receipt}: the stamp is on the cube's STAR wedge and "
+					f"the receipt on the FILE wedge, and pairing them needs the "
+					f"star substitution this module refuses (k_irr_rows_for).  "
+					f"OPEN RULING for a deck whose two wedges differ — stamp "
+					f"the evaluation energies on the file wedge, or declare "
+					f"them star-invariant and unfold: "
+					f"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md.")
+			raise ValueError(
+				f"{SIGMA_EVAL_DATASET} has shape {eval_rel_ev.shape}; expected "
+				f"the receipt's file-wedge/window shape {values.shape[1:]}."
+				f"{diagnosis}")
+		return {
+			"hartree_diag_ev": np.real(values[0]),
+			"sigma_x_diag_ev": np.real(values[1]),
+			"sigma_c_at_dft_diag_ev": values[2],
+			"sigma_c_omega_diag_ev": c_omega,
+			"omega_rel_ev": omega_rel_ev,
+			"omega_reference_ev": omega_reference_ev,
+			"omega_reference_provenance": omega_reference_provenance,
+			"eval_energies_rel_ev": eval_rel_ev,
+			"eval_energies_provenance": eval_provenance,
+			"eval_coverage": eval_coverage,
+			"band_start": b0,
+			"band_stop": b1,
+			"file_wedge_full_bz_rows": file_rows,
+			"degeneracy_policy": policy,
+			"degeneracy_tol_ry": tol_ry,
+			"hartree_exchange_basis": hx_basis,
+			"correlation_basis": c_basis,
+			"hartree_source": hartree_source,
+			"kin_ion_has_hartree": kin_ion_has_hartree,
+		}
 
 
 # ===========================================================================

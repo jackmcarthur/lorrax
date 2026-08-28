@@ -488,6 +488,89 @@ def test_make_eqp_bgw_stored_array_is_substituted_not_ignored():
         f"got {shift:.6f} eV — the array is being ignored")
 
 
+def test_make_eqp_bgw_prefers_the_live_assembly_receipt(monkeypatch):
+    """A v3 file rebuilds even when every raw cube payload is inaccessible."""
+    from file_io.sigma_output import append_eqp_assembly_receipt_h5
+    from gw.eqp_bgw import assemble_eqp, make_eqp_bgw
+
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, stored=True)
+        h_live = np.tile([285.0, 275.0, 285.0, 275.0], (2, 1))
+        x_live = np.tile([-21.0, -19.0, -21.0, -19.0], (2, 1))
+        with h5py.File(os.path.join(d, "sigma_mnk.h5"), "r") as h5:
+            omega = np.asarray(h5["omega_ev"])
+        assembly = assemble_eqp(
+            kpoints_irr_frac=np.zeros((2, 3)), band_offset=1,
+            e_dft_ev=np.zeros((2, 4)), kin_ion_diag_ev=np.zeros((2, 4)),
+            hartree_diag_ev=h_live, sigma_x_diag_ev=x_live,
+            sigma_c_omega_diag_ev=np.zeros((omega.size, 2, 4)),
+            omega_rel_ev=omega, e_dft_rel_ev=np.zeros((2, 4)),
+            hartree_source="stored", hartree_already_resolved=True,
+            mean_field_gate=False, print_fn=lambda *_: None)
+        append_eqp_assembly_receipt_h5(
+            os.path.join(d, "sigma_mnk.h5"),
+            assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(2),
+            degeneracy_policy="bgw_average",
+            degeneracy_tol_ry=1.0e-6,
+        )
+        raw_names = {
+            "/sigma_total_kij_ev", "/sigma_c_kij_ev",
+            "/sigma_sx_kij_ev", "/hartree_kij_ev",
+        }
+        original_getitem = h5py.Dataset.__getitem__
+
+        def _receipt_only(self, key):
+            if self.name in raw_names:
+                raise AssertionError(
+                    f"schema-v3 posthoc touched forbidden raw payload {self.name}")
+            return original_getitem(self, key)
+
+        monkeypatch.setattr(h5py.Dataset, "__getitem__", _receipt_only)
+        make_eqp_bgw(d)
+        got = _read_eqp_qp_column(os.path.join(d, "eqp0.dat")).reshape(2, 4)
+
+    # kin_ion=-300 eV and correlation=0, so this is the exact assembly.
+    assert np.array_equal(got, -300.0 + h_live + x_live)
+
+
+def test_make_eqp_bgw_refuses_shape_compatible_receipt_row_permutation():
+    """FILE-wedge row identity, not shape, binds receipt to rotations/cube."""
+    from file_io.sigma_output import (
+        EQP_ASSEMBLY_DATASET,
+        EQP_ASSEMBLY_FILE_ROWS_ATTR,
+        append_eqp_assembly_receipt_h5,
+    )
+    from gw.eqp_bgw import assemble_eqp, make_eqp_bgw
+
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, stored=True)
+        path = os.path.join(d, "sigma_mnk.h5")
+        h_live = np.tile([285.0, 275.0, 285.0, 275.0], (2, 1))
+        with h5py.File(path, "r") as h5:
+            omega = np.asarray(h5["omega_ev"])
+        assembly = assemble_eqp(
+            kpoints_irr_frac=np.zeros((2, 3)), band_offset=1,
+            e_dft_ev=np.zeros((2, 4)), kin_ion_diag_ev=np.zeros((2, 4)),
+            hartree_diag_ev=h_live, sigma_x_diag_ev=np.zeros_like(h_live),
+            sigma_c_omega_diag_ev=np.zeros((omega.size, 2, 4)),
+            omega_rel_ev=omega, e_dft_rel_ev=np.zeros((2, 4)),
+            hartree_source="stored", hartree_already_resolved=True,
+            mean_field_gate=False, print_fn=lambda *_: None)
+        append_eqp_assembly_receipt_h5(
+            path,
+            assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(2),
+            degeneracy_policy="bgw_average",
+            degeneracy_tol_ry=1.0e-6,
+        )
+        with h5py.File(path, "a") as h5:
+            h5[EQP_ASSEMBLY_DATASET].attrs[
+                EQP_ASSEMBLY_FILE_ROWS_ATTR] = np.array([1, 0])
+        with pytest.raises(ValueError, match="shape-compatible k-row permutation"):
+            make_eqp_bgw(d)
+
+
 def test_kin_ion_hartree_source_resolution():
     """The precedence ladder and the refusals, on real files."""
     from file_io.kin_ion import (
@@ -563,16 +646,16 @@ def _eqp_body_bytes(path):
         return "".join(l for l in fh if not l.startswith("#")).encode()
 
 
-def _assemble_from_run_dir_via_in_memory(d, out0, out1):
-    """Load the CLI's artifacts by hand and go through the LIVE entry point.
+def _assemble_from_run_dir_via_canonical_assembly(d, out0, out1):
+    """Load the CLI's artifacts by hand and call the canonical assembler.
 
     Deliberately does NOT reuse ``make_eqp_bgw``'s loader: the point is to
-    reach ``write_eqp_bgw_in_memory`` — what ``gw_output.write_results``
-    calls — with the same numbers the CLI reads, and prove the two entry
-    points cannot produce different files.
+    reach ``assemble_eqp(...).write(...)`` — the same seam
+    ``gw_output.write_results`` calls — with the same numbers the CLI reads,
+    and prove the live and post-hoc routes cannot produce different files.
     """
     from common.units import RYD_TO_EV
-    from gw.eqp_bgw import write_eqp_bgw_in_memory
+    from gw.eqp_bgw import assemble_eqp
     from file_io.kin_ion import (kin_ion_hartree_source, HARTREE_DATASET,
                                  read_star_map)
     from file_io.sigma_output import k_irr_rows_for
@@ -612,17 +695,16 @@ def _assemble_from_run_dir_via_in_memory(d, out0, out1):
         with h5py.File(kip, "r") as k:
             vhf = np.asarray(k[HARTREE_DATASET])[kmap, b0:b1, b0:b1]
         vh_exact = np.real(np.diagonal(vhf, axis1=1, axis2=2)) * RYD_TO_EV
-    return write_eqp_bgw_in_memory(
-        eqp0_path=os.path.join(d, out0), eqp1_path=os.path.join(d, out1),
+    return assemble_eqp(
         kpoints_irr_frac=kpts, band_offset=b0, e_dft_ev=e_dft,
         kin_ion_diag_ev=kin_diag,
         hartree_diag_ev=np.real(np.diagonal(vh, axis1=1, axis2=2)),
         sigma_x_diag_ev=np.real(np.diagonal(sx, axis1=1, axis2=2)),
-        sigma_c_at_dft_diag_ev=None,
         sigma_c_omega_diag_ev=np.diagonal(sc, axis1=2, axis2=3),
         omega_rel_ev=om, e_dft_rel_ev=e_dft - efermi,
         nspin=1, hartree_source=src, exact_hartree_diag_ev=vh_exact,
-    )
+    ).write(eqp0_path=os.path.join(d, out0),
+            eqp1_path=os.path.join(d, out1))
 
 
 def test_both_eqp_entry_points_are_byte_identical():
@@ -647,7 +729,7 @@ def test_both_eqp_entry_points_are_byte_identical():
         with tempfile.TemporaryDirectory() as d:
             _make_eqp_cli_inputs(d, **kw)
             make_eqp_bgw(d)                       # -> eqp0.dat / eqp1.dat
-            _assemble_from_run_dir_via_in_memory(
+            _assemble_from_run_dir_via_canonical_assembly(
                 d, "eqp0_mem.dat", "eqp1_mem.dat")
             for a, b in (("eqp0.dat", "eqp0_mem.dat"),
                          ("eqp1.dat", "eqp1_mem.dat")):

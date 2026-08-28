@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 
 from common.units import RYD_TO_EV
-from gw.production_report import GWProductionReport
+from gw.production_report import (
+    EQP0_FILE_ROLE,
+    EQP1_FILE_ROLE,
+    QP_ROTATIONS_FILE_ROLE,
+    QP_WFN_FILE_ROLE,
+    GWProductionReport,
+)
 
 
 def _config():
@@ -171,6 +177,9 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "MPI ranks      : 4" in text
     assert "JAX/JAXLIB     : 0.test / 0.testlib" in text
     assert "Godby-Needs plasmon-pole GW" in text
+    assert "one-shot full-matrix effective Hamiltonian" in text
+    assert "fixed-DFT-state diagonal G0W0" in text
+    assert "textbook G0W0" not in text and "standard G0W0" not in text
     assert ("QP consistency  : one_shot_dft | other options: fixed_point "
             "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)") in text
     assert "EQP2 treatment  : off (set write_eqp2=true" in text
@@ -190,7 +199,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "Grid margins    : 3.80000 eV below; 5.60000 eV above" in text
     assert "Tail calculations: N1=36 / N2=41 / N3=46 cumulative bands" in text
     assert "DFT gap        : 0.40000 eV" in text
-    assert "QP gap         : 0.40000 eV (insulating)" in text
+    assert "Full-matrix effective-H gap: 0.40000 eV (insulating)" in text
     assert "Gap correction : +0.00000 eV relative to DFT" in text
     assert "Quasiparticle energies" not in text
     assert "cuFFT flat-k FFI" in text
@@ -247,6 +256,16 @@ def test_report_spells_out_enabled_eqp2_and_convergence(tmp_path):
     assert "final post-rotation map verified" in text
     assert "semicore preserves E-E_F" in text
     assert "Held fixed      : screening, W, and all self-energy diagrams" in text
+    assert "EQP2 eigenvectors: internal to this consistency loop; not serialized" in text
+    assert "QP WFN/rotations: remain the ordinary one-shot" in text
+    assert "eqp2.dat contains the final EQP2 eigenvalue spectrum only" in text
+
+
+def test_closing_file_roles_do_not_conflate_full_matrix_and_diagonal_outputs():
+    assert EQP0_FILE_ROLE == "fixed-DFT-state diagonal zeroth-order energies"
+    assert EQP1_FILE_ROLE == "fixed-DFT-state diagonal Z-linearized energies"
+    assert QP_ROTATIONS_FILE_ROLE == "full-matrix effective-H rotations"
+    assert QP_WFN_FILE_ROLE == "matched full-matrix QP wavefunctions"
 
 
 def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):

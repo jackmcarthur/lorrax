@@ -2628,8 +2628,10 @@ def format_startup_report(f: dict) -> list:
     else:
         add("  The JAX persistent compile cache is OFF, so every rank "
             "compiles every module in this run; set ISDF_JAX_CACHE_DIR to a "
-            "rank-visible directory, or unset it to take the $SCRATCH "
-            "default, to turn it on.")
+            "rank-visible directory to turn it on, or leave it unset and let "
+            "the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache "
+            "first, then $SCRATCH/lorrax_jax_cache, then the home cache "
+            "(docs/dev/env_vars.md).")
     add("  The cache key includes every array shape, so a system size this "
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")

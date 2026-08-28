@@ -47,6 +47,8 @@ import pytest
 h5py = pytest.importorskip("h5py")
 
 from file_io.sigma_output import (                              # noqa: E402
+    EQP_ASSEMBLY_EXPECTED_DATASET,
+    EQP_ASSEMBLY_SCHEMA_VERSION,
     K_STORAGE_ATTR,
     K_STORAGE_IBZ,
     K_STORAGE_VERSION,
@@ -184,7 +186,7 @@ def test_star_select_is_a_take_and_nothing_else():
 
 
 # ---------------------------------------------------------------------------
-# 2.  Back-compat is by ABSENCE of the attribute
+# 2.  Back-compat is by ABSENCE of the marker dataset
 # ---------------------------------------------------------------------------
 
 def test_no_star_means_no_attr_means_full(tmp_path):
@@ -194,6 +196,8 @@ def test_no_star_means_no_attr_means_full(tmp_path):
 
     path = _write(tmp_path, _cube(), None)
     with h5py.File(path, "r") as f:
+        assert int(f[EQP_ASSEMBLY_EXPECTED_DATASET][()]) == (
+            EQP_ASSEMBLY_SCHEMA_VERSION)
         for name in ("sigma_total_kij_ev", "sigma_c_kij_ev",
                      "sigma_sx_kij_ev", "hartree_kij_ev"):
             assert K_STORAGE_ATTR not in f[name].attrs, (

@@ -42,8 +42,13 @@ def _deck(tmp_path, wfn_name):
     return str(deck)
 
 
-def _stamped_qp_wfn(path, *, scheme=None, band_start=8, band_stop=40):
-    from file_io.qp_wfn import QP_WFN_ATTR, QP_WFN_SCHEME
+def _stamped_qp_wfn(path, *, scheme=None, band_start=8, band_stop=40,
+                    with_method_provenance=False):
+    from file_io.qp_wfn import (
+        QP_ENERGY_DEFINITION_ATTR, QP_SOLVER_ATTR, QP_WFN_ATTR,
+        QP_WFN_SCHEME,
+    )
+    from file_io.sigma_output import SIGMA_EVAL_PROVENANCE_ATTR
 
     with h5py.File(str(path), "w") as f:
         f.create_dataset("mf_header/kpoints/nrk", data=1)
@@ -51,6 +56,11 @@ def _stamped_qp_wfn(path, *, scheme=None, band_start=8, band_stop=40):
         f.attrs["qp_wfn_band_start"] = int(band_start)
         f.attrs["qp_wfn_band_stop"] = int(band_stop)
         f.attrs["qp_wfn_source"] = "WFN.h5"
+        if with_method_provenance:
+            f.attrs[QP_SOLVER_ATTR] = "one_shot_dft"
+            f.attrs[QP_ENERGY_DEFINITION_ATTR] = (
+                "full_matrix_effective_hamiltonian_sigma_at_e_dft")
+            f.attrs[SIGMA_EVAL_PROVENANCE_ATTR] = "at_e_dft"
 
 
 def _mean_field_wfn(path):
@@ -72,6 +82,18 @@ def test_the_reader_identifies_a_stamped_qp_wfn(tmp_path):
     assert stamp is not None
     assert stamp["scheme"] == QP_WFN_SCHEME
     assert (stamp["band_start"], stamp["band_stop"]) == (8, 40)
+
+
+def test_the_reader_exposes_additive_one_shot_method_provenance(tmp_path):
+    from file_io.qp_wfn import read_qp_wfn_stamp
+
+    p = tmp_path / "WFN_qp.h5"
+    _stamped_qp_wfn(p, with_method_provenance=True)
+    stamp = read_qp_wfn_stamp(p)
+    assert stamp["qp_solver"] == "one_shot_dft"
+    assert stamp["qp_energy_definition"] == (
+        "full_matrix_effective_hamiltonian_sigma_at_e_dft")
+    assert stamp["sigma_eval_provenance"] == "at_e_dft"
 
 
 def test_an_unstamped_wfn_is_unverifiable_not_mean_field(tmp_path):
@@ -164,5 +186,6 @@ def test_the_writer_stamps_what_the_reader_reads():
     assert "QP_WFN_ATTR" in body and "QP_WFN_SCHEME" in body, (
         "write_qp_wfn_h5 no longer stamps its output; the eqp refusal would "
         "silently stop firing and every QP WFN would read as mean-field")
-    for extra in ("qp_wfn_band_start", "qp_wfn_band_stop"):
+    for extra in ("qp_wfn_band_start", "qp_wfn_band_stop",
+                  "_qp_provenance_attrs"):
         assert extra in body, extra

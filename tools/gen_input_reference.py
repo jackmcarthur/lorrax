@@ -128,7 +128,7 @@ KEYS: dict[str, tuple[str, str]] = {
     # ---- Solver ----
     "density_self_consistent": ("Solver", "Rebuild V_H from the current orbitals every SC iteration instead of rotating the fixed DFT V_H into the QP basis; off keeps QSGW fixed-density."),
     "sc_on_ibz": ("Solver", "Run the SC loop's H/E/U and carried state on the STAR wedge (one row per symmetry orbit), broadcasting back at the boundary; Sigma stays on the full BZ. Ignored when every k-star is a singleton. Default TRUE since 2026-08-15: measured equivalent to the full-BZ loop to 1e-6 meV per iterate under linear mixing on gnppm_debug, though rCROP's trajectory is k-set dependent by construction."),
-    "qp_solver": ("Solver", "QP extraction: one_shot_dft (G0W0 at E_DFT; auto default) | fixed_point (on-shell) | self_consistent (QSGW loop)."),
+    "qp_solver": ("Solver", "QP extraction: one_shot_dft (one-shot full-matrix effective Hamiltonian with Sigma evaluated at E_DFT using QSGW Hermitian symmetrization; distinct from fixed-DFT-state diagonal G0W0; auto default) | fixed_point (diagonal on-shell solve followed by a full-matrix effective Hamiltonian) | self_consistent (QSGW loop; STATIC Sigma only -- self_consistent beside a dynamic compute_mode (gn_ppm/hl_ppm/mpa) is REFUSED at driver entry, because the SC finalize leaves the full Sigma_c(omega) cube in qp_band by design while H/Sigma_x are rotated to dft_band, so their diagonals combine exactly only at U = identity; pair it with cohsex, or use one_shot_dft / fixed_point. tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two bases on the self-consistent path')."),
     "do_G0": ("Solver", "Compute the analytic q->0 static head terms (needs dipole.h5); part of every production run."),
     "self_consistent": ("Solver", "DEPRECATED alias for qp_solver = self_consistent."),
     "sc_max_iter": ("Solver", "Self-consistency iteration cap."),
@@ -143,6 +143,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "distributed_lu": ("Solver", "Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only)."),
     # ---- BSE ----
     "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical."),
+    "w_head_densify": ("BSE", "Coarse-to-fine W-head treatment for bse_k_grid: c1 (split the singular Gamma head before densification and re-attach it analytically; default) | legacy (trigonometric interpolation, diagnostic A/B control only)."),
     "get_centroids_fi": ("BSE", "htransform -> BSE handoff: also compute fine-grid psi at the coarse centroids (bse_setup.compute_wfns_fi)."),
     "wfn_fi_min": ("BSE", "Sub-window lower edge on the htransform band axis (0-based)."),
     "wfn_fi_max": ("BSE", "Sub-window upper edge, exclusive; 0 = full window."),

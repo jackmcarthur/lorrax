@@ -743,11 +743,12 @@ class QPSolver(str, enum.Enum):
     The three states are mutually exclusive answers to the same physics
     question, each naming a standard method:
 
-    - ``ONE_SHOT_DFT`` — textbook G0W0 (THE DEFAULT).  Σ is built once
-      from the DFT inputs and *everything* is evaluated at E_DFT: the
-      eqp0/eqp1 text outputs (at-DFT Newton + Z-linearization, as always)
-      AND the QSGW-symmetrised Σ_xc whose eigh produces ``E_qp_ry`` /
-      ``qp_wfn_rotations.h5`` / ``WFN_qp.h5``.  No iteration of any kind.
+    - ``ONE_SHOT_DFT`` — one-shot full-matrix effective Hamiltonian (THE
+      DEFAULT).  Σ is built once from the DFT inputs and evaluated at
+      E_DFT; the QSGW-Hermitianised Σ_xc is diagonalised to produce
+      ``E_qp_ry`` / ``qp_wfn_rotations.h5`` / ``WFN_qp.h5``.  This is
+      distinct from the fixed-DFT-state diagonal ``eqp0.dat`` /
+      ``eqp1.dat`` outputs.  No iteration of any kind.
     - ``FIXED_POINT`` — one-shot Σ + diagonal on-shell solve
       E = h0 + ReΣ(E) for the QSGW-build evaluation energies
       (eigenvalue-only; Σ is never rebuilt).  Dynamic modes only — static
@@ -766,6 +767,51 @@ class QPSolver(str, enum.Enum):
     ONE_SHOT_DFT = "one_shot_dft"
     FIXED_POINT = "fixed_point"
     SELF_CONSISTENT = "self_consistent"
+
+
+@dataclass(frozen=True)
+class QPSolverSemantics:
+    """Stable human and artifact vocabulary for one resolved QP solver."""
+
+    description: str
+    energy_definition: str
+    sigma_evaluation_provenance: str
+
+
+#: One owner for the scientific meaning attached to the stable ``qp_solver``
+#: wire values.  Runtime reports, progress messages and QP HDF5 artifacts all
+#: consume this table; none should infer the meaning from a filename such as
+#: ``eqp0.dat`` or from the historical ``one_shot_dft`` spelling.
+QP_SOLVER_SEMANTICS = {
+    QPSolver.ONE_SHOT_DFT: QPSolverSemantics(
+        description=(
+            "one-shot full-matrix effective Hamiltonian; Sigma evaluated "
+            "at E_DFT with QSGW Hermitian symmetrization (distinct from "
+            "fixed-DFT-state diagonal G0W0)"),
+        energy_definition="full_matrix_effective_hamiltonian_sigma_at_e_dft",
+        sigma_evaluation_provenance="at_e_dft",
+    ),
+    QPSolver.FIXED_POINT: QPSolverSemantics(
+        description=(
+            "one-shot full-matrix effective Hamiltonian after a diagonal "
+            "fixed-Sigma on-shell solve"),
+        energy_definition=(
+            "full_matrix_effective_hamiltonian_sigma_at_diagonal_fixed_point"),
+        sigma_evaluation_provenance="fixed_sigma_diagonal_fixed_point",
+    ),
+    QPSolver.SELF_CONSISTENT: QPSolverSemantics(
+        description="self-consistent QSGW effective Hamiltonian",
+        energy_definition="self_consistent_qsgw_effective_hamiltonian",
+        sigma_evaluation_provenance="self_consistent_qp",
+    ),
+}
+
+
+def qp_solver_semantics(solver) -> QPSolverSemantics:
+    """Return the single canonical description/provenance for ``solver``."""
+    resolved = (solver if isinstance(solver, QPSolver)
+                else QPSolver(getattr(solver, "value", solver)))
+    return QP_SOLVER_SEMANTICS[resolved]
 
 
 
@@ -1332,7 +1378,8 @@ _DEFAULTS = {
     # ``qp_solver`` is the orthogonal axis describing how QP energies are
     # extracted from Σ (see the ``QPSolver`` enum).  ``"auto"`` resolves
     # from the deprecated ``self_consistent`` key (true → self_consistent)
-    # and otherwise defaults to "one_shot_dft" (standard G0W0).  New input
+    # and otherwise defaults to "one_shot_dft" (the one-shot full-matrix
+    # effective-Hamiltonian route).  New input
     # files should set it explicitly:
     #   "one_shot_dft" | "fixed_point" | "self_consistent".
     "qp_solver": "auto",
@@ -1663,6 +1710,10 @@ _DEFAULTS = {
     # coarse route for a nonnested target; exciton_bands ``--w-coarse-grid``
     # instead decimates a native fine W and therefore remains nested-only.
     "bse_k_grid": "",
+    # Coarse-to-fine W-head treatment.  ``c1`` splits the singular Gamma
+    # head before densification and re-attaches it analytically; ``legacy``
+    # is retained only as the shipped A/B control.
+    "w_head_densify": "c1",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q
@@ -3973,7 +4024,8 @@ class LorraxConfig:
 
         1. ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated
            key, still honored);
-        2. else → ``ONE_SHOT_DFT`` — standard G0W0 is the default.
+        2. else → ``ONE_SHOT_DFT`` — the one-shot full-matrix
+           effective-Hamiltonian route is the default.
            (The deprecated ``sigma_at_dft_energies = true`` alias also
            lands here: its intended meaning — authoritative at-DFT QP
            evaluation — IS the default.)

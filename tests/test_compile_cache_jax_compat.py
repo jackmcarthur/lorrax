@@ -41,10 +41,20 @@ from common import jax_compile_cache as jcc
 
 
 @pytest.fixture(autouse=True)
-def _clean_compat_state():
+def _clean_compat_state(monkeypatch):
     """Each test starts with no announcement memo and rank 0 speaking."""
     jcc._COMPAT_SAID.clear()
     old_idx, jcc._STATE.proc_idx = jcc._STATE.proc_idx, 0
+    # The module is process-global, just like JAX's cache hooks.  Isolate the
+    # write receipt so a successful-put test cannot make a later read-only
+    # test look like it wrote an entry.  monkeypatch restores the prior live
+    # process state after this focused test module's fixture unwinds.
+    for name, value in (
+            ("write_metrics_available", False),
+            ("local_writes", 0),
+            ("local_write_bytes", 0),
+            ("local_write_secs", 0.0)):
+        monkeypatch.setattr(jcc._STATE, name, value)
     yield
     jcc._COMPAT_SAID.clear()
     jcc._STATE.proc_idx = old_idx
@@ -131,18 +141,19 @@ def test_invariant_key_patch_is_silent_on_a_supported_jax(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # the lookup hook — forwards without interpreting
 # ---------------------------------------------------------------------------
-def _fake_compilation_cache(n_get_params: int, *, verification: bool):
+def _fake_compilation_cache(n_get_params: int, *, verification: bool,
+                            result=("executable", 1.0)):
     seen = []
 
     if n_get_params == 3:
         def _get(cache_key, compile_options, backend):
             seen.append((cache_key, compile_options, backend))
-            return "executable", 1.0
+            return result
     else:
         def _get(cache_key, compile_options, backend, executable_devices):
             seen.append((cache_key, compile_options, backend,
                          executable_devices))
-            return "executable", 1.0
+            return result
 
     def _in_cache(backend, cache_key):
         return True
@@ -152,6 +163,129 @@ def _fake_compilation_cache(n_get_params: int, *, verification: bool):
     if verification:
         mod.VerificationCache = lambda base: ("verified", base)
     return mod, seen
+
+
+@pytest.mark.parametrize("result,want_hits", [
+    (("executable", 1.0), 1),
+    ((None, None), 0),
+])
+def test_p1_observer_counts_lookups_without_changing_jaxs_answer(
+        monkeypatch, result, want_hits):
+    """The P=1 instrument observes both a hit and its red-twin miss.
+
+    An empty agreed set is deliberate: if the observer accidentally inherits
+    the P>1 veto, neither call reaches JAX and the ``seen`` assertion fails.
+    The returned tuple is asserted verbatim so telemetry cannot become policy.
+    """
+    mod, seen = _fake_compilation_cache(
+        4, verification=True, result=result)
+    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+    monkeypatch.setattr(jcc._STATE, "agreed", frozenset())
+    monkeypatch.setattr(jcc._STATE, "probes", 0)
+    monkeypatch.setattr(jcc._STATE, "hits", 0)
+    monkeypatch.setattr(jcc._STATE, "blocked", 0)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 0.0)
+    monkeypatch.setattr(jcc._STATE, "probe_keys", set())
+
+    jcc._install_observation_patch()
+    got = mod.get_executable_and_time(
+        "p1-key", "opts", "backend", "devices")
+
+    assert got == result
+    assert seen == [("p1-key", "opts", "backend", "devices")]
+    assert jcc._STATE.probes == 1
+    assert jcc._STATE.hits == want_hits
+    assert jcc._STATE.blocked == 0
+    assert jcc._STATE.probe_keys == {"p1-key"}
+
+
+def test_p1_observer_preserves_a_cache_read_exception(monkeypatch):
+    """RED arm: observation must not demote a corrupt read to a miss."""
+    mod, _seen = _fake_compilation_cache(4, verification=True)
+
+    def _raises(*_args):
+        raise OSError("constructed corrupt cache entry")
+
+    mod.get_executable_and_time = _raises
+    monkeypatch.setattr(jax_src, "compilation_cache", mod, raising=False)
+    monkeypatch.setattr(jcc._STATE, "probes", 0)
+    monkeypatch.setattr(jcc._STATE, "hits", 0)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 0.0)
+    monkeypatch.setattr(jcc._STATE, "probe_keys", set())
+
+    jcc._install_observation_patch()
+    with pytest.raises(OSError, match="constructed corrupt cache entry"):
+        mod.get_executable_and_time(
+            "broken", "opts", "backend", "devices")
+    assert jcc._STATE.probes == 1
+    assert jcc._STATE.hits == 0
+
+
+def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):
+    """The P=1 early return cannot bypass the observation hook again."""
+    calls = []
+    config_updates = []
+    monkeypatch.setattr(jcc, "_COMPILATION_CACHE_READY", False)
+    for name in ("enabled", "dir", "n_proc", "proc_idx"):
+        monkeypatch.setattr(jcc._STATE, name, getattr(jcc._STATE, name))
+    monkeypatch.setattr(jax, "process_count", lambda: 1)
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(jcc, "_install_compile_counter", lambda: None)
+    monkeypatch.setattr(jcc.atexit, "register", lambda _fn: None)
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        jax.config, "update",
+        lambda *args: config_updates.append(args))
+    monkeypatch.setattr(jcc, "_install_atomic_put_patch", lambda: None)
+    monkeypatch.setattr(jcc, "bound_cache_dir", lambda: "")
+    monkeypatch.setattr(
+        jcc, "_install_observation_patch",
+        lambda: calls.append("observation"))
+    monkeypatch.setattr(
+        jcc, "_install_agreement_patch",
+        lambda: pytest.fail("P=1 installed the agreement policy"))
+
+    jcc.ensure_jax_compile_cache()
+
+    assert calls == ["observation"]
+    assert jcc._STATE.n_proc == 1
+    assert jcc._STATE.enabled is True
+    assert ("jax_compilation_cache_dir",
+            str(tmp_path / "cache" / "np1")) in config_updates
+    assert not [name for name, _value in config_updates
+                if name == "jax_persistent_cache_min_compile_time_secs"]
+
+
+def test_cache_default_prefers_workflow_over_global_fallback(monkeypatch,
+                                                             tmp_path):
+    """A named workflow takes precedence over the legacy global fallback."""
+    monkeypatch.delenv("ISDF_JAX_CACHE_DIR", raising=False)
+    monkeypatch.delenv("LORRAX_RUN_DIR", raising=False)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("SCRATCH", str(scratch))
+    # The module no longer exports this second owner; if a user supplies it,
+    # LORRAX still resolves only its own documented policy.
+    monkeypatch.setenv(
+        "JAX_COMPILATION_CACHE_DIR", str(tmp_path / "native-jax-cache"))
+
+    assert jcc._resolve_cache_base_dir() == (
+        str(scratch / "lorrax_jax_cache"), "$SCRATCH fallback")
+
+    run_dir = tmp_path / "this-workflow"
+    monkeypatch.setenv("LORRAX_RUN_DIR", str(run_dir))
+    assert jcc._resolve_cache_base_dir() == (
+        str(run_dir / ".lorrax_jax_cache"), "LORRAX_RUN_DIR")
+
+
+def test_explicit_cache_control_wins_over_run_dir(monkeypatch, tmp_path):
+    """The legacy expert knob retains both path override and empty opt-out."""
+    monkeypatch.setenv("LORRAX_RUN_DIR", str(tmp_path / "workflow"))
+    explicit = tmp_path / "restart-campaign"
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", f"  {explicit}  ")
+    assert jcc._resolve_cache_base_dir() == (str(explicit), "explicit")
+
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", "   ")
+    assert jcc._resolve_cache_base_dir() == ("", "explicit")
 
 
 @pytest.mark.parametrize("n_params", [3, 4])
@@ -302,8 +436,8 @@ def test_atomic_put_survives_a_half_present_verification_surface(
     assert isinstance(cache, _lru.LRUCache)
 
 
-def test_atomic_put_writes_through_a_temp_file(monkeypatch, tmp_path):
-    """The point of the patch — atomicity — must survive the shim."""
+def test_atomic_put_reports_exact_successful_write_cost(monkeypatch, tmp_path):
+    """A completed atomic write has an exact count, payload size and time."""
     cc, _ = _fake_compilation_cache(4, verification=False)
     monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
     monkeypatch.setattr(jax_src, "config",
@@ -311,10 +445,179 @@ def test_atomic_put_writes_through_a_temp_file(monkeypatch, tmp_path):
 
     jcc._install_atomic_put_patch()
     cache, _path = cc.get_file_cache(str(tmp_path))
-    cache.put("somekey", b"payload")
+    payload = b"post-compression-payload"
+    cache.put("somekey", payload)
 
-    assert (tmp_path / "somekey-cache").read_bytes() == b"payload"
+    assert (tmp_path / "somekey-cache").read_bytes() == payload
     assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+    stats = jcc.compile_cache_stats()
+    assert stats["write_metrics_available"] is True
+    assert stats["local_writes"] == 1
+    assert stats["local_write_bytes"] == len(payload)
+    assert stats["local_write_secs"] >= 0.0
+    assert stats["is_cache_writer"] is True
+    assert "process-local" in stats["write_scope"]
+
+    # JAX's existing-entry fast path is not another write.
+    cache.put("somekey", b"replacement-that-must-not-land")
+    again = jcc.compile_cache_stats()
+    assert again["local_writes"] == 1
+    assert again["local_write_bytes"] == len(payload)
+
+
+def test_atomic_put_failure_preserves_exception_and_reports_no_write(
+        monkeypatch, tmp_path):
+    """A failed rename remains JAX's exception, not a successful receipt."""
+    cc, _ = _fake_compilation_cache(4, verification=False)
+    monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
+    monkeypatch.setattr(jax_src, "config",
+                        _fake_config(check_contents=None), raising=False)
+
+    jcc._install_atomic_put_patch()
+    cache, _path = cc.get_file_cache(str(tmp_path))
+    original = OSError("constructed rename failure")
+
+    def _fail_rename(_src, _dst):
+        raise original
+
+    monkeypatch.setattr(jcc.os, "replace", _fail_rename)
+    with pytest.raises(OSError) as excinfo:
+        cache.put("broken", b"payload")
+
+    assert excinfo.value is original
+    stats = jcc.compile_cache_stats()
+    assert stats["write_metrics_available"] is True
+    assert stats["local_writes"] == 0
+    assert stats["local_write_bytes"] == 0
+    assert stats["local_write_secs"] == 0.0
+    assert not (tmp_path / "broken-cache").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+
+
+def test_cache_hit_observation_does_not_count_as_a_write(monkeypatch,
+                                                         tmp_path):
+    """Read/probe telemetry and write telemetry are independent."""
+    cc, seen = _fake_compilation_cache(
+        4, verification=False, result=("cached-executable", 3.0))
+    monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
+    monkeypatch.setattr(jax_src, "config",
+                        _fake_config(check_contents=None), raising=False)
+    monkeypatch.setattr(jcc._STATE, "probes", 0)
+    monkeypatch.setattr(jcc._STATE, "hits", 0)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 0.0)
+    monkeypatch.setattr(jcc._STATE, "probe_keys", set())
+
+    jcc._install_atomic_put_patch()
+    cc.get_file_cache(str(tmp_path))  # arms exact unlimited-write telemetry
+    jcc._install_observation_patch()
+    got = cc.get_executable_and_time(
+        "warm-key", "opts", "backend", "devices")
+
+    assert got == ("cached-executable", 3.0)
+    assert seen == [("warm-key", "opts", "backend", "devices")]
+    stats = jcc.compile_cache_stats()
+    assert stats["probes"] == 1
+    assert stats["hits"] == 1
+    assert stats["read_secs"] >= 0.0
+    assert stats["local_writes"] == 0
+    assert stats["local_write_bytes"] == 0
+    assert stats["local_write_secs"] == 0.0
+
+
+def test_receipt_separates_read_and_local_p0_write_time(monkeypatch):
+    """The human receipt cannot fold filesystem writes into cache reads."""
+    said = []
+    monkeypatch.setattr(jcc, "bound_cache_dir", lambda: "")
+    monkeypatch.setattr(
+        jcc, "_debug_say", lambda message: said.append(message))
+    monkeypatch.setattr(jcc._STATE, "n_proc", 4)
+    monkeypatch.setattr(jcc._STATE, "proc_idx", 0)
+    monkeypatch.setattr(jcc._STATE, "probes", 7)
+    monkeypatch.setattr(jcc._STATE, "hits", 6)
+    monkeypatch.setattr(jcc._STATE, "read_secs", 1.25)
+    jcc._STATE.set_write_metrics_available(True)
+    jcc._STATE.record_write(19, 2.5)
+
+    jcc._report_impl()
+
+    assert len(said) == 1
+    assert "cache_probes=7 hits=6 (1.25s)" in said[0]
+    assert "cache_writes_local=1 bytes=19 (2.50s; JAX p0-only)" in said[0]
+
+
+def test_write_receipt_reset_is_deterministic():
+    """Repeated resets produce the same exact zero state."""
+    jcc._STATE.set_write_metrics_available(True)
+    jcc._STATE.record_write(17, 2.5)
+
+    for _ in range(2):
+        jcc._STATE.reset_write_metrics()
+        assert jcc._STATE.write_metrics() == {
+            "write_metrics_available": True,
+            "local_writes": 0,
+            "local_write_bytes": 0,
+            "local_write_secs": 0.0,
+        }
+        jcc._STATE.record_write(17, 2.5)
+
+
+def test_capped_lru_write_cost_is_explicitly_unmeasured(monkeypatch,
+                                                        tmp_path):
+    """The delegated P=1 eviction path must not publish numeric zeros.
+
+    This is the one cell in this file that reaches jax's real
+    ``lru_cache.LRUCache``, so it is the one cell with a dependency the rest
+    of the module does not have.  See the guard below.
+    """
+    # CANNOT-RUN, which is not a pass.
+    #
+    # Setting ``compilation_cache_max_size`` to a finite 1024 is exactly what
+    # this test is about: a finite cap is what puts ``_AtomicLRUCache`` on its
+    # parent's eviction branch (``eviction_enabled = max_size != -1``), which
+    # is the branch whose write cost the patch refuses to report as a numeric
+    # zero.  But that same branch is the one jax guards with
+    # ``if filelock is None: raise RuntimeError(...)``
+    # (jax/_src/lru_cache.py) — so with ``filelock`` absent the constructor
+    # raises before a single assertion below executes.
+    #
+    # ``filelock`` is not a declared dependency of this tree (pyproject lists
+    # h5py, jax, jaxlib, matplotlib, numpy, scipy, xmlschema, xsdata) and jax
+    # itself treats it as optional, so on a bare environment this cell was a
+    # deterministic hard fail that said nothing whatever about the code under
+    # test — the kind of standing red everybody learns to scroll past, which
+    # is how a real regression gets to hide behind it.
+    #
+    # Skipping is therefore the honest report and not a pass: a skip here
+    # means the delegated-eviction receipt went unverified on this machine.
+    # The fix is to install ``filelock`` and re-run, not to read the green.
+    pytest.importorskip(
+        "filelock",
+        reason="CANNOT-RUN (not a pass): the `filelock` package is not "
+               "installed.  This cell sets a finite "
+               "jax_compilation_cache_max_size, which is what puts jax's "
+               "LRUCache on its eviction branch, and that branch raises "
+               "RuntimeError('Please install the `filelock` package to set "
+               "`jax_compilation_cache_max_size`') before any assertion here "
+               "runs.  So the delegated-eviction write-metrics receipt is "
+               "UNVERIFIED on this machine, not verified-good.  Fix: install "
+               "filelock (pip install filelock) and re-run this cell.")
+
+    cc, _ = _fake_compilation_cache(4, verification=False)
+    monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
+    monkeypatch.setattr(
+        jax_src, "config",
+        types.SimpleNamespace(
+            compilation_cache_max_size=types.SimpleNamespace(value=1024)),
+        raising=False)
+
+    jcc._install_atomic_put_patch()
+    cc.get_file_cache(str(tmp_path))
+
+    stats = jcc.compile_cache_stats()
+    assert stats["write_metrics_available"] is False
+    assert stats["local_writes"] is None
+    assert stats["local_write_bytes"] is None
+    assert stats["local_write_secs"] is None
 
 
 # ---------------------------------------------------------------------------

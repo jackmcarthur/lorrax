@@ -403,35 +403,18 @@ rest.
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | don't pre-grab a fixed XLA pool (set by `runtime.set_default_env()`) |
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre HDF5 compatibility |
 
-**There are two compile-cache variables and they are not the same knob.**
-This page used to list only the first, and `env_vars.md` only the second,
-which is how "just clear the cache directory" came to name the wrong
-directory.
+There is one repository-configured LORRAX compile-cache owner:
+`ISDF_JAX_CACHE_DIR`, with
+`LORRAX_RUN_DIR` providing the preferred workflow-local path.  Launchers that
+set neither retain the legacy scratch/home fallback pending its required P=4
+A/B.  The modulefile no longer exports JAX's independent
+`JAX_COMPILATION_CACHE_DIR` before LORRAX can install its multi-rank agreement
+layer.  The complete policy and controls live in
+[`env_vars.md`](../dev/env_vars.md) §2b.
 
-| variable | whose | what it is |
-|---|---|---|
-| `JAX_COMPILATION_CACHE_DIR` | **jax's own**, default `$SCRATCH/.jax_cache` | set by `config/modulefiles/lorrax/0.1.0.lua` and `config/README.md`; nothing under `src/` reads it. |
-| `ISDF_JAX_CACHE_DIR` | **LORRAX's**, `$SCRATCH/lorrax_jax_cache` → `$XDG_CACHE_HOME/isdf_jax_compilation` | the knob `common/jax_compile_cache.py` actually acts on, together with the whole `LORRAX_JAX_CACHE_*` family. Registry: [`env_vars.md`](../dev/env_vars.md) §2b. |
-
-Either way the key includes **every array shape**, so a new system size always
-misses.
-
-> **On the GPU leg the persistent compile cache is currently dead at P=1, and
-> LORRAX's own patch is what kills it.** Measured 2026-08-06. With
-> `ISDF_JAX_CACHE_DIR` unset, JAX's native cache works and writes entries.
-> With LORRAX's patch armed, `common.jax_compile_cache` reports
-> `enabled=True` and **zero entries are written** — so the run pays full
-> compile time on every launch while the startup block says the cache is on.
->
-> This is not the container: the native path works in the same image. Any
-> statement anywhere promising compile-cache behaviour on the GPU leg —
-> including the `LORRAX_JAX_CACHE_*` rows in
-> [`env_vars.md`](../dev/env_vars.md) §2b, which describe the multi-process
-> design — is currently describing the CPU leg only.
->
-> `enabled=True` with zero entries written is the exact shape QUALITY_PATTERNS
-> #7 is about: a status field reporting intent rather than outcome. Treat the
-> entry count, not the flag, as the observable.
+The persistent key includes array shapes, so a different material or system
+size generally misses.  JAX's in-process executable cache is separate and
+remains active when persistent caching is off.
 
 ### 2.1 The three allocators
 
@@ -517,7 +500,7 @@ the CUDA plugin cold load hiding inside the first `jax.devices()`.
 | a CPU/MPI run exits rc=1 **after** succeeding | its driver did not cross the shared `runtime.run_main_and_finalize()` boundary (the older Frontera overlay is a driver-specific fallback; [transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` |
 | wrong data from `psum_scatter` on CPU, rc=0 | you are on gloo — see [transports](transports.md); this is the corruption that moved LORRAX to `impl=mpi` |
-| stale JIT cache `KeyError` warnings | clear the directory `common.jax_compile_cache` actually used — that is `$ISDF_JAX_CACHE_DIR` (see §2), **not** `$JAX_COMPILATION_CACHE_DIR`. The run's startup block prints the resolved path; use that. |
+| stale JIT cache `KeyError` warnings | clear the workflow-local or explicit directory named by `common.jax_compile_cache` at startup (see §2); do not guess a user-global path. |
 | `LORRAX_MPI_TYPE=pmix` hangs (Perlmutter) | opt-in legacy path; the unified default `cray_shasta` covers SLATE, cuSOLVERMp and phdf5 |
 
 Debug flags: `JAX_DEBUG_NANS=1`, `JAX_DISABLE_JIT=1`, `JAX_LOG_COMPILES=1`,

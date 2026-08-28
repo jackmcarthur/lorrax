@@ -794,9 +794,11 @@ def solve_qp(
 
     The three QP-energy definitions (see ``LorraxConfig.qp_solver``):
 
-    - ``one_shot_dft`` — textbook G0W0: the QSGW-symmetrised Σ_xc was
+    - ``one_shot_dft`` — the full-matrix QSGW-Hermitianised Σ_xc was
       already evaluated at E_DFT inside ``compute_sigma_xc`` (the same
-      call the SC iteration map makes), so this is a pass-through.
+      call the SC iteration map makes), so this is a pass-through.  Its
+      subsequent ``eigh`` result is distinct from the fixed-DFT-state
+      diagonal G0W0 result written to ``eqp0.dat``.
       Static modes (X_ONLY / COHSEX) and the streamed-Σ_c stand-in land
       here too: ``sigma_xc_kij_ry`` is the mode's total Σ_xc by
       construction.
@@ -814,7 +816,7 @@ def solve_qp(
     Ry on the Ry ω-grid; mixing that with eV-converted h0/Σ_x is a
     footgun.
     """
-    from .gw_config import QPSolver
+    from .gw_config import QPSolver, qp_solver_semantics
 
     # ONE BASIS ASSUMED across these two reads, and across the sig_x /
     # omega_dft_rel_ev reads in the FIXED_POINT branch below.  On a
@@ -829,8 +831,9 @@ def solve_qp(
 
     if qp_solver is not QPSolver.FIXED_POINT or sigma_c_omega is None:
         if config.compute_mode.is_dynamic and sigma_c_omega is not None:
-            print_fn("  QP solver: one_shot_dft — QSGW build evaluated at "
-                     "E_DFT (standard G0W0)")
+            print_fn(
+                "  QP solver: one_shot_dft — "
+                + qp_solver_semantics(QPSolver.ONE_SHOT_DFT).description)
         return sigma_result.sigma_xc_kij_ry + sig_h
 
     # QPSolver.FIXED_POINT: diagonal Σ(E) fixed point in Ry.

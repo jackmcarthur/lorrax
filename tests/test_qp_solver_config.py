@@ -3,7 +3,8 @@
 Covers the auto-resolution contract of ``LorraxConfig.qp_solver``
 (G0W0_SC_TOGGLE_DESIGN.md §2a):
 
-1. Default → ``ONE_SHOT_DFT`` (standard G0W0).
+1. Default → ``ONE_SHOT_DFT`` (one-shot full-matrix effective H at
+   E_DFT, distinct from fixed-state diagonal G0W0).
 2. Legacy ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated,
    honored).
 3. Legacy ``sigma_at_dft_energies = true`` → ``ONE_SHOT_DFT`` (the orphan
@@ -21,7 +22,7 @@ from __future__ import annotations
 import pathlib
 import pytest
 
-from gw.gw_config import LorraxConfig, QPSolver
+from gw.gw_config import LorraxConfig, QPSolver, qp_solver_semantics
 
 
 BASE_INPUT = """\
@@ -46,6 +47,16 @@ def _config(tmp_path, extra: str = "", name: str = "cohsex_qp.in"):
 def test_default_is_one_shot_dft(tmp_path):
     cfg = _config(tmp_path)
     assert cfg.qp_solver is QPSolver.ONE_SHOT_DFT
+
+
+def test_one_shot_semantics_name_the_full_matrix_not_textbook_g0w0():
+    semantics = qp_solver_semantics(QPSolver.ONE_SHOT_DFT)
+    assert "one-shot full-matrix effective Hamiltonian" in semantics.description
+    assert "fixed-DFT-state diagonal G0W0" in semantics.description
+    assert "textbook" not in semantics.description
+    assert semantics.energy_definition == (
+        "full_matrix_effective_hamiltonian_sigma_at_e_dft")
+    assert semantics.sigma_evaluation_provenance == "at_e_dft"
 
 
 def test_legacy_self_consistent_resolves_and_warns(tmp_path):
@@ -74,9 +85,8 @@ def test_explicit_fixed_point_dynamic(tmp_path):
 
 
 def test_unknown_value_raises(tmp_path):
-    cfg = _config(tmp_path, "qp_solver = bogus\n")
     with pytest.raises(ValueError, match="qp_solver"):
-        cfg.qp_solver
+        _config(tmp_path, "qp_solver = bogus\n")
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +94,9 @@ def test_unknown_value_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_fixed_point_static_mode_rejected(tmp_path):
-    cfg = _config(
-        tmp_path, "compute_mode = cohsex\nqp_solver = fixed_point\n")
     with pytest.raises(ValueError, match="fixed_point"):
-        cfg.qp_solver
+        _config(
+            tmp_path, "compute_mode = cohsex\nqp_solver = fixed_point\n")
 
 
 def test_kij_stream_refused_at_parse(tmp_path):
@@ -455,3 +464,44 @@ def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
     assert cfg.backend.distributed_cholesky == "auto"
     assert cfg.backend.distributed_lu == "off"
     assert any("distributed_lu=auto" in l and "off" in l for l in lines)
+
+
+def test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses():
+    """Tombstone for the removed self_consistent x dynamic combination.
+
+    tests/regression/gnppm_debug/gnppm_sc.in is the tree's only
+    self-consistent deck and has raised at driver entry since 2026-08-25.
+    Its gnppm_sc_session fixture has no consumer, so the removal turned
+    nothing red.  This cell reads the real deck, checks it still declares
+    the refused pair, and AST-checks the guard is still present.
+
+    Restoring the capability makes this cell fail.  Delete it together with
+    the guard, its twins at the post-Sigma seam and in
+    gw_output.write_results, and the qp_solver rows in
+    docs/input_reference.md and docs/drivers.md.
+    """
+    import ast
+
+    deck = (pathlib.Path(__file__).resolve().parent
+            / "regression" / "gnppm_debug" / "gnppm_sc.in")
+    assert deck.is_file(), f"the one SC deck is missing: {deck}"
+    cfg = LorraxConfig.from_input_file(
+        str(deck), print_fn=lambda *a, **k: None)
+    # Parsing still accepts the pair; the refusal is in the driver.
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.compute_mode.is_dynamic
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "gw" / "gw_jax.py").read_text()
+    guards = [
+        node for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.If)
+        and any(isinstance(n, ast.Raise) for n in node.body)
+        and "SELF_CONSISTENT" in ast.dump(node.test)
+        and "is_dynamic" in ast.dump(node.test)
+    ]
+    assert guards, (
+        "gw_jax no longer refuses qp_solver=self_consistent beside a dynamic "
+        "compute_mode, but gnppm_sc.in and the qp_solver doc rows still say "
+        "it does.  Restoring the capability means deleting this cell and "
+        "those rows in the same commit.")
