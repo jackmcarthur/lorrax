@@ -55,6 +55,18 @@ window, ``bispinor``, the WFN's FFT grid), and the resolved values are
 stamped into the output so the generator and the GW run cannot silently
 disagree.  ``--sys_dim`` may only *confirm* the deck, never contradict it.
 
+What the compile cache is worth here
+------------------------------------
+Step 7 of ``runtime.initialize_communicator_stack`` arms the persistent
+compile cache at import, above every jit in this file.  Without one, this
+CLI re-lowers every kernel on every invocation: REPORTED, UNVERIFIED (no
+artifact path survives in the record) — at nb=256, 40 s of recorded
+sections inside a 124 s run.  The per-k kernels recompile once per
+DISTINCT ngk (the COMPILE NOTE in :func:`compute_hartree_matrix`), so the
+miss count is the IBZ k-count, not one.  A cache FAILURE is demoted to the
+``compile_cache_error`` line of the startup report, not refused, so "the
+cache is armed" is a report field to read rather than a guarantee.
+
 Usage:
   python -m gw.kin_ion_io -i cohsex.in -o kin_ion.h5 [-n NB] [--no-hartree]
 """
@@ -1017,14 +1029,8 @@ def main(argv=None):
     report.begin(input_file=args.input)
     report.architecture(mesh_role="band-matrix axes X x Y")
 
-    # Persistent compile cache: already armed at import, by step 7 of this
-    # module's ``initialize_communicator_stack`` (runtime/__init__.py:1491),
-    # which is above every jit here.  It is not optional for this CLI —
-    # without a cache it re-lowers every kernel on every invocation, which
-    # at nb=256 is most of the wall: 40 s of recorded sections inside a
-    # 124 s run.  The per-k kernels recompile once per DISTINCT ngk (see
-    # the COMPILE NOTE in compute_hartree_matrix), so the miss count is the
-    # IBZ k-count, not one.
+    # Compile cache: armed at import by step 7 of initialize_communicator_stack
+    # (see this module's docstring, "What the compile cache is worth here").
 
     # ---- the multi-rank contract: DISTRIBUTE, then write once -----------
     # This used to refuse ``srun -n P`` outright, because every rank redid

@@ -197,9 +197,9 @@ from .production_output import (
     format_kmeans_report,
     prune_band_ranges,
 )
+# Reachable through the one service-path bootstrap above; gated by
+# tests/test_service_path_bootstrap.py.
 import symmetry_maps                                            # noqa: E402
-                                 # reachable because of the ONE service-path
-                                 # bootstrap above (the `_services` block)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -446,8 +446,8 @@ def main():
         warning_fn=production_warnings.append)
     production_stdout.install()
 
-    # (the compile cache was armed at import, by step 7 of this module's
-    # ``initialize_communicator_stack`` -- runtime/__init__.py:1491)
+    # (the compile cache was armed at import, by step 7 of
+    # initialize_communicator_stack)
     print0(f"✓ JAX initialized: {dist.device_summary()}")
 
     timing.reset()
