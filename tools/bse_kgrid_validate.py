@@ -25,7 +25,7 @@ init_jax_distributed(); fallback_to_cpu_if_no_gpu_backend()
 from bse.bse_io import load_bse_data_from_restart_sharded
 from bse.bse_ring_comm import make_bse_shardings
 from bse.bse_stack_matvec import build_bse_stack_matvec
-from bse.bse_w_exact import _create_mesh_xy
+from common.collectives import single_device_mesh
 from solvers.lanczos import block_lanczos_eig_jit
 
 RY2EV = 13.6056980659
@@ -81,7 +81,7 @@ def main():
     ap.add_argument("--out", default="bse_kgrid_validate.npz")
     args = ap.parse_args()
     fine = tuple(int(s) for s in args.fine.replace(",", " ").split())
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     kw = dict(n_val=args.n_val, n_cond=args.n_cond, mesh_xy=mesh_xy)
     res = {}
 

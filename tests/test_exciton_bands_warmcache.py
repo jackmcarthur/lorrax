@@ -65,9 +65,20 @@ NS = 1
 NQ = 3
 
 
-def _mesh(px=1, py=1):
-    from bse.bse_w_exact import _create_mesh_xy
-    return _create_mesh_xy(px, py)
+def _mesh():
+    """The process-local 1x1 these cells put their small arrays on.
+
+    NOT ``create_mesh_xy(1, 1)``: since 2026-08-27 that factory refuses a
+    shape that does not consume the device list in play, and its
+    canonical-reuse branch calls ``resolve_mesh``, so it also refuses on any
+    non-square count — i.e. it depends on the process device count, which a
+    module-scope ``XLA_FLAGS`` write elsewhere in a census can change under
+    this file (tests/harness.py: "a module-scope write never unwinds").
+    ``single_device_mesh`` is the sanctioned process-local 1x1 and is safe at
+    any count; it is what test_layering's own mesh gate names.
+    """
+    from common.collectives import single_device_mesh
+    return single_device_mesh()
 
 
 def _operands(seed=0):

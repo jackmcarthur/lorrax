@@ -157,14 +157,18 @@ _ENTRY_POINTS = [
     ("bse.bse_ring_comm", "create_mesh_xy"),
     ("bse.bse_ring_comm", "create_mesh_2d"),
     ("bse.bse_ring_comm", "create_mesh_xy_from_flags"),
-    ("bse.bse_w_exact", "_create_mesh_xy"),
-    ("bse.bse_feast", "_create_mesh_xy"),
-    # ``bse.bse_pseudopoles._create_mesh_xy`` was here until 2026-08-27, when
-    # that module's local one-line alias was deleted and its main() went
-    # straight to ``create_mesh_xy_from_flags`` (one-owner rule).  The row is
-    # replaced, not dropped: the resolver that every bse driver's main() now
-    # calls is itself an entry point, and it is the one a "--px/--py omitted"
-    # run takes.
+    # THIS LIST IS NOW THE WHOLE SET, and that is the point.  Three
+    # ``_create_mesh_xy`` one-line aliases had rows here — ``bse_pseudopoles``
+    # (deleted 2026-08-27 with its module's move to
+    # ``create_mesh_xy_from_flags``), then ``bse_feast`` and ``bse_w_exact``,
+    # deleted in the same fix round once their last real callers moved to
+    # ``collectives.single_device_mesh``.  A row aimed at a function no
+    # production route can reach measures the gate keeping the code alive, not
+    # the code: exactly the tautology section 5b of tests/test_layering.py
+    # argues against.  The three surviving names ARE the reachable set —
+    # ``create_mesh_xy_from_flags`` is what all six drivers' ``main()`` call,
+    # and the structural gate below (no ``Mesh(`` outside bse_ring_comm) is
+    # what stops a fourth entry point appearing without a row.
 ]
 
 
@@ -183,6 +187,17 @@ def test_every_bse_mesh_entry_point_goes_through_prepare_mesh(
     ``--px/--py`` — the arm that carries the production default since
     2026-08-27.  A ``(1, 1)`` call here would test the explicit arm twice and
     leave the default one unwarmed-and-unwatched.
+
+    EVERY ARM NAMES ITS DEVICES.  ``create_mesh_xy(1, 1)`` with an implicit
+    list is now a refusal in any process with more than one device, and this
+    file cannot assume one: a module-scope ``XLA_FLAGS=
+    --xla_force_host_platform_device_count=4`` in a sibling collected into the
+    same worker (tests/test_contract_bands.py, tests/test_sanity_gates_jax.py)
+    widens the whole session with no mesh marker, and tests/harness.py records
+    that class as measured — "a module-scope write never unwinds".  The
+    explicit ``jax.local_devices()[:1]`` is also the arm worth spying on: it
+    is the only one that takes ``create_mesh_xy``'s NON-canonical branch, i.e.
+    the branch that actually constructs a ``Mesh`` and could skip the warm-up.
     """
     import importlib
 
@@ -199,11 +214,11 @@ def test_every_bse_mesh_entry_point_goes_through_prepare_mesh(
     monkeypatch.setattr(ring, "prepare_mesh", _spy)
     fn = getattr(mod, fname)
     if fname == "create_mesh_2d":
-        mesh = fn([jax.devices()[0]])
+        mesh = fn(jax.local_devices()[:1])
     elif fname == "create_mesh_xy_from_flags":
         mesh = fn(None, None)
     else:
-        mesh = fn(1, 1)
+        mesh = fn(1, 1, jax.local_devices()[:1])
     assert len(seen) == 1, (
         f"{modname}.{fname} built a mesh without going through prepare_mesh — "
         f"its cliques are never warmed and it dies at P>1 under impl=mpi")

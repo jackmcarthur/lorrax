@@ -317,10 +317,10 @@ def test_compute_wc_qwedge_end_to_end(gnppm_session):
     harness.skip_unless_gpu(pytest)
     import time
 
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
     restart = bse_io._find_restart_file(input_path)
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     # BOUNDED PROBE CHUNK.  ``probe_chunk=None`` solves the whole padded basis
     # (399 columns on this fixture) as one block, which is the shape that made
     # this cell an ``extra`` in the first place.  A chunked sweep is the thing

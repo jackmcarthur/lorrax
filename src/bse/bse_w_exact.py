@@ -63,7 +63,6 @@ from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
-    create_mesh_xy,
     create_mesh_xy_from_flags,
     make_bse_shardings,
 )
@@ -79,27 +78,6 @@ jax.config.update("jax_enable_x64", True)
 # finite-q W_q loop and the per-omega oracle sweep reuse ONE executable and every
 # q / omega after the first is dispatch-only (see _get_block_gmres_solver).
 _BLOCK_GMRES_CACHE: dict[tuple, tuple] = {}
-
-
-def _create_mesh_xy(px: int, py: int) -> Mesh:
-    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
-
-    This used to be a local copy that built the Mesh and returned it WITHOUT
-    warming the MPI cliques, so every driver reaching it — ``bse_w_exact``,
-    ``exciton_bands`` (which imported this name) — died at P>1 under
-    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``.  Kept as a name so the
-    existing importers do not move; the body is delegation only.
-
-    No DRIVER reaches it any more: this module's ``main()`` and
-    ``exciton_bands`` both went to ``create_mesh_xy_from_flags`` on
-    2026-08-27, which is where "--px/--py omitted means the run's mesh"
-    lives.  The name survives for ``tools/bse_kgrid_validate.py``,
-    ``tests/test_bse_kgrid.py``, ``tests/test_w_head_densify.py`` and
-    ``tests/test_exciton_bands_warmcache.py``, all of which ask for a
-    process-local 1x1 in a one-device process, and for
-    ``tests/test_bse_gather_and_mesh.py``'s ``_ENTRY_POINTS`` spy.
-    """
-    return create_mesh_xy(px, py)
 
 
 def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):

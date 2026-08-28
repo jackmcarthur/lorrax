@@ -26,7 +26,6 @@ import numpy as np
 from bse.bse_feast import (build_preconditioner_diagonal_sharded,
                            ladder_matvec_operands, matvec_operands)
 from bse.bse_io import _find_restart_file, load_bse_data_from_restart_sharded
-from bse.bse_ring_comm import create_mesh_xy
 from bse.bse_w_exact import (_apply_shifted_matvec, build_finite_q_data,
                              build_probe_rhs, enforce_trs_pair_gauge,
                              _symmetry_tables)
@@ -36,7 +35,7 @@ from bse.w_ladder_product_precond import (lanczos_extremal_bound,
                                           make_half_sum_appliers,
                                           make_product_preconditioner,
                                           make_tda_schur_preconditioner)
-from common.collectives import gather_to_host
+from common.collectives import gather_to_host, single_device_mesh
 
 
 def host(x):
@@ -45,7 +44,7 @@ def host(x):
 
 def run_case(run_dir, deck_name, q_index, col, cap, tol, n_cg_p, n_cg_q,
              out_rows):
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     deck = os.path.join(run_dir, deck_name)
     restart = _find_restart_file(deck)
     raw = load_bse_data_from_restart_sharded(

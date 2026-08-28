@@ -405,11 +405,11 @@ def test_w_ladder_trs_gauge_mechanism_on_a_synthetic_payload(ns):
     discriminating twin is the gauge scramble below.
     """
     harness.skip_unless_gpu(pytest)
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     from bse.bse_serial import compute_pair_amplitude
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_w_exact import enforce_trs_pair_gauge
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     data, neg = _trs_synthetic_payload(mesh, ns=ns)
     q = (1, 0, 0)
     grid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
@@ -492,9 +492,9 @@ def test_trs_gauge_is_deterministic_and_jitter_stable(ns):
     same discipline.
     """
     harness.skip_unless_gpu(pytest)
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     from bse.bse_w_exact import enforce_trs_pair_gauge
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     data, neg = _trs_synthetic_payload(mesh, ns=ns)
     # Force a degenerate pair at a proper +-k SOURCE slot so the
     # subspace canonicalizer is actually exercised (the payload's random
@@ -579,10 +579,11 @@ def test_w_ladder_gauge_sensitivity_is_real_bounded_and_reciprocity_blind():
     partner — a valid TRS pairing, deliberately not canonical.
     """
     harness.skip_unless_gpu(pytest)
-    from bse.bse_ring_comm import create_mesh_xy, make_bse_shardings
+    from bse.bse_ring_comm import make_bse_shardings
+    from common.collectives import single_device_mesh
     from bse.bse_serial import compute_pair_amplitude
     from bse.bse_w_exact import _theta, _spin_rotation
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     data, neg = _trs_synthetic_payload(mesh)
     # a degenerate pair at a source slot, so the gauge freedom is non-trivial
     k_src = next(k for k in range(int(neg.size)) if k < int(neg[k]))
@@ -646,9 +647,9 @@ def test_trs_gauge_refuses_a_non_trs_kgrid():
     """A deck whose eps(-k) != eps(k) has NO exact gauge for the conj-pattern
     channel — the helper must refuse by name, not symmetrize a lie."""
     harness.skip_unless_gpu(pytest)
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     from bse.bse_w_exact import enforce_trs_pair_gauge
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     data, _ = _trs_synthetic_payload(mesh)
     broken = dict(data)
     e = _host(broken["eps_c"]).copy()
@@ -809,9 +810,20 @@ def test_w_ladder_matches_dense_oracle_on_a_mesh(px, py):
     # that stops ``--px 2 --py 2`` from stranding ranks 4..15 on a 16-device
     # job — so ``create_mesh_xy(1, 1)`` inside a four-device process is now,
     # correctly, a refusal.  Handing it the devices the leg is meant to use
-    # says which job is being asserted about and is behaviour-identical to
-    # what this line did before: the mesh built is the same one, over the
-    # same devices, in both legs and in both process widths.
+    # says which job is being asserted about; it is behaviour-identical to
+    # what this line did before at P=1 (same object, same devices), and the
+    # P>1 claim is NOT made — this cell is single-process by construction.
+    #
+    # WHY NOT ``collectives.single_device_mesh()`` for the 1x1 leg, which is
+    # what the other four cells in this file now use.  Because here the 1x1
+    # leg is the CONTROL for the 2x2 leg, not a place to park arrays: the
+    # cells attribute any 1x1-vs-2x2 disagreement to the MESH, which requires
+    # both legs to come out of the same factory with the same warm-up.
+    # ``single_device_mesh`` has no 2x2 arm and skips ``prepare_mesh``, so
+    # splitting the parametrization across two factories would put a second
+    # difference in the comparison.  ``jax.devices()`` (not
+    # ``local_devices()``) is right for the same reason: the 2x2 leg is a
+    # four-device mesh inside ONE process, so the global list is the job.
     mesh = create_mesh_xy(px, py, jax.devices()[: px * py])
     data = _synthetic_payload(mesh)
     cols = np.array([0, 3, 5], dtype=int)

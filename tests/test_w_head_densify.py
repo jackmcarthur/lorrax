@@ -144,11 +144,11 @@ def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path):
     exercised through the real loader, not reasoned about.
     """
     from bse.bse_io import load_bse_data_from_restart_sharded
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
 
     restart = str(tmp_path / "isdf_tensors_test.h5")
     _write_synthetic_restart(restart)
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     kw = dict(n_val=1, n_cond=1, mesh_xy=mesh_xy, inject_head=True,
               cell_volume=270.0, n_occ=2)
     d0 = load_bse_data_from_restart_sharded(restart, bse_k_grid=None, **kw)

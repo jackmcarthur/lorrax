@@ -121,11 +121,11 @@ def _load(restart, inp, mesh_xy, bse_k_grid, w_head_densify=None):
 def test_on_grid_identity_byte_equal(tmp_path):
     """bse_k_grid == coarse → the bundle is byte-identical to the no-flag path."""
     harness.skip_unless_gpu(pytest)
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     inp = run / "cohsex_kg.in"
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     d0 = _load(restart, inp, mesh_xy, None)
     cg = (int(d0["nkx"]), int(d0["nky"]), int(d0["nkz"]))
     d1 = _load(restart, inp, mesh_xy, cg)          # == coarse → fast path
@@ -139,7 +139,7 @@ def test_on_grid_identity_byte_equal(tmp_path):
 def test_densify_3to6_shapes_and_solvable(tmp_path):
     """3×3→6×6 densification: fine-grid bundle shapes + a solvable spectrum."""
     harness.skip_unless_gpu(pytest)
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_stack_matvec import build_bse_stack_matvec
     from solvers.lanczos import block_lanczos_eig_jit
@@ -148,7 +148,7 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     inp = run / "cohsex_kg.in"
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     d0 = _load(restart, inp, mesh_xy, None)
     df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)   # slab arm
 
@@ -202,7 +202,7 @@ def test_the_slab_c1_runs_through_the_dimension_selected_head(tmp_path):
     than selecting ``legacy`` or stopping at the old refusal.
     """
     harness.skip_unless_gpu(pytest)
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
     run = _make_run(tmp_path)
     if not os.path.exists(DIPOLE_FIXTURE):
         pytest.skip("matching MoS2 3x3 dipole.h5 fixture not present")
@@ -216,7 +216,7 @@ def test_the_slab_c1_runs_through_the_dimension_selected_head(tmp_path):
     inp = run / "cohsex_kg.in"                 # w_head_densify unset → c1
     assert "w_head_densify" not in inp.read_text()
     assert "sys_dim = 2" in inp.read_text()
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     df = _load(restart, inp, mesh_xy, (4, 4, 1))  # no arm named → default C1
     assert (int(df["nkx"]), int(df["nky"]), int(df["nkz"])) == (4, 4, 1)
     W = np.asarray(jax.device_get(df["W_q"]))
@@ -291,12 +291,12 @@ def test_densify_default_preserves_deck_vq0_bitwise(tmp_path):
     Pre-fix this tile was replaced by a vq_interp model reconstruction carrying
     an LR-only fine mini-BZ head, so the assert below was provably false."""
     harness.skip_unless_gpu(pytest)
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
     run = _make_run(tmp_path)
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
     inp = run / "cohsex_kg.in"
     assert "head_minibz_average" not in inp.read_text()
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     d0 = _load(restart, inp, mesh_xy, None)                        # coarse 3×3×1
     df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)      # fine 6×6×1
 
@@ -323,14 +323,14 @@ def test_densify_optin_matches_prefix_construction(tmp_path):
     harness.skip_unless_gpu(pytest)
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
     from bse import vq_interp
 
     run = _make_run(tmp_path)
     inp = run / "cohsex_on.in"
     inp.write_text(_KG_INPUT + "head_minibz_average = true\n")
     restart = str(run / "tmp" / "isdf_tensors_640.h5")
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     d0 = _load(restart, inp, mesh_xy, None)
     df = _load(restart, inp, mesh_xy, (6, 6, 1), LEGACY_HEAD)   # slab arm
 

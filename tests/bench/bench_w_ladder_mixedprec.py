@@ -65,10 +65,10 @@ def _log(s):
 
 def _payload(run_dir, input_name, n_val=10**9, n_cond=10**9):
     from bse import bse_io
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     input_path = os.path.join(run_dir, input_name)
     restart = bse_io._find_restart_file(input_path)
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=n_val, n_cond=n_cond, mesh_xy=mesh,
         input_file=input_path, inject_head=False, load_v_full=True)
