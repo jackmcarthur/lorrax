@@ -957,6 +957,7 @@ def z_q_from_psi_sm(
 	weight_r: jax.Array | None = None,
 	cache_face_y_blocks: bool = False,
 	face_y_cache_r_tile: int = 0,
+	_face_transform32_reduce16: bool = False,
 ) -> jax.Array:
 	"""Z_q, the ζ fit's r-chunk pair-density RHS (band contraction + IFFT/γ̃/FFT,
 	streamed over r-chunks).
@@ -981,6 +982,10 @@ def z_q_from_psi_sm(
 	the derivation and the ``all_to_all('y')`` collision this design avoids.
 	"""
 	if layout == "legacy":
+		if _face_transform32_reduce16:
+			raise ValueError(
+				"z_q_from_psi_sm: _face_transform32_reduce16 is a private "
+				"face-layout prototype and cannot be used with layout='legacy'.")
 		if psi_l_X is None or psi_r_X is None:
 			raise ValueError(
 				"z_q_from_psi_sm(layout='legacy') requires psi_l_X= and "
@@ -1014,7 +1019,8 @@ def z_q_from_psi_sm(
 		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
 		kgrid=kgrid, mesh_xy=mesh_xy,
 		cache_y_blocks=bool(cache_face_y_blocks),
-		cache_y_r_tile=int(face_y_cache_r_tile))
+		cache_y_r_tile=int(face_y_cache_r_tile),
+		transform32_reduce16=bool(_face_transform32_reduce16))
 
 
 def _z_q_legacy(
@@ -1563,6 +1569,7 @@ def _z_q_face(
 	mesh_xy: Mesh,
 	cache_y_blocks: bool = False,
 	cache_y_r_tile: int = 0,
+	transform32_reduce16: bool = False,
 ) -> jax.Array:
 	"""Face-layout Z_q: the same canonical io_callback/``psi_r_cache``
 	read, ``all_to_all('y')`` r-scatter + ``all_gather('x')`` band
@@ -1677,6 +1684,10 @@ def _z_q_face(
 		cache_y_r_tile = 0
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	if transform32_reduce16 and (lhs_id or rhs_id):
+		raise ValueError(
+			"_z_q_face: transform32_reduce16 is a private transverse-only "
+			"prototype; charge/identity endpoints retain the accepted path.")
 
 	if cache_y_blocks and cache_y_r_tile < n_zchunk:
 		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
@@ -1696,7 +1707,8 @@ def _z_q_face(
 				r_chunk_size=cache_y_r_tile,
 				kgrid=kgrid, mesh_xy=mesh_xy,
 				cache_y_blocks=True,
-				cache_y_r_tile=cache_y_r_tile)
+				cache_y_r_tile=cache_y_r_tile,
+				transform32_reduce16=transform32_reduce16)
 			for tile_idx in range(n_cache_tiles)
 		)
 		Z_q = jnp.concatenate(Z_q_tiles, axis=-1)
@@ -1727,6 +1739,10 @@ def _z_q_face(
 			"_z_q_face: PsiGStore public carrier metadata is inconsistent: "
 			f"band_chunk_carrier={bpd_max_global}, local width={bpd_max}, "
 			f"world_size={P_total}")
+	if transform32_reduce16 and bpd_max_global != 32:
+		raise ValueError(
+			"_z_q_face: transform32_reduce16 requires a 32-band global "
+			f"PsiGStore carrier; got {bpd_max_global}. Set band_chunk_size=32.")
 	n_bc = len(bcr)
 
 	# Y-side compaction table — IDENTICAL derivation to `_z_q_legacy`'s
@@ -1792,7 +1808,7 @@ def _z_q_face(
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
 		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
-		lhs_id, rhs_id,
+		lhs_id, rhs_id, bool(transform32_reduce16),
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -1923,6 +1939,43 @@ def _z_q_face(
 						y_r = jax.lax.dynamic_index_in_dim(
 							psi_Y_bc, perm_R_[b], axis=2, keepdims=False)
 						y_r = phase_R_[b] * y_r
+
+						if transform32_reduce16:
+							# Communicate the 32-band carrier once, but expose the
+							# accepted bc16 update order to the P carry.  Keeping this
+							# as an ordered scan prevents a 32-wide reduction tree.
+							def reduce16_body(half_carry, half_idx):
+								P_l_half, P_r_half = half_carry
+								start = half_idx * 16
+								x_l_half = jax.lax.dynamic_slice_in_dim(
+									x_l, start, 16, axis=2)
+								x_r_half = jax.lax.dynamic_slice_in_dim(
+									x_r, start, 16, axis=2)
+								y_l_half = jax.lax.dynamic_slice_in_dim(
+									y_l, start, 16, axis=1)
+								y_r_half = jax.lax.dynamic_slice_in_dim(
+									y_r, start, 16, axis=1)
+								w_l_half = jax.lax.dynamic_slice_in_dim(
+									w_l_bc, start, 16, axis=0)
+								w_r_half = jax.lax.dynamic_slice_in_dim(
+									w_r_bc, start, 16, axis=0)
+								x_l_half = x_l_half * w_l_half[
+									None, None, :].astype(x_l_half.dtype)
+								x_r_half = x_r_half * w_r_half[
+									None, None, :].astype(x_r_half.dtype)
+								delta_l = jnp.einsum(
+									'kmn,knr->krm', x_l_half, y_l_half,
+									optimize=True)
+								delta_r = jnp.einsum(
+									'kmn,knr->krm', x_r_half, y_r_half,
+									optimize=True)
+								return (P_l_half + delta_l,
+										P_r_half + delta_r), None
+
+							(P_l_acc, P_r_acc), _ = jax.lax.scan(
+								reduce16_body, (P_l_acc, P_r_acc),
+								jnp.arange(2, dtype=jnp.int32), unroll=1)
+							return (P_l_acc, P_r_acc), None
 
 						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
 						x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
@@ -5812,6 +5865,7 @@ def _make_fit_one_rchunk_kernel(
     layout: str = "legacy",
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    _face_transform32_reduce16: bool = False,
 ):
     """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
     over every piece of static structure + a :class:`PsiGStore` carrying
@@ -5936,6 +5990,8 @@ def _make_fit_one_rchunk_kernel(
                 weight_l=weight_l, weight_r=weight_r,
                 cache_face_y_blocks=bool(cache_face_y_blocks),
                 face_y_cache_r_tile=int(face_y_cache_r_tile),
+                _face_transform32_reduce16=bool(
+                    _face_transform32_reduce16),
             )
         else:
             # Pre-multiply by 1/norms so the pair-density einsum sees the
@@ -6067,6 +6123,7 @@ def fit_one_rchunk(
     weight_r: jax.Array | None = None,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    _face_transform32_reduce16: bool = False,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -6107,6 +6164,11 @@ def fit_one_rchunk(
     # the factory's closure-captured values; μ=1/2/3 therefore compile
     # separately instead of trying to turn tracers into host attributes.
     is_charge = (int(vertex_mu_L) == 0)
+    if _face_transform32_reduce16 and (layout != "face" or is_charge):
+        raise ValueError(
+            "fit_one_rchunk: _face_transform32_reduce16 is a private "
+            "transverse face-layout prototype; charge and legacy routes "
+            "retain the accepted implementation.")
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
     _cache_y_r_tile = 0
     _cache_y_blocks = bool(cache_face_y_blocks)
@@ -6139,6 +6201,7 @@ def fit_one_rchunk(
         str(layout),
         bool(_cache_y_blocks),
         int(_cache_y_r_tile),
+        bool(_face_transform32_reduce16),
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -6168,6 +6231,8 @@ def fit_one_rchunk(
             layout=str(layout),
             cache_face_y_blocks=bool(_cache_y_blocks),
             face_y_cache_r_tile=int(_cache_y_r_tile),
+            _face_transform32_reduce16=bool(
+                _face_transform32_reduce16),
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path

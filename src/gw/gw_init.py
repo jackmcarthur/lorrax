@@ -2135,6 +2135,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 						_chunks_T.get('cache_face_y_blocks', False)),
 					face_y_cache_r_tile=int(
 						_chunks_T.get('face_y_cache_r_tile', 0)),
+					_face_transform32_reduce16=True,
 					vertex_mu_L=mu_L,
 					bispinor_lift=(representation.current_lift or "raw"),
 					# Transverse ζ IBZ-write activates whenever the

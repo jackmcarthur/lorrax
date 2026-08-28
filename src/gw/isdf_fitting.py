@@ -181,6 +181,7 @@ def fit_zeta_to_h5(
     cache_psi_r: bool = True,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    _face_transform32_reduce16: bool = False,
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
     bispinor_lift: str = "raw",
@@ -1430,6 +1431,8 @@ def fit_zeta_to_h5(
                     weight_r=(weight_r_face if low_mem_bands else None),
                     cache_face_y_blocks=bool(cache_face_y_blocks),
                     face_y_cache_r_tile=int(face_y_cache_r_tile),
+                    _face_transform32_reduce16=bool(
+                        _face_transform32_reduce16),
                 )
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
