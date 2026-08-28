@@ -95,3 +95,11 @@ a.out
 # generic-cloud lane artifacts (config/cloud/)
 .native/
 src/ffi/cpp/build_cloud/
+# ...and the HOST leg's build dir, which config/cloud/build_ffi_host.sh
+# creates by default (LORRAX_CLOUD_HOST_BUILD).  It was missing here while
+# its CUDA sibling above was listed, so a `git add -A` in this checkout
+# swept four ninja/cmake artifacts into a commit (2026-08-27).  The
+# `src/ffi/**/CMakeFiles/` and `CMakeCache.txt` rules above catch most of a
+# cmake tree but not `build.ninja`, `.ninja_deps`, `.ninja_log` or the
+# generated `lorrax_config.h`.
+src/ffi/cpp/build_host_cloud/
