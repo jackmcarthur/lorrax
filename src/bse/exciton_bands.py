@@ -129,8 +129,6 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-jax.config.update("jax_enable_x64", True)
-
 from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,

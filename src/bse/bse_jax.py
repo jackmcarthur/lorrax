@@ -52,8 +52,6 @@ from .bse_lanczos import (
 )
 from .bse_io import write_eigenvectors_stream
 
-jax.config.update("jax_enable_x64", True)
-
 __all__ = [
     "apply_bse_hamiltonian_single_device",
     "apply_bse_hamiltonian_single_device_jit",

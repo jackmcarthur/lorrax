@@ -56,7 +56,6 @@ import warnings
 import numpy as np
 import jax
 import jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
 
 from file_io import (
     load_kin_ion_submatrix, load_centroid_basis,
