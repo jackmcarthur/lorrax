@@ -14,31 +14,61 @@ The difference here is checkable rather than rhetorical: at
 ``process_count() == 1`` this process ALREADY holds every shard of every
 mesh-sharded array, because all N devices are its own.  So this backend
 never gathers anything across a process boundary, and it is written to
-move **one shard at a time** —
+move a BOUNDED number of shards at a time, never the global array —
 
 * :meth:`_SerialBackend.write_slab` iterates ``A.addressable_shards`` and
-  writes each shard's own hyperslab, so the host-resident peak is ONE
-  shard, not the global array;
+  writes each shard's own hyperslab: the STAGING peak is ONE shard.
+  MEASURED 0.02 MB against an 8.39 MB global array;
 * :meth:`_SerialBackend.read_slab` builds its result through
-  ``jax.make_array_from_callback``, which asks for one shard at a time, so
-  the host-resident peak is again ONE shard.
+  ``jax.make_array_from_callback``, which asks for one shard at a time and
+  is handed one staging block at a time: the STAGING peak is again ONE
+  shard.  MEASURED 2.10 MB for a 1024² f64 ``P('x','y')`` read whose
+  shards are 2.10 MB.
+
+SAY WHICH MEMORY, BECAUSE THE TOTAL AND THE STAGING ARE DIFFERENT NUMBERS
+and an earlier version of this docstring claimed the smaller one for both.
+``tracemalloc`` around that read reports **10.49 MB** peak, which is not
+2.10: it is the RETURNED ARRAY (8.39 MB — four shards, every one of them
+in this process) plus one shard of staging.  The returned array is the
+caller's own result and is global-sized *by construction* on an emulated
+mesh; that is what emulation IS, and it is the same paragraph as the one
+above — the process already holds every shard.  What this module is
+answerable for is the staging above that, and the staging is one shard.
+
+MEASUREMENT SCOPE for both numbers: this WSL2 box, jax 0.9.1,
+``JAX_PLATFORMS=cpu``, ``JAX_ENABLE_X64=1``, D=4 via
+``--xla_force_host_platform_device_count=4``, ``tracemalloc`` around one
+call, probe ``staging_probe.py`` (a snapshot, not a property; no GPU leg
+— and this tier now refuses one, so the CPU backend's aliasing of
+``make_array_from_callback`` inputs is the only behaviour it can have).
 
 The scaling doctrine ("no N_mu^2-class object required to fit on one
 process") is therefore not weakened BY THIS MODULE: whatever the emulation
-already forced onto this process is what it moves, plus one shard.  The
-doctrine is spent by the emulation itself, which is also why this tier is
-scoped to ``P == 1`` and can never be selected on a real multi-process run
-— the seven-doors failure mode.
+already forced onto this process is what it moves, plus one shard of
+staging.  The doctrine is spent by the emulation itself, which is also why
+this tier is scoped to ``P == 1`` and can never be selected on a real
+multi-process run — the seven-doors failure mode.
 
-WHAT IT REFUSES.  ``process_count() > 1``, at construction, by name.  It is
-a tier chosen from a PREDICATE, never a fallback from a failed transport:
-nothing in this module or in ``slab_io`` catches an FFI error and lands
-here.  The four ``p*q != process_count()`` refusals in the tree
-(``ffi/io.py``'s phdf5 open, ``ffi/cublasmp/batched.py``,
-``distrib_la/_slate.py``, ``distrib_la/matmul.py``) are untouched and still
-fire on an emulated mesh — that is what makes this a second door rather
-than a relaxation of the first, and
-``tests/test_slab_io_emulated_mesh.py`` observes it.
+WHAT IT REFUSES.  ``process_count() > 1``, a non-emulated mesh, a
+non-``cpu`` mesh platform and a mode outside ``w``/``a``/``r`` — all at
+construction, all by name.  It is a tier chosen from a PREDICATE, never a
+fallback from a failed transport: nothing in this module or in ``slab_io``
+catches an FFI error and lands here.  The ``p*q != process_count()``
+refusals elsewhere in the tree are untouched and still fire on an emulated
+mesh — that is what makes this a second door rather than a relaxation of
+the first, and ``tests/test_slab_io_emulated_mesh.py`` observes it for the
+phdf5 one.  Where they are, at ``9681eda6``, from
+``grep -rnE '!= *(int\\()?jax\\.process_count\\(\\)|!= *(int\\()?process_count\\(\\)|!= *world\\b'``
+over ``src/`` and ``services/*/src/`` — five modules, six sites:
+``ffi/io.py:120`` (the phdf5 open, the one this tier stands beside),
+``ffi/cublasmp/batched.py:56``, ``distrib_la/_slate.py:112``,
+``distrib_la/matmul.py:78`` and ``distrib_la/_cusolvermp.py:89``/``:205``.
+No numeral is load-bearing here and none is offered as a total: THE
+PATTERN CANNOT SEE refusals spelled positively (``==`` then raise), the C++
+backstop at ``ffi/cpp/phdf5/shard_index.h:298``, ``tools/``, or any ref but
+this one.  The related-but-different mesh-vs-world guard in
+``common/collectives.py:734`` (``psum_replicate``) is not in that set and
+is not a transport door.
 
 WHAT IT IS NOT FOR.  Production.  An emulated run is device-parallel inside
 each jit and serial across everything a real run parallelises over
@@ -69,13 +99,14 @@ from ._slab_io_ffi import (_DatasetGeometry, _apply_dataset_attrs,
                            _normalize_window_tables, _replace_inode_for_write,
                            _sharding_to_axis_info, _shard_divisors,
                            _validate_block_divisible, mesh_divisible_shape)
-
-#: Journal stack name.  Every HDF5 call this module makes goes through
-#: h5py's bundled libhdf5, so it is journaled under the same token
-#: ``file_io.hdf5_owner`` and ``file_io.h5_journal`` use for that library —
-#: a journal that called it something else would not line up with the
-#: registry's verdict on the same path.
-_J_H5PY = "h5py"
+# THE JOURNAL TOKEN IS THE REGISTRY'S, NOT A LITERAL OF THIS MODULE'S.  Every
+# HDF5 call here goes through h5py's bundled libhdf5, and the name for that
+# library instance is owned by :mod:`file_io.hdf5_owner` — ``h5_journal``
+# says so at its ``STACKS`` set ("the registry owns the concept, this module
+# only prints it").  A fourth spelling of the same string is a fourth thing
+# to keep in step with the registry's verdict on the same path, so this
+# module imports the one name instead of re-declaring it.
+from .hdf5_owner import STACK_H5PY
 
 #: Announced once per process, not once per file: the tier is a property of
 #: the run's (process, device) geometry, and one line per zeta chunk would
@@ -119,12 +150,37 @@ def announce_tier(mesh) -> None:
     test_the_receipt_is_discarded_by_the_production_stdout_sink`` pins the
     fact so it cannot be rediscovered.
 
-    THE STRUCTURAL RECEIPT IS THE ONE THAT HOLDS ANYWHERE: at P=1/D>1 the
-    phdf5 transport cannot open a file at all (``ffi.io.open_file`` refuses
-    before any byte moves), so an emulated run that produced HDF5 output
-    produced it here.  Putting the tier in the driver's scientific report,
-    beside ``Wavefunctions  : <backend> reader``, is the missing piece and
-    is a reporting-surface change this module does not get to make.
+    THE RECEIPT THAT SURVIVES THE SINK IS A FILE, NOT A PRINT.  With
+    ``LORRAX_H5_JOURNAL=1`` every op this tier performs is written to
+    ``h5_journal.rank<N>.log`` as ``stack=h5py`` — through a stream
+    :mod:`file_io.h5_journal` owns, which ``ProductionStdout`` does not
+    touch because it is not ``sys.stdout``.  ``stack=h5py op=open`` on a
+    LORRAX-written path IS the statement "the serial tier moved these
+    bytes", it is per-op rather than once per process, and it is the
+    receipt to quote in a parity claim made from an emulated arm.
+    ``test_the_journal_names_the_library_the_tier_actually_used``
+    (``stack=h5py``, never ``stack=ffi``) and
+    ``test_the_journal_receipt_survives_the_production_stdout_sink``
+    (the same line, written while ``ProductionStdout`` is installed) are
+    the two cells that make that sentence evidence.
+
+    THE STRUCTURAL RECEIPT, SCOPED TO WHAT IT ACTUALLY COVERS: at P=1/D>1
+    the phdf5 transport cannot open a file at all (``ffi.io.open_file``
+    refuses before any byte moves), so on an emulated run **HDF5 output
+    that went through SlabIO** went through this tier.  It says nothing
+    about the ~20 writers in the tree that hold their own ``h5py.File``
+    and never reach ``file_io.slab_io`` (``file_io.wfn_writer``,
+    ``gw.kin_ion_io``, ``bse.bse_window``, ``bse.absorption_common``,
+    ``file_io.qp_wfn``, …) — those produce HDF5 on an emulated run for a
+    reason that has nothing to do with any tier.
+
+    STILL OPEN, AND OWNER-SCOPED: putting the transport in the driver's
+    scientific report beside ``Wavefunctions  : <backend> reader``.  That
+    is the one surface ``ProductionStdout.emit`` writes to, and reaching it
+    means changing the report format in four drivers and deciding where
+    the reporter gets the run's mesh — a reporting-surface decision this
+    module does not get to make on its own.  Until it is made, the journal
+    file above is the production-visible receipt.
     """
     key = (int(mesh.devices.size), int(process_count()))
     if key in _ANNOUNCED:
@@ -163,7 +219,7 @@ class _SerialBackend(_DatasetGeometry):
     #: h5py's bundled libhdf5, and ``file_io.slab_io`` stamps its own
     #: journal lines with this.  Read the note beside ``_FfiBackend.
     #: journal_stack`` for why the door does not name a library of its own.
-    journal_stack = _J_H5PY
+    journal_stack = STACK_H5PY
 
     def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
         # THE TIER IS SELECTABLE ONLY AT P == 1, and it says so here rather
@@ -205,6 +261,63 @@ class _SerialBackend(_DatasetGeometry):
                 "  fix   : construct SlabIO normally — file_io.slab_io picks "
                 "the transport from the same predicate.\n"
                 "  doc   : docs/architecture/slab_io.md")
+        # ...AND THE MESH MUST BE A HOST MESH.  ``mesh_is_emulated`` reads
+        # only ``devices.size`` against ``process_count()`` and is
+        # deliberately platform-BLIND (see its docstring), so it is equally
+        # true of a SINGLE-PROCESS MULTI-GPU mesh — ``resolve_mesh()`` on a
+        # 4-GPU box, or the mesh harness child that hands one process all
+        # four devices.  That geometry is a DELETED ARM, not an emulation:
+        # `src/bse/STATUS.md` records "Single-process multi-GPU is not a
+        # supported geometry — the cuSOLVERMg backend built on it has been
+        # deleted", and on base ``ffi.io.open_file`` refused it at
+        # ``src/ffi/io.py:120`` like any other p*q != P mesh.  Without this
+        # check, adding the tier would have RE-OPENED it through a serial
+        # h5py route nobody chose — a request for a deleted arm downgrading
+        # instead of refusing, which is the one thing TASTE rule 10 forbids.
+        # The platform is read with the helper the FFI gate already uses, so
+        # the two agree on what "cpu" means by construction.
+        from ffi.gate import mesh_ffi_platform
+        plat = mesh_ffi_platform(mesh)
+        if plat != "cpu":
+            raise RuntimeError(
+                "SlabIO serial tier refusal\n"
+                f"  file  : {path}\n"
+                f"  got   : an emulated mesh of {int(mesh.devices.size)} "
+                f"{plat!r} devices in one process.\n"
+                "  want  : the serial tier is the CPU-emulation tier.  A "
+                "single-process multi-GPU mesh is not an emulation, it is "
+                "the geometry deleted with the cuSOLVERMg backend "
+                "(src/bse/STATUS.md), and phdf5 refuses it at "
+                "src/ffi/io.py:120.  Serving it here would turn that "
+                "refusal into a silent serial-h5py downgrade.\n"
+                "  fix   : launch one process per GPU and let the phdf5 FFI "
+                "transport serve the mesh (the production path), or build "
+                "the mesh from jax.devices('cpu') with "
+                "--xla_force_host_platform_device_count for the emulated "
+                "geometry this tier exists for.\n"
+                "  doc   : docs/architecture/slab_io.md")
+        # THE MODE VOCABULARY IS THE TRANSPORT'S, and it is validated HERE
+        # rather than left to h5py.  ``ffi.io.open_file`` refuses anything
+        # outside w/a/r at src/ffi/io.py:115; h5py accepts six modes, so
+        # without this an emulated run would quietly accept 'r+', 'x' and
+        # 'w-' that the production tier refuses — and 'x'/'w-' would create
+        # a file while bypassing ``_replace_inode_for_write`` (which only
+        # runs for 'w'), i.e. the inode contract silently differs by tier.
+        # h5py's own refusal is no substitute: its text advertises the six
+        # modes SlabIO does NOT support and names no LORRAX rule.
+        if mode not in ("w", "a", "r"):
+            raise ValueError(
+                "SlabIO serial tier refusal\n"
+                f"  file  : {path}\n"
+                f"  got   : mode={mode!r}.\n"
+                "  want  : mode must be w/a/r, the same three the phdf5 "
+                "transport accepts (src/ffi/io.py:115) — 'w' truncate+create "
+                "(replacing the inode), 'a' append-or-create, 'r' read-only. "
+                "h5py accepts 'r+', 'x' and 'w-' as well; SlabIO does not, "
+                "and a tier that took them would mean mode has a different "
+                "vocabulary depending on the device geometry.\n"
+                "  fix   : pass one of 'w', 'a', 'r'.\n"
+                "  doc   : docs/architecture/slab_io.md")
         announce_tier(mesh)
 
         self.path = str(path)
@@ -220,13 +333,13 @@ class _SerialBackend(_DatasetGeometry):
 
         import h5py
 
-        from .hdf5_owner import STACK_H5PY, note_close, note_open
+        from .hdf5_owner import note_close, note_open
         self._owner_token: int | None = note_open(
             self.path, STACK_H5PY, mode,
             where=f"SlabIO/_SerialBackend({os.path.basename(self.path)}, "
                   f"mode={mode!r})")
         try:
-            with _journal.op_scope("open", self.path, stack=_J_H5PY,
+            with _journal.op_scope("open", self.path, stack=STACK_H5PY,
                                    mode=mode):
                 self._h5 = h5py.File(self.path, mode)
         except BaseException:
@@ -286,7 +399,7 @@ class _SerialBackend(_DatasetGeometry):
         """
         want_shape = tuple(int(s) for s in shape)
         want_dtype = np.dtype(dtype)
-        with _journal.op_scope("create", self.path, stack=_J_H5PY, ds=name,
+        with _journal.op_scope("create", self.path, stack=STACK_H5PY, ds=name,
                                cnt=want_shape, mode=self.mode):
             if name in self._h5:
                 ds = self._h5[name]
@@ -395,21 +508,26 @@ class _SerialBackend(_DatasetGeometry):
             op="write_slab", name=name, valid_shape=valid_shape,
             slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
 
-        with _journal.op_scope("write", self.path, stack=_J_H5PY, ds=name,
-                               off=off, cnt=slab_shape, mode=self.mode):
-            ds = self._h5[name]
-            if host:
-                self._write_block(ds, np.asarray(A), (0,) * len(slab_shape),
-                                  off, vshape)
-                return
-            seen: set = set()
-            for shard in A.addressable_shards:
-                starts, _stops = _index_bounds(shard.index, slab_shape)
-                if starts in seen:
-                    continue                     # replica of one already written
-                seen.add(starts)
-                self._write_block(ds, np.asarray(shard.data), starts, off,
-                                  vshape)
+        # NO ``op_scope`` HERE.  ``SlabIO.write_slab`` — the public door —
+        # already opens one for this op with the same ds/off/cnt/mode, and
+        # the journal's stated contract is that "one slab read or write is
+        # **one** line" (docs/architecture/slab_io.md#journal).  The FFI
+        # backend likewise journals no write of its own; the seam is the
+        # single choke point for both tiers, which is what makes the two
+        # tiers' logs comparable line for line.
+        ds = self._h5[name]
+        if host:
+            self._write_block(ds, np.asarray(A), (0,) * len(slab_shape),
+                              off, vshape)
+            return
+        seen: set = set()
+        for shard in A.addressable_shards:
+            starts, _stops = _index_bounds(shard.index, slab_shape)
+            if starts in seen:
+                continue                     # replica of one already written
+            seen.add(starts)
+            self._write_block(ds, np.asarray(shard.data), starts, off,
+                              vshape)
 
     @staticmethod
     def _write_block(ds, block: np.ndarray, starts: Sequence[int],
@@ -464,11 +582,66 @@ class _SerialBackend(_DatasetGeometry):
         """One hyperslab, sharded ``partition_spec``, built shard by shard.
 
         ``jax.make_array_from_callback`` asks for each addressable shard's
-        global index in turn, so the host never holds more than one shard —
-        the same tile guarantee the collective reader gets from its per-rank
-        H5Dread, reached a different way.  Past ``valid_shape`` the result
-        is zero, per shard, which is the padded consumer buffer both tiers
+        global index in turn and is handed one staging block at a time, so
+        SlabIO's staging peak is ONE SHARD — the same tile guarantee the
+        collective reader gets from its per-rank H5Dread, reached a
+        different way, and bounded by a constant rather than by the device
+        count.  (The array this RETURNS is a different quantity; the module
+        docstring says which is which.)  Past ``valid_shape`` the result is
+        zero, per shard, which is the padded consumer buffer both tiers
         promise.
+
+        WHY THE REPLICA CACHE EXISTS ONLY WHEN THERE ARE REPLICAS.  It is a
+        de-duplicator, never a correctness device — dropping it entirely
+        would cost redundant reads and change no value — so it should exist
+        exactly when it can hit.  It can hit only when some index is asked
+        for by more than one device, i.e. when ``prod(_shard_divisors(…))``
+        is less than ``mesh.devices.size``.  On a FULLY SHARDED spec the two
+        are equal, every device has its own index, and a cache is pure
+        accumulation for zero hits — so on that spec, which is the
+        production one, there is no cache at all and the staging peak is one
+        block.
+
+        MEASURED, callback calls / h5py reads, one 4x4 read on a 2x2:
+
+        ====================  ========  ==========  =======
+        spec                  cb calls  h5py reads  cache
+        ====================  ========  ==========  =======
+        ``P(None, None)``            1           1  none
+        ``P('x', None)``             4           2  yes
+        ``P(None, 'y')``             4           2  yes
+        ``P('x', 'y')``              4           4  none
+        ====================  ========  ==========  =======
+
+        Two things in that table are worth not rediscovering.  First, jax
+        de-duplicates the FULLY replicated case itself — it calls the
+        callback once, not four times — so the cache is not what makes that
+        row a 1.  Second, ``P(None,'y')`` is why the cache is a dict and not
+        a one-entry memo: the indices arrive alternating (col0, col1, col0,
+        col1) because devices are enumerated row-major, so a memo holding
+        only the last block would hit zero times and read 4.  A one-entry
+        memo was written here first and this table is what caught it.
+
+        WHAT THE OLD UNCONDITIONAL DICT COST, HONESTLY.  It cached on every
+        spec, including the fully sharded one where it could never hit.  On
+        THIS backend that cost nothing measurable — the CPU
+        ``make_array_from_callback`` aliases each numpy block straight into
+        the device buffer, so the dict held the very objects the returned
+        array already holds, and before/after ``tracemalloc`` peaks are both
+        10.49 MB.  The audit that found it read the global-sized peak as the
+        dict's doing; it is the returned array's.  The dict was still the
+        wrong structure on the spec that matters: its retention is
+        O(distinct shards) by construction, and only an aliasing detail of
+        one backend made that free.  The bound is now in the code rather
+        than inherited from jax's CPU implementation.
+
+        NO RED TWIN COVERS "no cache on a fully sharded spec", and that is
+        stated rather than papered over: the aliasing above makes the
+        difference invisible to ``tracemalloc`` on the CPU backend, so a
+        memory cell here would pass with the cache restored and would be a
+        check that cannot fail.  What IS covered is the read COUNT, by
+        ``test_a_sharded_read_issues_one_h5py_read_per_DISTINCT_shard``.
+        The retention bound rides on the argument, not on a measurement.
         """
         mesh = mesh or self.mesh
         ds_shape, ds_dtype = self._dataset_geom(name)
@@ -495,16 +668,20 @@ class _SerialBackend(_DatasetGeometry):
 
         ds = self._h5[name]
         want = np.dtype(dtype)
-        # REPLICAS READ ONCE.  A fully replicated spec gives every device the
-        # same index; without this cache a 4-device replicated read is four
-        # identical H5Dreads of the same bytes.
-        cache: dict = {}
+        # REPLICAS READ ONCE — AND ONLY WHEN THERE ARE REPLICAS.  See the
+        # docstring: on a fully sharded spec every device asks for its own
+        # index, so a cache cannot hit and would be pure accumulation.
+        divs = _shard_divisors(
+            axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+            mesh_shape=mesh_shape, ndim=len(read_shape))
+        n_distinct = int(np.prod(divs)) if len(divs) else 1
+        cache: dict | None = ({} if n_distinct < int(mesh.devices.size)
+                              else None)
 
         def _block(index):
             starts, stops = _index_bounds(index, read_shape)
-            got = cache.get(starts)
-            if got is not None:
-                return got
+            if cache is not None and starts in cache:
+                return cache[starts]
             out = np.zeros(tuple(hi - lo for lo, hi in zip(starts, stops)),
                            dtype=want)
             src, dst = [], []
@@ -518,13 +695,14 @@ class _SerialBackend(_DatasetGeometry):
                 src.append(slice(int(off[d]) + lo, int(off[d]) + hi))
             if not empty:
                 out[tuple(dst)] = np.asarray(ds[tuple(src)], dtype=want)
-            cache[starts] = out
+            if cache is not None:
+                cache[starts] = out
             return out
 
-        with _journal.op_scope("read", self.path, stack=_J_H5PY, ds=name,
-                               off=off, cnt=read_shape, mode=self.mode):
-            return jax.make_array_from_callback(
-                tuple(int(s) for s in read_shape), sharding, _block)
+        # NO ``op_scope`` HERE — ``SlabIO.read_slab`` already wrote this op's
+        # line; see the note in :meth:`write_slab`.
+        return jax.make_array_from_callback(
+            tuple(int(s) for s in read_shape), sharding, _block)
 
     # ------------------------------------------------------------------
     def read_slabs(
@@ -582,7 +760,15 @@ class _SerialBackend(_DatasetGeometry):
                        + tuple(partition_spec[window_axis:])))
         out_sharding = NamedSharding(mesh, out_spec)
         ds = self._h5[name]
-        cache: dict = {}
+        # ONLY WHEN THERE ARE REPLICAS, for the reason :meth:`read_slab`
+        # gives at length.  ``divs`` is already in hand here, and on the
+        # production spec — ``P(('x','y'), None, None, None)`` from
+        # wfn_loader's ``read_slabs`` call — this is None: every device has
+        # its own index, so a table could never hit and would only
+        # accumulate.
+        n_distinct = int(np.prod(divs)) if len(divs) else 1
+        cache: dict | None = ({} if n_distinct < int(mesh.devices.size)
+                              else None)
 
         def _block(index):
             # Drop the window axis: the rest of the index is the shard's
@@ -591,9 +777,8 @@ class _SerialBackend(_DatasetGeometry):
             file_index = tuple(index[:window_axis]) + tuple(
                 index[window_axis + 1:])
             starts, _stops = _index_bounds(file_index, slab_shape)
-            got = cache.get(starts)
-            if got is not None:
-                return got
+            if cache is not None and starts in cache:
+                return cache[starts]
             blk = np.zeros((n_win,) + per_rank_shape, dtype=want)
             for w in range(n_win):
                 src, dst, empty = [], [], False
@@ -609,14 +794,13 @@ class _SerialBackend(_DatasetGeometry):
                 if not empty:
                     blk[w][tuple(dst)] = np.asarray(ds[tuple(src)], dtype=want)
             packed = np.moveaxis(blk, 0, window_axis)
-            cache[starts] = packed
+            if cache is not None:
+                cache[starts] = packed
             return packed
 
-        with _journal.op_scope("read", self.path, stack=_J_H5PY, ds=name,
-                               off=f"nwin{n_win}", cnt=slab_shape,
-                               mode=self.mode):
-            return jax.make_array_from_callback(out_shape, out_sharding,
-                                                _block)
+        # NO ``op_scope`` HERE — ``SlabIO.read_slabs`` already wrote this
+        # op's line (with the same ``off=nwin<n>``); see :meth:`write_slab`.
+        return jax.make_array_from_callback(out_shape, out_sharding, _block)
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -629,21 +813,34 @@ class _SerialBackend(_DatasetGeometry):
         both tiers publish deferred metadata at exactly the same moment in
         the lifecycle — a caller must not be able to tell which tier wrote
         its file by when ``omega_ev`` appeared.
+
+        THE CLAIM IS RELEASED IN A ``finally``, not after a close that
+        returned.  A ``H5Fclose`` that raises would otherwise leave this
+        path claimed in :mod:`file_io.hdf5_owner` for the life of the
+        process, and the next open of it — by either library — would be
+        refused by a claim whose owner is gone.  The FFI tier releases
+        unconditionally for the same reason and says so at
+        ``_slab_io_ffi.py`` ("so a double close or a handle that never
+        opened still releases"); a tier whose thesis is contract-parity
+        with that one must not diverge here.  ``note_close`` is idempotent
+        against the token, so a second ``close()`` is a no-op.
         """
-        from .hdf5_owner import STACK_H5PY, note_close, open_scope
-        with _journal.op_scope("close", self.path, stack=_J_H5PY,
-                               mode=self.mode):
-            self._h5.close()
-        if self._owner_token is not None:
-            note_close(self.path, self._owner_token)
-            self._owner_token = None
+        from .hdf5_owner import note_close, open_scope
+        try:
+            with _journal.op_scope("close", self.path, stack=STACK_H5PY,
+                                   mode=self.mode):
+                self._h5.close()
+        finally:
+            if self._owner_token is not None:
+                note_close(self.path, self._owner_token)
+                self._owner_token = None
         if self._deferred_attrs or self._deferred_ds_attrs:
             import h5py
 
             with open_scope(self.path, STACK_H5PY, "a",
                             where="_SerialBackend.close deferred-attr reopen"), \
                     _journal.op_scope(
-                        "attr_w", self.path, stack=_J_H5PY, mode="a",
+                        "attr_w", self.path, stack=STACK_H5PY, mode="a",
                         cnt=(len(self._deferred_attrs),
                              len(self._deferred_ds_attrs))), \
                     h5py.File(self.path, "a") as h5:

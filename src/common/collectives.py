@@ -378,6 +378,22 @@ def mesh_is_emulated(mesh) -> bool:
     ``services/symmetry_maps/bench/bench_symmetry_maps.py``, whose ``emulated``
     column states it per row for the same reason.
 
+    IT IS ALSO PLATFORM-BLIND, WHICH IS THE THIRD DIRECTION AND THE ONE
+    THAT BITES.  It reads ``devices.size`` and ``process_count()`` and
+    nothing else, so it is equally true of a SINGLE-PROCESS MULTI-GPU mesh
+    — ``resolve_mesh()`` on a 4-GPU box, or a test harness child handed all
+    four GPUs.  That geometry is not an emulation; it is the arm deleted
+    with the cuSOLVERMg backend (``src/bse/STATUS.md``), and every FFI
+    transport refuses it.  So a consumer that TIERS DOWN on this predicate
+    must add its own platform guard, or it will serve a deleted geometry
+    through a path nobody chose.  ``file_io._slab_io_serial`` does exactly
+    that (``ffi.gate.mesh_ffi_platform(mesh) != "cpu"`` → refuse), and
+    ``tests/test_slab_io_emulated_mesh.py`` has the false case.  Widening
+    this predicate to read the platform itself would be wrong: "more
+    devices than processes" is a true statement about that mesh, and the
+    consumers that only ASK the question (rather than tiering down on it)
+    want the honest answer.
+
     WHAT IT IS FOR.  A mesh cell is a per-DEVICE thing; an MPI/NCCL/HDF5
     context is a per-PROCESS thing.  Every transport that bootstraps one
     context per mesh cell (``ffi.io.open_file``, ``ffi.cublasmp.batched``,
