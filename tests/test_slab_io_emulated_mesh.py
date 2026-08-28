@@ -156,6 +156,55 @@ def test_the_tier_announces_itself_in_the_log(tmp_path, capsys):
 
 
 @pytest.mark.mesh(4)
+def test_the_receipt_is_discarded_by_the_production_stdout_sink(tmp_path):
+    """…and a production DRIVER run does not show it.  Measured, not assumed.
+
+    ``runtime.production_stream.ProductionStdout`` — installed by
+    ``gw.gw_jax`` and every other driver — points ``sys.stdout`` at
+    ``/dev/null`` so that "ordinary component chatter is discarded".  The
+    announcement above is ordinary component chatter by that definition,
+    so it does NOT reach a production log; it reappears under
+    ``LORRAX_DEBUG_PRINT=1`` (``debug=True`` here).
+
+    This cell exists because the tier's first docstring claimed the line
+    printed "on exactly the runs whose bytes did not go through collective
+    MPI-IO", and the first end-to-end emulated gnppm_debug run's log named
+    the transport nowhere.  A claim about where output lands is a claim
+    that has to be executed.  The consequence — the driver's scientific
+    report does not yet carry the slab transport the way it carries
+    ``Wavefunctions  : <backend> reader`` — is a gap, recorded here so it
+    is a known fact rather than a rediscovery.
+    """
+    import io as _io
+    import sys
+
+    import file_io._slab_io_serial as serial
+    from runtime.production_stream import ProductionStdout
+
+    mesh = _mesh(2, 2)
+
+    def visible(debug: bool) -> bool:
+        serial._ANNOUNCED.clear()
+        cap = _io.StringIO()
+        real, sys.stdout = sys.stdout, cap
+        ps = ProductionStdout(debug=debug, rank=0)
+        ps.install()
+        try:
+            with SlabIO(tmp_path / f"p{int(debug)}.h5", mode="w", mesh=mesh):
+                pass
+        finally:
+            ps.close()
+            sys.stdout = real
+        return "transport = serial" in cap.getvalue()
+
+    assert visible(True), "LORRAX_DEBUG_PRINT=1 must still show the receipt"
+    assert not visible(False), (
+        "the production sink no longer swallows the receipt — if that is "
+        "intentional, this cell and the tier's docstring table are the "
+        "record that has to change with it")
+
+
+@pytest.mark.mesh(4)
 def test_the_serial_tier_refuses_a_non_emulated_mesh(tmp_path):
     """A 1x1 at one process is NOT emulated and must not reach this tier.
 

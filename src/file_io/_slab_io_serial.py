@@ -92,14 +92,39 @@ def announce_tier(mesh) -> None:
     transport moved the bytes without the reader having to know the
     predicate.
 
-    UNCONDITIONAL, unlike that one, and the difference is deliberate.
-    WfnLoader's announcement is debug-gated because BOTH its tiers are
-    production paths and the line would be noise on every run.  This tier
-    is selected only on an emulated mesh, which no production launch
-    produces, so the line cannot become noise — it prints on exactly the
-    runs whose bytes did NOT go through collective MPI-IO, which is
-    provenance a reader must not have to infer.  It is also the route
-    receipt any parity claim made from an emulated arm has to quote.
+    IT DOES NOT CONSULT ``debug_print_enabled``, unlike that one, and the
+    difference is deliberate: WfnLoader gates because BOTH its tiers are
+    production paths and the line would be noise on every run, while this
+    tier is selected only on an emulated mesh, which no production launch
+    produces.
+
+    WHERE IT IS ACTUALLY VISIBLE, MEASURED rather than assumed — because
+    "unconditional" is not the same as "reaches the log", and the first
+    version of this docstring claimed it was:
+
+    ==================================  =======
+    context                             visible
+    ==================================  =======
+    pytest / tools / a bare script      YES
+    driver run, ``LORRAX_DEBUG_PRINT=1``  YES
+    driver run, production default      **NO**
+    ==================================  =======
+
+    A production driver installs :class:`runtime.production_stream.
+    ProductionStdout`, which points ``sys.stdout`` at ``/dev/null`` for
+    every component ``print`` — this line included, exactly as designed
+    ("ordinary component chatter is discarded", that module's docstring).
+    So the route receipt a parity claim needs is NOT this line on a
+    production run; ``tests/test_slab_io_emulated_mesh.py::
+    test_the_receipt_is_discarded_by_the_production_stdout_sink`` pins the
+    fact so it cannot be rediscovered.
+
+    THE STRUCTURAL RECEIPT IS THE ONE THAT HOLDS ANYWHERE: at P=1/D>1 the
+    phdf5 transport cannot open a file at all (``ffi.io.open_file`` refuses
+    before any byte moves), so an emulated run that produced HDF5 output
+    produced it here.  Putting the tier in the driver's scientific report,
+    beside ``Wavefunctions  : <backend> reader``, is the missing piece and
+    is a reporting-surface change this module does not get to make.
     """
     key = (int(mesh.devices.size), int(process_count()))
     if key in _ANNOUNCED:
