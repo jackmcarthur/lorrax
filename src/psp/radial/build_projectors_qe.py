@@ -975,10 +975,27 @@ def build_E_blocks_full(pseudo, *, soc: bool = True) -> Dict[int, np.ndarray]:
                         raise RuntimeError(
                             f"j-average: ℓ={l} channel has D_avg = 0; "
                             f"average_pp's √(D/D_avg) is undefined.")
-                    # QE's √(D_j / D_avg): the RATIO is positive whenever both
-                    # j channels have D of the same sign as their weighted
-                    # mean, which is what makes this well-defined for the
-                    # negative-D ℓ=2 channels of an ONCV FR pseudo.
+                    # QE's √(D_j / D_avg) is well-defined only when both j
+                    # channels share the sign of their weighted mean (true
+                    # for e.g. the negative-D ℓ=2 channels of ONCV FR Si/Mo).
+                    # It is FALSE for the first ℓ=1 shell of the PseudoDojo
+                    # FR 5d pseudos (Au/Hf/Hg/Ir/Os/Re: D_jj of opposite
+                    # sign, Au −0.4798/+2.5893 Ry) — np.sqrt(negative)
+                    # returned silent NaN here until 2026-08-28.  QE's own
+                    # average_pp.f90:71-80 carries the same sqrt, so such a
+                    # pseudo is not j-averageable in QE either: refuse.
+                    if d_m / d_avg < 0.0 or d_p / d_avg < 0.0:
+                        raise ValueError(
+                            f"j-average: ℓ={l} channel pair has opposite-sign "
+                            f"D_jj (D_j- = {d_m:.6f}, D_j+ = {d_p:.6f} Ry, "
+                            f"D_avg = {d_avg:.6f}); average_pp's √(D/D_avg) "
+                            f"is imaginary, so this fully-relativistic "
+                            f"pseudopotential cannot be j-averaged (QE's "
+                            f"average_pp would NaN identically).  got: "
+                            f"soc=False with a non-averageable FR pseudo; "
+                            f"want: soc=True with an nspinor=2 WFN, or a "
+                            f"scalar-relativistic (nc-sr) pseudopotential "
+                            f"for this element.")
                     u = {g_minus: l * np.sqrt(d_m / d_avg) / (2.0 * l + 1.0),
                          g_plus: (l + 1.0) * np.sqrt(d_p / d_avg) / (2.0 * l + 1.0)}
                     for g_r in (g_minus, g_plus):

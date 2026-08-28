@@ -69,6 +69,13 @@ def all_solid_harmonics(K_cart: jax.Array, l_max: int = 3) -> jax.Array:
 
     Pure JAX — no if/else on l, safe inside lax.scan/JIT.
     """
+    if l_max > 3:
+        # Same ceiling as solid_harmonics_jax; without this, l=4 rows were
+        # silently all-zero and vnl_ops would have consumed a zero projector
+        # for a g-channel pseudo (no such UPF exists in either staged set,
+        # but a silent zero operator must not be reachable).
+        raise NotImplementedError(
+            f"all_solid_harmonics: l_max={l_max} > 3 not implemented")
     x = K_cart[:, 0]
     y = K_cart[:, 1]
     z = K_cart[:, 2]
