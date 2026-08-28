@@ -807,18 +807,6 @@ def fit_zeta_to_h5(
                         f"distributed_cholesky at 'auto' (which gives "
                         f"replicated_rank_truncate) for this tier.")
                 _resolved_solver_kind = 'distributed_rank_truncate'
-
-        # Preserve the fused path's exact ridge scalar for distributed LU.
-        # Materializing this tiny (nq,) reduction before factor preparation
-        # prevents XLA from choosing a different fused reduction tree whose
-        # last-bit change is amplified by the near-null transverse modes.
-        factor_trace_per_q = None
-        if (int(vertex_mu_L) != 0 and _resolved_solver_kind in
-                ('cusolvermp_lu', 'scalapack_lu')):
-            with timing.section("zeta_fit.trace_L_q"):
-                factor_trace_per_q = jnp.einsum(
-                    'qii->q', C_q_flat[:, :n_rmu, :n_rmu])
-                factor_trace_per_q.block_until_ready()
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
@@ -869,8 +857,7 @@ def fit_zeta_to_h5(
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
                 transverse_zeta_rcond=float(transverse_zeta_rcond),
-                distrib_la_batched_route=distrib_la_batched_route,
-                transverse_trace_per_q=factor_trace_per_q)
+                distrib_la_batched_route=distrib_la_batched_route)
         else:
             L_q = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),

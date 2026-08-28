@@ -4003,7 +4003,6 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
 
 def _factor_c_q_transverse_distributed_lu(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, *, backend: str,
-    trace_per_q: jax.Array | None = None,
 ) -> FactorToken:
     """DISTRIBUTED-plan hoisted transverse LU on the ridged logical block.
 
@@ -4024,10 +4023,11 @@ def _factor_c_q_transverse_distributed_lu(
     ``distrib_la.solve(token, B)`` is the only thing that can consume it,
     and it checks B against the extents the factor was made at.
 
-    ``trace_per_q`` is the materialized trace used by the fused path.  It is
-    passed explicitly because allowing XLA to fuse the reduction into this
-    preparation kernel changed its reduction tree on the production CCT;
-    the near-null transverse solve amplified that tiny ridge change.
+    The ridge uses the SAME einsum expression over the sharded logical
+    block that ``fit_zeta_to_h5`` fed the fused path as
+    ``cct_trace_per_q`` — same reduction order, same bits, so the
+    factored matrix is bit-identical to the one the fused
+    ``batched_distributed_solve_lu`` factored every r-chunk.
     """
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
@@ -4036,26 +4036,20 @@ def _factor_c_q_transverse_distributed_lu(
     key = (id(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
     if key not in _transverse_distributed_lu_cache:
         @jax.jit
-        def _prep(C, trace):
+        def _prep(C):
             # Slice to the LOGICAL extent (load-bearing: pad-extent LU
             # roundoff is amplified O(1) in the near-null transverse
             # modes — ROOT_CAUSE.md 2026-07-08) and add the per-q ridge.
             C_log = jax.lax.with_sharding_constraint(
                 C[:, :n_log, :n_log], xy_shard)
+            trace_per_q = jnp.einsum('qii->q', C_log)
             ridge = (_TRANSVERSE_LU_RIDGE
-                     * jnp.abs(trace) / n_log)[:, None, None]
+                     * jnp.abs(trace_per_q) / n_log)[:, None, None]
             eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
             return jax.lax.with_sharding_constraint(
                 C_log + ridge * eye_n, xy_shard)
         _transverse_distributed_lu_cache[key] = _prep
-    if trace_per_q is None:
-        trace_per_q = jnp.einsum('qii->q', C_q[:, :n_log, :n_log])
-        trace_per_q.block_until_ready()
-    if trace_per_q.shape != (nq,):
-        raise ValueError(
-            f"transverse trace must have shape ({nq},), got "
-            f"{trace_per_q.shape}")
-    C_reg = _transverse_distributed_lu_cache[key](C_q, trace_per_q)
+    C_reg = _transverse_distributed_lu_cache[key](C_q)
     # ``n=n_log`` is redundant with C_reg's own extent and passed anyway:
     # it is what makes the divisibility guard fire HERE rather than inside
     # the descriptor build.
@@ -4602,7 +4596,6 @@ def factor_c_q(
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     transverse_zeta_rcond: float = TRANSVERSE_ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "auto",
-    transverse_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute system-matrix L_q from CCT matrix.
@@ -4767,8 +4760,7 @@ def factor_c_q(
             return _factor_c_q_transverse_distributed_lu(
                 C_q, mesh_xy, n_rmu_logical,
                 backend=('scalapack' if t_kind == 'scalapack_lu'
-                         else 'cusolvermp'),
-                trace_per_q=transverse_trace_per_q), None
+                         else 'cusolvermp')), None
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
