@@ -21,7 +21,7 @@ This module centralizes:
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import enum
 import os
 
@@ -1418,66 +1418,32 @@ def _require_static_photon_numerical_certificate(
     return max_forward_error_bound
 
 
-def complete_static_slab_photon_q0(
+def _complete_static_slab_photon_q0_from_effective_response(
     V_packed: jax.Array,
     W_packed: jax.Array,
-    response,
+    *,
+    layout,
+    H_linear: jax.Array,
+    S_effective: jax.Array,
+    YW_y: jax.Array,
+    WZ_x: jax.Array,
     g0_X: jax.Array,
     g0_Y: jax.Array,
     cubature_receipt,
-    *,
     mesh_xy: Mesh,
+    require_ward_closure: bool,
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
-    r"""Complete bare and screened packed photon operators in the Γ cell.
+    r"""Complete one already-folded static photon response in the Γ cell.
 
-    ``cubature_receipt`` is the sole vcoul provider's authenticated exact
-    Wigner--Seitz/Duffy ladder and the sole cell-volume source for the
-    completion.  Each sample first solves the coupled
-    four-field head Dyson
-    equation; only its ``(1,qx,qy)`` moments survive.  The packed body is
-    then updated by one bare and nine screened rank-four outer products.
-    No sample-by-centroid tensor or second photon packing convention exists.
+    This is the sole cubature/Dyson/factor-construction owner.  ``H_linear``
+    and ``S_effective`` are the effective response *after* the caller's one
+    canonical head/body Schur fold; ``YW_y`` and ``WZ_x`` are the matching
+    one-leg halves from that same fold.  Keeping those inputs keyword-only
+    makes controlled projections reuse production arithmetic without adding
+    a response-model or deck-policy surface here.
     """
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
-
-    # The exact/full response and every deliberately bounded cubature model
-    # share this numerical path.  A bounded response stores only independent
-    # inputs and explicit term availability; it never inherits the exact
-    # response's provenance flags.
-    from .static_gauge_response import (
-        StaticGaugeCubatureResponse,
-        StaticGaugeResponseCapability,
-        require_static_gauge_cubature_response,
-    )
-    if isinstance(response, StaticGaugeCubatureResponse):
-        response = require_static_gauge_cubature_response(response, mesh_xy)
-        H_linear = response.H_linear
-        # A bounded response fingerprint authenticates that model's inputs;
-        # it is not a complete Hamiltonian/current/contact identity.  Do not
-        # publish it in the exact-response Sigma receipt.
-        operator_fingerprint = None
-        bounded_retained = (
-            response.capability is
-            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE)
-        if response.response_fingerprint is None:
-            bounded_response_fingerprint = None
-            bounded_response_capability = None
-            bounded_response_approximation = None
-        else:
-            bounded_response_fingerprint = response.response_fingerprint
-            bounded_response_capability = response.capability.value
-            bounded_response_approximation = response.approximation
-    else:
-        response = require_static_gauge_head_response(response, mesh_xy)
-        H_linear = static_hall_linear_response(response.sigma_H)
-        operator_fingerprint = (
-            response.hamiltonian_config_operator_fingerprint)
-        bounded_response_fingerprint = None
-        bounded_response_capability = None
-        bounded_response_approximation = None
-        bounded_retained = False
-    layout = response.layout
     packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
                     layout.packed_extent)
     if (tuple(V_packed.shape) != packed_shape
@@ -1495,25 +1461,10 @@ def complete_static_slab_photon_q0(
         cubature_receipt)
     cell_volume = float(cubature_receipt.cell_volume)
 
-    # The headless Gamma body remains resident and 2-D sharded.  Four calls
-    # reuse the sole bounded Schur-fold graph; broadcasting W over the two
-    # coordinate axes would create four body views in one executable.
-    W_gamma = W_packed[0]
-    S_effective = response.S_direct
-    for a in range(2):
-        for b in range(2):
-            folded = fold_small_head_wings_sharded(
-                response.S_direct[a, b],
-                response.Y_x[a], W_gamma, response.Z_y[b],
-                float(cell_volume), mesh_xy=mesh_xy)
-            S_effective = S_effective.at[a, b].set(folded)
-    S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
-    YW_y, WZ_x = small_head_wing_halves_sharded(
-        response.Y_x, W_gamma, response.Z_y, mesh_xy=mesh_xy)
     jax.block_until_ready((S_effective, YW_y, WZ_x))
     effective_ward, effective_hermiticity = static_gauge_tensor_residuals(
         S_effective)
-    if (not bounded_retained
+    if (bool(require_ward_closure)
             and effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX):
         raise ValueError(
             "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
@@ -1668,19 +1619,172 @@ def complete_static_slab_photon_q0(
         max_dyson_forward_error_bound=max_forward_error_bound,
         mixed_scale_qstar=qstar,
         mixed_convergence_error_ratios=mixed_error_ratios,
-        ward_residual=max(float(response.ward_residual), effective_ward),
-        hermiticity_residual=max(
-            float(response.hermiticity_residual), effective_hermiticity),
-        hamiltonian_config_operator_fingerprint=(
-            operator_fingerprint),
+        ward_residual=effective_ward,
+        hermiticity_residual=effective_hermiticity,
+        hamiltonian_config_operator_fingerprint=None,
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
             screened_pairs=tuple(screened_pairs)),
+        bounded_response_fingerprint=None,
+        bounded_response_capability=None,
+        bounded_response_approximation=None,
+    )
+    return V_packed, W_packed, evidence
+
+
+def _fold_static_slab_photon_response(
+    W_packed: jax.Array,
+    response,
+    cubature_receipt,
+    *,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Return the incumbent folded ``S`` and its two one-leg factor bases."""
+    from vcoul import validate_slab_minibz_photon_receipt
+    cubature_receipt = validate_slab_minibz_photon_receipt(
+        cubature_receipt)
+    W_gamma = W_packed[0]
+    S_effective = response.S_direct
+    cell_volume = float(cubature_receipt.cell_volume)
+    for a in range(2):
+        for b in range(2):
+            folded = fold_small_head_wings_sharded(
+                response.S_direct[a, b],
+                response.Y_x[a], W_gamma, response.Z_y[b],
+                cell_volume, mesh_xy=mesh_xy)
+            S_effective = S_effective.at[a, b].set(folded)
+    S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
+    YW_y, WZ_x = small_head_wing_halves_sharded(
+        response.Y_x, W_gamma, response.Z_y, mesh_xy=mesh_xy)
+    return S_effective, YW_y, WZ_x
+
+
+def _complete_static_slab_photon_q0_cc_projected_control(
+    V_packed: jax.Array,
+    W_packed: jax.Array,
+    response,
+    g0_X: jax.Array,
+    g0_Y: jax.Array,
+    cubature_receipt,
+    *,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    r"""Complete the controlled CC projection of one retained full response.
+
+    The authenticated full-IJ response is folded by the production owner.
+    Only then is its effective response projected to ``S[:,:,C,C]`` with
+    ``H=0``.  The bare photon ``D``, provider rule, and the matching ``YW/WZ``
+    factor bases remain identical to the full-IJ arm.  This is a diagnostic
+    control seam, so the returned completion deliberately carries none of the
+    full response's fingerprint/capability provenance.
+    """
+    from .static_gauge_response import (
+        StaticGaugeResponseCapability,
+        require_static_gauge_cubature_response,
+    )
+    response = require_static_gauge_cubature_response(response, mesh_xy)
+    if response.capability is not (
+            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE):
+        raise ValueError(
+            "CC-projected completion control requires the authenticated "
+            "full-IJ isometric retained-bubble response")
+    S_effective, YW_y, WZ_x = _fold_static_slab_photon_response(
+        W_packed, response, cubature_receipt, mesh_xy=mesh_xy)
+    S_cc = jnp.zeros_like(S_effective)
+    S_cc = S_cc.at[:, :, 0, 0].set(S_effective[:, :, 0, 0])
+    H_zero = jnp.zeros_like(response.H_linear)
+    return _complete_static_slab_photon_q0_from_effective_response(
+        V_packed, W_packed,
+        layout=response.layout,
+        H_linear=H_zero,
+        S_effective=S_cc,
+        YW_y=YW_y,
+        WZ_x=WZ_x,
+        g0_X=g0_X,
+        g0_Y=g0_Y,
+        cubature_receipt=cubature_receipt,
+        mesh_xy=mesh_xy,
+        require_ward_closure=False,
+    )
+
+
+def complete_static_slab_photon_q0(
+    V_packed: jax.Array,
+    W_packed: jax.Array,
+    response,
+    g0_X: jax.Array,
+    g0_Y: jax.Array,
+    cubature_receipt,
+    *,
+    mesh_xy: Mesh,
+) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    r"""Fold and complete bare and screened packed photon operators at Γ.
+
+    The response producer remains the authority for validation, availability,
+    and provenance.  The already-folded effective tensors then enter the one
+    numerical completion owner above, so production and controlled response
+    projections cannot drift in cubature, Dyson, or q=0 factor arithmetic.
+    """
+    from .static_gauge_response import (
+        StaticGaugeCubatureResponse,
+        StaticGaugeResponseCapability,
+        require_static_gauge_cubature_response,
+    )
+    if isinstance(response, StaticGaugeCubatureResponse):
+        response = require_static_gauge_cubature_response(response, mesh_xy)
+        H_linear = response.H_linear
+        operator_fingerprint = None
+        bounded_retained = (
+            response.capability is
+            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE)
+        if response.response_fingerprint is None:
+            bounded_response_fingerprint = None
+            bounded_response_capability = None
+            bounded_response_approximation = None
+        else:
+            bounded_response_fingerprint = response.response_fingerprint
+            bounded_response_capability = response.capability.value
+            bounded_response_approximation = response.approximation
+    else:
+        response = require_static_gauge_head_response(response, mesh_xy)
+        H_linear = static_hall_linear_response(response.sigma_H)
+        operator_fingerprint = (
+            response.hamiltonian_config_operator_fingerprint)
+        bounded_response_fingerprint = None
+        bounded_response_capability = None
+        bounded_response_approximation = None
+        bounded_retained = False
+
+    S_effective, YW_y, WZ_x = _fold_static_slab_photon_response(
+        W_packed, response, cubature_receipt, mesh_xy=mesh_xy)
+
+    V_completed, W_completed, completion = (
+        _complete_static_slab_photon_q0_from_effective_response(
+            V_packed, W_packed,
+            layout=response.layout,
+            H_linear=H_linear,
+            S_effective=S_effective,
+            YW_y=YW_y,
+            WZ_x=WZ_x,
+            g0_X=g0_X,
+            g0_Y=g0_Y,
+            cubature_receipt=cubature_receipt,
+            mesh_xy=mesh_xy,
+            require_ward_closure=not bounded_retained,
+        ))
+    completion = replace(
+        completion,
+        ward_residual=max(
+            float(response.ward_residual), completion.ward_residual),
+        hermiticity_residual=max(
+            float(response.hermiticity_residual),
+            completion.hermiticity_residual),
+        hamiltonian_config_operator_fingerprint=operator_fingerprint,
         bounded_response_fingerprint=bounded_response_fingerprint,
         bounded_response_capability=bounded_response_capability,
         bounded_response_approximation=bounded_response_approximation,
     )
-    return V_packed, W_packed, evidence
+    return V_completed, W_completed, completion
 
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
