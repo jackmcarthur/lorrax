@@ -517,14 +517,28 @@ def scan_module_scope_env_writes(source: str):
 
 
 def scan_mesh_construction(source: str):
-    """Every call to a name/attribute ``Mesh``. ``[line, ...]``."""
+    """Every call to a name/attribute ``Mesh``. ``[line, ...]``.
+
+    Also counts calls through an alias bound by
+    ``from jax.sharding import Mesh as X`` (module- or function-level), so
+    renaming at import does not evade the scan.  Dynamic forms (getattr,
+    importlib) are outside AST scope and are not chased here.
+    """
+    tree = ast.parse(source)
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "jax.sharding":
+            for a in node.names:
+                if a.name == "Mesh" and a.asname:
+                    aliases.add(a.asname)
     out = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             fn = node.func
             name = fn.id if isinstance(fn, ast.Name) else (
                 fn.attr if isinstance(fn, ast.Attribute) else None)
-            if name == "Mesh":
+            if name == "Mesh" or (isinstance(fn, ast.Name) and
+                                  fn.id in aliases):
                 out.append(node.lineno)
     return sorted(out)
 
@@ -1222,14 +1236,28 @@ def test_the_mesh_owners_all_still_build_one(sources):
 
 
 def test_the_mesh_scan_can_fail():
-    """RED TWIN for rule 4, including the attribute spelling."""
+    """RED TWIN for rule 4, including the attribute and asname spellings.
+
+    The two asname snippets scanned CLEAN before 2026-08-28 (measured on the
+    pre-fix checker at a6c57166: both returned ``[]``) — renaming at import
+    was the one static spelling the scan missed.
+    """
     for src in ("m = Mesh(devs.reshape(2, 2), ('x', 'y'))\n",
                 "m = jax.sharding.Mesh(d, ('x','y'))\n",
-                "def f():\n    return Mesh(np.asarray(jax.devices()[:1]), ())\n"):
+                "def f():\n    return Mesh(np.asarray(jax.devices()[:1]), ())\n",
+                "from jax.sharding import Mesh as _M\nm = _M(d, ('x','y'))\n",
+                "def f(d):\n"
+                "    from jax.sharding import Mesh as MM\n"
+                "    return MM(d, ('x','y'))\n"):
         assert scan_mesh_construction(src), (
             f"the mesh scan does not detect a construction in {src!r}")
     assert scan_mesh_construction("mesh = prepare_mesh()\nx = mesh.shape\n") == [], (
         "the mesh scan flags a mesh USE; only construction is banned")
+    assert scan_mesh_construction(
+        "from jax.sharding import NamedSharding as _M\ns = _M(m, spec)\n"
+    ) == [], (
+        "the mesh scan flags an alias of a DIFFERENT jax.sharding name; "
+        "only Mesh aliases count")
 
 
 # ===========================================================================
