@@ -117,6 +117,26 @@ def _c128(*dims, shard: int = 1) -> float:
     return _C128 * n / max(int(shard), 1)
 
 
+def _coupled_mu123_zq_incremental_bytes(
+        *, nk: int, nq: int, ns: int, mu: int, face_nb: int,
+        r_chunk: int, p_x: int, p_y: int) -> dict[str, float]:
+    """Private prototype delta over one accepted transverse face fit.
+
+    The coupled transport returns all three completed ``Z_q`` channels, so
+    two additional ``Z_q[q,mu_X,r_Y]`` arrays are live.  Its full-spin X
+    owner cache is sharded only over ``mu_X`` and replicated over Y.  The
+    incumbent bounded Y cache and one channel's two P carries are unchanged.
+    """
+    completed_zq = 2.0 * _c128(
+        nq, mu, r_chunk, shard=int(p_x) * int(p_y))
+    shared_x_face = _c128(nk, ns, mu, face_nb, shard=p_x)
+    return {
+        "two_additional_completed_zq": completed_zq,
+        "shared_full_spin_x_face": shared_x_face,
+        "total": completed_zq + shared_x_face,
+    }
+
+
 def _pair_density_slots() -> int:
     """Concurrent rank-5 ``(nk, ns², μ, cr)`` pair-density slots XLA keeps
     live at the Stage-C peak — 3 on GPU, 4 on CPU.  This is a

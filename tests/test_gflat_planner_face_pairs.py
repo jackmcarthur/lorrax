@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from gw.gflat_memory_model import (
+    _coupled_mu123_zq_incremental_bytes,
     _face_pair_density_slots,
     _fft_box_bytes,
     plan_gflat_chunks,
@@ -66,6 +67,15 @@ def _profile_cliff_plan(r_chunk):
         r_chunk_override=r_chunk,
         distributed_zeta_solve="distributed", low_mem_bands=True,
         face_current_vertex=True)
+
+
+def test_coupled_mu123_prototype_prices_two_zq_outputs_and_shared_x_face():
+    delta = _coupled_mu123_zq_incremental_bytes(
+        nk=36, nq=36, ns=4, mu=800, face_nb=256,
+        r_chunk=82_944, p_x=4, p_y=4)
+    assert delta["two_additional_completed_zq"] == 4_777_574_400
+    assert delta["shared_full_spin_x_face"] == 117_964_800
+    assert delta["total"] == 4_895_539_200
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
