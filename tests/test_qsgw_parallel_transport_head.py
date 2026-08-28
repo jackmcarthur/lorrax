@@ -484,6 +484,9 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     raw["wfn_fingerprint_utf8"] = np.frombuffer(
         fingerprint.encode("ascii"), dtype=np.uint8
     )
+    raw["coefficient_frame_utf8"] = np.frombuffer(
+        b"source_pauli_coefficient_frame_v1", dtype=np.uint8)
+    raw["derivative_axes"] = np.asarray((0, 1, 2), dtype=np.int32)
     raw.update(
         {
             f"velocity_validation_{key}": np.asarray(value, dtype=np.float64)
@@ -545,7 +548,8 @@ def test_pt_loader_reads_stamps_through_read_small_and_never_h5py(monkeypatch):
     monkeypatch.setitem(sys.modules, "h5py", SimpleNamespace(File=_RefusingH5py.File))
     monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
 
-    wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
+    wfn = SimpleNamespace(
+        kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0, nspinor=1)
     meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
     with pytest.raises(ValueError, match="mandatory finite-link DFT head"):
         load_parallel_transport_head(
@@ -617,6 +621,9 @@ def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
     raw["wfn_fingerprint_utf8"] = np.frombuffer(
         fingerprint.encode("ascii"), dtype=np.uint8
     )
+    raw["coefficient_frame_utf8"] = np.frombuffer(
+        b"source_pauli_coefficient_frame_v1", dtype=np.uint8)
+    raw["derivative_axes"] = np.asarray((0, 1, 2), dtype=np.int32)
     # Deliberately NO "velocity_validation_{atol,rtol,max_abs,...}" keys --
     # exactly what a real velocity-only artifact never writes.
 
@@ -642,7 +649,8 @@ def test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing(
     monkeypatch.setattr(slab_io_mod, "SlabIO", _FakeSlabIO)
     monkeypatch.setattr(pt_common, "wfn_fingerprint", lambda _wfn: fingerprint)
 
-    wfn = SimpleNamespace(kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0)
+    wfn = SimpleNamespace(
+        kgrid=(2, 2, 2), bvec=np.eye(3), blat=1.0, nspinor=1)
     meta = SimpleNamespace(b_id_4_user=8, nspinor=1, nk_tot=8)
     with pytest.raises(ValueError, match="connection_complete is not 1"):
         load_parallel_transport_head(
@@ -853,7 +861,7 @@ def test_raw_hall_fractional_occupations_and_degeneracy_refusal():
         gamma_raw, energies, occupations,
         mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk,
         nspin=1, nspinor_wfn=2))
-    with pytest.raises(ValueError, match="one Gamma_raw row per full-BZ"):
+    with pytest.raises(ValueError, match="one vertex row per full-BZ"):
         raw_hall_pseudovector_sharded(
             gamma_raw, energies, occupations,
             mesh=_mesh(), nb_logical=nb, cell_volume=29.0, nk_tot=nk + 1,

@@ -144,7 +144,7 @@ class GWResults:
     photon_head_sigma_operator_fingerprint: str | None = None
     #: Derived identity for a bounded response whose approximation is not an
     #: exact ``StaticGaugeHeadResponse``.  Charge+Hall intentionally leaves
-    #: this triplet unset; the normalized retained-bubble producer fills all
+    #: this triplet unset; the full photon-head producer fills all
     #: three fields or none.
     photon_head_sigma_response_fingerprint: str | None = None
     photon_head_sigma_response_capability: str | None = None

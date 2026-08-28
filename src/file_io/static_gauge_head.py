@@ -1,4 +1,4 @@
-"""Immutable SlabIO format for a gauge-complete static photon head.
+"""Immutable SlabIO formats for photon-head response data.
 
 This is the sole format owner for ``StaticGaugeHeadResponse``.  The bounded
 direct tensor and Hall vector are replicated; the two body wings retain their
@@ -20,7 +20,7 @@ import jax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
-from common.collectives import barrier
+from common.collectives import barrier, gather_to_host
 from common.parallel_transport import (
     WFN_FINGERPRINT_SCHEME,
     fingerprint_from_binding,
@@ -64,13 +64,13 @@ STATIC_GAUGE_HEAD_CONVENTION_ID = (
 )
 
 STATIC_GAUGE_HALL_SCHEMA_VERSION = 2
-ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION = 4
-ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID = (
-    "lorrax.isometric_retained_bubble_source/v4"
-    "|payload=energy_scaled_d1_raw+S_direct_cart+mixed_transition_tensor_cart"
-    "|sharding=P(None,None,None,x,y)+replicated"
-    "|mixed_CT=occupied_bra_real_2x3;CT=-i*T;TC=CT^dagger"
-    "|contact=omitted_by_model|complement=omitted_by_model")
+FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_SCHEMA_VERSION = 1
+FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_CONVENTION_ID = (
+    "lorrax.frequency_resolved_four_current_head/v1"
+    "|frequency_axis=omega_ry"
+    "|response=Q0_direct+H_linear+S_direct"
+    "|transition=energy_scaled_d1_raw"
+    "|energy=Rydberg|lorentz=(C,Jx,Jy,Jz)")
 
 #: Derived evidence from the completed static slab photon head.  It is a
 #: separate immutable receipt, never a response or restart source.
@@ -111,8 +111,11 @@ _STATIC_PHOTON_COMPLETION_SCALAR_DIAGNOSTICS = (
 _S_DATASET = "S_direct_cart"
 _Y_DATASET = "Y_cart_x"
 _Z_DATASET = "Z_cart_y"
-_P_SOURCE_DATASET = "energy_scaled_d1_raw"
-_S_SOURCE_DATASET = "S_direct_cart"
+_FOUR_CURRENT_HEAD_DATASETS = (
+    "omega_ry", "Q0_direct", "H_linear", "S_direct",
+    "energy_scaled_d1_raw",
+)
+_FOUR_CURRENT_HEAD_PROVENANCE = "provenance_utf8_i32"
 _LOADER_TOKEN = object()
 
 
@@ -372,243 +375,176 @@ def load_static_gauge_hall_artifact(
     )
 
 
-def write_isometric_retained_bubble_source_artifact(
-    path: str | Path,
-    source,
-    *,
-    mesh_xy: Mesh,
+def write_frequency_resolved_four_current_head(
+    path: str | Path, source, *, mesh_xy: Mesh,
 ) -> None:
-    """Persist the bounded normalized source without q2/link/WFN replicas."""
+    """Persist one method-neutral frequency bank and its transition jet."""
     import json
-    from gw.static_gauge_response import (
-        require_isometric_retained_bubble_source)
+    from gw.static_gauge_response import require_photon_head_source
 
-    source = require_isometric_retained_bubble_source(source, mesh_xy)
-    final_path, partial_path = _immutable_partial_paths(
-        path, artifact_name="IsometricRetainedBubbleSource")
+    source = require_photon_head_source(source, mesh_xy)
+    response = source.response
+    omega_values = response.canonical_frequencies(
+        gather_to_host(response.omega_ry).reshape(-1))
+    if omega_values != (0.0 + 0.0j,):
+        raise ValueError(
+            "finite-frequency four-current head persistence is disabled "
+            "until Q0/H/S share one causal response kernel")
+    d = int(response.H_linear.shape[1])
     logical = int(source.band_stop) - int(source.band_start)
-    p_shape = (2, 4, int(source.nk_tot), logical, logical)
-    availability_json = json.dumps(
-        source.availability.as_tokens(), sort_keys=True, separators=(",", ":"))
-    with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
-        io.create_dataset(
-            _P_SOURCE_DATASET, shape=p_shape, dtype=np.complex128)
-        io.create_dataset(
-            _S_SOURCE_DATASET, shape=(2, 2, 4, 4), dtype=np.complex128)
-        # SlabIO clips the producer's mesh padding to this logical dataset.
-        # A consumer on a different mesh reads the same logical bytes into
-        # its own padded carrier; processor count is not artifact semantics.
-        io.write_slab(_P_SOURCE_DATASET, source.energy_scaled_d1_raw)
-        io.write_slab(_S_SOURCE_DATASET, source.S_direct)
-        io.write_attr(
-            "schema_version",
-            np.int32(ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION))
-        io.write_attr("complete", np.int32(1))
-        io.write_attr(
-            "artifact_kind_i32",
-            _text_i32("isometric_retained_bubble_source", encoding="ascii"))
-        io.write_attr(
-            "convention_id_i32",
-            _text_i32(ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID))
-        io.write_attr(
-            "availability_json_i32", _text_i32(availability_json))
-        for name, value in (
-            ("charge_representation_i32", source.charge_representation),
-            ("spatial_current_representation_i32",
-             source.spatial_current_representation),
-            ("endpoint_jet_convention_i32", source.endpoint_jet_convention),
-            ("hamiltonian_config_operator_fingerprint_i32",
-             source.hamiltonian_config_operator_fingerprint),
-            ("source_fingerprint_i32", source.source_fingerprint),
-            ("wfn_fingerprint_i32", source.wfn_fingerprint),
-            ("approximation_i32", source.approximation),
-        ):
-            io.write_attr(name, _text_i32(value, encoding="ascii"))
-        io.write_attr("band_start", np.int32(source.band_start))
-        io.write_attr("band_stop", np.int32(source.band_stop))
-        io.write_attr("nk_tot", np.int32(source.nk_tot))
-        io.write_attr("band_extent", np.int32(logical))
-        io.write_attr(
-            "parallel_transport_schema_version",
-            np.int32(source.parallel_transport_schema_version))
-        io.write_attr(
-            "parallel_transport_polar_rcond",
-            np.float64(source.parallel_transport_polar_rcond))
-        io.write_attr(
-            "parallel_transport_derivative_axes",
-            np.asarray(
-                source.parallel_transport_derivative_axes, dtype=np.int32))
-        io.write_attr(
-            "parallel_transport_coefficient_frame_i32",
-            _text_i32(
-                source.parallel_transport_coefficient_frame,
-                encoding="ascii"))
-        io.write_attr("mixed_transition_tensor_cart", np.asarray(
-            jax.device_get(source.mixed_transition_tensor),
-            dtype=np.float64))
-        for name in (
-            "charge_ward_residual", "ward_residual", "hermiticity_residual",
-            "ordered_curvature_residual", "q2_symmetry_residual",
-            "hall_antisymmetry_residual",
-        ):
-            io.write_attr(name, np.float64(getattr(source, name)))
+    transition_shape = (d, 4, int(source.nk_tot), logical, logical)
+    transition = source.energy_scaled_d1_raw
+    if tuple(transition.shape[:3]) != transition_shape[:3]:
+        raise ValueError("energy_scaled_d1_raw has incompatible derivative axes")
 
+    provenance = {
+        "artifact": "frequency_resolved_four_current_head",
+        "schema": FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_SCHEMA_VERSION,
+        "convention": FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_CONVENTION_ID,
+        "operator_fingerprint": source.hamiltonian_config_operator_fingerprint,
+        "source_fingerprint": source.source_fingerprint,
+        "pt_schema": int(source.parallel_transport_schema_version),
+        "pt_rcond": float(source.parallel_transport_polar_rcond),
+        "pt_frame": source.parallel_transport_coefficient_frame,
+        "pt_axes": [int(axis) for axis in source.parallel_transport_derivative_axes],
+        "wfn_fingerprint": source.wfn_fingerprint,
+        "band_start": int(source.band_start), "band_stop": int(source.band_stop),
+        "nk_tot": int(source.nk_tot),
+        "residuals": {name: float(getattr(source, name)) for name in (
+            "charge_ward_residual",
+            "ordered_curvature_residual", "q2_symmetry_residual")},
+    }
+    provenance_i32 = _text_i32(json.dumps(
+        provenance, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="frequency_resolved_four_current_head")
+    with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
+        for name in _FOUR_CURRENT_HEAD_DATASETS:
+            value = transition if name == "energy_scaled_d1_raw" else getattr(response, name)
+            shape = transition_shape if name == "energy_scaled_d1_raw" else value.shape
+            io.create_dataset(name, shape=shape, dtype=value.dtype)
+            io.write_slab(name, value)
+        io.create_dataset(
+            _FOUR_CURRENT_HEAD_PROVENANCE,
+            shape=provenance_i32.shape, dtype=np.int32)
+        io.write_slab(_FOUR_CURRENT_HEAD_PROVENANCE, provenance_i32)
     _publish_completed_partial(
         partial_path, final_path,
-        artifact_name="IsometricRetainedBubbleSource",
-        barrier_name="isometric_retained_bubble_source_published")
+        artifact_name="frequency_resolved_four_current_head",
+        barrier_name="frequency_resolved_four_current_head_published")
 
 
-def load_isometric_retained_bubble_source_artifact(
-    path: str | Path,
-    *,
-    mesh_xy: Mesh,
-    wfn,
-    expected_band_start: int,
-    expected_band_stop: int,
-    expected_nk_tot: int,
+def load_frequency_resolved_four_current_head(
+    path: str | Path, *, mesh_xy: Mesh, wfn,
+    expected_band_start: int, expected_band_stop: int, expected_nk_tot: int,
     wfn_fingerprint_binding=None,
 ):
-    """Load the immutable normalized source onto its native shardings."""
+    """Load one immutable frequency bank and validate its single fingerprint."""
     import json
+    from common.four_current_model import (
+        ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+        ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
+    )
+    from gw.four_current_head import FrequencyResolvedFourCurrentHead
     from gw.static_gauge_response import (
         ISOMETRIC_ENDPOINT_JET_CONVENTION,
-        ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION,
-        ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
-        _issue_isometric_retained_bubble_source,
-        require_isometric_retained_bubble_source,
+        PHOTON_HEAD_SOURCE_APPROXIMATION,
+        _issue_photon_head_source,
+        require_photon_head_source,
     )
 
     artifact_path = Path(path)
     if artifact_path.name.endswith(".partial"):
-        raise ValueError(
-            "GATE isometric_retained_bubble_partial: refusing a partial path")
+        raise ValueError("refusing a partial frequency-resolved four-current head")
     if not artifact_path.exists():
         raise FileNotFoundError(
-            "GATE isometric_retained_bubble_artifact_absent: no completed "
-            f"artifact exists at {artifact_path}")
+            f"no completed four-current head exists at {artifact_path}")
     expected_wfn = _require_wfn_sha256(
-        wfn_fingerprint(wfn)
-        if wfn_fingerprint_binding is None
+        wfn_fingerprint(wfn) if wfn_fingerprint_binding is None
         else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
-    expected_start, expected_stop, expected_nk = (
-        int(expected_band_start), int(expected_band_stop),
-        int(expected_nk_tot))
-    expected_availability = json.dumps(
-        ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY.as_tokens(),
-        sort_keys=True, separators=(",", ":"))
-
     with SlabIO(str(artifact_path), mode="r", mesh=mesh_xy) as io:
-        def text_field(name: str) -> str:
-            return _decode_i32_text(
-                _read_required_small(io, name), field_name=name,
-                encoding="ascii")
-
-        complete = int(np.asarray(_read_required_small(io, "complete")))
-        schema = int(np.asarray(_read_required_small(io, "schema_version")))
-        kind = text_field("artifact_kind_i32")
-        convention = text_field("convention_id_i32")
-        availability_json = text_field("availability_json_i32")
-        charge_representation = text_field("charge_representation_i32")
-        current_representation = text_field(
-            "spatial_current_representation_i32")
-        endpoint_convention = text_field("endpoint_jet_convention_i32")
-        operator_fingerprint = text_field(
-            "hamiltonian_config_operator_fingerprint_i32")
-        source_fingerprint = text_field("source_fingerprint_i32")
-        artifact_wfn = text_field("wfn_fingerprint_i32")
-        approximation = text_field("approximation_i32")
-        start = int(np.asarray(_read_required_small(io, "band_start")))
-        stop = int(np.asarray(_read_required_small(io, "band_stop")))
-        nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
-        band_extent = int(np.asarray(_read_required_small(io, "band_extent")))
-        pt_schema = int(np.asarray(_read_required_small(
-            io, "parallel_transport_schema_version")))
-        pt_rcond = float(np.asarray(_read_required_small(
-            io, "parallel_transport_polar_rcond")))
-        pt_axes = tuple(int(axis) for axis in np.asarray(
-            _read_required_small(io, "parallel_transport_derivative_axes"),
-            dtype=np.int32).reshape(-1))
-        pt_frame = text_field("parallel_transport_coefficient_frame_i32")
-        mixed_transition_tensor = _read_required_small(
-            io, "mixed_transition_tensor_cart")
-        residuals = {name: float(np.asarray(_read_required_small(io, name)))
-                     for name in (
-                         "charge_ward_residual", "ward_residual",
-                         "hermiticity_residual", "ordered_curvature_residual",
-                         "q2_symmetry_residual",
-                         "hall_antisymmetry_residual")}
-
-        refusals = []
-        if complete != 1:
-            refusals.append(f"complete={complete}, expected 1")
-        if schema != ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION:
-            refusals.append(
-                f"schema_version={schema}, expected "
-                f"{ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION}")
-        if kind != "isometric_retained_bubble_source":
-            refusals.append(
-                f"artifact kind {kind!r} is not a normalized response source")
-        if convention != ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID:
-            refusals.append("source Fourier/unit/payload convention differs")
-        if availability_json != expected_availability:
-            refusals.append("explicit term availability differs")
-        if endpoint_convention != ISOMETRIC_ENDPOINT_JET_CONVENTION:
-            refusals.append("endpoint-jet representation/convention differs")
-        if approximation != ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION:
-            refusals.append("approximation declaration differs")
-        if artifact_wfn != expected_wfn:
-            refusals.append("WFN fingerprint differs")
-        if (start, stop) != (expected_start, expected_stop):
-            refusals.append(
-                f"band interval [{start},{stop}) != expected "
-                f"[{expected_start},{expected_stop})")
-        if nk_tot != expected_nk:
-            refusals.append(f"nk_tot={nk_tot}, expected {expected_nk}")
-        if band_extent != stop - start:
-            refusals.append(
-                f"stored logical band extent {band_extent} != {stop-start}")
-        if refusals:
-            raise ValueError(
-                "GATE isometric_retained_bubble_artifact_mismatch:\n  - "
-                + "\n  - ".join(refusals))
-
         try:
-            energy_scaled_d1_raw = io.read_slab(
-                _P_SOURCE_DATASET,
-                partition_spec=P(None, None, None, "x", "y"))
-            S_direct = io.read_slab(
-                _S_SOURCE_DATASET, shape=(2, 2, 4, 4), partition_spec=P())
-        except (KeyError, RuntimeError, ValueError) as exc:
+            provenance = json.loads(_decode_i32_text(
+                io.read_small(_FOUR_CURRENT_HEAD_PROVENANCE),
+                field_name=_FOUR_CURRENT_HEAD_PROVENANCE, encoding="utf-8"))
+            arrays = {name: io.read_slab(
+                name, partition_spec=(
+                    P(None, None, None, "x", "y")
+                    if name == "energy_scaled_d1_raw" else P()))
+                for name in _FOUR_CURRENT_HEAD_DATASETS}
+        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
             raise ValueError(
-                "GATE isometric_retained_bubble_schema: missing or unreadable "
-                "P/S dataset") from exc
+                "frequency-resolved four-current head has an unreadable payload") from exc
 
-    from common.collectives import device_put_process_local
-    from jax.sharding import NamedSharding
-    mixed_transition_tensor = device_put_process_local(
-        np.asarray(mixed_transition_tensor, dtype=np.float64),
-        NamedSharding(mesh_xy, P()))
-    source = _issue_isometric_retained_bubble_source(
-        energy_scaled_d1_raw=energy_scaled_d1_raw,
-        S_direct=S_direct,
-        mixed_transition_tensor=mixed_transition_tensor,
-        availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
-        charge_representation=charge_representation,
-        spatial_current_representation=current_representation,
-        endpoint_jet_convention=endpoint_convention,
-        hamiltonian_config_operator_fingerprint=operator_fingerprint,
-        source_fingerprint=source_fingerprint,
-        parallel_transport_schema_version=pt_schema,
-        parallel_transport_polar_rcond=pt_rcond,
-        parallel_transport_coefficient_frame=pt_frame,
-        parallel_transport_derivative_axes=pt_axes,
-        wfn_fingerprint=artifact_wfn,
-        band_start=start, band_stop=stop, nk_tot=nk_tot,
-        approximation=approximation,
-        **residuals,
+    provenance_keys = {
+        "artifact", "schema", "convention", "operator_fingerprint",
+        "source_fingerprint", "pt_schema", "pt_rcond", "pt_frame",
+        "pt_axes", "wfn_fingerprint", "band_start", "band_stop", "nk_tot",
+        "residuals",
+    }
+    if not isinstance(provenance, dict) or set(provenance) != provenance_keys:
+        raise ValueError(
+            "frequency-resolved four-current head provenance fields differ")
+    refusals = []
+    expected_identity = (
+        "frequency_resolved_four_current_head",
+        FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_SCHEMA_VERSION,
+        FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_CONVENTION_ID,
     )
-    return require_isometric_retained_bubble_source(source, mesh_xy)
+    identity = tuple(
+        provenance.get(key) for key in ("artifact", "schema", "convention"))
+    if identity != expected_identity:
+        refusals.append("artifact schema or convention differs")
+    start, stop, nk_tot = (int(provenance.get("band_start", -1)),
+                           int(provenance.get("band_stop", -1)),
+                           int(provenance.get("nk_tot", -1)))
+    if provenance.get("wfn_fingerprint") != expected_wfn:
+        refusals.append("WFN fingerprint differs")
+    if (start, stop, nk_tot) != (
+            int(expected_band_start), int(expected_band_stop), int(expected_nk_tot)):
+        refusals.append("band interval or k-point count differs")
+    try:
+        response = FrequencyResolvedFourCurrentHead(**{
+            name: arrays[name] for name in _FOUR_CURRENT_HEAD_DATASETS[:-1]})
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "frequency-resolved four-current response bank is invalid") from exc
+    d = int(response.H_linear.shape[1])
+    logical = stop - start
+    transition = arrays["energy_scaled_d1_raw"]
+    if (transition.ndim != 5 or tuple(transition.shape[:3]) != (d, 4, nk_tot)
+            or int(transition.shape[-2]) < logical
+            or int(transition.shape[-1]) < logical):
+        refusals.append("transition jet does not cover the logical band shape")
+    residuals = provenance.get("residuals", {})
+    residual_names = (
+        "charge_ward_residual",
+        "ordered_curvature_residual", "q2_symmetry_residual")
+    if set(residuals) != set(residual_names):
+        refusals.append("object-level residual provenance is incomplete")
+    if refusals:
+        raise ValueError(
+            "frequency-resolved four-current head mismatch:\n  - "
+            + "\n  - ".join(refusals))
+
+    source = _issue_photon_head_source(
+        energy_scaled_d1_raw=transition, response=response,
+        charge_representation=ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+        spatial_current_representation=(
+            ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION),
+        endpoint_jet_convention=ISOMETRIC_ENDPOINT_JET_CONVENTION,
+        hamiltonian_config_operator_fingerprint=provenance["operator_fingerprint"],
+        source_fingerprint=provenance["source_fingerprint"],
+        parallel_transport_schema_version=int(provenance["pt_schema"]),
+        parallel_transport_polar_rcond=float(provenance["pt_rcond"]),
+        parallel_transport_coefficient_frame=provenance["pt_frame"],
+        parallel_transport_derivative_axes=tuple(provenance["pt_axes"]),
+        wfn_fingerprint=provenance["wfn_fingerprint"],
+        band_start=start, band_stop=stop, nk_tot=nk_tot,
+        approximation=PHOTON_HEAD_SOURCE_APPROXIMATION,
+        **{name: float(residuals[name]) for name in residual_names},
+    )
+    return require_photon_head_source(source, mesh_xy)
 
 
 def write_static_gauge_head_artifact(
@@ -950,7 +886,8 @@ def write_static_photon_head_completion_receipt_h5(
     """Write the already-computed bounded completion through SlabIO."""
     from vcoul import slab_minibz_photon_receipt_digest
 
-    receipt = completion.cubature_receipt
+    cubature = completion.cubature
+    receipt = cubature.cubature_receipt
     provider_digest = slab_minibz_photon_receipt_digest(receipt)
     values = {
         "cubature_orders": receipt.orders,
@@ -959,15 +896,18 @@ def write_static_photon_head_completion_receipt_h5(
         "cubature_polygon_area": receipt.polygon_area,
         "cubature_cell_volume": receipt.cell_volume,
         "cubature_weight_sum_defects": receipt.weight_sum_defects,
-        "observed_physical_counts": completion.observed_physical_counts,
+        "observed_physical_counts": cubature.observed_physical_counts,
         "observed_padded_solve_counts":
-            completion.observed_padded_solve_counts,
-        "bare_D_mean": completion.bare_D_mean,
-        "screened_moments": completion.screened_moments,
-        **{name: getattr(completion, name)
+            cubature.observed_padded_solve_counts,
+        "bare_D_mean": cubature.bare_D_mean,
+        "screened_moments": cubature.screened_moments,
+        **{name: getattr(
+            completion if name in ("ward_residual", "hermiticity_residual")
+            else cubature,
+            name)
            for name in _STATIC_PHOTON_COMPLETION_SCALAR_DIAGNOSTICS},
         "mixed_convergence_error_ratios":
-            completion.mixed_convergence_error_ratios,
+            cubature.mixed_convergence_error_ratios,
     }
     payload = _validated_static_photon_completion_payload(values)
     final_path, partial_path = _immutable_partial_paths(
@@ -1051,19 +991,19 @@ def read_static_photon_head_completion_receipt_h5(
 
 
 __all__ = [
-    "ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID",
-    "ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION",
+    "FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_CONVENTION_ID",
+    "FREQUENCY_RESOLVED_FOUR_CURRENT_HEAD_SCHEMA_VERSION",
     "LoadedStaticGaugeHeadResponse",
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
     "STATIC_GAUGE_HEAD_CONVENTION_ID",
     "STATIC_GAUGE_HEAD_SCHEMA_VERSION",
     "STATIC_PHOTON_HEAD_COMPLETION_FILENAME",
     "STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION",
-    "load_isometric_retained_bubble_source_artifact",
+    "load_frequency_resolved_four_current_head",
     "load_static_gauge_hall_artifact",
     "load_static_gauge_head_artifact",
     "read_static_photon_head_completion_receipt_h5",
-    "write_isometric_retained_bubble_source_artifact",
+    "write_frequency_resolved_four_current_head",
     "write_static_gauge_hall_artifact",
     "write_static_gauge_head_artifact",
     "write_static_photon_head_completion_receipt_h5",

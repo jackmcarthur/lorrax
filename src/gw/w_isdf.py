@@ -2096,7 +2096,7 @@ def compute_static_photon_response(
     """Build the packed static photon body and its selected q=0 model.
 
     ``full_static_cohsex`` uses the normalized isometric finite-q carrier and
-    may attach the explicitly bounded retained-bubble q=0 response.
+    may attach the explicitly bounded photon-head q=0 response.
     Its separately named diagnostic remains headless and experimental.
     ``charge_hall_cubature`` adds only the declared charge and Hall response
     through the existing exact slab cubature.  Neither mode claims the
@@ -2193,9 +2193,9 @@ def compute_static_photon_response(
             )
         else:
             from file_io.static_gauge_head import (
-                load_isometric_retained_bubble_source_artifact)
-            head_source = load_isometric_retained_bubble_source_artifact(
-                config.paths.static_gauge_retained_source_file,
+                load_frequency_resolved_four_current_head)
+            head_source = load_frequency_resolved_four_current_head(
+                config.paths.photon_head_source_file,
                 mesh_xy=mesh_xy,
                 wfn=wfn,
                 expected_band_start=int(meta.b_id_0),
@@ -2270,8 +2270,8 @@ def compute_static_photon_response(
             )
         else:
             from .static_gauge_response import (
-                build_isometric_retained_bubble_response)
-            response = build_isometric_retained_bubble_response(
+                build_static_four_current_response)
+            response = build_static_four_current_response(
                 head_source,
                 wfns_charge,
                 wfns_transverse,
@@ -2281,6 +2281,7 @@ def compute_static_photon_response(
                 mesh=mesh_xy,
                 wfn=wfn,
                 meta=meta,
+                omega_ry=0.0 + 0.0j,
             )
         if len(photon_g0_vectors) != 4:
             raise ValueError(
@@ -2302,7 +2303,7 @@ def compute_static_photon_response(
         if (photon_mode is BispinorGWMode.FULL_STATIC_COHSEX
                 and jax.process_index() == 0):
             print(
-                "  [photon response] BOUNDED retained Ward diagnostics "
+                "  [photon response] BOUNDED four-current Ward diagnostics "
                 f"direct={float(response.ward_residual):.6e}; "
                 f"direct_or_folded_max="
                 f"{float(head_completion.ward_residual):.6e}; "
@@ -2321,13 +2322,13 @@ def compute_static_photon_response(
         head_completion=head_completion,
         current_model=current_model,
         approximation=(
-            ((response.approximation + "_on_isometric_finite_q_body")
+            ((response.approximation + "_on_four_current_finite_q_body")
              if photon_mode is BispinorGWMode.FULL_STATIC_COHSEX
              else (response.approximation +
                    "_on_experimental_no_pair_finite_q_body"))
             if coupled_head
             else (
-                "experimental_isometric_kinetic_balance_full_packed_"
+                "experimental_four_current_kinetic_balance_full_packed_"
                 "finite_q_screening_headless_v1"
                 if photon_mode is
                 BispinorGWMode.ISOMETRIC_FULL_STATIC_HEADLESS_DIAGNOSTIC

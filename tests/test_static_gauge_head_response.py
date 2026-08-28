@@ -10,6 +10,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.gw_config import (
+    BispinorGWMode,
     HeadCorrection,
     LorraxConfig,
 )
@@ -143,6 +144,27 @@ def test_static_head_moment_matches_direct_coupled_dyson_algebra():
     assert float(np.asarray(condition_max)) >= 1.0
     assert (float(np.asarray(conditioned_backward))
             >= np.finfo(np.float64).eps)
+
+
+def test_static_head_moment_includes_frequency_sample_q0_response():
+    q = np.asarray(
+        ((0.17, -0.09, 0.0), (-0.12, 0.21, 0.0)), dtype=np.float64)
+    D = np.stack((
+        np.diag((2.0, -0.7, -0.9, -0.4)),
+        np.diag((1.6, -0.8, -0.6, -0.3)),
+    )).astype(np.complex128)
+    Q0 = np.diag((0.07, -0.03, 0.04, -0.02)).astype(np.complex128)
+    H = np.zeros((2, 4, 4), dtype=np.complex128)
+    S = np.zeros((2, 2, 4, 4), dtype=np.complex128)
+    weight = np.asarray((0.4, 0.6), dtype=np.float64)
+
+    moments, *_ = static_slab_photon_head_moment_chunk(
+        q, D, H, S, 2, weight, Q0_direct=Q0)
+    W = np.linalg.solve(np.eye(4)[None] - D @ Q0[None], D)
+    basis = np.column_stack((np.ones(2), q[:, :2]))
+    expected = np.einsum(
+        "s,su,sij,sv->uvij", weight, basis, W, basis)
+    np.testing.assert_allclose(moments, expected, rtol=2e-14, atol=2e-14)
 
 
 def test_static_head_moment_applies_deterministic_cubature_weights():
@@ -339,22 +361,28 @@ def test_static_gauge_response_refuses_missing_physics_provenance(changes, gate)
             _response(mesh, **changes), mesh)
 
 
-@pytest.mark.parametrize("caller_response", (None, "fabricated"))
-def test_full_screened_runtime_refuses_before_opening_a_body(caller_response):
+@pytest.mark.parametrize(
+    ("caller_response", "message"),
+    (
+        (None, "requires the fresh WFN"),
+        ("fabricated", "caller-supplied response is not used"),
+    ),
+)
+def test_full_screened_runtime_requires_authenticated_inputs(
+        caller_response, message):
     mesh = _mesh()
     config = SimpleNamespace(
         head=SimpleNamespace(correction=HeadCorrection.FULL),
     )
     response = None if caller_response is None else _response(mesh)
-    with pytest.raises(
-            ValueError, match="static_gauge_head_end_to_end_uncertified"):
+    with pytest.raises(ValueError, match=message):
         compute_static_photon_response(
             None, None, None, None, None, mesh, config=config,
             gauge_head_response=response,
         )
 
 
-def test_full_screened_deck_refuses_on_the_real_parse_path(tmp_path):
+def test_full_screened_deck_reaches_the_real_parse_path(tmp_path):
     deck = tmp_path / "full_static_bispinor.in"
     deck.write_text(
         "[cohsex]\n"
@@ -364,8 +392,16 @@ def test_full_screened_deck_refuses_on_the_real_parse_path(tmp_path):
         "memory_per_device_gb = 4.0\n"
         "bispinor = true\n"
         "bispinor_gw = full_static_cohsex\n"
+        "compute_mode = cohsex\n"
+        "qp_solver = one_shot_dft\n"
         "head_correction = full\n"
+        "number_bands_chi = 8\n"
+        "number_bands_sigma = 8\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n"
+        "low_mem_bands = true\n"
+        "w_dyson_solver = distributed\n"
     )
-    with pytest.raises(
-            ValueError, match="full_static_bispinor_gauge_head_unavailable"):
-        LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
+    config = LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
+    assert config.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
+    assert config.head.correction is HeadCorrection.FULL

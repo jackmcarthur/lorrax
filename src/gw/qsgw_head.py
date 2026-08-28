@@ -173,6 +173,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.shard_map import shard_map
+from gw.four_current_head import FrequencyResolvedFourCurrentHead
 
 
 __all__ = [
@@ -484,7 +485,7 @@ class StaticGaugeSecondOrderComponent:
 
     @property
     def S_bubble_q2_coefficient_cart(self) -> jax.Array:
-        r"""Retained-bubble coefficient of ``q_a q_b`` in Cartesian form.
+        r"""Direct bubble coefficient of ``q_a q_b`` in Cartesian form.
 
         The differentiated response is stored in symmetric pair order
         ``(xx,xy,yy)`` as ``S_bubble_second_derivative``.  Taylor's theorem
@@ -974,7 +975,9 @@ def reduced_covector_to_cartesian(
         )
     inverse = np.linalg.inv(B)
     omitted = tuple(axis for axis in (0, 1, 2) if axis not in axes)
-    mixing = inverse[np.ix_(np.asarray(targets), np.asarray(omitted))]
+    target_index = np.asarray(targets, dtype=np.intp)
+    omitted_index = np.asarray(omitted, dtype=np.intp)
+    mixing = inverse[np.ix_(target_index, omitted_index)]
     tolerance = 256.0 * np.finfo(np.float64).eps * max(
         1.0, float(np.max(np.abs(inverse))))
     if omitted and float(np.max(np.abs(mixing))) > tolerance:
@@ -984,7 +987,8 @@ def reduced_covector_to_cartesian(
             f"Cartesian axes {targets} is {float(np.max(np.abs(mixing))):.6e} "
             f"> {tolerance:.6e}")
     return jnp.einsum(
-        "ij,j...->i...", inverse[np.ix_(targets, axes)], A,
+        "ij,j...->i...",
+        inverse[np.ix_(target_index, np.asarray(axes, dtype=np.intp))], A,
         optimize=True)
 
 
@@ -1527,6 +1531,22 @@ def _static_gauge_bubble_mixed_derivative_kernel(
     kernel = jax.jit(_kernel)
     _KERNEL_CACHE[key] = kernel
     return kernel
+
+
+def _transition_d1_from_energy_scaled(
+    energy_scaled_d1_raw,
+    energies,
+):
+    """Recover the literal transition jet without dividing degeneracies."""
+    delta = energies[:, :, None] - energies[:, None, :]
+    nonzero_delta = delta != 0.0
+    safe_delta = jnp.where(
+        nonzero_delta, delta, jnp.asarray(1.0, dtype=delta.dtype))
+    return jnp.where(
+        nonzero_delta[None, None],
+        -energy_scaled_d1_raw / safe_delta[None, None],
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
 
 
 def _head_wing_kernel(
@@ -3090,6 +3110,8 @@ def static_gauge_second_order_component_sharded(
         raise ValueError(
             "static gauge second-order component is insulating-only; "
             "metallic f'' occupation response is not derived")
+    omega_values = FrequencyResolvedFourCurrentHead.canonical_frequencies(
+        omegas_ry)
 
     from common.bispinor_init import HALFALPHA
     from common.parallel_transport import (
@@ -3195,7 +3217,7 @@ def static_gauge_second_order_component_sharded(
         forward_neighbors,
         energies,
         occupations,
-        omegas_ry,
+        omega_values,
         mesh=mesh,
         kgrid=kgrid,
         bvec_cart=bvec_cart,
@@ -3373,15 +3395,8 @@ def static_gauge_second_order_component_sharded(
         velocity_hessian[a, b], axis1=-2, axis2=-1))
         for a, b in pair_axes))
 
-    delta = energies[:, :, None] - energies[:, None, :]
-    nonzero_delta = delta != 0.0
-    transition_d1 = jnp.where(
-        nonzero_delta[None, None],
-        -first.energy_scaled_d1_raw / jnp.where(
-            nonzero_delta, delta, jnp.asarray(1.0, dtype=delta.dtype)
-        )[None, None],
-        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
-    )
+    transition_d1 = _transition_d1_from_energy_scaled(
+        first.energy_scaled_d1_raw, energies)
     prefactor = jnp.asarray(
         4.0
         / (
@@ -3392,8 +3407,12 @@ def static_gauge_second_order_component_sharded(
         ),
         dtype=jnp.complex128,
     )
-    omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
+    omega = device_put_process_local(
+        np.asarray(omega_values, dtype=np.complex128),
+        NamedSharding(mesh, P()),
+    )
     eta = jnp.asarray(float(eta_ry), dtype=jnp.float64)
+
     mixed_kernel = _static_gauge_bubble_mixed_derivative_kernel(
         mesh, nb_logical=logical)
     full_pairs = []
@@ -3681,7 +3700,7 @@ def static_gauge_full_bz_state_tables(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return one symmetry-owned insulating full-BZ state table.
 
-    Static Hall and retained-bubble producers must use identical energy and
+    Static Hall and four-current producers must use identical energy and
     occupation rows.  This helper owns the file-wedge validation, insulating
     gate and sole symmetry unfold so those producers cannot drift.
     """
@@ -4158,11 +4177,20 @@ def head_samples_from_s(
     response_kind="direct_irreducible",
     source_prefix: str = "qsgw_parallel_transport",
 ) -> tuple[object, ...]:
-    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
+    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
+
+    A slab sample is already Schur-folded on entry.  Its in-plane ``S_ab``
+    is embedded in the charge-charge block of the fixed four-field response
+    and completed independently at that frequency by the exact-WS cubature.
+    Other dimensionalities retain the incumbent scalar estimator.
+    """
     from gw.head_correction import (
-        HeadResponseKind, HeadSample, resolve_head_override)
+        HeadResponseKind,
+        HeadSample,
+        resolve_head_override,
+        slab_photon_cubature_moments,
+    )
     from gw.isdf_fitting import mem_probe
-    from gw.vcoul import compute_q0_averages
 
     # This is the first host readback of ``S_cart_omega`` for callers that
     # do not already sync it (``finalize_iteration_head_samples`` now does,
@@ -4185,6 +4213,7 @@ def head_samples_from_s(
     }
     out = []
     kind = HeadResponseKind(response_kind)
+    slab_cubature_receipt = None
     for z, S in zip(omegas, S_host):
         override = resolve_head_override(params, z)
         if override is not None:
@@ -4192,18 +4221,39 @@ def head_samples_from_s(
             continue
         is_static_metal = (
             static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
-        vc0, wc0 = compute_q0_averages(
-            wfn,
-            jnp.asarray(0.0, dtype=jnp.float64),
-            meta,
-            S_cart=None if is_static_metal else S,
-            static_kappa2=(
-                jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
-                if is_static_metal else None),
-            analytic_sphere=bool(getattr(
-                config.head, "analytic_q0_sphere",
-                config.head.head_minibz_average)),
-        )
+        if int(meta.sys_dim) == 2 and not is_static_metal:
+            if slab_cubature_receipt is None:
+                from vcoul import (
+                    CoulombGeometry,
+                    get_kernel,
+                    slab_minibz_photon_cubature,
+                )
+                slab_cubature_receipt = slab_minibz_photon_cubature(
+                    get_kernel(2), CoulombGeometry.from_wfn(wfn),
+                    tuple(int(value) for value in meta.kgrid))
+            S_cc = np.zeros((2, 2, 4, 4), dtype=np.complex128)
+            S_cc[:, :, 0, 0] = S[:2, :2]
+            cubature = slab_photon_cubature_moments(
+                np.zeros((2, 4, 4), dtype=np.complex128),
+                S_cc,
+                slab_cubature_receipt,
+            )
+            vc0 = cubature.bare_D_mean[0, 0]
+            wc0 = cubature.screened_moments[0, 0, 0, 0]
+        else:
+            from gw.vcoul import compute_q0_averages
+            vc0, wc0 = compute_q0_averages(
+                wfn,
+                jnp.asarray(0.0, dtype=jnp.float64),
+                meta,
+                S_cart=None if is_static_metal else S,
+                static_kappa2=(
+                    jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
+                    if is_static_metal else None),
+                analytic_sphere=bool(getattr(
+                    config.head, "analytic_q0_sphere",
+                    config.head.head_minibz_average)),
+            )
         out.append(
             HeadSample(
                 vc0=complex(vc0),

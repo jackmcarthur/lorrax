@@ -58,7 +58,7 @@ def _completion():
         chunks=object(),
         _provider_digest="a" * 64,
     )
-    return SimpleNamespace(
+    cubature_moments = SimpleNamespace(
         bare_D_mean=bare,
         screened_moments=moments,
         cubature_receipt=cubature,
@@ -70,6 +70,9 @@ def _completion():
         max_dyson_forward_error_bound=1.0e-12,
         mixed_scale_qstar=0.03125,
         mixed_convergence_error_ratios=(0.25, 0.125),
+    )
+    return SimpleNamespace(
+        cubature=cubature_moments,
         ward_residual=2.0e-13,
         hermiticity_residual=3.0e-13,
         # Deliberately unrepresentable sentinels: neither the runtime carrier
@@ -91,22 +94,24 @@ def test_static_photon_head_completion_receipt_roundtrip_is_bounded(tmp_path):
 
     assert loaded["schema_version"] == (
         STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION)
-    assert loaded["cubature_method"] == completion.cubature_receipt.method
+    assert loaded["cubature_method"] == (
+        completion.cubature.cubature_receipt.method)
     assert loaded["cubature_provider_digest"] == (
-        completion.cubature_receipt._provider_digest)
+        completion.cubature.cubature_receipt._provider_digest)
     assert loaded["cubature_polygon_area"] == (
-        completion.cubature_receipt.polygon_area)
+        completion.cubature.cubature_receipt.polygon_area)
     np.testing.assert_array_equal(
         loaded["cubature_weight_sum_defects"],
-        completion.cubature_receipt.weight_sum_defects)
-    np.testing.assert_array_equal(loaded["bare_D_mean"], completion.bare_D_mean)
+        completion.cubature.cubature_receipt.weight_sum_defects)
     np.testing.assert_array_equal(
-        loaded["screened_moments"], completion.screened_moments)
+        loaded["bare_D_mean"], completion.cubature.bare_D_mean)
+    np.testing.assert_array_equal(
+        loaded["screened_moments"], completion.cubature.screened_moments)
     np.testing.assert_array_equal(
         loaded["observed_physical_counts"],
-        completion.observed_physical_counts)
+        completion.cubature.observed_physical_counts)
     assert loaded["max_backward_residual"] == (
-        completion.max_backward_residual)
+        completion.cubature.max_backward_residual)
     assert loaded["ward_residual"] == completion.ward_residual
     assert metadata["photon_head_completion_receipt_path"] == str(
         path.resolve())
@@ -128,7 +133,8 @@ def test_static_photon_head_completion_receipt_roundtrip_is_bounded(tmp_path):
 def test_static_photon_head_completion_receipt_refuses_wrong_tensor_shape(
         tmp_path):
     completion = _completion()
-    completion.screened_moments = np.zeros((9, 4, 4), dtype=np.complex128)
+    completion.cubature.screened_moments = np.zeros(
+        (9, 4, 4), dtype=np.complex128)
     path = tmp_path / "malformed.h5"
     with pytest.raises(ValueError, match="screened_moments.*shape"):
         write_static_photon_head_completion_receipt_h5(

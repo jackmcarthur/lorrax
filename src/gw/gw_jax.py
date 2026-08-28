@@ -333,8 +333,7 @@ def main(argv=None):
 				" (normalized Pauli two-spinor charge/CC reference; raw "
 				"kinetic-balance only at spatial-current vertices)"),
 			"full_static_cohsex": (
-				" (experimental no-pair packed 4x4 static response; "
-				"head_correction=off)"),
+				" (full packed 4x4 static response)"),
 			"charge_hall_cubature": (
 				" (experimental no-pair packed 4x4 body plus charge/Hall "
 				"slab cubature; not FULL)"),

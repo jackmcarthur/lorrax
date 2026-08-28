@@ -1467,7 +1467,7 @@ _DEFAULTS = {
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
     "static_gauge_hall_file": "static_gauge_hall.h5",
-    "static_gauge_retained_source_file": "static_gauge_retained_source.h5",
+    "photon_head_source_file": "photon_head_source.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -3241,7 +3241,7 @@ class FilePaths:
     kin_ion_file: str
     parallel_transport_file: str
     static_gauge_hall_file: str
-    static_gauge_retained_source_file: str
+    photon_head_source_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -3542,7 +3542,7 @@ def refuse_unsupported_low_mem_bands(config) -> None:
 
 
 def uses_static_photon_response(config) -> bool:
-    """Whether screening and Sigma use the packed 4x4 photon response."""
+    """Whether screening and Sigma use a static packed 4x4 response."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     return mode in (
@@ -3634,8 +3634,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "explicit headless diagnostic cannot enable q=0 completion.\n"
             f"  got:  bispinor_gw = {mode.value}, head_correction = full\n"
             "  want: head_correction = off\n"
-            "  fix: use bispinor_gw = full_static_cohsex for the bounded "
-            "isometric retained-bubble q=0 producer, or keep this diagnostic "
+            "  fix: use bispinor_gw = full_static_cohsex for the photon "
+            "head producer, or keep this diagnostic "
             "headless\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
     if mode is BispinorGWMode.CHARGE_HALL_CUBATURE:
@@ -3731,17 +3731,17 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         if accepted:
             continue
         raise ValueError(
-            "GATE static_bispinor_photon_envelope: "
+            "GATE bispinor_photon_envelope: "
             f"bispinor_gw = {mode.value} is refused with {got}.\n"
             f"  got:  {got}\n"
             f"  want: {want}\n"
             "  why:  the packed-photon modes are deliberately narrow "
-            "full-BZ, one-shot insulating static calculations. "
+            "full-BZ, one-shot insulating calculations. "
             "The charge_hall_cubature mode includes only the explicitly "
             "declared charge CC and Hall CT/TC long-wave terms. Photon "
             "restart storage, bulk coupled heads, "
-            "self-consistency, and dynamic photon models are not silently "
-            "approximated here.\n"
+            "self-consistency and undeclared frequency models are not "
+            "silently approximated here.\n"
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
@@ -5104,8 +5104,7 @@ class LorraxConfig:
             kin_ion_file=str(_g("kin_ion_file")),
             parallel_transport_file=str(_g("parallel_transport_file")),
             static_gauge_hall_file=str(_g("static_gauge_hall_file")),
-            static_gauge_retained_source_file=str(
-                _g("static_gauge_retained_source_file")),
+            photon_head_source_file=str(_g("photon_head_source_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),

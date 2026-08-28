@@ -6,7 +6,7 @@ Hall Chern--Simons term.  Ordinary current response,
 contact and complement-space closure are omitted *by model*, never stored as
 accidental zeros and never promoted to ``full_static_gauge``.
 
-The normalized retained-bubble capability uses the same carrier and numerical
+The normalized photon-head capability uses the same carrier and numerical
 consumer, but declares its larger four-current support and its missing
 contact/complement pieces explicitly.  A capability is data, never inferred
 from zero entries.
@@ -28,11 +28,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.four_current_model import resolve_four_current_representation
 from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
+from gw.four_current_head import FrequencyResolvedFourCurrentHead
 
 
 class StaticGaugeResponseCapability(str, enum.Enum):
     CHARGE_HALL_CUBATURE = "charge_hall_cubature"
-    ISOMETRIC_RETAINED_BUBBLE = "isometric_retained_bubble"
+    FOUR_CURRENT = "photon_head"
     FULL_STATIC_GAUGE = "full_static_gauge"
 
 
@@ -76,11 +77,22 @@ class StaticGaugeTermAvailability:
             required = {
                 "cc_q2", "ct_q1", "tc_q1", "y_charge", "z_charge"}
         elif capability is (
-                StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE):
+                StaticGaugeResponseCapability.FOUR_CURRENT):
             required = {
                 "cc_q2", "ct_q1", "tc_q1", "ct_q2", "tc_q2", "tt_q2",
                 "y_charge", "y_current", "z_charge", "z_current",
             }
+            if not all(status[name] == StaticGaugeTermStatus.COMPLETE.value
+                       for name in required):
+                return False
+            if status["tt_q0"] not in (
+                    StaticGaugeTermStatus.COMPLETE.value,
+                    StaticGaugeTermStatus.OMITTED_BY_MODEL.value):
+                return False
+            return all(
+                name in required or name == "tt_q0"
+                or value == StaticGaugeTermStatus.OMITTED_BY_MODEL.value
+                for name, value in status.items())
         else:
             raise ValueError(
                 f"unsupported bounded static-gauge capability {capability!r}")
@@ -115,7 +127,7 @@ def _charge_hall_availability() -> StaticGaugeTermAvailability:
 CHARGE_HALL_CUBATURE_AVAILABILITY = _charge_hall_availability()
 
 
-def _isometric_retained_bubble_availability() -> StaticGaugeTermAvailability:
+def _photon_head_availability() -> StaticGaugeTermAvailability:
     complete = StaticGaugeTermStatus.COMPLETE
     omitted = StaticGaugeTermStatus.OMITTED_BY_MODEL
     return StaticGaugeTermAvailability(
@@ -129,13 +141,12 @@ def _isometric_retained_bubble_availability() -> StaticGaugeTermAvailability:
     )
 
 
-ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY = (
-    _isometric_retained_bubble_availability())
+PHOTON_HEAD_AVAILABILITY = _photon_head_availability()
 _PRODUCER_TOKEN = object()
 _SOURCE_TOKEN = object()
 
-ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION = (
-    "isometric_retained_bubble_full_mixed_ct_no_contact_no_complement_v2")
+PHOTON_HEAD_SOURCE_APPROXIMATION = (
+    "photon_head_full_mixed_ct_no_vnl_commutator_no_contact_no_complement_v2")
 ISOMETRIC_ENDPOINT_JET_CONVENTION = (
     "uniform_gauge_endpoint_jet/v4"
     "|kinetic_balance_lift=isometric"
@@ -164,16 +175,18 @@ class StaticGaugeCubatureResponse:
     r"""Inputs for ``R(q)=q_a H_linear[a]+q_a q_b S_ab``.
 
     Capability declares the support of ``S_direct`` and the wings.  Charge+
-    Hall has charge-only S/Y/Z; the isometric retained bubble has all four
+    Hall has charge-only S/Y/Z; the four-current has all four
     Lorentz fields but explicitly omits contact and complement closure.
     ``H_linear`` is the single bounded CT/TC carrier: charge+Hall derives it
-    from its sealed pseudovector, while retained FULL-CT keeps the authentic
+    from its sealed pseudovector, while four-current FULL-CT keeps the authentic
     normalized mixed tensor without a lossy Hall projection.
     """
 
     capability: StaticGaugeResponseCapability
     availability: StaticGaugeTermAvailability
     layout: PhotonBasisLayout
+    omega_ry: complex
+    Q0_direct: jax.Array | None       # (4,4), replicated when available
     S_direct: jax.Array               # (2,2,4,4), replicated charge CC
     H_linear: jax.Array               # (2,4,4), replicated CT/TC
     Y_x: jax.Array                    # (2,4,Npacked), P(None,None,'x')
@@ -194,26 +207,19 @@ class StaticGaugeCubatureResponse:
                 "bounded static-gauge response producer")
 
 
-# Compatibility import for callers/tests written before the bounded carrier
-# gained a second capability.  This is the same class, not a sibling record.
-ChargeHallCubatureResponse = StaticGaugeCubatureResponse
-
-
 @dataclass(frozen=True)
-class IsometricRetainedBubbleSource:
+class PhotonHeadSource:
     """Persistable response source after the expensive endpoint transaction.
 
     ``energy_scaled_d1_raw`` is the width-eight ``(a,I)`` head jet used by
-    the canonical wing contraction.  ``S_direct`` is the retained-bubble q2
-    coefficient at omega=0.  Contact and complement arrays are deliberately
-    absent; their omission is carried by ``availability`` and
-    ``approximation`` rather than encoded as zeros.
+    the canonical wing contraction.  ``response`` contains all directly
+    evaluated frequencies on one explicit axis.  Contact and complement
+    arrays are deliberately absent; their omission is carried by the
+    response convention rather than encoded as zeros.
     """
 
     energy_scaled_d1_raw: jax.Array  # (2,4,nk,nb,nb), P(None,None,None,x,y)
-    S_direct: jax.Array              # (2,2,4,4), replicated
-    mixed_transition_tensor: jax.Array  # (2,3), replicated real
-    availability: StaticGaugeTermAvailability
+    response: FrequencyResolvedFourCurrentHead
     charge_representation: str
     spatial_current_representation: str
     endpoint_jet_convention: str
@@ -228,18 +234,15 @@ class IsometricRetainedBubbleSource:
     band_stop: int
     nk_tot: int
     charge_ward_residual: float
-    ward_residual: float
-    hermiticity_residual: float
     ordered_curvature_residual: float
     q2_symmetry_residual: float
-    hall_antisymmetry_residual: float
     approximation: str
     _source_token: object
 
     def __post_init__(self) -> None:
         if self._source_token is not _SOURCE_TOKEN:
             raise TypeError(
-                "IsometricRetainedBubbleSource is issued only by the "
+                "PhotonHeadSource is issued only by the "
                 "registered producer or immutable artifact loader")
 
 
@@ -251,12 +254,18 @@ def _source_fingerprint(
     parallel_transport_coefficient_frame: str,
     parallel_transport_derivative_axes: tuple[int, ...],
 ) -> str:
-    """Bind the endpoint representation/jet semantics before persistence."""
+    """Bind the complete input lineage of one photon-head source.
+
+    This is deliberately not a response-payload digest.  The distributed
+    transition jet and the replicated Q0/H/S bank are authenticated by the
+    WFN, operator, band-manifold, PT and convention lineage that produced
+    them; in-memory validation never gathers either payload to re-hash it.
+    """
     import hashlib
     from common.parallel_transport import fingerprint_update_value
 
     digest = hashlib.sha256()
-    digest.update(b"lorrax.isometric_retained_bubble_source/v4\0")
+    digest.update(b"lorrax.photon_head_source_lineage/v1\0")
     for label, value in (
         ("operator", operator_fingerprint),
         ("wfn", wfn_fingerprint),
@@ -271,28 +280,30 @@ def _source_fingerprint(
         ("parallel_transport_derivative_axes",
          tuple(int(axis) for axis in parallel_transport_derivative_axes)),
         ("endpoint_jet", ISOMETRIC_ENDPOINT_JET_CONVENTION),
-        ("approximation", ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION),
+        ("approximation", PHOTON_HEAD_SOURCE_APPROXIMATION),
     ):
         fingerprint_update_value(digest, label, value)
     return "sha256:" + digest.hexdigest()
 
 
-def _issue_isometric_retained_bubble_source(**fields):
+def _issue_photon_head_source(**fields):
     """Private common constructor for the producer and SlabIO loader."""
-    return IsometricRetainedBubbleSource(
+    return PhotonHeadSource(
         **fields, _source_token=_SOURCE_TOKEN)
 
 
-def require_isometric_retained_bubble_source(
-    source: IsometricRetainedBubbleSource, mesh_xy: Mesh,
-) -> IsometricRetainedBubbleSource:
+def require_photon_head_source(
+    source: PhotonHeadSource, mesh_xy: Mesh,
+) -> PhotonHeadSource:
     """Validate the bounded source without gathering its band-square jet."""
-    if not isinstance(source, IsometricRetainedBubbleSource):
+    if not isinstance(source, PhotonHeadSource):
         raise TypeError(
-            "normalized retained-bubble response requires "
-            f"IsometricRetainedBubbleSource; got {type(source).__name__}")
-    source.availability.require_for(
-        StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE)
+            "normalized photon-head response requires "
+            f"PhotonHeadSource; got {type(source).__name__}")
+    if not isinstance(source.response, FrequencyResolvedFourCurrentHead):
+        raise TypeError(
+            "photon-head source response must be "
+            "FrequencyResolvedFourCurrentHead")
     from common.four_current_model import (
         ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
         ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
@@ -302,19 +313,19 @@ def require_isometric_retained_bubble_source(
             or source.spatial_current_representation !=
             ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
         raise ValueError(
-            "retained-bubble source is not in the normalized isometric "
+            "photon-head source is not in the normalized isometric "
             "four-current representation")
     if source.endpoint_jet_convention != ISOMETRIC_ENDPOINT_JET_CONVENTION:
-        raise ValueError("retained-bubble endpoint-jet convention differs")
-    if source.approximation != ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION:
-        raise ValueError("retained-bubble approximation declaration differs")
+        raise ValueError("photon-head endpoint-jet convention differs")
+    if source.approximation != PHOTON_HEAD_SOURCE_APPROXIMATION:
+        raise ValueError("photon-head approximation declaration differs")
     from gw.head_correction import require_canonical_operator_fingerprint
     require_canonical_operator_fingerprint(
         source.hamiltonian_config_operator_fingerprint,
-        gate="isometric_retained_bubble_operator_fingerprint")
+        gate="photon_head_operator_fingerprint")
     require_canonical_operator_fingerprint(
         source.source_fingerprint,
-        gate="isometric_retained_bubble_source_fingerprint")
+        gate="photon_head_source_fingerprint")
     _canonical_wfn_sha256(source.wfn_fingerprint)
 
     expected_source_fingerprint = _source_fingerprint(
@@ -331,73 +342,68 @@ def require_isometric_retained_bubble_source(
         parallel_transport_derivative_axes=(
             tuple(source.parallel_transport_derivative_axes)))
     if source.source_fingerprint != expected_source_fingerprint:
-        raise ValueError(
-            "retained-bubble source fingerprint does not bind its current "
-            "endpoint-jet fields")
+        raise ValueError("photon-head source lineage differs")
     from file_io.parallel_transport import SCHEMA_VERSION as PT_SCHEMA_VERSION
     if int(source.parallel_transport_schema_version) != int(PT_SCHEMA_VERSION):
         raise ValueError(
-            "retained-bubble source PT schema differs from the current "
+            "photon-head source PT schema differs from the current "
             f"owner: {source.parallel_transport_schema_version} != "
             f"{PT_SCHEMA_VERSION}")
     if source.parallel_transport_coefficient_frame != (
             "source_pauli_coefficient_frame_v1"):
-        raise ValueError("retained-bubble source has a non-Pauli PT frame")
+        raise ValueError("photon-head source has a non-Pauli PT frame")
     if tuple(source.parallel_transport_derivative_axes) != (0, 1):
-        raise ValueError("retained-bubble source PT coverage is not in-plane")
+        raise ValueError("photon-head source PT coverage is not in-plane")
     if (not np.isfinite(source.parallel_transport_polar_rcond)
             or float(source.parallel_transport_polar_rcond) <= 0.0):
-        raise ValueError("retained-bubble source has invalid PT polar_rcond")
+        raise ValueError("photon-head source has invalid PT polar_rcond")
 
     logical = int(source.band_stop) - int(source.band_start)
     if int(source.band_start) != 0 or logical <= 0 or int(source.nk_tot) <= 0:
-        raise ValueError("retained-bubble source has an invalid state manifold")
+        raise ValueError("photon-head source has an invalid state manifold")
     storage = int(source.energy_scaled_d1_raw.shape[-1])
     if tuple(source.energy_scaled_d1_raw.shape) != (
             2, 4, int(source.nk_tot), storage, storage):
         raise ValueError(
-            "retained-bubble P jet must be (2,4,nk,nb,nb); got "
+            "photon-head P jet must be (2,4,nk,nb,nb); got "
             f"{source.energy_scaled_d1_raw.shape}")
     if storage < logical:
-        raise ValueError("retained-bubble P jet does not cover logical bands")
+        raise ValueError("photon-head P jet does not cover logical bands")
+    if np.dtype(source.energy_scaled_d1_raw.dtype) != np.dtype(np.complex128):
+        raise TypeError(
+            "energy_scaled_d1_raw dtype "
+            f"{source.energy_scaled_d1_raw.dtype} != {np.dtype(np.complex128)}")
     arrays = (
         (source.energy_scaled_d1_raw, "energy_scaled_d1_raw",
-         np.complex128, P(None, None, None, "x", "y")),
-        (source.S_direct, "S_direct", np.complex128, P()),
-        (source.mixed_transition_tensor, "mixed_transition_tensor",
-         np.float64, P()),
+         P(None, None, None, "x", "y")),
+        (source.response.omega_ry, "response.omega_ry", P()),
+        (source.response.Q0_direct, "response.Q0_direct", P()),
+        (source.response.H_linear, "response.H_linear", P()),
+        (source.response.S_direct, "response.S_direct", P()),
     )
-    if tuple(source.S_direct.shape) != (2, 2, 4, 4):
-        raise ValueError(f"S_direct shape {source.S_direct.shape} != (2,2,4,4)")
-    if tuple(source.mixed_transition_tensor.shape) != (2, 3):
-        raise ValueError(
-            "mixed_transition_tensor shape "
-            f"{source.mixed_transition_tensor.shape} != (2,3)")
-    for array, name, dtype, spec in arrays:
-        if np.dtype(array.dtype) != np.dtype(dtype):
-            raise TypeError(f"{name} dtype {array.dtype} != {np.dtype(dtype)}")
+    for array, name, spec in arrays:
         if not _same_mesh_sharding(array, mesh_xy, spec):
             raise ValueError(f"{name} must have production sharding {spec}")
     residuals = np.asarray((
-        source.charge_ward_residual, source.ward_residual,
-        source.hermiticity_residual, source.ordered_curvature_residual,
-        source.q2_symmetry_residual, source.hall_antisymmetry_residual),
+        source.charge_ward_residual, source.ordered_curvature_residual,
+        source.q2_symmetry_residual),
         dtype=np.float64)
     if np.any(~np.isfinite(residuals)) or np.any(residuals < 0.0):
-        raise ValueError("retained-bubble source has invalid residuals")
+        raise ValueError("photon-head source has invalid residuals")
     return source
 
 
-def build_isometric_retained_bubble_source(
+def build_photon_head_source(
     uniform_gauge, parallel_transport,
     *, wfn, sym, band_start: int, band_stop: int, mesh: Mesh,
-) -> IsometricRetainedBubbleSource:
-    """Compose the canonical isometric endpoint transaction once.
+) -> PhotonHeadSource:
+    """Compose the exact static row of a frequency-axis response bank.
 
     WFN/VNL/FFT work remains in the preprocessing driver.  This function
     consumes its sealed uniform-gauge result plus the existing PT owner and
-    persists only the width-eight first jet, small q2 coefficient and full
-    mixed CT tensor needed later by the centroid-wing producer.
+    persists the width-eight first jet and the established static H/S
+    convention.  Finite-frequency production remains closed until Q0/H/S
+    are derived from one causal two-orientation response.
     """
     from common.bispinor_init import ISOMETRIC_KINETIC_BALANCE_LIFT
     from common.four_current_model import resolve_four_current_representation
@@ -407,51 +413,53 @@ def build_isometric_retained_bubble_source(
     from gw.head_correction import (
         canonicalize_static_gauge_q2_tensor,
         require_canonical_operator_fingerprint,
-        static_gauge_tensor_residuals,
+        static_mixed_linear_response,
     )
     from gw.qsgw_head import (
         ParallelTransportHeadData,
         _hall_pseudovector_sharded,
-        static_gauge_full_bz_state_tables,
         static_gauge_second_order_component_sharded,
+        static_gauge_full_bz_state_tables,
     )
 
     if not isinstance(uniform_gauge, UniformGaugeMatrixElements):
         raise TypeError(
-            "retained-bubble source requires the complete uniform-gauge "
+            "photon-head source requires the complete uniform-gauge "
             "endpoint transaction")
     if (uniform_gauge.dgamma_dq_raw is None
             or uniform_gauge.d2gamma_dq2_raw is None
             or uniform_gauge.dcharge_dq_raw is None
             or uniform_gauge.d2charge_dq2_raw is None):
         raise ValueError(
-            "retained-bubble source requires canonical charge and current "
+            "photon-head source requires canonical charge and current "
             "q1/q2 endpoint jets")
     if not isinstance(parallel_transport, ParallelTransportHeadData):
         raise TypeError(
-            "retained-bubble source requires the canonical PT link artifact")
+            "photon-head source requires the canonical PT link artifact")
     if parallel_transport.coefficient_frame != (
             "source_pauli_coefficient_frame_v1"):
         raise ValueError(
-            "retained-bubble source requires source-Pauli coefficient-frame "
+            "photon-head source requires source-Pauli coefficient-frame "
             "links; isometric endpoint q1/q2 already contains dU/dK and an "
             "isometric-link connection would double count it")
     if tuple(parallel_transport.derivative_axes) != (0, 1):
         raise ValueError(
-            "retained-bubble source requires exact in-plane PT derivative "
+            "photon-head source requires exact in-plane PT derivative "
             f"coverage (0,1); got {parallel_transport.derivative_axes}")
     if parallel_transport.velocity_dft_cart is None:
         raise ValueError(
-            "retained-bubble source requires the PT source-Hamiltonian "
+            "photon-head source requires the PT source-Hamiltonian "
             "velocity for QE energy q1/q2")
     start, stop = int(band_start), int(band_stop)
     logical = stop - start
     if start != 0 or logical <= 0:
-        raise ValueError("retained-bubble band interval must be [0,stop)")
+        raise ValueError("photon-head band interval must be [0,stop)")
     if int(parallel_transport.nb_logical) != logical:
         raise ValueError(
             "endpoint jet and PT links use different band manifolds: "
             f"jet=[{start},{stop}), PT=[0,{parallel_transport.nb_logical})")
+    omega_values = (0.0 + 0.0j,)
+    static_index = 0
     representation = resolve_four_current_representation(
         True, BispinorGWMode.FULL_STATIC_COHSEX)
     if (representation.charge_lift != ISOMETRIC_KINETIC_BALANCE_LIFT
@@ -460,7 +468,7 @@ def build_isometric_retained_bubble_source(
 
     energies, occupations = static_gauge_full_bz_state_tables(
         wfn=wfn, sym=sym, band_start=start, band_stop=stop)
-    second = static_gauge_second_order_component_sharded(
+    second_order = static_gauge_second_order_component_sharded(
         uniform_gauge.gamma_raw,
         uniform_gauge.dgamma_dq_raw,
         uniform_gauge.d2gamma_dq2_raw,
@@ -468,7 +476,7 @@ def build_isometric_retained_bubble_source(
         parallel_transport.forward_neighbors,
         energies,
         occupations,
-        (0.0 + 0.0j,),
+        omega_values,
         mesh=mesh,
         kgrid=tuple(int(v) for v in wfn.kgrid),
         bvec_cart=(np.asarray(wfn.bvec, dtype=np.float64)
@@ -483,53 +491,64 @@ def build_isometric_retained_bubble_source(
         charge_dq2_raw=uniform_gauge.d2charge_dq2_raw,
         hamiltonian_velocity_cart=parallel_transport.velocity_dft_cart,
     )
-    _hall_projection, hall_residual, mixed_transition_tensor = (
-        _hall_pseudovector_sharded(
-        uniform_gauge.gamma_raw, energies, occupations,
-        mesh=mesh, nb_logical=logical,
-        cell_volume=float(wfn.cell_volume), nk_tot=int(sym.nk_tot),
-        nspin=int(wfn.nspin), nspinor_wfn=int(wfn.nspinor),
-        charge_energy_scaled_d1_raw=(
-            second.first_order.energy_scaled_d1_raw[:, 0]),
-        require_antisymmetry=False))
     operator_fingerprint = require_canonical_operator_fingerprint(
         uniform_gauge.hamiltonian_config_operator_fingerprint,
-        gate="isometric_retained_bubble_uniform_operator")
+        gate="photon_head_uniform_operator")
     wfn_fp = _canonical_wfn_sha256(wfn_fingerprint(wfn))
 
-    S_direct = canonicalize_static_gauge_q2_tensor(
-        second.S_bubble_q2_coefficient_cart[0])
-    ward, hermiticity = static_gauge_tensor_residuals(S_direct)
+    S_direct = second_order.S_bubble_q2_coefficient_cart
+    S_static = canonicalize_static_gauge_q2_tensor(S_direct[static_index])
+    _hall_projection, _hall_residual, mixed_transition_tensor = (
+        _hall_pseudovector_sharded(
+            uniform_gauge.gamma_raw, energies, occupations,
+            mesh=mesh, nb_logical=logical,
+            cell_volume=float(wfn.cell_volume), nk_tot=int(sym.nk_tot),
+            nspin=int(wfn.nspin), nspinor_wfn=int(wfn.nspinor),
+            charge_energy_scaled_d1_raw=(
+                second_order.first_order.energy_scaled_d1_raw[:, 0]),
+            require_antisymmetry=False))
+    H_static = _replicated(
+        static_mixed_linear_response(mixed_transition_tensor),
+        mesh, dtype=np.complex128)
+    S_direct = S_direct.at[static_index].set(S_static)
+    frequency_response = FrequencyResolvedFourCurrentHead(
+        omega_ry=_replicated(
+            np.asarray(omega_values, dtype=np.complex128),
+            mesh, dtype=np.complex128),
+        Q0_direct=_replicated(
+            np.zeros((1, 4, 4), dtype=np.complex128),
+            mesh, dtype=np.complex128),
+        H_linear=H_static[None],
+        S_direct=S_direct,
+    )
     values = jax.device_get((
-        second.first_order.charge_ward_residual,
-        second.ordered_curvature_residual,
-        second.q2_symmetry_residual,
+        second_order.first_order.charge_ward_residual,
+        second_order.ordered_curvature_residual,
+        second_order.q2_symmetry_residual,
     ))
-    source = _issue_isometric_retained_bubble_source(
+    source_fingerprint = _source_fingerprint(
+        operator_fingerprint=operator_fingerprint,
+        wfn_fingerprint=wfn_fp, band_start=start, band_stop=stop,
+        nk_tot=int(sym.nk_tot),
+        parallel_transport_schema_version=(
+            int(parallel_transport.schema_version)),
+        parallel_transport_polar_rcond=(
+            float(parallel_transport.polar_rcond)),
+        parallel_transport_coefficient_frame=(
+            parallel_transport.coefficient_frame),
+        parallel_transport_derivative_axes=(
+            tuple(parallel_transport.derivative_axes)))
+    source = _issue_photon_head_source(
         energy_scaled_d1_raw=jnp.asarray(
-            second.first_order.energy_scaled_d1_raw,
+            second_order.first_order.energy_scaled_d1_raw,
             dtype=jnp.complex128),
-        S_direct=jnp.asarray(S_direct, dtype=jnp.complex128),
-        mixed_transition_tensor=jnp.asarray(
-            mixed_transition_tensor, dtype=jnp.float64),
-        availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
+        response=frequency_response,
         charge_representation=representation.charge_representation,
         spatial_current_representation=(
             representation.spatial_current_representation),
         endpoint_jet_convention=ISOMETRIC_ENDPOINT_JET_CONVENTION,
         hamiltonian_config_operator_fingerprint=operator_fingerprint,
-        source_fingerprint=_source_fingerprint(
-            operator_fingerprint=operator_fingerprint,
-            wfn_fingerprint=wfn_fp, band_start=start, band_stop=stop,
-            nk_tot=int(sym.nk_tot),
-            parallel_transport_schema_version=(
-                int(parallel_transport.schema_version)),
-            parallel_transport_polar_rcond=(
-                float(parallel_transport.polar_rcond)),
-            parallel_transport_coefficient_frame=(
-                parallel_transport.coefficient_frame),
-            parallel_transport_derivative_axes=(
-                tuple(parallel_transport.derivative_axes))),
+        source_fingerprint=source_fingerprint,
         parallel_transport_schema_version=int(parallel_transport.schema_version),
         parallel_transport_polar_rcond=float(parallel_transport.polar_rcond),
         parallel_transport_coefficient_frame=(
@@ -539,14 +558,11 @@ def build_isometric_retained_bubble_source(
         wfn_fingerprint=wfn_fp,
         band_start=start, band_stop=stop, nk_tot=int(sym.nk_tot),
         charge_ward_residual=float(np.asarray(values[0])),
-        ward_residual=float(ward),
-        hermiticity_residual=float(hermiticity),
         ordered_curvature_residual=float(np.asarray(values[1])),
         q2_symmetry_residual=float(np.asarray(values[2])),
-        hall_antisymmetry_residual=float(hall_residual),
-        approximation=ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION,
+        approximation=PHOTON_HEAD_SOURCE_APPROXIMATION,
     )
-    return require_isometric_retained_bubble_source(source, mesh)
+    return require_photon_head_source(source, mesh)
 
 
 def _same_mesh_sharding(array, mesh: Mesh, spec: P) -> bool:
@@ -569,16 +585,19 @@ def require_static_gauge_cubature_response(
             f"{type(response).__name__}")
     if response.capability not in (
             StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE,
-            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE):
+            StaticGaugeResponseCapability.FOUR_CURRENT):
         raise ValueError(
             "bounded static-gauge producer cannot issue a FULL capability")
     response.availability.require_for(response.capability)
     response.layout.assert_mesh(mesh_xy)
+    omega = complex(response.omega_ry)
+    if not (np.isfinite(omega.real) and np.isfinite(omega.imag)):
+        raise ValueError("bounded response has a non-finite omega_ry")
 
     if not str(response.charge_representation).strip():
         raise ValueError("bounded response has no charge representation")
     if (response.capability is
-            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE):
+            StaticGaugeResponseCapability.FOUR_CURRENT):
         from common.four_current_model import (
             ISOMETRIC_KINETIC_BALANCE_CHARGE_REPRESENTATION,
             ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
@@ -588,12 +607,12 @@ def require_static_gauge_cubature_response(
                 or response.spatial_current_representation !=
                 ISOMETRIC_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION):
             raise ValueError(
-                "isometric retained-bubble response carries a different "
+                "four-current response carries a different "
                 "charge/current representation")
         from gw.head_correction import require_canonical_operator_fingerprint
         require_canonical_operator_fingerprint(
             response.response_fingerprint,
-            gate="isometric_retained_bubble_fingerprint")
+            gate="photon_head_fingerprint")
     elif response.response_fingerprint is not None:
         from gw.head_correction import require_canonical_operator_fingerprint
         require_canonical_operator_fingerprint(
@@ -611,6 +630,14 @@ def require_static_gauge_cubature_response(
         (response.Z_y, "Z_y", (2, n_packed, 4), np.complex128,
          P(None, "y", None)),
     )
+    if response.Q0_direct is not None:
+        arrays = (
+            (response.Q0_direct, "Q0_direct", (4, 4), np.complex128, P()),
+            *arrays,
+        )
+    elif response.capability is StaticGaugeResponseCapability.FOUR_CURRENT:
+        raise ValueError(
+            "four-current response requires Q0_direct")
     for array, name, shape, dtype, spec in arrays:
         if tuple(array.shape) != shape:
             raise ValueError(f"{name} shape {array.shape} != {shape}")
@@ -623,11 +650,12 @@ def require_static_gauge_cubature_response(
     H = np.asarray(jax.device_get(response.H_linear))
     if not np.all(np.isfinite(H)):
         raise ValueError("bounded static H_linear is not finite")
-    if (np.any(H[:, 0, 0] != 0.0)
-            or np.any(H[:, 1:, 1:] != 0.0)
-            or np.any(H - np.conj(np.swapaxes(H, -1, -2)) != 0.0)):
+    if (np.any(H - np.conj(np.swapaxes(H, -1, -2)) != 0.0)
+            or (omega == 0.0 + 0.0j
+                and (np.any(H[:, 0, 0] != 0.0)
+                     or np.any(H[:, 1:, 1:] != 0.0)))):
         raise ValueError(
-            "bounded static H_linear must contain Hermitian CT/TC only")
+            "bounded H_linear violates its Hermitian/static support")
     if (response.capability is
             StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE
             and (np.any(S[:, :, 0, 1:] != 0.0)
@@ -667,7 +695,8 @@ def require_charge_hall_cubature_response(
 
 
 def _bounded_response_fingerprint(
-    source: IsometricRetainedBubbleSource,
+    source: PhotonHeadSource,
+    omega_ry: complex,
     charge_receipt,
     transverse_receipt,
     layout: PhotonBasisLayout,
@@ -678,9 +707,13 @@ def _bounded_response_fingerprint(
     from common.parallel_transport import fingerprint_update_value
 
     digest = hashlib.sha256()
-    digest.update(b"lorrax.isometric_retained_bubble_response/v1\0")
+    digest.update(b"lorrax.photon_head_response/v1\0")
     fingerprint_update_value(
         digest, "source_fingerprint", source.source_fingerprint)
+    fingerprint_update_value(
+        digest, "omega_ry",
+        (float(complex(omega_ry).real).hex(),
+         float(complex(omega_ry).imag).hex()))
     fingerprint_update_value(
         digest, "body_leg_placement", DISTINCT_BODY_LEG_PLACEMENT)
     fingerprint_update_value(
@@ -696,8 +729,8 @@ def _bounded_response_fingerprint(
     return "sha256:" + digest.hexdigest()
 
 
-def build_isometric_retained_bubble_response(
-    source: IsometricRetainedBubbleSource,
+def build_static_four_current_response(
+    source: PhotonHeadSource,
     wfns_charge,
     wfns_transverse,
     *,
@@ -707,13 +740,18 @@ def build_isometric_retained_bubble_response(
     mesh: Mesh,
     wfn,
     meta,
+    omega_ry,
 ) -> StaticGaugeCubatureResponse:
-    """Attach canonical distinct-face body wings to the persisted head jet."""
-    from gw.head_correction import static_mixed_linear_response
-
-    source = require_isometric_retained_bubble_source(source, mesh)
+    """Attach the distinct-face Y(0)/Z(0) static four-current response."""
+    source = require_photon_head_source(source, mesh)
+    omega = complex(omega_ry)
+    frequency_index = source.response.index(omega)
+    if omega != 0.0 + 0.0j:
+        raise ValueError(
+            "dynamic four-current head consumption is not connected; "
+            "the frequency bank is preprocessing data, not a GN-PPM model")
     if not isinstance(layout, PhotonBasisLayout):
-        raise TypeError("retained-bubble response requires PhotonBasisLayout")
+        raise TypeError("photon-head response requires PhotonBasisLayout")
     layout.assert_mesh(mesh)
     from common.bispinor_init import (
         ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE)
@@ -724,29 +762,29 @@ def build_isometric_retained_bubble_response(
             (transverse_binding, wfns_transverse, "transverse")):
         if not isinstance(binding, AuthenticatedWavefunctions):
             raise TypeError(
-                f"retained-bubble {role} carrier lacks its authenticated "
+                f"photon-head {role} carrier lacks its authenticated "
                 "WavefunctionBasisReceipt")
         if binding.wavefunctions is not carrier or binding.receipt.role != role:
             raise ValueError(
-                f"retained-bubble {role} binding does not name its carrier")
+                f"photon-head {role} binding does not name its carrier")
         receipt = binding.receipt
         if receipt.wfn_fingerprint != source.wfn_fingerprint:
             raise ValueError(
-                f"retained-bubble {role} basis and endpoint jet use "
+                f"photon-head {role} basis and endpoint jet use "
                 "different WFN identities")
         if receipt.band_interval != (
                 int(source.band_start), int(source.band_stop)):
             raise ValueError(
-                f"retained-bubble {role} basis band interval "
+                f"photon-head {role} basis band interval "
                 f"{receipt.band_interval} != source "
                 f"[{source.band_start},{source.band_stop})")
         if (receipt.bispinor_lift_provenance !=
                 ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE):
             raise ValueError(
-                f"retained-bubble {role} basis is not the isometric carrier")
+                f"photon-head {role} basis is not the isometric carrier")
         if carrier.layout != "face":
             raise ValueError(
-                f"retained-bubble {role} wings require low-memory face "
+                f"photon-head {role} wings require low-memory face "
                 f"layout; got {carrier.layout!r}")
 
     charge_receipt = charge_binding.receipt
@@ -779,7 +817,7 @@ def build_isometric_retained_bubble_response(
             or wfns_charge.enk.shape != wfns_transverse.enk.shape
             or wfns_charge.occ.shape != wfns_transverse.occ.shape):
         raise ValueError(
-            "retained-bubble source and live charge/transverse state tables "
+            "photon-head source and live charge/transverse state tables "
             "have different k/band carriers")
     energy = wfns_charge.enk[:, :storage]
     occupations = wfns_charge.occ[:, :storage]
@@ -804,7 +842,7 @@ def build_isometric_retained_bubble_response(
             bundle,
             energy,
             occupations,
-            (0.0 + 0.0j,),
+            (omega,),
             mesh=mesh,
             nb_logical=logical,
             nk_tot=int(source.nk_tot),
@@ -851,23 +889,26 @@ def build_isometric_retained_bubble_response(
         jnp.maximum(jnp.max(jnp.abs(Y_x)), jnp.max(jnp.abs(z_as_y))),
         1.0e-300)
     wing_reciprocity = float(np.asarray(jax.device_get(delta / scale)))
+    S_direct = source.response.S_direct[frequency_index]
+    ward_residual, hermiticity_residual = static_gauge_tensor_residuals(
+        S_direct)
     response = StaticGaugeCubatureResponse(
-        capability=StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE,
-        availability=ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY,
+        capability=StaticGaugeResponseCapability.FOUR_CURRENT,
+        availability=PHOTON_HEAD_AVAILABILITY,
         layout=layout,
-        S_direct=source.S_direct,
-        H_linear=_replicated(
-            static_mixed_linear_response(source.mixed_transition_tensor),
-            mesh, dtype=np.complex128),
+        omega_ry=omega,
+        Q0_direct=source.response.Q0_direct[frequency_index],
+        S_direct=S_direct,
+        H_linear=source.response.H_linear[frequency_index],
         Y_x=Y_x,
         Z_y=Z_y,
-        ward_residual=float(source.ward_residual),
-        hermiticity_residual=float(source.hermiticity_residual),
+        ward_residual=ward_residual,
+        hermiticity_residual=hermiticity_residual,
         wing_reciprocity_residual=wing_reciprocity,
         charge_representation=source.charge_representation,
         spatial_current_representation=source.spatial_current_representation,
         response_fingerprint=_bounded_response_fingerprint(
-            source, charge_receipt, transverse_receipt, layout),
+            source, omega, charge_receipt, transverse_receipt, layout),
         approximation=source.approximation,
         _producer_token=_PRODUCER_TOKEN,
     )
@@ -997,6 +1038,7 @@ def build_charge_hall_cubature_response(
     response = StaticGaugeCubatureResponse(
         capability=StaticGaugeResponseCapability.CHARGE_HALL_CUBATURE,
         availability=availability, layout=layout,
+        omega_ry=0.0 + 0.0j, Q0_direct=None,
         S_direct=S_direct, H_linear=H_linear, Y_x=Y_x, Z_y=Z_y,
         ward_residual=float(ward), hermiticity_residual=float(hermiticity),
         wing_reciprocity_residual=wing_reciprocity,
@@ -1019,21 +1061,20 @@ def require_full_static_gauge_availability(
 
 __all__ = [
     "CHARGE_HALL_CUBATURE_AVAILABILITY",
-    "ChargeHallCubatureResponse",
     "DISTINCT_BODY_LEG_PLACEMENT",
     "ISOMETRIC_ENDPOINT_JET_CONVENTION",
-    "ISOMETRIC_RETAINED_BUBBLE_APPROXIMATION",
-    "ISOMETRIC_RETAINED_BUBBLE_AVAILABILITY",
-    "IsometricRetainedBubbleSource",
+    "PHOTON_HEAD_SOURCE_APPROXIMATION",
+    "PHOTON_HEAD_AVAILABILITY",
+    "PhotonHeadSource",
     "StaticGaugeCubatureResponse",
     "StaticGaugeResponseCapability",
     "StaticGaugeTermAvailability",
     "StaticGaugeTermStatus",
     "build_charge_hall_cubature_response",
-    "build_isometric_retained_bubble_source",
-    "build_isometric_retained_bubble_response",
+    "build_photon_head_source",
+    "build_static_four_current_response",
     "require_charge_hall_cubature_response",
     "require_static_gauge_cubature_response",
     "require_full_static_gauge_availability",
-    "require_isometric_retained_bubble_source",
+    "require_photon_head_source",
 ]

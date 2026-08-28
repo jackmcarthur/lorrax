@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, gather_to_host
 from common.shard_map import shard_map
 from common.units import RYD_TO_EV
 
@@ -242,7 +242,7 @@ def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
     antisymmetric coordinate tensor is unobservable under ``q_a q_b`` and is
     refused rather than retained as an arbitrary representative.
     """
-    S = np.asarray(jax.device_get(S_direct), dtype=np.complex128)
+    S = np.asarray(gather_to_host(S_direct), dtype=np.complex128)
     if S.shape != (2, 2, 4, 4):
         raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
     if not np.all(np.isfinite(S)):
@@ -1092,18 +1092,17 @@ def small_head_wing_halves_sharded(
 def _static_slab_photon_head_moment_chunk(
     q_cart: jax.Array,
     D_raw: jax.Array,
-    H_hall: jax.Array,
+    Q0_direct: jax.Array,
+    H_linear: jax.Array,
     S_quadratic: jax.Array,
     valid_count: jax.Array,
     sample_weight: jax.Array,
 ):
     r"""Accumulate one fixed-size chunk of the coupled small-head solve.
 
-    ``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the two
-    periodic in-plane Cartesian coordinates of a slab.  ``H_hall`` is private
-    to this numerical kernel: the public entry derives it from ``sigma_H`` so
-    an arbitrary linear CT/TC matrix cannot enter production.  For every valid
-    mini-BZ sample this evaluates the *coupled* four-field Dyson equation
+    ``R(q) = Q0_direct + q_a H_linear[a] + q_a q_b S_quadratic[a,b]``
+    uses the two periodic in-plane Cartesian coordinates of a slab.  For every
+    valid mini-BZ sample this evaluates the *coupled* four-field Dyson equation
 
     ``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
 
@@ -1118,11 +1117,13 @@ def _static_slab_photon_head_moment_chunk(
     """
     q = jnp.asarray(q_cart, dtype=jnp.float64)
     D = jnp.asarray(D_raw, dtype=jnp.complex128)
-    H = jnp.asarray(H_hall, dtype=jnp.complex128)
+    Q0 = jnp.asarray(Q0_direct, dtype=jnp.complex128)
+    H = jnp.asarray(H_linear, dtype=jnp.complex128)
     S = jnp.asarray(S_quadratic, dtype=jnp.complex128)
     qxy = q[:, :2]
     R = (
-        jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
+        Q0[None]
+        + jnp.einsum("sa,aij->sij", qxy, H, optimize=True)
         + jnp.einsum("sa,sb,abij->sij", qxy, qxy, S, optimize=True)
     )
     identity = jnp.eye(4, dtype=jnp.complex128)[None, :, :]
@@ -1177,15 +1178,19 @@ def static_slab_photon_head_moment_chunk(
     S_quadratic,
     valid_count,
     sample_weight,
+    *,
+    Q0_direct=None,
 ):
     """Validated entry to the fixed-size static slab photon-head graph.
 
     Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
     ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
-    units (no cell-volume factor), ``H_linear`` is the validated
-    ``(2,4,4)`` CT/TC response, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
-    normalizes each provider-issued weighted rule and applies the one and only
-    ``1/Vcell`` while rebuilding the packed q=Gamma row.
+    units (no cell-volume factor), ``Q0_direct`` is an optional ``(4,4)``
+    response, ``H_linear`` is ``(2,4,4)``, and ``S_quadratic`` is
+    ``(2,2,4,4)``.  Omitting ``Q0_direct`` supplies an exact zero and preserves
+    the established static response.  The caller normalizes each
+    provider-issued weighted rule and applies the one and only ``1/Vcell``
+    while rebuilding the packed q=Gamma row.
 
     The function is intentionally slab/static-only.  A bulk analytic-sphere
     correction cannot be added after this nonlinear coupled solve, and must
@@ -1193,6 +1198,7 @@ def static_slab_photon_head_moment_chunk(
     """
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
+    q0_shape = (4, 4) if Q0_direct is None else tuple(np.shape(Q0_direct))
     h_shape = tuple(np.shape(H_linear))
     S_shape = tuple(np.shape(S_quadratic))
     if len(q_shape) != 2 or q_shape[1] != 3:
@@ -1200,10 +1206,12 @@ def static_slab_photon_head_moment_chunk(
     expected_D = (q_shape[0], 4, 4)
     if d_shape != expected_D:
         raise ValueError(f"D_raw must be {expected_D}, got {d_shape}")
-    if h_shape != (2, 4, 4) or S_shape != (2, 2, 4, 4):
+    if (q0_shape != (4, 4) or h_shape != (2, 4, 4)
+            or S_shape != (2, 2, 4, 4)):
         raise ValueError(
-            "static slab response requires H_linear=(2,4,4) and "
-            f"S_quadratic=(2,2,4,4); got {h_shape}/{S_shape}")
+            "slab response requires Q0_direct=(4,4), "
+            "H_linear=(2,4,4), and S_quadratic=(2,2,4,4); got "
+            f"{q0_shape}/{h_shape}/{S_shape}")
     n_valid = int(valid_count)
     if not 0 <= n_valid <= q_shape[0]:
         raise ValueError(
@@ -1217,13 +1225,17 @@ def static_slab_photon_head_moment_chunk(
         raise ValueError(
             "sample_weight must be finite and nonnegative on valid rows, "
             "with exact zeros on padded rows")
+    Q0 = jnp.zeros((4, 4), dtype=jnp.complex128) if Q0_direct is None else (
+        jnp.asarray(Q0_direct, dtype=jnp.complex128))
     H = jnp.asarray(H_linear, dtype=jnp.complex128)
     S_sharding = getattr(S_quadratic, "sharding", None)
     if isinstance(S_sharding, NamedSharding):
+        Q0 = device_put_process_local(
+            Q0, NamedSharding(S_sharding.mesh, P()))
         H = device_put_process_local(
             H, NamedSharding(S_sharding.mesh, P()))
     result = _static_slab_photon_head_moment_chunk(
-        q_cart, D_raw, H, S_quadratic,
+        q_cart, D_raw, Q0, H, S_quadratic,
         jnp.asarray(n_valid, dtype=jnp.int32), jnp.asarray(weight))
     return result
 
@@ -1251,8 +1263,8 @@ class StaticPhotonQ0FactorCarrier:
 
 
 @dataclass(frozen=True)
-class StaticSlabPhotonHeadCompletion:
-    """Evidence and bounded runtime carrier for one slab q=0 completion."""
+class SlabPhotonCubatureMoments:
+    """Authenticated exact-WS moments of one effective 4x4 response."""
 
     bare_D_mean: np.ndarray
     screened_moments: np.ndarray
@@ -1265,6 +1277,13 @@ class StaticSlabPhotonHeadCompletion:
     max_dyson_forward_error_bound: float
     mixed_scale_qstar: float
     mixed_convergence_error_ratios: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class StaticSlabPhotonHeadCompletion:
+    """Evidence and bounded runtime carrier for one slab q=0 completion."""
+
+    cubature: SlabPhotonCubatureMoments
     ward_residual: float
     hermiticity_residual: float
     hamiltonian_config_operator_fingerprint: str | None
@@ -1418,64 +1437,24 @@ def _require_static_photon_numerical_certificate(
     return max_forward_error_bound
 
 
-def _complete_static_slab_photon_q0_from_effective_response(
-    V_packed: jax.Array,
-    W_packed: jax.Array,
-    *,
-    layout,
-    H_linear: jax.Array,
-    S_effective: jax.Array,
-    YW_y: jax.Array,
-    WZ_x: jax.Array,
-    g0_X: jax.Array,
-    g0_Y: jax.Array,
+def slab_photon_cubature_moments(
+    H_linear,
+    S_effective,
     cubature_receipt,
-    mesh_xy: Mesh,
-    require_ward_closure: bool,
-) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
-    r"""Complete one already-folded static photon response in the Γ cell.
+    *,
+    Q0_direct=None,
+) -> SlabPhotonCubatureMoments:
+    r"""Solve and average one effective response on the exact slab mini-BZ.
 
-    This is the sole cubature/Dyson/factor-construction owner.  ``H_linear``
-    and ``S_effective`` are the effective response *after* the caller's one
-    canonical head/body Schur fold; ``YW_y`` and ``WZ_x`` are the matching
-    one-leg halves from that same fold.  Keeping those inputs keyword-only
-    makes controlled projections reuse production arithmetic without adding
-    a response-model or deck-policy surface here.
+    ``Q0_direct`` defaults to an exact-zero ``(4,4)`` matrix; ``H_linear`` is
+    ``(2,4,4)`` and ``S_effective`` is ``(2,2,4,4)`` in the fixed
+    ``(C,Tx,Ty,Tz)`` basis.  The response is one frequency sample: callers
+    repeat this transaction for distinct frequencies rather than fitting or
+    interpolating the nonlinear Dyson integrand pointwise.
     """
-    from .photon_layout import (
-        MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
-    packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
-                    layout.packed_extent)
-    if (tuple(V_packed.shape) != packed_shape
-            or tuple(W_packed.shape) != packed_shape):
-        raise ValueError(
-            "coupled photon head requires equal packed V/W bodies; got "
-            f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
-    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
-    if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
-        raise ValueError(
-            f"packed Γ vectors must both be {factor_shape}; got "
-            f"{g0_X.shape}/{g0_Y.shape}")
     from vcoul import validate_slab_minibz_photon_receipt
-    cubature_receipt = validate_slab_minibz_photon_receipt(
-        cubature_receipt)
-    cell_volume = float(cubature_receipt.cell_volume)
 
-    jax.block_until_ready((S_effective, YW_y, WZ_x))
-    effective_ward, effective_hermiticity = static_gauge_tensor_residuals(
-        S_effective)
-    if (bool(require_ward_closure)
-            and effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX):
-        raise ValueError(
-            "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
-            f"response violates the Ward identity: {effective_ward:.6e} > "
-            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
-    if effective_hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
-        raise ValueError(
-            "GATE static_gauge_head_fold_hermiticity: the actual Y-W-Z-"
-            f"folded response violates Hermiticity: "
-            f"{effective_hermiticity:.6e} > "
-            f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
+    receipt = validate_slab_minibz_photon_receipt(cubature_receipt)
 
     # Exactly three provider-issued rules are solved sequentially.  All three
     # have the same padded carrier, so the JAX graph compiles once; the
@@ -1488,7 +1467,7 @@ def _complete_static_slab_photon_q0_from_effective_response(
     conditioned_backward_errors = []
     observed_physical = []
     observed_padded = []
-    for chunk in cubature_receipt.chunks:
+    for chunk in receipt.chunks:
         q_host = np.asarray(chunk.q_cart, dtype=np.float64)
         weight = np.asarray(chunk.sample_weight, dtype=np.float64)
         n_valid = int(chunk.physical_count)
@@ -1496,7 +1475,7 @@ def _complete_static_slab_photon_q0_from_effective_response(
          chunk_condition_max,
          chunk_conditioned_backward) = static_slab_photon_head_moment_chunk(
             q_host, chunk.D_raw, H_linear, S_effective,
-            n_valid, weight)
+            n_valid, weight, Q0_direct=Q0_direct)
         (moment_host, D_host, count_host, residual_host, sigma_host,
          condition_host, conditioned_backward_host) = jax.device_get((
              moments, bare_sum, returned_count, backward,
@@ -1522,16 +1501,16 @@ def _complete_static_slab_photon_q0_from_effective_response(
         observed_physical.append(returned)
         observed_padded.append(int(q_host.shape[0]))
 
-    if (tuple(observed_physical) != cubature_receipt.physical_counts
-            or tuple(observed_padded) != cubature_receipt.padded_counts):
+    if (tuple(observed_physical) != receipt.physical_counts
+            or tuple(observed_padded) != receipt.padded_counts):
         raise RuntimeError(
             "executed photon solve counts differ from the vcoul receipt: "
             f"physical={tuple(observed_physical)}/"
-            f"{cubature_receipt.physical_counts}, padded="
-            f"{tuple(observed_padded)}/{cubature_receipt.padded_counts}")
+            f"{receipt.physical_counts}, padded="
+            f"{tuple(observed_padded)}/{receipt.padded_counts}")
     D_mean = per_order_D[-1]
     moments_mean = per_order_moments[-1]
-    qstar = np.sqrt(float(cubature_receipt.polygon_area))
+    qstar = np.sqrt(float(receipt.polygon_area))
 
     def _dimensionless_moments(moment):
         scaled = np.empty_like(moment)
@@ -1569,6 +1548,83 @@ def _complete_static_slab_photon_q0_from_effective_response(
         max_condition=max_condition,
         max_conditioned_backward=max_conditioned_backward,
         mixed_error_ratios=mixed_error_ratios)
+
+    return SlabPhotonCubatureMoments(
+        bare_D_mean=D_mean,
+        screened_moments=moments_mean,
+        cubature_receipt=receipt,
+        observed_physical_counts=tuple(observed_physical),
+        observed_padded_solve_counts=tuple(observed_padded),
+        max_backward_residual=max_residual,
+        min_dyson_singular_value=min_sigma,
+        max_dyson_condition_number=max_condition,
+        max_dyson_forward_error_bound=max_forward_error_bound,
+        mixed_scale_qstar=qstar,
+        mixed_convergence_error_ratios=mixed_error_ratios,
+    )
+
+
+def _complete_static_slab_photon_q0_from_effective_response(
+    V_packed: jax.Array,
+    W_packed: jax.Array,
+    *,
+    layout,
+    Q0_direct: jax.Array | None,
+    H_linear: jax.Array,
+    S_effective: jax.Array,
+    YW_y: jax.Array,
+    WZ_x: jax.Array,
+    g0_X: jax.Array,
+    g0_Y: jax.Array,
+    cubature_receipt,
+    mesh_xy: Mesh,
+    require_ward_closure: bool,
+) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
+    r"""Complete one already-folded static photon response in the Γ cell.
+
+    ``H_linear`` and ``S_effective`` are the effective response *after* the
+    caller's one canonical head/body Schur fold; ``YW_y`` and ``WZ_x`` are
+    the matching one-leg halves from that same fold.  The exact cubature and
+    Dyson moments come from :func:`slab_photon_cubature_moments`;
+    this routine owns only their packed low-rank insertion.
+    """
+    from .photon_layout import (
+        MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
+    packed_shape = (int(V_packed.shape[0]), layout.packed_extent,
+                    layout.packed_extent)
+    if (tuple(V_packed.shape) != packed_shape
+            or tuple(W_packed.shape) != packed_shape):
+        raise ValueError(
+            "coupled photon head requires equal packed V/W bodies; got "
+            f"V={V_packed.shape}, W={W_packed.shape}, expected={packed_shape}")
+    factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+    if tuple(g0_X.shape) != factor_shape or tuple(g0_Y.shape) != factor_shape:
+        raise ValueError(
+            f"packed Γ vectors must both be {factor_shape}; got "
+            f"{g0_X.shape}/{g0_Y.shape}")
+    jax.block_until_ready((S_effective, YW_y, WZ_x))
+    effective_ward, effective_hermiticity = static_gauge_tensor_residuals(
+        S_effective)
+    if (bool(require_ward_closure)
+            and effective_ward > _STATIC_GAUGE_WARD_RESIDUAL_MAX):
+        raise ValueError(
+            "GATE static_gauge_head_fold_ward: the actual Y-W-Z-folded "
+            f"response violates the Ward identity: {effective_ward:.6e} > "
+            f"{_STATIC_GAUGE_WARD_RESIDUAL_MAX:.1e}")
+    if effective_hermiticity > _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:
+        raise ValueError(
+            "GATE static_gauge_head_fold_hermiticity: the actual Y-W-Z-"
+            f"folded response violates Hermiticity: "
+            f"{effective_hermiticity:.6e} > "
+            f"{_STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX:.1e}")
+
+    cubature = slab_photon_cubature_moments(
+        H_linear, S_effective, cubature_receipt,
+        Q0_direct=Q0_direct)
+    D_mean = cubature.bare_D_mean
+    moments_mean = cubature.screened_moments
+    cubature_receipt = cubature.cubature_receipt
+    cell_volume = float(cubature_receipt.cell_volume)
 
     dtype = V_packed.dtype
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
@@ -1608,17 +1664,7 @@ def _complete_static_slab_photon_q0_from_effective_response(
             screened_pairs.append((left_basis[u], right_rows))
 
     evidence = StaticSlabPhotonHeadCompletion(
-        bare_D_mean=D_mean,
-        screened_moments=moments_mean,
-        cubature_receipt=cubature_receipt,
-        observed_physical_counts=tuple(observed_physical),
-        observed_padded_solve_counts=tuple(observed_padded),
-        max_backward_residual=max_residual,
-        min_dyson_singular_value=min_sigma,
-        max_dyson_condition_number=max_condition,
-        max_dyson_forward_error_bound=max_forward_error_bound,
-        mixed_scale_qstar=qstar,
-        mixed_convergence_error_ratios=mixed_error_ratios,
+        cubature=cubature,
         ward_residual=effective_ward,
         hermiticity_residual=effective_hermiticity,
         hamiltonian_config_operator_fingerprint=None,
@@ -1669,7 +1715,7 @@ def _complete_static_slab_photon_q0_cc_projected_control(
     *,
     mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
-    r"""Complete the controlled CC projection of one retained full response.
+    r"""Complete the controlled CC projection of one four-current response.
 
     The authenticated full-IJ response is folded by the production owner.
     Only then is its effective response projected to ``S[:,:,C,C]`` with
@@ -1684,18 +1730,23 @@ def _complete_static_slab_photon_q0_cc_projected_control(
     )
     response = require_static_gauge_cubature_response(response, mesh_xy)
     if response.capability is not (
-            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE):
+            StaticGaugeResponseCapability.FOUR_CURRENT):
         raise ValueError(
             "CC-projected completion control requires the authenticated "
-            "full-IJ isometric retained-bubble response")
+            "four-current response")
     S_effective, YW_y, WZ_x = _fold_static_slab_photon_response(
         W_packed, response, cubature_receipt, mesh_xy=mesh_xy)
     S_cc = jnp.zeros_like(S_effective)
     S_cc = S_cc.at[:, :, 0, 0].set(S_effective[:, :, 0, 0])
+    Q0_cc = None
+    if response.Q0_direct is not None:
+        Q0_cc = jnp.zeros_like(response.Q0_direct)
+        Q0_cc = Q0_cc.at[0, 0].set(response.Q0_direct[0, 0])
     H_zero = jnp.zeros_like(response.H_linear)
     return _complete_static_slab_photon_q0_from_effective_response(
         V_packed, W_packed,
         layout=response.layout,
+        Q0_direct=Q0_cc,
         H_linear=H_zero,
         S_effective=S_cc,
         YW_y=YW_y,
@@ -1732,11 +1783,12 @@ def complete_static_slab_photon_q0(
     )
     if isinstance(response, StaticGaugeCubatureResponse):
         response = require_static_gauge_cubature_response(response, mesh_xy)
+        Q0_direct = response.Q0_direct
         H_linear = response.H_linear
         operator_fingerprint = None
-        bounded_retained = (
+        bounded_four_current = (
             response.capability is
-            StaticGaugeResponseCapability.ISOMETRIC_RETAINED_BUBBLE)
+            StaticGaugeResponseCapability.FOUR_CURRENT)
         if response.response_fingerprint is None:
             bounded_response_fingerprint = None
             bounded_response_capability = None
@@ -1747,13 +1799,14 @@ def complete_static_slab_photon_q0(
             bounded_response_approximation = response.approximation
     else:
         response = require_static_gauge_head_response(response, mesh_xy)
+        Q0_direct = None
         H_linear = static_hall_linear_response(response.sigma_H)
         operator_fingerprint = (
             response.hamiltonian_config_operator_fingerprint)
         bounded_response_fingerprint = None
         bounded_response_capability = None
         bounded_response_approximation = None
-        bounded_retained = False
+        bounded_four_current = False
 
     S_effective, YW_y, WZ_x = _fold_static_slab_photon_response(
         W_packed, response, cubature_receipt, mesh_xy=mesh_xy)
@@ -1762,6 +1815,7 @@ def complete_static_slab_photon_q0(
         _complete_static_slab_photon_q0_from_effective_response(
             V_packed, W_packed,
             layout=response.layout,
+            Q0_direct=Q0_direct,
             H_linear=H_linear,
             S_effective=S_effective,
             YW_y=YW_y,
@@ -1770,7 +1824,7 @@ def complete_static_slab_photon_q0(
             g0_Y=g0_Y,
             cubature_receipt=cubature_receipt,
             mesh_xy=mesh_xy,
-            require_ward_closure=not bounded_retained,
+            require_ward_closure=not bounded_four_current,
         ))
     completion = replace(
         completion,

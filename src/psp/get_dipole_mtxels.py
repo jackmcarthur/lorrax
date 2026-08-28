@@ -911,12 +911,12 @@ def main(argv=None):
 		help="Optional immutable SlabIO output for --static-gauge-hall-only.",
 	)
 	parser.add_argument(
-		"--static-gauge-retained-source-out",
+		"--photon-head-source-out",
 		type=str,
 		default=None,
-		help="Immutable normalized retained-bubble source output. Requires "
+		help="Immutable photon-head source output. Requires "
 		     "--parallel-transport-out; writes source-Pauli in-plane links "
-		     "and a separate isometric endpoint transaction without writing "
+		     "and the static four-current endpoint transaction without writing "
 		     "dipole.h5.",
 	)
 	parser.add_argument(
@@ -932,16 +932,16 @@ def main(argv=None):
 	if args.static_gauge_hall_out is not None and not args.static_gauge_hall_only:
 		parser.error(
 			"--static-gauge-hall-out requires --static-gauge-hall-only")
-	if (args.static_gauge_retained_source_out is not None
+	if (args.photon_head_source_out is not None
 			and args.parallel_transport_out is None):
 		parser.error(
-			"--static-gauge-retained-source-out requires "
+			"--photon-head-source-out requires "
 			"--parallel-transport-out")
-	if (args.static_gauge_retained_source_out is not None
+	if (args.photon_head_source_out is not None
 			and (args.static_gauge_hall_only or args.w_av_only
 				 or args.with_finite_q)):
 		parser.error(
-			"--static-gauge-retained-source-out cannot be combined with "
+			"--photon-head-source-out cannot be combined with "
 			"Hall-only, W-av-only, or finite-q density preprocessing")
 	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
 		parser.error(
@@ -1066,28 +1066,27 @@ def main(argv=None):
 	four_current_bispinor = bool(params.get("bispinor", False))
 	bispinor_gw_mode = coerce_bispinor_gw_mode(
 		params.get("bispinor_gw", "bare_transverse"))
-	retained_source_requested = bool(
-		args.static_gauge_retained_source_out is not None)
-	if retained_source_requested:
+	photon_head_source_requested = bool(args.photon_head_source_out is not None)
+	if photon_head_source_requested:
 		if bispinor_gw_mode is not BispinorGWMode.FULL_STATIC_COHSEX:
 			parser.error(
-				"--static-gauge-retained-source-out requires "
+				"--photon-head-source-out requires "
 				"bispinor_gw=full_static_cohsex")
 		if args.parallel_transport_velocity_only:
 			parser.error(
-				"retained-source preprocessing requires completed in-plane "
+				"photon-head preprocessing requires completed in-plane "
 				"links, not --parallel-transport-velocity-only")
 		if not four_current_bispinor:
 			parser.error(
-				"--static-gauge-retained-source-out requires bispinor=true; "
+				"--photon-head-source-out requires bispinor=true; "
 				"the isometric four-current carrier may not contradict the deck")
 		if args.vnl_mode != "analytic" or args.skip_vnl:
 			parser.error(
-				"--static-gauge-retained-source-out requires the analytic VNL "
+				"--photon-head-source-out requires the analytic VNL "
 				"operator with no --skip-vnl")
 		if float(vnl_velocity_sign) != float(VNL_VELOCITY_SIGN_FLIPPED):
 			parser.error(
-				"--static-gauge-retained-source-out requires canonical "
+				"--photon-head-source-out requires canonical "
 				"vnl_velocity_sign=+1 so the source-QE energy jet and the "
 				"Gamma/Q/Q2 endpoint transaction use the same Hamiltonian")
 	elif args.static_gauge_hall_only and args.parallel_transport_out is not None:
@@ -1269,8 +1268,8 @@ def main(argv=None):
 		pseudos,
 		nspinor=int(wfn.nspinor),
 		compute_contact=bool(
-			args.static_gauge_hall_only or retained_source_requested),
-		compute_transfer_q2=bool(retained_source_requested),
+			args.static_gauge_hall_only or photon_head_source_requested),
+		compute_transfer_q2=bool(photon_head_source_requested),
 	)
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
@@ -1638,7 +1637,7 @@ def main(argv=None):
 						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
 						nbands=nb,
 						effective_nspinor=(
-							int(wfn.nspinor) if retained_source_requested
+							int(wfn.nspinor) if photon_head_source_requested
 							else int(meta.nspinor)),
 						bispinor=bispinor,
 						velocity_dft_kmajor=H_v,
@@ -1646,7 +1645,7 @@ def main(argv=None):
 						wfn_fingerprint=wfn_fingerprint(wfn),
 						rcond=float(args.parallel_transport_rcond),
 						derivative_axes=(
-							(0, 1) if retained_source_requested
+							(0, 1) if photon_head_source_requested
 							else (0, 1, 2)))
 				write_pt_remainder = write_parallel_transport_artifact
 				validate_pt_artifact = validate_parallel_transport_artifact
@@ -1656,7 +1655,7 @@ def main(argv=None):
 			# ``owner_only`` keeps it off the peers (BD.4) and the gather
 			# runs in chunks so a peer's transient is one chunk.
 			dip_k_major = (
-				None if retained_source_requested
+				None if photon_head_source_requested
 				else blocks_to_host(H_v, nb=nb, owner_only=True))
 		del H_v, psi_G
 		if pt_path is not None and args.parallel_transport_velocity_only:
@@ -1691,7 +1690,7 @@ def main(argv=None):
 					w_av_first_neighbors=w_av_first_neighbors,
 					w_av_second_neighbors=w_av_second_neighbors,
 					derivative_axes=(
-						(0, 1) if retained_source_requested
+						(0, 1) if photon_head_source_requested
 						else (0, 1, 2)))
 			with timing.section("parallel_transport_validation"):
 				metrics = validate_pt_artifact(
@@ -1701,7 +1700,7 @@ def main(argv=None):
 					atol=float(args.parallel_transport_validation_atol),
 					rtol=float(args.parallel_transport_validation_rtol),
 					derivative_axes=(
-						(0, 1) if retained_source_requested
+						(0, 1) if photon_head_source_requested
 						else (0, 1, 2)))
 			print(
 				"  DFT covariant-velocity validation: PASS "
@@ -1712,17 +1711,17 @@ def main(argv=None):
 			report.emit("Covariant DFT velocity: PASS; "
 							f"max abs={float(metrics['max_abs']):.5e}; "
 							f"max rel={float(metrics['max_rel']):.5e}")
-		if retained_source_requested:
+		if photon_head_source_requested:
 			if int(meta.b_id_4_user) != nb:
 				raise ValueError(
-					"retained static-gauge source requires one exact PT/endpoint "
+					"photon-head source requires one exact PT/endpoint "
 					f"band manifold; Meta=[0,{int(meta.b_id_4_user)}), "
 					f"producer=[0,{nb})")
 			from gw.qsgw_head import load_parallel_transport_head
 			from gw.static_gauge_response import (
-				build_isometric_retained_bubble_source)
+				build_photon_head_source)
 			from file_io.static_gauge_head import (
-				write_isometric_retained_bubble_source_artifact)
+				write_frequency_resolved_four_current_head)
 			with timing.section("static_gauge_isometric_endpoint_sweep"):
 				psi_iso = wfn.load(
 					bands=(0, nb), k="full_bz",
@@ -1746,34 +1745,29 @@ def main(argv=None):
 			# The endpoint sweep does not consume PT links/velocity.  Load their
 			# five distributed band-square tables only after the 60-component
 			# isometric transaction is complete, bounding the producer peak.
-			with timing.section("static_gauge_retained_source_load_links"):
+			with timing.section("photon_head_source.load_links"):
 				parallel_transport = load_parallel_transport_head(
 					str(pt_path), mesh=RUNTIME.mesh, wfn=wfn, meta=meta,
 					expected_coefficient_frame=(
 						"source_pauli_coefficient_frame_v1"),
 					expected_derivative_axes=(0, 1))
-			with timing.section("static_gauge_retained_source_compose"):
-				source = build_isometric_retained_bubble_source(
+			with timing.section("photon_head_source.compose"):
+				source = build_photon_head_source(
 					uniform_gauge, parallel_transport, wfn=wfn, sym=sym,
 					band_start=0, band_stop=nb, mesh=RUNTIME.mesh)
-			with timing.section("static_gauge_retained_source_write"):
-				write_isometric_retained_bubble_source_artifact(
-					args.static_gauge_retained_source_out, source,
+			with timing.section("photon_head_source.write"):
+				write_frequency_resolved_four_current_head(
+					args.photon_head_source_out, source,
 					mesh_xy=RUNTIME.mesh)
 			if jax.process_index() == 0:
 				print(
-					"STATIC_GAUGE_RETAINED_SOURCE "
+					"PHOTON_HEAD_SOURCE "
 					f"source_fingerprint={source.source_fingerprint} "
 					f"operator_fingerprint="
 					f"{source.hamiltonian_config_operator_fingerprint} "
 					f"bands=[{source.band_start},{source.band_stop}) "
 					f"derivative_axes={parallel_transport.derivative_axes} "
-					f"vnl_velocity_sign={float(vnl_velocity_sign):+.1f} "
-					f"hall_antisymmetry_residual="
-					f"{source.hall_antisymmetry_residual:.6e} "
-					f"ward_residual={source.ward_residual:.6e} "
-					f"hermiticity_residual="
-					f"{source.hermiticity_residual:.6e}")
+					f"vnl_velocity_sign={float(vnl_velocity_sign):+.1f}")
 			del uniform_gauge, parallel_transport, source
 			dipole_progress.step()
 			dipole_progress.finish()
