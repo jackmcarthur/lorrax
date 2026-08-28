@@ -92,6 +92,7 @@ __all__ = [
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
     "single_device_mesh",
+    "mesh_is_emulated",
     "prepare_mesh",
     # staging a host table onto a mesh, without a collective
     "device_put_process_local",
@@ -360,6 +361,63 @@ def single_device_mesh():
             np.asarray(jax.local_devices()[:1]).reshape(1, 1),
             axis_names=('x', 'y'))
     return _PROCESS_LOCAL_MESH
+
+
+def mesh_is_emulated(mesh) -> bool:
+    """True when ``mesh`` spans more devices than this run has processes.
+
+    ``mesh.devices.size > 1 and process_count() == 1`` — one process
+    owning every cell of a multi-device mesh, which is what
+    ``--xla_force_host_platform_device_count=N`` produces and what a real
+    ``srun -n N`` never does.
+
+    The predicate reads ``process_count()``, not the XLA flag, and that is
+    load-bearing in both directions: a real ``-n 4`` leg sets no flag and
+    must never be labelled emulated, and a flagged single-process run must
+    never be labelled real.  Same spelling as
+    ``services/symmetry_maps/bench/bench_symmetry_maps.py``, whose ``emulated``
+    column states it per row for the same reason.
+
+    It is also platform-blind, which is the third direction and the one
+    that bites.  It reads ``devices.size`` and ``process_count()`` and
+    nothing else, so it is equally true of a single-process multi-GPU mesh
+    — ``resolve_mesh()`` on a 4-GPU box, or a test harness child handed all
+    four GPUs.  That geometry is not an emulation; it is the arm deleted
+    with the cuSOLVERMg backend (``src/bse/STATUS.md``), and every FFI
+    transport refuses it.  So a consumer that tiers down on this predicate
+    must add its own platform guard, or it will serve a deleted geometry
+    through a path nobody chose.  ``file_io._slab_io_serial`` does exactly
+    that (``ffi.gate.mesh_ffi_platform(mesh) != "cpu"`` → refuse), and
+    ``tests/test_slab_io_emulated_mesh.py`` has the false case.  Widening
+    this predicate to read the platform itself would be wrong: "more
+    devices than processes" is a true statement about that mesh, and the
+    consumers that only ask the question (rather than tiering down on it)
+    want the honest answer.
+
+    What it is for.  A mesh cell is a per-device thing; an MPI/NCCL/HDF5
+    context is a per-process thing.  Every transport that bootstraps one
+    context per mesh cell (``ffi.io.open_file``, ``ffi.cublasmp.batched``,
+    ``distrib_la._slate``) therefore requires ``p*q == process_count()`` and
+    refuses an emulated mesh — correctly, since all N devices would share
+    rank 0's hyperslab or communicator.  A component with a serial tier
+    (``wfn_loader``'s ``eager``, ``file_io._slab_io_serial``) asks this
+    instead, and selects the tier that needs no per-cell context.  It is a
+    tier predicate, never a fallback trigger: nothing may call it after a
+    transport has failed.
+
+    ``False`` at ``P=1/D=1`` (nothing to emulate) and at every ``P>1``,
+    including the misconfiguration where one of several processes was
+    handed extra devices — that one is a refusal at the transport, not a
+    tier-down here.
+    """
+    try:
+        size = int(mesh.devices.size)
+    except AttributeError as exc:
+        raise TypeError(
+            f"mesh_is_emulated: expected a jax.sharding.Mesh, got "
+            f"{type(mesh).__name__} — the predicate reads mesh.devices.size "
+            f"against process_count()") from exc
+    return size > 1 and process_count() == 1
 
 
 def prepare_mesh(mesh=None, *, axis_names=("x", "y"), print_fn=print):
