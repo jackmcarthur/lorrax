@@ -573,6 +573,25 @@ def test_band_chunks_must_complete_before_pair_product():
     assert not np.isclose(completed_then_product, product_per_chunk)
 
 
+def test_y_cache_build_unroll2_is_private_and_transverse_only(monkeypatch):
+    from isdf.core import _z_q_face_y_cache_build_unroll
+
+    env = "LORRAX_ZETA_YCACHE_BUILD_UNROLL2"
+    monkeypatch.delenv(env, raising=False)
+    assert _z_q_face_y_cache_build_unroll(
+        cache_y_blocks=True, lhs_id=False, rhs_id=False) == 1
+
+    monkeypatch.setenv(env, "1")
+    assert _z_q_face_y_cache_build_unroll(
+        cache_y_blocks=True, lhs_id=True, rhs_id=True) == 1
+    assert _z_q_face_y_cache_build_unroll(
+        cache_y_blocks=False, lhs_id=False, rhs_id=False) == 1
+    assert _z_q_face_y_cache_build_unroll(
+        cache_y_blocks=True, lhs_id=False, rhs_id=False) == 2
+    assert _z_q_face_y_cache_build_unroll(
+        cache_y_blocks=True, lhs_id=True, rhs_id=False) == 2
+
+
 # ---------------------------------------------------------------------------
 # Real-CUDA CLI (matches test_isdf_cq_face_parity.py's shape; not required
 # for the check above, since this path needs no gemm_plan/real-process

@@ -1547,6 +1547,17 @@ def _z_q_legacy(
 # mirrors the `_c_q_legacy` / `_c_q_face` split above.
 # ============================================================================
 
+_ZETA_YCACHE_BUILD_UNROLL2_ENV = "LORRAX_ZETA_YCACHE_BUILD_UNROLL2"
+
+
+def _z_q_face_y_cache_build_unroll(
+		*, cache_y_blocks: bool, lhs_id: bool, rhs_id: bool) -> int:
+	"""Private lowering schedule; identity/charge stays at ``unroll=1``."""
+	transverse = not (bool(lhs_id) and bool(rhs_id))
+	return (2 if cache_y_blocks and transverse
+			and env_bool(_ZETA_YCACHE_BUILD_UNROLL2_ENV, False) else 1)
+
+
 def _z_q_face(
 	psi_mun: jax.Array,
 	psi_G_store,
@@ -1677,6 +1688,9 @@ def _z_q_face(
 		cache_y_r_tile = 0
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	y_cache_build_unroll = _z_q_face_y_cache_build_unroll(
+		cache_y_blocks=bool(cache_y_blocks),
+		lhs_id=bool(lhs_id), rhs_id=bool(rhs_id))
 
 	if cache_y_blocks and cache_y_r_tile < n_zchunk:
 		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
@@ -1792,7 +1806,7 @@ def _z_q_face(
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
 		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
-		lhs_id, rhs_id,
+		lhs_id, rhs_id, y_cache_build_unroll,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -1956,7 +1970,8 @@ def _z_q_face(
 
 				_, psi_Y_blocks = jax.lax.scan(
 					build_y_block, jnp.zeros((), dtype=jnp.int32),
-					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+					jnp.arange(n_bc, dtype=jnp.int32),
+					unroll=y_cache_build_unroll)
 				# Original one-pass cache: one canonical transform per band
 				# chunk, then read-only reuse across every spin pair.
 				Z_R = accumulate_spin_pairs(psi_Y_blocks, r_loc)
