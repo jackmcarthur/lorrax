@@ -91,7 +91,19 @@ class FakeBackend:
     ``owner`` field reads and what the h5py side collides with — faking
     the transport must not fake the ownership, or the two-stack stream
     this suite is about stops being two-stack.
+
+    For the same reason it declares ``journal_stack``: since 2026-08-27
+    ``SlabIO`` stamps its journal lines with the BACKEND's library name
+    rather than a module constant of its own (there are two backends now,
+    and the constant became a lie for one of them).  A stand-in that
+    omitted it would either crash the door or need a default there — and a
+    silently defaulted library name is exactly the defect that change
+    removed.
     """
+
+    #: This fake stands in for the collective transport, so it names that
+    #: transport's library.
+    journal_stack = "ffi"
 
     def __init__(self, path, mesh=None, mode="w"):
         self.path, self.mesh, self.mode = path, mesh, mode
@@ -127,9 +139,26 @@ class Boom(RuntimeError):
     """A transport failure that must cross ``SlabIO`` and be journaled."""
 
 
+def _one_by_one_mesh():
+    """A REAL 1x1 ``('x','y')`` mesh, where an ``object()`` used to do.
+
+    ``SlabIO`` reads the mesh at construction now — ``common.collectives.
+    mesh_is_emulated`` picks the tier from it — so a sentinel is refused by
+    name (``expected a jax.sharding.Mesh, got object``).  That refusal is
+    the point: a duck-typed mesh that silently answered "not emulated"
+    would route to the collective transport on a geometry nobody checked.
+    1x1 is the geometry this suite means anyway — it keeps every cell on
+    the FFI door, which is the backend ``FakeBackend`` stands in for.
+    """
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    return Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
+
+
 def slabio(monkeypatch, path, *, mode="w", backend=FakeBackend):
     monkeypatch.setattr(SIO, "_FfiBackend", backend)
-    return SIO.SlabIO(path, mode=mode, mesh=object())
+    return SIO.SlabIO(path, mode=mode, mesh=_one_by_one_mesh())
 
 
 # ---------------------------------------------------------------------------
