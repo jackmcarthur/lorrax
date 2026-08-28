@@ -803,27 +803,22 @@ def test_w_ladder_matches_dense_oracle_on_a_mesh(px, py):
     if px * py > jax.device_count():
         pytest.skip(f"needs {px * py} devices; have {jax.device_count()}")
     from bse.bse_ring_comm import create_mesh_xy
-    # The device list is passed EXPLICITLY because this cell's 1x1 leg is a
+    # The device list is passed explicitly because this cell's 1x1 leg is a
     # process-local control inside a process that has four devices visible
     # (the LORRAX_MESH_CELL=1 recipe above).  Since 2026-08-27 create_mesh_xy
-    # refuses a shape that does not consume the list it is handed — the guard
-    # that stops ``--px 2 --py 2`` from stranding ranks 4..15 on a 16-device
-    # job — so ``create_mesh_xy(1, 1)`` inside a four-device process is now,
-    # correctly, a refusal.  Handing it the devices the leg is meant to use
-    # says which job is being asserted about; it is behaviour-identical to
-    # what this line did before at P=1 (same object, same devices), and the
-    # P>1 claim is NOT made — this cell is single-process by construction.
+    # refuses a shape that does not consume the list it is handed, so a bare
+    # ``create_mesh_xy(1, 1)`` inside a four-device process refuses.  Naming
+    # the devices the leg is meant to use says which job is asserted about,
+    # and is behaviour-identical to what this line did at P=1.  No P>1 claim
+    # is made: this cell is single-process by construction.
     #
-    # WHY NOT ``collectives.single_device_mesh()`` for the 1x1 leg, which is
-    # what the other four cells in this file now use.  Because here the 1x1
-    # leg is the CONTROL for the 2x2 leg, not a place to park arrays: the
-    # cells attribute any 1x1-vs-2x2 disagreement to the MESH, which requires
-    # both legs to come out of the same factory with the same warm-up.
-    # ``single_device_mesh`` has no 2x2 arm and skips ``prepare_mesh``, so
-    # splitting the parametrization across two factories would put a second
-    # difference in the comparison.  ``jax.devices()`` (not
-    # ``local_devices()``) is right for the same reason: the 2x2 leg is a
-    # four-device mesh inside ONE process, so the global list is the job.
+    # Not ``collectives.single_device_mesh()``, which the other four cells in
+    # this file use, because here the 1x1 leg is the control for the 2x2 leg:
+    # the cells attribute a 1x1-vs-2x2 disagreement to the mesh, which needs
+    # both legs out of the same factory with the same warm-up.
+    # ``single_device_mesh`` has no 2x2 arm and skips ``prepare_mesh``.
+    # ``jax.devices()`` rather than ``local_devices()`` for the same reason:
+    # the 2x2 leg is a four-device mesh inside one process.
     mesh = create_mesh_xy(px, py, jax.devices()[: px * py])
     data = _synthetic_payload(mesh)
     cols = np.array([0, 3, 5], dtype=int)

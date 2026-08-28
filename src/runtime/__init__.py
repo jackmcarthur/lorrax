@@ -15,7 +15,7 @@ The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
 ``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
 each making exactly ONE module-top call, gated per driver by
 ``tests/test_crossfile_requests.py`` (the R1 audit).  Since 2026-08-27 the BSE
-CLIs that take ``--px/--py`` do NOT reshape: all six resolve the flags through
+CLIs that take ``--px/--py`` do not reshape: all six resolve the flags through
 ``bse.bse_ring_comm.create_mesh_xy_from_flags``, which returns this startup
 mesh itself when they are omitted and refuses any shape that is not it, so the
 run has exactly one mesh object.  :meth:`RuntimeStack.reshape` remains for
@@ -1300,16 +1300,16 @@ class RuntimeStack:
 
         FOR THE ONE CASE THE STARTUP CALL CANNOT SERVE.  The entry point
         runs above ``import jax``, so it cannot know a mesh shape that comes
-        from the command line.  ``gw.downfold_cli`` is the ONE caller
+        from the command line.  ``gw.downfold_cli`` is the one caller
         (2026-08-27): the BSE drivers used to be the reason this method
         exists, and since that date they resolve ``--px/--py`` through
         ``bse.bse_ring_comm.create_mesh_xy_from_flags`` instead, which never
         reshapes.
 
-        AND THE BSE FAMILY NOW DEPENDS ON STAYING OUT OF HERE.  This swaps
+        The BSE family now depends on staying out of here.  This swaps
         ``self.mesh`` without touching ``collectives._CANONICAL_MESHES`` (or
         ``self.facts``), so after a reshape a bare ``resolve_mesh()`` still
-        returns the STARTUP mesh and the startup facts still name the old
+        returns the startup mesh and the startup facts still name the old
         shape.  ``create_mesh_xy_from_flags``'s omitted arm goes through
         ``create_mesh_2d`` -> ``resolve_mesh``, so a BSE driver that reshaped
         would be handed a mesh that is not ``RUNTIME.mesh``.  Unreachable

@@ -68,7 +68,7 @@ NQ = 3
 def _mesh():
     """The process-local 1x1 these cells put their small arrays on.
 
-    NOT ``create_mesh_xy(1, 1)``: since 2026-08-27 that factory refuses a
+    Not ``create_mesh_xy(1, 1)``: since 2026-08-27 that factory refuses a
     shape that does not consume the device list in play, and its
     canonical-reuse branch calls ``resolve_mesh``, so it also refuses on any
     non-square count — i.e. it depends on the process device count, which a

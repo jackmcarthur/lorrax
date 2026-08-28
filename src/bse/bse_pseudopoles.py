@@ -593,9 +593,9 @@ def main(argv: list[str] | None = None) -> None:
     timing.reset()
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
-    # shape must BE that mesh.  Called through the OWNER, not through a local
-    # one-line alias: the four ``_create_mesh_xy`` copies this module used to
-    # carry one of are why five drivers silently ran un-warmed at P>1.
+    # shape must BE that mesh.  Called through the one owner, not a local
+    # alias: this module used to carry one of the four ``_create_mesh_xy``
+    # copies, which is why five drivers silently ran un-warmed at P>1.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)

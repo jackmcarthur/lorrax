@@ -1165,10 +1165,10 @@ _MESH_OWNERS = {
     # process_allgather clique (4 of 4 cells at P=16, job 7882523).  Folding
     # it into ``prepare_mesh`` is the open warm-up-contract decision, and
     # doing it by deleting the call site is how the refusals come back.
-    # THAT DEFERRAL IS NOW LOAD-BEARING, not merely postponed (owner ruling
+    # That deferral is now load-bearing, not merely postponed (owner ruling
     # wanted): it is the whole reason ``create_mesh_xy_from_flags``'s omitted
     # arm must route through ``create_mesh_2d()`` rather than a bare
-    # ``resolve_mesh()`` — a bare resolve returns the right OBJECT with
+    # ``resolve_mesh()`` — a bare resolve returns the right object with
     # neither warm-up — and it is why the BSE family cannot adopt
     # ``gw/downfold_cli.py``'s ``RUNTIME.reshape`` shape instead.
     # Since 2026-08-27 the direct-construction arm is reachable only when a
@@ -1227,24 +1227,24 @@ def test_the_mesh_scan_can_fail():
 
 
 # ===========================================================================
-# 5b.  RULE 4, SHARPENED FOR THE BSE FAMILY — one mesh, and no 1x1 default
+# 5b.  RULE 4, sharpened for the BSE family — one mesh, and no 1x1 default
 # ===========================================================================
 #
 # Rule 4 above is enforced against ``_MESH_OWNERS``, an editable set: adding a
 # module to it is a two-line change that makes the gate pass.  For the BSE
-# family the owner is a FACT, not a licence — ``bse_ring_comm`` is the only
+# family the owner is a fact, not a licence — ``bse_ring_comm`` is the only
 # module in ``src/bse/`` that may construct a Mesh — so it is asserted here
 # against a literal, where widening it means editing the assertion itself.
 #
 # The second rule below is the one this bundle exists for, and rule 4 cannot
 # see it: a driver does not need to say ``Mesh(`` to end up on the wrong mesh.
-# Until 2026-08-27 all SIX bse-family drivers declared ``--px``/``--py`` with
+# Until 2026-08-27 all six bse-family drivers declared ``--px``/``--py`` with
 # ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
 # ``bse_w_exact``, ``exciton_bands``, two declarations each, twelve in all —
-# so a run with NO flags asked the (correct, shared) factory for
+# so a run with no flags asked the (correct, shared) factory for
 # a 1x1 — the whole BSE on one device of a four-GPU node, while the startup
-# receipt announced 2x2; at P>1 the same default builds over
-# ``jax.devices()[:1]``, process 0's device on every rank.  MEASURED on the
+# report announced 2x2; at P>1 the same default builds over
+# ``jax.devices()[:1]``, process 0's device on every rank.  Measured on the
 # pre-fix tree in a four-device process (``JAX_PLATFORMS=cpu
 # XLA_FLAGS=--xla_force_host_platform_device_count=4``): startup mesh (2, 2),
 # ``create_mesh_xy(1, 1)`` -> shape (1, 1) over device [0], ``is
@@ -1254,7 +1254,7 @@ def test_the_mesh_scan_can_fail():
 # thing that has to stay right — and the default is therefore what this gate
 # reads.  ``default=None`` is the spelling ``gw/downfold_cli.py`` already uses.
 
-#: The ONE module in ``src/bse/`` allowed to construct a ``Mesh``.
+#: The one module in ``src/bse/`` allowed to construct a ``Mesh``.
 _BSE_MESH_OWNER = "bse.bse_ring_comm"
 
 
@@ -1314,7 +1314,7 @@ def test_the_bse_family_builds_no_second_mesh(sources):
 
 
 def test_the_bse_mesh_owner_still_owns_one(sources):
-    """CONTROL: if the factory moved, the gate above would pass on an empty
+    """Control: if the factory moved, the gate above would pass on an empty
     scan and nobody would notice."""
     assert scan_mesh_construction(sources[_BSE_MESH_OWNER]), (
         f"{_BSE_MESH_OWNER} constructs no Mesh — the factory moved, and the "
@@ -1322,14 +1322,14 @@ def test_the_bse_mesh_owner_still_owns_one(sources):
 
 
 def test_no_bse_driver_defaults_its_mesh_shape(sources):
-    """``--px``/``--py`` omitted must mean THE RUN'S MESH, never 1x1."""
+    """``--px``/``--py`` omitted must mean the run's mesh, never 1x1."""
     seen, bad = [], []
     for mod in _bse_modules(sources):
         for line, flag, default in scan_px_py_defaults(sources[mod]):
             seen.append((mod, flag))
             if default not in ("None", "<absent>"):
                 bad.append((mod, line, flag, default))
-    # EXACT, not a floor.  At ``>= 10`` two declarations could vanish with the
+    # Exact, not a floor.  At ``>= 10`` two declarations could vanish with the
     # gate still green — a driver losing its --px/--py silently reverts to
     # whatever its main() does with the missing attribute, which is the class
     # of defect this section exists for.  Six drivers x two flags = 12; if a

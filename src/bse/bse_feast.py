@@ -1470,10 +1470,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # Omitted --px/--py = the run's canonical square mesh (create_mesh_2d),
     # not 1x1; a given shape must BE that mesh.  args.px/args.py are then
-    # overwritten with the resolved shape, because the FEAST report line
-    # ("Backend : Sharded BSE matvec (px, py = ...)") is fed from them and a
-    # receipt naming the request rather than the mesh in use is the defect
-    # this bundle exists to remove.
+    # overwritten with the resolved shape, so the FEAST report line
+    # ("Backend : Sharded BSE matvec (px, py = ...)") names the mesh in use
+    # rather than the request.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)

@@ -633,17 +633,16 @@ def main(argv=None) -> int:
         help="Run the deterministic random-data matvec/Lanczos self-test and exit.")
     args, _ = parser.parse_known_args(argv)
 
-    # OMITTED --px/--py = the run's canonical square mesh, NOT 1x1.  Resolved
-    # here, before every branch below, for two reasons.  (a) An explicit shape
-    # that is not the job's refuses at the top of main() rather than after a
-    # delegate has printed its banner.  (b) This driver's DEFAULT route is a
-    # delegation -- `if not args.lanczos:` hands the whole solve to
-    # bse_feast.main(["--px", str(args.px), ...]) -- and the --kpm-dos route
-    # and ring_matvec_correctness_check take px/py the same way, so what the
-    # forwarded argv carries must be the RESOLVED shape.  Until 2026-08-27 it
-    # carried the argparse placeholder 1/1, i.e. the default run put a
-    # four-GPU node's whole BSE on one device while the startup receipt above
-    # announced 2x2.
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1.  Resolved
+    # here, above every branch below, for two reasons.  A shape that is not
+    # the job's then refuses at the top of main() rather than after a delegate
+    # has printed its banner; and the default route is a delegation --
+    # `if not args.lanczos:` hands the solve to bse_feast.main(["--px",
+    # str(args.px), ...]), with --kpm-dos and ring_matvec_correctness_check
+    # taking px/py the same way -- so the forwarded argv must carry the
+    # resolved shape.  Until 2026-08-27 it carried the argparse placeholder
+    # 1/1: the default run put a four-GPU node's whole BSE on one device while
+    # the startup report above announced 2x2.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
 

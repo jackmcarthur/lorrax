@@ -118,9 +118,9 @@ import numpy as np
 # BEFORE this module's own ``import jax`` and any ``jax.devices()`` /
 # mesh creation so a multi-node srun yields the full global device set.
 # This driver names ``--px/--py``; ``create_mesh_xy_from_flags(px, py)`` in
-# main() hands back THIS startup mesh when they are omitted (the default
+# main() hands back this startup mesh when they are omitted (the default
 # since 2026-08-27) and refuses any explicit shape that is not it, so the
-# mesh every NamedSharding embeds is the one the receipt above describes.
+# mesh every NamedSharding embeds is the one the report above describes.
 from runtime import (debug_print, debug_print_enabled,
                      initialize_communicator_stack, rank0_print)
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
@@ -1531,7 +1531,7 @@ def main(argv=None):
 
     # Omitted --px/--py = the run's canonical square mesh (RUNTIME.mesh by
     # identity, not a twin), not 1x1; a given shape must BE that mesh.  The
-    # log line below then states the mesh IN USE, because args.px/args.py
+    # log line below then states the mesh in use, because args.px/args.py
     # carry the resolved shape rather than the request.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)

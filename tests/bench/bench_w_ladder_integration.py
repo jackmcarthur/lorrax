@@ -198,7 +198,7 @@ def _wedge_setup(args):
 
     # ``--mesh`` omitted = the run's mesh, the same rule the six bse drivers'
     # --px/--py follow since 2026-08-27.  It defaulted to "1,1", so every
-    # number this bench ever printed under ``lx run -G 4`` was measured on ONE
+    # number this bench ever printed under ``lx run -G 4`` was measured on one
     # of the four GPUs while the header said otherwise — the same defect the
     # drivers were fixed for, in the instrument used to judge them.  (It is
     # now also a refusal, not a quiet 1x1: create_mesh_xy rejects a shape that

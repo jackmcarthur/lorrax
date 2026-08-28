@@ -12,7 +12,7 @@ import pytest
 
 
 def _process_local_mesh_xy():
-    """A 1x1 ``('x','y')`` mesh over THIS process's own device.
+    """A 1x1 ``('x','y')`` mesh over this process's own device.
 
     These cells are index-map gates, not distribution gates: they need
     somewhere to put two small arrays.  ``collectives.single_device_mesh`` is
