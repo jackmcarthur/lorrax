@@ -1,4 +1,4 @@
-"""Two BSE service contracts, each with a control built to go red.
+"""Three BSE service contracts, each with a control built to go red.
 
 1. **ONE mesh factory in ``src/bse/``.**  Four byte-identical
    ``_create_mesh_xy(px, py)`` bodies used to build the ``('x','y')`` Mesh
@@ -18,6 +18,16 @@
    fully-addressable array concatenates each process's complete copy and
    multiplies the leading axis by P.  At the 64-rank run this file was written
    for that is a 64x-too-long array of plausible dtype and finite values.
+
+3. **``--px``/``--py`` omitted means THE RUN'S MESH.**  They defaulted to
+   ``1``, so every bse-family driver launched with no mesh flags asked the
+   (correct, shared) factory for a 1x1 and ran a four-GPU node on one device
+   while the startup receipt announced 2x2; at P>1 the same default builds
+   over ``jax.devices()[:1]`` — process 0's device on EVERY rank — and every
+   rank >= 1 dies in ``collectives._require_addressable``.  The gate has to
+   be behavioural and it has to run WIDE: at one device every arm of that bug
+   agrees, and ``--px 2 --py 2`` (what every launch recipe in-tree passes) is
+   the input that masks it.
 
 WHY EACH INSTRUMENT CARRIES A CONTROL.  Both gates here are of the class that
 is indistinguishable from a no-op when it passes: a structural scan that
@@ -473,3 +483,136 @@ def test_the_wrong_arm_really_multiplies_the_leading_axis(monkeypatch, P):
         f"_gather_host let a fully-addressable array through the tiled "
         f"allgather: got {good.shape}, expected (4, 3)")
     assert np.allclose(good, np.arange(12.0).reshape(4, 3))
+
+
+# ---------------------------------------------------------------------------
+# 3. behavioural: omitted --px/--py resolve to THE run's mesh, and a shape
+#    that does not consume the job refuses
+# ---------------------------------------------------------------------------
+#
+# THIS CELL MUST RUN IN A WIDE PROCESS OR IT PROVES NOTHING.  On one device
+# the canonical mesh IS 1x1, so the pre-fix default, the post-fix default and
+# the refusal all agree.  The suite pins one GPU per worker
+# (``conftest.pytest_configure``), so the wide process is made here: a child
+# with ``JAX_PLATFORMS=cpu
+# XLA_FLAGS=--xla_force_host_platform_device_count=4``.
+#
+# EMULATED DEVICES ARE ADMISSIBLE FOR THIS QUESTION AND ONLY THIS ONE.  The
+# four-GPU rule forbids substituting host emulation for a parallel-physics
+# claim; nothing here is a physics claim.  What is asserted is which Mesh
+# OBJECT a resolver returns and which shapes it refuses — device-kind
+# independent, and false on the pre-fix tree in exactly this process shape
+# (measured 2026-08-27: startup mesh (2, 2), ``create_mesh_xy(1, 1)`` ->
+# (1, 1) over device [0], ``is RUNTIME.mesh`` False).
+#
+# The child does NOT call ``initialize_communicator_stack``: this is a
+# question about ``bse_ring_comm`` and ``collectives``, and going through the
+# runtime entry point would drag in the required-FFI gate and make an absent
+# ``.so`` look like a mesh defect.
+
+_WIDE_CHILD = r"""
+import jax
+from bse.bse_ring_comm import (create_mesh_xy, create_mesh_xy_from_flags,
+                               make_bse_shardings)
+from common.collectives import resolve_mesh
+
+print("DEVICES", len(jax.devices()))
+canonical = resolve_mesh(axis_names=("x", "y"))
+m = create_mesh_xy_from_flags(None, None)
+print("OMITTED_SHAPE", tuple(int(n) for n in m.devices.shape))
+print("OMITTED_IS_CANONICAL", m is canonical)
+print("SHARDINGS_EMBED_CANONICAL",
+      all(s.mesh is canonical for s in vars(make_bse_shardings(m)).values()))
+try:
+    create_mesh_xy_from_flags(1, 1)
+    print("EXPLICIT_ONE_BY_ONE ACCEPTED")
+except ValueError as exc:
+    print("EXPLICIT_ONE_BY_ONE REFUSED", str(len(jax.devices())) in str(exc))
+try:
+    create_mesh_xy_from_flags(2, None)
+    print("HALF_REQUEST ACCEPTED")
+except ValueError:
+    print("HALF_REQUEST REFUSED")
+# CONTROL: the identity assertions above must be capable of returning False.
+# This is the pre-fix behaviour spelled out — the prefix slice of the device
+# list — and it must NOT be the canonical mesh.
+twin = create_mesh_xy(1, 1, jax.devices()[:1])
+print("CONTROL_TWIN_SHAPE", tuple(int(n) for n in twin.devices.shape))
+print("CONTROL_TWIN_IS_CANONICAL", twin is canonical)
+"""
+
+
+def _run_wide_child(n_devices: int = 4):
+    """Run ``_WIDE_CHILD`` in a fresh process that sees ``n_devices``."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"
+    env["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={n_devices}"
+    # The child must import what THIS process imports; under ``lx test`` the
+    # source root arrives on sys.path, not necessarily in PYTHONPATH.
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    proc = subprocess.run([sys.executable, "-c", _WIDE_CHILD],
+                          capture_output=True, text=True, env=env, timeout=900)
+    assert proc.returncode == 0, (
+        f"the widened child died (rc={proc.returncode}).\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-3000:]}")
+    facts = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isupper():
+            facts[parts[0]] = parts[1].strip()
+    return facts, proc.stdout
+
+
+def test_omitted_px_py_resolve_to_the_runs_own_mesh():
+    """The default path lands on THE canonical mesh, by identity."""
+    facts, out = _run_wide_child(4)
+    assert facts.get("DEVICES") == "4", (
+        f"the child did not widen — every arm of this defect agrees at one "
+        f"device, so the cell would pass vacuously.  Child said:\n{out}")
+    assert facts.get("OMITTED_SHAPE") == "(2, 2)", (
+        f"--px/--py omitted gave {facts.get('OMITTED_SHAPE')} on a 4-device "
+        f"job; the run's mesh is 2x2.  Child said:\n{out}")
+    # ``Mesh.__eq__`` is true for equal-but-distinct twins, and a twin is
+    # exactly the defect (a second set of communicators, a second copy of
+    # every shape-keyed jit cache), so the assertion is IDENTITY.
+    assert facts.get("OMITTED_IS_CANONICAL") == "True", (
+        f"the resolved mesh is not THE canonical object.  Child said:\n{out}")
+    assert facts.get("SHARDINGS_EMBED_CANONICAL") == "True", (
+        f"make_bse_shardings embedded a mesh that is not the run's.  Child "
+        f"said:\n{out}")
+
+
+def test_a_shape_that_does_not_consume_the_job_refuses():
+    """``--px 1 --py 1`` on a 4-device job is the case that used to succeed."""
+    facts, out = _run_wide_child(4)
+    assert facts.get("DEVICES") == "4", f"the child did not widen:\n{out}"
+    assert facts.get("EXPLICIT_ONE_BY_ONE", "").startswith("REFUSED"), (
+        f"an explicit 1x1 was accepted on a 4-device job — the mesh covers "
+        f"one device and the other three enter the same jit from outside it. "
+        f"Child said:\n{out}")
+    assert facts.get("EXPLICIT_ONE_BY_ONE") == "REFUSED True", (
+        f"the refusal does not name the job's device count, so it cannot "
+        f"tell the user what to ask for.  Child said:\n{out}")
+    assert facts.get("HALF_REQUEST") == "REFUSED", (
+        f"--px without --py was accepted.  Child said:\n{out}")
+
+
+def test_the_mesh_identity_assertion_can_be_false():
+    """CONTROL for the two cells above.
+
+    ``x is canonical`` would also hold if some layer collapsed every mesh to
+    one object, in which case the assertions above would be tautologies.
+    Build the mesh the pre-fix code built — ``create_mesh_xy`` over the
+    PREFIX of the device list — and require it to be a different object of a
+    different shape.
+    """
+    facts, out = _run_wide_child(4)
+    assert facts.get("CONTROL_TWIN_SHAPE") == "(1, 1)", out
+    assert facts.get("CONTROL_TWIN_IS_CANONICAL") == "False", (
+        f"a 1x1 mesh over device 0 compared IDENTICAL to the run's 2x2 mesh; "
+        f"the identity instrument used above cannot fail, so it is not "
+        f"evidence.  Child said:\n{out}")
