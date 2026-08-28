@@ -570,6 +570,7 @@ def resolve_hartree_diag_ev(
 	hartree_source: str | None = None,
 	kin_ion_has_hartree: bool = False,
 	exact_hartree_diag_ev: np.ndarray | None = None,
+	hartree_already_resolved: bool = False,
 	print_fn=print,
 ) -> tuple[np.ndarray, str]:
 	"""Decide the ⟨mk|V_H|mk⟩ term of H₀.  **The only copy of this rule.**
@@ -590,6 +591,24 @@ def resolve_hartree_diag_ev(
 	other        (``isdf`` / ``gspace`` / ``none`` / unknown) —
 	             ``hartree_diag_ev`` *is* the run's V_H.  **Use as given.**
 
+	``hartree_already_resolved=True`` says the caller's ``hartree_diag_ev``
+	has ALREADY had this scalar source policy applied to it upstream, so
+	this function must preserve the array as given rather than applying the
+	policy a second time.  A caller holding a raw, unresolved column leaves
+	the flag false.  In THIS tree the flag has exactly one caller —
+	``make_eqp_bgw``'s schema-v3 receipt branch, whose ``hartree_diag_ev``
+	is the resolved H that the live assembly persisted.  The live driver
+	(``gw.gw_output.write_results``) still hands this seam a PRE-seam column
+	and leaves the flag false; see the note on ``exact_hartree_diag_ev``.
+
+	Ported verbatim (signature, this flag's body, and the threading through
+	:func:`assemble_eqp`) from ``9d78648e`` on
+	``fix/sigma-hartree-artifact-provenance-2026-08-25``, where the flag has
+	a second motivation absent here: a non-scalar transverse photon Hartree
+	field living in ``sig_h`` beside the scalar term, which is why that
+	branch also flips the ``write_results`` call site to ``True``.  Neither
+	that field nor that call-site flip is in this tree.
+
 	``exact_hartree_diag_ev`` is the substitution operand and is optional
 	on purpose.  On the live driver path ``gw.sigma_dispatch`` has already
 	substituted the exact matrix into ``sig_h`` at the one point V_H
@@ -606,6 +625,16 @@ def resolve_hartree_diag_ev(
 	``'suppressed'`` / ``'substituted'`` / ``'as-given'``.
 	"""
 	h = np.real(np.asarray(hartree_diag_ev, dtype=np.float64))
+	if bool(hartree_already_resolved):
+		if exact_hartree_diag_ev is not None:
+			raise ValueError(
+				"an already-resolved Hartree input cannot also request an exact "
+				"post-hoc substitution")
+		print_fn(
+			"  V_H seam: live SigmaResult already applied the scalar Hartree "
+			"source policy — preserving its resolved direct contribution as given "
+			f"(mean magnitude = {float(np.mean(np.abs(h))):.3f} eV).")
+		return h, "as-given"
 	if bool(kin_ion_has_hartree) or hartree_source == "folded":
 		print_fn(
 			"  V_H seam: kin_ion carries the exact FFT-grid V_H in its own "
@@ -696,6 +725,7 @@ def assemble_eqp(
 	hartree_source: str | None = None,
 	kin_ion_has_hartree: bool = False,
 	exact_hartree_diag_ev: np.ndarray | None = None,
+	hartree_already_resolved: bool = False,
 	mean_field_gate: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
@@ -703,7 +733,9 @@ def assemble_eqp(
 
 	Order of operations, and each step happens exactly once:
 
-	1. the V_H seam (:func:`resolve_hartree_diag_ev`);
+	1. the V_H seam (:func:`resolve_hartree_diag_ev`), resolving a raw
+	   pre-seam column or, under ``hartree_already_resolved``, preserving
+	   an explicitly already-resolved one;
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
@@ -735,6 +767,7 @@ def assemble_eqp(
 		hartree_source=hartree_source,
 		kin_ion_has_hartree=kin_ion_has_hartree,
 		exact_hartree_diag_ev=exact_hartree_diag_ev,
+		hartree_already_resolved=hartree_already_resolved,
 		print_fn=print_fn,
 	)
 
