@@ -127,7 +127,19 @@ __all__ = ["SlabIO", "assert_available", "mesh_divisible_shape",
 #: leaves a file whose last line names the op that killed it — which is
 #: the whole instrument, given that all three failure signatures in
 #: ``SLAB_IO_ROOT_CAUSE_AUDIT.md`` are native deaths.
-_STACK = "ffi"
+#:
+#: THE STACK NAME IS THE BACKEND'S, NOT THIS MODULE'S.  It used to be the
+#: module constant ``_STACK = "ffi"``, which was true while there was one
+#: transport and became a LIE the moment the emulated tier landed: the
+#: journal showed ``stack=h5py op=open`` from ``_SerialBackend`` and
+#: ``stack=ffi op=open`` from this class, on the same file, in the same
+#: millisecond (measured in the gnppm_debug emulated arm's
+#: ``h5_journal.rank0.log``).  The journal's whole subject is WHICH HDF5
+#: LIBRARY INSTANCE touched a file — it is read alongside
+#: ``file_io.hdf5_owner``'s verdict, which is keyed on the same names — so
+#: a door that stamps the wrong library defeats the instrument.  Each
+#: backend now declares its own; see ``_FfiBackend.journal_stack`` and
+#: ``_SerialBackend.journal_stack``.
 
 
 class SlabIO:
@@ -190,26 +202,31 @@ class SlabIO:
         # ``_slab_io_ffi`` around ``open_file`` itself, and the registry
         # writes a third naming the ownership verdict the open walked
         # into.  Three facts, three lines, one per choke point.
+        # THE ONE TIER DECISION, taken from a PREDICATE before any transport
+        # runs — never from a transport that failed.  An emulated mesh
+        # (P == 1, more mesh cells than processes) has no per-process MPI
+        # world to derive a per-rank hyperslab from, so ``ffi.io.open_file``
+        # refuses it and is right to; the serial tier is the second door for
+        # that one geometry, and it moves only shards this single process
+        # already owns.  See ``_slab_io_serial`` for why this is not the tier
+        # deleted in 2026-08-06, and ``tests/test_slab_io_emulated_mesh.py``
+        # for the cell proving the FFI door still refuses.
+        #
+        # The CLASS is chosen before it is constructed so the journal's stack
+        # name is known even for an open that RAISES: a failed open is the
+        # line most worth having, and it must still name the right library.
+        if mesh_is_emulated(mesh):
+            from ._slab_io_serial import _SerialBackend
+            backend_cls = _SerialBackend
+        else:
+            backend_cls = _FfiBackend
+        self._stack = backend_cls.journal_stack
         try:
-            # THE ONE TIER DECISION, taken from a PREDICATE before any
-            # transport runs — never from a transport that failed.  An
-            # emulated mesh (P == 1, more mesh cells than processes) has no
-            # per-process MPI world to derive a per-rank hyperslab from, so
-            # ``ffi.io.open_file`` refuses it and is right to; the serial
-            # tier is the second door for that one geometry, and it moves
-            # only shards this single process already owns.  See
-            # ``_slab_io_serial`` for why this is not the tier deleted in
-            # 2026-08-06, and ``tests/test_slab_io_emulated_mesh.py`` for
-            # the cell proving the FFI door still refuses.
-            if mesh_is_emulated(mesh):
-                from ._slab_io_serial import _SerialBackend
-                self._backend = _SerialBackend(self.path, mesh=mesh, mode=mode)
-            else:
-                self._backend = _FfiBackend(self.path, mesh=mesh, mode=mode)
+            self._backend = backend_cls(self.path, mesh=mesh, mode=mode)
         except BaseException as exc:
-            _journal.fail("open", self.path, exc, stack=_STACK, mode=mode)
+            _journal.fail("open", self.path, exc, stack=self._stack, mode=mode)
             raise
-        _journal.record("open", self.path, stack=_STACK, mode=mode,
+        _journal.record("open", self.path, stack=self._stack, mode=mode,
                         handle=self._handle())
 
     def _handle(self):
@@ -260,7 +277,7 @@ class SlabIO:
         at the wrong offsets, so the corruption is DETECTED here and
         CREATED somewhere earlier — do not start reading at this method.
         """
-        with _journal.op_scope("close", self.path, stack=_STACK,
+        with _journal.op_scope("close", self.path, stack=self._stack,
                                mode=self.mode, handle=self._handle()):
             self._backend.close()
 
@@ -304,7 +321,7 @@ class SlabIO:
         collective create has no chunk-layout argument, so SlabIO does not
         expose a no-op ``chunks=`` compatibility parameter.
         """
-        with _journal.op_scope("create", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("create", self.path, stack=self._stack, ds=name,
                                cnt=tuple(int(s) for s in shape),
                                mode=self.mode, handle=self._handle()):
             self._backend.create_dataset(
@@ -333,7 +350,7 @@ class SlabIO:
         For scalars and small metadata arrays that are replicated or
         already on host.  Bulk data goes through :meth:`write_slab`.
         """
-        with _journal.op_scope("attr_w", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("attr_w", self.path, stack=self._stack, ds=name,
                                mode=self.mode, handle=self._handle()):
             self._backend.write_attr(name, value)
 
@@ -350,7 +367,7 @@ class SlabIO:
         time its attrs are applied.  A name absent at that moment raises,
         exactly as it does for ``create_dataset``.
         """
-        _journal.record("attr_w", self.path, stack=_STACK, ds=name,
+        _journal.record("attr_w", self.path, stack=self._stack, ds=name,
                         cnt=len(attrs), mode=self.mode,
                         handle=self._handle())
         self._backend._deferred_ds_attrs.append((str(name), dict(attrs)))
@@ -408,7 +425,7 @@ class SlabIO:
         dataset refuses, on every rank.  ``global_shape`` is likewise
         only needed when ``write_slab`` has to create the dataset.
         """
-        with _journal.op_scope("write", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("write", self.path, stack=self._stack, ds=name,
                                off=offset, cnt=tuple(A.shape) if hasattr(
                                    A, "shape") else None,
                                mode=self.mode, handle=self._handle()):
@@ -484,7 +501,7 @@ class SlabIO:
         if shape is None and partition_spec is not None:
             shape = self._backend.padded_shape_for(
                 name, mesh=mesh, partition_spec=partition_spec)
-        with _journal.op_scope("read", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("read", self.path, stack=self._stack, ds=name,
                                off=offset,
                                cnt=None if shape is None else tuple(
                                    int(s) for s in shape),
@@ -526,7 +543,7 @@ class SlabIO:
         dataset's own shape — ``()`` for a scalar, so ``int(arr)`` and
         ``arr[()]`` both work the way an h5py reader would expect.
         """
-        with _journal.op_scope("read", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("read", self.path, stack=self._stack, ds=name,
                                mode=self.mode, handle=self._handle()):
             return self._backend.read_whole(name, dtype=dtype)
 
@@ -593,7 +610,7 @@ class SlabIO:
         # ``off`` is the WINDOW COUNT here, not an origin: n windows share
         # one call and their origins are a table, which does not belong on
         # a log line.  The origins are the caller's ``offsets`` argument.
-        with _journal.op_scope("read", self.path, stack=_STACK, ds=name,
+        with _journal.op_scope("read", self.path, stack=self._stack, ds=name,
                                off=f"nwin{len(offsets)}",
                                cnt=tuple(int(s) for s in shape),
                                mode=self.mode, handle=self._handle()):

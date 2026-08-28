@@ -563,3 +563,37 @@ def test_read_slabs_at_the_production_geometry(tmp_path):
     # the ragged window: 4 real rows, then zero
     assert np.array_equal(packed[:, :, 1, :4], ds[:, :, 5:9])
     assert np.array_equal(packed[:, :, 1, 4], np.zeros((nb, ns, 2)))
+
+
+@pytest.mark.mesh(4)
+def test_the_journal_names_the_library_the_tier_actually_used(tmp_path,
+                                                              monkeypatch):
+    """``stack=h5py``, never ``stack=ffi``, on an emulated open.
+
+    The journal's whole subject is WHICH HDF5 LIBRARY INSTANCE touched a
+    file — it is read beside ``file_io.hdf5_owner``'s verdict, which is
+    keyed on the same two names.  ``slab_io`` used to stamp a module
+    constant ``_STACK = "ffi"``, true while there was one transport; the
+    first emulated gnppm_debug run's ``h5_journal.rank0.log`` then showed
+    ``stack=h5py op=open`` from the serial backend and ``stack=ffi
+    op=open`` from the door, on the same file in the same millisecond.
+
+    Read out of the journal FILE rather than off the class attribute: the
+    attribute is what the fix changed, so asserting on it would test the
+    fix against itself.
+    """
+    monkeypatch.setenv("LORRAX_H5_JOURNAL", "1")
+    monkeypatch.chdir(tmp_path)          # the journal lands in the cwd
+    mesh = _mesh(2, 2)
+    with SlabIO(tmp_path / "j.h5", mode="w", mesh=mesh) as io:
+        io.create_dataset("A", shape=(4, 4), dtype=np.float64)
+        io.write_slab("A", _sharded(np.ones((4, 4)), mesh, P("x", "y")))
+
+    logs = sorted(tmp_path.glob("h5_journal.rank*.log"))
+    assert logs, f"no journal written into {tmp_path}"
+    lines = [ln for log in logs for ln in log.read_text().splitlines()
+             if "/j.h5" in ln]
+    assert lines, "journal has no lines for the file under test"
+    assert all("stack=h5py" in ln for ln in lines), (
+        "an emulated-tier operation was journaled under the FFI library:\n"
+        + "\n".join(ln for ln in lines if "stack=h5py" not in ln))

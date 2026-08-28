@@ -1655,6 +1655,14 @@ def _apply_dataset_attrs(h5, pending) -> None:
 class _FfiBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO backend."""
 
+    #: WHICH HDF5 LIBRARY INSTANCE this backend's operations go through, in
+    #: the vocabulary ``file_io.hdf5_owner`` and ``file_io.h5_journal``
+    #: share.  ``file_io.slab_io`` stamps its own journal lines with this
+    #: rather than with a module constant of its own — a door that names a
+    #: library its backend does not use defeats the instrument whose entire
+    #: subject is which library touched the file.
+    journal_stack = _J_FFI
+
     def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
         # Lazy import — keeps file_io importable without the FFI built.
         from ffi.phdf5 import open_file as _open_file, close_file as _close_file

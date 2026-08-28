@@ -159,6 +159,12 @@ def _index_bounds(index, shape: Sequence[int]) -> tuple[tuple[int, ...],
 class _SerialBackend(_DatasetGeometry):
     """Single-process h5py SlabIO backend.  See the module docstring."""
 
+    #: ``h5py``, not ``ffi``: every HDF5 call this tier makes goes through
+    #: h5py's bundled libhdf5, and ``file_io.slab_io`` stamps its own
+    #: journal lines with this.  Read the note beside ``_FfiBackend.
+    #: journal_stack`` for why the door does not name a library of its own.
+    journal_stack = _J_H5PY
+
     def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
         # THE TIER IS SELECTABLE ONLY AT P == 1, and it says so here rather
         # than trusting its one caller.  A fallback for a broken
