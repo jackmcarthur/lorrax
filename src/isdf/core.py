@@ -6181,6 +6181,7 @@ def fit_one_rchunk(
     weight_r: jax.Array | None = None,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
+    _prebuilt_Z_q: jax.Array | None = None,
 ):
     """Entry point for the r-chunk body jit.  Caches one compiled kernel
     per distinct static configuration.
@@ -6221,6 +6222,10 @@ def fit_one_rchunk(
     # the factory's closure-captured values; μ=1/2/3 therefore compile
     # separately instead of trying to turn tracers into host attributes.
     is_charge = (int(vertex_mu_L) == 0)
+    if _prebuilt_Z_q is not None and (layout != "face" or is_charge):
+        raise ValueError(
+            "fit_one_rchunk: _prebuilt_Z_q is reserved for the private "
+            "coupled transverse face route")
     gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
     _cache_y_r_tile = 0
     _cache_y_blocks = bool(cache_face_y_blocks)
@@ -6305,12 +6310,16 @@ def fit_one_rchunk(
     _r0 = host_rss_gb() if _dbg else 0.0
     _t_z0 = time.perf_counter() if _dbg else 0.0
     with timing.section("zeta_fit.chunk.z_q_build"):
-        Z_q = fn.z_q_phase(
-            psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
-            norms_l, norms_r, r_start_dyn,
-            gamma_perm, gamma_phase, psi_r_cache,
-            psi_mun, weight_l, weight_r)
-        Z_q.block_until_ready()
+        if _prebuilt_Z_q is None:
+            Z_q = fn.z_q_phase(
+                psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
+                norms_l, norms_r, r_start_dyn,
+                gamma_perm, gamma_phase, psi_r_cache,
+                psi_mun, weight_l, weight_r)
+            Z_q.block_until_ready()
+        else:
+            Z_q = _prebuilt_Z_q
+            Z_q.block_until_ready()
     _t_z = (time.perf_counter() - _t_z0) if _dbg else 0.0
     _r1 = host_rss_gb() if _dbg else 0.0
     _t_s0 = time.perf_counter() if _dbg else 0.0

@@ -8,6 +8,7 @@ entirely by :func:`gw.gflat_memory_model.plan_gflat_chunks` — the single
 production planner (persistent floor + max over five stage transients).
 """
 import os
+import threading
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -1733,6 +1734,140 @@ def _gate_fresh_zeta_rank_findings(
 		         f"UNCERTIFIED and can only raise the weight finding.")
 
 
+class _CoupledMu123ZqCoordinator:
+	"""Host scheduler for the experimental three-current Zq transaction.
+
+	Channel setup runs one-at-a-time.  For each r chunk, μ=1 builds the one
+	shared ``Z_q[3,q,mu,r]`` stack; μ=1,2,3 then consume its slices in the
+	accepted solve/accumulate order.  The stack is released immediately after
+	μ=3 finishes that chunk.  Final G-flat writes and provenance also retain
+	the accepted μ=1→2→3 order.
+	"""
+	_CHANNELS = (1, 2, 3)
+
+	def __init__(self):
+		self._cv = threading.Condition()
+		self._prepared = set()
+		self._release_prepared = False
+		self._aborted = None
+		self._chunk = 0
+		self._arrived = set()
+		self._z_stack = None
+		self._turn = 1
+		self._final_turn = 1
+
+	def _raise_if_aborted(self):
+		if self._aborted is not None:
+			raise RuntimeError(
+				"coupled mu123 Zq transaction aborted") from self._aborted
+
+	def abort(self, exc):
+		with self._cv:
+			if self._aborted is None:
+				self._aborted = exc
+			self._cv.notify_all()
+
+	def channel_prepared(self, mu):
+		mu = int(mu)
+		with self._cv:
+			if mu not in self._CHANNELS or mu in self._prepared:
+				raise ValueError(f"invalid/duplicate prepared channel mu={mu}")
+			self._prepared.add(mu)
+			self._cv.notify_all()
+			while not self._release_prepared:
+				self._raise_if_aborted()
+				self._cv.wait()
+			self._raise_if_aborted()
+
+	def wait_channel_prepared(self, mu):
+		with self._cv:
+			while int(mu) not in self._prepared:
+				self._raise_if_aborted()
+				self._cv.wait()
+
+	def release_channels(self):
+		with self._cv:
+			if self._prepared != set(self._CHANNELS):
+				raise RuntimeError(
+					"cannot release coupled channels before all are prepared")
+			self._release_prepared = True
+			self._cv.notify_all()
+
+	def acquire_channel_Z_q(self, mu, chunk_idx, builder):
+		mu = int(mu)
+		chunk_idx = int(chunk_idx)
+		build_here = False
+		with self._cv:
+			while chunk_idx != self._chunk:
+				self._raise_if_aborted()
+				self._cv.wait()
+			if mu in self._arrived:
+				raise RuntimeError(
+					f"duplicate coupled-Zq arrival mu={mu}, chunk={chunk_idx}")
+			self._arrived.add(mu)
+			self._cv.notify_all()
+			while self._arrived != set(self._CHANNELS):
+				self._raise_if_aborted()
+				self._cv.wait()
+			if mu == 1 and self._z_stack is None:
+				build_here = True
+			else:
+				while self._z_stack is None:
+					self._raise_if_aborted()
+					self._cv.wait()
+
+		if build_here:
+			try:
+				z_stack = builder()
+				z_stack.block_until_ready()
+			except BaseException as exc:
+				self.abort(exc)
+				raise
+			with self._cv:
+				self._z_stack = z_stack
+				self._cv.notify_all()
+
+		with self._cv:
+			while self._turn != mu:
+				self._raise_if_aborted()
+				self._cv.wait()
+			self._raise_if_aborted()
+			return self._z_stack[mu - 1]
+
+	def finish_chunk(self, mu, chunk_idx):
+		mu = int(mu)
+		with self._cv:
+			if int(chunk_idx) != self._chunk or mu != self._turn:
+				raise RuntimeError(
+					f"out-of-order coupled chunk finish mu={mu}, "
+					f"chunk={chunk_idx}, expected mu={self._turn}, "
+					f"chunk={self._chunk}")
+			if mu < 3:
+				self._turn += 1
+			else:
+				self._z_stack = None
+				self._arrived.clear()
+				self._turn = 1
+				self._chunk += 1
+			self._cv.notify_all()
+
+	def wait_finalize(self, mu):
+		with self._cv:
+			while self._final_turn != int(mu):
+				self._raise_if_aborted()
+				self._cv.wait()
+			self._raise_if_aborted()
+
+	def finish_channel(self, mu):
+		with self._cv:
+			if self._final_turn != int(mu):
+				raise RuntimeError(
+					f"out-of-order coupled channel finish mu={mu}, "
+					f"expected {self._final_turn}")
+			self._final_turn += 1
+			self._cv.notify_all()
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
              psi_nmu_fresh=None, psi_mun_fresh=None,
@@ -1774,6 +1909,12 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# γ̃ contract sits inside shard_map bodies so threading a kwarg
 	# through every call would be churn for no benefit).
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
+	_coupled_mu123_requested = env_bool(
+		"LORRAX_EXPERIMENTAL_COUPLED_ZQ", False, print_fn=print_fn)
+	if _coupled_mu123_requested and not cfg.bispinor:
+		raise ValueError(
+			"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires bispinor=true; it "
+			"only couples the three transverse current fits")
 
 	if zeta_contract is None:
 		zeta_contract = _resolve_zeta_fit_contract(
@@ -1836,6 +1977,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_cent_T_idx = zeta_contract.centroids_transverse
 	_transverse_identity = zeta_contract.transverse_identity
 	_chunks_T = None
+	_gflat_plan_T = None
 	_write_ibz_only_transverse = zeta_contract.write_ibz_only_transverse
 	if cfg.bispinor:
 		if len(_reuse_T) != 3:
@@ -1853,10 +1995,61 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# definitively declined and ahead of the μ_L fit loop; all three
 		# Lorentz components share this one transverse-sized plan.
 		if not all(_reuse_T):
-			_chunks_T, _ = _plan_gflat_chunks_for_channel(
+			_chunks_T, _gflat_plan_T = _plan_gflat_chunks_for_channel(
 				meta=_meta_T, cfg=cfg, band_slices=band_slices,
 				mesh_xy=mesh_xy, is_bispinor=True,
 				face_current_vertex=True, print_fn=print_fn)
+	_coupled_mu123_enabled = False
+	if _coupled_mu123_requested and cfg.bispinor:
+		if any(_reuse_T) and not all(_reuse_T):
+			raise ValueError(
+				"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires either all three "
+				"transverse ζ files to be reusable or all three to need a "
+				"fresh fit; partial reuse remains on the sequential path")
+		if all(_reuse_T):
+			print_fn(
+				"  [experimental] coupled transverse Zq requested, but all "
+				"three μ_L files are reusable; no transverse fit is needed.")
+		else:
+			if not cfg.memory.low_mem_bands:
+				raise ValueError(
+					"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires "
+					"low_mem_bands=true")
+			if not bool(_chunks_T.get('cache_face_y_blocks', False)):
+				raise ValueError(
+					"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires the "
+					"planner-selected bounded face-Y cache")
+			from gw.gflat_memory_model import (
+				_coupled_mu123_zq_incremental_bytes)
+			_p_x = int(mesh_xy.shape['x'])
+			_p_y = int(mesh_xy.shape['y'])
+			_coupled_delta = _coupled_mu123_zq_incremental_bytes(
+				nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
+				ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
+				face_nb=int(band_slices.b4 - band_slices.b0),
+				r_chunk=int(_chunks_T['chunk_r']), p_x=_p_x, p_y=_p_y,
+				ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
+				          or int(0.06 * _meta_T.n_rtot)),
+				n_rtot=int(_meta_T.n_rtot),
+				cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)))
+			_coupled_projected = (
+				float(_gflat_plan_T.hwm_bytes) + _coupled_delta['total'])
+			if _coupled_projected > float(_gflat_plan_T.budget_bytes):
+				raise ValueError(
+					"LORRAX_EXPERIMENTAL_COUPLED_ZQ does not fit the device "
+					f"budget: accepted-plan HWM "
+					f"{_gflat_plan_T.hwm_bytes / 1e9:.2f} GB/dev + coupled "
+					f"increment {_coupled_delta['total'] / 1e9:.2f} GB/dev "
+					f"> {_gflat_plan_T.budget_bytes / 1e9:.2f} GB/dev")
+			print_fn(
+				f"  [experimental] coupled Zq memory increment: "
+				f"{_coupled_delta['total'] / 1e9:.2f} GB/dev "
+				f"(+2 completed Zq slices + 2 G-flat outputs + 2 factors "
+				f"+ shared full-spin X face"
+				+ (" + 2 ψ(r) caches" if _coupled_delta[
+					'two_additional_psi_r_caches'] else "") + "); "
+				f"projected HWM {_coupled_projected / 1e9:.2f} GB/dev")
+			_coupled_mu123_enabled = True
 	# Fresh writers and provenance stamps consume exactly the identity that
 	# was tested before planning; there is no second reconstruction here.
 	_provenance = zeta_contract.provenance
@@ -2097,13 +2290,23 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			_isdf_core._fit_one_rchunk_cache.clear()
 			gc.collect()
 
-		for mu_L in (1, 2, 3):
+		def _drain_coupled_rank_findings(mu_L, stage):
+			# The services are process-global.  The coupled schedule serializes
+			# this callback with the corresponding preparation/solve so a
+			# deferred finding can never be attributed to the next current.
+			# Stay silent on the overwhelmingly common empty path; the accepted
+			# per-channel gate below still emits its canonical final banner.
+			if spectral_closure.pending() or rank_criterion.pending():
+				_gate_fresh_zeta_rank_findings(
+					f"the μ_L={mu_L} transverse ζ fit's {stage}",
+					transverse=True, print_fn=print_fn)
+
+		def _fit_transverse_channel(mu_L, coordinator=None):
 			zeta_mu_path = _zeta_T_paths[mu_L]
 			if _reuse_T[mu_L - 1]:
 				print_fn(f"  [zeta reuse] μ_L={mu_L} accepted at "
 				         f"{zeta_mu_path}; fit skipped independently.")
-				continue
-			_drop_traced_caches()
+				return
 			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
 			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
 			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
@@ -2147,6 +2350,11 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					# is loud per the bispinor IBZ requirement.
 					write_ibz_only=_write_ibz_only_transverse,
 					zeta_cutoff_ry=_zeta_cutoff,
+					_coupled_mu123_coordinator=coordinator,
+					_coupled_rank_gate=(
+						(lambda stage: _drain_coupled_rank_findings(
+							mu_L, stage))
+						if coordinator is not None else None),
 					print_fn=print_fn,
 				)
 			_gate_fresh_zeta_rank_findings(
@@ -2168,6 +2376,56 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					         f"({exc}); this ζ_T will be refit on the next "
 					         f"run.")
 			barrier(f"zeta_provenance_mu{mu_L}")
+			if coordinator is not None:
+				coordinator.finish_channel(mu_L)
+
+		if _coupled_mu123_enabled:
+			print_fn(
+				"  [experimental] coupled μ_L=1,2,3 transverse Zq: one "
+				"shared face transform per r chunk; solve, write, and "
+				"provenance remain ordered μ_L=1→2→3")
+			_drop_traced_caches()
+			_coordinator = _CoupledMu123ZqCoordinator()
+			_errors = {}
+			_errors_lock = threading.Lock()
+
+			def _run_coupled_channel(mu_L):
+				try:
+					_fit_transverse_channel(mu_L, _coordinator)
+				except BaseException as exc:
+					with _errors_lock:
+						_errors.setdefault(mu_L, exc)
+					_coordinator.abort(exc)
+
+			_threads = []
+			_setup_exc = None
+			try:
+				# Starting each successor only after its predecessor has
+				# reached the r-loop keeps all preparation collectives in the
+				# exact accepted μ order on every process.
+				for mu_L in (1, 2, 3):
+					_thread = threading.Thread(
+						target=_run_coupled_channel, args=(mu_L,),
+						name=f"lorrax-zq-mu{mu_L}", daemon=False)
+					_thread.start()
+					_threads.append(_thread)
+					_coordinator.wait_channel_prepared(mu_L)
+				_coordinator.release_channels()
+			except BaseException as exc:
+				_setup_exc = exc
+				_coordinator.abort(exc)
+			finally:
+				for _thread in _threads:
+					_thread.join()
+			if _errors:
+				raise _errors[min(_errors)]
+			if _setup_exc is not None:
+				raise _setup_exc
+		else:
+			for mu_L in (1, 2, 3):
+				if not _reuse_T[mu_L - 1]:
+					_drop_traced_caches()
+				_fit_transverse_channel(mu_L)
 
 	return zeta_h5_path, mem_est, transverse_wfn_data
 

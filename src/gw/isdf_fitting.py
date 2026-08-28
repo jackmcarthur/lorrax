@@ -17,7 +17,7 @@ from common.collectives import (
 )
 from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 from runtime import debug_print_enabled
-from runtime.padding import round_up
+from runtime.padding import bounded_partition_tile, round_up
 
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
@@ -35,6 +35,7 @@ from isdf.core import (
     host_rss_gb as _host_rss_gb,
     factor_c_q,
     fit_one_rchunk,
+    _z_q_face_coupled_mu123,
     _resolve_solver_kind,
     _resolve_zeta_gather,
     _band_norms_slice,
@@ -184,6 +185,8 @@ def fit_zeta_to_h5(
     psi_nmu_fresh: jax.Array | None = None,
     psi_mun_fresh: jax.Array | None = None,
     bispinor_lift: str = "raw",
+    _coupled_mu123_coordinator=None,
+    _coupled_rank_gate=None,
     print_fn=print,
 ):
     """
@@ -338,6 +341,19 @@ def fit_zeta_to_h5(
                 "fit_zeta_to_h5: psi_rmuT_X is required when "
                 "low_mem_bands=False (the legacy r-chunk loop reads it in "
                 "STEP 1/STEP 6).")
+
+    if (_coupled_mu123_coordinator is not None
+            and (not low_mem_bands or not cache_face_y_blocks
+                 or int(vertex_mu_L) not in (1, 2, 3))):
+        raise ValueError(
+            "fit_zeta_to_h5: the private coupled-mu123 coordinator is "
+            "transverse-only and requires low_mem_bands=True with the "
+            "planner-selected bounded face-Y cache")
+    if ((_coupled_mu123_coordinator is None)
+            != (_coupled_rank_gate is None)):
+        raise ValueError(
+            "fit_zeta_to_h5: the private coupled coordinator and rank "
+            "gate must be supplied together")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -1358,6 +1374,9 @@ def fit_zeta_to_h5(
         jax.block_until_ready(gflat_acc)
         jax.block_until_ready(L_q)
     mem_probe("pre_rchunk_loop")
+    if _coupled_mu123_coordinator is not None:
+        _coupled_rank_gate("prepared")
+        _coupled_mu123_coordinator.channel_prepared(int(vertex_mu_L))
 
     # glibc heap trim hook (see the comment at the call site in the loop
     # below).  DEFAULT ON — one ``malloc_trim(0)`` per r-chunk costs a few
@@ -1396,6 +1415,29 @@ def fit_zeta_to_h5(
             _dbg_rchunk = debug_print_enabled()
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
+            _prebuilt_Z_q = None
+            if _coupled_mu123_coordinator is not None:
+                def _build_coupled_Z_q():
+                    _cache_cap = int(face_y_cache_r_tile) or actual_n_rchunk
+                    _cache_tile = bounded_partition_tile(
+                        actual_n_rchunk, _cache_cap,
+                        int(mesh_xy.shape['y']))
+                    if _cache_tile <= 0:
+                        raise ValueError(
+                            "coupled mu123 Zq requires a valid bounded "
+                            "face-Y cache tile")
+                    return _z_q_face_coupled_mu123(
+                        psi_mun_fresh, psi_G_store, psi_r_cache,
+                        weight_l_face, weight_r_face,
+                        band_chunk_ranges=band_chunk_ranges,
+                        r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                        r_chunk_size=actual_n_rchunk,
+                        kgrid=kgrid, mesh_xy=mesh_xy,
+                        cache_y_r_tile=_cache_tile)
+
+                _prebuilt_Z_q = (
+                    _coupled_mu123_coordinator.acquire_channel_Z_q(
+                        int(vertex_mu_L), chunk_idx, _build_coupled_Z_q))
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
                  jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
@@ -1430,10 +1472,13 @@ def fit_zeta_to_h5(
                     weight_r=(weight_r_face if low_mem_bands else None),
                     cache_face_y_blocks=bool(cache_face_y_blocks),
                     face_y_cache_r_tile=int(face_y_cache_r_tile),
+                    _prebuilt_Z_q=_prebuilt_Z_q,
                 )
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
                 zeta_chunk.block_until_ready()
+            if _coupled_rank_gate is not None:
+                _coupled_rank_gate(f"rchunk {chunk_idx} solve")
             _t_fit = time.perf_counter() - t0
             t_fit_total += _t_fit
             _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0
@@ -1466,6 +1511,9 @@ def fit_zeta_to_h5(
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write
             _mem_probe(f"after_accumulate chunk={chunk_idx}")
+            if _coupled_mu123_coordinator is not None:
+                _coupled_mu123_coordinator.finish_chunk(
+                    int(vertex_mu_L), chunk_idx)
             _rss2 = _host_rss_gb() if _dbg_rchunk else 0.0
             # Return glibc's free-but-still-mapped heap to the OS at the
             # end of each r-chunk.  Together with
@@ -1550,6 +1598,9 @@ def fit_zeta_to_h5(
     # allocator keeps the peak reservation so this reads close to the
     # all-time high water.
     _track_peak()
+
+    if _coupled_mu123_coordinator is not None:
+        _coupled_mu123_coordinator.wait_finalize(int(vertex_mu_L))
 
     # ---- Write the accumulated G-flat ζ_q ----
     # One collective write of the persistent ``(n_q_disk, n_rmu,

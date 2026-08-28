@@ -119,21 +119,37 @@ def _c128(*dims, shard: int = 1) -> float:
 
 def _coupled_mu123_zq_incremental_bytes(
         *, nk: int, nq: int, ns: int, mu: int, face_nb: int,
-        r_chunk: int, p_x: int, p_y: int) -> dict[str, float]:
+        r_chunk: int, p_x: int, p_y: int, ngkmax: int = 0,
+        n_rtot: int = 0, cache_psi_r: bool = False) -> dict[str, float]:
     """Private prototype delta over one accepted transverse face fit.
 
     The coupled transport returns all three completed ``Z_q`` channels, so
     two additional ``Z_q[q,mu_X,r_Y]`` arrays are live.  Its full-spin X
     owner cache is sharded only over ``mu_X`` and replicated over Y.  The
-    incumbent bounded Y cache and one channel's two P carries are unchanged.
+    production coordinator also retains two extra G-flat outputs and two
+    extra transverse CCT factors.  When ψ(r) is hoisted, its two additional
+    all-P-sharded copies are included too.  The incumbent bounded Y cache and
+    one channel's two P carries are unchanged.
     """
     completed_zq = 2.0 * _c128(
         nq, mu, r_chunk, shard=int(p_x) * int(p_y))
     shared_x_face = _c128(nk, ns, mu, face_nb, shard=p_x)
+    extra_gflat = 2.0 * _c128(
+        nq, mu, ngkmax, shard=int(p_x) * int(p_y))
+    extra_factors = 2.0 * _c128(
+        nq, mu, mu, shard=int(p_x) * int(p_y))
+    face_nb_transport = round_up(face_nb, int(p_x) * int(p_y))
+    extra_psi_r = (2.0 * _c128(
+        nk, face_nb_transport, ns, n_rtot,
+        shard=int(p_x) * int(p_y)) if cache_psi_r else 0.0)
     return {
         "two_additional_completed_zq": completed_zq,
         "shared_full_spin_x_face": shared_x_face,
-        "total": completed_zq + shared_x_face,
+        "two_additional_gflat_outputs": extra_gflat,
+        "two_additional_transverse_factors": extra_factors,
+        "two_additional_psi_r_caches": extra_psi_r,
+        "total": (completed_zq + shared_x_face + extra_gflat
+                  + extra_factors + extra_psi_r),
     }
 
 

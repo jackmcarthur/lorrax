@@ -75,7 +75,8 @@ def test_coupled_mu123_prototype_prices_two_zq_outputs_and_shared_x_face():
         r_chunk=82_944, p_x=4, p_y=4)
     assert delta["two_additional_completed_zq"] == 4_777_574_400
     assert delta["shared_full_spin_x_face"] == 117_964_800
-    assert delta["total"] == 4_895_539_200
+    assert delta["two_additional_transverse_factors"] == 46_080_000
+    assert delta["total"] == 4_941_619_200
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
