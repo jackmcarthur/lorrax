@@ -70,4 +70,3 @@ def test_host_spill_env_requires_and_only_threads_through_coupled_route():
     assert f"{flag} requires " in source
     call = source.index("_spill_coupled_gflat_to_host=")
     assert "coordinator is not None" in source[call:call + 180]
-
