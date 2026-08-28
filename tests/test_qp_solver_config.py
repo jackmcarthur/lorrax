@@ -487,7 +487,7 @@ def test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses():
     assert deck.is_file(), f"the one SC deck is missing: {deck}"
     cfg = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *a, **k: None)
-    # PARSE still accepts the pair; the refusal lives in the driver.
+    # Parsing still accepts the pair; the refusal is in the driver.
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.compute_mode.is_dynamic
 

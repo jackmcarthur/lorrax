@@ -3237,3 +3237,22 @@ Evidence:
 `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/reports/screening_diagrams_wbse/evidence/`
 — `operator_reciprocity_mesh4.*`, `ladder_finiteq_gate_mesh4.*`,
 `closure_gate_mesh4.*`, `combined_mesh4.*`. Sandbox claims 0214 / 0215.
+
+## test_w_head_densify's equal-grid cell fails after another suite runs
+
+OPEN, 2026-08-27, environment interaction, not a branch regression.
+`tests/test_w_head_densify.py::test_the_loader_does_not_defer_when_the_grids_are_equal`
+passes when its file runs alone — 70 passed, with no FFI library, with the
+host leg, and with both legs — and fails inside a multi-file run with
+`IndexError: index 0 is out of bounds for axis 0 with size 0` at
+`src/bse/bse_loading.py:202`, where `_get_local_mesh_coords` looks up
+`jax.local_devices()` in the 1x1 mesh the cell just built. Some other
+module in the run changed the process's device set first; this is the same
+collection-time `os.environ` mutation that makes a bare `pytest tests/`
+exit 4.
+
+Measured on both sides of the receipt fix with one command and the same two
+FFI libraries: 1 failed / 301 passed / 8 skipped at `6fafd126`, and 1 failed
+/ 304 passed / 8 skipped after it, the same cell each time. Pairing
+`test_sanity_gates_jax.py` before it reproduces the failure; pairing
+`test_jax_cache_contract.py` before it does not.
