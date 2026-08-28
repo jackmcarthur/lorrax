@@ -179,7 +179,10 @@ _SPEC = {
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "rocm")),
-    ("solve_lu", "cusolvermp"): ("lorrax_cusolvermp_batched_solve_lu", ("CUDA",)),
+    ("solve_lu", "cusolvermp"): (("lorrax_cusolvermp_batched_solve_lu",
+                                    "lorrax_cusolvermp_batched_getrf",
+                                    "lorrax_cusolvermp_batched_getrs"),
+                                   ("CUDA",)),
     # The scalapack LU family is THREE handlers since the transverse
     # factor hoist (2026-08): the fused solve (legacy callers) plus the
     # split getrf/getrs pair the hoisted ζ factor stage requires.  All

@@ -254,9 +254,9 @@ the batch route.
 * **`solve()` checks `B` against the token's `n` and `nbatch`**, so a
   mismatched RHS refuses instead of corrupting a solve or hanging in a
   collective.
-* **`factor`/`solve` is not the fused route.** `factor('solve_lu', …)`
-  raises `NotImplementedError` for any backend but ScaLAPACK; one factor per
-  solve is `plan('solve_lu', mesh, backend=…).batched(A, B)`.
+* **`factor`/`solve` is not the fused route.** ScaLAPACK and cuSOLVERMp LU
+  both expose split getrf/getrs through the opaque token. One factor per solve
+  remains available as `plan('solve_lu', mesh, backend=…).batched(A, B)`.
 * **Env grants capability, never selects a backend.** `LORRAX_FFI_SO` /
   `LORRAX_FFI_HOST_SO` pin which `.so` to open. `distrib_la.resolve` reads
   no environment at all. An explicit pin that cannot be honoured is a
@@ -925,6 +925,11 @@ evidence — the SLATE trsm back-solve had never run before step 2:
 | cuSOLVERMp token round trip, GPU 2×2 | 5.6e-16 | " |
 | ScaLAPACK LU + ipiv, CPU 2×2 | 3.855e-13 | native LU control 3.856e-13 |
 | batched-vs-serial eigh | **bit-identical** (0.0 in W and Z) | — |
+
+The cuSOLVERMp LU token's rank-private pivot row is sized to the vendor
+contract ``LOCr(M_A) + MB_A``.  It is still O(n/Px) per matrix/rank; the
+extra block is required storage for distributed row interchanges, not a
+replicated global pivot.
 
 ## Antipatterns
 

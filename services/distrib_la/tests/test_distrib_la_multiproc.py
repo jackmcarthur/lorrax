@@ -280,6 +280,57 @@ def check_cusolvermp_factor_solve(mesh, dtype="complex128", nq=2, n=64,
     return dict(residual=r)
 
 
+def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
+                                     nrhs=32):
+    """Split CUDA getrf/getrs parity, reuse, and pivot ownership.
+
+    The second RHS uses the same opaque token and is compared against the
+    incumbent fused handler.  The internal handle is inspected only here to
+    prove every process owns ``LOCr(M_A)+MB_A = 2*n/Px`` pivots per q:
+    the carrier remains rank-private rather than replicating a global pivot.
+    """
+    rng = np.random.default_rng(20260827)
+    A_np = _herm(rng, nq, n, dtype)
+    A_np += np.eye(n, dtype=A_np.dtype)[None, :, :] * 0.37
+    B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+    B2_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+
+    for target in ("lorrax_cusolvermp_batched_getrf",
+                   "lorrax_cusolvermp_batched_getrs"):
+        usable, why = D.probe_target(target, "CUDA")
+        assert usable, f"new CUDA handler {target} is not loadable: {why}"
+
+    tok = D.factor("solve_lu", _put(A_np, mesh, (None, "x", "y")), mesh,
+                   backend="cusolvermp")
+    X1 = _gather(D.solve(tok, _put(B_np, mesh, (None, "x", "y"))))
+    X2 = _gather(D.solve(tok, _put(B2_np, mesh, (None, "x", "y"))))
+    r1, r2 = _resid(A_np, X1, B_np), _resid(A_np, X2, B2_np)
+    assert r1 < 1e-10 and r2 < 1e-10, (
+        f"cusolvermp split residuals rhs1={r1:.3e} rhs2={r2:.3e}")
+
+    fused = _gather(D.plan("solve_lu", mesh, backend="cusolvermp", n=n)
+                    .batched(_put(A_np, mesh, (None, "x", "y")),
+                             _put(B2_np, mesh, (None, "x", "y"))))
+    assert np.array_equal(X2, fused), (
+        f"split CUDA second solve drifts from fused getrf+getrs "
+        f"(rel {_rel(X2, fused):.3e})")
+
+    held = tok._factor  # service-internal white-box ownership gate
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ipiv_len = 2 * (n // px)
+    want_local = (nq, ipiv_len)
+    want_global = (nq, px * py * ipiv_len)
+    assert tuple(held.ipiv.shape) == want_global, (
+        f"pivot carrier global shape {held.ipiv.shape}, want {want_global}")
+    local_shapes = [tuple(s.data.shape) for s in held.ipiv.addressable_shards]
+    assert local_shapes and all(s == want_local for s in local_shapes), (
+        f"rank-local pivot shapes {local_shapes}, want {want_local}")
+    assert not held.ipiv.is_fully_replicated, "pivot carrier is replicated"
+    return dict(rhs1=r1, rhs2=r2, fused_rel=_rel(X2, fused),
+                pivot_global=want_global, pivot_local=want_local,
+                pivot_local_bytes=nq * ipiv_len * 8)
+
+
 def check_slate_factor_solve(mesh, dtype="complex128", nq=2, n=64, nrhs=32):
     """FIRST EXECUTION of the SLATE trsm back-solve.  Read the docstring.
 
@@ -971,6 +1022,11 @@ def test_cusolvermp_factor_solve_token_round_trip():
     check_cusolvermp_factor_solve(_needs("cholesky", "cusolvermp", "gpu"))
 
 
+def test_cusolvermp_lu_factor_solve_token_round_trip():
+    check_cusolvermp_lu_factor_solve(
+        _needs("solve_lu", "cusolvermp", "gpu"))
+
+
 def test_slate_factor_solve_first_execution():
     """The SLATE trsm back-solve, at 1x1.  Its 2x2 execution is leg L-c."""
     check_slate_factor_solve(_needs("cholesky", "slate", "cpu"))
@@ -1095,6 +1151,8 @@ _CLI_CELLS = [
      lambda mesh, dt: check_slate_factor_solve(mesh, dt)),
     ("cusolvermp_factor_solve", "CUDA",
      lambda mesh, dt: check_cusolvermp_factor_solve(mesh, dt)),
+    ("cusolvermp_lu_factor_solve", "CUDA",
+     lambda mesh, dt: check_cusolvermp_lu_factor_solve(mesh, dt)),
     ("cusolvermp_hostile_extents", "CUDA",
      lambda mesh, dt: check_hostile_extents_through_the_ffi(
          mesh, dt, backend="cusolvermp", op="solve_lu")),
