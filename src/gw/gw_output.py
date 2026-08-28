@@ -1161,7 +1161,7 @@ def write_results(
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
-    qp_solver=None,
+    qp_solver,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1229,9 +1229,11 @@ def write_results(
         Write ``qp_wfn_rotations.h5`` here.  Self-consistent runs that
         already wrote the converged SC rotation pass ``False`` so this
         post-Sigma eigensolve cannot overwrite the authoritative file.
-    qp_solver : QPSolver or str, optional
-        Resolved solver whose canonical method provenance is stamped on the
-        rotations artifact.  Omission preserves legacy unstamped behavior.
+    qp_solver : QPSolver or str
+        Resolved solver whose method provenance is stamped on the rotations
+        artifact.  Required, as on ``write_qp_wfn_oneshot`` above: a
+        defaulted ``None`` here wrote an unstamped ``qp_wfn_rotations.h5``
+        instead of refusing.  The one caller always passes it.
     """
     from file_io import (
         write_sigma_to_file,
@@ -1569,16 +1571,16 @@ def write_results(
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
-        provenance = {}
-        if qp_solver is not None:
-            from .gw_config import qp_solver_semantics
-            semantics = qp_solver_semantics(qp_solver)
-            provenance = {
-                "qp_solver": getattr(qp_solver, "value", qp_solver),
-                "qp_energy_definition": semantics.energy_definition,
-                "sigma_eval_provenance": (
-                    semantics.sigma_evaluation_provenance),
-            }
+        # No unstamped arm: the caller must pass the resolved solver, so a
+        # rotations artifact written here always names the solver.
+        from .gw_config import qp_solver_semantics
+        semantics = qp_solver_semantics(qp_solver)
+        provenance = {
+            "qp_solver": getattr(qp_solver, "value", qp_solver),
+            "qp_energy_definition": semantics.energy_definition,
+            "sigma_eval_provenance": (
+                semantics.sigma_evaluation_provenance),
+        }
         nkx, nky, nkz = kgrid
         # The service owns the (irr_idx_k, sym_idx_k, n_sym_spatial) triple
         # — ``n_sym_spatial`` from ``sym_mats_k``, not from the WFN header,
