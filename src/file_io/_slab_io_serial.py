@@ -311,20 +311,28 @@ class _SerialBackend(_DatasetGeometry):
         merely N identical writes of identical bytes).  A fully replicated
         4-device array therefore costs ONE write, not four.
         """
-        host = not isinstance(A, jax.Array)
-        slab_shape_in = tuple(int(s) for s in np.shape(A))
+        if not isinstance(A, jax.Array):
+            A = np.asarray(A)
+            host = True
+        else:
+            host = False
+        slab_shape_in = tuple(int(s) for s in A.shape)
         off, slab_shape, req_gshape = _normalize_slab_request(
             op="write_slab", name=name, offset=offset,
             slab_shape=slab_shape_in, global_shape=global_shape,
             check_bounds=False)
-        if not host:
-            # The same JAX constraint the FFI tier restates: a (shape, spec)
-            # pair that cannot form equal block shards is one JAX itself
-            # refuses to build, so name the numbers here rather than let it
-            # surface from a traced buffer.
+        # THE SAME JAX CONSTRAINT THE FFI TIER RESTATES, on exactly the
+        # cases where it has one: a (shape, spec) pair that cannot form
+        # equal block shards.  Scoped to a NamedSharding on THIS mesh
+        # because ``mesh_shape`` below is this mesh's, and reading a
+        # foreign mesh's axis indices against it would refuse a legal
+        # operand.  The FFI tier reaches the same set from the other side:
+        # it re-places a foreign-mesh operand as REPLICATED on self.mesh
+        # first, and a replicated spec makes every divisor 1.
+        if (not host and isinstance(A.sharding, NamedSharding)
+                and A.sharding.mesh is self.mesh):
             axis_count_per_dim, axis_flat = _sharding_to_axis_info(
-                A.sharding, A.ndim) if isinstance(
-                    A.sharding, NamedSharding) else ((0,) * A.ndim, ())
+                A.sharding, A.ndim)
             mesh_shape = tuple(int(self.mesh.shape[ax])
                                for ax in self.mesh.axis_names)
             _validate_block_divisible(

@@ -219,6 +219,34 @@ def test_a_replicated_write_lands_once_and_correctly(tmp_path):
 
 
 @pytest.mark.mesh(4)
+def test_a_host_numpy_operand_and_an_off_mesh_array_both_write(tmp_path):
+    """The two operands that carry no mesh sharding at all.
+
+    ``file_io.sigma_output``'s ``sigma_mnk.h5`` writer hands SlabIO host
+    arrays assembled by ``extract_and_stamp_k_irr``, and a committed
+    single-device ``jax.Array`` reaches the same door from other callers.
+    Neither has a ``NamedSharding`` on this mesh, so neither can be read
+    through the mesh's axis indices — the FFI tier re-places them as
+    replicated, this one takes their single shard.  Both must land the
+    same bytes as the host array they are.
+    """
+    mesh = _mesh(2, 2)
+    path = tmp_path / "hostops.h5"
+    host = np.arange(4 * 4, dtype=np.float64).reshape(4, 4)
+    committed = jax.device_put(jnp.asarray(host), jax.devices("cpu")[0])
+
+    with SlabIO(path, mode="w", mesh=mesh) as io:
+        io.create_dataset("H", shape=host.shape, dtype=np.float64)
+        io.write_slab("H", host)
+        io.create_dataset("D", shape=host.shape, dtype=np.float64)
+        io.write_slab("D", committed)
+
+    with h5py.File(path, "r") as f:
+        assert np.array_equal(np.asarray(f["H"][:]), host)
+        assert np.array_equal(np.asarray(f["D"][:]), host)
+
+
+@pytest.mark.mesh(4)
 def test_pad_rows_past_the_dataset_are_dropped_with_no_argument(tmp_path):
     """``write_slab`` clips to ``min(A.shape, dataset - offset)``.
 
