@@ -40,6 +40,20 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     ``docs/architecture/decisions.md`` 2026-08-01): a ``px != py`` request
     refuses rather than building a rectangular mesh.
 
+    THE SHAPE MUST CONSUME THE WHOLE DEVICE LIST — ``px * py ==
+    len(devices)``, both directions guarded (2026-08-27).  Over-request was
+    always refused; UNDER-request was not, so ``--px 2 --py 2`` on a
+    16-device job was accepted and quietly built a mesh over
+    ``devices[:4]``, leaving ranks 4..15 entering the same jit from outside
+    the mesh.  ``RuntimeStack.reshape`` (``runtime/__init__.py``) already had
+    exactly this rule; the two now cannot drift.  With the equality enforced,
+    the ``devices[: px * py]`` slice below is the identity on the list it was
+    handed.  The comparison is against the list IN PLAY, not against
+    ``jax.devices()``: a caller that deliberately passes a sub-list (the
+    process-local 1x1 controls in ``tests/``, ``create_mesh_2d([dev0])``) is
+    asserting a different job, and that is a greppable act rather than a
+    default.  A CLI never does it — its ``devices`` is ``None``.
+
     WHY THIS FUNCTION EXISTS AT ALL.  Four byte-identical
     ``_create_mesh_xy(px, py)`` bodies used to live in ``bse_w_exact``,
     ``bse_feast``, ``bse_pseudopoles`` (and, by import, ``bse_kpm``), none of
@@ -78,6 +92,24 @@ def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
     if px * py > len(devices):
         raise ValueError(
             f"Requested px*py={px*py} devices, only {len(devices)} available")
+    if px * py < len(devices):
+        import math
+        s = math.isqrt(len(devices))
+        raise ValueError(
+            f"create_mesh_xy: a {px}x{py} mesh was requested, but the device "
+            f"list in play has {len(devices)} device(s) over "
+            f"{jax.process_count()} process(es), so {len(devices) - px * py} "
+            f"of them would sit OUTSIDE the mesh.  Idle-rank truncation is "
+            f"not implemented on this stack, for the reason "
+            f"``common.collectives.resolve_mesh`` states: under the "
+            f"production transport JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi, "
+            f"communicator creation is MPI_Comm_split — collective over "
+            f"MPI_COMM_WORLD — so an out-of-mesh rank that never runs the "
+            f"warm-up jits leaves every in-mesh rank blocked in the split, "
+            f"and psum_replicate / the k-sweep gathers assume mesh size == "
+            f"process count.  Request --px {s} --py {s}, or omit --px/--py "
+            f"and get that mesh by default "
+            f"(:func:`create_mesh_xy_from_flags`).")
     # Reuse the run's canonical mesh when the request IS that mesh: since
     # the BSE drivers start with ``runtime.initialize_communicator_stack``
     # (2026-08-01), the canonical square ('x','y') mesh already exists — an
@@ -179,6 +211,57 @@ def create_mesh_2d(devices: Optional[list] = None) -> Mesh:
             f"(a {s + 1}x{s + 1} mesh) processes.")
 
     return create_mesh_xy(s, s, devices)
+
+
+def create_mesh_xy_from_flags(px: Optional[int],
+                              py: Optional[int]) -> Mesh:
+    """THE ``--px/--py`` resolution, for every BSE driver's ``main()``.
+
+    OMITTED MEANS THE RUN'S MESH.  ``px is None and py is None`` — the
+    argparse default in all five bse-family drivers since 2026-08-27 — is a
+    request for the job's canonical square mesh, i.e. exactly what
+    ``runtime.initialize_communicator_stack`` already built and announced in
+    the startup receipt.  It used to mean ``1x1``: ``--px``/``--py``
+    defaulted to ``1``, so ``python -m bse.bse_jax -i deck.in`` with no flags
+    ran the whole solve on ONE device of a four-GPU node (three idle, no
+    warning) and, at P>1, built a mesh over ``jax.devices()[:1]`` — process
+    0's device on every rank — which every rank >= 1 then refuses in
+    ``collectives._require_addressable``.  Every launch recipe in-tree
+    hard-codes ``--px 2 --py 2`` (``tests/fast_gate.py``,
+    ``tests/test_bse_bgw_regression.py``,
+    ``tests/multi_device/restart_q_storage_ab.sh``) — that is the shape of a
+    default nobody can rely on.
+
+    A GIVEN SHAPE IS AN ASSERTION, NOT A REQUEST.  Both must be given
+    together, and :func:`create_mesh_xy` then refuses anything that is not
+    square and does not consume the job.  What survives both guards IS the
+    canonical shape, so the returned object is the canonical mesh by
+    IDENTITY (``resolve_mesh``'s ``_CANONICAL_MESHES`` cache), not an
+    equal-but-distinct twin — which is the property that matters, because
+    ``Mesh.__eq__`` is true for twins while the shape-keyed jit caches key on
+    the mesh OBJECT embedded in each ``NamedSharding``.
+
+    The ``None`` arm goes through :func:`create_mesh_2d`, not through a bare
+    ``resolve_mesh()``, because ``bse_feast`` / ``bse_w_exact`` / ``bse_kpm``
+    / ``bse_pseudopoles`` call only ``runtime.bootstrap()`` and hold no
+    ``RuntimeStack``: for them a bare resolve would hand back an UNWARMED
+    mesh and drop both :func:`common.collectives.prepare_mesh`'s cliques and
+    the :func:`_warm_process_allgather` warm-up this module documents (32
+    refusals at P=16, job 7881216; 4-of-4 cells at P=16, job 7882523).  Same
+    object either way; only the warm-up differs.
+
+    Collective: every rank must reach this together.
+    """
+    if (px is None) != (py is None):
+        raise ValueError(
+            f"create_mesh_xy_from_flags: --px and --py must be given "
+            f"together (got px={px!r}, py={py!r}).  Omit BOTH to run on the "
+            f"job's canonical square mesh, or give both — and then they must "
+            f"name that same mesh, because a partial mesh strands the ranks "
+            f"outside it (see create_mesh_xy).")
+    if px is None:
+        return create_mesh_2d()
+    return create_mesh_xy(int(px), int(py))
 
 
 def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
