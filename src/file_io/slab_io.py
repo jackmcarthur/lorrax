@@ -44,7 +44,18 @@ There used to be three, selected by a ``slab_io`` deck key through an
   fallback — the correct response to a stale ``.so`` is a refusal naming
   it, which is the repo-wide contract (CLAIMS 81).  DELETED.
 
-So there is no ``backend=`` argument, no ``use_ffi_io=`` argument, no
+THE ONE EXCEPTION, AND IT IS NOT A CHOICE (2026-08-27).  An EMULATED mesh
+— ``common.collectives.mesh_is_emulated``: more mesh cells than processes,
+i.e. ``P == 1`` under ``--xla_force_host_platform_device_count`` — has no
+per-process MPI world for the phdf5 transport to derive a per-rank
+hyperslab from, so ``ffi.io.open_file`` refuses it by name and must keep
+doing so.  For that ONE geometry :meth:`SlabIO.__init__` constructs
+``_slab_io_serial._SerialBackend`` instead: single-process h5py, one shard
+at a time, selectable only at ``P == 1`` and refusing above it.  Read
+``file_io._slab_io_serial`` for why that is not the allgather tier coming
+back; the caller states nothing and no call site changes.
+
+So there is still no ``backend=`` argument, no ``use_ffi_io=`` argument, no
 ``SlabIOBackend`` enum, and no ``slab_io`` deck key.  A deployment that
 cannot serve the tile path REFUSES at open, naming the probe that
 declined and the repair for that probe — :func:`assert_available` is
@@ -100,6 +111,8 @@ from typing import Sequence
 import numpy as np
 import jax
 
+from common.collectives import mesh_is_emulated
+
 from . import h5_journal as _journal
 from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
                            probe_availability, probe_read_availability)
@@ -140,7 +153,12 @@ class SlabIO:
     * :func:`assert_available` — a deployment that cannot serve the tile
       path refuses HERE, naming the probe that declined.  It is called
       for you; a caller invoking it directly is doing a pre-flight, not
-      meeting a requirement.
+      meeting a requirement.  On an EMULATED mesh the serial tier is
+      constructed instead and this probe is not reached: that tier needs
+      no phdf5 library because it opens no collective handle.  Which tier
+      you got is one line in the log (``debug_print_enabled``), and the
+      predicate is ``common.collectives.mesh_is_emulated`` — not a
+      fallback, not a capability probe, not an argument.
     * ``mode="w"`` REPLACES the inode (rank-0 unlink + barrier).  A
       Lustre layout is fixed at inode create, so ``H5Fcreate(TRUNC)``
       over an old file would silently keep its stripe count.  ``"a"`` and
@@ -173,7 +191,21 @@ class SlabIO:
         # writes a third naming the ownership verdict the open walked
         # into.  Three facts, three lines, one per choke point.
         try:
-            self._backend = _FfiBackend(self.path, mesh=mesh, mode=mode)
+            # THE ONE TIER DECISION, taken from a PREDICATE before any
+            # transport runs — never from a transport that failed.  An
+            # emulated mesh (P == 1, more mesh cells than processes) has no
+            # per-process MPI world to derive a per-rank hyperslab from, so
+            # ``ffi.io.open_file`` refuses it and is right to; the serial
+            # tier is the second door for that one geometry, and it moves
+            # only shards this single process already owns.  See
+            # ``_slab_io_serial`` for why this is not the tier deleted in
+            # 2026-08-06, and ``tests/test_slab_io_emulated_mesh.py`` for
+            # the cell proving the FFI door still refuses.
+            if mesh_is_emulated(mesh):
+                from ._slab_io_serial import _SerialBackend
+                self._backend = _SerialBackend(self.path, mesh=mesh, mode=mode)
+            else:
+                self._backend = _FfiBackend(self.path, mesh=mesh, mode=mode)
         except BaseException as exc:
             _journal.fail("open", self.path, exc, stack=_STACK, mode=mode)
             raise

@@ -157,8 +157,14 @@ _L3_MODULES = frozenset({
     # function-local for that cycle.  Its only other ``src/`` import is
     # ``common.collectives.process_rank`` (L3), for the rank in the
     # filename.
-    "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
-    "file_io.hdf5_owner", "file_io.h5_journal",
+    #
+    # ``file_io._slab_io_serial`` is the transport's emulated-mesh tier
+    # (``P == 1`` with more mesh cells than processes).  Its whole subject
+    # is which devices a single process owns and which hyperslab each of
+    # them holds — process/device/file facts, the same ones
+    # ``_slab_io_ffi`` is made of — so it sits beside it and not above it.
+    "file_io.slab_io", "file_io._slab_io_ffi", "file_io._slab_io_serial",
+    "file_io.paths", "file_io.hdf5_owner", "file_io.h5_journal",
 })
 #: Whole packages at L3.  Two of the three services are here for the same
 #: reason ``ffi`` is: their entire subject is devices, meshes, processes,
