@@ -255,10 +255,23 @@ def main(argv=None):
 	# remains at the post-Sigma seam as an invariant against future routing drift.
 	if qp_solver is QPSolver.SELF_CONSISTENT and mode.is_dynamic:
 		raise ValueError(
-			"self-consistent dynamic EQP output is not basis-consistent: H and "
-			"Sigma_x would be dft_band while the full C(omega) operator remains "
-			"qp_band. Rotate the full correlation operator before running this "
-			"combination.")
+			"REFUSED: qp_solver=self_consistent beside a dynamic compute_mode.\n"
+			f"  got:  qp_solver={qp_solver.value}, compute_mode={mode.value}\n"
+			"  want: self_consistent with a STATIC compute_mode (cohsex), or a "
+			"dynamic compute_mode with qp_solver=one_shot_dft / fixed_point\n"
+			"  why:  the SC finalize rotates V_H / Sigma_x / Sigma_xc / "
+			"Sigma_SX / Sigma_COH to dft_band (gw/sc_iteration.py) and "
+			"leaves the C(omega) cube in qp_band by design, because the "
+			"QSGW ansatz only holds in the basis whose eigenvalues it uses "
+			"(gw.sigma_dispatch.SIGMA_BASIS_FIELDS). Their diagonals add up "
+			"only at U = identity.\n"
+			"  fix:  rotate the correlation operator for output, then delete "
+			"this guard, its twins at the post-Sigma seam and in "
+			"gw_output.write_results, and the qp_solver rows in "
+			"docs/input_reference.md and docs/drivers.md together.\n"
+			"  doc:  tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two "
+			"bases on the self-consistent path'; "
+			"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md")
 	do_screened = mode.needs_screening
 	print0(
 		f"  Head policy: head_correction={config.head.correction.value}; "

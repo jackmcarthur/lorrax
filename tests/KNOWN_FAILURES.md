@@ -1065,10 +1065,26 @@ which is deliberate.
 The defect is downstream: `compute_eqp_diag` forms
 `Δ = kin_ion + V_H + Σ_x + Σ_c(E_DFT) − E_DFT` from three DFT-basis
 diagonals plus that one QP-basis diagonal.  The sum is basis-consistent
-only at U = identity.  `write_results` is unguarded, so both files are
-written on the SC path (unlike `eqp_g0w0.dat`, guarded at
-`gw_output.py:846`).  The same mixing reaches `sigma_xc_at_dft_ev`
+only at U = identity.  The same mixing reaches `sigma_xc_at_dft_ev`
 (`gw_jax.py:600-603`).
+
+FAIL-CLOSED SINCE 2026-08-25, which is a refusal and not a fix.  Upstream
+`92130176` (here as `44ee0dfa`) added guards at driver entry and at the
+post-Σ seam, and `9d79b6c` (`6fafd126`) a third in `write_results`, so
+`qp_solver = self_consistent` beside a dynamic `compute_mode` now raises
+before screening instead of writing two files that mix bases.  Static SC
+(`cohsex`) is untouched.  The measurement above is still owed: nothing has
+bounded the error, so the combination is refused, not known-bad.
+
+What the removal costs: `tests/regression/gnppm_debug/gnppm_sc.in` is the
+tree's only self-consistent deck and now raises at driver entry, and its
+`gnppm_sc_session` fixture (`tests/conftest.py:845`) had no consumer, so
+nothing turned red.  `tests/test_qp_solver_config.py`'s
+`test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses` is the
+tombstone: it reads that deck, checks it still declares the refused pair,
+and AST-checks the guard, so restoring the capability fails there and takes
+the doc rows with it.  Details:
+`docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md`.
 
 The error scales with ‖U − 1‖ and NO ONE HAS MEASURED IT.  To measure:
 read `U_mnk` from an SC run's `qp_wfn_rotations.h5`, report the largest
