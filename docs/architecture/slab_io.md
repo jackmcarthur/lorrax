@@ -59,6 +59,13 @@ Consequences that follow directly, and that callers must not work around:
 
 **Since 2026-08-06 the contract is enforced by construction rather than by
 a check: there is one transport, so there is nothing else to select.**
+One geometry is served by a second backend and it is still not a choice:
+on an EMULATED mesh (`common.collectives.mesh_is_emulated` — `P == 1` with
+more mesh cells than processes) `ffi.io.open_file` refuses, correctly, and
+`SlabIO` constructs `file_io._slab_io_serial._SerialBackend` instead. It
+moves one shard at a time, takes no argument, refuses above one process,
+and announces itself; see that module's docstring for why it is not the
+tier deleted below.
 
 ### What a caller may assume, and what it may not {#may-assume}
 

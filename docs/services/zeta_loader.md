@@ -95,8 +95,11 @@ plan and the g0_mu append. There is no backend switch and nothing to
 demote to: a stack without the phdf5 FFI serves the whole header/format
 surface and refuses collective reads by name. The transport carries a
 per-PROCESS MPI context, so a mesh handed to the loader must satisfy
-`p*q == jax.process_count()` — emulated multi-device meshes are refused
-by the FFI itself. Declared package deps are lxkit, jax, numpy, h5py;
+`p*q == jax.process_count()` — the FFI itself refuses anything else, and
+since 2026-08-27 `SlabIO` serves the one exception (an EMULATED mesh,
+`P == 1` with more cells than processes) through
+`file_io._slab_io_serial`, which is single-process h5py and refuses above
+one process. Declared package deps are lxkit, jax, numpy, h5py;
 `file_io.slab_io`, `file_io.mf_header`, `file_io.isdf_header` and
 `common.gvec_fft_box` are reached through call-time imports that refuse
 by name — the wave-1b seam (they become package deps when
@@ -176,6 +179,10 @@ page-cache-warm, so compare rows to rows, not bands to bands).
   lives in `format.py`, once. A new copy is a future silent-pass.
 - **Adding a `zeta_rcond` mirror.** Import `ZETA_RCOND_DEFAULT` from
   `gw.gw_config`; the AST ratchet fails a literal default.
-- **Handing the transport an emulated multi-device mesh.** The FFI
-  refuses `p*q != process_count` — build the mesh from the process
-  count, and get 2×2 claims from a real `srun -n 4` leg.
+- **Quoting an emulated multi-device mesh as a 2×2 result.** The FFI
+  refuses `p*q != process_count`; `SlabIO` serves that geometry through
+  its serial tier instead, so a loader call on an emulated 2×2 now RUNS
+  and its numbers are real. What it is not is a P=4 claim — an emulated
+  run serialises the process-parallel k sweep onto one process and writes
+  serially. Build the mesh from the process count, and get 2×2 scaling
+  and collective-transport claims from a real `srun -n 4` leg.
