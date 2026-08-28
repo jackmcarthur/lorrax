@@ -508,3 +508,126 @@ def test_qe_simpsn_weights_match_upflib_conventions():
     w8 = _qe_simpsn_weights(8)
     assert w8[7] == 0.0
     assert np.allclose(w8[:7], w7)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-28 follow-up: the SAME QE schemes on the scf-potential lane
+# (build_ionic_and_core / scf_potential — LORRAX's own NSCF solver path).
+# The kih-producer port left radial_tables.alpha_z and the
+# build_all_tables vloc/nlcc rows on full-mesh generic-Simpson weights;
+# these tests pin the ported scheme with independent references and carry
+# the old scheme as a red twin, exactly like the producer-lane tests above.
+# QE references: upflib/vloc_mod.f90 init_tab_vloc (q>0 AND q=0 branches),
+# upflib/rhoc_mod.f90 init_tab_rhc — both integrate DO ir = 1, msh.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _staged_upfs(), reason="no staged Si UPFs")
+@pytest.mark.parametrize("tag,path", _staged_upfs())
+def test_alpha_z_uses_qe_msh_scheme_and_full_mesh_simpson_fails(tag, path):
+    from scipy.integrate import simpson as scipy_simpson
+
+    from psp.radial_tables import (_simpson_weights, alpha_z,
+                                   qe_vloc_radial_scheme)
+    from psp.species import extract_species
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+
+    sp, = extract_species({"Si": normalize_dataclass(load_upf(path))})
+    r, rab, v, z = sp.r, sp.rab, sp.vloc_r, sp.z_valence
+    e2 = 2.0
+    vol = 270.1071612068362                  # Si 4x4x4 deck cell volume
+
+    msh, _w = qe_vloc_radial_scheme(r, rab)
+    f = r * (r * v + z * e2)
+    ref = float(scipy_simpson(f[:msh], x=r[:msh]))
+    got = alpha_z(sp, vol) * vol / (4.0 * np.pi)
+    assert abs(got - ref) < 1e-10
+
+    # RED TWIN: the pre-port scheme — generic Simpson over the FULL mesh —
+    # keeps the r > 10 tail where tabulated vloc deviates from -Z e2/r:
+    # measured |old-ref| = 6.4e-7 (SR) / 5.4e-5 (FR) Ry*bohr^3, i.e.
+    # -0.0008 / +0.0680 meV on every KIH diagonal of this deck.
+    old = float(np.sum(f * _simpson_weights(len(r)) * rab))
+    assert abs(old - ref) > 1e-7
+
+
+@pytest.mark.skipif(not _staged_upfs(), reason="no staged Si UPFs")
+@pytest.mark.parametrize("tag,path", _staged_upfs())
+def test_vloc_nlcc_tables_use_qe_msh_scheme_and_full_mesh_fails(tag, path):
+    import dataclasses
+
+    from scipy.special import erf as scipy_erf, spherical_jn
+
+    from psp.radial_tables import (_simpson_weights, build_all_tables,
+                                   core_charge_table, qe_vloc_radial_scheme,
+                                   vloc_sr_table)
+    from psp.species import extract_species
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+
+    sp, = extract_species({"Si": normalize_dataclass(load_upf(path))})
+    r, rab = sp.r, sp.rab
+    e2 = 2.0
+    # Synthetic core charge with FULL-mesh support: the real Si rho_core
+    # is identically zero beyond ~r=6, so truncation cannot show on it —
+    # this row exists to prove the nlcc integral runs the msh scheme.
+    sp_syn = dataclasses.replace(sp, rho_core_r=1.0 / (1.0 + r * r),
+                                 has_nlcc=True)
+    tables = build_all_tables([sp, sp_syn], q_max=5.0, n_q=101)
+    q = tables["q"]
+
+    msh, w_qe = qe_vloc_radial_scheme(r, rab)
+    w_old = _simpson_weights(len(r)) * rab
+
+    # vloc row at a low-q grid point (largest tail sensitivity)
+    safe_r = np.where(r > 0, r, 1.0)
+    a = sp.vloc_r + sp.z_valence * e2 * np.where(
+        r > 0, scipy_erf(r) / safe_r, 2.0 / np.sqrt(np.pi))
+    iq = 10
+    g = spherical_jn(0, q[iq] * r) * r * r * a
+    ref = float(np.sum(g[:msh] * w_qe))
+    old = float(np.sum(g * w_old))
+    assert abs(tables["vloc"][0, iq] - ref) < 1e-12
+    # RED TWIN: full-mesh generic Simpson misses by 4.8e-7 (SR) /
+    # 2.1e-6 (FR) — the scf-lane sibling of the producer's vloc defect.
+    assert abs(old - ref) > 1e-7
+
+    # nlcc row (synthetic full-support core charge)
+    for iq in (10, 60):
+        g = spherical_jn(0, q[iq] * r) * r * r * sp_syn.rho_core_r
+        ref = float(np.sum(g[:msh] * w_qe))
+        old = float(np.sum(g * w_old))
+        assert abs(tables["nlcc"][1, iq] - ref) < 1e-12
+        # RED TWIN: 6.6e-2 / 9.3e-4 — the msh truncation is load-bearing.
+        assert abs(old - ref) > 1e-4
+
+    # The numpy twins (vloc_sr_table / core_charge_table) must match the
+    # batched JAX rows: two independent Bessel implementations (scipy vs
+    # the Miller-recurrence kernel), one quadrature convention.
+    assert np.max(np.abs(vloc_sr_table(sp, q) - tables["vloc"][0])) < 1e-10
+    assert np.max(np.abs(core_charge_table(sp, q) - tables["nlcc"][0])) < 1e-10
+
+
+@pytest.mark.skipif(not _SR_SI.exists(), reason=f"{_SR_SI} not staged")
+def test_projector_numpy_twins_match_batched_tables():
+    """projector_table / projector_deriv_table (kkbeta scheme) against the
+    batched build_all_tables rows — scipy Bessel vs the JAX Miller kernel,
+    one quadrature convention.  Guards the twins against future drift."""
+    from psp.radial_tables import (build_all_tables, projector_deriv_table,
+                                   projector_table)
+    from psp.species import extract_species
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+
+    sp, = extract_species({"Si": normalize_dataclass(load_upf(_SR_SI))})
+    tables = build_all_tables([sp], q_max=5.0, n_q=101)
+    q = tables["q"]
+    F = tables["proj_tables"][0]
+    H = tables["deriv_tables"][0]
+
+    for ip in range(sp.n_proj):
+        l = int(sp.proj_l[ip])
+        assert np.max(np.abs(projector_table(sp, ip, q) - F[ip])) < 1e-10
+        D_ref = -H[ip].copy() if l == 0 else np.concatenate(
+            [[0.0], -H[ip][1:] / q[1:] ** l])
+        assert np.max(np.abs(projector_deriv_table(sp, ip, q) - D_ref)) < 1e-10

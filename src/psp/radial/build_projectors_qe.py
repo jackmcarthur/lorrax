@@ -32,6 +32,12 @@ from .radial_jax import (
     make_uniform_q_grid,
     radial_weights,
 )
+# The QE radial quadrature schemes have ONE owner: psp.radial_tables.
+# (No cycle: radial_tables imports psp.species + psp.radial.radial_jax only.)
+from psp.radial_tables import (
+    qe_beta_radial_scheme as _qe_beta_radial_scheme,
+    qe_vloc_radial_scheme as _qe_vloc_radial_scheme,
+)
 
 # Self-contained: provide local implementations of helpers previously imported
 
@@ -357,44 +363,6 @@ def spherical_hankel_transform_l_np(l: int,
     return _spherical_hankel_transform_l(l, r, beta_r, q, rab)
 
 
-def _qe_vloc_radial_scheme(
-    r: np.ndarray,
-    rab: np.ndarray | None,
-) -> Tuple[int, np.ndarray]:
-    """QE's radial quadrature for local-potential integrals: (msh, weights).
-
-    Matches QE exactly (verified against QE 7.4 sources):
-    - Modules/read_pseudo.f90:175-186 — the integration mesh is truncated at
-      ``rcut = 10`` bohr (msh = 1-based index of the first r > 10, or the full
-      mesh) and then FORCED ODD: ``msh = 2*((msh+1)/2) - 1``.
-    - upflib/simpsn.f90 — composite-Simpson weights 1/3, 4/3, 2/3, ..., 4/3,
-      1/3 on the (odd) truncated mesh, times ``rab``.
-
-    A bare ``rab`` (rectangle-rule) weighting is NOT equivalent: by
-    Euler–Maclaurin its error against Simpson is ~ -(h²/12)·f'(0), and the
-    alpha-Z integrand r·(r·V_loc + Z·e²) has f'(0) = Z·e² exactly — a
-    pseudo-independent, band-independent constant that showed up as a
-    -0.08 meV offset on every KIH diagonal (Si, h = 0.01).  The full-mesh
-    tail (r > 10, where tabulated vloc deviates from -Z·e²/r in the last
-    digits) added a further pseudo-DEPENDENT constant (+0.068 meV for the
-    FR Si pseudo).  Both vanish with QE's scheme.
-    """
-    r = np.asarray(r, dtype=float)
-    n = len(r)
-    above = np.nonzero(r > 10.0)[0]
-    msh = int(above[0]) + 1 if above.size else n     # 1-based, as in QE
-    msh = 2 * ((msh + 1) // 2) - 1                   # forced odd
-    w = np.ones(msh, dtype=np.float64)
-    w[1:-1:2] = 4.0 / 3.0
-    w[2:-1:2] = 2.0 / 3.0
-    w[0] = w[-1] = 1.0 / 3.0
-    if rab is not None:
-        w *= np.asarray(rab, dtype=float)[:msh]
-    else:
-        w *= float(r[1] - r[0]) if n > 1 else 1.0
-    return msh, w
-
-
 def _fourier_transform_vloc_qe(
     r: np.ndarray,
     rab: np.ndarray | None,
@@ -438,7 +406,7 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
     qmax = float(np.max(K_norm)) if K_norm.size > 0 else 0.0
     q_points = max(1024, 2 * len(r))
     q_grid = make_uniform_q_grid(qmax, q_points)
-    weights = radial_weights(r, rab, scheme='rab')
+    kkb, weights = _qe_beta_radial_scheme(r, rab, _kkbeta_of(betas, len(r)))
     result: Dict[Tuple[int, int], np.ndarray] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
@@ -449,9 +417,20 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        tab = make_projector_table(l, r, beta_r, q_grid, weights)
+        tab = make_projector_table(l, r[:kkb], beta_r[:kkb], q_grid, weights)
         result[(l, idx)] = tab(K_norm)
     return result
+
+
+def _kkbeta_of(betas, n_r: int) -> int:
+    """QE's ``upf%kkbeta`` from raw UPF beta objects: max cutoff_radius_index
+    over the betas, full mesh when the UPF carries none.  Twin of the
+    ``SpeciesData.kkbeta`` extraction in ``psp.species.extract_species``."""
+    kkb = 0
+    for beta in betas:
+        kb = getattr(beta, 'cutoff_radius_index', None)
+        kkb = max(kkb, int(kb) if kb else n_r)
+    return min(kkb, n_r) if betas else n_r
 
 
 # Removed: build_species_rows_qe (not used by production pipeline)
@@ -1145,7 +1124,7 @@ def precompute_projector_tables(
     if q_points is None:
         q_points = max(2048, 2 * len(r))
     q_grid = make_uniform_q_grid(float(q_max), q_points)
-    weights = radial_weights(r, rab, scheme='rab')
+    kkb, weights = _qe_beta_radial_scheme(r, rab, _kkbeta_of(betas, len(r)))
     tables: Dict[Tuple[int, int], RadialTable] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
@@ -1156,7 +1135,8 @@ def precompute_projector_tables(
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        tables[(l, idx)] = make_projector_table(l, r, beta_r, q_grid, weights)
+        tables[(l, idx)] = make_projector_table(l, r[:kkb], beta_r[:kkb],
+                                                q_grid, weights)
     return tables
 
 

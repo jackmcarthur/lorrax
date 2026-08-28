@@ -96,12 +96,25 @@ before implementing.
    an analytic Fourier expression (V_pert ≡ 1 → only G=0 component
    survives).  Save: 1-2 of the 12 FFT plan-find compiles, ~0.3 s.
 
-3. **`compute_dZ=True` velocity path is still eager.**
-   `_build_vnl_kdata_core` keeps the `compute_dZ=True` block on numpy
-   because of a per-channel Python loop.  Vectorise the dZ assembly
-   along the same lines as `_assemble_Z_jit` so `get_dipole_mtxels`
-   benefits from the same compile-once batched path.  Save: per-k
-   dipole compute on cold start; small but consistent.
+3. **`compute_dZ=True` velocity path is still eager — MEASURED, patch
+   banked, NOT shipped (2026-08-28: it is an ulp change).**
+   `_build_vnl_kdata_core` keeps the `compute_dZ=True` block eager
+   because of a per-channel Python loop that re-traces three `jax.jvp`s
+   through the solid harmonics on EVERY k.  Measured on the Si 4×4×4 SR
+   deck (CPU x64, ngkmax=588, total_R=36): **48.9 ms/k** eager steady
+   state vs **0.70 ms/k** for the `compute_dZ=False` twin — ~3.1 s over
+   a 64-point full-BZ sweep, growing with nk and channel count.
+   A module-scope jit (`_assemble_Z_dZ_jit`, static per-channel
+   metadata, loop unrolled at trace) gets **1.31 ms/k** (37×) and cuts
+   first-call 1300→453 ms — but XLA fusion moves ~26 % of Z/dZ elements
+   by ≤1.4e-16 (1-ulp class; this project has seen a 1-ulp einsum change
+   flip a pivoted-Cholesky pivot), so it is an OWNER DECISION, not a
+   perf patch.  The finished, bitwise-compared patch + evidence live in
+   the 2026-08-28 session scratchpad (`taskB/dz_jit_candidate.patch`).
+   Note the `mtxel_sweep` dipole path already runs this math traced
+   (inside `lax.scan`), so only the eager consumers are affected:
+   `get_dipole_mtxels.compute_vnl_velocity_cart`, its finite-q SOS
+   loop, and `orbital_magnetization`.
 
 4. **Reconsider Schur warm-start cost-benefit.**
    On MoS₂ 3×3 with α_pv shift, Schur saves ~10 % iterations

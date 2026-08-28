@@ -27,7 +27,6 @@ from psp.radial.build_projectors_qe import (
 )
 from psp.radial.radial_jax import differentiate_uniform_table
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
-from psp.radial_tables import projector_deriv_table as _projector_deriv_table
 
 
 # ---------------------------------------------------------------------------
