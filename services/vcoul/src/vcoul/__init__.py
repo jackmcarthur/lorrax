@@ -59,6 +59,12 @@ WHO CALLS WHAT
     the true mini-lattice Wigner--Seitz polygon, fixed 16/24/32 Duffy--Gauss
     ladder, cell volume, reciprocal lattice/k-grid identity, normalized
     weights, and physical/padded solve counts.
+``bulk_minibz_photon_cubature(kernel, geometry, kgrid)``
+    The provider-only arbitrary-3D analogue: an exact mini-lattice WS
+    polyhedron triangulated into centrally paired origin tetrahedra.  Its
+    fixed 8/12/16 Duffy--Gauss payloads stream through
+    ``iter_bulk_minibz_photon_cubature`` at one fixed padded chunk shape;
+    no screened Dyson implementation lives in this service.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -110,12 +116,16 @@ from vcoul.quadrature import (
     gauss_legendre_interval,
 )
 from vcoul.minibz import (
+    BulkMinibzPhotonReceipt,
     COULOMB_GAUGE_TT_SIGN,
     SlabMinibzPhotonReceipt,
     apply_transverse_projector,
     transverse_projector,
     build_miniBZ_dq_cart,
     build_v_head_miniBZ_fn_3d,
+    bulk_minibz_photon_cubature,
+    iter_bulk_minibz_photon_cubature,
+    validate_bulk_minibz_photon_receipt,
     minibz_average,
     minibz_cell_affine,
     minibz_frac_to_cart,
@@ -153,6 +163,7 @@ __all__ = [
     "GAUSS_LEGENDRE_INTERVAL_PROVENANCE", "gauss_legendre_interval",
     # mini-BZ sampling / averaging
     "COULOMB_GAUGE_TT_SIGN",
+    "BulkMinibzPhotonReceipt",
     "SlabMinibzPhotonReceipt",
     "apply_transverse_projector",
     "transverse_projector",
@@ -160,6 +171,9 @@ __all__ = [
     "sample_minibz_qpoints", "minibz_inscribed_sphere_r2",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "iter_minibz_photon_samples",
+    "bulk_minibz_photon_cubature",
+    "iter_bulk_minibz_photon_cubature",
+    "validate_bulk_minibz_photon_receipt",
     "slab_minibz_photon_cubature",
     "validate_slab_minibz_photon_receipt",
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",

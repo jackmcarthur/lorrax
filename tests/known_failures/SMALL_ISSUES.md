@@ -775,6 +775,14 @@ silent overwrite.
 
 ## Fixed (strike-in-place graveyard — newest first)
 
+- **The vcoul import-isolation door-count pin was eight exports stale** —
+  **FIXED on `feat/vcoul-3d-ws-cubature-2026-08-28`.** At the pinned base
+  `3b942f7d`, `vcoul.__all__` contains 42 names while
+  `test_vcoul_import_isolation.py` still asserts 34; both facts are read
+  directly from that commit, so this predates the arbitrary-3D provider.
+  The provider adds exactly four door names, and the pin now asserts 46 in
+  the same change. This is test bookkeeping only; no Coulomb value is involved.
+
 - **Row 38** (`centroid/pivoted_cholesky.py` imports `wfn_loader` at module
   scope for annotations that are never evaluated) — **TAKEN AND FIXED** on
   `feat/downfold-orbit-floor-2026-08-10`, 2026-08-10, branch pushed and NOT

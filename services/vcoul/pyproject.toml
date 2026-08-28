@@ -8,13 +8,11 @@ version = "0.1.0"
 description = "The bare and truncated Coulomb interaction as pure math: v(q+G) for 3D bulk / 2D slab / 0D box, mini-BZ Voronoi head averaging, the bare-Coulomb sphere predicate, and BerkeleyGW vcoul-file parity"
 requires-python = ">=3.12"
 
-# THE QUARANTINE, DECLARED.  scipy is NOT here: it is optional, it is
-# reached from exactly one function (`minibz_voronoi_batches`, for the
-# scrambled-Sobol generator), and it sits behind an announce-or-refuse
-# gate — `method="sobol"` REFUSES without it, `method="auto"` demotes and
-# says so once, `method="uniform"` never asks.  An installed vcoul on a
-# machine with no scipy imports fine, computes every v(q+G) and every
-# uniform-draw head, and refuses exactly one generator by name.
+# THE QUARANTINE, DECLARED.  scipy is NOT here: it is optional and reached
+# only inside the scrambled-Sobol generator and the explicit exact-3D-WS
+# provider.  Both refuse by name when requested without it; importing vcoul,
+# every v(q+G), every uniform-draw head, and the exact slab provider remain
+# available without scipy.
 #
 # Unlike lxkit, `import vcoul` DOES import jax, and that is correct rather
 # than a concession: `wrap_points_to_voronoi` is a jitted kernel and the
@@ -34,7 +32,8 @@ dependencies = ["numpy", "jax"]
 # production numbers; without it, `method="auto"` demotes to a uniform
 # draw with nsamples raised to 2.5e6 and announces once.
 sobol = ["scipy>=1.16.0"]
-test = ["pytest>=8.0.0", "numpy", "lxkit"]
+exact_ws = ["scipy>=1.16.0"]
+test = ["pytest>=8.0.0", "numpy", "scipy>=1.16.0", "lxkit"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
