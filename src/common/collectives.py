@@ -92,6 +92,7 @@ __all__ = [
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
     "single_device_mesh",
+    "mesh_is_emulated",
     "prepare_mesh",
     # staging a host table onto a mesh, without a collective
     "device_put_process_local",
@@ -360,6 +361,47 @@ def single_device_mesh():
             np.asarray(jax.local_devices()[:1]).reshape(1, 1),
             axis_names=('x', 'y'))
     return _PROCESS_LOCAL_MESH
+
+
+def mesh_is_emulated(mesh) -> bool:
+    """True when ``mesh`` spans more devices than this run has processes.
+
+    ``mesh.devices.size > 1 and process_count() == 1`` — one process
+    owning every cell of a multi-device mesh, which is what
+    ``--xla_force_host_platform_device_count=N`` produces and what a real
+    ``srun -n N`` never does.
+
+    THE PREDICATE READS ``process_count()``, NOT THE XLA FLAG, and that is
+    load-bearing in both directions: a real ``-n 4`` leg sets no flag and
+    must never be labelled emulated, and a flagged single-process run must
+    never be labelled real.  Same spelling as
+    ``services/symmetry_maps/bench/bench_symmetry_maps.py``, whose ``emulated``
+    column states it per row for the same reason.
+
+    WHAT IT IS FOR.  A mesh cell is a per-DEVICE thing; an MPI/NCCL/HDF5
+    context is a per-PROCESS thing.  Every transport that bootstraps one
+    context per mesh cell (``ffi.io.open_file``, ``ffi.cublasmp.batched``,
+    ``distrib_la._slate``) therefore requires ``p*q == process_count()`` and
+    REFUSES an emulated mesh — correctly, since all N devices would share
+    rank 0's hyperslab or communicator.  A component with a serial tier
+    (``wfn_loader``'s ``eager``, ``file_io._slab_io_serial``) asks this
+    instead, and selects the tier that needs no per-cell context.  It is a
+    tier PREDICATE, never a fallback trigger: nothing may call it after a
+    transport has failed.
+
+    ``False`` at ``P=1/D=1`` (nothing to emulate) and at every ``P>1``,
+    including the misconfiguration where one of several processes was
+    handed extra devices — that one is a refusal at the transport, not a
+    tier-down here.
+    """
+    try:
+        size = int(mesh.devices.size)
+    except AttributeError as exc:
+        raise TypeError(
+            f"mesh_is_emulated: expected a jax.sharding.Mesh, got "
+            f"{type(mesh).__name__} — the predicate reads mesh.devices.size "
+            f"against process_count()") from exc
+    return size > 1 and process_count() == 1
 
 
 def prepare_mesh(mesh=None, *, axis_names=("x", "y"), print_fn=print):
