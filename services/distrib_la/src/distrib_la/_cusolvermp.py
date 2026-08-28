@@ -417,6 +417,15 @@ class CusolverMpBatchedLU:
     nbatch: int
 
 
+def _ipiv_local_len(n: int, Px: int, mb: int) -> int:
+    """Return cuSOLVERMp's local ``LOCr(M_A) + MB_A`` pivot extent.
+
+    This wrapper admits only matrix extents divisible by ``Px`` and uses
+    one block row per process row, so ``LOCr(M_A) == n // Px``.
+    """
+    return n // Px + mb
+
+
 def batched_distributed_getrf(
     A: jax.Array,
     *,
@@ -440,7 +449,7 @@ def batched_distributed_getrf(
     loader.get_lib("CUDA")
     ctx_handle = get_or_init_context(mesh, col_major=False)
     mb, nb = n // Px, n // Py
-    ipiv_len = nb
+    ipiv_len = _ipiv_local_len(n, Px, mb)
     key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb,
            int(ctx_handle))
     jit_getrf = _JIT_CACHE.get(key)
@@ -494,7 +503,7 @@ def batched_distributed_getrs(
     loader.get_lib("CUDA")
     ctx_handle = get_or_init_context(mesh, col_major=False)
     mb_b, nb_b = LU.mb, nrhs // Py
-    ipiv_len = LU.nb
+    ipiv_len = _ipiv_local_len(LU.n, Px, LU.mb)
     key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, nrhs,
            LU.mb, LU.nb, mb_b, nb_b, int(ctx_handle))
     jit_getrs = _JIT_CACHE.get(key)

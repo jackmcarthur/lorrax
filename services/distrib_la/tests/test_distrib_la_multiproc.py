@@ -286,8 +286,8 @@ def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
 
     The second RHS uses the same opaque token and is compared against the
     incumbent fused handler.  The internal handle is inspected only here to
-    prove every process owns ``n/Py`` pivots per q: the global carrier has
-    ``P*n/Py = Px*n`` entries per q, not ``P*n`` replicated entries.
+    prove every process owns ``LOCr(M_A)+MB_A = 2*n/Px`` pivots per q:
+    the carrier remains rank-private rather than replicating a global pivot.
     """
     rng = np.random.default_rng(20260827)
     A_np = _herm(rng, nq, n, dtype)
@@ -317,8 +317,9 @@ def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
 
     held = tok._factor  # service-internal white-box ownership gate
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
-    want_local = (nq, n // py)
-    want_global = (nq, px * n)
+    ipiv_len = 2 * (n // px)
+    want_local = (nq, ipiv_len)
+    want_global = (nq, px * py * ipiv_len)
     assert tuple(held.ipiv.shape) == want_global, (
         f"pivot carrier global shape {held.ipiv.shape}, want {want_global}")
     local_shapes = [tuple(s.data.shape) for s in held.ipiv.addressable_shards]
@@ -327,7 +328,7 @@ def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
     assert not held.ipiv.is_fully_replicated, "pivot carrier is replicated"
     return dict(rhs1=r1, rhs2=r2, fused_rel=_rel(X2, fused),
                 pivot_global=want_global, pivot_local=want_local,
-                pivot_local_bytes=nq * (n // py) * 8)
+                pivot_local_bytes=nq * ipiv_len * 8)
 
 
 def check_slate_factor_solve(mesh, dtype="complex128", nq=2, n=64, nrhs=32):

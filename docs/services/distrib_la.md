@@ -926,6 +926,11 @@ evidence — the SLATE trsm back-solve had never run before step 2:
 | ScaLAPACK LU + ipiv, CPU 2×2 | 3.855e-13 | native LU control 3.856e-13 |
 | batched-vs-serial eigh | **bit-identical** (0.0 in W and Z) | — |
 
+The cuSOLVERMp LU token's rank-private pivot row is sized to the vendor
+contract ``LOCr(M_A) + MB_A``.  It is still O(n/Px) per matrix/rank; the
+extra block is required storage for distributed row interchanges, not a
+replicated global pivot.
+
 ## Antipatterns
 
 * Calling jnp.linalg.svd at a consumer, or using eigh(A.H @ A), bypasses the

@@ -41,8 +41,9 @@
 // original A after the solve).  Callers should declare
 // `input_output_aliases={0: <out-index>}` on a jit surround if they
 // want XLA to donate A's buffer.  The pivot vector is allocated per
-// call via cudaMallocAsync on ctx->stream and freed before the ctx→xla
-// cross-stream event.
+// call via cudaMalloc and freed before the ctx→xla
+// cross-stream event.  cuSOLVERMp requires LOCr(M_A) + MB_A pivot entries
+// per rank, including the extra block used by distributed row interchanges.
 
 #include <complex>
 #include <cstdint>
@@ -93,10 +94,10 @@ static ffi::Error BatchedSolveLuImpl(
     const int64_t B_local_cols = (nrhs + Py - 1) / Py;
     const int64_t A_slice = lld_A * A_local_cols;
     const int64_t B_slice = lld_A * B_local_cols;
-    // Per-slice local ipiv length.  cuSOLVERMp's ipiv is distributed
-    // along the process-column dim — the NVIDIA mp_getrf_getrs sample
-    // allocates exactly LOCc(N) per rank.  Match that allocation.
-    const int64_t ipiv_slice = A_local_cols;
+    // Per-slice local ipiv length.  The cuSOLVERMp Getrf/Getrs contract is
+    // LOCr(M_A) + MB_A, not LOCc(N).  This one-block-per-process-row
+    // descriptor has LOCr(M_A) == lld_A.
+    const int64_t ipiv_slice = lld_A + mb_a;
 
     // Copy A into A_factored_out (unless aliased); copy B into X_out
     // (unless aliased).  getrf and getrs are in-place on their output
@@ -243,9 +244,10 @@ static ffi::Error BatchedSolveLuImpl(
 
 // Split sibling of BatchedSolveLuImpl.  LU and ipiv remain device-resident
 // between calls so a physics stage can pay getrf once and issue getrs for
-// every RHS chunk.  ipiv_len is the LOCAL cuSOLVERMp extent LOCc(N)=N/Py;
+// every RHS chunk.  ipiv_len is the LOCAL cuSOLVERMp extent
+// LOCr(M_A)+MB_A;
 // Python represents the rank-private rows as P(None,('x','y')), hence each
-// rank stores exactly nq*N/Py int64 values (never a replicated global pivot).
+// rank stores exactly nq*(LOCr+MB) int64 values (never a replicated pivot).
 template <typename T>
 static ffi::Error BatchedGetrfImpl(
     int64_t nq, int64_t n, int64_t mb, int64_t nb, int64_t ipiv_len,
@@ -258,10 +260,11 @@ static ffi::Error BatchedGetrfImpl(
     const int Py = ctx->q;
     const int64_t lld_A = (n + Px - 1) / Px;
     const int64_t local_cols = (n + Py - 1) / Py;
-    if (ipiv_len != local_cols) {
+    const int64_t expected_ipiv_len = lld_A + mb;
+    if (ipiv_len != expected_ipiv_len) {
         std::ostringstream os;
         os << "cusolvermp.getrf: ipiv_len=" << ipiv_len
-           << " != LOCc(N)=" << local_cols;
+           << " != LOCr(M_A)+MB_A=" << expected_ipiv_len;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     const int64_t A_slice = lld_A * local_cols;
@@ -331,10 +334,11 @@ static ffi::Error BatchedGetrsImpl(
     const int64_t lld_A = (n + Px - 1) / Px;
     const int64_t A_local_cols = (n + Py - 1) / Py;
     const int64_t B_local_cols = (nrhs + Py - 1) / Py;
-    if (ipiv_len != A_local_cols) {
+    const int64_t expected_ipiv_len = lld_A + mb_a;
+    if (ipiv_len != expected_ipiv_len) {
         std::ostringstream os;
         os << "cusolvermp.getrs: ipiv_len=" << ipiv_len
-           << " != LOCc(N)=" << A_local_cols;
+           << " != LOCr(M_A)+MB_A=" << expected_ipiv_len;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     const int64_t A_slice = lld_A * A_local_cols;
@@ -426,6 +430,14 @@ static ffi::Error BatchedGetrfDispatch(
         ipiv_out->element_type() != ffi::DataType::S64)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "cusolvermp.getrf: LU must match A and ipiv must be int64");
+    const auto ipiv_dims = ipiv_out->dimensions();
+    if (ipiv_dims.size() != 2 || ipiv_dims[0] != nq ||
+        ipiv_dims[1] != ipiv_len) {
+        std::ostringstream os;
+        os << "cusolvermp.getrf: local ipiv buffer must be (" << nq
+           << ", " << ipiv_len << ") int64";
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedGetrfImpl<double>(
@@ -463,6 +475,14 @@ static ffi::Error BatchedGetrsDispatch(
         ipiv.element_type() != ffi::DataType::S64)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "cusolvermp.getrs: LU/B/X must share dtype and ipiv must be int64");
+    const auto ipiv_dims = ipiv.dimensions();
+    if (ipiv_dims.size() != 2 || ipiv_dims[0] != nq ||
+        ipiv_dims[1] != ipiv_len) {
+        std::ostringstream os;
+        os << "cusolvermp.getrs: local ipiv buffer must be (" << nq
+           << ", " << ipiv_len << ") int64";
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedGetrsImpl<double>(
