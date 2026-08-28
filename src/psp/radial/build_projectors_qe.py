@@ -389,6 +389,37 @@ def _fourier_transform_vloc_qe(
     ).values
 
 
+def _cubic_eval_uniform_q(values: np.ndarray, dq: float, q: np.ndarray) -> np.ndarray:
+    """4-point cubic-Lagrange evaluation of a uniform q₀=0 table.
+
+    Forward-window stencil (nodes i0..i0+3, query offset px measured from
+    node i0) — the same scheme QE uses to consume its dq=0.01 tables
+    (upflib/vloc_mod.f90 interp_vloc / beta_mod.f90 interp_beta).  The
+    polynomial identity holds for any px, so clamping i0 to the last full
+    window makes the top of the table a one-sided (still exact-at-nodes)
+    evaluation instead of an out-of-range gather.
+
+    Error is O(dq⁴) against linear's O(dq²): measured on the 2026-08-28
+    atom sweep, |cubic−exact| ≤ 1e-9 Ry on every element's V_loc SR table
+    at the production node density, vs up to 1.7e-6 Ry (Zn) for linear —
+    which was the dominant term of the Fe/Zn KIH excess vs QE.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    if n < 4:
+        # degenerate table — fall back to nearest-node
+        idx = np.clip(np.rint(np.asarray(q) / dq).astype(int), 0, n - 1)
+        return values[idx]
+    x = np.asarray(q, dtype=np.float64) / float(dq)
+    i0 = np.clip(np.floor(x).astype(np.int64), 0, n - 4)
+    px = x - i0
+    ux, vx, wx = 1.0 - px, 2.0 - px, 3.0 - px
+    return (values[i0] * ux * vx * wx / 6.0
+            + values[i0 + 1] * px * vx * wx / 2.0
+            - values[i0 + 2] * px * ux * wx / 2.0
+            + values[i0 + 3] * px * ux * vx / 6.0)
+
+
 def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tuple[int, int], np.ndarray]:
     ppmesh = getattr(pseudo, 'pp_mesh', None)
     ppnl = getattr(pseudo, 'pp_nonlocal', None)
@@ -507,16 +538,23 @@ def build_local_ionic_potential_on_G_total(
         v_r = np.asarray(vloc, dtype=float)
         Zval = float(getattr(pseudo.pp_header, 'z_valence', 0.0))
 
-        # 8x-per-mesh-point q resolution: the table is consumed through
-        # LINEAR interpolation, whose error is O(dq²); at 2*len(r) the
-        # residual against QE's dq=0.01 cubic table was a measured
-        # ~0.005 meV band-to-band spread on the KIH diagonal, at 8x it
-        # is ~0.0004 meV.  One-time cost, host-side numpy.
+        # 8x-per-mesh-point q resolution, consumed through 4-point CUBIC
+        # Lagrange (O(dq⁴)) rather than linear (O(dq²)).  The node count
+        # spans the FULL FFT-box corner |G|, so dq GROWS with ecutrho and
+        # box shape while the table stays "8x": on the 2026-08-28 atom
+        # sweep the linear consumption at the resulting dq ≈ 3.1e-3
+        # bohr⁻¹ (80 Ry, 12-bohr box, Zn) put a measured −0.055 meV on
+        # the 3s KIH diagonal vs QE — the entire Fe/Zn arm-D excess.
+        # Densifying linear to that floor needs dq ≈ 4e-4 (~8×, priced
+        # 7.7–9.5 s/species vs 0.45 s); cubic at the EXISTING nodes is
+        # ~1e-10 Ry (≪ 1e-4 meV) at zero extra build cost.  This is a
+        # host-side numpy setup path — no autodiff flows through it —
+        # so no custom-JVP structure is touched.
         q_points = max(8192, 8 * len(r))
         q_grid = make_uniform_q_grid(float(np.max(q_flat)), q_points)
         V_q_sr = _fourier_transform_vloc_qe(r, rab, v_r, q_grid, Zval, cell_volume)
-        tab = RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=V_q_sr)
-        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * tab(q_flat)
+        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * _cubic_eval_uniform_q(
+            V_q_sr, float(q_grid[1] - q_grid[0]), q_flat)
         V_sr_on_grid = V_sr_on_flat.reshape((nx, ny, nz))
 
         # Alpha‑Z at G=0

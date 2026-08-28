@@ -233,7 +233,7 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor,
 
 def build_vnl_setup(
     wfn, sym=None, meta=None, pseudos=None,
-    n_q: int = 4000,
+    n_q: int | None = None,
     nspinor: int | None = None,
     q_max: float | None = None,
     soc: bool | None = None,
@@ -247,6 +247,15 @@ def build_vnl_setup(
     sym : SymMaps, optional — used to determine q_max if not provided.
     meta : Meta, optional — used with sym for q_max scan.
     pseudos : dict — element → UPF
+    n_q : int, optional — radial-table node count.  ``None`` (default)
+        scales it with q_max so the grid spacing dq is ECUT-INDEPENDENT
+        (target 5e-4 bohr⁻¹, floor 4000 nodes).  The historical fixed
+        n_q=4000 made dq GROW with the cutoff — at 80 Ry (dq ≈ 2.3e-3)
+        the linear interp of the sharply curved Fe/Zn 3d/semicore-s form
+        factors cost a measured 0.0024/0.0011 meV on the KIH diagonal vs
+        QE (2026-08-28 atom sweep); at dq = 5e-4 that is ~1e-4 meV, below
+        the light-element agreement floor, for a ~3 s (was ~1 s) one-time
+        per-run table build.  Pass an explicit n_q to override.
     q_max : float, optional — if provided, skip the k-point scan for q_max.
     soc : bool, optional — j-RESOLVED (True) vs j-AVERAGED (False) projectors.
         ``None`` (default) means "not declared": ``resolve_soc_mode`` looks for
@@ -290,6 +299,12 @@ def build_vnl_setup(
                 if qk.size:
                     q_max = max(q_max, float(np.max(qk)))
     q_max *= 1.01
+
+    if n_q is None:
+        # dq ecut-independent (see docstring): a fixed node count over a
+        # cutoff-dependent [0, q_max] hands the COARSEST table to exactly
+        # the hard-pseudo/high-ecut decks whose form factors curve most.
+        n_q = max(4000, int(np.ceil(q_max / 5.0e-4)) + 1)
 
     # Extract species data and projector tables
     species_list = extract_species(pseudos)
