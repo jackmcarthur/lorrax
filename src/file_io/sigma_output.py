@@ -1532,6 +1532,7 @@ def _raw_operator_stamp_errors(h5):
 def append_eqp_assembly_receipt_h5(
 	filepath, *,
 	assembly,
+	file_wedge_full_bz_rows,
 	degeneracy_policy: str,
 	degeneracy_tol_ry: float,
 	print_fn=None,
@@ -1540,12 +1541,28 @@ def append_eqp_assembly_receipt_h5(
 
 	The assembler, not this format owner, produces H/X/C(E_DFT) and the
 	conditioned C(omega) curve.  This function validates and transcribes that
-	completed payload; it never accepts independent operand arrays or caller row
-	identities that could drift from what live eqp0/eqp1 used.  The file-wedge
-	rows are derived from the raw cube's canonical star map via
-	:func:`read_star_map` and :func:`compact_star_tables`.  The full operator
-	cubes remain raw.
+	completed payload; it never accepts independent operand arrays that could
+	drift from what live eqp0/eqp1 used.  The full operator cubes remain raw.
 	Call on rank 0 after collective cube close and after ``assemble_eqp``.
+
+	The k rows come from the caller, not from the file, because two
+	different k-sets meet here.  ``sigma_mnk.h5`` stores the STAR wedge
+	(one row per symmetry orbit, what :func:`extract_and_stamp_k_irr`
+	keeps).  The completed assembly is on the FILE wedge (``wfn.kpoints``,
+	the rows eqp0/eqp1 are written on, which is what
+	:attr:`EQP_ASSEMBLY_FILE_ROWS_ATTR` names).  They have the same length
+	only when nk_red == n_orbits: gnppm_debug is 9 and 5, bispinor_debug 9
+	and 5, cohsex_debug 4 and 3, while si_cohsex_debug, si_bse_debug and
+	hbn_cohsex_debug coincide.  Deriving one from the other refused correct
+	assemblies on the first group until 2026-08-27, and the star map cannot
+	supply the file wedge: it labels each full-BZ k with its orbit and says
+	nothing about which k the WFN stored.
+
+	``file_wedge_full_bz_rows`` is checked, not trusted: one row per
+	assembly row, distinct, in range for the cube's mesh, and every stored
+	star reached by at least one row.  The last is the part with content —
+	a file wedge reaches the whole zone under the group, so an assembly
+	short a star, or on another deck's k-set, fails it.
 	"""
 	abs_path = os.path.abspath(filepath)
 	if not os.path.isfile(abs_path):
@@ -1612,14 +1629,40 @@ def append_eqp_assembly_receipt_h5(
 		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
 		with h5py.File(abs_path, "r") as raw_h5:
 			nk_raw = int(raw_h5["sigma_c_kij_ev"].shape[1])
-	file_rows = (np.arange(nk_raw, dtype=np.int64) if star is None
-		else compact_star_tables(star[0])[0])
-	if file_rows.shape != (h.shape[0],):
+	file_rows = np.asarray(file_wedge_full_bz_rows, dtype=np.int64)
+	if file_rows.ndim != 1 or file_rows.shape != (h.shape[0],):
 		raise ValueError(
-			"EQP assembly receipt row count disagrees with the raw cube's "
-			"canonical star map: completed assembly has "
-			f"{h.shape[0]} k rows, raw artifact resolves to "
-			f"{file_rows.shape[0]} canonical rows.")
+			"EQP assembly receipt file-wedge rows: got shape "
+			f"{file_rows.shape}, want one full-BZ row index per assembly k "
+			f"row, i.e. ({h.shape[0]},).  Fix: pass the same reduction the "
+			"assembly's rows came from, "
+			"symmetry_maps.reduce_full_bz_to_file_wedge(sym, arange(nk_full)), "
+			"never a table the writer holds separately.")
+	if file_rows.size and (int(file_rows.min()) < 0
+			or np.unique(file_rows).size != file_rows.size):
+		raise ValueError(
+			"EQP assembly receipt file-wedge rows must be distinct "
+			f"non-negative full-BZ indices; got {file_rows.tolist()}.")
+	# The mesh the cube's tables describe: without a star map the cube is
+	# the full BZ, with one the tables are (nk_full,).
+	compact = None if star is None else np.asarray(star[0])
+	nk_full = nk_raw if compact is None else int(compact.size)
+	if file_rows.size and int(file_rows.max()) >= nk_full:
+		raise ValueError(
+			"EQP assembly receipt file-wedge row "
+			f"{int(file_rows.max())} is out of range for the "
+			f"{nk_full}-k mesh {os.path.basename(abs_path)} describes; the "
+			"assembly and the cube are not from the same run.")
+	if compact is not None:
+		covered = np.unique(compact[file_rows])
+		if covered.size != nk_raw:
+			raise ValueError(
+				"EQP assembly receipt k-set does not cover the raw cube: "
+				f"{file_rows.size} file-wedge rows reach {covered.size} of "
+				f"the {nk_raw} stars {os.path.basename(abs_path)} stores "
+				f"(stars {covered.tolist()}).  Every stored star must be the "
+				"orbit of at least one row.  Fix: assemble on the run's own "
+				"wfn.kpoints set.")
 	with open_scope(
 			abs_path, STACK_H5PY, "a",
 			where="append_eqp_assembly_receipt_h5"), \
@@ -1882,9 +1925,27 @@ def read_eqp_assembly_receipt(filepath):
 		eval_rel_ev, eval_provenance, eval_coverage = (
 			_eval_metadata_from_open_h5(h5))
 		if eval_rel_ev is not None and eval_rel_ev.shape != values.shape[1:]:
+			# The stamp is on the star wedge (the cube writer put it there);
+			# the receipt is on the file wedge.  Pairing them would hand a
+			# star parent's evaluation energies to another member of that
+			# star, which k_irr_rows_for refuses, so this refuses and names
+			# which mismatch it is.
+			diagnosis = ""
+			nk_receipt, nk_eval = int(values.shape[1]), int(eval_rel_ev.shape[0])
+			if nk_eval != nk_receipt:
+				diagnosis = (
+					f"  The stamp has {nk_eval} k rows against the receipt's "
+					f"{nk_receipt}: the stamp is on the cube's STAR wedge and "
+					f"the receipt on the FILE wedge, and pairing them needs the "
+					f"star substitution this module refuses (k_irr_rows_for).  "
+					f"OPEN RULING for a deck whose two wedges differ — stamp "
+					f"the evaluation energies on the file wedge, or declare "
+					f"them star-invariant and unfold: "
+					f"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md.")
 			raise ValueError(
 				f"{SIGMA_EVAL_DATASET} has shape {eval_rel_ev.shape}; expected "
-				f"the receipt's file-wedge/window shape {values.shape[1:]}.")
+				f"the receipt's file-wedge/window shape {values.shape[1:]}."
+				f"{diagnosis}")
 		return {
 			"hartree_diag_ev": np.real(values[0]),
 			"sigma_x_diag_ev": np.real(values[1]),

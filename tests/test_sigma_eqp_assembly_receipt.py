@@ -63,11 +63,21 @@ def _assembly(h, x, c=None, *, curve=None, source="stored"):
     )
 
 
-def _append(path, h, x, c=None, *, source="stored", policy="bgw_average"):
+def _append(path, h, x, c=None, *, rows=None, source="stored",
+            policy="bgw_average"):
+    """Append with the FILE-wedge rows the call site resolved.
+
+    ``rows`` defaults to ``arange(nk)`` because the synthetic files here
+    store the full BZ, where the file wedge IS every row.  The cells that
+    exercise a real IBZ-stored cube pass their own.
+    """
     assembly = _assembly(h, x, c, source=source)
+    nk = np.asarray(h).shape[0]
     append_eqp_assembly_receipt_h5(
         path,
         assembly=assembly,
+        file_wedge_full_bz_rows=(
+            np.arange(nk) if rows is None else np.asarray(rows)),
         degeneracy_policy=policy,
         degeneracy_tol_ry=1.0e-6,
     )
@@ -155,6 +165,7 @@ def test_receipt_replays_the_same_conditioned_curve_and_assembly(tmp_path):
     append_eqp_assembly_receipt_h5(
         path,
         assembly=live,
+        file_wedge_full_bz_rows=np.arange(1),
         degeneracy_policy="bgw_average",
         degeneracy_tol_ry=1.0e-6,
     )
@@ -240,17 +251,36 @@ def test_appender_refuses_new_raw_cube_missing_creation_marker(tmp_path):
         _append(path, [[11.0, 11.0]], [[-3.0, -3.0]])
 
 
-def test_receipt_derives_rows_and_validates_policy_before_writing(tmp_path):
+def test_receipt_checks_rows_and_policy_before_writing(tmp_path):
     path = _sigma_file(tmp_path / "sigma_mnk.h5")
     assembly = _assembly([[11.0, 11.0]], [[-3.0, -3.0]])
     wrong_nk = _assembly(
         [[11.0, 11.0], [12.0, 12.0]],
         [[-3.0, -3.0], [-4.0, -4.0]],
     )
-    with pytest.raises(ValueError, match="canonical star map"):
+    # One row index per assembly k row, or nothing is stamped.
+    with pytest.raises(ValueError, match="want one full-BZ row index"):
         append_eqp_assembly_receipt_h5(
             path,
             assembly=wrong_nk,
+            file_wedge_full_bz_rows=np.arange(1),
+            degeneracy_policy="bgw_average",
+            degeneracy_tol_ry=1.0e-6,
+        )
+    # Counted right, but naming a k this 1-row full-BZ cube does not have.
+    with pytest.raises(ValueError, match="out of range for the 1-k mesh"):
+        append_eqp_assembly_receipt_h5(
+            path,
+            assembly=wrong_nk,
+            file_wedge_full_bz_rows=np.arange(2),
+            degeneracy_policy="bgw_average",
+            degeneracy_tol_ry=1.0e-6,
+        )
+    with pytest.raises(ValueError, match="must be distinct"):
+        append_eqp_assembly_receipt_h5(
+            path,
+            assembly=wrong_nk,
+            file_wedge_full_bz_rows=np.array([0, 0]),
             degeneracy_policy="bgw_average",
             degeneracy_tol_ry=1.0e-6,
         )
@@ -258,12 +288,19 @@ def test_receipt_derives_rows_and_validates_policy_before_writing(tmp_path):
         append_eqp_assembly_receipt_h5(
             path,
             assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(1),
             degeneracy_policy="guess",
             degeneracy_tol_ry=1.0e-6,
         )
 
 
-def test_receipt_rows_are_raw_star_map_first_occurrences(tmp_path):
+def test_receipt_rows_are_the_call_site_s_own_file_wedge(tmp_path):
+    """The stamped rows are the ones the caller passed.
+
+    Two stars over a 5-k mesh, and a file wedge of rows [3, 2] rather than
+    the star-map answer [0, 2]: row 3 is the other member of star 4.  A
+    writer deriving the rows would mislabel which k the payload belongs to.
+    """
     path = tmp_path / "ibz_sigma_mnk.h5"
     irr = np.array([4, 4, 9, 4, 9], dtype=np.int32)
     with h5py.File(path, "w") as h5:
@@ -280,6 +317,118 @@ def test_receipt_rows_are_raw_star_map_first_occurrences(tmp_path):
         path,
         [[11.0, 11.0], [12.0, 12.0]],
         [[-3.0, -3.0], [-4.0, -4.0]],
+        rows=np.array([3, 2]),
     )
     np.testing.assert_array_equal(
-        receipt["file_wedge_full_bz_rows"], np.array([0, 2]))
+        receipt["file_wedge_full_bz_rows"], np.array([3, 2]))
+
+
+# The real deck's k topology, read off tests/regression/gnppm_debug (MoS2
+# 3x3x1): nrk is 9 on a [3,3,1] grid, so the WFN stores the whole zone and
+# the file wedge is all nine rows, while the run's sigma_mnk.h5 keeps five
+# cube rows under these star tables.  Every other fixture in this file has
+# nk_red == n_orbits and so cannot see a 9-vs-5 deck.
+GNPPM_IRR_IDX_K = np.array([0, 1, 1, 2, 3, 4, 2, 4, 3], dtype=np.int32)
+GNPPM_SYM_IDX_K = np.array([0, 2, 0, 2, 2, 2, 0, 0, 0], dtype=np.int32)
+GNPPM_N_SYM_SPATIAL = 2
+GNPPM_N_STARS = 5
+GNPPM_NK_RED = 9
+
+
+def _gnppm_topology_cube(path, nb=2):
+    """A tiny cube carrying the REAL gnppm_debug star tables."""
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("omega_ev", data=OMEGA)
+        ds = h5.create_dataset(
+            "sigma_c_kij_ev",
+            data=np.zeros((OMEGA.size, GNPPM_N_STARS, nb, nb)))
+        ds.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
+        ds.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
+        ds.attrs[N_SYM_SPATIAL_ATTR] = GNPPM_N_SYM_SPATIAL
+        h5.create_dataset(IRR_IDX_DATASET, data=GNPPM_IRR_IDX_K)
+        h5.create_dataset(SYM_IDX_DATASET, data=GNPPM_SYM_IDX_K)
+    return path
+
+
+def test_receipt_accepts_the_real_gnppm_file_wedge_over_a_star_wedge_cube(
+        tmp_path):
+    """9 assembly rows against a 5-row cube is correct on this deck.
+
+    The case that was red: until 2026-08-27 the writer derived the rows
+    from the cube's star map and required equal counts, so this deck
+    refused its own assembly ("completed assembly has 9 k rows, raw
+    artifact resolves to 5 canonical rows"; a CrI3 bispinor run hit the
+    same message on 2026-08-26).  Nothing was corrupt — the assembly is on
+    the file wedge and the cube on the star wedge.
+    """
+    path = _gnppm_topology_cube(tmp_path / "sigma_mnk.h5")
+    h = np.arange(GNPPM_NK_RED * 2, dtype=np.float64).reshape(GNPPM_NK_RED, 2)
+    receipt = _append(path, h, -h, rows=np.arange(GNPPM_NK_RED))
+    assert receipt["hartree_diag_ev"].shape == (GNPPM_NK_RED, 2)
+    np.testing.assert_array_equal(
+        receipt["file_wedge_full_bz_rows"], np.arange(GNPPM_NK_RED))
+    # The payload really is the nine independent rows, not five unfolded.
+    np.testing.assert_array_equal(receipt["hartree_diag_ev"], h)
+    with h5py.File(path, "r") as h5:
+        assert h5["sigma_c_kij_ev"].shape[1] == GNPPM_N_STARS
+
+
+def test_receipt_refuses_a_file_wedge_that_misses_one_of_the_cube_s_stars(
+        tmp_path):
+    """Five rows, the count the old gate demanded, covering three stars.
+
+    Rows [0,1,2,3,6] reach stars {0,1,2} and leave stars 3 and 4 with no
+    assembly row.  A count check cannot see this.
+    """
+    path = _gnppm_topology_cube(tmp_path / "sigma_mnk.h5")
+    bad_rows = np.array([0, 1, 2, 3, 6])
+    assert np.unique(GNPPM_IRR_IDX_K[bad_rows]).size < GNPPM_N_STARS
+    h = np.zeros((bad_rows.size, 2))
+    with pytest.raises(ValueError, match="does not cover the raw cube"):
+        _append(path, h, h, rows=bad_rows)
+
+
+def test_receipt_lands_on_the_real_gnppm_run(gnppm_session):
+    """The real input: the sigma_mnk.h5 a driver run wrote.
+
+    Everything else in this file builds its own HDF5.  This reads what
+    ``write_results`` produced on the tracked deck — the path that used to
+    die inside the appender before eqp0.dat existed.  The file wedge being
+    longer than the star wedge is the property under test, so it is
+    asserted: on a deck where they coincide this cell proves nothing.
+
+    The receipt is read through h5py, not through
+    ``read_eqp_assembly_receipt``, because that reader still refuses this
+    deck — sigma_eval_rel_ev is on the star wedge.  Both halves are pinned
+    here, so closing that open ruling turns this cell red.
+    """
+    import os
+
+    from file_io.sigma_output import (
+        EQP_ASSEMBLY_DATASET,
+        EQP_ASSEMBLY_FILE_ROWS_ATTR,
+        read_eqp_assembly_receipt,
+    )
+
+    path = os.path.join(str(gnppm_session.run_dir), "sigma_mnk.h5")
+    assert os.path.isfile(path), f"the gnppm session wrote no {path}"
+    with h5py.File(path, "r") as h5:
+        nk_stored = int(h5["sigma_c_kij_ev"].shape[1])
+        nk_full = int(h5[IRR_IDX_DATASET].shape[0])
+        assert EQP_ASSEMBLY_DATASET in h5, "the run left no EQP receipt"
+        ds = h5[EQP_ASSEMBLY_DATASET]
+        nk_receipt = int(ds.shape[1])
+        rows = np.asarray(ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR])
+    assert rows.shape == (nk_receipt,)
+    assert nk_stored < nk_receipt <= nk_full, (
+        f"gnppm_debug should have a file wedge longer than its star wedge; "
+        f"got {nk_receipt} receipt rows against {nk_stored} stored and "
+        f"{nk_full} full-BZ k.  If this deck ever becomes nk_red == n_orbits, "
+        f"this cell no longer discriminates and must be re-aimed.")
+    # Every stored star is reached by one of the receipt's rows.
+    with h5py.File(path, "r") as h5:
+        compact = np.asarray(h5[IRR_IDX_DATASET][()])
+    assert np.unique(compact[rows]).size == nk_stored
+    # Open ruling: the evaluation stamp is on the other wedge.
+    with pytest.raises(ValueError, match="STAR wedge and the receipt"):
+        read_eqp_assembly_receipt(path)

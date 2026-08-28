@@ -168,6 +168,7 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
             append_eqp_assembly_receipt_h5(
                 path,
                 assembly=assembly,
+                file_wedge_full_bz_rows=np.arange(1),
                 degeneracy_policy="bgw_average",
                 degeneracy_tol_ry=1.0e-6,
             )
@@ -177,6 +178,7 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
     append_eqp_assembly_receipt_h5(
         path,
         assembly=assembly,
+        file_wedge_full_bz_rows=np.arange(1),
         degeneracy_policy="bgw_average",
         degeneracy_tol_ry=1.0e-6,
     )

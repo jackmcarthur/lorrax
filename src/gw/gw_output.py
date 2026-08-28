@@ -1485,9 +1485,16 @@ def write_results(
     # of pre-assembly operand arguments.
     if results.sigma_omega_h5_path is not None:
         from file_io import append_eqp_assembly_receipt_h5
+        # The receipt's k rows are resolved here, not in the format owner.
+        # The assembly is on the file wedge because ``_wedge`` put it there;
+        # the cube is on the star wedge, and the two differ in length
+        # wherever nk_red != n_orbits (gnppm_debug: 9 and 5).  Same
+        # reduction, applied to an index vector, as for ``kpts_irr`` above.
         append_eqp_assembly_receipt_h5(
             results.sigma_omega_h5_path,
             assembly=assembly,
+            file_wedge_full_bz_rows=_wedge(np.arange(
+                int(np.shape(sym.unfolded_kpts)[0]), dtype=np.int64)),
             degeneracy_policy=degeneracy_policy,
             degeneracy_tol_ry=degeneracy_tol_ry,
             print_fn=print_fn,

@@ -510,6 +510,7 @@ def test_make_eqp_bgw_prefers_the_live_assembly_receipt(monkeypatch):
         append_eqp_assembly_receipt_h5(
             os.path.join(d, "sigma_mnk.h5"),
             assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(2),
             degeneracy_policy="bgw_average",
             degeneracy_tol_ry=1.0e-6,
         )
@@ -559,6 +560,7 @@ def test_make_eqp_bgw_refuses_shape_compatible_receipt_row_permutation():
         append_eqp_assembly_receipt_h5(
             path,
             assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(2),
             degeneracy_policy="bgw_average",
             degeneracy_tol_ry=1.0e-6,
         )
