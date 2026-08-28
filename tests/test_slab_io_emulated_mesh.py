@@ -517,3 +517,49 @@ def test_mode_w_replaces_the_file_rather_than_appending_to_it(tmp_path):
     with h5py.File(path, "r") as f:
         assert "old" not in f
         assert "new" in f
+
+
+@pytest.mark.mesh(4)
+def test_read_slabs_at_the_production_geometry(tmp_path):
+    """The shape ``wfn_loader`` actually asks for, not a convenient one.
+
+    ``services/wfn_loader/src/wfn_loader/loader.py`` reads ``wfns/coeffs``
+    as a 4-D slab with ``window_axis=2`` and
+    ``partition_spec=P(('x','y'), None, None, None)`` — a window axis that
+    is NOT zero, and one dim sharded by BOTH mesh axes.  The cell above
+    exercises neither: at ``window_axis=0`` the ``PartitionSpec`` split
+    around the window is trivial, and a single-axis spec never reaches
+    ``_sharding_to_axis_info``'s tuple branch.  A tier tested only on the
+    easy geometry is a tier tested on a geometry no caller uses.
+
+    Judged against the per-window fold-down, which shares no code with the
+    window loop, and against plain h5py for window 0.
+    """
+    mesh = _mesh(2, 2)
+    path = tmp_path / "prod_windows.h5"
+    # (bands, ns, ngkmax, 2) with three k windows down the ngkmax axis.
+    nb, ns, ngkmax = 8, 2, 5
+    ds = np.arange(nb * ns * 15 * 2, dtype=np.float64).reshape(nb, ns, 15, 2)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("coeffs", data=ds)
+
+    offsets = [(0, 0, 0, 0), (0, 0, 5, 0), (0, 0, 10, 0)]
+    valid = [(nb, ns, 5, 2), (nb, ns, 4, 2), (nb, ns, 5, 2)]  # middle ragged
+    spec = P(("x", "y"), None, None, None)
+
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        packed = np.asarray(jax.device_get(io.read_slabs(
+            "coeffs", shape=(nb, ns, ngkmax, 2), offsets=offsets,
+            valid_shapes=valid, partition_spec=spec, window_axis=2)))
+        folded = np.stack([
+            np.asarray(jax.device_get(io.read_slab(
+                "coeffs", shape=(nb, ns, ngkmax, 2), offset=o,
+                valid_shape=v, partition_spec=spec)))
+            for o, v in zip(offsets, valid)], axis=2)
+
+    assert packed.shape == (nb, ns, 3, ngkmax, 2)
+    assert np.array_equal(packed, folded)
+    assert np.array_equal(packed[:, :, 0], ds[:, :, 0:5])
+    # the ragged window: 4 real rows, then zero
+    assert np.array_equal(packed[:, :, 1, :4], ds[:, :, 5:9])
+    assert np.array_equal(packed[:, :, 1, 4], np.zeros((nb, ns, 2)))
