@@ -64,12 +64,9 @@ from .production_output import (
     format_kmeans_report,
     prune_band_ranges,
 )
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 import symmetry_maps                                            # noqa: E402
+                                 # reachable because of the ONE service-path
+                                 # bootstrap at :42-45 above
 
 
 # ─────────────────────────────────────────────────────────────────────────

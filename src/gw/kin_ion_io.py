@@ -117,11 +117,6 @@ from psp.get_DFT_mtxels import (
 )
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from runtime.production_stream import ProductionStdout          # noqa: E402
 
 
