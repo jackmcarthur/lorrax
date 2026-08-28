@@ -857,6 +857,18 @@ def fit_zeta_to_h5(
                         f"distributed_cholesky at 'auto' (which gives "
                         f"replicated_rank_truncate) for this tier.")
                 _resolved_solver_kind = 'distributed_rank_truncate'
+
+        # Preserve the fused path's exact ridge scalar for distributed LU.
+        # Materializing this tiny (nq,) reduction before factor preparation
+        # prevents XLA from choosing a different fused reduction tree whose
+        # last-bit change is amplified by the near-null transverse modes.
+        factor_trace_per_q = None
+        if (int(vertex_mu_L) != 0 and _resolved_solver_kind in
+                ('cusolvermp_lu', 'scalapack_lu')):
+            with timing.section("zeta_fit.trace_L_q"):
+                factor_trace_per_q = jnp.einsum(
+                    'qii->q', C_q_flat[:, :n_rmu, :n_rmu])
+                factor_trace_per_q.block_until_ready()
         if int(vertex_mu_L) == 0:
             _how = ("rank-truncated pinv"
                     if _resolved_solver_kind == 'replicated_rank_truncate'
@@ -868,9 +880,10 @@ def fit_zeta_to_h5(
         else:
             _how_t = ("hoisted per-q pivoted LU (once per channel)"
                       if _resolved_solver_kind == 'lu'
-                      else "hoisted distributed pXgetrf (block-cyclic, "
+                      else "hoisted distributed getrf (block-cyclic, "
                            "once per channel)"
-                      if _resolved_solver_kind == 'scalapack_lu'
+                      if _resolved_solver_kind in
+                      ('scalapack_lu', 'cusolvermp_lu')
                       else "rank-truncated pinv (|lambda| cut, explicit "
                            "C+, once per channel, rcond="
                            f"{float(transverse_zeta_rcond):g})"
@@ -899,15 +912,15 @@ def fit_zeta_to_h5(
             # Transverse: the factor stage is HOISTED (2026-08) — one
             # pivoted LU per q per CHANNEL instead of per r-chunk.
             # factor_c_q returns (factor, piv): (LU, perm) on the local
-            # plan, a distrib_la FactorToken (ipiv inside it) on the
-            # scalapack plan, (CCT passthrough, None) on the cusolvermp
-            # plan (fused per-r-chunk getrf+getrs kept there).
+            # plan, or a distrib_la FactorToken (ipiv inside it) on either
+            # distributed-library plan.
             L_q, lu_piv = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
                 n_rmu_logical=n_rmu, solver_kind=_resolved_solver_kind,
                 zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
                 transverse_zeta_rcond=float(transverse_zeta_rcond),
-                distrib_la_batched_route=distrib_la_batched_route)
+                distrib_la_batched_route=distrib_la_batched_route,
+                transverse_trace_per_q=factor_trace_per_q)
         else:
             L_q = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
