@@ -130,6 +130,32 @@ def test_slab_io_selects_the_serial_tier_on_an_emulated_mesh(tmp_path):
 
 
 @pytest.mark.mesh(4)
+def test_the_tier_announces_itself_in_the_log(tmp_path, capsys):
+    """The route receipt, observed in stdout rather than assumed.
+
+    A parity claim made from an emulated arm has to quote the transport
+    that moved its bytes (TASTE rule 15), and a reader must not have to
+    infer it from the device count.  The line is UNCONDITIONAL — this
+    tier prints on exactly the runs that did not go through collective
+    MPI-IO, so it cannot become noise — and once per (devices, processes)
+    geometry, not once per file.
+    """
+    import file_io._slab_io_serial as serial
+
+    mesh = _mesh(2, 2)
+    serial._ANNOUNCED.clear()
+    with SlabIO(tmp_path / "a.h5", mode="w", mesh=mesh):
+        pass
+    first = capsys.readouterr().out
+    assert "transport = serial" in first, first
+    assert "1 process" in first and "4 devices" in first, first
+    assert "process_count" in first, first
+    with SlabIO(tmp_path / "b.h5", mode="w", mesh=mesh):
+        pass
+    assert "transport = serial" not in capsys.readouterr().out
+
+
+@pytest.mark.mesh(4)
 def test_the_serial_tier_refuses_a_non_emulated_mesh(tmp_path):
     """A 1x1 at one process is NOT emulated and must not reach this tier.
 

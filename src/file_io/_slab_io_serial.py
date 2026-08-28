@@ -62,7 +62,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import mesh_is_emulated, process_count
-from runtime import debug_print_enabled
 
 from . import h5_journal as _journal
 from ._slab_io_ffi import (_DatasetGeometry, _apply_dataset_attrs,
@@ -92,9 +91,16 @@ def announce_tier(mesh) -> None:
     geometry that selected it, and the mechanism — so a log says which
     transport moved the bytes without the reader having to know the
     predicate.
+
+    UNCONDITIONAL, unlike that one, and the difference is deliberate.
+    WfnLoader's announcement is debug-gated because BOTH its tiers are
+    production paths and the line would be noise on every run.  This tier
+    is selected only on an emulated mesh, which no production launch
+    produces, so the line cannot become noise — it prints on exactly the
+    runs whose bytes did NOT go through collective MPI-IO, which is
+    provenance a reader must not have to infer.  It is also the route
+    receipt any parity claim made from an emulated arm has to quote.
     """
-    if not debug_print_enabled():
-        return
     key = (int(mesh.devices.size), int(process_count()))
     if key in _ANNOUNCED:
         return
