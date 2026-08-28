@@ -64,6 +64,7 @@ from .bse_ring_comm import (
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
     create_mesh_xy,
+    create_mesh_xy_from_flags,
     make_bse_shardings,
 )
 from .bse_serial import compute_pair_amplitude
@@ -85,9 +86,18 @@ def _create_mesh_xy(px: int, py: int) -> Mesh:
 
     This used to be a local copy that built the Mesh and returned it WITHOUT
     warming the MPI cliques, so every driver reaching it — ``bse_w_exact``,
-    ``exciton_bands`` (which imports this name) — died at P>1 under
+    ``exciton_bands`` (which imported this name) — died at P>1 under
     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``.  Kept as a name so the
     existing importers do not move; the body is delegation only.
+
+    No DRIVER reaches it any more: this module's ``main()`` and
+    ``exciton_bands`` both went to ``create_mesh_xy_from_flags`` on
+    2026-08-27, which is where "--px/--py omitted means the run's mesh"
+    lives.  The name survives for ``tools/bse_kgrid_validate.py``,
+    ``tests/test_bse_kgrid.py``, ``tests/test_w_head_densify.py`` and
+    ``tests/test_exciton_bands_warmcache.py``, all of which ask for a
+    process-local 1x1 in a one-device process, and for
+    ``tests/test_bse_gather_and_mesh.py``'s ``_ENTRY_POINTS`` spy.
     """
     return create_mesh_xy(px, py)
 
@@ -1261,8 +1271,12 @@ def main(argv=None) -> None:
                         help="Valence bands (default: FULL chi0 window = n_occ).")
     parser.add_argument("--n-cond", type=int, default=None,
                         help="Conduction bands (default: FULL chi0 window).")
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--omega-ev", type=float, default=0.0,
                         help="Real frequency omega in eV (default: 0, static W0).")
     parser.add_argument("--eta-ev", type=float, default=0.0,
@@ -1280,7 +1294,10 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     timing.reset()
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
+    # shape must BE that mesh (bse_ring_comm.create_mesh_xy_from_flags).
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)
 
     # BAND-WINDOW PARITY: the Casida pair basis must span the SAME band window the

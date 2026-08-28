@@ -34,6 +34,7 @@ from .bse_ring_comm import (
     build_bse_ring_matvec,
     build_bse_ring_matvec_full,
     create_mesh_2d,
+    create_mesh_xy_from_flags,
     make_bse_shardings,
     ring_matvec_correctness_check,
     ring_matvec_smoke_test,
@@ -435,8 +436,12 @@ def main(argv=None) -> int:
     parser.add_argument("--degeneracy-tol-ry", type=float,
                         default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
                         help="'same multiplet' tolerance in Ry (default 1 meV)")
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--n-eig", type=int, default=5)
     parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
     parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
@@ -627,6 +632,20 @@ def main(argv=None) -> int:
         "--parallelism-self-test", action="store_true",
         help="Run the deterministic random-data matvec/Lanczos self-test and exit.")
     args, _ = parser.parse_known_args(argv)
+
+    # OMITTED --px/--py = the run's canonical square mesh, NOT 1x1.  Resolved
+    # here, before every branch below, for two reasons.  (a) An explicit shape
+    # that is not the job's refuses at the top of main() rather than after a
+    # delegate has printed its banner.  (b) This driver's DEFAULT route is a
+    # delegation -- `if not args.lanczos:` hands the whole solve to
+    # bse_feast.main(["--px", str(args.px), ...]) -- and the --kpm-dos route
+    # and ring_matvec_correctness_check take px/py the same way, so what the
+    # forwarded argv carries must be the RESOLVED shape.  Until 2026-08-27 it
+    # carried the argparse placeholder 1/1, i.e. the default run put a
+    # four-GPU node's whole BSE on one device while the startup receipt above
+    # announced 2x2.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
 
     if args.ring_test:
         ring_matvec_smoke_test()

@@ -146,9 +146,15 @@ def test_the_blessed_factory_really_is_in_that_file():
 _ENTRY_POINTS = [
     ("bse.bse_ring_comm", "create_mesh_xy"),
     ("bse.bse_ring_comm", "create_mesh_2d"),
+    ("bse.bse_ring_comm", "create_mesh_xy_from_flags"),
     ("bse.bse_w_exact", "_create_mesh_xy"),
     ("bse.bse_feast", "_create_mesh_xy"),
-    ("bse.bse_pseudopoles", "_create_mesh_xy"),
+    # ``bse.bse_pseudopoles._create_mesh_xy`` was here until 2026-08-27, when
+    # that module's local one-line alias was deleted and its main() went
+    # straight to ``create_mesh_xy_from_flags`` (one-owner rule).  The row is
+    # replaced, not dropped: the resolver that every bse driver's main() now
+    # calls is itself an entry point, and it is the one a "--px/--py omitted"
+    # run takes.
 ]
 
 
@@ -161,6 +167,12 @@ def test_every_bse_mesh_entry_point_goes_through_prepare_mesh(
     warm-up short-circuits at ``process_count() <= 1``, so a spy one level
     deeper would never fire in a single-process test and the gate would be
     void — the exact failure this file exists to avoid.
+
+    ``create_mesh_xy_from_flags`` is called with ``(None, None)``, which is
+    what every bse driver's ``main()`` passes when the user omits
+    ``--px/--py`` — the arm that carries the production default since
+    2026-08-27.  A ``(1, 1)`` call here would test the explicit arm twice and
+    leave the default one unwarmed-and-unwatched.
     """
     import importlib
 
@@ -176,7 +188,12 @@ def test_every_bse_mesh_entry_point_goes_through_prepare_mesh(
 
     monkeypatch.setattr(ring, "prepare_mesh", _spy)
     fn = getattr(mod, fname)
-    mesh = fn(1, 1) if fname != "create_mesh_2d" else fn([jax.devices()[0]])
+    if fname == "create_mesh_2d":
+        mesh = fn([jax.devices()[0]])
+    elif fname == "create_mesh_xy_from_flags":
+        mesh = fn(None, None)
+    else:
+        mesh = fn(1, 1)
     assert len(seen) == 1, (
         f"{modname}.{fname} built a mesh without going through prepare_mesh — "
         f"its cliques are never warmed and it dies at P>1 under impl=mpi")

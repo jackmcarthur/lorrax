@@ -28,7 +28,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
-                            create_mesh_xy, make_bse_shardings)
+                            create_mesh_xy, create_mesh_xy_from_flags,
+                            make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
 from .bse_serial import compute_pair_amplitude
@@ -985,8 +986,13 @@ def run_feast_ritz(
 def _create_mesh_xy(px: int, py: int) -> Mesh:
     """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
 
-    Was a local un-warmed copy; ``bse_kpm`` imports this name.  See the
-    docstring on ``create_mesh_xy`` for why the duplication was a defect.
+    Was a local un-warmed copy.  See the docstring on ``create_mesh_xy`` for
+    why the duplication was a defect.  No driver reaches it any more — this
+    module's ``main()`` and ``bse_kpm``'s both went to
+    ``create_mesh_xy_from_flags`` on 2026-08-27 — but the name is kept
+    because ``tests/test_bse_gather_and_mesh.py``'s ``_ENTRY_POINTS`` spies
+    on it to prove every BSE mesh entry point still reaches ``prepare_mesh``,
+    and shrinking that list weakens the gate.
     """
     return create_mesh_xy(px, py)
 
@@ -1386,8 +1392,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--n-lanczos", type=int, default=10,
                         help="Minimum Lanczos steps for spectral bounds.")
     parser.add_argument("--n-lanczos-max", type=int, default=50,
@@ -1472,7 +1482,14 @@ def main(argv: list[str] | None = None) -> None:
         if _jax_mod.process_index() == 0:
             print(f"  [jax compile cache] skipped: {_e}", flush=True)
 
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh (create_mesh_2d),
+    # not 1x1; a given shape must BE that mesh.  args.px/args.py are then
+    # overwritten with the resolved shape, because the FEAST report line
+    # ("Backend : Sharded BSE matvec (px, py = ...)") is fed from them and a
+    # receipt naming the request rather than the mesh in use is the defect
+    # this bundle exists to remove.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)
     with timing.section("feast.restart_load"):
         data = load_bse_data_from_restart_sharded(
