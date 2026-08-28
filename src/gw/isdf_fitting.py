@@ -10,6 +10,7 @@ import jax.experimental.multihost_utils  # noqa: F401  (sync_global_devices)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import Meta
+from common import collectives
 from common import timing
 from common import jax_profile
 from common.collectives import (
@@ -54,6 +55,28 @@ from isdf.core import FactorToken
 # NCCL collective buffers, and other XLA-arena-external allocations.
 _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
+
+
+def _coupled_gflat_spill(value, *, enabled):
+    """Park one coupled-channel G-flat accumulator in process-local RAM."""
+    if not enabled:
+        return value
+    return collectives.spill_to_host(value)
+
+
+def _coupled_gflat_restore(value, *, enabled):
+    """Restore one parked accumulator for its canonical device operation."""
+    if not enabled:
+        return value
+    return collectives.restore_from_host(value)
+
+
+def _local_shard_nbytes(arr) -> int:
+    """Exact bytes this process will hold after spilling ``arr``."""
+    return sum(
+        int(np.prod(shard.data.shape)) * np.dtype(shard.data.dtype).itemsize
+        for shard in arr.addressable_shards
+    )
 
 
 def mem_probe(label, *, only_rank0=True):
@@ -187,6 +210,7 @@ def fit_zeta_to_h5(
     bispinor_lift: str = "raw",
     _coupled_mu123_coordinator=None,
     _coupled_rank_gate=None,
+    _spill_coupled_gflat_to_host: bool = False,
     print_fn=print,
 ):
     """
@@ -354,6 +378,11 @@ def fit_zeta_to_h5(
         raise ValueError(
             "fit_zeta_to_h5: the private coupled coordinator and rank "
             "gate must be supplied together")
+    if (_spill_coupled_gflat_to_host
+            and _coupled_mu123_coordinator is None):
+        raise ValueError(
+            "fit_zeta_to_h5: coupled G-flat host spill is private to the "
+            "three-channel transverse coordinator")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
     # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
@@ -1375,6 +1404,18 @@ def fit_zeta_to_h5(
         jax.block_until_ready(L_q)
     mem_probe("pre_rchunk_loop")
     if _coupled_mu123_coordinator is not None:
+        if _spill_coupled_gflat_to_host:
+            _local_gflat_host_bytes = _local_shard_nbytes(gflat_acc)
+            with timing.section("zeta_fit.gflat_spill_initial"):
+                gflat_acc = _coupled_gflat_spill(
+                    gflat_acc, enabled=True)
+            if (jax.process_index() == 0 and int(vertex_mu_L) == 1):
+                print_fn(
+                    "  [experimental] coupled G-flat host spill: "
+                    f"{_local_gflat_host_bytes} bytes/channel/rank, "
+                    f"{3 * _local_gflat_host_bytes} bytes/rank with all "
+                    "three accumulators parked")
+            mem_probe("pre_rchunk_loop_host_spilled")
         _coupled_rank_gate("prepared")
         _coupled_mu123_coordinator.channel_prepared(int(vertex_mu_L))
 
@@ -1496,6 +1537,10 @@ def fit_zeta_to_h5(
             # written once after the loop.
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.h5_write"):
+                if _spill_coupled_gflat_to_host:
+                    with timing.section("zeta_fit.gflat_restore_accumulate"):
+                        gflat_acc = _coupled_gflat_restore(
+                            gflat_acc, enabled=True)
                 gflat_acc = accumulate_rchunk_to_gflat(
                     rchunk=zeta_chunk, gflat_acc=gflat_acc,
                     fft_grid=meta.fft_grid, r0=r_start,
@@ -1506,7 +1551,11 @@ def fit_zeta_to_h5(
                     mesh=mesh_xy,
                 )
                 del zeta_chunk
-                if debug_print_enabled():
+                if _spill_coupled_gflat_to_host:
+                    with timing.section("zeta_fit.gflat_spill_accumulated"):
+                        gflat_acc = _coupled_gflat_spill(
+                            gflat_acc, enabled=True)
+                elif debug_print_enabled():
                     jax.block_until_ready(gflat_acc)
             _t_write = time.perf_counter() - t0
             t_write_total += _t_write
@@ -1601,6 +1650,9 @@ def fit_zeta_to_h5(
 
     if _coupled_mu123_coordinator is not None:
         _coupled_mu123_coordinator.wait_finalize(int(vertex_mu_L))
+    if _spill_coupled_gflat_to_host:
+        with timing.section("zeta_fit.gflat_restore_final_write"):
+            gflat_acc = _coupled_gflat_restore(gflat_acc, enabled=True)
 
     # ---- Write the accumulated G-flat ζ_q ----
     # One collective write of the persistent ``(n_q_disk, n_rmu,

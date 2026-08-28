@@ -1918,6 +1918,14 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
 	_coupled_mu123_requested = env_bool(
 		"LORRAX_EXPERIMENTAL_COUPLED_ZQ", False, print_fn=print_fn)
+	_coupled_gflat_host_spill_requested = env_bool(
+		"LORRAX_EXPERIMENTAL_COUPLED_ZQ_HOST_SPILL", False,
+		print_fn=print_fn)
+	if (_coupled_gflat_host_spill_requested
+			and not _coupled_mu123_requested):
+		raise ValueError(
+			"LORRAX_EXPERIMENTAL_COUPLED_ZQ_HOST_SPILL requires "
+			"LORRAX_EXPERIMENTAL_COUPLED_ZQ=1")
 	if _coupled_mu123_requested and not cfg.bispinor:
 		raise ValueError(
 			"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires bispinor=true; it "
@@ -2362,6 +2370,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 						(lambda stage: _drain_coupled_rank_findings(
 							mu_L, stage))
 						if coordinator is not None else None),
+					_spill_coupled_gflat_to_host=bool(
+						coordinator is not None
+						and _coupled_gflat_host_spill_requested),
 					print_fn=print_fn,
 				)
 			_gate_fresh_zeta_rank_findings(
