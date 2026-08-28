@@ -1165,6 +1165,12 @@ _MESH_OWNERS = {
     # process_allgather clique (4 of 4 cells at P=16, job 7882523).  Folding
     # it into ``prepare_mesh`` is the open warm-up-contract decision, and
     # doing it by deleting the call site is how the refusals come back.
+    # THAT DEFERRAL IS NOW LOAD-BEARING, not merely postponed (owner ruling
+    # wanted): it is the whole reason ``create_mesh_xy_from_flags``'s omitted
+    # arm must route through ``create_mesh_2d()`` rather than a bare
+    # ``resolve_mesh()`` — a bare resolve returns the right OBJECT with
+    # neither warm-up — and it is why the BSE family cannot adopt
+    # ``gw/downfold_cli.py``'s ``RUNTIME.reshape`` shape instead.
     # Since 2026-08-27 the direct-construction arm is reachable only when a
     # caller hands it an explicit device list: a shape must consume the list
     # it is given, so the default path (devices=None) always lands on the
@@ -1232,8 +1238,10 @@ def test_the_mesh_scan_can_fail():
 #
 # The second rule below is the one this bundle exists for, and rule 4 cannot
 # see it: a driver does not need to say ``Mesh(`` to end up on the wrong mesh.
-# Until 2026-08-27 all five bse-family drivers declared ``--px``/``--py`` with
-# ``default=1``, so a run with NO flags asked the (correct, shared) factory for
+# Until 2026-08-27 all SIX bse-family drivers declared ``--px``/``--py`` with
+# ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
+# ``bse_w_exact``, ``exciton_bands``, two declarations each, twelve in all —
+# so a run with NO flags asked the (correct, shared) factory for
 # a 1x1 — the whole BSE on one device of a four-GPU node, while the startup
 # receipt announced 2x2; at P>1 the same default builds over
 # ``jax.devices()[:1]``, process 0's device on every rank.  MEASURED on the
@@ -1321,10 +1329,17 @@ def test_no_bse_driver_defaults_its_mesh_shape(sources):
             seen.append((mod, flag))
             if default not in ("None", "<absent>"):
                 bad.append((mod, line, flag, default))
-    assert len(seen) >= 10, (
-        f"only {len(seen)} --px/--py declarations found in src/bse/ "
-        f"({seen}) — the five drivers declare two each, so this gate is not "
-        f"reading the parsers it thinks it is")
+    # EXACT, not a floor.  At ``>= 10`` two declarations could vanish with the
+    # gate still green — a driver losing its --px/--py silently reverts to
+    # whatever its main() does with the missing attribute, which is the class
+    # of defect this section exists for.  Six drivers x two flags = 12; if a
+    # seventh driver is added, edit this literal deliberately (rule: prefer
+    # the sufficient check over the merely necessary one).
+    assert len(seen) == 12, (
+        f"{len(seen)} --px/--py declarations found in src/bse/, expected 12 "
+        f"(six drivers x two flags): {seen}.  Either a driver stopped "
+        f"declaring its mesh flags, or one was added and this literal is "
+        f"stale — both need a human, neither is a pass")
     assert not bad, (
         f"these give --px/--py a shape default: {bad}.  Omitted means the "
         f"job's canonical square mesh (bse_ring_comm.create_mesh_xy_from_"
