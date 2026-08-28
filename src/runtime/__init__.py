@@ -14,11 +14,12 @@ The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
 ``centroid.kmeans_cli``, ``psp.get_dipole_mtxels``, ``gw.kin_ion_io``,
 ``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
 each making exactly ONE module-top call, gated per driver by
-``tests/test_crossfile_requests.py`` (the R1 audit).  The two BSE CLIs that
-take ``--px/--py`` still start on the canonical square mesh; a different
-(square) shape goes through :meth:`RuntimeStack.reshape` (or the BSE factory
-``bse.bse_ring_comm.create_mesh_xy``, which reuses the startup mesh whenever
-the requested shape matches it).  Only square meshes are supported (repo
+``tests/test_crossfile_requests.py`` (the R1 audit).  Since 2026-08-27 the BSE
+CLIs that take ``--px/--py`` do not reshape: all six resolve the flags through
+``bse.bse_ring_comm.create_mesh_xy_from_flags``, which returns this startup
+mesh itself when they are omitted and refuses any shape that is not it, so the
+run has exactly one mesh object.  :meth:`RuntimeStack.reshape` remains for
+``gw.downfold_cli``, its only caller.  Only square meshes are supported (repo
 ``docs/architecture/decisions.md`` 2026-08-01); both paths refuse
 ``px != py``.
 
@@ -1421,9 +1422,20 @@ class RuntimeStack:
 
         FOR THE ONE CASE THE STARTUP CALL CANNOT SERVE.  The entry point
         runs above ``import jax``, so it cannot know a mesh shape that comes
-        from the command line — and ``bse.exciton_bands`` / ``bse.bse_w_exact``
-        take ``--px``/``--py``.  Those drivers still make ONE startup call;
-        they follow it with this, after argparse.
+        from the command line.  ``gw.downfold_cli`` is the one caller
+        (2026-08-27): the BSE drivers used to be the reason this method
+        exists, and since that date they resolve ``--px/--py`` through
+        ``bse.bse_ring_comm.create_mesh_xy_from_flags`` instead, which never
+        reshapes.
+
+        The BSE family now depends on staying out of here.  This swaps
+        ``self.mesh`` without touching ``collectives._CANONICAL_MESHES`` (or
+        ``self.facts``), so after a reshape a bare ``resolve_mesh()`` still
+        returns the startup mesh and the startup facts still name the old
+        shape.  ``create_mesh_xy_from_flags``'s omitted arm goes through
+        ``create_mesh_2d`` -> ``resolve_mesh``, so a BSE driver that reshaped
+        would be handed a mesh that is not ``RUNTIME.mesh``.  Unreachable
+        today only because no BSE driver reshapes.
 
         Not a second mesh in the sense the re-entry guard refuses: the old
         one is dropped, the new one is warmed by the same

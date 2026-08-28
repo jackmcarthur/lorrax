@@ -10,6 +10,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+
+def _process_local_mesh_xy():
+    """A 1x1 ``('x','y')`` mesh over this process's own device.
+
+    These cells are index-map gates, not distribution gates: they need
+    somewhere to put two small arrays.  ``collectives.single_device_mesh`` is
+    the sanctioned process-local 1x1 and is safe at any device count, which
+    ``create_mesh_xy(1, 1)`` deliberately is not since 2026-08-27 — it now
+    refuses a shape that does not consume the job, so the previous spelling
+    here (``exciton_bands._create_mesh_xy(1, 1)``, an import this driver no
+    longer carries) would refuse inside a widened multi-GPU pytest process.
+    """
+    from common.collectives import single_device_mesh
+    return single_device_mesh()
+
+
 # ===========================================================================
 # 3. the Gamma gate reports the whole overlap spectrum
 # ===========================================================================
@@ -69,7 +85,7 @@ def test_gamma_gate_compares_only_matched_native_points_on_8_to_12():
         "psi_c_X": jnp.asarray(psi_stored),
     }
     logs = []
-    mesh = eb._create_mesh_xy(1, 1)
+    mesh = _process_local_mesh_xy()
     eb.gate_htransform_vs_stored(
         jnp.asarray(psi_htransform), jnp.asarray(eps_htransform), data, mesh,
         htransform_k_indices=htransform_k, stored_k_indices=stored_k,
@@ -91,7 +107,7 @@ def test_gamma_gate_refuses_mismatched_native_tables_without_a_map():
     with pytest.raises(ValueError, match="canonical common-grid index map"):
         eb.gate_htransform_vs_stored(
             jnp.ones((144, 1, 1, 1), dtype=jnp.complex128),
-            jnp.zeros((144, 1)), data, eb._create_mesh_xy(1, 1),
+            jnp.zeros((144, 1)), data, _process_local_mesh_xy(),
             log=lambda _: None)
 
 
@@ -116,6 +132,6 @@ def test_gamma_gate_refuses_mixed_coarse_energy_and_fine_psi_axes():
     with pytest.raises(ValueError, match="internally inconsistent BSE bundle"):
         eb.gate_htransform_vs_stored(
             jnp.ones((144, 1, 1, 1), dtype=jnp.complex128),
-            jnp.zeros((144, 1)), data, eb._create_mesh_xy(1, 1),
+            jnp.zeros((144, 1)), data, _process_local_mesh_xy(),
             htransform_k_indices=htransform_k,
             stored_k_indices=stored_k, log=lambda _: None)

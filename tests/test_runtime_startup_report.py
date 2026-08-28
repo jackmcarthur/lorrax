@@ -1060,10 +1060,15 @@ def test_a_second_mesh_shape_is_refused_not_silently_ignored():
 
 
 def test_reshape_exists_for_the_one_case_the_entry_point_cannot_serve():
-    """``bse.exciton_bands`` / ``bse.bse_w_exact`` take --px/--py, which the
-    module-level startup call cannot know.  ``RuntimeStack.reshape`` is how
-    they stay on ONE startup call; it must warm the new mesh and announce
-    the swap, or the block above it describes a mesh the run is not using.
+    """``gw.downfold_cli`` takes --px/--py, which the module-level startup
+    call cannot know.  ``RuntimeStack.reshape`` is how it stays on ONE startup
+    call; it must warm the new mesh and announce the swap, or the block above
+    it describes a mesh the run is not using.
+
+    It was ``bse.exciton_bands`` / ``bse.bse_w_exact`` until 2026-08-27; all
+    six BSE drivers now go through
+    ``bse.bse_ring_comm.create_mesh_xy_from_flags``, which never reshapes, so
+    ``grep -rn 'RUNTIME.reshape' src/ tests/ tools/`` has exactly one hit.
     """
     src = open(os.path.join(_SRC, "runtime", "__init__.py")).read()
     tree = ast.parse(src)

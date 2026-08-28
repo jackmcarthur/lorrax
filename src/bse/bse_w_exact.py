@@ -63,7 +63,7 @@ from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,
     build_density_snapshot_operator,
-    create_mesh_xy,
+    create_mesh_xy_from_flags,
     make_bse_shardings,
 )
 from .bse_serial import compute_pair_amplitude
@@ -78,18 +78,6 @@ jax.config.update("jax_enable_x64", True)
 # finite-q W_q loop and the per-omega oracle sweep reuse ONE executable and every
 # q / omega after the first is dispatch-only (see _get_block_gmres_solver).
 _BLOCK_GMRES_CACHE: dict[tuple, tuple] = {}
-
-
-def _create_mesh_xy(px: int, py: int) -> Mesh:
-    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
-
-    This used to be a local copy that built the Mesh and returned it WITHOUT
-    warming the MPI cliques, so every driver reaching it — ``bse_w_exact``,
-    ``exciton_bands`` (which imports this name) — died at P>1 under
-    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``.  Kept as a name so the
-    existing importers do not move; the body is delegation only.
-    """
-    return create_mesh_xy(px, py)
 
 
 def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
@@ -1261,8 +1249,12 @@ def main(argv=None) -> None:
                         help="Valence bands (default: FULL chi0 window = n_occ).")
     parser.add_argument("--n-cond", type=int, default=None,
                         help="Conduction bands (default: FULL chi0 window).")
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--omega-ev", type=float, default=0.0,
                         help="Real frequency omega in eV (default: 0, static W0).")
     parser.add_argument("--eta-ev", type=float, default=0.0,
@@ -1280,7 +1272,10 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     timing.reset()
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
+    # shape must BE that mesh (bse_ring_comm.create_mesh_xy_from_flags).
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)
 
     # BAND-WINDOW PARITY: the Casida pair basis must span the SAME band window the

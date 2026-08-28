@@ -117,9 +117,10 @@ import numpy as np
 # square ('x','y') mesh, compile cache, rank-0 report.  Must run
 # BEFORE this module's own ``import jax`` and any ``jax.devices()`` /
 # mesh creation so a multi-node srun yields the full global device set.
-# This driver names ``--px/--py``; ``_create_mesh_xy(px, py)`` in main()
-# reuses the startup mesh when the requested shape matches it and builds
-# (and warms) the requested one when it does not.
+# This driver names ``--px/--py``; ``create_mesh_xy_from_flags(px, py)`` in
+# main() hands back this startup mesh when they are omitted (the default
+# since 2026-08-27) and refuses any explicit shape that is not it, so the
+# mesh every NamedSharding embeds is the one the report above describes.
 from runtime import (debug_print, debug_print_enabled,
                      initialize_communicator_stack, rank0_print)
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
@@ -144,10 +145,9 @@ from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      decimate_W_q_to_subgrid, make_w_densifier,
                      build_w_head_channel, resolve_w_head_densify,
                      _resolve_head_params, PAD_EPS_GUARD_RY)
-from .bse_ring_comm import make_bse_shardings
+from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
-from .bse_w_exact import _create_mesh_xy
 from .bse_window import refuse_eqp_on_a_qp_wfn
 from . import vq_interp
 
@@ -1325,8 +1325,11 @@ def build_parser():
              "both htransform and coarse-V batched linalg. auto preserves "
              "the backend's distributed route; batch_reshard moves q onto "
              "the mesh and runs local whole-matrix JAX linalg.")
-    ap.add_argument("--px", type=int, default=1)
-    ap.add_argument("--py", type=int, default=1)
+    ap.add_argument("--px", type=int, default=None,
+                    help="mesh rows; default = the run's square startup mesh")
+    ap.add_argument("--py", type=int, default=None,
+                    help="mesh columns; must equal --px, and px*py must be "
+                         "the job's device count")
     ap.add_argument("--rerun-check", action="store_true",
                     help="RUN the diagnostic warm re-run of the solve scan "
                          "(reproducibility assert + dispatch-only per-Q "
@@ -1524,7 +1527,12 @@ def main(argv=None):
     # progress is not emitted 16×.
     _rank0 = jax.process_index() == 0
 
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh (RUNTIME.mesh by
+    # identity, not a twin), not 1x1; a given shape must BE that mesh.  The
+    # log line below then states the mesh in use, because args.px/args.py
+    # carry the resolved shape rather than the request.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     log(f"[dist] jax.device_count()={jax.device_count()} "
         f"process_count()={jax.process_count()} "
         f"local_device_count()={jax.local_device_count()}; "
