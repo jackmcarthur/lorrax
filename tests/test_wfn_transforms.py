@@ -534,3 +534,41 @@ def test_to_box_shape(synth_loader):
     out = to_box(psi, g_index, synth_loader.fft_grid, mesh=MESH)
     assert out.shape == (psi.shape[0], psi.shape[1], psi.shape[2], nx, ny, nz)
     assert out.dtype == jnp.complex128
+
+
+# ---------------------------------------------------------------------------
+# get_enk_bandrange: the nspinor default comes from the file, not from 2
+# ---------------------------------------------------------------------------
+
+def test_get_enk_bandrange_default_nspinor_is_read_from_the_wfn():
+    """``nspinor=2`` as a hardcoded DEFAULT was silent-wrong on an
+    nspinor=1 file: nspinor widths the WEIGHTS axis only (one
+    ``np.repeat``), so an omitted argument mis-widthed the weights while
+    ``enk`` — which every current defaulting caller keeps — never moved.
+    Pinned here: the default equals the explicit ``wfn.nspinor`` call
+    exactly, an explicit override still wins (the pre-fix behaviour, so
+    the GW callers passing ``meta.nspinor`` are untouched), and ``enk``
+    is nspinor-independent.
+    """
+    from types import SimpleNamespace
+
+    from common.wfn_transforms import get_enk_bandrange
+
+    en = np.array([[[0.0, 1.0, 2.0, 3.0]]])       # (nspin=1, nk_irr=1, nb=4)
+    wfn = SimpleNamespace(energies=en, efermi=1.5, nspinor=1)
+    sym = SimpleNamespace(irr_idx_k=np.array([0, 0]))
+
+    enk_d, w_d = get_enk_bandrange(wfn, sym, (0, 4), (1, 3))
+    enk_1, w_1 = get_enk_bandrange(wfn, sym, (0, 4), (1, 3), nspinor=1)
+    assert w_d.shape == (2, 4 * 1), (
+        f"default weights width {w_d.shape}: the default did not follow "
+        f"wfn.nspinor=1")
+    np.testing.assert_array_equal(np.asarray(w_d), np.asarray(w_1))
+    np.testing.assert_array_equal(np.asarray(enk_d), np.asarray(enk_1))
+
+    # Explicit override beats the file (bispinor callers pass 4).
+    enk_4, w_4 = get_enk_bandrange(wfn, sym, (0, 4), (1, 3), nspinor=4)
+    assert w_4.shape == (2, 4 * 4)
+    # RED-TWIN arm: enk must be identical across nspinor, or the cells
+    # above would be pinning the wrong claim.
+    np.testing.assert_array_equal(np.asarray(enk_d), np.asarray(enk_4))

@@ -1127,6 +1127,71 @@ def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
                 spinor._ensure_phdf5_static()["U_per_full"]).shape[1:] == (2, 2)
 
 
+# ---------------------------------------------------------------------------
+#  Header layouts the coeffs slicing cannot serve — refused by NAME
+# ---------------------------------------------------------------------------
+
+def test_a_real_flavor_wfn_is_refused_by_name_not_by_indexerror(tmp_path):
+    """flavor=1 (real coefficients) must refuse at construction, by name.
+
+    BGW sizes the trailing axis of ``wfns/coeffs`` by iflavor
+    (``Common/wfn_io_hdf5.F90`` ``setup_hdf5_wfn_file``: ``a3(1)=iflavor``);
+    this loader hardcodes that re/im axis as 2 at every coeffs slice.  The
+    surgery below builds the HONEST iflavor=1 layout — trailing axis extent
+    1, not just a stamped header — which is what makes the cell
+    discriminate ORDER as well as presence: the density-symmetry check at
+    the END of ``__init__`` slices ``raw[..., 1]`` off the raw dataset, so
+    a refusal placed after it (or deleted) surfaces as an IndexError that
+    says nothing about flavor, and the ``match=`` below rejects exactly
+    that.
+
+    The twin arm first: the same builder's file at flavor=2 constructs,
+    so the refusal is keyed on the header value, not fired unconditionally.
+    """
+    path = _synth_wfn(tmp_path)
+    with WfnLoader(path) as loader:
+        assert int(loader.flavor) == 2, "the builder no longer writes flavor=2"
+    with h5py.File(path, "r+") as f:
+        c = f["wfns/coeffs"][..., :1]          # honest iflavor=1 layout
+        del f["wfns/coeffs"]
+        f.create_dataset("wfns/coeffs", data=c)
+        f["mf_header/flavor"][...] = 1
+    with pytest.raises(ValueError, match=r"got mf_header/flavor=1, want 2"):
+        WfnLoader(path)
+
+
+def test_a_collinear_nspin2_wfn_is_refused_not_read_as_spin_up_only(tmp_path):
+    """nspin=2 must refuse at construction — the silent-wrong alternative.
+
+    BGW packs coeffs axis 1 as ``nspin*nspinor`` (same F90 routine:
+    ``a3(3)``); the loader treats that axis as the SPINOR axis alone.  The
+    surgery makes a LAYOUT-HONEST collinear file — nspin=2, nspinor=1,
+    coeffs axis 1 reinterpreted as the two spin channels, and el/occ/
+    ifmin/ifmax duplicated along their spin axis — so it passes every
+    OTHER ``__init__`` check (the occs-shape check compares against
+    ``(nspin, nkpts, nbands)`` and would be satisfied): absent this
+    refusal the loader constructs and every coeffs slice reads channel 0
+    only, which is the spin-up-only silent read, not an error.
+    ``symmetry_maps/density_symmetry_check.py``'s nspin==2 arm documents
+    the same gap but stays permissive, so it is no backstop.
+
+    Twin arm first: the untouched nspin=1 file constructs.
+    """
+    path = _synth_wfn(tmp_path)
+    with WfnLoader(path) as loader:
+        assert int(loader.nspin) == 1, "the builder no longer writes nspin=1"
+    with h5py.File(path, "r+") as f:
+        kp = f["mf_header/kpoints"]
+        kp["nspin"][...] = 2
+        kp["nspinor"][...] = 1     # coeffs axis 1 (extent 2) = nspin*nspinor
+        for name in ("el", "occ", "ifmin", "ifmax"):
+            d = kp[name][:]
+            del kp[name]
+            kp.create_dataset(name, data=np.concatenate([d, d], axis=0))
+    with pytest.raises(ValueError, match=r"nspin=2, want 1"):
+        WfnLoader(path)
+
+
 def test_the_loader_kept_no_second_copy_of_the_per_rank_band_clamp():
     """STRUCTURAL, and the only structural cell this service keeps.
 
