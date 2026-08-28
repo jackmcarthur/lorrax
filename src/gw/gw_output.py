@@ -669,6 +669,7 @@ def write_freq_debug(
     omega_grid_ry,
     sym,
     e_eval_ev=None,
+    photon_completion_metadata=None,
     print_fn=print,
 ):
     """Optional Σ-decomposition debug table (rank-0 caller, all in eV).
@@ -763,6 +764,11 @@ def write_freq_debug(
             "photon_head_sector_convention": (
                 "final_post_dyson_lorentz_blocks"),
         }
+        if photon_completion_metadata is None:
+            raise ValueError(
+                "coupled photon head diagnostics require the persisted "
+                "completion receipt metadata")
+        _photon_head_metadata.update(dict(photon_completion_metadata))
         if results.photon_head_sigma_operator_fingerprint is not None:
             from .head_correction import require_canonical_operator_fingerprint
             _fingerprint = require_canonical_operator_fingerprint(
@@ -790,6 +796,10 @@ def write_freq_debug(
           or results.photon_head_sigma_response_fingerprint is not None):
         raise ValueError(
             "photon head Sigma identity exists without a basis")
+    elif photon_completion_metadata is not None:
+        raise ValueError(
+            "photon completion receipt metadata exists without photon head "
+            "Sigma diagnostics")
     if _photon_head is None:
         _photon_head = np.zeros(
             (3, 3, _nk, _nb), dtype=np.complex128)

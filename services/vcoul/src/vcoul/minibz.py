@@ -104,6 +104,7 @@ __all__ = [
     "minibz_transverse_head_avg",
     "SlabMinibzPhotonReceipt",
     "slab_minibz_photon_cubature",
+    "slab_minibz_photon_receipt_digest",
     "validate_slab_minibz_photon_receipt",
     "iter_minibz_photon_samples",
     "build_miniBZ_dq_cart",
@@ -915,6 +916,11 @@ def validate_slab_minibz_photon_receipt(
             "slab_minibz_photon_cubature")
     _require_slab_minibz_photon_receipt(receipt)
     return receipt
+
+
+def slab_minibz_photon_receipt_digest(receipt) -> str:
+    """Return the provider-owned digest after canonical revalidation."""
+    return validate_slab_minibz_photon_receipt(receipt)._provider_digest
 
 
 def _require_slab_minibz_photon_receipt(receipt) -> None:
