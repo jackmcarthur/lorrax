@@ -150,6 +150,9 @@ def test_polygon_photon_receipt_binds_fixed_ladder_weights_and_counts():
     np.testing.assert_array_equal(
         np.asarray(receipt.reciprocal_lattice_rows), HEX_BVEC)
     assert vcoul.validate_slab_minibz_photon_receipt(receipt) is receipt
+    provider_digest = vcoul.slab_minibz_photon_receipt_digest(receipt)
+    assert len(provider_digest) == 64
+    assert all(c in "0123456789abcdef" for c in provider_digest)
     polygon = np.asarray(receipt.polygon_vertices)
     assert polygon.shape == (6, 2)
     mini = np.asarray(receipt.mini_lattice_rows)

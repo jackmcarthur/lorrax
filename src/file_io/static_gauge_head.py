@@ -72,6 +72,42 @@ ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID = (
     "|mixed_CT=occupied_bra_real_2x3;CT=-i*T;TC=CT^dagger"
     "|contact=omitted_by_model|complement=omitted_by_model")
 
+#: Derived evidence from the completed static slab photon head.  It is a
+#: separate immutable receipt, never a response or restart source.
+STATIC_PHOTON_HEAD_COMPLETION_FILENAME = (
+    "static_slab_photon_head_completion.h5")
+STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION = 1
+
+_STATIC_PHOTON_COMPLETION_FIELDS = {
+    "cubature_orders": ((3,), np.int32),
+    "cubature_physical_counts": ((3,), np.int64),
+    "cubature_padded_counts": ((3,), np.int64),
+    "cubature_polygon_area": ((), np.float64),
+    "cubature_cell_volume": ((), np.float64),
+    "cubature_weight_sum_defects": ((3,), np.float64),
+    "observed_physical_counts": ((3,), np.int64),
+    "observed_padded_solve_counts": ((3,), np.int64),
+    "bare_D_mean": ((4, 4), np.complex128),
+    "screened_moments": ((3, 3, 4, 4), np.complex128),
+    "max_backward_residual": ((), np.float64),
+    "min_dyson_singular_value": ((), np.float64),
+    "max_dyson_condition_number": ((), np.float64),
+    "max_dyson_forward_error_bound": ((), np.float64),
+    "mixed_scale_qstar": ((), np.float64),
+    "mixed_convergence_error_ratios": ((2,), np.float64),
+    "ward_residual": ((), np.float64),
+    "hermiticity_residual": ((), np.float64),
+}
+_STATIC_PHOTON_COMPLETION_SCALAR_DIAGNOSTICS = (
+    "max_backward_residual",
+    "min_dyson_singular_value",
+    "max_dyson_condition_number",
+    "max_dyson_forward_error_bound",
+    "mixed_scale_qstar",
+    "ward_residual",
+    "hermiticity_residual",
+)
+
 _S_DATASET = "S_direct_cart"
 _Y_DATASET = "Y_cart_x"
 _Z_DATASET = "Z_cart_y"
@@ -883,6 +919,137 @@ def load_static_gauge_head_artifact(
     return loaded
 
 
+def _validated_static_photon_completion_payload(values) -> dict[str, np.ndarray]:
+    payload = {}
+    for name, (shape, dtype) in _STATIC_PHOTON_COMPLETION_FIELDS.items():
+        array = np.asarray(values[name], dtype=dtype)
+        if array.shape != shape or not np.all(np.isfinite(array)):
+            raise ValueError(
+                "GATE static_photon_completion_receipt_schema: "
+                f"invalid {name}; expected finite shape {shape}, got "
+                f"{array.shape}")
+        payload[name] = array
+    if (not np.array_equal(
+            payload["observed_physical_counts"],
+            payload["cubature_physical_counts"])
+            or not np.array_equal(
+                payload["observed_padded_solve_counts"],
+                payload["cubature_padded_counts"])):
+        raise ValueError(
+            "GATE static_photon_completion_receipt_counts: executed solve "
+            "counts differ from the provider receipt")
+    return payload
+
+
+def write_static_photon_head_completion_receipt_h5(
+    path: str | Path,
+    completion,
+    *,
+    mesh: Mesh,
+) -> dict[str, str]:
+    """Write the already-computed bounded completion through SlabIO."""
+    from vcoul import slab_minibz_photon_receipt_digest
+
+    receipt = completion.cubature_receipt
+    provider_digest = slab_minibz_photon_receipt_digest(receipt)
+    values = {
+        "cubature_orders": receipt.orders,
+        "cubature_physical_counts": receipt.physical_counts,
+        "cubature_padded_counts": receipt.padded_counts,
+        "cubature_polygon_area": receipt.polygon_area,
+        "cubature_cell_volume": receipt.cell_volume,
+        "cubature_weight_sum_defects": receipt.weight_sum_defects,
+        "observed_physical_counts": completion.observed_physical_counts,
+        "observed_padded_solve_counts":
+            completion.observed_padded_solve_counts,
+        "bare_D_mean": completion.bare_D_mean,
+        "screened_moments": completion.screened_moments,
+        **{name: getattr(completion, name)
+           for name in _STATIC_PHOTON_COMPLETION_SCALAR_DIAGNOSTICS},
+        "mixed_convergence_error_ratios":
+            completion.mixed_convergence_error_ratios,
+    }
+    payload = _validated_static_photon_completion_payload(values)
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="StaticSlabPhotonHeadCompletion")
+    with SlabIO(str(partial_path), mode="w", mesh=mesh) as io:
+        io.write_attr(
+            "schema_version",
+            np.int32(STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION))
+        io.write_attr(
+            "cubature_method_i32", _text_i32(receipt.method, encoding="ascii"))
+        io.write_attr(
+            "cubature_provider_digest_i32",
+            _text_i32(provider_digest, encoding="ascii"))
+        for name, value in payload.items():
+            io.write_attr(name, value)
+        io.write_attr("complete", np.int32(1))
+    _publish_completed_partial(
+        partial_path, final_path,
+        artifact_name="StaticSlabPhotonHeadCompletion",
+        barrier_name="static_slab_photon_head_completion_published")
+
+    metadata = {
+        "photon_head_completion_receipt_path": str(final_path.resolve()),
+        "photon_head_completion_schema_version": str(
+            STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION),
+    }
+    for name in _STATIC_PHOTON_COMPLETION_SCALAR_DIAGNOSTICS:
+        metadata[f"photon_head_completion_{name}"] = (
+            f"{float(payload[name]):.17e}")
+    for index, value in enumerate(
+            payload["mixed_convergence_error_ratios"]):
+        metadata[
+            "photon_head_completion_mixed_convergence_error_ratio_"
+            f"{index}"] = f"{float(value):.17e}"
+    return metadata
+
+
+def read_static_photon_head_completion_receipt_h5(
+    path: str | Path,
+    *,
+    mesh: Mesh,
+) -> dict[str, object]:
+    """Read bounded evidence as a dictionary, never a hydrated response."""
+    artifact_path = Path(path)
+    if artifact_path.name.endswith(".partial"):
+        raise ValueError(
+            "GATE static_photon_completion_partial: refusing a partial path")
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            "GATE static_photon_completion_absent: no completed receipt at "
+            f"{artifact_path}")
+    with SlabIO(str(artifact_path), mode="r", mesh=mesh) as io:
+        schema = int(np.asarray(_read_required_small(io, "schema_version")))
+        complete = int(np.asarray(_read_required_small(io, "complete")))
+        method = _decode_i32_text(
+            _read_required_small(io, "cubature_method_i32"),
+            field_name="cubature_method_i32", encoding="ascii")
+        provider_digest = _decode_i32_text(
+            _read_required_small(io, "cubature_provider_digest_i32"),
+            field_name="cubature_provider_digest_i32", encoding="ascii")
+        values = {
+            name: _read_required_small(io, name, dtype=dtype)
+            for name, (_, dtype) in _STATIC_PHOTON_COMPLETION_FIELDS.items()
+        }
+    digest_ok = (
+        len(provider_digest) == 64
+        and all(c in "0123456789abcdef" for c in provider_digest))
+    if (schema != STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION
+            or complete != 1 or not method or not digest_ok):
+        raise ValueError(
+            "GATE static_photon_completion_receipt_schema: "
+            f"schema={schema}, complete={complete}, method={method!r}, "
+            f"provider_digest_valid={digest_ok}")
+    return {
+        "path": str(artifact_path.resolve()),
+        "schema_version": schema,
+        "cubature_method": method,
+        "cubature_provider_digest": provider_digest,
+        **_validated_static_photon_completion_payload(values),
+    }
+
+
 __all__ = [
     "ISOMETRIC_RETAINED_BUBBLE_SOURCE_CONVENTION_ID",
     "ISOMETRIC_RETAINED_BUBBLE_SOURCE_SCHEMA_VERSION",
@@ -890,10 +1057,14 @@ __all__ = [
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
     "STATIC_GAUGE_HEAD_CONVENTION_ID",
     "STATIC_GAUGE_HEAD_SCHEMA_VERSION",
+    "STATIC_PHOTON_HEAD_COMPLETION_FILENAME",
+    "STATIC_PHOTON_HEAD_COMPLETION_SCHEMA_VERSION",
     "load_isometric_retained_bubble_source_artifact",
     "load_static_gauge_hall_artifact",
     "load_static_gauge_head_artifact",
+    "read_static_photon_head_completion_receipt_h5",
     "write_isometric_retained_bubble_source_artifact",
     "write_static_gauge_hall_artifact",
     "write_static_gauge_head_artifact",
+    "write_static_photon_head_completion_receipt_h5",
 ]

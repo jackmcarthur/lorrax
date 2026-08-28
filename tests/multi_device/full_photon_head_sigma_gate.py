@@ -181,6 +181,13 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             head_sigma_diag_w_kn_ry=None,
             omega_grid_ry=None,
             sym=sym,
+            photon_completion_metadata=(
+                {
+                    "photon_head_completion_receipt_path": (
+                        "static_slab_photon_head_completion.h5"),
+                    "photon_head_completion_schema_version": "1",
+                }
+                if present else None),
             print_fn=lambda *_args, **_kwargs: None,
         )
         if not os.path.isfile(path):

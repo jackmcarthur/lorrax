@@ -629,6 +629,7 @@ def main(argv=None):
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.
 	photon_response = None
+	photon_completion_metadata = None
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		W_by_role = {}
 	else:
@@ -653,6 +654,19 @@ def main(argv=None):
 					dyson_solver=config.backend.w_dyson_solver,
 					distrib_la_batched_route=(
 						config.backend.distrib_la_batched_route))
+				completion = photon_response.head_completion
+				if completion is None:
+					raise RuntimeError(
+						"static photon response returned no q=0 completion receipt")
+				from file_io.static_gauge_head import (
+					STATIC_PHOTON_HEAD_COMPLETION_FILENAME,
+					write_static_photon_head_completion_receipt_h5,
+				)
+				completion_path = os.path.join(
+					input_dir, STATIC_PHOTON_HEAD_COMPLETION_FILENAME)
+				photon_completion_metadata = (
+					write_static_photon_head_completion_receipt_h5(
+						completion_path, completion, mesh=mesh_xy))
 				# Sigma consumes packed block views directly.  Do not extract a
 				# scalar W00 body solely to satisfy the legacy role mapping.
 				W_by_role = {}
@@ -662,6 +676,9 @@ def main(argv=None):
 					f"current_model={photon_response.current_model}, "
 					f"current_contact={photon_response.current_contact}, "
 					f"packed_extent={photon_response.layout.packed_extent}")
+				print0(
+					"  static photon head completion receipt: "
+					f"{completion_path}")
 			else:
 				W_by_role = compute_screening_model(
 					mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -1206,6 +1223,7 @@ def main(argv=None):
 			omega_grid_ry=omega_grid_ry,
 			sym=sym,
 			e_eval_ev=e_eval_ev,
+			photon_completion_metadata=photon_completion_metadata,
 			print_fn=print0,
 		)
 		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix
