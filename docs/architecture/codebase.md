@@ -348,7 +348,6 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │  Meta.from_system, BandSlices.from_band_edges
     │  mesh_xy = _build_mesh()
     │  phdf5_init_mpi() establishes the collective MPI-IO transport
-    │  ensure_jax_compile_cache()
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │ ISDF  —  gw_init.prepare_isdf_and_wavefunctions                       │

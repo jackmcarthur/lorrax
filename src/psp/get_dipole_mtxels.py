@@ -61,10 +61,6 @@ from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
 import psp.vnl_ops as vnl_ops
 import h5py
 from runtime.production_stream import ProductionStdout
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
 
 # --------------------------
 # K+G helpers

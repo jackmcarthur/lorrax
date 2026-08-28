@@ -31,6 +31,35 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
+import argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+	"""The CLI.  ABOVE the startup call so ``--help`` can reach it.
+
+	Needs nothing but ``argparse``, which is what makes the seam below
+	possible; see :mod:`runtime.cli_seam`.
+	"""
+	argp = argparse.ArgumentParser(
+		allow_abbrev=False,
+		description=(
+			"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
+			"self-energy, one-shot or self-consistent (see "
+			"gw_config.ComputeMode / QPSolver)."))
+	argp.add_argument(
+		"-i",
+		"--input",
+		default="cohsex_test.in",
+		help="Input file",
+	)
+	return argp
+
+
+if __name__ == "__main__":
+	# Argv is answered before any runtime exists — runtime/cli_seam.py.
+	from runtime.cli_seam import refuse_bad_argv
+	refuse_bad_argv(build_parser())
+
 from runtime import (
 	debug_print, debug_print_enabled, initialize_communicator_stack, rank0_print,
 )
@@ -47,7 +76,6 @@ from runtime import (
 #: in one process gets the same stack rather than a second mesh.
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
-import argparse
 import gc
 import os
 import time
@@ -56,7 +84,6 @@ import warnings
 import numpy as np
 import jax
 import jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
 
 from file_io import (
     load_kin_ion_submatrix, load_centroid_basis,
@@ -171,19 +198,8 @@ def _compute_static_head(
 
 
 def main(argv=None):
-	_description = (
-		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
-		"self-energy, one-shot or self-consistent (see "
-		"gw_config.ComputeMode / QPSolver).")
-	argp = argparse.ArgumentParser(
-		allow_abbrev=False, description=_description)
-	argp.add_argument(
-		"-i",
-		"--input",
-		default="cohsex_test.in",
-		help="Input file",
-	)
-	args = argp.parse_args(argv)
+	# Same factory the module-scope seam used, so the two cannot disagree.
+	args = build_parser().parse_args(argv)
 
 	# ---- Stage timing: ONE table, and it sums to the wall -------------------
 	# ``timing.reset()`` used to sit just above the ISDF call, which threw
