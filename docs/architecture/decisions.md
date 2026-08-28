@@ -309,7 +309,17 @@ be refused at seven doors is not a tier; it is dead code wearing a safety
 label. `H5PY_ALLGATHER` and `PHDF5_HOST` are both gone, along with the
 `slab_io` deck key, the `use_ffi_io` boolean, the `SlabIOBackend` enum and
 the `auto` router. There is one transport, so the contract holds by
-construction. See [`slab_io.md`](slab_io.md#tiers-history) for the
+construction. **Amended 2026-08-27:** one geometry now has a second
+backend, and it is still not a choice — on an EMULATED mesh (`P == 1` with
+more mesh cells than processes, `common.collectives.mesh_is_emulated`) the
+phdf5 open refuses, and `SlabIO` constructs
+`file_io._slab_io_serial._SerialBackend` instead. It is selected from a
+predicate before any transport is built, never from a transport that
+failed; it takes no deck key, no env var and no argument; and it refuses
+above one process, off a CPU mesh, and outside `w`/`a`/`r`. The property
+the paragraph above is defending — that no caller can *select* a tier —
+is unchanged; what changed is that "one transport" is now "one transport
+per geometry, with the geometry read from the mesh". See [`slab_io.md`](slab_io.md#tiers-history) for the
 per-tier evidence, including the `nm -D` measurements that showed
 `PHDF5_HOST`'s only selection condition to be false on every deployed
 library.

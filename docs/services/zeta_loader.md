@@ -89,11 +89,12 @@ import on first attribute access.
 
 ## Backends
 
-One transport: SlabIO (`_FfiBackend`, phdf5 via the LORRAX FFI pair) for
-the collective plan; serial h5py for the headers, the probe, the local
-plan and the g0_mu append. There is no backend switch and nothing to
-demote to: a stack without the phdf5 FFI serves the whole header/format
-surface and refuses collective reads by name. The transport carries a
+One transport for the collective plan: SlabIO (`_FfiBackend`, phdf5 via
+the LORRAX FFI pair), with the one geometry exception named below; serial
+h5py for the headers, the probe, the local plan and the g0_mu append.
+There is no backend switch and nothing to demote to: a stack without the
+phdf5 FFI serves the whole header/format surface and refuses collective
+reads by name. The transport carries a
 per-PROCESS MPI context, so a mesh handed to the loader must satisfy
 `p*q == jax.process_count()` — the FFI itself refuses anything else, and
 since 2026-08-27 `SlabIO` serves the one exception (an EMULATED mesh,

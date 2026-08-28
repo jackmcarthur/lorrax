@@ -1408,6 +1408,25 @@ class _DatasetGeometry:
     callers.  ``lrx_phdf5_ensure_dataset`` performs the same check
     collectively on every rank, which is where it has to be — a Python
     twin can only see the ranks that reach it, and the two could disagree.
+
+    THE EMULATED TIER HAS ITS OWN PYTHON TWIN OF THAT RULE, and it is not
+    the one deleted above: ``_slab_io_serial._SerialBackend.create_dataset``
+    restates reuse-or-refuse in Python because it never calls
+    ``lrx_phdf5_ensure_dataset`` at all — there is no C handler on that
+    path.  The 2026-08-11 argument does not reach it either, because the
+    tier exists only at ``process_count() == 1``: with exactly one rank,
+    "a Python twin can only see the ranks that reach it" is a distinction
+    without a difference.  If the two wordings ever have to say the same
+    thing, they are ``_slab_io_ffi``'s C call and that method.
+
+    THE GEOMETRY AND NORMALISATION HELPERS BELOW ARE SHARED, not private
+    to this transport: ``_slab_io_serial`` imports ``_DatasetGeometry``,
+    ``_normalize_slab_request``, ``_normalize_valid_shape``,
+    ``_normalize_window_tables``, ``_replace_inode_for_write``,
+    ``_sharding_to_axis_info``, ``_shard_divisors``,
+    ``_validate_block_divisible``, ``_apply_dataset_attrs`` and
+    ``mesh_divisible_shape`` from here.  They are underscore-private to the
+    package, not to this module, and changing one changes both tiers.
     """
 
     def _geom_init(self) -> None:
