@@ -149,9 +149,13 @@ def compute_sigma_x_bispinor(
     jax.Array
         Σ^B[k, m, n] on the same sharding as the scalar Σ_X.
     """
-    from .cohsex_sigma import _make_cohsex_kernels
+    from .cohsex_sigma import _make_cohsex_kernels, _spin_capacity
     nk_tot = int(meta.nk_tot)
-    sigma_sx_k, _, _ = _make_cohsex_kernels(mesh_xy, meta.kgrid, nk_tot)
+    # f_spin derived the same way as compute_cohsex_sigma so the two share
+    # one cache entry; on this bispinor-only path it is always exactly 1.0
+    # (and the sx kernel taken here never reads it).
+    sigma_sx_k, _, _ = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, nk_tot, _spin_capacity(meta))
 
     # ψ is delivered at PADDED n_rmu (load_centroids_band_chunked rounds
     # to mesh-product); V tiles on disk are at LOGICAL extent.  Pad V to

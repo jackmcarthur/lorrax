@@ -497,6 +497,7 @@ def validate_kin_ion_against_run(
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
+	nspinor: int | None = None,
 	print_fn=print,
 ) -> dict:
 	"""Refuse a ``kin_ion.h5`` that disagrees with the run it feeds.
@@ -518,6 +519,22 @@ def validate_kin_ion_against_run(
 			f"kin_ion.h5 was generated with sys_dim={int(stored_sys_dim)} but this "
 			f"run uses sys_dim={int(sys_dim)}.  The Coulomb truncation convention "
 			"must match — regenerate kin_ion.h5 with the run's own input file."
+		)
+	# Same legacy contract as sys_dim: the producer stamps ``nspinor``
+	# (gw.kin_ion_io), an older file simply lacks the attr and is accepted.
+	# A spin-structure mismatch is not a band-count problem the checks
+	# below could catch — an nspinor=2 file has ψ†ψ over two components
+	# and (with SOC) j-resolved V_NL, so its T+V_ion against a scalar
+	# WFN's basis is silently, systematically wrong.
+	stored_nspinor = attrs.get("nspinor")
+	if nspinor is not None and stored_nspinor is not None and (
+		int(stored_nspinor) != int(nspinor)
+	):
+		raise ValueError(
+			f"kin_ion.h5 was generated from an nspinor={int(stored_nspinor)} "
+			f"WFN but this run's WFN has nspinor={int(nspinor)}.  T+V_ion "
+			"matrix elements are per spin structure — regenerate kin_ion.h5 "
+			"from the run's own WFN."
 		)
 	# The LOGICAL k count, not the stored one: an IBZ-stored file holds nrk
 	# rows and hands the run nk of them, and comparing the stored extent

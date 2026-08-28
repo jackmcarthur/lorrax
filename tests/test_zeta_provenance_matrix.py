@@ -86,7 +86,10 @@ def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
     wfn = SimpleNamespace(_filename=wfn_path, ecutwfc=30.0, ecutrho=120.0)
     meta = SimpleNamespace(
         n_rmu=(CENTS.shape[0] if n_rmu is None else int(n_rmu)),
-        fft_grid=np.array([9, 9, 45]))
+        fft_grid=np.array([9, 9, 45]),
+        # The stamp records the source WFN's spin structure (2026-08-28);
+        # this matrix models the spinor decks every legacy stamp came from.
+        nspinor_wfnfile=2)
     if transverse_identity is None:
         transverse_identity = _tid(cfg, cents_T=cents_T,
                                    solver_kind=solver_kind)

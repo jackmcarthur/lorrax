@@ -253,6 +253,15 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'band_range_left':      [int(band_range_left[0]), int(band_range_left[1])],
 		'band_range_right':     [int(band_range_right[0]), int(band_range_right[1])],
 		'bispinor':             bool(cfg.bispinor),
+		# The source WFN's spin structure (FILE nspinor, not meta.nspinor:
+		# a bispinor run's ζ is fit from the 2-component file ψ, and
+		# ``bispinor`` above already separates those stamps).  A ζ fit
+		# from an nspinor=2 WFN reused by an nspinor=1 rerun at the same
+		# (path, size) fingerprint would evaluate pair densities with the
+		# wrong component count.  A stamp MISSING this key predates
+		# scalar support, i.e. was fit at nspinor=2 —
+		# ``_zeta_reuse_ok``'s legacy table says exactly that.
+		'nspinor':              int(meta.nspinor_wfnfile),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
 		# EFFECTIVE (env-overridden) values, recorded via the SAME
@@ -589,6 +598,11 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		#       refits — the only safe reading, because such a stamp
 		#       carries no evidence about the ζ_T files beside it and
 		#       those ζ_T carry no stamp of their own at all.
+		#   nspinor                 2     (2026-08-28: every ζ stamped
+		#       before scalar support was fit from an nspinor=2 WFN —
+		#       the tree refused nspinor=1 files — so an nspinor=2 rerun
+		#       reuses a legacy stamp and an nspinor=1 rerun refits,
+		#       naming the key.)
 		_LEGACY_KEY_DEFAULTS = {
 			'distributed_zeta_solve': 'replicated',
 			'transverse_zeta_solve': 'ridge',
@@ -597,6 +611,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			'centroids_transverse_md5': None,
 			'distributed_lu': None,
 			'transverse_solver_kind': None,
+			'nspinor': 2,
 		}
 		# The exception applies ONLY when the difference is entirely
 		# "this stamp predates some keys": every key the two stamps share

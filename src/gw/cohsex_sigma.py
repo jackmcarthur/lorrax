@@ -30,6 +30,30 @@ from .wavefunction_bundle import project as _project
 from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 
 
+def _spin_capacity(meta) -> float:
+    """Electrons per occupied band, from meta's DECLARED spin structure.
+
+    Delegates to the ONE canonical helper
+    (``psp.get_DFT_mtxels.spin_degeneracy_factor`` — ``Meta`` duck-types
+    the two attrs it reads, and bispinor meta.nspinor=4 yields exactly
+    1.0, like nspinor=2).  The presence check exists because the helper
+    getattr-defaults a missing attr to 1, which would hand a meta that
+    never declared its spin structure the SCALAR factor 2 *silently* —
+    the V_H it scales is a ~500 eV quantity, so refuse loudly instead.
+    """
+    for attr in ("nspin", "nspinor"):
+        if not hasattr(meta, attr):
+            raise AttributeError(
+                f"cohsex_sigma: meta.{attr} is missing — the Hartree ρ and "
+                f"the fixed-N window check are capacity-weighted (2 e⁻ per "
+                f"band iff nspin == nspinor == 1), so meta must declare its "
+                f"spin structure (got a {type(meta).__name__} without it).  "
+                f"Fix: pass a common.meta.Meta, or give the stub explicit "
+                f"nspin/nspinor.")
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
+    return float(spin_degeneracy_factor(meta))
+
+
 # ---------------------------------------------------------------------------
 # Gij — occupation projector in band space.  Static COHSEX uses the
 # band-space occupation projector (not the τ-phase form used by chi0);
@@ -74,7 +98,12 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
         # The metallic form of the same V_H-silently-small hazard the
         # integer guard below prevents: electrons carried by bands outside
         # the Σ window would silently leave the Hartree density.
-        n_win = float(np.sum(f_win)) / float(meta.nk_tot)
+        # ``n_electrons`` is capacity-weighted (the efermi solvers count
+        # f × spin_degeneracy_factor), so the band sum must be too: 2
+        # electrons per band on a spin-restricted scalar WFN, exactly 1.0
+        # for nspinor ≥ 2 (bispinor meta.nspinor=4 included).
+        n_win = (_spin_capacity(meta)
+                 * float(np.sum(f_win)) / float(meta.nk_tot))
         n_target = float(occupation_state.n_electrons)
         if abs(n_win - n_target) > 1.0e-8:
             raise ValueError(
@@ -145,21 +174,27 @@ def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
 
 
-def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int):
+def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int,
+                         f_spin: float):
     """Cached factory: returns (sigma_sx, sigma_coh, hartree) jit'd kernels.
 
-    Keyed on (id(mesh_xy), kgrid, ffi_dial_key()) — same shape the chi0 /
-    ppm_sigma kernel caches use.  The ``ffi_dial_key()`` component is
+    Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), f_spin) — same shape the
+    chi0 / ppm_sigma kernel caches use.  The ``ffi_dial_key()`` component is
     load-bearing: the ``make_flat_k_*`` factories below read
     ``LORRAX_FFT_FFI`` at FACTORY time, so without the dials in the key a
     mid-process flag flip would serve a kernel built for the stale backend
     (the flat-k FFT service contract, ``docs/dev/flat_k_fft_service.md``).
     ``nk_tot`` = prod(kgrid) and is redundant for cache-lookup purposes; it
     stays as a positional arg because the Hartree kernel closes over it as
-    a compile-time constant.
+    a compile-time constant.  ``f_spin`` (electrons per occupied band,
+    ``psp.get_DFT_mtxels.spin_degeneracy_factor``: 2.0 for a spin-restricted
+    scalar WFN, else exactly 1.0) scales ONLY the Hartree ρ and is in the
+    key — no default, so no caller can silently get the spinor kernel, and
+    a kernel cached for one spin structure can never serve the other.
     """
     from ffi import ffi_dial_key
-    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key())
+    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
+                 float(f_spin))
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
@@ -223,6 +258,17 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int], nk_tot: int
         rho = jnp.real(jnp.einsum(
             'kisx,kjsx,kij->x',
             jnp.conj(psi_yr), psi_yr, Gij, optimize=True))
+        if f_spin != 1.0:
+            # ρ, and ONLY ρ, carries the spin degeneracy (2 electrons per
+            # band on a spin-restricted scalar WFN).  BGW puts the
+            # nspin=nspinor=1 factor 2 into epsilon and the density
+            # (epsilon_main.f90 ``fact``), never into the Σ band sums
+            # (sigma_main.f90: occupancy 1 per band) — so Σ_SX/Σ_COH/Σ_X
+            # above take no factor, and χ₀'s copy already lives in
+            # ``w_isdf._w_solve_pref_scalar``.  Trace-time guard: the
+            # nspinor ≥ 2 path emits no op at all — bit-identity, not
+            # merely value identity.
+            rho = rho * f_spin
         Vrho = jnp.einsum(
             'xy,y->x', V_q[0],
             rho / jnp.asarray(nk_tot, dtype=jnp.float64), optimize=True)
@@ -348,8 +394,10 @@ def compute_cohsex_sigma(
 
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
+    # _spin_capacity scales the Hartree ρ only (see the hartree kernel);
+    # exactly 1.0 for every nspinor ≥ 2 deck.
     sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
-        mesh_xy, kgrid, nk_tot)
+        mesh_xy, kgrid, nk_tot, _spin_capacity(meta))
 
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
@@ -444,7 +492,7 @@ def compute_v_h_sigma_x(
     """
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot))
+        mesh_xy, meta.kgrid, int(meta.nk_tot), _spin_capacity(meta))
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
     with mesh_xy:

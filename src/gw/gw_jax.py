@@ -705,6 +705,7 @@ def main(argv=None):
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
+		nspinor=int(wfn.nspinor),
 		print_fn=print0,
 	)
 	# Which V_H source this run will use, resolved once and printed.  Only
