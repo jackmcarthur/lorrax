@@ -170,7 +170,7 @@ __all__ = [
     "pin_matmul_precision",
     "read_matmul_precision",
     "enforce_x64",
-    "own_x64_on_a_live_jax",
+    "set_x64_on_imported_jax",
     "X64_OVERRIDE_ENV",
 ]
 
@@ -421,10 +421,9 @@ def install_failfast_excepthook() -> None:
     sys._lorrax_failfast_installed = True
 
 
-#: jax's own 64-bit variable, and the LORRAX override that lets a run
-#: proceed without it.  The override is named (TASTE rule 12): an off-dial
-#: refuses, but an operator who deliberately wants a 32-bit debug run has one
-#: spelling for it and it is recorded in the log.
+#: jax's own 64-bit variable, and the named override that lets a run proceed
+#: without it.  x64 off refuses; a deliberate 32-bit debug run has exactly one
+#: spelling for the opt-out, and it is printed on every startup.
 _X64_ENV = "JAX_ENABLE_X64"
 X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 
@@ -453,24 +452,22 @@ def _x64_requested():
     return None
 
 
-def own_x64_on_a_live_jax():
+def set_x64_on_imported_jax():
     """Apply the resolved :data:`_X64_ENV` to a jax that is ALREADY imported.
 
-    THE HOLE THIS CLOSES.  Setting the variable is enough only when jax is
-    imported AFTER it: jax latches x64 once, when ``jax._src.config`` is
-    first imported.  An entry point that imports jax FIRST and the driver
-    second leaves it latched at whatever the environment said BEFORE the
-    runtime spoke -- ``tools/profile_gw_xprof.py`` (``import jax`` at :20,
-    ``from gw import gw_jax`` at :68) is the in-tree caller that takes that
-    order, and any test or notebook that touches jax before a driver is
-    another.  MEASURED 2026-08-27 (WSL box, jax 0.9.1, JAX_PLATFORMS=cpu,
-    ``env -u JAX_ENABLE_X64``): in that order the process ran with
-    ``jnp.zeros(1, dtype=float).dtype == float32``, silently, for the whole
-    run.  The runtime OWNS this flag -- one owner, both import orders --
-    which is why the fix is here and not an ``update`` re-asserted in each
-    driver, where it covered only the drivers that remembered it.
+    Setting the variable is enough only when jax is imported after it: jax
+    latches x64 once, when ``jax._src.config`` is first imported.  An entry
+    point that imports jax first and the driver second leaves it latched at
+    whatever the environment said before the runtime ran --
+    ``tools/profile_gw_xprof.py`` (``import jax`` at :20, ``from gw import
+    gw_jax`` at :68) takes that order, and so does any test or notebook that
+    touches jax before a driver.  Measured 2026-08-27 (WSL box, jax 0.9.1,
+    JAX_PLATFORMS=cpu, ``env -u JAX_ENABLE_X64``): in that order the process
+    ran with ``jnp.zeros(1, dtype=float).dtype == float32``, silently, for
+    the whole run.  The flag is set here rather than re-asserted in each
+    driver, which only covered the drivers that remembered it.
 
-    NEVER IMPORTS JAX: ``sys.modules.get`` only.  In the ordinary order
+    Never imports jax: ``sys.modules.get`` only.  In the ordinary order
     (driver first) jax is not loaded yet, this returns ``None``, and jax
     reads the variable itself at import as before.
 
@@ -494,22 +491,21 @@ def enforce_x64(resolved, *, where: str, say=None) -> None:
     unset variable before jax exists, or a spelling jax itself will refuse),
     which passes.
 
-    WHY A REFUSAL AND NOT A WARNING.  LORRAX physics is complex128
-    throughout -- ``ffi/io.py:329-351`` refuses an int64 dataset opened with
-    x64 off for the same reason -- so x64 off is not a slower answer, it is
-    a different one, and every consequence of it (a c64 Σ, an f32 eigenvalue
-    solve) is invisible in the output. TASTE rule 13: an instrument that
-    measures a defect and then proceeds is not a gate.
+    A refusal and not a warning: LORRAX physics is complex128 throughout
+    (``ffi/io.py:329-351`` refuses an int64 dataset opened with x64 off for
+    the same reason), so x64 off is not a slower answer but a different one,
+    and every consequence of it -- a c64 Σ, an f32 eigenvalue solve -- is
+    invisible in the output.
 
-    Two call sites, two different causes, both real:
+    Two call sites, two different causes:
 
-    * :func:`set_default_env` -- the REQUEST (``JAX_ENABLE_X64=0`` in the
-      environment).  Refusing there is the only point that precedes jax's
-      first array, and it is what makes the answer uniform across all eight
-      drivers: before this, an explicit ``=0`` meant f32 in the four drivers
-      no library re-armed and f64 in the four it did.
-    * step 8a of :func:`initialize_communicator_stack` -- the RESOLVED flag
-      read back off the live jax (``collect_startup_facts``' ``x64``).  That
+    * :func:`set_default_env` -- the request (``JAX_ENABLE_X64=0`` in the
+      environment).  The only point that precedes jax's first array, and the
+      one that makes the answer uniform across all eight drivers: before
+      this, an explicit ``=0`` meant f32 in the four drivers no library
+      re-armed and f64 in the four it did.
+    * step 8a of :func:`initialize_communicator_stack` -- the resolved flag
+      read back off the live jax (``collect_startup_facts``' ``x64``).  This
       is the sufficient check: it fires whatever turned x64 off, including a
       library ``config.update`` after step 1 and an ``update`` that did not
       take, neither of which the request check can see.
@@ -613,12 +609,11 @@ def set_default_env(*, platform: str = "gpu") -> None:
     see :func:`_check_allocator_env`.
     """
     os.environ.setdefault(_X64_ENV, "1")
-    # ONE OWNER, BOTH IMPORT ORDERS.  The line above is enough only when jax
-    # is imported after it; :func:`own_x64_on_a_live_jax` covers the other
-    # order, and :func:`enforce_x64` refuses an explicit ``=0`` here, before
-    # the first array exists, rather than degrading to f32 in silence.
+    # The line above covers only the import order where jax comes second;
+    # set_x64_on_imported_jax covers the other one.  enforce_x64 refuses an
+    # explicit ``=0`` here, before the first array exists.
     enforce_x64(_x64_requested(), where=f"the {_X64_ENV} environment variable")
-    own_x64_on_a_live_jax()
+    set_x64_on_imported_jax()
     # HDF5 FILE LOCKING OFF BY DEFAULT (audit A1, 2026-08-15).  A LORRAX
     # process maps TWO independent HDF5 library instances — h5py's bundled
     # wheel libhdf5 and the FFI's cray libhdf5_parallel — and the stores
@@ -1497,8 +1492,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        XLA_PYTHON_CLIENT_PREALLOCATE=false, the allocator-spelling refusal,
        the glibc malloc tuning, and the first arming of the CPU-only plugin
        skip.  MUST precede the first backend init; jax reads x64 at import
-       and the GPU knobs when the CUDA client is built.  x64 is also PUSHED
-       onto a jax that was already imported (:func:`own_x64_on_a_live_jax`),
+       and the GPU knobs when the CUDA client is built.  x64 is also set on a
+       jax that was already imported (:func:`set_x64_on_imported_jax`),
        because the variable alone covers only one of the two import orders.
     2. :func:`announce_cpu_collectives` -- after (1), because it reads the
        RESOLVED ``JAX_PLATFORMS``; before any collective, because gloo's
@@ -1553,9 +1548,9 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        while the compile cache and all compatibility checks remain live.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
-    8a. :func:`enforce_x64` on the RESOLVED flag the report just measured.
-       HERE AS WELL AS AT (1), because the two see different things: (1)
-       sees the REQUEST, this one sees what actually happened to the flag
+    8a. :func:`enforce_x64` on the resolved flag the report just measured.
+       Here as well as at (1), because the two see different things: (1)
+       sees the request, this one sees what actually happened to the flag
        -- a library ``config.update`` after step 1, or an ``update`` that
        did not take.  It costs one dict read.
 

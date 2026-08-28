@@ -95,5 +95,5 @@ a.out
 # generic-cloud lane artifacts (config/cloud/)
 .native/
 src/ffi/cpp/build_cloud/
-# ...and the host leg build_ffi_host.sh writes beside it.
+# ...and the host build tree build_ffi_host.sh writes beside it.
 src/ffi/cpp/build_host_cloud/

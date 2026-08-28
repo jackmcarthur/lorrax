@@ -124,8 +124,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     # Argv is answered before any runtime exists — runtime/cli_seam.py.
-    from runtime.cli_seam import refuse_bad_argv_before_startup
-    refuse_bad_argv_before_startup(build_argparser())
+    from runtime.cli_seam import refuse_bad_argv
+    refuse_bad_argv(build_argparser())
 
 
 # ---- join the distributed world BEFORE anything touches XLA ------------

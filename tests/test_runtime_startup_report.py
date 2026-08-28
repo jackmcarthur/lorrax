@@ -1227,7 +1227,7 @@ def test_the_startup_facts_can_actually_measure_the_precision():
 # 11.  x64 — the runtime owns it, under BOTH import orders
 # ---------------------------------------------------------------------------
 #
-# THE DEFECT THIS SECTION EXISTS FOR, measured 2026-08-27 on this box: with
+# The defect this section exists for, measured 2026-08-27 on this box: with
 # the per-driver ``jax.config.update("jax_enable_x64", True)`` deleted, a
 # process that imported jax BEFORE the driver ran the whole calculation in
 # float32 with nothing on screen — ``set_default_env``'s ``setdefault`` is
@@ -1284,14 +1284,14 @@ def test_x64_is_on_in_both_import_orders(jax_first):
 
 
 def test_the_import_order_probe_can_see_a_float32_run():
-    """THE RED TWIN for the cell above, and the reason it is not vacuous.
+    """The red twin for the cell above, and the reason it is not vacuous.
 
-    Neutering the one line that owns the flag (``own_x64_on_a_live_jax``)
+    Neutering the one line that owns the flag (``set_x64_on_imported_jax``)
     reproduces the defect exactly: jax-first goes float32, driver-first does
     not.  Without this, both arms above could be passing because something
     else in the tree happened to arm x64.
     """
-    mut = "runtime.own_x64_on_a_live_jax = lambda: None"
+    mut = "runtime.set_x64_on_imported_jax = lambda: None"
     hurt = _x64_probe(jax_first=True, mutation=mut)
     assert hurt.returncode == 0, hurt.stderr[-2000:]
     assert "X64 False float32" in hurt.stdout, (

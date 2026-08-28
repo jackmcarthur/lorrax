@@ -8,10 +8,10 @@ library is not built it printed no usage at all, exiting 1 at
 
 Two independent halves, because either alone is defeatable:
 
-  * STATIC.  The seam call exists at module scope ABOVE the startup call.
+  * Static.  The seam call exists at module scope above the startup call.
     AST, not grep: a comment saying "we answer --help early" is not the
     call being made.
-  * BEHAVIOURAL.  The driver is actually launched.  The FFI library is
+  * Behavioural.  The driver is actually launched.  The FFI library is
     pointed at a path that does not exist, so ANY process that reaches
     the runtime cannot exit 0 -- which is what makes "exit 0 with usage"
     proof that the runtime did not run, rather than a hope.
@@ -22,8 +22,8 @@ seam must not swallow launches), and a driver on the debt list below
 must FAIL the behavioural assertion -- which is what shows the
 assertion can fail at all.
 
-THE SEAM'S THREE PRECONDITIONS ARE GATED TOO.  Each is one edit away
-from being lost, and none of them announces itself by failing a driver:
+The seam's three preconditions are gated too.  Each is one edit away from
+being lost, and none of them announces itself by failing a driver:
 
   * the seam call sits under ``if __name__ == "__main__":``.  A driver
     imported as a LIBRARY must never consult argv -- ``bse.exciton_bands``
@@ -33,8 +33,8 @@ from being lost, and none of them announces itself by failing a driver:
     module that does.  jax latches x64 and the platform at ITS import, so
     an import that beats ``runtime.set_default_env`` to it silently costs
     the run its 64-bit values (measured 2026-08-27; see
-    ``runtime.own_x64_on_a_live_jax``).
-  * the SEAMED/debt census is DERIVED from ``src/`` rather than listed, so
+    ``runtime.set_x64_on_imported_jax``).
+  * the SEAMED/debt census is derived from ``src/`` rather than listed, so
     a driver that lands unseamed turns this file red instead of simply
     being absent from a table nobody re-derives.
 """
@@ -67,7 +67,7 @@ SEAMED = {
 #: Measured 2026-08-27 by importing the named module in a fresh
 #: interpreter and checking ``'jax' in sys.modules``.
 #:
-#: THE TARGET IS ZERO AND THIS COUNT MUST ONLY GO DOWN.  Closing one of
+#: The target is zero and this count may only go down.  Closing one of
 #: these means splitting the jax-free constants out of the named module,
 #: which is a decision about that module, not about the driver.
 NO_SEAM_DEBT = {
@@ -77,11 +77,10 @@ NO_SEAM_DEBT = {
     "psp.get_dipole_mtxels": ("psp/get_dipole_mtxels.py", "common.mtxel_sweep"),
 }
 
-#: A RATCHET, NOT A CEILING, and the difference is the whole point: with
-#: ``<=`` here, seaming a driver and forgetting to lower this number left the
-#: recorded target above the truth, and the next unseamed driver could land
-#: back into the gap without a red cell.  ``==`` means closing debt is not
-#: finished until this constant is edited, which is the act that records it.
+#: A ratchet, not a ceiling.  With ``<=`` here, seaming a driver and
+#: forgetting to lower this number leaves the recorded target above the
+#: truth, and the next unseamed driver lands back into the gap with no red
+#: cell.  ``==`` means closing debt is not finished until this is edited.
 DEBT_TARGET = 4
 
 
@@ -100,7 +99,7 @@ def _startup_census() -> dict:
     """``{dotted: [lineno]}`` for EVERY module under ``src/`` that calls
     ``initialize_communicator_stack`` at module scope.
 
-    DERIVED, never listed.  A hand-kept roster of drivers can only fail when
+    Derived, never listed.  A hand-kept roster of drivers can only fail when
     a developer edits it, which is the one moment it is least likely to be
     wrong; this walks the tree instead, so a driver that lands next week is
     in the census the day it lands.
@@ -158,10 +157,10 @@ def _module_scope_call_lines(source: str, name: str) -> list:
 @pytest.mark.parametrize("mod", sorted(SEAMED))
 def test_the_seam_runs_before_the_startup_call(mod):
     src = _source(SEAMED[mod])
-    seam = _module_scope_call_lines(src, "refuse_bad_argv_before_startup")
+    seam = _module_scope_call_lines(src, "refuse_bad_argv")
     start = _module_scope_call_lines(src, "initialize_communicator_stack")
     assert seam, (
-        f"{mod} has no module-scope refuse_bad_argv_before_startup() call. "
+        f"{mod} has no module-scope refuse_bad_argv() call. "
         f"A comment about answering --help early is not the call.")
     assert start, f"{mod} no longer initializes the runtime at module scope"
     assert max(seam) < min(start), (
@@ -214,22 +213,22 @@ _BLOCK_NODES = (ast.If, ast.Try, ast.With, ast.For, ast.While, ast.Module,
 
 @pytest.mark.parametrize("mod", sorted(SEAMED))
 def test_the_seam_call_is_under_a_main_guard(mod):
-    """THE GUARD IS LOAD-BEARING, NOT DECORATION.
+    """The guard is load-bearing, not decoration.
 
     Dedent the seam out of its guard and every cell in this file still
     passes (measured), while ``import gw.kin_ion_io`` from any program with
     its own argv dies at ``argparse`` -- ``gw.sigma_dispatch`` imports that
     module, ``bse.exciton_bands`` imports ``bandstructure.htransform``, and
     neither owns the argv the seam would parse.  The rule the docstring at
-    ``runtime/cli_seam.py:56-60`` states, as a check.
+    ``runtime/cli_seam.py:54-58`` states, as a check.
     """
     tree = ast.parse(_source(SEAMED[mod]))
     parents = _parent_map(tree)
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
              and (getattr(n.func, "id", None)
                   or getattr(n.func, "attr", None))
-             == "refuse_bad_argv_before_startup"]
-    assert calls, f"{mod} has no refuse_bad_argv_before_startup() call at all"
+             == "refuse_bad_argv"]
+    assert calls, f"{mod} has no refuse_bad_argv() call at all"
     for call in calls:
         node = parents.get(call)
         while node is not None and not isinstance(node, _BLOCK_NODES):
@@ -272,7 +271,7 @@ def _module_scope_imports(source: str) -> list:
 
 @pytest.mark.parametrize("mod", sorted(SEAMED))
 def test_no_module_scope_import_above_the_startup_call_names_jax(mod):
-    """THE CONSTRAINT THE WHOLE SEAM RESTS ON (``runtime/cli_seam.py:29-34``).
+    """The constraint the seam rests on (``runtime/cli_seam.py:27-31``).
 
     jax latches x64 and the platform when IT is imported.  One ``import
     jax`` above the startup call therefore costs the run its 64-bit values
@@ -280,7 +279,7 @@ def test_no_module_scope_import_above_the_startup_call_names_jax(mod):
     exists because its parser needs a jax-importing module, so whoever
     closes that debt is one line away from doing exactly this.
 
-    STATIC because it must fire on the spelling, in milliseconds, on a box
+    Static because it must fire on the spelling, in milliseconds, on a box
     with no runtime; the transitive half (a module above the seam that
     pulls jax indirectly) is measured by
     :func:`test_nothing_above_the_startup_call_pulls_jax`.
@@ -296,7 +295,7 @@ def test_no_module_scope_import_above_the_startup_call_names_jax(mod):
 
 
 def test_the_census_of_drivers_is_derived_from_the_tree():
-    """A DRIVER THAT LANDS UNSEAMED MUST TURN THIS FILE RED.
+    """A driver that lands unseamed must turn this file red.
 
     Both tables below are hand-written, so on their own they can only fail
     when someone edits them.  This re-derives the population — every module
@@ -321,7 +320,7 @@ def test_the_debt_list_is_exactly_the_unseamed_drivers():
     for mod, rel in list(SEAMED.items()) + [
             (m, v[0]) for m, v in NO_SEAM_DEBT.items()]:
         src = _source(rel)
-        if _module_scope_call_lines(src, "refuse_bad_argv_before_startup"):
+        if _module_scope_call_lines(src, "refuse_bad_argv"):
             seamed_now.add(mod)
         else:
             unseamed_now.add(mod)
@@ -341,7 +340,7 @@ def test_the_debt_list_is_exactly_the_unseamed_drivers():
 def _import_pulls_jax(dotted: str) -> bool:
     """Does a bare ``import <dotted>`` leave jax in ``sys.modules``?
 
-    MEASURED, in a fresh interpreter, because that is the claim: this test
+    Measured in a fresh interpreter, because that is the claim: this test
     process has imported jax long before it reads this file, so an
     in-process check would answer True for every module in the tree.
     """
@@ -361,7 +360,7 @@ def _import_pulls_jax(dotted: str) -> bool:
 def test_each_debt_entry_names_a_module_that_really_imports_jax(mod):
     """The debt's REASON has to be true, or the list is an excuse list.
 
-    Two halves, and the name of this test is the DYNAMIC one: the named
+    Two halves, and the name of this test is the dynamic one: the named
     module is imported in a fresh interpreter and must actually pull jax.
     The static half (the driver still imports it) is what makes the entry
     about THIS driver rather than about a module it stopped using.
@@ -386,7 +385,7 @@ def test_each_debt_entry_names_a_module_that_really_imports_jax(mod):
 
 
 def test_the_jax_import_measurement_can_answer_no():
-    """THE CONTROL for the cell above.  ``argparse`` is what every seamed
+    """The control for the cell above.  ``argparse`` is what every seamed
     parser needs and nothing more; a probe that answered "pulls jax" for it
     would make all four debt reasons above vacuous."""
     assert not _import_pulls_jax("argparse")
@@ -404,7 +403,7 @@ def _launch(mod, *args):
     reaches the runtime CANNOT exit 0.  ``returncode == 0`` is therefore
     the whole proof here, and it is a sharp one.
 
-    THERE IS DELIBERATELY NO "the banner did not print" ASSERTION.  It
+    There is deliberately no "the banner did not print" assertion.  It
     would be a tautology inside this harness: the FFI refusal is step 6b
     and the startup report is step 8, so under a broken ``.so`` no process
     can print the banner however far it got -- measured 2026-08-27, two
@@ -472,7 +471,7 @@ def _library_import(mod: str) -> str:
 
 @pytest.mark.parametrize("mod", sorted(SEAMED))
 def test_a_library_import_never_consults_argv(mod):
-    """THE BEHAVIOURAL TWIN of the ``__main__``-guard cell above."""
+    """The behavioural twin of the ``__main__``-guard cell above."""
     out = _library_import(mod)
     assert out.startswith("REACHED_STARTUP"), (
         f"importing {mod} as a library under a hostile argv answered {out!r}. "
@@ -530,7 +529,7 @@ def test_the_seam_does_not_swallow_a_good_argv():
 
 @pytest.mark.parametrize("mod", sorted(NO_SEAM_DEBT))
 def test_the_behavioural_assertion_can_fail(mod):
-    """THE CONTROL.  An unseamed driver must NOT pass the check above.
+    """The control: an unseamed driver must not pass the check above.
 
     Without this, `test_help_exits_zero_without_a_runtime` could be
     asserting something every driver in the tree already satisfies.

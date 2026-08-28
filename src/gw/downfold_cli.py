@@ -78,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     # Argv is answered before any runtime exists — runtime/cli_seam.py.
-    from runtime.cli_seam import refuse_bad_argv_before_startup
-    refuse_bad_argv_before_startup(build_parser())
+    from runtime.cli_seam import refuse_bad_argv
+    refuse_bad_argv(build_parser())
 
 from runtime import initialize_communicator_stack
 
