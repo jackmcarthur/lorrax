@@ -171,8 +171,12 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor,
         if nspinor == 1:
             # FORCED, not assumed: one-component wavefunctions admit only
             # the j-averaged operator, so the undetermined case has a
-            # unique representable resolution (= QE average_pp).
-            print_fn(f"{tag}V_NL: j-AVERAGED (scalar-relativistic, QE "
+            # unique representable resolution (= QE average_pp).  The
+            # WARNING prefix is load-bearing: production output routes
+            # legacy prints through preprocessing_output.legacy_print,
+            # which retains only _WARNING_WORDS lines — without it this
+            # announcement is silently dropped unless LORRAX_DEBUG_PRINT=1.
+            print_fn(f"{tag}WARNING: V_NL j-AVERAGED (scalar-relativistic, QE "
                      f"average_pp), forced by nspinor=1.  FR pseudos "
                      f"{sorted(j_pseudos)}, discarding "
                      f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
@@ -180,7 +184,8 @@ def resolve_soc_mode(pseudos, wfn=None, *, soc=None, nspinor,
             return False
         # ── UNDETERMINED.  Announce; do not decide silently. ──
         print_fn(f"\n{SOC_BANNER}")
-        print_fn(f"{tag}SPIN-ORBIT MODE UNDETERMINED — assuming lspinorb=.TRUE.")
+        # WARNING prefix load-bearing — see the forced-nspinor=1 branch above.
+        print_fn(f"{tag}WARNING: SPIN-ORBIT MODE UNDETERMINED — assuming lspinorb=.TRUE.")
         print_fn(SOC_BANNER)
         print_fn(f"  Fully-relativistic pseudopotentials: {sorted(j_pseudos)}")
         print_fn(f"  Wavefunctions: nspinor={nspinor} "
