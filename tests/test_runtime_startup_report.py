@@ -1020,7 +1020,8 @@ def test_the_entry_point_calls_the_phases_in_the_one_correct_order():
     seq = _entry_point_call_sequence()
     wanted = ["install_failfast_excepthook", "bootstrap", "prepare_mesh",
               "ensure_jax_compile_cache", "_install_pjrt_log_filter",
-              "collect_startup_facts", "format_startup_report"]
+              "collect_startup_facts", "enforce_x64",
+              "format_startup_report"]
     idx = []
     for w in wanted:
         assert w in seq, f"{w} is not called by initialize_communicator_stack"
@@ -1059,10 +1060,15 @@ def test_a_second_mesh_shape_is_refused_not_silently_ignored():
 
 
 def test_reshape_exists_for_the_one_case_the_entry_point_cannot_serve():
-    """``bse.exciton_bands`` / ``bse.bse_w_exact`` take --px/--py, which the
-    module-level startup call cannot know.  ``RuntimeStack.reshape`` is how
-    they stay on ONE startup call; it must warm the new mesh and announce
-    the swap, or the block above it describes a mesh the run is not using.
+    """``gw.downfold_cli`` takes --px/--py, which the module-level startup
+    call cannot know.  ``RuntimeStack.reshape`` is how it stays on ONE startup
+    call; it must warm the new mesh and announce the swap, or the block above
+    it describes a mesh the run is not using.
+
+    It was ``bse.exciton_bands`` / ``bse.bse_w_exact`` until 2026-08-27; all
+    six BSE drivers now go through
+    ``bse.bse_ring_comm.create_mesh_xy_from_flags``, which never reshapes, so
+    ``grep -rn 'RUNTIME.reshape' src/ tests/ tools/`` has exactly one hit.
     """
     src = open(os.path.join(_SRC, "runtime", "__init__.py")).read()
     tree = ast.parse(src)
@@ -1220,3 +1226,157 @@ def test_the_startup_facts_can_actually_measure_the_precision():
     pytest.importorskip("jax")
     runtime.pin_matmul_precision()
     assert runtime.read_matmul_precision() in ("highest", "float32")
+
+
+# ---------------------------------------------------------------------------
+# 11.  x64 — the runtime owns it, under BOTH import orders
+# ---------------------------------------------------------------------------
+#
+# The defect this section exists for, measured 2026-08-27 on this box: with
+# the per-driver ``jax.config.update("jax_enable_x64", True)`` deleted, a
+# process that imported jax BEFORE the driver ran the whole calculation in
+# float32 with nothing on screen — ``set_default_env``'s ``setdefault`` is
+# read by jax only at ITS import, so in that order it arrives too late.
+# ``tools/profile_gw_xprof.py`` (:20 ``import jax``, :68 ``from gw import
+# gw_jax``) is the in-tree caller that takes that order.
+#
+# Every cell here is a subprocess, because import order is a property of a
+# PROCESS and pytest has already imported jax by the time it reads this file.
+
+_X64_PROBE = """
+import os, sys, importlib
+{jax_first}
+import runtime
+{mutation}
+def _stub(*a, **kw):
+    # Step 1 only: the FFI gate (6b) needs a loadable .so, which a login-class
+    # box does not have.  This isolates exactly the env/ownership half.
+    runtime.set_default_env()
+    return None
+runtime.initialize_communicator_stack = _stub
+sys.argv = ["gw_jax", "-i", "x.in"]
+importlib.import_module("gw.gw_jax")
+import jax, jax.numpy as jnp
+print("X64", bool(jax.config.read("jax_enable_x64")),
+      jnp.zeros(1, dtype=float).dtype, flush=True)
+"""
+
+
+def _x64_probe(*, jax_first: bool, mutation: str = "", x64_env=None):
+    """Run the import-order probe in a fresh interpreter; return its output."""
+    import subprocess
+    env = dict(os.environ)
+    env.pop("JAX_ENABLE_X64", None)
+    if x64_env is not None:
+        env["JAX_ENABLE_X64"] = x64_env
+    env["JAX_PLATFORMS"] = "cpu"
+    env["PYTHONPATH"] = os.pathsep.join([p for p in sys.path if p])
+    body = _X64_PROBE.format(
+        jax_first="import jax, jax.numpy as jnp" if jax_first else "",
+        mutation=mutation)
+    return subprocess.run([sys.executable, "-c", body],
+                          capture_output=True, text=True, timeout=300, env=env)
+
+
+@pytest.mark.parametrize("jax_first", [False, True],
+                         ids=["driver-imported-first", "jax-imported-first"])
+def test_x64_is_on_in_both_import_orders(jax_first):
+    """The property, stated as the operator experiences it: float64 either way."""
+    p = _x64_probe(jax_first=jax_first)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "X64 True float64" in p.stdout, (
+        f"jax_first={jax_first}: {p.stdout!r}\n{p.stderr[-2000:]}")
+
+
+def test_the_import_order_probe_can_see_a_float32_run():
+    """The red twin for the cell above, and the reason it is not vacuous.
+
+    Neutering the one line that owns the flag (``set_x64_on_imported_jax``)
+    reproduces the defect exactly: jax-first goes float32, driver-first does
+    not.  Without this, both arms above could be passing because something
+    else in the tree happened to arm x64.
+    """
+    mut = "runtime.set_x64_on_imported_jax = lambda: None"
+    hurt = _x64_probe(jax_first=True, mutation=mut)
+    assert hurt.returncode == 0, hurt.stderr[-2000:]
+    assert "X64 False float32" in hurt.stdout, (
+        f"the ownership line is no longer what closes the hole: {hurt.stdout!r}")
+    fine = _x64_probe(jax_first=False, mutation=mut)
+    assert "X64 True float64" in fine.stdout, (
+        "the driver-first arm is supposed to be covered by the environment "
+        "variable alone; if it is not, this probe is measuring something else")
+
+
+def test_owning_x64_never_imports_jax():
+    """``set_default_env`` runs ABOVE every driver's ``import jax``.
+
+    If owning the flag pulled jax in, it would defeat the ordering it exists
+    to protect — and ``runtime.cli_seam``'s whole ``--help`` seam with it.
+    """
+    import subprocess
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([p for p in sys.path if p])
+    p = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, runtime; runtime.set_default_env(); "
+         "print('JAX_LOADED', 'jax' in sys.modules)"],
+        capture_output=True, text=True, timeout=300, env=env)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "JAX_LOADED False" in p.stdout, p.stdout
+
+
+def test_an_explicit_x64_off_refuses():
+    with pytest.raises(RuntimeError) as exc:
+        runtime.enforce_x64(False, where="a test", say=lambda *a, **k: None)
+    msg = str(exc.value)
+    for part in ("got", "want", "fix", "doc", runtime.X64_OVERRIDE_ENV):
+        assert part in msg, f"the refusal does not state {part!r}:\n{msg}"
+
+
+def test_the_x64_gate_is_not_unconditional():
+    """The negative control: a gate that refused whatever it was handed would
+    satisfy the cell above while refusing every healthy run."""
+    assert runtime.enforce_x64(True, where="a test") is None
+    assert runtime.enforce_x64(None, where="a test") is None
+
+
+def test_the_named_override_announces_instead_of_refusing(monkeypatch):
+    monkeypatch.setenv(runtime.X64_OVERRIDE_ENV, "1")
+    said = []
+    runtime.enforce_x64(False, where="a test", say=said.append)
+    assert said and "UNCERTIFIED" in said[0], said
+
+
+def test_set_default_env_refuses_an_explicit_x64_off_before_jax_exists():
+    """END TO END, and BEFORE the first array: the request arm of the gate.
+
+    Its twin is the ``=1`` run in the same cell — without that, a
+    ``set_default_env`` that raised unconditionally would pass this.
+    """
+    import subprocess
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([p for p in sys.path if p])
+    code = "import runtime; runtime.set_default_env(); print('CONTINUED')"
+    off = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, timeout=300,
+                         env={**env, "JAX_ENABLE_X64": "0"})
+    assert off.returncode != 0, f"x64=0 was accepted: {off.stdout!r}"
+    assert "64-bit values are OFF" in off.stderr, off.stderr[-2000:]
+    on = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                        text=True, timeout=300,
+                        env={**env, "JAX_ENABLE_X64": "1"})
+    assert on.returncode == 0 and "CONTINUED" in on.stdout, on.stderr[-2000:]
+
+
+def test_the_x64_env_is_read_through_jaxs_own_grammar(monkeypatch):
+    """``true``/``off`` are values jax accepts, so this reader must too — a
+    stricter reading here would call a float32 run x64-on.  An unrecognised
+    spelling is jax's to refuse, with its own message, so it reads as
+    ``None`` (unknown) rather than as either answer."""
+    for raw, want in (("1", True), ("true", True), ("YES", True), ("on", True),
+                      ("0", False), ("false", False), ("off", False),
+                      ("nope", None)):
+        monkeypatch.setenv("JAX_ENABLE_X64", raw)
+        assert runtime._x64_requested() is want, raw
+    monkeypatch.delenv("JAX_ENABLE_X64")
+    assert runtime._x64_requested() is None

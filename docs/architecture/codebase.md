@@ -107,6 +107,7 @@ src/
 │   ├── read_bgw_vcoul.py      BGW vcoul table reader (diagnostic override)
 │   └── slab_io.py             SlabIO: one sharded MPI-IO transport
 │       _slab_io_ffi.py          collective parallel-HDF5 implementation
+│       _slab_io_serial.py       serial tier for the emulated mesh (P=1, D>1, CPU)
 │
 ├── ffi/                  # XLA FFI bridge to native libraries
 │   ├── common/                ffi_loader (ctypes) + cpp (CMake) → liblorrax_ffi.so
@@ -254,7 +255,11 @@ MPI-IO. The CUDA and host native libraries compile the same C++ transport;
 the host build reads XLA's CPU buffer in place instead of staging device data.
 There is no backend enum, Python parallel-h5py tier, rank-0 allgather fallback,
 or deck/API selector. A deployment without the required native handler refuses
-at file open rather than changing the memory model.
+at file open rather than changing the memory model. One geometry exception
+since 2026-08-27: on an emulated mesh (P=1 with more mesh cells than
+processes, CPU only) the phdf5 open refuses and `SlabIO` constructs
+`_slab_io_serial._SerialBackend` instead — selected from a mesh predicate,
+never a caller choice; see [slab_io.md](slab_io.md).
 
 Used for `zeta_q.h5` and `V_qmunu.h5` (big files), and for `sigma_mnk.h5` via `write_sigma_omega_h5`.
 
@@ -348,7 +353,6 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │  Meta.from_system, BandSlices.from_band_edges
     │  mesh_xy = _build_mesh()
     │  phdf5_init_mpi() establishes the collective MPI-IO transport
-    │  ensure_jax_compile_cache()
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │ ISDF  —  gw_init.prepare_isdf_and_wavefunctions                       │
@@ -672,7 +676,7 @@ main                                       [gw/gw_jax.py]
 | **Write sigma_mnk.h5** | `file_io/sigma_output.py : write_sigma_omega_h5` |
 | **Write eqp0.dat / eqp1.dat** (IBZ wedge) | `gw/eqp_bgw.py : assemble_eqp`, `write_bgw_eqp` |
 | **Write sigma_diag.dat / eqp_g0w0.dat** (full BZ) | `file_io/sigma_output.py : write_sigma_to_file`, `write_eqp_g0w0` |
-| **SlabIO (parallel-HDF5 transport)** | `file_io/slab_io.py : SlabIO` (implementation: `_slab_io_ffi.py`) |
+| **SlabIO (parallel-HDF5 transport)** | `file_io/slab_io.py : SlabIO` (implementation: `_slab_io_ffi.py`; emulated-mesh serial tier: `_slab_io_serial.py`) |
 | **Centroid selection** | `centroid/kmeans_cli.py : main` (algorithm: `centroid/kmeans_isdf.py`) |
 | **Dipole generation** | `psp/get_dipole_mtxels.py : main` |
 | **kin_ion generation** | `gw/kin_ion_io.py : main` |

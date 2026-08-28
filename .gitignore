@@ -91,3 +91,9 @@ h5_journal_crash.rank*.txt
 # tracked reference files match it (src/psp/psp_dataclass.out,
 # tests/regression/cohsex_debug/sigma_*_ref.out).
 a.out
+
+# generic-cloud lane artifacts (config/cloud/)
+.native/
+src/ffi/cpp/build_cloud/
+# ...and the host build tree build_ffi_host.sh writes beside it.
+src/ffi/cpp/build_host_cloud/

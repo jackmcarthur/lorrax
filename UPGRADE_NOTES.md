@@ -3,6 +3,30 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-08-28 — startup ownership, BSE mesh flags, emulated CPU meshes
+
+- The runtime owns `JAX_ENABLE_X64`: it applies the resolved value even when
+  jax was imported before the driver, and a resolved `False` refuses at
+  startup. `LORRAX_ALLOW_X64_OFF=1` continues as an announced uncertified
+  run. The per-driver `jax.config.update` lines are gone.
+- Drivers no longer arm the persistent compile cache; step 7 of
+  `runtime.initialize_communicator_stack` owns it. With `ISDF_JAX_CACHE_DIR`
+  unset and `LORRAX_RUN_DIR` set, sequential drivers share one
+  workflow-local cache under `$LORRAX_RUN_DIR/.lorrax_jax_cache`.
+- BSE-family drivers: omitted `--px/--py` now means the run's canonical
+  square mesh (it used to mean 1×1). An explicit shape must consume the
+  job's device count exactly — under- and over-requests both refuse.
+- `gw_jax`, `kin_ion_io`, `downfold_cli` and `kmeans_cli` answer `--help`
+  and bad argv before any runtime exists (`runtime.cli_seam`); the other
+  four drivers still pay full bring-up first.
+- Single-process multi-device CPU meshes
+  (`XLA_FLAGS=--xla_force_host_platform_device_count=N`) now run end to
+  end: `SlabIO` serves them through an announced serial tier
+  (`file_io._slab_io_serial`, CPU only). The `p*q == process_count`
+  refusals stand everywhere else.
+- `qp_solver = self_consistent` beside a dynamic `compute_mode`
+  (`gn_ppm`/`hl_ppm`/`mpa`) refuses at driver entry; pair it with `cohsex`.
+
 ## 2026-08-18 — retired HDF5 controls now refuse or are absent
 
 - GW decks containing `slab_io` or `use_ffi_io` now refuse with a targeted

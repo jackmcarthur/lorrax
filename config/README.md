@@ -99,7 +99,6 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 | `HDF5_USE_FILE_LOCKING` | `FALSE` | Lustre filesystem HDF5 compatibility |
 | `XLA_PYTHON_CLIENT_PREALLOCATE` | `false` | Don't pre-grab a fixed XLA pool; let NCCL/cuSOLVERMp share VRAM |
 | `XLA_PYTHON_CLIENT_ALLOCATOR` | `cuda_async` | cudaMallocAsync mempool (shared with NCCL) instead of XLA's BFC — **not** `platform`, see below |
-| `JAX_COMPILATION_CACHE_DIR` | `$SCRATCH/.jax_cache` | Persistent XLA PTX cache across JAX processes |
 
 > **`platform` is NOT cudaMallocAsync.**  The three values name three
 > different allocators in the CUDA plugin, and this table used to conflate
@@ -150,7 +149,7 @@ sbatch $LORRAX_ROOT/config/perlmutter/run_gw.slurm
 **Exported variables** for scripting:
 `LORRAX_ROOT`, `LORRAX_SRC`, `LORRAX_SITE`, `LORRAX_IMAGE`, `LORRAX_SHIFTER`,
 `LORRAX_FFI_NVHPC_HOST`, `LORRAX_FFI_PHDF5_HOST`, `LORRAX_FFI_SLATE_HOST`,
-`LORRAX_SLATE_INSTALL_DIR`, `JAX_COMPILATION_CACHE_DIR`.
+`LORRAX_SLATE_INSTALL_DIR`.
 
 ### Unified Cray MPICH stack
 
@@ -218,8 +217,10 @@ itself is *not* the bottleneck — everything above it is.
   etc. back-to-back. Saves the ~5 s shifter bring-up per invocation.
   (Python still cold-starts each call inside the shell — the real 100×
   win is keeping one Python REPL alive.)
-- **`JAX_COMPILATION_CACHE_DIR`** defaults to `$SCRATCH/.jax_cache`.
-  Amortises XLA PTX compile across JAX processes.
+- Repository compile-cache policy is owned by `ISDF_JAX_CACHE_DIR` /
+  `LORRAX_RUN_DIR` in
+  [`docs/dev/env_vars.md`](../docs/dev/env_vars.md).  The module does not arm a
+  second, process-global JAX cache before LORRAX's multi-rank agreement layer.
 - For multi-rank MPI runs, `lxrun` is still required — shifter's
   MPI integration needs `srun` on the outside (per upstream Shifter
   SLURM integration docs).

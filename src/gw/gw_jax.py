@@ -31,6 +31,35 @@ the q→0 Coulomb head is a scalar channel threaded through every stage,
 not a stage; W is evaluated at exactly the two frequencies {0, iω_p} a
 one-pole model is determined by.  See ``docs/theory/physics.md``.
 """
+import argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+	"""The CLI.  ABOVE the startup call so ``--help`` can reach it.
+
+	Needs nothing but ``argparse``, which is what makes the seam below
+	possible; see :mod:`runtime.cli_seam`.
+	"""
+	argp = argparse.ArgumentParser(
+		allow_abbrev=False,
+		description=(
+			"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
+			"self-energy, one-shot or self-consistent (see "
+			"gw_config.ComputeMode / QPSolver)."))
+	argp.add_argument(
+		"-i",
+		"--input",
+		default="cohsex_test.in",
+		help="Input file",
+	)
+	return argp
+
+
+if __name__ == "__main__":
+	# Argv is answered before any runtime exists — runtime/cli_seam.py.
+	from runtime.cli_seam import refuse_bad_argv
+	refuse_bad_argv(build_parser())
+
 from runtime import (
 	debug_print, debug_print_enabled, initialize_communicator_stack, rank0_print,
 )
@@ -47,7 +76,6 @@ from runtime import (
 #: in one process gets the same stack rather than a second mesh.
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
-import argparse
 import gc
 import os
 import time
@@ -56,7 +84,6 @@ import warnings
 import numpy as np
 import jax
 import jax.numpy as jnp
-jax.config.update("jax_enable_x64", True)
 
 from file_io import (
     load_kin_ion_submatrix, load_centroid_basis,
@@ -93,7 +120,13 @@ from .head_correction import (
 	format_static_head_diagnostics,
 )
 from .wavefunction_bundle import BandSlices
-from .production_report import GWProductionReport
+from .production_report import (
+	EQP0_FILE_ROLE,
+	EQP1_FILE_ROLE,
+	QP_ROTATIONS_FILE_ROLE,
+	QP_WFN_FILE_ROLE,
+	GWProductionReport,
+)
 from runtime.production_stream import ProductionStdout
 from .gw_output import (
 	GWResults,
@@ -171,19 +204,8 @@ def _compute_static_head(
 
 
 def main(argv=None):
-	_description = (
-		"LORRAX GW driver — X-only / COHSEX / GN-PPM / HL-PPM / MPA "
-		"self-energy, one-shot or self-consistent (see "
-		"gw_config.ComputeMode / QPSolver).")
-	argp = argparse.ArgumentParser(
-		allow_abbrev=False, description=_description)
-	argp.add_argument(
-		"-i",
-		"--input",
-		default="cohsex_test.in",
-		help="Input file",
-	)
-	args = argp.parse_args(argv)
+	# Same factory the module-scope seam used, so the two cannot disagree.
+	args = build_parser().parse_args(argv)
 
 	# ---- Stage timing: ONE table, and it sums to the wall -------------------
 	# ``timing.reset()`` used to sit just above the ISDF call, which threw
@@ -242,6 +264,30 @@ def main(argv=None):
 	# refusal names the mode; a typo'd mode value never reaches this line
 	# because ``config.compute_mode`` already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+	# Dynamic SC currently returns two basis sectors by design: finalized H/X
+	# operators are rotated back to DFT bands, while the full C(omega) operator
+	# remains in QP bands for the QSGW ansatz.  Refuse that unsupported output
+	# contract here, before screening or the expensive SC loop.  A second guard
+	# remains at the post-Sigma seam as an invariant against future routing drift.
+	if qp_solver is QPSolver.SELF_CONSISTENT and mode.is_dynamic:
+		raise ValueError(
+			"REFUSED: qp_solver=self_consistent beside a dynamic compute_mode.\n"
+			f"  got:  qp_solver={qp_solver.value}, compute_mode={mode.value}\n"
+			"  want: self_consistent with a STATIC compute_mode (cohsex), or a "
+			"dynamic compute_mode with qp_solver=one_shot_dft / fixed_point\n"
+			"  why:  the SC finalize rotates V_H / Sigma_x / Sigma_xc / "
+			"Sigma_SX / Sigma_COH to dft_band (gw/sc_iteration.py) and "
+			"leaves the C(omega) cube in qp_band by design, because the "
+			"QSGW ansatz only holds in the basis whose eigenvalues it uses "
+			"(gw.sigma_dispatch.SIGMA_BASIS_FIELDS). Their diagonals add up "
+			"only at U = identity.\n"
+			"  fix:  rotate the correlation operator for output, then delete "
+			"this guard, its twins at the post-Sigma seam and in "
+			"gw_output.write_results, and the qp_solver rows in "
+			"docs/input_reference.md and docs/drivers.md together.\n"
+			"  doc:  tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two "
+			"bases on the self-consistent path'; "
+			"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md")
 	do_screened = mode.needs_screening
 	print0(
 		f"  Head policy: head_correction={config.head.correction.value}; "
@@ -609,7 +655,9 @@ def main(argv=None):
 	# step — static COHSEX kernels for X_ONLY/COHSEX, the PPM pipeline
 	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
 	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
-	# E_DFT (textbook G0W0; ``solve_qp`` re-evaluates for fixed_point).
+	# E_DFT (a one-shot full-matrix effective Hamiltonian, distinct from the
+	# fixed-state diagonal G0W0 output; ``solve_qp`` re-evaluates for
+	# fixed_point).
 	# SC-iteration-1 ≡ this call, pinned by tests/test_invariance_gates.py
 	# ::test_sc_iteration1_equals_one_shot.
 	# SC runs skip it — the iteration map would re-do this work on iter 1.
@@ -817,6 +865,13 @@ def main(argv=None):
 	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
+	if (qp_solver is QPSolver.SELF_CONSISTENT
+			and sigma_c_omega is not None):
+		raise ValueError(
+			"self-consistent dynamic EQP output is not basis-consistent: H and "
+			"Sigma_x have been rotated to dft_band, while the full C(omega) "
+			"operator remains qp_band. Refusing to combine their diagonals until "
+			"the full C(omega) operator is rotated consistently.")
 	head_sigma_diag_w_kn_ry = (
 		sc_result.head_sigma_diag_dft_w_kn_ry
 		if qp_solver is QPSolver.SELF_CONSISTENT
@@ -827,13 +882,6 @@ def main(argv=None):
 	omega_grid_ry = (
 		np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
 		if sigma_result.omega_grid_ry is not None else None)
-	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
-	# only).  Same spelling as the PPM pipeline's step 4.
-	sigma_xc_at_dft_ev = (
-		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
-		+ sigma_c_at_dft_ev
-		if sigma_c_at_dft_ev is not None else None)
-
 	# ---- BGW-style degenerate-set averaging at the H-build seam ----
 	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
 	if not config.no_degen_averaging:
@@ -851,17 +899,10 @@ def main(argv=None):
 			arr = np.asarray(diag)
 			if arr.ndim == 1:
 				arr = np.broadcast_to(arr, np.asarray(enk_dft).shape)
-			if arr.ndim == 2:
+			if arr.ndim in (2, 3):
 				return average_within_degenerate_sets(
 					arr, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
 					tol_ry=float(config.degen_avg_tol_ry))
-			if arr.ndim == 3:
-				return np.stack([
-					average_within_degenerate_sets(
-						slab,
-						energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-						tol_ry=float(config.degen_avg_tol_ry))
-					for slab in arr], axis=0)
 			raise ValueError(
 				f"head diagnostic has unsupported shape {arr.shape}")
 
@@ -881,6 +922,17 @@ def main(argv=None):
 		if head_sigma_diag_w_kn_ry is not None:
 			head_sigma_diag_w_kn_ry = _average_head_diag(
 				head_sigma_diag_w_kn_ry)
+
+	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
+	# only).  Form it AFTER the one canonical conditioning seam above: forming
+	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
+	# unequal degenerate diagonals even while every other live text output used
+	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
+	# so this same expression deliberately preserves the raw red twin.
+	sigma_xc_at_dft_ev = (
+		np.diagonal(np.asarray(sig_x), axis1=1, axis2=2) * RYD_TO_EV
+		+ sigma_c_at_dft_ev
+		if sigma_c_at_dft_ev is not None else None)
 
 	# ---- Single H-build + diagonalization on replicated arrays ----
 	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
@@ -931,7 +983,7 @@ def main(argv=None):
 	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
 		write_qp_wfn_oneshot(
 			U_full, E_full, wfn=wfn, band_slices=band_slices,
-			input_dir=input_dir, print_fn=print0)
+			input_dir=input_dir, qp_solver=qp_solver, print_fn=print0)
 
 	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
 	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
@@ -942,6 +994,14 @@ def main(argv=None):
 	if sigma_c_omega is not None:
 		sigma_c_omega_diag_ev = np.asarray(extract_sigma_diag_replicated(
 			sigma_c_omega, mesh_xy)) * RYD_TO_EV
+		if not config.no_degen_averaging:
+			# Output-only diagonal curve.  The full persisted operator stays raw,
+			# while this curve uses the SAME canonical group owner at every omega;
+			# assemble_eqp consequently derives C(E_DFT) and Z from one function.
+			sigma_c_omega_diag_ev = average_within_degenerate_sets(
+				sigma_c_omega_diag_ev,
+				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry))
 		omega_rel_ev = omega_grid_ev
 	else:
 		sigma_c_omega_diag_ev = None
@@ -1030,8 +1090,12 @@ def main(argv=None):
 			# decision is made where the data is written, through
 			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
 			sym=sym,
+			degeneracy_policy=(
+				"disabled" if config.no_degen_averaging else "bgw_average"),
+			degeneracy_tol_ry=float(config.degen_avg_tol_ry),
 			write_qp_rotations=not rotations_written,
 			qp_rotations_k_storage=config.qp_rotations_k_storage,
+			qp_solver=qp_solver,
 			print_fn=print0,
 		)
 		timing.record("gw_jax.output", time.perf_counter() - _t_out)
@@ -1084,10 +1148,18 @@ def main(argv=None):
 		("self-energy table", "written" if os.path.exists(
 			config.paths.sigma_diag_file) else "absent",
 		 config.paths.sigma_diag_file),
-		("G0W0 energies", "written" if os.path.exists(config.paths.eqp0_file)
+		(EQP0_FILE_ROLE,
+		 "written" if os.path.exists(config.paths.eqp0_file)
 		 else "absent", config.paths.eqp0_file),
-		("linearized energies", "written" if os.path.exists(
+		(EQP1_FILE_ROLE,
+		 "written" if os.path.exists(
 			config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
+		(QP_ROTATIONS_FILE_ROLE, "written" if os.path.exists(
+			os.path.join(input_dir, "qp_wfn_rotations.h5")) else "absent",
+		 os.path.join(input_dir, "qp_wfn_rotations.h5")),
+		(QP_WFN_FILE_ROLE, "written" if os.path.exists(
+			os.path.join(input_dir, "WFN_qp.h5")) else "absent",
+		 os.path.join(input_dir, "WFN_qp.h5")),
 	]
 	if config.eqp2.enabled:
 		_file_rows.append((

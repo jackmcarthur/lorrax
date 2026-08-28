@@ -157,8 +157,14 @@ _L3_MODULES = frozenset({
     # function-local for that cycle.  Its only other ``src/`` import is
     # ``common.collectives.process_rank`` (L3), for the rank in the
     # filename.
-    "file_io.slab_io", "file_io._slab_io_ffi", "file_io.paths",
-    "file_io.hdf5_owner", "file_io.h5_journal",
+    #
+    # ``file_io._slab_io_serial`` is the transport's emulated-mesh tier
+    # (``P == 1`` with more mesh cells than processes).  Its whole subject
+    # is which devices a single process owns and which hyperslab each of
+    # them holds — process/device/file facts, the same ones
+    # ``_slab_io_ffi`` is made of — so it sits beside it and not above it.
+    "file_io.slab_io", "file_io._slab_io_ffi", "file_io._slab_io_serial",
+    "file_io.paths", "file_io.hdf5_owner", "file_io.h5_journal",
 })
 #: Whole packages at L3.  Two of the three services are here for the same
 #: reason ``ffi`` is: their entire subject is devices, meshes, processes,
@@ -577,11 +583,11 @@ _DRIVER_PLUMBING_BUDGET = {
     # its ``shard_map`` comes from ``common.shard_map`` rather than from
     # ``jax.experimental`` — so the residue is one ``jax.sharding`` import.
     "bandstructure.htransform": 1,
-    # One ``from jax.sharding import ...`` each.  The four BSE CLIs also
-    # default ``--px/--py`` to 1 and slice ``devices[:px*py]``, so on 16
-    # devices with no flags they run a 1x1 mesh with no warning.  That is a
-    # DEFAULTS bug, not a plumbing one; fixing the default in place comes
-    # first (see docs/architecture/layers.md, "what not to unify").
+    # One ``from jax.sharding import ...`` each (a ``mesh_xy: Mesh``
+    # annotation in every one).  The separate DEFAULTS bug these four
+    # carried — ``--px/--py`` defaulting to 1, so on 16 devices with no flags
+    # they ran a 1x1 mesh with no warning — is fixed (2026-08-27) and is now
+    # gated in section 5b, not described here.
     "bse.bse_feast": 1,
     "bse.bse_pseudopoles": 1,
     "bse.bse_w_exact": 1,
@@ -1158,12 +1164,25 @@ _MESH_OWNERS = {
     "common.collectives",     # resolve_mesh + single_device_mesh: THE two
     "runtime",                # RuntimeStack.reshape, which then calls
                               # prepare_mesh on the result
-    # ``create_mesh_2d`` — the ONLY other one left, and it is not a dialect,
+    # ``create_mesh_xy`` — the ONLY other one left, and it is not a dialect,
     # it is a contract: it builds the mesh AND warms the impl=mpi
     # communicator cliques, without which the TDA Lanczos dies on every rank
-    # at P=16 (32 refusals, job 7881216; 0 with it).  Folding it into
-    # ``prepare_mesh`` is the open warm-up-contract decision, and doing it by
-    # deleting the call site is how the refusals come back.
+    # at P=16 (32 refusals, job 7881216; 0 with it), plus the
+    # process_allgather clique (4 of 4 cells at P=16, job 7882523).  Folding
+    # it into ``prepare_mesh`` is the open warm-up-contract decision, and
+    # doing it by deleting the call site is how the refusals come back.
+    # That deferral is now load-bearing, not merely postponed (owner ruling
+    # wanted): it is the whole reason ``create_mesh_xy_from_flags``'s omitted
+    # arm must route through ``create_mesh_2d()`` rather than a bare
+    # ``resolve_mesh()`` — a bare resolve returns the right object with
+    # neither warm-up — and it is why the BSE family cannot adopt
+    # ``gw/downfold_cli.py``'s ``RUNTIME.reshape`` shape instead.
+    # Since 2026-08-27 the direct-construction arm is reachable only when a
+    # caller hands it an explicit device list: a shape must consume the list
+    # it is given, so the default path (devices=None) always lands on the
+    # canonical-mesh branch.  ``_BSE_MESH_OWNER`` in section 5b asserts the
+    # same fact for src/bse/ against a literal rather than against this
+    # editable set.
     "bse.bse_ring_comm",
     # GATE 10 must build a 1x1 mesh over ``jax.devices("cpu")`` INSIDE a
     # process whose default backend is CUDA — that inversion is the thing the
@@ -1211,6 +1230,144 @@ def test_the_mesh_scan_can_fail():
             f"the mesh scan does not detect a construction in {src!r}")
     assert scan_mesh_construction("mesh = prepare_mesh()\nx = mesh.shape\n") == [], (
         "the mesh scan flags a mesh USE; only construction is banned")
+
+
+# ===========================================================================
+# 5b.  RULE 4, sharpened for the BSE family — one mesh, and no 1x1 default
+# ===========================================================================
+#
+# Rule 4 above is enforced against ``_MESH_OWNERS``, an editable set: adding a
+# module to it is a two-line change that makes the gate pass.  For the BSE
+# family the owner is a fact, not a licence — ``bse_ring_comm`` is the only
+# module in ``src/bse/`` that may construct a Mesh — so it is asserted here
+# against a literal, where widening it means editing the assertion itself.
+#
+# The second rule below is the one this bundle exists for, and rule 4 cannot
+# see it: a driver does not need to say ``Mesh(`` to end up on the wrong mesh.
+# Until 2026-08-27 all six bse-family drivers declared ``--px``/``--py`` with
+# ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
+# ``bse_w_exact``, ``exciton_bands``, two declarations each, twelve in all —
+# so a run with no flags asked the (correct, shared) factory for
+# a 1x1 — the whole BSE on one device of a four-GPU node, while the startup
+# report announced 2x2; at P>1 the same default builds over
+# ``jax.devices()[:1]``, process 0's device on every rank.  Measured on the
+# pre-fix tree in a four-device process (``JAX_PLATFORMS=cpu
+# XLA_FLAGS=--xla_force_host_platform_device_count=4``): startup mesh (2, 2),
+# ``create_mesh_xy(1, 1)`` -> shape (1, 1) over device [0], ``is
+# RUNTIME.mesh`` False, every ``make_bse_shardings`` entry embedding the twin.
+# The fix makes omission mean "the run's mesh"
+# (``bse_ring_comm.create_mesh_xy_from_flags``), so the argparse default is the
+# thing that has to stay right — and the default is therefore what this gate
+# reads.  ``default=None`` is the spelling ``gw/downfold_cli.py`` already uses.
+
+#: The one module in ``src/bse/`` allowed to construct a ``Mesh``.
+_BSE_MESH_OWNER = "bse.bse_ring_comm"
+
+
+def scan_px_py_defaults(source: str):
+    """Every ``add_argument("--px"/"--py", ...)``. ``[(line, flag, default)]``.
+
+    ``default`` is the unparsed source of the ``default=`` keyword, or
+    ``"<absent>"`` when there is none (argparse's own default is ``None``,
+    which is the wanted behaviour, so absence passes).  AST, not prose: a
+    comment arguing about the default is not the default.
+    """
+    out = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else (
+            fn.id if isinstance(fn, ast.Name) else None)
+        if name != "add_argument":
+            continue
+        flags = [a.value for a in node.args
+                 if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        flag = next((f for f in flags if f in ("--px", "--py")), None)
+        if flag is None:
+            continue
+        default = "<absent>"
+        for kw in node.keywords:
+            if kw.arg == "default":
+                default = ast.unparse(kw.value)
+                break
+        out.append((node.lineno, flag, default))
+    return sorted(out)
+
+
+def _bse_modules(sources):
+    return sorted(m for m in sources if m.split(".")[0] == "bse")
+
+
+def test_the_bse_family_builds_no_second_mesh(sources):
+    """``src/bse/`` constructs a ``Mesh`` in exactly one file."""
+    mods = _bse_modules(sources)
+    assert len(mods) >= 10 and _BSE_MESH_OWNER in mods, (
+        f"the scan saw {len(mods)} bse modules ({mods}) — it must see the "
+        f"package, or this gate passes vacuously")
+    offenders = {m: scan_mesh_construction(sources[m])
+                 for m in mods if m != _BSE_MESH_OWNER
+                 and scan_mesh_construction(sources[m])}
+    assert not offenders, (
+        f"these build their own Mesh inside src/bse/: {offenders}.  The BSE "
+        f"mesh has ONE factory ({_BSE_MESH_OWNER}.create_mesh_xy) because it "
+        f"is also where the impl=mpi clique warm-up and the process_allgather "
+        f"warm-up live; a second Mesh is a second set of communicators, a "
+        f"second copy of every shape-keyed jit cache, and — measured — 32 "
+        f"refusals at P=16 (job 7881216).  Call create_mesh_xy_from_flags "
+        f"(--px/--py), create_mesh_2d (the run's mesh) or "
+        f"collectives.single_device_mesh (process-local 1x1).")
+
+
+def test_the_bse_mesh_owner_still_owns_one(sources):
+    """Control: if the factory moved, the gate above would pass on an empty
+    scan and nobody would notice."""
+    assert scan_mesh_construction(sources[_BSE_MESH_OWNER]), (
+        f"{_BSE_MESH_OWNER} constructs no Mesh — the factory moved, and the "
+        f"gate above is now asserting nothing about the file that matters")
+
+
+def test_no_bse_driver_defaults_its_mesh_shape(sources):
+    """``--px``/``--py`` omitted must mean the run's mesh, never 1x1."""
+    seen, bad = [], []
+    for mod in _bse_modules(sources):
+        for line, flag, default in scan_px_py_defaults(sources[mod]):
+            seen.append((mod, flag))
+            if default not in ("None", "<absent>"):
+                bad.append((mod, line, flag, default))
+    # Exact, not a floor.  At ``>= 10`` two declarations could vanish with the
+    # gate still green — a driver losing its --px/--py silently reverts to
+    # whatever its main() does with the missing attribute, which is the class
+    # of defect this section exists for.  Six drivers x two flags = 12; if a
+    # seventh driver is added, edit this literal deliberately (rule: prefer
+    # the sufficient check over the merely necessary one).
+    assert len(seen) == 12, (
+        f"{len(seen)} --px/--py declarations found in src/bse/, expected 12 "
+        f"(six drivers x two flags): {seen}.  Either a driver stopped "
+        f"declaring its mesh flags, or one was added and this literal is "
+        f"stale — both need a human, neither is a pass")
+    assert not bad, (
+        f"these give --px/--py a shape default: {bad}.  Omitted means the "
+        f"job's canonical square mesh (bse_ring_comm.create_mesh_xy_from_"
+        f"flags); a numeric default silently runs a four-GPU node on one "
+        f"device and strands every rank >= 1 at P>1.  Use default=None, as "
+        f"gw/downfold_cli.py does.")
+
+
+def test_the_px_py_default_scan_can_fail():
+    """RED TWIN for both spellings of the defect it exists to catch."""
+    bad = ('p.add_argument("--px", type=int, default=1)\n'
+           'p.add_argument("--py", type=int, default=1)\n')
+    assert [d for _, _, d in scan_px_py_defaults(bad)] == ["1", "1"], (
+        "the scan does not read a numeric --px/--py default")
+    ok = ('ap.add_argument("--px", type=int, default=None, help="rows")\n'
+          'ap.add_argument("--py", type=int)\n')
+    assert [d for _, _, d in scan_px_py_defaults(ok)] == ["None", "<absent>"], (
+        "the scan misreads an explicit None or an absent default")
+    assert scan_px_py_defaults('p.add_argument("--pxx", default=1)\n') == [], (
+        "the scan matches a flag that merely starts with --px")
+    assert scan_px_py_defaults('# px defaults to 1 here\nx = 1\n') == [], (
+        "the scan reads prose: a comment about a default is not a default")
 
 
 # ===========================================================================

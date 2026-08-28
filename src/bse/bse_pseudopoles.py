@@ -31,7 +31,7 @@ from .bse_ring_comm import (
     build_density_snapshot_operator,
     build_density_drive_operators,
     build_density_readout_operator_full,
-    create_mesh_xy,
+    create_mesh_xy_from_flags,
     make_bse_shardings,
 )
 from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
@@ -212,14 +212,6 @@ def _feast_filter(
     filtered, iters = runner(X_batch.astype(runner_dtype), z_jnp, w_jnp, diag_h_gmres)
     iters_host = np.asarray(jax.device_get(iters))
     return filtered, iters_host
-
-
-def _create_mesh_xy(px: int, py: int) -> Mesh:
-    """Alias of the ONE BSE mesh factory (``bse_ring_comm.create_mesh_xy``).
-
-    Was a local un-warmed copy.  See ``create_mesh_xy`` for why.
-    """
-    return create_mesh_xy(px, py)
 
 
 def run_pseudopoles(
@@ -563,8 +555,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--m0", type=int, default=6, help="Biased random seeds per window.")
     parser.add_argument("--n-quad", type=int, default=8, help="Quadrature points per half contour.")
     parser.add_argument("--p-keep", type=int, default=4, help="Bright modes retained per window.")
@@ -596,7 +592,12 @@ def main(argv: list[str] | None = None) -> None:
 
     timing.reset()
 
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
+    # shape must BE that mesh.  Called through the one owner, not a local
+    # alias: this module used to carry one of the four ``_create_mesh_xy``
+    # copies, which is why five drivers silently ran un-warmed at P>1.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)
 
     with timing.section("pseudopoles.load"):

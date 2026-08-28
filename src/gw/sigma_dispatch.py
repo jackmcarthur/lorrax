@@ -485,7 +485,14 @@ def finalize_dynamic_sigma(
                 print_fn=print_fn,
             )
         else:
-            sigma_omega_h5_path = sigma_omega_output_path(config, input_dir)
+            # The field names the cube this finalize wrote, so with no write
+            # it is None.  A path here promises a file that does not exist:
+            # qsgw_utils.write_qsgw_sigma_cube opens it "a" (h5py creates a
+            # file with no omega axis and no raw operators) and
+            # gw_output.write_results raises FileNotFoundError appending the
+            # EQP receipt.  Only the SC path passes False today, and it
+            # replaces the field afterwards with the converged write.
+            sigma_omega_h5_path = None
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(

@@ -1065,10 +1065,26 @@ which is deliberate.
 The defect is downstream: `compute_eqp_diag` forms
 `Δ = kin_ion + V_H + Σ_x + Σ_c(E_DFT) − E_DFT` from three DFT-basis
 diagonals plus that one QP-basis diagonal.  The sum is basis-consistent
-only at U = identity.  `write_results` is unguarded, so both files are
-written on the SC path (unlike `eqp_g0w0.dat`, guarded at
-`gw_output.py:846`).  The same mixing reaches `sigma_xc_at_dft_ev`
+only at U = identity.  The same mixing reaches `sigma_xc_at_dft_ev`
 (`gw_jax.py:600-603`).
+
+FAIL-CLOSED SINCE 2026-08-25, which is a refusal and not a fix.  Upstream
+`92130176` (here as `44ee0dfa`) added guards at driver entry and at the
+post-Σ seam, and `9d79b6c` (`6fafd126`) a third in `write_results`, so
+`qp_solver = self_consistent` beside a dynamic `compute_mode` now raises
+before screening instead of writing two files that mix bases.  Static SC
+(`cohsex`) is untouched.  The measurement above is still owed: nothing has
+bounded the error, so the combination is refused, not known-bad.
+
+What the removal costs: `tests/regression/gnppm_debug/gnppm_sc.in` is the
+tree's only self-consistent deck and now raises at driver entry, and its
+`gnppm_sc_session` fixture (`tests/conftest.py:845`) had no consumer, so
+nothing turned red.  `tests/test_qp_solver_config.py`'s
+`test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses` is the
+tombstone: it reads that deck, checks it still declares the refused pair,
+and AST-checks the guard, so restoring the capability fails there and takes
+the doc rows with it.  Details:
+`docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md`.
 
 The error scales with ‖U − 1‖ and NO ONE HAS MEASURED IT.  To measure:
 read `U_mnk` from an SC run's `qp_wfn_rotations.h5`, report the largest
@@ -3221,3 +3237,22 @@ Evidence:
 `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/reports/screening_diagrams_wbse/evidence/`
 — `operator_reciprocity_mesh4.*`, `ladder_finiteq_gate_mesh4.*`,
 `closure_gate_mesh4.*`, `combined_mesh4.*`. Sandbox claims 0214 / 0215.
+
+## test_w_head_densify's equal-grid cell fails after another suite runs
+
+OPEN, 2026-08-27, environment interaction, not a branch regression.
+`tests/test_w_head_densify.py::test_the_loader_does_not_defer_when_the_grids_are_equal`
+passes when its file runs alone — 70 passed, with no FFI library, with the
+host leg, and with both legs — and fails inside a multi-file run with
+`IndexError: index 0 is out of bounds for axis 0 with size 0` at
+`src/bse/bse_loading.py:202`, where `_get_local_mesh_coords` looks up
+`jax.local_devices()` in the 1x1 mesh the cell just built. Some other
+module in the run changed the process's device set first; this is the same
+collection-time `os.environ` mutation that makes a bare `pytest tests/`
+exit 4.
+
+Measured on both sides of the receipt fix with one command and the same two
+FFI libraries: 1 failed / 301 passed / 8 skipped at `6fafd126`, and 1 failed
+/ 304 passed / 8 skipped after it, the same cell each time. Pairing
+`test_sanity_gates_jax.py` before it reproduces the failure; pairing
+`test_jax_cache_contract.py` before it does not.

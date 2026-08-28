@@ -575,22 +575,32 @@ def _probe_mpi_world_size():
             if not flag.value:
                 return None, f"{label}: MPI not initialized at this point"
             size = ctypes.c_int(-1)
+            # ABI is detected by SYMBOL PRESENCE, never by trial call: with
+            # the flavours swapped, MPI_Comm_size does not return an error —
+            # Open MPI dereferences the MPICH integer handle 0x44000000 as a
+            # pointer and SEGFAULTS (measured: Ubuntu OpenMPI 4.1/libmpi.so.40,
+            # cloud-lane bring-up 2026-08-26, crash in MPI_Comm_size+0x3c
+            # "Address not mapped").  ompi_mpi_comm_world existing in the
+            # library is what makes it Open MPI; its absence is what permits
+            # the MPICH-handle call.
+            try:
+                addr = ctypes.addressof(
+                    ctypes.c_void_p.in_dll(lib, "ompi_mpi_comm_world"))
+            except (ValueError, AttributeError):
+                addr = None
+            if addr is not None:
+                # Open MPI ABI: MPI_COMM_WORLD is &ompi_mpi_comm_world.
+                if lib.MPI_Comm_size(ctypes.c_void_p(addr),
+                                     ctypes.byref(size)) == 0 \
+                        and size.value > 0:
+                    return size.value, f"{label}, Open MPI ABI"
+                last = f"{label}: MPI_Comm_size returned no usable size (Open MPI ABI)"
+                continue
             # MPICH ABI: MPI_COMM_WORLD is the integer handle 0x44000000.
             comm = ctypes.c_int(0x44000000)
             if lib.MPI_Comm_size(comm, ctypes.byref(size)) == 0 \
                     and size.value > 0:
                 return size.value, f"{label}, MPICH ABI"
-            # Open MPI ABI: MPI_COMM_WORLD is &ompi_mpi_comm_world.
-            try:
-                addr = ctypes.addressof(
-                    ctypes.c_void_p.in_dll(lib, "ompi_mpi_comm_world"))
-                size2 = ctypes.c_int(-1)
-                if lib.MPI_Comm_size(ctypes.c_void_p(addr),
-                                     ctypes.byref(size2)) == 0 \
-                        and size2.value > 0:
-                    return size2.value, f"{label}, Open MPI ABI"
-            except (ValueError, AttributeError):
-                pass
             last = f"{label}: MPI_Comm_size returned no usable size"
         except (AttributeError, OSError) as e:
             last = f"{label}: {type(e).__name__}: {e}"
@@ -957,39 +967,25 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
     return tuple(out)
 
 
-def _local_shard_and_global_offset(
-    A: jax.Array,
-) -> tuple[np.ndarray, tuple[int, ...]]:
-    """Return ``(local_numpy, global_offset)`` for the process-local shard.
-
-    LORRAX runs one JAX device per process under multi-process (mesh on
-    ``mesh_xy``), so each process has exactly one addressable shard.
-
-    The shard's ``.index`` is a tuple of ``slice`` objects giving the
-    GLOBAL start/stop along each axis.  Slabs are always contiguous
-    along each axis (no broadcast tiling) so ``.start`` is the offset
-    within A.shape.  Replicated axes give ``slice(0, A.shape[ax])`` —
-    every process holds the full axis and writes the same overlapping
-    rows; under independent MPI-IO that's a redundant write but
-    semantically correct (every rank writes identical bytes).
-    """
-    shards = A.addressable_shards
-    if len(shards) != 1:
-        # Multi-device-per-process (e.g. GPU with N visible devices
-        # under a single process).  Not the LORRAX CPU mesh-xy regime
-        # but worth a clear error rather than silent wrong data.
-        raise RuntimeError(
-            f"SlabIO expects 1 addressable shard per process; "
-            f"got {len(shards)} for A.shape={tuple(A.shape)}.  Did you "
-            f"set --xla_force_host_platform_device_count > 1 on a "
-            f"multi-process run?")
-    shard = shards[0]
-    local = np.asarray(shard.data)
-    # Replicated axes have ``slice(None, None)`` (no explicit bounds);
-    # treat ``start=None`` as 0 (the full-axis slab starts at 0).
-    offset = tuple(int(s.start) if s.start is not None else 0
-                   for s in shard.index)
-    return local, offset
+# ``_local_shard_and_global_offset`` — "one addressable shard per process,
+# and here is its global offset" — was deleted on 2026-08-27, for the same
+# reason as ``_shard_read_plan`` below and with the same evidence.  A
+# repo-wide grep at a28b9daa over src/ services/ tests/ tools/ config/
+# docs/ found the definition here and no call site: the only live copy is
+# ``wfn_loader._collectives._local_shard_and_global_offset``, whose own
+# docstring records that it was ported from this file verbatim, and which
+# ``wfn_loader.loader`` does call.
+#
+# It had to go now rather than later because it was actively misleading
+# about this module.  Its refusal read "SlabIO expects 1 addressable shard
+# per process; got N ... Did you set
+# --xla_force_host_platform_device_count > 1 on a multi-process run?",
+# sitting in the transport that ``file_io._slab_io_serial`` extends —
+# where four addressable shards in one process is now the supported
+# geometry and is exactly what the serial tier iterates.  A dead helper
+# stating a constraint the live code does not have is worse than no
+# helper: the next reader has to prove it is dead before trusting the
+# tier beside it.
 
 
 # ``_shard_read_plan`` — the per-device (local_shape, dst, disk) hyperslab
@@ -1412,6 +1408,25 @@ class _DatasetGeometry:
     callers.  ``lrx_phdf5_ensure_dataset`` performs the same check
     collectively on every rank, which is where it has to be — a Python
     twin can only see the ranks that reach it, and the two could disagree.
+
+    The emulated tier has its own Python twin of that rule, and it is not
+    the one deleted above: ``_slab_io_serial._SerialBackend.create_dataset``
+    restates reuse-or-refuse in Python because it never calls
+    ``lrx_phdf5_ensure_dataset`` at all — there is no C handler on that
+    path.  The 2026-08-11 argument does not reach it either, because the
+    tier exists only at ``process_count() == 1``: with exactly one rank,
+    "a Python twin can only see the ranks that reach it" is a distinction
+    without a difference.  If the two wordings ever have to say the same
+    thing, they are ``_slab_io_ffi``'s C call and that method.
+
+    The geometry and normalisation helpers below are shared, not private
+    to this transport: ``_slab_io_serial`` imports ``_DatasetGeometry``,
+    ``_normalize_slab_request``, ``_normalize_valid_shape``,
+    ``_normalize_window_tables``, ``_replace_inode_for_write``,
+    ``_sharding_to_axis_info``, ``_shard_divisors``,
+    ``_validate_block_divisible``, ``_apply_dataset_attrs`` and
+    ``mesh_divisible_shape`` from here.  They are underscore-private to the
+    package, not to this module, and changing one changes both tiers.
     """
 
     def _geom_init(self) -> None:
@@ -1658,6 +1673,14 @@ def _apply_dataset_attrs(h5, pending) -> None:
 # ---------------------------------------------------------------------------
 class _FfiBackend(_DatasetGeometry):
     """Collective MPI-IO SlabIO backend."""
+
+    #: Which HDF5 library instance this backend's operations go through, in
+    #: the vocabulary ``file_io.hdf5_owner`` and ``file_io.h5_journal``
+    #: share.  ``file_io.slab_io`` stamps its own journal lines with this
+    #: rather than with a module constant of its own — a door that names a
+    #: library its backend does not use defeats the instrument whose entire
+    #: subject is which library touched the file.
+    journal_stack = _J_FFI
 
     def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
         # Lazy import — keeps file_io importable without the FFI built.

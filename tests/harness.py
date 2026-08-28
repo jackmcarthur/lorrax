@@ -624,10 +624,15 @@ def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
     if platform is None:
         platform = requested_platform()
     env = os.environ.copy()
-    cache_dir = Path(env.get("JAX_COMPILATION_CACHE_DIR",
-                             str(REPO_ROOT / ".pytest_jax_cache")))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir))
+    cache_setting = env.get(
+        "ISDF_JAX_CACHE_DIR", str(REPO_ROOT / ".pytest_jax_cache"))
+    if cache_setting.strip():
+        Path(cache_setting).mkdir(parents=True, exist_ok=True)
+    env.setdefault("ISDF_JAX_CACHE_DIR", cache_setting)
+    # One cache owner: callers testing the native JAX knob may restore it in
+    # ``extra_env`` below, but ordinary regression runs exercise LORRAX's
+    # agreement/atomic-write path rather than an inherited global cache.
+    env.pop("JAX_COMPILATION_CACHE_DIR", None)
     env.setdefault("JAX_ENABLE_COMPILATION_CACHE", "1")
     env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
     env.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
