@@ -563,7 +563,45 @@ def test_write_receipt_reset_is_deterministic():
 
 def test_capped_lru_write_cost_is_explicitly_unmeasured(monkeypatch,
                                                         tmp_path):
-    """The delegated P=1 eviction path must not publish numeric zeros."""
+    """The delegated P=1 eviction path must not publish numeric zeros.
+
+    This is the ONE cell in this file that reaches jax's real
+    ``lru_cache.LRUCache``, so it is the one cell with a dependency the rest
+    of the module does not have.  See the guard below.
+    """
+    # CANNOT-RUN, WHICH IS NOT A PASS.
+    #
+    # Setting ``compilation_cache_max_size`` to a finite 1024 is exactly what
+    # this test is about: a finite cap is what puts ``_AtomicLRUCache`` on its
+    # parent's eviction branch (``eviction_enabled = max_size != -1``), which
+    # is the branch whose write cost the patch refuses to report as a numeric
+    # zero.  But that same branch is the one jax guards with
+    # ``if filelock is None: raise RuntimeError(...)``
+    # (jax/_src/lru_cache.py) — so with ``filelock`` absent the constructor
+    # raises before a single assertion below executes.
+    #
+    # ``filelock`` is not a declared dependency of this tree (pyproject lists
+    # h5py, jax, jaxlib, matplotlib, numpy, scipy, xmlschema, xsdata) and jax
+    # itself treats it as optional, so on a bare environment this cell was a
+    # deterministic hard FAIL that said nothing whatever about the code under
+    # test — the kind of standing red everybody learns to scroll past, which
+    # is how a real regression gets to hide behind it.
+    #
+    # Skipping is therefore the honest report and NOT a pass: a skip here
+    # means the delegated-eviction receipt went UNVERIFIED on this machine.
+    # The fix is to install ``filelock`` and re-run, not to read the green.
+    pytest.importorskip(
+        "filelock",
+        reason="CANNOT-RUN (not a pass): the `filelock` package is not "
+               "installed.  This cell sets a finite "
+               "jax_compilation_cache_max_size, which is what puts jax's "
+               "LRUCache on its eviction branch, and that branch raises "
+               "RuntimeError('Please install the `filelock` package to set "
+               "`jax_compilation_cache_max_size`') before any assertion here "
+               "runs.  So the delegated-eviction write-metrics receipt is "
+               "UNVERIFIED on this machine, not verified-good.  Fix: install "
+               "filelock (pip install filelock) and re-run this cell.")
+
     cc, _ = _fake_compilation_cache(4, verification=False)
     monkeypatch.setattr(jax_src, "compilation_cache", cc, raising=False)
     monkeypatch.setattr(
