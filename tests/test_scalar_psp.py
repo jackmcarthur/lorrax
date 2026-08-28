@@ -377,3 +377,134 @@ def test_real_sr_si_upf_is_scalar_end_to_end():
     assert sp.n_proj == len(sp.proj_l)
     off = sp.dij - np.diag(np.diag(sp.dij))
     assert not off.any()
+
+
+# ---------------------------------------------------------------------------
+# QE radial quadrature conventions (2026-08-28 KIH-offset fix).
+#
+# Two schemes were brought into line with QE 7.4 after a per-term diagonal
+# comparison against pw2bgw kih.dat isolated two constant offsets:
+#
+# * V_loc (build_projectors_qe._qe_vloc_radial_scheme): the alpha-Z / SR
+#   tables integrated with BARE rab weights (rectangle rule) over the FULL
+#   mesh.  Euler-Maclaurin: rectangle-vs-Simpson error ~ -(h^2/12) f'(0)
+#   with f'(0) = Z e^2 exactly, a pseudo-independent -0.08 meV constant on
+#   every KIH diagonal (Si, h=0.01); the full-mesh tail added +0.068 meV
+#   for the FR Si pseudo.  QE: Modules/read_pseudo.f90 truncates at
+#   r <= 10 bohr, forces the count odd, upflib/simpsn.f90 weights.
+#
+# * V_NL (radial_tables.build_all_tables): beta integrals ran over the
+#   full mesh with generic Simpson weights; QE (upflib/beta_mod.f90) uses
+#   simpsn over EXACTLY upf%kkbeta points.  ONCVPSP l=2 betas end on
+#   ~1e-4 nonzero values at that index -> +0.004 meV V_NL constant.
+#
+# Each test pins the fixed scheme against an INDEPENDENT implementation
+# (scipy.integrate.simpson on the same truncated mesh) and carries a red
+# twin: the OLD scheme's value must FAIL the new tolerance, so the test
+# cannot be satisfied by a tautology.
+# ---------------------------------------------------------------------------
+
+def _staged_upfs():
+    fr = Path.home() / ("projects/nonspinor_2026-08-28/runs/Si_sr_4x4x4/"
+                        "qe_fravg/nscf/Si.upf")
+    out = []
+    if _SR_SI.exists():
+        out.append(("sr", _SR_SI))
+    if fr.exists():
+        out.append(("fr", fr))
+    return out
+
+
+@pytest.mark.skipif(not _staged_upfs(), reason="no staged Si UPFs")
+@pytest.mark.parametrize("tag,path", _staged_upfs())
+def test_qe_vloc_radial_scheme_matches_qe_and_old_rectangle_fails(tag, path):
+    from scipy.integrate import simpson as scipy_simpson
+
+    from psp.radial.build_projectors_qe import _qe_vloc_radial_scheme
+    from psp.species import extract_species
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+
+    sp, = extract_species({"Si": normalize_dataclass(load_upf(path))})
+    r, rab, v, z = sp.r, sp.rab, sp.vloc_r, sp.z_valence
+    e2 = 2.0
+
+    msh, w = _qe_vloc_radial_scheme(r, rab)
+    # QE's msh rule: odd, and the last included point is the first r > 10
+    # (or the trimmed full mesh when r never exceeds 10 bohr).
+    assert msh % 2 == 1
+    if r[-1] > 10.0:
+        assert r[msh - 1] <= 10.0 + r[1] - r[0] and r[min(msh, len(r) - 1)] >= 10.0 - 1e-12
+
+    f = r * (r * v + z * e2)                      # alpha-Z integrand
+    alpha_fixed = float(np.sum(f[:msh] * w))
+    # Independent reference: scipy's composite Simpson on the SAME odd
+    # truncated mesh (dx from rab: uniform ONCVPSP grid).
+    alpha_ref = float(scipy_simpson(f[:msh], x=r[:msh]))
+    assert abs(alpha_fixed - alpha_ref) < 1e-10
+
+    # RED TWIN: the pre-fix scheme (bare rab over the full mesh) misses the
+    # reference by ~6.7e-5 (SR) / ~1.3e-5 (FR) Ry*bohr^3 -- an 0.08 / 0.016
+    # meV constant on every KIH diagonal.  It must FAIL the tolerance above.
+    alpha_old = float(np.sum(f * rab))
+    assert abs(alpha_old - alpha_ref) > 1e-6
+
+    # Same for the q>0 short-range table at a representative q.
+    from scipy.special import erf as _erf
+    q = 2.0
+    a = r * v + z * e2 * _erf(r)
+    g = a * np.sin(q * r) / q
+    t_fixed = float(np.sum(g[:msh] * w))
+    t_ref = float(scipy_simpson(g[:msh], x=r[:msh]))
+    assert abs(t_fixed - t_ref) < 1e-10
+
+
+@pytest.mark.skipif(not _SR_SI.exists(), reason=f"{_SR_SI} not staged")
+def test_beta_tables_use_kkbeta_and_full_mesh_generic_weights_fail():
+    from scipy.special import spherical_jn
+
+    from psp.radial_tables import (_qe_simpsn_weights, _simpson_weights,
+                                   build_all_tables)
+    from psp.species import extract_species
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+
+    sp, = extract_species({"Si": normalize_dataclass(load_upf(_SR_SI))})
+    assert 0 < sp.kkbeta < len(sp.r)              # 196 for this UPF
+
+    tables = build_all_tables([sp], q_max=5.0, n_q=101)
+    q = tables["q"]
+    F = tables["proj_tables"][0]                  # (n_proj, n_q)
+
+    # Reference: direct QE-simpsn integral over kkbeta points, per q.
+    kk = sp.kkbeta
+    w_qe = _qe_simpsn_weights(kk) * sp.rab[:kk]
+    w_old = _simpson_weights(len(sp.r)) * sp.rab  # pre-fix: full mesh
+    ip = int(np.argmax(sp.proj_l))                # an l=2 projector
+    l = int(sp.proj_l[ip])
+    integ = sp.beta_r[ip] * sp.r ** 2             # r^2 (beta/r) = r * beta_upf
+    worst_fix = worst_old = 0.0
+    for iq in (30, 60, 90):
+        jl = spherical_jn(l, q[iq] * sp.r)
+        ref = float(np.sum(integ[:kk] * jl[:kk] * w_qe))
+        old = float(np.sum(integ * jl * w_old))
+        worst_fix = max(worst_fix, abs(F[ip, iq] - ref))
+        worst_old = max(worst_old, abs(old - ref))
+    assert worst_fix < 1e-12
+    # RED TWIN: the old full-mesh generic weights disagree at ~1e-6 for
+    # this l=2 projector (beta ends on ~1e-4 nonzero values at kkbeta),
+    # the +0.004 meV V_NL diagonal constant.
+    assert worst_old > 1e-8
+
+
+def test_qe_simpsn_weights_match_upflib_conventions():
+    """Odd n: standard composite Simpson.  Even n: QE's simpsn drops the
+    last point and closes with net 1/3 on the one before -- i.e. the odd
+    rule on the first n-1 points, NOT scipy's even-interval handling."""
+    from psp.radial_tables import _qe_simpsn_weights
+
+    w7 = _qe_simpsn_weights(7)
+    assert np.allclose(w7 * 3.0, [1, 4, 2, 4, 2, 4, 1])
+    w8 = _qe_simpsn_weights(8)
+    assert w8[7] == 0.0
+    assert np.allclose(w8[:7], w7)

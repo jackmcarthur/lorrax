@@ -124,6 +124,28 @@ def _simpson_weights(n_r: int) -> np.ndarray:
     return sw
 
 
+def _qe_simpsn_weights(n: int) -> np.ndarray:
+    """QE's composite-Simpson weights, upflib/simpsn.f90 EXACTLY.
+
+    Odd n: the standard 1/3, 4/3, 2/3, ..., 4/3, 1/3.  Even n: QE's
+    even-mesh branch — the last point gets weight 0 and the one before it
+    net 1/3 (interior 2/3 minus the closing 1/3), i.e. the standard odd
+    rule on the first n-1 points.  β integrals in QE run over exactly
+    ``upf%kkbeta`` points (often even — 196 for the PseudoDojo Si UPFs),
+    so matching QE's V_NL requires this branch, not a parity fix-up.
+    """
+    w = np.zeros(n, dtype=np.float64)
+    i = np.arange(2, n)                      # 1-based interior 2..n-1
+    w[1:n - 1] = np.abs((i % 2) - 2) * 2.0   # even i -> 4, odd i -> 2
+    if n % 2 == 1:
+        w[0] += 1.0
+        w[n - 1] += 1.0
+    else:
+        w[0] += 1.0
+        w[n - 2] -= 1.0
+    return w / 3.0
+
+
 def build_all_tables(
     species_list: list[SpeciesData],
     q_max: float,
@@ -190,31 +212,42 @@ def build_all_tables(
             has_nlcc[i] = True
 
         # ── Projector forward + deriv tables, grouped by l (resp. l+1) ──
+        # β integrals use QE's convention (upflib/beta_mod.f90 init_tab_beta):
+        # simpsn weights over EXACTLY kkbeta points, NOT the full mesh.
+        # ONCVPSP l=2 betas end on ~1e-4 nonzero values at the cutoff
+        # index, where full-mesh generic weights disagree with QE —
+        # measured as a +0.004 meV constant on every V_NL diagonal.
+        kkb = int(getattr(sp, "kkbeta", 0)) or n_r
+        kkb = min(kkb, n_r)
+        wb_np = _qe_simpsn_weights(kkb) * sp.rab[:kkb]
+        rb_j = jnp.asarray(sp.r[:kkb], dtype=jnp.float64)
+        wb_j = jnp.asarray(wb_np, dtype=jnp.float64)
+
         n_proj = sp.n_proj
         ls = np.asarray(sp.proj_l, dtype=int)
         F_table = np.zeros((n_proj, n_q), dtype=np.float64)
         H_table = np.zeros((n_proj, n_q), dtype=np.float64)
 
         # Forward F_l: integrand is (β/r), Bessel order l_p
-        beta_over_r = np.asarray(sp.beta_r, dtype=np.float64)        # (n_proj, n_r)
+        beta_over_r = np.asarray(sp.beta_r, dtype=np.float64)[:, :kkb]  # (n_proj, kkb)
         # Deriv raw H_{l+1}: integrand is β(r) = (β/r)·r, Bessel order l_p+1
-        beta_full = beta_over_r * sp.r[None, :]                       # (n_proj, n_r)
+        beta_full = beta_over_r * sp.r[None, :kkb]                      # (n_proj, kkb)
 
         for l_val in np.unique(ls):
             idx = np.where(ls == l_val)[0]
             F_block = spherical_hankel_table_batch_jax(
-                int(l_val), r_j,
+                int(l_val), rb_j,
                 jnp.asarray(beta_over_r[idx], dtype=jnp.float64),
-                q_j, w_j,
+                q_j, wb_j,
             )
             F_table[idx] = np.asarray(F_block)
 
         for l_val in np.unique(ls + 1):
             idx = np.where(ls + 1 == l_val)[0]
             H_block = spherical_hankel_table_batch_jax(
-                int(l_val), r_j,
+                int(l_val), rb_j,
                 jnp.asarray(beta_full[idx], dtype=jnp.float64),
-                q_j, w_j,
+                q_j, wb_j,
             )
             H_table[idx] = np.asarray(H_block)
 

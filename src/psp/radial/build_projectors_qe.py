@@ -357,6 +357,44 @@ def spherical_hankel_transform_l_np(l: int,
     return _spherical_hankel_transform_l(l, r, beta_r, q, rab)
 
 
+def _qe_vloc_radial_scheme(
+    r: np.ndarray,
+    rab: np.ndarray | None,
+) -> Tuple[int, np.ndarray]:
+    """QE's radial quadrature for local-potential integrals: (msh, weights).
+
+    Matches QE exactly (verified against QE 7.4 sources):
+    - Modules/read_pseudo.f90:175-186 — the integration mesh is truncated at
+      ``rcut = 10`` bohr (msh = 1-based index of the first r > 10, or the full
+      mesh) and then FORCED ODD: ``msh = 2*((msh+1)/2) - 1``.
+    - upflib/simpsn.f90 — composite-Simpson weights 1/3, 4/3, 2/3, ..., 4/3,
+      1/3 on the (odd) truncated mesh, times ``rab``.
+
+    A bare ``rab`` (rectangle-rule) weighting is NOT equivalent: by
+    Euler–Maclaurin its error against Simpson is ~ -(h²/12)·f'(0), and the
+    alpha-Z integrand r·(r·V_loc + Z·e²) has f'(0) = Z·e² exactly — a
+    pseudo-independent, band-independent constant that showed up as a
+    -0.08 meV offset on every KIH diagonal (Si, h = 0.01).  The full-mesh
+    tail (r > 10, where tabulated vloc deviates from -Z·e²/r in the last
+    digits) added a further pseudo-DEPENDENT constant (+0.068 meV for the
+    FR Si pseudo).  Both vanish with QE's scheme.
+    """
+    r = np.asarray(r, dtype=float)
+    n = len(r)
+    above = np.nonzero(r > 10.0)[0]
+    msh = int(above[0]) + 1 if above.size else n     # 1-based, as in QE
+    msh = 2 * ((msh + 1) // 2) - 1                   # forced odd
+    w = np.ones(msh, dtype=np.float64)
+    w[1:-1:2] = 4.0 / 3.0
+    w[2:-1:2] = 2.0 / 3.0
+    w[0] = w[-1] = 1.0 / 3.0
+    if rab is not None:
+        w *= np.asarray(rab, dtype=float)[:msh]
+    else:
+        w *= float(r[1] - r[0]) if n > 1 else 1.0
+    return msh, w
+
+
 def _fourier_transform_vloc_qe(
     r: np.ndarray,
     rab: np.ndarray | None,
@@ -368,13 +406,15 @@ def _fourier_transform_vloc_qe(
     """QE-style Fourier transform of the local pseudopotential (Ry).
 
     Matches upflib/vloc_mod by tabulating the short-range part with an
-    erf-subtracted integrand and re-adding the analytic tail in G space.
+    erf-subtracted integrand and re-adding the analytic tail in G space,
+    integrating with QE's own radial scheme (r <= 10 bohr, odd-point
+    Simpson — see :func:`_qe_vloc_radial_scheme`).
     """
-
-    weights = radial_weights(np.asarray(r, dtype=float), rab, scheme='rab')
+    r = np.asarray(r, dtype=float)
+    msh, weights = _qe_vloc_radial_scheme(r, rab)
     return make_local_sr_table(
-        np.asarray(r, dtype=float),
-        np.asarray(vloc_r, dtype=float),
+        r[:msh],
+        np.asarray(vloc_r, dtype=float)[:msh],
         float(z_valence),
         np.asarray(q_grid, dtype=float),
         weights,
@@ -488,7 +528,12 @@ def build_local_ionic_potential_on_G_total(
         v_r = np.asarray(vloc, dtype=float)
         Zval = float(getattr(pseudo.pp_header, 'z_valence', 0.0))
 
-        q_points = max(2048, 2 * len(r))
+        # 8x-per-mesh-point q resolution: the table is consumed through
+        # LINEAR interpolation, whose error is O(dq²); at 2*len(r) the
+        # residual against QE's dq=0.01 cubic table was a measured
+        # ~0.005 meV band-to-band spread on the KIH diagonal, at 8x it
+        # is ~0.0004 meV.  One-time cost, host-side numpy.
+        q_points = max(8192, 8 * len(r))
         q_grid = make_uniform_q_grid(float(np.max(q_flat)), q_points)
         V_q_sr = _fourier_transform_vloc_qe(r, rab, v_r, q_grid, Zval, cell_volume)
         tab = RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=V_q_sr)
@@ -508,19 +553,17 @@ def build_local_ionic_potential_on_G_total(
                 # Just ensure it's properly scaled.
                 pass  # V_sr_on_grid[0,0,0] is already set by spl(0) * prefactor
             else:
-                # 3D: use alpha_Z integral
-                if rab is not None:
-                    integrand = r * (r * v_r + Zval * e2)
-                    alphaZ = (4.0 * np.pi) * np.sum(integrand * rab) * inv_omega
+                # 3D: alpha_Z integral with QE's exact radial scheme
+                # (upflib/vloc_mod.f90 init_tab_vloc G=0 branch: simpson
+                # over msh points of r*(r*vloc + Z*e2)).  See
+                # _qe_vloc_radial_scheme for why bare-rab rectangle
+                # weights put a -0.08 meV constant on every KIH diagonal.
+                if len(r) > 1:
+                    msh, w_qe = _qe_vloc_radial_scheme(r, rab)
+                    integrand = r[:msh] * (r[:msh] * v_r[:msh] + Zval * e2)
+                    alphaZ = (4.0 * np.pi) * np.sum(integrand * w_qe) * inv_omega
                 else:
-                    if len(r) > 1:
-                        integrand = r * (r * v_r + Zval * e2)
-                        dr = r[1] - r[0]
-                        w = np.ones_like(r)
-                        w[0] = 0.5; w[-1] = 0.5
-                        alphaZ = (4.0 * np.pi) * np.sum(integrand * w) * dr * inv_omega
-                    else:
-                        alphaZ = 0.0
+                    alphaZ = 0.0
                 V_sr_on_grid[0, 0, 0] = sqrtN * alphaZ
         except Exception:
             pass

@@ -46,6 +46,14 @@ class SpeciesData:
     beta_r: np.ndarray      # (n_proj, n_r) β(r)/r radial functions
     proj_l: np.ndarray      # (n_proj,) int — angular momentum per projector
     dij: np.ndarray         # (n_proj, n_proj) D-matrix in Ry
+    # QE's upf%kkbeta: β radial integrals run over EXACTLY this many mesh
+    # points (max cutoff_radius_index over the betas; upflib/beta_mod.f90
+    # init_tab_beta).  Integrating β over the full mesh with generic
+    # Simpson weights instead disagrees with QE at the cutoff point —
+    # ONCVPSP l=2 betas end on ~1e-4 nonzero values there — which showed
+    # up as a +0.004 meV constant on every V_NL diagonal vs QE.  Falls
+    # back to the full mesh when the UPF carries no cutoff index.
+    kkbeta: int = 0
 
 
 def extract_species(pseudos: dict) -> list[SpeciesData]:
@@ -85,6 +93,7 @@ def extract_species(pseudos: dict) -> list[SpeciesData]:
         beta_r = np.zeros((n_proj, len(r)), dtype=np.float64)
         proj_l = np.zeros(n_proj, dtype=np.int32)
 
+        kkbeta = 0
         for ip in range(n_proj):
             beta_obj = pp_nl.pp_beta[ip]
             raw = np.asarray(beta_obj.value, dtype=np.float64)
@@ -92,6 +101,9 @@ def extract_species(pseudos: dict) -> list[SpeciesData]:
             safe_r = np.where(r > 0, r, 1.0)
             beta_r[ip] = np.where(r > 0, raw / safe_r, 0.0)
             proj_l[ip] = int(beta_obj.angular_momentum)
+            kb = getattr(beta_obj, "cutoff_radius_index", None)
+            kkbeta = max(kkbeta, int(kb) if kb else len(r))
+        kkbeta = min(kkbeta, len(r)) if n_proj else len(r)
 
         # D-matrix
         dij_flat = np.asarray(pp_nl.pp_dij.value, dtype=np.float64)
@@ -102,7 +114,7 @@ def extract_species(pseudos: dict) -> list[SpeciesData]:
             r=r, rab=rab,
             vloc_r=vloc_r, rho_core_r=rho_core_r, has_nlcc=has_nlcc,
             n_proj=n_proj, beta_r=beta_r, proj_l=proj_l,
-            dij=dij,
+            dij=dij, kkbeta=kkbeta,
         ))
     return species
 
