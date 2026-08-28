@@ -562,11 +562,12 @@ def compute_ppm_sigma_pipeline(
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
             q_neg_index=q_neg,
-            # User-ruled GN variant: re-anchor the exact 0.2% tails at the fit
-            # owner before the incumbent exact-pane planner sees the reduced
-            # support.  This is lossy versus BGW finite-pole parity; HL is a
-            # different real-axis model and is deliberately unchanged.
-            coarsen_extreme_tails=not is_hl,
+            # The tail policy is explicit so scalar and four-current control
+            # arms can use the same pole treatment.  HL remains unchanged:
+            # this coarsening rule was derived only for the imaginary-axis
+            # GN fit.
+            coarsen_extreme_tails=(
+                not is_hl and bool(config.ppm.coarsen_extreme_tails)),
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)

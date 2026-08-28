@@ -2122,6 +2122,7 @@ _DEFAULTS = {
     # their references are re-pinned).  HL probes (real axis) always take
     # the dedicated path.
     "ppm_probe_chi_reuse": "off",
+    "ppm_coarsen_extreme_tails": True,
     "ppm_sigma_target_error": 1.0e-6,
     "ppm_sigma_max_nodes": 64,
     # Multipole W sampling / bounded Sigma consumption.
@@ -4163,6 +4164,7 @@ class PPMConfig:
     #: folded into the static sweep when the error gate passes — see
     #: _DEFAULTS["ppm_probe_chi_reuse"]).
     probe_chi_reuse: str
+    coarsen_extreme_tails: bool
 
     # --- σ-quadrature minimax ---
     sigma_target_error: float
@@ -5177,6 +5179,7 @@ class LorraxConfig:
                 float(_g("ppm_head_omega_h_ry"))
                 if _g("ppm_head_omega_h_ry") is not None else None),
             probe_chi_reuse=str(_g("ppm_probe_chi_reuse")).strip().lower(),
+            coarsen_extreme_tails=bool(_g("ppm_coarsen_extreme_tails")),
             sigma_target_error=float(_g("ppm_sigma_target_error")),
             sigma_max_nodes=int(_g("ppm_sigma_max_nodes")),
             invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
