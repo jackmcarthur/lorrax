@@ -182,15 +182,15 @@ Ranked.  These escape input-file validation, the run log, and provenance.
 3. `LORRAX_WFN_BACKEND` (`""` → config/auto; forces `eager` \| `phdf5`,
    `services/wfn_loader/src/wfn_loader/loader.py`) → the `slab_io`/backend config
    section, so the read path is recorded alongside the write path.
-4. **`LORRAX_SIGMA_PLAN` → a Sigma planning key.**  Default `panes` preserves
-   the incumbent MPA pane/window planner exactly; `delivered` selects one
-   delivered-error minimax rule per causal branch
-   (`gw.mpa.sigma.resolve_sigma_plan_builder`).  Grammar is the exact,
-   case-insensitive enum
-   `panes` \| `delivered` after stripping; blank means `panes`, and every other
-   value REFUSES naming both choices.  This changes the quadrature and is
+4. **`LORRAX_SIGMA_PLAN` → a Sigma planning key.** Default `panes` preserves
+   the incumbent GN-PPM and MPA pane/window planners exactly; `delivered`
+   selects the shared measure-apportioned hybrid planner for both routes
+   (`gw.sigma_plan.resolve_sigma_plan`). Grammar is the exact, case-insensitive
+   enum `panes` \| `delivered` after stripping; blank means `panes`, and every
+   other value REFUSES naming both choices. This changes the quadrature and is
    therefore policy, not machine capability; the env form is the initial
-   opt-in and must be promoted before it becomes a default candidate.
+   opt-in and must be promoted before it becomes a default candidate. See
+   [the delivered-plan contract](delivered_plan.md).
 
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
