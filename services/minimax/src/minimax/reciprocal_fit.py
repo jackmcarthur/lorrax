@@ -21,6 +21,8 @@ numerical evidence, not a continuum certificate.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,6 +30,49 @@ from scipy.optimize import linprog
 from scipy.sparse import coo_matrix, hstack, vstack
 
 Array = np.ndarray
+
+_BLAS_CONTROLLER = None
+
+
+@contextlib.contextmanager
+def _environment_single_thread():
+    """Best-effort thread cap when ``threadpoolctl`` is unavailable."""
+    names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update({name: "1" for name in names})
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def single_core_blas():
+    """Context manager capping BLAS/OpenMP pools to one thread.
+
+    The delivered plans are sized for one CPU core, and the dense
+    factorizations here are small (thousands of rows, ~100 columns).  On
+    a many-core login node the default OpenBLAS pool is pathological for
+    them: with the 128-thread pool a 4000x47 ``lstsq`` measured 17.6 s
+    per call against 120 ms single-threaded — a 146x barrier-thrash
+    penalty, not compute.  The controller is created once and reused;
+    when threadpoolctl is unavailable the standard BLAS/OpenMP environment
+    variables are scoped to one thread for the call instead.
+    """
+    global _BLAS_CONTROLLER
+    if _BLAS_CONTROLLER is None:
+        try:
+            from threadpoolctl import ThreadpoolController
+            _BLAS_CONTROLLER = ThreadpoolController()
+        except ImportError:
+            _BLAS_CONTROLLER = False
+    if _BLAS_CONTROLLER is False:
+        return _environment_single_thread()
+    return _BLAS_CONTROLLER.limit(limits=1)
 
 
 @dataclass(frozen=True)
@@ -194,6 +239,23 @@ def _polygon_directions(count: int) -> Array:
     return np.exp(-1.0j * 2.0 * np.pi * np.arange(int(count)) / int(count))
 
 
+def _on_single_core(solver):
+    """Run a weight solver under the one-core BLAS cap.
+
+    Callers inside ``fit_reciprocal_measure`` are already capped; this
+    guard covers direct callers of the solvers, and re-applying the
+    cached controller costs microseconds.
+    """
+    import functools
+
+    @functools.wraps(solver)
+    def wrapped(*args, **kwargs):
+        with single_core_blas():
+            return solver(*args, **kwargs)
+    return wrapped
+
+
+@_on_single_core
 def solve_fixed_time_weights(
     problem: ReciprocalMeasureProblem,
     times: Array,
@@ -385,19 +447,22 @@ def solve_fixed_time_weights(
             objective / float(objective_scale))
 
 
+@_on_single_core
 def solve_fixed_time_weights_fast(
     problem: ReciprocalMeasureProblem,
     times: Array,
     *,
-    iterations: int = 12,
+    iterations: int = 36,
+    stall_iterations: int = 3,
     conditioning_slack: float = 1.0e-3,
     conditioning_pass: bool = True,
+    start_weights: Array | None = None,
 ) -> tuple[Array, float]:
     r"""Near-minimax complex weights by iteratively reweighted least squares.
 
     Approximates the objective of ``solve_fixed_time_weights`` at a tiny
-    fraction of its cost: each iteration solves one dense least-squares in
-    the ``2 n_nodes`` real weight unknowns, with Lawson multipliers
+    fraction of its cost: each iteration solves one weighted least-squares
+    in the ``n_nodes`` complex weight unknowns, with Lawson multipliers
     pressing the worst frequencies and an L1 reweighting pressing large
     residual cells.  The returned objective is the exact measured
     delivered error on the problem's kept cells — stronger currency than
@@ -407,6 +472,27 @@ def solve_fixed_time_weights_fast(
     measured error stays inside ``(1 + conditioning_slack)`` of the best
     unpenalized error wins, spending the same declared slack on
     cancellation control.
+
+    ``iterations`` is a cap, not a schedule: the loop stops once the
+    measured error has not improved by 0.1% for ``stall_iterations``
+    straight iterations.  Under-converged weights are not merely slow, they are
+    node-expensive — on the P1 bench the search returned 26 nodes from
+    12 fixed iterations, 18 from 32 fixed, and 22 from this patience
+    rule with warm starts, against the certified LP's 20 — so the cap
+    defaults high and the patience rule does the budgeting.
+    ``start_weights``, physical weights for the same
+    ``times``, seeds the first residual (a search re-solving after a
+    one-node or one-frequency change converges in a few iterations from
+    the previous solution).
+
+    Each iteration solves the weighted least squares through one thin QR
+    of the gauged atoms computed per call: with ``A = Q R`` the iteration
+    reduces to an ``n x n`` normal system on the weighted orthonormal
+    columns — a ~4x cheaper step than a fresh dense factorization — while
+    the raw atom collinearity stays isolated in the triangular map ``R``.
+    A solve that comes back non-finite (or an ``R`` too singular to
+    invert) falls back to the dense complex ``lstsq`` for that iteration,
+    and every iterate is judged by the exact measured metric either way.
     """
     nodes = np.asarray(times, dtype=np.complex128)
     if nodes.ndim != 1 or nodes.size == 0:
@@ -426,41 +512,81 @@ def solve_fixed_time_weights_fast(
     truth = 1.0 / d_flat
     scale = problem.cell_masses[keep_j] / delivered[keep_i]
     n_nodes = nodes.size
+    if int(stall_iterations) < 1:
+        raise ValueError("stall_iterations must be positive")
+
+    if keep_i.size >= n_nodes:
+        q_basis, r_map = np.linalg.qr(atoms)
+        r_diag = np.abs(np.diagonal(r_map))
+        fast_path = bool(r_diag.min() > 1.0e-10 * max(float(r_diag.max()),
+                                                      1.0e-300))
+    else:
+        q_basis, r_map, fast_path = None, None, False
 
     def measured(residual: Array) -> tuple[Array, float]:
         by_frequency = np.bincount(keep_i, weights=scale * np.abs(residual),
                                    minlength=n_frequency)
         return by_frequency, float(np.max(by_frequency))
 
-    def weighted_solve(row_weight: Array, ridge: float) -> Array:
-        root = np.sqrt(row_weight)
-        real_block = root[:, None] * atoms.real
-        imag_block = root[:, None] * atoms.imag
-        system = np.block([[real_block, -imag_block],
-                           [imag_block, real_block]])
-        rhs = np.concatenate([root * truth.real, root * truth.imag])
-        extra_rows = []
-        extra_rhs = []
+    def _extra_rows(root: Array, ridge: float, basis_map: Array | None) -> list:
+        # Ridge and zero-weight-sum rows in y-space, optionally mapped to
+        # the orthonormal z = R y variables through inv(R).
+        rows = []
         if ridge > 0.0:
             # Penalize the PHYSICAL weight magnitudes y * gauge.
-            penalty = np.sqrt(ridge) * gauge
-            extra_rows.append(np.concatenate(
-                [np.diag(penalty), np.zeros((n_nodes, n_nodes))], axis=1))
-            extra_rows.append(np.concatenate(
-                [np.zeros((n_nodes, n_nodes)), np.diag(penalty)], axis=1))
-            extra_rhs.append(np.zeros(2 * n_nodes))
+            penalty = (np.sqrt(ridge) * gauge).astype(np.complex128)
+            rows.append(np.diag(penalty) if basis_map is None
+                        else penalty[:, None] * basis_map)
         if problem.zero_weight_sum:
             hard = 1.0e6 * float(np.max(root)) + 1.0
-            extra_rows.append(hard * np.concatenate(
-                [gauge, np.zeros(n_nodes)])[None, :])
-            extra_rows.append(hard * np.concatenate(
-                [np.zeros(n_nodes), gauge])[None, :])
-            extra_rhs.append(np.zeros(2))
-        if extra_rows:
-            system = np.concatenate([system] + extra_rows, axis=0)
-            rhs = np.concatenate([rhs] + extra_rhs)
-        solution = np.linalg.lstsq(system, rhs, rcond=None)[0]
-        return solution[:n_nodes] + 1.0j * solution[n_nodes:]
+            row = (hard * gauge).astype(np.complex128)
+            rows.append(row[None, :] if basis_map is None
+                        else (row @ basis_map)[None, :])
+        return rows
+
+    def _dense_solve(root: Array, ridge: float) -> Array:
+        # The doubled real block [[Re A, -Im A], [Im A, Re A]] over
+        # [Re y; Im y] is exactly the complex least squares in y: the two
+        # objectives are the identical sum of squares (the ridge rows on
+        # Re y and Im y are the complex diagonal ridge, and the two
+        # zero-sum rows over the real gauge are one complex row), so the
+        # complex solve returns the same minimizer at half the LAPACK
+        # dimensions and without assembling four block copies.
+        system = root[:, None] * atoms
+        rhs = root * truth
+        extra = _extra_rows(root, ridge, None)
+        if extra:
+            system = np.concatenate([system] + extra, axis=0)
+            rhs = np.concatenate(
+                [rhs, np.zeros(sum(block.shape[0] for block in extra))])
+        return np.linalg.lstsq(system, rhs, rcond=None)[0]
+
+    r_inverse: Array | None = None
+
+    def weighted_solve(row_weight: Array, ridge: float) -> Array:
+        nonlocal r_inverse
+        root = np.sqrt(row_weight)
+        if not fast_path:
+            return _dense_solve(root, ridge)
+        weighted_q = root[:, None] * q_basis
+        gram = weighted_q.conj().T @ weighted_q
+        right = weighted_q.conj().T @ (root * truth)
+        extra = None
+        if ridge > 0.0 or problem.zero_weight_sum:
+            if r_inverse is None:
+                r_inverse = np.linalg.solve(
+                    r_map, np.eye(n_nodes, dtype=np.complex128))
+            extra = _extra_rows(root, ridge, r_inverse)
+            for block in extra:
+                gram = gram + block.conj().T @ block
+        try:
+            z = np.linalg.solve(gram, right)
+            y = np.linalg.solve(r_map, z)
+        except np.linalg.LinAlgError:
+            return _dense_solve(root, ridge)
+        if not np.all(np.isfinite(y)):
+            return _dense_solve(root, ridge)
+        return y
 
     def irls(start: Array | None, count: int, ridge: float,
              lawson: Array) -> tuple[Array, Array, float, Array]:
@@ -468,6 +594,7 @@ def solve_fixed_time_weights_fast(
         residual = (-truth if coefficients is None
                     else atoms @ coefficients - truth)
         best_y, best_error, best_by = None, np.inf, None
+        stalled = 0
         for _ in range(count):
             by_frequency, _ = measured(residual)
             top = float(np.max(by_frequency))
@@ -480,12 +607,23 @@ def solve_fixed_time_weights_fast(
             coefficients = weighted_solve(row_weight, ridge)
             residual = atoms @ coefficients - truth
             by_frequency, error = measured(residual)
+            # Patience rule: the configured number of iterations without
+            # a 0.1% improvement of the best measured error ends the loop.
+            stalled = 0 if error < best_error * (1.0 - 1.0e-3) else stalled + 1
             if error < best_error:
                 best_y, best_error, best_by = coefficients, error, by_frequency
+            if stalled >= int(stall_iterations):
+                break
         return best_y, lawson, best_error, best_by
 
     lawson0 = np.full(n_frequency, 1.0 / n_frequency)
-    best_y, lawson, best_error, _ = irls(None, int(iterations), 0.0, lawson0)
+    start_y = None
+    if start_weights is not None:
+        seeded = np.asarray(start_weights, dtype=np.complex128)
+        if seeded.shape == nodes.shape and np.all(np.isfinite(seeded)):
+            start_y = seeded * np.exp(log_peak)
+    best_y, lawson, best_error, _ = irls(start_y, int(iterations), 0.0,
+                                         lawson0)
     if conditioning_pass and best_y is not None:
         allowed = best_error * (1.0 + float(conditioning_slack))
         # Ridge units: error is dimensionless, weights are O(|d|)-ish;
@@ -507,5 +645,7 @@ __all__ = [
     "evaluate_rule",
     "delivered_error",
     "rule_amplification",
+    "single_core_blas",
     "solve_fixed_time_weights",
+    "solve_fixed_time_weights_fast",
 ]
