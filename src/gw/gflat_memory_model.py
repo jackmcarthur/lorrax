@@ -170,12 +170,32 @@ def _coupled_mu123_zq_incremental_bytes(
         "two_additional_gflat_outputs": extra_gflat,
         "two_additional_host_gflat_outputs": (
             extra_gflat_host if host_spill_gflat else 0.0),
+        "three_host_gflat_outputs": (
+            1.5 * extra_gflat_host if host_spill_gflat else 0.0),
         "two_additional_transverse_factors": extra_factors,
         "two_additional_psi_r_caches": extra_psi_r,
         "stacked_solve_transient": stacked_solve,
         "total": (completed_zq + shared_x_face + extra_gflat
                   + extra_factors + extra_psi_r + stacked_solve),
     }
+
+
+def _batch_reshard_operand_floor_bytes(
+        *, batch: int, mu: int, nrhs: int, processes: int) -> float:
+    """Measured three-arena floor of one local batch-reshard solve."""
+    batch_local = (int(batch) + int(processes) - 1) // int(processes)
+    return 3.0 * _c128(batch_local, mu, int(mu) + int(nrhs))
+
+
+def _coupled_route_projected_hwm_bytes(
+        *, base_hwm: float, persistent: float, coupled_delta: float,
+        solve_operand_floor: float = 0.0) -> float:
+    """Maximum of the incumbent stage HWM and route-specific solve stage."""
+    delta = float(coupled_delta)
+    return max(
+        float(base_hwm) + delta,
+        float(persistent) + float(solve_operand_floor) + delta,
+    )
 
 
 def _pair_density_slots() -> int:

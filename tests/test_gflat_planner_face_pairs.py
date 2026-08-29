@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import numpy as np
 
 from gw.gflat_memory_model import (
+    _batch_reshard_operand_floor_bytes,
     _coupled_mu123_zq_incremental_bytes,
+    _coupled_route_projected_hwm_bytes,
     _face_pair_density_slots,
     _fft_box_bytes,
     plan_gflat_chunks,
@@ -99,7 +101,23 @@ def test_coupled_host_spill_moves_gflat_bytes_off_device():
     assert resident["two_additional_gflat_outputs"] == moved
     assert spilled["two_additional_gflat_outputs"] == 0
     assert spilled["two_additional_host_gflat_outputs"] == moved
+    assert spilled["three_host_gflat_outputs"] == 1.5 * moved
     assert resident["total"] - spilled["total"] == moved
+
+
+def test_batch_reshard_floor_matches_three_measured_live_arenas():
+    expected = 3 * 16 * 7 * 800 * (800 + 27_648)
+    assert _batch_reshard_operand_floor_bytes(
+        batch=108, mu=800, nrhs=27_648, processes=16) == expected
+
+
+def test_local_route_hwm_includes_solve_floor_not_just_base_plus_delta():
+    assert _coupled_route_projected_hwm_bytes(
+        base_hwm=70, persistent=50, coupled_delta=10,
+        solve_operand_floor=40) == 100
+    assert _coupled_route_projected_hwm_bytes(
+        base_hwm=70, persistent=20, coupled_delta=10,
+        solve_operand_floor=5) == 80
 
 
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():

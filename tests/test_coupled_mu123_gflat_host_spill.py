@@ -95,3 +95,14 @@ def test_explicit_local_route_never_silently_changes_backend():
         budget_bytes=100, local_delta_bytes=50,
         distributed_delta_bytes=20,
     ) == (False, "batch_reshard", None)
+
+
+def test_automatic_policy_keeps_fragmentation_platform_and_host_gates():
+    source = inspect.getsource(fit_zeta)
+    assert "_gflat_plan_T.target_utilization" in source
+    assert "'A100' in _device_kind" in source
+    assert "_p_xy in (4, 16)" in source
+    assert "three_host_gflat_outputs" in source
+    assert "0.35 * _host_total_gb" in source
+    assert "_gflat_plan_T.persistent_bytes" in source
+    assert "_local_budget_delta" in source

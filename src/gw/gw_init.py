@@ -2075,7 +2075,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			and bool(cfg.memory.low_mem_bands)
 			and bool(_chunks_T.get('cache_face_y_blocks', False))):
 		from gw.gflat_memory_model import (
+			_batch_reshard_operand_floor_bytes,
+			_coupled_route_projected_hwm_bytes,
 			_coupled_mu123_zq_incremental_bytes)
+		from common.gpu_utils import get_cpu_memory_total
 		_p_x = int(mesh_xy.shape['x'])
 		_p_y = int(mesh_xy.shape['y'])
 		_delta_args = dict(
@@ -2097,23 +2100,59 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		_distributed_delta = _coupled_mu123_zq_incremental_bytes(
 			**_delta_args, stack_three_solves=False)
 		_p_xy = _p_x * _p_y
-		_batch_total = int(_meta_T.nk_tot)
-		_batch_per_rank = (_batch_total + _p_xy - 1) // _p_xy
 		_mu_T = int(_meta_T.n_rmu_padded)
-		_local_operand_floor = (
-			3 * 16 * _batch_per_rank * _mu_T
-			* (_mu_T + int(_chunks_T['chunk_r'])))
+		_local_operand_floor = _batch_reshard_operand_floor_bytes(
+			batch=int(_meta_T.nk_tot), mu=_mu_T,
+			nrhs=int(_chunks_T['chunk_r']), processes=_p_xy)
+		_local_devices = jax.local_devices()
+		_device_kind = (
+			str(_local_devices[0].device_kind).upper()
+			if _local_devices else "")
+		_certified_local_backend = (
+			jax.default_backend() in ('gpu', 'cuda')
+			and 'A100' in _device_kind
+			and _p_x == _p_y and _p_xy in (4, 16))
+		# The deck/planner budget is rank-invariant and no larger than the
+		# allocator pool.  Using it for the measured 50% operand ceiling is a
+		# conservative static dispatch; process-local memory_stats could differ
+		# transiently and must not choose different collective routes by rank.
+		_allocator_limit = float(_gflat_plan_T.budget_bytes)
 		_local_capacity_ok = (
-			_mu_T <= 16_384
-			and _local_operand_floor <= 0.50 * _gflat_plan_T.budget_bytes)
-		(_coupled_mu123_enabled, _transverse_batched_route,
-		 _selected_delta_bytes) = _select_coupled_mu123_route(
-			requested_route=_transverse_batched_route,
-			base_hwm_bytes=_gflat_plan_T.hwm_bytes,
-			budget_bytes=_gflat_plan_T.budget_bytes,
-			local_delta_bytes=_local_delta['total'],
-			distributed_delta_bytes=_distributed_delta['total'],
-			local_capacity_ok=_local_capacity_ok)
+			_certified_local_backend and _mu_T <= 16_384
+			and _local_operand_floor <= 0.50 * _allocator_limit)
+		try:
+			_slurm_nodes = max(1, int(os.environ.get('SLURM_NNODES', '1')))
+		except ValueError:
+			_slurm_nodes = 1
+		_ranks_per_node = (
+			int(jax.process_count()) + _slurm_nodes - 1) // _slurm_nodes
+		_host_total_gb = get_cpu_memory_total()
+		_host_required_node = (
+			_local_delta['three_host_gflat_outputs'] * _ranks_per_node)
+		_host_spill_ok = (
+			_host_total_gb is not None
+			and _host_required_node <= 0.35 * _host_total_gb * 1024**3)
+		_effective_device_budget = (
+			float(_gflat_plan_T.budget_bytes)
+			* float(_gflat_plan_T.target_utilization))
+		_local_projected_hwm = _coupled_route_projected_hwm_bytes(
+			base_hwm=_gflat_plan_T.hwm_bytes,
+			persistent=_gflat_plan_T.persistent_bytes,
+			coupled_delta=_local_delta['total'],
+			solve_operand_floor=_local_operand_floor)
+		_local_budget_delta = max(
+			0.0, _local_projected_hwm - float(_gflat_plan_T.hwm_bytes))
+		if _host_spill_ok:
+			(_coupled_mu123_enabled, _transverse_batched_route,
+			 _selected_delta_bytes) = _select_coupled_mu123_route(
+				requested_route=_transverse_batched_route,
+				base_hwm_bytes=_gflat_plan_T.hwm_bytes,
+				budget_bytes=_effective_device_budget,
+				local_delta_bytes=_local_budget_delta,
+				distributed_delta_bytes=_distributed_delta['total'],
+				local_capacity_ok=_local_capacity_ok)
+		else:
+			_selected_delta_bytes = None
 		if _coupled_mu123_enabled:
 			_coupled_delta = (
 				_local_delta if _transverse_batched_route == 'batch_reshard'
@@ -2125,13 +2164,18 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				f"solve_route={_transverse_batched_route}, "
 				f"device increment {_selected_delta_bytes / 1e9:.2f} GB, "
 				f"projected HWM {_coupled_projected / 1e9:.2f} GB; "
-				f"extra completed G-flat outputs are host-spilled "
-				f"({_coupled_delta['two_additional_host_gflat_outputs'] / 1e9:.2f} "
-				"GB/rank).")
+				f"three G-flat outputs use "
+				f"{_coupled_delta['three_host_gflat_outputs'] / 1e9:.2f} "
+				f"GB host/rank, {_host_required_node / 1e9:.2f} GB/node.")
 		else:
+			_reason = (
+				f"host spill {_host_required_node / 1e9:.2f} GB/node exceeds "
+				"the 35% host-RAM cap"
+				if not _host_spill_ok else
+				"coupled live set exceeds the fragmentation-safe device budget")
 			print_fn(
-				"  [bispinor] coupled μ_L=1,2,3 live set exceeds the device "
-				"budget; using the sequential capacity fallback.")
+				f"  [bispinor] {_reason}; using the sequential capacity "
+				"fallback.")
 	# Fresh writers and provenance stamps consume exactly the identity that
 	# was tested before planning; there is no second reconstruction here.
 	_provenance = zeta_contract.provenance
