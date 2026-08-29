@@ -81,7 +81,7 @@ def _geometry():
     return geometry(_SEEDS)
 
 
-def _w_omega(n_omega, n_q, n_mu, seed=17):
+def _w_omega(n_omega, n_q, n_mu, seed=17, *, hermitian=True):
     """A frequency-resolved wedge with a DIFFERENT tensor at every ω.
 
     Different per slab on purpose: a builder that broadcast one tensor
@@ -91,17 +91,19 @@ def _w_omega(n_omega, n_q, n_mu, seed=17):
     rng = np.random.default_rng(seed)
     a = (rng.standard_normal((n_omega, n_q, n_mu, n_mu))
          + 1j * rng.standard_normal((n_omega, n_q, n_mu, n_mu)))
-    return 0.5 * (a + np.swapaxes(a.conj(), -1, -2))
+    return (0.5 * (a + np.swapaxes(a.conj(), -1, -2))
+            if hermitian else a)
 
 
-def _hand_unfold(W_ibz, tables):
+def _hand_unfold(W_ibz, tables, *, time_reversal_rule="conj"):
     """The per-element reference, in plain numpy::
 
         W_full[q, μ, ν] = exp(2πi q_irr·(L_{s,μ} − L_{s,ν}))
                           · W_ibz[i(q), α_s(μ), α_s(ν)]
 
-    conjugated on TRS rows.  Written out rather than reused from the
-    kernel so the unfold arm compares two independent computations.
+    with the selected q-reversal covariance on TRS rows.  Written out
+    rather than reused from the kernel so the unfold arm compares two
+    independent computations.
     """
     irr = np.asarray(tables.irr_idx_q)
     sym = np.asarray(tables.sym_idx_q)
@@ -110,12 +112,21 @@ def _hand_unfold(W_ibz, tables):
     for iq in range(len(irr)):
         parent, s = int(irr[iq]), int(sym[iq])
         p = np.asarray(tables.sym_perm[s])
-        blk = W_ibz[parent][np.ix_(p, p)]
+        trs = s >= int(tables.n_sym_spatial)
+        source = (
+            W_ibz[parent].T
+            if trs and time_reversal_rule == "pair_transpose"
+            else W_ibz[parent])
+        blk = source[np.ix_(p, p)]
         qL = (np.asarray(tables.L_table[s], dtype=float)
               @ np.asarray(tables.q_irr_frac)[parent])
         ph = np.exp(2j * np.pi * qL)
-        blk = ph[:, None] * blk * np.conj(ph)[None, :]
-        out[iq] = np.conj(blk) if s >= int(tables.n_sym_spatial) else blk
+        if trs and time_reversal_rule == "pair_transpose":
+            blk = np.conj(ph)[:, None] * blk * ph[None, :]
+        else:
+            blk = ph[:, None] * blk * np.conj(ph)[None, :]
+        out[iq] = (
+            np.conj(blk) if trs and time_reversal_rule == "conj" else blk)
     return out
 
 
@@ -152,17 +163,20 @@ def _mesh():
                 ("x", "y"))
 
 
-def _write_w(path, name="W_qmunu_omega", n_omega=6, ready=True, seed=17):
+def _write_w(path, name="W_qmunu_omega", n_omega=6, ready=True, seed=17,
+             *, time_reversal_rule="conj", hermitian=True):
     """A complete W(ω) file, plus the tensor it was written from."""
     tables, verdict, n_mu = _geometry()
-    W = _w_omega(n_omega, _N_Q_IBZ, n_mu, seed=seed)
+    W = _w_omega(
+        n_omega, _N_Q_IBZ, n_mu, seed=seed, hermitian=hermitian)
     omega = np.array([0.0 + 0.1j, 0.4 + 0.1j, 0.9 + 0.1j,
                       0.0 + 1.0j, 0.5 + 1.0j, 1.2 + 1.0j][:n_omega])
     line = np.array([0, 0, 0, 1, 1, 1][:n_omega], dtype=np.int32)
     MS.allocate_w_omega(
         path, name, n_omega=n_omega, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
         tables=tables, omega=omega, sampling=_SAMPLING, omega_line=line,
-        closure_verdict=verdict, provenance={"deck": "synthetic-glide"})
+        closure_verdict=verdict, provenance={"deck": "synthetic-glide"},
+        time_reversal_rule=time_reversal_rule)
     for i in range(n_omega):
         MS.write_w_slab(path, name, i, W[i], ready=ready)
     return W, tables, verdict, n_mu, omega, line
@@ -480,6 +494,31 @@ def test_the_wedge_unfolds_per_frequency(tmpdir_path):
         _assert_offdiag_elementwise(got, want, f"unfold at ω index {i}")
         assert np.allclose(got, want, rtol=1e-13, atol=1e-13)
         assert hdr["q_storage"] == "ibz"
+
+
+def test_pair_transpose_covariance_is_stamped_and_used(tmpdir_path):
+    """A non-Hermitian dynamic response must not take the scalar conj arm."""
+    pytest.importorskip("jax")
+    W, tables, _, _, _, _ = _write_w(
+        tmpdir_path, n_omega=2, time_reversal_rule="pair_transpose",
+        hermitian=False)
+    got, header = MS.read_w_slab(
+        tmpdir_path, "W_qmunu_omega", 1, unfold=True, mesh_xy=_mesh())
+    want = _hand_unfold(
+        W[1], tables, time_reversal_rule="pair_transpose")
+    scalar_wrong = _hand_unfold(
+        W[1], tables, time_reversal_rule="conj")
+    assert header["time_reversal_rule"] == "pair_transpose"
+    assert np.allclose(got, want, rtol=1e-13, atol=1e-13)
+    assert not np.allclose(got, scalar_wrong, rtol=1e-13, atol=1e-13)
+
+
+def test_older_version_two_store_keeps_historical_conj_rule(tmpdir_path):
+    _write_w(tmpdir_path, n_omega=2)
+    with h5py.File(tmpdir_path, "a") as f:
+        del f["W_qmunu_omega"].attrs[MS._TIME_REVERSAL_ATTR]
+    header = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    assert header["time_reversal_rule"] == "conj"
 
 
 def test_the_unfold_of_a_single_stored_q_refuses(tmpdir_path):

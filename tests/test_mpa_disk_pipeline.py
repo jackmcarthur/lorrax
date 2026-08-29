@@ -43,20 +43,30 @@ def test_iteration_artifacts_retain_only_the_completed_map(
 def test_q_wedge_returns_the_resolution_verdict(monkeypatch):
     verdict = object()
     resolution = SimpleNamespace(verdict=verdict)
+    policy_calls = []
     monkeypatch.setattr(
         "gw.v_q_g_flat._resolve_ibz_q_list",
         lambda **kwargs: (
             None, np.zeros((1, 3)), np.zeros(1, np.int32),
             np.zeros(1, np.int32), np.zeros((1, 1), np.int32),
             np.zeros((1, 1, 3), np.int32), True, resolution))
+    monkeypatch.setattr(
+        "gw.qgrid_symmetry.qgrid_trs_policy_for",
+        lambda **kwargs: (
+            policy_calls.append(kwargs)
+            or SimpleNamespace(unfold_sym_idx=np.zeros(1, np.int32))))
     sym = SimpleNamespace(
         q_irr_full_idx=np.array([0], np.int32),
-        sym_matrices=np.eye(3, dtype=np.int32)[None, ...])
+        sym_matrices=np.eye(3, dtype=np.int32)[None, ...],
+        trs_allowed=False)
     q_idx, _tables, got = model._q_wedge(
         sym, np.zeros((1, 3), np.int32),
         SimpleNamespace(kgrid=(1, 1, 1), fft_grid=(1, 1, 1)))
     np.testing.assert_array_equal(q_idx, [0])
     assert got is verdict
+    assert len(policy_calls) == 1
+    assert policy_calls[0]["sym"] is sym
+    assert policy_calls[0]["context"] == "MPA chi/Wc q-wedge storage"
 
 
 def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):

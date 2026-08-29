@@ -70,10 +70,16 @@ def _q_wedge(sym, centroid_indices, meta):
         context="MPA chi/Wc q-wedge storage", return_resolution=True)
     if not use_ibz:
         raise ValueError("MPA disk sampling requires an orbit-closed q wedge")
+    from gw.qgrid_symmetry import qgrid_trs_policy_for
+    n_sym_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    policy = qgrid_trs_policy_for(
+        sym=sym, irr_idx_q=irr, sym_idx_q=sym_idx,
+        kgrid=tuple(meta.kgrid), n_sym_spatial=n_sym_spatial,
+        context="MPA chi/Wc q-wedge storage")
     tables = QirrTables(
-        irr_idx_q=irr, sym_idx_q=sym_idx, q_irr_frac=q_frac,
+        irr_idx_q=irr, sym_idx_q=policy.unfold_sym_idx, q_irr_frac=q_frac,
         sym_perm=perm, L_table=wraps,
-        n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]))
+        n_sym_spatial=n_sym_spatial)
     return np.asarray(sym.q_irr_full_idx, np.int32), tables, resolution.verdict
 
 

@@ -237,6 +237,13 @@ MPA_FIT_FORMAT_VERSION = 1
 _FREQ_ATTR = "mpa_freq_axis"
 _FREQ_ATTR_VALUE = "leading"
 
+#: Symmetry-service covariance used when a stored q wedge is unfolded.
+#: New files always stamp it.  Version-2 files written before this field
+#: existed retain their exact historical ``conj`` interpretation.
+_TIME_REVERSAL_ATTR = "mpa_time_reversal_rule"
+_TIME_REVERSAL_DEFAULT = "conj"
+_TIME_REVERSAL_RULES = frozenset(("conj", "pair_transpose"))
+
 #: Sampling-protocol keys every W(ω) file must carry, with the units the
 #: theory plan states them in.  Required rather than defaulted: a fit
 #: whose partition α nobody recorded is a fit nobody can reproduce, and
@@ -261,8 +268,12 @@ _SAMPLING_ORDER = ("protocol", "varpi", "n_p", "alpha", "omega_max")
 _MPA_OWNED_ATTRS = (
     _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units",
     *("mpa_" + key for key in _SAMPLING_ORDER),
-    "mpa_grid_hash",
+    "mpa_grid_hash", _TIME_REVERSAL_ATTR,
 )
+
+# ``mpa_time_reversal_rule`` was added without changing the rank-4 byte layout.
+# Its absence is readable only as the one meaning every older writer used.
+_MPA_LEGACY_OPTIONAL_ATTRS = frozenset((_TIME_REVERSAL_ATTR,))
 
 #: Occupation-provenance stamps, in a fixed order; attr name = "mpa_" +
 #: key.  Written only when an occupation state is supplied, so insulating
@@ -685,6 +696,16 @@ def _normalise_grid(omega, omega_line, n_omega):
     return w, line
 
 
+def _normalise_time_reversal_rule(rule):
+    """Validate the symmetry service's closed q-covariance vocabulary."""
+    value = str(rule)
+    if value not in _TIME_REVERSAL_RULES:
+        raise ValueError(
+            "mpa_store: time_reversal_rule must be one of "
+            f"{tuple(sorted(_TIME_REVERSAL_RULES))}, got {rule!r}")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Write: allocate, fill slab by slab, stamp
 # ---------------------------------------------------------------------------
@@ -704,6 +725,7 @@ def allocate_w_omega(
     dtype=None,
     provenance=None,
     energy_unit="Ha",
+    time_reversal_rule=_TIME_REVERSAL_DEFAULT,
     mode="a",
 ):
     """Create the (n_omega, n_q, N_μ, N_μ) dataset with NO slab ready.
@@ -759,7 +781,8 @@ def allocate_w_omega(
             grp, name, tables=tables, omega=omega, sampling=sampling,
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(n_omega, dtype=bool),
-            provenance=provenance, energy_unit=energy_unit)
+            provenance=provenance, energy_unit=energy_unit,
+            time_reversal_rule=time_reversal_rule)
 
 
 def _w_storage_geometry(n_omega, n_q_on_disk, n_mu, dtype,
@@ -808,6 +831,7 @@ def allocate_w_omega_collective(
     provenance=None,
     n_rmu_logical=None,
     energy_unit="Ha",
+    time_reversal_rule=_TIME_REVERSAL_DEFAULT,
     mode="a",
 ):
     """Collectively allocate W(z); serial HDF5 writes metadata only.
@@ -859,7 +883,8 @@ def allocate_w_omega_collective(
             omega_line=omega_line, closure_verdict=closure_verdict,
             data_ready=np.zeros(shape[0], dtype=bool),
             n_rmu_logical=n_rmu_logical, provenance=provenance,
-            energy_unit=energy_unit)
+            energy_unit=energy_unit,
+            time_reversal_rule=time_reversal_rule)
     barrier("mpa_w_omega_allocated")
 
 
@@ -876,6 +901,7 @@ def stamp_w_omega(
     n_rmu_logical=None,
     provenance=None,
     energy_unit="Ha",
+    time_reversal_rule=_TIME_REVERSAL_DEFAULT,
     mode="a",
 ):
     """Make an ALREADY-WRITTEN 4-D dataset a version-2 W(ω) tensor.
@@ -998,6 +1024,8 @@ def stamp_w_omega(
                 val = np.float64(val)
             ds.attrs["mpa_" + key] = val
         ds.attrs["mpa_grid_hash"] = grid_hash
+        ds.attrs[_TIME_REVERSAL_ATTR] = _normalise_time_reversal_rule(
+            time_reversal_rule)
         ds.attrs["mpa_writer"] = "file_io.mpa_store"
         for key, val in extra.items():
             ds.attrs["mpa_prov_" + str(key)] = val
@@ -1228,7 +1256,8 @@ def read_w_header(src, name, *, mode="r"):
     Returns a plain dict with these keys, every one of which some reader
     below indexes by name: ``format_version``, ``freq_axis``, ``n_omega``,
     ``omega`` ``(n_omega,)`` complex128, ``omega_line`` ``(n_omega,)``
-    int32, ``omega_units``, ``sampling``, ``grid_hash``, ``data_ready``
+    int32, ``omega_units``, ``sampling``, ``grid_hash``,
+    ``time_reversal_rule``, ``data_ready``
     ``(n_omega,)`` bool, ``n_ready``, ``q_storage``, ``n_q_on_disk``,
     ``n_q_full``, ``n_mu``, ``n_rmu_logical``, ``centroid_hash``,
     ``table_hash``, ``closure_verdict``, ``provenance``.
@@ -1263,7 +1292,9 @@ def read_w_header(src, name, *, mode="r"):
         # KeyError deep in the read, because "which attr is missing" is
         # the question a half-written file raises and a traceback
         # through ``ds.attrs[...]`` answers it one attr at a time.
-        absent = [a for a in _MPA_OWNED_ATTRS if a not in ds.attrs]
+        absent = [
+            a for a in _MPA_OWNED_ATTRS
+            if a not in ds.attrs and a not in _MPA_LEGACY_OPTIONAL_ATTRS]
         if absent:
             raise ValueError(
                 f"mpa_store: {name!r} is a version "
@@ -1316,6 +1347,10 @@ def read_w_header(src, name, *, mode="r"):
                 f"this tensor was evaluated at, so every pole fitted "
                 f"from it would be fitted against the wrong abscissae.")
 
+        time_reversal_rule = _normalise_time_reversal_rule(
+            qs.qirr_attr_str(ds, _TIME_REVERSAL_ATTR)
+            if _TIME_REVERSAL_ATTR in ds.attrs else _TIME_REVERSAL_DEFAULT)
+
         scalar_ready = ds.attrs.get("qirr_data_ready", None)
         if scalar_ready is not None and bool(scalar_ready) != bool(
                 ready.all()):
@@ -1366,6 +1401,7 @@ def read_w_header(src, name, *, mode="r"):
             "omega_units": qs.qirr_attr_str(ds, "mpa_omega_units"),
             "sampling": sampling,
             "grid_hash": recomputed,
+            "time_reversal_rule": time_reversal_rule,
             "data_ready": ready,
             "n_ready": int(ready.sum()),
             "q_storage": shape_says,
@@ -1593,6 +1629,7 @@ def read_w_slab(
         q_irr_frac=can.q_irr_frac,
         mesh_xy=mesh_xy,
         n_sym_spatial=int(can.n_sym_spatial),
+        trs_rule=header["time_reversal_rule"],
     )
     return full, header
 
