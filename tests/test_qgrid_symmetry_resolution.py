@@ -38,9 +38,7 @@ fixture.
 from __future__ import annotations
 
 import ast
-import json
 import os
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -58,49 +56,6 @@ _REG = os.path.join(_HERE, "regression")
 _DECK = ("si_cohsex_debug", "WFN.h5")
 _OPEN_SET = "centroids_frac_960.txt"
 _CLOSED_SET = "centroids_frac_144.txt"
-
-
-def _q_receipt_sym(source="test:inversion"):
-    return SimpleNamespace(
-        q_symmetry_source=source,
-        trs_allowed=False,
-        sym_matrices=np.asarray((np.eye(3), -np.eye(3)), dtype=np.int32),
-        translations=np.zeros((2, 3)),
-        irr_idx_q=np.asarray((0, 1), dtype=np.int32),
-        sym_idx_q=np.asarray((0, 1), dtype=np.int32),
-        q_irr_kgrid_int=np.asarray(((0, 0, 0),), dtype=np.int32),
-        q_irr_full_idx=np.asarray((0,), dtype=np.int32),
-    )
-
-
-def test_zeta_q_receipt_matches_current_effective_group_across_channels():
-    from gw.qgrid_symmetry import require_zeta_q_symmetry
-    from symmetry_maps import q_symmetry_receipt_json
-
-    sym = _q_receipt_sym()
-    receipt = q_symmetry_receipt_json(sym)
-    loaders = tuple(SimpleNamespace(q_symmetry_receipt=receipt)
-                    for _ in range(4))
-    require_zeta_q_symmetry(sym=sym, loaders=loaders)
-
-    mismatched = json.loads(receipt)
-    mismatched["q_irr_full_idx"] = [1]
-    loaders = loaders[:2] + (SimpleNamespace(q_symmetry_receipt=json.dumps(
-        mismatched, sort_keys=True, separators=(",", ":"))),) + loaders[3:]
-    with pytest.raises(ValueError, match="channel 2"):
-        require_zeta_q_symmetry(sym=sym, loaders=loaders)
-
-
-def test_zeta_q_receipt_preserves_historical_wfn_path():
-    from gw.qgrid_symmetry import require_zeta_q_symmetry
-
-    require_zeta_q_symmetry(
-        sym=SimpleNamespace(q_symmetry_source="wfn"),
-        loaders=(SimpleNamespace(q_symmetry_receipt=None),))
-    with pytest.raises(ValueError, match="channel 0"):
-        require_zeta_q_symmetry(
-            sym=SimpleNamespace(q_symmetry_source="wfn"),
-            loaders=(SimpleNamespace(q_symmetry_receipt="{}"),))
 
 
 def _deck_file(*parts):

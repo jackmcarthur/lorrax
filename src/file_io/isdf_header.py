@@ -46,10 +46,6 @@ What lives in ``isdf_header``
   complete"; ``fit_provenance`` says "…and here is what it is complete
   FOR".  Both are required for ``gw.gw_init`` to reuse a ζ instead of
   refitting; a legacy file missing either is refit.
-- ``q_symmetry_receipt`` (scalar str, optional): canonical JSON for the
-  spatial group and exact q reduction tables used by this fit.  It is
-  separate from ``mf_header``, which continues to describe the raw WFN k
-  rows verbatim.  Legacy files omit it and therefore use WFN q symmetry.
 """
 
 from __future__ import annotations
@@ -134,12 +130,6 @@ class IsdfHeader:
                                  # EXACTLY.  ``None`` on legacy files => no
                                  # reuse (refit), which is the safe direction.
 
-    q_symmetry_receipt: str | None = None
-                                 # Canonical symmetry_maps JSON receipt for
-                                 # the q-only group/tables used by this fit.
-                                 # ``None`` means the q tables came directly
-                                 # from the copied WFN header (legacy/default).
-
     @property
     def n_rmu(self) -> int:
         return int(self.r_mu_fft_idx.shape[0])
@@ -164,7 +154,6 @@ class IsdfHeader:
         ngk_per_q: np.ndarray | None = None,
         zeta_cutoff_ry: float | None = None,
         fit_provenance: str | None = None,
-        q_symmetry_receipt: str | None = None,
     ) -> 'IsdfHeader':
         """Build a header from centroid FFT-grid indices.
 
@@ -226,8 +215,6 @@ class IsdfHeader:
             zeta_cutoff_ry=cutoff,
             fit_provenance=(None if fit_provenance is None
                             else str(fit_provenance)),
-            q_symmetry_receipt=(None if q_symmetry_receipt is None
-                                else str(q_symmetry_receipt)),
         )
 
 
@@ -259,7 +246,6 @@ def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
     obj.ngk_per_q = isdf.ngk_per_q
     obj.zeta_cutoff_ry = isdf.zeta_cutoff_ry
     obj.fit_provenance = isdf.fit_provenance
-    obj.q_symmetry_receipt = isdf.q_symmetry_receipt
     obj.ngkmax_zeta = isdf.ngkmax   # WFN.h5-style padded G-axis size
 
 
@@ -286,8 +272,6 @@ def _read_group(f: h5.File) -> IsdfHeader:
               if 'zeta_cutoff_ry' in g else None)
     prov = (_decode_str(g['fit_provenance'][()])
             if 'fit_provenance' in g else None)
-    q_sym = (_decode_str(g['q_symmetry_receipt'][()])
-             if 'q_symmetry_receipt' in g else None)
     return IsdfHeader(
         density=_decode_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
@@ -299,7 +283,6 @@ def _read_group(f: h5.File) -> IsdfHeader:
         ngk_per_q=nk,
         zeta_cutoff_ry=cutoff,
         fit_provenance=prov,
-        q_symmetry_receipt=q_sym,
     )
 
 
@@ -360,9 +343,6 @@ def write_isdf_header(
         if header.fit_provenance is not None:
             g.create_dataset('fit_provenance',
                              data=np.bytes_(header.fit_provenance))
-        if header.q_symmetry_receipt is not None:
-            g.create_dataset('q_symmetry_receipt',
-                             data=np.bytes_(header.q_symmetry_receipt))
 
 
 def mark_zeta_done(path: str | Path) -> None:

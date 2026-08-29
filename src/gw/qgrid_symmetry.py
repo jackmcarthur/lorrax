@@ -50,39 +50,6 @@ from __future__ import annotations
 import numpy as np
 
 
-def require_zeta_q_symmetry(*, sym, loaders) -> None:
-    """Refuse a zeta artifact whose q tables differ from this run's.
-
-    The raw ``mf_header`` continues to describe WFN k symmetry.  A derived
-    q-only group is therefore identified by the separate canonical receipt
-    written by the zeta fitter.  All four bispinor channels must carry the
-    same receipt; ordinary WFN-derived fits retain the historical absence of
-    that field.
-    """
-    source = str(getattr(sym, "q_symmetry_source", "wfn"))
-    expected = None
-    if source != "wfn":
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import q_symmetry_receipt_json
-        expected = q_symmetry_receipt_json(sym)
-
-    for channel, loader in enumerate(tuple(loaders)):
-        actual = getattr(loader, "q_symmetry_receipt", None)
-        if actual != expected:
-            expected_label = ("WFN q symmetry (no separate receipt)"
-                              if expected is None
-                              else f"effective q symmetry source={source!r}")
-            actual_label = ("no receipt" if actual is None
-                            else "a different effective-q receipt")
-            raise ValueError(
-                "zeta q-symmetry mismatch: channel "
-                f"{channel} carries {actual_label}, but this run requires "
-                f"{expected_label}. Refit all charge/transverse zeta files "
-                "together; refusing to address their q rows with different "
-                "tables.")
-
-
 def resolve_qgrid_symmetry_tables(
     *,
     sym,
