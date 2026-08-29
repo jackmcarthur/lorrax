@@ -67,6 +67,10 @@ class ComplexTimeSearchOptions:
     # occupies it; disable the shortcut to let the measured fit compete on
     # sign-definite supports too.
     sector_shortcut: bool = True
+    # Warm start: exact times to activate before growth (typically the
+    # previous tolerance rung's rule when walking a ladder).  They join
+    # the dictionary as family "seed" and remain prunable.
+    seed_times: tuple = ()
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.target_error) < 1.0:
@@ -279,6 +283,10 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
             return sector
 
     candidates, candidate_families = candidate_time_dictionary(problem, options)
+    if options.seed_times:
+        warm = np.asarray(list(options.seed_times), dtype=np.complex128)
+        candidates = np.concatenate([candidates, warm])
+        candidate_families = candidate_families + ("seed",) * warm.size
     n_frequency = problem.frequencies.size
     fit_count = min(int(options.fit_frequency_count), n_frequency)
     stride = max(1, n_frequency // fit_count)
@@ -292,8 +300,11 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
     # seed"), else the shortest crossing-capable atoms.  Ties resolve by
     # magnitude order, deterministically.
     families_array = np.asarray(candidate_families)
+    seed_index = np.nonzero(families_array == "seed")[0]
     ray_index = np.nonzero(families_array == "ray")[0]
-    if ray_index.size:
+    if seed_index.size:
+        picks = seed_index
+    elif ray_index.size:
         ray_angle = np.angle(candidates[ray_index])
         distinct_angles = np.unique(np.round(ray_angle, 12))
         central = distinct_angles[
