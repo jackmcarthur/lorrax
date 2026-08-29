@@ -60,8 +60,8 @@ exactly nothing and could be skipped.  They are not skipped, on purpose:
 
 * the scan needs shapes uniform across iterations, and the occupied count
   varies per k in a metal;
-* fractional occupations — the successor to the step function in
-  ``gw.efermi`` — make every band contribute, so a code that slices to
+* fractional occupations, including the signed MP1 weights used for metallic
+  self-consistency, may make every band contribute, so a code that slices to
   the occupied window would have to be rewritten rather than re-fed.
 
 The price is transforming ``nb`` bands instead of ``n_occ``.  Measure it
@@ -362,7 +362,8 @@ def symmetrise_density(rho_r, sym_perm):
 @timing.timed("vh.rho", watch=True)
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
-                  U=None, sym_perm=None):
+                  U=None, sym_perm=None, include_dirac_current: bool = False,
+                  charge_nspinor: int | None = None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
@@ -386,9 +387,16 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         ``None`` builds ρ from ``psi_G`` unrotated — the DFT density and
         the gate's baseline.
 
+    ``include_dirac_current=True`` requires four-component orbitals and
+    returns ``(rho,Jx,Jy,Jz)`` from the SAME inverse FFT and the SAME signed
+    per-state occupations.  ``charge_nspinor`` may restrict only ``rho`` to
+    a leading carrier block (the Pauli-reference model); all three currents
+    continue to use the full four-spinor.  The local contraction is shared
+    with :func:`psp.get_DFT_mtxels.valence_density_from_kpoint`.
+
     Returns
     -------
-    (nx, ny, nz) float64, replicated.
+    (nx, ny, nz) or (4, nx, ny, nz) float64, replicated.
 
     NORMALISATION is term-for-term ``psp.get_DFT_mtxels.
     valence_density_from_kpoint``: ψ_r = ifftn(box, 'ortho')·√(N/Ω), so
@@ -422,6 +430,23 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     f_spin = float(spin_degeneracy)
 
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
+    include_current = bool(include_dirac_current)
+    ns = int(psi.shape[2])
+    charge_ns = ns if charge_nspinor is None else int(charge_nspinor)
+    if not 0 < charge_ns <= ns:
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_nspinor} for nspinor={ns}")
+    if include_current and ns != 4:
+        raise ValueError(
+            "rho_from_wfns: Dirac current requires four-component "
+            f"bispinors; got nspinor={ns}")
+    if include_current and sym_perm is not None:
+        raise ValueError(
+            "rho_from_wfns: sym_perm is a scalar-density projector and "
+            "cannot rotate a polar current. Build the full-BZ four-current "
+            "with uniform weights, then call "
+            "symmetry_maps.project_polar_fft_field on its spatial rows.")
     p_prod = spec_divisor(mesh, _band_spec(), 1)
     _pad = pad_axis(psi, p_prod, axis=1)
     psi, nb_logical = _pad.array, _pad.logical   # LOGICAL, by name
@@ -465,7 +490,10 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     box_spec = P(None, ("x", "y"), None, None, None, None)
     ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
                                   norm="ortho", axes=(-3, -2, -1))
-    rho_sharding = NamedSharding(mesh, P(None, None, None))
+    field_shape = ((4, *grid) if include_current else grid)
+    field_spec = (P(None, None, None, None) if include_current
+                  else P(None, None, None))
+    rho_sharding = NamedSharding(mesh, field_spec)
 
     def build():
         @jax.jit
@@ -521,11 +549,14 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                     psi_t = psi_k[None]
                 box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
                 psi_r = ifftn(box) * scale
-                dens = jnp.einsum('n,knsxyz->xyz', occ_k,
-                                  jnp.abs(psi_r) ** 2, optimize=True)
+                from psp.get_DFT_mtxels import density_components_from_psi_r
+                dens = density_components_from_psi_r(
+                    psi_r[0], occ_k,
+                    include_dirac_current=include_current,
+                    charge_nspinor=charge_ns)
                 return rho + (w_k * f_spin) * dens, None
 
-            rho0 = jnp.zeros(grid, dtype=jnp.float64)
+            rho0 = jnp.zeros(field_shape, dtype=jnp.float64)
             xs = ((psi_s, U_x, occ_, w_, bidx_) if have_U
                   else (psi_s, occ_, w_, bidx_))
             rho, _ = jax.lax.scan(body, rho0, xs, unroll=1)
@@ -539,7 +570,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     fn = _cached_jit(
         "rho_from_wfns",
         (psi.shape, tuple(np.shape(U_j)), grid, float(cell_volume), f_spin,
-         have_U, None if sym_perm is None else tuple(np.shape(sym_perm)),
+         have_U, include_current, charge_ns,
+         None if sym_perm is None else tuple(np.shape(sym_perm)),
          _sharding_key(psi)),
         build)
     # sym_perm is an OPERAND, not a closure.  The cache key can only carry

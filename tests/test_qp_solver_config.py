@@ -140,10 +140,10 @@ def test_pauli_reference_selector_splits_charge_from_current(tmp_path):
     assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
 
 
-def test_pauli_reference_refuses_self_consistency(tmp_path):
+def test_pauli_reference_self_consistency_requires_live_four_current(tmp_path):
     with pytest.raises(
             ValueError,
-            match="bispinor_current_hartree_self_consistency_unavailable"):
+            match="bispinor_self_consistency_requires_live_four_current"):
         _config(
             tmp_path,
             "bispinor = true\n"
@@ -151,6 +151,19 @@ def test_pauli_reference_refuses_self_consistency(tmp_path):
             "restart = false\n"
             "write_restart_tensors = false\n"
             "qp_solver = self_consistent\n")
+
+
+def test_pauli_reference_accepts_live_four_current_self_consistency(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = pauli_reference_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n"
+        "qp_solver = self_consistent\n"
+        "density_self_consistent = true\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
 
 
 def test_pauli_reference_requires_four_current_enablement(tmp_path):

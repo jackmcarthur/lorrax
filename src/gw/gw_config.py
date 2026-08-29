@@ -3550,24 +3550,23 @@ def uses_coupled_photon_head(config) -> bool:
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
-    """Validate the narrow one-shot static packed-photon modes."""
+    """Validate four-current modes and require live direct fields for QSGW."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
-    if bool(config.bispinor) and (
-        config.qp_solver is not QPSolver.ONE_SHOT_DFT
-        or bool(config.density_self_consistent)
-    ):
+    if (bool(config.bispinor)
+            and config.qp_solver is QPSolver.SELF_CONSISTENT
+            and not bool(config.density_self_consistent)):
         raise ValueError(
-            "GATE bispinor_current_hartree_self_consistency_unavailable: "
-            "exact transverse direct Hartree is currently a one-shot "
-            "kin_ion/G-space artifact built from the DFT occupied "
-            "bispinors. QSGW or density_self_consistent would require "
-            "rebuilding the signed current from each iteration's evolving "
-            "orbitals; refusing a frozen or basis-only approximation.\n"
+            "GATE bispinor_self_consistency_requires_live_four_current: "
+            "bispinor QSGW changes the occupied orbitals, so its scalar "
+            "charge and signed Dirac current must both be rebuilt on every "
+            "map call. The live four-current implementation is selected by "
+            "density_self_consistent = true; refusing a frozen DFT direct "
+            "field.\n"
             f"  got: qp_solver = {config.qp_solver.value}, "
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
-            "  want: qp_solver = one_shot_dft, "
-            "density_self_consistent = false")
+            "  want: density_self_consistent = true (or "
+            "qp_solver = one_shot_dft)")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if not bool(config.bispinor):

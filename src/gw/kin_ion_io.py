@@ -406,7 +406,11 @@ def broadcast_ibz_to_full_bz(A_irr, sym):
     """
     if A_irr is None:
         return None
-    return _broadcast_ibz_slab(np.asarray(A_irr), *star_tables(sym))
+    # The canonical adapter dispatches on the operand: NumPy stays on the
+    # host, while a JAX array is gathered/conjugated where it is and retains
+    # its trailing-axis sharding.  Do not coerce here: that would turn the
+    # live driver's star broadcast back into the host gather it avoids.
+    return _broadcast_ibz_slab(A_irr, *star_tables(sym))
 
 
 def _wedge_sweep_kspec(wfn, sym):
@@ -870,7 +874,8 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            bispinor_lift: str = "raw",
                            print_fn=print,
                            owner_only: bool = False,
-                           k_set: str = "full"):
+                           k_set: str = "full",
+                           return_sharded: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
 
     SINGLE SOURCE for every exact-V_H consumer: the CLI in this module
@@ -900,17 +905,23 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     ``sys_dim``); mixing it with V_loc's is a large systematic error
     inside a ~500 eV cancellation.
 
-    Returns the FULL matrix as a host ``numpy`` array replicated on
-    every rank, not the diagonal: a QSGW band rotation needs
-    ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.  A caller
-    that wants the SHARDED block instead calls
-    :func:`common.mtxel_sweep.sweep_matrix_elements` directly, which is
-    what ``gw.sc_iteration.rebuild_hartree_dft_basis`` does.
+    By default returns the FULL matrix as a host ``numpy`` array replicated
+    on every rank, not the diagonal: a QSGW band rotation needs
+    ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.  Live driver
+    consumers pass ``return_sharded=True``; the SC rebuild calls
+    :func:`common.mtxel_sweep.sweep_matrix_elements` directly because it
+    already owns the real-space potential and its DFT-basis contraction.
 
     ``owner_only=True`` (this module's CLI, whose only consumer is the
     rank-0 h5 write) assembles on rank 0 alone and returns ``None`` on
     every other rank — see :func:`common.mtxel_sweep.blocks_to_host`.
-    Replicated consumers (gspace route) keep the default.
+    Legacy host consumers keep the default.
+
+    ``return_sharded=True`` is the live-driver boundary: it retains the
+    logical ``(nk,nb,nb)`` result at ``P(None,'x','y')`` and performs the
+    star broadcast on device.  No rank assembles a band tile and no host
+    round trip occurs.  It is mutually exclusive with ``owner_only``;
+    artifact writers keep the explicit owner-only host boundary above.
 
     ``k_set`` names which k-set the RESULT is on, and the two consumers
     now answer differently — which is why it is a parameter rather than a
@@ -926,9 +937,13 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     """
     if k_set not in ("full", "ibz"):
         raise ValueError(
-            f"compute_hartree_matrix: k_set must be 'full' (the replicated "
-            f"full-BZ table the gspace route consumes) or 'ibz' (the "
+            f"compute_hartree_matrix: k_set must be 'full' (the full-BZ "
+            f"table the gspace route consumes) or 'ibz' (the "
             f"pre-broadcast block the CLI persists); got {k_set!r}")
+    if return_sharded and owner_only:
+        raise ValueError(
+            "compute_hartree_matrix: return_sharded and owner_only are "
+            "mutually exclusive output boundaries")
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
     nocc = int(wfn.nelec)
@@ -1103,6 +1118,7 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     # single definition of that layout, shared with the loader, so no
     # reshard is inserted between the read and the scan.
     from common.mtxel_sweep import (SweepGeometry, blocks_to_host,
+                                    four_current_potential_operator,
                                     local_potential_operator,
                                     sweep_matrix_elements)
     from common.wfn_layout import band_sphere_spec
@@ -1114,66 +1130,70 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         bispinor_lift=bispinor_lift)
     psi_charge = psi_G if charge_ns == int(psi_G.shape[2]) \
         else psi_G[:, :, :charge_ns, :]
-    geom_charge = SweepGeometry(
+    geom_matrix = SweepGeometry(
         mesh=mesh, fft_grid=meta.fft_grid,
-        ngkmax=int(psi_charge.shape[3]), nb=nb,
-        ns=int(psi_charge.shape[2]), nk=nk_irr,
-        cell_volume=float(wfn.cell_volume))
-    print_fn(f"\n⟨mk|V_H|nk⟩: one k-scan over {nk_irr} STAR-WEDGE k-points "
-             f"(broadcast to {nk} full-BZ k), "
-             f"{geom_charge.nb} bands sharded over P={world}; "
+        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ns=(int(psi_G.shape[2]) if with_transverse
+            else int(psi_charge.shape[2])),
+        nk=nk_irr, cell_volume=float(wfn.cell_volume))
+    matrix_label = ("⟨mk|V_H|nk⟩ + <m|sum_i alpha_i A_i|n>"
+                    if with_transverse else "⟨mk|V_H|nk⟩")
+    print_fn(f"\n{matrix_label}: one k-scan over {nk_irr} STAR-WEDGE "
+             f"k-points (broadcast to {nk} full-BZ k), "
+             f"{geom_matrix.nb} bands sharded over P={world}; "
              f"charge nspinor={charge_ns}...")
+    matrix_psi = psi_G if with_transverse else psi_charge
+    matrix_operator = (
+        four_current_potential_operator(
+            geom_matrix, V_H_r, V_T_r, charge_nspinor=charge_ns)
+        if with_transverse else local_potential_operator(geom_matrix, V_H_r))
     with timing.section("vh_matrix"):
-        H_vh = sweep_matrix_elements(
-            psi_charge,
-            operator=local_potential_operator(geom_charge, V_H_r),
-            geom=geom_charge,
+        H_matrix = sweep_matrix_elements(
+            matrix_psi, operator=matrix_operator, geom=geom_matrix,
             gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k=k_spec),
-            # The WFN loader's paired k representative for these exact G rows,
-            # not a separately returned table that is only equal today.
-            kvecs=gtab.kvecs)
-        # THE BOUNDARY, stated rather than implied.  Both consumers want a
-        # HOST array — the CLI writes it with serial h5py on rank 0
-        # (``owner_only=True``), and ``sigma_dispatch``'s gspace route hands
-        # it to ``replicate_to_mesh`` as a replicated global operand — so
-        # the sharding is undone HERE for both, and named.  (The QSGW
-        # consumer that CAN stay sharded,
-        # ``sc_iteration.rebuild_hartree_dft_basis``, calls
-        # ``sweep_matrix_elements`` directly and never reaches this line.)
+            box_index=wfn.box_index(k=k_spec), kvecs=gtab.kvecs)
+        if with_transverse:
+            H_vh, H_vt = H_matrix[:, 0], H_matrix[:, 1]
+        else:
+            H_vh = H_matrix
+        del H_matrix
+        # THE BOUNDARY, stated rather than implied.  The CLI writes with
+        # serial h5py on rank 0 and therefore explicitly gathers through
+        # ``blocks_to_host(owner_only=True)``.  The live gspace driver keeps
+        # the matrix at P(None,'x','y') and star-broadcasts on device.  The
+        # SC consumer already owns its potential and calls the sweep directly.
         #
-        # THE k-SET IS WHERE THEY PART.  gspace needs the full BZ in memory
-        # and gets it, unchanged.  The CLI's consumer is a FILE, and the
-        # file now stores the IBZ block and unfolds on read, so handing the
-        # CLI a broadcast it would immediately re-compress is the work this
-        # change exists to delete.
-        H_host = blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
+        # THE k-SET IS WHERE THEY PART.  gspace needs the full BZ as a
+        # distributed device array.  The CLI's consumer is a FILE, and the
+        # file stores the IBZ block and unfolds on read, so handing the CLI a
+        # broadcast it would immediately re-compress is wasted work.
+        if return_sharded:
+            H_wedge = H_vh[:, :nb, :nb]
+            if k_set == "ibz":
+                H_charge = H_wedge
+            else:
+                H_charge = broadcast_ibz_to_full_bz(H_wedge, sym)
+        else:
+            H_host = blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
+            H_charge = (H_host if k_set == "ibz"
+                        else broadcast_ibz_to_full_bz(H_host, sym))
     del H_vh
-    H_charge = (H_host if k_set == "ibz"
-                else broadcast_ibz_to_full_bz(H_host, sym))
     if not with_transverse:
         del psi_G, psi_charge
         return H_charge
 
-    geom_current = SweepGeometry(
-        mesh=mesh, fft_grid=meta.fft_grid,
-        ngkmax=int(psi_G.shape[3]), nb=nb,
-        ns=int(psi_G.shape[2]), nk=nk_irr,
-        cell_volume=float(wfn.cell_volume))
-    print_fn(
-        f"\n<m|sum_i alpha_i A_i|n>: same {nk_irr}-point STAR-WEDGE "
-        f"scan, {geom_current.nb} bands sharded over P={world}...")
-    with timing.section("vh_transverse_matrix"):
-        H_vt = sweep_matrix_elements(
-            psi_G,
-            operator=local_potential_operator(
-                geom_current, V_T_r, dirac_vector=True),
-            geom=geom_current, gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=wfn.box_index(k=k_spec), kvecs=gtab.kvecs)
-        H_t_host = blocks_to_host(H_vt, nb=nb, owner_only=owner_only)
+    with timing.section("vh_transverse_matrix_boundary"):
+        if return_sharded:
+            H_t_wedge = H_vt[:, :nb, :nb]
+            if k_set == "ibz":
+                H_transverse = H_t_wedge
+            else:
+                H_transverse = broadcast_ibz_to_full_bz(H_t_wedge, sym)
+        else:
+            H_t_host = blocks_to_host(H_vt, nb=nb, owner_only=owner_only)
+            H_transverse = (H_t_host if k_set == "ibz"
+                            else broadcast_ibz_to_full_bz(H_t_host, sym))
     del H_vt, psi_G, psi_charge, V_T_r
-    H_transverse = (H_t_host if k_set == "ibz"
-                    else broadcast_ibz_to_full_bz(H_t_host, sym))
     return ExactHartreeMatrices(
         charge=H_charge,
         transverse=H_transverse,
@@ -1518,8 +1538,8 @@ def main(argv=None):
     #
     # ``owner_only``: this CLI's only V_H consumers are the rank-0 h5
     # write and the rank-0 diagnostic print, so no peer needs the
-    # replicated (nk, nb, nb) table (BD.4).  The driver's gspace route
-    # (``sigma_dispatch``) keeps the replicated default.
+    # replicated (nk, nb, nb) table (BD.4).  The driver's live gspace route
+    # requests the device-resident, two-axis-band-sharded return instead.
     #
     # ``k_set``: IBZ for the normal path, because that is what gets stored.
     # ``--fold-hartree`` is the one exception and it is not an optimisation

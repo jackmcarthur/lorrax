@@ -333,6 +333,27 @@ class SCMapScreeningArtifacts:
 
 
 @dataclass(frozen=True)
+class SCExactHartree:
+    """Caller-owned direct field rebuilt from one SC map's orbitals.
+
+    Every matrix is on the full BZ in the original DFT basis.  Keeping the
+    scalar and transverse pieces separate preserves ``sigma_mnk.h5``'s
+    decomposition; :attr:`total` is the only combination that enters the
+    Hamiltonian.
+    """
+
+    scalar_dft: jax.Array
+    transverse_dft: jax.Array | None
+    efermi_ry: float
+
+    @property
+    def total(self):
+        if self.transverse_dft is None:
+            return self.scalar_dft
+        return self.scalar_dft + self.transverse_dft
+
+
+@dataclass(frozen=True)
 class SCOutputs:
     """Output-only records captured from one map call.
 
@@ -357,6 +378,7 @@ class SCOutputs:
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
+    exact_hartree_dft: SCExactHartree | None = None
 
 
 @dataclass(frozen=True)
@@ -1548,7 +1570,12 @@ def _dft_psi_sphere(inputs):
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
-    key = (id(inputs.wfn), b_lo, b_hi)
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(inputs.config.bispinor), inputs.config.bispinor_gw)
+    carrier_bispinor = bool(representation.current_bispinor)
+    carrier_lift = representation.current_lift or "raw"
+    key = (id(inputs.wfn), b_lo, b_hi, carrier_bispinor, carrier_lift)
     hit = _PSI_G_CACHE.get(key)
     if hit is None:
         # ONE-TIME ROW.  The section is entered every iteration but only
@@ -1559,7 +1586,9 @@ def _dft_psi_sphere(inputs):
         with timing.section("vh.psi_load"):
             spec = band_sphere_spec()
             psi = inputs.wfn.load(
-                bands=(b_lo, b_hi), k="full_bz", sharding=spec)
+                bands=(b_lo, b_hi), k="full_bz", sharding=spec,
+                bispinor=carrier_bispinor,
+                bispinor_lift=carrier_lift)
             bidx = np.asarray(inputs.wfn.box_index(k="full_bz"))
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
@@ -1582,9 +1611,11 @@ def _kstar(inputs):
     return KStarMap.identity(int(inputs.kin_ion_dft.shape[0]))
 
 
-# THE DENSITY-SC ROW, AND ITS FOUR CHILDREN.  ``vh.rebuild`` is the whole
+# THE DENSITY-SC ROW, AND ITS CHILDREN.  ``vh.rebuild`` is the whole
 # rebuild; under it the timing tree carries ``vh.psi_load``,
-# ``vh.rotate_bands``, ``vh.rho``, ``vh.poisson`` and ``mtxel.sweep``.
+# ``vh.rotate_bands``, ``vh.rho``, ``vh.poisson`` and ``mtxel.sweep``;
+# four-current runs also carry ``vh.transverse_field`` while scalar and
+# transverse matrix elements ride the same packed sweep.
 # No ``watch`` on the parent: every child that produces a device array
 # blocks on it (see each one's note), so the last statement of this
 # function has already been synchronised and the inclusive time is real.
@@ -1611,8 +1642,8 @@ def _kstar(inputs):
 # module docstrings worry about — it is the matrix-element sweep, which
 # alone exceeds this deck's whole chi0+W screening (5.51 s/iteration).
 @timing.timed("vh.rebuild")
-def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
-    """⟨m|V_H[ρ_i]|n⟩ in the DFT basis, from iteration i's own orbitals.
+def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
+    """Exact direct Hartree in the DFT basis from iteration-i orbitals.
 
     The cycle this closes::
 
@@ -1638,9 +1669,13 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     """
     from gw.efermi import (fermi_level_step, occupied_band_count,
                            step_occupations)
-    from gw.qsgw_density import rotate_bands, hartree_from_orbitals
+    from gw.qsgw_density import rotate_bands, rho_from_wfns
+    from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
-    from common.mtxel_sweep import (SweepGeometry, local_potential_operator,
+    from psp.get_DFT_mtxels import build_hartree_potential
+    from common.mtxel_sweep import (SweepGeometry,
+                                    four_current_potential_operator,
+                                    local_potential_operator,
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
 
@@ -1679,26 +1714,94 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry):
     psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
-    _rho, V_H_r = hartree_from_orbitals(
-        psi_qp, occ, kweights, inputs.wfn, mesh=inputs.mesh_xy,
+    representation = resolve_four_current_representation(
+        bool(inputs.config.bispinor), inputs.config.bispinor_gw)
+    include_current = bool(representation.current_bispinor)
+    charge_ns = (int(psi_qp.shape[2]) if representation.charge_bispinor
+                 else int(inputs.wfn.nspinor))
+    fields = rho_from_wfns(
+        psi_qp, occ, kweights, mesh=inputs.mesh_xy,
         box_index=bidx, fft_grid=grid,
-        truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
+        cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,
-        # ``occupied_band_count`` rather than a second einsum: same
-        # contraction, and it is the number ``fermi_level_step`` targets.
-        expected_electrons=f_spin * occupied_band_count(occ, kweights),
-        print_fn=inputs.print_fn)
+        include_dirac_current=include_current,
+        charge_nspinor=charge_ns)
+    rho_r = fields[0] if include_current else fields
+    expected_electrons = f_spin * occupied_band_count(occ, kweights)
+    with timing.section("vh.poisson"):
+        V_H_r = build_hartree_potential(
+            rho_r, inputs.wfn,
+            truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
+            expected_electrons=expected_electrons,
+            print_fn=inputs.print_fn)
+
+    V_T_r = None
+    if include_current:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import project_polar_fft_field
+        from psp.dft_operators import transverse_potential_from_current
+        from vcoul import COULOMB_GAUGE_TT_SIGN
+
+        current_raw = np.asarray(fields[1:], dtype=np.float64)
+        ngrid = int(np.prod(grid))
+        current_g0 = np.sum(current_raw, axis=(-3, -2, -1)) / np.sqrt(ngrid)
+        current_scale = max(
+            float(np.linalg.norm(current_raw)), np.finfo(np.float64).tiny)
+        inputs.print_fn(
+            "    SC Dirac-current G=0 diagnostic (J=j/c): "
+            f"||J0||={float(np.linalg.norm(current_g0)):.6e}, "
+            f"||J||={current_scale:.6e}, "
+            f"ratio={float(np.linalg.norm(current_g0)) / current_scale:.6e}; "
+            "periodic TT sets G=0 to zero")
+        projection = project_polar_fft_field(current_raw, inputs.sym)
+        inputs.print_fn(
+            "    SC Dirac-current symmetry projection: "
+            f"rows={projection.n_symmetry_rows} "
+            f"(antiunitary={projection.n_antiunitary_rows}), "
+            f"movement={projection.relative_movement:.6e}, "
+            f"residual={projection.relative_residual:.6e} <= "
+            f"{projection.relative_residual_tolerance:.6e}")
+        with timing.section("vh.transverse_field"):
+            V_T_r = transverse_potential_from_current(
+                jnp.asarray(projection.field, dtype=jnp.float64),
+                jnp.asarray(inputs.wfn.bdot, dtype=jnp.float64),
+                jnp.asarray(inputs.wfn.bvec, dtype=jnp.float64),
+                float(inputs.wfn.blat),
+                bool(getattr(inputs.config, "sys_dim", 3) == 2),
+                tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k="full_bz")
-    geom = SweepGeometry(mesh=inputs.mesh_xy, fft_grid=grid,
-                         ngkmax=int(psi_G.shape[3]), nb=nb,
-                         ns=int(psi_G.shape[2]), nk=nk,
-                         cell_volume=float(inputs.wfn.cell_volume))
-    H_vh = sweep_matrix_elements(
-        psi_G, operator=local_potential_operator(geom, V_H_r), geom=geom,
-        gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
-        kvecs=gtab.kvecs)
-    return H_vh, e_f
+    psi_charge = psi_G[:, :, :charge_ns, :]
+    geom_matrix = SweepGeometry(
+        mesh=inputs.mesh_xy, fft_grid=grid,
+        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ns=(int(psi_G.shape[2]) if V_T_r is not None
+            else int(psi_charge.shape[2])), nk=nk,
+        cell_volume=float(inputs.wfn.cell_volume))
+    if V_T_r is not None:
+        H_pair = sweep_matrix_elements(
+            psi_G,
+            operator=four_current_potential_operator(
+                geom_matrix, V_H_r, V_T_r,
+                charge_nspinor=charge_ns),
+            geom=geom_matrix,
+            gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
+            kvecs=gtab.kvecs)
+        H_scalar, H_transverse = H_pair[:, 0], H_pair[:, 1]
+        del H_pair
+    else:
+        H_scalar = sweep_matrix_elements(
+            psi_charge,
+            operator=local_potential_operator(geom_matrix, V_H_r),
+            geom=geom_matrix,
+            gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
+            kvecs=gtab.kvecs)
+        H_transverse = None
+    return SCExactHartree(
+        scalar_dft=H_scalar,
+        transverse_dft=H_transverse,
+        efermi_ry=float(e_f))
 
 
 def _residency_census(named, print_fn) -> None:
@@ -2230,18 +2333,26 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
     # orbitals, alongside Sigma_i and from the same U_qp, both feeding
     # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
+    exact_hartree_dft = None
     v_h_dft_new = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):
         # rho is built from FULL-BZ psi (uniform weights, no star sum),
         # so it takes the broadcast U and E; the matrix it returns is
         # selected to the IBZ to match delta_h_dft.
-        v_h_dft_new, e_f_ry = rebuild_hartree_dft_basis(
+        exact_hartree_dft = rebuild_hartree_dft_basis(
             inputs, U_full, E_full)
+        v_h_dft_new = exact_hartree_dft.total
+        from common import sanity as _sanity
+        _sanity.check_finite(
+            "V_H[SC] + H_T[SC]", v_h_dft_new,
+            print_fn=inputs.print_fn)
         if not ks.is_identity:
             v_h_dft_new = ks.select(v_h_dft_new)
         inputs.print_fn(
-            f"    density-SC: rebuilt V_H from iteration {state.iteration} "
-            f"orbitals (E_F = {e_f_ry:.6f} Ry)")
+            f"    density-SC: rebuilt exact scalar"
+            f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
+            f"Hartree from iteration {state.iteration} orbitals "
+            f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
@@ -2549,6 +2660,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
              ("sigma_xc_kij_ry", sigma_result.sigma_xc_kij_ry),
              ("sigma_x_kij_ry", sigma_result.sigma_x_kij_ry),
              ("v_h_kij_ry", sigma_result.v_h_kij_ry),
+             ("V_H[SC] scalar", (
+                 exact_hartree_dft.scalar_dft
+                 if exact_hartree_dft is not None else None)),
+             ("H_T[SC] transverse", (
+                 exact_hartree_dft.transverse_dft
+                 if exact_hartree_dft is not None else None)),
              # THE ω-CUBE.  (nω, nk, nb, nb) and the largest object the
              # loop carries; it is the one whose retention across
              # iterations ``residual_fn`` now drops, so its measured
@@ -2662,6 +2779,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 iteration_head=iteration_head,
                 static_head_terms=iteration_static_head_terms,
             ),
+            exact_hartree_dft=exact_hartree_dft,
         ),
     )
 
@@ -4353,7 +4471,10 @@ def run_sc_driver(
         rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
-        input_dir=input_dir, sym=sym, print_fn=print_fn,
+        input_dir=input_dir, sym=sym,
+        exact_hartree_dft=state_final.outputs.exact_hartree_dft,
+        sigma_basis_U=state_final.outputs.sigma_basis_U,
+        print_fn=print_fn,
     )
 
     # Rotate every QP-basis SigmaResult field back to the DFT basis.
@@ -4388,13 +4509,22 @@ def run_sc_driver(
             head_sigma_diag_dft = _rotate_head_diagonal_to_dft(
                 sigma_result.head_sigma_diag_w_kn_ry, U, mesh=mesh_xy,
                 weight_dft_qp=head_weight_dft_qp)
-    sig_h = _rotate_to_dft_basis(sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
-    v_h_scalar = _rotate_to_dft_basis(
-        sigma_result.v_h_scalar_kij_ry, U, mesh=mesh_xy)
-    h_transverse = (
-        _rotate_to_dft_basis(
-            sigma_result.h_transverse_kij_ry, U, mesh=mesh_xy)
-        if sigma_result.h_transverse_kij_ry is not None else None)
+    exact_hartree_dft = state_final.outputs.exact_hartree_dft
+    if exact_hartree_dft is None:
+        sig_h = _rotate_to_dft_basis(
+            sigma_result.v_h_kij_ry, U, mesh=mesh_xy)
+        v_h_scalar = _rotate_to_dft_basis(
+            sigma_result.v_h_scalar_kij_ry, U, mesh=mesh_xy)
+        h_transverse = (
+            _rotate_to_dft_basis(
+                sigma_result.h_transverse_kij_ry, U, mesh=mesh_xy)
+            if sigma_result.h_transverse_kij_ry is not None else None)
+    else:
+        # Already contracted with the unrotated DFT orbitals.  Rotating this
+        # through the Sigma-basis U would be a second, erroneous basis change.
+        v_h_scalar = exact_hartree_dft.scalar_dft
+        h_transverse = exact_hartree_dft.transverse_dft
+        sig_h = exact_hartree_dft.total
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
         sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
@@ -4571,6 +4701,8 @@ def dump_sigma_omega_h5_final(
     mesh_xy: Mesh,
     input_dir: str,
     sym=None,
+    exact_hartree_dft: SCExactHartree | None = None,
+    sigma_basis_U=None,
     print_fn: Callable = print,
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
@@ -4589,6 +4721,31 @@ def dump_sigma_omega_h5_final(
         state.outputs.sigma_result if state.outputs is not None else None)
     if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
         return None
+    if exact_hartree_dft is not None:
+        if sigma_basis_U is None:
+            raise ValueError(
+                "dump_sigma_omega_h5_final: caller-owned exact Hartree "
+                "requires the DFT-to-Sigma basis rotation")
+        # The dynamic cube stays in the last map's QP basis.  The live direct
+        # field was contracted directly in DFT basis, so rotate its two
+        # components INTO that QP basis once for this file rather than
+        # mixing bases or repeating the rotation on every SC iteration.
+        U = _place(sigma_basis_U, mesh_xy, _band_rotation_spec())
+        scalar_qp = _rotate_fixed_matrix(
+            exact_hartree_dft.scalar_dft, U, mesh=mesh_xy, to_qp=True)
+        transverse_qp = (
+            _rotate_fixed_matrix(
+                exact_hartree_dft.transverse_dft, U,
+                mesh=mesh_xy, to_qp=True)
+            if exact_hartree_dft.transverse_dft is not None else None)
+        total_qp = (scalar_qp if transverse_qp is None
+                    else scalar_qp + transverse_qp)
+        import dataclasses
+        sigma_result = dataclasses.replace(
+            sigma_result,
+            v_h_kij_ry=total_qp,
+            v_h_scalar_kij_ry=scalar_qp,
+            h_transverse_kij_ry=transverse_qp)
     from .dynamic_sigma import write_sigma_omega
     from .qsgw_utils import write_qsgw_sigma_cube
 

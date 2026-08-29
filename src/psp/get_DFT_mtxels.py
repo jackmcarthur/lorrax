@@ -162,6 +162,69 @@ def spin_degeneracy_factor(wfn) -> float:
     return float(wfn.occupation_state_capacity)
 
 
+def density_components_from_psi_r(
+    psi_r: jnp.ndarray,
+    band_occupations: jnp.ndarray | None = None,
+    *,
+    include_dirac_current: bool = False,
+    charge_nspinor: int | None = None,
+) -> jnp.ndarray:
+    """Contract real-space spinors into charge and optional Dirac current.
+
+    ``psi_r`` is ``(nb,nspinor,nx,ny,nz)``.  The return is either the
+    scalar charge density or ``(rho,Jx,Jy,Jz)``, before the caller's k-point
+    weight and spin-degeneracy prefactor.  ``band_occupations`` is a signed
+    per-band weight: MP1's small negative occupations therefore enter every
+    four-current component through exactly the same arithmetic.
+
+    This is the single local four-current contraction used by both the
+    streamed one-shot density and ``gw.qsgw_density``'s evolving-orbital
+    scan.  FFT placement and accumulation differ between those two plans;
+    the gamma convention, charge carrier and occupation weighting do not.
+    """
+    psi = jnp.asarray(psi_r)
+    if psi.ndim != 5:
+        raise ValueError(
+            "density_components_from_psi_r requires "
+            f"(nb,nspinor,nx,ny,nz); got shape={psi.shape}")
+    ns = int(psi.shape[1])
+    charge_ns = ns if charge_nspinor is None else int(charge_nspinor)
+    if not 0 < charge_ns <= ns:
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_nspinor} for nspinor={ns}")
+    if include_dirac_current and ns != 4:
+        raise ValueError(
+            "Dirac current requires four-component kinetic-balance "
+            f"bispinors; got nspinor={ns}")
+
+    occ = None
+    if band_occupations is not None:
+        occ = jnp.asarray(band_occupations, dtype=jnp.float64)
+        if occ.ndim != 1 or int(occ.shape[0]) != int(psi.shape[0]):
+            raise ValueError(
+                "band_occupations must have one entry per real-space "
+                f"orbital; got {occ.shape}, expected ({int(psi.shape[0])},)")
+        occ = occ[:, None, None, None, None]
+
+    psi_charge = psi[:, :charge_ns]
+    charge_terms = jnp.real(jnp.conj(psi_charge) * psi_charge)
+    rho = jnp.sum(
+        charge_terms if occ is None else occ * charge_terms, axis=(0, 1))
+    if not include_dirac_current:
+        return rho
+
+    psi_dag = jnp.conj(psi)
+    currents = []
+    for mu in (1, 2, 3):
+        perm, phase = gamma_perm_phase(mu)
+        terms = jnp.real(
+            psi_dag * gamma_apply(psi, perm, phase, axis=1))
+        currents.append(jnp.sum(
+            terms if occ is None else occ * terms, axis=(0, 1)))
+    return jnp.stack((rho, *currents))
+
+
 @partial(
     jax.jit,
     static_argnames=("nocc", "include_dirac_current", "charge_nspinor"),
@@ -189,37 +252,12 @@ def _valence_density_kernel(
     scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
     psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
     psi_r = local_ifftn3(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
-    psi_charge = (psi_r if charge_nspinor is None
-                  else psi_r[:, :int(charge_nspinor)])
     prefactor = weight * spin_degeneracy
-    if band_occupations is None:
-        # Keep the exact-unit insulating path's incumbent arithmetic: no
-        # multiply-by-one is inserted into its band/spinor reduction.
-        rho = prefactor * jnp.sum(
-            jnp.real(jnp.conj(psi_charge) * psi_charge), axis=(0, 1))
-    else:
-        occ = band_occupations[:, None, None, None, None]
-        rho = prefactor * jnp.sum(
-            occ * jnp.real(jnp.conj(psi_charge) * psi_charge), axis=(0, 1))
-    if not include_dirac_current:
-        return rho
-
-    # The same occupied bispinors, weights, IFFT and normalisation as rho.
-    # These are the signed normalized currents J_i = j_i/c = Psi^dagger
-    # alpha_i Psi.  In particular there is NO 1/alpha_fs rescaling: that
-    # belongs only to centroid selection's squared-current weight.
-    psi_dag = jnp.conj(psi_r)
-    currents = []
-    for mu in (1, 2, 3):
-        perm, phase = gamma_perm_phase(mu)
-        alpha_psi = gamma_apply(psi_r, perm, phase, axis=1)
-        if band_occupations is None:
-            currents.append(prefactor * jnp.sum(
-                jnp.real(psi_dag * alpha_psi), axis=(0, 1)))
-        else:
-            currents.append(prefactor * jnp.sum(
-                occ * jnp.real(psi_dag * alpha_psi), axis=(0, 1)))
-    return jnp.stack((rho, *currents))
+    components = density_components_from_psi_r(
+        psi_r, band_occupations,
+        include_dirac_current=include_dirac_current,
+        charge_nspinor=charge_nspinor)
+    return prefactor * components
 
 
 def valence_density_from_kpoint(

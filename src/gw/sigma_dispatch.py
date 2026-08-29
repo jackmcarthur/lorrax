@@ -64,8 +64,10 @@ class SigmaResult:
 
     Always populated
     ----------------
-    v_h_kij_ry           : (nk, nb, nb)   Total direct field
-                                          ``V_H + H_T`` (replicated)
+    v_h_kij_ry           : (nk, nb, nb)   Total direct field ``V_H + H_T``.
+                                          Exact G-space paths may retain the
+                                          two-axis band sharding; consumers
+                                          own any explicit gather.
     v_h_scalar_kij_ry    : (nk, nb, nb)   Scalar charge Hartree only
     h_transverse_kij_ry  : (nk, nb, nb)   Transverse current Hartree, or
                                           None for charge-only runs
@@ -316,16 +318,17 @@ def _place_band_rotation(U, mesh_xy, dtype):
 def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
     """``V_H^QP = U† · V_H^DFT · U`` with U kept at ``band_rotation_spec``.
 
-    The RESULT is pinned replicated because ``SigmaResult.v_h_kij_ry``
-    feeds the k-star select and the host readbacks downstream; U is not,
-    because it is the (nk, nb, nb) object that reaches 9.2 GB/rank at
-    nk=144/nb=2000.
+    The result lands at the canonical two-axis band layout.  This keeps the
+    exact G-space route distributed through its basis change; callers that
+    truly need a host/replicated object own that explicit boundary.  U is
+    likewise never replicated: it is the ``(nk,nb,nb)`` object that reaches
+    9.2 GB/rank at nk=144/nb=2000.
     """
-    from .qsgw_density import rotate_band_matrix
+    from .qsgw_density import band_rotation_spec, rotate_band_matrix
 
     out = rotate_band_matrix(v_h_dft, U, mesh=mesh, to_qp=True)
     return jax.lax.with_sharding_constraint(
-        out, NamedSharding(mesh, P(None, None, None)))
+        out, NamedSharding(mesh, band_rotation_spec()))
 
 
 def invalidate_hartree_cache() -> None:
@@ -397,14 +400,8 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
         print_fn("  V_H: rebuilding the exact FFT-grid matrix on the fly "
                  "(hartree_source=gspace) — DISTRIBUTED over the run's own "
                  "mesh (ρ: one psum; Poisson: replicated; ⟨mk|V_H|nk⟩: "
-                 "k-partitioned + one gather).")
+                 "two-axis band sharded; star broadcast stays on device).")
         # Lazy: pulls in the psp stack, which the ISDF path does not need.
-        # ``replicate_to_mesh`` is generic k-partition plumbing and comes
-        # from the SERVICE; only ``compute_hartree_matrix`` (real physics,
-        # and the reason for the lazy import) comes from the driver.  Both
-        # used to be imported from ``kin_ion_io``, which made a library
-        # module depend on a CLI for a collective helper.
-        from common.collectives import replicate_to_mesh
         from gw.kin_ion_io import compute_hartree_matrix
         hartree_meta = meta
         if require_transverse and int(meta.nspinor) != 4:
@@ -420,26 +417,16 @@ def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
                 int(wfn.nspinor)
                 if require_transverse and not charge_bispinor else None),
             bispinor_lift=(representation.current_lift or "raw"),
-            print_fn=print_fn)
-        v_h_np = (exact_hartree.charge if require_transverse
-                  else exact_hartree)
-        # ``compute_hartree_matrix`` hands every rank the same host array;
-        # publish it as a genuinely REPLICATED global array so it composes
-        # with the (global) ``sig_h`` it replaces.  ``jnp.asarray`` here
-        # would have produced a single-device array — fine at P=1, an
-        # operand-sharding mismatch at P>1.
-        v_h = replicate_to_mesh(
-            np.ascontiguousarray(
-                v_h_np[:, band_slices.b0:band_slices.b3,
-                       band_slices.b0:band_slices.b3]),
-            mesh_xy)
+            print_fn=print_fn,
+            return_sharded=True)
+        v_h_exact = (exact_hartree.charge if require_transverse
+                     else exact_hartree)
+        v_h = v_h_exact[:, band_slices.b0:band_slices.b3,
+                        band_slices.b0:band_slices.b3]
         if require_transverse:
-            v_h_t = replicate_to_mesh(
-                np.ascontiguousarray(
-                    exact_hartree.transverse[
-                        :, band_slices.b0:band_slices.b3,
-                        band_slices.b0:band_slices.b3]),
-                mesh_xy)
+            v_h_t = exact_hartree.transverse[
+                :, band_slices.b0:band_slices.b3,
+                band_slices.b0:band_slices.b3]
     elif source == "folded":
         print_fn("  V_H: LEGACY folded kin_ion.h5 — V_H is inside its values; "
                  "the ISDF sig_h is suppressed to avoid double counting.")
@@ -1059,7 +1046,7 @@ def compute_sigma_xc(
         # rotate it twice for no reason.  Zero it and let the caller own
         # it.  ``resolve_external_hartree`` still runs above so the graph
         # shape stays source-independent.
-        source, v_h_ext = "caller_dft", None
+        source, v_h_ext, h_transverse = "caller_dft", None, None
         sig_h = jnp.zeros_like(sig_h)
     if source == "folded":
         sig_h = jnp.zeros_like(sig_h)
@@ -1078,9 +1065,10 @@ def compute_sigma_xc(
             # ``sc_iteration`` hands over, and the rotation is
             # ``rotate_band_matrix`` — the same primitive
             # ``sc_iteration._rotate_to_dft_basis`` and
-            # ``qsgw_density.rotate_bands`` use.  Only the RESULT is pinned
-            # replicated: a sharded ``SigmaResult.v_h_kij_ry`` propagates
-            # into the k-star select and the host readbacks downstream.
+            # ``qsgw_density.rotate_bands`` use.  The result stays on the
+            # canonical two-axis band layout: k-star selection is
+            # device-native, while an output consumer that truly needs a
+            # host table owns that explicit boundary.
             # (The previous form gathered U replicated first — 10.7 ms
             # against 5.3 ms for an already-replicated U at nk=16/nb=128 on
             # a 2×2 mesh, job 7889424 — which is the 9.2 GB/rank object at
@@ -1100,12 +1088,12 @@ def compute_sigma_xc(
                 hartree_basis_rotation, mesh_xy, sig_h.dtype),
             mesh=mesh_xy)
     if h_transverse is not None:
-        # ``hartree_source`` and ``omit_v_h`` own only the scalar charge
-        # potential.  The exact periodic G-space current artifact is a
-        # separate operator, so append it independently after the scalar
-        # replacement rather than letting hartree_source erase it.  It is the
-        # SSOT for every bispinor_gw mode; no centroid
-        # direct contraction or exchange q->0 head reaches this seam.
+        # The exact periodic G-space current artifact is a separate operator,
+        # so append it independently after the scalar source replacement.
+        # ``omit_v_h`` cleared it above together with the scalar term: under
+        # density-SC the caller rebuilt BOTH fields from the evolving
+        # orbitals, and retaining this frozen DFT artifact would double-count
+        # H_T while silently mixing two densities.
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
     sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path

@@ -667,7 +667,7 @@ def test_kin_ion_io_shim_if_present_forwards_and_does_not_copy():
 
 
 def test_the_driver_still_runs_its_sweeps_through_a_shared_kernel():
-    """Not merely importable: both matrix-element sweeps must go through
+    """Not merely importable: all matrix-element sweeps must go through
     ``common.mtxel_sweep``, or the driver quietly kept a private copy.
 
     This pin used to demand two ``gather_k_blocks`` calls labelled
@@ -688,11 +688,11 @@ def test_the_driver_still_runs_its_sweeps_through_a_shared_kernel():
         "kin_ion_io is back on the k-partitioned gather, which cannot use "
         "more than nk ranks")
     assert names.count("sweep_matrix_elements") == 2, (
-        "expected the V_H and kin_ion sweeps, both through "
+        "expected packed scalar/current Hartree and kin_ion sweeps through "
         "common.mtxel_sweep")
-    assert names.count("blocks_to_host") == 2, (
-        "each sweep's sharded block must be undone at a NAMED boundary, "
-        "never by an implicit gather")
+    assert names.count("blocks_to_host") == 3, (
+        "each artifact/legacy output arm must undo its sharded block at a "
+        "NAMED boundary; the live return_sharded arms bypass these calls")
 
 
 def test_the_driver_gets_its_mesh_and_its_warm_up_from_one_call():
