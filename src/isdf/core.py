@@ -2002,6 +2002,104 @@ def _z_q_face(
 					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
 				return Z_R
 
+			def accumulate_coupled_channels(
+					psi_Y_blocks, psi_X_blocks, active_r_loc):
+				"""Share the channel-independent left density across mu=1,2,3.
+
+				Only one right-channel density is live at a time.  Thus coupling
+				the arithmetic removes two redundant left contractions/IFFTs per
+				spin pair without introducing a three-channel P_r carrier.
+				"""
+				Z_R_init = jnp.zeros(
+					(3, nkx, nky, nkz, active_r_loc, mu_loc),
+					dtype=jnp.complex128)
+
+				def spin_pair_body(Z_R_acc, ab):
+					a = ab // ns
+					b = ab % ns
+					P_l_init = jnp.zeros(
+						(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
+
+					def left_band_body(P_l_acc, bc_idx):
+						psi_Y_bc = psi_Y_blocks[bc_idx]
+						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
+						global_band = b_lo_rel_arr[bc_idx] + p_arr
+						bc_valid = global_band < b_hi_rel_arr[bc_idx]
+						g_clamped = jnp.clip(global_band, 0, nb_face - 1)
+						w_l_bc = jnp.where(
+							bc_valid, jnp.take(w_l_, g_clamped), 0.0)
+						x_l = jax.lax.dynamic_index_in_dim(
+							psi_X_blocks[bc_idx], a, axis=1, keepdims=False)
+						y_l = jax.lax.dynamic_index_in_dim(
+							psi_Y_bc, b, axis=2, keepdims=False)
+						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
+						delta_l = jnp.einsum(
+							'kmn,knr->krm', x_l, y_l, optimize=True)
+						return P_l_acc + delta_l, None
+
+					P_l, _ = jax.lax.scan(
+						left_band_body, P_l_init,
+						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+					P_l_R = local_ifftn3(
+						P_l.reshape(nkx, nky, nkz, active_r_loc, mu_loc),
+						axes=(0, 1, 2), norm='forward')
+					P_l_R_conj = jnp.conj(P_l_R)
+
+					def channel_body(Z_R_channels, channel_idx):
+						perm_L_channel = perm_L_[channel_idx]
+						phase_L_channel = phase_L_[channel_idx]
+						perm_R_channel = perm_R_[channel_idx]
+						phase_R_channel = phase_R_[channel_idx]
+						P_r_init = jnp.zeros(
+							(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
+
+						def right_band_body(P_r_acc, bc_idx):
+							psi_Y_bc = psi_Y_blocks[bc_idx]
+							p_arr = jnp.arange(
+								bpd_max_global, dtype=jnp.int32)
+							global_band = b_lo_rel_arr[bc_idx] + p_arr
+							bc_valid = global_band < b_hi_rel_arr[bc_idx]
+							g_clamped = jnp.clip(
+								global_band, 0, nb_face - 1)
+							w_r_bc = jnp.where(
+								bc_valid, jnp.take(w_r_, g_clamped), 0.0)
+							x_r = jax.lax.dynamic_index_in_dim(
+								psi_X_blocks[bc_idx], perm_L_channel[a],
+								axis=1, keepdims=False)
+							x_r = phase_L_channel[a] * x_r
+							y_r = jax.lax.dynamic_index_in_dim(
+								psi_Y_bc, perm_R_channel[b],
+								axis=2, keepdims=False)
+							y_r = phase_R_channel[b] * y_r
+							x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
+							delta_r = jnp.einsum(
+								'kmn,knr->krm', x_r, y_r, optimize=True)
+							return P_r_acc + delta_r, None
+
+						P_r, _ = jax.lax.scan(
+							right_band_body, P_r_init,
+							jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
+						P_r_R = local_ifftn3(
+							P_r.reshape(
+								nkx, nky, nkz, active_r_loc, mu_loc),
+							axes=(0, 1, 2), norm='forward')
+						Z_R_channel = jax.lax.dynamic_index_in_dim(
+							Z_R_channels, channel_idx, axis=0, keepdims=False)
+						Z_R_channel = Z_R_channel + P_l_R_conj * P_r_R
+						Z_R_channels = jax.lax.dynamic_update_index_in_dim(
+							Z_R_channels, Z_R_channel, channel_idx, axis=0)
+						return Z_R_channels, None
+
+					Z_R_acc, _ = jax.lax.scan(
+						channel_body, Z_R_acc,
+						jnp.arange(3, dtype=jnp.int32), unroll=1)
+					return Z_R_acc, None
+
+				Z_R, _ = jax.lax.scan(
+					spin_pair_body, Z_R_init,
+					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
+				return Z_R
+
 			if cache_y_blocks:
 				def build_y_block(_unused, bc_idx):
 					return _unused, load_y_block_full(bc_idx)
@@ -2017,9 +2115,11 @@ def _z_q_face(
 						build_x_block, jnp.zeros((), dtype=jnp.int32),
 						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
 
+					Z_R_channels = accumulate_coupled_channels(
+						psi_Y_blocks, psi_X_blocks, r_loc)
+
 					def channel_body(_unused, channel_idx):
-						Z_R_channel = accumulate_spin_pairs(
-							psi_Y_blocks, r_loc, psi_X_blocks, channel_idx)
+						Z_R_channel = Z_R_channels[channel_idx]
 						Z_q_3d_channel = local_fftn3(
 							Z_R_channel, axes=(0, 1, 2), norm='forward')
 						Z_q_channel = jnp.transpose(
