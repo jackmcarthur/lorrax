@@ -7,13 +7,15 @@ run against it.** It began as that script's output, but many rows have since
 grown into paragraphs the generator's one-line model cannot express, and the
 generator writes the whole file when it succeeds — so regenerating would flatten
 `restart_q_storage`, `mc_average_placement` and a dozen others back to a
-sentence. Verified 2026-08-10: the script's `KEYS` table is missing entries for
-`mc_average_placement`, `mc_average_placement_vcoul`, `restart_q_storage`,
-`sc_eigh` and `write_restart_tensors`, so today it refuses before writing —
-which is the only reason this page survived. The generator no longer carries
-the deleted HDF5 selector entries. Use it as a **drift checker** (it prints
-exactly which keys have appeared in or vanished from `_DEFAULTS`) and edit this
-page by hand.
+sentence. The script's `KEYS` table omits several live keys, including
+`mc_average_placement`,
+`mc_average_placement_vcoul`, `restart_q_storage`, `sc_eigh` and
+`write_restart_tensors`, so it currently refuses before writing — which is the
+only reason this page survived. It also stops before the key comparison because
+its AST reader cannot resolve imported literal defaults. Therefore it is
+neither a generator nor a working drift gate today; this is registered in
+`tests/KNOWN_FAILURES.md`. Edit this page by hand until that tool is repaired
+or replaced. The generator no longer carries the deleted HDF5 selector entries.
 `gw_config._DEFAULTS` remains the single source of truth for deck keys.
 Unknown keys warn: a key not in `_DEFAULTS` and not covered by a removed-key
 branch is reported in one aggregated rank-0 warning and ignored; `strict_keys = true`
@@ -60,7 +62,7 @@ page has to read it from.
 | `charge_zeta_solve` | `"rank_truncate"` | Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky. |
 | `distributed_zeta_solve` | `"auto"` | Zeta back-solve tier: replicated | per_q | distributed (nothing O(mu^2) replicated); auto = replicated under the 4 GiB gather cap, else per_q. |
 | `zeta_rcond` | `1e-08` | Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND. It is a physical convergence axis with a measured plateau, NOT an escape hatch: since 2026-08-22 a cut that discards anything while the achieved kappa_eff exceeds the certified 1e8 REFUSES rather than being merely announced ([`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md), override `LORRAX_RANK_POLICY`). |
-| `transverse_zeta_solve` | `"ridge"` | Transverse (bispinor) zeta-solve family: ridge (default; hoisted pivoted LU + 1e-12 ridge, byte-identical historical path) or rank_truncate (per-q eigh pseudo-inverse with an |lambda| cut; distributed plan via distributed_zeta_solve=distributed runs pzheevd at the padded extent, so any centroid count fits any square mesh). **The transverse CCT is Hermitian INDEFINITE, and a POSITIVE ridge is not a regularizer for it** — `C + eps*I` moves negative eigenvalues TOWARD zero, and above kappa ~ 1e12 that is measured actively harmful. `ridge` remains the default only because no production-deck measurement of `rank_truncate` exists yet; since 2026-08-22 it carries a kappa LOWER BOUND from `\|diag U\|` of its own LU and REFUSES above 1e12 (`LORRAX_RANK_POLICY`). `rank_truncate` is the correct scheme for an indefinite operator. See [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) section 4. |
+| `transverse_zeta_solve` | `"ridge"` | Transverse (bispinor) zeta-solve family: `ridge` (default; pivoted LU after the accepted trace-scaled `1e-12` diagonal shift) or `rank_truncate` (per-q eigh pseudo-inverse with an `|lambda|` cut; `distributed_zeta_solve=distributed` uses pzheevd at the padded extent). Ridge factor lifetime follows the selected schedule: local or distributed-token sequential routes factor once per q and channel, while the coupled `batch_reshard` route keeps raw CCT and runs local factor+solve per r-chunk. The transverse CCT is Hermitian indefinite, so a positive shift is not a spectral regularizer: it moves negative eigenvalues toward zero. The ridge family refuses when its reachable `|diag U|` lower-bound instrument exceeds the configured conditioning policy; a provider-owned `FactorToken` cannot expose that instrument and says so. `rank_truncate` bounds conditioning by construction. See [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md) section 4. |
 | `transverse_zeta_rcond` | `1e-10` | Transverse rank-truncation cutoff tau relative to |lambda|_max (rank_truncate family only; no env twin). One copy of the default lives at `gw_config.TRANSVERSE_ZETA_RCOND_DEFAULT`; the two producer-side signatures import it. Note kappa_cap = 1e10 here, ABOVE the 1e8 certified for a PSD overlap Gram: the transverse channel is a different operator with no production measurement behind it, so its site is UNCERTIFIED and warns rather than refusing. |
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
@@ -209,8 +211,8 @@ page has to read it from.
 | `sc_dump_dir` | `""` | Directory for per-iteration E-history npy dumps; empty = off. |
 | `sc_eigh` | `"auto"` | Eigh for the per-iteration (nk, nb, nb) carry: native = k-batch-sharded through `distrib_la`, one whole (nb, nb) tile per device; distributed = one tile spread over the mesh; auto = distributed once a tile exceeds a fraction of `memory_per_device_gb` and that backend resolves, else native. Indivisible band extents are sentinel-padded and sliced back to their logical size. Layout only — the eigenvalues agree and the physics does not change. |
 | `distributed_cholesky` | `"auto"` | Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate. |
-| `distributed_lu` | `"auto"` | Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only). |
-| `distrib_la_batched_route` | `"auto"` | Schedule used by every array-returning `distrib_la.Plan.batched` call. `auto` preserves the plan's normal distributed scan or backend-batched implementation (the robust default when one matrix must stay mesh-sharded). `batch_reshard` explicitly moves `H_k(m_X,n_Y)` to `H_{k_XY}(m,n)`, runs the local JAX operation on each device's whole matrices, and reshards outputs back to the plan contract. Use only when one complete matrix plus its result/workspace fits on each device. Backend resolution and the Plan I/O contract stay unchanged, but this explicit call route executes the local JAX kernel rather than the resolved backend. It does not apply to opaque `factor()`/`solve()` token routes. The htransform and exciton-band CLIs expose the same spelling as `--distrib-la-batched-route`; CLI wins over the deck. **On the GW W-solve it is INERT unless `w_dyson_solver = distributed`** — the default `local` plan is a per-q dense LU inside a `shard_map` that never enters `distrib_la` at all, so the key parses, resolves and then changes nothing. Measured 2026-08-16 on the sodium metallic MPA deck: with `w_dyson_solver` at its default the two arms are byte-identical in `eqp0`/`eqp1` over all 1392 rows; with `w_dyson_solver = distributed` the announcement changes from `batched 'auto' -> backend_batched` to `batched 'batch_reshard' -> batch_reshard` and the arms agree to 0.001 ueV. |
+| `distributed_lu` | `"auto"` | Backend for transverse ridge LU: `auto` \| `off` \| `cusolvermp` \| `scalapack` (host CPU, explicit only). This chooses the LU implementation, not the `Plan.batched` schedule. Distributed providers return opaque split-factor `FactorToken`s. |
+| `distrib_la_batched_route` | `"auto"` | Public `distrib_la.Plan.batched` schedule: `auto` leaves scan versus backend-batched selection to the service; `batch_reshard` explicitly moves `H_k[m_X,n_Y]` to `H_{k_XY}[m,n]`, runs the local JAX operation, and applies the inverse movement. The explicit route requires one complete matrix plus outputs/workspace per device, does not alter backend resolution or the Plan I/O contract, and does not apply to opaque `factor()`/`solve()` tokens. The coupled three-transverse-channel zeta caller adds a private capacity policy when all channels are fresh: with `auto`, use coupled local `batch_reshard` when its certified geometry and full live set fit; otherwise use coupled distributed `FactorToken` LU when that live set fits; otherwise use three sequential channel fits. An explicit `batch_reshard` request is never changed to a distributed token: if the coupled local live set does not fit, the sequential fallback retains explicit `batch_reshard` per channel. Partial transverse-zeta reuse always fits only the missing channels sequentially. The htransform and exciton-band CLIs expose the same spelling; CLI wins. The key is inert for the default local W solve, which does not call `distrib_la`. |
 | `eigh_backend` | `"auto"` | BSE/htransform distributed-eigh sites: auto|off = q-batched native eigh; distributed | cusolvermp | slate | scalapack spread ONE tile over the mesh. CLI --eigh-backend overrides. |
 | `use_low_mem_eigh` | false | Same axis by intent: one (rank,rank) matrix does not fit a rank; true + auto => distributed; true + off refused at parse. |
 
@@ -229,6 +231,11 @@ math/layout outputs, not an execution schedule, so selecting a different
 route does not by itself invalidate an otherwise reusable restart; route is
 included in compiled-kernel cache keys wherever it changes a closed-over
 Plan.
+
+The coupled transverse selector is caller policy, not a third public
+`distrib_la` route.  Its local and distributed coupled schedules share the
+three-channel Z build but retain three ordered q-batch solve boundaries; no
+stacked or fused three-channel cuSOLVERMp solve is selected.
 
 ## BSE
 

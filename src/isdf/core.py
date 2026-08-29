@@ -5318,17 +5318,17 @@ def solve_zeta(
     indefinite — γ̃^i ⊗ γ̃^i has both signs of eigenvalue, so Cholesky is
     invalid and the factor is a pivoted LU with a small diagonal ridge
     ``ε·|tr(C_log)|/n_log`` (ε = :data:`_TRANSVERSE_LU_RIDGE`).  Since
-    the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel:
-    ``L_q`` then carries the packed factors and ``lu_piv`` the
-    permutation on the LOCAL plan, and this routine only APPLIES them per
+    the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel on
+    the ordinary local plan: ``L_q`` carries the packed factors and
+    ``lu_piv`` the permutation, and this routine only APPLIES them per
     r-chunk (``lax.linalg.lu_solve`` — bit-identical to the fused
-    ``jnp.linalg.solve``).  On the ScaLAPACK plan ``L_q`` is instead a
-    :class:`distrib_la.FactorToken`, which carries the block-cyclic
-    factors AND their per-rank ipiv together, and ``lu_piv`` is None: the
-    pivots are not this module's to hold.  When ``L_q`` is a plain array
-    and ``lu_piv`` is None (cusolvermp plan, or a legacy caller passing
-    the raw CCT) the fused per-r-chunk factor+solve paths below remain and
-    behave exactly as before.  Bunch-Kaufman LDL^T would be the natural Hermitian-
+    ``jnp.linalg.solve``).  On the ScaLAPACK and cuSOLVERMp plans ``L_q``
+    is instead a :class:`distrib_la.FactorToken`, which carries the
+    block-cyclic factors and rank-private pivots; this module never opens
+    that token.  The explicit local ``batch_reshard`` route is different:
+    ``factor_c_q`` keeps the raw CCT and its trace, and this routine performs
+    the local factor+solve after face-to-batch movement in each r-chunk.
+    Bunch-Kaufman LDL^T would be the natural Hermitian-
     indefinite factorization but JAX doesn't expose it; pivoted LU is
     numerically equivalent for our purposes.
 
@@ -5595,8 +5595,10 @@ def solve_zeta(
     # LU (once per channel) and handed us (LU factors, permutation).
     # This routine then only APPLIES lax.linalg.lu_solve per r-chunk —
     # the same call jnp.linalg.solve makes after its internal lu(), so
-    # the bits match the fused path exactly.  ``lu_piv is None`` keeps
-    # the fused per-r-chunk factor+solve (legacy callers, cusolvermp).
+    # the bits match the fused path exactly.  A plain array with
+    # ``lu_piv is None`` is either an explicit pseudo-inverse or the raw CCT
+    # used by the local batch-reshard/legacy factor+solve path.  Provider
+    # factors arrive as FactorToken and are handled above this branch.
     hoisted_lu = bool(use_lu and lu_piv is not None)
 
     # ``use_rank_trunc`` selects the matmul back-solve for the charge

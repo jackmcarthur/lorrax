@@ -66,6 +66,16 @@ divisible by the device count. Use it only when one complete matrix, its
 output, and the native solver workspace fit on one device. It is not a
 replacement for a distributed backend in the single-matrix capacity regime.
 
+Those meanings are service-owned and complete: `batched_route` does not
+choose between `Plan.batched` and the separate `factor()`/`solve()`
+`FactorToken` API, and it does not schedule a caller's multi-channel work.
+For example, LORRAX's coupled transverse-zeta caller applies its own capacity
+policy above this API: automatic local `batch_reshard`, then a distributed
+token, then sequential channels. An explicit `batch_reshard` request never
+silently becomes a token route; partial reuse is sequential. The coupled
+caller shares its Z build but retains three ordered solve calls, not a fused
+three-channel cuSOLVERMp operation.
+
 Top-level `matmul` has deliberately different default routing from `plan`.
 `matmul(..., backend='auto')` selects cuBLASMp on CUDA, PBLAS
 `pdgemm`/`pzgemm` on CPU, or `slate::multiply` on ROCm; `cusolvermp` is an

@@ -1,13 +1,15 @@
 # Memory Model and Chunk Size Optimization
 
-The ζ-fitting pipeline allocates tensors in clearly defined stages.  The
-single production planner is
-`gw/gflat_memory_model.py::plan_gflat_chunks`.  It returns
+The ζ-fitting pipeline allocates tensors in clearly defined stages.  Its
+production planner is `gw/gflat_memory_model.py::plan_gflat_chunks`.  It returns
 `band_chunk`, `r_chunk`, `n_r_chunks`, `q_chunk`, and
 `gflat_chunk_size`, together with the predicted A–F stage peaks, rank floor,
-and binding stage.  `prepare_isdf_and_wavefunctions` calls it once and passes
-that one plan through the fit; there is no legacy planner whose result is
-later overwritten.
+and binding stage.  `prepare_isdf_and_wavefunctions` makes one charge plan and,
+for a bispinor fit, one transverse plan because `N_mu^T` and the transverse
+band inventory differ from the charge values.  All three transverse channels
+use that transverse plan.  The coupled-μ1–3 admission check in `gw_init.py`
+adds its simultaneous live set to the one-channel A–F plan; it does not run a
+second chunk-size search.
 
 Vq has one additional execution chunk outside that plan:
 `vq_g_chunk_size`.  It chunks the G axis of the per-q contraction.
@@ -22,6 +24,7 @@ Conventions throughout this doc:
 |---|---|
 | Element size | complex128 → 16 B (`_mem(…) = 16 · ∏dims / shard`) |
 | Mesh axes | `'x'` = μ/centroid, `'y'` = r-chunk; `P = p_x · p_y` |
+| Transverse symbols | `M_T = N_mu^T` (padded transverse extent), `Q = N_q^full`, `R = B_r`, `G = N_G`, all before per-rank division |
 | Budget detection | `memory_per_device_gb > 0` is used verbatim; zero calls `common.gpu_utils.get_device_memory_gb`, which reserves headroom from the detected free memory |
 | Target utilization | planner default: 0.90 scalar, 0.85 spinor (`nspinor=2`), 0.78 bispinor (`nspinor>=4`); positive `ISDF_CHUNK_TARGET_UTILIZATION` overrides it after clamping to `[0.85, 1.0]` |
 
@@ -47,7 +50,7 @@ Typical ranges (from production datasets):
 | **Centroid load (Peak A)** | fit-loop persistent floor + compiled centroid-load FFT box | `M_A = persistent + _fft_box_bytes(n_k, B_b, n_s, fft_grid, mesh)` |
 | **Centroid copies** | two X-sharded + two Y-sharded copies | `M_cent = 2·16·n_k·n_s·μ·n_b·(1/p_x+1/p_y)` |
 | **Stage-A FFT fallback** | used only when the compiled query is unavailable; announced as an under-predicting fallback | `4·16·n_k·B_b·n_s·n_r/P` (no cuFFT-plan term) |
-| **C_q build (Peak B)** | `P_l`, `P_r`, `C_q`, `L_q` | `M_B = persistent + 16·n_q·μ²/P + 2·16·n_k·n_s²·μ²/P` |
+| **C_q build + factor (Peak B)** | `P_l`, `P_r`, `C_q`, factor or pseudo-inverse | `M_B = persistent + 16·n_q·μ²/P + 2·16·n_k·n_s²·μ²/P` |
 | **fit + ζ solve (Peak C)** | larger of the pair-density/r-chunk live set and route-specific solve live set | see [§R-Chunk](#r-chunk-b_r) and [§Solve stage](#solve-stage) |
 | **accumulate_rchunk_to_gflat (Peak D)** | `gflat_acc`, `zeta_chunk`, two FFT-box-sized slots | `M_D = persistent + 16·n_q^disk·μ·B_r/P + 2·16·cs·n_r` |
 | **Vq contraction (Peak E)** | `V_acc`, one or two full IBZ ζ̃ slabs, and their X/Y resharded faces | see [§Vq G-Chunk](#vq-g-chunk) |
@@ -202,15 +205,16 @@ accumulator:
 M_rhs_stacks = 2 · 16 · n_q · μ · B_r / P
 ```
 
-The factor term depends on `distributed_zeta_solve`:
+The ordinary charge gather term depends on `distributed_zeta_solve`:
 
 - the replicated gather route uses `q_chunk` as its vmapped compute batch and
   adds `q_chunk · 16 · μ²` bytes;
 - the `per_q` gather route deliberately gathers one `(1, μ, μ)` factor
   tile plus its Y-gather row, adds `16 · μ² · (1 + 1/p_y)`, and fixes the
   reported `q_chunk` to one;
-- distributed `FactorToken` routes keep the factor 2-D sharded and bypass the
-  replicated q-batch loop, so their reported `q_chunk` is also one.
+- fully distributed routes keep the pseudo-inverse or `FactorToken` 2-D
+  sharded and bypass the replicated q-batch loop, so their reported `q_chunk`
+  is also one.
 
 For explicit `replicated`, the planner chooses
 
@@ -226,6 +230,102 @@ Peak C is `persistent + max(C_fit, C_solve)`.
 
 Consequently `q_chunk` is an active compute-batching choice on one route, not
 a universal live-memory cap and not a Vq q chunk.
+
+#### Transverse ridge solve routes
+
+For every route, the ridged matrix enters as
+`C_q[Q,M_T_x,M_T_y] = P(None,'x','y')`, and each right-hand side enters
+and leaves as `Z_q[Q,M_T_x,R_y] = P(None,'x','y')`.
+
+- **Hoisted local JAX LU.** `factor_c_q` factorizes each logical
+  `(M_T,M_T)` tile once, q-parallel when selected, and `solve_zeta` gathers a
+  replicated or per-q tile for each r-chunk.  This route can have an
+  `O(M_T^2)` whole-tile transient on one rank.
+- **Local batch-reshard.** Two `all_to_all` operations change the matrix and
+  RHS from `P(None,'x','y')` to `P(('x','y'),None,None)`.  Rank `p` solves
+  `ceil(Q/P)` complete matrices with local `jnp.linalg.solve`, then the two
+  inverse exchanges restore the face layout.  The leading batch is padded to
+  `Q_pad = P·ceil(Q/P)`, `M_T` must tile both mesh axes, and `R` must tile
+  `p_y`.  This route deliberately refactorizes in every r-chunk; it does not
+  call ScaLAPACK or cuSOLVERMp.  Its measured local-operand HBM floor is
+
+  ```
+  M_batch = 3 · 16 · ceil(Q/P) · M_T · (M_T + R).
+  ```
+
+  The two exchanges prevent useful input-to-output donation, so the factor
+  three is required unless BufferAssignment for the shipping executable proves
+  a smaller live count.
+- **Fully distributed token.** `distrib_la.factor('solve_lu', ...)` performs
+  one batched `getrf` per channel and returns an opaque `FactorToken`.
+  `distrib_la.solve(token,Z_q)` performs `getrs` for every r-chunk.  ScaLAPACK
+  and cuSOLVERMp both implement this split contract.  The token remains
+  2-D-sharded: its leading matrix storage is
+  `16·Q·M_T^2/P` bytes per rank, plus lower-order pivot metadata, and an
+  RHS or output is `16·Q·M_T·R/P`.  No rank receives a complete matrix.
+
+Thus cuSOLVERMp is not a fused, factor-per-r-chunk route.  The only current
+factor-per-r-chunk route is the intentional local batch-reshard route.
+
+#### Coupled mu1-3 transverse live set
+
+The coupled scheduler prepares all three channel factors, builds one shared
+`Z_q[3,Q,M_T,R]` per r-chunk, and consumes its slices in the fixed order
+μ1, μ2, μ3.  Production keeps three separate `Q`-batch solves rather
+than flattening them to one `3Q` batch.  This preserves the accepted batched
+solver arithmetic.  It does not stack three solve outputs.
+
+Let `K=N_k`, `S=N_s`, `B=N_b^face`, and
+`B_pad=P·ceil(B/P)`.  Relative to the accepted one-channel transverse plan,
+the coupled schedule adds the following exact modeled HBM bytes per rank:
+
+```
+ΔM_coupled = 2·16·Q·M_T·R/P              # two extra completed Z stacks
+             + 16·K·S·M_T·B/p_x            # shared full-spin X face
+             + 2·16·Q·M_T^2/P              # two extra factors or raw CCTs
+             + 2·16·K·B_pad·S·N_r/P        # only when cache_psi_r=true
+```
+
+The three G-flat accumulators are not resident on the GPU together.  Each
+local `P(None,('x','y'),None)` shard is parked in process-local host RAM and
+only the active channel is restored.  The host requirement used by admission
+is conservatively
+
+```
+M_host,rank = 3·16·Q·M_T·G/P,
+M_host,node = ranks_per_node · M_host,rank.
+```
+
+If the transverse basis has `M_T = M_charge/3`, this host accumulator is
+exactly the size of the one-channel charge accumulator
+`16·Q·M_charge·G/P`; it is not asymptotically larger in any fit dimension.
+
+At runtime the stored q extent may be `N_q^disk`; the admission check uses
+full `Q`, so it cannot underprice an IBZ-reduced accumulator.  Coupling is
+therefore `O(Q·M_T^2/P + Q·M_T·R/P + K·S·M_T·B/p_x)` in device memory
+and `O(Q·M_T·G/P)` in host memory.  The coupled delta adds no additional
+whole `M_T^2` tile beyond the selected solve route.  The distributed-token
+route has no such tile; local batch-reshard deliberately materializes
+`ceil(Q/P)` complete matrices per rank.
+
+Admission in `gw_init.py` applies all of these gates before starting the
+coupled schedule:
+
+1. Host spill must be at most 35% of detected node RAM.  Unknown node RAM
+   fails this gate.
+2. The local batch-reshard route is certified only on CUDA A100, square
+   `P in {4,16}`, `M_T <= 16384`, and `M_batch <= 0.50·plan.budget_bytes`.
+3. Its projected HBM is the larger of
+   `base_peak + ΔM_coupled` and
+   `persistent + M_batch + ΔM_coupled`; that value must fit
+   `plan.budget_bytes·plan.target_utilization`.
+4. If the requested route is `auto` and local batch-reshard does not fit,
+   the scheduler tries the fully distributed token route using
+   `base_peak + ΔM_coupled`.  An explicit batch-reshard request is never
+   silently changed to a distributed numerical route.
+5. Failure of either capacity test selects the sequential μ1, μ2, μ3
+   schedule.  Partial restart reuse also selects sequential execution so only
+   missing channels are fitted; full reuse skips the fit.
 
 ## Q-Chunk (`B_q`)
 
@@ -357,7 +457,7 @@ location:
 | Peak | Stage | Persistent | Transient (per scan iter, aliased) |
 |---|---|---|---|
 | **A** | `load_centroid_wfns` (pre-loop, once per channel) | centroid output being filled `(n_k, n_s, n_rmu, n_b/P)` | ψ(G)→r FFT box `4·16·n_k·B_b·n_s·n_r / (p_x · p_y)`, replicated `(n_k, n_r)` phase table |
-| **B** | `CCT + Cholesky` (pre-loop) | centroids (L+R copies) | open-spin `P_l + P_r (n_k, n_s², μ, μ)`, `C_q (n_q, μ, μ)`, `L_q (n_q, μ, μ)` |
+| **B** | `CCT + factor` (pre-loop) | centroids (L+R copies) | open-spin `P_l + P_r (n_k, n_s², μ, μ)`, `C_q (n_q, μ, μ)`, factor or pseudo-inverse `(n_q, μ, μ)` |
 | **C** | `fit_one_rchunk` + ζ solve (inside r-chunk loop) | centroids + `L_q` (base) | larger of the pair-density/r-chunk live set and route-specific RHS/output + factor-gather live set |
 | **D** | `accumulate_rchunk_to_gflat` (right after each `fit_one_rchunk`) | `gflat_acc (n_q^disk, n_rmu/p_xy, ngkmax)` | `zeta_chunk (n_q^disk, n_rmu/p_xy, B_r)`, per-scan-iter FFT box `cs · n_r · 16 · fft_factor` |
 | **E** | G-flat Vq contraction (post-fit) | one X- and one Y-sharded centroid copy | `V_acc`, one/two IBZ ζ̃ slabs, X/Y-resharded ζ̃ faces |
@@ -375,7 +475,7 @@ peak_A = persistent_total
        + _fft_box_bytes(n_k, B_b, n_s, fft_grid, mesh_xy, P)
 ```
 
-### Peak B — CCT + Cholesky
+### Peak B — CCT + factor
 
 Pair density on the full (μ, ν) grid + Cq FFT + factorization.  The
 planner charges the same fit-loop persistent floor plus the full pair-density

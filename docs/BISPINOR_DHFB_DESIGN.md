@@ -1,20 +1,22 @@
 # Bispinor GW — Phase-1 Design (DHF + Bare-Breit)
 
-> **SUPERSEDED IN PART (2026-07-31).** Historical design document; the physics
-> (§§1–4) still describes the implementation, but the code map has moved:
+> **SUPERSEDED IN PART; CURRENT IMPLEMENTATION NOTES UPDATED 2026-08-29.**
+> This remains the phase-1 physics record. The current source map and ζ
+> schedule supersede the original implementation plan:
 >
 > - Σ^B assembly lives in `src/gw/sigma_x_bispinor.py` (the planned
 >   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
 >   `src/gw/v_q_bispinor.py`.
-> - Transverse ζ-solve policy (supersedes §4's "Cholesky + 1e-14 ridge for all
->   four channels"): the transverse CCT^μ is Hermitian but indefinite, solved by
->   pivoted LU with a 1e-12·|tr|/n ridge (`isdf/core.py:2536` `solve_zeta`);
->   the charge channel defaults to `charge_zeta_solve = rank_truncate`
->   (rank-revealing eigh pseudo-inverse, `zeta_rcond` = 1e-8).
+> - Transverse ζ uses the Hermitian-indefinite CCT path. The default ridge
+>   family is pivoted LU; `transverse_zeta_solve=rank_truncate` is the explicit
+>   indefinite pseudo-inverse alternative. Fresh μ=1,2,3 fits may share their
+>   face transform while keeping separate ordered solves. See
+>   [the face ζ architecture](architecture/zeta_fit_face_psi_cct.md#current-coupled-transverse-schedule-2026-08-29).
 > - File-map rows that no longer exist: `src/common/load_wfns.py`,
 >   `src/common/isdf_fitting.py` (now `src/gw/isdf_fitting.py` +
->   `src/isdf/core.py`), `src/centroid/centroid_io.py` (the `density:` header
->   is written/checked by `kmeans_cli` and the GW loaders directly),
+>   `src/isdf/core.py`), `src/centroid/centroid_io.py` (centroid provenance
+>   is written by `kmeans_cli`; the GW contract is the configured file role
+>   plus a hash of its FFT-index table),
 >   `docs/PHYSICS_COMPREHENSIVE.md` /
 >   `docs/CODEBASE_COMPREHENSIVE.md` (see `docs/theory/physics.md` /
 >   `docs/architecture/codebase.md`), and the `runs/MoS2/...` validation dirs
@@ -22,8 +24,9 @@
 > - Current usage: manual ch. 8 (bispinor GW) and `docs/drivers.md`
 >   (two-centroid-file convention, `--density-mode current`).
 
-**Status:** historical design record (was: in flight on `agent-B/bispinor-design`)
-**Last update:** 2026-05-02; superseded-in-part header 2026-07-31
+**Status:** historical physics design with current implementation addenda
+
+**Last update:** 2026-08-29
 
 ## 1. Scope
 
@@ -86,14 +89,25 @@ $$\rho^{\mu_L}_{n_l n_r,k,q}(r) = \sum_{ab}\psi^*_{l,n_l,k,a}(r)\,\tilde\gamma^{
 
 **Architecture (data flow when bispinor=True):**
 
-A bispinor run reads **two** centroid files, each self-identifying via a `density:` line in the header comment block:
+A bispinor run reads **two** centroid files. Each carries human-readable
+`density fit`, `source density`, and `intended channels` provenance:
 
-| File (suffix) | Header `density:` | Built by | Used for |
+| File (suffix) | Intended channels | Built by | Used for |
 |---|---|---|---|
-| `centroids_frac_<N>.txt`         | `scalar`  | `kmeans_cli` (default mode)            | $\mu_L=0$ (charge channel) |
-| `centroids_frac_<M>_current.txt` | `current` | `kmeans_cli --density-mode current`    | $\mu_L\in\{1,2,3\}$        |
+| `centroids_frac_<N>.txt`         | $\tilde\gamma^0$ (charge) | `kmeans_cli` (default mode) | $\mu_L=0$ (charge channel) |
+| `centroids_frac_<M>_current.txt` | $\tilde\gamma^{1,2,3}$ (current) | `kmeans_cli --density-mode current` | $\mu_L\in\{1,2,3\}$ |
 
-Both files are loaded via [`centroid.centroid_io.read_centroids`](../src/centroid/centroid_io.py), which validates the `density:` field.  $N$ and $M$ may differ (orbit-closure and pivoted-Cholesky pruning produce different counts).  ψ at the centroids is loaded **twice** — once at the scalar-set indices, once at the current-set indices — and stored as two arrays.  The Σ-side contraction routes each $\mu_L$ to the appropriate ψ array; the resulting $\zeta^{\mu_L}_q$ tensors have different second-axis sizes, which downstream consumers must keep paired with the centroid set they were fit on.
+`kmeans_cli` writes that provenance. At runtime, the two configured path roles
+select the charge and transverse tables; ζ and restart provenance bind each
+role to the content hash of its FFT-index table. The loader does not infer a
+table's role by parsing comment text. $N$ and $M$ may differ because orbit
+closure and pivoted-Cholesky pruning act on different weights. Wavefunctions
+are sampled once per centroid set. Under
+`low_mem_bands=true`, each sample is immediately converted to its own
+two-face carrier; charge and transverse carriers remain separate because
+their centroid axes have different meanings and extents. The resulting
+$\zeta^{\mu_L}_q$ files must stay paired with the centroid identity in their
+fit provenance.
 
 **Current-density weight (Gordon-decomposed Pauli current):**
 
@@ -116,22 +130,73 @@ $\alpha_{\rm FS}$ suppression.
 | 2 | 3.07e-3 | 3.56e-3 | 0.863 |
 | 3 | 2.89e-3 | 3.41e-3 | 0.848 |
 
-A small but consistent ~13–15% reconstruction-error improvement on the i-channels.  The current set has ~4% more centroids (668 vs 640) due to orbit-closure inflation — count-matched comparison would be needed to claim the full 13–15% is structural.  CrI3 will probably show a larger gap; the architecture is in place for whatever the heavier-element data shows.
+This historical test showed a consistent 13–15% reconstruction-error
+improvement on the i-channels. The current set had about 4% more centroids
+(668 versus 640) because of orbit closure, so it does not isolate the effect
+of the density weight. It is centroid-selection evidence, not a validation of
+the current coupled solver schedule.
 
-**Gram and solver — same path for all four channels:**
+### 4.1 Current CCT, sharding, and solve schedule
 
-$$K_q(\mu,\lambda) = \sum_{n_l, n_r, k_l}\rho^*_{n_l n_r k_l q}(\mu)\,\rho_{n_l n_r k_l q}(\lambda),\quad
-\rho_{n_l n_r k_l q}(r)=\sum_{ab}\psi^*_{l,n_l,k_l,a}(r)\,\tilde\gamma_{ab}\,\psi_{r,n_r,k_l+q,b}(r).$$
+The production fit uses the Schur CCT construction. Its charge member is
+positive semidefinite and defaults to the rank-revealing charge
+pseudo-inverse. Each transverse $\tilde\gamma^i$ member is Hermitian but
+indefinite. It therefore uses pivoted LU with the accepted trace-scaled ridge,
+or the explicit `transverse_zeta_solve=rank_truncate` indefinite
+pseudo-inverse. The old claim that all four channels share one Cholesky path
+is false.
 
-$K_q$ is a literal Gram of band-pair vectors → PSD for every $\tilde\gamma$.  All four channels use **Cholesky + 1e-14·|trace| ridge**.
+The principal layouts are:
 
-Driver: [`runs/MoS2/B_bispinor_pd_smoke_2026-05-02/run_zeta_proper_gram.py`](../../runs/MoS2/B_bispinor_pd_smoke_2026-05-02/run_zeta_proper_gram.py).  On MoS2 3×3, all four channels confirm $\lambda_{\min}>0$, Cholesky residual ~1e-19, and single-band-pair reconstruction at $q=\Gamma$ goes to the sub-1% level (8.3e-6 / 4.4e-3 / 6.4e-3 / 7.1e-3 for $\mu_L=0,1,2,3$).
+```text
+psi_mun[k,s,mu_X,n_Y]
+C_q[mu_L,q,mu_X,nu_Y]
+Z_mu123[mu_L,q,mu_X,r_Y]
+zeta_q[q,mu_XY,r]
+zeta_G[q,mu_XY,G]
+```
 
-### 4.1 Why not the cheaper Schur factorization?
+Charge has its own centroid extent. The three transverse systems share the
+current-centroid extent but remain distinct matrices and files. On an eligible
+fresh fit, `_z_q_face_coupled_mu123` builds one leading-three-channel RHS. It
+reuses the face-Y transform/scatter, the X-owner broadcast, and the
+channel-independent left pair density. It evaluates the three right densities
+in μ=1→2→3 order, keeping one right carry live at a time.
 
-The Schur-product form $\mathrm{CCT}_q(\mu,\lambda)=\sum_k P_l^*(\mu,\lambda;k)\odot P_r(\mu,\lambda;k)$ (with $P=\sum_n\psi^*\tilde\gamma\psi$ already spin-summed) costs only $O(N_k n_{r\mu}^2)$ — a factor $N_l N_r$ cheaper than $K_q$.  However, expanding $\langle v|\mathrm{CCT}|v\rangle$ groups spin and spatial indices the wrong way and produces a kernel $M=\tilde\gamma^*\otimes\tilde\gamma$ on the 16-dim spin-pair index, with eigenvalues equal to products of $\tilde\gamma$'s eigenvalues.  For $\tilde\gamma^0=I_4$ this is $I_{16}\succeq0$; for $\tilde\gamma^i=\alpha^i$ (eigenvalues $\pm1$) it has 8 eigenvalues $+1$ and 8 eigenvalues $-1$ → indefinite.  The proper Gram avoids this by contracting spin at a single spatial point, leaving $\langle v|K_q|v\rangle=\sum|\sum_\mu v_\mu\rho|^2\ge0$ trivially.
+The solves are deliberately separate and ordered, not one flattened
+three-channel solve. With `batch_reshard`, each channel's raw CCT and RHS move
+from the 2-D face layout to whole matrices distributed over the q batch; local
+JAX LU factor-and-solve runs once per r chunk. On the distributed route, each
+channel is factored once into an opaque `distrib_la.FactorToken`, and the
+provider applies that token to the 2-D-sharded RHS in every r chunk. No
+provider factor is exposed or moved into `isdf`.
 
-For the MoS2 smoke the $N_l N_r$ band-pair factor is ~128 (8 valence × 16 conduction); $K_q$ build is ~0.5 s on 1 GPU.  For larger systems we will need chunked-band-pair accumulation in the $K_q$ build to stay within memory; not currently implemented.
+Each channel's persistent G-flat accumulator is parked in process-local host
+memory. The active channel alone is restored for the canonical
+`accumulate_rchunk_to_gflat` call and spilled immediately afterward. A final
+barrier makes all three fits reach completion before μ=1 starts writing; final
+writes, closes, and provenance remain μ=1→2→3.
+
+Coupling is automatic only when all three transverse files are fresh, the
+bounded face-Y cache is selected, host spill fits its node-RAM cap, and the
+complete device live set fits the planner budget. Partial reuse fits only the
+missing files on the sequential schedule. Capacity failure also falls back to
+the sequential schedule without changing the fit or the requested public
+`distrib_la` route.
+
+The detailed loop and sharding contract is in
+[ζ-fit CCT on the two-face carrier](architecture/zeta_fit_face_psi_cct.md#current-coupled-transverse-schedule-2026-08-29).
+Closed-form memory and capacity policy belong to the
+[memory model](architecture/memory-model.md); this page does not duplicate
+them.
+
+### 4.2 Historical proper-Gram alternative
+
+The original design proposed a literal positive-semidefinite band-pair Gram
+for every vertex. Production retained the cheaper Schur CCT and handles the
+transverse indefiniteness in the solver. A proper Gram remains a possible
+scientific alternative if a future accuracy study justifies its larger
+band-pair cost; it is not the implemented path.
 
 ## 5. File map
 
@@ -139,32 +204,31 @@ For the MoS2 smoke the $N_l N_r$ band-pair factor is ~128 (8 valence × 16 condu
 |---|---|
 | [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | Single σ·p implementation; requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
 | [`services/wfn_loader/`](services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
-| [`src/common/isdf_fitting.py`](../src/common/isdf_fitting.py) | Adds `compute_pair_density_with_vertex` and `compute_pair_density_lorentz` (γ̃-vertex generalization of the existing scalar helper). |
-| [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | 4×4 spinor rotations (extending the 2×2 Pauli ones). **Not yet implemented**; required at M1 for symmetry-aware unfolding. The 3-vector Lorentz mixing that DOES exist is `unfold_v_q_bispinor_lorentz` — read its `R_proper_table` convention note before feeding it a rotation table. |
+| [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
+| [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical k/q maps and spin rotations used by the fit, IBZ writer, and V reconstruction. The 3-vector Lorentz unfold uses the service's `R_proper_table` convention. |
 | **[`src/centroid/current_density.py`](../src/centroid/current_density.py)** *(new)* | Builds $W_{\rm curr}(r)$ from the canonical lifted bispinor and direct $\Psi^\dagger\alpha_i\Psi/\alpha_{\rm FS}$ vertex; the Gordon form remains the independent parity identity. |
-| **[`src/centroid/centroid_io.py`](../src/centroid/centroid_io.py)** *(new)* | `read_centroids(path)` parses the `density:` header line; downstream consumers dispatch on it. |
-| [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes `density:` and `weight:` header lines. |
-| **`src/gw/breit_sigma.py`** *(new, future)* | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction → $\Sigma^B_{\alpha\beta}$. |
-| [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Factor $v(q+G)$ + transverse projector helper for $D^{ij}$. |
+| [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes density-fit, source-density, and intended-channel provenance. |
+| [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
+| [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
 | [`src/gw/cohsex_sigma.py`](../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
-| [`src/gw/gw_jax.py`](../src/gw/gw_jax.py), [`gw_config.py`](../src/gw/gw_config.py) | Activate `bispinor`; add `breit_sigma` sub-flag. |
+| [`src/gw/gw_init.py`](../src/gw/gw_init.py), [`gw_config.py`](../src/gw/gw_config.py) | Resolve independent reuse, select coupled versus sequential transverse fitting, and bind the `bispinor_gw` policy. |
 
 ## 6. Phasing
 
 | Stage | Deliverable | Status |
 |---|---|---|
 | M0 | This doc | done |
-| M1 | Bispinor lift end-to-end + 4×4 SymMaps; identity-regression vs ns=2 | partial (lift ✓, SymMaps pending) |
+| M1 | Bispinor lift end-to-end + symmetry service | done for the production bare-transverse path |
 | M2 | Four-density ISDF infra: pair-density helpers, channel-aware centroid mode | done |
-| M3 | $\chi^0_{00}$, $W_{00}$ on bispinor $G^0$ | pending |
-| M4 | $\Sigma^C$ with explicit $\tilde\gamma^0$ vertices | pending |
-| M5 | $\Sigma^B$ from bare $D^{ij}$ | pending |
-| M6 | DHFB-Breit reference comparison (atomic Ne/Ar/Hg or solid-state Bi) | pending |
+| M3 | $\chi^0_{00}$, $W_{00}$ on bispinor $G^0$ | implemented |
+| M4 | $\Sigma^C$ with explicit $\tilde\gamma^0$ vertices | implemented |
+| M5 | $\Sigma^B$ from bare $D^{ij}$ | implemented in `sigma_x_bispinor.py` |
+| M6 | External DHFB-Breit reference comparison | open validation work |
 
 ## 7. Validation strategy
 
-1. **Identity-vertex regression**: with `breit_sigma=False` and a scalar-relativistic input, ns=4 result must reproduce the existing ns=2 result at fp64 noise.
-2. **$c\to\infty$ limit**: zero $\alpha_{\rm FS}$ → $\psi_S\to 0$ → $\Sigma^B\to 0$.  Single-line knob.
+1. **Identity-vertex regression**: the $\tilde\gamma^0=I$ charge kernels must agree between the legacy and face carriers at fp64 noise.
+2. **$c\to\infty$ limit**: as $\alpha_{\rm FS}\to0$, $\psi_S\to0$ and $\Sigma^B\to0$.
 3. **Light-atom DHFB-Breit reference** (Ne/Ar/Kr): order-of-magnitude match for $\Sigma^B$ core corrections.  Quantitative match is phase-2 (transverse screening matters at ~10%).
 
 ## 8. Out of scope (phase-2)
@@ -173,13 +237,15 @@ $\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($
 
 ## 9. Open questions
 
-1. Switch i-channels from Schur CCT + eigh-pinv to proper Gram $K_q$ + Cholesky if $\Sigma^B$ accuracy is insufficient (cost $\sim N_l N_r$× extra in Gram build).
-2. Renormalize $\Psi$ post-lift so $\|\Psi\|^2=1$ exactly?  Effect is $\alpha_{\rm FS}^2$-small but systematic.
-3. ζ storage: single H5 with leading $\mu_L$ axis vs. four files.  Lean toward single H5 with a `lorentz_complete` mask.
+1. Does a proper positive-semidefinite band-pair Gram improve transverse ζ accuracy enough to justify replacing the cheaper indefinite Schur CCT?
+2. What external DHFB/Breit reference should certify the absolute transverse self-energy, beyond internal carrier and mesh parity?
+3. Which screened transverse terms belong in the first phase-2 model, and what q→0 completion must accompany them?
 
 ## 10. Reference
 
-Key validation log: [`runs/MoS2/B_bispinor_pd_smoke_2026-05-02/`](../../runs/MoS2/B_bispinor_pd_smoke_2026-05-02/) — pair-density smoke (`run_pd_smoke.py`), ζ-fit smoke (`run_zeta_fit.py`), channel-aware ζ-fit (`run_zeta_channel_aware.py`), bvec-units diagnostic (`check_bvec_units.py`).
+Historical validation provenance was recorded under the machine-local
+`runs/MoS2/B_bispinor_pd_smoke_2026-05-02/` directory. It is not shipped and
+does not certify the current coupled schedule.
 
 Internal: [`docs/theory/physics.md`](theory/physics.md) (scalar ISDF GW) and [`docs/architecture/codebase.md`](architecture/codebase.md). *These two links named `PHYSICS_COMPREHENSIVE.md` / `CODEBASE_COMPREHENSIVE.md` until 2026-08-06; both were deleted in the 2026-07-31 restructure, and the banner at the top of this page had already recorded their successors while these links kept pointing at the graves.*
 

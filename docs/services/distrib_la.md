@@ -214,6 +214,18 @@ must select `batched_route='batch_reshard'`; Cholesky may alternatively select
 opaque `factor()`/`solve()` token surface is separate and is not changed by
 the batch route.
 
+`batched_route` owns only the execution of an array-returning
+`Plan.batched` call. It does not choose whether an application uses a Plan,
+an opaque `FactorToken`, or a larger multi-channel schedule. LORRAX's coupled
+transverse-zeta caller is one deliberate higher-level policy: for an eligible
+all-fresh fit, its `auto` request tries certified local `batch_reshard`, then
+a distributed split-factor token, then sequential channels as capacity
+requires. Explicit `batch_reshard` never switches to the token route; failure
+to fit the coupled local live set selects sequential calls that retain the
+explicit route. Partial reuse is sequential. Both coupled schedules share Z
+construction but keep three ordered q-batch solves; there is no public or
+private fused three-channel cuSOLVERMp route.
+
 ## Contract
 
 * Polar/SVD is a composite, not a resolver operation: its backend argument is
@@ -254,9 +266,12 @@ the batch route.
 * **`solve()` checks `B` against the token's `n` and `nbatch`**, so a
   mismatched RHS refuses instead of corrupting a solve or hanging in a
   collective.
-* **`factor`/`solve` is not the fused route.** ScaLAPACK and cuSOLVERMp LU
-  both expose split getrf/getrs through the opaque token. One factor per solve
-  remains available as `plan('solve_lu', mesh, backend=…).batched(A, B)`.
+* **`factor`/`solve` is the split-token surface, not `Plan.batched`.**
+  ScaLAPACK and cuSOLVERMp LU expose getrf/getrs through one opaque token, so
+  callers may factor once and apply getrs repeatedly. The array-returning
+  `plan('solve_lu', mesh, backend=…).batched(A, B)` instead owns one complete
+  factor+solve call per input batch and may select the service's staged local
+  route.
 * **Env grants capability, never selects a backend.** `LORRAX_FFI_SO` /
   `LORRAX_FFI_HOST_SO` pin which `.so` to open. `distrib_la.resolve` reads
   no environment at all. An explicit pin that cannot be honoured is a

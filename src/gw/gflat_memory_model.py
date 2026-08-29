@@ -123,7 +123,7 @@ def _coupled_mu123_zq_incremental_bytes(
         n_rtot: int = 0, cache_psi_r: bool = False,
         stack_three_solves: bool = False,
         host_spill_gflat: bool = False) -> dict[str, float]:
-    """Private prototype delta over one accepted transverse face fit.
+    """Production coupled-schedule delta over one transverse face fit.
 
     The coupled transport returns all three completed ``Z_q`` channels, so
     two additional ``Z_q[q,mu_X,r_Y]`` arrays are live.  Its full-spin X

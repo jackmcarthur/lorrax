@@ -1,6 +1,13 @@
 # ζ-fit CCT on the two-face ψ carrier (`low_mem_bands=true`)
 
-Landed: `feat/zeta-fit-face-psi-2026-08-22`, on top of
+> **Current status (2026-08-29, `origin/main` at `2aee7e60`).** This page
+> begins with the 2026-08-22 face-carrier landings, then records later
+> extensions. The production transverse schedule is now the coupled μ=1,2,3
+> route described in [Current coupled transverse schedule](#current-coupled-transverse-schedule-2026-08-29).
+> Its code owners are `gw.gw_init`, `gw.isdf_fitting`, and `isdf.core`.
+> Memory arithmetic belongs to the [memory model](memory-model.md), not here.
+
+Original landing: `feat/zeta-fit-face-psi-2026-08-22`, on top of
 `integ/low-mem-bands-2026-08-22`. Continues the audit
 (`reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`) and its revision
 round, which scoped this exact gap: "The FULL contract — product-sharding
@@ -13,8 +20,8 @@ Two independent halves of the ζ fit consume ψ:
 
 | stage | before this change | after this change |
 |---|---|---|
-| CCT (Gram build, `fit_zeta_to_h5` STEP 2) | 4 single-axis copies (`psi_l_rmu_Y`, `psi_r_rmu_Y`, `psi_l_rmuT_X`, `psi_r_rmuT_X`), never all-P sharded | **all-P face carrier** (`psi_nmu`/`psi_mun`, `2·S/(Px·Py)`), never single-axis |
-| r-chunk loop (STEP 6, `fit_one_rchunk`/`z_q_from_psi_sm`) | 2 single-axis X-form copies (`2·S/Px`) | **unchanged** — still single-axis X-form, refused-by-name for this session |
+| CCT (system-matrix build, `fit_zeta_to_h5` STEP 2) | 4 single-axis copies (`psi_l_rmu_Y`, `psi_r_rmu_Y`, `psi_l_rmuT_X`, `psi_r_rmuT_X`), never all-P sharded | **all-P face carrier** (`psi_nmu`/`psi_mun`), never single-axis |
+| r-chunk loop (STEP 6, `fit_one_rchunk`/`z_q_from_psi_sm`) | 2 resident single-axis X-form copies | The face kernel reconstructs one bounded X band block from `psi_mun`; its planner-selected Y cache reuses the canonical transform/scatter. Fresh transverse μ=1,2,3 fits may share both transactions. |
 
 `low_mem_bands=false` (the default) is bit-identical to the pre-existing
 path: every new branch is a static, structurally-dead arm under that flag
@@ -322,15 +329,11 @@ alive during STEP 6 are the persistent face carrier (already counted,
 `2·S/(Px·Py)`, shared with the post-fit bundle) and the bounded per-bc
 transients `_z_q_face` builds and frees each scan iteration.
 
-## Refusals added
+## Current face-route boundaries
 
 `fit_zeta_to_h5(low_mem_bands=True)` refuses, by name, before any
 compute:
 
-* `vertex_mu_L != 0` (bispinor/transverse) — already refused upstream by
-  `gw_config.refuse_unsupported_low_mem_bands`; re-checked here as a
-  second, cheap line of defense, since neither `isdf.core._c_q_face` nor
-  `_z_q_face` has a non-identity-γ̃ arm.
 * `band_norms is not None` (pseudobands) — the face CCT/r-chunk paths
   have no weighted-norms arm; a real feature gap if ever needed together,
   not a silent approximation.
@@ -341,10 +344,10 @@ compute:
   copy (the whole point of this session's redesign) — mirrors the
   `psi_rmu_Y` check exactly, added beside it.
 
-`isdf.core.c_q_from_psi_sm(layout='face')` and `z_q_from_psi_sm
-(layout='face')` separately each refuse `gamma_L`/`gamma_R` not both
-`None`, for the same reason as the first bullet — defense in depth at
-the lower-level primitives too.
+Charge and monomial transverse vertices are supported. The coupled
+transverse coordinator is narrower: it requires a four-spinor face carrier,
+all three channels fresh, and the planner-selected bounded face-Y cache.
+Otherwise the same face kernels run on the sequential schedule.
 
 ## Verification
 
@@ -384,7 +387,8 @@ run. See that branch's commits for the exact diff each check landed with.
   can be conditioned badly enough that the difference decides the
   answer," with its own worked example of one ULP flipping a pivoted-
   Cholesky pivot order): `zeta_q_G` is not `C_q` itself but the OUTPUT of
-  STEP 3's rank-truncated Cholesky solve against `C_q`, and that solve is
+  that historical source's STEP 3 conditioning/back-solve against `C_q`, and
+  that solve is
   the amplifier — a ~1e-15-relative perturbation in the Gram entering an
   ill-conditioned factorization is expected to surface as a much larger
   relative change in the solved coefficients, all while the underlying
@@ -412,7 +416,7 @@ run. See that branch's commits for the exact diff each check landed with.
   from the incumbent single-axis fit's ≈0.8 s at this shape — the
   accepted memory-for-communication trade, smaller in absolute terms
   than the ~tens-of-seconds ballpark floated before landing, and well
-  short of dominating the 253 s total (screening + Cholesky dominate).
+  short of dominating the 253 s total (screening + the ζ solve dominate).
   `eqp0.dat` (1224 QP rows) vs. the pre-existing face reference
   (`.../face_headoff/`, the incumbent-fit face leg from the audit's
   revision round): **max|ΔE_QP| = 7.0e-9 eV**, mean 2.2e-9 eV,
@@ -529,7 +533,7 @@ carried over from a plan.
       also bit-exact**, max\|diff\|=0.0, max\|rel diff\|=0.0. This is a
       STRONGER result than the CCT half's own `zeta_q.h5` parity
       (6.4e-4 relative, amplified through STEP 3's ill-conditioned
-      Cholesky from a genuine ~1e-15-relative summation-order change):
+      solve from a genuine ~1e-15-relative summation-order change):
       here there is no summation-order change to amplify, because the
       masked-`psum` mechanism reduces to a select at every position, not
       a re-ordered reduction — the SAME mechanism the isolated parity
@@ -881,3 +885,81 @@ eV — the same order of magnitude as this project's other lifted rows
 inventory (layout='face')..."` for the transverse bundle) confirms
 neither ever falls back to a legacy single-axis copy under this deck.
 Artifacts: `runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/`.
+
+## Current coupled transverse schedule (2026-08-29)
+
+The charge fit remains independent. For the three current vertices, the
+driver first checks each `zeta_q_mu{1,2,3}.h5` separately. Coupling is eligible
+only when all three files need a fresh fit, `low_mem_bands=true`, and the
+transverse planner selected the bounded face-Y cache. Partial reuse fits only
+the missing channels, sequentially. A capacity miss also uses the sequential
+schedule; it is a safe fallback, not a different equation.
+
+The important global layouts are:
+
+```text
+psi_mun[k,s,mu_X,n_Y]
+C_q[mu_L,q,mu_X,nu_Y]       # three separately prepared systems
+Z_mu123[mu_L,q,mu_X,r_Y]    # one shared r-chunk build
+zeta_q[q,mu_XY,r]           # one channel after its solve
+zeta_G[q,mu_XY,G]           # persistent G-flat output for that channel
+```
+
+`mu_L` is a three-element replicated selector, not a processor axis.
+`mu_XY` means one centroid axis flattened over the product mesh. The Y and X
+caches live inside the manual `shard_map`, so they are local working buffers,
+not additional global arrays with public `NamedSharding` contracts. Their
+conceptual layouts are `psi_Y[bc,k,n,s,r_Y]` with the active band block
+replicated, and `psi_X[bc,k,s,mu_X,n]` with that block broadcast from its Y
+owner.
+
+For each outer r chunk, all three host threads meet at the coordinator. μ=1
+builds `Z_mu123`; μ=2 and μ=3 wait for it. `_z_q_face_coupled_mu123` performs
+the canonical ψ(G)→ψ(r) transform, the Y `all_to_all('y')` plus
+`all_gather('x')`, and the X-owner broadcast once per band chunk. It also
+reuses the channel-independent left
+pair density. The right density and vertex phase are evaluated for μ=1, then
+2, then 3, with only one channel's right carry live. This preserves the
+accepted scalar-spin-pair and band-scan order.
+
+The leading three-channel RHS is not solved as one 108-system batch. The
+coordinator hands out one `Z_q[q,mu_X,r_Y]` slice at a time, and the existing
+per-channel solver runs in μ=1→2→3 order. This retains the accepted three
+36-q arithmetic boundaries; the former stacked solve changed physical CrI3
+results at about the 1e-9 relative level and is not selected by `gw_init`.
+
+There are two solve transports:
+
+- `batch_reshard`: keep the raw CCT for each channel; the trace-scaled ridge
+  is added inside each per-r-chunk solve. On every r chunk,
+  `distrib_la.Plan.batched` moves independent q systems from
+  `C_q[q,mu_X,nu_Y]` / `Z_q[q,mu_X,r_Y]` to whole matrices distributed over
+  the batch axis, runs local JAX LU solve, and returns the face-sharded result.
+  It deliberately refactors each r chunk. The coupled policy selects this
+  route automatically only on its audited A100 square P4/P16 envelope and
+  only when the full live-set and operand-floor checks pass.
+- distributed factor-token route: factor each channel once during ordered
+  preparation. The LU factors and pivots remain inside an opaque
+  `distrib_la.FactorToken`; each r chunk sends its 2-D-sharded RHS through the
+  matching provider back-solve. No factor is exposed, concatenated, gathered,
+  or moved into the local batch route.
+
+An explicit `batch_reshard` request is never silently converted to the
+distributed provider. If the coupled local live set does not fit, the driver
+keeps that requested per-channel solve route but drops coupling. With
+`distrib_la_batched_route=auto`, it may keep coupling on the distributed-token
+route when that complete live set fits.
+
+Each channel's G-flat accumulator is moved to process-local host memory before
+the coordinator releases preparation. For every channel slice, the code
+restores only that accumulator, calls the canonical
+`accumulate_rchunk_to_gflat`, and spills it again immediately. Thus all three
+completed outputs exist concurrently on the host, but only the active one is
+on device. After the last r chunk, a final-ready barrier prevents μ=1 from
+starting its G-flat write while μ=2 or μ=3 still solves. Final restore, write,
+close, and provenance remain ordered μ=1→2→3.
+
+The capacity equations, host-spill pricing, solve operand floor, and
+fragmentation target are owned by [the memory model](memory-model.md) and
+`gw.gflat_memory_model`. The large-centroid alternatives and their sharding
+costs are summarized in [`docs/dev/large_nmu_operation.md`](../dev/large_nmu_operation.md).
