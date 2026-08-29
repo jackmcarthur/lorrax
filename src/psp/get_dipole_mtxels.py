@@ -1068,6 +1068,9 @@ def main(argv=None):
 				print(f"Found pseudopotentials in {fallback}")
 				break
 
+	from psp.pseudos import pseudo_summary_lines
+	report.pseudopotentials(pseudo_summary_lines(pseudos))
+
 	# ── PRE-FLIGHT.  THE ONE CHECK THIS DRIVER NEVER RAN. ────────────────
 	# ``psp.operator_checks`` was written for exactly three callers and its
 	# own module docstring names them: "before computing kin+ion, DIPOLE

@@ -1135,7 +1135,8 @@ def main(argv=None):
         pseudos=pseudos, wfn=wfn, sys_dim=sys_dim,
         caller="kin_ion_io",
     )
-    print0(f"Pseudopotentials: {list(ctx.pseudos.keys())}")
+    from psp.pseudos import pseudo_summary_lines
+    report.pseudopotentials(pseudo_summary_lines(ctx.pseudos))
     print0(f"Coulomb truncation: {'2D slab' if ctx.truncation_2d else '3D bulk'}")
 
     # ---- build structure data ----

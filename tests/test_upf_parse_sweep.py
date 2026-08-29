@@ -203,3 +203,36 @@ def test_fr_mo_j_average_still_builds():
     E_avg = build_E_blocks_full(_load(_FR_MO), soc=False)
     for _l, E in E_avg.items():
         assert np.all(np.isfinite(E))
+
+
+def test_pseudo_summary_lines_name_sr_fr_and_header_disagreement():
+    """The Pseudopotentials report block states the beta-channel verdict;
+    a header that disagrees is printed but does not win."""
+    from psp.pseudos import pseudo_summary_lines
+
+    sr_path = _SR_DIR / "Si.upf"
+    fr_path = _FR_DIR / "Au.upf"
+    if not (sr_path.exists() and fr_path.exists()):
+        pytest.skip("staged pseudo sets absent")
+    sr, fr = _load(sr_path), _load(fr_path)
+    # production load_pseudopotentials stamps the source path; _load is bare
+    setattr(sr, "_source_path", str(sr_path))
+    setattr(fr, "_source_path", str(fr_path))
+    text = "\n".join(pseudo_summary_lines({"Si": sr, "Au": fr}))
+    assert "Si.upf — scalar-relativistic" in text
+    assert "Au.upf — fully-relativistic" in text
+    assert "kkbeta" in text and "NLCC" in text
+    # Red twin: lie in the SR header — the betas must win, loudly.
+    class _Hdr:
+        pass
+    hdr = _Hdr()
+    for a in ("element", "z_valence", "relativistic"):
+        setattr(hdr, a, getattr(sr.pp_header, a, None))
+    hdr.relativistic = "full"
+    forged = type(sr).__new__(type(sr))
+    forged.__dict__.update(sr.__dict__)
+    forged.pp_header = hdr
+    hdr.z_valence = sr.pp_header.z_valence
+    lied = "\n".join(pseudo_summary_lines({"Si": forged}))
+    assert "scalar-relativistic" in lied          # betas' verdict
+    assert "beta channels win" in lied            # the disagreement is named

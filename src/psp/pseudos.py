@@ -121,3 +121,46 @@ def print_atomic_structure(wfn, pseudos: dict) -> None:
         fname = os.path.basename(getattr(pseudo, "_source_path", ""))
         print(f"  {element:<6} {z_val:>5} {n_proj:>6}  {fname}")
     print()
+
+
+def pseudo_summary_lines(pseudos: dict) -> list[str]:
+    """Per-species log lines for the Pseudopotentials report block.
+
+    The SR/FR verdict follows the projector policy (radial/
+    build_projectors_qe.pseudo_has_j_channels): a beta carrying an
+    explicit jjj is what makes a file j-resolved — the PP_HEADER
+    ``relativistic``/``has_so`` attributes are advisory, so when they
+    disagree with the betas both are printed and the betas win.
+    """
+    from psp.radial.build_projectors_qe import pseudo_has_j_channels
+
+    lines: list[str] = []
+    for element in sorted(pseudos):
+        pseudo = pseudos[element]
+        hdr = pseudo.pp_header
+        fname = os.path.basename(getattr(pseudo, "_source_path", "?"))
+        has_j = pseudo_has_j_channels(pseudo)
+        rel_attr = getattr(hdr, "relativistic", None)
+        rel_attr = getattr(rel_attr, "value", rel_attr)  # enum → str
+        kind = ("fully-relativistic (j-resolved channels)" if has_j
+                else "scalar-relativistic (no j-resolved channels)")
+        header_says_full = str(rel_attr).strip().lower() == "full"
+        if header_says_full != has_j and rel_attr is not None:
+            kind += f' [header relativistic="{rel_attr}"; beta channels win]'
+        lines.append(f"{element:<15}: {fname} — {kind}")
+
+        betas = getattr(getattr(pseudo, "pp_nonlocal", None), "pp_beta", [])
+        ls = [int(getattr(b, "angular_momentum", 0)) for b in betas]
+        per_l = " ".join(f"l={l}:{ls.count(l)}" for l in sorted(set(ls)))
+        kkbeta = max((int(getattr(b, "cutoff_radius_index", 0) or 0)
+                      for b in betas), default=0)
+        mesh = len(getattr(getattr(pseudo, "pp_mesh", None), "pp_r", None).value) \
+            if getattr(getattr(pseudo, "pp_mesh", None), "pp_r", None) is not None else 0
+        nlcc = "yes" if getattr(pseudo, "pp_nlcc", None) is not None else "no"
+        lines.append(
+            f"{'':<15}  z_val {float(hdr.z_valence):g}  "
+            f"proj {len(betas)} ({per_l})  NLCC {nlcc}  "
+            f"mesh {mesh}  kkbeta {kkbeta}")
+    if not lines:
+        lines.append("(none loaded)")
+    return lines
