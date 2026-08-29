@@ -109,11 +109,11 @@ of a (3,3) head tensor in this tree contracts it with a REAL mini-BZ draw:
 same.  For real ``q`` that contraction sees ONLY ``(S + S^T)/2``, so an
 antisymmetric part is silently discarded — not detected, discarded.  Worse, at
 real ``z`` where Xi is Hermitian, ``(S + S^T)/2 = Re(S)``, so the contraction
-is real by construction and ``head_densify._refuse_complex`` — the guard that
-exists to notice a complex head — CANNOT fire on a Hermitian-but-not-symmetric
-Xi.  A consumer that wants the full tensor must either symmetrize deliberately
-and say so, or refuse when ``asym`` is above tolerance.  This engine reports
-the number; it does not symmetrize.
+is real by construction and the real-head guard CANNOT fire on a
+Hermitian-but-not-symmetric Xi.  A scalar consumer may perform that contraction
+but must retain the measured tensor in its response record; a full-tensor
+consumer must preserve it or refuse when ``asym`` is above tolerance.  This
+engine reports the number; it does not symmetrize.
 
 SCOPE
 -----

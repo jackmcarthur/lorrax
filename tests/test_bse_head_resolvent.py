@@ -30,6 +30,7 @@ Every cell is seconds on one device.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -363,9 +364,10 @@ def test_xi_is_hermitian_at_real_z_but_not_symmetric(payload, mesh):
     * Symmetric: NOT structural.  It needs the transition SUM to pair
       ``k`` with ``-k`` (``v(-k) = -conj(v(k))``, ``Delta(-k) = Delta(k)``).
       Without that pairing Xi is measurably non-symmetric — asserted as a red
-      twin, because a reader that assumes symmetry silently keeps only
-      ``(Xi + Xi^T)/2`` (``gw.head_densify.head_scalar_pointwise`` contracts
-      with REAL mini-BZ draws) and cannot detect what it dropped.
+      twin. ``gw.head_densify.head_scalar_pointwise`` sees only
+      ``(Xi + Xi^T)/2`` when it contracts with real mini-BZ draws, so the
+      response record must retain the measured Xi rather than replace it by
+      the scalar projection's symmetric part.
     """
     op = hr.build_head_operator(mesh, payload, include_w=True)
     _, _, d_pair = _dipole(SMALL, payload, 7)
@@ -383,6 +385,41 @@ def test_xi_is_hermitian_at_real_z_but_not_symmetric(payload, mesh):
         f"Xi came out symmetric ({got.asym[0]:.3e}) on a payload with no "
         f"k -> -k pairing.  Either the engine is symmetrizing (it must not) or "
         f"this fixture accidentally acquired TRS.")
+
+
+def test_gw_finalizer_retains_nonsymmetric_xi(monkeypatch):
+    from gw import qsgw_head, screening_bse
+    from gw.gw_config import HeadCorrection
+
+    xi = np.asarray([
+        [0.20, 0.01 + 0.03j, 0.00],
+        [0.01 - 0.03j, 0.15, 0.02j],
+        [0.00, -0.02j, 0.10],
+    ])
+    captured = {}
+
+    def _sample(S_cart_omega, *_args, **_kwargs):
+        captured["S"] = np.asarray(S_cart_omega)
+        return (SimpleNamespace(S_cart=captured["S"][0]),)
+
+    monkeypatch.setattr(qsgw_head, "head_samples_from_s", _sample)
+    installed = []
+    resolver = SimpleNamespace(
+        wfn=object(), install_samples=lambda samples: installed.append(samples))
+    result = SimpleNamespace(
+        xi=xi[None], z=np.asarray([0.0j]), resids=np.asarray([0.0]),
+        iters=np.asarray([1]), asym=np.asarray([0.1]), delta_mismatch=0.0)
+    finalized = screening_bse._finalize_ladder_head(
+        SimpleNamespace(head_result=result),
+        config=SimpleNamespace(
+            head=SimpleNamespace(correction=HeadCorrection.FULL)),
+        meta=object(), head_resolver=resolver, print_fn=lambda *_args: None)
+
+    np.testing.assert_array_equal(finalized.samples[0].S_cart, xi)
+    assert len(installed) == 1 and installed[0] is finalized.samples
+    q = np.asarray([0.2, -0.1, 0.3])
+    xi_symmetric = 0.5 * (xi + xi.T)
+    np.testing.assert_allclose(q @ xi @ q, q @ xi_symmetric @ q)
 
 
 def test_xi_becomes_real_symmetric_under_k_to_minus_k_pairing(mesh):

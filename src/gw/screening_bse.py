@@ -813,7 +813,6 @@ def _finalize_ladder_head(wedge, *, config, meta, head_resolver, print_fn=print)
             "w_bse q->0 head resolvent did not converge: max true residual "
             f"{worst:.3e}, iterations {hottest}/{_GMRES_MAX_ITER}")
     xi = np.asarray(result.xi, dtype=np.complex128)
-    xi_long = 0.5 * (xi + np.swapaxes(xi, -1, -2))
     print_fn(
         "  w_bse head: using micro-reducible BSE resolvent exactly once "
         f"(max residual {worst:.2e}, max |Xi-Xi^T|/|Xi| "
@@ -821,7 +820,7 @@ def _finalize_ladder_head(wedge, *, config, meta, head_resolver, print_fn=print)
         f"{float(result.delta_mismatch):.2e}); no Schur refold.")
     from .qsgw_head import IterationHeadSamples, head_samples_from_s
     samples = head_samples_from_s(
-        xi_long, result.z, wfn=head_resolver.wfn,
+        xi, result.z, wfn=head_resolver.wfn,
         meta=meta, config=config, response_kind="micro_reducible",
         source_prefix="bse_resolvent_micro")
     resolved = IterationHeadSamples(
