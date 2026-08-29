@@ -1809,6 +1809,10 @@ class _CoupledMu123ZqCoordinator:
 			stacked_inputs = None
 		with self._cv:
 			self._stacked_solve_inputs = stacked_inputs
+			# The concatenated carrier is now the sole factor/trace owner for
+			# the stacked route.  Retaining the three registration tuples would
+			# keep an avoidable second copy alive through every r chunk.
+			self._solve_inputs.clear()
 			self._release_prepared = True
 			self._cv.notify_all()
 

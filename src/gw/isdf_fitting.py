@@ -1447,6 +1447,13 @@ def fit_zeta_to_h5(
         _coupled_rank_gate("prepared")
         _coupled_mu123_coordinator.channel_prepared(
             int(vertex_mu_L), solve_inputs=_coupled_solve_inputs)
+        if _coupled_stacked_solve:
+            # release_channels() has materialized and synchronized the one
+            # concatenated carrier.  Drop each channel's superseded factor
+            # and trace before entering the memory-dominant face loop.
+            L_q = None
+            cct_trace_per_q = None
+            _coupled_solve_inputs = None
 
     # glibc heap trim hook (see the comment at the call site in the loop
     # below).  DEFAULT ON — one ``malloc_trim(0)`` per r-chunk costs a few

@@ -125,3 +125,4 @@ def test_prepared_channels_publish_one_mu_major_solve_stack():
     np.testing.assert_array_equal(
         np.asarray(trace), [10, 10, 20, 20, 30, 30])
     assert all(seen[mu][0] is factor for mu in (1, 2, 3))
+    assert coordinator._solve_inputs == {}
