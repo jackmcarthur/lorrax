@@ -11,6 +11,7 @@ from gw.minimax_screening import (
     fit_gn_ppm_from_wc_pair,
 )
 from gw.ppm_sigma import _residue_for_space
+from gw.qsgw_head import head_samples_from_s
 from gw.screening import (
     ScreeningRequest,
     _assert_imaginary_probe_supported,
@@ -246,3 +247,27 @@ def test_broken_tr_route_refuses_an_even_probe_plan():
             RuntimeError, "gn_ppm_ordered_probe_producer"):
         _assert_imaginary_probe_supported(trs_allowed=False)
     _assert_imaginary_probe_supported(trs_allowed=True)
+
+
+def test_broken_tr_gn_head_refuses_unpaired_average():
+    config = SimpleNamespace(
+        compute_mode=ComputeMode.GN_PPM,
+        head=SimpleNamespace(
+            vhead=None,
+            whead_0freq=None,
+            whead_imfreq=None,
+            head_minibz_average=False,
+        ),
+    )
+
+    for sys_dim in (2, 3):
+        for trs_holds in (False, None):
+            with np.testing.assert_raises_regex(
+                    RuntimeError, "gn_ppm_unpaired_head_average"):
+                head_samples_from_s(
+                    np.eye(3, dtype=np.complex128)[None],
+                    (0.41j,),
+                    wfn=SimpleNamespace(trs_holds=trs_holds),
+                    meta=SimpleNamespace(sys_dim=sys_dim),
+                    config=config,
+                )

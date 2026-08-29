@@ -3694,7 +3694,11 @@ def head_samples_from_s(
     response_kind="direct_irreducible",
     source_prefix: str = "qsgw_parallel_transport",
 ) -> tuple[object, ...]:
-    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
+    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
+
+    A broken-TR GN probe requires an inversion-paired point rule; the
+    incumbent scalar estimator does not supply one in any dimensionality.
+    """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
     from gw.isdf_fitting import mem_probe
@@ -3719,6 +3723,14 @@ def head_samples_from_s(
         "whead_0freq": config.head.whead_0freq,
         "whead_imfreq": config.head.whead_imfreq,
     }
+    raw_mode = getattr(config, "compute_mode", None)
+    gn_head_needs_paired_rule = False
+    if raw_mode is not None:
+        from gw.gw_config import ComputeMode, coerce_compute_mode
+        trs_measured = getattr(wfn, "trs_holds", None)
+        gn_head_needs_paired_rule = (
+            coerce_compute_mode(raw_mode) is ComputeMode.GN_PPM
+            and (trs_measured is None or not bool(trs_measured)))
     out = []
     kind = HeadResponseKind(response_kind)
     for z, S in zip(omegas, S_host):
@@ -3728,6 +3740,14 @@ def head_samples_from_s(
             continue
         is_static_metal = (
             static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
+        if gn_head_needs_paired_rule and abs(z.imag) > 1.0e-14:
+            raise RuntimeError(
+                "GATE gn_ppm_unpaired_head_average: an imaginary-frequency "
+                "GN head requires an "
+                "inversion-paired mini-BZ rule when time reversal "
+                "is broken or unmeasured.  The legacy "
+                "compute_q0_averages point set is not paired; use "
+                "the exact-cell provider or an explicit head override.")
         vc0, wc0 = compute_q0_averages(
             wfn,
             jnp.asarray(0.0, dtype=jnp.float64),
