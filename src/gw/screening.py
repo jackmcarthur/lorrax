@@ -165,19 +165,20 @@ def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
 def _assert_broken_tr_dynamic_model_supported(
     mode: ComputeMode,
     *,
-    trs_allowed,
+    trs_allowed: bool | None,
 ) -> None:
     """Reject dynamic screening models that identify both pole residues."""
-    if trs_allowed is None or bool(trs_allowed):
+    if trs_allowed is True:
         return
     if mode is ComputeMode.HL_PPM:
         raise RuntimeError(
-            "GATE hl_ppm_broken_tr_response: measured broken TR requires "
-            "distinct positive- and negative-frequency pole residues, but "
-            "HL-PPM currently stores one residue for both poles.")
+            "GATE hl_ppm_broken_tr_response: broken or unmeasured TR "
+            "requires distinct positive- and negative-frequency pole "
+            "residues, but HL-PPM currently stores one residue for both "
+            "poles.")
     if mode is ComputeMode.MPA:
         raise RuntimeError(
-            "GATE mpa_broken_tr_response: measured broken TR requires "
+            "GATE mpa_broken_tr_response: broken or unmeasured TR requires "
             "distinct positive- and negative-frequency pole residues, but "
             "the current MPA model is explicitly even in frequency.")
 

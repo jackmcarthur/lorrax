@@ -189,27 +189,28 @@ def test_broken_tr_probe_gate_keeps_q_reciprocity_not_fixed_q_hermiticity(
     assert calls == ["finite", "hermitian", "q_reciprocity"]
 
 
-def test_dynamic_one_residue_models_refuse_measured_broken_tr():
+def test_dynamic_one_residue_models_require_affirmative_tr():
     config = SimpleNamespace(
         screening=SimpleNamespace(diagrams=ScreeningDiagrams.W_RPA))
-    common = dict(
-        quad=None,
-        e_ref=0.0,
-        sym=SimpleNamespace(trs_allowed=False),
-        centroid_indices=None,
-        config=config,
-        meta=None,
-        mesh_xy=None,
-        run_dir="",
-        label="test",
-    )
+    for trs_allowed in (False, None):
+        common = dict(
+            quad=None,
+            e_ref=0.0,
+            sym=SimpleNamespace(trs_allowed=trs_allowed),
+            centroid_indices=None,
+            config=config,
+            meta=None,
+            mesh_xy=None,
+            run_dir="",
+            label="test",
+        )
 
-    for mode, gate in (
-        (ComputeMode.HL_PPM, "hl_ppm_broken_tr_response"),
-        (ComputeMode.MPA, "mpa_broken_tr_response"),
-    ):
-        with np.testing.assert_raises_regex(RuntimeError, gate):
-            compute_screening_model(mode, None, None, **common)
+        for mode, gate in (
+            (ComputeMode.HL_PPM, "hl_ppm_broken_tr_response"),
+            (ComputeMode.MPA, "mpa_broken_tr_response"),
+        ):
+            with np.testing.assert_raises_regex(RuntimeError, gate):
+                compute_screening_model(mode, None, None, **common)
 
     # Static screening has no positive/negative-frequency residue pair.
     assert compute_screening_model(
