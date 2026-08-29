@@ -207,6 +207,19 @@ _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
 
+# Delivered-error fitting on a weighted complex support.  Also SciPy
+# (linprog), so it lives behind the same lazy door: a production table
+# lookup must not import an optimiser.
+_RECIPROCAL_FIT_NAMES = (
+    "ReciprocalMeasureProblem", "ComplexTimeRule",
+    "evaluate_rule", "delivered_error", "rule_amplification",
+    "solve_fixed_time_weights",
+)
+_TIME_NODE_SEARCH_NAMES = (
+    "ComplexTimeSearchOptions", "support_arc",
+    "candidate_time_dictionary", "fit_reciprocal_measure",
+)
+
 
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
@@ -220,12 +233,20 @@ def __getattr__(name: str):
     if name in _FREQUENCY_FIT_NAMES:
         from minimax import frequency_fit as _fit      # noqa: PLC0415
         return getattr(_fit, name)
+    if name in _RECIPROCAL_FIT_NAMES:
+        from minimax import reciprocal_fit as _measure  # noqa: PLC0415
+        return getattr(_measure, name)
+    if name in _TIME_NODE_SEARCH_NAMES:
+        from minimax import time_node_search as _search  # noqa: PLC0415
+        return getattr(_search, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
 def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
-                  | set(_FREQUENCY_FIT_NAMES))
+                  | set(_FREQUENCY_FIT_NAMES)
+                  | set(_RECIPROCAL_FIT_NAMES)
+                  | set(_TIME_NODE_SEARCH_NAMES))
 
 
 __all__ = [
@@ -249,6 +270,9 @@ __all__ = [
     "UncertifiedSolveRefused", "SamplingUnsupported",
     # --- generic complex-frequency fitting (lazy; scipy) -------------------
     *_FREQUENCY_FIT_NAMES,
+    # --- delivered-error fitting on a weighted support (lazy; scipy) -------
+    *_RECIPROCAL_FIT_NAMES,
+    *_TIME_NODE_SEARCH_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]
