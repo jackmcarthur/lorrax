@@ -27,6 +27,7 @@ import ast
 import os
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -481,7 +482,8 @@ class _Reached(Exception):
 
 def _stub_kwargs(config, tmp_path):
     return dict(
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0, sym=SimpleNamespace(trs_allowed=True),
+        centroid_indices=None,
         config=config, meta=None, mesh_xy=None,
         run_dir=str(tmp_path / "mpa"), label="unit",
         tensors_filename=str(tmp_path / "isdf_tensors_4.h5"),

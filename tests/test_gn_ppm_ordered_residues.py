@@ -216,6 +216,27 @@ def test_dynamic_one_residue_models_refuse_measured_broken_tr():
         ComputeMode.MPA, None, None, static_only=True, **common) == {}
 
 
+def test_w_bse_refuses_broken_tr_before_the_ladder():
+    config = SimpleNamespace(
+        screening=SimpleNamespace(diagrams=ScreeningDiagrams.W_BSE))
+    with np.testing.assert_raises_regex(
+            RuntimeError, "w_bse_requires_measured_trs"):
+        compute_screening_model(
+            ComputeMode.GN_PPM,
+            None,
+            None,
+            quad=None,
+            e_ref=0.0,
+            sym=SimpleNamespace(trs_allowed=False),
+            centroid_indices=None,
+            config=config,
+            meta=None,
+            mesh_xy=None,
+            run_dir="",
+            label="test",
+        )
+
+
 def test_resolvent_probe_gate_obeys_the_same_ordered_response_policy(
     monkeypatch,
 ):

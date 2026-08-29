@@ -863,6 +863,16 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if diagrams is ScreeningDiagrams.W_BSE:
+        trs_allowed = getattr(sym, "trs_allowed", None)
+        if trs_allowed is None or not bool(trs_allowed):
+            raise RuntimeError(
+                "GATE w_bse_requires_measured_trs: the v1 ladder's "
+                "anti-resonant channel uses a time-reversal pair gauge, "
+                "which is exact only after time reversal has been measured "
+                "to hold.  This run reports broken or unmeasured TR; use "
+                "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
+                "ladder has a general ordered-response construction.")
     if not static_only:
         _assert_broken_tr_dynamic_model_supported(
             mode, trs_allowed=getattr(sym, "trs_allowed", None))
