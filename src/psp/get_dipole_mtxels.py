@@ -575,8 +575,7 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     ``--vnl-velocity-sign`` beats the deck key ``vnl_velocity_sign``,
     which beats the default.  ``None`` and the empty string both mean
     NOT DECLARED, so a deck that has never heard of the key and a deck
-    that omits it are the same run -- the same reading
-    ``resolve_soc_mode`` gives ``soc``.
+    that omits it are the same run.
 
     The default is
     :data:`common.mtxel_sweep.VNL_VELOCITY_SIGN_FLIPPED`, and it is read
@@ -626,12 +625,13 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     notice which arm it was handed.
 
     ``nspinor`` (the WFN's spin representation) and ``soc`` (the RESOLVED
-    j-resolved/j-averaged V_NL choice, ``vnl_setup.soc``) follow the same
-    ``None`` = pre-knob-caller reading.  ``prov_nspinor`` is enforced by
-    ``check_dipole_provenance`` (INVARIANTS row 3: representation is part
-    of the reuse contract); ``prov_soc`` is record-only, because the
-    consuming run cannot derive its own value from a BerkeleyGW WFN.h5
-    (nothing in that file records lspinorb).
+    j-resolved/j-averaged V_NL choice, ``vnl_setup.soc`` — automatic,
+    measured against the wavefunctions when nothing declares it) follow
+    the same ``None`` = pre-knob-caller reading.  ``prov_nspinor`` is
+    enforced by ``check_dipole_provenance`` (INVARIANTS row 3:
+    representation is part of the reuse contract); ``prov_soc`` stays
+    record-only — the consumer could re-measure, but the stamp is the
+    cheap, honest record of what THIS file was built with.
     """
     h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
     h5.attrs["prov_wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
@@ -803,18 +803,10 @@ def main(argv=None):
 		     "cohsex_debug does), so a fixture re-cut from a clean checkout "
 		     "needs this flag — see gw.kin_ion_io, which has had it all along.",
 	)
-	parser.add_argument(
-		"--soc",
-		choices=("auto", "true", "false"),
-		default="auto",
-		help="Which V_NL projectors to build from a FULLY-RELATIVISTIC "
-		     "pseudopotential: 'true' = j-resolved (spin-orbit ON), "
-		     "'false' = j-averaged scalar-relativistic (QE average_pp), "
-		     "'auto' (default) reads QE's <spinorbit> when available and "
-		     "otherwise announces its resolution.  Same contract as "
-		     "gw.kin_ion_io --soc; nspinor=2 (noncollinear) does NOT imply "
-		     "spin-orbit and a BerkeleyGW WFN.h5 records nspinor only.",
-	)
+	# There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
+	# resolved automatically inside build_vnl_setup — QE's <spinorbit> when
+	# available, nspinor=1 by force, and the FR + nspinor=2 + BGW-WFN case
+	# by MEASUREMENT against the wavefunctions (psp.vnl_ops.measure_soc_mode).
 	parser.add_argument(
 		"--vnl-velocity-sign",
 		type=float,
@@ -1142,7 +1134,6 @@ def main(argv=None):
 		meta,
 		pseudos,
 		nspinor=int(wfn.nspinor),
-		soc={"auto": None, "true": True, "false": False}[args.soc],
 	)
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
@@ -1155,6 +1146,7 @@ def main(argv=None):
 		f"V_NL evaluator : {args.vnl_mode} "
 		+ ("derivative" if args.vnl_mode == "analytic" else
 		   f"finite difference ({args.vnl_num_scheme})"),
+		f"SOC projectors : {vnl_setup.soc_provenance}",
 		f"V_NL sign      : {float(vnl_velocity_sign):+.5f} in the stored convention",
 		"q = 0 matrix   : enabled; full band-to-band Cartesian velocity",
 		"finite-q SOS   : " + ("enabled" if args.with_finite_q else "off"),

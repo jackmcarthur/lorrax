@@ -124,7 +124,6 @@ def run_kpm_dos(
     seed: int = 0,
     buffer: float = 0.10,
     nosym: bool = False,
-    soc: bool | None = None,
     plot_file: str = "dft_dos_kpm.pdf",
     verbose: bool = True,
 ) -> dict:
@@ -145,10 +144,6 @@ def run_kpm_dos(
         Fractional buffer on spectral bounds.
     nosym : bool
         If True, use full (unreduced) k-grid.
-    soc : bool or None
-        j-RESOLVED (True) vs j-AVERAGED (False) V_NL from an FR pseudo.
-        ``None`` = not declared: ``crystal.spinorbit`` (QE <spinorbit>,
-        always present on the .save route) resolves it authoritatively.
     plot_file : str
         Output plot path.
     verbose : bool
@@ -177,8 +172,11 @@ def run_kpm_dos(
             jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat,
             truncation_2d=truncation_2d)
         V_scf = build_V_scf(V_loc, V_H, V_xc)
+        # j-resolved vs j-averaged V_NL resolves automatically:
+        # ``crystal.spinorbit`` (QE <spinorbit>, always present on the
+        # .save route) is authoritative inside build_vnl_setup.
         vnl_setup = vnl_ops.build_vnl_setup(
-            crystal, pseudos=pseudos, nspinor=nspinor, soc=soc,
+            crystal, pseudos=pseudos, nspinor=nspinor,
             q_max=float(np.sqrt(ecutwfc)) * 1.01)
 
     # ── k-point grid ───────────────────────────────────────────────
@@ -332,12 +330,8 @@ def main():
     parser.add_argument("--pseudo_dir", default=None)
     parser.add_argument("--nk", type=int, nargs=3, default=[4, 4, 4])
     parser.add_argument("--nosym", action="store_true")
-    parser.add_argument("--soc", choices=("auto", "true", "false"),
-                        default="auto",
-                        help="V_NL from an FR pseudo: j-resolved (true) / "
-                             "j-averaged average_pp (false) / read QE's "
-                             "<spinorbit> (auto).  Same contract as "
-                             "gw.kin_ion_io --soc.")
+    # No --soc flag: the .save route always carries QE's <spinorbit>, and
+    # build_vnl_setup honors it automatically (psp.vnl_ops.resolve_soc_mode).
     parser.add_argument("--n-moments", type=int, default=300)
     parser.add_argument("--n-random", type=int, default=3)
     parser.add_argument("--buffer", type=float, default=0.10)
@@ -356,7 +350,6 @@ def main():
         buffer=args.buffer,
         seed=args.seed,
         nosym=args.nosym,
-        soc={"auto": None, "true": True, "false": False}[args.soc],
         plot_file=args.plot,
     )
 

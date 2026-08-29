@@ -47,7 +47,6 @@ def build_dft_potentials(
     rho_val: jax.Array,
     *,
     truncation_2d: bool,
-    soc: bool | None = None,
     verbose: bool = True,
 ) -> tuple[jax.Array, jax.Array, vnl_ops.VNLSetup]:
     """Build (V_scf, V_loc, vnl_setup) on the FFT grid.
@@ -64,11 +63,6 @@ def build_dft_potentials(
         Real-space valence charge density in e/bohr³.
     truncation_2d : bool
         Apply 2D Coulomb truncation in V_H (slab geometries).
-    soc : bool or None
-        j-RESOLVED (True) vs j-AVERAGED (False) V_NL projectors from a
-        fully-relativistic UPF; ``None`` = not declared, resolved (and
-        announced) by ``vnl_ops.resolve_soc_mode`` from ``mf.spinorbit``
-        when ``mf`` came from a QE ``.save``.
     verbose : bool
         Print timing.
 
@@ -97,8 +91,12 @@ def build_dft_potentials(
         jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
         truncation_2d=truncation_2d)
     V_scf = build_V_scf(V_loc, V_H, V_xc)
+    # j-resolved vs j-averaged V_NL resolves automatically inside
+    # build_vnl_setup: ``mf.spinorbit`` (QE <spinorbit>) when ``mf`` came
+    # from a .save; measured against the wavefunctions when ``mf`` is a
+    # WFN reader with FR pseudos and no such record.
     vnl_setup = vnl_ops.build_vnl_setup(
-        mf, pseudos=pseudos, nspinor=nspinor, soc=soc,
+        mf, pseudos=pseudos, nspinor=nspinor,
         q_max=float(np.sqrt(float(mf.ecutwfc))) * 1.01)
 
     if verbose:

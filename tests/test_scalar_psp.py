@@ -1,13 +1,14 @@
-"""Scalar-relativistic (nspinor=1) pseudopotential semantics.
+"""Scalar-relativistic (nspinor=1) pseudopotential semantics, and the
+FLAGLESS automatic V_NL spin-orbit resolution (owner ruling 2026-08-28).
 
-Pins the nspinor=1 generalization of the V_NL spin-orbit resolution
-(2026-08-28) and its refusals:
-
-* ``resolve_soc_mode``: SR pseudos resolve False for ANY nspinor; an FR
-  pseudo with nspinor=1 is FORCED to the j-averaged operator when soc is
-  undeclared (QE ``average_pp`` for any lspinorb=.false. start) and
-  REFUSES soc=True — a j-resolved V_NL has no representation on
-  one-component wavefunctions.
+* ``resolve_soc_mode``: no soc/spinor flag exists anywhere.  SR pseudos
+  resolve False quietly for ANY nspinor; QE's ``<spinorbit>`` is
+  authoritative when present; an FR pseudo with nspinor=1 is FORCED to
+  the j-averaged operator (QE ``average_pp``) and a spinorbit=true claim
+  with nspinor=1 REFUSES — a j-resolved V_NL has no representation on
+  one-component wavefunctions.  FR + nspinor=2 + no record returns None:
+  the answer is MEASURED (``measure_soc_mode``), pinned below on real
+  fixture WFNs for both arms plus the refusal twins.
 * ``build_E_blocks_full`` on a j-free UPF: E^{σσ'} = D ⊗ δ_{σσ'}, so the
   nspinor=1 slice E[:1,:1] IS the scalar D-block, bit for bit, and the
   ``soc`` argument cannot matter.
@@ -74,41 +75,55 @@ def _fr_pseudo(d_minus=0.3, d_plus=0.1):
 
 
 # ---------------------------------------------------------------------------
-# resolve_soc_mode
+# resolve_soc_mode — the AUTOMATIC contract (owner ruling 2026-08-28):
+# no soc/spinor flag exists anywhere.  Metadata arms here; the measured
+# arm (FR + nspinor=2 + no <spinorbit>) is pinned on real fixture WFNs
+# further down.
 # ---------------------------------------------------------------------------
 
-def test_sr_pseudo_resolves_false_for_any_nspinor_and_any_request():
+def test_sr_pseudo_resolves_false_quietly_for_any_nspinor():
     from psp.vnl_ops import resolve_soc_mode
 
     sr, _ = _sr_pseudo()
     for nspinor in (1, 2):
-        for soc in (None, False, True):
-            lines = []
-            assert resolve_soc_mode({"Si": sr}, soc=soc, nspinor=nspinor,
-                                    print_fn=lines.append) is False
-            if soc is None:
-                # the quiet contract: no choice exists, so no announcement
-                assert lines == []
+        lines = []
+        assert resolve_soc_mode({"Si": sr}, nspinor=nspinor,
+                                print_fn=lines.append) is False
+        # the quiet contract: no choice exists, so no announcement
+        assert lines == []
 
 
-def test_fr_nspinor2_undeclared_keeps_jresolved_and_announces():
-    # No-op pin of the historical nspinor=2 behaviour: the scalar work must
-    # not have moved this banner by so much as a branch.
+def test_the_soc_flag_is_gone():
+    # The owner's ruling is a surface contract, not a default: there must be
+    # NO caller-declared arm left to reach.  A caller still passing soc=
+    # gets a TypeError, not a silently ignored knob (the parsed-but-unread
+    # defect class this repo has paid for).
+    from psp.vnl_ops import build_vnl_setup, resolve_soc_mode
+
+    with pytest.raises(TypeError):
+        resolve_soc_mode({"Mo": _fr_pseudo()}, soc=True, nspinor=2)
+    with pytest.raises(TypeError):
+        build_vnl_setup(None, pseudos={"Mo": _fr_pseudo()}, nspinor=2,
+                        soc=True)
+
+
+def test_fr_nspinor2_undeclared_returns_none_meaning_measure():
+    # The old assume-True banner is gone: with an FR pseudo, 2-component
+    # wavefunctions and no authoritative record, the resolver hands the
+    # question to the MEASUREMENT (build_vnl_setup / measure_soc_mode)
+    # instead of deciding.
     from psp.vnl_ops import resolve_soc_mode
 
     lines = []
-    assert resolve_soc_mode({"Mo": _fr_pseudo()}, soc=None, nspinor=2,
-                            print_fn=lines.append) is True
-    text = "\n".join(lines)
-    assert "UNDETERMINED" in text
-    assert "j-RESOLVED" in text
+    assert resolve_soc_mode({"Mo": _fr_pseudo()}, nspinor=2,
+                            print_fn=lines.append) is None
 
 
 def test_fr_nspinor1_undeclared_is_forced_averaged_and_says_so():
     from psp.vnl_ops import resolve_soc_mode
 
     lines = []
-    assert resolve_soc_mode({"Mo": _fr_pseudo()}, soc=None, nspinor=1,
+    assert resolve_soc_mode({"Mo": _fr_pseudo()}, nspinor=1,
                             print_fn=lines.append) is False
     text = "\n".join(lines)
     # Red twin of a silent resolution: the forced choice must be announced,
@@ -118,43 +133,39 @@ def test_fr_nspinor1_undeclared_is_forced_averaged_and_says_so():
     assert "0.200000" in text          # |0.3 - 0.1| Ry, the ΔD at stake
 
 
-def test_fr_nspinor1_soc_true_refuses():
-    from psp.vnl_ops import resolve_soc_mode
-
-    with pytest.raises(ValueError, match="no representation") as err:
-        resolve_soc_mode({"Mo": _fr_pseudo()}, soc=True, nspinor=1)
-    msg = str(err.value)
-    for needle in ("got:", "want:", "fix:", "nspinor=1", "average_pp"):
-        assert needle in msg, f"refusal must carry {needle!r}: {msg}"
-
-
-def test_fr_nspinor1_qe_spinorbit_true_also_refuses_naming_the_source():
+def test_fr_nspinor1_qe_spinorbit_true_refuses_naming_the_source():
     # The contradictory-file case: a wfn claiming lspinorb with 1-component
-    # wavefunctions is not honorable either, and the refusal must say WHERE
-    # the soc=True came from.
+    # wavefunctions cannot be honored, and the refusal must say WHERE the
+    # spin-orbit claim came from — and must not point at flags that no
+    # longer exist.
     from psp.vnl_ops import resolve_soc_mode
 
     wfn = SimpleNamespace(spinorbit=True)
-    with pytest.raises(ValueError, match="QE <spinorbit>"):
-        resolve_soc_mode({"Mo": _fr_pseudo()}, wfn, soc=None, nspinor=1)
+    with pytest.raises(ValueError, match="QE <spinorbit>") as err:
+        resolve_soc_mode({"Mo": _fr_pseudo()}, wfn, nspinor=1)
+    msg = str(err.value)
+    for needle in ("got:", "want:", "fix:", "nspinor=1", "average_pp"):
+        assert needle in msg, f"refusal must carry {needle!r}: {msg}"
+    for gone in ("--soc", "soc=False", "soc=True", "pass soc"):
+        assert gone not in msg, f"refusal points at a removed flag: {msg}"
 
 
-def test_fr_nspinor2_soc_true_does_not_refuse():
-    # Green twin of the refusal: the same request on 2-component
-    # wavefunctions is the historical, correct path.
-    from psp.vnl_ops import resolve_soc_mode
-
-    assert resolve_soc_mode({"Mo": _fr_pseudo()}, soc=True, nspinor=2,
-                            print_fn=lambda *_: None) is True
-
-
-def test_fr_nspinor1_soc_false_is_the_ordinary_averaged_path():
+def test_qe_spinorbit_is_authoritative_both_ways():
     from psp.vnl_ops import resolve_soc_mode
 
     lines = []
-    assert resolve_soc_mode({"Mo": _fr_pseudo()}, soc=False, nspinor=1,
-                            print_fn=lines.append) is False
-    assert any("j-AVERAGED" in ln for ln in lines)
+    assert resolve_soc_mode({"Mo": _fr_pseudo()},
+                            SimpleNamespace(spinorbit=True), nspinor=2,
+                            print_fn=lines.append) is True
+    assert any("j-RESOLVED" in ln and "QE <spinorbit>" in ln for ln in lines)
+
+    lines = []
+    for nspinor in (1, 2):
+        assert resolve_soc_mode({"Mo": _fr_pseudo()},
+                                SimpleNamespace(spinorbit=False),
+                                nspinor=nspinor,
+                                print_fn=lines.append) is False
+    assert any("j-AVERAGED" in ln and "QE <spinorbit>" in ln for ln in lines)
 
 
 def test_resolve_soc_mode_requires_nspinor():
@@ -163,7 +174,7 @@ def test_resolve_soc_mode_requires_nspinor():
     from psp.vnl_ops import resolve_soc_mode
 
     with pytest.raises(TypeError):
-        resolve_soc_mode({"Mo": _fr_pseudo()}, soc=False)
+        resolve_soc_mode({"Mo": _fr_pseudo()})
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +372,7 @@ def test_real_sr_si_upf_is_scalar_end_to_end():
     assert pseudo_has_j_channels(p) is False
 
     lines = []
-    assert resolve_soc_mode({"Si": p}, soc=None, nspinor=1,
+    assert resolve_soc_mode({"Si": p}, nspinor=1,
                             print_fn=lines.append) is False
     assert lines == []                # SR: no choice exists, quiet contract
 
@@ -377,6 +388,146 @@ def test_real_sr_si_upf_is_scalar_end_to_end():
     assert sp.n_proj == len(sp.proj_l)
     off = sp.dij - np.diag(np.diag(sp.dij))
     assert not off.any()
+
+
+# ---------------------------------------------------------------------------
+# The MEASURED resolution arm, on real fixture WFNs (2026-08-28).
+#
+# Ground truth, established from the spectra themselves (an average_pp
+# Hamiltonian commutes with every spin rotation, so ALL its eigenvalues
+# have even multiplicity at every k):
+#   * si_cohsex_debug/WFN.h5 — exact spin pairing everywhere (worst broken
+#     (2n,2n+1) pair 0.000000 eV): lspinorb=.false. (matches its QE run
+#     06_si_4x4x4_nosoc, <spinorbit>false</spinorbit>).
+#   * cohsex_debug/WFNsmall.h5 (MoS2, FR Mo+S) — spin pairing broken by up
+#     to 0.136 eV at K: genuinely lspinorb=.true.  (gnppm_debug measures
+#     0.138 eV — also true; cohsex_debug is used here because it carries
+#     its own UPFs.)
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[1]
+_SI_SPINOR_WFN = _REPO / "tests/regression/si_cohsex_debug/WFN.h5"
+_MOS2_SOC_DECK = _REPO / "tests/regression/cohsex_debug"
+_FR_SI_UPF = Path("/home/jackm/SOURCES/agent_tasks/qe-gw-pipeline/"
+                  "assets/pseudos_standard/Si.upf")
+
+
+def _wfn_loader(path):
+    from ffi import _services
+    _services.ensure_on_path()
+    from wfn_loader import WfnLoader
+
+    return WfnLoader(str(path))
+
+
+@pytest.fixture(scope="module")
+def si_spinor_measured():
+    """(wfn, setup, printed lines) for the Si spinor deck + FR Si.upf."""
+    if not (_SI_SPINOR_WFN.exists() and _FR_SI_UPF.exists()):
+        pytest.skip("si_cohsex_debug WFN or FR Si.upf not staged")
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+    from psp.vnl_ops import build_vnl_setup
+
+    wfn = _wfn_loader(_SI_SPINOR_WFN)
+    pseudo = normalize_dataclass(load_upf(_FR_SI_UPF))
+    lines: list[str] = []
+    setup = build_vnl_setup(wfn, pseudos={"Si": pseudo}, nspinor=2,
+                            print_fn=lines.append)
+    return wfn, setup, lines
+
+
+def test_measurement_selects_javeraged_on_the_lspinorb_false_wfn(
+        si_spinor_measured):
+    """The auto-fix of the defect-#21 class: the spinor Si fixture
+    (lspinorb=false WFN + FR pseudo) now measures its way to j-AVERAGED —
+    the historically-correct answer the old assume-True default got wrong."""
+    import re as _re
+
+    _wfn, setup, lines = si_spinor_measured
+    assert setup.soc is False
+    assert "j-AVERAGED selected by measurement" in setup.soc_provenance
+    # Both discriminants are on the record, at the calibrated scales:
+    # the wrong (j-resolved) candidate splits probed multiplets at the
+    # SOC scale (Si Δ0 ~ 4.8e-2 eV on V_NL alone), the right one sits at
+    # the numerical floor — seven decades apart.
+    nums = [float(x) for x in
+            _re.findall(r"(\d\.\d+e[+-]\d+) eV", setup.soc_provenance)]
+    assert len(nums) >= 2
+    s_avg, s_res = nums[0], nums[1]
+    assert s_avg < 1e-6, setup.soc_provenance
+    assert s_res > 1e-3, setup.soc_provenance
+    # the announcement also went through print_fn (debug stream)
+    assert any("selected by measurement" in ln for ln in lines)
+
+
+def test_measurement_selects_jresolved_on_the_lspinorb_true_wfn():
+    """The other arm: a genuine SOC WFN (MoS2, spin pairing broken by
+    0.136 eV) must measure its way to j-RESOLVED."""
+    wfn_path = _MOS2_SOC_DECK / "WFNsmall.h5"
+    if not wfn_path.exists():
+        pytest.skip("cohsex_debug fixture not staged")
+    from psp.pseudos import load_pseudopotentials
+    from psp.vnl_ops import build_vnl_setup
+
+    wfn = _wfn_loader(wfn_path)
+    pseudos = load_pseudopotentials(str(_MOS2_SOC_DECK))
+    assert sorted(pseudos) == ["Mo", "S"]
+    lines: list[str] = []
+    setup = build_vnl_setup(wfn, pseudos=pseudos, nspinor=2,
+                            print_fn=lines.append)
+    assert setup.soc is True
+    assert "j-RESOLVED selected by measurement" in setup.soc_provenance
+    # On this deck the probed multiplets are (P)T-protected doublets that
+    # BOTH candidates leave invariant; the positive lspinorb evidence is
+    # el itself breaking exact spin degeneracy (impossible for average_pp).
+    assert "spin degeneracy" in setup.soc_provenance
+
+
+def test_measurement_refusals_are_loud_and_the_equivalence_arm_is_green(
+        si_spinor_measured):
+    """Red twins for the measured arm — the refusals must fire, and the
+    same calls with the benign condition must NOT (no tautology)."""
+    import jax.numpy as jnp
+    from psp.radial.build_projectors_qe import build_E_blocks_full
+    from psp.upf.load_upf import load_upf
+    from psp.upf.normalize import normalize_dataclass
+    from psp.vnl_ops import measure_soc_mode
+
+    wfn, setup, _ = si_spinor_measured
+
+    # 1. No WFN reader behind the object: refuse at the door.
+    with pytest.raises(RuntimeError, match="cannot be measured"):
+        measure_soc_mode(object(), None, None, None, delta_d_ry=0.1)
+
+    # 2. Candidates indistinguishable on everything probed while ΔD says
+    #    they differ materially: UNMEASURABLE, loudly.
+    with pytest.raises(RuntimeError, match="UNMEASURABLE"):
+        measure_soc_mode(wfn, setup, setup.E_super, setup.E_super,
+                         delta_d_ry=0.148, print_fn=lambda *a: None)
+
+    # 2g. Green twin of 2: the SAME call with ΔD below the floor is the
+    #     equivalence verdict, not a refusal.
+    soc, line = measure_soc_mode(wfn, setup, setup.E_super, setup.E_super,
+                                 delta_d_ry=0.0, print_fn=lambda *a: None)
+    assert soc is True and "equivalent" in line
+
+    # 3. BOTH candidates split (here: the j-resolved E handed in as both
+    #    arms, against the average_pp WFN): wrong-pairing refusal.
+    blocks_res = build_E_blocks_full(
+        normalize_dataclass(load_upf(_FR_SI_UPF)), soc=True)
+    ns, r_tot = setup.nspinor, setup.total_R
+    e_sup = np.zeros((ns, ns, r_tot, r_tot), dtype=np.complex128)
+    off = 0
+    for ch in setup.channels:                     # single species: Si
+        e_np = np.asarray(blocks_res[ch.l])[:ns, :ns]
+        for _a in range(ch.natoms):
+            e_sup[:, :, off:off + ch.R, off:off + ch.R] = e_np
+            off += ch.R
+    e_res = jnp.asarray(e_sup)
+    with pytest.raises(RuntimeError, match="BOTH candidate"):
+        measure_soc_mode(wfn, setup, e_res, e_res,
+                         delta_d_ry=0.148, print_fn=lambda *a: None)
 
 
 # ---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ from common.preprocessing_output import (PreprocessingProductionReport,
                                          timing_total)
 from common.progress import LoopProgress
 from common.scientific_output import (
-    band_range, policy, pseudopotential_file_rows,
+    band_range, pseudopotential_file_rows,
 )
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
@@ -955,18 +955,12 @@ def build_argparser() -> argparse.ArgumentParser:
                            "reproducing old artifacts — the stored-array default is "
                            "strictly better (kin_ion stays reusable, QSGW gets the "
                            "full matrix, and the VH column stops reading 0.000).")
-    argp.add_argument("--soc", choices=("auto", "true", "false"), default="auto",
-                      help="which V_NL projectors to build from a FULLY-RELATIVISTIC "
-                           "pseudopotential.  'true' = j-resolved (spin-orbit ON, the "
-                           "historical behaviour, correct for lspinorb=.true. "
-                           "wavefunctions).  'false' = j-averaged scalar-relativistic "
-                           "V_NL ⊗ 1_spin, reproducing QE average_pp — correct for "
-                           "noncolin=.true., lspinorb=.false. wavefunctions.  'auto' "
-                           "(default) reads QE's <spinorbit> when the structure came "
-                           "from a .save and otherwise ANNOUNCES that it is assuming "
-                           "spin-orbit.  nspinor=2 means noncollinear, which does NOT "
-                           "imply spin-orbit; a BerkeleyGW WFN.h5 records nspinor and "
-                           "nothing else, so on that input this cannot be inferred.")
+    # There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
+    # resolved automatically, always — scalar pseudos quietly, QE's
+    # <spinorbit> authoritatively, nspinor=1 by force, and the FR + nspinor=2
+    # + BGW-WFN case by MEASUREMENT against the wavefunctions
+    # (psp.vnl_ops.measure_soc_mode).  The verdict is announced in the
+    # report's pathways block and stamped into the artifact.
     return argp
 
 
@@ -1183,15 +1177,14 @@ def main(argv=None):
     vloc_progress.finish()
 
     vnl_setup = None
-    soc_flag = {"auto": None, "true": True, "false": False}[args.soc]
     if pseudos:
         print0("Building unified V_NL setup...")
-        # ``soc`` decides which PROJECTORS get built — j-resolved (spin-orbit)
-        # or j-averaged (scalar-relativistic).  It is upstream of the
-        # projector contraction and does not touch it.  ``None`` means the
-        # caller did not declare, in which case ``resolve_soc_mode`` looks for
-        # QE's <spinorbit> and, failing that, announces the assumption instead
-        # of taking it silently.
+        # Which PROJECTORS get built — j-resolved (spin-orbit) or j-averaged
+        # (scalar-relativistic) — is resolved automatically inside
+        # ``build_vnl_setup``: QE's <spinorbit> when the structure came from
+        # a .save, nspinor=1 by force, and otherwise MEASURED against the
+        # wavefunctions (see psp.vnl_ops.measure_soc_mode).  The choice is
+        # upstream of the projector contraction and does not touch it.
         vnl_progress = LoopProgress(
             1, report.progress, title="nonlocal projector construction",
             item_name="projector setup")
@@ -1203,7 +1196,6 @@ def main(argv=None):
                 meta,
                 pseudos,
                 nspinor=int(wfn.nspinor),
-                soc=soc_flag,
                 print_fn=print0,
             )
         vnl_progress.step()
@@ -1216,15 +1208,14 @@ def main(argv=None):
         "folded into kin_ion (legacy compatibility)" if folded else
         "stored separately as v_hartree" if args.hartree else
         "absent; the GW driver must use its ISDF Hartree route")
-    resolved_soc = ("on" if bool(vnl_setup.soc) else "off") \
-        if vnl_setup is not None else "off (no projector setup)"
+    resolved_soc = (vnl_setup.soc_provenance if vnl_setup is not None
+                    else "none (no projector setup)")
     report.pathways((
         "Mean-field H0  : T + V_loc + V_NL",
         f"Hartree V_H    : {hartree_text}",
         "Coulomb system : " + ("2D slab truncation" if ctx.truncation_2d
                                 else "3D bulk periodic"),
-        "SOC projectors : " + policy(args.soc, ("auto", "true", "false"))
-        + f" -> {resolved_soc}",
+        f"SOC projectors : {resolved_soc}",
         f"k-space compute: {nk_irr} star-wedge points; "
         f"{int(sym.nk_tot)} full-BZ points reconstructed on read",
         "k-space storage: " + ("star wedge" if store_ibz else
@@ -1372,12 +1363,13 @@ def main(argv=None):
     # another k's eigenvalues.  The full-BZ table is the wedge's star
     # broadcast and carries no independent information.
     #
-    # This is the detector that needs NO metadata.  A BerkeleyGW WFN.h5
-    # records ``nspinor`` and not ``lspinorb``, so when the deck does not
-    # declare and there is no QE .save, the flag-based check in
-    # ``resolve_soc_mode`` can only announce an assumption — this one can
-    # still MEASURE whether the assumption was wrong, by asking whether
-    # T+V_loc+V_NL splits a manifold that ``el`` holds degenerate.
+    # This is the detector that needs NO metadata.  The V_NL builder now
+    # resolves j-resolved vs j-averaged the same way up front
+    # (``psp.vnl_ops.measure_soc_mode``, a few multiplet blocks of V_NL
+    # alone); this post-hoc pass is the independent full-operator twin —
+    # every k in the wedge, every band, T+V_loc+V_NL rather than V_NL —
+    # so a wrong selection, a broken WFN/UPF pairing, or any OTHER
+    # symmetry defect of the assembled matrix still gets caught here.
     if rank == 0 and kin_ion_irr is not None:
         from psp.operator_checks import check_degeneracy_consistency
         _en = np.asarray(wfn.energies)
@@ -1467,11 +1459,16 @@ def main(argv=None):
                 # noncollinear is not spin-orbit, and a file written with
                 # j-resolved projectors against a lspinorb=.false. WFN is
                 # indistinguishable from a correct one by every other attr
-                # here.  ``soc_requested`` records what the caller asked for,
-                # ``soc`` what was actually built.
+                # here.  ``soc`` records what was actually built (the
+                # automatically resolved — possibly MEASURED — mode);
+                # ``soc_provenance`` says how it was decided, numbers
+                # included.  There is no requested value to stamp: the
+                # resolution takes no user input.
                 ds.attrs["soc"] = bool(
                     vnl_setup.soc) if vnl_setup is not None else False
-                ds.attrs["soc_requested"] = args.soc
+                ds.attrs["soc_provenance"] = (
+                    vnl_setup.soc_provenance if vnl_setup is not None
+                    else "no projector setup")
                 ds.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
                 # ---- WHAT THIS FILE WAS MADE FROM -------------------------
                 # ``wfn_file`` above is a BASENAME: every WFN in the project

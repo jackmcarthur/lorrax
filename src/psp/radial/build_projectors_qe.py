@@ -1029,11 +1029,12 @@ def build_E_blocks_full(pseudo, *, soc: bool = True) -> Dict[int, np.ndarray]:
                             f"D_avg = {d_avg:.6f}); average_pp's √(D/D_avg) "
                             f"is imaginary, so this fully-relativistic "
                             f"pseudopotential cannot be j-averaged (QE's "
-                            f"average_pp would NaN identically).  got: "
-                            f"soc=False with a non-averageable FR pseudo; "
-                            f"want: soc=True with an nspinor=2 WFN, or a "
-                            f"scalar-relativistic (nc-sr) pseudopotential "
-                            f"for this element.")
+                            f"average_pp would NaN identically).  got: the "
+                            f"j-averaged operator required for a "
+                            f"non-averageable FR pseudo; "
+                            f"want: an nspinor=2 WFN (the j-resolved "
+                            f"operator), or a scalar-relativistic (nc-sr) "
+                            f"pseudopotential for this element.")
                     u = {g_minus: l * np.sqrt(d_m / d_avg) / (2.0 * l + 1.0),
                          g_plus: (l + 1.0) * np.sqrt(d_p / d_avg) / (2.0 * l + 1.0)}
                     for g_r in (g_minus, g_plus):

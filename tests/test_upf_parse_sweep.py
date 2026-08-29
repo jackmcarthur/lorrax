@@ -183,10 +183,12 @@ def test_fr_au_j_average_refuses_not_nan():
     with pytest.raises(ValueError) as ei:
         build_E_blocks_full(p, soc=False)
     msg = str(ei.value)
-    # The refusal must name the shell, both D values, and the fix.
+    # The refusal must name the shell, both D values, and the fix — and
+    # the fix must not point at soc flags, which no longer exist.
     assert "opposite-sign" in msg
     assert "-0.47" in msg and "2.58" in msg
-    assert "soc=True" in msg
+    assert "nspinor=2 WFN" in msg and "nc-sr" in msg
+    assert "soc=True" not in msg and "--soc" not in msg
     # Green twin 1: the j-RESOLVED arm of the same pseudo stays finite.
     E_res = build_E_blocks_full(p, soc=True)
     for _l, E in E_res.items():
@@ -205,9 +207,10 @@ def test_fr_mo_j_average_still_builds():
         assert np.all(np.isfinite(E))
 
 
-def test_pseudo_summary_lines_name_sr_fr_and_header_disagreement():
-    """The Pseudopotentials report block states the beta-channel verdict;
-    a header that disagrees is printed but does not win."""
+def test_pseudo_summary_lines_one_line_per_species_with_generator_tag():
+    """The Pseudopotentials report block: ONE line per species carrying
+    file, SR/FR verdict (beta channels win over a lying header), z_val,
+    NLCC, and a short generator tag when the file names one."""
     from psp.pseudos import pseudo_summary_lines
 
     sr_path = _SR_DIR / "Si.upf"
@@ -218,10 +221,17 @@ def test_pseudo_summary_lines_name_sr_fr_and_header_disagreement():
     # production load_pseudopotentials stamps the source path; _load is bare
     setattr(sr, "_source_path", str(sr_path))
     setattr(fr, "_source_path", str(fr_path))
-    text = "\n".join(pseudo_summary_lines({"Si": sr, "Au": fr}))
+    lines = pseudo_summary_lines({"Si": sr, "Au": fr})
+    assert len(lines) == 2                        # ONE line per species
+    text = "\n".join(lines)
     assert "Si.upf — scalar-relativistic" in text
     assert "Au.upf — fully-relativistic" in text
-    assert "kkbeta" in text and "NLCC" in text
+    assert "z_val 4" in text and "NLCC yes" in text
+    # generator tag from PP_INFO ("ONCVPSP ... version 3.3.0"), ≤15 chars
+    assert "(ONCVPSP-3.3.0)" in text
+    # the old two-line detail went to the chopping block, not the report
+    for gone in ("kkbeta", "mesh", "proj "):
+        assert gone not in text
     # Red twin: lie in the SR header — the betas must win, loudly.
     class _Hdr:
         pass
@@ -233,6 +243,10 @@ def test_pseudo_summary_lines_name_sr_fr_and_header_disagreement():
     forged.__dict__.update(sr.__dict__)
     forged.pp_header = hdr
     hdr.z_valence = sr.pp_header.z_valence
-    lied = "\n".join(pseudo_summary_lines({"Si": forged}))
+    lied_lines = pseudo_summary_lines({"Si": forged})
+    assert len(lied_lines) == 1                   # still one line
+    lied = lied_lines[0]
     assert "scalar-relativistic" in lied          # betas' verdict
     assert "beta channels win" in lied            # the disagreement is named
+    # forged header has no `generated`; PP_INFO still resolves the tag
+    assert "(ONCVPSP-3.3.0)" in lied
