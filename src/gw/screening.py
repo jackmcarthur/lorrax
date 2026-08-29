@@ -143,7 +143,14 @@ _FORCE_FULL_BZ_ANNOUNCED = False
 
 
 def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
-    """Refuse broken-TR RPA until control flow selects an ordered kernel."""
+    """Refuse broken-TR RPA until control flow selects an ordered kernel.
+
+    The replacement branch must consume the ordered complex-quadrature plan
+    directly through ``precompile_chi0_contour`` / ``compute_chi0_contour``.
+    Executing that kernel is the receipt; a flag attached to an ordinary
+    quadrature is not.  It returns the existing single ``probe`` role at
+    ``+i*xi``; the fit constructs ``-i*xi`` by q-negated transpose.
+    """
     if not bool(trs_allowed):
         raise RuntimeError(
             "GATE gn_ppm_ordered_probe_producer: measured broken TR requires "
@@ -153,6 +160,26 @@ def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
             "claimed ordered response.  Merge the producer branch whose "
             "control flow executes the ordered kernel; a metadata stamp on "
             "this quadrature is not evidence that it did so.")
+
+
+def _assert_broken_tr_dynamic_model_supported(
+    mode: ComputeMode,
+    *,
+    trs_allowed,
+) -> None:
+    """Reject dynamic screening models that identify both pole residues."""
+    if trs_allowed is None or bool(trs_allowed):
+        return
+    if mode is ComputeMode.HL_PPM:
+        raise RuntimeError(
+            "GATE hl_ppm_broken_tr_response: measured broken TR requires "
+            "distinct positive- and negative-frequency pole residues, but "
+            "HL-PPM currently stores one residue for both poles.")
+    if mode is ComputeMode.MPA:
+        raise RuntimeError(
+            "GATE mpa_broken_tr_response: measured broken TR requires "
+            "distinct positive- and negative-frequency pole residues, but "
+            "the current MPA model is explicitly even in frequency.")
 
 
 def compute_static_w(
@@ -836,6 +863,9 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if not static_only:
+        _assert_broken_tr_dynamic_model_supported(
+            mode, trs_allowed=getattr(sym, "trs_allowed", None))
     if mode is ComputeMode.MPA:
         if static_only:
             return {}

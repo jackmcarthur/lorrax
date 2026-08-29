@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
+from gw.gw_config import ComputeMode, ScreeningDiagrams
 from gw.minimax_screening import (
     fit_gn_ppm_from_wc_pair,
 )
@@ -11,6 +14,7 @@ from gw.ppm_sigma import _residue_for_space
 from gw.screening import (
     ScreeningRequest,
     _assert_imaginary_probe_supported,
+    compute_screening_model,
     _gate_w,
 )
 
@@ -182,6 +186,33 @@ def test_broken_tr_probe_gate_keeps_q_reciprocity_not_fixed_q_hermiticity(
         frequency_odd_response=True,
     )
     assert calls == ["finite", "hermitian", "q_reciprocity"]
+
+
+def test_dynamic_one_residue_models_refuse_measured_broken_tr():
+    config = SimpleNamespace(
+        screening=SimpleNamespace(diagrams=ScreeningDiagrams.W_RPA))
+    common = dict(
+        quad=None,
+        e_ref=0.0,
+        sym=SimpleNamespace(trs_allowed=False),
+        centroid_indices=None,
+        config=config,
+        meta=None,
+        mesh_xy=None,
+        run_dir="",
+        label="test",
+    )
+
+    for mode, gate in (
+        (ComputeMode.HL_PPM, "hl_ppm_broken_tr_response"),
+        (ComputeMode.MPA, "mpa_broken_tr_response"),
+    ):
+        with np.testing.assert_raises_regex(RuntimeError, gate):
+            compute_screening_model(mode, None, None, **common)
+
+    # Static screening has no positive/negative-frequency residue pair.
+    assert compute_screening_model(
+        ComputeMode.MPA, None, None, static_only=True, **common) == {}
 
 
 def test_resolvent_probe_gate_obeys_the_same_ordered_response_policy(
