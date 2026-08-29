@@ -242,6 +242,16 @@ def solve_fixed_time_weights(
     log_peak = np.max(exponent.real, axis=0)
     atoms = np.exp(exponent - log_peak[None, :])
     gauge = np.exp(-log_peak)
+    # Entries far below a column's peak are honest zeros of that atom: the
+    # exponent is the dimensionless t*d product, and a deep Laplace node
+    # evaluated across the whole support decays hundreds of e-foldings.
+    # Flushing them perturbs any fitted Q(d) by at most
+    # flush * sum|weights| — the amplification this module already
+    # reports — so at healthy amplification the change sits ~1e-12 of
+    # scale, far under every certificate. The flush is deliberate here
+    # rather than left to the solver, whose own silent 1e-9 drop
+    # threshold is NOT harmless at tight certificates.
+    atoms[np.abs(atoms) < 1.0e-12] = 0.0
     # The raw atom columns are numerically near-collinear with entries
     # spanning tens of orders of magnitude; HiGHS loses its basis
     # factorization on them at any row scaling (dual simplex ends "Not
