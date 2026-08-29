@@ -202,6 +202,69 @@ def test_complex_contour_matches_direct_k_minus_q_sum(monkeypatch):
             psi, enk, slices, tau, alpha, wrong_time=True))) > 1e-3
 
 
+def test_ordered_contour_uses_transposed_negative_q_orientation(monkeypatch):
+    """An exact equal-gap case separates q-pairing from conjugation."""
+    import common.fft_helpers as fft_helpers
+
+    monkeypatch.setattr(
+        fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    nk, nb, ns, nmu = 3, 2, 1, 4
+    psi = np.empty((nk, nb, ns, nmu), dtype=np.complex128)
+    for k in range(nk):
+        for band in range(nb):
+            for mu in range(nmu):
+                psi[k, band, 0, mu] = (
+                    0.31 + 0.17 * k + 0.13 * band + 0.07 * mu
+                    + 1j * (
+                        0.19 + 0.11 * k * (mu + 1)
+                        - 0.05 * band + 0.03 * mu * mu))
+    enk = np.broadcast_to(np.asarray([-0.5, 0.5]), (nk, nb)).copy()
+    slices = BandSlices.from_band_edges(0, 0, 1, 2, 2)
+    wfns = Wavefunctions(
+        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
+        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
+        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
+        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        enk=_put(enk, mesh, P(None, None)),
+        occ=_put(np.asarray([[1.0, 0.0]] * nk), mesh, P(None, None)),
+        slices=slices,
+    )
+    z = 0.7j
+    tau = np.asarray([0.0j, 0.0j])
+    signs = np.asarray([1, -1], dtype=np.int8)
+    weight_rows = np.asarray([
+        [1.0 / (1.0 - z), 0.0],
+        [0.0, 1.0 / (1.0 + z)],
+    ])
+    meta = SimpleNamespace(nkx=nk, nky=1, nkz=1)
+    got = np.asarray(jax.device_get(
+        w_isdf.compute_chi0_contour_ordered(
+            wfns, tau, weight_rows, signs, np.asarray([z, z]),
+            meta, mesh)))
+
+    carrier = np.zeros((nk, nmu, nmu), dtype=np.complex128)
+    for q in range(nk):
+        for k in range(nk):
+            kmq = (k - q) % nk
+            transition = (
+                np.conj(psi[kmq, 1, 0]) * psi[k, 0, 0])
+            carrier[q] += np.outer(transition, np.conj(transition))
+    carrier /= np.sqrt(float(nk))
+    q_neg = np.asarray([0, 2, 1])
+    paired = np.swapaxes(carrier[q_neg], -1, -2)
+    want = -carrier / (1.0 - z) - paired / (1.0 + z)
+    np.testing.assert_allclose(got, want, rtol=3.0e-13, atol=3.0e-13)
+
+    wrong_same_q = -carrier / (1.0 - z) - carrier / (1.0 + z)
+    reverse_forward = -carrier / (1.0 + z)
+    wrong_adjoint = -carrier / (1.0 - z) + np.conj(
+        np.swapaxes(reverse_forward[q_neg], -1, -2))
+    scale = np.max(np.abs(want))
+    assert np.max(np.abs(want - wrong_same_q)) / scale > 1.0e-2
+    assert np.max(np.abs(want - wrong_adjoint)) / scale > 1.0e-2
+
+
 def test_contour_rows_encode_both_resolvent_signs():
     tau0 = 0.37 + 0.11j
     tau = np.array([tau0, tau0])

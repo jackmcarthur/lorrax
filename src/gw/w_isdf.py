@@ -2342,14 +2342,8 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
     kernel.lower(*args).compile()
 
 
-def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
-                             E_gap):
-    """Complete contour weights for both independent-particle resolvents.
-
-    ``frequency_sign=+1`` represents ``-1/(Delta-z)`` and ``-1`` represents
-    ``-1/(Delta+z)``.  The device kernel evolves ``Delta-E_gap``, so this
-    host-side coefficient supplies the omitted gap and requested frequency.
-    """
+def _chi0_contour_inputs(tau, weight_rows, frequency_sign, z_values):
+    """Normalize and validate the raw complex-contour arrays."""
     tau = np.asarray(tau, dtype=np.complex128)
     weight_rows = np.asarray(weight_rows, dtype=np.complex128)
     frequency_sign = np.asarray(frequency_sign)
@@ -2362,9 +2356,56 @@ def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
             "weight_rows (n_out,L)")
     if not np.all(np.isin(frequency_sign, (-1, 1))):
         raise ValueError("chi0 contour frequency_sign must contain only +/-1")
+    if (not np.all(np.isfinite(tau))
+            or not np.all(np.isfinite(weight_rows))
+            or not np.all(np.isfinite(z_values))):
+        raise ValueError("chi0 contour arrays must be finite")
+    return tau, weight_rows, frequency_sign, z_values
+
+
+def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
+                             E_gap):
+    """Complete contour weights for both independent-particle resolvents.
+
+    ``frequency_sign=+1`` represents ``-1/(Delta-z)`` and ``-1`` represents
+    ``-1/(Delta+z)``.  The device kernel evolves ``Delta-E_gap``, so this
+    host-side coefficient supplies the omitted gap and requested frequency.
+    """
+    tau, weight_rows, frequency_sign, z_values = _chi0_contour_inputs(
+        tau, weight_rows, frequency_sign, z_values)
     exponent = -tau[None, :] * (
         float(E_gap) - frequency_sign[None, :] * z_values[:, None])
     return -weight_rows * np.exp(exponent)
+
+
+def _ordered_chi0_contour_inputs(
+    tau, weight_rows, frequency_sign, z_values,
+):
+    """Validate the two transition orientations of one ordered response."""
+    tau, weight_rows, frequency_sign, z_values = _chi0_contour_inputs(
+        tau, weight_rows, frequency_sign, z_values)
+    if weight_rows.shape[0] != 2:
+        raise ValueError(
+            "ordered chi0 contour requires exactly two weight rows")
+    positive = frequency_sign == 1
+    negative = frequency_sign == -1
+    if not np.any(positive) or not np.any(negative):
+        raise ValueError(
+            "ordered chi0 contour requires both frequency signs")
+    if z_values[0] != z_values[1]:
+        raise ValueError(
+            "ordered chi0 contour rows must evaluate the same frequency")
+    if (np.any(weight_rows[0, negative] != 0.0)
+            or np.any(weight_rows[1, positive] != 0.0)):
+        raise ValueError(
+            "ordered chi0 contour row 0 must contain only +frequency "
+            "weights and row 1 only -frequency weights")
+    if (not np.any(weight_rows[0, positive] != 0.0)
+            or not np.any(weight_rows[1, negative] != 0.0)):
+        raise ValueError(
+            "ordered chi0 contour requires a nonzero weight in each "
+            "frequency orientation")
+    return tau, weight_rows, frequency_sign, z_values
 
 
 def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
@@ -2429,7 +2470,51 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
     kernel.lower(*args).compile()
 
 
+def compute_chi0_contour_ordered(
+    wfns, tau, weight_rows, frequency_sign, z_values, meta, mesh_xy, *,
+    energy_reference=0.0,
+):
+    r"""Evaluate an ordered complex-frequency independent-particle response.
 
+    Row 0 contains only the ``1/(z-Delta)`` transition orientation and row 1
+    only the ``-1/(z+Delta)`` orientation, both at the same ``z``.  The
+    contour kernel evaluates both rows in one shared node sweep.  The second
+    endpoint orientation is then supplied by the symmetry service:
+
+    .. math::
+
+        \chi^0_q(z) = F^+_q(z) + F^-_{-q}(z)^T.
+
+    The transpose has no conjugation.  Both input pieces and the result keep
+    the contour kernel's canonical all-process ``P(None, 'x', 'y')`` layout.
+    """
+    tau, weight_rows, frequency_sign, z_values = (
+        _ordered_chi0_contour_inputs(
+            tau, weight_rows, frequency_sign, z_values))
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import q_negation_index, q_pair_transpose
+
+    forward, reverse_forward = compute_chi0_contour(
+        wfns, tau, weight_rows, frequency_sign, z_values,
+        meta, mesh_xy, energy_reference=energy_reference)
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    reverse = q_pair_transpose(
+        reverse_forward, q_negation_index(kgrid))
+    return forward + reverse
+
+
+def precompile_chi0_contour_ordered(
+    wfns, tau, weight_rows, frequency_sign, z_values, meta, mesh_xy, *,
+    energy_reference=None,
+):
+    """AOT-compile the shared two-output contour sweep of the ordered path."""
+    tau, weight_rows, frequency_sign, z_values = (
+        _ordered_chi0_contour_inputs(
+            tau, weight_rows, frequency_sign, z_values))
+    precompile_chi0_contour(
+        wfns, tau, weight_rows, frequency_sign, z_values,
+        meta, mesh_xy, energy_reference=energy_reference)
 
 def _occupation_support_slices(
         occupations,

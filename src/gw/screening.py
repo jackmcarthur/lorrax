@@ -146,7 +146,8 @@ def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
     """Refuse broken-TR RPA until control flow selects an ordered kernel.
 
     The replacement branch must consume the ordered complex-quadrature plan
-    directly through ``precompile_chi0_contour`` / ``compute_chi0_contour``.
+    directly through ``precompile_chi0_contour_ordered`` /
+    ``compute_chi0_contour_ordered``.
     Executing that kernel is the receipt; a flag attached to an ordinary
     quadrature is not.  It returns the existing single ``probe`` role at
     ``+i*xi``; the fit constructs ``-i*xi`` by q-negated transpose.
@@ -157,9 +158,10 @@ def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
             "the ordered complex-minimax response producer.  This ordinary "
             "RPA branch still selects the historical frequency-even chi0 "
             "kernel, which would force R_+=R_- while the downstream fit "
-            "claimed ordered response.  Merge the producer branch whose "
-            "control flow executes the ordered kernel; a metadata stamp on "
-            "this quadrature is not evidence that it did so.")
+            "claimed ordered response.  Supply both orientation-resolved "
+            "contour weight rows and execute compute_chi0_contour_ordered; "
+            "a metadata stamp on an ordinary quadrature is not evidence "
+            "that it did so.")
 
 
 def _assert_broken_tr_dynamic_model_supported(
