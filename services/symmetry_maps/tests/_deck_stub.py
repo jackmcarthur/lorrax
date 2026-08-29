@@ -23,10 +23,10 @@ four decks' ``(irr_idx_k, sym_idx_k)`` bit-compared against
 ``data/star_tables_e9340d1.json`` — is a property of ``symmetry_maps``
 alone and not of the loader that usually feeds it.
 
-``trs_holds=True`` IS PINNED, NOT DEFAULTED.  ``SymMaps`` falls back to the
-permissive ``True`` for any object carrying no verdict, so a stub that
-simply omitted the attribute would get the same tables while asserting
-nothing about them.  MEASURED 2026-08-07 on all four in-tree decks:
+``trs_holds=True`` IS PINNED, NOT DEFAULTED.  ``SymMaps`` disables
+antiunitary rows for an object carrying no verdict, so omitting the attribute
+would ask a different physics question.  MEASURED 2026-08-07 on all four
+in-tree decks:
 ``density_symmetry_check`` returns TRS=HOLDS, so ``WfnLoader`` sets
 ``trs_holds=True`` and ``SymMaps.trs_allowed`` is True on every one of
 them.  The stub states that measurement rather than inheriting a default;

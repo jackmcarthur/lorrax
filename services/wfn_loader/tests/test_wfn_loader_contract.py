@@ -1143,6 +1143,9 @@ def test_a_scalar_wfn_unfolds_to_the_full_bz_with_no_spinor_factor(
         assert not np.any(np.abs(loader.translations) > 1e-12), (
             "PRECONDITION: this deck must be symmorphic for the exact "
             "comparison below (a live τ-phase would need a tolerance)")
+        # This deliberately synthetic scalar fixture disables the physical
+        # density check but explicitly tests the antiunitary unfold.
+        loader.trs_holds = True
         sym = loader._ensure_sym()
         n_tran = int(sym.sym_matrices.shape[0])
         rows = sorted({int(s) for s in sym.sym_idx_k})
@@ -1190,6 +1193,8 @@ def test_the_device_spinor_table_is_1x1_on_a_scalar_wfn(
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
 
     with WfnLoader(path, backend="eager", mesh=mesh) as loader:
+        # Same explicit test provenance as the eager antiunitary arm above.
+        loader.trs_holds = True
         static = loader._ensure_phdf5_static()
         U = np.asarray(static["U_per_full"])
         assert U.shape[1:] == (1, 1), (

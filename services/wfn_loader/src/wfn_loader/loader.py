@@ -380,10 +380,10 @@ class WfnLoader:
         # ±-closed k-subsample — order a second
         # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
         # — cached per (file, mtime, size) for the process.
-        # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
-        # warning.
+        # ``LORRAX_TRS_CHECK=0`` opts out and leaves the verdict unmeasured;
+        # ``=strict`` raises instead of warning.
         self.density_symmetry = None
-        self.trs_holds = True
+        self.trs_holds: bool | None = None
         self._run_density_symmetry_check()
 
     # ------------------------------------------------------------------
@@ -500,7 +500,7 @@ class WfnLoader:
         if report is None:
             return
         self.density_symmetry = report
-        self.trs_holds = bool(report.trs_holds)
+        self.trs_holds = report.trs_holds
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -732,9 +732,9 @@ class WfnLoader:
             fft_grid=self.fft_grid,
             # MEASURED (not inferred) time-reversal verdict — see
             # ``_run_density_symmetry_check``.  ``SymMaps`` refuses to
-            # select time-reversal rows when this is False, whatever the
-            # ``ntran``/k-weight flags imply.
-            trs_holds=bool(getattr(self, "trs_holds", True)),
+            # select time-reversal rows when this is False or None, whatever
+            # the ``ntran``/k-weight flags imply.
+            trs_holds=getattr(self, "trs_holds", None),
         )
 
     def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:

@@ -200,6 +200,10 @@ class _StubMeta:
     nk_tot = 1
 
 
+class _StubSym:
+    trs_allowed = True
+
+
 def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
         monkeypatch):
     """Wires test 2's harness shape onto the REAL ``compute_screening`` loop.
@@ -240,7 +244,7 @@ def test_compute_screening_spills_an_earlier_role_before_a_later_roles_build(
 
     result = screening.compute_screening(
         wfns=None, V_q=None, requests=requests,
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0, sym=_StubSym(), centroid_indices=None,
         config=_StubConfig(), meta=_StubMeta(), mesh_xy=None,
         print_fn=lambda *a, **k: None)
 
@@ -277,7 +281,7 @@ def test_a_single_role_scheme_never_spills(monkeypatch):
 
     result = screening.compute_screening(
         wfns=None, V_q=None, requests=[ScreeningRequest(0.0 + 0.0j, "static")],
-        quad=None, e_ref=0.0, sym=None, centroid_indices=None,
+        quad=None, e_ref=0.0, sym=_StubSym(), centroid_indices=None,
         config=_StubConfig(), meta=_StubMeta(), mesh_xy=None,
         print_fn=lambda *a, **k: None)
 

@@ -628,9 +628,9 @@ def compute_screening(
     from common.progress import LoopProgress
 
     W_by_role: dict[str, jax.Array] = {}
-    # Production SymMaps always carries the measured density verdict.  The
-    # default is only for small orchestration fixtures that pass ``sym=None``.
-    trs_allowed = bool(getattr(sym, "trs_allowed", True))
+    # Production SymMaps carries the retained TRS verdict.  Missing fixture
+    # metadata cannot authorize the reciprocal/TRS response branch.
+    trs_allowed = bool(getattr(sym, "trs_allowed", False))
     # X_ONLY declares no screening requests — return before any cadence
     # print.  A Started/Finished "screening (chi0 -> W)" pair around zero
     # work is an observable that does not discriminate (QUALITY_PATTERNS

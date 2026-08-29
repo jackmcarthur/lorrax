@@ -8,7 +8,8 @@ that measurement has to get right:
 1. it must not cry wolf on a real, nonmagnetic, symmetric deck;
 2. it must catch a manifestly TRS-broken occupied manifold; and
 3. when it does, ``SymMaps`` must structurally refuse to select a
-   time-reversal row.
+   time-reversal row; and
+4. a disabled or failed measurement must remain unmeasured, not become TRS.
 
 The synthetic decks are built here rather than captured so the physics
 under test (Kramers pairing vs an unpaired spin-polarised manifold) is
@@ -302,15 +303,47 @@ def test_symmaps_gate_refuses_trs_rows_for_a_magnetic_deck(tmp_path):
     assert int(np.max(sym.sym_idx_q)) < ntran
 
 
-def test_check_is_a_no_op_when_disabled(tmp_path, monkeypatch):
+def test_disabled_check_leaves_trs_unmeasured(tmp_path, monkeypatch):
     path = _kramers_deck(tmp_path, magnetic=True)
     monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
     assert trs_check_mode() == "off"
     loader = WfnLoader(path)
     assert loader.density_symmetry is None
-    assert loader.trs_holds is True          # permissive, historical behaviour
+    assert loader.trs_holds is None
     sym = loader._ensure_sym()
-    assert sym.trs_allowed is True
+    assert sym.trs_allowed is False
+
+
+def test_check_failure_does_not_authorize_trs(tmp_path, monkeypatch):
+    import symmetry_maps.density_symmetry_check as density_check
+
+    path = _kramers_deck(tmp_path, magnetic=True)
+
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError("injected density-check failure")
+
+    monkeypatch.setattr(density_check, "check_density_symmetries", _fail)
+    with pytest.warns(RuntimeWarning, match="failed to run"):
+        loader = WfnLoader(path)
+    assert loader.density_symmetry.trs_basis == "skipped"
+    assert loader.density_symmetry.trs_holds is None
+    assert loader.trs_holds is None
+    assert loader._ensure_sym().trs_allowed is False
+
+
+def test_mesh_trs_provenance_requires_exact_coverage():
+    from symmetry_maps.density_symmetry_check import _mesh_needs_trs
+
+    grid = np.array([4, 1, 1], dtype=np.int64)
+    identity = np.eye(3, dtype=np.int64)[None]
+    full = np.array([[0, 0, 0], [1, 0, 0],
+                     [2, 0, 0], [3, 0, 0]], dtype=np.int64)
+    folded = full[:3]
+    incomplete = full[1:2]
+
+    assert _mesh_needs_trs(full, identity, grid) is False
+    assert _mesh_needs_trs(folded, identity, grid) is True
+    assert _mesh_needs_trs(incomplete, identity, grid) is None
 
 
 def test_strict_mode_raises_on_a_broken_deck(tmp_path, monkeypatch):

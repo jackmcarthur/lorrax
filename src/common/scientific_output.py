@@ -306,14 +306,16 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"spatial operations tested; max residual {max_res}")
         mesh_implies = ("unknown" if receipt.trs_implied_by_mesh is None else
                         "yes" if receipt.trs_implied_by_mesh else "no")
+        trs_state = ("UNMEASURED" if receipt.trs_holds is None else
+                     "HOLDS" if receipt.trs_holds else "BROKEN")
         lines.append(
-            f"Time reversal  : {'HOLDS' if receipt.trs_holds else 'BROKEN'} "
+            f"Time reversal  : {trs_state} "
             f"({receipt.trs_basis}; |m|/|rho|={m_rel}; "
             f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
             f"mesh requires it={mesh_implies})")
         lines.append(
             f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-            "from the measured density verdict")
+            "from the retained TRS verdict")
 
     display_tau = clean_rounded(tau, digits=TAU_DIGITS)
     for i, (rotation, shift) in enumerate(

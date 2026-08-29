@@ -1949,11 +1949,12 @@ class SymMaps:
             allow_trs: whether time-reversal rows of ``sym_mats_k`` may be
                 SELECTED when mapping the full BZ onto the IBZ.  ``None``
                 (default) takes the value from ``wfn.trs_holds`` — the
-                MEASURED verdict that ``WfnLoader`` obtains by building
+                verdict that ``WfnLoader`` obtains by building
                 the spin-resolved density from the raw IBZ wavefunctions
-                (``density_symmetry_check``) — falling back to
-                ``True`` (the historical, permissive behaviour) for
-                wfn-shaped objects that carry no verdict.
+                (``density_symmetry_check``).  A missing or unmeasured
+                verdict disables time-reversal rows; callers that possess
+                independent provenance may opt in explicitly with
+                ``allow_trs=True``.
 
                 When False, ``sym_mats_k`` keeps its ``2·ntran`` length
                 (``unfold_psi`` hard-requires that shape — §Q) but the
@@ -1964,12 +1965,12 @@ class SymMaps:
                 TRS-reduced mesh therefore fails loudly instead of
                 silently returning iσ_y·conj(ψ).
         """
-        # Measured-TRS gate.  ``allow_trs=None`` → consult the wfn object;
-        # objects with no verdict (legacy WFNReader, hand-built stubs) get
-        # the permissive default so this is a pure no-op for them.
+        # TRS gate.  ``allow_trs=None`` consults the wfn object.  Physical
+        # symmetry is fail-closed: absence of a verdict cannot authorize an
+        # antiunitary row.
         if allow_trs is None:
             allow_trs = getattr(wfn, 'trs_holds', None)
-        self.trs_allowed = True if allow_trs is None else bool(allow_trs)
+        self.trs_allowed = (False if allow_trs is None else bool(allow_trs))
 
         # get symmetry matrices from wfn file
         try:
@@ -2167,13 +2168,16 @@ class SymMaps:
             else self.sym_mats_k[:wfn.ntran])
         if not self.trs_allowed:
             import warnings as _warnings
+            trs_reason = (
+                "time-reversal symmetry has not been established for this "
+                "WFN" if allow_trs is None else
+                "the supplied time-reversal verdict disables antiunitary "
+                "symmetry for this WFN")
             _warnings.warn(
-                "SymMaps: the measured charge density says TIME-REVERSAL "
-                "SYMMETRY IS BROKEN for this WFN, so the time-reversal rows "
-                "of sym_mats_k will not be used to map the full BZ. If this "
-                "file's IBZ was reduced using time reversal the mapping "
-                "below will fail loudly — which is the correct outcome: a "
-                "TRS-reduced mesh for a magnetic system is not physical.",
+                f"SymMaps: {trs_reason}, so the time-reversal rows of "
+                "sym_mats_k will not be used to map the full BZ. If this "
+                "file's IBZ requires time reversal, the mapping below will "
+                "refuse rather than infer the missing physical symmetry.",
                 RuntimeWarning)
 
         # The list of full-zone k-points.  The k_full -> k_irr PARENT MAP
@@ -2431,8 +2435,8 @@ class SymMaps:
         ntran = len(self.sym_matrices)
         # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3).
         # Searches ``_sym_mats_k_search`` — the full TRS-augmented table
-        # unless the measured density says TRS is broken, in which case
-        # only the spatial half is eligible.
+        # unless TRS is broken or unmeasured, in which case only the spatial
+        # half is eligible.
         Skbar = np.einsum('ijk,lk->lij', self._sym_mats_k_search, wfn.kpoints)
         Skbar = self._wrap_to_bz(Skbar)
 
@@ -2453,14 +2457,12 @@ class SymMaps:
             raise ValueError(
                 f"SymMaps: {n_bad} of {full_kpts.shape[0]} full-BZ k-points "
                 f"cannot be reached from the IBZ using the SPATIAL symmetry "
-                f"operations alone, and the measured charge density says "
-                f"time-reversal symmetry is BROKEN for these wavefunctions "
-                f"(magnetization density above tolerance), so the "
-                f"time-reversal rows must not be used. This WFN's k-mesh was "
-                f"reduced with an assumption its own wavefunctions "
-                f"contradict; regenerate it with `noinv=.true.` (or fix the "
-                f"magnetic ground state). Set LORRAX_TRS_CHECK=0 to restore "
-                f"the old flags-only behaviour at your own risk."
+                f"operations alone, while time-reversal symmetry is broken "
+                f"or has not been established for these wavefunctions. "
+                f"Antiunitary rows therefore cannot complete this mesh. If "
+                f"TRS is broken, regenerate the WFN with `noinv=.true.`; if "
+                f"it is unmeasured, run the density check or pass "
+                f"allow_trs=True only with independent provenance."
             )
 
         # INHERITED FROM create_kpoint_symmetry_map, not new (design

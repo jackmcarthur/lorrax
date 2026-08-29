@@ -289,13 +289,14 @@ class DensitySymmetryReport:
     """Outcome of the load-time density symmetry measurement."""
 
     # --- the headline -------------------------------------------------
-    trs_holds: bool
+    trs_holds: bool | None
     #: How ``trs_holds`` was established:
     #: ``'measured'``      — ± k-pairs were present and ‖m‖ was measured
     #: ``'spin-degenerate'`` — nspin=1, nspinor=1: no magnetization exists
-    #: ``'unmeasurable'``  — no ± k-pair in the file (TRS-folded IBZ);
-    #:                       verdict defaults to True, see module docstring
-    #: ``'skipped'``       — check disabled or it failed to run
+    #: ``'unmeasurable'``  — no ± k-pair in the file; ``True`` only when
+    #:                       spatial plus antiunitary stars exactly complete
+    #:                       the stored uniform mesh, otherwise ``None``
+    #: ``'skipped'``       — check failed to run; verdict is ``None``
     trs_basis: str
     #: ‖Σ_pair w·m‖∞ / ‖ρ‖∞, maximised over ± pairs.  None if not measured.
     m_rel: float | None
@@ -307,8 +308,10 @@ class DensitySymmetryReport:
     #: THE FLAG SIDE of the comparison: True when the file's k list
     #: cannot generate its own ``kgrid`` using the stored SPATIAL
     #: operations alone, i.e. the mesh was reduced assuming time
-    #: reversal.  ``trs_implied_by_mesh and not trs_holds`` is a
-    #: flags-vs-measurement disagreement and is escalated loudly.
+    #: reversal.  False means spatial rows suffice; None means neither the
+    #: spatial nor spatial-plus-TR star completes the declared mesh.
+    #: ``trs_implied_by_mesh and not trs_holds`` is a flags-vs-measurement
+    #: disagreement and is escalated loudly.
     trs_implied_by_mesh: bool | None
 
     # --- spatial table ------------------------------------------------
@@ -348,7 +351,7 @@ class DensitySymmetryReport:
 
     @property
     def ok(self) -> bool:
-        return bool(self.trs_holds and self.spatial_ops_ok
+        return bool(self.trs_holds is True and self.spatial_ops_ok
                     and self.invariants_ok)
 
     def summary(self) -> str:
@@ -359,9 +362,11 @@ class DensitySymmetryReport:
                if np.isfinite(r)]
         smax = (f"{np.nanmax(self.spatial_residual):.2e}"
                 if nsp else "untested")
+        trs_state = ("UNMEASURED" if self.trs_holds is None else
+                     "HOLDS" if self.trs_holds else "BROKEN")
         return (
             f"[density-symmetry] {os.path.basename(self.path)}: "
-            f"TRS={'HOLDS' if self.trs_holds else 'BROKEN'} "
+            f"TRS={trs_state} "
             f"({self.trs_basis}, ‖m‖/‖ρ‖={m}, coverage={self.trs_coverage:.0%}, "
             f"mesh-implies-TRS={self.trs_implied_by_mesh}) "
             f"| spatial {len(nsp)}/{len(self.spatial_residual)} ops tested, "
@@ -375,7 +380,7 @@ class DensitySymmetryReport:
 
 def _skipped_report(path: str, reason: str) -> DensitySymmetryReport:
     return DensitySymmetryReport(
-        trs_holds=True, trs_basis="skipped", m_rel=None, m_rel_total=None,
+        trs_holds=None, trs_basis="skipped", m_rel=None, m_rel_total=None,
         trs_coverage=0.0, tol_trs=TOL_TRS, trs_implied_by_mesh=None,
         spatial_ops_ok=True, spatial_residual=np.zeros(0), spatial_untested=(),
         spatial_failed=(), tol_spatial=TOL_SPATIAL,
@@ -484,21 +489,29 @@ def _little_groups(kint: np.ndarray, sym_mats_k: np.ndarray,
 
 
 def _mesh_needs_trs(kint: np.ndarray, sym_mats_k: np.ndarray,
-                    kgrid: np.ndarray) -> bool:
+                    kgrid: np.ndarray) -> bool | None:
     """Does the file's k list need time reversal to cover its own kgrid?
 
     This is the *flag* side of the flags-vs-measurement comparison: it
     reads only the stored k-points, weights-free, and asks whether the
     SPATIAL star of the IBZ already fills the ``kgrid``.  A ``nosym``
-    full-BZ deck and a spatially-reduced deck both answer False; a
-    TRS-folded IBZ answers True.
+    full-BZ deck and a spatially-reduced deck both answer False.  True is
+    returned only when adjoining the corresponding ``-S`` rows completes
+    the mesh exactly; an incomplete or malformed list returns None rather
+    than being mistaken for a TRS-folded IBZ.
     """
     kgrid = np.asarray(kgrid, dtype=np.int64)
     seen: set[tuple[int, int, int]] = set()
     for S in np.asarray(sym_mats_k, dtype=np.int64):
         img = np.mod(kint @ S.T, kgrid[None, :])
         seen.update(map(tuple, img.tolist()))
-    return len(seen) < int(np.prod(kgrid))
+    n_full = int(np.prod(kgrid))
+    if len(seen) == n_full:
+        return False
+    with_trs = set(seen)
+    for row in seen:
+        with_trs.add(tuple(np.mod(-np.asarray(row, dtype=np.int64), kgrid)))
+    return True if len(with_trs) == n_full else None
 
 
 def _grid_permutation(mtrx: np.ndarray, tau_2pi: np.ndarray,
@@ -919,7 +932,7 @@ def check_density_symmetries(
         # (``_eager_build``, ``to_box``, the phdf5 tables), and there is no
         # spin axis anywhere in ``WfnLoader``.  Rather than silently
         # measure whatever happens to sit on axis 1, say so.
-        trs_holds, trs_basis = True, "unsupported"
+        trs_holds, trs_basis = None, "unsupported"
         m_rel = m_rel_total = None
         coverage = 0.0
         messages.append(
@@ -927,9 +940,8 @@ def check_density_symmetries(
             "m_z = ρ_↑ − ρ_↓, but LORRAX's WFN reader has no spin axis "
             "(coeffs axis 1 is the SPINOR axis everywhere), so the two "
             "channels are not addressable and TRS cannot be measured. "
-            "Verdict left permissive — but note a nspin=2 deck is the "
-            "MOST likely place for TRS to actually be broken, so treat "
-            "any such run as unverified.")
+            "The verdict remains unmeasured and antiunitary rows are "
+            "disabled.")
     else:
         covered_w = 0.0
         m_total = np.zeros((3,) + fft_grid, dtype=np.float64)
@@ -966,16 +978,20 @@ def check_density_symmetries(
                 covered_w += float(w_sel[int(np.flatnonzero(sel == jk)[0])])
         coverage = covered_w
         if not done:
-            trs_holds, trs_basis = True, "unmeasurable"
+            trs_holds = True if trs_implied is True else None
+            trs_basis = "unmeasurable"
             m_rel = m_rel_total = None
-            messages.append(
-                "no ± k-pair present in the file's k list"
-                + (" — consistent with an IBZ reduced using time reversal,"
-                   if trs_implied else " (unexpected: the spatial star"
-                   " already covers the kgrid),")
-                + " which QE only does when TRS is assumed and which a "
-                "TRS-broken system cannot produce; verdict defaults to "
-                "TRS holds (see module docstring)")
+            if trs_implied is True:
+                messages.append(
+                    "no ± k-pair is present, but spatial plus antiunitary "
+                    "stars exactly complete the declared kgrid; the stored "
+                    "TR-folded mesh therefore supplies the affirmative "
+                    "provenance needed to use those rows")
+            else:
+                messages.append(
+                    "no ± k-pair is present and the stored k-list does not "
+                    "have exact TR-folded-mesh provenance; the TRS verdict "
+                    "remains unmeasured and antiunitary rows are disabled")
         else:
             m_rel = pair_max / rho_scale
             m_rel_total = float(np.max(np.abs(m_total))) / rho_scale
@@ -1095,8 +1111,8 @@ def cached_density_symmetry_check(
     Returns ``None`` when the check is disabled.  Never raises unless
     ``LORRAX_TRS_CHECK=strict``: a diagnostic that can abort a production
     run on its own bugs is worse than no diagnostic, so unexpected
-    failures degrade to a warning plus the permissive (status-quo)
-    verdict.
+    failures degrade to a warning plus an unmeasured verdict, which disables
+    antiunitary rows.
 
     ``valence_density_fn`` / ``spin_degeneracy_fn`` are handed straight to
     :func:`check_density_symmetries`; see its docstring for the
@@ -1131,9 +1147,10 @@ def cached_density_symmetry_check(
             raise
         warnings.warn(
             f"density symmetry check failed to run on "
-            f"{getattr(loader, '_path', '<wfn>')}: {exc!r}. Proceeding with "
-            f"the permissive (flags-derived) symmetry treatment. Set "
-            f"LORRAX_TRS_CHECK=0 to disable this check.", RuntimeWarning)
+            f"{getattr(loader, '_path', '<wfn>')}: {exc!r}. Time reversal "
+            f"remains unmeasured and antiunitary symmetry rows are disabled."
+            f" Set LORRAX_TRS_CHECK=0 to disable this check explicitly.",
+            RuntimeWarning)
         rep = _skipped_report(getattr(loader, "_path", "<wfn>"), repr(exc))
         _CACHE[key] = rep
         return rep
