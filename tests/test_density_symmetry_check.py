@@ -331,6 +331,28 @@ def test_check_failure_does_not_authorize_trs(tmp_path, monkeypatch):
     assert loader._ensure_sym().trs_allowed is False
 
 
+def test_tr_folded_mesh_does_not_replace_a_tr_measurement(
+    tmp_path, monkeypatch,
+):
+    import symmetry_maps.density_symmetry_check as density_check
+
+    path = _kramers_deck(tmp_path, magnetic=False)
+    monkeypatch.setattr(
+        density_check, "_negation_pairs",
+        lambda kint, kgrid: np.full(len(kint), -1, dtype=np.int64))
+    monkeypatch.setattr(
+        density_check, "_mesh_needs_trs",
+        lambda kint, sym_mats_k, kgrid: True)
+
+    loader = WfnLoader(path)
+    report = loader.density_symmetry
+    assert report.trs_implied_by_mesh is True
+    assert report.trs_basis == "unmeasurable"
+    assert report.trs_holds is None
+    with pytest.warns(RuntimeWarning, match="has not been established"):
+        assert loader._ensure_sym().trs_allowed is False
+
+
 def test_mesh_trs_provenance_requires_exact_coverage():
     from symmetry_maps.density_symmetry_check import _mesh_needs_trs
 

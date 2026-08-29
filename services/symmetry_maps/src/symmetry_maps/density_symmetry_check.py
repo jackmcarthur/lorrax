@@ -293,9 +293,9 @@ class DensitySymmetryReport:
     #: How ``trs_holds`` was established:
     #: ``'measured'``      — ± k-pairs were present and ‖m‖ was measured
     #: ``'spin-degenerate'`` — nspin=1, nspinor=1: no magnetization exists
-    #: ``'unmeasurable'``  — no ± k-pair in the file; ``True`` only when
-    #:                       spatial plus antiunitary stars exactly complete
-    #:                       the stored uniform mesh, otherwise ``None``
+    #: ``'unmeasurable'``  — no ± k-pair in the file; verdict is ``None``.
+    #:                       Mesh folding is retained separately as
+    #:                       provenance and never substitutes for measurement.
     #: ``'skipped'``       — check failed to run; verdict is ``None``
     trs_basis: str
     #: ‖Σ_pair w·m‖∞ / ‖ρ‖∞, maximised over ± pairs.  None if not measured.
@@ -978,15 +978,16 @@ def check_density_symmetries(
                 covered_w += float(w_sel[int(np.flatnonzero(sel == jk)[0])])
         coverage = covered_w
         if not done:
-            trs_holds = True if trs_implied is True else None
+            trs_holds = None
             trs_basis = "unmeasurable"
             m_rel = m_rel_total = None
             if trs_implied is True:
                 messages.append(
                     "no ± k-pair is present, but spatial plus antiunitary "
-                    "stars exactly complete the declared kgrid; the stored "
-                    "TR-folded mesh therefore supplies the affirmative "
-                    "provenance needed to use those rows")
+                    "stars exactly complete the declared kgrid. This records "
+                    "that the file was TR-folded; it does not measure the "
+                    "wavefunctions' time-reversal symmetry. The verdict "
+                    "remains unmeasured and antiunitary rows are disabled")
             else:
                 messages.append(
                     "no ± k-pair is present and the stored k-list does not "
