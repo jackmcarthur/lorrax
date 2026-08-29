@@ -62,6 +62,11 @@ class ComplexTimeSearchOptions:
     growth_cap: float = 30.0
     fit_frequency_count: int = 8
     prune_trials_per_round: int = 6
+    # The certified sector rule is simple and carries an analytic bound,
+    # but it pays for the whole radial annulus whether or not the measure
+    # occupies it; disable the shortcut to let the measured fit compete on
+    # sign-definite supports too.
+    sector_shortcut: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.target_error) < 1.0:
@@ -268,9 +273,10 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
     time with refitting.  Raises when the target is not reachable within
     ``max_nodes``, naming both levers.
     """
-    sector = _sector_rule_rotated(problem, options)
-    if sector is not None and sector.node_count <= int(options.max_nodes):
-        return sector
+    if options.sector_shortcut:
+        sector = _sector_rule_rotated(problem, options)
+        if sector is not None and sector.node_count <= int(options.max_nodes):
+            return sector
 
     candidates, candidate_families = candidate_time_dictionary(problem, options)
     n_frequency = problem.frequencies.size
@@ -280,10 +286,26 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
         list(range(0, n_frequency, stride)) + [n_frequency - 1]))
 
     active = np.zeros(candidates.size, dtype=bool)
-    seed_scores = _residual_scores(
-        problem, np.empty(0, np.complex128), np.empty(0, np.complex128),
-        candidates)
-    active[int(np.argmax(seed_scores))] = True
+    growth_history: list[tuple[float, float, str, float]] = []
+    # Seeding: a short sector-like ladder along the central decaying ray
+    # when one exists (the guide's "sector nodes plus a small crossing
+    # seed"), else the shortest crossing-capable atoms.  Ties resolve by
+    # magnitude order, deterministically.
+    families_array = np.asarray(candidate_families)
+    ray_index = np.nonzero(families_array == "ray")[0]
+    if ray_index.size:
+        ray_angle = np.angle(candidates[ray_index])
+        distinct_angles = np.unique(np.round(ray_angle, 12))
+        central = distinct_angles[
+            int(np.argmin(np.abs(distinct_angles - np.median(ray_angle))))]
+        ladder = ray_index[np.abs(np.round(ray_angle, 12) - central) == 0.0]
+        ladder = ladder[np.argsort(np.abs(candidates[ladder]))]
+        seed_count = max(1, min(6, ladder.size, int(options.max_nodes) // 4))
+        picks = ladder[np.linspace(0, ladder.size - 1, seed_count).astype(int)]
+    else:
+        picks = np.argsort(np.abs(candidates))[:4]
+    for index in np.unique(picks):
+        active[int(index)] = True
 
     target = float(options.target_error)
 
@@ -300,6 +322,10 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
         return candidates[mask], weights, float(np.max(error)), error
 
     times, weights, best_error, error_by_frequency = solve_on(fit_set, active)
+    for index in np.nonzero(active)[0]:
+        growth_history.append((float(candidates[index].real),
+                               float(candidates[index].imag),
+                               candidate_families[index], best_error))
 
     exchanges_since_growth = 0
     while best_error > target:
@@ -334,6 +360,9 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
         _, chosen, solved = min(trial_rows, key=lambda row: (row[0], row[1]))
         active[chosen] = True
         times, weights, best_error, error_by_frequency = solved
+        growth_history.append((float(candidates[chosen].real),
+                               float(candidates[chosen].imag),
+                               candidate_families[chosen], best_error))
         exchanges_since_growth = 0
 
     # Prune with refitting, weakest node first; a removal survives only if
@@ -391,6 +420,7 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
         amplification=p99,
         amplification_max=peak,
         method="measured_crossing",
+        growth_history=tuple(growth_history),
     )
 
 
