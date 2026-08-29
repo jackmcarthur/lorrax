@@ -18,6 +18,8 @@ The four handle paths this replaces (all measured in LORRAX at 96a6399)::
 
     scalapack solve_lu   batched_distributed_getrf -> (LU, ipiv)
                          ipiv is P(None,('x','y')) i32, never gathered
+    cusolvermp solve_lu  batched_distributed_getrf -> opaque LU handle
+                         ipiv is P(None,('x','y')) i64, never gathered
     cusolvermp cholesky  batched_distributed_cholesky(...).raw, then the
                          CALLER rebuilding CusolverMpBatchedLowerL(raw,
                          mesh, n, mb, nb, nbatch) hundreds of lines later
@@ -143,7 +145,7 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
     A = ensure_sharding(A, NamedSharding(mesh_xy, P(None, "x", "y")))
 
     if op == "solve_lu":
-        if resolved != "scalapack":
+        if resolved not in ("scalapack", "cusolvermp"):
             raise NotImplementedError(
                 f"factor('solve_lu') has no split on backend {resolved!r}: "
                 f"its FFI entry point is the FUSED getrf+getrs "
@@ -230,9 +232,11 @@ def solve(token: FactorToken, B) -> jax.Array:
     B = ensure_sharding(B, NamedSharding(mesh, P(None, "x", "y")))
     mod = backend_module(token.backend)
 
-    if token.op == "solve_lu":                                  # scalapack
-        LU, ipiv = token._factor
-        return mod.batched_distributed_getrs(LU, ipiv, B, mesh=mesh)
+    if token.op == "solve_lu":
+        if token.backend == "scalapack":
+            LU, ipiv = token._factor
+            return mod.batched_distributed_getrs(LU, ipiv, B, mesh=mesh)
+        return mod.batched_distributed_getrs(token._factor, B, mesh=mesh)
     if token.backend == "cusolvermp":
         return mod.batched_distributed_potrs(token._factor, B, mesh=mesh)
 

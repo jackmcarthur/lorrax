@@ -82,7 +82,10 @@ def _tid(cfg, cents_T=CENTS_T, solver_kind="lu"):
 
 
 def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
-          cents_T=CENTS_T, solver_kind="lu", wfn_path=""):
+          carrier_bispinor=None,
+          cents_T=CENTS_T, solver_kind="lu", wfn_path="",
+          band_range_left=(0, 26), band_range_right=(1, 128),
+          logical_band_stop=128):
     wfn = SimpleNamespace(_filename=wfn_path, ecutwfc=30.0, ecutrho=120.0)
     meta = SimpleNamespace(
         n_rmu=(CENTS.shape[0] if n_rmu is None else int(n_rmu)),
@@ -92,10 +95,12 @@ def _prov(cfg, *, vertex_mu_L=0, n_rmu=None, transverse_identity=None,
                                    solver_kind=solver_kind)
     return gw_init._zeta_fit_provenance(
         wfn=wfn, meta=meta, cfg=cfg,
-        band_range_left=(0, 26), band_range_right=(1, 128),
+        band_range_left=band_range_left, band_range_right=band_range_right,
+        logical_band_stop=logical_band_stop,
         zeta_cutoff=30.0, zeta_vcoul_cutoff=30.0,
         write_ibz_only=True, band_norms=None,
         vertex_mu_L=vertex_mu_L,
+        carrier_bispinor=carrier_bispinor,
         transverse_identity=transverse_identity)
 
 
@@ -131,6 +136,24 @@ def _strip(prov_json, keys):
     for k in keys:
         d.pop(k, None)
     return json.dumps(d, sort_keys=True)
+
+
+def test_cri3_asymmetric_physical_ranges_exclude_the_p16_carrier_pad():
+    """Schema 2 records physics, not the mesh-dependent b4=256 carrier."""
+    cfg = _cfg(bispinor=False)
+    explicit = json.loads(_prov(
+        cfg, band_range_left=(0, 190), band_range_right=(0, 250),
+        logical_band_stop=250))
+    followed_carrier = json.loads(_prov(
+        cfg, band_range_left=(0, 190), band_range_right=(0, 256),
+        logical_band_stop=250))
+
+    assert explicit["band_range_left_logical"] == [0, 190]
+    assert explicit["band_range_right_logical"] == [0, 250]
+    assert followed_carrier["band_range_left_logical"] == [0, 190]
+    assert followed_carrier["band_range_right_logical"] == [0, 250]
+    assert 256 not in explicit["band_range_right_logical"]
+    assert 256 not in followed_carrier["band_range_right_logical"]
 
 
 _ALL3 = ("distributed_zeta_solve", "transverse_zeta_solve",
@@ -180,6 +203,85 @@ def test_matching_stamp_reused(stub_reader):
     assert gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=lambda *a: None)
 
 
+def test_pre_pair_domain_charge_stamp_refits(stub_reader):
+    """An LR-only asymmetric charge zeta is not valid for the closed domain."""
+    new = _prov(_cfg(bispinor=False))
+    old = json.loads(new)
+    old.pop("charge_pair_training_domain")
+    path = stub_reader(json.dumps(old, sort_keys=True))
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    joined = " ".join(msgs)
+    assert "charge_pair_training_domain" in joined
+
+
+def test_pair_domain_stamp_changes_only_asymmetric_charge():
+    cfg = _cfg(bispinor=False)
+    asymmetric = json.loads(_prov(cfg))
+    equal = json.loads(_prov(
+        cfg, band_range_left=(0, 26), band_range_right=(0, 26)))
+    transverse = json.loads(_prov(_cfg(bispinor=True), vertex_mu_L=1))
+    assert asymmetric["charge_pair_training_domain"] == "ordered_lr_plus_rl"
+    assert "charge_pair_training_domain" not in equal
+    assert "charge_pair_training_domain" not in transverse
+    assert asymmetric["schema"] == equal["schema"] == transverse["schema"] == 2
+
+
+def test_logical_band_ranges_are_mesh_invariant_and_physics_sensitive(
+        stub_reader):
+    """Zero pad endpoints vary with P; the explicit logical window does not."""
+    cfg = _cfg(bispinor=False)
+    p4 = _prov(cfg, band_range_left=(0, 160),
+               band_range_right=(0, 252), logical_band_stop=250)
+    p16 = _prov(cfg, band_range_left=(0, 160),
+                band_range_right=(0, 256), logical_band_stop=250)
+    physical_256 = _prov(cfg, band_range_left=(0, 160),
+                         band_range_right=(0, 256), logical_band_stop=256)
+    assert p4 == p16
+    p250 = json.loads(p16)
+    p256 = json.loads(physical_256)
+    assert p250["band_range_right_logical"] == [0, 250]
+    assert p256["band_range_right_logical"] == [0, 256]
+    assert "band_range_right" not in p250
+    assert physical_256 != p16
+    path = stub_reader(p4)
+    assert gw_init._zeta_reuse_ok(path, p16, CENTS,
+                                  print_fn=lambda *a: None)
+
+
+def test_legacy_same_padding_cannot_prove_logical_stop(stub_reader):
+    """[0,256] in schema 1 is ambiguous between logical 250 and 256."""
+    new = _prov(_cfg(bispinor=False), band_range_left=(0, 160),
+                band_range_right=(0, 256), logical_band_stop=250)
+    legacy = json.loads(new)
+    legacy["schema"] = 1
+    legacy["band_range_left"] = legacy.pop("band_range_left_logical")
+    legacy.pop("band_range_right_logical")
+    legacy["band_range_right"] = [0, 256]
+    path = stub_reader(json.dumps(legacy, sort_keys=True))
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS,
+                                      print_fn=msgs.append)
+    assert any("matching storage padding cannot prove equivalence" in m
+               for m in msgs)
+
+
+def test_refit_consumer_reads_each_schema_at_its_declared_range():
+    """BSE reproduction reads schema 2 logically and schema 1 historically."""
+    from bse.vq_interp import _zeta_fit_window_of
+
+    schema2 = json.loads(_prov(
+        _cfg(bispinor=False), band_range_left=(0, 256),
+        band_range_right=(0, 256), logical_band_stop=250))
+    assert _zeta_fit_window_of(schema2) == (0, 250)
+    schema1 = {
+        "schema": 1,
+        "band_range_left": [0, 256],
+        "band_range_right": [0, 256],
+    }
+    assert _zeta_fit_window_of(schema1) == (0, 256)
+
+
 def test_provenance_collapse_nonbispinor_and_ridge_tau():
     # Non-bispinor: transverse keys are inert — provenance identical.
     a = _prov(_cfg(bispinor=False, family="ridge", tau=1e-10))
@@ -193,6 +295,22 @@ def test_provenance_collapse_nonbispinor_and_ridge_tau():
     d = json.loads(_prov(_cfg(bispinor=True, family="rank_truncate",
                               tau=1e-6)))
     assert d["transverse_zeta_rcond"] == 1e-6
+
+
+def test_pauli_charge_reuses_off_charge_stamp_but_raw4_tt_stays_pinned():
+    """Carrier identity, not the enclosing four-current policy, owns zeta."""
+    off_charge = _prov(_cfg(bispinor=False))
+    four_current_cfg = _cfg(bispinor=True)
+    pauli_charge = _prov(four_current_cfg, carrier_bispinor=False)
+    assert pauli_charge == off_charge
+
+    raw4_tt = json.loads(_prov(
+        four_current_cfg, vertex_mu_L=1, n_rmu=CENTS_T.shape[0],
+        carrier_bispinor=True))
+    assert raw4_tt["bispinor"] is True
+    assert raw4_tt["n_rmu_transverse"] == CENTS_T.shape[0]
+    assert raw4_tt["centroids_transverse_md5"] == \
+        gw_init._centroid_table_md5(CENTS_T)
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +460,7 @@ def test_real_input_change_alongside_a_legacy_gap_still_refits(stub_reader):
 
 
 def test_per_vertex_stamps_differ_only_in_vertex_and_mu():
-    """One bispinor configuration produces four stamps; they differ in
-    exactly the two entries that make the four ζ files different."""
+    """One bispinor configuration produces four channel-specific stamps."""
     cfg = _cfg(bispinor=True)
     charge = json.loads(_prov(cfg, vertex_mu_L=0))
     stamps = {L: json.loads(_prov(cfg, vertex_mu_L=L,
@@ -353,8 +470,9 @@ def test_per_vertex_stamps_differ_only_in_vertex_and_mu():
         assert s["vertex_mu_L"] == L
         assert s["n_rmu"] == CENTS_T.shape[0]
         assert sorted(k for k in set(charge) | set(s)
-                      if charge.get(k) != s.get(k)) == ["n_rmu",
-                                                        "vertex_mu_L"]
+                      if charge.get(k) != s.get(k)) == [
+                          "charge_pair_training_domain", "n_rmu",
+                          "vertex_mu_L"]
     # ζ_T for μ_L=1 is not interchangeable with μ_L=2.
     assert stamps[1] != stamps[2]
 

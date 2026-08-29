@@ -349,24 +349,26 @@ def test_the_decoupling_is_announced_with_both_numbers():
     assert "DECOUPLED" in blob and "zeta_nband=52" in blob and "b4=60" in blob
 
 
-def test_fit_zeta_takes_its_ranges_from_the_resolver():
+def test_zeta_contract_takes_its_ranges_from_the_resolver():
     """A/B INSTRUMENT CHECK, applied to a deck key: a key that parsed and was
-    read by nobody is a green that measures nothing.  ``fit_zeta`` must not
-    keep a second copy of the band-range arithmetic beside the resolver."""
+    read by nobody is a green that measures nothing.  The pre-fit contract
+    must not keep a second copy of the band-range arithmetic beside the
+    resolver."""
     src = open(SRC_INIT, encoding="utf8").read()
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "fit_zeta")
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_resolve_zeta_fit_contract")
     body = ast.get_source_segment(src, fn) or ""
     assert "zeta_fit_band_ranges(" in body, (
-        "fit_zeta no longer calls the resolver — the deck key would parse and "
-        "steer nothing")
+        "the zeta contract no longer calls the resolver — the deck key would "
+        "parse and steer nothing")
     assert "check_zeta_fit_windows(" in body
     assert "b_id_4_user" in body, (
         "the production guard lost the logical unpadded band stop")
     assert "(band_slices.b1, band_slices.b4)" not in body, (
-        "fit_zeta grew a second copy of the right band range; the resolver is "
-        "the only place that arithmetic may live")
+        "the zeta contract grew a second copy of the right band range; the "
+        "resolver is the only place that arithmetic may live")
     # ONE resolved edge, three consumers.  Reading the deck key at each gate
     # is how the banner came to say 700 while the fit ran on 160: three sites,
     # three chances to disagree about whether the run is decoupled.
@@ -376,25 +378,35 @@ def test_fit_zeta_takes_its_ranges_from_the_resolver():
     # about the code (TASTE rule 17).
     code = ast.unparse(fn)
     assert code.count("resolve_zeta_fit_edge(") == 1, (
-        "fit_zeta must resolve the edge against the PADDED b4, exactly once")
+        "the zeta contract must resolve the edge against the PADDED b4, "
+        "exactly once")
     assert code.count("zeta_nband") == 1, (
         "the deck key is read exactly once, by the resolver; every gate below "
         f"reads the resolved value (found {code.count('zeta_nband')})")
 
 
 def test_the_fit_window_travels_into_the_provenance_stamp():
-    """``_zeta_fit_provenance`` records ``band_range_left``/``_right``, which
+    """``_zeta_fit_provenance`` records the logical left/right ranges, which
     is how ζ reuse notices a changed window AND how ``bse.vq_interp``'s refit
     learns which bands the producer actually fitted.  Both are the same two
     tuples this resolver returns."""
     src = open(SRC_INIT, encoding="utf8").read()
     tree = ast.parse(src)
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "fit_zeta")
-    body = ast.get_source_segment(src, fn) or ""
-    assert "band_range_left=band_range_left" in body
-    assert "band_range_right=band_range_right" in body
-    # and the same two names are what fit_zeta_to_h5 is handed
-    i_prov = body.index("_zeta_fit_provenance(")
-    i_fit = body.index("fit_zeta_to_h5(")
-    assert i_fit > 0 and i_prov > 0
+    contract = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_resolve_zeta_fit_contract")
+    fit = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "fit_zeta")
+    contract_body = ast.get_source_segment(src, contract) or ""
+    fit_body = ast.get_source_segment(src, fit) or ""
+    assert "band_range_left=band_range_left" in contract_body
+    assert "band_range_right=band_range_right" in contract_body
+    assert "logical_band_stop=logical_band_stop" in contract_body
+    # The contract owns the stamp identity; fit_zeta consumes those same
+    # fields and passes them to the canonical writer.
+    assert "band_range_left = zeta_contract.band_range_left" in fit_body
+    assert "band_range_right = zeta_contract.band_range_right" in fit_body
+    assert "band_range_left=band_range_left" in fit_body
+    assert "band_range_right=band_range_right" in fit_body
+    assert contract_body.index("_zeta_fit_provenance(") > 0
+    assert fit_body.index("fit_zeta_to_h5(") > 0

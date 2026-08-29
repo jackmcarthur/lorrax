@@ -167,6 +167,8 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
+    "lorrax_cusolvermp_batched_getrf":    "CusolverMpBatchedGetrfFfi",
+    "lorrax_cusolvermp_batched_getrs":    "CusolverMpBatchedGetrsFfi",
     "lorrax_slate_eigh":                  "SlateEighFfi",
     "lorrax_slate_potrf":                 "SlatePotrfFfi",
     "lorrax_slate_trsm":                  "SlateTrsmFfi",

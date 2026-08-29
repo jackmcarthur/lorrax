@@ -62,10 +62,10 @@ from common.collectives import (device_put_process_local,      # noqa: E402
                                 resolve_mesh)
 from symmetry_maps import (SymMaps, star_select,               # noqa: E402
                                   star_broadcast, star_spread)
-from common.mtxel_sweep import (SweepGeometry, band_sphere_spec,  # noqa: E402
-                                kinetic_operator,
+from common.mtxel_sweep import (SweepGeometry, kinetic_operator,  # noqa: E402
                                 sweep_matrix_elements,
                                 blocks_to_host)
+from common.wfn_layout import band_sphere_spec                    # noqa: E402
 from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
                                  # with the owner's workspace fix)
 _services.ensure_on_path()

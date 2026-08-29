@@ -46,6 +46,13 @@ backend='auto', batched_route='auto')``
     plan.  The default dispatches to cuBLASMp, PBLAS or SLATE; the explicit
     opt-in performs x/y face-to-batch exchanges, local GEMM, then y/x inverse
     exchanges. ``backend='off'`` makes that route provider-free.
+``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) ->
+GemmPlan``
+    Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
+    that will call it many times from inside its own ``jax.jit``/
+    ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
+    B, C=None, *, out=None)`` is trace-safe: cuBLASMp only, one replicated
+    leading batch (holds k), no transpose modes.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -92,6 +99,7 @@ from distrib_la.matmul import (
     matmul,
     resolve_matmul_backend,
 )
+from distrib_la.matmul_plan import GemmPlan, gemm_plan
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTES,
@@ -127,6 +135,8 @@ __all__ = [
     "PolarPlan", "plan_polar_factor", "polar_factor",
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
+    # planned N,N GEMM (trace-safe, for hot loops)
+    "GemmPlan", "gemm_plan",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_SCAN_UNROLL",

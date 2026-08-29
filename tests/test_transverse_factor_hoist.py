@@ -185,6 +185,11 @@ def _run_worker(tag: str, timeout: int = 900):
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env["JAX_ENABLE_X64"] = "1"
+    # This fixture deliberately contains near-null indefinite modes so it
+    # can test scheduling identity at the difficult spectrum.  Keep the
+    # production rank-policy diagnostic, but do not let that independent
+    # policy gate prevent the fused-versus-hoisted comparison from running.
+    env["LORRAX_RANK_POLICY"] = "warn"
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "")
                         + f" --xla_force_host_platform_device_count={_NDEV}"
                         ).strip()

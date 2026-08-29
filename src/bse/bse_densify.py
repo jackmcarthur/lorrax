@@ -571,16 +571,23 @@ def _interpolate_bse_data_to_grid(
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
 
+    # The restart and fresh htransform WFN first meet at this seam.
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    from .bse_window import _parse_wfn_path
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_parse_wfn_path(input_file),
+        state_artifact_path=restart_file,
+        where="bse_k_grid restart/htransform state")
+
     # ── WHICH ISDF BASIS THE htransform FITS IN ───────────────────────────
     # On a NATIVE bundle: the deck's own table, and ``keep`` is None — this
     # block is then a no-op and everything below is the program it always was.
     #
     # On a DOWNFOLDED bundle the two questions come apart, and the densifier
     # has to answer them through ``exciton_bands.resolve_isdf_basis``, the ONE
-    # owner of this contract.  The exact rank-0 arm fits in the parent basis
-    # and slices its output.  The explicit reduced arm applies the same
-    # ordered ``keep`` before fitting and is born at μ_S.  Without either
-    # deliberate route, the pad below is asked for
+    # owner of this contract.  The sole whole-state QRCP fit applies the
+    # ordered ``keep`` before evaluating its basis and is born at μ_S.
+    # Without that route, the pad below is asked for
     # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
     # with an index error that names neither the downfold nor the basis.
     # Same defect class as PIPELINE_HEALTH row 4, which closed this for
@@ -595,15 +602,13 @@ def _interpolate_bse_data_to_grid(
     keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
 
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
-    _rank_multiplier = ht.resolve_galerkin_rank_multiplier(
-        params.get("htransform_rank_multiplier", 0.0))
-    _fit_subset = keep if _rank_multiplier > 0.0 else None
-    _output_keep = None if _fit_subset is not None else keep
-    (wfn, sym, meta, _mesh, _S, ctilde, B_at_mu,
+    _fit_subset = keep
+    (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn)
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond
@@ -635,7 +640,6 @@ def _interpolate_bse_data_to_grid(
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-        centroid_keep_idx=_output_keep,
         distrib_la_batched_route=_distrib_la_batched_route,
         htransform_quality_record_fn=htransform_quality_record_fn)
 
@@ -646,10 +650,10 @@ def _interpolate_bse_data_to_grid(
     @partial(jax.jit, out_shardings=(x4, y4, x4, y4, rep, rep))
     def _split_pad(psi, enk):
         # psi (nk_f, n_val+n_cond, ns, n_mu); enk (nk_f, n_val+n_cond).
-        # A downfold parent→child column slice has already run INSIDE
-        # compute_wfns_fi as each q chunk entered its retained cache, before
-        # the global concatenate.  This jit therefore never receives a
-        # parent-width psi operand.
+        # ``initialize_wfns`` evaluated the sole whole-state basis directly
+        # on the resolved child centroid rows, so ``compute_wfns_fi`` and this
+        # split both receive the restart's final μ width.  There is no
+        # parent-width projected-wavefunction route here.
         psi_v = psi[:, :n_val]
         psi_c = psi[:, n_val:n_val + n_cond]
         psi_v = jnp.pad(psi_v, ((0, 0), (0, nv_pad - n_val), (0, 0),

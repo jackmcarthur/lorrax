@@ -44,11 +44,11 @@
     "seed_policy": "no seed: both routes are deterministic convex programs or fixed Gauss-Legendre panels. The only randomness is the rescaling check's draw, which is seeded at 20260808 and is a test, not a solve."
   },
   "sweep": {
-    "solver_wall_seconds": 0.11,
-    "entries": 54,
-    "certified": 54,
+    "solver_wall_seconds": 135.7,
+    "entries": 55,
+    "certified": 55,
     "by_rule": {
-      "btv_minimax": 35,
+      "btv_minimax": 36,
       "positive_composite": 19
     },
     "ledger": [
@@ -871,6 +871,21 @@
             "node_count": 1420,
             "kappa0": 1.0000000000000009,
             "wall_s": 0.01
+          }
+        ]
+      },
+      {
+        "range_max": 92.36189541312947,
+        "beta": 29.126243024110114,
+        "error_bound": 6.86665972794514e-08,
+        "attempts": [
+          {
+            "rule": "btv_minimax",
+            "kappa_cap": 2.0,
+            "outcome": "pass",
+            "node_count": 12,
+            "kappa0": 1.2886570001952167,
+            "wall_s": 135.59
           }
         ]
       }
@@ -2190,6 +2205,43 @@
         "reweight_rounds": 5
       },
       "beta_tolerance": 0.0005441056489944459
+    },
+    {
+      "family": "complex_laplace",
+      "rule": "btv_minimax",
+      "range_param": "R",
+      "range_max": 92.36189541312947,
+      "beta_param": "omega_hat",
+      "beta": 29.126243024110114,
+      "beta_min": 29.126243024110114,
+      "error_bound": 6.86665972794514e-08,
+      "error_metric": "linf_abs_complex_modulus_scaled",
+      "node_count": 12,
+      "max_error": 3.482826125636253e-08,
+      "real_part_max_error": 2.4702185571351398e-08,
+      "kappa0": 1.2886570001952167,
+      "kappa0_bound": 2.0,
+      "kappa0_tier": "normal",
+      "sum_abs_w": 0.6157883603814865,
+      "moment_residual": 7.99371549566212e-08,
+      "moment_ceiling": 1.56837761975518e-06,
+      "rescale_max_error_ratio": 1.0000000000815632,
+      "beta_tolerance": 3.298512801278186e-05,
+      "certified": true,
+      "payload_sha256": "ec767e49c0513b83b2531daabab6694b9639656fc7a917b0e7abb444f65282fb",
+      "beta_axis": "exact_entry_only",
+      "file": "complex_laplace/complex_laplace_R_92p361895_b_29p126243024110_eps_6p9em08.npz",
+      "generation": {
+        "dictionary_size": 500,
+        "dictionary_retries": 0,
+        "dictionary_range": [
+          0.00010826975729840288,
+          59.999999999999986
+        ],
+        "solve_grid": 600,
+        "solve_tolerance": 3.776662850369827e-08,
+        "reweight_rounds": 5
+      }
     },
     {
       "family": "complex_laplace",

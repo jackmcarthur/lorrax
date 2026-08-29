@@ -70,7 +70,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 from common.contract_bands import (                  # noqa: E402
     contract_bands_block_reshard, bands_gemm_ffi_enabled,
-    bands_gemm_ffi_mode)
+    bands_gemm_ffi_mode, merge_spin_centroid, split_spin_centroid)
 
 
 NK, NS, MU, MN, E = 4, 2, 16, 8, 3
@@ -549,6 +549,149 @@ def test_ffi_gemm_plan():
         print("  [ffi] all FFI-plan gates PASS", flush=True)
     finally:
         os.environ["LORRAX_BANDS_GEMM_FFI"] = "0"
+
+
+# ---------------------------------------------------------------------------
+# Face layout — the low_mem_bands two-face GEMM-seam merge helpers and the
+# contract_bands_block_reshard(layout='face') refusal ladder.  The two-GEMM
+# numeric plan itself needs distrib_la.gemm_plan, which is cuBLASMp-only
+# (CUDA-only today) — its algebra parity is certified on the real 4-rank
+# CUDA gate, tests/multi_device/low_mem_bands_g_projection_hartree_gate.py.
+# What CAN be certified on an emulated CPU mesh, and is here: the (s,mu)
+# merge/split reshape itself is correct AND free of any collective (the
+# measured correction to the audit report's own "flatten (s,mu)" claim —
+# see contract_bands.merge_spin_centroid's docstring), and every new
+# layout='face' keyword refuses cleanly before ever reaching gemm_plan.
+# ---------------------------------------------------------------------------
+
+def test_merge_split_spin_centroid_roundtrip_and_no_collective():
+    """merge_spin_centroid/split_spin_centroid: bit-exact roundtrip against
+    plain NumPy transpose+reshape, correct per-rank shard placement (a
+    genuinely chunked P(...,'x'|'y',...) array would hold exactly this),
+    and — the load-bearing claim — the compiled HLO for the FORWARD merge
+    contains NO collective at all.  ``test_merge_spin_centroid_storage_order_
+    needs_an_all_to_all`` below is the negative control: merging in the
+    OTHER (storage) order is not free, so this is not a vacuous check."""
+    mesh = _mesh()
+    nk, s, mu, n = NK, NS, MU, MN
+    rng = np.random.default_rng(11)
+    host = _crand(rng, nk, s, mu, n)
+    x = jax.device_put(
+        jnp.asarray(host), NamedSharding(mesh, P(None, None, "x", "y")))
+
+    @jax.jit
+    def merge(x):
+        return merge_spin_centroid(x, 1, 2)
+
+    compiled = jax.jit(merge).lower(x).compile()
+    txt = compiled.as_text()
+    for tok in ("all-to-all", "all-gather", "collective-permute",
+               "reduce-scatter"):
+        assert tok not in txt, (
+            f"merge_spin_centroid(spin_axis=1, centroid_axis=2) [sharded "
+            f"axis major] emitted a {tok!r} — should be a free local "
+            f"reshape; HLO:\n{txt}")
+
+    y = merge(x)
+    expected = np.swapaxes(host, 1, 2).reshape(nk, mu * s, n)
+    err = _relerr(y, expected)
+    assert err == 0.0, f"merge_spin_centroid not bit-exact: {err:.3e}"
+    for shard in y.addressable_shards:
+        got = np.asarray(shard.data)
+        want = expected[shard.index]
+        assert np.array_equal(got, want), (
+            f"merge_spin_centroid: shard {shard.device} holds the wrong "
+            f"slice of the merged array — not a genuinely chunked "
+            f"P(None,'x','y') result")
+
+    back = split_spin_centroid(y, 1, s, mu)
+    err_back = _relerr(back, host)
+    assert err_back == 0.0, (
+        f"split_spin_centroid did not invert merge_spin_centroid exactly: "
+        f"{err_back:.3e}")
+
+
+def test_merge_spin_centroid_storage_order_needs_an_all_to_all():
+    """Negative control for the test above: merging in the BUNDLE'S OWN
+    storage order (spin outer/replicated, centroid inner/sharded — what a
+    literal "flatten (s,mu)" reading of the audit report would do) is NOT
+    a free reshape.  This is the measured fact
+    ``greens_function_kernel``'s and ``contract_bands``'s module
+    docstrings cite; pinned here so a future JAX/XLA version change that
+    silently fixes or breaks this optimization is caught rather than
+    assumed."""
+    mesh = _mesh()
+    nk, s, mu, n = NK, NS, MU, MN
+    rng = np.random.default_rng(12)
+    host = _crand(rng, nk, s, mu, n)
+    x = jax.device_put(
+        jnp.asarray(host), NamedSharding(mesh, P(None, None, "x", "y")))
+
+    @jax.jit
+    def bad_merge(x):
+        nk_, s_, mu_, n_ = x.shape
+        y = x.reshape(nk_, s_ * mu_, n_)
+        return jax.lax.with_sharding_constraint(
+            y, NamedSharding(mesh, P(None, "x", "y")))
+
+    txt = jax.jit(bad_merge).lower(x).compile().as_text()
+    assert "all-to-all" in txt, (
+        "expected the storage-order (s outer, mu inner) merge to need an "
+        "all-to-all on this JAX/XLA version; if this now fails, the "
+        "optimization landed upstream and merge_spin_centroid's own "
+        "docstring / greens_function_kernel's should be revisited (it may "
+        "no longer be the wrong order) rather than this test silently "
+        "skipped")
+
+
+def test_merge_spin_centroid_rejects_non_adjacent_axes():
+    mesh = _mesh()
+    x = jnp.zeros((NK, NS, 4, MU, MN), dtype=jnp.complex128)
+    with pytest.raises(ValueError, match="adjacent"):
+        merge_spin_centroid(x, 1, 3)
+
+
+def test_face_projector_requires_face_shape():
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="face_shape"):
+        contract_bands_block_reshard(mesh, layout="face")
+
+
+def test_face_projector_rejects_extra():
+    """``extra`` (the BSE/Σ-channel stack axis) has no face-layout
+    mechanism — the two-GEMM projector takes no batched stack; a caller
+    with several projections calls it once per slice instead
+    (``gw.ppm_tau_kernel._bracketed_face``/``_stack_channels``).  Still
+    refused after 2026-08-22's ``channels='split_reim'`` port — see the
+    next test for what that port changed."""
+    mesh = _mesh()
+    face_shape = (NK, MN, MU, NS)
+    with pytest.raises(NotImplementedError, match="extra"):
+        contract_bands_block_reshard(
+            mesh, layout="face", face_shape=face_shape, extra="leading")
+
+
+def test_face_projector_rejects_bad_channels():
+    """A ``channels`` value that is neither ``'none'`` nor ``'split_reim'``
+    still refuses at the SAME validation ladder, before ``gemm_plan`` is
+    ever reached — this is the CPU-checkable half of the guard.  Positive
+    construction of ``channels='split_reim'`` (2026-08-22, the dynamic
+    PPM/MPA Σ_c(τ) two-channel plan) needs a real ``distrib_la.gemm_plan``
+    — CUDA-only today — so it is NOT checked here; see
+    ``tests/test_ppm_tau_kernel_face_parity.py``'s real 4-rank CUDA gate,
+    which exercises exactly this channels value end to end (the
+    ``merged_x=False`` cases)."""
+    mesh = _mesh()
+    face_shape = (NK, MN, MU, NS)
+    with pytest.raises(ValueError, match="channels"):
+        contract_bands_block_reshard(
+            mesh, layout="face", face_shape=face_shape, channels="bogus")
+
+
+def test_contract_bands_rejects_bad_layout():
+    mesh = _mesh()
+    with pytest.raises(ValueError, match="layout"):
+        contract_bands_block_reshard(mesh, layout="bogus")
 
 
 # ---------------------------------------------------------------------------

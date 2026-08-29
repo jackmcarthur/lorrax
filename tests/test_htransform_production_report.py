@@ -39,9 +39,6 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     params = {"eigh_backend": "auto", "htransform_rank_multiplier": 0.0}
     report.environment(
         params=params, wfn=wfn,
-        gram_plan=SimpleNamespace(
-            requested="auto", backend="native", is_native=True, n=48,
-            mesh=SimpleNamespace(shape={"x": 2, "y": 2})),
         fine_plan=SimpleNamespace(
             requested="distributed", backend="cusolvermp",
             requested_batched_route="auto", batched_route="scan"),
@@ -73,13 +70,18 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     numerical_report = rank_criterion.rank_report(
         spectrum, 0.05, rank_used=3, rank_ceiling=4)
     report.spectral_compression({
-        "stacked_states": 48, "site_spin_columns": 40,
-        "structural_ceiling": 40, "numerical_rank": 3,
+        "method": "whole_state_randomized_qrcp",
+        "stacked_states": 48, "state_dimension": 40,
+        "candidate_count": 12, "search_rank": 8, "raw_rank": 3,
         "retained_rank": 3, "carried_rank": 4, "null_padding": 1,
-        "rank_multiplier": 0.0, "numerical_report": numerical_report,
-        "compression": rank_criterion.singular_value_compression(spectrum, 3),
-        "numerical_closure": spectral_closure.cluster_at_cut(spectrum, 3),
-        "model_closure": None,
+        "rank_multiplier": 20.0, "qr_eps": 1.0e-3, "qrcp_seed": 0,
+        "qrcp_rng_version": "test-v1", "candidate_hash": "abc",
+        "pivot_hash": "def", "min_cholesky_diagonal": 0.2,
+        "coefficient_orthogonality_error": 2.0e-7,
+        "max_missing_state_norm_squared": 3.0e-4,
+        "relative_frobenius_residual": 4.0e-3,
+        "selected_orientation_error": 5.0e-12,
+        "selected_orientation_tolerance": 2.0e-8,
     })
     report.htransform_quality({
         "row_isometry_max": 2.0e-7,
@@ -112,10 +114,10 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Centroid orbit: NOT CLOSED : 1/2 spatial operations" in text
     assert "worst residual 2.50000e-01 at S02" in text
     assert "Galerkin basis : rank 12" in text
-    assert "Galerkin basis : 48 stacked states x 40 site-spin samples" in text
-    assert "Model order     : full numerical span; retained rank 3" in text
-    assert "Sampled-psi tail:" in text
-    assert "not a band-energy error bound" in text
+    assert "Galerkin basis : 48 stacked states x 40 full-Bloch components" in text
+    assert "QRCP rank      : qr_eps=1.00000e-03; raw rank 3" in text
+    assert "relative Frobenius residual=4.00000e-03" in text
+    assert "not a fine-k band-energy error bound" in text
     assert "rank 4 = 3 physical + 1 exact-null mesh pad" in text
     assert "Guard buffer   :" in text
     assert "Guard bands    : 7-8; E range" in text
@@ -123,8 +125,8 @@ def test_htransform_report_names_spaces_path_progress_and_files(tmp_path):
     assert "Zero shoulder  : max E(band 8) = 6.39468 eV" in text
     assert "N01    Γ  k=( 0.00000  0.00000  0.00000)" in text
     assert "L01  Γ -> X: 1 intervals; 2 endpoint-inclusive points" in text
-    assert "Gram eigensolve: auto (other choices:" in text
-    assert "-> native; replicated native JAX; n=48" in text
+    assert "whole-state randomized QRCP" in text
+    assert "no Gram eigensolve" in text
     assert "Fine-k eigensolve: distributed -> cusolvermp" in text
     assert "Batched LA     : auto (other choices: batch_reshard) -> scan" in text
     assert "Row isometry   : max |C C^H - I|=2.00000e-07" in text
@@ -149,6 +151,54 @@ def test_htransform_runtime_startup_uses_the_one_debug_stream():
               "htransform.py").read_text(encoding="utf8")
     assert "initialize_communicator_stack(print_fn=debug_print)" in source
     assert "RUNTIME = initialize_communicator_stack()" not in source
+
+
+def test_basis_input_emits_exactly_one_canonical_rank_receipt(
+        tmp_path, monkeypatch):
+    import inspect
+    import bandstructure.htransform as htransform
+    from isdf import galerkin
+
+    basis = galerkin.GalerkinBasis(
+        ctilde=np.eye(2, dtype=np.complex128)[None],
+        basis_at_nodes=np.ones((2, 1, 1), dtype=np.complex128),
+        rank_physical=2,
+        band_range=(3, 5),
+        selected_state_indices=(0, 1),
+        selection_factor=np.eye(2, dtype=np.complex128),
+        qrcp_seed=7,
+        qrcp_eps=1.0e-3,
+        qrcp_raw_rank=2,
+        qrcp_search_rank=2,
+        candidate_hash="a" * 64,
+        pivot_hash="b" * 64,
+    )
+    basis_path = tmp_path / "basis.h5"
+    basis_path.touch()
+    monkeypatch.setattr(
+        htransform, "read_galerkin_basis", lambda *args, **kwargs: basis)
+    records = []
+    restored = htransform.streaming_galerkin_solve(
+        object(), object(), SimpleNamespace(nspinor=1, n_rtot=2),
+        np.zeros((1, 3), dtype=np.int32), object(), (3, 5),
+        basis_input=str(basis_path), rank_record_fn=records.append,
+        rank_multiplier=20.0, qr_eps=1.0e-3, qrcp_seed=7,
+    )
+
+    assert restored is basis
+    assert len(records) == 1
+    record = records[0]
+    assert (record["method"], record["stacked_states"],
+            record["state_dimension"]) == (
+                "whole_state_randomized_qrcp", 2, 2)
+    assert (record["raw_rank"], record["retained_rank"],
+            record["carried_rank"], record["null_padding"]) == (2, 2, 2, 0)
+    assert record["min_cholesky_diagonal"] == 1.0
+    assert record["coefficient_orthogonality_error"] == 0.0
+    assert record["relative_frobenius_residual"] == 0.0
+    fit_source = inspect.getsource(galerkin.fit_galerkin_basis)
+    assert "rank_record = galerkin_rank_record(" in fit_source
+    assert '"method": "whole_state_randomized_qrcp"' not in fit_source
 
 
 def test_outer_r_shell_mask_handles_even_odd_and_singleton_axes():

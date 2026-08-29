@@ -75,6 +75,7 @@ _NTRAN = 2
 #    that caught it.
 _SEEDS_12 = ((0, 0), (3, 6), (1, 1), (2, 1), (3, 2), (4, 3), (5, 1))
 _SEEDS_10 = _SEEDS_12[:6]
+_SEEDS_6 = _SEEDS_12[:4]
 
 
 def _geometry(seeds):
@@ -108,6 +109,19 @@ def _hostile_geometry():
     perm, L, n = _geometry(_SEEDS_10)
     assert n == 10 and n % 4 != 0, f"expected 10 centroids, got {n}"
     return perm, L, n
+
+
+def _padded_geometry(seeds, padded):
+    """Orbit-closed logical tables with the production identity/zero tail."""
+    perm, L, logical = _geometry(seeds)
+    assert logical <= int(padded)
+    perm_out = np.broadcast_to(
+        np.arange(int(padded), dtype=np.int32),
+        (perm.shape[0], int(padded))).copy()
+    perm_out[:, :logical] = perm
+    L_out = np.zeros((L.shape[0], int(padded), 3), dtype=L.dtype)
+    L_out[:, :logical] = L
+    return perm_out, L_out, logical
 
 
 #: A full-BZ q map that uses BOTH halves of the sym table: two spatial rows
@@ -164,6 +178,35 @@ def _hand_unfold(V_ibz, *, perm, L, n_rmu, trs_rule="conj"):
         if s >= _NTRAN:
             blk = np.conj(blk) if trs_rule == "conj" else blk.T
         out[iq] = blk
+    return out
+
+
+def _rectangular_pair_reference(
+        forward, reverse, *, left_perm, left_L, right_perm, right_L,
+        logical_left, logical_right):
+    """Dense CT/TC partner action; deliberately no JAX/service calls."""
+    n_left, n_right = forward.shape[-2:]
+    out = np.zeros((len(_IRR), n_left, n_right), dtype=forward.dtype)
+    for iq, (parent, s) in enumerate(zip(_IRR, _SYM)):
+        parent, s = int(parent), int(s)
+        lp = np.asarray(left_perm[s])
+        rp = np.asarray(right_perm[s])
+        q_parent = _Q_IRR[parent]
+        phase_left = np.exp(
+            2j * np.pi * (np.asarray(left_L[s]) @ q_parent))
+        phase_right = np.exp(
+            2j * np.pi * (np.asarray(right_L[s]) @ q_parent))
+        if s >= _NTRAN:
+            block = reverse[parent].T[np.ix_(lp, rp)]
+            block = (np.conj(phase_left)[:, None] * block
+                     * phase_right[None, :])
+        else:
+            block = forward[parent][np.ix_(lp, rp)]
+            block = (phase_left[:, None] * block
+                     * np.conj(phase_right)[None, :])
+        block[logical_left:, :] = 0.0
+        block[:, logical_right:] = 0.0
+        out[iq] = block
     return out
 
 
@@ -271,6 +314,87 @@ def test_pair_transpose_unfolds_a_nonhermitian_operator(px, py):
         q_irr_frac=_Q_IRR, mesh_xy=mesh, n_sym_spatial=_NTRAN,
         trs_rule="pair_transpose"))
     np.testing.assert_allclose(got, ref, rtol=1.0e-13, atol=1.0e-13)
+
+
+@pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
+def test_rectangular_ct_uses_distinct_bases_explicit_tc_partner_and_padding(
+        px, py):
+    """One all-P tile closes the CT↔TC antiunitary action.
+
+    The two endpoint bases have unequal physical and padded extents, different
+    permutations and different wraps.  Padding is planted nonzero so a pass
+    requires the symmetry owner itself to mask it.  On antiunitary rows the
+    source is the independently supplied TC tile, transposed into CT order;
+    using CT itself is both shape-wrong and numerically distinguishable.
+    """
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = _mesh(px, py)
+    left_perm, left_L, logical_left = _padded_geometry(_SEEDS_10, 12)
+    right_perm, right_L, logical_right = _padded_geometry(_SEEDS_6, 8)
+    rng = np.random.default_rng(82541)
+    forward = (rng.standard_normal((3, 12, 8))
+               + 1j * rng.standard_normal((3, 12, 8)))
+    reverse = (rng.standard_normal((3, 8, 12))
+               + 1j * rng.standard_normal((3, 8, 12)))
+
+    ref = _rectangular_pair_reference(
+        forward, reverse, left_perm=left_perm, left_L=left_L,
+        right_perm=right_perm, right_L=right_L,
+        logical_left=logical_left, logical_right=logical_right)
+
+    got = unfold_isdf_operator(
+        jnp.asarray(forward), irr_idx=_IRR, sym_idx=_SYM,
+        sym_perm=left_perm, L_table=left_L, q_irr_frac=_Q_IRR,
+        mesh_xy=mesh, n_sym_spatial=_NTRAN,
+        trs_rule="pair_transpose", right_sym_perm=right_perm,
+        right_L_table=right_L, left_logical_extent=logical_left,
+        right_logical_extent=logical_right,
+        trs_pair_q_ibz=jnp.asarray(reverse))
+    np.testing.assert_allclose(
+        np.asarray(got), ref, rtol=1.0e-13, atol=1.0e-13)
+    assert tuple(got.shape) == (len(_IRR), 12, 8)
+    assert got.sharding.is_equivalent_to(
+        NamedSharding(mesh, P(None, "x", "y")), 3)
+    np.testing.assert_array_equal(np.asarray(got)[:, logical_left:, :], 0.0)
+    np.testing.assert_array_equal(np.asarray(got)[:, :, logical_right:], 0.0)
+
+    trs_rows = np.flatnonzero(_SYM >= _NTRAN)
+    wrong_partner = np.swapaxes(forward, -1, -2)
+    # A cropped/self-derived partner is the tempting CT-is-TC shortcut.  It
+    # must be observably different on the exact antiunitary rows.
+    wrong = _rectangular_pair_reference(
+        forward, wrong_partner,
+        left_perm=left_perm, left_L=left_L, right_perm=right_perm,
+        right_L=right_L, logical_left=logical_left,
+        logical_right=logical_right)
+    scale = max(float(np.max(np.abs(ref[trs_rows]))), 1.0e-300)
+    assert float(np.max(np.abs(ref[trs_rows] - wrong[trs_rows]))) / scale > 0.1
+
+
+def test_rectangular_pair_transpose_refuses_without_the_reversed_tile():
+    import jax.numpy as jnp
+
+    mesh = _mesh(1, 1)
+    left_perm, left_L, _ = _padded_geometry(_SEEDS_10, 12)
+    right_perm, right_L, _ = _padded_geometry(_SEEDS_6, 8)
+    with pytest.raises(ValueError, match="requires trs_pair_q_ibz"):
+        unfold_isdf_operator(
+            jnp.zeros((3, 12, 8), dtype=jnp.complex128),
+            irr_idx=_IRR, sym_idx=_SYM, sym_perm=left_perm,
+            L_table=left_L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+            n_sym_spatial=_NTRAN, trs_rule="pair_transpose",
+            right_sym_perm=right_perm, right_L_table=right_L)
+
+    # Shape equality is never a basis receipt.  Conversely, unequal axes may
+    # not silently fall back to the historical one-table/square action.
+    with pytest.raises(ValueError, match="right extent"):
+        unfold_isdf_operator(
+            jnp.zeros((3, 12, 8), dtype=jnp.complex128),
+            irr_idx=_IRR, sym_idx=_SYM, sym_perm=left_perm,
+            L_table=left_L, q_irr_frac=_Q_IRR, mesh_xy=mesh,
+            n_sym_spatial=_NTRAN)
 
 
 def test_unknown_trs_rule_refuses():

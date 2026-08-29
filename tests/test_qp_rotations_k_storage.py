@@ -8,6 +8,8 @@ the arrays in hand and keeps the wedge only if the reconstruction is
 exact.  These cells pin that, in both directions, and pin the thing the
 whole format rests on — that a file with no stamp is read as full-BZ.
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -21,8 +23,8 @@ from file_io.kin_ion import (                                    # noqa: E402
 from file_io.qp_wfn import (                                     # noqa: E402
     QP_ENERGY_DEFINITION_ATTR, QP_ROT_FULL_BZ_DATASETS,
     QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE, QP_SOLVER_ATTR,
-    qp_rotations_k_storage, read_qp_rotations_full_bz,
-    write_qp_rotations_h5,
+    authenticate_qp_rotations_source_wfn, qp_rotations_k_storage,
+    read_qp_rotations_full_bz, write_qp_rotations_h5,
 )
 from file_io.sigma_output import SIGMA_EVAL_PROVENANCE_ATTR       # noqa: E402
 
@@ -40,6 +42,14 @@ _IRR = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
 _SYM = np.array([0, 1, 0, 2, 0, _NSS + 1], dtype=np.int32)   # row 5 is TRS
 _KIRR_TO_KFULL = np.array([0, 2, 4], dtype=np.int32)
 _TABLES = (_IRR, _SYM, _NSS)
+
+
+def _source_wfn(kpoints, nb):
+    """Small pathless WFN identity for this format-only test module."""
+    return SimpleNamespace(
+        energies=np.zeros((1, len(kpoints), nb), dtype=np.float64),
+        kpoints=np.asarray(kpoints, dtype=np.float64),
+        nelec=max(1, nb // 2), nspinor=1, nbands=nb, path=None)
 
 
 def _star_consistent_payload(nb=3, seed=0):
@@ -67,8 +77,32 @@ def _write(tmp_path, name, U, E, kpts, **kw):
     stored = write_qp_rotations_h5(
         path, U_mnk=U, E_qp_nk=E, band_start=0, band_stop=U.shape[-1],
         kpoints_crys=kpts, nkx=2, nky=1, nkz=1,
-        kirr_to_kfull=_KIRR_TO_KFULL, **kw)
+        kirr_to_kfull=_KIRR_TO_KFULL,
+        source_wfn=_source_wfn(kpts, U.shape[-1]), **kw)
     return path, stored
+
+
+def test_qp_authentication_reuses_bound_wfn_fingerprint_without_rescan(
+        monkeypatch):
+    import common.parallel_transport as transport
+
+    wfn = _source_wfn(np.zeros((_NK_FULL, 3)), 3)
+    binding = transport.bind_wfn_fingerprint(wfn)
+    canonical = transport.fingerprint_from_binding(binding, wfn)
+    artifact = {
+        "source_wfn_fingerprint_scheme": transport.WFN_FINGERPRINT_SCHEME,
+        "source_wfn_fingerprint": canonical,
+    }
+    assert authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path="qp_wfn_rotations.h5") == canonical
+
+    def unexpected_rescan(_wfn):
+        raise AssertionError("bound QP source-WFN fingerprint rescanned")
+
+    monkeypatch.setattr(transport, "wfn_fingerprint", unexpected_rescan)
+    assert authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path="qp_wfn_rotations.h5",
+        wfn_fingerprint_binding=binding) == canonical
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +299,8 @@ def test_a_wedge_row_that_is_never_a_parent_is_refused_not_written(tmp_path):
             str(tmp_path / f"np_{k_storage}.h5"), U_mnk=U, E_qp_nk=E,
             band_start=0, band_stop=nb, kpoints_crys=kpts,
             nkx=2, nky=1, nkz=1, kirr_to_kfull=rows,
-            k_storage=k_storage, star_tables=tables, **kw)
+            k_storage=k_storage, star_tables=tables,
+            source_wfn=_source_wfn(kpts, nb), **kw)
 
     with pytest.raises(ValueError, match="never an orbit parent"):
         _w("ibz")

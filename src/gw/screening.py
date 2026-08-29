@@ -793,11 +793,18 @@ def compute_screening_model(
 
     THE ``screening_diagrams`` FORK LIVES HERE AND NOWHERE ELSE.  The role
     plan (:func:`screening_requests_for`) and the Σ dispatch are identical
-    for both values — the same Σ ansatz wants W at the same frequencies
+    for every value — the same Σ ansatz wants W at the same frequencies
     either way; only WHICH W satisfies the request changes.  ``w_rpa``
     therefore reaches exactly the statements it reached before the fork
     existed, which is what keeps the frozen Si pins and the 0.644 meV BGW
     cell bit-identical.
+
+    ``w_bse`` and ``w_rpa_resolvent`` reach the SAME stage helper
+    (:func:`gw.screening_bse.compute_screening_ladder`) with ``include_w``
+    set to whether the ladder's direct rung is in the operator — one
+    matvec builder with a kernel switch (``bse.bse_ring_comm.
+    build_bse_ring_matvec_full``'s own ``include_W``), not a second
+    facade.
 
     ``tensors_filename`` is the ISDF restart file.  It is unused by the
     ``w_rpa`` path and REQUIRED by ``w_bse``, which persists the RPA W(0)
@@ -840,14 +847,15 @@ def compute_screening_model(
             result["iteration_head"] = iteration_head
         return result
 
-    if diagrams is ScreeningDiagrams.W_BSE:
+    if diagrams in (ScreeningDiagrams.W_BSE, ScreeningDiagrams.W_RPA_RESOLVENT):
         from .screening_bse import compute_screening_ladder
         return compute_screening_ladder(
             mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
             centroid_indices=centroid_indices, config=config, meta=meta,
             mesh_xy=mesh_xy, tensors_filename=tensors_filename,
             head_resolver=head_resolver, head_channel=head_channel,
-            static_only=static_only, print_fn=print_fn)
+            static_only=static_only, print_fn=print_fn,
+            include_w=(diagrams is ScreeningDiagrams.W_BSE))
     if diagrams is not ScreeningDiagrams.W_RPA:
         # EXHAUSTIVENESS, not defensive programming.  A member added to
         # ScreeningDiagrams without a branch here would otherwise fall into
@@ -883,15 +891,19 @@ def driver_persists_w0(mode, config) -> bool:
       ``gw_output.persist_w0_and_head`` refuses that shape by name
       (gw_output.py, the ``is_dynamic``-without-``ppm_model`` branch) and
       the driver has never called it.
-    * ``screening_diagrams = w_bse`` — the stage helper has ALREADY
-      persisted, because the RPA W(0) it wrote is the input the ladder
-      facade reads back.  ``W_by_role["static"]`` at this point is the
-      LADDER W, and re-persisting would stamp it into ``W0_qmunu``, where
-      every downstream consumer (BSE, downfold, a later restart) reads
-      that dataset as the RPA static screened Coulomb.  Silently writing a
-      different operator under an established dataset's name is the
-      provenance failure class (QUALITY_PATTERNS #10), so the answer is
-      "already done", not "do it again".
+    * ``screening_diagrams = w_bse`` or ``w_rpa_resolvent`` — the stage
+      helper has ALREADY persisted, because the RPA W(0) it wrote is the
+      restart-handoff input the ladder facade reads back (both arms run
+      the identical ``prepare_ladder_restart``).  ``W_by_role["static"]``
+      at this point is the RESOLVENT'S W — the ladder W under ``w_bse``,
+      the resolvent-RPA W under ``w_rpa_resolvent`` — and re-persisting
+      either would stamp it into ``W0_qmunu``, where every downstream
+      consumer (BSE, downfold, a later restart) reads that dataset as the
+      DYSON-route RPA static screened Coulomb.  Silently writing a
+      different operator (or even a value-close but distinctly-computed
+      one) under an established dataset's name is the provenance failure
+      class (QUALITY_PATTERNS #10), so the answer is "already done", not
+      "do it again".
 
     Lives here rather than in ``gw_jax`` so the driver keeps one call and
     no mode/diagram arithmetic, and so the two reasons sit next to the
@@ -901,7 +913,7 @@ def driver_persists_w0(mode, config) -> bool:
         return False
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    return diagrams is not ScreeningDiagrams.W_BSE
+    return diagrams is ScreeningDiagrams.W_RPA
 
 
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,

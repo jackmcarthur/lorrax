@@ -189,3 +189,19 @@ def test_the_writer_stamps_what_the_reader_reads():
     for extra in ("qp_wfn_band_start", "qp_wfn_band_stop",
                   "_qp_provenance_attrs"):
         assert extra in body, extra
+
+
+def test_postprocess_adapter_uses_the_canonical_qp_wfn_writer():
+    """The optional CLI must not grow a second WFN rotation/write path."""
+    import ast
+
+    src = os.path.join(os.path.dirname(__file__), "..", "src",
+                       "postprocess", "rotate_wfn_to_qp.py")
+    tree = ast.parse(open(src, encoding="utf8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "rotate_wfn_coefficients")
+    body = ast.unparse(fn)
+    assert "write_qp_wfn_h5" in body
+    for duplicate in ("h5py.File", "shutil.copy2", "wfns/coeffs"):
+        assert duplicate not in body, duplicate

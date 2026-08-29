@@ -25,9 +25,12 @@ The surface
 ``WfnLoader.load`` / ``.load_process_local`` / ``.bands``
     ψ for a (band-range, k-set) window: as a GLOBAL sharded array, as a
     THIS-PROCESS-ONLY array, and as a band-chunked iterator.
-``WfnLoader.gvecs`` / ``.ngk_valid`` / ``.box_index`` / ``.box_index_dev``
-    The G-vector side: the padded per-k Miller-index table, its logical
-    lengths, and the FFT-box gather table (host, and cached on device).
+``WfnLoader.kvecs`` / ``.gvecs`` / ``.ngk_valid`` / ``.box_index`` /
+``.box_index_dev``
+    The reciprocal-space side: paired fractional-k and padded per-k
+    Miller-index tables, logical lengths, and the FFT-box gather table (host,
+    and cached on device). Bloch phases and ``k+G`` must use the paired loader
+    tables rather than reconstructing k independently.
 ``KSpec``
     The k-spec vocabulary: ``'ibz'``, ``'full_bz'``, or an explicit list
     of full-BZ indices.
@@ -56,15 +59,19 @@ from wfn_loader.loader import (
     IBZRows,
     KSpec,
     WfnLoader,
+    WfnProvenance,
     _bispinor_lift_kernel,
     _get_bispinor_lift_jit,
     _phdf5_unfold_kernel,
     _sharded_zero_proto_fn,
+    read_wfn_provenance,
+    uniform_band_windows,
 )
 
 __all__ = [
     # the class, and the k-spec vocabulary its methods take
-    "WfnLoader", "KSpec", "IBZRows",
+    "WfnLoader", "WfnProvenance", "read_wfn_provenance",
+    "KSpec", "IBZRows", "uniform_band_windows",
     # module-level helpers the in-tree tests pin by name (see above)
     "_phdf5_unfold_kernel",
     "_sharded_zero_proto_fn", "_get_bispinor_lift_jit",

@@ -97,25 +97,20 @@ class HTransformProductionReport:
         for line in architecture_lines(self.runtime):
             self.emit(line)
 
-    def environment(self, *, params, wfn, gram_plan, fine_plan,
+    def environment(self, *, params, wfn, fine_plan,
                     fine_enabled: bool) -> None:
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        requested_eigh = resolve_text(params.get("eigh_backend", "auto"))
-        eigh_text = policy(
-            requested_eigh,
-            ("auto", "off", "distributed", "cusolvermp", "slate",
-             "scalapack"))
-        if requested_eigh.strip().lower() != str(gram_plan.requested).lower():
-            eigh_text += f" -> {gram_plan.requested}"
-        if str(gram_plan.requested).lower() != str(gram_plan.backend).lower():
-            eigh_text += f" -> {gram_plan.backend}"
-        geometry = ("replicated native JAX" if gram_plan.is_native else
-                    f"one matrix tile over {int(gram_plan.mesh.shape['x'])} x "
-                    f"{int(gram_plan.mesh.shape['y'])} ranks")
-        self.emit(f"Gram eigensolve: {eigh_text}; {geometry}; n={int(gram_plan.n)}")
+        multiplier = float(params.get("htransform_rank_multiplier", 20.0))
+        if multiplier == 0.0:
+            multiplier = 20.0
+        self.emit(
+            "Galerkin basis : whole-state randomized QRCP; search ceiling "
+            f"{multiplier:.5f} x fitted bands; qr_eps="
+            f"{float(params.get('htransform_qr_eps', 1.0e-3)):.5e}; seed="
+            f"{int(params.get('htransform_qrcp_seed', 0))}; no Gram eigensolve")
         if fine_enabled:
             fine_text = policy(
                 fine_plan.requested,

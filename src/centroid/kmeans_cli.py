@@ -99,8 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Which scalar field to use as the kmeans weight. "
                         "'scalar' (default) is the standard charge density "
                         "ρ(r), the right weight for charge-channel ISDF "
-                        "(γ̃^0).  'current' is the squared Gordon-decomposed "
-                        "Pauli current Σ_{n,k,i}(j^Gordon_{n,k,i})², the "
+                        "(γ̃^0).  'current' is the squared Dirac current "
+                        "Σ_{n,k,i}|Ψ†α_iΨ/α_fs|² (exactly the Gordon current "
+                        "for LORRAX's kinetic-balance lift), the "
                         "right weight for the i-channel ISDF (γ̃^{1,2,3}) "
                         "in the bispinor pipeline.  Output files are "
                         "written with distinguishing suffixes ('' / "
@@ -167,9 +168,11 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 # switch owns all of them; the concise production report uses rank0_print.
 print0 = debug_print
 
+import gc
 import os
 import time
 
+import jax
 import numpy as np
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -197,6 +200,52 @@ from .production_output import (
     format_kmeans_report,
     prune_band_ranges,
 )
+
+
+def _release_lloyd_before_prune(*arrays) -> None:
+    """Synchronize and release the completed Lloyd device state.
+
+    Pivoted-Cholesky immediately loads a new WFN working set, and the prune
+    consumes none of the returned labels or preparation grids: snapping has
+    already copied the centroid coordinates and candidate indices to the host.
+    Make that lifecycle boundary explicit and report BFC's measured effect.
+    """
+    def _bytes_in_use():
+        used_values = []
+        for device in jax.local_devices():
+            stats = device.memory_stats() or {}
+            used = stats.get("bytes_in_use")
+            if used is not None:
+                used_values.append(int(used))
+        return max(used_values) if used_values else None
+
+    before = _bytes_in_use()
+    unique_arrays = []
+    seen = set()
+    for array in arrays:
+        if isinstance(array, jax.Array) and id(array) not in seen:
+            jax.block_until_ready(array)
+            unique_arrays.append(array)
+            seen.add(id(array))
+    for array in unique_arrays:
+        if not array.is_deleted():
+            array.delete()
+    del unique_arrays
+    # Lloyd's executable cache can retain device constants and the allocator
+    # cannot reclaim deleted buffers while Python cycles still own them.
+    jax.clear_caches()
+    gc.collect()
+    after = _bytes_in_use()
+    memory_note = ""
+    if before is not None and after is not None:
+        memory_note = (
+            f"; device bytes-in-use {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
+    print("Released completed Lloyd/preparation device state before prune "
+          f"WFN transfer{memory_note}")
+
+
 # Reachable through the one service-path bootstrap above; gated by
 # tests/test_service_path_bootstrap.py.
 import symmetry_maps                                            # noqa: E402
@@ -277,8 +326,6 @@ def _resolve_symmetry(args, wfn, sym, charge_density):
     """
     if args.no_orbit:
         return None, None, None, 1, False
-    from ffi import _services
-    _services.ensure_on_path()
     from symmetry_maps import real_space_action_tables
     R, Rinv, tau = real_space_action_tables(
         wfn, sym, charge_density=charge_density)
@@ -303,8 +350,8 @@ def _resolve_weight(args, wfn, charge_density, Rinv, tau, dist_mesh=None):
     if args.centroid_weight != "band_range":
         return charge_density, (
             "scalar charge density ρ(r)" if args.density_mode == "scalar"
-            else "Gordon-decomposed Pauli current "
-                 "Σ_{n,k,i}(j^Gordon_{n,k,i}(r))²"), None
+            else "direct Dirac current "
+                 "Σ_{n,k,i}|Ψ†α_iΨ/α_fs|²"), None
 
     if args.density_mode != "scalar":
         raise ValueError(
@@ -350,8 +397,6 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         # matching centroid_source_map_and_wrap and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
         # for Si Fd-3m.
-        from ffi import _services
-        _services.ensure_on_path()
         from symmetry_maps import unfold_orbit_unique_with_id
         unfolded, orbit_id = unfold_orbit_unique_with_id(
             reps_snapped, np.asarray(Rinv), np.asarray(tau))
@@ -464,7 +509,7 @@ def main():
 
     with timing.section("setup.wfn_io"):
         wfn = WfnLoader("WFN.h5")
-        sym = symmetry_maps.SymMaps(wfn)
+        sym = wfn.symmetry()
 
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
@@ -562,7 +607,7 @@ def main():
         kmeans_target = M_cand
 
     with timing.section("kmeans"):
-        _, centroids, _, _ = weighted_kmeans_jax(
+        labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
             avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
@@ -579,6 +624,18 @@ def main():
     pruned = False
     prune_rank = None
     if oversample > 1.0 and n_unique > N_c:
+        release_arrays = [labels, centroids]
+        for array in (weight, kmeans_weight, charge_density):
+            # ``charge_density`` is the plot payload.  In charge-weight mode
+            # both weight names alias that same JAX array, so retaining only
+            # the charge_density Python reference is not enough: deleting an
+            # alias deletes the underlying device buffer for every reference.
+            if not args.plot or array is not charge_density:
+                release_arrays.append(array)
+        _release_lloyd_before_prune(*release_arrays)
+        del release_arrays, labels, centroids, weight, kmeans_weight
+        if not args.plot:
+            del charge_density
         (centroid_indices, n_unique, rank, n_orbit_keep,
          _n_val_eff, _max_band) = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,

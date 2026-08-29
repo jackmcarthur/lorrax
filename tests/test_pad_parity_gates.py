@@ -45,6 +45,7 @@ equality, and where it is not we check the structural property.
 """
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from pathlib import Path
@@ -272,6 +273,206 @@ def test_there_is_exactly_one_mesh_divisibility_pad_helper():
     assert hits == [], (
         f"a second mesh-divisibility pad helper is back in {hits}; "
         "runtime.padding.pad_axis is the one implementation")
+
+
+def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
+    """The kmeans/htransform seam has one spec and one arithmetic backend.
+
+    This is deliberately a source gate: importing htransform initializes the
+    communicator/FFI stack, while the property under test is which authority
+    its static layout planning names.  Value/HLO parity remains in the driver
+    and staged-reshard suites.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    src = repo / "src"
+    layout_path = src / "common" / "wfn_layout.py"
+    galerkin_path = src / "isdf" / "galerkin.py"
+    app_paths = (
+        layout_path,
+        src / "common" / "mtxel_sweep.py",
+        src / "common" / "parallel_transport.py",
+        src / "common" / "wfn_transforms.py",
+        src / "common" / "psi_G_store.py",
+        src / "bandstructure" / "htransform.py",
+        galerkin_path,
+        src / "file_io" / "parallel_transport.py",
+        src / "gw" / "kin_ion_io.py",
+        src / "gw" / "qsgw_density.py",
+        src / "gw" / "sc_iteration.py",
+        src / "psp" / "get_dipole_mtxels.py",
+    )
+    mtxel = (src / "common" / "mtxel_sweep.py").read_text()
+    bundle = (src / "gw" / "wavefunction_bundle.py").read_text()
+    parallel = (src / "common" / "parallel_transport.py").read_text()
+    wfn = (src / "common" / "wfn_transforms.py").read_text()
+    store = (src / "common" / "psi_G_store.py").read_text()
+    ht = (src / "bandstructure" / "htransform.py").read_text()
+    galerkin = galerkin_path.read_text()
+    staged = (src / "common" / "staged_reshard.py").read_text()
+    fit = (src / "common" / "sharding_fit.py").read_text()
+    gflat_body = wfn.split("def gflat_to_rmu(", 1)[1].split("\ndef ", 1)[0]
+    accumulate_body = wfn.split(
+        "def accumulate_rchunk_to_gflat(", 1)[1].split("\ndef ", 1)[0]
+    centroid_body = wfn.split(
+        "def load_centroids_band_chunked(", 1)[1].split("\ndef ", 1)[0]
+    galerkin_body = galerkin.split("def fit_galerkin_basis(", 1)[1].split(
+        "\ndef ", 1)[0]
+    move_body = staged.split("def band_to_product_r_reshard(", 1)[1].split(
+        "\ndef ", 1)[0]
+    subset_body = fit.split("def _largest_divisible_subset(", 1)[1].split(
+        "\ndef ", 1)[0]
+
+    # Code-token census, not a grep through comments/docstrings (TASTE 17):
+    # the application-side ψ(G-flat) clients may contain exactly one literal,
+    # at the dependency-light authority.  A retyped literal in any live client
+    # makes this fail even if that client still imports the authority too.
+    def is_band_sphere_literal(node):
+        if not isinstance(node, ast.Call) or len(node.args) != 4:
+            return False
+        if not isinstance(node.func, ast.Name) or node.func.id != "P":
+            return False
+        first, axes, third, fourth = node.args
+        if not all(isinstance(arg, ast.Constant) and arg.value is None
+                   for arg in (first, third, fourth)):
+            return False
+        if not isinstance(axes, (ast.Tuple, ast.List)) or len(axes.elts) != 2:
+            return False
+        return [getattr(item, "value", None) for item in axes.elts] == ["x", "y"]
+
+    literal_sites = {
+        path.relative_to(src).as_posix(): [
+            node.lineno for node in ast.walk(ast.parse(path.read_text()))
+            if is_band_sphere_literal(node)
+        ]
+        for path in app_paths
+    }
+    literal_sites = {path: lines for path, lines in literal_sites.items() if lines}
+    assert list(literal_sites) == ["common/wfn_layout.py"], literal_sites
+    assert len(literal_sites["common/wfn_layout.py"]) == 1, literal_sites
+
+    # The two low-memory face layouts likewise have one common-layer
+    # spelling.  The GW bundle re-exports them for compatibility, while the
+    # finite-q common-layer endpoint consumes the common owner directly.
+    layout_tree = ast.parse(layout_path.read_text())
+    layout_names = {
+        target.id
+        for node in ast.walk(layout_tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert {"PSI_NMU_SPEC", "PSI_MUN_SPEC"} <= layout_names
+    bundle_tree = ast.parse(bundle)
+    bundle_assignments = {
+        target.id
+        for node in ast.walk(bundle_tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert not ({"PSI_NMU_SPEC", "PSI_MUN_SPEC"} & bundle_assignments)
+    assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC" in bundle
+    assert "from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, band_sphere_spec" in mtxel
+    assert "NamedSharding(geom.mesh, PSI_NMU_SPEC)" in mtxel
+    assert "NamedSharding(geom.mesh, PSI_MUN_SPEC)" in mtxel
+    endpoint = next(
+        node for node in ast.parse(mtxel).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "finite_transfer_current_to_centroids")
+    old_face_literals = {
+        (None, "x", None, None, "y"),
+        (None, None, None, "x", "y"),
+    }
+    endpoint_literals = {
+        tuple(arg.value for arg in node.args)
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "P"
+        and all(isinstance(arg, ast.Constant) for arg in node.args)
+    }
+    assert endpoint_literals.isdisjoint(old_face_literals), endpoint_literals
+
+    # The old mtxel_sweep location is not a compatibility facade.  Scan import
+    # nodes over the bounded source root so a new indirect consumer cannot make
+    # two apparent owners without reintroducing the literal itself.
+    legacy_imports = []
+    for root in (src, repo / "tests"):
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if (isinstance(node, ast.ImportFrom)
+                        and node.module == "common.mtxel_sweep"
+                        and any(alias.name == "band_sphere_spec"
+                                for alias in node.names)):
+                    legacy_imports.append(
+                        f"{path.relative_to(repo).as_posix()}:{node.lineno}")
+    assert legacy_imports == [], legacy_imports
+    mtxel_all = next(
+        node.value for node in ast.walk(ast.parse(mtxel))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets)
+    )
+    assert "band_sphere_spec" not in {
+        item.value for item in mtxel_all.elts if isinstance(item, ast.Constant)
+    }
+
+    assert "GFLAT_LOAD_SPEC" not in wfn
+    assert "band_sphere_spec()" in store
+    assert "p = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in store
+    assert "p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])" not in store
+    assert "p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)" in gflat_body
+    assert "np.prod([mesh.shape" not in gflat_body
+    assert "mu_gflat_spec = P(None, ('x', 'y'), None)" in accumulate_body
+    assert "p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)" in accumulate_body
+    assert "np.prod([mesh.shape" not in accumulate_body
+    assert "p_band = spec_divisor(mesh_xy, sharding_load, axis=1)" in centroid_body
+
+    # Streaming owns one fixed, mesh-divisible band tile and pads the logical
+    # window to an integer number of those tiles.  Match expressions as ASTs:
+    # this pins the contract without copying its extent arithmetic into a
+    # second executable helper (and without depending on source formatting).
+    centroid_tree = ast.parse(
+        "def load_centroids_band_chunked(" + centroid_body)
+
+    def has_centroid_assignment(name, expression):
+        expected = ast.dump(ast.parse(expression, mode="eval").body)
+        return any(
+            ast.dump(node.value) == expected
+            for node in ast.walk(centroid_tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+        )
+
+    assert has_centroid_assignment(
+        "band_tile", "round_up(requested_band_tile, p_band)")
+    assert has_centroid_assignment(
+        "nb_accum", "round_up(nb_total, band_tile)")
+    assert has_centroid_assignment(
+        "nb_per_band_shard",
+        "band_tile // p_band if stream_tiles "
+        "else round_up(nb_total, p_band) // p_band",
+    )
+    assert has_centroid_assignment(
+        "nb_padded_global",
+        "band_tile if stream_tiles else nb_per_band_shard * p_band",
+    )
+    assert "(nb_total + n_devices - 1) // n_devices" not in centroid_body
+    assert "divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)" in parallel
+    assert "p_band = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)" in galerkin_body
+    assert "p_band = max(1, int(mesh_xy.size))" not in galerkin_body
+    assert "n_pad = round_up(nq, batch_size) - nq" in ht
+    assert "n_pad = (-nq) % batch_size" not in ht
+    assert "band_divisor = spec_divisor(mesh, in_spec, axis=1)" in move_body
+    assert "r_divisor = spec_divisor(mesh, out_spec, axis=3)" in move_body
+    assert "ndev = p_x * p_y" not in move_body
+    assert "m_pad = round_up(m_loc, p_y)" in staged
+    assert "m_pad = -(-m_loc // p_y) * p_y" not in staged
+    assert "p = shard_factor(mesh, picked)" in subset_body
+    assert "p *= int(mesh.shape[a])" not in subset_body
 
 
 def test_init_bse_subspace_drops_the_pad_by_count_not_by_value():

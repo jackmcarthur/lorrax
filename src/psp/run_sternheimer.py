@@ -91,7 +91,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1108,7 +1107,7 @@ def run_sternheimer(
     # ── Load WFN + SymMaps + Meta ──────────────────────────────────────
     t_setup = time.perf_counter()
     wfn = WfnLoader(wfn_path)
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
     nspinor = int(wfn.nspinor)
 
     # Occupied count per k (insulator).  wfn.nelec is ifmax — total occupied
@@ -1162,12 +1161,12 @@ def run_sternheimer(
     # have different nG).  Compute it once and pass to every
     # setup_H_k_from_kvec call.
     from psp.dft_operators import compute_ngkmax
-    kpts_all = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    kpts_all = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
     ngkmax = int(compute_ngkmax(kpts_all, np.asarray(wfn.bdot),
                                  float(wfn.ecutwfc), tuple(wfn.fft_grid)))
     H_cache = []   # list of (H_k, Gk_int_canonical) per full-BZ k
     for ik in range(sym.nk_tot):
-        kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+        kv = np.asarray(kpts_all[ik], dtype=np.float64)
         H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta,
                                    V_loc_r=V_loc, ngkmax=ngkmax)
         Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
@@ -1234,7 +1233,7 @@ def run_sternheimer(
     Gy_full       = jnp.stack([H_cache[ik][0].Gy     for ik in range(nk_full)], axis=0)
     Gz_full       = jnp.stack([H_cache[ik][0].Gz     for ik in range(nk_full)], axis=0)
     Gk_int_full   = jnp.stack([H_cache[ik][1]        for ik in range(nk_full)], axis=0)
-    kvec_kmq_full = jnp.asarray(np.asarray(sym.unfolded_kpts), dtype=jnp.float64)
+    kvec_kmq_full = jnp.asarray(kpts_all, dtype=jnp.float64)
 
     # ψ on FFT box (donatable through the chi pipeline).
     U_box_full    = psi_box_full[:, :n_occ]                              # (nk, nv, ns, nx, ny, nz)
@@ -1341,16 +1340,15 @@ def run_sternheimer(
     # ══════════════════════════════════════════════════════════════════
     #  q-loop:  Python over q, vmap+jit over k
     # ══════════════════════════════════════════════════════════════════
+    from common.kq_mapping import kminq_idx_for_iq
+    from symmetry_maps import bgw_signed_q_representative
     for q_idx, iq_red in enumerate(iq_list):
-        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
-        # Signed representative q_signed ∈ [-1/2, 1/2)³.
-        qvec = qvec_pos - np.round(qvec_pos)
+        qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
         if verbose:
             print(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
 
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)
         Gprime_j = jnp.asarray(Gprime_int)
-        from common.kq_mapping import kminq_idx_for_iq
         kminq_idx_j = jnp.asarray(kminq_idx_for_iq(sym, iq_red))
         qvec_j = jnp.asarray(qvec, dtype=jnp.float64)
 
@@ -1397,7 +1395,7 @@ def run_sternheimer(
     if with_s_tensor:
         if verbose:
             print(f"\n══ S-tensor at q=0 ══")
-        kvec_k_stack    = jnp.asarray(np.asarray(sym.unfolded_kpts), dtype=jnp.float64)
+        kvec_k_stack    = jnp.asarray(kpts_all, dtype=jnp.float64)
         precond_stack_S = jnp.stack([
             tpa_preconditioner_diag(H_cache[ik][0].T_diag, K_bar_sq_full[ik])
             for ik in range(nk_full)

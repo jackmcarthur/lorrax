@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
+from distrib_la._shape import ipiv_local_len
 from distrib_la._slate import (_mesh_key, ensure_registered,
                                get_or_init_context, validate_mesh)
 
@@ -332,12 +333,6 @@ def _validate_lu_geometry(A, mesh: Mesh, *, what: str):
     return Px, Py, nq, n, n // gmax
 
 
-def _ipiv_local_len(n: int, Px: int, g: int) -> int:
-    """Per-rank ipiv extent: ``LOCr(M_A) + MB_A`` per the ScaLAPACK spec.
-    On the square / 1-D meshes the wrapper allows, ``LOCr = n / Px``."""
-    return n // max(Px, 1) + g
-
-
 def batched_distributed_getrf(
     A: jax.Array,
     *,
@@ -374,7 +369,7 @@ def batched_distributed_getrf(
     Px, Py, nq, n, g = _validate_lu_geometry(A, mesh, what="getrf")
     ensure_registered(mesh)
     ctx_handle = get_or_init_context(mesh)
-    ipiv_len = _ipiv_local_len(n, Px, g)
+    ipiv_len = ipiv_local_len(n, Px, g)
 
     key = ("scalapack_getrf", _mesh_key(mesh), A.dtype,
            nq, n, g, int(ctx_handle))
@@ -426,7 +421,7 @@ def batched_distributed_getrs(
             f"got LU={LU.shape}, B={B.shape}")
     if LU.dtype != B.dtype:
         raise ValueError(f"LU.dtype {LU.dtype} != B.dtype {B.dtype}")
-    ipiv_len = _ipiv_local_len(n, Px, g)
+    ipiv_len = ipiv_local_len(n, Px, g)
     P_tot = Px * Py
     if (ipiv.ndim != 2 or int(ipiv.shape[0]) != nq
             or int(ipiv.shape[1]) != P_tot * ipiv_len

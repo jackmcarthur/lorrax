@@ -7,12 +7,12 @@ measures BOTH halves of it:
 
 * ``import zeta_loader`` drags in NO lorrax package.  Clean, with the
   monorepo unreachable in both senses (``sys.modules`` AND ``sys.path``).
-* The FORMAT surface — ``probe_zeta_file`` / ``write_g0_mu`` — is FULLY
+* The FORMAT surface — ``probe_zeta_file`` — is FULLY
   FUNCTIONAL there.  Not "importable": a probe that imports and then cannot
   read a file is not a standalone probe.  Both of its production call sites
   run OUTSIDE a loader's lifetime (the two ``gw_init`` probes gate whether
-  the fit runs at all; the append happens after the collective handle is
-  gone), so this is the half that has to work with nothing else present.
+  the fit runs at all), so this is the half that has to work with nothing
+  else present.
 * The DATA path is NOT standalone, and it REFUSES BY NAME rather than
   dying in an ImportError traceback three frames deep.  That is the
   wave-1b seam made observable: ``file_io.mf_header``,
@@ -108,17 +108,15 @@ def test_zeta_loader_imports_with_the_monorepo_absent():
 
 
 def test_the_format_surface_is_fully_functional_with_no_lorrax():
-    """probe_zeta_file AND write_g0_mu, RUN, in the isolated child.
+    """``probe_zeta_file`` runs in the isolated child.
 
     "Importable" is the weak claim and it is not the one D8 makes.  Both of
-    these functions have production call sites that run where no loader
-    could exist, so the standalone property has to be about what they DO:
+    This function has production call sites that run where no loader could
+    exist, so the standalone property has to be about what it DOES:
 
     * the probe answers on a garbage file (``readable=False`` + an error
       record) and on ``None`` — its never-raises contract, exercised where
-      there is no lorrax to fall back on;
-    * ``write_g0_mu`` builds a real ζ file, appends ``g0_mu``, and the
-      bytes read back equal what went in.
+      there is no lorrax to fall back on.
 
     The fixture builder (``zeta_synth``) is on the child's path and is pure
     h5py+numpy for exactly this reason — see its module docstring.  A
@@ -148,19 +146,6 @@ def test_the_format_surface_is_fully_functional_with_no_lorrax():
         "assert q.readable is True and q.dataset_name == 'zeta_q_G'\n"
         "assert q.mu_extent == 5 and q.zeta_done is True\n"
         "assert q.r_mu_fft_idx.shape == (5, 3)\n"
-        # --- write_g0_mu: round trip, and the guard ----------------------
-        "g0 = (np.arange(15.0).reshape(3, 5)\n"
-        "      + 1j * np.arange(15.0).reshape(3, 5))\n"
-        "assert ZL.write_g0_mu(z, g0, n_rmu_expected=5) == (3, 5)\n"
-        "import h5py\n"
-        "with h5py.File(z, 'r') as f:\n"
-        "    assert (f['g0_mu'][...] == g0).all()\n"
-        "try:\n"
-        "    ZL.write_g0_mu(z, np.zeros((3, 8)), n_rmu_expected=5)\n"
-        "except ValueError as exc:\n"
-        "    assert 'LOGICAL centroid count' in str(exc)\n"
-        "else:\n"
-        "    raise AssertionError('the logical-extent guard did not fire')\n"
     )
     run = import_isolation("zeta_loader", _lorrax_roots(), src_dir=_SVC_SRC,
                            deps=_DEPS, extra_path=[_LXKIT_SRC, _TESTS],
@@ -195,7 +180,6 @@ def test_the_format_surface_needs_no_jax():
         "Z.build_gflat(z, n_q=2, n_rmu=3, ngkmax=4)\n"
         "p = ZL.probe_zeta_file(z)\n"
         "assert p.readable and p.dataset_name == 'zeta_q_G'\n"
-        "ZL.write_g0_mu(z, np.zeros((2, 3), complex), n_rmu_expected=3)\n"
         "assert 'jax' not in sys.modules, 'the format surface pulled jax'\n"
         # the positive control: the reader is lazy, not gone.
         "cls = ZL.ZetaLoader\n"
@@ -244,7 +228,7 @@ def test_the_data_path_refuses_by_naming_the_missing_host_tree_module():
         "    assert 'HOST-TREE module' in m, m\n"
         "    assert 'wave 1b' in m, m\n"
         "    assert 'ffi._services.ensure_on_path()' in m, m\n"
-        "    assert 'probe_zeta_file / write_g0_mu' in m, m\n"
+        "    assert 'probe_zeta_file' in m, m\n"
         "else:\n"
         "    raise AssertionError(\n"
         "        'ZetaLoader constructed with lorrax off sys.path; the "
@@ -281,7 +265,7 @@ def test_the_four_lazy_helpers_share_one_refusal_sentence():
         assert "HOST-TREE module" in msg
         assert "wave 1b" in msg
         assert "ffi._services.ensure_on_path()" in msg
-        assert "probe_zeta_file / write_g0_mu" in msg
+        assert "probe_zeta_file" in msg
         assert "pure h5py+numpy" in msg
 
 

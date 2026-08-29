@@ -387,6 +387,15 @@ peak_B = persistent_total
        + 2·16·n_k·n_s²·μ²/P
 ```
 
+Under `low_mem_bands=true` this stage's band contraction is a distributed
+SUMMA GEMM over the two-face carrier rather than a rank-local einsum over
+single-axis ψ — see
+[`zeta_fit_face_psi_cct.md`](zeta_fit_face_psi_cct.md) for the staging and
+why it reuses `gw.greens_function_kernel`'s GEMM-seam convention.  The
+transient shape above is largely unchanged (still one open-spin pair
+density per side); the persistent floor changes as `_persistent_bytes`'s
+`psi_copies` docstring now states.
+
 ### Peak C — fit_one_rchunk
 
 The binding peak on most production runs.  The pair-density phase holds:
@@ -557,7 +566,8 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
    `get_device_memory_gb` returns `0.9 · bytes_available`; choose
    `28.0` for a 40 GB A100, `56.0`–`72.0` for an 80 GB hbm80g A100,
    `6.0` for an 8 GB local GPU.  The planner default is `ns²`-aware
-   (`_default_util`): 0.90 scalar, 0.85 spinor `ns=2`, 0.78 bispinor
+   (`common.gpu_utils.bfc_fragmentation_target_utilization`): 0.90 scalar,
+   0.85 spinor `ns=2`, 0.78 bispinor
    `ns=4` — larger `ns²` means a bigger single contiguous Stage-C arena,
    which needs more headroom against BFC fragmentation.
 2. **Pick the mesh** `p_x × p_y = total_GPUs`.  Square-ish meshes
@@ -664,7 +674,7 @@ is a systematic *low bound* for a kernel containing an FFT.
 
 ```
 gw/gflat_memory_model.py::_fft_box_bytes          # Stage-A FFT-box term
-  -> common/fft_helpers.py::query_fft_peak_bytes  # compile the production FFT
+  -> common/fft_helpers.py::query_fft_peak_bytes  # compile exact kind + norm
      -> runtime/aot_memory.py::aot_kernel_peak_bytes
           compiled.memory_analysis()      -> compiled_peak
           parse fft ops from as_text()    -> FftSpec per op
@@ -672,13 +682,17 @@ gw/gflat_memory_model.py::_fft_box_bytes          # Stage-A FFT-box term
         total = compiled_peak + cufft_scratch
 ```
 
-`query_fft_peak_bytes` compiles **the same helper production runs**
-(`make_sharded_fftn_3d`: a `shard_map`'d device-local rank-3 `jnp.fft.fftn`,
-one cuFFT plan per rank). Before 2026-07-30 it compiled the per-axis
+`query_fft_peak_bytes` requires the caller to state the transform kind and
+normalization, then compiles **the same helper production runs**. Stage A asks
+for `make_sharded_ifftn_3d(..., norm='ortho')`, exactly matching the WFN
+spatial loader: a `shard_map`'d device-local rank-3 `jnp.fft.ifftn`, one cuFFT
+plan per rank. Before 2026-07-30 the query compiled the per-axis
 `custom_partitioning` form instead — three rank-1 plans that no production path
 ever builds — and read only `memory_analysis()`, while its own docstring
 promised the result "includes cuFFT scratch". Both defects are fixed; the
-per-axis form has been deleted rather than left as a modelling-only path.
+per-axis form has been deleted rather than left as a modelling-only path. The
+query cache includes kind and norm because the normalization scale can change
+XLA's live buffers even when cuFFT happens to choose the same plan.
 
 The query itself was calibrated in `scripts/profiling/aot_cufft_sanity.py`
 using the `(75, 75, 200)` CrI3 grid and the batched FFT shape from the old
@@ -749,10 +763,12 @@ That figure is theirs, not measured here, so it is recorded rather than
 folded into a term: adding an unverified constant to the model is how the
 `fft_box_factor` story started. Two things make it tolerable for now — it is
 a per-process constant rather than a shape-dependent term that grows with the
-chunk knobs, and `_default_util` already withholds 10–22 % of the budget
-(0.90 / 0.85 / 0.78 by `ns`), which is 0.8–1.8 GB on an 8 GB card and far
-more on production cards. It is still an unmodelled term and should be closed
-by an arena-size query on the FFI side, not by a constant here.
+chunk knobs, and
+`common.gpu_utils.bfc_fragmentation_target_utilization` already withholds
+10–22 % of the budget (0.90 / 0.85 / 0.78 by `ns`), which is 0.8–1.8 GB on
+an 8 GB card and far more on production cards. It is still an unmodelled term
+and should be closed by an arena-size query on the FFI side, not by a constant
+here.
 
 ## Measured corrections behind the G-flat terms
 

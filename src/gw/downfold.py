@@ -423,11 +423,10 @@ def negate_q_index(kgrid) -> np.ndarray:
     to coincide with it on a SYMMETRIC window (``S(-q) = conj(S(q))``) and
     does not in general, which is why the relabel is what ships.
     """
-    n1, n2, n3 = (int(v) for v in kgrid)
-    lin = np.arange(n1 * n2 * n3).reshape(n1, n2, n3)
-    return lin[np.ix_((-np.arange(n1)) % n1,
-                      (-np.arange(n2)) % n2,
-                      (-np.arange(n3)) % n3)].ravel()
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import q_negation_index
+    return q_negation_index(kgrid)
 
 
 # ---------------------------------------------------------------------------
@@ -856,9 +855,8 @@ def select_cur_centroids(
     moves it, the same way a band-window resolver moves the counts.
     """
     from centroid import distribution as dist
-    from centroid.pivoted_cholesky import (
-        make_sharded_pivoted_cholesky_select, refuse_unless_select_certified,
-    )
+    from centroid.pivoted_cholesky import refuse_unless_select_certified
+    from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
     from common.collectives import gather_to_host
 
     if not (0.0 < float(rcond) < 1.0):

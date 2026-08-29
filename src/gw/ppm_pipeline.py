@@ -49,6 +49,7 @@ from .ppm_sigma import (
     fit_ppm,
 )
 from .ppm_tau_kernel import precompile_sigma
+from .ppm_windows import hgl_partition_required, sigma_regularization_for_config
 
 
 @dataclass(frozen=True)
@@ -547,6 +548,12 @@ def compute_ppm_sigma_pipeline(
         )
 
         # Step 1: PPM pole fit
+        q_neg = None
+        if not is_hl:
+            from ffi import _services
+            _services.ensure_on_path()
+            from symmetry_maps import q_negation_index
+            q_neg = q_negation_index(tuple(int(v) for v in meta.kgrid))
         ppm = fit_ppm(
             W_static_q, W_probe_q, V_q, probe_omega, mesh_xy,
             fallback_omega=config.ppm.fallback_omega,
@@ -554,6 +561,12 @@ def compute_ppm_sigma_pipeline(
             print_fn=print_fn,
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
+            q_neg_index=q_neg,
+            # User-ruled GN variant: re-anchor the exact 0.2% tails at the fit
+            # owner before the incumbent exact-pane planner sees the reduced
+            # support.  This is lossy versus BGW finite-pole parity; HL is a
+            # different real-axis model and is deliberately unchanged.
+            coarsen_extreme_tails=not is_hl,
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
@@ -605,7 +618,15 @@ def compute_ppm_sigma_pipeline(
             for note in plan.notes:
                 print_fn(f"  Σc band extrapolation: {note}")
         with timing.section("sigma.compile"):
-            precompile_sigma(wfns, ppm, meta, mesh_xy, brackets=plan.bounds)
+            sigma_xi = sigma_regularization_for_config(config)
+            precompile_sigma(
+                wfns, ppm, meta, mesh_xy,
+                brackets=plan.bounds,
+                energy_windows=hgl_partition_required(
+                    config.omega_grid_ry,
+                    sigma_xi.resolved_ry,
+                    config.sigma.window_edge_factor),
+            )
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,

@@ -1,8 +1,10 @@
 """Memory detection helpers for JAX device budget.
 
 Used by ``gw.gw_init`` and ``gw.gw_config`` to size chunking parameters.
-The only public entry points callers actually use are
-:func:`get_device_memory_gb` and :func:`get_device_memory_info`.
+This module also owns the one BFC fragmentation target shared by planners
+whose large stage allocations scale with a small field-width factor, and the
+worst-process residency reduction required when allocator state sizes static
+multi-process control flow.
 """
 
 import os
@@ -12,6 +14,64 @@ import subprocess
 # ============================================================================
 # Memory Detection for Auto-sizing Chunk Parameters
 # ============================================================================
+
+def bfc_fragmentation_target_utilization(width_factor: int) -> float:
+    """Return the conservative stage fraction of an available BFC budget.
+
+    This is a *second* bound after live available memory has been measured;
+    it is not an estimate of array bytes.  A stage can fit by arithmetic and
+    still fail when BFC must place one large arena among earlier transient
+    allocations.  ``width_factor`` is the caller-visible multiplier of the
+    stage's large buffers (the physics meaning stays at the caller).
+
+    The table is measured production policy, formerly private to the G-flat
+    planner: factor 4 at 0.85 failed with a 23-GB single arena on a 40-GB
+    device, while 0.78 fit.  Factors 2 and 1 retain progressively more of the
+    budget.  Keeping the table here prevents independent GW and htransform
+    copies from drifting.
+    """
+    try:
+        factor = int(width_factor)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"width_factor must be a positive integer, got {width_factor!r}") \
+            from None
+    if factor != width_factor or factor <= 0:
+        raise ValueError(
+            f"width_factor must be a positive integer, got {width_factor!r}")
+    if factor >= 4:
+        return 0.78
+    if factor == 2:
+        return 0.85
+    return 0.90
+
+
+def worst_process_resident_bytes(local_bytes: int) -> int:
+    """Return one rank-invariant allocator-residency floor.
+
+    Allocator residency is process-local and can differ because JIT arenas are
+    released asynchronously.  Any value that sizes a static executable or
+    host-loop shape must therefore be derived from the same worst-process
+    floor on every rank.  Keep the communication in the canonical process-
+    collective service and the memory policy here.
+    """
+    import numpy as np
+
+    from common.collectives import all_gather_processes
+
+    local_i = int(local_bytes)
+    if local_i < 0:
+        raise ValueError(f"resident bytes must be nonnegative, got {local_i}")
+    gathered = np.asarray(
+        all_gather_processes(np.asarray(local_i, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if gathered.size == 0 or np.any(gathered < 0):
+        raise ValueError(
+            "process residency gather returned no values or a negative value"
+        )
+    return int(np.max(gathered))
+
 
 def _query_nvidia_smi_memory(field: str) -> float | None:
     """Query a single GPU memory field (in MiB) from nvidia-smi."""
@@ -193,5 +253,7 @@ def get_device_memory_info() -> dict:
     }
 
 
-__all__ = ["get_device_memory_gb", "get_device_memory_info",
-           "get_gpu_memory_nvidia_smi", "get_cpu_memory_total"]
+__all__ = ["bfc_fragmentation_target_utilization",
+           "get_device_memory_gb", "get_device_memory_info",
+           "get_gpu_memory_nvidia_smi", "get_cpu_memory_total",
+           "worst_process_resident_bytes"]

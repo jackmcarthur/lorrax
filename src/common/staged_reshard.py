@@ -1,4 +1,6 @@
-"""``face_to_batch_reshard`` — the STAGED face→batch reshard.
+"""Explicit volume-preserving staged reshard services.
+
+``face_to_batch_reshard`` — the STAGED face→batch reshard.
 
 The movement-only sibling of :mod:`common.contract_bands`.  Where that
 module stages a *contraction* so no ``(μ, μ)``-class tile ever lands on
@@ -174,9 +176,10 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
+from runtime.padding import round_up, spec_divisor
 
 #: The two exchange schedules that land on ``P((ax_x, ax_y), None, None)``.
 #: ``split_b_first`` is the default and the measured one; ``flatten_m_first``
@@ -184,8 +187,15 @@ from common.collectives import warm_mesh_cliques
 ROUTES = ("split_b_first", "flatten_m_first")
 DEFAULT_ROUTE = "split_b_first"
 
-__all__ = ["face_to_batch_reshard", "face_to_batch_reshard_supported",
-           "ROUTES", "DEFAULT_ROUTE"]
+__all__ = [
+    "band_to_product_r_reshard",
+    "face_to_batch_reshard",
+    "face_to_batch_reshard_supported",
+    "shard_local_slice_pad",
+    "shard_local_update",
+    "ROUTES",
+    "DEFAULT_ROUTE",
+]
 
 
 _DIVISIBILITY_MSG = (
@@ -197,6 +207,241 @@ _DIVISIBILITY_MSG = (
     "the spec: a degraded spec here is a replicated batch, which is the "
     "failure this primitive exists to remove.{hint}"
 )
+
+
+def band_to_product_r_reshard(
+    mesh: Mesh, *, axes: tuple[str, str] = ("x", "y")
+) -> Callable:
+    """Factory for the exact band-product → r-product wavefunction move.
+
+    The input and output contracts are::
+
+        (k, b, s, r)  P(None, (x,y), None, None)
+                  ->  P(None, None, None, (y,x))
+
+    This is the two-axis extension of the established ISDF band→r exchange.
+    Both stages are inside one manual-axis region, so GSPMD cannot replace
+    them with its replicate-then-slice fallback::
+
+        y: split r, concat b  ->  P(None, x, None, y)
+        x: split r, concat b  ->  P(None, None, None, (y,x))
+
+    If the incoming flat band-block number is ``x*p_y + y``, the first
+    exchange concatenates the ``y`` blocks for each fixed ``x`` and the
+    second concatenates those groups in ``x`` order.  The final band order
+    is therefore exactly the original global order.  The real-space block
+    is first selected by ``y`` and then by ``x``, hence the deliberately
+    reversed output tuple ``(y,x)``.  Every intermediate contains exactly
+    ``k*b*s*r/(p_x*p_y)`` elements per rank: no axis is ever replicated.
+
+    Callers must zero-pad the free r extent through :mod:`runtime.padding`
+    before this service.  This routine owns movement only; it neither pads
+    nor changes values.
+    """
+    from common.shard_map import shard_map
+
+    ax_x, ax_y = axes
+    names = tuple(mesh.axis_names)
+    if ax_x not in names or ax_y not in names:
+        raise ValueError(
+            "band_to_product_r_reshard: mesh axes "
+            f"{names} do not contain axes={axes!r}")
+    p_x = int(mesh.shape[ax_x])
+    p_y = int(mesh.shape[ax_y])
+    in_spec = P(None, (ax_x, ax_y), None, None)
+    out_spec = P(None, None, None, (ax_y, ax_x))
+    band_divisor = spec_divisor(mesh, in_spec, axis=1)
+    r_divisor = spec_divisor(mesh, out_spec, axis=3)
+
+    def _body(a):
+        if p_y > 1:
+            a = jax.lax.all_to_all(
+                a, ax_y, split_axis=3, concat_axis=1, tiled=True)
+        if p_x > 1:
+            a = jax.lax.all_to_all(
+                a, ax_x, split_axis=3, concat_axis=1, tiled=True)
+        return a
+
+    sm = shard_map(
+        _body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec,
+        check_vma=False)
+    compiled = jax.jit(
+        sm,
+        in_shardings=NamedSharding(mesh, in_spec),
+        out_shardings=NamedSharding(mesh, out_spec),
+    )
+
+    def _reshard(a):
+        shape = tuple(int(s) for s in a.shape)
+        if len(shape) != 4:
+            raise ValueError(
+                "band_to_product_r_reshard expects rank-4 (k,b,s,r), "
+                f"got shape {shape}")
+        # Fail BEFORE the shard_map boundary: accepting a replicated or
+        # r-sharded array here would let that boundary synthesize the exact
+        # implicit generic reshard this service exists to forbid.  Normalize
+        # PartitionSpec's elided trailing Nones by the established
+        # wfn_transforms convention, then require the run's one Mesh object.
+        sharding = getattr(a, "sharding", None)
+        if isinstance(sharding, NamedSharding):
+            actual_spec = tuple(sharding.spec)
+            actual_spec += (None,) * (len(shape) - len(actual_spec))
+        else:
+            actual_spec = (None,) * len(shape)
+        expected_spec = tuple(in_spec)
+        expected_spec += (None,) * (len(shape) - len(expected_spec))
+        same_mesh = (isinstance(sharding, NamedSharding)
+                     and sharding.mesh is mesh)
+        if actual_spec != expected_spec or not same_mesh:
+            raise ValueError(
+                "band_to_product_r_reshard requires an array already "
+                f"committed to {in_spec} on the supplied Mesh; got "
+                f"spec={P(*actual_spec)} on {type(sharding).__name__}. "
+                "Refusing an implicit pre-reshard at the shard_map boundary.")
+        if shape[1] % band_divisor or shape[3] % r_divisor:
+            raise ValueError(
+                "band_to_product_r_reshard requires the band and r extents "
+                f"to divide the {p_x}x{p_y} mesh product: shape={shape}. "
+                "Pad bands through WfnLoader and r through "
+                "runtime.padding.pad_axis.")
+        return compiled(a)
+
+    # Production calls enter through ``_reshard`` so the concrete array's
+    # committed source layout is checked before any staged/JIT boundary.
+    # HLO instrumentation must lower the already-pinned executable directly:
+    # wrapping ``_reshard`` in another jit would replace ``a`` by a tracer and
+    # erase the concrete ``a.sharding`` fact the guard deliberately requires.
+    _reshard.lower = compiled.lower
+
+    warm_mesh_cliques(mesh)
+    return _reshard
+
+
+def shard_local_slice_pad(
+    mesh: Mesh,
+    *,
+    spec: P,
+    axis: int,
+    mesh_axis: str,
+    local_size: int,
+) -> Callable:
+    """Factory for a device-local slice with an exact-zero tail.
+
+    A normal global slice of a ``P(mesh_axis)`` axis changes the global
+    extent and therefore repartitions ownership.  XLA may implement that as
+    full replication followed by slicing.  This primitive instead enters a
+    manual ``shard_map`` first and indexes *within each already-owned shard*.
+    The output keeps ``spec`` and has ``local_size`` entries per shard on
+    ``axis``.  Out-of-range tail entries are exact zeros.
+
+    ``start`` is a replicated scalar measured in LOCAL-shard coordinates.
+    The same compiled executable therefore serves every tile offset, including
+    the padded tail, without a global reshard or a second padding convention.
+    """
+    from common.shard_map import shard_map
+
+    size = int(local_size)
+    if size <= 0:
+        raise ValueError(f"shard_local_slice_pad local_size must be >0; got {size}")
+    spec_t = tuple(spec)
+    rank = len(spec_t)
+    ax = int(axis) % rank
+    spec_full = spec_t + (None,) * (rank - len(spec_t))
+    if mesh_axis not in tuple(mesh.axis_names):
+        raise ValueError(
+            f"shard_local_slice_pad mesh has no axis {mesh_axis!r}: "
+            f"{tuple(mesh.axis_names)!r}")
+    if spec_full[ax] != mesh_axis:
+        raise ValueError(
+            "shard_local_slice_pad requires the sliced axis to be sharded "
+            f"only by {mesh_axis!r}; got spec={spec}, axis={ax}")
+
+    sh = NamedSharding(mesh, spec)
+    rep = NamedSharding(mesh, P())
+
+    def _body(a, start):
+        n_local = int(a.shape[ax])
+        ids = jnp.asarray(start, dtype=jnp.int32) + jnp.arange(
+            size, dtype=jnp.int32)
+        safe = jnp.minimum(ids, jnp.int32(n_local - 1))
+        out = jnp.take(a, safe, axis=ax)
+        mask_shape = [1] * a.ndim
+        mask_shape[ax] = size
+        valid = (ids < jnp.int32(n_local)).reshape(mask_shape)
+        return jnp.where(valid, out, jnp.zeros((), dtype=a.dtype))
+
+    sm = shard_map(
+        _body, mesh=mesh, in_specs=(spec, P()), out_specs=spec,
+        check_vma=False)
+    compiled = jax.jit(
+        sm, in_shardings=(sh, rep), out_shardings=sh)
+
+    def _slice(a, start):
+        sharding = getattr(a, "sharding", None)
+        actual = tuple(sharding.spec) if isinstance(sharding, NamedSharding) else ()
+        actual += (None,) * (a.ndim - len(actual))
+        expected = tuple(spec) + (None,) * (a.ndim - len(tuple(spec)))
+        if not isinstance(sharding, NamedSharding) \
+                or sharding.mesh is not mesh or actual != expected:
+            raise ValueError(
+                "shard_local_slice_pad requires its input already committed "
+                f"to {spec} on the supplied Mesh; got {sharding!r}")
+        return compiled(a, start)
+
+    _slice.lower = compiled.lower
+    return _slice
+
+
+def shard_local_update(mesh: Mesh, *, spec: P) -> Callable:
+    """Factory for donated, device-local tile insertion into a sharded face.
+
+    ``dst`` and ``tile`` share ``spec``.  ``starts`` contains one LOCAL-shard
+    offset per array axis.  Out-of-range tail indices are dropped, so a
+    zero-padded final tile can update a logical-sized destination without
+    backward clamping.  The body is inside ``shard_map`` and donates ``dst``;
+    it cannot communicate or allocate a second global face.
+    """
+    from common.shard_map import shard_map
+
+    sh = NamedSharding(mesh, spec)
+    rep = NamedSharding(mesh, P())
+
+    def _body(dst, tile, starts):
+        grids = jnp.ix_(*(
+            jnp.asarray(starts[d], dtype=jnp.int32)
+            + jnp.arange(tile.shape[d], dtype=jnp.int32)
+            for d in range(dst.ndim)
+        ))
+        return dst.at[grids].set(tile, mode="drop")
+
+    sm = shard_map(
+        _body, mesh=mesh, in_specs=(spec, spec, P()), out_specs=spec,
+        check_vma=False)
+    compiled = jax.jit(
+        sm, in_shardings=(sh, sh, rep), out_shardings=sh,
+        donate_argnums=(0,))
+
+    def _update(dst, tile, starts):
+        for name, value in (("dst", dst), ("tile", tile)):
+            sharding = getattr(value, "sharding", None)
+            actual = (tuple(sharding.spec)
+                      if isinstance(sharding, NamedSharding) else ())
+            actual += (None,) * (value.ndim - len(actual))
+            expected = tuple(spec) + (None,) * (value.ndim - len(tuple(spec)))
+            if not isinstance(sharding, NamedSharding) \
+                    or sharding.mesh is not mesh or actual != expected:
+                raise ValueError(
+                    f"shard_local_update {name} must already be committed "
+                    f"to {spec} on the supplied Mesh; got {sharding!r}")
+        if dst.ndim != tile.ndim or tuple(starts.shape) != (dst.ndim,):
+            raise ValueError(
+                "shard_local_update requires dst/tile of equal rank and "
+                f"starts.shape=({dst.ndim},); got {dst.shape}, {tile.shape}, "
+                f"{tuple(starts.shape)}")
+        return compiled(dst, tile, starts)
+
+    _update.lower = compiled.lower
+    return _update
 
 
 def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
@@ -376,7 +621,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
                 sm = _make_sm(_body_split_b_first)
             else:
                 m_loc = m // p_x
-                m_pad = -(-m_loc // p_y) * p_y          # ceil to a p_y multiple
+                m_pad = round_up(m_loc, p_y)
                 if m_pad == m_loc:
                     keep = None
                 else:

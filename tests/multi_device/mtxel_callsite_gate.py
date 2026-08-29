@@ -81,11 +81,11 @@ from common.collectives import (process_count, process_rank,   # noqa: E402
 from common.jax_compile_cache import _STATE as CC_STATE        # noqa: E402
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,      # noqa: E402
                                 VNL_VELOCITY_SIGN_SHIPPED,
-                                SweepGeometry, band_sphere_spec,
-                                blocks_to_host, dipole_operator,
+                                SweepGeometry, blocks_to_host, dipole_operator,
                                 kinetic_operator,
                                 local_potential_operator, sum_operators,
                                 sweep_matrix_elements, vnl_operator)
+from common.wfn_layout import band_sphere_spec                   # noqa: E402
 from common.wfn_transforms import load_kpoint_fftbox_local     # noqa: E402
 from ffi import _services      # noqa: F401,E402  (path bootstrap; dies
                                  # with the owner's workspace fix)
@@ -209,7 +209,7 @@ def main():
     nocc = int(wfn.nelec)
     f_spin = spin_degeneracy_factor(wfn)
     rho_np = build_valence_density_distributed(
-        wfn, sym, meta, nocc, nk=nk, mesh=mesh, print_fn=p0)
+        wfn, sym, meta, nk=nk, mesh=mesh, print_fn=p0)
     V_H_r = build_hartree_potential(
         jnp.asarray(rho_np), wfn, truncation_2d=truncation_2d,
         expected_electrons=f_spin * float(nocc), print_fn=p0)

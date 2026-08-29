@@ -69,14 +69,35 @@ give the next production attempt (or the next agent) an attributable,
 measured live-array snapshot at each stage instead of the single
 unattributed sync point this module had before.
 
+``low_mem_bands`` face-layout wings (2026-08-22)
+-------------------------------------------------
+``head_wings_sharded``/``static_head_wings_sharded`` (feeding ``Y_x``/
+``Z_y``/``static_Y_x``/``static_Z_y``) now dispatch on ``wfns.layout``
+(``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``, census rows
+6/7): ``layout='legacy'`` is the exact untouched body; ``layout='face'``
+routes to ``_head_wings_sharded_face``/``_static_head_wings_sharded_face``,
+whose kernels (``_head_wing_kernel_face``, ``_static_head_wings_kernel_
+face``) never hold a band-replicated psi copy the way the legacy ring
+does — see ``_head_wing_kernel_face``'s own docstring for the bounded
+mu-blocked-gather algorithm and its relationship (none) to the separately
+registered, still-open v-sharding-reshard 81.74-GiB legacy defect
+(``KNOWN_LORRAX_ISSUES.md``).  ``head_s_tensor_sharded`` (feeding
+``S_direct``) needs no face port — it never touches psi.
+
 Units and coordinates
 ---------------------
 Hamiltonians and frequencies are Ry.  ``bvec_cart`` has reciprocal lattice
-vectors as rows in 1/bohr, matching ``blat * WfnLoader.bvec``.  The FFT is
-used only by the retained spectral/reference derivative; the production
-finite-link stencil differentiates on the reduced-coordinate kappa grid and
-``B^{-1}`` converts that covector to Cartesian k.  There is no extra hbar
-conversion in LORRAX's Ry/bohr velocity convention.
+vectors as rows in 1/bohr, matching ``blat * WfnLoader.bvec``.  The
+production finite-link stencil differentiates on the reduced-coordinate
+kappa grid and ``B^{-1}`` converts that covector to Cartesian k.  There is
+no extra hbar conversion in LORRAX's Ry/bohr velocity convention.  (An
+FFT-based spectral derivative plus a separate finite-link connection
+commutator existed here as a second discretization of ``D_k Sigma``; it is
+retired as of the 2026-08-23 retirement sweep — the Si velocity
+expeditions measured its correction as ~uncorrelated with the true one on
+real SOC data, not merely lower-order, because a finite grid gives the
+split no exact product rule to cancel truncation error against.  See
+``covariant_link_derivative``, the sole production/gate discretization.)
 
 TIME-REVERSAL PARITY OF THE QSGW VELOCITY — the convention, derived
 --------------------------------------------------------------------
@@ -150,6 +171,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from common.shard_map import shard_map
 
 
@@ -158,15 +180,21 @@ __all__ = [
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
+    "StaticGaugeFirstOrderComponent",
+    "StaticGaugeHallTransaction",
+    "StaticGaugeSecondOrderComponent",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
     "build_iteration_head_samples",
     "build_iteration_head_response",
     "build_dft_head_response",
-    "covariant_cartesian_derivative",
     "covariant_link_derivative",
     "head_s_tensor_sharded",
     "head_wings_sharded",
+    "raw_hall_pseudovector_sharded",
+    "static_gauge_hall_transaction",
+    "static_gauge_first_order_component_sharded",
+    "static_gauge_second_order_component_sharded",
     "static_head_wings_sharded",
     "head_samples_from_s",
     "finalize_iteration_head_sample",
@@ -177,9 +205,7 @@ __all__ = [
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
     "report_trs_velocity_parity",
-    "spectral_cartesian_derivative",
     "trs_velocity_parity_residual",
-    "validate_dft_velocity_identity",
 ]
 
 # The band-trace parity residual above which the assembled velocity is
@@ -208,6 +234,84 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # The full Y/Z outputs are much smaller (three Cartesian rows/columns), and a
 # ring step visits every frequency block before circulating its band tile.
 _HEAD_WING_FREQUENCY_BLOCK = 8
+
+# Bound the face-layout wing kernel's per-step psi gather (obstacle #3/#5 of
+# the low_mem_bands audit, report §"Full q->0 head/body wings").  psi_mun/
+# psi_nmu have NO replicated band axis (unlike legacy's psi_xn/psi_yn), so a
+# rank cannot read an arbitrary band window for free; instead it gathers the
+# FULL band extent for a small MU block at a time via one lax.all_gather per
+# block, keeping the transient (nk, ns, nb_full, mu_block)-shaped buffer
+# bounded independent of how many centroids this rank owns locally.  See
+# ``_head_wing_kernel_face``'s docstring for the full residency algebra.
+_HEAD_WING_MU_BLOCK = 64
+# Width three is the incumbent Rydberg velocity.  Width eight has the same
+# energy-denominator contract: for a literal long-wave transition derivative
+# D^(I,a) = d_q_a M^I|_0 it consumes P^(I,a) = -DeltaE * D^(I,a), flattened
+# as (a,I)=(2,4).  It never consumes D itself.  Keeping that distinction at
+# this shared boundary prevents a future producer from adding two spurious
+# inverse powers of DeltaE.  The width-eight contraction is only the
+# first-derivative/first-derivative piece of a generalized CT/TT response;
+# second jets, response-weight derivatives and contact terms are assembled by
+# the producer, not inferred here.
+_HEAD_VERTEX_WIDTHS = (3, 8)
+
+
+_STATIC_GAUGE_HALL_PRODUCER_ID = (
+    "lorrax.static_gauge_hall/full_bz_uniform_gauge_v1")
+_STATIC_GAUGE_HALL_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class StaticGaugeHallTransaction:
+    """Sealed Hall result from one complete uniform-gauge transaction.
+
+    ``sigma_H`` is the three-component real Hall pseudovector consumed by
+    the static response producer.  The fingerprint is copied from the same
+    uniform-gauge sweep that supplied ``Gamma_raw``.  A current-only sweep
+    authenticates the Hall operator without claiming contact or transfer-jet
+    closure; those terms remain an explicit capability decision downstream.
+
+    The large ``Gamma_raw`` band matrix remains sharded over both processor
+    axes and is not retained here.  The only replicated product is the
+    three-component Hall vector.
+    """
+
+    sigma_H: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+    wfn_fingerprint: str
+    band_start: int
+    band_stop: int
+    nk_tot: int
+    producer_id: str
+    _producer_token: object
+
+    def __post_init__(self) -> None:
+        if self._producer_token is not _STATIC_GAUGE_HALL_TOKEN:
+            raise TypeError(
+                "StaticGaugeHallTransaction is issued only by "
+                "static_gauge_hall_transaction")
+        fingerprint = str(
+            self.hamiltonian_config_operator_fingerprint).strip()
+        if (not fingerprint.startswith("sha256:") or len(fingerprint) != 71
+                or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
+            raise ValueError(
+                "StaticGaugeHallTransaction has an invalid operator hash")
+        wfn_sha = str(self.wfn_fingerprint).strip()
+        if (len(wfn_sha) != 64
+                or any(c not in "0123456789abcdef" for c in wfn_sha)):
+            raise ValueError("StaticGaugeHallTransaction has an invalid WFN hash")
+        if (int(self.band_start) != 0 or int(self.band_stop) <= 0
+                or int(self.nk_tot) <= 0):
+            raise ValueError(
+                "StaticGaugeHallTransaction requires bands [0,stop) and "
+                "nk_tot>0")
+        if self.producer_id != _STATIC_GAUGE_HALL_PRODUCER_ID:
+            raise ValueError(
+                "StaticGaugeHallTransaction has an unknown producer")
+        if (tuple(self.sigma_H.shape) != (3,)
+                or np.dtype(self.sigma_H.dtype) != np.dtype(np.float64)):
+            raise ValueError(
+                "StaticGaugeHallTransaction sigma_H must be float64[3]")
 
 
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
@@ -240,9 +344,9 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
     fresh zeta fit or a restart load -- the restart loader's ψ contract is
     not at fault; the fresh path only avoids it because the ISDF zeta fit
     upstream OOMs first at production scale, on a different binder, so it
-    never reaches this call.  ``jax.device_put`` here places ``v`` on the
-    mesh directly from its single source device, before it ever reaches a
-    kernel, so no jit call in this module dispatches a foreign sharding.
+    never reaches this call.  The canonical process-local placement helper
+    puts ``v`` on the mesh before it reaches a kernel, so no jit call in this
+    module dispatches a foreign sharding or invents a second placement path.
     """
     nb = int(v.shape[-1])
     alignment = lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
@@ -253,7 +357,8 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
         e = jnp.pad(e, ((0, 0), (0, pad)))
         f = jnp.pad(f, ((0, 0), (0, pad)))
         surface = jnp.pad(surface, ((0, 0), (0, pad)))
-    v = jax.device_put(v, NamedSharding(mesh, P(None, None, "x", "y")))
+    v = device_put_process_local(
+        v, NamedSharding(mesh, P(None, None, "x", "y")))
     return v, e, f, surface
 
 
@@ -267,6 +372,13 @@ class ParallelTransportHeadData:
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
     validation: dict[str, float]
+    #: ``(n_source, 3, nb_logical)`` link-overlap singular values, descending
+    #: along the last axis, host-resident (small: O(nk*nb) real numbers).
+    #: Read but NOT consulted by this loader itself -- the D3(a) preflight
+    #: in ``sc_iteration.load_head_velocity_source`` reads it from here to
+    #: refuse a window edge that cuts a hybridized manifold.  See
+    #: ``file_io.parallel_transport.load_link_singular_values``.
+    singular_values: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -298,6 +410,97 @@ class DftVelocityHeadData:
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
+
+
+@dataclass(frozen=True)
+class StaticGaugeFirstOrderComponent:
+    r"""Retained-manifold first jet and its authentic ``D1*D1`` response.
+
+    ``energy_scaled_d1_raw[a,I]`` is
+    ``P^(I,a)=-DeltaE*D^(I,a)`` in the canonical in-plane ``(a,I)=(2,4)``
+    order.  ``S_first_first`` is only the corresponding bilinear response
+    term, shaped ``(n_omega,2,2,4,4)``.  It is deliberately not a
+    :class:`gw.head_correction.StaticGaugeHeadResponse`: response-weight
+    second derivatives, the complete second state/vertex jet, and contact
+    terms are absent.
+
+    The band-linear fields retain the mesh-padded band extent.  They are
+    derivatives with respect to Cartesian transfer q for the bra ``k-q``
+    orientation; only entries below ``nb_logical`` are physical.
+    ``retained_connection_cart`` is the same in-plane connection already
+    formed for the first jet.  Returning that live value lets the opt-in
+    second-order component reuse it without a second link-stencil pass.
+    """
+
+    energy_scaled_d1_raw: jax.Array
+    S_first_first: jax.Array
+    bra_energy_dq_ry: jax.Array
+    occupation_difference_dq: jax.Array
+    charge_ward_residual: jax.Array
+    retained_connection_cart: jax.Array
+    nb_logical: int
+
+
+@dataclass(frozen=True)
+class StaticGaugeSecondOrderComponent:
+    r"""Retained-manifold insulating second-order bubble component.
+
+    ``transition_d2_raw[pair,I]`` is the literal symmetric second transition
+    jet in pair order ``(xx,xy,yy)``.  ``S_second_zero_zero_second`` is its
+    second-zero plus zero-second bubble contraction.  ``S_response_weight``
+    contains the terms generated by the first and second derivatives of the
+    exact incumbent Adler--Wiser weight.  ``S_bubble_second_derivative`` is
+    their sum with the symmetrized first-first contribution; it is the
+    derivative, not the coefficient of ``q_a q_b`` (the latter is one half).
+
+    This object is deliberately retained-manifold and bubble-only.  It is
+    not a :class:`gw.head_correction.StaticGaugeHeadResponse`: complement-
+    space state response, metallic occupation derivatives, contact response,
+    body lineage, and persistence are absent.
+    """
+
+    first_order: StaticGaugeFirstOrderComponent
+    transition_d2_raw: jax.Array
+    bra_energy_dq2_ry: jax.Array
+    occupation_difference_dq2: jax.Array
+    S_second_zero_zero_second: jax.Array
+    S_response_weight: jax.Array
+    S_bubble_second_derivative: jax.Array
+    ordered_curvature_residual: jax.Array
+    q2_symmetry_residual: jax.Array
+    nb_logical: int
+
+    @property
+    def S_bubble_q2_coefficient_cart(self) -> jax.Array:
+        r"""Retained-bubble coefficient of ``q_a q_b`` in Cartesian form.
+
+        The differentiated response is stored in symmetric pair order
+        ``(xx,xy,yy)`` as ``S_bubble_second_derivative``.  Taylor's theorem
+        supplies the factor ``1/2``.  This view expands the result to
+        ``(n_omega,2,2,4,4)`` so that its axes match the ``S_direct``
+        convention of :class:`gw.head_correction.StaticGaugeHeadResponse`::
+
+            Pi_bubble(q) = q_a q_b S_bubble_q2_coefficient_cart[a,b]
+
+        It remains only the retained-manifold bubble contribution.  In
+        particular, exposing the correctly normalized coefficient does not
+        supply the missing complement-space or contact terms and cannot be
+        used by itself to publish a production FULL head.
+        """
+        hessian = jnp.asarray(self.S_bubble_second_derivative)
+        if hessian.ndim != 4 or hessian.shape[1:] != (3, 4, 4):
+            raise ValueError(
+                "S_bubble_second_derivative must have shape "
+                "(n_omega,3,4,4) in pair order (xx,xy,yy); got "
+                f"{hessian.shape}")
+        coefficient = 0.5 * hessian
+        xx, xy, yy = (
+            coefficient[:, 0], coefficient[:, 1], coefficient[:, 2])
+        return jnp.stack(
+            (jnp.stack((xx, xy), axis=1),
+             jnp.stack((xy, yy), axis=1)),
+            axis=1,
+        )
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
@@ -356,6 +559,7 @@ def load_parallel_transport_head(
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
+        load_link_singular_values,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import band_storage_extent, wfn_fingerprint
@@ -394,11 +598,6 @@ def load_parallel_transport_head(
         )
         fingerprint = _ascii_stamp(
             io, path, "wfn_fingerprint_utf8")
-        validation = {
-            key: float(io.read_small(f"velocity_validation_{key}",
-                                     dtype=np.float64))
-            for key in validation_names
-        }
 
         expected_nb = int(meta.b_id_4_user)
         expected_kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
@@ -450,11 +649,36 @@ def load_parallel_transport_head(
         # this raises on every rank or on none — and each rank's ``__exit__``
         # then closes the collective handle, which is the ordering
         # ``SlabIO.close`` requires.
+        #
+        # ALSO before the ``velocity_validation_*`` float read, deliberately:
+        # those 11 datasets (``atol``, ``rtol``, ``max_abs``, ...) are only
+        # written by ``complete_velocity_validation``, at the END of
+        # ``write_parallel_transport_artifact`` — never by
+        # ``initialize_parallel_transport_artifact``.  A velocity-only
+        # artifact (D2, ``--parallel-transport-velocity-only``) therefore
+        # NEVER has them, only ``velocity_validation_complete/passed = 0``
+        # (its unconditional init-time stamp).  Reading them before this
+        # refusal check crashed with a bare ``KeyError: "...doesn't exist"``
+        # on exactly that artifact class instead of the named refusal above
+        # (audit finding, 2026-08-23: reproduced live against a real
+        # velocity-only artifact through this exact loader,
+        # ``runs/Na/02_soc48b_qsgw_mpa/09_dft_velocity_headgate_p16_20260823/
+        # veloc_build/parallel_transport_velocity_only.h5``) — the
+        # "links-requiring consumer reading a velocity-only artifact must
+        # refuse, not crash" contract this artifact-schema split exists to
+        # keep.  ``velocity_validation_complete != 1`` is already one of the
+        # ``refusals`` above, so by the time this line is reached the floats
+        # are guaranteed present.
         if refusals:
             raise ValueError(
                 f"{path}: refusing QSGW parallel-transport head:\n  - "
                 + "\n  - ".join(refusals)
             )
+        validation = {
+            key: float(io.read_small(f"velocity_validation_{key}",
+                                     dtype=np.float64))
+            for key in validation_names
+        }
 
         spec = P(None, None, "x", "y")
         nb_storage = band_storage_extent(mesh, expected_nb)
@@ -469,6 +693,12 @@ def load_parallel_transport_head(
         velocity = io.read_slab(
             VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
         )
+        # Small (O(nk*nb) real) host-resident diagnostic, read in the SAME
+        # handle as everything above -- one owner, one open, per this
+        # loader's own docstring.  Not consulted here; the D3(a) window
+        # preflight in ``sc_iteration.load_head_velocity_source`` reads it
+        # off the returned object.
+        singular_values = load_link_singular_values(io, nb_logical=expected_nb)
 
     expected_prefix = (3, int(meta.nk_tot))
     if (
@@ -508,6 +738,7 @@ def load_parallel_transport_head(
         nb_logical=expected_nb,
         reciprocal_lattice_cart=reciprocal,
         validation=validation,
+        singular_values=singular_values,
     )
 
 
@@ -657,6 +888,32 @@ def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
 
 
 def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
+    """Cached FFT-based Cartesian derivative kernel.
+
+    RETAINED WITHOUT A PRODUCTION CALLER (2026-08-23 retirement sweep,
+    D4): this and :func:`_cartesian_fft_multipliers` used to back the
+    public ``spectral_cartesian_derivative``/``covariant_cartesian_
+    derivative`` pair, both retired below (dead: zero production callers,
+    and the Si velocity expeditions measured the split construction they
+    implemented -- a separately-FFT-differentiated operator plus a
+    finite-link commutator -- as producing a correction with ~0 overlap
+    to the true one on real SOC data; see the module docstring's
+    ``v_Q = v_DFT + D_link(...)`` note and
+    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md``).  These two
+    stayed: ``tests/multi_device/parallel_transport_profile.py`` imports
+    them directly (bypassing the now-deleted public wrapper) for its own
+    HLO-rematerialization check.  That test module was ALREADY broken
+    before this sweep touched anything -- it also imports
+    ``covariant_structured_delta``/``_structured_delta_kernel``, which do
+    not exist anywhere in this file and have not since before this
+    session (grep-verified); registered separately in
+    KNOWN_LORRAX_ISSUES.md rather than repaired here, since untangling it
+    means editing a P=4 real-distributed-service gate this sweep cannot
+    execute to verify.  Left in place rather than deleted out from under
+    that reference, per DISCIPLINE's "grep-verified zero callers in src/
+    AND tests/" bar -- this one is not zero in tests/, even though the
+    caller is inert.
+    """
     from ffi import ffi_dial_key
 
     key = ("spectral_cart", id(mesh), tuple(kgrid), ffi_dial_key())
@@ -686,93 +943,6 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
     _KERNEL_CACHE[key] = _kernel
     return _kernel
-
-
-def spectral_cartesian_derivative(
-    operator_k,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-):
-    """Spectrally differentiate a full-BZ band operator.
-
-    ``operator_k`` is ``(nk,nb,nb)`` at ``P(None,'x','y')``.  The full
-    k grid remains local to each band tile, so the FFT communicates no band
-    data.  One cached compiled graph contains the forward FFT and one inverse
-    FFT batched across the three Cartesian components.
-    """
-    kgrid = tuple(int(n) for n in kgrid)
-    nk = int(np.prod(kgrid))
-    if tuple(operator_k.shape[:1]) != (nk,) or operator_k.ndim != 3:
-        raise ValueError(
-            f"operator_k must have shape ({nk},nb,nb), got {tuple(operator_k.shape)}."
-        )
-    if operator_k.shape[1] != operator_k.shape[2]:
-        raise ValueError("spectral derivative requires square band matrices.")
-    mult = jnp.asarray(
-        _cartesian_fft_multipliers(kgrid, np.asarray(bvec_cart)), dtype=jnp.float64
-    )
-    return _spectral_kernel(mesh, kgrid)(
-        jnp.asarray(operator_k, dtype=jnp.complex128), mult
-    )
-
-
-def _commutator_kernel(mesh: Mesh) -> Callable:
-    key = ("band_commutator", id(mesh))
-    hit = _KERNEL_CACHE.get(key)
-    if hit is not None:
-        return hit
-    _mesh_xy(mesh)
-
-    def _local(A_row, H_col, H_row, A_col):
-        AH = jnp.einsum("akim,kmj->akij", A_row, H_col, optimize=True)
-        HA = jnp.einsum("kim,akmj->akij", H_row, A_col, optimize=True)
-        return AH - HA
-
-    # Gather only one band dimension of each operand.  No rank ever owns a
-    # full (nb,nb) matrix; the output returns to the native 2-D band tile.
-    sm = shard_map(
-        _local,
-        mesh=mesh,
-        in_specs=(
-            P(None, None, "x", None),
-            P(None, None, "y"),
-            P(None, "x", None),
-            P(None, None, None, "y"),
-        ),
-        out_specs=P(None, None, "x", "y"),
-        check_vma=False,
-    )
-
-    @jax.jit
-    def _kernel(A, H):
-        return sm(A, H, H, A)
-
-    _KERNEL_CACHE[key] = _kernel
-    return _kernel
-
-
-def covariant_cartesian_derivative(
-    operator_k,
-    connection_cart,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-):
-    """Return ``partial_i operator - i[A_i,operator]`` for i=x,y,z."""
-    H = jnp.asarray(operator_k, dtype=jnp.complex128)
-    A = jnp.asarray(connection_cart, dtype=jnp.complex128)
-    expected = (3,) + tuple(H.shape)
-    if tuple(A.shape) != expected:
-        raise ValueError(
-            f"connection_cart must have shape {expected}, got {tuple(A.shape)}."
-        )
-    partial = spectral_cartesian_derivative(
-        H, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart
-    )
-    return partial - 1j * _commutator_kernel(mesh)(A, H)
 
 
 def covariant_link_derivative(
@@ -986,14 +1156,78 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    key = ("head_s", id(mesh), int(nb_logical))
+def _interband_degenerate_weight(
+    dE, f_diff, z, s_avg, prefactor, near_degenerate, *, include_surface: bool,
+):
+    r"""Adler-Wiser interband weight, continuous through ``dE -> 0``.
+
+    ``prefactor * f_diff / (dE * (z**2 - dE**2))`` has a removable
+    singularity at ``dE = 0`` for FIXED, nonzero ``z``: by l'Hopital on the
+    numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
+    ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
+    caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
+    mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
+    limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
+    ``_fractional_pair_scan`` already takes for its own ``z=0`` diagonal
+    limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
+    is ``+`` rather than ``-`` because this module's ``f_diff`` is built
+    ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical
+    limit, opposite index convention).  The ``z``-dependence keeps its
+    finite-``z`` form throughout: only ``dE`` is taken to a limit, never
+    ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
+    different singularity and is untouched by this branch.
+
+    ``s_avg`` (``0.5*(s_bra+s_ket)``) and ``near_degenerate`` (the
+    resolution-scaled ``|dE|`` test) are precomputed by the caller,
+    already broadcast to ``dE``'s shape: neither depends on ``omega``, so
+    hoisting them out of the inner per-frequency closure avoids
+    recomputing a comparison already fixed by the band-pair tile alone.
+
+    ``include_surface`` is a plain Python ``bool``, closed over at trace
+    time by the caller (its kernel factory already keys its compilation
+    cache on it): when ``False`` -- no ``-f'`` data, i.e. every insulating
+    or fixed-occupation deck -- this compiles to EXACTLY the pre-fix
+    ``jnp.where(|denom|>1e-16, regular, 0)`` body; the degenerate branch
+    is never lowered into that HLO graph and ``s_avg``/``near_degenerate``
+    are unused (may be ``None``).
+
+    SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
+    is ``_s_tensor_kernel``'s ONLY; the wing kernels
+    (``_head_wing_kernel_legacy``/``_face``) build a structurally
+    DIFFERENT ``F_ij = pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
+    power of ``dE`` (documented explicitly in ``head_wings_sharded``'s own
+    docstring), because a wing pairs one velocity leg with one
+    dimension-1-in-energy density vertex where the head pairs two
+    velocity legs.  At fixed nonzero ``z``, THAT formula is already
+    continuous as ``dE -> 0`` (``f_diff -> 0`` at the same order as the
+    numerator, no compensating ``dE`` in the denominator to cancel), so
+    its own ``|denom|>1e-16`` clip is not this same defect -- it guards a
+    ``z ~= dE`` resonance, a different singularity this helper does not
+    address.  Do not reuse this helper there without rederiving the limit.
+    """
+    denom = dE * (z * z - dE * dE)
+    zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
+    regular = prefactor * f_diff / denom
+    clipped = jnp.where(jnp.abs(denom) > 1.0e-16, regular, zero)
+    if not include_surface:
+        return clipped
+    z_ok = jnp.abs(z) > 1.0e-15
+    degenerate = prefactor * s_avg / (z * z)
+    return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+
+
+def _s_tensor_kernel(
+    mesh: Mesh, *, nb_logical: int, include_surface: bool = False,
+) -> Callable:
+    key = ("head_s", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta):
+    def _local(
+        v_local, e_bra, e_ket, f_bra, f_ket, s_bra, s_ket, omegas, prefactor, eta,
+    ):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -1006,13 +1240,26 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         # occupation difference.  The historical 0/1 path is unchanged
         # because its energy-ordered nonzero differences are positive.
         transition = logical & (dE > 0.0)
+        if include_surface:
+            scale = jnp.maximum(
+                1.0,
+                jnp.maximum(jnp.abs(e_bra)[:, :, None], jnp.abs(e_ket)[:, None, :]),
+            )
+            near_degenerate = (
+                jnp.abs(dE) <= 64.0 * jnp.finfo(jnp.float64).eps * scale)
+            s_avg = 0.5 * (s_bra[:, :, None] + s_ket[:, None, :])
+        else:
+            near_degenerate = None
+            s_avg = None
 
         def _one(omega):
             z = omega + 1j * eta
-            denom = dE * (z * z - dE * dE)
             weight = jnp.where(
-                transition & (jnp.abs(denom) > 1.0e-16),
-                prefactor * f_diff / denom,
+                transition,
+                _interband_degenerate_weight(
+                    dE, f_diff, z, s_avg, prefactor, near_degenerate,
+                    include_surface=include_surface,
+                ),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
             local = jnp.einsum(
@@ -1047,13 +1294,17 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             return _carry, jax.vmap(_one)(omega_block)
 
         _, out_blocks = jax.lax.scan(_block, None, omega_blocks, unroll=1)
-        return out_blocks.reshape(n_padded, 3, 3)[:n_omega]
+        n_vertex = int(v_local.shape[0])
+        return out_blocks.reshape(
+            n_padded, n_vertex, n_vertex)[:n_omega]
 
     sm = shard_map(
         _local,
         mesh=mesh,
         in_specs=(
             P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
             P(None, "x"),
             P(None, "y"),
             P(None, "x"),
@@ -1070,7 +1321,120 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     return kernel
 
 
+def _static_gauge_bubble_mixed_derivative_kernel(
+    mesh: Mesh, *, nb_logical: int,
+) -> Callable:
+    r"""Differentiate the incumbent insulating head bubble for one ``ab``.
+
+    This is analytic AD of :func:`_s_tensor_kernel`, not a second response
+    weight or collective implementation.  The two scalar parameters select
+    one ordered pair of physical transfer directions.  Supplying the same
+    first jet on both parameters gives a diagonal second derivative; supplying
+    different jets gives a mixed derivative.  In both cases the ``s*t``
+    coefficient is the physical symmetric second jet.
+    """
+    key = ("static_gauge_bubble_mixed_d2", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    bubble = _s_tensor_kernel(
+        mesh, nb_logical=int(nb_logical), include_surface=False)
+
+    def _kernel(
+        m0,
+        d_left,
+        d_right,
+        d2_pair,
+        energies,
+        energy_left,
+        energy_right,
+        energy_d2_pair,
+        occupations,
+        omegas,
+        prefactor,
+        eta,
+    ):
+        surface = jnp.zeros_like(energies)
+        origin = jnp.zeros((2,), dtype=energies.dtype)
+        tangent_s = jnp.asarray((1.0, 0.0), dtype=energies.dtype)
+        tangent_t = jnp.asarray((0.0, 1.0), dtype=energies.dtype)
+
+        def _evaluate(st, *, vertex_second_only: bool):
+            s, t = st[0], st[1]
+            if vertex_second_only:
+                m_q = m0 + (s * t) * d2_pair
+                e_bra = energies
+            else:
+                m_q = (
+                    m0
+                    + s * d_left
+                    + t * d_right
+                    + (s * t) * d2_pair
+                )
+                e_bra = (
+                    energies
+                    + s * energy_left
+                    + t * energy_right
+                    + (s * t) * energy_d2_pair
+                )
+            delta = e_bra[:, :, None] - energies[:, None, :]
+            energy_scaled = -delta[None] * m_q
+            return bubble(
+                energy_scaled,
+                e_bra,
+                energies,
+                occupations,
+                occupations,
+                surface,
+                surface,
+                omegas,
+                prefactor,
+                eta,
+            )
+
+        def _mixed(fun):
+            def _along_s(st):
+                return jax.jvp(fun, (st,), (tangent_s,))[1]
+
+            return jax.jvp(_along_s, (origin,), (tangent_t,))[1]
+
+        full = _mixed(lambda st: _evaluate(st, vertex_second_only=False))
+        second_zero = _mixed(
+            lambda st: _evaluate(st, vertex_second_only=True))
+        return full, second_zero
+
+    kernel = jax.jit(_kernel)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
 def _head_wing_kernel(
+    mesh: Mesh,
+    *,
+    nb_logical: int,
+    include_surface: bool,
+    layout: str = "legacy",
+) -> Callable:
+    """Layout dispatcher.  ``layout='legacy'`` (default) returns the exact
+    pre-``low_mem_bands`` kernel, unmoved; ``layout='face'`` returns the
+    two-face carrier's bounded band-pair-gather kernel.  Single owner, no
+    ``build_G_low_mem``-style fork: this is the ONE call site every caller
+    of the direct q-linear wings goes through (see :func:`head_wings_sharded`,
+    the only caller)."""
+    if layout == "legacy":
+        return _head_wing_kernel_legacy(
+            mesh, nb_logical=int(nb_logical),
+            include_surface=bool(include_surface))
+    if layout == "face":
+        return _head_wing_kernel_face(
+            mesh, nb_logical=int(nb_logical),
+            include_surface=bool(include_surface))
+    raise ValueError(
+        f"_head_wing_kernel: layout must be 'legacy' or 'face', got "
+        f"{layout!r}")
+
+
+def _head_wing_kernel_legacy(
     mesh: Mesh,
     *,
     nb_logical: int,
@@ -1084,6 +1448,9 @@ def _head_wing_kernel(
     rank circulates its small velocity tile around that mesh axis.  After one
     ring every local centroid slice has seen every band tile, while no rank
     ever materialises a full ``nb x nb`` velocity matrix.
+
+    UNTOUCHED by ``low_mem_bands`` — this is the exact pre-existing body,
+    unmoved; see ``_head_wing_kernel_face`` for the two-face sibling.
     """
     key = ("head_wings", id(mesh), int(nb_logical), bool(include_surface))
     hit = _KERNEL_CACHE.get(key)
@@ -1185,8 +1552,9 @@ def _head_wing_kernel(
         psi_low_x = jax.lax.dynamic_slice(
             psi_xn_local, (zero, zero, zero, y_start), (nk, ns, nmu_x, ny))
 
+        n_vertex = int(v_local.shape[0])
         y0 = jnp.zeros(
-            (n_omega_padded, 3, nmu_x), dtype=jnp.complex128)
+            (n_omega_padded, n_vertex, nmu_x), dtype=jnp.complex128)
 
         def _left_step(step, carry):
             v_tile, acc = carry
@@ -1248,7 +1616,7 @@ def _head_wing_kernel(
         psi_high_y = jax.lax.dynamic_slice(
             psi_yn_local, (zero, zero, zero, x_start), (nk, ns, nmu_y, nx))
         z0 = jnp.zeros(
-            (n_omega_padded, nmu_y, 3), dtype=jnp.complex128)
+            (n_omega_padded, nmu_y, n_vertex), dtype=jnp.complex128)
 
         def _right_step(step, carry):
             v_tile, acc = carry
@@ -1325,6 +1693,301 @@ def _head_wing_kernel(
     return kernel
 
 
+def _head_wing_kernel_face(
+    mesh: Mesh,
+    *,
+    nb_logical: int,
+    include_surface: bool,
+) -> Callable:
+    r"""Two-face-carrier q-linear wing contraction (audit report §"Full
+    q->0 head/body wings", census rows 6/7).
+
+    WHY THE LEGACY RING DOES NOT PORT, AND THE 10x ALGEBRA
+    --------------------------------------------------------
+    ``_head_wing_kernel_legacy`` is cheap only because ``psi_xn``/``psi_yn``
+    carry a REPLICATED band axis: any rank can read an arbitrary band
+    window ``psi_xn_local[..., lo:hi]`` for free, so only the small
+    velocity tile (``3 x nk x nx x ny``, independent of mu) needs
+    circulating around the ring.  ``psi_mun``/``psi_nmu`` have NO such
+    replicated axis — every axis is mesh-sharded — so the identical trick
+    is unavailable, exactly the report's own words: "a face layout needs a
+    2-D band-pair ring/tile algorithm... cannot be replaced by the
+    one-particle G GEMM" (dense ``Gij``/exact-response census row).
+
+    A DIFFERENT confirmed 81.74-GiB defect (registered separately,
+    `KNOWN_LORRAX_ISSUES.md`, "the v-sharding fix is not closed") lives on
+    the LEGACY-only path and is unrelated to what follows: this module's
+    own algebra there was ``10.006x`` ONE FULL ``(nk,ns,mu,nb)`` psi copy,
+    the size GSPMD's auto-reshard prologue pays when it reconciles ONE
+    off-mesh (``SingleDeviceSharding``) operand — the freshly host-read
+    velocity — against SEVERAL already on-mesh psi-sized operands inside a
+    single compiled program.  That mechanism needs a legacy-shaped psi
+    input (a full band-replicated copy) to reproduce, so it CANNOT recur
+    here even in principle: this kernel never holds anything psi-shaped
+    that is band-replicated, and every operand it builds is explicitly
+    the canonical process-local placement helper onto its declared
+    ``NamedSharding`` before use (see
+    ``_pad_head_band_manifold_to`` below) — the exact discipline whose
+    absence caused that legacy defect.  The residency bound below is
+    therefore independent of, not a fix for, that open legacy row.
+
+    THE BOUNDED ALGORITHM
+    ----------------------
+    Split the work along the axis each face orientation already carries
+    for free:
+
+    * mu (the OUTPUT index) never moves.  ``psi_mun``'s mu axis is
+      X-sharded — the SAME axis ``Y_x``'s output is sharded on — so a
+      rank's own local mu range is already the right output range, no
+      communication.  Symmetrically for ``psi_nmu`` (mu on Y) and ``Z_y``.
+    * n (the two SUMMED band indices ``i``, ``j`` of ``b_ij(mu) = sum_s
+      conj(psi_i(mu)) psi_j(mu)``) is what is missing locally: ``psi_mun``
+      only holds a Y-fraction of it.  For a SMALL block of ``_HEAD_WING_
+      MU_BLOCK`` mu values at a time, one ``lax.all_gather`` over the
+      OTHER mesh axis assembles the full ``nb_full``-wide band vector for
+      exactly that block — bounded by ``nk * ns * nb_full * mu_block``,
+      independent of how many mu values this rank owns in total.  ``i``
+      and ``j`` then read the SAME gathered array (two labels on one
+      operand, matching ``b_ij``'s own definition), so no second ring or
+      gather is needed for the "other" band index the way a naive
+      transcription of the legacy ring might suggest.
+    * The (i,j)-operator itself — ``conj(v[a,i,j]) * F_ij(omega)`` — is
+      ``nb_full x nb_full``, INDEPENDENT of mu.  It is built once (one
+      two-axis ``lax.all_gather`` of the small, already band-mesh-sharded
+      velocity) and reused across every mu block, at the SAME
+      ``_HEAD_WING_FREQUENCY_BLOCK``-bounded omega streaming the legacy
+      kernel already uses (reused unchanged, not re-derived).
+
+    COST, NAMED (matching ``Wavefunctions.band_mask``'s own convention):
+    every mu block pays the FULL ``nb_full x nb_full`` (i,j) contraction —
+    the same "good correctness bring-up path" obstacle #3 already
+    sanctions for masked face operations — so this kernel does
+    ``mu_local / _HEAD_WING_MU_BLOCK`` TIMES the (i,j) FLOPs a
+    theoretically optimal ring would, in exchange for a residency bound
+    that never scales with mu.  Also unlike legacy, ranks sharing an
+    output mu range but differing on the OTHER mesh axis (e.g. same X,
+    different Y for ``Y_x``) redundantly compute the IDENTICAL answer —
+    correct (every rank's own local mu range is complete on its own, no
+    ``psum`` needed) but ``P``-axis-fold redundant in FLOPs, a stated
+    trade for zero extra communication.
+
+    Peak transient per rank, this kernel only (steady-state persistent
+    storage is unaffected — it is still ``psi_mun``/``psi_nmu`` at
+    ``2*S/(Px*Py)``, the carrier's own number):
+    ``v_full`` (``3*nk*nb_full^2``, gathered once) +
+    ``weight`` (``omega_block*nk*nb_full^2``, rebuilt once per mu block) +
+    the gathered psi block (``nk*ns*nb_full*mu_block``, small).  None of
+    these three terms contains ``mu_local`` or ``mu_pad``.
+    """
+    key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(
+        v_local,
+        psi_mun_local,
+        psi_nmu_local,
+        energies,
+        occupations,
+        surface_weight,
+        omegas,
+        pref_inter,
+        pref_surface,
+        eta,
+    ):
+        nk = v_local.shape[1]
+        v_full = jax.lax.all_gather(v_local, ax_x, axis=2, tiled=True)
+        v_full = jax.lax.all_gather(v_full, ax_y, axis=3, tiled=True)
+        nb_full = v_full.shape[-1]
+        ns = psi_mun_local.shape[1]
+        mu_x_local = psi_mun_local.shape[2]
+        mu_y_local = psi_nmu_local.shape[-1]
+
+        idx = jnp.arange(nb_full)
+        logical1d = idx < nb_logical
+        logical2d = (logical1d[:, None] & logical1d[None, :])[None, :, :]
+        dE = energies[:, :, None] - energies[:, None, :]
+        f_diff = occupations[:, None, :] - occupations[:, :, None]
+        transition = logical2d & (dE > 0.0)
+        if include_surface:
+            diagonal = logical2d & (idx[:, None] == idx[None, :])[None, :, :]
+            surface_pair = jnp.where(diagonal, surface_weight[:, :, None], 0.0)
+        else:
+            surface_pair = jnp.zeros_like(dE)
+
+        n_omega = omegas.shape[0]
+        z = omegas + 1j * eta
+        inv_z = jnp.where(
+            jnp.abs(omegas) > 1.0e-15, 1.0 / z,
+            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+        freq_block = min(_HEAD_WING_FREQUENCY_BLOCK, int(n_omega))
+        n_omega_padded = ((int(n_omega) + freq_block - 1) // freq_block) * freq_block
+        freq_pad = n_omega_padded - int(n_omega)
+        z_blocks = jnp.pad(
+            z, (0, freq_pad),
+            constant_values=jnp.asarray(1.0j, dtype=jnp.complex128),
+        ).reshape(-1, freq_block)
+        inv_z_blocks = jnp.pad(inv_z, (0, freq_pad)).reshape(-1, freq_block)
+
+        def _weighted_stack(contract):
+            """Stream omega in bounded blocks (mirrors the legacy ring's
+            own ``_HEAD_WING_FREQUENCY_BLOCK`` discipline); no cross-block
+            accumulation is needed since distinct blocks cover distinct
+            frequencies (unlike the legacy ring's cross-RING-STEP carry)."""
+            def _step(_carry, node):
+                z_block, inv_z_block = node
+                denom = z_block[:, None, None, None] ** 2 - dE[None] ** 2
+                weight = jnp.where(
+                    transition[None] & (jnp.abs(denom) > 1.0e-16),
+                    pref_inter * f_diff[None] / denom,
+                    jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+                )
+                if include_surface:
+                    weight = weight + (
+                        pref_surface * inv_z_block[:, None, None, None]
+                        * surface_pair[None])
+                return _carry, contract(weight)
+            _, blocks = jax.lax.scan(
+                _step, None, (z_blocks, inv_z_blocks), unroll=1)
+            return blocks
+
+        # ---- Y_x: mu on X (psi_mun's own axis), gather bands over Y ----
+        mu_x_block = min(_HEAD_WING_MU_BLOCK, int(mu_x_local))
+        n_x_blocks = -(-int(mu_x_local) // mu_x_block)
+        mu_x_padded = n_x_blocks * mu_x_block
+        psi_mun_padded = jnp.pad(
+            psi_mun_local,
+            ((0, 0), (0, 0), (0, mu_x_padded - mu_x_local), (0, 0)))
+
+        def _x_step(_carry, blk):
+            zero = jnp.zeros((), dtype=blk.dtype)
+            start = blk * mu_x_block
+            tile = jax.lax.dynamic_slice(
+                psi_mun_padded, (zero, zero, start, zero),
+                (nk, ns, mu_x_block, psi_mun_padded.shape[-1]))
+            psi_full = jax.lax.all_gather(tile, ax_y, axis=3, tiled=True)
+
+            def _contract_left(weight):
+                return jnp.einsum(
+                    "akij,wkij,ksmi,ksmj->wam",
+                    jnp.conj(v_full), weight,
+                    jnp.conj(psi_full), psi_full,
+                    optimize=True,
+                )
+            blocks = _weighted_stack(_contract_left)
+            return _carry, blocks.reshape(
+                n_omega_padded, int(v_full.shape[0]), mu_x_block)
+
+        _, y_chunks = jax.lax.scan(
+            _x_step, None, jnp.arange(n_x_blocks, dtype=jnp.int32), unroll=1)
+        n_vertex = int(v_full.shape[0])
+        Y_x = jnp.moveaxis(y_chunks, 0, 2).reshape(
+            n_omega_padded, n_vertex,
+            mu_x_padded)[:n_omega, :, :mu_x_local]
+
+        # ---- Z_y: mu on Y (psi_nmu's own axis), gather bands over X ----
+        mu_y_block = min(_HEAD_WING_MU_BLOCK, int(mu_y_local))
+        n_y_blocks = -(-int(mu_y_local) // mu_y_block)
+        mu_y_padded = n_y_blocks * mu_y_block
+        psi_nmu_padded = jnp.pad(
+            psi_nmu_local,
+            ((0, 0), (0, 0), (0, 0), (0, mu_y_padded - mu_y_local)))
+
+        def _y_step(_carry, blk):
+            zero = jnp.zeros((), dtype=blk.dtype)
+            start = blk * mu_y_block
+            tile = jax.lax.dynamic_slice(
+                psi_nmu_padded, (zero, zero, zero, start),
+                (nk, psi_nmu_padded.shape[1], ns, mu_y_block))
+            gathered = jax.lax.all_gather(tile, ax_x, axis=1, tiled=True)
+            psi_full = jnp.transpose(gathered, (0, 2, 3, 1))
+
+            def _contract_right(weight):
+                return jnp.einsum(
+                    "ksmi,ksmj,wkij,bkij->wmb",
+                    psi_full, jnp.conj(psi_full), weight, v_full,
+                    optimize=True,
+                )
+            blocks = _weighted_stack(_contract_right)
+            return _carry, blocks.reshape(
+                n_omega_padded, mu_y_block, n_vertex)
+
+        _, z_chunks = jax.lax.scan(
+            _y_step, None, jnp.arange(n_y_blocks, dtype=jnp.int32), unroll=1)
+        Z_y = jnp.moveaxis(z_chunks, 0, 1).reshape(
+            n_omega_padded, mu_y_padded,
+            n_vertex)[:n_omega, :mu_y_local, :]
+
+        return Y_x, Z_y
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),   # v_local
+            P(None, None, "x", "y"),   # psi_mun_local  (PSI_MUN_SPEC)
+            P(None, "x", None, "y"),   # psi_nmu_local  (PSI_NMU_SPEC)
+            P(None, None),             # energies (nk, nb_full), replicated
+            P(None, None),             # occupations
+            P(None, None),             # surface_weight
+            P(None),                   # omegas
+            P(),
+            P(),
+            P(),
+        ),
+        out_specs=(P(None, None, "x"), P(None, "y", None)),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
+    """Like ``_pad_head_band_manifold`` but pads to an EXPLICIT ``width``
+    rather than inferring one from ``v``'s own current extent.
+
+    The face wing kernel's contracted operand (``psi_mun``/``psi_nmu``) is
+    NOT legally sliceable to an arbitrary logical window (obstacle #3: a
+    face-sharded band axis need not be mesh-divisible at that boundary),
+    so it is always gathered at its full stored ``nb_full`` width.  ``v``/
+    ``e``/``f``/``surface`` must therefore be embedded in that SAME width
+    (zero beyond the physical ``[b0,b4)`` extent — safe, since every
+    consumer masks on ``nb_logical``, never on ``v``'s own shape) rather
+    than the smaller chi0-only padding ``_pad_head_band_manifold`` does
+    for the legacy kernel.  ``nb_full`` is already mesh-divisible by
+    construction of the two-face carrier, so no further rounding is
+    needed here.
+
+    Also applies the fix registered in ``KNOWN_LORRAX_ISSUES.md`` (the
+    v-sharding-commit defect on the legacy path): every returned array goes
+    through the canonical process-local placement helper onto its declared
+    mesh sharding before any kernel sees it, so a foreign
+    ``SingleDeviceSharding`` operand never reaches this kernel's
+    ``shard_map``.
+    """
+    nb = int(v.shape[-1])
+    if width < nb:
+        raise ValueError(
+            f"_pad_head_band_manifold_to: width={width} smaller than v's "
+            f"own extent {nb}")
+    pad = width - nb
+    if pad:
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
+        e = jnp.pad(e, ((0, 0), (0, pad)))
+        f = jnp.pad(f, ((0, 0), (0, pad)))
+        surface = jnp.pad(surface, ((0, 0), (0, pad)))
+    v = device_put_process_local(
+        v, NamedSharding(mesh, P(None, None, "x", "y")))
+    e = device_put_process_local(e, NamedSharding(mesh, P(None, None)))
+    f = device_put_process_local(f, NamedSharding(mesh, P(None, None)))
+    surface = device_put_process_local(
+        surface, NamedSharding(mesh, P(None, None)))
+    return v, e, f, surface
+
+
 def head_wings_sharded(
     velocity_cart,
     wfns,
@@ -1364,14 +2027,46 @@ def head_wings_sharded(
     axis.  Frequencies are blocked inside each ring step, so a tile is sent
     once rather than once per frequency block and no all-frequency pair
     tensor is formed.
+
+    Layout dispatch on ``wfns.layout`` (report §5, single owner): the body
+    below, unchanged, is ``layout='legacy'``.  ``layout='face'`` routes to
+    :func:`_head_wings_sharded_face`, which returns the SAME
+    ``(Y_x, Z_y)`` shapes/sharding/physics — every caller downstream of
+    this function is layout-agnostic.  A ``wfns`` with no ``layout``
+    attribute at all (pre-two-face-carrier test fixtures that stand in a
+    bare ``psi_xn``/``psi_yn``-carrying stub) defaults to ``'legacy'``,
+    matching ``Wavefunctions.layout``'s own dataclass default.
+
+    Exactly two operator widths are admitted: the incumbent three Cartesian
+    velocity rows and the canonical eight-row packed ``(a,I)`` energy-scaled
+    jet ``P^(I,a)=-DeltaE*d_q_a M^I|_0`` (two in-plane q directions by four
+    Lorentz fields).  Literal transition derivatives are not accepted by
+    this denominator convention.  The width-eight result is the associated
+    first-derivative one-leg contribution, not a claim that the complete
+    CT/TT response needs no response-weight, second-jet, or contact terms.
+    Keeping that boundary closed gives the shared kernel exactly two XLA
+    shapes, rather than one compile for every caller-chosen width.
     """
+    layout = getattr(wfns, "layout", "legacy")
+    if layout == "face":
+        return _head_wings_sharded_face(
+            velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
+            mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
+            nspinor=nspinor, eta_ry=eta_ry,
+            surface_weight_kn=surface_weight_kn)
+    if layout != "legacy":
+        raise ValueError(
+            f"head_wings_sharded: wfns.layout must be 'legacy' or 'face', "
+            f"got {layout!r}")
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
-    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+    if (v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS
+            or v.shape[2] != v.shape[3]):
         raise ValueError(
-            f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -1417,6 +2112,85 @@ def head_wings_sharded(
         )
 
 
+def _head_wings_sharded_face(
+    velocity_cart,
+    wfns,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+):
+    """``layout='face'`` body of :func:`head_wings_sharded`.  Same physics
+    and normalization as the legacy body's docstring; only the carrier and
+    kernel differ.  ``psi_mun``/``psi_nmu`` span the bundle's full stored
+    ``[b0,b4)`` band extent (obstacle #3), so — unlike the legacy body,
+    which truncates ``wfns.psi_xn``/``psi_yn`` down to the velocity's own
+    ``nb_pad`` — this pads ``v``/``e``/``f``/``surface`` UP to that full
+    extent instead (:func:`_pad_head_band_manifold_to`); the kernel masks
+    anything beyond ``nb_logical`` to zero.
+    """
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
+    if (v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS
+            or v.shape[2] != v.shape[3]):
+        raise ValueError(
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
+    if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            f"velocity (nk,nb)={v.shape[1:3]}.")
+    if wfns.psi_mun is None or wfns.psi_nmu is None:
+        raise ValueError(
+            "head_wings_sharded(layout='face') requires wfns.psi_mun and "
+            "wfns.psi_nmu (got None) — this bundle is not a face carrier "
+            "despite wfns.layout=='face'.")
+    nk_mun, s_mun, _mu_x, n_mun = wfns.psi_mun.shape
+    nk_nmu, n_nmu, s_nmu, _mu_y = wfns.psi_nmu.shape
+    if nk_mun != int(v.shape[1]) or nk_nmu != int(v.shape[1]):
+        raise ValueError(
+            "centroid wavefunction k axis does not match the velocity")
+    if s_mun != s_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu spinor axes disagree: {s_mun} vs {s_nmu}")
+    if n_mun != n_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu band extents disagree: {n_mun} vs {n_nmu}")
+    nb_full = int(n_mun)
+    if nb_full < int(v.shape[-1]):
+        raise ValueError("centroid wavefunctions do not cover the head manifold")
+    include_surface = surface_weight_kn is not None
+    surface = (
+        jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+        if include_surface else jnp.zeros_like(e))
+    if surface.shape != e.shape:
+        raise ValueError(
+            f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
+    v, e, f, surface = _pad_head_band_manifold_to(
+        v, e, f, surface, mesh=mesh, width=nb_full)
+    spin_denominator = (
+        float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
+    pref_surface = 2.0 / (float(nk_tot) * spin_denominator)
+    return _head_wing_kernel(
+        mesh, nb_logical=int(nb_logical),
+        include_surface=bool(include_surface), layout="face")(
+            v, wfns.psi_mun, wfns.psi_nmu, e, f, surface, omega,
+            jnp.asarray(pref_inter, dtype=jnp.complex128),
+            jnp.asarray(pref_surface, dtype=jnp.complex128),
+            jnp.asarray(float(eta_ry), dtype=jnp.float64),
+        )
+
+
 def static_head_wings_sharded(
     wfns,
     surface_weight_kn,
@@ -1437,7 +2211,25 @@ def static_head_wings_sharded(
     the explicit minus sign below is physical.  The x/y centroid copies stay
     sharded on their respective mesh axes and the spinor axis is summed
     without any component-count special case.
+
+    Layout dispatch on ``wfns.layout`` (report §5): the body below,
+    unchanged, is ``layout='legacy'``.  ``layout='face'`` routes to
+    :func:`_static_head_wings_sharded_face` — per the audit report, this
+    is the EASY wing: a local density-weighted band sum plus one
+    ``psum``, no ring/gather needed at all (unlike the dynamic wings),
+    because the static vertex is DIAGONAL in mu — no cross-mu operator to
+    sweep.  A ``wfns`` with no ``layout`` attribute defaults to
+    ``'legacy'`` (see :func:`head_wings_sharded`'s matching note).
     """
+    layout = getattr(wfns, "layout", "legacy")
+    if layout == "face":
+        return _static_head_wings_sharded_face(
+            wfns, surface_weight_kn, mesh=mesh, nb_logical=nb_logical,
+            nk_tot=nk_tot, nspin=nspin, nspinor=nspinor)
+    if layout != "legacy":
+        raise ValueError(
+            f"static_head_wings_sharded: wfns.layout must be 'legacy' or "
+            f"'face', got {layout!r}")
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
     if surface.ndim != 2:
         raise ValueError(
@@ -1473,6 +2265,119 @@ def static_head_wings_sharded(
             NamedSharding(mesh, P("y")),
         )
     return left, right
+
+
+def _static_head_wings_kernel_face(mesh: Mesh) -> Callable:
+    """Cached shard_map kernel: a LOCAL density-weighted band sum per
+    face orientation, then one ``psum`` over the mesh axis holding the
+    summed band index.  No ring, no gather — see
+    :func:`_static_head_wings_sharded_face`'s docstring for why the
+    static vertex does not need one (it is diagonal in mu, unlike the
+    dynamic wings' genuine (i,j) operator)."""
+    key = ("static_head_wings_face", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(psi_mun_local, psi_nmu_local, weight_full):
+        nk = psi_mun_local.shape[0]
+
+        n_y_local = psi_mun_local.shape[-1]
+        y_coord = jax.lax.axis_index(ax_y)
+        y_zero = jnp.zeros((), dtype=y_coord.dtype)
+        y_start = y_coord * n_y_local
+        weight_y = jax.lax.dynamic_slice(
+            weight_full, (y_zero, y_start), (nk, n_y_local))
+        density_x = jnp.sum(jnp.square(jnp.abs(psi_mun_local)), axis=1)
+        left = jax.lax.psum(
+            jnp.einsum("kn,kmn->m", weight_y, density_x), ax_y)
+
+        n_x_local = psi_nmu_local.shape[1]
+        x_coord = jax.lax.axis_index(ax_x)
+        x_zero = jnp.zeros((), dtype=x_coord.dtype)
+        x_start = x_coord * n_x_local
+        weight_x = jax.lax.dynamic_slice(
+            weight_full, (x_zero, x_start), (nk, n_x_local))
+        density_y = jnp.sum(jnp.square(jnp.abs(psi_nmu_local)), axis=2)
+        right = jax.lax.psum(
+            jnp.einsum("kn,knm->m", weight_x, density_y), ax_x)
+        return left, right
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),   # psi_mun_local  (PSI_MUN_SPEC)
+            P(None, "x", None, "y"),   # psi_nmu_local  (PSI_NMU_SPEC)
+            P(None, None),             # weight (nk, nb_full), replicated
+        ),
+        out_specs=(P("x"), P("y")),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def _static_head_wings_sharded_face(
+    wfns,
+    surface_weight_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+):
+    """``layout='face'`` body of :func:`static_head_wings_sharded`.
+
+    ``C_mu = (2/(Nk*nspin*nspinor)) sum_kn f'(E_kn)|psi_kn(mu)|^2`` is
+    DIAGONAL in mu — no cross-mu (i,j) operator, unlike the dynamic
+    wings — so no gather/ring is needed: each rank sums ``|psi|^2`` over
+    the band-index fraction it already owns locally, then one ``psum``
+    over the mesh axis holding that fraction completes the sum, exactly
+    the report's own words ("local |psi|^2 weighted band sums followed
+    by a psum").  Like the dynamic face wing, this pays the full
+    ``nb_full``-wide sum rather than a windowed one (obstacle #3).
+    """
+    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    if surface.ndim != 2:
+        raise ValueError(
+            f"static head surface weights must be (nk,nb), got {surface.shape}")
+    if wfns.psi_mun is None or wfns.psi_nmu is None:
+        raise ValueError(
+            "static_head_wings_sharded(layout='face') requires "
+            "wfns.psi_mun and wfns.psi_nmu (got None).")
+    nk_mun, _s_mun, _mu_x, n_mun = wfns.psi_mun.shape
+    _nk_nmu, n_nmu, _s_nmu, _mu_y = wfns.psi_nmu.shape
+    if n_mun != n_nmu:
+        raise ValueError(
+            f"psi_mun/psi_nmu band extents disagree: {n_mun} vs {n_nmu}")
+    nb_full = int(n_mun)
+    if not (0 < int(nb_logical) <= nb_full):
+        raise ValueError(f"need 0 < nb_logical <= {nb_full}, got {nb_logical}")
+    if int(surface.shape[0]) != nk_mun:
+        raise ValueError("centroid wavefunctions do not cover static weights")
+    width = int(surface.shape[1])
+    if width > nb_full:
+        raise ValueError(
+            "static head surface weights are wider than the face bundle's "
+            f"stored band extent: {width} > {nb_full}")
+    if width < nb_full:
+        surface = jnp.pad(surface, ((0, 0), (0, nb_full - width)))
+    logical = jnp.arange(nb_full)[None, :] < int(nb_logical)
+    weight = device_put_process_local(
+        jnp.where(logical, surface, 0.0),
+        NamedSharding(mesh, P(None, None)))
+    prefactor = -2.0 / (
+        float(nk_tot)
+        * float(max(int(nspin), 1))
+        * float(max(int(nspinor), 1))
+    )
+    left, right = _static_head_wings_kernel_face(mesh)(
+        wfns.psi_mun, wfns.psi_nmu, weight)
+    return prefactor * left, prefactor * right
 
 
 def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
@@ -1588,14 +2493,26 @@ def head_s_tensor_sharded(
 
     Energies and occupations are passed twice with complementary one-axis
     shardings.  Each rank forms only its local conduction-by-valence tile;
-    a two-axis psum reduces the final 3x3 tensor.
+    a two-axis psum reduces the final operator-axis tensor.  The ordinary
+    path passes three Cartesian velocities.  A static-gauge producer instead
+    flattens its canonical energy-scaled jet
+    ``P^(I,a)=-DeltaE*d_q_a M^I|_0`` over ``(a,I)=(2,4)``.  Passing the
+    literal transition derivative would be wrong by two powers of the
+    interband energy in this kernel's bilinear.  This width-eight contraction
+    owns only the first-derivative/first-derivative term; the producer must add
+    the independently derived response-weight, second-jet, and contact terms
+    before calling a result complete.  No other width is admitted, so this
+    shared kernel has exactly the incumbent width-three and packed width-eight
+    executable shapes.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
-    if v.ndim != 4 or v.shape[0] != 3:
-        raise ValueError(f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS:
+        raise ValueError(
+            "velocity_cart must be (n_vertex,nk,nb,nb) with canonical "
+            f"n_vertex in {_HEAD_VERTEX_WIDTHS}; got {v.shape}.")
     if e.shape != f.shape or tuple(e.shape) != tuple(v.shape[1:3]):
         raise ValueError(
             f"energy/occupation shapes {e.shape}/{f.shape} do not match "
@@ -1623,18 +2540,27 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    interband = _s_tensor_kernel(
+        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
+    )(
         v,
         e,
         e,
         f,
         f,
+        surface,
+        surface,
         omega,
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
     )
     if not include_surface:
         return interband
+    if int(v.shape[0]) != 3:
+        raise ValueError(
+            "packed energy-scaled transition jets do not yet have a derived "
+            "metallic Drude completion; surface_weight_kn is admitted only "
+            "for the incumbent three-Cartesian-velocity path")
     drude = head_drude_tensor_sharded(
         v,
         surface,
@@ -1656,6 +2582,830 @@ def head_s_tensor_sharded(
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
     return interband + drude[None, :, :] * inv_z2[:, None, None]
+
+
+def static_gauge_first_order_component_sharded(
+    gamma_raw,
+    dgamma_dq_raw,
+    forward_links,
+    forward_neighbors,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+) -> StaticGaugeFirstOrderComponent:
+    r"""Build the insulating retained-manifold ``D1*D1`` gauge component.
+
+    For band-matrix order ``(bra=m, ket=n)``, Berry connection
+    ``A_a=i<u_m|d_a u_n>`` and the repository's bra ``k-q`` orientation,
+
+    ``D_a^0=-i A_a`` and
+    ``D_a^i=-i (A_a Gamma_i) + Q_{i,a}``.
+
+    The shared width-eight head kernel consumes
+    ``P_a^I=-Delta_mn D_a^I``, not ``D``.  Its charge column is populated by
+    the exact Ward reduction ``P_a^0=v_a=Gamma_a/(alpha_FS/2)``; the
+    finite-link value ``-Delta D_a^0`` is retained only in the reported
+    closure residual.  This makes the charge-charge block reduce to the
+    incumbent dipole S tensor without inheriting finite-link truncation.
+
+    This first bounded lane is insulating.  Its occupation-difference jet is
+    exactly zero.  A metallic ``-df/dE`` table is refused because the current
+    production table may be an integrated tetrahedron weight, not a local
+    chain-rule derivative.  The explicit q2 vertex is intentionally absent:
+    using it before the second state jet exists would mislabel a partial
+    second derivative as complete.
+    """
+    if surface_weight_kn is not None:
+        raise ValueError(
+            "static gauge first-order component is insulating-only; "
+            "metallic occupation derivatives are not yet derived")
+
+    from common.bispinor_init import HALFALPHA
+    from common.parallel_transport import (
+        band_storage_extent,
+        fourth_order_connection,
+        make_distributed_band_matmul,
+        undersampled_link_axes,
+    )
+    from runtime.padding import pad_axis
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    q1 = jnp.asarray(dgamma_dq_raw, dtype=jnp.complex128)
+    links = jnp.asarray(forward_links, dtype=jnp.complex128)
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    occupations = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    grid = tuple(int(n) for n in kgrid)
+    logical = int(nb_logical)
+    storage = band_storage_extent(mesh, logical)
+    nk = int(nk_tot)
+
+    if gamma.shape != (nk, 3, storage, storage):
+        raise ValueError(
+            "gamma_raw must be the mesh-padded uniform-gauge result with "
+            f"shape {(nk, 3, storage, storage)}; got {gamma.shape}")
+    if q1.shape != (nk, 3, 3, storage, storage):
+        raise ValueError(
+            "dgamma_dq_raw must be (nk,current,transfer,band,band) with "
+            f"shape {(nk, 3, 3, storage, storage)}; got {q1.shape}")
+    if links.shape != (3, nk, storage, storage):
+        raise ValueError(
+            "forward_links must share the uniform-gauge band manifold; "
+            f"expected {(3, nk, storage, storage)}, got {links.shape}")
+    if np.shape(forward_neighbors) != (nk, 3):
+        raise ValueError(
+            f"forward_neighbors must be {(nk, 3)}; got "
+            f"{np.shape(forward_neighbors)}")
+    if int(np.prod(grid)) != nk:
+        raise ValueError(f"kgrid product {int(np.prod(grid))} != nk_tot {nk}")
+    short_in_plane = tuple(
+        axis for axis in undersampled_link_axes(grid) if axis in ("x", "y"))
+    if short_in_plane:
+        raise ValueError(
+            "static gauge in-plane first jet requires the canonical fourth-"
+            f"order link stencil; undersampled axes={short_in_plane}")
+    if energies.ndim != 2 or occupations.shape != energies.shape:
+        raise ValueError(
+            "energies and occupations must be paired (nk,nb) tables; got "
+            f"{energies.shape} and {occupations.shape}")
+    if int(energies.shape[0]) != nk or int(energies.shape[1]) not in (
+            logical, storage):
+        raise ValueError(
+            "energy/occupation tables must carry the logical or padded head "
+            f"manifold ({nk},{logical}|{storage}); got {energies.shape}")
+    occ_host = np.asarray(occupations[:, :logical])
+    if not np.all((occ_host == 0.0) | (occ_host == 1.0)):
+        raise ValueError(
+            "static gauge first-order component requires exact insulating "
+            "0/1 occupations; metallic/fractional occupation derivatives "
+            "are not yet derived")
+
+    if int(energies.shape[1]) == logical:
+        energies = pad_axis(energies, storage, axis=1).array
+        occupations = pad_axis(occupations, storage, axis=1).array
+    if energies.shape != (nk, storage) or occupations.shape != (nk, storage):
+        raise AssertionError("canonical band padding did not reach storage")
+
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
+    connection_reduced = fourth_order_connection(
+        links,
+        np.asarray(forward_neighbors, dtype=np.int64),
+        spacing,
+        band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
+    )
+    connection_cart = reduced_covector_to_cartesian(
+        connection_reduced, bvec_cart)[:2]
+
+    # One batched distributed product for all (a,i), not six new kernels.
+    gamma_dir = jnp.moveaxis(gamma, 1, 0)
+    left = jnp.broadcast_to(
+        connection_cart[:, None], (2, 3, nk, storage, storage),
+    ).reshape(6, nk, storage, storage)
+    right = jnp.broadcast_to(
+        gamma_dir[None], (2, 3, nk, storage, storage),
+    ).reshape(6, nk, storage, storage)
+    a_gamma = make_distributed_band_matmul(mesh, n_batch_axes=2)(
+        left, right).reshape(2, 3, nk, storage, storage)
+    q_current = jnp.transpose(q1, (2, 1, 0, 3, 4))[:2]
+    d_current = -1.0j * a_gamma + q_current
+
+    delta = energies[:, :, None] - energies[:, None, :]
+    velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    p_charge = velocity[:2]
+    p_current = -delta[None, None] * d_current
+    p = jnp.concatenate((p_charge[:, None], p_current), axis=1)
+
+    d_charge_state = -1.0j * connection_cart
+    p_charge_state = -delta[None] * d_charge_state
+    f_diff = occupations[:, None, :] - occupations[:, :, None]
+    band = jnp.arange(storage)
+    transition = (
+        (delta > 0.0)
+        & (jnp.abs(f_diff) > 1.0e-12)
+        & (band[:, None] < logical)
+        & (band[None, :] < logical)
+    )
+    charge_error = jnp.max(jnp.where(
+        transition[None], jnp.abs(p_charge_state - p_charge), 0.0))
+    charge_scale = jnp.max(jnp.where(
+        transition[None], jnp.abs(p_charge), 0.0))
+    charge_ward_residual = jnp.where(
+        charge_scale > 0.0, charge_error / charge_scale, 0.0)
+
+    p_flat = p.reshape(8, nk, storage, storage)
+    s_flat = head_s_tensor_sharded(
+        p_flat,
+        energies,
+        occupations,
+        omegas_ry,
+        mesh=mesh,
+        nb_logical=logical,
+        cell_volume=float(cell_volume),
+        nk_tot=nk,
+        nspin=int(nspin),
+        nspinor=int(nspinor),
+        eta_ry=float(eta_ry),
+    )
+    s_first_first = jnp.transpose(
+        s_flat.reshape(int(s_flat.shape[0]), 2, 4, 2, 4),
+        (0, 1, 3, 2, 4),
+    )
+    bra_energy_dq = -jnp.real(jnp.diagonal(
+        velocity[:2], axis1=-2, axis2=-1))
+    return StaticGaugeFirstOrderComponent(
+        energy_scaled_d1_raw=p,
+        S_first_first=s_first_first,
+        bra_energy_dq_ry=bra_energy_dq,
+        occupation_difference_dq=jnp.zeros_like(bra_energy_dq),
+        charge_ward_residual=charge_ward_residual,
+        retained_connection_cart=connection_cart,
+        nb_logical=logical,
+    )
+
+
+def static_gauge_second_order_component_sharded(
+    gamma_raw,
+    dgamma_dq_raw,
+    d2gamma_dq2_raw,
+    forward_links,
+    forward_neighbors,
+    energies_kn_ry,
+    occupations_kn,
+    omegas_ry,
+    *,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    surface_weight_kn=None,
+) -> StaticGaugeSecondOrderComponent:
+    r"""Build the insulating retained-manifold bubble through second q order.
+
+    The bra is at ``k-q``.  With ``A_a=i<u|d_a u>`` and the incumbent
+    transported derivative ``C_b(O)=d_b O-i[A_b,O]``, the symmetric retained
+    second bra jet is
+
+    ``T_ab = sym_ab(i C_b(A_a) - A_b A_a)``
+    ``     = sym_ab(i d_b A_a - A_a A_b)``.
+
+    The current transition jet is therefore
+
+    ``E_i,ab = T_ab Gamma_i - i(A_a Q_i,b + A_b Q_i,a) + Q2_i,ab``.
+
+    ``Q2`` is the true second derivative used with ``q_a q_b/2`` by the
+    canonical ICL sweep.  Its transfer indices must already be symmetric at
+    roundoff; this consumer measures and refuses asymmetry rather than
+    repairing it.
+
+    The response is analytic AD of the exact incumbent head-weight kernel.
+    This preserves its transition mask, prefactor, frequency blocking,
+    two-axis band tiling, and sole psum implementation.  Only ``(xx,xy,yy)``
+    is streamed.  Exact charge ``P=v`` from the first-order Ward reduction is
+    retained in the first jet; the finite-link ``T_ab`` remains the explicit
+    retained-manifold second charge jet.
+
+    This API is insulating and bubble-only.  It neither consumes metallic
+    surface weights nor supplies complement-space, contact, body, or FULL
+    screened completion.
+    """
+    if surface_weight_kn is not None:
+        raise ValueError(
+            "static gauge second-order component is insulating-only; "
+            "metallic f'' occupation response is not derived")
+
+    from common.bispinor_init import HALFALPHA
+    from common.parallel_transport import (
+        fourth_order_covariant_derivative,
+        make_distributed_band_matmul,
+    )
+    from runtime.padding import pad_axis
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    q1 = jnp.asarray(dgamma_dq_raw, dtype=jnp.complex128)
+    q2 = jnp.asarray(d2gamma_dq2_raw, dtype=jnp.complex128)
+    links = jnp.asarray(forward_links, dtype=jnp.complex128)
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    occupations = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    grid = tuple(int(n) for n in kgrid)
+    nk = int(nk_tot)
+    logical = int(nb_logical)
+    if gamma.ndim != 4 or gamma.shape[-2] != gamma.shape[-1]:
+        raise ValueError(
+            "gamma_raw must be (nk,current,band,band) before Q2 validation; "
+            f"got {gamma.shape}")
+    storage = int(gamma.shape[-1])
+    expected_q2 = (nk, 3, 3, 3, storage, storage)
+    if q2.shape != expected_q2:
+        raise ValueError(
+            "d2gamma_dq2_raw must be "
+            "(nk,current,transfer,transfer,band,band) with shape "
+            f"{expected_q2}; got {q2.shape}")
+
+    q2_cart = jnp.transpose(q2, (2, 3, 1, 0, 4, 5))[:2, :2]
+    q2_asymmetry = jnp.max(jnp.abs(q2_cart - jnp.swapaxes(q2_cart, 0, 1)))
+    q2_scale = jnp.max(jnp.abs(q2_cart))
+    q2_symmetry_residual = jnp.where(
+        q2_scale > 0.0, q2_asymmetry / q2_scale, 0.0)
+    q2_error_host, q2_scale_host = (
+        float(x) for x in jax.device_get((q2_asymmetry, q2_scale)))
+    q2_tolerance = 512.0 * np.finfo(np.float64).eps * max(
+        1.0, q2_scale_host)
+    if q2_error_host > q2_tolerance:
+        raise ValueError(
+            "static gauge Q2 transfer indices are not symmetric: "
+            f"max|Q2_ab-Q2_ba|={q2_error_host:.6e}, "
+            f"roundoff allowance={q2_tolerance:.6e}; regenerate the "
+            "canonical ICL transfer jet rather than averaging this defect")
+
+    first = static_gauge_first_order_component_sharded(
+        gamma,
+        q1,
+        links,
+        forward_neighbors,
+        energies,
+        occupations,
+        omegas_ry,
+        mesh=mesh,
+        kgrid=kgrid,
+        bvec_cart=bvec_cart,
+        nb_logical=logical,
+        cell_volume=float(cell_volume),
+        nk_tot=nk,
+        nspin=int(nspin),
+        nspinor=int(nspinor),
+        eta_ry=float(eta_ry),
+    )
+
+    if int(energies.shape[1]) == logical:
+        energies = pad_axis(energies, storage, axis=1).array
+        occupations = pad_axis(occupations, storage, axis=1).array
+    if energies.shape != (nk, storage) or occupations.shape != (nk, storage):
+        raise ValueError(
+            "second-order energy/occupation tables must reach the first-"
+            f"order storage shape {(nk, storage)}; got "
+            f"{energies.shape}/{occupations.shape}")
+
+    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
+    plus = np.asarray(forward_neighbors, dtype=np.int64)
+    multiply_one = make_distributed_band_matmul(mesh, n_batch_axes=1)
+    multiply_six = make_distributed_band_matmul(mesh, n_batch_axes=2)
+
+    def _multiply_in_six(left, right):
+        """Run one bounded block on the first-jet's six-wide executable."""
+        count = int(left.shape[0])
+        if right.shape != left.shape:
+            raise ValueError(
+                f"paired component products differ: {left.shape}/{right.shape}")
+        if not 0 < count <= 6:
+            raise ValueError(
+                "second-order band products must be streamed in one "
+                f"six-component block; got {count}")
+        pad = 6 - count
+        if pad:
+            zeros = jnp.zeros(
+                (pad, nk, storage, storage), dtype=left.dtype)
+            left = jnp.concatenate((left, zeros), axis=0)
+            right = jnp.concatenate((right, zeros), axis=0)
+        return multiply_six(left, right)[:count]
+
+    def _cartesian_covariant_derivatives(operators):
+        rows = []
+        for operator in operators:
+            reduced = fourth_order_covariant_derivative(
+                operator,
+                links,
+                plus,
+                spacing,
+                band_matmul=multiply_one,
+            )
+            rows.append(reduced_covector_to_cartesian(
+                reduced, bvec_cart)[:2])
+        return jnp.stack(rows, axis=0)
+
+    connection = first.retained_connection_cart
+    connection_derivative = _cartesian_covariant_derivatives(connection)
+    left_b = jnp.broadcast_to(
+        connection[None], (2, 2, nk, storage, storage))
+    right_a = jnp.broadcast_to(
+        connection[:, None], (2, 2, nk, storage, storage))
+    connection_product = _multiply_in_six(
+        left_b.reshape(4, nk, storage, storage),
+        right_a.reshape(4, nk, storage, storage),
+    ).reshape(2, 2, nk, storage, storage)
+    ordered_t = 1.0j * connection_derivative - connection_product
+    retained_t = 0.5 * (ordered_t + jnp.swapaxes(ordered_t, 0, 1))
+    curvature_error = jnp.max(jnp.abs(
+        ordered_t - jnp.swapaxes(ordered_t, 0, 1)))
+    curvature_scale = jnp.max(jnp.abs(ordered_t))
+    ordered_curvature_residual = jnp.where(
+        curvature_scale > 0.0, curvature_error / curvature_scale, 0.0)
+
+    gamma_dir = jnp.moveaxis(gamma, 1, 0)
+    q_current = jnp.transpose(q1, (2, 1, 0, 3, 4))[:2]
+    pair_axes = ((0, 0), (0, 1), (1, 1))
+    t_pair = jnp.stack(tuple(retained_t[a, b] for a, b in pair_axes))
+
+    # One existing distributed-matmul family owns every T*Gamma and A*Q
+    # product.  Stream one retained pair at a time: the first block holds
+    # [T_ab*Gamma_i, A_a*Q_i,b], the diagonal reuses its A*Q half, and only
+    # xy needs a second (three-valid, six-wide padded) A_b*Q_i,a block.
+    # No 21-component band-square input or product carrier is materialized.
+    current_d2_rows = []
+    for p, (a, b) in enumerate(pair_axes):
+        primary_left = jnp.concatenate((
+            jnp.broadcast_to(
+                t_pair[p][None], (3, nk, storage, storage)),
+            jnp.broadcast_to(
+                connection[a][None], (3, nk, storage, storage)),
+        ), axis=0)
+        primary_right = jnp.concatenate((gamma_dir, q_current[b]), axis=0)
+        primary = _multiply_in_six(primary_left, primary_right)
+        current = primary[:3] - 1.0j * primary[3:]
+        if a == b:
+            current = current - 1.0j * primary[3:]
+        else:
+            secondary_left = jnp.broadcast_to(
+                connection[b][None], (3, nk, storage, storage))
+            secondary = _multiply_in_six(
+                secondary_left, q_current[a])
+            current = current - 1.0j * secondary
+        current_d2_rows.append(current + q2_cart[a, b])
+    current_d2 = jnp.stack(current_d2_rows)
+    transition_d2 = jnp.concatenate((t_pair[:, None], current_d2), axis=1)
+
+    velocity = gamma_dir / jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    velocity_derivative = _cartesian_covariant_derivatives(velocity[:2])
+    velocity_hessian = 0.5 * (
+        velocity_derivative + jnp.swapaxes(velocity_derivative, 0, 1))
+    energy_d2 = jnp.stack(tuple(jnp.real(jnp.diagonal(
+        velocity_hessian[a, b], axis1=-2, axis2=-1))
+        for a, b in pair_axes))
+
+    delta = energies[:, :, None] - energies[:, None, :]
+    nonzero_delta = delta != 0.0
+    transition_d1 = jnp.where(
+        nonzero_delta[None, None],
+        -first.energy_scaled_d1_raw / jnp.where(
+            nonzero_delta, delta, jnp.asarray(1.0, dtype=delta.dtype)
+        )[None, None],
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
+    identity = jnp.broadcast_to(
+        jnp.eye(storage, dtype=jnp.complex128)[None],
+        (nk, storage, storage),
+    )
+    m0 = jnp.concatenate((identity[None], gamma_dir), axis=0)
+
+    prefactor = jnp.asarray(
+        4.0
+        / (
+            float(cell_volume)
+            * float(nk)
+            * float(max(int(nspin), 1))
+            * float(max(int(nspinor), 1))
+        ),
+        dtype=jnp.complex128,
+    )
+    omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
+    eta = jnp.asarray(float(eta_ry), dtype=jnp.float64)
+    mixed_kernel = _static_gauge_bubble_mixed_derivative_kernel(
+        mesh, nb_logical=logical)
+    full_pairs = []
+    second_zero_pairs = []
+    for p, (a, b) in enumerate(pair_axes):
+        full, second_zero = mixed_kernel(
+            m0,
+            transition_d1[a],
+            transition_d1[b],
+            transition_d2[p],
+            energies,
+            first.bra_energy_dq_ry[a],
+            first.bra_energy_dq_ry[b],
+            energy_d2[p],
+            occupations,
+            omega,
+            prefactor,
+            eta,
+        )
+        full_pairs.append(full)
+        second_zero_pairs.append(second_zero)
+    full_second = jnp.stack(full_pairs, axis=1)
+    second_zero = jnp.stack(second_zero_pairs, axis=1)
+    first_first = jnp.stack(tuple(
+        first.S_first_first[:, a, b]
+        + first.S_first_first[:, b, a]
+        for a, b in pair_axes
+    ), axis=1)
+    response_weight = full_second - first_first - second_zero
+
+    return StaticGaugeSecondOrderComponent(
+        first_order=first,
+        transition_d2_raw=transition_d2,
+        bra_energy_dq2_ry=energy_d2,
+        occupation_difference_dq2=jnp.zeros_like(energy_d2),
+        S_second_zero_zero_second=second_zero,
+        S_response_weight=response_weight,
+        S_bubble_second_derivative=full_second,
+        ordered_curvature_residual=ordered_curvature_residual,
+        q2_symmetry_residual=q2_symmetry_residual,
+        nb_logical=logical,
+    )
+
+
+def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    """Distributed occupied-state Berry-overlap contraction.
+
+    This is the band-tiled form of ``orbital_magnetization.cB``.  It returns
+    the axial cross product before physical prefactors; no band matrix is
+    gathered and only the three-component reduction is replicated.
+    """
+    key = ("static_gauge_raw_hall", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(gamma_local, e_bra, e_ket, f_bra, f_ket, deps_tol):
+        nx, ny = gamma_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        logical = (
+            (ix[:, None] < nb_logical)
+            & (iy[None, :] < nb_logical)
+        )[None, :, :]
+        dE = e_bra[:, :, None] - e_ket[:, None, :]
+        separated = jnp.abs(dE) > deps_tol
+        inv_dE2 = jnp.where(
+            logical & separated,
+            1.0 / jnp.square(jnp.where(separated, dE, 1.0)),
+            0.0,
+        )
+        weight = f_bra[:, :, None] * inv_dE2
+
+        gx, gy, gz = gamma_local
+        # Hermiticity gives Gamma_b[m,n] = conj(Gamma_b[n,m]), avoiding a
+        # transpose/all-to-all of the band tile.  This is exactly the axial
+        # product used by psp.orbital_magnetization.orbital_pieces_at_k.
+        cross = jnp.stack((
+            gy * jnp.conj(gz) - gz * jnp.conj(gy),
+            gz * jnp.conj(gx) - gx * jnp.conj(gz),
+            gx * jnp.conj(gy) - gy * jnp.conj(gx),
+        ))
+        cB_raw = jnp.einsum("akij,kij->a", cross, weight, optimize=True)
+
+        # A degeneracy joining differently occupied states invalidates the
+        # ordinary insulating SOS expression; report one small flag rather
+        # than silently clipping it into a Hall number.
+        unsafe = jnp.any(
+            logical
+            & (~separated)
+            & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
+        return (
+            jax.lax.psum(cB_raw, (ax_x, ax_y)),
+            jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
+        )
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(),
+        ),
+        out_specs=(P(None), P()),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def raw_hall_pseudovector_sharded(
+    gamma_raw,
+    energies_kn_ry,
+    occupations_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor_wfn: int,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+):
+    r"""Derive the schema's real raw Hall pseudovector from ``Gamma_raw``.
+
+    The accepted raw Breit vertex and physical Pauli velocity are
+
+    ``Gamma_raw = (alpha_FS/2) v_Ry`` and
+    ``j = c Gamma_raw = v_Ry/2``.
+
+    Let ``cB`` be the incumbent orbital-magnetization Berry overlap built
+    from ``v_Ry``.  With state capacity
+    ``C=2/(nspin*nspinor_wfn)``, the immutable-schema convention is
+
+    ``sigma_H_raw = -(alpha_FS*C/(2*Omega_cell)) Im(cB)``.
+
+    This implementation contracts the same transaction's ``Gamma_raw``
+    directly, so ``cB_raw=(alpha_FS/2)^2 cB`` and the applied prefactor is
+    equivalently ``-C/(Omega_cell*Nk*(alpha_FS/2))``.  The minus sign is the
+    documented occupied-Berry/Hall sign; ``static_hall_linear_response``
+    later inserts the independent ``+i epsilon[b,a,i]`` CT convention.
+    """
+    from common.bispinor_init import HALFALPHA
+
+    gamma = jnp.asarray(gamma_raw, dtype=jnp.complex128)
+    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    if gamma.ndim != 4 or gamma.shape[1] != 3:
+        raise ValueError(
+            "gamma_raw must be (nk,3,nb,nb) from "
+            f"sweep_uniform_gauge_matrix_elements; got {gamma.shape}")
+    if gamma.shape[2] != gamma.shape[3]:
+        raise ValueError("gamma_raw band matrices must be square")
+    if e.shape != f.shape or tuple(e.shape) not in (
+            (int(gamma.shape[0]), int(nb_logical)),
+            (int(gamma.shape[0]), int(gamma.shape[2]))):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            "the logical or stored band extent of gamma_raw "
+            f"{gamma.shape} (nb_logical={int(nb_logical)})")
+    if not (0 < int(nb_logical) <= int(gamma.shape[2])):
+        raise ValueError(
+            f"need 0 < nb_logical <= stored nb={gamma.shape[2]}; "
+            f"got {nb_logical}")
+    if not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0:
+        raise ValueError("cell_volume must be positive")
+    if int(nk_tot) <= 0 or int(nspin) <= 0 or int(nspinor_wfn) <= 0:
+        raise ValueError("nk_tot, nspin, and nspinor_wfn must be positive")
+    if int(gamma.shape[0]) != int(nk_tot):
+        raise ValueError(
+            "raw Hall requires one Gamma_raw row per full-BZ k point: "
+            f"gamma_raw nk={int(gamma.shape[0])}, nk_tot={int(nk_tot)}. "
+            "IBZ/subset rows must be unfolded through the symmetry service "
+            "before the 1/Nk normalization is applied")
+    if float(degeneracy_tolerance_ry) <= 0.0:
+        raise ValueError("degeneracy_tolerance_ry must be positive")
+
+    # ``sweep_uniform_gauge_matrix_elements`` stores both band axes at the
+    # mesh-divisible carrier extent, while WFN energies/occupations are the
+    # logical file manifold.  Use the repository padding owner rather than
+    # forcing a producer to manufacture padded electronic states.  The
+    # kernel's explicit ``nb_logical`` mask makes these storage rows inert.
+    if int(e.shape[1]) != int(gamma.shape[2]):
+        from runtime.padding import pad_axis
+        e = pad_axis(e, int(gamma.shape[2]), axis=1).array
+        f = pad_axis(f, int(gamma.shape[2]), axis=1).array
+
+    # Reuse the incumbent head manifold's one padding/sharding owner.  The
+    # transpose is a view putting the replicated component axis first.
+    vertex = jnp.transpose(gamma, (1, 0, 2, 3))
+    vertex, e, f, _ = _pad_head_band_manifold(
+        vertex, e, f, jnp.zeros_like(e), mesh=mesh)
+    cB_raw, unsafe = _raw_hall_kernel(
+        mesh, nb_logical=int(nb_logical))(
+            vertex,
+            e,
+            e,
+            f,
+            f,
+            jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64),
+        )
+    if int(np.asarray(unsafe)):
+        raise ValueError(
+            "GATE static_gauge_raw_hall_degenerate: differently occupied "
+            "states are degenerate within degeneracy_tolerance_ry; the "
+            "insulating occupied-state Berry SOS formula is undefined")
+    capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
+    prefactor = -capacity / (
+        float(cell_volume) * float(nk_tot) * float(HALFALPHA))
+    return jnp.asarray(
+        prefactor * jnp.imag(cB_raw), dtype=jnp.float64)
+
+
+def static_gauge_hall_transaction(
+    uniform_gauge,
+    *,
+    wfn,
+    sym,
+    band_start: int,
+    band_stop: int,
+    mesh: Mesh,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+) -> StaticGaugeHallTransaction:
+    r"""Produce the artifact-ready Hall term from one canonical transaction.
+
+    ``uniform_gauge`` must be the result of
+    :func:`common.mtxel_sweep.sweep_uniform_gauge_matrix_elements`.  Hall
+    production consumes its current block.  Exact contact and optional
+    transfer-q1/q2 fields are validated when present, but they are not
+    materialized merely to reduce Hall: on a realistic band manifold that
+    would make a three-number reduction retain many unrelated band matrices.
+    A complete response producer must separately require those fields under
+    its own capability gate; the charge+Hall model records them as omitted.
+
+    Energies and occupations are read from the same ``WfnLoader`` and unfolded
+    from its file wedge through :func:`symmetry_maps.unfold_file_wedge_to_full_bz`.
+    Consequently ``Gamma_raw``, energies and occupations all have one row per
+    physical full-BZ k before the sole ``1/Nk`` normalization is applied.  No
+    driver-local star reconstruction, wavefunction reopen, band-matrix gather,
+    FFT, current operator, or second Hall contraction is introduced here.
+    """
+    from common.mtxel_sweep import (
+        UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)
+    from common.parallel_transport import wfn_fingerprint
+    from symmetry_maps import unfold_file_wedge_to_full_bz
+
+    if not isinstance(uniform_gauge, (
+            UniformGaugeCurrentMatrixElements, UniformGaugeMatrixElements)):
+        raise TypeError(
+            "static gauge Hall production requires the canonical "
+            "uniform-gauge current transaction")
+    complete = isinstance(uniform_gauge, UniformGaugeMatrixElements)
+    if (complete
+            and ((uniform_gauge.dgamma_dq_raw is None)
+                 != (uniform_gauge.d2gamma_dq2_raw is None))):
+        raise ValueError(
+            "uniform-gauge Hall transaction has only one of its optional "
+            "first/second transfer-jet fields")
+
+    start, stop = int(band_start), int(band_stop)
+    logical = stop - start
+    if start != 0 or logical <= 0 or stop > int(wfn.nbands):
+        raise ValueError(
+            "static gauge Hall band interval must start at band zero and "
+            f"satisfy 0 < stop <= WFN.nbands; got [{start},{stop})")
+    if int(wfn.nspin) != 1:
+        raise ValueError(
+            "static gauge Hall transaction currently requires nspin=1: "
+            "Gamma_raw has no explicit spin-channel axis")
+
+    gamma = uniform_gauge.gamma_raw
+    nk_tot = int(sym.nk_tot)
+    if (gamma.ndim != 4 or int(gamma.shape[0]) != nk_tot
+            or int(gamma.shape[1]) != 3
+            or int(gamma.shape[2]) != int(gamma.shape[3])
+            or int(gamma.shape[2]) < logical):
+        raise ValueError(
+            "canonical static gauge Hall transaction requires full-BZ "
+            "Gamma_raw[nk,3,nb,nb] with both band carriers covering the "
+            f"logical interval: got {gamma.shape}, nk_tot={nk_tot}, "
+            f"logical bands={logical}")
+    storage = int(gamma.shape[2])
+    if (complete and tuple(uniform_gauge.lambda_raw.shape) != (
+            nk_tot, 3, 3, storage, storage)):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid exact-contact "
+            f"shape {uniform_gauge.lambda_raw.shape}")
+    if (complete and uniform_gauge.dgamma_dq_raw is not None
+            and tuple(uniform_gauge.dgamma_dq_raw.shape) != (
+                nk_tot, 3, 3, storage, storage)):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid first transfer "
+            f"jet shape {uniform_gauge.dgamma_dq_raw.shape}")
+    if (complete and uniform_gauge.d2gamma_dq2_raw is not None
+            and tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
+                nk_tot, 3, 3, 3, storage, storage)):
+        raise ValueError(
+            "uniform-gauge Hall transaction has an invalid second transfer "
+            f"jet shape {uniform_gauge.d2gamma_dq2_raw.shape}")
+
+    fingerprint = str(
+        uniform_gauge.hamiltonian_config_operator_fingerprint).strip()
+    if (not fingerprint.startswith("sha256:")
+            or len(fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef" for c in fingerprint[7:])):
+        raise ValueError(
+            "uniform-gauge Hall transaction lacks the canonical "
+            "Hamiltonian/config/operator SHA-256 fingerprint")
+
+    energies_file = np.asarray(
+        wfn.energies[0, :, start:stop], dtype=np.float64)
+    occupations_file = np.asarray(
+        wfn.occs[0, :, start:stop], dtype=np.float64)
+    if (energies_file.shape != (int(sym.nk_red), logical)
+            or occupations_file.shape != energies_file.shape):
+        raise ValueError(
+            "WFN energy/occupation file-wedge tables do not match the "
+            f"requested Hall manifold: {energies_file.shape}/"
+            f"{occupations_file.shape}, expected "
+            f"{(int(sym.nk_red), logical)}")
+    if np.any((occupations_file != 0.0) & (occupations_file != 1.0)):
+        raise ValueError(
+            "static gauge Hall artifact production is insulating-only and "
+            "requires exact 0/1 occupations")
+    occupations_above = np.asarray(
+        wfn.occs[0, :, stop:], dtype=np.float64)
+    if np.any(occupations_above != 0.0):
+        raise ValueError(
+            "static gauge Hall band interval omits occupied WFN states; "
+            "increase band_stop")
+
+    energies_full = unfold_file_wedge_to_full_bz(sym, energies_file)
+    occupations_full = unfold_file_wedge_to_full_bz(sym, occupations_file)
+    sigma_H = raw_hall_pseudovector_sharded(
+        gamma,
+        energies_full,
+        occupations_full,
+        mesh=mesh,
+        nb_logical=logical,
+        cell_volume=float(wfn.cell_volume),
+        nk_tot=nk_tot,
+        nspin=int(wfn.nspin),
+        nspinor_wfn=int(wfn.nspinor),
+        degeneracy_tolerance_ry=float(degeneracy_tolerance_ry),
+    )
+    return StaticGaugeHallTransaction(
+        sigma_H=sigma_H,
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        wfn_fingerprint=wfn_fingerprint(wfn),
+        band_start=start,
+        band_stop=stop,
+        nk_tot=nk_tot,
+        producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
+        _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+    )
+
+
+def _static_gauge_hall_transaction_from_artifact(
+    *, sigma_H, hamiltonian_config_operator_fingerprint: str,
+    wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
+    mesh: Mesh,
+) -> StaticGaugeHallTransaction:
+    """Place a loader-validated Hall vector on the run mesh."""
+    sigma = device_put_process_local(
+        np.asarray(sigma_H, dtype=np.float64),
+        NamedSharding(mesh, P()))
+    return StaticGaugeHallTransaction(
+        sigma_H=sigma,
+        hamiltonian_config_operator_fingerprint=(
+            hamiltonian_config_operator_fingerprint),
+        wfn_fingerprint=wfn_fingerprint,
+        band_start=int(band_start),
+        band_stop=int(band_stop),
+        nk_tot=int(nk_tot),
+        producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
+        _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+    )
 
 
 @dataclass(frozen=True)
@@ -2059,6 +3809,9 @@ def build_iteration_head_response(
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
     )
+    # Physical state multiplicity belongs to the source WFN.  A
+    # kinetic-balance lift changes only the stored spinor representation.
+    normalization_nspinor = int(meta.nspinor_wfnfile)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
@@ -2069,7 +3822,7 @@ def build_iteration_head_response(
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin),
-        nspinor=int(meta.nspinor),
+        nspinor=normalization_nspinor,
         eta_ry=resolved_eta_ry,
         surface_weight_kn=surface_weight_qp_kn,
     )
@@ -2086,7 +3839,7 @@ def build_iteration_head_response(
             nb_logical=nb_logical,
             nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin),
-            nspinor=int(meta.nspinor),
+            nspinor=normalization_nspinor,
             eta_ry=resolved_eta_ry,
             surface_weight_kn=surface_weight_qp_kn,
         )
@@ -2103,7 +3856,7 @@ def build_iteration_head_response(
             nb_logical=int(nb_logical),
             nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin),
-            nspinor=int(meta.nspinor),
+            nspinor=normalization_nspinor,
         )
         from gw.w_isdf import compute_chi0_static_fractional_gamma
         static_chi_body_gamma = compute_chi0_static_fractional_gamma(
@@ -2119,7 +3872,7 @@ def build_iteration_head_response(
     if surface_weight_qp_kn is not None:
         capacity = 2.0 / (
             float(max(int(wfn.nspin), 1))
-            * float(max(int(meta.nspinor), 1)))
+            * float(max(normalization_nspinor, 1)))
         # Tetrahedron weights arrive multiplied by Nk to share the distributed
         # Drude contraction's interface.  Undo that factor for the normalized
         # BZ density of states, then use kappa_TF^2=8*pi*DOS_Ry/Omega.
@@ -2154,6 +3907,7 @@ def build_dft_head_response(
     wfn,
     meta,
     config,
+    wfn_fingerprint_binding=None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -2171,6 +3925,36 @@ def build_dft_head_response(
         raise FileNotFoundError(
             "head_correction=full requires dipole.h5 to build the direct "
             f"head and wings; missing {dipole_path}.")
+    # Fail before the host read and every sharded head allocation.  Shape does
+    # not identify a velocity artifact: in particular, a two-spinor dipole and
+    # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
+    # The producer owns both the stamp grammar and sign resolution; consume
+    # those owners directly rather than mirroring either convention here.
+    from psp.get_dipole_mtxels import (
+        check_dipole_provenance, resolve_vnl_velocity_sign)
+    expected_vnl_sign = resolve_vnl_velocity_sign(
+        None, config.vnl_velocity_sign)
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
+        getattr(config, "bispinor_gw", "bare_transverse"))
+    if not check_dipole_provenance(
+            dipole_path,
+            wfn=wfn,
+            nval=int(config.nval),
+            ncond=int(config.ncond),
+            nband=int(config.nband),
+            bispinor=representation.scalar_head_bispinor,
+            skip_vnl=False,
+            vnl_mode="analytic",
+            vnl_velocity_sign=expected_vnl_sign,
+            wfn_fingerprint_binding=wfn_fingerprint_binding):
+        raise ValueError(
+            "GATE dft_head_dipole_provenance: head_correction=full refuses "
+            "dipole.h5 because its WFN/q→0-coverage/VNL/representation "
+            "provenance does not authenticate the charge-response body. "
+            "Regenerate the "
+            "dipole from this run's deck before building S_direct or wings.")
     velocity_cart, _ = read_dipole_h5(dipole_path)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
@@ -2186,16 +3970,19 @@ def build_dft_head_response(
             f"(3,{int(meta.nk_tot)},{nb_logical},{nb_logical}) for global "
             f"bands [{b0},{b4}).")
     z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
+    # ``meta.nspinor`` is four for the bispinor representation, whereas
+    # response normalization counts the source-WFN states.
+    normalization_nspinor = int(meta.nspinor_wfnfile)
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
-        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta))
     Y_x, Z_y = head_wings_sharded(
         jnp.asarray(velocity_cart), wfns, energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
-        nspin=int(wfn.nspin), nspinor=int(meta.nspinor),
+        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta))
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
@@ -2432,42 +4219,3 @@ def report_trs_velocity_parity(
         return False
     print_fn(f"  sanity[{name}]: {detail} — parity holds.")
     return True
-
-
-def validate_dft_velocity_identity(
-    h_dft_k,
-    connection_cart,
-    velocity_dft_cart,
-    *,
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
-) -> dict[str, float]:
-    """Mandatory full-matrix gate for ``v = partial H - i[A,H]``.
-
-    Reductions happen on device; only five scalars cross to the host.
-    Diagonal and off-diagonal maxima are reported separately so a passing
-    diagonal cannot hide a link-orientation error in the transition sector.
-    """
-    target = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    got = covariant_cartesian_derivative(
-        h_dft_k, connection_cart, mesh=mesh, kgrid=kgrid, bvec_cart=bvec_cart
-    )
-    if got.shape != target.shape:
-        raise ValueError(
-            f"reconstructed/target velocity shapes differ: {got.shape}/{target.shape}."
-        )
-    diff = jnp.abs(got - target)
-    nb = int(diff.shape[-1])
-    eye = jnp.eye(nb, dtype=bool)[None, None, :, :]
-    scale = jnp.max(jnp.abs(target))
-    herm = jnp.max(jnp.abs(got - jnp.conj(jnp.swapaxes(got, -1, -2))))
-    vals = (
-        jnp.max(diff),
-        jnp.max(jnp.where(eye, diff, 0.0)),
-        jnp.max(jnp.where(~eye, diff, 0.0)),
-        jnp.max(diff) / jnp.maximum(scale, 1.0e-30),
-        herm,
-    )
-    names = ("max_abs", "max_abs_diag", "max_abs_offdiag", "max_rel", "hermiticity")
-    return {name: float(value) for name, value in zip(names, vals)}

@@ -49,12 +49,25 @@ from common.progress import LoopProgress
 from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
-                                band_sphere_spec, blocks_to_host,
-                                dipole_operator, sweep_matrix_elements)
-from common.parallel_transport import WFN_FINGERPRINT_SCHEME, wfn_fingerprint
+                                blocks_to_host, dipole_operator,
+                                sweep_matrix_elements,
+                                sweep_uniform_current_matrix_elements)
+from common.parallel_transport import (
+	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
+)
+from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
+from common.bispinor_init import (
+	ALPHA_FS, DIRAC_ALPHA_VERTEX_PROVENANCE,
+	KINETIC_BALANCE_LIFT_PROVENANCE, NO_PAIR_DIRAC_CURRENT_MODEL,
+)
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
-from gw.gw_config import read_lorrax_input as read_cohsex_input
+from gw.gw_config import (
+	BispinorGWMode, coerce_bispinor_gw_mode,
+	read_lorrax_input as read_cohsex_input,
+)
+from common.four_current_model import resolve_four_current_representation
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
@@ -147,57 +160,10 @@ def compute_block_direct_cnk(*args, **kwargs):
 # Finite-q matrix elements for SOS chi head/wing/S/w pipeline
 # --------------------------
 
-def _build_g_lookup(Gk_int_kmq: np.ndarray, Gk_int_k: np.ndarray,
-                     G_wrap: np.ndarray, *,
-                     ngk_kmq: int, ngk_k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Per-(k, q) integer lookup that translates between the G-spheres of
-    ``k`` and ``canonical(k − q)`` under umklapp.
-
-    For each μ_k in the ket's G-sphere, we want the μ_kmq such that
-    ``Gk_int_kmq[μ_kmq] == Gk_int_k[μ_k] + G_wrap``.  When that G-vector
-    lies outside the canonical-kmq sphere we mark it −1 (the bra
-    coefficient there is zero anyway, so the contribution to the
-    overlap is zero).
-
-    Both G-lists are the loader's fixed ``(ngkmax, 3)`` tables, so the
-    PHYSICAL extents ``ngk_kmq`` / ``ngk_k`` are passed explicitly and the
-    pad rows take no part:
-
-    * the bra-side dictionary is built over the first ``ngk_kmq`` rows —
-      the pad rows are all ``(0,0,0)``, so including them would rebind
-      the Γ key to the LAST pad index and every ket G that maps to Γ
-      would then read a zero coefficient;
-    * the ket-side loop runs over the first ``ngk_k`` rows and the rest
-      of the mask is False — a pad row would otherwise look up
-      ``(0,0,0) + G_wrap``, which is frequently a real member of the bra
-      sphere, and contribute a spurious ψ(Γ) term.
-
-    The Python dictionary work is therefore unchanged from the ragged
-    route; only the returned arrays are widened to ``ngkmax``.
-
-    Returns
-    -------
-    map_arr : (ngkmax,) int32  — μ_kmq index per μ_k (0 placeholder where
-              not found or padded; use ``mask`` to gate).
-    mask    : (ngkmax,) bool   — True where the lookup succeeded.
-    """
-    ngkmax = int(Gk_int_k.shape[0])
-    ngk_k = int(ngk_k)
-    target = Gk_int_k[:ngk_k] + G_wrap[None, :]                         # (ngk_k, 3)
-    g_dict = {tuple(int(x) for x in g): i
-              for i, g in enumerate(Gk_int_kmq[:int(ngk_kmq)])}
-    map_arr = np.zeros(ngkmax, dtype=np.int32)
-    mask = np.zeros(ngkmax, dtype=bool)
-    for i, t in enumerate(target):
-        idx = g_dict.get((int(t[0]), int(t[1]), int(t[2])), -1)
-        mask[i] = idx >= 0
-        map_arr[i] = idx if idx >= 0 else 0
-    return map_arr, mask
-
-
-@jax.jit
+@functools.partial(jax.jit, static_argnames=('selected_dirac_current',))
 def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
-                                map_arr, mask):
+                                map_arr, mask, *,
+                                selected_dirac_current=False):
     """Symmetric-velocity cell overlap on G-sphere with umklapp lookup.
 
     All inputs in the canonical-kmq / k G-sphere layouts:
@@ -219,6 +185,8 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
                  v_sym = ½(v_R + v_L)
                  v_R = ⟨bra | (kin + VNL(k))|ket⟩       — bra unchanged
                  v_L = ⟨(kin + VNL(k_can_kmq))|bra⟩† |ket⟩
+    alpha_mn : (3, nc, nv) complex128 or None — exact selected
+                 ⟨bra|alpha_i|ket⟩ on the same four-spinor coefficients.
     """
     # Bra aligned to ket's G-axis: (nc, ns, nG_k).
     bra_aligned = jnp.take(c_can_m, map_arr, axis=-1)
@@ -237,101 +205,22 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
     v_L = jnp.einsum('amsG,nsG->amn', jnp.conj(vbra_aligned), c_n_k,
                        optimize=True)
     v_sym = 0.5 * (v_R + v_L)
-    return rho_mn, v_sym
 
-
-@functools.partial(jax.jit, static_argnames=('fft_grid',))
-def _apply_kinetic_velocity_Gbox(psi_Gbox_k, kvec, bvec_blat, fft_grid):
-    """Compute v^α_kin |ψ_n,k⟩ in the G-space FFT-box layout.
-
-    ``load_kpoint_fftbox`` stores ``c_nk(G)`` scattered into an FFT-box
-    array (zero outside the G-sphere).  The kinetic velocity in G-space
-    is just an elementwise multiplication by ``(k + G)_cart^α`` — no
-    FFT.  Note: this matches the convention of
-    ``dft_operators.momentum_matrix_k``  (atomic-unit cartesian
-    velocity, no V_cell factor).
-
-    Parameters
-    ----------
-    psi_Gbox_k : (nb, nspinor, nx, ny, nz) complex128 — c_n,k(G) in box.
-    kvec       : (3,) float64 crystal coords.
-    bvec_blat  : (3, 3) float64 — blat·bvec (cartesian rec-lat).
-    fft_grid   : static (nx, ny, nz).
-
-    Returns
-    -------
-    (3, nb, nspinor, nx, ny, nz) — c_n,k(G) · (k+G)_cart^α per α.
-    """
-    nx, ny, nz = fft_grid
-    gx = jnp.fft.fftfreq(nx, d=1.0 / nx).astype(jnp.float64)
-    gy = jnp.fft.fftfreq(ny, d=1.0 / ny).astype(jnp.float64)
-    gz = jnp.fft.fftfreq(nz, d=1.0 / nz).astype(jnp.float64)
-    kGc_x = kvec[0] + gx[:, None, None]
-    kGc_y = kvec[1] + gy[None, :, None]
-    kGc_z = kvec[2] + gz[None, None, :]
-    kG_cart_x = (kGc_x * bvec_blat[0, 0] + kGc_y * bvec_blat[1, 0]
-                  + kGc_z * bvec_blat[2, 0])
-    kG_cart_y = (kGc_x * bvec_blat[0, 1] + kGc_y * bvec_blat[1, 1]
-                  + kGc_z * bvec_blat[2, 1])
-    kG_cart_z = (kGc_x * bvec_blat[0, 2] + kGc_y * bvec_blat[1, 2]
-                  + kGc_z * bvec_blat[2, 2])
-
-    return jnp.stack((
-        psi_Gbox_k * kG_cart_x[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-        psi_Gbox_k * kG_cart_y[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-        psi_Gbox_k * kG_cart_z[None, None, :, :, :].astype(psi_Gbox_k.dtype),
-    ), axis=0)
-
-
-@functools.partial(jax.jit, static_argnames=('fft_grid',))
-def _cell_overlaps_at_q_Gbox(
-    psi_Gbox_k_n, vpsi_Gbox_k_n, psi_Gbox_kmq_m_canonical, G_wrap, fft_grid,
-):
-    """G-space cell overlaps for one (k, q) pair — kinetic-only velocity.
-
-    Compute
-        rho_mn(k, q) = ⟨u_{m, k-q} | u_{n, k}⟩_cell
-        v_mn_α(k, q) = ⟨u_{m, k-q} | v^α | u_{n, k}⟩_cell  (kinetic part)
-
-    in G-space.  Umklapp from canonical-(k-q) to actual k-q is handled
-    via a 3-axis ``jnp.roll`` of the bra:
-        c_{m, k-q}(G) = c_{m, canonical}(G + G_wrap)
-                       = roll(c_{m, canonical}, shift=−G_wrap)(G)
-    so the bra in G-box is roll(c_can, −G_wrap_int) along the (gx, gy, gz)
-    axes.  No 1/N_grid factor — convention matches
-    ``momentum_matrix_k`` (sum over G of c* (k+G) c gives the AU velocity
-    matrix element directly).
-
-    Parameters
-    ----------
-    psi_Gbox_k_n            : (nb_n, nspinor, nx, ny, nz)
-    vpsi_Gbox_k_n           : (3, nb_n, nspinor, nx, ny, nz)
-    psi_Gbox_kmq_m_canonical : (nb_m, nspinor, nx, ny, nz)
-    G_wrap                  : (3,) int32 — umklapp shift for THIS (k, q).
-    fft_grid                : static.
-
-    Returns
-    -------
-    rho_mn   : (nb_m, nb_n) complex128
-    v_mn_alp : (3, nb_m, nb_n) complex128
-    """
-    # Roll the bra by −G_wrap along the 3 G-axes (last 3).
-    # ``shift`` is the number of places to shift TOWARDS HIGHER indices;
-    # roll(x, +s)[i] = x[i − s].  We want bra[G] = c_can[G + G_wrap], so
-    # shift = −G_wrap.
-    # G_wrap is a 3-vector traced under vmap; jnp.roll accepts traced
-    # shifts in modern JAX, but we re-roll one axis at a time so the
-    # codepath is robust across versions.
-    bra_can = jnp.conj(psi_Gbox_kmq_m_canonical)
-    bra = jnp.roll(bra_can, shift=-G_wrap[0], axis=-3)
-    bra = jnp.roll(bra,     shift=-G_wrap[1], axis=-2)
-    bra = jnp.roll(bra,     shift=-G_wrap[2], axis=-1)
-
-    rho_mn = jnp.einsum('msxyz,nsxyz->mn', bra, psi_Gbox_k_n,
-                          optimize=True)
-    v_mn_alp = jnp.einsum('msxyz,ansxyz->amn', bra, vpsi_Gbox_k_n,
-                          optimize=True)
-    return rho_mn, v_mn_alp
+    alpha_mn = None
+    if selected_dirac_current:
+        if c_n_k.shape[1] != 4:
+            raise ValueError(
+                "selected Dirac current requires four-spinor coefficients; "
+                f"got spin axis {c_n_k.shape[1]}")
+        alpha_channels = []
+        for mu in (1, 2, 3):
+            perm, phase = gamma_perm_phase(mu)
+            alpha_ket = gamma_apply(c_n_k, perm, phase, axis=1)
+            alpha_channels.append(jnp.einsum(
+                'msG,nsG->mn', jnp.conj(bra_aligned), alpha_ket,
+                optimize=True))
+        alpha_mn = jnp.stack(alpha_channels, axis=0)
+    return rho_mn, v_sym, alpha_mn
 
 
 def compute_finite_q_mtxels(
@@ -353,6 +242,10 @@ def compute_finite_q_mtxels(
       v_cvkq[3, nc, nv, nk, nq] complex128 — symmetric (v_R + v_L)/2 of
                                               ⟨u_{c, k-q} | v^α | u_{v, k}⟩_cell
                                               including kinetic + VNL.
+      alpha_cvkq[3, nc, nv, nk, nq] complex128 or None — dimensionless
+                                              ⟨u_{c,k-q}|alpha_i|u_{v,k}⟩.
+      ward_residual_cvkq[nc, nv, nk, nq] complex128 or None —
+          (E_c,k-q - E_v,k)_Ry rho + q_bohr^-1 · (2 alpha / alpha_fs), in Ry.
       kminq_idx[nk, nq] int32 — canonical k-q lookup.
 
     Plumbing:
@@ -380,10 +273,11 @@ def compute_finite_q_mtxels(
     from common.kq_mapping import kminq_idx_for_iq, umklapp_G_wrap
     from psp.dft_operators import apply_kinetic_velocity_to_ket
     import psp.vnl_ops as vnl_ops
+    from symmetry_maps import bgw_signed_q_representative
 
     nk_full = int(sym.nk_tot)
-    bvec_blat = jnp.asarray(np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
-                             dtype=jnp.float64)
+    bvec_blat_np = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    bvec_blat = jnp.asarray(bvec_blat_np, dtype=jnp.float64)
     n_occ = int(wfn.nelec)
     v_lo = max(0, n_occ - int(nv_block))
     c_lo = n_occ
@@ -391,7 +285,11 @@ def compute_finite_q_mtxels(
     nv_eff = n_occ - v_lo
     nc_eff = c_hi - c_lo
 
-    kpts_full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    kpts_full = np.asarray(gtab.kvecs, dtype=np.float64)
+    energies_full_ry = (np.asarray(wfn.energies[0, :, :int(nb)],
+                                   dtype=np.float64)[np.asarray(
+                                       sym.irr_idx_k, dtype=np.int32)]
+                        if bispinor else None)
 
     # ── Per-k apply: kinetic + VNL on the ket side, plus same on bra side ──
     # Note: the apply'd vectors live on each k's own G-sphere.  We need
@@ -485,6 +383,8 @@ def compute_finite_q_mtxels(
     nq = len(iq_list)
     rho_cvkq = np.zeros((nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
     v_cvkq   = np.zeros((3, nc_eff, nv_eff, nk_full, nq), dtype=np.complex128)
+    alpha_cvkq = np.zeros_like(v_cvkq) if bispinor else None
+    ward_residual_cvkq = np.zeros_like(rho_cvkq) if bispinor else None
     kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
 
     pair_progress = LoopProgress(
@@ -496,33 +396,46 @@ def compute_finite_q_mtxels(
         kminq_idx = kminq_idx_for_iq(sym, iq_red)
         kminq_idx_kq[:, jq] = kminq_idx
 
-        qvec_pos = np.asarray(wfn.kpoints[iq_red], dtype=np.float64)
-        qvec = qvec_pos - np.round(qvec_pos)
+        qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
+        q_cart_bohr = qvec @ bvec_blat_np
+        G_wrap_k = np.asarray(umklapp_G_wrap(
+            kpts_full, kpts_full[kminq_idx], qvec), dtype=np.int32)
 
         max_rho = max_v = 0.0
         for ik in range(nk_full):
             ikmq = int(kminq_idx[ik])
-            kvec_k_np   = kpts_full[ik]
-            kvec_kmq_np = kpts_full[ikmq]
-            G_wrap_np = np.round((kvec_k_np - qvec) - kvec_kmq_np).astype(np.int32)
+            G_wrap_np = G_wrap_k[ik]
 
             Gk_int_k   = np.asarray(gtab.gvecs[ik],   dtype=np.int32)
             Gk_int_can = np.asarray(gtab.gvecs[ikmq], dtype=np.int32)
-            map_arr, mask = _build_g_lookup(
+            map_arr, mask = build_g_wrap_lookup(
                 Gk_int_can, Gk_int_k, G_wrap_np,
-                ngk_kmq=int(gtab.ngk[ikmq]), ngk_k=int(gtab.ngk[ik]))
+                ngk_neighbor=int(gtab.ngk[ikmq]),
+                ngk_center=int(gtab.ngk[ik]))
             map_arr_j = jnp.asarray(map_arr, dtype=jnp.int32)
             mask_j    = jnp.asarray(mask)
 
-            rho_mn, v_sym = _cell_overlap_with_lookup(
+            rho_mn, v_sym, alpha_mn = _cell_overlap_with_lookup(
                 psi_c_per_k[ikmq], psi_v_per_k[ik],
                 vket_v_per_k[ik],  vket_c_per_k[ikmq],
                 map_arr_j, mask_j,
+                selected_dirac_current=bool(bispinor),
             )
             rho_cvkq[:, :, ik, jq] = np.asarray(rho_mn)
             v_cvkq[:, :, :, ik, jq] = np.asarray(v_sym)
             max_rho = max(max_rho, float(jnp.max(jnp.abs(rho_mn))))
             max_v   = max(max_v,   float(jnp.max(jnp.abs(v_sym))))
+            if bispinor:
+                alpha_np = np.asarray(alpha_mn)
+                alpha_cvkq[:, :, :, ik, jq] = alpha_np
+                delta_e_ry = (
+                    energies_full_ry[ikmq, c_lo:c_hi, None]
+                    - energies_full_ry[ik, None, v_lo:n_occ])
+                ward_np = (delta_e_ry * np.asarray(rho_mn)
+                           + (2.0 / ALPHA_FS)
+                           * np.einsum('a,amn->mn', q_cart_bohr, alpha_np,
+                                       optimize=True))
+                ward_residual_cvkq[:, :, ik, jq] = ward_np
             pair_progress.step()
         if diagnostic_fn is not None:
             diagnostic_fn(
@@ -531,7 +444,8 @@ def compute_finite_q_mtxels(
                 f"|rho|_∞={max_rho:.5e}  |v|_∞={max_v:.5e}")
     pair_progress.finish()
 
-    return rho_cvkq, v_cvkq, kminq_idx_kq, n_occ, v_lo, c_hi
+    return (rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
+            kminq_idx_kq, n_occ, v_lo, c_hi)
 
 # --------------------------
 # Provenance: which WFN and which band window produced this dipole.h5
@@ -550,10 +464,13 @@ def compute_finite_q_mtxels(
 # gauge coefficients.  It is independent of the WFN's path and inode; see
 # ``common.parallel_transport.wfn_fingerprint`` for the exact coverage bound.
 
+_DIPOLE_Q0_OPERATOR_SCHEME = "lorrax.dipole_q0.exact_reduced_origin/v1"
+
 _PROV_ATTRS = ("prov_wfn_sha256", "prov_wfn_fingerprint_scheme",
                "prov_nval", "prov_ncond", "prov_nband",
                "prov_nb_written", "prov_bispinor", "prov_skip_vnl",
-               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign")
+               "prov_vnl_mode", "prov_wfn_file", "prov_vnl_velocity_sign",
+               "prov_q0_operator_scheme")
 
 #: Word spellings of the two arms, so a deck can say which one it means
 #: rather than carrying a bare ``-1`` whose meaning is a source comment.
@@ -629,13 +546,90 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     h5.attrs["prov_bispinor"] = bool(bispinor)
     h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
     h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+    # ``analytic`` and the VNL sign do not identify the implementation.  In
+    # particular, 5036f21b replaced the old sqrt(q^2+1e-8) projector
+    # regularizer and approximate l>0 origin row by exact reduced-radial
+    # moments.  That reaches ordinary Gamma-point dZ and therefore the stored
+    # velocity.  Fail closed across that boundary rather than calling two
+    # different operator discretisations the same artifact.
+    h5.attrs["prov_q0_operator_scheme"] = _DIPOLE_Q0_OPERATOR_SCHEME
     if vnl_velocity_sign is not None:
         h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
 
 
-def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
-                             print_fn=print) -> bool:
-    """Does ``path`` match the WFN and band window of the CURRENT run?
+def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
+    """Band extent of the ordinary q→0 matrix written by this driver.
+
+    ``ncond`` is not otherwise an operand of the ordinary dipole sweep: the
+    producer loads ``[0, nb_written)`` and evaluates the full square operator
+    on that manifold.  Keep the resolution here because provenance may relax
+    a literal ``ncond`` mismatch only when both decks resolve to this same
+    physical matrix extent.  The optional ``finite_q`` payload is different:
+    its conduction axis is literally sliced with ``ncond`` and is therefore
+    handled as an explicit exception by :func:`check_dipole_provenance`.
+    """
+    return min(
+        int(wfn.nbands),
+        max(int(wfn.nelec) + int(ncond), int(nband)),
+    )
+
+
+def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
+    """Can an ``ncond``-mismatched file represent the identical q→0 matrix?"""
+    expected = _resolve_dipole_nb_written(
+        wfn, ncond=int(ncond), nband=int(nband))
+    if "finite_q" in h5:
+        return False, (
+            "finite_q/ is present and its stored conduction axis is sized by "
+            "the producer's ncond")
+
+    problems = []
+    if "prov_nb_written" not in h5.attrs:
+        problems.append("prov_nb_written is absent")
+    else:
+        got = int(np.asarray(h5.attrs["prov_nb_written"]))
+        producer_expected = _resolve_dipole_nb_written(
+            wfn,
+            ncond=int(np.asarray(h5.attrs["prov_ncond"])),
+            nband=int(np.asarray(h5.attrs.get("prov_nband", nband))),
+        )
+        if got != producer_expected:
+            problems.append(
+                f"prov_nb_written: file={got} producer-resolved="
+                f"{producer_expected}")
+        if got != expected:
+            problems.append(
+                f"prov_nb_written: file={got} run-resolved={expected}")
+
+    shapes = {}
+    for name, rank in (("dipole_cart", 4), ("deltaE", 3)):
+        if name not in h5:
+            problems.append(f"{name} is absent")
+            continue
+        shape = tuple(int(v) for v in h5[name].shape)
+        shapes[name] = shape
+        if len(shape) != rank or shape[-2:] != (expected, expected):
+            problems.append(
+                f"{name} shape={shape}, expected square band axes "
+                f"({expected},{expected})")
+    if (len(shapes.get("dipole_cart", ())) >= 2
+            and len(shapes.get("deltaE", ())) >= 1
+            and shapes["dipole_cart"][1] != shapes["deltaE"][0]):
+        problems.append(
+            "dipole_cart and deltaE carry different k extents "
+            f"({shapes['dipole_cart'][1]} versus {shapes['deltaE'][0]})")
+
+    return not problems, ("; ".join(problems) if problems
+                          else f"identical q→0 extent {expected}")
+
+
+def check_dipole_provenance(
+    path, *, wfn, nval, ncond, nband,
+    bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    wfn_fingerprint_binding=None,
+    print_fn=print,
+) -> bool:
+    """Does ``path`` match the WFN, window, and requested operator convention?
 
     Returns True only when a stamp exists AND agrees.  Disagreement goes
     through ``common.sanity.warn`` (the same channel
@@ -645,10 +639,18 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
     unstamped file predates this guard and cannot be vouched for.
     """
     from common import sanity
+    from common.parallel_transport import fingerprint_from_binding
 
     try:
         with h5py.File(str(path), "r") as h5:
             attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
+            ncond_mismatch = (
+                "prov_ncond" not in attrs
+                or _prov_ne(attrs["prov_ncond"], int(ncond)))
+            q0_ncond_ok, q0_ncond_detail = (False, "prov_ncond is absent")
+            if ncond_mismatch and "prov_ncond" in attrs:
+                q0_ncond_ok, q0_ncond_detail = _q0_ncond_coverage(
+                    h5, wfn=wfn, ncond=ncond, nband=nband)
     except OSError as exc:
         print_fn(f"  [dipole provenance] cannot open {path} "
                  f"({type(exc).__name__}: {exc})")
@@ -677,31 +679,64 @@ def check_dipole_provenance(path, *, wfn, nval, ncond, nband,
             f"scheme {got_scheme!r}, not {WFN_FINGERPRINT_SCHEME!r}; "
             "regenerate dipole.h5 with `python -m psp.get_dipole_mtxels` "
             "to make it checkable.")
+    if not fingerprint_checkable:
+        # This is an identity refusal, not evidence that any later field
+        # differs.  Preserve that distinction: legacy-fingerprint tests and
+        # users must not receive a fabricated DFT/window/operator mismatch
+        # merely because a newly required field is also absent.
+        return False
 
     want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
-            "prov_nband": int(nband)}
+            "prov_nband": int(nband),
+            "prov_q0_operator_scheme": _DIPOLE_Q0_OPERATOR_SCHEME}
     if fingerprint_checkable:
-        want["prov_wfn_sha256"] = wfn_fingerprint(wfn)
-    bad = [(k, attrs[k], v) for k, v in want.items()
-           if k in attrs and _prov_ne(attrs[k], v)]
+        want["prov_wfn_sha256"] = (
+            wfn_fingerprint(wfn)
+            if wfn_fingerprint_binding is None
+            else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    optional = {
+        "prov_bispinor": bispinor,
+        "prov_skip_vnl": skip_vnl,
+        "prov_vnl_mode": vnl_mode,
+        "prov_vnl_velocity_sign": vnl_velocity_sign,
+    }
+    want.update({key: value for key, value in optional.items()
+                 if value is not None})
+    # An expected operator field that is absent is not a legacy default: it is
+    # uncheckable provenance.  The caller choosing that convention must fail
+    # closed instead of silently reading whichever operator made the file.
+    bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
+           if (k != "prov_ncond" or not q0_ncond_ok)
+           and (k not in attrs or _prov_ne(attrs[k], v))]
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)
+        if ncond_mismatch and not q0_ncond_ok:
+            detail += f"; q→0 coverage refusal: {q0_ncond_detail}"
         sanity.warn(
-            f"{path} was generated from a DIFFERENT DFT solution or band "
-            f"window than this run ({detail}).  dipole.h5 has the right "
-            f"shape either way, so nothing downstream will notice: the q→0 "
-            f"head S(ω), and every Σ_SX/Σ_COH correction built from it, "
-            f"would be assembled from stale velocity matrix elements.  "
+            f"{path} was generated from a DIFFERENT DFT solution, band "
+            f"window, or velocity/representation convention than this run "
+            f"({detail}).  dipole.h5 has the right shape either way, so a "
+            f"shape-only reader would not notice: the q→0 head S(ω), and "
+            f"every Σ_SX/Σ_COH correction built from it, would be assembled "
+            f"from incompatible velocity matrix elements.  "
             f"Regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.",
             print_fn=print_fn)
         return False
 
-    if not fingerprint_checkable:
-        return False
+    if ncond_mismatch:
+        print_fn(
+            "  [dipole provenance] producer "
+            f"ncond={int(np.asarray(attrs['prov_ncond']))} differs from run "
+            f"ncond={int(ncond)}, accepted because {q0_ncond_detail}; the "
+            "ordinary payload is the same full-square operator.")
     print_fn(
         f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
-        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)})")
+        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)}"
+        + (f", bispinor={bool(bispinor)}" if bispinor is not None else "")
+        + (f", vnl_velocity_sign={float(vnl_velocity_sign):+.1f}"
+           if vnl_velocity_sign is not None else "")
+        + ")")
     return True
 
 
@@ -818,6 +853,21 @@ def main(argv=None):
 		     "W_av_*_neighbors input flags; skip dipole and PT preprocessing.",
 	)
 	parser.add_argument(
+		"--parallel-transport-velocity-only",
+		action="store_true",
+		help="Write ONLY the exact DFT p-matrix velocity stage of the "
+		     "--parallel-transport-out artifact (v = p + i[r,V_NL]); skip "
+		     "the nearest-neighbour link stream, the fourth-order "
+		     "connection and the mandatory velocity-identity validation "
+		     "entirely, so this producer runs on decks whose mesh cannot "
+		     "support the link stencil on every axis (a collapsed 2D slab "
+		     "kgrid, or an undersampled one).  Matches the consumer "
+		     "contract of sc_head_update=dft_velocity "
+		     "(gw.qsgw_head.load_dft_velocity_head), which reads this same "
+		     "dataset and requires neither links nor a completed "
+		     "validation.  Requires --parallel-transport-out.",
+	)
+	parser.add_argument(
 		"--parallel-transport-rcond",
 		type=float,
 		default=1.0e-10,
@@ -847,6 +897,19 @@ def main(argv=None):
 			 "(dipole_cart, deltaE) blocks.",
 	)
 	parser.add_argument(
+		"--static-gauge-hall-only",
+		action="store_true",
+		help="Run only the canonical full-BZ uniform-current sweep and print "
+		     "its raw Hall pseudovector. This does not write dipole.h5 or "
+		     "fabricate any other static-gauge response term.",
+	)
+	parser.add_argument(
+		"--static-gauge-hall-out",
+		type=str,
+		default=None,
+		help="Optional immutable SlabIO output for --static-gauge-hall-only.",
+	)
+	parser.add_argument(
 		"--iq-list",
 		type=int,
 		nargs='+',
@@ -856,6 +919,23 @@ def main(argv=None):
 	args = parser.parse_args(argv)
 	debug = debug_print_enabled()
 
+	if args.static_gauge_hall_out is not None and not args.static_gauge_hall_only:
+		parser.error(
+			"--static-gauge-hall-out requires --static-gauge-hall-only")
+	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
+		parser.error(
+			"--parallel-transport-velocity-only requires "
+			"--parallel-transport-out: it names the file to write the "
+			"velocity-only artifact to")
+	if args.static_gauge_hall_only:
+		if args.vnl_mode != "analytic" or args.skip_vnl:
+			parser.error(
+				"--static-gauge-hall-only requires the analytic VNL operator")
+		if (args.parallel_transport_out is not None or args.w_av_only
+				or args.with_finite_q):
+			parser.error(
+				"--static-gauge-hall-only cannot be combined with another "
+				"dipole/PT/finite-q producer")
 	if args.parallel_transport_out is not None:
 		if Path(args.parallel_transport_out).resolve() == Path(args.out).resolve():
 			parser.error(
@@ -909,6 +989,15 @@ def main(argv=None):
 			w_av_first_neighbors or w_av_second_neighbors):
 		parser.error(
 			"--w-av-only requires an enabled W_av_*_neighbors input flag")
+	if args.parallel_transport_velocity_only and (
+			w_av_first_neighbors or w_av_second_neighbors):
+		parser.error(
+			"--parallel-transport-velocity-only cannot be combined with an "
+			"enabled W_av_*_neighbors input flag: the W-av finite-q stencil "
+			"is written by the SAME link/connection remainder this mode "
+			"skips (write_parallel_transport_artifact), so the combination "
+			"would silently produce a velocity-only artifact and no W-av "
+			"stencil despite the deck asking for one")
 
 	# The relative sign of i[r, V_NL] in the assembled velocity, resolved
 	# ONCE here so that the two producer routes below -- the analytic
@@ -954,7 +1043,34 @@ def main(argv=None):
 			nband = int(nband_param)
 	except Exception:
 		nband = max(int(wfn.nbands), int(wfn.nelec) + int(ncond))
-	bispinor = bool(params.get("bispinor", False))
+	four_current_bispinor = bool(params.get("bispinor", False))
+	bispinor_gw_mode = coerce_bispinor_gw_mode(
+		params.get("bispinor_gw", "bare_transverse"))
+	if (bispinor_gw_mode in (
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+			and not four_current_bispinor):
+		parser.error(
+			f"bispinor_gw={bispinor_gw_mode.value} requires "
+			"bispinor=true; the selector does not enable spatial-current "
+			"channels implicitly")
+	if (args.static_gauge_hall_only and bispinor_gw_mode in (
+			BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+			BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)):
+		parser.error(
+			f"bispinor_gw={bispinor_gw_mode.value} is a bare-TT "
+			"current-only comparison and does not define the FULL/static-Hall "
+			"response requested by --static-gauge-hall-only")
+	if args.static_gauge_hall_only and not four_current_bispinor:
+		parser.error(
+			"--static-gauge-hall-only requires bispinor=true so the canonical "
+			"kinetic-balance four-current is present")
+	# This producer owns the scalar charge/head vertex.  The comparison mode
+	# therefore loads the normalized QE two-spinor carrier here; the accepted
+	# raw four-spinor spatial-current vertices live only in the transverse
+	# Hartree and bare-TT exchange owners.
+	bispinor = resolve_four_current_representation(
+		four_current_bispinor, bispinor_gw_mode).scalar_head_bispinor
 
 	# Every communicator the sweep and the closing gather will use was
 	# warmed by the module-top ``initialize_communicator_stack()``
@@ -964,7 +1080,8 @@ def main(argv=None):
 
 	# Ensure we load enough conduction bands for debug/output comparisons.
 	# ψ is NOT loaded here — see the k sweep below.
-	nband_eff = min(int(wfn.nbands), max(int(wfn.nelec) + int(ncond), int(nband)))
+	nband_eff = _resolve_dipole_nb_written(
+		wfn, ncond=ncond, nband=nband)
 
 	if args.w_av_only:
 		report.environment(wfn=wfn, lines=(
@@ -1103,6 +1220,8 @@ def main(argv=None):
 		meta,
 		pseudos,
 		nspinor=int(wfn.nspinor),
+		compute_contact=bool(args.static_gauge_hall_only),
+		compute_transfer_q2=False,
 	)
 	report.environment(wfn=wfn, lines=(
 		"Matrix storage : distributed band blocks on the X x Y mesh",
@@ -1143,6 +1262,48 @@ def main(argv=None):
 
 	nk = int(sym.nk_tot)
 	nb = int(nband_eff)
+	if args.static_gauge_hall_only:
+		from gw.qsgw_head import static_gauge_hall_transaction
+
+		psi_G = wfn.load(
+			bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
+			bispinor=True)
+		geom = SweepGeometry(
+			mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
+			ngkmax=int(psi_G.shape[3]), nb=nb, ns=int(psi_G.shape[2]),
+			nk=nk, cell_volume=float(wfn.cell_volume))
+		with timing.section("static_gauge_uniform_sweep"):
+			uniform_gauge = sweep_uniform_current_matrix_elements(
+				psi_G, wfn=wfn, band_start=0, band_stop=nb, geom=geom,
+				bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
+				gvecs=gtab.gvecs, gmask=gtab.mask,
+				box_index=wfn.box_index(k="full_bz"),
+				kvecs=np.asarray(gtab.kvecs))
+		with timing.section("static_gauge_hall_reduce"):
+			hall = static_gauge_hall_transaction(
+				uniform_gauge, wfn=wfn, sym=sym, band_start=0,
+				band_stop=nb, mesh=RUNTIME.mesh)
+			sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
+		if args.static_gauge_hall_out is not None:
+			from file_io.static_gauge_head import (
+				write_static_gauge_hall_artifact)
+			with timing.section("static_gauge_hall_write"):
+				write_static_gauge_hall_artifact(
+					args.static_gauge_hall_out, hall, mesh_xy=RUNTIME.mesh)
+		if jax.process_index() == 0:
+			print(
+				"STATIC_GAUGE_HALL_TRANSACTION "
+				f"producer_id={hall.producer_id} "
+				f"operator_fingerprint="
+				f"{hall.hamiltonian_config_operator_fingerprint} "
+				f"bands=[{hall.band_start},{hall.band_stop}) "
+				f"nk_tot={hall.nk_tot} "
+				f"sigma_H_raw_bohr^-1="
+				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
+				f"{sigma_H[2]:.17e}]")
+		timing.report(title="--- Timing (seconds) ---",
+		              wall=time.perf_counter() - _t_main)
+		return 0
 
 	# ── ΔE: pure host arithmetic on the band energy table ───────────────
 	# No ψ, no device, nk·nb²·8 B (2 MB at MoS₂ 4×4 / 128 bands), so it is
@@ -1276,7 +1437,7 @@ def main(argv=None):
 		"""
 		wfn_k = load_kpoint_fftbox_local(wfn, meta, i, nb,
 		                                 bispinor=bispinor)
-		kpoint = jnp.asarray(sym.unfolded_kpts[i], dtype=jnp.float64)
+		kpoint = jnp.asarray(gtab.kvecs[i], dtype=jnp.float64)
 		Gk_crys, g_mask = gtab.at(i)
 		# Momentum per component
 		p_cart = compute_p_operator_k(
@@ -1412,7 +1573,7 @@ def main(argv=None):
 				psi_G, operator=op, geom=geom,
 				gvecs=gtab.gvecs, gmask=gtab.mask,
 				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(sym.unfolded_kpts))
+				kvecs=np.asarray(gtab.kvecs))
 			if args.parallel_transport_out is not None:
 				# The feature is deliberately opt-in: the default dipole
 				# artifact and its bitwise production path remain untouched.
@@ -1442,7 +1603,25 @@ def main(argv=None):
 			# runs in chunks so a peer's transient is one chunk.
 			dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
 		del H_v, psi_G
-		if pt_path is not None:
+		if pt_path is not None and args.parallel_transport_velocity_only:
+			# D2 (reports/metal_head_pt_pipelines_2026-08-23/PLAN.md): the
+			# link stream, the fourth-order connection and the mandatory
+			# velocity-identity validation are ALL skipped -- none of them
+			# is a stencil this deck's mesh may even support (a collapsed
+			# 2D slab kgrid, or an undersampled one), and NONE of them is
+			# read by the sc_head_update=dft_velocity consumer this mode
+			# targets (gw.qsgw_head.load_dft_velocity_head).  The velocity
+			# transaction above already wrote and closed
+			# velocity_dft_cart, band manifold, kgrid, reciprocal lattice
+			# and the WFN fingerprint -- every provenance field that
+			# loader checks.
+			print(
+				"  DFT velocity-only parallel-transport artifact: no "
+				"links, no connection, no validation (--parallel-transport"
+				"-velocity-only).")
+			print(f"\nWrote DFT-velocity-only parallel-transport data to "
+			      f"{pt_path}")
+		elif pt_path is not None:
 			# The SlabIO velocity transaction above is closed and durable,
 			# and the all-k psi/H_v device arrays are now dead.  The link
 			# stream therefore holds only one central and one neighbour WFN
@@ -1480,13 +1659,15 @@ def main(argv=None):
 	del dip_k_major
 
 	# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
-	rho_cvkq = v_cvkq = kminq_idx_kq = None
+	rho_cvkq = v_cvkq = alpha_cvkq = ward_residual_cvkq = None
+	kminq_idx_kq = None
 	cv_meta = None
 	if args.with_finite_q:
 		print("\nComputing finite-q matrix elements (SOS pipeline)...")
 		iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 		with timing.section("finite_q"):
-			rho_cvkq, v_cvkq, kminq_idx_kq, n_occ_eff, v_lo, c_hi = compute_finite_q_mtxels(
+			(rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
+			 kminq_idx_kq, n_occ_eff, v_lo, c_hi) = compute_finite_q_mtxels(
 				wfn, sym, meta, vnl_setup, gtab,
 				nb=nb,
 				bispinor=bispinor,
@@ -1552,6 +1733,25 @@ def main(argv=None):
 					"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
 					"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
 					"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
+				if alpha_cvkq is not None:
+					ds_alpha = fq.create_dataset('alpha_cvkq', data=alpha_cvkq)
+					ds_alpha.attrs['operator'] = (
+						"<u_{c,k-q}|alpha_i=gamma^0 gamma^i|u_{v,k}>_cell")
+					ds_alpha.attrs['units'] = "dimensionless"
+					ds_alpha.attrs['normalization'] = (
+						"same unrenormalized kinetic-balance four-spinors as rho_cvkq")
+					ds_ward = fq.create_dataset(
+						'ward_residual_cvkq', data=ward_residual_cvkq)
+					ds_ward.attrs['units'] = "rydberg"
+					ds_ward.attrs['formula'] = (
+						"(E_c(k-q)-E_v(k))_Ry*rho_cvkq + "
+						"q_cart_bohr^-1 dot (2*alpha_cvkq/alpha_fs)")
+					ds_ward.attrs['energy_source'] = "WFN mean-field eigenvalues"
+					fq.attrs['selected_current_model'] = NO_PAIR_DIRAC_CURRENT_MODEL
+					fq.attrs['selected_current_lift'] = KINETIC_BALANCE_LIFT_PROVENANCE
+					fq.attrs['selected_current_operator'] = DIRAC_ALPHA_VERTEX_PROVENANCE
+					fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
+					fq.attrs['alpha_fs'] = float(ALPHA_FS)
 	barrier("dipole_write")
 	write_progress.step()
 	write_progress.finish()

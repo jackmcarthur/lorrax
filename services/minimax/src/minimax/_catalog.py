@@ -245,9 +245,76 @@ def parse_catalog(raw: Mapping[str, Any], *, catalog_name: str
             f"a {type(tables).__name__}, not a list.")
     default_family = raw.get("family") if isinstance(raw.get("family"), str) \
         else None
-    return tuple(parse_entry(e, i, catalog_name=catalog_name,
-                             default_family=default_family)
-                 for i, e in enumerate(tables))
+    entries = tuple(parse_entry(e, i, catalog_name=catalog_name,
+                                default_family=default_family)
+                    for i, e in enumerate(tables))
+    schema_version = int(raw.get("schema_version", 0))
+    top_provenance = raw.get("provenance")
+    top_certificate = raw.get("certification")
+    for entry in entries:
+        if not entry.certified:
+            continue
+        missing = [key for key in (
+            "payload_sha256", "kappa0", "max_error")
+            if entry.raw.get(key) is None]
+        certificate = entry.raw.get("certification", top_certificate)
+        provenance = entry.raw.get("provenance", top_provenance)
+        if certificate is None:
+            missing.append("certification")
+        if provenance is None:
+            missing.append("provenance")
+        if schema_version <= 1 and "provenance" not in entry.raw:
+            missing.append("per-entry provenance")
+        if missing:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} is incomplete; missing {missing}.")
+        if not isinstance(certificate, Mapping) or not certificate:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has no usable certification object.")
+        if not isinstance(provenance, Mapping):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has no usable provenance object.")
+        required_provenance = (
+            ("tool", "tool_sha256", "generator_commit", "backend_sha256")
+            if schema_version <= 1 else ("tool",))
+        missing_provenance = [key for key in required_provenance
+                              if not provenance.get(key)]
+        if (schema_version > 1
+                and not (provenance.get("generator_commit")
+                         or provenance.get("tool_sha256"))):
+            missing_provenance.append("generator_commit|tool_sha256")
+        if (schema_version > 1
+                and not any(provenance.get(key)
+                            for key in ("backend_sha256", "numpy", "scipy",
+                                        "python"))):
+            missing_provenance.append("backend identity")
+        if missing_provenance:
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} provenance lacks {missing_provenance}.")
+        for key in ("payload_sha256",):
+            value = str(entry.raw[key])
+            if len(value) != 64 or any(c not in "0123456789abcdef"
+                                      for c in value.lower()):
+                raise CatalogCorrupt(
+                    f"minimax: certified catalog {catalog_name!r} entry "
+                    f"{entry.index} has invalid {key}={value!r}.")
+        if not np.isfinite(float(entry.raw["kappa0"])):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has non-finite kappa0.")
+        claimed_error = float(entry.raw["max_error"])
+        if not (np.isfinite(claimed_error)
+                and 0.0 <= claimed_error <= entry.error_bound):
+            raise CatalogCorrupt(
+                f"minimax: certified catalog {catalog_name!r} entry "
+                f"{entry.index} has max_error={claimed_error!r}, which is "
+                f"not finite and within [0, error_bound="
+                f"{entry.error_bound!r}].")
+    return entries
 
 
 @lru_cache(maxsize=4)
@@ -368,6 +435,15 @@ def nearest_below(
 _HASH_CACHE: dict[str, str] = {}
 
 
+def payload_sha256(tau: np.ndarray, alpha: np.ndarray) -> str:
+    """SHA-256 over the canonical little-endian numerical payload bytes."""
+    digest = hashlib.sha256()
+    digest.update(np.asarray(tau, dtype="<f8").tobytes())
+    alpha_dtype = "<c16" if np.iscomplexobj(alpha) else "<f8"
+    digest.update(np.asarray(alpha, dtype=alpha_dtype).tobytes())
+    return digest.hexdigest()
+
+
 def _sha256_of(path) -> str:
     key = str(path)
     cached = _HASH_CACHE.get(key)
@@ -423,6 +499,44 @@ def load_table(entry: CatalogEntry) -> tuple[np.ndarray, np.ndarray, float,
         # keeping that cast keeps the served bytes identical.  The strip
         # families ship complex128 alpha and must NOT be flattened to real.
         alpha = np.asarray(alpha, dtype=np.float64)
+    if entry.certified:
+        if (tau.ndim != 1 or alpha.ndim != 1
+                or tau.size != alpha.size
+                or tau.size != entry.node_count):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} has tau shape "
+                f"{tau.shape}, alpha shape {alpha.shape}, and catalog "
+                f"node_count={entry.node_count}; certified payload arrays "
+                f"must be equal-length 1-D arrays matching node_count.")
+        if not (np.all(np.isfinite(tau)) and np.all(np.isfinite(alpha))):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} has non-finite "
+                f"tau or alpha values.")
+        if entry.family == "noncrossing" and (
+                np.any(tau <= 0.0) or not np.isrealobj(alpha)
+                or np.any(alpha <= 0.0)):
+            raise TableUnreadable(
+                f"minimax: certified noncrossing table {entry.file!r} "
+                f"must have positive real nodes and weights.")
+        if not (np.isfinite(err) and 0.0 <= err <= entry.error_bound):
+            raise TableUnreadable(
+                f"minimax: certified table {entry.file!r} payload "
+                f"max_error={err!r} is not finite and within "
+                f"[0, error_bound={entry.error_bound!r}].")
+    expected_payload = entry.raw.get("payload_sha256")
+    if expected_payload is not None:
+        actual_payload = payload_sha256(tau, alpha)
+        if str(expected_payload) != actual_payload:
+            raise TableUnreadable(
+                f"minimax: shipped table {entry.file!r} payload SHA-256 "
+                f"is {actual_payload}, but catalog {entry.catalog_name!r} "
+                f"entry {entry.index} stamps {expected_payload!r}.")
+    if (entry.certified and entry.claimed_max_error is not None
+            and err != entry.claimed_max_error):
+        raise TableUnreadable(
+            f"minimax: certified table {entry.file!r} payload max_error "
+            f"{err!r} differs bit-exactly from catalog max_error "
+            f"{entry.claimed_max_error!r}.")
     if entry.kappa0 is not None:
         kappa0 = entry.kappa0
     return tau, alpha, err, kappa0, table_hash
@@ -438,7 +552,13 @@ def provenance_for(entry: CatalogEntry, table_hash: str,
     bundle, and printing it on every serve is what makes WP6's absence
     visible in a log instead of only in a design document.
     """
-    prov = (catalog_raw or {}).get("provenance") or {}
+    entry_prov = entry.raw.get("provenance")
+    if entry_prov is not None and not isinstance(entry_prov, Mapping):
+        raise CatalogCorrupt(
+            f"minimax: catalog {entry.catalog_name!r} entry {entry.index} "
+            f"has non-object provenance {entry_prov!r}.")
+    prov = (entry_prov if entry_prov is not None
+            else (catalog_raw or {}).get("provenance") or {})
     tool = prov.get("tool")
     commit = prov.get("generator_commit") or prov.get("tool_sha256")
     if commit and tool:
@@ -451,6 +571,8 @@ def provenance_for(entry: CatalogEntry, table_hash: str,
         f"numpy-{prov['numpy']}" if "numpy" in prov else None,
         f"scipy-{prov['scipy']}" if "scipy" in prov else None,
         f"python-{prov['python']}" if "python" in prov else None,
+        f"id-{str(prov['backend_sha256'])[:12]}"
+        if "backend_sha256" in prov else None,
     ) if b]
     backend = ("cpu:" + "/".join(backend_bits) if backend_bits
                else "unrecorded (catalog schema v1)")

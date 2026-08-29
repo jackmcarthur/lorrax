@@ -70,8 +70,8 @@ in the file's own header; read it there rather than here.
 ## Files
 
 - `bispinor_test.in` — GN-PPM bispinor input (Tier-1 gate; the Tier-2
-  pad-flip gate reruns it fresh with `LORRAX_EXTRA_MU_PAD=4` — bispinor
-  restart is not yet supported, see gw_init.py).
+  pad-flip gate reruns it fresh with `LORRAX_EXTRA_MU_PAD=4`; bispinor
+  restart round-trips in both layouts since 2026-08-23, see gw_init.py).
 - `centroids_frac_256.txt` / `centroids_frac_209_current.txt` — charge /
   transverse ISDF centroid sets (seed 42).
 - `sigma_diag_bispinor_ref.dat` — frozen reference (sigX/sigC/sigXC).

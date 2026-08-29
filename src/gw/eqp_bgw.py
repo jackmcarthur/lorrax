@@ -592,31 +592,20 @@ def resolve_hartree_diag_ev(
 	             ``hartree_diag_ev`` *is* the run's V_H.  **Use as given.**
 
 	``hartree_already_resolved=True`` says the caller's ``hartree_diag_ev``
-	has ALREADY had this scalar source policy applied to it upstream, so
+	has already had this scalar source policy applied upstream, so
 	this function must preserve the array as given rather than applying the
-	policy a second time.  A caller holding a raw, unresolved column leaves
-	the flag false.  In THIS tree the flag has exactly one caller —
-	``make_eqp_bgw``'s schema-v3 receipt branch, whose ``hartree_diag_ev``
-	is the resolved H that the live assembly persisted.  The live driver
-	(``gw.gw_output.write_results``) still hands this seam a PRE-seam column
-	and leaves the flag false; see the note on ``exact_hartree_diag_ev``.
-
-	Ported verbatim (signature, this flag's body, and the threading through
-	:func:`assemble_eqp`) from ``9d78648e`` on
-	``fix/sigma-hartree-artifact-provenance-2026-08-25``, where the flag has
-	a second motivation absent here: a non-scalar transverse photon Hartree
-	field living in ``sig_h`` beside the scalar term, which is why that
-	branch also flips the ``write_results`` call site to ``True``.  Neither
-	that field nor that call-site flip is in this tree.
+	policy a second time.  The live driver uses this after
+	``gw.sigma_dispatch`` resolves the scalar source policy, and the array may
+	also contain a transverse direct field.  The post-hoc schema-v3/v4 receipt
+	path also uses it because the persisted Hartree diagonal is the exact
+	resolved H from live assembly.  A legacy caller holding a raw column leaves
+	the flag false and may supply ``exact_hartree_diag_ev``.
 
 	``exact_hartree_diag_ev`` is the substitution operand and is optional
-	on purpose.  On the live driver path ``gw.sigma_dispatch`` has already
-	substituted the exact matrix into ``sig_h`` at the one point V_H
-	enters ``SigmaResult``, so the caller passes ``None`` and this
-	function is a no-op for ``stored``.  On the post-hoc CLI path nothing
-	upstream did that, so ``make_eqp_bgw`` reads ``kin_ion.h5``'s
-	``v_hartree`` and passes it here.  Either way the decision is made
-	once, by this function.
+	on purpose.  The live driver passes an already-resolved ``sig_h`` and no
+	substitution operand.  On the post-hoc CLI path nothing upstream applied
+	the policy, so ``make_eqp_bgw`` reads ``kin_ion.h5``'s ``v_hartree`` and
+	passes it here.
 
 	Reading the file attribute is the only supported discriminator —
 	never infer the state from magnitudes (``file_io.kin_ion`` docstring).
@@ -679,7 +668,8 @@ class EqpAssembly:
 	eqp0_ev: np.ndarray
 	eqp1_ev: np.ndarray
 	kin_ion_diag_ev: np.ndarray
-	hartree_diag_ev: np.ndarray          # post-seam: the V_H actually used
+	hartree_diag_ev: np.ndarray          # post-seam total Hdir = V_H + H_T
+	hartree_scalar_diag_ev: np.ndarray   # scalar V_H used by DFT diagnostics
 	sigma_x_diag_ev: np.ndarray
 	sigma_c_at_dft_diag_ev: np.ndarray
 	#: The exact output-conditioned diagonal curve used to derive both
@@ -689,6 +679,7 @@ class EqpAssembly:
 	z_factor: np.ndarray | None
 	hartree_rule: str                    # 'suppressed' | 'substituted' | 'as-given'
 	implied_vxc_ev: np.ndarray | None
+	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
 	hartree_source: str | None = None
 	kin_ion_has_hartree: bool = False
@@ -732,6 +723,8 @@ def assemble_eqp(
 	kin_ion_has_hartree: bool = False,
 	exact_hartree_diag_ev: np.ndarray | None = None,
 	hartree_already_resolved: bool = False,
+	hartree_scalar_diag_ev: np.ndarray | None = None,
+	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
@@ -740,8 +733,8 @@ def assemble_eqp(
 	Order of operations, and each step happens exactly once:
 
 	1. the V_H seam (:func:`resolve_hartree_diag_ev`), resolving a raw
-	   pre-seam column or, under ``hartree_already_resolved``, preserving
-	   an explicitly already-resolved one;
+	   legacy column or, under ``hartree_already_resolved``, preserving the
+	   exact resolved live-driver or persisted-receipt contribution;
 	2. the mean-field gate on the *resolved* H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the source-aware
 	   implied-V_xc check; warn-only, never raises);
@@ -778,13 +771,40 @@ def assemble_eqp(
 		hartree_already_resolved=hartree_already_resolved,
 		print_fn=print_fn,
 	)
+	if hartree_scalar_diag_ev is None:
+		if hartree_transverse_diag_ev is not None:
+			raise ValueError(
+				"assemble_eqp: H_T was supplied without its scalar V_H twin; "
+				"component-aware direct fields require scalar, transverse, and "
+				"their aggregate together.")
+		hartree_scalar_used = np.asarray(hartree_used, dtype=np.float64)
+		hartree_transverse_used = None
+	else:
+		if not hartree_already_resolved:
+			raise ValueError(
+				"assemble_eqp: component-aware Hartree input must cross the "
+				"scalar-source seam before assembly; refusing to apply one "
+				"aggregate rule to independently supplied components.")
+		hartree_scalar_used = np.asarray(
+			hartree_scalar_diag_ev, dtype=np.float64)
+		hartree_transverse_used = (
+			None if hartree_transverse_diag_ev is None else np.asarray(
+				hartree_transverse_diag_ev, dtype=np.float64))
+		expected_total = hartree_scalar_used
+		if hartree_transverse_used is not None:
+			expected_total = hartree_scalar_used + hartree_transverse_used
+		if not np.array_equal(
+			np.asarray(hartree_used, dtype=np.float64), expected_total):
+			raise ValueError(
+				"assemble_eqp: direct-field aggregate is not exactly "
+				"V_H_scalar + H_transverse; refusing an unauthenticated Hdir.")
 
 	implied_vxc = None
 	if mean_field_gate:
 		implied_vxc = _warn_on_unphysical_h0(
 			e_dft_ev=e_dft_ev,
 			kin_ion_diag_ev=kin_ion_diag_ev,
-			hartree_diag_ev=hartree_used,
+			hartree_diag_ev=hartree_scalar_used,
 			kin_ion_has_hartree=kin_ion_has_hartree,
 			hartree_source=hartree_source,
 			print_fn=print_fn,
@@ -871,6 +891,7 @@ def assemble_eqp(
 		eqp0_ev=eqp0_ev, eqp1_ev=eqp1_ev,
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_used,
+		hartree_scalar_diag_ev=hartree_scalar_used,
 		sigma_x_diag_ev=sigma_x_diag_ev,
 		sigma_c_at_dft_diag_ev=sigma_c_at_dft,
 		sigma_c_omega_diag_ev=(
@@ -879,6 +900,7 @@ def assemble_eqp(
 		z_factor=z_factor,
 		hartree_rule=rule,
 		implied_vxc_ev=implied_vxc,
+		hartree_transverse_diag_ev=hartree_transverse_used,
 		nspin=int(nspin),
 		hartree_source=hartree_source,
 		kin_ion_has_hartree=bool(kin_ion_has_hartree),
@@ -1099,11 +1121,12 @@ def make_eqp_bgw(
 		)
 
 	# Decide the format BEFORE touching any raw operator payload.  A complete
-	# schema-v3 artifact is served entirely by its small completed-assembly
+	# schema-v3/v4 artifact is served entirely by its small completed-assembly
 	# receipt plus omega/evaluation metadata from the same owner-routed open.
 	# Only a truly legacy file enters the format owner's diagonal hyperslab
 	# reader, which never materializes a full (nω,nk,nb,nb) cube on rank 0.
 	from file_io.sigma_output import (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION,
 		read_eqp_assembly_receipt,
 		read_sigma_eqp_diagonal_window,
 	)
@@ -1213,8 +1236,33 @@ def make_eqp_bgw(
 	# ``gw.sigma_dispatch`` does) so this module stays importable without
 	# pulling in the jax-dependent file_io stack; the V_H seam below takes
 	# the same import for the same reason and they are one statement.
-	from file_io.kin_ion import (HARTREE_DATASET, kin_ion_hartree_source,
-	                             read_full_bz_dataset)
+	from file_io.kin_ion import (
+		HARTREE_DATASET, read_full_bz_dataset, resolve_hartree_source,
+		authenticate_kin_ion_hartree_wfn_receipt)
+	# A completed receipt names the source the live assembly actually selected,
+	# including an explicit isdf/gspace override on a file that also offers a
+	# stored array.  Ask the format owner's resolver to authenticate that choice.
+	# ``folded`` is a disk state rather than a legal frontend request, so auto is
+	# the canonical way to establish it and the equality below authenticates it.
+	_receipt_source = (None if _receipt is None else _receipt["hartree_source"])
+	_source_request = (
+		"auto" if _receipt_source in (None, "folded") else _receipt_source)
+	_src = resolve_hartree_source(
+		kin_ion_path, _source_request, print_fn=lambda *_args: None)
+	if _receipt_source is not None and _src != _receipt_source:
+		raise ValueError(
+			f"EQP receipt selected Hartree source {_receipt_source!r}, but "
+			f"{os.path.basename(kin_ion_path)} resolves to {_src!r}.")
+	_component_aware_direct = bool(
+		_receipt is not None
+		and int(_receipt["schema_version"])
+		== EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		and _receipt["hartree_transverse_diag_ev"] is not None)
+	authenticate_kin_ion_hartree_wfn_receipt(
+		kin_ion_path, wfn_path,
+		selected_hartree_source=_src,
+		band_stop=band_stop,
+		require_transverse=(_component_aware_direct and _src != "gspace"))
 	kin_full = read_full_bz_dataset(kin_ion_path, "kin_ion")
 	if kin_full.ndim != 3:
 		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")
@@ -1222,7 +1270,7 @@ def make_eqp_bgw(
 	kin_ion_diag_ev = np.real(np.diagonal(kin_irr, axis1=1, axis2=2)) * RYD_TO_EV
 
 	# Sigma payload selection already happened above, before this unrelated
-	# mean-field read: schema v3 supplied only its small receipt, while the
+	# mean-field read: schema v3/v4 supplied only its small receipt, while the
 	# legacy route supplied exact requested diagonals through the format-owned
 	# row/window hyperslab reader.
 	# ── THE LINEARIZATION POINT, FROM THE FILE'S OWN STAMP ────────────
@@ -1293,13 +1341,13 @@ def make_eqp_bgw(
 	#
 	# Reading the attribute is the only supported discriminator — never
 	# infer it from magnitudes (``file_io.kin_ion`` module docstring).
-	# ``kin_ion_hartree_source`` / ``HARTREE_DATASET`` came in with the
-	# kin_ion read above, which is the same lazy import for the same
-	# reason.
-	_src = kin_ion_hartree_source(kin_ion_path)
+	# ``_src`` / ``HARTREE_DATASET`` came in with the kin_ion read above,
+	# which is the same lazy import for the same reason.
 	vh_exact = None
 	hartree_already_resolved = False
 	receipt_c_at_dft = None
+	receipt_hartree_scalar = None
+	receipt_hartree_transverse = None
 	if _receipt is not None:
 		if (_receipt["band_start"], _receipt["band_stop"]) != (
 				band_start, band_stop):
@@ -1340,6 +1388,9 @@ def make_eqp_bgw(
 				"EQP receipt and kin_ion disagree about whether scalar Hartree is "
 				"folded into kin_ion.")
 		hartree_diag = _receipt["hartree_diag_ev"]
+		receipt_hartree_scalar = _receipt["hartree_scalar_diag_ev"]
+		receipt_hartree_transverse = _receipt[
+			"hartree_transverse_diag_ev"]
 		sigma_x_diag = _receipt["sigma_x_diag_ev"]
 		receipt_c_at_dft = _receipt["sigma_c_at_dft_diag_ev"]
 		# The receipt curve, not the raw operator diagonal, is the exact
@@ -1349,7 +1400,8 @@ def make_eqp_bgw(
 		sigma_c_omega_diag = _receipt["sigma_c_omega_diag_ev"]
 		hartree_already_resolved = True
 		print(
-			f"  EQP assembly receipt: assembled file-wedge H/X/C(E_DFT) "
+			f"  EQP assembly receipt: schema v{_receipt['schema_version']}, "
+			f"assembled file-wedge H/X/C(E_DFT) "
 			f"plus conditioned C(omega), "
 			f"bases={_receipt['hartree_exchange_basis']}/"
 			f"{_receipt['correlation_basis']}, "
@@ -1388,6 +1440,8 @@ def make_eqp_bgw(
 		hartree_source=_src,
 		exact_hartree_diag_ev=vh_exact,
 		hartree_already_resolved=hartree_already_resolved,
+		hartree_scalar_diag_ev=receipt_hartree_scalar,
+		hartree_transverse_diag_ev=receipt_hartree_transverse,
 	)
 	if (receipt_c_at_dft is not None
 			and not np.array_equal(

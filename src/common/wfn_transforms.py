@@ -46,18 +46,24 @@ from typing import Sequence, TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from runtime.padding import round_up, pad_axis
+from runtime.padding import round_up, pad_axis, spec_divisor
 from common.shard_map import shard_map
+from common.staged_reshard import band_to_product_r_reshard
+from common.wfn_layout import band_sphere_spec
+from common.gpu_utils import worst_process_resident_bytes
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
 
 if TYPE_CHECKING:
     from common.meta import Meta
+    from runtime.aot_memory import AotPeakBreakdown
 
 
 __all__ = [
+    "FULL_BLOCH_TRANSFORM_SCHEME",
     "to_box", "to_rbox", "to_rmu", "to_rchunk",
-    "to_rmu_inner", "to_rchunk_inner",
+    "to_rmu_inner", "to_rchunk_inner", "take_rchunk_padded",
+    "gflat_to_rchunk_aot_memory", "gflat_to_rchunk_aot_peak_bytes",
     "apply_bloch_phase", "apply_bloch_phase_on_slice",
     "gflat_to_rmu",
     "accumulate_rchunk_to_gflat",
@@ -69,10 +75,21 @@ __all__ = [
     "load_kpoint_fftbox_local",
     "process_local_mesh",
     "read_Gvecs_to_devices",
+    "prepare_rchunk_carrier",
     "iter_psi_rchunk_bandwise",
     "load_centroids_band_chunked",
     "load_psi_gflat_padded",
 ]
+
+
+#: Versioned physics convention for the full-Bloch real-space rows produced
+#: by this owner and :class:`common.psi_G_store.PsiGStore`.  Persisted
+#: consumers must stamp this word: a WFN content fingerprint alone cannot
+#: distinguish coefficients transformed with the old independently rebuilt
+#: modular k table from coefficients transformed with loader-paired k/G
+#: representatives.
+FULL_BLOCH_TRANSFORM_SCHEME = (
+    "lorrax-full-bloch-v1:loader-paired-k-g:ifftn-ortho:phase-plus")
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +101,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _KERNEL_CACHE: dict = {}
+_RCHUNK_PEAK_CACHE: dict = {}
 
 
 def _cached_jit(name: str, key: tuple, build):
@@ -98,9 +116,8 @@ def _cached_jit(name: str, key: tuple, build):
 
 # Module-level dedup for the device-resident ``(nk, nx, ny, nz) int32``
 # g_index buffer captured by ``build()`` closures.  Without this cache,
-# every distinct ``_cached_jit`` key (which changes per channel via
-# ``r_mu_id`` for centroid loads) would build a NEW compiled fn with a
-# NEW captured ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED buffer
+# every distinct ``_cached_jit`` key would otherwise build a NEW compiled fn
+# with a NEW captured ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED buffer
 # — leaking +1 buffer per channel from the centroid-load path on top of
 # the (now-fixed) ``psi_G_store._g_index_dev`` leak (agent_h §3 Finding
 # 3).  Keyed by content-hash of the numpy g_index so different k-sets
@@ -182,8 +199,8 @@ def _resolve_gindex_dev(g_index):
     or a ``jax.Array`` g_index — without a device→host roundtrip
     when the caller has the canonical buffer in hand.
 
-    Round-6 canonical-accessor helper for the closure-bake call sites
-    (:func:`gflat_to_rmu`, :func:`accumulate_rchunk_to_gflat`).
+    Round-6 canonical-accessor helper for transform call sites such as
+    :func:`gflat_to_rmu` and :func:`accumulate_rchunk_to_gflat`.
     Two-path logic:
 
     * ``jax.Array`` input → assumed to be the canonical buffer (e.g.
@@ -232,8 +249,8 @@ def _resolve_gindex_dev(g_index):
 # Shared kernel: G-flat ψ + g_index → FFT-box ψ (zero-sentinel gather)
 # ---------------------------------------------------------------------------
 #
-# Algorithm (matches ``common/gvec_fft_box.make_fft_box_kernel`` but on
-# WfnLoader's c128 layout).  For each FFT-box cell (nx, ny, nz),
+# ``common.gvec_fft_box`` owns the host-built inverse index; this is the sole
+# device gather that consumes it.  For each FFT-box cell (nx, ny, nz),
 # ``g_index[k, nx, ny, nz]`` gives the position along the G-axis of psi
 # to gather from; positions equal to ``ngkmax`` map to a synthetic
 # zero slot appended on the G-axis before the gather.  One ``take``
@@ -649,11 +666,49 @@ def to_rchunk_inner(
     # Reshape (..., nx, ny, nz) → (..., n_rtot).  Same contract as
     # to_rchunk._local_rchunk: assumes 3 leading axes before the spatial.
     rb_flat = rb.reshape(*rb.shape[:3], n_rtot)
-    slab = jax.lax.dynamic_slice_in_dim(rb_flat, r0, r_len_i, axis=-1)
+    slab = take_rchunk_padded(rb_flat, r0, r_len_i)
     if kvecs_frac is not None:
         slab = apply_bloch_phase_on_slice(
             slab, kvecs_frac, fft_grid_t, r0, r_len_i)
     return slab
+
+
+def take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
+    """Take a fixed-width flat-r slab, zero-filling beyond physical r.
+
+    ``lax.dynamic_slice`` clamps an out-of-bounds start backward.  That is
+    correct for its API but wrong for a mesh-padded final r carrier: asking
+    for ``[r0, r0 + r_len)`` must retain those exact logical cells and append
+    zeros, never substitute earlier physical cells.  The r axis is local and
+    replicated at both callers, so this bounded gather preserves their
+    existing low-memory sharding and allocates only the requested slab.
+    """
+    n_rtot = int(values.shape[-1])
+    r_len_i = int(r_len)
+    r0_arr = jnp.asarray(r0, dtype=jnp.int32)
+
+    def _direct(_):
+        # Preserve the incumbent contiguous-slice executable for every main
+        # chunk.  Only the ragged final carrier takes the masked gather arm.
+        return jax.lax.dynamic_slice_in_dim(
+            values, r0_arr, r_len_i, axis=-1)
+
+    def _padded(_):
+        r_idx = r0_arr + jnp.arange(r_len_i, dtype=jnp.int32)
+        valid = (r_idx >= 0) & (r_idx < n_rtot)
+        safe_idx = jnp.clip(r_idx, 0, n_rtot - 1)
+        slab = jnp.take(values, safe_idx, axis=-1)
+        valid_shape = (1,) * (slab.ndim - 1) + (r_len_i,)
+        return jnp.where(valid.reshape(valid_shape), slab, 0)
+
+    # ``lax.cond`` traces both arms.  A slice wider than the entire operand
+    # is statically invalid even when the runtime predicate selects the
+    # padded arm, so omit that arm altogether for this tiny-grid case.
+    if r_len_i > n_rtot:
+        return _padded(None)
+
+    in_bounds = (r0_arr >= 0) & (r0_arr + r_len_i <= n_rtot)
+    return jax.lax.cond(in_bounds, _direct, _padded, operand=None)
 
 
 def to_rchunk(
@@ -666,12 +721,17 @@ def to_rchunk(
     mesh: Mesh,
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    allow_padded_tail: bool = False,
 ) -> jax.Array:
     """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
 
     Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz``.  ``r0``
     may be a Python int (bounds-checked) or a traced scalar (caller's
-    responsibility).
+    responsibility).  ``allow_padded_tail=True`` permits only the upper end
+    of that interval to exceed the physical FFT box; the canonical
+    :func:`take_rchunk_padded` body fills those carrier cells with exact
+    zeros.  The caller remains responsible for deriving the carrier extent
+    through :mod:`runtime.padding`.
 
     The full G-flat gather → FFT-box → IFFT → r-slice (→ Bloch phase)
     pipeline runs inside one ``shard_map`` region.  Keeping it
@@ -686,10 +746,17 @@ def to_rchunk(
     n_rtot = nx * ny * nz
     r_len_i = int(r_len)
     if isinstance(r0, (int, np.integer)):
-        if r0 < 0 or int(r0) + r_len_i > n_rtot:
+        r0_i = int(r0)
+        outside = r0_i < 0 or r0_i + r_len_i > n_rtot
+        padded_tail = (bool(allow_padded_tail) and 0 <= r0_i < n_rtot
+                       and r0_i + r_len_i > n_rtot)
+        if outside and not padded_tail:
             raise ValueError(
-                f"to_rchunk: [{int(r0)}, {int(r0) + r_len_i}) "
-                f"out of [0, {n_rtot})")
+                f"to_rchunk: [{r0_i}, {r0_i + r_len_i}) "
+                f"out of [0, {n_rtot})"
+                + (" (set allow_padded_tail=True only for a "
+                   "runtime.padding-derived carrier)"
+                   if r0_i + r_len_i > n_rtot else ""))
 
     psi_spec = P(*_spec_of(psi))
     out_spec = tuple(_output_sharding(psi, mesh, n_extra_axes=1).spec)
@@ -746,6 +813,145 @@ def to_rchunk(
         return fn(psi, g_index_j, r0_arg)
     return fn(psi, g_index_j, r0_arg,
               jnp.asarray(kvecs_frac, dtype=jnp.float64))
+
+
+def gflat_to_rchunk_aot_memory(
+    *,
+    mesh: Mesh,
+    nk: int,
+    band_carrier: int,
+    nspinor: int,
+    ngkmax: int,
+    fft_grid: Sequence[int],
+    r_carrier: int,
+    norm: str,
+    dtype=jnp.complex128,
+) -> AotPeakBreakdown:
+    """AOT memory breakdown of the canonical full-Bloch WFN r-slab program.
+
+    This is the planning view of :func:`to_rchunk_inner`, not an FFT-box
+    proxy.  It compiles the same G-flat gather -> FFT box -> local IFFT ->
+    flat-r slice -> Bloch-phase program used inside
+    :class:`common.psi_G_store.PsiGStore`, with the production shardings and
+    carrier extents, then asks :mod:`runtime.aot_memory` for XLA's complete
+    buffer peak plus the cuFFT plan workspace.
+
+    ``PsiGStore`` obtains ``psi_G`` from an ``io_callback`` inside its
+    ``shard_map``.  Here that callback result is represented as a regular
+    argument of the identical local program.  The AOT service includes
+    argument bytes in ``total``, so the callback output remains priced while
+    avoiding a second WFN reader or transform implementation.
+
+    A standalone IFFT measurement is insufficient for this decision: its
+    argument represents an already-built FFT box and therefore cannot see the
+    gather buffer, retained r-slab, or Bloch-phase/output buffers surrounding
+    the FFT.  Those buffers were enough for a 32-band CrI3 carrier to pass the
+    old preflight and then fail its first real cuFFT workspace allocation.
+    """
+    nk = int(nk)
+    band_carrier = int(band_carrier)
+    nspinor = int(nspinor)
+    ngkmax = int(ngkmax)
+    r_carrier = int(r_carrier)
+    fft_grid_t = tuple(int(v) for v in fft_grid)
+    if len(fft_grid_t) != 3 or any(v <= 0 for v in fft_grid_t):
+        raise ValueError(
+            "gflat_to_rchunk_aot_memory: fft_grid must contain three "
+            f"positive extents; got {fft_grid_t}")
+    if min(nk, band_carrier, nspinor, ngkmax, r_carrier) <= 0:
+        raise ValueError(
+            "gflat_to_rchunk_aot_memory: all logical extents must be "
+            "positive")
+    if norm not in ("backward", "ortho", "forward"):
+        raise ValueError(
+            "gflat_to_rchunk_aot_memory: norm must be 'backward', "
+            f"'ortho', or 'forward'; got {norm!r}")
+
+    platform = mesh.devices.flat[0].platform
+    key = (
+        id(mesh), nk, band_carrier, nspinor, ngkmax, fft_grid_t,
+        r_carrier, norm, jnp.dtype(dtype).str, platform,
+        tuple(mesh.axis_names),
+        tuple(int(mesh.shape[a]) for a in mesh.axis_names),
+    )
+    hit = _RCHUNK_PEAK_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    psi_sharding = NamedSharding(mesh, band_sphere_spec())
+    gindex_sharding = NamedSharding(mesh, P(None, None, None, None))
+    kvec_sharding = NamedSharding(mesh, P(None, None))
+    rep = NamedSharding(mesh, P())
+
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(band_sphere_spec(), P(None, None, None, None), P(),
+                  P(None, None)),
+        out_specs=band_sphere_spec(),
+        check_vma=False,
+    )
+    def _local(psi_G, g_index, r0, kvecs_frac):
+        return to_rchunk_inner(
+            psi_G, g_index, fft_grid_t, r0, r_carrier,
+            norm=norm, kvecs_frac=kvecs_frac)
+
+    kernel = jax.jit(
+        _local,
+        in_shardings=(psi_sharding, gindex_sharding, rep, kvec_sharding),
+        out_shardings=psi_sharding,
+    )
+    specs = (
+        jax.ShapeDtypeStruct(
+            (nk, band_carrier, nspinor, ngkmax), dtype,
+            sharding=psi_sharding),
+        jax.ShapeDtypeStruct(
+            (nk, *fft_grid_t), jnp.int32, sharding=gindex_sharding),
+        jax.ShapeDtypeStruct((), jnp.int32, sharding=rep),
+        jax.ShapeDtypeStruct((nk, 3), jnp.float64, sharding=kvec_sharding),
+    )
+    lowered = kernel.lower(*specs)
+    compiled = lowered.compile(
+        compiler_options={"xla_gpu_memory_limit_slop_factor": 10000}
+    ) if platform in ("gpu", "cuda") else lowered.compile()
+    from runtime.aot_memory import aot_kernel_peak_bytes
+    memory = aot_kernel_peak_bytes(compiled, platform=platform)
+    if platform in ("gpu", "cuda") and not memory.fft_specs:
+        raise RuntimeError(
+            "gflat_to_rchunk_aot_memory: the compiled canonical WFN "
+            "r-slab program exposes no FFT operation, so its cuFFT workspace "
+            "cannot be certified")
+    if platform in ("gpu", "cuda") and not memory.cufft_measured:
+        raise RuntimeError(
+            "gflat_to_rchunk_aot_memory: the canonical WFN r-slab program's "
+            "cuFFT workspace query is unavailable on CUDA; refusing a "
+            "known-low memory preflight")
+    _RCHUNK_PEAK_CACHE[key] = memory
+    return memory
+
+
+def gflat_to_rchunk_aot_peak_bytes(
+    *,
+    mesh: Mesh,
+    nk: int,
+    band_carrier: int,
+    nspinor: int,
+    ngkmax: int,
+    fft_grid: Sequence[int],
+    r_carrier: int,
+    norm: str,
+    dtype=jnp.complex128,
+) -> int:
+    """Per-rank total peak HBM for the canonical WFN r-slab program.
+
+    Compatibility view of :func:`gflat_to_rchunk_aot_memory`.  Both APIs use
+    the same signature-keyed compiled-memory cache, so a planner that needs
+    the independently placeable cuFFT workspace does not compile twice.
+    """
+    return int(gflat_to_rchunk_aot_memory(
+        mesh=mesh, nk=nk, band_carrier=band_carrier, nspinor=nspinor,
+        ngkmax=ngkmax, fft_grid=fft_grid, r_carrier=r_carrier, norm=norm,
+        dtype=dtype).total)
 
 
 
@@ -844,6 +1050,7 @@ def gflat_to_rmu(
     mesh: Mesh,
     fft_grid: Sequence[int],
     kvecs_frac: np.ndarray | jax.Array | None = None,
+    k_row_map: np.ndarray | jax.Array | None = None,
     norm: str = "backward",
     chunk_size: int | None = None,
 ) -> jax.Array:
@@ -921,6 +1128,13 @@ def gflat_to_rmu(
         gathered samples are multiplied by ``exp(+2πi k·r_mu)`` per
         ``(k, r_mu)`` pair (separable in x/y/z; pre-computed once per
         k).  ``None`` skips the phase.
+    k_row_map
+        Optional ``(nk,)`` integer row selector.  Row ``k`` of ``psi_G``
+        then uses ``g_index[k_row_map[k]]`` and, when present,
+        ``kvecs_frac[k_row_map[k]]``.  The selector is a runtime operand so
+        every q row shares one executable and the loader's cached full
+        FFT-box table is never copied/reordered outside this owner.  The
+        default ``None`` preserves the historical row-aligned path.
     norm
         Forwarded to :func:`jnp.fft.ifftn`.  Defaults to ``"backward"``
         to match the legacy :func:`to_rmu` default; centroid-load
@@ -943,13 +1157,13 @@ def gflat_to_rmu(
     nb_total  = int(psi_G.shape[1])
     ns        = int(psi_G.shape[2])
     ngkmax    = int(psi_G.shape[3])
-    r_mu_arr  = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
-    if r_mu_arr.ndim != 2 or int(r_mu_arr.shape[1]) != 3:
+    r_mu_shape = tuple(int(s) for s in np.shape(r_mu))
+    if len(r_mu_shape) != 2 or r_mu_shape[1] != 3:
         raise ValueError(
             f"gflat_to_rmu: r_mu must be (n_rmu, 3); got shape "
-            f"{r_mu_arr.shape}.")
-    n_rmu     = int(r_mu_arr.shape[0])
-    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+            f"{r_mu_shape}.")
+    n_rmu     = r_mu_shape[0]
+    p_prod    = spec_divisor(mesh, band_sphere_spec(), axis=1)
     # Band-flat sharding needs the band axis divisible by the mesh.  Pad it
     # up with ZERO bands so ANY device count works: the htransform SP /
     # galerkin entry (bandstructure.htransform.streaming_galerkin_solve)
@@ -980,14 +1194,19 @@ def gflat_to_rmu(
             f"gflat_to_rmu: g_index trailing shape {g_shape[1:]} "
             f"≠ fft_grid {fft_grid_t}.")
 
-    # r_mu range check (Python int values; replicated, OK to validate
-    # at trace time).
-    if (np.any(r_mu_arr[:, 0] < 0) or np.any(r_mu_arr[:, 0] >= nx)
-            or np.any(r_mu_arr[:, 1] < 0) or np.any(r_mu_arr[:, 1] >= ny)
-            or np.any(r_mu_arr[:, 2] < 0) or np.any(r_mu_arr[:, 2] >= nz)):
-        raise ValueError(
-            f"gflat_to_rmu: r_mu has out-of-range coords for "
-            f"fft_grid {fft_grid_t}.")
+    # Retain the eager caller guard without forcing a device→host roundtrip
+    # when the canonical producer already supplies a jax.Array.  Device
+    # values remain runtime operands below, exactly as in ``to_rmu``.
+    if not isinstance(r_mu, jax.Array):
+        r_mu_host = np.asarray(r_mu, dtype=np.int32)
+        if (np.any(r_mu_host[:, 0] < 0) or np.any(r_mu_host[:, 0] >= nx)
+                or np.any(r_mu_host[:, 1] < 0)
+                or np.any(r_mu_host[:, 1] >= ny)
+                or np.any(r_mu_host[:, 2] < 0)
+                or np.any(r_mu_host[:, 2] >= nz)):
+            raise ValueError(
+                f"gflat_to_rmu: r_mu has out-of-range coords for "
+                f"fft_grid {fft_grid_t}.")
 
     # Clamp the chunk to the actual row count: a chunk larger than the
     # data only inflates the flat-axis zero-pad — and with it the
@@ -1002,44 +1221,53 @@ def gflat_to_rmu(
 
     if kvecs_frac is None:
         kvecs_shape = None
-        kvecs_id = None
+        kvecs_dev = None
     else:
-        kvecs_arr = np.ascontiguousarray(np.asarray(kvecs_frac, dtype=np.float64))
-        kvecs_shape = tuple(int(s) for s in kvecs_arr.shape)
-        # Content-hash kvecs — same lesson as gflat_to_rchunk: the
-        # per-k phase tables (phx/phy/phz) bake into the cached
-        # closure, so shape-only keying would silently reuse stale
-        # tables when a different caller passes new kvecs_frac.
-        kvecs_id = hash(kvecs_arr.tobytes())
-    # Round-6: resolve canonical device buffer + cache_id without a
-    # numpy roundtrip for jax.Array inputs.  See _resolve_gindex_dev.
-    g_index_dev_canonical, g_index_id = _resolve_gindex_dev(g_index)
-    r_mu_id    = hash(r_mu_arr.tobytes())
+        # Shape validation is host-only, but the values remain on device.
+        # A streamed tile is already a jax.Array; np.asarray here would add a
+        # device-to-host-to-device copy at every k tile boundary.
+        kvecs_shape = tuple(int(s) for s in np.shape(kvecs_frac))
+        if kvecs_shape != (nk, 3):
+            raise ValueError(
+                f"gflat_to_rmu: kvecs_frac must be ({nk}, 3); got "
+                f"{kvecs_shape}.")
+        kvecs_dev = jnp.asarray(kvecs_frac, dtype=jnp.float64)
+    if k_row_map is None:
+        k_row_map_shape = None
+        k_row_map_dev = None
+    else:
+        k_row_map_shape = tuple(int(s) for s in np.shape(k_row_map))
+        if k_row_map_shape != (nk,):
+            raise ValueError(
+                f"gflat_to_rmu: k_row_map must be ({nk},); got "
+                f"{k_row_map_shape}.")
+        k_row_map_host = np.asarray(k_row_map, dtype=np.int64)
+        if np.any(k_row_map_host < 0) or np.any(k_row_map_host >= nk):
+            raise ValueError(
+                f"gflat_to_rmu: k_row_map contains a row outside [0,{nk}).")
+        k_row_map_dev = jnp.asarray(k_row_map, dtype=jnp.int32)
+    # Resolve the canonical device buffer without a numpy roundtrip for
+    # jax.Array inputs.  See _resolve_gindex_dev.
+    g_index_dev_canonical, _ = _resolve_gindex_dev(g_index)
+    r_mu_dev = jnp.asarray(r_mu, dtype=jnp.int32)
 
     key = (
-        tuple(int(s) for s in psi_G.shape),
-        fft_grid_t, n_rmu, r_mu_id, ngkmax, g_index_id,
-        norm, kvecs_shape, kvecs_id, cs, n_chunks, pad_N,
-        _sharding_key(psi_G),
+        tuple(int(s) for s in psi_G.shape), tuple(g_shape),
+        fft_grid_t, r_mu_shape, ngkmax,
+        norm, kvecs_shape, k_row_map_shape, cs, n_chunks, pad_N,
+        # The shard_map below owns the input layout: every operand enters as
+        # ``band_sphere_spec()`` on this explicit mesh.  Key that contract,
+        # not the incidental sharding wrapper returned by each streamed
+        # loader call; recent JAX can represent equal placements with
+        # distinct wrappers/spec spellings and would otherwise grow one
+        # compiled family per tile.
+        (id(mesh), tuple(band_sphere_spec())),
     )
 
     def build():
-        # Per-k phase tables and centroid-coord constants baked into the
-        # closure.  r_mu is replicated so we can index the per-row
-        # phases by r_mu directly inside the scan body.
-        r_mu_c    = jnp.asarray(r_mu_arr, dtype=jnp.int32)
-        if kvecs_frac is not None:
-            kv = jnp.asarray(np.asarray(kvecs_frac), dtype=jnp.float64)
-            # Forward Bloch phase: sign = +1 (post-IFFT, ψ = exp(+2πi k·r)·u).
-            _ph = lambda k_axis, n: jnp.exp(
-                +2j * jnp.pi * k_axis[:, None] * (jnp.arange(n) / n)[None, :])
-            phx, phy, phz = _ph(kv[:, 0], nx), _ph(kv[:, 1], ny), _ph(kv[:, 2], nz)
-            # Per-centroid 1D-phase columns: (nk, n_rmu) each.
-            phx_rmu_all = phx[:, r_mu_c[:, 0]]    # (nk, n_rmu)
-            phy_rmu_all = phy[:, r_mu_c[:, 1]]
-            phz_rmu_all = phz[:, r_mu_c[:, 2]]
-        else:
-            phx_rmu_all = phy_rmu_all = phz_rmu_all = None
+        # G-index, centroid coordinates and k-vectors are runtime operands:
+        # fixed-shape streamed tiles and centroid sets share one executable,
+        # with no retained per-content device constant.
 
         # Round-6: pass g_index through shard_map's in_specs (NOT
         # closure capture) so the Auto-sharded NamedSharding-replicated
@@ -1054,15 +1282,13 @@ def gflat_to_rmu(
         # already used by ``isdf_fitting._make_pair_pipeline_sm`` for
         # the same buffer and ensures both sides share the canonical
         # WfnLoader-cached device allocation.
-        in_spec  = P(None, ('x', 'y'), None, None)
+        in_spec  = band_sphere_spec()
         gidx_spec = P(None, None, None, None)
-        out_spec = P(None, ('x', 'y'), None, None)
+        rmu_spec = P(None, None)
+        kvec_spec = P(None, None)
+        out_spec = band_sphere_spec()
 
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(in_spec, gidx_spec),
-                 out_specs=out_spec,
-                 check_vma=False)
-        def _kernel(psi_, g_index_):
+        def _body(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
             # Per-rank: (nk, nb_local, ns, ngkmax).
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
@@ -1070,6 +1296,21 @@ def gflat_to_rmu(
                     psi_flat, ((0, pad_N), (0, 0), (0, 0)))
             out_flat = jnp.zeros(
                 (N + pad_N, ns, n_rmu), dtype=psi_.dtype)
+            if kvecs_ is not None:
+                # Preserve the established separable phase arithmetic exactly;
+                # only its k-vector operand moved from a closure constant to a
+                # runtime value so fixed-shape k tiles share one executable.
+                _ph = lambda k_axis, n: jnp.exp(
+                    +2j * jnp.pi * k_axis[:, None]
+                    * (jnp.arange(n) / n)[None, :])
+                phx = _ph(kvecs_[:, 0], nx)
+                phy = _ph(kvecs_[:, 1], ny)
+                phz = _ph(kvecs_[:, 2], nz)
+                phx_rmu_all = phx[:, r_mu_[:, 0]]
+                phy_rmu_all = phy[:, r_mu_[:, 1]]
+                phz_rmu_all = phz[:, r_mu_[:, 2]]
+            else:
+                phx_rmu_all = phy_rmu_all = phz_rmu_all = None
 
             def body(out, i):
                 i0    = i * cs
@@ -1077,17 +1318,19 @@ def gflat_to_rmu(
                     psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
                 k_row = jnp.clip(
                     (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)  # (cs,)
+                mapped_k_row = (k_row if k_row_map_ is None
+                                else k_row_map_[k_row])
                 # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row g_index gather: (cs, nx, ny, nz).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = g_index_[k_row]
+                g_per_row = g_index_[mapped_k_row]
                 box = _box_kernel(
                     sub4, g_per_row, ngkmax=ngkmax)      # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
-                samples = rb[:, :, r_mu_c[:, 0], r_mu_c[:, 1], r_mu_c[:, 2]]
+                samples = rb[:, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
                 if phx_rmu_all is not None:
                     # Per-row Bloch phase at the gathered centroid
                     # cells — apply_bloch_phase is multiplicative on the
@@ -1095,9 +1338,9 @@ def gflat_to_rmu(
                     # algebraically identical to applying it on the
                     # full FFT box before gather (cf. gflat_to_rchunk's
                     # phase-on-slice pattern).
-                    phx_q = phx_rmu_all[k_row]           # (cs, n_rmu)
-                    phy_q = phy_rmu_all[k_row]
-                    phz_q = phz_rmu_all[k_row]
+                    phx_q = phx_rmu_all[mapped_k_row]
+                    phy_q = phy_rmu_all[mapped_k_row]
+                    phz_q = phz_rmu_all[mapped_k_row]
                     samples = samples * (phx_q * phy_q * phz_q)[:, None, :]
                 return jax.lax.dynamic_update_slice_in_dim(
                     out, samples, i0, axis=0), None
@@ -1108,10 +1351,50 @@ def gflat_to_rmu(
                 out_flat = out_flat[:N]
             return out_flat.reshape(nk, nb_local, ns, n_rmu)
 
+        if kvecs_frac is None and k_row_map is None:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, rmu_spec),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, r_mu_):
+                return _body(psi_, g_index_, r_mu_, None, None)
+        elif k_row_map is None:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, rmu_spec, kvec_spec),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, r_mu_, kvecs_):
+                return _body(psi_, g_index_, r_mu_, kvecs_, None)
+        elif kvecs_frac is None:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, rmu_spec, P(None)),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, r_mu_, k_row_map_):
+                return _body(psi_, g_index_, r_mu_, None, k_row_map_)
+        else:
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(in_spec, gidx_spec, rmu_spec, kvec_spec,
+                               P(None)),
+                     out_specs=out_spec,
+                     check_vma=False)
+            def _kernel(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
+                return _body(
+                    psi_, g_index_, r_mu_, kvecs_, k_row_map_)
+
         return jax.jit(_kernel)
 
     fn = _cached_jit('gflat_to_rmu', key, build)
-    out = fn(psi_G, g_index_dev_canonical)     # (nk, nb_pad_total, ns, n_rmu)
+    if kvecs_frac is None and k_row_map is None:
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev)
+    elif k_row_map is None:
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev, kvecs_dev)
+    elif kvecs_frac is None:
+        out = fn(psi_G, g_index_dev_canonical, r_mu_dev, k_row_map_dev)
+    else:
+        out = fn(
+            psi_G, g_index_dev_canonical, r_mu_dev, kvecs_dev,
+            k_row_map_dev)
     if nb_pad_total != nb_total:
         # Drop the zero pad-bands.  Replicate the band axis first (bands off
         # the mesh) so the slice to the logical nb_total — which need not
@@ -1260,7 +1543,8 @@ def accumulate_rchunk_to_gflat(
     n_q       = int(rchunk.shape[0])
     n_rmu_pad = int(rchunk.shape[1])
     r_len_i   = int(rchunk.shape[-1])
-    p_prod    = int(np.prod([mesh.shape[a] for a in mesh.axis_names]))
+    mu_gflat_spec = P(None, ('x', 'y'), None)
+    p_prod    = spec_divisor(mesh, mu_gflat_spec, axis=1)
     if n_rmu_pad % p_prod != 0:
         raise ValueError(
             f"accumulate_rchunk_to_gflat: n_rmu_padded={n_rmu_pad} not "
@@ -1330,8 +1614,7 @@ def accumulate_rchunk_to_gflat(
         # Sharding: μ is the only sharded axis on both rchunk and
         # gflat_acc.  P(None, ('x','y'), None) is enforced by the
         # caller; the shard_map below sees per-rank slabs.
-        in_spec  = P(None, ('x', 'y'), None)
-        out_spec = P(None, ('x', 'y'), None)
+        in_spec = out_spec = mu_gflat_spec
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(in_spec, in_spec, P()),
@@ -1500,7 +1783,13 @@ def apply_bloch_phase_on_slice(
     # int ``r0`` (broadcast as a constant) and jax-scalar ``r0`` (each
     # element a traced add).  ``nyn nz`` are static so divmod constants
     # fold cleanly.
-    flat = r0 + jnp.arange(r_len_i, dtype=jnp.int32)         # (r_len,)
+    # ``to_rchunk_inner`` permits a fixed-width carrier whose final cells
+    # lie beyond the physical FFT box and are exact zeros.  Clip only the
+    # phase lookup for those inert cells so every gather remains in bounds;
+    # valid slab coordinates are unchanged bit-for-bit.
+    flat = jnp.clip(
+        r0 + jnp.arange(r_len_i, dtype=jnp.int32),
+        0, nx * ny * nz - 1)                                # (r_len,)
     rx = flat // (ny * nz)
     ry = (flat // nz) % ny
     rz = flat % nz
@@ -1588,7 +1877,8 @@ def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
 
 
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
-                             bispinor: bool = False):
+                             bispinor: bool = False,
+                             bispinor_lift: str = "raw"):
     """One k-point's ψ in the FFT box, **process-local**.
 
     Returns ``(nb - b_lo, nspinor, nx, ny, nz)`` c128 on
@@ -1608,7 +1898,8 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
     """
     loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
     psi = loader.load_process_local(
-        bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor))
+        bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor),
+        bispinor_lift=bispinor_lift)
     ns_have = int(psi.shape[2])
     if int(meta.nspinor) > ns_have:
         _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
@@ -1715,6 +2006,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
 def read_Gvecs_to_devices(
     wfn, sym, bandrange, meta: "Meta", bispinor: bool, mesh_xy: Mesh,
     k_range: tuple[int, int] | None = None,
+    *, bispinor_lift: str = "raw",
 ):
     """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box.
 
@@ -1741,12 +2033,12 @@ def read_Gvecs_to_devices(
     else:
         k = list(range(int(k_range[0]), int(k_range[1])))
 
-    sharding = P(None, ("x", "y"), None, None)
+    sharding = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
     psi_G_flat = loader.load(
         bands=(b_lo, b_hi), k=k, sharding=sharding,
-        bispinor=bool(bispinor),
+        bispinor=bool(bispinor), bispinor_lift=bispinor_lift,
     )
     ns_after_lift = 4 if bispinor else int(loader.nspinor)
     if int(meta.nspinor) > ns_after_lift:
@@ -1758,10 +2050,6 @@ def read_Gvecs_to_devices(
     return psi_box, nb_logical
 
 
-# Default band-sharded G-flat spec shared by every ψ(G-flat) load site.
-_GFLAT_LOAD_SPEC = P(None, ('x', 'y'), None, None)
-
-
 def load_psi_gflat_padded(
     loader,
     bands: tuple[int, int],
@@ -1770,7 +2058,8 @@ def load_psi_gflat_padded(
     bispinor: bool,
     pad_to: int | None = None,
     k="full_bz",
-    sharding: P = _GFLAT_LOAD_SPEC,
+    sharding: P = band_sphere_spec(),
+    bispinor_lift: str = "raw",
 ) -> "jax.Array | None":
     """One capped + zero-padded ψ(G-flat) load — THE shared load dance.
 
@@ -1802,7 +2091,7 @@ def load_psi_gflat_padded(
         return None
     psi = loader.load(
         bands=(b_lo, b_hi_in_file), k=k, sharding=sharding,
-        bispinor=bool(bispinor))
+        bispinor=bool(bispinor), bispinor_lift=bispinor_lift)
     nb_loaded = int(psi.shape[1])
     if nb_loaded < target:
         psi = jnp.concatenate(
@@ -1815,34 +2104,6 @@ def load_psi_gflat_padded(
     return psi
 
 
-def _slice_bands_gflat(psi_full: jax.Array, lo: int, width: int,
-                       mesh: Mesh) -> jax.Array:
-    """Band-window slice ``psi_full[:, lo:lo+width]`` of a device-resident
-    ψ(G-flat) window, re-sharded to the standard band-sharded spec.
-
-    One cached jit per (shape, width) — ``lo`` is a traced scalar, so the
-    whole band-chunk sweep dispatches ONE compiled slicer.  Caller must
-    guarantee ``lo + width <= psi_full.shape[1]`` (``dynamic_slice``
-    would silently clamp-and-shift otherwise).
-    """
-    if lo + width > int(psi_full.shape[1]):
-        raise ValueError(
-            f"_slice_bands_gflat: [{lo}, {lo + width}) out of "
-            f"[0, {int(psi_full.shape[1])})")
-    key = (psi_full.shape, int(width), _sharding_key(psi_full), id(mesh))
-
-    def build():
-        out_shard = NamedSharding(mesh, _GFLAT_LOAD_SPEC)
-
-        @partial(jax.jit, out_shardings=out_shard)
-        def fn(psi_, lo_):
-            return jax.lax.dynamic_slice_in_dim(psi_, lo_, width, axis=1)
-        return fn
-
-    fn = _cached_jit('slice_bands_gflat', key, build)
-    return fn(psi_full, jnp.int32(lo))
-
-
 # ============================================================================
 # R-CHUNK EXTRACTION: Contiguous r-space chunking via flattened r-index
 # ============================================================================
@@ -1852,20 +2113,94 @@ def _slice_bands_gflat(psi_full: jax.Array, lo: int, width: int,
 # ============================================================================
 
 
+def prepare_rchunk_carrier(
+    mesh_xy: Mesh,
+    *,
+    r_start: int,
+    r_end: int,
+    n_rtot: int,
+    product_r_spec: P | None,
+):
+    """Plan and finish the canonical band-sharded r-chunk carrier.
+
+    This is the one owner for the r-range validation, runtime-padding
+    divisor, terminal-tail rule, and staged band-product → r-product move
+    shared by direct WFN iteration and reusable coefficient sources.  The
+    transform that produces the already-zero-filled carrier remains the
+    caller's responsibility.
+
+    Returns ``(carrier_extent, output_sharding, finish)``.  ``finish`` checks
+    the produced extent and commits it to the requested layout; when
+    ``product_r_spec`` is the canonical product-r layout it invokes
+    :func:`common.staged_reshard.band_to_product_r_reshard`.
+    """
+    r_start = int(r_start)
+    r_end = int(r_end)
+    n_rtot = int(n_rtot)
+    if not 0 <= r_start < r_end <= n_rtot:
+        raise ValueError(
+            "prepare_rchunk_carrier: expected "
+            f"0 <= r_start < r_end <= {n_rtot}, got "
+            f"[{r_start}, {r_end})")
+
+    out_y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
+    product_reshard = None
+    if product_r_spec is not None:
+        expected = P(None, None, None, ('y', 'x'))
+        if product_r_spec != expected:
+            raise ValueError(
+                "prepare_rchunk_carrier: the canonical product-r route "
+                f"has spec {expected}, got {product_r_spec}")
+        r_pad_divisor = spec_divisor(mesh_xy, product_r_spec, axis=3)
+        product_reshard = band_to_product_r_reshard(mesh_xy)
+        out_r = NamedSharding(mesh_xy, product_r_spec)
+    else:
+        r_pad_divisor = 1
+        out_r = out_y
+
+    logical_extent = r_end - r_start
+    carrier_extent = round_up(logical_extent, r_pad_divisor)
+    if (product_reshard is not None and carrier_extent != logical_extent
+            and r_end != n_rtot):
+        raise ValueError(
+            "prepare_rchunk_carrier: product-r padding is only inert on "
+            "a terminal slab ending at the physical FFT-grid extent; got "
+            f"[{r_start}, {r_end}) of [0, {n_rtot})")
+
+    def _finish(a):
+        if int(a.shape[-1]) != carrier_extent:
+            raise AssertionError(
+                "prepare_rchunk_carrier: canonical padded-r slice returned "
+                f"extent {int(a.shape[-1])}, expected runtime.padding "
+                f"carrier {carrier_extent}")
+        if product_reshard is None:
+            return jax.lax.with_sharding_constraint(a, out_y)
+        return product_reshard(a)
+
+    return carrier_extent, out_r, _finish
+
+
 def iter_psi_rchunk_bandwise(
     wfn, sym, meta, mesh_xy, band_range, r_start, r_end, bispinor,
     band_chunk_size: int = 16,
     k_chunk_size: int = 0,
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
-    psi_G_flat: jax.Array | None = None,
+    product_r_spec: P | None = None,
+    bispinor_lift: str = "raw",
 ):
-    """Generator: yield ``(bc_range, psi_bc_Y)`` one band chunk at a time.
+    """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time.
 
-    Each yielded ``psi_bc_Y`` has shape
-    ``(nk, bc_range[1]-bc_range[0], ns, r_end-r_start)`` sharded
-    ``P(None, None, None, 'y')`` — the FFT-to-r-chunk slab of just
-    the current band chunk.  The caller is responsible for
+    By default each result has shape ``(nk, bc, ns, r_end-r_start)`` sharded
+    ``P(None, None, None, 'y')``, preserving the historical contract.  When
+    ``product_r_spec=P(None,None,None,('y','x'))``, the free r axis is first
+    rounded through :mod:`runtime.padding` to that spec's canonical divisor;
+    :func:`take_rchunk_padded` emits the exact-zero carrier tail inside the
+    existing FFT shard-map, and the result moves directly from the input's
+    product-band layout to the product-r layout by
+    :func:`common.staged_reshard.band_to_product_r_reshard`.  That route is
+    two volume-preserving all-to-alls and never constructs the historical
+    x-replicated r-on-y global carrier.  The caller is responsible for
     accumulating contributions (e.g. ``P += einsum(ψ_L_bc, ψ_R_bc)``)
     so only one band chunk's r-chunk shard is live at any moment,
     decoupling the pair-density peak from the total band count.
@@ -1886,18 +2221,6 @@ def iter_psi_rchunk_bandwise(
     the same width — the extra bands then contribute exactly zero.
     ``None`` disables the pad (legacy per-chunk-shape behaviour).
 
-    ``psi_G_flat`` — optional device-resident ψ(G-flat) window covering
-    ``band_range`` (band-sharded ``P(None, ('x','y'), None, None)``, as
-    returned by :func:`load_psi_gflat_padded`).  When given, each band
-    chunk is a device SLICE of it instead of a fresh ``loader.load`` —
-    ONE file read (+ symmetry unfold) serves the whole sweep, and a
-    caller that already holds the window (htransform loads the same
-    window for centroid sampling) pays zero extra I/O.  Slice columns
-    beyond the chunk's real bands hold the window's own pad rows
-    (finite; zero or real file bands) — same contract as the loader's
-    internal band round-up, so consumers must keep masking ``[bc, w)``.
-    Full-BZ path only (``k_chunk_size`` must stay 0).
-
     Uses :class:`wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
     is unused (loader builds its own SymMaps).
     """
@@ -1907,6 +2230,13 @@ def iter_psi_rchunk_bandwise(
     nk_tot = int(meta.nk_tot)
     nk_batch = nk_tot if k_chunk_size <= 0 else min(k_chunk_size, nk_tot)
     n_rchunk = int(r_end - r_start)
+    n_rchunk_carrier, out_r, _finish_r_carrier = prepare_rchunk_carrier(
+        mesh_xy,
+        r_start=r_start,
+        r_end=r_end,
+        n_rtot=meta.n_rtot,
+        product_r_spec=product_r_spec,
+    )
 
     if band_chunk_ranges is None:
         nb_total = b_end - b_start
@@ -1920,73 +2250,27 @@ def iter_psi_rchunk_bandwise(
     # JIT'd zero-allocator used by the k-chunked path (memoised by
     # shape).  Keeps the top-level ``jnp.zeros`` from being
     # rematerialised replicated on every device.
-    out_Y = NamedSharding(mesh_xy, P(None, None, None, 'y'))
-    _zeros_Y_cache: dict = {}
-    def _zeros_Y(shape):
-        fn = _zeros_Y_cache.get(shape)
+    _zeros_out_cache: dict = {}
+    def _zeros_out(shape):
+        fn = _zeros_out_cache.get(shape)
         if fn is None:
             fn = jax.jit(
                 lambda: jnp.zeros(shape, dtype=jnp.complex128),
-                out_shardings=out_Y)
-            _zeros_Y_cache[shape] = fn
+                out_shardings=out_r)
+            _zeros_out_cache[shape] = fn
         return fn()
 
-    sharding_load = _GFLAT_LOAD_SPEC
+    sharding_load = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
-    g_index_full = loader.box_index(k="full_bz")
-    sym_loader = loader.symmetry()
-    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
-    kvecs_frac_full = (
-        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
-        / kgrid_arr[None, :])
-
-    # ── Window-reuse fast path: slice per-bc from a resident G-flat ──
-    if psi_G_flat is not None:
-        if 0 < nk_batch < nk_tot:
-            raise ValueError(
-                "iter_psi_rchunk_bandwise: psi_G_flat reuse requires the "
-                "full-BZ path (k_chunk_size=0)")
-        # Widths per chunk (band_pad_to overrides so to_rchunk compiles
-        # once); pad the window ONCE up to the max slice extent so the
-        # dynamic-slice never clamps (clamp would shift the window and
-        # leak earlier bands into pad columns).
-        # ``max`` guards a chunk wider than band_pad_to (never truncate
-        # real bands) — same semantics as the pad-only-if-smaller load
-        # path.
-        widths = [
-            (max(int(band_pad_to), b1 - b0) if band_pad_to is not None
-             else (b1 - b0))
-            for (b0, b1) in band_chunk_ranges]
-        need = max(
-            (b0 - b_start) + w
-            for (b0, _b1), w in zip(band_chunk_ranges, widths))
-        nb_avail = int(psi_G_flat.shape[1])
-        if need > nb_avail:
-            def _build_pad():
-                out_shard = NamedSharding(mesh_xy, sharding_load)
-
-                @partial(jax.jit, out_shardings=out_shard)
-                def fn(psi_):
-                    return jnp.pad(
-                        psi_, ((0, 0), (0, need - nb_avail), (0, 0), (0, 0)))
-                return fn
-            psi_G_flat = _cached_jit(
-                'pad_bands_gflat',
-                (psi_G_flat.shape, need, _sharding_key(psi_G_flat),
-                 id(mesh_xy)),
-                _build_pad)(psi_G_flat)
-        for bc_range, w in zip(band_chunk_ranges, widths):
-            psi_bc = _slice_bands_gflat(
-                psi_G_flat, int(bc_range[0]) - b_start, w, mesh_xy)
-            psi_bc_Y = to_rchunk(
-                psi_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
-                kvecs_frac=jnp.asarray(kvecs_frac_full))
-            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
-            del psi_bc
-            yield bc_range, psi_bc_Y
-        return
+    # Reuse the loader-owned replicated device table.  Passing the host table
+    # here would make ``to_rchunk`` allocate a second identical G-vector to
+    # FFT-box map beside the centroid path's canonical buffer.
+    g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
+    # WfnLoader owns the paired (k,G) gauge. A local integer-grid rebuild can
+    # choose k+G_lattice while ``box_index`` still labels coefficients for k,
+    # corrupting the full-Bloch phase.
+    kvecs_frac_full = loader.kvecs(k="full_bz")
 
     for bc_range in band_chunk_ranges:
         if nk_batch >= nk_tot:
@@ -1997,42 +2281,45 @@ def iter_psi_rchunk_bandwise(
             # zero-padded UH slice).
             psi_G_bc = load_psi_gflat_padded(
                 loader, bc_range, mesh_xy=mesh_xy, bispinor=bispinor,
-                pad_to=band_pad_to, k="full_bz", sharding=sharding_load)
+                pad_to=band_pad_to, k="full_bz", sharding=sharding_load,
+                bispinor_lift=bispinor_lift)
             if psi_G_bc is None:
                 raise ValueError(
                     f"iter_psi_rchunk_bandwise: band chunk {bc_range} lies "
                     f"entirely past the file's band extent "
                     f"({int(loader.nbands)})")
-            psi_bc_Y = to_rchunk(
+            psi_bc_r = to_rchunk(
                 psi_G_bc, g_index_full, meta.fft_grid,
-                int(r_start), n_rchunk, mesh=mesh_xy, norm="ortho",
-                kvecs_frac=jnp.asarray(kvecs_frac_full))
-            psi_bc_Y = jax.lax.with_sharding_constraint(psi_bc_Y, out_Y)
+                int(r_start), n_rchunk_carrier, mesh=mesh_xy, norm="ortho",
+                kvecs_frac=jnp.asarray(kvecs_frac_full),
+                allow_padded_tail=(n_rchunk_carrier > n_rchunk))
+            psi_bc_r = _finish_r_carrier(psi_bc_r)
             del psi_G_bc
-            yield bc_range, psi_bc_Y
+            yield bc_range, psi_bc_r
         else:
             nb_chunk = bc_range[1] - bc_range[0]
             nspinor = meta.nspinor
-            psi_bc_Y_full = _zeros_Y(
-                (nk_tot, nb_chunk, nspinor, n_rchunk))
+            psi_bc_r_full = _zeros_out(
+                (nk_tot, nb_chunk, nspinor, n_rchunk_carrier))
             for k0 in range(0, nk_tot, nk_batch):
                 k1 = min(k0 + nk_batch, nk_tot)
                 k_ids = list(range(k0, k1))
                 psi_G_flat = loader.load(
                     bands=bc_range, k=k_ids,
-                    sharding=sharding_load, bispinor=bispinor)
+                    sharding=sharding_load, bispinor=bispinor,
+                    bispinor_lift=bispinor_lift)
                 psi_k_chunk = to_rchunk(
                     psi_G_flat,
                     g_index_full[k0:k1],
-                    meta.fft_grid, int(r_start), n_rchunk,
+                    meta.fft_grid, int(r_start), n_rchunk_carrier,
                     mesh=mesh_xy, norm="ortho",
-                    kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]))
-                psi_k_chunk = jax.lax.with_sharding_constraint(
-                    psi_k_chunk, out_Y)
-                psi_bc_Y_full = psi_bc_Y_full.at[
+                    kvecs_frac=jnp.asarray(kvecs_frac_full[k0:k1]),
+                    allow_padded_tail=(n_rchunk_carrier > n_rchunk))
+                psi_k_chunk = _finish_r_carrier(psi_k_chunk)
+                psi_bc_r_full = psi_bc_r_full.at[
                     k0:k1, :, :, :].set(psi_k_chunk)
                 del psi_G_flat, psi_k_chunk
-            yield bc_range, psi_bc_Y_full
+            yield bc_range, psi_bc_r_full
 
 
 # ============================================================================
@@ -2052,6 +2339,7 @@ def load_centroids_band_chunked(
     k_chunk_size: int | None = None,
     *,
     psi_G_flat: jax.Array | None = None,
+    bispinor_lift: str = "raw",
 ) -> tuple[jax.Array, jax.Array]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
@@ -2073,10 +2361,23 @@ def load_centroids_band_chunked(
         bispinor: Whether to use bispinor
         mesh_xy: Device mesh
         band_range: (b_start, b_end)
-        band_chunk_size: Bands to FFT at once (memory control)
-        k_chunk_size: K-points to FFT at once (None = all at once).
-            When set, processes k-points in batches to control the size
-            of the FFT box array (the dominant memory bottleneck).
+        band_chunk_size: Maximum bands in one outer WFN/FFT tile.  A
+            positive value smaller than the logical window activates the
+            streamed owner; this is the existing GW Stage-A band policy.
+        k_chunk_size: Maximum k-points in one outer WFN/FFT tile.  ``None``
+            or a non-positive value keeps all k-points inside each band tile.
+            A positive value activates k streaming even when the band window
+            fits one tile.
+        psi_G_flat: Optional already-loaded full G-flat window.  This keeps
+            the bulk path regardless of chunk hints because its owner (the
+            htransform Galerkin path) deliberately reuses the same allocation
+            after centroid sampling.
+
+        Both outer remainders are zero-padded through
+        :mod:`runtime.padding` to the one fixed physical tile shape.  G-index
+        and k-vector values are runtime operands, so all tiles of a window
+        reuse one compiled transform family; padding changes scheduling only,
+        not the logical return extent or centroid values.
 
     Returns:
         psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
@@ -2109,41 +2410,24 @@ def load_centroids_band_chunked(
     # nx, ny, nz]`` transient on every rank — Peak A in
     # ``gw/gflat_memory_model.py``.  Single slot, but the §0
     # zero-replicated-intermediates principle still bites.  ``gflat_to_rmu``
-    # fuses the bc/k iteration into one shard_map + lax.scan whose
-    # per-iter FFT box is sharded along the band axis on ``('x','y')``
-    # and aliased across scan iters; the legacy ``band_chunk_size`` /
-    # ``k_chunk_size`` knobs collapse into the single ``chunk_size``
-    # below (rows of the flat (nk · nb_local) axis per scan iter).
+    # fuses each fixed-shape band/k tile into one shard_map + lax.scan whose
+    # per-iter FFT box is sharded along the band axis on ``('x','y')`` and
+    # aliased across scan iters.  The two outer tile sizes bound the WFN and
+    # transform operands; ``chunk_size`` below independently bounds FFT rows
+    # within one tile.
 
     # Per-iter FFT box bound for ``gflat_to_rmu``: each scan iter holds
     # one ``c128[cs, ns, nx, ny, nz]`` box per rank.  ``peak_copies``
     # is the same conservative XLA scratch multiplier used historically
     # by the old k_chunk_size autodetect (4 on single-rank, 9 on
     # multi-rank — covers the IFFT scratch + IFFT output).
-    n_devices = jax.device_count()
-    peak_copies = 4 if n_devices == 1 else 9
+    sharding_load = band_sphere_spec()
+    p_band = spec_divisor(mesh_xy, sharding_load, axis=1)
+    mesh_devices = int(mesh_xy.size)
+    peak_copies = 4 if mesh_devices == 1 else 9
     gpu_mem_bytes = 36e9
     if hasattr(meta, 'memory_per_device_gb') and meta.memory_per_device_gb > 0:
         gpu_mem_bytes = meta.memory_per_device_gb * 1e9
-
-    # Translate legacy hints (band_chunk_size, k_chunk_size) into the
-    # new flat-row count.  Both default to a non-None value; an explicit
-    # k_chunk_size from the caller bounds rows × nb_padded, otherwise we
-    # pick cs purely from the per-rank HBM budget.  In either case the
-    # budget bound applies last so cs can never exceed it.
-    cs_budget = max(1, int(gpu_mem_bytes
-                           // (nspinor * n_rtot * 16 * peak_copies)))
-    if k_chunk_size is not None and k_chunk_size > 0:
-        # Honor an explicit cap: at most ``k_chunk_size`` k-points
-        # worth of work per iter, sized against the per-rank band
-        # block.  Same per-iter footprint as the legacy nested loops.
-        n_bands_per_rank = max(
-            1, (nb_total + n_devices - 1) // n_devices)
-        cs_hint = int(k_chunk_size) * min(
-            int(band_chunk_size), n_bands_per_rank)
-        cs = max(1, min(cs_hint, cs_budget))
-    else:
-        cs = cs_budget
 
     # Output shardings + accumulators.  Same final layout as before:
     # psi_rmu_Y has the centroid axis on 'y'; psi_rmuT_X has it on 'x'.
@@ -2156,25 +2440,254 @@ def load_centroids_band_chunked(
     # centroid extent loaded here must equal the meta extent the ζ-fit
     # kernels were shaped with.
     n_rmu_padded = padded_mu_extent(n_rmu, mesh_xy)
-    sharding_load = P(None, ('x', 'y'), None, None)
-
     loader = wfn  # reuse top-level WfnLoader
-    # Round-6 canonical accessor: pass the loader-cached device-resident
-    # sphere index directly to gflat_to_rmu so the captured-in-closure
-    # buffer IS the canonical one shared with psi_G_store's
-    # _g_index_dev.  Pre-Round-6 we passed the host numpy from
-    # loader.box_index(...) and let gflat_to_rmu's content-hash cache
-    # build its own device buffer — distinct sharding (no NamedSharding
-    # on the wfn_transforms path) meant the cached dedup didn't unify
-    # with box_index_dev's REPLICATED NamedSharding buffer.  Result: 3
-    # device buffers for the same (nk, nx, ny, nz) data (agent_l Round-5
-    # §2 measured live count = 3 at pre_rchunk_loop).
+    # The shared GW memory plan already owns a positive Stage-A band chunk;
+    # honor it here instead of bulk-loading the very tensor it prices.  Prune
+    # additionally supplies a positive k chunk.  A preloaded htransform
+    # window deliberately stays bulk because its next Galerkin sweep reuses
+    # that allocation.  Keep one fixed band/k tile shape (runtime-padding
+    # both remainders) so the transform compiles once per physical window.
+    k_stream_requested = (
+        k_chunk_size is not None and int(k_chunk_size) > 0
+    )
+    requested_k_tile = (
+        int(k_chunk_size)
+        if k_stream_requested
+        else nk_tot
+    )
+    requested_band_tile = min(
+        nb_total, max(1, int(band_chunk_size)))
+    stream_tiles = (
+        psi_G_flat is None
+        and (k_stream_requested
+             or requested_band_tile < nb_total)
+    )
+    k_tile = min(nk_tot, requested_k_tile) if stream_tiles else nk_tot
+    band_tile = nb_total
+    if stream_tiles:
+        band_tile = round_up(requested_band_tile, p_band)
+    nk_accum = round_up(nk_tot, k_tile)
+    nb_accum = round_up(nb_total, band_tile)
+
+    # Persistent term for the transfer.  Bulk retains the complete sharded
+    # G-flat input.  Streaming retains only one fixed tile beside the donated
+    # final X/Y accumulators; tile sample/reshard faces are priced too because
+    # they coexist at the insert boundary.
+    nb_per_band_shard = (
+        band_tile // p_band if stream_tiles
+        else round_up(nb_total, p_band) // p_band
+    )
+    nb_padded_global = (
+        band_tile if stream_tiles else nb_per_band_shard * p_band
+    )
+    if not stream_tiles:
+        nb_accum = nb_padded_global
+    n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
+    n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
+    gflat_local_bytes = (
+        k_tile * nb_per_band_shard * nspinor * int(loader.ngkmax) * 16
+    )
+    output_local_bytes = (
+        nk_accum * nb_accum * nspinor * 16
+        * (((n_rmu_padded + n_x - 1) // n_x)
+           + ((n_rmu_padded + n_y - 1) // n_y))
+    )
+    tile_band_output_local_bytes = 0
+    tile_face_local_bytes = 0
+    if stream_tiles:
+        tile_band_output_local_bytes = (
+            k_tile * nb_per_band_shard * nspinor * n_rmu * 16
+        )
+        tile_face_local_bytes = (
+            k_tile * band_tile * nspinor * 16
+            * (((n_rmu_padded + n_x - 1) // n_x)
+               + ((n_rmu_padded + n_y - 1) // n_y))
+        )
+    # A caller-provided G-flat tensor is already in memory_stats(); only price
+    # it here when this call will allocate it.  This avoids double-charging
+    # htransform's shared-window reuse path.
+    new_gflat_bytes = gflat_local_bytes if psi_G_flat is None else 0
+    persistent_bytes = (
+        new_gflat_bytes + output_local_bytes
+        + tile_band_output_local_bytes + tile_face_local_bytes
+    )
+    min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
+    existing_live_local_bytes = 0
+    for device in jax.local_devices():
+        stats = device.memory_stats() or {}
+        existing_live_local_bytes = max(
+            existing_live_local_bytes, int(stats.get("bytes_in_use") or 0),
+        )
+    # ``cs`` below is a static scan shape and cache-key component.  Allocator
+    # residency can differ by process after asynchronous Lloyd/JIT teardown;
+    # use one shared worst-rank floor so every process compiles the same scan.
+    existing_live_bytes = worst_process_resident_bytes(
+        existing_live_local_bytes)
+    scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
+                         - persistent_bytes)
+    if scan_budget_bytes < min_scan_bytes:
+        min_live_bytes = (existing_live_bytes + persistent_bytes
+                          + min_scan_bytes)
+        raise MemoryError(
+            "load_centroids_band_chunked planner refuses before WFN "
+            f"allocation: the minimum per-device live set is "
+            f"{min_live_bytes / 2**30:.2f} GiB (G-flat "
+            f"{'tile' if stream_tiles else 'input'} + X/Y centroid "
+            f"outputs + one FFT scan row), but the residual prune "
+            f"transient budget is {gpu_mem_bytes / 2**30:.2f} GiB. "
+            "A smaller scan chunk cannot reduce this floor; use more "
+            "devices, larger-HBM devices, or a narrower prune band window."
+        )
+
+    # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
+    # flat-row count.  Only the budget LEFT AFTER persistent arrays may size
+    # the scan transient.  In either arm the bound applies last.
+    cs_budget = max(1, int(
+        scan_budget_bytes // (nspinor * n_rtot * 16 * peak_copies)
+    ))
+    if stream_tiles:
+        cs_hint = k_tile * nb_per_band_shard
+        cs = max(1, min(cs_hint, cs_budget))
+    else:
+        cs = cs_budget
+    print(
+        "[load_centroids planner] "
+        f"existing={existing_live_bytes / 2**30:.2f}, "
+        f"persistent={persistent_bytes / 2**30:.2f}, "
+        f"scan_budget={scan_budget_bytes / 2**30:.2f} GiB/device, "
+        f"peak_copies={peak_copies}, cs={cs}, "
+        f"stream={'on' if stream_tiles else 'off'}, "
+        f"k_tile={k_tile}, band_tile={band_tile}"
+    )
+    # Pass the loader-cached device-resident sphere index directly to
+    # gflat_to_rmu.  It is a runtime operand shared with psi_G_store's
+    # _g_index_dev, so streaming neither retains a per-tile constant nor
+    # constructs a duplicate device buffer.
     g_index_full = loader.box_index_dev(k="full_bz", mesh=mesh_xy)
-    sym_loader = loader.symmetry()
-    kgrid_arr = np.asarray(meta.kgrid, dtype=np.float64)
-    kvecs_frac_full = (
-        np.asarray(sym_loader.kvecs_asints, dtype=np.float64)
-        / kgrid_arr[None, :])
+    # Use the k representatives paired with this loader's full-BZ G table;
+    # see the identical streamed-r door above.
+    kvecs_frac_full = loader.kvecs(k="full_bz")
+
+    # One reshard owner for both the bulk and streamed paths.  The input is
+    # band-sharded; the two consumers need independent Y-face and transposed
+    # X-face layouts.  Applying each stage constraint before μ padding avoids
+    # the x-major/y-major involuntary rematerialization documented below.
+    @partial(jax.jit, out_shardings=(out_Y, out_X))
+    def _reshard_centroid_tile(psi_rmu_band):
+        pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
+        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
+        if n_rmu_padded > n_rmu:
+            psi_rmu = jnp.pad(psi_rmu, pad_cfg)
+        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
+        psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
+        if n_rmu_padded > n_rmu:
+            psi_T = jnp.pad(psi_T, pad_cfg)
+        psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
+        psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
+        return psi_rmu, psi_rmuT
+
+    def _finish_faces(psi_rmu_all, psi_rmuT_all):
+        # Remove fixed-shape stream/loader pad rows before returning the
+        # public logical k and band extents.
+        if int(psi_rmu_all.shape[0]) > nk_tot:
+            psi_rmu_all = psi_rmu_all[:nk_tot]
+            psi_rmuT_all = psi_rmuT_all[:nk_tot]
+        if int(psi_rmu_all.shape[1]) > nb_total:
+            psi_rmu_all = psi_rmu_all[:, :nb_total, :, :]
+            psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
+        psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
+        psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
+
+        # Zero user-band-pad rows (unchanged contract).
+        nb_user_in_range = max(0, meta.b_id_4_user - b_start)
+        if nb_user_in_range < nb_total:
+            zero_y = jnp.zeros_like(
+                psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
+            zero_x = jnp.zeros_like(
+                psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
+            psi_rmu_all = psi_rmu_all.at[
+                :, nb_user_in_range:nb_total, :, :].set(zero_y)
+            psi_rmuT_all = psi_rmuT_all.at[
+                :, :, nb_user_in_range:nb_total, :].set(zero_x)
+        return psi_rmu_all, psi_rmuT_all
+
+    if b_start >= int(loader.nbands):
+        raise ValueError(
+            "load_centroids_band_chunked: band window "
+            f"({b_start}, {b_end}) lies entirely past the file's "
+            f"band extent ({int(loader.nbands)})")
+
+    if stream_tiles:
+        @partial(jax.jit, out_shardings=(out_Y, out_X))
+        def _zero_faces():
+            return (
+                jnp.zeros(
+                    (nk_accum, nb_accum, nspinor, n_rmu_padded),
+                    dtype=jnp.complex128),
+                jnp.zeros(
+                    (nk_accum, n_rmu_padded, nb_accum, nspinor),
+                    dtype=jnp.complex128),
+            )
+
+        @partial(
+            jax.jit, donate_argnums=(0, 1), out_shardings=(out_Y, out_X))
+        def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0):
+            tile_y, tile_x = _reshard_centroid_tile(psi_rmu_band)
+            zero = jnp.int32(0)
+            acc_y = jax.lax.dynamic_update_slice(
+                acc_y, tile_y, (k0, b0, zero, zero))
+            acc_x = jax.lax.dynamic_update_slice(
+                acc_x, tile_x, (k0, zero, b0, zero))
+            return acc_y, acc_x
+
+        psi_rmu_all, psi_rmuT_all = _zero_faces()
+        from common.collectives import barrier as _sync_barrier
+        _sync_barrier("load_centroids_pre_stream")
+
+        for b_rel in range(0, nb_total, band_tile):
+            b_hi_rel = min(b_rel + band_tile, nb_total)
+            band_window = (b_start + b_rel, b_start + b_hi_rel)
+            for k0 in range(0, nk_tot, k_tile):
+                k1 = min(k0 + k_tile, nk_tot)
+                k_ids = list(range(k0, k1))
+                with timing.section("load_centroids.loader_load"):
+                    psi_G_tile = load_psi_gflat_padded(
+                        loader, band_window, mesh_xy=mesh_xy,
+                        bispinor=bispinor, pad_to=band_tile, k=k_ids,
+                        sharding=sharding_load,
+                        bispinor_lift=bispinor_lift)
+                    # A terminal band tile can lie wholly beyond mnband when
+                    # Meta rounded the user's logical edge to the mesh.  The
+                    # accumulator is already exact zero there.
+                    if psi_G_tile is None:
+                        continue
+                    psi_G_tile = pad_axis(
+                        psi_G_tile, k_tile, axis=0).array
+                    jax.block_until_ready(psi_G_tile)
+
+                g_index_tile = pad_axis(
+                    g_index_full[k0:k1], k_tile, axis=0).array
+                kvecs_tile = pad_axis(
+                    jnp.asarray(kvecs_frac_full[k0:k1]),
+                    k_tile, axis=0).array
+                with timing.section("load_centroids.gflat_to_rmu"):
+                    psi_rmu_band = gflat_to_rmu(
+                        psi_G_tile, g_index_tile, centroid_idx_np,
+                        mesh=mesh_xy, fft_grid=meta.fft_grid,
+                        kvecs_frac=kvecs_tile, norm="ortho",
+                        chunk_size=cs)
+                    jax.block_until_ready(psi_rmu_band)
+                del psi_G_tile, g_index_tile, kvecs_tile
+
+                with timing.section("load_centroids.reshard_insert"):
+                    psi_rmu_all, psi_rmuT_all = _insert_tile(
+                        psi_rmu_all, psi_rmuT_all, psi_rmu_band,
+                        jnp.int32(k0), jnp.int32(b_rel))
+                    jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
+                del psi_rmu_band
+
+        gc.collect()
+        return _finish_faces(psi_rmu_all, psi_rmuT_all)
 
     # Pull all (nk_tot, nb_padded, ns, ngkmax) ψ(G-flat) onto device in
     # one collective load.  The G-flat tensor is small relative to the
@@ -2203,15 +2716,14 @@ def load_centroids_band_chunked(
         with timing.section("load_centroids.loader_load"):
             psi_G_flat = load_psi_gflat_padded(
                 loader, (b_start, b_end), mesh_xy=mesh_xy,
-                bispinor=bispinor, k="full_bz", sharding=sharding_load)
+                bispinor=bispinor, k="full_bz", sharding=sharding_load,
+                bispinor_lift=bispinor_lift)
             if psi_G_flat is None:
                 raise ValueError(
                     f"load_centroids_band_chunked: band window "
                     f"({b_start}, {b_end}) lies entirely past the file's "
                     f"band extent ({int(loader.nbands)})")
             jax.block_until_ready(psi_G_flat)
-    nb_padded = int(psi_G_flat.shape[1])
-
     # One shard_map + scan: full (nk, nb_padded) extent, centroid
     # samples emitted band-sharded.  FFT box exists once at scan-body
     # scope and is per-rank-local (mesh.size× smaller than the legacy
@@ -2253,23 +2765,10 @@ def load_centroids_band_chunked(
     # on per-shard c128[144,16,2,640] — wk_AO/gw80 first attempt).  With
     # the constraint first, the two pads are distinct instructions on
     # distinctly-sharded operands and each chain stays on its own axis.
-    @jax.jit
-    def _reshard_all(psi_rmu_band):
-        pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
-        if n_rmu_padded > n_rmu:
-            psi_rmu = jnp.pad(psi_rmu, pad_cfg)
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
-        psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
-        if n_rmu_padded > n_rmu:
-            psi_T = jnp.pad(psi_T, pad_cfg)
-        psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
-        psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
-        return psi_rmu, psi_rmuT
-
     # Attribution barrier: the process-local WfnLoader work above this line
     # does not synchronize processes, so the first collective inside
-    # ``_reshard_all`` absorbs ALL process skew accumulated since launch
+    # ``_reshard_centroid_tile`` absorbs ALL process skew accumulated since
+    # launch
     # (cold-start import/startup skew).  Measured: the identical
     # 606c/P=80 cell pair in job 7876541 recorded reshard = 92.6 s on
     # the allocation's first (cold) srun vs 0.55 s on the third run on
@@ -2281,27 +2780,8 @@ def load_centroids_band_chunked(
         _sync_barrier("load_centroids_pre_reshard")
 
     with timing.section("load_centroids.reshard"):
-        psi_rmu_all, psi_rmuT_all = _reshard_all(psi_rmu_band)
+        psi_rmu_all, psi_rmuT_all = _reshard_centroid_tile(psi_rmu_band)
         jax.block_until_ready(psi_rmuT_all)
     del psi_rmu_band
-
-    # Slice off the band pad rows added by ``loader.load``.  When
-    # ``nb_padded == nb_total`` this is a no-op slice that XLA folds away.
-    if nb_padded > nb_total:
-        psi_rmu_all = psi_rmu_all[:, :nb_total, :, :]
-        psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
-        psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
-        psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
     gc.collect()
-
-    # Zero user-band-pad rows (unchanged contract).
-    nb_user_in_range = max(0, meta.b_id_4_user - b_start)
-    if nb_user_in_range < nb_total:
-        zero_y = jnp.zeros_like(psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
-        zero_x = jnp.zeros_like(psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
-        psi_rmu_all = psi_rmu_all.at[
-            :, nb_user_in_range:nb_total, :, :].set(zero_y)
-        psi_rmuT_all = psi_rmuT_all.at[
-            :, :, nb_user_in_range:nb_total, :].set(zero_x)
-
-    return psi_rmu_all, psi_rmuT_all
+    return _finish_faces(psi_rmu_all, psi_rmuT_all)

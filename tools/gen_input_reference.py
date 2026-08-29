@@ -69,6 +69,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "band_chunk_size": ("ISDF / zeta", "Bands per chunk in the band-chunked FFT/pair-density loops."),
     "r_chunk_size": ("ISDF / zeta", "Real-space columns per zeta-fit chunk; 0 = auto from the memory model."),
     "memory_per_device_gb": ("ISDF / zeta", "Per-device memory budget for the chunk planners; 0 = auto-detect."),
+    "low_mem_bands": ("ISDF / zeta", "Two-face 2-D-sharded psi carrier (gw.wavefunction_bundle layout=\"face\": psi_nmu/psi_mun, both P(None,'x','y') at the (s,mu) GEMM seam) in place of the legacy four single-axis copies. 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py. Default false = layout=\"legacy\", bit-identical to every deck written before this key existed. Narrow envelope while consumers are ported one at a time; an unsupported combination (head_correction=full, qp_solver=self_consistent, mpa_material_class=metal, bispinor=true, explicit dense Gij) refuses by name rather than silently falling back to legacy."),
     # ---- Screening ----
     "do_screened": ("Screening", "Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it."),
     "screening_method": ("Screening", "chi0 frequency treatment (minimax quadrature is the only production method)."),
@@ -99,7 +100,11 @@ KEYS: dict[str, tuple[str, str]] = {
     "bgw_vcoul_sym_wfn": ("Screening", "Aux WFN supplying the full symmetry group to fold LORRAX q's onto BGW's IBZ q-list."),
     # ---- Sigma ----
     "compute_mode": ("Sigma", "Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags and never infers mpa. mpa is the multipole-W ansatz (the complex-pole fit of W): it parses today and REFUSES TO RUN today, naming itself, because its Sigma stage has not landed -- it is on the axis so that every mode-dispatch site in the tree has to handle it explicitly rather than absorbing it into a plasmon-pole branch. Spelled mpa rather than full_freq because every value on this axis names the ansatz, and full_freq names a family of them; see the ComputeMode docstring."),
-    "ppm_sigma_target_error": ("Sigma", "Target error of the PPM Sigma^c tau-quadrature."),
+    "ppm_sigma_target_error": (
+        "Sigma",
+        "Physical absolute kernel-error target for the PPM Sigma^c "
+        "tau-quadrature (Ry^-1); the dimensionless HGL crossing service "
+        "receives eps_hat = xi*eps_phys."),
     "ppm_sigma_max_nodes": ("Sigma", "Node-count cap for the PPM Sigma^c quadrature."),
     "sigma_omega_min_ev": ("Sigma", "Sigma(omega) grid lower edge (eV, relative to E_DFT)."),
     "sigma_omega_max_ev": ("Sigma", "Sigma(omega) grid upper edge (eV)."),

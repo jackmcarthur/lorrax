@@ -21,6 +21,7 @@ import pytest
 from lxkit.testing import hostile_extents
 
 from distrib_la._native2d import block_size_for
+from distrib_la._shape import ipiv_local_len
 
 
 def _mesh_shapes():
@@ -79,6 +80,20 @@ def test_a_prime_extent_on_a_real_mesh_refuses():
 def test_the_refusal_names_the_divisor_and_the_mesh():
     exc = pytest.raises(ValueError, block_size_for, 17, 2, 2).value
     assert "17" in str(exc) and "2x2" in str(exc) and "lcm(2,2)=2" in str(exc)
+
+
+@pytest.mark.parametrize(
+    "n,px,mb,want",
+    [(64, 1, 64, 128), (128, 2, 64, 128), (800, 4, 200, 400)],
+)
+def test_cusolvermp_pivot_extent_includes_the_required_extra_block(
+        n, px, mb, want):
+    """cuSOLVERMp Getrf/Getrs require ``LOCr(M_A) + MB_A`` pivots.
+
+    The production-shape row is the regression: the old ``LOCc(N)``
+    formula returned 200 instead of 400 on the 4x4, N=800 solve.
+    """
+    assert ipiv_local_len(n, px, mb) == want
 
 
 def test_dense_to_tiles_round_trips_on_the_lower_triangle():

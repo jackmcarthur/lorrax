@@ -24,9 +24,10 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop via ``symmetry_maps.unfold_isdf_operator`` (V_q)
-and the local :func:`_unfold_g0_ibz_to_full` (g0); the V_q output
-sharding ``P(None, 'x', 'y')`` matches.
+IBZ unfold runs post-loop through the symmetry service for both the bilinear
+``V_q`` and the one-leg literal-``G=0`` coefficient.  The latter must inspect
+the parent G table: a star operation can map a nonzero parent G onto the
+full-zone literal G=0.  The V_q output sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
@@ -284,7 +285,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
             # identity tail on the permutation (pad centroids map to
             # themselves), zero tail on the umklapp wrap (pad centroids
             # never wrap).  Consumers (``unfold_isdf_operator``,
-            # ``_unfold_g0_ibz_to_full``, gw_jax's W unfold) then
+            # ``unfold_isdf_one_leg``, gw_jax's W unfold) then
             # REQUIRE an exact extent match instead of each re-padding
             # per site — the too-small/too-large guards there replace a
             # silent ``promise_in_bounds`` OOB gather (the TRS-bug
@@ -312,14 +313,11 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
              for qy in range(nky) for qz in range(nkz)],
             dtype=np.int32)
 
-    # BGW wrap: q > kg/2 → q - kg.  Same convention the writer used
-    # when building the per-q gvec_components on disk.
-    kg_arr = np.asarray(kgrid, dtype=np.float64)
-    q_irr_wrapped = np.where(
-        q_irr_kgrid_int > kg_arr / 2,
-        q_irr_kgrid_int - kg_arr,
-        q_irr_kgrid_int).astype(np.float64)
-    q_irr_frac = q_irr_wrapped / kg_arr
+    # The symmetry service owns BGW's strict half-grid tie convention.
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import bgw_integer_q_to_fractional
+    q_irr_frac = bgw_integer_q_to_fractional(q_irr_kgrid_int, kgrid)
     result = (q_irr_kgrid_int, q_irr_frac,
               q_full_to_irr_idx, q_full_to_irr_sym,
               sym_perm, L_table, use_ibz)
@@ -368,7 +366,11 @@ def _compute_V_q_g_flat_one_tile(
     kgrid, fft_grid, mesh_xy,
     g_chunk: int | None,
     sym, centroid_indices,             # IBZ closure check is on the L centroids
+    is_charge_cc: bool,
     write_g0: bool,
+    one_leg_action: str,
+    qgrid_policy=None,
+    source_component: int | None = None,
     timing_label: str,
     verbose: bool,
 ) -> tuple[jax.Array, jax.Array | None]:
@@ -380,8 +382,10 @@ def _compute_V_q_g_flat_one_tile(
     buffer, and post-loop unfolds IBZ → full-BZ via the existing
     centroid double-permute (V_q is bilinear in ζ; no τ phase).
 
-    Returns ``(V_qmunu_full_BZ, g0_or_None)`` at the production
-    shardings ``P(None, 'x', 'y')`` and ``P(None, 'x')``.
+    Returns ``(V_qmunu_full_BZ, g0_or_None)``.  A scalar one-leg result is
+    sharded ``P(None, 'x')``.  Under the polar action an IBZ tile returns
+    this streamed source component's three target-channel contributions as
+    ``(3,n_q_full,n_mu)`` under ``P(None,None,'x')``.
     """
     same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
     # ``n_rmu_*`` is the logical centroid count for each side — read off the
@@ -401,7 +405,7 @@ def _compute_V_q_g_flat_one_tile(
 
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import unfold_isdf_operator
+    from symmetry_maps import unfold_isdf_one_leg, unfold_isdf_operator
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
@@ -411,6 +415,23 @@ def _compute_V_q_g_flat_one_tile(
         kgrid=kgrid, fft_grid=fft_grid,
         context=f"V_q g-flat tile [{timing_label}]")
     n_q_ibz = int(q_irr_frac.shape[0])
+
+    policy = qgrid_policy
+    unfold_sym = full_to_irr_sym
+    if use_ibz:
+        n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
+        if policy is None:
+            from .qgrid_symmetry import qgrid_trs_policy_for
+            policy = qgrid_trs_policy_for(
+                sym=sym, irr_idx_q=full_to_irr_idx,
+                sym_idx_q=full_to_irr_sym, kgrid=tuple(kgrid),
+                n_sym_spatial=n_sym_spatial,
+                context=f"V_q / one-leg [{timing_label}]")
+        unfold_sym = np.asarray(policy.unfold_sym_idx, dtype=np.int32)
+        if unfold_sym.shape != np.asarray(full_to_irr_sym).shape:
+            raise ValueError(
+                f"_compute_V_q_g_flat_one_tile[{timing_label}]: shared "
+                "QgridTrsPolicy has the wrong q extent.")
 
     gvec_components = np.asarray(
         zeta_L_loader.gvec_components, dtype=np.int32)
@@ -489,7 +510,11 @@ def _compute_V_q_g_flat_one_tile(
 
     kernel = _make_per_q_kernel(
         mesh_xy, n_rmu_L_padded, n_rmu_R_padded, ngkmax, g_chunk,
-        write_g0=write_g0, same_zeta=same_zeta)
+        # On an IBZ the literal full-zone G=0 may be a nonzero parent G;
+        # selecting disk slot zero inside this kernel is therefore unsafe.
+        # The service action below reads the exact parent slot while the
+        # same zeta slab is still resident.
+        write_g0=bool(write_g0 and not use_ibz), same_zeta=same_zeta)
 
     read_L = _make_read_all_ibz(zeta_L_loader, n_rmu_L_padded, mesh_xy)
     read_R = (read_L if same_zeta
@@ -562,6 +587,21 @@ def _compute_V_q_g_flat_one_tile(
             jax.block_until_ready(V_acc)
             print(f"    [{timing_label}] q={q}/{n_q_ibz}: "
                   f"kernel={_t.perf_counter() - _t1:.2f}s", flush=True)
+
+    if write_g0 and use_ibz:
+        g0_acc = unfold_isdf_one_leg(
+            zeta_L_all,
+            gvec_components=gvec_components,
+            sym=sym,
+            sym_idx=unfold_sym,
+            sym_perm=sym_perm,
+            L_table=L_table,
+            q_irr_frac=q_irr_frac,
+            kgrid=kgrid,
+            mesh_xy=mesh_xy,
+            component_action=one_leg_action,
+            source_component=source_component,
+        )
     del zeta_L_all
     if not same_zeta:
         del zeta_R_all
@@ -576,20 +616,13 @@ def _compute_V_q_g_flat_one_tile(
         # umklapp phase ``exp(2π i q_irr · (L_μ − L_ν))`` is essential
         # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-        unfold_sym = full_to_irr_sym
-        if timing_label == "CC":
+        if is_charge_cc:
             # TIME REVERSAL IS MEASURED, NEVER ASSUMED.  This block used to
             # compose q with −q through Θ and project the self-negative
             # rows unconditionally; on a ferromagnet that fabricates a
             # symmetry the density says is absent.  The policy object reads
             # ``sym.trs_allowed`` (the load-time spin-density verdict) and
             # this site no longer contains a TRS branch of its own.
-            from .qgrid_symmetry import qgrid_trs_policy_for
-            policy = qgrid_trs_policy_for(
-                sym=sym, irr_idx_q=full_to_irr_idx,
-                sym_idx_q=full_to_irr_sym, kgrid=tuple(kgrid),
-                n_sym_spatial=n_sym_spatial, context="V_q [CC]")
-            unfold_sym = policy.unfold_sym_idx
             # The point-group covariance the unfold below ASSUMES of the
             # finite ζ basis, measured on the stored parents while they are
             # still the pre-unfold wedge.  The q↔−q gate downstream is
@@ -618,7 +651,7 @@ def _compute_V_q_g_flat_one_tile(
         # compute path takes no restart decision and this line costs a list
         # check on every other run.  Only the CC tile is offered: the
         # bispinor CT/TT tiles are not restart tensors.
-        if timing_label == "CC":
+        if is_charge_cc:
             from .restart_q_storage import deposit_pre_unfold
             deposit_pre_unfold(
                 "V_qmunu", V_acc,
@@ -630,16 +663,13 @@ def _compute_V_q_g_flat_one_tile(
             V_acc, irr_idx=full_to_irr_idx, sym_idx=unfold_sym,
             sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
             mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
-        if write_g0:
-            g0_acc = _unfold_g0_ibz_to_full(
-                g0_acc, full_to_irr_idx=full_to_irr_idx,
-                full_to_irr_sym=unfold_sym,
-                sym_perm=sym_perm, mesh_xy=mesh_xy,
-                n_sym_spatial=n_sym_spatial)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
     if write_g0:
-        return V_qmunu, jax.lax.with_sharding_constraint(g0_acc, g0_sh)
+        g0_spec = (P(None, 'x') if int(g0_acc.ndim) == 2
+                   else P(None, None, 'x'))
+        return V_qmunu, jax.lax.with_sharding_constraint(
+            g0_acc, NamedSharding(mesh_xy, g0_spec))
     return V_qmunu, None
 
 
@@ -736,7 +766,9 @@ def compute_all_V_q_g_flat(
         mesh_xy=mesh_xy,
         g_chunk=g_chunk,
         sym=sym, centroid_indices=centroid_indices,
+        is_charge_cc=True,
         write_g0=True,
+        one_leg_action="scalar",
         timing_label='CC',
         verbose=verbose,
     )
@@ -776,16 +808,12 @@ def compute_head_channel_zeta(
     the same ζ slabs rather than a third output of the V_q hot loop — the
     default V_q path stays byte-for-byte and compile-for-compile unchanged.
 
-    THE MISSING TAU PHASE IS EXACT HERE, NOT AN APPROXIMATION.
-    ``_unfold_g0_ibz_to_full`` applies the centroid permutation and omits
-    the ``exp(-i (Sq + SG) . tau)`` phase, with a docstring noting that the
-    only historical consumer was Γ.  It is reused unchanged because every
-    term of ``P_q`` is ``conj(zeta(G_j)) * zeta(G_j)`` — the SAME column
-    conjugated against itself — so the phase cancels term by term, for any
-    G and any symmetry operation.  Under TRS the helper conjugates, and
-    ``P -> conj(P)``, which is the ``V_{-q} = conj(V_q)`` rule.  A tied set
-    maps onto a tied set under the little group (``|q+G|`` is invariant), so
-    the SUM over j is invariant under the relabelling the unfold induces.
+    Each selected source column is unfolded by
+    ``symmetry_maps.unfold_isdf_one_leg`` with its actual parent Miller
+    vector, including the centroid source gather, L phase, nonsymmorphic tau
+    phase and measured antiunitary convention.  A tied set maps onto a tied
+    set under the little group (``|q+G|`` is invariant), so the sum over
+    columns is independent of their image ordering.
     """
     from .compute_vcoul import compute_v_q_per_G  # bootstrap, see the CC path
     from vcoul import (CoulombGeometry, build_v_head_miniBZ_fn_3d, get_kernel,
@@ -841,6 +869,16 @@ def compute_head_channel_zeta(
     read_all = _make_read_all_ibz(zeta_loader, n_rmu_padded, mesh_xy)
     zeta_all = read_all(n_q_ibz)              # (n_q_ibz, mu_pad, ngkmax)
 
+    policy = None
+    if use_ibz:
+        from .qgrid_symmetry import qgrid_trs_policy_for
+        policy = qgrid_trs_policy_for(
+            sym=sym, irr_idx_q=full_to_irr_idx,
+            sym_idx_q=full_to_irr_sym, kgrid=tuple(kgrid),
+            n_sym_spatial=int(np.asarray(sym_perm).shape[0]) // 2,
+            context="head-channel one-leg")
+        from symmetry_maps import unfold_isdf_one_leg
+
     sel_dev = jnp.asarray(np.asarray(table.sel, dtype=np.int32))
     mask_dev = jnp.asarray(np.asarray(table.mask, dtype=np.float64),
                            dtype=jnp.complex128)
@@ -856,12 +894,23 @@ def compute_head_channel_zeta(
         col = col * mask_dev[:, j:j + 1]
         col = jax.lax.with_sharding_constraint(col, g0_sh)
         if use_ibz:
-            n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
-            col = _unfold_g0_ibz_to_full(
-                col, full_to_irr_idx=full_to_irr_idx,
-                full_to_irr_sym=full_to_irr_sym,
-                sym_perm=sym_perm, mesh_xy=mesh_xy,
-                n_sym_spatial=n_sym_spatial)
+            source_slot = np.broadcast_to(
+                np.asarray(table.sel[:, j], dtype=np.int32)[:, None, None],
+                (n_q_ibz, 3, 1))
+            source_g = np.take_along_axis(
+                gvec_components, source_slot, axis=2)[:, :, 0]
+            col = unfold_isdf_one_leg(
+                col,
+                source_gvec_components=source_g,
+                sym=sym,
+                sym_idx=policy.unfold_sym_idx,
+                sym_perm=sym_perm,
+                L_table=L_table,
+                q_irr_frac=q_irr_frac,
+                kgrid=kgrid,
+                mesh_xy=mesh_xy,
+                component_action="scalar",
+            )
         cols.append(jax.lax.with_sharding_constraint(col, g0_sh))
     del zeta_all
 
@@ -893,110 +942,3 @@ def compute_head_channel_zeta(
 __all__ = ["compute_all_V_q_g_flat", "_compute_V_q_g_flat_one_tile",
             "_resolve_ibz_q_list", "_pick_g_chunk", "_make_read_all_ibz",
             "compute_head_channel_zeta"]
-
-
-# Relocated from the deleted gw/v_q_tile.py (2026-07-02) — the only
-# survivor of the r-space tile subsystem; sole consumer is compute_all_V_q_g_flat.
-def _unfold_g0_ibz_to_full(
-    g0_ibz: jax.Array,
-    *,
-    full_to_irr_idx: np.ndarray,
-    full_to_irr_sym: np.ndarray,
-    sym_perm: np.ndarray,
-    mesh_xy: Mesh,
-    n_sym_spatial: int | None = None,
-) -> jax.Array:
-    """Expand ``g0_ibz (n_qpt_irr, μ)`` → ``(n_q_full, μ)``.
-
-    g0 transforms like a single ζ leg (not bilinear), so under {S | τ}:
-
-        g0_full[q, π_s(μ)] = e^{-i (Sq + 0)·τ_s} · g0_ibz[i(q), μ]
-
-    However, the **only** downstream use of g0 is the Γ slot (q=0),
-    where S = identity ⇒ no phase, no permutation.  For q ≠ Γ the
-    head-correction code in ``head_correction.py`` does not consume
-    ``g0_acc[q]``.  So we apply the centroid permutation (correct
-    structure) but omit the τ-phase (its effect is unobservable; the
-    Γ phase is exp(0) = 1 anyway).  If a future consumer needs the
-    correct phase, set ``include_tau_phase=True``.
-
-    TRS-augmented rows: g0 is a single ζ leg, so the TRS rule is a
-    plain conjugation: ``g0_{full}^{TRS-q, π_s(μ)} = conj(g0_{ibz}^{i(q), μ})``.
-    Pass ``n_sym_spatial=ntran`` along with a
-    ``centroid_source_map_and_wrap(..., extend_trs=True)`` table to enable
-    the conj branch.  Without ``n_sym_spatial``, no TRS conj is
-    applied; any TRS-augmented sym index in ``full_to_irr_sym`` then
-    hits the hard-fail guard below.
-    """
-    # Trivial-IBZ short-circuit (ntran=1, no centroid permutation, no
-    # μ-pad).  See ``unfold_isdf_operator`` for the rationale; we
-    # keep the same guard here so the no-op pass-through doesn't even
-    # dispatch a jit.
-    idx_np = np.asarray(full_to_irr_idx)
-    sym_np = np.asarray(full_to_irr_sym)
-    if (idx_np.shape[0] == int(g0_ibz.shape[0])
-            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
-            and np.all(sym_np == 0)
-            and int(g0_ibz.shape[-1]) == int(np.asarray(sym_perm).shape[-1])):
-        return g0_ibz
-
-    # TRS-aware bounds check, mirroring ``unfold_isdf_operator``.
-    n_sym_perm = int(np.asarray(sym_perm).shape[0])
-    max_sym = int(sym_np.max()) if sym_np.size else -1
-    if max_sym >= n_sym_perm:
-        raise ValueError(
-            f"_unfold_g0_ibz_to_full: full_to_irr_sym contains value "
-            f"{max_sym} (TRS-augmented row index) but sym_perm has only "
-            f"{n_sym_perm} rows.  Build sym_perm via "
-            f"``centroid_source_map_and_wrap(..., extend_trs=True)`` to "
-            f"cover the TRS-augmented half of ``sym_mats_k``, and pass "
-            f"``n_sym_spatial=ntran`` here.")
-    if n_sym_spatial is not None and int(n_sym_spatial) * 2 != n_sym_perm:
-        raise ValueError(
-            f"_unfold_g0_ibz_to_full: n_sym_spatial={n_sym_spatial} is "
-            f"inconsistent with sym_perm.shape[0]={n_sym_perm}.  "
-            f"sym_perm must have shape (2·n_sym_spatial, n_rmu).")
-
-    # The μ pad is baked into ``sym_perm`` at construction
-    # (``_resolve_ibz_q_list``); its identity tail argsorts to itself,
-    # so ``inv_perm`` needs no per-site pad-extension.  REQUIRE an
-    # exact extent match (both directions) — same rationale as
-    # ``unfold_isdf_operator``: a mismatch would feed the ``promise_in_bounds``
-    # gather below with out-of-range indices and clip silently.
-    inv_perm = np.argsort(sym_perm, axis=-1).astype(np.int32)
-    if int(g0_ibz.shape[-1]) != int(inv_perm.shape[-1]):
-        raise ValueError(
-            f"_unfold_g0_ibz_to_full: g0 μ-extent {int(g0_ibz.shape[-1])}"
-            f" != sym_perm extent {int(inv_perm.shape[-1])}.  Tables "
-            f"carry the μ pad from construction (_resolve_ibz_q_list); "
-            f"pass g0 at the same (padded) extent.")
-    full_to_irr_idx = np.asarray(full_to_irr_idx, dtype=np.int32)
-    full_to_irr_sym = np.asarray(full_to_irr_sym, dtype=np.int32)
-    inv_perm_j = jnp.asarray(inv_perm)
-    idx_j = jnp.asarray(full_to_irr_idx)
-    sym_j = jnp.asarray(full_to_irr_sym)
-
-    # TRS mask: same convention as ``unfold_isdf_operator``.
-    if n_sym_spatial is not None:
-        trs_mask_np = (sym_np >= int(n_sym_spatial))
-    else:
-        trs_mask_np = np.zeros(sym_np.shape, dtype=bool)
-    trs_mask_j = jnp.asarray(trs_mask_np)
-
-    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
-
-    @partial(jax.jit, out_shardings=g0_sh)
-    def _do_unfold(g0):
-        perm_q = inv_perm_j[sym_j]                                  # (n_q_full, n_rmu_padded)
-        g0_at_irr = g0[idx_j]                                       # (n_q_full, μ)
-        # ``mode='promise_in_bounds'`` to skip the take_along_axis
-        # OOB-fill helper that breaks under shard_map+x64; same fix
-        # as ``unfold_isdf_operator``.
-        g0_full = jnp.take_along_axis(
-            g0_at_irr, perm_q, axis=1, mode='promise_in_bounds')
-        # TRS rows: ζ-leg conjugation (g0 is a single ζ leg, not
-        # bilinear, so the TRS conj does NOT cancel — apply it).
-        g0_full = jnp.where(trs_mask_j[:, None], jnp.conj(g0_full), g0_full)
-        return g0_full
-
-    return _do_unfold(g0_ibz)

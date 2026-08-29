@@ -1,10 +1,17 @@
 import math
-from typing import Callable
+from typing import Callable, Literal
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map
+
+
+# Value-level parity contract for the canonical flat-k service.  This is the
+# registered Sigma-path class from ``docs/dev/flat_k_fft_service.md`` section
+# 7 and ``docs/architecture/ffi_layout.md`` section 7, not a bit-equality
+# promise between FFT engines.
+FLAT_K_FFT_VALUE_RTOL = 1.0e-12
 
 
 # =============================================================================
@@ -36,12 +43,15 @@ def query_fft_peak_bytes(
     input_shape: tuple[int, ...],
     fft_axes: tuple[int, ...],
     sharding: NamedSharding,
+    kind: Literal["fftn", "ifftn"],
+    norm: str | None,
     dtype=jnp.complex128,
 ) -> int:
-    """Per-rank peak HBM bytes of the production 3-D FFT at this shape.
+    """Per-rank peak HBM bytes of one production sharded 3-D FFT.
 
-    Compiles the SAME helper production uses — :func:`make_sharded_fftn_3d`,
-    a ``shard_map``'d device-local ``jnp.fft.fftn`` — at ``input_shape`` /
+    Compiles the SAME helper production uses —
+    :func:`make_sharded_fftn_3d` or :func:`make_sharded_ifftn_3d`, selected
+    by ``kind`` — with the production ``norm`` at ``input_shape`` /
     ``sharding``, then returns
     ``runtime.aot_memory.aot_kernel_peak_bytes(...).total``:
 
@@ -58,14 +68,31 @@ def query_fft_peak_bytes(
     parseable fft op — which would silently zero the cuFFT term — is reported
     rather than believed.
 
-    Caches by ``(input_shape, fft_axes, sharding.spec, dtype_str,
-    mesh_shape)``, so each unique FFT shape compiles once per process.
+    ``kind`` and ``norm`` are required rather than defaulted: normalization
+    can add a scale kernel and therefore change XLA's live buffers, while an
+    inverse FFT is a distinct production program even when cuFFT happens to
+    choose the same plan workspace.  A memory planner must name the transform
+    it is pricing instead of silently measuring a convenient forward FFT.
+
+    Caches by ``(input_shape, fft_axes, sharding.spec, kind, norm, dtype_str,
+    mesh platform/shape)``, so each unique production FFT program compiles
+    once per process.
     """
     from runtime.aot_memory import aot_kernel_peak_bytes, announce_once
 
+    if kind not in ("fftn", "ifftn"):
+        raise ValueError(
+            f"query_fft_peak_bytes: kind must be 'fftn' or 'ifftn'; "
+            f"got {kind!r}")
+    if norm not in (None, "backward", "ortho", "forward"):
+        raise ValueError(
+            "query_fft_peak_bytes: norm must be None, 'backward', 'ortho', "
+            f"or 'forward'; got {norm!r}")
+
     mesh = sharding.mesh
+    platform = mesh.devices.flat[0].platform
     key = (tuple(input_shape), tuple(fft_axes),
-           str(sharding.spec), jnp.dtype(dtype).str,
+           str(sharding.spec), kind, norm, jnp.dtype(dtype).str, platform,
            tuple(mesh.axis_names),
            tuple(int(mesh.shape[a]) for a in mesh.axis_names))
     hit = _fft_workspace_cache.get(key)
@@ -77,17 +104,18 @@ def query_fft_peak_bytes(
     # THE SAME FACTORY PRODUCTION USES.  Every real FFT box in the pipeline
     # (wfn_transforms._local_box_fft, the ζ writer's r→G FFT in
     # gw.isdf_fitting, the flat-k helpers below; zeta_loader's reader-side
-    # twin was deleted 2026-08-07) goes through
-    # make_sharded_*fftn_3d: one shard_map'd
-    # rank-3 ``jnp.fft.fftn`` per rank over its local shard, which XLA:GPU
-    # lowers to ONE cuFFT rank-3 plan.  Modelling the per-axis
+    # twin was deleted 2026-08-07) goes through make_sharded_*fftn_3d: one
+    # shard_map'd rank-3 jnp.fft transform per rank over its local shard,
+    # which XLA:GPU lowers to ONE cuFFT rank-3 plan.  Modelling the per-axis
     # ``make_jittable_local_fftn_3d`` form instead (as this function did
     # before) sizes three rank-1 plans that no production path ever builds.
-    local_fftn = make_sharded_fftn_3d(
-        mesh, sharding.spec, sharding.spec, axes=tuple(fft_axes), norm=None)
-    jit_fft = jax.jit(local_fftn, out_shardings=sharding)
+    factory = (make_sharded_ifftn_3d if kind == "ifftn"
+               else make_sharded_fftn_3d)
+    local_fft = factory(
+        mesh, sharding.spec, sharding.spec,
+        axes=tuple(fft_axes), norm=norm)
+    jit_fft = jax.jit(local_fft, out_shardings=sharding)
 
-    platform = mesh.devices.flat[0].platform
     on_gpu = platform in ("gpu", "cuda")
     try:
         lowered = jit_fft.lower(spec)
@@ -118,8 +146,9 @@ def query_fft_peak_bytes(
         fallback = 3 * total_elems * elem // max(1, n_devs)
         announce_once(
             f"fft-peak-compile-failed:{key}",
-            f"FFT peak query could NOT compile {tuple(input_shape)} "
-            f"{jnp.dtype(dtype).name} on spec {sharding.spec} "
+            f"FFT peak query could NOT compile {kind}(norm={norm!r}) for "
+            f"{tuple(input_shape)} {jnp.dtype(dtype).name} on spec "
+            f"{sharding.spec} "
             f"({type(exc).__name__}: {exc}).  Falling back to a 3×data "
             f"analytic bound ({fallback/1e9:.2f} GB/rank) that does NOT "
             f"include cuFFT plan workspace")
@@ -134,8 +163,9 @@ def query_fft_peak_bytes(
         # exact under-prediction this path exists to remove.
         announce_once(
             f"fft-peak-no-hlo-fft:{key}",
-            f"FFT peak query compiled {tuple(input_shape)} on a {platform!r} "
-            f"mesh but the optimized HLO exposes NO fft op.  On a CUDA mesh "
+            f"FFT peak query compiled {kind}(norm={norm!r}) for "
+            f"{tuple(input_shape)} on a {platform!r} mesh but the optimized "
+            f"HLO exposes NO fft op.  On a CUDA mesh "
             f"that silently zeroes the cuFFT plan-workspace term — XLA has "
             f"probably changed how it emits FFTs; see "
             f"runtime.aot_memory._FFT_OP_RE")

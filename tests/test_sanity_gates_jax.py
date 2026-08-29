@@ -465,6 +465,24 @@ def test_make_eqp_bgw_stored_array_matches_the_folded_route():
         f"  max|diff| = {np.max(np.abs(folded - stored)):.6f} eV")
 
 
+def test_make_eqp_authenticates_wfn_before_kin_ion_payload(tmp_path, monkeypatch):
+    from file_io import kin_ion as owner
+    from gw.eqp_bgw import make_eqp_bgw
+
+    d = _make_eqp_cli_inputs(str(tmp_path), stored=True)
+    events = []
+    validate = owner.authenticate_kin_ion_hartree_wfn_receipt
+    read = owner.read_full_bz_dataset
+    monkeypatch.setattr(owner, "authenticate_kin_ion_hartree_wfn_receipt",
+                        lambda *a, **k: (events.append("auth"),
+                                        validate(*a, **k))[1])
+    monkeypatch.setattr(owner, "read_full_bz_dataset",
+                        lambda *a, **k: (events.append("payload"),
+                                        read(*a, **k))[1])
+    make_eqp_bgw(d)
+    assert events[0] == "auth" and "payload" in events
+
+
 def test_make_eqp_bgw_stored_array_is_substituted_not_ignored():
     """The stored array must REPLACE sigma_mnk's ISDF column, not be a no-op.
 
@@ -532,6 +550,59 @@ def test_make_eqp_bgw_prefers_the_live_assembly_receipt(monkeypatch):
 
     # kin_ion=-300 eV and correlation=0, so this is the exact assembly.
     assert np.array_equal(got, -300.0 + h_live + x_live)
+
+
+@pytest.mark.parametrize("selected_source,component_aware", [
+    ("isdf", False), ("gspace", True),
+])
+def test_make_eqp_authenticates_explicit_live_source_over_stored_offer(
+        selected_source, component_aware):
+    """Selected source wins; gspace v4 carries H_T without stored H_T."""
+    from file_io.sigma_output import (
+        append_eqp_assembly_receipt_h5, write_sigma_omega_h5)
+    from gw.eqp_bgw import assemble_eqp, make_eqp_bgw
+
+    with tempfile.TemporaryDirectory() as d:
+        _make_eqp_cli_inputs(d, stored=True)
+        scalar = np.full((2, 4), 280.0)
+        transverse = (np.tile([1.0, -1.0, 1.0, -1.0], (2, 1))
+                      if component_aware else None)
+        h_live = scalar if transverse is None else scalar + transverse
+        with h5py.File(os.path.join(d, "sigma_mnk.h5"), "r") as h5:
+            omega = np.asarray(h5["omega_ev"])
+        if component_aware:
+            shape = (2, 6, 6)
+            raw_scalar = np.zeros(shape, dtype=np.complex128)
+            raw_transverse = np.zeros_like(raw_scalar)
+            write_sigma_omega_h5(
+                os.path.join(d, "sigma_mnk.h5"), omega,
+                sigma_c_kij_ev=np.zeros((omega.size,) + shape),
+                sigma_sx_kij_ev=np.zeros(shape),
+                hartree_kij_ev=raw_scalar + raw_transverse,
+                hartree_scalar_kij_ev=raw_scalar,
+                hartree_transverse_kij_ev=raw_transverse)
+        component_kwargs = ({} if transverse is None else {
+            "hartree_scalar_diag_ev": scalar,
+            "hartree_transverse_diag_ev": transverse,
+        })
+        assembly = assemble_eqp(
+            kpoints_irr_frac=np.zeros((2, 3)), band_offset=1,
+            e_dft_ev=np.zeros((2, 4)), kin_ion_diag_ev=np.zeros((2, 4)),
+            hartree_diag_ev=h_live, sigma_x_diag_ev=np.zeros_like(h_live),
+            sigma_c_omega_diag_ev=np.zeros((omega.size, 2, 4)),
+            omega_rel_ev=omega, e_dft_rel_ev=np.zeros((2, 4)),
+            hartree_source=selected_source, hartree_already_resolved=True,
+            mean_field_gate=False, print_fn=lambda *_: None,
+            **component_kwargs)
+        append_eqp_assembly_receipt_h5(
+            os.path.join(d, "sigma_mnk.h5"), assembly=assembly,
+            file_wedge_full_bz_rows=np.arange(2),
+            degeneracy_policy="bgw_average", degeneracy_tol_ry=1.0e-6)
+        make_eqp_bgw(d)
+        got = _read_eqp_qp_column(
+            os.path.join(d, "eqp0.dat")).reshape(2, 4)
+
+    assert np.array_equal(got, -300.0 + h_live)
 
 
 def test_make_eqp_bgw_refuses_shape_compatible_receipt_row_permutation():
@@ -892,6 +963,58 @@ def test_valence_density_nocc_none_matches_the_sliced_form():
     d = valence_density_from_kpoint(box[2:], nocc=None, weight=0.25,
                                     cell_volume=13.0, spin_degeneracy=2.0)
     assert float(jnp.abs(a - (c + d)).max()) < 1e-13 * float(jnp.abs(a).max())
+
+
+def test_fractional_weights_apply_identically_to_charge_and_dirac_current():
+    """One signed f_nk operand weights rho and every J=psi^dag alpha psi."""
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
+    rng = np.random.default_rng(20260825)
+    box = (rng.standard_normal((3, 4, 3, 4, 5))
+           + 1j * rng.standard_normal((3, 4, 3, 4, 5)))
+    box = jnp.asarray(box, dtype=jnp.complex128)
+    occupations = np.asarray([0.75, 0.30, -0.05], dtype=np.float64)
+    kwargs = dict(nocc=None, weight=0.25, cell_volume=17.0,
+                  spin_degeneracy=1.0, include_dirac_current=True)
+    got = np.asarray(valence_density_from_kpoint(
+        box, band_occupations=occupations, **kwargs))
+    expected = sum(
+        occupations[ib] * np.asarray(valence_density_from_kpoint(
+            box[ib:ib + 1], **kwargs))
+        for ib in range(occupations.size))
+    scale = max(float(np.max(np.abs(expected))), 1.0)
+    assert got.shape[0] == 4
+    assert float(np.max(np.abs(got - expected))) < 2.0e-13 * scale
+
+
+def test_pauli_reference_removes_only_small_component_charge():
+    """The comparison changes j0/electron count, never raw4 spatial J."""
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
+    rng = np.random.default_rng(20260826)
+    upper = (rng.standard_normal((1, 2, 3, 4, 5))
+             + 1j * rng.standard_normal((1, 2, 3, 4, 5)))
+    upper /= np.linalg.norm(upper)
+    lower = 0.02 * (
+        rng.standard_normal((1, 2, 3, 4, 5))
+        + 1j * rng.standard_normal((1, 2, 3, 4, 5)))
+    box4 = jnp.asarray(np.concatenate((upper, lower), axis=1),
+                       dtype=jnp.complex128)
+    kwargs = dict(nocc=None, weight=1.0, cell_volume=17.0,
+                  spin_degeneracy=1.0, include_dirac_current=True)
+    raw4 = np.asarray(valence_density_from_kpoint(box4, **kwargs))
+    split = np.asarray(valence_density_from_kpoint(
+        box4, charge_nspinor=2, **kwargs))
+    pauli2 = np.asarray(valence_density_from_kpoint(
+        box4[:, :2], nocc=None, weight=1.0, cell_volume=17.0,
+        spin_degeneracy=1.0))
+
+    # IFFT normalization gives integral rho = reciprocal-space norm.
+    dvol = 17.0 / float(np.prod(box4.shape[-3:]))
+    assert abs(float(split[0].sum()) * dvol - 1.0) < 2.0e-13
+    expected_excess = float(np.vdot(lower, lower).real)
+    assert abs(float((raw4[0] - split[0]).sum()) * dvol
+               - expected_excess) < 2.0e-13
+    assert np.array_equal(split[0], pauli2)
+    assert np.array_equal(split[1:], raw4[1:])
 
 
 def test_collective_helpers_are_the_identity_at_P1():

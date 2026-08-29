@@ -1,29 +1,85 @@
-"""Opt-in reduced cross-k Galerkin model-order contract.
-
-The historical htransform carries the full numerical rank and remains the
-default.  These cells pin the distinct approximation requested by the input
-key: rank proportional to bands at one k, followed by a per-k polar factor so
-``build_fH_R`` keeps its row-isometry invariant.
-"""
+"""Published whole-state randomized-QRCP htransform contract."""
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 
+def test_whole_state_workspace_must_fit_the_bfc_reserve(monkeypatch):
+    """An aggregate-safe FFT still refuses when its arena cannot be placed."""
+    pytest.importorskip("jax")
+    from isdf import galerkin
+
+    def _ledger(**kwargs):
+        del kwargs
+        return {
+            "HWM": 700.0,
+            "WFN_RCHUNK_TRANSFORM": 650.0,
+            "WFN_RCHUNK_COMPILED": 450.0,
+            "WFN_CUFFT_WORKSPACE": 200.0,
+            "Q_TILE_LOCAL": 10.0,
+            "r_chunk_carrier": 16.0,
+        }
+
+    monkeypatch.setattr(galerkin, "_whole_state_memory_ledger", _ledger)
+    mesh = SimpleNamespace(size=16, shape={"x": 4, "y": 4})
+    kwargs = dict(
+        meta=object(), mesh_xy=mesh, nk=2, nspinor=2, ngkmax=8,
+        band_carrier=64, state_count=32, search_rank=4,
+        candidate_carrier=8, requested_q_tile_budget=512,
+        device_pool_limit=1000.0, log_fn=lambda *args: None)
+
+    # spinor width 2 owns the public 0.85 target: HWM 700 < 850, but the
+    # independently allocated workspace 200 is larger than its 150 reserve.
+    with pytest.raises(MemoryError, match="contiguous BFC reserve"):
+        galerkin._resolve_whole_state_stream_budget(**kwargs)
+
+    safe = dict(kwargs, device_pool_limit=1400.0)
+    _, ledger = galerkin._resolve_whole_state_stream_budget(**safe)
+    assert ledger["WFN_CUFFT_WORKSPACE"] == 200.0
+
+
+def test_wfn_rchunk_integer_peak_api_is_the_cached_breakdown_view(monkeypatch):
+    """Existing callers retain the integer-total API without another compile."""
+    pytest.importorskip("jax")
+    from common import wfn_transforms
+
+    planning_src = inspect.getsource(
+        wfn_transforms.gflat_to_rchunk_aot_memory)
+    assert "not memory.cufft_measured" in planning_src
+    assert "known-low memory preflight" in planning_src
+
+    calls = []
+
+    def _memory(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(total=1234)
+
+    monkeypatch.setattr(
+        wfn_transforms, "gflat_to_rchunk_aot_memory", _memory)
+    got = wfn_transforms.gflat_to_rchunk_aot_peak_bytes(
+        mesh=object(), nk=1, band_carrier=1, nspinor=1, ngkmax=1,
+        fft_grid=(1, 1, 1), r_carrier=1, norm="ortho")
+    assert got == 1234
+    assert len(calls) == 1
+
+
 def test_rank_multiplier_vocabulary_and_default():
     pytest.importorskip("jax")
-    from bandstructure.htransform import resolve_galerkin_rank_multiplier
+    from isdf.galerkin import validate_rank_multiplier
     from gw.gw_config import _DEFAULTS
 
-    assert _DEFAULTS["htransform_rank_multiplier"] == 0.0
-    assert resolve_galerkin_rank_multiplier(0) == 0.0
-    assert resolve_galerkin_rank_multiplier("10") == 10.0
+    assert _DEFAULTS["htransform_rank_multiplier"] == 20.0
+    assert validate_rank_multiplier(0, name="htransform_rank_multiplier") == 20.0
+    assert validate_rank_multiplier(
+        "10", name="htransform_rank_multiplier") == 10.0
     for bad in (-1, 0.5, float("nan"), "not-a-number"):
         with pytest.raises(ValueError, match="htransform_rank_multiplier"):
-            resolve_galerkin_rank_multiplier(bad)
+            validate_rank_multiplier(bad, name="htransform_rank_multiplier")
 
 
 def test_downfold_centroid_subset_is_ordered_strict_and_checked():
@@ -36,43 +92,74 @@ def test_downfold_centroid_subset_is_ordered_strict_and_checked():
             validate_centroid_subset_idx(np.asarray(bad), 10)
 
 
-def test_lowdin_restores_every_k_row_isometry_and_red_twin_is_nonorthogonal():
+def test_newton_inverse_reports_the_archived_residual_contract():
     pytest.importorskip("jax")
     import jax.numpy as jnp
-    from bandstructure.htransform import _lowdin_orthonormalize_band_rows
+    from bandstructure.htransform import (
+        NEWTON_RESIDUAL_MAX,
+        fun,
+        newton_inv,
+        require_newton_converged,
+    )
 
-    rng = np.random.default_rng(20260820)
-    nk, nb, rank = 5, 6, 40
-    c = (rng.standard_normal((nk, nb, rank))
-         + 1j * rng.standard_normal((nk, nb, rank)))
-    # Plant a well-conditioned but visibly non-isometric shared-span block.
-    c[:, 0] *= 0.35
-    gram_before = np.einsum("kna,kma->knm", c, np.conj(c), optimize=True)
-    before = float(np.max(np.abs(gram_before - np.eye(nb)[None])))
-    assert before > 1.0, "RED TWIN DID NOT GO RED: input was accidentally isometric"
+    a, n, shift = 0.8, 3.0, 1.25
+    expected = jnp.asarray([-1.6, -0.4, 0.2, 1.0], dtype=jnp.float64)
+    recovered, residual = newton_inv(
+        a, n, shift, fun(a, n, shift, expected))
+    assert np.max(np.abs(np.asarray(recovered) - np.asarray(expected))) < 1e-11
+    assert float(residual) <= NEWTON_RESIDUAL_MAX
+    require_newton_converged(float(residual), where="unit receipt")
+    with pytest.raises(ValueError, match="did not converge"):
+        require_newton_converged(
+            2.0 * NEWTON_RESIDUAL_MAX, where="red receipt")
 
-    out, lmin, lmax, before_dev, after_dev, move = (
-        _lowdin_orthonormalize_band_rows(jnp.asarray(c)))
-    out = np.asarray(out)
-    gram_after = np.einsum("kna,kma->knm", out, np.conj(out), optimize=True)
-    assert np.max(np.abs(gram_after - np.eye(nb)[None])) < 2.0e-13
-    assert float(after_dev) < 2.0e-13
-    assert float(before_dev) == pytest.approx(before, rel=2.0e-13)
-    assert 0.0 < float(lmin) <= float(lmax)
-    assert float(move) > 0.01
+    inverse_src = inspect.getsource(newton_inv)
+    assert "lax.while_loop" in inverse_src
+    assert "lax.fori_loop" not in inverse_src
 
 
-def test_reduced_policy_is_opt_in_and_refit_is_refused():
+def test_standalone_htransform_refuses_an_occupied_band_cut(monkeypatch):
     pytest.importorskip("jax")
-    from bandstructure import htransform as ht
+    from types import SimpleNamespace
+    import file_io.centroids
+    from bandstructure import htransform
 
-    sig = inspect.signature(ht.streaming_galerkin_solve)
-    assert sig.parameters["rank_multiplier"].default == 0.0
-    src = inspect.getsource(ht.streaming_galerkin_solve)
-    assert "if rank_multiplier > 0.0 and return_full_proj" in src
-    assert "rank_multiplier=params.get" in inspect.getsource(ht.initialize_wfns)
-    # The default must not be routed through the approximate polar factor.
-    assert "if rank_multiplier > 0.0:" in src
+    monkeypatch.setattr(
+        htransform, "setup_wfn_and_sym",
+        lambda *args, **kwargs: (SimpleNamespace(nelec=12), object()))
+
+    def _centroids_were_reached(*args, **kwargs):
+        raise RuntimeError("centroid stage reached")
+
+    monkeypatch.setattr(
+        file_io.centroids, "load_centroids",
+        _centroids_were_reached)
+    params = {"wfn_file": "unused.h5", "nval": 11, "ncond": 2, "nband": 13}
+    with pytest.raises(ValueError, match="requires every occupied band"):
+        htransform.initialize_wfns(
+            "unused.in", params, lambda *args: None, mesh_xy=object(),
+            require_all_occupied=True)
+
+    # Internal BSE windows deliberately keep their explicit partial-window
+    # contract, so the same setup reaches the next stage when the standalone
+    # gate is absent.
+    with pytest.raises(RuntimeError, match="centroid stage reached"):
+        htransform.initialize_wfns(
+            "unused.in", params, lambda *args: None, mesh_xy=object())
+
+
+def test_refit_consumes_the_compact_whole_state_factor():
+    pytest.importorskip("jax")
+    from isdf import galerkin
+    root = Path(__file__).resolve().parents[1] / "src"
+    src = (root / "bandstructure" / "htransform.py").read_text()
+    fit_src = inspect.getsource(galerkin.fit_galerkin_basis)
+    assert "return_full_proj" not in src
+    assert "include_projector" not in fit_src
+    assert "selector_projector" not in fit_src
+    assert "rank_multiplier=params.get" in src
+    assert "selected_state_indices" in fit_src
+    assert "selection_factor=L" in fit_src
 
 
 def test_bse_consumers_forward_the_q_chunk_key():
@@ -84,7 +171,25 @@ def test_bse_consumers_forward_the_q_chunk_key():
         src = (root / name).read_text()
         assert 'batch_size=int(params.get("wfn_fi_q_chunk", 0))' in src, name
         assert "centroid_subset_idx=_fit_subset" in src, name
-        assert "_output_keep = None if _fit_subset is not None" in src, name
+        assert "_fit_subset = keep" in src, name
+        assert "centroid_keep_idx" not in src, name
+
+    refit_src = (root / "vq_interp.py").read_text()
+    assert "centroid_subset_idx=keep_idx" in refit_src
+    assert "B_at_mu = B_at_mu[:, :," not in refit_src
+
+
+def test_kpath_inverts_only_physical_states_and_publishes_return_window():
+    """The rank-space null carrier is not a physical band window."""
+    root = Path(__file__).resolve().parents[1] / "src"
+    src = (root / "bandstructure" / "htransform.py").read_text()
+    fft_src = (root / "common" / "fft_helpers.py").read_text()
+
+    assert "[:nq, :states]" in src
+    assert "energies_on_path = energies_sorted_jax" in src
+    assert "jax.vmap(\n                lambda row: newton_inv" not in src
+    assert "FLAT_K_FFT_VALUE_RTOL = 1.0e-12" in fft_src
+    assert "fft_rel > FLAT_K_FFT_VALUE_RTOL" in src
 
 
 def test_exciton_a_band_reaches_both_htransform_calls():
