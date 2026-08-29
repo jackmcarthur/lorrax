@@ -216,6 +216,7 @@ _RECIPROCAL_FIT_NAMES = (
     "ReciprocalMeasureProblem", "ComplexTimeRule",
     "evaluate_rule", "delivered_error", "rule_amplification",
     "solve_fixed_time_weights",
+    "solve_fixed_time_weights_fast",
 )
 _TIME_NODE_SEARCH_NAMES = (
     "ComplexTimeSearchOptions", "support_arc",
