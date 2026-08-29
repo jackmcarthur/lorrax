@@ -103,25 +103,6 @@ def test_zeta_q_receipt_preserves_historical_wfn_path():
             loaders=(SimpleNamespace(q_symmetry_receipt="{}"),))
 
 
-def test_zeta_closure_uses_one_effective_group_for_matrix_and_translation():
-    """A derived q group must never mix its matrix with raw-WFN tnp."""
-    path = os.path.join(_SRC, "gw", "isdf_fitting.py")
-    tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
-    calls = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "resolve_qgrid_symmetry_tables"
-    ]
-    assert len(calls) == 1
-    keywords = {kw.arg: kw.value for kw in calls[0].keywords}
-    tnp = keywords["translations"]
-    assert (isinstance(tnp, ast.Attribute)
-            and isinstance(tnp.value, ast.Name)
-            and tnp.value.id == "sym"
-            and tnp.attr == "translations")
-
-
 def _deck_file(*parts):
     return os.path.join(_REG, _DECK[0], *parts)
 

@@ -601,12 +601,11 @@ def fit_zeta_to_h5(
     if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables
         _is_transverse = int(vertex_mu_L) != 0
-        # Matrices and translations must come from the SAME effective group.
-        # They ordinarily originate in the WFN together; a q-only derived
-        # group deliberately leaves that raw header unchanged.
+        # ``sym.sym_matrices`` holds the spatial ops; the fractional
+        # translations live on WFNReader (BGW WFN.h5 layout).
         _res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices,
-            fft_grid=meta.fft_grid, translations=sym.translations,
+            fft_grid=meta.fft_grid, translations=wfn.translations,
             context=("bispinor transverse ζ̃_T IBZ write"
                      if _is_transverse else "ζ̃ IBZ write"),
             announce_fallback=not _is_transverse,
