@@ -204,6 +204,7 @@ def test_isdf_header_round_trip(tmp_path):
         fft_grid=(16, 16, 16),
         density='scalar',
         vertex_mu_L=0,
+        q_symmetry_receipt='{"schema":1,"source":"test"}',
     )
     # Need a destination file to attach the header to.
     with h5py.File(out_path, 'w') as _:
@@ -217,6 +218,7 @@ def test_isdf_header_round_trip(tmp_path):
     np.testing.assert_array_equal(rd.r_mu_fft_idx, r_mu_fft_idx)
     np.testing.assert_array_equal(
         rd.r_mu_crystal, r_mu_fft_idx.astype(np.float64) / 16.0)
+    assert rd.q_symmetry_receipt == '{"schema":1,"source":"test"}'
 
 
 def test_isdf_header_current_label(tmp_path):

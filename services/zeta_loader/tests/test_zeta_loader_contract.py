@@ -26,12 +26,15 @@ WHAT THIS FILE PINS THAT NOTHING PINNED BEFORE
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import sys
 
 import numpy as np
 import pytest
+import h5py
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 if _TESTS not in sys.path:                          # bare-checkout / CLI runs
@@ -513,6 +516,7 @@ _BOUND_ISDF = (
     "density", "vertex_mu_L", "r_mu_fft_idx", "r_mu_crystal", "n_rmu",
     "zeta_is_done", "zeta_layout", "gvec_components", "ngk_per_q",
     "ngkmax_zeta", "zeta_cutoff_ry", "fit_provenance",
+    "q_symmetry_receipt",
 )
 #: Derived in ``__init__`` (or a property), not bound: these are the loader's
 #: OWN statements about the file and are consumed by ``vq_interp.py:213``
@@ -559,12 +563,36 @@ def test_the_header_surface_production_consumes_is_pinned(tmp_path):
         assert int(zl.ngkmax_zeta) == 4
         assert float(zl.zeta_cutoff_ry) == 10.0
         assert zl.zeta_is_done is True
+        assert zl.q_symmetry_receipt is None
         # Derived.
         assert zl.n_q_on_disk == 2 and zl.n_rmu_disk == 3
         assert zl.n_G_sph_disk == 4 and zl.n_rtot_disk == 512
         assert zl.n_q_full == 8                # prod(kgrid=(2,2,2))
         assert zl.q_layout == "ibz"            # 2 on disk != 8 full
         assert zl.n_rtot == 512
+
+
+def test_effective_q_receipt_is_bound_to_fit_provenance(tmp_path):
+    _needs_host_tree()
+    receipt = '{"schema":1,"source":"test-inversion"}'
+    digest = hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+    provenance = json.dumps({"q_symmetry_sha256": digest})
+    path, _p = Z.build_gflat(
+        tmp_path / "z.h5", n_q=2, n_rmu=3, ngkmax=4,
+        fit_provenance=provenance)
+    with h5py.File(path, "a") as handle:
+        handle["isdf_header"].create_dataset(
+            "q_symmetry_receipt", data=np.bytes_(receipt))
+    with ZetaLoader(path) as loader:
+        assert loader.q_symmetry_receipt == receipt
+
+    with h5py.File(path, "a") as handle:
+        del handle["isdf_header/fit_provenance"]
+        handle["isdf_header"].create_dataset(
+            "fit_provenance",
+            data=np.bytes_(json.dumps({"q_symmetry_sha256": "0" * 64})))
+    with pytest.raises(ValueError, match="does not match fit_provenance"):
+        ZetaLoader(path)
 
 
 def test_the_pin_covers_everything_the_binders_actually_bind(tmp_path):

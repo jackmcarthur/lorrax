@@ -69,6 +69,8 @@ imports become declared package dependencies and these helpers go.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Sequence
@@ -230,6 +232,24 @@ class ZetaLoader:
                 f"and re-run the fit (restart=false), or point at a complete "
                 f"ζ.  Set LORRAX_ALLOW_PARTIAL_ZETA=1 to override for "
                 f"debugging.")
+        if mode == "r" and bool(self.zeta_is_done) \
+                and self.q_symmetry_receipt is not None:
+            try:
+                provenance = json.loads(self.fit_provenance or "")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"{self._path} carries an effective q-symmetry receipt "
+                    "but no parseable fit_provenance tying the fit to it.") \
+                    from exc
+            measured = hashlib.sha256(
+                self.q_symmetry_receipt.encode("utf-8")).hexdigest()
+            expected = provenance.get("q_symmetry_sha256")
+            if expected != measured:
+                raise ValueError(
+                    f"{self._path} effective q-symmetry receipt digest "
+                    f"{measured} does not match fit_provenance "
+                    f"q_symmetry_sha256={expected!r}; refusing mismatched "
+                    "q rows/tables.")
         # Header-vs-dataset agreement.  The two are written by different
         # calls (``write_isdf_header`` then the SlabIO append); a crash
         # between them, or a stale header surviving a rewrite, leaves a

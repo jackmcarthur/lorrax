@@ -183,7 +183,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
                          write_ibz_only, band_norms, vertex_mu_L=0,
                          carrier_bispinor=None, carrier_lift=None,
-                         transverse_identity=None):
+                         transverse_identity=None, sym=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -399,6 +399,17 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	# Pauli-reference stamps remain byte-for-byte reusable.
 	if carrier_lift is not None:
 		prov['bispinor_lift'] = str(carrier_lift)
+	# Effective q symmetry is deliberately separate from ``mf_header`` (which
+	# continues to identify the raw WFN k rows).  Default WFN-derived symmetry
+	# writes no extra key, preserving existing provenance bytes and reuse.  A
+	# q-only group adds its canonical service receipt digest, so it can never
+	# reuse an identity-q artifact or one produced by different q tables.
+	if sym is not None and getattr(sym, 'q_symmetry_source', 'wfn') != 'wfn':
+		import hashlib
+		from symmetry_maps import q_symmetry_receipt_json
+		_q_receipt = q_symmetry_receipt_json(sym)
+		prov['q_symmetry_sha256'] = hashlib.sha256(
+			_q_receipt.encode('utf-8')).hexdigest()
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
 	# every transverse fit retain their byte-identical schema-1 provenance;
 	# an old asymmetric LR-only stamp lacks this non-legacy key and therefore
@@ -1467,7 +1478,7 @@ def _resolve_zeta_fit_contract(
 		band_norms=band_norms,
 		carrier_bispinor=bool(int(meta.nspinor) == 4),
 		carrier_lift=_normalized_charge_lift,
-		vertex_mu_L=0, transverse_identity=transverse_identity)
+		vertex_mu_L=0, transverse_identity=transverse_identity, sym=sym)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
 			wfn=wfn, meta=meta_transverse, cfg=cfg,
@@ -1479,7 +1490,8 @@ def _resolve_zeta_fit_contract(
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
 			carrier_lift=_normalized_current_lift,
-			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
+			vertex_mu_L=mu_L, transverse_identity=transverse_identity,
+			sym=sym)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
 	reuse_charge = _zeta_reuse_ok(
@@ -2706,6 +2718,9 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 			                ) as zt2, \
 			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
 			                ) as zt3:
+				from .qgrid_symmetry import require_zeta_q_symmetry
+				require_zeta_q_symmetry(
+					sym=sym, loaders=(zc, zt1, zt2, zt3))
 				with mesh_xy:
 					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
 						zeta_C_loader=zc,
@@ -2800,6 +2815,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
 			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
 			                ) as zeta_io:
+				from .qgrid_symmetry import require_zeta_q_symmetry
+				require_zeta_q_symmetry(sym=sym, loaders=(zeta_io,))
 				_cent_idx_np = (
 					np.asarray(jax.device_get(centroid_indices),
 					           dtype=np.int32)

@@ -1133,6 +1133,14 @@ def fit_zeta_to_h5(
         vertex_mu_L=int(vertex_mu_L),
         zeta_layout='G_flat',
     )
+    # A q-only effective group must not be written into ``mf_header``: that
+    # header describes the raw WFN k rows and is copied verbatim above.  Its
+    # exact q tables instead travel as an optional service-owned receipt.
+    # Ordinary WFN-derived symmetry omits the field, preserving historical
+    # files byte-for-byte.
+    if getattr(sym, 'q_symmetry_source', 'wfn') != 'wfn':
+        from symmetry_maps import q_symmetry_receipt_json
+        _hdr_kwargs['q_symmetry_receipt'] = q_symmetry_receipt_json(sym)
     if _gflat_gvec_components is None:
         raise ValueError(
             "G-flat ζ writer requires a ζ sphere — pass "
