@@ -242,6 +242,16 @@ def solve_fixed_time_weights(
     log_peak = np.max(exponent.real, axis=0)
     atoms = np.exp(exponent - log_peak[None, :])
     gauge = np.exp(-log_peak)
+    # The raw atom columns are numerically near-collinear with entries
+    # spanning tens of orders of magnitude; HiGHS loses its basis
+    # factorization on them at any row scaling (dual simplex ends "Not
+    # Set", IPM ends "Unknown").  The LP therefore works in the
+    # orthonormal column basis of a thin QR, and the triangular map back
+    # to atom coefficients happens only after the solve.
+    if n_kept >= nodes.size:
+        basis, triangular = np.linalg.qr(atoms)
+    else:
+        basis, triangular = atoms, np.eye(nodes.size)
     truth = 1.0 / d_flat
     row_scale = (problem.cell_masses[keep_j] / delivered[keep_i]
                  * float(objective_scale))
@@ -253,7 +263,7 @@ def solve_fixed_time_weights(
     rows, cols, values, rhs = [], [], [], []
     row = 0
     for direction in directions:
-        turned = direction * atoms * row_scale[:, None]
+        turned = direction * basis * row_scale[:, None]
         sample = np.arange(n_kept)
         rows.append(np.repeat(row + sample, n_nodes))
         cols.append(np.tile(np.arange(n_nodes), n_kept))
@@ -287,17 +297,25 @@ def solve_fixed_time_weights(
     equality = None
     equality_rhs = None
     if problem.zero_weight_sum:
-        real_row = np.concatenate([gauge.real, -gauge.imag, np.zeros(n_kept + 1)])
-        imag_row = np.concatenate([gauge.imag, gauge.real, np.zeros(n_kept + 1)])
+        # sum(weights) in the rotated variables: gauge @ inv(R) y.
+        mapped = np.linalg.solve(triangular.T, gauge.astype(np.complex128))
+        real_row = np.concatenate([mapped.real, -mapped.imag, np.zeros(n_kept + 1)])
+        imag_row = np.concatenate([mapped.imag, mapped.real, np.zeros(n_kept + 1)])
         equality = np.vstack([real_row, imag_row])
         equality_rhs = np.zeros(2)
 
+    # The default 1e-7 feasibility tolerances are absolute in the scaled
+    # units; per-cell slack then hides any optimum below roughly
+    # n_cells * 1e-7 / objective_scale (observed as "optimal" T = 0).
+    tolerances = {"primal_feasibility_tolerance": 1.0e-9,
+                  "dual_feasibility_tolerance": 1.0e-9}
     cost = np.zeros(n_var)
     cost[-1] = 1.0
     bounds = ([(None, None)] * (2 * n_nodes)
               + [(0.0, None)] * n_kept + [(0.0, None)])
     first = linprog(cost, A_ub=inequality, b_ub=upper, A_eq=equality,
-                    b_eq=equality_rhs, bounds=bounds, method="highs")
+                    b_eq=equality_rhs, bounds=bounds, method="highs",
+                    options=tolerances)
     if not first.success:
         raise RuntimeError(
             f"weight solve failed for {n_nodes} nodes over {n_kept} cells: "
@@ -313,15 +331,19 @@ def solve_fixed_time_weights(
         pinned = float(objective) * (1.0 + float(conditioning_slack)) + 1.0e-30
         n_var2 = n_var + n_nodes
         sample = np.arange(n_nodes)
+        # a = inv(R) y, so the envelope rows are dense in y.
+        inverse_map = np.linalg.inv(triangular)
         envelope_blocks = []
         for sign_r, sign_i in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
-            block = coo_matrix(
-                (np.concatenate([np.full(n_nodes, sign_r / np.sqrt(2.0)),
-                                 np.full(n_nodes, sign_i / np.sqrt(2.0)),
-                                 np.full(n_nodes, -1.0)]),
-                 (np.tile(sample, 3),
-                  np.concatenate([sample, n_nodes + sample, n_var + sample]))),
-                shape=(n_nodes, n_var2))
+            on_real = (sign_r * inverse_map.real
+                       + sign_i * inverse_map.imag) / np.sqrt(2.0)
+            on_imag = (sign_i * inverse_map.real
+                       - sign_r * inverse_map.imag) / np.sqrt(2.0)
+            block = hstack([coo_matrix(on_real), coo_matrix(on_imag),
+                            coo_matrix((n_nodes, n_kept + 1)),
+                            coo_matrix((np.full(n_nodes, -1.0),
+                                        (sample, sample)),
+                                       shape=(n_nodes, n_nodes))])
             envelope_blocks.append(block)
         stacked = vstack(
             [hstack([inequality, coo_matrix((row, n_nodes))])]
@@ -334,12 +356,13 @@ def solve_fixed_time_weights(
             [equality, np.zeros((2, n_nodes))])
         second = linprog(cost2, A_ub=stacked, b_ub=stacked_rhs,
                          A_eq=equality2, b_eq=equality_rhs,
-                         bounds=bounds2, method="highs")
+                         bounds=bounds2, method="highs", options=tolerances)
         if second.success:
             solution = second.x[:n_var]
             objective = float(second.x[n_var - 1])
 
-    weights = (solution[:n_nodes] + 1.0j * solution[n_nodes:2 * n_nodes]) * gauge
+    rotated = solution[:n_nodes] + 1.0j * solution[n_nodes:2 * n_nodes]
+    weights = np.linalg.solve(triangular, rotated) * gauge
     return (np.asarray(weights, dtype=np.complex128),
             objective / float(objective_scale))
 
