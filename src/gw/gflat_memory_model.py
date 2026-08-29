@@ -120,7 +120,8 @@ def _c128(*dims, shard: int = 1) -> float:
 def _coupled_mu123_zq_incremental_bytes(
         *, nk: int, nq: int, ns: int, mu: int, face_nb: int,
         r_chunk: int, p_x: int, p_y: int, ngkmax: int = 0,
-        n_rtot: int = 0, cache_psi_r: bool = False) -> dict[str, float]:
+        n_rtot: int = 0, cache_psi_r: bool = False,
+        stack_three_solves: bool = False) -> dict[str, float]:
     """Private prototype delta over one accepted transverse face fit.
 
     The coupled transport returns all three completed ``Z_q`` channels, so
@@ -129,7 +130,8 @@ def _coupled_mu123_zq_incremental_bytes(
     production coordinator also retains two extra G-flat outputs and two
     extra transverse CCT factors.  When ψ(r) is hoisted, its two additional
     all-P-sharded copies are included too.  The incumbent bounded Y cache and
-    one channel's two P carries are unchanged.
+    one channel's two P carries are unchanged.  ``stack_three_solves`` adds
+    the larger of the two nonconcurrent face↔batch solve liveness phases.
     """
     completed_zq = 2.0 * _c128(
         nq, mu, r_chunk, shard=int(p_x) * int(p_y))
@@ -142,14 +144,31 @@ def _coupled_mu123_zq_incremental_bytes(
     extra_psi_r = (2.0 * _c128(
         nk, face_nb_transport, ns, n_rtot,
         shard=int(p_x) * int(p_y)) if cache_psi_r else 0.0)
+    stacked_solve = 0.0
+    if stack_three_solves:
+        p_xy = int(p_x) * int(p_y)
+        b_one = round_up(nq, p_xy)
+        b_three = round_up(3 * nq, p_xy)
+        delta_b = b_three - b_one
+        # Two nonconcurrent liveness phases bind.  First, face→batch local
+        # RHS input/output plus the larger A arena; second, one enlarged local
+        # RHS arena plus all three face outputs retained by the coordinator.
+        local_phase = (
+            2.0 * _c128(delta_b, mu, r_chunk, shard=p_xy)
+            + _c128(delta_b, mu, mu, shard=p_xy))
+        face_phase = (
+            _c128(delta_b, mu, r_chunk, shard=p_xy)
+            + 2.0 * _c128(nq, mu, r_chunk, shard=p_xy))
+        stacked_solve = max(local_phase, face_phase)
     return {
         "two_additional_completed_zq": completed_zq,
         "shared_full_spin_x_face": shared_x_face,
         "two_additional_gflat_outputs": extra_gflat,
         "two_additional_transverse_factors": extra_factors,
         "two_additional_psi_r_caches": extra_psi_r,
+        "stacked_solve_transient": stacked_solve,
         "total": (completed_zq + shared_x_face + extra_gflat
-                  + extra_factors + extra_psi_r),
+                  + extra_factors + extra_psi_r + stacked_solve),
     }
 
 

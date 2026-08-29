@@ -79,6 +79,14 @@ def test_coupled_mu123_prototype_prices_two_zq_outputs_and_shared_x_face():
     assert delta["total"] == 4_941_619_200
 
 
+def test_coupled_mu123_stacked_solve_prices_nonconcurrent_peak():
+    delta = _coupled_mu123_zq_incremental_bytes(
+        nk=36, nq=36, ns=4, mu=800, face_nb=256,
+        r_chunk=27_648, p_x=4, p_y=4,
+        stack_three_solves=True)
+    assert delta["stacked_solve_transient"] == 3_008_102_400
+
+
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
     plan = _run50_plan()
     assert not plan.cache_psi_r

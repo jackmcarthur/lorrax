@@ -2,6 +2,9 @@
 
 import threading
 
+import jax.numpy as jnp
+import numpy as np
+
 from gw.gw_init import _CoupledMu123ZqCoordinator
 
 
@@ -93,3 +96,32 @@ def test_final_write_turn_waits_for_all_channel_loops():
     for thread in (first, second, third):
         thread.join(timeout=5)
         assert not thread.is_alive()
+
+
+def test_prepared_channels_publish_one_mu_major_solve_stack():
+    coordinator = _CoupledMu123ZqCoordinator()
+    seen = {}
+
+    def worker(mu):
+        factor = jnp.full((2, 1, 1), mu, dtype=jnp.complex128)
+        trace = jnp.full((2,), 10 * mu, dtype=jnp.complex128)
+        coordinator.channel_prepared(mu, solve_inputs=(factor, trace))
+        seen[mu] = coordinator.stacked_solve_inputs()
+
+    threads = []
+    for mu in (1, 2, 3):
+        thread = threading.Thread(target=worker, args=(mu,))
+        thread.start()
+        threads.append(thread)
+        coordinator.wait_channel_prepared(mu)
+    coordinator.release_channels()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    factor, trace = seen[1]
+    np.testing.assert_array_equal(
+        np.asarray(factor[:, 0, 0]), [1, 1, 2, 2, 3, 3])
+    np.testing.assert_array_equal(
+        np.asarray(trace), [10, 10, 20, 20, 30, 30])
+    assert all(seen[mu][0] is factor for mu in (1, 2, 3))

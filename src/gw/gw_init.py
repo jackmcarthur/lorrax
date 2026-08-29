@@ -1737,11 +1737,12 @@ def _gate_fresh_zeta_rank_findings(
 class _CoupledMu123ZqCoordinator:
 	"""Host scheduler for the experimental three-current Zq transaction.
 
-	Channel setup runs one-at-a-time.  For each r chunk, μ=1 builds the one
-	shared ``Z_q[3,q,mu,r]`` stack; μ=1,2,3 then consume its slices in the
-	accepted solve/accumulate order.  The stack is released immediately after
-	μ=3 finishes that chunk.  Final G-flat writes and provenance also retain
-	the accepted μ=1→2→3 order.
+	Channel setup runs one-at-a-time.  For each r chunk, μ=1 builds one shared
+	``[3,q,mu,r]`` stack: raw Zq on the general route, or solved zeta when the
+	three batch-reshard solves can be flattened into one transaction.  μ=1,2,3
+	then consume its slices in the accepted accumulate order.  The stack is
+	released immediately after μ=3 finishes that chunk.  Final G-flat writes
+	and provenance also retain the accepted μ=1→2→3 order.
 	"""
 	_CHANNELS = (1, 2, 3)
 
@@ -1752,8 +1753,10 @@ class _CoupledMu123ZqCoordinator:
 		self._aborted = None
 		self._chunk = 0
 		self._arrived = set()
-		self._z_stack = None
+		self._chunk_stack = None
 		self._turn = 1
+		self._solve_inputs = {}
+		self._stacked_solve_inputs = None
 		self._final_ready = set()
 		self._final_turn = 1
 
@@ -1768,12 +1771,13 @@ class _CoupledMu123ZqCoordinator:
 				self._aborted = exc
 			self._cv.notify_all()
 
-	def channel_prepared(self, mu):
+	def channel_prepared(self, mu, solve_inputs=None):
 		mu = int(mu)
 		with self._cv:
 			if mu not in self._CHANNELS or mu in self._prepared:
 				raise ValueError(f"invalid/duplicate prepared channel mu={mu}")
 			self._prepared.add(mu)
+			self._solve_inputs[mu] = solve_inputs
 			self._cv.notify_all()
 			while not self._release_prepared:
 				self._raise_if_aborted()
@@ -1791,10 +1795,34 @@ class _CoupledMu123ZqCoordinator:
 			if self._prepared != set(self._CHANNELS):
 				raise RuntimeError(
 					"cannot release coupled channels before all are prepared")
+			ordered = tuple(self._solve_inputs[mu] for mu in self._CHANNELS)
+		if any(item is not None for item in ordered):
+			if not all(item is not None for item in ordered):
+				raise RuntimeError(
+					"coupled channels disagreed on the stacked-solve route")
+			factors, traces = zip(*ordered)
+			stacked_factor = jnp.concatenate(factors, axis=0)
+			stacked_trace = jnp.concatenate(traces, axis=0)
+			jax.block_until_ready((stacked_factor, stacked_trace))
+			stacked_inputs = (stacked_factor, stacked_trace)
+		else:
+			stacked_inputs = None
+		with self._cv:
+			self._stacked_solve_inputs = stacked_inputs
 			self._release_prepared = True
 			self._cv.notify_all()
 
-	def acquire_channel_Z_q(self, mu, chunk_idx, builder):
+	def stacked_solve_inputs(self):
+		with self._cv:
+			if not self._release_prepared:
+				raise RuntimeError(
+					"stacked solve inputs requested before channel release")
+			if self._stacked_solve_inputs is None:
+				raise RuntimeError(
+					"coupled transaction did not register stacked solve inputs")
+			return self._stacked_solve_inputs
+
+	def _acquire_channel_stack(self, mu, chunk_idx, builder):
 		mu = int(mu)
 		chunk_idx = int(chunk_idx)
 		build_here = False
@@ -1810,10 +1838,10 @@ class _CoupledMu123ZqCoordinator:
 			while self._arrived != set(self._CHANNELS):
 				self._raise_if_aborted()
 				self._cv.wait()
-			if mu == 1 and self._z_stack is None:
+			if mu == 1 and self._chunk_stack is None:
 				build_here = True
 			else:
-				while self._z_stack is None:
+				while self._chunk_stack is None:
 					self._raise_if_aborted()
 					self._cv.wait()
 
@@ -1825,7 +1853,7 @@ class _CoupledMu123ZqCoordinator:
 				self.abort(exc)
 				raise
 			with self._cv:
-				self._z_stack = z_stack
+				self._chunk_stack = z_stack
 				self._cv.notify_all()
 
 		with self._cv:
@@ -1833,7 +1861,13 @@ class _CoupledMu123ZqCoordinator:
 				self._raise_if_aborted()
 				self._cv.wait()
 			self._raise_if_aborted()
-			return self._z_stack[mu - 1]
+			return self._chunk_stack[mu - 1]
+
+	def acquire_channel_Z_q(self, mu, chunk_idx, builder):
+		return self._acquire_channel_stack(mu, chunk_idx, builder)
+
+	def acquire_channel_zeta(self, mu, chunk_idx, builder):
+		return self._acquire_channel_stack(mu, chunk_idx, builder)
 
 	def finish_chunk(self, mu, chunk_idx):
 		mu = int(mu)
@@ -1846,7 +1880,7 @@ class _CoupledMu123ZqCoordinator:
 			if mu < 3:
 				self._turn += 1
 			else:
-				self._z_stack = None
+				self._chunk_stack = None
 				self._arrived.clear()
 				self._turn = 1
 				self._chunk += 1
@@ -2038,6 +2072,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				_coupled_mu123_zq_incremental_bytes)
 			_p_x = int(mesh_xy.shape['x'])
 			_p_y = int(mesh_xy.shape['y'])
+			_stack_three_solves = (
+				str(cfg.backend.distrib_la_batched_route).strip().lower()
+				== 'batch_reshard')
 			_coupled_delta = _coupled_mu123_zq_incremental_bytes(
 				nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
 				ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
@@ -2046,7 +2083,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
 				          or int(0.06 * _meta_T.n_rtot)),
 				n_rtot=int(_meta_T.n_rtot),
-				cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)))
+				cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+				stack_three_solves=_stack_three_solves)
 			_coupled_projected = (
 				float(_gflat_plan_T.hwm_bytes) + _coupled_delta['total'])
 			if _coupled_projected > float(_gflat_plan_T.budget_bytes):
@@ -2062,7 +2100,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				f"(+2 completed Zq slices + 2 G-flat outputs + 2 factors "
 				f"+ shared full-spin X face"
 				+ (" + 2 ψ(r) caches" if _coupled_delta[
-					'two_additional_psi_r_caches'] else "") + "); "
+					'two_additional_psi_r_caches'] else "")
+				+ (" + stacked-solve transient" if _coupled_delta[
+					'stacked_solve_transient'] else "") + "); "
 				f"projected HWM {_coupled_projected / 1e9:.2f} GB/dev")
 			_coupled_mu123_enabled = True
 	# Fresh writers and provenance stamps consume exactly the identity that

@@ -36,6 +36,7 @@ from isdf.core import (
     host_rss_gb as _host_rss_gb,
     factor_c_q,
     fit_one_rchunk,
+    solve_zeta,
     _z_q_face_coupled_mu123,
     _resolve_solver_kind,
     _resolve_zeta_gather,
@@ -968,6 +969,20 @@ def fit_zeta_to_h5(
     else:
         cct_trace_per_q = None
 
+    # The coupled batch-reshard route can flatten all three (mu,q) stacks
+    # into one canonical solve_zeta call.  Register only raw-array
+    # distributed-LU inputs: tokens already own a provider factor and local
+    # hoisted LU owns separate pivots, neither can be concatenated safely.
+    _coupled_stacked_solve = bool(
+        _coupled_mu123_coordinator is not None
+        and str(distrib_la_batched_route).strip().lower() == "batch_reshard"
+        and _resolved_solver_kind in ("cusolvermp_lu", "scalapack_lu")
+        and not isinstance(L_q, FactorToken)
+        and lu_piv is None
+        and cct_trace_per_q is not None)
+    _coupled_solve_inputs = (
+        (L_q, cct_trace_per_q) if _coupled_stacked_solve else None)
+
     # Free C_q to reclaim GPU memory before z-chunk loop
     # (P_k_mumu was already deleted above)
     # This is critical for fitting within memory budget
@@ -1430,7 +1445,8 @@ def fit_zeta_to_h5(
                     "three accumulators parked")
             mem_probe("pre_rchunk_loop_host_spilled")
         _coupled_rank_gate("prepared")
-        _coupled_mu123_coordinator.channel_prepared(int(vertex_mu_L))
+        _coupled_mu123_coordinator.channel_prepared(
+            int(vertex_mu_L), solve_inputs=_coupled_solve_inputs)
 
     # glibc heap trim hook (see the comment at the call site in the loop
     # below).  DEFAULT ON — one ``malloc_trim(0)`` per r-chunk costs a few
@@ -1470,6 +1486,7 @@ def fit_zeta_to_h5(
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
             _mem_probe(f"rchunk_start chunk={chunk_idx}")
             _prebuilt_Z_q = None
+            _prebuilt_zeta = None
             if _coupled_mu123_coordinator is not None:
                 def _build_coupled_Z_q():
                     _cache_cap = int(face_y_cache_r_tile) or actual_n_rchunk
@@ -1489,45 +1506,86 @@ def fit_zeta_to_h5(
                         kgrid=kgrid, mesh_xy=mesh_xy,
                         cache_y_r_tile=_cache_tile)
 
-                _prebuilt_Z_q = (
-                    _coupled_mu123_coordinator.acquire_channel_Z_q(
-                        int(vertex_mu_L), chunk_idx, _build_coupled_Z_q))
+                if _coupled_stacked_solve:
+                    def _build_coupled_zeta():
+                        with timing.section(
+                                "zeta_fit.chunk.coupled_z_q_build"):
+                            Z_mu_q = _build_coupled_Z_q()
+                            if q_irr_full_idx is not None:
+                                Z_mu_q = Z_mu_q[:, jnp.asarray(
+                                    np.asarray(
+                                        q_irr_full_idx, dtype=np.int32))]
+                        L_mu_q, trace_mu_q = (
+                            _coupled_mu123_coordinator.
+                            stacked_solve_inputs())
+                        n_q_solve = int(Z_mu_q.shape[1])
+                        Z_flat = Z_mu_q.reshape(
+                            3 * n_q_solve, n_rmu_padded,
+                            actual_n_rchunk)
+                        with timing.section(
+                                "zeta_fit.chunk.coupled_solve"):
+                            zeta_flat = solve_zeta(
+                                L_mu_q, Z_flat, mesh_xy, q_chunk_size,
+                                vertex_mu_L=1,
+                                solver_kind=_resolved_solver_kind,
+                                cct_trace_per_q=trace_mu_q,
+                                n_rmu_logical=int(n_rmu),
+                                zeta_gather=_resolved_zeta_gather,
+                                distrib_la_batched_route=(
+                                    distrib_la_batched_route))
+                            zeta_mu_q = zeta_flat.reshape(
+                                3, n_q_solve, n_rmu_padded,
+                                actual_n_rchunk)
+                        return zeta_mu_q
+
+                    _prebuilt_zeta = (
+                        _coupled_mu123_coordinator.acquire_channel_zeta(
+                            int(vertex_mu_L), chunk_idx,
+                            _build_coupled_zeta))
+                else:
+                    _prebuilt_Z_q = (
+                        _coupled_mu123_coordinator.acquire_channel_Z_q(
+                            int(vertex_mu_L), chunk_idx,
+                            _build_coupled_Z_q))
             t0 = time.perf_counter()
             with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
                  jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
-                zeta_chunk = fit_one_rchunk(
-                    psi_G_store=psi_G_store,
-                    psi_r_cache=psi_r_cache,
-                    psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
-                    psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
-                    L_q=L_q,
-                    norms_l=norms_l_jax,
-                    norms_r=norms_r_jax,
-                    r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
-                    mesh_xy=mesh_xy,
-                    meta=meta,
-                    band_chunk_ranges=band_chunk_ranges,
-                    band_range_left=band_range_left,
-                    band_range_right=band_range_right,
-                    band_range_full=band_range_full,
-                    actual_n_rchunk=actual_n_rchunk,
-                    q_chunk_size=q_chunk_size,
-                    vertex_mu_L=int(vertex_mu_L),
-                    solver_kind=_resolved_solver_kind,
-                    q_irr_full_idx=q_irr_full_idx,   # Phase B: gather inside the kernel
-                    q_neg_idx=_q_neg_idx,
-                    cct_trace_per_q=cct_trace_per_q,
-                    zeta_gather=_resolved_zeta_gather,
-                    lu_piv=lu_piv,
-                    distrib_la_batched_route=distrib_la_batched_route,
-                    layout=('face' if low_mem_bands else 'legacy'),
-                    psi_mun=(psi_mun_fresh if low_mem_bands else None),
-                    weight_l=(weight_l_face if low_mem_bands else None),
-                    weight_r=(weight_r_face if low_mem_bands else None),
-                    cache_face_y_blocks=bool(cache_face_y_blocks),
-                    face_y_cache_r_tile=int(face_y_cache_r_tile),
-                    _prebuilt_Z_q=_prebuilt_Z_q,
-                )
+                if _prebuilt_zeta is not None:
+                    zeta_chunk = _prebuilt_zeta
+                else:
+                    zeta_chunk = fit_one_rchunk(
+                        psi_G_store=psi_G_store,
+                        psi_r_cache=psi_r_cache,
+                        psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
+                        psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
+                        L_q=L_q,
+                        norms_l=norms_l_jax,
+                        norms_r=norms_r_jax,
+                        r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
+                        mesh_xy=mesh_xy,
+                        meta=meta,
+                        band_chunk_ranges=band_chunk_ranges,
+                        band_range_left=band_range_left,
+                        band_range_right=band_range_right,
+                        band_range_full=band_range_full,
+                        actual_n_rchunk=actual_n_rchunk,
+                        q_chunk_size=q_chunk_size,
+                        vertex_mu_L=int(vertex_mu_L),
+                        solver_kind=_resolved_solver_kind,
+                        q_irr_full_idx=q_irr_full_idx,
+                        q_neg_idx=_q_neg_idx,
+                        cct_trace_per_q=cct_trace_per_q,
+                        zeta_gather=_resolved_zeta_gather,
+                        lu_piv=lu_piv,
+                        distrib_la_batched_route=distrib_la_batched_route,
+                        layout=('face' if low_mem_bands else 'legacy'),
+                        psi_mun=(psi_mun_fresh if low_mem_bands else None),
+                        weight_l=(weight_l_face if low_mem_bands else None),
+                        weight_r=(weight_r_face if low_mem_bands else None),
+                        cache_face_y_blocks=bool(cache_face_y_blocks),
+                        face_y_cache_r_tile=int(face_y_cache_r_tile),
+                        _prebuilt_Z_q=_prebuilt_Z_q,
+                    )
                 if actual_n_rchunk != logical_n_rchunk:
                     zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
                 zeta_chunk.block_until_ready()
