@@ -103,7 +103,7 @@ def _fft_ffi_fused_enabled() -> bool:
 
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = False,
-    layout: str = "legacy", face_shape=None,
+    layout: str = "legacy", face_shape=None, right_face_shape=None,
 ) -> Callable[..., jax.Array]:
     """Build the shard_map'd ψ* σ ψ projector that reduce-scatters the output.
 
@@ -113,7 +113,9 @@ def _make_project_ri_reduce_scatter(
     the SAME channel-plan dispatch (``merged_x`` -> ``channels='none'``
     single complex chain, else ``channels='split_reim'`` two-channel
     plan), just the face mechanism (two planned GEMMs) rather than the
-    shard_map/psum_scatter chain.  Requires ``face_shape``.  See
+    shard_map/psum_scatter chain.  Requires ``face_shape``;
+    ``right_face_shape`` selects the existing rectangular endpoint form.
+    See
     :func:`common.contract_bands._face_project_kernel`'s own docstring
     for the algebra.
 
@@ -222,6 +224,7 @@ def _make_project_ri_reduce_scatter(
         channels=("none" if merged_x else "split_reim"),
         layout=layout,
         face_shape=face_shape,
+        right_face_shape=right_face_shape,
         divisibility_hint=(
             "Both existing sigma call sites pad via pad_sigma_window; "
             "meta.py rounds b_id_4 to world_size but NOT the sigma band "
@@ -261,10 +264,11 @@ def get_sigma_spatial_kernel(
     merged_x: bool = False,
     layout: str = "legacy",
     face_shape=None,
+    right_face_shape=None,
 ) -> SpatialKernel:
     """Return the ansatz-neutral ``G_k x W_q -> Sigma_kij`` kernel.
 
-    ``layout``/``face_shape`` (2026-08-22): forwarded ONLY to the
+    ``layout``/``face_shape``/``right_face_shape``: forwarded ONLY to the
     projection tail (:func:`_make_project_ri_reduce_scatter`).  The FFT
     convolution above it (``ifftn``/``fftn``/the fused ``gw_conv`` FFI
     call) is layout-AGNOSTIC and unchanged either way: ``build_G``/
@@ -303,7 +307,7 @@ def get_sigma_spatial_kernel(
         make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
     from ffi import ffi_dial_key
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           bool(merged_x), layout, face_shape)
+           bool(merged_x), layout, face_shape, right_face_shape)
     if key in _sigma_spatial_kernel_cache:
         return _sigma_spatial_kernel_cache[key]
     from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
@@ -326,7 +330,8 @@ def get_sigma_spatial_kernel(
         _V_ifftn = make_flat_k_ifftn(mesh_xy, kgrid, _V_spec, norm='ortho')
 
     project = _make_project_ri_reduce_scatter(
-        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape)
+        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
+        right_face_shape=right_face_shape)
 
     @jax.jit
     def prep_w(W_q):
@@ -430,7 +435,8 @@ def _stack_channels(outs, mesh_xy: Mesh):
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
-    layout: str = "legacy", face_shape=None, pack_brackets: bool = True,
+    layout: str = "legacy", face_shape=None, right_face_shape=None,
+    pack_brackets: bool = True,
     energy_windows: bool = False,
 ) -> Callable[..., jax.Array]:
     """GN/MPA adapter that builds G and calls the shared spatial kernel.
@@ -518,25 +524,43 @@ def _get_sigma_kij_kernel(
         raise ValueError(
             "_get_sigma_kij_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
+    if layout != "face" and right_face_shape is not None:
+        raise ValueError(
+            "_get_sigma_kij_kernel: right_face_shape is only valid for "
+            "layout='face'")
+    if layout == "face":
+        face_shape = tuple(int(v) for v in face_shape)
+        if right_face_shape is None:
+            right_face_shape = face_shape
+        else:
+            right_face_shape = tuple(int(v) for v in right_face_shape)
+        nk_f, nb_full_f, n_rmu_f, ns_f = face_shape
+        nk_r, nb_right, n_rmu_right, ns_right = right_face_shape
+        if (nk_r, nb_right, ns_right) != (nk_f, nb_full_f, ns_f):
+            raise ValueError(
+                "_get_sigma_kij_kernel: face endpoints must share "
+                "(nk, nb_full, nspinor); got "
+                f"{face_shape} and {right_face_shape}")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           bool(pack_brackets), bool(energy_windows))
+           right_face_shape, bool(pack_brackets), bool(energy_windows))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
-        layout=layout, face_shape=face_shape)
+        layout=layout, face_shape=face_shape,
+        right_face_shape=right_face_shape)
 
     g_plan = None
     g_plans = None
     use_packed = False
     if layout == "face":
         from distrib_la import gemm_plan
-        nk_f, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
         mu_s_f = n_rmu_f * ns_f
-        g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
+        mu_s_right = n_rmu_right * ns_f
+        g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_right,
                            nq=nk_f, dtype=jnp.complex128)
         use_packed = bool(pack_brackets) and brackets is not None \
             and len(brackets) > 1
@@ -559,7 +583,7 @@ def _get_sigma_kij_kernel(
                     g_plans.append(g_plan)   # identical shape -- reuse
                 else:
                     g_plans.append(gemm_plan(
-                        mesh_xy, m=mu_s_f, k=w_pad, n=mu_s_f, nq=nk_f,
+                        mesh_xy, m=mu_s_f, k=w_pad, n=mu_s_right, nq=nk_f,
                         dtype=jnp.complex128))
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
@@ -859,6 +883,7 @@ def _get_sigma_tau_kernel(
     brackets: tuple[tuple[int, int], ...] = ((0, None),),
     layout: str = "legacy",
     face_shape=None,
+    right_face_shape=None,
     pack_brackets: bool = True,
     energy_windows: bool = False,
 ) -> Callable[..., jax.Array]:
@@ -880,7 +905,7 @@ def _get_sigma_tau_kernel(
     that is the whole design and it is why this argument lives on the kernel
     rather than on its caller.
 
-    ``layout``/``face_shape`` (2026-08-22): forwarded verbatim to
+    ``layout``/``face_shape``/``right_face_shape``: forwarded verbatim to
     :func:`_get_sigma_kij_kernel` — this wrapper's own body (the B-side
     W(τ) synthesis, ``_build_W_t_q``) touches no ψ operand and needs no
     layout dispatch of its own; B_q/Omega_q/mask_B are q-space PPM-pole
@@ -906,7 +931,7 @@ def _get_sigma_tau_kernel(
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), kgrid, _stage_timing_enabled(),
                  ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-                 bool(pack_brackets), bool(energy_windows))
+                 right_face_shape, bool(pack_brackets), bool(energy_windows))
     if cache_key in _sigma_tau_kernel_cache:
         return _sigma_tau_kernel_cache[cache_key]
 
@@ -917,6 +942,7 @@ def _get_sigma_tau_kernel(
                                              brackets=brackets,
                                              layout=layout,
                                              face_shape=face_shape,
+                                             right_face_shape=right_face_shape,
                                              pack_brackets=pack_brackets,
                                              energy_windows=energy_windows)
 
@@ -1072,7 +1098,7 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
-    layout: str = "legacy", face_shape=None,
+    layout: str = "legacy", face_shape=None, right_face_shape=None,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1086,14 +1112,14 @@ def get_shared_sigma_tau_kernel(
     This is the entry point ``gw.mpa.sigma`` calls (insulating MPA shares
     this exact kernel with GN-PPM's merged Laplace plan — no bracket plan,
     the MPA/shared-multipole ``brackets=None`` shape); ``layout``/
-    ``face_shape`` (2026-08-22) forward to :func:`_get_sigma_kij_kernel`
-    unchanged.
+    ``face_shape``/``right_face_shape`` forward to
+    :func:`_get_sigma_kij_kernel` unchanged.
     """
     kgrid = tuple(int(x) for x in kgrid)
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           layout, face_shape)
+           layout, face_shape, right_face_shape)
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -1101,7 +1127,8 @@ def get_shared_sigma_tau_kernel(
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
-        layout=layout, face_shape=face_shape)
+        layout=layout, face_shape=face_shape,
+        right_face_shape=right_face_shape)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,

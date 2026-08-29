@@ -46,6 +46,9 @@ Five cases cover the matrix the port's own design points name:
     extrapolation shape), exercising ``_bracketed_face``'s mask-
     intersection loop for real (not the single-bracket ((0,None),) shape
     every other case here uses, which is a no-op intersection).
+  * ``rectangular_ct_ns2`` -- distinct left/right centroid extents and
+    independent endpoint orbitals, the CT/TC geometry required by a
+    full-current dynamic interaction.
 """
 from __future__ import annotations
 
@@ -104,6 +107,10 @@ _CASES = (
         ns=1, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8, nb_sigma=8,
         weight_kind="bool", merged_x=True,
         brackets=((0, 3), (3, 6), (6, None)), seed=5)),
+    ("rectangular_ct_ns2", dict(
+        ns=2, nk_tuple=(2, 1, 1), n_rmu=4, n_rmu_right=6,
+        nb_full=8, nb_sigma=8, weight_kind="bool", merged_x=True,
+        brackets=((0, None),), seed=6)),
 )
 
 
@@ -115,12 +122,14 @@ def _to_host(x, mesh):
 
 def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
                                  nb_sigma, weight_kind, merged_x, brackets,
-                                 seed):
+                                 seed, n_rmu_right=None):
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
     nkx, nky, nkz = nk_tuple
     nk = nkx * nky * nkz
     kgrid = nk_tuple
     rng = np.random.default_rng(seed)
+    if n_rmu_right is None:
+        n_rmu_right = n_rmu
 
     # ---- one logical psi, two axis orders (module docstring) ---------
     # psi_full[k, n(band), s, mu]: the (n,s,mu) order -- IS psi_xr/psi_yr
@@ -128,6 +137,12 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     psi_full = _crand(rng, nk, nb_full, ns, n_rmu)
     # (k, s, mu, n) order -- IS psi_xn/psi_yn (legacy) and psi_mun (face).
     psi_full_T = np.transpose(psi_full, (0, 2, 3, 1))
+    if n_rmu_right == n_rmu:
+        psi_full_right = psi_full
+        psi_full_right_T = psi_full_T
+    else:
+        psi_full_right = _crand(rng, nk, nb_full, ns, n_rmu_right)
+        psi_full_right_T = np.transpose(psi_full_right, (0, 2, 3, 1))
 
     # ---- shared, layout-agnostic physics operands ---------------------
     E_A = jnp.asarray(rng.uniform(-1.0, 1.0, size=(nk, nb_full)))
@@ -135,11 +150,13 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         sel = jnp.asarray(rng.uniform(size=(nk, nb_full)) > 0.5)
     else:
         sel = jnp.asarray(rng.uniform(0.0, 1.0, size=(nk, nb_full)))
-    B_q = jnp.asarray(_crand(rng, nk, n_rmu, n_rmu))
+    B_q = jnp.asarray(_crand(rng, nk, n_rmu, n_rmu_right))
     Omega_q = jnp.asarray(
-        rng.uniform(0.2, 3.0, size=(nk, n_rmu, n_rmu))
-        - 1j * rng.uniform(0.0, 0.5, size=(nk, n_rmu, n_rmu)))
-    mask_B = jnp.asarray(rng.uniform(size=(nk, n_rmu, n_rmu)) > 0.3)
+        rng.uniform(0.2, 3.0, size=(nk, n_rmu, n_rmu_right))
+        - 1j * rng.uniform(0.0, 0.5,
+                           size=(nk, n_rmu, n_rmu_right)))
+    mask_B = jnp.asarray(
+        rng.uniform(size=(nk, n_rmu, n_rmu_right)) > 0.3)
     Om_lo = jnp.asarray(-np.inf, dtype=jnp.float64)
     Om_hi = jnp.asarray(np.inf, dtype=jnp.float64)
     E_ref_A = jnp.asarray(0.0, dtype=jnp.float64)
@@ -156,11 +173,11 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     yn_spec = NamedSharding(mesh, P(None, None, "y", None))
 
     psi_coh_xn_L = jax.device_put(jnp.asarray(psi_full_T), xn_spec)
-    psi_coh_yr_L = jax.device_put(jnp.asarray(psi_full), yr_spec)
+    psi_coh_yr_L = jax.device_put(jnp.asarray(psi_full_right), yr_spec)
     psi_proj_xr_L0 = jax.device_put(
         jnp.asarray(psi_full[:, :nb_sigma, :, :]), xr_spec)
     psi_proj_yn_L0 = jax.device_put(
-        jnp.asarray(psi_full_T[:, :, :, :nb_sigma]), yn_spec)
+        jnp.asarray(psi_full_right_T[:, :, :, :nb_sigma]), yn_spec)
     psi_proj_xr_L, psi_proj_yn_L, nb_real = pad_sigma_window(
         psi_proj_xr_L0, psi_proj_yn_L0, mesh)
     assert nb_real == nb_sigma
@@ -176,7 +193,10 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     nmu_spec = NamedSharding(mesh, P(None, "x", None, "y"))
     psi_mun = jax.device_put(jnp.asarray(psi_full_T), mun_spec)
     psi_nmu = jax.device_put(jnp.asarray(psi_full), nmu_spec)
+    psi_mun_right = jax.device_put(jnp.asarray(psi_full_right_T), mun_spec)
+    psi_nmu_right = jax.device_put(jnp.asarray(psi_full_right), nmu_spec)
     face_shape = (nk, nb_full, n_rmu, ns)
+    right_face_shape = (nk, nb_full, n_rmu_right, ns)
 
     # pack_brackets=False: this module gates the MASK bracket loop
     # specifically (module docstring, ``brackets_ns1``'s own case
@@ -192,10 +212,11 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     # vs legacy on the identical three-bracket shape.
     tau_kernel_face = _get_sigma_tau_kernel(
         mesh_xy=mesh, kgrid=kgrid, merged_x=merged_x, brackets=brackets,
-        layout="face", face_shape=face_shape, pack_brackets=False)
+        layout="face", face_shape=face_shape,
+        right_face_shape=right_face_shape, pack_brackets=False)
 
     out_face = jax.block_until_ready(tau_kernel_face(
-        psi_mun, psi_nmu, psi_nmu, psi_mun,
+        psi_mun, psi_nmu_right, psi_nmu, psi_mun_right,
         E_A, sel, B_q, Omega_q, mask_B, Om_lo, Om_hi,
         E_ref_A, E_ref_B, t_node,
     ))
@@ -219,7 +240,8 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         ref_scale = float(np.abs(la_h).max())
         max_abs = float(absdiff.max())
         max_rel = max_abs / max(ref_scale, 1e-300)
-        p0(f"  ns={ns} nk={nk} nb_full={nb_full} nb_sigma={nb_sigma} "
+        p0(f"  ns={ns} nk={nk} mu={n_rmu}x{n_rmu_right} "
+           f"nb_full={nb_full} nb_sigma={nb_sigma} "
            f"merged_x={merged_x} brackets={brackets} channel={c}: "
            f"max|diff|={max_abs:.3e} (ref scale {ref_scale:.3e}) "
            f"max|rel diff|={max_rel:.3e}")
