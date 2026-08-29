@@ -62,6 +62,13 @@ def _fit_zeta_tree():
     return _function_tree("fit_zeta")
 
 
+def _nested_function(tree, name):
+    matches = [n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == name]
+    assert len(matches) == 1, "expected one nested %s" % name
+    return matches[0]
+
+
 def _calls(tree, name):
     out = []
     for n in ast.walk(tree):
@@ -154,17 +161,13 @@ def test_only_missing_channels_reach_fit_writers():
     assert len(charge_guards) == 1, (
         "the charge writer is not exclusively in the non-reuse branch")
 
-    mu_loops = [n for n in ast.walk(fit_zeta)
-                if isinstance(n, ast.For)
-                and ast.unparse(n.target) == "mu_L"
-                and any(x is fits[1] for x in ast.walk(n))]
-    assert len(mu_loops) == 1
-    loop = mu_loops[0]
-    skip = next((n for n in loop.body if isinstance(n, ast.If)
+    channel = _nested_function(fit_zeta, "_fit_transverse_channel")
+    assert any(x is fits[1] for x in ast.walk(channel))
+    skip = next((n for n in channel.body if isinstance(n, ast.If)
                  and ast.unparse(n.test) == "_reuse_T[mu_L - 1]"), None)
-    assert skip is not None and any(isinstance(n, ast.Continue)
+    assert skip is not None and any(isinstance(n, ast.Return)
                                     for n in ast.walk(skip)), (
-        "an accepted transverse artifact does not continue past the writer")
+        "an accepted transverse artifact does not return before the writer")
     assert skip.lineno < fits[1].lineno
 
 
@@ -242,9 +245,9 @@ def test_every_fresh_channel_gates_rank_findings_before_stamp():
                    key=lambda n: n.lineno)
     stamps = sorted(_calls(fit_zeta, "stamp_fit_provenance"),
                     key=lambda n: n.lineno)
-    assert len(fits) == len(gates) == len(stamps) == 2, (
-        "charge and transverse must each have one fit, one shared gate, "
-        "and one provenance-stamp source site")
+    assert len(fits) == len(stamps) == 2 and len(gates) == 3, (
+        "charge/transverse need one final gate each, plus the coupled "
+        "schedule's deferred-finding drain callback")
     assert fits[0].lineno < gates[0].lineno < stamps[0].lineno, (
         "fresh charge does not cross the rank-finding seam before stamping")
 
@@ -257,21 +260,20 @@ def test_every_fresh_channel_gates_rank_findings_before_stamp():
     assert len(charge_gate_guards) == 1, (
         "an accepted charge artifact can still enter the fresh-fit gate")
 
-    mu_loops = [
-        n for n in ast.walk(fit_zeta)
-        if isinstance(n, ast.For)
-        and ast.unparse(n.target) == "mu_L"
-        and any(x is fits[1] for x in ast.walk(n))
-    ]
-    assert len(mu_loops) == 1
-    loop = mu_loops[0]
-    skip = next(n for n in loop.body if isinstance(n, ast.If)
+    channel = _nested_function(fit_zeta, "_fit_transverse_channel")
+    skip = next(n for n in channel.body if isinstance(n, ast.If)
                 and ast.unparse(n.test) == "_reuse_T[mu_L - 1]")
-    assert (skip.lineno < fits[1].lineno < gates[1].lineno
+    channel_gates = _calls(channel, "_gate_fresh_zeta_rank_findings")
+    channel_stamps = _calls(channel, "stamp_fit_provenance")
+    assert len(channel_gates) == len(channel_stamps) == 1
+    assert (skip.lineno < fits[1].lineno < channel_gates[0].lineno
             < stamps[1].lineno), (
         "transverse resume/fit/gate/stamp ordering is not fail-closed")
-    assert all(any(x is call for x in ast.walk(loop))
-               for call in (fits[1], gates[1], stamps[1]))
+    assert all(any(x is call for x in ast.walk(channel))
+               for call in (fits[1], channel_gates[0], channel_stamps[0]))
+
+    drain = _nested_function(fit_zeta, "_drain_coupled_rank_findings")
+    assert len(_calls(drain, "_gate_fresh_zeta_rank_findings")) == 1
 
 
 if __name__ == "__main__":

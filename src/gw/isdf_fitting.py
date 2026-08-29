@@ -212,6 +212,7 @@ def fit_zeta_to_h5(
     _coupled_mu123_coordinator=None,
     _coupled_rank_gate=None,
     _spill_coupled_gflat_to_host: bool = False,
+    _stack_coupled_solve_inputs: bool = False,
     print_fn=print,
 ):
     """
@@ -383,6 +384,11 @@ def fit_zeta_to_h5(
             and _coupled_mu123_coordinator is None):
         raise ValueError(
             "fit_zeta_to_h5: coupled G-flat host spill is private to the "
+            "three-channel transverse coordinator")
+    if (_stack_coupled_solve_inputs
+            and _coupled_mu123_coordinator is None):
+        raise ValueError(
+            "fit_zeta_to_h5: stacked coupled solves are private to the "
             "three-channel transverse coordinator")
 
     # P0 — entry of ζ-fit.  Captures the persistent state set up by
@@ -975,6 +981,7 @@ def fit_zeta_to_h5(
     # hoisted LU owns separate pivots, neither can be concatenated safely.
     _coupled_stacked_solve = bool(
         _coupled_mu123_coordinator is not None
+        and _stack_coupled_solve_inputs
         and str(distrib_la_batched_route).strip().lower() == "batch_reshard"
         and _resolved_solver_kind in ("cusolvermp_lu", "scalapack_lu")
         and not isinstance(L_q, FactorToken)
@@ -1439,7 +1446,7 @@ def fit_zeta_to_h5(
                     gflat_acc, enabled=True)
             if (jax.process_index() == 0 and int(vertex_mu_L) == 1):
                 print_fn(
-                    "  [experimental] coupled G-flat host spill: "
+                    "  [bispinor] coupled G-flat host spill: "
                     f"{_local_gflat_host_bytes} bytes/channel/rank, "
                     f"{3 * _local_gflat_host_bytes} bytes/rank with all "
                     "three accumulators parked")

@@ -87,6 +87,21 @@ def test_coupled_mu123_stacked_solve_prices_nonconcurrent_peak():
     assert delta["stacked_solve_transient"] == 3_008_102_400
 
 
+def test_coupled_host_spill_moves_gflat_bytes_off_device():
+    resident = _coupled_mu123_zq_incremental_bytes(
+        nk=36, nq=36, ns=4, mu=800, face_nb=256,
+        r_chunk=27_648, p_x=4, p_y=4, ngkmax=76_551)
+    spilled = _coupled_mu123_zq_incremental_bytes(
+        nk=36, nq=36, ns=4, mu=800, face_nb=256,
+        r_chunk=27_648, p_x=4, p_y=4, ngkmax=76_551,
+        host_spill_gflat=True)
+    moved = 2 * 16 * 36 * 800 * 76_551 / 16
+    assert resident["two_additional_gflat_outputs"] == moved
+    assert spilled["two_additional_gflat_outputs"] == 0
+    assert spilled["two_additional_host_gflat_outputs"] == moved
+    assert resident["total"] - spilled["total"] == moved
+
+
 def test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache():
     plan = _run50_plan()
     assert not plan.cache_psi_r

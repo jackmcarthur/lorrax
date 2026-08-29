@@ -1913,6 +1913,32 @@ class _CoupledMu123ZqCoordinator:
 			self._cv.notify_all()
 
 
+def _select_coupled_mu123_route(*, requested_route, base_hwm_bytes,
+		budget_bytes, local_delta_bytes, distributed_delta_bytes,
+		local_capacity_ok=True):
+	"""Choose the fastest coupled transverse schedule that fits device HBM.
+
+	This policy is private to the three current-density ζ fits.  The public
+	``distrib_la_batched_route`` still governs every other consumer.  An
+	explicit ``batch_reshard`` request is never silently changed to the
+	distributed service; if its coupled live set does not fit, the incumbent
+	sequential schedule retains that explicit per-channel route.
+	"""
+	route = str(requested_route).strip().lower()
+	if route not in ("auto", "batch_reshard"):
+		raise ValueError(
+			f"unsupported distrib_la_batched_route={requested_route!r}")
+	base = float(base_hwm_bytes)
+	budget = float(budget_bytes)
+	local_delta = float(local_delta_bytes)
+	distributed_delta = float(distributed_delta_bytes)
+	if bool(local_capacity_ok) and base + local_delta <= budget:
+		return True, "batch_reshard", local_delta
+	if route == "auto" and base + distributed_delta <= budget:
+		return True, "auto", distributed_delta
+	return False, route, None
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
              psi_nmu_fresh=None, psi_mun_fresh=None,
@@ -1954,20 +1980,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	# γ̃ contract sits inside shard_map bodies so threading a kwarg
 	# through every call would be churn for no benefit).
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
-	_coupled_mu123_requested = env_bool(
-		"LORRAX_EXPERIMENTAL_COUPLED_ZQ", False, print_fn=print_fn)
-	_coupled_gflat_host_spill_requested = env_bool(
-		"LORRAX_EXPERIMENTAL_COUPLED_ZQ_HOST_SPILL", False,
-		print_fn=print_fn)
-	if (_coupled_gflat_host_spill_requested
-			and not _coupled_mu123_requested):
-		raise ValueError(
-			"LORRAX_EXPERIMENTAL_COUPLED_ZQ_HOST_SPILL requires "
-			"LORRAX_EXPERIMENTAL_COUPLED_ZQ=1")
-	if _coupled_mu123_requested and not cfg.bispinor:
-		raise ValueError(
-			"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires bispinor=true; it "
-			"only couples the three transverse current fits")
 
 	if zeta_contract is None:
 		zeta_contract = _resolve_zeta_fit_contract(
@@ -2053,62 +2065,73 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				mesh_xy=mesh_xy, is_bispinor=True,
 				face_current_vertex=True, print_fn=print_fn)
 	_coupled_mu123_enabled = False
-	if _coupled_mu123_requested and cfg.bispinor:
-		if any(_reuse_T) and not all(_reuse_T):
-			raise ValueError(
-				"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires either all three "
-				"transverse ζ files to be reusable or all three to need a "
-				"fresh fit; partial reuse remains on the sequential path")
-		if all(_reuse_T):
-			print_fn(
-				"  [experimental] coupled transverse Zq requested, but all "
-				"three μ_L files are reusable; no transverse fit is needed.")
-		else:
-			if not cfg.memory.low_mem_bands:
-				raise ValueError(
-					"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires "
-					"low_mem_bands=true")
-			if not bool(_chunks_T.get('cache_face_y_blocks', False)):
-				raise ValueError(
-					"LORRAX_EXPERIMENTAL_COUPLED_ZQ requires the "
-					"planner-selected bounded face-Y cache")
-			from gw.gflat_memory_model import (
-				_coupled_mu123_zq_incremental_bytes)
-			_p_x = int(mesh_xy.shape['x'])
-			_p_y = int(mesh_xy.shape['y'])
-			_stack_three_solves = (
-				str(cfg.backend.distrib_la_batched_route).strip().lower()
-				== 'batch_reshard')
-			_coupled_delta = _coupled_mu123_zq_incremental_bytes(
-				nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
-				ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
-				face_nb=int(band_slices.b4 - band_slices.b0),
-				r_chunk=int(_chunks_T['chunk_r']), p_x=_p_x, p_y=_p_y,
-				ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
-				          or int(0.06 * _meta_T.n_rtot)),
-				n_rtot=int(_meta_T.n_rtot),
-				cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
-				stack_three_solves=_stack_three_solves)
+	_transverse_batched_route = str(
+		cfg.backend.distrib_la_batched_route).strip().lower()
+	if cfg.bispinor and any(_reuse_T) and not all(_reuse_T):
+		print_fn(
+			"  [bispinor] partial transverse ζ reuse: fitting only missing "
+			"channels on the sequential schedule.")
+	if (cfg.bispinor and not any(_reuse_T)
+			and bool(cfg.memory.low_mem_bands)
+			and bool(_chunks_T.get('cache_face_y_blocks', False))):
+		from gw.gflat_memory_model import (
+			_coupled_mu123_zq_incremental_bytes)
+		_p_x = int(mesh_xy.shape['x'])
+		_p_y = int(mesh_xy.shape['y'])
+		_delta_args = dict(
+			nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
+			ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
+			face_nb=int(band_slices.b4 - band_slices.b0),
+			r_chunk=int(_chunks_T['chunk_r']), p_x=_p_x, p_y=_p_y,
+			ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
+			          or int(0.06 * _meta_T.n_rtot)),
+			n_rtot=int(_meta_T.n_rtot),
+			cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+			host_spill_gflat=True)
+		# The shared Zq transform is coupled, but the three real transverse
+		# systems retain their accepted 36-q solve boundaries.  Flattening them
+		# to 108 q exposed input-sensitive ~1e-9 arithmetic drift on CrI3 while
+		# saving only a small solve dispatch inside a transform-dominated chunk.
+		_local_delta = _coupled_mu123_zq_incremental_bytes(
+			**_delta_args, stack_three_solves=False)
+		_distributed_delta = _coupled_mu123_zq_incremental_bytes(
+			**_delta_args, stack_three_solves=False)
+		_p_xy = _p_x * _p_y
+		_batch_total = int(_meta_T.nk_tot)
+		_batch_per_rank = (_batch_total + _p_xy - 1) // _p_xy
+		_mu_T = int(_meta_T.n_rmu_padded)
+		_local_operand_floor = (
+			3 * 16 * _batch_per_rank * _mu_T
+			* (_mu_T + int(_chunks_T['chunk_r'])))
+		_local_capacity_ok = (
+			_mu_T <= 16_384
+			and _local_operand_floor <= 0.50 * _gflat_plan_T.budget_bytes)
+		(_coupled_mu123_enabled, _transverse_batched_route,
+		 _selected_delta_bytes) = _select_coupled_mu123_route(
+			requested_route=_transverse_batched_route,
+			base_hwm_bytes=_gflat_plan_T.hwm_bytes,
+			budget_bytes=_gflat_plan_T.budget_bytes,
+			local_delta_bytes=_local_delta['total'],
+			distributed_delta_bytes=_distributed_delta['total'],
+			local_capacity_ok=_local_capacity_ok)
+		if _coupled_mu123_enabled:
+			_coupled_delta = (
+				_local_delta if _transverse_batched_route == 'batch_reshard'
+				else _distributed_delta)
 			_coupled_projected = (
-				float(_gflat_plan_T.hwm_bytes) + _coupled_delta['total'])
-			if _coupled_projected > float(_gflat_plan_T.budget_bytes):
-				raise ValueError(
-					"LORRAX_EXPERIMENTAL_COUPLED_ZQ does not fit the device "
-					f"budget: accepted-plan HWM "
-					f"{_gflat_plan_T.hwm_bytes / 1e9:.2f} GB/dev + coupled "
-					f"increment {_coupled_delta['total'] / 1e9:.2f} GB/dev "
-					f"> {_gflat_plan_T.budget_bytes / 1e9:.2f} GB/dev")
+				float(_gflat_plan_T.hwm_bytes) + _selected_delta_bytes)
 			print_fn(
-				f"  [experimental] coupled Zq memory increment: "
-				f"{_coupled_delta['total'] / 1e9:.2f} GB/dev "
-				f"(+2 completed Zq slices + 2 G-flat outputs + 2 factors "
-				f"+ shared full-spin X face"
-				+ (" + 2 ψ(r) caches" if _coupled_delta[
-					'two_additional_psi_r_caches'] else "")
-				+ (" + stacked-solve transient" if _coupled_delta[
-					'stacked_solve_transient'] else "") + "); "
-				f"projected HWM {_coupled_projected / 1e9:.2f} GB/dev")
-			_coupled_mu123_enabled = True
+				f"  [bispinor] coupled μ_L=1,2,3 schedule: "
+				f"solve_route={_transverse_batched_route}, "
+				f"device increment {_selected_delta_bytes / 1e9:.2f} GB, "
+				f"projected HWM {_coupled_projected / 1e9:.2f} GB; "
+				f"extra completed G-flat outputs are host-spilled "
+				f"({_coupled_delta['two_additional_host_gflat_outputs'] / 1e9:.2f} "
+				"GB/rank).")
+		else:
+			print_fn(
+				"  [bispinor] coupled μ_L=1,2,3 live set exceeds the device "
+				"budget; using the sequential capacity fallback.")
 	# Fresh writers and provenance stamps consume exactly the identity that
 	# was tested before planning; there is no second reconstruction here.
 	_provenance = zeta_contract.provenance
@@ -2281,9 +2304,10 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	transverse_wfn_data = None
 
 	# ── Bispinor: fit ζ^{μ_L=1,2,3} on the current-density centroid set ──
-	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  Three
-	# sequential calls keep peak GPU memory at the scalar-fit level.  Output
-	# paths follow the convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
+	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  The
+	# automatic coupled schedule shares the expensive face transform; its
+	# capacity fallback makes three sequential calls.  Output paths follow the
+	# convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
 	#
 	# Loud-fail guard: if cfg.bispinor=True the transverse ζ fit MUST run,
 	# otherwise downstream V_q silently falls back to scalar V_q and then
@@ -2386,7 +2410,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					band_norms=_band_norms,
 					distributed_cholesky=cfg.backend.distributed_cholesky,
 					distributed_lu=cfg.backend.distributed_lu,
-					distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
+					distrib_la_batched_route=_transverse_batched_route,
 					zeta_ridge=cfg.backend.zeta_ridge,
 					distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
 					transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
@@ -2415,8 +2439,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 							mu_L, stage))
 						if coordinator is not None else None),
 					_spill_coupled_gflat_to_host=bool(
-						coordinator is not None
-						and _coupled_gflat_host_spill_requested),
+						coordinator is not None),
+					_stack_coupled_solve_inputs=False,
 					print_fn=print_fn,
 				)
 			_gate_fresh_zeta_rank_findings(
@@ -2443,8 +2467,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 
 		if _coupled_mu123_enabled:
 			print_fn(
-				"  [experimental] coupled μ_L=1,2,3 transverse Zq: one "
-				"shared face transform per r chunk; solve, write, and "
+				"  [bispinor] coupled μ_L=1,2,3 transverse Zq: one "
+				"shared face transform per r chunk; the three solves, write, and "
 				"provenance remain ordered μ_L=1→2→3")
 			_drop_traced_caches()
 			_coordinator = _CoupledMu123ZqCoordinator()

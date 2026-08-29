@@ -121,14 +121,17 @@ def _coupled_mu123_zq_incremental_bytes(
         *, nk: int, nq: int, ns: int, mu: int, face_nb: int,
         r_chunk: int, p_x: int, p_y: int, ngkmax: int = 0,
         n_rtot: int = 0, cache_psi_r: bool = False,
-        stack_three_solves: bool = False) -> dict[str, float]:
+        stack_three_solves: bool = False,
+        host_spill_gflat: bool = False) -> dict[str, float]:
     """Private prototype delta over one accepted transverse face fit.
 
     The coupled transport returns all three completed ``Z_q`` channels, so
     two additional ``Z_q[q,mu_X,r_Y]`` arrays are live.  Its full-spin X
     owner cache is sharded only over ``mu_X`` and replicated over Y.  The
     production coordinator also retains two extra G-flat outputs and two
-    extra transverse CCT factors.  When ψ(r) is hoisted, its two additional
+    extra transverse CCT factors.  ``host_spill_gflat`` parks those outputs
+    in process-local RAM, so their bytes are reported separately and do not
+    inflate the device HWM.  When ψ(r) is hoisted, its two additional
     all-P-sharded copies are included too.  The incumbent bounded Y cache and
     one channel's two P carries are unchanged.  ``stack_three_solves`` adds
     the larger of the two nonconcurrent face↔batch solve liveness phases.
@@ -136,8 +139,9 @@ def _coupled_mu123_zq_incremental_bytes(
     completed_zq = 2.0 * _c128(
         nq, mu, r_chunk, shard=int(p_x) * int(p_y))
     shared_x_face = _c128(nk, ns, mu, face_nb, shard=p_x)
-    extra_gflat = 2.0 * _c128(
+    extra_gflat_host = 2.0 * _c128(
         nq, mu, ngkmax, shard=int(p_x) * int(p_y))
+    extra_gflat = 0.0 if host_spill_gflat else extra_gflat_host
     extra_factors = 2.0 * _c128(
         nq, mu, mu, shard=int(p_x) * int(p_y))
     face_nb_transport = round_up(face_nb, int(p_x) * int(p_y))
@@ -164,6 +168,8 @@ def _coupled_mu123_zq_incremental_bytes(
         "two_additional_completed_zq": completed_zq,
         "shared_full_spin_x_face": shared_x_face,
         "two_additional_gflat_outputs": extra_gflat,
+        "two_additional_host_gflat_outputs": (
+            extra_gflat_host if host_spill_gflat else 0.0),
         "two_additional_transverse_factors": extra_factors,
         "two_additional_psi_r_caches": extra_psi_r,
         "stacked_solve_transient": stacked_solve,
