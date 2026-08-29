@@ -126,6 +126,10 @@ class ComplexTimeRule:
     amplification_max: float
     method: str
     error_bound: float | None = None
+    # One row per accepted growth step, in acceptance order:
+    # (time_re, time_im, family, delivered_error_after) — enough to rebuild
+    # any prefix rule for convergence-versus-node-count studies.
+    growth_history: tuple[tuple[float, float, str, float], ...] = ()
 
     @property
     def node_count(self) -> int:
