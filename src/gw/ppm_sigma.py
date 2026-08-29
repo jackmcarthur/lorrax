@@ -81,7 +81,7 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import resolve_sigma_plan
+from .sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
 from .wavefunction_bundle import face_kernel_kwargs
 
 
@@ -1655,6 +1655,7 @@ def compute_sigma_c_ppm_omega_grid(
         # causal branches are still planned independently, so this does not
         # introduce a time-reversal identification at the W producer seam.
         from .mpa.delivered_windows import build_delivered_sigma_windows
+        tau_grid_mode = resolve_delivered_tau_grid()
         Omega_one = jnp.expand_dims(Omega_abs, axis=0)
         B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
         shared_plan, geometry = build_delivered_sigma_windows(
@@ -1664,14 +1665,17 @@ def compute_sigma_c_ppm_omega_grid(
             target_error=target_error,
             max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
             crossing_eps_q=crossing_eps_q,
-            use_shipped_minimax_tables=bool(use_shipped_minimax_tables))
+            use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
+            tau_grid_mode=tau_grid_mode)
         for report in geometry["branches"]:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
             delivered_windows[report["tag"]] = [
                 row.window for row in shared_plan[start:stop]]
         print_fn(
             f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
-            f"windows, {geometry['n_tau']} total nodes, "
+            f"windows, grid={geometry['tau_grid_mode']}, "
+            f"{geometry['window_tau_pairs']} (window,tau) pairs, "
+            f"{geometry['distinct_tau_count']} branch-distinct tau, "
             f"plan {geometry['plan_seconds']:.3f} s")
 
     # Run each branch and fold its Σc tiles into per-rank HOST tile

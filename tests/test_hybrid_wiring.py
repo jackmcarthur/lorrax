@@ -7,7 +7,7 @@ import pytest
 from gw.mpa.delivered_windows import build_delivered_sigma_windows
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
-from gw.sigma_plan import resolve_sigma_plan
+from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
 from minimax import tail_refined_lattice_measure
 
 
@@ -95,6 +95,40 @@ def test_mpa_pole_windows_reconstruct_a_small_true_sigma():
     assert relative <= 2.0e-3
 
 
+def test_shared_grid_uses_one_branch_grid_at_matched_true_error():
+    omega = np.linspace(0.0, 0.9, 7)
+    energies = np.asarray([0.15, 0.55])
+    branch = _branch("MPA conduction", "cond", energies, omega)
+    poles = np.asarray([0.35 - 0.08j, 1.25 - 0.16j, 2.2 - 0.25j])
+    residues = np.asarray([0.8 + 0.1j, -0.3 + 0.25j, 0.12 - 0.2j])
+    eta = 0.05
+    plan, report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega,
+        regularization_width_ry=eta, target_error=2.0e-3,
+        lattice_bins=10, max_nodes=120,
+        pane_times=tuple(np.geomspace(0.01, 160.0, 120)),
+        tau_grid_mode="shared")
+
+    grids = [np.asarray(row.window.nodes.t) for row in plan]
+    assert len(grids) >= 2
+    for grid in grids[1:]:
+        np.testing.assert_array_equal(grid, grids[0])
+    assert report["tau_grid_mode"] == "shared"
+    assert report["window_tau_pairs"] == len(plan) * grids[0].size
+    assert report["distinct_tau_count"] == grids[0].size
+    assert report["direct_term_count"] == 0
+    assert report["branches"][0]["window_axis"] == "pole"
+    assert report["branches"][0]["state_support"] == "full"
+
+    executed = _executed_scalar(plan, poles, residues, energies, omega)
+    broadened = poles.real - 1.0j * (-poles.imag + eta)
+    denominator = (omega[:, None, None] - energies[None, :, None]
+                   - broadened[None, None, :])
+    direct = -np.sum(residues[None, None, :] / denominator, axis=(1, 2))
+    relative = np.max(np.abs(executed - direct)) / np.max(np.abs(direct))
+    assert relative <= 2.0e-3
+
+
 def test_shared_selector_defaults_and_refuses_unknown(monkeypatch):
     from gw import ppm_sigma
     from gw.mpa import sigma as mpa_sigma
@@ -108,3 +142,11 @@ def test_shared_selector_defaults_and_refuses_unknown(monkeypatch):
     monkeypatch.setenv("LORRAX_SIGMA_PLAN", "hybrid")
     with pytest.raises(ValueError, match="panes.*delivered"):
         resolve_sigma_plan()
+
+    monkeypatch.delenv("LORRAX_DELIVERED_TAU_GRID", raising=False)
+    assert resolve_delivered_tau_grid() == "free"
+    monkeypatch.setenv("LORRAX_DELIVERED_TAU_GRID", " shared ")
+    assert resolve_delivered_tau_grid() == "shared"
+    monkeypatch.setenv("LORRAX_DELIVERED_TAU_GRID", "union")
+    with pytest.raises(ValueError, match="free.*shared"):
+        resolve_delivered_tau_grid()

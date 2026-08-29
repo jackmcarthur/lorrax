@@ -49,6 +49,30 @@ the fitted time orientation to the executor convention, folds
 `exp(-eta*t_exec)` into each weight once, and retains the executor's global
 `-1` prefactor.
 
+### Shared tau grid
+
+The delivered planner defaults to independent (`free`) window grids. Set
+
+```bash
+export LORRAX_DELIVERED_TAU_GRID=shared
+```
+
+to build one identical grid per causal branch and re-solve unrestricted
+complex weights for every window on that grid. Candidate times are the union
+of already accepted incumbent-discipline fits; progressively smaller shared
+prefixes are retained only when every refined residual and p99 amplification
+check still passes. The accepted free union, zero-padded per window, is the
+deterministic fallback when it fits under the node ceiling.
+
+Reports keep the two cost currencies separate: `window_tau_pairs` is
+`sum_w n_tau(w)` and remains the production executor's actual dispatch count;
+`distinct_tau_count` sums the per-branch shared-grid sizes and is the transform
+count available to a future fused executor. The current executor does not yet
+fuse equal tau values across windows, so shared planning alone does not claim
+that transform saving. Direct reciprocal fallbacks, when used by an offline
+hardening study, are reported separately as `direct_term_count` and are never
+silently priced as executable tau nodes.
+
 ## GN-PPM and time reversal
 
 GN-PPM presents its single fitted pole per spatial matrix element as a

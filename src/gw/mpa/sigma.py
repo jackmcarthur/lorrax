@@ -16,7 +16,7 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_plan import resolve_sigma_plan
+from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
 from gw.wavefunction_bundle import face_kernel_kwargs
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
@@ -373,6 +373,7 @@ def compute_sigma_c_mpa_omega_grid(
                 slice(0, n_poles), unfold=True, return_sharded=True,
                 to_unit="Ry")
             from .delivered_windows import build_delivered_sigma_windows
+            tau_grid_mode = resolve_delivered_tau_grid()
             plan, geometry = build_delivered_sigma_windows(
                 [Omega] * len(branches), [B] * len(branches), branches,
                 omega_grid_ry,
@@ -380,7 +381,8 @@ def compute_sigma_c_mpa_omega_grid(
                 target_error=target_error,
                 max_nodes=max(int(max_rank), int(crossing_max_nodes)),
                 crossing_eps_q=1.0e-3,
-                use_shipped_minimax_tables=True)
+                use_shipped_minimax_tables=True,
+                tau_grid_mode=tau_grid_mode)
             del Omega, B
         if plan_mode == "panes":
             print_fn(
@@ -391,7 +393,9 @@ def compute_sigma_c_mpa_omega_grid(
                 f"  MPA windows [delivered]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
                 f"{geometry['n_windows']} logical windows, "
-                f"{geometry['n_tau']} total nodes")
+                f"grid={geometry['tau_grid_mode']}, "
+                f"{geometry['window_tau_pairs']} (window,tau) pairs, "
+                f"{geometry['distinct_tau_count']} branch-distinct tau")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, print_fn=print_fn)

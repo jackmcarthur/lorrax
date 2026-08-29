@@ -48,6 +48,7 @@ from minimax import (
     fit_phase_bounded_candidates,
     partition_measure_windows,
     rule_amplification,
+    solve_fixed_time_weights_fast,
     tail_refined_lattice_measure,
 )
 
@@ -517,6 +518,116 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
     }
 
 
+def _stable_time_union(fits):
+    """Return one exact stable union and each free rule's union indices."""
+    values, lookup, row_indices = [], {}, []
+    for fit in fits:
+        indices = []
+        for value in np.asarray(fit["times"], np.complex128):
+            key = (float(value.real), float(value.imag))
+            if key not in lookup:
+                lookup[key] = len(values)
+                values.append(complex(value))
+            indices.append(lookup[key])
+        row_indices.append(np.asarray(indices, dtype=np.int64))
+    return np.asarray(values, dtype=np.complex128), row_indices
+
+
+def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
+    """Fit one common time grid with independent weights for branch windows.
+
+    The candidate set is the exact union of already accepted incumbent-
+    discipline rules. Candidates are ordered by their normalized weight across
+    windows, then progressively refitted with the minimax service's fixed-time
+    IRLS solver. Every trial is judged on the refined lattice and the same p99
+    amplification cap as the free rules. The full union with zero-padded free
+    weights is the deterministic fallback, so grid sharing cannot weaken an
+    already accepted plan when that union fits under ``max_nodes``.
+    """
+    union, free_indices = _stable_time_union(fits)
+    if union.size == 0:
+        raise RuntimeError("shared tau grid received no fitted nodes")
+    score = np.zeros(union.size, dtype=np.float64)
+    for fit, indices in zip(fits, free_indices):
+        strength = np.abs(np.asarray(fit["weights"], np.complex128))
+        scale = max(float(np.sum(strength)), 1.0e-300)
+        np.add.at(score, indices, strength / scale)
+    order = np.lexsort((union.imag, union.real, np.abs(union), -score))
+    candidates = union[order]
+    inverse_order = np.empty(order.size, dtype=np.int64)
+    inverse_order[order] = np.arange(order.size, dtype=np.int64)
+    seeded = []
+    for fit, indices in zip(fits, free_indices):
+        weights = np.zeros(candidates.size, dtype=np.complex128)
+        weights[inverse_order[indices]] = np.asarray(
+            fit["weights"], dtype=np.complex128)
+        seeded.append(weights)
+
+    limit = min(int(max_nodes), int(candidates.size))
+    coarse = (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 80, 96,
+              112, 128, 160, 200, 256, 384, 512, limit)
+    ranks = sorted(set(rank for rank in coarse if 0 < rank <= limit))
+    attempts = []
+    chosen = None
+    for rank in ranks:
+        times = candidates[:rank]
+        weights_by_window, metrics, accepted = [], [], True
+        for spec, fit, seed_weights in zip(specs, fits, seeded):
+            if rank == candidates.size:
+                weights = seed_weights
+                solver = "zero_padded_free_union"
+            else:
+                try:
+                    weights, _objective = solve_fixed_time_weights_fast(
+                        spec["problem"], times,
+                        conditioning_slack=1.0e-3,
+                        start_weights=seed_weights[:rank])
+                    solver = "fixed_time_irls"
+                except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+                    accepted = False
+                    break
+            base = _rule_metrics(spec["problem"], times, weights)
+            check = _rule_metrics(spec["validation"], times, weights)
+            good = bool(
+                np.all(np.isfinite(weights))
+                and check[0] <= fit["residual_target"]
+                and check[1] <= amp_cap)
+            accepted &= good
+            weights_by_window.append(weights)
+            metrics.append((base, check, solver))
+        attempts.append({
+            "node_count": int(rank), "accepted": bool(accepted),
+            "window_refined_residuals": [row[1][0] for row in metrics],
+            "window_amplification_p99": [row[1][1] for row in metrics],
+        })
+        if accepted and len(weights_by_window) == len(fits):
+            chosen = (times, weights_by_window, metrics)
+            break
+    if chosen is None:
+        raise RuntimeError(
+            "shared per-branch tau grid missed a refined target or the "
+            f"amplification cap within max_nodes={int(max_nodes)}; "
+            f"free-union nodes={int(candidates.size)}")
+
+    times, weights_by_window, metrics = chosen
+    for fit, weights, metric in zip(fits, weights_by_window, metrics):
+        base, check, solver = metric
+        fit["times"] = np.asarray(times, dtype=np.complex128)
+        fit["weights"] = np.asarray(weights, dtype=np.complex128)
+        fit["evidence"] = {
+            **fit["evidence"],
+            "free_family": fit["evidence"]["family"],
+            "family": "shared_branch_grid",
+            "shared_weight_solver": solver,
+            "fit_residual": base[0], "refined_residual": check[0],
+            "amplification_p99": check[1],
+            "amplification_max": check[2],
+            "shared_grid_node_count": int(times.size),
+            "shared_grid_free_union_count": int(candidates.size),
+            "shared_grid_attempts": attempts,
+        }
+
+
 def _all_pole_bounds(n_poles):
     bounds = np.asarray(
         (0.0, np.inf, -np.inf, -np.inf, np.inf, np.inf),
@@ -540,6 +651,7 @@ def build_delivered_sigma_windows(
     crossing_eps_q: float = 1.0e-3,
     use_shipped_minimax_tables: bool = True,
     pane_times: tuple = (),
+    tau_grid_mode: str = "free",
 ):
     """Build a measure-apportioned hybrid plan for MPA or one-pole GN-PPM.
 
@@ -568,6 +680,7 @@ def build_delivered_sigma_windows(
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
     eta, target = float(regularization_width_ry), float(target_error)
     amp_cap, safety = float(amplification_cap), float(true_error_safety)
+    grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
         raise ValueError("omega_grid_ry must be a nonempty finite vector")
@@ -579,6 +692,8 @@ def build_delivered_sigma_windows(
         raise ValueError("true_error_safety must lie in (0,1]")
     if not np.isfinite(amp_cap) or amp_cap <= 1.0:
         raise ValueError("amplification_cap must be finite and greater than one")
+    if grid_mode not in ("free", "shared"):
+        raise ValueError("tau_grid_mode must be 'free' or 'shared'")
 
     specs, branch_reports = [], []
     combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
@@ -634,7 +749,7 @@ def build_delivered_sigma_windows(
         tuple(spec["window"] for spec in specs),
         np.asarray([spec["difficulty"] for spec in specs]), total_absolute)
 
-    output = []
+    fits = []
     for spec, budget in zip(specs, budgets):
         branch, problem, validation = (
             spec["branch"], spec["problem"], spec["validation"])
@@ -648,6 +763,26 @@ def build_delivered_sigma_windows(
         else:
             times, weights, evidence = _fit_sign_definite(
                 problem, validation, residual_target, int(max_nodes), amp_cap)
+        fits.append({
+            "times": np.asarray(times, dtype=np.complex128),
+            "weights": np.asarray(weights, dtype=np.complex128),
+            "evidence": evidence, "budget": budget,
+            "residual_target": float(residual_target),
+        })
+
+    if grid_mode == "shared":
+        for report in branch_reports:
+            start, stop = int(report["plan_start"]), int(report["plan_stop"])
+            _shared_branch_grid(
+                specs[start:stop], fits[start:stop], int(max_nodes), amp_cap)
+
+    output = []
+    for spec, fit in zip(specs, fits):
+        branch = spec["branch"]
+        times, weights, evidence = (
+            fit["times"], fit["weights"], fit["evidence"])
+        budget, residual_target = fit["budget"], fit["residual_target"]
+        pole_sign = 1.0 if branch.space == "cond" else -1.0
         external_sign = -1 if branch.neg_omega_half else 1
         time_exec = pole_sign * np.asarray(times, np.complex128)
         alpha_exec = (np.asarray(weights, np.complex128)
@@ -688,15 +823,31 @@ def build_delivered_sigma_windows(
             "absolute_error_budget": budget.absolute_error_budget,
             "budget_fraction": budget.apportionment_weight,
             "relative_residual_target": residual_target,
+            "tau_grid_mode": grid_mode,
             "node_count": int(nodes.t.size), **evidence,
         })
 
     for report in branch_reports:
         report["window_count"] = int(report["plan_stop"] - report["plan_start"])
-        report["node_count"] = int(sum(
+        report["window_tau_pairs"] = int(sum(
             row["node_count"] for row in report["windows"]))
+        report["node_count"] = report["window_tau_pairs"]
+        rows = output[report["plan_start"]:report["plan_stop"]]
+        report["distinct_tau_count"] = len({
+            (float(value.real), float(value.imag))
+            for row in rows
+            for value in np.asarray(jax.device_get(row.window.nodes.t),
+                                    dtype=np.complex128)
+        })
+        report["direct_term_count"] = 0
+        report["window_axis"] = "pole"
+        report["state_support"] = "full"
+    window_tau_pairs = int(sum(row.window.n_tau for row in output))
+    distinct_tau_count = int(sum(
+        report["distinct_tau_count"] for report in branch_reports))
     return output, {
         "plan": "delivered", "planner": "hybrid_measure_apportioned",
+        "tau_grid_mode": grid_mode,
         "eta_ry": eta, "target_error": target,
         "true_error_safety": safety,
         "planned_absolute_error_budget": total_absolute,
@@ -704,7 +855,10 @@ def build_delivered_sigma_windows(
         "lattice_bins_per_axis": int(lattice_bins),
         "amplification_cap": amp_cap,
         "n_windows": len(output),
-        "n_tau": int(sum(row.window.n_tau for row in output)),
+        "n_tau": window_tau_pairs,
+        "window_tau_pairs": window_tau_pairs,
+        "distinct_tau_count": distinct_tau_count,
+        "direct_term_count": 0,
         "plan_seconds": time.perf_counter() - started,
         "branches": branch_reports,
     }

@@ -191,6 +191,14 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    therefore policy, not machine capability; the env form is the initial
    opt-in and must be promoted before it becomes a default candidate. See
    [the delivered-plan contract](delivered_plan.md).
+5. **`LORRAX_DELIVERED_TAU_GRID` → a delivered-grid key.** Read only after
+   `LORRAX_SIGMA_PLAN=delivered`. Default/blank `free` independently fits each
+   pole window; `shared` constrains all quadrature windows of one causal branch
+   to one identical tau grid while re-solving weights per window
+   (`gw.sigma_plan.resolve_delivered_tau_grid`). Grammar is the exact,
+   case-insensitive enum `free` \| `shared` after stripping; every other value
+   REFUSES. It changes the quadrature and is likewise an initial opt-in that
+   should be promoted to an input key before any default change.
 
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression
