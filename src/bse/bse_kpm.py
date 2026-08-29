@@ -30,8 +30,9 @@ from solvers.chebyshev import (
     reconstruct_dos,
     partition_windows,
 )
-from .bse_ring_comm import build_bse_ring_matvec, build_bse_ring_matvec_full, make_bse_shardings
-from .bse_feast import (estimate_spectral_bounds_sharded, _create_mesh_xy,
+from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
+                            create_mesh_xy_from_flags, make_bse_shardings)
+from .bse_feast import (estimate_spectral_bounds_sharded,
                         _build_gmres_data_fp32, ensure_W_R)
 from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
                      pad_zone_mask_np)
@@ -360,8 +361,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("-i", "--input", required=True, help="COHSEX input file")
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
-    parser.add_argument("--px", type=int, default=1)
-    parser.add_argument("--py", type=int, default=1)
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
     parser.add_argument("--n-moments", type=int, default=200,
                         help="Number of Chebyshev moments M (cost: R*M matvecs)")
     parser.add_argument("--n-random", type=int, default=4,
@@ -391,7 +396,11 @@ def main(argv: list[str] | None = None) -> None:
 
     timing.reset()
 
-    mesh_xy = _create_mesh_xy(args.px, args.py)
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
+    # shape must BE that mesh (bse_ring_comm.create_mesh_xy_from_flags).
+    # Reached from bse_jax --kpm-dos, which forwards its own resolved shape.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)
 
     with timing.section("kpm.load"):

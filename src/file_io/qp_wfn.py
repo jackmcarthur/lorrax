@@ -65,6 +65,7 @@ from .kin_ion import (
     SYM_IDX_DATASET,
     broadcast_ibz_to_full_bz,
 )
+from .sigma_output import SIGMA_EVAL_PROVENANCE_ATTR
 
 #: Legal values of the ``qp_rotations_k_storage`` input key.  Same three
 #: words as ``restart_q_storage`` (``gw.restart_q_storage.RESTART_Q_STORAGE``)
@@ -121,6 +122,32 @@ QP_WFN_ATTR = "qp_wfn_scheme"
 #: rather than the same word meaning something else.
 QP_WFN_SCHEME = "lorrax-qp-wfn-v1"
 
+#: Additive method provenance shared by the compact rotations file and the
+#: matched WFN.  These facts describe how the stored E/U pair was obtained;
+#: they do not change the v1 matched-pair contract above.  The Sigma
+#: evaluation spelling is imported from ``sigma_output``, which owns that
+#: vocabulary for ``sigma_mnk.h5`` as well.
+QP_SOLVER_ATTR = "qp_solver"
+QP_ENERGY_DEFINITION_ATTR = "qp_energy_definition"
+
+
+def _qp_provenance_attrs(*, qp_solver=None, qp_energy_definition=None,
+                         sigma_eval_provenance=None) -> dict[str, str]:
+    """Validate and return the all-or-none additive QP provenance attrs."""
+    values = {
+        QP_SOLVER_ATTR: qp_solver,
+        QP_ENERGY_DEFINITION_ATTR: qp_energy_definition,
+        SIGMA_EVAL_PROVENANCE_ATTR: sigma_eval_provenance,
+    }
+    present = [name for name, value in values.items() if value is not None]
+    if present and len(present) != len(values):
+        missing = [name for name, value in values.items() if value is None]
+        raise ValueError(
+            "QP artifact provenance is all-or-none; got "
+            f"{present}, missing {missing}.")
+    return ({name: str(value) for name, value in values.items()}
+            if present else {})
+
 
 def _wedge_reduction(payload, kirr_to_kfull, star_tables):
     """``(reduced_payload, worst_by_name)`` — the round trip, MEASURED.
@@ -175,6 +202,9 @@ def write_qp_rotations_h5(
     k_storage: str = "full",
     star_tables=None,
     print_fn=None,
+    qp_solver=None,
+    qp_energy_definition=None,
+    sigma_eval_provenance=None,
 ):
     """Write QP rotation matrices and eigenvalues to HDF5 file.
     
@@ -202,6 +232,9 @@ def write_qp_rotations_h5(
                arrays.  A table that lives elsewhere is a table that
                silently decays when anything upstream is regenerated.
         print_fn: where the storage decision is announced, or ``None``.
+        qp_solver, qp_energy_definition, sigma_eval_provenance: optional,
+               all-or-none run provenance for the stored E/U pair.  Legacy
+               callers may omit all three; absence means unverifiable.
 
     For postprocessing WFN.h5 → WFN_qp.h5:
         1. Load WFN.h5 coefficients for bands [band_start:band_stop]
@@ -218,6 +251,10 @@ def write_qp_rotations_h5(
     reads the physics arrays through :func:`read_qp_rotations_full_bz`
     and then indexes them by full-BZ k exactly as it always did.
     """
+    provenance = _qp_provenance_attrs(
+        qp_solver=qp_solver,
+        qp_energy_definition=qp_energy_definition,
+        sigma_eval_provenance=sigma_eval_provenance)
     if k_storage not in QP_ROTATIONS_K_STORAGE:
         raise ValueError(
             f"write_qp_rotations_h5: k_storage={k_storage!r} is none of "
@@ -345,6 +382,8 @@ def write_qp_rotations_h5(
         )
         f.attrs['energy_units'] = 'E_qp_nk_hartree in Hartree, E_qp_nk_rydberg in Rydberg'
         f.attrs['band_convention'] = '0-based indexing; bands [band_start, band_stop) were computed'
+        for name, value in provenance.items():
+            f.attrs[name] = value
         if kirr_to_kfull is not None:
             f.attrs['mapping_description'] = (
                 'kirr_to_kfull[ik_red] gives the index into kpoints_crys/U_mnk/E_qp_nk '
@@ -415,6 +454,9 @@ def write_qp_wfn_h5(
     band_stop: int,
     *,
     enk_full_base_ry: np.ndarray | None = None,
+    qp_solver=None,
+    qp_energy_definition=None,
+    sigma_eval_provenance=None,
 ) -> None:
     """Write a BGW-compatible WFN.h5 with QP-rotated ψ and replaced energies.
 
@@ -453,6 +495,11 @@ def write_qp_wfn_h5(
     recomputed from the QP energies + a fresh midgap E_F before
     handing the file to a downstream consumer that trusts ``occ``.
     """
+    provenance = _qp_provenance_attrs(
+        qp_solver=qp_solver,
+        qp_energy_definition=qp_energy_definition,
+        sigma_eval_provenance=sigma_eval_provenance)
+
     from .wfn_writer import WFNWriter
 
     nb_active = int(band_stop - band_start)
@@ -533,6 +580,8 @@ def write_qp_wfn_h5(
         h5.attrs["qp_wfn_band_start"] = int(band_start)
         h5.attrs["qp_wfn_band_stop"] = int(band_stop)
         h5.attrs["qp_wfn_source"] = str(getattr(wfn, "path", "") or "")
+        for name, value in provenance.items():
+            h5.attrs[name] = value
 
 
 
@@ -540,7 +589,8 @@ def read_qp_wfn_stamp(path) -> dict | None:
     """Is ``path`` a LORRAX QP WFN?  ``None`` when the file does not say.
 
     Returns the stamp written by :func:`write_qp_wfn_h5` — ``scheme``,
-    ``band_start``, ``band_stop``, ``source`` — or ``None``.
+    ``band_start``, ``band_stop``, ``source`` and optional method provenance
+    — or ``None``.
 
     THREE OUTCOMES, AND ONLY ONE OF THEM IS "NO".  A missing file, an
     unreadable one, and one with no stamp all return ``None``, which means
@@ -574,6 +624,10 @@ def read_qp_wfn_stamp(path) -> dict | None:
                 "band_stop": (None if _get("qp_wfn_band_stop") is None
                               else int(_get("qp_wfn_band_stop"))),
                 "source": _get("qp_wfn_source", "") or "",
+                "qp_solver": _get(QP_SOLVER_ATTR),
+                "qp_energy_definition": _get(QP_ENERGY_DEFINITION_ATTR),
+                "sigma_eval_provenance": _get(
+                    SIGMA_EVAL_PROVENANCE_ATTR),
             }
     except (OSError, KeyError):
         return None

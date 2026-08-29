@@ -97,9 +97,10 @@ class GWResults:
     self_consistent: bool = False
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
     sigma_xc_at_dft_ev: np.ndarray | None = None
-    # Full ω-grid Σ_c diagonal (PPM modes only) — drives the Z-factor in
-    # the BGW eqp1.dat writer.  Shape (n_omega, nk, nb_sigma), eV; ω is
-    # relative to the DFT mid-gap E_F.  None in static modes ⇒ Z=1.
+    # Output-conditioned ω-grid Σ_c diagonal (PPM modes only).  The live
+    # assembler derives BOTH C(E_DFT) and Z from this one curve; the persisted
+    # full operator cube remains raw.  Shape (n_omega, nk, nb_sigma), eV; ω
+    # is relative to the run's stamped reference.  None in static modes ⇒ Z=1.
     sigma_c_omega_diag_ev: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
@@ -424,6 +425,7 @@ def write_qp_wfn_oneshot(
     wfn,
     band_slices,
     input_dir: str,
+    qp_solver,
     print_fn=print,
 ):
     """One-shot WFN_qp.h5 dump (drop-in BSE / restart input).
@@ -444,6 +446,8 @@ def write_qp_wfn_oneshot(
             f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
         return
     from file_io.qp_wfn import write_qp_wfn_h5
+    from .gw_config import qp_solver_semantics
+    semantics = qp_solver_semantics(qp_solver)
     _qp_wfn_path = os.path.join(input_dir, "WFN_qp.h5")
     if jax.process_index() == 0:
         write_qp_wfn_h5(
@@ -451,6 +455,9 @@ def write_qp_wfn_oneshot(
             U_kmn=np.asarray(U_full, dtype=np.complex128),
             enk_active_qp_ry=np.asarray(E_full, dtype=np.float64),
             band_start=band_slices.b0, band_stop=band_slices.b3,
+            qp_solver=getattr(qp_solver, "value", qp_solver),
+            qp_energy_definition=semantics.energy_definition,
+            sigma_eval_provenance=semantics.sigma_evaluation_provenance,
         )
     try:
         from jax.experimental import multihost_utils as _mh
@@ -717,9 +724,10 @@ def write_qsgw_qp_ladders(
 
     ``e_qp_ry`` is the driver's own QP ladder (the eigh of
     ``½(H + H†)``, ``H = kin_ion + Σ_xc + V_H``) — passed rather than
-    recomputed so the file cannot disagree with ``eqp0.dat`` about what
-    this run's QP energies were.  It is not itself one of the three; it
-    is the reference the three are read against.
+    recomputed so the file cannot disagree with the run's full-matrix
+    effective-H spectrum.  This spectrum is distinct from the fixed-state
+    diagonal result in ``eqp0.dat``; it is the reference the optional
+    plotting ladders are read against.
     """
     if not bool(getattr(config, "write_qsgw_datasets", False)):
         return []
@@ -837,9 +845,10 @@ def write_qsgw_qp_ladders(
     # AGAINST THE RUN'S OWN LADDER, which is what makes the log line
     # readable without opening the file: each approximation is reported by
     # how far it sits from the E_qp this run actually used (the eigh of
-    # kin_ion + Σ_xc + V_H, the same array eqp0.dat is built from).  Both
-    # sides are per-k ascending eigenvalues, so the elementwise difference
-    # is band-for-band.  Taken BEFORE the append, on the full-BZ arrays,
+    # kin_ion + Σ_xc + V_H, distinct from the fixed-state diagonal array
+    # written to eqp0.dat).  Both sides are per-k ascending eigenvalues, so
+    # the elementwise difference is positional.  Taken BEFORE the append,
+    # on the full-BZ arrays,
     # because after it the ladders are one row per star.
     ref_ev = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
     deltas = {
@@ -1147,9 +1156,12 @@ def write_results(
     print_fn=print,
     *,
     eqp2_file: str | None = None,
+    degeneracy_policy: str,
+    degeneracy_tol_ry: float,
     eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
+    qp_solver,
 ):
     """Serialize all GW outputs — the unified ``punch('all')`` gateway.
 
@@ -1176,7 +1188,11 @@ def write_results(
 
     BGW-style degenerate-set averaging is applied **upstream** at the
     H-build seam in :mod:`gw.gw_jax`, so the writer just serializes
-    whatever ``GWResults`` carries — no re-averaging here.
+    whatever ``GWResults`` carries — no re-averaging here.  For a dynamic
+    run it first completes the shared EQP assembly and then persists that
+    assembly's exact H/X/C(E_DFT) plus its conditioned C(omega) curve beside
+    the raw ``sigma_mnk.h5`` operators.  A post-hoc rebuild therefore consumes
+    the exact live value-and-derivative operand rather than reconstructing it.
 
     Parameters
     ----------
@@ -1203,12 +1219,21 @@ def write_results(
         reader then had to reconstruct what the five meant and how they had
         to agree; the reduction now happens where the data is written,
         which is the only place that knows what it is writing.
+    degeneracy_policy, degeneracy_tol_ry
+        The already-applied output conditioning (``"bgw_average"`` or
+        ``"disabled"``) and its tolerance.  These are receipt provenance,
+        not instructions: this function never applies the projection itself.
     eqp_dE_ev : float
         Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
         Write ``qp_wfn_rotations.h5`` here.  Self-consistent runs that
         already wrote the converged SC rotation pass ``False`` so this
         post-Sigma eigensolve cannot overwrite the authoritative file.
+    qp_solver : QPSolver or str
+        Resolved solver whose method provenance is stamped on the rotations
+        artifact.  Required, as on ``write_qp_wfn_oneshot`` above: a
+        defaulted ``None`` here wrote an unstamped ``qp_wfn_rotations.h5``
+        instead of refusing.  The one caller always passes it.
     """
     from file_io import (
         write_sigma_to_file,
@@ -1424,14 +1449,26 @@ def write_results(
                     "driver's full-BZ k-set and the sigma band window.")
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
-    assemble_eqp(
+    if results.self_consistent and sigma_c_omega_diag_ev_irr is not None:
+        raise ValueError(
+            "write_results refuses self-consistent dynamic EQP assembly: "
+            "H/X are dft_band while the full C(omega) operator is qp_band. "
+            "Rotate the full correlation operator before combining them.")
+
+    # Assemble FIRST.  This object is now the one producer of the exact H/X,
+    # derived C(E_DFT), conditioned C(omega), and Z that live output used.
+    # A dynamic call deliberately supplies no independent C(E_DFT): both that
+    # value and its derivative come from the same conditioned diagonal curve.
+    assembly = assemble_eqp(
         kpoints_irr_frac=kpts_irr,
         band_offset=results.band_start,
         e_dft_ev=e_dft_ev_irr,
         kin_ion_diag_ev=kin_ion_diag_ev,
         hartree_diag_ev=hartree_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
-        sigma_c_at_dft_diag_ev=sigma_c_at_dft_diag_ev,
+        sigma_c_at_dft_diag_ev=(
+            None if sigma_c_omega_diag_ev_irr is not None
+            else sigma_c_at_dft_diag_ev),
         sigma_c_omega_diag_ev=sigma_c_omega_diag_ev_irr,
         omega_rel_ev=results.omega_rel_ev,
         e_dft_rel_ev=e_dft_rel_ev_irr,
@@ -1442,7 +1479,30 @@ def write_results(
         hartree_source=results.hartree_source,
         kin_ion_has_hartree=results.kin_ion_has_hartree,
         print_fn=print_fn,
-    ).write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
+    )
+
+    # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
+    # their diagonals in place would alter QSGW/SC semantics.  Persist only
+    # the completed EqpAssembly through the format owner, never a parallel set
+    # of pre-assembly operand arguments.
+    if results.sigma_omega_h5_path is not None:
+        from file_io import append_eqp_assembly_receipt_h5
+        # The receipt's k rows are resolved here, not in the format owner.
+        # The assembly is on the file wedge because ``_wedge`` put it there;
+        # the cube is on the star wedge, and the two differ in length
+        # wherever nk_red != n_orbits (gnppm_debug: 9 and 5).  Same
+        # reduction, applied to an index vector, as for ``kpts_irr`` above.
+        append_eqp_assembly_receipt_h5(
+            results.sigma_omega_h5_path,
+            assembly=assembly,
+            file_wedge_full_bz_rows=_wedge(np.arange(
+                int(np.shape(sym.unfolded_kpts)[0]), dtype=np.int64)),
+            degeneracy_policy=degeneracy_policy,
+            degeneracy_tol_ry=degeneracy_tol_ry,
+            print_fn=print_fn,
+        )
+
+    assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
     # ── eqp2.dat: fixed-Sigma eigenvalue self-consistency ─────────────────
     if results.E_eqp2_ry is not None:
@@ -1511,6 +1571,16 @@ def write_results(
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
+        # No unstamped arm: the caller must pass the resolved solver, so a
+        # rotations artifact written here always names the solver.
+        from .gw_config import qp_solver_semantics
+        semantics = qp_solver_semantics(qp_solver)
+        provenance = {
+            "qp_solver": getattr(qp_solver, "value", qp_solver),
+            "qp_energy_definition": semantics.energy_definition,
+            "sigma_eval_provenance": (
+                semantics.sigma_evaluation_provenance),
+        }
         nkx, nky, nkz = kgrid
         # The service owns the (irr_idx_k, sym_idx_k, n_sym_spatial) triple
         # — ``n_sym_spatial`` from ``sym_mats_k``, not from the WFN header,
@@ -1531,6 +1601,7 @@ def write_results(
             k_storage=str(qp_rotations_k_storage),
             star_tables=_sm.star_tables_of(sym),
             print_fn=print_fn,
+            **provenance,
         )
 
     # ── Status summary ────────────────────────────────────────────────────

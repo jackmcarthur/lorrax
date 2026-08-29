@@ -27,12 +27,20 @@ from common.scientific_output import (
     symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
+from .gw_config import qp_solver_semantics
 
 
 _WARNING_WORDS = (
     "WARNING", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
     "NOT TRUSTWORTHY", "DEPRECATED",
 )
+
+# Stable role labels for the driver's closing file table.  These deliberately
+# name the energy definition rather than inferring a method from ``eqpN``.
+EQP0_FILE_ROLE = "fixed-DFT-state diagonal zeroth-order energies"
+EQP1_FILE_ROLE = "fixed-DFT-state diagonal Z-linearized energies"
+QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
+QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
 
 
 class GWProductionReport:
@@ -126,11 +134,7 @@ class GWProductionReport:
             "hl_ppm": "Hybertsen-Louie plasmon-pole GW",
             "mpa": "multipole-approximation GW",
         }.get(mode, mode)
-        solver_text = {
-            "one_shot_dft": "one-shot QP Hamiltonian at DFT energies",
-            "fixed_point": "diagonal fixed-point QP solve",
-            "self_consistent": "self-consistent QSGW",
-        }.get(solver, solver)
+        solver_text = qp_solver_semantics(solver).description
         screening = getattr(config, "screening", None)
         diagrams = getattr(getattr(screening, "diagrams", None), "value", "-")
         diagram_text = {
@@ -395,7 +399,7 @@ class GWProductionReport:
             return
         state = "insulating" if qp_gap > 0.0 else "metallic/overlapping"
         self.emit(f"DFT gap        : {dft_gap:.5f} eV")
-        self.emit(f"QP gap         : {qp_gap:.5f} eV ({state})")
+        self.emit(f"Full-matrix effective-H gap: {qp_gap:.5f} eV ({state})")
         self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
         self.emit("State energies  : written to the EQP files listed below")
 
@@ -413,8 +417,13 @@ class GWProductionReport:
                   f"max|dE|={float(residual_ev) * 1e3:.6f} meV "
                   f"<= {float(tol_ev) * 1e3:.6f} meV over non-scissored "
                   "states; final post-rotation map verified")
-        self.emit("Updated objects : QP eigenvalues/eigenvectors and the "
+        self.emit("Updated internally: QP eigenvalues/eigenvectors and the "
                   "basis representation of stored Sigma(omega)")
+        self.emit("EQP2 eigenvectors: internal to this consistency loop; "
+                  "not serialized")
+        self.emit("QP WFN/rotations: remain the ordinary one-shot "
+                  "full-matrix artifacts; eqp2.dat contains the final "
+                  "EQP2 eigenvalue spectrum only")
         self.emit("Held fixed      : screening, W, and all self-energy diagrams")
         self.emit("Outside grid    : semicore preserves E-E_F; high conduction "
                   "uses the in-grid affine scissor")

@@ -126,9 +126,12 @@ Two rules follow, and both are enforced:
 
 ## 3. L3 — substrate
 
-**Process bootstrap** — `runtime/` (`__init__`, `aot_memory`, `padding`,
-`production_stream`, `xla_memory`, `jax_support`, `pjrt_log_filter`).
-`initialize_communicator_stack()` is the single startup entry point: env
+**Process bootstrap** — `runtime/` (`__init__`, `aot_memory`, `cli_seam`,
+`env_flags`, `padding`, `production_stream`, `xla_memory`, `jax_support`,
+`pjrt_log_filter`).
+`initialize_communicator_stack()` is the single startup entry point
+(`cli_seam` answers `--help`/bad argv before it, in the four drivers whose
+parsers need no jax): env
 before `import jax`, failfast excepthook, CPU-collectives transport,
 `jax.distributed`, GPU-or-CPU, the run's mesh with every communicator already
 created, the compile cache, and a rank-0 report of every choice where more than
@@ -301,7 +304,7 @@ stronger instrument than a level ever was.
 | **R2** | `solvers.sternheimer_solve` → `psp.dft_operators`. The former module-scope `STERN_DEBUG` read and its layering exception were deleted with the orphan debug stream on 2026-08-25. | Is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
 | **R3** | ~~`centroid.kmeans_isdf` → `centroid.orbit_syms` (lazy)~~ — **CLOSED 2026-08-07 by the `symmetry_maps` extraction.** `centroid/orbit_syms.py` left `src/` for `services/symmetry_maps/`; the call site is `from symmetry_maps import canonicalize_orbit`, an edge into a service door, and the `_L2_UPWARD_EXCEPTIONS` entry was deleted in the same commit that moved the module — which is what makes this dissolved rather than relabelled. The prescribed fix (inject the orbit map; signature change) is unaffected and stays registered. | — |
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope — a library mutating global jax configuration for whoever imports it. Same class as `centroid/kmeans_isdf.py`'s `config.update`, removed 2026-07-30. | Not free: the only consumer (`gw/sc_iteration.py:577`) is lazy and always post-`bootstrap()`, but a bare `import mixing.acceleration` in a fresh process would then run Anderson/CROP in **f32, silently**. Physics decision. |
-| — | `gw/__init__.py` sets `JAX_ENABLE_X64` | Argued in place, and shown inert for both GW drivers (they call `bootstrap()` then `jax.config.update` explicitly). Kept for import paths with no bootstrap. |
+| — | `gw/__init__.py` sets `JAX_ENABLE_X64` | Argued in place, and inert for both GW drivers: since 2026-08-27 their startup call owns x64 (`runtime.set_x64_on_imported_jax`; a resolved `False` refuses, override `LORRAX_ALLOW_X64_OFF=1`) — the per-driver `jax.config.update` lines are deleted. Kept for import paths with no bootstrap. |
 | — | `centroid/kmeans_plot.py` sets `MPLBACKEND=Agg` | Not a compute knob. A plotting helper choosing a headless renderer is the correct owner of that choice. |
 
 ---

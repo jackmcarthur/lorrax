@@ -758,7 +758,10 @@ def _read_kchunk_union_sharded_cached(
 """Sharded-slab FFI writer — thin shard_map wrapper around PhdfWriteFfi.
 
 Preferred public entry point for gw_jax / isdf / etc. is
-:mod:`file_io.slab_io`, which has exactly one transport — this one.  The
+:mod:`file_io.slab_io`, whose collective transport is this one — the only
+other backend it has is ``file_io._slab_io_serial``, which serves the
+emulated-mesh geometry that ``open_file`` below refuses (P=1, D>1) and is
+chosen from a mesh predicate rather than from any caller-facing dial.  The
 sentence that used to sit here still offered a choice between "the
 allgather-and-rank-0-h5py backend (default)" and the FFI backend; both
 the router and that backend were deleted at 233a830d, so the choice it

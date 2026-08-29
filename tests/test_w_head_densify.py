@@ -144,11 +144,11 @@ def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path):
     exercised through the real loader, not reasoned about.
     """
     from bse.bse_io import load_bse_data_from_restart_sharded
-    from bse.bse_w_exact import _create_mesh_xy
+    from common.collectives import single_device_mesh
 
     restart = str(tmp_path / "isdf_tensors_test.h5")
     _write_synthetic_restart(restart)
-    mesh_xy = _create_mesh_xy(1, 1)
+    mesh_xy = single_device_mesh()
     kw = dict(n_val=1, n_cond=1, mesh_xy=mesh_xy, inject_head=True,
               cell_volume=270.0, n_occ=2)
     d0 = load_bse_data_from_restart_sharded(restart, bse_k_grid=None, **kw)
@@ -718,6 +718,37 @@ def test_w_head_densify_takes_only_the_two_modes():
     assert resolve_w_head_densify("c1", {"w_head_densify": "legacy"}) == "c1"
     with pytest.raises(ValueError, match="w_head_densify"):
         resolve_w_head_densify("interpolate")
+
+
+def test_w_head_densify_deck_key_reaches_shipping_resolver(tmp_path, capsys):
+    """A strict deck must select the same mode the BSE loader consumes."""
+    from bse.bse_densify import (_read_lorrax_input_quietly,
+                                 resolve_w_head_densify)
+
+    deck = tmp_path / "cohsex.in"
+    deck.write_text(
+        "[cohsex]\nstrict_keys = true\nw_head_densify = legacy\n")
+    params = _read_lorrax_input_quietly(str(deck))
+
+    assert params["w_head_densify"] == "legacy"
+    assert resolve_w_head_densify(None, params) == "legacy"
+    report = capsys.readouterr().out
+    assert "unrecognized deck key" not in report
+    assert "deck read failed" not in report
+
+
+def test_invalid_w_head_densify_deck_value_is_named(tmp_path):
+    """The resolver must report the bad deck token, not its absent CLI arg."""
+    from bse.bse_densify import (_read_lorrax_input_quietly,
+                                 resolve_w_head_densify)
+
+    deck = tmp_path / "cohsex.in"
+    deck.write_text(
+        "[cohsex]\nstrict_keys = true\nw_head_densify = interpolate\n")
+    params = _read_lorrax_input_quietly(str(deck))
+
+    with pytest.raises(ValueError, match="interpolate"):
+        resolve_w_head_densify(None, params)
 
 
 def test_the_head_grid_may_be_nonnested_but_may_not_coarsen():

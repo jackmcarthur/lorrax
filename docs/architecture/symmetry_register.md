@@ -379,7 +379,10 @@ when this flag moves. NOT established: agreement at a converged fixed point
 `tests/regression/gnppm_debug/gnppm_sc.in` is the **only** committed deck with
 `qp_solver = self_consistent`. Before it, every deck was `one_shot_dft`, which
 is why this rotted invisibly: flipping the default would have changed no suite
-result.
+result. Since 2026-08-27 `gw.gw_jax` refuses this deck at entry —
+`self_consistent` beside the dynamic `gn_ppm` — so it now documents the pair
+the driver refuses rather than a runnable configuration
+(`tests/test_qp_solver_config.py`).
 
 `cohsex_debug` (4 vs 3, the sharpest divergence) **cannot run `sc_on_ibz` at
 all**: `centroids_frac_60.txt` is not orbit-closed, so the k-star spread of

@@ -41,10 +41,10 @@ import numpy as np
 
 def _payload(run_dir: str, input_name: str):
     from bse import bse_io
-    from bse.bse_ring_comm import create_mesh_xy
+    from common.collectives import single_device_mesh
     input_path = os.path.join(run_dir, input_name)
     restart = bse_io._find_restart_file(input_path)
-    mesh = create_mesh_xy(1, 1)
+    mesh = single_device_mesh()
     # FULL chi0 band window on both legs — band-window parity with the W_R
     # kernel, same reasoning as w_ladder.compute_wc_qwedge.
     data = bse_io.load_bse_data_from_restart_sharded(

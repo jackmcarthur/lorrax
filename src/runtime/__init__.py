@@ -14,11 +14,12 @@ The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
 ``centroid.kmeans_cli``, ``psp.get_dipole_mtxels``, ``gw.kin_ion_io``,
 ``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
 each making exactly ONE module-top call, gated per driver by
-``tests/test_crossfile_requests.py`` (the R1 audit).  The two BSE CLIs that
-take ``--px/--py`` still start on the canonical square mesh; a different
-(square) shape goes through :meth:`RuntimeStack.reshape` (or the BSE factory
-``bse.bse_ring_comm.create_mesh_xy``, which reuses the startup mesh whenever
-the requested shape matches it).  Only square meshes are supported (repo
+``tests/test_crossfile_requests.py`` (the R1 audit).  Since 2026-08-27 the BSE
+CLIs that take ``--px/--py`` do not reshape: all six resolve the flags through
+``bse.bse_ring_comm.create_mesh_xy_from_flags``, which returns this startup
+mesh itself when they are omitted and refuses any shape that is not it, so the
+run has exactly one mesh object.  :meth:`RuntimeStack.reshape` remains for
+``gw.downfold_cli``, its only caller.  Only square meshes are supported (repo
 ``docs/architecture/decisions.md`` 2026-08-01); both paths refuse
 ``px != py``.
 
@@ -169,6 +170,9 @@ __all__ = [
     "install_failfast_excepthook",
     "pin_matmul_precision",
     "read_matmul_precision",
+    "enforce_x64",
+    "set_x64_on_imported_jax",
+    "X64_OVERRIDE_ENV",
 ]
 
 
@@ -418,6 +422,117 @@ def install_failfast_excepthook() -> None:
     sys._lorrax_failfast_installed = True
 
 
+#: jax's own 64-bit variable, and the named override that lets a run proceed
+#: without it.  x64 off refuses; a deliberate 32-bit debug run has exactly one
+#: spelling for the opt-out, and it is printed on every startup.
+_X64_ENV = "JAX_ENABLE_X64"
+X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
+
+
+def _x64_requested():
+    """:data:`_X64_ENV` read through **jax's own** grammar; ``None`` if unset.
+
+    Mirrors ``jax._src.config.bool_env`` (``y yes t true on 1`` /
+    ``n no f false off 0``, case-folded) for the same reason
+    :func:`_check_allocator_env` mirrors jaxlib's allocator tuple: this
+    value is used to decide whether the run is 64-bit, so a laxer reading
+    here would certify as x64 a process that jax is about to run in f32.
+
+    An unrecognised spelling returns ``None`` rather than refusing: jax
+    raises on it at import, naming the variable and the value, and a second
+    refusal three lines earlier would only be a worse-worded copy.
+    """
+    raw = os.environ.get(_X64_ENV)
+    if raw is None:
+        return None
+    v = raw.lower()
+    if v in ("y", "yes", "t", "true", "on", "1"):
+        return True
+    if v in ("n", "no", "f", "false", "off", "0"):
+        return False
+    return None
+
+
+def set_x64_on_imported_jax():
+    """Apply the resolved :data:`_X64_ENV` to a jax that is ALREADY imported.
+
+    Setting the variable is enough only when jax is imported after it: jax
+    latches x64 once, when ``jax._src.config`` is first imported.  An entry
+    point that imports jax first and the driver second leaves it latched at
+    whatever the environment said before the runtime ran --
+    ``tools/profile_gw_xprof.py`` (``import jax`` at :20, ``from gw import
+    gw_jax`` at :68) takes that order, and so does any test or notebook that
+    touches jax before a driver.  Measured 2026-08-27 (WSL box, jax 0.9.1,
+    JAX_PLATFORMS=cpu, ``env -u JAX_ENABLE_X64``): in that order the process
+    ran with ``jnp.zeros(1, dtype=float).dtype == float32``, silently, for
+    the whole run.  The flag is set here rather than re-asserted in each
+    driver, which only covered the drivers that remembered it.
+
+    Never imports jax: ``sys.modules.get`` only.  In the ordinary order
+    (driver first) jax is not loaded yet, this returns ``None``, and jax
+    reads the variable itself at import as before.
+
+    Returns the value applied, or ``None`` when there was nothing to apply.
+    """
+    import sys
+    jax = sys.modules.get("jax")
+    if jax is None:
+        return None
+    want = _x64_requested()
+    if want is None:
+        return None
+    jax.config.update("jax_enable_x64", want)
+    return want
+
+
+def enforce_x64(resolved, *, where: str, say=None) -> None:
+    """REFUSE a run whose 64-bit values are off.  Announce a named opt-out.
+
+    ``resolved`` is a bool, or ``None`` for "not determinable here" (an
+    unset variable before jax exists, or a spelling jax itself will refuse),
+    which passes.
+
+    A refusal and not a warning: LORRAX physics is complex128 throughout
+    (``ffi/io.py:329-351`` refuses an int64 dataset opened with x64 off for
+    the same reason), so x64 off is not a slower answer but a different one,
+    and every consequence of it -- a c64 Σ, an f32 eigenvalue solve -- is
+    invisible in the output.
+
+    Two call sites, two different causes:
+
+    * :func:`set_default_env` -- the request (``JAX_ENABLE_X64=0`` in the
+      environment).  The only point that precedes jax's first array, and the
+      one that makes the answer uniform across all eight drivers: before
+      this, an explicit ``=0`` meant f32 in the four drivers no library
+      re-armed and f64 in the four it did.
+    * step 8a of :func:`initialize_communicator_stack` -- the resolved flag
+      read back off the live jax (``collect_startup_facts``' ``x64``).  This
+      is the sufficient check: it fires whatever turned x64 off, including a
+      library ``config.update`` after step 1 and an ``update`` that did not
+      take, neither of which the request check can see.
+    """
+    if resolved is None or resolved:
+        return
+    emit = say if say is not None else _print_rank0
+    from .env_flags import env_bool
+    if env_bool(X64_OVERRIDE_ENV, False, print_fn=emit):
+        emit(f"  [runtime] {X64_OVERRIDE_ENV}=1: 64-bit values are OFF "
+             f"({where}).  This run is UNCERTIFIED -- LORRAX physics is "
+             f"complex128 throughout and every result below is f32/c64.")
+        return
+    raise RuntimeError(
+        f"64-bit values are OFF and this run refuses to continue.\n"
+        f"  got   x64 = False ({where})\n"
+        f"  want  x64 = True -- LORRAX physics is complex128 throughout; "
+        f"with x64 off every array silently becomes f32/c64 and the run "
+        f"produces different numbers, not slower ones.\n"
+        f"  fix   unset {_X64_ENV} (the runtime sets it to 1 itself), or "
+        f"set {_X64_ENV}=1.\n"
+        f"  doc   runtime.set_default_env (step 1 of "
+        f"initialize_communicator_stack); {X64_OVERRIDE_ENV}=1 runs anyway "
+        f"and says so on every startup.")
+
+
 def set_default_env(*, platform: str = "gpu") -> None:
     """Set LORRAX's canonical JAX env defaults.
 
@@ -428,7 +543,10 @@ def set_default_env(*, platform: str = "gpu") -> None:
     client is created; in this package that is the ``jax.devices()`` inside
     :func:`fallback_to_cpu_if_no_gpu_backend`.  A ``setdefault`` after that
     point sets the string and changes nothing (see the WHY note below).
-    Uses ``setdefault`` so any caller-provided override wins.
+    Uses ``setdefault`` so any caller-provided override wins -- with one
+    exception, ``JAX_ENABLE_X64``: an explicit ``=0`` REFUSES here
+    (:func:`enforce_x64`), because that override does not make the run
+    cheaper, it makes it a different calculation.
 
     ``platform="gpu"`` (default) sets ``JAX_PLATFORMS="cuda,cpu"`` so
     JAX tries CUDA and falls back to CPU.  ``platform="cpu"`` forces CPU.
@@ -491,7 +609,12 @@ def set_default_env(*, platform: str = "gpu") -> None:
     A caller-supplied ``XLA_PYTHON_CLIENT_ALLOCATOR`` is VALIDATED here —
     see :func:`_check_allocator_env`.
     """
-    os.environ.setdefault("JAX_ENABLE_X64", "1")
+    os.environ.setdefault(_X64_ENV, "1")
+    # The line above covers only the import order where jax comes second;
+    # set_x64_on_imported_jax covers the other one.  enforce_x64 refuses an
+    # explicit ``=0`` here, before the first array exists.
+    enforce_x64(_x64_requested(), where=f"the {_X64_ENV} environment variable")
+    set_x64_on_imported_jax()
     # HDF5 FILE LOCKING OFF BY DEFAULT (audit A1, 2026-08-15).  A LORRAX
     # process maps TWO independent HDF5 library instances — h5py's bundled
     # wheel libhdf5 and the FFI's cray libhdf5_parallel — and the stores
@@ -1299,9 +1422,19 @@ class RuntimeStack:
 
         FOR THE ONE CASE THE STARTUP CALL CANNOT SERVE.  The entry point
         runs above ``import jax``, so it cannot know a mesh shape that comes
-        from the command line — and ``bse.exciton_bands`` / ``bse.bse_w_exact``
-        take ``--px``/``--py``.  Those drivers still make ONE startup call;
-        they follow it with this, after argparse.
+        from the command line.  ``gw.downfold_cli`` is the one caller
+        (2026-08-27): the BSE drivers used to be the reason this method
+        exists, and since that date they resolve ``--px/--py`` through
+        ``bse.bse_ring_comm.create_mesh_xy_from_flags`` instead, which never
+        reshapes.
+
+        The BSE family now depends on staying out of here.  This swaps
+        ``self.mesh`` without touching ``collectives._CANONICAL_MESHES``, so
+        after a reshape a bare ``resolve_mesh()`` still returns the startup
+        mesh.  ``create_mesh_xy_from_flags``'s omitted arm goes through
+        ``create_mesh_2d`` -> ``resolve_mesh``, so a BSE driver that reshaped
+        would be handed a mesh that is not ``RUNTIME.mesh``.  Unreachable
+        today only because no BSE driver reshapes.
 
         Not a second mesh in the sense the re-entry guard refuses: the old
         one is dropped, the new one is warmed by the same
@@ -1334,6 +1467,18 @@ class RuntimeStack:
                       axis_names=tuple(self.mesh.axis_names))
         self.mesh = prepare_mesh(wanted, axis_names=tuple(self.mesh.axis_names),
                                  print_fn=say)
+        # facts and report still describe the old mesh.  Refresh every
+        # mesh-derived facts entry (collect_startup_facts reads the mesh in
+        # exactly these three), then rebuild the report — both formatters
+        # are pure functions of facts, so this keeps report == f(facts).
+        # common.scientific_output.architecture_lines reads the facts
+        # (facts["mesh_shape"]), not the report.
+        self.facts["mesh_shape"] = self.mesh_shape
+        self.facts["mesh_axes"] = tuple(self.mesh.axis_names)
+        self.facts["linalg"] = _linalg_facts(self.mesh)
+        self.report = tuple(
+            format_startup_report(self.facts) if debug_print_enabled()
+            else format_production_startup_report(self.facts))
         say(f"  The startup mesh {old[0]}x{old[1]} was replaced by the "
             f"{int(px)}x{int(py)} mesh this driver's arguments asked for, and "
             f"the new mesh's communicator cliques were warmed before the "
@@ -1370,7 +1515,9 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        XLA_PYTHON_CLIENT_PREALLOCATE=false, the allocator-spelling refusal,
        the glibc malloc tuning, and the first arming of the CPU-only plugin
        skip.  MUST precede the first backend init; jax reads x64 at import
-       and the GPU knobs when the CUDA client is built.
+       and the GPU knobs when the CUDA client is built.  x64 is also set on a
+       jax that was already imported (:func:`set_x64_on_imported_jax`),
+       because the variable alone covers only one of the two import orders.
     2. :func:`announce_cpu_collectives` -- after (1), because it reads the
        RESOLVED ``JAX_PLATFORMS``; before any collective, because gloo's
        reduce-scatter corrupts silently and the operator has to learn that
@@ -1424,6 +1571,11 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        while the compile cache and all compatibility checks remain live.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
+    8a. :func:`enforce_x64` on the resolved flag the report just measured.
+       Here as well as at (1), because the two see different things: (1)
+       sees the request, this one sees what actually happened to the flag
+       -- a library ``config.update`` after step 1, or an ``update`` that
+       did not take.  It costs one dict read.
 
     Parameters
     ----------
@@ -1510,6 +1662,10 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     _t_cache = time.perf_counter()
     # -- 8 ------------------------------------------------------------------
     facts = collect_startup_facts(mesh, cache_error=cache_error)
+    # -- 8a -----------------------------------------------------------------
+    enforce_x64(facts["x64"], say=say,
+                where="jax.config.read('jax_enable_x64'), read back off the "
+                      "live client at step 8")
     # ``jax_import`` is CARVED OUT of ``env_and_distributed``, not added
     # beside it: the rows have to keep summing to ``total`` or every driver
     # epilogue that re-records them (htransform, gw_jax, bse_jax) breaks its
@@ -2483,8 +2639,10 @@ def format_startup_report(f: dict) -> list:
     else:
         add("  The JAX persistent compile cache is OFF, so every rank "
             "compiles every module in this run; set ISDF_JAX_CACHE_DIR to a "
-            "rank-visible directory, or unset it to take the $SCRATCH "
-            "default, to turn it on.")
+            "rank-visible directory to turn it on, or leave it unset and let "
+            "the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache "
+            "first, then $SCRATCH/lorrax_jax_cache, then the home cache "
+            "(docs/dev/env_vars.md).")
     add("  The cache key includes every array shape, so a system size this "
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")

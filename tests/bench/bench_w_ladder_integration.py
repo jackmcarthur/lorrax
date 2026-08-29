@@ -16,7 +16,9 @@ Argv-driven (tests/bench convention; pytest does not collect this directory).
                     ``--block``, ``--x0``).  The minimal-fixture leg: default
                     16 probe columns, 1 q, 1 z.
 
-Scope of every number: single process, whatever ``lx run -G`` gave it.
+Scope of every number: single process, on the whole mesh ``lx run -G`` gave it
+(``--mesh`` omitted; it defaulted to ``1,1`` until 2026-08-27, so numbers taken
+before that date were one device wide however many the job held).
 """
 from __future__ import annotations
 
@@ -187,15 +189,23 @@ def _wedge_setup(args):
     """Payload + engine + one q-shifted payload — shared by matvec/solve."""
     import jax
     from bse import bse_io
-    from bse.bse_ring_comm import create_mesh_xy
+    from bse.bse_ring_comm import create_mesh_xy_from_flags
     from bse.bse_feast import (build_preconditioner_diagonal_sharded,
                                ladder_matvec_operands, matvec_operands)
     from bse.bse_w_exact import (build_finite_q_data, enforce_trs_pair_gauge,
                                  _symmetry_tables)
     from bse.w_ladder import build_ladder_resolvent
 
-    px, py = (int(s) for s in args.mesh.split(","))
-    mesh = create_mesh_xy(px, py)
+    # ``--mesh`` omitted = the run's mesh, the same rule the six bse drivers'
+    # --px/--py follow since 2026-08-27.  It defaulted to "1,1", so every
+    # number this bench ever printed under ``lx run -G 4`` was measured on one
+    # of the four GPUs while the header said otherwise — the same defect the
+    # drivers were fixed for, in the instrument used to judge them.  (It is
+    # now also a refusal, not a quiet 1x1: create_mesh_xy rejects a shape that
+    # does not consume the device list.)
+    px, py = ((None, None) if args.mesh is None
+              else tuple(int(s) for s in args.mesh.split(",")))
+    mesh = create_mesh_xy_from_flags(px, py)
     input_path = os.path.join(args.run_dir, args.input)
     restart = bse_io._find_restart_file(input_path)
     data = bse_io.load_bse_data_from_restart_sharded(
@@ -520,7 +530,10 @@ def main(argv=None):
     # --mode solve
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--input", default="gnppm_test.in")
-    ap.add_argument("--mesh", default="1,1")
+    ap.add_argument("--mesh", default=None,
+                    help="px,py.  Omitted = the run's canonical square mesh "
+                         "(bse_ring_comm.create_mesh_xy_from_flags); a given "
+                         "shape must BE that mesh.")
     ap.add_argument("--cols", type=int, default=16)
     ap.add_argument("--q-index", default="0")
     ap.add_argument("--zs", default="0")

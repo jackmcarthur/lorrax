@@ -55,11 +55,72 @@ window, ``bispinor``, the WFN's FFT grid), and the resolved values are
 stamped into the output so the generator and the GW run cannot silently
 disagree.  ``--sys_dim`` may only *confirm* the deck, never contradict it.
 
+What the compile cache is worth here
+------------------------------------
+Step 7 of ``runtime.initialize_communicator_stack`` arms the persistent
+compile cache at import, above every jit in this file.  Without one, this
+CLI re-lowers every kernel on every invocation: REPORTED, UNVERIFIED (no
+artifact path survives in the record) — at nb=256, 40 s of recorded
+sections inside a 124 s run.  The per-k kernels recompile once per
+DISTINCT ngk (the COMPILE NOTE in :func:`compute_hartree_matrix`), so the
+miss count is the IBZ k-count, not one.  A cache FAILURE is demoted to the
+``compile_cache_error`` line of the startup report, not refused, so "the
+cache is armed" is a report field to read rather than a guarantee.
+
 Usage:
   python -m gw.kin_ion_io -i cohsex.in -o kin_ion.h5 [-n NB] [--no-hartree]
 """
 
+import argparse
 import os
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    """The CLI's argument parser.
+
+    Split out of :func:`main` so the V_H defaults are pinnable by a unit
+    test without running the generator, and kept ABOVE the startup call
+    so ``--help`` can reach it without one (:mod:`runtime.cli_seam`).
+    """
+    argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
+    argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
+    argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
+    argp.add_argument("--report-file", default=None,
+                      help="human-readable report (default: kin_ion.out beside output)")
+    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
+    argp.add_argument("--sys_dim", type=int, default=None,
+                      help="system dimensionality: 0, 2, or 3.  Must AGREE with "
+                           "the input file when the file specifies it.")
+    argp.add_argument("--pseudo_dir", default=None,
+                      help="directory containing *.upf files (default: input file dir)")
+    argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
+                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
+                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
+                           "itself stays pristine T+V_loc+V_NL)")
+    argp.add_argument("--no-hartree", dest="hartree", action="store_false",
+                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
+                           "the GW run must supply V_H from the ISDF V_q[0] tile")
+    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
+                      default=False,
+                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
+                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
+                           "reproducing old artifacts — the stored-array default is "
+                           "strictly better (kin_ion stays reusable, QSGW gets the "
+                           "full matrix, and the VH column stops reading 0.000).")
+    # There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
+    # resolved automatically, always — scalar pseudos quietly, QE's
+    # <spinorbit> authoritatively, nspinor=1 by force, and the FR + nspinor=2
+    # + BGW-WFN case by MEASUREMENT against the wavefunctions
+    # (psp.vnl_ops.measure_soc_mode).  The verdict is announced in the
+    # report's pathways block and stamped into the artifact.
+    return argp
+
+
+if __name__ == "__main__":
+    # Argv is answered before any runtime exists — runtime/cli_seam.py.
+    from runtime.cli_seam import refuse_bad_argv
+    refuse_bad_argv(build_argparser())
+
 
 # ---- join the distributed world BEFORE anything touches XLA ------------
 # THE startup call (runtime module docstring): env defaults, fail-fast
@@ -73,8 +134,6 @@ import os
 from runtime import (debug_print, debug_print_enabled,         # noqa: E402
                      initialize_communicator_stack, rank0_print)
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
-
-import argparse                                               # noqa: E402
 
 import numpy as np
 import jax.numpy as jnp
@@ -117,11 +176,6 @@ from psp.get_DFT_mtxels import (
 )
 from psp.operator_checks import validate_operator_inputs
 import psp.vnl_ops as vnl_ops
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
-
 from runtime.production_stream import ProductionStdout          # noqa: E402
 
 
@@ -924,46 +978,6 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         return broadcast_ibz_to_full_bz(H_host, sym)
 
 
-def build_argparser() -> argparse.ArgumentParser:
-    """The CLI's argument parser.
-
-    Split out of :func:`main` so the V_H defaults are pinnable by a unit
-    test without running the generator.
-    """
-    argp = argparse.ArgumentParser(description="Chunked kin+ion computation")
-    argp.add_argument("-i", "--input", required=True, help="cohsex / GW input file")
-    argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
-    argp.add_argument("--report-file", default=None,
-                      help="human-readable report (default: kin_ion.out beside output)")
-    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
-    argp.add_argument("--sys_dim", type=int, default=None,
-                      help="system dimensionality: 0, 2, or 3.  Must AGREE with "
-                           "the input file when the file specifies it.")
-    argp.add_argument("--pseudo_dir", default=None,
-                      help="directory containing *.upf files (default: input file dir)")
-    argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
-                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
-                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
-                           "itself stays pristine T+V_loc+V_NL)")
-    argp.add_argument("--no-hartree", dest="hartree", action="store_false",
-                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
-                           "the GW run must supply V_H from the ISDF V_q[0] tile")
-    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
-                      default=False,
-                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
-                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
-                           "reproducing old artifacts — the stored-array default is "
-                           "strictly better (kin_ion stays reusable, QSGW gets the "
-                           "full matrix, and the VH column stops reading 0.000).")
-    # There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
-    # resolved automatically, always — scalar pseudos quietly, QE's
-    # <spinorbit> authoritatively, nspinor=1 by force, and the FR + nspinor=2
-    # + BGW-WFN case by MEASUREMENT against the wavefunctions
-    # (psp.vnl_ops.measure_soc_mode).  The verdict is announced in the
-    # report's pathways block and stamped into the artifact.
-    return argp
-
-
 def main(argv=None):
     import time as _time
     _t_main = _time.perf_counter()
@@ -1009,15 +1023,8 @@ def main(argv=None):
     report.begin(input_file=args.input)
     report.architecture(mesh_role="band-matrix axes X x Y")
 
-    # Persistent compile cache — same call, same position (after the
-    # distributed init, before any jit) as gw.gw_jax:145.  Without it this
-    # CLI re-lowers every kernel on every invocation, which at nb=256 is
-    # most of the wall: 40 s of recorded sections inside a 124 s run.  The
-    # per-k kernels here recompile once per DISTINCT ngk (see the COMPILE
-    # NOTE in compute_hartree_matrix), so the miss count is the IBZ k-count,
-    # not one.
-    from common.jax_compile_cache import ensure_jax_compile_cache
-    ensure_jax_compile_cache()
+    # Compile cache: armed at import by step 7 of initialize_communicator_stack
+    # (see this module's docstring, "What the compile cache is worth here").
 
     # ---- the multi-rank contract: DISTRIBUTE, then write once -----------
     # This used to refuse ``srun -n P`` outright, because every rank redid

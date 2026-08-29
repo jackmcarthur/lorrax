@@ -69,6 +69,7 @@ def test_full_sigma_cube_rotation_is_u_dagger_sigma_u():
                                rtol=2e-13, atol=2e-13)
 
 
+@pytest.mark.mesh(4)
 def test_full_sigma_cube_rotation_stays_two_axis_sharded_on_p4():
     if len(jax.devices()) < 4:
         pytest.skip("requires four visible devices")
