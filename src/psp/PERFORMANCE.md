@@ -96,23 +96,23 @@ before implementing.
    an analytic Fourier expression (V_pert ≡ 1 → only G=0 component
    survives).  Save: 1-2 of the 12 FFT plan-find compiles, ~0.3 s.
 
-3. **`compute_dZ=True` velocity path is still eager — MEASURED, patch
-   banked, NOT shipped (2026-08-28: it is an ulp change).**
-   `_build_vnl_kdata_core` keeps the `compute_dZ=True` block eager
-   because of a per-channel Python loop that re-traces three `jax.jvp`s
-   through the solid harmonics on EVERY k.  Measured on the Si 4×4×4 SR
-   deck (CPU x64, ngkmax=588, total_R=36): **48.9 ms/k** eager steady
-   state vs **0.70 ms/k** for the `compute_dZ=False` twin — ~3.1 s over
-   a 64-point full-BZ sweep, growing with nk and channel count.
-   A module-scope jit (`_assemble_Z_dZ_jit`, static per-channel
-   metadata, loop unrolled at trace) gets **1.31 ms/k** (37×) and cuts
-   first-call 1300→453 ms — but XLA fusion moves ~26 % of Z/dZ elements
-   by ≤1.4e-16 (1-ulp class; this project has seen a 1-ulp einsum change
-   flip a pivoted-Cholesky pivot), so it is an OWNER DECISION, not a
-   perf patch.  The finished, bitwise-compared patch + evidence live in
-   the 2026-08-28 session scratchpad (`taskB/dz_jit_candidate.patch`).
-   Note the `mtxel_sweep` dipole path already runs this math traced
-   (inside `lax.scan`), so only the eager consumers are affected:
+3. **DONE (2026-08-28, owner approved the ulp change): `compute_dZ=True`
+   path is jitted (`_assemble_Z_dZ_jit`).**
+   Historically the block ran eager — a per-channel Python loop
+   re-traced three `jax.jvp`s through the solid harmonics on EVERY k.
+   Measured on the Si 4×4×4 SR deck (CPU x64, ngkmax=588, total_R=36):
+   **51.5 ms/k** eager steady state vs **0.69 ms/k** for the
+   `compute_dZ=False` twin.  The module-scope jit (static per-channel
+   metadata, loop unrolled at trace) gets **1.38 ms/k** (37×), cuts
+   first-call 3312→515 ms, and took the finite-q dipole producer's
+   velocity-prep stage 5.25→2.17 s on that deck (total run 7.28→4.60 s).
+   NOT bitwise: XLA fusion moves ~26 % of Z/dZ elements by ≤1.4e-16
+   (1-ulp; this project has seen a 1-ulp einsum change flip a
+   pivoted-Cholesky pivot), which the owner accepted 2026-08-28.
+   Artifact-level deltas on the SR Si deck: `dipole_cart`/`deltaE`
+   BITWISE (the `mtxel_sweep` q=0 lane was already traced and inlines
+   the same jaxpr), `finite_q/rho_cvkq` bitwise, `finite_q/v_cvkq`
+   max rel 2.4e-16.  The eager consumers that gained:
    `get_dipole_mtxels.compute_vnl_velocity_cart`, its finite-q SOS
    loop, and `orbital_magnetization`.
 

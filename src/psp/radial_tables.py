@@ -260,8 +260,18 @@ def build_all_tables(
     species_list: list[SpeciesData],
     q_max: float,
     n_q: int = 4000,
+    *,
+    projectors: bool = True,
 ) -> dict:
     """Build Hankel tables for all species on a uniform q-grid.
+
+    ``projectors=False`` builds only the l=0 rows (vloc + nlcc) and sets
+    ``proj_tables`` / ``deriv_tables`` to ``None`` so an accidental
+    consumer fails loudly instead of reading zeros.  The caller is
+    ``ionic_gspace.build_ionic_and_core``, which consumes ONLY the l=0
+    rows: at its ecut-independent dq (~47k nodes on a 24-cubed Si box)
+    the projector/deriv rows it would throw away cost ~8.3 s of the
+    8.5 s build, the l=0 rows 0.2 s (measured 2026-08-28, WSL CPU x64).
 
     Per-species the per-projector forward (F_l) and analytic-deriv
     raw-Hankel (H_{l+1}) tables are produced in two batched JAX kernel
@@ -327,6 +337,9 @@ def build_all_tables(
             nlcc[i] = l0_np[1]
             has_nlcc[i] = True
 
+        if not projectors:
+            continue
+
         # ── Projector forward + deriv tables, grouped by l (resp. l+1) ──
         # β integrals use QE's convention (upflib/beta_mod.f90 init_tab_beta):
         # simpsn weights over EXACTLY kkbeta points, NOT the full mesh.
@@ -372,5 +385,5 @@ def build_all_tables(
     return dict(q=q, dq=float(q[1] - q[0]) if n_q > 1 else 1.0,
                 vloc=vloc, nlcc=nlcc,
                 has_vloc=has_vloc, has_nlcc=has_nlcc,
-                proj_tables=proj_tables,
-                deriv_tables=deriv_tables)
+                proj_tables=proj_tables if projectors else None,
+                deriv_tables=deriv_tables if projectors else None)

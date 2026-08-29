@@ -856,8 +856,9 @@ def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
     operands — which is what forbids the eager entry point inside a
     trace: ``np.asarray`` on a ``lax.scan`` carry raises
     ``TracerArrayConversionError``.  The core is already pure jax in
-    both branches (``_assemble_Z_jit`` for ``compute_dZ=False``, jnp +
-    ``jax.jvp`` for the derivative), so nothing else has to change.
+    both branches (``_assemble_Z_jit`` for ``compute_dZ=False``,
+    ``_assemble_Z_dZ_jit`` for the derivative — a jit call inside a
+    trace inlines), so nothing else has to change.
 
     The caller is ``common.mtxel_sweep``'s V_NL and dipole operators,
     which build Z (and dZ) for the scan's current k.  Everything the
@@ -866,6 +867,83 @@ def build_vnl_kdata_traced(kvec, Gk_int, setup: VNLSetup, *,
     body lowers ONCE for the whole sweep.
     """
     return _build_vnl_kdata_core(kvec, Gk_int, setup, compute_dZ=compute_dZ)
+
+
+@functools.partial(jax.jit, static_argnames=('l_max', 'chan_meta'))
+def _assemble_Z_dZ_jit(
+    kvec, Gk_int,
+    B, dq, G_table, Gp_table, prefactor,
+    row_beta_idx, row_l, row_m, row_tau, chan_taus,
+    *, l_max, chan_meta,
+):
+    """JIT'd body of ``_build_vnl_kdata_core`` for ``compute_dZ=True``.
+
+    Returns ``(Z, dZ)`` with shapes ``(total_R, nG)`` / ``(3, total_R, nG)``.
+
+    The per-channel Python loop is NOT vectorised — it UNROLLS at trace
+    time, which is the right cost model: ``chan_meta`` is one entry per
+    (species, l) channel (3 for Si, ~n_species·(l_max+1) in general —
+    tens at production scale, independent of natoms), and each entry's
+    static ints (l, nbeta, natoms, beta_table_start, R) shape its block.
+    ``chan_taus`` (one ``(natoms, 3)`` array per channel) rides along as
+    a pytree operand so atom positions stay dynamic.
+
+    WHY THIS EXISTS: the historical eager path re-traced three
+    ``jax.jvp``s through the solid harmonics per channel on EVERY k —
+    measured 48.9-51.5 ms/k on the Si 4x4x4 SR deck (vs 0.7 ms/k for the
+    ``compute_dZ=False`` twin), i.e. ~3.3 s of pure re-trace over a
+    64-point full-BZ finite-q dipole sweep.  Jitting with the loop
+    unrolled lowers ONCE per (shape, chan_meta) and replays from the
+    compile cache.  Same primitives in the same order as the eager block
+    it replaces — only the dispatch changed — but XLA fusion moves ~26 %
+    of Z/dZ elements by <=1.4e-16 (1-ulp class; owner accepted the shift
+    2026-08-28).
+    """
+    from psp.radial.solid_harmonics import all_solid_harmonics
+
+    nG = Gk_int.shape[0]
+    K_crys = Gk_int.astype(jnp.float64) + kvec[None, :]
+    K_cart = K_crys @ B
+    # Regularizer: see _assemble_Z_jit.
+    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
+
+    G_all = _interp_with_deriv(q, dq, G_table, Gp_table)
+    S_all = all_solid_harmonics(K_cart, l_max=l_max)
+
+    G_r = G_all[row_beta_idx]
+    S_r = S_all[row_l, row_m]
+    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ row_tau.T)).T
+    c_il_r = prefactor * (1j) ** row_l
+    Z = c_il_r[:, None] * G_r * S_r * phase_r             # (total_R, nG)
+
+    K_over_q = K_cart / q[:, None]
+    Gp_all = _table_interp(q, dq, Gp_table)
+    dZ_blocks = []
+    for (l, nbeta, natoms, beta_table_start, R), tau_j in zip(
+            chan_meta, chan_taus):
+        c_il = prefactor * (1j) ** l
+
+        G_bG = G_all[beta_table_start:beta_table_start + nbeta]
+        Gp_bG = Gp_all[beta_table_start:beta_table_start + nbeta]
+        S = S_all[l, :2 * l + 1]
+        phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T
+
+        dS = jnp.stack([
+            jax.jvp(lambda K, l=l: _solid_harmonics_jax(l, K),
+                    (K_cart,), (jnp.zeros((nG, 3)).at[:, j].set(1.0),))[1]
+            for j in range(3)
+        ], axis=0)
+
+        Binv = jnp.linalg.inv(B)
+        dphase = -2j * jnp.pi * (tau_j @ Binv.T)[:, :, None] * phase[:, None, :]
+        drad = Gp_bG[None, :, :] * K_over_q.T[:, None, :]
+        core = drad[:, :, None, :] * S[None, None, :, :] + G_bG[None, :, None, :] * dS[:, None, :, :]
+        dZ_core = c_il * phase[:, None, None, None, :] * core[None, :]
+        radS = G_bG[:, None, :] * S[None, :, :]
+        dZ_phase = c_il * radS[None, None, :, :, :] * dphase[:, :, None, None, :]
+        dZ_blocks.append((dZ_core + dZ_phase).transpose(1, 0, 2, 3, 4).reshape(3, natoms * R, nG))
+    dZ = jnp.concatenate(dZ_blocks, axis=1)
+    return Z, dZ
 
 
 @functools.partial(jax.jit, static_argnames=('l_max',))
@@ -940,79 +1018,67 @@ def _build_vnl_kdata_core(
         return VNLKData(Z=Z, E_super=setup.E_super, nG=nG,
                         total_R=setup.total_R, dZ=None)
 
-    # ── compute_dZ=True path: still eager (used by get_dipole_mtxels).
-    #    TODO: jit this too once the per-channel for-loop is vectorised.
-    from psp.radial.solid_harmonics import all_solid_harmonics
+    # ── compute_dZ=True path: jitted at module scope (_assemble_Z_dZ_jit),
+    #    same math, static per-channel metadata.  Historically this branch
+    #    ran EAGER — every call re-traced three jax.jvp's through the solid
+    #    harmonics per channel, ~50 ms/k measured on the Si 4x4x4 SR deck
+    #    (PERFORMANCE.md item 3) — and is 1-ulp-equivalent jitted.
+    #
+    # ``compute_dZ=True`` PROMISES AN ARRAY, and the empty-channel case
+    # used to break that promise silently.  A setup with no channels
+    # (no pseudopotentials loaded, or none covering the structure)
+    # produces no dZ blocks; returning ``None`` there handed a
+    # `NoneType` to ``apply_vnl_velocity_to_ket``, which conjugates its
+    # ``dZ`` argument — so the failure surfaced ~30 s later as
+    # ``TypeError: conjugate requires ndarray or scalar arguments`` six
+    # frames inside a jitted einsum, naming neither the deck nor the
+    # missing file.  ``Z`` already degrades gracefully in that case (it
+    # is the ``(0, nG)`` empty projector matrix and every contraction
+    # through it is zero); ``dZ`` degrades the SAME way, at
+    # ``(3, total_R, nG)`` with ``total_R == 0``.
+    #
+    # THIS IS THE SECOND LINE OF DEFENCE, NOT THE FIX.  A zero V_NL
+    # velocity is the arithmetically correct answer for an empty
+    # projector set and the wrong ANSWER for a real deck, which is why
+    # the drivers must refuse the empty set up front —
+    # ``psp.operator_checks.validate_operator_inputs``, now called by
+    # ``get_dipole_mtxels`` as it already was by ``gw.kin_ion_io`` and
+    # ``get_DFT_mtxels``.  What this branch buys is that the kernel's
+    # documented contract is true for every caller, including the ones
+    # that legitimately hold no projectors.
+    if not setup.channels:
+        Z = _assemble_Z_jit(
+            jnp.asarray(kvec, dtype=jnp.float64),
+            jnp.asarray(Gk_np, dtype=jnp.int32),
+            jnp.asarray(setup.B, dtype=jnp.float64),
+            jnp.asarray(setup.dq, dtype=jnp.float64),
+            setup.G_table, setup.Gp_table,
+            jnp.asarray(setup.prefactor, dtype=jnp.float64),
+            setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
+            l_max=int(setup.l_max),
+        )
+        return VNLKData(Z=Z, E_super=setup.E_super, nG=nG,
+                        total_R=setup.total_R,
+                        dZ=jnp.zeros((3, int(setup.total_R), nG),
+                                     dtype=Z.dtype))
 
-    K_crys = jnp.asarray(Gk_np, dtype=jnp.float64) + jnp.asarray(kvec)[None, :]
-    B_j = jnp.asarray(setup.B, dtype=jnp.float64)
-    K_cart = K_crys @ B_j
-    q = jnp.sqrt(jnp.sum(K_cart ** 2, axis=1) + 1e-8)
-
-    G_all = _interp_with_deriv(q, setup.dq, setup.G_table, setup.Gp_table)
-    S_all = all_solid_harmonics(K_cart, l_max=setup.l_max)
-
-    G_r = G_all[setup.row_beta_idx]
-    S_r = S_all[setup.row_l, setup.row_m]
-    phase_r = jnp.exp(-2j * jnp.pi * (K_crys @ setup.row_tau.T)).T
-    c_il_r = setup.prefactor * (1j) ** setup.row_l
-
-    Z = c_il_r[:, None] * G_r * S_r * phase_r             # (total_R, nG)
-
-    # dZ for velocity (optional — still uses per-channel JVP, TODO: vectorize)
-    dZ_j = None
-    if compute_dZ:
-        K_over_q = K_cart / q[:, None]
-        Gp_all = _table_interp(q, setup.dq, setup.Gp_table)
-        dZ_blocks = []
-        for ch in setup.channels:
-            l, nbeta, R = ch.l, ch.nbeta, ch.R
-            tau_j = jnp.asarray(ch.tau, dtype=jnp.float64)
-            c_il = setup.prefactor * (1j) ** l
-
-            G_bG = G_all[ch.beta_table_start:ch.beta_table_start + nbeta]
-            Gp_bG = Gp_all[ch.beta_table_start:ch.beta_table_start + nbeta]
-            S = S_all[l, :2*l+1]
-            phase = jnp.exp(-2j * jnp.pi * (K_crys @ tau_j.T)).T
-
-            dS = jnp.stack([
-                jax.jvp(lambda K: _solid_harmonics_jax(l, K),
-                        (K_cart,), (jnp.zeros((nG, 3)).at[:, j].set(1.0),))[1]
-                for j in range(3)
-            ], axis=0)
-
-            Binv = jnp.linalg.inv(B_j)
-            dphase = -2j * jnp.pi * (tau_j @ Binv.T)[:, :, None] * phase[:, None, :]
-            drad = Gp_bG[None, :, :] * K_over_q.T[:, None, :]
-            core = drad[:, :, None, :] * S[None, None, :, :] + G_bG[None, :, None, :] * dS[:, None, :, :]
-            dZ_core = c_il * phase[:, None, None, None, :] * core[None, :]
-            radS = G_bG[:, None, :] * S[None, :, :]
-            dZ_phase = c_il * radS[None, None, :, :, :] * dphase[:, :, None, None, :]
-            dZ_blocks.append((dZ_core + dZ_phase).transpose(1, 0, 2, 3, 4).reshape(3, ch.natoms * R, nG))
-        # ``compute_dZ=True`` PROMISES AN ARRAY, and the empty-channel case
-        # used to break that promise silently.  A setup with no channels
-        # (no pseudopotentials loaded, or none covering the structure)
-        # produces ``dZ_blocks == []``; returning ``None`` there handed a
-        # `NoneType` to ``apply_vnl_velocity_to_ket``, which conjugates its
-        # ``dZ`` argument — so the failure surfaced ~30 s later as
-        # ``TypeError: conjugate requires ndarray or scalar arguments`` six
-        # frames inside a jitted einsum, naming neither the deck nor the
-        # missing file.  ``Z`` already degrades gracefully in that case (it
-        # is the ``(0, nG)`` empty projector matrix and every contraction
-        # through it is zero); ``dZ`` now degrades the SAME way, at
-        # ``(3, total_R, nG)`` with ``total_R == 0``.
-        #
-        # THIS IS THE SECOND LINE OF DEFENCE, NOT THE FIX.  A zero V_NL
-        # velocity is the arithmetically correct answer for an empty
-        # projector set and the wrong ANSWER for a real deck, which is why
-        # the drivers must refuse the empty set up front —
-        # ``psp.operator_checks.validate_operator_inputs``, now called by
-        # ``get_dipole_mtxels`` as it already was by ``gw.kin_ion_io`` and
-        # ``get_DFT_mtxels``.  What this branch buys is that the kernel's
-        # documented contract is true for every caller, including the ones
-        # that legitimately hold no projectors.
-        dZ_j = (jnp.concatenate(dZ_blocks, axis=1) if dZ_blocks
-                else jnp.zeros((3, int(setup.total_R), nG), dtype=Z.dtype))
+    chan_meta = tuple(
+        (int(ch.l), int(ch.nbeta), int(ch.natoms),
+         int(ch.beta_table_start), int(ch.R))
+        for ch in setup.channels)
+    chan_taus = tuple(jnp.asarray(ch.tau, dtype=jnp.float64)
+                      for ch in setup.channels)
+    Z, dZ_j = _assemble_Z_dZ_jit(
+        jnp.asarray(kvec, dtype=jnp.float64),
+        jnp.asarray(Gk_np, dtype=jnp.int32),
+        jnp.asarray(setup.B, dtype=jnp.float64),
+        jnp.asarray(setup.dq, dtype=jnp.float64),
+        setup.G_table, setup.Gp_table,
+        jnp.asarray(setup.prefactor, dtype=jnp.float64),
+        setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
+        chan_taus,
+        l_max=int(setup.l_max), chan_meta=chan_meta,
+    )
 
     return VNLKData(
         Z=Z, E_super=setup.E_super, nG=nG,
