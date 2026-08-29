@@ -2,6 +2,7 @@ import types
 
 import numpy as np
 import pytest
+import jax.numpy as jnp
 from types import SimpleNamespace
 
 from gw.head_correction import (
@@ -9,6 +10,7 @@ from gw.head_correction import (
     HeadResponseKind,
     HeadSample,
     _dipole_window_from_params,
+    apply_q0_head_rank1_sharded,
     compute_static_head_terms,
     fit_head_ppm,
     fit_head_ppm_from_samples,
@@ -253,6 +255,31 @@ def test_fit_head_ppm_negative_branch_sign_matches_positive_limit():
     )
     np.testing.assert_allclose(head_s.R_h, head.R_h)
     np.testing.assert_allclose(head_s.B_h, head.B_h)
+
+
+@pytest.mark.parametrize("bad_probe", [2.0 + 1.0e-3j, np.nan, np.inf])
+def test_fit_head_ppm_refuses_an_invalid_probe_head(bad_probe):
+    with pytest.raises(ValueError, match="probe screened head: head scalar"):
+        fit_head_ppm_from_samples(
+            HeadSample(vc0=10.0 + 0.0j, wcoul0=5.0 + 0.0j,
+                       source="unit", omega=0.0j),
+            HeadSample(vc0=10.0 + 0.0j, wcoul0=bad_probe,
+                       source="unit", omega=2.0j),
+            probe_omega=2.0j,
+        )
+
+
+def test_q0_rank_one_injection_refuses_a_complex_screened_head():
+    with pytest.raises(ValueError, match="screened rank-one head: head scalar"):
+        apply_q0_head_rank1_sharded(
+            jnp.zeros((1, 1), dtype=jnp.complex128),
+            jnp.zeros((1, 1, 1, 1, 1), dtype=jnp.complex128),
+            jnp.ones(1, dtype=jnp.complex128),
+            jnp.ones(1, dtype=jnp.complex128),
+            1.0,
+            np.asarray([2.0 + 1.0e-3j]),
+            1.0,
+        )
 
 
 def test_fit_head_ppm_R_h_continuous_across_omega_sq_zero():

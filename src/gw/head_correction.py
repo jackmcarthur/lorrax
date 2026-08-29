@@ -35,6 +35,45 @@ from common.shard_map import shard_map
 from common.units import RYD_TO_EV
 
 
+def require_real_head_values(
+    values,
+    where: str,
+    *,
+    rtol: float = 1.0e-10,
+) -> np.ndarray:
+    """Return real head coefficients or refuse non-finite/complex values."""
+    head = np.asarray(values)
+    if not np.all(np.isfinite(head)):
+        raise ValueError(f"{where}: head scalar values are not finite")
+    scale = float(np.max(np.abs(head))) if head.size else 0.0
+    imag = float(np.max(np.abs(np.imag(head)))) if head.size else 0.0
+    if scale > 0.0 and imag > rtol * scale:
+        raise ValueError(
+            f"{where}: head scalar has |Im| = {imag:.6e} against "
+            f"|value| = {scale:.6e} "
+            f"(rel {imag / scale:.3e} > {rtol:.0e}). A complex head "
+            f"coefficient breaks Hermiticity of the rank-one update by "
+            f"2i·Im(value)·conj(g0)⊗g0. This real-scalar path has no "
+            f"projection rule for an unpaired frequency-odd contribution "
+            f"or finite broadening.")
+    return np.real(head)
+
+
+def require_real_head_scalar(
+    value,
+    where: str,
+    *,
+    rtol: float = 1.0e-10,
+) -> float:
+    """Return one finite real head coefficient."""
+    scalar = np.asarray(value)
+    if scalar.size != 1:
+        raise ValueError(
+            f"{where}: expected one head scalar, got shape {scalar.shape}")
+    return float(require_real_head_values(
+        scalar, where, rtol=rtol).reshape(()).item())
+
+
 def _analytic_q0_sphere(params) -> bool:
     """One compatibility-preserving resolver for the q=0 v estimator."""
     return (
@@ -1928,9 +1967,14 @@ def fit_head_ppm_from_samples(
 ) -> HeadGNParams:
     """Fit the scalar PPM head from resolved static and probe-frequency samples."""
     return fit_head_ppm(
-        vc0=float(head_static.vc0.real),
-        wcoul0_static=float(head_static.wcoul0.real),
-        wcoul0_probe=float(head_probe.wcoul0.real),
+        vc0=require_real_head_scalar(
+            head_static.vc0, "fit_head_ppm_from_samples: static bare head"),
+        wcoul0_static=require_real_head_scalar(
+            head_static.wcoul0,
+            "fit_head_ppm_from_samples: static screened head"),
+        wcoul0_probe=require_real_head_scalar(
+            head_probe.wcoul0,
+            "fit_head_ppm_from_samples: probe screened head"),
         probe_omega=probe_omega,
     )
 
@@ -1994,8 +2038,12 @@ def fit_head_hl_analytic_from_sample(
 ) -> HeadGNParams:
     """Wrapper for :func:`fit_head_hl_analytic` using a resolved head sample."""
     return fit_head_hl_analytic(
-        vc0=float(head_static.vc0.real),
-        wcoul0_static=float(head_static.wcoul0.real),
+        vc0=require_real_head_scalar(
+            head_static.vc0,
+            "fit_head_hl_analytic_from_sample: static bare head"),
+        wcoul0_static=require_real_head_scalar(
+            head_static.wcoul0,
+            "fit_head_hl_analytic_from_sample: static screened head"),
         omega_p_sq_ry=omega_p_sq_ry,
     )
 
@@ -2040,8 +2088,12 @@ def fit_head_with_fixed_omega_from_sample(
 ) -> HeadGNParams:
     """Wrapper for :func:`fit_head_with_fixed_omega` using a HeadSample."""
     return fit_head_with_fixed_omega(
-        vc0=float(head_static.vc0.real),
-        wcoul0_static=float(head_static.wcoul0.real),
+        vc0=require_real_head_scalar(
+            head_static.vc0,
+            "fit_head_with_fixed_omega_from_sample: static bare head"),
+        wcoul0_static=require_real_head_scalar(
+            head_static.wcoul0,
+            "fit_head_with_fixed_omega_from_sample: static screened head"),
         omega_h_ry=omega_h_ry,
     )
 
@@ -2456,13 +2508,17 @@ def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
 def _head_rank1_scalars(vhead, whead, cell_volume, omega_index, dtype):
     """Resolve (v_scalar, w_scalar) = (head / V_cell) for a rank-1 update."""
     inv_V = 1.0 / float(cell_volume)
-    v_scalar = (jnp.asarray(complex(vhead) * inv_V, dtype=dtype)
-                if vhead is not None else None)
+    v_scalar = None
+    if vhead is not None:
+        v_value = require_real_head_scalar(vhead, "q=0 bare rank-one head")
+        v_scalar = jnp.asarray(v_value * inv_V, dtype=dtype)
     if whead is None:
         return v_scalar, None
-    whead_arr = jnp.asarray(whead, dtype=jnp.complex128)
+    whead_arr = np.asarray(whead)
     w_val = whead_arr if whead_arr.ndim == 0 else whead_arr[omega_index]
-    return v_scalar, jnp.asarray(w_val * inv_V, dtype=dtype)
+    w_scalar = require_real_head_scalar(
+        w_val, "q=0 screened rank-one head")
+    return v_scalar, jnp.asarray(w_scalar * inv_V, dtype=dtype)
 
 
 def apply_q0_head_rank1(

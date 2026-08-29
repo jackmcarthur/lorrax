@@ -138,6 +138,7 @@ _services.ensure_on_path()
 import vcoul                                                  # noqa: E402
 from vcoul import CoulombGeometry                             # noqa: E402
 from vcoul import wrap_points_to_voronoi                      # noqa: E402
+from gw.head_correction import require_real_head_values       # noqa: E402
 
 __all__ = [
     "head_scalar_pointwise",
@@ -226,8 +227,8 @@ def head_scalar_pointwise(q_cart, S_cart) -> np.ndarray:
     vq = EIGHT_PI / q2
     qSq = np.einsum("qi,ij,qj->q", q, S, q)
     val = vq / (1.0 - vq * qSq)
-    _refuse_complex(val, "head_scalar_pointwise")
-    return np.real(val).reshape(lead)
+    val = require_real_head_values(val, "head_scalar_pointwise")
+    return val.reshape(lead)
 
 
 def slab_head_scalar_pointwise(
@@ -272,31 +273,8 @@ def slab_head_scalar_pointwise(
     vq = np.asarray(v_over_omega, dtype=np.float64) * float(geometry.cell_volume)
     qSq = np.einsum("qi,ij,qj->q", q, S, q)
     val = vq / (1.0 - vq * qSq)
-    _refuse_complex(val, "slab_head_scalar_pointwise")
-    return np.real(val).reshape(lead)
-
-
-def _refuse_complex(val, where: str, rtol: float = 1e-10) -> None:
-    """Refuse a head scalar with a physically meaningful imaginary part.
-
-    The rank-one update is Hermitian ONLY because its coefficient is real.
-    A complex coefficient makes ``s·conj(g₀)⊗g₀`` non-Hermitian by exactly
-    ``2i·Im(s)·conj(g₀)⊗g₀`` — which is the deliberate red twin the
-    Hermiticity gate trips on.  Dropping the imaginary part silently would
-    make that twin invisible, so it is a refusal, not a cast.
-    """
-    v = np.asarray(val)
-    scale = float(np.max(np.abs(v))) if v.size else 0.0
-    imag = float(np.max(np.abs(np.imag(v)))) if v.size else 0.0
-    if scale > 0.0 and imag > rtol * scale:
-        raise ValueError(
-            f"{where}: head scalar has |Im| = {imag:.6e} against "
-            f"|S| = {scale:.6e} (rel {imag / scale:.3e} > {rtol:.0e}).  A "
-            f"complex head coefficient breaks Hermiticity of the rank-one "
-            f"update by 2i·Im(S)·conj(g0)⊗g0.  The static (ω=0, η=0) head "
-            f"this stage consumes is real; a complex one means S_cart came "
-            f"from a finite η or a finite ω and this path has no ruling for "
-            f"it.")
+    val = require_real_head_values(val, "slab_head_scalar_pointwise")
+    return val.reshape(lead)
 
 
 def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
@@ -334,7 +312,8 @@ def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
     Returns
     -------
     float
-        Ry·bohr³, real (see :func:`_refuse_complex`).
+        Ry·bohr³, real (see
+        :func:`gw.head_correction.require_real_head_values`).
     """
     sd = _validated_sys_dim(sys_dim)
     _, wcoul0 = vcoul.get_kernel(sd).q0_average(
@@ -343,8 +322,8 @@ def gamma_cell_head_scalar(geometry: CoulombGeometry, kgrid, S_cart, *,
         analytic_sphere=analytic_sphere,
     )
     val = complex(wcoul0)
-    _refuse_complex(np.asarray([val]), "gamma_cell_head_scalar")
-    return float(val.real)
+    return float(require_real_head_values(
+        np.asarray([val]), "gamma_cell_head_scalar")[0])
 
 
 def fine_q_cart(bvec, fine_grid, *, return_unwrapped: bool = False):
@@ -821,7 +800,10 @@ def head_channel_zone_average(S_grid) -> float:
     float
         Ry·bohr³.  Multiply by 1/Ω to compare against an injected scalar.
     """
-    S = np.asarray(S_grid, dtype=np.float64)
+    S = np.asarray(
+        require_real_head_values(S_grid, "head_channel_zone_average"),
+        dtype=np.float64,
+    )
     return float(np.sum(S) / S.size)
 
 
@@ -860,7 +842,10 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
     """
     import jax.numpy as jnp
 
-    S = np.asarray(S_grid, dtype=np.float64)
+    S = np.asarray(
+        require_real_head_values(S_grid, "attach_head_channel"),
+        dtype=np.float64,
+    )
     if S.ndim != 3:
         raise ValueError(f"attach_head_channel: S_grid must be (nfx,nfy,nfz); "
                          f"got {S.shape}")

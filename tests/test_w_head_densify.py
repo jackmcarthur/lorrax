@@ -532,6 +532,18 @@ def test_a_complex_head_scalar_is_refused_before_it_can_be_attached():
     with pytest.raises(ValueError, match="Hermiticity"):
         head_scalar_pointwise(q[None, :], S_bad)
 
+    S_grid_bad = np.ones((1, 1, 1), dtype=np.complex128) * (1.0 + 0.3j)
+    with pytest.raises(ValueError, match="Hermiticity"):
+        head_channel_zone_average(S_grid_bad)
+    with pytest.raises(ValueError, match="Hermiticity"):
+        attach_head_channel(
+            jnp.zeros((1, 1, 1, 1, 1), dtype=jnp.complex128),
+            jnp.ones(1, dtype=jnp.complex128),
+            jnp.ones(1, dtype=jnp.complex128),
+            S_grid_bad,
+            1.0,
+        )
+
 
 # ===========================================================================
 # 6.  DIMENSION DISPATCH AND REFUSALS

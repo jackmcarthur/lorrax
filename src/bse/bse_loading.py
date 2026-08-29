@@ -1151,8 +1151,11 @@ def load_bse_data_from_restart_sharded(
                   f"V_cell={cell_volume:.2f}): {head_str} "
                   f"[source: {head_src}]")
             if defer_whead and w0_ready and whead is not None:
+                from gw.head_correction import require_real_head_scalar
+
                 head_channel = {
-                    "whead": float(complex(whead[0]).real),
+                    "whead": require_real_head_scalar(
+                        whead[0], "BSE deferred screened head"),
                     "cell_volume": float(cell_volume),
                     "gamma_cell": w_head_gamma_cell,
                 }

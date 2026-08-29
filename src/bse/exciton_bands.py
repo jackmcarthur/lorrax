@@ -1411,7 +1411,10 @@ def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
         log("[coarse-W] no whead resolved (no deck override, no restart "
             "scalar); the densifier operand is already head-free")
         return None
-    return {"whead": float(complex(whead[0]).real),
+    from gw.head_correction import require_real_head_scalar
+
+    return {"whead": require_real_head_scalar(
+                whead[0], "exciton-bands native screened head"),
             "cell_volume": float(cell_volume)}
 
 
