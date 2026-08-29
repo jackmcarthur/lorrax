@@ -559,7 +559,18 @@ def test_make_eqp_authenticates_explicit_live_source_over_stored_offer(
         selected_source, component_aware):
     """Selected source wins; gspace v4 carries H_T without stored H_T."""
     from file_io.sigma_output import (
-        append_eqp_assembly_receipt_h5, write_sigma_omega_h5)
+        DIRECT_FIELD_SUM_FILE_WEDGE_ATTR,
+        DIRECT_FIELD_SUM_FULL_BZ_ATTR,
+        DIRECT_FIELD_SUM_RULE,
+        DIRECT_FIELD_SUM_RULE_ATTR,
+        EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION,
+        EQP_ASSEMBLY_EXPECTED_DATASET,
+        SIGMA_OPERATOR_STATE_ATTR,
+        SIGMA_OPERATOR_STATE_RAW,
+        SIGMA_OPERATOR_STATE_VERSION,
+        SIGMA_OPERATOR_STATE_VERSION_ATTR,
+        append_eqp_assembly_receipt_h5,
+    )
     from gw.eqp_bgw import assemble_eqp, make_eqp_bgw
 
     with tempfile.TemporaryDirectory() as d:
@@ -574,14 +585,33 @@ def test_make_eqp_authenticates_explicit_live_source_over_stored_offer(
             shape = (2, 6, 6)
             raw_scalar = np.zeros(shape, dtype=np.complex128)
             raw_transverse = np.zeros_like(raw_scalar)
-            write_sigma_omega_h5(
-                os.path.join(d, "sigma_mnk.h5"), omega,
-                sigma_c_kij_ev=np.zeros((omega.size,) + shape),
-                sigma_sx_kij_ev=np.zeros(shape),
-                hartree_kij_ev=raw_scalar + raw_transverse,
-                hartree_scalar_kij_ev=raw_scalar,
-                hartree_transverse_kij_ev=raw_transverse,
-                mesh=_mesh())
+            # This is a receipt/authentication test, not a SlabIO transport
+            # test.  Complete the synthetic raw-operator artifact directly so
+            # a multi-rank pytest run does not ask every rank to collectively
+            # rewrite the same temporary file.
+            with h5py.File(os.path.join(d, "sigma_mnk.h5"), "a") as h5:
+                h5["hartree_kij_ev"][...] = raw_scalar + raw_transverse
+                h5.create_dataset("hartree_scalar_kij_ev", data=raw_scalar)
+                h5.create_dataset(
+                    "hartree_transverse_kij_ev", data=raw_transverse)
+                h5.create_dataset(
+                    EQP_ASSEMBLY_EXPECTED_DATASET,
+                    data=np.int32(EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION))
+                for name in (
+                        "sigma_c_kij_ev", "sigma_sx_kij_ev",
+                        "hartree_kij_ev", "hartree_scalar_kij_ev",
+                        "hartree_transverse_kij_ev"):
+                    h5[name].attrs[SIGMA_OPERATOR_STATE_ATTR] = (
+                        SIGMA_OPERATOR_STATE_RAW)
+                    h5[name].attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = (
+                        SIGMA_OPERATOR_STATE_VERSION)
+                for name in (
+                        "hartree_kij_ev", "hartree_scalar_kij_ev",
+                        "hartree_transverse_kij_ev"):
+                    h5[name].attrs[DIRECT_FIELD_SUM_RULE_ATTR] = (
+                        DIRECT_FIELD_SUM_RULE)
+                    h5[name].attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = True
+                    h5[name].attrs[DIRECT_FIELD_SUM_FILE_WEDGE_ATTR] = True
         component_kwargs = ({} if transverse is None else {
             "hartree_scalar_diag_ev": scalar,
             "hartree_transverse_diag_ev": transverse,
