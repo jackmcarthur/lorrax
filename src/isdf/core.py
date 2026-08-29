@@ -2099,11 +2099,12 @@ def _z_q_face(
 					# Reuse one completed band sum and IFFT; γ3 has a different
 					# permutation and keeps its own one-carrier transaction.
 					P_r_R_12 = right_density_R(jnp.asarray(0, dtype=jnp.int32))
-					base_12 = P_l_R_conj * P_r_R_12
-					Z_R_acc = update_channel(Z_R_acc, 0, base_12)
+					Z_R_acc = update_channel(
+						Z_R_acc, 0, P_l_R_conj * P_r_R_12)
 					phase_2_ab = phase_L_[1, a] * phase_R_[1, b]
 					Z_R_acc = update_channel(
-						Z_R_acc, 1, phase_2_ab * base_12)
+						Z_R_acc, 1,
+						P_l_R_conj * (phase_2_ab * P_r_R_12))
 					P_r_R_3 = right_density_R(jnp.asarray(2, dtype=jnp.int32))
 					Z_R_acc = update_channel(
 						Z_R_acc, 2, P_l_R_conj * P_r_R_3)
