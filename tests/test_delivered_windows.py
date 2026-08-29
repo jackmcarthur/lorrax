@@ -68,22 +68,27 @@ def _two_branch_plan():
     plan, report = build_delivered_sigma_windows(
         pole_sets, residue_sets, branches, omega,
         regularization_width_ry=0.02, target_error=2.0e-4,
-        max_nodes=200, sector_shortcut=False)
+        max_nodes=200, amplification_cap=30.0)
     return branches, pole_sets, plan, report
 
 
 def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
     branches, _pole_sets, plan, report = _two_branch_plan()
-    assert len(plan) == len(branches) == 2
-    assert report["n_windows"] == 2
+    assert len(branches) == 2
+    assert report["n_windows"] == len(plan)
     assert report["n_tau"] == sum(row.window.n_tau for row in plan)
-    for branch, row, evidence in zip(branches, plan, report["branches"]):
-        assert row.window.n_tau == evidence["node_count"] > 0
-        assert evidence["delivered_error_max"] <= report["target_error"]
-        assert (np.max(evidence["delivered_error_by_frequency"])
-                <= report["target_error"])
-        assert row.window.project == "full"
-        np.testing.assert_array_equal(row.window.mask_A, branch.base_mask_A)
+    for branch, evidence in zip(branches, report["branches"]):
+        rows = plan[evidence["plan_start"]:evidence["plan_stop"]]
+        assert len(rows) == evidence["window_count"]
+        assert sum(row.window.n_tau for row in rows) == evidence["node_count"]
+        for row, window_evidence in zip(rows, evidence["windows"]):
+            assert row.window.n_tau == window_evidence["node_count"] > 0
+            assert (window_evidence["refined_residual"]
+                    <= window_evidence["relative_residual_target"])
+            assert (window_evidence["amplification_p99"]
+                    <= report["amplification_cap"])
+            assert row.window.project == "full"
+            np.testing.assert_array_equal(row.window.mask_A, branch.base_mask_A)
 
 
 def test_tr_broken_cond_and_val_pole_sets_produce_independent_plans():
@@ -91,20 +96,20 @@ def test_tr_broken_cond_and_val_pole_sets_produce_independent_plans():
     assert not np.array_equal(pole_sets[0], pole_sets[1])
     assert [row["tag"] for row in report["branches"]] == [
         "positive conduction", "positive valence"]
-    cond_times = np.asarray(plan[0].window.nodes.t)
-    val_times = np.asarray(plan[1].window.nodes.t)
+    cond = report["branches"][0]
+    val = report["branches"][1]
+    cond_times = np.concatenate([
+        np.asarray(row.window.nodes.t)
+        for row in plan[cond["plan_start"]:cond["plan_stop"]]])
+    val_times = np.concatenate([
+        np.asarray(row.window.nodes.t)
+        for row in plan[val["plan_start"]:val["plan_stop"]]])
     assert (cond_times.shape != val_times.shape
             or not np.allclose(cond_times, val_times))
 
 
 def test_selector_defaults_to_incumbent_panes(monkeypatch):
-    from gw.mpa import sigma
+    from gw.sigma_plan import resolve_sigma_plan
 
-    incumbent = object()
-    delivered = object()
     monkeypatch.delenv("LORRAX_SIGMA_PLAN", raising=False)
-    monkeypatch.setattr(sigma, "build_shared_sigma_windows", incumbent)
-    monkeypatch.setattr(sigma, "_build_delivered_sigma_windows", delivered)
-    mode, builder = sigma.resolve_sigma_plan_builder()
-    assert mode == "panes"
-    assert builder is incumbent
+    assert resolve_sigma_plan() == "panes"

@@ -222,6 +222,13 @@ _TIME_NODE_SEARCH_NAMES = (
     "ComplexTimeSearchOptions", "support_arc",
     "candidate_time_dictionary", "fit_reciprocal_measure",
 )
+_MEASURE_WINDOW_NAMES = (
+    "MeasureWindow", "WindowErrorBudget", "tail_refined_lattice_measure",
+    "partition_measure_windows", "apportion_true_error",
+)
+_WINDOWED_FIT_NAMES = (
+    "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
+)
 
 
 def __getattr__(name: str):
@@ -242,6 +249,12 @@ def __getattr__(name: str):
     if name in _TIME_NODE_SEARCH_NAMES:
         from minimax import time_node_search as _search  # noqa: PLC0415
         return getattr(_search, name)
+    if name in _MEASURE_WINDOW_NAMES:
+        from minimax import measure_windows as _windows  # noqa: PLC0415
+        return getattr(_windows, name)
+    if name in _WINDOWED_FIT_NAMES:
+        from minimax import windowed_fit as _windowed_fit  # noqa: PLC0415
+        return getattr(_windowed_fit, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
@@ -249,7 +262,9 @@ def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
                   | set(_RECIPROCAL_FIT_NAMES)
-                  | set(_TIME_NODE_SEARCH_NAMES))
+                  | set(_TIME_NODE_SEARCH_NAMES)
+                  | set(_MEASURE_WINDOW_NAMES)
+                  | set(_WINDOWED_FIT_NAMES))
 
 
 __all__ = [
@@ -277,6 +292,9 @@ __all__ = [
     # --- delivered-error fitting on a weighted support (lazy; scipy) -------
     *_RECIPROCAL_FIT_NAMES,
     *_TIME_NODE_SEARCH_NAMES,
+    # --- measure-apportioned window planning (lazy; numpy/scipy) -----------
+    *_MEASURE_WINDOW_NAMES,
+    *_WINDOWED_FIT_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]

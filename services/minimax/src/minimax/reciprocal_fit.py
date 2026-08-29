@@ -175,6 +175,9 @@ class ComplexTimeRule:
     # (time_re, time_im, family, delivered_error_after) — enough to rebuild
     # any prefix rule for convergence-versus-node-count studies.
     growth_history: tuple[tuple[float, float, str, float], ...] = ()
+    # False when the search hit its node ceiling and returned its best rule
+    # instead of raising; every error above still describes that actual rule.
+    target_met: bool = True
 
     @property
     def node_count(self) -> int:

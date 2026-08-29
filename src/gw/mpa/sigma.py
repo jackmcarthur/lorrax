@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,35 +16,12 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
+from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import face_kernel_kwargs
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             build_shared_sigma_windows,
                             summarize_sigma_poles)
-
-
-def _build_delivered_sigma_windows(*args, **kwargs):
-    """Lazy service/solver import; the default panes path pays none of it."""
-    from .delivered_windows import build_delivered_sigma_windows
-    return build_delivered_sigma_windows(*args, **kwargs)
-
-
-def resolve_sigma_plan_builder():
-    """Resolve ``LORRAX_SIGMA_PLAN`` to its planning pathway.
-
-    The exact grammar is ``panes`` or ``delivered`` after stripping and
-    lower-casing.  Unset and blank both preserve the incumbent panes path;
-    every other spelling refuses rather than silently running another arm.
-    """
-    raw = os.environ.get("LORRAX_SIGMA_PLAN", "panes").strip().lower()
-    mode = raw or "panes"
-    if mode == "panes":
-        return mode, build_shared_sigma_windows
-    if mode == "delivered":
-        return mode, _build_delivered_sigma_windows
-    raise ValueError(
-        "LORRAX_SIGMA_PLAN must be 'panes' or 'delivered'; "
-        f"got {raw!r}")
 
 
 def _bounded_pole_batch_size(value):
@@ -356,7 +331,7 @@ def compute_sigma_c_mpa_omega_grid(
         wfns, omega_grid_ry, efermi_ry,
         occupation_state=occupation_state,
         occupation_window_threshold=occupation_window_threshold)
-    plan_mode, plan_builder = resolve_sigma_plan_builder()
+    plan_mode = resolve_sigma_plan()
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
     # does its h5py reads (ledger, unfold tables) before that handle
@@ -382,7 +357,7 @@ def compute_sigma_c_mpa_omega_grid(
                     edge_factor=edge_factor, pole_offset=lo,
                     occupation_window_threshold=occupation_window_threshold))
                 del Omega, B
-            plan, geometry = plan_builder(
+            plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
                 edge_factor=edge_factor, target_error=target_error,
@@ -397,12 +372,15 @@ def compute_sigma_c_mpa_omega_grid(
             Omega, B = reader.read(
                 slice(0, n_poles), unfold=True, return_sharded=True,
                 to_unit="Ry")
-            plan, geometry = plan_builder(
+            from .delivered_windows import build_delivered_sigma_windows
+            plan, geometry = build_delivered_sigma_windows(
                 [Omega] * len(branches), [B] * len(branches), branches,
                 omega_grid_ry,
                 regularization_width_ry=regularization_width_ry,
                 target_error=target_error,
-                max_nodes=max(int(max_rank), int(crossing_max_nodes)))
+                max_nodes=max(int(max_rank), int(crossing_max_nodes)),
+                crossing_eps_q=1.0e-3,
+                use_shipped_minimax_tables=True)
             del Omega, B
         if plan_mode == "panes":
             print_fn(

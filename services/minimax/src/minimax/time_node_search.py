@@ -122,6 +122,9 @@ class ComplexTimeSearchOptions:
     # production sizes — measured 12-33 s — so search cost is O(nodes)
     # solves either way, just three orders apart).
     weight_solver: str = "irls"
+    # Return the best rule found (target_met=False) instead of raising when
+    # the node ceiling is reached; actual errors are reported either way.
+    return_best_on_miss: bool = False
     # Search-schedule toggles; see the class docstring.
     coarse_to_fine: bool = True
     coarse_cell_cap: int = 60
@@ -905,7 +908,8 @@ def _fit_reciprocal_measure_pinned(
     fit_set, times, weights, best_error, error_by_frequency = grow(
         problem, int(options.fit_frequency_count),
         int(options.polygon_directions),
-        record_initial=not run_coarse, raise_on_ceiling=True,
+        record_initial=not run_coarse,
+        raise_on_ceiling=not bool(options.return_best_on_miss),
         stage_target=target,
         carried_fit_set=carried_fit_set, carried_warm=carried_warm)
 
@@ -948,6 +952,8 @@ def _fit_reciprocal_measure_pinned(
         amplification=p99,
         amplification_max=peak,
         method="measured_crossing",
+        target_met=bool(float(np.max(error))
+                        <= float(options.target_error) * (1.0 + 1.0e-12)),
         growth_history=tuple(growth_history),
     )
 

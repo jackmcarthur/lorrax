@@ -81,6 +81,7 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
+from .sigma_plan import resolve_sigma_plan
 from .wavefunction_bundle import face_kernel_kwargs
 
 
@@ -941,6 +942,7 @@ def _run_sigma_branch(
     use_shipped_minimax_tables: bool = True,
     packed_coh: tuple[tuple, tuple] | None = None,
     partition_hgl: bool = False,
+    planned_windows: list[_SigmaWindow] | None = None,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -1019,19 +1021,23 @@ def _run_sigma_branch(
         return None, []
 
     with timing.section("sigma.windows"):
-        windows = _build_windows_for_branch(
-            omega_nonneg_ry=omega_nonneg_ry,
-            E_A=E_A, base_mask_A=base_mask_A,
-            Omega_q=Omega_q, base_mask_B=base_mask_B,
-            space=space, neg_omega_half=neg_omega_half,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor,
-            target_error=target_error, max_nodes=max_nodes,
-            crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
-            use_shipped_minimax_tables=use_shipped_minimax_tables,
-            log_tag=log_tag, print_fn=print_fn,
-            partition_hgl=partition_hgl,
-        )
+        if planned_windows is None:
+            windows = _build_windows_for_branch(
+                omega_nonneg_ry=omega_nonneg_ry,
+                E_A=E_A, base_mask_A=base_mask_A,
+                Omega_q=Omega_q, base_mask_B=base_mask_B,
+                space=space, neg_omega_half=neg_omega_half,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                target_error=target_error, max_nodes=max_nodes,
+                crossing_eps_q=crossing_eps_q,
+                crossing_max_nodes=crossing_max_nodes,
+                use_shipped_minimax_tables=use_shipped_minimax_tables,
+                log_tag=log_tag, print_fn=print_fn,
+                partition_hgl=partition_hgl,
+            )
+        else:
+            windows = list(planned_windows)
     if not windows:
         return None, []
 
@@ -1640,6 +1646,34 @@ def compute_sigma_c_ppm_omega_grid(
         cond_mask=cond_mask, val_mask=val_mask,
     )
 
+    plan_mode = resolve_sigma_plan()
+    delivered_windows = {}
+    if plan_mode == "delivered" and branches:
+        # GN-PPM has one fitted pole per (q,mu,nu).  Add only the leading
+        # singleton axis expected by the shared MPA planner; the existing
+        # B_mask remains the executor's exact validity selector. Independent
+        # causal branches are still planned independently, so this does not
+        # introduce a time-reversal identification at the W producer seam.
+        from .mpa.delivered_windows import build_delivered_sigma_windows
+        Omega_one = jnp.expand_dims(Omega_abs, axis=0)
+        B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
+        shared_plan, geometry = build_delivered_sigma_windows(
+            [Omega_one] * len(branches), [B_one] * len(branches), branches,
+            omega_req,
+            regularization_width_ry=regularization_width_ry,
+            target_error=target_error,
+            max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
+            crossing_eps_q=crossing_eps_q,
+            use_shipped_minimax_tables=bool(use_shipped_minimax_tables))
+        for report in geometry["branches"]:
+            start, stop = int(report["plan_start"]), int(report["plan_stop"])
+            delivered_windows[report["tag"]] = [
+                row.window for row in shared_plan[start:stop]]
+        print_fn(
+            f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
+            f"windows, {geometry['n_tau']} total nodes, "
+            f"plan {geometry['plan_seconds']:.3f} s")
+
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a
     # given ω-half share those indices, so the second branch's `+=` sums
@@ -1673,6 +1707,8 @@ def compute_sigma_c_ppm_omega_grid(
             E_A=br.E_A, base_mask_A=br.base_mask_A,
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
+            planned_windows=delivered_windows.get(br.tag)
+            if plan_mode == "delivered" else None,
             **common_branch_kwargs,
         )
         if branch_tiles is None:
