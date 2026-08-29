@@ -203,6 +203,7 @@ from symmetry_maps.maps import (
     find_irreducible_bz_points,
     kgrid_shift_map,
     q_negation_index,
+    q_pair_transpose,
     slice_q_full_to_ibz,
     star_broadcast,
     reduce_full_bz_to_file_wedge,
@@ -285,6 +286,7 @@ __all__ = [
     "SymMaps", "kgrid_shift_map", "bgw_integer_q_to_fractional",
     "bgw_signed_q_representative",
     "q_negation_index",
+    "q_pair_transpose",
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
     # k-stars (band-index IBZ<->full BZ)

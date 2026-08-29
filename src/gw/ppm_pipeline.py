@@ -567,6 +567,12 @@ def compute_ppm_sigma_pipeline(
             # support.  This is lossy versus BGW finite-pole parity; HL is a
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
+            # SymMaps.trs_allowed is the load-time spin-density measurement,
+            # not a deck declaration.  Only the broken-TR GN probe can carry
+            # an independent frequency-odd response; HL keeps its established
+            # real-axis fit.
+            include_frequency_odd_response=(
+                not is_hl and not bool(sym.trs_allowed)),
         )
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)

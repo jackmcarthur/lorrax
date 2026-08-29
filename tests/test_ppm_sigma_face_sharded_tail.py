@@ -10,6 +10,8 @@ canonical ``strip_sigma_window`` slice+reshard.
 The hostile geometry is deliberately tiny and non-degenerate:
 ``nb_full=8``, ``nb_sigma=4`` on a real 2x2 mesh.  Values outside the logical
 block are nonzero, so a gate that merely assumes a zero pad cannot pass.
+Distinct ordered GN residues additionally require every production
+conduction branch to receive R+ and every valence branch to receive R-.
 There is no random input and no physics-kernel twin here: the seam under test
 is movement-only finalization after the already-gated tau projection.
 """
@@ -58,7 +60,7 @@ NB_SIGMA = 4
 NK = 2
 
 
-def _tiny_problem(layout: str):
+def _tiny_problem(layout: str, mesh):
     slices = BandSlices.from_band_edges(
         0, 0, 2, NB_SIGMA, NB_FULL,
         b4_chi=NB_FULL, b4_sigma=NB_FULL)
@@ -72,10 +74,16 @@ def _tiny_problem(layout: str):
     ], dtype=jnp.float64)
     wfns = SimpleNamespace(
         layout="face", slices=slices, enk=enk, occ=occ)
+    q_sharding = NamedSharding(mesh, P(None, "x", "y"))
     ppm = SimpleNamespace(
-        B_q=jnp.ones((1, 2, 2), dtype=jnp.complex128),
-        Omega_q=jnp.full((1, 2, 2), 2.0, dtype=jnp.float64),
-        valid_mask_q=jnp.ones((1, 2, 2), dtype=bool),
+        B_q=jax.device_put(
+            np.full((1, 2, 2), 2.0, dtype=np.complex128), q_sharding),
+        B_negative_q=jax.device_put(
+            np.full((1, 2, 2), 7.0, dtype=np.complex128), q_sharding),
+        Omega_q=jax.device_put(
+            np.full((1, 2, 2), 2.0, dtype=np.float64), q_sharding),
+        valid_mask_q=jax.device_put(
+            np.ones((1, 2, 2), dtype=bool), q_sharding),
     )
     meta = SimpleNamespace(
         nk_tot=NK, nkx=NK, nky=1, nkz=1,
@@ -99,7 +107,7 @@ def _tiny_problem(layout: str):
 
 
 def _analytic_branch_tiles(*, omega_nonneg_ry, log_tag, wfns, mesh_xy,
-                           meta, **_unused):
+                           meta, B_q, **_unused):
     """Return nonzero-tail host tiles at the production finalizer seam."""
     n_omega = int(np.asarray(omega_nonneg_ry).size)
     shape = (1, n_omega, NK, NB_FULL, NB_FULL)
@@ -116,6 +124,15 @@ def _analytic_branch_tiles(*, omega_nonneg_ry, log_tag, wfns, mesh_xy,
         branch_code = 100.0 if log_tag.endswith("cond") else 1000.0
     else:
         raise AssertionError(f"unexpected Sigma branch tag {log_tag!r}")
+
+    expected_residue = 2.0 if log_tag.endswith("cond") else 7.0
+    assert tuple(B_q.sharding.spec) == (None, "x", "y")
+    for shard in B_q.addressable_shards:
+        np.testing.assert_array_equal(
+            np.asarray(shard.data),
+            np.full(shard.data.shape, expected_residue, np.complex128),
+            err_msg=f"{log_tag} received the wrong ordered GN residue",
+        )
 
     iw = np.arange(n_omega, dtype=np.float64)[None, :, None, None, None]
     ik = np.arange(NK, dtype=np.float64)[None, None, :, None, None]
@@ -144,7 +161,7 @@ def check_face_sharded_tail_parity(mesh):
     omega = np.asarray([-0.2, 0.1], dtype=np.float64)
 
     def run(layout):
-        wfns, ppm, meta, ppm_cfg, sigma_cfg, quad = _tiny_problem(layout)
+        wfns, ppm, meta, ppm_cfg, sigma_cfg, quad = _tiny_problem(layout, mesh)
         with mock.patch.object(
                 ppm_sigma, "_run_sigma_branch",
                 side_effect=_analytic_branch_tiles):

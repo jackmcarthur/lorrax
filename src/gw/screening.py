@@ -142,6 +142,19 @@ def screening_requests_for(
 _FORCE_FULL_BZ_ANNOUNCED = False
 
 
+def _assert_imaginary_probe_supported(*, trs_allowed: bool) -> None:
+    """Refuse broken-TR RPA until control flow selects an ordered kernel."""
+    if not bool(trs_allowed):
+        raise RuntimeError(
+            "GATE gn_ppm_ordered_probe_producer: measured broken TR requires "
+            "the ordered complex-minimax response producer.  This ordinary "
+            "RPA branch still selects the historical frequency-even chi0 "
+            "kernel, which would force R_+=R_- while the downstream fit "
+            "claimed ordered response.  Merge the producer branch whose "
+            "control flow executes the ordered kernel; a metadata stamp on "
+            "this quadrature is not evidence that it did so.")
+
+
 def compute_static_w(
     wfns,
     V_q: jax.Array,
@@ -588,6 +601,9 @@ def compute_screening(
     from common.progress import LoopProgress
 
     W_by_role: dict[str, jax.Array] = {}
+    # Production SymMaps always carries the measured density verdict.  The
+    # default is only for small orchestration fixtures that pass ``sym=None``.
+    trs_allowed = bool(getattr(sym, "trs_allowed", True))
     # X_ONLY declares no screening requests — return before any cadence
     # print.  A Started/Finished "screening (chi0 -> W)" pair around zero
     # work is an observable that does not discriminate (QUALITY_PATTERNS
@@ -612,7 +628,7 @@ def compute_screening(
     fused_plan = None
     chi0_probe_reused = None
     _reuse_mode = str(getattr(config.ppm, "probe_chi_reuse", "off"))
-    if _reuse_mode == "auto":
+    if _reuse_mode == "auto" and trs_allowed:
         _imag_probes = [
             r for r in requests
             if r.role != "static"
@@ -711,7 +727,10 @@ def compute_screening(
                 head_channel=head_channel)
             chi0_probe_reused = None   # donated into solve_w — dead ref
             with timing.section("W.gate"):
-                _gate_w(W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid))
+                _gate_w(
+                    W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid),
+                    frequency_odd_response=(
+                        on_imag and not trs_allowed))
             _store_role(req.role, idx, W)
             bar.step()
             continue
@@ -719,6 +738,7 @@ def compute_screening(
             quad_used = build_imag_quadrature(
                 quad, abs(req.omega_ry.imag),
                 config.minimax_config, print_fn=print_fn)
+            _assert_imaginary_probe_supported(trs_allowed=trs_allowed)
         else:
             quad_used = build_real_quadrature(
                 quad, abs(req.omega_ry.real),
@@ -743,7 +763,10 @@ def compute_screening(
             role=req.role, force_full_bz=True, section="chi0_W_probe",
             head_channel=head_channel)
         with timing.section("W.gate"):
-            _gate_w(W, req, print_fn=print_fn)
+            _gate_w(
+                W, req, print_fn=print_fn, kgrid=tuple(meta.kgrid),
+                frequency_odd_response=(
+                    on_imag and not trs_allowed))
         _store_role(req.role, idx, W)
         bar.step()
 
@@ -917,7 +940,7 @@ def driver_persists_w0(mode, config) -> bool:
 
 
 def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
-            kgrid=None) -> None:
+            kgrid=None, frequency_odd_response: bool = False) -> None:
     """Stage gate on one solved W — the Dyson solve is the fragile seam.
 
     ``W = (1 − Vχ₀)⁻¹V`` is the only place in the GW flow where a matrix
@@ -928,10 +951,12 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
     finiteness reduction plus one hermiticity residual here names the
     stage instead.
 
-    ``W`` is Hermitian for the two frequencies LORRAX evaluates (ω = 0 and
-    ω = iω_p, both on axes where χ₀ is Hermitian); the real-axis HL probe
-    is *not* Hermitian in general, so hermiticity is only asserted on the
-    imaginary/zero-frequency branch.
+    Static ``W(0)`` is Hermitian.  At a nonzero imaginary probe, a
+    time-reversal-broken ordered response can instead contain the real
+    antisymmetric Hall term and is generally non-Hermitian even at q=0;
+    ``frequency_odd_response`` disables only that false fixed-q check.  The
+    all-q relation ``W_q(iξ) = W_{-q}(iξ)^*`` remains valid and is still
+    checked.  The real-axis HL probe is not Hermitian in general.
 
     THE HERMITICITY CHECK IS NOT THE ONE THE BSE NEEDS, and on its own it
     is how this seam stayed green while broken.  ``W[q=0]`` passes
@@ -950,10 +975,12 @@ def _gate_w(W, req: ScreeningRequest, *, print_fn: Callable = print,
     label = f"W[{req.role}]"
     sanity.check_finite(label, W, print_fn=print_fn)
     if abs(complex(req.omega_ry).real) == 0.0:
-        # ω on the imaginary axis (including ω=0): W is Hermitian.
-        # rtol is generous — this catches structural mixing, not roundoff.
-        sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
-                               print_fn=print_fn)
+        nonzero_imag = abs(complex(req.omega_ry).imag) > 0.0
+        if not (frequency_odd_response and nonzero_imag):
+            # Static W, and the established frequency-even probe, are
+            # Hermitian.  rtol catches structural mixing rather than roundoff.
+            sanity.check_hermitian(f"{label}[q=0]", W[0], rtol=1e-6,
+                                   print_fn=print_fn)
         # The load-bearing property, over ALL q.
         #
         # SCOPE.  This sits inside the ω-real == 0 branch deliberately.  On

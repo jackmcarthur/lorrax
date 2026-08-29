@@ -45,7 +45,7 @@ from symmetry_maps import (SymMaps, apply_spinor_rotation,
                            centroid_source_map_and_wrap,
                            common_uniform_grid_indices,
                            fft_grid_pullback_perm, find_irreducible_bz_points,
-                           kgrid_shift_map, q_negation_index,
+                           kgrid_shift_map, q_negation_index, q_pair_transpose,
                            recover_symmorphic_density_point_group,
                            spinor_rotation_for_sym_row, tau_phase_row,
                            unfold_psi)
@@ -63,6 +63,54 @@ def test_q_negation_index_is_the_c_order_involution():
     expected = np.ravel_multi_index(((-coords) % np.asarray(grid)).T, grid)
     np.testing.assert_array_equal(neg, expected)
     np.testing.assert_array_equal(neg[neg], np.arange(neg.size))
+
+
+def test_q_pair_transpose_uses_negative_q_without_conjugation():
+    grid = (3, 1, 1)
+    neg = q_negation_index(grid)
+    values = (
+        np.arange(3 * 2 * 2).reshape(3, 2, 2)
+        + 1j * (20 + np.arange(3 * 2 * 2).reshape(3, 2, 2))
+    )
+
+    got = np.asarray(q_pair_transpose(values, neg))
+    expected = np.swapaxes(values[neg], -1, -2)
+    np.testing.assert_array_equal(got, expected)
+    assert not np.array_equal(got, np.conj(expected))
+
+
+def test_q_pair_transpose_rows_are_bounded_and_keep_canonical_layout():
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    devices = np.asarray(jax.devices()[:1]).reshape(1, 1)
+    mesh = Mesh(devices, ("x", "y"))
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    values = jax.device_put(
+        np.arange(3 * 2 * 2).reshape(3, 2, 2), sharding)
+    got = q_pair_transpose(
+        values, q_negation_index((3, 1, 1)), q_rows=np.asarray([2]))
+    assert got.shape == (1, 2, 2)
+    assert got.sharding == sharding
+    np.testing.assert_array_equal(np.asarray(got), values[1].T[None, ...])
+
+
+@pytest.mark.parametrize(
+    "spec", [
+        (None, None, None),
+        (None, "x", None),
+        (None, "y", "x"),
+    ],
+)
+def test_q_pair_transpose_refuses_noncanonical_named_layout(spec):
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    bad = NamedSharding(mesh, P(*spec))
+    values = jax.device_put(np.zeros((1, 2, 2), np.complex128), bad)
+    with pytest.raises(ValueError, match="canonical all-P layout"):
+        q_pair_transpose(values, np.asarray([0]))
 
 
 def test_nonnested_8x8_to_12x12_has_the_exact_4x4_intersection():

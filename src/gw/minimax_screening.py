@@ -286,6 +286,10 @@ class GNPPMFitResult:
     omega_min_after: float = float("nan")
     omega_max_after: float = float("nan")
     tail_anchor_omega: float = float("nan")
+    #: Positive-amplitude carrier ``R_-`` at the negative pole.  ``None`` is
+    #: the historical reciprocal model, where both pole branches use
+    #: ``B_qmunu``.  Present means ``B_qmunu`` is ``R_+``.
+    B_negative_qmunu: jax.Array | None = None
 
 
 def fit_gn_ppm_from_wc_pair(
@@ -295,6 +299,7 @@ def fit_gn_ppm_from_wc_pair(
     *,
     fallback_omega: float,
     n_mu_logical: int,
+    include_frequency_odd_response: bool = False,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
 ) -> GNPPMFitResult:
@@ -306,6 +311,15 @@ def fit_gn_ppm_from_wc_pair(
         ``W^c(0)`` in shape ``(nq,n_rmu,n_rmu)``.
     Wc_probe_qmunu
         ``W^c(z_probe)`` in the same shape/sharding as ``Wc0_qmunu``.
+    include_frequency_odd_response
+        Retain the ordered response.  The symmetry service constructs
+        bounded row blocks of
+        ``W^c_{-q}(z_probe)^T = W^c_q(-z_probe)`` from
+        ``Wc_probe_qmunu`` and ``q_neg_index``; the full partner operator is
+        never resident.  The even probe part fixes the shared pole and
+        residue sum, while the odd part fixes the positive- and
+        negative-frequency carriers returned in ``B_qmunu`` and
+        ``B_negative_qmunu``.  False is the bit-preserving historical path.
     probe_omega
         Complex probe frequency ``z_probe`` in Ry. For the standard GN fit this is
         purely imaginary, e.g. ``2j``.
@@ -325,10 +339,9 @@ def fit_gn_ppm_from_wc_pair(
         (all-true mask) when the inputs are unpadded.
     q_neg_index
         Canonical full-grid ``q -> -q`` row permutation from the public
-        ``symmetry_maps.q_negation_index`` service.  Required only when
-        ``coarsen_extreme_tails`` is true; the GN policy uses it together with
-        ``mu <-> nu`` to keep the physical four-lane partner orbit atomic and
-        never reconstructs the q convention locally.
+        ``symmetry_maps.q_negation_index`` service.  Required when retaining
+        the frequency-odd response or coarsening tails.  Both consumers route
+        through that one convention rather than rebuilding q arithmetic.
     coarsen_extreme_tails
         Apply the user-ruled GN policy to successfully fitted logical modes:
         replace at most the lowest and highest 0.2% of pole frequencies by
@@ -369,17 +382,26 @@ def fit_gn_ppm_from_wc_pair(
     _z = jnp.asarray(probe_omega, dtype=jnp.complex128)
     _fb = jnp.asarray(fallback_host, dtype=jnp.float64)
     _W0 = jnp.asarray(Wc0_qmunu)
+    ordered = bool(include_frequency_odd_response)
+    if ordered:
+        z_host = complex(probe_omega)
+        if (not np.isfinite(z_host.real) or not np.isfinite(z_host.imag)
+                or abs(z_host) == 0.0):
+            raise ValueError(
+                "fit_gn_ppm_from_wc_pair: an ordered-response fit requires "
+                f"a finite nonzero probe_omega; got {probe_omega!r}.")
 
     # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
     # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
     # of the LOCAL (already-sharded) tile is what sizes the arena.
     _nq = int(_W0.shape[0])
     _qneg = None
-    if coarsen_extreme_tails:
+    if coarsen_extreme_tails or ordered:
         if q_neg_index is None:
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index is required when "
-                "coarsen_extreme_tails=True.")
+                "retaining the frequency-odd response or coarsening "
+                "extreme tails.")
         _qneg_raw = np.asarray(q_neg_index)
         if (_qneg_raw.shape != (_nq,)
                 or not np.all(np.isfinite(_qneg_raw))
@@ -399,13 +421,39 @@ def fit_gn_ppm_from_wc_pair(
     _per_q *= _W0.dtype.itemsize
     _qb = _gn_ppm_fit_q_block(_nq, _per_q)
 
+    # The ordered partner is scratch, never a second resident operator.  Its
+    # rows are built by symmetry_maps and donated immediately into the fit or
+    # residue output.  Bound the GLOBAL block bytes (therefore conservatively
+    # bounding every local shard); use at least one q row, and for nq>1 force
+    # at least two blocks so a whole partner tile is never materialized even
+    # on a small test/deck.
+    if ordered:
+        pair_qb = max(
+            1, min(_nq, _GN_PPM_ORDERED_PARTNER_BUDGET_BYTES // max(1, _per_q)))
+        if _nq > 1:
+            pair_qb = min(pair_qb, _nq - 1)
+        _qb = min(_qb, pair_qb)
+
+    def _pair_block(q0, q1):
+        from symmetry_maps import q_pair_transpose
+
+        return q_pair_transpose(
+            Wc_probe_qmunu, _qneg,
+            q_rows=np.arange(q0, q1, dtype=np.int32))
+
     if _qb >= _nq:
         # Whole thing fits: the historical single-shot call, untouched.
+        _pair = _pair_block(0, _nq) if ordered else None
         (omega_vals, B_vals, good, n_good, n_modes,
          omega_min, omega_max, pair_rel_min) = _gn_ppm_fit_kernel(
-            Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log)
+            Wc0_qmunu, Wc_probe_qmunu, _z, _fb, n_log, _pair)
     else:
-        _om, _bv, _gd = [], [], []
+        # Allocate the required outputs once in the input's all-P layout.
+        # Donated destination updates avoid retaining every block and then
+        # allocating another full tensor for concatenate.
+        omega_vals = jnp.zeros_like(jnp.real(_W0), dtype=jnp.float64)
+        B_vals = jnp.zeros_like(_W0, dtype=jnp.complex128)
+        good = jnp.zeros_like(jnp.real(_W0), dtype=bool)
         n_good = jnp.asarray(0.0, dtype=jnp.float64)
         n_modes = jnp.asarray(0.0, dtype=jnp.float64)
         omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
@@ -413,21 +461,20 @@ def fit_gn_ppm_from_wc_pair(
         pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
         for _q0 in range(0, _nq, _qb):
             _q1 = min(_q0 + _qb, _nq)
+            _pair = _pair_block(_q0, _q1) if ordered else None
             (_o, _b, _g, _ng, _nm,
              _omin, _omax, _rmin) = _gn_ppm_fit_kernel(
                  Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1],
-                 _z, _fb, n_log)
-            _om.append(_o); _bv.append(_b); _gd.append(_g)
+                 _z, _fb, n_log, _pair)
+            omega_vals, B_vals, good = _write_q_blocks(
+                (omega_vals, B_vals, good), (_o, _b, _g),
+                jnp.asarray(_q0, dtype=jnp.int32))
             # Exact integer counts -> summation order is irrelevant.
             n_good = n_good + _ng
             n_modes = n_modes + _nm
             omega_min = jnp.minimum(omega_min, _omin)
             omega_max = jnp.maximum(omega_max, _omax)
             pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
-        omega_vals = jnp.concatenate(_om, axis=0)
-        B_vals = jnp.concatenate(_bv, axis=0)
-        good = jnp.concatenate(_gd, axis=0)
-        del _om, _bv, _gd
 
     fulfilled = n_good / jnp.maximum(n_modes, 1.0)
     # Every host transfer in the fit is a scalar and deliberately outside
@@ -472,6 +519,29 @@ def fit_gn_ppm_from_wc_pair(
                 f"the fitted support [{omega_min_host}, {omega_max_host}] "
                 f"-> [{omega_min_after}, {omega_max_after}].")
 
+    # The incumbent B is half the residue sum,
+    #     B_even = (R_+ + R_-)/2 = -Wc(0) Omega/2.
+    # For an ordered response the odd probe part supplies the half-difference,
+    #     (R_+ - R_-)/2 = W_odd(z) (z^2 - Omega^2)/(2z).
+    # Apply this after the optional tail policy has fixed the final Omega, so
+    # both sampled frequency parities remain represented by that pole.
+    B_negative_vals = None
+    if ordered:
+        # B_vals itself becomes R_+; only the physically necessary R_- gets a
+        # second full destination.  Each bounded partner block is donated
+        # into R_- scratch and both residue blocks are immediately folded into
+        # the two all-P destinations -- no block lists and no concatenate.
+        B_negative_vals = jnp.zeros_like(B_vals, dtype=jnp.complex128)
+        for _q0 in range(0, _nq, _qb):
+            _q1 = min(_q0 + _qb, _nq)
+            _pair = _pair_block(_q0, _q1)
+            _rp, _rm = _frequency_residues(
+                B_vals[_q0:_q1], omega_vals[_q0:_q1],
+                Wc_probe_qmunu[_q0:_q1], _pair, _z)
+            B_vals, B_negative_vals = _write_q_blocks(
+                (B_vals, B_negative_vals), (_rp, _rm),
+                jnp.asarray(_q0, dtype=jnp.int32))
+
     return GNPPMFitResult(
         omega_qmunu=omega_vals,
         B_qmunu=B_vals,
@@ -486,6 +556,7 @@ def fit_gn_ppm_from_wc_pair(
         omega_min_after=omega_min_after,
         omega_max_after=omega_max_after,
         tail_anchor_omega=tail_anchor,
+        B_negative_qmunu=B_negative_vals,
     )
 
 
@@ -519,6 +590,12 @@ def fit_gn_ppm_from_wc_pair(
 # something to quietly restructure).
 _GN_PPM_FIT_ARENA_BUDGET_BYTES = int(
     float(os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "8")) * 1024 ** 3)
+
+#: Maximum GLOBAL bytes in the transient ordered-response partner block.
+#: Every block keeps ``P(None,'x','y')``, so the per-device amount is this
+#: divided by P.  The buffer is donated into the next pole output; the only
+#: new full-size resident is the physically necessary R_- field.
+_GN_PPM_ORDERED_PARTNER_BUDGET_BYTES = 1 * 1024 ** 3
 #: Live-footprint multiple of one (q-block, mu, nu) c128 tile.
 #: DELIBERATELY CONSERVATIVE.  Once the replicated mode-count mask is gone
 #: (R37) the measured multiple is ~4 (params + outputs + a half-tile temp), so
@@ -690,8 +767,15 @@ def _coarsen_gn_ppm_extreme_tails(
         anchor,
     )
 
-@partial(jax.jit, static_argnums=(4,))
-def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
+@partial(jax.jit, static_argnums=(4,), donate_argnums=(5,))
+def _gn_ppm_fit_kernel(
+    Wc0_qmunu,
+    Wc_probe_qmunu,
+    z_probe,
+    fallback,
+    n_log,
+    Wc_probe_pair_qmunu=None,
+):
     """The GN-PPM fit as ONE XLA module.  Elementwise; layout-preserving.
 
     Why jitted (scorecard J.3 / AD).  Run eagerly this chain materialises
@@ -722,6 +806,13 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     """
     Wc0 = jnp.asarray(Wc0_qmunu, dtype=jnp.complex128)
     Wc_probe = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    if Wc_probe_pair_qmunu is not None:
+        # This stays inside the one fit module: the even probe is consumed by
+        # the elementwise algebra immediately and never becomes another
+        # resident ``(q,mu,nu)`` allocation.
+        Wc_probe = 0.5 * (
+            Wc_probe
+            + jnp.asarray(Wc_probe_pair_qmunu, dtype=jnp.complex128))
     n_mu = int(Wc0.shape[-1])
 
     mu_log = jnp.arange(n_mu) < n_log
@@ -826,6 +917,43 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log):
     )
 
 
+@partial(jax.jit, donate_argnums=(0,))
+def _write_q_blocks(outputs, blocks, q0):
+    """Donate aligned q blocks into full all-P destination pytrees."""
+    return jax.tree_util.tree_map(
+        lambda out, block: jax.lax.dynamic_update_slice_in_dim(
+            out, block, q0, axis=0),
+        outputs,
+        blocks,
+    )
+
+
+@partial(jax.jit, donate_argnums=(3,))
+def _frequency_residues(
+    B_even_qmunu,
+    omega_qmunu,
+    Wc_probe_qmunu,
+    Wc_probe_pair_qmunu,
+    z_probe,
+):
+    """Return ``(R_+, R_-)`` without materializing a resident odd tile."""
+    B_even = jnp.asarray(B_even_qmunu, dtype=jnp.complex128)
+    omega = jnp.asarray(omega_qmunu, dtype=jnp.float64)
+    W_plus = jnp.asarray(Wc_probe_qmunu, dtype=jnp.complex128)
+    W_minus = jnp.asarray(Wc_probe_pair_qmunu, dtype=jnp.complex128)
+    z = jnp.asarray(z_probe, dtype=jnp.complex128)
+    W_odd = 0.5 * (W_plus - W_minus)
+    half_difference = (
+        0.5 * W_odd
+        * (z * z - omega.astype(jnp.complex128) ** 2) / z
+    )
+    # Logical pad modes were born with Omega=0; keep them dead even if a
+    # padded producer happened to carry nonzero probe noise there.
+    live = omega > 0.0
+    return (
+        jnp.where(live, B_even + half_difference, 0.0j),
+        jnp.where(live, B_even - half_difference, 0.0j),
+    )
 def solve_laplace_minimax_interval(
     x_min: float,
     x_max: float,

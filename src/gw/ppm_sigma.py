@@ -109,12 +109,17 @@ class PPMBuildResult:
     Wc0_q: jax.Array          # (nq, μ, μ) static W^c(0) = W(0) − V; the data
                               # seam for the invalid-pole static-COHSEX term
                               # (ppm_invalid_mode="static_limit", BGW mode 3).
-                              # Identity: Wc0 = −2·B_q/Ω_q elementwise.
-    B_q: jax.Array            # (nq, μ, μ) PPM amplitude
+                              # Reciprocal identity: Wc0 = −2·B_q/Ω_q.
+                              # Ordered identity when B_negative_q is present:
+                              # Wc0 = −(B_q + B_negative_q)/Ω_q.
+    B_q: jax.Array            # (nq, μ, μ) positive-frequency residue R_+
     Omega_q: jax.Array        # (nq, μ, μ) PPM pole frequency
     valid_mask_q: jax.Array   # (nq, μ, μ)
     unfulfilled_fraction: float
     n_nodes_static: int
+    #: Positive-amplitude carrier R_- at the negative pole.  None preserves
+    #: the historical reciprocal model, where both branches consume B_q.
+    B_negative_q: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +197,16 @@ class _SigmaPhysicsState(NamedTuple):
     invalid_mask: jax.Array    # (nq, μ, μ)     bool, logical modes with Ω²<0
     n_total_modes: jax.Array   # scalar int64
     n_invalid: jax.Array       # scalar int64
+
+
+def _residue_for_space(space: str, B_positive, B_negative=None):
+    """Select the causal pole carrier once, before the branch executor."""
+    if space == "cond":
+        return B_positive
+    if space == "val":
+        return B_positive if B_negative is None else B_negative
+    raise ValueError(
+        f"_residue_for_space: space must be 'cond' or 'val'; got {space!r}.")
 
 
 #: Env escape hatch for :func:`assert_gapped_occupations_for_ppm`.  It is an
@@ -370,6 +385,7 @@ def fit_ppm(
     n_mu_logical: int,
     q_neg_index: np.ndarray | None = None,
     coarsen_extreme_tails: bool = False,
+    include_frequency_odd_response: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -393,6 +409,13 @@ def fit_ppm(
     ``1/z^2`` moments, so it is not strict BGW pole parity.  It is explicit
     here because the same algebra also fits HL poles, whose real-axis
     two-point model must not silently inherit this GN policy.
+
+    ``include_frequency_odd_response=True`` retains the ordered probe's
+    antisymmetric frequency part.  The fit asks the canonical symmetry
+    service for bounded rows of ``W^c_{-q}(z)^T`` and returns aligned ``R_+``
+    and ``R_-`` fields, so the Sigma executor performs no q lookup,
+    transpose, or conjugation.  The default is the historical one-residue
+    path.
     """
     import time as _t
     z = complex(probe_omega)
@@ -400,16 +423,28 @@ def fit_ppm(
 
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
+    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    if include_frequency_odd_response:
+        if q_neg_index is None:
+            raise ValueError(
+                "fit_ppm: q_neg_index is required when retaining the "
+                "frequency-odd response.")
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
+         include_frequency_odd_response=bool(
+             include_frequency_odd_response),
          q_neg_index=q_neg_index,
          coarsen_extreme_tails=bool(coarsen_extreme_tails))
 
-    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.omega_qmunu), q_shard)
     B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    B_negative = (
+        None if fit.B_negative_qmunu is None
+        else jax.lax.with_sharding_constraint(
+            jnp.asarray(fit.B_negative_qmunu), q_shard)
+    )
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
@@ -475,6 +510,7 @@ def fit_ppm(
         valid_mask_q=valid_mask,
         unfulfilled_fraction=fit.unfulfilled_fraction,
         n_nodes_static=n_nodes_static,
+        B_negative_q=B_negative,
     )
 
 
@@ -1401,6 +1437,11 @@ def compute_sigma_c_ppm_omega_grid(
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
+    B_negative_q = getattr(ppm, "B_negative_q", None)
+    if B_negative_q is not None and B_negative_q.shape != B_q.shape:
+        raise ValueError(
+            "PPM negative-frequency residue must match B_q shape; got "
+            f"{B_negative_q.shape} versus {B_q.shape}.")
     Omega_q = ppm.Omega_q
     valid_mask_q = ppm.valid_mask_q
     omega_values_ry = omega_grid_ry
@@ -1514,6 +1555,14 @@ def compute_sigma_c_ppm_omega_grid(
     cond_mask = state.cond_mask
     val_mask = state.val_mask
     B_corr = state.B_corr
+    B_negative_corr = (
+        None if B_negative_q is None
+        else jnp.asarray(B_negative_q, dtype=jnp.complex128)
+    )
+    if (B_negative_corr is not None
+            and isinstance(B_corr.sharding, NamedSharding)):
+        B_negative_corr = jax.lax.with_sharding_constraint(
+            B_negative_corr, B_corr.sharding)
     Omega_abs = state.Omega_abs
     B_mask = state.B_mask
     n_total_modes = int(jax.device_get(state.n_total_modes))
@@ -1612,7 +1661,6 @@ def compute_sigma_c_ppm_omega_grid(
     )
 
     common_branch_kwargs = dict(
-        B_q=B_corr,
         Omega_q=Omega_abs,
         base_mask_B=B_mask,
         regularization_width_ry=regularization_width_ry,
@@ -1671,6 +1719,8 @@ def compute_sigma_c_ppm_omega_grid(
         branch_tiles, _ = _run_sigma_branch(
             omega_nonneg_ry=br.omega_abs,
             E_A=br.E_A, base_mask_A=br.base_mask_A,
+            B_q=_residue_for_space(
+                br.space, B_corr, B_negative_corr),
             space=br.space, neg_omega_half=br.neg_omega_half,
             log_tag=br.tag,
             **common_branch_kwargs,

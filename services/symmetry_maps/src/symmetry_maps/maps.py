@@ -155,6 +155,125 @@ def q_negation_index(kgrid):
     return np.ravel_multi_index(neg.T, tuple(grid)).astype(np.int32)
 
 
+_Q_PAIR_TRANSPOSE_JIT_CACHE: dict = {}
+
+
+def q_pair_transpose(
+    operator_q, q_neg_index, *, q_rows=None, out_sharding=None,
+):
+    r"""Return the ordered-response partner ``X_{-q}^{T}``.
+
+    ``operator_q`` is one full-grid square operator in canonical
+    ``(q, left, right)`` order.  For a retarded density response this is the
+    frequency-reversed partner,
+
+    .. math::
+
+        X^{\mathrm{pair}}_q(z) = X_{-q}(z)^T = X_q(-z),
+
+    with no complex conjugation.  Keeping this action in the symmetry service
+    prevents response fits from acquiring their own spelling of the full-grid
+    q order or of the endpoint transpose.
+
+    A distributed input must be exactly ``P(None, 'x', 'y')`` and returns in
+    that same all-P layout.  ``q_rows`` optionally selects a bounded set of
+    output rows; row ``r`` then reads only ``operator_q[q_neg_index[r]]``.
+    This is the production memory seam: a caller can consume partner rows
+    immediately without ever making the whole partner operator resident.
+    ``out_sharding`` may pin the same contract explicitly; by default a named
+    input sharding is reused.  Plain host/single-device arrays remain a small
+    algebra-test path and need no artificial mesh.
+    """
+    a = jnp.asarray(operator_q)
+    if a.ndim != 3 or int(a.shape[1]) != int(a.shape[2]):
+        raise ValueError(
+            "q_pair_transpose: operator_q must have square shape "
+            f"(nq,n,n); got {a.shape}.")
+
+    raw = np.asarray(q_neg_index)
+    nq = int(a.shape[0])
+    if (raw.shape != (nq,) or not np.all(np.isfinite(raw))
+            or not np.array_equal(raw, np.rint(raw))):
+        raise ValueError(
+            "q_pair_transpose: q_neg_index must contain one finite integer "
+            f"row per q; got shape={raw.shape} for nq={nq}.")
+    q_neg = raw.astype(np.int32)
+    if (np.any(q_neg < 0) or np.any(q_neg >= nq)
+            or not np.array_equal(q_neg[q_neg], np.arange(nq))):
+        raise ValueError(
+            "q_pair_transpose: q_neg_index must be an involution over "
+            f"[0,{nq}).")
+
+    if q_rows is None:
+        rows = np.arange(nq, dtype=np.int32)
+    else:
+        rows_raw = np.asarray(q_rows)
+        if (rows_raw.ndim != 1 or not np.all(np.isfinite(rows_raw))
+                or not np.array_equal(rows_raw, np.rint(rows_raw))):
+            raise ValueError(
+                "q_pair_transpose: q_rows must be a finite integer vector; "
+                f"got shape={rows_raw.shape}.")
+        rows = rows_raw.astype(np.int32)
+        if np.any(rows < 0) or np.any(rows >= nq):
+            raise ValueError(
+                "q_pair_transpose: q_rows contains an index outside "
+                f"[0,{nq}).")
+
+    input_sharding = getattr(a, "sharding", None)
+    canonical = P(None, "x", "y")
+    if isinstance(input_sharding, NamedSharding):
+        if input_sharding.spec != canonical:
+            raise ValueError(
+                "q_pair_transpose: a distributed operator must use the "
+                f"canonical all-P layout {canonical}; got "
+                f"{input_sharding.spec}.")
+        if out_sharding is None:
+            out_sharding = input_sharding
+    elif len(getattr(input_sharding, "device_set", ())) > 1:
+        raise ValueError(
+            "q_pair_transpose: a multi-device operator must carry a "
+            "NamedSharding with P(None,'x','y'); an uncommitted or "
+            f"replicated array would materialize N_mu^2 off the all-P mesh "
+            f"({input_sharding}).")
+    if out_sharding is not None and not isinstance(
+            out_sharding, NamedSharding):
+        raise ValueError(
+            "q_pair_transpose: out_sharding must be a NamedSharding with "
+            "P(None,'x','y').")
+    if isinstance(out_sharding, NamedSharding):
+        if out_sharding.spec != canonical:
+            raise ValueError(
+                "q_pair_transpose: output must use the canonical all-P "
+                f"layout {canonical}; got {out_sharding.spec}.")
+        if (isinstance(input_sharding, NamedSharding)
+                and out_sharding != input_sharding):
+            raise ValueError(
+                "q_pair_transpose: input and output must use the same "
+                "NamedSharding/mesh; cross-mesh movement is not part of the "
+                "q-pair operation.")
+
+    key = (
+        tuple(int(v) for v in a.shape), str(a.dtype),
+        int(rows.size), out_sharding,
+    )
+    fn = _Q_PAIR_TRANSPOSE_JIT_CACHE.get(key)
+    if fn is None:
+        @jax.jit
+        def fn(value, source_rows):
+            partner = jnp.swapaxes(
+                jnp.take(value, source_rows, axis=0), -1, -2)
+            if out_sharding is not None:
+                partner = jax.lax.with_sharding_constraint(
+                    partner, out_sharding)
+            return partner
+
+        _Q_PAIR_TRANSPOSE_JIT_CACHE[key] = fn
+    # Row VALUES are an ordinary tiny device operand, not part of the compile
+    # key.  A production q walk therefore compiles once per block SHAPE (full
+    # block plus at most one remainder), rather than once per q block.
+    return fn(a, jnp.asarray(q_neg[rows], dtype=jnp.int32))
+
+
 def common_uniform_grid_indices(grid_a, grid_b):
     """Aligned C-order rows shared by two unshifted uniform BZ grids.
 

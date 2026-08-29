@@ -535,7 +535,7 @@ def _assert_restart_is_loadable(tensors_filename, *, include_w=True,
 # ---------------------------------------------------------------------------
 
 def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None,
-                      include_w=True):
+                      include_w=True, frequency_odd_response=False):
     """Run ``_gate_w`` as a non-negotiable resolvent-stage refusal.
 
     ``common.sanity`` defaults to warn-and-continue because its generic gates
@@ -558,14 +558,17 @@ def _gate_w_or_refuse(W, req, *, stage, print_fn=print, kgrid=None,
     previous = os.environ.get("LORRAX_SANITY")
     os.environ["LORRAX_SANITY"] = "strict"
     try:
-        _gate_w(W, req, print_fn=print_fn, kgrid=kgrid)
+        _gate_w(
+            W, req, print_fn=print_fn, kgrid=kgrid,
+            frequency_odd_response=frequency_odd_response)
     except sanity.SanityError as exc:
         raise ValueError(
             f"GATE {rule_id}: screening_diagrams = {diagram_name} "
             f"refuses a screened-interaction stage that failed _gate_w.\n"
             f"  got:  {stage}: {exc}\n"
-            f"  want: finite W, q=0 hermiticity residual <= 1e-6, and -- "
-            f"for omega on the imaginary axis -- q<->-q conjugate "
+            f"  want: finite W, the applicable q=0 covariance residual "
+            f"<= 1e-6, and -- for omega on the imaginary axis -- "
+            f"q<->-q conjugate "
             f"reciprocity residual <= 1e-5\n"
             f"  fix:  do not consume or publish this run's downstream "
             f"artifacts; fix the named W stage and rerun, or use "
@@ -1068,11 +1071,14 @@ def compute_screening_ladder(
         # loosen it (design section 4).
         with timing.section("W.gate", announce=True,
                             label=f"W[{req.role}] ({diagram_name}) "
-                                  f"finiteness + hermiticity gate"):
+                                  f"finiteness + covariance gate"):
             _gate_w_or_refuse(
                 W_q, req, stage=f"assembled {diagram_name} W[{req.role}]",
                 print_fn=print_fn, kgrid=tuple(meta.kgrid),
-                include_w=include_w)
+                include_w=include_w,
+                frequency_odd_response=(
+                    abs(complex(req.omega_ry).imag) > 0.0
+                    and not bool(sym.trs_allowed)))
         W_by_role[req.role] = W_q
     return W_by_role
 
