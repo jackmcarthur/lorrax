@@ -31,6 +31,7 @@ from minimax.reciprocal_fit import (
     evaluate_rule,
     rule_amplification,
     solve_fixed_time_weights,
+    solve_fixed_time_weights_fast,
 )
 from minimax.sector import reciprocal_sector_rule
 
@@ -71,6 +72,12 @@ class ComplexTimeSearchOptions:
     # previous tolerance rung's rule when walking a ladder).  They join
     # the dictionary as family "seed" and remain prunable.
     seed_times: tuple = ()
+    # "irls" solves each weight subproblem by reweighted least squares in
+    # milliseconds and judges by the exact measured metric; "lp" restores
+    # the certified polygonal program (tens of seconds per solve at
+    # production sizes — measured 12-33 s — so search cost is O(nodes)
+    # solves either way, just three orders apart).
+    weight_solver: str = "irls"
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.target_error) < 1.0:
@@ -320,15 +327,26 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
 
     target = float(options.target_error)
 
+    def weight_solve(sub: ReciprocalMeasureProblem, nodes: Array,
+                     conditioning: bool) -> Array:
+        if options.weight_solver == "lp":
+            weights, _ = solve_fixed_time_weights(
+                sub, nodes,
+                polygon_directions=int(options.polygon_directions),
+                conditioning_slack=float(options.conditioning_slack),
+                conditioning_pass=conditioning,
+                objective_scale=1.0 / target)
+        else:
+            weights, _ = solve_fixed_time_weights_fast(
+                sub, nodes,
+                conditioning_slack=float(options.conditioning_slack),
+                conditioning_pass=conditioning)
+        return weights
+
     def solve_on(indices: list[int],
                  mask: Array) -> tuple[Array, Array, float, Array]:
         sub = _fit_subproblem(problem, np.asarray(sorted(indices)))
-        weights, _ = solve_fixed_time_weights(
-            sub, candidates[mask],
-            polygon_directions=int(options.polygon_directions),
-            conditioning_slack=float(options.conditioning_slack),
-            conditioning_pass=False,
-            objective_scale=1.0 / target)
+        weights = weight_solve(sub, candidates[mask], False)
         error, _ = delivered_error(problem, candidates[mask], weights)
         return candidates[mask], weights, float(np.max(error)), error
 
@@ -401,23 +419,14 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
             break
 
     sub = _fit_subproblem(problem, np.asarray(sorted(fit_set)))
-    weights, _ = solve_fixed_time_weights(
-        sub, candidates[active],
-        polygon_directions=int(options.polygon_directions),
-        conditioning_slack=float(options.conditioning_slack),
-        conditioning_pass=True,
-        objective_scale=1.0 / target)
+    weights = weight_solve(sub, candidates[active], True)
     times = candidates[active]
     error, excluded = delivered_error(problem, times, weights)
     if float(np.max(error)) > target:
         # The conditioning pass holds its slack on the fitting set; if the
         # full-frequency metric slipped past the target, keep the stricter
         # pre-conditioning weights instead of returning a miss.
-        weights, _ = solve_fixed_time_weights(
-            sub, times,
-            polygon_directions=int(options.polygon_directions),
-            conditioning_pass=False,
-            objective_scale=1.0 / target)
+        weights = weight_solve(sub, times, False)
         error, excluded = delivered_error(problem, times, weights)
     p99, peak = rule_amplification(times, weights, problem)
     families = tuple(np.asarray(candidate_families)[active])

@@ -385,6 +385,122 @@ def solve_fixed_time_weights(
             objective / float(objective_scale))
 
 
+def solve_fixed_time_weights_fast(
+    problem: ReciprocalMeasureProblem,
+    times: Array,
+    *,
+    iterations: int = 12,
+    conditioning_slack: float = 1.0e-3,
+    conditioning_pass: bool = True,
+) -> tuple[Array, float]:
+    r"""Near-minimax complex weights by iteratively reweighted least squares.
+
+    Approximates the objective of ``solve_fixed_time_weights`` at a tiny
+    fraction of its cost: each iteration solves one dense least-squares in
+    the ``2 n_nodes`` real weight unknowns, with Lawson multipliers
+    pressing the worst frequencies and an L1 reweighting pressing large
+    residual cells.  The returned objective is the exact measured
+    delivered error on the problem's kept cells — stronger currency than
+    the LP's polygonal bound, and the only number any caller of this
+    module ever acts on.  The conditioning pass replaces the LP's second
+    solve with a ridge ladder: the largest weight-magnitude penalty whose
+    measured error stays inside ``(1 + conditioning_slack)`` of the best
+    unpenalized error wins, spending the same declared slack on
+    cancellation control.
+    """
+    nodes = np.asarray(times, dtype=np.complex128)
+    if nodes.ndim != 1 or nodes.size == 0:
+        raise ValueError("times must be a nonempty 1d array")
+    kept, delivered, _ = problem.retained()
+    d = problem.denominators
+    n_frequency, _ = d.shape
+    keep_i, keep_j = np.nonzero(kept & (problem.cell_masses[None, :] > 0.0))
+    if keep_i.size == 0:
+        raise ValueError("no cell survives the excluded region")
+    d_flat = d[keep_i, keep_j]
+    exponent = 1.0j * d_flat[:, None] * nodes[None, :]
+    log_peak = np.max(exponent.real, axis=0)
+    atoms = np.exp(exponent - log_peak[None, :])
+    gauge = np.exp(-log_peak)
+    atoms[np.abs(atoms) < 1.0e-12] = 0.0
+    truth = 1.0 / d_flat
+    scale = problem.cell_masses[keep_j] / delivered[keep_i]
+    n_nodes = nodes.size
+
+    def measured(residual: Array) -> tuple[Array, float]:
+        by_frequency = np.bincount(keep_i, weights=scale * np.abs(residual),
+                                   minlength=n_frequency)
+        return by_frequency, float(np.max(by_frequency))
+
+    def weighted_solve(row_weight: Array, ridge: float) -> Array:
+        root = np.sqrt(row_weight)
+        real_block = root[:, None] * atoms.real
+        imag_block = root[:, None] * atoms.imag
+        system = np.block([[real_block, -imag_block],
+                           [imag_block, real_block]])
+        rhs = np.concatenate([root * truth.real, root * truth.imag])
+        extra_rows = []
+        extra_rhs = []
+        if ridge > 0.0:
+            # Penalize the PHYSICAL weight magnitudes y * gauge.
+            penalty = np.sqrt(ridge) * gauge
+            extra_rows.append(np.concatenate(
+                [np.diag(penalty), np.zeros((n_nodes, n_nodes))], axis=1))
+            extra_rows.append(np.concatenate(
+                [np.zeros((n_nodes, n_nodes)), np.diag(penalty)], axis=1))
+            extra_rhs.append(np.zeros(2 * n_nodes))
+        if problem.zero_weight_sum:
+            hard = 1.0e6 * float(np.max(root)) + 1.0
+            extra_rows.append(hard * np.concatenate(
+                [gauge, np.zeros(n_nodes)])[None, :])
+            extra_rows.append(hard * np.concatenate(
+                [np.zeros(n_nodes), gauge])[None, :])
+            extra_rhs.append(np.zeros(2))
+        if extra_rows:
+            system = np.concatenate([system] + extra_rows, axis=0)
+            rhs = np.concatenate([rhs] + extra_rhs)
+        solution = np.linalg.lstsq(system, rhs, rcond=None)[0]
+        return solution[:n_nodes] + 1.0j * solution[n_nodes:]
+
+    def irls(start: Array | None, count: int, ridge: float,
+             lawson: Array) -> tuple[Array, Array, float, Array]:
+        coefficients = start
+        residual = (-truth if coefficients is None
+                    else atoms @ coefficients - truth)
+        best_y, best_error, best_by = None, np.inf, None
+        for _ in range(count):
+            by_frequency, _ = measured(residual)
+            top = float(np.max(by_frequency))
+            lawson = lawson * (by_frequency / top + 1.0e-12)
+            lawson = lawson / np.sum(lawson)
+            floor = (1.0e-12 * float(np.max(np.abs(truth)))
+                     + 1.0e-6 * float(np.mean(np.abs(residual))))
+            row_weight = (lawson[keep_i] * scale
+                          / np.maximum(np.abs(residual), floor))
+            coefficients = weighted_solve(row_weight, ridge)
+            residual = atoms @ coefficients - truth
+            by_frequency, error = measured(residual)
+            if error < best_error:
+                best_y, best_error, best_by = coefficients, error, by_frequency
+        return best_y, lawson, best_error, best_by
+
+    lawson0 = np.full(n_frequency, 1.0 / n_frequency)
+    best_y, lawson, best_error, _ = irls(None, int(iterations), 0.0, lawson0)
+    if conditioning_pass and best_y is not None:
+        allowed = best_error * (1.0 + float(conditioning_slack))
+        # Ridge units: error is dimensionless, weights are O(|d|)-ish;
+        # anchor the ladder to the unpenalized solution's own magnitude.
+        anchor = best_error / max(float(np.sum(np.abs(best_y * gauge))),
+                                  1.0e-300) ** 2
+        for ridge in anchor * np.geomspace(1.0e4, 1.0e-2, 7):
+            candidate, _, error, _ = irls(best_y, 3, float(ridge), lawson)
+            if candidate is not None and error <= allowed:
+                best_y, best_error = candidate, error
+                break
+    weights = np.asarray(best_y, dtype=np.complex128) * gauge
+    return weights, best_error
+
+
 __all__ = [
     "ReciprocalMeasureProblem",
     "ComplexTimeRule",
