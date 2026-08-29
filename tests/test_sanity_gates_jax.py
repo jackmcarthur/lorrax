@@ -580,7 +580,8 @@ def test_make_eqp_authenticates_explicit_live_source_over_stored_offer(
                 sigma_sx_kij_ev=np.zeros(shape),
                 hartree_kij_ev=raw_scalar + raw_transverse,
                 hartree_scalar_kij_ev=raw_scalar,
-                hartree_transverse_kij_ev=raw_transverse)
+                hartree_transverse_kij_ev=raw_transverse,
+                mesh=_mesh())
         component_kwargs = ({} if transverse is None else {
             "hartree_scalar_diag_ev": scalar,
             "hartree_transverse_diag_ev": transverse,
