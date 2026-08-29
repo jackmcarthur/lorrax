@@ -36,10 +36,10 @@ reference.  What each pin uniquely covers:
   SX/COH kernels and the K_POINTS band-path input.
 * ``gnppm`` — MoS2 3×3 GN-PPM: the dynamic workhorse (minimax
   screening, PPM fit, 4-branch τ-integration, analytic q→0 head,
-  eqp0/eqp1 writers) with the IBZ cascade ACTIVE (asserted on the run
-  log — the frozen values alone cannot see a silently deactivated
-  cascade because IBZ ≡ full-BZ).  Its session run doubles as the
-  prepared state for every Tier-2 from-restart invariance gate.
+  eqp0/eqp1 writers) with the IBZ cascade ACTIVE (asserted from the
+  authenticated V/W restart receipts — the frozen values alone cannot see
+  a silently deactivated cascade because IBZ ≡ full-BZ). Its session run
+  doubles as the prepared state for every Tier-2 from-restart invariance gate.
 * ``bispinor`` — MoS2 3×3 nspinor=2 bispinor GN-PPM: dynamic Σ_c on the
   screened charge W plus bare Breit Σ^B folded into sigX; 4 ζ channels,
   7 V_q tiles, transverse γ̃ machinery no scalar gate touches.
@@ -500,11 +500,21 @@ def test_gnppm_matches_reference(gnppm_session):
         REG / "gnppm_debug" / "sigma_diag_gnppm_ref.dat",
         ("sigX", "sigC", "sigXC"), _XMACHINE_ATOL_EV, "gnppm")
     # The frozen values CANNOT detect a silently deactivated IBZ cascade
-    # (IBZ ≡ full-BZ numerically) — pin the activation on the log.
-    assert "unfold=IBZ→full" in gnppm_session.stdout, (
-        "gnppm session run did not take the IBZ cascade (V_q g-flat log "
-        "line missing 'unfold=IBZ→full') — orbit closure regressed?")
-    assert "orbit closure failed" not in gnppm_session.stdout
+    # (IBZ ≡ full-BZ numerically). Pin the persisted V/W receipts through
+    # the format's public reader rather than a debug print suppressed by the
+    # production-report stream.
+    import h5py
+    from symmetry_maps import dataset_q_storage, read_tables
+
+    restart = gnppm_session.run_dir / "tmp" / "isdf_tensors_399.h5"
+    with h5py.File(restart, "r") as h5:
+        for name in ("V_qmunu", "W0_qmunu"):
+            assert dataset_q_storage(h5[name]) == "ibz"
+            assert bool(h5[name].attrs["qirr_data_ready"])
+            assert h5[name].shape[0] == 5
+    for name in ("V_qmunu", "W0_qmunu"):
+        tables = read_tables(restart, name)
+        assert (tables.n_q_ibz, tables.n_q_full) == (5, 9)
 
 
 @pytest.mark.regression
