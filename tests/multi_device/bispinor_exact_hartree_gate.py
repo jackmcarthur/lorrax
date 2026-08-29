@@ -101,8 +101,13 @@ def main():
             failures.append(f"{name} hermiticity {herm:.3e}")
         if spec != P(None, "x", "y"):
             failures.append(f"{name} layout {spec}")
-        if not np.isfinite(nonzero) or nonzero == 0.0:
-            failures.append(f"{name} is zero/nonfinite")
+        if not np.isfinite(nonzero):
+            failures.append(f"{name} is nonfinite")
+        # This fixture is measured TR-symmetric.  Its correctly projected
+        # periodic current may therefore be exact zero (the synthetic gate
+        # owns nonzero-current algebra); only scalar charge must be nonzero.
+        if name == "charge" and nonzero == 0.0:
+            failures.append("charge is zero")
 
     diagnostics = {
         "current_g0_relative": float(device.current_g0_relative),
