@@ -2045,7 +2045,7 @@ def _z_q_face(
 						axes=(0, 1, 2), norm='forward')
 					P_l_R_conj = jnp.conj(P_l_R)
 
-					def right_density_R(channel_idx):
+					def channel_body(Z_R_channels, channel_idx):
 						perm_L_channel = perm_L_[channel_idx]
 						phase_L_channel = phase_L_[channel_idx]
 						perm_R_channel = perm_R_[channel_idx]
@@ -2083,31 +2083,16 @@ def _z_q_face(
 							P_r.reshape(
 								nkx, nky, nkz, active_r_loc, mu_loc),
 							axes=(0, 1, 2), norm='forward')
-						return P_r_R
-
-					def update_channel(Z_R_channels, channel_idx, delta):
 						Z_R_channel = jax.lax.dynamic_index_in_dim(
 							Z_R_channels, channel_idx, axis=0, keepdims=False)
-						Z_R_channel = Z_R_channel + delta
+						Z_R_channel = Z_R_channel + P_l_R_conj * P_r_R
 						Z_R_channels = jax.lax.dynamic_update_index_in_dim(
 							Z_R_channels, Z_R_channel, channel_idx, axis=0)
-						return Z_R_channels
+						return Z_R_channels, None
 
-					# γ1 and γ2 have the same monomial permutation.  Their only
-					# right-density difference for a fixed scalar spin pair is the
-					# k/q/r-independent phase product h2[a]h2[b] ∈ {−1,+1}.
-					# Reuse one completed band sum and IFFT; γ3 has a different
-					# permutation and keeps its own one-carrier transaction.
-					P_r_R_12 = right_density_R(jnp.asarray(0, dtype=jnp.int32))
-					Z_R_acc = update_channel(
-						Z_R_acc, 0, P_l_R_conj * P_r_R_12)
-					phase_2_ab = phase_L_[1, a] * phase_R_[1, b]
-					Z_R_acc = update_channel(
-						Z_R_acc, 1,
-						P_l_R_conj * (phase_2_ab * P_r_R_12))
-					P_r_R_3 = right_density_R(jnp.asarray(2, dtype=jnp.int32))
-					Z_R_acc = update_channel(
-						Z_R_acc, 2, P_l_R_conj * P_r_R_3)
+					Z_R_acc, _ = jax.lax.scan(
+						channel_body, Z_R_acc,
+						jnp.arange(3, dtype=jnp.int32), unroll=1)
 					return Z_R_acc, None
 
 				Z_R, _ = jax.lax.scan(
