@@ -95,3 +95,16 @@ def test_tr_broken_cond_and_val_pole_sets_produce_independent_plans():
     val_times = np.asarray(plan[1].window.nodes.t)
     assert (cond_times.shape != val_times.shape
             or not np.allclose(cond_times, val_times))
+
+
+def test_selector_defaults_to_incumbent_panes(monkeypatch):
+    from gw.mpa import sigma
+
+    incumbent = object()
+    delivered = object()
+    monkeypatch.delenv("LORRAX_SIGMA_PLAN", raising=False)
+    monkeypatch.setattr(sigma, "build_shared_sigma_windows", incumbent)
+    monkeypatch.setattr(sigma, "_build_delivered_sigma_windows", delivered)
+    mode, builder = sigma.resolve_sigma_plan_builder()
+    assert mode == "panes"
+    assert builder is incumbent

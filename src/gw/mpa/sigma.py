@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -21,6 +23,30 @@ from gw.wavefunction_bundle import face_kernel_kwargs
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             build_shared_sigma_windows,
                             summarize_sigma_poles)
+
+
+def _build_delivered_sigma_windows(*args, **kwargs):
+    """Lazy service/solver import; the default panes path pays none of it."""
+    from .delivered_windows import build_delivered_sigma_windows
+    return build_delivered_sigma_windows(*args, **kwargs)
+
+
+def resolve_sigma_plan_builder():
+    """Resolve ``LORRAX_SIGMA_PLAN`` to its planning pathway.
+
+    The exact grammar is ``panes`` or ``delivered`` after stripping and
+    lower-casing.  Unset and blank both preserve the incumbent panes path;
+    every other spelling refuses rather than silently running another arm.
+    """
+    raw = os.environ.get("LORRAX_SIGMA_PLAN", "panes").strip().lower()
+    mode = raw or "panes"
+    if mode == "panes":
+        return mode, build_shared_sigma_windows
+    if mode == "delivered":
+        return mode, _build_delivered_sigma_windows
+    raise ValueError(
+        "LORRAX_SIGMA_PLAN must be 'panes' or 'delivered'; "
+        f"got {raw!r}")
 
 
 def _bounded_pole_batch_size(value):
@@ -315,11 +341,11 @@ def compute_sigma_c_mpa_omega_grid(
     entry points, which is what keeps the branch supports, the pole census
     and the window build on one support.
 
-    Pole tensors are read collectively in their native sharding.  A first
-    configured-batch walk retains only scalar geometry for planning; the
-    spatial executor rereads and releases the same pole ranges.  No complete
-    pole axis exists on host or device unless the deck explicitly chooses a
-    batch equal to its pole count.
+    Pole tensors are read collectively in their native sharding.  The panes
+    pathway's first configured-batch walk retains only scalar geometry; the
+    delivered pathway reads the complete pole axis once and reduces each
+    addressable spatial shard to a bounded measure.  The spatial executor
+    then rereads and releases its configured pole ranges in either mode.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
@@ -330,7 +356,7 @@ def compute_sigma_c_mpa_omega_grid(
         wfns, omega_grid_ry, efermi_ry,
         occupation_state=occupation_state,
         occupation_window_threshold=occupation_window_threshold)
-    summaries = []
+    plan_mode, plan_builder = resolve_sigma_plan_builder()
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
     # does its h5py reads (ledger, unfold tables) before that handle
@@ -340,28 +366,54 @@ def compute_sigma_c_mpa_omega_grid(
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
     with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
-        for lo in range(0, n_poles, int(pole_batch_size)):
-            hi = min(lo + int(pole_batch_size), n_poles)
-            Omega, B = reader.read(
-                slice(lo, hi), unfold=True, return_sharded=True,
-                to_unit="Ry")
-            summaries.extend(summarize_sigma_poles(
-                Omega, B, branches,
+        if plan_mode == "panes":
+            # The incumbent path is intentionally kept byte-for-byte in its
+            # own arm: same configured census batches, summaries, builder
+            # arguments, and executor plan.
+            summaries = []
+            for lo in range(0, n_poles, int(pole_batch_size)):
+                hi = min(lo + int(pole_batch_size), n_poles)
+                Omega, B = reader.read(
+                    slice(lo, hi), unfold=True, return_sharded=True,
+                    to_unit="Ry")
+                summaries.extend(summarize_sigma_poles(
+                    Omega, B, branches,
+                    regularization_width_ry=regularization_width_ry,
+                    edge_factor=edge_factor, pole_offset=lo,
+                    occupation_window_threshold=occupation_window_threshold))
+                del Omega, B
+            plan, geometry = plan_builder(
+                summaries, branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo,
-                occupation_window_threshold=occupation_window_threshold))
+                edge_factor=edge_factor, target_error=target_error,
+                crossing_target_error=crossing_target_error,
+                max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
+                omega_cluster_gap_ry=omega_cluster_gap_ry,
+                occupation_window_threshold=occupation_window_threshold)
+        else:
+            # The delivered measure needs the residues, not only rectangle
+            # extrema.  Pole fields stay sharded; the planner reduces each
+            # addressable shard to bounded cells before any cross-rank gather.
+            Omega, B = reader.read(
+                slice(0, n_poles), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            plan, geometry = plan_builder(
+                [Omega] * len(branches), [B] * len(branches), branches,
+                omega_grid_ry,
+                regularization_width_ry=regularization_width_ry,
+                target_error=target_error,
+                max_nodes=max(int(max_rank), int(crossing_max_nodes)))
             del Omega, B
-        plan, geometry = build_shared_sigma_windows(
-            summaries, branches,
-            regularization_width_ry=regularization_width_ry,
-            edge_factor=edge_factor, target_error=target_error,
-            crossing_target_error=crossing_target_error,
-            max_rank=max_rank, crossing_max_nodes=crossing_max_nodes,
-            omega_cluster_gap_ry=omega_cluster_gap_ry,
-            occupation_window_threshold=occupation_window_threshold)
-        print_fn(
-            f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-            f"{geometry['n_windows']} logical windows")
+        if plan_mode == "panes":
+            print_fn(
+                f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+                f"{geometry['n_windows']} logical windows")
+        else:
+            print_fn(
+                f"  MPA windows [delivered]: "
+                f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+                f"{geometry['n_windows']} logical windows, "
+                f"{geometry['n_tau']} total nodes")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, print_fn=print_fn)
