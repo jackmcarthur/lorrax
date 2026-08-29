@@ -317,9 +317,17 @@ def solve_fixed_time_weights(
                     b_eq=equality_rhs, bounds=bounds, method="highs",
                     options=tolerances)
     if not first.success:
+        # Dual simplex and interior point fail differently on large
+        # near-degenerate models (measured: 5040-cell solves where one
+        # reports model_status Unknown and the other certifies Optimal),
+        # so try the second algorithm before refusing.
+        first = linprog(cost, A_ub=inequality, b_ub=upper, A_eq=equality,
+                        b_eq=equality_rhs, bounds=bounds, method="highs-ipm",
+                        options=tolerances)
+    if not first.success:
         raise RuntimeError(
-            f"weight solve failed for {n_nodes} nodes over {n_kept} cells: "
-            f"{first.message}")
+            f"weight solve failed for {n_nodes} nodes over {n_kept} cells "
+            f"under both highs and highs-ipm: {first.message}")
     objective = float(first.x[-1])
     solution = first.x
 
