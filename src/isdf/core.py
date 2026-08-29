@@ -4884,8 +4884,8 @@ def factor_c_q(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
     # Indefinite-CCT path: no Cholesky.  TWO solve families since
-    # 2026-08-01, both hoisted (factor ONCE per channel, applied per
-    # r-chunk):
+    # 2026-08-01.  The ordinary routes are hoisted (factor ONCE per channel,
+    # applied per r-chunk):
     #   ridge (LU) family — per-q pivoted LU + 1e-12 ridge (see the
     #   "hoisted TRANSVERSE factor stage" section above);
     #   rank_truncate family — per-q eigh pseudo-inverse with an |λ| cut
@@ -4927,6 +4927,17 @@ def factor_c_q(
                 indefinite=True,
                 distrib_la_batched_route=distrib_la_batched_route), None
         if t_kind in ('scalapack_lu', 'cusolvermp_lu'):
+            # A block-cyclic token cannot enter distrib_la's face-to-batch
+            # schedule.  Keep raw CCT so solve_zeta can use that plan-shaped
+            # route, adding the accepted materialized trace ridge once.  This
+            # refactors each chunk, trading small n_mu_T^3 work for avoiding
+            # the latency-heavy world-grid getrs sequence.
+            if distrib_la_batched_route == 'batch_reshard':
+                if jax.process_index() == 0:
+                    print("  [zeta transverse ridge] batch_reshard keeps "
+                          "the raw CCT; factor+solve runs per r-chunk after "
+                          "face-to-batch movement", flush=True)
+                return C_q, None
             # The factor is an opaque FactorToken with no public buffer, so
             # the |diag U| instrument cannot reach it.  Say that rather than
             # skipping silently: an unmeasured path and a clean one must not
