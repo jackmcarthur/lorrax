@@ -3,6 +3,8 @@
 import numpy as np
 import jax.numpy as jnp
 
+from gw.mpa import delivered_windows as delivered
+
 from gw.mpa.delivered_windows import (
     build_delivered_sigma_windows,
     combine_delivered_sigma_pole_measures,
@@ -20,6 +22,22 @@ def _branch(tag, space, energies, omega, *, negative_half=False):
     return _SigmaBranch(
         tag, E_A, mask, space, negative_half, np.abs(omega),
         np.arange(omega.size, dtype=np.int64))
+
+
+def test_delivered_reduction_forwards_the_process_mesh_identity(monkeypatch):
+    """The delivered planner must not construct an equal second mesh."""
+    process_mesh = object()
+    seen = []
+    monkeypatch.setattr(delivered, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        delivered, "psum_replicate",
+        lambda local, mesh: seen.append(mesh) or np.asarray(local))
+
+    out = delivered._sum_fixed_process_table(
+        np.asarray([1, 2]), process_mesh, "identity probe")
+    np.testing.assert_array_equal(out, [1, 2])
+    assert seen == [process_mesh]
+    assert seen[0] is process_mesh
 
 
 def test_single_term_executed_convention_reproduces_minus_residue_over_d():
