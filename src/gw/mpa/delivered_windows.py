@@ -518,10 +518,9 @@ def _sum_fixed_process_table(local, mesh_xy, label):
 _DEVICE_POLE_REDUCERS = {}
 _LAST_POLE_FIELD_MEASURE = None
 # Measured on the Na 24-band census: one 49-million-value scatter serialized
-# on 3,750 counters. Independent 6,400-value tables keep about five values per
-# counter, exactly tile that measured shard, and stay below 240 MB per pole;
-# the collective remains 30 KB per pole and other shapes use bounded padding.
-_CENSUS_HISTOGRAM_BLOCK = 6400
+# on 3,750 counters. Independent 8K-value tables keep only about six values per
+# counter and the temporary below 200 MB per pole; the collective stays 30 KB.
+_CENSUS_HISTOGRAM_BLOCK = 8192
 
 
 def _device_pole_reducer(Omega_local, B_local, bins, eta, split):
