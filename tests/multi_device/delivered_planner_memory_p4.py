@@ -11,7 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import sys
 import tracemalloc
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "services" / "minimax" / "src"))
 
 import jax
 
@@ -33,8 +39,11 @@ from common.collectives import (  # noqa: E402
     process_rank,
     resolve_mesh,
 )
-from gw.mpa.delivered_windows import _pole_measures  # noqa: E402
+from gw.mpa import delivered_windows as delivered_module  # noqa: E402
 from gw.ppm_windows import _SigmaBranch  # noqa: E402
+import minimax  # noqa: E402
+
+_pole_measures = delivered_module._pole_measures
 
 
 LATTICE_BINS = 25
@@ -157,6 +166,10 @@ def main():
         receipt = {
             "world_size": process_count(),
             "mesh": dict(mesh.shape),
+            "jax_version": jax.__version__,
+            "jaxlib_version": jax.lib.__version__,
+            "delivered_module": delivered_module.__file__,
+            "minimax_module": minimax.__file__,
             "lattice_bins": LATTICE_BINS,
             "rows": rows,
             "verdict": "PASS_FIXED_PRECOLLECTIVE_CEILING",
