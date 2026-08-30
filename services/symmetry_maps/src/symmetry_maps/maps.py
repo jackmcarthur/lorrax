@@ -734,6 +734,10 @@ def _get_unfold_isdf_operator_jit(
         tuple(int(d.id) for d in mesh_xy.devices.flat),
         tuple(int(s) for s in mesh_xy.devices.shape),
     )
+    import hashlib as _h, sys as _s
+    _parts = [_h.md5(repr(part).encode() if not isinstance(part, bytes)
+                     else part).hexdigest()[:6] for part in key]
+    print("UNFOLD-KEY", "-".join(_parts), file=_s.stderr, flush=True)
     hit = _UNFOLD_ISDF_OPERATOR_JIT_CACHE.get(key)
     if hit is not None:
         return hit

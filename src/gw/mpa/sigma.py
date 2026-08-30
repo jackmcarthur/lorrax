@@ -434,19 +434,14 @@ def integrate_sigma_store(
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     def batches(reader):
-        # Unfold ONCE and slice per batch. Per-batch unfolding bakes each
-        # batch's tables into a fresh constant-folded kernel, so every
-        # batch pays a full retrace and XLA compile (observed on Na 24b:
-        # banner-only output for 30+ minutes on a minutes-long deck); the
-        # pane path has always unfolded the full range up front.
-        Omega_all, B_all = reader.read(
-            slice(0, int(n_poles)), unfold=True, return_sharded=True,
-            to_unit="Ry")
         for lo in range(0, int(n_poles), batch_size):
             hi = min(lo + batch_size, int(n_poles))
-            yield lo, Omega_all[lo:hi], B_all[lo:hi]
-        del Omega_all, B_all
-        gc.collect()
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True,
+                to_unit="Ry")
+            yield lo, Omega, B
+            del Omega, B
+            gc.collect()
 
     def run(reader):
         return _integrate_sigma_batches(
@@ -578,15 +573,11 @@ def compute_sigma_c_mpa_omega_grid(
             # own arm: same configured census batches, summaries, builder
             # arguments, and executor plan.
             summaries = []
-            # One unfold, sliced per batch — same reason as batches():
-            # per-batch unfold recompiles a constant-baked kernel each
-            # pass and turned the seconds-scale planner into minutes.
-            Omega_all, B_all = reader.read(
-                slice(0, int(n_poles)), unfold=True, return_sharded=True,
-                to_unit="Ry")
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = Omega_all[lo:hi], B_all[lo:hi]
+                Omega, B = reader.read(
+                    slice(lo, hi), unfold=True, return_sharded=True,
+                    to_unit="Ry")
                 summaries.extend(summarize_sigma_poles(
                     Omega, B, branches,
                     regularization_width_ry=regularization_width_ry,
@@ -612,14 +603,11 @@ def compute_sigma_c_mpa_omega_grid(
                 measure_delivered_sigma_pole_batch,
             )
             measured = [[] for _branch in branches]
-            # One unfold, sliced per batch (third and last per-batch
-            # unfold site; see batches() for the recompile mechanism).
-            Omega_all, B_all = reader.read(
-                slice(0, int(n_poles)), unfold=True, return_sharded=True,
-                to_unit="Ry")
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = Omega_all[lo:hi], B_all[lo:hi]
+                Omega, B = reader.read(
+                    slice(lo, hi), unfold=True, return_sharded=True,
+                    to_unit="Ry")
                 for branch_index, branch in enumerate(branches):
                     measured[branch_index].append(
                         measure_delivered_sigma_pole_batch(
