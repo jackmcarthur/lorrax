@@ -54,20 +54,26 @@ def main() -> int:
     nk, na, nb_storage = 8, 16, 32
     raw = (rng.normal(size=(nk, na, na))
            + 1j * rng.normal(size=(nk, na, na)))
-    delta_active_host = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    hamiltonian_host = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
     dft_energies_host = rng.normal(size=(nk, na))
-    hamiltonian_host = delta_active_host.copy()
-    hamiltonian_host[:, np.arange(na), np.arange(na)] += dft_energies_host
     tail_host = rng.normal(size=(nk, nb_storage))
 
     matrix_sharding = NamedSharding(mesh, P(None, "x", "y"))
     vector_sharding = NamedSharding(mesh, P(None, ("x", "y")))
     replicated_vector = NamedSharding(mesh, P(None, None))
     hamiltonian = device_put_process_local(hamiltonian_host, matrix_sharding)
-    delta_active = device_put_process_local(delta_active_host, matrix_sharding)
     dft_energies = device_put_process_local(
         dft_energies_host, replicated_vector)
     tail = device_put_process_local(tail_host, vector_sharding)
+
+    # The incumbent caller used two eager device operations before the
+    # assembly kernel.  Reproduce that exact arithmetic, rather than seeding
+    # DeltaH on the host as (DeltaH + E) and demanding that floating-point
+    # cancellation recover the pre-addition bits.
+    h_dft_active = (
+        dft_energies[:, :, None]
+        * jnp.eye(na, dtype=jnp.complex128)[None, :, :])
+    delta_active = hamiltonian - h_dft_active
 
     candidate = _assemble_delta_kernel(mesh, nb_storage)
     out = candidate(hamiltonian, dft_energies, tail)
@@ -77,12 +83,11 @@ def main() -> int:
             f"fused head output lost P(None,x,y): {out.sharding.spec}")
 
     expected = np.zeros((nk, nb_storage, nb_storage), dtype=np.complex128)
-    expected[:, :na, :na] = delta_active_host
+    expected[:, :na, :na] = hamiltonian_host
+    expected[:, np.arange(na), np.arange(na)] -= dft_energies_host
     expected[:, np.arange(na, nb_storage), np.arange(na, nb_storage)] = (
         tail_host[:, na:nb_storage])
-    max_abs = float(np.max(np.abs(_host(out) - expected)))
-    if max_abs != 0.0:
-        raise AssertionError(f"fused head assembly mismatch: {max_abs}")
+    analytic_max_abs = float(np.max(np.abs(_host(out) - expected)))
 
     @partial(jax.jit, out_shardings=matrix_sharding)
     def incumbent(delta_active_arg, tail_arg):
@@ -94,9 +99,12 @@ def main() -> int:
 
     reference = incumbent(delta_active, tail)
     jax.block_until_ready(reference)
-    reference_max_abs = float(np.max(np.abs(_host(reference) - expected)))
-    if reference_max_abs != 0.0:
-        raise AssertionError(f"incumbent assembly oracle mismatch: {reference_max_abs}")
+    candidate_reference_max_abs = float(
+        np.max(np.abs(_host(out) - _host(reference))))
+    if candidate_reference_max_abs != 0.0:
+        raise AssertionError(
+            "fused head assembly differs from the incumbent device "
+            f"sequence: {candidate_reference_max_abs}")
 
     candidate_hlo = (
         candidate.lower(hamiltonian, dft_energies, tail)
@@ -117,8 +125,8 @@ def main() -> int:
         print(
             "HEAD_MANIFOLD_FUSION_RECEIPT",
             {
-                "max_abs": max_abs,
-                "reference_max_abs": reference_max_abs,
+                "candidate_reference_max_abs": candidate_reference_max_abs,
+                "analytic_max_abs": analytic_max_abs,
                 "output_spec": str(out.sharding.spec),
                 "candidate_collectives": candidate_collectives,
                 "incumbent_collectives": incumbent_collectives,
