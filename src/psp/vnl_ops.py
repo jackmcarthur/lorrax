@@ -1270,7 +1270,7 @@ def _build_vnl_kdata_core(
             jnp.asarray(Gk_np, dtype=jnp.int32),
             jnp.asarray(setup.B, dtype=jnp.float64),
             jnp.asarray(setup.dq, dtype=jnp.float64),
-            setup.G_table, setup.Gp_table,
+            setup.G_table,
             jnp.asarray(setup.prefactor, dtype=jnp.float64),
             setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
             l_max=int(setup.l_max),

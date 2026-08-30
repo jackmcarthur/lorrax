@@ -706,7 +706,7 @@ def check_dipole_provenance(
     # from an nspinor=1 WFN has the right shape for an nspinor=2 run of
     # the same crystal and vice versa (INVARIANTS row 3: representation).
     want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
-            "prov_nband": int(nband), "prov_nspinor": int(wfn.nspinor),
+            "prov_nband": int(nband),
             "prov_q0_operator_scheme": _DIPOLE_Q0_OPERATOR_SCHEME}
     if fingerprint_checkable:
         want["prov_wfn_sha256"] = (
@@ -727,6 +727,13 @@ def check_dipole_provenance(
     bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
            if (k != "prov_ncond" or not q0_ncond_ok)
            and (k not in attrs or _prov_ne(attrs[k], v))]
+    # prov_nspinor: required-IF-PRESENT (the comment above this want dict
+    # is the contract) — a legacy file that predates the stamp is accepted,
+    # a stamped mismatch refuses.
+    if "prov_nspinor" in attrs and _prov_ne(attrs["prov_nspinor"],
+                                            int(wfn.nspinor)):
+        bad.append(("prov_nspinor", attrs["prov_nspinor"],
+                    int(wfn.nspinor)))
     if bad:
         detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
                            for k, got, exp in bad)

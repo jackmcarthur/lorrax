@@ -72,8 +72,14 @@ def _spin_capacity(meta) -> float:
                 f"spin structure (got a {type(meta).__name__} without it).  "
                 f"Fix: pass a common.meta.Meta, or give the stub explicit "
                 f"nspin/nspinor.")
-    from psp.get_DFT_mtxels import spin_degeneracy_factor
-    return float(spin_degeneracy_factor(meta))
+    # Computed from meta's own declared file-spin structure.  NOT delegated
+    # to psp.get_DFT_mtxels.spin_degeneracy_factor: that helper is now the
+    # loader's occupation-capacity door (wfn.occupation_state_capacity) and
+    # takes a WfnLoader, not a Meta.  nspinor_wfnfile keeps bispinor
+    # (meta.nspinor=4, file 2) at exactly 1.0.
+    return 2.0 if (int(meta.nspin) == 1
+                   and int(getattr(meta, "nspinor_wfnfile", meta.nspinor))
+                   == 1) else 1.0
 
 
 def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
@@ -326,17 +332,7 @@ def make_hartree_projection_kernel(
     V_AB rho_B`` before projecting, paying three band GEMMs rather than nine.
     """
     shape_key = None if face_shape is None else tuple(int(v) for v in face_shape)
-    # ``f_spin`` (electrons per occupied band,
-    # psp.get_DFT_mtxels.spin_degeneracy_factor: 2.0 for a spin-restricted
-    # scalar WFN, else exactly 1.0) scales ONLY this density — BGW puts the
-    # nspin=nspinor=1 factor 2 into epsilon and the density
-    # (epsilon_main.f90 ``fact``), never into the Σ band sums
-    # (sigma_main.f90: occupancy 1 per band); χ₀'s copy lives in
-    # ``w_isdf._w_solve_pref_scalar``.  Required kwarg + cache-key member:
-    # no caller can silently get the spinor kernel, and a kernel cached for
-    # one spin structure can never serve another.  The ``!= 1.0`` guard is
-    # trace-time: the nspinor ≥ 2 path emits no op at all — bit-identity.
-    key = (id(mesh_xy), layout, shape_key, float(f_spin))
+    key = (id(mesh_xy), layout, shape_key)
     if key in _hartree_projection_cache:
         return _hartree_projection_cache[key]
 

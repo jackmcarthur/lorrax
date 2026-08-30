@@ -51,15 +51,18 @@ def test_w_solve_pref_scalar_pins_all_three_spin_structures():
     from gw.w_isdf import _w_solve_pref_scalar
     nk = 8
     # spinor (the production MoS2/Si decks) — unchanged, exact.
-    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=2)) \
+    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=2, nspinor_wfnfile=2)) \
         == 2.0 / (float(nk) ** 0.5 * 1.0 * 2.0)
     # scalar: the BGW nspin=nspinor=1 factor 2 lives HERE (and in ρ),
     # nowhere else.
-    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=1)) \
+    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=1, nspinor_wfnfile=1)) \
         == 2.0 / (float(nk) ** 0.5)
-    # bispinor (meta.nspinor=4) — the current value, pinned as-is.
-    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=4)) \
-        == 2.0 / (float(nk) ** 0.5 * 1.0 * 4.0)
+    # bispinor (meta.nspinor=4): since the 2026-08-29 four-current refactor
+    # the pref reads the FILE nspinor (a bispinor run rides a 2-component
+    # file; the lift's own normalization lives in the lift) — bispinor
+    # therefore shares the nspinor=2 value.
+    assert _w_solve_pref_scalar(NS(nk_tot=nk, nspin=1, nspinor=4, nspinor_wfnfile=2)) \
+        == 2.0 / (float(nk) ** 0.5 * 1.0 * 2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +120,7 @@ def _hartree_trace(mesh, kgrid, f_spin, wfns, Gij, n_mu):
     nk = int(np.prod(kgrid))
     V_q = jnp.broadcast_to(
         jnp.eye(n_mu, dtype=jnp.complex128), (nk, n_mu, n_mu))
-    _, _, hartree_k = _make_cohsex_kernels(mesh, kgrid, nk, f_spin)
+    _, _, hartree_k = _make_cohsex_kernels(mesh, kgrid, nk, f_spin=f_spin)
     with mesh:
         sig_h = hartree_k(wfns, Gij, V_q)
     return np.asarray(sig_h)
@@ -176,12 +179,12 @@ def test_cohsex_kernel_cache_is_keyed_on_f_spin(monkeypatch):
     _stub_fft_factories(monkeypatch)
     _fresh_kernel_cache(monkeypatch)
     mesh = _mesh()
-    k_spinor = _make_cohsex_kernels(mesh, (2, 1, 1), 2, 1.0)
-    k_scalar = _make_cohsex_kernels(mesh, (2, 1, 1), 2, 2.0)
+    k_spinor = _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=1.0)
+    k_scalar = _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=2.0)
     assert k_spinor is not k_scalar and k_spinor[2] is not k_scalar[2]
     # …and the cache still caches: same key, same kernels (element
     # identity — the factory rebuilds the outer tuple on a miss).
-    assert _make_cohsex_kernels(mesh, (2, 1, 1), 2, 2.0)[2] is k_scalar[2]
+    assert _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=2.0)[2] is k_scalar[2]
 
 
 def test_the_static_drivers_derive_f_spin_from_meta():
@@ -236,7 +239,8 @@ def test_fixed_n_window_check_accepts_a_scalar_deck(monkeypatch):
     EVERY scalar deck by exactly the capacity."""
     from gw.cohsex_sigma import build_Gij
     mesh = _mesh()
-    meta = NS(nk_tot=2, nb_sigma=4, nelec=2, nspin=1, nspinor=1)
+    meta = NS(nk_tot=2, nb_sigma=4, nelec=2, nspin=1, nspinor=1,
+              nspinor_wfnfile=1)
     f = np.array([[1.0, 1.0, 0.0, 0.0]] * 2)     # 2 filled bands per k
     Gij = build_Gij(meta, mesh, _occ_state(f, n_electrons=4.0))
     got = np.asarray(Gij)
@@ -276,6 +280,10 @@ def _write_min_kin_ion(path, nspinor=None):
     with h5py.File(path, "w") as f:
         ds = f.create_dataset(
             "kin_ion", data=np.zeros((2, 3, 3), dtype=np.complex128))
+        # main's 2026-08-29 representation gate fails closed on a MISSING
+        # bispinor stamp; stamp it so the flow reaches the nspinor check
+        # (the nspinor attr keeps its own required-if-present contract).
+        ds.attrs["bispinor"] = False
         if nspinor is not None:
             ds.attrs["nspinor"] = int(nspinor)
     return str(path)
@@ -289,18 +297,24 @@ def test_kin_ion_validator_refuses_a_spin_structure_mismatch(tmp_path):
     from file_io.kin_ion import validate_kin_ion_against_run
     p = _write_min_kin_ion(tmp_path / "kin_ion.h5", nspinor=2)
     with pytest.raises(ValueError, match=r"nspinor=2.*nspinor=1"):
-        validate_kin_ion_against_run(p, nspinor=1, print_fn=lambda *_: None)
+        validate_kin_ion_against_run(p, nspinor=1, expected_bispinor=False,
+                                     selected_hartree_source="stored",
+                                     print_fn=lambda *_: None)
 
 
 def test_kin_ion_validator_green_and_legacy_twins(tmp_path):
     from file_io.kin_ion import validate_kin_ion_against_run
     # Green: matching stamp passes.
     p = _write_min_kin_ion(tmp_path / "kin_ion_match.h5", nspinor=2)
-    validate_kin_ion_against_run(p, nspinor=2, print_fn=lambda *_: None)
+    validate_kin_ion_against_run(p, nspinor=2, expected_bispinor=False,
+                                 selected_hartree_source="stored",
+                                 print_fn=lambda *_: None)
     # Legacy-accept: a pre-stamp file (no attr) is NOT refused — the red
     # twin of over-refusal, same contract as the sys_dim attr.
     p2 = _write_min_kin_ion(tmp_path / "kin_ion_legacy.h5", nspinor=None)
-    validate_kin_ion_against_run(p2, nspinor=1, print_fn=lambda *_: None)
+    validate_kin_ion_against_run(p2, nspinor=1, expected_bispinor=False,
+                                 selected_hartree_source="stored",
+                                 print_fn=lambda *_: None)
 
 
 def test_the_driver_threads_wfn_nspinor_into_the_validator():
@@ -367,6 +381,7 @@ def _prov(nspinor_wfnfile, monkeypatch):
     return _zeta_fit_provenance(
         wfn=wfn, meta=meta, cfg=cfg,
         band_range_left=(0, 8), band_range_right=(0, 16),
+        logical_band_stop=16,
         zeta_cutoff=10.0, zeta_vcoul_cutoff=40.0,
         write_ibz_only=True, band_norms=None)
 
