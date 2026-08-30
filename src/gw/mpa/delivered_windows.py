@@ -536,7 +536,6 @@ def _device_pole_reducer(Omega_local, B_local, bins, eta, split):
     eta = float(eta)
     split = float(split)
     n_cells = bins * bins
-    nodes = jnp.linspace(0.0, 1.0, bins, dtype=jnp.float64)
 
     def _local_reduce(omega_local, residue_local, pole):
         """Reduce one local spatial tile to its 30 KB partial table."""
@@ -556,18 +555,14 @@ def _device_pole_reducer(Omega_local, B_local, bins, eta, split):
         real_coordinate = real / (real + eta)
         width_coordinate = width / (width + eta)
 
+        real_scaled = real_coordinate * (bins - 1)
+        width_scaled = width_coordinate * (bins - 1)
         real_lower = jnp.clip(
-            jnp.floor(real_coordinate * (bins - 1)),
-            0, bins - 2).astype(jnp.int32)
+            jnp.floor(real_scaled), 0, bins - 2).astype(jnp.int32)
         width_lower = jnp.clip(
-            jnp.floor(width_coordinate * (bins - 1)),
-            0, bins - 2).astype(jnp.int32)
-        real_fraction = (
-            (real_coordinate - nodes[real_lower])
-            / (nodes[real_lower + 1] - nodes[real_lower]))
-        width_fraction = (
-            (width_coordinate - nodes[width_lower])
-            / (nodes[width_lower + 1] - nodes[width_lower]))
+            jnp.floor(width_scaled), 0, bins - 2).astype(jnp.int32)
+        real_fraction = real_scaled - real_lower
+        width_fraction = width_scaled - width_lower
         interval = (real > split).astype(jnp.int32)
         block_size = _CENSUS_HISTOGRAM_BLOCK
         n_values = int(omega.size)
