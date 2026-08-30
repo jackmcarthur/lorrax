@@ -24,9 +24,6 @@ from psp.get_DFT_mtxels import (  # noqa: E402
     spin_density_matrix_to_pauli_fields,
     valence_density_from_kpoint,
 )
-from symmetry_maps.density_symmetry_check import (  # noqa: E402
-    _spin_resolved_density,
-)
 
 
 @pytest.mark.parametrize(
@@ -137,31 +134,3 @@ def test_spin_matrix_mode_refuses_non_pauli_and_conflicting_requests():
         density_components_from_psi_r(
             pauli, include_dirac_current=True,
             return_spin_density_matrix=True)
-
-
-def test_symmetry_diagnostic_uses_one_matrix_quadrature_for_pauli_spinors():
-    rng = np.random.default_rng(23)
-    box = (rng.standard_normal((2, 2, 2, 2, 2))
-           + 1j * rng.standard_normal((2, 2, 2, 2, 2)))
-    density_calls = []
-    fields_calls = []
-
-    def counted_density(arr, **kwargs):
-        density_calls.append(dict(kwargs))
-        return valence_density_from_kpoint(arr, **kwargs)
-
-    def counted_fields(matrix):
-        fields_calls.append(tuple(matrix.shape))
-        return spin_density_matrix_to_pauli_fields(matrix)
-
-    rho, magnetisation = _spin_resolved_density(
-        box, nocc=2, weight=0.4, cell_volume=11.0,
-        spin_degeneracy=1.0, band_occupations=np.asarray([0.75, 0.2]),
-        want_transverse=True, valence_density_fn=counted_density,
-        spin_density_fields_fn=counted_fields)
-
-    assert len(density_calls) == 1
-    assert density_calls[0]["return_spin_density_matrix"] is True
-    assert fields_calls == [(2, 2, 2, 2, 2)]
-    assert rho.shape == (2, 2, 2)
-    assert magnetisation.shape == (3, 2, 2, 2)

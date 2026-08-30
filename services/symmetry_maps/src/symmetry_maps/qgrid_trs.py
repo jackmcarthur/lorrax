@@ -25,7 +25,7 @@ The three producers used to compose q with −q through time reversal
 *unconditionally*, and to project every self-negative q row onto its
 Θ-invariant part, with no reference to whether time reversal is a symmetry
 of the wavefunctions at hand.  ``density_symmetry_check`` already MEASURES
-that from the spin-resolved density at load time and publishes the verdict
+that from the occupied two-component DFT subspaces and publishes the verdict
 as ``WfnLoader.trs_holds`` → ``SymMaps.trs_allowed``; nothing on the q axis
 read it.
 
@@ -183,7 +183,7 @@ def trs_pair_coherent_unfold_sym_idx(
                 f"{jq}->{int(irr[jq])}).  A TRS composition is valid only "
                 "for one solved wedge row; do not fabricate reciprocity "
                 "across two independently solved rows.  On a deck whose "
-                "measured density says TIME REVERSAL IS BROKEN this is the "
+                "DFT reference check says TIME REVERSAL IS BROKEN this is the "
                 "expected table and the policy must not have reached here: "
                 "build QgridTrsPolicy with trs_measured=False so the rows "
                 "stay independent.")
@@ -478,7 +478,7 @@ class QgridTrsPolicy:
     branch left to get wrong.
 
     ``trs_measured`` is the verdict ``density_symmetry_check`` obtained
-    from the spin-resolved density, arriving through
+    from the two-component DFT reference check, arriving through
     ``SymMaps.trs_allowed``.  It has no default anywhere on this path.
     """
 
@@ -544,7 +544,7 @@ class QgridTrsPolicy:
         where = f" [{self.context}]" if self.context else ""
         if not self.trs_measured:
             return (
-                f"q-grid TRS policy{where}: the measured spin density says "
+                f"q-grid TRS policy{where}: the DFT reference check says "
                 f"TIME REVERSAL IS BROKEN for this WFN.  Every full-BZ q row "
                 f"keeps the spatial parent it was solved from; no q/-q "
                 f"composition and no fixed-q TRS projector is applied.  "
@@ -597,13 +597,13 @@ def build_qgrid_trs_policy(
         # simply contains no time-reversal operation.  The one thing left
         # to check is that the TABLES agree with the VERDICT — a Θ row in
         # ``sym_idx_q`` means the wedge was reduced using a symmetry the
-        # density says is absent, and the correct outcome is a loud refusal
+        # reference verdict says is absent, and the outcome is a refusal
         # rather than an unfold that conjugates a magnetic wavefunction.
         offenders = np.flatnonzero(selected >= n_spatial)
         if offenders.size:
             raise ValueError(
-                "GATE trs_measured_vs_tables: the measured spin density "
-                "says time reversal is BROKEN for this WFN, but the q-grid "
+                "GATE trs_measured_vs_tables: the reference verdict says "
+                "time reversal is BROKEN for this WFN, but the q-grid "
                 f"symmetry table selects time-reversal rows at "
                 f"{offenders.size} of {n_full} q "
                 f"(first at q={int(offenders[0])}, row "

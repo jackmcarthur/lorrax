@@ -11,7 +11,7 @@ the ψ-unfold antiunitary rule
 :func:`tau_phase_row`), the real-space orbit machinery the ISDF
 quadrature is built on (:func:`real_space_action_tables`,
 :func:`centroid_source_map_and_wrap`, …), and
-the TRS *measurement* (:func:`check_density_symmetries`) that decides
+the 2c DFT-reference check (:func:`check_spinor_reference_trs`) that decides
 whether the flags in the file may be believed at all.
 
 THE PACKAGE IS THE DOOR.  There is no separate facade module: everything a
@@ -43,13 +43,10 @@ because a symmetry moves r and does not move bands.  The two are not
 variants of each other; the argument is written out above
 :func:`star_select` in :mod:`symmetry_maps.maps`.
 
-TIME REVERSAL IS A MEASUREMENT HERE, NOT A CONVENTION.
-:func:`check_density_symmetries` builds ρ from the raw IBZ coefficients
-and asks whether ``w_k m_k + w_{−k} m_{−k}`` vanishes; the verdict lands
-on the loader as ``trs_holds`` and :class:`SymMaps` refuses to select
-time-reversal rows when the density says TRS is broken, whatever the
-flags in the file claim.  That is why the check is in this package and
-not beside it: the thing it protects is the unfold.
+TIME REVERSAL IS CHECKED, NOT INFERRED.  The 2c check compares occupied
+density operators using raw partners, spatial-only partners, or TRIM
+closure.  It excludes antiunitary-generated partners.  Its verdict lands
+on the loader as ``trs_holds`` and gates antiunitary rows in :class:`SymMaps`.
 
 The surface
 -----------
@@ -187,6 +184,7 @@ from symmetry_maps.density_symmetry_check import (
     DensitySymmetryReport,
     cached_density_symmetry_check,
     check_density_symmetries,
+    check_spinor_reference_trs,
     trs_check_mode,
 )
 from symmetry_maps.directed_edges import (
@@ -332,8 +330,9 @@ __all__ = [
     # past-the-door edge and ``tests/test_layering.py`` rule 6 counts it.
     "QIRR_VERSION_ATTR", "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
     "qirr_generator_commit", "validate_qirr_tables",
-    # the TRS measurement
+    # the 2c TRS reference check
     "DensitySymmetryReport", "check_density_symmetries",
+    "check_spinor_reference_trs",
     "cached_density_symmetry_check", "trs_check_mode",
     # the q-axis TRS POLICY that consumes that measurement, and the
     # covariance statistic the unfold's own contract rests on

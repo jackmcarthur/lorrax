@@ -18,9 +18,9 @@ below then re-derives the same tables through the production
 never quietly drift into being a different question.
 
 THE I5 PRECONDITION TRIPWIRE.  ``cohsex_debug``'s TRS rows are GRATUITOUS:
-its IBZ is spatially reduced (``tests/test_density_symmetry_check.py:307``
-— "ntran=12, nonmagnetic MoS2, spatially-reduced IBZ", asserting
-``trs_coverage > 0.5``), and the time-reversal rows come from the shipping
+its IBZ is spatially reduced (the real-fixture gate in
+``tests/test_density_symmetry_check.py`` checks the 2c reference), and the
+time-reversal rows come from the shipping
 op-selection policy's missing ``break``, not from the mesh.  3e002f2 says so
 in as many words: the policy "produces gratuitous TRS rows on decks where
 every k is rotation-reachable".  So the deck's whole discriminating power
@@ -108,8 +108,8 @@ def test_the_stub_carries_every_declared_attribute(deck):
     assert d.translations.shape[0] >= d.ntran
     assert d.atom_crys.shape == (len(d.atom_types), 3)
     assert d.trs_holds is True, (
-        "trs_holds is PINNED True from the measured density verdict, not "
-        "defaulted; see _deck_stub's module docstring")
+        "trs_holds is PINNED True, not defaulted; see _deck_stub's "
+        "module docstring")
 
 
 # ---------------------------------------------------------------------------
@@ -492,10 +492,8 @@ def test_the_wrong_rotation_direction_fails_half_the_mappings():
 def test_a_single_corrupted_op_is_caught_and_the_others_are_not():
     """One bad op, one failure — localisation, not a blanket refusal.
 
-    Mirrors ``tests/test_density_symmetry_check.py``'s corrupted-op cell
-    (rewrite ``mtrx[1]`` to a 90 degree z-rotation, assert op 1 flagged and
-    op 0 still clean).  A validator that failed everything on one bad op
-    would be useless for finding which one.
+    A validator that failed everything on one bad op would be useless for
+    finding which one.
     """
     d = _deck("si_cohsex_debug")
     sym = SymMaps(d)
