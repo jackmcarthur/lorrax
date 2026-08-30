@@ -1,5 +1,8 @@
 # COHSEX in the JAX ISDF Pipeline
 
+> Historical implementation snapshot. Current direct-field behavior is owned
+> by [the Hartree theory page](../../theory/hartree.md).
+
 This note expands on `docs/formalism.md` with the full set of working equations
 implemented in `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.py`.
 It is organized to match the major stages of the driver: ISDF interpolation,
@@ -182,12 +185,9 @@ $\Sigma_{ij}(\mathbf{k}) = \sum_{\mu\nu}\psi^{*}_{i\mathbf{k}}(\mathbf{r}_\mu)
     \Sigma^{\text{SX}}_{\mu\nu}(\mathbf{k})\psi_{j\mathbf{k}}(\mathbf{r}_\nu)$,
 performed in two einsums by `get_sigma_x_kij_jax`.【F:src/gw_isdf/gw_jax.py†L804-L820】
 
-The Hartree correction is accumulated from the $\mathbf{q}=0$ Coulomb block by
-contracting $V_{0}$ with the centroid density $\rho_{\mu} =
-\sum_{n\mathbf{k}} |\psi_{n\mathbf{k}}(\mathbf{r}_\mu)|^{2}/N_k$.  The code
-explicitly forms $V_{0}\rho$ and projects it with the same centroids used for
-$\Sigma^{\text{SX}}$.【F:src/gw_isdf/gw_jax.py†L820-L834】  A dynamical Coulomb-hole contribution will
-reuse the same machinery once the frequency dependence of \(W\) is reinstated.
+At this snapshot, Hartree was accumulated from the q=0 Coulomb block by
+forming $V_0\rho$ in the centroid basis and projecting it like
+$\Sigma^{\mathrm{SX}}$.【F:src/gw_isdf/gw_jax.py†L820-L834】
 
 ### Spin conventions
 
@@ -199,22 +199,17 @@ so occupation is strictly 1 per state rather than 2.
 
 ## 7. Fixed-point self-consistency (prototype)
 
-The current driver contains a fixed-point prototype that would iterate the total
+This snapshot contains a fixed-point prototype that would iterate the total
 self-energy until convergence.  The Hamiltonians are
 $$
 H_{\text{DFT}} = K + I + V_H + V_{xc},\qquad
 H_{\text{QP}} = K + I + V_H + \Sigma_{xc}(\omega\!\approx\!0),
 $$
 where $K+I$ ("kin+ion") is provided by a separate module in the codebase.
-The prototype repeatedly re-evaluates the exchange/Hartree pipeline given an
-updated $\Sigma$.  The iteration is wrapped
-in `crop_family_fixed_history_map`, which provides Anderson-like mixing and a
-residual history for monitoring.  At present the loop only updates the static
-exchange block and has not been validated for full self-consistency; the entry
-point toggled by `self_consistent` simply calls the prototype before writing the
-final matrices.【F:src/gw_isdf/gw_jax.py†L1230-L1372】  Extending this to a true
-GW cycle would require reloading wavefunctions with updated occupancies and
-adding the dynamical $\Sigma^{\text{COH}}$ contribution.
+The snapshot's prototype re-evaluated static exchange and Hartree under
+`crop_family_fixed_history_map`; it was not validated as a full GW cycle and
+did not update dynamical $\Sigma^{\mathrm{COH}}$.
+【F:src/gw_isdf/gw_jax.py†L1230-L1372】
 
 ## 8. Memory and parallel-scaling considerations
 

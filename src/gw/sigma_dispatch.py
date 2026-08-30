@@ -33,9 +33,8 @@ file write, QSGW build).
 
 from __future__ import annotations
 
-import functools as _functools
-import os
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import numpy as np
@@ -64,8 +63,10 @@ class SigmaResult:
 
     Always populated
     ----------------
-    v_h_kij_ry           : (nk, nb, nb)   Total direct field
-                                          ``V_H + H_T`` (replicated)
+    v_h_kij_ry           : (nk, nb, nb)   Total direct field ``V_H + H_T``.
+                                          Exact G-space paths may retain the
+                                          two-axis band sharding; consumers
+                                          own any explicit gather.
     v_h_scalar_kij_ry    : (nk, nb, nb)   Scalar charge Hartree only
     h_transverse_kij_ry  : (nk, nb, nb)   Transverse current Hartree, or
                                           None for charge-only runs
@@ -111,6 +112,10 @@ class SigmaResult:
     sigma_xc_kij_ry: jax.Array
     v_h_scalar_kij_ry: jax.Array | None = None
     h_transverse_kij_ry: jax.Array | None = None
+    #: Internal density-SC receipt.  When true the two V_H fields are a
+    #: compact scalar-zero sentinel; the SC owner restores full matrices at
+    #: both output seams.  Consumers must never infer omission from shape.
+    hartree_omitted: bool = False
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
     #: Exact final-block q=0 photon-head diagonals, already in the DFT
@@ -156,6 +161,14 @@ class SigmaResult:
     band_extrapolation_scheme: str | None = None
 
     def __post_init__(self) -> None:
+        if self.hartree_omitted:
+            if self.h_transverse_kij_ry is not None:
+                raise ValueError(
+                    "SigmaResult: omitted Hartree cannot carry H_T")
+            if tuple(np.shape(self.v_h_kij_ry)) != ():
+                raise ValueError(
+                    "SigmaResult: hartree_omitted requires the compact "
+                    "scalar-zero sentinel")
         if self.v_h_scalar_kij_ry is None:
             if self.h_transverse_kij_ry is not None:
                 raise ValueError(
@@ -249,50 +262,8 @@ BASIS_FREE_FIELDS = (
     "band_extrapolation_counts",
     "band_extrapolation_estimator",
     "band_extrapolation_scheme",
+    "hartree_omitted",
 )
-
-
-# ---------------------------------------------------------------------------
-# H₀'s Hartree term: resolve the source once, cache the array
-# ---------------------------------------------------------------------------
-
-#: (kin_ion path, b0, b3, resolved source, mesh identity) →
-#: (source, V_H (nk,nb,nb) Ry | None).  Mesh identity is the STABLE
-#: shape/axis/device-id tuple from :func:`_mesh_cache_key`, not ``id()``.
-#: The QSGW loop calls ``compute_sigma_xc`` once per SC iteration and the
-#: exact V_H does not change with the band basis (it is a fixed operator in
-#: the DFT basis, and ``rotate_wavefunctions`` handles the basis change on
-#: H₀ as a whole), so re-reading — or worse, re-running the ``gspace``
-#: build, every iteration would be pure waste.
-#:
-#: WHAT THE CACHE ASSUMES, AND WHEN IT MUST BE DROPPED.  The statement
-#: above is exactly true for QSGW **at fixed density** — the only kind the
-#: driver runs today: the SC loop rotates the band basis, it does not
-#: rebuild ρ.  A density-updating QSGW breaks the assumption, because then
-#: V_H is a function of the current occupied orbitals and *does* change
-#: every iteration.  The kernel is ready for that
-#: (``compute_hartree_matrix(..., psi_rotation=U[:, :, :nocc])`` builds ρ
-#: from the rotated ψ) and the cost is affordable — see the QSGW readiness
-#: note in the scorecard — but such a loop MUST call
-#: :func:`invalidate_hartree_cache` at the top of each iteration, or it
-#: will silently keep iteration 0's Hartree potential for ever.
-_hartree_cache: dict = {}
-
-
-def _mesh_cache_key(mesh_xy) -> tuple:
-    """STABLE identity of a Mesh for cache keying: axis names + extents
-    plus the flat device-id tuple.
-
-    The previous key component was ``id(mesh_xy)``, which a new Mesh can
-    REUSE after the old one is garbage-collected — a false hit would then
-    hand back V_H arrays sharded on a dead mesh.  Conversely, two JAX
-    ``Mesh`` objects over the same devices/axes compare equal and their
-    ``NamedSharding``s compose, so a hit across equivalent Mesh OBJECTS
-    (which ``id()`` needlessly missed) is correct.  (audit fix/zq
-    2026-07-28)
-    """
-    return (tuple(mesh_xy.shape.items()),
-            tuple(int(d.id) for d in mesh_xy.devices.flat))
 
 
 def _place_band_rotation(U, mesh_xy, dtype):
@@ -312,144 +283,57 @@ def _place_band_rotation(U, mesh_xy, dtype):
     return device_put_process_local(np.asarray(U, dtype=dtype), sh)
 
 
-@_functools.partial(jax.jit, static_argnames=("mesh",))
+@partial(jax.jit, static_argnames=("mesh",))
 def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
     """``V_H^QP = U† · V_H^DFT · U`` with U kept at ``band_rotation_spec``.
 
-    The RESULT is pinned replicated because ``SigmaResult.v_h_kij_ry``
-    feeds the k-star select and the host readbacks downstream; U is not,
-    because it is the (nk, nb, nb) object that reaches 9.2 GB/rank at
-    nk=144/nb=2000.
+    The result lands at the canonical two-axis band layout.  This keeps the
+    exact G-space route distributed through its basis change; callers that
+    truly need a host/replicated object own that explicit boundary.  U is
+    likewise never replicated: it is the ``(nk,nb,nb)`` object that reaches
+    9.2 GB/rank at nk=144/nb=2000.
     """
-    from .qsgw_density import rotate_band_matrix
+    from .qsgw_density import band_rotation_spec, rotate_band_matrix
 
     out = rotate_band_matrix(v_h_dft, U, mesh=mesh, to_qp=True)
     return jax.lax.with_sharding_constraint(
-        out, NamedSharding(mesh, P(None, None, None)))
+        out, NamedSharding(mesh, band_rotation_spec()))
 
 
-def invalidate_hartree_cache() -> None:
-    """Drop the memoised V_H so the next call rebuilds it.
-
-    Required by any self-consistency loop that updates the DENSITY (not
-    just the band basis) — see the note on :data:`_hartree_cache`.
-    """
-    _hartree_cache.clear()
-
-
-def resolve_external_hartree(config, meta, band_slices, mesh_xy, *,
-                             wfn=None, sym=None, print_fn=print):
-    """``(source, V_H | None, V_H_T | None)`` for this run.
-
-    ``source`` is one of ``'stored' | 'folded' | 'isdf' | 'gspace'``.
-    The scalar array is returned only for ``stored`` / ``gspace``; ``folded``
-    means "V_H is inside kin_ion's values, add nothing", and ``isdf``
-    means "keep the ISDF quadrature".  A bispinor run additionally receives
-    the exact transverse direct matrix, independently of the scalar source:
-    read from its separate kin_ion dataset except when ``gspace`` builds both
-    fields in one occupied-WFN transaction.
-    """
-    from file_io.kin_ion import (
-        load_hartree_submatrix, load_transverse_hartree_submatrix,
-        resolve_hartree_source,
-    )
-
-    path = config.paths.kin_ion_file
-    requested = getattr(config, "hartree_source", "auto")
-    source = resolve_hartree_source(path, requested, print_fn=print_fn)
-    require_transverse = bool(config.bispinor)
+def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
+                          print_fn=print):
+    """Build the sole Hartree representation: exact, live, and G-space."""
+    from dataclasses import replace
     from common.four_current_model import resolve_four_current_representation
+    from .kin_ion_io import compute_hartree_matrix
+
     representation = resolve_four_current_representation(
         config.bispinor, config.bispinor_gw)
-    charge_bispinor = representation.charge_bispinor
-    if require_transverse and source == "folded":
-        raise ValueError(
-            "kinetic-balance bispinor GW refuses a legacy folded kin_ion "
-            "artifact; regenerate separate authenticated scalar and "
-            "transverse direct Hartree datasets.")
-    key = (os.path.abspath(path), int(band_slices.b0), int(band_slices.b3),
-           source, require_transverse, _mesh_cache_key(mesh_xy))
-    # A gspace result is a functional of the live WFN occupations and gauge,
-    # neither of which belongs to this path/window cache key.  Rebuild it;
-    # stored artifacts already authenticate their WFN at the format gate.
-    cacheable = source != "gspace"
-    if cacheable and key in _hartree_cache:
-        return _hartree_cache[key]
-
-    v_h = None
-    v_h_t = None
-    if require_transverse and source != "gspace":
-        v_h_t = load_transverse_hartree_submatrix(
-            path, band_slices.b0, band_slices.b3, mesh=mesh_xy)
-        print_fn(
-            "  V_H^T: exact periodic G-space Dirac-current matrix read "
-            "from kin_ion.h5; G=0 is zero and no exchange head enters.")
-    if source == "stored":
-        v_h = load_hartree_submatrix(
-            path, band_slices.b0, band_slices.b3,
-            mesh=mesh_xy)
-        print_fn("  V_H: exact FFT-grid matrix read from kin_ion.h5's "
-                 "'v_hartree' dataset; the ISDF quadrature is not used.")
-    elif source == "gspace":
-        if wfn is None or sym is None:
-            raise ValueError(
-                "hartree_source=gspace needs the WFN loader and SymMaps.")
-        print_fn("  V_H: rebuilding the exact FFT-grid matrix on the fly "
-                 "(hartree_source=gspace) — DISTRIBUTED over the run's own "
-                 "mesh (ρ: one psum; Poisson: replicated; ⟨mk|V_H|nk⟩: "
-                 "k-partitioned + one gather).")
-        # Lazy: pulls in the psp stack, which the ISDF path does not need.
-        # ``replicate_to_mesh`` is generic k-partition plumbing and comes
-        # from the SERVICE; only ``compute_hartree_matrix`` (real physics,
-        # and the reason for the lazy import) comes from the driver.  Both
-        # used to be imported from ``kin_ion_io``, which made a library
-        # module depend on a CLI for a collective helper.
-        from common.collectives import replicate_to_mesh
-        from gw.kin_ion_io import compute_hartree_matrix
-        hartree_meta = meta
-        if require_transverse and int(meta.nspinor) != 4:
-            from dataclasses import replace
-            hartree_meta = replace(meta, nspinor=4, npol=4)
-        exact_hartree = compute_hartree_matrix(
-            wfn, sym, hartree_meta,
-            truncation_2d=(int(config.sys_dim) == 2),
-            nb=int(band_slices.b3), mesh=mesh_xy,
-            band_chunk_size=int(config.memory.band_chunk_size),
-            include_transverse=require_transverse,
-            charge_nspinor=(
-                int(wfn.nspinor)
-                if require_transverse and not charge_bispinor else None),
-            bispinor_lift=(representation.current_lift or "raw"),
-            print_fn=print_fn)
-        v_h_np = (exact_hartree.charge if require_transverse
-                  else exact_hartree)
-        # ``compute_hartree_matrix`` hands every rank the same host array;
-        # publish it as a genuinely REPLICATED global array so it composes
-        # with the (global) ``sig_h`` it replaces.  ``jnp.asarray`` here
-        # would have produced a single-device array — fine at P=1, an
-        # operand-sharding mismatch at P>1.
-        v_h = replicate_to_mesh(
-            np.ascontiguousarray(
-                v_h_np[:, band_slices.b0:band_slices.b3,
-                       band_slices.b0:band_slices.b3]),
-            mesh_xy)
-        if require_transverse:
-            v_h_t = replicate_to_mesh(
-                np.ascontiguousarray(
-                    exact_hartree.transverse[
-                        :, band_slices.b0:band_slices.b3,
-                        band_slices.b0:band_slices.b3]),
-                mesh_xy)
-    elif source == "folded":
-        print_fn("  V_H: LEGACY folded kin_ion.h5 — V_H is inside its values; "
-                 "the ISDF sig_h is suppressed to avoid double counting.")
-    else:
-        print_fn("  V_H: ISDF V_q[0] quadrature (hartree_source=isdf); H0 "
-                 "therefore depends on the centroid count.")
-
-    if cacheable:
-        _hartree_cache[key] = (source, v_h, v_h_t)
-    return source, v_h, v_h_t
+    include_transverse = bool(config.bispinor)
+    hartree_meta = (replace(meta, nspinor=4, npol=4)
+                    if include_transverse and int(meta.nspinor) != 4 else meta)
+    print_fn(
+        "  V_H: exact FFT-grid matrix built live in G-space "
+        "(ρ: one psum; Poisson: replicated; matrix elements: two-axis "
+        "band sharded; star broadcast stays on device).")
+    exact = compute_hartree_matrix(
+        wfn, sym, hartree_meta,
+        truncation_2d=(int(config.sys_dim) == 2),
+        nb=int(band_slices.b3), mesh=mesh_xy,
+        band_chunk_size=int(config.memory.band_chunk_size),
+        include_transverse=include_transverse,
+        charge_nspinor=(
+            int(wfn.nspinor)
+            if include_transverse and not representation.charge_bispinor
+            else None),
+        bispinor_lift=(representation.current_lift or "raw"),
+        print_fn=print_fn, return_sharded=True)
+    charge = exact.charge if include_transverse else exact
+    window = (slice(None),
+              slice(int(band_slices.b0), int(band_slices.b3)),
+              slice(int(band_slices.b0), int(band_slices.b3)))
+    return charge[window], (exact.transverse[window]
+                            if include_transverse else None)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +348,7 @@ def finalize_dynamic_sigma(
     sig_h: jax.Array,
     v_h_scalar: jax.Array | None = None,
     h_transverse: jax.Array | None = None,
+    hartree_omitted: bool = False,
     e_qp_ev: np.ndarray,
     config,
     meta,
@@ -629,6 +514,7 @@ def finalize_dynamic_sigma(
         v_h_kij_ry=sig_h,
         v_h_scalar_kij_ry=v_h_scalar,
         h_transverse_kij_ry=h_transverse,
+        hartree_omitted=bool(hartree_omitted),
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
@@ -761,7 +647,7 @@ def compute_sigma_xc(
     -------
     :class:`SigmaResult` populated per the mode.
     """
-    from .cohsex_sigma import compute_cohsex_sigma, compute_v_h_sigma_x
+    from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
 
     # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
@@ -934,13 +820,13 @@ def compute_sigma_xc(
         # whole frozen LorraxConfig (re-running its __post_init__) to change a
         # field with no remaining reader.  The log line above is the record.
 
-    # Static channels: sig_h (V_H) and sig_x (bare exchange) are needed
-    # by every mode; sig_sx / sig_coh use W(ω=0), and WHICH MODES BUILD
+    # Static exchange is needed by every mode; sig_sx / sig_coh use W(ω=0),
+    # and WHICH MODES BUILD
     # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
     # MODE_SIGMA_CHANNELS``), not this branch's opinion — that is the one
     # fact the QSGW appendix writer and this dispatch have to agree on,
     # and they now read it from the same row.  Route to a separate
-    # top-level entry point for the V-only path so the modes that build no
+    # top-level entry point for the X-only path so the modes that build no
     # static screened channels never invoke the W-touching kernels, and
     # the two paths each get their own jit-cached graph.
     W_static = W_by_role.get("static", V_q)
@@ -969,21 +855,12 @@ def compute_sigma_xc(
                 "a scalar correction would double count the charge sector "
                 "and omit coupled current wings.")
 
-        # The V-only facade remains the scalar Hartree owner, but skips its
-        # historical scalar+TT exchange contraction.  X, SX, and COH are all
-        # REPLACED, not augmented, by one sixteen-block photon loop over the
-        # same packed V/W and canonical Green/convolution/projector services.
+        # X, SX, and COH are all produced by one sixteen-block photon loop
+        # over the same packed V/W and canonical services.
         from .cohsex_sigma import _resolve_Gij
         photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-        cohsex = compute_v_h_sigma_x(
-            wfns, V_q, meta, mesh_xy,
-            Gij=photon_Gij,
-            static_head_terms=None,
-            occupation_state=None,
-            compute_bare_x=False,
-        )
         from .photon_sigma import compute_static_photon_sigma
-        (photon_x, photon_sx, photon_coh,
+        (sig_x, sig_sx, sig_coh,
          photon_head_diagnostics) = compute_static_photon_sigma(
             wfns_charge=wfns,
             wfns_transverse=wfns_transverse,
@@ -1006,9 +883,6 @@ def compute_sigma_xc(
                 photon_head_diagnostics
                 .hamiltonian_config_operator_fingerprint)
             photon_head_sigma_basis = photon_head_diagnostics.output_basis
-        cohsex["sig_x"] = photon_x
-        cohsex["sig_sx"] = photon_sx
-        cohsex["sig_coh"] = photon_coh
     elif builds_static_screened:
         cohsex = compute_cohsex_sigma(
             wfns, V_q, W_static, meta, mesh_xy,
@@ -1020,8 +894,11 @@ def compute_sigma_xc(
             bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
         )
+        sig_x = cohsex["sig_x"]
+        sig_sx = cohsex["sig_sx"]
+        sig_coh = cohsex["sig_coh"]
     else:
-        cohsex = compute_v_h_sigma_x(
+        sig_x = compute_sigma_x(
             wfns, V_q, meta, mesh_xy,
             Gij=Gij,
             static_head_terms=static_head_terms,
@@ -1029,87 +906,42 @@ def compute_sigma_xc(
             bispinor_v_q_path=bispinor_v_q_path,
             occupation_state=occupation_state,
         )
-    sig_h = cohsex["sig_h"]
-    sig_x = cohsex["sig_x"]
+        sig_sx = sig_coh = jnp.zeros_like(sig_x)
 
-    # ── The V_H-source seam (single point of truth) ──────────────────────
-    # ``sig_h`` above is the scalar ISDF V_q[0] quadrature.  This is the ONE
-    # place the scalar term enters ``SigmaResult``, so resolving its source
-    # here makes every downstream consumer consistent by construction rather
-    # than each remembering the rule: the eigh operand ``sigma_total =
-    # Σ_xc + V_H``, the fixed-point h₀, the SC iteration map, eqp{0,1}.dat
-    # and sigma_diag.dat's VH column all read what this decides.
-    #   stored/gspace → replace it with the exact FFT-grid matrix
-    #   folded        → zero it (V_H is inside kin_ion's values already)
-    #   isdf          → keep it
-    # The ISDF quadrature runs regardless; it is cheap next to Σ AT SCALE, and
-    # running it unconditionally keeps the graph shape source-independent.
-    # Sized 2026-08-11 (P=4, BFC@0.85): gw_jax.isdf is 24.4% of the driver wall
-    # against Σ's 28.6% at Si 4x4x4, and 27.7% against 41.8% at Si 6x6x6 — so
-    # "cheap next to Σ" holds where it matters and INVERTS on the gnppm_debug
-    # fixture (23.7% against 5.2%), which is a bring-up-dominated gate deck.
-    source, v_h_ext, h_transverse = resolve_external_hartree(
-        config, meta, band_slices, mesh_xy, wfn=wfn, sym=sym, print_fn=print_fn)
+    # Density-SC rebuilds this same exact G-space operator from the evolving
+    # orbitals directly in the DFT basis.  Other paths build it once here.
     if omit_v_h:
-        # DENSITY SELF-CONSISTENCY.  V_H is supplied by the caller in the
-        # DFT basis and added straight to ``kin_ion_dft``, which is also
-        # DFT — so it must NOT travel through here.  Everything this
-        # function returns is in the QP basis and gets rotated back by
-        # ``sc_iteration``; routing V_H through that round trip would
-        # rotate it twice for no reason.  Zero it and let the caller own
-        # it.  ``resolve_external_hartree`` still runs above so the graph
-        # shape stays source-independent.
-        source, v_h_ext = "caller_dft", None
-        sig_h = jnp.zeros_like(sig_h)
-    if source == "folded":
-        sig_h = jnp.zeros_like(sig_h)
-    elif v_h_ext is not None:
-        v_h_ext = jnp.asarray(v_h_ext, dtype=sig_h.dtype)
+        # A scalar zero preserves SigmaResult's arithmetic-compatible field
+        # contract without allocating an otherwise dead (nk,nb,nb) matrix.
+        # The density-SC caller branches before matrix assembly and replaces
+        # this sentinel with its separately retained exact field at every
+        # final output seam.
+        sig_h = jnp.asarray(0, dtype=sig_x.dtype)
+        h_transverse = None
+    else:
+        sig_h, h_transverse = _compute_live_hartree(
+            config, meta, band_slices, mesh_xy,
+            wfn=wfn, sym=sym, print_fn=print_fn)
+        sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
-            # QSGW: ``wfns`` is in the CURRENT QP basis, so every Σ channel
-            # this function returns is too, and ``sc_iteration`` rotates the
-            # lot back with ``O_DFT = U·O_QP·U†``.  The stored/gspace V_H is
-            # a fixed operator in the DFT basis, so it must be rotated INTO
-            # the QP basis first (``O_QP = U†·O_DFT·U``) — substituting it
-            # raw would make the rotate-back return ``U·V_H·U†`` and put a
-            # basis error into a ~500 eV term with no other symptom.
-            #
-            # U STAYS AT ``qsgw_density.band_rotation_spec``, which is what
-            # ``sc_iteration`` hands over, and the rotation is
-            # ``rotate_band_matrix`` — the same primitive
-            # ``sc_iteration._rotate_to_dft_basis`` and
-            # ``qsgw_density.rotate_bands`` use.  Only the RESULT is pinned
-            # replicated: a sharded ``SigmaResult.v_h_kij_ry`` propagates
-            # into the k-star select and the host readbacks downstream.
-            # (The previous form gathered U replicated first — 10.7 ms
-            # against 5.3 ms for an already-replicated U at nk=16/nb=128 on
-            # a 2×2 mesh, job 7889424 — which is the 9.2 GB/rank object at
-            # nk=144/nb=2000.)  This branch is skipped entirely under
-            # density-SC (``omit_v_h`` zeroes sig_h above).
-            v_h_ext = _rotate_v_h_to_qp(
-                jnp.asarray(v_h_ext, dtype=sig_h.dtype),
-                _place_band_rotation(hartree_basis_rotation, mesh_xy,
-                                     sig_h.dtype),
-                mesh=mesh_xy)
-        sig_h = v_h_ext
+            rotation = _place_band_rotation(
+                hartree_basis_rotation, mesh_xy, sig_h.dtype)
+            sig_h = _rotate_v_h_to_qp(sig_h, rotation, mesh=mesh_xy)
     v_h_scalar = sig_h
     if h_transverse is not None and hartree_basis_rotation is not None:
         h_transverse = _rotate_v_h_to_qp(
             jnp.asarray(h_transverse, dtype=sig_h.dtype),
-            _place_band_rotation(
-                hartree_basis_rotation, mesh_xy, sig_h.dtype),
+            rotation,
             mesh=mesh_xy)
     if h_transverse is not None:
-        # ``hartree_source`` and ``omit_v_h`` own only the scalar charge
-        # potential.  The exact periodic G-space current artifact is a
-        # separate operator, so append it independently after the scalar
-        # replacement rather than letting hartree_source erase it.  It is the
-        # SSOT for every bispinor_gw mode; no centroid
-        # direct contraction or exchange q->0 head reaches this seam.
+        # The exact periodic G-space current artifact is a separate operator,
+        # so append it independently after the scalar source replacement.
+        # ``omit_v_h`` cleared it above together with the scalar term: under
+        # density-SC the caller rebuilt BOTH fields from the evolving
+        # orbitals, and retaining this frozen DFT artifact would double-count
+        # H_T while silently mixing two densities.
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
-    sig_sx = cohsex["sig_sx"]                    # zero placeholders for V-only path
-    sig_coh = cohsex["sig_coh"]
     if mode is ComputeMode.X_ONLY:
         # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
         # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
@@ -1118,6 +950,7 @@ def compute_sigma_xc(
             v_h_kij_ry=sig_h,
             v_h_scalar_kij_ry=v_h_scalar,
             h_transverse_kij_ry=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sig_x,
             sigma_sx_kij_ry=sig_x,
@@ -1133,6 +966,7 @@ def compute_sigma_xc(
             v_h_kij_ry=sig_h,
             v_h_scalar_kij_ry=v_h_scalar,
             h_transverse_kij_ry=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sigma_xc,
             sigma_sx_kij_ry=sig_sx,
@@ -1304,6 +1138,7 @@ def compute_sigma_xc(
             body.sigma_c_kij, head_diag,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             e_qp_ev=e_qp_ev,
             config=config, meta=meta, mesh_xy=mesh_xy,
             sym=sym, wfn=wfn, band_slices=band_slices,
@@ -1365,6 +1200,7 @@ def compute_sigma_xc(
         ppm_outputs.head_sigma_diag_w_kn_ry,
         sig_x=sig_x, sig_h=sig_h,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+        hartree_omitted=bool(omit_v_h),
         e_qp_ev=e_qp_ev,
         config=config, meta=meta, mesh_xy=mesh_xy,
         sym=sym, wfn=wfn, band_slices=band_slices,

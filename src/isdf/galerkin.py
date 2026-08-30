@@ -684,6 +684,7 @@ def fit_galerkin_basis(
         extra_rank_pad: int = 0,
         progress_fn=None,
         rank_record_fn=None,
+        distrib_la_batched_route: str = "auto",
 ) -> GalerkinBasis:
     """Fit the published whole-state Hamiltonian-transform basis.
 
@@ -934,7 +935,8 @@ def fit_galerkin_basis(
         gram_stack = _prepare_selected(selected_gram)
         del selected_gram
         chol_plan = linalg_plan(
-            "cholesky", mesh_xy, backend="native2d", n=rank)
+            "cholesky", mesh_xy, backend="native2d", n=rank,
+            batched_route=distrib_la_batched_route)
         log_fn(f"  [route] selected-state factor: {chol_plan.describe()}")
         L_stack = chol_plan.batched(gram_stack)
         del gram_stack

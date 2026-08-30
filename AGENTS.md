@@ -41,7 +41,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `services/distrib_la/` | **The distributed dense-linalg service**: one door for `eigh` / `cholesky` / `solve_lu` over scalapack, slate, cusolvermp and native (incl. the 2D-blocked `native2d` Cholesky that was `src/common/cholesky_2d.py`). Read `docs/services/distrib_la.md` first | Cholesky / eigh / LU on a mesh; backend refusals; `.so` pins |
 | `src/common/fft_helpers.py` | Flat-k FFT helpers | FFT plumbing |
 | `src/common/gvec_fft_box.py` | Sphere ↔ FFT-box gather | V_q G-space build |
-| `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the time-reversal MEASUREMENT (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
+| `services/symmetry_maps/` | **The crystal-symmetry service**: one door for `SymMaps` (IBZ→full BZ tables, spinor rotations), the k-star index map, the sharded q-axis unfolds, the real-space orbit machinery and the 2c DFT-reference TRS check (was `src/common/symmetry_maps.py`, `src/centroid/orbit_syms.py`, `src/common/density_symmetry_check.py`). Read `docs/services/symmetry_maps.md` first | Symmetry / k-point unfolding; star conjugation; TRS verdicts |
 | `services/minimax/` | **The certified-quadrature service**: one door for `serve` / `lookup` (shipped tables with provenance and refusals), the target and family vocabulary as data, and the offline solvers behind an announced escape hatch (was `src/common/minimax.py` + `src/common/minimax_assets/`). Reach it as `import minimax`; never a submodule path. | Quadrature node/weight issues; "no certified table" refusals; uncertified-solve announcements |
 | `src/common/meta.py` | `Meta` system-parameters dataclass | k/q-grid, band ranges |
 | `services/wfn_loader/` | **The ψ(G) loading service**: one door for `WfnLoader`, the canonical WFN.h5 reader, with `backend='auto'` picking the eager or the phdf5 (parallel HDF5) collective read and the two held byte-identical (was `src/file_io/wfn_loader.py`). Reach it as `import wfn_loader`, or as `from file_io import WfnLoader` / `WFNReader`; never a submodule path. Read `docs/services/wfn_loader.md` first | Wavefunction loading, H5 read backends |
@@ -91,11 +91,15 @@ uv run python -m pytest -q --census
 ### Perlmutter (Shifter, via the `lx` harness)
 
 ```bash
-export LX_BASE_MODULE=lorrax_J070             # without it you get the wrong jax
+export LX_BASE_MODULE=lorrax_A                # JAX/JAXLIB 0.9 lane
 lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in   # one P=4 step, allocates or attaches
 lx test                                       # the default gate, on a compute node, in cwd
 lx status                                     # who is running where
 ```
+
+Perlmutter requires one task/rank per GPU; the
+[machine page](docs/environment/machines/perlmutter.md#required-gpu-task-geometry)
+owns the launch and evidence contract.
 
 `lx` allocates or attaches by itself, so never `sbatch` an iteration and never
 `lx release --all`. The older `module load lorrax_X` + `lxalloc`/`lxrun`/`lxpre`
@@ -114,7 +118,7 @@ Working invocations from the certified scripts (`config/frontera/templates/gw_de
 ```bash
 # preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
 python3 -u -m centroid.kmeans_cli 3000 --orbit --qe-save ../b300_out/MoS2.save --out-suffix _b300_c3000
-python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300 --hartree
+python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300
 
 # multi-node GW via the certified launch block (gw_ht_b300.sbatch):
 export LORRAX_ROOT=... LORRAX_RUN_DIR=... LORRAX_INPUT=gw.in

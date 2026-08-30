@@ -32,6 +32,12 @@ from .radial_jax import (
     make_uniform_q_grid,
     radial_weights,
 )
+# The QE radial quadrature schemes have ONE owner: psp.radial_tables.
+# (No cycle: radial_tables imports psp.species + psp.radial.radial_jax only.)
+from psp.radial_tables import (
+    qe_beta_radial_scheme as _qe_beta_radial_scheme,
+    qe_vloc_radial_scheme as _qe_vloc_radial_scheme,
+)
 
 # Self-contained: provide local implementations of helpers previously imported
 
@@ -368,17 +374,50 @@ def _fourier_transform_vloc_qe(
     """QE-style Fourier transform of the local pseudopotential (Ry).
 
     Matches upflib/vloc_mod by tabulating the short-range part with an
-    erf-subtracted integrand and re-adding the analytic tail in G space.
+    erf-subtracted integrand and re-adding the analytic tail in G space,
+    integrating with QE's own radial scheme (r <= 10 bohr, odd-point
+    Simpson — see :func:`_qe_vloc_radial_scheme`).
     """
-
-    weights = radial_weights(np.asarray(r, dtype=float), rab, scheme='rab')
+    r = np.asarray(r, dtype=float)
+    msh, weights = _qe_vloc_radial_scheme(r, rab)
     return make_local_sr_table(
-        np.asarray(r, dtype=float),
-        np.asarray(vloc_r, dtype=float),
+        r[:msh],
+        np.asarray(vloc_r, dtype=float)[:msh],
         float(z_valence),
         np.asarray(q_grid, dtype=float),
         weights,
     ).values
+
+
+def _cubic_eval_uniform_q(values: np.ndarray, dq: float, q: np.ndarray) -> np.ndarray:
+    """4-point cubic-Lagrange evaluation of a uniform q₀=0 table.
+
+    Forward-window stencil (nodes i0..i0+3, query offset px measured from
+    node i0) — the same scheme QE uses to consume its dq=0.01 tables
+    (upflib/vloc_mod.f90 interp_vloc / beta_mod.f90 interp_beta).  The
+    polynomial identity holds for any px, so clamping i0 to the last full
+    window makes the top of the table a one-sided (still exact-at-nodes)
+    evaluation instead of an out-of-range gather.
+
+    Error is O(dq⁴) against linear's O(dq²): measured on the 2026-08-28
+    atom sweep, |cubic−exact| ≤ 1e-9 Ry on every element's V_loc SR table
+    at the production node density, vs up to 1.7e-6 Ry (Zn) for linear —
+    which was the dominant term of the Fe/Zn KIH excess vs QE.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    if n < 4:
+        # degenerate table — fall back to nearest-node
+        idx = np.clip(np.rint(np.asarray(q) / dq).astype(int), 0, n - 1)
+        return values[idx]
+    x = np.asarray(q, dtype=np.float64) / float(dq)
+    i0 = np.clip(np.floor(x).astype(np.int64), 0, n - 4)
+    px = x - i0
+    ux, vx, wx = 1.0 - px, 2.0 - px, 3.0 - px
+    return (values[i0] * ux * vx * wx / 6.0
+            + values[i0 + 1] * px * vx * wx / 2.0
+            - values[i0 + 2] * px * ux * wx / 2.0
+            + values[i0 + 3] * px * ux * vx / 6.0)
 
 
 def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tuple[int, int], np.ndarray]:
@@ -398,7 +437,7 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
     qmax = float(np.max(K_norm)) if K_norm.size > 0 else 0.0
     q_points = max(1024, 2 * len(r))
     q_grid = make_uniform_q_grid(qmax, q_points)
-    weights = radial_weights(r, rab, scheme='rab')
+    kkb, weights = _qe_beta_radial_scheme(r, rab, _kkbeta_of(betas, len(r)))
     result: Dict[Tuple[int, int], np.ndarray] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
@@ -409,9 +448,20 @@ def _form_factors_qe(pseudo, K_norm: np.ndarray, cell_volume: float) -> Dict[Tup
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        tab = make_projector_table(l, r, beta_r, q_grid, weights)
+        tab = make_projector_table(l, r[:kkb], beta_r[:kkb], q_grid, weights)
         result[(l, idx)] = tab(K_norm)
     return result
+
+
+def _kkbeta_of(betas, n_r: int) -> int:
+    """QE's ``upf%kkbeta`` from raw UPF beta objects: max cutoff_radius_index
+    over the betas, full mesh when the UPF carries none.  Twin of the
+    ``SpeciesData.kkbeta`` extraction in ``psp.species.extract_species``."""
+    kkb = 0
+    for beta in betas:
+        kb = getattr(beta, 'cutoff_radius_index', None)
+        kkb = max(kkb, int(kb) if kb else n_r)
+    return min(kkb, n_r) if betas else n_r
 
 
 # Removed: build_species_rows_qe (not used by production pipeline)
@@ -488,11 +538,23 @@ def build_local_ionic_potential_on_G_total(
         v_r = np.asarray(vloc, dtype=float)
         Zval = float(getattr(pseudo.pp_header, 'z_valence', 0.0))
 
-        q_points = max(2048, 2 * len(r))
+        # 8x-per-mesh-point q resolution, consumed through 4-point CUBIC
+        # Lagrange (O(dq⁴)) rather than linear (O(dq²)).  The node count
+        # spans the FULL FFT-box corner |G|, so dq GROWS with ecutrho and
+        # box shape while the table stays "8x": on the 2026-08-28 atom
+        # sweep the linear consumption at the resulting dq ≈ 3.1e-3
+        # bohr⁻¹ (80 Ry, 12-bohr box, Zn) put a measured −0.055 meV on
+        # the 3s KIH diagonal vs QE — the entire Fe/Zn arm-D excess.
+        # Densifying linear to that floor needs dq ≈ 4e-4 (~8×, priced
+        # 7.7–9.5 s/species vs 0.45 s); cubic at the EXISTING nodes is
+        # ~1e-10 Ry (≪ 1e-4 meV) at zero extra build cost.  This is a
+        # host-side numpy setup path — no autodiff flows through it —
+        # so no custom-JVP structure is touched.
+        q_points = max(8192, 8 * len(r))
         q_grid = make_uniform_q_grid(float(np.max(q_flat)), q_points)
         V_q_sr = _fourier_transform_vloc_qe(r, rab, v_r, q_grid, Zval, cell_volume)
-        tab = RadialTable(q0=float(q_grid[0]), dq=float(q_grid[1] - q_grid[0]), values=V_q_sr)
-        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * tab(q_flat)
+        V_sr_on_flat = (sqrtN * (4.0 * np.pi) * inv_omega) * _cubic_eval_uniform_q(
+            V_q_sr, float(q_grid[1] - q_grid[0]), q_flat)
         V_sr_on_grid = V_sr_on_flat.reshape((nx, ny, nz))
 
         # Alpha‑Z at G=0
@@ -508,19 +570,17 @@ def build_local_ionic_potential_on_G_total(
                 # Just ensure it's properly scaled.
                 pass  # V_sr_on_grid[0,0,0] is already set by spl(0) * prefactor
             else:
-                # 3D: use alpha_Z integral
-                if rab is not None:
-                    integrand = r * (r * v_r + Zval * e2)
-                    alphaZ = (4.0 * np.pi) * np.sum(integrand * rab) * inv_omega
+                # 3D: alpha_Z integral with QE's exact radial scheme
+                # (upflib/vloc_mod.f90 init_tab_vloc G=0 branch: simpson
+                # over msh points of r*(r*vloc + Z*e2)).  See
+                # _qe_vloc_radial_scheme for why bare-rab rectangle
+                # weights put a -0.08 meV constant on every KIH diagonal.
+                if len(r) > 1:
+                    msh, w_qe = _qe_vloc_radial_scheme(r, rab)
+                    integrand = r[:msh] * (r[:msh] * v_r[:msh] + Zval * e2)
+                    alphaZ = (4.0 * np.pi) * np.sum(integrand * w_qe) * inv_omega
                 else:
-                    if len(r) > 1:
-                        integrand = r * (r * v_r + Zval * e2)
-                        dr = r[1] - r[0]
-                        w = np.ones_like(r)
-                        w[0] = 0.5; w[-1] = 0.5
-                        alphaZ = (4.0 * np.pi) * np.sum(integrand * w) * dr * inv_omega
-                    else:
-                        alphaZ = 0.0
+                    alphaZ = 0.0
                 V_sr_on_grid[0, 0, 0] = sqrtN * alphaZ
         except Exception:
             pass
@@ -953,10 +1013,28 @@ def build_E_blocks_full(pseudo, *, soc: bool = True) -> Dict[int, np.ndarray]:
                         raise RuntimeError(
                             f"j-average: ℓ={l} channel has D_avg = 0; "
                             f"average_pp's √(D/D_avg) is undefined.")
-                    # QE's √(D_j / D_avg): the RATIO is positive whenever both
-                    # j channels have D of the same sign as their weighted
-                    # mean, which is what makes this well-defined for the
-                    # negative-D ℓ=2 channels of an ONCV FR pseudo.
+                    # QE's √(D_j / D_avg) is well-defined only when both j
+                    # channels share the sign of their weighted mean (true
+                    # for e.g. the negative-D ℓ=2 channels of ONCV FR Si/Mo).
+                    # It is FALSE for the first ℓ=1 shell of the PseudoDojo
+                    # FR 5d pseudos (Au/Hf/Hg/Ir/Os/Re: D_jj of opposite
+                    # sign, Au −0.4798/+2.5893 Ry) — np.sqrt(negative)
+                    # returned silent NaN here until 2026-08-28.  QE's own
+                    # average_pp.f90:71-80 carries the same sqrt, so such a
+                    # pseudo is not j-averageable in QE either: refuse.
+                    if d_m / d_avg < 0.0 or d_p / d_avg < 0.0:
+                        raise ValueError(
+                            f"j-average: ℓ={l} channel pair has opposite-sign "
+                            f"D_jj (D_j- = {d_m:.6f}, D_j+ = {d_p:.6f} Ry, "
+                            f"D_avg = {d_avg:.6f}); average_pp's √(D/D_avg) "
+                            f"is imaginary, so this fully-relativistic "
+                            f"pseudopotential cannot be j-averaged (QE's "
+                            f"average_pp would NaN identically).  got: the "
+                            f"j-averaged operator required for a "
+                            f"non-averageable FR pseudo; "
+                            f"want: an nspinor=2 WFN (the j-resolved "
+                            f"operator), or a scalar-relativistic (nc-sr) "
+                            f"pseudopotential for this element.")
                     u = {g_minus: l * np.sqrt(d_m / d_avg) / (2.0 * l + 1.0),
                          g_plus: (l + 1.0) * np.sqrt(d_p / d_avg) / (2.0 * l + 1.0)}
                     for g_r in (g_minus, g_plus):
@@ -1102,7 +1180,7 @@ def precompute_projector_tables(
     if q_points is None:
         q_points = max(2048, 2 * len(r))
     q_grid = make_uniform_q_grid(float(q_max), q_points)
-    weights = radial_weights(r, rab, scheme='rab')
+    kkb, weights = _qe_beta_radial_scheme(r, rab, _kkbeta_of(betas, len(r)))
     tables: Dict[Tuple[int, int], RadialTable] = {}
     for idx, beta in enumerate(betas, start=1):
         l = int(getattr(beta, 'lll', getattr(beta, 'angular_momentum', 0)))
@@ -1113,7 +1191,8 @@ def precompute_projector_tables(
             beta_r[0] = beta_r[1]
         else:
             beta_r = raw_beta / r
-        tables[(l, idx)] = make_projector_table(l, r, beta_r, q_grid, weights)
+        tables[(l, idx)] = make_projector_table(l, r[:kkb], beta_r[:kkb],
+                                                q_grid, weights)
     return tables
 
 

@@ -91,6 +91,10 @@ def build_dft_potentials(
         jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
         truncation_2d=truncation_2d)
     V_scf = build_V_scf(V_loc, V_H, V_xc)
+    # j-resolved vs j-averaged V_NL resolves automatically inside
+    # build_vnl_setup: ``mf.spinorbit`` (QE <spinorbit>) when ``mf`` came
+    # from a .save; measured against the wavefunctions when ``mf`` is a
+    # WFN reader with FR pseudos and no such record.
     vnl_setup = vnl_ops.build_vnl_setup(
         mf, pseudos=pseudos, nspinor=nspinor,
         q_max=float(np.sqrt(float(mf.ecutwfc))) * 1.01)

@@ -113,6 +113,14 @@ class ScientificProductionReport:
         for line in lines:
             self.emit(str(line))
 
+    def pseudopotentials(self, lines: Iterable[str]) -> None:
+        """One block per run naming every UPF read and its SR/FR nature —
+        lines come from psp.pseudos.pseudo_summary_lines (the beta-channel
+        verdict, not the header's)."""
+        self.heading("Pseudopotentials")
+        for line in lines:
+            self.emit(str(line))
+
     def system(self, *, natoms: int, species: Iterable[str], fft_grid,
                lines: Iterable[str] = ()) -> None:
         grid = tuple(int(value) for value in fft_grid)

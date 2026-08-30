@@ -78,6 +78,7 @@ nav:
   - Theory:
       - Overview: theory/overview.md
       - Physics: theory/physics.md
+      - Direct Hartree field: theory/hartree.md
       - ISDF / zeta-V(q): theory/isdf-zeta-vq.md
       - Minimax quadrature: theory/minimax-quadrature.md
       - Symmetry: theory/symmetry.md

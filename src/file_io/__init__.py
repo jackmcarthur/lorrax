@@ -71,7 +71,6 @@ from .sigma_output import (
     k_irr_rows_for,
     read_eqp_assembly_receipt,
     read_eval_energies,
-    read_sigma_eqp_diagonal_window,
     sigma_star_spread_stats,
     star_select_k_irr,
     write_sigma_to_file,
@@ -81,8 +80,6 @@ from .sigma_output import (
 )
 from .qp_wfn import write_qp_rotations_h5
 from .kin_ion import (
-    HARTREE_DATASET,
-    HARTREE_SOURCES,
     IRR_IDX_DATASET,
     K_STORAGE_ATTR,
     K_STORAGE_FULL,
@@ -95,13 +92,8 @@ from .kin_ion import (
     read_full_bz_dataset,
     read_star_map,
     load_kin_ion_submatrix,
-    load_hartree_submatrix,
-    kin_ion_has_hartree,
-    kin_ion_hartree_source,
-    resolve_hartree_source,
     read_kin_ion_provenance,
     validate_kin_ion_against_run,
-    authenticate_kin_ion_hartree_wfn_receipt,
 )
 from .centroids import (
     LoadedCentroids,

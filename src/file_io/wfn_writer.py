@@ -96,11 +96,17 @@ class WFNWriter:
         # Eigenvalues / occupations — filled per k-point
         self._el = np.zeros((self.nspin, self.nk, nbands), dtype=np.float64)
         self._occ = np.zeros((self.nspin, self.nk, nbands), dtype=np.float64)
-        # nspinor=2 (SOC/bispinor): spinor bands hold 1 e- each → nelec bands.
-        # nspinor=1 (spin-unpolarized): 2 e- per band → nelec//2. (nspin=2 not
-        # emitted by this writer — only channel [0] is filled.)
-        n_occ = int(crystal.nelec) if self.nspinor == 2 else int(crystal.nelec) // 2
-        self._occ[0, :, :n_occ] = 1.0
+        # n_occ is an occupied-BAND count: a band holds 2/(nspin·nspinor)
+        # electrons.  ``num_electrons`` (WfnLoader) is the physical electron
+        # count; a QE CrystalData has no such attr and its ``nelec`` IS that
+        # count.  A WfnLoader's ``nelec`` is already a band count
+        # (max(ifmax)) — halving IT again at nspinor=1 double-halved the
+        # qp_wfn rewrite path.  (nspin=2 not emitted by this writer — only
+        # channel [0] is filled.)
+        self._n_occ = int(round(float(
+            getattr(crystal, "num_electrons", crystal.nelec))
+            * self.nspin * self.nspinor / 2.0))
+        self._occ[0, :, :self._n_occ] = 1.0
 
         # Open file, write header, pre-allocate coeffs
         self._f = h5py.File(path, "w")
@@ -135,12 +141,8 @@ class WFNWriter:
         f.create_dataset(kp + "el", data=self._el)
         f.create_dataset(kp + "occ", data=self._occ)
 
-        # nspinor=2 (SOC/bispinor): spinor bands hold 1 e- each → nelec bands.
-        # nspinor=1 (spin-unpolarized): 2 e- per band → nelec//2. (nspin=2 not
-        # emitted by this writer — only channel [0] is filled.)
-        n_occ = int(crystal.nelec) if self.nspinor == 2 else int(crystal.nelec) // 2
         ifmin = np.ones((nspin, nk), dtype=np.int32)
-        ifmax = np.full((nspin, nk), n_occ, dtype=np.int32)
+        ifmax = np.full((nspin, nk), self._n_occ, dtype=np.int32)
         f.create_dataset(kp + "ifmin", data=ifmin)
         f.create_dataset(kp + "ifmax", data=ifmax)
 

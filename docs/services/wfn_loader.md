@@ -55,7 +55,7 @@ for the real one, which is exactly what the deleted shim was.
 
 | name | what it is |
 |---|---|
-| `WfnLoader(path, *, mesh=None, backend='auto')` | Open + read header + measure TRS. **Eager** on metadata, lazy on ψ. With `LORRAX_DEBUG_PRINT=1`, `backend='auto'` announces its pick once per (backend, world). |
+| `WfnLoader(path, *, mesh=None, backend='auto')` | Open the WFN, read metadata, and check a 2c DFT reference before TRS unfolding. |
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
@@ -66,7 +66,7 @@ for the real one, which is exactly what the deleted shim was.
 | `path`, `symmetry()`, `kpt_starts` | The public spellings of what consumers used to reach as `._filename` / `._ensure_sym()` / `._kpt_starts`. |
 | `get_gvec_nk(ik)` | Deprecated one-k shim for legacy vcoul/qp_wfn; one release. |
 | header surface | The `MfHeader` fields (`nkpts`, `nbands`, `nspinor`, `kgrid`, `fft_grid`, `bvec`, …) plus derived `nelec/vbm/cbm/efermi/atom_crys`, same names `WFNReader` exposed. |
-| `trs_holds`, `density_symmetry` | MEASURED properties of the coefficients (load-time density symmetry check), not inferences from flags. `SymMaps` is the consumer. |
+| `trs_holds`, `trs_reference` | 2c occupied-subspace verdict and receipt. `density_symmetry` is a temporary compatibility alias. |
 | `close()` / context manager | Releases the h5py handle and the SlabIO handle. |
 
 ## Contract
@@ -87,7 +87,11 @@ for the real one, which is exactly what the deleted shim was.
   (`backend='phdf5_host'`, both doors). At P>1 with a mesh and no
   phdf5-capable library on either platform, `auto` REFUSES, quoting the
   door probe's reason per platform and the `LORRAX_WFN_BACKEND=eager` way
-  through — no silent demotion. `phdf5` without a mesh refuses.
+  through — no silent demotion. `phdf5` without a mesh refuses. Headers the
+  coeffs slicing cannot serve refuse at construction, before anything reads
+  the raw dataset: `flavor != 2` (real-flavor files; the re/im axis is
+  hardcoded as 2) and `nspin != 1` (coeffs axis 1 is treated as the spinor
+  axis alone, so nspin=2 would silently read spin-up only).
 * **`load` vs `load_process_local`.** `load` returns one logical global
   array (every rank must request the same window); `load_process_local`
   is the k-parallel primitive (per-rank windows, combination explicit).

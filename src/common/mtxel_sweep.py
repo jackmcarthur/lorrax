@@ -288,6 +288,7 @@ __all__ = [
     "Operator",
     "kinetic_operator",
     "local_potential_operator",
+    "four_current_potential_operator",
     "vnl_operator",
     "dipole_operator",
     "uniform_gauge_operator",
@@ -588,6 +589,87 @@ def local_potential_operator(
             scale, deltaV, fft_norm,
             tuple(int(d) for d in V_r_j.shape)))
     return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,), key=key)
+
+
+def four_current_potential_operator(
+    geom: SweepGeometry, V_scalar_r, V_vector_r, *, charge_nspinor: int,
+) -> Operator:
+    """Pack scalar ``V_H`` and ``sum_i alpha_i A_i`` into one FFT sweep.
+
+    The returned two components are separate matrix elements, not their sum:
+    component 0 is the scalar charge Hartree and component 1 is the spatial
+    Dirac-current Hartree.  They share the sphere scatter, inverse FFT, ket
+    reshard and bra contraction.  The forward FFT is batched over the two
+    outputs, preserving the decomposition required by ``sigma_mnk.h5``.
+
+    ``charge_nspinor`` applies only to component 0.  This is load-bearing for
+    the Pauli-reference model: the full four-spinor carries the current, while
+    the scalar charge uses its leading source-WFN components.  Zeroing the
+    scalar operator ket outside that block is algebraically identical to
+    slicing both bra and ket because those output spinor rows are exact zero.
+    """
+    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from psp.get_DFT_mtxels import local_potential_scalars
+
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "four-current local potential requires four-component "
+            f"bispinors; geom.ns={int(geom.ns)}")
+    charge_ns = int(charge_nspinor)
+    if not 0 < charge_ns <= 4:
+        raise ValueError(
+            "four-current charge_nspinor must be in [1,4]; got "
+            f"{charge_nspinor}")
+    grid = tuple(int(s) for s in geom.fft_grid)
+    V0 = jnp.asarray(V_scalar_r, dtype=jnp.complex128)
+    V1 = jnp.asarray(V_vector_r, dtype=jnp.complex128)
+    if tuple(int(s) for s in V0.shape) != grid:
+        raise ValueError(
+            f"scalar four-current potential must have shape {grid}; got "
+            f"{tuple(int(s) for s in V0.shape)}")
+    if tuple(int(s) for s in V1.shape) != (3, *grid):
+        raise ValueError(
+            "spatial four-current potential must have shape "
+            f"{(3, *grid)}; got {tuple(int(s) for s in V1.shape)}")
+
+    mesh = geom.mesh
+    ifftn = make_sharded_ifftn_3d(
+        mesh, geom.spec_box_xy, geom.spec_box_xy,
+        norm="ortho", axes=(-3, -2, -1))
+    comp_box_spec = P(None, None, ("x", "y"), None, None, None, None)
+    fftn = make_sharded_fftn_3d(
+        mesh, comp_box_spec, comp_box_spec,
+        norm="ortho", axes=(-3, -2, -1))
+    scalars = local_potential_scalars(geom.cell_volume, geom.ngrid)
+    scale = float(scalars.scale)
+    fft_scale = float(scalars.deltaV * scalars.fft_norm)
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    charge_mask = jnp.asarray(
+        np.arange(4) < charge_ns, dtype=jnp.complex128).reshape(
+            1, 1, 4, 1, 1, 1)
+
+    def op(psi_n, gvec, gmask, bidx, kvec, V0, V1):
+        del kvec
+        box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
+        psi_r = ifftn(box) * scale
+        phi_scalar = psi_r * charge_mask * V0
+        phi_vector = jnp.zeros_like(psi_r)
+        for i, (perm, phase) in enumerate(alpha_vertices):
+            phi_vector = phi_vector + V1[i] * gamma_apply(
+                psi_r, perm, phase, axis=2)
+        # (component, k, band, spinor, x, y, z): the component batch is
+        # replicated and the band shard moves from axis 1 to axis 2.
+        phi_G = fftn(jnp.stack((phi_scalar, phi_vector), axis=0)) * fft_scale
+        gx, gy, gz = gvec[:, 0], gvec[:, 1], gvec[:, 2]
+        out = phi_G[..., gx, gy, gz]
+        out = jnp.moveaxis(out, 0, -1)
+        return out * gmask[None, None, None, :, None].astype(out.dtype)
+
+    return Operator(
+        apply=op, post=float(scalars.post), ncomp=2, consts=(V0, V1),
+        key=("four_current_local_potential", grid, geom.ngkmax, geom.ns,
+             charge_ns, scale, fft_scale))
 
 
 def _ket(psi_n, gmask):
@@ -1938,14 +2020,14 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
     returns the block SHARDED, which is the point: no rank holds a full
     ``(nb, nb)``.  Every consumer that keeps its result in that layout
     (``gw.sc_iteration.rebuild_hartree_dft_basis``) must NOT call this.
-    It exists for the sinks that cannot take a sharded operand — the
+    It exists for the sinks that cannot take a sharded operand — today the
     serial ``h5py`` writes in ``gw.kin_ion_io`` and
-    ``psp.get_dipole_mtxels``, and the replicated global operand
-    ``gw.sigma_dispatch``'s gspace route builds — and it re-materialises
-    the replicated ``(nk, nb, nb)`` on the ranks that keep it.  What the
+    ``psp.get_dipole_mtxels`` — and it re-materialises the replicated
+    ``(nk, nb, nb)`` on the ranks that keep it.  The live
+    ``gw.sigma_dispatch`` G-space route does not cross this boundary; its
+    star broadcast and basis rotation retain ``P(None,'x','y')``.  What the
     sweep removes upstream of here is the per-k full-band FFT box and the
-    ``P ≤ nk`` ceiling; the table itself is the output and something has
-    to hold it.
+    ``P ≤ nk`` ceiling; an artifact writer still has to hold its table.
 
     ``owner_only=True`` keeps it on rank 0 and returns ``None`` elsewhere
     — the same contract ``collectives.gather_k_blocks(owner_only=True)``
@@ -1976,16 +2058,13 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
       true until 233a830d deleted that backend and the ``slab_io`` router
       with it.  There is one transport left and it writes from the shards,
       so the reason recorded here is spent — what is left is the work.
-    * The third consumer cannot be converted at all by itself:
-      ``gw.sigma_dispatch.resolve_external_hartree`` READS the table back
-      as a replicated global operand and rotates it with
-      ``hartree_basis_rotation``, and ``gw.sc_iteration``'s
-      ``_rotate_to_dft_basis`` / ``apply_band_partition`` consume the
-      result the same way.  Removing W2 end to end is a read-side and
-      consumer change of the same size as the write-side one.
+    * The former third consumer is converted: the live G-space source returns
+      ``P(None,'x','y')`` and rotates it without a host or replicated seam.
+      W2 therefore survives only at the two serial artifact writers named
+      above, not in the in-memory driver path.
 
-    So it is three files this module does not own plus a backend-dependent
-    claim, not a change to this function.  Recorded rather than half-landed.
+    Converting those two writers is separate I/O work this module does not
+    own.  Recorded rather than half-landed.
     """
     from common.collectives import gather_to_host, process_rank
 

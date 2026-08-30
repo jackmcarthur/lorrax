@@ -172,9 +172,7 @@ class GWProductionReport:
         self.emit(f"Screening      : {diagram_text}; "
                   f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
-        self.emit(f"Coulomb system : {geometry}; Hartree source=" + policy(
-            getattr(config, "hartree_source", "-"),
-            ("auto", "stored", "isdf", "gspace")))
+        self.emit(f"Coulomb system : {geometry}; Hartree=live G-space")
         self.emit("Spin channels  : " + (
             "charge + transverse current (bispinor)"
             if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))

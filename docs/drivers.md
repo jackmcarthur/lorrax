@@ -125,33 +125,20 @@ fails the check. Missing pseudopotentials in the deck dir / `../qe/{scf,nscf}` f
 
 ## kin-ion — `gw.kin_ion_io`
 
-Computes the ionic one-body Hamiltonian matrix `<mk|T + V_loc + V_NL|nk>` for every full-BZ k and, by default,
-the exact FFT-grid mean-field Hartree `<mk|V_H|nk>` — the pieces of H0 = kin_ion + V_H, a ~500 eV cancellation
-(MoS2: -502 + 461 eV), from which the run reconstructs Vxc = E_dft - kin_ion - V_H. Reads the deck (`-i`) as
-the single source of truth (`sys_dim` -> Coulomb truncation, `nval`/`ncond`/`nband`, `bispinor`), plus `WFN.h5`
-and the `*.upf` pseudopotentials; writes `kin_ion.h5` with two datasets: `kin_ion` (pristine T+V_loc+V_NL) and
-`v_hartree` (separate, so one file serves both exact-V_H and ISDF-V_H runs). The V_H build is distributed:
-rho partitioned over (k, band-chunk) with exactly one psum, the Poisson solve replicated by design, and
-`<mk|V_H|nk>` k-partitioned with one gather; the exact route is pinned to QE's `kih.dat` at rms 1e-4 eV,
-while the ISDF `V_q[0]` route plateaus at ~0.1-0.5% relative — up to eV-scale on the gap (4.15 eV measured).
+Writes `<mk|T+V_loc+V_NL|nk>` to `kin_ion.h5`; Hartree is built live by GW
+([contract](theory/hartree.md)). The deck owns system, band, and spinor
+settings; `WFN.h5` and the pseudopotentials are provenance inputs.
 
-Invoke: `python3 -m gw.kin_ion_io -i deck.in -o kin_ion.h5 -n NB [--no-hartree]`; multi-rank capable
-(rank-0 write after gather); certified 1-proc in `deck_b300.sbatch` step 4 (`-n 300 --hartree`) and at P=16:
-40→14 s wall (2.9×; driver-recorded 24.5→6.7 s), `kin_ion` EXACT vs P=1, `v_hartree` max Δ 2.13e-14 (psum
-order), k-sweeps near-ideal (vh_matrix_k 8.45→0.80 s at 16 k / 16 ranks) — BD.2, job 7884867.
-Reuse contract: dataset attrs `nk`/`nb`/`sys_dim`/`truncation_2d`/`pseudopotentials`/`has_hartree`/
-`hartree_truncation_2d`/`input_file`/`wfn_file`. NOTE no WFN content hash (unlike dipole): a regenerated WFN
-with a stale `kin_ion.h5` is NOT auto-detected — rerun this driver after any WFN regeneration. Fastloop
-stage: `kin_ion` (~6 s of the chain).
+Invoke: `python3 -m gw.kin_ion_io -i deck.in -o kin_ion.h5 -n NB`.
+Multi-rank writes are coordinated at rank 0. Reuse requires matching k storage,
+spinor representation, system dimension, band extent, WFN, input, and
+pseudopotential stamps; mismatch refuses before reading the matrix.
 
 | key / flag | default | meaning |
 |---|---|---|
 | `-n` / `--nb` | max(deck `nband`, nelec+ncond) | bands written; HARD FLOOR nelec+ncond — the run's `load_kin_ion_submatrix` reads `[0, nelec+ncond)` |
-| `--no-hartree` | off | skip V_H entirely; the GW run must then use `hartree_source = isdf` |
-| `--fold-hartree` | off | LEGACY: add V_H into `kin_ion` values, stamp `has_hartree=True` (old-artifact reproduction only) |
 | `--sys_dim` | from deck (default 2) | may only CONFIRM the deck's `sys_dim`; contradiction is fatal |
 | `--pseudo_dir` | deck dir (falls back `../qe/{scf,nscf}`) | where `*.upf` live |
-| `hartree_source` (deck, read by GW run) | `auto` | the G-space vs ISDF V_H switch: `stored` (require `v_hartree`) / `isdf` (V_q[0] tile) / `gspace` (rebuild exact in-run) / `auto` (stored if present, else legacy fold, else isdf) |
 | `kin_ion_file` (deck) | `kin_ion.h5` | file the GW run reads back |
 
 New-user refusals: `--sys_dim contradicts sys_dim=... in deck` (fix the deck); `Requested N bands but the
@@ -185,7 +172,6 @@ P-scaling at P=16 (b300 deck, 2979c/300b): the ζ charge factor executes q-paral
 | `eqp2_accelerator` / `eqp2_history_depth` | rcrop / 5 | rCROP on the Hermitian Hamiltonian carried in the original DFT basis (so eigenvector gauge is absent from the residual); `linear` selects unaccelerated Picard iteration |
 | `restart` | true | reuse `tmp/isdf_tensors_{n_rmu}.h5` (skip ζ-fit/V_q); stamp contract below |
 | `ppm_probe_chi_reuse` | off | opt-in `auto`: probe χ₀ folds into ONE fused τ sweep on static+k augmented nodes; pays only where per-node χ cost dominates (nets +1.2 s at b300 — planner cost; job 7885109) |
-| `hartree_source` | auto | THE G-space vs ISDF V_H switch: `stored` (v_hartree array in kin_ion.h5) \| `gspace` (exact FFT-grid rebuild) \| `isdf` (V_q[0] quadrature) \| legacy `folded` = V_H inside kin_ion values; auto resolves stored→folded→isdf |
 | `charge_zeta_solve` | rank_truncate | charge ζ CCT conditioner: rank-revealing eigh pseudo-inverse dropping λ < `zeta_rcond`·λmax (default 1e-8) vs bit-identical historical `cholesky`. The cut is GATED, not merely announced: when it discards anything and the achieved κ_eff exceeds the certified 1e8, the run REFUSES — [`docs/dev/rank_truncation_policy.md`](dev/rank_truncation_policy.md), override `LORRAX_RANK_POLICY` |
 | `distributed_zeta_solve` | auto | ζ back-solve tier: `replicated` \| `per_q` \| `distributed` (nothing O(μ²) replicated; needs rank_truncate + square/1-D mesh); auto = replicated under 4 GiB gather cap, else per_q |
 | `transverse_zeta_solve` / `distributed_lu` | ridge / auto | Transverse CCT is indefinite. `ridge` applies the accepted trace-scaled shift and pivoted LU; `distributed_lu` chooses local, cuSOLVERMp, or explicit CPU ScaLAPACK LU. Sequential and distributed-token schedules hoist one factor per q and channel. Coupled local `batch_reshard` instead keeps raw CCT and performs local factor+solve per r-chunk. |

@@ -2668,7 +2668,8 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         params, override=distrib_la_batched_route)
     (wfn, sym, meta, _, basis, enk_sigma) = initialize_wfns(
         input_file, params, log_fn, mesh_xy=mesh_xy,
-        n_guard_bands=n_guard, centroid_subset_idx=keep_idx)
+        n_guard_bands=n_guard, centroid_subset_idx=keep_idx,
+        distrib_la_batched_route=_distrib_la_batched_route)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nk, nb_wide, rank = (int(ctilde.shape[0]), int(ctilde.shape[1]),
                          int(ctilde.shape[2]))

@@ -18,6 +18,7 @@ in the container, not on a login node.
 """
 import pathlib
 import sys
+import types
 
 import pytest
 
@@ -39,20 +40,30 @@ class _RecordingWfn:
         self.nk = nk
         self.ngkmax = ngkmax
 
-    def load(self, *, bands, k, sharding=None, bispinor=False):
+    def load(self, *, bands, k, sharding=None, bispinor=False,
+             bispinor_lift="raw"):
+        del k, sharding, bispinor, bispinor_lift
         self.calls.append((int(bands[0]), int(bands[1])))
         nb = int(bands[1]) - int(bands[0])
         return jax.numpy.zeros(
             (self.nk, nb, 1, self.ngkmax), dtype=jax.numpy.complex128)
 
     def box_index(self, *, k):
+        del k
         return np.zeros((self.nk, self.ngkmax, 3), dtype=np.int32)
+
+    def box_index_dev(self, *, k, mesh):
+        del mesh
+        return jax.numpy.asarray(self.box_index(k=k))
 
 
 class _Inputs:
     def __init__(self, band_slices, nb_carry, nk=2):
         self.band_slices = band_slices
         self.wfn = _RecordingWfn(nk=nk)
+        self.mesh_xy = object()
+        self.config = types.SimpleNamespace(
+            bispinor=False, bispinor_gw=None)
         self.kin_ion_dft = jax.numpy.zeros(
             (nk, nb_carry, nb_carry), dtype=jax.numpy.complex128)
 
@@ -90,6 +101,17 @@ def test_psi_sphere_cache_key_separates_equal_width_windows():
     sc_iteration._dft_psi_sphere(a)
     sc_iteration._dft_psi_sphere(b)
     assert wfn.calls == [(0, 32), (32, 64)], wfn.calls
+    sc_iteration._PSI_G_CACHE.clear()
+
+
+def test_psi_sphere_reuses_the_loader_owned_device_index():
+    """Both SC consumers receive the canonical resident box-index buffer."""
+    sc_iteration._PSI_G_CACHE.clear()
+    inp = _Inputs(_slices(0, 8), nb_carry=8)
+    first = sc_iteration._dft_psi_sphere(inp)
+    second = sc_iteration._dft_psi_sphere(inp)
+    assert first[1] is second[1]
+    assert isinstance(first[1], jax.Array)
     sc_iteration._PSI_G_CACHE.clear()
 
 

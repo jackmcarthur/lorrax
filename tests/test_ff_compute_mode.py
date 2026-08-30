@@ -387,7 +387,7 @@ def test_the_table_records_what_the_four_working_modes_actually_build():
     Read off the shipped kernels: ``x_only`` returns Σ_x alone; ``cohsex``
     returns Σ_SX + Σ_COH beside its bare Σ_x; the two PPMs return Σ_x plus
     a Σ_c(ω) cube and never touch the static screened channels
-    (``sigma_dispatch`` routes them to ``compute_v_h_sigma_x``).
+    (``sigma_dispatch`` routes them to ``compute_sigma_x``).
     """
     assert sigma_channels_for(ComputeMode.X_ONLY) == frozenset(
         {SigmaChannel.X})

@@ -522,9 +522,10 @@ def main():
     with timing.section("setup.charge_density"):
         if args.density_mode == "current":
             from .current_density import build_current_density
-            # n_occ convention: nelec for FR (nspinor=2), nelec/2 for scalar
-            # (nspinor=1 — restricted Kohn-Sham, two electrons per band).
-            n_occ = int(wfn.nelec) if int(wfn.nspinor) == 2 else int(wfn.nelec) // 2
+            # wfn.nelec = max(ifmax) is an occupied-BAND count in BOTH
+            # conventions (1 e-/band FR, 2 e-/band scalar) — never halve
+            # it: ``nelec // 2`` here double-halved the scalar case.
+            n_occ = int(wfn.nelec)
             print0(f"  density-mode=current: building bispinor j² weight "
                    f"with n_occ={n_occ} (nspinor_wfn={int(wfn.nspinor)})")
             charge_density = build_current_density(

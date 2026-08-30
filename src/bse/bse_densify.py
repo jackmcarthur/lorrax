@@ -607,7 +607,8 @@ def _interpolate_bse_data_to_grid(
      enk_sigma) = ht.initialize_wfns(
          input_file, params, log_fn, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset,
-         rank_record_fn=htransform_rank_record_fn)
+         rank_record_fn=htransform_rank_record_fn,
+         distrib_la_batched_route=_distrib_la_batched_route)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index

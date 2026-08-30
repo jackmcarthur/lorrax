@@ -170,7 +170,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              qrcp_seed: int = 0,
                              basis_input: str | None = None,
                              basis_output: str | None = None,
-                             progress_fn=None, rank_record_fn=None):
+                             progress_fn=None, rank_record_fn=None,
+                             distrib_la_batched_route: str = "auto"):
     """Resolve htransform policy around the reusable Galerkin fit service.
 
     Input and output are deliberately distinct: a requested restart may not
@@ -249,6 +250,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         extra_rank_pad=extra_rank_pad,
         progress_fn=progress_fn,
         rank_record_fn=rank_record_fn,
+        distrib_la_batched_route=distrib_la_batched_route,
     )
     if basis_output:
         write_galerkin_basis(
@@ -1127,7 +1129,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                     rank_record_fn=None, wfn_sym=None, *,
                     require_all_occupied: bool = False,
                     basis_input: str | None = None,
-                    basis_output: str | None = None):
+                    basis_output: str | None = None,
+                    distrib_la_batched_route: str | None = None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1305,6 +1308,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
+    distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=distrib_la_batched_route)
     basis_input = _resolve(basis_input) if basis_input else None
     basis_output = _resolve(basis_output) if basis_output else None
     with mesh_xy:
@@ -1317,6 +1322,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             progress_fn=progress_fn,
             rank_record_fn=rank_record_fn,
             basis_input=basis_input, basis_output=basis_output,
+            distrib_la_batched_route=distrib_la_batched_route,
         )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
            f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
@@ -2192,7 +2198,8 @@ def main(argv=None):
             centroid_record_fn=_centroid_records.append,
             rank_record_fn=_rank_records.append,
             require_all_occupied=True,
-            basis_input=args.basis_input, basis_output=args.basis_output)
+            basis_input=args.basis_input, basis_output=args.basis_output,
+            distrib_la_batched_route=distrib_la_batched_route)
     _setup_progress.step()
     _setup_progress.finish()
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes

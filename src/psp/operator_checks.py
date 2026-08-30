@@ -250,8 +250,11 @@ def check_degeneracy_consistency(
         print_fn("  against wavefunctions from noncolin=.true.,")
         print_fn("  lspinorb=.false. (QE ran average_pp; its eigenvalues carry")
         print_fn("  no spin-orbit).  A 2+4 pattern on a 6-fold at Γ is the")
-        print_fn("  Γ8/Γ7 spin-orbit signature.  Pass soc=False to build the")
-        print_fn("  j-averaged (scalar-relativistic) V_NL instead.")
+        print_fn("  Γ8/Γ7 spin-orbit signature.  The V_NL builder resolves")
+        print_fn("  j-resolved vs j-averaged automatically by this same")
+        print_fn("  measurement (psp.vnl_ops.measure_soc_mode), so a split")
+        print_fn("  HERE means the operator disagrees with the wavefunctions")
+        print_fn("  anyway — check the WFN / pseudopotential pairing.")
         print_fn(bar + "\n")
     else:
         print_fn(f"  {label}: degeneracy-consistent — "

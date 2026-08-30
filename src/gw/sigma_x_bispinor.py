@@ -158,7 +158,7 @@ def compute_sigma_x_bispinor(
     # / common.contract_bands.contract_bands_block_reshard(layout=...)
     # for a face-layout wfns_transverse rather than only ever working on
     # the legacy carrier.
-    sigma_sx_k, _, _ = _make_cohsex_kernels(
+    sigma_sx_k, _ = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, nk_tot, **face_kernel_kwargs(wfns_transverse))
 
     # Instrumented psi inventory disclosure (report §7's "disclose the
@@ -238,7 +238,7 @@ def compute_sigma_x_bispinor(
         # 2-D sharded.  Gather to replicated FIRST (legal at any size),
         # THEN window to nb_sigma (a plain slice of a replicated array,
         # no divisibility constraint) — the SAME sequence
-        # compute_cohsex_sigma/compute_v_h_sigma_x already use for their
+        # compute_cohsex_sigma/compute_sigma_x already use for their
         # OTHER static channels, so this function's return contract
         # matches theirs regardless of which layout built it.
         rep = NamedSharding(mesh_xy, P(None, None, None))

@@ -617,11 +617,11 @@ def _compute_V_q_g_flat_one_tile(
         # for non-cubic / non-symmorphic systems.
         n_sym_spatial = int(np.asarray(sym_perm).shape[0]) // 2
         if is_charge_cc:
-            # TIME REVERSAL IS MEASURED, NEVER ASSUMED.  This block used to
+            # TIME REVERSAL IS EXPLICIT, NEVER ASSUMED HERE. This block used to
             # compose q with −q through Θ and project the self-negative
             # rows unconditionally; on a ferromagnet that fabricates a
-            # symmetry the density says is absent.  The policy object reads
-            # ``sym.trs_allowed`` (the load-time spin-density verdict) and
+            # symmetry the reference verdict says is absent. The policy reads
+            # ``sym.trs_allowed`` and
             # this site no longer contains a TRS branch of its own.
             # The point-group covariance the unfold below ASSUMES of the
             # finite ζ basis, measured on the stored parents while they are

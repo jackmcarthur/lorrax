@@ -172,6 +172,9 @@ def run_kpm_dos(
             jnp.asarray(crystal.bvec, dtype=jnp.float64), crystal.blat,
             truncation_2d=truncation_2d)
         V_scf = build_V_scf(V_loc, V_H, V_xc)
+        # j-resolved vs j-averaged V_NL resolves automatically:
+        # ``crystal.spinorbit`` (QE <spinorbit>, always present on the
+        # .save route) is authoritative inside build_vnl_setup.
         vnl_setup = vnl_ops.build_vnl_setup(
             crystal, pseudos=pseudos, nspinor=nspinor,
             q_max=float(np.sqrt(ecutwfc)) * 1.01)
@@ -327,6 +330,8 @@ def main():
     parser.add_argument("--pseudo_dir", default=None)
     parser.add_argument("--nk", type=int, nargs=3, default=[4, 4, 4])
     parser.add_argument("--nosym", action="store_true")
+    # No --soc flag: the .save route always carries QE's <spinorbit>, and
+    # build_vnl_setup honors it automatically (psp.vnl_ops.resolve_soc_mode).
     parser.add_argument("--n-moments", type=int, default=300)
     parser.add_argument("--n-random", type=int, default=3)
     parser.add_argument("--buffer", type=float, default=0.10)

@@ -1,14 +1,7 @@
 """Standalone, falsifiably — the quarantine this service exists to have.
 
-``symmetry_maps`` absorbed three modules that between them used to reach
-``file_io`` (a dead ``from file_io import WfnLoader``, the only real cycle
-with the loader) and ``psp`` (``density_symmetry_check``'s valence-density
-quadrature).  Both edges are gone by construction rather than by discipline:
-the dead import was DELETED in the extraction commit (design decision 12)
-and the quadrature is INJECTED (``valence_density_fn`` /
-``spin_degeneracy_fn``, WAVE1_BRIEF ruling 4) with a ``None`` default that
-does the same lazy ``psp.get_DFT_mtxels`` import the module always did, on
-the one call path that has a loader in hand.
+``symmetry_maps`` imports neither ``file_io`` nor ``psp``. The 2c reference
+check receives a loader object and works directly on raw coefficient slabs.
 
 "By construction" is a claim, and the only way to observe it is a process
 where lorrax is ABSENT.  :func:`lxkit.testing.import_isolation` builds one:
@@ -66,12 +59,9 @@ def _lorrax_roots() -> tuple[str, ...]:
 
     NAMESPACE PACKAGES COUNT.  ``src/psp/`` has NO ``__init__.py`` — it is
     an implicit namespace package — and a roots list filtered on
-    ``__init__.py`` (which is how ``services/distrib_la``'s copy of this
-    helper is written) drops it silently.  psp is ruling 4's whole subject:
-    the quadrature injection exists so ``density_symmetry_check`` does not
-    import it at module scope, and a quarantine test that never named the
-    package it is quarantining would be the tautology this suite is full of
-    cells against.  Any directory holding a ``.py`` is a root here.
+    ``__init__.py`` drops it silently.  The 2c check has no psp dependency,
+    and this test must name psp for that assertion to mean anything. Any
+    directory holding a ``.py`` is a root here.
     """
     if os.path.isdir(_LORRAX_SRC):
         found = []
@@ -136,16 +126,8 @@ def test_the_three_absorbed_modules_all_import_clean():
     assert run.loaded == ()
 
 
-def test_the_injected_quadrature_keeps_psp_out_of_the_import_graph():
-    """WAVE1_BRIEF ruling 4, observed rather than described.
-
-    ``check_density_symmetries`` grew keyword-only ``valence_density_fn`` /
-    ``spin_degeneracy_fn`` whose ``None`` default preserves the lazy
-    ``psp.get_DFT_mtxels`` import verbatim.  The claim is that BINDING the
-    function — reading its signature, which is what a caller wiring the
-    injection does — costs no psp import.  Asserted in the isolated child,
-    where a psp import would be an ``ImportError`` and not a silent success.
-    """
+def test_compatibility_signature_keeps_psp_out_of_the_import_graph():
+    """Binding the compatibility API imports no LORRAX physics package."""
     _needs_jax()
     run = import_isolation(
         "symmetry_maps", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
@@ -155,8 +137,12 @@ def test_the_injected_quadrature_keeps_psp_out_of_the_import_graph():
                  "p = inspect.signature(S.check_density_symmetries).parameters\n"
                  "assert 'valence_density_fn' in p, sorted(p)\n"
                  "assert 'spin_degeneracy_fn' in p, sorted(p)\n"
+                 "assert 'spin_density_fields_fn' in p, sorted(p)\n"
                  "assert p['valence_density_fn'].default is None\n"
+                 "assert p['spin_density_fields_fn'].default is None\n"
                  "assert p['valence_density_fn'].kind is "
+                 "inspect.Parameter.KEYWORD_ONLY\n"
+                 "assert p['spin_density_fields_fn'].kind is "
                  "inspect.Parameter.KEYWORD_ONLY\n")
     assert run.loaded == ()
 
@@ -225,8 +211,8 @@ def test_symmetry_maps_still_imports_clean_with_lorrax_on_the_path():
     # has to be checked — a psp dropped from the list would make every cell
     # in this file green about a package nobody was watching.
     assert "psp" in _lorrax_roots(), (
-        "psp is not in the forbidden roots; ruling 4's quadrature injection "
-        "would be unwatched because src/psp has no __init__.py")
+        "psp is not in the forbidden roots, so its absence from the 2c "
+        "reference check would be unwatched")
 
 
 # ---------------------------------------------------------------------------

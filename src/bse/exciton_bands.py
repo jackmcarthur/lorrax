@@ -1737,7 +1737,8 @@ def main(argv=None):
      enk_sigma) = ht.initialize_wfns(
          args.input, params, log, mesh_xy=mesh_xy,
          centroid_subset_idx=_fit_subset, wfn_sym=(wfn, sym),
-         rank_record_fn=_path_rank_records.append)
+         rank_record_fn=_path_rank_records.append,
+         distrib_la_batched_route=args.distrib_la_batched_route)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     if enk_qp_full is not None:
         # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:

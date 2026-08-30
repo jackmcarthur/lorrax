@@ -61,7 +61,9 @@ a real deck — two arms that hashed the same would silently share a
 compiled program, which is the hazard
 ``tests/test_dipole_vnl_velocity_sign.py`` gates synthetically.
 
-Env: MTX_DECK (input file), MTX_NB.
+Env: MTX_DECK (input file), MTX_NB, and optional MTX_PSEUDO_DIR (defaults
+to the deck directory, useful when a read-only WFN fixture shares another
+fixture's identical species pseudopotentials).
 """
 import os
 import sys
@@ -74,6 +76,7 @@ RUNTIME = initialize_communicator_stack()
 import numpy as np                                            # noqa: E402
 import jax                                                    # noqa: E402
 import jax.numpy as jnp                                       # noqa: E402
+from jax.sharding import PartitionSpec as P                   # noqa: E402
 
 from common import Meta                                       # noqa: E402
 from common.collectives import (process_count, process_rank,   # noqa: E402
@@ -175,9 +178,10 @@ def main():
        f"nk={nk} nb={nb} ns={int(wfn.nspinor)} grid={grid} "
        f"nelec={int(wfn.nelec)} bispinor={bispinor}")
 
-    pseudos = load_pseudopotentials(deck_dir)
+    pseudo_dir = os.environ.get("MTX_PSEUDO_DIR", deck_dir)
+    pseudos = load_pseudopotentials(pseudo_dir)
     if not pseudos:
-        raise SystemExit(f"no .upf in {deck_dir}")
+        raise SystemExit(f"no .upf in {pseudo_dir}")
 
     # ---- k-independent potentials, exactly as the drivers build them -----
     assignments = build_atom_pp_assignments(
@@ -390,6 +394,17 @@ def main():
         print_fn=p0)
     worst.append(host_vs_reference(vh_e2e, vh_ref,
                                    "compute_hartree_matrix e2e", p0))
+    vh_e2e_sharded = compute_hartree_matrix(
+        wfn, sym, meta, truncation_2d=truncation_2d, nb=nb, mesh=mesh,
+        print_fn=p0, return_sharded=True)
+    worst.append(shard_vs_reference(
+        vh_e2e_sharded, vh_ref, "compute_hartree_matrix device e2e", p0))
+    expected_spec = P(None, "x", "y")
+    spec_ok = vh_e2e_sharded.sharding.spec == expected_spec
+    p0(f"[mtxel] {'device e2e output layout':<38} "
+       f"{vh_e2e_sharded.sharding.spec!s:<20} "
+       f"{'PASS' if spec_ok else f'FAIL want {expected_spec}'}")
+    worst.append(0.0 if spec_ok else 1.0)
 
     print(f"[mtxel] rank={rank:03d} VmHWM local {hwm_local:.3f} GiB, "
           f"after sweep {hwm_sweep:.3f} GiB", flush=True)

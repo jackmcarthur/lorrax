@@ -188,7 +188,7 @@ def fit_zeta_to_h5(
     psi_rmuT_X: jax.Array | None,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
-    bispinor: bool = True,
+    bispinor: bool = False,
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
@@ -264,7 +264,12 @@ def fit_zeta_to_h5(
                     entry below).
         band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
         q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
-        bispinor: Whether to use bispinor wavefunctions
+        bispinor: Whether to use bispinor wavefunctions.  Default False —
+                    the SCALAR/spinor charge-channel fit; every production
+                    caller passes ``cfg.bispinor`` explicitly (gw_init), so
+                    the default only decides what a forgetful new caller
+                    gets, and the four-ζ bispinor pipeline is the wrong
+                    thing to get by accident.
         band_range_left: (start, end) for left wfns. Default: (b0, b3)
         band_range_right: (start, end) for right wfns. Default: (b0, b4)
         low_mem_bands: When True (``low_mem_bands`` deck key), the CCT Gram

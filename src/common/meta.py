@@ -128,6 +128,18 @@ class Meta:
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
         n_proc = jax.process_count()
         b_id_0 = 0
+        # Deck guard: nval counts occupied BANDS, and a spin-restricted
+        # scalar WFN (nspinor=1) holds HALF as many of those as the
+        # nspinor=2 deck it was ported from (2 electrons per band) — the
+        # unhalved nval lands here as a negative b_id_1 and silent nonsense
+        # downstream.
+        if int(nval) > int(wfn.nelec):
+            raise ValueError(
+                f"Meta.from_system: nval={int(nval)} valence bands requested "
+                f"but the WFN holds only nelec={int(wfn.nelec)} occupied "
+                f"bands.  If this deck was ported from an nspinor=2 run to a "
+                f"scalar (nspinor=1) WFN, halve its band counts: each scalar "
+                f"band holds two electrons.  Fix: nval <= {int(wfn.nelec)}.")
         b_id_1 = int(wfn.nelec - nval)
         # TODO(metal-band-windows): ``wfn.nelec=max(ifmax)`` is only the
         # highest partially occupied band boundary.  Replace this single b2

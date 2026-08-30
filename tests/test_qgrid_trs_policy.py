@@ -1,10 +1,10 @@
-"""The q-axis time-reversal policy — MEASURED, never assumed.
+"""The q-axis time-reversal policy — explicit, never inferred here.
 
 WHAT IS BEING PINNED.  ``symmetry_maps.qgrid_trs`` owns every decision the
 IBZ→full-BZ q unfold takes about time reversal, and
 ``gw.qgrid_symmetry.qgrid_trs_policy_for`` is the one door that supplies
-it with the MEASURED verdict (``SymMaps.trs_allowed``, from
-``density_symmetry_check``'s spin-resolved density) plus rank 0 and the
+it with the verdict (``SymMaps.trs_allowed``; automatically checked for a
+2c DFT reference) plus rank 0 and the
 once-per-run announcement.  Bare ``V_q``, RPA ``W_q`` and ladder ``W_q``
 all consume the same object.
 
@@ -355,9 +355,10 @@ def test_magnetic_soc_deck_runs_on_the_same_evidence_as_a_magnetic_scalar():
     """A ferromagnet WITH spin-orbit is a TRS-broken deck like any other.
 
     The historical trap is to reason "nspinor=2, therefore Kramers,
-    therefore time reversal".  ``density_symmetry_check`` measures the
-    magnetization density and returns BROKEN for a magnetic SOC deck; the
-    policy must consume that verdict and not the spinor count.
+    therefore time reversal". The 2c reference check returns BROKEN for a
+    magnetic SOC deck; the policy must consume that verdict and not infer
+    one from the spinor count. Scalar cases below exercise policy algebra
+    with an explicit verdict; they are not automatic reference checks.
     """
     grid, irr, sym, reps = _cri3_shaped_tables()
     policy = build_qgrid_trs_policy(

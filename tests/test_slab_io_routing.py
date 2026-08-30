@@ -20,7 +20,7 @@ else.  What remains, and is still worth pinning:
 3. The MPI launcher/singleton probes, which moved from ``gw.gw_config``
    (L1) down to ``file_io._slab_io_ffi`` (L3) with the availability
    check.  That move also deleted an uphill L3 -> L1 import.
-4. ``normalize_w_dyson_solver`` and ``hartree_source`` — unrelated
+4. ``normalize_w_dyson_solver`` and removed-input refusals — unrelated
    parse-time vocabulary that has always lived in this file.
 
 Style follows tests/test_qp_solver_config.py: throwaway input files, no
@@ -352,17 +352,13 @@ def test_deck_level_lstsq_raises_at_parse(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# hartree_source — validated at parse time
+# hartree_source — removed and refused at parse time
 # ---------------------------------------------------------------------------
 
-def test_hartree_source_invalid_rejected(tmp_path):
-    with pytest.raises(ValueError, match="hartree_source"):
-        _config(tmp_path, "hartree_source = bogus\n")
-
-
-def test_hartree_source_valid_accepted(tmp_path):
-    cfg = _config(tmp_path, "hartree_source = stored\n")
-    assert cfg.hartree_source == "stored"
+@pytest.mark.parametrize("value", ["auto", "stored", "isdf", "gspace", "bogus"])
+def test_removed_hartree_source_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match="hartree_source.*removed"):
+        _config(tmp_path, f"hartree_source = {value}\n")
 
 
 # ---------------------------------------------------------------------------

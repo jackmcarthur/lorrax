@@ -131,9 +131,14 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
     import h5py
 
     from file_io.sigma_output import (
+        EQP_ASSEMBLY_EXPECTED_DATASET,
+        EQP_ASSEMBLY_SCHEMA_VERSION,
+        SIGMA_OPERATOR_STATE_ATTR,
+        SIGMA_OPERATOR_STATE_RAW,
+        SIGMA_OPERATOR_STATE_VERSION,
+        SIGMA_OPERATOR_STATE_VERSION_ATTR,
         append_eqp_assembly_receipt_h5,
         read_eqp_assembly_receipt,
-        read_sigma_eqp_diagonal_window,
     )
     from gw.eqp_bgw import assemble_eqp
 
@@ -141,8 +146,14 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
     omega = np.array([-1.0, 0.0, 1.0])
     with h5py.File(path, "w") as h5:
         h5.create_dataset("omega_ev", data=omega)
-        h5.create_dataset(
+        ds = h5.create_dataset(
             "sigma_c_kij_ev", data=np.zeros((omega.size, 1, 2, 2)))
+        ds.attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+        ds.attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = (
+            SIGMA_OPERATOR_STATE_VERSION)
+        h5.create_dataset(
+            EQP_ASSEMBLY_EXPECTED_DATASET,
+            data=np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, np.int32))
     assembly = assemble_eqp(
         kpoints_irr_frac=np.zeros((1, 3)),
         band_offset=0,
@@ -153,17 +164,12 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
         sigma_c_omega_diag_ev=np.zeros((omega.size, 1, 2)),
         omega_rel_ev=omega,
         e_dft_rel_ev=np.zeros((1, 2)),
-        hartree_source="stored",
-        hartree_already_resolved=True,
         mean_field_gate=False,
         print_fn=lambda *_: None,
     )
 
     token = HO.note_open(path, HO.STACK_FFI, "a", where="test: live SlabIO")
     try:
-        with pytest.raises(RuntimeError, match="one-owner-per-file"):
-            read_sigma_eqp_diagonal_window(
-                path, full_bz_rows=np.array([0]), band_start=0, band_stop=2)
         with pytest.raises(RuntimeError, match="one-owner-per-file"):
             append_eqp_assembly_receipt_h5(
                 path,

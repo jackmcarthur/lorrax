@@ -39,7 +39,7 @@ lx test                                       # the default gate, on a compute n
 lx test --census                              # the full census (see docs/contributing.md)
 lx status                                     # who is running where
 lx doctor                                     # verify site, module, helpers
-lx shell -G 4                                 # interactive pty on a compute node
+lx shell                                      # one-task, one-GPU interactive pty
 lx alloc -N 4 --time 04:00:00                 # allocate deliberately (idempotent)
 lx release                                    # cancel only what lx created
 ```
@@ -49,6 +49,18 @@ allocation is 4 nodes / 4 h. Ask for `-G 4` when you want a whole node,
 `-N n` for multiple nodes, `--cpu` for the Milan CPU partition. `--dry-run`
 prints the `srun` line and exits — the fastest way to see what your step will
 actually inherit.
+
+### Required GPU task geometry
+
+Use one task/rank per GPU. Keep `lx`'s default rank count or set it explicitly:
+
+```bash
+lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in
+```
+
+`-N 1 -G 4 -n 1` violates the process/collective contract and is not P=4
+evidence. `lx shell` is one task/one GPU. Report GPU count, rank count, and
+runtime mesh.
 
 > ### `lx` runs the checkout its *base module* names, not the one you are standing in
 >
@@ -198,7 +210,7 @@ equivalent exists for these two knobs.
 `SLURM_NTASKS > 1` auto-triggers `jax.distributed.initialize()` (via
 `runtime.initialize_communicator_stack()`; a sentinel guards re-import).
 Expected in-job topology: `jax.local_devices()` = `[cuda:0]` per rank,
-`len(jax.devices())` = ranks × nodes.
+`len(jax.devices())` = total ranks = nodes × GPUs per node.
 
 ## 4. Generic-cluster porting
 

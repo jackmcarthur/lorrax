@@ -11,7 +11,7 @@ the ψ-unfold antiunitary rule
 :func:`tau_phase_row`), the real-space orbit machinery the ISDF
 quadrature is built on (:func:`real_space_action_tables`,
 :func:`centroid_source_map_and_wrap`, …), and
-the TRS *measurement* (:func:`check_density_symmetries`) that decides
+the 2c DFT-reference check (:func:`check_spinor_reference_trs`) that decides
 whether the flags in the file may be believed at all.
 
 THE PACKAGE IS THE DOOR.  There is no separate facade module: everything a
@@ -43,13 +43,10 @@ because a symmetry moves r and does not move bands.  The two are not
 variants of each other; the argument is written out above
 :func:`star_select` in :mod:`symmetry_maps.maps`.
 
-TIME REVERSAL IS A MEASUREMENT HERE, NOT A CONVENTION.
-:func:`check_density_symmetries` builds ρ from the raw IBZ coefficients
-and asks whether ``w_k m_k + w_{−k} m_{−k}`` vanishes; the verdict lands
-on the loader as ``trs_holds`` and :class:`SymMaps` refuses to select
-time-reversal rows when the density says TRS is broken, whatever the
-flags in the file claim.  That is why the check is in this package and
-not beside it: the thing it protects is the unfold.
+TIME REVERSAL IS CHECKED, NOT INFERRED.  The 2c check compares occupied
+density operators using raw partners, spatial-only partners, or TRIM
+closure.  It excludes antiunitary-generated partners.  Its verdict lands
+on the loader as ``trs_holds`` and gates antiunitary rows in :class:`SymMaps`.
 
 The surface
 -----------
@@ -187,6 +184,8 @@ from symmetry_maps.density_symmetry_check import (
     DensitySymmetryReport,
     cached_density_symmetry_check,
     check_density_symmetries,
+    check_spinor_reference_trs,
+    occupation_operator_residual,
     trs_check_mode,
 )
 from symmetry_maps.directed_edges import (
@@ -196,11 +195,14 @@ from symmetry_maps.directed_edges import (
 )
 from symmetry_maps.maps import (
     KStarMap,
+    SpatialOperatorTables,
     SymMaps,
     bgw_integer_q_to_fractional,
     bgw_signed_q_representative,
     common_uniform_grid_indices,
     find_irreducible_bz_points,
+    build_spatial_operator_tables,
+    map_full_kpoints_to_irreducible,
     kgrid_shift_map,
     q_negation_index,
     slice_q_full_to_ibz,
@@ -282,11 +284,13 @@ from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
     # tables
-    "SymMaps", "kgrid_shift_map", "bgw_integer_q_to_fractional",
+    "SymMaps", "SpatialOperatorTables", "build_spatial_operator_tables",
+    "kgrid_shift_map", "bgw_integer_q_to_fractional",
     "bgw_signed_q_representative",
     "q_negation_index",
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
+    "map_full_kpoints_to_irreducible",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # directed band-matrix edges: pure table + the one symmetry action
@@ -332,9 +336,11 @@ __all__ = [
     # past-the-door edge and ``tests/test_layering.py`` rule 6 counts it.
     "QIRR_VERSION_ATTR", "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
     "qirr_generator_commit", "validate_qirr_tables",
-    # the TRS measurement
+    # the 2c TRS reference check
     "DensitySymmetryReport", "check_density_symmetries",
-    "cached_density_symmetry_check", "trs_check_mode",
+    "check_spinor_reference_trs",
+    "cached_density_symmetry_check", "occupation_operator_residual",
+    "trs_check_mode",
     # the q-axis TRS POLICY that consumes that measurement, and the
     # covariance statistic the unfold's own contract rests on
     "QgridTrsPolicy", "build_qgrid_trs_policy",

@@ -195,7 +195,8 @@ THE DESIGN (workstream AH): SNAPSHOT AGREEMENT OVER A SHARED DIRECTORY
    however make the write ATOMIC (temp file + ``os.replace``) so a
    concurrently-running job can never observe a torn entry.
 
-4. **JAX's auto-enabled XLA sub-caches are turned OFF at P > 1.**  When the
+4. **JAX's auto-enabled XLA sub-caches are turned OFF at P > 1, and whenever
+   the LORRAX persistent cache is explicitly off.**  When the
    persistent cache is on, ``jax/_src/compiler.py::get_compile_options``
    also points XLA at ``{cache_dir}/xla_gpu_per_fusion_autotune_cache_dir``
    with ``AutotuneCacheMode.UPDATE`` on process 0 and ``READ`` on the peers.
@@ -1602,6 +1603,12 @@ def ensure_jax_compile_cache() -> None:
                  f"read that as a cache hit.")
 
     cache_dir, cache_source = _resolve_cache_base_dir()
+    if n_proc > 1 or not cache_dir:
+        # This setting belongs before every early return below.  Otherwise an
+        # explicit cache opt-out leaves JAX's process-0 UPDATE / peer READ
+        # per-fusion cache active but gives it no real base directory.  Rank 0
+        # then fails alone while its peers continue towards a collective.
+        _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
     if not cache_dir:  # only the explicit empty/whitespace opt-out reaches here
         if proc_idx == 0:
             _say(f"persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" "
@@ -1659,6 +1666,9 @@ def ensure_jax_compile_cache() -> None:
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
             # desynchronises AutotunerPass' modulo-P work split.
             _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
+        # Cache-miss explanations are opt-in via JAX_EXPLAIN_CACHE_MISSES=1
+        # only; LORRAX_DEBUG_PRINT deliberately does NOT imply them (the
+        # coupling produced 56.6% log spam — io-overhead audit 2026-08-30).
     except Exception as exc:
         if proc_idx == 0:
             _say(f"DISABLED: jax.config.update failed ({exc}).")

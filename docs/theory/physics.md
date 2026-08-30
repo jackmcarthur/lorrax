@@ -202,12 +202,11 @@ mini-BZ-averaged meanings are separated in
 
 ## 7. Quasiparticle Hamiltonian
 
-The stored one-body reference is \(H_{\mathrm{DFT}}-V_{xc}\), so the
-quasiparticle Hamiltonian is assembled once as
+The stored one-body operator is kinetic plus ionic; the
+[direct field](hartree.md) is live:
 
 $$
-H_{\mathrm{QP}}
-=(H_{\mathrm{DFT}}-V_{xc})+V_H+\Sigma_{xc}.
+H_{\mathrm{QP}}=(T+V_{\mathrm{ion}})+H_{\mathrm{dir}}+\Sigma_{xc}.
 $$
 
 A dynamic self-energy is first interpolated on its real-frequency grid. The

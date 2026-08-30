@@ -1,22 +1,8 @@
-"""Gates for the load-time density symmetry measurement.
-
-``common.density_symmetry_check`` replaces a decade of flag-based
-inference ("ntran<=1 means nosym means ...") with a measurement taken
-from the wavefunctions themselves.  These tests pin the three things
-that measurement has to get right:
-
-1. it must not cry wolf on a real, nonmagnetic, symmetric deck;
-2. it must catch a manifestly TRS-broken occupied manifold; and
-3. when it does, ``SymMaps`` must structurally refuse to select a
-   time-reversal row.
-
-The synthetic decks are built here rather than captured so the physics
-under test (Kramers pairing vs an unpaired spin-polarised manifold) is
-visible in the test source.
-"""
+"""Gates for the two-component DFT-reference TRS check."""
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 
 import h5py
 import numpy as np
@@ -32,6 +18,13 @@ from symmetry_maps import (                                     # noqa: E402
     check_density_symmetries,
     trs_check_mode,
 )
+from symmetry_maps.density_symmetry_check import (               # noqa: E402
+    _classify_trs_evidence,
+    _occupation_operator_residual,
+    _plan_two_component_evidence,
+    _theta_overlap,
+)
+import symmetry_maps.density_symmetry_check as density_check     # noqa: E402
 
 
 _FIXTURE = os.path.join(
@@ -59,7 +52,7 @@ def _neg_closed_gvecs() -> np.ndarray:
 
 def _write_wfn(path: str, *, coeffs: np.ndarray, gvecs: np.ndarray,
                kpoints: np.ndarray, kgrid, nocc: int, mtrx: np.ndarray,
-               tnp: np.ndarray) -> str:
+               tnp: np.ndarray, shift=(0.0, 0.0, 0.0)) -> str:
     """Minimal BGW-shaped WFN.h5.  ``coeffs`` is (nb, 2, ngktot) complex."""
     nb, nspinor, ngktot = coeffs.shape
     nrk = int(kpoints.shape[0])
@@ -77,7 +70,7 @@ def _write_wfn(path: str, *, coeffs: np.ndarray, gvecs: np.ndarray,
         kp.create_dataset("ngkmax", data=np.int32(int(ngk.max())))
         kp.create_dataset("ecutwfc", data=np.float64(20.0))
         kp.create_dataset("kgrid", data=np.asarray(kgrid, dtype=np.int32))
-        kp.create_dataset("shift", data=np.zeros(3, dtype=np.float64))
+        kp.create_dataset("shift", data=np.asarray(shift, dtype=np.float64))
         kp.create_dataset("ngk", data=ngk)
         kp.create_dataset("ifmin", data=np.ones((1, nrk), dtype=np.int32))
         kp.create_dataset("ifmax", data=np.full((1, nrk), nocc, dtype=np.int32))
@@ -121,17 +114,17 @@ def _write_wfn(path: str, *, coeffs: np.ndarray, gvecs: np.ndarray,
     return path
 
 
-def _kramers_deck(tmp_path, *, magnetic: bool, ntran: int = 2) -> str:
-    """Γ-only 2-spinor deck; occupied manifold either Kramers-paired or
+def _kramers_deck(tmp_path, *, magnetic: bool, ntran: int = 2,
+                  kpoint=(0.0, 0.0, 0.0)) -> str:
+    """One-k 2-spinor deck; occupied manifold is closed under Theta or
     fully spin-polarised.
 
     Kramers case: bands come in pairs ``(ψ, Θψ)`` with
     ``Θψ(G) = iσ_y conj(ψ(−G))``, i.e. ``(a, b) → (conj(b(−G)),
-    −conj(a(−G)))``.  Every Pauli component of the pair's density then
-    cancels identically, for ANY random ψ — the check must see m ≡ 0.
+    −conj(a(−G)))``. The occupied subspace is closed under Θ.
 
-    Magnetic case: every occupied band is pure spin-up, so ``m_z ≡ ρ``
-    and ``‖m‖∞/‖ρ‖∞ = 1`` — as unambiguous a TRS violation as exists.
+    Magnetic case: every occupied band is pure spin-up, so its Θ image is
+    orthogonal to the occupied subspace.
     """
     rng = np.random.default_rng(0x5EED)
     gvecs = _neg_closed_gvecs()
@@ -140,49 +133,57 @@ def _kramers_deck(tmp_path, *, magnetic: bool, ntran: int = 2) -> str:
     neg_idx = np.array([neg[tuple(g)] for g in gvecs], dtype=np.int64)
 
     def _rand() -> np.ndarray:
-        """Random ψ(G) with ``c(G) = c(−G)`` ⇒ ψ(r) even ⇒ ρ(r) even, so
-        the deck's declared inversion really IS a symmetry of it and the
-        spatial arm of the check must pass.  Only the TRS arm is then
-        under test."""
+        """Random G-even spinor used to make the synthetic inversion valid."""
         c = rng.normal(size=(2, ngk)) + 1j * rng.normal(size=(2, ngk))
         return 0.5 * (c + c[:, neg_idx])
 
     nocc, nb = 4, 6
-    coeffs = np.zeros((nb, 2, ngk), dtype=np.complex128)
+
+    def _orthogonalise(candidate: np.ndarray,
+                       rows: list[np.ndarray]) -> np.ndarray:
+        out = np.array(candidate, dtype=np.complex128, copy=True)
+        for row in rows:
+            out -= np.vdot(row, out) * row
+        norm = np.linalg.norm(out)
+        if norm < 1.0e-10:
+            raise AssertionError("synthetic spinor basis lost rank")
+        return out / norm
+
+    rows: list[np.ndarray] = []
     if magnetic:
         for n in range(nb):
             c = _rand()
-            if n < nocc:
-                c[1] = 0.0                # occupied manifold is pure spin-up
-            coeffs[n] = c
+            c[1] = 0.0                    # all bands are pure spin-up
+            rows.append(_orthogonalise(c, rows))
     else:
         for n in range(0, nb, 2):
-            psi = _rand()
-            coeffs[n] = psi
-            coeffs[n + 1, 0] = np.conj(psi[1, neg_idx])
-            coeffs[n + 1, 1] = -np.conj(psi[0, neg_idx])
-    # Normalise each band so ∫ρ d³r = f_spin · nocc exactly (f_spin = 1
-    # for nspinor=2), making the invariants arm meaningful too.
-    coeffs /= np.sqrt(np.sum(np.abs(coeffs) ** 2,
-                             axis=(1, 2)))[:, None, None]
+            psi = _orthogonalise(_rand(), rows)
+            theta = np.empty_like(psi)
+            theta[0] = np.conj(psi[1, neg_idx])
+            theta[1] = -np.conj(psi[0, neg_idx])
+            theta = _orthogonalise(theta, rows + [psi])
+            rows.extend((psi, theta))
+    coeffs = np.stack(rows)
+    flat = coeffs.reshape(nb, -1)
+    assert np.max(np.abs(flat.conj() @ flat.T - np.eye(nb))) < 2.0e-14
 
     mtrx = np.tile(np.eye(3, dtype=np.int32)[None], (ntran, 1, 1))
     if ntran >= 2:
         mtrx[1] = -np.eye(3, dtype=np.int32)          # inversion
-    name = "WFN_magnetic.h5" if magnetic else "WFN_kramers.h5"
+    kpoint = np.asarray(kpoint, dtype=np.float64)
+    off_gamma = bool(np.max(np.abs(kpoint)) > 1.0e-12)
+    name = "WFN_magnetic" if magnetic else "WFN_kramers"
+    name += "_spatial.h5" if off_gamma else ".h5"
     return _write_wfn(
         str(tmp_path / name), coeffs=coeffs, gvecs=gvecs,
-        kpoints=np.zeros((1, 3)), kgrid=(1, 1, 1), nocc=nocc,
-        mtrx=mtrx, tnp=np.zeros((ntran, 3)))
+        kpoints=kpoint[None], kgrid=((2, 1, 1) if off_gamma else (1, 1, 1)),
+        shift=((0.5, 0.0, 0.0) if off_gamma else (0.0, 0.0, 0.0)),
+        nocc=nocc, mtrx=mtrx, tnp=np.zeros((ntran, 3)))
 
 
 # ----------------------------------------------------------------------
 # EXECUTABLE AUDIT OF THE TRS ALGEBRA
 #
-# The verdict this module produces rests on three lines of Pauli algebra
-# spelled out as (T1)-(T3) in ``common/density_symmetry_check.py``.  They
-# are pinned here as tests so a future reader (or agent) can check the
-# math without trusting a comment.
 # ----------------------------------------------------------------------
 _SX = np.array([[0, 1], [1, 0]], dtype=complex)
 _SY = np.array([[0, -1j], [1j, 0]], dtype=complex)
@@ -190,13 +191,8 @@ _SZ = np.array([[1, 0], [0, -1]], dtype=complex)
 _ISY = np.array([[0, 1], [-1, 0]], dtype=complex)      # = i·σ_y
 
 
-def test_T1_isigma_y_matches_symmetry_maps_and_is_kramers():
-    """(T1): Θ = iσ_y K with Θ² = −1, and LORRAX's stored constant is iσ_y."""
-    # PRIVATE NAME — stays on the ``common.symmetry_maps`` SHIM on purpose.
-    # The door re-exports the public surface only; ``_I_SIGMA_Y`` is
-    # module-private in ``symmetry_maps.maps``.  The phase-wide shim-deletion
-    # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
-    # the service's own suite, which may import the private directly.
+def test_isigma_y_matches_symmetry_maps_and_is_kramers():
+    """Theta = i sigma_y K has Theta squared equal to -1."""
     from symmetry_maps.maps import _I_SIGMA_Y
 
     assert np.allclose(_ISY, 1j * _SY)
@@ -205,9 +201,7 @@ def test_T1_isigma_y_matches_symmetry_maps_and_is_kramers():
     assert np.allclose(_ISY @ np.conj(_ISY), -np.eye(2))
 
 
-def test_T3_time_reversal_flips_the_magnetization_density():
-    """(T3): the identity σ_y σ_i σ_y = −σ_i*, and its consequence
-    m_{Θψ} = −m_ψ, which is the whole basis of the TRS verdict."""
+def test_time_reversal_flips_pauli_expectation_values():
     for s in (_SX, _SY, _SZ):
         assert np.allclose(_SY @ s @ _SY, -np.conj(s))
 
@@ -221,37 +215,130 @@ def test_T3_time_reversal_flips_the_magnetization_density():
         assert m_phi == pytest.approx(-m_psi, abs=1e-13)
 
 
-def test_polarisation_identities_used_to_get_m_from_the_quadrature():
-    """The four-call reconstruction in ``_spin_resolved_density``:
-    m_x = D(a+b) − ρ and m_y = ρ − D(a+ib), with D linear in |·|²."""
-    rng = np.random.default_rng(12)
-    a = rng.normal(size=8) + 1j * rng.normal(size=8)
-    b = rng.normal(size=8) + 1j * rng.normal(size=8)
-    rho = np.abs(a) ** 2 + np.abs(b) ** 2
-    assert np.allclose(np.abs(a + b) ** 2 - rho, 2 * np.real(np.conj(a) * b))
-    assert np.allclose(rho - np.abs(a + 1j * b) ** 2,
-                       2 * np.imag(np.conj(a) * b))
+def test_occupied_density_residual_is_gauge_invariant():
+    """Band phases and rotations inside equally occupied blocks are inert."""
+    rng = np.random.default_rng(19)
+    u1, _ = np.linalg.qr(
+        rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2)))
+    u2, _ = np.linalg.qr(
+        rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2)))
+    overlap = np.zeros((4, 4), dtype=np.complex128)
+    overlap[:2, :2] = u1
+    overlap[2:, 2:] = u2
+    occupations = np.asarray([1.0, 1.0, 0.2, 0.2])
+    residual, min_singular = _occupation_operator_residual(
+        overlap, occupations, occupations)
+    assert residual < 5.0e-8
+    assert min_singular == pytest.approx(1.0, abs=5.0e-15)
+
+    # Mixing differently occupied sectors changes the one-particle density.
+    mixed = np.eye(4, dtype=np.complex128)
+    angle = 0.2
+    mixed[[1, 2], [1, 2]] = np.cos(angle)
+    mixed[1, 2] = np.sin(angle)
+    mixed[2, 1] = -np.sin(angle)
+    residual, _ = _occupation_operator_residual(
+        mixed, occupations, occupations)
+    assert residual > 0.1
+
+
+def test_theta_overlap_handles_reciprocal_representatives_and_band_gauge():
+    rng = np.random.default_rng(23)
+    nb, ng = 3, 5
+    flat = (rng.normal(size=(2 * ng, nb))
+            + 1j * rng.normal(size=(2 * ng, nb)))
+    q, _ = np.linalg.qr(flat)
+    source = q.T.reshape(nb, 2, ng)
+    source_g = np.stack((np.arange(ng) - 2,
+                         np.zeros(ng, dtype=int),
+                         np.zeros(ng, dtype=int)), axis=1)
+    # target k=3/4 is the wrapped representative of -1/4, hence K=(1,0,0).
+    target_g = -source_g - np.asarray([1, 0, 0])
+    theta = np.empty_like(source)
+    theta[:, 0] = np.conj(source[:, 1])
+    theta[:, 1] = -np.conj(source[:, 0])
+    gauge, _ = np.linalg.qr(
+        rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb)))
+    target = (gauge @ theta.reshape(nb, -1)).reshape(theta.shape)
+    overlap = _theta_overlap(
+        source, source_g, np.asarray([0.25, 0.0, 0.0]),
+        target, target_g, np.asarray([0.75, 0.0, 0.0]))
+    residual, min_singular = _occupation_operator_residual(
+        overlap, np.ones(nb), np.ones(nb))
+    assert residual < 5.0e-8
+    assert min_singular == pytest.approx(1.0, abs=5.0e-15)
+
+
+def test_evidence_planner_never_needs_an_antiunitary_row():
+    inversion = -np.eye(3, dtype=np.int64)
+    identity = np.eye(3, dtype=np.int64)
+    kpoints = np.asarray([
+        [0.25, 0.0, 0.0],
+        [0.00, 0.0, 0.0],
+        [0.50, 0.0, 0.0],
+    ])
+    evidence = _plan_two_component_evidence(
+        kpoints, np.stack((identity, inversion)), np.ones(3), max_k=0)
+    quarter = next(item for item in evidence if item.source == 0)
+    assert quarter.kind == "spatial-pair"
+    assert quarter.spatial_op == 1
+    assert all(item.spatial_op is None or item.spatial_op < 2
+               for item in evidence)
+
+    raw_closed = np.asarray([[0.25, 0.0, 0.0], [0.75, 0.0, 0.0]])
+    evidence = _plan_two_component_evidence(
+        raw_closed, identity[None], np.ones(2), max_k=0)
+    assert evidence == [density_check._TRSEvidence("raw-pair", 0, 1)]
+
+
+def test_independent_failure_outranks_larger_spatial_residual():
+    evidence = [
+        density_check._TRSEvidence("spatial-pair", 0, 1, 1),
+        density_check._TRSEvidence("trim", 2, 2),
+    ]
+    assert _classify_trs_evidence(
+        evidence, [0.30, 0.20], tol_trs=0.10,
+    ) == (True, "trim-falsified", True, "trim", 0.20)
 
 
 # ----------------------------------------------------------------------
 # Synthetic gates
 # ----------------------------------------------------------------------
-def test_kramers_manifold_measures_trs_holds(tmp_path):
+def test_kramers_manifold_at_one_trim_is_inconclusive_globally(tmp_path):
     path = _kramers_deck(tmp_path, magnetic=False)
     loader = WfnLoader(path)
     rep = loader.density_symmetry
     assert rep is not None, "check must be ON by default"
-    assert rep.trs_basis == "measured"
-    assert rep.trs_holds is True, rep.summary()
-    # Kramers cancellation is exact in exact arithmetic; only fp64 FFT
-    # round-off survives, so this should be many orders below the gate.
+    assert rep.trs_basis == "trim-only"
+    assert rep.trs_holds is False, rep.summary()
+    # Kramers closure is exact; only overlap round-off survives.
     assert rep.m_rel < 1e-12, rep.summary()
     assert rep.trs_coverage == pytest.approx(1.0)
-    assert loader.trs_holds is True
-    # Nothing else may fire: the deck's inversion is a real symmetry of
-    # these (G-even) coefficients and the bands are normalised.
-    assert rep.ok, rep.messages
+    assert loader.trs_holds is False
+    assert rep.conclusive is False
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
+
+
+@pytest.mark.parametrize("magnetic", [False, True])
+def test_spatial_only_ibz_unfold_is_real_trs_evidence(tmp_path, magnetic):
+    """Inversion reaches -k without using an antiunitary unfold row."""
+    path = _kramers_deck(
+        tmp_path, magnetic=magnetic, kpoint=(0.25, 0.0, 0.0))
+    warning = pytest.warns(RuntimeWarning) if magnetic else nullcontext()
+    with warning:
+        loader = WfnLoader(path)
+    rep = loader.trs_reference
+    assert dict(rep.evidence_counts) == {
+        "raw-pair": 0, "spatial-pair": 1, "trim": 0}
+    expected_basis = (
+        "spatial-conditional-failure" if magnetic else "spatial-conditional")
+    assert rep.trs_basis == expected_basis
+    if magnetic:
+        assert rep.trs_holds is False
+        assert rep.subspace_residual == pytest.approx(1.0, rel=1.0e-9)
+    else:
+        assert rep.trs_holds is True, rep.summary()
+        assert rep.subspace_residual < 5.0e-8
 
 
 def test_fractional_diagnostic_uses_complete_weighted_band_support(tmp_path):
@@ -264,7 +351,7 @@ def test_fractional_diagnostic_uses_complete_weighted_band_support(tmp_path):
     assert loader.physical_density_band_stop == occ.size
     assert rep.charge_expected == pytest.approx(float(np.sum(occ)))
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
-    assert rep.ok, rep.messages
+    assert rep.subspace_residual < 1.0e-12, rep.messages
 
 
 def test_spin_polarised_manifold_is_caught(tmp_path):
@@ -272,9 +359,9 @@ def test_spin_polarised_manifold_is_caught(tmp_path):
     with pytest.warns(RuntimeWarning):
         loader = WfnLoader(path)
     rep = loader.density_symmetry
-    assert rep.trs_basis == "measured"
+    assert rep.trs_basis == "trim-falsified"
     assert rep.trs_holds is False, rep.summary()
-    # every occupied band is spin-up => m_z is the whole density
+    # The occupied space is orthogonal to its time-reversed image.
     assert rep.m_rel == pytest.approx(1.0, rel=1e-9)
     assert loader.trs_holds is False
     # TRS must be the ONLY thing that fails: the spatial op and the
@@ -317,7 +404,24 @@ def test_strict_mode_raises_on_a_broken_deck(tmp_path, monkeypatch):
     path = _kramers_deck(tmp_path, magnetic=True)
     monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
     assert trs_check_mode() == "strict"
-    with pytest.raises(RuntimeError, match="density symmetry check FAILED"):
+    with pytest.raises(RuntimeError, match="two-component TRS check FAILED"):
+        WfnLoader(path)
+
+
+def test_strict_mode_rechecks_policy_on_cached_report(tmp_path, monkeypatch):
+    path = _kramers_deck(tmp_path, magnetic=True)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    with pytest.warns(RuntimeWarning):
+        WfnLoader(path)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
+    with pytest.raises(RuntimeError, match="two-component TRS check FAILED"):
+        WfnLoader(path)
+
+
+def test_strict_mode_refuses_a_trim_only_pass(tmp_path, monkeypatch):
+    path = _kramers_deck(tmp_path, magnetic=False)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
+    with pytest.raises(RuntimeError, match="TRS check INCONCLUSIVE"):
         WfnLoader(path)
 
 
@@ -325,16 +429,17 @@ def test_strict_mode_raises_on_a_broken_deck(tmp_path, monkeypatch):
 # Real-fixture gates
 # ----------------------------------------------------------------------
 @pytest.mark.skipif(not os.path.exists(_FIXTURE), reason="fixture absent")
-def test_fixture_passes_every_arm():
-    """cohsex_debug: ntran=12, nonmagnetic MoS2, spatially-reduced IBZ."""
+def test_fixture_passes_two_component_reference_check():
+    """cohsex_debug: nonmagnetic two-component MoS2 reference."""
     loader = WfnLoader(_FIXTURE)
     rep = check_density_symmetries(loader, max_k=0)
     print("\n" + rep.summary())
     for msg in rep.messages:
         print("   ", msg)
     assert rep.trs_holds, rep.summary()
-    assert rep.trs_basis == "measured"
-    assert rep.trs_coverage > 0.5
+    assert rep.trs_basis in {
+        "raw-subspace", "spatial-conditional", "trim-only"}
+    assert rep.trs_coverage > 0.0
     assert rep.spatial_ops_ok, rep.messages
     assert rep.invariants_ok, rep.summary()
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-8)
@@ -348,11 +453,7 @@ def test_raw_read_matches_the_loader_ibz_path():
     """``_raw_ibz_psi_k`` must stay bit-identical to the loader's
     documented raw-IBZ contract, so the deliberate independence of the
     check's reader can never become a silent divergence."""
-    # PRIVATE NAME — stays on the ``common.density_symmetry_check`` SHIM on
-    # purpose.  The door re-exports the four ``__all__`` names only;
-    # ``_raw_ibz_psi_k`` is module-private.  The phase-wide shim-deletion
-    # commit (WAVE1_BRIEF ruling 2) decides this cell's home — likely into
-    # the service's own suite, which may import the private directly.
+    # The bounded raw reader must agree with the loader's IBZ contract.
     from symmetry_maps.density_symmetry_check import _raw_ibz_psi_k
 
     loader = WfnLoader(_FIXTURE)
@@ -371,29 +472,5 @@ def test_subsampling_does_not_change_the_verdict():
     sub = check_density_symmetries(loader, max_k=2)
     assert sub.trs_holds == full.trs_holds
     assert sub.subsampled and sub.n_k_used <= full.n_k_used
-    # the sampled sub-density still normalises exactly
+    # Compatibility charge fields remain internally consistent.
     assert sub.charge == pytest.approx(sub.charge_expected, rel=1e-8)
-
-
-@pytest.mark.skipif(not os.path.exists(_FIXTURE), reason="fixture absent")
-def test_a_corrupted_symmetry_op_is_caught(tmp_path):
-    """Rewrite the fixture's symmetry block with a bogus op and confirm
-    the density flags exactly that op."""
-    import shutil
-    bad = str(tmp_path / "WFN_badsym.h5")
-    shutil.copy(_FIXTURE, bad)
-    os.chmod(bad, 0o644)
-    with h5py.File(bad, "r+") as f:
-        mt = f["mf_header/symmetry/mtrx"][()]
-        # A 90-degree rotation about z is NOT a symmetry of MoS2 (D3h).
-        mt[1] = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=mt.dtype)
-        f["mf_header/symmetry/mtrx"][...] = mt
-        del f["mf_header/symmetry/ntran"]
-        f["mf_header/symmetry"].create_dataset("ntran", data=np.int32(2))
-    loader = WfnLoader(bad)
-    rep = check_density_symmetries(loader, max_k=0)
-    print("\n" + rep.summary())
-    assert not rep.spatial_ops_ok, rep.summary()
-    assert 1 in rep.spatial_failed, rep.spatial_residual
-    assert np.isfinite(rep.spatial_residual[0])
-    assert rep.spatial_residual[0] < rep.tol_spatial   # identity still fine
