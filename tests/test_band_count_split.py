@@ -556,7 +556,7 @@ def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
         assert_restart_window_matches(path, band_slices=same)   # identical
 
         # Sigma moved, chi held: legitimate reuse, no refusal
-        moved_sigma = _slices(b0=0, b1=0, b2=8, b3=20, b4=28,
+        moved_sigma = _slices(b0=0, b1=0, b2=8, b3=16, b4=28,
                               b4_chi=28, b4_sigma=16)
         assert_restart_window_matches(path, band_slices=moved_sigma)
 
