@@ -727,8 +727,9 @@ def measure_delivered_sigma_pole_fields(
     The pole locations and residue masses do not depend on the causal state
     branch. Distributed JAX inputs stay on their device shards while one
     kernel checks every pole and builds a fixed mass/first-moment lattice.
-    The XY mesh sums that 30 KB lattice per pole, then one small payload is
-    copied to the host. NumPy inputs keep a simple host fallback for tests.
+    One tree transfer copies the batch's small tables to the host. The process
+    collective sums only those fixed 30 KB-per-pole tables. NumPy inputs keep
+    a simple host fallback for tests.
 
     Returns
     -------
@@ -835,7 +836,12 @@ def measure_delivered_sigma_pole_batch(
     state_amplitude=None, lattice_bins=DEFAULT_LATTICE_BINS, pole_offset=0,
     mesh_xy=None, pole_field_measure=None,
 ):
-    """Attach one causal branch to a shared compact pole-field measure."""
+    """Attach one causal branch to a shared compact pole-field measure.
+
+    Pole cells and masses do not depend on the state branch. Pass a prior
+    ``pole_field_measure`` to attach another branch without reducing the large
+    pole field again.
+    """
     if pole_split_ry is None:
         pole_split_ry = delivered_product_geometry(
             [branch], regularization_width_ry)["pole_edge_ry"]
