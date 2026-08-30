@@ -37,12 +37,11 @@ import numpy as np
 from common.collectives import (gather_to_host, process_count, process_rank,
                                 psum_replicate)
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.evaluator import damped_rectangle_positive_rule
+from gw.mpa.evaluator import gauss_legendre_interval
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_windows import _SigmaBranch, _SigmaWindow
-from minimax import (ReciprocalMeasureProblem, delivered_error,
-                     fit_damped_reciprocal, rule_amplification,
-                     solve_fixed_time_weights_fast,
+import minimax as _mm
+from minimax import (ReciprocalMeasureProblem, solve_fixed_time_weights_fast,
                      tail_refined_lattice_measure)
 
 
@@ -54,14 +53,24 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
 _PLAN_CACHE_VERSION = 3
 
-# These tolerances generate candidate rules.  Acceptance is based only on the
-# achieved delivered residual and the noise-budget inequality above.
-_FIT_TOLERANCE_LADDER = (
-    1.0e-1, 7.5e-2, 5.0e-2, 3.0e-2, 2.0e-2, 1.0e-2,
-    7.5e-3, 5.0e-3, 3.0e-3, 2.0e-3, 1.0e-3, 7.5e-4,
-    5.0e-4, 3.0e-4, 2.0e-4, 1.0e-4, 7.5e-5, 5.0e-5,
-    3.0e-5, 2.0e-5, 1.0e-5,
-)
+# The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
+# artifact coordinate, not a planner dial; asking for another value cannot
+# select those tables safely.
+_CROSSING_EPS_Q = 1.0e-3
+
+# The one crossing fallback uses one deterministic IRLS call.  Twelve steps
+# with three-step patience and 20% conditioning slack are the frozen-Na
+# settings that keep both crossing windows below their incumbent residuals
+# while leaving the complete six-window fitting stage below three seconds.
+_CROSSING_FIT_ITERATIONS = 12
+_CROSSING_FIT_STALL = 3
+_CROSSING_CONDITIONING_SLACK = 0.2
+
+# The causal integral tail is exp(-gamma_min * t_max).  Reserving 90% of the
+# requested relative target for that tail is the balanced allocation already
+# present in evaluator.damped_rectangle_gauss_rule; it fixes the time interval
+# without a search over tail fractions.
+_CROSSING_TAIL_FRACTION = 0.9
 
 
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
@@ -97,7 +106,10 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
     digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
     digest.update(repr((float(eta), float(target), float(safety),
                         float(factor_cap), int(pair_ceiling), str(grid_mode),
-                        int(lattice_bins), _FIT_TOLERANCE_LADDER)).encode())
+                        int(lattice_bins), _CROSSING_EPS_Q,
+                        _CROSSING_FIT_ITERATIONS, _CROSSING_FIT_STALL,
+                        _CROSSING_CONDITIONING_SLACK,
+                        _CROSSING_TAIL_FRACTION)).encode())
     for spec in specs:
         branch = spec["branch"]
         digest.update(repr((
@@ -161,7 +173,9 @@ def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
                 np.linalg.LinAlgError):
             return None
         if (times.ndim != 1 or weights.shape != times.shape
-                or not times.size or not _rule_accepted(
+                or not times.size or np.any(times == 0.0)
+                or not np.all(np.isfinite(times))
+                or not np.all(np.isfinite(weights)) or not _rule_accepted(
                     metrics, residual_target)
                 or max(factor) > float(factor_cap)):
             return None
@@ -689,9 +703,30 @@ def _window_kind(problem):
 
 
 def _rule_metrics(problem, times, weights):
-    residual, _excluded = delivered_error(problem, times, weights)
-    p99, peak = rule_amplification(times, weights, problem)
-    return float(np.max(residual)), float(p99), float(peak)
+    """Measure residual and amplification from one shared phase matrix."""
+    kept, delivered, _excluded = problem.retained()
+    denominator = problem.denominators
+    phase = np.exp(
+        1.0j * denominator[..., None]
+        * np.asarray(times, np.complex128)[None, None, :])
+    term = phase * np.asarray(weights, np.complex128)[None, None, :]
+    value = np.sum(term, axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        truth = np.where(
+            kept, 1.0 / np.where(kept, denominator, 1.0), 0.0)
+    numerator = (np.where(kept, np.abs(value - truth), 0.0)
+                 @ problem.cell_masses)
+    residual = numerator / delivered
+
+    kappa = (np.sum(np.abs(term), axis=-1)
+             / np.maximum(np.abs(value), 1.0e-300))[kept]
+    mass = np.broadcast_to(
+        problem.cell_masses[None, :], denominator.shape)[kept]
+    order = np.argsort(kappa, kind="stable")
+    cumulative = np.cumsum(mass[order])
+    p99 = kappa[order][
+        np.searchsorted(cumulative, 0.99 * cumulative[-1])]
+    return float(np.max(residual)), float(p99), float(np.max(kappa))
 
 
 def _rule_accepted(metrics, target):
@@ -702,67 +737,224 @@ def _rule_accepted(metrics, target):
         <= AMPLIFICATION_NOISE_SAFETY * float(target))
 
 
-def _fit_sign_definite_at_tolerance(problem, tolerance, max_nodes):
+def _absolute_kernel_target(problem, relative_target):
+    """Convert delivered relative error to a uniform absolute kernel bound.
+
+    If ``|Q(d) - 1/d| <= eps_abs`` on every retained cell, the delivered
+    numerator at frequency ``i`` is at most ``eps_abs * sum(mass)``.  Thus
+    ``relative_target * min(delivered_mass) / sum(mass)`` is a sufficient
+    physical absolute target.  It is used only to select a shipped table;
+    acceptance is always remeasured in the delivered norm.
+    """
+    _kept, delivered_mass, _excluded = problem.retained()
+    total_mass = float(np.sum(problem.cell_masses))
+    target = (float(relative_target) * float(np.min(delivered_mass))
+              / total_mass)
+    if not np.isfinite(target) or target <= 0.0:
+        raise RuntimeError(
+            "delivered product window has no positive absolute error target")
+    return target
+
+
+def _catalog_walk(family, range_value, scaled_target, max_nodes, *,
+                  target_kind=None, eps_q=None):
+    """Return shipped entries in selection order, then tighter/wider order."""
+    entries = []
+    for entry in _mm.catalog().for_family(family):
+        if entry.range_max + 1.0e-12 < float(range_value):
+            continue
+        if entry.error_bound - 1.0e-18 > float(scaled_target):
+            continue
+        if entry.node_count > int(max_nodes):
+            continue
+        if target_kind is not None and entry.target_kind != target_kind:
+            continue
+        if eps_q is not None and (
+                entry.eps_q is None
+                or abs(entry.eps_q - float(eps_q)) > 1.0e-12):
+            continue
+        entries.append(entry)
+    return sorted(entries, key=lambda entry: (
+        entry.range_max, -entry.error_bound, entry.node_count))
+
+
+def _load_catalog_entry(entry, *, family, target, eps_q=None):
+    """Load one exact catalog entry through the minimax service door."""
+    keywords = {} if eps_q is None else {"eps_q": float(eps_q)}
+    return _mm.lookup(
+        family=family, target=target, range_value=entry.range_max,
+        error_bound=entry.error_bound, n_max=entry.node_count, **keywords)
+
+
+def _sign_definite_orientation(problem):
+    """Return positive-real lower-half support and its executor transform."""
     denominator = problem.denominators
     if np.all(denominator.real > 0.0):
         if np.all(denominator.imag <= 0.0):
-            rotated, transform = denominator, "positive_lower"
-        elif np.all(denominator.imag >= 0.0):
-            rotated, transform = np.conj(denominator), "positive_upper"
-        else:
-            raise RuntimeError("sign-definite support crosses the real axis")
+            return denominator, "positive_lower"
+        if np.all(denominator.imag >= 0.0):
+            return np.conj(denominator), "positive_upper"
     elif np.all(denominator.real < 0.0):
         if np.all(denominator.imag >= 0.0):
-            rotated, transform = -denominator, "negative_upper"
-        elif np.all(denominator.imag <= 0.0):
-            rotated, transform = -np.conj(denominator), "negative_lower"
+            return -denominator, "negative_upper"
+        if np.all(denominator.imag <= 0.0):
+            return -np.conj(denominator), "negative_lower"
+    raise RuntimeError(
+        "sign-definite product support crosses an axis and cannot be served")
+
+
+def _sign_definite_table_candidates(problem, relative_target, max_nodes):
+    """Yield rescaled noncrossing tables in conservative walk order."""
+    rotated, transform = _sign_definite_orientation(problem)
+    x_min = float(np.min(rotated.real))
+    x_max = float(np.max(rotated.real))
+    if not 0.0 < x_min <= x_max < np.inf:
+        raise RuntimeError(
+            f"invalid sign-definite support [{x_min:.6g}, {x_max:.6g}] Ry")
+    range_value = x_max / x_min
+    absolute_target = _absolute_kernel_target(problem, relative_target)
+    scaled_target = absolute_target * x_min
+    entries = _catalog_walk(
+        "noncrossing", range_value, scaled_target, max_nodes)
+    if not entries:
+        raise RuntimeError(
+            "no shipped noncrossing table covers "
+            f"R={range_value:.6g}, scaled target={scaled_target:.6g}, "
+            f"and max_nodes={int(max_nodes)}")
+    for entry in entries:
+        served = _load_catalog_entry(
+            entry, family="noncrossing", target="inverse")
+        tau = np.asarray(served.nodes, np.float64) / x_min
+        alpha = np.asarray(served.weights, np.float64) / x_min
+        if transform.startswith("positive"):
+            times, weights = 1.0j * tau, alpha
         else:
-            raise RuntimeError("sign-definite support crosses the real axis")
-    else:
-        raise RuntimeError("sign-definite fitter received a crossing window")
-    gamma = -rotated.imag
-    rectangle = np.asarray([[
-        float(np.min(rotated.real)), float(np.max(rotated.real)),
-        float(np.min(gamma)), float(np.max(gamma)),
-    ]])
-    fit = fit_damped_reciprocal(
-        rectangle, target_error=max(float(tolerance), 1.0e-12),
-        max_rank=min(128, int(max_nodes)), training_points=16,
-        validation_points=80, contour_count=7, lawson_iterations=6)
-    if transform == "positive_lower":
-        times, weights = 1.0j * fit.nodes, fit.weights
-    elif transform == "positive_upper":
-        times, weights = 1.0j * np.conj(fit.nodes), np.conj(fit.weights)
-    elif transform == "negative_upper":
-        times, weights = -1.0j * fit.nodes, -fit.weights
-    else:
-        times, weights = -1.0j * np.conj(fit.nodes), -np.conj(fit.weights)
+            times, weights = -1.0j * tau, -alpha
+        yield np.asarray(times), np.asarray(weights), {
+            "family": "noncrossing",
+            "transform": transform,
+            "requested_range": range_value,
+            "table_range": float(entry.range_max),
+            "requested_scaled_error": scaled_target,
+            "catalog_error_bound_scaled": float(entry.error_bound),
+            "certificate_abs_error_bound": float(entry.error_bound / x_min),
+            "catalog_achieved_abs_error": float(served.max_error / x_min),
+            "candidate_tolerance": float(entry.error_bound),
+            "provenance": served.provenance.one_line(),
+        }
+
+
+def _crossing_geometry(problem, pole_sign):
+    oriented = float(pole_sign) * problem.denominators
+    gamma = oriented.imag
+    if np.any(gamma <= 0.0):
+        raise RuntimeError("oriented crossing support is not eta-damped")
+    gamma_min = float(np.min(gamma))
+    span = float(np.ptp(oriented.real))
+    return oriented, gamma_min, span / gamma_min
+
+
+def _crossing_table_candidates(problem, pole_sign, relative_target,
+                               max_nodes):
+    """Yield HGL table rules whose scaled span and bound cover the support."""
+    _oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
+    absolute_target = _absolute_kernel_target(problem, relative_target)
+    scaled_target = absolute_target * gamma_min
+    entries = _catalog_walk(
+        "crossing", A_dim, scaled_target, max_nodes,
+        target_kind="hgl", eps_q=_CROSSING_EPS_Q)
+    for entry in entries:
+        served = _load_catalog_entry(
+            entry, family="crossing", target="hgl",
+            eps_q=_CROSSING_EPS_Q)
+        times = (float(pole_sign) * np.asarray(served.nodes, np.float64)
+                 / gamma_min)
+        weights = (float(pole_sign) * -1.0j
+                   * np.asarray(served.weights, np.float64) / gamma_min)
+        yield np.asarray(times), np.asarray(weights), {
+            "family": "crossing_hgl",
+            "requested_range": A_dim,
+            "table_range": float(entry.range_max),
+            "requested_scaled_error": scaled_target,
+            "catalog_error_bound_scaled": float(entry.error_bound),
+            "certificate_abs_error_bound": float(
+                entry.error_bound / gamma_min),
+            "catalog_achieved_abs_error": float(
+                served.max_error / gamma_min),
+            "candidate_tolerance": float(entry.error_bound),
+            "provenance": served.provenance.one_line(),
+        }
+
+
+def _crossing_fallback_node_count(A_dim, max_nodes):
+    """Choose the fallback size from the nearest shipped HGL span."""
+    entries = [entry for entry in _mm.catalog().for_family("crossing")
+               if entry.target_kind == "hgl"
+               and entry.eps_q is not None
+               and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
+    if not entries:
+        raise RuntimeError("the shipped HGL family is empty")
+    lower_ranges = [entry.range_max for entry in entries
+                    if entry.range_max <= float(A_dim) + 1.0e-12]
+    table_range = (max(lower_ranges) if lower_ranges
+                   else min(entry.range_max for entry in entries))
+    node_count = max(entry.node_count for entry in entries
+                     if entry.range_max == table_range)
+    if node_count > int(max_nodes):
+        raise RuntimeError(
+            f"crossing support A={A_dim:.6g} needs {node_count} fixed "
+            f"nodes from the nearest HGL span, max_nodes={int(max_nodes)}")
+    return int(node_count), float(table_range)
+
+
+def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
+    """Fit one fixed deterministic causal grid; never search node/time pairs."""
+    oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
+    node_count, source_range = _crossing_fallback_node_count(A_dim, max_nodes)
+    target = min(float(relative_target), 0.5)
+    t_max = (np.log(1.0 / (_CROSSING_TAIL_FRACTION * target))
+             / gamma_min)
+    tau, positive_weights = gauss_legendre_interval(
+        node_count, 0.0, t_max)
+    times = float(pole_sign) * np.asarray(tau, np.float64)
+    seed = (float(pole_sign) * -1.0j
+            * np.asarray(positive_weights, np.float64))
+    weights, _objective = solve_fixed_time_weights_fast(
+        problem, times,
+        iterations=_CROSSING_FIT_ITERATIONS,
+        stall_iterations=_CROSSING_FIT_STALL,
+        conditioning_slack=_CROSSING_CONDITIONING_SLACK,
+        conditioning_pass=True,
+        start_weights=seed)
     return np.asarray(times), np.asarray(weights), {
-        "family": "damped_reciprocal", "transform": transform,
-        "candidate_tolerance": float(tolerance),
+        "family": "crossing_fixed_time_fit",
+        "requested_range": A_dim,
+        "node_count_source_range": source_range,
+        "candidate_tolerance": float(relative_target),
+        "eta_floor_ry": gamma_min,
+        "real_span_ry": float(np.ptp(oriented.real)),
+        "time_ceiling_ry_inverse": float(t_max),
+        "fit_iterations": _CROSSING_FIT_ITERATIONS,
+        "fit_stall_iterations": _CROSSING_FIT_STALL,
+        "conditioning_slack": _CROSSING_CONDITIONING_SLACK,
+        "provenance": "one deterministic fixed-time IRLS fit",
     }
 
 
-def _fit_crossing_at_tolerance(problem, pole_sign, tolerance, max_nodes):
-    oriented = ReciprocalMeasureProblem(
-        frequencies=float(pole_sign) * problem.frequencies,
-        internal_sums=float(pole_sign) * problem.internal_sums,
-        cell_masses=problem.cell_masses)
-    denominator = oriented.denominators
-    gamma = denominator.imag
-    if np.any(gamma <= 0.0):
-        raise RuntimeError("oriented crossing support is not eta-damped")
-    rule = damped_rectangle_positive_rule(
-        float(np.min(gamma)), float(np.max(gamma)),
-        float(np.max(np.abs(denominator.real))),
-        rel_tol=float(tolerance), max_nodes=int(max_nodes))
-    time = np.asarray(rule["t"], dtype=np.complex128)
-    weight = -1.0j * np.asarray(rule["h"], dtype=np.float64)
-    return float(pole_sign) * time, float(pole_sign) * weight, {
-        "family": str(rule["rule_type"]),
-        "candidate_tolerance": float(tolerance),
-        "nyquist_bandwidth_ry": float(np.max(np.abs(denominator.real))),
-        "eta_floor_ry": float(np.min(gamma)),
+def _rule_candidate(problem, validation, times, weights, evidence):
+    times = np.asarray(times, np.complex128)
+    weights = np.asarray(weights, np.complex128)
+    if (times.ndim != 1 or weights.shape != times.shape or not times.size
+            or np.any(times == 0.0)
+            or not np.all(np.isfinite(times))
+            or not np.all(np.isfinite(weights))):
+        raise RuntimeError("served quadrature has invalid or zero time nodes")
+    return {
+        "times": times,
+        "weights": weights,
+        "fit_metrics": _rule_metrics(problem, times, weights),
+        "metrics": _rule_metrics(validation, times, weights),
+        "evidence": evidence,
     }
 
 
@@ -794,72 +986,77 @@ def _factor_growth(spec, times, eta):
     return green, screened
 
 
-def _candidate_rules(spec, eta, max_nodes, factor_growth_cap):
-    """Return the Pareto rules for one product window."""
+def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
+                     relative_target):
+    """Return the first lookup-first rule passing the measured window gates."""
     best_pair = (np.inf, np.inf)
-    by_nodes = {}
     attempts = []
-    for tolerance in _FIT_TOLERANCE_LADDER:
+    if spec["kind"] == "crossing":
+        def rules():
+            yield from _crossing_table_candidates(
+                spec["problem"], spec["pole_sign"], relative_target,
+                max_nodes)
+            # At most one optimized fit exists: it is made only after every
+            # matching shipped HGL table has missed the measured gates.
+            yield _fit_crossing_once(
+                spec["problem"], spec["pole_sign"], relative_target,
+                max_nodes)
+        rule_rows = rules()
+    else:
+        rule_rows = _sign_definite_table_candidates(
+            spec["problem"], relative_target, max_nodes)
+    iterator = iter(rule_rows)
+    while True:
         try:
-            if spec["kind"] == "crossing":
-                times, weights, evidence = _fit_crossing_at_tolerance(
-                    spec["problem"], spec["pole_sign"], tolerance,
-                    max_nodes)
-            else:
-                times, weights, evidence = _fit_sign_definite_at_tolerance(
-                    spec["problem"], tolerance, max_nodes)
-            if int(times.size) > int(max_nodes):
-                continue
-            base = _rule_metrics(spec["problem"], times, weights)
-            refined = _rule_metrics(spec["validation"], times, weights)
+            times, weights, evidence = next(iterator)
+        except StopIteration:
+            break
+        except (FloatingPointError, OverflowError, RuntimeError, ValueError,
+                np.linalg.LinAlgError) as exc:
+            raise RuntimeError(
+                f"delivered product window {spec['name']!r} refused: "
+                f"{exc}") from exc
+        try:
+            candidate = _rule_candidate(
+                spec["problem"], spec["validation"],
+                times, weights, evidence)
+            refined = candidate["metrics"]
             factor = _factor_growth(spec, times, eta)
             best_pair = min(best_pair, (refined[0], refined[1]))
             attempts.append({
-                "candidate_tolerance": tolerance,
+                "family": evidence["family"],
+                "candidate_tolerance": evidence["candidate_tolerance"],
                 "node_count": int(times.size),
                 "refined_residual": refined[0],
                 "amplification_p99": refined[1],
                 "amplification_max": refined[2],
                 "factor_log_growth_max": max(factor),
             })
-            if (not np.all(np.isfinite(weights))
+            if (not _rule_accepted(refined, relative_target)
                     or max(factor) > float(factor_growth_cap)):
                 continue
             required_target = max(
                 refined[0],
                 refined[1] * RUNTIME_NOISE_EPSILON
                 / AMPLIFICATION_NOISE_SAFETY)
-            candidate = {
-                "times": times, "weights": weights,
-                "fit_metrics": base, "metrics": refined,
-                "required_target": float(required_target),
-                "absolute_cost": float(spec["envelope"] * required_target),
-                "factor_growth": factor,
-                "evidence": evidence,
-                "attempts": attempts.copy(),
-            }
-            previous = by_nodes.get(int(times.size))
-            if previous is None or candidate["absolute_cost"] < previous[
-                    "absolute_cost"]:
-                by_nodes[int(times.size)] = candidate
+            candidate.update(
+                required_target=float(required_target),
+                absolute_cost=float(spec["envelope"] * required_target),
+                factor_growth=factor,
+                attempts=attempts.copy())
+            return [candidate]
         except (FloatingPointError, OverflowError, RuntimeError, ValueError,
                 np.linalg.LinAlgError) as exc:
             attempts.append({
-                "candidate_tolerance": tolerance, "refusal": str(exc)})
-    candidates = []
-    best_cost = np.inf
-    for nodes in sorted(by_nodes):
-        candidate = by_nodes[nodes]
-        if candidate["absolute_cost"] < best_cost:
-            candidates.append(candidate)
-            best_cost = candidate["absolute_cost"]
-    if not candidates:
-        residual, amplification = best_pair
-        raise RuntimeError(
-            f"delivered product window {spec['name']!r} refused: achieved "
-            f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
-            "no rule survived the bounded factor/noise construction")
-    return candidates
+                "family": evidence.get("family", "unknown"),
+                "candidate_tolerance": evidence.get("candidate_tolerance"),
+                "refusal": str(exc)})
+    residual, amplification = best_pair
+    raise RuntimeError(
+        f"delivered product window {spec['name']!r} refused: achieved "
+        f"(residual={residual:.6g}, amplification_p99={amplification:.6g}); "
+        "the shipped product-window family and its one crossing fallback "
+        "did not survive the residual, noise, and factor-growth gates")
 
 
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
@@ -913,46 +1110,6 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
     return selected, int(nodes), float(required_cost)
 
 
-def _stable_time_union(fits):
-    values, lookup, indices = [], {}, []
-    for fit in fits:
-        row = []
-        for value in np.asarray(fit["times"], np.complex128):
-            key = (float(value.real), float(value.imag))
-            if key not in lookup:
-                lookup[key] = len(values)
-                values.append(complex(value))
-            row.append(lookup[key])
-        indices.append(np.asarray(row, np.int64))
-    return np.asarray(values, np.complex128), indices
-
-
-def _share_branch_grid(specs, fits, eta, factor_cap):
-    """Use the exact free-rule union, refitting only window weights."""
-    union, indices = _stable_time_union(fits)
-    for spec, fit, free_indices in zip(specs, fits, indices):
-        seed = np.zeros(union.size, np.complex128)
-        seed[free_indices] = fit["weights"]
-        try:
-            weights, _objective = solve_fixed_time_weights_fast(
-                spec["problem"], union, conditioning_slack=1.0e-3,
-                start_weights=seed)
-        except (FloatingPointError, OverflowError, ValueError,
-                np.linalg.LinAlgError):
-            weights = seed
-        metrics = _rule_metrics(spec["validation"], union, weights)
-        factor = _factor_growth(spec, union, eta)
-        if (not _rule_accepted(metrics, fit["residual_target"])
-                or max(factor) > float(factor_cap)):
-            raise RuntimeError(
-                f"delivered product window {spec['name']!r} refused: "
-                f"achieved (residual={metrics[0]:.6g}, "
-                f"amplification_p99={metrics[1]:.6g}) on shared grid")
-        fit.update(times=union, weights=weights, metrics=metrics,
-                   factor_growth=factor)
-    return int(union.size)
-
-
 def _state_products(branch, raw_energy, state_edge, pole_edge):
     crossing = ((branch.space == "cond" and not branch.neg_omega_half)
                 or (branch.space == "val" and branch.neg_omega_half))
@@ -1002,7 +1159,7 @@ def build_delivered_sigma_windows(
     plan_cache_request_fingerprint=None,
 ):
     """Build the owner-specified product-window delivered Sigma plan."""
-    del crossing_eps_q, use_shipped_minimax_tables, pane_times
+    del max_direct_terms
     started = time.perf_counter()
     branch_rows = list(branches)
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
@@ -1011,7 +1168,6 @@ def build_delivered_sigma_windows(
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
     pair_ceiling = min(int(max_nodes), MAX_WINDOW_TAU_PAIRS)
-    direct_ceiling = int(max_direct_terms)
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
@@ -1022,10 +1178,18 @@ def build_delivered_sigma_windows(
         raise ValueError("envelope_error_safety must lie in (0,1]")
     if pair_ceiling < 1:
         raise ValueError("max_nodes must permit at least one pair")
-    if direct_ceiling < 0:
-        raise ValueError("max_direct_terms must be nonnegative")
-    if grid_mode not in ("free", "shared"):
-        raise ValueError("tau_grid_mode must be 'free' or 'shared'")
+    if not np.isclose(float(crossing_eps_q), _CROSSING_EPS_Q,
+                      rtol=0.0, atol=1.0e-15):
+        raise ValueError(
+            f"lookup-first crossing tables require eps_q={_CROSSING_EPS_Q:g}")
+    if not bool(use_shipped_minimax_tables):
+        raise ValueError("lookup-first planning requires shipped minimax tables")
+    if tuple(pane_times):
+        raise ValueError("lookup-first planning does not accept pane time grids")
+    if grid_mode != "free":
+        raise ValueError(
+            "lookup-first planning uses one served grid per window; "
+            "tau_grid_mode must be 'free'")
     geometry = delivered_product_geometry(
         branch_rows, eta, edge_factor=float(edge_factor))
     split = geometry["pole_edge_ry"]
@@ -1180,30 +1344,20 @@ def build_delivered_sigma_windows(
                     required_cost, window_tau_pairs)
     if cached is None:
         cache_status = "disabled" if plan_cache_path is None else "miss"
+        # Each lookup first receives the largest relative allowance it could
+        # spend without exceeding the complete plan budget by itself.  The
+        # exact selector below then checks the sum of ACHIEVED costs.  This
+        # support-derived ceiling avoids a tolerance sweep while preserving
+        # the global delivered-error contract.
         candidates_by_window = [
-            _candidate_rules(spec, eta, pair_ceiling, factor_cap)
+            _candidate_rules(
+                spec, eta, pair_ceiling, factor_cap,
+                min(0.5, total_absolute / spec["envelope"]))
             for spec in specs]
         fits, free_pairs, required_cost = _select_rules(
             specs, candidates_by_window, total_absolute, pair_ceiling)
 
-        if grid_mode == "shared":
-            for report in branch_reports:
-                start, stop = report["plan_start"], report["plan_stop"]
-                if stop > start:
-                    _share_branch_grid(
-                        specs[start:stop], fits[start:stop], eta, factor_cap)
-            window_tau_pairs = sum(int(fit["times"].size) for fit in fits)
-            if window_tau_pairs > pair_ceiling:
-                refused_index = int(np.argmax(
-                    [fit["times"].size for fit in fits]))
-                spec, fit = specs[refused_index], fits[refused_index]
-                raise RuntimeError(
-                    f"delivered product window {spec['name']!r} refused: "
-                    f"achieved (residual={fit['metrics'][0]:.6g}, "
-                    f"amplification_p99={fit['metrics'][1]:.6g}); shared grid "
-                    f"needs {window_tau_pairs} pairs, ceiling={pair_ceiling}")
-        else:
-            window_tau_pairs = free_pairs
+        window_tau_pairs = free_pairs
         _save_plan_cache(
             plan_cache_path, cache_fingerprint, fits, free_pairs,
             required_cost, window_tau_pairs)
@@ -1237,7 +1391,8 @@ def build_delivered_sigma_windows(
                 "delivered Cartesian product window; "
                 f"residual {metrics[0]:.6g}/{residual_target:.6g}; "
                 f"kappa_p99 {metrics[1]:.6g}; runtime noise "
-                f"{runtime_noise:.6g}/{noise_budget:.6g}"))
+                f"{runtime_noise:.6g}/{noise_budget:.6g}; "
+                f"{fit['evidence']['provenance']}"))
         output.append(SharedSigmaWindow(
             window=window, E_A=branch.E_A,
             omega_abs=np.asarray(branch.omega_abs, np.float64),
@@ -1266,13 +1421,16 @@ def build_delivered_sigma_windows(
             "screened_factor_log_growth_max": fit["factor_growth"][1],
             "family": fit["evidence"]["family"],
             "candidate_tolerance": fit["evidence"]["candidate_tolerance"],
-            "direct_term_count": 0,
+            "certificate_abs_error_bound": fit["evidence"].get(
+                "certificate_abs_error_bound"),
+            "catalog_achieved_abs_error": fit["evidence"].get(
+                "catalog_achieved_abs_error"),
+            "fit_provenance": fit["evidence"]["provenance"],
         })
 
     for report in branch_reports:
         report["node_count"] = sum(
             row["node_count"] for row in report["windows"])
-        report["direct_term_count"] = 0
     distinct_tau_count = sum(len({
         (float(value.real), float(value.imag))
         for row in output[report["plan_start"]:report["plan_stop"]]
@@ -1302,9 +1460,7 @@ def build_delivered_sigma_windows(
         "runtime_noise_epsilon": RUNTIME_NOISE_EPSILON,
         "runtime_noise_safety": AMPLIFICATION_NOISE_SAFETY,
         "factor_growth_cap": factor_cap,
-        "hard_direct_term_ceiling": 0,
         "global_window_tau_pair_ceiling": pair_ceiling,
-        "global_direct_term_ceiling": direct_ceiling,
         "tau_grid_mode": grid_mode,
         "n_windows": len(output),
         "n_tau": window_tau_pairs,

@@ -2,6 +2,7 @@
 
 import numpy as np
 import jax.numpy as jnp
+import pytest
 
 from gw.mpa import delivered_windows as delivered
 
@@ -13,6 +14,7 @@ from gw.mpa.delivered_windows import (
 )
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
+from minimax import ReciprocalMeasureProblem
 
 
 def _branch(tag, space, energies, omega, *, negative_half=False):
@@ -47,7 +49,7 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     Omega = np.asarray([1.0 - 0.2j])
     residue = np.asarray([0.8 + 0.3j])
     eta = 0.05
-    plan, _ = build_delivered_sigma_windows(
+    plan, report = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
         regularization_width_ry=eta,
         envelope_relative_target=1.0e-5,
@@ -71,7 +73,12 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     # Signed valence energy E=-0.6 and s=E-Omega.
     denominator = omega_grid[0] - (-0.6 - broadened_pole)
     expected = -residue[0] / denominator
-    np.testing.assert_allclose(executed, expected, rtol=1.0e-10, atol=0.0)
+    relative_error = abs(executed - expected) / abs(expected)
+    evidence = report["branches"][0]["windows"][0]
+    assert relative_error <= 1.01 * evidence["refined_residual"]
+    assert evidence["family"] == "noncrossing"
+    assert evidence["certificate_abs_error_bound"] > 0.0
+    assert "shipped noncrossing/" in evidence["fit_provenance"]
 
 
 def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
@@ -102,7 +109,7 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
     assert streamed[6] == whole[6]
     assert streamed[7] == whole[7]
 
-    direct, direct_report = build_delivered_sigma_windows(
+    resident, resident_report = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
         regularization_width_ry=0.02, envelope_relative_target=1.0e-5,
         lattice_bins=9, max_nodes=128)
@@ -110,10 +117,10 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
         None, None, [branch], omega_grid,
         regularization_width_ry=0.02, envelope_relative_target=1.0e-5,
         lattice_bins=9, max_nodes=128, measures_by_branch=[streamed])
-    assert direct_report["window_tau_pairs"] == batched_report[
+    assert resident_report["window_tau_pairs"] == batched_report[
         "window_tau_pairs"]
-    assert len(direct) == len(batched)
-    for got, expected in zip(batched, direct):
+    assert len(resident) == len(batched)
+    for got, expected in zip(batched, resident):
         np.testing.assert_array_equal(got.state_indices, expected.state_indices)
         np.testing.assert_array_equal(got.pole_indices, expected.pole_indices)
         np.testing.assert_allclose(got.window.nodes.t, expected.window.nodes.t)
@@ -184,7 +191,7 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
         for row, window_evidence in zip(rows, evidence["windows"]):
             assert row.window.n_tau == window_evidence["node_count"]
             assert window_evidence["node_count"] > 0
-            assert window_evidence["direct_term_count"] == 0
+            assert np.all(np.asarray(row.window.nodes.t) != 0.0)
             assert (window_evidence["refined_residual"]
                     <= window_evidence["relative_residual_target"])
             assert window_evidence["noise_budget_met"]
@@ -199,7 +206,6 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
         assert evidence["window_axis"] == (
             "state_interval_x_pole_interval")
         assert evidence["state_support"] == "plain_interval"
-    assert report["direct_term_count"] == 0
     assert report["window_tau_pairs"] <= 200
 
 
@@ -225,3 +231,64 @@ def test_selector_defaults_to_incumbent_panes(monkeypatch):
 
     monkeypatch.delenv("LORRAX_SIGMA_PLAN", raising=False)
     assert resolve_sigma_plan() == "panes"
+
+
+def test_sign_definite_planning_is_lookup_only(monkeypatch):
+    """A noncrossing window must never enter either optimizer."""
+    def optimizer_called(*_args, **_kwargs):
+        raise AssertionError("lookup-first noncrossing plan called an optimizer")
+
+    monkeypatch.setattr(
+        delivered, "solve_fixed_time_weights_fast", optimizer_called)
+    branch = _branch("lookup-only valence", "val", [0.6], [0.8])
+    poles = np.asarray([1.0 - 0.2j])
+    residues = np.asarray([0.8 + 0.3j])
+    plan, report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], np.asarray([0.8]),
+        regularization_width_ry=0.05,
+        envelope_relative_target=1.0e-5,
+        max_nodes=64)
+
+    assert len(plan) == 1
+    evidence = report["branches"][0]["windows"][0]
+    assert evidence["family"] == "noncrossing"
+    assert evidence["catalog_achieved_abs_error"] > 0.0
+
+
+def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
+    frequencies = np.asarray([-0.5, 0.5])
+    problem = ReciprocalMeasureProblem(
+        frequencies=frequencies,
+        internal_sums=np.asarray([0.0 - 0.05j]),
+        cell_masses=np.asarray([1.0]))
+    original = delivered.solve_fixed_time_weights_fast
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(delivered, "solve_fixed_time_weights_fast", counted)
+    times, weights, evidence = delivered._fit_crossing_once(
+        problem, pole_sign=1.0, relative_target=2.0e-2, max_nodes=64)
+
+    assert len(calls) == 1
+    assert calls[0]["iterations"] == delivered._CROSSING_FIT_ITERATIONS
+    assert evidence["family"] == "crossing_fixed_time_fit"
+    assert times.shape == weights.shape
+    assert np.all(times != 0.0)
+
+
+def test_zero_time_rule_is_refused():
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0]))
+    with pytest.raises(RuntimeError, match="zero time"):
+        delivered._rule_candidate(
+            problem, problem, np.asarray([0.0]), np.asarray([1.0]),
+            {"family": "invalid"})
+
+
+def test_tolerance_ladder_is_deleted():
+    assert not hasattr(delivered, "_FIT_TOLERANCE_LADDER")
