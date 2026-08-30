@@ -523,19 +523,22 @@ _LAST_POLE_FIELD_MEASURE = None
 _CENSUS_HISTOGRAM_BLOCK = 8192
 
 
-def _device_pole_reducer(Omega_local, B_local, bins):
+def _device_pole_reducer(Omega_local, B_local, bins, eta, split):
     """Return one cached shard-local reducer shared by every pole."""
     key = (tuple(Omega_local.shape), tuple(B_local.shape), int(bins),
-           np.dtype(Omega_local.dtype).str, np.dtype(B_local.dtype).str)
+           np.dtype(Omega_local.dtype).str, np.dtype(B_local.dtype).str,
+           float(eta), float(split))
     cached = _DEVICE_POLE_REDUCERS.get(key)
     if cached is not None:
         return cached
 
     bins = int(bins)
+    eta = float(eta)
+    split = float(split)
     n_cells = bins * bins
     nodes = jnp.linspace(0.0, 1.0, bins, dtype=jnp.float64)
 
-    def _local_reduce(omega_local, residue_local, eta, split, pole):
+    def _local_reduce(omega_local, residue_local, pole):
         """Reduce one local spatial tile to its 30 KB partial table."""
         omega = jnp.reshape(omega_local[pole], (-1,))
         residue = jnp.reshape(residue_local[pole], (-1,))
@@ -759,12 +762,11 @@ def measure_delivered_sigma_pole_fields(
             raise ValueError("pole and residue shard layouts differ")
         omega_local = Omega.addressable_data(0)
         residue_local = B.addressable_data(0)
-        reducer = _device_pole_reducer(omega_local, residue_local, bins)
+        reducer = _device_pole_reducer(
+            omega_local, residue_local, bins, eta, split)
         local_payload_rows = tuple(
             reducer(
-                omega_local, residue_local, jnp.asarray(eta, jnp.float64),
-                jnp.asarray(split, jnp.float64),
-                jnp.asarray(pole, jnp.int32))
+                omega_local, residue_local, jnp.asarray(pole, jnp.int32))
             for pole in range(int(Omega.shape[0]))
         )
         local_payload = np.asarray(
