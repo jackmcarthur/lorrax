@@ -105,15 +105,15 @@ def test_planner_routes_a_small_failed_crossing_to_direct(monkeypatch):
 
     def refuse(*_args, **_kwargs):
         raise RuntimeError(
-            "hybrid crossing fit missed its apportioned target or "
-            "amplification cap: gate")
+            "hybrid crossing fit missed its apportioned envelope target or "
+            "maximum amplification cap: gate")
 
     monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", refuse)
     plan, report = build_delivered_sigma_windows(
         [np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)],
         [np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)],
         [branch], np.asarray([0.8]), regularization_width_ry=0.05,
-        target_error=1.0e-4, max_nodes=8)
+        envelope_relative_target=1.0e-4, max_nodes=8)
     assert len(plan) == 1
     assert plan[0].direct
     assert plan[0].window.n_tau == 0
@@ -156,8 +156,9 @@ def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch)
     residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
     plan, report = build_delivered_sigma_windows(
         [poles], [residues], [branch], omega,
-        regularization_width_ry=0.05, target_error=1.0e-4,
-        max_nodes=2)
+        regularization_width_ry=0.05,
+        envelope_relative_target=1.0e-4,
+        max_nodes=8)
 
     assert len(plan) == 4
     assert report["direct_term_count"] == 0

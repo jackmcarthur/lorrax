@@ -1,4 +1,4 @@
-"""Focused gates for the delivered-error MPA Sigma pathway."""
+"""Focused gates for the envelope-relative MPA Sigma pathway."""
 
 import numpy as np
 import jax.numpy as jnp
@@ -30,7 +30,8 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     eta = 0.05
     plan, _ = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
-        regularization_width_ry=eta, target_error=1.0e-11,
+        regularization_width_ry=eta,
+        envelope_relative_target=1.0e-11,
         max_nodes=512)
 
     row = plan[0]
@@ -69,20 +70,21 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
             pole_offset=lo, **kwargs)
         for lo in range(2)
     ])
-    for index in (0, 1, 2, 5, 6, 7, 8):
+    for index in (0, 1, 2, 3, 6, 7, 8, 9):
         np.testing.assert_allclose(streamed[index], whole[index])
-    for index in (3, 4):
+    for index in (4, 5):
         for got, expected in zip(streamed[index], whole[index]):
             np.testing.assert_allclose(got, expected)
-    assert streamed[9] == whole[9]
+    assert streamed[10] == whole[10]
+    assert streamed[11] == whole[11]
 
     direct, direct_report = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
-        regularization_width_ry=0.02, target_error=1.0e-5,
+        regularization_width_ry=0.02, envelope_relative_target=1.0e-5,
         lattice_bins=9, max_nodes=128)
     batched, batched_report = build_delivered_sigma_windows(
         None, None, [branch], omega_grid,
-        regularization_width_ry=0.02, target_error=1.0e-5,
+        regularization_width_ry=0.02, envelope_relative_target=1.0e-5,
         lattice_bins=9, max_nodes=128, measures_by_branch=[streamed])
     assert direct_report["window_tau_pairs"] == batched_report[
         "window_tau_pairs"]
@@ -112,7 +114,8 @@ def _two_branch_plan():
     ]
     plan, report = build_delivered_sigma_windows(
         pole_sets, residue_sets, branches, omega,
-        regularization_width_ry=0.02, target_error=2.0e-4,
+        regularization_width_ry=0.02,
+        envelope_relative_target=2.0e-4,
         max_nodes=200, amplification_cap=30.0)
     return branches, pole_sets, plan, report
 
@@ -130,7 +133,7 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
             assert row.window.n_tau == window_evidence["node_count"] > 0
             assert (window_evidence["refined_residual"]
                     <= window_evidence["relative_residual_target"])
-            assert (window_evidence["amplification_p99"]
+            assert (window_evidence["amplification_max"]
                     <= report["amplification_cap"])
             assert row.window.project == "full"
             np.testing.assert_array_equal(row.window.mask_A, branch.base_mask_A)

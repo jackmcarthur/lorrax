@@ -857,9 +857,10 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
-    # resolve_sigma_plan -- explicit, fail-closed selection between
-    # the incumbent pane planner and the opt-in delivered-error planner.
+    # resolve_sigma_plan / resolve_delivered_tau_grid -- explicit,
+    # fail-closed selection of the opt-in planner and its branch-grid policy.
     "gw.sigma_plan": {
+        "LORRAX_DELIVERED_TAU_GRID",
         "LORRAX_SIGMA_PLAN",
     },
     # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
@@ -1001,6 +1002,19 @@ def test_the_resolver_scan_can_fail():
     assert scan_env_reads_outside_resolvers(ok) == [], (
         "the scan flags the sanctioned resolver pattern; the gate would be "
         "turned off")
+
+
+def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
+    """RED TWIN: a resolver alone does not register a new policy read."""
+    mod = "gw.sigma_plan"
+    injected = (
+        sources[mod]
+        + "\ndef resolve_audit_negative_control():\n"
+        + "    return os.environ.get('LORRAX_UNREGISTERED_POLICY', '')\n")
+    live = {key for key, _line in scan_l1_env_reads(injected)}
+    assert live - _L1_LIBRARY_ENV_READS[mod] == {
+        "LORRAX_UNREGISTERED_POLICY"
+    }, "the exact-set ratchet failed to detect a newly introduced policy read"
 
 
 # ===========================================================================

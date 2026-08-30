@@ -21,12 +21,23 @@ planning.
 
 For each causal branch the planner forms the internal sums
 `s = E + Omega` (conduction) or `s = E - Omega` (valence). Delivered mass is
-the state occupation weight times the state amplitude magnitude, pole-residue
-magnitude, and cloud-in-cell weight. Pole damping includes the requested Sigma
-regularization exactly once.
+the state occupation weight times the projected state-amplitude envelope,
+pole-residue magnitude, and cloud-in-cell weight. The production callers
+measure that state envelope from the actual left/right intermediate and
+output wavefunction carriers as
+`||psi^L_kn|| ||psi^R_kn|| max_i||psi^L_ki|| max_j||psi^R_kj||`; they never
+use the planner's unit-amplitude fallback. Pole damping includes the requested
+Sigma regularization exactly once.
 
-The service's tail-refined lattice uses delivered-mass quantiles with the
+The service's tail-refined validation lattice uses unweighted count quantiles with the
 fixed per-axis bands 0--1%, 1--4%, 4--8%, 8--96%, 96--99%, and 99--100%.
+The distributed spatial-pole pre-reduction instead uses a fixed compact
+coordinate `x/(x+eta)` for positive pole energy and intrinsic width. Each
+local shard deposits mass and complex first moments onto at most
+`lattice_bins^2` cells before any collective. One fixed-size `psum` per
+leading pole produces the global centroids. Thus the communicated cell count
+is independent of process count, state count, and spatial pole extent; no raw
+state--spatial-pole support is gathered.
 The explicit state--leading-pole tuples are then split by delivered-mass
 quantiles (up to four conduction and three valence windows). Each tuple block
 is an executable selector, not merely a fitting surrogate. The MPA executor
@@ -35,16 +46,27 @@ batch, runs the canonical `build_G_tau` and screened-interaction synthesis for
 those components, and sums them before the canonical Sigma transform and band
 projection. No large spatial tensor acquires a tuple axis.
 
-One conservative absolute true-error envelope is multiplied by the 0.8 safety
-factor and apportioned among windows in proportion to delivered mass times
-measured inverse-gap difficulty. Sign-definite windows use the minimax
+The production target is **envelope-relative**. It multiplies the
+noncancelling inverse-gap planning envelope by the unchanged 0.8 safety factor
+and is apportioned among windows in proportion to delivered mass times
+measured inverse-gap difficulty. It is not a physical relative Sigma-error
+target. When a reference Sigma is supplied, the planner reports the measured
+`inverse_gap_envelope / max|Sigma_reference|` exchange rate; without a
+reference it reports that calibration as unavailable. Since the initial
+difficulty is envelope divided by delivered mass, mass-times-difficulty
+apportionment intentionally gives each retained window the same normalized
+envelope residual target; the later crossing-window redistribution remains a
+separate safety step. Sign-definite windows use the minimax
 service's incumbent `fit_damped_reciprocal`. Crossing windows use the
 amplification-capped fixed-phase service fit over the union of the incumbent
 MPA positive-time rule, the pane/HGL crossing family, and the service time
-dictionary. The refined lattice validates the selected rule. A missed
-crossing budget or the default p99 amplification cap of 10 may use exact
-reciprocal summation when the failed block contains at most `max_nodes`
-tuples. That fallback is reported in direct-term currency and does not
+dictionary. The refined lattice validates the selected rule. Acceptance gates
+the maximum amplification, while p99 remains diagnostic. The adapter also
+refuses a rule when either separately executed `G` or `W` exponential exceeds
+the log-growth cap, even if their product would cancel. A missed crossing
+budget or safety gate may use exact
+reciprocal summation when the failed block contains at most
+`max_direct_terms` tuples. That fallback is reported in direct-term currency and does not
 consume tau nodes; larger failed supports refuse.
 
 Every result is an ordinary `SharedSigmaWindow` consumed by the existing MPA
@@ -79,6 +101,10 @@ forward transform and band projection run once per distinct tau and resident
 pole batch. The run log reports both actual tau dispatches and the saved Sigma
 back-transforms. Exact reciprocal fallbacks are reported separately as
 `direct_term_count` and never silently priced as tau nodes.
+`max_nodes` is a global `window_tau_pairs` ceiling for the complete plan, not
+a per-window allowance. Shared-grid selection converts the remaining global
+budget to a per-branch grid ceiling before fitting, and a final fail-closed
+check pins the total. Direct terms have their own separately reported ceiling.
 
 ## GN-PPM and time reversal
 
@@ -95,18 +121,20 @@ Positive- and negative-frequency causal branches are always separate planner
 inputs. The adapter does not reconstruct one W half from the other, preserving
 the current time-reversal-broken W producer seam.
 
-## Scope of the error statement
+## Scope of the envelope statement
 
 The planner report records node counts, fit and refined residuals,
-amplification, apportioned absolute budgets, and planning wall time. Its true
-error envelope applies to the scalar residue-weighted reciprocal measure used
-for planning. It is conservative for that measure; it is not a proof that
-spatial projection cannot cancel or amplify errors in every Sigma matrix
-element. A full real-material run still needs the normal P=4 integration and
+amplification, apportioned envelope budgets, and planning wall time. Its
+inverse-gap currency applies to the scalar residue-weighted reciprocal measure
+used for planning. The projected state weights make that measure responsive to
+the real requested band projection, but spatial phases and cancellations still
+prevent the target from being called a physical relative Sigma error. A full
+real-material run still needs the normal P=4 integration and
 reference-comparison gates.
 
 MPA planning reads the complete fitted pole axis once in its native spatial
-sharding and reduces each addressable shard before cross-process gathering.
+sharding and reduces each addressable shard before fixed-size cross-process
+reduction.
 The executor then returns to configured pole batches. GN-PPM reuses its
 already-resident single pole. In both modes the default `panes` arm retains its
 previous reads, plan, and execution order.

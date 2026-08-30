@@ -20,7 +20,8 @@ from gw.ppm_tau_kernel import (get_shared_sigma_direct_kernel,
                                get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
-from gw.wavefunction_bundle import face_kernel_kwargs
+from gw.wavefunction_bundle import (face_kernel_kwargs,
+                                    projected_state_amplitude_envelope)
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             build_shared_sigma_windows,
@@ -602,6 +603,9 @@ def compute_sigma_c_mpa_omega_grid(
                 combine_delivered_sigma_pole_measures,
                 measure_delivered_sigma_pole_batch,
             )
+            state_amplitudes = projected_state_amplitude_envelope(
+                wfns, state_bands=wfns.slices.sigma_sum,
+                projection_bands=wfns.slices.sigma)
             measured = [[] for _branch in branches]
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
@@ -613,7 +617,8 @@ def compute_sigma_c_mpa_omega_grid(
                         measure_delivered_sigma_pole_batch(
                             branch, Omega, B,
                             regularization_width_ry=regularization_width_ry,
-                            pole_offset=lo))
+                            state_amplitude=state_amplitudes,
+                            pole_offset=lo, mesh_xy=mesh_xy))
                 del Omega, B
                 gc.collect()
             measures_by_branch = [
@@ -623,12 +628,12 @@ def compute_sigma_c_mpa_omega_grid(
             plan, geometry = build_delivered_sigma_windows(
                 None, None, branches, omega_grid_ry,
                 regularization_width_ry=regularization_width_ry,
-                target_error=target_error,
+                envelope_relative_target=target_error,
                 max_nodes=max(int(max_rank), int(crossing_max_nodes)),
                 crossing_eps_q=1.0e-3,
                 use_shipped_minimax_tables=True,
                 tau_grid_mode=tau_grid_mode,
-                measures_by_branch=measures_by_branch)
+                measures_by_branch=measures_by_branch, mesh_xy=mesh_xy)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -637,6 +642,8 @@ def compute_sigma_c_mpa_omega_grid(
             print_fn(
                 f"  MPA windows [delivered]: "
                 f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+                f"target={geometry['envelope_relative_target']:.3g} "
+                "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
                 f"{geometry['n_windows']} logical windows, "
                 f"grid={geometry['tau_grid_mode']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
