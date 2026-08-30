@@ -202,6 +202,33 @@ def _compute_static_head(
 	return terms
 
 
+def _oneshot_mpa_occupation_state(config, wfn, wfns):
+	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA.
+
+	The self-consistent driver already solves this state at map entry.  A
+	non-SC driver must solve it once from the DFT spectrum and thread that same
+	record to the MPA fit and Sigma; reconstructing either the chemical
+	potential or occupations at a consumer would violate the one-state rule.
+	"""
+	if str(getattr(config.mpa, "material_class", "insulator")) != "metal":
+		return None
+	from psp.get_DFT_mtxels import spin_degeneracy_factor
+	from .efermi import OccupationState
+
+	energies = np.asarray(wfns.enk, dtype=np.float64)
+	if energies.ndim != 2 or min(energies.shape) < 1:
+		raise ValueError(
+			"one-shot metallic MPA occupation energies must be nonempty "
+			f"(nk,nb), got {energies.shape}")
+	nk = int(energies.shape[0])
+	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
+	return OccupationState.solve_mp1(
+		energies, kweights, float(wfn.num_electrons),
+		float(config.occ_broadening_ry),
+		state_capacity=spin_degeneracy_factor(wfn),
+		clamp_tol=float(config.occupation_clamp_tol))
+
+
 def main(argv=None):
 	# Same factory the module-scope seam used, so the two cannot disagree.
 	args = build_parser().parse_args(argv)
@@ -531,6 +558,16 @@ def main(argv=None):
 		)
 	V_qmunu = isdf.V_qmunu
 	wfns = isdf.wf_bundle
+	oneshot_occupation_state = (
+		_oneshot_mpa_occupation_state(config, wfn, wfns)
+		if (qp_solver is not QPSolver.SELF_CONSISTENT
+			and mode.value == "mpa") else None)
+	if oneshot_occupation_state is not None:
+		print0(
+			"  one-shot occupations: fixed-N MP1 state, "
+			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
+			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
+			f"occ_hash={oneshot_occupation_state.occ_hash}")
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
@@ -671,6 +708,7 @@ def main(argv=None):
 					head_channel=getattr(isdf, 'head_channel', None),
 					mpa_plan=oneshot_mpa_plan,
 					iteration_head_response=oneshot_head_response,
+					occupation_state=oneshot_occupation_state,
 					tensors_filename=tensors_filename,
 					print_fn=print0)
 
@@ -781,6 +819,7 @@ def main(argv=None):
 				wfns_transverse=wfns_transverse,
 				bispinor_v_q_path=bispinor_v_q_path,
 				photon_response=photon_response,
+				occupation_state=oneshot_occupation_state,
 				print_fn=print0,
 			)
 		# Screening bodies have no consumer after Sigma.  In the photon mode

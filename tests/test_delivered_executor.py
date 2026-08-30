@@ -1,5 +1,8 @@
 """Convention and geometry gates for the delivered Sigma executor."""
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import jax.numpy as jnp
 
@@ -116,3 +119,24 @@ def test_planner_routes_a_small_failed_crossing_to_direct(monkeypatch):
     assert plan[0].pole_indices.tolist() == [0]
     assert report["window_tau_pairs"] == 0
     assert report["direct_term_count"] == 1
+
+
+def test_metal_oneshot_threads_one_occupation_state_to_fit_and_sigma():
+    """The driver must not drop fixed-N occupations at either MPA consumer."""
+    source = (Path(__file__).resolve().parents[1]
+              / "src" / "gw" / "gw_jax.py").read_text()
+    tree = ast.parse(source)
+    calls = {"compute_screening_model": [], "compute_sigma_xc": []}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id in calls:
+            calls[node.func.id].append(node)
+    for name, matches in calls.items():
+        assert matches, f"driver has no {name} call"
+        assert any(
+            keyword.arg == "occupation_state"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "oneshot_occupation_state"
+            for call in matches for keyword in call.keywords
+        ), f"{name} drops the one-shot metallic occupation state"
