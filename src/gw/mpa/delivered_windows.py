@@ -51,6 +51,11 @@ ENVELOPE_ERROR_SAFETY = 0.8
 FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
+# Default pair budget for the shipped 0..5 eV demonstration grid; the deck's
+# max_nodes OWNS the budget (a 4x-wider omega request physically needs more
+# crossing nodes — growth is linear in crossing bandwidth). 200 remains the
+# default via the config default; it is a resource certificate, not an
+# accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
 _PLAN_CACHE_VERSION = 3
 
@@ -1152,6 +1157,11 @@ def _crossing_fallback_node_count(A_dim, max_nodes):
                    else min(entry.range_max for entry in entries))
     node_count = max(entry.node_count for entry in entries
                      if entry.range_max == table_range)
+    if float(A_dim) > table_range:
+        # Crossing node counts grow linearly in bandwidth (measured across
+        # the shipped HGL family); a request wider than the widest shipped
+        # span extrapolates the density rather than running under-resolved.
+        node_count = int(np.ceil(node_count * float(A_dim) / table_range))
     if node_count > int(max_nodes):
         raise RuntimeError(
             f"crossing support A={A_dim:.6g} needs {node_count} fixed "
@@ -1419,7 +1429,7 @@ def build_delivered_sigma_windows(
     target = float(envelope_relative_target)
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
-    pair_ceiling = min(int(max_nodes), MAX_WINDOW_TAU_PAIRS)
+    pair_ceiling = int(max_nodes)
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
