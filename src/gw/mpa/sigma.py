@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
@@ -204,15 +205,22 @@ def _integrate_sigma_batches(
                 omega_values=row.omega_abs)
             for t in np.asarray(
                     jax.device_get(win.nodes.t), np.complex128):
-                sigma_tau = tau_kernel(
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    row.E_A, selector, B, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(t, dtype=jnp.complex128))
-                accumulator.add_tau(sigma_tau)
+                # Match the GN-PPM executor's timing seam.  With
+                # LORRAX_SIGMA_TAU_TIMING=1 the shared kernel emits blocking
+                # children under dispatch; the accumulator row then exposes
+                # any host placement/submission cost without changing the
+                # production synchronization contract.
+                with timing.section("sigma.tau.dispatch"):
+                    sigma_tau = tau_kernel(
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        row.E_A, selector, B, Omega,
+                        pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_A),
+                        jnp.asarray(win.E_ref_B),
+                        jnp.asarray(t, dtype=jnp.complex128))
+                with timing.section("sigma.tau.device_accum"):
+                    accumulator.add_tau(sigma_tau)
                 n_tau += 1
             accumulator.end_window()
             n_sweeps += 1
