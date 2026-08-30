@@ -58,6 +58,7 @@ DEFAULT_LATTICE_BINS = 25
 DEFAULT_AMPLIFICATION_CAP = 10.0
 ENVELOPE_ERROR_SAFETY = 0.8
 FACTOR_GROWTH_CAP = 30.0
+DEFAULT_DIRECT_TERM_CEILING = 4096
 WINDOW_COUNT = {"cond": 4, "val": 3}
 CROSSING_CUT_FRACTIONS = (0.45, 0.40, 0.60)
 
@@ -830,6 +831,86 @@ def _crossing_block_spec(parent, members, frequency_positions, name):
     }
 
 
+def _raw_support_blocks(spec):
+    """Split one tuple window by its actual pole-cell support.
+
+    A delivered-mass pole mean can lie above the omega grid while the same
+    tuple's compact spatial pole measure crosses it.  Energy-quantile cuts on
+    the means cannot repair that mismatch.  Classify every executable
+    state--leading-pole tuple using the minimum/maximum over its own bounded
+    pole cells, then return disjoint above, below, and crossing children.
+    No spatial tuple carrier is materialized: only two scalars per explicit
+    state--leading-pole tuple are retained.
+    """
+    members = np.asarray(spec["member_indices"], dtype=np.int64)
+    states = np.asarray(spec["state_indices"], dtype=np.int32)
+    poles = np.asarray(spec["pole_indices"], dtype=np.int32)
+    live_states = np.asarray(spec["live_state_indices"], dtype=np.int32)
+    positions = np.searchsorted(live_states, states)
+    if (np.any(positions >= live_states.size)
+            or not np.array_equal(live_states[positions], states)):
+        raise AssertionError("raw-support split selected an unknown state")
+    energies = np.asarray(spec["signed_energy"], dtype=np.float64)[positions]
+    pole_sign = 1.0 if spec["branch"].space == "cond" else -1.0
+    lower = np.empty(members.size, dtype=np.float64)
+    upper = np.empty(members.size, dtype=np.float64)
+    for pole in np.unique(poles):
+        selected = poles == pole
+        cells = np.asarray(
+            spec["pole_cells"][int(pole)], dtype=np.complex128).real
+        support = energies[selected, None] + pole_sign * cells[None, :]
+        lower[selected] = np.min(support, axis=1)
+        upper[selected] = np.max(support, axis=1)
+
+    frequencies = np.asarray(spec["problem"].frequencies, dtype=np.float64)
+    above = lower > float(np.max(frequencies))
+    below = upper < float(np.min(frequencies))
+    crossing = ~(above | below)
+    if np.any(above & below):
+        raise AssertionError("raw-support tuple cannot be above and below")
+    labels = (("raw_above", above, False),
+              ("raw_below", below, False),
+              ("raw_crossing", crossing, True))
+    frequency_positions = np.arange(frequencies.size, dtype=np.int64)
+    children = []
+    for label, selected, exact in labels:
+        if not np.any(selected):
+            continue
+        child = _crossing_block_spec(
+            spec, members[selected], frequency_positions,
+            f"{spec['window'].name}.{label}")
+        child["raw_support_exact_direct"] = bool(exact)
+        child["raw_support_real_range_ry"] = [
+            float(np.min(lower[selected])), float(np.max(upper[selected]))]
+        children.append(child)
+    owned = np.concatenate([
+        np.asarray(child["member_indices"], dtype=np.int64)
+        for child in children])
+    if not np.array_equal(np.sort(owned), np.sort(members)):
+        raise AssertionError("raw-support split lost or duplicated membership")
+    return children
+
+
+def _apportion_split_budget(parent_budget, children):
+    """Conserve one parent's absolute envelope allowance across children."""
+    scores = np.asarray([child["envelope"] for child in children], np.float64)
+    shares = scores / float(np.sum(scores))
+    budgets = [replace(
+        parent_budget, name=child["window"].name,
+        delivered_mass=child["window"].delivered_mass,
+        measured_difficulty=child["difficulty"],
+        apportionment_weight=(
+            parent_budget.apportionment_weight * float(share)),
+        absolute_error_budget=(
+            parent_budget.absolute_error_budget * float(share)))
+        for child, share in zip(children, shares)]
+    error = abs(sum(row.absolute_error_budget for row in budgets)
+                - parent_budget.absolute_error_budget)
+    if error > 1.0e-13 * max(parent_budget.absolute_error_budget, 1.0):
+        raise AssertionError("raw-support child budgets do not conserve parent")
+    return budgets
+
+
 def _fit_crossing_blocks(
     spec, budget, *, pole_sign, eta, max_nodes, amp_cap, crossing_eps_q,
     use_shipped_minimax_tables, pane_times, factor_growth_cap,
@@ -1284,7 +1365,8 @@ def build_delivered_sigma_windows(
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
     tau_pair_ceiling = int(max_nodes)
-    direct_ceiling = (tau_pair_ceiling if max_direct_terms is None
+    direct_ceiling = (DEFAULT_DIRECT_TERM_CEILING
+                      if max_direct_terms is None
                       else int(max_direct_terms))
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
@@ -1403,6 +1485,16 @@ def build_delivered_sigma_windows(
     budgets = apportion_true_error(
         tuple(spec["window"] for spec in specs),
         np.asarray([spec["difficulty"] for spec in specs]), total_absolute)
+    raw_specs, raw_budgets = [], []
+    for spec, budget in zip(specs, budgets):
+        children = _raw_support_blocks(spec)
+        child_budgets = _apportion_split_budget(budget, children)
+        raw_specs.extend(children)
+        raw_budgets.extend(child_budgets)
+    specs, budgets = raw_specs, raw_budgets
+    for report in branch_reports:
+        report["raw_support_split"] = True
+        report["raw_support_direct_term_ceiling"] = int(direct_ceiling)
 
     execution_specs, fits = [], []
     tau_pairs_used = 0
@@ -1420,7 +1512,26 @@ def build_delivered_sigma_windows(
                 "delivered plan exhausted its global window_tau_pairs "
                 f"ceiling max_nodes={tau_pair_ceiling} before fitting "
                 f"{spec['window'].name!r}")
-        if spec["window"].kind == "crossing":
+        if spec.get("raw_support_exact_direct", False):
+            n_direct = int(spec["state_indices"].size)
+            if direct_terms_used + n_direct > direct_ceiling:
+                raise RuntimeError(
+                    "raw-support crossing split exceeds the separate bounded "
+                    f"direct-term ceiling: need {direct_terms_used + n_direct}, "
+                    f"ceiling={direct_ceiling}")
+            direct = True
+            times = np.empty(0, dtype=np.complex128)
+            weights = np.empty(0, dtype=np.complex128)
+            evidence = {
+                "family": "raw_support_exact_direct",
+                "fit_residual": 0.0, "refined_residual": 0.0,
+                "amplification_p99": 1.0,
+                "amplification_max": 1.0,
+                "direct_term_count": n_direct,
+                "direct_term_ceiling": int(direct_ceiling),
+                "factor_growth_cap": factor_cap,
+            }
+        elif spec["window"].kind == "crossing":
             try:
                 times, weights, evidence = _fit_crossing(
                     problem, validation, residual_target, pole_sign, eta,
