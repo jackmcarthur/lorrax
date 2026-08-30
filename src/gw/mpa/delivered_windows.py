@@ -177,7 +177,7 @@ def _compress(values, masses, bins):
     return cells, cell_mass
 
 
-def _pole_measures(branch, Omega, B, eta, amplitude, bins):
+def _pole_measures(branch, Omega, B, eta, amplitude, bins, *, pole_offset=0):
     """Build compact pole measures plus executable tuple geometry.
 
     The spatial pole field is reduced once per leading pole.  Tuple mass and
@@ -195,6 +195,9 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
         branch, amplitude)
     pole_sign = 1.0 if branch.space == "cond" else -1.0
     n_poles = int(Omega.shape[0])
+    pole_offset = int(pole_offset)
+    if pole_offset < 0:
+        raise ValueError("pole_offset must be nonnegative")
     local_values = [[] for _ in range(n_poles)]
     local_masses = [[] for _ in range(n_poles)]
     bad_B = bad_pole = raw_count = 0
@@ -264,7 +267,7 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
             representative.append(complex(
                 energy + pole_sign * pole_mean))
             tuple_state_indices.append(int(state_index))
-            tuple_pole_indices.append(int(pole_index))
+            tuple_pole_indices.append(int(pole_offset + pole_index))
 
     raw_global = int(np.asarray(all_gather_processes(
         np.asarray([raw_count], dtype=np.int64))).sum())
@@ -276,6 +279,62 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
         np.asarray(tuple_state_indices, np.int32),
         np.asarray(tuple_pole_indices, np.int32),
         raw_global,
+    )
+
+
+def measure_delivered_sigma_pole_batch(
+    branch, Omega, B, *, regularization_width_ry, state_amplitude=None,
+    lattice_bins=DEFAULT_LATTICE_BINS, pole_offset=0,
+):
+    """Reduce one resident leading-pole batch to bounded host measures.
+
+    The returned tuple retains global leading-pole indices through
+    ``pole_offset`` while the bounded pole-cell tables remain local to this
+    batch. Combine consecutive results with
+    :func:`combine_delivered_sigma_pole_measures` before planning.
+    """
+    return _pole_measures(
+        branch, Omega, B, float(regularization_width_ry), state_amplitude,
+        int(lattice_bins), pole_offset=int(pole_offset))
+
+
+def combine_delivered_sigma_pole_measures(batch_measures):
+    """Combine consecutive measured pole batches in deterministic order."""
+    rows = list(batch_measures)
+    if not rows:
+        raise ValueError("delivered Sigma needs at least one measured pole batch")
+    first = rows[0]
+    signed_energy = np.asarray(first[0], np.float64)
+    state_mass = np.asarray(first[1], np.float64)
+    state_indices = np.asarray(first[2], np.int32)
+    pole_cells, pole_weights = [], []
+    masses, representative = [], []
+    tuple_state_indices, tuple_pole_indices = [], []
+    raw_count = 0
+    for row in rows:
+        if (not np.array_equal(np.asarray(row[0]), signed_energy)
+                or not np.array_equal(np.asarray(row[1]), state_mass)
+                or not np.array_equal(np.asarray(row[2]), state_indices)):
+            raise ValueError(
+                "delivered pole batches disagree about their branch states")
+        pole_cells.extend(row[3])
+        pole_weights.extend(row[4])
+        masses.append(np.asarray(row[5], np.float64))
+        representative.append(np.asarray(row[6], np.complex128))
+        tuple_state_indices.append(np.asarray(row[7], np.int32))
+        tuple_pole_indices.append(np.asarray(row[8], np.int32))
+        raw_count += int(row[9])
+
+    masses = np.concatenate(masses)
+    representative = np.concatenate(representative)
+    tuple_state_indices = np.concatenate(tuple_state_indices)
+    tuple_pole_indices = np.concatenate(tuple_pole_indices)
+    order = np.lexsort((tuple_pole_indices, tuple_state_indices))
+    return (
+        signed_energy, state_mass, state_indices,
+        tuple(pole_cells), tuple(pole_weights),
+        masses[order], representative[order],
+        tuple_state_indices[order], tuple_pole_indices[order], raw_count,
     )
 
 
@@ -732,6 +791,7 @@ def build_delivered_sigma_windows(
     use_shipped_minimax_tables: bool = True,
     pane_times: tuple = (),
     tau_grid_mode: str = "free",
+    measures_by_branch=None,
 ):
     """Build a measure-apportioned hybrid plan for MPA or one-pole GN-PPM.
 
@@ -749,13 +809,18 @@ def build_delivered_sigma_windows(
     """
     started = time.perf_counter()
     branch_rows = list(branches)
-    omega_rows = _per_branch(
-        Omega_poles_by_branch, branch_rows, "Omega_poles_by_branch")
-    residue_rows = _per_branch(
-        B_poles_by_branch, branch_rows, "B_poles_by_branch")
-    amplitude_rows = _optional_per_branch(
-        state_amplitudes_by_branch, branch_rows,
-        "state_amplitudes_by_branch")
+    if measures_by_branch is None:
+        omega_rows = _per_branch(
+            Omega_poles_by_branch, branch_rows, "Omega_poles_by_branch")
+        residue_rows = _per_branch(
+            B_poles_by_branch, branch_rows, "B_poles_by_branch")
+        amplitude_rows = _optional_per_branch(
+            state_amplitudes_by_branch, branch_rows,
+            "state_amplitudes_by_branch")
+        measure_rows = None
+    else:
+        measure_rows = _per_branch(
+            measures_by_branch, branch_rows, "measures_by_branch")
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
     eta, target = float(regularization_width_ry), float(target_error)
     amp_cap, safety = float(amplification_cap), float(true_error_safety)
@@ -773,11 +838,17 @@ def build_delivered_sigma_windows(
         raise ValueError("amplification_cap must be finite and greater than one")
     if grid_mode not in ("free", "shared"):
         raise ValueError("tau_grid_mode must be 'free' or 'shared'")
+    if measure_rows is None:
+        measure_rows = [
+            _pole_measures(
+                branch, Omega, B, eta, amplitude, int(lattice_bins))
+            for branch, Omega, B, amplitude in zip(
+                branch_rows, omega_rows, residue_rows, amplitude_rows)
+        ]
 
     specs, branch_reports = [], []
     combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
-    for branch, Omega, B, amplitude in zip(
-            branch_rows, omega_rows, residue_rows, amplitude_rows):
+    for branch, measure in zip(branch_rows, measure_rows):
         indices = np.asarray(branch.omega_idx, dtype=np.int64)
         frequencies = omega_grid[indices]
         expected = (-np.asarray(branch.omega_abs, dtype=np.float64)
@@ -788,8 +859,7 @@ def build_delivered_sigma_windows(
                 f"branch {branch.tag!r} frequency indices disagree with its signed half")
         (signed_energy, state_mass, live_state_indices,
          pole_cells, pole_weights, masses, representative, state_indices,
-         pole_indices, raw_count) = _pole_measures(
-            branch, Omega, B, eta, amplitude, int(lattice_bins))
+         pole_indices, raw_count) = measure
         windows = _partition_tuples(
             representative, masses, frequencies, branch.space,
             force_single=(np.unique(pole_indices).size == 1))
@@ -995,6 +1065,8 @@ def build_delivered_sigma_windows(
 
 
 __all__ = [
+    "combine_delivered_sigma_pole_measures",
     "DEFAULT_AMPLIFICATION_CAP", "DEFAULT_LATTICE_BINS",
     "TRUE_ERROR_SAFETY", "build_delivered_sigma_windows",
+    "measure_delivered_sigma_pole_batch",
 ]

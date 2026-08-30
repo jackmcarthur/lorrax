@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -54,11 +56,17 @@ def _tau_group_key(row):
         raise ValueError(
             "delivered tuple windows must use the full complex projection")
     t = np.asarray(jax.device_get(win.nodes.t), np.complex128)
+    energy = np.asarray(jax.device_get(row.E_A), np.float64)
+    mask = np.asarray(win.mask_A, bool)
+    band_weight = getattr(row, "band_weight", None)
+    weight = (b"" if band_weight is None else
+              np.asarray(jax.device_get(band_weight), np.float64).tobytes())
     return (
         t.shape, t.tobytes(),
         np.asarray(row.omega_idx, np.int64).tobytes(),
         np.asarray(row.omega_abs, np.float64).tobytes(),
         int(win.omega_sign), float(win.E_ref_A), float(win.E_ref_B),
+        energy.shape, energy.tobytes(), mask.tobytes(), weight,
     )
 
 
@@ -225,9 +233,17 @@ def _integrate_sigma_batches(
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
-    logical_tau_pairs = direct_terms = direct_frequency_dispatches = 0
+    logical_tau_pairs = (int(sum(
+        row.window.n_tau for row in plan
+        if not bool(getattr(row, "direct", False))))
+        if delivered_tuples else 0)
+    direct_terms = direct_frequency_dispatches = 0
     component_transforms = 0
     batch_size = int(pole_batch_size)
+    global_tau_groups = (
+        _tau_groups(plan, tuple(range(int(n_poles))))
+        if delivered_tuples else ())
+    partial_tau = {}
     for lo, Omega, B in batches:
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
@@ -243,14 +259,7 @@ def _integrate_sigma_batches(
                             base_selector.shape)
                 nodes = np.asarray(
                     jax.device_get(win.nodes.t), np.complex128)
-                accumulator.begin_window(
-                    nodes, np.ones(nodes.size, np.complex128),
-                    omega_sign=win.omega_sign, prefactor=1.0,
-                    e_ref_sum=0.0, antihermitian=False,
-                    omega_indices=first.omega_idx,
-                    omega_values=first.omega_abs)
-                logical_tau_pairs += sum(
-                    row.window.n_tau for row, _selected in group)
+                group_key = _tau_group_key(first)
                 for tau_index, t in enumerate(nodes):
                     selectors, pole_weights = _tuple_components(
                         group, tau_index, base_selector, width)
@@ -265,10 +274,10 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(t, dtype=jnp.complex128))
-                    accumulator.add_tau(sigma_tau)
-                    n_tau += 1
-                accumulator.end_window()
-                n_sweeps += 1
+                    partial_key = (group_key, tau_index)
+                    if partial_key in partial_tau:
+                        sigma_tau = partial_tau[partial_key] + sigma_tau
+                    partial_tau[partial_key] = sigma_tau.block_until_ready()
 
             for row in plan:
                 if not bool(getattr(row, "direct", False)):
@@ -355,6 +364,34 @@ def _integrate_sigma_batches(
                 n_sweeps += 1
                 logical_tau_pairs += win.n_tau
         del B, Omega
+        gc.collect()
+
+    if delivered_tuples:
+        for group in global_tau_groups:
+            first = group[0][0]
+            win = first.window
+            nodes = np.asarray(jax.device_get(win.nodes.t), np.complex128)
+            group_key = _tau_group_key(first)
+            accumulator.begin_window(
+                nodes, np.ones(nodes.size, np.complex128),
+                omega_sign=win.omega_sign, prefactor=1.0,
+                e_ref_sum=0.0, antihermitian=False,
+                omega_indices=first.omega_idx,
+                omega_values=first.omega_abs)
+            for tau_index in range(nodes.size):
+                try:
+                    sigma_tau = partial_tau.pop((group_key, tau_index))
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "delivered Sigma pole batching left an incomplete "
+                        "equal-tau group") from exc
+                accumulator.add_tau(sigma_tau)
+                n_tau += 1
+            accumulator.end_window()
+            n_sweeps += 1
+        if partial_tau:
+            raise RuntimeError(
+                "delivered Sigma pole batching produced orphaned tau blocks")
 
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
@@ -403,6 +440,8 @@ def integrate_sigma_store(
                 slice(lo, hi), unfold=True, return_sharded=True,
                 to_unit="Ry")
             yield lo, Omega, B
+            del Omega, B
+            gc.collect()
 
     def run(reader):
         return _integrate_sigma_batches(
@@ -504,11 +543,11 @@ def compute_sigma_c_mpa_omega_grid(
     entry points, which is what keeps the branch supports, the pole census
     and the window build on one support.
 
-    Pole tensors are read collectively in their native sharding.  The panes
-    pathway's first configured-batch walk retains only scalar geometry; the
-    delivered pathway reads the complete pole axis once and reduces each
-    addressable spatial shard to a bounded measure.  The spatial executor
-    then rereads and releases its configured pole ranges in either mode.
+    Pole tensors are read collectively in their native sharding. Both
+    planners retain only bounded host geometry from each configured pole
+    batch. The spatial executor then rereads and releases the same pole
+    ranges, retaining only projected Sigma(tau) partial sums when delivered
+    equal-tau groups span more than one batch.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
@@ -545,6 +584,7 @@ def compute_sigma_c_mpa_omega_grid(
                     edge_factor=edge_factor, pole_offset=lo,
                     occupation_window_threshold=occupation_window_threshold))
                 del Omega, B
+                gc.collect()
             plan, geometry = build_shared_sigma_windows(
                 summaries, branches,
                 regularization_width_ry=regularization_width_ry,
@@ -555,23 +595,40 @@ def compute_sigma_c_mpa_omega_grid(
                 occupation_window_threshold=occupation_window_threshold)
         else:
             # The delivered measure needs the residues, not only rectangle
-            # extrema.  Pole fields stay sharded; the planner reduces each
-            # addressable shard to bounded cells before any cross-rank gather.
-            Omega, B = reader.read(
-                slice(0, n_poles), unfold=True, return_sharded=True,
-                to_unit="Ry")
-            from .delivered_windows import build_delivered_sigma_windows
+            # extrema. Pole fields stay sharded and resident only for one
+            # configured batch; the planner retains bounded host cells.
+            from .delivered_windows import (
+                build_delivered_sigma_windows,
+                combine_delivered_sigma_pole_measures,
+                measure_delivered_sigma_pole_batch,
+            )
+            measured = [[] for _branch in branches]
+            for lo in range(0, n_poles, int(pole_batch_size)):
+                hi = min(lo + int(pole_batch_size), n_poles)
+                Omega, B = reader.read(
+                    slice(lo, hi), unfold=True, return_sharded=True,
+                    to_unit="Ry")
+                for branch_index, branch in enumerate(branches):
+                    measured[branch_index].append(
+                        measure_delivered_sigma_pole_batch(
+                            branch, Omega, B,
+                            regularization_width_ry=regularization_width_ry,
+                            pole_offset=lo))
+                del Omega, B
+                gc.collect()
+            measures_by_branch = [
+                combine_delivered_sigma_pole_measures(rows)
+                for rows in measured]
             tau_grid_mode = resolve_delivered_tau_grid()
             plan, geometry = build_delivered_sigma_windows(
-                [Omega] * len(branches), [B] * len(branches), branches,
-                omega_grid_ry,
+                None, None, branches, omega_grid_ry,
                 regularization_width_ry=regularization_width_ry,
                 target_error=target_error,
                 max_nodes=max(int(max_rank), int(crossing_max_nodes)),
                 crossing_eps_q=1.0e-3,
                 use_shipped_minimax_tables=True,
-                tau_grid_mode=tau_grid_mode)
-            del Omega, B
+                tau_grid_mode=tau_grid_mode,
+                measures_by_branch=measures_by_branch)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

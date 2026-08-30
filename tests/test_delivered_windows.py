@@ -3,7 +3,11 @@
 import numpy as np
 import jax.numpy as jnp
 
-from gw.mpa.delivered_windows import build_delivered_sigma_windows
+from gw.mpa.delivered_windows import (
+    build_delivered_sigma_windows,
+    combine_delivered_sigma_pole_measures,
+    measure_delivered_sigma_pole_batch,
+)
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
 
@@ -48,6 +52,47 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     denominator = omega_grid[0] - (-0.6 - broadened_pole)
     expected = -residue[0] / denominator
     np.testing.assert_allclose(executed, expected, rtol=1.0e-10, atol=0.0)
+
+
+def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
+    """Pole batching changes residency, not tuple geometry or fitted rules."""
+    omega_grid = np.asarray([0.0])
+    branch = _branch("streamed conduction", "cond", [0.2], omega_grid)
+    Omega = np.asarray([0.5 - 0.05j, 0.9 - 0.08j]).reshape(2, 1, 1, 1)
+    residue = np.asarray([0.7 + 0.2j, 0.3 - 0.1j]).reshape(2, 1, 1, 1)
+    kwargs = dict(regularization_width_ry=0.02, lattice_bins=9)
+    whole = measure_delivered_sigma_pole_batch(
+        branch, Omega, residue, **kwargs)
+    streamed = combine_delivered_sigma_pole_measures([
+        measure_delivered_sigma_pole_batch(
+            branch, Omega[lo:lo + 1], residue[lo:lo + 1],
+            pole_offset=lo, **kwargs)
+        for lo in range(2)
+    ])
+    for index in (0, 1, 2, 5, 6, 7, 8):
+        np.testing.assert_allclose(streamed[index], whole[index])
+    for index in (3, 4):
+        for got, expected in zip(streamed[index], whole[index]):
+            np.testing.assert_allclose(got, expected)
+    assert streamed[9] == whole[9]
+
+    direct, direct_report = build_delivered_sigma_windows(
+        [Omega], [residue], [branch], omega_grid,
+        regularization_width_ry=0.02, target_error=1.0e-5,
+        lattice_bins=9, max_nodes=128)
+    batched, batched_report = build_delivered_sigma_windows(
+        None, None, [branch], omega_grid,
+        regularization_width_ry=0.02, target_error=1.0e-5,
+        lattice_bins=9, max_nodes=128, measures_by_branch=[streamed])
+    assert direct_report["window_tau_pairs"] == batched_report[
+        "window_tau_pairs"]
+    assert len(direct) == len(batched)
+    for got, expected in zip(batched, direct):
+        np.testing.assert_array_equal(got.state_indices, expected.state_indices)
+        np.testing.assert_array_equal(got.pole_indices, expected.pole_indices)
+        np.testing.assert_allclose(got.window.nodes.t, expected.window.nodes.t)
+        np.testing.assert_allclose(
+            got.window.nodes.alpha, expected.window.nodes.alpha)
 
 
 def _two_branch_plan():
