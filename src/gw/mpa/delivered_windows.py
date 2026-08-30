@@ -28,11 +28,9 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import PartitionSpec as P
 
 from common.collectives import (gather_to_host, process_count, process_rank,
                                 psum_replicate)
-from common.shard_map import shard_map
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.evaluator import damped_rectangle_positive_rule
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -525,14 +523,10 @@ _LAST_POLE_FIELD_MEASURE = None
 _CENSUS_HISTOGRAM_BLOCK = 8192
 
 
-def _device_pole_reducer(Omega, B, mesh_xy, bins):
+def _device_pole_reducer(Omega_local, B_local, bins):
     """Return one cached shard-local reducer shared by every pole."""
-    omega_spec = getattr(Omega.sharding, "spec", None)
-    residue_spec = getattr(B.sharding, "spec", None)
-    if omega_spec is None or residue_spec is None:
-        raise ValueError("device pole census needs named array shardings")
-    key = (id(mesh_xy), omega_spec, residue_spec, int(Omega.shape[0]),
-           int(bins), np.dtype(Omega.dtype).str, np.dtype(B.dtype).str)
+    key = (tuple(Omega_local.shape), tuple(B_local.shape), int(bins),
+           np.dtype(Omega_local.dtype).str, np.dtype(B_local.dtype).str)
     cached = _DEVICE_POLE_REDUCERS.get(key)
     if cached is not None:
         return cached
@@ -542,7 +536,7 @@ def _device_pole_reducer(Omega, B, mesh_xy, bins):
     nodes = jnp.linspace(0.0, 1.0, bins, dtype=jnp.float64)
 
     def _local_reduce(omega_local, residue_local, eta, split, pole):
-        """Reduce one local spatial tile, then sum 30 KB over XY."""
+        """Reduce one local spatial tile to its 30 KB partial table."""
         omega = jnp.reshape(omega_local[pole], (-1,))
         residue = jnp.reshape(residue_local[pole], (-1,))
         finite_residue = jnp.isfinite(residue)
@@ -626,16 +620,10 @@ def _device_pole_reducer(Omega, B, mesh_xy, bins):
             jnp.count_nonzero(residue_live & ~pole_ok),
             jnp.count_nonzero(live),
         )).astype(jnp.int64)
-        moments = jax.lax.psum(moments, axis_name=("x", "y"))
-        counts = jax.lax.psum(counts, axis_name=("x", "y"))
         return jnp.concatenate(
             (jnp.reshape(moments, (-1,)), counts.astype(jnp.float64)))
 
-    mapped = shard_map(
-        _local_reduce, mesh=mesh_xy,
-        in_specs=(omega_spec, residue_spec, P(), P(), P()), out_specs=P(),
-        check_vma=False)
-    cached = jax.jit(mapped)
+    cached = jax.jit(_local_reduce)
     _DEVICE_POLE_REDUCERS[key] = cached
     return cached
 
@@ -766,21 +754,30 @@ def measure_delivered_sigma_pole_fields(
 
     if isinstance(Omega, jax.Array) and mesh_xy is not None:
         started = time.perf_counter()
-        reducer = _device_pole_reducer(Omega, B, mesh_xy, bins)
-        payload_device = jnp.stack([
+        if getattr(Omega.sharding, "spec", None) != getattr(
+                B.sharding, "spec", None):
+            raise ValueError("pole and residue shard layouts differ")
+        omega_local = Omega.addressable_data(0)
+        residue_local = B.addressable_data(0)
+        reducer = _device_pole_reducer(omega_local, residue_local, bins)
+        local_payload_device = jnp.stack([
             reducer(
-                Omega, B, jnp.asarray(eta, jnp.float64),
+                omega_local, residue_local, jnp.asarray(eta, jnp.float64),
                 jnp.asarray(split, jnp.float64),
                 jnp.asarray(pole, jnp.int32))
             for pole in range(int(Omega.shape[0]))
         ])
-        payload = np.asarray(jax.device_get(payload_device), np.float64)
+        local_payload = np.asarray(
+            jax.device_get(local_payload_device), np.float64)
+        payload = np.asarray(_sum_fixed_process_table(
+            local_payload, mesh_xy, "pole-batch mass/moment table"),
+            np.float64)
         n_moments = 2 * 3 * bins * bins
         moments = payload[:, :n_moments].reshape(
             int(Omega.shape[0]), 2, 3, bins * bins)
         counts = np.sum(
             np.rint(payload[:, n_moments:]).astype(np.int64), axis=0)
-        reduction = "device_fixed_mass_first_moment_psum"
+        reduction = "device_local_fixed_mass_first_moment_psum"
         if os.environ.get("LORRAX_DELIVERED_CENSUS_PROFILE", "0") == "1":
             print(
                 f"[delivered-census-profile] rank={process_rank()} "
