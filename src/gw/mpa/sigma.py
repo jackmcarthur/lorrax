@@ -445,34 +445,36 @@ def compute_sigma_c_mpa_omega_grid(
             measured = [[] for _branch in branches]
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
-                for branch_index, branch in enumerate(branches):
-                    measured[branch_index].append(
-                        measure_delivered_sigma_pole_batch(
-                            branch, Omega, B,
-                            regularization_width_ry=regularization_width_ry,
-                            pole_split_ry=product_geometry["pole_edge_ry"],
-                            state_amplitude=state_amplitudes,
-                            pole_offset=lo, mesh_xy=mesh_xy))
+                with timing.section("sigma.plan.measure"):
+                    Omega, B = reader.read(
+                        slice(lo, hi), unfold=True, return_sharded=True,
+                        to_unit="Ry")
+                    for branch_index, branch in enumerate(branches):
+                        measured[branch_index].append(
+                            measure_delivered_sigma_pole_batch(
+                                branch, Omega, B,
+                                regularization_width_ry=regularization_width_ry,
+                                pole_split_ry=product_geometry["pole_edge_ry"],
+                                state_amplitude=state_amplitudes,
+                                pole_offset=lo, mesh_xy=mesh_xy))
                 del Omega, B
                 gc.collect()
-            measures_by_branch = [
-                combine_delivered_sigma_pole_measures(rows)
-                for rows in measured]
-            tau_grid_mode = resolve_delivered_tau_grid()
-            plan, geometry = build_delivered_sigma_windows(
-                None, None, branches, omega_grid_ry,
-                regularization_width_ry=regularization_width_ry,
-                envelope_relative_target=target_error,
-                max_nodes=max(int(max_rank), int(crossing_max_nodes)),
-                crossing_eps_q=1.0e-3,
-                use_shipped_minimax_tables=True,
-                tau_grid_mode=tau_grid_mode,
-                max_direct_terms=resolve_delivered_max_direct_terms(),
-                edge_factor=edge_factor,
-                measures_by_branch=measures_by_branch, mesh_xy=mesh_xy)
+            with timing.section("sigma.plan.fit"):
+                measures_by_branch = [
+                    combine_delivered_sigma_pole_measures(rows)
+                    for rows in measured]
+                tau_grid_mode = resolve_delivered_tau_grid()
+                plan, geometry = build_delivered_sigma_windows(
+                    None, None, branches, omega_grid_ry,
+                    regularization_width_ry=regularization_width_ry,
+                    envelope_relative_target=target_error,
+                    max_nodes=max(int(max_rank), int(crossing_max_nodes)),
+                    crossing_eps_q=1.0e-3,
+                    use_shipped_minimax_tables=True,
+                    tau_grid_mode=tau_grid_mode,
+                    max_direct_terms=resolve_delivered_max_direct_terms(),
+                    edge_factor=edge_factor,
+                    measures_by_branch=measures_by_branch, mesh_xy=mesh_xy)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -487,7 +489,8 @@ def compute_sigma_c_mpa_omega_grid(
                 f"grid={geometry['tau_grid_mode']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
-                f"{geometry['direct_term_count']} direct terms")
+                f"{geometry['direct_term_count']} direct terms, "
+                f"plan {geometry['plan_seconds']:.3f} s")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
@@ -497,9 +500,10 @@ def compute_sigma_c_mpa_omega_grid(
                         f"kappa_p99={window['amplification_p99']:.6g}, "
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
-        return integrate_sigma_store(
-            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-            pole_batch_size=pole_batch_size, print_fn=print_fn)
+        with timing.section("sigma.exec"):
+            return integrate_sigma_store(
+                wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+                pole_batch_size=pole_batch_size, print_fn=print_fn)
 
 
 def assert_head_body_occupation_match(head_attrs, occupation_state):
