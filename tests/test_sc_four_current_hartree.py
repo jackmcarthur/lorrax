@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import pathlib
 
 import numpy as np
@@ -104,6 +105,27 @@ def test_equal_occupation_unitary_preserves_the_whole_four_current():
     assert np.max(np.abs(rotated - baseline)) < 2.0e-12 * scale
 
 
+def test_complex_nontrivial_rotation_matches_explicit_orbitals():
+    """The inline scan rotation matches the column-convention reference."""
+    rng, psi, bidx, _, grid = _fixture()
+    mesh = resolve_mesh()
+    occ = np.asarray([[0.85, 0.35, 0.05], [0.70, 0.20, -0.03]])
+    weights = np.full(2, 0.5)
+    rotations = np.stack([_haar(rng, 3) for _ in range(2)])
+    psi_rotated = np.einsum(
+        "kmn,kmsg->knsg", rotations, psi, optimize=True)
+    kw = dict(mesh=mesh, box_index=bidx, fft_grid=grid,
+              cell_volume=17.0, spin_degeneracy=1.0,
+              include_dirac_current=True, charge_nspinor=2)
+    inline = np.asarray(rho_from_wfns(
+        _put(psi, mesh, band_sphere_spec()), occ, weights,
+        U=_put(rotations, mesh, band_rotation_spec()), **kw))
+    explicit = np.asarray(rho_from_wfns(
+        _put(psi_rotated, mesh, band_sphere_spec()), occ, weights, **kw))
+    scale = max(float(np.max(np.abs(explicit))), 1.0)
+    assert np.max(np.abs(inline - explicit)) < 2.0e-12 * scale
+
+
 def test_packed_four_current_matrix_sweep_matches_two_independent_sweeps():
     """Packing shares FFT/reshard work without changing either component."""
     rng, psi, bidx, coords, grid = _fixture()
@@ -192,6 +214,45 @@ def test_density_sc_suppresses_both_frozen_direct_components():
                     assigned.update(
                         elt.id for elt in target.elts if isinstance(elt, ast.Name))
     assert {"sig_h", "h_transverse"} <= assigned
+    omit_text = ast.get_source_segment(path.read_text(encoding="utf-8"), omit)
+    assert "zeros_like(sig_x)" not in omit_text
+    assert "jnp.asarray(0, dtype=sig_x.dtype)" in omit_text
+
+
+def test_live_hartree_addition_is_fused_and_donates_the_dead_base():
+    """SC must not retain or materialise V_H+H_T before H assembly."""
+    text = (ROOT / "src" / "gw" / "sc_iteration.py").read_text(
+        encoding="utf-8")
+    assert "v_h_dft_new = exact_hartree_dft.total" not in text
+    assert "def _add_exact_four_current_hartree" in text
+    module = ast.parse(text)
+    fn = next(n for n in module.body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_add_exact_four_current_hartree")
+    decorator = ast.get_source_segment(text, fn.decorator_list[0])
+    assert "donate_argnums=(0,)" in decorator
+
+
+def test_hartree_omission_receipt_restores_full_output_matrices():
+    """The compact internal sentinel cannot masquerade as a final field."""
+    from gw.sigma_dispatch import SigmaResult
+
+    matrix = jnp.ones((2, 4, 4), dtype=jnp.complex128)
+    omitted = SigmaResult(
+        v_h_kij_ry=jnp.asarray(0, dtype=jnp.complex128),
+        v_h_scalar_kij_ry=jnp.asarray(0, dtype=jnp.complex128),
+        hartree_omitted=True,
+        sigma_x_kij_ry=-matrix,
+        sigma_xc_kij_ry=-0.5 * matrix)
+    restored = dataclasses.replace(
+        omitted, v_h_kij_ry=2 * matrix, v_h_scalar_kij_ry=matrix,
+        h_transverse_kij_ry=matrix, hartree_omitted=False)
+    assert not restored.hartree_omitted
+    assert restored.v_h_kij_ry.shape == matrix.shape
+    assert restored.v_h_scalar_kij_ry.shape == matrix.shape
+    assert restored.h_transverse_kij_ry.shape == matrix.shape
+    with pytest.raises(ValueError, match="scalar-zero sentinel"):
+        dataclasses.replace(omitted, v_h_kij_ry=matrix)
 
 
 def test_live_hartree_is_carried_to_both_final_output_seams():
@@ -226,6 +287,53 @@ def test_sc_density_applies_rotation_inside_the_scan():
                    and isinstance(n.func, ast.Name)
                    and n.func.id == "rotate_bands"
                    for n in ast.walk(fn))
+
+
+def test_density_scan_reshards_only_the_singleton_k_slice():
+    """Resident psi stays band-xy; only psi[k] is placed m-on-x."""
+    module = ast.parse((ROOT / "src" / "gw" / "qsgw_density.py").read_text(
+        encoding="utf-8"))
+    fn = next(n for n in module.body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "rho_from_wfns")
+    constraints = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "with_sharding_constraint"
+        and len(n.args) >= 2
+    ]
+
+    def _named_arg(call, value, sharding):
+        return (isinstance(call.args[0], ast.Name)
+                and call.args[0].id == value
+                and isinstance(call.args[1], ast.Name)
+                and call.args[1].id == sharding)
+
+    assert sum(_named_arg(call, "psi_", "band_xy")
+               for call in constraints) == 1
+    assert not any(_named_arg(call, "psi_", "m_on_x")
+                   for call in constraints)
+    slice_reshards = [
+        call for call in constraints
+        if isinstance(call.args[0], ast.Subscript)
+        and isinstance(call.args[0].value, ast.Name)
+        and call.args[0].value.id == "psi_k"
+        and isinstance(call.args[0].slice, ast.Constant)
+        and call.args[0].slice.value is None
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "m_on_x"
+    ]
+    assert len(slice_reshards) == 1
+    rotation_einsums = [
+        call for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "einsum"
+        and any(isinstance(arg, ast.Name) and arg.id == "psi_k_x"
+                for arg in call.args)
+    ]
+    assert len(rotation_einsums) == 1
 
 
 def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():

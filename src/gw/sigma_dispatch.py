@@ -112,6 +112,10 @@ class SigmaResult:
     sigma_xc_kij_ry: jax.Array
     v_h_scalar_kij_ry: jax.Array | None = None
     h_transverse_kij_ry: jax.Array | None = None
+    #: Internal density-SC receipt.  When true the two V_H fields are a
+    #: compact scalar-zero sentinel; the SC owner restores full matrices at
+    #: both output seams.  Consumers must never infer omission from shape.
+    hartree_omitted: bool = False
     sigma_sx_kij_ry: jax.Array | None = None
     sigma_coh_kij_ry: jax.Array | None = None
     #: Exact final-block q=0 photon-head diagonals, already in the DFT
@@ -157,6 +161,14 @@ class SigmaResult:
     band_extrapolation_scheme: str | None = None
 
     def __post_init__(self) -> None:
+        if self.hartree_omitted:
+            if self.h_transverse_kij_ry is not None:
+                raise ValueError(
+                    "SigmaResult: omitted Hartree cannot carry H_T")
+            if tuple(np.shape(self.v_h_kij_ry)) != ():
+                raise ValueError(
+                    "SigmaResult: hartree_omitted requires the compact "
+                    "scalar-zero sentinel")
         if self.v_h_scalar_kij_ry is None:
             if self.h_transverse_kij_ry is not None:
                 raise ValueError(
@@ -250,6 +262,7 @@ BASIS_FREE_FIELDS = (
     "band_extrapolation_counts",
     "band_extrapolation_estimator",
     "band_extrapolation_scheme",
+    "hartree_omitted",
 )
 
 
@@ -335,6 +348,7 @@ def finalize_dynamic_sigma(
     sig_h: jax.Array,
     v_h_scalar: jax.Array | None = None,
     h_transverse: jax.Array | None = None,
+    hartree_omitted: bool = False,
     e_qp_ev: np.ndarray,
     config,
     meta,
@@ -500,6 +514,7 @@ def finalize_dynamic_sigma(
         v_h_kij_ry=sig_h,
         v_h_scalar_kij_ry=v_h_scalar,
         h_transverse_kij_ry=h_transverse,
+        hartree_omitted=bool(hartree_omitted),
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_qsgw,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
@@ -896,7 +911,12 @@ def compute_sigma_xc(
     # Density-SC rebuilds this same exact G-space operator from the evolving
     # orbitals directly in the DFT basis.  Other paths build it once here.
     if omit_v_h:
-        sig_h = jnp.zeros_like(sig_x)
+        # A scalar zero preserves SigmaResult's arithmetic-compatible field
+        # contract without allocating an otherwise dead (nk,nb,nb) matrix.
+        # The density-SC caller branches before matrix assembly and replaces
+        # this sentinel with its separately retained exact field at every
+        # final output seam.
+        sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
         sig_h, h_transverse = _compute_live_hartree(
@@ -930,6 +950,7 @@ def compute_sigma_xc(
             v_h_kij_ry=sig_h,
             v_h_scalar_kij_ry=v_h_scalar,
             h_transverse_kij_ry=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sig_x,
             sigma_sx_kij_ry=sig_x,
@@ -945,6 +966,7 @@ def compute_sigma_xc(
             v_h_kij_ry=sig_h,
             v_h_scalar_kij_ry=v_h_scalar,
             h_transverse_kij_ry=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             sigma_x_kij_ry=sig_x,
             sigma_xc_kij_ry=sigma_xc,
             sigma_sx_kij_ry=sig_sx,
@@ -1116,6 +1138,7 @@ def compute_sigma_xc(
             body.sigma_c_kij, head_diag,
             sig_x=sig_x, sig_h=sig_h,
             v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+            hartree_omitted=bool(omit_v_h),
             e_qp_ev=e_qp_ev,
             config=config, meta=meta, mesh_xy=mesh_xy,
             sym=sym, wfn=wfn, band_slices=band_slices,
@@ -1177,6 +1200,7 @@ def compute_sigma_xc(
         ppm_outputs.head_sigma_diag_w_kn_ry,
         sig_x=sig_x, sig_h=sig_h,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+        hartree_omitted=bool(omit_v_h),
         e_qp_ev=e_qp_ev,
         config=config, meta=meta, mesh_xy=mesh_xy,
         sym=sym, wfn=wfn, band_slices=band_slices,
