@@ -111,7 +111,7 @@ def average_sigma_components(
     Returns the eight inputs, averaged, in the same order.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.collectives import device_put_process_local
+    from common.collectives import device_put_process_local, gather_to_host
 
     rep = NamedSharding(mesh_xy, P(None, None, None))
 
@@ -122,8 +122,12 @@ def average_sigma_components(
     # the (replicated) Σ components, identical on every rank;
     # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
     def _dav(M):
+        # gather_to_host, not np.asarray: under sigma_omega_layout=sharded
+        # (mandatory for MPA metals) M spans other processes' devices and a
+        # host fetch raises; the gather returns the identical full array on
+        # every process, so the averaged result stays replica-consistent.
         return device_put_process_local(apply_to_matrix_diagonals(
-            np.asarray(M), energies_kn_ry, tol_ry), rep)
+            gather_to_host(M), energies_kn_ry, tol_ry), rep)
 
     sigma_total = _dav(sigma_total)
     sig_sx, sig_coh, sig_x = _dav(sig_sx), _dav(sig_coh), _dav(sig_x)
