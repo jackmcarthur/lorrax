@@ -218,18 +218,49 @@ def _sum_fixed_process_table(local, mesh_xy, label):
     return psum_replicate(local, mesh_xy)
 
 
-def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
-                   *, pole_offset=0, mesh_xy=None):
-    """Measure shallow/deep pole intervals before compact reduction."""
-    signed_energy, state_mass, state_indices = _branch_states(
-        branch, amplitude)
+def measure_delivered_sigma_pole_fields(
+    Omega, B, *, regularization_width_ry, pole_split_ry,
+    lattice_bins=DEFAULT_LATTICE_BINS, pole_offset=0, mesh_xy=None,
+):
+    """Reduce one pole batch's branch-invariant spatial fields once.
+
+    The four causal branches differ only in their state energies and
+    weights.  Their pole locations, residue masses, shallow/deep split, and
+    fixed collectives are identical, so measuring those fields per branch
+    repeats both a synchronizing device-to-host copy and the full spatial
+    histogram four times.
+
+    Parameters
+    ----------
+    Omega, B : array-like
+        Complex pole locations and residues with a common leading pole axis;
+        the remaining axes are the sharded spatial ISDF field.
+    regularization_width_ry : float
+        Causal broadening in Ry.
+    pole_split_ry : float
+        Shallow/deep pole boundary in Ry.
+    lattice_bins : int
+        Number of compact histogram nodes along each pole coordinate.
+    pole_offset : int
+        Global index of the first resident pole.
+    mesh_xy : Mesh, optional
+        Distributed mesh used for fixed-size moment reductions.
+
+    Returns
+    -------
+    tuple
+        Pole cells, their residue masses, global pole indices, global live
+        spatial-pole count, and bounded-reduction evidence.
+    """
+    eta = float(regularization_width_ry)
+    bins = int(lattice_bins)
     n_poles = int(Omega.shape[0])
     split = float(pole_split_ry)
     if not np.isfinite(split) or split <= 0.0:
         raise ValueError("pole_split_ry must be finite and positive")
     local_moments = np.zeros(
         (n_poles, 2, 3, int(bins) ** 2), dtype=np.float64)
-    bad_B = bad_pole = raw_count = 0
+    bad_B = bad_pole = live_count = 0
     for pole_indices, Omega_chunk, B_chunk in _local_pole_chunks(Omega, B):
         for local, pole_index in enumerate(pole_indices):
             omega = np.asarray(Omega_chunk[local], np.complex128).reshape(-1)
@@ -253,7 +284,7 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
                         _bounded_pole_moments(
                             broadened[selected], residue_mass[selected],
                             bins, eta))
-            raw_count += int(np.count_nonzero(live)) * int(signed_energy.size)
+            live_count += int(np.count_nonzero(live))
 
     bad = _sum_fixed_process_table(
         np.asarray([bad_B, bad_pole], dtype=np.int64), mesh_xy,
@@ -284,8 +315,9 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
         pole_cells.append(tuple(cells_by_interval))
         pole_weights.append(tuple(weights_by_interval))
 
-    raw_global = int(_sum_fixed_process_table(
-        np.asarray(raw_count, dtype=np.int64), mesh_xy, "raw-count scalar"))
+    live_global = int(_sum_fixed_process_table(
+        np.asarray(live_count, dtype=np.int64), mesh_xy,
+        "live-pole-count scalar"))
     ceiling = int(bins) ** 2
     evidence = {
         "pole_split_ry": split,
@@ -300,23 +332,30 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
     }
     poles = np.arange(int(pole_offset), int(pole_offset) + n_poles,
                       dtype=np.int32)
-    return (signed_energy, state_mass, state_indices, tuple(pole_cells),
-            tuple(pole_weights), poles, raw_global, evidence)
+    return (tuple(pole_cells), tuple(pole_weights), poles, live_global,
+            evidence)
 
 
 def measure_delivered_sigma_pole_batch(
     branch, Omega, B, *, regularization_width_ry, pole_split_ry=None,
     state_amplitude=None, lattice_bins=DEFAULT_LATTICE_BINS, pole_offset=0,
-    mesh_xy=None,
+    mesh_xy=None, pole_field_measure=None,
 ):
     """Reduce one resident pole batch into the two product pole intervals."""
     if pole_split_ry is None:
         pole_split_ry = delivered_product_geometry(
             [branch], regularization_width_ry)["pole_edge_ry"]
-    return _pole_measures(
-        branch, Omega, B, float(regularization_width_ry), state_amplitude,
-        int(lattice_bins), float(pole_split_ry), pole_offset=int(pole_offset),
-        mesh_xy=mesh_xy)
+    if pole_field_measure is None:
+        pole_field_measure = measure_delivered_sigma_pole_fields(
+            Omega, B, regularization_width_ry=regularization_width_ry,
+            pole_split_ry=pole_split_ry, lattice_bins=lattice_bins,
+            pole_offset=pole_offset, mesh_xy=mesh_xy)
+    pole_cells, pole_weights, poles, live_count, evidence = pole_field_measure
+    signed_energy, state_mass, state_indices = _branch_states(
+        branch, state_amplitude)
+    raw_count = int(live_count) * int(signed_energy.size)
+    return (signed_energy, state_mass, state_indices, pole_cells, pole_weights,
+            poles, raw_count, evidence)
 
 
 def combine_delivered_sigma_pole_measures(batch_measures):
@@ -741,9 +780,10 @@ def build_delivered_sigma_windows(
             state_amplitudes_by_branch, branch_rows,
             "state_amplitudes_by_branch")
         measure_rows = [
-            _pole_measures(
-                branch, Omega, B, eta, amplitude, int(lattice_bins), split,
-                mesh_xy=mesh_xy)
+            measure_delivered_sigma_pole_batch(
+                branch, Omega, B, regularization_width_ry=eta,
+                state_amplitude=amplitude, lattice_bins=int(lattice_bins),
+                pole_split_ry=split, mesh_xy=mesh_xy)
             for branch, Omega, B, amplitude in zip(
                 branch_rows, omega_rows, residue_rows, amplitude_rows)
         ]
@@ -1000,4 +1040,5 @@ __all__ = [
     "combine_delivered_sigma_pole_measures",
     "delivered_product_geometry",
     "measure_delivered_sigma_pole_batch",
+    "measure_delivered_sigma_pole_fields",
 ]

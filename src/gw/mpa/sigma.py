@@ -435,6 +435,7 @@ def compute_sigma_c_mpa_omega_grid(
                 combine_delivered_sigma_pole_measures,
                 delivered_product_geometry,
                 measure_delivered_sigma_pole_batch,
+                measure_delivered_sigma_pole_fields,
             )
             state_amplitudes = projected_state_amplitude_envelope(
                 wfns, state_bands=wfns.slices.sigma_sum,
@@ -446,17 +447,32 @@ def compute_sigma_c_mpa_omega_grid(
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
                 with timing.section("sigma.plan.measure"):
-                    Omega, B = reader.read(
-                        slice(lo, hi), unfold=True, return_sharded=True,
-                        to_unit="Ry")
-                    for branch_index, branch in enumerate(branches):
-                        measured[branch_index].append(
-                            measure_delivered_sigma_pole_batch(
-                                branch, Omega, B,
-                                regularization_width_ry=regularization_width_ry,
-                                pole_split_ry=product_geometry["pole_edge_ry"],
-                                state_amplitude=state_amplitudes,
+                    with timing.section("sigma.plan.read"):
+                        Omega, B = reader.read(
+                            slice(lo, hi), unfold=True, return_sharded=True,
+                            to_unit="Ry")
+                    with timing.section("sigma.plan.measure_fields"):
+                        pole_field_measure = (
+                            measure_delivered_sigma_pole_fields(
+                                Omega, B,
+                                regularization_width_ry=(
+                                    regularization_width_ry),
+                                pole_split_ry=(
+                                    product_geometry["pole_edge_ry"]),
                                 pole_offset=lo, mesh_xy=mesh_xy))
+                    for branch_index, branch in enumerate(branches):
+                        with timing.section("sigma.plan.measure_branch"):
+                            measured[branch_index].append(
+                                measure_delivered_sigma_pole_batch(
+                                    branch, Omega, B,
+                                    regularization_width_ry=(
+                                        regularization_width_ry),
+                                    pole_split_ry=(
+                                        product_geometry["pole_edge_ry"]),
+                                    state_amplitude=state_amplitudes,
+                                    pole_offset=lo, mesh_xy=mesh_xy,
+                                    pole_field_measure=pole_field_measure))
+                    del pole_field_measure
                 del Omega, B
                 gc.collect()
             with timing.section("sigma.plan.fit"):

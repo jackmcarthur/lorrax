@@ -7,6 +7,7 @@ from gw.mpa.delivered_windows import (
     build_delivered_sigma_windows,
     combine_delivered_sigma_pole_measures,
     measure_delivered_sigma_pole_batch,
+    measure_delivered_sigma_pole_fields,
 )
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
@@ -61,7 +62,8 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
     branch = _branch("streamed conduction", "cond", [0.2], omega_grid)
     Omega = np.asarray([0.5 - 0.05j, 0.9 - 0.08j]).reshape(2, 1, 1, 1)
     residue = np.asarray([0.7 + 0.2j, 0.3 - 0.1j]).reshape(2, 1, 1, 1)
-    kwargs = dict(regularization_width_ry=0.02, lattice_bins=9)
+    kwargs = dict(
+        regularization_width_ry=0.02, pole_split_ry=0.03, lattice_bins=9)
     whole = measure_delivered_sigma_pole_batch(
         branch, Omega, residue, **kwargs)
     streamed = combine_delivered_sigma_pole_measures([
@@ -82,6 +84,13 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
                     np.testing.assert_allclose(got, expected)
     assert streamed[6] == whole[6]
     assert streamed[7] == whole[7]
+
+    snapshot = measure_delivered_sigma_pole_fields(Omega, residue, **kwargs)
+    cached = measure_delivered_sigma_pole_batch(
+        branch, Omega, residue, pole_field_measure=snapshot, **kwargs)
+    for index in (0, 1, 2, 5, 6):
+        np.testing.assert_allclose(cached[index], whole[index])
+    assert cached[7] == whole[7]
 
     direct, direct_report = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,

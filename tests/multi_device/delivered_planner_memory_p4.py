@@ -46,7 +46,7 @@ from gw.mpa import delivered_windows as delivered_module  # noqa: E402
 from gw.ppm_windows import _SigmaBranch  # noqa: E402
 import minimax  # noqa: E402
 
-_pole_measures = delivered_module._pole_measures
+_measure_pole_batch = delivered_module.measure_delivered_sigma_pole_batch
 
 
 LATTICE_BINS = 25
@@ -103,9 +103,10 @@ def _measure(label, n_states, side, mesh):
 
     tracemalloc.start()
     tracemalloc.reset_peak()
-    result = _pole_measures(
-        branch, omega, residue, ETA_RY, amplitude, LATTICE_BINS, mesh
-    )
+    result = _measure_pole_batch(
+        branch, omega, residue, regularization_width_ry=ETA_RY,
+        pole_split_ry=0.8, state_amplitude=amplitude,
+        lattice_bins=LATTICE_BINS, mesh_xy=mesh)
     current_bytes, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     del current_bytes
@@ -126,7 +127,7 @@ def _measure(label, n_states, side, mesh):
         "python_peak_bytes_by_rank": peaks.tolist(),
         "python_peak_bytes_max": int(peaks.max()),
         "collective_cells_per_pole_per_rank": int(
-            evidence["collective_spatial_cell_ceiling_per_pole"]
+            evidence["collective_spatial_cell_ceiling_per_pole_interval"]
         ),
         "collective_payload_bytes_per_pole_per_rank": int(
             evidence["collective_payload_bytes_per_pole_per_rank"]
