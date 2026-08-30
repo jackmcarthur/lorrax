@@ -1076,7 +1076,6 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     layout: str = "legacy", face_shape=None,
-    tuple_components: bool = False,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1086,16 +1085,6 @@ def get_shared_sigma_tau_kernel(
     tile before that unchanged convolution.  It always uses the single
     complex projection carrier; HGL's missing sine arm is completed once by
     :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
-
-    With ``tuple_components=True`` the same owner consumes a small exact
-    factorization of a delivered state--pole tuple mask.  Each component has
-    one state selector and one vector of leading-pole coefficients.  G and W
-    are transformed component by component, their real-space products are
-    summed, and the Sigma-side forward transform plus band projection run
-    once.  Thus a shared-grid group pays one Sigma back-transform per distinct
-    tau even when several logical windows carry different coefficients.  The
-    loop keeps one G/W pair live at a time; no leading component axis is ever
-    materialized on a large spatial tensor.
 
     This is the entry point ``gw.mpa.sigma`` calls (insulating MPA shares
     this exact kernel with GN-PPM's merged Laplace plan — no bracket plan,
@@ -1107,97 +1096,12 @@ def get_shared_sigma_tau_kernel(
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           layout, face_shape, bool(tuple_components))
+           layout, face_shape)
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
-
-    if tuple_components:
-        if _stage_timing_enabled():
-            raise NotImplementedError(
-                "delivered tuple-component Sigma fusion is not available "
-                "with LORRAX_SIGMA_TAU_TIMING=1; disable the stage-split "
-                "diagnostic for the production fused executor")
-        if face_shape is None and layout == "face":
-            raise ValueError(
-                "tuple-component Sigma fusion with layout='face' requires "
-                "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        from .greens_function_kernel import build_G_tau
-        from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
-                                          V_FFT5D_SPEC as _V_spec)
-        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-
-        nk_tot = int(np.prod(kgrid))
-        inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
-        G_ifft = make_flat_k_ifftn(
-            mesh_xy, kgrid, _G_spec, norm="ortho")
-        G_fft = make_flat_k_fftn(
-            mesh_xy, kgrid, _G_spec, norm="ortho")
-        W_ifft = make_flat_k_ifftn(
-            mesh_xy, kgrid, _V_spec, norm="ortho")
-        project = _make_project_ri_reduce_scatter(
-            mesh_xy, merged_x=True, layout=layout, face_shape=face_shape)
-        g_plan = None
-        if layout == "face":
-            from distrib_la import gemm_plan
-            nk_f, nb_f, n_mu_f, n_spin_f = (int(x) for x in face_shape)
-            mu_spin = n_mu_f * n_spin_f
-            g_plan = gemm_plan(
-                mesh_xy, m=mu_spin, k=nb_f, n=mu_spin, nq=nk_f,
-                dtype=jnp.complex128)
-
-        def _build_component_G(xn, yr, E_A, selector, E_ref_A, t_node):
-            return build_G_tau(
-                xn, yr, E_A, 1j * t_node, e_ref=E_ref_A,
-                band_weight=selector, layout=layout, gemm=g_plan)
-
-        def _build_component_W(B_poles, Omega_poles, pole_weights,
-                               E_ref_B, t_node):
-            phase = jnp.exp(
-                -1j * (Omega_poles - E_ref_B) * t_node)
-            weights = pole_weights.reshape(
-                (pole_weights.shape[0],)
-                + (1,) * (Omega_poles.ndim - 1))
-            W_q = jnp.sum(weights * B_poles * phase, axis=0)
-            return jax.lax.with_sharding_constraint(W_q, q_mu_sharding)
-
-        @jax.jit
-        def _tau_components(
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, component_selectors, B_poles, Omega_poles,
-            component_pole_weights, E_ref_A, E_ref_B, t_node,
-        ):
-            if component_selectors.shape[0] < 1:
-                raise ValueError(
-                    "tuple-component Sigma fusion requires at least one "
-                    "component")
-
-            def _product(index):
-                selector = jax.lax.dynamic_index_in_dim(
-                    component_selectors, index, axis=0, keepdims=False)
-                pole_weight = jax.lax.dynamic_index_in_dim(
-                    component_pole_weights, index, axis=0, keepdims=False)
-                G_k = _build_component_G(
-                    psi_coh_xn, psi_coh_yr, E_A, selector,
-                    E_ref_A, t_node)
-                W_q = _build_component_W(
-                    B_poles, Omega_poles, pole_weight, E_ref_B, t_node)
-                return G_ifft(G_k) * W_ifft(W_q)[:, None, :, None, :]
-
-            product = _product(0)
-
-            def _add(index, total):
-                return total + _product(index)
-
-            product = jax.lax.fori_loop(
-                1, component_selectors.shape[0], _add, product)
-            sigma_k = G_fft(product * inv_sqrt_nk)
-            return project(psi_proj_xr, sigma_k, psi_proj_yn)
-
-        _sigma_shared_tau_kernel_cache[key] = _tau_components
-        return _tau_components
 
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,

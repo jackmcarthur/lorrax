@@ -16,8 +16,7 @@ from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import (SigmaOmegaResult,
                           assert_sharded_sigma_window_divides_mesh,
                           pad_sigma_window, strip_sigma_window)
-from gw.ppm_tau_kernel import (get_shared_sigma_direct_kernel,
-                               get_shared_sigma_tau_kernel)
+from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_plan import (resolve_delivered_max_direct_terms,
                            resolve_delivered_tau_grid, resolve_sigma_plan)
@@ -49,87 +48,6 @@ def _batch_rows(row, batch):
         (None if state_indices is None else
          np.asarray(state_indices[keep], np.int32)),
     )
-
-
-def _tau_group_key(row):
-    """Exact compatibility key for one fused equal-tau executor group."""
-    win = row.window
-    if win.project_code != 0:
-        raise ValueError(
-            "delivered tuple windows must use the full complex projection")
-    t = np.asarray(jax.device_get(win.nodes.t), np.complex128)
-    energy = np.asarray(jax.device_get(row.E_A), np.float64)
-    mask = np.asarray(win.mask_A, bool)
-    band_weight = getattr(row, "band_weight", None)
-    weight = (b"" if band_weight is None else
-              np.asarray(jax.device_get(band_weight), np.float64).tobytes())
-    return (
-        t.shape, t.tobytes(),
-        np.asarray(row.omega_idx, np.int64).tobytes(),
-        np.asarray(row.omega_abs, np.float64).tobytes(),
-        int(win.omega_sign), float(win.E_ref_A), float(win.E_ref_B),
-        energy.shape, energy.tobytes(), mask.tobytes(), weight,
-    )
-
-
-def _tau_groups(plan, batch):
-    """Group executable rows by exact shared grid and frequency block."""
-    groups = {}
-    order = []
-    for row in plan:
-        if bool(getattr(row, "direct", False)):
-            continue
-        selected = _batch_rows(row, batch)
-        if selected is None:
-            continue
-        key = _tau_group_key(row)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append((row, selected))
-    return [groups[key] for key in order]
-
-
-def _tuple_components(group, tau_index, base_selector, batch_width):
-    """Factor a fused group into one exact state selector per local pole.
-
-    The dense coefficient table is tiny: ``(nk*nb, pole_batch_size<=8)``.
-    Its columns are an exact decomposition, so the device kernel carries at
-    most one G/W component per resident leading pole while performing only
-    one Sigma-side back-transform for the whole equal-tau group.
-    """
-    base = np.asarray(base_selector, dtype=np.complex128)
-    coefficients = np.zeros((base.size, int(batch_width)), np.complex128)
-    all_bounds = np.asarray(
-        (0.0, np.inf, -np.inf, -np.inf, np.inf, np.inf), np.float64)
-    for row, selected in group:
-        local_poles, bounds, phase_real, state_indices = selected
-        if state_indices is None:
-            raise ValueError(
-                "tuple-component fusion requires explicit state_indices")
-        if (not np.all(bounds == all_bounds[None, :])
-                or np.any(phase_real)):
-            raise ValueError(
-                "delivered tuple fusion currently requires complete complex "
-                "pole fields; bounded/real-phase panes stay on the incumbent "
-                "separable executor")
-        win = row.window
-        t = complex(np.asarray(jax.device_get(win.nodes.t))[tau_index])
-        alpha = complex(np.asarray(
-            jax.device_get(win.nodes.alpha))[tau_index])
-        coefficient = (float(win.prefactor) * alpha
-                       * np.exp(-1j * (win.E_ref_A + win.E_ref_B) * t))
-        np.add.at(coefficients, (state_indices, local_poles), coefficient)
-    coefficients *= base.reshape(-1, 1)
-    active = np.nonzero(np.any(coefficients != 0.0, axis=0))[0]
-    if not active.size:
-        raise RuntimeError("shared delivered tau group has no active component")
-    selectors = coefficients[:, active].T.reshape(
-        (active.size,) + base.shape)
-    pole_weights = np.zeros(
-        (active.size, int(batch_width)), dtype=np.complex128)
-    pole_weights[np.arange(active.size), active] = 1.0
-    return selectors, pole_weights
 
 
 def _integrate_sigma_batches(
@@ -220,180 +138,61 @@ def _integrate_sigma_batches(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
         **face_kwargs)
-    delivered_tuples = any(
-        getattr(row, "state_indices", None) is not None for row in plan)
-    tuple_tau_kernel = (
-        get_shared_sigma_tau_kernel(
-            mesh_xy=mesh_xy, kgrid=kgrid, tuple_components=True,
-            **face_kwargs)
-        if delivered_tuples else None)
-    direct_kernel = (
-        get_shared_sigma_direct_kernel(
-            mesh_xy=mesh_xy, kgrid=kgrid, **face_kwargs)
-        if any(bool(getattr(row, "direct", False)) for row in plan)
-        else None)
+    if any(getattr(row, "state_indices", None) is not None
+           or bool(getattr(row, "direct", False)) for row in plan):
+        raise ValueError(
+            "MPA Sigma execution requires Cartesian product windows; "
+            "explicit delivered tuples/direct terms have no separate kernel")
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
-    logical_tau_pairs = (int(sum(
-        row.window.n_tau for row in plan
-        if not bool(getattr(row, "direct", False))))
-        if delivered_tuples else 0)
+    logical_tau_pairs = 0
     direct_terms = direct_frequency_dispatches = 0
-    component_transforms = 0
     batch_size = int(pole_batch_size)
-    global_tau_groups = (
-        _tau_groups(plan, tuple(range(int(n_poles))))
-        if delivered_tuples else ())
-    partial_tau = {}
     for lo, Omega, B in batches:
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
-        if delivered_tuples:
-            for group in _tau_groups(plan, batch):
-                first = group[0][0]
-                win = first.window
-                weight = getattr(first, "band_weight", None)
-                base_selector = np.asarray(win.mask_A, np.complex128)
-                if weight is not None:
-                    base_selector *= np.asarray(
-                        jax.device_get(weight), np.float64).reshape(
-                            base_selector.shape)
-                nodes = np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128)
-                group_key = _tau_group_key(first)
-                for tau_index, t in enumerate(nodes):
-                    selectors, pole_weights = _tuple_components(
-                        group, tau_index, base_selector, width)
-                    component_transforms += int(selectors.shape[0])
-                    selectors_j, pole_weights_j = (
-                        device_put_process_local(x, small)
-                        for x in (selectors, pole_weights))
-                    sigma_tau = tuple_tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        first.E_A, selectors_j, B, Omega, pole_weights_j,
-                        jnp.asarray(win.E_ref_A),
-                        jnp.asarray(win.E_ref_B),
-                        jnp.asarray(t, dtype=jnp.complex128))
-                    partial_key = (group_key, tau_index)
-                    if partial_key in partial_tau:
-                        sigma_tau = partial_tau[partial_key] + sigma_tau
-                    partial_tau[partial_key] = sigma_tau.block_until_ready()
-
-            for row in plan:
-                if not bool(getattr(row, "direct", False)):
-                    continue
-                selected = _batch_rows(row, batch)
-                if selected is None:
-                    continue
-                local_poles, bounds, phase_real, state_indices = selected
-                if state_indices is None:
-                    raise ValueError(
-                        "a direct delivered row requires explicit "
-                        "state_indices")
-                win = row.window
-                base_selector = np.asarray(win.mask_A, np.complex128)
-                weight = getattr(row, "band_weight", None)
-                if weight is not None:
-                    base_selector *= np.asarray(
-                        jax.device_get(weight), np.float64).reshape(
-                            base_selector.shape)
-                (base_selector_j, local_poles_j, bounds_j, phase_real_j,
-                 state_indices_j) = (
-                    device_put_process_local(x, small) for x in (
-                        base_selector, local_poles, bounds, phase_real,
-                        state_indices))
-                pole_sign = int(getattr(row, "pole_sign", 1))
-                external_sign = int(win.omega_sign) * pole_sign
-                eta = float(getattr(row, "direct_eta_ry", 0.0))
-                for omega_abs, omega_index in zip(
-                        np.asarray(row.omega_abs, np.float64),
-                        np.asarray(row.omega_idx, np.int64)):
-                    sigma_direct = direct_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        row.E_A, base_selector_j, B, Omega,
-                        state_indices_j, local_poles_j, bounds_j,
-                        phase_real_j, jnp.asarray(omega_abs),
-                        jnp.asarray(external_sign), jnp.asarray(pole_sign),
-                        jnp.asarray(eta))
-                    accumulator.add_direct(
-                        sigma_direct, int(omega_index),
-                        coefficient=win.prefactor)
-                    direct_frequency_dispatches += 1
-                direct_terms += int(state_indices.size)
-        else:
-            # Incumbent panes: preserve the established call sequence and
-            # bounded-pole semantics byte-for-byte.
-            for row in plan:
-                selected = _batch_rows(row, batch)
-                if selected is None:
-                    continue
-                pole_indices, bounds, phase_real, _states = selected
-                pole_indices, bounds, phase_real = (
-                    device_put_process_local(x, small)
-                    for x in (pole_indices, bounds, phase_real))
-                win = row.window
-                weight = getattr(row, "band_weight", None)
-                if weight is None:
-                    selector = jnp.asarray(win.mask_A)
-                else:
-                    selector = (jnp.asarray(win.mask_A, jnp.float64)
-                                * jnp.reshape(
-                                    jnp.asarray(weight, jnp.float64),
-                                    np.asarray(win.mask_A).shape))
-                accumulator.begin_window(
-                    win.nodes.t, win.nodes.alpha,
-                    omega_sign=win.omega_sign, prefactor=win.prefactor,
-                    e_ref_sum=win.E_ref_A + win.E_ref_B,
-                    antihermitian=(win.project_code == 1),
-                    omega_indices=row.omega_idx,
-                    omega_values=row.omega_abs)
-                for t in np.asarray(
-                        jax.device_get(win.nodes.t), np.complex128):
-                    sigma_tau = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        row.E_A, selector, B, Omega,
-                        pole_indices, bounds, phase_real,
-                        jnp.asarray(win.E_ref_A),
-                        jnp.asarray(win.E_ref_B),
-                        jnp.asarray(t, dtype=jnp.complex128))
-                    accumulator.add_tau(sigma_tau)
-                    n_tau += 1
-                accumulator.end_window()
-                n_sweeps += 1
-                logical_tau_pairs += win.n_tau
-        del B, Omega
-        gc.collect()
-
-    if delivered_tuples:
-        for group in global_tau_groups:
-            first = group[0][0]
-            win = first.window
-            nodes = np.asarray(jax.device_get(win.nodes.t), np.complex128)
-            group_key = _tau_group_key(first)
+        for row in plan:
+            selected = _batch_rows(row, batch)
+            if selected is None:
+                continue
+            pole_indices, bounds, phase_real, _states = selected
+            pole_indices, bounds, phase_real = (
+                device_put_process_local(x, small)
+                for x in (pole_indices, bounds, phase_real))
+            win = row.window
+            weight = getattr(row, "band_weight", None)
+            if weight is None:
+                selector = jnp.asarray(win.mask_A)
+            else:
+                selector = (jnp.asarray(win.mask_A, jnp.float64)
+                            * jnp.reshape(
+                                jnp.asarray(weight, jnp.float64),
+                                np.asarray(win.mask_A).shape))
             accumulator.begin_window(
-                nodes, np.ones(nodes.size, np.complex128),
-                omega_sign=win.omega_sign, prefactor=1.0,
-                e_ref_sum=0.0, antihermitian=False,
-                omega_indices=first.omega_idx,
-                omega_values=first.omega_abs)
-            for tau_index in range(nodes.size):
-                try:
-                    sigma_tau = partial_tau.pop((group_key, tau_index))
-                except KeyError as exc:
-                    raise RuntimeError(
-                        "delivered Sigma pole batching left an incomplete "
-                        "equal-tau group") from exc
+                win.nodes.t, win.nodes.alpha,
+                omega_sign=win.omega_sign, prefactor=win.prefactor,
+                e_ref_sum=win.E_ref_A + win.E_ref_B,
+                antihermitian=(win.project_code == 1),
+                omega_indices=row.omega_idx,
+                omega_values=row.omega_abs)
+            for t in np.asarray(
+                    jax.device_get(win.nodes.t), np.complex128):
+                sigma_tau = tau_kernel(
+                    psi_coh_xn, psi_coh_yr,
+                    psi_proj_xr, psi_proj_yn,
+                    row.E_A, selector, B, Omega,
+                    pole_indices, bounds, phase_real,
+                    jnp.asarray(win.E_ref_A),
+                    jnp.asarray(win.E_ref_B),
+                    jnp.asarray(t, dtype=jnp.complex128))
                 accumulator.add_tau(sigma_tau)
                 n_tau += 1
             accumulator.end_window()
             n_sweeps += 1
-        if partial_tau:
-            raise RuntimeError(
-                "delivered Sigma pole batching produced orphaned tau blocks")
+            logical_tau_pairs += win.n_tau
+        del B, Omega
+        gc.collect()
 
     sigma = strip_sigma_window(
         accumulator.finalize(), nb_real, mesh_xy=mesh_xy)
@@ -404,7 +203,7 @@ def _integrate_sigma_batches(
         f"{direct_terms} direct terms in {direct_frequency_dispatches} "
         f"frequency dispatches; equal-tau fusion saved "
         f"{transform_saving} Sigma back-transforms "
-        f"({component_transforms} G/W component transforms)")
+        f"through the shared pane tau kernel")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
