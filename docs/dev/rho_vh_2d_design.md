@@ -23,10 +23,11 @@ The local physics is shared. The data schedule is selected by use case.
 | one-shot GW | stream fixed `(k, band)` chunks in `gw.kin_ion_io` | bounded wavefunction memory; one final grid reduction | work is divided by JAX process, not by every addressable device |
 | density-self-consistent GW | scan resident band-sharded orbitals in `gw.qsgw_density` | reuses the rotated orbitals and runs on the full device mesh | retains the orbitals and performs mesh reductions during the scan |
 
-The one-shot schedule is fully parallel for the common launch with one GPU
-per process. With one process controlling several GPUs, its density/current
-stage currently runs on that process's first device. The later
-matrix-element sweep still uses the full two-dimensional mesh. Extending the
+The one-shot schedule is fully parallel for the required launch with one GPU
+per process. A historical one-process/multi-GPU diagnostic showed that its
+density/current stage uses only the process's first device; that launch
+geometry is prohibited on Perlmutter and is not P=4 evidence. The later
+matrix-element sweep did use the visible two-dimensional mesh. Extending the
 stream over global devices would combine its low memory use with full-device
 parallelism; it should reuse the same local contraction and finish with one
 grid reduction.

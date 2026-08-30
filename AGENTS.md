@@ -97,6 +97,11 @@ lx test                                       # the default gate, on a compute n
 lx status                                     # who is running where
 ```
 
+**Perlmutter GPU runs use exactly one task/rank per GPU.** Leave `-n` at
+`lx`'s default or set `-n = nodes * GPUs_per_node`. A whole-node run is
+`-N 1 -G 4 -n 4`; `-G 4 -n 1` is prohibited and is not P=4 evidence.
+Interactive `lx shell` sessions use one GPU.
+
 `lx` allocates or attaches by itself, so never `sbatch` an iteration and never
 `lx release --all`. The older `module load lorrax_X` + `lxalloc`/`lxrun`/`lxpre`
 workflow is superseded; `docs/environment/machines/perlmutter.md` is the current

@@ -440,8 +440,10 @@ run. See that branch's commits for the exact diff each check landed with.
   GB` (face) `+ ≈0.98 GB` (X-form at `3.90 GB / p_x=4`) plus small
   metadata, not with a leftover single-axis Y-form (which would add
   another ≈0.98 GB at this shape).
-* **Regression, real 4-rank CUDA** (`lx run -G 4 -n 1 ...`, JID
-  57438326): `tests/test_zeta_mesh_invariance.py` **7/7 PASS**
+* **Regression, historical one-rank/four-visible-GPU placement** (`lx run
+  -G 4 -n 1 ...`, JID 57438326):
+  `tests/test_zeta_mesh_invariance.py` **7/7 PASS**. This placement is now
+  prohibited and is single-rank numerical evidence, not a real P=4 gate.
   (unaffected — the small-system fast path never sets `low_mem_bands`);
   `tests/test_wavefunction_bundle_face_carrier.py`,
   `tests/test_low_mem_bands_envelope.py`, `tests/test_contract_bands.py`
