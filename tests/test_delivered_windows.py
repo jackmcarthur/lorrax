@@ -14,7 +14,8 @@ from gw.mpa.delivered_windows import (
 )
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
-from minimax import ReciprocalMeasureProblem
+from minimax import (ReciprocalMeasureProblem, delivered_error,
+                     rule_amplification)
 
 
 def _branch(tag, space, energies, omega, *, negative_half=False):
@@ -288,6 +289,56 @@ def test_zero_time_rule_is_refused():
         delivered._rule_candidate(
             problem, problem, np.asarray([0.0]), np.asarray([1.0]),
             {"family": "invalid"})
+
+
+def test_combined_rule_metrics_match_the_service_definitions():
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([-0.2, 0.4]),
+        internal_sums=np.asarray([-1.0 - 0.1j, -0.7 - 0.2j]),
+        cell_masses=np.asarray([0.3, 0.7]))
+    times = np.asarray([0.2j, 0.9j])
+    weights = np.asarray([0.4 - 0.1j, 0.6 + 0.2j])
+    residual, _excluded = delivered_error(problem, times, weights)
+    p99, peak = rule_amplification(times, weights, problem)
+
+    np.testing.assert_allclose(
+        delivered._rule_metrics(problem, times, weights),
+        (np.max(residual), p99, peak), rtol=2.0e-15, atol=0.0)
+
+
+def test_noncrossing_table_walk_continues_after_a_measured_miss(monkeypatch):
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([0.0]),
+        internal_sums=np.asarray([-1.0 - 0.1j]),
+        cell_masses=np.asarray([1.0]))
+    denominator = complex(problem.denominators[0, 0])
+    passing_time = np.asarray([1.0j])
+    passing_weight = np.asarray([
+        np.exp(denominator) / denominator], dtype=np.complex128)
+
+    def table_walk(*_args, **_kwargs):
+        yield (np.asarray([1.0j]), np.asarray([0.0j]),
+               {"family": "noncrossing", "candidate_tolerance": 1.0e-6,
+                "provenance": "first table"})
+        yield (passing_time, passing_weight,
+               {"family": "noncrossing", "candidate_tolerance": 2.0e-7,
+                "provenance": "next tighter table"})
+
+    monkeypatch.setattr(
+        delivered, "_sign_definite_table_candidates", table_walk)
+    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
+    spec = {
+        "name": "walk probe", "kind": "sign_definite_positive",
+        "problem": problem, "validation": problem, "pole_sign": 1.0,
+        "envelope": 1.0,
+    }
+    candidates = delivered._candidate_rules(
+        spec, eta=0.1, max_nodes=8, factor_growth_cap=30.0,
+        relative_target=1.0e-5)
+
+    assert len(candidates) == 1
+    assert candidates[0]["evidence"]["provenance"] == "next tighter table"
+    assert len(candidates[0]["attempts"]) == 2
 
 
 def test_tolerance_ladder_is_deleted():
