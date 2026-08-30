@@ -25,7 +25,10 @@ import jax
 # exactly the JAX process mesh it needs without bootstrapping unrelated native
 # services; that also makes absence of an in-tree FFI build irrelevant to the
 # stated memory claim.
-jax.distributed.initialize()
+# ``select_gpu.sh`` exposes one device per process.  Slurm auto-detection
+# otherwise reuses the local rank as a device ordinal (1/2/3 on those ranks),
+# even though each process-local CUDA namespace contains only device zero.
+jax.distributed.initialize(local_device_ids=[0])
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
