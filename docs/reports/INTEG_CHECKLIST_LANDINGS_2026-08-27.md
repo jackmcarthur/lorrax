@@ -166,9 +166,11 @@ paths are sequential — and no test covers the combination, because the two
 branches were developed against different bases. Closing it means new schema
 fields, so it is recorded rather than fixed here.
 
-**(b) Direct-field branch divergence: resolved.** The live G-space builder is
-now the only Hartree path, so the old source-resolution merge conflict no
-longer exists.
+**(b) Direct-field branch divergence (resolved).** At this report's baseline,
+`18c5b718` omitted upstream's `hartree_already_resolved=True`; this was a
+numerical no-op because the folded-source matrix was zeroed, but it left a
+repeatable merge conflict and changed the reported rule label. `62f1fa22`
+deleted source selection: live G-space is now the only Hartree path.
 
 **(c) The evaluation-stamp wedge ruling** — §1a.
 

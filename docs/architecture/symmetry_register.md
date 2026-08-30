@@ -697,8 +697,8 @@ measurable separately and both are ~100 % of the signal:
 So the complete rule is `d_a(gk) = −1^{TRS} · R_cart_forward[s]_{ab} ·
 conj^{TRS}(d_b(k))`, and the sign is there because **v̂ is odd under time
 reversal** while `kin_ion` is even. The live G-space Hartree matrix follows
-the scalar-operator star relation but is not a stored artifact. The tree already said the
-transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
+the scalar-operator star relation but is not stored. The tree already said
+the transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
 rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
 TRANSPOSE of this matrix", and the scorecard above records it as *named but
 unused*. The TRS sign was not written down anywhere.

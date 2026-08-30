@@ -320,10 +320,9 @@ Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are
 ### 3.3 Key collective patterns
 
 - **Static COHSEX Σ path** (`gw.cohsex_sigma`): `_convolve(G, W)` uses
-  per-device IFFT/FFT on the replicated three-dimensional k axes while
-  keeping μ on `'x'` and ν on `'y'`. The final band projection is
-  two-axis sharded. The Hartree matrix is built separately from the WFN by
-  `gw.kin_ion_io.compute_hartree_matrix` and stays `P(None,'x','y')`.
+  per-device FFTs on replicated three-dimensional k axes while μ/ν remain on
+  `'x'`/`'y'`; band projection is two-axis sharded. Separately,
+  `compute_hartree_matrix` returns `P(None,'x','y')`.
 
 - **χ₀ minimax kernel** (`w_isdf._get_chi_minimax_kernel`): `Gv` and `Gc` use *swapped* μ/ν ⇄ 'x'/'y' assignments (`_Gv_spec` μ=x, ν=y; `_Gc_spec` μ=y, ν=x) so that the final `einsum('Rambn,Rbnam->Rmn')` contracts over the two local axes and leaves output sharded `(μ_Y, ν_X)` — explicit `with_sharding_constraint` on `_chi_R_spec = P(None, 'y', 'x')` prevents XLA from replicating a 23 GB intermediate at Si 4×4×4 60 Ry μ=2400.
 

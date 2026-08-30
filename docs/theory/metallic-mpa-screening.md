@@ -615,15 +615,11 @@ equalizing xi/eta or carrying this caveat verbatim.
 
 ### 5.4 Exchange, SX, and Hartree occupations
 
-`gw.cohsex_sigma.build_Gij(occupation_state=...)` builds
-`G_ij = diag(f)` for exchange and screened exchange. It refuses a Sigma
-window whose electron count differs from the occupation state by more than
-`1e-8`. Step occupations reproduce the insulating projector exactly.
-
-The same `OccupationState` reaches the dynamic Sigma pipeline and the live
-G-space Hartree build. Hartree uses every occupied band needed by the density;
-the screening occupation window does not truncate it. Charge and bispinor
-current use the same `f_kn` table in every self-consistent iteration.
+`build_Gij(occupation_state=...)` uses `G_ij=diag(f)` for exchange and SX;
+an electron-count mismatch above `1e-8` refuses, and step occupations recover
+the insulating projector exactly. Hartree receives the same `OccupationState`
+but uses the complete density rather than the screening window
+([contract](hartree.md)).
 
 ### 5.5 Provenance stamps
 

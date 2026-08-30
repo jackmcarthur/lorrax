@@ -339,11 +339,9 @@ See `claims/0441.md` for exact job ids and artifact paths; summarized here.
   dispatcher split, independent of anything face-specific.
 * **`tests/test_low_mem_bands_envelope.py`** (the refusal-row comment
   update): 24/24 PASS, JID 57457661.
-* **`tests/test_zeta_mesh_invariance.py`**: 7/7 PASS on a historical
-  one-rank/four-visible-GPU launch (`lx run -N 1 -G 4 -n 1 ...`, JID
-  57457661). That placement is now prohibited and proves only single-rank
-  numerical behavior, not P=4 scaling. The result was otherwise unaffected,
-  as expected (this session never touches `isdf/`). The CPU-emulated multi-device
+* **`tests/test_zeta_mesh_invariance.py`**: 7/7 PASS, JID 57457661,
+  historical one-rank/four-visible-GPU launch (`-N 1 -G 4 -n 1`). This is
+  single-rank numerical evidence, not P=4 or scaling evidence. The CPU-emulated multi-device
   path for this file is unreliable on this sandbox's jax build
   independent of any diff here (`KNOWN_SANDBOX_ERRORS.md`, 2026-08-23
   row); 5/7 there, verified identical on the unmodified base tree via

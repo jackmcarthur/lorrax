@@ -1,5 +1,8 @@
 # COHSEX in the JAX ISDF Pipeline
 
+> Historical implementation snapshot. Current direct-field behavior is owned
+> by [the Hartree theory page](../../theory/hartree.md).
+
 This note expands on `docs/formalism.md` with the full set of working equations
 implemented in `src/gw_isdf/gw_jax.py` and `src/gw_isdf/w_isdf.py`.
 It is organized to match the major stages of the driver: ISDF interpolation,
@@ -182,11 +185,9 @@ $\Sigma_{ij}(\mathbf{k}) = \sum_{\mu\nu}\psi^{*}_{i\mathbf{k}}(\mathbf{r}_\mu)
     \Sigma^{\text{SX}}_{\mu\nu}(\mathbf{k})\psi_{j\mathbf{k}}(\mathbf{r}_\nu)$,
 performed in two einsums by `get_sigma_x_kij_jax`.【F:src/gw_isdf/gw_jax.py†L804-L820】
 
-LORRAX builds Hartree from the occupied density on the WFN FFT grid, solves
-Poisson in G-space, and projects the resulting local potential into the band
-basis. Bispinor
-calculations form charge and transverse current matrix elements in the same
-packed sweep. See `docs/dev/rho_vh_2d_design.md` for the current contract.
+At this snapshot, Hartree was accumulated from the q=0 Coulomb block by
+forming $V_0\rho$ in the centroid basis and projecting it like
+$\Sigma^{\mathrm{SX}}$.【F:src/gw_isdf/gw_jax.py†L820-L834】
 
 ### Spin conventions
 
@@ -196,19 +197,19 @@ self-energy formulas.  The wavefunctions already represent the full spinor
 structure (though collapsed to a single component when SOC lifts degeneracy),
 so occupation is strictly 1 per state rather than 2.
 
-## 7. Self-consistency
+## 7. Fixed-point self-consistency (prototype)
 
-The current driver contains a fixed-point prototype that would iterate the total
+This snapshot contains a fixed-point prototype that would iterate the total
 self-energy until convergence.  The Hamiltonians are
 $$
 H_{\text{DFT}} = K + I + V_H + V_{xc},\qquad
 H_{\text{QP}} = K + I + V_H + \Sigma_{xc}(\omega\!\approx\!0),
 $$
 where $K+I$ ("kin+ion") is provided by a separate module in the codebase.
-The self-consistent driver diagonalizes the current Hamiltonian, resolves its
-occupation state, and rebuilds the direct field from the current orbitals.
-Basis conversion, mixing and convergence are owned by `gw.sc_iteration`; this
-archived note does not define their current policy.
+The snapshot's prototype re-evaluated static exchange and Hartree under
+`crop_family_fixed_history_map`; it was not validated as a full GW cycle and
+did not update dynamical $\Sigma^{\mathrm{COH}}$.
+【F:src/gw_isdf/gw_jax.py†L1230-L1372】
 
 ## 8. Memory and parallel-scaling considerations
 

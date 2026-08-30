@@ -125,17 +125,14 @@ fails the check. Missing pseudopotentials in the deck dir / `../qe/{scf,nscf}` f
 
 ## kin-ion — `gw.kin_ion_io`
 
-Computes the pristine ionic one-body Hamiltonian matrix `<mk|T + V_loc + V_NL|nk>` for every full-BZ k.
-It reads the deck (`-i`) as the source of truth (`sys_dim`, band window, spinor mode), plus `WFN.h5` and the
-`*.upf` pseudopotentials, and writes only the `kin_ion` operator to `kin_ion.h5`. The GW driver separately
-builds the occupied density, solves the [direct Hartree field](theory/hartree.md)
-in G-space, and contracts `<mk|V_H|nk>` during GW. There is no Hartree
-preprocessing step.
+Writes `<mk|T+V_loc+V_NL|nk>` to `kin_ion.h5`; Hartree is built live by GW
+([contract](theory/hartree.md)). The deck owns system, band, and spinor
+settings; `WFN.h5` and the pseudopotentials are provenance inputs.
 
-Invoke: `python3 -m gw.kin_ion_io -i deck.in -o kin_ion.h5 -n NB`; multi-rank capable with a coordinated
-rank-0 write. Reuse contract: the file stamps its k storage, spinor representation, system dimension, band
-extent, input, WFN, and pseudopotential provenance. Files outside this contract are refused before the matrix
-payload is read. Fastloop stage: `kin_ion` (~6 s of the chain).
+Invoke: `python3 -m gw.kin_ion_io -i deck.in -o kin_ion.h5 -n NB`.
+Multi-rank writes are coordinated at rank 0. Reuse requires matching k storage,
+spinor representation, system dimension, band extent, WFN, input, and
+pseudopotential stamps; mismatch refuses before reading the matrix.
 
 | key / flag | default | meaning |
 |---|---|---|

@@ -1,22 +1,18 @@
 # Direct Hartree field
 
-LORRAX builds the direct field from the wavefunctions and occupations used by
-the current calculation. It does this when GW runs. The `kin_ion.h5` file
-contains only the kinetic and ionic operators.
+`kin_ion.h5` contains only kinetic and ionic operators. GW builds the direct
+field live from its wavefunctions and occupations.
 
-## Charge and current
-
-The scalar source is
+## Sources
 
 $$
 \rho(\mathbf r)=\sum_{\mathbf k n}w_{\mathbf k}f_{n\mathbf k}
 \psi^\dagger_{n\mathbf k}(\mathbf r)\psi_{n\mathbf k}(\mathbf r).
 $$
 
-Here $w_{\mathbf k}$ is the k-point weight and $f_{n\mathbf k}$ is the full
-occupation weight. A screening band cutoff does not truncate this sum.
-
-A four-component bispinor calculation also forms the signed Dirac current
+Here $f_{n\mathbf k}$ is the physical occupation; a screening cutoff does not
+truncate the density. Four-component bispinors also form the signed Dirac
+current
 
 $$
 J_i(\mathbf r)/c=\sum_{\mathbf k n}w_{\mathbf k}f_{n\mathbf k}
@@ -24,33 +20,26 @@ J_i(\mathbf r)/c=\sum_{\mathbf k n}w_{\mathbf k}f_{n\mathbf k}
 \psi_{n\mathbf k}(\mathbf r).
 $$
 
-This is a current density, not a second charge density. Charge and current are
-contracted from the same orbitals, occupations and inverse FFT.
+Charge and current use the same orbitals, occupations, and inverse FFT. $J/c$
+is a current, not a second charge density.
 
-## Reciprocal-space solve
-
-In Rydberg units, the periodic scalar solve is
+## G-space solve
 
 $$
 V_H(\mathbf G)=\frac{8\pi\rho(\mathbf G)}{|\mathbf G|^2},\qquad
 \mathbf G\ne0.
 $$
 
-The periodic average $V_H(\mathbf G=0)$ is set to zero. A two-dimensional
-calculation applies the slab Coulomb factor selected by `sys_dim`.
-
-For a bispinor, the same Coulomb kernel acts on the transverse part of the
-current,
+The periodic zero mode is zero; `sys_dim=2` applies the slab Coulomb factor.
+For bispinors, the same kernel acts on transverse current:
 
 $$
 A_i(\mathbf G)=s_{TT}v(\mathbf G)
 \left(\delta_{ij}-\frac{G_iG_j}{|\mathbf G|^2}\right)J_j(\mathbf G)/c.
 $$
 
-The transverse projector and its sign convention are shared with the other
-current vertices. The zero mode is again zero.
-
-The band-space direct operator is
+Here $s_{TT}$ is the shared transverse-metric sign and $A_i(0)=0$. The
+band-space operator is
 
 $$
 H^{\mathrm{dir}}_{mn\mathbf k}=
@@ -58,20 +47,15 @@ H^{\mathrm{dir}}_{mn\mathbf k}=
 \left\langle m\mathbf k\left|\sum_i\alpha_iA_i\right|n\mathbf k\right\rangle.
 $$
 
-The vector term is absent in a scalar calculation. LORRAX packs the scalar
-and vector actions into one matrix-element sweep. The result remains sharded
-over both band axes.
+Scalar runs omit the vector term. One packed matrix-element sweep returns
+`P(None,'x','y')` over the two band axes.
 
-## Self-consistency
+## Lifecycle
 
-A one-shot calculation uses the DFT orbitals and their physical occupations.
-A density-self-consistent calculation rebuilds charge, current and the direct
-field from the current occupied orbitals at every iteration. It then forms
-the matrix elements in that same basis. Screening is rebuilt by its own GW
-path; it is not part of the Hartree solve.
+One-shot GW uses DFT orbitals. Density-self-consistent GW rebuilds the sources
+and field from the current orbitals at every iteration, then contracts the
+field in the DFT basis. Screening is a separate GW stage. Hartree always uses
+the WFN FFT grid: there is no stored, folded, or ISDF Hartree selector.
 
-ISDF compresses screening and self-energy objects. The direct field instead
-uses the wavefunction FFT grid.
-
-Implementation ownership and parallel schedules are described in the
-repository-only note `docs/dev/rho_vh_2d_design.md`.
+API ownership, schedules, and evidence scope:
+`docs/dev/rho_vh_2d_design.md` (repository only).

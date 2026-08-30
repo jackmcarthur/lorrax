@@ -3,7 +3,8 @@
 > **2026-07-31 note:** every reference to `_accumulate_kij_stream` /
 > `kij_stream` below is moot — the streamed accumulation mode was removed
 > (owner-approved deprecation sweep); only the `write_sigma_omega_h5`
-> targets remain relevant.
+> targets remain relevant. Variable names in the snippets are historical;
+> current Hartree APIs are documented in `docs/theory/hartree.md`.
 
 ## Scope (narrowed after the second audit)
 
@@ -12,11 +13,11 @@ Two write sites in `gw_jax` — both already routed through
 That's the entire target of v1:
 
 1. **Static COHSEX** — three `(nk, nb, nb)` C128 arrays (`sig_sx`,
-   `sig_coh`, `direct_hartree`), produced sharded under `mesh_xy` and currently
-   flattened to host via `np.array(...)` at
+   `sig_coh`, `sig_h`), produced sharded under `mesh_xy` and then flattened
+   to host via `np.array(...)` at
    [`gw_jax.py:500-501`](/pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_C/src/gw/gw_jax.py#L500).
 2. **Dynamic Σ_c(ω)** — one `(n_omega, nk, nb, nb)` C128 tensor
-   (`sigma_c_omega`), produced sharded, currently either:
+   (`sigma_c_omega`), produced sharded, then either:
    - **accum mode**: accumulated on host, written in one shot
      ([`ppm_sigma.py:828`](/pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_C/src/gw/ppm_sigma.py#L828));
    - **stream mode**: read-modify-write into an open HDF5 dataset per
@@ -171,7 +172,7 @@ write_sigma_omega_h5(
     sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
     sigma_c_kij_ev=ryd2ev * sigma_c_omega,
     sigma_sx_kij_ev=ryd2ev * sig_sx,
-    hartree_kij_ev=ryd2ev * direct_hartree)
+    hartree_kij_ev=ryd2ev * sig_h)
 
 # after — adds use_ffi_io + mesh, removes the `if meta.rank == 0:` guard
 #         (the helper handles rank-0 itself)
@@ -179,7 +180,7 @@ write_sigma_omega_h5(
     sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
     sigma_c_kij_ev=ryd2ev * sigma_c_omega,
     sigma_sx_kij_ev=ryd2ev * sig_sx,
-    hartree_kij_ev=ryd2ev * direct_hartree,
+    hartree_kij_ev=ryd2ev * sig_h,
     mesh=mesh_xy,
     use_ffi_io=config.use_ffi_io)
 ```

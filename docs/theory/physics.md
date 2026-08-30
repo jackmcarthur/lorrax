@@ -202,9 +202,8 @@ mini-BZ-averaged meanings are separated in
 
 ## 7. Quasiparticle Hamiltonian
 
-The stored one-body operator is the kinetic plus ionic Hamiltonian. The
-[direct Hartree field](hartree.md) is built from the current wavefunctions,
-so the quasiparticle Hamiltonian is assembled once as
+The stored one-body operator is kinetic plus ionic; the
+[direct field](hartree.md) is live:
 
 $$
 H_{\mathrm{QP}}=(T+V_{\mathrm{ion}})+H_{\mathrm{dir}}+\Sigma_{xc}.

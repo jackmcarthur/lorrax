@@ -52,21 +52,15 @@ actually inherit.
 
 ### Required GPU task geometry
 
-Use exactly **one task/rank per GPU**. `lx` already defaults to
-`ranks = nodes * GPUs_per_node`; do not lower that value with `-n`.
+Use one task/rank per GPU. Keep `lx`'s default rank count or set it explicitly:
 
 ```bash
 lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in
 ```
 
-`-N 1 -G 4 -n 1` is prohibited. It gives one process four visible devices,
-which bypasses the process-per-GPU loading and collective contract used by
-the production drivers. It is neither a P=4 test nor valid utilization
-evidence. Report requested GPUs, ranks, and the runtime mesh separately; a
-device count alone does not establish that work was distributed.
-
-An interactive `lx shell` is one task and therefore uses one GPU. For a
-multi-GPU check, launch the program with `lx run` and the matching rank count.
+`-N 1 -G 4 -n 1` violates the process/collective contract and is not P=4
+evidence. `lx shell` is one task/one GPU. Report GPU count, rank count, and
+runtime mesh.
 
 > ### `lx` runs the checkout its *base module* names, not the one you are standing in
 >

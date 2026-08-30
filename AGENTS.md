@@ -91,16 +91,15 @@ uv run python -m pytest -q --census
 ### Perlmutter (Shifter, via the `lx` harness)
 
 ```bash
-export LX_BASE_MODULE=lorrax_J070             # without it you get the wrong jax
+export LX_BASE_MODULE=lorrax_A                # JAX/JAXLIB 0.9 lane
 lx run -N 1 -G 4 -n 4 python3 -u -m gw.gw_jax -i cohsex.in   # one P=4 step, allocates or attaches
 lx test                                       # the default gate, on a compute node, in cwd
 lx status                                     # who is running where
 ```
 
-**Perlmutter GPU runs use exactly one task/rank per GPU.** Leave `-n` at
-`lx`'s default or set `-n = nodes * GPUs_per_node`. A whole-node run is
-`-N 1 -G 4 -n 4`; `-G 4 -n 1` is prohibited and is not P=4 evidence.
-Interactive `lx shell` sessions use one GPU.
+Perlmutter requires one task/rank per GPU; the
+[machine page](docs/environment/machines/perlmutter.md#required-gpu-task-geometry)
+owns the launch and evidence contract.
 
 `lx` allocates or attaches by itself, so never `sbatch` an iteration and never
 `lx release --all`. The older `module load lorrax_X` + `lxalloc`/`lxrun`/`lxpre`
@@ -119,7 +118,7 @@ Working invocations from the certified scripts (`config/frontera/templates/gw_de
 ```bash
 # preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
 python3 -u -m centroid.kmeans_cli 3000 --orbit --qe-save ../b300_out/MoS2.save --out-suffix _b300_c3000
-python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300 --hartree
+python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300
 
 # multi-node GW via the certified launch block (gw_ht_b300.sbatch):
 export LORRAX_ROOT=... LORRAX_RUN_DIR=... LORRAX_INPUT=gw.in

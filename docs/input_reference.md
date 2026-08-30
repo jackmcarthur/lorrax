@@ -170,7 +170,7 @@ page has to read it from.
 | key | default | meaning |
 |---|---|---|
 | `wfn_file` | `"WFN.h5"` | BGW-format wavefunction input (WFN.h5). |
-| `kin_ion_file` | `"kin_ion.h5"` | Pristine T+V_loc+V_NL matrix from `gw.kin_ion_io`. GWJAX builds Hartree live in G-space from the run WFN. |
+| `kin_ion_file` | `"kin_ion.h5"` | T+V_loc+V_NL matrix; Hartree is built live ([contract](theory/hartree.md)). |
 | `report_file` | `"gwjax.out"` | Rank-zero, human-readable GW calculation report: processor architecture, active numerical backends, crystal symmetry and IBZ sampling, band/energy windows, QP gap relative to DFT, role-labelled paths, warnings, runtime/import attribution, and sequential ζ/V(q)/χ₀/W/Σ timings. Per-state QP energies stay in the named EQP files. Launcher placement and per-rank diagnostics remain in the launcher log; detailed component chatter is enabled only by `LORRAX_DEBUG_PRINT=1`. |
 | `sigma_diag_file` | `"sigma_diag.dat"` | LORRAX-native per-(k,n) Sigma-decomposition text output. |
 | `eqp0_file` | `"eqp0.dat"` | BGW-format zeroth-order QP energies output. |
