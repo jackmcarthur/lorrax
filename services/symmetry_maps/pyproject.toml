@@ -5,18 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "symmetry_maps"
 version = "0.1.0"
-description = "Crystal symmetry for a plane-wave deck: k-grid reduction and IBZ<->full-BZ tables, the band-index k-star map, the sharded q-axis unfolds, the psi-unfold antiunitary rule, real-space orbit permutations, and the time-reversal measurement"
+description = "Crystal symmetry tables, unfolds, orbit maps, and the two-component DFT time-reversal check"
 requires-python = ">=3.12"
 
-# THE QUARANTINE, DECLARED.  ``psp`` and ``file_io`` appear nowhere in this
-# list because nothing here imports them at module scope: the density
-# quadrature is INJECTED (`valence_density_fn` / `spin_degeneracy_fn` on
-# `check_density_symmetries`, WAVE1_BRIEF ruling 4) and its `None` default
-# does the same lazy `psp.get_DFT_mtxels` import the module always did, on
-# the one call path that has a loader in hand.  An installed symmetry_maps
-# on a machine with no lorrax imports fine and answers every table
-# question; it needs `psp` only when a caller asks it to build rho.
-#
+# ``psp`` and ``file_io`` are not dependencies. The 2c reference check uses
+# raw coefficient slabs supplied by the loader and NumPy overlaps.
 # lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims);
 # this package reaches it through its test tier today and depends on it the
 # same way distrib_la does.  jax is the substrate the unfolds are written

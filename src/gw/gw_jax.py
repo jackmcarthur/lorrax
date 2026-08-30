@@ -833,52 +833,22 @@ def main(argv=None):
 	# collapsed into a replicated Σ_xc^QSGW by ``build_qsgw_sigma_xc``
 	# below.  This lets the rest of post-processing (eigh, scissor,
 	# eqp output) operate on replicated arrays without resharding seams.
-	# Provenance gate BEFORE the read: kin_ion.h5 fixes the Coulomb
-	# truncation convention and the band window for the whole mean-field
-	# side of H₀, and ``has_hartree`` decides whether the ISDF ``sig_h``
-	# is added on top.  A silent disagreement here lands as tens of eV in
-	# a ~500 eV cancellation, so it is checked loudly, once.
+	# Provenance gate BEFORE the read.  In particular, refuse the retired
+	# format that folded V_H into kin_ion: this driver always adds the live
+	# G-space field.
 	from file_io import validate_kin_ion_against_run
-	# Called for its gate side effect only: it RAISES on any provenance
-	# disagreement and prints the file's V_H storage summary.  The returned
-	# attrs dict is deliberately not bound — the V_H routing is resolved
-	# immediately below before validation, and it is THAT resolution (hartree_source /
-	# kin_ion_has_hartree) which flows into the GWResults output
-	# provenance (release audit 2026-07-28: the previous ``kin_ion_attrs``
-	# binding was dead).
-	# TIMED as one row: the gate, the source resolution and the slab read are
-	# a single logical stage ("get H₀ off disk") and the read is a distributed
-	# H5 slab load whose cost is a file-system property, not a physics one.
+	# TIMED as one row: the gate and slab read are one logical stage.
 	_t_kin = time.perf_counter()
-	from file_io.kin_ion import resolve_hartree_source
-	hartree_source = resolve_hartree_source(
-		config.paths.kin_ion_file, config.hartree_source, print_fn=print0)
-	# The format owner distinguishes exact-integer legacy compatibility from a
-	# fractional stored/folded artifact by the artifact's occupation-policy
-	# marker, then fingerprints THIS exact loader only when that receipt is
-	# required.  No caller-carried ISDF digest can enter this gate.
 	validate_kin_ion_against_run(
 		config.paths.kin_ion_file,
 		expected_bispinor=config.bispinor,
 		expected_bispinor_gw_mode=config.bispinor_gw.value,
-		wfn=wfn,
-		wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-		selected_hartree_source=hartree_source,
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
 		nspinor=int(wfn.nspinor),
-		require_transverse=(
-			bool(config.bispinor) and hartree_source != "gspace"),
 		print_fn=print0,
 	)
-	# Which V_H source this run will use, resolved once and printed.  Only
-	# the LEGACY ``folded`` case means "V_H is inside kin_ion's values";
-	# ``stored``/``gspace`` supply it as a separate matrix that the Σ seam
-	# substitutes for the ISDF quadrature, and ``isdf`` keeps the latter.
-	print0(f"  hartree_source: requested={config.hartree_source} "
-	       f"→ resolved={hartree_source}")
-	kin_ion_has_hartree = (hartree_source == "folded")
 	kin_ion = load_kin_ion_submatrix(
 		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
 		mesh=mesh_xy,
@@ -1168,8 +1138,6 @@ def main(argv=None):
 		efermi_ev=efermi_dft_ev,
 		sigma_omega_h5_path=sigma_omega_h5_path,
 		tensors_filename=tensors_filename,
-		kin_ion_has_hartree=kin_ion_has_hartree,
-		hartree_source=hartree_source,
 		E_eqp2_ry=(None if eqp2_result is None
 		             else np.asarray(eqp2_result.energies_ry)),
 		eqp2_iterations=(None if eqp2_result is None

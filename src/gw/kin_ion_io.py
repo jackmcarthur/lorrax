@@ -1,77 +1,5 @@
 #!/usr/bin/env python3
-"""kin+ion computation: T + V_loc + V_NL (+ V_H) for all k → kin_ion.h5.
-
-**By default this writes separate direct-field datasets** and never mixes them:
-
-``kin_ion``   (nk, nb, nb) — ``T + V_loc + V_NL``, **pristine**.
-``v_hartree`` (nk, nb, nb) — the exact FFT-grid ⟨mk|V_H|nk⟩, Ry.
-``v_hartree_transverse`` — for kinetic-balance bispinors, the exact
-periodic ``<mk|sum_i alpha_i A_i[J/c]|nk>`` direct operator, Ry.
-
-Keeping them apart is what makes one file serve every consumer: the same
-``kin_ion.h5`` feeds a run that wants the exact V_H (``hartree_source=
-stored``) and one that wants the ISDF quadrature (``isdf``), the VH
-column of ``sigma_diag.dat`` stops reading 0.000 by construction, and a
-QSGW band rotation gets the **full matrix** rather than a diagonal it
-cannot transform.  At 12×12 / 80 bands the extra array is ~15 MB.
-
-``--no-hartree`` skips V_H entirely (ionic-only file, ISDF route
-mandatory).  ``--fold-hartree`` reproduces the legacy pre-``v_hartree``
-format that added V_H *into* ``kin_ion`` and stamped ``has_hartree=True``;
-it exists only to regenerate old artifacts bit-for-bit.
-
-Which V_H source to use — read this before trusting an eqp number
------------------------------------------------------------------
-``H₀ = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩`` is a catastrophic cancellation: for MoS₂
-the two terms are −502 eV and +461 eV and their sum is −42 eV, so V_H's
-*relative* accuracy is H₀'s accuracy in absolute eV.
-
-* **stored / gspace (exact FFT-grid).**  ⟨mk|V_H|nk⟩ through the same
-  local-potential normalisation V_loc takes: analytically exact and
-  centroid-count independent.  Pinned to QE's ``kih.dat`` at rms
-  1e-4 eV.  Built by ONE distributed kernel
-  (:func:`compute_hartree_matrix`) shared by this CLI, the driver's
-  ``gspace`` route and the QSGW loop: ρ is partitioned over
-  (k, band-chunk) and reduced with a single 1.4 MB psum, the Poisson
-  solve is replicated on purpose, and ⟨mk|V_H|nk⟩ is one k-scan with
-  that k's bands sharded over every process (``common.mtxel_sweep``),
-  so it keeps scaling to P = nb where the previous k-partitioned route
-  stopped at P = nk.
-* **isdf (V_q[0] tile).**  Costs nothing extra, inherits the GW run's
-  full P-way distribution, recomputable in-loop for QSGW.  Measured vs
-  the exact route (MoS₂, scorecard §S.5): ~1 % on the occupied manifold
-  at 6 centroids per ζ-fit band, 0.11–0.20 % from 9 c/band upward —
-  where it **plateaus** (2.5× more centroids, and a 1e-12 rank cutoff
-  instead of 1e-8, each buy <5 % relative).
-
-The plateau is why the exact sources exist.  A 0.5 % V_H error is 2 eV
-of H₀, and the VBM and CBM errors do not cancel: on the MoS₂ 12×12 at
-606 centroids the ISDF route is 0.54 % rms over the occupied manifold
-and that is +1.91 eV on the VBM and −2.25 eV on the CBM at K — **4.15 eV
-on the band gap**.  50 meV QP energies need V_H to ~1e-4 relative, two
-orders past the plateau.
-
-Every physical convention is inherited from the run's own input deck
-(``sys_dim`` → Coulomb truncation, ``nval``/``ncond``/``nband`` → band
-window, ``bispinor``, the WFN's FFT grid), and the resolved values are
-stamped into the output so the generator and the GW run cannot silently
-disagree.  ``--sys_dim`` may only *confirm* the deck, never contradict it.
-
-What the compile cache is worth here
-------------------------------------
-Step 7 of ``runtime.initialize_communicator_stack`` arms the persistent
-compile cache at import, above every jit in this file.  Without one, this
-CLI re-lowers every kernel on every invocation: REPORTED, UNVERIFIED (no
-artifact path survives in the record) — at nb=256, 40 s of recorded
-sections inside a 124 s run.  The per-k kernels recompile once per
-DISTINCT ngk (the COMPILE NOTE in :func:`compute_hartree_matrix`), so the
-miss count is the IBZ k-count, not one.  A cache FAILURE is demoted to the
-``compile_cache_error`` line of the startup report, not refused, so "the
-cache is armed" is a report field to read rather than a guarantee.
-
-Usage:
-  python -m gw.kin_ion_io -i cohsex.in -o kin_ion.h5 [-n NB] [--no-hartree]
-"""
+"""Kinetic and ionic Hamiltonian preprocessing.\n\nThe CLI writes only pristine ``T + V_loc + V_NL`` matrices to\n``kin_ion.h5``. Hartree has one implementation, ``compute_hartree_matrix``,\ncalled live by ``gw_jax`` for scalar charge and, for bispinors, the periodic\ntransverse-current direct field.\n\nUsage:\n  python -m gw.kin_ion_io -i lorrax.in -o kin_ion.h5 [-n NB]\n"""
 
 import argparse
 import os
@@ -81,7 +9,7 @@ from typing import NamedTuple
 def build_argparser() -> argparse.ArgumentParser:
     """The CLI's argument parser.
 
-    Split out of :func:`main` so the V_H defaults are pinnable by a unit
+    Split out of :func:`main` so the CLI contract is pinnable by a unit
     test without running the generator, and kept ABOVE the startup call
     so ``--help`` can reach it without one (:mod:`runtime.cli_seam`).
     """
@@ -96,26 +24,8 @@ def build_argparser() -> argparse.ArgumentParser:
                            "the input file when the file specifies it.")
     argp.add_argument("--pseudo_dir", default=None,
                       help="directory containing *.upf files (default: input file dir)")
-    argp.add_argument("--hartree", dest="hartree", action="store_true", default=True,
-                      help="DEFAULT: also compute the exact FFT-grid ⟨mk|V_H|nk⟩ and "
-                           "store it as the SEPARATE 'v_hartree' array (kin_ion "
-                           "itself stays pristine T+V_loc+V_NL)")
-    argp.add_argument("--no-hartree", dest="hartree", action="store_false",
-                      help="skip V_H entirely: the file carries T+V_loc+V_NL only and "
-                           "the GW run must supply V_H from the ISDF V_q[0] tile")
-    argp.add_argument("--fold-hartree", dest="fold_hartree", action="store_true",
-                      default=False,
-                      help="LEGACY/compat: add V_H INTO the kin_ion values and stamp "
-                           "has_hartree=True (the pre-'v_hartree' format).  Only for "
-                           "reproducing old artifacts — the stored-array default is "
-                           "strictly better (kin_ion stays reusable, QSGW gets the "
-                           "full matrix, and the VH column stops reading 0.000).")
-    # There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
-    # resolved automatically, always — scalar pseudos quietly, QE's
-    # <spinorbit> authoritatively, nspinor=1 by force, and the FR + nspinor=2
-    # + BGW-WFN case by MEASUREMENT against the wavefunctions
-    # (psp.vnl_ops.measure_soc_mode).  The verdict is announced in the
-    # report's pathways block and stamped into the artifact.
+    # SOC projector selection is automatic: QE metadata when available,
+    # scalar for nspinor=1, otherwise a wavefunction measurement.
     return argp
 
 
@@ -167,12 +77,7 @@ _services.ensure_on_path()
 import symmetry_maps                                           # noqa: E402
 from wfn_loader import IBZRows, WfnLoader                           # noqa: E402
 from file_io.kin_ion import (
-    HARTREE_DATASET, HARTREE_OCCUPATION_POLICY,
-    TRANSVERSE_HARTREE_DATASET,
-    TRANSVERSE_HARTREE_CURRENT_PROJECTION,
-    TRANSVERSE_HARTREE_G0_DIAGNOSTIC, TRANSVERSE_HARTREE_G0_POLICY,
-    TRANSVERSE_HARTREE_PROJECTOR, TRANSVERSE_HARTREE_SYMMETRY,
-    IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_FULL,
+    IRR_IDX_DATASET, K_STORAGE_ATTR,
     K_STORAGE_IBZ, K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR,
     N_SYM_SPATIAL_ATTR, SYM_IDX_DATASET,
     broadcast_ibz_to_full_bz as _broadcast_ibz_slab,
@@ -204,8 +109,8 @@ def _resolve_against(path: str, base_dir: str) -> str:
 # ===========================================================================
 # THE IRREDUCIBLE k-SET, AND WHAT THE UNFOLD ACTUALLY IS
 # ===========================================================================
-# ``kin_ion`` = T + V_loc + V_NL (and ``v_hartree`` = V_H) are SCALAR
-# operators built from the crystal's own potentials, so each commutes with
+# ``kin_ion`` = T + V_loc + V_NL is a SCALAR operator built from the
+# crystal's own potentials, so it commutes with
 # every operation of the space group AND with time reversal.  ψ(Sk) is
 # *defined* — by ``WfnLoader.load(k='full_bz')``, which is the only
 # producer — as the symmetry image of ψ at that k's ORBIT PARENT.  So the
@@ -542,11 +447,8 @@ def get_kin_ion_k(wfn_k, Gk_crys, kvec, V_loc_r, vnl_setup, wfn, g_mask=None,
 # ===========================================================================
 # THE EXACT V_H, distributed
 # ===========================================================================
-# Everything below exists so that ONE implementation of the exact V_H serves
-# all three consumers — the ``kin_ion.h5`` generator CLI, the driver's
-# ``hartree_source=gspace`` route, and the QSGW loop that will rebuild V_H
-# from an updated ρ every SC iteration.  It is mesh-aware from 1×1
-# (single-node CLI) up to a production mesh.
+# Everything below is the driver's one exact G-space Hartree implementation.
+# It is mesh-aware from 1×1 up to a production mesh.
 #
 # The plumbing itself — mesh, work partition, psum, gather, the pipelined
 # per-k sweep — is ``common.collectives``; nothing here reaches under it.
@@ -867,18 +769,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
                            charge_nspinor: int | None = None,
                            bispinor_lift: str = "raw",
                            print_fn=print,
-                           owner_only: bool = False,
-                           k_set: str = "full",
                            return_sharded: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
 
-    SINGLE SOURCE for every exact-V_H consumer: the CLI in this module
-    (which stores the result as ``kin_ion.h5``'s ``v_hartree``
-    dataset), the driver's ``hartree_source=gspace`` route, and the
-    QSGW loop that rebuilds V_H from an updated ρ.  Both stored and
-    gspace must produce the same numbers or the two sources would
-    disagree, so there is exactly one implementation — and, since this
-    revision, exactly one *distributed* implementation.
+    Single distributed source for the live GW Hamiltonian and density-SC
+    rebuild.
 
     Distribution: see the contract block at the head of this section.
     ρ is partitioned over (k, band-chunk) and reduced with one psum;
@@ -899,45 +794,13 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
     ``sys_dim``); mixing it with V_loc's is a large systematic error
     inside a ~500 eV cancellation.
 
-    By default returns the FULL matrix as a host ``numpy`` array replicated
-    on every rank, not the diagonal: a QSGW band rotation needs
-    ⟨m|V_H|n⟩ off-diagonals to transform H₀ into the QP basis.  Live driver
-    consumers pass ``return_sharded=True``; the SC rebuild calls
+    By default returns the full-BZ matrix as a host ``numpy`` array replicated
+    on every rank for diagnostic callers. Live GW consumers pass
+    ``return_sharded=True`` and retain ``P(None,'x','y')`` through the
+    full-BZ star broadcast. The SC rebuild calls
     :func:`common.mtxel_sweep.sweep_matrix_elements` directly because it
     already owns the real-space potential and its DFT-basis contraction.
-
-    ``owner_only=True`` (this module's CLI, whose only consumer is the
-    rank-0 h5 write) assembles on rank 0 alone and returns ``None`` on
-    every other rank — see :func:`common.mtxel_sweep.blocks_to_host`.
-    Legacy host consumers keep the default.
-
-    ``return_sharded=True`` is the live-driver boundary: it retains the
-    logical ``(nk,nb,nb)`` result at ``P(None,'x','y')`` and performs the
-    star broadcast on device.  No rank assembles a band tile and no host
-    round trip occurs.  It is mutually exclusive with ``owner_only``;
-    artifact writers keep the explicit owner-only host boundary above.
-
-    ``k_set`` names which k-set the RESULT is on, and the two consumers
-    now answer differently — which is why it is a parameter rather than a
-    decision baked into the return.  ``"full"`` (default, and what the
-    driver's ``hartree_source=gspace`` route needs) returns the
-    ``(nk_tot, nb, nb)`` star broadcast, exactly as before.  ``"ibz"``
-    returns the ``(n_orbits, nb, nb)`` block the sweep produced,
-    un-broadcast — the STAR wedge, see :func:`star_wedge_rows` — for the
-    CLI to persist: its consumer reads V_H back out of
-    ``kin_ion.h5``, and ``file_io.kin_ion`` unfolds it there.  Nothing
-    else about the computation changes, so the two answers are related by
-    exactly one gather and the default path is bit-for-bit what it was.
     """
-    if k_set not in ("full", "ibz"):
-        raise ValueError(
-            f"compute_hartree_matrix: k_set must be 'full' (the full-BZ "
-            f"table the gspace route consumes) or 'ibz' (the "
-            f"pre-broadcast block the CLI persists); got {k_set!r}")
-    if return_sharded and owner_only:
-        raise ValueError(
-            "compute_hartree_matrix: return_sharded and owner_only are "
-            "mutually exclusive output boundaries")
     mesh = resolve_mesh(mesh)
     _, world = process_rank_world()
     nocc = int(wfn.nelec)
@@ -1151,26 +1014,13 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
         else:
             H_vh = H_matrix
         del H_matrix
-        # THE BOUNDARY, stated rather than implied.  The CLI writes with
-        # serial h5py on rank 0 and therefore explicitly gathers through
-        # ``blocks_to_host(owner_only=True)``.  The live gspace driver keeps
-        # the matrix at P(None,'x','y') and star-broadcasts on device.  The
-        # SC consumer already owns its potential and calls the sweep directly.
-        #
-        # THE k-SET IS WHERE THEY PART.  gspace needs the full BZ as a
-        # distributed device array.  The CLI's consumer is a FILE, and the
-        # file stores the IBZ block and unfolds on read, so handing the CLI a
-        # broadcast it would immediately re-compress is wasted work.
+        # Live GW keeps the matrix at P(None,'x','y') and star-broadcasts on
+        # device. Diagnostic callers explicitly request the host boundary.
         if return_sharded:
-            H_wedge = H_vh[:, :nb, :nb]
-            if k_set == "ibz":
-                H_charge = H_wedge
-            else:
-                H_charge = broadcast_ibz_to_full_bz(H_wedge, sym)
+            H_charge = broadcast_ibz_to_full_bz(H_vh[:, :nb, :nb], sym)
         else:
-            H_host = blocks_to_host(H_vh, nb=nb, owner_only=owner_only)
-            H_charge = (H_host if k_set == "ibz"
-                        else broadcast_ibz_to_full_bz(H_host, sym))
+            H_charge = broadcast_ibz_to_full_bz(
+                blocks_to_host(H_vh, nb=nb, owner_only=False), sym)
     del H_vh
     if not with_transverse:
         del psi_G, psi_charge
@@ -1178,15 +1028,11 @@ def compute_hartree_matrix(wfn, sym, meta, *, truncation_2d: bool,
 
     with timing.section("vh_transverse_matrix_boundary"):
         if return_sharded:
-            H_t_wedge = H_vt[:, :nb, :nb]
-            if k_set == "ibz":
-                H_transverse = H_t_wedge
-            else:
-                H_transverse = broadcast_ibz_to_full_bz(H_t_wedge, sym)
+            H_transverse = broadcast_ibz_to_full_bz(
+                H_vt[:, :nb, :nb], sym)
         else:
-            H_t_host = blocks_to_host(H_vt, nb=nb, owner_only=owner_only)
-            H_transverse = (H_t_host if k_set == "ibz"
-                            else broadcast_ibz_to_full_bz(H_t_host, sym))
+            H_transverse = broadcast_ibz_to_full_bz(
+                blocks_to_host(H_vt, nb=nb, owner_only=False), sym)
     del H_vt, psi_G, psi_charge, V_T_r
     return ExactHartreeMatrices(
         charge=H_charge,
@@ -1321,21 +1167,11 @@ def main(argv=None):
             "channels implicitly.")
     representation = resolve_four_current_representation(
         bispinor, bispinor_gw_mode)
-    charge_bispinor = representation.charge_bispinor
     pauli_reference = bispinor and is_pauli_reference_model(bispinor_gw_mode)
-    # ``None`` is load-bearing for byte compatibility: every historical
-    # bare_transverse/non-bispinor density follows the old unsliced kernel.
-    charge_nspinor = int(wfn.nspinor) if pauli_reference else None
     charge_representation = representation.charge_representation
     explicit_comparison = bool(
         pauli_reference
         or is_isometric_kinetic_balance_model(bispinor_gw_mode))
-    if bispinor and args.fold_hartree:
-        raise SystemExit(
-            "--fold-hartree is legacy scalar-only storage and is refused "
-            "for kinetic-balance bispinors; write separate scalar and "
-            "transverse direct datasets instead.")
-
     # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
     # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the file below
     # that silently truncates the run's window, so it is a hard floor;
@@ -1354,12 +1190,6 @@ def main(argv=None):
             f"the deck's sigma window needs {nb_window}."
         )
     meta = Meta.from_system(wfn, sym, nval, ncond, nb_eff, 0, bispinor)
-    # Historical ``bare_transverse`` matrices are evaluated on Meta's raw4
-    # kinetic-balance carrier even though the source WFN itself stores only
-    # the normalized QE two-spinor.  Stamp the matrix carrier, not the file
-    # carrier; the Pauli-reference selector deliberately chooses the latter.
-    charge_matrix_nspinor = (
-        int(meta.nspinor) if charge_nspinor is None else charge_nspinor)
     nx, ny, nz = meta.fft_grid
     # ρ (and hence V_H) lives on the ψ FFT box, which for a BGW WFN is
     # already the ecutrho grid — do NOT let a stale ``grid_rho`` attribute
@@ -1380,10 +1210,7 @@ def main(argv=None):
     print0(f"sys_dim: {sys_dim}   bispinor: {bispinor}   "
           f"bispinor_gw: {bispinor_gw_mode.value}   "
           f"nspin/nspinor: {int(getattr(wfn, 'nspin', 1))}/{int(wfn.nspinor)}")
-    print0(f"scalar charge: {charge_representation} "
-          f"(matrix nspinor={charge_matrix_nspinor})")
     print0(f"nval={nval} ncond={ncond} nelec(bands)={int(wfn.nelec)}")
-    print0(f"Hartree folded in: {args.hartree}")
 
     # ---- load pseudopotentials ----
     pseudo_dir = args.pseudo_dir or input_dir
@@ -1477,24 +1304,16 @@ def main(argv=None):
         vnl_progress.finish()
 
     k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
-    store_ibz = not bool(args.fold_hartree and args.hartree)
-    folded = bool(args.fold_hartree and args.hartree)
-    hartree_text = (
-        "folded into kin_ion (legacy compatibility)" if folded else
-        "stored separately as v_hartree" if args.hartree else
-        "absent; the GW driver must use its ISDF Hartree route")
     resolved_soc = (vnl_setup.soc_provenance if vnl_setup is not None
                     else "none (no projector setup)")
     report.pathways((
-        "Mean-field H0  : T + V_loc + V_NL",
-        f"Hartree V_H    : {hartree_text}",
+        "Mean-field H0  : pristine T + V_loc + V_NL",
+        "Hartree V_H    : live G-space build in gw_jax",
         "Coulomb system : " + ("2D slab truncation" if ctx.truncation_2d
                                 else "3D bulk periodic"),
         f"SOC projectors : {resolved_soc}",
-        f"k-space compute: {nk_irr} star-wedge points; "
+        f"k-space compute/storage: {nk_irr} star-wedge points; "
         f"{int(sym.nk_tot)} full-BZ points reconstructed on read",
-        "k-space storage: " + ("star wedge" if store_ibz else
-                                "full BZ (legacy folded-Hartree layout)"),
     ))
     report.system(
         natoms=int(np.asarray(wfn.atom_crys).shape[0]),
@@ -1515,66 +1334,8 @@ def main(argv=None):
         f"WFN available  : {band_range(0, int(wfn.nbands))}",
     ))
 
-    # ---- build the mean-field V_H on the same FFT grid (k-independent) ----
-    # SAME Coulomb convention as V_loc above (``ctx.truncation_2d``, i.e.
-    # the deck's sys_dim) — which is also QE's, since the DFT run that
-    # produced E_DFT/vxc.dat used ``assume_isolated='2D'`` for a slab.
-    # ``mesh_xy`` was taken from ``RUNTIME.mesh`` above (built and
-    # clique-warmed by the module-top ``initialize_communicator_stack()``),
-    # so the communicator-bootstrap cost is paid once, up front, instead of
-    # inside the ρ psum.  Measured on Frontera/Gloo at P=4: the FIRST
-    # collective of a run costs ~12 s of topology exchange and the second
-    # costs microseconds, so without it the 1.4 MB all-reduce looks like
-    # 70 % of the kernel and the strong-scaling numbers are measuring the
-    # transport's handshake.
-    #
-    # ``owner_only``: this CLI's only V_H consumers are the rank-0 h5
-    # write and the rank-0 diagnostic print, so no peer needs the
-    # replicated (nk, nb, nb) table (BD.4).  The driver's live gspace route
-    # requests the device-resident, two-axis-band-sharded return instead.
-    #
-    # ``k_set``: IBZ for the normal path, because that is what gets stored.
-    # ``--fold-hartree`` is the one exception and it is not an optimisation
-    # question — that flag exists ONLY to reproduce pre-``v_hartree``
-    # artifacts bit-for-bit, so it takes the full-BZ V_H and the whole file
-    # stays in the legacy layout (see ``store_ibz`` below).
-    fractional_hartree_occupations = not bool(
-        wfn.occupations_are_exact_integer)
-    hartree_density_band_stop = int(wfn.physical_density_band_stop)
-    v_h_all = None
-    v_h_transverse_all = None
-    current_diagnostic = None
-    if args.hartree:
-        vh_progress = LoopProgress(
-            1, report.progress, title="Hartree matrix construction",
-            item_name="distributed band-matrix sweep")
-        vh_progress.start()
-        with timing.section("build_V_H"):
-            hartree_result = compute_hartree_matrix(
-                wfn, sym, meta, truncation_2d=ctx.truncation_2d, nb=nb_eff,
-                mesh=mesh_xy,
-                band_chunk_size=int(params["band_chunk_size"]),
-                include_transverse=bispinor,
-                charge_nspinor=charge_nspinor,
-                bispinor_lift=(representation.current_lift or "raw"),
-                print_fn=print0, owner_only=True,
-                k_set=("ibz" if store_ibz else "full"))
-            if bispinor:
-                v_h_all = hartree_result.charge
-                v_h_transverse_all = hartree_result.transverse
-                current_diagnostic = hartree_result
-            else:
-                v_h_all = hartree_result
-        vh_progress.step()
-        vh_progress.finish()
-
     # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
-    # ``kin_ion`` stays PRISTINE (T + V_loc + V_NL) unless --fold-hartree
-    # is given: V_H rides along as its own dataset so the same file can
-    # feed a run that wants the exact V_H and one that wants the ISDF
-    # quadrature, and so a QSGW rotation has the full ⟨m|V_H|n⟩ matrix.
-    #
-    # Same replacement, same reasons as ⟨mk|V_H|nk⟩ above: the k-partitioned
+    # ``kin_ion`` stays pristine T + V_loc + V_NL.  The k-partitioned
     # route boxed a whole k's bands on one rank and stopped scaling at
     # P = nk.  Here the three terms are summed ON THE KET
     # (``sum_operators``) so ⟨m|T+V_loc+V_NL|n⟩ is ONE sweep with one
@@ -1639,8 +1400,7 @@ def main(argv=None):
         # leaves this block is the IBZ slab itself — the star broadcast
         # used to follow immediately and now happens at the reader.
         kin_ion_irr = blocks_to_host(H_kin_ion, nb=nb_eff, owner_only=True)
-        kin_ion_all = (kin_ion_irr if store_ibz
-                       else broadcast_ibz_to_full_bz(kin_ion_irr, sym))
+        kin_ion_all = kin_ion_irr
     matrix_progress.step()
     matrix_progress.finish()
     del H_kin_ion, psi_G
@@ -1672,12 +1432,7 @@ def main(argv=None):
             label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
     del kin_ion_irr
 
-    # ``owner_only``: from here on ``kin_ion_all``/``v_h_all`` exist on
-    # rank 0 ONLY (None on the peers) — every consumer below is rank-0.
-    # ``folded`` is derived from the args, not from ``v_h_all``, so the
-    # provenance flag stays rank-invariant.
-    if folded and rank == 0:
-        kin_ion_all = kin_ion_all + v_h_all
+    # From here on ``kin_ion_all`` exists on rank 0 only.
 
     # ---- write output: COORDINATED, rank 0 only -------------------------
     # Rank 0 alone holds the gathered arrays (owner_only gather), and the
@@ -1687,8 +1442,7 @@ def main(argv=None):
     # the peers alive until the file is closed — an early exit would have
     # srun tear the step down mid-write.
     print0(f"\nWriting to {out_path}...")
-    desc = ("T + V_loc + V_NL + V_H matrix elements (H_DFT - V_xc)"
-            if folded else "T + V_loc + V_NL matrix elements")
+    desc = "T + V_loc + V_NL matrix elements"
     write_progress = LoopProgress(
         1, report.progress, title="kinetic and ionic artifact write",
         item_name="output artifact")
@@ -1707,17 +1461,10 @@ def main(argv=None):
                 f.create_dataset(SYM_IDX_DATASET, data=sym_idx_k)
 
                 def _stamp_k_storage(dset):
-                    """Say which k-set THIS dataset is on.  Per dataset,
-                    because the two need not agree — ``--fold-hartree``
-                    puts the whole file back on the full BZ, and a future
-                    array might land either way.  Absent means full, so
-                    this stamp is what makes a compressed file readable
-                    and its absence is what keeps every older one safe."""
-                    dset.attrs[K_STORAGE_ATTR] = (
-                        K_STORAGE_IBZ if store_ibz else K_STORAGE_FULL)
-                    if store_ibz:
-                        dset.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
-                        dset.attrs[N_SYM_SPATIAL_ATTR] = int(n_sym_spatial)
+                    """Stamp the canonical star-wedge storage."""
+                    dset.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
+                    dset.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
+                    dset.attrs[N_SYM_SPATIAL_ATTR] = int(n_sym_spatial)
 
                 ds = f.create_dataset("kin_ion", data=kin_ion_all, dtype=np.complex128)
                 _stamp_k_storage(ds)
@@ -1731,21 +1478,6 @@ def main(argv=None):
                 ds.attrs["truncation_2d"] = ctx.truncation_2d
                 ds.attrs["pseudopotentials"] = str(list(pseudos.keys()))
                 # ---- provenance: everything a consumer must agree with ----
-                # ``has_hartree`` means the LEGACY fold-in: V_H is inside the
-                # kin_ion VALUES and no consumer may add another.  It stays
-                # False for the stored-array default, which is what makes the
-                # new format safe for old readers (they see pristine kin_ion
-                # and correctly supply their own ISDF V_H).
-                ds.attrs["has_hartree"] = folded
-                ds.attrs["hartree_truncation_2d"] = bool(
-                    ctx.truncation_2d) if folded else False
-                if args.hartree and fractional_hartree_occupations:
-                    ds.attrs["exact_hartree_occupation_policy"] = (
-                        HARTREE_OCCUPATION_POLICY)
-                    ds.attrs["exact_hartree_expected_electrons"] = float(
-                        wfn.num_electrons)
-                    ds.attrs["exact_hartree_density_band_stop"] = (
-                        hartree_density_band_stop)
                 ds.attrs["input_file"] = os.path.basename(args.input)
                 ds.attrs["wfn_file"] = os.path.basename(wfn_path)
                 ds.attrs["nval"] = nval
@@ -1792,8 +1524,8 @@ def main(argv=None):
                 ds.attrs["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
                 ds.attrs["generator_commit"] = _generator_commit()
                 # The k-set actually COMPUTED — always the STAR wedge, and
-                # now always the one stored too except under
-                # --fold-hartree.  ``nrk`` keeps its meaning (``nk - nrk``
+                # now always the one stored too. ``nrk`` keeps its meaning
+                # (``nk - nrk``
                 # full-BZ rows are symmetry copies, not independent
                 # evaluations) but it is the ORBIT count, not
                 # ``wfn.nkpts``: on a WFN that stores more k than the mesh
@@ -1801,121 +1533,22 @@ def main(argv=None):
                 # this file is the number of rows in it.
                 ds.attrs["nrk"] = int(nk_irr)
                 ds.attrs["k_set_computed"] = "ibz"
-                if v_h_all is not None and not folded:
-                    vh = f.create_dataset(HARTREE_DATASET, data=v_h_all,
-                                          dtype=np.complex128)
-                    # V_H rides the same k-set as kin_ion, and says so
-                    # itself rather than inheriting: the two arrays are
-                    # added together to make H₀, and a reader that took
-                    # one dataset's storage claim as the other's would
-                    # sum a full-BZ table into an IBZ one.
-                    _stamp_k_storage(vh)
-                    vh.attrs["description"] = (
-                        "<mk|V_H|nk> (Ry), exact FFT-grid mean-field Hartree; "
-                        "NOT included in the 'kin_ion' dataset")
-                    vh.attrs["truncation_2d"] = bool(ctx.truncation_2d)
-                    vh.attrs["nocc"] = int(wfn.nelec)
-                    vh.attrs["density_band_stop"] = (
-                        hartree_density_band_stop)
-                    vh.attrs["fft_grid"] = np.asarray(meta.fft_grid, dtype=np.int32)
-                    vh.attrs["matrix_nspinor"] = charge_matrix_nspinor
-                    if explicit_comparison:
-                        vh.attrs["charge_representation"] = (
-                            charge_representation)
-                if v_h_transverse_all is not None:
-                    vht = f.create_dataset(
-                        TRANSVERSE_HARTREE_DATASET,
-                        data=v_h_transverse_all, dtype=np.complex128)
-                    _stamp_k_storage(vht)
-                    vht.attrs["description"] = (
-                        "<mk|sum_i alpha_i A_i[J/c]|nk> (Ry), exact "
-                        "periodic Coulomb-gauge transverse direct Hartree")
-                    vht.attrs["truncation_2d"] = bool(ctx.truncation_2d)
-                    vht.attrs["nocc"] = int(wfn.nelec)
-                    vht.attrs["density_band_stop"] = (
-                        hartree_density_band_stop)
-                    vht.attrs["fft_grid"] = np.asarray(
-                        meta.fft_grid, dtype=np.int32)
-                    vht.attrs["matrix_nspinor"] = int(meta.nspinor)
-                    if explicit_comparison:
-                        vht.attrs["spatial_current_representation"] = (
-                            representation.spatial_current_representation)
-                    vht.attrs["source_wfn_nspinor"] = int(wfn.nspinor)
-                    from common.bispinor_init import (
-                        DIRAC_ALPHA_VERTEX_PROVENANCE,
-                        kinetic_balance_lift_provenance,
-                        NO_PAIR_DIRAC_CURRENT_MODEL,
-                    )
-                    vht.attrs["current_model"] = NO_PAIR_DIRAC_CURRENT_MODEL
-                    vht.attrs["bispinor_lift"] = (
-                        kinetic_balance_lift_provenance(
-                            representation.current_lift or "raw"))
-                    vht.attrs["current_vertex"] = DIRAC_ALPHA_VERTEX_PROVENANCE
-                    vht.attrs["tt_metric_sign"] = float(
-                        current_diagnostic.tt_metric_sign)
-                    vht.attrs["tt_projector"] = TRANSVERSE_HARTREE_PROJECTOR
-                    vht.attrs["g0_policy"] = TRANSVERSE_HARTREE_G0_POLICY
-                    vht.attrs["g0_current_diagnostic_policy"] = (
-                        TRANSVERSE_HARTREE_G0_DIAGNOSTIC)
-                    vht.attrs["current_g0_l2"] = float(
-                        current_diagnostic.current_g0_l2)
-                    vht.attrs["current_l2"] = float(
-                        current_diagnostic.current_l2)
-                    vht.attrs["current_g0_relative"] = float(
-                        current_diagnostic.current_g0_relative)
-                    vht.attrs["symmetry_class"] = TRANSVERSE_HARTREE_SYMMETRY
-                    vht.attrs["current_symmetry_projection"] = (
-                        TRANSVERSE_HARTREE_CURRENT_PROJECTION)
-                    vht.attrs["current_symmetry_relative_movement"] = float(
-                        current_diagnostic.current_symmetry_relative_movement)
-                    vht.attrs["current_symmetry_relative_residual"] = float(
-                        current_diagnostic.current_symmetry_relative_residual)
-                    vht.attrs[
-                        "current_symmetry_rotation_table_closure_defect"] = float(
-                            current_diagnostic.
-                            current_symmetry_rotation_table_closure_defect)
-                    vht.attrs[
-                        "current_symmetry_floating_point_residual_bound"] = float(
-                            current_diagnostic.
-                            current_symmetry_floating_point_residual_bound)
-                    vht.attrs[
-                        "current_symmetry_relative_residual_tolerance"] = float(
-                            current_diagnostic.
-                            current_symmetry_relative_residual_tolerance)
-                    vht.attrs["current_symmetry_rows"] = int(
-                        current_diagnostic.current_symmetry_rows)
-                    vht.attrs["current_symmetry_antiunitary_rows"] = int(
-                        current_diagnostic.current_symmetry_antiunitary_rows)
 
     barrier("kin_ion_written")
     write_progress.step()
     write_progress.finish()
 
-    # Diagnostics read the gathered tables, which only rank 0 holds.
-    _src = ("FOLDED into kin_ion (legacy)" if folded else
-            (f"stored as '{HARTREE_DATASET}'" if args.hartree
-             else "absent (ISDF route required)"))
     if rank == 0:
-        _store = (f"star wedge, unfolded to {sym.nk_tot} k on read "
-                  f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x)"
-                  if store_ibz else "full BZ (legacy fold-in layout)")
         print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
-               f"{kin_ion_all.shape} stored on the {_store}, "
-               f"sys_dim={sys_dim}, V_H {_src}")
-        if v_h_all is not None:
-            d0 = np.real(np.diagonal(kin_ion_all[0])) * 13.605693122994
-            v0 = np.real(np.diagonal(v_h_all[0])) * 13.605693122994
-            print0("  kin_ion diag (eV), k=0, first 8: "
-                  + "  ".join(f"{v:.4f}" for v in d0[:8]))
-            print0("  V_H     diag (eV), k=0, first 8: "
-                  + "  ".join(f"{v:.4f}" for v in v0[:8]))
+               f"{kin_ion_all.shape} on the star wedge "
+               f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x compression), "
+               f"sys_dim={sys_dim}; V_H is not stored.")
     wall = _time.perf_counter() - _t_main
     records = timing.records()
     report.timings((
         ("wavefunction input", timing_total(records, "load_wfn")),
         ("local ionic potential", timing_total(records, "build_V_loc")),
         ("nonlocal projectors", timing_total(records, "build_V_NL")),
-        ("Hartree matrix", timing_total(records, "build_V_H")),
         ("T + ionic matrix", timing_total(records, "kin_ion")),
         ("artifact write", timing_total(records, "write_h5")),
     ), wall=wall)

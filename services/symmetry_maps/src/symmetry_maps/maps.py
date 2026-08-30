@@ -7,6 +7,7 @@
 # unfolded_kpts, …) and the kfull-symmap / q-IBZ helpers used by the
 # GW driver.
 from functools import partial
+from dataclasses import dataclass
 
 import numpy as np
 import jax
@@ -301,6 +302,115 @@ def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None
         sym_idx = sym_idx_pre
 
     return irr_idx, sym_idx, irr_out
+
+
+def map_full_kpoints_to_irreducible(
+    kpoints,
+    sym_mats_k,
+    full_kpoints,
+    *,
+    tol=1.0e-6,
+):
+    """Map full-zone rows to stored k rows without inventing preimages.
+
+    This is the coordinate planner used by :class:`SymMaps`.  It deliberately
+    preserves the registered selection rule: the highest stored-k row with a
+    match wins, then the lowest symmetry row for that stored k.  ``matched``
+    is returned separately so callers can refuse incomplete WFN metadata
+    before consuming the zero-initialized index arrays.
+
+    Parameters are fractional reciprocal coordinates.  ``sym_mats_k`` is
+    exactly the set of rows the caller's policy permits (spatial only, or the
+    TRS-augmented table); this function never decides whether TRS is physical.
+    """
+    stored = np.asarray(kpoints, dtype=np.float64)
+    sym = np.asarray(sym_mats_k, dtype=np.int64)
+    full = np.asarray(full_kpoints, dtype=np.float64)
+    if stored.ndim != 2 or stored.shape[1:] != (3,):
+        raise ValueError(
+            "map_full_kpoints_to_irreducible: kpoints must have shape "
+            f"(nk,3), got {stored.shape}.")
+    if sym.ndim != 3 or sym.shape[1:] != (3, 3) or sym.shape[0] < 1:
+        raise ValueError(
+            "map_full_kpoints_to_irreducible: sym_mats_k must have shape "
+            f"(nsym,3,3) with nsym>0, got {sym.shape}.")
+    if full.ndim != 2 or full.shape[1:] != (3,):
+        raise ValueError(
+            "map_full_kpoints_to_irreducible: full_kpoints must have shape "
+            f"(nfull,3), got {full.shape}.")
+    tol = float(tol)
+    if not np.isfinite(tol) or tol <= 0.0:
+        raise ValueError(
+            "map_full_kpoints_to_irreducible: tol must be finite and "
+            f"positive, got {tol!r}.")
+
+    images = np.einsum("sij,kj->ksi", sym, stored, optimize=True)
+    images = np.mod(images, 1.0)
+    images[images > 0.99999] = 0.0
+    full_wrapped = np.mod(full, 1.0)
+    full_wrapped[full_wrapped > 0.99999] = 0.0
+
+    parent = np.zeros(full.shape[0], dtype=np.int32)
+    op = np.zeros(full.shape[0], dtype=np.int32)
+    matched = np.zeros(full.shape[0], dtype=bool)
+    for ifull, target in enumerate(full_wrapped):
+        for ikbar in range(stored.shape[0]):
+            diffs = np.abs(images[ikbar] - target)
+            hits = np.where(np.all(diffs < tol, axis=1))[0]
+            if hits.size:
+                parent[ifull] = ikbar
+                op[ifull] = int(hits[0])
+                matched[ifull] = True
+    return parent, op, matched
+
+
+@dataclass(frozen=True)
+class SpatialOperatorTables:
+    """Spatial WFN operations, independent of any k-mesh coverage map."""
+
+    sym_matrices: np.ndarray
+    sym_mats_k: np.ndarray
+    translations: np.ndarray
+    R_cart: np.ndarray
+    U_spinor: np.ndarray
+
+
+def build_spatial_operator_tables(wfn) -> SpatialOperatorTables:
+    """Build canonical spatial/antiunitary action tables from a WFN header.
+
+    This does not map a single k point.  The 2c reference check can therefore
+    test a malformed or physically inconsistent reduced WFN and issue its TRS
+    verdict before :class:`SymMaps` independently refuses incomplete coverage.
+    """
+    ntran = int(getattr(wfn, "ntran", 0))
+    if ntran < 1:
+        raise ValueError(
+            f"build_spatial_operator_tables: ntran must be positive, got "
+            f"{ntran}.")
+    spatial = np.asarray(wfn.sym_matrices[:ntran], dtype=np.int32)
+    if spatial.shape != (ntran, 3, 3):
+        raise ValueError(
+            "build_spatial_operator_tables: active mtrx rows must have shape "
+            f"({ntran},3,3), got {spatial.shape}.")
+    translations = np.asarray(
+        wfn.translations[:ntran], dtype=np.float64)
+    if translations.shape != (ntran, 3):
+        raise ValueError(
+            "build_spatial_operator_tables: active tnp rows must have shape "
+            f"({ntran},3), got {translations.shape}.")
+    mats_spatial = spatial.transpose(0, 2, 1).copy()
+    mats_augmented = np.concatenate(
+        [mats_spatial, -mats_spatial], axis=0)
+    R_cart = SymMaps.syms_crystal_to_cartesian(wfn)
+    U_spinor = SymMaps.get_spinor_rotations(
+        wfn, R_cart[:ntran])
+    return SpatialOperatorTables(
+        sym_matrices=spatial,
+        sym_mats_k=mats_augmented,
+        translations=translations,
+        R_cart=R_cart,
+        U_spinor=U_spinor,
+    )
 
 
 def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
@@ -1673,12 +1783,11 @@ def unfold_psi(
         service application below and that helper's own docstring for the
         defect this replaced (registered 2026-08-08, fixed 2026-08-09).
 
-        Note that ns = 1 does NOT switch the TRS rows off. A scalar
-        nspin=1 deck is spin-degenerate by construction, so
-        ``density_symmetry_check`` returns ``TRS = HOLDS`` on basis
-        ``'spin-degenerate'`` (m ≡ 0 identically) and the TRS rows stay in
-        ``SymMaps``'s search set. The ns=1 TRS branch above is live code
-        on any scalar deck, not a documented impossibility.
+        Note that ns = 1 does NOT switch the TRS rows off. The automatic
+        DFT-reference check is deliberately 2c-only, so scalar decks retain
+        the historical permissive setting unless a caller supplies an
+        explicit ``trs_holds`` verdict. The ns=1 TRS branch above therefore
+        remains live code.
 
         NON-SYMMORPHIC τ UNDER TRS. ``tau_phase_row`` is fed ``S_full``
         (= −S on a TRS row), so ``exp(−i (−S·G)·τ) = exp(+i (S·G)·τ)`` —
@@ -1690,12 +1799,10 @@ def unfold_psi(
 
         INDEPENDENT MEASUREMENT. Whether TRS holds AT ALL for a given file
         is no longer inferred from ``ntran``/k-weights: it is measured from
-        the wavefunctions by ``density_symmetry_check`` (identity
-        (★★★) there: m_{−k}(r) = −m_k(r)), and a False verdict removes the
-        TRS rows from ``SymMaps``'s search set so this branch is never
-        reached. That measurement deliberately uses NO symmetry operation,
-        NO τ and NO U_spinor, so it is an independent check on this code
-        rather than a restatement of it.
+        the two-component DFT reference by ``density_symmetry_check``.  The
+        check compares occupied density operators using raw partners,
+        spatial-only partners, or TRIM closure; it never accepts a state
+        generated by this antiunitary branch as evidence.
 
         Implementation note: ``sym_mats_k[sym_idx]`` already encodes the
         ±S sign (TRS rows are ``-S``). Computing
@@ -1830,9 +1937,9 @@ class SymMaps:
             allow_trs: whether time-reversal rows of ``sym_mats_k`` may be
                 SELECTED when mapping the full BZ onto the IBZ.  ``None``
                 (default) takes the value from ``wfn.trs_holds`` — the
-                MEASURED verdict that ``WfnLoader`` obtains by building
-                the spin-resolved density from the raw IBZ wavefunctions
-                (``density_symmetry_check``) — falling back to
+                verdict that ``WfnLoader`` obtains from the occupied
+                two-component DFT subspaces (``density_symmetry_check``) —
+                falling back to
                 ``True`` (the historical, permissive behaviour) for
                 wfn-shaped objects that carry no verdict.
 
@@ -1857,7 +1964,47 @@ class SymMaps:
             ntran = int(getattr(wfn, 'ntran', 1))
         except Exception:
             ntran = 1
-        if ntran <= 1:
+        if ntran < 1:
+            raise ValueError(
+                f"SymMaps: WFN ntran must be positive, got {ntran}.")
+        _kgrid = np.asarray(wfn.kgrid, dtype=np.int64)
+        if _kgrid.shape != (3,) or np.any(_kgrid <= 0):
+            raise ValueError(
+                "SymMaps: WFN kgrid must contain three positive extents; "
+                f"got {_kgrid.tolist()}.")
+        _nfull_declared = int(np.prod(_kgrid, dtype=np.int64))
+        _nk_stored = int(getattr(wfn, "nkpts", len(wfn.kpoints)))
+        if _nk_stored > _nfull_declared:
+            raise ValueError(
+                f"SymMaps: WFN stores {_nk_stored} k-points but its kgrid "
+                f"declares only {_nfull_declared} full-BZ rows.")
+
+        # ``ntran=1`` says only that identity is the sole SPATIAL operation.
+        # It does not say the file stores the full BZ: a nonmagnetic WFN may
+        # still contain a TR-reduced half mesh which needs the synthesized
+        # ``-I`` row below.  Keep the fast identity path only when every
+        # declared grid point is genuinely present and the active row is I.
+        _identity_full_grid = (ntran == 1 and
+                               _nk_stored == _nfull_declared)
+        if _identity_full_grid:
+            _stored_op = np.asarray(wfn.sym_matrices[0], dtype=np.int64)
+            if not np.array_equal(_stored_op, np.eye(3, dtype=np.int64)):
+                raise ValueError(
+                    "SymMaps: a full-grid ntran=1 WFN must store identity as "
+                    f"its active symmetry row; got {_stored_op.tolist()}.")
+            _declared_grid = self._generate_uniform_full_kpoints(wfn)
+            _, _, _full_present = map_full_kpoints_to_irreducible(
+                wfn.kpoints, np.eye(3, dtype=np.int64)[None, :, :],
+                _declared_grid)
+            if not np.all(_full_present):
+                _bad = np.where(~_full_present)[0]
+                raise ValueError(
+                    f"SymMaps: ntran=1 WFN has nrk=product(kgrid)="
+                    f"{_nfull_declared}, but its stored k coordinates do not "
+                    f"cover the declared uniform mesh; {_bad.size} rows are "
+                    f"missing, first {_declared_grid[_bad[0]].tolist()}.")
+
+        if _identity_full_grid:
             # Trivial identity-only symmetry path
             self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
             # ``sym_mats_k`` MUST be TRS-augmented to length ``2·ntran``
@@ -1990,15 +2137,15 @@ class SymMaps:
         # `r' = Rinv @ r + τ` (see orbit_syms.centroid_source_map_and_wrap,
         # and BerkeleyGW/Common/symmetries.f90:189 which stores mtrx as
         # invert(mtrx_inv) where mtrx_inv is the real-space rotation).
-        self.sym_matrices = wfn.sym_matrices[:wfn.ntran]
-        self.sym_mats_k = self.sym_matrices[:wfn.ntran].transpose(0,2,1).copy()  # these apply to k-points as sym_mats_k[i] @ [kx,ky,kz]
+        _operator_tables = build_spatial_operator_tables(wfn)
+        self.sym_matrices = _operator_tables.sym_matrices
+        self.sym_mats_k = _operator_tables.sym_mats_k[:wfn.ntran].copy()
         # BGW non-symmorphic translations (``tnp``).  Carried so
         # downstream callers (orbit-aware centroid sym perm, q-IBZ
         # unfold) don't need to re-thread the WFNReader through every
         # API.  Slice to ``[:ntran]`` to match ``sym_matrices`` —
         # legacy WFN files pad ``tnp`` to length 48.
-        self.translations = np.asarray(
-            wfn.translations[:wfn.ntran], dtype=np.float64)
+        self.translations = _operator_tables.translations
         
         # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
         # This is needed because QE uses time-reversal to reduce k-points, but doesn't
@@ -2024,10 +2171,10 @@ class SymMaps:
         #      supplied by ``sym_mats_k[sym_idx] = −S`` flowing into
         #      ``WfnLoader.gvecs(k='full_bz')``.  Half of Θ without the
         #      other half = ψ(r) → ψ*(−r) = scorecard §Q.
-        #   4. ``density_symmetry_check`` MEASURES whether TRS is
-        #      a symmetry of these particular wavefunctions at all, from
-        #      the magnetization density, using none of 1–3.  Its verdict
-        #      arrives here as ``wfn.trs_holds`` and drives (2).
+        #   4. ``density_symmetry_check`` tests the occupied 2c reference
+        #      with raw/spatial-only partners or TRIM closure.  It never
+        #      uses an antiunitary row as evidence.  Its verdict arrives
+        #      here as ``wfn.trs_holds`` and drives (2).
         # ``orbit_syms.centroid_source_map_and_wrap(extend_trs=True)``
         # is the real-space counterpart: TRS leaves r fixed, so its rows
         # duplicate the spatial rows rather than negating anything.
@@ -2049,7 +2196,7 @@ class SymMaps:
         if not self.trs_allowed:
             import warnings as _warnings
             _warnings.warn(
-                "SymMaps: the measured charge density says TIME-REVERSAL "
+                "SymMaps: the two-component DFT reference says TIME-REVERSAL "
                 "SYMMETRY IS BROKEN for this WFN, so the time-reversal rows "
                 "of sym_mats_k will not be used to map the full BZ. If this "
                 "file's IBZ was reduced using time reversal the mapping "
@@ -2167,8 +2314,8 @@ class SymMaps:
         # det<0→-R flip; restricting to length ntran here makes the bug
         # unreachable by construction. See ``reports/trs_sym_audit_2026-05-14``
         # Site #6 for the per-element derivation.
-        self.R_cart = self.syms_crystal_to_cartesian(wfn)
-        self.U_spinor = self.get_spinor_rotations(wfn, self.R_cart[:wfn.ntran])
+        self.R_cart = _operator_tables.R_cart
+        self.U_spinor = _operator_tables.U_spinor
         # ``R_proper[s]`` is the PROPER (det=+1) Cartesian rotation that
         # mixes the bispinor 3-vector vertices ``γ̃^{1,2,3} = (σ_x, σ_y,
         # σ_z)`` per the SO(3) image of ``U_spinor``'s SU(2) sandwich:
@@ -2307,36 +2454,22 @@ class SymMaps:
 
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
         del kpoint_map  # kept in signature for compatibility with older callers
-        irk_to_k_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
-        irk_sym_map = np.zeros(full_kpts.shape[0], dtype=np.int32)
-        ntran = len(self.sym_matrices)
-        # all symmetries applied to the irr k-points: shape (nkbar, nsym, 3).
         # Searches ``_sym_mats_k_search`` — the full TRS-augmented table
-        # unless the measured density says TRS is broken, in which case
-        # only the spatial half is eligible.
-        Skbar = np.einsum('ijk,lk->lij', self._sym_mats_k_search, wfn.kpoints)
-        Skbar = self._wrap_to_bz(Skbar)
-
-        # find the symmetry operations that map the irr k-points to the full k-points
-        matched = np.zeros(full_kpts.shape[0], dtype=bool)
-        for ikfull, kfull in enumerate(full_kpts):
-            for ikbar in range(wfn.nkpts):
-                # Compare each component within tolerance
-                diffs = np.abs(Skbar[ikbar] - kfull)
-                matches = np.where(np.all(diffs < 1e-6, axis=1))[0]
-                if len(matches) > 0:
-                    irk_to_k_map[ikfull] = ikbar
-                    irk_sym_map[ikfull] = matches[0]
-                    matched[ikfull] = True
+        # unless the DFT reference check says TRS is broken, in which case
+        # only the spatial half is eligible.  The planner owns the registered
+        # highest-parent/lowest-operation tie break and exposes coverage.
+        irk_to_k_map, irk_sym_map, matched = (
+            map_full_kpoints_to_irreducible(
+                wfn.kpoints, self._sym_mats_k_search, full_kpts))
 
         if not self.trs_allowed and not np.all(matched):
             n_bad = int(np.count_nonzero(~matched))
             raise ValueError(
                 f"SymMaps: {n_bad} of {full_kpts.shape[0]} full-BZ k-points "
                 f"cannot be reached from the IBZ using the SPATIAL symmetry "
-                f"operations alone, and the measured charge density says "
+                f"operations alone, and the DFT reference check says "
                 f"time-reversal symmetry is BROKEN for these wavefunctions "
-                f"(magnetization density above tolerance), so the "
+                f"(occupied-subspace residual above tolerance), so the "
                 f"time-reversal rows must not be used. This WFN's k-mesh was "
                 f"reduced with an assumption its own wavefunctions "
                 f"contradict; regenerate it with `noinv=.true.` (or fix the "
@@ -2344,29 +2477,19 @@ class SymMaps:
                 f"the old flags-only behaviour at your own risk."
             )
 
-        # INHERITED FROM create_kpoint_symmetry_map, not new (design
-        # decision 4).  The retired parent map's loop carried the only
-        # "WFN symmetry data incomplete" warning in the class; the
-        # predicate is the same one -- ``sym_mats_k`` is a group, so
-        # "some S maps k_full into the IBZ" and "some S maps some IBZ k
-        # onto k_full" have the same truth value -- so it is re-raised
-        # here rather than deleted with the loop that used to own it.
-        # ``matched`` is already computed above for the TRS refusal.
-        # The FALLBACK differs and that is stated, not hidden: the old
-        # loop wrote the NEAREST irreducible k into the map it returned;
-        # the arrays returned here keep their zero initialisation, i.e.
-        # IBZ k 0 with the identity.  That was already this function's
-        # behaviour and is not changed.
         if self.trs_allowed and not np.all(matched):
-            import warnings
             bad = np.where(~matched)[0]
-            warnings.warn(
-                f"WFN symmetry data incomplete: {bad.size} k-points could "
-                f"not be mapped via stored symmetries "
-                f"(ntran={len(self._sym_mats_k_search)}). Falling back to "
-                f"irreducible k 0 with the identity operation for those "
-                f"rows. First unmatched: {full_kpts[bad[0]]}",
-                RuntimeWarning)
+            raise ValueError(
+                f"SymMaps: WFN symmetry data are incomplete: {bad.size} of "
+                f"{full_kpts.shape[0]} full-BZ k-points cannot be reached "
+                f"from the stored k rows using the permitted spatial and "
+                f"time-reversal-composed operations "
+                f"(ntran_search={len(self._sym_mats_k_search)}). First "
+                f"unmatched: {full_kpts[bad[0]].tolist()}. Refusing instead "
+                f"of substituting stored k 0 with identity; that substitution "
+                f"would fabricate Gamma wavefunctions. Regenerate the WFN "
+                f"with a self-consistent symmetry header or an explicit full "
+                f"k-grid.")
 
         # Note: TRS-augmented sym indices (irk_sym_map >= ntran) are now
         # handled correctly by ``unfold_psi`` (PR3, 2026-05-14). The
@@ -2438,7 +2561,8 @@ class SymMaps:
 
         return failures
 
-    def syms_crystal_to_cartesian(self, wfn):
+    @staticmethod
+    def syms_crystal_to_cartesian(wfn):
         """Cartesian rotation matrix used as input to ``get_spinor_rotations``.
 
         ``get_spinor_rotations`` runs Markley's quaternion algorithm and
@@ -2503,7 +2627,8 @@ class SymMaps:
         A_T_inv = np.linalg.inv(A_T)
         # Spatial-only mtrx (length ntran). TRS-augmented rows are -R_spatial
         # in cartesian (TRS doesn't change the spatial rotation).
-        mtrx = np.asarray(self.sym_matrices)
+        ntran = int(wfn.ntran)
+        mtrx = np.asarray(wfn.sym_matrices[:ntran])
         R_spatial = np.einsum('ij,njk,kl->nil', A_T, mtrx, A_T_inv)
         R_spatial = np.around(R_spatial, decimals=10)
         # Match the existing 2·ntran-row convention for downstream consumers.
@@ -2571,7 +2696,8 @@ class SymMaps:
         """
         return np.swapaxes(np.asarray(self.R_cart), -1, -2)
 
-    def get_spinor_rotations(self, wfn, sym_matrices_cart):
+    @staticmethod
+    def get_spinor_rotations(wfn, sym_matrices_cart):
         """
         Converts a list of rotation matrices to their spinor representations using Markley's modification
         of Shepperd's algorithm (aka quaternion representation, see Brad Barker's dissertation).

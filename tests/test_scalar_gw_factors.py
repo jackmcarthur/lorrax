@@ -9,10 +9,8 @@ DENSITY; the Σ band sums carry occupancy 1 per band with NO spin factor
   * χ₀'s prefactor  — ``gw.w_isdf._w_solve_pref_scalar`` (already correct;
     pinned here so nobody "fixes" it by moving spin into the ``-2.0``
     time-ordering factor at w_isdf.py:925/970/1672, which is NOT spin);
-  * the ISDF Hartree ρ — ``gw.cohsex_sigma``'s hartree kernel (fixed
-    2026-08-28: at nspinor=1 it built HALF the electron density, i.e. a
-    ~500 eV V_H silently wrong by 2×, on the only production V_H path
-    when hartree_source=isdf).
+  * the live G-space Hartree ρ — the canonical density quadrature called by
+    ``gw.kin_ion_io.build_valence_density_distributed``.
 
 Every factor introduced is exactly 1.0 on the nspinor≥2 path (bispinor
 meta.nspinor=4 included) — the spinor arms below are bit-identity pins,
@@ -66,143 +64,42 @@ def test_w_solve_pref_scalar_pins_all_three_spin_structures():
 
 
 # ---------------------------------------------------------------------------
-# (2) The ISDF Hartree kernel — through the REAL factory and kernel.
-#
-# The flat-k FFT factories require the FFI .so, which the hartree kernel
-# never touches; they are stubbed with REFUSING functions so this cell can
-# run FFI-free while proving, not assuming, that the kernel under test
-# stays off the FFT path (a stub that got called would fail the test, not
-# fake a pass).
+# (2) The sole live G-space Hartree density owner.
 # ---------------------------------------------------------------------------
 
-def _stub_fft_factories(monkeypatch):
-    from common import fft_helpers
 
-    def _refusing_factory(*_a, **_k):
-        def _refuse(_x):
-            raise AssertionError(
-                "flat-k FFT invoked — the hartree kernel must not reach "
-                "the FFT path; only sigma_sx/sigma_coh may, and this test "
-                "does not call those.")
-        return _refuse
+def test_live_gspace_density_carries_scalar_spin_degeneracy():
+    """The sole Hartree density quadrature applies the scalar factor once."""
+    from psp.get_DFT_mtxels import valence_density_from_kpoint
 
-    monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", _refusing_factory)
-    monkeypatch.setattr(fft_helpers, "make_flat_k_ifftn", _refusing_factory)
+    psi = jnp.asarray(
+        np.arange(16, dtype=np.float64).reshape(2, 1, 2, 2, 2) + 1j)
+    kwargs = dict(nocc=2, weight=0.5, cell_volume=11.0)
+    unfixed = np.asarray(valence_density_from_kpoint(
+        psi, spin_degeneracy=1.0, **kwargs))
+    scalar = np.asarray(valence_density_from_kpoint(
+        psi, spin_degeneracy=2.0, **kwargs))
+    assert np.array_equal(scalar, 2.0 * unfixed)
 
 
-def _fresh_kernel_cache(monkeypatch):
+def test_cohsex_has_no_second_hartree_density_owner():
     from gw import cohsex_sigma
-    monkeypatch.setattr(cohsex_sigma, "_cohsex_kernel_cache", {})
+
+    assert not hasattr(cohsex_sigma, "make_hartree_density_kernel")
+    assert not hasattr(cohsex_sigma, "make_hartree_field_kernel")
 
 
-def _bundle(nk, ns, n_mu, nocc, seed=7):
-    """A (nb = ns·n_mu)-band bundle whose ψ rows are a unitary over the
-    combined (s, μ) index — so Σ_m |ψ_m(s,μ)|² = 1 at every (s, μ) and
-    Σ_{s,μ} |ψ_m(s,μ)|² = 1 for every band, which makes the traces below
-    exact by algebra rather than by tolerance."""
-    from gw.wavefunction_bundle import BandSlices, Wavefunctions
-    nb = ns * n_mu
-    rng = np.random.default_rng(seed)
-    a = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
-    q, _ = np.linalg.qr(a)
-    psi = np.broadcast_to(q.reshape(nb, ns, n_mu), (nk, nb, ns, n_mu))
-    psi_r = jnp.asarray(psi)                       # (nk, n, s, μ) — xr/yr
-    psi_n = jnp.asarray(psi.transpose(0, 2, 3, 1))  # (nk, s, μ, n) — xn/yn
-    slices = BandSlices.from_band_edges(0, nocc, nocc, nb, nb)
-    wfns = Wavefunctions(
-        psi_xn=psi_n, psi_xr=psi_r, psi_yr=psi_r, psi_yn=psi_n,
-        enk=jnp.zeros((nk, nb)), occ=jnp.zeros((nk, nb)), slices=slices)
-    return wfns, nb
-
-
-def _hartree_trace(mesh, kgrid, f_spin, wfns, Gij, n_mu):
-    from gw.cohsex_sigma import _make_cohsex_kernels
-    nk = int(np.prod(kgrid))
-    V_q = jnp.broadcast_to(
-        jnp.eye(n_mu, dtype=jnp.complex128), (nk, n_mu, n_mu))
-    _, _, hartree_k = _make_cohsex_kernels(mesh, kgrid, nk, f_spin=f_spin)
-    with mesh:
-        sig_h = hartree_k(wfns, Gij, V_q)
-    return np.asarray(sig_h)
-
-
-def test_isdf_hartree_rho_carries_the_scalar_spin_degeneracy(monkeypatch):
-    """Electron-count gate through the REAL hartree kernel (the
-    ``expected_electrons`` idea of kin_ion_io's exact-V_H path, restated
-    for the ISDF quadrature).  With V_q[0] = 1 the kernel returns
-    ⟨m|ρ/nk|n⟩, and with unitary ψ over the combined (s,μ) index
-
-        tr Σ_H(k) = ns · Σ_μ ρ(μ)/nk = ns · f_spin · n_occ
-
-    (the leading ns is basis completeness — each μ is projected once per
-    spinor component — not physics).  At nspinor=1 the electron count is
-    f_spin·n_occ = 2·n_occ; the pre-2026-08-28 kernel produced n_occ,
-    which is the red twin asserted below via the f_spin=1.0 build."""
-    from gw.cohsex_sigma import build_Gij
-    _stub_fft_factories(monkeypatch)
-    _fresh_kernel_cache(monkeypatch)
-    mesh = _mesh()
-    kgrid, n_mu, nocc = (2, 1, 1), 4, 2
-    nk = int(np.prod(kgrid))
-
-    # ── scalar (ns=1): ρ must carry 2 electrons per occupied band ──────
-    wfns, nb = _bundle(nk, 1, n_mu, nocc)
-    Gij = build_Gij(NS(nk_tot=nk, nb_sigma=nb, nelec=nocc), mesh)
-    sig = _hartree_trace(mesh, kgrid, 2.0, wfns, Gij, n_mu)
-    tr = np.trace(sig, axis1=1, axis2=2).real
-    np.testing.assert_allclose(tr, 2.0 * nocc, rtol=0, atol=1e-12)
-
-    # RED TWIN — the pre-fix kernel (no spin factor, i.e. f_spin=1.0)
-    # counts HALF the electrons on the same scalar bundle.  ×2.0 is exact
-    # in IEEE, so the equality is bitwise: the factor is applied exactly
-    # once, linearly, and nowhere else in the kernel.
-    sig_unfixed = _hartree_trace(mesh, kgrid, 1.0, wfns, Gij, n_mu)
-    tr_unfixed = np.trace(sig_unfixed, axis1=1, axis2=2).real
-    np.testing.assert_allclose(tr_unfixed, float(nocc), rtol=0, atol=1e-12)
-    assert np.array_equal(sig, 2.0 * sig_unfixed)
-
-    # ── spinor (ns=2): factor exactly 1.0 — count is n_occ, unchanged ──
-    wfns2, nb2 = _bundle(nk, 2, n_mu, 3)
-    Gij2 = build_Gij(NS(nk_tot=nk, nb_sigma=nb2, nelec=3), mesh)
-    sig2 = _hartree_trace(mesh, kgrid, 1.0, wfns2, Gij2, n_mu)
-    tr2 = np.trace(sig2, axis1=1, axis2=2).real
-    np.testing.assert_allclose(tr2, 2 * 3.0, rtol=0, atol=1e-12)  # ns·n_occ
-
-
-def test_cohsex_kernel_cache_is_keyed_on_f_spin(monkeypatch):
-    """A kernel cached for one spin structure must never serve the other:
-    without f_spin in the key, a spinor run followed by a scalar rerun in
-    the same process would reuse the f_spin=1.0 hartree closure and halve
-    ρ with no other symptom.  Red twin: drop f_spin from the cache key at
-    cohsex_sigma.py:~168 and the first assertion fails."""
-    from gw.cohsex_sigma import _make_cohsex_kernels
-    _stub_fft_factories(monkeypatch)
-    _fresh_kernel_cache(monkeypatch)
-    mesh = _mesh()
-    k_spinor = _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=1.0)
-    k_scalar = _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=2.0)
-    assert k_spinor is not k_scalar and k_spinor[2] is not k_scalar[2]
-    # …and the cache still caches: same key, same kernels (element
-    # identity — the factory rebuilds the outer tuple on a miss).
-    assert _make_cohsex_kernels(mesh, (2, 1, 1), 2, f_spin=2.0)[2] is k_scalar[2]
-
-
-def test_the_static_drivers_derive_f_spin_from_meta():
-    """The kernel-level cells above prove the factor works; this pins that
-    every production entry actually threads it — from meta, through the
-    ONE canonical helper — so the factory's required argument cannot be
-    satisfied with a literal that ignores the deck's spin structure."""
-    import inspect
-    from gw import cohsex_sigma, sigma_x_bispinor
-    for fn in (cohsex_sigma.compute_cohsex_sigma,
-               cohsex_sigma.compute_v_h_sigma_x,
-               sigma_x_bispinor.compute_sigma_x_bispinor):
-        src = inspect.getsource(fn)
-        assert "_spin_capacity(meta)" in src, fn.__qualname__
-        assert "_make_cohsex_kernels(" in src, fn.__qualname__
-    # …and _spin_capacity itself delegates to the ONE canonical helper.
-    assert "spin_degeneracy_factor" in inspect.getsource(
-        cohsex_sigma._spin_capacity)
+def test_live_hartree_derives_f_spin_at_the_density_owner():
+    """Pin the production call chain from exact Hartree to the quadrature."""
+    source = (_REPO / "src" / "gw" / "kin_ion_io.py").read_text()
+    density_src = source[
+        source.index("def build_valence_density_distributed("):
+        source.index("class ExactHartreeMatrices")
+    ]
+    hartree_src = source[source.index("def compute_hartree_matrix("):]
+    assert "f_spin = spin_degeneracy_factor(wfn)" in density_src
+    assert "spin_degeneracy=f_spin" in density_src
+    assert "build_valence_density_distributed(" in hartree_src
 
 
 def test_spin_capacity_refuses_an_undeclared_spin_structure():
@@ -298,7 +195,6 @@ def test_kin_ion_validator_refuses_a_spin_structure_mismatch(tmp_path):
     p = _write_min_kin_ion(tmp_path / "kin_ion.h5", nspinor=2)
     with pytest.raises(ValueError, match=r"nspinor=2.*nspinor=1"):
         validate_kin_ion_against_run(p, nspinor=1, expected_bispinor=False,
-                                     selected_hartree_source="stored",
                                      print_fn=lambda *_: None)
 
 
@@ -307,13 +203,11 @@ def test_kin_ion_validator_green_and_legacy_twins(tmp_path):
     # Green: matching stamp passes.
     p = _write_min_kin_ion(tmp_path / "kin_ion_match.h5", nspinor=2)
     validate_kin_ion_against_run(p, nspinor=2, expected_bispinor=False,
-                                 selected_hartree_source="stored",
                                  print_fn=lambda *_: None)
     # Legacy-accept: a pre-stamp file (no attr) is NOT refused — the red
     # twin of over-refusal, same contract as the sys_dim attr.
     p2 = _write_min_kin_ion(tmp_path / "kin_ion_legacy.h5", nspinor=None)
     validate_kin_ion_against_run(p2, nspinor=1, expected_bispinor=False,
-                                 selected_hartree_source="stored",
                                  print_fn=lambda *_: None)
 
 

@@ -269,8 +269,8 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
                             enumerate_ibz: bool = True) -> list[str]:
     """Render the canonical spatial operations and BZ/IBZ sampling.
 
-    The density/TRS statements below only quote ``WfnLoader.density_symmetry``
-    and ``SymMaps.trs_allowed``.  No symmetry is rechecked here.
+    The TRS statement below only quotes ``WfnLoader.trs_reference`` and
+    ``SymMaps.trs_allowed``.  No symmetry is rechecked here.
     """
     rotations = np.asarray(sym.Rinv_grid)
     n_sym = int(rotations.shape[0])
@@ -285,7 +285,9 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         "translations",
     ]
 
-    receipt = getattr(wfn, "density_symmetry", None)
+    receipt = getattr(wfn, "trs_reference", None)
+    if receipt is None:
+        receipt = getattr(wfn, "density_symmetry", None)
     if receipt is None:
         lines.append(
             "Density check   : unavailable; symmetry metadata accepted "
@@ -293,6 +295,34 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         lines.append(
             f"Time reversal  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
             "for BZ unfolding")
+    elif getattr(receipt, "method", "real-space-density") == \
+            "occupied-density-subspace":
+        if receipt.trs_basis == "not-2c":
+            lines.append(
+                f"DFT 2c TRS     : NOT APPLICABLE "
+                f"(nspin={int(receipt.nspin)}, "
+                f"nspinor={int(receipt.nspinor)})")
+            lines.append(
+                f"Time reversal  : "
+                f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
+                "for BZ unfolding")
+        else:
+            residual = ("n/a" if receipt.subspace_residual is None else
+                        f"{float(receipt.subspace_residual):.{digits}e}")
+            evidence = ", ".join(
+                f"{kind}={int(count)}"
+                for kind, count in receipt.evidence_counts)
+            state = "BROKEN" if not receipt.trs_holds else (
+                "CONSISTENT" if receipt.conclusive else "INCONCLUSIVE")
+            lines.append(
+                f"DFT 2c TRS     : {state} ({receipt.trs_basis}; "
+                f"occupied-density residual={residual}; "
+                f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
+                f"{evidence or 'no independent evidence'})")
+            lines.append(
+                f"TRS unfolding  : "
+                f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
+                "from the two-component reference check")
     else:
         m_rel = ("n/a" if receipt.m_rel is None else
                  f"{float(receipt.m_rel):.{digits}e}")
@@ -313,7 +343,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"mesh requires it={mesh_implies})")
         lines.append(
             f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-            "from the measured density verdict")
+            "from the retained legacy verdict")
 
     display_tau = clean_rounded(tau, digits=TAU_DIGITS)
     for i, (rotation, shift) in enumerate(

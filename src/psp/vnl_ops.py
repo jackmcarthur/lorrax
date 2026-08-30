@@ -2280,14 +2280,13 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
     different k for the finite-q matrix element used in the SOS chi
     head/wing pipeline.
     """
-    P  = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z),  psi_G, optimize=True)   # ⟨Z|n⟩
-    D  = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
-    dP = jnp.einsum('jRG,nsG->jRsn', jnp.conj(dZ), psi_G, optimize=True)
-    dD = jnp.einsum('stRQ,jQtn->jRsn', E_super, dP, optimize=True)
+    coefficients = _contract_projector_coefficients(
+        psi_G, Z, dZ, None, E_super)
+    D, dD, _ = _coupled_projector_coefficients(coefficients)
     # (∂Z^j) D — first piece in the symmetrized derivative
     t1 = jnp.einsum('jRG,Rsn->jnsG', dZ, D, optimize=True)
     # Z dD — second piece
-    t2 = jnp.einsum('RG,jRsn->jnsG', Z,  dD, optimize=True)
+    t2 = jnp.einsum('RG,jRsn->jnsG', Z, dD, optimize=True)
     return t1 + t2
 
 
@@ -2295,10 +2294,20 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
 def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).
 
-    Thin bra-contraction wrapper around :func:`apply_vnl_velocity_to_ket`
-    so the q=0 dipole path and the finite-q SOS path share the same
-    underlying velocity application — no duplicated logic.
+    At q=0 the bra and ket share the same projector coefficients, so form
+    the matrix directly as ``(dP)† D + P† dD`` with ``P = Z† psi`` and
+    ``D = E P``.  This is exactly the bra contraction of
+    :func:`apply_vnl_velocity_to_ket`, without materializing its
+    ``(3, nb, nspinor, nG)`` output.  The apply-to-ket endpoint remains the
+    owner for finite-q matrix elements, where the bra is a different state.
     """
-    v_ket = apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super)            # (3, nb, ns, nG)
-    return jnp.einsum('msG,jnsG->jmn', jnp.conj(psi_G), v_ket,
-                       optimize=True)
+    coefficients = _contract_projector_coefficients(
+        psi_G, Z, dZ, None, E_super)
+    D, dD, _ = _coupled_projector_coefficients(coefficients)
+    return (
+        jnp.einsum(
+            'jRsm,Rsn->jmn', jnp.conj(coefficients.dc_cart), D,
+            optimize=True)
+        + jnp.einsum(
+            'Rsm,jRsn->jmn', jnp.conj(coefficients.c), dD,
+            optimize=True))

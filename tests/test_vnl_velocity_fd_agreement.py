@@ -132,7 +132,67 @@ def _cosine_and_scale(analytic, fd):
 
 
 # ---------------------------------------------------------------------------
-# 1. The gate the failure needed
+# 1. The q=0 matrix endpoint stays identical to the general ket endpoint
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("nspinor", [1, 2])
+def test_q0_coefficient_matrix_matches_bra_contracted_velocity_ket(nspinor):
+    """The bounded q=0 endpoint is value-equivalent to the general action."""
+    rng = np.random.default_rng(42 + nspinor)
+    nband, nrow, ng = 4, 5, 9
+
+    def random_complex(shape):
+        return (rng.standard_normal(shape)
+                + 1j * rng.standard_normal(shape)).astype(np.complex128)
+
+    psi = jnp.asarray(random_complex((nband, nspinor, ng)))
+    Z = jnp.asarray(random_complex((nrow, ng)))
+    dZ = jnp.asarray(random_complex((3, nrow, ng)))
+    E = jnp.asarray(random_complex((nspinor, nspinor, nrow, nrow)))
+
+    velocity_ket = vnl_ops.apply_vnl_velocity_to_ket(psi, Z, dZ, E)
+    expected = jnp.einsum(
+        "msG,jnsG->jmn", jnp.conj(psi), velocity_ket, optimize=True)
+    actual = vnl_ops.vnl_velocity_matrix(psi, Z, dZ, E)
+
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(actual)),
+        np.asarray(jax.device_get(expected)),
+        rtol=5e-13, atol=5e-13)
+
+
+def test_q0_velocity_matrix_lowering_has_no_band_spin_g_carrier():
+    """The q=0 lowering must not contain the general velocity-ket carrier.
+
+    The positive control lowers ``apply_vnl_velocity_to_ket`` at the same
+    shapes and requires its public ``(3, nb, nspinor, nG)`` output to appear.
+    Thus an IR spelling change fails explicitly instead of making the absence
+    check pass vacuously.
+    """
+    nband, nspinor, nrow, ng = 5, 2, 4, 11
+    c128 = jnp.complex128
+    args = (
+        jax.ShapeDtypeStruct((nband, nspinor, ng), c128),
+        jax.ShapeDtypeStruct((nrow, ng), c128),
+        jax.ShapeDtypeStruct((3, nrow, ng), c128),
+        jax.ShapeDtypeStruct((nspinor, nspinor, nrow, nrow), c128),
+    )
+    matrix_ir = vnl_ops.vnl_velocity_matrix.lower(*args).as_text()
+    apply_ir = vnl_ops.apply_vnl_velocity_to_ket.lower(*args).as_text()
+    forbidden_carrier = (
+        f"tensor<3x{nband}x{nspinor}x{ng}xcomplex<f64>>")
+
+    assert forbidden_carrier in apply_ir, (
+        "positive control could not find the velocity-ket result shape in "
+        "its lowering; update this structural check for the current IR "
+        "spelling rather than accepting a vacuous pass")
+    assert forbidden_carrier not in matrix_ir, (
+        "vnl_velocity_matrix reintroduced the (3,nb,nspinor,nG) carrier; "
+        "contract directly through P, dP, D, and dD")
+
+
+# ---------------------------------------------------------------------------
+# 2. The finite-difference gate the sign failure needed
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("ik", [0, 1])
@@ -162,7 +222,7 @@ def test_finite_difference_agrees_with_the_analytic_velocity(ik):
 
 
 # ---------------------------------------------------------------------------
-# 2. The false cases
+# 3. The false cases
 # ---------------------------------------------------------------------------
 
 def test_an_inverted_analytic_sign_trips_the_gate():
@@ -205,7 +265,7 @@ def test_the_comparison_has_signal_to_compare():
 
 
 # ---------------------------------------------------------------------------
-# 3. The driver-level twin, which closes the loop the cells above cannot
+# 4. The driver-level twin, which closes the loop the cells above cannot
 # ---------------------------------------------------------------------------
 #
 # HONEST LIMIT OF EVERYTHING ABOVE.  Those cells compare

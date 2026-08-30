@@ -172,10 +172,10 @@ the branch at all; and it **cannot pass on `cohsex_debug`**, whose noise floor
 1.2e-15. Both legs fail those two checks identically, before and after the fix.
 Use a TRS-bearing deck for TRS coverage, and do not read that red as new.
 
-### The q axis: TRS is MEASURED, and the branch is gone (2026-08-22)
+### The q axis: TRS is checked, and the branch is gone (2026-08-22)
 
-`density_symmetry_check` has measured whether time reversal is a symmetry of
-*these* wavefunctions since 2026-07, and publishes it as
+For a 2c DFT reference, `density_symmetry_check` compares occupied subspaces
+using raw, spatial-only, or TRIM evidence and publishes the verdict as
 `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. **The q axis did not read it.**
 `gw/v_q_g_flat.py`, `gw/screening.py` and `gw/screening_bse.py` each composed
 q with −q through Θ and projected every self-negative q row onto its
@@ -666,7 +666,7 @@ compressible would move physics.
 
 ### The three rows that are NOT one operation
 
-`kin_ion`, `v_hartree` and Σ move onto a wedge through `star_broadcast`,
+`kin_ion` and Σ move onto a wedge through `star_broadcast`,
 which is a **pure row gather plus `conj` on the time-reversed rows**. That
 works because they are SCALAR operators: each commutes with every space-group
 operation and with time reversal, so a star holds one matrix.
@@ -696,8 +696,9 @@ measurable separately and both are ~100 % of the signal:
 
 So the complete rule is `d_a(gk) = −1^{TRS} · R_cart_forward[s]_{ab} ·
 conj^{TRS}(d_b(k))`, and the sign is there because **v̂ is odd under time
-reversal** while `kin_ion`/`v_hartree` are even. The tree already said the
-transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
+reversal** while `kin_ion` is even. The live G-space Hartree matrix follows
+the scalar-operator star relation but is not stored. The tree already said
+the transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
 rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
 TRANSPOSE of this matrix", and the scorecard above records it as *named but
 unused*. The TRS sign was not written down anywhere.

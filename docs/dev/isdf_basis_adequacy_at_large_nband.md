@@ -28,7 +28,7 @@ gate the project runs:
 | `el_compare` (NSCF provenance) | 1.86e-11 eV | upstream of the ISDF entirely |
 | `gate_h0` (H0 identity / implied Vxc) | 3.9e-5 eV | tests the one-body Hamiltonian |
 | W Dyson residual | 1.9e-14 | tests the screening solve, not Sigma |
-| density symmetry / TRS | 1.3e-14 | tests the wavefunctions |
+| 2c occupied-subspace TRS | 1.3e-14 | tests the DFT reference |
 | bare `Sigma_X` diagonal | 0.03% vs a good run | exchange needs far less ISDF rank |
 | q->0 head correction fit | 0.026%, identical on-shell shift | analytic, ISDF-independent |
 | route / restart / rc checks | all clean | structural, not numerical |

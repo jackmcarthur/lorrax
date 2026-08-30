@@ -434,7 +434,7 @@ def test_head_body_occupation_match_refuses_mismatch_and_unstamped():
 # this cell tests the occupation weighting and the projection, not the q-sum.
 # ---------------------------------------------------------------------------
 
-from gw.cohsex_sigma import _make_cohsex_kernels, _resolve_Gij, _spin_capacity
+from gw.cohsex_sigma import _make_cohsex_kernels, _resolve_Gij
 from gw.ppm_sigma import (
     _compute_invalid_static_sigma,
     _invalid_static_coh_by_bracket,
@@ -520,8 +520,8 @@ def test_invalid_static_shared_spatial_matches_legacy_dense_cohsex():
                            [False, True, False],
                            [True, False, True]]])
     W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
-    sigma_sx_k, sigma_coh_k, _ = _make_cohsex_kernels(
-        mesh, meta.kgrid, int(meta.nk_tot), _spin_capacity(meta))
+    sigma_sx_k, sigma_coh_k = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot))
     Gij = _resolve_Gij(None, meta, mesh, None)
     with mesh:
         legacy = np.asarray(jax.device_get(
@@ -544,8 +544,8 @@ def test_invalid_static_brackets_match_legacy_dense_cohsex():
                            [False, True, True]]])
     brackets = ((0, 1), (1, _SX_NB))
     W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
-    _, sigma_coh_k, _ = _make_cohsex_kernels(
-        mesh, meta.kgrid, int(meta.nk_tot), _spin_capacity(meta))
+    _, sigma_coh_k = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot))
     legacy = []
     with mesh:
         for lo, hi in brackets:
@@ -564,9 +564,7 @@ def test_invalid_static_brackets_match_legacy_dense_cohsex():
 def test_sigma_x_takes_diag_f_and_differs_from_the_integer_projector():
     wfns, meta, psi_xn, psi_xr, psi_yr, psi_yn, V_q = _sx_fixture()
     mesh = _mesh_1x1()
-    sigma_sx_k, _, _ = _make_cohsex_kernels(mesh, meta.kgrid,
-                                            int(meta.nk_tot),
-                                            _spin_capacity(meta))
+    sigma_sx_k, _ = _make_cohsex_kernels(mesh, meta.kgrid, int(meta.nk_tot))
 
     f_int = np.asarray([1.0, 1.0, 0.0])
     f_frac = np.asarray([1.0, 0.625, 0.375])   # same 2 electrons, smeared
@@ -604,9 +602,7 @@ def test_sigma_x_step_occupations_reproduce_the_integer_projector_bitwise():
     """The insulating no-delta claim, at Σ_x rather than at the projector."""
     wfns, meta, *_unused, V_q = _sx_fixture()
     mesh = _mesh_1x1()
-    sigma_sx_k, _, _ = _make_cohsex_kernels(mesh, meta.kgrid,
-                                            int(meta.nk_tot),
-                                            _spin_capacity(meta))
+    sigma_sx_k, _ = _make_cohsex_kernels(mesh, meta.kgrid, int(meta.nk_tot))
 
     Gij_int = _resolve_Gij(None, meta, mesh, None)
     Gij_step = _resolve_Gij(
@@ -649,7 +645,7 @@ def test_the_occupation_state_actually_reaches_all_three_build_Gij_sites():
     from gw import cohsex_sigma, ppm_pipeline, ppm_sigma, sigma_dispatch
 
     for fn in (cohsex_sigma.compute_cohsex_sigma,
-               cohsex_sigma.compute_v_h_sigma_x,
+               cohsex_sigma.compute_sigma_x,
                cohsex_sigma.build_Gij,
                ppm_sigma.compute_sigma_c_ppm_omega_grid,
                ppm_sigma._compute_invalid_static_sigma,
@@ -670,4 +666,4 @@ def test_the_occupation_state_actually_reaches_all_three_build_Gij_sites():
     dispatch_src = inspect.getsource(sigma_dispatch.compute_sigma_xc)
     assert dispatch_src.count("occupation_state=occupation_state") >= 3, (
         "compute_sigma_xc must forward occupation_state to "
-        "compute_cohsex_sigma, compute_v_h_sigma_x and the PPM pipeline")
+        "compute_cohsex_sigma, compute_sigma_x and the PPM pipeline")

@@ -18,6 +18,7 @@ Each arrow has one detailed owner:
 |---|---|
 | How do ISDF, screening, self-energy, and QSGW fit together? | [Core ISDF and GW theory](physics.md) |
 | How are interpolation vectors and Coulomb matrices formed? | [G-flat zeta and V](isdf-zeta-vq.md) |
+| How is the direct Hartree field built from charge and current? | [Direct Hartree field](hartree.md) |
 | Which symmetry convention controls irreducible-zone work and unfolding? | [Symmetry](symmetry.md) |
 | How are static and GN/HL-PPM frequency integrals separated? | [Minimax quadrature](minimax-quadrature.md) |
 | What fixes the HL plasmon pole? | [HL-GPP derivation](hl-gpp-derivation.md) |

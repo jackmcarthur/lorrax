@@ -1,53 +1,13 @@
-"""Kinetic + ionic Hamiltonian I/O, and the mean-field V_H it may carry.
+"""Kinetic + ionic Hamiltonian I/O.
 
-``kin_ion`` holds ⟨mk|T + V_loc + V_NL|nk⟩ — **pristine ionic mean field,
-never V_H** in files written by the current ``gw.kin_ion_io``.
-
-H₀ = kin_ion + V_H is a ~500 eV catastrophic cancellation, so *where*
-⟨mk|V_H|nk⟩ comes from is a first-class, explicitly-resolved decision.
-Three sources, in ``auto`` precedence order:
-
-``stored``  — the file carries a separate ``v_hartree`` dataset
-    ``(nk, nb, nb)`` complex128, Ry, the exact FFT-grid matrix evaluated
-    at generation time (this is what ``gw.kin_ion_io`` writes by
-    default).  The **full matrix**, not just the diagonal, so a QSGW
-    band rotation can transform it.  ``kin_ion`` itself stays pristine.
-``isdf``    — ⟨mk|V_H|nk⟩ from the ISDF ``V_q[0]`` tile
-    (``gw.cohsex_sigma``'s Hartree kernel).  Fully P-distributed and
-    recomputable in-loop; centroid-count dependent.
-``gspace``  — built on the fly by the driver through the same exact
-    FFT-grid route (``gw.kin_ion_io.compute_hartree_matrix``), on the
-    run's own device mesh.  Since scorecard §X that route is
-    distributed (ρ: one psum; Poisson: replicated; matrix elements:
-    k-partitioned + one gather), so ``gspace`` is now the in-loop /
-    QSGW-capable spelling of the exact V_H and not just an offline one.
-
-Kinetic-balance bispinor files may additionally carry
-``v_hartree_transverse``.  It is independent of the scalar-source choice and
-stores the exact periodic ``alpha.A[J/c]`` direct operator; the reader
-authenticates its own star/storage and physics provenance before reading the
-payload.  There is no centroid or exchange-head fallback.
-
-Plus one **legacy** state that only ever appears on disk, never as a
-request:
-
-``folded``  — ``has_hartree=True`` and NO ``v_hartree`` dataset: V_H was
-    added *into* the ``kin_ion`` values (the pre-``v_hartree`` format).
-    The driver must then add no V_H of its own.  Read-only support.
-
-**Back-compatibility is safe in the dangerous direction.**  A file in
-the new format has pristine ``kin_ion`` and no ``has_hartree`` attribute,
-so an *old* reader treats it as a legacy ionic-only file and adds its own
-ISDF V_H — which is correct, not a double count.  Only the reverse
-(a ``folded`` file read as pristine) would double count, and
-``_warn_on_unphysical_h0`` fires hard on that.
-
-Reading the attributes / dataset presence is the ONLY supported way to
-tell these apart — never infer from magnitudes.
+``kin_ion`` holds ⟨mk|T + V_loc + V_NL|nk⟩ and must be pristine.  Hartree is
+always rebuilt live in G-space by the GW driver.  The reader refuses the old
+``has_hartree=True`` folded format because adding the live field to it would
+double count a roughly 500 eV cancellation.
 
 WHICH k-SET THE ARRAYS ARE STORED ON — read this before indexing one
 ----------------------------------------------------------------------
-All three matrix datasets are computed on the STAR WEDGE — one
+The matrix dataset is computed on the STAR WEDGE — one
 row per symmetry orbit — and, since the store-compressed change,
 **stored** there too: the file's k axis is ``n_orbits`` rows, not ``nk``,
 and the full-BZ table is rebuilt by :func:`broadcast_ibz_to_full_bz` when
@@ -86,38 +46,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.four_current_model import (
 	is_pauli_reference_model,
 	is_isometric_kinetic_balance_model,
-	PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
 	resolve_four_current_representation,
 )
 
 from .slab_io import SlabIO
-
-#: Name of the separate exact-V_H dataset inside ``kin_ion.h5``.
-HARTREE_DATASET = "v_hartree"
-
-#: Exact periodic transverse direct Hartree on kinetic-balance bispinors.
-TRANSVERSE_HARTREE_DATASET = "v_hartree_transverse"
-TRANSVERSE_HARTREE_PROJECTOR = "delta_ij_minus_G_i_G_j_over_G2"
-TRANSVERSE_HARTREE_G0_POLICY = "periodic_zero_no_minibz_or_exchange_head"
-TRANSVERSE_HARTREE_G0_DIAGNOSTIC = (
-	"report_only_partial_dirac_current_omits_gauged_vnl")
-TRANSVERSE_HARTREE_SYMMETRY = "crystal_scalar_time_reversal_even"
-TRANSVERSE_HARTREE_CURRENT_PROJECTION = (
-	"symmetry_maps.project_polar_fft_field:fft_grid_pullback_perm+"
-	"SymMaps.R_cart_forward:measured_trs_policy:residual_over_raw_J_l2:"
-	"affine_rotation_closure_bound_v2")
-
-#: Fractional exact-Hartree artifacts must name the quadrature that produced
-#: BOTH rho and J.  Exact integer-occupation files deliberately omit this
-#: marker and remain compatible: their incumbent band sum is the same algebra.
-#: A fractional file without it is ambiguous with the old, silently
-#: unit-weighted producer.
-HARTREE_OCCUPATION_POLICY = (
-	"wfn_loader.occs:full_bz_irr_idx_k:per_k_per_band_rho_and_J:v1")
-
-#: Legal values of the ``hartree_source`` input key.
-HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
-_RESOLVED_HARTREE_SOURCES = ("stored", "folded", "isdf", "gspace")
 
 #: Per-dataset attr naming the k-set the array is STORED on.  **Absent
 #: means** :data:`K_STORAGE_FULL` — see the module docstring for why that
@@ -148,8 +80,8 @@ N_SYM_SPATIAL_ATTR = "n_sym_spatial"
 # ===========================================================================
 # THE UNFOLD, AND WHY THE PREDICATE IS PASSED EXPLICITLY
 # ===========================================================================
-# ``kin_ion`` (T + V_loc + V_NL) and ``v_hartree`` (V_H) are SCALAR operators
-# built from the crystal's own potentials, so each commutes with every
+# ``kin_ion`` (T + V_loc + V_NL) is a SCALAR operator built from the
+# crystal's own potentials, so it commutes with every
 # operation of the space group AND with time reversal, and the full-BZ table
 # holds only ``nrk`` distinct matrices.  ``gw.kin_ion_io`` derives that
 # statement in full; what matters at the READ side is the shape of the map:
@@ -383,105 +315,7 @@ def read_kin_ion_provenance(h5_path: str) -> dict:
 		                     else K_STORAGE_IBZ)
 		out["_nk_logical"] = (int(ds.shape[0]) if star is None
 		                      else int(star[0].size))
-		out["_has_v_hartree"] = HARTREE_DATASET in h5
-		if out["_has_v_hartree"]:
-			out["_hartree_shape"] = tuple(
-				int(s) for s in h5[HARTREE_DATASET].shape)
-			# The array's OWN attrs win.  ``kin_ion`` also stamps
-			# ``hartree_truncation_2d`` (False whenever V_H is not folded
-			# into its values), so a ``setdefault`` here would mask the
-			# stored array's real Coulomb convention behind that False and
-			# make the load-time report say "truncation_2d=False" for a
-			# correctly 2D-truncated V_H.
-			for k, v in h5[HARTREE_DATASET].attrs.items():
-				out[f"hartree_{k}"] = v
-		out["_has_v_hartree_transverse"] = TRANSVERSE_HARTREE_DATASET in h5
-		if out["_has_v_hartree_transverse"]:
-			out["_transverse_hartree_shape"] = tuple(
-				int(s) for s in h5[TRANSVERSE_HARTREE_DATASET].shape)
-			for k, v in h5[TRANSVERSE_HARTREE_DATASET].attrs.items():
-				out[f"transverse_hartree_{k}"] = v
 	return out
-
-
-def kin_ion_has_hartree(h5_path: str) -> bool:
-	"""True iff V_H is **folded into the ``kin_ion`` values themselves**.
-
-	The legacy (pre-``v_hartree``) contract flag for the
-	no-double-counting rule.  It is deliberately NOT true for the current
-	format, where V_H lives in its own dataset and ``kin_ion`` is
-	pristine — see :func:`kin_ion_hartree_source`, which is what new code
-	should call.  Legacy files written before the fold-in carry no
-	attribute at all and answer False, preserving their semantics.
-	"""
-	try:
-		attrs = read_kin_ion_provenance(h5_path)
-	except (FileNotFoundError, KeyError):
-		return False
-	if attrs.get("_has_v_hartree"):
-		return False           # separate array ⇒ kin_ion values are pristine
-	return bool(attrs.get("has_hartree", False))
-
-
-def kin_ion_hartree_source(h5_path: str) -> str:
-	"""What the FILE offers: ``'stored'`` | ``'folded'`` | ``'none'``.
-
-	Pure inspection — no policy.  :func:`resolve_hartree_source` applies
-	the request and the precedence.
-	"""
-	try:
-		attrs = read_kin_ion_provenance(h5_path)
-	except (FileNotFoundError, KeyError):
-		return "none"
-	if attrs.get("_has_v_hartree"):
-		return "stored"
-	if bool(attrs.get("has_hartree", False)):
-		return "folded"
-	return "none"
-
-
-def resolve_hartree_source(h5_path: str, requested: str = "auto",
-                           *, print_fn=print) -> str:
-	"""Decide where ⟨mk|V_H|nk⟩ comes from.  Returns the resolved source.
-
-	``auto`` precedence: **stored** array → legacy **folded** values →
-	**isdf**.  An explicit request is honoured, except that it may not
-	silently contradict a folded file: a ``folded`` ``kin_ion.h5`` has V_H
-	inside its values and *any* other source would double count, so that
-	combination raises rather than producing a plausible wrong number.
-
-	Returns one of ``'stored' | 'folded' | 'isdf' | 'gspace'``.  Only
-	``'folded'`` means "add nothing"; the other three all supply a V_H
-	that the driver adds to a pristine ``kin_ion``.
-	"""
-	requested = str(requested or "auto").strip().lower()
-	if requested not in HARTREE_SOURCES:
-		raise ValueError(
-			f"hartree_source={requested!r} is not one of {HARTREE_SOURCES}")
-	available = kin_ion_hartree_source(h5_path)
-
-	if available == "folded":
-		if requested in ("auto", "stored"):
-			return "folded"
-		raise ValueError(
-			f"hartree_source={requested!r} was requested but "
-			f"{os.path.basename(h5_path)} is a LEGACY folded file: V_H is "
-			"already inside its kin_ion values, so adding a second source "
-			"would double count ~500 eV.  Regenerate kin_ion.h5 (the current "
-			"writer stores V_H as a separate 'v_hartree' array and leaves "
-			"kin_ion pristine), or drop the override.")
-
-	if requested == "auto":
-		return "stored" if available == "stored" else "isdf"
-	if requested == "stored":
-		if available != "stored":
-			raise ValueError(
-				f"hartree_source=stored but {os.path.basename(h5_path)} has no "
-				f"'{HARTREE_DATASET}' dataset.  Regenerate it with "
-				"`python -m gw.kin_ion_io` (which stores V_H by default), or "
-				"use hartree_source=isdf / gspace.")
-		return "stored"
-	return requested                      # 'isdf' or 'gspace'
 
 
 def _load_matrix_submatrix(
@@ -527,513 +361,80 @@ def _load_matrix_submatrix(
 	return _unfold_if_ibz(arr, star)
 
 
-def load_hartree_submatrix(
-	h5_path: str,
-	band_start: int,
-	band_stop: int,
-	*,
-	mesh: Mesh | None = None,
-) -> jax.Array:
-	"""Read the stored exact ⟨mk|V_H|nk⟩ sub-window, replicated (Ry).
-
-	Same shape/sharding contract as :func:`load_kin_ion_submatrix` — the
-	two are added together to form H₀, so they must come back in the same
-	layout, which includes coming back on the same k-set.  Both therefore
-	unfold a stored IBZ slab here, at the read boundary.  Raises if the
-	dataset is absent; call :func:`resolve_hartree_source` first.
-	"""
-	return _load_matrix_submatrix(
-		h5_path, HARTREE_DATASET, band_start, band_stop, mesh=mesh)
-
-
-def load_transverse_hartree_submatrix(
-	h5_path: str,
-	band_start: int,
-	band_stop: int,
-	*,
-	mesh: Mesh | None = None,
-) -> jax.Array:
-	"""Read exact ``<m|sum_i alpha_i A_i[J/c]|n>`` replicated (Ry)."""
-	return _load_matrix_submatrix(
-		h5_path, TRANSVERSE_HARTREE_DATASET,
-		band_start, band_stop, mesh=mesh)
-
-
-def _validate_hartree_occupation_receipt(
-	attrs,
-	components,
-	wfn,
-	*,
-	wfn_fingerprint_binding=None,
-) -> None:
-	"""Authenticate one file-wide fractional rho/J receipt."""
-	scheme = attrs.get("wfn_fingerprint_scheme")
-	fingerprint = attrs.get("wfn_fingerprint")
-	if (scheme is None) != (fingerprint is None):
-		raise ValueError("kin_ion WFN fingerprint scheme/value must be atomic.")
-	has_fingerprint = scheme is not None
-	if has_fingerprint:
-		from common.parallel_transport import (
-			WFN_FINGERPRINT_SCHEME, fingerprint_from_binding,
-			wfn_fingerprint)
-		if isinstance(scheme, (bytes, np.bytes_)):
-			scheme = scheme.decode("ascii")
-		if isinstance(fingerprint, (bytes, np.bytes_)):
-			fingerprint = fingerprint.decode("ascii")
-		if str(scheme) != WFN_FINGERPRINT_SCHEME:
-			raise ValueError("kin_ion has an unknown WFN fingerprint scheme.")
-		if wfn is None:
-			raise ValueError(
-				"kin_ion WFN fingerprint validation requires its canonical "
-				"WFN provenance view.")
-		current_fingerprint = (
-			wfn_fingerprint(wfn)
-			if wfn_fingerprint_binding is None else
-			fingerprint_from_binding(wfn_fingerprint_binding, wfn))
-		if str(fingerprint) != str(current_fingerprint):
-			raise ValueError("kin_ion has a different WFN fingerprint.")
-	if not components:
-		return
-	triple = tuple(attrs.get(f"exact_hartree_{name}") for name in (
-		"occupation_policy", "expected_electrons", "density_band_stop"))
-	if all(value is None for value in triple):
-		if wfn is None:
-			return  # pre-occupation-schema legacy WFN/artifact pair
-		current_fractional = not bool(wfn.occupations_are_exact_integer)
-		if current_fractional:
-			raise ValueError(
-				"fractional exact Hartree lacks a complete-WFN occupation "
-				"receipt; regenerate with all smearing tails weighted.")
-		return  # explicit exact-integer legacy compatibility
-	if any(value is None for value in triple):
-		raise ValueError(
-			"exact-Hartree occupation receipt must contain policy, fixed-N, "
-			"and density support atomically.")
-	if not has_fingerprint:
-		raise ValueError(
-			"weighted exact Hartree lacks its canonical WFN fingerprint.")
-	if wfn is None:
-		raise ValueError(
-			"weighted exact-Hartree validation requires its canonical WFN "
-			"provenance view.")
-	current_fractional = not bool(wfn.occupations_are_exact_integer)
-	policy, expected, support = triple
-	if isinstance(policy, (bytes, np.bytes_)):
-		policy = policy.decode("ascii")
-	if (str(policy) != HARTREE_OCCUPATION_POLICY
-			or not np.isfinite(float(expected)) or int(support) <= 0):
-		raise ValueError("exact Hartree has an invalid occupation receipt.")
-	receipt = (float(expected), int(support))
-	target = (float(wfn.num_electrons),
-	          int(wfn.physical_density_band_stop))
-	if receipt != target:
-		raise ValueError(
-			f"exact-Hartree receipt {receipt!r} differs from current WFN "
-			f"target/support {target!r}.")
-	for prefix, label in components:
-		if prefix is None:  # folded scalar has no separate component dataset
-			continue
-		component_support = attrs.get(f"{prefix}_density_band_stop")
-		if component_support is None or int(component_support) != receipt[1]:
-			raise ValueError(
-				f"{label} density support differs from the rho/J receipt.")
-
-	if not current_fractional:
-		raise ValueError(
-			"fractional exact-Hartree artifact cannot feed an integer WFN.")
-
-
-def _hartree_receipt_components(attrs, selected_hartree_source,
-								require_transverse):
-	"""Resolve which exact-Hartree components this consumer selected."""
-	if selected_hartree_source not in _RESOLVED_HARTREE_SOURCES:
-		raise ValueError(
-			"exact-Hartree authentication requires a resolved Hartree source "
-			f"in {_RESOLVED_HARTREE_SOURCES}; got "
-			f"{selected_hartree_source!r}.")
-	components = []
-	if selected_hartree_source == "stored":
-		components.append(("hartree", "selected scalar exact Hartree"))
-	elif selected_hartree_source == "folded":
-		components.append((None, "selected folded exact Hartree"))
-	if require_transverse:
-		if not attrs.get("_has_v_hartree_transverse"):
-			raise ValueError(
-				"the independently authenticated direct-field receipt requires "
-				f"{TRANSVERSE_HARTREE_DATASET!r}, but kin_ion.h5 has no such "
-				"dataset.")
-		components.append(("transverse_hartree", TRANSVERSE_HARTREE_DATASET))
-	return components
-
-
 def validate_kin_ion_against_run(
 	h5_path: str,
 	*,
 	expected_bispinor: bool,
-	selected_hartree_source: str,
 	expected_bispinor_gw_mode: str | None = None,
-	wfn=None,
-	wfn_fingerprint_binding=None,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
 	nspinor: int | None = None,
-	require_transverse: bool = False,
 	print_fn=print,
 ) -> dict:
-	"""Refuse a ``kin_ion.h5`` that disagrees with the run it feeds.
-
-	``kin_ion`` fixes the Coulomb truncation convention, band window, and
-	four-current policy for the whole mean-field side of H₀.  Its component
-	receipts separately authenticate the scalar-charge and spatial-current
-	representations because their band matrices have identical shapes.  Thus
-	``bispinor`` is required provenance: a missing or unequal stamp refuses
-	before any matrix payload is read.  A file generated under
-	``sys_dim=3`` silently consumed by a ``sys_dim=2`` run puts a large
-	*systematic* error into a ~500 eV cancellation — indistinguishable,
-	from the outside, from a basis-convergence problem.  Check it once,
-	loudly, at load time.  Legacy files (no provenance attrs) are
-	accepted with a note for older optional fields; representation is the one
-	fail-closed exception because the writer already stamps it and there is no
-	safe legacy default.  Fractional stored/folded Hartree is the second
-	fail-closed exception: its canonical WFN fingerprint includes the complete
-	occupation table, and its policy marker distinguishes the weighted producer
-	from older artifacts that silently summed every support band with weight 1.
-	"""
+	"""Validate pristine kinetic+ionic provenance before its slab is read."""
 	attrs = read_kin_ion_provenance(h5_path)
-	components = _hartree_receipt_components(
-		attrs, selected_hartree_source, require_transverse)
-	_validate_hartree_occupation_receipt(
-		attrs, components, wfn,
-		wfn_fingerprint_binding=wfn_fingerprint_binding)
+	if bool(attrs.get("has_hartree", False)):
+		raise ValueError(
+			"kin_ion.h5 has has_hartree=True: this retired format folds V_H "
+			"into kin_ion and would double count the mandatory live G-space "
+			"Hartree field. Regenerate a pristine kin_ion.h5.")
+
 	stored_bispinor = attrs.get("bispinor")
 	if stored_bispinor is None:
 		raise ValueError(
-			"kin_ion.h5 carries no bispinor provenance stamp, so its "
-			"wavefunction representation cannot be compared with this run. "
-			"Regenerate kin_ion.h5 from the run's exact input deck."
-		)
+			"kin_ion.h5 has no bispinor provenance; regenerate it from the "
+			"run's input deck.")
 	if bool(stored_bispinor) != bool(expected_bispinor):
 		raise ValueError(
-			f"kin_ion.h5 was generated with bispinor="
-			f"{bool(stored_bispinor)} but this run uses bispinor="
-			f"{bool(expected_bispinor)}. The mean-field artifact must use the "
-			"same four-current policy as the GW run; regenerate "
-			"kin_ion.h5 from this run's exact input deck."
-		)
-	pauli_reference = is_pauli_reference_model(expected_bispinor_gw_mode)
-	isometric = is_isometric_kinetic_balance_model(
-		expected_bispinor_gw_mode)
-	explicit_comparison = bool(pauli_reference or isometric)
-	expected_mode_value = str(getattr(
-		expected_bispinor_gw_mode, "value", expected_bispinor_gw_mode))
+			f"kin_ion.h5 has bispinor={bool(stored_bispinor)} but this run "
+			f"uses bispinor={bool(expected_bispinor)}; regenerate it.")
+
 	representation = resolve_four_current_representation(
 		expected_bispinor, expected_bispinor_gw_mode)
-	expected_charge_representation = representation.charge_representation
-	stored_charge_representation = attrs.get("charge_representation")
-	if bool(expected_bispinor) and (
-		stored_charge_representation is None and explicit_comparison
-		or stored_charge_representation is not None
-		and str(stored_charge_representation) != expected_charge_representation
-	):
-		raise ValueError(
-			"kin_ion scalar charge representation is "
-			f"{stored_charge_representation!r}, expected "
-			f"{expected_charge_representation!r}; regenerate kin_ion.h5 from "
-			"this run's exact input deck.")
-	if explicit_comparison and str(attrs.get("bispinor_gw_mode")) != (
-		expected_mode_value):
-		raise ValueError(
-			"the explicit four-current comparison requires an authenticated "
-			f"bispinor_gw_mode={expected_mode_value!r}; "
-			f"artifact has {attrs.get('bispinor_gw_mode')!r}.")
-	if bool(expected_bispinor):
-		stored_current_representation = attrs.get(
-			"spatial_current_representation")
-		if (stored_current_representation is None and explicit_comparison
-				or stored_current_representation is not None
-				and str(stored_current_representation) !=
-				representation.spatial_current_representation):
-			raise ValueError(
-				"kin_ion spatial-current representation is "
-				f"{stored_current_representation!r}, expected "
-				f"{representation.spatial_current_representation!r}.")
+	if expected_bispinor:
+		for attr, expected in (
+			("charge_representation", representation.charge_representation),
+			("spatial_current_representation",
+			 representation.spatial_current_representation),
+		):
+			stored = attrs.get(attr)
+			if stored is not None and str(stored) != str(expected):
+				raise ValueError(
+					f"kin_ion.h5 {attr}={stored!r}, expected {expected!r}.")
+		if (is_pauli_reference_model(expected_bispinor_gw_mode)
+				or is_isometric_kinetic_balance_model(
+					expected_bispinor_gw_mode)):
+			expected_mode = str(getattr(
+				expected_bispinor_gw_mode, "value",
+				expected_bispinor_gw_mode))
+			if str(attrs.get("bispinor_gw_mode")) != expected_mode:
+				raise ValueError(
+					f"kin_ion.h5 bispinor_gw_mode="
+					f"{attrs.get('bispinor_gw_mode')!r}, expected "
+					f"{expected_mode!r}.")
+
 	stored_sys_dim = attrs.get("sys_dim")
-	if sys_dim is not None and stored_sys_dim is not None and (
-		int(stored_sys_dim) != int(sys_dim)
-	):
+	if (sys_dim is not None and stored_sys_dim is not None
+			and int(stored_sys_dim) != int(sys_dim)):
 		raise ValueError(
-			f"kin_ion.h5 was generated with sys_dim={int(stored_sys_dim)} but this "
-			f"run uses sys_dim={int(sys_dim)}.  The Coulomb truncation convention "
-			"must match — regenerate kin_ion.h5 with the run's own input file."
-		)
-	# Same legacy contract as sys_dim: the producer stamps ``nspinor``
-	# (gw.kin_ion_io), an older file simply lacks the attr and is accepted.
-	# A spin-structure mismatch is not a band-count problem the checks
-	# below could catch — an nspinor=2 file has ψ†ψ over two components
-	# and (with SOC) j-resolved V_NL, so its T+V_ion against a scalar
-	# WFN's basis is silently, systematically wrong.
+			f"kin_ion.h5 has sys_dim={int(stored_sys_dim)} but this run "
+			f"uses sys_dim={int(sys_dim)}.")
 	stored_nspinor = attrs.get("nspinor")
-	if nspinor is not None and stored_nspinor is not None and (
-		int(stored_nspinor) != int(nspinor)
-	):
+	if (nspinor is not None and stored_nspinor is not None
+			and int(stored_nspinor) != int(nspinor)):
 		raise ValueError(
-			f"kin_ion.h5 was generated from an nspinor={int(stored_nspinor)} "
-			f"WFN but this run's WFN has nspinor={int(nspinor)}.  T+V_ion "
-			"matrix elements are per spin structure — regenerate kin_ion.h5 "
-			"from the run's own WFN."
-		)
-	# The LOGICAL k count, not the stored one: an IBZ-stored file holds nrk
-	# rows and hands the run nk of them, and comparing the stored extent
-	# would refuse every compressed file on a deck with any symmetry at all.
+			f"kin_ion.h5 has nspinor={int(stored_nspinor)} but this run "
+			f"uses nspinor={int(nspinor)}; regenerate it from this WFN.")
 	if nk is not None and int(attrs["_nk_logical"]) != int(nk):
 		raise ValueError(
-			f"kin_ion.h5 has nk={int(attrs['_nk_logical'])} "
-			f"(stored on {attrs['_k_storage']}, {attrs['_shape'][0]} rows on "
-			f"disk) but the run has nk={int(nk)}."
-		)
+			f"kin_ion.h5 has nk={int(attrs['_nk_logical'])} but the run has "
+			f"nk={int(nk)}.")
 	if band_stop is not None and int(attrs["_shape"][1]) < int(band_stop):
 		raise ValueError(
-			f"kin_ion.h5 has {int(attrs['_shape'][1])} bands but the run's sigma "
-			f"window needs {int(band_stop)}."
-		)
-	if attrs.get("_has_v_hartree"):
-		hs = attrs.get("_hartree_shape", ("?", "?", "?"))
-		if band_stop is not None and int(hs[1]) < int(band_stop):
-			raise ValueError(
-				f"kin_ion.h5 stores V_H for {int(hs[1])} bands but the run's "
-				f"sigma window needs {int(band_stop)}.  The two arrays must "
-				"cover the same window — regenerate with a larger -n.")
-		if expected_bispinor:
-			matrix_nspinor = attrs.get("hartree_matrix_nspinor")
-			expected_matrix_nspinor = (
-				4 if representation.charge_bispinor else 2)
-			if (matrix_nspinor is None
-					or int(matrix_nspinor) != expected_matrix_nspinor):
-				raise ValueError(
-					f"{HARTREE_DATASET} matrix_nspinor={matrix_nspinor!r}; "
-					"the selected scalar charge representation requires "
-					f"matrix_nspinor={expected_matrix_nspinor}. Regenerate "
-					"kin_ion.h5.")
-			component_representation = attrs.get(
-				"hartree_charge_representation")
-			if (component_representation is None and explicit_comparison
-					or component_representation is not None
-					and str(component_representation) !=
-					expected_charge_representation):
-				raise ValueError(
-					f"{HARTREE_DATASET} charge representation is "
-					f"{component_representation!r}, expected "
-					f"{expected_charge_representation!r}.")
-		print_fn(
-			f"  kin_ion: pristine T+V_loc+V_NL, plus a stored exact V_H array "
-			f"{tuple(hs)} (truncation_2d="
-			f"{bool(attrs.get('hartree_truncation_2d', False))})."
-		)
-	elif bool(attrs.get("has_hartree", False)):
-		if expected_bispinor:
-			raise ValueError(
-				"a kinetic-balance bispinor run cannot consume a legacy folded "
-				"kin_ion artifact: scalar V_H is inseparable from kin_ion and the "
-				"exact transverse direct component has no authenticated seam. "
-				"Regenerate separate scalar and transverse Hartree datasets.")
-		print_fn(
-			"  kin_ion: LEGACY folded file — exact FFT-grid V_H is inside the "
-			f"kin_ion values (truncation_2d="
-			f"{bool(attrs.get('hartree_truncation_2d', False))}); no V_H will "
-			"be added on top."
-		)
-	else:
-		print_fn(
-			"  kin_ion: ionic only (no stored V_H) — V_H comes from the ISDF "
-			"centroid quadrature, so H0 depends on the centroid count."
-		)
-
-	if require_transverse:
-		# Authenticate this dataset's own storage receipt before any SlabIO
-		# payload read.  It may not inherit a sibling dataset's k-set claim.
-		read_star_map(h5_path, TRANSVERSE_HARTREE_DATASET)
-		shape = attrs["_transverse_hartree_shape"]
-		if band_stop is not None and int(shape[1]) < int(band_stop):
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} stores {int(shape[1])} bands but "
-				f"the run needs {int(band_stop)}; regenerate with a larger -n.")
-		required = {
-			"tt_projector": TRANSVERSE_HARTREE_PROJECTOR,
-			"g0_policy": TRANSVERSE_HARTREE_G0_POLICY,
-			"g0_current_diagnostic_policy": TRANSVERSE_HARTREE_G0_DIAGNOSTIC,
-			"symmetry_class": TRANSVERSE_HARTREE_SYMMETRY,
-			"current_symmetry_projection":
-				TRANSVERSE_HARTREE_CURRENT_PROJECTION,
-		}
-		from common.bispinor_init import (
-			DIRAC_ALPHA_VERTEX_PROVENANCE,
-			kinetic_balance_lift_provenance,
-			NO_PAIR_DIRAC_CURRENT_MODEL,
-		)
-		required.update({
-			"current_model": NO_PAIR_DIRAC_CURRENT_MODEL,
-			"bispinor_lift": kinetic_balance_lift_provenance(
-				representation.current_lift or "raw"),
-			"current_vertex": DIRAC_ALPHA_VERTEX_PROVENANCE,
-		})
-		for name, expected in required.items():
-			got = attrs.get(f"transverse_hartree_{name}")
-			if str(got) != expected:
-				raise ValueError(
-					f"{TRANSVERSE_HARTREE_DATASET} provenance {name!r} is "
-					f"{got!r}, expected {expected!r}; regenerate kin_ion.h5.")
-		from ffi import _services
-		_services.ensure_on_path()
-		from vcoul import COULOMB_GAUGE_TT_SIGN
-		stored_sign = attrs.get("transverse_hartree_tt_metric_sign")
-		if stored_sign is None or float(stored_sign) != float(
-			COULOMB_GAUGE_TT_SIGN
-		):
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} tt_metric_sign={stored_sign!r}, "
-				f"expected canonical {float(COULOMB_GAUGE_TT_SIGN)}.")
-		if sys_dim is not None:
-			stored_trunc = attrs.get("transverse_hartree_truncation_2d")
-			if stored_trunc is None or bool(stored_trunc) != (int(sys_dim) == 2):
-					raise ValueError(
-					f"{TRANSVERSE_HARTREE_DATASET} truncation_2d="
-					f"{stored_trunc!r} disagrees with sys_dim={int(sys_dim)}.")
-		matrix_nspinor = attrs.get("transverse_hartree_matrix_nspinor")
-		if matrix_nspinor is None or int(matrix_nspinor) != 4:
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} matrix_nspinor="
-				f"{matrix_nspinor!r}; exact alpha.A projection requires the "
-				"canonical four-component kinetic-balance matrix basis.")
-		component_current_representation = attrs.get(
-			"transverse_hartree_spatial_current_representation")
-		if (component_current_representation is None and explicit_comparison
-				or component_current_representation is not None
-				and str(component_current_representation) !=
-				representation.spatial_current_representation):
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} spatial-current "
-				f"representation is {component_current_representation!r}, "
-				"expected the canonical raw kinetic-balance spatial current.")
-		source_nspinor = attrs.get("transverse_hartree_source_wfn_nspinor")
-		artifact_nspinor = attrs.get("nspinor")
-		if (source_nspinor is None or artifact_nspinor is None
-				or int(source_nspinor) != int(artifact_nspinor)):
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} source_wfn_nspinor="
-				f"{source_nspinor!r} disagrees with the authenticated kin_ion "
-				f"WFN basis nspinor={artifact_nspinor!r}.")
-		for name in (
-			"current_g0_l2", "current_l2", "current_g0_relative",
-			"current_symmetry_relative_movement",
-			"current_symmetry_relative_residual",
-			"current_symmetry_rotation_table_closure_defect",
-			"current_symmetry_floating_point_residual_bound",
-			"current_symmetry_relative_residual_tolerance",
-		):
-			value = attrs.get(f"transverse_hartree_{name}")
-			if value is None or not np.isfinite(float(value)) or float(value) < 0:
-				raise ValueError(
-					f"{TRANSVERSE_HARTREE_DATASET} carries invalid diagnostic "
-					f"{name}={value!r}.")
-		residual = float(attrs[
-			"transverse_hartree_current_symmetry_relative_residual"])
-		stored_tolerance = float(attrs[
-			"transverse_hartree_current_symmetry_relative_residual_tolerance"])
-		rotation_defect = float(attrs[
-			"transverse_hartree_current_symmetry_rotation_table_closure_defect"])
-		floating_bound = float(attrs[
-			"transverse_hartree_current_symmetry_floating_point_residual_bound"])
-		derived_tolerance = rotation_defect + floating_bound
-		sum_roundoff = (
-			8.0 * np.finfo(np.float64).eps
-			* max(abs(rotation_defect), abs(floating_bound),
-			      abs(stored_tolerance), np.finfo(np.float64).tiny))
-		if abs(stored_tolerance - derived_tolerance) > sum_roundoff:
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} carries an unauthenticated "
-				"current-symmetry tolerance: stored total="
-				f"{stored_tolerance:.6e}, but rotation-table closure defect "
-				f"{rotation_defect:.6e} + floating reduction bound "
-				f"{floating_bound:.6e} = {derived_tolerance:.6e}.")
-		if derived_tolerance <= 0 or residual > derived_tolerance:
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} does not certify its star-wedge "
-				f"projection: residual={residual:.6e}, derived tolerance="
-				f"{derived_tolerance:.6e} (delta_R={rotation_defect:.6e}, "
-				f"floating={floating_bound:.6e}).")
-		for name in ("current_symmetry_rows",
-		             "current_symmetry_antiunitary_rows"):
-			value = attrs.get(f"transverse_hartree_{name}")
-			if value is None or int(value) < 0:
-				raise ValueError(
-					f"{TRANSVERSE_HARTREE_DATASET} carries invalid projection "
-					f"receipt {name}={value!r}.")
-		n_spatial = attrs.get(
-			f"transverse_hartree_{N_SYM_SPATIAL_ATTR}")
-		n_rows = int(attrs["transverse_hartree_current_symmetry_rows"])
-		n_anti = int(attrs[
-			"transverse_hartree_current_symmetry_antiunitary_rows"])
-		if (n_spatial is None or int(n_spatial) < 1
-				or n_anti not in (0, int(n_spatial))
-				or n_rows != int(n_spatial) + n_anti):
-			raise ValueError(
-				f"{TRANSVERSE_HARTREE_DATASET} projection rows do not match its "
-				f"authenticated star table: n_sym_spatial={n_spatial!r}, "
-				f"rows={n_rows}, antiunitary_rows={n_anti}.")
-		print_fn(
-			f"  kin_ion: exact transverse direct Hartree {tuple(shape)}; "
-			f"||J(G=0)||2/||J(r)||2="
-			f"{float(attrs['transverse_hartree_current_g0_relative']):.3e}, "
-			"periodic TT G=0 is structurally zero (no miniBZ head); "
-			f"current covariance residual={residual:.3e} <= "
-			f"{derived_tolerance:.3e} (delta_R={rotation_defect:.3e}, "
-			f"floating={floating_bound:.3e}).")
-	return attrs
-
-
-def authenticate_kin_ion_hartree_wfn_receipt(
-	h5_path: str,
-	wfn_path: str,
-	*,
-	selected_hartree_source: str,
-	band_stop: int | None = None,
-	require_transverse: bool = False,
-) -> dict:
-	"""Authenticate post-hoc Hartree/WFN provenance before a matrix read.
-
-	This deliberately does not validate representation: the EQP-facing door
-	has no independent run configuration from which to establish it, and a v3
-	charge-only receipt does not prove non-bispinor.  ``require_transverse`` may
-	only be set from independent component-aware receipt evidence (v4 today).
-	The live GW path uses :func:`validate_kin_ion_against_run` with its parsed
-	``config.bispinor`` for the independent representation check.
-	A pre-occupation-schema artifact paired with a similarly old WFN lacking
-	``mf_header/kpoints/occ`` retains the explicit legacy compatibility branch;
-	any modern WFN or artifact marker takes the canonical provenance path.
-	"""
-	attrs = read_kin_ion_provenance(h5_path)
-	markers = (
-		"wfn_fingerprint_scheme", "wfn_fingerprint",
-		"exact_hartree_occupation_policy",
-		"exact_hartree_expected_electrons",
-		"exact_hartree_density_band_stop",
-	)
-	needs_provenance = any(attrs.get(name) is not None for name in markers)
-	if not needs_provenance:
-		with h5py.File(wfn_path, "r") as h5:
-			needs_provenance = "mf_header/kpoints/occ" in h5
-	wfn = None
-	if needs_provenance:
-		from wfn_loader import read_wfn_provenance
-		wfn = read_wfn_provenance(wfn_path)
-	components = _hartree_receipt_components(
-		attrs, selected_hartree_source, bool(require_transverse))
-	_validate_hartree_occupation_receipt(attrs, components, wfn)
-	if band_stop is not None and int(attrs["_shape"][1]) < int(band_stop):
-		raise ValueError(
-			f"kin_ion.h5 has {int(attrs['_shape'][1])} bands but the EQP "
-			f"window needs {int(band_stop)}.")
+			f"kin_ion.h5 has {int(attrs['_shape'][1])} bands but the run "
+			f"needs {int(band_stop)}.")
+	print_fn("  kin_ion: pristine T+V_loc+V_NL; Hartree is built live in G-space.")
 	return attrs
 
 
@@ -1046,9 +447,8 @@ def load_kin_ion_submatrix(
 ) -> jax.Array:
 	"""Read the [band_start, band_stop) sub-window of ``kin_ion`` replicated.
 
-	Stored dataset is ``H_DFT − V_xc`` (kinetic + ionic; Hartree only if it
-	was added at generation time), so V_xc should not be subtracted again
-	downstream.
+	Stored dataset is the pristine ``T + V_loc + V_NL`` operator.  Folded
+	Hartree files are rejected by :func:`validate_kin_ion_against_run`.
 
 	The full kin_ion sub-block ``(nk, nb, nb)`` fits comfortably on a single
 	device — it is loaded **fully replicated** on ``mesh`` so the

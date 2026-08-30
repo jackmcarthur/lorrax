@@ -24,7 +24,6 @@ def _config():
         no_degen_averaging=False,
         degen_avg_tol_ry=1.0e-6,
         restart=False,
-        hartree_source="auto",
         backend=SimpleNamespace(
             charge_zeta_solve="rank_truncate",
             distributed_zeta_solve="per_q",
@@ -186,7 +185,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
     assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
     assert " Ry" not in text and "Rydberg" not in text
-    assert "Coulomb system : 2D slab; Hartree source=auto" in text
+    assert "Coulomb system : 2D slab; Hartree=live G-space" in text
     assert "Full BZ grid   : 2 k points" in text
     assert "Stored IBZ     : 2 k points" in text
     assert ("Centroid orbit: CLOSED : 1/1 spatial operations preserve 399 "
