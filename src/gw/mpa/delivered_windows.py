@@ -177,14 +177,19 @@ def _compress(values, masses, bins):
     return cells, cell_mass
 
 
-def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
-    """Build one bounded measure for every live state--pole tuple.
+def _pole_measures(branch, Omega, B, eta, amplitude, bins):
+    """Build compact pole measures plus executable tuple geometry.
 
-    The spatial pole field is reduced once per leading pole.  Shifting that
-    bounded pole measure by each live state energy then produces the explicit
-    tuple rows the executor can address.  The returned state indices are flat
-    indices into the branch's ``(k, band)`` carrier; pole indices retain their
-    leading-axis identity in the streamed fit store.
+    The spatial pole field is reduced once per leading pole.  Tuple mass and
+    representative coordinates are then scalar products of that pole summary
+    with each live state.  No per-tuple lattice is retained: on a real 8^3,
+    48-band, eight-pole run that would mean roughly 200,000 Python objects and
+    hundreds of millions of duplicated lattice cells.  The selected windows
+    build their bounded measures once in :func:`_tuple_window_problems`.
+
+    Returned state indices are flat indices into the branch's ``(k, band)``
+    carrier; pole indices retain their leading-axis identity in the streamed
+    fit store.
     """
     signed_energy, state_mass, state_indices = _branch_states(
         branch, amplitude)
@@ -241,7 +246,6 @@ def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
         pole_cells.append(cells)
         pole_weights.append(weights)
 
-    base, refined = [], []
     tuple_mass, representative = [], []
     tuple_state_indices, tuple_pole_indices = [], []
     # State-major, pole-minor is the DEV-80 tuple convention.  Keeping this
@@ -253,28 +257,20 @@ def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
                 pole_cells, pole_weights)):
             if cells is None:
                 continue
-            internal = np.asarray(
-                energy + pole_sign * cells, dtype=np.complex128)
-            delivered = np.asarray(mass * weights, dtype=np.float64)
-            cells_b, mass_b, cells_r, mass_r = tail_refined_lattice_measure(
-                internal, delivered, bins_per_axis=int(bins))
-            base.append(ReciprocalMeasureProblem(
-                frequencies=frequencies, internal_sums=cells_b,
-                cell_masses=mass_b))
-            refined.append(ReciprocalMeasureProblem(
-                frequencies=frequencies, internal_sums=cells_r,
-                cell_masses=mass_r))
-            total = float(np.sum(delivered))
+            total_pole_mass = float(np.sum(weights))
+            pole_mean = complex(np.sum(weights * cells) / total_pole_mass)
+            total = float(mass * total_pole_mass)
             tuple_mass.append(total)
             representative.append(complex(
-                np.sum(delivered * internal) / total))
+                energy + pole_sign * pole_mean))
             tuple_state_indices.append(int(state_index))
             tuple_pole_indices.append(int(pole_index))
 
     raw_global = int(np.asarray(all_gather_processes(
         np.asarray([raw_count], dtype=np.int64))).sum())
     return (
-        base, refined,
+        signed_energy, state_mass, state_indices,
+        tuple(pole_cells), tuple(pole_weights),
         np.asarray(tuple_mass, np.float64),
         np.asarray(representative, np.complex128),
         np.asarray(tuple_state_indices, np.int32),
@@ -334,15 +330,58 @@ def _partition_tuples(representative, masses, frequencies, space, *,
         name=f"{window.name}_tuples") for window in local)
 
 
-def _combine_problems(problems, indices, frequencies):
-    selected = [problems[int(index)] for index in indices
-                if problems[int(index)] is not None]
-    if not selected:
-        raise ValueError("delivered Sigma window has no measured pole support")
-    return ReciprocalMeasureProblem(
-        frequencies=frequencies,
-        internal_sums=np.concatenate([row.internal_sums for row in selected]),
-        cell_masses=np.concatenate([row.cell_masses for row in selected]))
+def _tuple_window_problems(
+    member_indices, tuple_state_indices, tuple_pole_indices,
+    state_indices, signed_energy, state_mass, pole_cells, pole_weights,
+    frequencies, pole_sign, bins,
+):
+    """Build base/refined lattices once for one executable tuple window.
+
+    For each pole, selected state energies are first compressed to the same
+    bounded lattice vocabulary as the spatial residue field.  Their outer sum
+    has at most ``bins * bins^2`` cells per pole instead of one copied pole
+    lattice per actual ``(k, band, pole)`` tuple.  Tuple membership itself is
+    unchanged and remains exact in the executor.
+    """
+    members = np.asarray(member_indices, np.int64)
+    states = np.asarray(tuple_state_indices[members], np.int32)
+    poles = np.asarray(tuple_pole_indices[members], np.int32)
+    if not members.size:
+        raise ValueError("delivered Sigma window has no measured tuple support")
+
+    internal_rows, delivered_rows = [], []
+    for pole in np.unique(poles):
+        selected_states = states[poles == pole]
+        positions = np.searchsorted(state_indices, selected_states)
+        if (np.any(positions >= state_indices.size)
+                or not np.array_equal(state_indices[positions], selected_states)):
+            raise AssertionError(
+                "delivered tuple state index is outside its live-state table")
+        state_cells, state_weights = _compress(
+            np.asarray(signed_energy[positions], np.complex128),
+            np.asarray(state_mass[positions], np.float64), bins)
+        cells = pole_cells[int(pole)]
+        weights = pole_weights[int(pole)]
+        if cells is None or weights is None:
+            raise AssertionError(
+                "delivered tuple selected a pole without measured support")
+        internal_rows.append((
+            state_cells[:, None] + pole_sign * cells[None, :]).reshape(-1))
+        delivered_rows.append((
+            state_weights[:, None] * weights[None, :]).reshape(-1))
+
+    internal = np.concatenate(internal_rows)
+    delivered = np.concatenate(delivered_rows)
+    cells_b, mass_b, cells_r, mass_r = tail_refined_lattice_measure(
+        internal, delivered, bins_per_axis=int(bins))
+    return (
+        ReciprocalMeasureProblem(
+            frequencies=frequencies, internal_sums=cells_b,
+            cell_masses=mass_b),
+        ReciprocalMeasureProblem(
+            frequencies=frequencies, internal_sums=cells_r,
+            cell_masses=mass_r),
+    )
 
 
 def _window_kind(problem):
@@ -747,10 +786,10 @@ def build_delivered_sigma_windows(
         if not np.allclose(frequencies, expected, rtol=0.0, atol=1.0e-13):
             raise ValueError(
                 f"branch {branch.tag!r} frequency indices disagree with its signed half")
-        (base, refined, masses, representative, state_indices,
+        (signed_energy, state_mass, live_state_indices,
+         pole_cells, pole_weights, masses, representative, state_indices,
          pole_indices, raw_count) = _pole_measures(
-            branch, Omega, B, frequencies, eta, amplitude,
-            int(lattice_bins))
+            branch, Omega, B, eta, amplitude, int(lattice_bins))
         windows = _partition_tuples(
             representative, masses, frequencies, branch.space,
             force_single=(np.unique(pole_indices).size == 1))
@@ -763,9 +802,12 @@ def build_delivered_sigma_windows(
             "plan_start": len(specs), "windows": [],
         }
         for window in windows:
-            problem = _combine_problems(base, window.member_indices, frequencies)
-            validation = _combine_problems(
-                refined, window.member_indices, frequencies)
+            problem, validation = _tuple_window_problems(
+                window.member_indices, state_indices, pole_indices,
+                live_state_indices, signed_energy, state_mass,
+                pole_cells, pole_weights, frequencies,
+                1.0 if branch.space == "cond" else -1.0,
+                int(lattice_bins))
             envelope_by_frequency = (
                 problem.cell_masses[None, :] / np.abs(problem.denominators)
             ).sum(axis=1)
