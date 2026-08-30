@@ -666,6 +666,28 @@ class DeviceOmegaAccumulator:
         self._coeff = None
         self._index = 0
 
+    def add_direct(self, sigma_omega, omega_index, *, coefficient=1.0):
+        """Add one exact direct-frequency tile outside the tau lifecycle.
+
+        Direct reciprocal terms already carry their complete denominator,
+        so there is no tau coefficient or open window.  Reusing the ordinary
+        sharded omega-add primitive keeps the output layout and accumulation
+        order identical to tau contributions while making the separate cost
+        currency explicit at the call site.
+        """
+        if self._coeff is not None:
+            raise RuntimeError(
+                "cannot add a direct Sigma tile while a tau window is open")
+        index = int(omega_index)
+        if not 0 <= index < self._omega.size:
+            raise ValueError(
+                f"direct omega index {index} outside [0,{self._omega.size})")
+        coeff = np.zeros(self._omega.size, dtype=np.complex128)
+        coeff[index] = complex(coefficient)
+        coeff = device_put_process_local(coeff, self._replicated)
+        self._total = _device_omega_add(self._sharding)(
+            self._total, sigma_omega, coeff)
+
     def finalize(self):
         if self._coeff is not None:
             raise RuntimeError("cannot finalize an open frequency window")

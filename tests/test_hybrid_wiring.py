@@ -23,19 +23,34 @@ def _executed_scalar(plan, poles, residues, energies, omega):
     output = np.zeros(np.asarray(omega).shape, dtype=np.complex128)
     for row in plan:
         win = row.window
+        if row.direct:
+            external_sign = int(win.omega_sign) * int(row.pole_sign)
+            for frequency, frequency_index in zip(
+                    row.omega_abs, row.omega_idx):
+                for state_index, pole_index in zip(
+                        row.state_indices, row.pole_indices):
+                    denominator = (
+                        external_sign * frequency
+                        - row.pole_sign * (
+                            energies[state_index] + poles[pole_index]
+                            - 1j * row.direct_eta_ry))
+                    output[frequency_index] += (
+                        win.prefactor * residues[pole_index] / denominator)
+            continue
         times = np.asarray(win.nodes.t)
         alpha = np.asarray(win.nodes.alpha)
-        for frequency_index, frequency in enumerate(omega):
+        for frequency_index, frequency in zip(row.omega_idx, row.omega_abs):
             coefficient = _omega_coefficient(
                 np, frequency, times, alpha, win.omega_sign,
                 win.prefactor, e_ref=win.E_ref_A + win.E_ref_B)
-            for energy in energies:
+            for state_index, pole_index in zip(
+                    row.state_indices, row.pole_indices):
+                energy = energies[state_index]
                 green = np.exp(-1.0j * (energy - win.E_ref_A) * times)
-                for pole_index in row.pole_indices:
-                    screened = residues[pole_index] * np.exp(
-                        -1.0j * (poles[pole_index] - win.E_ref_B) * times)
-                    output[frequency_index] += np.sum(
-                        coefficient * green * screened)
+                screened = residues[pole_index] * np.exp(
+                    -1.0j * (poles[pole_index] - win.E_ref_B) * times)
+                output[frequency_index] += np.sum(
+                    coefficient * green * screened)
     return output
 
 
@@ -64,7 +79,8 @@ def test_gn_single_pole_reduction_is_one_executable_window():
     assert report["branches"][0]["live_pole_count"] == 1
     assert report["branches"][0]["window_count"] == 1
     assert len(plan) == 1
-    np.testing.assert_array_equal(plan[0].pole_indices, [0])
+    np.testing.assert_array_equal(plan[0].pole_indices, [0, 0])
+    np.testing.assert_array_equal(plan[0].state_indices, [0, 1])
     assert plan[0].window.project == "full"
 
 
@@ -81,7 +97,9 @@ def test_mpa_pole_windows_reconstruct_a_small_true_sigma():
         regularization_width_ry=eta, target_error=2.0e-3,
         lattice_bins=10, max_nodes=120, pane_times=pane_times)
     membership = np.concatenate([row.pole_indices for row in plan])
-    np.testing.assert_array_equal(np.sort(membership), np.arange(poles.size))
+    np.testing.assert_array_equal(
+        np.unique(membership), np.arange(poles.size))
+    assert membership.size == energies.size * poles.size
     assert report["n_windows"] >= 2
     assert all(row["amplification_p99"] <= report["amplification_cap"]
                for row in report["branches"][0]["windows"])
@@ -117,8 +135,8 @@ def test_shared_grid_uses_one_branch_grid_at_matched_true_error():
     assert report["window_tau_pairs"] == len(plan) * grids[0].size
     assert report["distinct_tau_count"] == grids[0].size
     assert report["direct_term_count"] == 0
-    assert report["branches"][0]["window_axis"] == "pole"
-    assert report["branches"][0]["state_support"] == "full"
+    assert report["branches"][0]["window_axis"] == "state_pole_tuple"
+    assert report["branches"][0]["state_support"] == "explicit"
 
     executed = _executed_scalar(plan, poles, residues, energies, omega)
     broadened = poles.real - 1.0j * (-poles.imag + eta)

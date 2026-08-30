@@ -46,6 +46,9 @@ _sigma_spatial_kernel_cache: dict[tuple[object, ...], "SpatialKernel"] = {}
 _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
+_sigma_shared_direct_kernel_cache: dict[
+    tuple[object, ...], Callable[..., jax.Array]
+] = {}
 
 
 def _stage_timing_enabled() -> bool:
@@ -1073,6 +1076,7 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
 def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     layout: str = "legacy", face_shape=None,
+    tuple_components: bool = False,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1082,6 +1086,16 @@ def get_shared_sigma_tau_kernel(
     tile before that unchanged convolution.  It always uses the single
     complex projection carrier; HGL's missing sine arm is completed once by
     :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
+
+    With ``tuple_components=True`` the same owner consumes a small exact
+    factorization of a delivered state--pole tuple mask.  Each component has
+    one state selector and one vector of leading-pole coefficients.  G and W
+    are transformed component by component, their real-space products are
+    summed, and the Sigma-side forward transform plus band projection run
+    once.  Thus a shared-grid group pays one Sigma back-transform per distinct
+    tau even when several logical windows carry different coefficients.  The
+    loop keeps one G/W pair live at a time; no leading component axis is ever
+    materialized on a large spatial tensor.
 
     This is the entry point ``gw.mpa.sigma`` calls (insulating MPA shares
     this exact kernel with GN-PPM's merged Laplace plan — no bracket plan,
@@ -1093,12 +1107,98 @@ def get_shared_sigma_tau_kernel(
     from ffi import ffi_dial_key
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
-           layout, face_shape)
+           layout, face_shape, bool(tuple_components))
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+    if tuple_components:
+        if _stage_timing_enabled():
+            raise NotImplementedError(
+                "delivered tuple-component Sigma fusion is not available "
+                "with LORRAX_SIGMA_TAU_TIMING=1; disable the stage-split "
+                "diagnostic for the production fused executor")
+        if face_shape is None and layout == "face":
+            raise ValueError(
+                "tuple-component Sigma fusion with layout='face' requires "
+                "face_shape=(nk, nb_full, n_rmu, nspinor)")
+        from .greens_function_kernel import build_G_tau
+        from .wavefunction_bundle import (G_FFT7D_SPEC as _G_spec,
+                                          V_FFT5D_SPEC as _V_spec)
+        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+
+        nk_tot = int(np.prod(kgrid))
+        inv_sqrt_nk = -1.0 / np.sqrt(float(nk_tot))
+        G_ifft = make_flat_k_ifftn(
+            mesh_xy, kgrid, _G_spec, norm="ortho")
+        G_fft = make_flat_k_fftn(
+            mesh_xy, kgrid, _G_spec, norm="ortho")
+        W_ifft = make_flat_k_ifftn(
+            mesh_xy, kgrid, _V_spec, norm="ortho")
+        project = _make_project_ri_reduce_scatter(
+            mesh_xy, merged_x=True, layout=layout, face_shape=face_shape)
+        g_plan = None
+        if layout == "face":
+            from distrib_la import gemm_plan
+            nk_f, nb_f, n_mu_f, n_spin_f = (int(x) for x in face_shape)
+            mu_spin = n_mu_f * n_spin_f
+            g_plan = gemm_plan(
+                mesh_xy, m=mu_spin, k=nb_f, n=mu_spin, nq=nk_f,
+                dtype=jnp.complex128)
+
+        def _build_component_G(xn, yr, E_A, selector, E_ref_A, t_node):
+            return build_G_tau(
+                xn, yr, E_A, 1j * t_node, e_ref=E_ref_A,
+                band_weight=selector, layout=layout, gemm=g_plan)
+
+        def _build_component_W(B_poles, Omega_poles, pole_weights,
+                               E_ref_B, t_node):
+            phase = jnp.exp(
+                -1j * (Omega_poles - E_ref_B) * t_node)
+            weights = pole_weights.reshape(
+                (pole_weights.shape[0],)
+                + (1,) * (Omega_poles.ndim - 1))
+            W_q = jnp.sum(weights * B_poles * phase, axis=0)
+            return jax.lax.with_sharding_constraint(W_q, q_mu_sharding)
+
+        @jax.jit
+        def _tau_components(
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+            E_A, component_selectors, B_poles, Omega_poles,
+            component_pole_weights, E_ref_A, E_ref_B, t_node,
+        ):
+            if component_selectors.shape[0] < 1:
+                raise ValueError(
+                    "tuple-component Sigma fusion requires at least one "
+                    "component")
+
+            def _product(index):
+                selector = jax.lax.dynamic_index_in_dim(
+                    component_selectors, index, axis=0, keepdims=False)
+                pole_weight = jax.lax.dynamic_index_in_dim(
+                    component_pole_weights, index, axis=0, keepdims=False)
+                G_k = _build_component_G(
+                    psi_coh_xn, psi_coh_yr, E_A, selector,
+                    E_ref_A, t_node)
+                W_q = _build_component_W(
+                    B_poles, Omega_poles, pole_weight, E_ref_B, t_node)
+                return G_ifft(G_k) * W_ifft(W_q)[:, None, :, None, :]
+
+            product = _product(0)
+
+            def _add(index, total):
+                return total + _product(index)
+
+            product = jax.lax.fori_loop(
+                1, component_selectors.shape[0], _add, product)
+            sigma_k = G_fft(product * inv_sqrt_nk)
+            return project(psi_proj_xr, sigma_k, psi_proj_yn)
+
+        _sigma_shared_tau_kernel_cache[key] = _tau_components
+        return _tau_components
+
     sigma_kij = _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         layout=layout, face_shape=face_shape)
@@ -1142,6 +1242,139 @@ def get_shared_sigma_tau_kernel(
 
     _sigma_shared_tau_kernel_cache[key] = _tau_staged
     return _tau_staged
+
+
+def _flat_q_difference_map(kgrid: tuple[int, int, int]) -> np.ndarray:
+    """Return ``q(k,k') = k-k'`` in the canonical flat-grid ordering."""
+    shape = tuple(int(x) for x in kgrid)
+    nk = int(np.prod(shape))
+    coords = np.asarray(np.unravel_index(np.arange(nk), shape)).T
+    out = np.empty((nk, nk), dtype=np.int32)
+    for source, source_coord in enumerate(coords):
+        q_coord = (coords - source_coord[None, :]) % np.asarray(shape)
+        out[source] = np.ravel_multi_index(q_coord.T, shape)
+    return out
+
+
+def _direct_reciprocal_denominator(
+    omega_abs, omega_external_sign, pole_sign, energy, pole, eta,
+):
+    """Causal direct denominator with the delivered eta fold applied once."""
+    return (omega_external_sign * omega_abs
+            - pole_sign * (energy + pole - 1j * eta))
+
+
+def get_shared_sigma_direct_kernel(
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
+    layout: str = "legacy", face_shape=None,
+) -> Callable[..., jax.Array]:
+    """Return the exact direct reciprocal contraction for delivered tuples.
+
+    A direct tuple is a flat ``(k', band)`` state index paired with one
+    leading multipole index.  For output k it owns q = k-k', so the exact
+    denominator remains local to the same term,
+
+    ``d = sign_omega*omega - sign_pole*(E(k',n) + Omega_p(q) - i*eta)``.
+
+    The kernel builds the tuple's rank-one Green's-function density through
+    the canonical :func:`greens_function_kernel.build_G_tau` owner at t=0,
+    performs the explicit q lookup required by the nonseparable denominator,
+    accumulates one centroid-basis Sigma tile, and calls the same canonical
+    band projector as the tau path once.  There is no second Green's-function,
+    FFT, or projection implementation.  Direct terms are intentionally a
+    separate cost currency; no tau count is incremented by this callable.
+    """
+    kgrid = tuple(int(x) for x in kgrid)
+    from ffi import ffi_dial_key
+    key = (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape)
+    if key in _sigma_shared_direct_kernel_cache:
+        return _sigma_shared_direct_kernel_cache[key]
+    if face_shape is None and layout == "face":
+        raise ValueError(
+            "direct delivered Sigma with layout='face' requires "
+            "face_shape=(nk, nb_full, n_rmu, nspinor)")
+
+    ensure_jax_compile_cache()
+    from .greens_function_kernel import build_G_tau
+    project = _make_project_ri_reduce_scatter(
+        mesh_xy, merged_x=True, layout=layout, face_shape=face_shape)
+    g_plan = None
+    if layout == "face":
+        from distrib_la import gemm_plan
+        nk_f, nb_f, n_mu_f, n_spin_f = (int(x) for x in face_shape)
+        mu_spin = n_mu_f * n_spin_f
+        g_plan = gemm_plan(
+            mesh_xy, m=mu_spin, k=nb_f, n=mu_spin, nq=nk_f,
+            dtype=jnp.complex128)
+    q_difference = jnp.asarray(_flat_q_difference_map(kgrid), jnp.int32)
+    nk_tot = int(np.prod(kgrid))
+
+    @jax.jit
+    def _direct(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+        E_A, base_selector, B_poles, Omega_poles,
+        state_indices, pole_indices, bounds, phase_real,
+        omega_abs, omega_external_sign, pole_sign, eta,
+    ):
+        if state_indices.shape[0] < 1:
+            raise ValueError("direct delivered Sigma requires a nonempty tuple list")
+        flat_band_count = E_A.shape[-1]
+        state_axis = jnp.arange(E_A.size, dtype=jnp.int32)
+
+        def _term(index):
+            state = jax.lax.dynamic_index_in_dim(
+                state_indices, index, axis=0, keepdims=False)
+            pole = jax.lax.dynamic_index_in_dim(
+                pole_indices, index, axis=0, keepdims=False)
+            b = jax.lax.dynamic_index_in_dim(
+                bounds, index, axis=0, keepdims=False)
+            use_real = jax.lax.dynamic_index_in_dim(
+                phase_real, index, axis=0, keepdims=False)
+            selector = (jnp.reshape(base_selector, (-1,))
+                        * (state_axis == state)).reshape(E_A.shape)
+            G_k = build_G_tau(
+                psi_coh_xn, psi_coh_yr, E_A,
+                jnp.asarray(0.0 + 0.0j, jnp.complex128),
+                e_ref=0.0, band_weight=selector,
+                layout=layout, gemm=g_plan)
+            source_k = state // flat_band_count
+            source_G = jax.lax.dynamic_index_in_dim(
+                G_k, source_k, axis=0, keepdims=False)
+            q_index = jax.lax.dynamic_index_in_dim(
+                q_difference, source_k, axis=0, keepdims=False)
+            Omega = jax.lax.dynamic_index_in_dim(
+                Omega_poles, pole, axis=0, keepdims=False)[q_index]
+            residue = jax.lax.dynamic_index_in_dim(
+                B_poles, pole, axis=0, keepdims=False)[q_index]
+            a = jnp.real(Omega)
+            gamma = -jnp.imag(Omega)
+            selected = ((a > b[0]) & (a <= b[1])
+                        & (gamma >= b[2]) & (gamma > b[3])
+                        & (gamma < b[4]) & (gamma <= b[5]))
+            phase = jnp.where(use_real, a + 0.0j, Omega)
+            energy = jnp.reshape(E_A, (-1,))[state]
+            denominator = _direct_reciprocal_denominator(
+                omega_abs, omega_external_sign, pole_sign,
+                energy, phase, eta)
+            screened = jnp.where(
+                selected, residue / denominator,
+                jnp.asarray(0.0 + 0.0j, jnp.complex128))
+            return source_G[None, ...] * screened[:, None, :, None, :]
+
+        sigma_k = _term(0)
+
+        def _add(index, total):
+            return total + _term(index)
+
+        sigma_k = jax.lax.fori_loop(
+            1, state_indices.shape[0], _add, sigma_k)
+        # Orthogonal FFT convolution plus the spatial kernel's
+        # ``-1/sqrt(Nk)`` prefactor is exactly ``-sum_q/Nk``.
+        sigma_k = sigma_k * (-1.0 / float(nk_tot))
+        return project(psi_proj_xr, sigma_k, psi_proj_yn)
+
+    _sigma_shared_direct_kernel_cache[key] = _direct
+    return _direct
 
 
 def precompile_sigma(wfns, ppm, meta, mesh_xy: Mesh, *,

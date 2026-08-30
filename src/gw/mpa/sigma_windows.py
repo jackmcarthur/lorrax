@@ -37,6 +37,25 @@ class SharedSigmaWindow(NamedTuple):
     #: incumbent bool-mask semantics.  The executor folds it into the A-side
     #: selector operand; planning here uses only the SUPPORT mask.
     band_weight: jax.Array | None = None
+    #: Optional explicit state index paired one-to-one with
+    #: ``pole_indices``.  ``None`` is the incumbent Cartesian window:
+    #: every selected pole contracts every state admitted by ``mask_A``.
+    #: A vector is the delivered tuple-block contract: entry ``r`` selects
+    #: exactly ``(state_indices[r], pole_indices[r])``.  State indices are
+    #: flat indices into ``E_A``/``mask_A`` and therefore retain the k-point
+    #: as well as the band identity.
+    state_indices: np.ndarray | None = None
+    #: Exact reciprocal fallback.  Such a row has no tau nodes and is
+    #: evaluated by the direct k/q contraction in ``gw.mpa.sigma``.  Keeping
+    #: this bit on the ordinary shared-window row means there is still one
+    #: plan geometry and one streamed pole-store walk.
+    direct: bool = False
+    #: Causal pole orientation used by the exact denominator (+1 conduction,
+    #: -1 valence).  It is inert on tau rows.
+    pole_sign: int = 1
+    #: Additional causal width folded into the delivered fit, in Ry.  Direct
+    #: rows insert it in the reciprocal denominator exactly once.
+    direct_eta_ry: float = 0.0
 
 
 _INF = np.inf

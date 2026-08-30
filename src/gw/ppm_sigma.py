@@ -1667,6 +1667,19 @@ def compute_sigma_c_ppm_omega_grid(
             crossing_eps_q=crossing_eps_q,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
             tau_grid_mode=tau_grid_mode)
+        direct = [row for row in shared_plan if row.direct]
+        if direct:
+            # GN's branch executor still owns bracketed host-tile sinks and
+            # accepts scalar _SigmaWindow rows, whereas the exact reciprocal
+            # fallback is an MPA SharedSigmaWindow operation. A one-pole
+            # delivered GN plan is otherwise Cartesian-equivalent to its
+            # explicit state tuples, so dropping tuple metadata is safe only
+            # for tau rows. Refuse the unsupported direct case loudly rather
+            # than passing a zero-node window into the incumbent tau loop.
+            raise NotImplementedError(
+                "GN-PPM delivered planning selected exact direct terms; "
+                "direct reciprocal execution is currently supported by the "
+                "MPA SharedSigmaWindow executor only")
         for report in geometry["branches"]:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
             delivered_windows[report["tag"]] = [

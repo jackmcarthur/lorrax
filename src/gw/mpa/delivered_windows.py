@@ -7,18 +7,19 @@ For each causal branch the physical denominator is
 
 This module is the production port of DEV-80's ``hybrid_planner.py`` and
 ``run_study.lattice_measure``. It reduces each addressable pole shard onto
-the service's tail-refined cloud-in-cell lattice, partitions the executable
-leading pole axis by delivered-mass quantiles, apportions one conservative
-true-error envelope by ``mass * measured inverse-gap difficulty``, then uses
-the incumbent damped reciprocal fit for sign-definite windows and the
-amplification-capped pane/HGL candidate fit for crossing windows.
+the service's tail-refined cloud-in-cell lattice, partitions explicit
+state--leading-pole tuples by delivered-mass quantiles, apportions one
+conservative true-error envelope by ``mass * measured inverse-gap
+difficulty``, then uses the incumbent damped reciprocal fit for
+sign-definite windows and the amplification-capped pane/HGL candidate fit
+for crossing windows.
 
 The result is ordinary :class:`gw.mpa.sigma_windows.SharedSigmaWindow` rows.
-The existing GN spatial kernel remains the only executor: no tuple mask,
-second Green's function, or second tau kernel is introduced. Consequently
-window membership is an exact partition of the leading pole axis; the full
-state x residue measure within each selected pole set determines its fit.
-The one-pole GN-PPM reduction is the degenerate one-window case.
+Their parallel ``state_indices`` / ``pole_indices`` vectors are a disjoint
+tuple partition consumed by the established shared Sigma executor.  A small
+crossing support that exhausts every bounded quadrature attempt may be marked
+``direct``; it is evaluated exactly and is never counted as tau.  The
+one-pole GN-PPM reduction is the degenerate state-window case.
 """
 
 from __future__ import annotations
@@ -83,7 +84,7 @@ def _optional_per_branch(values, branches, name):
 
 
 def _branch_states(branch, amplitude):
-    """Return signed state energies and delivered state masses."""
+    """Return signed energies, delivered masses, and flat live indices."""
     energy = np.asarray(gather_to_host(branch.E_A), dtype=np.float64)
     mask = np.asarray(gather_to_host(branch.base_mask_A), dtype=bool)
     if energy.shape != mask.shape:
@@ -107,7 +108,9 @@ def _branch_states(branch, amplitude):
         raise ValueError(
             f"delivered Sigma branch {branch.tag!r} has no live states")
     pole_sign = 1.0 if branch.space == "cond" else -1.0
-    return pole_sign * energy[live], state_mass[live]
+    flat_live = np.flatnonzero(live.reshape(-1)).astype(np.int32)
+    return (pole_sign * energy.reshape(-1)[flat_live],
+            state_mass.reshape(-1)[flat_live], flat_live)
 
 
 def _leading_indices(index, count):
@@ -175,8 +178,16 @@ def _compress(values, masses, bins):
 
 
 def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
-    """Build bounded base/refined delivered measures for every live pole."""
-    signed_energy, state_mass = _branch_states(branch, amplitude)
+    """Build one bounded measure for every live state--pole tuple.
+
+    The spatial pole field is reduced once per leading pole.  Shifting that
+    bounded pole measure by each live state energy then produces the explicit
+    tuple rows the executor can address.  The returned state indices are flat
+    indices into the branch's ``(k, band)`` carrier; pole indices retain their
+    leading-axis identity in the streamed fit store.
+    """
+    signed_energy, state_mass, state_indices = _branch_states(
+        branch, amplitude)
     pole_sign = 1.0 if branch.space == "cond" else -1.0
     n_poles = int(Omega.shape[0])
     local_values = [[] for _ in range(n_poles)]
@@ -215,7 +226,7 @@ def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
         raise ValueError(
             f"delivered Sigma poles contain {int(bad[1])} unsupported live poles")
 
-    base, refined, pole_mass, representative = [], [], [], []
+    pole_cells, pole_weights = [], []
     for pole_index in range(n_poles):
         values = (np.concatenate(local_values[pole_index])
                   if local_values[pole_index] else np.empty(0, np.complex128))
@@ -223,33 +234,53 @@ def _pole_measures(branch, Omega, B, frequencies, eta, amplitude, bins):
                   if local_masses[pole_index] else np.empty(0, np.float64))
         values, masses = _gather_variable(values, masses)
         if not values.size:
-            base.append(None)
-            refined.append(None)
-            pole_mass.append(0.0)
-            representative.append(np.nan + 1.0j * np.nan)
+            pole_cells.append(None)
+            pole_weights.append(None)
             continue
-        pole_cells, pole_weights = _compress(values, masses, bins)
-        internal = (signed_energy[:, None]
-                    + pole_sign * pole_cells[None, :]).reshape(-1)
-        delivered = (state_mass[:, None]
-                     * pole_weights[None, :]).reshape(-1)
-        cells, cell_mass, refined_cells, refined_mass = (
-            tail_refined_lattice_measure(
-                internal, delivered, bins_per_axis=int(bins)))
-        base.append(ReciprocalMeasureProblem(
-            frequencies=frequencies, internal_sums=cells,
-            cell_masses=cell_mass))
-        refined.append(ReciprocalMeasureProblem(
-            frequencies=frequencies, internal_sums=refined_cells,
-            cell_masses=refined_mass))
-        total = float(np.sum(delivered))
-        pole_mass.append(total)
-        representative.append(complex(np.sum(delivered * internal) / total))
+        cells, weights = _compress(values, masses, bins)
+        pole_cells.append(cells)
+        pole_weights.append(weights)
+
+    base, refined = [], []
+    tuple_mass, representative = [], []
+    tuple_state_indices, tuple_pole_indices = [], []
+    # State-major, pole-minor is the DEV-80 tuple convention.  Keeping this
+    # order makes the planner's membership vectors directly comparable with
+    # the hardened toy receipts and deterministic across storage shardings.
+    for energy, mass, state_index in zip(
+            signed_energy, state_mass, state_indices):
+        for pole_index, (cells, weights) in enumerate(zip(
+                pole_cells, pole_weights)):
+            if cells is None:
+                continue
+            internal = np.asarray(
+                energy + pole_sign * cells, dtype=np.complex128)
+            delivered = np.asarray(mass * weights, dtype=np.float64)
+            cells_b, mass_b, cells_r, mass_r = tail_refined_lattice_measure(
+                internal, delivered, bins_per_axis=int(bins))
+            base.append(ReciprocalMeasureProblem(
+                frequencies=frequencies, internal_sums=cells_b,
+                cell_masses=mass_b))
+            refined.append(ReciprocalMeasureProblem(
+                frequencies=frequencies, internal_sums=cells_r,
+                cell_masses=mass_r))
+            total = float(np.sum(delivered))
+            tuple_mass.append(total)
+            representative.append(complex(
+                np.sum(delivered * internal) / total))
+            tuple_state_indices.append(int(state_index))
+            tuple_pole_indices.append(int(pole_index))
 
     raw_global = int(np.asarray(all_gather_processes(
         np.asarray([raw_count], dtype=np.int64))).sum())
-    return (base, refined, np.asarray(pole_mass, np.float64),
-            np.asarray(representative, np.complex128), raw_global)
+    return (
+        base, refined,
+        np.asarray(tuple_mass, np.float64),
+        np.asarray(representative, np.complex128),
+        np.asarray(tuple_state_indices, np.int32),
+        np.asarray(tuple_pole_indices, np.int32),
+        raw_global,
+    )
 
 
 def _single_measure_window(index, value, mass, frequencies):
@@ -266,11 +297,20 @@ def _single_measure_window(index, value, mass, frequencies):
         scale_min=scale, scale_max=scale, scale_span=1.0)
 
 
-def _partition_poles(representative, masses, frequencies, space):
+def _partition_tuples(representative, masses, frequencies, space, *,
+                      force_single=False):
     live = np.nonzero(masses > 0.0)[0]
     if live.size == 0:
-        raise ValueError("delivered Sigma branch has no live poles")
-    if live.size == 1:
+        raise ValueError("delivered Sigma branch has no live tuples")
+    if live.size == 1 or bool(force_single):
+        if live.size > 1:
+            total = float(np.sum(masses[live]))
+            value = complex(
+                np.sum(masses[live] * representative[live]) / total)
+            only = _single_measure_window(0, value, total, frequencies)
+            return (replace(
+                only, name=f"{only.name}_one_pole",
+                member_indices=live),)
         return (_single_measure_window(
             int(live[0]), representative[live[0]], masses[live[0]],
             frequencies),)
@@ -283,15 +323,15 @@ def _partition_poles(representative, masses, frequencies, space):
         # A single atom can carry more than one requested quantile's mass,
         # leaving every other label empty. Dropping empty bins is required;
         # the executable and conservative fallback is one window containing
-        # every live pole, not an invented split of that atom.
+        # every live tuple, not an invented split of that atom.
         total = float(np.sum(masses[live]))
         value = complex(np.sum(masses[live] * representative[live]) / total)
         only = _single_measure_window(0, value, total, frequencies)
-        return (replace(only, name=f"{only.name}_poles",
+        return (replace(only, name=f"{only.name}_tuples",
                         member_indices=live),)
     return tuple(replace(
         window, member_indices=live[window.member_indices],
-        name=f"{window.name}_poles") for window in local)
+        name=f"{window.name}_tuples") for window in local)
 
 
 def _combine_problems(problems, indices, frequencies):
@@ -583,7 +623,8 @@ def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
                         conditioning_slack=1.0e-3,
                         start_weights=seed_weights[:rank])
                     solver = "fixed_time_irls"
-                except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+                except (FloatingPointError, OverflowError,
+                        np.linalg.LinAlgError, ValueError):
                     accepted = False
                     break
             base = _rule_metrics(spec["problem"], times, weights)
@@ -657,11 +698,10 @@ def build_delivered_sigma_windows(
 
     Pole/residue collections contain one array per causal branch (or mappings
     keyed by ``branch.tag``); independent positive/negative W producers are
-    never collapsed through a time-reversal assumption. The planner first
-    partitions the leading pole axis, the only pole selector the incumbent
-    executor can apply without a coupled tuple kernel. Each resulting fit is
-    nevertheless measured on the full state x residue distribution selected
-    by that pole set.
+    never collapsed through a time-reversal assumption. The planner
+    partitions explicit state--leading-pole tuples, which the MPA executor
+    factors into small state-selector/pole-weight components without
+    materializing a tuple axis on any spatial tensor.
 
     The absolute budget is ``target_error * combined inverse-gap envelope *
     true_error_safety``. The envelope bounds the scalar weighted reciprocal
@@ -707,15 +747,19 @@ def build_delivered_sigma_windows(
         if not np.allclose(frequencies, expected, rtol=0.0, atol=1.0e-13):
             raise ValueError(
                 f"branch {branch.tag!r} frequency indices disagree with its signed half")
-        base, refined, masses, representative, raw_count = _pole_measures(
-            branch, Omega, B, frequencies, eta, amplitude, int(lattice_bins))
-        windows = _partition_poles(
-            representative, masses, frequencies, branch.space)
+        (base, refined, masses, representative, state_indices,
+         pole_indices, raw_count) = _pole_measures(
+            branch, Omega, B, frequencies, eta, amplitude,
+            int(lattice_bins))
+        windows = _partition_tuples(
+            representative, masses, frequencies, branch.space,
+            force_single=(np.unique(pole_indices).size == 1))
         report = {
             "tag": branch.tag, "space": branch.space,
             "negative_frequency_half": bool(branch.neg_omega_half),
             "raw_tuple_count": raw_count,
-            "live_pole_count": int(np.count_nonzero(masses)),
+            "live_tuple_count": int(np.count_nonzero(masses)),
+            "live_pole_count": int(np.unique(pole_indices).size),
             "plan_start": len(specs), "windows": [],
         }
         for window in windows:
@@ -735,7 +779,10 @@ def build_delivered_sigma_windows(
             specs.append({
                 "branch": branch, "problem": problem,
                 "validation": validation, "window": measured_window,
-                "pole_indices": np.asarray(window.member_indices, np.int32),
+                "state_indices": np.asarray(
+                    state_indices[window.member_indices], np.int32),
+                "pole_indices": np.asarray(
+                    pole_indices[window.member_indices], np.int32),
                 "envelope": envelope, "difficulty": envelope / mass,
                 "branch_report": report,
             })
@@ -755,11 +802,34 @@ def build_delivered_sigma_windows(
             spec["branch"], spec["problem"], spec["validation"])
         residual_target = budget.absolute_error_budget / spec["envelope"]
         pole_sign = 1.0 if branch.space == "cond" else -1.0
+        direct = False
         if spec["window"].kind == "crossing":
-            times, weights, evidence = _fit_crossing(
-                problem, validation, residual_target, pole_sign, eta,
-                int(max_nodes), amp_cap, float(crossing_eps_q),
-                bool(use_shipped_minimax_tables), tuple(pane_times))
+            try:
+                times, weights, evidence = _fit_crossing(
+                    problem, validation, residual_target, pole_sign, eta,
+                    int(max_nodes), amp_cap, float(crossing_eps_q),
+                    bool(use_shipped_minimax_tables), tuple(pane_times))
+            except RuntimeError as exc:
+                # The hardened DEV-80 route permits an exact reciprocal
+                # fallback only for a genuinely small tuple support.  It is
+                # a different execution currency, so it never consumes the
+                # tau ceiling or masquerades as an exponential rule.
+                n_direct = int(spec["state_indices"].size)
+                if (n_direct > int(max_nodes)
+                        or not str(exc).startswith(
+                            "hybrid crossing fit missed")):
+                    raise
+                direct = True
+                times = np.empty(0, dtype=np.complex128)
+                weights = np.empty(0, dtype=np.complex128)
+                evidence = {
+                    "family": "exact_direct_reciprocal_fallback",
+                    "fit_residual": 0.0, "refined_residual": 0.0,
+                    "amplification_p99": 1.0,
+                    "amplification_max": 1.0,
+                    "quadrature_refusal": str(exc),
+                    "direct_term_count": n_direct,
+                }
         else:
             times, weights, evidence = _fit_sign_definite(
                 problem, validation, residual_target, int(max_nodes), amp_cap)
@@ -768,13 +838,19 @@ def build_delivered_sigma_windows(
             "weights": np.asarray(weights, dtype=np.complex128),
             "evidence": evidence, "budget": budget,
             "residual_target": float(residual_target),
+            "direct": direct,
         })
 
     if grid_mode == "shared":
         for report in branch_reports:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
-            _shared_branch_grid(
-                specs[start:stop], fits[start:stop], int(max_nodes), amp_cap)
+            quadrature = [index for index in range(start, stop)
+                          if not fits[index]["direct"]]
+            if quadrature:
+                _shared_branch_grid(
+                    [specs[index] for index in quadrature],
+                    [fits[index] for index in quadrature],
+                    int(max_nodes), amp_cap)
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -795,6 +871,8 @@ def build_delivered_sigma_windows(
         E_ref_A = float(np.min(
             state_energy.reshape(-1)[state_mask.reshape(-1)]))
         pole_indices = spec["pole_indices"]
+        state_indices = spec["state_indices"]
+        is_direct = bool(fit["direct"])
         window = _SigmaWindow(
             name=spec["window"].name, nodes=nodes,
             mask_A=state_mask.reshape(state_energy.shape),
@@ -802,7 +880,7 @@ def build_delivered_sigma_windows(
             omega_sign=int(pole_sign * external_sign), project="full",
             prefactor=-1.0, max_error=float(evidence["refined_residual"]),
             provenance=(
-                "hybrid delivered-mass pole window; tail-refined lattice; "
+                "hybrid delivered-mass tuple window; tail-refined lattice; "
                 f"true-budget share {budget.apportionment_weight:.4g}; "
                 f"{evidence['family']}; amplification p99 "
                 f"{evidence['amplification_p99']:.4g}"))
@@ -813,10 +891,14 @@ def build_delivered_sigma_windows(
             pole_indices=pole_indices,
             bounds=_all_pole_bounds(pole_indices.size),
             phase_real=np.zeros(pole_indices.size, dtype=bool),
-            band_weight=branch.band_weight))
+            band_weight=branch.band_weight,
+            state_indices=state_indices,
+            direct=is_direct, pole_sign=int(pole_sign),
+            direct_eta_ry=eta))
         spec["branch_report"]["windows"].append({
             "name": spec["window"].name, "kind": spec["window"].kind,
             "pole_indices": pole_indices.tolist(),
+            "state_indices": state_indices.tolist(),
             "delivered_mass": spec["window"].delivered_mass,
             "measured_difficulty": spec["difficulty"],
             "absolute_error_envelope": spec["envelope"],
@@ -824,7 +906,10 @@ def build_delivered_sigma_windows(
             "budget_fraction": budget.apportionment_weight,
             "relative_residual_target": residual_target,
             "tau_grid_mode": grid_mode,
-            "node_count": int(nodes.t.size), **evidence,
+            "node_count": int(nodes.t.size),
+            "direct_term_count": int(state_indices.size) if is_direct else 0,
+            "execution": "direct" if is_direct else "tau",
+            **evidence,
         })
 
     for report in branch_reports:
@@ -839,12 +924,15 @@ def build_delivered_sigma_windows(
             for value in np.asarray(jax.device_get(row.window.nodes.t),
                                     dtype=np.complex128)
         })
-        report["direct_term_count"] = 0
-        report["window_axis"] = "pole"
-        report["state_support"] = "full"
+        report["direct_term_count"] = int(sum(
+            row["direct_term_count"] for row in report["windows"]))
+        report["window_axis"] = "state_pole_tuple"
+        report["state_support"] = "explicit"
     window_tau_pairs = int(sum(row.window.n_tau for row in output))
     distinct_tau_count = int(sum(
         report["distinct_tau_count"] for report in branch_reports))
+    direct_term_count = int(sum(
+        report["direct_term_count"] for report in branch_reports))
     return output, {
         "plan": "delivered", "planner": "hybrid_measure_apportioned",
         "tau_grid_mode": grid_mode,
@@ -858,7 +946,7 @@ def build_delivered_sigma_windows(
         "n_tau": window_tau_pairs,
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
-        "direct_term_count": 0,
+        "direct_term_count": direct_term_count,
         "plan_seconds": time.perf_counter() - started,
         "branches": branch_reports,
     }
