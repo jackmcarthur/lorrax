@@ -198,7 +198,10 @@ Ranked.  These escape input-file validation, the run log, and provenance.
    (`gw.sigma_plan.resolve_delivered_tau_grid`). Grammar is the exact,
    case-insensitive enum `free` \| `shared` after stripping; every other value
    REFUSES. It changes the quadrature and is likewise an initial opt-in that
-   should be promoted to an input key before any default change.
+   should be promoted to an input key before any default change. There is no
+   exact-pair fallback or environment limit: a problem that product windows
+   cannot serve refuses, and an obsolete receipt containing pairwise work
+   refuses while naming the receipt path.
 
 **Do NOT promote:** anything in §3 (debug), §4 (build), or the compile
 cache (§2 — a machine fact; its mandatory-`""` status during regression

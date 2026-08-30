@@ -11,8 +11,7 @@ from gw.mpa.delivered_windows import (
 )
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
-from gw.sigma_plan import (resolve_delivered_max_direct_terms,
-                           resolve_delivered_tau_grid, resolve_sigma_plan)
+from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
 from gw.wavefunction_bundle import (
     BandSlices,
     Wavefunctions,
@@ -33,28 +32,12 @@ def _executed_scalar(plan, poles, residues, energies, omega):
     output = np.zeros(np.asarray(omega).shape, dtype=np.complex128)
     for row in plan:
         win = row.window
-        if row.direct:
-            external_sign = int(win.omega_sign) * int(row.pole_sign)
-            for frequency, frequency_index in zip(
-                    row.omega_abs, row.omega_idx):
-                for state_index, pole_index in zip(
-                        row.state_indices, row.pole_indices):
-                    denominator = (
-                        external_sign * frequency
-                        - row.pole_sign * (
-                            energies[state_index] + poles[pole_index]
-                            - 1j * row.direct_eta_ry))
-                    output[frequency_index] += (
-                        win.prefactor * residues[pole_index] / denominator)
-            continue
         times = np.asarray(win.nodes.t)
         alpha = np.asarray(win.nodes.alpha)
-        if row.state_indices is None:
-            states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
-            pairs = tuple((state, pole) for state in states
-                          for pole in row.pole_indices)
-        else:
-            pairs = tuple(zip(row.state_indices, row.pole_indices))
+        assert row.state_indices is None
+        states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
+        pairs = tuple((state, pole) for state in states
+                      for pole in row.pole_indices)
         for frequency_index, frequency in zip(row.omega_idx, row.omega_abs):
             coefficient = _omega_coefficient(
                 np, frequency, times, alpha, win.omega_sign,
@@ -211,7 +194,6 @@ def test_shared_grid_uses_one_branch_grid_at_matched_envelope_error():
     assert report["tau_grid_mode"] == "shared"
     assert report["window_tau_pairs"] == len(plan) * grids[0].size
     assert report["distinct_tau_count"] == grids[0].size
-    assert report["direct_term_count"] == 0
     assert report["branches"][0]["window_axis"] == (
         "state_interval_x_pole_interval")
     assert report["branches"][0]["state_support"] == "plain_interval"
@@ -333,12 +315,3 @@ def test_shared_selector_defaults_and_refuses_unknown(monkeypatch):
     monkeypatch.setenv("LORRAX_DELIVERED_TAU_GRID", "union")
     with pytest.raises(ValueError, match="free.*shared"):
         resolve_delivered_tau_grid()
-
-    monkeypatch.delenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", raising=False)
-    assert resolve_delivered_max_direct_terms() == 32
-    monkeypatch.setenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", " 7 ")
-    assert resolve_delivered_max_direct_terms() == 7
-    for invalid in ("-1", "many"):
-        monkeypatch.setenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", invalid)
-        with pytest.raises(ValueError, match="nonnegative integer"):
-            resolve_delivered_max_direct_terms()
