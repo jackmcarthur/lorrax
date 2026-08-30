@@ -46,7 +46,7 @@ FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 1
+_PLAN_CACHE_VERSION = 2
 
 # These tolerances generate candidate rules.  Acceptance is based only on the
 # achieved delivered residual and the noise-budget inequality above.
@@ -73,19 +73,20 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
             dtype=np.int64) if count else np.empty(0, np.int64)
         sample = np.take(array, indices)
         # Collective reductions can differ below roundoff between otherwise
-        # identical P=4 restarts.  Eleven decimal places is five orders
-        # tighter than the smallest candidate tolerance.  Sampling keeps the
-        # cache lookup bounded; every cached rule is still re-certified on
-        # the complete live validation measure before it can execute.
+        # identical P=4 restarts.  Seven significant digits remain two orders
+        # tighter than the smallest candidate tolerance while being invariant
+        # to that reduction noise over measures with different unit scales.
+        # Sampling keeps lookup bounded.  A fingerprint mismatch still takes
+        # the complete live validation path below before a rule can execute.
         if np.issubdtype(sample.dtype, np.complexfloating):
-            canonical = np.stack(
-                (np.round(sample.real, 11), np.round(sample.imag, 11)),
-                axis=-1)
+            canonical = "\0".join(
+                f"{value.real:.7g},{value.imag:.7g}" for value in sample)
         elif np.issubdtype(sample.dtype, np.floating):
-            canonical = np.round(sample, 11)
+            canonical = "\0".join(f"{value:.7g}" for value in sample)
         else:
-            canonical = sample
-        digest.update(np.ascontiguousarray(canonical).view(np.uint8))
+            canonical = np.ascontiguousarray(sample).view(np.uint8)
+        digest.update(canonical.encode() if isinstance(canonical, str)
+                      else canonical)
 
     digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
     digest.update(repr((float(eta), float(target), float(safety),
