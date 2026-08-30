@@ -78,7 +78,51 @@ def test_symmetry_receipt_fractional_ops_and_ibz_use_five_decimals():
     assert "tau=(" in text
     assert "Time reversal  : HOLDS (measured" in text
     assert "coverage=100.00%" in text
-    assert "TRS unfolding  : enabled from the measured density verdict" in text
+    assert "TRS unfolding  : enabled from the retained legacy verdict" in text
     assert " 0.25000   0.25000   0.25000   0.75000" in text
     assert ".250000" not in text
     assert "-0.00000" not in text
+
+
+def test_two_component_trs_receipt_names_evidence_and_inconclusive_state():
+    receipt = SimpleNamespace(
+        method="occupied-density-subspace", trs_holds=True,
+        conclusive=False, trs_basis="trim-only", subspace_residual=2.0e-13,
+        trs_coverage=0.125,
+        evidence_counts=(("raw-pair", 0), ("spatial-pair", 0), ("trim", 1)),
+    )
+    wfn = SimpleNamespace(
+        trs_reference=receipt, density_symmetry=receipt,
+        kgrid=np.array([2, 2, 2]), shift=np.zeros(3),
+        kpoints=np.zeros((1, 3)), kweights=np.ones(1),
+    )
+    sym = SimpleNamespace(
+        Rinv_grid=np.eye(3, dtype=int)[None],
+        translations=np.zeros((1, 3)), trs_allowed=True,
+        nk_tot=8, nk_red=1,
+    )
+    text = "\n".join(symmetry_sampling_lines(wfn, sym))
+    assert "DFT 2c TRS     : INCONCLUSIVE (trim-only" in text
+    assert "occupied-density residual=2.00000e-13" in text
+    assert "trim=1" in text
+    assert "from the two-component reference check" in text
+
+
+def test_two_component_trs_receipt_is_not_applied_to_scalar_reference():
+    receipt = SimpleNamespace(
+        method="occupied-density-subspace", trs_basis="not-2c",
+        nspin=1, nspinor=1,
+    )
+    wfn = SimpleNamespace(
+        trs_reference=receipt, density_symmetry=receipt,
+        kgrid=np.array([1, 1, 1]), shift=np.zeros(3),
+        kpoints=np.zeros((1, 3)), kweights=np.ones(1),
+    )
+    sym = SimpleNamespace(
+        Rinv_grid=np.eye(3, dtype=int)[None],
+        translations=np.zeros((1, 3)), trs_allowed=True,
+        nk_tot=1, nk_red=1,
+    )
+    text = "\n".join(symmetry_sampling_lines(wfn, sym))
+    assert "DFT 2c TRS     : NOT APPLICABLE (nspin=1, nspinor=1)" in text
+    assert "S01" in text       # the receipt must not truncate the operation list

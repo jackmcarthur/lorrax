@@ -25,7 +25,7 @@ row                          what evaporates when it is missing
                              — the extraction's whole criterion and the
                              §8.1 op-selection tripwire
 ``file:cohsex/WFNsmall.h5``  the I5/I6 discriminator (the only in-tree deck
-                             with a TRS-first star) AND lorrax's own four
+                             with a TRS-first star) AND lorrax's three real
                              ``test_density_symmetry_check`` fixture cells
 ``module:h5py``              every deck cell at once, as an importorskip
 ``devices:4-forceable``      the L-b emulated-mesh tier:

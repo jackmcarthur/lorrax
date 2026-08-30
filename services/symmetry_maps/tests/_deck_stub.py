@@ -24,13 +24,10 @@ four decks' ``(irr_idx_k, sym_idx_k)`` bit-compared against
 alone and not of the loader that usually feeds it.
 
 ``trs_holds=True`` IS PINNED, NOT DEFAULTED.  ``SymMaps`` falls back to the
-permissive ``True`` for any object carrying no verdict, so a stub that
-simply omitted the attribute would get the same tables while asserting
-nothing about them.  MEASURED 2026-08-07 on all four in-tree decks:
-``density_symmetry_check`` returns TRS=HOLDS, so ``WfnLoader`` sets
-``trs_holds=True`` and ``SymMaps.trs_allowed`` is True on every one of
-them.  The stub states that measurement rather than inheriting a default;
-if a deck's density verdict ever flips, the parity arm against
+permissive ``True`` for an object carrying no verdict. The automatic check
+is 2c-only; other layouts keep that permissive setting. The stub records the
+expected effective value explicitly. If a 2c deck's verdict flips, the
+parity arm against
 ``SymMaps(WfnLoader(...))`` is what says so, and it can only say so because
 the two sides disagree about a value that was written down.
 

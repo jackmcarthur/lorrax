@@ -20,9 +20,8 @@ does for the linalg backends:
 
 * the four in-tree WFN decks are present, so every deck-table cell RUNS
   (nothing here is gated on ``/pscratch``);
-* ``cohsex_debug/WFNsmall.h5`` specifically — it is also what
-  ``tests/test_density_symmetry_check.py:33`` gates its four fixture cells
-  on, the ONLY in-tree TRS-active measurement of the density verdict, and
+* ``cohsex_debug/WFNsmall.h5`` specifically — it also gates the three real-
+  fixture cells in ``tests/test_density_symmetry_check.py``, and
   the deck the I5 tripwire needs;
 * ``h5py`` imports, so the L-a+ tier is not silently a no-op;
 * four host devices are FORCEABLE — ``--xla_force_host_platform_device_count
@@ -115,8 +114,8 @@ _ALLOWED = (
 _MUST = (
     MustRow("decks", "symmetry_maps", "decks:all-four", "in-tree"),
     # Named separately from ``decks`` because this one file also gates
-    # tests/test_density_symmetry_check.py's four fixture cells (:33) —
-    # the crown-jewel MEASUREMENT of the TRS verdict — and the §8.1 I5
+    # tests/test_density_symmetry_check.py's three real-fixture cells and the
+    # §8.1 I5
     # tripwire.  Losing it costs two suites, not one.
     MustRow("density_fixture", "symmetry_maps",
             "file:cohsex_debug/WFNsmall.h5", "in-tree"),
@@ -217,8 +216,8 @@ def probe_capability(target: str, platform: str) -> tuple[bool, str]:
         if not os.path.isfile(path):
             return False, (
                 f"{path} is absent.  It gates this suite's I5 tripwire AND "
-                f"tests/test_density_symmetry_check.py's four fixture cells "
-                f"(:33) — the only in-tree MEASUREMENT of the TRS verdict.")
+                f"tests/test_density_symmetry_check.py's three real-fixture "
+                f"cells.")
         return True, ""
     if target.startswith("module:"):
         name = target[len("module:"):]

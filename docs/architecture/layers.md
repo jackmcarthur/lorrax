@@ -289,19 +289,10 @@ edge whose target is a service's top-level package: levels order modules
 within one distribution unit, and an import of `lxkit`, `distrib_la` or
 `symmetry_maps` is governed by rule 6 (lorrax reaches a service through its
 door and nowhere else) instead. `symmetry_maps` is the service that forced the
-distinction, because it is the first one that is not substrate — and the two
-alternatives were measured rather than argued. Left at the L1 default, which
-is what a package full of Brillouin zones is, it produces
-`L2->L1 centroid.kmeans_isdf:583 (lazy) imports symmetry_maps`; forced into
-`_L3_PACKAGES` the way `distrib_la` sits there, it produces two
-`L3->L1 symmetry_maps.density_symmetry_check -> psp.get_DFT_mtxels` edges
-instead. One exception either way, describing the same fact from opposite
-ends, and the second buys its green by relabelling physics as substrate.
-Nothing goes unwatched: reaching *past* a door still counts (rule 6), and a
-service reaching back into `src/` — those `psp` edges are real, and are
-`symmetry_maps`'s one remaining lorrax dependency — is owned by the mandatory
-import-isolation test and the service's declared `dependencies`, which is a
-stronger instrument than a level ever was.
+distinction, because it is the first one that is not substrate. It stays at
+the L1 default: callers use the service door and reaching past that door still
+counts under rule 6. The 2c reference check works directly in G space, so the
+former symmetry-service dependency on `psp.get_DFT_mtxels` is gone.
 
 | # | violation | why it is still here |
 |---|---|---|

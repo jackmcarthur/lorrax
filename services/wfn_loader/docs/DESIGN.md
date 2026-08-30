@@ -155,11 +155,8 @@ is the same.
   adopt_mesh / header fields).
 - Sibling seams (ruling 1/2): `common/symmetry_maps.py`,
   `common/density_symmetry_check.py` belong to the symmetry_maps
-  orchestrator. wfn_loader keeps its LAZY runtime imports of the legacy
-  paths (`_ensure_sym`, `_run_density_symmetry_check`) — shims stay
-  phase-wide, so land-order is irrelevant. No new injection kwargs (owner's
-  no-added-indirection rule; ruling 4's compat-default pattern is the
-  sibling's to implement on their side of the seam).
+  orchestrator. wfn_loader reaches the service through lazy runtime imports
+  in `_ensure_sym` and `_run_density_symmetry_check`.
   REGISTERED to symmetry_maps: `density_symmetry_check` reads loader
   privates `._file`/`._kpt_starts`/`.ngk` (survey §2.1); `kpt_starts`
   becomes a public property on the door now, the `._file` read is theirs.
@@ -195,8 +192,7 @@ Public surface unchanged in name and semantics: `WfnLoader`, `load`,
   documented use case, ruling 1. Zero-cost).
 - `symmetry()` becomes the public accessor; `_ensure_sym` stays as an alias
   (2 production sites replumb to the public name).
-- `kpt_starts` becomes a public property (for the density_symmetry_check
-  seam above).
+- `kpt_starts` is public for the bounded raw-IBZ coefficient reader above.
 - NO `__slots__`, NO strict `__setattr__`, ever: `psp/get_DFT_mtxels.py:1043`
   monkey-patches `grid_rho` onto the instance (survey §2.4.3). Documented in
   Antipatterns.

@@ -1049,17 +1049,11 @@ def upward_edges(sources):
         symmetry_maps at the L1 default (honest: it is crystal physics)
             L2->L1 centroid.kmeans_isdf:583 (lazy) imports symmetry_maps
 
-        symmetry_maps forced into _L3_PACKAGES (the distrib_la shape)
-            L3->L1 symmetry_maps.density_symmetry_check:658 (lazy)
-                   imports psp.get_DFT_mtxels
-            L3->L1 symmetry_maps.density_symmetry_check:749 (lazy)
-                   imports psp.get_DFT_mtxels
-
-    Two exceptions to choose between, both describing the same fact from
-    opposite ends -- and the second one buys its green by calling a
-    package full of Brillouin zones "substrate".  The package stays at the
-    L1 default, which is what it is, and the edge INTO it stops being a
-    level question.
+    The package stays at the L1 default, which is what it is, and an edge
+    INTO its public door is not a within-distribution level question.  The
+    former symmetry-service edge back to ``psp.get_DFT_mtxels`` disappeared
+    when the 2c reference check moved from FFT densities to G-space occupied
+    subspaces.
 
     NOTHING IS LEFT UNWATCHED BY THIS.  Reaching past a door still counts
     (rule 6, and the shims' budgets below are the checklist).  A service

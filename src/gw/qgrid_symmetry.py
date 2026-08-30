@@ -151,8 +151,8 @@ def qgrid_trs_policy_for(
 
     ``trs_measured`` is read off ``SymMaps.trs_allowed``, which
     ``SymMaps.__init__`` takes from ``WfnLoader.trs_holds``, which
-    ``density_symmetry_check`` obtained by building the spin-resolved
-    density from the raw IBZ wavefunctions.  No caller of this function
+    ``density_symmetry_check`` obtained from the occupied two-component
+    DFT subspaces before antiunitary unfolding.  No caller of this function
     passes a verdict of its own, and the policy constructor has no default
     for it, so there is no path by which a driver can assume time reversal.
 

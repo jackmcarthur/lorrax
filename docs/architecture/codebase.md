@@ -239,7 +239,7 @@ IBZ → full BZ unfolding. Builds the full mesh, k→q maps, spinor SU(2) rotati
 - `get_cnk_fullzone_batch(wfn, band_indices, nk)` — vectorized
 
 Since 2026-08-07 this class, the k-star index map, the sharded q-axis
-unfolds, the real-space orbit machinery and the TRS measurement live in
+unfolds, the real-space orbit machinery and the 2c TRS reference check live in
 `services/symmetry_maps/` and are reached by `import symmetry_maps` —
 never through a submodule path. `src/common/symmetry_maps.py`,
 `src/centroid/orbit_syms.py` and `src/common/density_symmetry_check.py`

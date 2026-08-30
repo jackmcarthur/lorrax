@@ -914,8 +914,8 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
     time-reversal decision — pair coherence and the fixed-q projector — is
     the SHARED policy object (``gw.qgrid_symmetry.qgrid_trs_policy_for``),
     because bare V, RPA W and ladder W must use one q-grid realization and
-    because the decision is taken from the MEASURED density verdict, not
-    assumed here.  This is not a second unfold: one service, one set of
+    because the decision is taken from the shared TRS verdict, not assumed
+    here. This is not a second unfold: one service, one set of
     centroid/phase tables, and one convention for the umklapp phase and TRS
     conjugation.
     """

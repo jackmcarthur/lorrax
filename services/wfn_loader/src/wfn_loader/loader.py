@@ -359,56 +359,13 @@ class WfnLoader:
         # always returns the same ``jax.Array``.
         self._gvecs_dev_cache: dict[tuple, "jax.Array"] = {}
 
-        # ------------------------------------------------------------------
-        # Load-time symmetry MEASUREMENT (default ON).
-        #
-        # A WFN file states which spatial operations it *claims* and how
-        # its k-mesh was reduced, but never states whether time-reversal
-        # symmetry holds for the system.  Inferring that from flags
-        # (``ntran``, "is this a nosym deck") is what produced the
-        # ψ(r) → ψ*(−r) corruption of scorecard §Q, and several bugs
-        # before it.  Instead we build the spin-resolved charge density
-        # from the RAW IBZ wavefunctions and measure it: ``trs_holds``
-        # below is a MEASURED property of these coefficients, and
-        # ``SymMaps`` consults it before it will select any
-        # time-reversal row (see ``_sym_wfn_stub``).
-        #
-        # WHAT IS AND IS NOT ESTABLISHED BY ``self.trs_holds`` — read this
-        # before relying on it, and see the derivations it points at:
-        #   * MEASURED: whether the occupied manifold is time-reversal
-        #     invariant, via ``m_{−k}(r) = −m_k(r)`` summed over the ± k
-        #     pairs present in the file.  That identity involves NO
-        #     symmetry operation, NO fractional translation τ, NO umklapp
-        #     vector and NO ``U_spinor`` — so it is an INDEPENDENT check
-        #     on the unfold, not a restatement of it.  Derivation (T1)-(T5)
-        #     in ``common/density_symmetry_check.py``.
-        #   * ALSO MEASURED: that each claimed ``{S|τ}`` really leaves ρ
-        #     invariant.  Because ρ is a spinor TRACE, ``U_spinor`` and the
-        #     τ-phase cancel out of it, so this arm validates ``mtrx`` and
-        #     ``tnp`` only.
-        #   * NOT MEASURED: ``U_spinor`` and the τ-phase used by
-        #     ``unfold_psi`` (they cancel in ρ, see above), and TRS for
-        #     ``nspin == 2`` decks (this reader has no spin axis — coeffs
-        #     axis 1 is the spinor axis everywhere, so the two collinear
-        #     channels are not addressable and the check says so).
-        # The verdict reaches ``SymMaps`` through ``_sym_wfn_stub`` below;
-        # ``SymMaps`` is the ONLY consumer, and it is also the only place
-        # that can turn a time-reversal row into a conjugated ψ, so
-        # gating there covers every backend (eager / phdf5).
-        #
-        # The diagnostic pairs the raw IBZ coefficients with this loader's
-        # canonical per-k/per-band ``occs`` rows.  ``nelec=max(ifmax)`` is
-        # only a nominal support boundary (signed smearing tails may extend
-        # past it); it is never treated as a unit-filled electron count for a
-        # fractional metal.
-        # Runs last in ``__init__`` because it needs ``nelec``,
-        # ``kweights``, ``box_index`` and the open file handle.  Cost is the
-        # exact nonzero occupation support on a
-        # ±-closed k-subsample — order a second
-        # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
-        # — cached per (file, mtime, size) for the process.
-        # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
-        # warning.
+        # Two-component DFT-reference TRS check (default on).  It compares
+        # occupied one-particle density operators in G space, using only raw
+        # k/-k pairs, spatial-only unfolding, or TRIM closure.  A state made
+        # with an antiunitary row is never evidence.  SymMaps consumes the
+        # verdict before selecting any time-reversal row.
+        self.trs_reference = None
+        # Compatibility name retained while report consumers migrate.
         self.density_symmetry = None
         self.trs_holds = True
         self._run_density_symmetry_check()
@@ -513,19 +470,18 @@ class WfnLoader:
         """Exclusive prefix sum of ``ngk`` — the per-k offset into the
         flat ``wfns/coeffs`` / ``wfns/gvecs`` G axis.
 
-        Public for the ``common/density_symmetry_check.py`` seam, which
-        reads this to slice the raw datasets itself (survey §2.1).  That
-        file belongs to the symmetry_maps orchestrator; the PROPERTY is
-        this door's half of the seam.
+        Public for the two-component reference check, which reads bounded
+        raw coefficient slabs without invoking a full-BZ loader path.
         """
         return self._kpt_starts
 
     def _run_density_symmetry_check(self) -> None:
-        """Measure TRS + the spatial symmetry table from ψ (see above)."""
+        """Check the two-component DFT reference before TRS unfolding."""
         from symmetry_maps import cached_density_symmetry_check
         report = cached_density_symmetry_check(self)
         if report is None:
             return
+        self.trs_reference = report
         self.density_symmetry = report
         self.trs_holds = bool(report.trs_holds)
 
@@ -757,7 +713,7 @@ class WfnLoader:
                 "ij,kj->ki",
                 np.linalg.inv(self.avec).T, self.atom_positions),
             fft_grid=self.fft_grid,
-            # MEASURED (not inferred) time-reversal verdict — see
+            # CHECKED (not inferred) time-reversal verdict — see
             # ``_run_density_symmetry_check``.  ``SymMaps`` refuses to
             # select time-reversal rows when this is False, whatever the
             # ``ntran``/k-weight flags imply.
