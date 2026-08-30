@@ -26,6 +26,7 @@ __all__ = [
     "cached_density_symmetry_check",
     "check_density_symmetries",
     "check_spinor_reference_trs",
+    "occupation_operator_residual",
     "trs_check_mode",
 ]
 
@@ -252,7 +253,7 @@ def _theta_overlap(
             + np.conj(dst[:, 1, ti]) @ theta_dn.T)
 
 
-def _occupation_operator_residual(
+def occupation_operator_residual(
     overlap: np.ndarray,
     target_occupations: np.ndarray,
     source_occupations: np.ndarray,
@@ -281,6 +282,10 @@ def _occupation_operator_residual(
     residual = float(np.sqrt(max(0.0, distance2) / denom))
     singular = np.linalg.svd(M, compute_uv=False)
     return residual, (float(np.min(singular)) if singular.size else 0.0)
+
+
+# Compatibility for focused tests and older diagnostic imports.
+_occupation_operator_residual = occupation_operator_residual
 
 
 def _spatial_mesh_needs_trs(
@@ -312,9 +317,11 @@ def _empty_report(
     nspin: int,
     nspinor: int,
     conclusive: bool,
+    trs_holds: bool = True,
 ) -> DensitySymmetryReport:
     return DensitySymmetryReport(
-        trs_holds=True, trs_basis=basis, m_rel=None, m_rel_total=None,
+        trs_holds=bool(trs_holds), trs_basis=basis, m_rel=None,
+        m_rel_total=None,
         trs_coverage=0.0, tol_trs=tol_trs, trs_implied_by_mesh=None,
         spatial_ops_ok=True, spatial_residual=np.zeros(0),
         spatial_untested=(), spatial_failed=(), tol_spatial=float("nan"),
@@ -373,7 +380,7 @@ def _check_two_component_trs(
             raw_cache[ik] = (coeff, gvec)
         return raw_cache[ik]
 
-    local_sym = None
+    operator_tables = None
     residuals: list[float] = []
     singular_values: list[float] = []
     covered = np.zeros(kpoints.shape[0], dtype=bool)
@@ -382,9 +389,9 @@ def _check_two_component_trs(
     for item in evidence:
         source, source_g = raw(item.source)
         if item.kind == "spatial-pair":
-            if local_sym is None:
-                from symmetry_maps.maps import SymMaps
-                local_sym = SymMaps(loader, allow_trs=True)
+            if operator_tables is None:
+                from symmetry_maps.maps import build_spatial_operator_tables
+                operator_tables = build_spatial_operator_tables(loader)
             from symmetry_maps.maps import unfold_psi
             s = int(item.spatial_op)
             if not 0 <= s < ntran:
@@ -392,10 +399,10 @@ def _check_two_component_trs(
             target_raw, target_raw_g = raw(item.target_raw)
             target = unfold_psi(
                 target_raw, sym_idx=s, g_kbar=target_raw_g,
-                sym_mats_k=local_sym.sym_mats_k,
-                translations=local_sym.translations,
-                U_spinor_spatial=local_sym.U_spinor)
-            S = np.asarray(local_sym.sym_mats_k[s], dtype=np.int64)
+                sym_mats_k=operator_tables.sym_mats_k,
+                translations=operator_tables.translations,
+                U_spinor_spatial=operator_tables.U_spinor)
+            S = np.asarray(operator_tables.sym_mats_k[s], dtype=np.int64)
             target_k = -np.asarray(kpoints[item.source], dtype=np.float64)
             sk = S @ np.asarray(kpoints[item.target_raw], dtype=np.float64)
             kg0_f = target_k - sk
@@ -412,7 +419,7 @@ def _check_two_component_trs(
         overlap = _theta_overlap(
             source, source_g, kpoints[item.source],
             target, target_g, target_k)
-        residual, min_singular = _occupation_operator_residual(
+        residual, min_singular = occupation_operator_residual(
             overlap, occupations[item.target_raw], occupations[item.source])
         t_overlap += time.perf_counter() - tic
         residuals.append(residual)
@@ -479,7 +486,11 @@ def _check_two_component_trs(
     charge_expected = float(getattr(loader, "num_electrons", np.nan))
     n_used = int(np.count_nonzero(covered))
     return DensitySymmetryReport(
-        trs_holds=not broken, trs_basis=basis,
+        # A pass with only TRIM closure cannot establish TRS away from the
+        # measured point.  Likewise, no evidence is not permissive evidence.
+        # Disable antiunitary unfolding unless the test is both passing and
+        # conclusive; an explicit LORRAX_TRS_CHECK=0 remains the opt-out.
+        trs_holds=bool(not broken and conclusive), trs_basis=basis,
         m_rel=max_residual, m_rel_total=None,
         trs_coverage=float(np.sum(weights[covered]) / weight_norm),
         tol_trs=tol_trs, trs_implied_by_mesh=trs_implied,
@@ -560,7 +571,7 @@ def _enforce_policy(
     strict_inconclusive = mode == "strict" and not report.conclusive
     if mode == "strict" and (not report.ok or strict_inconclusive):
         detail = "\n  ".join(report.messages)
-        state = "INCONCLUSIVE" if report.ok else "FAILED"
+        state = "INCONCLUSIVE" if not report.conclusive else "FAILED"
         raise RuntimeError(
             f"WFN two-component TRS check {state} for {report.path}:\n  "
             f"{detail}")
@@ -605,7 +616,7 @@ def cached_density_symmetry_check(loader) -> DensitySymmetryReport | None:
             loader, basis="skipped", message=repr(exc), tol_trs=tol,
             nspin=int(getattr(loader, "nspin", 0) or 0),
             nspinor=int(getattr(loader, "nspinor", 0) or 0),
-            conclusive=False)
+            conclusive=False, trs_holds=False)
     _CACHE[key] = report
     _enforce_policy(report, mode, announce=True)
     return report

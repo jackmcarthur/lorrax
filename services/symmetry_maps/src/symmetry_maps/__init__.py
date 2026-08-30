@@ -185,6 +185,7 @@ from symmetry_maps.density_symmetry_check import (
     cached_density_symmetry_check,
     check_density_symmetries,
     check_spinor_reference_trs,
+    occupation_operator_residual,
     trs_check_mode,
 )
 from symmetry_maps.directed_edges import (
@@ -194,11 +195,14 @@ from symmetry_maps.directed_edges import (
 )
 from symmetry_maps.maps import (
     KStarMap,
+    SpatialOperatorTables,
     SymMaps,
     bgw_integer_q_to_fractional,
     bgw_signed_q_representative,
     common_uniform_grid_indices,
     find_irreducible_bz_points,
+    build_spatial_operator_tables,
+    map_full_kpoints_to_irreducible,
     kgrid_shift_map,
     q_negation_index,
     slice_q_full_to_ibz,
@@ -280,11 +284,13 @@ from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
     # tables
-    "SymMaps", "kgrid_shift_map", "bgw_integer_q_to_fractional",
+    "SymMaps", "SpatialOperatorTables", "build_spatial_operator_tables",
+    "kgrid_shift_map", "bgw_integer_q_to_fractional",
     "bgw_signed_q_representative",
     "q_negation_index",
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
+    "map_full_kpoints_to_irreducible",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # directed band-matrix edges: pure table + the one symmetry action
@@ -333,7 +339,8 @@ __all__ = [
     # the 2c TRS reference check
     "DensitySymmetryReport", "check_density_symmetries",
     "check_spinor_reference_trs",
-    "cached_density_symmetry_check", "trs_check_mode",
+    "cached_density_symmetry_check", "occupation_operator_residual",
+    "trs_check_mode",
     # the q-axis TRS POLICY that consumes that measurement, and the
     # covariance statistic the unfold's own contract rests on
     "QgridTrsPolicy", "build_qgrid_trs_policy",
