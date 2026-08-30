@@ -13,11 +13,14 @@ import json
 import os
 import tracemalloc
 
-from runtime import finalize_process, initialize_communicator_stack
+import jax
 
-RUNTIME = initialize_communicator_stack()
+# This is a planner/collective measurement, not a driver or FFI gate.  Start
+# exactly the JAX process mesh it needs without bootstrapping unrelated native
+# services; that also makes absence of an in-tree FFI build irrelevant to the
+# stated memory claim.
+jax.distributed.initialize()
 
-import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
@@ -168,4 +171,7 @@ def main():
 
 
 if __name__ == "__main__":
-    finalize_process(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        jax.distributed.shutdown()
