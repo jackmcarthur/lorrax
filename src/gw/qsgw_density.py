@@ -699,11 +699,17 @@ def rotate_bands(psi_G, U_qp, *, mesh: Mesh):
 # ``np.asarray(U_qp)`` a few lines later for the k-star broadcast, so both
 # were being synchronised immediately regardless; E and Z come out of one
 # FFI call, so blocking on the pair is the same wait as blocking on either.
-# Pad-diagonal sentinel for the band-axis pad below.  Ry; physical QP
-# eigenvalues are O(1) Ry, so this is ~10 orders clear and the pad
-# eigenvalues cannot interleave with the physical spectrum at any deck.
-# Same spelling as the tree's other sentinel, psp/dft_operators.py:736.
-_EIGH_PAD_SENTINEL_RY = 1e10
+def _eigh_pad_sentinel_ry(H_physical):
+    """Return one scale-aware pad eigenvalue per physical Hamiltonian.
+
+    For Hermitian ``H``, every eigenvalue is bounded in magnitude by the
+    induced infinity norm.  Twice that norm is therefore strictly above
+    the physical spectrum whenever ``H`` is nonzero, while staying on the
+    matrix's numerical scale.  The exactly-zero matrix uses 1 Ry.
+    """
+    row_scale = jnp.max(jnp.sum(jnp.abs(H_physical), axis=-1), axis=-1)
+    return jnp.where(row_scale > 0.0, 2.0 * row_scale,
+                     jnp.ones_like(row_scale))
 
 
 @timing.timed("sc.eigh", watch=True)
@@ -720,22 +726,17 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     The explicit ``off`` + ``batch_reshard`` route instead gives each rank
     whole fit-size matrices from the k batch, which is faster while a tile
     fits its memory budget.  A band axis that the divisor does not divide
-    is padded to it with a large diagonal SENTINEL and sliced back BY COUNT
-    after the solve; callers never see a padded shape.
+    is padded to it with a per-k scale-aware diagonal sentinel and sliced
+    back BY COUNT after the solve; callers never see a padded shape.
 
-    PARITY, and its limit.  Padding is **reduction-order gauge, not
-    bit-exactness**.  The pad modes are exactly inert — the block is
-    block-diagonal with zero coupling, so physical eigenpairs are
-    unchanged in exact arithmetic — but a wider array changes how XLA
-    *groups* the nonzeros inside full-array reductions, so ``E`` at
-    ``nb_pad > nb`` can differ from ``E`` at ``nb_pad == nb`` in the last
-    few ulp.  Drift scales with reduction length and with the trajectory,
-    not with a fixed ULP count: measured 0.2 eps at ``nk*nb^2 = 243`` and
-    39.9 eps at 29768, a contracting run staying <= 8.3 eps while a
-    stalled one reached 2.9e5.  What bounds it is the RESIDUAL, not eps:
-    ``|dH| <= 6.1e-8`` of the per-element residual norm.  Do not gate this
-    on a ULP count — that passes on a fixture and fails at production
-    shapes.
+    PARITY, and its limit.  The pad modes are exactly inert — the block is
+    block-diagonal with zero coupling, so physical eigenpairs are unchanged
+    in exact arithmetic.  The pad eigenvalue is ``2*||H||_inf`` per k
+    (1 Ry for exactly-zero H), not a fixed out-of-scale number: this keeps
+    the padded solve's backward error on the physical matrix scale while
+    placing every pad mode strictly above the physical Hermitian spectrum.
+    A wider array can still change reduction order in the last few ulp, so
+    parity is governed by residual/subspace checks, never a fixed ULP count.
 
     Backend-agnostic.  The default
     ``resolve_backend('eigh', 'distributed', mesh)`` picks the platform's
@@ -781,17 +782,19 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     _services.ensure_on_path()
     from distrib_la import dispatch_batched_eigh
 
-    H_j = jnp.asarray(H)
-    nb = int(H_j.shape[1])
+    H_physical = jnp.asarray(H)
+    nb = int(H_physical.shape[1])
+    # pXheevd reads ONE triangle, so a non-Hermitian input is silently
+    # interpreted rather than refused.  Hermitise the physical block before
+    # computing its scale or introducing a pad.
+    H_physical = 0.5 * (
+        H_physical + jnp.conj(jnp.swapaxes(H_physical, -1, -2)))
     p_prod = spec_divisor(mesh, _band_spec(), 1)
-    H_j = pad_axis(H_j, p_prod, axis=1).array
+    H_j = pad_axis(H_physical, p_prod, axis=1).array
     H_j = pad_axis(H_j, p_prod, axis=2).array
     nb_pad = int(H_j.shape[1])
     H_j = jax.lax.with_sharding_constraint(
         H_j, NamedSharding(mesh, band_rotation_spec()))
-    # pXheevd reads ONE triangle, so a non-Hermitian input is silently
-    # interpreted rather than refused.  Hermitise here.
-    H_j = 0.5 * (H_j + jnp.conj(jnp.swapaxes(H_j, -1, -2)))
     if nb_pad != nb:
         # SENTINEL pad, then drop BY COUNT.  ``pad_axis`` zero-fills, so
         # the pad block is [H 0; 0 0] and the pad eigenvalues are exactly
@@ -805,7 +808,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         # rule can separate them.  An identity pad (λ = 1 Ry = 13.6 eV)
         # fixes neither: it still lands inside a realistic QP window.
         #
-        # With a large sentinel on the pad diagonal the block stays exactly
+        # With a high sentinel on the pad diagonal the block stays exactly
         # block-diagonal with zero coupling, so the padded subspace
         # decouples EXACTLY: physical eigenvectors keep zero weight on pad
         # rows, physical eigenvalues are unchanged, and the sentinel
@@ -817,18 +820,17 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         # deflates exactly; only the safe VALUE differs, because there the
         # pad modes are dropped by |lambda| and here by position.
         #
-        # Sentinel value: 1e10, the tree's existing spelling
-        # (psp/dft_operators.py:736,759). Physical eigenvalues here are
-        # O(1) Ry, so it is ~10 orders clear. NOTE it is safe *because it
-        # is dropped*: common/wfn_transforms.py:1606-1618 deliberately
-        # chose a FINITE max(E)+1 Ry sentinel for band energies that are
-        # KEPT, since those flow into PPM resolvents 1/(w - e + i.eta).
-        # These do not survive this function, and a value that is absurd
-        # on sight makes a future leak loud instead of silent.
+        # A fixed enormous sentinel makes the padded eigensystem badly
+        # conditioned even though the pad block decouples algebraically.
+        # For Hermitian H, lambda_max <= ||H||_inf, so 2*||H||_inf is
+        # strictly above every physical eigenvalue and stays on the matrix
+        # scale.  Keep it per k; the two scalar reductions exist only on
+        # this odd-band path.  The exactly-zero fallback is 1 Ry.
+        pad_sentinel = _eigh_pad_sentinel_ry(H_physical)[:, None, None]
         i = jnp.arange(nb_pad)[:, None]
         j = jnp.arange(nb_pad)[None, :]
         on_pad_diag = ((i == j) & (i >= nb))[None]
-        H_j = jnp.where(on_pad_diag, _EIGH_PAD_SENTINEL_RY, H_j)
+        H_j = jnp.where(on_pad_diag, pad_sentinel, H_j)
     E, U = dispatch_batched_eigh(
         H_j, mesh, distrib_la_backend,
         batched_route=distrib_la_batched_route)

@@ -226,27 +226,57 @@ def test_the_pad_is_a_sentinel_and_the_result_is_sliced_back_by_count():
     src = pathlib.Path(qsgw_density.__file__).read_text()
     body = src[src.index("def distributed_eigh_bands("):]
     body = body[:body.index("\ndef ")]
-    assert "_EIGH_PAD_SENTINEL_RY" in body, (
-        "the band pad must carry the large diagonal sentinel; a zero pad "
+    assert "_eigh_pad_sentinel_ry(H_physical)" in body, (
+        "the band pad must carry the scale-aware diagonal sentinel; a zero pad "
         "injects exact-0.0 eigenvalues mid-spectrum and moves band order, "
         "_midgap_efermi and the occupations")
+    odd_branch = body.index("if nb_pad != nb:")
+    sentinel_call = body.index("_eigh_pad_sentinel_ry(H_physical)")
+    assert sentinel_call > odd_branch, (
+        "the row-sum/max reductions belong only to the padded odd-band path; "
+        "divisible band counts must not pay or compile them")
     assert "E = E[:, :nb]" in body and "U = U[:, :nb, :nb]" in body, (
         "the eigh result must be sliced back to the LOGICAL band extent "
         "by COUNT — that is what makes the sentinel correct rather than "
         "merely convenient, and what the lifted refusal relies on")
 
 
-def test_the_sentinel_is_orders_clear_of_any_physical_eigenvalue():
-    """1e10 Ry vs O(1) Ry QP eigenvalues.
+def _sentinel(H):
+    from gw.qsgw_density import _eigh_pad_sentinel_ry
+    return np.asarray(_eigh_pad_sentinel_ry(jnp.asarray(H)[None]))[0]
 
-    Not a style check: the sentinel is only safe if pad eigenvalues
-    cannot interleave with the physical spectrum at ANY deck.  An
-    identity pad (1.0 Ry = 13.6 eV) fails exactly this — it is above most
-    states of interest but inside a wide QP window.
-    """
-    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
-    assert S >= 1e8
-    assert S / 13.6057 > 1e6          # eV, vs any conceivable QP window
+
+def test_the_sentinel_is_above_a_positive_diagonal_spectrum():
+    H = np.diag([2.0, 7.0, -1.0])
+    S = _sentinel(H)
+    assert S == 2.0 * np.linalg.norm(H, ord=np.inf)
+    assert S > np.linalg.eigvalsh(H)[-1]
+
+
+def test_the_sentinel_is_scale_aware_for_a_negative_definite_spectrum():
+    H = np.diag([-5.0, -2.0, -0.25])
+    S = _sentinel(H)
+    assert S == 2.0 * np.linalg.norm(H, ord=np.inf)
+    assert S > np.linalg.eigvalsh(H)[-1]
+
+
+def test_the_sentinel_uses_one_ry_only_for_an_exactly_zero_matrix():
+    assert _sentinel(np.zeros((4, 4))) == 1.0
+
+
+def test_the_sentinel_uses_the_complex_hermitian_infinity_norm_per_k():
+    H0 = np.array([[2.0, 1.0 + 2.0j],
+                   [1.0 - 2.0j, -3.0]], dtype=np.complex128)
+    H1 = 0.125 * H0
+    from gw.qsgw_density import _eigh_pad_sentinel_ry
+    got = np.asarray(_eigh_pad_sentinel_ry(jnp.asarray([H0, H1])))
+    want = 2.0 * np.asarray([
+        np.linalg.norm(H0, ord=np.inf),
+        np.linalg.norm(H1, ord=np.inf),
+    ])
+    np.testing.assert_allclose(got, want, rtol=1e-14, atol=0.0)
+    assert got.shape == (2,)                 # one scalar reduction per k
+    assert np.all(got > np.linalg.eigvalsh(np.stack([H0, H1]))[:, -1])
 
 
 def test_a_sentinel_pad_block_decouples_exactly():
@@ -256,11 +286,11 @@ def test_a_sentinel_pad_block_decouples_exactly():
     eigenvalues are EXACTLY s, they occupy the last slots of an ascending
     spectrum, and the physical eigenvectors carry zero weight on pad rows.
     """
-    from gw.qsgw_density import _EIGH_PAD_SENTINEL_RY as S
     rng = np.random.default_rng(3)
     nb, nb_pad = 10, 16
     A = rng.normal(size=(nb, nb))
     H = 0.5 * (A + A.T)
+    S = _sentinel(H)
     Hp = np.zeros((nb_pad, nb_pad))
     Hp[:nb, :nb] = H
     Hp[np.arange(nb, nb_pad), np.arange(nb, nb_pad)] = S
@@ -268,6 +298,26 @@ def test_a_sentinel_pad_block_decouples_exactly():
     assert np.all(w[nb:] == S)                       # exactly, not approx
     assert np.abs(w[:nb] - np.linalg.eigh(H)[0]).max() < 1e-10
     assert np.abs(V[nb:, :nb]).max() == 0.0          # no leakage into pad rows
+
+
+def test_scale_aware_odd_band_pad_preserves_conditioning_and_residual():
+    """The pad must not dominate backward error for an odd physical nb."""
+    rng = np.random.default_rng(117)
+    nb, nb_pad = 5, 8
+    A = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
+    H = 0.5 * (A + A.conj().T)
+    S = _sentinel(H)
+    Hp = np.zeros((nb_pad, nb_pad), dtype=H.dtype)
+    Hp[:nb, :nb] = H
+    Hp[np.arange(nb, nb_pad), np.arange(nb, nb_pad)] = S
+    E, U = np.linalg.eigh(Hp)
+    E, U = E[:nb], U[:nb, :nb]
+    residual = np.linalg.norm(H @ U - U * E[None], ord="fro")
+    residual /= np.linalg.norm(H, ord="fro")
+    orth = np.linalg.norm(U.conj().T @ U - np.eye(nb), ord="fro")
+    assert residual < 1e-13
+    assert orth < 1e-13
+    assert S / np.linalg.norm(H, ord=np.inf) == 2.0
 
 
 def test_a_large_tile_leaves_the_native_batch():
