@@ -256,6 +256,25 @@ def test_p1_cache_setup_arms_the_observer_before_return(monkeypatch, tmp_path):
                 if name == "jax_persistent_cache_min_compile_time_secs"]
 
 
+@pytest.mark.parametrize("n_proc", [1, 4])
+def test_explicit_cache_off_also_disables_xla_subcaches(monkeypatch, n_proc):
+    """Cache-off must not leave JAX's rank-asymmetric cache half configured."""
+    config_updates = []
+    monkeypatch.setattr(jcc, "_COMPILATION_CACHE_READY", False)
+    monkeypatch.setattr(jax, "process_count", lambda: n_proc)
+    monkeypatch.setattr(jax, "process_index", lambda: 0)
+    monkeypatch.setattr(jcc, "_install_compile_counter", lambda: None)
+    monkeypatch.setattr(jcc.atexit, "register", lambda _fn: None)
+    monkeypatch.setenv("ISDF_JAX_CACHE_DIR", "")
+    monkeypatch.setattr(
+        jax.config, "update", lambda *args: config_updates.append(args))
+
+    jcc.ensure_jax_compile_cache()
+
+    assert config_updates == [
+        ("jax_persistent_cache_enable_xla_caches", "")]
+
+
 def test_cache_default_prefers_workflow_over_global_fallback(monkeypatch,
                                                              tmp_path):
     """A named workflow takes precedence over the legacy global fallback."""

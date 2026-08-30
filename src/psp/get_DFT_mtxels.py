@@ -270,6 +270,23 @@ def density_components_from_psi_r(
     return jnp.stack((rho, *currents))
 
 
+@jax.jit
+def _spin_density_matrix_to_pauli_fields_kernel(
+    matrix: jnp.ndarray,
+) -> jnp.ndarray:
+    """Fused device contraction behind the validated public helper."""
+    rho_00 = matrix[0, 0]
+    rho_11 = matrix[1, 1]
+    rho_01 = matrix[0, 1]
+    rho_10 = matrix[1, 0]
+    return jnp.stack((
+        jnp.real(rho_00 + rho_11),
+        jnp.real(rho_01 + rho_10),
+        jnp.real(1j * (rho_01 - rho_10)),
+        jnp.real(rho_00 - rho_11),
+    ))
+
+
 def spin_density_matrix_to_pauli_fields(rho_ab: jnp.ndarray) -> jnp.ndarray:
     """Return real ``(rho,mx,my,mz)`` fields from local ``rho_ab``.
 
@@ -290,16 +307,7 @@ def spin_density_matrix_to_pauli_fields(rho_ab: jnp.ndarray) -> jnp.ndarray:
         raise ValueError(
             "rho_ab must have two leading spin axes of length 2; "
             f"got shape={matrix.shape}")
-    rho_00 = matrix[0, 0]
-    rho_11 = matrix[1, 1]
-    rho_01 = matrix[0, 1]
-    rho_10 = matrix[1, 0]
-    return jnp.stack((
-        jnp.real(rho_00 + rho_11),
-        jnp.real(rho_01 + rho_10),
-        jnp.real(1j * (rho_01 - rho_10)),
-        jnp.real(rho_00 - rho_11),
-    ))
+    return _spin_density_matrix_to_pauli_fields_kernel(matrix)
 
 
 @partial(
