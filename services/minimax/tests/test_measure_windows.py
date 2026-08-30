@@ -1,66 +1,41 @@
+"""The tail-refined lattice is the service's one measure compressor."""
 import numpy as np
 import pytest
 
-from minimax.measure_windows import (
-    apportion_true_error,
-    partition_measure_windows,
-)
+from minimax.measure_windows import tail_refined_lattice_measure
 
 
-def test_partition_isolates_crossing_and_conserves_membership_and_mass():
-    support = np.array([
-        -8.0 + 0.4j, -3.0 + 0.5j,
-        1.0 - 0.3j, 4.0 - 0.7j,
-        7.0 - 0.4j, 12.0 - 0.8j, 30.0 - 1.2j,
-    ])
-    masses = np.array([1.0, 2.0, 3.0, 1.0, 5.0, 2.0, 4.0])
-    windows = partition_measure_windows(
-        support, masses, np.linspace(0.0, 5.0, 11), window_count=5)
+def test_tail_refined_lattice_conserves_mass_and_refines():
+    rng = np.random.default_rng(11)
+    support = rng.normal(2.0, 1.5, 400) - 1.0j * rng.gamma(2.0, 0.1, 400)
+    masses = rng.random(400) * np.exp(-rng.uniform(0.0, 8.0, 400))
 
-    assert 2 <= len(windows) <= 5
-    crossing = [window for window in windows if window.kind == "crossing"]
-    assert len(crossing) == 1
-    assert np.array_equal(np.sort(crossing[0].member_indices), [2, 3])
-    members = np.concatenate([window.member_indices for window in windows])
-    assert np.array_equal(np.sort(members), np.arange(support.size))
-    assert sum(window.delivered_mass for window in windows) == pytest.approx(
-        masses.sum())
-    assert all(np.isfinite(window.scale_span) and window.scale_span >= 1.0
-               for window in windows)
+    cells, cell_mass, refined, refined_mass = tail_refined_lattice_measure(
+        support, masses, bins_per_axis=25)
+
+    assert cell_mass.sum() == pytest.approx(masses.sum(), rel=1e-12)
+    assert refined_mass.sum() == pytest.approx(masses.sum(), rel=1e-12)
+    assert refined.size > cells.size
+    assert np.all(cell_mass > 0.0) and np.all(refined_mass > 0.0)
+    # the compressed support stays inside the raw bounding box
+    for lattice in (cells, refined):
+        assert lattice.real.min() >= support.real.min() - 1e-12
+        assert lattice.real.max() <= support.real.max() + 1e-12
 
 
-def test_sign_definite_support_uses_nonempty_mass_quantiles():
-    support = -np.geomspace(1.0, 100.0, 12) + 0.5j
-    masses = np.arange(1.0, 13.0)
-    windows = partition_measure_windows(
-        support, masses, np.linspace(0.0, 5.0, 11), window_count=3)
-
-    assert len(windows) == 3
-    assert all(window.kind == "below" for window in windows)
-    assert all(window.member_indices.size > 0 for window in windows)
-    assert np.array_equal(
-        np.sort(np.concatenate([window.member_indices for window in windows])),
-        np.arange(support.size))
+def test_degenerate_one_value_axis_conserves_mass_exactly():
+    support = np.full(7, 3.0) - 0.25j  # both axes degenerate
+    masses = np.arange(1.0, 8.0)
+    cells, cell_mass, refined, refined_mass = tail_refined_lattice_measure(
+        support, masses, bins_per_axis=25)
+    assert cell_mass.sum() == masses.sum()
+    assert refined_mass.sum() == masses.sum()
+    np.testing.assert_allclose(cells, support[0])
 
 
-def test_true_error_budget_is_mass_times_measured_difficulty():
-    support = -np.geomspace(1.0, 30.0, 8) + 0.5j
-    masses = np.ones(8)
-    windows = partition_measure_windows(
-        support, masses, np.linspace(0.0, 5.0, 11), window_count=2)
-    difficulty = np.array([1.0, 3.0])
-    budgets = apportion_true_error(windows, difficulty, 2.0e-4)
-
-    expected_score = np.array(
-        [window.delivered_mass for window in windows]) * difficulty
-    actual = np.array([budget.absolute_error_budget for budget in budgets])
-    assert actual.sum() == pytest.approx(2.0e-4)
-    assert actual / actual.sum() == pytest.approx(expected_score / expected_score.sum())
-
-
-@pytest.mark.parametrize("window_count", [1, 6])
-def test_window_count_refuses_outside_small_planner_contract(window_count):
-    with pytest.raises(ValueError, match="window_count"):
-        partition_measure_windows(
-            np.array([-2.0 + 0.2j, 8.0 - 0.2j]), np.ones(2),
-            np.linspace(0.0, 5.0, 3), window_count=window_count)
+def test_rejects_empty_or_nonfinite_measures():
+    with pytest.raises(ValueError):
+        tail_refined_lattice_measure(np.array([]), np.array([]))
+    with pytest.raises(ValueError):
+        tail_refined_lattice_measure(
+            np.array([1.0 + 0.0j, np.nan + 0.0j]), np.ones(2))
