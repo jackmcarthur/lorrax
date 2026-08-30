@@ -533,17 +533,17 @@ def test_crossing_band_remains_identity_under_rigid_valence_policy():
 def test_sc_map_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
     """Static seam gate: the pure policy must be fed F(H)'s own anchor."""
     source = (_SCISSOR.parent / "sc_iteration.py").read_text()
-    start = source.index("# ``ks``, NOT A WEIGHT ARRAY.")
-    stop = source.index("H_qp_dft_new = apply_band_partition(", start)
+    start = source.index("def _apply_scissor_partition_policy(")
+    stop = source.index("\ndef ", start + 1)
     block = source[start:stop]
 
     fit = block.index("_scissor_E_qp_for_outofrange(")
     probe = block.index("H_fermi_probe = apply_band_partition(")
-    anchor = block.index("_partitioned_candidate_efermi(")
+    anchor = block.index("candidate_efermi_fn(H_fermi_probe)")
     displacement = block.index("fermi_displacement_ry = (")
     final_policy = block.index("qsgw_out_of_range_energies(")
     assert fit < probe < anchor < displacement < final_policy
-    assert "candidate_efermi_ry - float(inputs.efermi_dft_ry)" in block
+    assert "candidate_efermi_ry - float(efermi_dft_ry)" in block
     assert "fermi_displacement_ry=0.0" in block
     # Conduction is already final in the probe and the same fitted object is
     # passed to the final policy; neither a second fit nor a copied affine law.
@@ -556,11 +556,15 @@ def test_sc_map_wires_the_same_map_candidate_fermi_not_the_entry_fermi():
 
     # The final H is independently re-anchored and refused if the tail moved
     # E_F, so the provisional non-circularity argument is executable.
-    final_start = stop
-    final_stop = source.index("# THE STAR-SPREAD GATE", final_start)
-    final_block = source[final_start:final_stop]
-    assert "final_efermi_ry = _partitioned_candidate_efermi(" in final_block
-    assert "final_efermi_ry, candidate_efermi_ry" in final_block
+    assert "final_efermi_ry = float(candidate_efermi_fn(H_partitioned))" in block
+    assert "final_efermi_ry, candidate_efermi_ry" in block
+
+    # The SC caller binds that callback to the candidate-spectrum owner; it
+    # does not pass the map-entry Fermi level as a frozen scalar.
+    map_start = source.index("def gw_iteration_map(")
+    map_stop = source.index("def _scissor_E_qp_for_outofrange(", map_start)
+    map_block = source[map_start:map_stop]
+    assert "candidate_efermi_fn=lambda H: _partitioned_candidate_efermi(" in map_block
 
 
 def test_frac_tol_is_validated():

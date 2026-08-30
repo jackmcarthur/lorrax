@@ -123,9 +123,8 @@ def band_rotation_spec() -> P:
 
     The eigenvector matrix, columns, sharded so no rank holds a full
     ``(nb, nb)``.  It is exactly ``batched_distributed_eigh``'s declared
-    output layout, so the FFI path needs no reshard at all; ask
-    ``_make_kshard_eigh(..., u_spec=...)`` for the same layout from the
-    native path rather than resharding a replicated U after the fact.
+    output layout.  ``distributed_eigh_bands`` gives both the native
+    batch-reshard and distributed backends this same contract.
     """
     return P(None, "x", "y")
 

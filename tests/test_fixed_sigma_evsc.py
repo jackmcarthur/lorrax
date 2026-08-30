@@ -88,6 +88,42 @@ def test_full_sigma_cube_rotation_stays_two_axis_sharded_on_p4():
                                rtol=3e-13, atol=3e-13)
 
 
+@pytest.mark.mesh(4)
+def test_fixed_sigma_nondivisible_logical_window_stays_on_p4_carrier():
+    """nb=5 exercises the seed, repeated eigh pad, and final-map check."""
+    if len(jax.devices()) != 4:
+        pytest.skip("requires four visible devices")
+    from common.collectives import resolve_mesh
+
+    mesh = resolve_mesh()
+    omega_ev = np.linspace(-20.0, 20.0, 9)
+    e_dft_ev = np.asarray([[-2.0, -0.8, 0.6, 1.4, 2.3]])
+    e_dft_ry = e_dft_ev / RYD_TO_EV
+    kin = np.diag(e_dft_ry[0])[None].astype(np.complex128)
+    zmat = jnp.zeros((1, 5, 5), dtype=jnp.complex128)
+    result = SigmaResult(
+        v_h_kij_ry=zmat,
+        sigma_x_kij_ry=zmat,
+        sigma_xc_kij_ry=zmat,
+        sigma_c_omega_kij_ry=jnp.zeros(
+            (omega_ev.size, 1, 5, 5), dtype=jnp.complex128),
+        omega_grid_ev=omega_ev,
+        omega_grid_ry=omega_ev / RYD_TO_EV,
+        efermi_dft_ev=0.0,
+    )
+    got = run_fixed_sigma_evsc(
+        result, jnp.asarray(kin), e_dft_ry,
+        config=_config(tol_ev=1.0e-12, max_iter=3),
+        **_band_context(e_dft_ry, n_occ=2),
+        mesh_xy=mesh, print_fn=lambda *_a: None)
+
+    assert got.energies_ry.shape == e_dft_ry.shape
+    assert got.U_dft_to_qp.shape == (1, 5, 5)
+    assert got.U_dft_to_qp.sharding.spec == P(None, "x", "y")
+    np.testing.assert_allclose(got.energies_ry, e_dft_ry,
+                               rtol=0.0, atol=2.0e-14)
+
+
 def _host_reference(kin, vh, sx, sigma_w, omega_ev, e_dft_ry,
                     *, tol_ev, max_iter):
     nk, nb = e_dft_ry.shape

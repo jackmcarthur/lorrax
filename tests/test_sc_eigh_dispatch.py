@@ -101,21 +101,23 @@ def test_the_eigh_choice_does_not_read_density_self_consistent():
     assert got in ("native", "distributed")
 
 
-def test_iteration_map_resolves_the_eigh_separately_from_the_efermi_rule():
-    """Source gate: the two decisions must not share a branch again.
+def test_driver_resolves_eigh_once_and_map_keeps_it_separate_from_efermi():
+    """Source gate: resolution is loop-owned and not a physics branch.
 
     ``density_self_consistent`` may still select the E_F rule — that is a
-    physics question — but it must not appear in the eigh dispatch.
+    physics question — but repeated map/convergence calls consume the one
+    resolved ``inputs.eigh_kind`` value.
     """
     src = pathlib.Path(sc_iteration.__file__).read_text()
+    driver = src[src.index("def run_sc_driver("):
+                 src.index("def final_qp_eigenstates(")]
     body = src[src.index("def gw_iteration_map("):
                src.index("def _scissor_E_qp_for_outofrange(")]
-    eigh_at = body.index("eigh_kind = _resolve_sc_eigh(")
-    call_at = body.index("E_qp_ry, U_qp = distributed_eigh_bands(")
-    dsc_at = body.index('"density_self_consistent"', eigh_at)
-    assert eigh_at < call_at < dsc_at, (
-        "the eigh dispatch must be resolved before, and independently of, "
-        "the density_self_consistent branch")
+    assert driver.count("eigh_kind = _resolve_sc_eigh(") == 1
+    assert "_resolve_sc_eigh(" not in body
+    call_at = body.index("E_qp_ry, U_qp = _sc_eigh_bands(")
+    dsc_at = body.index('"density_self_consistent"', call_at)
+    assert "kind=inputs.eigh_kind" in body[call_at:dsc_at]
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +368,8 @@ def test_the_native_eigh_matches_a_host_reference():
     rng = np.random.default_rng(2)
     H = _random_hermitian(rng, 3, 8)
 
-    eigh_kshard, _ = sc_iteration._kshard_eigh_kernels(
-        mesh, sc_iteration._band_rotation_spec())
-    E_n, U_n = (np.asarray(a) for a in eigh_kshard(jnp.asarray(H)))
+    E_n, U_n = (np.asarray(a) for a in sc_iteration._sc_eigh_bands(
+        jnp.asarray(H), kind="native", mesh_xy=mesh, config=_Config()))
     E_h, U_h = np.linalg.eigh(H)
 
     scale = float(np.abs(E_h).max())

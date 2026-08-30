@@ -72,7 +72,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
-from common.collectives import barrier, device_put_process_local
+from common.collectives import (barrier, device_put_process_local,
+                                gather_to_host)
 from common.units import RYD_TO_EV
 from .band_partition import (
     BandPartition, apply_band_partition, build_omega_band_partition)
@@ -292,6 +293,11 @@ class SCInputs:
     # to anchor the Sigma window/partition.  Retained here so an SC map never
     # re-solves the old endpoint of its Fermi displacement.
     efermi_dft_ry: float
+    #: Resolved once for the whole loop.  Every repeated diagonalisation,
+    #: including convergence and terminal extraction, routes through
+    #: ``qsgw_density.distributed_eigh_bands`` / ``distrib_la`` with this
+    #: choice; no map-local eigensolver or reshard policy exists.
+    eigh_kind: str
     #: IBZ ⇄ full-BZ map for BAND-INDEX quantities.  ``None`` ⇒ the loop
     #: runs entirely on the full BZ, which is what every result before
     #: 2026-08-04 did and what the one-shot equivalence gate pins.  When
@@ -434,6 +440,9 @@ class SCState:
     (maximally so at max_iter=1, where the correct U is the identity).
     """
 
+    # Canonical all-P carrier: qsgw_density.band_rotation_spec(), i.e.
+    # P(None, 'x', 'y').  Only its O(nk*nb) spectrum and terminal writer
+    # products may be replicated/gathered.
     H_qp_dft: jax.Array              # (nk, nb_active, nb_active) Ry, DFT basis
     iteration: int
     # DIAGNOSTIC continuity only (mu-drift log): the map ENTRY-solves its
@@ -462,11 +471,6 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
         inputs.band_slices.sigma_range, inputs.band_slices.sigma_range,
         nspinor=inputs.meta.nspinor)
     enk_dft_ry = np.asarray(enk_dft, dtype=np.float64)
-    nk, nb_active = enk_dft_ry.shape
-    # Per-k diagonal of E_DFT_kn — broadcast cast to complex128 for the
-    # iteration carry.
-    H0 = (enk_dft_ry[:, :, None] * np.eye(nb_active)[None, :, :]).astype(
-        np.complex128)
     # The carried state lives on whatever k-set the loop runs on.  With a
     # k-star map that is the IBZ, so H0 is selected here ONCE rather than
     # every iteration; diag(E_DFT) is star-consistent by construction, so
@@ -474,13 +478,14 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     # requires H0 to be exactly diagonal) still fires.
     ks = getattr(inputs, "kstar", None)
     if ks is not None and not ks.is_identity:
-        H0 = ks.select(H0)
-    rep = NamedSharding(inputs.mesh_xy, P(None, None, None))
-    # Process-local replication (plain ``jax.device_put`` of host numpy
-    # onto a multi-process sharding fires JAX's hidden ``assert_equal``
-    # all-gather, P × nk × nb² × 16 B — scorecard AA.1).  ``H0`` is a
-    # pure function of the DFT energies, identical on every rank;
-    # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
+        enk_dft_ry = np.asarray(ks.select(enk_dft_ry), dtype=np.float64)
+    # Only the small spectrum is staged replicated.  The O(nk*nb^2)
+    # diagonal carrier is formed directly at band_rotation_spec, so no rank
+    # ever constructs or transfers the full host matrix.
+    spectrum_sh = NamedSharding(inputs.mesh_xy, P(None, None))
+    E0 = device_put_process_local(enk_dft_ry, spectrum_sh)
+    from_diagonal, _, _ = _sc_carrier_kernels(inputs.mesh_xy)
+    H0 = from_diagonal(E0)
     occ_state, head_surface_weight_kn = _solve_head_occupations(
         inputs, inputs.wfns_dft.enk)
     if occ_state is not None:
@@ -542,7 +547,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 f"spectrum gives {initial_efermi_ry:.12e} Ry but SCInputs "
                 f"stored {float(inputs.efermi_dft_ry):.12e} Ry.")
     return SCState(
-        H_qp_dft=device_put_process_local(H0, rep),
+        H_qp_dft=H0,
         iteration=0,
         occupation_state=occ_state,
         head_surface_weight_kn=head_surface_weight_kn,
@@ -715,85 +720,12 @@ def _assert_index_mask_matches_classes(inputs: SCInputs, classes) -> None:
 # Iteration map
 # ---------------------------------------------------------------------------
 
-def _make_kshard_eigh(mesh_xy: Mesh, *, eigvalsh_only: bool,
-                      u_spec: P | None = None):
-    """Return a jit'd eigh that briefly k-shards the input over the mesh
-    so each device only does its slice of the per-k diagonalisations,
-    then allgathers the eigenvalues (and U if requested) back to
-    replicated.  Pure perf hint — the math is identical to running
-    ``vmap(eigh)`` on the replicated input.
-
-    ``nk`` NEED NOT divide ``mesh_xy.size``.  ``with_sharding_constraint``
-    is a layout hint and GSPMD shards the k axis unevenly when it has to —
-    some devices simply get one fewer k.  (This docstring previously
-    asserted the opposite; job 7889742 ran the ``sc_on_ibz`` arm green at
-    P=4 with ``nk_irr = 10``, and ``_run_linear_mixing`` calls the
-    eigvalsh kernel on that ``(10, nb, nb)`` carry — ``10 % 4 != 0``.
-    ``dsc_demo/ibz44v.7889742.out:26``.)  What it costs at ``nk <
-    mesh.size`` is idle devices, not a failure.
-    """
-    rep_E = NamedSharding(mesh_xy, P(None, None))
-    # ``u_spec`` chooses where U LANDS.  The SC loop asks for
-    # ``qsgw_density.band_rotation_spec`` (``P(None,'x','y')``, so no rank
-    # holds a full (nb, nb)); the default replicates it and is kept for
-    # ``final_qp_eigenstates``, whose only consumers are host writers.
-    # Parametrised rather than copied: the eigh itself, the k-shard hint
-    # and the hermitisation are identical and must not drift.
-    rep_U = NamedSharding(mesh_xy,
-                          P(None, None, None) if u_spec is None else u_spec)
-    k_shard_3d = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-
-    # Replication is an ENFORCED output contract (out_shardings), not a
-    # body hint: at P=4 the trailing with_sharding_constraint was dropped
-    # by the partitioner and the host read local-shard-plus-zeros — 22 of
-    # 29 IBZ rows exactly 0.0 in every eqp snapshot, max|dE| = VBM to six
-    # decimals, and the MP1 mu solved on a three-quarters-zero table
-    # (QUALITY_PATTERNS §4: the optimized HLO is the only ground truth).
-    if eigvalsh_only:
-        @_functools.partial(jax.jit, out_shardings=rep_E)
-        def _f(H):
-            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
-            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
-            return jax.vmap(jnp.linalg.eigvalsh)(H_h)
-        return _f
-    else:
-        @_functools.partial(jax.jit, out_shardings=(rep_E, rep_U))
-        def _f(H):
-            H_k = jax.lax.with_sharding_constraint(H, k_shard_3d)
-            H_h = 0.5 * (H_k + jnp.conj(jnp.swapaxes(H_k, -1, -2)))
-            E, U = jax.vmap(jnp.linalg.eigh)(H_h)
-            return E, U
-        return _f
-
-
-# Kernel cache.  The eigh is keyed by ``(mesh, u_spec)`` because ``u_spec``
-# changes its output sharding and therefore its lowering; the eigvalsh has
-# no U and is cached on its own key so a second U layout does not retrace
-# it.  Re-used across all SC iterations, so the JIT cost is paid once.
-_KSHARD_EIGH_CACHE: dict[tuple, object] = {}
-
-
-def _kshard_eigh_kernels(mesh_xy: Mesh, u_spec: P | None = None) -> tuple:
-    key = (id(mesh_xy), u_spec)
-    eigh = _KSHARD_EIGH_CACHE.get(key)
-    if eigh is None:
-        eigh = _make_kshard_eigh(mesh_xy, eigvalsh_only=False, u_spec=u_spec)
-        _KSHARD_EIGH_CACHE[key] = eigh
-    ev_key = (id(mesh_xy), "eigvalsh")
-    eigvalsh = _KSHARD_EIGH_CACHE.get(ev_key)
-    if eigvalsh is None:
-        eigvalsh = _make_kshard_eigh(mesh_xy, eigvalsh_only=True)
-        _KSHARD_EIGH_CACHE[ev_key] = eigvalsh
-    return eigh, eigvalsh
-
-
 def _midgap_efermi(E: jax.Array, n_occ: int) -> jax.Array:
     """Fixed-band-cut midgap E_F from ascending eigenvalues.
 
-    One spelling, two callers (:func:`_diagonalize_and_get_efermi` and
-    :func:`gw_iteration_map`), because which EIGH ran and which E_F rule
-    applies are now independent decisions and the rule must not be
-    duplicated inside one of the eigh branches.
+    One spelling for the map and terminal writer.  Which EIGH ran and which
+    E_F rule applies are independent decisions; the rule does not belong in
+    the distributed linear-algebra service.
 
     Valid for an insulator with a fixed occupied count; the general
     answer, and the one the IBZ needs, is
@@ -802,25 +734,6 @@ def _midgap_efermi(E: jax.Array, n_occ: int) -> jax.Array:
     vbm = jnp.max(E[:, :n_occ])
     cbm = jnp.where(n_occ < E.shape[1], jnp.min(E[:, n_occ:]), vbm)
     return 0.5 * (vbm + cbm)
-
-
-def _diagonalize_and_get_efermi(
-    H: jax.Array, n_occ: int, mesh_xy: Mesh, u_spec: P | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Hermitise + eigh + midgap E_F.  Returns (E, U, efermi_ry).
-
-    Per-k eighs are briefly k-sharded over the device mesh so each
-    device only does ``nk / mesh_size`` of them.  The midgap reduction
-    runs on the gathered E (small, replicated).
-
-    ``u_spec`` is where U lands; ``None`` replicates it.  Pass
-    ``qsgw_density.band_rotation_spec()`` when the CALLER's consumers are
-    the device-side rotations, and leave it ``None`` when they are host
-    writers — see the two call sites.
-    """
-    eigh_kshard, _ = _kshard_eigh_kernels(mesh_xy, u_spec)
-    E, U = eigh_kshard(H)
-    return E, U, _midgap_efermi(E, n_occ)
 
 
 def _partitioned_candidate_efermi(
@@ -838,8 +751,9 @@ def _partitioned_candidate_efermi(
     :func:`_solve_occupation_state` fixed-N MP1 implementation used at map
     entry; no second chemical-potential policy is spelled here.
     """
-    _, eigvalsh_candidate = _kshard_eigh_kernels(inputs.mesh_xy)
-    E_candidate_ry = eigvalsh_candidate(H_partitioned)
+    E_candidate_ry = _sc_eigenvalues(
+        H_partitioned, kind=inputs.eigh_kind, mesh_xy=inputs.mesh_xy,
+        config=inputs.config)
     if not use_mp1:
         return float(_midgap_efermi(E_candidate_ry, n_occ))
 
@@ -1006,6 +920,17 @@ def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
         f"{kind!r}.")
 
 
+def _sc_eigenvalues(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
+    """Repeated SC spectrum through the one ``distrib_la`` eigh door.
+
+    The service currently returns eigenvectors for every supported backend;
+    discarding that sharded result is preferable to maintaining a second
+    map-local ``eigvalsh`` route with a different reshard/padding policy.
+    """
+    E, _ = _sc_eigh_bands(H, kind=kind, mesh_xy=mesh_xy, config=config)
+    return E
+
+
 def _band_rotation_spec() -> P:
     """``gw.qsgw_density.band_rotation_spec()``, resolved lazily.
 
@@ -1029,10 +954,8 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
 
     * an already-correctly-placed ``jax.Array`` — ``jax.device_put`` onto
       the same sharding is a no-op, so the default SC path pays nothing;
-    * a ``jax.Array`` at another mesh layout, which is what
-      ``qsgw_density.distributed_eigh_bands`` and
-      ``_make_kshard_eigh(u_spec=...)`` both emit — ``device_put`` reshards
-      it on the device.  ``jnp.asarray`` would leave it where it was and
+    * a ``jax.Array`` at another mesh layout — ``device_put`` reshards it on
+      the device.  ``jnp.asarray`` would leave it where it was and
       ``np.asarray`` raises "Fetching value for jax.Array that spans
       non-addressable (non process local) devices" at P>1 (measured,
       job 7889419);
@@ -1053,6 +976,94 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
     if isinstance(x, jax.Array):
         return jax.device_put(x, sh)
     return device_put_process_local(x, sh)
+
+
+_SC_CARRIER_KERNELS: dict[int, tuple[Callable, Callable, Callable]] = {}
+
+
+def _sc_carrier_kernels(mesh: Mesh) -> tuple[Callable, Callable, Callable]:
+    """Cached construction/inspection kernels for the canonical SC carrier.
+
+    Only ``(nk, nb)`` diagonals and one scalar leave
+    ``band_rotation_spec``.  In particular, the iteration-zero exact-diagonal
+    gate never fetches the ``(nk, nb, nb)`` carry to a host.
+    """
+    cached = _SC_CARRIER_KERNELS.get(id(mesh))
+    if cached is not None:
+        return cached
+
+    matrix_sh = NamedSharding(mesh, _band_rotation_spec())
+    spectrum_sh = NamedSharding(mesh, P(None, None))
+    scalar_sh = NamedSharding(mesh, P())
+
+    @_functools.partial(
+        jax.jit, in_shardings=spectrum_sh, out_shardings=matrix_sh)
+    def from_diagonal(E):
+        nb = E.shape[1]
+        eye = jnp.eye(nb, dtype=jnp.complex128)
+        return E.astype(jnp.complex128)[:, :, None] * eye[None, :, :]
+
+    @_functools.partial(
+        jax.jit, in_shardings=matrix_sh,
+        out_shardings=(spectrum_sh, scalar_sh))
+    def inspect_initial(H):
+        diagonal = jnp.diagonal(H, axis1=1, axis2=2)
+        nb = H.shape[1]
+        off_diagonal = H - diagonal[:, :, None] * jnp.eye(
+            nb, dtype=H.dtype)[None, :, :]
+        exact = (jnp.all(off_diagonal == 0)
+                 & jnp.all(jnp.imag(diagonal) == 0)
+                 & jnp.all(jnp.isfinite(diagonal)))
+        return jnp.real(diagonal), exact
+
+    @_functools.partial(
+        jax.jit, in_shardings=spectrum_sh, out_shardings=matrix_sh)
+    def identity_from_spectrum(E):
+        nb = E.shape[1]
+        return jnp.broadcast_to(
+            jnp.eye(nb, dtype=jnp.complex128), (E.shape[0], nb, nb))
+
+    cached = (from_diagonal, inspect_initial, identity_from_spectrum)
+    _SC_CARRIER_KERNELS[id(mesh)] = cached
+    return cached
+
+
+_SC_DIAGONAL_KERNELS: dict[int, Callable] = {}
+
+
+def _sc_matrix_diagonal(H: jax.Array, *, mesh: Mesh) -> jax.Array:
+    """Replicated ``(nk, nb)`` real diagonal of an all-P SC matrix."""
+    fn = _SC_DIAGONAL_KERNELS.get(id(mesh))
+    if fn is None:
+        matrix_sh = NamedSharding(mesh, _band_rotation_spec())
+        spectrum_sh = NamedSharding(mesh, P(None, None))
+
+        @_functools.partial(
+            jax.jit, in_shardings=matrix_sh, out_shardings=spectrum_sh)
+        def _diagonal(A):
+            return jnp.real(jnp.diagonal(A, axis1=1, axis2=2))
+
+        fn = _diagonal
+        _SC_DIAGONAL_KERNELS[id(mesh)] = fn
+    return fn(H)
+
+
+def _terminal_replicate(x, mesh: Mesh):
+    """Gather one terminal result and restore the driver-facing layout.
+
+    This is intentionally not usable inside the SC loop.  The generic GW
+    output seam still consumes replicated matrices; gathering here, after the
+    last accepted map and artifact writes, preserves that public contract
+    without making it the fixed-point carrier contract.
+    """
+    if x is None:
+        return x
+    ndim = int(x.ndim) if hasattr(x, "ndim") else int(np.ndim(x))
+    if ndim == 0:
+        return x
+    host = gather_to_host(x) if isinstance(x, jax.Array) else np.asarray(x)
+    rep = NamedSharding(mesh, P(*([None] * ndim)))
+    return device_put_process_local(host, rep)
 
 
 _FIXED_SIGMA_ROTATE_CACHE: dict[tuple[int, tuple[int, ...]], Callable] = {}
@@ -1210,9 +1221,10 @@ def run_fixed_sigma_evsc(
 
     rotation_spec = _band_rotation_spec()
     matrix_sharding = NamedSharding(mesh_xy, rotation_spec)
-    ident = np.broadcast_to(
-        np.eye(nb, dtype=np.complex128)[None, :, :], (nk, nb, nb)).copy()
-    U_seed = _place(ident, mesh_xy, rotation_spec)
+    spectrum_sharding = NamedSharding(mesh_xy, P(None, None))
+    E_seed = device_put_process_local(e_dft_ry, spectrum_sharding)
+    from_diagonal, _, identity_from_spectrum = _sc_carrier_kernels(mesh_xy)
+    U_seed = identity_from_spectrum(E_seed)
     h0_dft = jnp.asarray(kin_ion_dft_ry) + jnp.asarray(v_h_dft)
     h0_dft = _place(h0_dft, mesh_xy, rotation_spec)
     sigma_c_dft = _place(
@@ -1278,12 +1290,14 @@ def run_fixed_sigma_evsc(
     # makes the first map evaluation exactly the requested one-shot
     # Sigma_mn(E_m^DFT)+Sigma_mn(E_n^DFT) construction, including inside a
     # degenerate DFT manifold where a generic eigh may choose another gauge.
-    H_seed_host = np.zeros((nk, nb, nb), dtype=np.complex128)
-    H_seed_host[:, np.arange(nb), np.arange(nb)] = e_dft_ry
-    H_seed = _place(H_seed_host, mesh_xy, rotation_spec)
+    H_seed = from_diagonal(E_seed)
+
+    def _matrix_layout(A):
+        with mesh_xy:
+            return jax.lax.with_sharding_constraint(A, matrix_sharding)
 
     def _eigh(H):
-        H = _place(H, mesh_xy, rotation_spec)
+        H = _matrix_layout(H)
         return _sc_eigh_bands(
             H, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
 
@@ -1298,7 +1312,7 @@ def run_fixed_sigma_evsc(
 
     def _fixed_map(H_dft):
         call_index = map_calls[0]
-        H_dft = _place(H_dft, mesh_xy, rotation_spec)
+        H_dft = _matrix_layout(H_dft)
         H_dft = 0.5 * (
             H_dft + jnp.conj(jnp.swapaxes(H_dft, -1, -2)))
         if call_index == 0:
@@ -1373,12 +1387,13 @@ def run_fixed_sigma_evsc(
             H_full + jnp.conj(jnp.swapaxes(H_full, -1, -2)))
         H_out, _ = _apply_scissor_partition_policy(
             H_full, e_dft_ry, valence_mask_kn, partition, kstar,
+            mesh_xy=mesh_xy,
             efermi_dft_ry=efermi_dft_scissor_ry,
             n_occ=n_occ,
             candidate_efermi_fn=_candidate_efermi,
             band_classes=band_classes,
             label="EQP2", print_fn=print_fn)
-        H_out = _place(H_out, mesh_xy, rotation_spec)
+        H_out = _matrix_layout(H_out)
         sanity.refuse_nonfinite(
             f"eqp2 H map call {call_index + 1}", H_out,
             print_fn=print_fn)
@@ -1440,7 +1455,7 @@ def run_fixed_sigma_evsc(
         def _residual_fn(H):
             call_index = residual_calls[0]
             H_in = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-            H_in = _place(H_in, mesh_xy, rotation_spec)
+            H_in = _matrix_layout(H_in)
             H_out, e_out, U_out, residual = _fixed_map(H_in)
             residual_calls[0] += 1
             role = ("initial" if call_index == 0 else
@@ -1458,7 +1473,7 @@ def run_fixed_sigma_evsc(
                     if residual_check <= tol_ev:
                         raise _EQP2Converged(
                             e_check, U_check, residual_check)
-            return _place(H_out - H_in, mesh_xy, rotation_spec)
+            return _matrix_layout(H_out - H_in)
 
         try:
             rcrop_nojit(
@@ -1494,16 +1509,11 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
     ``band_rotation_spec`` — no rank holds a full (nb, nb) of it, and
     the (nk, nb, nb) intermediate is sharded too.
 
-    ONLY THE RESULT IS PINNED REPLICATED, and it has to be: the SC carry
-    is ``kin_ion + this``, and ``_run_rcrop``, ``_run_linear_mixing`` and
-    ``_scissor_E_qp_for_outofrange`` all read the carry back on the host,
-    which raises the non-addressable-devices error on a sharded array at
-    P>1.  ``O_qp`` arrives replicated from ``compute_sigma_xc`` for the
-    same reason.  So this seam still holds two replicated (nk, nb, nb)
-    objects; what it no longer holds is the two U-shaped ones (U itself
-    and the rotation's intermediate), which is 2/4 of its former peak.
-    Making the carry itself distributed is a separate change and would
-    have to move those three host readbacks first.
+    The result stays at :func:`gw.qsgw_density.band_rotation_spec`, the
+    canonical SC Hamiltonian layout.  rCROP uses the same layout; scissor
+    fitting extracts only the replicated diagonal, and terminal writers use
+    one explicit gather after the accepted map.  No map evaluation gathers
+    this ``(nk, nb, nb)`` matrix.
 
     THIS REPLACES A GATHERED U, AND THAT WAS A DELIBERATE CHOICE ONCE.
     The previous form pinned U replicated and did the whole contraction
@@ -1532,7 +1542,7 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 
     out = rotate_band_matrix(O_qp, U, mesh=mesh, to_qp=False)
     return jax.lax.with_sharding_constraint(
-        out, NamedSharding(mesh, P(None, None, None)))
+        out, NamedSharding(mesh, _band_rotation_spec()))
 
 
 # ---------------------------------------------------------------------------
@@ -1926,9 +1936,9 @@ def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
     basis-normalisation slip, not physics.
 
     COST.  Four device reductions to ≤ 4 scalars, hence four host syncs
-    per iteration.  The iteration already synchronises three times
-    (``eigvalsh_kshard``, the k-star spread, the scissor's ``np.asarray``
-    of the H diagonal), so this adds reductions, not a new class of
+    per iteration.  The iteration already synchronises for the spectrum,
+    k-star spread, and the scissor's small replicated H diagonal, so this
+    adds reductions, not a new class of
     stall.  The diagonal is taken ON DEVICE: ``gw_jax`` writes
     ``np.diagonal(np.asarray(sigma_x))``, which pulls the whole
     (nk, nb, nb) to the host — 9.2 GB at nk=144/nb=2000 — and that would
@@ -1957,7 +1967,7 @@ def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
 
 
 def _report_extrapolation_eqp_shift(
-    H_extrap, H_unextrap, *, mesh_xy, n_occ, iteration, print_fn) -> None:
+    H_extrap, H_unextrap, *, inputs, n_occ, iteration, print_fn) -> None:
     """Diagonalize both Σ's H and report the correction AT THE EQP LEVEL.
 
     WHY A SECOND DIAGONALIZATION IS WORTH ITS COST.  The extrapolation report
@@ -1969,13 +1979,12 @@ def _report_extrapolation_eqp_shift(
     level, so the eqp level is what gets reported beside its un-extrapolated
     twin.
 
-    TWO DIAGONALIZATIONS, NOT FOUR.  Both are ``eigvalsh`` — eigenvalues only,
-    no eigenvectors, because nothing here feeds back into the iteration.  The
-    rejected alternative is diagonalizing each of the three band brackets and
-    extrapolating the EIGENVALUES, which is four diagonalizations AND is
-    wrong: eigenvalues are not linear in the matrix, so an extrapolated
-    spectrum is the spectrum of no Hamiltonian (see
-    ``band_extrapolation.extrapolation_weights``).
+    TWO DIAGONALIZATIONS, NOT FOUR.  Both route through the loop's one
+    ``distrib_la`` eigensystem door and discard the sharded eigenvectors.  A
+    local eigvalsh would duplicate its padding and layout policy.  The rejected
+    alternative is diagonalizing each of the three band brackets and
+    extrapolating the EIGENVALUES, which is four diagonalizations and is wrong:
+    eigenvalues are not linear in the matrix.
 
     THE H's HERE ARE PRE-PARTITION, and that is the right pair to compare.
     ``apply_band_partition`` masks off-diagonals of non-protected bands and
@@ -1985,9 +1994,13 @@ def _report_extrapolation_eqp_shift(
     two arms differing in exactly ONE thing, the band-sum tail in Σ_c, rather
     than also differing in a scissor refitted separately on each.
     """
-    _, eigvalsh = _kshard_eigh_kernels(mesh_xy, _band_rotation_spec())
-    e_ext = np.asarray(eigvalsh(H_extrap), dtype=np.float64) * RYD_TO_EV
-    e_n3 = np.asarray(eigvalsh(H_unextrap), dtype=np.float64) * RYD_TO_EV
+    def _spectrum(H):
+        return _sc_eigenvalues(
+            H, kind=inputs.eigh_kind, mesh_xy=inputs.mesh_xy,
+            config=inputs.config)
+
+    e_ext = np.asarray(_spectrum(H_extrap), dtype=np.float64) * RYD_TO_EV
+    e_n3 = np.asarray(_spectrum(H_unextrap), dtype=np.float64) * RYD_TO_EV
     d = e_ext - e_n3
     nb = e_ext.shape[1]
     n_occ = max(0, min(int(n_occ), nb))
@@ -2100,41 +2113,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # off-diagonals are not invariant under it.  Returning U = I
         # removes the dependence rather than relying on it.
         #
-        # The predicate below is EXACT (bitwise all-zero off-diagonal),
-        # not a tolerance, so it cannot fire on a carry that is merely
-        # nearly diagonal, and a non-finite diagonal makes the difference
-        # non-zero and falls through to eigh.  ``.real`` on the diagonal is
-        # exact for the only producer of iteration 0
-        # (``make_initial_state_from_dft`` writes a real diagonal).
-        H_np = np.asarray(state.H_qp_dft)
-        nb = H_np.shape[1]
-        diag = np.diagonal(H_np, axis1=1, axis2=2)
-        if not np.any(H_np - diag[:, :, None] * np.eye(nb)[None]):
-            E_np = np.ascontiguousarray(diag.real)
-            vbm = E_np[:, :n_occ].max()
-            cbm = E_np[:, n_occ:].min() if n_occ < nb else vbm
-            efermi_ry = 0.5 * (vbm + cbm)
-            rep2 = NamedSharding(inputs.mesh_xy, P(None, None))
-            # U AT band_rotation_spec, NOT REPLICATED.  This is the same
-            # (nk, nb, nb) object ``distributed_eigh_bands`` emits sharded
-            # at every iteration ≥ 1 (9.2 GB replicated at nb=2000/nk=144),
-            # and iteration 0 was the last producer still handing a
-            # replicated one to ``rotate_wavefunctions`` /
-            # ``qsgw_density.rotate_bands``.  Sharding it is free for both:
-            # ``rotate_bands`` takes this layout as-is (measured 115.7 ms
-            # against 117.6 ms replicated, same three collectives, argument
-            # 41 MiB against 44 MiB — job 7889424), and
-            # ``rotate_wavefunctions`` reshards to ``band_mix_spec``
-            # whichever it gets.  ``_rotate_to_dft_basis`` contracts in
-            # this layout directly and no longer gathers it.
-            # Process-local placement — see the H_qp_dft note above (same
-            # hidden assert_equal; same rank-invariance argument, and here
-            # each rank stages only its own nb²/(px·py) block).
-            E_qp_ry = device_put_process_local(E_np, rep2)
-            U_qp = device_put_process_local(
-                np.broadcast_to(
-                    np.eye(nb, dtype=np.complex128), H_np.shape),
-                NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
+        # The predicate is EXACT (bitwise zero off diagonal and real finite
+        # diagonal), not a tolerance.  Its reduction returns only one scalar;
+        # the diagonal is O(nk*nb), and the carrier never leaves its two-axis
+        # layout.  The canonical producer passes; a custom non-diagonal or
+        # non-finite iteration-zero state falls through to distrib_la.
+        _, inspect_initial, identity_from_spectrum = _sc_carrier_kernels(
+            inputs.mesh_xy)
+        E_initial, is_exact_diagonal = inspect_initial(state.H_qp_dft)
+        if bool(np.asarray(gather_to_host(is_exact_diagonal))):
+            E_qp_ry = E_initial
+            U_qp = identity_from_spectrum(E_initial)
+            efermi_ry = _midgap_efermi(E_qp_ry, n_occ)
     if E_qp_ry is None:
         # TWO INDEPENDENT DECISIONS, and they used to be one condition.
         #
@@ -2170,25 +2160,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # — 4.00 MiB → 1.00 MiB at nk=16/nb=128 on a 2×2 mesh (job
         # 7889423), and it is the (nk, nb, nb) object that reaches 9.2 GB
         # at nb=2000/nk=144.
-        nb_carry = int(state.H_qp_dft.shape[1])
-        eigh_kind = _resolve_sc_eigh(
-            nb_carry, inputs.mesh_xy, inputs.config,
-            print_fn=inputs.print_fn)
-        # ``<= 1``, NOT ``== 0``.  Iteration 0 reaches this block only when
-        # the carry is not exactly diagonal, which the canonical
-        # ``make_initial_state_from_dft`` never produces — so an
-        # ``== 0`` guard printed nothing on any real run (job 7890020,
-        # every arm).  Iteration 1 is the first that actually runs an
-        # eigh; both are allowed so a non-canonical initial carry still
-        # reports.
-        if state.iteration <= 1:
-            inputs.print_fn(
-                f"    SC eigh: {eigh_kind} (nb={nb_carry}, one (nb, nb) tile "
-                f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "
-                f"sc_eigh="
-                f"{getattr(getattr(inputs.config, 'sc', None), 'eigh', 'auto')})")
         E_qp_ry, U_qp = _sc_eigh_bands(
-            state.H_qp_dft, kind=eigh_kind, mesh_xy=inputs.mesh_xy,
+            state.H_qp_dft, kind=inputs.eigh_kind, mesh_xy=inputs.mesh_xy,
             config=inputs.config)
 
         if bool(getattr(inputs.config, "density_self_consistent", False)):
@@ -2698,7 +2671,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                     delta_h_dft_n3, scalar, transverse))
         _report_extrapolation_eqp_shift(
             H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
-            mesh_xy=inputs.mesh_xy, n_occ=n_occ,
+            inputs=inputs, n_occ=n_occ,
             iteration=state.iteration, print_fn=inputs.print_fn)
 
     if state.iteration == 0:
@@ -2741,6 +2714,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # exact rows selected above.
     H_qp_dft_new, scissor_fit = _apply_scissor_partition_policy(
         H_qp_dft_full, e_dft_act, val_mask, inputs.partition, ks,
+        mesh_xy=inputs.mesh_xy,
         efermi_dft_ry=float(inputs.efermi_dft_ry),
         n_occ=n_occ,
         candidate_efermi_fn=lambda H: _partitioned_candidate_efermi(
@@ -2748,6 +2722,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             use_mp1=entry_occ_state is not None),
         band_classes=scissor_classes,
         label="SC", print_fn=inputs.print_fn)
+    with inputs.mesh_xy:
+        H_qp_dft_new = jax.lax.with_sharding_constraint(
+            H_qp_dft_new,
+            NamedSharding(inputs.mesh_xy, _band_rotation_spec()))
     # THE STAR-SPREAD GATE, ON THE OBJECT THAT SHIPS.  It ran before the
     # partition until 2026-08-16, which certified a matrix the loop then
     # rewrote.  The partition is precisely the operation that could break the
@@ -2845,6 +2823,7 @@ def _scissor_E_qp_for_outofrange(
     in_range_mask: jax.Array,
     kstar,
     *,
+    mesh_xy: Mesh,
     band_classes=None,
     fermi_displacement_ry: float,
     print_fn=None,
@@ -2900,8 +2879,11 @@ def _scissor_E_qp_for_outofrange(
     if bool(in_range.all()):
         return e_dft_kn_ry, None
 
-    H_diag_np = np.real(np.asarray(jnp.diagonal(
-        H_qp_dft_full, axis1=1, axis2=2)))
+    # Only the O(nk*nb) diagonal is a host input to the fit.  The full
+    # Hamiltonian remains at band_rotation_spec on all P ranks.
+    H_diag_np = np.asarray(
+        _sc_matrix_diagonal(H_qp_dft_full, mesh=mesh_xy),
+        dtype=np.float64)
     in_range_kn = np.broadcast_to(
         in_range[None, :], e_dft_np.shape).astype(bool)
     # THE THREE-WAY CLASSIFICATION.  ``band_classes`` is None on an
@@ -2947,6 +2929,7 @@ def _apply_scissor_partition_policy(
     partition: BandPartition,
     kstar,
     *,
+    mesh_xy: Mesh,
     efermi_dft_ry: float,
     n_occ: int,
     candidate_efermi_fn: Callable[[jax.Array], float],
@@ -2966,6 +2949,7 @@ def _apply_scissor_partition_policy(
     scissor_provisional_ry, scissor_fit = _scissor_E_qp_for_outofrange(
         H_qp_dft_full, e_dft_kn_ry, valence_mask_kn,
         partition.in_range_mask, kstar,
+        mesh_xy=mesh_xy,
         band_classes=band_classes,
         fermi_displacement_ry=0.0,
         print_fn=print_fn,
@@ -3292,10 +3276,10 @@ def run_self_consistency(
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
 
-    The iteration carry holds only ``H_qp_dft``; convergence is judged
-    on the **eigenvalues** of consecutive H matrices (recomputed each
-    iteration via the same k-sharded eigvalsh kernel as the main map)
-    so the carry never gets out of sync with a separately-tracked E.
+    The iteration carry holds only ``H_qp_dft``; convergence is judged on
+    the **eigenvalues** of consecutive H matrices through the same
+    ``distrib_la`` route as the map, so no separately tracked E or local
+    eigensolver can drift from the carry.
 
     Parameters
     ----------
@@ -3326,7 +3310,10 @@ def run_self_consistency(
     """
     print_fn = inputs.print_fn
     _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
-    _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
+    def eigenvalues(H):
+        return _sc_eigenvalues(
+            H, kind=inputs.eigh_kind, mesh_xy=inputs.mesh_xy,
+            config=inputs.config)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
     _dump_dir = inputs.config.sc.dump_dir
@@ -3335,9 +3322,9 @@ def run_self_consistency(
     if max_iter == 1:
         state_new = gw_iteration_map(state_init, inputs)
         e_initial_ev = (
-            np.asarray(eigvalsh_kshard(state_init.H_qp_dft)) * RYD_TO_EV)
+            np.asarray(eigenvalues(state_init.H_qp_dft)) * RYD_TO_EV)
         e_new_ev = (
-            np.asarray(eigvalsh_kshard(state_new.H_qp_dft)) * RYD_TO_EV)
+            np.asarray(eigenvalues(state_new.H_qp_dft)) * RYD_TO_EV)
         rms = float(np.sqrt(np.mean((e_new_ev - e_initial_ev) ** 2)))
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
@@ -3362,7 +3349,7 @@ def run_self_consistency(
             state_init, inputs,
             max_iter=max_iter, tol_ev=tol_ev,
             history_depth=history_depth,
-            eigvalsh_kshard=eigvalsh_kshard,
+            eigenvalues=eigenvalues,
             print_fn=print_fn,
             dump_dir=_dump_dir,
         )
@@ -3370,7 +3357,7 @@ def run_self_consistency(
         return _run_linear_mixing(
             state_init, inputs,
             max_iter=max_iter, tol_ev=tol_ev, mixing=mixing,
-            eigvalsh_kshard=eigvalsh_kshard,
+            eigenvalues=eigenvalues,
             print_fn=print_fn,
             dump_dir=_dump_dir,
         )
@@ -3382,7 +3369,7 @@ def run_self_consistency(
 def _run_linear_mixing(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, mixing: float,
-    eigvalsh_kshard, print_fn, dump_dir,
+    eigenvalues, print_fn, dump_dir,
 ) -> tuple[SCState, list[float]]:
     """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
 
@@ -3394,7 +3381,7 @@ def _run_linear_mixing(
     """
     state = state_init
     rms_history: list[float] = []
-    E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
+    E_prev_ev = np.asarray(eigenvalues(state.H_qp_dft)) * RYD_TO_EV
     _e_history: list[np.ndarray] = [E_prev_ev.copy()]
     #: Map OUTPUTS (pre-mix candidates), which is what the eqp snapshots
     #: hold.  Separate from ``_e_history`` (accepted MIXED iterates) because
@@ -3425,7 +3412,7 @@ def _run_linear_mixing(
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
         E_candidate_ev = (
-            np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
+            np.asarray(eigenvalues(state_map.H_qp_dft)) * RYD_TO_EV)
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
         # evaluated point before constructing an unevaluated mixed candidate.
         # This is the state returned on convergence or budget exhaustion.
@@ -3449,7 +3436,7 @@ def _run_linear_mixing(
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
         )
-        E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
+        E_new_ev = np.asarray(eigenvalues(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new_ev.copy())
@@ -3514,7 +3501,7 @@ def _run_linear_mixing(
 def _run_rcrop(
     state_init: SCState, inputs: SCInputs, *,
     max_iter: int, tol_ev: float, history_depth: int,
-    eigvalsh_kshard, print_fn, dump_dir,
+    eigenvalues, print_fn, dump_dir,
 ) -> tuple[SCState, list[float]]:
     """rCROP (Anderson-style) accelerated fixed point.
 
@@ -3544,14 +3531,11 @@ def _run_rcrop(
     k-set, so under ``sc_on_ibz`` it is the IBZ: measured n = 163840
     (nk=10) against 262144 (nk=16) on mos2_4x4, job 7889876.
 
-    The accelerator's only collective is one (m+1, m+1) Gram; the update is
-    an elementwise combination over the history axis.  What is NOT free is
-    the seam here: ``gw_iteration_map`` needs a REPLICATED carry (it adds a
-    replicated ``kin_ion_dft`` and, at iteration 0, reads the carry on the
-    host to test exact diagonality), so ``residual_fn`` gathers one
-    (nk, nb, nb) per call and reshards the residual back.  Distributing the
-    carry itself is a separate change and needs that iteration-0 readback
-    (:628) and ``kin_ion``'s replicated load to move first.
+    The accelerator's only intentional collective is one (m+1, m+1) Gram;
+    the update is an elementwise combination over the history axis.  The
+    logical carry and padded history now share ``band_rotation_spec``: slicing
+    and padding change only the band extent, never the layout, so a map call
+    contains no Hamiltonian gather/reshard seam.
     """
     from mixing.acceleration import rcrop_nojit
 
@@ -3578,7 +3562,7 @@ def _run_rcrop(
     # Three separate claims, because they have three different answers:
     #
     #   1. THE PAD MODES ARE EXACTLY INERT.  H reaches ``gw_iteration_map``
-    #      and ``eigvalsh_kshard`` only at the LOGICAL extent
+    #      and the eigensystem service only at the LOGICAL extent
     #      (``_to_carry`` slices first), so no spurious zero eigenvalue is
     #      ever admitted to the RMS-ΔE history, and the pad zone is
     #      bit-for-bit 0.0 after 12 rCROP iterations — 60, 992 and 3072 pad
@@ -3653,20 +3637,21 @@ def _run_rcrop(
         f"{2.0 * history_depth * x0.nbytes / 2**30:.4f} GiB global / "
         f"{2.0 * history_depth * local_b / 2**30:.4f} GiB here")
 
-    # THE SEAM, and the only reshard in the loop.  History entries live at
-    # ``entry_sh`` at the PADDED band extent; ``gw_iteration_map`` needs the
-    # carry REPLICATED at the LOGICAL one.  The band extent is the only
-    # thing that crosses this seam — nk never changes, and at nb_pad == nb
-    # both directions collapse to exactly the pre-pad spelling.
+    # One layout at two extents.  History entries are padded; map entries are
+    # logical.  Slicing/padding stays at ``entry_sh`` and never routes through
+    # the replicated default of ``_place``.
     def _to_carry(A):
-        return _place(A if nb_pad == nb else A[:, :nb, :nb], mesh)
+        logical = A if nb_pad == nb else A[:, :nb, :nb]
+        with mesh:
+            return jax.lax.with_sharding_constraint(logical, entry_sh)
 
     def _to_entry(A):
-        return jax.device_put(_pad_bands(A), entry_sh)
+        with mesh:
+            return jax.lax.with_sharding_constraint(_pad_bands(A), entry_sh)
 
     # Bookkeeping for per-iteration printing + final SCOutputs capture.
     _e_history: list[np.ndarray] = [
-        np.asarray(eigvalsh_kshard(H0)) * RYD_TO_EV]
+        np.asarray(eigenvalues(H0)) * RYD_TO_EV]
     _last_outputs: list = [None]
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
@@ -3678,16 +3663,14 @@ def _run_rcrop(
         inputs.partition.in_range_mask, dtype=bool).reshape(-1)
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
-        # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
-        # (nk, nb, nb) per call and is the price of the map's replicated
-        # carry; the residual goes straight back to the entry layout, so the
-        # history never holds a replicated copy.
+        # SHARDED IN, SHARDED LOGICAL CARRY, SHARDED OUT.  Only the band
+        # extent changes at this boundary.
         H = _to_carry(H_in)
         # rCROP's mixing combinations don't preserve Hermitisation
         # exactly (numeric drift); re-Hermitise before feeding the
         # iteration map so eigh stays well-defined.
         H = 0.5 * (H + jnp.conj(jnp.swapaxes(H, -1, -2)))
-        E_in = np.asarray(eigvalsh_kshard(H)) * RYD_TO_EV
+        E_in = np.asarray(eigenvalues(H)) * RYD_TO_EV
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
         # ``gw_iteration_map`` reads ``state.iteration`` and
         # ``state.H_qp_dft`` and nothing else, so the previous result was
@@ -3712,7 +3695,7 @@ def _run_rcrop(
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         # Track per-call eigenvalue RMS so the user sees progress in the
         # same shape the linear path prints.
-        E_new = np.asarray(eigvalsh_kshard(state_out.H_qp_dft)) * RYD_TO_EV
+        E_new = np.asarray(eigenvalues(state_out.H_qp_dft)) * RYD_TO_EV
         # THE CRITERION: the fixed-point residual of THIS call, output
         # against that same call's input.  Not the difference between
         # successive accepted iterates -- under rCROP the accepted
@@ -3859,9 +3842,8 @@ def _run_rcrop(
     # Final state: use the last x from rCROP (Hermitised) and the last
     # captured SCOutputs so the writer downstream has the full
     # frequency-grid Σ_c, head pieces, etc.
-    # Back to the REPLICATED carry layout: every consumer of the returned
-    # state (``_scissor_E_qp_for_outofrange``, ``final_qp_eigenstates``,
-    # the h5 writers) reads it back on the host.
+    # Back to the logical band extent, still at the all-P carrier layout.
+    # Terminal writers gather only after the accepted map is complete.
     H_final = _to_carry(result.x)
     H_final = 0.5 * (H_final + jnp.conj(jnp.swapaxes(H_final, -1, -2)))
     state_final = SCState(
@@ -4266,7 +4248,7 @@ def run_sc_driver(
     # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
     # module indexes the ACTIVE window with a GLOBAL band count:
     # ``val_mask_active`` below, ``n_occ`` in ``gw_iteration_map``, the
-    # ``E[:, :n_occ]`` midgap in ``_diagonalize_and_get_efermi``, and the
+    # ``E[:, :n_occ]`` midgap in ``_midgap_efermi``, and the
     # ``fermi_level_step`` target in ``rebuild_hartree_dft_basis``.  All
     # four are ``meta.nelec``, which counts from band 0, while the window
     # starts at ``b0``.  They coincide only at ``b0 == 0``.  ``Meta`` fixes
@@ -4373,6 +4355,16 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
+    # The one large invariant input joins the carrier layout once, before any
+    # map call.  Every H assembly from here is canonical all-P arithmetic.
+    kin_ion = _place(kin_ion, mesh_xy, _band_rotation_spec())
+    eigh_kind = _resolve_sc_eigh(
+        int(nb_active), mesh_xy, config, print_fn=print_fn)
+    print_fn(
+        f"  SC eigh: {eigh_kind} (nb={int(nb_active)}, one (nb, nb) tile "
+        f"= {int(nb_active) * int(nb_active) * 16 / 2**20:.2f} MiB, "
+        f"sc_eigh={getattr(config.sc, 'eigh', 'auto')})")
+
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
         print_fn=print_fn)
@@ -4408,6 +4400,7 @@ def run_sc_driver(
         # One SC convention at both endpoints: fixed-band midgap on an
         # insulator, the existing initial fixed-N _mu_ry on a metal.
         efermi_dft_ry=efermi_dft_scissor_ry,
+        eigh_kind=eigh_kind,
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,
@@ -4510,6 +4503,7 @@ def run_sc_driver(
     if config.debug.write_wfn_h5:
         dump_qp_wfn_artifacts(
             state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+            eigh_kind=inputs.eigh_kind, config=config,
             kstar=kstar_io, state_on_ibz=kstar is not None,
             wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
             logical_band_stop=int(meta.b_id_4_user),
@@ -4578,7 +4572,6 @@ def run_sc_driver(
     sig_x = _rotate_to_dft_basis(sigma_result.sigma_x_kij_ry, U, mesh=mesh_xy)
     sigma_xc_dft = _rotate_to_dft_basis(
         sigma_result.sigma_xc_kij_ry, U, mesh=mesh_xy)
-    sigma_total = sigma_xc_dft + sig_h
     sigma_result_dft = dataclasses.replace(
         sigma_result,
         v_h_kij_ry=sig_h,
@@ -4628,6 +4621,36 @@ def run_sc_driver(
                        if sigma_result.efermi_dft_ev is not None
                        else float(wfn.efermi) * RYD_TO_EV),
     )
+
+    # Driver/output compatibility boundary.  Everything above, including all
+    # final QP->DFT rotations, stays on the all-P matrix layout.  The generic
+    # GW conditioning and writers below ``run_sc_driver`` are host-oriented,
+    # so gather each terminal matrix exactly once here rather than turning
+    # their replicated contract into the SC loop's carrier contract.
+    v_h_scalar_out = _terminal_replicate(
+        sigma_result_dft.v_h_scalar_kij_ry, mesh_xy)
+    h_transverse_out = _terminal_replicate(
+        sigma_result_dft.h_transverse_kij_ry, mesh_xy)
+    sig_h_out = (v_h_scalar_out if h_transverse_out is None
+                 else v_h_scalar_out + h_transverse_out)
+    sigma_xc_out = _terminal_replicate(
+        sigma_result_dft.sigma_xc_kij_ry, mesh_xy)
+    sigma_total = sigma_xc_out + sig_h_out
+    sigma_result_dft = dataclasses.replace(
+        sigma_result_dft,
+        v_h_kij_ry=sig_h_out,
+        v_h_scalar_kij_ry=v_h_scalar_out,
+        h_transverse_kij_ry=h_transverse_out,
+        sigma_x_kij_ry=_terminal_replicate(
+            sigma_result_dft.sigma_x_kij_ry, mesh_xy),
+        sigma_xc_kij_ry=sigma_xc_out,
+        sigma_sx_kij_ry=_terminal_replicate(
+            sigma_result_dft.sigma_sx_kij_ry, mesh_xy),
+        sigma_coh_kij_ry=_terminal_replicate(
+            sigma_result_dft.sigma_coh_kij_ry, mesh_xy),
+        sigma_xc_kij_ry_unextrap=_terminal_replicate(
+            sigma_result_dft.sigma_xc_kij_ry_unextrap, mesh_xy),
+    )
     return SCDriverResult(
         sigma_result_dft=sigma_result_dft,
         sigma_total_dft=sigma_total,
@@ -4640,6 +4663,7 @@ def run_sc_driver(
 
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
+    eigh_kind: str, config,
     state_capacity: float | None = None,
     clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -4661,21 +4685,10 @@ def final_qp_eigenstates(
     eigenvalues, so the midgap over the IBZ and over the full BZ are the
     same number.
 
-    Returned arrays are host-side numpy (not jax.Array) since the
-    typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
-    NumPy.  Use this once after :func:`run_self_consistency` to extract
-    the (E_qp_ry, U_qp, efermi_ry) needed for downstream rotation +
-    serialisation.
-
-    THE ONE PLACE THAT KEEPS THE REPLICATED U, deliberately.  The SC loop
-    asks ``_diagonalize_and_get_efermi`` for U at
-    ``qsgw_density.band_rotation_spec`` because its consumers are device
-    rotations; this function's only consumers are ``np.asarray`` two lines
-    below and the two h5py writers behind it, which need the whole
-    ``(nk, nb, nb)`` on the host on rank 0 whatever the device layout is.
-    Sharding U here would buy nothing and add a gather, and the host read
-    would then need the same guard ``gw_iteration_map``'s k-star broadcast
-    carries.
+    Returned arrays are host-side NumPy because the only consumers are the
+    terminal h5py writers.  The eigensolve still uses the loop's resolved
+    ``distrib_la`` route and emits U at ``band_rotation_spec``; the sanctioned
+    collective gather occurs only after that solve.
 
     Returns
     -------
@@ -4683,8 +4696,10 @@ def final_qp_eigenstates(
     U_kmn     : (nk, nb_active, nb_active) complex128, ``U[k, m, n] = ⟨DFT_m | QP_n⟩``
     efermi_ry : float, midgap of the converged eigenvalues
     """
-    E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
-        state.H_qp_dft, n_occ, mesh_xy)
+    E_ry, U = _sc_eigh_bands(
+        state.H_qp_dft, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
+    efermi_ry = _midgap_efermi(E_ry, n_occ)
+    E_host = np.asarray(E_ry, dtype=np.float64)
     # ONE omega reference, fifth site (the final writers): the midgap rule
     # is the insulating convention. A metallic run's eqp/sigma writers
     # evaluated Sigma_c at midgap — 2.66 eV above the loop's fixed-N mu on
@@ -4701,7 +4716,7 @@ def final_qp_eigenstates(
                 "state_capacity (spin_degeneracy_factor(wfn)) to place the "
                 "final mu; got None. The caller has the WFN in scope.")
         from .efermi import solve_mp1_occupations
-        _E_np = np.asarray(E_ry, dtype=np.float64)
+        _E_np = E_host
         _st = state.occupation_state
         _mu_ry, _ = solve_mp1_occupations(
             _E_np,
@@ -4718,8 +4733,8 @@ def final_qp_eigenstates(
         )
         efermi_ry = float(_mu_ry)
     return (
-        np.asarray(E_ry, dtype=np.float64),
-        np.asarray(U, dtype=np.complex128),
+        E_host,
+        np.asarray(gather_to_host(U), dtype=np.complex128),
         float(efermi_ry),
     )
 
@@ -4863,6 +4878,8 @@ def dump_qp_wfn_artifacts(
     state: SCState, *,
     n_occ: int,
     mesh_xy: Mesh,
+    eigh_kind: str,
+    config,
     kstar=None,                          # IBZ <-> full BZ map (KStarMap)
     state_on_ibz: bool = False,          # k-set ``state.H_qp_dft`` is on
     wfn,                                 # WFNReader (source of base coeffs + crystal)
@@ -4957,6 +4974,7 @@ def dump_qp_wfn_artifacts(
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
         state, n_occ=n_occ, mesh_xy=mesh_xy,
+        eigh_kind=eigh_kind, config=config,
         state_capacity=float(spin_degeneracy_factor(wfn)),
         clamp_tol=float(clamp_tol))
     enk_full_ry, U_full = _loop_arrays_on_full_bz(

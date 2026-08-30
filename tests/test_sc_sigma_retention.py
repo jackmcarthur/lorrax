@@ -174,7 +174,7 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
         H_qp_dft=jnp.zeros((1, 1, 1), dtype=jnp.complex128), iteration=0)
     final, _ = sc_iteration._run_linear_mixing(
         initial, inputs, max_iter=1, tol_ev=1.0e-12, mixing=0.25,
-        eigvalsh_kshard=lambda H: jnp.real(H[..., 0]),
+        eigenvalues=lambda H: jnp.real(H[..., 0]),
         print_fn=lambda *_args: None, dump_dir=None)
 
     np.testing.assert_array_equal(np.asarray(final.H_qp_dft), 0.0)

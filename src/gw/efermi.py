@@ -25,8 +25,8 @@ OPERANDS.  ``E_kn`` is the device operand.  ``kweights`` is a k-table of
 ``n_k`` numbers, built once per run, and stays host numpy — passed into
 the kernel as an argument, so no recompilation per call.
 
-WHY THIS IS ITS OWN MODULE.  ``sc_iteration._diagonalize_and_get_efermi``
-computes a midgap E_F from a FIXED integer ``n_occ``, i.e. it assumes band
+WHY THIS IS ITS OWN MODULE.  ``sc_iteration._midgap_efermi`` computes a
+midgap E_F from a FIXED integer ``n_occ``, i.e. it assumes band
 ``n_occ`` is the last occupied one at EVERY k and ignores the k-weights.
 That is right for a gapped insulator on a uniform grid and wrong for a
 metal, for a semimetal, and for any k-set with non-uniform weights — which
@@ -615,7 +615,7 @@ def fermi_level_step(E_kn, kweights, n_occ_bands: float) -> float:
           the VBM energy would then make ``E < E_F`` EXCLUDE the VBM and
           undercount by one band, so E_F is placed at the midpoint of the
           VBM and the next state up (the CBM).  That is also the
-          convention ``sc_iteration._diagonalize_and_get_efermi`` uses
+          convention ``sc_iteration._midgap_efermi`` uses
           (``0.5·(vbm + cbm)``), so the two agree on the case they share.
 
     Raises

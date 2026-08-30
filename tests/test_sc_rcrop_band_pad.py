@@ -81,13 +81,87 @@ def test_the_pad_goes_through_the_shared_helper():
 def test_the_carry_reaches_the_map_at_the_logical_extent():
     """THE correctness condition for the pad, and it is not about memory.
 
-    ``gw_iteration_map`` and ``eigvalsh_kshard`` must never see the padded
+    ``gw_iteration_map`` and the spectrum service must never see the padded
     H.  A zero-padded Hermitian matrix has (nb_pad - nb) extra EXACT-ZERO
     eigenvalues, and ``eigvalsh`` would fold them into the RMS-DeltaE
     history and into any occupation/E_F logic downstream -- a wrong number,
     not a gauge shift.  ``_to_carry`` slicing is what prevents it.
     """
     assert "A[:, :nb, :nb]" in _RCROP
+
+
+def test_the_logical_carry_never_crosses_a_replicated_place_seam():
+    """History and map carry share the canonical two-band-axis layout."""
+    carry = _RCROP[_RCROP.index("def _to_carry("):
+                    _RCROP.index("# Bookkeeping", _RCROP.index("def _to_carry("))]
+    assert "_place(" not in carry
+    assert "with_sharding_constraint" in carry
+    assert "entry_sh" in carry
+
+
+def test_rcrop_returns_the_canonical_logical_carry():
+    tail = _RCROP[_RCROP.index("# Final state:"):]
+    assert "H_final = _to_carry(result.x)" in tail
+    assert "_place(H_final" not in tail
+
+
+def test_kin_ion_joins_the_carrier_layout_once_before_the_loop():
+    driver = _block("run_sc_driver")
+    placement = "kin_ion = _place(kin_ion, mesh_xy, _band_rotation_spec())"
+    assert driver.count(placement) == 1
+    assert driver.index(placement) < driver.index("inputs = SCInputs(")
+
+
+def test_iteration_zero_does_not_fetch_the_matrix_carrier():
+    iteration = _block("gw_iteration_map")
+    assert "np.asarray(state.H_qp_dft)" not in iteration
+    assert "inspect_initial(state.H_qp_dft)" in iteration
+
+
+def test_no_map_or_accelerator_seam_stages_the_matrix_on_host():
+    """Audit the exact three boundaries that execute once per map call."""
+    for name in ("gw_iteration_map", "_run_linear_mixing", "_run_rcrop"):
+        body = _block(name)
+        assert "process_allgather" not in body
+        assert "gather_to_host(state" not in body
+        assert "np.asarray(state" not in body
+        assert "_place(state" not in body
+    iteration = _block("gw_iteration_map")
+    # The only explicit gather in the map is one scalar exact-diagonal bit.
+    assert iteration.count("gather_to_host(") == 1
+    assert "gather_to_host(is_exact_diagonal)" in iteration
+
+
+def test_matrix_np_asarray_sites_are_only_replicated_spectra():
+    """H remains an argument to distrib_la; only its O(nk*nb) E is read."""
+    for name in ("run_self_consistency", "_run_linear_mixing", "_run_rcrop"):
+        body = _block(name)
+        for line in body.splitlines():
+            if "np.asarray(eigenvalues(" in line:
+                assert ".H_qp_dft" in line or "eigenvalues(H" in line
+        assert "np.asarray(H" not in body
+
+
+def test_terminal_matrix_gathers_follow_the_accepted_map_and_final_rotations():
+    driver = _block("run_sc_driver")
+    accepted = driver.index("state_final, rms_history = run_self_consistency(")
+    artifact = driver.index("dump_sigma_omega_h5_final(", accepted)
+    rotate = driver.index("# Rotate every QP-basis SigmaResult field", artifact)
+    boundary = driver.index("# Driver/output compatibility boundary", rotate)
+    gather = driver.index("_terminal_replicate(", boundary)
+    returned = driver.index("return SCDriverResult(", gather)
+    assert accepted < artifact < rotate < boundary < gather < returned
+    assert "_terminal_replicate(" not in driver[accepted:boundary]
+
+
+def test_distrib_la_is_the_only_repeated_diagonalization_owner():
+    src = _SRC
+    assert "def _make_kshard_eigh(" not in src
+    assert "def _kshard_eigh_kernels(" not in src
+    assert "jnp.linalg.eigh" not in src
+    assert "jnp.linalg.eigvalsh" not in src
+    spectrum = _block("_sc_eigenvalues")
+    assert spectrum.count("_sc_eigh_bands(") == 1
 
 
 def test_the_tolerance_is_built_from_the_logical_element_count():

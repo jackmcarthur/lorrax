@@ -1499,9 +1499,9 @@ def rotate_wavefunctions(
     What arrives already sharded is the CALLER's half of this.  A
     replicated ``U`` costs nothing extra here (the constraint is a local
     slice) but was replicated before the call; ``sc_iteration`` can hand
-    over a distributed one by asking ``_make_kshard_eigh`` for
-    ``u_spec=qsgw_density.band_rotation_spec()``, which it already
-    supports, or by using ``distributed_eigh_bands``, which emits it.
+    over a distributed one through ``distributed_eigh_bands``; both its
+    native batch-reshard and distributed routes emit
+    ``qsgw_density.band_rotation_spec()``.
 
     Active / inactive partition
     ---------------------------
