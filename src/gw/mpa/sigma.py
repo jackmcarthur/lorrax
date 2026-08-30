@@ -36,17 +36,43 @@ def _bounded_pole_batch_size(value):
 
 
 def _batch_rows(row, batch):
+    """Relocalize one window's pole ranges into a fixed batch-width carrier.
+
+    The tau kernel's executable signature must not depend on how many poles a
+    particular pane/product window selects.  Inactive rows therefore occupy
+    the remaining batch slots with an impossible ``a`` interval.  All windows
+    over a resident batch then call the same jitted callable with identical
+    shapes, dtypes, and shardings; only the selector values change.
+    """
+    batch = tuple(int(p) for p in batch)
     local = {int(p): i for i, p in enumerate(batch)}
     keep = [i for i, p in enumerate(row.pole_indices) if int(p) in local]
     if not keep:
         return None
-    state_indices = getattr(row, "state_indices", None)
+    capacity = len(batch)
+    if len(keep) > capacity:
+        raise ValueError(
+            "one MPA window selects a resident pole more than once; "
+            f"{len(keep)} selector rows exceed batch width {capacity}")
+    count = len(keep)
+    pole_indices = np.zeros(capacity, dtype=np.int32)
+    pole_indices[:count] = [local[int(row.pole_indices[i])] for i in keep]
+    # ``a > +inf`` is false for every finite pole.  Keeping all six values
+    # finite-or-infinite (never NaN) also makes the inactive path harmless
+    # under XLA predicate motion.
+    bounds = np.broadcast_to(
+        np.asarray((np.inf, -np.inf, np.inf, np.inf, -np.inf, -np.inf),
+                   np.float64),
+        (capacity, 6),
+    ).copy()
+    bounds[:count] = np.asarray(row.bounds[keep], np.float64)
+    phase_real = np.zeros(capacity, dtype=bool)
+    phase_real[:count] = np.asarray(row.phase_real[keep], bool)
     return (
-        np.asarray([local[int(row.pole_indices[i])] for i in keep], np.int32),
-        np.asarray(row.bounds[keep], np.float64),
-        np.asarray(row.phase_real[keep], bool),
-        (None if state_indices is None else
-         np.asarray(state_indices[keep], np.int32)),
+        pole_indices,
+        bounds,
+        phase_real,
+        None,
     )
 
 
@@ -201,9 +227,8 @@ def _integrate_sigma_batches(
         f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
         f"({n_poles} poles, batches of {batch_size}); "
         f"{direct_terms} direct terms in {direct_frequency_dispatches} "
-        f"frequency dispatches; equal-tau fusion saved "
-        f"{transform_saving} Sigma back-transforms "
-        f"through the shared pane tau kernel")
+        f"frequency dispatches; {transform_saving} undispatched logical tau; "
+        f"panes and product windows used one shared tau kernel")
     return SigmaOmegaResult(
         omega_ry=omega,
         omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
@@ -347,8 +372,7 @@ def compute_sigma_c_mpa_omega_grid(
     Pole tensors are read collectively in their native sharding. Both
     planners retain only bounded host geometry from each configured pole
     batch. The spatial executor then rereads and releases the same pole
-    ranges, retaining only projected Sigma(tau) partial sums when delivered
-    equal-tau groups span more than one batch.
+    ranges through the one pane/product-window tau kernel.
     """
     ledger = validate_fit_store(
         fit_src, expected_identity=fit_identity,
