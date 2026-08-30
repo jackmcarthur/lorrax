@@ -139,9 +139,10 @@ def test_the_three_absorbed_modules_all_import_clean():
 def test_the_injected_quadrature_keeps_psp_out_of_the_import_graph():
     """WAVE1_BRIEF ruling 4, observed rather than described.
 
-    ``check_density_symmetries`` grew keyword-only ``valence_density_fn`` /
-    ``spin_degeneracy_fn`` whose ``None`` default preserves the lazy
-    ``psp.get_DFT_mtxels`` import verbatim.  The claim is that BINDING the
+    ``check_density_symmetries`` has keyword-only ``valence_density_fn``,
+    ``spin_degeneracy_fn`` and ``spin_density_fields_fn`` parameters whose
+    ``None`` defaults preserve lazy ``psp.get_DFT_mtxels`` imports.  The
+    claim is that BINDING the
     function — reading its signature, which is what a caller wiring the
     injection does — costs no psp import.  Asserted in the isolated child,
     where a psp import would be an ``ImportError`` and not a silent success.
@@ -155,8 +156,12 @@ def test_the_injected_quadrature_keeps_psp_out_of_the_import_graph():
                  "p = inspect.signature(S.check_density_symmetries).parameters\n"
                  "assert 'valence_density_fn' in p, sorted(p)\n"
                  "assert 'spin_degeneracy_fn' in p, sorted(p)\n"
+                 "assert 'spin_density_fields_fn' in p, sorted(p)\n"
                  "assert p['valence_density_fn'].default is None\n"
+                 "assert p['spin_density_fields_fn'].default is None\n"
                  "assert p['valence_density_fn'].kind is "
+                 "inspect.Parameter.KEYWORD_ONLY\n"
+                 "assert p['spin_density_fields_fn'].kind is "
                  "inspect.Parameter.KEYWORD_ONLY\n")
     assert run.loaded == ()
 

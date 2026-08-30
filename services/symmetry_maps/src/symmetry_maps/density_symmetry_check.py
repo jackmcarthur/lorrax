@@ -619,15 +619,19 @@ def _spin_resolved_density(psi_box: np.ndarray, *, nocc: int, weight: float,
                            cell_volume: float, spin_degeneracy: float,
                            band_occupations: np.ndarray | None,
                            want_transverse: bool,
-                           valence_density_fn=None):
+                           valence_density_fn=None,
+                           spin_density_fields_fn=None):
     """``(ρ_k, m_k)`` for one k, both weighted by ``weight``.
 
-    Every component goes through
+    The two-component path goes through ONE call to
     :func:`psp.get_DFT_mtxels.valence_density_from_kpoint` — the single
     source of truth for the density quadrature (ortho IFFT × √(N/Ω)) —
-    so this cannot drift from the production ρ used for V_H.
-    ``valence_density_fn`` is that function, injected; ``None`` imports it
-    lazily, exactly as this module always has.  See
+    requesting its local ``rho_ab = sum psi_a psi_b*`` return, then through
+    :func:`psp.get_DFT_mtxels.spin_density_matrix_to_pauli_fields` for the
+    Pauli contraction.  Thus charge and all three spin components share one
+    IFFT, while neither normalization nor the sigma-y convention is
+    reimplemented in this service.  Both callables are injectable; ``None``
+    imports each lazily only when used.  See
     :func:`check_density_symmetries` for why the injection exists and why
     the default is the import.
 
@@ -640,23 +644,13 @@ def _spin_resolved_density(psi_box: np.ndarray, *, nocc: int, weight: float,
         m_y = ψ†σ_y ψ  = −i a*b + i b*a   = 2·Im(a* b)
         m_z = ψ†σ_z ψ  = |a|² − |b|²
 
-    Writing ``D(·)`` for the imported quadrature (which is linear in
-    ``|·|²`` and sums over whatever spinor axis it is handed), the four
-    components follow from it alone — no second quadrature is written
-    anywhere in LORRAX:
-
-        ρ   = D(a) + D(b)
-        m_z = D(a) − D(b)
-        m_x = D(a + b)  − ρ     since |a+b|²  = ρ + 2Re(a*b) = ρ + m_x
-        m_y = ρ − D(a + ib)     since |a+ib|² = ρ − 2Im(a*b) = ρ − m_y
-
-    (``|a+ib|² = |a|² + |b|² + 2Re(a*·ib) = ρ + 2Re(i a*b) = ρ − 2Im(a*b)``.)
-    Cost: 4 quadrature calls instead of the 2 a bespoke kernel would
-    need — the deliberate price of having exactly one FFT-normalisation
-    convention in the code base.
-
     ``m`` is None when the wavefunctions are scalar (``nspinor == 1``),
     where no magnetization density is representable at all.
+
+    Four-component kinetic-balance files retain the incumbent upper-Pauli
+    diagnostic below.  The new matrix API intentionally refuses them rather
+    than silently choosing a relativistic spin operator; that convention is
+    outside this raw-IBZ symmetry check's ownership.
     """
     if valence_density_fn is None:
         from psp.get_DFT_mtxels import valence_density_from_kpoint as _D
@@ -675,6 +669,28 @@ def _spin_resolved_density(psi_box: np.ndarray, *, nocc: int, weight: float,
     if ns == 1:
         return dens(psi_box), None
 
+    if ns == 2:
+        kwargs = dict(nocc=nocc, weight=weight,
+                      cell_volume=cell_volume,
+                      spin_degeneracy=spin_degeneracy,
+                      return_spin_density_matrix=True)
+        if band_occupations is not None:
+            kwargs["band_occupations"] = band_occupations
+        rho_ab = _D(psi_box, **kwargs)
+        if spin_density_fields_fn is None:
+            from psp.get_DFT_mtxels import (
+                spin_density_matrix_to_pauli_fields as _to_fields,
+            )
+        else:
+            _to_fields = spin_density_fields_fn
+        fields = np.asarray(_to_fields(rho_ab), dtype=np.float64)
+        rho = fields[0]
+        m = np.array(fields[1:], copy=True)
+        if not want_transverse:
+            m[:2] = 0.0
+        return rho, m
+
+    # Compatibility path for four-component kinetic-balance diagnostics.
     a = psi_box[:, 0:1]
     b = psi_box[:, 1:2]
     d_a = dens(a)
@@ -701,6 +717,7 @@ def check_density_symmetries(
     want_transverse: bool = True,
     valence_density_fn=None,
     spin_degeneracy_fn=None,
+    spin_density_fields_fn=None,
 ) -> DensitySymmetryReport:
     """Measure TRS + the spatial symmetry table against ρ built from ψ.
 
@@ -738,6 +755,9 @@ def check_density_symmetries(
     ``spin_degeneracy_fn``
         ``spin_degeneracy_factor(loader) -> float``.  Same contract, same
         default, same lazy import.
+    ``spin_density_fields_fn``
+        ``spin_density_matrix_to_pauli_fields(rho_ab)``.  Used only for a
+        two-component spinor file and likewise lazy-imported by default.
 
     Ruling 4 is a COMPAT DEFAULT by construction: every call site in the
     tree passes neither, so every call site is unchanged and runs the same
@@ -831,7 +851,8 @@ def check_density_symmetries(
                     band_occupations=(occupation_weights[
                         int(ik), b_lo:b_hi] * band_mask),
                     want_transverse=want_transverse,
-                    valence_density_fn=valence_density_fn)
+                    valence_density_fn=valence_density_fn,
+                    spin_density_fields_fn=spin_density_fields_fn)
                 t_quad += time.perf_counter() - t
                 r += r_chunk
                 if m_chunk is not None:
@@ -852,7 +873,8 @@ def check_density_symmetries(
             cell_volume=cell_volume, spin_degeneracy=f_spin,
             band_occupations=None,
             want_transverse=want_transverse,
-            valence_density_fn=valence_density_fn)
+            valence_density_fn=valence_density_fn,
+            spin_density_fields_fn=spin_density_fields_fn)
         t_quad += time.perf_counter() - t
         rho_k[int(ik)] = r
         if m is not None:
@@ -1089,6 +1111,7 @@ def cached_density_symmetry_check(
     *,
     valence_density_fn=None,
     spin_degeneracy_fn=None,
+    spin_density_fields_fn=None,
 ) -> DensitySymmetryReport | None:
     """Run (or replay) the check for ``loader``; honours the env switches.
 
@@ -1098,7 +1121,8 @@ def cached_density_symmetry_check(
     failures degrade to a warning plus the permissive (status-quo)
     verdict.
 
-    ``valence_density_fn`` / ``spin_degeneracy_fn`` are handed straight to
+    ``valence_density_fn`` / ``spin_degeneracy_fn`` /
+    ``spin_density_fields_fn`` are handed straight to
     :func:`check_density_symmetries`; see its docstring for the
     non-circularity argument they preserve.  They are deliberately NOT in
     :func:`_cache_key`: the key identifies the FILE and the tolerances,
@@ -1125,7 +1149,8 @@ def cached_density_symmetry_check(
         rep = check_density_symmetries(
             loader, tol_trs=tol_trs, tol_spatial=tol_spatial, max_k=max_k,
             valence_density_fn=valence_density_fn,
-            spin_degeneracy_fn=spin_degeneracy_fn)
+            spin_degeneracy_fn=spin_degeneracy_fn,
+            spin_density_fields_fn=spin_density_fields_fn)
     except Exception as exc:                      # pragma: no cover - guard
         if mode == "strict":
             raise

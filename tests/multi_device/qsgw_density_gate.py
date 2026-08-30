@@ -42,6 +42,7 @@ from gw.qsgw_density import (rho_from_wfns, rho_r_to_G,          # noqa: E402
                              symmetrise_density,
                              hartree_from_orbitals)
 from psp.get_DFT_mtxels import (valence_density_from_kpoint,    # noqa: E402
+                                spin_density_matrix_to_pauli_fields,
                                 compute_local_V_k)
 from common.mtxel_sweep import (SweepGeometry,                  # noqa: E402
                                 local_potential_operator,
@@ -152,6 +153,22 @@ def main():
     ok3 = (d_k / s_k) <= RTOL
     p0(f"[qd] 3. vs valence_density_from_kpoint  rel {d_k / s_k:.3e}  "
        f"{'PASS' if ok3 else 'FAIL'}")
+
+    # ---- 3b. raw spin-density matrix from the resident sharded scan -----
+    raw_kw = {k: v for k, v in kw.items() if k != "sym_perm"}
+    rho_ab_j = rho_from_wfns(
+        psi_j, occ, kweights, return_spin_density_matrix=True, **raw_kw)
+    matrix_spec = rho_ab_j.sharding.spec
+    rho_ab = np.asarray(rho_ab_j)
+    fields = np.asarray(spin_density_matrix_to_pauli_fields(rho_ab))
+    herm = np.array_equal(rho_ab[1, 0], np.conj(rho_ab[0, 1]))
+    d_spin_charge = float(np.max(np.abs(fields[0] - rho_ref))) / scale
+    ok3b = (rho_ab.shape == (2, 2, *GRID)
+            and matrix_spec == P(None, None, None, None, None)
+            and herm and d_spin_charge <= RTOL)
+    p0(f"[qd] 3b. resident rho_ab shape={rho_ab.shape} spec={matrix_spec} "
+       f"exact-Hermitian={herm} charge-rel={d_spin_charge:.3e}  "
+       f"{'PASS' if ok3b else 'FAIL'}")
 
     # ---- 4. negative control: a general U MUST move rho -----------------
     U_gen = np.stack([_haar(rng, NB) for _ in range(NK)])
@@ -346,7 +363,7 @@ def main():
     p0(f"[qd] rho(G=0) = {complex(np.asarray(rho_G).ravel()[0]):.6e} "
        f"(= sum_r rho = {float(rho_ref.sum()):.6e})")
 
-    ok = (ok1 and ok2 and ok3 and ok4 and ok4b and ok5 and ok5b
+    ok = (ok1 and ok2 and ok3 and ok3b and ok4 and ok4b and ok5 and ok5b
           and ok6 and ok6b and ok7 and ok8 and ok9 and ok10)
     p0(f"[qd] VERDICT {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

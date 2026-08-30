@@ -363,7 +363,8 @@ def symmetrise_density(rho_r, sym_perm):
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
                   U=None, sym_perm=None, include_dirac_current: bool = False,
-                  charge_nspinor: int | None = None):
+                  charge_nspinor: int | None = None,
+                  return_spin_density_matrix: bool = False):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
@@ -394,9 +395,19 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     continue to use the full four-spinor.  The local contraction is shared
     with :func:`psp.get_DFT_mtxels.valence_density_from_kpoint`.
 
+    ``return_spin_density_matrix=True`` requires two-component Pauli
+    spinors and returns raw
+    ``rho_ab(r)=sum_kn w_k f_nk psi_kna(r) psi_knb(r)*`` from the same scan.
+    It refuses
+    ``sym_perm`` because a scalar pullback cannot supply the spin rotation,
+    axial parity, or antiunitary action.  The symmetry service can apply
+    those operations to this raw matrix without duplicating the density
+    build.
+
     Returns
     -------
-    (nx, ny, nz) or (4, nx, ny, nz) float64, replicated.
+    ``(nx,ny,nz)`` or ``(4,nx,ny,nz)`` float64, or
+    ``(2,2,nx,ny,nz)`` complex128 in spin-matrix mode; replicated.
 
     NORMALISATION is term-for-term ``psp.get_DFT_mtxels.
     valence_density_from_kpoint``: ψ_r = ifftn(box, 'ortho')·√(N/Ω), so
@@ -431,6 +442,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
 
     psi = jnp.asarray(psi_G, dtype=jnp.complex128)
     include_current = bool(include_dirac_current)
+    return_spin_matrix = bool(return_spin_density_matrix)
     ns = int(psi.shape[2])
     charge_ns = ns if charge_nspinor is None else int(charge_nspinor)
     if not 0 < charge_ns <= ns:
@@ -447,6 +459,24 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             "cannot rotate a polar current. Build the full-BZ four-current "
             "with uniform weights, then call "
             "symmetry_maps.project_polar_fft_field on its spatial rows.")
+    if return_spin_matrix and include_current:
+        raise ValueError(
+            "rho_from_wfns: return_spin_density_matrix and "
+            "include_dirac_current are mutually exclusive")
+    if return_spin_matrix and ns != 2:
+        raise ValueError(
+            "rho_from_wfns: spin-density matrix requires exactly "
+            f"two-component Pauli spinors; got nspinor={ns}")
+    if return_spin_matrix and charge_nspinor is not None:
+        raise ValueError(
+            "rho_from_wfns: charge_nspinor does not apply to the complete "
+            "two-component spin-density matrix")
+    if return_spin_matrix and sym_perm is not None:
+        raise ValueError(
+            "rho_from_wfns: sym_perm is a scalar-density projector and "
+            "cannot act on rho_ab. Request the raw matrix with "
+            "sym_perm=None, then apply the canonical spinor/axial/TR "
+            "symmetry action.")
     p_prod = spec_divisor(mesh, _band_spec(), 1)
     _pad = pad_axis(psi, p_prod, axis=1)
     psi, nb_logical = _pad.array, _pad.logical   # LOGICAL, by name
@@ -471,8 +501,9 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         U_j = jnp.zeros((1, 1, 1), dtype=jnp.complex128)   # unused operand
 
     w_np = np.asarray(kweights, dtype=np.float64)
-    if sym_perm is None and w_np.size > 1 and not np.allclose(
-            w_np, w_np[0], rtol=0, atol=1e-12):
+    if (not return_spin_matrix and sym_perm is None and w_np.size > 1
+            and not np.allclose(
+                w_np, w_np[0], rtol=0, atol=1e-12)):
         raise ValueError(
             f"rho_from_wfns: kweights are non-uniform "
             f"(min {w_np.min():.6g}, max {w_np.max():.6g}), so this k-set is "
@@ -490,9 +521,11 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     box_spec = P(None, ("x", "y"), None, None, None, None)
     ifftn = make_sharded_ifftn_3d(mesh, box_spec, box_spec,
                                   norm="ortho", axes=(-3, -2, -1))
-    field_shape = ((4, *grid) if include_current else grid)
-    field_spec = (P(None, None, None, None) if include_current
-                  else P(None, None, None))
+    field_shape = ((2, 2, *grid) if return_spin_matrix else
+                   ((4, *grid) if include_current else grid))
+    field_spec = (P(None, None, None, None, None) if return_spin_matrix else
+                  (P(None, None, None, None) if include_current
+                   else P(None, None, None)))
     rho_sharding = NamedSharding(mesh, field_spec)
 
     def build():
@@ -553,10 +586,13 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                 dens = density_components_from_psi_r(
                     psi_r[0], occ_k,
                     include_dirac_current=include_current,
-                    charge_nspinor=charge_ns)
+                    charge_nspinor=(None if return_spin_matrix else charge_ns),
+                    return_spin_density_matrix=return_spin_matrix)
                 return rho + (w_k * f_spin) * dens, None
 
-            rho0 = jnp.zeros(field_shape, dtype=jnp.float64)
+            field_dtype = (jnp.complex128 if return_spin_matrix
+                           else jnp.float64)
+            rho0 = jnp.zeros(field_shape, dtype=field_dtype)
             xs = ((psi_s, U_x, occ_, w_, bidx_) if have_U
                   else (psi_s, occ_, w_, bidx_))
             rho, _ = jax.lax.scan(body, rho0, xs, unroll=1)
@@ -570,7 +606,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     fn = _cached_jit(
         "rho_from_wfns",
         (psi.shape, tuple(np.shape(U_j)), grid, float(cell_volume), f_spin,
-         have_U, include_current, charge_ns,
+         have_U, include_current, charge_ns, return_spin_matrix,
          None if sym_perm is None else tuple(np.shape(sym_perm)),
          _sharding_key(psi)),
         build)

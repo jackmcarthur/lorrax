@@ -221,16 +221,24 @@ def test_T3_time_reversal_flips_the_magnetization_density():
         assert m_phi == pytest.approx(-m_psi, abs=1e-13)
 
 
-def test_polarisation_identities_used_to_get_m_from_the_quadrature():
-    """The four-call reconstruction in ``_spin_resolved_density``:
-    m_x = D(a+b) − ρ and m_y = ρ − D(a+ib), with D linear in |·|²."""
+def test_spin_density_matrix_pauli_contraction_identities():
+    """The one-IFFT rho_ab path has the direct Pauli signs, including y."""
     rng = np.random.default_rng(12)
     a = rng.normal(size=8) + 1j * rng.normal(size=8)
     b = rng.normal(size=8) + 1j * rng.normal(size=8)
-    rho = np.abs(a) ** 2 + np.abs(b) ** 2
-    assert np.allclose(np.abs(a + b) ** 2 - rho, 2 * np.real(np.conj(a) * b))
-    assert np.allclose(rho - np.abs(a + 1j * b) ** 2,
-                       2 * np.imag(np.conj(a) * b))
+    rho_01 = a * np.conj(b)
+    fields = np.stack((
+        np.abs(a) ** 2 + np.abs(b) ** 2,
+        2 * np.real(rho_01),
+        -2 * np.imag(rho_01),
+        np.abs(a) ** 2 - np.abs(b) ** 2,
+    ))
+    spinor = np.stack((a, b), axis=1)
+    direct = np.stack([
+        np.real(np.einsum("na,ab,nb->n", np.conj(spinor), sigma, spinor))
+        for sigma in (np.eye(2), _SX, _SY, _SZ)
+    ])
+    assert np.allclose(fields, direct)
 
 
 # ----------------------------------------------------------------------

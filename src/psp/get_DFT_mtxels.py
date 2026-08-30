@@ -168,14 +168,24 @@ def density_components_from_psi_r(
     *,
     include_dirac_current: bool = False,
     charge_nspinor: int | None = None,
+    return_spin_density_matrix: bool = False,
 ) -> jnp.ndarray:
-    """Contract real-space spinors into charge and optional Dirac current.
+    """Contract real-space spinors into charge, current, or spin density.
 
     ``psi_r`` is ``(nb,nspinor,nx,ny,nz)``.  The return is either the
     scalar charge density or ``(rho,Jx,Jy,Jz)``, before the caller's k-point
     weight and spin-degeneracy prefactor.  ``band_occupations`` is a signed
     per-band weight: MP1's small negative occupations therefore enter every
     four-current component through exactly the same arithmetic.
+
+    With ``return_spin_density_matrix=True``, exactly two spinor components
+    are required and the return shape is ``(2,2,nx,ny,nz)`` with axes
+    ``(a,b,x,y,z)`` and convention
+    ``rho_ab(r) = sum_n f_n psi_na(r) psi_nb(r)*``.  It has the same density
+    units as the scalar return after the caller's k/spin prefactor, and its
+    trace is the incumbent scalar charge density.  This raw local matrix has
+    no spatial-symmetry projection: spin is an axial vector and cannot use
+    the scalar charge pullback without a separately owned axial/TR action.
 
     This is the single local four-current contraction used by both the
     streamed one-shot density and ``gw.qsgw_density``'s evolving-orbital
@@ -193,19 +203,54 @@ def density_components_from_psi_r(
         raise ValueError(
             "charge_nspinor must select a nonempty leading spinor block; "
             f"got {charge_nspinor} for nspinor={ns}")
+    if return_spin_density_matrix and include_dirac_current:
+        raise ValueError(
+            "return_spin_density_matrix and include_dirac_current are "
+            "mutually exclusive density representations")
     if include_dirac_current and ns != 4:
         raise ValueError(
             "Dirac current requires four-component kinetic-balance "
             f"bispinors; got nspinor={ns}")
+    if return_spin_density_matrix and ns != 2:
+        raise ValueError(
+            "spin-density matrix requires exactly two-component Pauli "
+            f"spinors; got nspinor={ns}")
+    if return_spin_density_matrix and charge_nspinor is not None:
+        raise ValueError(
+            "charge_nspinor does not apply when returning the complete "
+            "two-component spin-density matrix")
 
-    occ = None
+    occ_band = None
     if band_occupations is not None:
-        occ = jnp.asarray(band_occupations, dtype=jnp.float64)
-        if occ.ndim != 1 or int(occ.shape[0]) != int(psi.shape[0]):
+        occ_band = jnp.asarray(band_occupations, dtype=jnp.float64)
+        if (occ_band.ndim != 1
+                or int(occ_band.shape[0]) != int(psi.shape[0])):
             raise ValueError(
                 "band_occupations must have one entry per real-space "
-                f"orbital; got {occ.shape}, expected ({int(psi.shape[0])},)")
-        occ = occ[:, None, None, None, None]
+                f"orbital; got {occ_band.shape}, "
+                f"expected ({int(psi.shape[0])},)")
+
+    if return_spin_density_matrix:
+        # Reduce only the independent entries: constructing the full outer
+        # product would expose a (nb,2,2,nx,ny,nz) complex transient.  The
+        # explicit conjugate also makes Hermiticity exact, not tolerance
+        # dependent.
+        occ_grid = (None if occ_band is None
+                    else occ_band[:, None, None, None])
+
+        def weighted_sum(terms):
+            return jnp.sum(
+                terms if occ_grid is None else occ_grid * terms, axis=0)
+
+        rho_00 = weighted_sum(jnp.real(jnp.conj(psi[:, 0]) * psi[:, 0]))
+        rho_11 = weighted_sum(jnp.real(jnp.conj(psi[:, 1]) * psi[:, 1]))
+        rho_01 = weighted_sum(psi[:, 0] * jnp.conj(psi[:, 1]))
+        row_0 = jnp.stack((rho_00, rho_01))
+        row_1 = jnp.stack((jnp.conj(rho_01), rho_11))
+        return jnp.stack((row_0, row_1))
+
+    occ = (None if occ_band is None
+           else occ_band[:, None, None, None, None])
 
     psi_charge = psi[:, :charge_ns]
     charge_terms = jnp.real(jnp.conj(psi_charge) * psi_charge)
@@ -225,9 +270,42 @@ def density_components_from_psi_r(
     return jnp.stack((rho, *currents))
 
 
+def spin_density_matrix_to_pauli_fields(rho_ab: jnp.ndarray) -> jnp.ndarray:
+    """Return real ``(rho,mx,my,mz)`` fields from local ``rho_ab``.
+
+    ``rho_ab`` must have shape ``(2,2,...)`` and the convention used by
+    :func:`density_components_from_psi_r`, ``rho_ab = psi_a psi_b*``.
+    The contraction is literally ``Tr(rho sigma_i)`` and therefore uses both
+    off-diagonal entries; for a Hermitian matrix this gives
+    ``m_y = -2 Im(rho_01)``.  That sign is the direct consequence of
+    ``psi^dagger [[0,-i],[i,0]] psi`` rather than a storage convention.  The
+    returned leading-axis order is exactly ``(rho,mx,my,mz)``.
+
+    The result is real by construction.  The helper does not silently
+    Hermitise its input: callers constructing a matrix by another route can
+    inspect its anti-Hermitian residual before contracting it.
+    """
+    matrix = jnp.asarray(rho_ab)
+    if matrix.ndim < 2 or tuple(matrix.shape[:2]) != (2, 2):
+        raise ValueError(
+            "rho_ab must have two leading spin axes of length 2; "
+            f"got shape={matrix.shape}")
+    rho_00 = matrix[0, 0]
+    rho_11 = matrix[1, 1]
+    rho_01 = matrix[0, 1]
+    rho_10 = matrix[1, 0]
+    return jnp.stack((
+        jnp.real(rho_00 + rho_11),
+        jnp.real(rho_01 + rho_10),
+        jnp.real(1j * (rho_01 - rho_10)),
+        jnp.real(rho_00 - rho_11),
+    ))
+
+
 @partial(
     jax.jit,
-    static_argnames=("nocc", "include_dirac_current", "charge_nspinor"),
+    static_argnames=("nocc", "include_dirac_current", "charge_nspinor",
+                     "return_spin_density_matrix"),
 )
 def _valence_density_kernel(
     psi_k_box: jnp.ndarray,
@@ -239,6 +317,7 @@ def _valence_density_kernel(
     nocc: int | None,
     include_dirac_current: bool,
     charge_nspinor: int | None,
+    return_spin_density_matrix: bool,
 ) -> jnp.ndarray:
     """Jitted body of :func:`valence_density_from_kpoint`.
 
@@ -256,7 +335,8 @@ def _valence_density_kernel(
     components = density_components_from_psi_r(
         psi_r, band_occupations,
         include_dirac_current=include_dirac_current,
-        charge_nspinor=charge_nspinor)
+        charge_nspinor=charge_nspinor,
+        return_spin_density_matrix=return_spin_density_matrix)
     return prefactor * components
 
 
@@ -270,6 +350,7 @@ def valence_density_from_kpoint(
     band_occupations: jnp.ndarray | np.ndarray | None = None,
     include_dirac_current: bool = False,
     charge_nspinor: int | None = None,
+    return_spin_density_matrix: bool = False,
 ) -> jnp.ndarray:
     """One k-point's contribution to ρ_v(r), on the ψ FFT box grid.
 
@@ -312,18 +393,40 @@ def valence_density_from_kpoint(
     spatial currents, while rho sums only its normalized upper/source
     two-spinor block.  ``None`` preserves the historical all-component charge
     convention byte-for-byte.
+
+    ``return_spin_density_matrix=True`` requires exactly two-component
+    Pauli spinors and returns local ``rho_ab(r)`` with shape
+    ``(2,2,nx,ny,nz)`` and convention
+    ``rho_ab = w_k f_spin sum_n f_nk psi_na psi_nb*``.  Its trace equals
+    this function's default scalar result.  It is intentionally the raw
+    k-point contribution, before any scalar spatial-symmetry projector;
+    use :func:`spin_density_matrix_to_pauli_fields` for ordered
+    ``(rho,mx,my,mz)`` fields.
     """
     include_current = bool(include_dirac_current)
+    return_spin_matrix = bool(return_spin_density_matrix)
     if charge_nspinor is not None and not (
         0 < int(charge_nspinor) <= int(psi_k_box.shape[1])
     ):
         raise ValueError(
             "charge_nspinor must select a nonempty leading spinor block; "
             f"got {charge_nspinor} for nspinor={int(psi_k_box.shape[1])}")
+    if return_spin_matrix and include_current:
+        raise ValueError(
+            "return_spin_density_matrix and include_dirac_current are "
+            "mutually exclusive density representations")
     if include_current and int(psi_k_box.shape[1]) != 4:
         raise ValueError(
             "Dirac current requires four-component kinetic-balance "
             f"bispinors; got nspinor={int(psi_k_box.shape[1])}")
+    if return_spin_matrix and int(psi_k_box.shape[1]) != 2:
+        raise ValueError(
+            "spin-density matrix requires exactly two-component Pauli "
+            f"spinors; got nspinor={int(psi_k_box.shape[1])}")
+    if return_spin_matrix and charge_nspinor is not None:
+        raise ValueError(
+            "charge_nspinor does not apply when returning the complete "
+            "two-component spin-density matrix")
     occupations = None
     if band_occupations is not None:
         occupations = jnp.asarray(band_occupations, dtype=jnp.float64)
@@ -343,7 +446,8 @@ def valence_density_from_kpoint(
         nocc=None if nocc is None else int(nocc),
         include_dirac_current=include_current,
         charge_nspinor=(None if charge_nspinor is None
-                        else int(charge_nspinor)))
+                        else int(charge_nspinor)),
+        return_spin_density_matrix=return_spin_matrix)
 
 
 # ===========================================================================
