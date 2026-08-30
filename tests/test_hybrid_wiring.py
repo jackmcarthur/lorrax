@@ -11,7 +11,8 @@ from gw.mpa.delivered_windows import (
 )
 from gw.ppm_accumulators import _omega_coefficient
 from gw.ppm_windows import _SigmaBranch
-from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
+from gw.sigma_plan import (resolve_delivered_max_direct_terms,
+                           resolve_delivered_tau_grid, resolve_sigma_plan)
 from gw.wavefunction_bundle import (
     BandSlices,
     Wavefunctions,
@@ -318,3 +319,12 @@ def test_shared_selector_defaults_and_refuses_unknown(monkeypatch):
     monkeypatch.setenv("LORRAX_DELIVERED_TAU_GRID", "union")
     with pytest.raises(ValueError, match="free.*shared"):
         resolve_delivered_tau_grid()
+
+    monkeypatch.delenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", raising=False)
+    assert resolve_delivered_max_direct_terms() == 32
+    monkeypatch.setenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", " 7 ")
+    assert resolve_delivered_max_direct_terms() == 7
+    for invalid in ("-1", "many"):
+        monkeypatch.setenv("LORRAX_DELIVERED_MAX_DIRECT_TERMS", invalid)
+        with pytest.raises(ValueError, match="nonnegative integer"):
+            resolve_delivered_max_direct_terms()

@@ -36,4 +36,28 @@ def resolve_delivered_tau_grid() -> str:
     return mode
 
 
-__all__ = ["resolve_delivered_tau_grid", "resolve_sigma_plan"]
+def resolve_delivered_max_direct_terms() -> int:
+    """Resolve the per-branch ceiling on exact direct terms.
+
+    Direct summation is an escape hatch, not a route: the owner ruling
+    retires per-pair stages, and the planner must refuse rather than
+    exceed this ceiling. The default keeps the hatch at a few dozen
+    terms; zero is a legal request and forces pure quadrature.
+    """
+    raw = os.environ.get("LORRAX_DELIVERED_MAX_DIRECT_TERMS", "32").strip()
+    value = raw or "32"
+    try:
+        ceiling = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "LORRAX_DELIVERED_MAX_DIRECT_TERMS must be a nonnegative "
+            f"integer; got {raw!r}") from error
+    if ceiling < 0:
+        raise ValueError(
+            "LORRAX_DELIVERED_MAX_DIRECT_TERMS must be a nonnegative "
+            f"integer; got {raw!r}")
+    return ceiling
+
+
+__all__ = ["resolve_delivered_max_direct_terms", "resolve_delivered_tau_grid",
+           "resolve_sigma_plan"]
