@@ -612,11 +612,14 @@ def compute_sigma_c_mpa_omega_grid(
                 measure_delivered_sigma_pole_batch,
             )
             measured = [[] for _branch in branches]
+            # One unfold, sliced per batch (third and last per-batch
+            # unfold site; see batches() for the recompile mechanism).
+            Omega_all, B_all = reader.read(
+                slice(0, int(n_poles)), unfold=True, return_sharded=True,
+                to_unit="Ry")
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
+                Omega, B = Omega_all[lo:hi], B_all[lo:hi]
                 for branch_index, branch in enumerate(branches):
                     measured[branch_index].append(
                         measure_delivered_sigma_pole_batch(
