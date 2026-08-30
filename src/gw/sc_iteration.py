@@ -1762,16 +1762,21 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
         from psp.dft_operators import transverse_potential_from_current
         from vcoul import COULOMB_GAUGE_TT_SIGN
 
-        current_raw = np.asarray(fields[1:], dtype=np.float64)
+        # ``rho_from_wfns`` returns the canonical replicated JAX carrier.
+        # Keep the full current resident through symmetry and the TT solve;
+        # only the three scalar diagnostics below cross to the host.
+        current_raw = jnp.asarray(fields[1:], dtype=jnp.float64)
         ngrid = int(np.prod(grid))
-        current_g0 = np.sum(current_raw, axis=(-3, -2, -1)) / np.sqrt(ngrid)
+        current_g0 = (
+            jnp.sum(current_raw, axis=(-3, -2, -1)) / np.sqrt(ngrid))
+        current_g0_l2 = float(jnp.linalg.norm(current_g0))
         current_scale = max(
-            float(np.linalg.norm(current_raw)), np.finfo(np.float64).tiny)
+            float(jnp.linalg.norm(current_raw)), np.finfo(np.float64).tiny)
         inputs.print_fn(
             "    SC Dirac-current G=0 diagnostic (J=j/c): "
-            f"||J0||={float(np.linalg.norm(current_g0)):.6e}, "
+            f"||J0||={current_g0_l2:.6e}, "
             f"||J||={current_scale:.6e}, "
-            f"ratio={float(np.linalg.norm(current_g0)) / current_scale:.6e}; "
+            f"ratio={current_g0_l2 / current_scale:.6e}; "
             "periodic TT sets G=0 to zero")
         projection = project_polar_fft_field(current_raw, inputs.sym)
         inputs.print_fn(
@@ -1783,7 +1788,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
             f"{projection.relative_residual_tolerance:.6e}")
         with timing.section("vh.transverse_field"):
             V_T_r = transverse_potential_from_current(
-                jnp.asarray(projection.field, dtype=jnp.float64),
+                projection.field,
                 jnp.asarray(inputs.wfn.bdot, dtype=jnp.float64),
                 jnp.asarray(inputs.wfn.bvec, dtype=jnp.float64),
                 float(inputs.wfn.blat),

@@ -289,6 +289,28 @@ def test_sc_density_applies_rotation_inside_the_scan():
                    for n in ast.walk(fn))
 
 
+def test_sc_transverse_projection_never_host_converts_the_full_current():
+    """Only scalar receipts may cross between the rho scan and TT solve."""
+    path = ROOT / "src" / "gw" / "sc_iteration.py"
+    text = path.read_text(encoding="utf-8")
+    module = ast.parse(text)
+    fn = next(n for n in module.body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "rebuild_hartree_dft_basis")
+    source = ast.get_source_segment(text, fn)
+    host_conversions = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "np"
+        and n.func.attr == "asarray"
+    ]
+    assert not host_conversions
+    assert "current_raw = jnp.asarray(fields[1:]" in source
+    assert "transverse_potential_from_current(\n                projection.field" in source
+
+
 def test_density_scan_reshards_only_the_singleton_k_slice():
     """Resident psi stays band-xy; only psi[k] is placed m-on-x."""
     module = ast.parse((ROOT / "src" / "gw" / "qsgw_density.py").read_text(

@@ -27,6 +27,7 @@ import hashlib
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ._compat import deprecated_alias
 
@@ -1354,7 +1355,7 @@ def resolve_qgrid_symmetry(
 class PolarFFTFieldProjection:
     """A polar FFT field and the measured receipt for its group projection."""
 
-    field: np.ndarray
+    field: np.ndarray | jax.Array
     relative_movement: float
     relative_residual: float
     rotation_table_closure_defect: float
@@ -1364,56 +1365,32 @@ class PolarFFTFieldProjection:
     n_antiunitary_rows: int
 
 
-def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
-    r"""Project a Cartesian polar field on an FFT grid onto crystal symmetry.
+@dataclasses.dataclass(frozen=True)
+class _PolarFFTFieldPlan:
+    """Validated static certificate; owns the one host pullback table."""
 
-    ``field`` is ``(3,nx,ny,nz)``.  Every permitted row acts through the
-    canonical real-space pullback from :func:`fft_grid_pullback_perm` and
-    the forward Cartesian-index action ``SymMaps.R_cart_forward``::
+    cache_token: bytes
+    rotations: np.ndarray
+    pullback: np.ndarray
+    n_spatial: int
+    n_rows: int
+    rotation_table_closure_defect: float
+    floating_point_residual_bound: float
+    residual_tolerance: float
 
-        (g J)_a(r_new) = R_forward[g]_{a b} J_b(r_old).
 
-    The time-reversal half of ``R_cart_forward`` already contains the one
-    minus sign of a time-odd polar current.  Time reversal does not move
-    ``r``, so its row reuses the spatial pullback and no second parity sign
-    is applied.  Antiunitary rows participate only when the live
-    ``SymMaps.trs_allowed`` verdict permits them.
+_POLAR_FIELD_PLAN_CACHE: dict[bytes, _PolarFFTFieldPlan] = {}
+_POLAR_FIELD_JIT_CACHE: dict = {}
 
-    The receipt measures the raw-to-projected movement and the worst
-    covariance residual of the projected field over those same rows, both
-    relative to the raw-field L2 scale (so a symmetry-required zero field
-    is not divided by its own cancellation noise).
 
-    The covariance acceptance bar is derived from the representation table,
-    not chosen independently.  For the pullback composition ``g`` after
-    ``h``, the exact affine product is
+def _polar_field_plan(fft_grid, sym) -> _PolarFFTFieldPlan:
+    """Return one authenticated affine plan per symmetry/grid/TR verdict.
 
-    ``S_gh = S_h @ S_g`` and
-    ``tau_gh = tau_g + inv(S_g) @ tau_h (mod Z)``.
-
-    The spatial row is identified by those two exact integer certificates;
-    the antiunitary bit is the XOR.  If ``R`` were an exact representation,
-    reindexing the group average would give zero covariance residual.  The
-    rounded canonical Cartesian table instead gives the measured bound
-
-    ``delta_R = max_(g,h) ||R_g @ R_h - R_gh||_2``.
-
-    Because every pullback is a permutation, its contribution relative to
-    the raw-field L2 norm is at most ``delta_R``.  The remaining group
-    reduction is bounded by
-    ``64 eps n_rows max(1, max_g(||R_g||_2)^2)``.  Their sum is the returned
-    tolerance.  A
-    local ``alpha·A`` operator built from the result is therefore eligible
-    for the incumbent star-wedge matrix sweep without another symmetry rule.
+    The lookup token hashes only bounded symmetry metadata plus the three
+    grid integers.  In particular it never hashes or retains the
+    ``O(n_sym*N_grid)`` pullback.  A cache hit therefore bypasses grid
+    permutation construction, exact affine closure and rotation-bound work.
     """
-    value = np.asarray(field)
-    if value.ndim != 4 or value.shape[0] != 3:
-        raise ValueError(
-            "project_polar_fft_field: field must have shape "
-            f"(3,nx,ny,nz); got {value.shape}.")
-    if not np.all(np.isfinite(value)):
-        raise ValueError("project_polar_fft_field: field contains non-finite values.")
-
     spatial_raw = np.asarray(sym.sym_matrices)
     if (not np.all(np.isfinite(spatial_raw))
             or not np.array_equal(spatial_raw, np.rint(spatial_raw))):
@@ -1441,60 +1418,64 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         raise ValueError(
             "project_polar_fft_field: SymMaps.translations must cover every "
             f"spatial row; got {translations.shape}, need ({n_spatial},3).")
-    if not np.all(np.isfinite(translations[:n_spatial])):
+    translations = translations[:n_spatial]
+    if not np.all(np.isfinite(translations)):
         raise ValueError(
             "project_polar_fft_field: SymMaps.translations contains "
             "non-finite values.")
 
-    fft_grid = np.asarray(value.shape[-3:], dtype=np.int64)
-    n_rows = 2 * n_spatial if bool(sym.trs_allowed) else n_spatial
-    flat = value.reshape(3, -1)
+    grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    trs_allowed = bool(sym.trs_allowed)
+    digest = hashlib.sha256()
+    for array in (spatial, rotations, translations, grid):
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(np.asarray(array).tobytes(order="C"))
+    digest.update(bytes((int(trs_allowed),)))
+    cache_token = digest.digest()
+    cached = _POLAR_FIELD_PLAN_CACHE.get(cache_token)
+    if cached is not None:
+        return cached
 
+    n_rows = 2 * n_spatial if trs_allowed else n_spatial
     # Build an exact affine-group product table without comparing the full
     # O(N_grid) permutations pairwise.  BGW translations are commensurate
     # with the FFT grid.  Lift their per-axis grid integers to one common
     # denominator so operations with the same S but different tau remain
     # distinct and every product lookup is integer-only.
-    tau_frac = translations[:n_spatial] / (2.0 * np.pi)
-    tau_scaled = tau_frac * fft_grid[None, :]
+    tau_frac = translations / (2.0 * np.pi)
+    tau_scaled = tau_frac * grid[None, :]
     tau_grid = np.rint(tau_scaled).astype(np.int64)
     tau_off_grid = float(np.max(np.abs(tau_scaled - tau_grid)))
     if tau_off_grid > _GRID_COMMENSURATE_TOL:
         raise RuntimeError(
             "project_polar_fft_field: SymMaps.translations are not "
-            f"commensurate with FFT grid {fft_grid.tolist()}; worst offset "
+            f"commensurate with FFT grid {grid.tolist()}; worst offset "
             f"is {tau_off_grid:.6e} of a grid step.  An exact affine "
             "closure certificate cannot be constructed.")
 
-    # The pullback/source action is p_s(r) = S_s (r - tau_s).  On an
-    # anisotropic grid, an integer S does not by itself prove that this maps
-    # grid points to grid points: coefficient S[a,b]/N_b must be an integer
-    # multiple of 1/N_a.  Certify N_a*S[a,b] divisible by N_b exactly.  With
-    # tau on-grid above, snapping in fft_grid_pullback_perm is then lossless,
-    # so affine closure below proves pullback[h][pullback[g]] == pullback[k]
-    # without an O(n_sym^2*N_grid) comparison.
-    grid_action_numerator = (
-        fft_grid[None, :, None] * spatial)
+    # An integer S maps an anisotropic grid exactly only when
+    # N_a*S[a,b] is divisible by N_b for every component.
+    grid_action_numerator = grid[None, :, None] * spatial
     grid_action_remainder = (
-        grid_action_numerator % fft_grid[None, None, :])
+        grid_action_numerator % grid[None, None, :])
     incompatible = np.argwhere(grid_action_remainder != 0)
     if incompatible.size:
         row, out_axis, in_axis = (int(x) for x in incompatible[0])
         raise RuntimeError(
             "project_polar_fft_field: spatial row "
             f"{row} does not map anisotropic FFT grid "
-            f"{fft_grid.tolist()} exactly under the source pullback "
+            f"{grid.tolist()} exactly under the source pullback "
             "S(r-tau): N_a*S[a,b] must be divisible by N_b, but "
             f"N[{out_axis}]*S[{out_axis},{in_axis}]="
             f"{int(grid_action_numerator[row, out_axis, in_axis])} is not "
-            f"divisible by N[{in_axis}]={int(fft_grid[in_axis])}.")
+            f"divisible by N[{in_axis}]={int(grid[in_axis])}.")
 
     pullback = fft_grid_pullback_perm(
-        spatial, translations[:n_spatial], fft_grid, validate=True)
-    common_denominator = int(np.lcm.reduce(fft_grid))
+        spatial, translations, grid, validate=True)
+    common_denominator = int(np.lcm.reduce(grid))
     tau_common = (
-        (tau_grid % fft_grid[None, :])
-        * (common_denominator // fft_grid)[None, :]
+        (tau_grid % grid[None, :])
+        * (common_denominator // grid)[None, :]
     ) % common_denominator
 
     inverse_spatial = np.rint(np.linalg.inv(spatial)).astype(np.int64)
@@ -1559,36 +1540,201 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     residual_tolerance = float(
         rotation_table_closure_defect + floating_point_residual_bound)
 
+    rotations_used = rotations[:n_rows].copy()
+    rotations_used.setflags(write=False)
+    pullback.setflags(write=False)
+    plan = _PolarFFTFieldPlan(
+        cache_token=cache_token,
+        rotations=rotations_used,
+        pullback=pullback,
+        n_spatial=n_spatial,
+        n_rows=n_rows,
+        rotation_table_closure_defect=rotation_table_closure_defect,
+        floating_point_residual_bound=floating_point_residual_bound,
+        residual_tolerance=residual_tolerance)
+    _POLAR_FIELD_PLAN_CACHE[cache_token] = plan
+    return plan
+
+
+def _polar_field_device_projection(value, plan):
+    """Project one resident field; only scalar receipts leave the device.
+
+    The affine tables are small host-owned certificates and are baked into
+    the compiled module.  The field is the only runtime operand, so the same
+    executable is reused by every SC iteration with the same grid, dtype and
+    layout.  Pinning every output is load-bearing at P>1: the field retains
+    its canonical carrier and the diagnostic scalars are replicated.
+    """
+    n_rows = plan.n_rows
+    n_spatial = plan.n_spatial
+    field_sharding = getattr(value, "sharding", None)
+    scalar_sharding = field_sharding
+    if isinstance(field_sharding, NamedSharding):
+        scalar_sharding = NamedSharding(field_sharding.mesh, P())
+    key = (
+        plan.cache_token,
+        tuple(int(n) for n in value.shape),
+        np.dtype(value.dtype).str,
+        repr(field_sharding),
+    )
+    fn = _POLAR_FIELD_JIT_CACHE.get(key)
+    if fn is None:
+        # These are references to the plan's immutable arrays, not copies.
+        rotations_np = plan.rotations
+        pullback_np = plan.pullback
+        output_shardings = None
+        if field_sharding is not None:
+            output_shardings = (
+                field_sharding, scalar_sharding, scalar_sharding,
+                scalar_sharding)
+
+        def _kernel(field):
+            rotations_j = jnp.asarray(rotations_np)
+            pullback_j = jnp.asarray(pullback_np)
+            work_dtype = jnp.result_type(field.dtype, jnp.float64)
+            flat = jnp.asarray(field, dtype=work_dtype).reshape(3, -1)
+
+            def _act(row, operand):
+                transformed = jax.lax.cond(
+                    row >= n_spatial,
+                    lambda x: jnp.conj(x),
+                    lambda x: x,
+                    operand)
+                spatial_row = row % n_spatial
+                gathered = transformed[:, pullback_j[spatial_row]]
+                return jnp.einsum(
+                    "ab,bn->an", rotations_j[row], gathered,
+                    precision=jax.lax.Precision.HIGHEST)
+
+            projected = jax.lax.fori_loop(
+                0, n_rows,
+                lambda row, acc: acc + _act(row, flat),
+                jnp.zeros_like(flat))
+            projected = projected / float(n_rows)
+
+            real_dtype = jnp.real(flat).dtype
+            tiny = jnp.asarray(jnp.finfo(real_dtype).tiny, dtype=real_dtype)
+            raw_norm = jnp.maximum(jnp.linalg.norm(flat), tiny)
+            movement = jnp.linalg.norm(projected - flat) / raw_norm
+            residual = jax.lax.fori_loop(
+                0, n_rows,
+                lambda row, worst: jnp.maximum(
+                    worst,
+                    jnp.linalg.norm(_act(row, projected) - projected)
+                    / raw_norm),
+                jnp.asarray(0.0, dtype=real_dtype))
+            return (projected.reshape(field.shape), movement, residual,
+                    jnp.all(jnp.isfinite(field)))
+
+        if output_shardings is None:
+            fn = jax.jit(_kernel)
+        else:
+            fn = jax.jit(_kernel, out_shardings=output_shardings)
+        _POLAR_FIELD_JIT_CACHE[key] = fn
+    return fn(value)
+
+
+def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
+    r"""Project a Cartesian polar field on an FFT grid onto crystal symmetry.
+
+    ``field`` is ``(3,nx,ny,nz)``.  Every permitted row acts through the
+    canonical real-space pullback from :func:`fft_grid_pullback_perm` and
+    the forward Cartesian-index action ``SymMaps.R_cart_forward``::
+
+        (g J)_a(r_new) = R_forward[g]_{a b} J_b(r_old).
+
+    The time-reversal half of ``R_cart_forward`` already contains the one
+    minus sign of a time-odd polar current.  An antiunitary row also complex
+    conjugates its operand.  Time reversal does not move ``r``, so its row
+    reuses the spatial pullback and no second parity sign is applied.
+    Antiunitary rows participate only when the live ``SymMaps.trs_allowed``
+    verdict permits them.
+
+    The receipt measures the raw-to-projected movement and the worst
+    covariance residual of the projected field over those same rows, both
+    relative to the raw-field L2 scale (so a symmetry-required zero field
+    is not divided by its own cancellation noise).
+
+    The covariance acceptance bar is derived from the representation table,
+    not chosen independently.  For the pullback composition ``g`` after
+    ``h``, the exact affine product is
+
+    ``S_gh = S_h @ S_g`` and
+    ``tau_gh = tau_g + inv(S_g) @ tau_h (mod Z)``.
+
+    The spatial row is identified by those two exact integer certificates;
+    the antiunitary bit is the XOR.  If ``R`` were an exact representation,
+    reindexing the group average would give zero covariance residual.  The
+    rounded canonical Cartesian table instead gives the measured bound
+
+    ``delta_R = max_(g,h) ||R_g @ R_h - R_gh||_2``.
+
+    Because every pullback is a permutation, its contribution relative to
+    the raw-field L2 norm is at most ``delta_R``.  The remaining group
+    reduction is bounded by
+    ``64 eps n_rows max(1, max_g(||R_g||_2)^2)``.  Their sum is the returned
+    tolerance.  A
+    local ``alpha·A`` operator built from the result is therefore eligible
+    for the incumbent star-wedge matrix sweep without another symmetry rule.
+    """
+    is_device = isinstance(field, jax.Array)
+    value = field if is_device else np.asarray(field)
+    if value.ndim != 4 or value.shape[0] != 3:
+        raise ValueError(
+            "project_polar_fft_field: field must have shape "
+            f"(3,nx,ny,nz); got {value.shape}.")
+    if not is_device and not np.all(np.isfinite(value)):
+        raise ValueError("project_polar_fft_field: field contains non-finite values.")
+
+    plan = _polar_field_plan(value.shape[-3:], sym)
+    n_spatial = plan.n_spatial
+    n_rows = plan.n_rows
+    rotations = plan.rotations
+    pullback = plan.pullback
+    flat = value.reshape(3, -1)
+
     def _act(row, operand):
         spatial_row = int(row) % n_spatial
-        return rotations[int(row)] @ operand[:, pullback[spatial_row]]
+        transformed = np.conj(operand) if int(row) >= n_spatial else operand
+        return rotations[int(row)] @ transformed[:, pullback[spatial_row]]
 
-    projected = np.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
-    for row in range(n_rows):
-        projected += _act(row, flat)
-    projected /= float(n_rows)
+    if is_device:
+        projected_field, movement_j, residual_j, all_finite_j = (
+            _polar_field_device_projection(value, plan))
+        if not bool(all_finite_j):
+            raise ValueError(
+                "project_polar_fft_field: field contains non-finite values.")
+        movement = float(movement_j)
+        residual = float(residual_j)
+    else:
+        projected = np.zeros_like(
+            flat, dtype=np.result_type(value.dtype, np.float64))
+        for row in range(n_rows):
+            projected += _act(row, flat)
+        projected /= float(n_rows)
 
-    tiny = np.finfo(np.float64).tiny
-    raw_norm = max(float(np.linalg.norm(flat)), tiny)
-    movement = float(np.linalg.norm(projected - flat) / raw_norm)
-    residual = max(
-        float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
-        for row in range(n_rows))
-    if not np.isfinite(residual) or residual > residual_tolerance:
+        tiny = np.finfo(np.float64).tiny
+        raw_norm = max(float(np.linalg.norm(flat)), tiny)
+        movement = float(np.linalg.norm(projected - flat) / raw_norm)
+        residual = max(
+            float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
+            for row in range(n_rows))
+        projected_field = projected.reshape(value.shape)
+    if not np.isfinite(residual) or residual > plan.residual_tolerance:
         raise RuntimeError(
             "project_polar_fft_field: the group-averaged field did not "
             "close under its own permitted symmetry rows: relative residual "
             f"{residual:.6e} exceeds the derived representation bound "
-            f"{residual_tolerance:.6e} = rotation-table closure defect "
-            f"{rotation_table_closure_defect:.6e} + floating reduction "
-            f"{floating_point_residual_bound:.6e} for {n_rows} rows.")
+            f"{plan.residual_tolerance:.6e} = rotation-table closure defect "
+            f"{plan.rotation_table_closure_defect:.6e} + floating reduction "
+            f"{plan.floating_point_residual_bound:.6e} for {n_rows} rows.")
     return PolarFFTFieldProjection(
-        field=projected.reshape(value.shape),
+        field=projected_field,
         relative_movement=movement,
         relative_residual=residual,
-        rotation_table_closure_defect=rotation_table_closure_defect,
-        floating_point_residual_bound=floating_point_residual_bound,
-        relative_residual_tolerance=residual_tolerance,
+        rotation_table_closure_defect=plan.rotation_table_closure_defect,
+        floating_point_residual_bound=plan.floating_point_residual_bound,
+        relative_residual_tolerance=plan.residual_tolerance,
         n_symmetry_rows=n_rows,
         n_antiunitary_rows=(n_spatial if bool(sym.trs_allowed) else 0),
     )
