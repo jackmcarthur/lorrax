@@ -64,10 +64,28 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
     digest = hashlib.sha256()
 
     def add_array(value):
-        array = np.ascontiguousarray(np.asarray(value))
+        array = np.asarray(value)
         digest.update(array.dtype.str.encode("ascii"))
         digest.update(repr(array.shape).encode("ascii"))
-        digest.update(array.view(np.uint8))
+        count = min(int(array.size), 4096)
+        indices = np.linspace(
+            0, max(int(array.size) - 1, 0), count,
+            dtype=np.int64) if count else np.empty(0, np.int64)
+        sample = np.take(array, indices)
+        # Collective reductions can differ below roundoff between otherwise
+        # identical P=4 restarts.  Eleven decimal places is five orders
+        # tighter than the smallest candidate tolerance.  Sampling keeps the
+        # cache lookup bounded; every cached rule is still re-certified on
+        # the complete live validation measure before it can execute.
+        if np.issubdtype(sample.dtype, np.complexfloating):
+            canonical = np.stack(
+                (np.round(sample.real, 11), np.round(sample.imag, 11)),
+                axis=-1)
+        elif np.issubdtype(sample.dtype, np.floating):
+            canonical = np.round(sample, 11)
+        else:
+            canonical = sample
+        digest.update(np.ascontiguousarray(canonical).view(np.uint8))
 
     digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
     digest.update(repr((float(eta), float(target), float(safety),
@@ -77,10 +95,10 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
         branch = spec["branch"]
         digest.update(repr((
             spec["name"], spec["kind"], float(spec["pole_sign"]),
-            int(spec["pole_interval"]), tuple(spec["state_interval"]),
-            tuple(spec["pole_bounds"]), float(spec["E_ref_A"]),
-            float(spec["envelope"]), branch.tag, branch.space,
+            int(spec["pole_interval"]), branch.tag, branch.space,
             bool(branch.neg_omega_half))).encode())
+        add_array((*spec["state_interval"], *spec["pole_bounds"],
+                   spec["E_ref_A"], spec["envelope"]))
         for key in ("pole_indices", "state_indices", "raw_state_energy"):
             add_array(spec[key])
         for problem in (spec["problem"], spec["validation"]):
@@ -105,8 +123,7 @@ def _load_plan_cache(path, fingerprint, n_specs):
         raise RuntimeError(
             f"could not read delivered-plan cache {path!r}: {exc}") from exc
     if (not isinstance(payload, dict)
-            or payload.get("version") != _PLAN_CACHE_VERSION
-            or payload.get("fingerprint") != fingerprint):
+            or payload.get("version") != _PLAN_CACHE_VERSION):
         return None
     fits = payload.get("fits")
     if not isinstance(fits, list) or len(fits) != int(n_specs):
@@ -114,7 +131,43 @@ def _load_plan_cache(path, fingerprint, n_specs):
             f"delivered-plan cache {path!r} has an invalid fit census")
     return (fits, int(payload["free_pairs"]),
             float(payload["required_cost"]),
-            int(payload["window_tau_pairs"]))
+            int(payload["window_tau_pairs"]),
+            payload.get("fingerprint") == fingerprint)
+
+
+def _validate_cached_fits(specs, fits, *, eta, factor_cap, pair_ceiling,
+                          total_absolute):
+    """Re-certify cached nodes and weights on the live measured problems."""
+    if len(fits) != len(specs):
+        return None
+    required_cost = 0.0
+    for spec, fit in zip(specs, fits):
+        try:
+            times = np.asarray(fit["times"], np.complex128)
+            weights = np.asarray(fit["weights"], np.complex128)
+            residual_target = float(fit["residual_target"])
+            metrics = _rule_metrics(spec["validation"], times, weights)
+            factor = _factor_growth(spec, times, eta)
+        except (KeyError, TypeError, ValueError, FloatingPointError,
+                np.linalg.LinAlgError):
+            return None
+        if (times.ndim != 1 or weights.shape != times.shape
+                or not times.size or not _rule_accepted(
+                    metrics, residual_target)
+                or max(factor) > float(factor_cap)):
+            return None
+        required = max(
+            metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
+            / AMPLIFICATION_NOISE_SAFETY)
+        required_cost += float(spec["envelope"] * required)
+        fit.update(metrics=metrics, factor_growth=factor,
+                   required_target=required,
+                   absolute_cost=float(spec["envelope"] * required))
+    if (sum(int(np.asarray(fit["times"]).size) for fit in fits)
+            > int(pair_ceiling)
+            or required_cost > float(total_absolute)):
+        return None
+    return float(required_cost)
 
 
 def _save_plan_cache(path, fingerprint, fits, free_pairs, required_cost,
@@ -959,8 +1012,21 @@ def build_delivered_sigma_windows(
         plan_cache_path, cache_fingerprint, len(specs))
     cache_status = "disabled" if plan_cache_path is None else "hit"
     if cached is not None:
-        fits, free_pairs, required_cost, window_tau_pairs = cached
-    else:
+        (fits, free_pairs, required_cost, window_tau_pairs,
+         fingerprint_match) = cached
+        validated_cost = _validate_cached_fits(
+            specs, fits, eta=eta, factor_cap=factor_cap,
+            pair_ceiling=pair_ceiling, total_absolute=total_absolute)
+        if validated_cost is None:
+            cached = None
+        else:
+            required_cost = validated_cost
+            cache_status = "hit" if fingerprint_match else "validated_hit"
+            if not fingerprint_match:
+                _save_plan_cache(
+                    plan_cache_path, cache_fingerprint, fits, free_pairs,
+                    required_cost, window_tau_pairs)
+    if cached is None:
         cache_status = "disabled" if plan_cache_path is None else "miss"
         candidates_by_window = [
             _candidate_rules(spec, eta, pair_ceiling, factor_cap)
