@@ -81,8 +81,7 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import (resolve_delivered_max_direct_terms,
-                         resolve_delivered_tau_grid, resolve_sigma_plan)
+from .sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
 from .wavefunction_bundle import (face_kernel_kwargs,
                                   projected_state_amplitude_envelope)
 
@@ -1679,11 +1678,7 @@ def compute_sigma_c_ppm_omega_grid(
             crossing_eps_q=crossing_eps_q,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
             tau_grid_mode=tau_grid_mode,
-            max_direct_terms=resolve_delivered_max_direct_terms(),
             edge_factor=edge_factor, mesh_xy=mesh_xy)
-        if geometry["direct_term_count"] != 0 or any(
-                row.direct for row in shared_plan):
-            raise AssertionError("delivered product planner emitted direct work")
         for report in geometry["branches"]:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
             delivered_windows[report["tag"]] = [

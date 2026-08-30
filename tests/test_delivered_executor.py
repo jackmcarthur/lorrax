@@ -8,7 +8,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from gw.mpa.delivered_windows import build_delivered_sigma_windows
-from gw.mpa.sigma import _batch_rows
+from gw.mpa.sigma import _batch_rows, _require_product_plan
 from gw.ppm_windows import _SigmaBranch
 
 
@@ -53,6 +53,17 @@ def test_mpa_executor_has_one_tau_kernel_factory_and_no_delivered_factory():
     assert len(calls) == 1
     assert "tuple_components" not in executor + kernel
     assert "get_shared_sigma_direct_kernel" not in executor + kernel
+
+
+def test_old_receipt_with_direct_work_refuses_by_path():
+    """A stale pairwise receipt is rejected before executor dispatch."""
+    geometry = {"direct_term_count": 1, "branches": []}
+    with np.testing.assert_raises_regex(
+            ValueError,
+            "delivered plan receipt '/tmp/old-plan.pkl' contains direct terms"):
+        _require_product_plan(
+            [_range_row((0,))], geometry,
+            receipt_path="/tmp/old-plan.pkl")
 
 
 def test_planner_refuses_an_unattainable_crossing_without_direct_fallback():
@@ -113,7 +124,6 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
     assert len(plan) == 1
     assert seen[0][0] == "crossing"
     np.testing.assert_array_equal(seen[0][1], omega)
-    assert report["direct_term_count"] == 0
     assert plan[0].state_indices is None
     np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 4])
     np.testing.assert_array_equal(plan[0].omega_idx, np.arange(omega.size))
@@ -122,7 +132,7 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
         "state_interval_x_pole_interval")
 
 
-def test_metallic_style_crossing_uses_one_bounded_zero_direct_rule():
+def test_metallic_style_crossing_uses_one_bounded_product_rule():
     """A metallic crossing is integrated by one eta-damped product rule."""
     energies = np.linspace(-0.7, 0.7, 8)
     omega = np.linspace(0.1, 0.9, 5)
@@ -138,12 +148,9 @@ def test_metallic_style_crossing_uses_one_bounded_zero_direct_rule():
     plan, report = build_delivered_sigma_windows(
         [poles], [residues], [branch], omega,
         regularization_width_ry=0.05,
-        envelope_relative_target=1.0e-4, max_nodes=64,
-        max_direct_terms=4)
+        envelope_relative_target=1.0e-4, max_nodes=64)
 
     assert len(plan) == 1
-    assert report["global_direct_term_ceiling"] == 4
-    assert report["direct_term_count"] == 0
     assert report["window_tau_pairs"] <= 64
     window = report["branches"][0]["windows"][0]
     assert window["kind"] == "crossing"
@@ -152,7 +159,6 @@ def test_metallic_style_crossing_uses_one_bounded_zero_direct_rule():
     assert window["noise_budget_met"]
     assert plan[0].state_indices is None
     np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 8])
-    assert not any(row.direct for row in plan)
 
 
 def test_metal_oneshot_threads_one_occupation_state_to_fit_and_sigma():

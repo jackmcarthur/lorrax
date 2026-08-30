@@ -18,8 +18,7 @@ from gw.ppm_sigma import (SigmaOmegaResult,
                           pad_sigma_window, strip_sigma_window)
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_plan import (resolve_delivered_max_direct_terms,
-                           resolve_delivered_plan_cache,
+from gw.sigma_plan import (resolve_delivered_plan_cache,
                            resolve_delivered_tau_grid, resolve_sigma_plan)
 from gw.wavefunction_bundle import (face_kernel_kwargs,
                                     projected_state_amplitude_envelope)
@@ -75,6 +74,34 @@ def _batch_rows(row, batch):
         phase_real,
         None,
     )
+
+
+def _require_product_plan(plan, geometry=None, *, receipt_path=None):
+    """Refuse saved or live plans containing explicit state--pole work.
+
+    Product windows are the only bounded-complexity execution contract.  A
+    receipt is checked before its rows reach the executor so an obsolete
+    receipt cannot silently recover the deleted pairwise route.
+    """
+    explicit_rows = sum(
+        getattr(row, "state_indices", None) is not None
+        or bool(getattr(row, "direct", False))
+        for row in plan)
+    recorded_rows = 0
+    if geometry is not None:
+        recorded_rows += int(geometry.get("direct_term_count", 0))
+        recorded_rows += sum(
+            int(branch.get("direct_term_count", 0))
+            for branch in geometry.get("branches", ()))
+    if not explicit_rows and not recorded_rows:
+        return
+    if receipt_path is not None:
+        raise ValueError(
+            f"delivered plan receipt {receipt_path!r} contains direct terms; "
+            "delete the receipt and replan with product windows")
+    raise ValueError(
+        "MPA Sigma execution requires Cartesian product windows; "
+        "explicit state--pole work is not supported")
 
 
 def _integrate_sigma_batches(
@@ -165,16 +192,11 @@ def _integrate_sigma_batches(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
         **face_kwargs)
-    if any(getattr(row, "state_indices", None) is not None
-           or bool(getattr(row, "direct", False)) for row in plan):
-        raise ValueError(
-            "MPA Sigma execution requires Cartesian product windows; "
-            "explicit delivered tuples/direct terms have no separate kernel")
+    _require_product_plan(plan)
     small = NamedSharding(mesh_xy, P())
 
     n_sweeps = n_tau = 0
     logical_tau_pairs = 0
-    direct_terms = direct_frequency_dispatches = 0
     batch_size = int(pole_batch_size)
     sweep_started = False
     for lo, Omega, B in batches:
@@ -247,8 +269,7 @@ def _integrate_sigma_batches(
     print_fn(
         f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
         f"({n_poles} poles, batches of {batch_size}); "
-        f"{direct_terms} direct terms in {direct_frequency_dispatches} "
-        f"frequency dispatches; {transform_saving} undispatched logical tau; "
+        f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
     return SigmaOmegaResult(
         omega_ry=omega,
@@ -452,7 +473,6 @@ def compute_sigma_c_mpa_omega_grid(
                 measure_delivered_sigma_pole_batch,
             )
             tau_grid_mode = resolve_delivered_tau_grid()
-            direct_ceiling = resolve_delivered_max_direct_terms()
             delivered_cache_path = resolve_delivered_plan_cache()
             delivered_max_nodes = max(
                 int(max_rank), int(crossing_max_nodes))
@@ -463,7 +483,11 @@ def compute_sigma_c_mpa_omega_grid(
                     "envelope_relative_target": target_error,
                     "max_nodes": delivered_max_nodes,
                     "tau_grid_mode": tau_grid_mode,
-                    "max_direct_terms": direct_ceiling,
+                    # Complete-plan v1 included this retired field in its
+                    # fingerprint.  It is immutable receipt-schema salt, not
+                    # a planner argument or execution limit; keeping it lets
+                    # certified product-only receipts survive the deletion.
+                    "max_direct_terms": 32,
                     "edge_factor": edge_factor,
                     "pole_batch_size": pole_batch_size,
                 })
@@ -471,6 +495,8 @@ def compute_sigma_c_mpa_omega_grid(
                 delivered_cache_path, request_fingerprint, branches)
             if cached is not None:
                 plan, geometry = cached
+                _require_product_plan(
+                    plan, geometry, receipt_path=delivered_cache_path)
             else:
                 state_amplitudes = projected_state_amplitude_envelope(
                     wfns, state_bands=wfns.slices.sigma_sum,
@@ -507,7 +533,6 @@ def compute_sigma_c_mpa_omega_grid(
                     crossing_eps_q=1.0e-3,
                     use_shipped_minimax_tables=True,
                     tau_grid_mode=tau_grid_mode,
-                    max_direct_terms=direct_ceiling,
                     edge_factor=edge_factor,
                     measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
                     plan_cache_path=delivered_cache_path,
@@ -526,8 +551,7 @@ def compute_sigma_c_mpa_omega_grid(
                 f"grid={geometry['tau_grid_mode']}, "
                 f"plan_cache={geometry['plan_cache_status']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-                f"{geometry['distinct_tau_count']} branch-distinct tau, "
-                f"{geometry['direct_term_count']} direct terms")
+                f"{geometry['distinct_tau_count']} branch-distinct tau")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:
                     print_fn(
