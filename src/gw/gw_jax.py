@@ -13,7 +13,7 @@ in this file, in execution order:
                                                            #   4-branch τ-integration]
                                                            #   ⊕ q→0 head channel        (sigma_dispatch)
     Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
-    E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
+    E_qp, U_qp      = accepted SC state | eigh(H0 + Σ)     # terminal eigensystem       (sc_iteration / degen_average)
 	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
@@ -855,7 +855,9 @@ def main(argv=None):
 	timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
-	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
+	# (Σ_xc + V_H, Ry, DFT basis, replicated).  One-shot diagonalises that
+	# raw operator below; SC returns the eigensystem of its accepted,
+	# partitioned ``state_final.H_qp_dft`` from the iteration owner.
 	# ``rotations_written`` is run_sc_driver's own report of whether it
 	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
 	# than re-deriving the predicate.
@@ -1033,7 +1035,7 @@ def main(argv=None):
 		+ sigma_c_at_dft_ev
 		if sigma_c_at_dft_ev is not None else None)
 
-	# ---- Single H-build + diagonalization on replicated arrays ----
+	# ---- Terminal output eigensystem ----
 	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
 	# on a NaN-bearing matrix returns without complaining, and the garbage
 	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
@@ -1059,16 +1061,27 @@ def main(argv=None):
 		       "Σ is a defect in the contraction or in what was handed to "
 		       "it, not a convergence problem.")
 
-	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
-	# one statement and normally seconds, but it is O(nk·nb³) and it is the
-	# only dense LAPACK call on the post-Σ path, so it is the row that tells
-	# you when the band window (not the physics) became the cost.
-	with timing.section("gw_jax.qp_eigh") as _sec_eigh:
-		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
-		_sec_eigh.watch(E_full, U_full)
+	if qp_solver is QPSolver.SELF_CONSISTENT:
+		# The accepted SC carry has already passed the protected/in-range/
+		# scissored partition.  Rebuilding H from the last raw SigmaResult here
+		# silently discards that policy and can change both E and U.  The SC
+		# owner solves ``state_final.H_qp_dft`` once through distrib_la and
+		# returns full-BZ compatibility arrays (including KStarMap's TR
+		# conjugation); optional WFN artifacts reuse the same solve.
+		E_full = sc_result.E_qp_full_ry
+		U_full = sc_result.U_dft_to_qp_full
+	else:
+		# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.
+		# Preserve the established one-shot expression exactly.
+		with timing.section("gw_jax.qp_eigh") as _sec_eigh:
+			H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+			E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+			_sec_eigh.watch(E_full, U_full)
 	sanity.refuse_nonfinite(
-		"E_qp (eigh of H_QP)", E_full, print_fn=print0,
+		("E_qp (accepted partitioned SC H_QP)"
+		 if qp_solver is QPSolver.SELF_CONSISTENT
+		 else "E_qp (eigh of H_QP)"),
+		E_full, print_fn=print0,
 		detail="LAPACK returns without complaining on a NaN-bearing matrix, "
 		       "so this is the last place a NaN spectrum can be stopped "
 		       "before eqp0/eqp1/WFN_qp.h5.")
@@ -1076,9 +1089,8 @@ def main(argv=None):
 
 	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
 	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
-	# (using state_final.H_qp_dft) — same physics, slightly different
-	# numerics from the post-Σ-seam eigh path.  Skip the second write
-	# in SC to avoid clobbering.
+	# from the same accepted terminal eigensystem now carried into GWResults.
+	# Skip the second write in SC to avoid clobbering.
 	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
 		write_qp_wfn_oneshot(
 			U_full, E_full, wfn=wfn, band_slices=band_slices,

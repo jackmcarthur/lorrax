@@ -395,10 +395,22 @@ class SCOutputs:
 
 @dataclass(frozen=True)
 class SCDriverResult:
-    """Final, basis-labelled products returned to :mod:`gw.gw_jax`."""
+    """Final, basis-labelled products returned to :mod:`gw.gw_jax`.
+
+    ``E_qp_full_ry`` and ``U_dft_to_qp_full`` are host compatibility arrays
+    on the full BZ.  The columns obey
+    ``U[k,m,n] = <DFT_m|QP_n>``.  Inside an exactly degenerate subspace the
+    column gauge is arbitrary; consumers comparing different eigensolvers or
+    meshes must compare the subspace projector rather than individual U's.
+    This is the incumbent terminal host/output compatibility seam, not a
+    claim that the still-open large-system SC carry/output replication problem
+    has been solved.
+    """
 
     sigma_result_dft: SigmaResult
     sigma_total_dft: jax.Array
+    E_qp_full_ry: np.ndarray
+    U_dft_to_qp_full: np.ndarray
     rms_history_ev: list[float]
     rotations_written: bool
     static_head_terms_dft: object | None
@@ -4498,25 +4510,52 @@ def run_sc_driver(
         ),
     )
 
+    # The terminal accepted eigensystem has ONE owner and ONE solve.  It is
+    # the eigensystem of the already partitioned/scissored SC carry, not of
+    # the last raw ``kin_ion + Sigma`` map output.  Solve on the state's own
+    # k-set, then use the incumbent KStarMap operation exactly once so the
+    # WFN writer and GWResults share one full-BZ result.  For an exactly
+    # degenerate manifold the columns of U retain the eigensolver's arbitrary
+    # gauge; star broadcast preserves that chosen gauge (and applies the
+    # antiunitary conjugation), while energies and subspace projectors remain
+    # the gauge-invariant comparison objects.
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
+    with timing.section("sc.final_eigh"):
+        final_eigensystem = final_qp_eigenstates(
+            state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy, config=config,
+            state_capacity=float(spin_degeneracy_factor(wfn)),
+            clamp_tol=float(config.occupation_clamp_tol), print_fn=print_fn)
+    E_qp_full_ry, U_dft_to_qp_full = _loop_arrays_on_full_bz(
+        final_eigensystem[:2], kstar=kstar_io,
+        state_on_ibz=kstar is not None)
+    final_eigensystem_full_bz = (
+        E_qp_full_ry, U_dft_to_qp_full, final_eigensystem[2])
+    del final_eigensystem
+    nk_full_expected = int(sym.unfolded_kpts.shape[0])
+    if (int(E_qp_full_ry.shape[0]) != nk_full_expected
+            or int(U_dft_to_qp_full.shape[0]) != nk_full_expected):
+        raise RuntimeError(
+            "GATE sc_final_eigensystem_full_bz: the terminal accepted "
+            f"state produced E/U with nk={int(E_qp_full_ry.shape[0])}/"
+            f"{int(U_dft_to_qp_full.shape[0])}, but the generic GWResults "
+            f"contract requires full-BZ nk={nk_full_expected}; "
+            f"state_on_ibz={kstar is not None}, kstar={kstar_io!r}")
+
     # Post-SC dumps: WFN_qp.h5 (drop-in BSE / restart input),
     # qp_wfn_rotations.h5 ((U, E_qp) companion), and the converged
     # sigma_mnk.h5 (intermediate iterations skipped the H5 write, so
-    # this is the single end-of-run write).  WFN_qp.h5 uses the eigh of
-    # ``state_final.H_qp_dft`` — the converged DFT-basis H — so its
-    # eigenvalues + U are the *true* QP eigenstates of the SC fixed
-    # point (the driver's post-Σ-seam eigh differs slightly because the
-    # SC carry applies the band partition).
+    # this is the single end-of-run write).  Both optional artifacts reuse
+    # the terminal result above; enabling them must not add a second solve.
     rotations_written = False
     if config.debug.write_wfn_h5:
         dump_qp_wfn_artifacts(
-            state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-            kstar=kstar_io, state_on_ibz=kstar is not None,
+            state_final, eigensystem_full_bz=final_eigensystem_full_bz,
+            state_on_ibz=kstar is not None,
             wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
             logical_band_stop=int(meta.b_id_4_user),
             output_dir=input_dir,
             qp_rotations_k_storage=config.qp_rotations_k_storage,
             print_fn=print_fn,
-            clamp_tol=float(config.occupation_clamp_tol),
         )
         rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
@@ -4631,6 +4670,8 @@ def run_sc_driver(
     return SCDriverResult(
         sigma_result_dft=sigma_result_dft,
         sigma_total_dft=sigma_total,
+        E_qp_full_ry=E_qp_full_ry,
+        U_dft_to_qp_full=U_dft_to_qp_full,
         rms_history_ev=rms_history,
         rotations_written=rotations_written,
         static_head_terms_dft=static_head_terms_dft,
@@ -4640,8 +4681,10 @@ def run_sc_driver(
 
 def final_qp_eigenstates(
     state: SCState, *, n_occ: int, mesh_xy: Mesh,
+    config,
     state_capacity: float | None = None,
     clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
+    print_fn: Callable = print,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Diagonalise the converged ``state.H_qp_dft`` and return the QP eigenstates.
 
@@ -4661,21 +4704,13 @@ def final_qp_eigenstates(
     eigenvalues, so the midgap over the IBZ and over the full BZ are the
     same number.
 
-    Returned arrays are host-side numpy (not jax.Array) since the
-    typical consumers (WFN_qp.h5 writer, eqp.dat tooling) operate on
-    NumPy.  Use this once after :func:`run_self_consistency` to extract
-    the (E_qp_ry, U_qp, efermi_ry) needed for downstream rotation +
-    serialisation.
-
-    THE ONE PLACE THAT KEEPS THE REPLICATED U, deliberately.  The SC loop
-    asks ``_diagonalize_and_get_efermi`` for U at
-    ``qsgw_density.band_rotation_spec`` because its consumers are device
-    rotations; this function's only consumers are ``np.asarray`` two lines
-    below and the two h5py writers behind it, which need the whole
-    ``(nk, nb, nb)`` on the host on rank 0 whatever the device layout is.
-    Sharding U here would buy nothing and add a gather, and the host read
-    would then need the same guard ``gw_iteration_map``'s k-star broadcast
-    carries.
+    The solve goes through :func:`_sc_eigh_bands`, hence through the same
+    :mod:`gw.qsgw_density` / ``distrib_la`` owner and logical-band padding
+    seam as every repeated SC diagonalisation.  The returned arrays cross to
+    host exactly once at the established output compatibility seam; the
+    optional h5py writers and generic ``GWResults`` then share them.  This
+    preserves the incumbent host-output contract; it deliberately does not
+    solve the separately tracked replicated SC carry/output scaling problem.
 
     Returns
     -------
@@ -4683,8 +4718,14 @@ def final_qp_eigenstates(
     U_kmn     : (nk, nb_active, nb_active) complex128, ``U[k, m, n] = ⟨DFT_m | QP_n⟩``
     efermi_ry : float, midgap of the converged eigenvalues
     """
-    E_ry, U, efermi_ry = _diagonalize_and_get_efermi(
-        state.H_qp_dft, n_occ, mesh_xy)
+    nb = int(state.H_qp_dft.shape[1])
+    eigh_kind = _resolve_sc_eigh(nb, mesh_xy, config, print_fn=print_fn)
+    E_ry, U = _sc_eigh_bands(
+        state.H_qp_dft, kind=eigh_kind, mesh_xy=mesh_xy, config=config)
+    efermi_ry = _midgap_efermi(E_ry, n_occ)
+    from common.collectives import gather_to_host
+    E_host = gather_to_host(E_ry)
+    U_host = gather_to_host(U)
     # ONE omega reference, fifth site (the final writers): the midgap rule
     # is the insulating convention. A metallic run's eqp/sigma writers
     # evaluated Sigma_c at midgap — 2.66 eV above the loop's fixed-N mu on
@@ -4701,7 +4742,7 @@ def final_qp_eigenstates(
                 "state_capacity (spin_degeneracy_factor(wfn)) to place the "
                 "final mu; got None. The caller has the WFN in scope.")
         from .efermi import solve_mp1_occupations
-        _E_np = np.asarray(E_ry, dtype=np.float64)
+        _E_np = np.asarray(E_host, dtype=np.float64)
         _st = state.occupation_state
         _mu_ry, _ = solve_mp1_occupations(
             _E_np,
@@ -4718,8 +4759,8 @@ def final_qp_eigenstates(
         )
         efermi_ry = float(_mu_ry)
     return (
-        np.asarray(E_ry, dtype=np.float64),
-        np.asarray(U, dtype=np.complex128),
+        np.asarray(E_host, dtype=np.float64),
+        np.asarray(U_host, dtype=np.complex128),
         float(efermi_ry),
     )
 
@@ -4861,9 +4902,7 @@ def dump_sigma_omega_h5_final(
 
 def dump_qp_wfn_artifacts(
     state: SCState, *,
-    n_occ: int,
-    mesh_xy: Mesh,
-    kstar=None,                          # IBZ <-> full BZ map (KStarMap)
+    eigensystem_full_bz: tuple[np.ndarray, np.ndarray, float],
     state_on_ibz: bool = False,          # k-set ``state.H_qp_dft`` is on
     wfn,                                 # WFNReader (source of base coeffs + crystal)
     sym,                                 # SymMaps (full-BZ k-list + kirr_fullids)
@@ -4873,11 +4912,12 @@ def dump_qp_wfn_artifacts(
     output_dir: str,
     qp_rotations_k_storage: str = "auto",
     print_fn: Callable = print,
-    clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[str, str, float]:
     """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
 
-    Diagonalises the converged ``state.H_qp_dft`` once, then writes:
+    Consumes the caller's one terminal eigensystem of the converged
+    ``state.H_qp_dft``, already placed on the full BZ through the incumbent
+    KStarMap operation, then writes:
 
     * ``WFN_qp.h5`` — full BGW-format wavefunction file with active-block
       ψ rotated by ``U`` and active-block energies replaced by ``E_qp``;
@@ -4931,13 +4971,13 @@ def dump_qp_wfn_artifacts(
       the consumer indexes ``U_mnk`` by full-BZ index
       (postprocess/rotate_wfn_to_qp.py:159).  In an SC run this is the sole
       owner: the later generic result writer is told not to overwrite it
-      from its slightly different post-Sigma eigensolve.
+      even though the generic result now carries these same terminal E/U.
 
-    ``state_on_ibz`` says which k-set the loop ran on (``config.sc_on_ibz``)
-    and ``kstar`` is the map.  The loop's rows reach the full BZ through
-    :func:`_loop_arrays_on_full_bz` and the file wedge through the service;
-    there is no star-wedge → file-wedge hop, because there is no such
-    operation.
+    ``state_on_ibz`` says which k-set the loop ran on (``config.sc_on_ibz``).
+    The caller has already put those rows on the full BZ through
+    :func:`_loop_arrays_on_full_bz`; this writer reaches the file wedge from
+    there through the service.  There is no star-wedge → file-wedge hop,
+    because there is no such operation.
 
     ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
     is required only when the final map used an energy-only tail scissor.
@@ -4954,13 +4994,7 @@ def dump_qp_wfn_artifacts(
 
     from file_io.qp_wfn import write_qp_rotations_h5, write_qp_wfn_h5
 
-    from psp.get_DFT_mtxels import spin_degeneracy_factor
-    enk_loop_ry, U_loop, efermi_ry = final_qp_eigenstates(
-        state, n_occ=n_occ, mesh_xy=mesh_xy,
-        state_capacity=float(spin_degeneracy_factor(wfn)),
-        clamp_tol=float(clamp_tol))
-    enk_full_ry, U_full = _loop_arrays_on_full_bz(
-        (enk_loop_ry, U_loop), kstar=kstar, state_on_ibz=state_on_ibz)
+    enk_full_ry, U_full, efermi_ry = eigensystem_full_bz
     # Full BZ → file wedge, by name.  One reduction, two arrays; the k
     # labels ``write_qp_wfn_h5`` writes are ``wfn.kpoints`` and this is the
     # selection that produces exactly those rows in exactly that order.
@@ -4976,13 +5010,13 @@ def dump_qp_wfn_artifacts(
             or nk_full != int(sym.unfolded_kpts.shape[0])):
         raise ValueError(
             f"dump_qp_wfn_artifacts: k-set placement failed — loop nk="
-            f"{int(U_loop.shape[0])} (on_ibz={state_on_ibz}) gave "
+            f"{int(state.H_qp_dft.shape[0])} (on_ibz={state_on_ibz}) gave "
             f"WFN_qp nk={nk_wfn_got} (need wfn.nkpts={nk_wfn_want}) and "
             f"rotations nk={nk_full} (need full BZ "
-            f"{int(sym.unfolded_kpts.shape[0])}); kstar={kstar!r}")
+            f"{int(sym.unfolded_kpts.shape[0])})")
     print_fn(f"  QP dump k-sets: WFN_qp {nk_wfn_got} (file wedge), "
              f"rotations {nk_full} (full BZ), "
-             f"loop {int(U_loop.shape[0])}"
+             f"loop {int(state.H_qp_dft.shape[0])}"
              f"{' (star wedge)' if state_on_ibz else ' (full BZ)'}")
     qp_wfn_path = os.path.join(output_dir, "WFN_qp.h5")
     qp_rot_path = os.path.join(output_dir, "qp_wfn_rotations.h5")
