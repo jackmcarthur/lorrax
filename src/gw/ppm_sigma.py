@@ -81,7 +81,7 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
+from .sigma_plan import resolve_sigma_plan
 from .wavefunction_bundle import (face_kernel_kwargs,
                                   projected_state_amplitude_envelope)
 
@@ -1656,7 +1656,7 @@ def compute_sigma_c_ppm_omega_grid(
         # causal branches are still planned independently, so this does not
         # introduce a time-reversal identification at the W producer seam.
         from .mpa.delivered_windows import build_delivered_sigma_windows
-        tau_grid_mode = resolve_delivered_tau_grid()
+        tau_grid_mode = "free"  # single grid mode; shared-grid dial removed (2026-08-31 ruling)
         Omega_one = jnp.expand_dims(Omega_abs, axis=0)
         B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
         state_amplitudes = projected_state_amplitude_envelope(

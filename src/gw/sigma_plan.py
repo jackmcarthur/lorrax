@@ -20,22 +20,6 @@ def resolve_sigma_plan() -> str:
     return mode
 
 
-def resolve_delivered_tau_grid() -> str:
-    """Resolve the delivered planner's per-branch tau-grid policy.
-
-    ``free`` preserves independently fitted window grids. ``shared`` makes
-    every quadrature window of a causal branch use one identical grid with
-    independently re-solved weights. Unknown values refuse before planning.
-    """
-    raw = os.environ.get("LORRAX_DELIVERED_TAU_GRID", "free").strip().lower()
-    mode = raw or "free"
-    if mode not in ("free", "shared"):
-        raise ValueError(
-            "LORRAX_DELIVERED_TAU_GRID must be 'free' or 'shared'; "
-            f"got {raw!r}")
-    return mode
-
-
 def resolve_delivered_plan_cache() -> str | None:
     """Resolve the optional measured-problem delivered-plan cache path.
 
@@ -47,5 +31,5 @@ def resolve_delivered_plan_cache() -> str | None:
     return os.path.abspath(os.path.expanduser(raw)) if raw else None
 
 
-__all__ = ["resolve_delivered_plan_cache", "resolve_delivered_tau_grid",
+__all__ = ["resolve_delivered_plan_cache",
            "resolve_sigma_plan"]

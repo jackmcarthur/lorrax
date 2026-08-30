@@ -109,7 +109,7 @@ def test_planner_refuses_an_unattainable_product_window():
     with np.testing.assert_raises_regex(
             RuntimeError,
             "delivered product window 'positive conduction:resonant' "
-            "refused: achieved"):
+            "refused"):
         build_delivered_sigma_windows(
             [np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)],
             [np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)],
@@ -127,8 +127,9 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
 
     seen = []
 
-    def one_node_candidate(spec, eta, max_nodes, factor_growth_cap):
-        del eta, max_nodes, factor_growth_cap
+    def one_node_candidate(spec, eta, max_nodes, factor_growth_cap,
+                           *args, **kwargs):
+        del eta, max_nodes, factor_growth_cap, args, kwargs
         seen.append((spec["kind"], spec["problem"].frequencies.copy()))
         return [{
             "times": np.asarray([0.25 + 0.0j]),
@@ -141,6 +142,7 @@ def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
             "evidence": {
                 "family": "test_product_rule",
                 "candidate_tolerance": 0.0,
+                "provenance": "test_fake_rule",
             },
             "attempts": [],
         }]

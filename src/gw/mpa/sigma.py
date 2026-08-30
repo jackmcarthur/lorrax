@@ -19,7 +19,7 @@ from gw.ppm_sigma import (SigmaOmegaResult,
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_plan import (resolve_delivered_plan_cache,
-                           resolve_delivered_tau_grid, resolve_sigma_plan)
+                           resolve_sigma_plan)
 from gw.wavefunction_bundle import (face_kernel_kwargs,
                                     projected_state_amplitude_envelope)
 
@@ -472,7 +472,9 @@ def compute_sigma_c_mpa_omega_grid(
                 load_complete_delivered_sigma_plan,
                 measure_delivered_sigma_pole_batch,
             )
-            tau_grid_mode = resolve_delivered_tau_grid()
+            # One grid mode only: the shared-grid dial was removed
+            # (owner ruling 2026-08-31; lookup rules carry their own nodes).
+            tau_grid_mode = "free"
             delivered_cache_path = resolve_delivered_plan_cache()
             delivered_max_nodes = max(
                 int(max_rank), int(crossing_max_nodes))
