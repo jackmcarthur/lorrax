@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 3
+_PLAN_CACHE_VERSION = 4
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1111,6 +1111,42 @@ def _crossing_geometry(problem, pole_sign):
     return oriented, gamma_min, span / gamma_min
 
 
+def _crossing_omega_patches(problem, pole_sign):
+    """Return the smallest equal contiguous omega patches HGL can cover.
+
+    Noncrossing problems and crossing problems within the widest shipped HGL
+    span return one identity patch.  Wider crossing problems try increasing
+    equal partitions of the omega rows and refuse if even one-row patches are
+    too wide.  The compact state/pole cells stay unchanged; only the omega
+    rows are rebuilt for each patch.  This is the seam where a future
+    user-specified Sigma window, with its own omega list and eta, can enter.
+    """
+    omega_rows = np.arange(problem.frequencies.size, dtype=np.int64)
+    if _window_kind(problem) != "crossing":
+        return (omega_rows,)
+    entries = [entry for entry in _mm.catalog().for_family("crossing")
+               if entry.target_kind == "hgl"
+               and entry.eps_q is not None
+               and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
+    if not entries:
+        raise RuntimeError("the shipped HGL family is empty")
+    widest_span = max(float(entry.range_max) for entry in entries)
+    for patch_count in range(1, omega_rows.size + 1):
+        patches = tuple(np.array_split(omega_rows, patch_count))
+        if all(_crossing_geometry(
+                ReciprocalMeasureProblem(
+                    frequencies=problem.frequencies[patch],
+                    internal_sums=problem.internal_sums,
+                    cell_masses=problem.cell_masses),
+                pole_sign)[2] <= widest_span + 1.0e-12
+               for patch in patches):
+            return patches
+    raise RuntimeError(
+        "crossing support cannot be served by omega product windows: "
+        f"even one-row patches exceed the widest shipped HGL span "
+        f"A={widest_span:.6g}")
+
+
 def _crossing_table_candidates(problem, pole_sign, relative_target,
                                max_nodes):
     """Yield HGL table rules whose scaled span and bound cover the support."""
@@ -1550,34 +1586,51 @@ def build_delivered_sigma_windows(
             else:
                 interval_code, product = built[0]
                 problem, validation, pole_indices = product
-            envelope_by_frequency = (
-                problem.cell_masses[None, :] / np.abs(problem.denominators)
-            ).sum(axis=1)
-            envelope = float(np.max(envelope_by_frequency))
             key = f"{branch.tag}:{name}"
             selected_raw = raw_energy[selected_states]
-            spec = {
-                "name": key, "branch": branch, "measure": measure,
-                "problem": problem, "validation": validation,
-                "kind": _window_kind(problem), "pole_sign": pole_sign,
-                "pole_interval": interval_code,
-                "pole_indices": pole_indices,
-                "state_positions": selected_states,
-                "state_indices": np.asarray(measure[2])[selected_states],
-                "raw_state_energy": selected_raw,
-                "state_interval": (float(state_lower), float(state_upper)),
-                "pole_bounds": ((0.0, np.inf) if interval_code == -1 else
-                                ((0.0, split) if interval_code == 0 else
-                                 (split, np.inf))),
-                "E_ref_A": float(np.min(selected_raw)),
-                "envelope": envelope, "branch_report": report,
-            }
-            specs.append(spec)
-            combined_envelope[positions] += envelope_by_frequency
+            omega_patches = _crossing_omega_patches(problem, pole_sign)
+            for patch_number, omega_rows in enumerate(omega_patches, start=1):
+                patch_problem = ReciprocalMeasureProblem(
+                    frequencies=frequencies[omega_rows],
+                    internal_sums=problem.internal_sums,
+                    cell_masses=problem.cell_masses)
+                patch_validation = ReciprocalMeasureProblem(
+                    frequencies=frequencies[omega_rows],
+                    internal_sums=validation.internal_sums,
+                    cell_masses=validation.cell_masses)
+                envelope_by_frequency = (
+                    patch_problem.cell_masses[None, :]
+                    / np.abs(patch_problem.denominators)
+                ).sum(axis=1)
+                envelope = float(np.max(envelope_by_frequency))
+                patch_count = len(omega_patches)
+                patch_name = (key if patch_count == 1 else
+                              f"{key}[p{patch_number}/{patch_count}]")
+                patch_positions = positions[omega_rows]
+                spec = {
+                    "name": patch_name, "branch": branch,
+                    "measure": measure, "problem": patch_problem,
+                    "validation": patch_validation,
+                    "kind": _window_kind(patch_problem),
+                    "pole_sign": pole_sign,
+                    "pole_interval": interval_code,
+                    "pole_indices": pole_indices,
+                    "state_positions": selected_states,
+                    "state_indices": np.asarray(measure[2])[selected_states],
+                    "raw_state_energy": selected_raw,
+                    "state_interval": (float(state_lower), float(state_upper)),
+                    "pole_bounds": ((0.0, np.inf) if interval_code == -1 else
+                                    ((0.0, split) if interval_code == 0 else
+                                     (split, np.inf))),
+                    "E_ref_A": float(np.min(selected_raw)),
+                    "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
+                    "omega_idx": patch_positions,
+                    "envelope": envelope, "branch_report": report,
+                }
+                specs.append(spec)
+                combined_envelope[patch_positions] += envelope_by_frequency
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
-        if report["window_count"] > 4:
-            raise AssertionError("product construction exceeded four windows")
         branch_reports.append(report)
 
     combined_scale = float(np.max(combined_envelope))
@@ -1657,14 +1710,16 @@ def build_delivered_sigma_windows(
                 f"{fit['evidence']['provenance']}"))
         output.append(SharedSigmaWindow(
             window=window, E_A=branch.E_A,
-            omega_abs=np.asarray(branch.omega_abs, np.float64),
-            omega_idx=np.asarray(branch.omega_idx, np.int64),
+            omega_abs=np.asarray(spec["omega_abs"], np.float64),
+            omega_idx=np.asarray(spec["omega_idx"], np.int64),
             pole_indices=spec["pole_indices"],
             bounds=_pole_bounds(len(spec["pole_indices"]), pole_lo, pole_hi),
             phase_real=np.zeros(len(spec["pole_indices"]), dtype=bool),
             band_weight=branch.band_weight))
         spec["branch_report"]["windows"].append({
             "name": spec["name"], "kind": spec["kind"],
+            "omega_abs_ry": np.asarray(spec["omega_abs"]).tolist(),
+            "omega_indices": np.asarray(spec["omega_idx"]).tolist(),
             "product_state_interval_ry": [state_lo, state_hi],
             "product_pole_interval_ry": [pole_lo, pole_hi],
             "pole_indices": spec["pole_indices"].tolist(),
