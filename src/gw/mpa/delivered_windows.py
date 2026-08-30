@@ -762,18 +762,27 @@ def measure_delivered_sigma_pole_fields(
             raise ValueError("pole and residue shard layouts differ")
         omega_local = Omega.addressable_data(0)
         residue_local = B.addressable_data(0)
+        factory_started = time.perf_counter()
         reducer = _device_pole_reducer(
             omega_local, residue_local, bins, eta, split)
-        local_payload_rows = tuple(
-            reducer(
+        factory_seconds = time.perf_counter() - factory_started
+        submit_seconds = []
+        local_payload_rows = []
+        for pole in range(int(Omega.shape[0])):
+            submit_started = time.perf_counter()
+            local_payload_rows.append(reducer(
                 omega_local, residue_local, jnp.asarray(pole, jnp.int32))
-            for pole in range(int(Omega.shape[0]))
-        )
+            )
+            submit_seconds.append(time.perf_counter() - submit_started)
+        readback_started = time.perf_counter()
         local_payload = np.asarray(
-            jax.device_get(local_payload_rows), np.float64)
+            jax.device_get(tuple(local_payload_rows)), np.float64)
+        readback_seconds = time.perf_counter() - readback_started
+        collective_started = time.perf_counter()
         payload = np.asarray(_sum_fixed_process_table(
             local_payload, mesh_xy, "pole-batch mass/moment table"),
             np.float64)
+        collective_seconds = time.perf_counter() - collective_started
         n_moments = 2 * 3 * bins * bins
         moments = payload[:, :n_moments].reshape(
             int(Omega.shape[0]), 2, 3, bins * bins)
@@ -784,7 +793,11 @@ def measure_delivered_sigma_pole_fields(
             print(
                 f"[delivered-census-profile] rank={process_rank()} "
                 f"device_field_measure={time.perf_counter() - started:.6f}s "
-                f"poles={int(Omega.shape[0])} host_bytes={payload.nbytes}",
+                f"poles={int(Omega.shape[0])} host_bytes={payload.nbytes} "
+                f"factory={factory_seconds:.6f}s "
+                f"submit={','.join(f'{value:.6f}' for value in submit_seconds)}s "
+                f"readback={readback_seconds:.6f}s "
+                f"collective={collective_seconds:.6f}s",
                 flush=True)
     else:
         moments, bad, live_count = _host_pole_moments(
