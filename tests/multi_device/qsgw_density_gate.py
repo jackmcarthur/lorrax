@@ -164,7 +164,7 @@ def main():
     herm = np.array_equal(rho_ab[1, 0], np.conj(rho_ab[0, 1]))
     d_spin_charge = float(np.max(np.abs(fields[0] - rho_ref))) / scale
     ok3b = (rho_ab.shape == (2, 2, *GRID)
-            and matrix_spec == P(None, None, None, None, None)
+            and matrix_spec == P()
             and herm and d_spin_charge <= RTOL)
     p0(f"[qd] 3b. resident rho_ab shape={rho_ab.shape} spec={matrix_spec} "
        f"exact-Hermitian={herm} charge-rel={d_spin_charge:.3e}  "
