@@ -613,22 +613,17 @@ Consequence: an MPA-vs-GN-PPM energy difference mixes physics with a 5.7x
 broadening mismatch. No such comparison may be claimed without either
 equalizing xi/eta or carrying this caveat verbatim.
 
-### 5.4 Exchange, SX, Hartree: `diag(f)` end to end
+### 5.4 Exchange, SX, and Hartree occupations
 
-`gw.cohsex_sigma.build_Gij(occupation_state=...)` builds `G_ij = diag(f)`
-over the `Sigma` window, with a metallized window-coverage guard (refuses a
-window electron count off the state's target by more than `1e-8` — the same
-`V_H`-silently-small hazard the integer `nb_sigma >= nelec` guard prevents),
-and step occupations reproduce the integer projector bit for bit (the
-insulator/metal unification done where it is exact; asserted in
-`tests/test_mpa_sigma.py`). **Wiring status, landed at `bfa402a0`:** the
-carried `OccupationState` reaches all three call sites through
-`compute_cohsex_sigma`, `compute_v_h_sigma_x` and
-`compute_ppm_sigma_pipeline` -> `compute_sigma_c_ppm_omega_grid` ->
-`_compute_invalid_static_sigma`, with `None` the default at every link
-(insulating behaviour byte-identical; 8 previously-failing threading cells
-green, 133-passed focused suite on JID 57005734). Metallic
-`Sigma_x`/SX/`V_H` take `diag(f)`.
+`gw.cohsex_sigma.build_Gij(occupation_state=...)` builds
+`G_ij = diag(f)` for exchange and screened exchange. It refuses a Sigma
+window whose electron count differs from the occupation state by more than
+`1e-8`. Step occupations reproduce the insulating projector exactly.
+
+The same `OccupationState` reaches the dynamic Sigma pipeline and the live
+G-space Hartree build. Hartree uses every occupied band needed by the density;
+the screening occupation window does not truncate it. Charge and bispinor
+current use the same `f_kn` table in every self-consistent iteration.
 
 ### 5.5 Provenance stamps
 

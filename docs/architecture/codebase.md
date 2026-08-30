@@ -319,7 +319,11 @@ Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are
 
 ### 3.3 Key collective patterns
 
-- **Static COHSEX Σ path** (`gw_jax.sigma_sx/sigma_coh/hartree`): `_convolve(G, W)` uses per-device IFFT/FFT on the replicated 3-D k-axes (via `fft_helpers`) while keeping μ on `'x'` and ν on `'y'`. The final `project(psi_xr, psi_yn, Σ_k)` does two einsum contractions that end up replicated on (k, m, n).
+- **Static COHSEX Σ path** (`gw.cohsex_sigma`): `_convolve(G, W)` uses
+  per-device IFFT/FFT on the replicated three-dimensional k axes while
+  keeping μ on `'x'` and ν on `'y'`. The final band projection is
+  two-axis sharded. The Hartree matrix is built separately from the WFN by
+  `gw.kin_ion_io.compute_hartree_matrix` and stays `P(None,'x','y')`.
 
 - **χ₀ minimax kernel** (`w_isdf._get_chi_minimax_kernel`): `Gv` and `Gc` use *swapped* μ/ν ⇄ 'x'/'y' assignments (`_Gv_spec` μ=x, ν=y; `_Gc_spec` μ=y, ν=x) so that the final `einsum('Rambn,Rbnam->Rmn')` contracts over the two local axes and leaves output sharded `(μ_Y, ν_X)` — explicit `with_sharding_constraint` on `_chi_R_spec = P(None, 'y', 'x')` prevents XLA from replicating a 23 GB intermediate at Si 4×4×4 60 Ry μ=2400.
 
@@ -410,12 +414,12 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
     │    iff do_G0 and not use_ppm_sigma
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Static COHSEX                                                         │
+│ Static COHSEX and direct field                                        │
 │ ─────────────────────────────────────────────────────────────────────│
 │   sigma_sx(wfns, Gij, W_q) :   -project[ IFFT(G_occ)·IFFT(W) ·√Nk⁻¹ ]  │
 │   sigma_coh(wfns, W_q, V_q):  +½ project[ IFFT(G_all)·IFFT(W-V) ...]   │
-│   hartree(wfns, Gij, V_q) :      project[ V(q=0) · ρ ]                 │
-│   sig_x = sigma_sx(wfns, Gij, V_q)   # bare-exchange diagnostic      │
+│   compute_hartree_matrix(WFN):   solve V_H(G), project <m|V_H|n>       │
+│   sig_x = compute_sigma_x(wfns, Gij, V_q)  # bare exchange             │
 │   + static_head_terms_to_kij (exact q→0 band-diagonal shifts)         │
 └──────────────────────────────────────────────────────────────────────┘
     │
@@ -448,7 +452,7 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
 │   → sigma_mnk.h5                                                      │
 └──────────────────────────────────────────────────────────────────────┘
     │
-    │  sigma_total = sig_sx + sig_coh + sig_h
+    │  sigma_total = sig_sx + sig_coh + direct_hartree
     │  kin_ion = load_kin_ion_submatrix(kin_ion_file, b0, b3)
     │  H_qp = (kin_ion + sigma_total) hermitianized
     │  E_qp, U_qp = jax.vmap(jnp.linalg.eigh)(H_qp)
@@ -605,10 +609,13 @@ main                                       [gw/gw_jax.py]
  │       └─ flat-k FFTs via fft_helpers
  ├─ solve_w → _get_w_solve_fn (cached)      [gw/w_isdf.py]
  │   └─ shard_map( fori_loop( lu_factor + lu_solve ) )
- ├─ sigma_sx / sigma_coh / hartree          [gw/gw_jax.py]
+ ├─ compute_cohsex_sigma                     [gw/cohsex_sigma.py]
  │   ├─ build_G                              [gw/greens_function_kernel.py]
- │   ├─ _convolve (G·W/√Nk via IFFT/FFT)     [gw/gw_jax.py]
+ │   ├─ _convolve (G·W/√Nk via IFFT/FFT)     [gw/cohsex_sigma.py]
  │   └─ project                              [gw/wavefunction_bundle.py]
+ ├─ compute_hartree_matrix                   [gw/kin_ion_io.py]
+ │   ├─ build_hartree_potential              [psp/get_DFT_mtxels.py]
+ │   └─ sweep_matrix_elements                [common/mtxel_sweep.py]
  └─ _compute_static_head                     [gw/gw_jax.py]
      └─ head_correction.resolve_head_sample  [gw/head_correction.py]
          ├─ EPSReader.epshead                [file_io/epsreader.py]
@@ -685,7 +692,8 @@ main                                       [gw/gw_jax.py]
 | **Build G** | `gw/greens_function_kernel.py : build_G` |
 | **Σ band projection** | `gw/wavefunction_bundle.py : project`, `project_ri` |
 | **Reduce-scatter projection** | `gw/ppm_sigma.py : _make_project_ri_reduce_scatter` |
-| **Static Σ_SX / Σ_COH / V_H** | `gw/gw_jax.py : sigma_sx`, `sigma_coh`, `hartree` |
+| **Static Σ_SX / Σ_COH** | `gw/cohsex_sigma.py : compute_cohsex_sigma` |
+| **Live G-space V_H matrix** | `gw/kin_ion_io.py : compute_hartree_matrix` |
 | **q→0 head resolution** | `gw/head_correction.py : resolve_head_sample` |
 | **Exact static head terms** | `gw/head_correction.py : compute_static_head_terms`, `static_head_terms_to_kij` |
 | **Dipole S(ω)** | `common/chi_from_dipole.py : compute_S_omega` |

@@ -176,7 +176,7 @@ separate k-set mismatches were hit and fixed ONE TRACEBACK AT A TIME:
 
 | # | site | operand |
 |---|---|---|
-| 1 | `sigma_dispatch.py:360` | `hartree_basis_rotation` — needed `U_full` |
+| 1 | direct-field basis rotation | needed `U_full` |
 | 2 | `qsgw_utils.py:449` | `e_qp_ev` — needed `E_full` |
 | 3 | `qp_wfn.py:136` | the QP WFN writer wants **IBZ** (`wfn.nkpts`), so the blanket broadcast at the exit was wrong |
 | 4 | `sc_iteration.py:1042` | `_rotate_to_dft_basis` AFTER the loop: `last_sigma_basis_U` is IBZ, `last_sigma_result` is full-BZ |

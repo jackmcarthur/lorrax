@@ -46,8 +46,8 @@ Landed:
   and `compute_hartree_matrix` end to end at the same figures; ONE compile
   per sweep for all three.
 
-Not yet: the SlabIO write of `H[m_X,n_Y,k]` and the
-`hartree_basis_rotation` consumer audit (§6.4). The three CLI sinks are
+Not yet: the SlabIO write of `H[m_X,n_Y,k]` and the direct-field basis-rotation
+consumer audit (§6.4). The three CLI sinks are
 serial h5py writes, so the sharding is undone at the boundary by name
 (`blocks_to_host`) rather than pushed into them; that is the trade §6.4
 exists to remove and it has not been removed.
@@ -243,7 +243,7 @@ an unmasked `(0,0,0)`-padded table; keep that guard.
    `psp` already had; the dipole needs a replicated component axis
    (`Operator.ncomp`) so its three directions cost one sweep, not three.
 4. The collector + `SlabIO` write of `H[m_X,n_Y,k]`, then the **consumer
-   audit** — `sigma_dispatch`'s `hartree_basis_rotation`
+   audit** — the direct-field basis rotation
    (`einsum('kpm,kpq,kqn->kmn')`) today wants a full `(nb,nb)` per k, and per
    the owner's ruling that rotation itself must become distributed through the
    linalg FFI in this same layout.

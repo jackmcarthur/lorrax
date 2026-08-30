@@ -166,15 +166,9 @@ paths are sequential — and no test covers the combination, because the two
 branches were developed against different bases. Closing it means new schema
 fields, so it is recorded rather than fixed here.
 
-**(b) A permanent divergence from a live upstream branch.** `18c5b718` ports
-the `hartree_already_resolved` parameter but deliberately does not port
-upstream's flip of the live call site to `hartree_already_resolved=True`. In
-this tree the flip is a numerical no-op (`sigma_dispatch.py:891-892` zeroes
-`sig_h` when `source == "folded"`, and the `v_h_ext` substitution ends at
-`:921`); only a log line and the `hartree_rule` label would move. But it
-diverges permanently from
-`origin/fix/sigma-hartree-artifact-provenance-2026-08-25` and will
-re-conflict at the next merge of that branch. **Owner ruling wanted.**
+**(b) Direct-field branch divergence: resolved.** The live G-space builder is
+now the only Hartree path, so the old source-resolution merge conflict no
+longer exists.
 
 **(c) The evaluation-stamp wedge ruling** — §1a.
 

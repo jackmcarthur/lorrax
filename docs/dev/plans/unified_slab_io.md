@@ -12,7 +12,7 @@ Two write sites in `gw_jax` — both already routed through
 That's the entire target of v1:
 
 1. **Static COHSEX** — three `(nk, nb, nb)` C128 arrays (`sig_sx`,
-   `sig_coh`, `sig_h`), produced sharded under `mesh_xy` and currently
+   `sig_coh`, `direct_hartree`), produced sharded under `mesh_xy` and currently
    flattened to host via `np.array(...)` at
    [`gw_jax.py:500-501`](/pscratch/sd/j/jackm/lorrax_sandbox/sources/lorrax_C/src/gw/gw_jax.py#L500).
 2. **Dynamic Σ_c(ω)** — one `(n_omega, nk, nb, nb)` C128 tensor
@@ -171,7 +171,7 @@ write_sigma_omega_h5(
     sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
     sigma_c_kij_ev=ryd2ev * sigma_c_omega,
     sigma_sx_kij_ev=ryd2ev * sig_sx,
-    hartree_kij_ev=ryd2ev * sig_h)
+    hartree_kij_ev=ryd2ev * direct_hartree)
 
 # after — adds use_ffi_io + mesh, removes the `if meta.rank == 0:` guard
 #         (the helper handles rank-0 itself)
@@ -179,7 +179,7 @@ write_sigma_omega_h5(
     sigma_omega_h5_path, ppm_options.omega_grid_ev, None,
     sigma_c_kij_ev=ryd2ev * sigma_c_omega,
     sigma_sx_kij_ev=ryd2ev * sig_sx,
-    hartree_kij_ev=ryd2ev * sig_h,
+    hartree_kij_ev=ryd2ev * direct_hartree,
     mesh=mesh_xy,
     use_ffi_io=config.use_ffi_io)
 ```
