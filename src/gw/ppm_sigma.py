@@ -82,7 +82,8 @@ from .ppm_accumulators import (
     _MemoryTileSink,
 )
 from .sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
-from .wavefunction_bundle import face_kernel_kwargs
+from .wavefunction_bundle import (face_kernel_kwargs,
+                                  projected_state_amplitude_envelope)
 
 
 def _face_g_plan(mesh_xy: Mesh, face_shape):
@@ -1658,15 +1659,25 @@ def compute_sigma_c_ppm_omega_grid(
         tau_grid_mode = resolve_delivered_tau_grid()
         Omega_one = jnp.expand_dims(Omega_abs, axis=0)
         B_one = jnp.expand_dims(jnp.where(B_mask, B_corr, 0.0j), axis=0)
+        state_amplitudes = projected_state_amplitude_envelope(
+            wfns, state_bands=s.full, projection_bands=s.sigma)
+        # GN carries the loaded union because chi0 may own more bands than
+        # Sigma.  The bracketed Sigma executor stops at sigma_sum; make the
+        # planner's real state weight vanish on the same unused tail.
+        state_amplitudes = (
+            state_amplitudes
+            * wfns.band_mask(s.sigma_sum).astype(state_amplitudes.dtype))
         shared_plan, geometry = build_delivered_sigma_windows(
             [Omega_one] * len(branches), [B_one] * len(branches), branches,
             omega_req,
             regularization_width_ry=regularization_width_ry,
-            target_error=target_error,
+            envelope_relative_target=target_error,
+            state_amplitudes_by_branch=(
+                [state_amplitudes] * len(branches)),
             max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
             crossing_eps_q=crossing_eps_q,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-            tau_grid_mode=tau_grid_mode)
+            tau_grid_mode=tau_grid_mode, mesh_xy=mesh_xy)
         direct = [row for row in shared_plan if row.direct]
         if direct:
             # GN's branch executor still owns bracketed host-tile sinks and
@@ -1686,7 +1697,9 @@ def compute_sigma_c_ppm_omega_grid(
                 row.window for row in shared_plan[start:stop]]
         print_fn(
             f"  GN-PPM windows [delivered]: {geometry['n_windows']} logical "
-            f"windows, grid={geometry['tau_grid_mode']}, "
+            f"windows, target={geometry['envelope_relative_target']:.3g} "
+            "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
+            f"grid={geometry['tau_grid_mode']}, "
             f"{geometry['window_tau_pairs']} (window,tau) pairs, "
             f"{geometry['distinct_tau_count']} branch-distinct tau, "
             f"plan {geometry['plan_seconds']:.3f} s")

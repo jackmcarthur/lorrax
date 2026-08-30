@@ -7,10 +7,10 @@ For each causal branch the physical denominator is
 
 This module is the production port of DEV-80's ``hybrid_planner.py`` and
 ``run_study.lattice_measure``. It reduces each addressable pole shard onto
-the service's tail-refined cloud-in-cell lattice, partitions explicit
+a fixed compact cloud-in-cell lattice before any collective, partitions explicit
 state--leading-pole tuples by delivered-mass quantiles, apportions one
-conservative true-error envelope by ``mass * measured inverse-gap
-difficulty``, then uses the incumbent damped reciprocal fit for
+envelope-error budget by ``mass * measured inverse-gap difficulty``, then
+uses the incumbent damped reciprocal fit for
 sign-definite windows and the amplification-capped pane/HGL candidate fit
 for crossing windows.
 
@@ -32,8 +32,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common.collectives import (all_gather_processes, gather_to_host,
-                                process_rank)
+from common.collectives import (gather_to_host, process_count, process_rank,
+                                psum_replicate)
 from gw.minimax_screening import MinimaxNodes, solve_phase_minimax_bandwidth
 from gw.mpa.evaluator import damped_rectangle_positive_rule
 from gw.mpa.sigma_windows import SharedSigmaWindow
@@ -56,7 +56,8 @@ from minimax import (
 
 DEFAULT_LATTICE_BINS = 25
 DEFAULT_AMPLIFICATION_CAP = 10.0
-TRUE_ERROR_SAFETY = 0.8
+ENVELOPE_ERROR_SAFETY = 0.8
+FACTOR_GROWTH_CAP = 30.0
 WINDOW_COUNT = {"cond": 4, "val": 3}
 
 
@@ -109,8 +110,10 @@ def _branch_states(branch, amplitude):
             f"delivered Sigma branch {branch.tag!r} has no live states")
     pole_sign = 1.0 if branch.space == "cond" else -1.0
     flat_live = np.flatnonzero(live.reshape(-1)).astype(np.int32)
+    reference_live = mask & np.isfinite(energy)
+    reference = float(np.min(energy[reference_live]))
     return (pole_sign * energy.reshape(-1)[flat_live],
-            state_mass.reshape(-1)[flat_live], flat_live)
+            state_mass.reshape(-1)[flat_live], flat_live, reference)
 
 
 def _leading_indices(index, count):
@@ -149,25 +152,6 @@ def _local_pole_chunks(Omega, B):
                np.asarray(shard_O.data), np.asarray(shard_B.data))
 
 
-def _gather_variable(values, masses):
-    """Gather variable-length complex cells from every process."""
-    count = np.asarray(all_gather_processes(
-        np.asarray([values.size], dtype=np.int64))).reshape(-1)
-    width = int(np.max(count, initial=0))
-    if width == 0:
-        return np.empty(0, np.complex128), np.empty(0, np.float64)
-    value_pad = np.zeros(width, dtype=np.complex128)
-    mass_pad = np.zeros(width, dtype=np.float64)
-    value_pad[:values.size] = values
-    mass_pad[:masses.size] = masses
-    value_all = np.asarray(all_gather_processes(value_pad))
-    mass_all = np.asarray(all_gather_processes(mass_pad))
-    return (np.concatenate([value_all[row, :size]
-                            for row, size in enumerate(count)]),
-            np.concatenate([mass_all[row, :size]
-                            for row, size in enumerate(count)]))
-
-
 def _compress(values, masses, bins):
     if not values.size:
         return (np.empty(0, dtype=np.complex128),
@@ -177,7 +161,71 @@ def _compress(values, masses, bins):
     return cells, cell_mass
 
 
-def _pole_measures(branch, Omega, B, eta, amplitude, bins):
+def _axis_cloud_weights(values, nodes):
+    """Cloud-in-cell indices and weights on one fixed bounded axis."""
+    if nodes.size == 1:
+        zero = np.zeros(values.size, dtype=np.int64)
+        return ((zero, np.ones(values.size, dtype=np.float64)),)
+    lower = np.clip(np.searchsorted(nodes, values, side="right") - 1,
+                    0, nodes.size - 2)
+    width = nodes[lower + 1] - nodes[lower]
+    fraction = np.where(
+        width > 0.0,
+        (values - nodes[lower]) / np.where(width > 0.0, width, 1.0),
+        0.0,
+    )
+    return ((lower, 1.0 - fraction), (lower + 1, fraction))
+
+
+def _bounded_pole_moments(values, masses, bins, eta):
+    """Reduce one local pole shard to ``bins**2`` mass/moment cells.
+
+    Positive pole energy and nonnegative intrinsic width are mapped to the
+    fixed compact coordinates ``x/(x+eta)``.  The physical broadening
+    ``eta`` therefore resolves the near-pole end while the unbounded tail
+    approaches one without requiring data-dependent global quantiles.  Each
+    raw point deposits mass and its real/imaginary first moments onto four
+    neighboring cells.  Summing these fixed tables across any sharding gives
+    the same global centroids and never communicates a raw support value.
+    """
+    value = np.asarray(values, dtype=np.complex128).reshape(-1)
+    mass = np.asarray(masses, dtype=np.float64).reshape(-1)
+    bins = int(bins)
+    if value.shape != mass.shape:
+        raise ValueError("pole values and masses must have matching shapes")
+    if bins < 4:
+        raise ValueError("lattice_bins must be at least 4")
+    if not value.size:
+        return np.zeros((3, bins * bins), dtype=np.float64)
+    scale = float(eta)
+    intrinsic_width = np.maximum(-value.imag - scale, 0.0)
+    real_coordinate = value.real / (value.real + scale)
+    width_coordinate = intrinsic_width / (intrinsic_width + scale)
+    nodes = np.linspace(0.0, 1.0, bins, dtype=np.float64)
+    real_cloud = _axis_cloud_weights(real_coordinate, nodes)
+    width_cloud = _axis_cloud_weights(width_coordinate, nodes)
+    moments = np.zeros((3, bins * bins), dtype=np.float64)
+    for real_index, real_weight in real_cloud:
+        for width_index, width_weight in width_cloud:
+            index = real_index * bins + width_index
+            share = mass * real_weight * width_weight
+            np.add.at(moments[0], index, share)
+            np.add.at(moments[1], index, share * value.real)
+            np.add.at(moments[2], index, share * value.imag)
+    return moments
+
+
+def _sum_fixed_process_table(local, mesh_xy, label):
+    """All-reduce one fixed table; variable-length fallbacks are forbidden."""
+    if process_count() > 1 and mesh_xy is None:
+        raise ValueError(
+            f"distributed delivered planning needs mesh_xy to all-reduce "
+            f"its bounded {label}; a variable-length all-gather is not "
+            "permitted")
+    return psum_replicate(local, mesh_xy)
+
+
+def _pole_measures(branch, Omega, B, eta, amplitude, bins, mesh_xy):
     """Build compact pole measures plus executable tuple geometry.
 
     The spatial pole field is reduced once per leading pole.  Tuple mass and
@@ -191,12 +239,16 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
     carrier; pole indices retain their leading-axis identity in the streamed
     fit store.
     """
-    signed_energy, state_mass, state_indices = _branch_states(
+    signed_energy, state_mass, state_indices, E_ref_A = _branch_states(
         branch, amplitude)
     pole_sign = 1.0 if branch.space == "cond" else -1.0
     n_poles = int(Omega.shape[0])
-    local_values = [[] for _ in range(n_poles)]
-    local_masses = [[] for _ in range(n_poles)]
+    # Three float64 planes per leading pole: mass, mass*Re(Omega), and
+    # mass*Im(Omega).  This is the COMPLETE process-local carrier.  Its
+    # ceiling is n_poles * 3 * bins**2 scalars regardless of the number of
+    # spatial entries or addressable shards.
+    local_moments = [np.zeros((3, int(bins) ** 2), dtype=np.float64)
+                     for _ in range(n_poles)]
     bad_B = bad_pole = raw_count = 0
 
     for pole_indices, Omega_chunk, B_chunk in _local_pole_chunks(Omega, B):
@@ -216,14 +268,13 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
             if not np.any(live):
                 continue
             broadened = omega[live].real - 1.0j * (gamma[live] + eta)
-            cells, masses = _compress(
-                broadened, np.abs(residue[live]), bins)
-            local_values[int(pole_index)].append(cells)
-            local_masses[int(pole_index)].append(masses)
+            local_moments[int(pole_index)] += _bounded_pole_moments(
+                broadened, np.abs(residue[live]), bins, eta)
             raw_count += int(np.count_nonzero(live)) * int(signed_energy.size)
 
-    bad = np.asarray(all_gather_processes(
-        np.asarray([bad_B, bad_pole], dtype=np.int64))).reshape(-1, 2).sum(axis=0)
+    bad = _sum_fixed_process_table(
+        np.asarray([bad_B, bad_pole], dtype=np.int64), mesh_xy,
+        "refusal-count table")
     if int(bad[0]):
         raise ValueError(
             f"delivered Sigma poles contain {int(bad[0])} nonfinite residues")
@@ -233,16 +284,16 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
 
     pole_cells, pole_weights = [], []
     for pole_index in range(n_poles):
-        values = (np.concatenate(local_values[pole_index])
-                  if local_values[pole_index] else np.empty(0, np.complex128))
-        masses = (np.concatenate(local_masses[pole_index])
-                  if local_masses[pole_index] else np.empty(0, np.float64))
-        values, masses = _gather_variable(values, masses)
-        if not values.size:
+        moments = _sum_fixed_process_table(
+            local_moments[pole_index], mesh_xy,
+            "pole mass/moment lattice")
+        live = moments[0] > 0.0
+        if not np.any(live):
             pole_cells.append(None)
             pole_weights.append(None)
             continue
-        cells, weights = _compress(values, masses, bins)
+        weights = moments[0, live]
+        cells = ((moments[1, live] + 1.0j * moments[2, live]) / weights)
         pole_cells.append(cells)
         pole_weights.append(weights)
 
@@ -266,16 +317,29 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins):
             tuple_state_indices.append(int(state_index))
             tuple_pole_indices.append(int(pole_index))
 
-    raw_global = int(np.asarray(all_gather_processes(
-        np.asarray([raw_count], dtype=np.int64))).sum())
+    raw_global = int(_sum_fixed_process_table(
+        np.asarray(raw_count, dtype=np.int64), mesh_xy,
+        "raw-count scalar"))
+    cell_ceiling = int(bins) ** 2
+    measure_evidence = {
+        "local_spatial_cell_ceiling_per_pole": cell_ceiling,
+        "collective_spatial_cell_ceiling_per_pole": cell_ceiling,
+        "collective_payload_bytes_per_pole_per_rank": (
+            3 * cell_ceiling * np.dtype(np.float64).itemsize),
+        "collective_reduction": "fixed_mass_first_moments_psum",
+        "collective_ceiling_independent_of_process_count": True,
+        "collective_ceiling_independent_of_state_count": True,
+        "collective_ceiling_independent_of_spatial_extent": True,
+    }
     return (
-        signed_energy, state_mass, state_indices,
+        signed_energy, state_mass, state_indices, E_ref_A,
         tuple(pole_cells), tuple(pole_weights),
         np.asarray(tuple_mass, np.float64),
         np.asarray(representative, np.complex128),
         np.asarray(tuple_state_indices, np.int32),
         np.asarray(tuple_pole_indices, np.int32),
         raw_global,
+        measure_evidence,
     )
 
 
@@ -401,6 +465,13 @@ def _rule_metrics(problem, times, weights):
     return float(np.max(relative)), float(p99), float(peak)
 
 
+def _rule_accepted(metrics, target, amplification_cap):
+    """Acceptance uses the maximum, never only a mass percentile."""
+    return bool(
+        metrics[0] <= float(target)
+        and metrics[2] <= float(amplification_cap))
+
+
 def _fit_sign_definite(problem, validation, target, max_nodes, amp_cap):
     denominator = problem.denominators
     if np.all(denominator.real > 0.0):
@@ -448,15 +519,17 @@ def _fit_sign_definite(problem, validation, target, max_nodes, amp_cap):
         })
         if best is None or row[:3] < best[:3]:
             best = row
-        if check[0] <= target and check[1] <= amp_cap:
+        if _rule_accepted(check, target, amp_cap):
             accepted.append(row)
             break
     chosen = min(accepted, key=lambda row: row[:3]) if accepted else best
-    if chosen[0] > target or chosen[1] > amp_cap:
+    if not _rule_accepted(chosen[6], target, amp_cap):
         raise RuntimeError(
-            "hybrid sign-definite fit missed its apportioned target or "
-            f"amplification cap: residual={chosen[0]:.3e}, "
-            f"p99={chosen[1]:.3g}, target={target:.3e}, cap={amp_cap:g}")
+            "hybrid sign-definite fit missed its apportioned envelope "
+            "target or maximum amplification cap: "
+            f"residual={chosen[0]:.3e}, "
+            f"p99={chosen[1]:.3g}, max={chosen[6][2]:.3g}, "
+            f"target={target:.3e}, cap={amp_cap:g}")
     return chosen[3], chosen[4], {
         "family": "damped_reciprocal", "transform": transform,
         "fit_residual": chosen[5][0], "refined_residual": chosen[6][0],
@@ -545,7 +618,7 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
             "fit_target_met": bool(check[0] <= target),
         })
         best = row
-        if check[0] <= target and check[1] <= amp_cap:
+        if _rule_accepted(check, target, amp_cap):
             accepted.append(row)
     for family, values in (("pane_plus_service", candidates),
                            ("pane_only_refit", pane)):
@@ -574,7 +647,7 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
             })
             if best is None or row[:3] < best[:3]:
                 best = row
-            if check[0] <= target and check[1] <= amp_cap:
+            if _rule_accepted(check, target, amp_cap):
                 accepted.append(row)
                 break
         if any(row[7] != "mpa_positive_incumbent" for row in accepted):
@@ -582,11 +655,13 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
     if best is None:
         raise RuntimeError("hybrid crossing fit had fewer than two candidates")
     chosen = min(accepted, key=lambda row: row[:3]) if accepted else best
-    if chosen[0] > target or chosen[1] > amp_cap:
+    if not _rule_accepted(chosen[6], target, amp_cap):
         raise RuntimeError(
-            "hybrid crossing fit missed its apportioned target or "
-            f"amplification cap: residual={chosen[0]:.3e}, "
-            f"p99={chosen[1]:.3g}, target={target:.3e}, cap={amp_cap:g}")
+            "hybrid crossing fit missed its apportioned envelope target or "
+            "maximum amplification cap: "
+            f"residual={chosen[0]:.3e}, "
+            f"p99={chosen[1]:.3g}, max={chosen[6][2]:.3g}, "
+            f"target={target:.3e}, cap={amp_cap:g}")
     return chosen[3], chosen[4], {
         "family": (chosen[7] if isinstance(chosen[7], str)
                    else chosen[7].__class__.__name__),
@@ -594,6 +669,49 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
         "amplification_p99": chosen[6][1],
         "amplification_max": chosen[6][2], "attempts": attempts,
         **receipt,
+    }
+
+
+def _factor_growth(spec, times, eta):
+    """Maximum log magnitude of the executor's separate G and W factors."""
+    time = np.asarray(times, dtype=np.complex128).reshape(-1)
+    if not time.size:
+        return 0.0, 0.0
+    pole_sign = 1.0 if spec["branch"].space == "cond" else -1.0
+    time_exec = pole_sign * time
+
+    selected_states = np.unique(np.asarray(spec["state_indices"], np.int32))
+    positions = np.searchsorted(spec["live_state_indices"], selected_states)
+    raw_energy = pole_sign * np.asarray(
+        spec["signed_energy"][positions], dtype=np.float64)
+    reference = float(spec["E_ref_A"])
+    green_log = float(np.max(np.real(
+        -1.0j * (raw_energy[:, None] - reference) * time_exec[None, :])))
+
+    pole_values = []
+    for pole in np.unique(np.asarray(spec["pole_indices"], np.int32)):
+        # Spatial planning cells include eta.  The executor's W exponential
+        # carries only the fitted pole width; eta is folded into alpha once.
+        pole_values.append(np.asarray(
+            spec["pole_cells"][int(pole)], np.complex128) + 1.0j * eta)
+    pole_values = np.concatenate(pole_values)
+    screened_log = float(np.max(np.real(
+        -1.0j * pole_values[:, None] * time_exec[None, :])))
+    return green_log, screened_log
+
+
+def _check_factor_growth(spec, times, eta, cap):
+    """Refuse rules whose separately executed exponentials are unsafe."""
+    green, screened = _factor_growth(spec, times, eta)
+    if max(green, screened) > float(cap):
+        raise RuntimeError(
+            "delivered rule violates the per-factor growth cap: "
+            f"log|G factor|={green:.6g}, log|W factor|={screened:.6g}, "
+            f"cap={float(cap):g}")
+    return {
+        "green_factor_log_growth_max": green,
+        "screened_factor_log_growth_max": screened,
+        "factor_growth_cap": float(cap),
     }
 
 
@@ -612,7 +730,7 @@ def _stable_time_union(fits):
     return np.asarray(values, dtype=np.complex128), row_indices
 
 
-def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
+def _shared_branch_grid(specs, fits, max_nodes, amp_cap, eta, factor_cap):
     """Fit one common time grid with independent weights for branch windows.
 
     The candidate set is the exact union of already accepted incumbent-
@@ -668,17 +786,21 @@ def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
                     break
             base = _rule_metrics(spec["problem"], times, weights)
             check = _rule_metrics(spec["validation"], times, weights)
+            factor = _factor_growth(spec, times, eta)
             good = bool(
                 np.all(np.isfinite(weights))
                 and check[0] <= fit["residual_target"]
-                and check[1] <= amp_cap)
+                and check[2] <= amp_cap
+                and max(factor) <= factor_cap)
             accepted &= good
             weights_by_window.append(weights)
-            metrics.append((base, check, solver))
+            metrics.append((base, check, solver, factor))
         attempts.append({
             "node_count": int(rank), "accepted": bool(accepted),
             "window_refined_residuals": [row[1][0] for row in metrics],
             "window_amplification_p99": [row[1][1] for row in metrics],
+            "window_amplification_max": [row[1][2] for row in metrics],
+            "window_factor_log_growth_max": [max(row[3]) for row in metrics],
         })
         if accepted and len(weights_by_window) == len(fits):
             chosen = (times, weights_by_window, metrics)
@@ -691,7 +813,7 @@ def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
 
     times, weights_by_window, metrics = chosen
     for fit, weights, metric in zip(fits, weights_by_window, metrics):
-        base, check, solver = metric
+        base, check, solver, factor = metric
         fit["times"] = np.asarray(times, dtype=np.complex128)
         fit["weights"] = np.asarray(weights, dtype=np.complex128)
         fit["evidence"] = {
@@ -702,6 +824,9 @@ def _shared_branch_grid(specs, fits, max_nodes, amp_cap):
             "fit_residual": base[0], "refined_residual": check[0],
             "amplification_p99": check[1],
             "amplification_max": check[2],
+            "green_factor_log_growth_max": factor[0],
+            "screened_factor_log_growth_max": factor[1],
+            "factor_growth_cap": float(factor_cap),
             "shared_grid_node_count": int(times.size),
             "shared_grid_free_union_count": int(candidates.size),
             "shared_grid_attempts": attempts,
@@ -722,16 +847,20 @@ def build_delivered_sigma_windows(
     omega_grid_ry,
     *,
     regularization_width_ry: float,
-    target_error: float,
+    envelope_relative_target: float,
     state_amplitudes_by_branch=None,
+    reference_sigma_omega=None,
     max_nodes: int = 512,
+    max_direct_terms: int | None = None,
     lattice_bins: int = DEFAULT_LATTICE_BINS,
     amplification_cap: float = DEFAULT_AMPLIFICATION_CAP,
-    true_error_safety: float = TRUE_ERROR_SAFETY,
+    envelope_error_safety: float = ENVELOPE_ERROR_SAFETY,
+    factor_growth_cap: float = FACTOR_GROWTH_CAP,
     crossing_eps_q: float = 1.0e-3,
     use_shipped_minimax_tables: bool = True,
     pane_times: tuple = (),
     tau_grid_mode: str = "free",
+    mesh_xy=None,
 ):
     """Build a measure-apportioned hybrid plan for MPA or one-pole GN-PPM.
 
@@ -742,10 +871,11 @@ def build_delivered_sigma_windows(
     factors into small state-selector/pole-weight components without
     materializing a tuple axis on any spatial tensor.
 
-    The absolute budget is ``target_error * combined inverse-gap envelope *
-    true_error_safety``. The envelope bounds the scalar weighted reciprocal
-    error represented by the fitting measure; it is conservative evidence,
-    not a claim about cancellation in the spatially projected Sigma matrix.
+    The absolute planning budget is ``envelope_relative_target * combined
+    inverse-gap envelope * envelope_error_safety``.  This target is relative
+    to the noncancelling planning envelope.  It is never a claim of relative
+    physical Sigma accuracy.  When ``reference_sigma_omega`` is supplied,
+    the report calibrates the exchange rate between those currencies.
     """
     started = time.perf_counter()
     branch_rows = list(branches)
@@ -757,8 +887,14 @@ def build_delivered_sigma_windows(
         state_amplitudes_by_branch, branch_rows,
         "state_amplitudes_by_branch")
     omega_grid = np.asarray(omega_grid_ry, dtype=np.float64)
-    eta, target = float(regularization_width_ry), float(target_error)
-    amp_cap, safety = float(amplification_cap), float(true_error_safety)
+    eta = float(regularization_width_ry)
+    target = float(envelope_relative_target)
+    amp_cap = float(amplification_cap)
+    safety = float(envelope_error_safety)
+    factor_cap = float(factor_growth_cap)
+    tau_pair_ceiling = int(max_nodes)
+    direct_ceiling = (tau_pair_ceiling if max_direct_terms is None
+                      else int(max_direct_terms))
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
@@ -766,13 +902,29 @@ def build_delivered_sigma_windows(
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("delivered Sigma regularization must be finite and positive")
     if not 0.0 < target < 1.0:
-        raise ValueError("delivered Sigma target_error must lie in (0,1)")
+        raise ValueError(
+            "delivered Sigma envelope_relative_target must lie in (0,1)")
     if not 0.0 < safety <= 1.0:
-        raise ValueError("true_error_safety must lie in (0,1]")
+        raise ValueError("envelope_error_safety must lie in (0,1]")
     if not np.isfinite(amp_cap) or amp_cap <= 1.0:
         raise ValueError("amplification_cap must be finite and greater than one")
+    if not np.isfinite(factor_cap) or factor_cap <= 0.0:
+        raise ValueError("factor_growth_cap must be finite and positive")
+    if tau_pair_ceiling < 1:
+        raise ValueError("max_nodes must be a positive global tau-pair ceiling")
+    if direct_ceiling < 0:
+        raise ValueError("max_direct_terms must be nonnegative")
     if grid_mode not in ("free", "shared"):
         raise ValueError("tau_grid_mode must be 'free' or 'shared'")
+    reference = None
+    if reference_sigma_omega is not None:
+        reference = np.asarray(reference_sigma_omega, np.complex128)
+        if reference.shape != omega_grid.shape or not np.all(np.isfinite(reference)):
+            raise ValueError(
+                "reference_sigma_omega must be a finite complex vector with "
+                "the same shape as omega_grid_ry")
+        if not float(np.max(np.abs(reference))) > 0.0:
+            raise ValueError("reference_sigma_omega must have nonzero scale")
 
     specs, branch_reports = [], []
     combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
@@ -786,10 +938,10 @@ def build_delivered_sigma_windows(
         if not np.allclose(frequencies, expected, rtol=0.0, atol=1.0e-13):
             raise ValueError(
                 f"branch {branch.tag!r} frequency indices disagree with its signed half")
-        (signed_energy, state_mass, live_state_indices,
+        (signed_energy, state_mass, live_state_indices, E_ref_A,
          pole_cells, pole_weights, masses, representative, state_indices,
-         pole_indices, raw_count) = _pole_measures(
-            branch, Omega, B, eta, amplitude, int(lattice_bins))
+         pole_indices, raw_count, measure_evidence) = _pole_measures(
+            branch, Omega, B, eta, amplitude, int(lattice_bins), mesh_xy)
         windows = _partition_tuples(
             representative, masses, frequencies, branch.space,
             force_single=(np.unique(pole_indices).size == 1))
@@ -800,6 +952,7 @@ def build_delivered_sigma_windows(
             "live_tuple_count": int(np.count_nonzero(masses)),
             "live_pole_count": int(np.unique(pole_indices).size),
             "plan_start": len(specs), "windows": [],
+            **measure_evidence,
         }
         for window in windows:
             problem, validation = _tuple_window_problems(
@@ -825,6 +978,10 @@ def build_delivered_sigma_windows(
                     state_indices[window.member_indices], np.int32),
                 "pole_indices": np.asarray(
                     pole_indices[window.member_indices], np.int32),
+                "live_state_indices": live_state_indices,
+                "signed_energy": signed_energy,
+                "E_ref_A": E_ref_A,
+                "pole_cells": pole_cells,
                 "envelope": envelope, "difficulty": envelope / mass,
                 "branch_report": report,
             })
@@ -839,27 +996,42 @@ def build_delivered_sigma_windows(
         np.asarray([spec["difficulty"] for spec in specs]), total_absolute)
 
     fits = []
+    tau_pairs_used = 0
     for spec, budget in zip(specs, budgets):
         branch, problem, validation = (
             spec["branch"], spec["problem"], spec["validation"])
         residual_target = budget.absolute_error_budget / spec["envelope"]
         pole_sign = 1.0 if branch.space == "cond" else -1.0
         direct = False
+        fit_node_ceiling = (tau_pair_ceiling if grid_mode == "shared" else
+                            tau_pair_ceiling - tau_pairs_used)
+        if fit_node_ceiling < 1:
+            raise RuntimeError(
+                "delivered plan exhausted its global window_tau_pairs "
+                f"ceiling max_nodes={tau_pair_ceiling} before fitting "
+                f"{spec['window'].name!r}")
         if spec["window"].kind == "crossing":
             try:
                 times, weights, evidence = _fit_crossing(
                     problem, validation, residual_target, pole_sign, eta,
-                    int(max_nodes), amp_cap, float(crossing_eps_q),
+                    fit_node_ceiling, amp_cap, float(crossing_eps_q),
                     bool(use_shipped_minimax_tables), tuple(pane_times))
+                evidence = {
+                    **evidence,
+                    **_check_factor_growth(
+                        spec, times, eta, factor_cap),
+                }
             except RuntimeError as exc:
                 # The hardened DEV-80 route permits an exact reciprocal
                 # fallback only for a genuinely small tuple support.  It is
                 # a different execution currency, so it never consumes the
                 # tau ceiling or masquerades as an exponential rule.
                 n_direct = int(spec["state_indices"].size)
-                if (n_direct > int(max_nodes)
-                        or not str(exc).startswith(
-                            "hybrid crossing fit missed")):
+                eligible_refusal = (
+                    str(exc).startswith("hybrid crossing fit missed")
+                    or str(exc).startswith(
+                        "delivered rule violates the per-factor growth cap"))
+                if n_direct > direct_ceiling or not eligible_refusal:
                     raise
                 direct = True
                 times = np.empty(0, dtype=np.complex128)
@@ -871,10 +1043,23 @@ def build_delivered_sigma_windows(
                     "amplification_max": 1.0,
                     "quadrature_refusal": str(exc),
                     "direct_term_count": n_direct,
+                    "factor_growth_cap": factor_cap,
                 }
         else:
             times, weights, evidence = _fit_sign_definite(
-                problem, validation, residual_target, int(max_nodes), amp_cap)
+                problem, validation, residual_target,
+                fit_node_ceiling, amp_cap)
+            evidence = {
+                **evidence,
+                **_check_factor_growth(spec, times, eta, factor_cap),
+            }
+        if not direct:
+            tau_pairs_used += int(np.asarray(times).size)
+            if grid_mode == "free" and tau_pairs_used > tau_pair_ceiling:
+                raise RuntimeError(
+                    "delivered plan exceeds its global window_tau_pairs "
+                    f"ceiling: {tau_pairs_used} > max_nodes="
+                    f"{tau_pair_ceiling}")
         fits.append({
             "times": np.asarray(times, dtype=np.complex128),
             "weights": np.asarray(weights, dtype=np.complex128),
@@ -884,15 +1069,27 @@ def build_delivered_sigma_windows(
         })
 
     if grid_mode == "shared":
+        tau_pairs_used = 0
         for report in branch_reports:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
             quadrature = [index for index in range(start, stop)
                           if not fits[index]["direct"]]
             if quadrature:
+                remaining = tau_pair_ceiling - tau_pairs_used
+                shared_node_ceiling = remaining // len(quadrature)
+                if shared_node_ceiling < 1:
+                    raise RuntimeError(
+                        "shared delivered plan exhausted its global "
+                        "window_tau_pairs ceiling before branch "
+                        f"{report['tag']!r}: remaining={remaining}, "
+                        f"windows={len(quadrature)}")
                 _shared_branch_grid(
                     [specs[index] for index in quadrature],
                     [fits[index] for index in quadrature],
-                    int(max_nodes), amp_cap)
+                    shared_node_ceiling, amp_cap, eta, factor_cap)
+                tau_pairs_used += (
+                    len(quadrature)
+                    * int(fits[quadrature[0]]["times"].size))
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -910,8 +1107,7 @@ def build_delivered_sigma_windows(
             alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
         state_energy = np.asarray(gather_to_host(branch.E_A), dtype=np.float64)
         state_mask = np.asarray(gather_to_host(branch.base_mask_A), dtype=bool)
-        E_ref_A = float(np.min(
-            state_energy.reshape(-1)[state_mask.reshape(-1)]))
+        E_ref_A = float(spec["E_ref_A"])
         pole_indices = spec["pole_indices"]
         state_indices = spec["state_indices"]
         is_direct = bool(fit["direct"])
@@ -922,10 +1118,11 @@ def build_delivered_sigma_windows(
             omega_sign=int(pole_sign * external_sign), project="full",
             prefactor=-1.0, max_error=float(evidence["refined_residual"]),
             provenance=(
-                "hybrid delivered-mass tuple window; tail-refined lattice; "
-                f"true-budget share {budget.apportionment_weight:.4g}; "
-                f"{evidence['family']}; amplification p99 "
-                f"{evidence['amplification_p99']:.4g}"))
+                "hybrid projected-envelope tuple window; bounded pole "
+                "lattice; envelope-budget share "
+                f"{budget.apportionment_weight:.4g}; {evidence['family']}; "
+                "amplification max "
+                f"{evidence['amplification_max']:.4g}"))
         output.append(SharedSigmaWindow(
             window=window, E_A=branch.E_A,
             omega_abs=np.asarray(branch.omega_abs, dtype=np.float64),
@@ -975,15 +1172,38 @@ def build_delivered_sigma_windows(
         report["distinct_tau_count"] for report in branch_reports))
     direct_term_count = int(sum(
         report["direct_term_count"] for report in branch_reports))
+    if window_tau_pairs > tau_pair_ceiling:
+        raise RuntimeError(
+            "delivered plan exceeds its global window_tau_pairs ceiling: "
+            f"{window_tau_pairs} > max_nodes={tau_pair_ceiling}")
+    if direct_term_count > direct_ceiling:
+        raise RuntimeError(
+            "delivered plan exceeds its separate direct-term ceiling: "
+            f"{direct_term_count} > max_direct_terms={direct_ceiling}")
+    if reference is None:
+        exchange_rate = None
+        calibration = "reference_sigma_unavailable"
+    else:
+        physical_scale = float(np.max(np.abs(reference)))
+        exchange_rate = combined_scale / physical_scale
+        calibration = "calibrated_to_reference_sigma"
     return output, {
         "plan": "delivered", "planner": "hybrid_measure_apportioned",
         "tau_grid_mode": grid_mode,
-        "eta_ry": eta, "target_error": target,
-        "true_error_safety": safety,
-        "planned_absolute_error_budget": total_absolute,
+        "eta_ry": eta, "envelope_relative_target": target,
+        "error_currency": "inverse_gap_envelope_relative",
+        "physical_relative_sigma_error_claimed": False,
+        "envelope_error_safety": safety,
+        "planned_absolute_envelope_error_budget": total_absolute,
         "combined_inverse_gap_envelope": combined_scale,
+        "envelope_to_physical_exchange_rate": exchange_rate,
+        "exchange_rate_calibration": calibration,
         "lattice_bins_per_axis": int(lattice_bins),
         "amplification_cap": amp_cap,
+        "amplification_gate": "maximum",
+        "factor_growth_cap": factor_cap,
+        "global_window_tau_pair_ceiling": tau_pair_ceiling,
+        "global_direct_term_ceiling": direct_ceiling,
         "n_windows": len(output),
         "n_tau": window_tau_pairs,
         "window_tau_pairs": window_tau_pairs,
@@ -996,5 +1216,6 @@ def build_delivered_sigma_windows(
 
 __all__ = [
     "DEFAULT_AMPLIFICATION_CAP", "DEFAULT_LATTICE_BINS",
-    "TRUE_ERROR_SAFETY", "build_delivered_sigma_windows",
+    "ENVELOPE_ERROR_SAFETY", "FACTOR_GROWTH_CAP",
+    "build_delivered_sigma_windows",
 ]

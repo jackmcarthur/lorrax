@@ -242,6 +242,37 @@ def test_the_candidate_dictionary_is_deterministic_label_sorted_and_growth_cappe
     assert np.all(growth <= 30.0 + 1.0e-9)
 
 
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"seed_times": (np.nan + 0.0j,)}, "finite"),
+        ({"seed_times": (0.5 + 0.0j, 0.5 + 0.0j)}, "duplicates"),
+        ({"seed_times": (0.1, 0.2), "max_nodes": 1}, "max_nodes"),
+        ({"weight_solver": "irlz"}, "weight_solver"),
+    ],
+)
+def test_search_options_refuse_unsafe_seeds_and_unknown_solver(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ComplexTimeSearchOptions(target_error=1.0e-3, **kwargs)
+
+
+def test_seed_growth_is_checked_before_any_fit_or_sector_shortcut():
+    options = ComplexTimeSearchOptions(
+        target_error=1.0e-3, max_nodes=4,
+        seed_times=(-100.0j,), growth_cap=1.0)
+    with pytest.raises(ValueError, match="seed_times.*growth_cap"):
+        fit_reciprocal_measure(_sector_problem(), options)
+
+
+def test_unseeded_fallback_respects_a_one_node_ceiling():
+    problem = _crossing_problem(gamma_sign=1.0)
+    options = ComplexTimeSearchOptions(
+        target_error=1.0e-12, max_nodes=1, sector_shortcut=False,
+        return_best_on_miss=True, coarse_to_fine=False)
+    rule = fit_reciprocal_measure(problem, options)
+    assert rule.node_count <= 1
+
+
 # ---------------------------------------------------------------------------
 #  the red twin
 # ---------------------------------------------------------------------------

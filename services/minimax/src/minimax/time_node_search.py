@@ -187,6 +187,20 @@ class ComplexTimeSearchOptions:
             raise ValueError("target_error must lie in (0,1)")
         if int(self.max_nodes) < 1:
             raise ValueError("max_nodes must be positive")
+        if str(self.weight_solver) not in ("irls", "lp"):
+            raise ValueError("weight_solver must be exactly 'irls' or 'lp'")
+        seeds = np.asarray(self.seed_times, dtype=np.complex128).reshape(-1)
+        if seeds.size > int(self.max_nodes):
+            raise ValueError(
+                f"seed_times has {seeds.size} nodes but max_nodes="
+                f"{int(self.max_nodes)}")
+        if not np.all(np.isfinite(seeds)):
+            raise ValueError("seed_times must contain only finite values")
+        for index, value in enumerate(seeds):
+            if index and np.any(
+                    np.abs(value - seeds[:index])
+                    <= 1.0e-9 * max(abs(value), 1.0)):
+                raise ValueError("seed_times must not contain duplicates")
         if int(self.candidate_angle_count) < 1 or int(self.candidates_per_round) < 1:
             raise ValueError("candidate counts must be positive")
         if int(self.coarse_cell_cap) < 1 or int(self.coarse_fit_frequency_count) < 1:
@@ -567,9 +581,32 @@ def fit_reciprocal_measure(problem: ReciprocalMeasureProblem,
         return _fit_reciprocal_measure_pinned(problem, options)
 
 
+def _validated_seed_times(
+        problem: ReciprocalMeasureProblem,
+        options: ComplexTimeSearchOptions) -> Array:
+    """Validate warm nodes on the same retained support as the dictionary."""
+    warm = np.asarray(options.seed_times, dtype=np.complex128).reshape(-1)
+    if not warm.size:
+        return warm
+    kept, _, _ = problem.retained()
+    live = kept & (problem.cell_masses[None, :] > 0.0)
+    denominator = problem.denominators[live]
+    growth = np.max(
+        -(warm[None, :] * denominator[:, None]).imag, axis=0)
+    bad = np.nonzero(growth > float(options.growth_cap))[0]
+    if bad.size:
+        index = int(bad[0])
+        raise ValueError(
+            f"seed_times[{index}] violates growth_cap="
+            f"{float(options.growth_cap):g} on the retained support: "
+            f"log magnitude {float(growth[index]):.6g}")
+    return warm
+
+
 def _fit_reciprocal_measure_pinned(
         problem: ReciprocalMeasureProblem,
         options: ComplexTimeSearchOptions) -> ComplexTimeRule:
+    warm = _validated_seed_times(problem, options)
     if options.sector_shortcut:
         sector = _sector_rule_rotated(problem, options)
         if sector is not None and sector.node_count <= int(options.max_nodes):
@@ -577,10 +614,22 @@ def _fit_reciprocal_measure_pinned(
 
     candidates, candidate_families = _cached_candidate_dictionary(
         problem, options)
-    if options.seed_times:
-        warm = np.asarray(list(options.seed_times), dtype=np.complex128)
-        candidates = np.concatenate([candidates, warm])
-        candidate_families = candidate_families + ("seed",) * warm.size
+    if warm.size:
+        labels = list(candidate_families)
+        append = []
+        for value in warm:
+            close = np.nonzero(
+                np.abs(value - candidates)
+                <= 1.0e-9 * max(abs(value), 1.0))[0]
+            if close.size:
+                labels[int(close[0])] = "seed"
+            else:
+                append.append(value)
+        if append:
+            candidates = np.concatenate(
+                [candidates, np.asarray(append, np.complex128)])
+            labels.extend(["seed"] * len(append))
+        candidate_families = tuple(labels)
 
     active = np.zeros(candidates.size, dtype=bool)
     growth_history: list[tuple[float, float, str, float]] = []
@@ -603,7 +652,8 @@ def _fit_reciprocal_measure_pinned(
         seed_count = max(1, min(6, ladder.size, int(options.max_nodes) // 4))
         picks = ladder[np.linspace(0, ladder.size - 1, seed_count).astype(int)]
     else:
-        picks = np.argsort(np.abs(candidates))[:4]
+        picks = np.argsort(np.abs(candidates))[
+            :min(4, int(options.max_nodes))]
     for index in np.unique(picks):
         active[int(index)] = True
 

@@ -1,4 +1,4 @@
-"""Focused gates for the delivered-error MPA Sigma pathway."""
+"""Focused gates for the envelope-relative MPA Sigma pathway."""
 
 import numpy as np
 import jax.numpy as jnp
@@ -26,7 +26,8 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     eta = 0.05
     plan, _ = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
-        regularization_width_ry=eta, target_error=1.0e-11,
+        regularization_width_ry=eta,
+        envelope_relative_target=1.0e-11,
         max_nodes=512)
 
     row = plan[0]
@@ -67,7 +68,8 @@ def _two_branch_plan():
     ]
     plan, report = build_delivered_sigma_windows(
         pole_sets, residue_sets, branches, omega,
-        regularization_width_ry=0.02, target_error=2.0e-4,
+        regularization_width_ry=0.02,
+        envelope_relative_target=2.0e-4,
         max_nodes=200, amplification_cap=30.0)
     return branches, pole_sets, plan, report
 
@@ -85,7 +87,7 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
             assert row.window.n_tau == window_evidence["node_count"] > 0
             assert (window_evidence["refined_residual"]
                     <= window_evidence["relative_residual_target"])
-            assert (window_evidence["amplification_p99"]
+            assert (window_evidence["amplification_max"]
                     <= report["amplification_cap"])
             assert row.window.project == "full"
             np.testing.assert_array_equal(row.window.mask_A, branch.base_mask_A)
