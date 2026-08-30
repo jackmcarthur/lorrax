@@ -1,19 +1,25 @@
-"""Delivered-error Sigma planning with a few Cartesian product windows.
+"""Plan delivered-error Sigma quadrature on measured product windows.
 
-Each causal branch is tiled by at most three rectangles
-``state interval x pole interval``.  Crossing support remains inside its
-rectangle and is integrated by a positive, eta-damped real-time rule.  The
-planner never emits explicit state--pole tuples and never emits direct terms.
+The planner has two numerical dials: the delivered envelope target and the
+retarded broadening ``eta``.  It divides each causal branch into a few
+``state interval x pole interval`` windows, measures their weighted reciprocal
+problems, and assigns each window part of the global error budget.
 
-The fit residual is physical planning error.  Amplification instead multiplies
-runtime roundoff, so its gate is the measured noise budget
+Sign-definite windows start from shipped noncrossing minimax tables.  Their
+certificate chain is: catalog range and scaled sup-norm bound, physical
+rescaling by the smallest gap, achieved error on the fitting lattice, achieved
+error on the refined validation lattice, and the runtime-noise gate.  A table
+that misses the measured gate is replaced by the next tighter or wider shipped
+table.  Crossing windows first try shipped HGL tables and otherwise perform one
+deterministic fixed-time weight fit.  The planner never evaluates explicit
+state--pole pairs and never emits zero-time or direct terms.
+
+The final acceptance test is
 
 ``kappa_p99 * RUNTIME_NOISE_EPSILON <= AMPLIFICATION_NOISE_SAFETY * target``.
 
-Here ``target`` is the relative inverse-gap-envelope allowance assigned to the
-window.  A small exact integer optimization chooses one rule per rectangle so
-that the summed absolute allowance stays inside the global delivered budget
-and the sum of ``(window, tau)`` pairs never exceeds 200.
+The plan also refuses exponent growth above its bounded-factor limit and more
+than 200 total ``(window, tau)`` pairs.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 2
+_PLAN_CACHE_VERSION = 3
 
 # These tolerances generate candidate rules.  Acceptance is based only on the
 # achieved delivered residual and the noise-budget inequality above.
