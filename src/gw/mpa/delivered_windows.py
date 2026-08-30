@@ -58,6 +58,7 @@ DEFAULT_LATTICE_BINS = 25
 DEFAULT_AMPLIFICATION_CAP = 10.0
 TRUE_ERROR_SAFETY = 0.8
 WINDOW_COUNT = {"cond": 4, "val": 3}
+CROSSING_CUT_FRACTIONS = (0.45, 0.40, 0.60)
 
 
 def _per_branch(values, branches, name):
@@ -656,6 +657,224 @@ def _fit_crossing(problem, validation, target, pole_sign, eta, max_nodes,
     }
 
 
+def _crossing_energy_parts(spec, lower_mass_fraction):
+    """Split one crossing tuple window at a stable delivered-mass quantile."""
+    members = np.asarray(spec["member_indices"], dtype=np.int64)
+    masses = np.asarray(spec["tuple_masses"], dtype=np.float64)[members]
+    coordinate = np.asarray(
+        spec["tuple_representative"], dtype=np.complex128)[members].real
+    order = np.argsort(coordinate, kind="stable")
+    ordered_members = members[order]
+    ordered_mass = masses[order]
+    cumulative = np.cumsum(ordered_mass)
+    midpoint = (cumulative - 0.5 * ordered_mass) / float(cumulative[-1])
+    lower = ordered_members[midpoint < float(lower_mass_fraction)]
+    upper = ordered_members[midpoint >= float(lower_mass_fraction)]
+    if lower.size == 0 or upper.size == 0:
+        raise RuntimeError("crossing energy quantile produced an empty part")
+    if not np.array_equal(
+            np.sort(np.concatenate((lower, upper))), np.sort(members)):
+        raise RuntimeError("crossing energy split lost or duplicated membership")
+    return lower, upper
+
+
+def _aligned_frequency_parts(spec, tuple_parts):
+    """Split the owning signed frequency block between ordered tuple parts."""
+    representative = np.asarray(
+        spec["tuple_representative"], dtype=np.complex128)
+    boundary = 0.5 * (
+        float(np.max(representative[tuple_parts[0]].real))
+        + float(np.min(representative[tuple_parts[1]].real)))
+    frequencies = np.asarray(spec["problem"].frequencies, dtype=np.float64)
+    positions = np.arange(frequencies.size, dtype=np.int64)
+    panes = (positions[frequencies < boundary],
+             positions[frequencies >= boundary])
+    if any(pane.size == 0 for pane in panes):
+        raise RuntimeError("aligned crossing split produced an empty frequency pane")
+    if not np.array_equal(
+            np.sort(np.concatenate(panes)), np.arange(frequencies.size)):
+        raise RuntimeError("aligned frequency panes do not partition omega")
+    return panes, boundary
+
+
+def _crossing_block_spec(parent, members, frequency_positions, name):
+    """Build one executable tuple/frequency block from its parent measure."""
+    context = parent["measure_context"]
+    positions = np.asarray(frequency_positions, dtype=np.int64)
+    frequencies = np.asarray(parent["problem"].frequencies)[positions]
+    problem, validation = _tuple_window_problems(
+        members, *context, frequencies,
+        1.0 if parent["branch"].space == "cond" else -1.0,
+        int(parent["lattice_bins"]))
+    envelope_by_frequency = (
+        problem.cell_masses[None, :] / np.abs(problem.denominators)
+    ).sum(axis=1)
+    envelope = float(np.max(envelope_by_frequency))
+    mass = float(np.sum(problem.cell_masses))
+    window = replace(
+        parent["window"], name=name, kind=_window_kind(problem),
+        member_indices=np.asarray(members, dtype=np.int64),
+        delivered_mass=mass,
+        mass_fraction=(mass / parent["window"].delivered_mass))
+    tuple_states = np.asarray(parent["tuple_state_indices"], dtype=np.int32)
+    tuple_poles = np.asarray(parent["tuple_pole_indices"], dtype=np.int32)
+    return {
+        **parent,
+        "problem": problem,
+        "validation": validation,
+        "window": window,
+        "member_indices": np.asarray(members, dtype=np.int64),
+        "state_indices": tuple_states[members],
+        "pole_indices": tuple_poles[members],
+        "omega_positions": np.asarray(
+            parent["omega_positions"], dtype=np.int64)[positions],
+        "envelope": envelope,
+        "difficulty": envelope / mass,
+        "hardening_parent": parent["window"].name,
+    }
+
+
+def _fit_crossing_blocks(
+    spec, budget, *, pole_sign, eta, max_nodes, amp_cap, crossing_eps_q,
+    use_shipped_minimax_tables, pane_times,
+):
+    """Harden a refused crossing window with aligned 2x2 execution blocks.
+
+    Frequency panes are disjoint.  Within each pane the parent absolute
+    allowance is split between the two tuple parts in proportion to their
+    measured inverse-gap envelopes, so summing the two certified block errors
+    cannot exceed the parent allowance.  A refused crossing child may become
+    exact direct work only when that child's explicit tuple support fits the
+    declared node-equivalent ceiling.
+    """
+    trials = []
+    for fraction in CROSSING_CUT_FRACTIONS:
+        try:
+            tuple_parts = _crossing_energy_parts(spec, fraction)
+            frequency_parts, boundary = _aligned_frequency_parts(
+                spec, tuple_parts)
+        except RuntimeError as exc:
+            trials.append({
+                "lower_mass_fraction": fraction, "accepted": False,
+                "refusal": str(exc),
+            })
+            continue
+        child_specs, child_fits = [], []
+        accepted = True
+        refusal = None
+        pane_receipts = []
+        for pane_index, frequency_positions in enumerate(frequency_parts):
+            pane_specs = [
+                _crossing_block_spec(
+                    spec, members, frequency_positions,
+                    (f"{spec['window'].name}.m{fraction:.2f}."
+                     f"o{pane_index}.t{tuple_index}"))
+                for tuple_index, members in enumerate(tuple_parts)
+            ]
+            scores = np.asarray(
+                [child["envelope"] for child in pane_specs], np.float64)
+            shares = scores / float(np.sum(scores))
+            pane_rows = []
+            for tuple_index, (child, share) in enumerate(
+                    zip(pane_specs, shares)):
+                child_budget = replace(
+                    budget, name=child["window"].name,
+                    delivered_mass=child["window"].delivered_mass,
+                    measured_difficulty=child["difficulty"],
+                    apportionment_weight=(
+                        budget.apportionment_weight * float(share)),
+                    absolute_error_budget=(
+                        budget.absolute_error_budget * float(share)))
+                residual_target = (
+                    child_budget.absolute_error_budget / child["envelope"])
+                direct = False
+                try:
+                    if child["window"].kind == "crossing":
+                        times, weights, evidence = _fit_crossing(
+                            child["problem"], child["validation"],
+                            residual_target, pole_sign, eta, int(max_nodes),
+                            amp_cap, float(crossing_eps_q),
+                            bool(use_shipped_minimax_tables), tuple(pane_times))
+                    else:
+                        times, weights, evidence = _fit_sign_definite(
+                            child["problem"], child["validation"],
+                            residual_target, int(max_nodes), amp_cap)
+                except RuntimeError as exc:
+                    n_direct = int(child["state_indices"].size)
+                    if (child["window"].kind != "crossing"
+                            or n_direct > int(max_nodes)
+                            or not str(exc).startswith(
+                                "hybrid crossing fit missed")):
+                        accepted = False
+                        refusal = (
+                            f"{child['window'].name} ({n_direct} tuples): {exc}")
+                        break
+                    direct = True
+                    times = np.empty(0, dtype=np.complex128)
+                    weights = np.empty(0, dtype=np.complex128)
+                    evidence = {
+                        "family": "exact_direct_reciprocal_fallback",
+                        "fit_residual": 0.0, "refined_residual": 0.0,
+                        "amplification_p99": 1.0,
+                        "amplification_max": 1.0,
+                        "quadrature_refusal": str(exc),
+                        "direct_term_count": n_direct,
+                    }
+                evidence = {
+                    **evidence,
+                    "crossing_hardening": "aligned_mass_frequency_block",
+                    "hardening_parent": spec["window"].name,
+                    "lower_mass_fraction": float(fraction),
+                    "energy_boundary_ry": float(boundary),
+                    "omega_pane": int(pane_index),
+                    "tuple_part": int(tuple_index),
+                }
+                child_specs.append(child)
+                child_fits.append({
+                    "times": np.asarray(times, dtype=np.complex128),
+                    "weights": np.asarray(weights, dtype=np.complex128),
+                    "evidence": evidence, "budget": child_budget,
+                    "residual_target": float(residual_target),
+                    "direct": direct,
+                })
+                pane_rows.append({
+                    "name": child["window"].name,
+                    "kind": child["window"].kind,
+                    "tuple_count": int(child["state_indices"].size),
+                    "node_count": int(np.asarray(times).size),
+                    "direct": bool(direct),
+                    "budget_share": float(share),
+                })
+            pane_receipts.append(pane_rows)
+            if not accepted:
+                break
+        tau_pairs = int(sum(fit["times"].size for fit in child_fits))
+        direct_terms = int(sum(
+            child["state_indices"].size
+            for child, fit in zip(child_specs, child_fits) if fit["direct"]))
+        trials.append({
+            "lower_mass_fraction": float(fraction),
+            "energy_boundary_ry": float(boundary),
+            "accepted": bool(accepted),
+            "tau_pairs": tau_pairs, "direct_term_count": direct_terms,
+            "panes": pane_receipts, "refusal": refusal,
+        })
+        if accepted:
+            receipt = {
+                "triggered": True,
+                "route": "aligned_2x2_tuple_frequency_blocks",
+                "selected_lower_mass_fraction": float(fraction),
+                "selected_energy_boundary_ry": float(boundary),
+                "trials": trials,
+            }
+            for fit in child_fits:
+                fit["evidence"]["hardening_receipt"] = receipt
+            return child_specs, child_fits
+    raise RuntimeError(
+        "hybrid crossing hardening found no accepted tuple/frequency-block "
+        f"plan for {int(spec['state_indices'].size)} explicit tuples: {trials}")
+
+
 def _stable_time_union(fits):
     """Return one exact stable union and each free rule's union indices."""
     values, lookup, row_indices = [], {}, []
@@ -891,10 +1110,22 @@ def build_delivered_sigma_windows(
             specs.append({
                 "branch": branch, "problem": problem,
                 "validation": validation, "window": measured_window,
+                "member_indices": np.asarray(
+                    window.member_indices, np.int64),
                 "state_indices": np.asarray(
                     state_indices[window.member_indices], np.int32),
                 "pole_indices": np.asarray(
                     pole_indices[window.member_indices], np.int32),
+                "tuple_state_indices": state_indices,
+                "tuple_pole_indices": pole_indices,
+                "tuple_masses": masses,
+                "tuple_representative": representative,
+                "measure_context": (
+                    state_indices, pole_indices, live_state_indices,
+                    signed_energy, state_mass, pole_cells, pole_weights),
+                "lattice_bins": int(lattice_bins),
+                "omega_positions": np.arange(
+                    frequencies.size, dtype=np.int64),
                 "envelope": envelope, "difficulty": envelope / mass,
                 "branch_report": report,
             })
@@ -908,7 +1139,7 @@ def build_delivered_sigma_windows(
         tuple(spec["window"] for spec in specs),
         np.asarray([spec["difficulty"] for spec in specs]), total_absolute)
 
-    fits = []
+    execution_specs, fits = [], []
     for spec, budget in zip(specs, budgets):
         branch, problem, validation = (
             spec["branch"], spec["problem"], spec["validation"])
@@ -922,29 +1153,42 @@ def build_delivered_sigma_windows(
                     int(max_nodes), amp_cap, float(crossing_eps_q),
                     bool(use_shipped_minimax_tables), tuple(pane_times))
             except RuntimeError as exc:
-                # The hardened DEV-80 route permits an exact reciprocal
-                # fallback only for a genuinely small tuple support.  It is
-                # a different execution currency, so it never consumes the
-                # tau ceiling or masquerades as an exponential rule.
-                n_direct = int(spec["state_indices"].size)
-                if (n_direct > int(max_nodes)
-                        or not str(exc).startswith(
-                            "hybrid crossing fit missed")):
+                if not str(exc).startswith("hybrid crossing fit missed"):
                     raise
-                direct = True
-                times = np.empty(0, dtype=np.complex128)
-                weights = np.empty(0, dtype=np.complex128)
-                evidence = {
-                    "family": "exact_direct_reciprocal_fallback",
-                    "fit_residual": 0.0, "refined_residual": 0.0,
-                    "amplification_p99": 1.0,
-                    "amplification_max": 1.0,
-                    "quadrature_refusal": str(exc),
-                    "direct_term_count": n_direct,
-                }
+                try:
+                    child_specs, child_fits = _fit_crossing_blocks(
+                        spec, budget, pole_sign=pole_sign, eta=eta,
+                        max_nodes=int(max_nodes), amp_cap=amp_cap,
+                        crossing_eps_q=float(crossing_eps_q),
+                        use_shipped_minimax_tables=bool(
+                            use_shipped_minimax_tables),
+                        pane_times=tuple(pane_times))
+                except RuntimeError:
+                    # The final exact route is legal only for a genuinely
+                    # small parent support. It is a separate execution
+                    # currency and never consumes the tau ceiling.
+                    n_direct = int(spec["state_indices"].size)
+                    if n_direct > int(max_nodes):
+                        raise
+                    direct = True
+                    times = np.empty(0, dtype=np.complex128)
+                    weights = np.empty(0, dtype=np.complex128)
+                    evidence = {
+                        "family": "exact_direct_reciprocal_fallback",
+                        "fit_residual": 0.0, "refined_residual": 0.0,
+                        "amplification_p99": 1.0,
+                        "amplification_max": 1.0,
+                        "quadrature_refusal": str(exc),
+                        "direct_term_count": n_direct,
+                    }
+                else:
+                    execution_specs.extend(child_specs)
+                    fits.extend(child_fits)
+                    continue
         else:
             times, weights, evidence = _fit_sign_definite(
                 problem, validation, residual_target, int(max_nodes), amp_cap)
+        execution_specs.append(spec)
         fits.append({
             "times": np.asarray(times, dtype=np.complex128),
             "weights": np.asarray(weights, dtype=np.complex128),
@@ -952,6 +1196,15 @@ def build_delivered_sigma_windows(
             "residual_target": float(residual_target),
             "direct": direct,
         })
+
+    specs = execution_specs
+    offset = 0
+    for report in branch_reports:
+        count = sum(spec["branch_report"] is report for spec in specs)
+        report["plan_start"], report["plan_stop"] = offset, offset + count
+        offset += count
+    if offset != len(specs):
+        raise AssertionError("delivered hardening lost an execution block")
 
     if grid_mode == "shared":
         for report in branch_reports:
@@ -998,8 +1251,10 @@ def build_delivered_sigma_windows(
                 f"{evidence['amplification_p99']:.4g}"))
         output.append(SharedSigmaWindow(
             window=window, E_A=branch.E_A,
-            omega_abs=np.asarray(branch.omega_abs, dtype=np.float64),
-            omega_idx=np.asarray(branch.omega_idx, dtype=np.int64),
+            omega_abs=np.asarray(branch.omega_abs, dtype=np.float64)[
+                spec["omega_positions"]],
+            omega_idx=np.asarray(branch.omega_idx, dtype=np.int64)[
+                spec["omega_positions"]],
             pole_indices=pole_indices,
             bounds=_all_pole_bounds(pole_indices.size),
             phase_real=np.zeros(pole_indices.size, dtype=bool),
@@ -1017,6 +1272,9 @@ def build_delivered_sigma_windows(
             "absolute_error_budget": budget.absolute_error_budget,
             "budget_fraction": budget.apportionment_weight,
             "relative_residual_target": residual_target,
+            "omega_positions": np.asarray(
+                spec["omega_positions"], dtype=np.int64).tolist(),
+            "hardening_parent": spec.get("hardening_parent"),
             "tau_grid_mode": grid_mode,
             "node_count": int(nodes.t.size),
             "direct_term_count": int(state_indices.size) if is_direct else 0,

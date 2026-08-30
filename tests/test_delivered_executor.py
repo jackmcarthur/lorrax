@@ -121,6 +121,62 @@ def test_planner_routes_a_small_failed_crossing_to_direct(monkeypatch):
     assert report["direct_term_count"] == 1
 
 
+def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch):
+    """A broad refusal becomes disjoint 2x2 blocks before direct fallback."""
+    E_A = jnp.asarray([[-0.4, -0.2, 0.0, 0.2]])
+    omega = np.asarray([0.2, 0.4, 0.6, 0.8])
+    branch = _SigmaBranch(
+        "positive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
+        "cond", False, omega, np.arange(omega.size, dtype=np.int64))
+
+    evidence = {
+        "family": "test_block_rule", "fit_residual": 0.0,
+        "refined_residual": 0.0, "amplification_p99": 1.0,
+        "amplification_max": 1.0, "attempts": [],
+    }
+
+    def crossing(problem, *_args, **_kwargs):
+        if problem.frequencies.size == omega.size:
+            raise RuntimeError(
+                "hybrid crossing fit missed its apportioned target or "
+                "amplification cap: block gate")
+        return (np.asarray([0.25 + 0.0j]),
+                np.asarray([0.5 - 0.1j]), dict(evidence))
+
+    def sign_definite(*_args, **_kwargs):
+        return (np.asarray([0.25 + 0.0j]),
+                np.asarray([0.5 - 0.1j]), dict(evidence))
+
+    monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", crossing)
+    monkeypatch.setattr(
+        "gw.mpa.delivered_windows._fit_sign_definite", sign_definite)
+    poles = np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)
+    residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
+    plan, report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega,
+        regularization_width_ry=0.05, target_error=1.0e-4,
+        max_nodes=2)
+
+    assert len(plan) == 4
+    assert report["direct_term_count"] == 0
+    frequency_blocks = {
+        tuple(np.asarray(row.omega_idx, dtype=np.int64)) for row in plan}
+    assert len(frequency_blocks) == 2
+    assert set().union(*(set(block) for block in frequency_blocks)) == set(
+        range(omega.size))
+    for block in frequency_blocks:
+        rows = [row for row in plan
+                if tuple(np.asarray(row.omega_idx, dtype=np.int64)) == block]
+        pairs = [
+            (int(state), int(pole))
+            for row in rows
+            for state, pole in zip(row.state_indices, row.pole_indices)
+        ]
+        assert sorted(pairs) == [(0, 0), (1, 0), (2, 0), (3, 0)]
+    assert all(window["hardening_parent"] is not None
+               for window in report["branches"][0]["windows"])
+
+
 def test_metal_oneshot_threads_one_occupation_state_to_fit_and_sigma():
     """The driver must not drop fixed-N occupations at either MPA consumer."""
     source = (Path(__file__).resolve().parents[1]
