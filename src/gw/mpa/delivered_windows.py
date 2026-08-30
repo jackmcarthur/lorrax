@@ -1014,15 +1014,15 @@ def build_delivered_sigma_windows(
     if cached is not None:
         (fits, free_pairs, required_cost, window_tau_pairs,
          fingerprint_match) = cached
-        validated_cost = _validate_cached_fits(
-            specs, fits, eta=eta, factor_cap=factor_cap,
-            pair_ceiling=pair_ceiling, total_absolute=total_absolute)
-        if validated_cost is None:
-            cached = None
-        else:
-            required_cost = validated_cost
-            cache_status = "hit" if fingerprint_match else "validated_hit"
-            if not fingerprint_match:
+        if not fingerprint_match:
+            validated_cost = _validate_cached_fits(
+                specs, fits, eta=eta, factor_cap=factor_cap,
+                pair_ceiling=pair_ceiling, total_absolute=total_absolute)
+            if validated_cost is None:
+                cached = None
+            else:
+                required_cost = validated_cost
+                cache_status = "validated_hit"
                 _save_plan_cache(
                     plan_cache_path, cache_fingerprint, fits, free_pairs,
                     required_cost, window_tau_pairs)
