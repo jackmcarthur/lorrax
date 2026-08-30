@@ -446,47 +446,72 @@ def compute_sigma_c_mpa_omega_grid(
             from .delivered_windows import (
                 build_delivered_sigma_windows,
                 combine_delivered_sigma_pole_measures,
+                delivered_plan_request_fingerprint,
                 delivered_product_geometry,
+                load_complete_delivered_sigma_plan,
                 measure_delivered_sigma_pole_batch,
             )
-            state_amplitudes = projected_state_amplitude_envelope(
-                wfns, state_bands=wfns.slices.sigma_sum,
-                projection_bands=wfns.slices.sigma)
-            product_geometry = delivered_product_geometry(
-                branches, regularization_width_ry,
-                edge_factor=edge_factor)
-            measured = [[] for _branch in branches]
-            for lo in range(0, n_poles, int(pole_batch_size)):
-                hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
-                for branch_index, branch in enumerate(branches):
-                    measured[branch_index].append(
-                        measure_delivered_sigma_pole_batch(
-                            branch, Omega, B,
-                            regularization_width_ry=regularization_width_ry,
-                            pole_split_ry=product_geometry["pole_edge_ry"],
-                            state_amplitude=state_amplitudes,
-                            pole_offset=lo, mesh_xy=mesh_xy))
-                del Omega, B
-                gc.collect()
-            measures_by_branch = [
-                combine_delivered_sigma_pole_measures(rows)
-                for rows in measured]
             tau_grid_mode = resolve_delivered_tau_grid()
-            plan, geometry = build_delivered_sigma_windows(
-                None, None, branches, omega_grid_ry,
-                regularization_width_ry=regularization_width_ry,
-                envelope_relative_target=target_error,
-                max_nodes=max(int(max_rank), int(crossing_max_nodes)),
-                crossing_eps_q=1.0e-3,
-                use_shipped_minimax_tables=True,
-                tau_grid_mode=tau_grid_mode,
-                max_direct_terms=resolve_delivered_max_direct_terms(),
-                edge_factor=edge_factor,
-                measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
-                plan_cache_path=resolve_delivered_plan_cache())
+            direct_ceiling = resolve_delivered_max_direct_terms()
+            delivered_cache_path = resolve_delivered_plan_cache()
+            delivered_max_nodes = max(
+                int(max_rank), int(crossing_max_nodes))
+            request_fingerprint = delivered_plan_request_fingerprint(
+                branches, omega_grid_ry, fit_ledger=ledger,
+                parameters={
+                    "regularization_width_ry": regularization_width_ry,
+                    "envelope_relative_target": target_error,
+                    "max_nodes": delivered_max_nodes,
+                    "tau_grid_mode": tau_grid_mode,
+                    "max_direct_terms": direct_ceiling,
+                    "edge_factor": edge_factor,
+                    "pole_batch_size": pole_batch_size,
+                })
+            cached = load_complete_delivered_sigma_plan(
+                delivered_cache_path, request_fingerprint, branches)
+            if cached is not None:
+                plan, geometry = cached
+            else:
+                state_amplitudes = projected_state_amplitude_envelope(
+                    wfns, state_bands=wfns.slices.sigma_sum,
+                    projection_bands=wfns.slices.sigma)
+                product_geometry = delivered_product_geometry(
+                    branches, regularization_width_ry,
+                    edge_factor=edge_factor)
+                measured = [[] for _branch in branches]
+                for lo in range(0, n_poles, int(pole_batch_size)):
+                    hi = min(lo + int(pole_batch_size), n_poles)
+                    Omega, B = reader.read(
+                        slice(lo, hi), unfold=True, return_sharded=True,
+                        to_unit="Ry")
+                    for branch_index, branch in enumerate(branches):
+                        measured[branch_index].append(
+                            measure_delivered_sigma_pole_batch(
+                                branch, Omega, B,
+                                regularization_width_ry=
+                                regularization_width_ry,
+                                pole_split_ry=
+                                product_geometry["pole_edge_ry"],
+                                state_amplitude=state_amplitudes,
+                                pole_offset=lo, mesh_xy=mesh_xy))
+                    del Omega, B
+                    gc.collect()
+                measures_by_branch = [
+                    combine_delivered_sigma_pole_measures(rows)
+                    for rows in measured]
+                plan, geometry = build_delivered_sigma_windows(
+                    None, None, branches, omega_grid_ry,
+                    regularization_width_ry=regularization_width_ry,
+                    envelope_relative_target=target_error,
+                    max_nodes=delivered_max_nodes,
+                    crossing_eps_q=1.0e-3,
+                    use_shipped_minimax_tables=True,
+                    tau_grid_mode=tau_grid_mode,
+                    max_direct_terms=direct_ceiling,
+                    edge_factor=edge_factor,
+                    measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
+                    plan_cache_path=delivered_cache_path,
+                    plan_cache_request_fingerprint=request_fingerprint)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

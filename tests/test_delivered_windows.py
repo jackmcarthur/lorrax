@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from gw.mpa.delivered_windows import (
     build_delivered_sigma_windows,
     combine_delivered_sigma_pole_measures,
+    load_complete_delivered_sigma_plan,
     measure_delivered_sigma_pole_batch,
 )
 from gw.ppm_accumulators import _omega_coefficient
@@ -96,6 +97,34 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
     assert len(direct) == len(batched)
     for got, expected in zip(batched, direct):
         np.testing.assert_array_equal(got.state_indices, expected.state_indices)
+        np.testing.assert_array_equal(got.pole_indices, expected.pole_indices)
+        np.testing.assert_allclose(got.window.nodes.t, expected.window.nodes.t)
+        np.testing.assert_allclose(
+            got.window.nodes.alpha, expected.window.nodes.alpha)
+
+
+def test_complete_plan_receipt_reconstructs_current_branch_arrays(tmp_path):
+    omega_grid = np.asarray([0.0])
+    branch = _branch("cached conduction", "cond", [0.2], omega_grid)
+    Omega = np.asarray([0.5 - 0.05j]).reshape(1, 1, 1, 1)
+    residue = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
+    path = tmp_path / "delivered-plan.pkl"
+    plan, report = build_delivered_sigma_windows(
+        [Omega], [residue], [branch], omega_grid,
+        regularization_width_ry=0.02,
+        envelope_relative_target=1.0e-5,
+        lattice_bins=9, max_nodes=128,
+        plan_cache_path=str(path),
+        plan_cache_request_fingerprint="current-input")
+
+    loaded, loaded_report = load_complete_delivered_sigma_plan(
+        str(path), "current-input", [branch])
+    assert loaded_report["plan_cache_status"] == "complete_hit"
+    assert loaded_report["window_tau_pairs"] == report["window_tau_pairs"]
+    for got, expected in zip(loaded, plan):
+        assert got.E_A is branch.E_A
+        np.testing.assert_array_equal(
+            got.window.mask_A, expected.window.mask_A)
         np.testing.assert_array_equal(got.pole_indices, expected.pole_indices)
         np.testing.assert_allclose(got.window.nodes.t, expected.window.nodes.t)
         np.testing.assert_allclose(

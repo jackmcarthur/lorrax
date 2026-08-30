@@ -126,6 +126,8 @@ def _load_plan_cache(path, fingerprint, n_specs):
     if (not isinstance(payload, dict)
             or payload.get("version") != _PLAN_CACHE_VERSION):
         return None
+    if payload.get("kind", "fits") != "fits":
+        return None
     fits = payload.get("fits")
     if not isinstance(fits, list) or len(fits) != int(n_specs):
         raise RuntimeError(
@@ -181,12 +183,154 @@ def _save_plan_cache(path, fingerprint, fits, free_pairs, required_cost,
     temporary = f"{path}.tmp.{os.getpid()}"
     payload = {
         "version": _PLAN_CACHE_VERSION,
+        "kind": "fits",
         "fingerprint": fingerprint,
         "fits": fits,
         "free_pairs": int(free_pairs),
         "required_cost": float(required_cost),
         "window_tau_pairs": int(window_tau_pairs),
     }
+    try:
+        with open(temporary, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def delivered_plan_request_fingerprint(branches, omega_grid_ry, *,
+                                       fit_ledger, parameters):
+    """Identify the stable upstream inputs of a complete delivered plan."""
+    digest = hashlib.sha256()
+    digest.update(b"delivered-complete-plan-v1")
+
+    def add(value):
+        if isinstance(value, Mapping):
+            digest.update(b"{")
+            for key in sorted(value, key=str):
+                add(str(key))
+                add(value[key])
+            digest.update(b"}")
+        elif isinstance(value, (tuple, list)):
+            digest.update(b"[")
+            for item in value:
+                add(item)
+            digest.update(b"]")
+        elif isinstance(value, (np.ndarray, jax.Array)):
+            array = (np.asarray(gather_to_host(value))
+                     if isinstance(value, jax.Array) else np.asarray(value))
+            array = np.ascontiguousarray(array)
+            digest.update(array.dtype.str.encode())
+            digest.update(repr(array.shape).encode())
+            digest.update(array.view(np.uint8))
+        else:
+            digest.update(repr(value).encode())
+            digest.update(b"\0")
+
+    add(fit_ledger)
+    add(parameters)
+    add(np.asarray(omega_grid_ry, np.float64))
+    for branch in branches:
+        add((branch.tag, branch.space, bool(branch.neg_omega_half)))
+        add(branch.E_A)
+        add(branch.base_mask_A)
+        add(branch.omega_abs)
+        add(branch.omega_idx)
+        add(branch.band_weight)
+    return digest.hexdigest()
+
+
+def load_complete_delivered_sigma_plan(path, request_fingerprint, branches):
+    """Load a complete certified product-window receipt before its census."""
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as stream:
+            payload = pickle.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, pickle.PickleError, EOFError) as exc:
+        raise RuntimeError(
+            f"could not read delivered-plan cache {path!r}: {exc}") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("version") != _PLAN_CACHE_VERSION
+            or payload.get("kind") != "complete"
+            or payload.get("request_fingerprint") != request_fingerprint):
+        return None
+    rows = []
+    for saved in payload.get("rows", ()):
+        branch_index = int(saved["branch_index"])
+        if not 0 <= branch_index < len(branches):
+            raise RuntimeError(
+                f"delivered-plan cache {path!r} has an invalid branch index")
+        branch = branches[branch_index]
+        window_data = dict(saved["window"])
+        window_data["nodes"] = MinimaxNodes(
+            t=jnp.asarray(saved["t"], dtype=jnp.complex128),
+            alpha=jnp.asarray(saved["alpha"], dtype=jnp.complex128))
+        window_data["mask_A"] = np.asarray(window_data["mask_A"], bool)
+        window = _SigmaWindow(**window_data)
+        rows.append(SharedSigmaWindow(
+            window=window, E_A=branch.E_A,
+            omega_abs=np.asarray(saved["omega_abs"], np.float64),
+            omega_idx=np.asarray(saved["omega_idx"], np.int64),
+            pole_indices=np.asarray(saved["pole_indices"], np.int32),
+            bounds=np.asarray(saved["bounds"], np.float64),
+            phase_real=np.asarray(saved["phase_real"], bool),
+            band_weight=branch.band_weight))
+    geometry = dict(payload["geometry"])
+    geometry.update(plan_cache_status="complete_hit",
+                    plan_cache_path=path, plan_seconds=0.0)
+    return rows, geometry
+
+
+def _save_complete_delivered_sigma_plan(path, request_fingerprint, output,
+                                        specs, geometry, branches):
+    """Atomically publish the fully constructed runtime-window receipt."""
+    if path is None or request_fingerprint is None or process_rank() != 0:
+        return
+    branch_index = {id(branch): index for index, branch in enumerate(branches)}
+    rows = []
+    for row, spec in zip(output, specs):
+        win = row.window
+        rows.append({
+            "branch_index": branch_index[id(spec["branch"])],
+            "t": np.asarray(jax.device_get(win.nodes.t), np.complex128),
+            "alpha": np.asarray(
+                jax.device_get(win.nodes.alpha), np.complex128),
+            "window": {
+                "name": win.name,
+                "mask_A": np.asarray(jax.device_get(win.mask_A), bool),
+                "E_ref_A": win.E_ref_A, "E_ref_B": win.E_ref_B,
+                "omega_sign": win.omega_sign, "project": win.project,
+                "prefactor": win.prefactor,
+                "mask_B_mode": win.mask_B_mode,
+                "mask_B_threshold": win.mask_B_threshold,
+                "crossing_kind": win.crossing_kind,
+                "max_error": win.max_error, "provenance": win.provenance,
+                "E_min": win.E_min, "E_max": win.E_max,
+                "B_lo": win.B_lo, "B_hi": win.B_hi,
+                "omega_indices": win.omega_indices,
+            },
+            "omega_abs": np.asarray(row.omega_abs, np.float64),
+            "omega_idx": np.asarray(row.omega_idx, np.int64),
+            "pole_indices": np.asarray(row.pole_indices, np.int32),
+            "bounds": np.asarray(row.bounds, np.float64),
+            "phase_real": np.asarray(row.phase_real, bool),
+        })
+    payload = {
+        "version": _PLAN_CACHE_VERSION, "kind": "complete",
+        "request_fingerprint": request_fingerprint,
+        "rows": rows, "geometry": geometry,
+    }
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary = f"{path}.tmp.{os.getpid()}"
     try:
         with open(temporary, "wb") as stream:
             pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
@@ -849,6 +993,7 @@ def build_delivered_sigma_windows(
     measures_by_branch=None,
     mesh_xy=None,
     plan_cache_path=None,
+    plan_cache_request_fingerprint=None,
 ):
     """Build the owner-specified product-window delivered Sigma plan."""
     del crossing_eps_q, use_shipped_minimax_tables, pane_times
@@ -1133,7 +1278,7 @@ def build_delivered_sigma_windows(
     if reference is not None:
         exchange_rate = combined_scale / float(np.max(np.abs(reference)))
         calibration = "calibrated_to_reference_sigma"
-    return output, {
+    report = {
         "planner": "delivered_product_windows",
         "eta_ry": eta,
         "envelope_relative_target": target,
@@ -1167,6 +1312,10 @@ def build_delivered_sigma_windows(
         "branches": branch_reports,
         **geometry,
     }
+    _save_complete_delivered_sigma_plan(
+        plan_cache_path, plan_cache_request_fingerprint, output, specs,
+        report, branch_rows)
+    return output, report
 
 
 __all__ = [
@@ -1175,6 +1324,8 @@ __all__ = [
     "MAX_WINDOW_TAU_PAIRS", "RUNTIME_NOISE_EPSILON",
     "build_delivered_sigma_windows",
     "combine_delivered_sigma_pole_measures",
+    "delivered_plan_request_fingerprint",
     "delivered_product_geometry",
+    "load_complete_delivered_sigma_plan",
     "measure_delivered_sigma_pole_batch",
 ]
