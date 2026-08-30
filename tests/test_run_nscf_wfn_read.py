@@ -31,6 +31,11 @@ The two gates:
 
 Nothing here needs a GPU, a mesh, or a QE ``.save``: the crystal is a
 namespace with the dozen fields the writer and the G-sphere builders read.
+
+Gate 3 (2026-08-28) rides on the same fixtures: the writer's ``n_occ`` /
+``ifmax`` must be an occupied-BAND count for BOTH crystal shapes it is
+handed (QE ``CrystalData``: nelec = electron count; ``WfnLoader`` via
+``qp_wfn``: nelec = band count, ``num_electrons`` = electron count).
 """
 from __future__ import annotations
 
@@ -227,3 +232,115 @@ def test_a_mismatched_g_sphere_is_refused(tmp_path):
     with pytest.raises(ValueError, match="disagrees with the NSCF G-sphere"):
         _load_deterministic_bands(str(path), crystal, (2, 2, 1), True,
                                   NSPINOR, False)
+
+
+# ---------------------------------------------------------------------------
+# Gate 3 — the writer's n_occ is an occupied-BAND count for BOTH input shapes
+# ---------------------------------------------------------------------------
+# ``WFNWriter`` receives two crystal shapes whose ``nelec`` MEAN DIFFERENT
+# THINGS: a QE ``CrystalData`` (nelec = physical electron count, no
+# ``num_electrons`` attr) and, via ``file_io.qp_wfn``, a ``WfnLoader``
+# (nelec = max(ifmax), already an occupied-band count; ``num_electrons`` =
+# the physical count).  n_occ = electrons·nspin·nspinor/2 converts the
+# physical count to bands in both conventions; halving a loader's nelec
+# AGAIN was the qp_wfn double-halving defect at nspinor=1.
+
+
+def _ns_with(base, **over):
+    """A copy of a SimpleNamespace crystal with fields overridden."""
+    return SimpleNamespace(**{**vars(base), **over})
+
+
+def _written_ifmax_and_occ(tmp_path, crystal, fname):
+    """Write a header-only Γ WFN through the writer; return (ifmax, occ[k=0])."""
+    import h5py
+
+    path = tmp_path / fname
+    kpoints = np.zeros((1, 3), dtype=np.float64)
+    G_master, _ = build_master_gvec_list(crystal)
+    gk = select_gvecs_for_k(kpoints[0], G_master, crystal.bdot,
+                            crystal.ecutwfc)[0]
+    w = WFNWriter(str(path), crystal, kpoints, np.ones(1), (1, 1, 1),
+                  NBANDS, [gk], nosym=True)
+    w.close()
+    with h5py.File(str(path), "r") as f:
+        return (int(f["mf_header/kpoints/ifmax"][0, 0]),
+                np.asarray(f["mf_header/kpoints/occ"][0, 0, :]))
+
+
+def test_crystal_shaped_nelec_keeps_todays_ifmax_at_both_spinor_counts(tmp_path):
+    """The QE-CrystalData arithmetic is PINNED: 4 e- → 2 bands scalar, 4 FR."""
+    for nspinor, want in ((1, 2), (2, 4)):
+        crystal = _ns_with(_cubic_crystal(), nspinor=nspinor)      # nelec=4 e-
+        ifmax, occ = _written_ifmax_and_occ(
+            tmp_path, crystal, f"WFN_crystal_ns{nspinor}.h5")
+        assert ifmax == want, (
+            f"nspinor={nspinor}: ifmax={ifmax}, want {want} occupied bands "
+            f"for {crystal.nelec} electrons")
+        assert np.array_equal(
+            occ, [1.0] * want + [0.0] * (NBANDS - want)), (
+            f"nspinor={nspinor}: occ row disagrees with ifmax={want}")
+
+
+def test_loader_shaped_input_is_not_double_halved_at_nspinor1(tmp_path):
+    """THE BROKEN CASE.  A WfnLoader's nelec is already a band count.
+
+    4 electrons at nspinor=1 fill 2 bands, so the loader-shaped stub has
+    nelec=2 (= max(ifmax)) and num_electrons=4.0.  The pre-fix expression
+    ``int(crystal.nelec) // 2`` halved the band count AGAIN → ifmax=1; the
+    precondition assert keeps this cell from ever passing vacuously.
+    """
+    crystal = _ns_with(_cubic_crystal(), nspinor=1,
+                       nelec=2, num_electrons=4.0)
+    assert int(crystal.nelec) // 2 != 2, (
+        "fixture numbers no longer discriminate: the pre-fix arithmetic "
+        "agrees with the expected value, so this cell proves nothing")
+    ifmax, occ = _written_ifmax_and_occ(tmp_path, crystal, "WFN_loader_ns1.h5")
+    assert ifmax == 2, (
+        f"ifmax={ifmax}: the loader-shaped nspinor=1 input was re-halved "
+        f"(want 2 = the band count the loader already computed)")
+    assert np.array_equal(occ, [1.0, 1.0] + [0.0] * (NBANDS - 2))
+
+
+def test_loader_shaped_input_at_nspinor2_is_unchanged(tmp_path):
+    """nspinor=2 bit-identity: 4 e- → nelec=4 spinor bands → ifmax=4."""
+    crystal = _ns_with(_cubic_crystal(), nspinor=2,
+                       nelec=4, num_electrons=4.0)
+    ifmax, occ = _written_ifmax_and_occ(tmp_path, crystal, "WFN_loader_ns2.h5")
+    assert ifmax == 4
+    assert np.array_equal(occ, [1.0] * 4 + [0.0] * (NBANDS - 4))
+
+
+def test_kmeans_current_density_n_occ_is_the_unhalved_band_count():
+    """The OTHER consumer of the same convention, pinned structurally.
+
+    ``centroid/kmeans_cli.py`` computes n_occ from a ``WfnLoader`` inside
+    ``main()``, behind a full CLI + density build, so the expression is
+    not executable here; the SEMANTIC it must follow (wfn.nelec is a band
+    count in both spinor conventions) is executed by the writer cells
+    above.  This cell pins the expression itself by AST — code tokens,
+    not prose (TASTE 17) — so the ``// 2`` double-halving cannot return
+    behind the comment that says not to.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "src" / "centroid" / "kmeans_cli.py").read_text()
+
+    def _n_occ_exprs(tree):
+        return [ast.unparse(n.value) for n in ast.walk(tree)
+                if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "n_occ"
+                        for t in n.targets)]
+
+    got = _n_occ_exprs(ast.parse(src))
+    assert got == ["int(wfn.nelec)"], (
+        f"kmeans_cli n_occ assignment(s) {got!r}: want exactly "
+        f"['int(wfn.nelec)'] — wfn.nelec = max(ifmax) is already an "
+        f"occupied-band count in both spinor conventions")
+    # RED TWIN: the pre-fix line must FAIL the same predicate, or the
+    # gate is matching nothing.
+    old = ast.parse("n_occ = int(wfn.nelec) if int(wfn.nspinor) == 2 "
+                    "else int(wfn.nelec) // 2")
+    assert _n_occ_exprs(old) != ["int(wfn.nelec)"]

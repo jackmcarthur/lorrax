@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -121,3 +122,67 @@ def print_atomic_structure(wfn, pseudos: dict) -> None:
         fname = os.path.basename(getattr(pseudo, "_source_path", ""))
         print(f"  {element:<6} {z_val:>5} {n_proj:>6}  {fname}")
     print()
+
+
+def _generator_tag(pseudo) -> str:
+    """Short (≤15 char) generator/set tag for the report block, or "".
+
+    Derived from PP_HEADER's ``generated`` attribute and the free-text
+    PP_INFO body.  Only patterns this repo's staged sets actually carry
+    are recognized (ONCVPSP with or without an adjacent version number;
+    the PseudoDojo token); anything else yields "" and the tag is simply
+    omitted — a guess here would be provenance fiction.
+    """
+    hdr = getattr(pseudo, "pp_header", None)
+    info = getattr(getattr(pseudo, "pp_info", None), "value", None) or ""
+    text = f"{getattr(hdr, 'generated', None) or ''} {info[:4000]}"
+    m = re.search(r"ONCVPSP[-\s]*v?(\d+\.\d+\.\d+)", text)
+    if m is None and "ONCVPSP" in text:
+        # ONCVPSP's own PP_INFO prose puts the number two lines below the
+        # name ("... version 3.3.0 08/16/2017 by D. R. Hamann").
+        m = re.search(r"version\s+(\d+\.\d+\.\d+)", text)
+        if m is None:
+            return "ONCVPSP"
+    if m is not None:
+        return f"ONCVPSP-{m.group(1)}"[:15]
+    if "PseudoDojo" in text:
+        return "PseudoDojo"
+    return ""
+
+
+def pseudo_summary_lines(pseudos: dict) -> list[str]:
+    """ONE log line per species for the Pseudopotentials report block.
+
+        Si             : Si.upf — scalar-relativistic, z_val 4, NLCC yes (ONCVPSP-3.3.0)
+
+    The SR/FR verdict follows the projector policy (radial/
+    build_projectors_qe.pseudo_has_j_channels): a beta carrying an
+    explicit jjj is what makes a file j-resolved — the PP_HEADER
+    ``relativistic``/``has_so`` attributes are advisory, so when they
+    disagree with the betas the disagreement is printed and the betas
+    win.  The trailing parenthetical is :func:`_generator_tag`, omitted
+    when nothing recognizable is in the file.
+    """
+    from psp.radial.build_projectors_qe import pseudo_has_j_channels
+
+    lines: list[str] = []
+    for element in sorted(pseudos):
+        pseudo = pseudos[element]
+        hdr = pseudo.pp_header
+        fname = os.path.basename(getattr(pseudo, "_source_path", "?"))
+        has_j = pseudo_has_j_channels(pseudo)
+        rel_attr = getattr(hdr, "relativistic", None)
+        rel_attr = getattr(rel_attr, "value", rel_attr)  # enum → str
+        kind = "fully-relativistic" if has_j else "scalar-relativistic"
+        header_says_full = str(rel_attr).strip().lower() == "full"
+        if header_says_full != has_j and rel_attr is not None:
+            kind += f' [header relativistic="{rel_attr}"; beta channels win]'
+        nlcc = "yes" if getattr(pseudo, "pp_nlcc", None) is not None else "no"
+        tag = _generator_tag(pseudo)
+        lines.append(
+            f"{element:<15}: {fname} — {kind}, "
+            f"z_val {float(hdr.z_valence):g}, NLCC {nlcc}"
+            + (f" ({tag})" if tag else ""))
+    if not lines:
+        lines.append("(none loaded)")
+    return lines

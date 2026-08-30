@@ -276,6 +276,33 @@ class WfnLoader:
             bind_mf_attrs, kpt_starts, read_mf_header_from_file)
         hdr = read_mf_header_from_file(self._file)
         bind_mf_attrs(self, hdr)
+        # Layout refusals, before ANYTHING slices wfns/coeffs — including
+        # ``_run_density_symmetry_check`` at the end of ``__init__``, whose
+        # ``_raw_ibz_psi_k`` reads ``loader._file["wfns/coeffs"]`` directly.
+        if int(self.flavor) != 2:
+            raise ValueError(
+                "WfnLoader: real-flavor WFN unsupported: got mf_header/"
+                f"flavor={int(self.flavor)}, want 2 (complex).  BGW sizes "
+                "the trailing axis of wfns/coeffs by iflavor (Common/"
+                "wfn_io_hdf5.F90 setup_hdf5_wfn_file: a3(1)=iflavor); this "
+                "loader hardcodes that re/im axis extent as 2 at every "
+                "coeffs slice, so a flavor=1 file dies as an opaque "
+                "IndexError / FFI over-request instead of here.  Fix: "
+                "convert with BGW's wfn utilities, or write complex "
+                "wavefunctions (pw2bgw real_or_complex=2).")
+        if int(self.nspin) != 1:
+            # ``symmetry_maps/density_symmetry_check.py`` (nspin==2 arm,
+            # ~:870) documents the same layout gap but stays permissive;
+            # this refusal supersedes it upstream.
+            raise ValueError(
+                "WfnLoader: spin-polarized WFN unsupported: got mf_header/"
+                f"kpoints/nspin={int(self.nspin)}, want 1 (nspinor may be "
+                "1 or 2).  BGW packs coeffs axis 1 as nspin*nspinor "
+                "(Common/wfn_io_hdf5.F90 setup_hdf5_wfn_file: "
+                "a3(3)=nspin*nspinor) and this loader treats that axis as "
+                "the SPINOR axis alone, so an nspin=2 file would silently "
+                "read only the spin-up channel.  Fix: produce an nspin=1 "
+                "WFN (non-spin-polarized, or noncollinear for magnetism).")
         # Cartesian-→-crystal: same expression legacy WFNReader exposed.
         self.atom_crys = np.einsum(
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
@@ -1423,17 +1450,12 @@ class WfnLoader:
             # phdf5 path requires a NamedSharding to express the
             # collective output layout.  Caller passed sharding=None on
             # a phdf5 loader → replicate output (rare in production but
-            # used by bit-equality tests).  Spinor axis size is 4 when
-            # bispinor=True.
-            ns_out = 4 if bispinor else int(self.nspinor)
+            # used by bit-equality tests).  The same NamedSharding serves
+            # the post-lift 4-spinor shape: a spec names mesh axes, not
+            # dim extents.
             if named_sharding is None:
                 named_sharding = NamedSharding(
                     self._mesh, P(*([None] * 4)))
-            elif bispinor:
-                # Rebuild the sharding for the post-lift shape — only
-                # the spinor axis count changes; partition spec is the
-                # same string set.
-                pass  # NamedSharding doesn't care about exact dim sizes
             psi = self._phdf5_build(
                 b_lo=b_lo, b_hi=b_hi, k_idxs=k_idxs, unfold=unfold,
                 nb_padded=nb_padded, out_sharding=named_sharding)

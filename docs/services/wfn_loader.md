@@ -87,7 +87,11 @@ for the real one, which is exactly what the deleted shim was.
   (`backend='phdf5_host'`, both doors). At P>1 with a mesh and no
   phdf5-capable library on either platform, `auto` REFUSES, quoting the
   door probe's reason per platform and the `LORRAX_WFN_BACKEND=eager` way
-  through — no silent demotion. `phdf5` without a mesh refuses.
+  through — no silent demotion. `phdf5` without a mesh refuses. Headers the
+  coeffs slicing cannot serve refuse at construction, before anything reads
+  the raw dataset: `flavor != 2` (real-flavor files; the re/im axis is
+  hardcoded as 2) and `nspin != 1` (coeffs axis 1 is treated as the spinor
+  axis alone, so nspin=2 would silently read spin-up only).
 * **`load` vs `load_process_local`.** `load` returns one logical global
   array (every rank must request the same window); `load_process_local`
   is the k-parallel primitive (per-rank windows, combination explicit).

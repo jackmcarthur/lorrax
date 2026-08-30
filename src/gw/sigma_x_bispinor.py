@@ -146,7 +146,7 @@ def compute_sigma_x_bispinor(
         function's return value to ``sig_x`` unconditionally, without a
         per-layout shape special-case of its own.
     """
-    from .cohsex_sigma import _make_cohsex_kernels
+    from .cohsex_sigma import _make_cohsex_kernels, _spin_capacity
     nk_tot = int(meta.nk_tot)
     # layout dispatch: face_kernel_kwargs(wfns_transverse) is {} under
     # layout='legacy' (dead-code-eliminated at trace time, byte-identical
@@ -158,8 +158,12 @@ def compute_sigma_x_bispinor(
     # / common.contract_bands.contract_bands_block_reshard(layout=...)
     # for a face-layout wfns_transverse rather than only ever working on
     # the legacy carrier.
+    # f_spin derived the same way as compute_cohsex_sigma so the two share
+    # one cache entry; on this bispinor-only path it is always exactly 1.0
+    # (and the sx kernel taken here never reads it).
     sigma_sx_k, _, _ = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, nk_tot, **face_kernel_kwargs(wfns_transverse))
+        mesh_xy, meta.kgrid, nk_tot, f_spin=_spin_capacity(meta),
+        **face_kernel_kwargs(wfns_transverse))
 
     # Instrumented psi inventory disclosure (report §7's "disclose the
     # selected layout"): the transverse-centroid bundle DOUBLES whichever

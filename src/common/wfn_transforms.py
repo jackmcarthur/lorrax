@@ -1931,7 +1931,7 @@ def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
     return load_kpoint_fftbox_local(wfn, meta, k_idx, nb)
 
 
-def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
+def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=None):
     """Return band energies and per-band weights for a given band window.
 
     Args:
@@ -1939,7 +1939,10 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
         sym: SymMaps with mappings between irreducible and full k sets
         bandrange: tuple[int,int] inclusive-exclusive (start, end) bands to extract
         sigma_bandrange: tuple[int,int] band window used to compute weighting
-        nspinor: Number of spinor components (2 for Pauli, 4 for bispinor)
+        nspinor: Spinor components widthing the WEIGHTS axis only (2 for
+            Pauli, 4 for bispinor); None reads ``wfn.nspinor``.  ``enk``
+            does not depend on it — a hardcoded default of 2 was
+            silent-wrong for the weights on an nspinor=1 file.
 
     Returns:
         enk: jax.Array of shape (nk_full, nb)
@@ -1959,6 +1962,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=2):
     type it expects.  Do NOT "fix" this back to ``jnp``.
     ────────────────────────────────────────────────────────────────────────
     """
+    nspinor = int(wfn.nspinor) if nspinor is None else int(nspinor)
     # Energies are stored on irreducible k; expand to full k using mapping.
     band_lo = int(bandrange[0])
     band_hi = int(bandrange[1])

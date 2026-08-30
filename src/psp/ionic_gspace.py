@@ -145,11 +145,26 @@ def build_ionic_and_core(
     fft_grid,
     *,
     truncation_2d: bool = False,
-    n_q: int = 4000,
+    n_q: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Build V_loc(r) and ρ_core(r) from pseudopotentials on the FFT grid.
 
     Returns (V_loc_r, rho_core_r, rho_core_G_scaled).
+
+    n_q : int, optional — radial-table node count.  ``None`` (default)
+        scales it with q_max so the grid spacing dq is ECUT-INDEPENDENT
+        (target 5e-4 bohr⁻¹, floor 4000 nodes) — the same rule
+        ``vnl_ops.build_vnl_setup`` adopted in 414ab25b, and the fix for
+        the same defect class (DEFECTS #20): a fixed n_q=4000 over the
+        FFT-box-corner |G| hands the COARSEST table to exactly the
+        hard-pseudo/high-ecut decks whose vloc(q) curves most.  The
+        table is consumed LINEARLY inside ``_ionic_gspace_jit``
+        (``interp_uniform_jax``) and stays linear: measured on the Si
+        4×4×4 SR and FR decks (24³ box, q_max 23.45/bohr), linear at
+        dq=5e-4 is ≤4.2e-9 (raw table) / ≤2e-10 Ry at the V(G)
+        coefficient — three decades under the ~1e-6 Ry level that would
+        justify a cubic gather in the jit.  (At the old dq=5.9e-3:
+        5.6e-7 raw / 2.6e-8 Ry.)  Pass an explicit n_q to override.
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables, alpha_z
@@ -164,9 +179,17 @@ def build_ionic_and_core(
     G_crys_flat, G_norm_flat = build_fft_G_data(fft_grid, bvec, blat)
     q_max = float(np.max(G_norm_flat))
 
+    if n_q is None:
+        # dq ecut-independent (see docstring; mirrors build_vnl_setup).
+        n_q = max(4000, int(np.ceil(q_max / 5.0e-4)) + 1)
+
     # ── Species data + radial tables (all CPU, one pass) ──
-    species_list = extract_species(pseudos, nspinor=int(getattr(wfn, 'nspinor', 2)))
-    tables = build_all_tables(species_list, q_max, n_q)
+    # projectors=False: this lane consumes ONLY the l=0 rows (vloc +
+    # nlcc); the projector/deriv rows belong to build_vnl_setup's own
+    # build_all_tables call and at this n_q would cost ~8.3 s/species-set
+    # of discarded work (measured 2026-08-28).
+    species_list = extract_species(pseudos)
+    tables = build_all_tables(species_list, q_max, n_q, projectors=False)
     species_natoms, species_tau, max_atoms = build_atom_species_map(wfn, species_list)
     n_sp = len(species_list)
     q0, dq = 0.0, tables["dq"]

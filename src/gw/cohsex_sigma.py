@@ -52,6 +52,36 @@ from .wavefunction_bundle import G_FFT7D_SPEC, V_FFT5D_SPEC
 # kept alongside the COHSEX kernels because it's only consumed here.
 # ---------------------------------------------------------------------------
 
+def _spin_capacity(meta) -> float:
+    """Electrons per occupied band, from meta's DECLARED spin structure.
+
+    Delegates to the ONE canonical helper
+    (``psp.get_DFT_mtxels.spin_degeneracy_factor`` — ``Meta`` duck-types
+    the two attrs it reads, and bispinor meta.nspinor=4 yields exactly
+    1.0, like nspinor=2).  The presence check exists because the helper
+    getattr-defaults a missing attr to 1, which would hand a meta that
+    never declared its spin structure the SCALAR factor 2 *silently* —
+    the V_H it scales is a ~500 eV quantity, so refuse loudly instead.
+    """
+    for attr in ("nspin", "nspinor"):
+        if not hasattr(meta, attr):
+            raise AttributeError(
+                f"cohsex_sigma: meta.{attr} is missing — the Hartree ρ and "
+                f"the fixed-N window check are capacity-weighted (2 e⁻ per "
+                f"band iff nspin == nspinor == 1), so meta must declare its "
+                f"spin structure (got a {type(meta).__name__} without it).  "
+                f"Fix: pass a common.meta.Meta, or give the stub explicit "
+                f"nspin/nspinor.")
+    # Computed from meta's own declared file-spin structure.  NOT delegated
+    # to psp.get_DFT_mtxels.spin_degeneracy_factor: that helper is now the
+    # loader's occupation-capacity door (wfn.occupation_state_capacity) and
+    # takes a WfnLoader, not a Meta.  nspinor_wfnfile keeps bispinor
+    # (meta.nspinor=4, file 2) at exactly 1.0.
+    return 2.0 if (int(meta.nspin) == 1
+                   and int(getattr(meta, "nspinor_wfnfile", meta.nspinor))
+                   == 1) else 1.0
+
+
 def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
     """Occupation projector G_ij = diag(1,...,1,0,...,0) for sigma bands.
 
@@ -90,7 +120,12 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
         # The metallic form of the same V_H-silently-small hazard the
         # integer guard below prevents: electrons carried by bands outside
         # the Σ window would silently leave the Hartree density.
-        n_win = float(np.sum(f_win)) / float(meta.nk_tot)
+        # ``n_electrons`` is capacity-weighted (the efermi solvers count
+        # f × spin_degeneracy_factor), so the band sum must be too: 2
+        # electrons per band on a spin-restricted scalar WFN, exactly 1.0
+        # for nspinor ≥ 2 (bispinor meta.nspinor=4 included).
+        n_win = (_spin_capacity(meta)
+                 * float(np.sum(f_win)) / float(meta.nk_tot))
         n_target = float(occupation_state.n_electrons)
         if abs(n_win - n_target) > 1.0e-8:
             raise ValueError(
@@ -201,7 +236,7 @@ _hartree_projection_cache: dict[tuple[object, ...], object] = {}
 
 
 def make_hartree_density_kernel(
-    mesh_xy: Mesh, *, layout: str, face_shape=None,
+    mesh_xy: Mesh, *, layout: str, face_shape=None, f_spin: float,
 ):
     """Occupied one-point ``sum_kn f_kn psi^dag Gamma_B psi`` owner.
 
@@ -215,7 +250,17 @@ def make_hartree_density_kernel(
     is exactly what channel zero's identity specialization returns.
     """
     shape_key = None if face_shape is None else tuple(int(v) for v in face_shape)
-    key = (id(mesh_xy), layout, shape_key)
+    # ``f_spin`` (electrons per occupied band,
+    # psp.get_DFT_mtxels.spin_degeneracy_factor: 2.0 for a spin-restricted
+    # scalar WFN, else exactly 1.0) scales ONLY this density — BGW puts the
+    # nspin=nspinor=1 factor 2 into epsilon and the density
+    # (epsilon_main.f90 ``fact``), never into the Σ band sums
+    # (sigma_main.f90: occupancy 1 per band); χ₀'s copy lives in
+    # ``w_isdf._w_solve_pref_scalar``.  Required kwarg + cache-key member:
+    # no caller can silently get the spinor kernel, and a kernel cached for
+    # one spin structure can never serve another.  The ``!= 1.0`` guard is
+    # trace-time: the nspinor ≥ 2 path emits no op at all — bit-identity.
+    key = (id(mesh_xy), layout, shape_key, float(f_spin))
     if key in _hartree_density_cache:
         return _hartree_density_cache[key]
 
@@ -234,6 +279,8 @@ def make_hartree_density_kernel(
             rho_sum = jnp.real(jnp.einsum(
                 "kisx,kjsx,kij->x", jnp.conj(psi), vertex_psi, Gij,
                 optimize=True))
+            if f_spin != 1.0:
+                rho_sum = rho_sum * f_spin
             return jax.lax.with_sharding_constraint(
                 rho_sum, NamedSharding(mesh_xy, P("y")))
 
@@ -244,6 +291,8 @@ def make_hartree_density_kernel(
         rho_sum = jnp.real(jnp.sum(
             jnp.conj(psi) * vertex_psi * occ[:, :, None, None],
             axis=(0, 1, 2)))
+        if f_spin != 1.0:
+            rho_sum = rho_sum * f_spin
         return jax.lax.with_sharding_constraint(
             rho_sum, NamedSharding(mesh_xy, P("y")))
 
@@ -377,7 +426,7 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "legacy",
-                         face_shape=None):
+                         face_shape=None, f_spin: float):
     """Cached factory returning SX/COH kernels and one Hartree scheduler.
 
     Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
@@ -415,13 +464,13 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # thrown away anyway.
     from ffi import ffi_dial_key
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
-                layout, face_shape)
+                layout, face_shape, float(f_spin))
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
     hartree_density = make_hartree_density_kernel(
-        mesh_xy, layout=layout, face_shape=face_shape)
+        mesh_xy, layout=layout, face_shape=face_shape, f_spin=f_spin)
     hartree_field = make_hartree_field_kernel(mesh_xy, nk_tot)
     hartree_project = make_hartree_projection_kernel(
         mesh_xy, layout=layout, face_shape=face_shape)
@@ -722,7 +771,8 @@ def compute_cohsex_sigma(
     kgrid = meta.kgrid
     nk_tot = int(meta.nk_tot)
     sigma_sx_k, sigma_coh_k, hartree_k = _make_cohsex_kernels(
-        mesh_xy, kgrid, nk_tot, **_face_kwargs(wfns))
+        mesh_xy, kgrid, nk_tot, f_spin=_spin_capacity(meta),
+        **_face_kwargs(wfns))
 
     with mesh_xy:
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
@@ -864,7 +914,8 @@ def compute_v_h_sigma_x(
     """
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _, hartree_k = _make_cohsex_kernels(
-        mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
+        mesh_xy, meta.kgrid, int(meta.nk_tot), f_spin=_spin_capacity(meta),
+        **_face_kwargs(wfns))
     with mesh_xy:
         sig_h = hartree_k(wfns, Gij, V_q)
         sig_h = _replicate_band_sigma(sig_h, mesh_xy)

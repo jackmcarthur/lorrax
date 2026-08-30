@@ -867,6 +867,7 @@ def main(argv=None):
 		sys_dim=config.sys_dim,
 		nk=meta.nk_tot,
 		band_stop=band_slices.b3,
+		nspinor=int(wfn.nspinor),
 		require_transverse=(
 			bool(config.bispinor) and hartree_source != "gspace"),
 		print_fn=print0,
