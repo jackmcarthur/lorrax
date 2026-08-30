@@ -42,9 +42,10 @@ from gw.sigma_dispatch import (
 SC_SRC = os.path.join(os.path.dirname(__file__), "..", "src", "gw",
                       "sc_iteration.py")
 
-#: The finalize's rotation primitive, and the other two band rotations in
-#: the Σ path — no Σ_c(ω) may pass through any of them.
-_ROTATORS = ("_rotate_to_dft_basis", "rotate_band_matrix", "_rotate_v_h_to_qp")
+#: The finalize's rotation primitives and the other band rotations in the
+#: Σ path.  The cube may pass only through its row-scanned helper.
+_ROTATORS = ("_rotate_to_dft_basis", "_rotate_sigma_omega_cube",
+             "rotate_band_matrix", "_rotate_v_h_to_qp")
 
 
 def _sc_module():
@@ -151,6 +152,5 @@ def test_sigma_basis_fields_are_never_rotated():
         assert attr not in SIGMA_BASIS_FIELDS, (
             f"{SC_SRC} line {n.lineno}: {name}() is applied to "
             f"{attr}, which gw.sigma_dispatch declares as staying in the "
-            f"Σ compute basis.  Σ_c(ω) in particular is the operand of "
-            f"the QSGW ansatz ½[Σ_ij(E_i) + Σ_ij(E_j)]ʰ, which is only "
-            f"itself in the basis whose energies E_i, E_j it uses.")
+            f"Σ compute basis.  Diagonal-only values and the evaluation "
+            f"spectrum cannot be similarity-transformed element-wise.")

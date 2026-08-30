@@ -188,10 +188,11 @@ class SigmaResult:
 # owes the post-Σ seam a DFT-basis object, so its finalize
 # (``sc_iteration.run_sc_driver``) rotates the matrices named in
 # ``ROTATED_TO_DFT_FIELDS`` with ``O_DFT = U·O_QP·U†`` and leaves the
-# rest untouched.  The returned object therefore holds TWO BASES AT
-# ONCE, deliberately; these four tuples are the record of which field is
-# in which, and they partition ``dataclasses.fields(SigmaResult)``
-# exactly (``tests/test_sigma_result_basis.py`` fails when they do not).
+# rest untouched.  The original Σ_c(ω) cube is written in its QP compute
+# basis before this finalize; the returned copy is rotated for DFT-basis
+# output assembly.  These four tuples record the returned object's basis
+# and partition ``dataclasses.fields(SigmaResult)`` exactly
+# (``tests/test_sigma_result_basis.py`` fails when they do not).
 
 #: Band-basis matrices, rotated together or not at all.  A Σ channel
 #: added to the dataclass and NOT added here comes back from the SC
@@ -205,6 +206,9 @@ ROTATED_TO_DFT_FIELDS = (
     "h_transverse_kij_ry",
     "sigma_x_kij_ry",
     "sigma_xc_kij_ry",
+    # Rotated one omega row at a time on device.  A band-sharded cube keeps
+    # P(None,None,'x','y'); no full-cube device or host gather is permitted.
+    "sigma_c_omega_kij_ry",
     # The un-extrapolated N₃ twin of ``sigma_xc_kij_ry``, present only when
     # the band extrapolation is driving.  It is here and not in
     # ``SIGMA_BASIS_FIELDS`` because it is the SAME KIND OF OBJECT as the
@@ -219,18 +223,10 @@ ROTATED_TO_DFT_FIELDS = (
 )
 
 #: Left in the Σ compute basis on purpose — do NOT rotate these.
-#: ``sigma_c_omega_kij_ry`` is the operand of the QSGW ansatz
-#: ``Σ_ij^QSGW = ½[Σ_ij(E_i) + Σ_ij(E_j)]ʰ`` (``qsgw_utils.py``:402),
-#: whose band indices must label the states whose energies E_i, E_j it
-#: is evaluated at, so the construction is only itself in that basis;
-#: it is also the (nω, nk, nb, nb) sharded tensor and the contents of
-#: sigma_mnk.h5.  The other three are already band DIAGONALS, on which a
-#: basis rotation does not act element-wise.  ``e_eval_ev`` belongs here
-#: for the strongest form of that reason: it is the list of energies
-#: E_i whose band index MUST be the one the cube's band index is, since
-#: the ansatz pairs them element-wise.
+#: These are already band DIAGONALS, on which a basis rotation does not act
+#: element-wise.  ``e_eval_ev`` is the spectrum used by the QSGW ansatz in
+#: the last map's QP basis; it is output provenance rather than an operator.
 SIGMA_BASIS_FIELDS = (
-    "sigma_c_omega_kij_ry",
     "sigma_c_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",

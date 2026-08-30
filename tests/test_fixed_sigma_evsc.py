@@ -12,7 +12,7 @@ from common.collectives import single_device_mesh
 from common.units import RYD_TO_EV
 from gw.sc_iteration import (
     _place,
-    _rotate_fixed_sigma_cube_to_qp,
+    _rotate_sigma_omega_cube,
     run_fixed_sigma_evsc,
 )
 from gw.sigma_dispatch import SigmaResult
@@ -51,9 +51,14 @@ def _unitary(rng, nk, nb):
     return np.asarray(out)
 
 
-def _rotate_host(cube, U):
+def _rotate_host_to_qp(cube, U):
     return np.einsum(
         "kpm,wkpq,kqn->wkmn", np.conj(U), cube, U, optimize=True)
+
+
+def _rotate_host_to_dft(cube, U):
+    return np.einsum(
+        "kmp,wkpq,knq->wkmn", U, cube, np.conj(U), optimize=True)
 
 
 def test_full_sigma_cube_rotation_is_u_dagger_sigma_u():
@@ -63,9 +68,22 @@ def test_full_sigma_cube_rotation_is_u_dagger_sigma_u():
             + 1j * rng.normal(size=(nw, nk, nb, nb)))
     U = _unitary(rng, nk, nb)
     mesh = single_device_mesh()
-    got = _rotate_fixed_sigma_cube_to_qp(
-        jnp.asarray(cube), _place(U, mesh, None), mesh=mesh)
-    np.testing.assert_allclose(np.asarray(got), _rotate_host(cube, U),
+    got = _rotate_sigma_omega_cube(
+        jnp.asarray(cube), _place(U, mesh, None), mesh=mesh, to_qp=True)
+    np.testing.assert_allclose(np.asarray(got), _rotate_host_to_qp(cube, U),
+                               rtol=2e-13, atol=2e-13)
+
+
+def test_full_sigma_cube_rotation_to_dft_is_u_sigma_u_dagger():
+    rng = np.random.default_rng(43)
+    nw, nk, nb = 4, 2, 3
+    cube = (rng.normal(size=(nw, nk, nb, nb))
+            + 1j * rng.normal(size=(nw, nk, nb, nb)))
+    U = _unitary(rng, nk, nb)
+    mesh = single_device_mesh()
+    got = _rotate_sigma_omega_cube(
+        jnp.asarray(cube), _place(U, mesh, None), mesh=mesh, to_qp=False)
+    np.testing.assert_allclose(np.asarray(got), _rotate_host_to_dft(cube, U),
                                rtol=2e-13, atol=2e-13)
 
 
@@ -80,11 +98,11 @@ def test_full_sigma_cube_rotation_stays_two_axis_sharded_on_p4():
     U = _unitary(rng, nk, nb)
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2),
                 axis_names=("x", "y"))
-    got = _rotate_fixed_sigma_cube_to_qp(
+    got = _rotate_sigma_omega_cube(
         _place(cube, mesh, P(None, None, "x", "y")),
-        _place(U, mesh, P(None, "x", "y")), mesh=mesh)
+        _place(U, mesh, P(None, "x", "y")), mesh=mesh, to_qp=False)
     assert got.sharding.spec == P(None, None, "x", "y")
-    np.testing.assert_allclose(np.asarray(got), _rotate_host(cube, U),
+    np.testing.assert_allclose(np.asarray(got), _rotate_host_to_dft(cube, U),
                                rtol=3e-13, atol=3e-13)
 
 
@@ -100,7 +118,7 @@ def _host_reference(kin, vh, sx, sigma_w, omega_ev, e_dft_ry,
             "kpm,kpq,kqn->kmn", np.conj(U), h0, U, optimize=True)
         sx_q = np.einsum(
             "kpm,kpq,kqn->kmn", np.conj(U), sx, U, optimize=True)
-        sc_q = _rotate_host(sigma_w, U)
+        sc_q = _rotate_host_to_qp(sigma_w, U)
         M = np.empty_like(sx_q)
         for k in range(nk):
             for m in range(nb):

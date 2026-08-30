@@ -290,30 +290,6 @@ def main(argv=None):
 	# refusal names the mode; a typo'd mode value never reaches this line
 	# because ``config.compute_mode`` already raised on it.
 	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
-	# Dynamic SC currently returns two basis sectors by design: finalized H/X
-	# operators are rotated back to DFT bands, while the full C(omega) operator
-	# remains in QP bands for the QSGW ansatz.  Refuse that unsupported output
-	# contract here, before screening or the expensive SC loop.  A second guard
-	# remains at the post-Sigma seam as an invariant against future routing drift.
-	if qp_solver is QPSolver.SELF_CONSISTENT and mode.is_dynamic:
-		raise ValueError(
-			"REFUSED: qp_solver=self_consistent beside a dynamic compute_mode.\n"
-			f"  got:  qp_solver={qp_solver.value}, compute_mode={mode.value}\n"
-			"  want: self_consistent with a STATIC compute_mode (cohsex), or a "
-			"dynamic compute_mode with qp_solver=one_shot_dft / fixed_point\n"
-			"  why:  the SC finalize rotates V_H / Sigma_x / Sigma_xc / "
-			"Sigma_SX / Sigma_COH to dft_band (gw/sc_iteration.py) and "
-			"leaves the C(omega) cube in qp_band by design, because the "
-			"QSGW ansatz only holds in the basis whose eigenvalues it uses "
-			"(gw.sigma_dispatch.SIGMA_BASIS_FIELDS). Their diagonals add up "
-			"only at U = identity.\n"
-			"  fix:  rotate the correlation operator for output, then delete "
-			"this guard, its twins at the post-Sigma seam and in "
-			"gw_output.write_results, and the qp_solver rows in "
-			"docs/input_reference.md and docs/drivers.md together.\n"
-			"  doc:  tests/KNOWN_FAILURES.md, 'eqp0.dat / eqp1.dat mix two "
-			"bases on the self-consistent path'; "
-			"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md")
 	do_screened = mode.needs_screening
 	print0(
 		f"  Head policy: head_correction={config.head.correction.value}; "
@@ -958,16 +934,10 @@ def main(argv=None):
 	# One extraction for SC and one-shot alike; PPM-only fields are None
 	# in static modes.
 	#
-	# TWO BASES ON ONE OBJECT on the SC path, by design: the finalize
-	# rotated ``sigma_dispatch.ROTATED_TO_DFT_FIELDS`` (sig_h, sig_x,
-	# sig_sx, sig_coh below) back to the DFT basis and left
-	# ``SIGMA_BASIS_FIELDS`` (sigma_c_omega, sigma_c_at_dft_ev) in the QP
-	# basis, where the QSGW ansatz
-	# that consumes Σ_c(ω) is defined.  Their band diagonals meet in
-	# ``sigma_xc_at_dft_ev`` below and in eqp{0,1}.dat
-	# (``eqp_bgw.compute_eqp_diag``); that sum is basis-consistent only
-	# at U = identity.  One-shot: every field is DFT basis and the
-	# question does not arise.  The separable analytic head diagonal is cheap
+	# On the SC path the finalize rotates every matrix consumed here,
+	# including the dynamic correlation cube, to the DFT output basis.  The
+	# original cube was already persisted in the last map's QP compute basis,
+	# where the QSGW ansatz is defined.  The separable analytic head diagonal is cheap
 	# enough to rotate without materialising its dense matrix; SC returns that
 	# as a separate DFT-basis diagnostic while leaving SigmaResult's
 	# basis-of-computation field untouched.
@@ -998,13 +968,6 @@ def main(argv=None):
 	e_eval_ev           = sigma_result.e_eval_ev
 	efermi_dft_ev       = sigma_result.efermi_dft_ev
 	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-	if (qp_solver is QPSolver.SELF_CONSISTENT
-			and sigma_c_omega is not None):
-		raise ValueError(
-			"self-consistent dynamic EQP output is not basis-consistent: H and "
-			"Sigma_x have been rotated to dft_band, while the full C(omega) "
-			"operator remains qp_band. Refusing to combine their diagonals until "
-			"the full C(omega) operator is rotated consistently.")
 	head_sigma_diag_w_kn_ry = (
 		sc_result.head_sigma_diag_dft_w_kn_ry
 		if qp_solver is QPSolver.SELF_CONSISTENT

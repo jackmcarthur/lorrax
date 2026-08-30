@@ -1665,12 +1665,6 @@ def write_results(
                     "driver's full-BZ k-set and the sigma band window.")
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
-    if results.self_consistent and sigma_c_omega_diag_ev_irr is not None:
-        raise ValueError(
-            "write_results refuses self-consistent dynamic EQP assembly: "
-            "H/X are dft_band while the full C(omega) operator is qp_band. "
-            "Rotate the full correlation operator before combining them.")
-
     # Assemble FIRST.  This object is now the one producer of the exact H/X,
     # derived C(E_DFT), conditioned C(omega), and Z that live output used.
     # A dynamic call deliberately supplies no independent C(E_DFT): both that
