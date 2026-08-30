@@ -435,6 +435,16 @@ def _leading_indices(index, count):
     return np.asarray(first, dtype=np.int64).reshape(-1)
 
 
+def _census_profile(label, started, **details):
+    """Print one opt-in census timing sample from the current process."""
+    if os.environ.get("LORRAX_DELIVERED_CENSUS_PROFILE", "0") != "1":
+        return
+    suffix = " ".join(f"{key}={value}" for key, value in details.items())
+    print(
+        f"[delivered-census-profile] rank={process_rank()} {label}="
+        f"{time.perf_counter() - started:.6f}s {suffix}", flush=True)
+
+
 def _local_pole_chunks(Omega, B):
     """Yield unique local leading-pole shards without gathering a field."""
     if tuple(Omega.shape) != tuple(B.shape) or len(Omega.shape) < 1:
@@ -444,19 +454,35 @@ def _local_pole_chunks(Omega, B):
     n_poles = int(Omega.shape[0])
     if not isinstance(Omega, jax.Array):
         if process_rank() == 0:
-            yield np.arange(n_poles), np.asarray(Omega), np.asarray(B)
+            started = time.perf_counter()
+            omega_host, residue_host = np.asarray(Omega), np.asarray(B)
+            _census_profile(
+                "host_array_view", started,
+                bytes=omega_host.nbytes + residue_host.nbytes)
+            yield np.arange(n_poles), omega_host, residue_host
         return
     if bool(getattr(Omega, "is_fully_replicated", False)):
         if process_rank() == 0:
-            yield (np.arange(n_poles), np.asarray(Omega.addressable_data(0)),
-                   np.asarray(B.addressable_data(0)))
+            started = time.perf_counter()
+            omega_host = np.asarray(Omega.addressable_data(0))
+            residue_host = np.asarray(B.addressable_data(0))
+            _census_profile(
+                "replicated_shard_transfer", started,
+                bytes=omega_host.nbytes + residue_host.nbytes)
+            yield np.arange(n_poles), omega_host, residue_host
         return
     for shard_O, shard_B in zip(Omega.addressable_shards,
                                 B.addressable_shards):
         if shard_O.index != shard_B.index:
             raise ValueError("pole and residue shard layouts differ")
-        yield (_leading_indices(shard_O.index, n_poles),
-               np.asarray(shard_O.data), np.asarray(shard_B.data))
+        started = time.perf_counter()
+        omega_host = np.asarray(shard_O.data)
+        residue_host = np.asarray(shard_B.data)
+        _census_profile(
+            "sharded_field_transfer", started,
+            bytes=omega_host.nbytes + residue_host.nbytes)
+        yield (_leading_indices(shard_O.index, n_poles), omega_host,
+               residue_host)
 
 
 def _axis_cloud_weights(values, nodes):
@@ -484,19 +510,36 @@ def _bounded_pole_moments(values, masses, bins, eta):
         raise ValueError("lattice_bins must be at least 4")
     if not value.size:
         return np.zeros((3, bins * bins), dtype=np.float64)
+    coordinate_started = time.perf_counter()
     intrinsic_width = np.maximum(-value.imag - float(eta), 0.0)
     real_coordinate = value.real / (value.real + float(eta))
     width_coordinate = intrinsic_width / (intrinsic_width + float(eta))
     nodes = np.linspace(0.0, 1.0, bins)
     moments = np.zeros((3, bins * bins), dtype=np.float64)
-    for real_index, real_weight in _axis_cloud_weights(real_coordinate, nodes):
-        for width_index, width_weight in _axis_cloud_weights(
-                width_coordinate, nodes):
+    _census_profile(
+        "bounded_coordinates", coordinate_started, values=value.size)
+    axis_seconds = 0.0
+    scatter_seconds = 0.0
+    axis_started = time.perf_counter()
+    real_cloud = _axis_cloud_weights(real_coordinate, nodes)
+    axis_seconds += time.perf_counter() - axis_started
+    for real_index, real_weight in real_cloud:
+        axis_started = time.perf_counter()
+        width_cloud = _axis_cloud_weights(width_coordinate, nodes)
+        axis_seconds += time.perf_counter() - axis_started
+        for width_index, width_weight in width_cloud:
             index = real_index * bins + width_index
             share = mass * real_weight * width_weight
+            scatter_started = time.perf_counter()
             np.add.at(moments[0], index, share)
             np.add.at(moments[1], index, share * value.real)
             np.add.at(moments[2], index, share * value.imag)
+            scatter_seconds += time.perf_counter() - scatter_started
+    if os.environ.get("LORRAX_DELIVERED_CENSUS_PROFILE", "0") == "1":
+        print(
+            f"[delivered-census-profile] rank={process_rank()} "
+            f"axis_cloud={axis_seconds:.6f}s scatter_add_at="
+            f"{scatter_seconds:.6f}s values={value.size}", flush=True)
     return moments
 
 
@@ -511,6 +554,7 @@ def _sum_fixed_process_table(local, mesh_xy, label):
 def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
                    *, pole_offset=0, mesh_xy=None):
     """Measure shallow/deep pole intervals before compact reduction."""
+    measure_started = time.perf_counter()
     signed_energy, state_mass, state_indices = _branch_states(
         branch, amplitude)
     n_poles = int(Omega.shape[0])
@@ -522,6 +566,7 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
     bad_B = bad_pole = raw_count = 0
     for pole_indices, Omega_chunk, B_chunk in _local_pole_chunks(Omega, B):
         for local, pole_index in enumerate(pole_indices):
+            validation_started = time.perf_counter()
             omega = np.asarray(Omega_chunk[local], np.complex128).reshape(-1)
             residue = np.asarray(B_chunk[local], np.complex128).reshape(-1)
             finite_B = np.isfinite(residue)
@@ -532,6 +577,9 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
             bad_pole += int(np.count_nonzero(
                 live & (~finite_O | (omega.real <= 0.0) | (gamma < 0.0))))
             live &= finite_O & (omega.real > 0.0) & (gamma >= 0.0)
+            _census_profile(
+                "pole_validity_masks", validation_started,
+                pole=int(pole_index), values=omega.size)
             if not np.any(live):
                 continue
             broadened = omega[live].real - 1.0j * (gamma[live] + eta)
@@ -545,9 +593,11 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
                             bins, eta))
             raw_count += int(np.count_nonzero(live)) * int(signed_energy.size)
 
+    collective_started = time.perf_counter()
     bad = _sum_fixed_process_table(
         np.asarray([bad_B, bad_pole], dtype=np.int64), mesh_xy,
         "refusal-count table")
+    _census_profile("refusal_collective", collective_started)
     if int(bad[0]):
         raise ValueError(
             f"delivered Sigma poles contain {int(bad[0])} nonfinite residues")
@@ -559,9 +609,13 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
     for pole_index in range(n_poles):
         cells_by_interval, weights_by_interval = [], []
         for interval in range(2):
+            collective_started = time.perf_counter()
             moments = _sum_fixed_process_table(
                 local_moments[pole_index, interval], mesh_xy,
                 "pole-interval mass/moment lattice")
+            _census_profile(
+                "moment_collective", collective_started,
+                pole=pole_index, interval=interval, bytes=moments.nbytes)
             live = moments[0] > 0.0
             if not np.any(live):
                 cells_by_interval.append(None)
@@ -574,8 +628,10 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
         pole_cells.append(tuple(cells_by_interval))
         pole_weights.append(tuple(weights_by_interval))
 
+    collective_started = time.perf_counter()
     raw_global = int(_sum_fixed_process_table(
         np.asarray(raw_count, dtype=np.int64), mesh_xy, "raw-count scalar"))
+    _census_profile("raw_count_collective", collective_started)
     ceiling = int(bins) ** 2
     evidence = {
         "pole_split_ry": split,
@@ -590,6 +646,9 @@ def _pole_measures(branch, Omega, B, eta, amplitude, bins, pole_split_ry,
     }
     poles = np.arange(int(pole_offset), int(pole_offset) + n_poles,
                       dtype=np.int32)
+    _census_profile(
+        "pole_measure_total", measure_started, branch=branch.tag,
+        poles=n_poles)
     return (signed_energy, state_mass, state_indices, tuple(pole_cells),
             tuple(pole_weights), poles, raw_global, evidence)
 
