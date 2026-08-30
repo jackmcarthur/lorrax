@@ -34,12 +34,10 @@ def _executed_scalar(plan, poles, residues, energies, omega):
         win = row.window
         times = np.asarray(win.nodes.t)
         alpha = np.asarray(win.nodes.alpha)
-        if row.state_indices is None:
-            states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
-            pairs = tuple((state, pole) for state in states
-                          for pole in row.pole_indices)
-        else:
-            pairs = tuple(zip(row.state_indices, row.pole_indices))
+        assert row.state_indices is None
+        states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
+        pairs = tuple((state, pole) for state in states
+                      for pole in row.pole_indices)
         for frequency_index, frequency in zip(row.omega_idx, row.omega_abs):
             coefficient = _omega_coefficient(
                 np, frequency, times, alpha, win.omega_sign,

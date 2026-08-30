@@ -66,7 +66,41 @@ def test_old_receipt_with_direct_work_refuses_by_path():
             receipt_path="/tmp/old-plan.pkl")
 
 
-def test_planner_refuses_an_unattainable_crossing_without_direct_fallback():
+def test_raw_sigma_checkpoint_precedes_every_qp_stage():
+    """The expensive Sigma cube must survive a later mean-field/QP failure."""
+    root = Path(__file__).resolve().parents[1]
+    dispatch_tree = ast.parse(
+        (root / "src" / "gw" / "sigma_dispatch.py").read_text())
+    finalizer = next(
+        node for node in dispatch_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "finalize_dynamic_sigma")
+
+    def named_call_lines(tree, name):
+        return [
+            node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name]
+
+    write_lines = named_call_lines(finalizer, "write_sigma_omega")
+    qsgw_lines = named_call_lines(finalizer, "build_qsgw_sigma_xc")
+    assert len(write_lines) == 1
+    assert qsgw_lines and write_lines[0] < min(qsgw_lines)
+
+    driver_tree = ast.parse(
+        (root / "src" / "gw" / "gw_jax.py").read_text())
+    main = next(
+        node for node in driver_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main")
+    sigma_lines = named_call_lines(main, "compute_sigma_xc")
+    kin_lines = named_call_lines(main, "load_kin_ion_submatrix")
+    solve_lines = named_call_lines(main, "solve_qp")
+    assert len(sigma_lines) == len(kin_lines) == len(solve_lines) == 1
+    assert sigma_lines[0] < kin_lines[0] < solve_lines[0]
+
+
+def test_planner_refuses_an_unattainable_product_window():
     E_A = jnp.asarray([[0.3]])
     branch = _SigmaBranch(
         "positive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
