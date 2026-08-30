@@ -46,7 +46,8 @@ if "--cpu" in sys.argv:  # force CPU backend (avoid GPU contention); must preced
     os.environ.setdefault("OMP_NUM_THREADS", "32")  # courteous cap on shared nodes
 
 import numpy as np
-import jax  # noqa: F401  (sets up x64; devices queried lazily)
+import jax
+import jax.numpy as jnp
 
 # Allow `python orbital_magnetization.py` as well as `-m psp.orbital_magnetization`
 _SRC = Path(__file__).resolve().parents[1]
@@ -73,6 +74,30 @@ _services.ensure_on_path()
 
 RY2EV = 13.605693122994
 MU_B_PREFACTOR = 0.5  # |m_e/hbar^2| in Ry-a0^2 units (magnitude; sign handled below)
+
+
+@jax.jit
+def _spin_z_per_band(psi_G):
+    """Return ``<sigma_z>`` for each two-spinor band on the device.
+
+    ``psi_G`` has shape ``(nb, 2, nG)`` and may be unnormalised.  Its G-pad
+    columns must already be zero, as they are at each caller's canonical
+    WFN/gather boundary.  The result is the real ``(nb,)`` reduction
+
+    ``sum_G (|psi_up(G)|^2 - |psi_down(G)|^2)``.
+
+    Keeping this reduction in JAX is load-bearing: callers transfer only the
+    per-band result, never the ``(nb, 2, nG)`` wavefunction merely to evaluate
+    the spin calibration.
+    """
+    if psi_G.ndim != 3 or int(psi_G.shape[1]) != 2:
+        raise ValueError(
+            "_spin_z_per_band requires psi_G with shape (nb,2,nG); got "
+            f"{tuple(int(n) for n in psi_G.shape)}")
+    return jnp.sum(
+        jnp.abs(psi_G[:, 0]) ** 2 - jnp.abs(psi_G[:, 1]) ** 2,
+        axis=1,
+    ).real
 
 
 # ----------------------------------------------------------------------
@@ -119,8 +144,8 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
     k_red = int(sym.irr_idx_k[ik])
     eps = np.asarray(wfn.energies[0, k_red, :nb], dtype=np.float64)
 
-    psi_G = np.asarray(gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask))  # (nb, ns, nG)
-    sz = (np.abs(psi_G[:, 0]) ** 2 - np.abs(psi_G[:, 1]) ** 2).sum(axis=1).real
+    psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)       # (nb, ns, nG)
+    sz = np.asarray(_spin_z_per_band(psi_G))                     # only (nb,) crosses
     del wfn_k, psi_G
     return v_kin, v_nl, eps, sz
 
@@ -238,7 +263,7 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         G_pad, g_mask = gtab.at(i)
         G_int = jnp.asarray(G_pad, dtype=jnp.int32)              # (ngkmax,3)
         # Mask ψ, not Z: every contraction below closes against conj(ψ_G).
-        psi_G = (jnp.asarray(np.asarray(psi_ibz[i]))
+        psi_G = (psi_ibz[i]
                  * jnp.asarray(g_mask)[None, None, :])           # (nb,ns,ngkmax)
         k_crys = jnp.asarray(gtab.kvecs[i], dtype=jnp.float64)
         eps = np.asarray(wfn.energies[0, i, :nbnd], dtype=np.float64)
@@ -252,8 +277,7 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
             psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
             v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
                 psi_phys, kdata.Z, kdata.dZ, kdata.E_super))
-        psi_np = np.asarray(psi_G)
-        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
+        sz = np.asarray(_spin_z_per_band(psi_G))
         S_sum += w_ibz[i] * float(sz[:nocc].sum())
         pa, pb = orbital_pieces_at_k(v, eps, nocc, deps_tol)
         cA += w_ibz[i] * pa.sum(axis=(1, 2)); cB += w_ibz[i] * pb.sum(axis=(1, 2))
@@ -366,8 +390,7 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
         cA += w_k * np.asarray(_axial(M0))               # (H+ε) sandwich
         cB += w_k * np.asarray(_axial(M1))               # overlap (the −2μ piece)
 
-        psi_np = np.asarray(U_val_G)
-        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
+        sz = np.asarray(_spin_z_per_band(U_val_G))
         S_sum += w_k * float(sz.sum())
         if (ik + 1) % 6 == 0 or ik == nk - 1:
             print(f"         k {ik+1}/{nk}")
