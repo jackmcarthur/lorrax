@@ -18,12 +18,14 @@ from psp.dft_operators import HamiltonianK, apply_H_k, setup_H_k_from_kvec, buil
 # The sparse-G kernel: JIT'd ONCE with static FFT grid dims.
 # H_k data passed as explicit arguments → same compiled code for all k.
 @functools.partial(jax.jit, static_argnames=("_nx", "_ny", "_nz"))
-def _apply_H_sparse(psi_G, T, V, Gx, Gy, Gz, Z, E, mask, _nx, _ny, _nz):
+def _apply_H_sparse(
+    psi_G, T, V, Gx, Gy, Gz, Z, couplings, mask, _nx, _ny, _nz,
+):
     """Sparse-G → sparse-G H|ψ⟩.  Single JIT trace for all k-points."""
     mask_f = mask[None, None, :].astype(psi_G.dtype)
     psi_box = jnp.zeros((*psi_G.shape[:2], _nx, _ny, _nz), dtype=psi_G.dtype)
     psi_box = psi_box.at[:, :, Gx, Gy, Gz].add(psi_G * mask_f)
-    return apply_H_k(psi_box, T, V, Gx, Gy, Gz, Z, E, mask)
+    return apply_H_k(psi_box, T, V, Gx, Gy, Gz, Z, couplings, mask)
 
 
 def make_apply_H(H_k: HamiltonianK):
@@ -38,7 +40,7 @@ def make_apply_H(H_k: HamiltonianK):
     def apply_H(psi_G):
         return _apply_H_sparse(psi_G, H_k.T_diag, H_k.V_scf,
                                H_k.Gx, H_k.Gy, H_k.Gz,
-                               H_k.vnl_Z, H_k.vnl_E, H_k.mask,
+                               H_k.vnl_Z, H_k.vnl_couplings, H_k.mask,
                                nx, ny, nz)
     return apply_H
 

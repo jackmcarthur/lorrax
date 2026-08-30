@@ -368,7 +368,7 @@ def _both_arms_matrix_elements():
     """<m|v|n> at both signs, from the synthetic setup the knob file owns.
 
     Imported rather than rebuilt: that file's ``_vnl_setup`` is
-    deliberately built with a random nonzero ``E_super`` (a null one
+    deliberately built with nonzero projector couplings (null couplings
     makes v_NL vanish and both arms agree), and duplicating 120 lines of
     projector construction to say the same thing twice is how two
     fixtures drift into disagreeing about what they test.
@@ -421,7 +421,7 @@ def test_the_velocity_sign_moves_oscillator_strengths():
 def test_the_sensitivity_measurement_is_not_a_tautology():
     """RED TWIN for the cell above.
 
-    With a null ``E_super`` the nonlocal term vanishes identically, both
+    With null couplings the nonlocal term vanishes identically, both
     arms collapse onto bare ``p``, and the sensitivity cell would be
     measuring nothing while still reading green if its threshold were
     written the other way round.  This asserts the collapse really is
@@ -436,7 +436,11 @@ def test_the_sensitivity_measurement_is_not_a_tautology():
 
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs, bvec, blat = _fixture()
-    dead = replace(_vnl_setup(), E_super=jnp.zeros_like(_vnl_setup().E_super))
+    live = _vnl_setup()
+    dead = replace(
+        live,
+        couplings=live.couplings._replace(
+            E_rows=jnp.zeros_like(live.couplings.E_rows)))
     got = {}
     with mesh:
         geom = _geom(mesh)

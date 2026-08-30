@@ -27,7 +27,7 @@ Public API (per-component builders):
   build_V_scf           — combine V_loc + V_H + V_xc into one array
   compute_V_H_and_V_xc  — @jax.jit: V_H (Poisson) + V_xc (PBE GGA) in 1.2 ms cached
   build_h_diag          — preconditioner diagonal: T + V_loc(G=0) + V_NL_diag
-  build_vnl_kdata       — dense VNL projectors (Z, E) from vnl_ops
+  build_vnl_kdata       — VNL projectors + bounded couplings from vnl_ops
 
 Public API (uniform kinetic gauge actions):
   apply_kinetic_velocity_to_ket — dT/dK applied to a ket block
@@ -79,9 +79,9 @@ class HamiltonianK:
     Gy: jax.Array                   # (nG,) int32
     Gz: jax.Array                   # (nG,) int32
 
-    # Nonlocal: Kleinman–Bylander projectors (dense, all channels concatenated)
+    # Nonlocal: Kleinman–Bylander projectors + atom-local row couplings
     vnl_Z: jax.Array                # (total_R, nG) complex128
-    vnl_E: jax.Array                # (nspinor, nspinor, total_R, total_R) complex128
+    vnl_couplings: object           # vnl_ops.VNLProjectorCouplings
 
     # Preconditioner diagonal (for Davidson): h_diag = T + v_of_0 + V_NL_diag
     h_diag: jax.Array               # (nG_padded,) float64 — QE's g_psi convention
@@ -630,13 +630,13 @@ def build_vnl_kdata(
     nspinor: int | None = None,
     gvectors: PaddedGVectors | None = None,
 ):
-    """Dense VNL projectors (Z, E) for one k-point via vnl_ops.
+    """VNL projectors and bounded atom-local couplings for one k-point.
 
-    Returns (vnl_Z, vnl_E) where:
+    Returns ``(vnl_Z, vnl_couplings)`` where:
       vnl_Z : (total_R, ngkmax) — all channels × atoms × betas concatenated,
               already zero on the pad columns (see
               ``vnl_ops.build_vnl_kdata``), so no caller-side mask is needed
-      vnl_E : (nspinor, nspinor, total_R, total_R) — block-diagonal D matrix
+      vnl_couplings : compact row-neighborhood form of the atom-local D blocks
     """
     import psp.vnl_ops as vnl_ops
 
@@ -645,7 +645,7 @@ def build_vnl_kdata(
 
     kdata = vnl_ops.build_vnl_kdata(k_idx, vnl_setup, wfn, sym, meta,
                                      gvectors=gvectors)
-    return kdata.Z, kdata.E_super
+    return kdata.Z, kdata.couplings
 
 
 @jax.jit
@@ -681,11 +681,11 @@ def vnl_matrix_from_kdata(psi_box, Gk_crys, kdata, mask=None):
 
     psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
     # Slice to physical spinor components if bispinor wavefunctions have
-    # more spinor components than the E_super block-diagonal (e.g. 4 vs 2).
-    nspinor_E = kdata.E_super.shape[0]
+    # more components than the Pauli pseudopotential (e.g. 4 vs 2).
+    nspinor_E = kdata.couplings.E_rows.shape[0]
     if psi_G.shape[1] > nspinor_E:
         psi_G = psi_G[:, :nspinor_E, :]
-    return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
+    return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.couplings)
 
 
 def vnl_velocity_from_kdata(psi_box, Gk_crys, kdata, mask=None):
@@ -696,18 +696,19 @@ def vnl_velocity_from_kdata(psi_box, Gk_crys, kdata, mask=None):
         raise ValueError("kdata.dZ is required for vnl_velocity_from_kdata")
     psi_G = gather_psi_G_from_crys(psi_box, Gk_crys, mask)
     # Slice to physical spinor components if bispinor wavefunctions have
-    # more spinor components than the E_super block-diagonal (e.g. 4 vs 2).
-    nspinor_E = kdata.E_super.shape[0]
+    # more components than the Pauli pseudopotential (e.g. 4 vs 2).
+    nspinor_E = kdata.couplings.E_rows.shape[0]
     if psi_G.shape[1] > nspinor_E:
         psi_G = psi_G[:, :nspinor_E, :]
-    return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
+    return vnl_ops.vnl_velocity_matrix(
+        psi_G, kdata.Z, kdata.dZ, kdata.couplings)
 
 
 def build_h_diag(
     T_diag: jax.Array,
     V_loc_r: jax.Array,
     vnl_Z: jax.Array,
-    vnl_E: jax.Array,
+    vnl_couplings,
 ) -> jax.Array:
     """Hamiltonian diagonal for the Davidson preconditioner (QE convention).
 
@@ -726,23 +727,12 @@ def build_h_diag(
     T_diag : (nG,) — |k+G|²
     V_loc_r : (nx, ny, nz) — ionic local potential (NOT V_scf)
     vnl_Z : (total_R, nG) — KB projectors
-    vnl_E : (nspinor, nspinor, total_R, total_R) — D-matrix
+    vnl_couplings : compact atom-local D row neighborhoods
     """
     v_of_0 = jnp.mean(V_loc_r)
 
-    # V_NL diagonal: sum over spinor channels and projectors
-    # ⟨G,s|V_NL|G,s⟩ = Σ_{R,Q} conj(Z[R,G]) E[s,s,R,Q] Z[Q,G]
-    # For the diagonal, sum over s:
-    nspinor = vnl_E.shape[0]
-    vnl_diag = jnp.zeros(T_diag.shape[0], dtype=jnp.float64)
-    for s in range(nspinor):
-        # E_ss[R,Q] = vnl_E[s,s,R,Q]
-        E_ss = vnl_E[s, s]  # (total_R, total_R)
-        # Σ_R,Q conj(Z[R,G]) E_ss[R,Q] Z[Q,G]
-        EZ = E_ss @ vnl_Z  # (total_R, nG)
-        vnl_diag = vnl_diag + jnp.real(
-            jnp.sum(jnp.conj(vnl_Z) * EZ, axis=0)
-        )
+    from psp import vnl_ops
+    vnl_diag = vnl_ops.vnl_diagonal(vnl_Z, vnl_couplings)
 
     return T_diag + v_of_0 + vnl_diag
 
@@ -814,7 +804,7 @@ def setup_H_k(
     # zero them so apply_vnl / build_h_diag never see spurious overlap.
     vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
 
-    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, kdata.E_super)
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, kdata.couplings)
               if V_loc_r is not None else T_diag)
     h_diag = jnp.where(mask, h_diag, jnp.asarray(1e10, dtype=h_diag.dtype))
 
@@ -823,7 +813,7 @@ def setup_H_k(
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
         vnl_Z=vnl_Z,
-        vnl_E=kdata.E_super,
+        vnl_couplings=kdata.couplings,
         h_diag=h_diag,
         mask=mask,
         nG=nG_actual,
@@ -881,9 +871,9 @@ def setup_H_k_from_kvec(
     # Tail-G mask: padded Z entries are non-zero (computed at K=kvec) —
     # mask them so apply_vnl / Q-projections never see spurious overlap.
     vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
-    vnl_E = kdata.E_super
+    vnl_couplings = kdata.couplings
 
-    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_couplings)
               if V_loc_r is not None else T_diag)
     # Force h_diag = 1e10 at padded entries (T_diag is already 1e10
     # there; build_h_diag adds the constant v_of_0, so this snap-back
@@ -896,7 +886,7 @@ def setup_H_k_from_kvec(
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
         vnl_Z=vnl_Z,
-        vnl_E=vnl_E,
+        vnl_couplings=vnl_couplings,
         h_diag=h_diag,
         mask=mask,
         nG=nG_actual,
@@ -909,7 +899,9 @@ def setup_H_k_from_kvec(
 # ═══════════════════════════════════════════════════════════════════════
 
 @functools.partial(jax.jit, donate_argnums=(0,))
-def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+def apply_H_k(
+    psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_couplings, mask,
+):
     """H|ψ⟩ = (T + V_scf + V_NL)|ψ⟩.  Single fused JIT dispatch.
 
     The input psi_box is **donated** (its buffer is reused by XLA).
@@ -924,7 +916,7 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     V_scf    : (nx, ny, nz) float64
     Gx,Gy,Gz : (nG_padded,) int32
     vnl_Z    : (total_R, nG_padded) complex128
-    vnl_E    : (nspinor, nspinor, total_R, total_R) complex128
+    vnl_couplings : bounded atom-local projector coupling carrier
     mask     : (nG_padded,) bool — True for valid G-vectors
 
     Returns
@@ -944,9 +936,9 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
    )[:, :, Gx, Gy, Gz] * mask_f
 
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
-    P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
-    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
+    import psp.vnl_ops as vnl_ops
+    H_G = H_G + vnl_ops.apply_vnl(
+        psi_G, vnl_Z, vnl_couplings) * mask_f
 
     return H_G
 
@@ -956,12 +948,14 @@ def apply(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return apply_H_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
+        H_k.vnl_Z, H_k.vnl_couplings, H_k.mask,
     )
 
 
 @jax.jit
-def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+def apply_H_k_from_G(
+    psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_couplings, mask,
+):
     """H|ψ⟩ where the input is the **G-sphere** representation (not the FFT
     box).  Skips the redundant ``scatter→gather`` round trip used by
     ``_apply_A_inline``: callers that already have ψ in G-form (e.g. CG
@@ -997,15 +991,17 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     H_G = H_G + Vpsi_box[:, :, Gx, Gy, Gz] * mask_f
 
     # V_NL on the G-sphere directly.
-    P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G_m, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
-    H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
+    import psp.vnl_ops as vnl_ops
+    H_G = H_G + vnl_ops.apply_vnl(
+        psi_G_m, vnl_Z, vnl_couplings) * mask_f
 
     return H_G
 
 
 @jax.jit
-def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
+def build_matrix_k(
+    psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_couplings, mask,
+):
     """Full ⟨m|H|n⟩ matrix at one k-point.  Returns (nb, nb) complex128."""
     import psp.vnl_ops as vnl_ops
 
@@ -1028,7 +1024,8 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     )
 
     # V_NL
-    H_mn = H_mn + vnl_ops.vnl_matrix(psi_G, vnl_Z, vnl_E)
+    H_mn = H_mn + vnl_ops.vnl_matrix(
+        psi_G, vnl_Z, vnl_couplings)
 
     return H_mn
 
@@ -1038,7 +1035,7 @@ def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
     return build_matrix_k(
         psi_box, H_k.T_diag, H_k.V_scf,
         H_k.Gx, H_k.Gy, H_k.Gz,
-        H_k.vnl_Z, H_k.vnl_E, H_k.mask,
+        H_k.vnl_Z, H_k.vnl_couplings, H_k.mask,
     )
 
 

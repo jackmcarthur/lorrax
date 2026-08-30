@@ -66,7 +66,7 @@ class SternheimerOp:
     T_diag, mask   : (nG,)                  — kinetic diag + cutoff mask
     V_scf          : (nx, ny, nz)           — real-space SCF potential
     Gx, Gy, Gz     : (nG,) int32            — G-sphere in FFT-box coords
-    vnl_Z, vnl_E   : see psp.dft_operators  — nonlocal KB projectors
+    vnl_Z, vnl_couplings : see psp.dft_operators — nonlocal KB data
     U_val          : (nv, nspinor, nG)      — occupied at k-q, orthonormal
     eps_v          : (nv,)                  — eigenvalues at source k
     alpha_pv       : ()  scalar             — level-shift
@@ -78,13 +78,13 @@ class SternheimerOp:
     eps_extra      : (M,) or None             — eigenvalues of H_{k-q} on U_extra
     """
     __slots__ = ("T_diag", "V_scf", "Gx", "Gy", "Gz",
-                 "vnl_Z", "vnl_E", "mask",
+                 "vnl_Z", "vnl_couplings", "mask",
                  "U_val", "eps_v", "alpha_pv", "precond_diag",
                  "U_extra", "eps_extra",
                  "fft_grid")
 
     def __init__(
-        self, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask,
+        self, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_couplings, mask,
         U_val, eps_v, alpha_pv, precond_diag, fft_grid,
         U_extra=None, eps_extra=None,
     ):
@@ -94,7 +94,7 @@ class SternheimerOp:
         self.Gy = Gy
         self.Gz = Gz
         self.vnl_Z = vnl_Z
-        self.vnl_E = vnl_E
+        self.vnl_couplings = vnl_couplings
         self.mask = mask
         self.U_val = U_val
         self.eps_v = eps_v
@@ -107,7 +107,7 @@ class SternheimerOp:
     def tree_flatten(self):
         # None-valued Schur fields become empty leaves for pytree compat.
         children = (self.T_diag, self.V_scf, self.Gx, self.Gy, self.Gz,
-                    self.vnl_Z, self.vnl_E, self.mask,
+                    self.vnl_Z, self.vnl_couplings, self.mask,
                     self.U_val, self.eps_v, self.alpha_pv, self.precond_diag,
                     self.U_extra, self.eps_extra)
         aux = (self.fft_grid, self.U_extra is None)
@@ -139,7 +139,7 @@ def _apply_A_inline(op: SternheimerOp, x: jax.Array) -> jax.Array:
     # of the scatter→gather round-trip the box-input ``apply_H_k`` forces.
     Hx = apply_H_k_from_G(x, op.T_diag, op.V_scf,
                            op.Gx, op.Gy, op.Gz,
-                           op.vnl_Z, op.vnl_E, op.mask)
+                           op.vnl_Z, op.vnl_couplings, op.mask)
     # H·x − ε_v·x
     shifted = Hx - op.eps_v[:, None, None].astype(x.dtype) * x
     # α_pv · P_val(x)

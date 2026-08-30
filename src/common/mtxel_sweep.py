@@ -696,7 +696,7 @@ def _ket(psi_n, gmask):
 def _pad_spinor(x, ns: int):
     """Zero-fill a ``(..., nb, ns_op, nG)`` operator output back to ``ns``.
 
-    ``E_super`` is built at the FILE's ``nspinor``; a bispinor ψ carries
+    The VNL couplings are built at the FILE's ``nspinor``; a bispinor ψ carries
     4 components, of which V_NL acts on the first 2.  The local plan
     handles this by slicing BOTH sides of the matrix element
     (``dft_operators.vnl_matrix_from_kdata``).  The sweep cannot: the m
@@ -745,8 +745,9 @@ def vnl_operator(geom: SweepGeometry, vnl_setup) -> Operator:
     def op(psi_n, gvec, gmask, bidx, kvec):
         psi = _ket(psi_n, gmask)
         kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup)
-        ns_e = int(kdata.E_super.shape[0])
-        out = vnl_ops.apply_vnl(psi[:, :ns_e], kdata.Z, kdata.E_super)
+        ns_e = int(kdata.couplings.E_rows.shape[0])
+        out = vnl_ops.apply_vnl(
+            psi[:, :ns_e], kdata.Z, kdata.couplings)
         return _pad_spinor(out, int(psi.shape[1]))[None]
 
     return Operator(apply=op, post=1.0,
@@ -867,9 +868,9 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
         if vnl_setup is not None:
             kdata = vnl_ops.build_vnl_kdata_traced(kvec, gvec, vnl_setup,
                                                    compute_dZ=True)
-            ns_e = int(kdata.E_super.shape[0])
+            ns_e = int(kdata.couplings.E_rows.shape[0])
             v_nl = vnl_ops.apply_vnl_velocity_to_ket(
-                psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.E_super)
+                psi[:, :ns_e], kdata.Z, kdata.dZ, kdata.couplings)
             pad = _pad_spinor(v_nl, int(psi.shape[1]))
             v = v + pad if flipped else v - pad
         return jnp.moveaxis(v, 0, -1)[None]

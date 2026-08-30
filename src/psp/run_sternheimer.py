@@ -281,7 +281,7 @@ def compute_kp_tangent_at_kvec(
     Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
     fft_grid,
     bdot: jax.Array,
-    vnl_E_super: jax.Array,
+    vnl_couplings,
     U_val_G: jax.Array,                 # (nv, ns, nG_p) — occupied at kvec_p_base
     eps_v_at_kvec_p: jax.Array,         # (nv,) — eigenvalues AT kvec_p (not source k!)
     alpha_pv_sc: jax.Array,
@@ -334,7 +334,7 @@ def compute_kp_tangent_at_kvec(
         return build_sternheimer_op_at_kvec_traced(
             kvec_p_t, Gkminq_int_np, vnl_setup,
             V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
-            bdot=bdot, vnl_E_super=vnl_E_super,
+            bdot=bdot, vnl_couplings=vnl_couplings,
             U_val_kminq_G=U_val_G, eps_v=eps_v_at_kvec_p,
             alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
             U_extra_G=U_extra_G, eps_extra=eps_extra_v_at_kvec_p,
@@ -367,7 +367,8 @@ def compute_kp_tangent_at_kvec(
     op_b3 = SternheimerOp(
         T_diag=op_base.T_diag, V_scf=op_base.V_scf,
         Gx=op_base.Gx, Gy=op_base.Gy, Gz=op_base.Gz,
-        vnl_Z=op_base.vnl_Z, vnl_E=op_base.vnl_E, mask=op_base.mask,
+        vnl_Z=op_base.vnl_Z, vnl_couplings=op_base.vnl_couplings,
+        mask=op_base.mask,
         U_val=op_base.U_val,
         eps_v=jnp.tile(op_base.eps_v, 3),
         alpha_pv=op_base.alpha_pv,
@@ -388,7 +389,7 @@ def compute_kp2_tangent_at_kvec(
     Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
     fft_grid,
     bdot: jax.Array,
-    vnl_E_super: jax.Array,
+    vnl_couplings,
     U_val_G: jax.Array,                 # (nv, ns, nG_p)
     U_val_grad_kp: jax.Array,           # (3, nv, ns, nG_p) from compute_kp_tangent_at_kvec
     eps_v_at_kvec_p: jax.Array,
@@ -433,7 +434,7 @@ def compute_kp2_tangent_at_kvec(
         return build_sternheimer_op_at_kvec_traced(
             kvec_p_t, Gkminq_int_np, vnl_setup,
             V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
-            bdot=bdot, vnl_E_super=vnl_E_super,
+            bdot=bdot, vnl_couplings=vnl_couplings,
             U_val_kminq_G=U_val_G, eps_v=eps_v_at_kvec_p,
             alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
             U_extra_G=U_extra_G, eps_extra=eps_extra_v_at_kvec_p,
@@ -505,7 +506,7 @@ def compute_s_tensor_contrib_at_q0(
     Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
     fft_grid,
     bdot: jax.Array,
-    vnl_E_super: jax.Array,
+    vnl_couplings,
     U_val_G: jax.Array,                 # (nv, ns, nG_p) — U_val at kvec_p_base
     U_val_grad_kp: jax.Array,           # (3, nv, ns, nG_p) ∂U/∂kvec_p
     eps_v: jax.Array,                   # (nv,)
@@ -575,7 +576,7 @@ def compute_s_tensor_contrib_at_q0(
         jnp.asarray(kvec_p_base_np, dtype=jnp.float64),
         Gkminq_int_np, vnl_setup,
         V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
-        bdot=bdot, vnl_E_super=vnl_E_super,
+        bdot=bdot, vnl_couplings=vnl_couplings,
         U_val_kminq_G=U_val_G, eps_v=eps_v,
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
@@ -586,7 +587,7 @@ def compute_s_tensor_contrib_at_q0(
     op_3 = SternheimerOp(
         T_diag=op.T_diag, V_scf=op.V_scf,
         Gx=op.Gx, Gy=op.Gy, Gz=op.Gz,
-        vnl_Z=op.vnl_Z, vnl_E=op.vnl_E, mask=op.mask,
+        vnl_Z=op.vnl_Z, vnl_couplings=op.vnl_couplings, mask=op.mask,
         U_val=op.U_val,
         eps_v=jnp.tile(op.eps_v, 3),
         alpha_pv=op.alpha_pv,
@@ -617,7 +618,7 @@ def build_sternheimer_op_at_kvec_traced(
     Gx, Gy, Gz: jax.Array,                    # (nG_p,) int32, each — constant across jvp
     fft_grid,                                 # tuple, static
     bdot: jax.Array,                          # (3, 3)
-    vnl_E_super: jax.Array,                   # (nspinor, nspinor, R, R) — k-indep KB energies
+    vnl_couplings,                            # compact k-independent KB couplings
     U_val_kminq_G: jax.Array,                 # (nv, nspinor, nG_p) — frozen-projector approx
     eps_v: jax.Array,                         # (nv,)
     alpha_pv_sc: jax.Array,                   # () scalar
@@ -669,7 +670,7 @@ def build_sternheimer_op_at_kvec_traced(
     return SternheimerOp(
         T_diag=T_diag, V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
-        vnl_Z=kdata.Z, vnl_E=vnl_E_super, mask=mask,
+        vnl_Z=kdata.Z, vnl_couplings=vnl_couplings, mask=mask,
         U_val=U_val_kminq_G, eps_v=eps_v,
         alpha_pv=alpha_pv_sc,
         precond_diag=precond_diag,
@@ -691,7 +692,7 @@ def chi_col_contrib_at_kvec_traced(
     Gx, Gy, Gz: jax.Array,
     fft_grid,
     bdot: jax.Array,
-    vnl_E_super: jax.Array,
+    vnl_couplings,
     U_val_kminq_G: jax.Array,
     eps_v: jax.Array,
     alpha_pv_sc: jax.Array,
@@ -765,7 +766,7 @@ def chi_col_contrib_at_kvec_traced(
         kvec_p_traced, Gkminq_int_np, vnl_setup,
         V_scf=V_scf, mask=mask,
         Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
-        bdot=bdot, vnl_E_super=vnl_E_super,
+        bdot=bdot, vnl_couplings=vnl_couplings,
         U_val_kminq_G=U_val_eff, eps_v=eps_v,
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_extra_G=U_extra_G, eps_extra=eps_extra,
@@ -892,7 +893,7 @@ def build_Gprime_list(qvec_crys: np.ndarray, wfn: WfnLoader, ng_out: int) -> np.
 # ``kminq_idx`` lookup vary), so one XLA module is reused for every q.
 
 def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
-                V_scf, vnl_E_super,
+                V_scf, vnl_couplings,
                 U_kmq_G, eps_v, precond_diag,
                 U_k_box, b, phase_unwrap,
                 Gprime_int, prefactor_j, alpha_pv_sc, bdot_,
@@ -906,7 +907,8 @@ def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
     return chi_col_contrib_at_kvec_traced(
         kvec_p_traced=kvec_p, Gkminq_int_np=Gkm_int, vnl_setup=vnl_setup,
         V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
-        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        fft_grid=fft_grid_static, bdot=bdot_,
+        vnl_couplings=vnl_couplings,
         U_val_kminq_G=U_kmq_G, eps_v=eps_v,
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         U_val_k_box=U_k_box, b=b,
@@ -918,7 +920,7 @@ def _per_k_chi(kvec_p, Gkm_int, mask, Gx, Gy, Gz,
     )
 
 
-# Vmap over the 14 leading-k-axis args; the rest (V_scf, vnl_E_super,
+# Vmap over the 14 leading-k-axis args; the rest (V_scf, vnl_couplings,
 # Gprime_int, prefactor, alpha_pv, bdot, vnl_setup, fft_grid, tol,
 # max_iter, use_schur) are shared across k.  None for U_extra/eps_extra
 # tells vmap to broadcast — but in_axes=0 for those when Schur is on.
@@ -927,7 +929,7 @@ def _make_chi_vmap_over_k(use_extra: bool):
     whether Schur warm-start (``U_extra_G``, ``eps_extra``) is enabled."""
     base_axes = (
         0, 0, 0, 0, 0, 0,        # kvec_p, Gkm_int, mask, Gx, Gy, Gz
-        None, None,               # V_scf, vnl_E_super
+        None, None,               # V_scf, vnl_couplings
         0, 0, 0,                  # U_kmq_G, eps_v, precond_diag
         0, 0, 0,                  # U_k_box, b, phase_unwrap
         None, None, None, None,   # Gprime_int, prefactor, alpha_pv, bdot
@@ -1009,7 +1011,7 @@ def _build_stk_at_q(
 
 def _per_k_full_S(kvec_k, Gk_int, mask, Gx, Gy, Gz,
                    U_val_G, eps_vk, precond_diag,
-                   V_scf, vnl_E_super,
+                   V_scf, vnl_couplings,
                    vnl_setup, fft_grid_static, alpha_pv_sc, bdot_,
                    tol, max_iter,
                    U_extra_G=None, eps_extra=None):
@@ -1020,7 +1022,8 @@ def _per_k_full_S(kvec_k, Gk_int, mask, Gx, Gy, Gz,
     grad_kp = compute_kp_tangent_at_kvec(
         kvec_p_base_np=kvec_k, Gkminq_int_np=Gk_int, vnl_setup=vnl_setup,
         V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
-        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        fft_grid=fft_grid_static, bdot=bdot_,
+        vnl_couplings=vnl_couplings,
         U_val_G=U_val_G, eps_v_at_kvec_p=eps_vk,
         alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         tol=tol, max_iter=max_iter,
@@ -1029,7 +1032,8 @@ def _per_k_full_S(kvec_k, Gk_int, mask, Gx, Gy, Gz,
     return compute_s_tensor_contrib_at_q0(
         kvec_p_base_np=kvec_k, Gkminq_int_np=Gk_int, vnl_setup=vnl_setup,
         V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz,
-        fft_grid=fft_grid_static, bdot=bdot_, vnl_E_super=vnl_E_super,
+        fft_grid=fft_grid_static, bdot=bdot_,
+        vnl_couplings=vnl_couplings,
         U_val_G=U_val_G, U_val_grad_kp=grad_kp,
         eps_v=eps_vk, alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
         tol=tol, max_iter=max_iter,
@@ -1047,7 +1051,7 @@ def _make_s_vmap_over_k(use_extra: bool):
     base_axes = (
         0, 0, 0, 0, 0, 0,        # kvec_k, Gk_int, mask, Gx, Gy, Gz
         0, 0, 0,                  # U_val_G, eps_vk, precond_diag
-        None, None,               # V_scf, vnl_E_super
+        None, None,               # V_scf, vnl_couplings
         None, None,               # vnl_setup, fft_grid_static
         None, None,               # alpha_pv_sc, bdot
         None, None,               # tol, max_iter
@@ -1318,7 +1322,7 @@ def run_sternheimer(
                 stk_q['kvec_p_stack'], stk_q['Gkmq_int_stack'],
                 stk_q['mask_stack'],
                 stk_q['Gx_stack'], stk_q['Gy_stack'], stk_q['Gz_stack'],
-                V_scf, jnp.asarray(H_cache[0][0].vnl_E),
+                V_scf, H_cache[0][0].vnl_couplings,
                 stk_q['U_kmq_G_stack'], stk_q['eps_vk_stack'],
                 stk_q['precond_diag_stack'],
                 stk_q['U_k_box_stack'], stk_q['b_stack'],
@@ -1401,7 +1405,7 @@ def run_sternheimer(
             for ik in range(nk_full)
         ], axis=0)
         eps_v_stack_S = en_occ_full
-        vnl_E_super_jnp = jnp.asarray(H_cache[0][0].vnl_E)
+        vnl_couplings = H_cache[0][0].vnl_couplings
 
         # Wrap the vmap'd kernel in a jit closure that captures
         # vnl_setup + fft_grid_static (Python pytrees not abstractable
@@ -1410,13 +1414,13 @@ def run_sternheimer(
         def _s_at_q0_jit(kvec_k_stk, Gk_int_stk, mask_stk,
                          Gx_stk, Gy_stk, Gz_stk,
                          U_val_stk, eps_v_stk, precond_stk,
-                         V_scf_, vnl_E_super_, alpha_pv_, bdot_,
+                         V_scf_, vnl_couplings_, alpha_pv_, bdot_,
                          U_extra_stk, eps_extra_stk):
             return s_vmap_over_k(
                 kvec_k_stk, Gk_int_stk, mask_stk,
                 Gx_stk, Gy_stk, Gz_stk,
                 U_val_stk, eps_v_stk, precond_stk,
-                V_scf_, vnl_E_super_,
+                V_scf_, vnl_couplings_,
                 vnl_setup, fft_grid_static, alpha_pv_, bdot_,
                 tol, max_iter,
                 U_extra_stk, eps_extra_stk,
@@ -1427,7 +1431,7 @@ def run_sternheimer(
             kvec_k_stack, Gk_int_full, mask_full,
             Gx_full, Gy_full, Gz_full,
             U_kmq_G_full, eps_v_stack_S, precond_stack_S,
-            V_scf, vnl_E_super_jnp, alpha_pv_j, bdot,
+            V_scf, vnl_couplings, alpha_pv_j, bdot,
             U_extra_G_full, eps_extra_full,
         )
         S_per_k.block_until_ready()

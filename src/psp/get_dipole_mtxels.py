@@ -119,10 +119,10 @@ def compute_vnl_matrix_from_setup(
 	# runs through ψ_G at least once.
 	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)
 	# Slice to physical spinor components for bispinor wavefunctions
-	nspinor_E = kdata.E_super.shape[0]
+	nspinor_E = kdata.couplings.E_rows.shape[0]
 	if psi_G.shape[1] > nspinor_E:
 		psi_G = psi_G[:, :nspinor_E, :]
-	return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.E_super)
+	return vnl_ops.vnl_matrix(psi_G, kdata.Z, kdata.couplings)
 
 
 def compute_vnl_velocity_cart(
@@ -142,10 +142,11 @@ def compute_vnl_velocity_cart(
 	)
 	psi_G = gather_psi_G_from_crys(wfn_k, Gk_crys, g_mask)
 	# Slice to physical spinor components for bispinor wavefunctions
-	nspinor_E = kdata.E_super.shape[0]
+	nspinor_E = kdata.couplings.E_rows.shape[0]
 	if psi_G.shape[1] > nspinor_E:
 		psi_G = psi_G[:, :nspinor_E, :]
-	return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
+	return vnl_ops.vnl_velocity_matrix(
+		psi_G, kdata.Z, kdata.dZ, kdata.couplings)
 
 
 def compute_projected_momentum_bgw_like(*args, **kwargs):
@@ -358,11 +359,11 @@ def compute_finite_q_mtxels(
         # than a multiply so the shipped arm executes the SAME negation
         # it always did.
         _vel_v = vnl_ops.apply_vnl_velocity_to_ket(
-            psi_v[:, :int(kdata.E_super.shape[0])],
-            kdata.Z, kdata.dZ, kdata.E_super)
+            psi_v[:, :int(kdata.couplings.E_rows.shape[0])],
+            kdata.Z, kdata.dZ, kdata.couplings)
         _vel_c = vnl_ops.apply_vnl_velocity_to_ket(
-            psi_c[:, :int(kdata.E_super.shape[0])],
-            kdata.Z, kdata.dZ, kdata.E_super)
+            psi_c[:, :int(kdata.couplings.E_rows.shape[0])],
+            kdata.Z, kdata.dZ, kdata.couplings)
         if vnl_velocity_sign < 0.0:
             v_NL_v, v_NL_c = -_vel_v, -_vel_c
         else:

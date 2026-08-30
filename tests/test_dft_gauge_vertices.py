@@ -75,9 +75,9 @@ def _setup(
     channel = ChannelMeta(
         l=0, nbeta=1, msize=1, R=1, tau=tau, E=E,
         beta_table_start=0, natoms=natoms)
-    E_super = np.zeros((2, 2, natoms, natoms), dtype=np.complex128)
-    for ia in range(natoms):
-        E_super[:, :, ia, ia] = E[:, :, 0, 0]
+    coupled_blocks = tuple((ia, ia + 1, 0) for ia in range(natoms))
+    couplings = vnl_ops._build_projector_couplings(
+        [channel], coupled_blocks, total_R=natoms, nspinor=2)
     return VNLSetup(
         channels=[channel], dq=dq, n_q=q.size, q_max=float(q[-1]),
         G_table=jnp.asarray(radial[None, :]),
@@ -86,13 +86,13 @@ def _setup(
         Gppp_table=(jnp.zeros((1, q.size), dtype=jnp.float64)
                     if third_derivatives else None),
         prefactor=0.67, B=B, cell_volume=1.0,
-        total_R=natoms, nspinor=2, E_super=jnp.asarray(E_super), l_max=0,
+        total_R=natoms, nspinor=2, couplings=couplings, l_max=0,
         soc=True,
         row_beta_idx=jnp.zeros(natoms, dtype=jnp.int32),
         row_l=jnp.zeros(natoms, dtype=jnp.int32),
         row_m=jnp.zeros(natoms, dtype=jnp.int32),
         row_tau=jnp.asarray(tau),
-        coupled_row_blocks=tuple((ia, ia + 1, 0) for ia in range(natoms)),
+        coupled_row_blocks=coupled_blocks,
     )
 
 
@@ -121,7 +121,7 @@ def _ordinary_vnl_action(psi, G, mask, k, setup):
         np.asarray(k, dtype=np.float64), np.asarray(G, dtype=np.int32), setup)
     mask_j = jnp.asarray(mask, dtype=psi.real.dtype)
     physical = psi * mask_j[None, None, :]
-    value = vnl_ops.apply_vnl(physical, kdata.Z, kdata.E_super)
+    value = vnl_ops.apply_vnl(physical, kdata.Z, kdata.couplings)
     return np.asarray(value * mask_j[None, None, :])
 
 
@@ -144,8 +144,10 @@ def _rectangular_vnl_action(
     physical = np.asarray(psi) * source_mask[None, None, :]
     coefficients = np.einsum(
         "RG,nsG->Rsn", np.conj(Z_source), physical, optimize=True)
+    E_rows = np.asarray(setup.couplings.E_rows)
+    partner_rows = np.asarray(setup.couplings.partner_rows)
     coupled = np.einsum(
-        "stRQ,Qtn->Rsn", np.asarray(setup.E_super), coefficients,
+        "stRq,Rqtn->Rsn", E_rows, coefficients[partner_rows],
         optimize=True)
     value = np.einsum(
         "RG,Rsn->nsG", Z_target, coupled, optimize=True)
@@ -683,7 +685,7 @@ def test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor():
         kinetic = basis * np.sum(K * K, axis=1)[None, None, :]
         kdata = build_vnl_kdata_from_kvec(k_value, G, setup)
         nonlocal_action = vnl_ops.apply_vnl(
-            basis, kdata.Z, kdata.E_super)
+            basis, kdata.Z, kdata.couplings)
         result = operator_matrix(kinetic + np.asarray(nonlocal_action))
         np.testing.assert_allclose(
             result, np.conj(result.T), rtol=3.0e-13, atol=3.0e-13)

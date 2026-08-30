@@ -1,10 +1,12 @@
 """
 psp/vnl_ops.py — Fast VNL operator: build once, apply many times.
 
-All channels × atoms × betas are concatenated into a single dense
-projector matrix Z of shape (total_R, nG).  E is a block-diagonal
-(nspinor, nspinor, total_R, total_R) matrix.  The VNL operator is
-then a single set of einsums with no Python loops.
+All channels × atoms × betas are concatenated into a projector matrix Z
+of shape (total_R, nG).  The atom-local pseudopotential coupling is stored as
+bounded row neighborhoods, never as the algebraically sparse
+``(nspinor, nspinor, total_R, total_R)`` supermatrix.  Ordinary VNL kernels
+therefore retain vectorized contractions while their k-independent storage is
+linear in ``total_R``.
 
 Radial form factors use table lookup on a uniform q-grid (linear
 interpolation) instead of spline evaluation. This keeps the production
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+from typing import NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -49,6 +52,22 @@ class ChannelMeta:
     natoms: int
 
 
+class VNLProjectorCouplings(NamedTuple):
+    r"""Bounded row representation of the canonical atom-local D matrices.
+
+    ``E_rows[s,t,R,q]`` couples global projector row ``R`` to the global row
+    ``partner_rows[R,q]``.  Padded neighbor slots have exactly-zero
+    ``E_rows``.  The width is the largest single atom/channel block, so the
+    carrier scales as ``O(nspinor**2 * total_R * max_channel_R)`` rather than
+    ``O(nspinor**2 * total_R**2)``.  No alternate pseudopotential algebra is
+    encoded here: every live entry is copied directly from one
+    :class:`ChannelMeta.E` block.
+    """
+
+    E_rows: jax.Array              # (nspinor, nspinor, total_R, row_width)
+    partner_rows: jax.Array        # (total_R, row_width) int32
+
+
 @dataclass
 class VNLSetup:
     """K-independent VNL data.  Built once from pseudopotentials.
@@ -68,7 +87,7 @@ class VNLSetup:
     cell_volume: float
     total_R: int
     nspinor: int
-    E_super: jax.Array | None = None  # (nspinor, nspinor, total_R, total_R)
+    couplings: VNLProjectorCouplings | None = None
     l_max: int = 0
     # WHICH PROJECTORS THESE ARE.  True = j-resolved (spin-orbit in V_NL);
     # False = j-averaged scalar-relativistic (QE average_pp).  Resolved by
@@ -102,7 +121,7 @@ class VNLSetup:
 class VNLKData:
     """Per-k-point VNL projector data.  Precomputed for fast apply."""
     Z: jax.Array                    # (total_R, nG) complex128
-    E_super: jax.Array              # (nspinor, nspinor, total_R, total_R)
+    couplings: VNLProjectorCouplings
     nG: int
     total_R: int
     # Optional: Cartesian k-derivatives for velocity.  ``None`` IF AND ONLY
@@ -118,6 +137,67 @@ class VNLKData:
     # field documents the layout rather than being a required argument to
     # anything: a kdata from that route is already inert on the pad.
     g_mask: np.ndarray | None = None   # (nG,) float64 or None
+
+
+def _build_projector_couplings(
+    channels: list[ChannelMeta],
+    coupled_row_blocks: tuple[tuple[int, int, int], ...],
+    *,
+    total_R: int,
+    nspinor: int,
+) -> VNLProjectorCouplings:
+    """Pack canonical channel couplings without constructing ``E_super``."""
+    ns = int(nspinor)
+    nrow = int(total_R)
+    if ns not in (1, 2):
+        raise ValueError(f"VNL coupling nspinor must be 1 or 2, got {ns}")
+    row_width = max((int(ch.R) for ch in channels), default=1)
+    E_rows = np.zeros(
+        (ns, ns, nrow, row_width), dtype=np.complex128)
+    partner_rows = np.zeros((nrow, row_width), dtype=np.int32)
+
+    expected = 0
+    for raw_start, raw_stop, raw_channel in coupled_row_blocks:
+        start, stop, ich = int(raw_start), int(raw_stop), int(raw_channel)
+        if start != expected or stop <= start or stop > nrow:
+            raise ValueError(
+                "VNL coupled_row_blocks must cover [0,total_R) once; "
+                f"expected start {expected}, got ({start},{stop})")
+        if ich < 0 or ich >= len(channels):
+            raise ValueError(
+                f"VNL coupled_row_blocks names invalid channel {ich}")
+        channel = channels[ich]
+        width = stop - start
+        if width != int(channel.R):
+            raise ValueError(
+                f"VNL block width {width} does not match channel R="
+                f"{int(channel.R)}")
+        E = np.asarray(channel.E[:ns, :ns], dtype=np.complex128)
+        if E.shape != (ns, ns, width, width):
+            raise ValueError(
+                f"ChannelMeta.E has shape {E.shape}, expected "
+                f"({ns},{ns},{width},{width})")
+        E_rows[:, :, start:stop, :width] = E
+        partner_rows[start:stop, :width] = np.arange(
+            start, stop, dtype=np.int32)[None, :]
+        expected = stop
+    if expected != nrow:
+        raise ValueError(
+            "VNL coupled_row_blocks do not cover all projector rows: "
+            f"covered {expected}, total_R={nrow}")
+    return VNLProjectorCouplings(
+        E_rows=jnp.asarray(E_rows, dtype=jnp.complex128),
+        partner_rows=jnp.asarray(partner_rows, dtype=jnp.int32),
+    )
+
+
+def _setup_projector_couplings(setup: VNLSetup) -> VNLProjectorCouplings:
+    """Return the setup's sole ordinary coupling carrier, or refuse."""
+    if setup.couplings is None:
+        raise ValueError(
+            "VNLSetup has no compact projector couplings; rebuild it with "
+            "build_vnl_setup")
+    return setup.couplings
 
 
 @dataclass(frozen=True)
@@ -515,16 +595,12 @@ def build_vnl_setup(
     row_tau_np = np.array(row_tau, dtype=np.float64).reshape(-1, 3) if row_tau else np.zeros((0, 3), dtype=np.float64)
     row_tau_j = jnp.asarray(row_tau_np, dtype=jnp.float64)
 
-    # ── Pre-build E_super (k-independent block-diagonal D-matrix) ──
-    E_super = np.zeros((nspinor, nspinor, total_R, total_R), dtype=np.complex128)
-    offset = 0
-    for ch in channels:
-        E_np = ch.E[:nspinor, :nspinor]
-        R = ch.R
-        for a in range(ch.natoms):
-            E_super[:, :, offset:offset+R, offset:offset+R] = E_np
-            offset += R
-    E_super_j = jnp.asarray(E_super, dtype=jnp.complex128)
+    # The D matrix is atom-local.  Store only each row's coupled atom block;
+    # the historical dense E_super allocated zeros for all cross-atom pairs
+    # and therefore grew quadratically in the total projector-row count.
+    couplings = _build_projector_couplings(
+        channels, tuple(coupled_row_blocks), total_R=total_R,
+        nspinor=nspinor)
 
     uniform_gauge_fingerprint = ""
     if compute_contact:
@@ -536,7 +612,7 @@ def build_vnl_setup(
         from common.parallel_transport import fingerprint_update_value
 
         digest = hashlib.sha256()
-        digest.update(b"lorrax.vnl_uniform_gauge/v1\0")
+        digest.update(b"lorrax.vnl_uniform_gauge/v2\0")
 
         for label, value in (
             ("B_cart", B),
@@ -553,7 +629,8 @@ def build_vnl_setup(
             ("row_m", np.asarray(row_m, dtype=np.int32)),
             ("row_tau", row_tau_np),
             ("coupled_blocks", np.asarray(coupled_row_blocks, dtype=np.int64)),
-            ("E_super", E_super),
+            ("coupling_E_rows", np.asarray(couplings.E_rows)),
+            ("coupling_partner_rows", np.asarray(couplings.partner_rows)),
         ):
             fingerprint_update_value(digest, label, value)
         if compute_transfer_q2:
@@ -570,7 +647,7 @@ def build_vnl_setup(
         prefactor=prefactor,
         B=B, cell_volume=cell_volume,
         total_R=total_R, nspinor=nspinor,
-        E_super=E_super_j, l_max=l_max, soc=bool(soc_resolved),
+        couplings=couplings, l_max=l_max, soc=bool(soc_resolved),
         row_beta_idx=row_beta_idx_j,
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
         coupled_row_blocks=tuple(coupled_row_blocks),
@@ -693,7 +770,7 @@ def build_vnl_kdata(
     mask_j = jnp.asarray(g_mask, dtype=kdata.Z.real.dtype)
     return VNLKData(
         Z=kdata.Z * mask_j[None, :],
-        E_super=kdata.E_super,
+        couplings=kdata.couplings,
         nG=kdata.nG,
         total_R=kdata.total_R,
         dZ=None if kdata.dZ is None else kdata.dZ * mask_j[None, None, :],
@@ -797,7 +874,7 @@ def _build_vnl_kdata_core(
             setup.row_beta_idx, setup.row_l, setup.row_m, setup.row_tau,
             l_max=int(setup.l_max),
         )
-        return VNLKData(Z=Z, E_super=setup.E_super, nG=nG,
+        return VNLKData(Z=Z, couplings=_setup_projector_couplings(setup), nG=nG,
                         total_R=setup.total_R, dZ=None)
 
     # ── compute_dZ=True path: still eager (used by get_dipole_mtxels).
@@ -879,7 +956,7 @@ def _build_vnl_kdata_core(
                 else jnp.zeros((3, int(setup.total_R), nG), dtype=Z.dtype))
 
     return VNLKData(
-        Z=Z, E_super=setup.E_super, nG=nG,
+        Z=Z, couplings=_setup_projector_couplings(setup), nG=nG,
         total_R=setup.total_R, dZ=dZ_j,
     )
 
@@ -1151,9 +1228,8 @@ def _compact_channel_couplings(setup: VNLSetup, row_width: int):
     """Stack canonical ``ChannelMeta.E`` blocks at one bounded scan shape.
 
     There is one compact entry per channel, not one ``total_R x total_R``
-    matrix and not one duplicate per atom.  ``E_super`` remains the ordinary
-    Hamiltonian owner's derived dense representation; this gauge action never
-    pads or copies it.
+    matrix and not one duplicate per atom.  Ordinary kernels consume the
+    row-neighborhood carrier derived from these same ``ChannelMeta.E`` blocks.
     """
     blocks = []
     for ich, channel in enumerate(setup.channels):
@@ -1822,47 +1898,94 @@ def compute_icl_vnl_finite_contact_to_ket(
 
 
 # ---------------------------------------------------------------------------
-# Core operators — single JIT, no loops
+# Core operators — bounded atom-local couplings
 # ---------------------------------------------------------------------------
 
 @jax.jit
-def apply_vnl(psi_G, Z, E_super):
+def _apply_projector_couplings(coefficients, couplings):
+    """Apply canonical atom-local D blocks to ``<beta|psi>`` coefficients."""
+    E_rows, partner_rows = couplings
+    zero = jnp.zeros_like(coefficients)
+
+    def neighbor_pass(total, iq):
+        E_neighbor = jax.lax.dynamic_index_in_dim(
+            E_rows, iq, axis=3, keepdims=False)
+        partner = coefficients[jax.lax.dynamic_index_in_dim(
+            partner_rows, iq, axis=1, keepdims=False)]
+        return total + jnp.einsum(
+            'stR,Rtn->Rsn', E_neighbor, partner, optimize=True), None
+
+    coupled, _ = jax.lax.scan(
+        neighbor_pass, zero,
+        jnp.arange(E_rows.shape[-1], dtype=jnp.int32), unroll=1)
+    return coupled
+
+
+@jax.jit
+def apply_vnl(psi_G, Z, couplings):
     """V_NL|psi> = Z E Z† |psi>.   (nvec, nspinor, nG) → same.
 
-    Z       : (total_R, nG)
-    E_super : (nspinor, nspinor, total_R, total_R)
+    ``couplings`` is :class:`VNLProjectorCouplings`; no dense total_R-square
+    coupling is accepted or constructed.
     """
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', E_super, P, optimize=True)
+    D = _apply_projector_couplings(P, couplings)
     return jnp.einsum('RG,Rsv->vsG', Z, D, optimize=True)
 
 
 @jax.jit
-def vnl_matrix(psi_G, Z, E_super):
+def vnl_matrix(psi_G, Z, couplings):
     """V_NL matrix elements <m|V_NL|n>.   Returns (nb, nb)."""
     P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
+    D = _apply_projector_couplings(P, couplings)
     return jnp.einsum('Rsm,Rsn->mn', jnp.conj(P), D, optimize=True)
 
 
 @jax.jit
-def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
+def vnl_diagonal(Z, couplings):
+    r"""Spin-summed ``<G,s|V_NL|G,s>`` without a dense D supermatrix."""
+    E_rows, partner_rows = couplings
+    zero = jnp.zeros((Z.shape[-1],), dtype=Z.real.dtype)
+
+    def neighbor_pass(total, iq):
+        E_neighbor = jax.lax.dynamic_index_in_dim(
+            E_rows, iq, axis=3, keepdims=False)
+        partner = Z[jax.lax.dynamic_index_in_dim(
+            partner_rows, iq, axis=1, keepdims=False)]
+        E_spin_trace = jnp.einsum('ssR->R', E_neighbor, optimize=True)
+        contribution = jnp.real(jnp.einsum(
+            'RG,R,RG->G', jnp.conj(Z), E_spin_trace, partner,
+            optimize=True))
+        return total + contribution, None
+
+    diagonal, _ = jax.lax.scan(
+        neighbor_pass, zero,
+        jnp.arange(E_rows.shape[-1], dtype=jnp.int32), unroll=1)
+    return diagonal
+
+
+@jax.jit
+def apply_vnl_velocity_to_ket(psi_G, Z, dZ, couplings):
     """∂V_NL/∂K_cart^α applied to a ket on the G-sphere.
 
     Returns ``(3, nb, nspinor, nG)`` complex — the velocity-applied ket
     ``v_NL^α |n,k⟩``  in the SAME G-sphere layout as ``psi_G``.
 
     Math:  ``∂V_NL/∂k^α = (∂Z^α) E Z† + Z E (∂Z^α)†``  (k-dependence
-    flows through the projectors Z(k); E_super is k-independent).  The
+    flows through the projectors Z(k); the compact coupling is k-independent).
+    The
     apply form leaves the bra index free so callers can either contract
     against ``conj(psi_G)`` to get the q=0 matrix element (see
     :func:`vnl_velocity_matrix`) OR against a different bra at a
     different k for the finite-q matrix element used in the SOS chi
     head/wing pipeline.
     """
-    coefficients = _contract_projector_coefficients(
-        psi_G, Z, dZ, None, E_super)
-    D, dD, _ = _coupled_projector_coefficients(coefficients)
+    P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
+    dP = jnp.einsum('jRG,nsG->jRsn', jnp.conj(dZ), psi_G,
+                    optimize=True)
+    D = _apply_projector_couplings(P, couplings)
+    dD = jax.vmap(
+        lambda part: _apply_projector_couplings(part, couplings))(dP)
     # (∂Z^j) D — first piece in the symmetrized derivative
     t1 = jnp.einsum('jRG,Rsn->jnsG', dZ, D, optimize=True)
     # Z dD — second piece
@@ -1871,7 +1994,7 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
 
 
 @jax.jit
-def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
+def vnl_velocity_matrix(psi_G, Z, dZ, couplings):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).
 
     At q=0 the bra and ket share the same projector coefficients, so form
@@ -1881,13 +2004,16 @@ def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     ``(3, nb, nspinor, nG)`` output.  The apply-to-ket endpoint remains the
     owner for finite-q matrix elements, where the bra is a different state.
     """
-    coefficients = _contract_projector_coefficients(
-        psi_G, Z, dZ, None, E_super)
-    D, dD, _ = _coupled_projector_coefficients(coefficients)
+    P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
+    dP = jnp.einsum('jRG,nsG->jRsn', jnp.conj(dZ), psi_G,
+                    optimize=True)
+    D = _apply_projector_couplings(P, couplings)
+    dD = jax.vmap(
+        lambda part: _apply_projector_couplings(part, couplings))(dP)
     return (
         jnp.einsum(
-            'jRsm,Rsn->jmn', jnp.conj(coefficients.dc_cart), D,
+            'jRsm,Rsn->jmn', jnp.conj(dP), D,
             optimize=True)
         + jnp.einsum(
-            'Rsm,jRsn->jmn', jnp.conj(coefficients.c), dD,
+            'Rsm,jRsn->jmn', jnp.conj(P), dD,
             optimize=True))

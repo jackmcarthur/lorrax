@@ -75,7 +75,10 @@ def _empty_channel_setup(total_R: int = 3, n_q: int = 64):
         Gp_table=jnp.zeros((1, n_q), dtype=jnp.float64),
         prefactor=1.0, B=np.eye(3), cell_volume=1.0,
         total_R=total_R, nspinor=1,
-        E_super=jnp.zeros((1, 1, total_R, total_R), dtype=jnp.complex128),
+        couplings=vnl_ops.VNLProjectorCouplings(
+            E_rows=jnp.zeros(
+                (1, 1, total_R, 1), dtype=jnp.complex128),
+            partner_rows=jnp.zeros((total_R, 1), dtype=jnp.int32)),
         l_max=0,
         row_beta_idx=jnp.zeros(total_R, dtype=jnp.int32),
         row_l=jnp.zeros(total_R, dtype=jnp.int32),
@@ -103,21 +106,22 @@ def _one_channel_setup(n_q: int = 64, natoms: int = 2):
     ch = vnl_ops.ChannelMeta(l=l, nbeta=nbeta, msize=msize, R=R,
                              tau=tau, E=E, beta_table_start=0, natoms=natoms)
     total_R = R * natoms
-    E_super = np.zeros((1, 1, total_R, total_R), dtype=np.complex128)
-    for a in range(natoms):
-        E_super[0, 0, a * R:(a + 1) * R, a * R:(a + 1) * R] = np.eye(R)
+    coupled_blocks = tuple(
+        (a * R, (a + 1) * R, 0) for a in range(natoms))
+    couplings = vnl_ops._build_projector_couplings(
+        [ch], coupled_blocks, total_R=total_R, nspinor=1)
     return vnl_ops.VNLSetup(
         channels=[ch], dq=float(q[1] - q[0]), n_q=n_q, q_max=1.0,
         G_table=jnp.asarray(G[None, :], dtype=jnp.float64),
         Gp_table=jnp.asarray(Gp[None, :], dtype=jnp.float64),
         prefactor=1.0, B=np.eye(3) * 1.1, cell_volume=1.0,
-        total_R=total_R, nspinor=1,
-        E_super=jnp.asarray(E_super, dtype=jnp.complex128),
+        total_R=total_R, nspinor=1, couplings=couplings,
         l_max=l,
         row_beta_idx=jnp.zeros(total_R, dtype=jnp.int32),
         row_l=jnp.full(total_R, l, dtype=jnp.int32),
         row_m=jnp.asarray(np.tile(np.arange(msize), natoms), dtype=jnp.int32),
         row_tau=jnp.asarray(np.repeat(tau, msize, axis=0), dtype=jnp.float64),
+        coupled_row_blocks=coupled_blocks,
     )
 
 
@@ -179,7 +183,8 @@ def test_apply_vnl_velocity_to_ket_survives_an_empty_projector_set():
     nb, ns, nG = 4, 1, _GK.shape[0]
     psi = jnp.asarray(np.random.default_rng(0).standard_normal((nb, ns, nG))
                       + 0j)
-    v = vnl_ops.apply_vnl_velocity_to_ket(psi, kd.Z, kd.dZ, kd.E_super)
+    v = vnl_ops.apply_vnl_velocity_to_ket(
+        psi, kd.Z, kd.dZ, kd.couplings)
     assert np.asarray(v).shape == (3, nb, ns, nG)
     assert np.all(np.asarray(v) == 0.0)
 

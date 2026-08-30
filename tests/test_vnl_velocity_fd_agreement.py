@@ -81,6 +81,16 @@ MIN_SCALE, MAX_SCALE = 0.5, 2.0
 H_CART = 1.0e-5
 
 
+def _all_to_all_couplings(E):
+    """Represent a small synthetic dense block in the bounded API."""
+    E = jnp.asarray(E)
+    nrow = int(E.shape[-1])
+    return vnl_ops.VNLProjectorCouplings(
+        E_rows=E,
+        partner_rows=jnp.broadcast_to(
+            jnp.arange(nrow, dtype=jnp.int32), (nrow, nrow)))
+
+
 def _both_derivatives(ik=0, nb=2, h=H_CART, invert_analytic=False):
     """(analytic, finite-difference) velocity matrices at one k.
 
@@ -101,15 +111,15 @@ def _both_derivatives(ik=0, nb=2, h=H_CART, invert_analytic=False):
     def V(kvec):
         kd = vnl_ops.build_vnl_kdata_traced(
             jnp.asarray(kvec), jnp.asarray(gv[ik]), setup, compute_dZ=False)
-        ns_e = int(kd.E_super.shape[0])
+        ns_e = int(kd.couplings.E_rows.shape[0])
         return np.asarray(jax.device_get(
-            vnl_ops.vnl_matrix(ket[:, :ns_e], kd.Z, kd.E_super)))
+            vnl_ops.vnl_matrix(ket[:, :ns_e], kd.Z, kd.couplings)))
 
     kd = vnl_ops.build_vnl_kdata_traced(
         jnp.asarray(kvecs[ik]), jnp.asarray(gv[ik]), setup, compute_dZ=True)
-    ns_e = int(kd.E_super.shape[0])
+    ns_e = int(kd.couplings.E_rows.shape[0])
     analytic = np.asarray(jax.device_get(vnl_ops.vnl_velocity_matrix(
-        ket[:, :ns_e], kd.Z, kd.dZ, kd.E_super)))
+        ket[:, :ns_e], kd.Z, kd.dZ, kd.couplings)))
     if invert_analytic:
         analytic = -analytic
 
@@ -149,11 +159,13 @@ def test_q0_coefficient_matrix_matches_bra_contracted_velocity_ket(nspinor):
     Z = jnp.asarray(random_complex((nrow, ng)))
     dZ = jnp.asarray(random_complex((3, nrow, ng)))
     E = jnp.asarray(random_complex((nspinor, nspinor, nrow, nrow)))
+    couplings = _all_to_all_couplings(E)
 
-    velocity_ket = vnl_ops.apply_vnl_velocity_to_ket(psi, Z, dZ, E)
+    velocity_ket = vnl_ops.apply_vnl_velocity_to_ket(
+        psi, Z, dZ, couplings)
     expected = jnp.einsum(
         "msG,jnsG->jmn", jnp.conj(psi), velocity_ket, optimize=True)
-    actual = vnl_ops.vnl_velocity_matrix(psi, Z, dZ, E)
+    actual = vnl_ops.vnl_velocity_matrix(psi, Z, dZ, couplings)
 
     np.testing.assert_allclose(
         np.asarray(jax.device_get(actual)),
@@ -175,7 +187,11 @@ def test_q0_velocity_matrix_lowering_has_no_band_spin_g_carrier():
         jax.ShapeDtypeStruct((nband, nspinor, ng), c128),
         jax.ShapeDtypeStruct((nrow, ng), c128),
         jax.ShapeDtypeStruct((3, nrow, ng), c128),
-        jax.ShapeDtypeStruct((nspinor, nspinor, nrow, nrow), c128),
+        vnl_ops.VNLProjectorCouplings(
+            E_rows=jax.ShapeDtypeStruct(
+                (nspinor, nspinor, nrow, nrow), c128),
+            partner_rows=jax.ShapeDtypeStruct(
+                (nrow, nrow), jnp.int32)),
     )
     matrix_ir = vnl_ops.vnl_velocity_matrix.lower(*args).as_text()
     apply_ir = vnl_ops.apply_vnl_velocity_to_ket.lower(*args).as_text()
@@ -250,7 +266,7 @@ def test_an_inverted_analytic_sign_trips_the_gate():
 def test_the_comparison_has_signal_to_compare():
     """The nonlocal velocity must be non-trivial on this fixture.
 
-    A null ``E_super`` or a null ``dZ`` makes both sides vanish; the
+    Null projector couplings or a null ``dZ`` make both sides vanish; the
     cosine is then undefined and every assertion above is vacuous.
     ``_cosine_and_scale`` refuses that case, and this cell is where the
     refusal is exercised on purpose rather than discovered in a year.

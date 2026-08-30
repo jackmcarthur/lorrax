@@ -251,7 +251,10 @@ def test_build_vnl_kdata_zeroes_Z_on_the_pad(monkeypatch):
         Gp_table=jnp.zeros((1, 64), dtype=jnp.float64),
         prefactor=1.0, B=np.eye(3), cell_volume=1.0,
         total_R=total_R, nspinor=1,
-        E_super=jnp.zeros((1, 1, total_R, total_R), dtype=jnp.complex128),
+        couplings=vnl_ops.VNLProjectorCouplings(
+            E_rows=jnp.zeros(
+                (1, 1, total_R, 1), dtype=jnp.complex128),
+            partner_rows=jnp.zeros((total_R, 1), dtype=jnp.int32)),
         l_max=0,
         row_beta_idx=jnp.zeros(total_R, dtype=jnp.int32),
         row_l=jnp.zeros(total_R, dtype=jnp.int32),

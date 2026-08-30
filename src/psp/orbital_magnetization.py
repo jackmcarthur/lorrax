@@ -248,10 +248,10 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
             kdata = vnl_ops.build_vnl_kdata_from_kvec(
                 np.asarray(gtab.kvecs[i], dtype=float),
                 np.asarray(G_pad, dtype=int), vnl_setup, compute_dZ=True)
-            nsE = kdata.E_super.shape[0]
+            nsE = kdata.couplings.E_rows.shape[0]
             psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
             v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
-                psi_phys, kdata.Z, kdata.dZ, kdata.E_super))
+                psi_phys, kdata.Z, kdata.dZ, kdata.couplings))
         psi_np = np.asarray(psi_G)
         sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
         S_sum += w_ibz[i] * float(sz[:nocc].sum())
@@ -350,14 +350,16 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
         # |∂̃_a u_v⟩ via Sternheimer — (3, nv, ns, nG), occupied only, no band sum
         d = compute_kp_tangent_at_kvec(
             kv, np.asarray(Gk_int), vnl_setup, V_scf, H_k.mask,
-            H_k.Gx, H_k.Gy, H_k.Gz, fft_grid, bdot, H_k.vnl_E,
+            H_k.Gx, H_k.Gy, H_k.Gz, fft_grid, bdot,
+            H_k.vnl_couplings,
             U_val_G, eps_v, alpha_pv, precond, tol=1e-10, max_iter=200)
 
         md = d * maskf.astype(d.dtype)
 
         def _Heps(da):                                   # (H_k + ε_v) |∂̃_a u_v⟩
             Hd = apply_H_k_from_G(da, H_k.T_diag, H_k.V_scf, H_k.Gx, H_k.Gy,
-                                  H_k.Gz, H_k.vnl_Z, H_k.vnl_E, H_k.mask)
+                                  H_k.Gz, H_k.vnl_Z,
+                                  H_k.vnl_couplings, H_k.mask)
             return Hd + eps_v[:, None, None] * (da * maskf.astype(da.dtype))
         opA = jax.vmap(_Heps)(d)                         # (3, nv, ns, nG)
 

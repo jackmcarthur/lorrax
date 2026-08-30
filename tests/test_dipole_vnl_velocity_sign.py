@@ -76,7 +76,7 @@ def _mesh():
 
 
 def _vnl_setup(seed=11):
-    """A synthetic ``VNLSetup`` with Z, dZ and E_super all nonzero.
+    """A synthetic ``VNLSetup`` with Z, dZ and D couplings all nonzero.
 
     One l = 0 channel, two radial betas, two sites -- enough that the
     ``compute_dZ=True`` branch runs its real per-channel JVP and returns
@@ -87,20 +87,28 @@ def _vnl_setup(seed=11):
     wrong derivative and both arms would move together, which is why the
     straddle assertion in the perturbation test is worth having.
 
-    E_super is deliberately random and not the zeros
-    ``tests/test_psp_padded_gvectors`` uses: a null E_super makes
+    The channel D block is deliberately random and not the zeros
+    ``tests/test_psp_padded_gvectors`` uses: a null coupling makes
     ``v_nl`` identically zero, both arms agree, and this whole file
     becomes a tautology wearing a measurement's clothes.
     """
     from psp import vnl_ops
 
     rng = np.random.default_rng(seed)
-    n_q = 96
+    # Cover every |G+k| in the synthetic D10 table.  The old 96-point table
+    # ended at 1.9 while this fixture reaches ~5; clipping made the finite
+    # difference exactly zero while the separately tabulated derivative
+    # stayed nonzero, and an unphysical cross-atom dense coupling hid it.
+    n_q = 320
     dq = 0.02
     tau = rng.standard_normal((NATOMS, 3))
+    E = 4.0 * (
+        rng.standard_normal((2, 2, NBETA * MSIZE, NBETA * MSIZE))
+        + 1j * rng.standard_normal(
+            (2, 2, NBETA * MSIZE, NBETA * MSIZE)))
     ch = vnl_ops.ChannelMeta(
         l=0, nbeta=NBETA, msize=MSIZE, R=NBETA * MSIZE, tau=tau,
-        E=np.zeros((2, 2, NBETA * MSIZE, NBETA * MSIZE)),
+        E=E,
         beta_table_start=0, natoms=NATOMS)
     # Smooth radial tables and their exact derivative, so the interpolant
     # and the JVP see a form factor rather than noise.
@@ -111,21 +119,22 @@ def _vnl_setup(seed=11):
                          for b in range(NBETA)])
     row_beta = np.tile(np.arange(NBETA, dtype=np.int32), NATOMS)
     row_tau = np.repeat(tau, NBETA * MSIZE, axis=0)
+    coupled_blocks = tuple(
+        (ia * NBETA, (ia + 1) * NBETA, 0) for ia in range(NATOMS))
+    couplings = vnl_ops._build_projector_couplings(
+        [ch], coupled_blocks, total_R=TOTAL_R, nspinor=NS)
     return vnl_ops.VNLSetup(
         channels=[ch], dq=dq, n_q=n_q, q_max=n_q * dq,
         G_table=jnp.asarray(G_table, dtype=jnp.float64),
         Gp_table=jnp.asarray(Gp_table, dtype=jnp.float64),
         prefactor=1.3, B=np.eye(3) * 1.17, cell_volume=1.0,
-        total_R=TOTAL_R, nspinor=NS,
-        E_super=jnp.asarray(
-            rng.standard_normal((NS, NS, TOTAL_R, TOTAL_R))
-            + 1j * rng.standard_normal((NS, NS, TOTAL_R, TOTAL_R)),
-            dtype=jnp.complex128),
+        total_R=TOTAL_R, nspinor=NS, couplings=couplings,
         l_max=0,
         row_beta_idx=jnp.asarray(row_beta, dtype=jnp.int32),
         row_l=jnp.zeros(TOTAL_R, dtype=jnp.int32),
         row_m=jnp.zeros(TOTAL_R, dtype=jnp.int32),
         row_tau=jnp.asarray(row_tau, dtype=jnp.float64),
+        coupled_row_blocks=coupled_blocks,
     )
 
 
@@ -185,9 +194,9 @@ def _pre_knob_ket(psi, gv, gmask, kvec, bvec, blat, setup, sign):
     kdata = vnl_ops.build_vnl_kdata_traced(jnp.asarray(kvec),
                                            jnp.asarray(gv), setup,
                                            compute_dZ=True)
-    ns_e = int(kdata.E_super.shape[0])
+    ns_e = int(kdata.couplings.E_rows.shape[0])
     v_nl = vnl_ops.apply_vnl_velocity_to_ket(ket[:, :ns_e], kdata.Z,
-                                             kdata.dZ, kdata.E_super)
+                                             kdata.dZ, kdata.couplings)
     v = v - v_nl if sign < 0.0 else v + v_nl
     return np.asarray(jax.device_get(jnp.moveaxis(v, 0, -1)[None]))
 
