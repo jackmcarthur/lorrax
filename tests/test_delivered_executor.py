@@ -2,12 +2,14 @@
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import jax.numpy as jnp
 
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.delivered_windows import build_delivered_sigma_windows
+from gw.mpa.delivered_windows import (_aligned_frequency_parts,
+                                      build_delivered_sigma_windows)
 from gw.mpa.sigma import (_batch_rows, _tau_groups, _tuple_components)
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_tau_kernel import (_direct_reciprocal_denominator,
@@ -175,6 +177,21 @@ def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch)
         assert sorted(pairs) == [(0, 0), (1, 0), (2, 0), (3, 0)]
     assert all(window["hardening_parent"] is not None
                for window in report["branches"][0]["windows"])
+
+
+def test_aligned_frequency_boundary_snaps_inside_a_one_sided_mean_segment():
+    """Detailed crossing tails remain splittable when tuple means are outside."""
+    spec = {
+        "tuple_representative": np.asarray([-2.0 - 0.1j, -1.0 - 0.1j]),
+        "problem": SimpleNamespace(
+            frequencies=np.asarray([0.0, 1.0, 2.0])),
+    }
+    panes, boundary, raw = _aligned_frequency_parts(
+        spec, (np.asarray([0]), np.asarray([1])))
+    assert raw == -1.5
+    assert boundary == 0.5
+    np.testing.assert_array_equal(panes[0], [0])
+    np.testing.assert_array_equal(panes[1], [1, 2])
 
 
 def test_metal_oneshot_threads_one_occupation_state_to_fit_and_sigma():

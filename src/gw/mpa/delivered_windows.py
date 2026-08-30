@@ -682,10 +682,22 @@ def _aligned_frequency_parts(spec, tuple_parts):
     """Split the owning signed frequency block between ordered tuple parts."""
     representative = np.asarray(
         spec["tuple_representative"], dtype=np.complex128)
-    boundary = 0.5 * (
+    raw_boundary = 0.5 * (
         float(np.max(representative[tuple_parts[0]].real))
         + float(np.min(representative[tuple_parts[1]].real)))
     frequencies = np.asarray(spec["problem"].frequencies, dtype=np.float64)
+    unique = np.unique(frequencies)
+    if unique.size < 2:
+        raise RuntimeError(
+            "aligned crossing hardening needs at least two frequencies")
+    # A tuple representative is the delivered-mass pole mean.  A broad pole
+    # field can make its detailed lattice cross the requested segment even
+    # when every mean lies to one side.  Snap that out-of-segment mass cut to
+    # the nearest INTERIOR frequency gap: the tuple partition remains exact,
+    # both frequency panes become executable, and every child is still judged
+    # on its own detailed base/refined measure.
+    gaps = 0.5 * (unique[:-1] + unique[1:])
+    boundary = float(gaps[np.argmin(np.abs(gaps - raw_boundary))])
     positions = np.arange(frequencies.size, dtype=np.int64)
     panes = (positions[frequencies < boundary],
              positions[frequencies >= boundary])
@@ -694,7 +706,7 @@ def _aligned_frequency_parts(spec, tuple_parts):
     if not np.array_equal(
             np.sort(np.concatenate(panes)), np.arange(frequencies.size)):
         raise RuntimeError("aligned frequency panes do not partition omega")
-    return panes, boundary
+    return panes, boundary, raw_boundary
 
 
 def _crossing_block_spec(parent, members, frequency_positions, name):
@@ -751,7 +763,7 @@ def _fit_crossing_blocks(
     for fraction in CROSSING_CUT_FRACTIONS:
         try:
             tuple_parts = _crossing_energy_parts(spec, fraction)
-            frequency_parts, boundary = _aligned_frequency_parts(
+            frequency_parts, boundary, raw_boundary = _aligned_frequency_parts(
                 spec, tuple_parts)
         except RuntimeError as exc:
             trials.append({
@@ -826,6 +838,7 @@ def _fit_crossing_blocks(
                     "hardening_parent": spec["window"].name,
                     "lower_mass_fraction": float(fraction),
                     "energy_boundary_ry": float(boundary),
+                    "raw_energy_boundary_ry": float(raw_boundary),
                     "omega_pane": int(pane_index),
                     "tuple_part": int(tuple_index),
                 }
@@ -855,6 +868,7 @@ def _fit_crossing_blocks(
         trials.append({
             "lower_mass_fraction": float(fraction),
             "energy_boundary_ry": float(boundary),
+            "raw_energy_boundary_ry": float(raw_boundary),
             "accepted": bool(accepted),
             "tau_pairs": tau_pairs, "direct_term_count": direct_terms,
             "panes": pane_receipts, "refusal": refusal,
@@ -865,6 +879,7 @@ def _fit_crossing_blocks(
                 "route": "aligned_2x2_tuple_frequency_blocks",
                 "selected_lower_mass_fraction": float(fraction),
                 "selected_energy_boundary_ry": float(boundary),
+                "selected_raw_energy_boundary_ry": float(raw_boundary),
                 "trials": trials,
             }
             for fit in child_fits:
