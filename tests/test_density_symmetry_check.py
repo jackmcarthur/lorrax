@@ -293,20 +293,18 @@ def test_evidence_planner_never_needs_an_antiunitary_row():
 # ----------------------------------------------------------------------
 # Synthetic gates
 # ----------------------------------------------------------------------
-def test_kramers_manifold_measures_trs_holds(tmp_path):
+def test_kramers_manifold_at_one_trim_is_inconclusive_globally(tmp_path):
     path = _kramers_deck(tmp_path, magnetic=False)
     loader = WfnLoader(path)
     rep = loader.density_symmetry
     assert rep is not None, "check must be ON by default"
     assert rep.trs_basis == "trim-only"
-    assert rep.trs_holds is True, rep.summary()
+    assert rep.trs_holds is False, rep.summary()
     # Kramers closure is exact; only overlap round-off survives.
     assert rep.m_rel < 1e-12, rep.summary()
     assert rep.trs_coverage == pytest.approx(1.0)
-    assert loader.trs_holds is True
-    # Nothing else may fire: the deck's inversion is a real symmetry of
-    # these (G-even) coefficients and the bands are normalised.
-    assert rep.ok, rep.messages
+    assert loader.trs_holds is False
+    assert rep.conclusive is False
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
 
 
@@ -342,7 +340,7 @@ def test_fractional_diagnostic_uses_complete_weighted_band_support(tmp_path):
     assert loader.physical_density_band_stop == occ.size
     assert rep.charge_expected == pytest.approx(float(np.sum(occ)))
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
-    assert rep.ok, rep.messages
+    assert rep.subspace_residual < 1.0e-12, rep.messages
 
 
 def test_spin_polarised_manifold_is_caught(tmp_path):

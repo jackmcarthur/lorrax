@@ -39,6 +39,7 @@ so reaching *past* the door is the thing that still flags.
 | name | what it is |
 |---|---|
 | `SymMaps(wfn)` | The eager table builder. Symmetry ops (spatial + TRS-augmented halves), `irr_idx_k`/`sym_idx_k`, the q maps, `R_cart` / `R_cart_forward` / `R_proper`, `U_spinor`, umklapp vectors. Reads 11 header attributes of `wfn`, including the MEASURED `trs_holds`. |
+| `build_spatial_operator_tables(wfn)` | Canonical `mtrx.T`, translation, Cartesian and spinor action tables without a k-map. The 2c reference check uses this to measure an inconsistent reduced WFN before `SymMaps` refuses its mesh coverage. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
 | `star_select(A_full, irr_idx_k)` | Keep one row per star — the FIRST occurrence, in full-BZ order, never `np.unique`'s ascending label order. |
 | `star_broadcast(A_irr, irr, sidx, nss, *, trs_reference='star_row')` | IBZ → full BZ with the conjugation predicate. Two legal values, one per operand flavour; an unknown value RAISES rather than defaulting. The default is `'star_row'` — see Contract for why the one `'ibz_slab'` caller passes it as a literal anyway. |
@@ -50,9 +51,9 @@ so reaching *past* the door is the thing that still flags.
 | `unfold_v_q_bispinor_lorentz(...)` | The 3-vector Lorentz mixing on the bispinor TT block. Its `R_proper_table` operand is in a convention the §A5 formula compensates for — see Antipatterns. |
 | `unfold_psi(cnk_kbar, *, sym_idx, g_kbar, sym_mats_k, translations, U_spinor_spatial)` | The (★) ψ derivation: spinor rotation, τ phase, G-list negation, TRS conjugation. Hard-raises unless `len(sym_mats_k) == 2·len(U_spinor_spatial)`. |
 | `slice_q_full_to_ibz` | Full-BZ → IBZ q-axis gather, sharding-preserving and jit-cached. |
-| `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points` | The pure-numpy primitives. `q_negation_index` owns the C-order full-q involution used by fit, downfold and diagnostics. `common_uniform_grid_indices` returns aligned C-order rows at the exact integer-grid intersection (for example 16 shared points for 8×8×1 and 12×12×1), without nearest-neighbour matching. `find_irreducible_bz_points`' anchored branch reproduces `find_symmetry_ops_simple`'s op-selection policy bit-for-bit — deliberately (see Contract). |
+| `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points`, `map_full_kpoints_to_irreducible` | Pure-NumPy primitives. The two mapping routines share the registered highest-parent/lowest-operation rule; `map_full_kpoints_to_irreducible` also returns a coverage mask so incomplete WFN metadata is refused before an index table is used. |
 | `compute_centroid_sym_perm`, `compute_rgrid_sym_perm`, `build_real_space_syms`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `recover_symmorphic_density_point_group` | Real-space orbit machinery. `compute_centroid_sym_perm(validate=True)` REFUSES a non-orbit-closed centroid set and names the regeneration fix. |
-| `check_spinor_reference_trs`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `trs_check_mode` | Gauge-invariant 2c occupied-density comparison. Raw, spatial-only, and TRIM evidence are distinguished; antiunitary-generated partners are excluded. `check_density_symmetries` is a compatibility spelling. |
+| `check_spinor_reference_trs`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `occupation_operator_residual`, `trs_check_mode` | Gauge-invariant 2c occupied-density comparison and its overlap-to-projector-distance primitive. Raw, spatial-only, and TRIM evidence are distinguished; antiunitary-generated partners are excluded. |
 | `build_qgrid_trs_policy(*, trs_measured, irr_idx_q, sym_idx_q, q_irr_full_idx, kgrid, n_sym_spatial)` → `QgridTrsPolicy` | **The q-axis consumer of that measurement, and the only one.** `trs_measured` is keyword-only with NO DEFAULT. True: pair-coherent row map (`unfold_sym_idx`) plus the one-element Θ projector at `q ≡ −q`, which returns the anti-Θ residual it removed rather than swallowing it. False: the identity row map, no projector, and a REFUSAL if the tables select a Θ row beside a magnetic verdict. |
 | `QgridTrsPolicy.measure_covariance(V_ibz, ...)` / `little_group_covariance_residual(...)` | The point-group covariance the IBZ→full-BZ unfold ASSUMES of the stored parent tiles, measured in the unfold's own arithmetic: for `s` in the little group of `q_p`, does `phase·V_p[α_s μ, α_s ν]` come back as `V_p`? **This is the statistic `check_q_conjugate_reciprocity` is structurally blind to** at a self-negative q, where it degenerates to "`V_q` is real" (measured on Na 8×8×8 SOC c464: reciprocity 3.9e-17 at Γ against a covariance residual of 1.2e-02). Returns `nan` when no non-identity little-group op exists — unanswerable, not a pass. |
 | `self_negative_q_mask(q_full_idx, *, kgrid)` | The one-element orbits of `q → −q`: every TRIM of an even mesh, Γ alone on an odd one. The rows a pair composition can never touch and the only rows the projector may act on. |
@@ -94,18 +95,26 @@ kept rather than deleted, with the case where it returns FALSE constructed
   if it drifts: the four-deck `(irr_idx_k, sym_idx_k)` bit-equality test,
   and the cohsex TRS-first-row precondition assertion (which FAILS rather
   than skips).
-* **Refusals are part of the API.** TRS-disallowed construction names
-  `noinv=.true.` and the `LORRAX_TRS_CHECK=0` escape hatch; the
+* **Refusals are part of the API.** A stored k/symmetry table must cover every
+  point declared by `kgrid`; missing rows never fall back to Γ/identity.
+  `ntran=1` reaches the fast full-grid path only when all grid points are
+  actually stored; otherwise it uses the ordinary `[I,-I]` planner.
+  TRS-disallowed construction names `noinv=.true.` and the
+  `LORRAX_TRS_CHECK=0` escape hatch; the
   orbit-closure refusal names the regeneration fix; `unfold_v_q`'s four
   shape refusals exist because `promise_in_bounds` gathers clip SILENTLY on
   an out-of-bounds index, so an unrefused shape is a wrong answer rather
   than an error.
 * **`nspinor = 2` means NONCOLLINEAR, not spin-orbit.** `SymMaps` and
   `unfold_psi` branch on the spinor axis, never on SOC.
-* **The TRS check is deliberately non-circular.** It uses no `unfold_psi`,
-  no `SymMaps`, no `U_spinor`, no τ: it compares two real-space densities.
-  A bug in the τ phase, in `U_spinor`, or in the umklapp vector cannot move
-  its verdict. That is what makes it a measurement.
+* **The 2c TRS check never tests a state made with an antiunitary row.** Raw
+  `k/-k` pairs and TRIM closure are direct. If only a spatial partner exists,
+  the check uses the canonical spatial unfold and labels the result
+  conditional; a mismatch disables antiunitary unfolding but is not assigned
+  to TRS alone. The metric is the occupied one-particle-subspace residual in
+  G space, invariant to band phases and rotations inside degenerate blocks.
+  TRIM-only or absent evidence is inconclusive and disables antiunitary
+  unfolding; only an explicit `LORRAX_TRS_CHECK=0` restores permissive mode.
 * **The q axis CONSUMES that verdict; it never re-derives or assumes it.**
   `QgridTrsPolicy` is the whole of the q-axis time-reversal contract, and
   `trs_measured` is keyword-only with no default so a caller who has not

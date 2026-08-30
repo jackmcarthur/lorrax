@@ -39,7 +39,13 @@ import pytest
 
 from _deck_stub import (DECK_WFN, DECKS, SYMMAPS_ATTRS, deck_available,
                         deck_path, read_deck)
-from symmetry_maps import KStarMap, SymMaps, star_broadcast, star_select
+from symmetry_maps import (
+    KStarMap,
+    SymMaps,
+    build_spatial_operator_tables,
+    star_broadcast,
+    star_select,
+)
 from symmetry_maps.maps import _star_conj_flags, _star_row_order
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -268,28 +274,70 @@ def test_symmaps_no_longer_publishes_the_lowest_sym_parent_map(deck):
     np.testing.assert_array_equal(grid, np.asarray(sym.unfolded_kpts))
 
 
-def test_the_incomplete_symmetry_warning_survived_the_drop():
-    """RED TWIN for the removal: the diagnostic did NOT go with the loop.
+def test_incomplete_symmetry_metadata_refuses_instead_of_fabricating_gamma():
+    """An uncovered full-k row must never inherit stored Γ/identity.
 
     The retired loop carried the class's only "WFN symmetry data
-    incomplete" warning.  Deleting a loop and its warning together is how a
-    cleanup silently removes coverage, so the warning moved into
+    incomplete" diagnostic.  Its successor in
     ``find_symmetry_ops_simple``, whose ``matched`` array already computes
     the same predicate (``sym_mats_k`` is a group, so "some S maps k_full
     into the IBZ" and "some S maps some IBZ k onto k_full" have the same
-    truth value).
+    truth value), used to warn and leave the index arrays at their zero
+    initialization.  That silently substituted Γ/identity wavefunctions.
 
     Constructed synthetically: Γ-only IBZ against a 2x2x1 grid, so three of
-    four full-BZ points are unreachable.  The message must name the COUNT,
-    the op count and the first offending k — "incomplete" alone sends the
-    reader to go and print them.
+    four full-BZ points are unreachable.  The refusal names the count and
+    first offending k.
     """
-    with pytest.warns(RuntimeWarning, match="WFN symmetry data incomplete"):
-        sym = SymMaps(_MinimalDeck())
-    # ...and the fallback is the one this function always used: IBZ k 0
-    # with the identity, NOT the retired loop's nearest-neighbour pick.
-    assert int(np.asarray(sym.irr_idx_k).max()) == 0
-    assert int(np.asarray(sym.sym_idx_k).max()) == 0
+    with pytest.raises(ValueError, match=r"incomplete: 3 of 4"):
+        SymMaps(_MinimalDeck())
+
+
+def test_operator_tables_do_not_require_a_complete_k_map():
+    ops = build_spatial_operator_tables(_MinimalDeck())
+    assert ops.sym_matrices.shape == (2, 3, 3)
+    assert ops.sym_mats_k.shape == (4, 3, 3)
+    assert ops.U_spinor.shape == (2, 2, 2)
+
+
+class _IdentityOnlyTrReducedDeck:
+    def __init__(self, *, trs_holds=True):
+        self.kpoints = np.asarray([
+            [0.0, 0.0, 0.0],
+            [0.25, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+        ])
+        self.kgrid = np.asarray([4, 1, 1], dtype=np.int32)
+        self.shift = np.zeros(3)
+        self.nkpts = 3
+        self.ntran = 1
+        self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
+        self.translations = np.zeros((1, 3))
+        self.avec = np.eye(3)
+        self.atom_types = np.array([1])
+        self.atom_crys = np.zeros((1, 3))
+        self.trs_holds = bool(trs_holds)
+
+
+def test_identity_only_tr_reduced_mesh_uses_the_synthesized_minus_identity():
+    sym = SymMaps(_IdentityOnlyTrReducedDeck())
+    assert sym.nk_tot == 4
+    assert int(sym.irr_idx_k[3]) == 1
+    assert int(sym.sym_idx_k[3]) == 1  # synthesized time-reversal row
+
+
+def test_identity_only_tr_reduced_mesh_refuses_when_reference_breaks_trs():
+    with pytest.warns(RuntimeWarning, match="TIME-REVERSAL SYMMETRY IS BROKEN"):
+        with pytest.raises(ValueError, match=r"1 of 4 full-BZ k-points"):
+            SymMaps(_IdentityOnlyTrReducedDeck(trs_holds=False))
+
+
+def test_identity_full_grid_rejects_duplicate_coordinates():
+    deck = _IdentityOnlyTrReducedDeck()
+    deck.kpoints = np.concatenate([deck.kpoints, deck.kpoints[:1]], axis=0)
+    deck.nkpts = 4
+    with pytest.raises(ValueError, match="coordinates do not cover"):
+        SymMaps(deck)
 
 
 def test_the_in_tree_decks_do_not_trip_that_warning():
