@@ -171,6 +171,31 @@ def test_close_logging_is_debug_only(monkeypatch, value, expected):
     assert slab_ffi._close_log_level() == expected
 
 
+def test_read_kernel_factory_reuses_one_shape_and_only_splits_a_tail():
+    """Repeated pole slabs must reuse one shard-map/JIT factory product."""
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    common = dict(
+        mesh_shape=(1, 1), axis_count_per_dim=(0, 0), axis_flat=())
+    slab_ffi._get_read_sm.cache_clear()
+    batch = jax.ShapeDtypeStruct((4, 8), np.dtype(np.complex128))
+    tail = jax.ShapeDtypeStruct((2, 8), np.dtype(np.complex128))
+
+    first = slab_ffi._get_read_sm(mesh, P(None, None),
+                                  out_struct=batch, **common)
+    repeat = slab_ffi._get_read_sm(mesh, P(None, None),
+                                   out_struct=batch, **common)
+    shorter = slab_ffi._get_read_sm(mesh, P(None, None),
+                                    out_struct=tail, **common)
+    info = slab_ffi._get_read_sm.cache_info()
+    assert first is repeat
+    assert shorter is not first
+    assert (info.hits, info.misses, info.currsize) == (1, 2, 2)
+
+
 def test_deleted_backend_modules_are_gone():
     """The two retired backends are deleted, not merely unreachable.
 

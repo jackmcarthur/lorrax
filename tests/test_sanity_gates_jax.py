@@ -145,6 +145,22 @@ def test_device_gate_cost_is_one_fetch():
     assert abs(max_abs - 1.0) < 1e-12
 
 
+def test_fresh_equal_named_sharding_hits_the_finite_kernel_cache():
+    """NamedSharding identity churn must not multiply sanity kernels."""
+    mesh = _mesh(1, min(4, len(jax.devices())))
+    first = NamedSharding(mesh, P(None, "y"))
+    second = NamedSharding(mesh, P(None, "y"))
+    assert first is not second
+    assert first == second
+    assert hash(first) == hash(second)
+
+    sanity._FINITE_STATS_CACHE.clear()
+    one = sanity._finite_stats_fn((4, 4), np.dtype(np.complex128), first)
+    two = sanity._finite_stats_fn((4, 4), np.dtype(np.complex128), second)
+    assert one is two
+    assert len(sanity._FINITE_STATS_CACHE) == 1
+
+
 def test_off_switch_skips_device_work():
     prev = os.environ.get("LORRAX_SANITY")
     os.environ["LORRAX_SANITY"] = "0"

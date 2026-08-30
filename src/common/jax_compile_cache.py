@@ -39,7 +39,11 @@ Knobs (all optional):
                                           naive shared-dir design.  This is
                                           the deadlock reproducer; never use
                                           it in production.
-  ``LORRAX_DEBUG_PRINT=1``              — also turn on JAX cache-miss logging.
+  ``JAX_EXPLAIN_CACHE_MISSES=1``        — opt in to JAX cache-miss explanations.
+                                          This is intentionally independent of
+                                          ``LORRAX_DEBUG_PRINT``: explanation
+                                          construction is diagnostic work, not
+                                          ordinary stage logging.
   ``LORRAX_JAX_CACHE_KEYDUMP=<dir>``    — every rank writes the SET of
                                           persistent-cache keys it asked
                                           about to ``<dir>/rank{i}_of{N}.json``
@@ -1655,9 +1659,6 @@ def ensure_jax_compile_cache() -> None:
             # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
             # desynchronises AutotunerPass' modulo-P work split.
             _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
-        from runtime import debug_print_enabled
-        if debug_print_enabled():
-            _jax.config.update("jax_explain_cache_misses", True)
     except Exception as exc:
         if proc_idx == 0:
             _say(f"DISABLED: jax.config.update failed ({exc}).")
