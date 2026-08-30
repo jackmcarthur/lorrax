@@ -29,22 +29,26 @@ output wavefunction carriers as
 use the planner's unit-amplitude fallback. Pole damping includes the requested
 Sigma regularization exactly once.
 
-The service's tail-refined validation lattice uses unweighted count quantiles with the
-fixed per-axis bands 0--1%, 1--4%, 4--8%, 8--96%, 96--99%, and 99--100%.
-The distributed spatial-pole pre-reduction instead uses a fixed compact
-coordinate `x/(x+eta)` for positive pole energy and intrinsic width. Each
-local shard deposits mass and complex first moments onto at most
-`lattice_bins^2` cells before any collective. One fixed-size `psum` per
-leading pole produces the global centroids. Thus the communicated cell count
-is independent of process count, state count, and spatial pole extent; no raw
-state--spatial-pole support is gathered.
-The explicit state--leading-pole tuples are then split by delivered-mass
-quantiles (up to four conduction and three valence windows). Each tuple block
-is an executable selector, not merely a fitting surrogate. The MPA executor
-factors it into a small coefficient table over states and the resident pole
-batch, runs the canonical `build_G_tau` and screened-interaction synthesis for
-those components, and sums them before the canonical Sigma transform and band
-projection. No large spatial tensor acquires a tuple axis.
+The service's tail-refined validation lattice uses unweighted count quantiles
+with the fixed per-axis bands 0--1%, 1--4%, 4--8%, 8--96%, 96--99%, and
+99--100%. The distributed spatial-pole pre-reduction instead uses a fixed
+compact coordinate `x/(x+eta)` for positive pole energy and intrinsic width.
+Each local shard deposits mass and complex first moments onto at most
+`lattice_bins^2` cells in each of two fixed pole intervals before any
+collective. Fixed-size `psum` operations produce the global centroids. Thus
+the communicated cell count is independent of process count, state count,
+and spatial pole extent; no raw state--spatial-pole support is gathered.
+
+Each causal branch is covered by two to four ordinary Cartesian product
+windows, `state interval x pole interval` (a degenerate one-pole branch may
+need only one). A window selects its states with a plain interval mask and its
+leading poles with a plain interval bound. There are no explicit state--pole
+tuple lists, membership predicates, or frequency staircases. The crossing
+band stays inside its resonant product window. Its `eta`-damped reciprocal is
+integrated by the positive real-time quadrature; candidate density follows
+the oscillatory bandwidth relative to the `eta` floor. An exact small integer
+selection chooses one candidate rule per window while enforcing at most 200
+total `(window, tau)` pairs across all branches.
 
 The production target is **envelope-relative**. It multiplies the
 noncancelling inverse-gap planning envelope by the unchanged 0.8 safety factor
@@ -55,28 +59,40 @@ target. When a reference Sigma is supplied, the planner reports the measured
 reference it reports that calibration as unavailable. Since the initial
 difficulty is envelope divided by delivered mass, mass-times-difficulty
 apportionment intentionally gives each retained window the same normalized
-envelope residual target; the later crossing-window redistribution remains a
-separate safety step. Sign-definite windows use the minimax
-service's incumbent `fit_damped_reciprocal`. Crossing windows use the
-amplification-capped fixed-phase service fit over the union of the incumbent
-MPA positive-time rule, the pane/HGL crossing family, and the service time
-dictionary. The refined lattice validates the selected rule. Acceptance gates
-the maximum amplification, while p99 remains diagnostic. The adapter also
-refuses a rule when either separately executed `G` or `W` exponential exceeds
-the log-growth cap, even if their product would cancel. A missed crossing
-budget or safety gate may use exact
-reciprocal summation when the failed block contains at most
-`max_direct_terms` tuples. That fallback is reported in direct-term currency and does not
-consume tau nodes; larger failed supports refuse.
+envelope residual target. Sign-definite windows use the minimax service's
+incumbent `fit_damped_reciprocal`; crossing windows use the `eta`-damped
+positive rule. The refined lattice validates every selected rule.
+
+Amplification multiplies runtime arithmetic noise, not the physical fit
+error. Acceptance is therefore
+
+```text
+residual <= target
+kappa_p99 * 6.0e-8 <= 0.05 * target
+```
+
+`6.0e-8` is the measured fp32-scale injected-noise figure from the trust
+study; the executor itself uses fp64, so it is conservative. The factor 0.05
+reserves five percent of the window's physical residual allowance for
+runtime noise. For example, a target of `8.26e-5` admits
+`kappa_p99 <= 68.8`. Peak amplification remains diagnostic and is not a
+fixed-cap acceptance gate. The adapter separately refuses a rule when either
+executed `G` or `W` exponential exceeds the log-growth cap, even if their
+product would cancel.
+
+This construction emits no direct terms. A refusal names the product window
+and the best achieved `(residual, kappa_p99)` pair. The separately configured
+`LORRAX_DELIVERED_MAX_DIRECT_TERMS` ceiling (default 32) remains in the shared
+driver contract and report as a fail-closed guard; the owner construction's
+target and achieved direct count are both zero.
 
 Every result is an ordinary `SharedSigmaWindow` consumed by the existing MPA
 window executor and `DeviceOmegaAccumulator`. The adapter converts the fitted
 time orientation to the executor convention, folds `exp(-eta*t_exec)` into
-each weight once, and retains the executor's global `-1` prefactor. Exact
-fallback rows reuse the canonical Green's-function builder and band
-projector, with the causal denominator evaluated at each required frequency
-and `exp(-eta*t)` replaced by the same single `-i eta` fold in that
-denominator.
+each weight once, and retains the executor's global `-1` prefactor. The pole
+interval and state mask remain independent executor selectors, so the
+streamed pole-batch walk evaluates their Cartesian product without adding a
+tuple axis to a large spatial tensor.
 
 ### Shared tau grid
 
@@ -87,11 +103,10 @@ export LORRAX_DELIVERED_TAU_GRID=shared
 ```
 
 to build one identical grid per causal branch and re-solve unrestricted
-complex weights for every window on that grid. Candidate times are the union
-of already accepted incumbent-discipline fits; progressively smaller shared
-prefixes are retained only when every refined residual and p99 amplification
-check still passes. The accepted free union, zero-padded per window, is the
-deterministic fallback when it fits under the node ceiling.
+complex weights for every window on that grid. Candidate times are the exact
+stable union of the already accepted free-window rules. Every refitted window
+must still satisfy its refined residual, p99 noise budget, and factor-growth
+gate.
 
 Reports keep the two cost currencies separate: `window_tau_pairs` is
 `sum_w n_tau(w)`, while `distinct_tau_count` sums the per-branch shared-grid
@@ -99,23 +114,22 @@ sizes. At execution, rows with the same exact tau grid and frequency block are
 fused: all component `G/W` transforms remain explicit, but the Sigma-side
 forward transform and band projection run once per distinct tau and resident
 pole batch. The run log reports both actual tau dispatches and the saved Sigma
-back-transforms. Exact reciprocal fallbacks are reported separately as
-`direct_term_count` and never silently priced as tau nodes.
+back-transforms. `direct_term_count` remains a separate reported currency and
+is zero for this construction.
 `max_nodes` is a global `window_tau_pairs` ceiling for the complete plan, not
 a per-window allowance. Shared-grid selection converts the remaining global
 budget to a per-branch grid ceiling before fitting, and a final fail-closed
-check pins the total. Direct terms have their own separately reported ceiling.
+check pins the total. Direct terms have their own separately reported ceiling
+and must remain zero.
 
 ## GN-PPM and time reversal
 
 GN-PPM presents its single fitted pole per spatial matrix element as a
 singleton leading pole axis. Degenerate one-pole measures therefore produce
-one executable window per causal branch without asking a quantile routine to
-invent empty bins. A tau-only one-pole tuple block is Cartesian-equivalent to
-that ordinary GN window. Exact direct fallback remains an explicit GN
-refusal; the direct executor currently belongs to the MPA streamed-pole
-pathway. MPA retains its fitted leading pole axis and may produce several
-windows.
+one Cartesian executable window per causal branch without asking a partition
+routine to invent empty bins. MPA retains its fitted leading pole axis and may
+produce several product windows. Both pathways assert that the delivered
+plan contains no direct rows before execution.
 
 Positive- and negative-frequency causal branches are always separate planner
 inputs. The adapter does not reconstruct one W half from the other, preserving
