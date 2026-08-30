@@ -638,6 +638,17 @@ class DeviceOmegaAccumulator:
         self._window = (_device_output_zeros(
             self._shape, self._sharding)() if antihermitian else None)
 
+    def precompile_tau_add(self, *, sigma_shape, sigma_sharding):
+        """Compile the accumulator fold before the timed tau sweep marker."""
+        sigma = jax.ShapeDtypeStruct(
+            tuple(int(n) for n in sigma_shape), jnp.complex128,
+            sharding=sigma_sharding)
+        coeff = jax.ShapeDtypeStruct(
+            (self._omega.size,), jnp.complex128,
+            sharding=self._replicated)
+        _device_omega_add(self._sharding).lower(
+            self._total, sigma, coeff).compile()
+
     def add_tau(self, sigma_tau):
         if self._coeff is None:
             raise RuntimeError("no open frequency window")

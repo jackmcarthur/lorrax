@@ -19,6 +19,9 @@ and the sum of ``(window, tau)`` pairs never exceeds 200.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import os
+import pickle
 import time
 
 import jax
@@ -43,6 +46,7 @@ FACTOR_GROWTH_CAP = 30.0
 RUNTIME_NOISE_EPSILON = 6.0e-8
 AMPLIFICATION_NOISE_SAFETY = 0.05
 MAX_WINDOW_TAU_PAIRS = 200
+_PLAN_CACHE_VERSION = 1
 
 # These tolerances generate candidate rules.  Acceptance is based only on the
 # achieved delivered residual and the noise-budget inequality above.
@@ -52,6 +56,94 @@ _FIT_TOLERANCE_LADDER = (
     5.0e-4, 3.0e-4, 2.0e-4, 1.0e-4, 7.5e-5, 5.0e-5,
     3.0e-5, 2.0e-5, 1.0e-5,
 )
+
+
+def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
+                            pair_ceiling, grid_mode, lattice_bins):
+    """Hash the measured numerical problems that determine fitted rules."""
+    digest = hashlib.sha256()
+
+    def add_array(value):
+        array = np.ascontiguousarray(np.asarray(value))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(repr(array.shape).encode("ascii"))
+        digest.update(array.view(np.uint8))
+
+    digest.update(f"delivered-plan-cache-v{_PLAN_CACHE_VERSION}".encode())
+    digest.update(repr((float(eta), float(target), float(safety),
+                        float(factor_cap), int(pair_ceiling), str(grid_mode),
+                        int(lattice_bins), _FIT_TOLERANCE_LADDER)).encode())
+    for spec in specs:
+        branch = spec["branch"]
+        digest.update(repr((
+            spec["name"], spec["kind"], float(spec["pole_sign"]),
+            int(spec["pole_interval"]), tuple(spec["state_interval"]),
+            tuple(spec["pole_bounds"]), float(spec["E_ref_A"]),
+            float(spec["envelope"]), branch.tag, branch.space,
+            bool(branch.neg_omega_half))).encode())
+        for key in ("pole_indices", "state_indices", "raw_state_energy"):
+            add_array(spec[key])
+        for problem in (spec["problem"], spec["validation"]):
+            for value in (problem.frequencies, problem.internal_sums,
+                          problem.cell_masses):
+                add_array(value)
+            digest.update(repr((float(problem.excluded_radius),
+                                float(problem.normalization_floor),
+                                bool(problem.zero_weight_sum))).encode())
+    return digest.hexdigest()
+
+
+def _load_plan_cache(path, fingerprint, n_specs):
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as stream:
+            payload = pickle.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, pickle.PickleError, EOFError) as exc:
+        raise RuntimeError(
+            f"could not read delivered-plan cache {path!r}: {exc}") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("version") != _PLAN_CACHE_VERSION
+            or payload.get("fingerprint") != fingerprint):
+        return None
+    fits = payload.get("fits")
+    if not isinstance(fits, list) or len(fits) != int(n_specs):
+        raise RuntimeError(
+            f"delivered-plan cache {path!r} has an invalid fit census")
+    return (fits, int(payload["free_pairs"]),
+            float(payload["required_cost"]),
+            int(payload["window_tau_pairs"]))
+
+
+def _save_plan_cache(path, fingerprint, fits, free_pairs, required_cost,
+                     window_tau_pairs):
+    """Atomically publish one rank's fitted-rule receipt."""
+    if path is None or process_rank() != 0:
+        return
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary = f"{path}.tmp.{os.getpid()}"
+    payload = {
+        "version": _PLAN_CACHE_VERSION,
+        "fingerprint": fingerprint,
+        "fits": fits,
+        "free_pairs": int(free_pairs),
+        "required_cost": float(required_cost),
+        "window_tau_pairs": int(window_tau_pairs),
+    }
+    try:
+        with open(temporary, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _per_branch(values, branches, name):
@@ -702,6 +794,7 @@ def build_delivered_sigma_windows(
     max_direct_terms: int = 32,
     measures_by_branch=None,
     mesh_xy=None,
+    plan_cache_path=None,
 ):
     """Build the owner-specified product-window delivered Sigma plan."""
     del crossing_eps_q, use_shipped_minimax_tables, pane_times
@@ -858,30 +951,44 @@ def build_delivered_sigma_windows(
 
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
-    candidates_by_window = [
-        _candidate_rules(spec, eta, pair_ceiling, factor_cap)
-        for spec in specs]
-    fits, free_pairs, required_cost = _select_rules(
-        specs, candidates_by_window, total_absolute, pair_ceiling)
-
-    if grid_mode == "shared":
-        for report in branch_reports:
-            start, stop = report["plan_start"], report["plan_stop"]
-            if stop > start:
-                _share_branch_grid(
-                    specs[start:stop], fits[start:stop], eta, factor_cap)
-        window_tau_pairs = sum(int(fit["times"].size) for fit in fits)
-        if window_tau_pairs > pair_ceiling:
-            refused_index = int(np.argmax(
-                [fit["times"].size for fit in fits]))
-            spec, fit = specs[refused_index], fits[refused_index]
-            raise RuntimeError(
-                f"delivered product window {spec['name']!r} refused: "
-                f"achieved (residual={fit['metrics'][0]:.6g}, "
-                f"amplification_p99={fit['metrics'][1]:.6g}); shared grid "
-                f"needs {window_tau_pairs} pairs, ceiling={pair_ceiling}")
+    cache_fingerprint = _plan_cache_fingerprint(
+        specs, eta=eta, target=target, safety=safety,
+        factor_cap=factor_cap, pair_ceiling=pair_ceiling,
+        grid_mode=grid_mode, lattice_bins=lattice_bins)
+    cached = _load_plan_cache(
+        plan_cache_path, cache_fingerprint, len(specs))
+    cache_status = "disabled" if plan_cache_path is None else "hit"
+    if cached is not None:
+        fits, free_pairs, required_cost, window_tau_pairs = cached
     else:
-        window_tau_pairs = free_pairs
+        cache_status = "disabled" if plan_cache_path is None else "miss"
+        candidates_by_window = [
+            _candidate_rules(spec, eta, pair_ceiling, factor_cap)
+            for spec in specs]
+        fits, free_pairs, required_cost = _select_rules(
+            specs, candidates_by_window, total_absolute, pair_ceiling)
+
+        if grid_mode == "shared":
+            for report in branch_reports:
+                start, stop = report["plan_start"], report["plan_stop"]
+                if stop > start:
+                    _share_branch_grid(
+                        specs[start:stop], fits[start:stop], eta, factor_cap)
+            window_tau_pairs = sum(int(fit["times"].size) for fit in fits)
+            if window_tau_pairs > pair_ceiling:
+                refused_index = int(np.argmax(
+                    [fit["times"].size for fit in fits]))
+                spec, fit = specs[refused_index], fits[refused_index]
+                raise RuntimeError(
+                    f"delivered product window {spec['name']!r} refused: "
+                    f"achieved (residual={fit['metrics'][0]:.6g}, "
+                    f"amplification_p99={fit['metrics'][1]:.6g}); shared grid "
+                    f"needs {window_tau_pairs} pairs, ceiling={pair_ceiling}")
+        else:
+            window_tau_pairs = free_pairs
+        _save_plan_cache(
+            plan_cache_path, cache_fingerprint, fits, free_pairs,
+            required_cost, window_tau_pairs)
 
     output = []
     for spec, fit in zip(specs, fits):
@@ -987,6 +1094,9 @@ def build_delivered_sigma_windows(
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
         "plan_seconds": time.perf_counter() - started,
+        "plan_cache_status": cache_status,
+        "plan_cache_path": plan_cache_path,
+        "plan_cache_fingerprint": cache_fingerprint,
         "branches": branch_reports,
         **geometry,
     }

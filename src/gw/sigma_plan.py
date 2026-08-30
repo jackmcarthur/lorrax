@@ -59,5 +59,17 @@ def resolve_delivered_max_direct_terms() -> int:
     return ceiling
 
 
-__all__ = ["resolve_delivered_max_direct_terms", "resolve_delivered_tau_grid",
+def resolve_delivered_plan_cache() -> str | None:
+    """Resolve the optional measured-problem delivered-plan cache path.
+
+    The cache stores only fitted quadrature rules.  Its fingerprint is made
+    after the live pole-measure pass, so changing restart tensors or any
+    planning input invalidates the receipt instead of reusing stale nodes.
+    """
+    raw = os.environ.get("LORRAX_DELIVERED_PLAN_CACHE", "").strip()
+    return os.path.abspath(os.path.expanduser(raw)) if raw else None
+
+
+__all__ = ["resolve_delivered_max_direct_terms",
+           "resolve_delivered_plan_cache", "resolve_delivered_tau_grid",
            "resolve_sigma_plan"]

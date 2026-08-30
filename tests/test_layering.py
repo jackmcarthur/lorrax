@@ -861,6 +861,7 @@ _L1_LIBRARY_ENV_READS = {
     # resolve_delivered_max_direct_terms -- explicit, fail-closed selection
     # of the opt-in planner, its branch-grid policy, and bounded escape hatch.
     "gw.sigma_plan": {
+        "LORRAX_DELIVERED_PLAN_CACHE",
         "LORRAX_DELIVERED_MAX_DIRECT_TERMS",
         "LORRAX_DELIVERED_TAU_GRID",
         "LORRAX_SIGMA_PLAN",

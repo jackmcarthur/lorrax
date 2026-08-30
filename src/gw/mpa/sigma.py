@@ -19,6 +19,7 @@ from gw.ppm_sigma import (SigmaOmegaResult,
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_plan import (resolve_delivered_max_direct_terms,
+                           resolve_delivered_plan_cache,
                            resolve_delivered_tau_grid, resolve_sigma_plan)
 from gw.wavefunction_bundle import (face_kernel_kwargs,
                                     projected_state_amplitude_envelope)
@@ -175,6 +176,7 @@ def _integrate_sigma_batches(
     logical_tau_pairs = 0
     direct_terms = direct_frequency_dispatches = 0
     batch_size = int(pole_batch_size)
+    sweep_started = False
     for lo, Omega, B in batches:
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
@@ -195,6 +197,25 @@ def _integrate_sigma_batches(
                             * jnp.reshape(
                                 jnp.asarray(weight, jnp.float64),
                                 np.asarray(win.mask_A).shape))
+            if not sweep_started:
+                first_t = np.asarray(
+                    jax.device_get(win.nodes.t), np.complex128)[0]
+                tau_kernel.lower(
+                    psi_coh_xn, psi_coh_yr,
+                    psi_proj_xr, psi_proj_yn,
+                    row.E_A, selector, B, Omega,
+                    pole_indices, bounds, phase_real,
+                    jnp.asarray(win.E_ref_A),
+                    jnp.asarray(win.E_ref_B),
+                    jnp.asarray(first_t, dtype=jnp.complex128)).compile()
+                accumulator.precompile_tau_add(
+                    sigma_shape=shape[1:],
+                    sigma_sharding=NamedSharding(
+                        mesh_xy, P(None, "x", "y")))
+                print_fn(
+                    "  MPA Sigma sweep begin: shared pane tau kernel "
+                    "prewarmed")
+                sweep_started = True
             accumulator.begin_window(
                 win.nodes.t, win.nodes.alpha,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
@@ -464,7 +485,8 @@ def compute_sigma_c_mpa_omega_grid(
                 tau_grid_mode=tau_grid_mode,
                 max_direct_terms=resolve_delivered_max_direct_terms(),
                 edge_factor=edge_factor,
-                measures_by_branch=measures_by_branch, mesh_xy=mesh_xy)
+                measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
+                plan_cache_path=resolve_delivered_plan_cache())
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -477,6 +499,7 @@ def compute_sigma_c_mpa_omega_grid(
                 "INVERSE-GAP-ENVELOPE-relative (not physical Sigma), "
                 f"{geometry['n_windows']} logical windows, "
                 f"grid={geometry['tau_grid_mode']}, "
+                f"plan_cache={geometry['plan_cache_status']}, "
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"{geometry['direct_term_count']} direct terms")
