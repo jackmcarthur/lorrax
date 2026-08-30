@@ -578,11 +578,15 @@ def compute_sigma_c_mpa_omega_grid(
             # own arm: same configured census batches, summaries, builder
             # arguments, and executor plan.
             summaries = []
+            # One unfold, sliced per batch — same reason as batches():
+            # per-batch unfold recompiles a constant-baked kernel each
+            # pass and turned the seconds-scale planner into minutes.
+            Omega_all, B_all = reader.read(
+                slice(0, int(n_poles)), unfold=True, return_sharded=True,
+                to_unit="Ry")
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
-                Omega, B = reader.read(
-                    slice(lo, hi), unfold=True, return_sharded=True,
-                    to_unit="Ry")
+                Omega, B = Omega_all[lo:hi], B_all[lo:hi]
                 summaries.extend(summarize_sigma_poles(
                     Omega, B, branches,
                     regularization_width_ry=regularization_width_ry,
