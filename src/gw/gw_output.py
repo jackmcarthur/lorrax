@@ -60,14 +60,7 @@ class GWResults:
     E_dft_ry : np.ndarray, (nk, nb)
         DFT reference eigenvalues (Rydberg).
     kin_ion_ry : np.ndarray, (nk, nb, nb)
-        H₀ = T + V_ion (+ V_H when ``kin_ion_has_hartree``) matrix (Ry).
-    kin_ion_has_hartree : bool
-        True when ``kin_ion.h5`` carried ``has_hartree=True``, i.e. the
-        exact FFT-grid mean-field V_H is already inside ``kin_ion_ry``.
-        The writer then adds no separate *scalar* Hartree term;
-        ``sigma_dispatch`` has already removed that part from ``sig_h``.
-        Independent non-scalar direct fields remain in ``sig_h`` and this
-        flag does not suppress them.
+        Pristine T + V_ion matrix (Ry); V_H is always separate and live.
     band_start, band_stop : int
         0-based band window [band_start, band_stop).
     use_ppm : bool
@@ -125,9 +118,6 @@ class GWResults:
     efermi_ev: float | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
-    kin_ion_has_hartree: bool = False
-    #: 'stored' | 'folded' | 'isdf' | 'gspace' — see file_io.kin_ion.
-    hartree_source: str | None = None
     # Optional fixed-Sigma eigenvalue-self-consistent ladder.  This is an
     # additional result beside the ordinary one-shot E_qp_ry/U_qp pair;
     # screening and Sigma were not rebuilt to obtain it.
@@ -951,7 +941,7 @@ def _runnable_modes_building(*channels: SigmaChannel) -> str:
 # WHAT IS NOT HERE, and why it is not manufactured.  ``qp_static_cohsex_ev``
 # is H₀ + Σ_SX + Σ_COH, and those two channels are built only by
 # ``compute_mode = cohsex`` (``sigma_dispatch``: the dynamic branch calls
-# ``compute_v_h_sigma_x``, which touches W not at all).  A PPM run could
+# ``compute_sigma_x``, which touches W not at all).  A PPM run could
 # be made to produce SOMETHING for that name — its Σ_x + Σ_c(ω=0) is also
 # a static self-energy — but that is a different operator, it already has
 # a name here (``qp_omega0_ev``), and a plot that plots one quantity twice
@@ -1154,8 +1144,6 @@ def _warn_on_unphysical_h0(
     e_dft_ev: np.ndarray,
     kin_ion_diag_ev: np.ndarray,
     hartree_diag_ev: np.ndarray,
-    kin_ion_has_hartree: bool = False,
-    hartree_source: str | None = None,
     print_fn=print,
 ) -> np.ndarray:
     """Flag a corrupted mean-field H₀ before it reaches eqp{0,1}.dat.
@@ -1164,26 +1152,13 @@ def _warn_on_unphysical_h0(
     pseudopotential system with semicore states both terms run to several
     hundred eV of opposite sign and their sum is only tens of eV (MoS₂:
     ⟨T+V_ion+V_NL⟩ = −502 eV, ⟨V_H⟩ = +461 eV, H₀ = −42 eV).  ``kin_ion``
-    comes from an exact plane-wave evaluation (``gw.kin_ion_io``) while
-    ``V_H`` is an ISDF centroid quadrature (``cohsex_sigma``'s ``hartree``
-    kernel), so *any* relative error in the ISDF pair-product
-    representation lands on H₀ multiplied by ~500 eV.  A 10 % ISDF error
-    — which an under-resolved centroid set will happily produce while
-    every stage still reports "successful" — is a 50 eV error in every QP
-    energy.
+    and ``V_H`` both come from exact plane-wave/FFT-grid evaluations.
 
     The cheap, assumption-free detector is the implied exchange-correlation
     potential ``V_xc = E_DFT − H₀``: the DFT eigenvalue identity
     ``E_DFT = ⟨T+V_ion+V_NL⟩ + ⟨V_H⟩ + ⟨V_xc⟩`` is exact, so a converged
     run must reproduce a physical ``V_xc`` band-by-band.  Returns the
     implied ``V_xc`` (nk, nb) in eV so callers can log it.
-
-    The identity is mode-agnostic on purpose: when ``kin_ion_has_hartree``
-    the V_H term already lives inside ``kin_ion_diag_ev`` and
-    ``hartree_diag_ev`` is zero, so the same sum and the same window
-    still apply.  Only the diagnosis printed on failure differs — an
-    exact-V_H run that trips this gate is NOT an ISDF convergence
-    problem, and saying so would send the reader down the wrong path.
 
     **Called from exactly one place:** ``eqp_bgw.assemble_eqp``, on the
     arrays the V_H seam just resolved.  Both eqp entry points (this
@@ -1203,41 +1178,20 @@ def _warn_on_unphysical_h0(
             | (implied_vxc_ev > _VXC_IMPLIED_MAX_EV)
         )
     )
-    _exact = bool(kin_ion_has_hartree) or (
-        hartree_source in ("stored", "gspace", "folded"))
-    _src = {
-        "folded": "kin_ion[exact V_H folded in]",
-        "stored": "kin_ion + V_H[exact, stored]",
-        "gspace": "kin_ion + V_H[exact, on-the-fly]",
-        "isdf":   "kin_ion + V_H[ISDF]",
-    }.get(hartree_source,
-          "kin_ion[exact V_H folded in]" if kin_ion_has_hartree
-          else "kin_ion + V_H[ISDF]")
     print_fn(
-        f"  H0 check: implied Vxc = E_DFT - ({_src}) in "
+        "  H0 check: implied Vxc = E_DFT - "
+        "(kin_ion + V_H[exact, live G-space]) in "
         f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
     )
     if n_bad == 0:
         return implied_vxc_ev
     k_bad, n_band_bad = np.unravel_index(
         int(np.argmax(np.abs(implied_vxc_ev))), implied_vxc_ev.shape)
-    if _exact:
-        _diagnosis = (
-            "H0 is fully exact here (T + V_ion + V_NL + V_H, all plane-wave / "
-            "FFT-grid), so this is NOT an ISDF convergence problem and raising "
-            "the centroid count will not help.  Look instead at whether "
-            "kin_ion.h5 was generated from THIS run's input file: a Coulomb "
-            "truncation mismatch (sys_dim), a wrong occupied-band count in the "
-            "density, or a WFN/deck mismatch are the ways this branch fails."
-        )
-    else:
-        _diagnosis = (
-            "Most likely cause: the ISDF centroid basis is too small to resolve "
-            "<nk|V_H|nk> (V_H is a centroid quadrature; kin_ion is exact), so "
-            "the ~500 eV cancellation in H0 does not close.  The durable fix is "
-            "to regenerate kin_ion.h5 with the exact V_H folded in "
-            "(gw.kin_ion_io, default); the stopgap is more centroids."
-        )
+    _diagnosis = (
+        "H0 is fully exact here, so raising the centroid count will not help. "
+        "Check that kin_ion.h5 and WFN.h5 came from this deck, including "
+        "sys_dim and the occupied-band count."
+    )
     # Emitted through ``common.sanity.warn`` so this failure carries the
     # ``*** LORRAX SANITY FAILURE`` grep token every other gate in the
     # tree uses, and so ``LORRAX_SANITY=strict`` stops the run here
@@ -1515,12 +1469,6 @@ def write_results(
     # per (k, n).  Column labels switch on mode: COHSEX prints
     # sigSX/sigCOH/sigTOT/VH; PPM prints sigX/sigC/sigXC/VH (same array
     # slots, relabelled).  The driver passes the right arrays for each mode.
-    #
-    # NOTE on the VH column when ``kin_ion_has_hartree``: its scalar charge
-    # part is 0.000 by design because that V_H was folded into kin_ion at
-    # generation time.  A separately resolved non-scalar direct field may
-    # remain and is reported here; the folded scalar mean field is not
-    # separately recoverable from ``kin_ion.h5``.
     if results.use_ppm:
         sx_arr = results.sig_x
         diag_ry = results.sigma_c_diag_at_dft_ry
@@ -1640,18 +1588,7 @@ def write_results(
     kin_ion_diag_ev = (
         np.real(np.diagonal(_wedge(results.kin_ion_ry), axis1=1, axis2=2)) * r2e
     )
-    # ── H₀'s Hartree term ─────────────────────────────────────────────────
-    # Handed to the assembly POST-seam: ``sigma_dispatch`` has already
-    # resolved the scalar source into ``sig_h``.  That distinction matters
-    # when ``sig_h`` also carries a non-scalar direct field (the transverse
-    # photon Hartree term): applying the folded/stored scalar rule again
-    # would erase the residual from eqp0/eqp1 while leaving it in the live
-    # Hamiltonian.  ``hartree_already_resolved=True`` makes the shared eqp
-    # seam preserve this exact operator; the post-hoc CLI leaves the flag
-    # false and resolves its raw file column there.
-    # The mean-field (implied-V_xc) gate moved with it — ``assemble_eqp``
-    # runs ``_warn_on_unphysical_h0`` on the resolved arrays, so a broken
-    # H₀ still reports itself exactly once, with the same wording.
+    # ── H₀'s sole live G-space Hartree term ───────────────────────────────
     hartree_diag_ev = np.real(
         np.diagonal(_wedge(sig_h_out), axis1=1, axis2=2))
     hartree_scalar_diag_ev = np.real(
@@ -1757,9 +1694,6 @@ def write_results(
         e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
-        hartree_source=results.hartree_source,
-        kin_ion_has_hartree=results.kin_ion_has_hartree,
-        hartree_already_resolved=True,
         print_fn=print_fn,
     )
 
@@ -1828,10 +1762,7 @@ def write_results(
         not results.self_consistent
         and results.sigma_xc_at_dft_ev is not None
     ):
-        # The scalar part of ``sig_h`` is zero in folded exact-V_H mode;
-        # any independently resolved non-scalar direct field remains.  This
-        # is therefore the same H0 operator the eqp writer used in every
-        # source mode.
+        # Same live G-space H0 operator used by the eqp writer.
         h0_diag = (
             np.real(
                 np.diagonal(results.kin_ion_ry + results.sig_h, axis1=1, axis2=2)

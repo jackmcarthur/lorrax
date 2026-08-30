@@ -1476,18 +1476,6 @@ _DEFAULTS = {
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
-    # Where H0's mean-field Hartree term comes from.  H0 = kin_ion + V_H is
-    # a ~500 eV cancellation, so this is an explicit, validated choice
-    # rather than something inferred from what happens to be on disk.
-    #   auto   — stored 'v_hartree' array in kin_ion.h5 if present, else
-    #            the legacy folded file if that is what it is, else isdf
-    #   stored — require the exact array in kin_ion.h5 (raises if absent)
-    #   isdf   — the ISDF V_q[0] tile (cohsex_sigma's Hartree kernel);
-    #            distributed and in-loop capable, centroid-count dependent
-    #   gspace — rebuild the exact FFT-grid matrix on the fly this run
-    # See file_io/kin_ion.py's module docstring for the full contract and
-    # the scorecard's S.5 table for the accuracy each buys.
-    "hartree_source": "auto",
     # Three human-readable text outputs (always written), plus one opt-in
     # fixed-Sigma eigenvalue-self-consistent QP ladder:
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
@@ -2383,6 +2371,7 @@ _LEGACY_DECK_KEYS = frozenset({
     "slab_io",                      # refused (one transport now)
     "use_ffi_io",                   # refused (one transport now)
     "gspace_mode",                  # refused (one ψ(G) lifecycle now)
+    "hartree_source",               # refused (live G-space is the only path)
     # 2026-08-14: host-tile accumulation is the only Σ(ω) accumulation
     # mode, so the key steered nothing.  The removed ``kij_stream`` VALUE
     # keeps its dedicated parse refusal; other values warn-and-ignore.
@@ -2408,10 +2397,7 @@ _NORMALIZE_STR = {
     "ppm_invalid_mode",
     "ppm_model",
     "ppm_probe_chi_reuse",
-    # ``restart_q_storage`` normalises here and is VALIDATED at parse time
-    # against RESTART_Q_STORAGE, the same shape ``hartree_source`` uses: a
-    # key whose wrong value would otherwise surface as a refusal deep in the
-    # restart write, after the compute.
+    # ``restart_q_storage`` normalises here and is VALIDATED at parse time.
     "restart_q_storage",
     # ``qp_rotations_k_storage`` normalises and validates the same way, for
     # the same reason: its wrong value would otherwise surface as a refusal
@@ -3013,6 +2999,13 @@ def read_lorrax_input(filename: str) -> dict:
                 "cache, then releases the host ψ(G) tiles before the "
                 "r-chunk loop.  The former file_reread mode no longer "
                 "described a distinct execution path."
+            )
+        if section.get("hartree_source", fallback=None) is not None:
+            raise ValueError(
+                "Input key 'hartree_source' has been removed: Hartree is "
+                "always built live in G-space from the run's WFN.  Remove "
+                "the key; stored, folded, and ISDF Hartree paths no longer "
+                "exist."
             )
         # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
         # accumulation is the only mode, so the key steered nothing.  The
@@ -4627,8 +4620,6 @@ class LorraxConfig:
     sys_dim: int
     density_self_consistent: bool
     sc_on_ibz: bool
-    #: auto | stored | isdf | gspace — see HARTREE_SOURCES.
-    hartree_source: str
     #: DFT occupation smearing of the starting point ("mp1" = Methfessel-
     #: Paxton order 1, the only certified family).  REQUIRED as a pair when
     #: ``mpa_material_class = metal``; refused under insulator.  Deck keys,
@@ -5457,23 +5448,12 @@ class LorraxConfig:
             transverse_zeta_rcond=_transverse_zeta_rcond,
             gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
         )
-        # Validate the V_H source at PARSE time, not at the read that
-        # would otherwise fail 20 minutes into a 40-node run.
-        from file_io.kin_ion import HARTREE_SOURCES
-        _hartree_source = str(_g("hartree_source") or "auto").strip().lower()
-        if _hartree_source not in HARTREE_SOURCES:
-            raise ValueError(
-                f"hartree_source={_hartree_source!r} is not one of "
-                f"{HARTREE_SOURCES}.  H0 = kin_ion + V_H is a ~500 eV "
-                "cancellation; this key is not guessed.")
         # Same treatment, same reason, for the restart q-set.  Validated
         # here and NOT resolved here: ``auto`` resolves against the closure
         # answer, which needs the run's centroid set and its symmetry
         # tables, so the field below is the RAW request and
         # ``gw.restart_q_storage.resolve_restart_q_storage`` turns it into a
-        # mode once those exist.  (``hartree_source`` can be stored resolved
-        # because its ``auto`` resolves against a file already on disk; this
-        # one cannot, and the ``_raw`` suffix says which kind it is — the
+        # mode once those exist.  The ``_raw`` suffix says which kind it is — the
         # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
         from gw.restart_q_storage import RESTART_Q_STORAGE
         # The ``or`` fallback must agree with ``_DEFAULTS`` — it is reached
@@ -5573,7 +5553,6 @@ class LorraxConfig:
             sys_dim=int(_g("sys_dim")),
             density_self_consistent=bool(_g("density_self_consistent")),
             sc_on_ibz=bool(_g("sc_on_ibz")),
-            hartree_source=_hartree_source,
             occ_smearing_family=_occ_family,
             occ_smearing_width_ry=_occ_width,
             occupation_clamp_tol=float(_g("occupation_clamp_tol")),

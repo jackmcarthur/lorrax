@@ -2030,11 +2030,11 @@ def _sc_head_frequency_plan(config, quad):
         # never enter the Loewner sample vector.
         if bool(config.do_G0) and not np.any(mpa_z == 0.0 + 0.0j):
             head_omegas.append(0.0 + 0.0j)
-    else:
-        head_omegas = (
-            [complex(req.omega_ry) for req in requests]
-            if requests else [0.0 + 0.0j])
-    return requests, mpa_plan, head_omegas
+        return requests, mpa_plan, head_omegas
+    head_omegas = (
+        [complex(req.omega_ry) for req in requests]
+        if requests else [0.0 + 0.0j])
+    return requests, None, head_omegas
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:

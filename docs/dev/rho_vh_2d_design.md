@@ -372,15 +372,14 @@ Antipattern checks the benchmark must make explicit, not assume:
    win, no API change.)
 2. Land the `(nb_x, nb_y)`-blocked kernel behind the plan resolver, `local`
    default, `distributed` opt-in; gate at 1e-12 against `local`.
-3. Sharded output + consumer audit — **this is the real work**, not the GEMM.
-   `v_hartree (nk,nb,nb)` in `kin_ion.h5` and every reader, notably
-   `sigma_dispatch`'s `hartree_basis_rotation` (`einsum('kpm,kpq,kqn->kmn')`)
-   which today wants the full `(nb,nb)` per k.
+3. Keep the matrix live and sharded through its consumer. The former
+   `v_hartree (nk,nb,nb)` artifact and its readers were removed; `gw_jax`
+   now contracts the G-space field directly and rotates that live matrix.
 4. Flip the resolver default once the b600 and 12×12 numbers are in.
 5. Apply the same treatment to the two sibling sweeps that share the pattern:
    kin+ion (`kin_ion_io.py:741`) and dipole (`get_dipole_mtxels.py:919`,
    `(nk,3,nb,nb)` — 3× the W2 exposure).
 
 Separately, and independently of the above: bispinor ζ reuse (§7), and the
-`psi_rotation` wiring plus `invalidate_hartree_cache` discipline that turns
-fixed-density QSGW into charge self-consistency (§4).
+`psi_rotation` wiring that turns fixed-density QSGW into charge
+self-consistency (§4). There is no cross-run Hartree cache to invalidate.

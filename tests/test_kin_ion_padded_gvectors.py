@@ -69,7 +69,7 @@ from psp.dft_operators import (
 from psp.get_DFT_mtxels import compute_kinetic_k, compute_local_V_k
 
 
-def _write_kin_ion_provenance_twin(path, *, bispinor):
+def _write_kin_ion_provenance_twin(path, *, bispinor, folded=False):
     import h5py
 
     with h5py.File(path, "w") as h5:
@@ -77,20 +77,25 @@ def _write_kin_ion_provenance_twin(path, *, bispinor):
             "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
         if bispinor is not None:
             ds.attrs["bispinor"] = bool(bispinor)
+        if folded:
+            ds.attrs["has_hartree"] = True
 
 
-def test_kin_ion_provenance_refuses_wrong_or_missing_bispinor_before_read(
+def test_kin_ion_provenance_refuses_folded_and_mismatched_files_before_read(
         tmp_path, monkeypatch):
-    """Same-shaped two- and four-spinor mean fields are not interchangeable."""
+    """Only a pristine operator with matching spinor provenance is usable."""
     import h5py
+    import pytest
     from file_io import kin_ion as owner
 
-    true_path = tmp_path / "kin_ion_true.h5"
-    false_path = tmp_path / "kin_ion_false.h5"
-    legacy_path = tmp_path / "kin_ion_unstamped.h5"
-    _write_kin_ion_provenance_twin(true_path, bispinor=True)
-    _write_kin_ion_provenance_twin(false_path, bispinor=False)
-    _write_kin_ion_provenance_twin(legacy_path, bispinor=None)
+    good = tmp_path / "kin_ion_good.h5"
+    wrong = tmp_path / "kin_ion_wrong.h5"
+    unstamped = tmp_path / "kin_ion_unstamped.h5"
+    folded = tmp_path / "kin_ion_folded.h5"
+    _write_kin_ion_provenance_twin(good, bispinor=True)
+    _write_kin_ion_provenance_twin(wrong, bispinor=False)
+    _write_kin_ion_provenance_twin(unstamped, bispinor=None)
+    _write_kin_ion_provenance_twin(folded, bispinor=True, folded=True)
 
     reads = []
     original_getitem = h5py.Dataset.__getitem__
@@ -101,201 +106,21 @@ def test_kin_ion_provenance_refuses_wrong_or_missing_bispinor_before_read(
         return original_getitem(dataset, key)
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", record_payload_read)
-    import pytest
-    with pytest.raises(ValueError, match="requires a resolved Hartree source"):
-        owner.validate_kin_ion_against_run(
-            true_path, expected_bispinor=True,
-            selected_hartree_source="auto",
-            print_fn=lambda *_args: None)
     assert owner.validate_kin_ion_against_run(
-        true_path, expected_bispinor=True,
-        selected_hartree_source="isdf",
+        good, expected_bispinor=True,
         print_fn=lambda *_args: None)["bispinor"]
-
+    with pytest.raises(ValueError, match="has_hartree=True.*retired format"):
+        owner.validate_kin_ion_against_run(
+            folded, expected_bispinor=True, print_fn=lambda *_args: None)
     with pytest.raises(ValueError, match="bispinor=False.*bispinor=True"):
         owner.validate_kin_ion_against_run(
-            false_path, expected_bispinor=True,
-            selected_hartree_source="isdf",
-            print_fn=lambda *_args: None)
-    with pytest.raises(ValueError, match="no bispinor provenance stamp"):
+            wrong, expected_bispinor=True, print_fn=lambda *_args: None)
+    with pytest.raises(ValueError, match="no bispinor provenance"):
         owner.validate_kin_ion_against_run(
-            legacy_path, expected_bispinor=True,
-            selected_hartree_source="isdf",
-            print_fn=lambda *_args: None)
+            unstamped, expected_bispinor=True, print_fn=lambda *_args: None)
     assert reads == [], "provenance gate read a kin_ion matrix payload"
 
 
-def test_pauli_reference_hartree_requires_explicit_two_plus_four_receipts(
-        tmp_path):
-    import h5py
-    import pytest
-    from common.four_current_model import (
-        PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
-        PAULI_TWO_SPINOR_CHARGE_REPRESENTATION,
-        RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
-    )
-    from file_io import kin_ion as owner
-
-    path = tmp_path / "kin_ion_pauli_reference.h5"
-    with h5py.File(path, "w") as h5:
-        ds = h5.create_dataset(
-            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
-        ds.attrs["bispinor"] = True
-        ds.attrs["bispinor_gw_mode"] = (
-            PAULI_REFERENCE_BARE_TRANSVERSE_MODEL)
-        ds.attrs["charge_representation"] = (
-            PAULI_TWO_SPINOR_CHARGE_REPRESENTATION)
-        ds.attrs["spatial_current_representation"] = (
-            RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION)
-        vh = h5.create_dataset(
-            owner.HARTREE_DATASET,
-            data=np.zeros((1, 2, 2), dtype=np.complex128))
-        vh.attrs["matrix_nspinor"] = 2
-        vh.attrs["charge_representation"] = (
-            PAULI_TWO_SPINOR_CHARGE_REPRESENTATION)
-
-    owner.validate_kin_ion_against_run(
-        path, expected_bispinor=True,
-        expected_bispinor_gw_mode=PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
-        selected_hartree_source="stored", print_fn=lambda *_args: None)
-    with h5py.File(path, "r+") as h5:
-        h5[owner.HARTREE_DATASET].attrs["matrix_nspinor"] = 4
-    with pytest.raises(ValueError, match="requires matrix_nspinor=2"):
-        owner.validate_kin_ion_against_run(
-            path, expected_bispinor=True,
-            expected_bispinor_gw_mode=(
-                PAULI_REFERENCE_BARE_TRANSVERSE_MODEL),
-            selected_hartree_source="stored", print_fn=lambda *_args: None)
-
-
-def test_fractional_hartree_receipt_checks_support_and_wfn_both_directions(
-        tmp_path, monkeypatch):
-    import h5py
-    import pytest
-    from types import SimpleNamespace
-    from common import parallel_transport
-    from file_io import kin_ion as owner
-
-    path = tmp_path / "kin_ion_fractional.h5"
-    current_fingerprint = "a" * 64
-    monkeypatch.setattr(
-        parallel_transport, "wfn_fingerprint",
-        lambda _wfn: current_fingerprint)
-    with h5py.File(path, "w") as h5:
-        ds = h5.create_dataset(
-            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
-        ds.attrs["bispinor"] = False
-        ds.attrs["wfn_fingerprint_scheme"] = (
-            parallel_transport.WFN_FINGERPRINT_SCHEME)
-        ds.attrs["wfn_fingerprint"] = current_fingerprint
-        ds.attrs["exact_hartree_occupation_policy"] = (
-            owner.HARTREE_OCCUPATION_POLICY)
-        ds.attrs["exact_hartree_expected_electrons"] = 1.25
-        ds.attrs["exact_hartree_density_band_stop"] = 4
-        vh = h5.create_dataset(
-            owner.HARTREE_DATASET,
-            data=np.zeros((1, 2, 2), dtype=np.complex128))
-        vh.attrs["density_band_stop"] = 4
-
-    wfn = SimpleNamespace(
-        occupations_are_exact_integer=False,
-        num_electrons=1.25,
-        physical_density_band_stop=4)
-    owner.validate_kin_ion_against_run(
-        path, expected_bispinor=False, selected_hartree_source="stored",
-        wfn=wfn, print_fn=lambda *_args: None)
-
-    with h5py.File(path, "r+") as h5:
-        del h5["kin_ion"].attrs["exact_hartree_expected_electrons"]
-    with pytest.raises(ValueError, match="atomically"):
-        owner.validate_kin_ion_against_run(
-            path, expected_bispinor=False,
-            selected_hartree_source="stored", wfn=wfn,
-            print_fn=lambda *_args: None)
-
-    with h5py.File(path, "r+") as h5:
-        h5["kin_ion"].attrs["exact_hartree_expected_electrons"] = 1.25
-        h5[owner.HARTREE_DATASET].attrs["density_band_stop"] = 3
-    with pytest.raises(ValueError, match="density support"):
-        owner.validate_kin_ion_against_run(
-            path, expected_bispinor=False,
-            selected_hartree_source="stored", wfn=wfn,
-            print_fn=lambda *_args: None)
-
-    with h5py.File(path, "r+") as h5:
-        h5[owner.HARTREE_DATASET].attrs["density_band_stop"] = 4
-        h5["kin_ion"].attrs["wfn_fingerprint"] = "b" * 64
-    wfn.occupations_are_exact_integer = True
-    with pytest.raises(ValueError, match="different WFN fingerprint"):
-        owner.validate_kin_ion_against_run(
-            path, expected_bispinor=False,
-            selected_hartree_source="stored", wfn=wfn,
-            print_fn=lambda *_args: None)
-
-    with h5py.File(path, "r+") as h5:
-        for name in ("occupation_policy", "expected_electrons",
-                     "density_band_stop"):
-            del h5["kin_ion"].attrs[f"exact_hartree_{name}"]
-    with pytest.raises(ValueError, match="different WFN fingerprint"):
-        owner.validate_kin_ion_against_run(
-            path, expected_bispinor=False,
-            selected_hartree_source="isdf", wfn=wfn,
-            print_fn=lambda *_args: None)
-
-
-def test_live_hartree_receipt_reuses_exact_loaded_wfn_binding(
-        tmp_path, monkeypatch):
-    """The live GW gate must not rescan a WFN already bound by gw_init."""
-    import h5py
-    from types import SimpleNamespace
-    from common import parallel_transport
-    from file_io import kin_ion as owner
-
-    path = tmp_path / "kin_ion_bound_wfn.h5"
-    fingerprint = "c" * 64
-    scans = []
-    monkeypatch.setattr(
-        parallel_transport, "wfn_fingerprint",
-        lambda source: (scans.append(source), fingerprint)[1])
-    wfn = SimpleNamespace(
-        occupations_are_exact_integer=False,
-        num_electrons=1.25,
-        physical_density_band_stop=4)
-    binding = parallel_transport.bind_wfn_fingerprint(wfn)
-    assert scans == [wfn]
-
-    with h5py.File(path, "w") as h5:
-        ds = h5.create_dataset(
-            "kin_ion", data=np.zeros((1, 2, 2), dtype=np.complex128))
-        ds.attrs["bispinor"] = False
-        ds.attrs["wfn_fingerprint_scheme"] = (
-            parallel_transport.WFN_FINGERPRINT_SCHEME)
-        ds.attrs["wfn_fingerprint"] = fingerprint
-        ds.attrs["exact_hartree_occupation_policy"] = (
-            owner.HARTREE_OCCUPATION_POLICY)
-        ds.attrs["exact_hartree_expected_electrons"] = 1.25
-        ds.attrs["exact_hartree_density_band_stop"] = 4
-        vh = h5.create_dataset(
-            owner.HARTREE_DATASET,
-            data=np.zeros((1, 2, 2), dtype=np.complex128))
-        vh.attrs["density_band_stop"] = 4
-
-    def refuse_rescan(_source):
-        raise AssertionError("live Hartree validation rescanned the WFN")
-
-    monkeypatch.setattr(
-        parallel_transport, "wfn_fingerprint", refuse_rescan)
-    owner.validate_kin_ion_against_run(
-        path, expected_bispinor=False, selected_hartree_source="stored",
-        wfn=wfn, wfn_fingerprint_binding=binding,
-        print_fn=lambda *_args: None)
-    assert scans == [wfn]
-
-
-# D10's gate.  Bit-exactness is explicitly NOT required: appending exact
-# zeros cannot change a sum in IEEE-754, but a shape change does move
-# XLA's choice of reduction BLOCKING, so the two routes may associate the
-# same nonzero terms differently.
 RTOL_D10 = 1e-12
 
 _GRID = (6, 6, 8)
@@ -697,7 +522,7 @@ def test_sweep_consumers_take_kvecs_from_the_same_gtab():
     root = Path(__file__).resolve().parents[1]
     for relpath, expected in (
             ("src/gw/kin_ion_io.py", 2),
-            ("src/gw/sc_iteration.py", 1),
+            ("src/gw/sc_iteration.py", 2),
     ):
         tree = ast.parse((root / relpath).read_text(encoding="utf-8"))
         paired = 0
@@ -705,7 +530,8 @@ def test_sweep_consumers_take_kvecs_from_the_same_gtab():
                      if isinstance(node, ast.Call)):
             keywords = {kw.arg: kw.value for kw in call.keywords
                         if kw.arg is not None}
-            if ast.unparse(keywords.get("gvecs")) != "gtab.gvecs":
+            gvecs = keywords.get("gvecs")
+            if gvecs is None or ast.unparse(gvecs) != "gtab.gvecs":
                 continue
             paired += 1
             assert ast.unparse(keywords.get("kvecs")) == "gtab.kvecs", (

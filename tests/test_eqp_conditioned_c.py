@@ -20,8 +20,6 @@ def _assemble(curve):
         sigma_c_omega_diag_ev=curve,
         omega_rel_ev=omega,
         e_dft_rel_ev=np.zeros((1, 2)),
-        hartree_source="stored",
-        hartree_already_resolved=True,
         mean_field_gate=False,
         print_fn=lambda *_: None,
     )
@@ -88,7 +86,6 @@ def test_dynamic_assembly_refuses_a_second_c_at_dft_producer():
             sigma_c_omega_diag_ev=curve,
             omega_rel_ev=np.array([-1.0, 0.0, 1.0]),
             e_dft_rel_ev=np.zeros((1, 2)),
-            hartree_already_resolved=True,
             mean_field_gate=False,
             print_fn=lambda *_: None,
         )

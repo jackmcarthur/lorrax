@@ -54,10 +54,8 @@ def _config(tmp_path, extra="", *, messages=None, sys_dim=3):
     file_io = types.ModuleType("file_io")
     file_io.__path__ = []
     file_io.resolve_input_paths = lambda params, input_dir: None
-    kin_ion = types.ModuleType("file_io.kin_ion")
-    kin_ion.HARTREE_SOURCES = ("auto", "stored", "isdf", "gspace")
     with mock.patch.dict(
-            sys.modules, {"file_io": file_io, "file_io.kin_ion": kin_ion}):
+            sys.modules, {"file_io": file_io}):
         return LorraxConfig.from_input_file(
             str(path),
             print_fn=lambda *a, **k: sink.append(" ".join(map(str, a))))

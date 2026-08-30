@@ -1,13 +1,12 @@
-"""Real 4-rank CUDA gate: algebra parity for the face-layout G builder,
-band projector and Hartree kernel against BOTH the legacy code path AND an
-independent NumPy reference.
+"""Real 4-rank CUDA gate: algebra parity for the face-layout G builder and
+band projector against BOTH the legacy code path AND a NumPy reference.
 
 Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census rows
 2/3/4 and sections 3/4/5 — the task this file certifies.
 
 WHY REAL CUDA, NOT EMULATED.  Every face-layout numeric path added by this
-task routes through ``distrib_la.gemm_plan`` (build_G, the two-GEMM
-projector, Hartree's own GEMM) — a cuBLASMp-only surface that refuses on
+task routes through ``distrib_la.gemm_plan`` (build_G and the two-GEMM
+projector) — a cuBLASMp-only surface that refuses on
 any non-CUDA mesh by construction (``gemm_plan``'s own docstring, and the
 sibling ``feat/distrib-la-planned-gemm-2026-08-22`` branch this builds on).
 So there is no emulated-CPU leg for these checks to fall back to; this file
@@ -41,10 +40,6 @@ Checks:
      gemm plan in hand (obstacle #4's named escape hatch).
   5. Projection — contract_bands_block_reshard(layout='face') against
      layout='legacy' and a NumPy einsum, ns=1 and ns=2.
-  6. Hartree — cohsex_sigma._make_cohsex_kernels(...)'s ``hartree`` kernel
-     under both layouts, against a from-scratch NumPy Hartree formula
-     (local density -> V-rho matvec -> band-basis projection).
-
 Run:
     lx run -G 4 -n 4 env PYTHONPATH=... python3 -u \\
         tests/multi_device/low_mem_bands_g_projection_hartree_gate.py \\
@@ -278,82 +273,6 @@ def check_projection(mesh, dtype="complex128", *, ns=2, mu=8, nb=4, nk=2):
 # 6. Hartree.
 # ---------------------------------------------------------------------------
 
-def check_hartree(mesh, dtype="complex128", *, ns=2, mu=8, nb_full=8,
-                  nb_sigma=5, nk=2):
-    from gw.cohsex_sigma import _make_cohsex_kernels
-    from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_XR_SPEC, PSI_YR_SPEC,
-        PSI_YN_SPEC, PSI_MUN_SPEC, PSI_NMU_SPEC)
-
-    rng = np.random.default_rng(2026082206 + ns)
-    psi_np = _rng_mat(rng, (nk, nb_full, ns, mu), dtype)   # (nk,n,s,mu)
-    enk_np = np.sort(rng.standard_normal((nk, nb_full)), axis=1)
-    f_np = rng.uniform(0.05, 0.95, size=(nk, nb_sigma))
-    Gij_np = np.zeros((nk, nb_sigma, nb_sigma), dtype=complex)
-    idx = np.arange(nb_sigma)
-    Gij_np[:, idx, idx] = f_np
-    V0_np = _rng_mat(rng, (mu, mu), dtype)
-    V0_np = 0.5 * (V0_np + np.conj(V0_np.T))     # Hermitian, physical V(q=0)
-    V_q_np = V0_np[None]
-
-    occ0 = min(2, nb_sigma)
-    slices = BandSlices.from_band_edges(0, 0, occ0, nb_sigma, nb_full)
-    kgrid = (nk, 1, 1)
-
-    # ---- NumPy reference, independent of both code paths ----
-    f_full = np.zeros((nk, nb_full))
-    f_full[:, :nb_sigma] = f_np
-    dens = (np.abs(psi_np) ** 2 * f_full[:, :, None, None]).sum(axis=(0, 1, 2))
-    rho_ref = dens / nk
-    Vrho_ref = V0_np @ rho_ref
-    psi_win = psi_np[:, :nb_sigma]     # (nk, nb_sigma, ns, mu)
-    want = np.einsum("kmsx,x,knsx->kmn", np.conj(psi_win), Vrho_ref,
-                     psi_win, optimize=True)
-
-    # ---- legacy bundle: psi_xn/psi_yn = psi transposed to (nk,s,mu,n);
-    # psi_xr/psi_yr = psi as-is -- all four are the SAME ψ (module docstring).
-    psi_band_last = psi_np.transpose(0, 2, 3, 1)
-    wfns_legacy = Wavefunctions(
-        psi_xn=_put(psi_band_last, mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi_np, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi_np, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi_band_last, mesh, PSI_YN_SPEC),
-        enk=_put(enk_np, mesh, (None, None)),
-        occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
-        slices=slices,
-    )
-    Gij_legacy = _put(Gij_np, mesh, (None, None, None))
-    V_q_legacy = _put(V_q_np, mesh, (None, None, None))
-    _, _, hartree_legacy = _make_cohsex_kernels(mesh, kgrid, nk, layout="legacy")
-    got_legacy = _gather(hartree_legacy(wfns_legacy, Gij_legacy, V_q_legacy))
-
-    # ---- face bundle ----
-    wfns_face = Wavefunctions(
-        psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
-        psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
-        enk=_put(enk_np, mesh, (None, None)),
-        occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
-        slices=slices, layout="face",
-    )
-    Gij_face = _put(Gij_np, mesh, (None, None, None))
-    V_q_face = _put(V_q_np, mesh, (None, None, None))
-    _, _, hartree_face = _make_cohsex_kernels(
-        mesh, kgrid, nk, layout="face",
-        face_shape=(nk, nb_full, mu, ns))
-    got_face_full = _gather(hartree_face(wfns_face, Gij_face, V_q_face))
-    got_face = got_face_full[:, :nb_sigma, :nb_sigma]
-
-    r_legacy = _rel(got_legacy, want)
-    r_face = _rel(got_face, want)
-    assert r_legacy < RTOL, f"legacy hartree rel err {r_legacy:.3e}"
-    assert r_face < RTOL, f"face hartree rel err {r_face:.3e}"
-    return {"legacy": r_legacy, "face": r_face}
-
-
-# ---------------------------------------------------------------------------
-# CLI mode.
-# ---------------------------------------------------------------------------
-
 _CLI_CELLS = [
     ("g_identity_ns1", lambda mesh, dt: check_g_weighted(mesh, dt, ns=1)),
     ("g_identity_ns2", lambda mesh, dt: check_g_weighted(mesh, dt, ns=2)),
@@ -367,8 +286,6 @@ _CLI_CELLS = [
      lambda mesh, dt: check_g_dense_gij_refuses(mesh, dt)),
     ("projection_ns1", lambda mesh, dt: check_projection(mesh, dt, ns=1)),
     ("projection_ns2", lambda mesh, dt: check_projection(mesh, dt, ns=2)),
-    ("hartree_ns1", lambda mesh, dt: check_hartree(mesh, dt, ns=1)),
-    ("hartree_ns2", lambda mesh, dt: check_hartree(mesh, dt, ns=2)),
 ]
 
 

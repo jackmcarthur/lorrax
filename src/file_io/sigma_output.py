@@ -134,10 +134,10 @@ SIGMA_CUBE_DATASETS = (
 )
 
 #: The additive direct-field decomposition carried only by component-aware
-#: schema-v4 artifacts.  ``hartree_kij_ev`` above remains the aggregate
+#: schema-v6 artifacts.  ``hartree_kij_ev`` above remains the aggregate
 #: ``Hdir`` so every ordinary operator consumer keeps its historical name;
 #: these two companions make its scalar ``V_H`` and transverse ``H_T``
-#: operands independently auditable.  Absence of BOTH means schema v3.
+#: operands independently auditable.  Absence of BOTH means schema v5.
 SIGMA_DIRECT_COMPONENT_DATASETS = (
 	"hartree_scalar_kij_ev",
 	"hartree_transverse_kij_ev",
@@ -164,7 +164,7 @@ SIGMA_OPERATOR_STATE_RAW = "raw_pre_output_conditioning"
 
 #: Canonical receipt persisted only AFTER live :func:`assemble_eqp` returns.
 #: The full cubes remain raw; the primary dataset holds the exact
-#: source-resolved H, X, and derived C(E_DFT) carried by that EqpAssembly.
+#: live G-space H, X, and derived C(E_DFT) carried by that EqpAssembly.
 #: Its small companion holds the output-conditioned C(omega) diagonal curve
 #: from which the same assembler derived both C(E_DFT) and Z.  H/X/C are all
 #: DFT-band basis; dynamic SC refuses until its full C(omega) operator is
@@ -187,12 +187,14 @@ EQP_ASSEMBLY_SCHEMA_VERSION_ATTR = "schema_version"
 # pushed-but-held intermediate that persisted pre-assembly C(E_DFT) while
 # deriving Z from the raw curve.  Neither byte meaning may collide with this
 # post-assembly, one-conditioned-curve schema.
-EQP_ASSEMBLY_SCHEMA_VERSION = 3
-#: Schema v4 is selected ONLY when ``H_T`` exists.  Keeping v3 as the
-#: charge-only constant is deliberate: old readers refuse a v4 expected
+EQP_ASSEMBLY_SCHEMA_VERSION = 5
+#: Schema v6 is selected ONLY when ``H_T`` exists.  Older v3/v4 receipts
+#: carried the removed Hartree-source policy and are refused.
+#: Keeping v5 as the
+#: charge-only constant is deliberate: old readers refuse a v6 expected
 #: marker before touching ``hartree_kij_ev``, instead of interpreting the
 #: aggregate ``Hdir`` as scalar ``V_H`` and corrupting implied Vxc.
-EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION = 4
+EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION = 6
 EQP_ASSEMBLY_STATE_ATTR = "state"
 EQP_ASSEMBLY_STATE_READY = "assembled"
 EQP_ASSEMBLY_HX_BASIS_ATTR = "hartree_exchange_basis"
@@ -202,7 +204,7 @@ EQP_ASSEMBLY_K_STORAGE_ATTR = "k_storage"
 EQP_ASSEMBLY_K_STORAGE_WEDGE = "file_wedge"
 EQP_ASSEMBLY_FILE_ROWS_ATTR = "file_wedge_full_bz_rows"
 EQP_ASSEMBLY_HARTREE_STATE_ATTR = "hartree_state"
-EQP_ASSEMBLY_HARTREE_STATE_RESOLVED = "source_resolved"
+EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE = "live_gspace"
 EQP_ASSEMBLY_BAND_START_ATTR = "band_start"
 EQP_ASSEMBLY_BAND_STOP_ATTR = "band_stop"
 EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR = "degeneracy_policy"
@@ -211,8 +213,6 @@ EQP_ASSEMBLY_DEGENERACY_POLICIES = (
 	"bgw_average",
 	"disabled",
 )
-EQP_ASSEMBLY_HARTREE_SOURCE_ATTR = "hartree_source"
-EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR = "kin_ion_has_hartree"
 
 #: The datasets the OPT-IN ``write_qsgw_datasets`` deck key adds, in the
 #: order a reader meets them.  They are the plotting payload: the static
@@ -676,7 +676,7 @@ def write_sigma_freq_debug_table(
 # get them from a run, not from this file.
 #
 # The reason a selection is nevertheless sound is that nothing downstream
-# consumes the dropped rows.  EQP consumption (kin_ion + v_hartree + Σ^xc)
+# consumes the dropped rows.  EQP consumption (kin_ion + live V_H + Σ^xc)
 # is already k_irr-side, and the static Hermitianization now happens on the
 # selected rows only, so the extraction removes payload that had no reader.
 #
@@ -1546,100 +1546,6 @@ def read_eval_energies(filepath):
 		return _eval_metadata_from_open_h5(h5)
 
 
-def read_sigma_eqp_diagonal_window(
-	filepath, *, full_bz_rows, band_start: int, band_stop: int,
-):
-	"""Read only the legacy EQP diagonals and their small axis metadata.
-
-	This is the sole legacy raw-operator reader for post-hoc EQP assembly.
-	It resolves file-wedge rows through :func:`read_star_map` and
-	:func:`k_irr_rows_for`, then issues scalar/vector diagonal hyperslabs;
-	neither a full ``(nω,nk,nb,nb)`` cube nor a full ``(nk,nb,nb)`` matrix
-	is ever materialized on rank 0.  New schema-v3/v4 artifacts do not call
-	this function at all: they are served by their small completed-assembly
-	receipt.
-	"""
-	abs_path = os.path.abspath(filepath)
-	b0, b1 = int(band_start), int(band_stop)
-	if b0 < 0 or b1 <= b0:
-		raise ValueError(f"invalid EQP band window [{b0},{b1}).")
-	requested_rows = np.asarray(full_bz_rows, dtype=np.int64)
-	if requested_rows.ndim != 1:
-		raise ValueError(
-			f"full_bz_rows must be one-dimensional; got {requested_rows.shape}.")
-
-	# The outer owner claim protects both the canonical star-map reader's
-	# nested h5py open and the diagonal hyperslab open below.  Same-stack
-	# nesting is legal; an overlapping FFI writer refuses at this one door.
-	with open_scope(
-			abs_path, STACK_H5PY, "r",
-			where="read_sigma_eqp_diagonal_window"):
-		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
-		if star is None:
-			k_rows = requested_rows
-		else:
-			k_rows = k_irr_rows_for(
-				requested_rows, star[0],
-				what=f"{os.path.basename(abs_path)} (legacy EQP diagonal reader)")
-		with h5py.File(abs_path, "r") as h5:
-			missing = [name for name in (
-				"sigma_sx_kij_ev", "hartree_kij_ev", "sigma_c_kij_ev")
-				if name not in h5]
-			if missing:
-				raise KeyError(
-					f"{os.path.basename(abs_path)} lacks legacy Sigma datasets "
-					f"{missing}.")
-			x_ds = h5["sigma_sx_kij_ev"]
-			h_ds = h5["hartree_kij_ev"]
-			c_ds = h5["sigma_c_kij_ev"]
-			omega, omega_ref, omega_prov = _omega_metadata_from_open_h5(h5)
-			if omega is None:
-				raise KeyError(f"{os.path.basename(abs_path)} lacks {OMEGA_DATASET!r}.")
-			if (x_ds.ndim != 3 or h_ds.shape != x_ds.shape
-					or c_ds.ndim != 4 or c_ds.shape[1:] != x_ds.shape
-					or x_ds.shape[1] != x_ds.shape[2]
-					or c_ds.shape[0] != omega.size
-					or b1 > x_ds.shape[1]):
-				raise ValueError(
-					f"malformed legacy Sigma shapes: omega={omega.shape}, "
-					f"X={x_ds.shape}, H={h_ds.shape}, C={c_ds.shape}, "
-					f"requested bands=[{b0},{b1}).")
-			if k_rows.size and (
-					int(np.min(k_rows)) < 0 or int(np.max(k_rows)) >= x_ds.shape[0]):
-				raise ValueError(
-					f"legacy Sigma row request {k_rows.tolist()} exceeds "
-					f"{x_ds.shape[0]} stored rows.")
-			nk, nb = requested_rows.size, b1 - b0
-			x_diag = np.empty((nk, nb), dtype=np.complex128)
-			h_diag = np.empty((nk, nb), dtype=np.complex128)
-			c_diag = np.empty((omega.size, nk, nb), dtype=np.complex128)
-			for ik, row in enumerate(k_rows):
-				for ib, band in enumerate(range(b0, b1)):
-					x_diag[ik, ib] = x_ds[int(row), band, band]
-					h_diag[ik, ib] = h_ds[int(row), band, band]
-					c_diag[:, ik, ib] = c_ds[:, int(row), band, band]
-			eval_rel, eval_prov, eval_cov = _eval_metadata_from_open_h5(h5)
-			if eval_rel is not None:
-				if (eval_rel.ndim != 2 or b1 > eval_rel.shape[1]
-						or (k_rows.size and int(np.max(k_rows)) >= eval_rel.shape[0])):
-					raise ValueError(
-						f"{SIGMA_EVAL_DATASET} has shape {eval_rel.shape}; "
-						f"cannot select file rows {k_rows.tolist()} and bands "
-						f"[{b0},{b1}).")
-				eval_rel = np.asarray(
-					eval_rel[k_rows, b0:b1], dtype=np.float64)
-	return {
-		"omega_rel_ev": omega,
-		"omega_reference_ev": omega_ref,
-		"omega_reference_provenance": omega_prov,
-		"sigma_x_diag_ev": x_diag,
-		"hartree_diag_ev": h_diag,
-		"sigma_c_omega_diag_ev": c_diag,
-		"eval_energies_rel_ev": eval_rel,
-		"eval_energies_provenance": eval_prov,
-		"eval_coverage": eval_cov,
-		"file_rows": np.asarray(k_rows, dtype=np.int64),
-	}
 
 
 def _raw_operator_stamp_errors(h5):
@@ -1789,16 +1695,6 @@ def append_eqp_assembly_receipt_h5(
 		raise ValueError(
 			"EQP degeneracy tolerance must be finite and non-negative; got "
 			f"{degeneracy_tol_ry!r}.")
-	if assembly.hartree_rule not in ("suppressed", "substituted", "as-given"):
-		raise ValueError(
-			f"unknown completed EqpAssembly Hartree rule "
-			f"{assembly.hartree_rule!r}.")
-	if bool(assembly.kin_ion_has_hartree) != (
-			assembly.hartree_source == "folded"):
-		raise ValueError(
-			"completed EqpAssembly Hartree provenance disagrees: "
-			f"source={assembly.hartree_source!r}, "
-			f"kin_ion_has_hartree={assembly.kin_ion_has_hartree!r}.")
 	c_basis = EQP_ASSEMBLY_DFT_BAND_BASIS
 
 	values = np.stack((h, x, c), axis=0)
@@ -1855,40 +1751,11 @@ def append_eqp_assembly_receipt_h5(
 		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		if expected is None:
-			component_artifact_names = [name for name in (
-				*SIGMA_DIRECT_COMPONENT_DATASETS,
-				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
-				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
-				if name in h5]
-			if component_aware or component_artifact_names:
-				raise ValueError(
-					f"{os.path.basename(abs_path)} has component-aware "
-					f"Hdir/V_H/H_T {component_artifact_names or 'assembly'} but no "
-					"schema-v4 expected marker; refusing to upgrade a legacy "
-					"artifact whose raw components cannot have the authenticated "
-					"full-BZ/file-wedge creation receipt.")
-			# A truly legacy raw file may be upgraded by this explicit appender.
-			# A new raw-stamped file without the creation marker is instead partial:
-			# accepting it would let an interrupted creation heal itself silently.
-			tagged = [name for name in SIGMA_RAW_OPERATOR_DATASETS if (
-				name in h5 and (
-					SIGMA_OPERATOR_STATE_ATTR in h5[name].attrs
-					or SIGMA_OPERATOR_STATE_VERSION_ATTR in h5[name].attrs))]
-			if tagged:
-				raise ValueError(
-					f"{os.path.basename(abs_path)} has new raw-operator stamps "
-					f"on {tagged} but no {EQP_ASSEMBLY_EXPECTED_DATASET!r} "
-					"marker; refusing a partial creation artifact.")
-			# Explicitly upgrading a truly legacy file also upgrades every
-			# present raw cube to the exact state contract required on all future
-			# new-schema reads.
-			for name in present:
-				h5[name].attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
-				h5[name].attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = (
-					SIGMA_OPERATOR_STATE_VERSION)
-			h5.create_dataset(
-				EQP_ASSEMBLY_EXPECTED_DATASET,
-				data=np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, dtype=np.int32))
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has no "
+				f"{EQP_ASSEMBLY_EXPECTED_DATASET!r} creation marker. Legacy "
+				"sigma_mnk.h5 files cannot be upgraded because they do not "
+				"authenticate a live G-space Hartree build; rerun gw_jax.")
 		else:
 			try:
 				expected_version = int(expected)
@@ -1918,7 +1785,7 @@ def append_eqp_assembly_receipt_h5(
 				if name in h5]
 			if foreign_components:
 				raise ValueError(
-					"schema-v3 charge-only append refuses component receipt "
+					"schema-v5 charge-only append refuses component receipt "
 					f"datasets {foreign_components}.")
 		candidate_names = [
 				EQP_ASSEMBLY_CANDIDATE_DATASET,
@@ -1943,16 +1810,11 @@ def append_eqp_assembly_receipt_h5(
 		ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR] = EQP_ASSEMBLY_K_STORAGE_WEDGE
 		ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR] = file_rows
 		ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR] = (
-			EQP_ASSEMBLY_HARTREE_STATE_RESOLVED)
+			EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE)
 		ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR] = b0
 		ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR] = b1
 		ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR] = policy
 		ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR] = tol_ry
-		ds.attrs[EQP_ASSEMBLY_HARTREE_SOURCE_ATTR] = str(
-			assembly.hartree_source
-			if assembly.hartree_source is not None else "unstated")
-		ds.attrs[EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR] = bool(
-			assembly.kin_ion_has_hartree)
 		h5.flush()
 		canonical_names = [
 			EQP_ASSEMBLY_DATASET,
@@ -1982,18 +1844,18 @@ def append_eqp_assembly_receipt_h5(
 			f"+ conditioned C(omega) "
 			f"{c_omega.shape}, DFT H/X/C, "
 			f"file wedge, {policy}, "
-			f"source-resolved H{component_text}; C(E_DFT) and Z share the "
+			f"live G-space H{component_text}; C(E_DFT) and Z share the "
 			"conditioned curve")
 	return abs_path
 
 
 def read_eqp_assembly_receipt(filepath):
-	"""Read and validate a v3 charge-only or v4 component-aware receipt.
+	"""Read and validate a v5 charge-only or v6 component-aware receipt.
 
 	No canonical/candidate dataset means a legacy artifact.  A candidate or
 	unknown/partial canonical schema refuses rather than falling back to raw.
-	v4 additionally authenticates aggregate ``Hdir`` against persisted scalar
-	``V_H`` and transverse ``H_T``; v3 refuses those companions entirely.
+	v6 additionally authenticates aggregate ``Hdir`` against persisted scalar
+	``V_H`` and transverse ``H_T``; v5 refuses those companions entirely.
 	"""
 	abs_path = os.path.abspath(filepath)
 
@@ -2097,8 +1959,6 @@ def read_eqp_assembly_receipt(filepath):
 			EQP_ASSEMBLY_BAND_STOP_ATTR,
 			EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR,
 			EQP_ASSEMBLY_DEGENERACY_TOL_ATTR,
-			EQP_ASSEMBLY_HARTREE_SOURCE_ATTR,
-			EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR,
 		)
 		missing_attrs = [name for name in required_attrs if name not in ds.attrs]
 		if missing_attrs:
@@ -2119,7 +1979,7 @@ def read_eqp_assembly_receipt(filepath):
 				or hx_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
 				or c_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
 				or k_storage != EQP_ASSEMBLY_K_STORAGE_WEDGE
-				or hartree_state != EQP_ASSEMBLY_HARTREE_STATE_RESOLVED
+				or hartree_state != EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE
 				or policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES):
 			raise ValueError(
 				f"unsupported {EQP_ASSEMBLY_DATASET} semantics: state={state!r}, "
@@ -2182,15 +2042,6 @@ def read_eqp_assembly_receipt(filepath):
 		if not np.isfinite(tol_ry) or tol_ry < 0.0:
 			raise ValueError(
 				f"malformed {EQP_ASSEMBLY_DEGENERACY_TOL_ATTR}={tol_ry!r}.")
-		hartree_source = _text(
-			ds.attrs[EQP_ASSEMBLY_HARTREE_SOURCE_ATTR])
-		kin_ion_has_hartree = bool(
-			ds.attrs[EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR])
-		if kin_ion_has_hartree != (hartree_source == "folded"):
-			raise ValueError(
-				"EQP receipt Hartree provenance disagrees: "
-				f"source={hartree_source!r}, "
-				f"kin_ion_has_hartree={kin_ion_has_hartree!r}.")
 		eval_rel_ev, eval_provenance, eval_coverage = (
 			_eval_metadata_from_open_h5(h5))
 		if eval_rel_ev is not None and eval_rel_ev.shape != values.shape[1:]:
@@ -2237,8 +2088,6 @@ def read_eqp_assembly_receipt(filepath):
 			"degeneracy_tol_ry": tol_ry,
 			"hartree_exchange_basis": hx_basis,
 			"correlation_basis": c_basis,
-			"hartree_source": hartree_source,
-			"kin_ion_has_hartree": kin_ion_has_hartree,
 			"schema_version": expected_version,
 		}
 

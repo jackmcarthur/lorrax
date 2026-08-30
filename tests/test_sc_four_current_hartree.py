@@ -191,7 +191,7 @@ def test_density_sc_suppresses_both_frozen_direct_components():
                 if isinstance(target, ast.Tuple):
                     assigned.update(
                         elt.id for elt in target.elts if isinstance(elt, ast.Name))
-    assert {"sig_h", "v_h_ext", "h_transverse"} <= assigned
+    assert {"sig_h", "h_transverse"} <= assigned
 
 
 def test_live_hartree_is_carried_to_both_final_output_seams():
@@ -206,12 +206,12 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
 
 
 def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():
-    """Driver requests a device result; only the legacy arm may gather it."""
+    """The sole GW caller requests a sharded device result."""
     dispatch = ast.parse((ROOT / "src" / "gw" / "sigma_dispatch.py").read_text(
         encoding="utf-8"))
     resolve = next(n for n in dispatch.body
                    if isinstance(n, ast.FunctionDef)
-                   and n.name == "resolve_external_hartree")
+                   and n.name == "_compute_live_hartree")
     calls = [n for n in ast.walk(resolve)
              if isinstance(n, ast.Call)
              and isinstance(n.func, ast.Name)
@@ -221,27 +221,3 @@ def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():
                     if kw.arg == "return_sharded"), None)
     assert keyword is not None
     assert isinstance(keyword.value, ast.Constant) and keyword.value.value is True
-
-    driver = ast.parse((ROOT / "src" / "gw" / "kin_ion_io.py").read_text(
-        encoding="utf-8"))
-    compute = next(n for n in driver.body
-                   if isinstance(n, ast.FunctionDef)
-                   and n.name == "compute_hartree_matrix")
-    boundaries = [
-        n for n in ast.walk(compute)
-        if isinstance(n, ast.If)
-        and isinstance(n.test, ast.Name)
-        and n.test.id == "return_sharded"
-    ]
-    assert len(boundaries) == 2  # scalar V_H and transverse alpha.A
-    for boundary in boundaries:
-        live_calls = [n for stmt in boundary.body for n in ast.walk(stmt)
-                      if isinstance(n, ast.Call)
-                      and isinstance(n.func, ast.Name)
-                      and n.func.id == "blocks_to_host"]
-        legacy_calls = [n for stmt in boundary.orelse for n in ast.walk(stmt)
-                        if isinstance(n, ast.Call)
-                        and isinstance(n.func, ast.Name)
-                        and n.func.id == "blocks_to_host"]
-        assert not live_calls
-        assert len(legacy_calls) == 1

@@ -1207,14 +1207,14 @@ def main(argv=None):
     print_atomic_structure(wfn, pseudos)
     
     # Compute the exact Hartree matrix through the same band-streamed owner
-    # used by stored/gspace GW.  Density support is loader-owned and therefore
+    # used by GW. Density support is loader-owned and therefore
     # independent of this diagnostic CLI's nelec+ncond output window.
     from gw.kin_ion_io import compute_hartree_matrix
     with timing.section("psp.get_DFT_mtxels.build_V_H"):
         exact_hartree_full = compute_hartree_matrix(
             wfn, sym, meta, truncation_2d=(sys_dim == 2),
             nb=int(nb_actual), mesh=mesh_xy, include_transverse=False,
-            print_fn=print, k_set="full")
+            print_fn=print)
 
     # Compute DFT Hamiltonian matrix elements
     print(f"\nComputing DFT Hamiltonian matrix elements...")

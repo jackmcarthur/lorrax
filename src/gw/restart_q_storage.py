@@ -39,7 +39,7 @@ from __future__ import annotations
 import dataclasses
 
 #: Legal values of the ``restart_q_storage`` input key.  Modelled on
-#: ``file_io.kin_ion.HARTREE_SOURCES``: a tuple the config parser validates
+#: a tuple the config parser validates
 #: against at PARSE time, so a typo dies on the deck rather than 20 minutes
 #: into a 40-node run.
 #:

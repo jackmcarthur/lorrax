@@ -196,9 +196,7 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
 def check_sigma_sx_chain_face_matches_legacy(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
-    from types import SimpleNamespace
-
-    from gw.cohsex_sigma import _make_cohsex_kernels, compute_v_h_sigma_x
+    from gw.cohsex_sigma import _make_cohsex_kernels
     from gw.photon_sigma import (
         _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
     from gw.wavefunction_bundle import (
@@ -244,9 +242,9 @@ def check_sigma_sx_chain_face_matches_legacy(
     V_q_legacy = _put(V_q_np, mesh, (None, None, None))
     V_q_face = _put(V_q_np, mesh, (None, None, None))
 
-    sigma_sx_legacy, _, _ = _make_cohsex_kernels(mesh, kgrid, nk,
-                                                 layout="legacy")
-    sigma_sx_face, _, _ = _make_cohsex_kernels(
+    sigma_sx_legacy, _ = _make_cohsex_kernels(mesh, kgrid, nk,
+                                              layout="legacy")
+    sigma_sx_face, _ = _make_cohsex_kernels(
         mesh, kgrid, nk, layout="face",
         face_shape=(nk, nb_full, mu, ns))
 
@@ -310,23 +308,6 @@ def check_sigma_sx_chain_face_matches_legacy(
     assert cache_size == 1, (
         "dynamic photon X/SX selector compiled more than one executable: "
         f"cache_size={cache_size}")
-
-    # Full photon mode retains compute_v_h_sigma_x as the sole Hartree owner,
-    # but must not touch either scalar or transverse bare-X.  A deliberately
-    # nonexistent transverse file makes the latter contract executable rather
-    # than documentary; the exact-zero placeholder is the dispatch seam.
-    v_only = compute_v_h_sigma_x(
-        wfns_face, V_q_face,
-        SimpleNamespace(kgrid=kgrid, nk_tot=nk), mesh,
-        Gij=Gij_face,
-        wfns_transverse=wfns_face,
-        bispinor_v_q_path="/deliberately/nonexistent/full-photon-v.h5",
-        compute_bare_x=False,
-    )
-    max_skipped_x = float(np.abs(_gather(v_only["sig_x"])).max())
-    assert max_skipped_x == 0.0, (
-        "compute_bare_x=False did not return its exact-zero exchange "
-        f"placeholder: max_abs={max_skipped_x:.3e}")
 
     return {
         "face_vs_legacy": r,

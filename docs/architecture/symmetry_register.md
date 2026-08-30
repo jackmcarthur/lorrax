@@ -666,7 +666,7 @@ compressible would move physics.
 
 ### The three rows that are NOT one operation
 
-`kin_ion`, `v_hartree` and Σ move onto a wedge through `star_broadcast`,
+`kin_ion` and Σ move onto a wedge through `star_broadcast`,
 which is a **pure row gather plus `conj` on the time-reversed rows**. That
 works because they are SCALAR operators: each commutes with every space-group
 operation and with time reversal, so a star holds one matrix.
@@ -696,7 +696,8 @@ measurable separately and both are ~100 % of the signal:
 
 So the complete rule is `d_a(gk) = −1^{TRS} · R_cart_forward[s]_{ab} ·
 conj^{TRS}(d_b(k))`, and the sign is there because **v̂ is odd under time
-reversal** while `kin_ion`/`v_hartree` are even. The tree already said the
+reversal** while `kin_ion` is even. The live G-space Hartree matrix follows
+the scalar-operator star relation but is not a stored artifact. The tree already said the
 transpose half — `maps.py` `R_cart_forward`'s docstring warns that "anything
 rotating a Cartesian INDEX (a dipole or any rank≥1 operator) must use the
 TRANSPOSE of this matrix", and the scorecard above records it as *named but
