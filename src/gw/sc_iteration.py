@@ -1616,7 +1616,7 @@ def _kstar(inputs):
 
 # THE DENSITY-SC ROW, AND ITS CHILDREN.  ``vh.rebuild`` is the whole
 # rebuild; under it the timing tree carries ``vh.psi_load``,
-# ``vh.rotate_bands``, ``vh.rho``, ``vh.poisson`` and ``mtxel.sweep``;
+# ``vh.rho``, ``vh.poisson`` and ``mtxel.sweep``;
 # four-current runs also carry ``vh.transverse_field`` while scalar and
 # transverse matrix elements ride the same packed sweep.
 # No ``watch`` on the parent: every child that produces a device array
@@ -1660,19 +1660,16 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     containing V_H[rho].  ``kin_ion_dft`` stays pristine T+V_loc+V_NL, so
     V_H arrives only through ``delta_h`` and cannot double-count.
 
-    RETURNED IN THE DFT BASIS, AND CONTRACTED THERE.  psi is rotated for
-    RHO -- rho needs the occupied QP orbitals -- but the matrix elements
-    are contracted with the UNROTATED psi_dft, because H is assembled in
-    the DFT basis around a pristine ``kin_ion_dft``.  A DFT-basis V_H adds
-    to it directly, with NO rotation at all.  Contracting with psi_qp
-    instead would put V_H in the QP basis only for the caller to rotate it
-    straight back, an nk*nb^3 round trip for the same number.
+    RETURNED IN THE DFT BASIS, AND CONTRACTED THERE.  The density scan applies
+    ``U_qp`` without materialising the full rotated wavefunction; matrix
+    elements use the unrotated DFT orbitals because H is assembled around a
+    pristine DFT-basis ``kin_ion_dft``.
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
     from gw.efermi import (fermi_level_step, occupied_band_count,
                            step_occupations)
-    from gw.qsgw_density import rotate_bands, rho_from_wfns
+    from gw.qsgw_density import rho_from_wfns
     from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from psp.get_DFT_mtxels import build_hartree_potential
@@ -1713,17 +1710,15 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
         e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
         occ = step_occupations(E_qp_ry, e_f)
 
-    # Rotated orbitals: needed for rho, NOT for the contraction below.
-    psi_qp = rotate_bands(psi_G, U_qp, mesh=inputs.mesh_xy)
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
     include_current = bool(representation.current_bispinor)
-    charge_ns = (int(psi_qp.shape[2]) if representation.charge_bispinor
+    charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
                  else int(inputs.wfn.nspinor))
     fields = rho_from_wfns(
-        psi_qp, occ, kweights, mesh=inputs.mesh_xy,
+        psi_G, occ, kweights, U=U_qp, mesh=inputs.mesh_xy,
         box_index=bidx, fft_grid=grid,
         cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,

@@ -205,6 +205,29 @@ def test_live_hartree_is_carried_to_both_final_output_seams():
     assert "sig_h = exact_hartree_dft.total" in text
 
 
+def test_sc_density_applies_rotation_inside_the_scan():
+    """SC must not materialise a full resident QP-wavefunction array."""
+    module = ast.parse((ROOT / "src" / "gw" / "sc_iteration.py").read_text(
+        encoding="utf-8"))
+    fn = next(n for n in module.body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "rebuild_hartree_dft_basis")
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "rho_from_wfns"]
+    assert len(calls) == 1
+    assert isinstance(calls[0].args[0], ast.Name)
+    assert calls[0].args[0].id == "psi_G"
+    rotation = next(kw for kw in calls[0].keywords if kw.arg == "U")
+    assert isinstance(rotation.value, ast.Name)
+    assert rotation.value.id == "U_qp"
+    assert not any(isinstance(n, ast.Call)
+                   and isinstance(n.func, ast.Name)
+                   and n.func.id == "rotate_bands"
+                   for n in ast.walk(fn))
+
+
 def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():
     """The sole GW caller requests a sharded device result."""
     dispatch = ast.parse((ROOT / "src" / "gw" / "sigma_dispatch.py").read_text(
