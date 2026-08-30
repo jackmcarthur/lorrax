@@ -163,11 +163,10 @@ is the same.
   REGISTERED to symmetry_maps: `density_symmetry_check` reads loader
   privates `._file`/`._kpt_starts`/`.ngk` (survey §2.1); `kpt_starts`
   becomes a public property on the door now, the `._file` read is theirs.
-- Private copies per ruling 3 (the distrib_la `_shard_map.py`/
-  `_collectives.py` pattern, already precedented in-tree):
-  `_shard_map.py`, `_collectives.py` (device_put_process_local +
-  `_local_shard_and_global_offset`). Registered for post-wave lxkit
-  consolidation.
+- `_shard_map.py` remains service-local. `_collectives.py` retains only the
+  loader-specific `_local_shard_and_global_offset`; `device_put_process_local`
+  has one implementation in `lxkit.placement` and is re-exported here for API
+  compatibility.
 - Stays imported lazily from lorrax (documented, runtime-only):
   `common.gvec_fft_box` (the sentinel contract is SHARED with zeta_loader —
   a private copy would fork the single source of truth),
@@ -297,7 +296,9 @@ publish, 45/36 → 3/3 with converted delta 42, is unaffected either way.
 - `file_io/kin_ion.py` explicit-shape read_slab spellings (1b slab_io
   retrofit).
 - KNOWN_FAILURES.md:49 stale [mos2] count row.
-- Post-wave: `_shard_map`/`_collectives` private copies → lxkit.
+- Complete: `device_put_process_local` is owned once by `lxkit.placement` and
+  re-exported by `_collectives`; `_local_shard_and_global_offset` remains
+  loader-specific and `_shard_map.py` remains service-local.
 - Observed during the leak measurement (not this service's): the
   `common/jax_compile_cache.py` agreement layer vetoes 2 entries on
   non-writer ranks (`vetoed=2, compiles=2` on ranks 1–3 vs 12/12 hits on

@@ -278,20 +278,28 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, band_sphere_spec
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis
 
 
 __all__ = [
     "SweepGeometry",
-    "band_sphere_spec",
     "Operator",
     "kinetic_operator",
     "local_potential_operator",
+    "four_current_potential_operator",
     "vnl_operator",
     "dipole_operator",
+    "uniform_gauge_operator",
     "sum_operators",
     "sweep_matrix_elements",
+    "sweep_uniform_current_matrix_elements",
+    "sweep_uniform_gauge_matrix_elements",
+    "finite_transfer_current_to_centroids",
+    "UniformGaugeMatrixElements",
+    "UniformGaugeCurrentMatrixElements",
+    "FiniteTransferCurrentEndpoint",
     "blocks_to_host",
 ]
 
@@ -299,20 +307,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-
-def band_sphere_spec() -> P:
-    """THE ψ layout: ``(n_k, nb, nspinor, ngkmax)``, bands over the mesh.
-
-    One definition, three consumers — ``wfn_loader`` defaults to
-    it, this sweep contracts in it, and ``gw.qsgw_density`` builds ρ from
-    it.  A second literal of the same PartitionSpec would not raise if it
-    drifted; it would silently insert a reshard between them, which is the
-    same class of latent bug ``runtime.padding.spec_divisor`` removed on
-    the band divisor.
-    """
-    return P(None, ("x", "y"), None, None)
-
-
 
 class SweepGeometry:
     """The fixed shapes every operator and the scan agree on.
@@ -412,8 +406,9 @@ class Operator(NamedTuple):
     index 1 and the component axis is appended.  It must NOT form
     anything of shape ``(nb, nb)`` and must not gather over bands.
 
-    ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL) and 3 for
-    a Cartesian one (dipole).  It is not a shape the sweep can infer:
+    ``ncomp`` is 0 for a scalar operator (T, V_loc, V_H, V_NL), 3 for
+    a Cartesian one (dipole), and 12 for the one packed uniform
+    current/contact transaction.  It is not a shape the sweep can infer:
     the sweep has to pick its einsum and its output spec at trace time,
     before it has seen the operator's output.
 
@@ -493,12 +488,19 @@ def kinetic_operator(geom: SweepGeometry, bdot) -> Operator:
                     key=('kinetic', geom.ngkmax, geom.ns))
 
 
-def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
-    """``V ∘ ψ = F[ V(r) · F⁻¹ψ ]`` — the FFT round trip, for V_H and V_loc.
+def local_potential_operator(
+    geom: SweepGeometry, V_r, *, dirac_vector: bool = False,
+) -> Operator:
+    """Local scalar ``V`` or Dirac-vector ``sum_i alpha_i A_i`` operator.
 
-    Term-for-term the normalisation of
+    The default is ``V ∘ ψ = F[V(r) F⁻¹ψ]``, term-for-term the normalisation of
     ``psp.get_DFT_mtxels.compute_local_V_k``, so the two agree to
     round-off and the difference is pure reassociation from the sharding.
+
+    ``dirac_vector=True`` consumes ``V_r.shape == (3,nx,ny,nz)`` and applies
+    ``F[sum_i alpha_i V_i(r) F⁻¹ψ]`` with the canonical monomial gamma
+    tables.  It is the same scatter/IFFT/FFT/gather and the same
+    normalisation, not a parallel band-projection implementation.
 
     The two transforms are built ONCE, here, outside the scan — they are
     pure functions of shape, so nothing about them is per-k.  Only the
@@ -529,7 +531,25 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     scale = float(_sc.scale)
     deltaV = float(_sc.deltaV)
     fft_norm = float(_sc.fft_norm)
+    vector = bool(dirac_vector)
     V_r_j = jnp.asarray(V_r, dtype=jnp.complex128)
+    if vector:
+        if int(geom.ns) != 4:
+            raise ValueError(
+                "Dirac-vector local potential requires four-component "
+                f"bispinors; geom.ns={int(geom.ns)}")
+        expected = (3, *tuple(int(s) for s in geom.fft_grid))
+        if tuple(int(s) for s in V_r_j.shape) != expected:
+            raise ValueError(
+                "Dirac-vector local potential must have shape "
+                f"{expected}; got {tuple(int(s) for s in V_r_j.shape)}")
+        from common.gamma_matrices import gamma_apply, gamma_perm_phase
+        alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    elif tuple(int(s) for s in V_r_j.shape) != tuple(geom.fft_grid):
+        raise ValueError(
+            "scalar local potential must have shape "
+            f"{tuple(geom.fft_grid)}; got "
+            f"{tuple(int(s) for s in V_r_j.shape)}")
 
     def op(psi_n, gvec, gmask, bidx, kvec, V_r_j):
         # sphere → box.  ``_box_kernel`` is reused verbatim: it is pure
@@ -538,7 +558,13 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
         # sentinel index gather exact zero.
         box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
         psi_r = ifftn(box) * scale
-        phi_r = psi_r * V_r_j
+        if vector:
+            phi_r = jnp.zeros_like(psi_r)
+            for i, (perm, phase) in enumerate(alpha_vertices):
+                phi_r = phi_r + V_r_j[i] * gamma_apply(
+                    psi_r, perm, phase, axis=2)
+        else:
+            phi_r = psi_r * V_r_j
         phi_G = fftn(phi_r) * (deltaV * fft_norm)
         # box → sphere.  Advanced indexing on the three replicated FFT
         # axes only, so the band sharding is untouched.
@@ -553,10 +579,97 @@ def local_potential_operator(geom: SweepGeometry, V_r) -> Operator:
     # ties one compiled sweep to one V_H — a full lowering per density-SC
     # step (:func:`_operator_key`).  The scalars above stay literals: they
     # are functions of the geometry and do not move.
-    return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,),
-                    key=('local_potential', geom.fft_grid, geom.ngkmax,
-                         geom.ns, scale, deltaV, fft_norm,
-                         tuple(int(d) for d in V_r_j.shape)))
+    key = (('local_potential', 'dirac_vector', geom.fft_grid, geom.ngkmax,
+            geom.ns, scale, deltaV, fft_norm,
+            tuple(int(d) for d in V_r_j.shape))
+           if vector else
+           # Preserve the historical scalar cache key byte-for-byte: adding
+           # this feature must not invalidate every Vloc/VH executable.
+           ('local_potential', geom.fft_grid, geom.ngkmax, geom.ns,
+            scale, deltaV, fft_norm,
+            tuple(int(d) for d in V_r_j.shape)))
+    return Operator(apply=op, post=float(_sc.post), consts=(V_r_j,), key=key)
+
+
+def four_current_potential_operator(
+    geom: SweepGeometry, V_scalar_r, V_vector_r, *, charge_nspinor: int,
+) -> Operator:
+    """Pack scalar ``V_H`` and ``sum_i alpha_i A_i`` into one FFT sweep.
+
+    The returned two components are separate matrix elements, not their sum:
+    component 0 is the scalar charge Hartree and component 1 is the spatial
+    Dirac-current Hartree.  They share the sphere scatter, inverse FFT, ket
+    reshard and bra contraction.  The forward FFT is batched over the two
+    outputs, preserving the decomposition required by ``sigma_mnk.h5``.
+
+    ``charge_nspinor`` applies only to component 0.  This is load-bearing for
+    the Pauli-reference model: the full four-spinor carries the current, while
+    the scalar charge uses its leading source-WFN components.  Zeroing the
+    scalar operator ket outside that block is algebraically identical to
+    slicing both bra and ket because those output spinor rows are exact zero.
+    """
+    from common.fft_helpers import make_sharded_fftn_3d, make_sharded_ifftn_3d
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from psp.get_DFT_mtxels import local_potential_scalars
+
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "four-current local potential requires four-component "
+            f"bispinors; geom.ns={int(geom.ns)}")
+    charge_ns = int(charge_nspinor)
+    if not 0 < charge_ns <= 4:
+        raise ValueError(
+            "four-current charge_nspinor must be in [1,4]; got "
+            f"{charge_nspinor}")
+    grid = tuple(int(s) for s in geom.fft_grid)
+    V0 = jnp.asarray(V_scalar_r, dtype=jnp.complex128)
+    V1 = jnp.asarray(V_vector_r, dtype=jnp.complex128)
+    if tuple(int(s) for s in V0.shape) != grid:
+        raise ValueError(
+            f"scalar four-current potential must have shape {grid}; got "
+            f"{tuple(int(s) for s in V0.shape)}")
+    if tuple(int(s) for s in V1.shape) != (3, *grid):
+        raise ValueError(
+            "spatial four-current potential must have shape "
+            f"{(3, *grid)}; got {tuple(int(s) for s in V1.shape)}")
+
+    mesh = geom.mesh
+    ifftn = make_sharded_ifftn_3d(
+        mesh, geom.spec_box_xy, geom.spec_box_xy,
+        norm="ortho", axes=(-3, -2, -1))
+    comp_box_spec = P(None, None, ("x", "y"), None, None, None, None)
+    fftn = make_sharded_fftn_3d(
+        mesh, comp_box_spec, comp_box_spec,
+        norm="ortho", axes=(-3, -2, -1))
+    scalars = local_potential_scalars(geom.cell_volume, geom.ngrid)
+    scale = float(scalars.scale)
+    fft_scale = float(scalars.deltaV * scalars.fft_norm)
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    charge_mask = jnp.asarray(
+        np.arange(4) < charge_ns, dtype=jnp.complex128).reshape(
+            1, 1, 4, 1, 1, 1)
+
+    def op(psi_n, gvec, gmask, bidx, kvec, V0, V1):
+        del kvec
+        box = _box_kernel(psi_n, bidx, ngkmax=geom.ngkmax)
+        psi_r = ifftn(box) * scale
+        phi_scalar = psi_r * charge_mask * V0
+        phi_vector = jnp.zeros_like(psi_r)
+        for i, (perm, phase) in enumerate(alpha_vertices):
+            phi_vector = phi_vector + V1[i] * gamma_apply(
+                psi_r, perm, phase, axis=2)
+        # (component, k, band, spinor, x, y, z): the component batch is
+        # replicated and the band shard moves from axis 1 to axis 2.
+        phi_G = fftn(jnp.stack((phi_scalar, phi_vector), axis=0)) * fft_scale
+        gx, gy, gz = gvec[:, 0], gvec[:, 1], gvec[:, 2]
+        out = phi_G[..., gx, gy, gz]
+        out = jnp.moveaxis(out, 0, -1)
+        return out * gmask[None, None, None, :, None].astype(out.dtype)
+
+    return Operator(
+        apply=op, post=float(scalars.post), ncomp=2, consts=(V0, V1),
+        key=("four_current_local_potential", grid, geom.ngkmax, geom.ns,
+             charge_ns, scale, fft_scale))
 
 
 def _ket(psi_n, gmask):
@@ -701,10 +814,10 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
     The structural argument is the sharpest: dropping the term entirely
     is BETTER than including it with the legacy sign, which is the
     signature of a sign and not of a magnitude.  Four further witnesses
-    agree, three of them internal to this tree — ``velocity_matrix_k``
-    and ``orbital_magnetization`` both assemble ``p + dV_NL/dK`` and
-    call it canonical, and ``--vnl-mode numeric`` did too (by way of a
-    double negation nobody had noticed).
+    agree, three of them internal to this tree — the surviving
+    ``vnl_ops.vnl_velocity_matrix`` derivative owner and
+    ``orbital_magnetization`` use ``+dV_NL/dK``, and ``--vnl-mode numeric``
+    did too (by way of a double negation nobody had noticed).
 
     ``gw.mpa.head_dipole.head_fsum_from_transitions`` carries the same
     table and the f-sum saturations beside it.
@@ -765,6 +878,806 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                     key=('dipole', geom.ngkmax, geom.ns, float(blat),
                          None if vnl_setup is None else id(vnl_setup),
                          sign))
+
+
+class UniformGaugeCurrentMatrixElements(NamedTuple):
+    r"""Band-sharded uniform current action without unrelated response jets.
+
+    This is a component-selection view of :func:`uniform_gauge_operator`, not
+    a second current implementation.  It exists for Hall consumers, which
+    need only ``Gamma_raw`` and the exact Hamiltonian/operator fingerprint;
+    retaining contact and transfer jets for that terminal three-number
+    reduction is prohibitive on a production band manifold.
+    """
+
+    gamma_raw: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+
+
+class UniformGaugeMatrixElements(NamedTuple):
+    r"""Band-sharded uniform gauge action and optional transfer jet.
+
+    ``gamma_raw`` is the dimensionless no-pair vertex
+    ``(alpha_FS/2) dH_Pauli_Ry/dk``. ``lambda_raw`` is its exact uniform
+    derivative ``(alpha_FS/2) d2H_Pauli_Ry/dkdk``.  Their shapes are
+    ``(nk,3,nb,nb)`` and ``(nk,3,3,nb,nb)`` and both retain the sweep's
+    two-dimensional band sharding.  With the separately priced transfer-q2
+    capability, ``dgamma_dq_raw`` and ``d2gamma_dq2_raw`` have shapes
+    ``(nk,3,3,nb,nb)`` and ``(nk,3,3,3,nb,nb)``.  They are deliberately one
+    transaction: response-jet and contact consumers must not reopen the WFN
+    or rebuild projectors.  Hall's current-only component selection is the
+    smaller sibling above and calls the same operator/sweep owners.
+    """
+
+    gamma_raw: jax.Array
+    lambda_raw: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+    dgamma_dq_raw: jax.Array | None = None
+    d2gamma_dq2_raw: jax.Array | None = None
+
+
+class FiniteTransferCurrentEndpoint(NamedTuple):
+    r"""One exact finite-q current endpoint sampled at current centroids.
+
+    ``current_nmu`` and ``current_mun`` are the two face orientations of
+    ``Gamma_i(k,q)|Psi_nk>``.  Their shapes are ``(nk,nb,3,4,n_rmu)`` and
+    ``(nk,3,4,n_rmu,nb)``; after flattening the replicated ``(cart,spin)``
+    pair, they use the canonical :data:`common.wfn_layout.PSI_NMU_SPEC` and
+    :data:`common.wfn_layout.PSI_MUN_SPEC`.  They are deliberately not a
+    :class:`gw.wavefunction_bundle.Wavefunctions`: the endpoint depends
+    jointly on ``(k,q)`` and pretending it were a q-independent wavefunction
+    face would let the incumbent k-FFT silently apply the wrong operator at
+    every other q.
+
+    The two fingerprints name different facts.  The Hamiltonian identity is
+    byte-identical to the uniform current/contact transaction so a future
+    head/body loader can require exact equality.  The path identity also
+    binds the finite-segment quadrature order and Ward tolerances; it is the
+    numerical certificate for this realization, not a second body-only
+    Hamiltonian identity.
+
+    ``iq_irr`` and ``q_irr_kgrid_int`` retain the symmetry service's IBZ row
+    identity; ``q_crys`` is its BGW signed fractional representative.  The
+    response consumer can therefore keep a one-row block attached to its
+    storage label without rebuilding a q grid.
+
+    ``basis_receipt`` is the exact immutable object supplied by the target
+    wavefunction bundle.  The producer authenticates it against the WFN,
+    physical band interval, FFT grid, ordered centroid table and live padded
+    extent, then propagates that same object rather than inferring provenance
+    from the two face shapes.
+
+    This NamedTuple is an orchestration record, not a compiled operand: its
+    q labels and fingerprints are host strings/NumPy arrays.  The producer
+    compiles only numerical inputs and constructs this record afterward;
+    the private response oracle validates it and extracts its arrays before
+    calling the cached Green kernel.
+    """
+
+    current_nmu: jax.Array
+    current_mun: jax.Array
+    n_rmu_logical: int
+    iq_irr: int
+    q_irr_kgrid_int: np.ndarray
+    q_crys: np.ndarray
+    kminq_idx: np.ndarray
+    g_wrap: np.ndarray
+    vnl_ward_residual_abs: jax.Array
+    vnl_ward_residual_rel: jax.Array
+    vnl_ward_reference_norm: jax.Array
+    hamiltonian_config_operator_fingerprint: str
+    vnl_path_operator_fingerprint: str
+    # Appended with a default so both pre-receipt positions AND constructor
+    # arity remain compatible for readers treating this as a positional row.
+    basis_receipt: object = None
+
+
+def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
+                           vnl_setup, include_contact: bool = True,
+                           include_transfer_q2: bool = False) -> Operator:
+    r"""One apply-to-ket owner for raw current and exact uniform contact.
+
+    The first three packed components are
+
+    ``Gamma_i = alpha_i + (alpha_FS/2) dV_NL/dK_i``
+
+    on the kinetic-balance bispinor.  Contracting the ``alpha_i`` term with
+    that bispinor is identically ``(alpha_FS/2) dT/dK_i``; no second
+    sigma.p spelling is introduced here.  With ``include_contact=True``
+    (the default), the final nine components are
+
+    ``Lambda_ab = (alpha_FS/2) d2(T+V_NL)/dK_a dK_b``.
+
+    Kinetic contact comes from :mod:`psp.dft_operators`; the exact-origin,
+    row/G-bounded VNL current and contact come from :mod:`psp.vnl_ops`.
+    Everything is evaluated inside one :func:`sweep_matrix_elements` scan,
+    so the WFN bra reshard and projector coefficient pass are not paid by
+    separate current/contact drivers.
+
+    ``include_transfer_q2=True`` extends the SAME transaction with the
+    explicit ICL transfer derivatives at fixed large-component coefficients.
+    For the repository's bra ``k-q`` orientation,
+
+    ``Q_raw[i,a] = -(alpha/2) sigma_a sigma_i
+                    -(alpha/4) V_NL,ia``
+
+    and ``Q2_raw[i,a,b] = (alpha/6) V_NL,iab``.  The Pauli ordering comes
+    from differentiating the BRA kinetic-balance endpoint.  It is formed by
+    sweeping ``alpha_i dPsi_a`` and taking its negative band-space adjoint,
+    thereby reusing :func:`common.bispinor_init.kinetic_balance_lift_jet`
+    instead of spelling a second sigma-product kernel.
+
+    These are explicit vertex derivatives only.  They do not include
+    eigenstate, energy, occupation, or response-weight derivatives and are
+    not by themselves a generalized long-wave response.
+    """
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "uniform_gauge_operator requires the canonical four-component "
+            f"kinetic-balance WFN carrier; geom.ns={int(geom.ns)}")
+    if vnl_setup is None:
+        raise ValueError(
+            "uniform_gauge_operator requires the canonical VNLSetup; a "
+            "kinetic-only transaction cannot certify pseudopotential current")
+    if int(vnl_setup.nspinor) != 2:
+        raise ValueError(
+            "uniform_gauge_operator requires a two-component Pauli VNLSetup; "
+            f"got nspinor={int(vnl_setup.nspinor)}")
+    transfer_q2 = bool(include_transfer_q2)
+    contact_enabled = bool(include_contact or transfer_q2)
+    if contact_enabled and vnl_setup.Gpp_table is None:
+        raise ValueError(
+            "uniform_gauge_operator requires VNLSetup built with "
+            "compute_contact=True")
+    if transfer_q2 and vnl_setup.Gppp_table is None:
+        raise ValueError(
+            "uniform_gauge_operator transfer q2 requires VNLSetup built "
+            "with compute_transfer_q2=True")
+
+    from common.bispinor_init import HALFALPHA, kinetic_balance_lift_jet
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from psp.dft_operators import apply_kinetic_contact_to_ket
+    from psp import vnl_ops
+
+    B_host = np.asarray(bvec, dtype=np.float64) * float(blat)
+    if not np.array_equal(B_host, np.asarray(vnl_setup.B, dtype=np.float64)):
+        raise ValueError(
+            "uniform_gauge_operator reciprocal lattice differs from the "
+            "VNLSetup used to differentiate the Hamiltonian")
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+
+    def op(psi_n, gvec, gmask, bidx, kvec):
+        del bidx
+        psi_4 = _ket(psi_n, gmask)
+        psi_L = psi_4[:, :2, :]
+
+        # The alpha matrices are the incumbent monomial gamma owner.  The
+        # input was lifted by WfnLoader through bispinor_init.lift_to_4spinor,
+        # so this contraction consumes (rather than reimplements) sigma.p.
+        gamma_kin = jnp.stack([
+            gamma_apply(psi_4, perm, phase, axis=1)
+            for perm, phase in alpha_vertices
+        ], axis=0)
+
+        vnl = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
+            psi_L, gvec, kvec, vnl_setup, gmask,
+            include_contact=contact_enabled, include_q2=transfer_q2)
+        gamma_vnl = _pad_spinor(
+            halfalpha.astype(psi_4.real.dtype)
+            * vnl.gamma0_cart_ket,
+            int(psi_4.shape[1]))
+        gamma = gamma_kin + gamma_vnl
+
+        fields = [gamma]
+        if contact_enabled:
+            lambda_kin = apply_kinetic_contact_to_ket(psi_L)
+            lambda_large = halfalpha.astype(psi_4.real.dtype) * (
+                lambda_kin + vnl.lambda0_cart_ket)
+            contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
+            fields.append(contact.reshape(9, *contact.shape[2:]))
+        if transfer_q2:
+            # dPsi/dK is independent of K.  Evaluating the canonical lift
+            # jet at zero avoids threading a second reciprocal-lattice
+            # operand through this already k-resolved operator.
+            _lifted_zero, dpsi_dK = kinetic_balance_lift_jet(
+                psi_L,
+                jnp.zeros((int(psi_L.shape[-1]), 3),
+                          dtype=psi_4.real.dtype))
+            del _lifted_zero
+            # This is B[i,a]=<Psi|alpha_i dPsi_a>.  The physical bra k-q
+            # derivative is -B^dagger, preserving sigma_a sigma_i ordering.
+            kinetic_q1_source = jnp.stack([
+                gamma_apply(dpsi_dK, perm, phase, axis=2)
+                for perm, phase in alpha_vertices
+            ], axis=0)
+            vnl_q1 = _pad_spinor(
+                halfalpha.astype(psi_4.real.dtype)
+                * vnl.dgamma_dq_cart_ket,
+                int(psi_4.shape[1]))
+            q1_adjoint_source = kinetic_q1_source - vnl_q1
+            q2 = _pad_spinor(
+                halfalpha.astype(psi_4.real.dtype)
+                * vnl.d2gamma_dq2_cart_ket,
+                int(psi_4.shape[1]))
+            fields.extend((
+                q1_adjoint_source.reshape(
+                    9, *q1_adjoint_source.shape[2:]),
+                q2.reshape(27, *q2.shape[3:]),
+            ))
+
+        packed = jnp.concatenate(tuple(fields), axis=0)
+        return jnp.moveaxis(packed, 0, -1)[None]
+
+    operator_key = (
+        ("uniform_gauge_current_contact" if contact_enabled
+         else "uniform_gauge_current"), geom.ngkmax, geom.ns,
+        float(blat), id(vnl_setup))
+    if transfer_q2:
+        operator_key += ("explicit_transfer_q2",)
+    return Operator(
+        apply=op, post=1.0,
+        ncomp=(48 if transfer_q2 else (12 if contact_enabled else 3)),
+        key=operator_key)
+
+
+def _gauge_hamiltonian_operator_fingerprint(
+    *, wfn, vnl_setup, band_start: int, band_stop: int,
+    geom: SweepGeometry, include_transfer_q2: bool,
+) -> str:
+    """Compose the one uniform/finite-q Hamiltonian operator identity.
+
+    This is the exact grammar historically in
+    :func:`sweep_uniform_gauge_matrix_elements`, moved without changing a
+    byte so the arbitrary-transfer endpoint cannot invent a near-duplicate
+    body fingerprint.  The finite-path quadrature/tolerance identity stays a
+    separate certificate owned by :mod:`psp.vnl_ops`.
+    """
+    start, stop = int(band_start), int(band_stop)
+    vnl_fingerprint = str(
+        getattr(vnl_setup, "uniform_gauge_fingerprint", "")).strip()
+    if (not vnl_fingerprint.startswith("sha256:")
+            or len(vnl_fingerprint) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef"
+                   for c in vnl_fingerprint[7:])):
+        raise ValueError(
+            "gauge-current transaction requires the canonical VNLSetup "
+            "content fingerprint; rebuild it with build_vnl_setup(..., "
+            "compute_contact=True)")
+
+    import hashlib
+    from common.bispinor_init import KINETIC_BALANCE_LIFT_PROVENANCE
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, fingerprint_update_value, wfn_fingerprint)
+    from psp import vnl_ops
+
+    digest = hashlib.sha256()
+    digest.update(b"lorrax.uniform_gauge_operator/v1\0")
+    for label, value in (
+        ("wfn_scheme", WFN_FINGERPRINT_SCHEME),
+        ("wfn", wfn_fingerprint(wfn)),
+        ("vnl", vnl_fingerprint),
+        ("vnl_gauge_path", vnl_ops.ICL_STRAIGHT_GAUGE_PATH),
+        ("kinetic_balance", KINETIC_BALANCE_LIFT_PROVENANCE),
+        ("band_interval", f"{start}:{stop}"),
+        ("nk", str(int(geom.nk))),
+        ("cell_volume", float(geom.cell_volume).hex()),
+    ):
+        fingerprint_update_value(digest, label, value)
+    if bool(include_transfer_q2):
+        fingerprint_update_value(
+            digest, "transfer_jet", "explicit_q2_fixed_large_component_v1")
+    return "sha256:" + digest.hexdigest()
+
+
+def _uniform_gauge_sweep_fingerprint(
+    *, wfn, vnl_setup, band_start: int, band_stop: int,
+    geom: SweepGeometry, include_transfer_q2: bool,
+) -> str:
+    """Validate one uniform sweep manifold and return its sole identity."""
+    start, stop = int(band_start), int(band_stop)
+    if start < 0 or stop <= start or stop > int(wfn.nbands):
+        raise ValueError(
+            "uniform gauge band interval must satisfy "
+            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
+    if stop - start != int(geom.nb_logical):
+        raise ValueError(
+            "uniform gauge band interval does not match SweepGeometry: "
+            f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
+    return _gauge_hamiltonian_operator_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
+        geom=geom, include_transfer_q2=bool(include_transfer_q2))
+
+
+def sweep_uniform_current_matrix_elements(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    bvec,
+    blat,
+    vnl_setup,
+    gvecs,
+    gmask,
+    box_index,
+    kvecs,
+    use_scan: bool = True,
+) -> UniformGaugeCurrentMatrixElements:
+    """Select only ``Gamma_raw`` from the canonical uniform-gauge sweep.
+
+    The operator closure, band reshard, VNL action and fingerprint owner are
+    exactly those used by :func:`sweep_uniform_gauge_matrix_elements`.
+    Only its static output component set differs, so a Hall-only producer
+    does not retain contact/response matrices that it cannot consume.
+    """
+    fingerprint = _uniform_gauge_sweep_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
+        band_stop=band_stop, geom=geom, include_transfer_q2=False)
+    gamma_raw = sweep_matrix_elements(
+        psi_G,
+        geom=geom,
+        operator=uniform_gauge_operator(
+            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
+            include_contact=False, include_transfer_q2=False),
+        gvecs=gvecs,
+        gmask=gmask,
+        box_index=box_index,
+        kvecs=kvecs,
+        use_scan=use_scan,
+    )
+    return UniformGaugeCurrentMatrixElements(
+        gamma_raw=gamma_raw,
+        hamiltonian_config_operator_fingerprint=fingerprint)
+
+
+def sweep_uniform_gauge_matrix_elements(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    bvec,
+    blat,
+    vnl_setup,
+    gvecs,
+    gmask,
+    box_index,
+    kvecs,
+    use_scan: bool = True,
+    include_transfer_q2: bool = False,
+) -> UniformGaugeMatrixElements:
+    """Run the canonical uniform current/contact transaction once.
+
+    The returned objects are views of one packed sweep output.  No host
+    gather, duplicate contraction, or new sharding convention is introduced.
+    The shared fingerprint is derived here from the canonical WFN identity,
+    the VNL owner's host-built content identity, the physical band interval,
+    and geometry.  This is the Hamiltonian/operator identity, deliberately
+    separate from the artifact-format convention stamped by its writer.
+    """
+    fingerprint = _uniform_gauge_sweep_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
+        band_stop=band_stop, geom=geom,
+        include_transfer_q2=bool(include_transfer_q2))
+
+    packed = sweep_matrix_elements(
+        psi_G,
+        geom=geom,
+        operator=uniform_gauge_operator(
+            geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
+            include_transfer_q2=bool(include_transfer_q2)),
+        gvecs=gvecs,
+        gmask=gmask,
+        box_index=box_index,
+        kvecs=kvecs,
+        use_scan=use_scan,
+    )
+    q1_raw = q2_raw = None
+    if bool(include_transfer_q2):
+        q1_source = packed[:, 12:21].reshape(
+            int(packed.shape[0]), 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1]))
+        q1_raw = -jnp.swapaxes(jnp.conj(q1_source), -1, -2)
+        q2_raw = packed[:, 21:48].reshape(
+            int(packed.shape[0]), 3, 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1]))
+    return UniformGaugeMatrixElements(
+        gamma_raw=packed[:, :3],
+        lambda_raw=packed[:, 3:12].reshape(
+            int(packed.shape[0]), 3, 3,
+            int(packed.shape[-2]), int(packed.shape[-1])),
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        dgamma_dq_raw=q1_raw,
+        d2gamma_dq2_raw=q2_raw,
+    )
+
+
+def finite_transfer_current_to_centroids(
+    psi_G,
+    *,
+    wfn,
+    band_start: int,
+    band_stop: int,
+    geom: SweepGeometry,
+    vnl_setup,
+    r_mu,
+    basis_receipt,
+    iq_irr: int,
+    path_order: int = 12,
+    path_rtol: float = 1.0e-10,
+    path_atol: float = 1.0e-12,
+    projector_row_chunk: int = 64,
+    g_chunk: int = 1024,
+    fft_chunk_size: int | None = None,
+    include_transfer_q2_identity: bool = True,
+) -> FiniteTransferCurrentEndpoint:
+    r"""Build the exact ICL finite-q current ket at current centroids.
+
+    This is the missing transaction between the WFN/G-sphere lifetime and
+    the current-ISDF/response layers.  It consumes, rather than rebuilds,
+    the loader-owned paired ``(k,G,box_index)`` gauge, the symmetry-owned
+    ``k -> k-q`` map, the canonical G-wrap lookup, the bounded ICL projector
+    action, the monomial alpha matrices, and
+    :func:`common.wfn_transforms.gflat_to_rmu`.
+
+    For the repository's ``bra k-q, ket k`` orientation the returned field
+    is
+
+    ``Gamma_i(k,q)|Psi_nk> = alpha_i|Psi_nk>
+       + (alpha_fs/2) Gamma_i^NL,ICL(k,q)|psi_L,nk>``.
+
+    The local alpha action is translated onto the canonical target G sphere
+    before it is added to the rectangular VNL action.  The target is then
+    sampled with the target representative's paired ``box_index`` and Bloch
+    vector.  Bands remain sharded over all processors throughout; no band
+    matrix or fewer-than-P current carrier is formed.  The centroid tail is
+    zero padded to :func:`runtime.padding.padded_mu_extent` so it can be
+    converted to the incumbent two-face layout without inventing a second
+    padding convention.
+
+    ``basis_receipt`` must be the receipt carried by the target
+    :class:`gw.wavefunction_bundle.Wavefunctions` bundle for these same
+    source inputs.  The canonical receipt owner checks it before the
+    finite-transfer kernel runs and the endpoint returns it unchanged.
+
+    This routine intentionally emits one q-resolved endpoint.  It does not
+    pass it to the incumbent q-independent k-FFT C/Z or Green builders:
+    doing so would reuse this q's operator at every q.  Their future caller
+    must stream q rows and use this same endpoint on both the zeta and chi
+    sides.  FULL remains fail-closed until that complementary contraction,
+    exact contact/downfolded completion, symmetry processing, and artifact
+    identity propagation exist.
+    """
+    from common.bispinor_init import HALFALPHA
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.kq_mapping import umklapp_G_wrap
+    from common.parallel_transport import build_g_wrap_lookup
+    from common.wfn_transforms import gflat_to_rmu
+    from psp import vnl_ops
+    from psp.dft_operators import padded_gvectors
+    from symmetry_maps import bgw_integer_q_to_fractional
+
+    start, stop = int(band_start), int(band_stop)
+    if start < 0 or stop <= start or stop > int(wfn.nbands):
+        raise ValueError(
+            "finite-transfer current band interval must satisfy "
+            f"0 <= start < stop <= WFN.nbands; got [{start},{stop})")
+    if stop - start != int(geom.nb_logical):
+        raise ValueError(
+            "finite-transfer current band interval does not match "
+            f"SweepGeometry: [{start},{stop}) vs "
+            f"nb_logical={int(geom.nb_logical)}")
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "finite-transfer current requires the canonical four-component "
+            f"kinetic-balance carrier; geom.ns={int(geom.ns)}")
+    if vnl_setup is None or int(vnl_setup.nspinor) != 2:
+        raise ValueError(
+            "finite-transfer current requires the canonical two-component "
+            "Pauli VNLSetup")
+    if bool(include_transfer_q2_identity) and vnl_setup.Gppp_table is None:
+        raise ValueError(
+            "finite-transfer FULL-body identity requires VNLSetup built "
+            "with compute_transfer_q2=True so it exactly matches the "
+            "uniform head transaction")
+    mesh_shape = tuple(int(v) for v in geom.mesh.devices.shape)
+    if (tuple(geom.mesh.axis_names) != ("x", "y")
+            or len(mesh_shape) != 2 or mesh_shape[0] != mesh_shape[1]):
+        raise ValueError(
+            "finite-transfer current requires the canonical square (x,y) "
+            f"processor mesh; got axes={tuple(geom.mesh.axis_names)}, "
+            f"shape={mesh_shape}")
+
+    required_loader_api = ("symmetry", "box_index_dev")
+    missing_loader_api = tuple(
+        name for name in required_loader_api
+        if not callable(getattr(wfn, name, None)))
+    if missing_loader_api:
+        raise TypeError(
+            "finite-transfer current requires one canonical WfnLoader; "
+            f"missing callable API {missing_loader_api}")
+    if tuple(int(v) for v in wfn.fft_grid) != tuple(geom.fft_grid):
+        raise ValueError(
+            "finite-transfer current SweepGeometry.fft_grid must match "
+            f"WfnLoader.fft_grid exactly; got {tuple(geom.fft_grid)} vs "
+            f"{tuple(int(v) for v in wfn.fft_grid)}")
+    if int(wfn.ngkmax) != int(geom.ngkmax):
+        raise ValueError(
+            "finite-transfer current SweepGeometry.ngkmax must match "
+            f"WfnLoader.ngkmax exactly; got {int(geom.ngkmax)} vs "
+            f"{int(wfn.ngkmax)}")
+    r_mu_host = np.ascontiguousarray(np.asarray(r_mu, dtype=np.int32))
+    if r_mu_host.ndim != 2 or int(r_mu_host.shape[1]) != 3:
+        raise ValueError(
+            f"finite-transfer current r_mu must be (n_rmu,3); got "
+            f"{r_mu_host.shape}")
+    from file_io.wfn_basis import WavefunctionBasisReceipt
+    if not isinstance(basis_receipt, WavefunctionBasisReceipt):
+        raise TypeError(
+            "finite-transfer current requires the canonical immutable "
+            "WavefunctionBasisReceipt from its target Wavefunctions bundle; "
+            f"got {type(basis_receipt)!r}")
+    from runtime.padding import padded_mu_extent
+    expected_mu_padded = padded_mu_extent(
+        int(r_mu_host.shape[0]), geom.mesh)
+    basis_receipt.assert_matches_source(
+        wfn=wfn, role="transverse", bispinor=True,
+        band_interval=(start, stop),
+        fft_grid=geom.fft_grid,
+        centroid_fft_idx=r_mu_host,
+        n_rmu_logical=int(r_mu_host.shape[0]),
+        n_rmu_padded=expected_mu_padded,
+        where="finite-transfer current endpoint")
+
+    # Only after the target bundle's receipt authenticates the source do any
+    # finite-transfer current arrays enter construction.
+    psi = jnp.asarray(psi_G, dtype=jnp.complex128)
+    if int(psi.shape[1]) not in (int(geom.nb_logical), int(geom.nb)):
+        raise ValueError(
+            "finite-transfer current psi_G band axis must be logical or "
+            f"mesh padded ({int(geom.nb_logical)} or {int(geom.nb)}); "
+            f"got {tuple(psi.shape)}")
+    if (int(psi.shape[0]), int(psi.shape[2]), int(psi.shape[3])) != (
+            int(geom.nk), 4, int(geom.ngkmax)):
+        raise ValueError(
+            "finite-transfer current psi_G must have shape "
+            f"(nk,nb,4,ngkmax)=({int(geom.nk)},nb,4,"
+            f"{int(geom.ngkmax)}); got {tuple(psi.shape)}")
+    psi = pad_axis(psi, geom.p_prod, axis=1).array
+    sym = wfn.symmetry()
+    gtab = padded_gvectors(wfn, k="full_bz")
+    gvecs_host = np.ascontiguousarray(gtab.gvecs, dtype=np.int32)
+    ngk_valid_host = np.ascontiguousarray(gtab.ngk, dtype=np.int32)
+    gmask_host = np.ascontiguousarray(gtab.mask, dtype=np.float64)
+    kvecs_host = np.ascontiguousarray(gtab.kvecs, dtype=np.float64)
+    box_index = wfn.box_index_dev(k="full_bz", mesh=geom.mesh)
+    expected_g = (int(geom.nk), int(geom.ngkmax), 3)
+    if gvecs_host.shape != expected_g:
+        raise ValueError(
+            f"finite-transfer current paired G table must be {expected_g}; "
+            f"got {gvecs_host.shape}")
+    iq = int(iq_irr)
+    q_rows_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
+    q_full_rows = np.asarray(sym.q_irr_full_idx, dtype=np.int32)
+    if q_rows_int.ndim != 2 or q_rows_int.shape[1] != 3:
+        raise ValueError(
+            "finite-transfer current requires SymMaps.q_irr_kgrid_int "
+            f"with shape (nq_irr,3); got {q_rows_int.shape}")
+    if q_full_rows.shape != (int(q_rows_int.shape[0]),):
+        raise ValueError(
+            "finite-transfer current q-IBZ rows/full-row labels disagree: "
+            f"{q_rows_int.shape} vs {q_full_rows.shape}")
+    if iq < 0 or iq >= int(q_rows_int.shape[0]):
+        raise ValueError(
+            f"finite-transfer current iq_irr={iq} outside symmetry-owned "
+            f"q-IBZ rows [0,{int(q_rows_int.shape[0])})")
+    kgrid_host = np.asarray(wfn.kgrid, dtype=np.int64)
+    if kgrid_host.shape != (3,) or np.any(kgrid_host <= 0):
+        raise ValueError(
+            "finite-transfer current requires WfnLoader.kgrid with three "
+            f"positive entries; got {kgrid_host}")
+    if np.any(q_rows_int < 0) or np.any(q_rows_int >= kgrid_host[None, :]):
+        raise ValueError(
+            "finite-transfer current SymMaps q-IBZ integer rows must lie "
+            f"inside WfnLoader.kgrid={kgrid_host.tolist()}")
+    q_crys = bgw_integer_q_to_fractional(q_rows_int[iq], kgrid_host)
+    iq_full = int(q_full_rows[iq])
+    kqfull = np.asarray(sym.kqfull_map, dtype=np.int32)
+    if kqfull.shape != (int(geom.nk), int(geom.nk)):
+        raise ValueError(
+            "finite-transfer current requires the symmetry-owned full "
+            f"k-q map with shape ({int(geom.nk)},{int(geom.nk)}); got "
+            f"{kqfull.shape}")
+    if iq_full < 0 or iq_full >= int(geom.nk):
+        raise ValueError(
+            f"finite-transfer q-IBZ full-row label {iq_full} is outside "
+            f"[0,{int(geom.nk)})")
+    kminq_idx = np.ascontiguousarray(
+        kqfull[:, iq_full], dtype=np.int32)
+    if kminq_idx.shape != (int(geom.nk),):
+        raise ValueError(
+            "symmetry k-q map has wrong shape for finite-transfer current: "
+            f"{kminq_idx.shape} vs ({int(geom.nk)},)")
+    if (np.any(kminq_idx < 0)
+            or np.any(kminq_idx >= int(geom.nk))):
+        raise ValueError("symmetry k-q map contains an out-of-range row")
+    if not np.array_equal(
+            np.sort(kminq_idx), np.arange(int(geom.nk), dtype=np.int32)):
+        raise ValueError(
+            "finite-transfer current requires each symmetry-owned k-q row "
+            "map to be a permutation of the full BZ")
+    target_k_host = kvecs_host[kminq_idx]
+    g_wrap = np.ascontiguousarray(np.asarray(jax.device_get(
+        umklapp_G_wrap(
+            jnp.asarray(kvecs_host), jnp.asarray(target_k_host),
+            jnp.asarray(q_crys))), dtype=np.int32))
+    del target_k_host
+
+    # Reverse lookup: for each TARGET G row, locate the SOURCE coefficient
+    # whose plane wave becomes it after the photon transfer.  Since
+    # k-q=k_target+G_wrap,
+    #
+    #   exp(-iq.r) exp(i(k+G_source).r)
+    #       = exp(i(k_target+G_target).r)
+    #
+    # requires G_source=G_target-G_wrap.  This is the canonical lookup with
+    # center/neighbor roles reversed and ``-G_wrap``, not another G
+    # dictionary implementation.
+    source_for_target = np.zeros(
+        (int(geom.nk), int(geom.ngkmax)), dtype=np.int32)
+    source_for_target_valid = np.zeros_like(source_for_target, dtype=bool)
+    for ik in range(int(geom.nk)):
+        target_row = int(kminq_idx[ik])
+        idx, valid = build_g_wrap_lookup(
+            gvecs_host[ik], gvecs_host[target_row], -g_wrap[ik],
+            ngk_neighbor=int(ngk_valid_host[ik]),
+            ngk_center=int(ngk_valid_host[target_row]))
+        source_for_target[ik] = idx
+        source_for_target_valid[ik] = valid
+
+    gvecs_j = jnp.asarray(gvecs_host, dtype=jnp.int32)
+    gmask_j = jnp.asarray(gmask_host, dtype=jnp.float64)
+    wrap_j = jnp.asarray(g_wrap, dtype=jnp.int32)
+    kminq_j = jnp.asarray(kminq_idx, dtype=jnp.int32)
+    source_for_target_j = jnp.asarray(source_for_target, dtype=jnp.int32)
+    source_for_target_valid_j = jnp.asarray(source_for_target_valid)
+    q_j = jnp.asarray(q_crys, dtype=jnp.float64)
+    alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
+    halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
+    endpoint_sharding = NamedSharding(
+        geom.mesh, P(None, ('x', 'y'), None, None, None))
+
+    def _run(psi_, source_g_, source_mask_, source_k_, q_, wrap_,
+             target_rows_, source_index_, source_valid_):
+        psi_ = jax.lax.with_sharding_constraint(
+            psi_, NamedSharding(geom.mesh, geom.spec_sphere_xy))
+
+        def one_k(xs):
+            (psi_k, G_source, mask_source, k_source, target_row, wrap_k,
+             source_index, source_valid) = xs
+            # Select both halves of the target (k,G) gauge from the same
+            # loader tables inside the k scan.  No per-q reordered full G
+            # table or independently paired k table becomes an operand.
+            G_target = source_g_[target_row]
+            mask_target = source_mask_[target_row]
+            k_target = source_k_[target_row]
+            physical = psi_k * mask_source[None, None, :].astype(psi_k.dtype)
+            alpha_source = jnp.stack([
+                gamma_apply(physical, perm, phase, axis=1)
+                for perm, phase in alpha_vertices
+            ], axis=1)  # (nb,3,4,nG_source)
+            alpha_target = jnp.take(
+                alpha_source, source_index, axis=-1)
+            alpha_target = jnp.where(
+                source_valid[None, None, None, :], alpha_target,
+                jnp.zeros((), dtype=alpha_target.dtype))
+
+            finite = vnl_ops.compute_icl_vnl_finite_transfer_to_ket(
+                physical[:, :2], G_source, G_target,
+                k_source, k_target, q_, wrap_k, vnl_setup,
+                mask_source, mask_target,
+                path_order=int(path_order), path_rtol=float(path_rtol),
+                path_atol=float(path_atol),
+                projector_row_chunk=int(projector_row_chunk),
+                g_chunk=int(g_chunk))
+            gamma_vnl = _pad_spinor(finite.gamma_cart_ket, 4)
+            gamma_vnl = jnp.moveaxis(gamma_vnl, 0, 1)
+            total = alpha_target + halfalpha.astype(
+                alpha_target.real.dtype) * gamma_vnl
+            return (total, finite.ward_residual_abs,
+                    finite.ward_residual_rel, finite.ward_reference_norm,
+                    finite.certified)
+
+        _, values = jax.lax.scan(
+            lambda carry, xs: (carry, one_k(xs)), None,
+            (psi_, source_g_, source_mask_, source_k_, target_rows_, wrap_,
+             source_index_, source_valid_),
+            unroll=1)
+        current_G = jax.lax.with_sharding_constraint(
+            values[0], endpoint_sharding)
+        return (current_G, values[1], values[2], values[3], values[4])
+
+    kernel = _cached_jit(
+        'finite_transfer_current_to_ket',
+        (tuple(int(v) for v in psi.shape), id(geom.mesh), id(vnl_setup),
+         int(path_order), float(path_rtol), float(path_atol),
+         int(projector_row_chunk), int(g_chunk),
+         _sharding_key(psi)),
+        lambda: jax.jit(_run))
+    current_G, ward_abs, ward_rel, ward_ref, certified = kernel(
+        psi, gvecs_j, gmask_j, jnp.asarray(kvecs_host), q_j, wrap_j,
+        kminq_j, source_for_target_j, source_for_target_valid_j)
+
+    certified_host = np.asarray(jax.device_get(certified), dtype=bool)
+    if not np.all(certified_host):
+        abs_host = np.asarray(jax.device_get(ward_abs), dtype=np.float64)
+        rel_host = np.asarray(jax.device_get(ward_rel), dtype=np.float64)
+        bad = np.flatnonzero(~certified_host)
+        raise RuntimeError(
+            "GATE finite_transfer_current_icl_ward_uncertified: exact ICL "
+            f"endpoint failed for source k rows {bad.tolist()}; "
+            f"max_abs={float(np.max(abs_host[bad])):.6e}, "
+            f"max_rel={float(np.max(rel_host[bad])):.6e}, "
+            f"path_order={int(path_order)}, rtol={float(path_rtol):.3e}, "
+            f"atol={float(path_atol):.3e}")
+
+    nk, nb, _, ns, ngkmax = (int(v) for v in current_G.shape)
+    current_flat = current_G.reshape(nk, nb, 3 * ns, ngkmax)
+    current_rmu_flat = gflat_to_rmu(
+        current_flat, box_index, r_mu_host, mesh=geom.mesh,
+        fft_grid=geom.fft_grid, kvecs_frac=kvecs_host,
+        k_row_map=kminq_idx, norm="ortho", chunk_size=fft_chunk_size)
+    del current_G, current_flat
+    n_rmu_logical = int(r_mu_host.shape[0])
+    # ``expected_mu_padded`` is the canonical runtime-padding owner's exact
+    # target (including the fixed-P pad-invariance test knob).  Using it as
+    # the divisor retains :func:`pad_axis` as the sole array pad spelling.
+    rmu_pad = pad_axis(current_rmu_flat, expected_mu_padded, axis=-1)
+    if int(rmu_pad.logical) != n_rmu_logical:
+        raise AssertionError(
+            "canonical centroid padding changed the logical extent: "
+            f"{int(rmu_pad.logical)} != {n_rmu_logical}")
+    current_rmu_flat = rmu_pad.array
+    n_rmu_padded = int(rmu_pad.padded)
+    current_nmu_sharding = NamedSharding(geom.mesh, PSI_NMU_SPEC)
+    current_mun_sharding = NamedSharding(geom.mesh, PSI_MUN_SPEC)
+    to_faces = _cached_jit(
+        'finite_transfer_current_to_faces',
+        (tuple(int(v) for v in current_rmu_flat.shape), id(geom.mesh)),
+        lambda: jax.jit(
+            lambda value: (value, value.transpose(0, 2, 3, 1)),
+            out_shardings=(current_nmu_sharding, current_mun_sharding)))
+    current_nmu, current_mun = to_faces(current_rmu_flat)
+    current_nmu = current_nmu.reshape(nk, nb, 3, ns, n_rmu_padded)
+    current_mun = current_mun.reshape(nk, 3, ns, n_rmu_padded, nb)
+    del current_rmu_flat
+
+    fingerprint = _gauge_hamiltonian_operator_fingerprint(
+        wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
+        geom=geom,
+        include_transfer_q2=bool(include_transfer_q2_identity))
+    path_fingerprint = vnl_ops.icl_vnl_finite_transfer_operator_fingerprint(
+        vnl_setup, path_order=int(path_order), path_rtol=float(path_rtol),
+        path_atol=float(path_atol))
+    return FiniteTransferCurrentEndpoint(
+        current_nmu=current_nmu,
+        current_mun=current_mun,
+        n_rmu_logical=n_rmu_logical,
+        basis_receipt=basis_receipt,
+        iq_irr=iq,
+        q_irr_kgrid_int=np.ascontiguousarray(q_rows_int[iq], dtype=np.int32),
+        q_crys=np.ascontiguousarray(q_crys, dtype=np.float64),
+        kminq_idx=kminq_idx,
+        g_wrap=g_wrap,
+        vnl_ward_residual_abs=ward_abs,
+        vnl_ward_residual_rel=ward_rel,
+        vnl_ward_reference_norm=ward_ref,
+        hamiltonian_config_operator_fingerprint=fingerprint,
+        vnl_path_operator_fingerprint=path_fingerprint,
+    )
 
 
 def sum_operators(*ops: Operator) -> Operator:
@@ -1107,14 +2020,14 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
     returns the block SHARDED, which is the point: no rank holds a full
     ``(nb, nb)``.  Every consumer that keeps its result in that layout
     (``gw.sc_iteration.rebuild_hartree_dft_basis``) must NOT call this.
-    It exists for the sinks that cannot take a sharded operand — the
+    It exists for the sinks that cannot take a sharded operand — today the
     serial ``h5py`` writes in ``gw.kin_ion_io`` and
-    ``psp.get_dipole_mtxels``, and the replicated global operand
-    ``gw.sigma_dispatch``'s gspace route builds — and it re-materialises
-    the replicated ``(nk, nb, nb)`` on the ranks that keep it.  What the
+    ``psp.get_dipole_mtxels`` — and it re-materialises the replicated
+    ``(nk, nb, nb)`` on the ranks that keep it.  The live
+    ``gw.sigma_dispatch`` G-space route does not cross this boundary; its
+    star broadcast and basis rotation retain ``P(None,'x','y')``.  What the
     sweep removes upstream of here is the per-k full-band FFT box and the
-    ``P ≤ nk`` ceiling; the table itself is the output and something has
-    to hold it.
+    ``P ≤ nk`` ceiling; an artifact writer still has to hold its table.
 
     ``owner_only=True`` keeps it on rank 0 and returns ``None`` elsewhere
     — the same contract ``collectives.gather_k_blocks(owner_only=True)``
@@ -1145,16 +2058,13 @@ def blocks_to_host(H, *, nb: int, owner_only: bool = False):
       true until 233a830d deleted that backend and the ``slab_io`` router
       with it.  There is one transport left and it writes from the shards,
       so the reason recorded here is spent — what is left is the work.
-    * The third consumer cannot be converted at all by itself:
-      ``gw.sigma_dispatch.resolve_external_hartree`` READS the table back
-      as a replicated global operand and rotates it with
-      ``hartree_basis_rotation``, and ``gw.sc_iteration``'s
-      ``_rotate_to_dft_basis`` / ``apply_band_partition`` consume the
-      result the same way.  Removing W2 end to end is a read-side and
-      consumer change of the same size as the write-side one.
+    * The former third consumer is converted: the live G-space source returns
+      ``P(None,'x','y')`` and rotates it without a host or replicated seam.
+      W2 therefore survives only at the two serial artifact writers named
+      above, not in the in-memory driver path.
 
-    So it is three files this module does not own plus a backend-dependent
-    claim, not a change to this function.  Recorded rather than half-landed.
+    Converting those two writers is separate I/O work this module does not
+    own.  Recorded rather than half-landed.
     """
     from common.collectives import gather_to_host, process_rank
 

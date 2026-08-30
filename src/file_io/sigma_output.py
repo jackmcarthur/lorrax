@@ -39,6 +39,8 @@ SIGMA_K_AXIS = {
 	"sigma_c_kij_ev": 1,
 	"sigma_sx_kij_ev": 0,
 	"hartree_kij_ev": 0,
+	"hartree_scalar_kij_ev": 0,
+	"hartree_transverse_kij_ev": 0,
 	"sigma_xc_qsgw_kij_ev": 0,
 	"qp_diag_self_consistent_ev": 0,
 	"qp_omega0_ev": 0,
@@ -131,6 +133,23 @@ SIGMA_CUBE_DATASETS = (
 	"hartree_kij_ev",
 )
 
+#: The additive direct-field decomposition carried only by component-aware
+#: schema-v4 artifacts.  ``hartree_kij_ev`` above remains the aggregate
+#: ``Hdir`` so every ordinary operator consumer keeps its historical name;
+#: these two companions make its scalar ``V_H`` and transverse ``H_T``
+#: operands independently auditable.  Absence of BOTH means schema v3.
+SIGMA_DIRECT_COMPONENT_DATASETS = (
+	"hartree_scalar_kij_ev",
+	"hartree_transverse_kij_ev",
+)
+SIGMA_RAW_OPERATOR_DATASETS = (
+	SIGMA_CUBE_DATASETS + SIGMA_DIRECT_COMPONENT_DATASETS)
+DIRECT_FIELD_SUM_RULE_ATTR = "direct_field_sum_rule"
+DIRECT_FIELD_SUM_RULE = (
+	"hartree_kij_ev=hartree_scalar_kij_ev+hartree_transverse_kij_ev")
+DIRECT_FIELD_SUM_FULL_BZ_ATTR = "direct_field_sum_verified_full_bz"
+DIRECT_FIELD_SUM_FILE_WEDGE_ATTR = "direct_field_sum_verified_file_wedge"
+
 #: Meaning of the four operator cubes above.  They are deliberately the
 #: unconditioned operators produced by the Sigma kernel: full off-diagonals
 #: intact, before the output-side BGW degenerate-set projection.  Changing
@@ -158,6 +177,10 @@ EQP_ASSEMBLY_CANDIDATE_DATASET = (
 EQP_ASSEMBLY_C_OMEGA_DATASET = "eqp_assembly_conditioned_sigma_c_omega_diag_ev"
 EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET = (
 	"__eqp_assembly_conditioned_sigma_c_omega_diag_ev_candidate")
+EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET = (
+	"eqp_assembly_hartree_scalar_transverse_diag_ev")
+EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET = (
+	"__eqp_assembly_hartree_scalar_transverse_diag_ev_candidate")
 EQP_ASSEMBLY_EXPECTED_DATASET = "eqp_assembly_receipt_expected"
 EQP_ASSEMBLY_SCHEMA_VERSION_ATTR = "schema_version"
 # v1 lacked final H/X/C and fail-closed creation semantics.  v2 was the
@@ -165,6 +188,11 @@ EQP_ASSEMBLY_SCHEMA_VERSION_ATTR = "schema_version"
 # deriving Z from the raw curve.  Neither byte meaning may collide with this
 # post-assembly, one-conditioned-curve schema.
 EQP_ASSEMBLY_SCHEMA_VERSION = 3
+#: Schema v4 is selected ONLY when ``H_T`` exists.  Keeping v3 as the
+#: charge-only constant is deliberate: old readers refuse a v4 expected
+#: marker before touching ``hartree_kij_ev``, instead of interpreting the
+#: aggregate ``Hdir`` as scalar ``V_H`` and corrupting implied Vxc.
+EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION = 4
 EQP_ASSEMBLY_STATE_ATTR = "state"
 EQP_ASSEMBLY_STATE_READY = "assembled"
 EQP_ASSEMBLY_HX_BASIS_ATTR = "hartree_exchange_basis"
@@ -216,6 +244,7 @@ def write_sigma_to_file(
 	sx_label: str = "sigSX",
 	corr_label: str = "sigCOH",
 	total_label: str = "sigTOT",
+	hartree_label: str = "VH",
 ):
 	"""Write self-energy components to file.
 
@@ -236,6 +265,7 @@ def write_sigma_to_file(
 		sx_label: Text label for first self-energy column
 		corr_label: Text label for second self-energy column
 		total_label: Text label for the sum of first and second columns
+		hartree_label: Text label for the direct-field column
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -432,7 +462,7 @@ def write_sigma_to_file(
 				if hv_diag is not None:
 					hv_re = float(np.real(hv_diag[k, n]))
 					hv_im = float(np.imag(hv_diag[k, n]))
-					line += f"  VH={hv_re:>12.6f}"
+					line += f"  {hartree_label}={hv_re:>12.6f}"
 					# Padded on the real branch too — it was NOT before, so
 					# the trailing Eo= column moved row to row.
 					line += _im(hv_im, hv_cplx)
@@ -515,6 +545,7 @@ def write_sigma_freq_debug_table(
 	columns: list[tuple[str, np.ndarray]],
 	*,
 	kpoints_crys,
+	metadata: dict[str, str] | None = None,
 ) -> str:
 	"""Write a per-(k, n) decomposition table.
 
@@ -536,6 +567,10 @@ def write_sigma_freq_debug_table(
 	conversion at the seam (consistent with the rule "internals in Ry, eV
 	only at print").
 
+	Optional ``metadata`` is written into this same canonical receipt as stable
+	``# metadata key=value`` lines.  Keys and values must each be single-line;
+	the caller owns their semantics and authentication.
+
 	The first row is a comment header naming all columns; subsequent rows
 	are tab-separated numerical values, one per ``(k, n)`` pair, with k
 	and n as the leading two integer columns.
@@ -546,6 +581,13 @@ def write_sigma_freq_debug_table(
 	"""
 	if not columns:
 		raise ValueError("write_sigma_freq_debug_table: ``columns`` is empty.")
+	metadata = {} if metadata is None else dict(metadata)
+	for key, value in metadata.items():
+		if not isinstance(key, str) or not key or any(c in key for c in "=\r\n"):
+			raise ValueError(f"invalid Sigma debug metadata key {key!r}")
+		if not isinstance(value, str) or any(c in value for c in "\r\n"):
+			raise ValueError(
+				f"invalid Sigma debug metadata value for {key!r}: {value!r}")
 
 	arrays = [(name, np.asarray(arr)) for name, arr in columns]
 	nk, nb = arrays[0][1].shape
@@ -593,6 +635,8 @@ def write_sigma_freq_debug_table(
 			"# Sigma frequency debug decomposition (per-(k, n) diagonals; all "
 			"energies in eV).\n"
 		)
+		for key in sorted(metadata):
+			f.write(f"# metadata {key}={metadata[key]}\n")
 		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
 		for ik in range(nk):
 			f.write(f"\nk-point {ik}:\n")
@@ -776,15 +820,16 @@ def _slab_to_host(a):
 	anyone ran it through the k_irr extraction (the extraction landed
 	2026-08-08, the sharded layout 2026-07-28, and the two had never met).
 
-	Same reconstruction ``ppm_windows._to_host_np`` uses, and for the same
-	reason; kept local because this module is numpy+h5py by charter and does
-	not import jax at module scope.  Replicated / numpy operands take the
-	fast path unchanged, so the default layout is byte-for-byte untouched.
+	The nonlocal route is owned by :func:`common.collectives.gather_to_host`;
+	this format-level wrapper keeps only the numpy/fully-addressable fast path
+	so this module does not import jax at module scope.  Replicated / numpy
+	operands therefore keep the byte-for-byte historical path, while global
+	replication and sharding use the codebase's one collective convention.
 	"""
 	if getattr(a, "is_fully_addressable", True):
 		return np.asarray(a)
-	from jax.experimental import multihost_utils
-	return np.asarray(multihost_utils.process_allgather(a, tiled=True))
+	from common.collectives import gather_to_host
+	return gather_to_host(a)
 
 
 def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
@@ -1076,6 +1121,35 @@ def k_irr_rows_for(full_bz_indices, compact_irr, *, what="caller"):
 	return compact[idx]
 
 
+def _assert_direct_field_sum(hdir, v_h_scalar, h_transverse, *, where):
+	"""Authenticate ``Hdir = V_H + H_T`` without inventing an I/O route.
+
+	The operands may be numpy arrays, replicated JAX arrays, or globally
+	sharded JAX arrays.  :func:`_slab_to_host` is already this format owner's
+	canonical bridge for exactly that set, so the identity check does not add
+	a direct ``device_get``/all-gather dialect.  The producer deliberately
+	forms ``Hdir`` with this association in output units; equality is exact,
+	not a physics tolerance.
+	"""
+	arrays = (hdir, v_h_scalar, h_transverse)
+	if any(a is None for a in arrays):
+		raise ValueError(
+			f"{where}: component-aware direct fields require the complete "
+			"Hdir/V_H/H_T triple.")
+	shapes = tuple(tuple(np.shape(a)) for a in arrays)
+	if len(set(shapes)) != 1:
+		raise ValueError(
+			f"{where}: Hdir/V_H/H_T shapes disagree: {shapes}.")
+	host = tuple(_slab_to_host(a) for a in arrays)
+	if not all(np.all(np.isfinite(a)) for a in host):
+		raise ValueError(
+			f"{where}: Hdir/V_H/H_T contains non-finite values.")
+	if not np.array_equal(host[0], host[1] + host[2]):
+		raise ValueError(
+			f"{where}: aggregate Hdir is not exactly scalar V_H + "
+			"transverse H_T.")
+
+
 def write_sigma_omega_h5(
 	filepath,
 	omega_ev,
@@ -1084,6 +1158,8 @@ def write_sigma_omega_h5(
 	sigma_c_kij_ev=None,
 	sigma_sx_kij_ev=None,
 	hartree_kij_ev=None,
+	hartree_scalar_kij_ev=None,
+	hartree_transverse_kij_ev=None,
 	mesh=None,
 	star=None,
 	omega_reference_ev=None,
@@ -1103,6 +1179,8 @@ def write_sigma_omega_h5(
 	  - sigma_c_kij_ev  (optional): (n_omega, nk, nb, nb)
 	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
 	  - hartree_kij_ev  (optional): (nk, nb, nb)
+	  - hartree_scalar_kij_ev (optional): scalar charge V_H
+	  - hartree_transverse_kij_ev (optional): current H_T
 	  - sigma_c_extrap_*_kn_ev (optional): (nk, nb) — the Σ_c
 	    band-convergence fit, present only when the run extrapolated
 
@@ -1183,6 +1261,24 @@ def write_sigma_omega_h5(
 	n_omega, nk, nb, nb2 = shape_ref
 	if nb != nb2:
 		raise ValueError("dynamic sigma tensors must be square in band indices.")
+	component_flags = (
+		hartree_scalar_kij_ev is not None,
+		hartree_transverse_kij_ev is not None,
+	)
+	component_aware = any(component_flags)
+	if component_aware:
+		if not all(component_flags) or hartree_kij_ev is None:
+			raise ValueError(
+				"write_sigma_omega_h5: component-aware direct output requires "
+				"aggregate Hdir, scalar V_H, and transverse H_T together; got "
+				f"Hdir={hartree_kij_ev is not None}, "
+				f"V_H={component_flags[0]}, H_T={component_flags[1]}.")
+		_assert_direct_field_sum(
+			hartree_kij_ev, hartree_scalar_kij_ev,
+			hartree_transverse_kij_ev, where="full-BZ raw Sigma input")
+	receipt_schema = (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		if component_aware else EQP_ASSEMBLY_SCHEMA_VERSION)
 
 	# sigma_total_kij_ev is derived when not passed: total = c + sx + h.
 	#
@@ -1205,6 +1301,8 @@ def write_sigma_omega_h5(
 		"sigma_c_kij_ev": sigma_c_kij_ev,
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
+		"hartree_scalar_kij_ev": hartree_scalar_kij_ev,
+		"hartree_transverse_kij_ev": hartree_transverse_kij_ev,
 	}
 	# INTO THE SAME PAYLOAD as the cubes: the eval spectrum labels the same
 	# (k, n) the cube's band diagonal does, so it must be extracted to the
@@ -1232,6 +1330,22 @@ def write_sigma_omega_h5(
 	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
 	hartree_kij_ev = payload["hartree_kij_ev"]
+	hartree_scalar_kij_ev = payload["hartree_scalar_kij_ev"]
+	hartree_transverse_kij_ev = payload["hartree_transverse_kij_ev"]
+	if component_aware:
+		_assert_direct_field_sum(
+			hartree_kij_ev, hartree_scalar_kij_ev,
+			hartree_transverse_kij_ev, where="file-wedge raw Sigma payload")
+
+	def _direct_attrs(name, semantics):
+		attrs = dict(_attrs(name) or {})
+		attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+		attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+		attrs["direct_field_semantics"] = semantics
+		attrs[DIRECT_FIELD_SUM_RULE_ATTR] = DIRECT_FIELD_SUM_RULE
+		attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = True
+		attrs[DIRECT_FIELD_SUM_FILE_WEDGE_ATTR] = True
+		return attrs
 
 	def _operator_attrs(name):
 		"""k-storage stamps plus the one meaning shared by every raw cube."""
@@ -1246,7 +1360,7 @@ def write_sigma_omega_h5(
 		# reader sees an expected-receipt artifact with no receipt and fails closed.
 		io.write_attr(
 			EQP_ASSEMBLY_EXPECTED_DATASET,
-			np.asarray(EQP_ASSEMBLY_SCHEMA_VERSION, dtype=np.int32),
+			np.asarray(receipt_schema, dtype=np.int32),
 		)
 		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
 		# The ω axis's own reference, stamped ON the ω axis — one place to
@@ -1298,8 +1412,26 @@ def write_sigma_omega_h5(
 			io.create_dataset("hartree_kij_ev",
 				shape=tuple(hartree_kij_ev.shape),
 				dtype=np.complex128,
-				attrs=_operator_attrs("hartree_kij_ev"))
+				attrs=(
+					_operator_attrs("hartree_kij_ev")
+					if hartree_transverse_kij_ev is None else _direct_attrs(
+						"hartree_kij_ev", "V_H_scalar+H_transverse")))
 			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		if hartree_scalar_kij_ev is not None:
+			io.create_dataset("hartree_scalar_kij_ev",
+				shape=tuple(hartree_scalar_kij_ev.shape),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_scalar_kij_ev", "V_H_scalar"))
+			io.write_slab("hartree_scalar_kij_ev", hartree_scalar_kij_ev)
+		if hartree_transverse_kij_ev is not None:
+			io.create_dataset("hartree_transverse_kij_ev",
+				shape=tuple(hartree_transverse_kij_ev.shape),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_transverse_kij_ev", "H_transverse"))
+			io.write_slab(
+				"hartree_transverse_kij_ev", hartree_transverse_kij_ev)
 		if eval_rel_extracted is not None:
 			# The two facts that make this array usable ride ON it: which
 			# spectrum it is, and how much of it the ω grid could answer
@@ -1423,8 +1555,9 @@ def read_sigma_eqp_diagonal_window(
 	It resolves file-wedge rows through :func:`read_star_map` and
 	:func:`k_irr_rows_for`, then issues scalar/vector diagonal hyperslabs;
 	neither a full ``(nω,nk,nb,nb)`` cube nor a full ``(nk,nb,nb)`` matrix
-	is ever materialized on rank 0.  New schema-v3 artifacts do not call this
-	function at all: they are served by their small completed-assembly receipt.
+	is ever materialized on rank 0.  New schema-v3/v4 artifacts do not call
+	this function at all: they are served by their small completed-assembly
+	receipt.
 	"""
 	abs_path = os.path.abspath(filepath)
 	b0, b1 = int(band_start), int(band_stop)
@@ -1514,7 +1647,7 @@ def _raw_operator_stamp_errors(h5):
 	def _text(value):
 		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
-	present = [name for name in SIGMA_CUBE_DATASETS if name in h5]
+	present = [name for name in SIGMA_RAW_OPERATOR_DATASETS if name in h5]
 	bad = []
 	for name in present:
 		attrs = h5[name].attrs
@@ -1527,6 +1660,37 @@ def _raw_operator_stamp_errors(h5):
 				or version != SIGMA_OPERATOR_STATE_VERSION):
 			bad.append(name)
 	return present, bad
+
+
+def _validate_raw_direct_component_contract(h5, *, required):
+	"""Validate the additive raw Hdir/V_H/H_T layout without loading cubes."""
+	def _text(value):
+		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+	names = ("hartree_kij_ev",) + SIGMA_DIRECT_COMPONENT_DATASETS
+	companions = tuple(
+		name for name in SIGMA_DIRECT_COMPONENT_DATASETS if name in h5)
+	if not companions and not required:
+		return False
+	present = tuple(name for name in names if name in h5)
+	if present != names:
+		raise ValueError(
+			"partial raw direct-field component layout: expected "
+			f"{names}, found {present}.")
+	shapes = tuple(tuple(h5[name].shape) for name in names)
+	if len(set(shapes)) != 1:
+		raise ValueError(
+			f"raw Hdir/V_H/H_T shapes disagree: {shapes}.")
+	for name in names:
+		attrs = h5[name].attrs
+		if (_text(attrs.get(DIRECT_FIELD_SUM_RULE_ATTR, "missing"))
+				!= DIRECT_FIELD_SUM_RULE
+				or not bool(attrs.get(DIRECT_FIELD_SUM_FULL_BZ_ATTR, False))
+				or not bool(attrs.get(DIRECT_FIELD_SUM_FILE_WEDGE_ATTR, False))):
+			raise ValueError(
+				f"{name} lacks the authenticated full-BZ/file-wedge "
+				f"{DIRECT_FIELD_SUM_RULE!r} contract.")
+	return True
 
 
 def append_eqp_assembly_receipt_h5(
@@ -1579,6 +1743,21 @@ def append_eqp_assembly_receipt_h5(
 	c = np.asarray(assembly.sigma_c_at_dft_diag_ev, dtype=np.complex128)
 	c_omega = np.asarray(
 		assembly.sigma_c_omega_diag_ev, dtype=np.complex128)
+	h_transverse_obj = getattr(
+		assembly, "hartree_transverse_diag_ev", None)
+	component_aware = h_transverse_obj is not None
+	receipt_schema = (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		if component_aware else EQP_ASSEMBLY_SCHEMA_VERSION)
+	h_components = None
+	if component_aware:
+		h_scalar = np.asarray(
+			assembly.hartree_scalar_diag_ev, dtype=np.float64)
+		h_transverse = np.asarray(h_transverse_obj, dtype=np.float64)
+		_assert_direct_field_sum(
+			h, h_scalar, h_transverse,
+			where="component-aware EQP assembly receipt")
+		h_components = np.stack((h_scalar, h_transverse), axis=0)
 	if h.ndim != 2 or x.shape != h.shape or c.shape != h.shape:
 		raise ValueError(
 			"EQP assembly receipt needs matching (nk_file_wedge, nb_window) "
@@ -1676,10 +1855,22 @@ def append_eqp_assembly_receipt_h5(
 		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		if expected is None:
+			component_artifact_names = [name for name in (
+				*SIGMA_DIRECT_COMPONENT_DATASETS,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
+				if name in h5]
+			if component_aware or component_artifact_names:
+				raise ValueError(
+					f"{os.path.basename(abs_path)} has component-aware "
+					f"Hdir/V_H/H_T {component_artifact_names or 'assembly'} but no "
+					"schema-v4 expected marker; refusing to upgrade a legacy "
+					"artifact whose raw components cannot have the authenticated "
+					"full-BZ/file-wedge creation receipt.")
 			# A truly legacy raw file may be upgraded by this explicit appender.
 			# A new raw-stamped file without the creation marker is instead partial:
 			# accepting it would let an interrupted creation heal itself silently.
-			tagged = [name for name in SIGMA_CUBE_DATASETS if (
+			tagged = [name for name in SIGMA_RAW_OPERATOR_DATASETS if (
 				name in h5 and (
 					SIGMA_OPERATOR_STATE_ATTR in h5[name].attrs
 					or SIGMA_OPERATOR_STATE_VERSION_ATTR in h5[name].attrs))]
@@ -1703,25 +1894,49 @@ def append_eqp_assembly_receipt_h5(
 				expected_version = int(expected)
 			except (TypeError, ValueError):
 				expected_version = -1
-		if expected is not None and expected_version != EQP_ASSEMBLY_SCHEMA_VERSION:
+		if expected is not None and expected_version != receipt_schema:
 			raise ValueError(
 				f"{os.path.basename(abs_path)} expects EQP receipt schema "
 				f"{expected!r}; this writer only appends schema "
-				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+				f"{receipt_schema} for this payload.")
 		if expected is not None and bad:
 			raise ValueError(
 				f"{os.path.basename(abs_path)} has partial/unknown raw operator "
 				f"state on {bad}; refusing to append schema "
-				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
-		for name in (
+				f"{receipt_schema}.")
+		raw_components = _validate_raw_direct_component_contract(
+			h5, required=component_aware)
+		if raw_components != component_aware:
+			raise ValueError(
+				f"schema-v{receipt_schema} receipt/component mismatch: raw "
+				f"component-aware={raw_components}, assembly "
+				f"component-aware={component_aware}.")
+		if not component_aware:
+			foreign_components = [name for name in (
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
+				if name in h5]
+			if foreign_components:
+				raise ValueError(
+					"schema-v3 charge-only append refuses component receipt "
+					f"datasets {foreign_components}.")
+		candidate_names = [
 				EQP_ASSEMBLY_CANDIDATE_DATASET,
-				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET):
+				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET]
+		if component_aware:
+			candidate_names.append(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
+		for name in candidate_names:
 			if name in h5:
 				del h5[name]
 		ds = h5.create_dataset(EQP_ASSEMBLY_CANDIDATE_DATASET, data=values)
 		h5.create_dataset(
 			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET, data=c_omega)
-		ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR] = EQP_ASSEMBLY_SCHEMA_VERSION
+		if component_aware:
+			h5.create_dataset(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
+				data=h_components)
+		ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR] = receipt_schema
 		ds.attrs[EQP_ASSEMBLY_STATE_ATTR] = EQP_ASSEMBLY_STATE_READY
 		ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR] = EQP_ASSEMBLY_DFT_BAND_BASIS
 		ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR] = c_basis
@@ -1739,30 +1954,46 @@ def append_eqp_assembly_receipt_h5(
 		ds.attrs[EQP_ASSEMBLY_KIN_ION_HAS_HARTREE_ATTR] = bool(
 			assembly.kin_ion_has_hartree)
 		h5.flush()
-		for name in (EQP_ASSEMBLY_DATASET, EQP_ASSEMBLY_C_OMEGA_DATASET):
+		canonical_names = [
+			EQP_ASSEMBLY_DATASET,
+			EQP_ASSEMBLY_C_OMEGA_DATASET]
+		if component_aware:
+			canonical_names.append(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET)
+		for name in canonical_names:
 			if name in h5:
 				del h5[name]
 		h5.move(EQP_ASSEMBLY_CANDIDATE_DATASET, EQP_ASSEMBLY_DATASET)
 		h5.move(
 			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
 			EQP_ASSEMBLY_C_OMEGA_DATASET)
+		if component_aware:
+			h5.move(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET)
 		h5.flush()
 
 	if print_fn is not None:
+		component_text = (
+			" + authenticated scalar V_H/transverse H_T"
+			if component_aware else "")
 		print_fn(
 			f"  EQP assembly receipt -> {os.path.basename(abs_path)}: "
-			f"assembled H/X/C(E_DFT) {h.shape} + conditioned C(omega) "
+			f"schema v{receipt_schema}, assembled H/X/C(E_DFT) {h.shape} "
+			f"+ conditioned C(omega) "
 			f"{c_omega.shape}, DFT H/X/C, "
 			f"file wedge, {policy}, "
-			"source-resolved H; C(E_DFT) and Z share the conditioned curve")
+			f"source-resolved H{component_text}; C(E_DFT) and Z share the "
+			"conditioned curve")
 	return abs_path
 
 
 def read_eqp_assembly_receipt(filepath):
-	"""Read and validate the completed H/X/C + conditioned-curve receipt.
+	"""Read and validate a v3 charge-only or v4 component-aware receipt.
 
 	No canonical/candidate dataset means a legacy artifact.  A candidate or
 	unknown/partial canonical schema refuses rather than falling back to raw.
+	v4 additionally authenticates aggregate ``Hdir`` against persisted scalar
+	``V_H`` and transverse ``H_T``; v3 refuses those companions entirely.
 	"""
 	abs_path = os.path.abspath(filepath)
 
@@ -1777,12 +2008,16 @@ def read_eqp_assembly_receipt(filepath):
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
 		curve_present = EQP_ASSEMBLY_C_OMEGA_DATASET in h5
+		components_present = EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET in h5
+		raw_component_present = any(
+			name in h5 for name in SIGMA_DIRECT_COMPONENT_DATASETS)
 		candidate_names = [name for name in (
 			EQP_ASSEMBLY_CANDIDATE_DATASET,
-			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET) if name in h5]
+			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
+			EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET) if name in h5]
 		new_schema = bool(
 			expected is not None or canonical_present or curve_present
-			or candidate_names)
+			or components_present or raw_component_present or candidate_names)
 		present, bad = _raw_operator_stamp_errors(h5)
 		if new_schema:
 			# Every read that claims any new-schema state validates EVERY raw
@@ -1813,23 +2048,40 @@ def read_eqp_assembly_receipt(filepath):
 			expected_version = int(expected)
 		except (TypeError, ValueError):
 			expected_version = -1
-		if expected is None or expected_version != EQP_ASSEMBLY_SCHEMA_VERSION:
+		valid_versions = (
+			EQP_ASSEMBLY_SCHEMA_VERSION,
+			EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION,
+		)
+		if expected is None or expected_version not in valid_versions:
 			raise ValueError(
 				f"{os.path.basename(abs_path)} has unknown/partial EQP receipt "
 				f"expectation {expected!r}; expected "
-				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+				f"{valid_versions[0]} or {valid_versions[1]}.")
+		component_aware = (
+			expected_version == EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION)
+		raw_components = _validate_raw_direct_component_contract(
+			h5, required=component_aware)
+		if raw_components != component_aware:
+			raise ValueError(
+				f"schema-v{expected_version} receipt/raw component mismatch: "
+				f"raw component-aware={raw_components}.")
 		if candidate_names:
 			raise ValueError(
 				f"{os.path.basename(abs_path)} has an interrupted "
 				f"candidate write {candidate_names}; refusing a stale or "
 				"partial EQP reconstruction.")
-		if not canonical_present or not curve_present:
+		if (not canonical_present or not curve_present
+				or components_present != component_aware):
 			missing = [name for name, there in (
 				(EQP_ASSEMBLY_DATASET, canonical_present),
-				(EQP_ASSEMBLY_C_OMEGA_DATASET, curve_present)) if not there]
+				(EQP_ASSEMBLY_C_OMEGA_DATASET, curve_present),
+				(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
+				 components_present or not component_aware)) if not there]
+			extra = ([] if component_aware or not components_present else
+				[EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET])
 			raise ValueError(
 				f"{os.path.basename(abs_path)} expects an EQP assembly receipt "
-				f"but {missing} is missing.")
+				f"but missing={missing}, unexpected={extra}.")
 		ds = h5[EQP_ASSEMBLY_DATASET]
 		if not isinstance(ds, h5py.Dataset):
 			raise ValueError(f"{EQP_ASSEMBLY_DATASET} is not an HDF5 dataset.")
@@ -1859,10 +2111,10 @@ def read_eqp_assembly_receipt(filepath):
 		k_storage = _text(ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR])
 		hartree_state = _text(ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR])
 		policy = _text(ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR])
-		if version != EQP_ASSEMBLY_SCHEMA_VERSION:
+		if version != expected_version:
 			raise ValueError(
-				f"unsupported {EQP_ASSEMBLY_DATASET} schema {version}; expected "
-				f"{EQP_ASSEMBLY_SCHEMA_VERSION}.")
+				f"{EQP_ASSEMBLY_DATASET} schema {version} disagrees with "
+				f"expected marker {expected_version}.")
 		if (state != EQP_ASSEMBLY_STATE_READY
 				or hx_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
 				or c_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
@@ -1877,6 +2129,9 @@ def read_eqp_assembly_receipt(filepath):
 		values = np.asarray(ds[()], dtype=np.complex128)
 		c_omega = np.asarray(
 			h5[EQP_ASSEMBLY_C_OMEGA_DATASET][()], dtype=np.complex128)
+		h_components = (np.asarray(
+			h5[EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET][()],
+			dtype=np.complex128) if component_aware else None)
 		file_rows = np.asarray(
 			ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR], dtype=np.int64)
 		b0 = int(ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR])
@@ -1891,6 +2146,20 @@ def read_eqp_assembly_receipt(filepath):
 		if np.any(np.imag(values[:2]) != 0.0):
 			raise ValueError(
 				f"{EQP_ASSEMBLY_DATASET} H/X rows must be exactly real.")
+		if component_aware:
+			if (h_components.shape != (2,) + values.shape[1:]
+					or not np.all(np.isfinite(h_components))):
+				raise ValueError(
+					f"malformed {EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET} "
+					f"shape {h_components.shape}; expected "
+					f"{(2,) + values.shape[1:]}, or non-finite values.")
+			if np.any(np.imag(h_components) != 0.0):
+				raise ValueError(
+					f"{EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET} must be "
+					"exactly real.")
+			_assert_direct_field_sum(
+				np.real(values[0]), np.real(h_components[0]),
+				np.real(h_components[1]), where="persisted EQP receipt")
 		if (c_omega.ndim != 3 or c_omega.shape[1:] != values.shape[1:]
 				or not np.all(np.isfinite(c_omega))):
 			raise ValueError(
@@ -1948,6 +2217,10 @@ def read_eqp_assembly_receipt(filepath):
 				f"{diagnosis}")
 		return {
 			"hartree_diag_ev": np.real(values[0]),
+			"hartree_scalar_diag_ev": (
+				None if h_components is None else np.real(h_components[0])),
+			"hartree_transverse_diag_ev": (
+				None if h_components is None else np.real(h_components[1])),
 			"sigma_x_diag_ev": np.real(values[1]),
 			"sigma_c_at_dft_diag_ev": values[2],
 			"sigma_c_omega_diag_ev": c_omega,
@@ -1966,6 +2239,7 @@ def read_eqp_assembly_receipt(filepath):
 			"correlation_basis": c_basis,
 			"hartree_source": hartree_source,
 			"kin_ion_has_hartree": kin_ion_has_hartree,
+			"schema_version": expected_version,
 		}
 
 

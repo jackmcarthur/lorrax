@@ -69,6 +69,7 @@ from file_io import (
     write_head_scalars_to_h5,
     write_restart_state_to_h5,
 )
+from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 from gw.downfold import (
     BandWindow,
     R19_ANCHOR,
@@ -1010,8 +1011,9 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
     band_slices = (_BandSlices(geom["band_window"],
                                geom.get("band_window_split"))
                    if geom["band_window"] is not None else None)
-    policy = read_coulomb_policy_from_h5(
-        resolve_restart_file(cfg.source_restart))
+    parent_file = resolve_restart_file(cfg.source_restart)
+    policy = read_coulomb_policy_from_h5(parent_file)
+    from file_io.qp_wfn import read_qp_state_source_provenance
 
     # THE COULOMB POLICY IS INHERITED VERBATIM, and stamped.  The congruence
     # is LINEAR and applied AFTER the Dyson solve, so the head convention
@@ -1025,6 +1027,7 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
         V_qmunu=small["V_qmunu"], W0_qmunu=small["W0_qmunu"],
         G0_mu_nu=g0_S, enk_full=enk_full,
         mesh=mesh_xy, mode="w",
+        qp_state_source_record=read_qp_state_source_provenance(parent_file),
         kgrid=tuple(int(v) for v in geom["kgrid"]),
         band_slices=band_slices, coulomb_policy=policy)
     write_restart_state_to_h5(
@@ -1575,9 +1578,8 @@ def _frac_to_fft_idx(rows, fft_grid):
     ``file_io.centroids.load_centroids``'s arithmetic, restated on host numpy
     so this module can reproduce the index table a consumer will derive from a
     coordinate file — including its wrap of an index that rounds up ONTO the
-    grid extent.  Restated rather than imported for the same reason
-    :func:`_centroid_table_md5` is: what has to agree is the FORMULA, and
-    spelling it here is what makes a disagreement visible in review.
+    grid extent.  The resulting table is stamped by the canonical
+    :func:`file_io.wfn_basis.centroid_table_md5` owner.
     """
     fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
     idx = np.rint(np.asarray(rows, dtype=np.float64)[:, :3]
@@ -1585,28 +1587,6 @@ def _frac_to_fft_idx(rows, fft_grid):
     for a in range(3):
         idx[idx[:, a] == fg[a], a] = 0
     return idx
-
-
-def _centroid_table_md5(fft_idx) -> str:
-    """The parent bundle's ``centroids_charge_md5``, recomputed.
-
-    ONE-LINE COPY OF ``gw_init._centroid_table_md5`` AND THAT IS DELIBERATE
-    — but it is a copy of the FORMULA, not of a number: int64, C-order
-    bytes, md5.  It is restated here rather than imported because
-    ``gw.gw_init`` is the GW driver's setup module and pulls the whole
-    fitting stack in behind it, and because this file needs the hash for the
-    opposite purpose: gw_init STAMPS it, this VERIFIES it.
-
-    The thing worth writing down is what the hash is OF.  It is not the
-    content of ``centroids_frac_*.txt``: that file holds FRACTIONAL
-    coordinates and the stamp hashes the FFT-GRID INDICES they round to.
-    Comparing a text file's own md5 against the stamp therefore never
-    matches, which is a mistake this function exists to make unavailable.
-    """
-    import hashlib
-    arr = np.ascontiguousarray(np.asarray(fft_idx, dtype=np.int64))
-    return hashlib.md5(arr.tobytes()).hexdigest()
-
 
 def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
                              print_fn=print) -> tuple:
@@ -1778,7 +1758,8 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
     THE STAMP IS THE FFT-INDEX HASH, NOT THE TEXT FILE'S.  This function used
     to write ``md5(bytes of the .txt)``, which is a perfectly good hash of a
     different object: ``centroids_charge_md5`` is defined by
-    ``gw_init._centroid_table_md5`` as md5 over the int64 FFT-GRID INDICES,
+    ``file_io.wfn_basis.centroid_table_md5`` as md5 over the int64
+    FFT-GRID INDICES,
     and ``gw_init`` compares against it in exactly that algebra.  A bundle
     stamped the other way can never match, so the stamp was not merely
     unverifiable but actively false — a downfolded bundle handed to a fresh

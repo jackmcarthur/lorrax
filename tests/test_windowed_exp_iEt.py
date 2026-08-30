@@ -265,3 +265,52 @@ def test_build_G_tau_bounds_route_equals_the_materialised_mask_route(psis, enk, 
     old = _build_G_tau_pre_refactor(xn, yr, enk, t, e_ref=0.5,
                                     mask=((enk > E_MIN) & (enk <= E_MAX)))
     assert np.array_equal(np.asarray(new), np.asarray(old))
+
+
+# ---------------------------------------------------------------------------
+# Face layout (low_mem_bands) — refusal ladder.  build_G/build_G_tau's
+# ``layout='face'`` numeric path needs a real distrib_la.GemmPlan (cuBLASMp,
+# CUDA-only today), so its algebra parity against layout='legacy' is
+# certified on the real 4-rank CUDA gate
+# (tests/multi_device/low_mem_bands_g_projection_hartree_gate.py), not here.
+# What IS certified on plain CPU, with no mesh and no gemm plan at all: the
+# static-layout dispatch refuses cleanly before ever touching one, and the
+# legacy default (``layout='legacy'``, exercised by every test above this
+# section) is untouched by the parameter's addition.
+# ---------------------------------------------------------------------------
+
+def test_build_G_rejects_unknown_layout():
+    with pytest.raises(ValueError, match="layout"):
+        build_G(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
+               layout="bogus")
+
+
+def test_build_G_face_requires_a_gemm_plan():
+    with pytest.raises(ValueError, match="gemm"):
+        build_G(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
+               layout="face")
+
+
+def test_build_G_face_refuses_dense_Gij_by_name():
+    """Report obstacle #4's named escape hatch: a dense (non-diagonal)
+    band operator is not ported for face layout — refuse rather than
+    silently build a legacy-shaped contraction this layout cannot run.
+    A sentinel non-None ``gemm`` is enough to reach the refusal; it is
+    never called (Gij is checked first)."""
+    with pytest.raises(NotImplementedError, match="Gij"):
+        build_G(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
+               Gij=jnp.zeros((1, 1, 1)), layout="face",
+               gemm=lambda *a, **k: None)
+
+
+def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
+    """build_G_tau's own layout dispatch: the SAME refusals as build_G,
+    reached through the phase-computation wrapper — pinning that the
+    forward is wired, not merely that build_G itself refuses."""
+    enk = jnp.zeros((2, 3))
+    with pytest.raises(ValueError, match="layout"):
+        build_G_tau(jnp.zeros((1,)), jnp.zeros((1,)), enk, 1.0,
+                   layout="bogus")
+    with pytest.raises(ValueError, match="gemm"):
+        build_G_tau(jnp.zeros((2, 1, 1, 3)), jnp.zeros((2, 3, 1, 1)),
+                   enk, 1.0, layout="face")

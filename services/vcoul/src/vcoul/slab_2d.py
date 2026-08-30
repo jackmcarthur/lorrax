@@ -13,14 +13,51 @@ import numpy as np
 
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
-from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                          minibz_voronoi_batches, sample_minibz_qpoints)
+from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
+                          minibz_inscribed_sphere_r2,
+                          minibz_transverse_head_avg, minibz_voronoi_batches)
 
 __all__ = ["Slab2D"]
 
 
 class Slab2D:
     sys_dim = SysDim.SLAB_2D
+
+    @staticmethod
+    def _truncation_half_height_from_bvec(bvec) -> float:
+        """Return the incumbent ``zc = pi / b3z`` slab convention.
+
+        The Ismail--Beigi kernel in this class is defined only for the
+        repository's Cartesian orientation: ``b1,b2`` lie in ``xy`` and
+        ``b3`` points along ``+z``.  A negative ``b3z`` is not another
+        spelling of the same supported geometry; taking ``abs(b3z)`` would
+        silently invent an orientation convention outside this owner.
+        """
+        bvec = np.asarray(bvec, dtype=np.float64)
+        if bvec.shape != (3, 3) or not np.all(np.isfinite(bvec)):
+            raise ValueError(
+                "Slab2D requires finite (3,3) Cartesian reciprocal rows")
+        in_plane_scale = max(
+            float(np.linalg.norm(bvec[0, :2])),
+            float(np.linalg.norm(bvec[1, :2])), 1.0)
+        if max(abs(float(bvec[0, 2])), abs(float(bvec[1, 2]))) > (
+                1.0e-12 * in_plane_scale):
+            raise ValueError(
+                "Slab2D requires b1 and b2 in the Cartesian xy plane")
+        b3_scale = max(in_plane_scale, abs(float(bvec[2, 2])), 1.0)
+        if (float(bvec[2, 2])
+                <= 128.0 * np.finfo(np.float64).eps * b3_scale
+                or np.linalg.norm(bvec[2, :2]) > 1.0e-12 * b3_scale):
+            raise ValueError(
+                "Slab2D requires a finite nonzero b3 directed along "
+                "Cartesian +z; reversed or tilted slab orientation is "
+                "unsupported")
+        return float(np.pi / float(bvec[2, 2]))
+
+    @classmethod
+    def truncation_half_height(cls, geometry: CoulombGeometry) -> float:
+        """Return the supported slab's Ismail--Beigi half-height."""
+        return cls._truncation_half_height_from_bvec(geometry.bvec)
 
     def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,
                       bdot=None, fft_grid=None):
@@ -32,7 +69,7 @@ class Slab2D:
         last ulp, and this path is bit-compared against the pre-port table.
         """
         del bdot, fft_grid
-        zc = float(np.pi / float(bvec_f[2, 2]))
+        zc = self._truncation_half_height_from_bvec(bvec_f)
         qG_frac = qf[:, None] + gvec_q                        # (3, nG)
         qG_cart = bvec_f.T @ qG_frac                          # (3, nG)
         denom = np.sum(qG_cart * qG_cart, axis=0)             # (nG,)
@@ -78,6 +115,7 @@ class Slab2D:
         """
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = np.asarray(geometry.bvec, dtype=np.float64)
+        zc = self.truncation_half_height(geometry)
         shift_cart = np.asarray(shift_frac, dtype=np.float64) @ bvec
         dq = minibz_voronoi_batches(
             bvec, (nkx, nky, nkz), nsamples=nsamples, method=method,
@@ -86,7 +124,7 @@ class Slab2D:
         return minibz_average(
             shift_cart, dq, kind=kind, celvol=float(geometry.cell_volume),
             n_kpts=int(nkx * nky * nkz), q0sph2=q0sph2,
-            alpha=alpha, zc=float(np.pi / bvec[2, 2]),
+            alpha=alpha, zc=zc,
             analytic_sphere=False, adaptive=True, n_coarse=n_coarse)
 
     def q0_average(
@@ -105,15 +143,15 @@ class Slab2D:
                 "q->0 form requires its separate |q| kernel")
         nkx, nky, nkz = (int(s) for s in kgrid)
         bvec = jnp.asarray(geometry.bvec, dtype=jnp.float64)
-        zc = jnp.pi / bvec[2, 2]
+        self.truncation_half_height(geometry)  # orientation refusal
+        zc = jnp.pi / bvec[2, 2]  # retain the incumbent device arithmetic
 
         # 2D head is a |Q| cusp, not a 1/q² pole → no analytic sphere term;
         # the flag only widens the Voronoi fold (nmax 1→3, BGW ncell=3).
         # Default (flag off) keeps nmax=1 → bit-identical.
-        nmax = 3 if analytic_sphere else 1
-        batches = sample_minibz_qpoints(
+        batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, nmax=nmax, is_2d=True,
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True,
         )
         # Sobol path uses the per-rep formula with the *cosine* term included
         # (since rq.z is exactly zero by construction, cos(qz·zc) == 1, but
@@ -159,3 +197,35 @@ class Slab2D:
         wq = vc_q / (1.0 + vc_q * (kxy * kxy) * gamma)
         wcoul0 = 8.0 * jnp.pi * jnp.mean(wq)
         return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
+
+    def q0_average_transverse_tensor(
+        self, geometry: CoulombGeometry, kgrid, *,
+        nsamples: int = 2**18,
+        method: str = "sobol",
+        qmc_reps: int = 10,
+        analytic_sphere: bool = False,
+    ) -> np.ndarray:
+        """``T_ab = ⟨v_slab(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare Coulomb-
+        gauge transverse-projector head (bispinor TT), bare units (no
+        ``1/celvol``).  Same draw as :meth:`q0_average` (``nmax`` 1↔3 on
+        the same ``analytic_sphere`` flag, ``is_2d=True``), so a caller
+        pinned to the CC ``vc0`` sampler gets the SAME sample points for
+        the TT head — see :func:`~vcoul.minibz.minibz_transverse_head_avg`
+        for the estimator and the physics it replaces (the missing q=Γ,
+        G=0 slot of the bare TT tiles,
+        ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
+        """
+        nkx, nky, nkz = (int(s) for s in kgrid)
+        bvec = np.asarray(geometry.bvec, dtype=np.float64)
+        zc = self.truncation_half_height(geometry)
+        batches = _sample_q0_minibz_qpoints(
+            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
+            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True)
+        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=True)
+        return minibz_transverse_head_avg(
+            np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
+            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
+            q0sph2=q0sph2, zc=zc,
+            # The slab flag widens the draw's Voronoi fold only; the
+            # Baldereschi analytic sphere is the 3D 1/q^2 treatment.
+            analytic_sphere=False, adaptive=True)

@@ -60,6 +60,7 @@ from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_config import MinimaxConfig
 from .minimax_screening import (
+    GN_PPM_EXTREME_TAIL_DIVISOR,
     MinimaxNodes,
     fit_gn_ppm_from_wc_pair,
 )
@@ -71,6 +72,7 @@ from .ppm_windows import (
     _to_host_np,
     _CROSSING_A_MAX,
     crossing_regularization_floor,
+    hgl_partition_required,
     resolve_sigma_regularization,
 )
 from .ppm_tau_kernel import _get_sigma_tau_kernel, get_sigma_spatial_kernel
@@ -79,6 +81,26 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
+from .wavefunction_bundle import face_kernel_kwargs
+
+
+def _face_g_plan(mesh_xy: Mesh, face_shape):
+    """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
+    ``greens_function_kernel._build_G_face`` requires — mirrors
+    ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
+    (single source of truth: same GEMM shape, same convention, both
+    named as "built ONCE by the caller" in ``build_G``'s own docstring).
+    Used only by the invalid-pole static-limit term below
+    (:func:`_compute_invalid_static_sigma` /
+    :func:`_invalid_static_coh_by_bracket`), which runs O(1) times per
+    Σ_c(ω) evaluation — NOT per τ — so building this plan inline here
+    (rather than caching it, the way ``ppm_tau_kernel``'s per-τ hot-loop
+    factories do) is proportionate to its call frequency."""
+    from distrib_la import gemm_plan
+    nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
+    mu_s = n_rmu * ns
+    return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
+                     dtype=jnp.complex128)
 
 
 @dataclass(frozen=True)
@@ -135,10 +157,12 @@ class _SigmaBranchTiles(NamedTuple):
     place of the old device-assembled, branch-stripped jax.Array (comms fix,
     2026-07-28; evidence: AQ 4962c/P=64 gw.log branch tails — 4× device
     re-upload + 4× 64-process allgather of the full Σ slab, ~17-18 s of the
-    Σ stage).  ``tiles[d]`` is (n_ω_branch, nk, m_pad/p_x, n_pad/p_y) numpy
-    at global 4-D index ``tile_index[d]``; the driver sums branches at their
-    global ω indices and gathers ONCE at stage end.  The mesh pad block is
-    still attached (stripped once, after the gather).
+    Σ stage).  ``tiles[d]`` is
+    (n_bracket, n_ω_branch, nk, m_pad/p_x, n_pad/p_y) numpy at global 5-D
+    index ``tile_index[d]``; the driver sums branches at their global ω
+    indices and gathers ONCE at stage end.  The internal carrier tail is
+    still attached (zero mesh pad under legacy; higher loaded bands under
+    face) and is stripped once at publication.
     """
     tiles: list                      # list[np.ndarray], one per addressable shard
     tile_index: list                 # list[tuple[slice, ...]] 5-D global indices
@@ -147,7 +171,7 @@ class _SigmaBranchTiles(NamedTuple):
                                      # (the ω axis sits BETWEEN n_brk and nk_proj
                                      # in the assembled cube, so it is not here)
     sharding: NamedSharding          # P(None, None, None, 'x', 'y'), 5-D global
-    nb_real: int                     # real QP window extent (pre-pad), for strip
+    nb_real: int                     # published QP-window extent, for strip
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +368,8 @@ def fit_ppm(
     print_fn=None,
     model_label: str = "PPM",
     n_mu_logical: int,
+    q_neg_index: np.ndarray | None = None,
+    coarsen_extreme_tails: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -358,6 +384,15 @@ def fit_ppm(
     count.  The fitted tensors keep the padded extent, but pad modes are
     born DEAD (Ω = B = 0, valid = False) and the ``unfulfilled``
     fraction counts logical modes only — see ``fit_gn_ppm_from_wc_pair``.
+    ``q_neg_index`` is the public symmetry service's canonical full-grid
+    involution, passed from the driver rather than rebuilt at this layer.  It
+    is required only when ``coarsen_extreme_tails`` is true.
+
+    ``coarsen_extreme_tails=True`` is the fixed user-ruled GN-only policy.  It
+    preserves affected ``Wc(0)`` elements but changes their finite poles and
+    ``1/z^2`` moments, so it is not strict BGW pole parity.  It is explicit
+    here because the same algebra also fits HL poles, whose real-axis
+    two-point model must not silently inherit this GN policy.
     """
     import time as _t
     z = complex(probe_omega)
@@ -365,14 +400,18 @@ def fit_ppm(
 
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    omega_qmunu, b_qmunu, valid_qmunu, unfulfilled = fit_gn_ppm_from_wc_pair(
-        Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
-        n_mu_logical=int(n_mu_logical))
+    fit = fit_gn_ppm_from_wc_pair(
+         Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
+         n_mu_logical=int(n_mu_logical),
+         q_neg_index=q_neg_index,
+         coarsen_extreme_tails=bool(coarsen_extreme_tails))
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    Omega = jax.lax.with_sharding_constraint(jnp.asarray(omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(b_qmunu), q_shard)
-    valid_mask = jax.lax.with_sharding_constraint(jnp.asarray(valid_qmunu), q_shard)
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    valid_mask = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
@@ -404,7 +443,29 @@ def fit_ppm(
         kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
         print_fn(
             f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
-            f"unfulfilled={100.0 * unfulfilled:.2f}%")
+            f"unfulfilled={100.0 * fit.unfulfilled_fraction:.2f}%")
+        print_fn(
+            f"  {model_label} pole census: valid={fit.n_valid}, "
+            f"Omega=[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] Ry, "
+            f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
+            f"{fit.pair_relative_separation_min:.8e}")
+        if coarsen_extreme_tails:
+            budget = fit.n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
+            print_fn(
+                "  GN user-ruled fitted-pole tail policy: "
+                f"low={fit.n_tail_low}/{budget}, "
+                f"high={fit.n_tail_high}/{budget}; "
+                f"[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] -> "
+                f"[{fit.omega_min_after:.8e}, {fit.omega_max_after:.8e}] Ry; "
+                f"anchor={fit.tail_anchor_omega:.8e} Ry; boundary key groups "
+                "are atomic before orbit closure; physical partner orbits "
+                "remain unsplit and closure may further undershoot"
+            )
+            print_fn(
+                "  GN tail semantics: affected Wc(0) is preserved by "
+                "B'=-Wc(0)*Omega'/2; the 1/z^2 moment changes; this is not "
+                "BGW finite-pole parity; exact panes remain downstream."
+            )
 
     return PPMBuildResult(
         omega_p=probe_mag,
@@ -412,7 +473,7 @@ def fit_ppm(
         B_q=B,
         Omega_q=Omega,
         valid_mask_q=valid_mask,
-        unfulfilled_fraction=unfulfilled,
+        unfulfilled_fraction=fit.unfulfilled_fraction,
         n_nodes_static=n_nodes_static,
     )
 
@@ -523,6 +584,7 @@ def _integrate_tau_windows_for_branch(
     psi_proj_yn: jax.Array,
     tau_kernel: Callable[..., jax.Array],
     tau_kernel_x: Callable[..., jax.Array],
+    energy_windows: bool,
     log_tag: str,
     print_fn,
 ) -> None:
@@ -583,6 +645,12 @@ def _integrate_tau_windows_for_branch(
                     _om_lo, _om_hi = window_mask_B_bounds(win)
                     Om_lo_j     = jnp.asarray(_om_lo, dtype=jnp.float64)
                     Om_hi_j     = jnp.asarray(_om_hi, dtype=jnp.float64)
+                    E_min_j = jnp.asarray(
+                        -np.inf if win.E_min is None else win.E_min,
+                        dtype=jnp.float64)
+                    E_max_j = jnp.asarray(
+                        np.inf if win.E_max is None else win.E_max,
+                        dtype=jnp.float64)
                     E_ref_A_j   = jnp.asarray(win.E_ref_A, dtype=jnp.float64)
                     E_ref_B_j   = jnp.asarray(win.E_ref_B, dtype=jnp.float64)
 
@@ -592,13 +660,19 @@ def _integrate_tau_windows_for_branch(
                 kern = tau_kernel_x if use_merged_x else tau_kernel
 
                 def build_sigma_tau(t_j):
-                    out = kern(
+                    common = (
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
                         E_A, mask_A_j, B_q, Omega_q, base_mask_B,
                         Om_lo_j, Om_hi_j,
-                        E_ref_A_j, E_ref_B_j, t_j,
                     )
+                    if not energy_windows:
+                        out = kern(
+                            *common, E_ref_A_j, E_ref_B_j, t_j)
+                    else:
+                        out = kern(
+                            *common, E_min_j, E_max_j,
+                            E_ref_A_j, E_ref_B_j, t_j)
                     # Merged kernel emits the single complex X = ψ†σψ; the
                     # accumulator reads (X, None).  Two-channel kernel emits
                     # the (σ_re, σ_im) tuple unchanged.
@@ -735,22 +809,110 @@ def assert_sharded_sigma_window_divides_mesh(nb_proj: int, mesh_xy, *,
            " (compute_mode = mpa has no replicated cube plan)."))
 
 
-def strip_sigma_window(sigma_kij, nb_real: int):
-    """Drop the :func:`pad_sigma_window` pad block from a (..., m, n) Sigma.
+def _make_strip_sharded_sigma_window(mesh_xy: Mesh, ndim: int, nb_real: int):
+    """The device-array arm of :func:`strip_sigma_window`.
 
-    The pad rows/cols are exactly zero (bilinear in zero-padded psi); this is
-    the single seam where the padded extent stops.  No-op when unpadded.
+    Ordinary numpy-style trailing-axis indexing (``sigma_kij[..., :nb_real,
+    :nb_real]``) is illegal on a LIVE ``P(...,'x','y')``-sharded axis whenever
+    the sliced extent would not itself divide the mesh --
+    :func:`assert_sharded_sigma_window_divides_mesh` exists to refuse that
+    case before this function is ever reached; ``nb_real`` arriving here is
+    always mesh-divisible on both trailing axes.
+
+    Given that precondition, this applies EXACTLY the mechanism
+    :func:`gw.wavefunction_bundle.pack_band_window` already uses on its own
+    ψ pair -- ``jax.lax.slice_in_dim`` on each mesh-sharded axis followed by
+    ``jax.lax.with_sharding_constraint`` back onto the canonical
+    ``P(...,'x','y')`` spec, run inside a cached ``jax.jit`` -- to Σ_c's OWN
+    trailing (m, n) axes instead of ψ's band axis.  Same idiom, different
+    tensor; not a second mechanism (2026-08-23, the MPA split-Σ-window fix).
+    """
+    axis_m, axis_n = ndim - 2, ndim - 1
+    spec = P(*((None,) * axis_m), 'x', 'y')
+
+    @jax.jit
+    def strip(sigma_kij):
+        out = jax.lax.slice_in_dim(sigma_kij, 0, nb_real, axis=axis_m)
+        out = jax.lax.slice_in_dim(out, 0, nb_real, axis=axis_n)
+        return jax.lax.with_sharding_constraint(
+            out, NamedSharding(mesh_xy, spec))
+    return strip
+
+
+def _strip_sharded_sigma_window_kernel(mesh_xy: Mesh, ndim: int, nb_real: int):
+    """One compiled repack kernel per ``(mesh, ndim, nb_real)`` -- the same
+    ``common.wfn_transforms._cached_jit`` idiom
+    ``wavefunction_bundle._pack_band_window_kernel`` uses, so a caller that
+    revisits the same (layout, window) does not re-trace."""
+    from common.wfn_transforms import _cached_jit
+    return _cached_jit(
+        'strip_sharded_sigma_window', (id(mesh_xy), ndim, nb_real),
+        lambda: _make_strip_sharded_sigma_window(mesh_xy, ndim, nb_real))
+
+
+def strip_sigma_window(sigma_kij, nb_real: int, *, mesh_xy: Mesh | None = None):
+    """Publish the leading logical window of a wider (..., m, n) Sigma.
+
+    Under legacy the wider tail is :func:`pad_sigma_window`'s exact-zero
+    mesh pad (bilinear in zero-padded psi).  Under the face carrier it can
+    contain real higher-band matrix elements; selecting the leading block
+    is still exact because every output ``Sigma[k,m,n]`` is an independent
+    contraction.  This is the single seam where either internal carrier
+    stops.  No-op when the input already has the logical extent.
 
     BOTH trailing extents are tested: since ``pad_sigma_window`` pads m and n
     independently, one axis can be at the real extent while the other is
     padded (mesh 8×10, window 70 → m=72, n=70).  Testing only the last axis
     would have returned an m-padded Σ untouched.
+
+    ``mesh_xy`` (2026-08-23): pass this when ``sigma_kij`` is a LIVE
+    ``jax.Array`` still carrying a mesh-partitioned ``P(...,'x','y')``
+    sharding on its trailing axes -- both dynamic-Sigma face finalizers use
+    it today: ``gw.mpa.sigma._integrate_sigma_batches`` directly, and this
+    module after its per-rank HOST tiles have been reassembled as a live
+    sharded array.  It is the EXPLICIT switch to the mesh-aware repack kernel
+    (:func:`_strip_sharded_sigma_window_kernel`), not an implicit sniff of
+    ``sigma_kij``'s type: every existing host/numpy caller, and the unit
+    tests that build a bare single-device ``jnp.asarray`` cube, never pass
+    it and take the ordinary trailing-axis slice below completely
+    unchanged.  A genuinely mesh-sharded array arriving with ``mesh_xy =
+    None`` refuses loudly instead of silently mis-indexing.
     """
     if sigma_kij is None:
         return sigma_kij
-    if (int(sigma_kij.shape[-2]) == int(nb_real)
-            and int(sigma_kij.shape[-1]) == int(nb_real)):
+    nb_real = int(nb_real)
+    if (int(sigma_kij.shape[-2]) == nb_real
+            and int(sigma_kij.shape[-1]) == nb_real):
         return sigma_kij
+    # ``mesh_xy`` is the caller's explicit signal that ``sigma_kij`` is a
+    # LIVE mesh-sharded jax.Array, not an implicit type sniff: existing
+    # host/numpy AND plain single-device jax.Array callers (the unit tests
+    # in tests/test_sigma_window_pad.py build bare ``jnp.asarray`` cubes
+    # with no mesh at all) never pass it and take the ordinary slice below
+    # completely unchanged.
+    if mesh_xy is not None:
+        kernel = _strip_sharded_sigma_window_kernel(
+            mesh_xy, int(sigma_kij.ndim), nb_real)
+        return kernel(sigma_kij)
+    if isinstance(sigma_kij, jax.Array):
+        sharding = getattr(sigma_kij, "sharding", None)
+        if (isinstance(sharding, NamedSharding)
+                and sharding.spec[-2] is not None
+                and sharding.spec[-1] is not None):
+            # Defensive backstop for a FUTURE caller that forgets mesh_xy,
+            # not a path any current caller reaches: a genuinely
+            # mesh-sharded array here would silently mis-shard under the
+            # plain slice below (the exact hazard assert_sharded_sigma_
+            # window_divides_mesh exists to prevent upstream) rather than
+            # loudly refuse.
+            raise ValueError(
+                "strip_sigma_window: sigma_kij is mesh-sharded "
+                f"(spec={tuple(sharding.spec)}) on its trailing axes but "
+                "mesh_xy was not given -- ordinary indexing is illegal on "
+                "a P(...,'x','y')-sharded axis whose sliced extent would "
+                "not itself divide the mesh; pass mesh_xy so the legal "
+                "slice+reshard kernel (pack_band_window's own mechanism) "
+                "can run.")
     return sigma_kij[..., :nb_real, :nb_real]
 
 
@@ -777,6 +939,8 @@ def _run_sigma_branch(
     log_tag: str = "",
     print_fn=print,
     use_shipped_minimax_tables: bool = True,
+    packed_coh: tuple[tuple, tuple] | None = None,
+    partition_hgl: bool = False,
 ) -> tuple['_SigmaBranchTiles | None', list[_SigmaWindow]]:
     """Orchestrator for one branch (cond or val × pos or neg ω half).
 
@@ -788,25 +952,68 @@ def _run_sigma_branch(
     carrying the mesh pad — the driver sums branches on host and performs
     the single end-of-stage gather + strip (comms fix 2026-07-28, see
     _SigmaBranchTiles).  Empty branches return ``None``.
+
+    ``packed_coh`` (2026-08-23): ``(psi_coh_xn_tuple, psi_coh_yr_tuple)``
+    -- the PACKED per-bracket carrier pairs (``wavefunction_bundle.
+    pack_band_window``), built ONCE by ``compute_sigma_c_ppm_omega_grid``
+    before the branch loop and passed to EVERY branch unchanged (every
+    branch integrates the SAME psi window; only ``E_A``/``base_mask_A``
+    differ by branch).  ``None`` (the default) keeps the mask-bracket /
+    legacy behaviour exactly as before this parameter existed -- see
+    ``_get_sigma_tau_kernel``'s own ``pack_brackets`` docstring for when
+    the caller should supply this.
     """
     omega_nonneg_ry = np.asarray(omega_nonneg_ry, dtype=np.float64)
     n_omega = int(omega_nonneg_ry.shape[0])
 
     s = wfns.slices
-    psi_coh_xn = wfns.xn(s.full)
-    psi_coh_yr = wfns.yr(s.full)
-    psi_proj_xr = wfns.xr(s.sigma)
-    psi_proj_yn = wfns.yn(s.sigma)
-    nk_proj = int(psi_proj_xr.shape[0])
-    # Mesh-pad the QP band window: the reduce-scatter projector and the
-    # Sigma_c tile sink both need m % p_x == 0 / n % p_y == 0 (see
-    # pad_sigma_window).  ``nb_proj`` stays the REAL window everywhere the
-    # caller can see; only the in-branch machinery runs at ``nb_pad``.
-    psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
-        psi_proj_xr, psi_proj_yn, mesh_xy)
-    # m and n are padded to DIFFERENT extents in general (m→p_x, n→p_y).
-    m_pad = int(psi_proj_xr.shape[1])
-    n_pad = int(psi_proj_yn.shape[3])
+    face_kwargs = face_kernel_kwargs(wfns)
+    pack_brackets = packed_coh is not None
+    if wfns.layout == "legacy":
+        psi_coh_xn = wfns.xn(s.full)
+        psi_coh_yr = wfns.yr(s.full)
+        psi_proj_xr = wfns.xr(s.sigma)
+        psi_proj_yn = wfns.yn(s.sigma)
+        nk_proj = int(psi_proj_xr.shape[0])
+        # Mesh-pad the QP band window: the reduce-scatter projector and the
+        # Sigma_c tile sink both need m % p_x == 0 / n % p_y == 0 (see
+        # pad_sigma_window).  ``nb_proj`` stays the REAL window everywhere
+        # the caller can see; only the in-branch machinery runs at
+        # ``nb_pad``.
+        psi_proj_xr, psi_proj_yn, nb_proj = pad_sigma_window(
+            psi_proj_xr, psi_proj_yn, mesh_xy)
+        # m and n are padded to DIFFERENT extents in general (m→p_x, n→p_y).
+        m_pad = int(psi_proj_xr.shape[1])
+        n_pad = int(psi_proj_yn.shape[3])
+    else:
+        # Face carrier (2026-08-22): psi_mun/psi_nmu span the FULL
+        # [b0,b4) loaded extent and cannot be sliced/windowed to the Σ
+        # band window s.sigma (report obstacle #3) — used UNSLICED for
+        # both the G-build ("coh") and projection ("proj") roles, same
+        # operand identity as cohsex_sigma's own face kernels.  The
+        # in-branch accumulator therefore runs at ``nb_full`` (already
+        # mesh-divisible, BandSlices.b4's own invariant — no padding
+        # needed), NOT the physical Σ window.  ``nb_proj`` still carries
+        # the FINAL desired extent (nb_sigma): the driver's
+        # ``strip_sigma_window`` call slices the fully-gathered/replicated
+        # host array down to it after the τ loop, which is valid at ANY
+        # extent (a plain host slice, not a sharding-divisibility
+        # constraint) — see ``compute_sigma_c_ppm_omega_grid``'s
+        # ``assert tile_meta.nb_real == nb_proj``.
+        #
+        # ``packed_coh`` (2026-08-23): when the caller pre-packed the
+        # bracket carriers (multi-bracket plans), THOSE tuples are the
+        # "coh" operand instead of the bare resident psi_mun/psi_nmu --
+        # the only thing that changes for the packed route; the
+        # projection ("proj") operand is unaffected (bracket-invariant,
+        # always the full Sigma window's own psi).
+        psi_coh_xn = wfns.psi_mun if packed_coh is None else packed_coh[0]
+        psi_coh_yr = wfns.psi_nmu if packed_coh is None else packed_coh[1]
+        psi_proj_xr = wfns.psi_nmu
+        psi_proj_yn = wfns.psi_mun
+        nk_proj = int(meta.nk_tot)
+        nb_proj = int(s.nb_sigma)
+        m_pad = n_pad = int(s.nb_full)
 
     if n_omega == 0:
         return None, []
@@ -823,15 +1030,26 @@ def _run_sigma_branch(
             crossing_eps_q=crossing_eps_q, crossing_max_nodes=crossing_max_nodes,
             use_shipped_minimax_tables=use_shipped_minimax_tables,
             log_tag=log_tag, print_fn=print_fn,
+            partition_hgl=partition_hgl,
         )
     if not windows:
         return None, []
 
     omega_vec = jnp.asarray(omega_nonneg_ry, dtype=jnp.float64)
+    # Product cells do not make per-cell executables.  E/B bounds below are
+    # rank-0 scalar runtime operands to the incumbent cached kernel; this bool
+    # selects its one pre-existing bounded-energy compile family once for the
+    # whole branch.  ``omega_indices`` never reaches JAX at all: the canonical
+    # host accumulator slices/scatters that axis after each tau result.
+    energy_windows = any(
+        win.E_min is not None or win.E_max is not None for win in windows)
     tau_kernel = _get_sigma_tau_kernel(
         mesh_xy=mesh_xy,
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         brackets=brackets,
+        pack_brackets=pack_brackets,
+        energy_windows=energy_windows,
+        **face_kwargs,
     )
     # Merged Laplace-plan sibling kernel (the default and only path for
     # project="full" windows — owner order 2026-07-28); crossing windows
@@ -841,6 +1059,9 @@ def _run_sigma_branch(
         kgrid=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         merged_x=True,
         brackets=brackets,
+        pack_brackets=pack_brackets,
+        energy_windows=energy_windows,
+        **face_kwargs,
     )
 
     # One async-D2H accumulator over the memory-tile sink: Σ_c(ω,k,m,n)
@@ -862,6 +1083,7 @@ def _run_sigma_branch(
         psi_coh_xn=psi_coh_xn, psi_coh_yr=psi_coh_yr,
         psi_proj_xr=psi_proj_xr, psi_proj_yn=psi_proj_yn,
         tau_kernel=tau_kernel, tau_kernel_x=tau_kernel_x,
+        energy_windows=energy_windows,
         log_tag=log_tag, print_fn=print_fn,
     )
 
@@ -874,10 +1096,11 @@ def _run_sigma_branch(
     # drain here under this row; everything else overlaps).
     with timing.section("sigma.finalize"):
         tiles, tile_index, tile_devices = accumulator.finalize_host_tiles()
-    # The mesh pad block stays attached here; the driver strips it ONCE
-    # after the single end-of-stage gather (pad rows are exactly zero, so
-    # summing padded branch tiles then stripping equals stripping each
-    # branch — see pad_sigma_window/strip_sigma_window).
+    # The internal carrier tail stays attached here; the driver strips it
+    # ONCE after final assembly.  Under legacy it is zero mesh pad.  Under
+    # face it contains real higher-band matrix elements, but each output
+    # element is independent, so selecting the leading nb_sigma block after
+    # branch summation is the same operation as selecting it per branch.
     return _SigmaBranchTiles(
         tiles=tiles,
         tile_index=tile_index,
@@ -935,13 +1158,16 @@ def _compute_invalid_static_sigma(
     bands must enter with their fractional weights.
     """
     from common.collectives import gather_to_host
-    from .cohsex_sigma import build_Gij
+    from .cohsex_sigma import build_Gij, _occ_diag_full
     from .greens_function_kernel import build_G
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
+    face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
+    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+             if wfns.layout == "face" else None)
 
     with mesh_xy:
         W_static = jnp.where(
@@ -950,8 +1176,16 @@ def _compute_invalid_static_sigma(
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
         W_prep = spatial.prep_w(W_static)
-        psi_xr, psi_yn, nb_real = pad_sigma_window(
-            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+
+        if wfns.layout == "legacy":
+            psi_xr, psi_yn, nb_real = pad_sigma_window(
+                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        else:
+            # Face: project over the FULL nb_full extent (report §3), then
+            # strip to nb_sigma below — same "weight, don't window" +
+            # late-window pattern as cohsex_sigma's own face kernels.
+            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
+            nb_real = int(s.nb_sigma)
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -959,13 +1193,24 @@ def _compute_invalid_static_sigma(
         # free to overlap the occupied and RI contractions.  The production
         # fused-FFI route additionally keeps the R-space G tile inside its
         # bounded handler rather than materialising the decomposed FFT chain.
-        G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        if wfns.layout == "legacy":
+            G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
+        else:
+            nb_full = int(s.nb_full)
+            phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
+            G_occ = build_G(wfns.psi_mun, wfns.psi_nmu, phases=phases,
+                            layout="face", gemm=g_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_sx), nb_real), dtype=np.complex128)
         del G_occ, sig_sx
 
-        G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
+        if wfns.layout == "legacy":
+            G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
+        else:
+            mask = wfns.band_mask(s.sigma_sum).astype(jnp.complex128)
+            G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
+                           layout="face", gemm=g_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -1023,9 +1268,12 @@ def _invalid_static_coh_by_bracket(
     from common.collectives import gather_to_host
     from .greens_function_kernel import build_G
 
+    face_kwargs = face_kernel_kwargs(wfns)
     spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True)
+        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
+    g_plan = (_face_g_plan(mesh_xy, face_kwargs["face_shape"])
+             if wfns.layout == "face" else None)
 
     out = []
     with mesh_xy:
@@ -1035,12 +1283,27 @@ def _invalid_static_coh_by_bracket(
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
         W_prep = spatial.prep_w(W_static)
-        psi_xr, psi_yn, nb_real = pad_sigma_window(
-            wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        if wfns.layout == "legacy":
+            psi_xr, psi_yn, nb_real = pad_sigma_window(
+                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
+        else:
+            psi_xr, psi_yn = wfns.psi_nmu, wfns.psi_mun
+            nb_real = int(s.nb_sigma)
         for lo, hi in brackets:
-            G_ri = build_G(
-                wfns.xn(slice(int(lo), int(hi))),
-                wfns.yr(slice(int(lo), int(hi))))
+            if wfns.layout == "legacy":
+                G_ri = build_G(
+                    wfns.xn(slice(int(lo), int(hi))),
+                    wfns.yr(slice(int(lo), int(hi))))
+            else:
+                # "Weight, don't window" — the SAME bracket-as-mask
+                # substitute the tau kernel's own _bracketed_face uses:
+                # psi_mun/psi_nmu cannot be sliced to an arbitrary band
+                # sub-range, so the bracket becomes a band-range mask
+                # applied as a phase weight instead.
+                mask = wfns.band_mask(
+                    slice(int(lo), int(hi))).astype(jnp.complex128)
+                G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=mask,
+                               layout="face", gemm=g_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(
                 gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -1115,7 +1378,26 @@ def compute_sigma_c_ppm_omega_grid(
         plan, s, meta=meta, where="ppm_sigma bracket partition")
     brackets = plan.bounds
     n_brk = plan.n_brackets
-    psi_proj_xr = wfns.xr(s.sigma)
+    # SIGMA-PROCEDURE START: build each bracket's packed carrier pair ONCE
+    # here, before the branch loop below, and reuse it across every
+    # branch's own tau-node/omega-window integration (owner directive,
+    # 2026-08-23 -- "materialize the band slices as their own array
+    # copies at the start of the sigma procedure").  Only engaged for a
+    # GENUINE multi-bracket plan (band extrapolation): the trivial
+    # single-bracket plan's own packed pair would be the resident carrier
+    # unchanged (wavefunction_bundle.pack_band_window's own fast path),
+    # so there is nothing to gain from a second code path there -- see
+    # ppm_tau_kernel._get_sigma_kij_kernel's own docstring for the same
+    # scoping decision on the kernel side.
+    packed_coh = None
+    if wfns.layout == "face" and n_brk > 1:
+        from .wavefunction_bundle import pack_band_window
+        with timing.section("sigma.pack_brackets") as sec:
+            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
+                     for lo, hi in brackets]
+            packed_coh = (tuple(p[0] for p in packed),
+                          tuple(p[1] for p in packed))
+            sec.watch(packed_coh)
     enk_full = wfns.enk[:, s.full]
     occ_full = wfns.occ[:, s.full]
     B_q = ppm.B_q
@@ -1175,6 +1457,8 @@ def compute_sigma_c_ppm_omega_grid(
             f"    (A_core capped at {_CROSSING_A_MAX:.0f}; the requested ξ "
             f"would make the HGL crossing quadrature ill-conditioned)")
     regularization_width_ry = _xi.resolved_ry
+    partition_hgl = hgl_partition_required(
+        omega_values_ry, regularization_width_ry, edge_factor)
     fermi_reference = sigma_cfg.fermi_reference
     invalid_mode = ppm_cfg.invalid_mode
 
@@ -1285,9 +1569,18 @@ def compute_sigma_c_ppm_omega_grid(
                 axis=0)
 
     # Host-tile accumulation is the only mode (``kij_stream`` REMOVED
-    # 2026-07-31).
-    nk_proj = int(psi_proj_xr.shape[0])
-    nb_proj = int(psi_proj_xr.shape[1])
+    # 2026-07-31).  ``nk_proj``/``nb_proj`` are read off ``meta``/``s``
+    # directly (2026-08-22) rather than off a ``wfns.xr(s.sigma)`` probe
+    # slice — the FINAL Σ_c(ω,k,m,n) extent this driver publishes is
+    # ALWAYS (nk_tot, nb_sigma, nb_sigma) regardless of which internal
+    # accumulator extent ``_run_sigma_branch`` used to get there (nb_sigma
+    # itself under legacy; the mesh-divisible nb_full under face — see
+    # that function's own docstring), and reading it off ``wfns.xr``
+    # crashed under ``layout='face'`` (that accessor refuses by name;
+    # this WAS the exact crash site the low_mem_bands_dynamic_ppm_unported
+    # refusal's discovery run hit first).
+    nk_proj = int(meta.nk_tot)
+    nb_proj = int(s.nb_sigma)
     n_omega = int(omega_req.size)
     kij_bytes = float(n_omega * nk_proj * nb_proj * nb_proj * 16)
 
@@ -1334,6 +1627,8 @@ def compute_sigma_c_ppm_omega_grid(
         print_fn=print_fn,
         use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
         brackets=brackets,
+        packed_coh=packed_coh,
+        partition_hgl=partition_hgl,
     )
 
     # Enumerate the 4 branches (ω sign × cond/val), skipping empty ω halves.
@@ -1433,9 +1728,9 @@ def compute_sigma_c_ppm_omega_grid(
                     padded_shape, tile_meta.sharding, arrays)
                 full_pad = _to_host_np(
                     gathered, dtype=np.complex128, tiled=True)
-            # Strip the mesh pad block (exactly zero) — the ONE seam
-            # where the padded QP window stops; everything below (host
-            # Σ buffer, eqp write) sees only the real nb_proj extent.
+            # Strip the internal carrier tail — the ONE seam where the
+            # wider legacy-pad/face-full window stops; everything below
+            # (host Σ buffer, eqp write) sees only nb_proj.
             sigma_kij_host += strip_sigma_window(full_pad, nb_proj)
 
     # Sharded-layout tail: NO reconstruction collective.  The per-rank
@@ -1444,14 +1739,17 @@ def compute_sigma_c_ppm_omega_grid(
     # static-COHSEX invalid-pole term added RANK-LOCALLY, are placed
     # back on their owning local devices (device_put of a process-local
     # buffer — no collective), and are published as ONE
-    # P(None,None,'x','y')-sharded jax.Array on the existing mesh.
+    # P(None,None,'x','y')-sharded jax.Array on the existing mesh.  Face
+    # tiles retain their nb_full carrier through that assembly and then use
+    # strip_sigma_window's canonical slice+reshard movement to publish
+    # nb_sigma -- the same output-side finalizer the MPA face executor uses.
     # Consumers (head injection, diag extraction, QSGW build,
     # sigma_mnk.h5 SlabIO write) read this array at its native
     # sharding.  The timing row exists to PROVE the tail stays ~0 s
     # (it replaces 'sigma.host_gather', which does not run here).
     if sharded_layout:
         with timing.section("sigma.tile_finalize"):
-            gshape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
+            logical_shape = (n_brk, n_omega, nk_proj, nb_proj, nb_proj)
             if tile_acc is None:
                 # No branch produced tiles (all-empty branches): a zero
                 # Σ_c, mirroring the replicated path's untouched zeros
@@ -1460,21 +1758,28 @@ def compute_sigma_c_ppm_omega_grid(
                 sharding = NamedSharding(
                     mesh_xy, P(None, None, None, 'x', 'y'))
                 devices = list(sharding.addressable_devices)
-                dmap = sharding.devices_indices_map(gshape)
-                local_shape = sharding.shard_shape(gshape)
+                dmap = sharding.devices_indices_map(logical_shape)
+                local_shape = sharding.shard_shape(logical_shape)
                 tile_acc = [np.zeros(local_shape, dtype=np.complex128)
                             for _ in devices]
                 tile_index = [tuple(dmap[d]) for d in devices]
+                assembled_shape = logical_shape
             else:
                 assert tile_meta.nb_real == nb_proj
-                # The divisibility refusal above guarantees the mesh pad
-                # resolved to identity — padded extents ARE the real
-                # extents (pattern #7: assert it, don't assume it).
-                assert tuple(int(s) for s in tile_meta.spatial_padded) \
-                    == (n_brk, nk_proj, nb_proj, nb_proj), (
-                    f"sharded Σ layout saw a padded window "
-                    f"{tile_meta.spatial_padded} despite the "
-                    f"divisibility guard (nb={nb_proj})")
+                # spatial_padded is (n_brk, nk, m_carrier, n_carrier); the
+                # omega axis is inserted at position 1.  Under legacy the
+                # carrier is pad_sigma_window's mesh pad; under face it is
+                # nb_full.  Both are legal for the current sharding, and
+                # only the published nb_proj extent must satisfy the guard.
+                _sp = tuple(int(v) for v in tile_meta.spatial_padded)
+                assert (len(_sp) == 4
+                        and _sp[:2] == (n_brk, nk_proj)
+                        and _sp[2] >= nb_proj and _sp[3] >= nb_proj), (
+                    f"sharded Sigma tile metadata disagrees with the run: "
+                    f"spatial_padded={_sp}, expected "
+                    f"(n_bracket={n_brk}, nk={nk_proj}, "
+                    f"m_carrier>={nb_proj}, n_carrier>={nb_proj})")
+                assembled_shape = (_sp[0], n_omega) + _sp[1:]
                 sharding = tile_meta.sharding
                 devices = tile_meta.devices
                 tile_index = tile_meta.tile_index
@@ -1520,11 +1825,33 @@ def compute_sigma_c_ppm_omega_grid(
             # being asserted away in a comment, as it was here.
             if sigma_static_host is not None:
                 for d, ix5 in enumerate(tile_index):
-                    tile_acc[d][0] += sigma_static_host[tuple(ix5[2:])][None, ...]
+                    # Face tiles may extend beyond nb_proj with REAL
+                    # higher-band values, not a zero mesh pad.  Add the
+                    # logical static term only on the overlap and leave the
+                    # carrier tail untouched for the canonical strip below.
+                    # m/n are the only sharded axes; k is retained from ix5
+                    # so this remains correct if its replicated spec changes.
+                    k_ix, m_ix, n_ix = ix5[2:]
+                    m0, m1, ms = m_ix.indices(assembled_shape[-2])
+                    n0, n1, ns = n_ix.indices(assembled_shape[-1])
+                    assert ms == ns == 1, (
+                        f"Sigma tile indices must be unit-stride slices; "
+                        f"got m={m_ix}, n={n_ix}")
+                    m1 = min(m1, nb_proj)
+                    n1 = min(n1, nb_proj)
+                    if m0 < m1 and n0 < n1:
+                        tile_acc[d][0, :, :, :m1 - m0, :n1 - n0] += (
+                            sigma_static_host[k_ix, m0:m1, n0:n1][None, ...])
             arrays = [jax.device_put(t, dev)
                       for t, dev in zip(tile_acc, devices)]
             sigma_kij_sharded = jax.make_array_from_single_device_arrays(
-                gshape, sharding, arrays)
+                assembled_shape, sharding, arrays)
+            sigma_kij_sharded = strip_sigma_window(
+                sigma_kij_sharded, nb_proj, mesh_xy=mesh_xy)
+            assert tuple(int(v) for v in sigma_kij_sharded.shape) \
+                == logical_shape, (
+                    f"sharded Sigma finalizer published "
+                    f"{sigma_kij_sharded.shape}, expected {logical_shape}")
 
     # static_limit: fold the ω-independent invalid-pole static-COHSEX
     # term into Σ_c at every ω (host add; the sharded layout folded it

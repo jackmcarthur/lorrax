@@ -177,6 +177,28 @@ def _stub_config(mode: str, *, do_G0: bool = True):
     )
 
 
+def _stub_wfn_meta(nb: int = 4):
+    """Minimal ``wfn``/``meta`` for a PURE DISPATCH test.
+
+    Added 2026-08-23 (audit finding: D3's preflight refusals read
+    ``wfn``/``meta`` unconditionally at the TOP of
+    ``load_head_velocity_source``, ahead of the mode dispatch this
+    section actually tests -- the original ``wfn=None, meta=None`` calls
+    below crashed with ``AttributeError`` on ``meta.b_id_4_user`` before
+    ever reaching either loader).  ``energies`` has exactly ``nb``
+    columns, which trips ``_refuse_degenerate_window_edge``'s own
+    documented no-op guard (``e.shape[1] <= nb``: "no bands beyond the
+    window are on hand" -- an honest scope limit, not a pass) rather than
+    exercising real degeneracy physics this section is not testing.
+    ``kgrid`` is a clean 8x8x8 so the per-axis stencil preflight
+    (``parallel_transport`` mode only) is silent too.
+    """
+    wfn = SimpleNamespace(
+        energies=np.zeros((1, nb)), kgrid=(8, 8, 8), trs_holds=None)
+    meta = SimpleNamespace(b_id_4_user=nb)
+    return wfn, meta
+
+
 @pytest.fixture
 def armed_loaders(monkeypatch):
     """Both loaders replaced: PT raises, DFT-velocity records its path."""
@@ -200,9 +222,10 @@ def armed_loaders(monkeypatch):
 
 def test_dft_velocity_never_calls_the_parallel_transport_loader(
         armed_loaders, tmp_path):
+    wfn, meta = _stub_wfn_meta()
     got = load_head_velocity_source(
         _stub_config("dft_velocity"), str(tmp_path),
-        mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+        mesh=None, wfn=wfn, meta=meta, print_fn=lambda *a, **k: None)
     assert got is _SENTINEL
     assert "parallel_transport" not in armed_loaders
     assert armed_loaders["dft_velocity"] == str(
@@ -212,10 +235,11 @@ def test_dft_velocity_never_calls_the_parallel_transport_loader(
 def test_the_transport_arm_does_call_it(armed_loaders, tmp_path):
     # Control: without this cell the one above would also pass if the
     # dispatch loaded nothing at all, or if the monkeypatch missed.
+    wfn, meta = _stub_wfn_meta()
     with pytest.raises(AssertionError, match="must not be reached"):
         load_head_velocity_source(
             _stub_config("parallel_transport"), str(tmp_path),
-            mesh=None, wfn=None, meta=None, print_fn=lambda *a, **k: None)
+            mesh=None, wfn=wfn, meta=meta, print_fn=lambda *a, **k: None)
     assert "parallel_transport" in armed_loaders
 
 
@@ -239,10 +263,11 @@ def test_both_modes_refuse_without_do_G0(armed_loaders, tmp_path, mode):
 
 def test_the_dispatch_announces_the_dropped_correction(
         armed_loaders, tmp_path):
+    wfn, meta = _stub_wfn_meta()
     lines: list[str] = []
     load_head_velocity_source(
         _stub_config("dft_velocity"), str(tmp_path),
-        mesh=None, wfn=None, meta=None,
+        mesh=None, wfn=wfn, meta=meta,
         print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
     said = "\n".join(lines)
     assert "DFT p-matrix velocity" in said
@@ -286,7 +311,9 @@ def _head_fixture(seed: int):
         U=U, bvec=bvec,
         omegas=np.asarray([0.31 + 0.05j, 0.77 + 0.05j, 1.4 + 0.05j]),
         wfn=SimpleNamespace(nspin=1),
-        meta=SimpleNamespace(cell_volume=97.3, nk_tot=nk, nspinor=2),
+        meta=SimpleNamespace(
+            cell_volume=97.3, nk_tot=nk, nspinor=2,
+            nspinor_wfnfile=2),
         config=SimpleNamespace(head=SimpleNamespace(wcoul0_eta=0.0)),
     )
 

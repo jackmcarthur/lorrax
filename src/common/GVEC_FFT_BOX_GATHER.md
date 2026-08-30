@@ -38,15 +38,14 @@ At runtime, pad `cnk` with one zero row at index `ngkmax`, then:
 psi[..., k, nx, ny, nz] = cnk_padded[..., k, inv[k, nx, ny, nz]]
 ```
 
-One `jnp.take` per k (trivially vmapped or absorbed into a flat
-single-gather via `flat_idx = k*(ngkmax+1) + inv[k,...]`).  Measured
-in `common/phdf5_wfn_read_test.py`: **800 ms scatter → 90 ms gather**
-at MoS2 3×3 scale; scatter correctness drops out automatically
-because the sentinel row is zero.
+One `jnp.take` over the flattened `(k,G)` plane uses
+`flat_idx = k*(ngkmax+1) + g_index[k,...]`.  Scatter correctness drops out
+automatically because the sentinel row is zero.
 
-## Proposed utility
+## Current ownership
 
-`src/common/gvec_fft_box.py`:
+`src/common/gvec_fft_box.py` owns the padded G-vector representation and the
+host-built inverse index:
 
 ```python
 def build_g_index_for_fft_box(
@@ -55,11 +54,13 @@ def build_g_index_for_fft_box(
     """g_index[k, nx, ny, nz] = position of this box cell's coefficient
     within k's coefficient slab, or ngkmax (sentinel) if empty."""
 
-def make_fft_box_kernel(mesh, nk, ngkmax, nb_padded, nspinor, fft_grid):
-    """Returns a jitted callable (cnk_slab, g_index) -> psi_G_fft_box
-    that fills a sharded FFT box from a re/im-packed coefficient slab
-    in one gather (no scatter, no per-k loop)."""
 ```
+
+`src/common/wfn_transforms.py` owns the sole device gather and all FFT
+variants.  Its public `to_box`, `to_rbox`, `to_rmu`, and `to_rchunk` routes
+share `_box_kernel`, and their FFTs route through `common.fft_helpers`.
+Charge density, current density, matrix-element sweeps, qsgw density, kmeans,
+htransform, and the reusable Galerkin source consume that same implementation.
 
 Note the two DIFFERENT sentinels this file talks about:
 
@@ -72,46 +73,13 @@ Note the two DIFFERENT sentinels this file talks about:
 
 They are unrelated; the shared word is historical.
 
-Both are already used by `PhdfWfnReader` in
-`common/phdf5_wfn_reader.py`; available to any caller that holds
-per-k ngkmax-wide slabs in the same layout.
+## Design notes
 
-## Call sites that should migrate
-
-Hot (inner loop, big win):
-
-- **`common/load_wfns.py::read_Gvecs_to_devices`** — the band-chunked
-  G-space loader.  Already replaced in the new `phdf5_wfn_reader`;
-  the legacy host-numpy path stays as a fallback for non-FFI builds.
-
-Setup-time (correctness-consistency win, modest throughput gain):
-
-- **`psp/get_DFT_mtxels.py:227`** — `buf.at[Gx, Gy, Gz].set(row)` for
-  the DFT-matrix-element buffer.  Runs once at psp setup; migration
-  is a 3-line edit.
-- **`centroid/get_charge_density.py:37`** — `fft_box.at[ix, iy, iz].set(data_1d)`
-  for the charge density used as kmeans weight.  Runs once at
-  preprocessing.
-
-Verification/debug (migrate opportunistically):
-
-- **`gw/w_from_eps0_0d_check.py:243`** — 0D check code.
-
-Leave alone (host-numpy scatter is already fast):
-
-- `load_wfns.py:41` (`load_kpoint_fftbox`) — host numpy.
-- `load_wfns.py:223` (legacy `read_Gvecs_to_devices` k-loop) — host
-  numpy.  The new phdf5 reader obsoletes this path but we keep it
-  around as a non-FFI fallback.
-
-## Design notes for the utility
-
-- `inv` is keyed by `(gvecs_per_k, fft_grid)` which for a given WFN
-  file is constant.  Build once, reuse across every band chunk, every
-  iteration of every driver.
+- `g_index` is keyed by `(gvecs_per_k, fft_grid)` which for a given WFN
+  file is constant.  `WfnLoader.box_index_dev` builds/places it once and
+  reuses the same canonical device buffer across band chunks and drivers.
 - The sentinel scheme (`ngkmax` as "empty") only works if `cnk_padded`
-  always has a zero at that slot — the utility should either own the
-  padding or document the contract loudly.
+  always has a zero at that slot.  `_box_kernel` owns that append.
 - For variable-ngk (nosym/irreducible-wedge): the COEFFICIENTS are
   zero-padded per k to `ngkmax`, so the gather covers the shape
   uniformly with no per-k dynamic logic at runtime.  The G-VECTORS are
@@ -127,10 +95,6 @@ Leave alone (host-numpy scatter is already fast):
   that ever bites, shard `inv` on the k axis and build the gather
   under `shard_map`.
 
-## Why this is not a sweeping refactor
-
-Only the hot inner-loop site (`read_Gvecs_to_devices`) paid a real
-cost.  The setup-time JAX scatters are two-edit migrations worth
-doing the next time we're editing those files — not a dedicated
-project.  Host-numpy sites are already fine.  The win was always
-concentrated in the band-chunked GW loop.
+The device implementation is deliberately not exposed from
+`gvec_fft_box`: doing so would create a second compiled transform family and
+split FFT/sharding conventions from `wfn_transforms`.

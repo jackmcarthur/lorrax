@@ -14,6 +14,21 @@ impossible).  The output leaves the chain already block-sharded
 (m on 'x', n on 'y'); every partial bigger than the final tile lives only
 as a rank-local shard between the two collectives.
 
+That is the ``layout="legacy"`` (default) body, byte-identical to the
+code this module shipped before ``low_mem_bands`` existed.
+``layout="face"`` (the two-face carrier, ``gw.wavefunction_bundle``)
+solves the SAME projection with a completely different mechanism — two
+planned ``distrib_la.gemm_plan`` N,N GEMMs, no shard_map, no
+psum_scatter — because face's ψ operands are 2-D sharded on BOTH mesh
+axes from the start, unlike legacy's ``psi_xr``/``psi_yn`` (band axis
+replicated going in, sharded only at the output).  See
+:func:`contract_bands_block_reshard`'s own docstring and
+``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.  Face's
+``channels="split_reim"`` arm (2026-08-22) is the dynamic PPM/MPA
+Σ_c(τ) two-channel plan, consumed by ``gw.ppm_tau_kernel``'s own face
+dispatch — see this module's :func:`_face_project_kernel` for the
+mechanism.
+
 Structure (per rank, inside one shard_map)::
 
     right    = einsum(O_local, ψ_right_local)     contract (s', ν_Y-local)
@@ -160,7 +175,70 @@ __all__ = [
     "contract_bands_block_reshard",
     "bands_gemm_ffi_enabled",
     "bands_gemm_ffi_mode",
+    "merge_spin_centroid",
+    "split_spin_centroid",
 ]
+
+
+# ---------------------------------------------------------------------------
+# GEMM-seam (s, mu) merge — shared by this module's face-layout projector
+# and gw.greens_function_kernel's face-layout G builder (the low_mem_bands
+# two-face carrier, reports/gwjax_low_mem_bands_audit_2026-08-22/report.md).
+# ---------------------------------------------------------------------------
+
+def merge_spin_centroid(x, spin_axis: int, centroid_axis: int):
+    """Merge an adjacent (spin, centroid) axis pair into ONE axis, for a
+    cuBLASMp N,N GEMM operand at the two-face carrier's (s,μ) seam.
+
+    ``spin_axis`` must hold a REPLICATED axis (``s``/``ns`` — size 1 or 2 in
+    every deck this has run against) and ``centroid_axis`` the adjacent
+    MESH-SHARDED one (``mu``/``nu``); ``centroid_axis == spin_axis + 1`` is
+    required (every ψ_nmu/ψ_mun/O field in this codebase stores them that
+    way — ``wavefunction_bundle.PSI_MUN_SPEC``/``PSI_NMU_SPEC``,
+    ``contract_bands``'s own ``O`` operand).
+
+    **The merge ORDER is load-bearing, not cosmetic — MEASURED, not a
+    style choice.**  A plain ``reshape`` merging the pair in STORAGE order
+    (spin outer/major, centroid inner/minor — what a naive "flatten (s,mu)"
+    reading of the audit report would do) is not a free reshape: traced on
+    an emulated 2x2 mesh, it lowers to a genuine ``all-to-all`` collective
+    for ns > 1 (verified in a throwaway probe kept out of the tree; the
+    HLO contained ``all-to-all(...channel_id=...)`` with no
+    ``with_sharding_constraint`` able to avoid it).  Putting the SHARDED
+    axis major and the replicated spin axis minor — this function's
+    ``jnp.swapaxes`` THEN ``reshape`` — is the free direction: zero
+    collectives in the compiled HLO, bit-exact against plain NumPy
+    transpose+reshape, and every rank's local shard equals the slice a
+    genuinely chunked ``P(...,'x'|'y',...)`` array would hold at that
+    merged position.  :func:`split_spin_centroid` is the exact inverse.
+
+    Returns the array with the two axes replaced by one of size
+    ``spin_size * centroid_size``, centroid-major (``merged = c*ns + s``).
+    """
+    if centroid_axis != spin_axis + 1:
+        raise ValueError(
+            f"merge_spin_centroid: centroid_axis={centroid_axis} must be "
+            f"spin_axis={spin_axis} + 1 (adjacent, centroid immediately "
+            "after spin) — every face-layout field in this tree stores "
+            "them that way; a non-adjacent pair needs its own transpose "
+            "at the call site before this helper, not a silent extra one "
+            "hidden in here.")
+    xt = jnp.swapaxes(x, spin_axis, centroid_axis)
+    shape = xt.shape
+    merged = (shape[:spin_axis] + (shape[spin_axis] * shape[spin_axis + 1],)
+             + shape[spin_axis + 2:])
+    return xt.reshape(merged)
+
+
+def split_spin_centroid(x, axis: int, spin_size: int, centroid_size: int):
+    """Inverse of :func:`merge_spin_centroid`: split the merged axis at
+    ``axis`` (size ``spin_size * centroid_size``, centroid-major) back into
+    two axes ``(spin, centroid)`` at ``(axis, axis + 1)`` — restoring the
+    bundle's own storage order (spin outer, centroid inner)."""
+    shape = x.shape
+    unmerged = shape[:axis] + (centroid_size, spin_size) + shape[axis + 1:]
+    y = x.reshape(unmerged)
+    return jnp.swapaxes(y, axis, axis + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +296,129 @@ _DIVISIBILITY_MSG = (
     "is the existing helper.{hint}")
 
 
+#: ``(nk, nb_full, n_rmu, nspinor)`` — the four static ints
+#: :func:`contract_bands_block_reshard`'s face path needs to build its two
+#: ``distrib_la.gemm_plan``s EAGERLY (their shapes are fixed at
+#: construction; unlike the legacy shard_map body, which is
+#: shape-polymorphic).  A plain 4-tuple rather than a new dataclass: this
+#: is the only site that reads it, and every field already has a home
+#: name elsewhere (``Wavefunctions.slices.nb_full``, ``psi_mun.shape``).
+FaceProjectShape = tuple
+
+
+def _face_project_kernel(mesh_xy: Mesh, face_shape, axes: tuple[str, str],
+                         channels: str = "none", right_face_shape=None):
+    """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
+    no psum_scatter — cuBLASMp's own distributed algorithm does the
+    reduction the legacy body does by hand.  See the module docstring's
+    face-layout section and reports/gwjax_low_mem_bands_audit_2026-08-22/
+    report.md §5 ("Sigma = conj(psi_nmu) @ (O @ psi_mun)").
+
+        T[s,μ,n]     = Σ_{s',ν} O[s,μ,s',ν] · psi_mun[s',ν,n]      (GEMM 1)
+        Σ[m,n]       = Σ_{s,μ}  conj(psi_nmu)[m,s,μ] · T[s,μ,n]    (GEMM 2)
+
+    Both O's (s,μ) and (s',ν) pairs, and both ψ copies' (s,μ)/(s,ν) pairs,
+    go through :func:`merge_spin_centroid` — EVERY one of the four merges
+    needs the same measured majority-order fix (module docstring).  The
+    two GEMMs' operands land in their OWN natural specs with no further
+    reshard: O's own spec already places (s,μ) on 'x' and (s',ν) on 'y'
+    (this module's canonical O layout, layout-independent — Σ's operator
+    is not a ψ copy and does not change shape with ``layout``); psi_mun's
+    (s,ν) is already on 'x'; psi_nmu's (s,μ) is already on 'y'.  T comes
+    out of GEMM 1 already shaped like a ψ_mun-family operand (μ,s merged
+    on 'x', n on 'y'), which is exactly GEMM 2's required B operand.
+
+    ``channels="none"`` (default): the single merged-complex chain,
+    Σ = ψ†Oψ.  ``channels="split_reim"`` (2026-08-22, the dynamic PPM/MPA
+    Σ_c(τ) two-channel plan — see ``gw.ppm_tau_kernel.
+    _make_project_ri_reduce_scatter``'s identically-named legacy plan):
+    O is split into ``Re O``/``Im O`` BEFORE projection and EACH real
+    channel rides the SAME two-GEMM chain independently, returning
+    ``(S_R, S_I)`` — both complex (ψ is complex even though the channel
+    weight is real).  No f64-split de-promotion trick here: that lever
+    exists on the legacy XLA-einsum body to dodge XLA's real-operand
+    promotion inside a mixed-dtype ``jnp.dot``; a planned cuBLASMp GEMM
+    is typed ``complex128`` at construction regardless of the operand's
+    algebraic content, so there is nothing to de-promote — running the
+    SAME complex chain twice (once per channel) is already the minimal
+    form.  ``extra`` (BSE/Σ-channel stack axis) stays unsupported here —
+    see :func:`contract_bands_block_reshard`'s own guard; the dynamic
+    Σ_c(τ) band-bracket stack rides a Python loop over this kernel
+    instead (``ppm_tau_kernel._stack_channels``), not this axis.
+    """
+    from distrib_la import gemm_plan
+
+    ax_x, ax_y = axes
+    nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
+    if right_face_shape is None:
+        right_face_shape = face_shape
+    nk_right, nb_right, n_rmu_right, ns_right = (
+        int(v) for v in right_face_shape)
+    if (nk_right, nb_right, ns_right) != (nk, nb_full, ns):
+        raise ValueError(
+            "contract_bands_block_reshard(layout='face'): left/right "
+            "face shapes must share (nk, nb_full, nspinor); got "
+            f"{face_shape} and {right_face_shape}")
+    mu_s_left = n_rmu_left * ns
+    mu_s_right = n_rmu_right * ns
+    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_full, nq=nk,
+                      dtype=jnp.complex128)
+    plan2 = gemm_plan(mesh_xy, m=nb_full, k=mu_s_left, n=nb_full, nq=nk,
+                      dtype=jnp.complex128)
+
+    def _check(psi_nmu, O, psi_mun):
+        if psi_nmu.ndim != 4 or psi_mun.ndim != 4 or O.ndim != 5:
+            raise ValueError(
+                "contract_bands_block_reshard(layout='face'): expected "
+                "psi_nmu rank 4 (nk,n,s,mu), O rank 5 (nk,s,mu,s',nu), "
+                f"psi_mun rank 4 (nk,s,mu,n); got "
+                f"{tuple(psi_nmu.shape)}, {tuple(O.shape)}, "
+                f"{tuple(psi_mun.shape)}")
+        expected = (
+            (nk, nb_full, ns, n_rmu_left),
+            (nk, ns, n_rmu_left, ns, n_rmu_right),
+            (nk, ns, n_rmu_right, nb_full),
+        )
+        got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
+        if got != expected:
+            raise ValueError(
+                "contract_bands_block_reshard(layout='face'): rectangular "
+                f"endpoint shapes {got} do not match planned {expected}")
+
+    def _project_one(psi_nmu, O, psi_mun):
+        """``project(psi_left, O, psi_right)`` — SAME argument order as
+        the legacy closure (psi_left is the one conjugated inside): under
+        ``layout='face'`` that is ``(psi_nmu, O, psi_mun)``."""
+        O1 = merge_spin_centroid(O, 1, 2)             # (nk, M, s', nu)
+        O_flat = merge_spin_centroid(O1, 2, 3)         # (nk, M, K)
+        psi_mun_flat = merge_spin_centroid(psi_mun, 1, 2)  # (nk, K, n)
+        T = plan1(O_flat, psi_mun_flat)                # (nk, M, n)
+        psi_nmu_flat = merge_spin_centroid(psi_nmu, 2, 3)  # (nk, m, K)
+        A = jnp.conj(psi_nmu_flat)
+        return plan2(A, T)                             # (nk, m, n)
+
+    if channels == "none":
+        def project(psi_nmu, O, psi_mun):
+            _check(psi_nmu, O, psi_mun)
+            return _project_one(psi_nmu, O, psi_mun)
+        return project
+
+    if channels != "split_reim":
+        raise ValueError(
+            f"_face_project_kernel: channels must be 'none' or "
+            f"'split_reim', got {channels!r}")
+
+    def project_split(psi_nmu, O, psi_mun):
+        _check(psi_nmu, O, psi_mun)
+        O_re = jnp.real(O).astype(jnp.complex128)
+        O_im = jnp.imag(O).astype(jnp.complex128)
+        S_R = _project_one(psi_nmu, O_re, psi_mun)
+        S_I = _project_one(psi_nmu, O_im, psi_mun)
+        return (S_R, S_I)
+
+    return project_split
+
+
 def contract_bands_block_reshard(
     mesh_xy: Mesh,
     *,
@@ -225,6 +426,9 @@ def contract_bands_block_reshard(
     extra: str = "none",
     axes: tuple[str, str] = ("x", "y"),
     divisibility_hint: str = "",
+    layout: str = "legacy",
+    face_shape=None,
+    right_face_shape=None,
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -246,7 +450,8 @@ def contract_bands_block_reshard(
         windows; channel algebra: gw.ppm_tau_kernel + manual §7.5).
         Returns the tuple ``(S_R, S_I)``, both complex.  Incompatible
         with ``extra`` (refused): stack the channel pair yourself as a
-        real leading-extra operand if you need both.
+        real leading-extra operand if you need both.  **Legacy layout
+        only** — refused under ``layout='face'``, see below.
     extra
         ``"none"`` | ``"leading"`` | ``"minor"`` — position of the
         caller's stack axis E (see canonical layout).  Both orders are
@@ -255,18 +460,77 @@ def contract_bands_block_reshard(
         ``"minor"`` always takes the XLA plan (structural: the
         contracted axis is not GEMM-reachable without a full-tile
         transpose copy) — use ``"leading"`` where the GEMM plan matters.
+        **Legacy layout only** — refused under ``layout='face'``.
     axes
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
     divisibility_hint
         Extra caller-specific text appended to the divisibility refusal.
+    layout
+        ``"legacy"`` (default): the shard_map + psum_scatter body below,
+        BYTE-IDENTICAL to the code this module shipped before
+        ``low_mem_bands`` existed.
+        ``"face"``: the two-face carrier's ``psi_nmu``/``psi_mun``
+        operands (``gw.wavefunction_bundle``) — a completely different
+        mechanism (two planned ``distrib_la.gemm_plan`` N,N GEMMs, no
+        shard_map, no psum_scatter; see :func:`_face_project_kernel`),
+        because those operands are 2-D sharded on BOTH mesh axes from the
+        start (unlike legacy's ``psi_xr``/``psi_yn``, whose band axis is
+        REPLICATED going in and only becomes sharded at the output) — the
+        collective-based algorithm below is not expressible on them.
+        Requires ``face_shape``; ``channels`` may be ``"none"`` or
+        ``"split_reim"`` (2026-08-22 — the dynamic PPM/MPA Σ_c(τ)
+        two-channel plan, ported: see :func:`_face_project_kernel`).
+        ``extra`` must stay ``"none"`` (refused otherwise — the face
+        projector has no batched-stack axis; a caller with several
+        projections calls this kernel once per slice instead).
+    face_shape
+        ``(nk, nb_full, n_rmu, nspinor)`` — required when ``layout=
+        'face'``.  Fixes both GEMM plans' shapes EAGERLY at this call
+        (the reason this is a factory ARGUMENT and not read off an
+        operand at call time: a ``GemmPlan`` cannot be built from inside
+        a trace — see ``distrib_la.gemm_plan``'s own docstring).
+    right_face_shape
+        Optional ``(nk, nb_full, n_rmu_right, nspinor)`` for a rectangular
+        operator.  Omit for the historical square projection.  The two
+        endpoints must share ``nk``, ``nb_full`` and ``nspinor``; only their
+        centroid extents may differ.
 
     Returns
     -------
-    ``project(psi_left, O, psi_right)`` — a shard_map'd callable, safe to
-    jit / trace into larger kernels.  Output shardings per the canonical
-    layout table.
+    ``project(psi_left, O, psi_right)`` — safe to jit / trace into larger
+    kernels.  Legacy: a shard_map'd callable, output per the canonical
+    layout table.  Face: two chained planned GEMMs, output ``(nk, m, n)``
+    at ``P(None, ax_x, ax_y)`` — the SAME output spec as legacy's.
     """
+    if layout not in ("legacy", "face"):
+        raise ValueError(
+            f"contract_bands_block_reshard: layout must be 'legacy' or "
+            f"'face', got {layout!r}")
+    if layout == "face":
+        if channels not in ("none", "split_reim"):
+            raise ValueError(
+                f"contract_bands_block_reshard(layout='face'): channels="
+                f"{channels!r} not in ('none', 'split_reim')")
+        if extra != "none":
+            raise NotImplementedError(
+                "contract_bands_block_reshard(layout='face'): extra="
+                f"{extra!r} is not ported — the two-GEMM face projector "
+                "has no batched-stack axis; a caller with several "
+                "projections to make (Σ channels, band brackets) calls "
+                "this kernel once per slice instead (see "
+                "gw.ppm_tau_kernel._bracketed_face / _stack_channels).  "
+                "channels='split_reim' IS ported (2026-08-22, the dynamic "
+                "PPM/MPA Σ_c(τ) two-channel plan) — see "
+                "_face_project_kernel's docstring.")
+        if face_shape is None:
+            raise ValueError(
+                "contract_bands_block_reshard(layout='face') requires "
+                "face_shape=(nk, nb_full, n_rmu, nspinor)")
+        return _face_project_kernel(
+            mesh_xy, face_shape, axes, channels=channels,
+            right_face_shape=right_face_shape)
+
     from common.shard_map import shard_map
 
     if channels not in ("none", "split_reim"):

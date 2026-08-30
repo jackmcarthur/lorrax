@@ -5,6 +5,11 @@
     "error_bound": "largest_tabulated_le_requested",
     "max_nodes": "table_node_count_must_not_exceed_request"
   },
+  "shipping_rule": {
+    "kappa0_definition": "max over u in [1,R] of u * sum_l |alpha_l| exp(-tau_l u)",
+    "normal": 2.0,
+    "rejected_above": 2.0
+  },
   "conventions": {
     "noncrossing": {
       "problem": "1/x on [1, R]",
@@ -21,18 +26,24 @@
   "sweeps": {
     "error_bounds": [
       1e-06,
-      2e-07
+      2e-07,
+      6.86665972794514e-08,
+      3e-08,
+      1.837465441237269e-08
     ],
     "crossing_A_dim_values": [
       20.0,
+      24.0,
       40.0
     ],
     "noncrossing_R_values": [
       10.0,
       21.544346900318832,
       46.41588833612777,
+      92.36189541312946,
       100.0,
       215.44346900318823,
+      256.0,
       464.15888336127773,
       1000.0,
       2154.4346900318824,
@@ -67,6 +78,18 @@
       "node_count": 25,
       "max_error": 4.4319801295600314e-07,
       "file": "crossing/crossing_hgl_A_20p000000_eps_1p0em06_epsq_1p0em03.npz"
+    },
+    {
+      "family": "crossing",
+      "target_kind": "hgl",
+      "error_bound": 1.837465441237269e-08,
+      "error_metric": "linf_abs_target",
+      "range_param": "A_dim",
+      "range_max": 24.0,
+      "eps_q": 0.001,
+      "node_count": 38,
+      "max_error": 7.759544937147034e-09,
+      "file": "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"
     },
     {
       "family": "crossing",
@@ -166,6 +189,16 @@
     },
     {
       "family": "noncrossing",
+      "error_bound": 6.86665972794514e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 92.36189541312946,
+      "node_count": 11,
+      "max_error": 3.8641991384480434e-08,
+      "file": "noncrossing/noncrossing_R_92p361895_eps_6p9em08.npz"
+    },
+    {
+      "family": "noncrossing",
       "error_bound": 2e-07,
       "error_metric": "linf_abs_scaled_1_over_x",
       "range_param": "R",
@@ -191,7 +224,37 @@
       "range_param": "R",
       "range_max": 215.44346900318823,
       "node_count": 12,
-      "max_error": 5.882476629848893e-08,
+      "max_error": 5.882476630022365e-08,
+      "held_out_max_error": 5.882476630022365e-08,
+      "kappa0": 1.0000064579102943,
+      "kappa0_bound": 2.0,
+      "sum_abs_alpha": 9.994891821604686,
+      "rescale_max_error_ratio": 1.0000000000042621,
+      "payload_sha256": "0862590c242946b08bad3c02add9c5cfb823696fa57c678758284acd26cd357d",
+      "certified": true,
+      "certification": {
+        "method": "held-out log grid plus endpoints, analytic derivative roots, and bounded local extrema",
+        "held_out_grid_size": 20003,
+        "derivative_root_count": 23,
+        "local_refinement_count": 23,
+        "checks": [
+          "refined_error",
+          "positive_nodes",
+          "positive_weights",
+          "kappa0",
+          "rescale"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_minimax_assets.py",
+        "tool_sha256": "81901eb9888baf4c52cae617428b17417c9309f1df3f61a3a02f177fe832e2a0",
+        "generator_commit": "c55621b240699e83e692ef7827c5902d5f8c3353",
+        "numpy": "2.5.2",
+        "scipy": "1.18.0",
+        "python": "3.12.12",
+        "certifier": "held-out-log+derivative-roots+bounded-extrema/v1",
+        "backend_sha256": "aa3cd1db8d8fede38ebbb669ca8e1eb01ae129ad05f5b7de60c3da4d550dba74"
+      },
       "file": "noncrossing/noncrossing_R_215p443469_eps_2p0em07.npz"
     },
     {
@@ -203,6 +266,46 @@
       "node_count": 11,
       "max_error": 2.897007376212457e-07,
       "file": "noncrossing/noncrossing_R_215p443469_eps_1p0em06.npz"
+    },
+    {
+      "family": "noncrossing",
+      "error_bound": 3e-08,
+      "error_metric": "linf_abs_scaled_1_over_x",
+      "range_param": "R",
+      "range_max": 256.0,
+      "node_count": 13,
+      "max_error": 1.8089704512114224e-08,
+      "held_out_max_error": 1.8089691966594046e-08,
+      "kappa0": 1.0000026652201994,
+      "kappa0_bound": 2.0,
+      "sum_abs_alpha": 10.673212502643748,
+      "rescale_max_error_ratio": 0.9999999968039788,
+      "payload_sha256": "dbfbae3d3e36f143c863b45d5f565b9a077c77b7c53573f0269c82c2b94c9ff3",
+      "certified": true,
+      "certification": {
+        "method": "held-out log grid plus endpoints, analytic derivative roots, and bounded local extrema",
+        "held_out_grid_size": 20003,
+        "derivative_root_count": 25,
+        "local_refinement_count": 25,
+        "checks": [
+          "refined_error",
+          "positive_nodes",
+          "positive_weights",
+          "kappa0",
+          "rescale"
+        ]
+      },
+      "provenance": {
+        "tool": "tools/generate_minimax_assets.py",
+        "tool_sha256": "81901eb9888baf4c52cae617428b17417c9309f1df3f61a3a02f177fe832e2a0",
+        "generator_commit": "c55621b240699e83e692ef7827c5902d5f8c3353",
+        "numpy": "2.5.2",
+        "scipy": "1.18.0",
+        "python": "3.12.12",
+        "certifier": "held-out-log+derivative-roots+bounded-extrema/v1",
+        "backend_sha256": "aa3cd1db8d8fede38ebbb669ca8e1eb01ae129ad05f5b7de60c3da4d550dba74"
+      },
+      "file": "noncrossing/noncrossing_R_256p000000_eps_3p0em08.npz"
     },
     {
       "family": "noncrossing",

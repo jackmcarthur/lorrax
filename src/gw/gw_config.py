@@ -39,6 +39,11 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.four_current_model import (
+    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL,
+    PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+    resolve_four_current_representation,
+)
 
 # The estimator vocabulary lives with the estimators, not here: a second copy
 # of the value list is a second thing to keep in step.  ``band_extrapolation``
@@ -116,7 +121,7 @@ def env_float(name: str, default: float, *, print_fn=print,
     ``ISDF_CHUNK_TARGET_UTILIZATION`` parser used to commit.
 
     ``refuse=True`` is for knobs that GATE correctness rather than tune
-    performance (``LORRAX_FH_ORTHO_TOL``): running with the default while
+    performance (``LORRAX_FI_FSHOULDER_TOL``): running with the default while
     the user believes a gate threshold is in force is itself the silent
     failure, so garbage refuses loudly, naming the variable — the
     announce-or-refuse doctrine's refuse half.
@@ -283,6 +288,66 @@ class ComputeMode(str, enum.Enum):
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
         }.get(self)
+
+
+class BispinorGWMode(str, enum.Enum):
+    """How the four-current photon channels enter the GW self-energy.
+
+    This is orthogonal to :class:`ComputeMode`: that enum selects the
+    frequency ansatz, while this one selects which Lorentz blocks are screened
+    and contracted.  ``bare_transverse`` is the historical charge-screened +
+    bare-TT behavior and remains the default.
+    """
+
+    BARE_TRANSVERSE = "bare_transverse"
+    PAULI_REFERENCE_BARE_TRANSVERSE = PAULI_REFERENCE_BARE_TRANSVERSE_MODEL
+    ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE = (
+        ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE_MODEL)
+    FULL_STATIC_COHSEX = "full_static_cohsex"
+    CHARGE_HALL_CUBATURE = "charge_hall_cubature"
+
+
+def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
+    if isinstance(value, BispinorGWMode):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return BispinorGWMode(str(raw).strip().lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"bispinor_gw={raw!r} is not a known mode; expected one of: "
+            f"{', '.join(v.value for v in BispinorGWMode)}."
+        ) from exc
+
+
+def uses_raw_kinetic_balance_charge(
+    bispinor: bool,
+    bispinor_gw,
+) -> bool:
+    """Whether scalar charge channels use the raw four-spinor carrier.
+
+    ``bispinor`` continues to mean that spatial-current channels are enabled.
+    The explicitly named Pauli-reference comparison is the sole exception to
+    the historical rule that the same raw kinetic-balance carrier also enters
+    charge density, scalar screening, and scalar self-energy.  Keeping this
+    decision here prevents preprocessing, charge ISDF, and the live driver
+    from deriving the representation split independently.
+    """
+    if not bool(bispinor):
+        return False
+    mode = coerce_bispinor_gw_mode(bispinor_gw)
+    return mode in (
+        BispinorGWMode.BARE_TRANSVERSE,
+        BispinorGWMode.FULL_STATIC_COHSEX,
+        BispinorGWMode.CHARGE_HALL_CUBATURE,
+    )
+
+
+def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
+    """Whether finite-q scalar channels use a four-spinor carrier."""
+    return resolve_four_current_representation(
+        bool(bispinor), coerce_bispinor_gw_mode(bispinor_gw)
+    ).charge_bispinor
 
 
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
@@ -481,6 +546,36 @@ class ScreeningDiagrams(str, enum.Enum):
       Two-stage by construction — the RPA ``W(0)`` of the first stage IS
       the ``W_R`` the ladder kernel consumes — which is why this value
       changes the dataflow rather than one solver call.
+    - ``W_RPA_RESOLVENT`` — the SAME resolvent identity
+      ``W(ω) − v = v (ω − H)⁻¹ v`` evaluated with the RPA operator
+      (``H_RPA``, the ladder's own ``include_w=False`` limit: the direct
+      rung ``−W_R(0)`` is parameterized OUT of the ring matvec rather than
+      rebuilt by a second matvec — ``bse.bse_ring_comm.
+      build_bse_ring_matvec_full(..., include_W=False)`` — so this value
+      exercises the same operator family as ``w_bse``, minus one term).
+      DESIGNED to reproduce ``w_rpa``'s W to the minimax-quadrature floor,
+      and CERTIFIED to do so on the spinor fixture the existing unit
+      suite exercises (``tests/test_bse_w_ladder_identities.py``,
+      ``tests/test_w_bse_wiring_closure.py`` — ``gnppm_debug``, nspinor=2,
+      ~7e-12 agreement). **OPEN, MEASURED 2026-08-23 on a SCALAR
+      (nspinor=1) system: it does NOT.** A direct q=0 tile probe against
+      the incumbent ``W0_qmunu`` on a fresh scalar Si deck found a
+      38-61%-relative, P-independent, window-size-insensitive
+      disagreement (KNOWN_LORRAX_ISSUES.md, the
+      ``bse_w_exact._build_rpa_resolvent`` row) — high shape-correlation
+      (cos~0.999) but a non-uniform per-entry under-scaling, the
+      signature of a missing/misapplied occupation or spin-degeneracy
+      weight rather than a sign, operator, or solver-tolerance defect.
+      THIS IS UPSTREAM OF ``include_w``: the same shared ring term backs
+      ``w_bse`` too, and that feature's own first-ever scalar decks
+      (``runs/Si_scalar/01_wbse_ab_2026-08-16``) never finished far
+      enough to have compared against a reference, so the gap has been
+      latent and undetected since that feature shipped. Do not read this
+      value (or ``w_bse``) as certified-correct on a scalar mean field
+      until that row closes; it exists to gate the resolvent machinery
+      against the incumbent Dyson route on a diagram set simple enough to
+      have an independent right answer, and on THIS run it correctly
+      caught that the two disagree.
 
     WHY AN ENUM AND NOT A BOOL.  ``ladder_screening = true`` would name the
     one alternative that exists today and spend the axis: the resolvent
@@ -499,10 +594,30 @@ class ScreeningDiagrams(str, enum.Enum):
     cannot always express: a metallic WFN on a deck that declares nothing
     is refused at the stage instead, on the occupations themselves
     (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
+    ``w_rpa_resolvent`` is refused at parse time against ``x_only``, the
+    self-consistent QP solver, ``mc_average_placement != off`` and
+    ``compute_mode = mpa`` — audited against ``w_bse``'s table, not
+    copied: the x_only / broadening / SC-loop / head-placement arguments
+    transfer (some by MECHANISM, some as an inherited infrastructure
+    risk; see ``_W_RPA_RESOLVENT_REFUSALS``' own per-row comments), and
+    ``compute_mode = mpa`` is a NEW row here — MPA's ``wc_source`` seam
+    (``gw.screening_bse.make_ladder_wc_source``) has not been extended or
+    gated for the RPA-resolvent arm this session, unlike ``w_bse``, where
+    it is SUPPORTED.  INSULATORS ONLY has NO parse-time row for this
+    value: it is subsumed by the ``compute_mode = mpa`` refusal (a
+    declared metal requires ``compute_mode = mpa``, which is refused
+    unconditionally here, making a parallel deck-key predicate always
+    shadowed — see ``_W_RPA_RESOLVENT_REFUSALS``' comment at that site).
+    The certification and its enforcement survive in full through the
+    OTHER half w_bse already has: a metallic WFN on a deck that declares
+    nothing is refused at the stage, on the occupations themselves,
+    under the SAME ``{value}_insulators_only`` id pattern
+    (``gw.screening_bse``).
     """
 
     W_RPA = "w_rpa"
     W_BSE = "w_bse"
+    W_RPA_RESOLVENT = "w_rpa_resolvent"
 
 
 def coerce_screening_diagrams(value) -> ScreeningDiagrams:
@@ -625,8 +740,160 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
 )
 
 
+#: WHICH COMBINATIONS OF ``screening_diagrams = w_rpa_resolvent`` v1
+#: REFUSES, and why.  AUDITED against ``_W_BSE_REFUSALS`` above rather than
+#: copied: ``w_rpa_resolvent`` reaches the identical ladder facade
+#: (``gw.screening_bse.compute_screening_ladder``) with
+#: ``include_w=False`` -- ``H_RPA`` in place of ``H_BSE``, same ring
+#: matvec builder, same restart handoff, same head resolvent -- so every
+#: row below states, per rule, whether the ``w_bse`` row's MECHANISM
+#: survives the missing rung or only its INFRASTRUCTURE risk does.
+#:
+#: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``
+#: and ``qp_solver = one_shot_dft`` / ``fixed_point``.  Unlike ``w_bse``,
+#: ``mpa`` is NOT supported here (see its own row) -- ``w_bse``'s
+#: ``wc_source`` seam (``make_ladder_wc_source``) was extended and gated
+#: for the ladder; doing the same for the RPA-resolvent arm is a real port,
+#: not merely flipping ``include_w``, because ``make_ladder_wc_source``
+#: hard-codes ``include_w=True`` in its one call site and that call site's
+#: own persist-timing (first call, cached across MPA's sample plan) has
+#: not been audited for the RPA-resolvent arm.
+_W_RPA_RESOLVENT_REFUSALS: tuple[
+    tuple[str, object, object, str, str, str], ...] = (
+    (
+        "w_rpa_resolvent_needs_a_screened_mode",
+        lambda cfg: cfg.compute_mode is ComputeMode.X_ONLY,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "a mode that consumes W: cohsex or gn_ppm",
+        "drop screening_diagrams (or set it to w_rpa) for a bare-exchange "
+        "run, or pick a screened compute_mode",
+        "MECHANISM UNCHANGED from w_bse_needs_a_screened_mode: x_only "
+        "builds no W at all regardless of which operator the resolvent "
+        "would have solved, so a computed-and-discarded W is the same "
+        "waste either way",
+    ),
+    (
+        "w_rpa_resolvent_mpa_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.MPA,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "cohsex or gn_ppm, or screening_diagrams = w_bse / w_rpa under mpa",
+        "use cohsex or gn_ppm with w_rpa_resolvent, or keep compute_mode = "
+        "mpa with screening_diagrams = w_bse (the ladder, supported) or "
+        "w_rpa (the incumbent Dyson route)",
+        "NOT an audited w_bse row -- mpa is w_bse's own supported case. "
+        "gw.screening_bse.make_ladder_wc_source hard-codes include_w=True "
+        "at its one call site, and its persist-on-first-call timing "
+        "against MPA's own sample plan has not been extended or gated for "
+        "the RPA-resolvent arm this session. Refused by name rather than "
+        "silently falling back to mpa's plain RPA Dyson solve under this "
+        "diagram set's label",
+    ),
+    (
+        "w_rpa_resolvent_hl_ppm_broadening_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.HL_PPM,
+        lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
+        "cohsex (static resolvent) or gn_ppm (static + imaginary-axis "
+        "resolvent)",
+        "use gn_ppm, whose probe sits on the imaginary axis where the "
+        "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
+        "MECHANISM UNCHANGED from w_bse_hl_ppm_broadening_unimplemented: "
+        "(z - H_RPA)^-1 on the real axis needs the same undecided "
+        "broadening (eta / xi) policy the ladder's (z - H_BSE)^-1 does "
+        "-- the gap is in the SHIFTED SOLVE, not in the rung",
+    ),
+    (
+        "w_rpa_resolvent_self_consistency_unimplemented",
+        lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
+        lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
+        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "run w_rpa_resolvent single-shot; for a QSGW loop keep "
+        "screening_diagrams = w_rpa until the per-iteration cycle lands",
+        "INFRASTRUCTURE RISK INHERITED, MECHANISM DOES NOT LITERALLY "
+        "APPLY: H_RPA carries no rung, so ensure_W_R(include_W=False) "
+        "never reads a previous iteration's W(0) back -- the SPECIFIC "
+        "stale-rung failure w_bse's row names cannot occur here. But "
+        "compute_screening_ladder's persist-then-read restart handoff "
+        "(prepare_ladder_restart -> _ladder_wedge) is the SAME facade "
+        "call for both diagram values, its SC-loop provenance was never "
+        "built or audited for either arm (DESIGN_2026-08-15.md section "
+        "1), and this session gated only qp_solver=one_shot_dft. Refusing "
+        "conservatively rather than shipping an unaudited combination "
+        "under a new name",
+    ),
+    # NO PARSE-TIME "w_rpa_resolvent_insulators_only" ROW -- audited and
+    # found DEAD, not omitted by oversight.  ``w_bse_insulators_only``'s
+    # deck-key predicate (``mpa_material_class != insulator``) is only
+    # ever TRUE past ``_validate_metal_compute_mode``'s standing invariant
+    # (material_class = metal implies compute_mode = mpa, enforced in
+    # ``LorraxConfig.__post_init__`` BEFORE this table runs -- see
+    # ``metal_material_class_requires_mpa``), i.e. the predicate can only
+    # fire on a ``compute_mode = mpa`` deck.  ``w_rpa_resolvent_mpa_
+    # unimplemented`` above already refuses EVERY ``compute_mode = mpa``
+    # deck under this diagram set, unconditionally, and it appears FIRST
+    # in this tuple -- so a parallel insulators-only row here would be
+    # logically implied by, and always shadowed by, that row: the exact
+    # "narrowed row that is a STRICT SUBSET of an earlier row's predicate"
+    # shape the ``low_mem_bands_metal_material_class_unported`` /
+    # ``low_mem_bands_dynamic_ppm_unported`` precedent in
+    # ``_LOW_MEM_BANDS_REFUSALS`` names and deletes on sight.  MEASURED,
+    # not merely reasoned: ``tests/test_w_rpa_resolvent_config.py`` tried
+    # exactly this deck (``mpa_material_class = metal`` under a non-mpa
+    # compute_mode) and reached ``metal_material_class_requires_mpa``
+    # instead, before this table ever ran.
+    #
+    # The insulators-only CERTIFICATION still applies in full -- audited,
+    # not dropped -- through its OTHER half, the one that does not need a
+    # deck key at all: ``gw.screening_bse.refuse_fractional_occupations``
+    # / ``_refuse_metallic_mean_field`` read the mean field's OWN
+    # occupations at the stage, before any compute, under the rule id
+    # ``w_rpa_resolvent_insulators_only`` (``diagram_name`` threaded from
+    # ``include_w``).  That check fires on every compute_mode this
+    # diagram set supports (cohsex, gn_ppm) and is not shadowed by
+    # anything: it is what actually gates a metallic WFN on a
+    # ``w_rpa_resolvent`` deck that declares nothing, which is the
+    # harder-to-see half of "insulators only" the ``w_bse`` docstring
+    # itself says the deck key cannot always express.  The pair-basis /
+    # integer-occupation argument transfers unchanged from ``w_bse``'s
+    # row (the band-index cut at ``nelec`` does not depend on
+    # ``include_w``); the ladder's OWN TRS-gauge machinery
+    # (``enforce_trs_pair_gauge``) is NOT part of that argument --
+    # ``sweep_q_wedge`` applies the gauge fix only on the
+    # ``include_w=True`` branch, and the RPA arm's reciprocity already
+    # holds without it (``w_ladder.py``'s own measurement: ring dyad and
+    # D are band-window/gauge invariant) -- stated so this comment cannot
+    # be read as citing a defect the RPA arm does not have.
+    (
+        "w_rpa_resolvent_head_placement_unimplemented",
+        lambda cfg: str(cfg.head.mc_average_placement) != "off",
+        lambda cfg: f"mc_average_placement = {cfg.head.mc_average_placement}",
+        "mc_average_placement = off (the default)",
+        "leave mc_average_placement at off under w_rpa_resolvent, or keep "
+        "screening_diagrams = w_rpa to use the BGW head placement",
+        "MECHANISM UNCHANGED from w_bse_head_placement_unimplemented: "
+        "head_correction=full obtains q=0 from the SAME micro-reducible "
+        "resolvent mechanism regardless of include_w (bse.head_resolvent."
+        "build_head_operator(..., include_w=include_w) is the one "
+        "operator builder for both arms); composing a post-solve "
+        "mc_average_placement with it has not been derived or certified "
+        "for either arm",
+    ),
+)
+
+
+#: One dispatch table for both resolvent screening diagrams, so a THIRD
+#: resolvent-family value added later gets its own row here rather than a
+#: new branch in the function below (the same reasoning
+#: ``MODE_SIGMA_CHANNELS`` uses for ``ComputeMode``).
+_RESOLVENT_REFUSAL_TABLES: dict[
+    "ScreeningDiagrams", tuple[tuple[str, object, object, str, str, str], ...]
+] = {
+    ScreeningDiagrams.W_BSE: _W_BSE_REFUSALS,
+    ScreeningDiagrams.W_RPA_RESOLVENT: _W_RPA_RESOLVENT_REFUSALS,
+}
+
+
 def refuse_unsupported_screening_diagrams(config) -> None:
-    """Refuse the ``w_bse`` combinations v1 does not serve, at PARSE time.
+    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time.
 
     Called from :meth:`LorraxConfig.from_input_file` once the record
     exists, because every predicate here reads a RESOLVED axis
@@ -638,19 +905,26 @@ def refuse_unsupported_screening_diagrams(config) -> None:
     NO-OP FOR ``w_rpa``, evaluated first and returning before any property
     is touched: a default deck must not acquire a new parse-time
     resolution -- and hence a new possible refusal -- from this function
-    existing.
+    existing.  ``w_bse`` and ``w_rpa_resolvent`` each carry their OWN
+    table (:data:`_RESOLVENT_REFUSAL_TABLES`) rather than one shared list,
+    because a shared table's ``doc`` text would have to describe both
+    operators at once -- which is exactly how the hl_ppm gate's dead-gate
+    incident happened (TASTE.md, "a gate pinned to a convention re-arms
+    itself"): a reused reference that does not resolve per call site reads
+    as evidence for a case it never measured.
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    if diagrams is not ScreeningDiagrams.W_BSE:
+    table = _RESOLVENT_REFUSAL_TABLES.get(diagrams)
+    if table is None:
         return
-    for rule_id, predicate, got, want, fix, doc in _W_BSE_REFUSALS:
+    for rule_id, predicate, got, want, fix, doc in table:
         if not predicate(config):
             continue
         raise ValueError(
-            f"GATE {rule_id}: screening_diagrams = w_bse is refused with "
-            f"{got(config)}.\n"
-            f"  got:  screening_diagrams = w_bse, {got(config)}\n"
+            f"GATE {rule_id}: screening_diagrams = {diagrams.value} is "
+            f"refused with {got(config)}.\n"
+            f"  got:  screening_diagrams = {diagrams.value}, {got(config)}\n"
             f"  want: {want}\n"
             f"  fix:  {fix}\n"
             f"  why:  {doc}.\n"
@@ -1146,8 +1420,11 @@ _DEFAULTS = {
     "zeta_nband": None,
     "sys_dim": 2,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
-    # instead of rotating the fixed DFT one into the QP basis.  Off keeps
-    # QSGW fixed-density, which is what every result before 2026-08-04 was.
+    # instead of rotating the fixed DFT one into the QP basis.  False remains
+    # the scalar-QSGW default.  ``from_input_file`` promotes an UNNAMED false
+    # to true for bispinor QSGW because freezing either member of the required
+    # (rho, J) four-current would be internally inconsistent; an explicit
+    # false is preserved and refused by the four-current gate below.
     "density_self_consistent": False,
     # Run the SC loop's H / E / U on the STAR wedge, broadcasting back at
     # the boundary.  Sigma stays on the full BZ -- it is an FFT over the
@@ -1186,6 +1463,7 @@ _DEFAULTS = {
     # p-matrix velocity stage only, without the links.
     "sc_head_update": "off",       # off | parallel_transport | dft_velocity
     "parallel_transport_file": "parallel_transport.h5",
+    "static_gauge_hall_file": "static_gauge_hall.h5",
     # Density-grid cutoff (Ry) for the psp matrix-element tools (kin_ion /
     # dipole).  None → the consumer defaults it to the WFN's own ``ecutwfc``.
     "ecutrho": None,
@@ -1385,6 +1663,9 @@ _DEFAULTS = {
     "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
+    # Orthogonal four-current screening policy.  The historical
+    # charge-screened + bare-transverse exchange path remains the default.
+    "bispinor_gw": "bare_transverse",
     # The relative sign of the i[r, V_NL] commutator in the assembled
     # velocity, read by ``psp.get_dipole_mtxels`` and passed to
     # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the shipped
@@ -1625,6 +1906,18 @@ _DEFAULTS = {
     # all three forms at the logical zeta window.
     "band_chunk_size": 16,
     "r_chunk_size": 0,
+    # Two-face 2-D-sharded ψ carrier (gw.wavefunction_bundle
+    # layout="face") in place of the legacy four single-axis copies:
+    # 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py.
+    # Default false = layout="legacy", the exact existing construction
+    # path, bit-identical.  NOT an env var (decisions.md: physics- and
+    # routing-relevant choices are declared inputs, not environment).
+    # Narrow envelope while G/Sigma/head/rotation/exact-response
+    # consumers are ported one at a time (see
+    # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md §6); an
+    # unsupported combination refuses by name rather than silently
+    # falling back to legacy.
+    "low_mem_bands": False,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -1686,6 +1979,22 @@ _DEFAULTS = {
     # The winding (2D e^{-i2θ}) is unaffected — only the head magnitude is
     # averaged; the phase-factored ζ̃ rank-1 structure carries the direction.
     "head_minibz_average": False,
+    # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction.
+    # False (default): the bare TT tiles' q=Γ, G=0 slot stays zero (the
+    # transverse projector P^T_ij(q̂) has no
+    # limit as q→0, so a naive point evaluation is undefined there and the
+    # shipped code leaves it at zero rather than guess).  True replaces
+    # that slot with the Coulomb-gauge spatial block
+    # −⟨v(q) P^T_ij(q̂)⟩_mBZ
+    # (vcoul.{slab_2d,bulk_3d}.*.q0_average_transverse_tensor) — the
+    # current-current analogue of the charge channel's ⟨v⟩ head, needed
+    # because the current structure factor ⟨m|α^i|n⟩ does NOT collapse to
+    # δ_mn the way the charge one does.  Only meaningful under
+    # bispinor=true; requires sys_dim in (2, 3) (box truncation's q=Γ,
+    # G=0 slot is already finite and needs no substitute).  See
+    # docs/BISPINOR_DHFB_DESIGN.md §11 and
+    # gw.v_q_bispinor._make_per_q_v_builder_for_tile's docstring.
+    "bispinor_tt_head_correction": False,
     # Singular Gamma-cell policy.  ``full`` is the shipping macroscopic W
     # head (microscopic local fields folded exactly once); the other two are
     # convergence/diagnostic arms, not alternative diagram sets.
@@ -1744,10 +2053,16 @@ _DEFAULTS = {
     #   "w_bse" — ladder-corrected W(omega) - v = v (omega - H)^-1 v with
     #        the statically screened direct rung -W(0) in H's kernel.  The
     #        RPA W(0) is still computed and persisted first; it IS the
-    #        ladder kernel's W_R.  Refused against x_only / hl_ppm /
-    #        qp_solver = self_consistent / mc_average_placement != off.
+    #        ladder kernel's W_R.  Refused against x_only / mpa (except
+    #        supported) / hl_ppm / qp_solver = self_consistent /
+    #        mc_average_placement != off.
+    #   "w_rpa_resolvent" — the SAME resolvent identity with the rung
+    #        parameterized out (H_RPA, not H_BSE): a cross-check route to
+    #        w_rpa's own W, not a third physical model.  Same refusal
+    #        family as w_bse, PLUS mpa (unlike w_bse, not yet supported).
     "screening_diagrams": "w_rpa",
-    # w_bse only: probe columns of the mu^2 ladder tile solved per block.
+    # w_bse / w_rpa_resolvent only: probe columns of the mu^2 ladder tile
+    # solved per block.
     # 0 (default) = the whole padded centroid basis in one block — the
     # historical behaviour, bit-identical for every existing deck.  A
     # positive value bounds the per-block solve memory; the facade rounds
@@ -2021,12 +2336,12 @@ _DEFAULTS = {
     "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
-    # 0 preserves the exact numerical-rank htransform span.  A value >= 1 is
-    # an explicit cross-k model-order approximation: retain approximately
-    # multiplier * (bands in the htransform window) shared alpha directions,
-    # then restore the per-k row-isometry required by f(H).  This is NOT an
-    # rtol alias and must be converged on the final observable.
-    "htransform_rank_multiplier": 0.0,
+    # Search ceiling for the published whole-state randomized QRCP basis.
+    # The qr_eps rank criterion selects the physical rank; this multiplier
+    # only bounds the search.  0 is accepted as an archived spelling of 20.
+    "htransform_rank_multiplier": 20.0,
+    "htransform_qr_eps": 1.0e-3,
+    "htransform_qrcp_seed": 0,
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
@@ -2077,6 +2392,7 @@ _LEGACY_DECK_KEYS = frozenset({
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
     "compute_mode",
+    "bispinor_gw",
     "qp_solver",
     "sc_accelerator",
     "sc_eigh",
@@ -2920,6 +3236,7 @@ class FilePaths:
     centroids_file_current: str | None
     kin_ion_file: str
     parallel_transport_file: str
+    static_gauge_hall_file: str
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
@@ -2979,6 +3296,529 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         "bgw_metal_q0_treatment.")
 
 
+#: WHICH COMBINATIONS OF ``low_mem_bands = true`` v1 REFUSES, and why.
+#:
+#: Same shape as ``_W_BSE_REFUSALS`` above: ``rule_id -> (predicate, got,
+#: want, fix, doc)``, assembled into one five-part message so a rule cannot
+#: be added without answering all five.  Predicates take the resolved
+#: :class:`LorraxConfig` and check only their OWN axis — the caller,
+#: :func:`refuse_unsupported_low_mem_bands`, has already established
+#: ``low_mem_bands = true`` before the loop runs.
+#:
+#: SUPPORTED, deliberately absent from this table (guide
+#: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §6):
+#: scalar/spinor, one-shot insulator (``qp_solver`` = ``one_shot_dft`` or
+#: ``fixed_point``), ``head_correction`` = ``off`` | ``no_local_fields``,
+#: standard chi0, COHSEX / GN-PPM / HL-PPM / insulating MPA, restart
+#: read/write.
+#:
+#: A FIFTH combination the guide names — an explicit dense ``Gij`` operand
+#: — has no deck key (every shipped driver call site leaves it at its
+#: ``None`` default; see ``cohsex_sigma._resolve_Gij``), so it cannot be a
+#: row in a config-resolution table keyed on parsed values.  It is guarded
+#: separately by :func:`refuse_explicit_gij_under_low_mem_bands`, called
+#: from ``compute_sigma_xc`` at the one seam that ever sees both operands
+#: together.
+_LOW_MEM_BANDS_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
+    # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
+    # own recorded lift condition: rotate_wavefunctions now dispatches on
+    # wfns_dft.layout and routes layout='face' through
+    # wavefunction_bundle._rotate_wavefunctions_face (two planned
+    # distrib_la.gemm_plan N,N GEMMs -- U^T @ psi_nmu, psi_mun @ U -- against
+    # a block-embedded U rather than a sliced ψ; see wavefunction_bundle
+    # ._face_rotate_kernel/._face_embed_active_U).  sc_iteration.py:1753
+    # needed NO change: it already calls rotate_wavefunctions(inputs.
+    # wfns_dft, ...), and the dispatch reads wfns_dft.layout, not a
+    # call-site flag.  Gated: real 4-rank CUDA algebra parity vs legacy
+    # (tests/test_qsgw_rotate_face_parity.py, U from a REAL small eigh —
+    # ns=1/ns=2, default AND offset active windows — 3/3 PASS, max relative
+    # diff ~1e-16..2e-16); a real end-to-end MoS2 k6_c50 compute_mode=
+    # gn_ppm head_correction=full qp_solver=self_consistent (3 iterations)
+    # leg, face vs legacy — see this session's CLAIMS.md row for job id and
+    # measured tolerances.  ``head_wings_sharded``'s own consumer,
+    # ``build_iteration_head_response`` (qsgw_head.py), needed NO change
+    # either: it treats ``wfns_qp`` opaquely (no direct psi_* field access)
+    # and forwards it to the already layout-dispatching wing kernels; the
+    # ONLY reason it read as "still legacy-only" before this session is
+    # that its sole producer, rotate_wavefunctions, had no face arm.
+    # LIFTED 2026-08-23 (fix/mpa-head-status-line-2026-08-23): the metal
+    # row was the LAST entry.  Both of its originally-named blockers were
+    # already ported+gated (metallic chi0 response; the MPA executor), and
+    # the residual reachability obstacle was the sc_iteration mpa_z
+    # NameError (KNOWN_LORRAX_ISSUES 2026-08-19 row), fixed in the same
+    # branch and gated by the staged Na dft_velocity P16 legs
+    # (runs/Na/02_soc48b_qsgw_mpa/09_dft_velocity_headgate_p16_20260823).
+    # The envelope is now EMPTY: every deck the legacy path serves is
+    # served under low_mem_bands=true.
+    # LIFTED for FRESH-FIT decks (2026-08-23,
+        # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
+        # closed.  Both halves the previous session's comment named as
+        # missing are now ported and gated:
+        #
+        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
+        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
+        #   representation-aware bundle operation folding γ̃ into whichever
+        #   pair of fields plays the G-build's direct/conjugated role
+        #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
+        #   2026-08-23 (feat/bispinor-face-2026-08-23), gated on real
+        #   4-rank CUDA with a genuine ns=4 fixture (5/5 Lorentz pairs,
+        #   ~1e-16 relative; tests/multi_device/
+        #   bispinor_transverse_vertex_face_gate.py).
+        # * The transverse ζ-FIT's face path — ``isdf.core.
+        #   c_q_from_psi_sm(layout='face')``/``z_q_from_psi_sm(layout=
+        #   'face')`` now accept non-identity ``gamma_L``/``gamma_R`` via
+        #   psi-ENDPOINT application (mirroring
+        #   ``with_lorentz_vertices``'s own field/axis table, folded in
+        #   BEFORE the band GEMM / masked-gather rather than at
+        #   ``gamma_double_contract``'s post-IFFT step — see
+        #   ``docs/architecture/zeta_fit_face_psi_cct.md``'s "γ̃ VERTEX"
+        #   sections for the derivation and its conjugation-convention
+        #   correction, found by reading ``greens_function_kernel.
+        #   _build_G_face`` directly: CCT's psi_mun is the CONJUGATED
+        #   operand, the OPPOSITE role from the G-build's own psi_mun).
+        #   Gated on real 4-rank CUDA, ALL 15 non-identity
+        #   ``(mu_L, nu_L)`` Lorentz-index pairs at ns=4 (the
+        #   discriminating cases — an identity vertex passes trivially
+        #   and proves nothing): ``tests/test_isdf_cq_face_parity.py``
+        #   18/18 PASS, max relative diff ~6e-16; ``tests/
+        #   test_isdf_zq_face_parity.py`` 18/18 PASS on real CUDA
+        #   (mostly bit-exact, max relative diff ~4e-16 where not — the
+        #   masked-``psum`` mechanism is a select, immune to summation-
+        #   order noise, same as its own identity-channel result).
+        #   ``gw.isdf_fitting.fit_zeta_to_h5``'s ``vertex_mu_L != 0``
+        #   refusal under ``low_mem_bands`` is dropped;
+        #   ``isdf.core._make_fit_one_rchunk_kernel``'s matching refusal
+        #   too.  ``gw.gw_init.fit_zeta`` builds the TRANSVERSE
+        #   centroid set's OWN face carrier via the SAME
+        #   ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the charge
+        #   channel already uses (not a fork), reused for both the ζ_T
+        #   fit and the post-fit Σ^B bundle.
+        #
+        # End-to-end: MoS2 3×3 bispinor GN-PPM fixture
+        # (tests/regression/bispinor_debug/bispinor_test.in,
+        # head_correction=off, restart=false), real 4-rank CUDA,
+        # low_mem_bands=true vs low_mem_bands=false — see
+        # runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/ for the
+        # artifacts and claims/ for the numbers.
+        #
+        # DELETED, not narrowed (same precedent as
+        # ``low_mem_bands_self_consistent_unported``'s own 2026-08-23
+        # lift): the census row's gap is closed for every combination
+        # bispinor ITSELF supports.  ``restart = true`` +
+        # ``bispinor = true`` round-trips in BOTH layouts (legacy
+        # per-channel ``psi_full_y_transverse`` since 2026-07-27; the
+        # face pair ``psi_full_y_transverse`` +
+        # ``psi_full_y_transverse_mun`` since 2026-08-23,
+        # feat/bispinor-restart-2026-08-23).  A file written by one
+        # layout read by the other refuses loudly by name in
+        # ``gw.gw_init.prepare_isdf_and_wavefunctions`` /
+        # ``file_io.read_restart_state_from_h5`` -- no silent data loss
+        # in any combination.
+    # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
+        # port-2026-08-22); the row was KEPT, narrowed to MPA only.  History
+        # of that narrowing:
+        # DISCOVERED on real 4-rank CUDA (tests/multi_device/
+        # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
+        # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
+        # supported-table's own claimed envelope) ran ISDF fit + chi0/W
+        # construction to completion under layout='face', then died in
+        # ``ppm_tau_kernel.precompile_sigma`` at the FIRST legacy accessor
+        # call (``wfns.xn(s.full)``) with the carrier's own named
+        # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
+        # The dynamic two-point plasmon-pole Sigma_c(omega) pipeline
+        # (ppm_tau_kernel.py's ``precompile_sigma``/``_get_sigma_tau_kernel``
+        # /``_get_sigma_kij_kernel``, ``common.contract_bands``'s
+        # channels="split_reim" face arm, and ppm_sigma.py's per-branch
+        # sigma builders + invalid-pole static-limit term) now dispatches
+        # on ``wfns.layout`` and routes through
+        # ``greens_function_kernel.build_G_tau(layout='face', gemm=...)``/
+        # ``contract_bands_block_reshard(layout='face', channels=...)`` —
+        # the SAME canonical owners the static COHSEX channels already
+        # used, extended rather than forked (report §5).  Gated: real
+        # 4-rank CUDA algebra parity (legacy vs face, identity + real tau
+        # weights, ns=1/ns=2, a non-mesh-divisible sigma window,
+        # tests/test_ppm_tau_kernel_face_parity.py, 5/5 PASS), a real
+        # end-to-end MoS2 k6_c50 leg at compute_mode=gn_ppm
+        # head_correction=full matching the legacy gn_ppm reference to
+        # ~1e-5 eV, and tests/test_zeta_mesh_invariance.py 7/7 unaffected
+        # (claims/0435.md).  A LARGER k6_c600 (mu=5282) confirmation of
+        # the same combination could NOT be completed this session: it
+        # dies in the already-registered, pre-existing qsgw_head.py
+        # head-response OOM (KNOWN_LORRAX_ISSUES.md's
+        # src/gw/qsgw_head.py:250-256 row; third independent
+        # reproduction, claims/0436.md) before ever reaching this
+        # pipeline's own code — that defect is inherited from this
+        # branch's base and is unrelated to this port (it also blocks
+        # head_correction=full under low_mem_bands=true for COHSEX at
+        # that scale).  Production-scale confirmation of THIS port
+        # remains open follow-up work, not claimed here.  ``mpa/sigma.py``
+        # (insulating MPA's own executor,
+        # ``_integrate_sigma_batches``) was mechanically ported the SAME
+        # session, sharing this now-gated tau-kernel/projector infra, but
+        # was NOT itself run end to end this session (its own
+        # sharded-output final layout has an additional named gap for a
+        # split Σ window — see that file's own comment) — kept refused
+        # then, pending its own gate.
+        #
+        # DELETED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23,
+        # claims/0443.md), not narrowed to metal-only: that named gap is
+        # now FIXED. gw.mpa.sigma._integrate_sigma_batches' sharded-output
+        # tail (a split Sigma window, nb_sigma != nb_full -- the ORDINARY
+        # case) is ported: strip_sigma_window gained a device-array arm
+        # that applies wavefunction_bundle.pack_band_window's OWN
+        # mechanism (jax.lax.slice_in_dim + jax.lax.with_sharding_
+        # constraint) to Sigma_c's own trailing (m,n) axes -- reusing that
+        # primitive's idiom rather than reworking psi_proj's INPUT width,
+        # which would have desynced it from contract_bands.py's eagerly-
+        # built, fixed-width GEMM plans (a shared contract this fix does
+        # not reopen).  Gated: real 4-rank CUDA mesh-aware strip_sigma_
+        # window parity (5/5, tests/test_mpa_sigma_split_window_strip.py,
+        # bit-exact) and a real end-to-end fresh one-shot insulating MPA
+        # leg (Si_scalar, a genuine split window nb_sigma=8 < nb_full=20)
+        # -- eqp0.dat max|dE_QP|=6.510e-05 eV, eqp1.dat max|dE_QP|=
+        # 8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy vs face.
+        #
+        # A NARROWED (metal-only) row was drafted first and then deleted
+        # rather than kept, per its own predicate's own "narrow it away
+        # entirely if nothing else remains under it" instruction: a
+        # metal deck's mpa_material_class == 'metal' predicate is a
+        # STRICT SUBSET of -- and, given _validate_metal_compute_mode's
+        # standing invariant (material_class == metal implies compute_
+        # mode == mpa, enforced in LorraxConfig.__post_init__ BEFORE this
+        # table ever runs), logically EQUIVALENT to -- the
+        # low_mem_bands_metal_material_class_unported row's own predicate,
+        # which appears earlier in this tuple and therefore always fires
+        # first.  A second, later row with an implied-equivalent predicate
+        # would never be reached -- a dead, vacuous entry, the exact "gate
+        # that cannot fail" shape TASTE.md warns against -- so it is
+        # deleted outright rather than shipped unreachable.  Metal MPA
+        # remains refused, by the metal row alone; see that row's own
+        # updated comment for why (three named infra obstacles this
+        # session, none of them in gw.mpa.sigma's own code).
+)
+
+
+def refuse_unsupported_low_mem_bands(config) -> None:
+    """Refuse the ``low_mem_bands = true`` combinations v1 does not serve.
+
+    BEFORE ALLOCATION.  Called from :meth:`LorraxConfig.from_input_file`
+    once the resolved record exists (predicates read ``compute_mode`` /
+    ``qp_solver``, which fold in the legacy flags — the same reason
+    :func:`refuse_unsupported_screening_diagrams` is called there and not
+    re-derived), so a doomed deck refuses in the first second of a run
+    rather than after the chi0 build or the ISDF fit that would otherwise
+    silently rebuild a one-axis replica to serve it.  Also called from
+    ``gw.gw_init.prepare_isdf_and_wavefunctions`` at entry, mirroring
+    :func:`refuse_unimplemented_compute_mode`'s two call sites: the parser
+    call is what saves the operator's allocation on the production path,
+    the driver-entry call is what makes a hand-built config (a test
+    harness, a future direct caller) safe without having to remember the
+    parser check.
+
+    NO-OP FOR ``low_mem_bands = false`` (the default), evaluated first and
+    returning before any predicate is touched: a default deck must not
+    acquire a new parse-time resolution — and hence a new possible
+    refusal — from this feature existing.
+    """
+    if not bool(config.memory.low_mem_bands):
+        return
+    for rule_id, predicate, got, want, fix, doc in _LOW_MEM_BANDS_REFUSALS:
+        if not predicate(config):
+            continue
+        raise ValueError(
+            f"GATE {rule_id}: low_mem_bands = true is refused with "
+            f"{got(config)}.\n"
+            f"  got:  low_mem_bands = true, {got(config)}\n"
+            f"  want: {want}\n"
+            f"  fix:  {fix}\n"
+            f"  why:  {doc}.\n"
+            f"  doc:  docs/input_reference.md '## ISDF / zeta', "
+            f"low_mem_bands.")
+
+
+def uses_static_photon_response(config) -> bool:
+    """Whether screening and Sigma use the packed 4x4 photon response."""
+    mode = coerce_bispinor_gw_mode(getattr(
+        config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    return mode in (
+        BispinorGWMode.FULL_STATIC_COHSEX,
+        BispinorGWMode.CHARGE_HALL_CUBATURE,
+    )
+
+
+def uses_coupled_photon_head(config) -> bool:
+    """Whether the packed photon response needs literal-Gamma vectors."""
+    return (uses_static_photon_response(config)
+            and config.head.correction is HeadCorrection.FULL)
+
+
+def refuse_unsupported_bispinor_gw(config) -> None:
+    """Validate four-current modes and require live direct fields for QSGW."""
+    mode = coerce_bispinor_gw_mode(
+        getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    if (bool(config.bispinor)
+            and config.qp_solver is QPSolver.SELF_CONSISTENT
+            and not bool(config.density_self_consistent)):
+        raise ValueError(
+            "GATE bispinor_self_consistency_requires_live_four_current: "
+            "bispinor QSGW changes the occupied orbitals, so its scalar "
+            "charge and signed Dirac current must both be rebuilt on every "
+            "map call. Bispinor QSGW selects the live four-current path by "
+            "default; refusing this explicit or hand-built request for a "
+            "frozen DFT direct field.\n"
+            f"  got: qp_solver = {config.qp_solver.value}, "
+            f"density_self_consistent = {bool(config.density_self_consistent)}\n"
+            "  want: density_self_consistent = true (or "
+            "qp_solver = one_shot_dft)")
+    if mode is BispinorGWMode.BARE_TRANSVERSE:
+        return
+    if not bool(config.bispinor):
+        raise ValueError(
+            f"GATE bispinor_gw_requires_bispinor: bispinor_gw = "
+            f"{mode.value} requires bispinor = true.  This axis selects "
+            "four-current screening; it does not turn four-spinor "
+            "wavefunctions on implicitly.")
+    if mode in (
+        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE,
+        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE,
+    ):
+        gate_prefix = (
+            "pauli_reference" if mode is
+            BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE
+            else "isometric_kinetic_balance")
+        if bool(config.restart):
+            raise ValueError(
+                f"GATE {gate_prefix}_restart_unavailable: "
+                f"bispinor_gw = {mode.value} requires "
+                "restart = false. Existing restart tensors do not carry "
+                "an authenticated carrier representation and could silently "
+                "substitute a different four-current basis. Fresh runs may "
+                "still reuse each zeta file "
+                "through its carrier-specific provenance.")
+        if bool(config.write_restart_tensors):
+            raise ValueError(
+                f"GATE {gate_prefix}_restart_write_unavailable: "
+                f"bispinor_gw = {mode.value} requires "
+                "write_restart_tensors = false. The current restart schema "
+                "cannot authenticate this explicit comparison "
+                "representation for a later consumer.")
+        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
+                and bool(config.head.bispinor_tt_head_correction)):
+            raise ValueError(
+                "GATE isometric_kinetic_balance_current_head_unavailable: "
+                "the normalized finite-q carrier has no authenticated "
+                "endpoint jets. Set bispinor_tt_head_correction = false; "
+                "the ordinary scalar q->0 head remains available from the "
+                "canonical QE two-spinor dipole artifact.")
+        if (mode is BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE
+                and config.head.correction is HeadCorrection.FULL
+                and config.screening.diagrams is not ScreeningDiagrams.W_RPA):
+            raise ValueError(
+                "GATE isometric_kinetic_balance_ladder_head_unavailable: "
+                "the ladder-screening facade does not accept the separate "
+                "source-Pauli centroid bundle required by the normalized "
+                "mode's scalar q->0 wings. Use screening_diagrams = w_rpa, "
+                "or head_correction = off.")
+        return
+    if (mode is BispinorGWMode.FULL_STATIC_COHSEX
+            and config.head.correction is HeadCorrection.FULL):
+        raise ValueError(
+            "GATE full_static_bispinor_gauge_head_unavailable: production "
+            "FULL_SCREENED bispinor q=0 completion is unavailable.\n"
+            "  got:  bispinor_gw = full_static_cohsex, "
+            "head_correction = full\n"
+            "  want: a versioned StaticGaugeHeadResponse carrying "
+            "S_direct, separately sourced sigma_H, sharded Y/Z, exact "
+            "contact/operator provenance, and certified Ward/Hermiticity "
+            "residuals\n"
+            "  fix:  complete the gauged VNL/downfolded operator artifact "
+            "and its loader, or set head_correction = off for the explicitly "
+            "experimental no-pair finite-body calculation\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+    required_head = (
+        HeadCorrection.FULL
+        if mode is BispinorGWMode.CHARGE_HALL_CUBATURE
+        else HeadCorrection.OFF)
+    requirements = (
+        (config.compute_mode is ComputeMode.COHSEX,
+         f"compute_mode = {config.compute_mode.value}",
+         "compute_mode = cohsex"),
+        (config.screening.diagrams is ScreeningDiagrams.W_RPA,
+         f"screening_diagrams = {config.screening.diagrams.value}",
+         "screening_diagrams = w_rpa"),
+        (config.head.correction is required_head,
+         f"head_correction = {config.head.correction.value}",
+         f"head_correction = {required_head.value}"),
+        (config.qp_solver is QPSolver.ONE_SHOT_DFT,
+         f"qp_solver = {config.qp_solver.value}",
+         "qp_solver = one_shot_dft"),
+        (str(config.mpa.material_class).strip().lower() == "insulator",
+         f"mpa_material_class = {config.mpa.material_class}",
+         "mpa_material_class = insulator"),
+        (not bool(config.restart), "restart = true", "restart = false"),
+        (mode is BispinorGWMode.FULL_STATIC_COHSEX
+         or int(config.sys_dim) == 2,
+         f"sys_dim = {config.sys_dim}", "sys_dim = 2"),
+        (bool(config.memory.low_mem_bands), "low_mem_bands = false",
+         "low_mem_bands = true"),
+        (str(config.backend.w_dyson_solver) == "distributed",
+         f"w_dyson_solver = {config.backend.w_dyson_solver}",
+         "w_dyson_solver = distributed"),
+        (not bool(config.head.bispinor_tt_head_correction),
+         "bispinor_tt_head_correction = true",
+         "bispinor_tt_head_correction = false"),
+        # BGW vcoul is a scalar parity diagnostic, not a certified
+        # four-current kernel.  Applying it to CC only would make the finite-q
+        # packed photon operator internally hybrid; propagating it through TT
+        # needs a canonical scalar sampler and its own photon certification.
+        (not bool(config.head.use_bgw_vcoul),
+         "use_bgw_vcoul = true",
+         "use_bgw_vcoul = false (the default)"),
+        # The coupled photon path constructs its direct S/Y/Z from the
+        # canonical qsgw response and performs its own bordered mini-BZ solve.
+        # Scalar HeadResolver source/override controls do not enter that
+        # algebra; accepting a non-default value would falsely claim they did.
+        # eta does reach the analytic charge response, but no matching
+        # broadening exists in the finite-q current response, so nonzero eta
+        # is refused as an inconsistent charge-only prescription.
+        (str(config.head.wcoul0_source).strip().lower() == "s_tensor",
+         f"wcoul0_source = {config.head.wcoul0_source}",
+         "wcoul0_source = s_tensor (the default)"),
+        (float(config.head.wcoul0_eta) == 0.0,
+         f"wcoul0_eta = {config.head.wcoul0_eta}",
+         "wcoul0_eta = 0 (the default)"),
+        (config.head.vhead is None,
+         f"vhead = {config.head.vhead}",
+         "vhead unset"),
+        (config.head.whead_0freq is None,
+         f"whead_0freq = {config.head.whead_0freq}",
+         "whead_0freq unset"),
+        (config.head.whead_imfreq is None,
+         f"whead_imfreq = {config.head.whead_imfreq}",
+         "whead_imfreq unset"),
+        (str(config.head.mc_average_placement) == "off",
+         f"mc_average_placement = {config.head.mc_average_placement}",
+         "mc_average_placement = off (the default)"),
+        (config.head.mc_average_placement_vcoul is None,
+         ("mc_average_placement_vcoul = "
+          f"{config.head.mc_average_placement_vcoul}"),
+         "mc_average_placement_vcoul unset"),
+    )
+    for accepted, got, want in requirements:
+        if accepted:
+            continue
+        raise ValueError(
+            "GATE static_bispinor_photon_envelope: "
+            f"bispinor_gw = {mode.value} is refused with {got}.\n"
+            f"  got:  {got}\n"
+            f"  want: {want}\n"
+            "  why:  the packed-photon modes are deliberately narrow "
+            "full-BZ, one-shot insulating static calculations. "
+            "The charge_hall_cubature mode includes only the explicitly "
+            "declared charge CC and Hall CT/TC long-wave terms. Photon "
+            "restart storage, bulk coupled heads, "
+            "self-consistency, and dynamic photon models are not silently "
+            "approximated here.\n"
+            "  doc:  docs/input_reference.md, bispinor_gw.")
+
+
+def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
+    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
+
+    NO-OP for the default ``false`` (returns before any predicate is
+    touched, same shape as :func:`refuse_unsupported_low_mem_bands`) and
+    for ``bispinor = false`` decks read through a hand-built config that
+    never sets the flag at all.
+
+    Two named conditions, GATE ``bispinor_tt_head_unsupported``:
+
+    1. ``bispinor = false`` — the flag corrects a bare TT V-tile that a
+       non-bispinor run never builds.
+    2. ``sys_dim not in (2, 3)`` — box truncation's q=Γ, G=0 slot is
+       already finite (``vcoul.box_0d.Box0D._v_bare_per_q`` never zeros
+       it), so there is no missing slot to substitute; the bispinor
+       g-flat path also does not reach sys_dim=0 today
+       (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
+       entry), so this is a defensive, not merely a redundant, refusal.
+
+    Called at parser altitude (``LorraxConfig.from_input_file``) and at
+    driver-entry altitude (``gw.gw_init.prepare_isdf_and_wavefunctions``),
+    mirroring :func:`refuse_unsupported_low_mem_bands`'s two call sites
+    for the same reason: the parser call saves the allocation on the
+    production path, the driver-entry call protects a hand-built config.
+    """
+    if not bool(config.head.bispinor_tt_head_correction):
+        return
+    if not bool(config.bispinor):
+        raise ValueError(
+            "GATE bispinor_tt_head_unsupported: "
+            "bispinor_tt_head_correction = true is refused with "
+            "bispinor = false.\n"
+            "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
+            "  want: bispinor = true\n"
+            "  fix:  set bispinor = true, or leave "
+            "bispinor_tt_head_correction at its default (false)\n"
+            "  why:  the correction replaces the q=Γ, G=0 slot of the "
+            "bare bispinor TT (transverse-transverse) V-tiles, which a "
+            "non-bispinor run never builds\n"
+            "  doc:  docs/input_reference.md '## Screening', "
+            "bispinor_tt_head_correction.")
+    sys_dim = int(config.sys_dim)
+    if sys_dim not in (2, 3):
+        raise ValueError(
+            "GATE bispinor_tt_head_unsupported: "
+            f"bispinor_tt_head_correction = true is refused with "
+            f"sys_dim = {sys_dim}.\n"
+            f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
+            "  want: sys_dim in {2, 3} (slab / bulk)\n"
+            "  fix:  set sys_dim to 2 or 3, or leave "
+            "bispinor_tt_head_correction at its default (false)\n"
+            "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
+            "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
+            "there is no missing slot for this correction to fill\n"
+            "  doc:  docs/input_reference.md '## Screening', "
+            "bispinor_tt_head_correction.")
+
+
+def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
+    """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
+
+    THE ONE ROW ``_LOW_MEM_BANDS_REFUSALS`` CANNOT HOLD.  Every other
+    combination in the envelope is a deck key readable at parse time; an
+    explicit ``Gij`` is a keyword-only Python parameter of
+    ``compute_sigma_xc`` / ``compute_cohsex_sigma`` that every shipped
+    driver call site (``gw_jax.py``, ``sc_iteration.py``) leaves at its
+    ``None`` default — ``cohsex_sigma._resolve_Gij``'s docstring names the
+    caller this guards, the SC-COHSEX loop iterating on its own projector.
+    No deck-resolution point ever sees the value, so this is called from
+    ``compute_sigma_xc`` at entry instead, before any Gij-dependent
+    allocation (``build_Gij`` / the dense band-matrix contract) — the one
+    seam that ever sees both ``low_mem_bands`` and a live ``Gij`` operand
+    together.
+
+    NO-OP for ``Gij is None`` (every production call today) or
+    ``low_mem_bands = false``, so this feature existing changes nothing for
+    the vastly more common calls that never touch either axis.
+    """
+    if not bool(config.memory.low_mem_bands) or Gij is None:
+        return
+    raise ValueError(
+        "GATE low_mem_bands_explicit_gij_unported: "
+        "low_mem_bands = true is refused with an explicit Gij operand.\n"
+        "  got:  low_mem_bands = true, Gij is not None (explicit dense "
+        "band-space occupation projector)\n"
+        "  want: Gij = None (the standard occupation_state path)\n"
+        "  fix:  do not pass an explicit Gij under low_mem_bands = true — "
+        "the occupation_state argument already builds one — or set "
+        "low_mem_bands = false\n"
+        "  why:  cohsex_sigma.build_Gij returns a fully replicated dense "
+        "(nk, nb_sigma, nb_sigma) array; under face psi, G and the "
+        "Hartree/exchange projection need a face-sharded band-matrix "
+        "contract that has not been ported (obstacle #4, 'treat production "
+        "Gij as diagonal data')\n"
+        "  doc:  docs/input_reference.md '## ISDF / zeta', low_mem_bands.")
+
+
 def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
     """Parse one reduced-coordinate q0 vector without guessing its units."""
     raw = str(value or "").replace(",", " ").split()
@@ -3025,6 +3865,7 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
+    bispinor_tt_head_correction: bool  # bare TT q=Γ,G=0 mini-BZ head (default off)
     w_av_first_neighbors: bool
     w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
@@ -3071,9 +3912,10 @@ class ScreeningConfig:
     regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
-    # w_bse only — ``bse.w_ladder.compute_wc_qwedge``'s public
-    # ``probe_chunk`` memory knob, threaded through the facade
-    # (``gw.screening_bse._ladder_wedge``).  0 = whole padded basis in
+    # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
+    # ``bse.w_ladder.compute_wc_qwedge``'s public ``probe_chunk`` memory
+    # knob, threaded through the facade (``gw.screening_bse._ladder_wedge``,
+    # which does not branch on ``include_w``).  0 = whole padded basis in
     # one block (historical).  Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
 
@@ -3106,20 +3948,25 @@ class ScreeningConfig:
                 f"never selected a different method, so replacing it with "
                 f"'screening_method = minimax' (or deleting the key, "
                 f"which defaults to minimax) changes no result.")
-        # REFUSE a spelling this axis does not have, naming the two it
+        # REFUSE a spelling this axis does not have, naming the ones it
         # does.  The parser already normalises through
         # ``coerce_screening_diagrams``; this is the guard for every OTHER
         # constructor of this record (tools, test stubs, a future reader),
-        # so the axis cannot acquire a third value by assignment.
+        # so the axis cannot acquire a fourth value by assignment.
         if not isinstance(self.diagrams, ScreeningDiagrams):
             raise ValueError(
                 f"screening_diagrams = {self.diagrams!r} is not supported.  "
                 f"The legal set is exactly "
                 f"{{{', '.join(d.value for d in ScreeningDiagrams)}}}: "
                 f"'w_rpa' (default) sums the random-phase series "
-                f"W = (1 - V chi0)^-1 V, and 'w_bse' sums the ladder series "
+                f"W = (1 - V chi0)^-1 V, 'w_bse' sums the ladder series "
                 f"W(w) - v = v (w - H)^-1 v with the statically screened "
-                f"direct rung in H.  Pass a ScreeningDiagrams member or run "
+                f"direct rung in H, and 'w_rpa_resolvent' evaluates the SAME "
+                f"resolvent identity with the rung parameterized out "
+                f"(H_RPA in place of H_BSE, one matvec builder, "
+                f"include_W=False) -- a cross-check route to the same W "
+                f"'w_rpa' sums by Dyson series, not a third physical model. "
+                f"Pass a ScreeningDiagrams member or run "
                 f"the value through gw_config.coerce_screening_diagrams, "
                 f"which raises with this same set for a typo.  This axis is "
                 f"ORTHOGONAL to screening_method and to compute_mode; see "
@@ -3543,6 +4390,7 @@ class MemoryConfig:
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
+    low_mem_bands: bool           # gw.wavefunction_bundle layout="face"
 
 
 @dataclass(frozen=True)
@@ -3840,6 +4688,11 @@ class LorraxConfig:
     qp_solver_raw: str            # "auto" | one of QPSolver.value strings
     do_screened: bool
     bispinor: bool
+    bispinor_gw: BispinorGWMode
+    #: Raw deck spelling resolved by the canonical dipole producer at the
+    #: point of use.  Keeping the spelling (rather than a second resolver in
+    #: gw_config) lets every velocity consumer take the producer's exact arm.
+    vnl_velocity_sign: str
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical
@@ -4227,6 +5080,7 @@ class LorraxConfig:
             centroids_file_current=cents_curr_resolved,
             kin_ion_file=str(_g("kin_ion_file")),
             parallel_transport_file=str(_g("parallel_transport_file")),
+            static_gauge_hall_file=str(_g("static_gauge_hall_file")),
             sigma_diag_file=str(_g("sigma_diag_file")),
             eqp0_file=str(_g("eqp0_file")),
             eqp1_file=str(_g("eqp1_file")),
@@ -4272,6 +5126,7 @@ class LorraxConfig:
             mc_average_placement_vcoul=(
                 str(_g("mc_average_placement_vcoul") or "") or None),
             head_minibz_average=bool(_g("head_minibz_average")),
+            bispinor_tt_head_correction=bool(_g("bispinor_tt_head_correction")),
             w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
             w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
             bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
@@ -4439,6 +5294,7 @@ class LorraxConfig:
             r_chunk_override=int(_g("r_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
+            low_mem_bands=bool(_g("low_mem_bands")),
         )
         # SlabIO routing + auto-route GPU FFIs off on the CPU backend.
         # cuSOLVERMp / cuBLASMp are GPU-only.  The phdf5 FFI is NOT: both
@@ -4735,6 +5591,8 @@ class LorraxConfig:
             qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
             do_screened=bool(_g("do_screened")),
             bispinor=bool(_g("bispinor")),
+            bispinor_gw=coerce_bispinor_gw_mode(_g("bispinor_gw")),
+            vnl_velocity_sign=str(_g("vnl_velocity_sign") or ""),
             # Compatibility mirror only.  Every new head decision reads the
             # enum above; keeping this resolved bool prevents old consumers
             # from disagreeing with ``head_correction = off``.
@@ -4761,6 +5619,24 @@ class LorraxConfig:
             input_dir=input_dir,
             input_file=os.path.abspath(filename),
         )
+        # ``density_self_consistent`` is still an independent physics choice
+        # for scalar QSGW, whose conventional fixed-density path remains the
+        # default.  Bispinor QSGW has no corresponding safe fixed-density
+        # treatment: both rho and the signed Dirac current J must follow the
+        # evolving occupied orbitals.  Normalize the UNNAMED default here,
+        # after the canonical qp_solver resolver exists, instead of duplicating
+        # its legacy/explicit precedence logic.  An explicit false survives
+        # unchanged and the gate below refuses it rather than overriding what
+        # the user wrote.
+        if (bool(resolved.bispinor)
+                and resolved.qp_solver is QPSolver.SELF_CONSISTENT
+                and "density_self_consistent" not in _named_keys
+                and not bool(resolved.density_self_consistent)):
+            resolved = _dc_replace(resolved, density_self_consistent=True)
+            print_fn(
+                "  [config provenance] bispinor qp_solver=self_consistent: "
+                "density_self_consistent was not named; enabling the "
+                "required live (rho, J) Hartree rebuild")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose
@@ -4768,6 +5644,18 @@ class LorraxConfig:
         # returns from this call before either property is touched.
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
+        refuse_unsupported_bispinor_gw(resolved)
+        # Same position/reason as the two calls above: low_mem_bands=false
+        # (the default) returns before any predicate is touched, so this
+        # adds no new resolution to a default deck.  See
+        # refuse_unsupported_low_mem_bands's docstring for why this call
+        # (parser altitude) and the mirrored call in
+        # gw.gw_init.prepare_isdf_and_wavefunctions (driver-entry altitude,
+        # for hand-built configs) both exist.
+        refuse_unsupported_low_mem_bands(resolved)
+        # Same position/reason again: bispinor_tt_head_correction = false
+        # (the default) returns before either predicate is touched.
+        refuse_unsupported_bispinor_tt_head_correction(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the

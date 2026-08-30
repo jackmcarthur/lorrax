@@ -60,7 +60,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "charge_zeta_solve": ("ISDF / zeta", "Charge zeta conditioner: rank_truncate (default; rank-revealing eigh pseudo-inverse) or the historical cholesky."),
     "distributed_zeta_solve": ("ISDF / zeta", "Zeta back-solve tier: replicated | per_q | distributed (nothing O(mu^2) replicated); auto = replicated under the 4 GiB gather cap, else per_q."),
     "zeta_rcond": ("ISDF / zeta", "Rank-truncation cutoff relative to lambda_max (default 1e-8, low end of the recovery plateau). Env LORRAX_ZETA_RCOND."),
-    "transverse_zeta_solve": ("ISDF / zeta", "Transverse (bispinor) zeta-solve family: ridge (default; hoisted pivoted LU + 1e-12 ridge, byte-identical historical path) or rank_truncate (per-q eigh pseudo-inverse with an |lambda| cut; distributed plan via distributed_zeta_solve=distributed runs pzheevd at the padded extent, so any centroid count fits any square mesh)."),
+    "transverse_zeta_solve": ("ISDF / zeta", "Transverse (bispinor) zeta-solve family: ridge (default; pivoted LU after the trace-scaled shift) or rank_truncate (per-q eigh pseudo-inverse with an |lambda| cut). Factor lifetime follows the execution schedule: sequential local and distributed-token routes factor once per q and channel; coupled batch_reshard performs one local factor+solve per r-chunk."),
     "transverse_zeta_rcond": ("ISDF / zeta", "Transverse rank-truncation cutoff tau relative to |lambda|_max (rank_truncate family only; no env twin)."),
     "zeta_cutoff": ("ISDF / zeta", "Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff."),
     "gamma_contract_mode": ("ISDF / zeta", "HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical."),
@@ -69,6 +69,7 @@ KEYS: dict[str, tuple[str, str]] = {
     "band_chunk_size": ("ISDF / zeta", "Bands per chunk in the band-chunked FFT/pair-density loops."),
     "r_chunk_size": ("ISDF / zeta", "Real-space columns per zeta-fit chunk; 0 = auto from the memory model."),
     "memory_per_device_gb": ("ISDF / zeta", "Per-device memory budget for the chunk planners; 0 = auto-detect."),
+    "low_mem_bands": ("ISDF / zeta", "Two-face 2-D-sharded psi carrier (gw.wavefunction_bundle layout=\"face\": psi_nmu/psi_mun, both P(None,'x','y') at the (s,mu) GEMM seam) in place of the legacy four single-axis copies. 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py. Default false = layout=\"legacy\", bit-identical to every deck written before this key existed. Narrow envelope while consumers are ported one at a time; an unsupported combination (head_correction=full, qp_solver=self_consistent, mpa_material_class=metal, bispinor=true, explicit dense Gij) refuses by name rather than silently falling back to legacy."),
     # ---- Screening ----
     "do_screened": ("Screening", "Legacy mode flag: build W and the screened Sigma terms (false = bare exchange only); compute_mode=auto reads it."),
     "screening_method": ("Screening", "chi0 frequency treatment (minimax quadrature is the only production method)."),
@@ -99,7 +100,11 @@ KEYS: dict[str, tuple[str, str]] = {
     "bgw_vcoul_sym_wfn": ("Screening", "Aux WFN supplying the full symmetry group to fold LORRAX q's onto BGW's IBZ q-list."),
     # ---- Sigma ----
     "compute_mode": ("Sigma", "Self-energy ansatz: x_only | cohsex | gn_ppm | hl_ppm | mpa; auto infers from the legacy do_screened/use_ppm_sigma/ppm_model flags and never infers mpa. mpa is the multipole-W ansatz (the complex-pole fit of W): it parses today and REFUSES TO RUN today, naming itself, because its Sigma stage has not landed -- it is on the axis so that every mode-dispatch site in the tree has to handle it explicitly rather than absorbing it into a plasmon-pole branch. Spelled mpa rather than full_freq because every value on this axis names the ansatz, and full_freq names a family of them; see the ComputeMode docstring."),
-    "ppm_sigma_target_error": ("Sigma", "Target error of the PPM Sigma^c tau-quadrature."),
+    "ppm_sigma_target_error": (
+        "Sigma",
+        "Physical absolute kernel-error target for the PPM Sigma^c "
+        "tau-quadrature (Ry^-1); the dimensionless HGL crossing service "
+        "receives eps_hat = xi*eps_phys."),
     "ppm_sigma_max_nodes": ("Sigma", "Node-count cap for the PPM Sigma^c quadrature."),
     "sigma_omega_min_ev": ("Sigma", "Sigma(omega) grid lower edge (eV, relative to E_DFT)."),
     "sigma_omega_max_ev": ("Sigma", "Sigma(omega) grid upper edge (eV)."),
@@ -140,7 +145,8 @@ KEYS: dict[str, tuple[str, str]] = {
     "eigh_backend": ("Solver", "BSE/htransform distributed-eigh sites: auto|off = q-batched native eigh; distributed | cusolvermp | slate | scalapack spread ONE tile over the mesh. CLI --eigh-backend overrides."),
     "use_low_mem_eigh": ("Solver", "Same axis by intent: one (rank,rank) matrix does not fit a rank; true + auto => distributed; true + off refused at parse."),
     "distributed_cholesky": ("Solver", "Charge-channel zeta-fit Cholesky backend: auto | off | cusolvermp | slate."),
-    "distributed_lu": ("Solver", "Transverse-channel LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only)."),
+    "distributed_lu": ("Solver", "Transverse ridge-LU backend: auto | off | cusolvermp | scalapack (host CPU; explicit only). Distributed providers expose split factor/solve tokens."),
+    "distrib_la_batched_route": ("Solver", "Public Plan.batched schedule: auto leaves scan/backend batching to distrib_la; batch_reshard stages complete matrices onto devices for local JAX operations. The coupled all-fresh transverse caller applies its own capacity policy above this service route; explicit batch_reshard never silently becomes a distributed token route."),
     # ---- BSE ----
     "bse_k_grid": ("BSE", "\"NX NY NZ\" fine grid: densify the BSE bundle (psi/eps, W) from the coarse restart grid before any solve; the q=0 exchange tile is k-grid-invariant and is carried through unchanged unless head_minibz_average is set; empty = coarse, byte-identical."),
     "w_head_densify": ("BSE", "Coarse-to-fine W-head treatment for bse_k_grid: c1 (split the singular Gamma head before densification and re-attach it analytically; default) | legacy (trigonometric interpolation, diagnostic A/B control only)."),

@@ -88,6 +88,7 @@ not conservative but simply wrong.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import platform
@@ -239,6 +240,36 @@ FIT_STAGE_ERROR_BOUND = 1.0e-12
 # regardless of training error.
 KAPPA_NORMAL = 2.0
 KAPPA_EXCEPTION = 4.0
+
+#: HiGHS' default primal/dual feasibility tolerance is 1e-7.  That was
+#: adequate while this generator only saw a 1e-6 SCALED request, but it is
+#: not adequate once the physical-window owner correctly maps a 1e-6 Ry^-1
+#: request to ``eps_hat = eps_phys*x_min``: CrI3's 0.0687 Ry gap asks for
+#: 6.87e-8, below the default feasibility scale.  The LP then reports a
+#: perfectly feasible 12-node BTV rule as infeasible and ``build_entry``
+#: falls through to a 530-node positive-composite rule.  These are documented
+#: HiGHS accuracy options, not a method or formulation change.  Keep them at
+#: one owner so the L1 feasibility solve and the minimax polish cannot certify
+#: against different numerical contracts.
+_HIGHS_ACCURACY_OPTIONS = {
+    "primal_feasibility_tolerance": 1.0e-10,
+    "dual_feasibility_tolerance": 1.0e-10,
+    "ipm_optimality_tolerance": 1.0e-12,
+}
+
+
+def _linprog_certified(*args, **kwargs):
+    """Run the incumbent HiGHS LP at the generator's certification scale."""
+
+    if kwargs.get("method", "highs") != "highs":
+        raise ValueError(
+            "complex_laplace certification requires linprog(method='highs')")
+    if "options" in kwargs:
+        raise ValueError(
+            "complex_laplace certification owns the HiGHS accuracy options; "
+            "callers must not supply a second numerical contract")
+    kwargs["options"] = dict(_HIGHS_ACCURACY_OPTIONS)
+    return linprog(*args, **kwargs)
 
 # The moment identity's ceiling, as a fraction of the trivial bound
 # ``error_bound * (R - 1)``.  A residual that equioscillates -- which is
@@ -452,12 +483,15 @@ def _lp_l1(dictionary, x, g, tol, node_weights, kappa_max):
     """min sum_l c_l |w_l|  s.t.  |resid| <= tol, kappa0 <= kappa_max.
 
     WHY THIS PROGRAM IS WRITTEN IN PHYSICAL UNITS AND STAYS THERE, AND
-    WHY THAT PUTS A FLOOR UNDER THE TIER IT CAN REACH.  HiGHS judges
-    primal feasibility on an absolute scale of about 1e-7.  At the 1e-6
-    tier the residual budget is 5.5e-7, five times that -- tight, and it
-    works.  At the fit stage's 1e-12 tier the budget is 5.5e-13, which
-    the solver cannot distinguish from zero, so every weight vector
-    would look feasible and the answer would mean nothing.
+    WHY THAT PUTS A FLOOR UNDER THE TIER IT CAN REACH.  HiGHS' default
+    primal/dual feasibility tolerance is 1e-7.  That default is now
+    explicitly tightened to 1e-10 by :func:`_linprog_certified`: the
+    normalized CrI3 production request is 6.87e-8, and leaving the solver's
+    own feasibility scale looser than the constraint made a feasible
+    12-node rule look infeasible.  At the fit stage's 1e-12 tier, however,
+    the residual budget is 5.5e-13, still far below the documented HiGHS
+    floor; every weight vector could look feasible and the answer would mean
+    nothing.
 
     Dividing the residual rows by ``tol`` fixes that in principle and
     was tried: it makes those rows carry coefficients of order 1e6 while
@@ -469,11 +503,12 @@ def _lp_l1(dictionary, x, g, tol, node_weights, kappa_max):
     reverted and the measurement kept.
 
     The consequence is a real boundary and not a preference: the
-    ``btv_minimax`` route serves 1e-6, and the fit stage's 1e-12 tier is
-    the ``positive_composite`` route's by construction.  That happens to
-    be the right split anyway -- the fit stage evaluates 2n_p samples
-    once, so it does not pay for nodes, and what it gains instead is the
-    beta envelope that lets an off-grid request be served at all.
+    ``btv_minimax`` route serves production and its gap-scaled sub-1e-7
+    requests, while the fit stage's 1e-12 tier is the
+    ``positive_composite`` route's by construction.  That happens to be the
+    right split anyway -- the fit stage evaluates 2n_p samples once, so it
+    does not pay for nodes, and what it gains instead is the beta envelope
+    that lets an off-grid request be served at all.
     """
 
     n = len(dictionary)
@@ -484,10 +519,11 @@ def _lp_l1(dictionary, x, g, tol, node_weights, kappa_max):
     if a_kap is not None:
         rows.append(a_kap)
         rhs.append(np.full(len(x), float(kappa_max)))
-    res = linprog(np.tile(np.asarray(node_weights, dtype=np.float64), 4),
-                  A_ub=vstack(rows, format="csr"),
-                  b_ub=np.concatenate(rhs),
-                  bounds=[(0.0, None)] * (4 * n), method="highs")
+    res = _linprog_certified(
+        np.tile(np.asarray(node_weights, dtype=np.float64), 4),
+        A_ub=vstack(rows, format="csr"),
+        b_ub=np.concatenate(rhs),
+        bounds=[(0.0, None)] * (4 * n), method="highs")
     if not res.success:
         return None
     v = res.x
@@ -522,9 +558,10 @@ def _lp_minimax(support, x, g, kappa_max, scale=1.0):
         rhs.append(np.full(m, float(kappa_max)))
     c = np.zeros(4 * n + 1)
     c[-1] = 1.0
-    res = linprog(c, A_ub=vstack(rows, format="csr"),
-                  b_ub=np.concatenate(rhs),
-                  bounds=[(0.0, None)] * (4 * n + 1), method="highs")
+    res = _linprog_certified(
+        c, A_ub=vstack(rows, format="csr"),
+        b_ub=np.concatenate(rhs),
+        bounds=[(0.0, None)] * (4 * n + 1), method="highs")
     if not res.success:
         return None, np.inf
     v = res.x
@@ -1031,7 +1068,7 @@ def catalog_document(entries, ledger, total_wall):
                 "chosen without reference to it."),
         },
         "shipping_rule": {
-            "source": "MPA_THEORY_PLAN.md section E",
+            "source": "docs/theory/THEORY_mpa_implementation.md",
             "kappa0_definition":
                 "max over u in [1,R] of u * sum_l |w_l| e^{-t_l u}",
             "kappa0_reference": (
@@ -1210,6 +1247,33 @@ def merge_entries(existing, fresh):
     return ordered, replaced
 
 
+def append_catalog_document(prior, entries, ledger, total_wall):
+    """Add rows without re-authoring certificates already in the bundle.
+
+    ``--append`` generates new bytes; only explicit ``--recertify`` may
+    remeasure old payloads.  Preserve the prior document and its table rows,
+    updating only the catalog census, ledger, and merged table list.  The
+    top-level provenance describes the original bundle campaign and must not
+    be reassigned to a later one-cell append.
+    """
+
+    doc = copy.deepcopy(prior)
+    sweep_doc = doc.setdefault("sweep", {})
+    sweep_doc["solver_wall_seconds"] = round(
+        float(sweep_doc.get("solver_wall_seconds", 0.0))
+        + float(total_wall), 2)
+    sweep_doc["entries"] = len(entries)
+    sweep_doc["certified"] = sum(
+        1 for entry in entries if entry["certified"])
+    sweep_doc["by_rule"] = {
+        rule: sum(1 for entry in entries if entry["rule"] == rule)
+        for rule in sorted({entry["rule"] for entry in entries})
+    }
+    sweep_doc["ledger"] = ledger
+    doc["tables"] = entries
+    return doc
+
+
 def recertify(output_root, verbose=True):
     """Re-derive every catalog field from the STAGED BYTES, not the solve.
 
@@ -1349,7 +1413,11 @@ def main(argv=None):
 
     def _checkpoint(entries, ledger, wall):
         merged, replaced = merge_entries(prior_tables, entries)
-        doc = catalog_document(merged, prior_ledger + ledger, wall)
+        if args.append and prior_tables:
+            doc = append_catalog_document(
+                prior, merged, prior_ledger + ledger, wall)
+        else:
+            doc = catalog_document(merged, prior_ledger + ledger, wall)
         tmp = path.with_suffix(".json.partial")
         tmp.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n",
                        encoding="utf-8")

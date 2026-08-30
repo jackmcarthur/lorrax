@@ -60,7 +60,9 @@ src/
 │   │                          production W: it is an algebraic kernel behind the
 │   │                          pytest `extra` marker (tests/test_head_wing_schur.py).
 │   │                          head_channel.py reuses its extract_V_body_sharded
-│   ├── wavefunction_bundle.py BandSlices + Wavefunctions (4 sharded ψ copies); project, project_ri (band-space contractions)
+│   ├── wavefunction_bundle.py BandSlices + Wavefunctions; legacy four-copy and
+│   │                          low-memory two-face ψ carriers; band projection
+│   ├── isdf_fitting.py        ζ-file lifecycle and the C/Z/factor/solve pipeline
 │   ├── coulomb/               dimension-aware Coulomb kernels behind get_kernel():
 │   │                            base.py (SysDim, dispatcher, mini-BZ sampler),
 │   │                            bulk_3d.py, slab_2d.py, box_0d.py
@@ -75,8 +77,7 @@ src/
 │   ├── meta.py                Meta dataclass (system params, band edges)
 │   ├── (symmetry_maps.py, density_symmetry_check.py → services/symmetry_maps/, 2026-08-07)
 │   ├── wfn_transforms.py      WFN.h5 reads, per-k FFT, kchunk helpers (was load_wfns.py)
-│   ├── isdf_fitting.py        CCT/ZCT kernels, Cholesky, zeta solve, full pipeline
-│   ├── cholesky_2d.py         2D blocked Cholesky (sharded)
+│   ├── pivoted_cholesky.py    row-sharded greedy selection + certificates
 │   ├── fft_helpers.py         flat-k ↔ 3D k FFT helpers via custom_partitioning
 │   ├── gvec_fft_box.py        sphere ↔ FFT-box gather (G-space layouts)
 │   ├── chi_from_dipole.py     S(ω) tensor from dipole matrix elements
@@ -89,8 +90,15 @@ src/
 │   ├── timing.py              named sections, aggregate report
 │   │   (minimax.py and minimax_assets/ left for services/minimax/ 2026-08-08)
 │   ├── (bench/smoke drivers → tests/bench/, 2026-07-31)
-│   │                          FFI smoke tests / benchmarks (run via lxrun)
+│   │                          FFI smoke tests / benchmarks (run through lx)
 │   └── phdf5_*                phdf5 benchmarks + plumbing tests
+│
+├── isdf/
+│   └── core.py                C_q and Z_q builders, ζ factors/back-solves,
+│                              face-cache and coupled transverse kernels
+│
+├── services/distrib_la/       one door for local and distributed dense LA
+├── services/zeta_loader/      ζ format probe and sharded/local readers
 │
 ├── file_io/              # Canonical file-format I/O (used by gw_jax)
 │   ├── (wfn_loader.py, zeta_loader.py → services/, 2026-08-07; __init__.py re-exports
@@ -125,7 +133,7 @@ src/
 │   ├── kmeans_cli.py          CLI entrypoint: `python -m centroid.kmeans_cli`
 │   ├── kmeans_isdf.py         k-means algorithm (k-means++ init, charge-weighted)
 │   ├── charge_density.py      ρ(r) build for centroid weights (get_charge_density)
-│   └── pivoted_cholesky.py    Cholesky-pruned candidate list
+│   └── pivoted_cholesky.py    candidate Gram build, prune policy + reporting
 │
 ├── psp/                  # Pseudopotentials + DFT operators
 │   ├── pseudos.py, upf/, radial/
@@ -292,10 +300,12 @@ Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are
 | Pair density `P_k(μ, ν)` | `P(None, 'x', 'y')` | scalar (spin-traced) |
 | Pair density `P_k(s, s', μ, ν)` | `P(None, None, None, 'x', 'y')` | spin-matrix mode |
 | `C_q(μ, ν)` | `P(None, 'x', 'y')` | CCT |
-| `L_q(μ, ν)` | `P(None, 'x', 'y')` | Cholesky factor |
-| `L_q` as tiles | `P(None, 'x', 'y', None, None)` | 2-D blocked algo |
-| `Z_q(μ, r)` | `P(None, 'x', 'y')` | ZCT z-chunk |
-| `ζ_q(μ, r_XY)` | `P(None, None, ('x','y'))` | triangular-solve output |
+| face `psi_mun(k,s,μ,n)` | `P(None, None, 'x', 'y')` | low-memory carrier; μ and bands split over the mesh |
+| face `psi_nmu(k,n,s,μ)` | `P(None, 'x', None, 'y')` | transposed face used by distributed GEMMs |
+| `F_q(μ, ν)` | `P(None, 'x', 'y')` | explicit factor/pseudo-inverse, or an opaque `distrib_la.FactorToken` with the same distributed ownership |
+| `Z_q(q,μ,r)` | `P(None, 'x', 'y')` | one real-space chunk: `Z_q[q,r_mu_X,r_chunk_Y]` |
+| `ζ_q(q,μ,r)` | `P(None, ('x','y'), None)` | solve output: μ flat-sharded over the mesh, r replicated for local FFTs |
+| on-disk `ζ_q(q,μ,G)` | `P(None, ('x','y'), None)` while writing | one G-flat tensor; logical μ extent on disk |
 | `V_q` flat-q | `P(None, 'x', 'y')` | (nq, μ_X, ν_Y) |
 | `χ₀_R` in tau step | `P(None, 'y', 'x')` | **Note**: μ on y, ν on x — matches einsum output |
 | G(k) 5D flat-k | `P(None, None, 'x', None, 'y')` | (nk, s, μ_X, s', ν_Y) |
@@ -317,9 +327,15 @@ Centroid-space (μ_X, ν_Y) is the dominant sharding. Flat-k / flat-q arrays are
 
 - **Σ^c(ω) project** (`ppm_sigma._make_project_ri_reduce_scatter`): replaces the naive `project_ri(ψ* σ ψ)` with a `shard_map` that uses two `psum_scatter` operations — one over `'x'` scattering the `m` index, one over `'y'` scattering `n`. Same NCCL byte volume as two psums, but output arrives `(m_X, n_Y)`-sharded, so every downstream `coeff·σ` multiply stays local.
 
-- **Cholesky** (`cholesky_2d.cholesky_2d_batched`): operates on tile layout `P(None, 'x', 'y', None, None)`. Panel broadcasts + triangular updates use `lax.psum` over axis `'x'`. Falls back to dense `jnp.linalg.cholesky` when `mesh.size == 1`.
-
-- **Triangular solve** (`isdf_fitting.solve_zeta_from_L_q`): loops over q-batches of size `q_chunk_size` (default 1); gathers `L_q[q0:q1]` to replicated, runs vmapped `solve_triangular` inside a `shard_map` over `('x','y')` flattened as a single scatter axis for the column dimension. Python loop with `donate_argnums` forces sequential GPU execution (fori_loop SPMD-replicates the carry; scan unrolled OOMs).
+- **ζ fit** (`gw.isdf_fitting` → `isdf.core`): `C_q` and each r-chunk
+  `Z_q` stay at `P(None,'x','y')`. The local plan moves a q-batch to complete
+  per-device matrices and runs native JAX linear algebra. The distributed
+  plan keeps every matrix face-sharded and uses an opaque
+  `distrib_la.factor()`/`solve()` token. Both return the same sharded ζ
+  contract. The bispinor fast path shares the bounded face-Y transform across
+  μ₁/μ₂/μ₃, but keeps the three solves and writes ordered. See
+  [the face-ψ ζ fit](zeta_fit_face_psi_cct.md) for the data motion and
+  [large-Nμ operation](../dev/large_nmu_operation.md) for route scaling.
 
 ---
 
@@ -361,15 +377,14 @@ WFN.h5 + WFNq.h5 + centroids_frac.h5 + (eps0mat.h5, dipole.h5 optional)
 │ Two paths:                                                            │
 │   restart=True  → load_restart_state_from_h5 (tagged_arrays.h5)       │
 │   restart=False →                                                     │
-│     isdf_fitting.fit_zeta_chunked_to_h5                               │
-│       ├─ load_centroids_band_chunked       (band-chunked FFT at r_μ)  │
-│       ├─ compute_pair_density_spin_{traced,matrix}   (both L and R)   │
-│       ├─ compute_CCT_from_left_right{_spin_matrix}   (k → R → q conv) │
-│       ├─ compute_L_q_from_CCT               (2-D blocked chol)        │
-│       └─ z-chunk loop:                                                │
-│           ├─ compute_ZCT_from_left_right_zchunk{_spin_matrix}          │
-│           ├─ solve_zeta_from_L_q             (triangular solve)       │
-│           └─ zeta_io.write_slab('zeta_q', ...)  via SlabIO            │
+│     gw_init.fit_zeta → gw.isdf_fitting.fit_zeta_to_h5              │
+│       ├─ isdf.core.c_q_from_psi_sm          C_q[q,μ_X,ν_Y]       │
+│       ├─ isdf.core.factor_c_q               local array or token       │
+│       ├─ r-chunk loop:                                                │
+│       │   ├─ isdf.core.z_q_from_psi_sm       Z_q[q,μ_X,r_Y]       │
+│       │   ├─ isdf.core.solve_zeta            ζ_q[q,μ_XY,r]        │
+│       │   └─ accumulate_rchunk_to_gflat      persistent ζ(q,μ,G)  │
+│       └─ one SlabIO.write_slab('zeta_q_G', ...) after all chunks    │
 │     compute_vcoul.compute_all_V_q  (dispatcher → G-flat path)         │
 │       └─ v_q_g_flat.compute_all_V_q_g_flat                            │
 │           ├─ compute_v_q_per_G  (v(q+G) on per-q WFN.h5 sphere)       │
@@ -457,7 +472,13 @@ GWResults → write_results → eqp.dat / eqp1.dat / sigma_mnk.h5 / qp_rotations
 
 ### 6.1 Input — `cohsex.in`
 
-Parsed by `LorraxConfig.from_input_file()`. Canonical reference: [`docs/input_reference.md`](../input_reference.md), generated from the parser by `tools/gen_input_reference.py` and drift-checked in `tools/release_check.sh`. (A prose companion, `docs/docs_gwjax/COHSEX_INPUT.md`, lives in the sandbox repo — not here, which is why the relative link that stood here could never resolve.) Between them they cover every flag (band ranges, ISDF parameters, memory budget, screening knobs, head-correction policy, frequency grid, etc.).
+Parsed by `LorraxConfig.from_input_file()`. The canonical prose reference is
+[`docs/input_reference.md`](../input_reference.md). It is currently
+hand-maintained: `tools/gen_input_reference.py` cannot parse all live defaults
+and would flatten the longer contract rows if allowed to write. That known
+release-gate defect is recorded in `tests/KNOWN_FAILURES.md`; do not describe
+the page as generated until the tool is repaired. The parser's `_DEFAULTS`
+dictionary remains the authority for the accepted key set and defaults.
 
 ### 6.2 Input — `centroids_frac.h5`
 
@@ -465,15 +486,21 @@ Generated by `centroid.kmeans_cli` (algorithm in `centroid.kmeans_isdf`). Stores
 
 ### 6.3 Intermediate — `zeta_q.h5`
 
-Written by `isdf_fitting.fit_zeta_chunked_to_h5` via `SlabIO`.
+Written by `gw.isdf_fitting.fit_zeta_to_h5` through `SlabIO`.
 
 ```
-/zeta_q : (n_q_flat, n_rtot, n_rmu)  complex128
-          chunks = (1, n_rchunk, n_rmu)
-          layout = flat-q:  q_flat = qx*nky*nkz + qy*nkz + qz
+/zeta_q_G : (n_q_disk, n_rmu_logical, ngkmax)  complex128
+            layout = flat-q; G positions are per-q sphere positions
+/isdf_header/ngk               logical G count for each stored q
+/isdf_header/gvec_components   per-q G-vector components
 ```
 
-**Layout note**: dataset is `(nq, n_rtot, n_rmu)` with n_rmu innermost — so each per-r-chunk write spans the full μ axis contiguously. The old `(nq, n_rmu, n_rtot)` layout scattered 480K × 1920-B strips per rank per write and ran 8× slower on Perlmutter pscratch. V_q reads remain contiguous (per-q slab at `(q, 0, 0)` is one block); the downstream kernel transposes on GPU (~50 µs/q).
+The fit accumulates this G-flat tensor across all real-space chunks, then
+writes it once. The three transverse files use the same format. During the
+coupled route their accumulators may live in host RAM between chunks; this
+does not change the file contract. `zeta_loader` owns format detection and
+the production sharded read. The older `/zeta_q` real-space dataset remains
+readable as a legacy format, but it is not written by the current driver.
 
 ### 6.4 Intermediate — `V_qmunu.h5` (or returned in-memory)
 
@@ -527,9 +554,8 @@ lorrax-bse       = "bse.bse_isdf:main"
 ### 7.2 Common module invocations
 
 ```bash
-# Perlmutter canonical (see config/README.md)
-lxpre cohsex.in 640                              # centroids + dipole + kin_ion
-lxrun python3 -u -m gw.gw_jax -i cohsex.in       # 4-GPU GW
+# Perlmutter canonical allocation/placement (see the machine guide)
+lx run python3 -u -m gw.gw_jax -i cohsex.in
 
 # Local dev
 uv run python -m centroid.kmeans_cli 640 --seed 42
@@ -537,10 +563,9 @@ uv run python -m psp.get_dipole_mtxels -i cohsex.in
 uv run python -m gw.kin_ion_io -i cohsex.in
 uv run python -m gw.gw_jax -i cohsex.in
 
-# FFI smoke tests (module-load + lxalloc first)
-lxrun python3 tests/bench/slate_batched_test.py
-lxrun python3 tests/bench/cusolvermp_eigh_test.py
-lxrun python3 -m common.phdf5_write_test
+# Focused compute-node tests
+lx test tests/bench/slate_batched_test.py
+lx test tests/bench/cusolvermp_eigh_test.py
 ```
 
 ---
@@ -551,22 +576,21 @@ lxrun python3 -m common.phdf5_write_test
 
 ```
 prepare_isdf_and_wavefunctions          [gw/gw_init.py]
- ├─ fit_zeta_chunked_to_h5               [common/isdf_fitting.py]
- │   ├─ load_centroids_band_chunked       [common/wfn_transforms.py]
- │   │   └─ read_Gvecs_to_devices           [common/wfn_transforms.py]
- │   ├─ compute_pair_density_spin_{traced,matrix}  [common/isdf_fitting.py]
- │   ├─ compute_CCT_from_left_right[_spin_matrix]  [common/isdf_fitting.py]
- │   │   └─ make_flat_k_{fftn,ifftn}        [common/fft_helpers.py]
- │   ├─ compute_L_q_from_CCT               [common/isdf_fitting.py]
- │   │   └─ cholesky_2d_batched            [common/cholesky_2d.py]
- │   └─ z-chunk loop:
- │       ├─ compute_ZCT_from_left_right_zchunk    [common/isdf_fitting.py]
- │       ├─ solve_zeta_from_L_q             [common/isdf_fitting.py]
- │       └─ SlabIO.write_slab               [file_io/slab_io.py]
+ ├─ load_centroids_band_chunked            [common/wfn_transforms.py]
+ ├─ fit_zeta                                [gw/gw_init.py]
+ │   └─ fit_zeta_to_h5                    [gw/isdf_fitting.py]
+ │       ├─ c_q_from_psi_sm                 [isdf/core.py]
+ │       ├─ factor_c_q                      [isdf/core.py]
+ │       │   └─ distrib_la.factor             [services/distrib_la]
+ │       ├─ r-chunk loop:
+ │       │   ├─ z_q_from_psi_sm / _z_q_face_coupled_mu123
+ │       │   ├─ solve_zeta                     [isdf/core.py]
+ │       │   └─ accumulate_rchunk_to_gflat     [gw/isdf_fitting.py]
+ │       └─ SlabIO.write_slab('zeta_q_G')    [file_io/slab_io.py]
  └─ compute_all_V_q  (dispatcher)        [gw/compute_vcoul.py]
      └─ compute_all_V_q_g_flat            [gw/v_q_g_flat.py]
          ├─ compute_v_q_per_G             [gw/compute_vcoul.py]
-         └─ ZetaReader.read_slab          [file_io/zeta_reader.py]
+         └─ ZetaLoader.read_zeta_G_slab   [services/zeta_loader]
 ```
 
 ### 8.2 Screening + static Σ
@@ -647,12 +671,11 @@ main                                       [gw/gw_jax.py]
 | **Load WFN.h5** | `services/wfn_loader/ : WfnLoader` (`import wfn_loader`, after `ffi._services.ensure_on_path()`); band-chunked FFT `common/wfn_transforms.py` |
 | **Symmetry unfolding** | `symmetry_maps : SymMaps.get_cnk_fullzone[_batch]` (service door) |
 | **Flat-k FFT helpers** | `common/fft_helpers.py : make_flat_k_fftn`, `make_flat_k_ifftn` |
-| **Pair density (spin-traced)** | `common/isdf_fitting.py : compute_pair_density_spin_traced` |
-| **CCT matrix** | `common/isdf_fitting.py : compute_CCT_from_left_right[_spin_matrix]` |
-| **Cholesky factorization** | `common/isdf_fitting.py : compute_L_q_from_CCT` → `common/cholesky_2d.py : cholesky_2d_batched` |
-| **ZCT matrix (z-chunk)** | `common/isdf_fitting.py : compute_ZCT_from_left_right_zchunk` |
-| **ζ solve** | `common/isdf_fitting.py : solve_zeta_from_L_q` |
-| **Full ζ pipeline** | `common/isdf_fitting.py : fit_zeta_chunked_to_h5` |
+| **C_q pair-density Gram** | `isdf/core.py : c_q_from_psi_sm` |
+| **Z_q r-chunk RHS** | `isdf/core.py : z_q_from_psi_sm`, `_z_q_face_coupled_mu123` |
+| **ζ factor and solve** | `isdf/core.py : factor_c_q`, `solve_zeta`; vendor calls through `distrib_la` |
+| **Full ζ pipeline** | `gw/gw_init.py : fit_zeta` → `gw/isdf_fitting.py : fit_zeta_to_h5` |
+| **ζ reader** | `zeta_loader : ZetaLoader` |
 | **Compute V_q** | `gw/compute_vcoul.py : compute_all_V_q` → `gw/v_q_g_flat.py : compute_all_V_q_g_flat` (charge) / `gw/v_q_bispinor.py : compute_V_q_bispinor_g_flat_to_h5` (bispinor) |
 | **Voronoi MC for q=0** | `gw/vcoul.py : compute_q0_averages`, or `gw/coulomb/base.py : sample_minibz_qpoints` + each kernel's `q0_average` |
 | **Coulomb kernel + truncation** | `gw/coulomb/` — `get_kernel(meta.sys_dim)` → `Bulk3D` (3) \| `Slab2D` (2) \| `Box0D` (0). Production `v(q+G)` enters at `gw/compute_vcoul.py : compute_v_q_per_G`. *(This row named `gw/vcoul.py : compute_V_qfullG_for_q` until 2026-08-06; that function does not exist anywhere in `src/`.)* **On `feat/vcoul-consolidation-2026-08-06` (unmerged)** `compute_v_q_per_G` becomes a thin dispatcher over one `coulomb/base.py : v_qG_table` driver: each kernel contributes only `_v_bare_per_q` (the dimension's bare formula at one q), and the per-q loop, the `vcoul_cutoff_ry` mask, the G=0 head-slot injection and the `(n_q, ngkmax)` float64 contract live once — so the cutoff, head injection and batching that used to exist only in `compute_vcoul` become available in every dimension, and `Box0D` refuses q≠0 rather than returning a wrong number. |

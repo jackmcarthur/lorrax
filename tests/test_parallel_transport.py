@@ -21,6 +21,7 @@ from common.parallel_transport import (
     fourth_order_connection,
     g_wrap_for_forward_step,
     make_distributed_band_matmul,
+    undersampled_link_axes,
     wfn_fingerprint,
 )
 import file_io.parallel_transport as pt_io
@@ -33,7 +34,7 @@ from file_io.parallel_transport import (
     VELOCITY_DFT_DATASET,
     complete_velocity_validation,
     initialize_parallel_transport_artifact,
-    validate_covariant_velocity,
+    write_parallel_transport_artifact,
 )
 from gw.gw_config import read_lorrax_input
 
@@ -147,18 +148,64 @@ def test_wfn_fingerprint_accepts_byte_identical_copy(tmp_path):
     assert any("window nval=8 ncond=32 nband=40" in line for line in lines)
 
 
-def test_artifact_refuses_an_aliased_fourth_order_mesh_before_io():
+def test_undersampled_link_axes_names_collapsed_and_undersampled_axes():
+    """The shared per-axis threshold: clean, undersampled and collapsed."""
+    assert undersampled_link_axes((8, 8, 8)) == []
+    assert undersampled_link_axes((5, 5, 5)) == []          # exactly at floor
+    assert undersampled_link_axes((4, 6, 6)) == ["x"]
+    assert undersampled_link_axes((9, 9, 1)) == ["z"]        # 2D-slab class
+    assert undersampled_link_axes((3, 1, 2)) == ["x", "y", "z"]
+
+
+def test_link_stage_refuses_an_aliased_fourth_order_mesh_before_io():
+    """D2/D3(c): the stencil gate now lives on the LINK remainder, not the
+    velocity-writing initializer — and it still fires before any I/O."""
     wfn = types.SimpleNamespace(kgrid=np.asarray([4, 6, 6]))
     try:
+        write_parallel_transport_artifact(
+            "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
+            bispinor=False)
+    except ValueError as exc:
+        msg = str(exc)
+        assert "PT-LINK-STENCIL-UNSUPPORTED" in msg
+        assert "kgrid=(4, 6, 6)" in msg and "undersampled axes x" in msg
+    else:
+        raise AssertionError("undersampled fourth-order mesh was accepted")
+
+
+def test_link_stage_refuses_a_collapsed_2d_axis_before_io():
+    """A genuinely collapsed slab axis (kgrid[i]=1) refuses HERE too — it is
+    never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md fix note);
+    a deck that wants only the velocity must ask for that instead (D2)."""
+    wfn = types.SimpleNamespace(kgrid=np.asarray([9, 9, 1]))
+    try:
+        write_parallel_transport_artifact(
+            "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
+            bispinor=False)
+    except ValueError as exc:
+        assert "undersampled axes z" in str(exc)
+    else:
+        raise AssertionError("collapsed 2D axis was accepted by the link stage")
+
+
+def test_initialize_no_longer_gates_the_velocity_write_on_kgrid():
+    """D2: the exact-DFT-velocity write is unconditional on kgrid.
+
+    Before this fix ``initialize_parallel_transport_artifact`` raised its
+    OWN ``ValueError`` naming "at least five" on this exact 2D kgrid, before
+    ``sym``/``mesh``/``velocity_dft_kmajor`` were ever touched (the test this
+    replaces).  Now the same undersampled/collapsed kgrid must run PAST that
+    removed check and fail downstream instead, on the ``sym=None`` this call
+    intentionally supplies as a probe -- proving the gate is gone rather than
+    merely relocated to a spot this call happens not to reach.
+    """
+    wfn = types.SimpleNamespace(kgrid=np.asarray([9, 9, 1]))
+    with pytest.raises(AttributeError):
         initialize_parallel_transport_artifact(
             "must-not-open.h5", wfn=wfn, sym=None, mesh=None, nbands=1,
             effective_nspinor=1, bispinor=False,
             velocity_dft_kmajor=None, wfn_path="WFN.h5",
             wfn_fingerprint="0" * 64)
-    except ValueError as exc:
-        assert "at least five" in str(exc) and "kgrid=(4, 6, 6)" in str(exc)
-    else:
-        raise AssertionError("undersampled fourth-order mesh was accepted")
 
 
 def test_forward_neighbors_do_not_assume_flattening_order():
@@ -387,34 +434,6 @@ def test_fourth_order_connection_and_orientation_red_twin():
         band_matmul=lambda left, right: left @ right))
     np.testing.assert_allclose(wrong[0, :, 0, 0], -expected, atol=2.0e-6)
     assert np.max(np.abs(wrong - got)) > 1.0
-
-
-def test_velocity_validation_covers_complex_diagonal_and_offdiagonal():
-    """The pass arm is exact and a commutator-sign red twin is rejected."""
-    rng = np.random.default_rng(11)
-    nk, nb = 2, 3
-    A0 = rng.normal(size=(3, nk, nb, nb)) + 1j * rng.normal(
-        size=(3, nk, nb, nb))
-    A = 0.5 * (A0 + np.swapaxes(A0.conj(), -1, -2))
-    H0 = rng.normal(size=(nk, nb, nb)) + 1j * rng.normal(
-        size=(nk, nb, nb))
-    H = 0.5 * (H0 + np.swapaxes(H0.conj(), -1, -2))
-    exact0 = rng.normal(size=A.shape) + 1j * rng.normal(size=A.shape)
-    exact = 0.5 * (exact0 + np.swapaxes(exact0.conj(), -1, -2))
-    comm = A @ H[None] - H[None] @ A
-    dH = exact + 1.0j * comm
-    metrics = validate_covariant_velocity(
-        dH, A, H, exact, band_matmul=np.matmul,
-        atol=1.0e-12, rtol=1.0e-12)
-    assert metrics["passed"]
-    assert metrics["max_abs_diagonal"] < 1.0e-12
-    assert metrics["max_abs_offdiagonal"] < 1.0e-12
-
-    red = validate_covariant_velocity(
-        exact - 1.0j * comm, A, H, exact, band_matmul=np.matmul,
-        atol=1.0e-12, rtol=1.0e-12)
-    assert not red["passed"]
-    assert red["max_abs_offdiagonal"] > 1.0e-3
 
 
 def _identity_links(nk, nb):

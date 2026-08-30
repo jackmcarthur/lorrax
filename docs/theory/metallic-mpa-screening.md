@@ -441,10 +441,25 @@ Per QSGW iteration `i`, using the state carried from `i-1`
 (`build_iteration_head_response`):
 
 1. **Velocities**: parallel-transport covariant derivative
-   (`covariant_structured_delta` on the stored Berry connection) added to
-   the DFT velocity, rotated to the current QP basis
-   (`rotate_velocity_active_to_qp`); `validate_dft_velocity_identity` is the
-   SOC-degeneracy guard in the per-iteration path.
+   (`covariant_link_derivative` on the stored finite-link connection) added
+   to the DFT velocity, rotated to the current QP basis
+   (`rotate_velocity_active_to_qp`). CORRECTED 2026-08-23 (D4 retirement
+   sweep, `fix/head-wing-mp1-and-retirement-2026-08-23`): this paragraph
+   named `covariant_structured_delta`, a symbol that does not exist
+   anywhere in `qsgw_head.py` and has not since before that sweep — a
+   pre-existing staleness, not something the sweep introduced (grep-
+   verified; the same dead name is what makes
+   `tests/multi_device/parallel_transport_profile.py` uncollectable,
+   registered separately). It also named `validate_dft_velocity_identity`
+   as "the SOC-degeneracy guard in the per-iteration path"; that function
+   never ran per-iteration (it was a standalone diagnostic gate with zero
+   production callers, confirmed by whole-tree grep before deletion) and
+   is now retired outright, per
+   `reports/metal_head_pt_pipelines_2026-08-23/PLAN.md`. Window-edge/
+   degeneracy protection for the metal head is being moved to preflight
+   refusals ahead of the SC loop (same PLAN.md, item D3) rather than a
+   per-iteration validator; see that plan and its landing branches for
+   the current mechanism.
 2. **Interband Kubo tensor** `S(z)` (`head_s_tensor_sharded`) with the
    iteration's occupations, in the `chi00 = q.S.q` convention owned by
    [S-tensor convention](s-tensor-convention.md).

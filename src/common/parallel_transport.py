@@ -22,6 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common.wfn_layout import band_sphere_spec
+from runtime.padding import round_up, spec_divisor
+
 
 __all__ = [
     "build_forward_neighbor_table",
@@ -36,9 +39,57 @@ __all__ = [
     "make_cross_k_overlap",
     "make_distributed_band_matmul",
     "make_cross_k_link",
+    "MIN_STENCIL_POINTS",
+    "undersampled_link_axes",
     "WFN_FINGERPRINT_SCHEME",
+    "bind_wfn_fingerprint",
+    "fingerprint_from_binding",
+    "fingerprint_update_value",
     "wfn_fingerprint",
 ]
+
+#: Minimum distinct mesh points a Cartesian direction needs to support the
+#: advertised fourth-order +/-2 link stencil (``fourth_order_connection`` /
+#: ``fourth_order_covariant_derivative``).  THE ONE PLACE THIS THRESHOLD IS
+#: DECIDED -- both the artifact producer
+#: (``file_io.parallel_transport.write_parallel_transport_artifact``) and the
+#: driver-entry preflight (``gw.sc_iteration.load_head_velocity_source``) read
+#: this name rather than each carrying its own literal ``5``, which is
+#: exactly the shadow-accounting failure class this tree's
+#: ``docs/dev/QUALITY_PATTERNS.md`` #3 names.
+MIN_STENCIL_POINTS: int = 5
+
+
+def undersampled_link_axes(kgrid) -> list[str]:
+    """Cartesian directions whose mesh cannot support the link stencil.
+
+    Applies PER AXIS, and ONLY to the stages that differentiate along k --
+    the nearest-neighbour link build and the fourth-order connection/
+    covariant-derivative stencil it feeds.  It does NOT apply to the
+    unconditional, gauge-free exact-DFT-velocity write
+    (``v = p + i[r,V_NL]`` needs no neighbouring k at all), which is why
+    that write is no longer gated on this check (KNOWN_LORRAX_ISSUES.md row
+    at ``file_io/parallel_transport.py:407-415`` / ``get_dipole_mtxels.py:
+    1309-1317``, 2026-08-19).
+
+    A genuinely collapsed direction (``kgrid[i] == 1``, e.g. the z axis of a
+    9x9x1 slab deck) is reported exactly like an undersampled periodic one
+    (``1 < kgrid[i] < 5``) -- NOT stamped as an analytic zero.  The fix note
+    on that same register row is explicit: "Do not fabricate a z derivative
+    for the separate covariant parallel-transport mode."  A 2D deck that
+    wants only the velocity reaches the links-free producer/consumer path
+    instead of asking this function anything; a 2D deck that asks for the
+    full ``parallel_transport`` link stage is refused, by name, on every
+    caller of this function.
+
+    Returns
+    -------
+    list[str]
+        The undersampled axis names, a subset of ``["x", "y", "z"]``, in
+        that fixed order.  Empty iff every direction supports the stencil.
+    """
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    return [axis for axis, n in zip("xyz", grid) if n < MIN_STENCIL_POINTS]
 
 _BAND_MATMUL_CACHE = {}
 
@@ -59,18 +110,16 @@ def band_storage_extent(mesh, nbands: int) -> int:
     their two band axes separately. Rounding to the full mesh product is
     accepted by both layouts, including rectangular meshes.
     """
-    from runtime.padding import round_up
-
     names = tuple(str(a) for a in mesh.axis_names)
     if names != ("x", "y"):
         raise ValueError(
             "parallel transport requires mesh axes ('x','y'); "
             f"got {names!r}")
-    divisor = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    divisor = spec_divisor(mesh, band_sphere_spec(), axis=1)
     return round_up(int(nbands), divisor)
 
 
-def _fingerprint_update_value(digest, label: str, value) -> None:
+def fingerprint_update_value(digest, label: str, value) -> None:
     """Add an ndarray-like value to ``digest`` without object-pointer bytes."""
     array = np.asarray(value)
     digest.update(label.encode("utf-8"))
@@ -95,7 +144,7 @@ def _fingerprint_sample_indices(size: int, count: int) -> np.ndarray:
 
 def _fingerprint_h5_attrs(digest, label: str, obj) -> None:
     for key in sorted(obj.attrs):
-        _fingerprint_update_value(
+        fingerprint_update_value(
             digest, f"attr:{label}:{key}", obj.attrs[key])
 
 
@@ -116,7 +165,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
             for name, obj in sorted(header_objects, key=lambda pair: pair[0]):
                 _fingerprint_h5_attrs(digest, name, obj)
                 if isinstance(obj, h5py.Dataset):
-                    _fingerprint_update_value(
+                    fingerprint_update_value(
                         digest, f"dataset:{name}", obj[()])
 
         if "wfns" not in h5:
@@ -130,7 +179,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
             dataset = wfns[dataset_name]
             _fingerprint_h5_attrs(
                 digest, f"wfns/{dataset_name}", dataset)
-            _fingerprint_update_value(
+            fingerprint_update_value(
                 digest, f"contract:wfns/{dataset_name}",
                 np.asarray(dataset.shape, dtype=np.int64))
             digest.update(dataset.dtype.str.encode("ascii"))
@@ -141,7 +190,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
                 f"WFN wfns/gvecs must be rank 2; got shape {gvecs.shape}")
         for ig in _fingerprint_sample_indices(
                 gvecs.shape[0], _WFN_GVEC_SAMPLE_COUNT):
-            _fingerprint_update_value(
+            fingerprint_update_value(
                 digest, f"sample:wfns/gvecs:{int(ig)}", gvecs[int(ig), :])
 
         coeffs = wfns["coeffs"]
@@ -155,7 +204,7 @@ def _fingerprint_wfn_file(digest, path) -> None:
         for ib in bands:
             for ig in g_rows:
                 # Spinor and real/imag axes are small and are included whole.
-                _fingerprint_update_value(
+                fingerprint_update_value(
                     digest,
                     f"sample:wfns/coeffs:{int(ib)}:{int(ig)}",
                     coeffs[int(ib), :, int(ig), :],
@@ -184,8 +233,8 @@ def wfn_fingerprint(wfn) -> str:
         ("loaded:energies", np.asarray(wfn.energies, dtype=np.float64)),
         ("loaded:kpoints", np.asarray(wfn.kpoints, dtype=np.float64)),
     ):
-        _fingerprint_update_value(digest, label, value)
-    _fingerprint_update_value(
+        fingerprint_update_value(digest, label, value)
+    fingerprint_update_value(
         digest, "loaded:counts",
         np.asarray(
             [int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands)],
@@ -196,6 +245,47 @@ def wfn_fingerprint(wfn) -> str:
     if path is not None:
         _fingerprint_wfn_file(digest, path)
     return digest.hexdigest()
+
+
+class _BoundWfnFingerprint:
+    """Host-only proof that one digest was computed from one loaded WFN."""
+
+    __slots__ = ("_source", "_fingerprint")
+
+    def __init__(self, source) -> None:
+        object.__setattr__(self, "_source", source)
+        object.__setattr__(self, "_fingerprint", wfn_fingerprint(source))
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("WFN fingerprint bindings are immutable")
+
+    def __reduce__(self):
+        raise TypeError("WFN fingerprint bindings are host-only and transient")
+
+
+def bind_wfn_fingerprint(wfn):
+    """Scan ``wfn`` once and bind the canonical digest to that exact object.
+
+    The opaque host-only result is an orchestration proof, not a numerical
+    JAX operand or a serializable artifact.  Consumers must extract its digest
+    through :func:`fingerprint_from_binding`, which refuses a different
+    loaded WFN even when it has the same path or array shapes.
+    """
+    return _BoundWfnFingerprint(wfn)
+
+
+def fingerprint_from_binding(binding, wfn) -> str:
+    """Return a bound canonical digest for the exact loaded ``wfn``."""
+    if not isinstance(binding, _BoundWfnFingerprint):
+        raise TypeError(
+            "expected the host-only result of bind_wfn_fingerprint; got "
+            f"{type(binding).__name__}")
+    if binding._source is not wfn:
+        raise ValueError(
+            "canonical WFN fingerprint binding belongs to a different "
+            "loaded WFN object; path or shape equality is not source "
+            "identity")
+    return binding._fingerprint
 
 
 def build_neighbor_table(

@@ -198,6 +198,7 @@ _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 _L2_MODULES = frozenset({
     "common.rank_criterion",   # the pseudo-inverse truncation criterion
     "common.spectral_closure",  # where that truncation is allowed to land
+    "common.pivoted_cholesky",  # row selection + numerical certificates
     "centroid.kmeans_isdf",    # density-weighted Lloyd loop under a metric
 })
 # ``common.minimax`` was here ("minimax quadrature: a Remez problem").  It is
@@ -321,6 +322,73 @@ def all_modules():
                     f"them would be invisible to every rule in this file")
             out[mod] = text
     return out
+
+
+_FINITE_Q_PUBLIC_ROW = "compute_finite_transfer_current_block_row"
+_FINITE_Q_PRIVATE_ORACLE = (
+    "_compute_finite_transfer_current_block_row_unverified")
+
+
+def scan_finite_q_public_refusal(source: str):
+    """Why the finite-q public row is not an authentication bypass.
+
+    Returns findings unless the public seam is one undecorated module-level
+    function whose only executable statement is ``raise NotImplementedError``.
+    A docstring is ignored.  The rule deliberately does not pin the refusal
+    prose, only the control-flow property that publication stays unreachable.
+    """
+    tree = ast.parse(source)
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == _FINITE_Q_PUBLIC_ROW
+    ]
+    if len(definitions) != 1:
+        return [("definition-count", len(definitions))]
+    fn = definitions[0]
+    findings = []
+    if fn.decorator_list:
+        findings.append(("decorated", fn.lineno))
+    body = list(fn.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Raise):
+        findings.append(("not-unconditional-single-raise", fn.lineno))
+        return findings
+    exc = body[0].exc
+    if (not isinstance(exc, ast.Call)
+            or not isinstance(exc.func, ast.Name)
+            or exc.func.id != "NotImplementedError"):
+        findings.append(("wrong-refusal-type", body[0].lineno))
+    return findings
+
+
+def scan_finite_q_private_oracle_references(source: str):
+    """References to the private fixed-q oracle outside its definition."""
+    tree = ast.parse(source)
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == _FINITE_Q_PRIVATE_ORACLE:
+                    hits.append(("import", node.lineno))
+        elif (isinstance(node, ast.Attribute)
+              and node.attr == _FINITE_Q_PRIVATE_ORACLE):
+            hits.append(("attribute", node.lineno))
+        elif (isinstance(node, ast.Name)
+              and isinstance(node.ctx, ast.Load)
+              and node.id == _FINITE_Q_PRIVATE_ORACLE):
+            hits.append(("name", node.lineno))
+        elif (isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name)
+              and node.func.id == "getattr"
+              and len(node.args) >= 2
+              and isinstance(node.args[1], ast.Constant)
+              and node.args[1].value == _FINITE_Q_PRIVATE_ORACLE):
+            hits.append(("getattr", node.lineno))
+    return sorted(set(hits), key=lambda hit: (hit[1], hit[0]))
 
 
 def modules_under_src(sources):
@@ -594,12 +662,12 @@ _DRIVER_PLUMBING_BUDGET = {
     # exciton-band assembly lives.  Numbered request.
     "bse.exciton_bands": 1,
     # ``jax.sharding`` at :20.  Same shape as exciton_bands, larger:
-    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on,
-    # and its Galerkin solve is written in ``shard_map``.  Its hand-rolled
+    # htransform is the H-matrix interpolation LIBRARY with a CLI bolted on.
+    # Its complete reusable Galerkin basis fit now lives in ``isdf.galerkin``;
+    # htransform retains the fH interpolation and its policy adapter, which
+    # still carry one ``jax.sharding`` import. Its hand-rolled
     # ``_build_mesh_xy`` is gone (2026-07-31; since 2026-08-01 it hands back
-    # the mesh ``initialize_communicator_stack`` built), and since 2026-08-06
-    # its ``shard_map`` comes from ``common.shard_map`` rather than from
-    # ``jax.experimental`` — so the residue is one ``jax.sharding`` import.
+    # the mesh ``initialize_communicator_stack`` built).
     "bandstructure.htransform": 1,
     # One ``from jax.sharding import ...`` each (a ``mesh_xy: Mesh``
     # annotation in every one).  The separate DEFAULTS bug these four
@@ -789,26 +857,19 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
-    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad /
-    # resolve_fh_ortho_tol / resolve_rank_policy_mode — one resolver each,
-    # refuse-on-garbage; the kwarg/entry layer can override by passing values
-    # down.  The last one carries the AUTHORITY of the rank-truncation gate
-    # (docs/dev/rank_truncation_policy.md); its name and grammar live in
-    # common/rank_criterion, which is L2 and may not read the environment, so
-    # the driver looks it up and passes it in.
+    # resolve_galerkin_chunk_bytes / resolve_extra_rank_pad — one resolver
+    # each, refuse-on-garbage; the entry layer passes resolved values down.
     "bandstructure.htransform": {
         "LORRAX_GALERKIN_CHUNK_GIB",
         "LORRAX_EXTRA_RANK_PAD",
-        "LORRAX_FH_ORTHO_TOL",
-        "LORRAX_RANK_POLICY",
     },
     # resolve_reshard_route — explicit kwarg wins, env is the A/B path the
     # production exciton_bands driver cannot plumb an argument to (file
     # ownership); unknown tokens announce, never silently.
     # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
-    # refuse-on-garbage, same shape as ``resolve_fh_ortho_tol`` in the sibling
-    # module four lines up.  It is deliberately NOT a driver flag: the gate
-    # catches a returned band that is ABSENT from fH, which is not a
+    # refuse-on-garbage, resolved once and passed down.  It is deliberately
+    # NOT a driver flag: the gate catches a returned band that is ABSENT from
+    # fH, which is not a
     # tolerance question, and the only value that changes its verdict is a
     # negative one, whose whole purpose is reproducing a known-bad run.
     "bandstructure.bse_setup": {
@@ -1054,6 +1115,36 @@ def test_no_module_imports_a_lower_numbered_layer(sources):
     assert not over, (
         f"an excused upward edge grew new sites — the exception was for the "
         f"count on the left, not for the direction: {over}")
+
+
+def test_pivoted_cholesky_selection_has_one_l2_owner(sources):
+    """The centroid and downfold routes share the numerical implementation."""
+    selector_names = {
+        "pivoted_cholesky_select",
+        "make_sharded_pivoted_cholesky_select",
+    }
+    owners = {name: [] for name in selector_names}
+    for mod, source in sources.items():
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in owners:
+                    owners[node.name].append(mod)
+    assert owners == {
+        "pivoted_cholesky_select": ["common.pivoted_cholesky"],
+        "make_sharded_pivoted_cholesky_select": ["common.pivoted_cholesky"],
+    }
+
+    for caller in ("centroid.pivoted_cholesky", "gw.downfold"):
+        imports = {
+            alias.name
+            for node in ast.walk(ast.parse(sources[caller]))
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "common.pivoted_cholesky"
+            for alias in node.names
+        }
+        assert "make_sharded_pivoted_cholesky_select" in imports, (
+            f"{caller} bypasses the common pivoted-Cholesky owner"
+        )
 
 
 def test_the_upward_exceptions_are_all_still_needed(sources):
@@ -1849,6 +1940,55 @@ def test_the_wfn_loader_door_scan_does_not_cry_wolf(sources):
     assert scan_service_door(ok, "m", "wfn_loader", subs, doors) == [], (
         "the service-door scan flags the door itself; the gate would be "
         "turned off")
+
+
+def test_finite_q_publication_stays_refused_and_private_oracle_unreachable(
+        sources):
+    """Authenticated fixed-q algebra still cannot become a source API.
+
+    The public seam remains one unconditional refusal, and no module under
+    ``src/`` may reference the private deterministic oracle.  Tests may call
+    the oracle to pin its algebra; production source may not route around the
+    remaining q-resolved C/Z, completion, rectangular-IBZ-action, and artifact
+    provenance requirements.
+    """
+    refusal = scan_finite_q_public_refusal(sources["gw.w_isdf"])
+    assert refusal == [], (
+        f"finite-q public publication seam is no longer an unconditional "
+        f"NotImplementedError: {refusal}")
+    callers = {}
+    for mod in sorted(modules_under_src(sources)):
+        hits = scan_finite_q_private_oracle_references(sources[mod])
+        if hits:
+            callers[mod] = hits
+    assert callers == {}, (
+        "src/ reaches the finite-q private oracle: "
+        f"{callers}")
+
+
+def test_finite_q_publication_ratchet_can_fail():
+    """RED TWIN for both halves of the finite-q publication boundary."""
+    conditional = f'''\
+def {_FINITE_Q_PUBLIC_ROW}(authenticated):
+    if authenticated:
+        return publish()
+    raise NotImplementedError("refused")
+'''
+    wrong_exception = f'''\
+def {_FINITE_Q_PUBLIC_ROW}():
+    raise RuntimeError("not the publication refusal")
+'''
+    assert scan_finite_q_public_refusal(conditional)
+    assert scan_finite_q_public_refusal(wrong_exception)
+
+    references = (
+        f"from gw.w_isdf import {_FINITE_Q_PRIVATE_ORACLE}\n",
+        f"answer = {_FINITE_Q_PRIVATE_ORACLE}(endpoint)\n",
+        f"answer = module.{_FINITE_Q_PRIVATE_ORACLE}(endpoint)\n",
+        f"answer = getattr(module, {_FINITE_Q_PRIVATE_ORACLE!r})(endpoint)\n",
+    )
+    for source in references:
+        assert scan_finite_q_private_oracle_references(source), source
 
 
 def test_no_module_is_in_two_levels():

@@ -92,7 +92,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ._collectives import device_put_process_local
 
 
-__all__ = ["IBZRows", "WfnLoader"]
+__all__ = [
+    "IBZRows", "WfnLoader", "WfnProvenance", "read_wfn_provenance",
+    "uniform_band_windows",
+]
 
 
 @dataclass(frozen=True)
@@ -105,7 +108,121 @@ class IBZRows:
 KSpec = Sequence[int] | IBZRows | Literal["ibz", "full_bz"]
 
 
+@dataclass(frozen=True)
+class _OccupationSummary:
+    nelec: int
+    state_capacity: float
+    num_electrons: float
+    exact_integer: bool
+    density_band_stop: int
+
+
+def _occupation_summary(mf) -> _OccupationSummary:
+    """Canonical immutable occupation metadata derived from one MfHeader."""
+    nspin = int(mf.nspin)
+    nspinor = int(mf.nspinor)
+    nkpts = int(mf.nkpts)
+    nbands = int(mf.nbands)
+    if min(nspin, nspinor, nkpts, nbands) <= 0:
+        raise ValueError(
+            "WFN occupation dimensions must be positive; got "
+            f"nspin={nspin}, nspinor={nspinor}, nkpts={nkpts}, "
+            f"nbands={nbands}.")
+    occs = np.asarray(mf.occs, dtype=np.float64)
+    if np.size(mf.ifmax) > 0:
+        nelec = int(np.max(mf.ifmax))
+    else:
+        nelec = int(np.sum(occs[0, 0] > 0.5))
+    if not 0 <= nelec <= nbands:
+        raise ValueError(
+            f"WFN ifmax implies band boundary {nelec}, outside [0,{nbands}].")
+    if not np.all(np.isfinite(occs)):
+        raise ValueError("WFN occupations must be finite.")
+    weights = np.asarray(mf.kweights, dtype=np.float64)
+    weight_sum = float(weights.sum())
+    if (weights.shape != (nkpts,)
+            or not np.all(np.isfinite(weights)) or np.any(weights < 0.0)
+            or not np.isfinite(weight_sum) or weight_sum <= 0.0):
+        raise ValueError(
+            "WFN k-point weights must be finite, nonnegative, and have "
+            f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
+    expected_shape = (nspin, nkpts, nbands)
+    if occs.shape != expected_shape:
+        raise ValueError(
+            f"WFN occupations have shape {occs.shape}, expected "
+            f"{expected_shape}.")
+    capacity = 2.0 / (float(nspin) * float(nspinor))
+    num_electrons = capacity * float(np.einsum(
+        "k,skb->", weights / weight_sum, occs, optimize=True))
+    exact = bool(np.all(occs[:, :, :nelec] == 1.0)
+                 and np.all(occs[:, :, nelec:] == 0.0))
+    if exact:
+        density_stop = nelec
+    else:
+        nonzero = np.flatnonzero(np.any(occs != 0.0, axis=(0, 1)))
+        density_stop = 0 if nonzero.size == 0 else int(nonzero[-1]) + 1
+    if density_stop <= 0:
+        raise ValueError(
+            "physical WFN density has no occupied states; exact Hartree "
+            "requires at least one exactly nonzero occupation.")
+    return _OccupationSummary(
+        nelec, capacity, num_electrons, exact, density_stop)
+
+
+@dataclass(frozen=True)
+class WfnProvenance:
+    """Lightweight WFN identity/occupation view; no G or psi payloads."""
+    path: str
+    energies: np.ndarray
+    kpoints: np.ndarray
+    nelec: int
+    nspinor: int
+    nbands: int
+    num_electrons: float
+    occupations_are_exact_integer: bool
+    physical_density_band_stop: int
+
+
+def read_wfn_provenance(path: str) -> WfnProvenance:
+    """Read one canonical MfHeader into the post-hoc authentication view."""
+    from file_io.mf_header import read_mf_header_from_file
+    resolved = str(Path(path).expanduser().resolve())
+    with h5.File(resolved, "r") as handle:
+        mf = read_mf_header_from_file(handle)
+    summary = _occupation_summary(mf)
+    energies = np.array(mf.energies, dtype=np.float64, copy=True)
+    kpoints = np.array(mf.kpoints, dtype=np.float64, copy=True)
+    energies.flags.writeable = kpoints.flags.writeable = False
+    return WfnProvenance(
+        resolved, energies, kpoints, summary.nelec, int(mf.nspinor),
+        int(mf.nbands), summary.num_electrons,
+        summary.exact_integer, summary.density_band_stop)
+
+
+def uniform_band_windows(b_lo: int, b_hi: int, width: int) -> list:
+    """Fixed-width ``(lo, mask)`` windows covering a band range once.
+
+    The final window overlaps instead of shortening, so every consumer sees
+    one compiled FFT shape; its 0/1 mask removes the overlap exactly.
+    """
+    b_lo, b_hi = int(b_lo), int(b_hi)
+    span = b_hi - b_lo
+    if span <= 0:
+        return []
+    width = min(max(1, int(width)), span)
+    out, counted = [], b_lo
+    while counted < b_hi:
+        lo = min(counted, b_hi - width)
+        mask = np.zeros(width, dtype=np.float64)
+        mask[counted - lo:] = 1.0
+        out.append((lo, mask))
+        counted = lo + width
+    return out
+
+
 class WfnLoader:
+    uniform_band_windows = staticmethod(uniform_band_windows)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -190,38 +307,14 @@ class WfnLoader:
         self.atom_crys = np.einsum(
             'ij,kj->ki', np.linalg.inv(self.avec).T, self.atom_positions)
 
-        # Derived band-fill metadata — same names WFNReader exposed.
-        # ``ifmax`` is the 1-based index of the highest band with nonzero
-        # occupation.  It is a BAND BOUNDARY, not an electron count: in a
-        # metal the last band can be only partially occupied.
-        if np.size(self.ifmax) > 0:
-            self.nelec = int(np.max(self.ifmax))
-        else:
-            self.nelec = int(np.sum(self.occs[0, 0] > 0.5))
-        weights = np.asarray(self.kweights, dtype=np.float64)
-        weight_sum = float(weights.sum())
-        if (weights.shape != (int(self.nkpts),)
-                or not np.all(np.isfinite(weights))
-                or np.any(weights < 0.0)
-                or not np.isfinite(weight_sum)
-                or weight_sum <= 0.0):
-            raise ValueError(
-                "WFN k-point weights must be finite, nonnegative, and have "
-                f"positive sum; got shape={weights.shape}, sum={weight_sum}.")
-        occs = np.asarray(self.occs, dtype=np.float64)
-        if occs.shape != (int(self.nspin), int(self.nkpts), int(self.nbands)):
-            raise ValueError(
-                "WFN occupations have shape "
-                f"{occs.shape}, expected "
-                f"({int(self.nspin)},{int(self.nkpts)},{int(self.nbands)}).")
-        # BerkeleyGW's WFN convention counts 2/(nspin*nspinor) electrons per
-        # unit occupation.  Unlike ``nelec=max(ifmax)``, this remains the
-        # physical fixed-N target for fractional occupations.
-        state_capacity = 2.0 / (
-            float(max(int(self.nspin), 1))
-            * float(max(int(self.nspinor), 1)))
-        self.num_electrons = state_capacity * float(np.einsum(
-            "k,skb->", weights / weight_sum, occs, optimize=True))
+        # Immutable occupation metadata is derived by the same bounded header
+        # helper used by the lightweight post-hoc provenance reader.
+        occupation = _occupation_summary(hdr)
+        self.nelec = occupation.nelec
+        self._occupation_state_capacity = occupation.state_capacity
+        self.num_electrons = occupation.num_electrons
+        self._occupations_are_exact_integer = occupation.exact_integer
+        self._physical_density_band_stop = occupation.density_band_stop
         _nb = int(self.energies.shape[-1])
         _occ_idx = max(0, min(self.nelec - 1, _nb - 1))
         self.vbm = float(np.max(self.energies[:, :, _occ_idx]))
@@ -303,12 +396,15 @@ class WfnLoader:
         # that can turn a time-reversal row into a conjugated ψ, so
         # gating there covers every backend (eager / phdf5).
         #
-        # TODO(metal-symmetry): form this diagnostic density with the WFN
-        # occupation weights; ``nelec=max(ifmax)`` overfills its current
-        # occupied-band-only window for a metal.
+        # The diagnostic pairs the raw IBZ coefficients with this loader's
+        # canonical per-k/per-band ``occs`` rows.  ``nelec=max(ifmax)`` is
+        # only a nominal support boundary (signed smearing tails may extend
+        # past it); it is never treated as a unit-filled electron count for a
+        # fractional metal.
         # Runs last in ``__init__`` because it needs ``nelec``,
-        # ``kweights``, ``box_index`` and the open file handle.  Cost is
-        # occupied-bands-only on a ±-closed k-subsample — order a second
+        # ``kweights``, ``box_index`` and the open file handle.  Cost is the
+        # exact nonzero occupation support on a
+        # ±-closed k-subsample — order a second
         # at fixture scale, ~5 s at 12x12 scale (measured, scorecard §U)
         # — cached per (file, mtime, size) for the process.
         # ``LORRAX_TRS_CHECK=0`` opts out; ``=strict`` raises instead of
@@ -333,6 +429,84 @@ class WfnLoader:
         the sibling wave-1 branches.
         """
         return self._path
+
+    @property
+    def occupations_are_exact_integer(self) -> bool:
+        """Whether the complete WFN table is exactly ``[1...1,0...0]``.
+
+        ``nelec=max(ifmax)`` is only nominal: smearing tails can extend past
+        it, so the complete stored table participates in this predicate.
+        """
+        return bool(self._occupations_are_exact_integer)
+
+    @property
+    def occupation_state_capacity(self) -> float:
+        """Electrons represented by one unit WFN occupation."""
+        return float(self._occupation_state_capacity)
+
+    @property
+    def physical_density_band_stop(self) -> int:
+        """Exclusive exact support for a physical WFN density quadrature."""
+        return int(self._physical_density_band_stop)
+
+    def physical_density_occupations(
+        self,
+        *,
+        k: str,
+        unit_as_none: bool = False,
+    ) -> np.ndarray | None:
+        """Canonical ``(nk, nb)`` occupation operand for physical density.
+
+        Full-BZ rows use the same cached ``SymMaps.irr_idx_k`` as the
+        wavefunction unfold.  ``unit_as_none`` preserves the exact insulating
+        reduction.  Collinear ``nspin=2`` is refused because the coefficient
+        carrier has no explicit spin-channel axis.
+        """
+        stop = self.physical_density_band_stop
+        if int(self.nspin) != 1:
+            raise ValueError(
+                "physical_density_occupations: WfnLoader has no explicit "
+                "collinear-spin wavefunction axis, so it cannot pair nspin="
+                f"{int(self.nspin)} occupations with its psi carrier.")
+        occs = np.asarray(self.occs, dtype=np.float64)
+        if k == "file":
+            selected = occs[0, :, :stop]
+        elif k == "full_bz":
+            sym = self.symmetry()
+            source_rows = np.asarray(
+                sym.irr_idx_k, dtype=np.int64)
+            if (source_rows.shape != (int(sym.nk_tot),)
+                    or np.any(source_rows < 0)
+                    or np.any(source_rows >= int(self.nkpts))):
+                raise ValueError(
+                    "physical_density_occupations: cached full-BZ source-row "
+                    f"map is invalid for nk_file={int(self.nkpts)}: "
+                    f"shape={source_rows.shape}.")
+            selected = occs[0, source_rows, :stop]
+        else:
+            raise ValueError(
+                "physical_density_occupations: k must be 'file' or "
+                f"'full_bz', got {k!r}.")
+        selected = np.ascontiguousarray(selected, dtype=np.float64)
+        if not np.all(np.isfinite(selected)):
+            raise ValueError(
+                "physical_density_occupations: WFN weights must be finite.")
+        if k == "full_bz":
+            unfolded_electrons = (self.occupation_state_capacity
+                                  * float(np.sum(selected))
+                                  / float(selected.shape[0]))
+            tol = (256.0 * np.finfo(np.float64).eps
+                   * max(1.0, abs(self.num_electrons), float(stop)))
+            if not np.isclose(unfolded_electrons, self.num_electrons,
+                              rtol=0.0, atol=tol):
+                raise ValueError(
+                    "full-BZ occupation unfold changes fixed N: "
+                    f"{unfolded_electrons:.16e} != "
+                    f"{self.num_electrons:.16e} (tol={tol:.3e}).")
+        if unit_as_none and np.array_equal(
+                selected, np.ones_like(selected)):
+            return None
+        return selected
 
     @property
     def kpt_starts(self) -> np.ndarray:
@@ -619,6 +793,31 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # G-vector and ngk_valid accessors
     # ------------------------------------------------------------------
+    def kvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
+        """Return the fractional k representatives paired with ``gvecs``.
+
+        This is the coordinate half of the loader's G-flat gauge contract.
+        For raw IBZ rows it returns the WFN file's own ``kpoints``; for a
+        full-BZ request it returns ``SymMaps.unfolded_kpts`` in the exact
+        requested row order. Consumers that form ``k+G`` or apply a Bloch
+        phase must take both tables from this loader: rebuilding k from an
+        integer grid can choose a different reciprocal-lattice image without
+        applying the compensating shift to G.
+        """
+        k_idxs, unfold = self._resolve_k(k)
+        if unfold:
+            table = np.asarray(
+                self._ensure_sym().unfolded_kpts, dtype=np.float64)
+        else:
+            table = np.asarray(self.kpoints, dtype=np.float64)
+        out = np.asarray(table[np.asarray(k_idxs, dtype=np.int32)],
+                         dtype=np.float64)
+        if out.shape != (len(k_idxs), 3) or not np.all(np.isfinite(out)):
+            raise ValueError(
+                "WfnLoader.kvecs: resolved k table must be finite with shape "
+                f"({len(k_idxs)}, 3); got {out.shape}.")
+        return np.ascontiguousarray(out)
+
     def gvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
         """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, padded
         beyond logical ``ngk`` with the FFT-box **pad sentinel**.
@@ -964,12 +1163,12 @@ class WfnLoader:
         # ``nspinor`` is NOT optional here.  ``sym.U_spinor`` is always
         # (ntran, 2, 2) — it is built from the CARTESIAN rotations and
         # knows nothing about how many components psi has — so on a scalar
-        # (nspinor=1) WFN the un-told helper hands back a 2x2, the unfold
-        # kernel's ``einsum("kac,bckg->bakg", ...)`` BROADCASTS the size-1
-        # spinor axis instead of raising, and psi comes back 2-component
-        # holding ``U[a,0]+U[a,1]`` times itself.  Told ``nspinor``, the
-        # helper returns the 1x1 identity and the same einsum is a genuine
-        # no-op.  Registered nspinor=1 loader defect, fixed 2026-08-09;
+        # (nspinor=1) WFN the un-told helper hands back a 2x2; the former
+        # unfold einsum BROADCASTED the size-1 spinor axis instead of raising,
+        # and psi came back 2-component holding ``U[a,0]+U[a,1]`` times
+        # itself.  Told ``nspinor``, the helper returns the 1x1 identity and
+        # the static service application is a genuine no-op.  Registered
+        # nspinor=1 loader defect, fixed 2026-08-09;
         # see ``tests/KNOWN_FAILURES.md``.
         from symmetry_maps import trs_augment_U
         U_per = trs_augment_U(
@@ -1191,6 +1390,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> jax.Array:
         """ψ(G) for a (band_range, k-set) window.
 
@@ -1209,8 +1409,8 @@ class WfnLoader:
           τ-phase + TR conjugation applied internally.
         * For ``k='ibz'``: raw WFN-file IBZ slab; no unfold.
 
-        ``bispinor=True`` lifts the small spinor components via
-        ``(α/2) σ·(k+G) ψ_L``.  ``nspinor_out`` is then 4; else 2 (or
+        ``bispinor=True`` lifts the small spinor components via the selected
+        canonical ``bispinor_lift`` representation. ``nspinor_out`` is then 4; else 2 (or
         the file's ``nspinor``).  Requires the WFN file to have
         ``nspinor == 2`` (BGW Pauli convention); ``ValueError``
         otherwise.
@@ -1219,6 +1419,10 @@ class WfnLoader:
             raise ValueError(
                 f"WfnLoader.load(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
+        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
+            raise ValueError(
+                "bispinor_lift selects a four-spinor transform and requires "
+                "bispinor=True")
 
         b_lo, b_hi = int(bands[0]), int(bands[1])
         nb_logical = b_hi - b_lo
@@ -1257,8 +1461,8 @@ class WfnLoader:
                 nb_padded=nb_padded, out_sharding=named_sharding)
             if bispinor:
                 psi = self._apply_bispinor_lift(
-                    psi, k=k, k_idxs=k_idxs, unfold=unfold,
-                    sharding=named_sharding)
+                    psi, k=k, sharding=named_sharding,
+                    representation=bispinor_lift)
             return psi
 
         if bispinor:
@@ -1269,7 +1473,8 @@ class WfnLoader:
                 nb_padded=nb_padded)
             psi_j = jnp.asarray(psi_np)
             psi_j = self._apply_bispinor_lift(
-                psi_j, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+                psi_j, k=k, sharding=None,
+                representation=bispinor_lift)
             if named_sharding is None:
                 return psi_j
             # Process-local shard-out.  ``jax.device_put`` of an
@@ -1303,6 +1508,7 @@ class WfnLoader:
         bands: tuple[int, int],
         k: KSpec = "full_bz",
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> jax.Array:
         """ψ(G) for THIS PROCESS ALONE — a **single-device** ``jax.Array``.
 
@@ -1343,6 +1549,10 @@ class WfnLoader:
             raise ValueError(
                 f"load_process_local(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
+        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
+            raise ValueError(
+                "bispinor_lift selects a four-spinor transform and requires "
+                "bispinor=True")
         b_lo, b_hi = int(bands[0]), int(bands[1])
         if b_hi <= b_lo:
             raise ValueError(f"empty band range: {bands}")
@@ -1364,7 +1574,8 @@ class WfnLoader:
         psi = jax.device_put(psi_np, jax.local_devices()[0])
         if bispinor:
             psi = self._apply_bispinor_lift(
-                psi, k=k, k_idxs=k_idxs, unfold=unfold, sharding=None)
+                psi, k=k, sharding=None,
+                representation=bispinor_lift)
         return psi
 
     def _eager_build_process_local(
@@ -1426,6 +1637,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
     ) -> Iterator[tuple[tuple[int, int], jax.Array]]:
         """Yield ``((bc_lo, bc_hi), psi)`` for a chunked sweep over bands."""
         if chunk <= 0:
@@ -1434,7 +1646,7 @@ class WfnLoader:
             bc_hi = min(bc_lo + int(chunk), int(b_hi))
             yield (bc_lo, bc_hi), self.load(
                 bands=(bc_lo, bc_hi), k=k, sharding=sharding,
-                bispinor=bispinor)
+                bispinor=bispinor, bispinor_lift=bispinor_lift)
 
     # ------------------------------------------------------------------
     # Bispinor lift (G-flat)
@@ -1444,9 +1656,8 @@ class WfnLoader:
         psi_2: jax.Array,
         *,
         k: KSpec,
-        k_idxs: np.ndarray,
-        unfold: bool,
         sharding: NamedSharding | None,
+        representation: str = "raw",
     ) -> jax.Array:
         """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
 
@@ -1460,27 +1671,22 @@ class WfnLoader:
         Pad rows of ψ are zero → small components of pad rows are also
         zero (clean propagation, no per-k mask needed).
 
-        ``unfold`` tells us which kvec table to use: raw IBZ
-        (``wfn.kpoints``, k_idxs are IBZ indices) vs full-BZ
-        (``sym.unfolded_kpts``, k_idxs are full-BZ indices).
+        ``k`` is resolved once by :meth:`kvecs`, the same public loader door
+        whose representatives are paired with :meth:`gvecs`.
         """
         gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int
-        if unfold:
-            sym = self._ensure_sym()
-            kvecs_np = np.asarray(
-                sym.unfolded_kpts, dtype=np.float64)[
-                    np.asarray(k_idxs, dtype=np.int32)]
-        else:
-            kvecs_np = np.asarray(
-                self.kpoints, dtype=np.float64)[
-                    np.asarray(k_idxs, dtype=np.int32)]
-        bvec = np.asarray(self.bvec, dtype=np.float64)
+        kvecs_np = self.kvecs(k=k)
+        # WFN stores bvec in reciprocal-lattice units and blat=2π/alat in
+        # bohr⁻¹.  This file-format boundary is the one place the bispinor
+        # lift converts to the Cartesian momentum its API requires.
+        bvec_cart_bohr = (
+            float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
         return _bispinor_lift_kernel(
             psi_2,
             jnp.asarray(gvecs, dtype=jnp.float64),
             jnp.asarray(kvecs_np),
-            jnp.asarray(bvec),
-            sharding=sharding,
+            jnp.asarray(bvec_cart_bohr),
+            sharding=sharding, representation=representation,
         )
 
     # ------------------------------------------------------------------
@@ -1565,7 +1771,10 @@ class WfnLoader:
 
 
 @functools.lru_cache(maxsize=None)
-def _get_bispinor_lift_jit(sharding: NamedSharding | None):
+def _get_bispinor_lift_jit(
+    sharding: NamedSharding | None,
+    representation: str = "raw",
+):
     """Cache one jit'd copy of the bispinor lift per output sharding.
 
     Without this, each call to ``_bispinor_lift_kernel`` traces every
@@ -1578,8 +1787,10 @@ def _get_bispinor_lift_jit(sharding: NamedSharding | None):
     from common.bispinor_init import lift_to_4spinor
 
     @jax.jit
-    def _kernel(psi_2, gvecs, kvecs, bvec):
-        out = lift_to_4spinor(psi_2, gvecs, kvecs, bvec)
+    def _kernel(psi_2, gvecs, kvecs, bvec_cart_bohr):
+        out = lift_to_4spinor(
+            psi_2, gvecs, kvecs, bvec_cart_bohr,
+            representation=representation)
         if sharding is not None:
             out = jax.lax.with_sharding_constraint(out, sharding)
         return out
@@ -1590,18 +1801,20 @@ def _bispinor_lift_kernel(
     psi_2: jax.Array,
     gvecs: jax.Array,
     kvecs: jax.Array,
-    bvec: jax.Array,
+    bvec_cart_bohr: jax.Array,
     *,
     sharding: NamedSharding | None,
+    representation: str = "raw",
 ) -> jax.Array:
     """Append small components → 4-spinor ψ.
 
     psi_2: (n_k, nb, 2, ngkmax) c128
     gvecs: (n_k, ngkmax, 3)  float64 (already cast)
     kvecs: (n_k, 3)          float64
-    bvec : (3, 3)            float64
+    bvec_cart_bohr : (3, 3)  float64, reciprocal rows in bohr⁻¹
     """
-    return _get_bispinor_lift_jit(sharding)(psi_2, gvecs, kvecs, bvec)
+    return _get_bispinor_lift_jit(sharding, str(representation).strip().lower())(
+        psi_2, gvecs, kvecs, bvec_cart_bohr)
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1880,8 @@ def _phdf5_unfold_kernel(
     ``(n_k, nb_padded, ns, ngkmax)``.
     """
     if unfold:
+        from symmetry_maps import apply_spinor_rotation
+
         def _per_rank(cnk_at_ibz, U_per_k, phase_per_k, tr_mask_per_k,
                        position_in_reads):
             cnk = cnk_at_ibz[..., 0] + 1j * cnk_at_ibz[..., 1]
@@ -1674,9 +1889,14 @@ def _phdf5_unfold_kernel(
             cnk = jnp.where(
                 tr_mask_per_k[None, None, :, None], jnp.conj(cnk), cnk)
             cnk = cnk * phase_per_k[None, None, :, :]
-            cnk = jnp.einsum("kac,bckg->bakg", U_per_k, cnk)
-            # (bpr, ns, n_k, ngkmax) → (n_k, bpr, ns, ngkmax)
-            return jnp.transpose(cnk, (2, 0, 1, 3))
+            # Normalize to spinor-last so symmetry_maps owns the same static
+            # ns=1/ns=2 application as the eager host unfold.  U's inserted
+            # singleton axes align k without materializing a broadcast.
+            cnk_last = jnp.transpose(cnk, (0, 2, 3, 1))
+            cnk_last = apply_spinor_rotation(
+                U_per_k[None, :, None, :, :], cnk_last)
+            # (bpr, n_k, ngkmax, ns) → (n_k, bpr, ns, ngkmax)
+            return jnp.transpose(cnk_last, (1, 0, 3, 2))
 
         in_specs = (
             P(("x", "y"), None, None, None, None),     # cnk_at_ibz

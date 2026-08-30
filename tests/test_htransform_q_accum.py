@@ -1,34 +1,27 @@
 """The streamed-Galerkin Q accumulator: memory ledger, mesh refusal, and
-the explicit band->r transition (2026-08-22).
+the explicit band->r transition (2026-08-22/24).
 
 Register rows closed here (sandbox KNOWN_LORRAX_ISSUES 2026-08-19):
 
-* ``htransform.py streaming_galerkin_solve`` priced only the streamed psi
-  band chunk while the full-r ``Q[rank, ns, n_rtot]`` accumulator stayed
-  live across all band chunks — CrI3 81k/160b/6800c at P=4 advertised
-  3.39 GB/chunk while XLA priced Q at 133.98 GiB/device (JID 57269074).
-  ``galerkin_q_ledger`` now charges Q (x2 donated in/out overlap), both
-  transition layouts of the psi chunk, the replicated Gram state, Vh, G
-  and the psi(G-flat) window, and ``_refuse_unfit_galerkin_mesh``
-  refuses a non-fitting mesh BEFORE compilation, naming the smallest
-  square mesh that fits.
-* The band-sharded psi slab entered the accumulation contraction with no
-  explicit reshard; the legacy SPMD partitioner fell back to fully
-  replicating a 54.3-GiB slab per GPU at P16 (JID 57271407,
-  "Involuntary full rematerialization").  ``_make_to_r_kernel`` is now
-  the ONE explicit band->r all-to-all, and ``_make_accum_kernel`` pins
-  its psi input sharding to Q's fitted r layout.
+* ``isdf.galerkin.build_streamed_projected_gram`` never retains Q over the whole
+  FFT grid.  It now accumulates all band chunks into one bounded Q r-chunk,
+  folds that chunk into G, and discards it before advancing r.
+* The generic product-band → r-on-y reshard fully rematerialised the carrier.
+  The production route now uses ``common.staged_reshard``'s two explicit,
+  volume-preserving all-to-alls and ``_make_accum_kernel`` pins its psi input
+  to the resulting product-r layout.
 
 The multi-device transition twin runs in a 4-CPU-device subprocess (the
-house pattern of ``test_transverse_rank_truncate``).  Importing
-``bandstructure.htransform`` needs the FFI host library, so every cell
-skips cleanly where it is not built (login nodes); the P=4 GPU leg is the
-compute-node ``lx test`` run.
+house pattern of ``test_transverse_rank_truncate``).  It imports the extracted
+owner directly: pulling in htransform would initialize the whole driver before
+the kernel test runs and would make the test describe launcher policy rather
+than Galerkin arithmetic.  The P=4 GPU leg is the compute-node ``lx test`` run.
 """
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -38,38 +31,50 @@ import pytest
 _NDEV = 4
 
 
-def _import_ht():
+def test_projected_gram_consumes_one_public_wfn_source():
+    """The r loop must not reopen the WFN or invent a second schedule."""
+    root = Path(__file__).resolve().parents[1] / "src"
+    gal = (root / "isdf" / "galerkin.py").read_text()
+    ht = (root / "bandstructure" / "htransform.py").read_text()
+
+    body = gal.split("def build_streamed_projected_gram(", 1)[1]
+    assert "source.iter_rchunk_bandwise(" in body
+    assert "source.band_chunk_ranges" in body
+    assert "source.band_chunk_carrier" in body
+    assert "iter_psi_rchunk_bandwise(" not in body
+    assert "build_psi_G_store(" in gal
+    assert "fit_galerkin_basis(" in ht
+
+
+def _import_galerkin():
     pytest.importorskip("jax")
     try:
-        from bandstructure import htransform as ht
+        from isdf import galerkin
     except RuntimeError as exc:  # FFI host library not built here
         if "FFI" in str(exc) or "liblorrax" in str(exc):
             pytest.skip(f"FFI host library unavailable: {exc}")
         raise
-    return ht
+    return galerkin
 
 
 # ---------------------------------------------------------------------------
-# Ledger arithmetic (pure shape algebra, but lives behind the ht import)
+# Ledger arithmetic (pure shape algebra in the Galerkin owner)
 # ---------------------------------------------------------------------------
 
-def test_the_ledger_charges_q_not_just_the_chunk():
-    """The CrI3 geometry that produced the 3.39 GB/chunk vs 133.98
-    GiB/device escape: the ledger's Q term must dominate and reproduce
-    XLA's own figure (rank*ns*n_rtot*16/q_shards)."""
-    ht = _import_ht()
+def test_the_ledger_charges_q_and_fold_workspace():
+    """The bounded Q carrier includes accumulation and fold workspace."""
+    gal = _import_galerkin()
     rank, nk, ns, n_rtot = 12960, 81, 2, 1_406_256
-    led = ht.galerkin_q_ledger(
+    led = gal.galerkin_q_ledger(
         rank=rank, nk=nk, nspinor=ns, n_rtot=n_rtot, band_chunk=16,
         m_states=nk * 160, mu_pad=6800, psi_win_elems=nk * 160 * ns * 90_000,
         p_total=4, q_shards=4, y_shards=2)
-    q_dev = rank * ns * n_rtot * 16 / 4          # XLA's 133.98 GiB class
-    assert led["Q accumulator (x2 donated in/out overlap)"] == pytest.approx(
-        2.0 * q_dev)
+    q_dev = rank * ns * n_rtot * 16 / 4
+    q_key = "Q r-chunk (x2 accumulation + x1 fold workspace)"
+    assert led[q_key] == pytest.approx(3.0 * q_dev)
     # Q dominates every other row on this geometry.
     others = {k: v for k, v in led.items()
-              if k not in ("TOTAL", "Q accumulator (x2 donated in/out "
-                           "overlap)")}
+              if k not in ("TOTAL", q_key)}
     assert all(v < q_dev for v in others.values()), others
     # And the old banner's unit — one streamed band, the "3.39 GB/chunk"
     # line — under-advertised the live set by more than an order of
@@ -78,29 +83,26 @@ def test_the_ledger_charges_q_not_just_the_chunk():
     assert led["TOTAL"] > 50 * bytes_per_band
 
 
-def test_refusal_names_a_fitting_square_mesh(monkeypatch):
+def test_refusal_names_a_fitting_square_mesh():
     """A pool smaller than the ledger refuses BEFORE compilation and
     names the smallest square mesh that fits — the register's required
     message shape."""
-    ht = _import_ht()
+    gal = _import_galerkin()
     import jax
     from jax.sharding import Mesh, PartitionSpec as P
-    import common.gpu_utils as gpu_utils
 
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     rank, nk, ns, n_rtot = 512, 8, 2, 4096
     kw = dict(rank=rank, nk=nk, nspinor=ns, n_rtot=n_rtot, band_chunk=8,
               m_states=nk * 16, mu_pad=256, psi_win_elems=nk * 16 * ns * 512)
-    led = ht.galerkin_q_ledger(p_total=1, q_shards=1, y_shards=1, **kw)
+    led = gal.galerkin_q_ledger(p_total=1, q_shards=1, y_shards=1, **kw)
     # Pool sized so the 1x1 ledger overflows but a wider square mesh fits.
     limit = int(led["TOTAL"] * 0.5)
-    monkeypatch.setattr(gpu_utils, "_get_jax_gpu_memory_bytes",
-                        lambda: (float(limit), 0.0, float(limit)))
     lines = []
     with pytest.raises(ValueError) as err:
-        ht._refuse_unfit_galerkin_mesh(
+        gal._refuse_unfit_galerkin_mesh(
             led, mesh_xy=mesh, q_spec=P(None, None, ("x", "y")),
-            log_fn=lines.append, **kw)
+            device_pool_limit=float(limit), log_fn=lines.append, **kw)
     msg = str(err.value)
     assert "does not fit" in msg and "GiB pool" in msg
     assert "smallest square mesh that fits" in msg, msg
@@ -109,44 +111,33 @@ def test_refusal_names_a_fitting_square_mesh(monkeypatch):
     m = re.search(r"pool size is (\d+)x(\d+)", msg)
     assert m and m.group(1) == m.group(2), msg
     named = int(m.group(1))
-    led_s = ht.galerkin_q_ledger(
-        p_total=named * named,
-        q_shards=ht._square_q_shards(n_rtot, named),
-        y_shards=(named if n_rtot % named == 0 else 1), **kw)
+    from runtime.padding import round_up
+    kw_s = {**kw, "n_rtot": round_up(n_rtot, named * named)}
+    led_s = gal.galerkin_q_ledger(
+        p_total=named * named, q_shards=named * named,
+        y_shards=named, **kw_s)
     assert led_s["TOTAL"] <= limit
 
 
-def test_refusal_gate_announces_when_it_cannot_run(monkeypatch):
+def test_refusal_gate_announces_when_it_cannot_run():
     """A gate reporting nothing must be distinguishable from a gate that
     checked nothing (TASTE 2026-08-15): with no readable pool the ledger
     prints and the refusal announces itself OFF instead of passing
     silently."""
-    ht = _import_ht()
+    gal = _import_galerkin()
     import jax
     from jax.sharding import Mesh, PartitionSpec as P
-    import common.gpu_utils as gpu_utils
 
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     kw = dict(rank=64, nk=4, nspinor=1, n_rtot=64, band_chunk=4,
               m_states=16, mu_pad=32, psi_win_elems=1024)
-    led = ht.galerkin_q_ledger(p_total=1, q_shards=1, y_shards=1, **kw)
-    monkeypatch.setattr(gpu_utils, "_get_jax_gpu_memory_bytes",
-                        lambda: (None, None, None))
+    led = gal.galerkin_q_ledger(
+        p_total=1, q_shards=1, y_shards=1, **kw)
     lines = []
-    ht._refuse_unfit_galerkin_mesh(
+    gal._refuse_unfit_galerkin_mesh(
         led, mesh_xy=mesh, q_spec=P(None, None, ("x", "y")),
-        log_fn=lines.append, **kw)
+        device_pool_limit=None, log_fn=lines.append, **kw)
     assert any("DID NOT RUN" in ln for ln in lines)
-
-
-def test_square_q_shards_matches_the_fitter_arithmetic():
-    ht = _import_ht()
-    # 27000 = 2^3 3^3 5^3 — the cohsex fixture extent from the sharding_fit
-    # history: indivisible by 64, divisible by 8.
-    assert ht._square_q_shards(27000, 8) == 8
-    assert ht._square_q_shards(27000, 4) == 4    # 16 does not divide; 4 does
-    assert ht._square_q_shards(27000, 7) == 1
-    assert ht._square_q_shards(4096, 4) == 16
 
 
 # ---------------------------------------------------------------------------
@@ -162,18 +153,18 @@ def _twin_body() -> dict:
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-    from bandstructure import htransform as ht
-    from common.sharding_fit import fit_sharding, shard_factor
+    from isdf import galerkin as gal
+    from common.sharding_fit import shard_factor
+    from common.staged_reshard import band_to_product_r_reshard
 
     devs = jax.devices()
     if len(devs) < _NDEV:
         return {"skip": f"only {len(devs)} devices"}
     mesh = Mesh(np.asarray(devs[:_NDEV]).reshape(2, 2), ("x", "y"))
 
-    rank, nk, w, ns, n_rtot = 8, 3, 4, 2, 16     # n_rtot % 4 == 0
+    rank, nk, w, ns, n_rtot = 8, 3, 4, 2, 19
     rep = NamedSharding(mesh, P())
-    sharding_q = fit_sharding(mesh, P(None, None, ("x", "y")),
-                              (rank, ns, n_rtot), "twin.Q")
+    sharding_q = NamedSharding(mesh, P(None, None, ("y", "x")))
     q_entry = sharding_q.spec[2]
     psi_layout = NamedSharding(mesh, P(None, None, None, q_entry))
 
@@ -181,38 +172,51 @@ def _twin_body() -> dict:
     inv_s = rng.standard_normal((rank, 1))
     grid_xy = NamedSharding(mesh, P("x", "y"))
 
-    # Two band chunks accumulated into one Q, then folded into G —
-    # against a plain numpy reference of the same sum.
-    Q = jax.jit(lambda: jnp.zeros((rank, ns, n_rtot), dtype=jnp.complex128),
-                out_shardings=sharding_q)()
+    # Three r chunks (including a 3->4 zero-padded terminal carrier), each
+    # accumulating two band chunks before its fold.  This is the production
+    # r-outer/band-inner invariant, against the same schedule in NumPy.
     G = jax.jit(lambda: jnp.zeros((rank, rank), dtype=jnp.complex128),
                 out_shardings=grid_xy)()
-    Q_ref = np.zeros((rank, ns * n_rtot), dtype=np.complex128)
+    G_ref = np.zeros((rank, rank), dtype=np.complex128)
     band_sh = NamedSharding(mesh, P(None, ("x", "y"), None, None))
     layout_ok = True
-    for _chunk in range(2):
-        UH = (rng.standard_normal((rank, nk * w))
-              + 1j * rng.standard_normal((rank, nk * w)))
-        psi = (rng.standard_normal((nk, w, ns, n_rtot))
-               + 1j * rng.standard_normal((nk, w, ns, n_rtot)))
-        # The loader hands the slab BAND-sharded over ('x','y').
-        psi_dev = jax.device_put(jnp.asarray(psi), band_sh)
-        to_r = ht._make_to_r_kernel(mesh, psi_layout)
-        psi_r = to_r(psi_dev)
-        layout_ok &= (psi_r.sharding.spec == psi_layout.spec)
-        accum = ht._make_accum_kernel(rank, w, ns, mesh, rep,
-                                      psi_layout, sharding_q)
-        Q = accum(jax.device_put(jnp.asarray(UH), rep),
-                  jax.device_put(jnp.asarray(inv_s), rep), psi_r, Q)
-        Q_ref += inv_s * (UH @ psi.reshape(nk * w, ns * n_rtot))
-    q_layout_ok = (Q.sharding.spec == sharding_q.spec)
-
-    fold = jax.jit(
-        lambda Q_, G_: G_ + jnp.einsum("asr,bsr->ab", Q_, jnp.conj(Q_),
-                                       optimize=True),
-        donate_argnums=(0, 1), out_shardings=grid_xy)
-    G = fold(Q, G)
-    G_ref = Q_ref @ Q_ref.conj().T
+    UH_chunks = [
+        (rng.standard_normal((rank, nk * w))
+         + 1j * rng.standard_normal((rank, nk * w)))
+        for _ in range(2)
+    ]
+    psi_chunks = [
+        (rng.standard_normal((nk, w, ns, n_rtot))
+         + 1j * rng.standard_normal((nk, w, ns, n_rtot)))
+        for _ in range(2)
+    ]
+    to_r = band_to_product_r_reshard(mesh)
+    fold = gal._make_fold_G_kernel(rank, mesh, sharding_q, grid_xy)
+    q_layout_ok = True
+    for r0, r1 in ((0, 8), (8, 16), (16, 19)):
+        carrier = ((r1 - r0 + 3) // 4) * 4
+        Q = jax.jit(
+            lambda n=carrier: jnp.zeros((rank, ns, n),
+                                        dtype=jnp.complex128),
+            out_shardings=sharding_q)()
+        Q_ref = np.zeros((rank, ns * carrier), dtype=np.complex128)
+        for UH, psi_full in zip(UH_chunks, psi_chunks):
+            psi = psi_full[..., r0:r1]
+            if carrier > r1 - r0:
+                psi = np.pad(psi, ((0, 0), (0, 0), (0, 0),
+                                   (0, carrier - (r1 - r0))))
+            # The loader hands the slab BAND-sharded over ('x','y').
+            psi_dev = jax.device_put(jnp.asarray(psi), band_sh)
+            psi_r = to_r(psi_dev)
+            layout_ok &= (psi_r.sharding.spec == psi_layout.spec)
+            accum = gal._make_accum_kernel(rank, w, ns, mesh, rep,
+                                           psi_layout, sharding_q)
+            Q = accum(jax.device_put(jnp.asarray(UH), rep),
+                      jax.device_put(jnp.asarray(inv_s), rep), psi_r, Q)
+            Q_ref += inv_s * (UH @ psi.reshape(nk * w, ns * carrier))
+        q_layout_ok &= (Q.sharding.spec == sharding_q.spec)
+        G = fold(Q, G)
+        G_ref += Q_ref @ Q_ref.conj().T
 
     g = np.asarray(jax.device_get(G))
     g_err = float(np.max(np.abs(g - G_ref)) / np.max(np.abs(G_ref)))
@@ -266,13 +270,13 @@ def _run_worker(tag: str, timeout: int = 900):
 
 
 def test_band_to_r_transition_matches_reference_at_p4():
-    """The explicit band->r all-to-all + pinned-layout accumulation
-    reproduce the flattened reference sum, land psi in Q's exact fitted
+    """The two staged band->r all-to-alls + pinned-layout accumulation
+    reproduce the flattened reference sum, land psi in Q's exact product-r
     layout, and keep Q in that layout.  Scope: one process over 4
     devices — REAL GPUs when this interpreter already has >= 4 (the lx
     test leg), else 4 forced host CPU devices in a subprocess.  The
     multi-PROCESS P=4 leg is a driver run, not this cell."""
-    _import_ht()   # skip early if FFI is absent in THIS interpreter
+    _import_galerkin()   # skip early if FFI is absent in THIS interpreter
     import jax
     if len(jax.devices()) >= _NDEV:
         out = _twin_body()

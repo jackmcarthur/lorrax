@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from common import timing
+from runtime.padding import pad_axis
 from . import distribution as dist
 from ffi import _services as _lx_services        # noqa: F401
 _lx_services.ensure_on_path()
@@ -692,7 +693,10 @@ def weighted_kmeans_jax(
     Pass the table from ``orbit_syms.real_space_action_tables(wfn, sym)``.
 
     Returns:
-        labels  : (P,) cluster assignment for each grid point.
+        labels  : cluster assignment for each grid point.  Its distributed
+            extent is padded to the mesh divisor when necessary; entries
+            beyond ``rho.size`` are the sentinel ``-1`` and are not logical
+            grid points.
         centroids: (N_c, 3) fractional centroids / canonical reps in [0, 1).
         steps_taken: int.
         max_movement_sq: final max movement² in avec units squared.
@@ -735,11 +739,47 @@ def weighted_kmeans_jax(
         centroids.block_until_ready()
 
     # The grid is the distributed axis: each rank owns a slice of the
-    # points and the whole centroid list.
-    positions = dist.place(positions, mesh, mesh_axis, None)
-    rho_flat = dist.place(rho_flat, mesh, mesh_axis)
-    metric_tensor = dist.place(metric_tensor, mesh)
+    # points and the whole centroid list.  Seed on the LOGICAL grid above:
+    # a zero-weight padding point must not enter either k-means++ or the
+    # random weighted draw.  Only then round the distributed extent up to
+    # the product-mesh divisor.  The shared padding helper returns the same
+    # object on already-divisible paths, preserving their computation.
+    grid_divisor = dist.n_shards(mesh, mesh_axis)
+    positions_pad = pad_axis(
+        positions, grid_divisor, axis=0, fill=0.0,
+    )
+    rho_pad = pad_axis(
+        rho_flat, grid_divisor, axis=0, fill=0.0,
+    )
+    if (positions_pad.logical != rho_pad.logical
+            or positions_pad.padded != rho_pad.padded):
+        raise AssertionError(
+            "k-means grid position/weight padding extents disagree: "
+            f"positions=({positions_pad.logical}, {positions_pad.padded}), "
+            f"weights=({rho_pad.logical}, {rho_pad.padded})"
+        )
+    n_grid_logical = positions_pad.logical
+    n_grid_padded = positions_pad.padded
+    if n_grid_padded != n_grid_logical:
+        print(
+            "K-means grid mesh padding: "
+            f"{n_grid_logical} -> {n_grid_padded} points "
+            f"(divisor {grid_divisor}); tail weights are zero"
+        )
+    positions_unplaced = positions_pad.array
+    rho_unplaced = rho_pad.array
+    metric_unplaced = metric_tensor
+    positions = dist.place(positions_unplaced, mesh, mesh_axis, None)
+    rho_flat = dist.place(rho_unplaced, mesh, mesh_axis)
+    metric_tensor = dist.place(metric_unplaced, mesh)
     centroids = dist.place(centroids, mesh)
+    # dist.place stages through a host array and creates independent placed
+    # buffers.  Do not keep the original full-grid device arrays alive for
+    # the duration of Lloyd.
+    positions_unplaced.delete()
+    rho_unplaced.delete()
+    metric_unplaced.delete()
+    del positions_pad, rho_pad, positions_unplaced, rho_unplaced, metric_unplaced
 
     lloyd = make_lloyd_loop(
         mesh, N_c, max_steps, tolerance, offsets,
@@ -767,8 +807,20 @@ def weighted_kmeans_jax(
                 positions, centroids, metric_tensor, N_c,
                 c_block=_pick_c_block(N_c), offsets=offsets,
             )
+        if n_grid_padded != n_grid_logical:
+            # Preserve the sharding-compatible padded shape, but make the
+            # non-grid tail impossible to mistake for a physical cluster
+            # assignment in any downstream inspection or pruning path.
+            labels = labels.at[n_grid_logical:].set(-1)
         labels.block_until_ready()
-    return labels, centroids, steps, float(max_mv_sq)
+
+    max_mv_sq_host = float(max_mv_sq)
+    # These placed arrays are the completed Lloyd working set.  They are
+    # not returned and dist.place created independent device buffers, so
+    # release them before the caller begins centroid snapping/pruning.
+    for work_array in (positions, rho_flat, metric_tensor):
+        work_array.delete()
+    return labels, centroids, steps, max_mv_sq_host
 
 
 # ─────────────────────────────────────────────────────────────────────────

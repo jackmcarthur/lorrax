@@ -446,31 +446,10 @@ def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
     nothing, so it does NOT refuse: an absence is a claim about what was
     searched.  Only a positive identification refuses.
     """
-    from file_io.qp_wfn import QP_WFN_SCHEME, read_qp_wfn_stamp
-
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
     wfn_path = _parse_wfn_path(input_file)
-    stamp = read_qp_wfn_stamp(wfn_path)
-    if stamp is None:
-        return
-    where = ""
-    if stamp.get("band_stop") is not None:
-        where = (f", bands [{stamp['band_start']}, {stamp['band_stop']}) "
-                 f"rotated from {stamp['source'] or 'an unrecorded WFN'}")
-    version_note = ""
-    if stamp["scheme"] != QP_WFN_SCHEME:
-        version_note = (f"  (That stamp is not {QP_WFN_SCHEME!r}: the file was "
-                        f"written by a different version of the QP writer.)")
-    raise ValueError(
-        f"--eqp {eqp_file} is redundant and destructive on this deck.  "
-        f"{wfn_path} is a LORRAX QP WFN (stamp {stamp['scheme']!r}{where}): "
-        f"its wavefunctions ARE the QP orbitals and its energies ARE the QP "
-        f"eigenvalues that produced them.  A second eqp ladder is written "
-        f"against DFT band LABELS, so applying it here discards the canonical "
-        f"eigenvalues and relabels the rotated orbitals with the mean-field "
-        f"ordering — with the right shapes, so nothing downstream notices.  "
-        f"Fix: drop --eqp.  To run a mean-field WFN with diagonal QP "
-        f"corrections instead, point wfn_file at the mean-field WFN.h5 and "
-        f"keep --eqp.{version_note}")
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file)
 
 
 def resolve_n_occ(
@@ -544,6 +523,8 @@ def apply_eqp_corrections(
     eqp_file: str,
     input_file: str,
     ry_to_ev: float = 13.6056980659,
+    *,
+    state_artifact_path: str | None = None,
 ) -> np.ndarray:
     """Apply BGW ``eqp{0,1}.dat`` corrections to full-BZ DFT eigenvalues.
 
@@ -575,9 +556,19 @@ def apply_eqp_corrections(
             "took QP shifts from the wrong star whenever two stars were "
             "degenerate; that path is deleted rather than defaulted.")
 
+    # Every public BSE eqp frontend (bse_jax, Haydock, Davidson, the direct
+    # restart loader and exciton bands) reaches this one correction owner.
+    # Refuse a second DFT-labelled ladder on a positively stamped QP WFN here
+    # rather than relying on each CLI to remember the same content contract.
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_parse_wfn_path(input_file), eqp_file=eqp_file,
+        state_artifact_path=state_artifact_path,
+        where="BSE diagonal-eqp state")
+
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import SymMaps, unfold_file_wedge_to_full_bz
+    from symmetry_maps import unfold_file_wedge_to_full_bz
     from wfn_loader import WfnLoader
 
     # 3-tuple: this consumer's band axis is already LOCAL to the deck's
@@ -589,7 +580,7 @@ def apply_eqp_corrections(
     nk_full, nb_full = enk_full.shape
 
     wfn = WfnLoader(_parse_wfn_path(input_file))
-    sym = SymMaps(wfn)
+    sym = wfn.symmetry()
     if sym.nk_tot != nk_full:
         raise ValueError(
             f"apply_eqp_corrections: enk_full has {nk_full} k-points but the "
@@ -650,7 +641,9 @@ def apply_eqp_and_reslice_bands(
     """
     with h5py.File(restart_file, "r") as f:
         enk_full_np = np.asarray(f["enk_full"][:])
-    enk_full_np = apply_eqp_corrections(enk_full_np, eqp_file, input_file=input_file)
+    enk_full_np = apply_eqp_corrections(
+        enk_full_np, eqp_file, input_file=input_file,
+        state_artifact_path=restart_file)
     n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     # Degeneracy guard, REPORT-ONLY here by construction.  The loader already
     # snapped the window on the DFT spectrum and ψ has been read at those

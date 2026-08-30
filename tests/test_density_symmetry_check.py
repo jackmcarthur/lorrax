@@ -254,6 +254,19 @@ def test_kramers_manifold_measures_trs_holds(tmp_path):
     assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
 
 
+def test_fractional_diagnostic_uses_complete_weighted_band_support(tmp_path):
+    path = _kramers_deck(tmp_path, magnetic=False)
+    occ = np.asarray([1.0, 1.0, 0.7, 0.7, 0.05, 0.05])
+    with h5py.File(path, "r+") as h5:
+        h5["mf_header/kpoints/occ"][0, 0, :] = occ
+    loader = WfnLoader(path)
+    rep = loader.density_symmetry
+    assert loader.physical_density_band_stop == occ.size
+    assert rep.charge_expected == pytest.approx(float(np.sum(occ)))
+    assert rep.charge == pytest.approx(rep.charge_expected, rel=1e-10)
+    assert rep.ok, rep.messages
+
+
 def test_spin_polarised_manifold_is_caught(tmp_path):
     path = _kramers_deck(tmp_path, magnetic=True)
     with pytest.warns(RuntimeWarning):

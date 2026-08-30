@@ -99,6 +99,20 @@ def test_rho_work_items_still_is_the_serial_sweep_at_p_le_nk():
         assert f(144, 26, world) == [(ik, 0, 26) for ik in range(144)]
 
 
+def test_rho_work_items_applies_the_band_memory_bound_without_ragged_shapes():
+    """The explicit deck bound is stronger than the P<=nk serial shape."""
+    f = _load_pure("src/gw/kin_ion_io.py", "rho_work_items")
+    items = f(36, 130, 16, max_bands_per_item=16)
+    assert len(items) == 36 * 10
+    assert {(lo, hi) for _, lo, hi in items} == {
+        (i * 13, (i + 1) * 13) for i in range(10)}
+    assert {hi - lo for _, lo, hi in items} == {13}
+
+    # A looser memory bound must preserve the incumbent parallel divisor.
+    incumbent = f(9, 26, 64)
+    assert f(9, 26, 64, max_bands_per_item=26) == incumbent
+
+
 def test_rho_work_items_balance_is_unchanged():
     f = _load_pure("src/gw/kin_ion_io.py", "rho_work_items")
     items = f(9, 26, 4)
@@ -124,7 +138,7 @@ def test_the_divisor_rule_never_asks_for_more_chunks_than_the_budget():
 
 
 # ---------------------------------------------------------------------------
-# SIBLING 3 — centroid/charge_density.py::_uniform_band_windows
+# SIBLING 3 — wfn_loader.loader.uniform_band_windows
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("b_lo,b_hi,width", [
     (0, 10, 4), (0, 12, 4), (0, 3, 10), (0, 1, 1), (5, 17, 5), (0, 10, 3),
@@ -132,7 +146,9 @@ def test_the_divisor_rule_never_asks_for_more_chunks_than_the_budget():
 ])
 def test_uniform_band_windows_are_uniform_and_cover_once(b_lo, b_hi, width):
     """Sibling 3: equal-width windows that OVERLAP rather than shorten."""
-    f = _load_pure("src/centroid/charge_density.py", "_uniform_band_windows")
+    f = _load_pure(
+        "services/wfn_loader/src/wfn_loader/loader.py",
+        "uniform_band_windows")
     windows = f(b_lo, b_hi, width)
     assert windows, "a non-empty band range produced no window"
     widths = {int(m.shape[0]) for _, m in windows}
@@ -154,7 +170,9 @@ def test_uniform_band_windows_are_uniform_and_cover_once(b_lo, b_hi, width):
 
 
 def test_uniform_band_windows_is_empty_only_for_an_empty_range():
-    f = _load_pure("src/centroid/charge_density.py", "_uniform_band_windows")
+    f = _load_pure(
+        "services/wfn_loader/src/wfn_loader/loader.py",
+        "uniform_band_windows")
     assert f(4, 4, 8) == []
     assert f(9, 3, 8) == []
     assert len(f(0, 1, 8)) == 1

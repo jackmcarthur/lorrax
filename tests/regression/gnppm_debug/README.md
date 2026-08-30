@@ -18,8 +18,8 @@ What changed vs the old fixture and why the frozen values moved:
 | nband | 80 | 46 |
 | WFN.h5 / kin_ion.h5 / dipole.h5 | — | unchanged (kin_ion/dipole are band-superset files; WFN not truncated — runtime reads only the requested window, truncation would only shrink the repo at the cost of a new 27 MB blob in history) |
 
-The k-grid stays 3×3 — the IBZ cascade keeps its 5/9 symmetry structure
-(`V_q g-flat [CC]: n_q_ibz=5 … unfold=IBZ→full` in the run log).
+The k-grid stays 3×3 — the IBZ cascade keeps its authenticated 5/9
+q-storage structure in the restart V/W receipts.
 
 Frozen references re-frozen from the shrunk fixture (same code):
 `sigma_diag_gnppm_ref.dat` (one-shot fresh run) and
@@ -50,6 +50,15 @@ dipole PRODUCER (`psp.get_dipole_mtxels`), which nothing on the Σ path
 calls.  Full provenance, **including the one thing this reference cannot
 see**, is in the file's own header; read it there rather than here.
 
+## 2026-08-28 provenance refresh
+
+The old 80-band `dipole.h5` and `kin_ion.h5` had no representation
+provenance and are now rejected. Both were regenerated from this exact deck
+with the current producers; they store the requested 46-band window, and
+`kin_ion.h5` retains the fixture's no-Hartree route. Two independent A100
+GN-PPM runs produced identical parsed physics. The resulting reference moves
+only sigC/sigXC (max 0.127146 eV); sigX and VH are unchanged.
+
 ## Shrink validation (all on 1 GPU, A100)
 
 * Fresh run twice → `sigma_diag`, `eqp0/1.dat` **bit-identical**
@@ -74,4 +83,4 @@ see**, is in the file's own header; read it there rather than here.
 - `sigma_diag_gnppm_ref.dat` — frozen Tier-1 reference.
 - `eqp_rotations_fixedpoint_ref.npy` — frozen `E_qp_nk_rydberg` (9, 46)
   for the fixed-point Tier-2 gate.
-- `WFN.h5`, `kin_ion.h5`, `dipole.h5` — unchanged mean-field inputs.
+- `WFN.h5` plus provenance-bound 46-band `kin_ion.h5` and `dipole.h5`.

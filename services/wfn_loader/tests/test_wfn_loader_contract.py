@@ -49,7 +49,7 @@ import h5py
 import numpy as np
 import pytest
 
-from wfn_loader import WfnLoader
+from wfn_loader import WfnLoader, read_wfn_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,69 @@ def _synth_wfn(tmp_path) -> str:
 @pytest.fixture
 def synth_wfn_path(tmp_path):
     return _synth_wfn(tmp_path)
+
+
+def test_physical_density_occupations_keep_signed_tails_and_explicit_k_map(
+        tmp_path, monkeypatch):
+    path = _synth_wfn(tmp_path)
+    occs = np.asarray([[[1.0, 0.8, 0.2, -0.05, 0.0, 0.0],
+                        [1.0, 0.6, 0.4, -0.02, 0.01, 0.0]]])
+    with h5py.File(path, "r+") as h5:
+        h5["mf_header/kpoints/occ"][...] = occs
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "0")
+    loader = WfnLoader(path)
+    assert not loader.occupations_are_exact_integer
+    assert loader.physical_density_band_stop == 5
+    assert loader.occupation_state_capacity == 1.0
+    assert loader.num_electrons == pytest.approx(
+        0.5 * float(np.sum(occs[0, 0]) + np.sum(occs[0, 1])))
+
+    from types import SimpleNamespace
+    loader._sym = SimpleNamespace(
+        nk_tot=4, irr_idx_k=np.asarray([1, 0, 1, 0], dtype=np.int32))
+    got = loader.physical_density_occupations(
+        k="full_bz", unit_as_none=True)
+    assert np.array_equal(got, occs[0, [1, 0, 1, 0], :5])
+    assert float(got[:, 3:].min()) < 0.0
+    loader.close()
+
+
+def test_path_authentication_uses_header_view_not_full_loader(
+        tmp_path, monkeypatch):
+    """Post-hoc provenance must not initialize G/psi or the FFT diagnostic."""
+    from common.parallel_transport import (
+        WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
+    from file_io.kin_ion import authenticate_kin_ion_hartree_wfn_receipt
+
+    wfn_path = _synth_wfn(tmp_path)
+    occs = np.asarray([[[1.0, 0.8, 0.2, -0.05, 0.0, 0.0],
+                        [1.0, 0.6, 0.4, -0.02, 0.01, 0.0]]])
+    with h5py.File(wfn_path, "r+") as h5:
+        h5["mf_header/kpoints/occ"][...] = occs
+
+    provenance = read_wfn_provenance(wfn_path)
+    assert provenance.physical_density_band_stop == 5
+    assert not provenance.occupations_are_exact_integer
+    fingerprint = wfn_fingerprint(provenance)
+
+    kin_path = str(tmp_path / "kin_ion.h5")
+    with h5py.File(kin_path, "w") as h5:
+        ds = h5.create_dataset(
+            "kin_ion", data=np.zeros((2, 6, 6), dtype=np.complex128))
+        ds.attrs["bispinor"] = False
+        ds.attrs["wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
+        ds.attrs["wfn_fingerprint"] = fingerprint
+
+    def _forbid_full_loader(*_args, **_kwargs):
+        raise AssertionError("post-hoc authentication constructed WfnLoader")
+
+    monkeypatch.setattr(WfnLoader, "__init__", _forbid_full_loader)
+    monkeypatch.setattr(
+        WfnLoader, "_run_density_symmetry_check", _forbid_full_loader)
+    attrs = authenticate_kin_ion_hartree_wfn_receipt(
+        kin_path, wfn_path, selected_hartree_source="isdf",
+        band_stop=6)
+    assert attrs["wfn_fingerprint"] == fingerprint
 
 
 #: The ``/pscratch`` deck the moved cells used to name.  Its machine is
@@ -205,11 +268,14 @@ def test_iterator_chunks_band_axis(synth_wfn_path):
 # Backend
 # ---------------------------------------------------------------------------
 
-def test_bispinor_lift_matches_legacy(wfn_path):
-    """``loader.load(bispinor=True)`` must reproduce the legacy
-    :func:`common.bispinor_init.get_small_psi_component` lift exactly
-    when applied to ``loader.load(bispinor=False)``."""
-    from common.bispinor_init import get_small_psi_component
+def test_bispinor_lift_uses_cartesian_momentum_with_blat(wfn_path):
+    """The production lift is ``(α/2) σ·[(k+G) @ (blat*bvec)] L``.
+
+    The reference is written independently in NumPy and every arm has
+    ``blat != 1``.  Omitting ``blat`` therefore fails this cell instead of
+    agreeing with a second copy of the same defect.
+    """
+    from common.bispinor_init import HALFALPHA
 
     with WfnLoader(wfn_path) as loader:
         if int(loader.nspinor) != 2:
@@ -225,23 +291,33 @@ def test_bispinor_lift_matches_legacy(wfn_path):
         ngk_v = loader.ngk_valid(k="full_bz")
         sym = loader._ensure_sym()
         unfolded_kpts = np.asarray(sym.unfolded_kpts, dtype=np.float64)
-        bvec = np.asarray(loader.bvec, dtype=np.float64)
+        bvec_cart_bohr = (
+            float(loader.blat) * np.asarray(loader.bvec, dtype=np.float64))
         n_k = psi_2.shape[0]
 
         for nk in range(n_k):
             n = int(ngk_v[nk])
             gvecs_k = gvecs_full[nk, :n].astype(np.float64)
             psi_L = psi_2[nk, :, :, :n]                          # (nb, 2, n)
-            import jax as _jax
-            psi_S_ref = np.asarray(get_small_psi_component(
-                _jax.numpy.asarray(gvecs_k),
-                _jax.numpy.asarray(unfolded_kpts[nk]),
-                _jax.numpy.asarray(bvec),
-                _jax.numpy.asarray(psi_L)))
+            p = (gvecs_k + unfolded_kpts[nk][None, :]) @ bvec_cart_bohr
+            px, py, pz = p.T
+            psi_S_ref = np.empty_like(psi_L)
+            psi_S_ref[:, 0, :] = HALFALPHA * (
+                pz[None, :] * psi_L[:, 0, :]
+                + (px - 1j * py)[None, :] * psi_L[:, 1, :])
+            psi_S_ref[:, 1, :] = HALFALPHA * (
+                (px + 1j * py)[None, :] * psi_L[:, 0, :]
+                - pz[None, :] * psi_L[:, 1, :])
             np.testing.assert_allclose(
                 psi_4[nk, :, 2:4, :n], psi_S_ref,
                 atol=1e-13, rtol=0,
                 err_msg=f"nk={nk}")
+            if np.linalg.norm(psi_S_ref) > 0.0:
+                wrong_without_blat = psi_S_ref / float(loader.blat)
+                assert not np.allclose(
+                    psi_4[nk, :, 2:4, :n], wrong_without_blat,
+                    atol=1e-13, rtol=1e-12), (
+                        f"nk={nk}: test failed to discriminate omitted blat")
             # Upper components preserved.
             np.testing.assert_array_equal(
                 psi_4[nk, :, 0:2, :], psi_2[nk, :, 0:2, :],

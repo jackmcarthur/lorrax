@@ -45,36 +45,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np
 import jax
 import jax.numpy as jnp
-from functools import partial, lru_cache
+from functools import partial
 from typing import NamedTuple
 
 
-# Full-BZ G-vectors for compute_valence_density (replaces
-# ``sym.get_gvecs_kfull`` per-k calls).  ``wfn`` is a
-# ``wfn_loader.WfnLoader`` everywhere in this repo, and the
-# loader already memoises ``gvecs()`` / ``ngk_valid()`` internally — use
-# it directly.  The per-path fallback loader (kept for any legacy
-# WFNReader-shaped handle) opens a SECOND file handle and re-reads the
-# ``(ngktot, 3)`` gvecs table, which duplicates hundreds of MB of host
-# RAM per rank at CrI3-class ngktot — avoid it when possible.
-@lru_cache(maxsize=4)
-def _wfn_loader_for_path(path: str):
-    from ffi import _services
-    _services.ensure_on_path()
-    from wfn_loader import WfnLoader
-    return WfnLoader(path)
-
-
-def _gvecs_full_cache(wfn):
-    if hasattr(wfn, "gvecs"):
-        return wfn.gvecs(k="full_bz")
-    return _wfn_loader_for_path(wfn._filename).gvecs(k="full_bz")
-
-
-def _ngk_full_cache(wfn):
-    if hasattr(wfn, "ngk_valid"):
-        return wfn.ngk_valid(k="full_bz")
-    return _wfn_loader_for_path(wfn._filename).ngk_valid(k="full_bz")
 # Support both `python -m psp.get_DFT_mtxels` and direct script execution
 try:
     from .normalize import normalize_dataclass
@@ -100,6 +74,7 @@ from psp.radial.build_projectors_qe import (
 )
 from psp.dft_operators import vnl_matrix_from_kdata
 from common.collectives import prepare_mesh, shard_over_k
+from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from dataclasses import dataclass
 import h5py
 import psp.vnl_ops as vnl_ops
@@ -118,7 +93,6 @@ _services.ensure_on_path()
 # the try arm raises on every interpreter and the fallback is the only
 # live code.  The service door is reached by ONE absolute import, and a
 # dual spelling of it would be two module objects waiting to happen.
-import symmetry_maps                                            # noqa: E402
 
 
 def report_devices(print_fn=print) -> None:
@@ -180,24 +154,91 @@ def spin_degeneracy_factor(wfn) -> float:
     channel of a collinear spin-polarised run (``nspin == 2``).
 
     Getting this wrong scales ρ — and therefore ⟨V_H⟩, a ~500 eV
-    quantity — by a factor of two, so it is derived here once and
-    checked against ``∫ρ d³r`` by :func:`build_hartree_potential`.
+    quantity — by a factor of two.  The WFN-loader occupation summary
+    derives it once; this compatibility door exposes that value to the
+    density quadrature, whose result is checked against ``∫ρ d³r`` by
+    :func:`build_hartree_potential`.
     """
-    nspin = int(getattr(wfn, "nspin", 1) or 1)
-    nspinor = int(getattr(wfn, "nspinor", 1) or 1)
-    if nspin == 1 and nspinor == 1:
-        return 2.0
-    return 1.0
+    return float(wfn.occupation_state_capacity)
 
 
-@partial(jax.jit, static_argnames=("nocc",))
+def density_components_from_psi_r(
+    psi_r: jnp.ndarray,
+    band_occupations: jnp.ndarray | None = None,
+    *,
+    include_dirac_current: bool = False,
+    charge_nspinor: int | None = None,
+) -> jnp.ndarray:
+    """Contract real-space spinors into charge and optional Dirac current.
+
+    ``psi_r`` is ``(nb,nspinor,nx,ny,nz)``.  The return is either the
+    scalar charge density or ``(rho,Jx,Jy,Jz)``, before the caller's k-point
+    weight and spin-degeneracy prefactor.  ``band_occupations`` is a signed
+    per-band weight: MP1's small negative occupations therefore enter every
+    four-current component through exactly the same arithmetic.
+
+    This is the single local four-current contraction used by both the
+    streamed one-shot density and ``gw.qsgw_density``'s evolving-orbital
+    scan.  FFT placement and accumulation differ between those two plans;
+    the gamma convention, charge carrier and occupation weighting do not.
+    """
+    psi = jnp.asarray(psi_r)
+    if psi.ndim != 5:
+        raise ValueError(
+            "density_components_from_psi_r requires "
+            f"(nb,nspinor,nx,ny,nz); got shape={psi.shape}")
+    ns = int(psi.shape[1])
+    charge_ns = ns if charge_nspinor is None else int(charge_nspinor)
+    if not 0 < charge_ns <= ns:
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_nspinor} for nspinor={ns}")
+    if include_dirac_current and ns != 4:
+        raise ValueError(
+            "Dirac current requires four-component kinetic-balance "
+            f"bispinors; got nspinor={ns}")
+
+    occ = None
+    if band_occupations is not None:
+        occ = jnp.asarray(band_occupations, dtype=jnp.float64)
+        if occ.ndim != 1 or int(occ.shape[0]) != int(psi.shape[0]):
+            raise ValueError(
+                "band_occupations must have one entry per real-space "
+                f"orbital; got {occ.shape}, expected ({int(psi.shape[0])},)")
+        occ = occ[:, None, None, None, None]
+
+    psi_charge = psi[:, :charge_ns]
+    charge_terms = jnp.real(jnp.conj(psi_charge) * psi_charge)
+    rho = jnp.sum(
+        charge_terms if occ is None else occ * charge_terms, axis=(0, 1))
+    if not include_dirac_current:
+        return rho
+
+    psi_dag = jnp.conj(psi)
+    currents = []
+    for mu in (1, 2, 3):
+        perm, phase = gamma_perm_phase(mu)
+        terms = jnp.real(
+            psi_dag * gamma_apply(psi, perm, phase, axis=1))
+        currents.append(jnp.sum(
+            terms if occ is None else occ * terms, axis=(0, 1)))
+    return jnp.stack((rho, *currents))
+
+
+@partial(
+    jax.jit,
+    static_argnames=("nocc", "include_dirac_current", "charge_nspinor"),
+)
 def _valence_density_kernel(
     psi_k_box: jnp.ndarray,
     weight: jnp.ndarray,
     cell_volume: jnp.ndarray,
     spin_degeneracy: jnp.ndarray,
+    band_occupations: jnp.ndarray | None,
     *,
     nocc: int | None,
+    include_dirac_current: bool,
+    charge_nspinor: int | None,
 ) -> jnp.ndarray:
     """Jitted body of :func:`valence_density_from_kpoint`.
 
@@ -211,8 +252,12 @@ def _valence_density_kernel(
     scale = jnp.sqrt(jnp.asarray(float(ngrid), dtype=jnp.float64) / cell_volume)
     psi_occ = psi_k_box if nocc is None else psi_k_box[: int(nocc)]
     psi_r = local_ifftn3(psi_occ, axes=(-3, -2, -1), norm='ortho') * scale
-    return (weight * spin_degeneracy) * jnp.sum(
-        jnp.real(jnp.conj(psi_r) * psi_r), axis=(0, 1))
+    prefactor = weight * spin_degeneracy
+    components = density_components_from_psi_r(
+        psi_r, band_occupations,
+        include_dirac_current=include_dirac_current,
+        charge_nspinor=charge_nspinor)
+    return prefactor * components
 
 
 def valence_density_from_kpoint(
@@ -222,37 +267,83 @@ def valence_density_from_kpoint(
     weight: float,
     cell_volume: float,
     spin_degeneracy: float = 1.0,
+    band_occupations: jnp.ndarray | np.ndarray | None = None,
+    include_dirac_current: bool = False,
+    charge_nspinor: int | None = None,
 ) -> jnp.ndarray:
     """One k-point's contribution to ρ_v(r), on the ψ FFT box grid.
 
     ``psi_k_box`` is ``(nb, nspinor, nx, ny, nz)`` G-space coefficients
     in the FFT box (the ``load_kpoint_fftbox`` / ``to_box`` layout).
-    Returns ``w_k · f_spin · Σ_{n<nocc, s} |ψ_{nks}(r)|²`` with the same
-    ``√(N_grid/Ω)`` normalisation :func:`compute_local_V_k` assumes, so
-    ``ΔV · Σ_r ρ = f_spin · w_k · nocc``.
+    Returns ``w_k · f_spin · Σ_{n<nocc, s} f_nk |ψ_{nks}(r)|²`` with the
+    same ``√(N_grid/Ω)`` normalisation :func:`compute_local_V_k` assumes,
+    so ``ΔV · Σ_r ρ = f_spin · w_k · Σ_n f_nk``.  Here ``f_nk=1`` when
+    ``band_occupations`` is omitted.
 
-    ``nocc=None`` means "every band in ``psi_k_box`` is occupied and
-    contributes" — the contract the **band-chunked** distributed sweep
-    needs, where a rank has been handed the band sub-window
-    ``[b_lo, b_hi)`` of the occupied manifold and there is no
-    band-0-based cut to apply.  ``nocc=n`` keeps the legacy
+    ``nocc=None`` means "every band in ``psi_k_box`` contributes" — the
+    contract the **band-chunked** distributed sweep needs, where a rank has
+    been handed the band sub-window ``[b_lo, b_hi)`` of the occupation
+    support and there is no band-0-based cut to apply.  ``nocc=n`` keeps the
+    legacy
     "first n rows of a full-window box" behaviour.  Both spellings
     produce identical arithmetic for the same set of bands; this is a
     slicing convention, not a second quadrature.
 
-    Single source of truth for the density quadrature: the
-    all-k-resident :func:`compute_valence_density`, the chunked per-k
+    ``band_occupations`` carries one canonical WFN occupation per band in
+    the selected contribution.  ``None`` means exact unit occupation and
+    retains the incumbent insulating reduction without a multiply-by-one.
+    When supplied, the SAME weights multiply rho and every signed Dirac
+    current component inside this one IFFT transaction.
+
+    Single source of truth for the per-k density quadrature: the same-grid
+    arm of all-k-resident :func:`compute_valence_density`, the chunked per-k
     CLI and the k/band-partitioned distributed sweep
     (``gw.kin_ion_io.build_valence_density_distributed``) all go
     through this one function.  The arithmetic runs in ONE jitted module
     (:func:`_valence_density_kernel`; ``nocc`` static, scalars traced).
+
+    ``include_dirac_current=True`` requires four-component bispinors and
+    returns ``(rho,Jx,Jy,Jz)`` from that same transform, where
+    ``J_i = Psi^dagger alpha_i Psi = j_i/c``.  The default scalar branch is
+    unchanged and does not trace any gamma operation.
+
+    ``charge_nspinor=2`` is the explicit Pauli-reference/current-only
+    comparison: the one resident raw four-spinor transform still supplies all
+    spatial currents, while rho sums only its normalized upper/source
+    two-spinor block.  ``None`` preserves the historical all-component charge
+    convention byte-for-byte.
     """
+    include_current = bool(include_dirac_current)
+    if charge_nspinor is not None and not (
+        0 < int(charge_nspinor) <= int(psi_k_box.shape[1])
+    ):
+        raise ValueError(
+            "charge_nspinor must select a nonempty leading spinor block; "
+            f"got {charge_nspinor} for nspinor={int(psi_k_box.shape[1])}")
+    if include_current and int(psi_k_box.shape[1]) != 4:
+        raise ValueError(
+            "Dirac current requires four-component kinetic-balance "
+            f"bispinors; got nspinor={int(psi_k_box.shape[1])}")
+    occupations = None
+    if band_occupations is not None:
+        occupations = jnp.asarray(band_occupations, dtype=jnp.float64)
+        n_contributing = (int(psi_k_box.shape[0]) if nocc is None else
+                          min(int(nocc), int(psi_k_box.shape[0])))
+        if occupations.ndim != 1 or int(occupations.shape[0]) != n_contributing:
+            raise ValueError(
+                "band_occupations must have one entry per contributing "
+                f"band; got shape={occupations.shape}, expected "
+                f"({n_contributing},)")
     return _valence_density_kernel(
         psi_k_box,
         jnp.asarray(float(weight), dtype=jnp.float64),
         jnp.asarray(float(cell_volume), dtype=jnp.float64),
         jnp.asarray(float(spin_degeneracy), dtype=jnp.float64),
-        nocc=None if nocc is None else int(nocc))
+        occupations,
+        nocc=None if nocc is None else int(nocc),
+        include_dirac_current=include_current,
+        charge_nspinor=(None if charge_nspinor is None
+                        else int(charge_nspinor)))
 
 
 # ===========================================================================
@@ -489,7 +580,7 @@ def build_hartree_potential(
     return V_H_r
 
 
-def compute_valence_density(wfn_k, sym, wfn):
+def compute_valence_density(wfn_k, sym, wfn, *, k_source: str):
     """
     Compute valence charge density rho_v(r) from occupied valence wavefunctions.
 
@@ -499,11 +590,23 @@ def compute_valence_density(wfn_k, sym, wfn):
     over the IBZ is the density of the representatives, not of the crystal
     — and it removes the unfold's residual from the full-mesh branch.
 
+    This resident compatibility path is exact-integer only.  Fractional
+    Hartree density is owned by the band-streamed distributed sweep;
+    fractional centroid selection uses the canonical QE density.
+
     Returns:
         Valence charge density rho_v(r) on an ecutrho-based FFT grid if available
     """
     # Compute on configured rho grid if present, else fall back to 2x
     nk_local, nb_all, nspinor, nx, ny, nz = wfn_k.shape
+    if k_source == "file":
+        kweights = np.asarray(wfn.kweights, dtype=np.float64)
+    elif k_source == "full_bz":
+        kweights = np.ones(nk_local, dtype=np.float64) / float(sym.nk_tot)
+    else:
+        raise ValueError(
+            "compute_valence_density: k_source must be 'file' or 'full_bz', "
+            f"got {k_source!r}.")
     try:
         nx_pad, ny_pad, nz_pad = int(wfn.grid_rho[0]), int(wfn.grid_rho[1]), int(wfn.grid_rho[2])
     except Exception:
@@ -520,29 +623,34 @@ def compute_valence_density(wfn_k, sym, wfn):
     # BAND count (max(ifmax)), so this factor is what turns it into charge.
     f_spin = spin_degeneracy_factor(wfn)
 
-    # Get k-point weights - if looping over full mesh (sym.nk_tot), use 1/nk_tot
-    # If looping over irreducible mesh with wfn.kweights, use those weights
-    use_kweights = hasattr(wfn, 'kweights') and nk_local == len(wfn.kweights)
-    if use_kweights:
-        kweights = np.asarray(wfn.kweights, dtype=np.float64)
-    else:
-        # Assume equal weights for full mesh
-        kweights = np.ones(nk_local, dtype=np.float64) / sym.nk_tot
+    if not wfn.occupations_are_exact_integer:
+        raise ValueError(
+            "compute_valence_density is the legacy resident all-k FFT-box "
+            "path and may not materialize every band of a fractional WFN. "
+            "Use gw.kin_ion_io.build_valence_density_distributed for exact "
+            "band-streamed Hartree density, or the canonical QE density for "
+            "centroid selection.")
+    nocc_all = min(int(wfn.nelec), int(nb_all))
+
+    gvecs_by_k = ngk_by_k = None
+    if not same_grid:
+        gvecs_by_k = wfn.gvecs(k=k_source)
+        ngk_by_k = wfn.ngk_valid(k=k_source)
 
     for ik in range(nk_local):
-        nocc = int(wfn.nelec)
-        nocc = min(nocc, nb_all)
+        nocc = nocc_all
         wk = float(kweights[ik])  # k-point weight
 
         if same_grid:
             # Single-sourced with the chunked per-k CLI path.
             rho_val_local += valence_density_from_kpoint(
                 wfn_k[ik], nocc=nocc, weight=wk,
-                cell_volume=float(wfn.cell_volume), spin_degeneracy=f_spin,
+                cell_volume=float(wfn.cell_volume),
+                spin_degeneracy=f_spin,
             )
         else:
-            # gvecs_k = sym.get_gvecs_kfull(wfn, ik)  # legacy
-            gvecs_k = np.asarray(_gvecs_full_cache(wfn)[ik, : int(_ngk_full_cache(wfn)[ik])])
+            gvecs_k = np.asarray(
+                gvecs_by_k[ik, :int(ngk_by_k[ik])])
             Gx = jnp.asarray(gvecs_k[:, 0], dtype=jnp.int32)
             Gy = jnp.asarray(gvecs_k[:, 1], dtype=jnp.int32)
             Gz = jnp.asarray(gvecs_k[:, 2], dtype=jnp.int32)
@@ -621,7 +729,8 @@ def compute_hartree_potential_real(
         blat: Lattice constant (bohr), needed if truncation_2d=True  
         truncation_2d: If True, apply 2D slab truncation for Coulomb
     """
-    rho_G = jnp.fft.fftn(rho_valence_padded, norm='ortho')
+    rho_G = local_fftn3(
+        rho_valence_padded, axes=(-3, -2, -1), norm="ortho")
     V_H_r = poisson_potential_from_rhoG(rho_G, bdot, bvec, blat, truncation_2d)
 
     return V_H_r
@@ -794,7 +903,7 @@ def _compute_local_V_k_jit(
 
 @timing.timed("psp.get_DFT_mtxels.get_H_matrix_elements", watch=True)
 def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
-                          n_valrange, sys_dim: int = 3):
+                          exact_hartree_full, sys_dim: int = 3):
     """
     Compute nonlocal pseudopotential matrix elements <mk|V_NL|nk> for all k-points.
 
@@ -808,7 +917,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
         global_psi_G: Global sharded wavefunction coefficients in G-space
         meta: System metadata
         mesh_xy: JAX device mesh for sharding
-        n_valrange: Band range for all valence bands [0, nelec]
+        exact_hartree_full: exact FFT-grid Hartree matrix from the shared
+            distributed owner, on the full BZ and the same band window as
+            ``global_psi_G``.
         sys_dim: system dimensionality (0/2/3) from the DECK.  Both the
             Hartree and the local ionic potential take their Coulomb
             convention from it — ``truncation_2d = (sys_dim == 2)``, the
@@ -837,8 +948,6 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)  # Crystal coordinates
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
     bvec = jnp.asarray(wfn.bvec, dtype=jnp.float64)
-    kpoints = jnp.asarray(sym.unfolded_kpts, dtype=jnp.float64)
-    
     print(f"\nSystem: {len(atom_positions)} atoms, {len(pseudos)} pseudopotential types")
     assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
     for ap in assignments:
@@ -872,6 +981,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     # re-padded it by hand to the max — three passes to arrive where the
     # loader already was (owner decision D10).
     gtab = padded_gvectors(wfn, k="full_bz")
+    kpoints = jnp.asarray(gtab.kvecs, dtype=jnp.float64)
     vnl_setup = vnl_ops.build_vnl_setup(
         wfn,
         sym,
@@ -880,30 +990,26 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
         nspinor=int(wfn.nspinor),
     )
 
-    # 3. Compute valence charge density from occupied states
-    V_H_r = None
+    # 3. The Hartree term comes from gw.kin_ion_io's distributed exact owner.
+    # This CLI's resident FFT-box carrier covers only its requested output
+    # window (nelec+ncond), which is not the physical-density support of a
+    # smeared WFN with signed occupation tails.  Rebuilding rho here would
+    # therefore either truncate those tails or force every full-BZ band into
+    # one resident box.  The shared owner streams the complete canonical
+    # support in bounded band chunks, then projects the same potential into
+    # this output window.
     rho_valence = None
-    print("\n  Computing valence charge density (ecutrho-based grid if provided)...")
-    rho_valence = compute_valence_density(wfn_k_sharded, sym, wfn)
-    print(f"    Valence density grid: {rho_valence.shape}")
-    # Precompute Hartree potential V_H(r) on the rho grid using reciprocal metric bdot
-    # Coulomb convention comes from the deck's sys_dim (ctx.truncation_2d),
-    # the SAME flag V_loc uses below.  Mixing the two puts a large
-    # systematic error straight into H0's ~500 eV cancellation.
     bdot_j = jnp.asarray(wfn.bdot, dtype=jnp.float64)
-    bvec_j = jnp.asarray(wfn.bvec, dtype=jnp.float64)
-    V_H_r = compute_hartree_potential_real(
-        rho_valence,
-        bdot_j,
-        bvec=bvec_j,
-        blat=float(wfn.blat),
-        truncation_2d=ctx.truncation_2d,   # deck sys_dim, NOT hardwired
-    )
-    deltaV = float(wfn.cell_volume) / float(np.prod(V_H_r.shape))
-    print(f"    Hartree potential grid: {V_H_r.shape}")
-    # Hartree energy: 1/2 ∫ rho(r) V_H(r) d^3r on the padded grid
-    hartree_energy = 0.5 * float(jnp.sum(rho_valence * V_H_r)*deltaV)
-    print(f"    Hartree energy (0.5 ∫ ρ V_H) = {hartree_energy:.6f} Ry")
+    hartree_shape = tuple(int(s) for s in np.shape(exact_hartree_full))
+    expected_hartree_shape = (
+        int(sym.nk_tot), int(global_psi_G.shape[1]),
+        int(global_psi_G.shape[1]))
+    if hartree_shape != expected_hartree_shape:
+        raise ValueError(
+            "get_H_matrix_elements: shared exact-Hartree matrix has shape "
+            f"{hartree_shape}, expected {expected_hartree_shape} for the "
+            "resident output carrier.")
+    print("\n  Using shared distributed exact FFT-grid Hartree matrix")
     # Compute core density from pseudopotentials (disabled for performance)  
     # rho_core = compute_core_density(atom_positions, atom_types, pseudos, meta)
     # Build local ionic potential on rho grid via G-space and FFT (return total only)
@@ -939,7 +1045,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
         # G-layouts inside a ~500 eV cancellation.
         T_k = compute_kinetic_k(wfn_k, Gk_crys, kpoint, bdot_j, g_mask)
         V_ion_k = compute_local_V_k(wfn_k, Gk_crys, V_loc_r, wfn.cell_volume, g_mask)
-        V_H_k = compute_local_V_k(wfn_k, Gk_crys, V_H_r, wfn.cell_volume, g_mask)
+        V_H_k = jnp.asarray(exact_hartree_full[i], dtype=jnp.complex128)
         kdata = vnl_ops.build_vnl_kdata_from_kvec(
             np.asarray(kpoint, dtype=float),
             np.asarray(Gk_crys, dtype=int),
@@ -1056,7 +1162,7 @@ def main(argv=None):
     # Initialize symmetry mappings
     print("\nInitializing symmetry mappings...")
     with timing.section("psp.get_DFT_mtxels.symmetry"):
-        sym = symmetry_maps.SymMaps(wfn)
+        sym = wfn.symmetry()
     print(f"  Success: {sym.nk_tot} total k-points, {sym.nk_red} irreducible k-points")
     
     # Get band ranges
@@ -1100,10 +1206,21 @@ def main(argv=None):
     # Print atomic structure information
     print_atomic_structure(wfn, pseudos)
     
+    # Compute the exact Hartree matrix through the same band-streamed owner
+    # used by stored/gspace GW.  Density support is loader-owned and therefore
+    # independent of this diagnostic CLI's nelec+ncond output window.
+    from gw.kin_ion_io import compute_hartree_matrix
+    with timing.section("psp.get_DFT_mtxels.build_V_H"):
+        exact_hartree_full = compute_hartree_matrix(
+            wfn, sym, meta, truncation_2d=(sys_dim == 2),
+            nb=int(nb_actual), mesh=mesh_xy, include_transverse=False,
+            print_fn=print, k_set="full")
+
     # Compute DFT Hamiltonian matrix elements
     print(f"\nComputing DFT Hamiltonian matrix elements...")
     H_DFT, rho_valence, k0 = get_H_matrix_elements(
-        wfn, sym, pseudos, global_psi_G, meta, mesh_xy, n_valrange,
+        wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
+        exact_hartree_full,
         sys_dim=sys_dim)
     print(f"  Hamiltonian matrix elements shape: {H_DFT.shape}")
     

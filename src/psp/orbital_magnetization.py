@@ -18,7 +18,8 @@ in Bohr).  Per-cell orbital moment, component gamma, in Bohr magnetons:
                                                      / (eps_n - eps_m)^2
 
 with v^a_nm = <u_nk| dH_k/dk_a |u_mk> the velocity matrix element (Ry*Bohr,
-exactly what ``dft_operators.velocity_matrix_k`` returns), w_k the k-point
+assembled from ``dft_operators.apply_kinetic_velocity_to_ket`` and the
+canonical ``vnl_ops.vnl_velocity_matrix`` derivative), w_k the k-point
 weights (sum to 1), and the leading -1/2 the electron-charge gyromagnetic
 prefactor m_e/hbar^2 = 1/(2 Ry a0^2) carrying the orbital moment = -mu_B L/hbar
 sign.  See ``orbital_magnetization_THEORY.md`` for the full derivation,
@@ -62,7 +63,6 @@ from common import Meta
 from common.wfn_transforms import load_kpoint_fftbox
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
-from psp.get_dipole_mtxels import compute_p_operator_k, compute_vnl_velocity_cart
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
 import psp.vnl_ops as vnl_ops
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -70,7 +70,6 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-import symmetry_maps                                            # noqa: E402
 
 RY2EV = 13.605693122994
 MU_B_PREFACTOR = 0.5  # |m_e/hbar^2| in Ry-a0^2 units (magnitude; sign handled below)
@@ -94,10 +93,18 @@ def velocity_at_k(wfn, sym, meta, vnl_setup, ik, nb, gvectors=None):
                   aliases Γ, so dropping the mask would double-count ψ(Γ)
                   in every one of the three quantities below.
     """
+    # Keep the pure orbital-response algebra importable without starting the
+    # dipole driver's communicator/FFI stack.  Only this WFN-owning execution
+    # path needs those producer routines.
+    from psp.get_dipole_mtxels import (
+        compute_p_operator_k,
+        compute_vnl_velocity_cart,
+    )
+
     wfn_k = load_kpoint_fftbox(wfn, sym, meta, ik, nb)            # (nb, ns, nx,ny,nz)
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
     Gk_crys, g_mask = tab.at(ik)
-    kpoint = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)  # crystal coords
+    kpoint = np.asarray(tab.kvecs[int(ik)], dtype=np.float64)  # crystal coords
 
     v_kin = np.asarray(compute_p_operator_k(
         wfn_k, Gk_crys, kpoint,
@@ -233,13 +240,13 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
         # Mask ψ, not Z: every contraction below closes against conj(ψ_G).
         psi_G = (jnp.asarray(np.asarray(psi_ibz[i]))
                  * jnp.asarray(g_mask)[None, None, :])           # (nb,ns,ngkmax)
-        k_crys = jnp.asarray(np.asarray(wfn.kpoints[i]), dtype=jnp.float64)
+        k_crys = jnp.asarray(gtab.kvecs[i], dtype=jnp.float64)
         eps = np.asarray(wfn.energies[0, i, :nbnd], dtype=np.float64)
         E[i] = eps
         v = np.asarray(momentum_matrix_k(psi_G, G_int, k_crys, jnp.asarray(B)))
         if sign != 0:
             kdata = vnl_ops.build_vnl_kdata_from_kvec(
-                np.asarray(wfn.kpoints[i], dtype=float),
+                np.asarray(gtab.kvecs[i], dtype=float),
                 np.asarray(G_pad, dtype=int), vnl_setup, compute_dZ=True)
             nsE = kdata.E_super.shape[0]
             psi_phys = psi_G[:, :nsE, :] if psi_G.shape[1] > nsE else psi_G
@@ -303,7 +310,8 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
     rho_val = build_rho_val_from_wfn(wfn, sym, meta, nocc, verbose=True)
     V_scf, V_loc, _vnl2 = build_dft_potentials(
         wfn, pseudos, rho_val, truncation_2d=truncation_2d, verbose=True)
-    ngkmax = int(compute_ngkmax(np.asarray(sym.unfolded_kpts, dtype=np.float64),
+    kvecs_full = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
+    ngkmax = int(compute_ngkmax(kvecs_full,
                                 np.asarray(wfn.bdot), float(wfn.ecutwfc), fft_grid))
     # QE-DFPT level shift α_pv = 2(E_max − E_min) over occupied bands (all k)
     en_occ = np.asarray(wfn.energies[0, :, :nocc], dtype=np.float64)
@@ -322,7 +330,7 @@ def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
         return jnp.stack([A[:, 1, 2], A[:, 2, 0], A[:, 0, 1]], axis=-1).sum(axis=0)
 
     for ik in range(nk):
-        kv = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+        kv = np.asarray(kvecs_full[ik], dtype=np.float64)
         k_red = int(sym.irr_idx_k[ik])
         eps_full = np.asarray(wfn.energies[0, k_red, :nbnd], dtype=np.float64)
         E[ik] = eps_full
@@ -492,7 +500,7 @@ def main(argv=None):
     wfn_path = Path(args.wfn).resolve()
     print(f"\n[orbmag] WFN: {wfn_path}")
     wfn = WfnLoader(str(wfn_path))
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
 
     nspinor = int(wfn.nspinor)
     if nspinor != 2:
@@ -589,7 +597,7 @@ def main(argv=None):
             vk, vnlk, eps, sz = velocity_at_k(wfn, sym, meta, vnl_setup, ik, nbnd,
                                               gvectors=gtab)
             Vp[ik], Vnl[ik], E[ik], SZ[ik] = vk, vnlk, eps, sz
-            Kc[ik] = np.asarray(sym.unfolded_kpts[ik], dtype=np.float64)
+            Kc[ik] = np.asarray(gtab.kvecs[ik], dtype=np.float64)
             if (ik + 1) % 6 == 0 or ik == nk - 1:
                 print(f"         k {ik+1}/{nk}")
         B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
@@ -602,7 +610,7 @@ def main(argv=None):
                   f"({hf['nsamples']} band/k samples):")
             print(f"         RMS |Re diag(v) - d eps/dk|:  "
                   f"p+vNL = {hf[1]:.4f}   p-vNL = {hf[-1]:.4f}  (Ry*Bohr)")
-            # Physical sign = p+vNL (canonical velocity_matrix_k); verified
+            # Physical sign = p+vNL (canonical vnl_ops derivative); verified
             # compute_vnl_velocity_cart == +dV_NL/dk off-diagonally (ratio 1.000).
             # dV_NL/dk is ~900x larger off-diagonal, so the diagonal HF test ties
             # — it validates kinetic part/units only.  Flip only on a large margin.

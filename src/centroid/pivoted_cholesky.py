@@ -16,7 +16,7 @@ Architectural map to ``gw/isdf_fitting.py``:
                                           (rank-5; same einsum at candidates
                                           r̃_a not chosen r_μ)
     gram_q0_from_pair                 ←→  q=0 cross-product (no k→q FFT)
-    (nothing)                         ←→  pivoted_cholesky_select  (new)
+    common.pivoted_cholesky           ←→  numerical row selector + certificates
 
 The Gram is built row-sharded over the ``('x','y')`` mesh and the select
 step runs on it in place: per iteration it costs one ``pmax`` for the
@@ -30,7 +30,7 @@ Shapes (following the md):
     psi_cond_cand  (nk, nc_eff, M)   complex  ψ_{c,k}(r̃_a)
     G              (M, M)            complex  Hermitian PSD
     L              (M, k_keep)       complex  Cholesky columns (padded)
-    piv            (k_keep,)         int32    pivot indices (−1 past rank)
+    piv            (k_keep,)         int32    pivots (−1 only on pool exhaustion)
     d_final        (M,)              real     Schur-complement residuals
 
 ``nv_eff`` / ``nc_eff`` fold the spinor axis into the band axis
@@ -40,14 +40,14 @@ been folded" convention.
 
 from __future__ import annotations
 
+import gc
+import math
 import os
 
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from common.shard_map import shard_map
 from jax.experimental import multihost_utils as _mh
 from functools import partial
 from typing import TYPE_CHECKING
@@ -69,327 +69,201 @@ if TYPE_CHECKING:                                                   # pragma: no
     from wfn_loader import WfnLoader
 from common import timing
 from common.collectives import device_put_process_local
+from common.gpu_utils import worst_process_resident_bytes
+from common.pivoted_cholesky import (
+    make_sharded_pivoted_cholesky_select as _make_sharded_select,
+)
+from runtime.padding import round_up
 
 from . import distribution as dist
-from ffi import _services      # noqa: F401  (path bootstrap; dies with the
-                                 # owner's workspace fix -- see _services.py)
-
-_services.ensure_on_path()
 
 import symmetry_maps                                            # noqa: E402
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Reference — single-device greedy pivoted Cholesky
-# ═══════════════════════════════════════════════════════════════════════
-#
-# The production path is ``make_sharded_pivoted_cholesky_select`` below;
-# this is the same greedy recurrence written without any collective, and
-# it is what ``tests/test_centroid_distribution.py`` gates the sharded
-# kernel against.  Keep the two in step.
+_GRAM_MIN_COL_BLOCK = 256
+_GRAM_COMPLEX_BYTES = 16
+_GRAM_SEED_BUDGET_FRACTION = 0.25
+_GRAM_FINAL_FOLD_SLOTS = 3
 
 
-# THE STOPPING RULE, AND WHY IT IS A CONTRACT AND NOT A DIAGNOSTIC
-# ─────────────────────────────────────────────────────────────────────────
-# Both kernels below compute ``floor = sqrt(eps) · max(diag G)`` — relative
-# to the largest initial diagonal, which is the scale-invariant choice, and
-# in the sharded kernel it is a ``pmax`` so it agrees across shard counts.
-# Until 2026-08-07 that number was computed and then used for NOTHING but
-# reporting ``rank``: the recurrence ran all ``k_keep`` iterations whatever
-# the residual did.  MEASURED consequence, on this box, reproducing
-# ``CENTROID_GEN_ASSESSMENT.md`` §4.1-§4.3 (probe ``pc_repro.py``):
-#
-#   * Gram of true rank 10, k_keep=40.  ``pivot_val`` clamps to ``eps``, so
-#     ``denom = sqrt(eps) ≈ 1.5e-8`` and each column is the previous one
-#     SQUARED over 1.5e-8 — a geometric blow-up.  Column norms past the
-#     cliff went 3.2e-07 … 5.2e+04, 2.2e+16, 1.1e+39, 1.4e+85, inf, nan;
-#     the first non-finite column was j = 22, twelve iterations past a true
-#     rank of 10.  ``argmax`` over NaN returns the FIRST NaN index, so the
-#     pivots past the rank came back ``0 1 3 4 5 7 8 9 10 11 13 …`` — the
-#     first unpicked indices, chosen by array position and not by any
-#     residual criterion.  Those are real candidate indices, so the pad
-#     guard below did not fire and the caller got what looked like a normal
-#     pivot list.  ``d_taken`` is masked to clean zeros past ``rank``, so
-#     the three numbers the wrapper prints never showed it; only
-#     ``trR_over_trG`` came back NaN.
-#   * Orbit mode, M=96 in 12 orbits of 8, k_keep=20.  Once every orbit is
-#     inactive ``masked_d`` is uniformly −inf, ``pivot_val`` clamps to
-#     ``eps`` rather than NaN and ``argmax`` over a uniform array returns 0:
-#     pivots came back ``[54 40 30 86 72 6 32 62 22 88 8 64 0 0 0 0 0 0 0 0]``
-#     — twelve genuine pivots, then index 0 repeated eight times, finite
-#     arithmetic and a nonsense answer.
-#   * Indefinite Gram (λ_min = −4.95e-01 against λ_max = 4.95e+02).  Reported
-#     rank 23 of 24, all 24 pivots distinct, ``L`` entirely finite,
-#     ``min(d_final)`` exactly 0.0 — NO signal anywhere in the return tuple
-#     that the input was not positive semidefinite, because the
-#     ``jnp.maximum(…, 0.0)`` on the Schur update destroys the classic PSD
-#     detector before it can be observed.  LAPACK's ``pstrf`` returns
-#     ``INFO > 0`` for exactly this case.
-#
-# The fix is three lines of arithmetic and no new machinery:
-#
-#   1. ``denom`` clamps at ``floor`` instead of at ``eps``.  On a healthy
-#      input ``pivot_val > floor`` so ``max(pivot_val, floor) == pivot_val``
-#      and every number is BIT-IDENTICAL to before; past the cliff the
-#      divisor can no longer be 1.5e-8 and the blow-up has no fuel.
-#   2. ``take = pivot_val > floor`` gates the writes.  Past the stop ``L``
-#      takes exact zeros, ``piv`` keeps the −1 sentinel it was initialised
-#      with, ``d`` and ``trR_over_trG`` freeze.  ``rank`` is then exactly
-#      the number of pivots taken — a HARD CONTRACT, not a diagnostic —
-#      and the caller's sentinel guard fires naturally.  This is deliberately
-#      NOT a ``lax.cond``: the predicate is a ``pmax`` result and therefore
-#      identical on every shard, but putting the sharded kernel's
-#      collectives inside a conditional region is a hazard for no gain,
-#      since the halted branch costs the same as a taken one either way.
-#   3. The Schur update keeps a clamp for the recurrence's own safety but
-#      the PSD detector now reads the value BEFORE it — ``d_min_raw``, the
-#      most negative pre-clamp residual diagonal seen over active rows.
-#      The clamp no longer destroys the detector; it just no longer feeds
-#      it.  The wrapper refuses when ``d_min_raw < −floor``, which is the
-#      ``pstrf`` INFO in the one form a jitted kernel can return it.
-#
-# WHAT DID NOT CHANGE, DELIBERATELY.  The PIVOT RULE.  Greedy
-# max-residual-diagonal IS LAPACK ``?pstrf``'s rule, and this work adopts
-# ``pstrf``'s SEMANTICS around it — terminate on a scale-relative
-# tolerance, report the achieved rank, signal indefiniteness INFO-style —
-# without touching the selection itself.  Every healthy-input result is
-# bit-identical to the pre-2026-08-07 kernel; that is checked, not asserted
-# (``pc_ab.py``, five cases including orbit mode, ``piv``/``L``/``rank``/
-# ``d_final``/``d_taken``/``trR`` all byte-equal).
-#
-# THE TOLERANCE POLICY, AND WHY IT IS A KNOB.  The floor is
-# ``tol_rel · max(diag G)`` with ``tol_rel`` defaulting to ``sqrt(eps)``
-# (~1.49e-08 in float64).  Relative to the largest INITIAL diagonal is the
-# scale-invariant choice and is what makes the answer independent of how G
-# is normalised; the sharded kernel takes that maximum through a ``pmax``
-# so the floor is identical at every shard count.  LAPACK's ``?pstrf``
-# defaults to ``n·eps·max(diag)`` instead, which at the production
-# M = 2580 is 5.7e-13 — some four orders LOOSER than the default here.
-# ``sqrt(eps)`` is kept as the default because it is the number this kernel
-# has always computed for its ``rank`` report, so adopting it as the
-# stopping rule leaves every existing deck's reported rank unmoved; a
-# caller that wants LAPACK's own policy passes ``tol_rel=n*eps``.  The
-# override is a parameter on all three entry points and, at the driver
-# seam, the ``LORRAX_CENTROID_PC_TOL`` environment variable.
-#
-# LAPACK PANEL BLOCKING DOES NOT TRANSFER HERE, AND IT WAS MEASURED.
-# ``?pstrf`` blocks because it factors the FULL matrix: k = n = M, so the
-# trailing update's O(M·b·M) per panel and the left-looking O(M·k) per step
-# are the same cost.  This kernel SELECTS ``k_keep`` columns out of M
-# candidates with k_keep << M — 42 of 2580 at the Si-class point, 900 of
-# 13872 at the MoS₂-class one.  The trailing update refreshes ALL M columns
-# of a working Gram; the algorithm only ever READS column p, at k of the M
-# columns, chosen adaptively.  So blocking pays M/k times the arithmetic:
-#
-#   shape                left-looking   panel-blocked   ratio
-#   D3 (M=2580, k=42)      4.55e+06       2.87e+08       63x
-#   MoS₂ (M=13872, k=900)  1.12e+10       1.74e+11       15x
-#
-# A prototype confirmed it (``blocked_proto.py``): the panel form reproduces
-# the pivot sequence EXACTLY at every shape tested — the blocking is correct
-# — and runs 3.5x to 16.7x SLOWER, worst at the D3 shape where M/k is worst.
-#
-# And it does not buy the round trips it was reached for.  Pivot selection
-# is inherently sequential: each pivot needs its own ``pmax`` on the value
-# and its own ``pmax`` on the tie-break index, whatever the panel width.
-# Blocking shrinks the ``L[p, :]`` psum from k_keep to b and adds one
-# all-gather per panel; the per-iteration COUNT is unchanged.
-#
-# The reduction that IS available needed no blocking at all, and is what
-# this kernel does.  MEASURED in the lowered HLO, per iteration of the
-# while body, on a real 2×2:
-#
-#   point mode, k_keep=20
-#     before  f64[], s32[], c128[20], f64[]          = 4
-#     after   f64[], s32[], c128[20]                 = 3
-#   orbit mode, k_keep=12
-#     before  f64[], s32[], c128[12], s32[], f64[]   = 5
-#     after   f64[], s32[], c128[13]                 = 3
-#
-# Two changes, neither touching the arithmetic: the trace-ratio psum is a
-# pure diagnostic and moves OUT of the loop (local partials, one psum at the
-# end), and the orbit-id broadcast RIDES the ``L[p, :]`` psum instead of
-# taking its own trip — visible above as c128[12]+s32[] becoming c128[13].
-# 1.33x fewer round trips in point mode, 1.67x in orbit mode, zero extra
-# flops, results bit-identical.  ``tests/test_centroid_distribution.py``
-# gates the count in the HLO, because NCCL latency is not measurable on an
-# emulated-device box and the count is the honest proxy.
-#
-# REGISTERED, NOT BUILT: block-greedy selection (take the top-b entries of
-# one snapshot of d per round) WOULD batch the pivot pmax and get the round
-# trips down by ~b.  It also CHANGES WHICH PIVOTS ARE CHOSEN on
-# well-separated Grams, not just on ties, so it needs its own owner ruling
-# and a regeneration story for every existing centroid file.  Not a
-# refactor; a different algorithm.
-#
-# The refusal DISCIPLINE — a named condition, the measured evidence, and
-# what to do instead — is borrowed from ``distrib_la``.  Its DISPATCH is
-# not: this kernel stays local (assessment R7 — it is a selection and not a
-# factorisation, the orbit-kill rule is crystallography rather than linear
-# algebra, no backend has a masked-active-set ``pstrf`` to dispatch to, and
-# at 0.165 s on a production Gram it is 3-4 % of the driver's wall).
+def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
+    """Transient bytes priced for one open-spin Gram column block.
 
-
-@partial(jax.jit, static_argnames=('k_keep', 'tol_rel'))
-def pivoted_cholesky_select(
-    G: jnp.ndarray,
-    k_keep: int,
-    orbit_id: jnp.ndarray | None = None,
-    *,
-    tol_rel: float | None = None,
-):
-    """Greedy pivoted Cholesky on an Hermitian PSD ``G``. STOPS at the
-    numerical-rank floor. Returns ``(piv, L, rank, d_final, d_taken,
-    trR_over_trG, psd_info)``.
-
-    ``rank`` is the number of pivots actually taken and is a CONTRACT:
-    ``piv[rank:] == -1``, ``L[:, rank:] == 0``, ``d_taken[rank:] == 0``.
-    ``rank < k_keep`` means the kernel could not certify what was asked for
-    and the returned pivot list is deliberately incomplete rather than
-    padded with noise — see the block comment above for what the old
-    always-run-k_keep behaviour did instead.
-
-    ``psd_info`` is ``(d_min_raw, at_row, at_step)`` — the most negative
-    pre-clamp residual diagonal observed, the candidate row that attained
-    it, and the iteration it happened on.  ``d_min_raw < -tol_rel·max(diag
-    G)`` says the input was not positive semidefinite, and the two indices
-    are what lets the refusal NAME the pivot rather than merely assert the
-    condition, which is the ``pstrf`` ``INFO`` contract.
-
-    ``tol_rel`` overrides the stopping tolerance, relative to the largest
-    initial diagonal; ``None`` means ``sqrt(eps)``.  See the block comment
-    above for why that, and not LAPACK's ``n·eps``, is the default.
-
-    When ``orbit_id`` is given (shape ``(M,)`` int), each pivot iteration
-    marks the **whole orbit** of the picked point as inactive — i.e. one
-    pivot per orbit. With a sym-invariant Gram (e.g. ρ-symmetric ISDF
-    candidate Gram), all orbit members of the picked pivot have the same
-    residual diagonal and the column update on any one of them is, by
-    symmetry, the optimal full-orbit removal. The caller unfolds picked
-    pivots through their orbits at output time to recover the full
-    centroid set.  Asking for more orbits than exist now STOPS at the last
-    real orbit instead of repeating index 0.
+    Both left and right pair-density intermediates are complex128 and have
+    ``nk * nspinor**2 * block_width**2`` elements.  Keep this formula here as
+    the single source used by the auto planner, its refusal, and unit gates.
     """
-    M = G.shape[0]
-    real_dtype = G.real.dtype
-    eps = jnp.finfo(real_dtype).eps
-    minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
-    if orbit_id is None:
-        orbit_id = jnp.arange(M, dtype=jnp.int32)         # each point its own orbit
-
-    diag_raw = jnp.real(jnp.diag(G))
-    # The floor moves ABOVE the loop: it is the stopping rule now, not a
-    # post-hoc label on a number the loop already ruined.
-    tol = jnp.sqrt(eps) if tol_rel is None else jnp.asarray(tol_rel,
-                                                            real_dtype)
-    floor = tol * jnp.max(diag_raw)
-    diag0 = jnp.maximum(diag_raw, 0.0)
-    trG = jnp.sum(diag0)
-
-    # The initial diagonal is itself a PSD statement: a negative entry on
-    # the diagonal of a PSD matrix is impossible, and step -1 names it.
-    at0 = jnp.argmin(diag_raw).astype(jnp.int32)
-    neg0 = diag_raw[at0] < 0.0
-    init = (
-        diag0,                                                       # d
-        jnp.zeros((M, k_keep), dtype=G.dtype),                       # L
-        -jnp.ones((k_keep,), dtype=jnp.int32),                       # piv
-        jnp.ones((M,), dtype=bool),                                  # active
-        jnp.zeros((k_keep,), dtype=real_dtype),                      # d_taken
-        jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(1.0),   # trR/trG
-        jnp.minimum(diag_raw[at0], jnp.zeros((), dtype=real_dtype)),  # d_min
-        jnp.where(neg0, at0, jnp.int32(-1)),                         # at_row
-        jnp.where(neg0, jnp.int32(-1), jnp.int32(-1)),               # at_step
-    )
-    col_ids = jnp.arange(k_keep)
-
-    def body(j, carry):
-        (d, L, piv, active, d_taken, trR_over_trG,
-         d_min_raw, d_min_at, d_min_j) = carry
-
-        masked_d = jnp.where(active, d, minus_inf)
-        p = jnp.argmax(masked_d)
-        # THE STOP.  ``pivot_val`` clamps at ``floor`` (not ``eps``), so on a
-        # healthy input this is bit-for-bit the old arithmetic and past the
-        # rank the divisor can no longer manufacture a blow-up.
-        take = masked_d[p] > floor
-        pivot_val = jnp.maximum(masked_d[p], floor)
-        # …AND THE CONTINUATION, which is a different question from the stop.
-        # ``take`` says "this pivot adds an independent DIRECTION"; ``avail``
-        # says "there is still a candidate to hand back".  Past the numerical
-        # rank the two diverge, and the selection keeps DELIVERING points
-        # (largest frozen residual first, ties to the lowest index — the same
-        # deterministic rule as above) while ``rank`` below keeps counting
-        # only the certified ones.  See ``refuse_unless_select_certified``
-        # for why a rank-deficient POOL is not an error: measured on the Si
-        # anchor deck, rank is ANTI-correlated with BerkeleyGW agreement.
-        # This is only safe because the clamp above already removed the
-        # 2026-08-07 blow-up: with ``take`` false, ``newcol`` is exactly zero,
-        # so ``d`` is unchanged and no divisor can run away.
-        avail = jnp.any(active)
-
-        # L[:, j] = (G[:, p] - Σ_{i<j} L[:, i] · conj(L[p, i])) / sqrt(d[p])
-        prev_mask = (col_ids < j).astype(G.dtype)
-        corr = L @ (jnp.conj(L[p, :]) * prev_mask)
-        denom = jnp.sqrt(pivot_val)
-        newcol = (G[:, p] - corr) / denom
-        # Pivot entry exactly sqrt(d[p]) — kills rounding drift.
-        newcol = newcol.at[p].set(denom.astype(G.dtype))
-        newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
-
-        L = L.at[:, j].set(newcol)
-        # ``avail``, not ``take``: a delivered pivot is a real candidate index
-        # even when it certifies no new direction.  ``-1`` now means ONLY
-        # "the pool ran out", which is the structural refusal.
-        piv = piv.at[j].set(jnp.where(avail, p, -1).astype(jnp.int32))
-        d_taken = d_taken.at[j].set(
-            jnp.where(take, pivot_val, 0.0).astype(real_dtype))
-
-        # Schur-complement update; d_new[p] ≈ 0 by the cleanup above.  The
-        # PSD detector reads d_raw BEFORE the clamp, over ACTIVE rows only
-        # (inactive rows carry −inf and would swamp the minimum).
-        d_raw = d - jnp.abs(newcol) ** 2
-        masked_raw = jnp.where(active, d_raw, jnp.inf)
-        step_at = jnp.argmin(masked_raw).astype(jnp.int32)
-        step_min = masked_raw[step_at]
-        # Keep the row and the step alongside the value, so the refusal can
-        # NAME the pivot the way pstrf's INFO does instead of only asserting
-        # that indefiniteness happened somewhere.
-        beats = take & (step_min < d_min_raw)
-        d_min_at = jnp.where(beats, step_at, d_min_at)
-        d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
-        d_min_raw = jnp.where(beats, step_min, d_min_raw)
-        # ``d_new`` past the stop is just the frozen residual with the −inf
-        # kill markers clipped away, so the trace ratio holds its last real
-        # value instead of going −inf/NaN.
-        d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
-        trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new) / trG)
-        # Mark p (or its whole orbit, if orbit_id was provided) inactive.
-        # ``avail``, not ``take``: without this the loop STALLS past the
-        # numerical rank — it re-picks the same p every remaining iteration
-        # and delivers nothing — which is what made the rank deficiency an
-        # unavoidable refusal rather than a reportable fact.
-        kill_mask = (orbit_id == orbit_id[p]) & avail
-        d = jnp.where(kill_mask, minus_inf, jnp.where(take, d_new, d))
-        active = active & ~kill_mask
-
-        return (d, L, piv, active, d_taken, trR_over_trG,
-                d_min_raw, d_min_at, d_min_j)
-
-    (d, L, piv, _, d_taken, trR_over_trG,
-     d_min_raw, d_min_at, d_min_j) = lax.fori_loop(0, k_keep, body, init)
-    d_final = jnp.where(jnp.isfinite(d), d, 0.0)
-    # Effective rank = #pivots taken.  With the stopping rule above this is
-    # exactly the loop's trip count: ``d_taken[j] > floor`` for every taken
-    # pivot by construction and 0 for every untaken one, so the count is a
-    # contract rather than the §4.4 assumption that ``d_taken`` happens to
-    # be monotone past the numerical rank (it is not, when it is noise).
-    rank = jnp.sum(d_taken > floor).astype(jnp.int32)
-    return (piv, L, rank, d_final, d_taken, trR_over_trG,
-            (d_min_raw, d_min_at, d_min_j))
+    nk_i = int(nk)
+    ns_i = int(nspinor)
+    block_i = int(block_width)
+    if nk_i < 1 or ns_i < 1 or block_i < 1:
+        raise ValueError(
+            "Gram block dimensions must be positive: "
+            f"nk={nk_i}, nspinor={ns_i}, block_width={block_i}"
+        )
+    return (2 * nk_i * ns_i * ns_i * block_i * block_i
+            * _GRAM_COMPLEX_BYTES)
 
 
+def auto_gram_col_block_width(
+    nk: int,
+    nspinor: int,
+    budget_bytes: int,
+    *,
+    divisor: int = 1,
+    min_width: int = _GRAM_MIN_COL_BLOCK,
+) -> int:
+    """Largest mesh-aligned Gram seed tile whose square-law price fits.
 
+    Auto widths align *down* so rounding for a mesh can never invalidate the
+    memory bound.  Refuse before the pair-density allocation when even the
+    supported minimum block cannot fit.
+    """
+    budget_i = int(budget_bytes)
+    divisor_i = max(1, int(divisor))
+    min_aligned = ((max(1, int(min_width)) + divisor_i - 1)
+                   // divisor_i) * divisor_i
+    if budget_i < 1:
+        raise MemoryError(
+            f"Gram tile planner has no positive seed budget: {budget_i} B"
+        )
+    coefficient = gram_col_block_bytes(nk, nspinor, 1)
+    max_unaligned = math.isqrt(budget_i // coefficient)
+    width = (max_unaligned // divisor_i) * divisor_i
+    if width < min_aligned:
+        required = gram_col_block_bytes(nk, nspinor, min_aligned)
+        raise MemoryError(
+            "Gram tile seed planner refuses before pair-density "
+            f"allocation: nk={int(nk)}, nspinor={int(nspinor)}, minimum "
+            f"mesh-aligned block={min_aligned} prices {required / 2**30:.2f} "
+            f"GiB but the Gram transient budget is {budget_i / 2**30:.2f} "
+            "GiB. Lower the candidate count/band window or raise the "
+            "device-memory budget."
+        )
+    return width
+
+
+def gram_col_block_device_bytes(
+    nk: int,
+    nspinor: int,
+    n_rows: int,
+    block_width: int,
+    *,
+    x_shards: int = 1,
+    y_shards: int = 1,
+) -> int:
+    """Exact local bytes of the two sharded square pair-density tiles.
+
+    ``n_rows`` remains in the signature for callers of the b6 pricing API;
+    the live row extent is now bounded by the tile width rather than silently
+    remaining the full candidate extent.  That makes the physical allocation
+    agree with :func:`gram_col_block_bytes`' square law.
+    """
+    x_i = max(1, int(x_shards))
+    y_i = max(1, int(y_shards))
+    rows_local = (min(int(n_rows), int(block_width)) + x_i - 1) // x_i
+    cols_local = (int(block_width) + y_i - 1) // y_i
+    return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
+
+
+def gram_block_live_set_bytes(
+    *,
+    resident_bytes: int,
+    pair_left_peak_bytes: int,
+    pair_right_peak_bytes: int,
+    gram_fold_peak_bytes: int,
+    one_pair_tile_bytes: int,
+    gram_matrix_local_bytes: int,
+    extract_left_increment_bytes: int = 0,
+    extract_right_increment_bytes: int = 0,
+    one_left_input_tile_bytes: int = 0,
+    one_right_input_tile_bytes: int = 0,
+) -> dict[str, int]:
+    """Complete per-device live set for one 2-D Gram tile.
+
+    ``resident_bytes`` is read from the live XLA allocator after BOTH WFN
+    windows have been produced by ``load_centroids_band_chunked``.  The three
+    executable peaks come from ``runtime.aot_memory`` applied to the exact
+    canonical pair-density and q=0-fold JITs.  The right pair build adds the
+    completed left pair tile; the fold peak already includes both pair inputs.
+    The donated shard-local update keeps one full local Gram at every tile
+    stage.  Finally, input + transpose/conjugate + output are conservatively
+    three full local-Gram slots; there is no global concatenate.
+    """
+    resident = int(resident_bytes)
+    pair_tile = int(one_pair_tile_bytes)
+    gram_local = int(gram_matrix_local_bytes)
+    stages = {
+        "extract_left": (resident + gram_local
+                         + int(one_left_input_tile_bytes)
+                         + int(extract_left_increment_bytes)),
+        "pair_left": resident + gram_local + int(pair_left_peak_bytes),
+        "extract_right": (resident + gram_local + pair_tile
+                          + int(one_right_input_tile_bytes)
+                          + int(extract_right_increment_bytes)),
+        "pair_right": (resident + gram_local + pair_tile
+                       + int(pair_right_peak_bytes)),
+        "gram_fold": resident + gram_local + int(gram_fold_peak_bytes),
+        "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
+    }
+    stages["peak"] = max(stages.values())
+    return stages
+
+
+def _auto_gram_width_from_compiled_peaks(
+    seed_width: int,
+    *,
+    max_width: int,
+    divisor: int,
+    budget_bytes: int,
+    peak_for_width,
+) -> tuple[int, dict[str, int]]:
+    """Geometrically grow/shrink to the largest certified rung.
+
+    Each rung compiles the SAME canonical tile executables production will
+    run.  A geometric ladder avoids a dozen throw-away production-shape
+    compilations while retaining a strict property: the returned rung itself
+    was queried and fits.  Tail tiles are zero-padded to this width, so there
+    is only one static executable shape to certify.
+    """
+    d = max(1, int(divisor))
+    floor = ((max(1, _GRAM_MIN_COL_BLOCK) + d - 1) // d) * d
+    ceiling = (int(max_width) // d) * d
+    width = min(max(floor, (int(seed_width) // d) * d), ceiling)
+    checked: dict[int, dict[str, int]] = {}
+
+    def check(w):
+        if w not in checked:
+            checked[w] = peak_for_width(w)
+        return checked[w]
+
+    facts = check(width)
+    while facts["peak"] > int(budget_bytes) and width > floor:
+        width = max(floor, ((width // 2) // d) * d)
+        facts = check(width)
+    if facts["peak"] > int(budget_bytes):
+        raise MemoryError(
+            "Gram tile planner refuses before pair-density allocation: "
+            f"the minimum mesh-aligned tile={floor} has a compiled full "
+            f"live set of {facts['peak'] / 2**30:.2f} GiB/device, above "
+            f"the {int(budget_bytes) / 2**30:.2f}-GiB/device target."
+        )
+
+    while width < ceiling:
+        wider = min(ceiling, ((2 * width) // d) * d)
+        if wider <= width:
+            break
+        wider_facts = check(wider)
+        if wider_facts["peak"] > int(budget_bytes):
+            break
+        width, facts = wider, wider_facts
+    return width, facts
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# The pure reference and row-sharded selection recurrences are owned by
+# ``common.pivoted_cholesky``.  This L1 module retains Gram construction,
+# centroid policy/certification, and point-set reporting.
 
 # ═══════════════════════════════════════════════════════════════════════
 # The kernel's INFO, read on the host
@@ -951,7 +825,7 @@ def prune_candidates_by_pivoted_cholesky(
     # inactive after each pivot pick (orbit_id of the pivot is broadcast
     # via psum-with-mask, same idiom as the L[p, :] broadcast).
     with timing.section("prune.select"):
-        select_step = make_sharded_pivoted_cholesky_select(
+        select_step = _make_sharded_select(
             mesh, M_pad, n_keep, mesh_axis=select_axis, tol_rel=tol_rel,
         )
         # Pad mask: real candidates active, pads inactive.  None when n_pad==0
@@ -1076,281 +950,6 @@ def prune_candidates_by_pivoted_cholesky(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Multi-device — sharded pivoted-Cholesky select
-# ═══════════════════════════════════════════════════════════════════════
-# Consumes the row-sharded G ∈ ℂ^(M×M) that ``build_gram_q0_via_loadwfns``
-# produces and runs the same greedy select as ``pivoted_cholesky_select``.
-# Sharded along M: each device owns (M_slab, M) of G and (M_slab, k_keep)
-# of L.
-#
-# Collectives per iteration (one per Lloyd-like step):
-#
-#   pmax(local_pv, 'x')       — 1 scalar: finds the global pivot value
-#   pmax(-winner_p, 'x')      — 1 int32:  breaks ties by lowest device idx
-#   psum(local_Lp, 'x')       — (k_keep,) array: broadcasts L[p, :] from
-#                                its owning shard to every device
-#
-# Total comm per iter: O(k_keep). Total over k_keep iters: O(k_keep²).
-# Matmul/Schur update are local — each device does L_slab @ (scalar)
-# + elementwise ops on (M_slab,)- and (M_slab, k_keep)-shaped arrays.
-#
-# Column access `G[:, global_p]`: because G is ROW-sharded, each device's
-# local slab already contains its portion of column p — no collective.
-# This is why row-sharding is preferred over column-sharding for this
-# algorithm.
-
-
-def make_sharded_pivoted_cholesky_select(
-    mesh: Mesh,
-    M: int,
-    k_keep: int,
-    *,
-    mesh_axis: str | tuple[str, ...] = 'x',
-    tol_rel: float | None = None,
-):
-    """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
-    numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
-    returns the same 7-tuple: ``(piv, L, rank, d_final, d_taken,
-    trR_over_trG, psd_info)`` with shardings (replicated, row-sharded,
-    replicated, row-sharded-1d, replicated, replicated, replicated).
-
-    The stopping predicate is ``global_pv > floor``, and BOTH sides of it
-    are ``pmax`` results — so every shard computes the same bool and the
-    two kernels agree on where to stop at any shard count.  That is the
-    property ``tests/test_centroid_distribution.py`` gates at >1 shard on an
-    emulated mesh; before 2026-08-07 that gate ran both sides at 1×1 and
-    every collective in here was satisfied vacuously."""
-    dist.require_axes(mesh, mesh_axis, "make_sharded_pivoted_cholesky_select")
-    n_dev = dist.n_shards(mesh, mesh_axis)
-    if M % n_dev != 0:
-        raise ValueError(f"M={M} must be divisible by product of mesh axes "
-                         f"{mesh_axis} (= {n_dev})")
-    M_slab = M // n_dev
-
-    row_shard = PartitionSpec(mesh_axis, None)
-    row_shard_1d = PartitionSpec(mesh_axis)
-    rep = PartitionSpec()
-
-    # Input layouts: G alone, or with ``orbit_id`` and/or ``active_init``, each
-    # row-sharded the same way as G's row dim.  ``active_init`` is the
-    # zero-pad mask (see ``prune_candidates_by_pivoted_cholesky``): rows marked
-    # False are never eligible to be picked, which is what lets the caller pad
-    # M up to a multiple of the mesh size instead of being refused.
-    in_specs_no_orbit = (row_shard,)
-    in_specs_orbit    = (row_shard, row_shard_1d)
-    out_specs = (rep, row_shard, rep, row_shard_1d, rep, rep,
-                 (rep, rep, rep))
-
-    @jax.jit
-    def step(G, orbit_id=None, active_init=None):
-        def body_local(G_slab, orbit_id_slab=None, active_slab=None):
-            real_dtype = G_slab.real.dtype
-            eps = jnp.finfo(real_dtype).eps
-            minus_inf = jnp.array(-jnp.inf, dtype=real_dtype)
-            my_idx = lax.axis_index(mesh_axis)
-
-            # Local diagonal of G: each device owns rows [my_idx*M_slab,
-            # (my_idx+1)*M_slab); the diag entry sits at col == row.
-            col_ids_local = my_idx * M_slab + jnp.arange(M_slab)
-            local_diag_raw = jnp.real(
-                G_slab[jnp.arange(M_slab), col_ids_local])
-            local_diag = jnp.maximum(local_diag_raw, 0.0)
-            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
-            col_ids_k = jnp.arange(k_keep)
-            # The floor moves ABOVE the loop, same as the reference kernel:
-            # it is the stopping rule, and ``pmax`` makes it identical on
-            # every shard so the two kernels stop at the same iteration.
-            d0max_global = lax.pmax(jnp.max(local_diag_raw),
-                                    axis_name=mesh_axis)
-            tol = (jnp.sqrt(eps) if tol_rel is None
-                   else jnp.asarray(tol_rel, real_dtype))
-            floor = tol * d0max_global
-
-            # A negative entry on the INITIAL diagonal is already a PSD
-            # statement; step -1 names it.  Row indices are kept GLOBAL so
-            # the refusal names a candidate, not a slab offset.
-            at0_loc = jnp.argmin(local_diag_raw).astype(jnp.int32)
-            at0_glob = (my_idx * M_slab + at0_loc).astype(jnp.int32)
-            neg0 = local_diag_raw[at0_loc] < 0.0
-
-            # Pad rows enter with d = 0 (their G row/col is exactly zero), so
-            # they contribute nothing to trG, to d0max, or to the Schur update.
-            # Starting them INACTIVE is what makes them unpickable: relying on
-            # the tie-break (pads sit at the highest global indices and the
-            # pivot rule takes the LOWEST index among ties) would work today but
-            # is an accident, not a contract.
-            active0 = (jnp.ones((M_slab,), dtype=bool) if active_slab is None
-                       else active_slab.astype(bool))
-
-            init = (
-                local_diag,                                              # d_slab
-                jnp.zeros((M_slab, k_keep), dtype=G_slab.dtype),         # L_slab
-                -jnp.ones((k_keep,), dtype=jnp.int32),                   # piv
-                active0,                                                 # active
-                jnp.zeros((k_keep,), dtype=real_dtype),                  # d_taken
-                # trR partials, LOCAL: slot 0 holds this shard's share of
-                # trG so the post-loop psum makes trR_over_trG[0] exactly 1.
-                jnp.zeros((k_keep + 1,), dtype=real_dtype).at[0].set(
-                    jnp.sum(local_diag)),
-                # d_min_raw / at_row / at_step — the pstrf INFO triple.
-                jnp.minimum(local_diag_raw[at0_loc],
-                            jnp.zeros((), dtype=real_dtype)),
-                jnp.where(neg0, at0_glob, jnp.int32(-1)),
-                jnp.int32(-1),
-            )
-
-            def body(j, carry):
-                (d, L, piv, active, d_taken, trR_over_trG,
-                 d_min_raw, d_min_at, d_min_j) = carry
-
-                # Pick global pivot: per-device argmax then pmax + tie-break
-                # to lowest global index.
-                masked_d = jnp.where(active, d, minus_inf)
-                local_p_idx = jnp.argmax(masked_d)
-                local_pv = masked_d[local_p_idx]
-                global_pv = lax.pmax(local_pv, mesh_axis)
-                local_global_p = (my_idx * M_slab + local_p_idx).astype(jnp.int32)
-                winner_p = jnp.where(
-                    local_pv >= global_pv, local_global_p, jnp.int32(2**30),
-                )
-                global_p = -lax.pmax(-winner_p, mesh_axis)
-                # THE STOP.  Both operands are pmax results, so this bool is
-                # identical on every shard — no shard can run an iteration
-                # another one skipped, and no collective goes unmatched.
-                take = global_pv > floor
-                pivot_val = jnp.maximum(global_pv, floor)
-                # THE CONTINUATION — see the reference kernel for the whole
-                # argument.  ``global_pv`` is ``-inf`` exactly when no shard
-                # holds an active candidate, so this bool is a pmax result
-                # too and is identical on every shard.
-                avail = global_pv > minus_inf
-
-                # Column p of G (no collective: G is row-sharded).
-                gcol_slab = G_slab[:, global_p]
-
-                # Row p of L: broadcast from owning shard via masked psum.
-                my_has_p = (global_p // M_slab == my_idx)
-                local_p_rel = global_p - my_idx * M_slab
-                safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
-                local_Lp = jnp.where(
-                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
-                )
-                if orbit_id_slab is None:
-                    L_p = lax.psum(local_Lp, mesh_axis)
-                else:
-                    # ONE psum, not two.  The orbit id of the picked pivot
-                    # rides the SAME masked broadcast as L[p, :] — it is the
-                    # same idiom, from the same owner, at the same point in
-                    # the iteration, and it was a second round trip purely
-                    # because it was written a few lines further down.  Orbit
-                    # ids are small integers and complex128 carries them
-                    # exactly, so packing costs nothing in precision.
-                    _oid_term = jnp.where(
-                        my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
-                    ).astype(G_slab.dtype)
-                    _fused = lax.psum(
-                        jnp.concatenate([local_Lp, _oid_term[None]]),
-                        mesh_axis)
-                    L_p = _fused[:k_keep]
-                    orbit_id_p = jnp.round(
-                        jnp.real(_fused[k_keep])).astype(jnp.int32)
-
-                # New column.
-                prev_mask = (col_ids_k < j).astype(G_slab.dtype)
-                corr = L @ (jnp.conj(L_p) * prev_mask)
-                denom = jnp.sqrt(pivot_val)
-                newcol = (gcol_slab - corr) / denom
-                # Pivot-row entry exactly sqrt(d[p]), only on the owner.
-                fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
-                newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype), newcol)
-                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
-
-                L = L.at[:, j].set(newcol)
-                piv = piv.at[j].set(jnp.where(avail, global_p, jnp.int32(-1)))
-                d_taken = d_taken.at[j].set(jnp.where(take, pivot_val, 0.0))
-
-                # Schur update; the PSD detector reads the residual BEFORE
-                # the clamp, over this shard's ACTIVE rows only.
-                d_raw = d - jnp.abs(newcol) ** 2
-                masked_raw = jnp.where(active, d_raw, jnp.inf)
-                step_at = jnp.argmin(masked_raw).astype(jnp.int32)
-                step_min = masked_raw[step_at]
-                beats = take & (step_min < d_min_raw)
-                d_min_at = jnp.where(
-                    beats, (my_idx * M_slab + step_at).astype(jnp.int32),
-                    d_min_at)
-                d_min_j = jnp.where(beats, j.astype(jnp.int32), d_min_j)
-                d_min_raw = jnp.where(beats, step_min, d_min_raw)
-                d_new = jnp.maximum(jnp.where(take, d_raw, d), 0.0)
-                # LOCAL partial only.  The psum that turns these into the
-                # global trace ratio runs ONCE, after the loop, on the whole
-                # (k_keep+1,) vector — it is a pure DIAGNOSTIC and paying a
-                # collective round trip per iteration for a number nobody
-                # reads until the end was the cheapest 25% on the hot path.
-                trR_over_trG = trR_over_trG.at[j + 1].set(jnp.sum(d_new))
-                if orbit_id_slab is None:
-                    kill_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
-                else:
-                    # ``orbit_id_p`` came back on the FUSED psum above.
-                    kill_mask = orbit_id_slab == orbit_id_p
-                kill_mask = kill_mask & avail
-                active = active & ~kill_mask
-                d = jnp.where(kill_mask, minus_inf,
-                              jnp.where(take, d_new, d))
-
-                return (d, L, piv, active, d_taken, trR_over_trG,
-                        d_min_raw, d_min_at, d_min_j)
-
-            (d_final, L_out, piv_out, _, d_taken, trR_over_trG,
-             d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
-                0, k_keep, body, init)
-            d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
-            # The one psum the per-iteration diagnostic was costing.
-            trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG
-            rank = jnp.sum(d_taken > floor).astype(jnp.int32)
-            # THREE reductions, ONCE, after the loop — not per iteration:
-            # the global minimum, then the row and step that attained it,
-            # tie-broken to the lowest global row exactly as the pivot rule
-            # is.  Putting these on the hot path would be a third collective
-            # per iteration for a number only the refusal reads.
-            g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
-            mine = d_min_raw == g_min
-            far = jnp.int32(2 ** 30)
-            g_at = -lax.pmax(-jnp.where(mine, d_min_at, far),
-                             axis_name=mesh_axis)
-            g_j = -lax.pmax(-jnp.where(mine, d_min_j, far),
-                            axis_name=mesh_axis)
-            return (piv_out, L_out, rank, d_final, d_taken, trR_over_trG,
-                    (g_min, g_at, g_j))
-
-        specs = [row_shard]
-        args = [G]
-        if orbit_id is not None:
-            specs.append(row_shard_1d); args.append(orbit_id)
-        if active_init is not None:
-            specs.append(row_shard_1d); args.append(active_init)
-        has_orbit = orbit_id is not None
-        has_active = active_init is not None
-
-        def _entry(*a):
-            g = a[0]
-            i = 1
-            oid = a[i] if has_orbit else None
-            if has_orbit:
-                i += 1
-            act = a[i] if has_active else None
-            return body_local(g, oid, act)
-
-        return shard_map(
-            _entry, mesh=mesh,
-            in_specs=tuple(specs), out_specs=out_specs,
-            check_vma=False,
-        )(*args)
-
-    return step
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # Full 2-D Gram pipeline: load_wfns → pair density → q=0 Gram
 # ═══════════════════════════════════════════════════════════════════════
 #
@@ -1457,7 +1056,13 @@ def build_gram_q0_via_loadwfns(
     from common.wfn_transforms import load_centroids_band_chunked
     from isdf import (
         pair_density,
+        pair_density_aot_peak_bytes,
         gram_q0_from_pair,
+        gram_q0_aot_peak_bytes,
+    )
+    from common.staged_reshard import (
+        shard_local_slice_pad,
+        shard_local_update,
     )
 
     # Resolve windows.
@@ -1525,6 +1130,12 @@ def build_gram_q0_via_loadwfns(
             memory_per_device_gb = 0.0  # falls back to the 36 GB default
     setattr(meta, "memory_per_device_gb", float(memory_per_device_gb))
 
+    # Prune must not retain the full-k G-flat WFN beside both final centroid
+    # faces.  A one-k fixed tile is the hard memory bound; the shared
+    # transform owner pads only the final tile and reuses one executable, so
+    # this changes transfer scheduling, not the Gram or selection semantics.
+    prune_k_tile = 1
+
     # Optional pseudoband norms — same clamp recipe as isdf_fitting.
     if band_norms is not None:
         band_norms_np = np.asarray(band_norms, dtype=np.float64)
@@ -1552,13 +1163,15 @@ def build_gram_q0_via_loadwfns(
               f"norms={'on' if band_norms is not None else 'off'}, "
               f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
-              f"band_chunk_size={band_chunk_size}")
+              f"band_chunk_size={band_chunk_size}, "
+              f"transfer_k_tile={prune_k_tile}")
 
     # ---- Left window ----
     with timing.section("left.load"):
         psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
             band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile,
         )
         if norms_l_j is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
@@ -1566,74 +1179,294 @@ def build_gram_q0_via_loadwfns(
             psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
         psi_l_rmu_Y.block_until_ready()
 
-    # ---- Single-device column-blocked path (size-ladder wall fix) ----
+    # ---- 2-D tiled path (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
     # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
-    # Per-element contraction order is unchanged by blocking the OUTPUT
-    # columns, so G is numerically the same map; only materialization moves.
-    # Multi-device meshes keep the original path untouched (the 'y'-sharded
-    # column axis must not be sliced locally).
+    # Per-element contraction order is unchanged by tiling BOTH candidate
+    # axes, so G is numerically the same map; only materialization moves.  The
+    # two-axis tile is important: the nk-aware square law must price the same
+    # object the pair-density compiler sees, never an unpriced M x block.
     n_dev_total = mesh_xy.devices.size
+    n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
+    n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
     col_block = 0
-    if n_dev_total == 1:
-        # LORRAX_GRAM_COL_BLOCK: explicit column-block width; a falsy token
-        # means "no override", i.e. the auto budget below.  This USED to be a bare
-        # presence test — ``=0`` and ``=off`` are the two spellings a user
-        # reaches for to DISABLE a knob, and they did the opposite or
-        # crashed: "0" is a non-empty string, so it took the override
-        # branch and ``max(256, 0)`` turned "off" into the SMALLEST legal
-        # block (maximum blocking), while "off" died in ``int()`` mid-run
-        # after the left window had already been loaded.  Same falsy
-        # vocabulary as ``runtime._env_falsy`` and every other LORRAX knob.
-        env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-        if env_cb.lower() in ("", "0", "false", "no", "off"):
-            env_cb = ""
-        if env_cb:
-            try:
-                col_block = max(256, int(env_cb))
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                    f"integer column width nor a falsy token "
-                    f"('', 0, false, no, off)."
-                ) from None
+    # LORRAX_GRAM_COL_BLOCK: historical name, now an explicit square-tile
+    # width; a falsy token
+    # means "no override", i.e. the auto budget below.  This USED to be a
+    # bare presence test — ``=0`` and ``=off`` are the two spellings a user
+    # reaches for to DISABLE a knob, and they did the opposite or crashed.
+    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
+    if env_cb.lower() in ("", "0", "false", "no", "off"):
+        env_cb = ""
+    nk_, _, ns_, M_cols = (int(x) for x in psi_l_rmu_Y.shape)
+    seed_budget_bytes = int(
+        float(meta.memory_per_device_gb) * 1e9
+        * _GRAM_SEED_BUDGET_FRACTION
+    )
+    tile_divisor = math.lcm(n_x, n_y)
+    block_source = "auto"
+    if env_cb:
+        block_source = "LORRAX_GRAM_COL_BLOCK override"
+        try:
+            requested_block = int(env_cb)
+            if requested_block <= 0:
+                raise ValueError
+            col_block = max(_GRAM_MIN_COL_BLOCK, requested_block)
+        except ValueError:
+            raise ValueError(
+                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
+                f"integer tile width nor a falsy token "
+                f"('', 0, false, no, off)."
+            ) from None
+        # A manual width keeps its historical floor and is rounded UP so the
+        # now-square tile divides BOTH mesh axes.  It is an explicit override,
+        # so it may exceed auto's target and the diagnostic below says so.
+        col_block = round_up(col_block, tile_divisor)
+    else:
+        if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
+            col_block = M_cols
         else:
-            nk_, _, ns_, M_ = psi_l_rmu_Y.shape
-            bytes_per_col = 2 * nk_ * ns_ * ns_ * M_ * 16
-            budget_bytes = float(meta.memory_per_device_gb) * 1e9 * 0.25
-            col_block = max(256, int(budget_bytes // max(bytes_per_col, 1)))
-        if col_block >= psi_l_rmu_Y.shape[3]:
-            col_block = 0  # one full block == the original computation
+            col_block = auto_gram_col_block_width(
+                nk_, ns_, seed_budget_bytes, divisor=tile_divisor,
+            )
+    if col_block >= M_cols:
+        col_block = 0  # one full block == the original computation
 
     if col_block:
-        M_cols = psi_l_rmu_Y.shape[3]
-        if verbose:
-            print(f"[pivoted_cholesky] column-blocked Gram: M={M_cols}, "
-                  f"col_block={col_block} "
-                  f"({-(-M_cols // col_block)} blocks; single-device path)")
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
                 band_chunk_size=band_chunk_size,
+                k_chunk_size=prune_k_tile,
             )
             if norms_r_j is not None:
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
                 psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
             psi_r_rmu_Y.block_until_ready()
+
+        # Compiler-aware width selection happens only after BOTH canonical
+        # WFN windows exist.  The allocator reading is therefore the actual
+        # resident floor (including loader tables and any unrelated live
+        # arrays), not a second shape formula for the WFN service.
+        gc.collect()
+        from common.gpu_utils import _get_jax_gpu_memory_bytes
+        _, live_now, _ = _get_jax_gpu_memory_bytes()
+        if live_now is None:
+            # CPU/fallback accounting: sum the returned WFN shards.  Announce
+            # that this is weaker because it cannot see service tables.
+            resident_local_bytes = 0
+            for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
+                        psi_r_rmu_Y, psi_r_rmuT_X):
+                resident_local_bytes += sum(
+                    int(np.asarray(sh.data).nbytes)
+                    for sh in arr.addressable_shards
+                )
+            from runtime.aot_memory import announce_once
+            announce_once(
+                "gram-live-allocator-unavailable",
+                "allocator bytes_in_use unavailable for the Gram planner; "
+                "using the four canonical WFN output shards as a KNOWN-LOW "
+                "resident floor",
+            )
+        else:
+            resident_local_bytes = int(live_now)
+
+        # The selected width controls static executable shapes and loop counts
+        # on every process.  Allocator residency itself is rank-local, so price
+        # from one shared worst-rank value before entering that host branch.
+        resident_bytes = worst_process_resident_bytes(resident_local_bytes)
+
+        target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
+        gram_local_bytes = (
+            ((M_cols + n_x - 1) // n_x)
+            * ((M_cols + n_y - 1) // n_y)
+            * _GRAM_COMPLEX_BYTES
+        )
+
+        rep_sh = NamedSharding(mesh_xy, PartitionSpec())
+        row_spec = PartitionSpec(None, 'x', None, None)
+        col_spec = PartitionSpec(None, None, None, 'y')
+        tile_spec = PartitionSpec('x', 'y')
+        tile_services = {}
+
+        def _services_for_width(tile_width):
+            tile_width = int(tile_width)
+            if tile_width not in tile_services:
+                tile_services[tile_width] = (
+                    shard_local_slice_pad(
+                        mesh_xy, spec=row_spec, axis=1, mesh_axis='x',
+                        local_size=tile_width // n_x),
+                    shard_local_slice_pad(
+                        mesh_xy, spec=col_spec, axis=3, mesh_axis='y',
+                        local_size=tile_width // n_y),
+                )
+            return tile_services[tile_width]
+
+        def _extract_increment(extractor, arr):
+            from runtime.aot_memory import aot_kernel_peak_bytes
+            arr_arg = jax.ShapeDtypeStruct(
+                tuple(int(s) for s in arr.shape), arr.dtype,
+                sharding=arr.sharding)
+            start_arg = jax.ShapeDtypeStruct(
+                (), jnp.int32, sharding=rep_sh)
+            compiled = extractor.lower(arr_arg, start_arg).compile()
+            return int(aot_kernel_peak_bytes(compiled).resident_increment)
+
+        def _compiled_live_set(tile_width):
+            tile_width = int(tile_width)
+            extract_x, extract_y = _services_for_width(tile_width)
+            extract_left = max(
+                _extract_increment(extract_x, psi_l_rmuT_X),
+                _extract_increment(extract_y, psi_l_rmu_Y),
+            )
+            extract_right = max(
+                _extract_increment(extract_x, psi_r_rmuT_X),
+                _extract_increment(extract_y, psi_r_rmu_Y),
+            )
+            left_peak = pair_density_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_left,
+                nspinor=ns_, n_col=tile_width,
+            )
+            right_peak = pair_density_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, n_rmu=tile_width, nb=nb_right,
+                nspinor=ns_, n_col=tile_width,
+            )
+            fold_peak = gram_q0_aot_peak_bytes(
+                mesh_xy=mesh_xy, nk=nk_, nspinor=ns_,
+                n_rmu=tile_width, n_col=tile_width,
+            )
+            one_pair_local = (
+                nk_ * ns_ * ns_
+                * ((tile_width + n_x - 1) // n_x)
+                * ((tile_width + n_y - 1) // n_y)
+                * _GRAM_COMPLEX_BYTES
+            )
+            one_left_input_local = (
+                nk_ * (tile_width // n_x) * nb_left * ns_
+                * _GRAM_COMPLEX_BYTES
+            )
+            one_right_input_local = (
+                nk_ * (tile_width // n_x) * nb_right * ns_
+                * _GRAM_COMPLEX_BYTES
+            )
+            facts = gram_block_live_set_bytes(
+                resident_bytes=resident_bytes,
+                pair_left_peak_bytes=left_peak,
+                pair_right_peak_bytes=right_peak,
+                gram_fold_peak_bytes=fold_peak,
+                one_pair_tile_bytes=one_pair_local,
+                gram_matrix_local_bytes=gram_local_bytes,
+                extract_left_increment_bytes=extract_left,
+                extract_right_increment_bytes=extract_right,
+                one_left_input_tile_bytes=one_left_input_local,
+                one_right_input_tile_bytes=one_right_input_local,
+            )
+            facts.update({
+                "extract_left": int(extract_left),
+                "extract_right": int(extract_right),
+                "pair_left_compiled": int(left_peak),
+                "pair_right_compiled": int(right_peak),
+                "gram_compiled": int(fold_peak),
+                "pair_tile": int(one_pair_local),
+            })
+            return facts
+
+        # Keep a genuine blocked path: the sequential full-M path below has
+        # a smaller WFN live set and remains preferable whenever the cheap
+        # b6 square-law screen said it fits.
+        max_tile_width = ((M_cols - 1) // tile_divisor) * tile_divisor
+        if not env_cb:
+            col_block, live_facts = _auto_gram_width_from_compiled_peaks(
+                col_block,
+                max_width=max_tile_width,
+                divisor=tile_divisor,
+                budget_bytes=target_bytes,
+                peak_for_width=_compiled_live_set,
+            )
+        else:
+            live_facts = _compiled_live_set(col_block)
+
+        if verbose:
+            square_gib = (
+                gram_col_block_bytes(nk_, ns_, col_block) / 2**30
+            )
+            local_gib = gram_col_block_device_bytes(
+                nk_, ns_, M_cols, col_block,
+                x_shards=n_x, y_shards=n_y,
+            ) / 2**30
+            ntiles = -(-M_cols // col_block)
+            print(
+                f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
+                f"tile={col_block} ({ntiles}x{ntiles} tiles; "
+                f"{n_dev_total}-device path; {block_source}; "
+                f"square-law={square_gib:.2f} GiB global, "
+                f"two-pair local={local_gib:.2f} GiB/device; "
+                f"resident(two WFN windows; worst rank)="
+                f"{resident_bytes / 2**30:.2f}, "
+                f"compiled L/R/fold="
+                f"{live_facts['pair_left_compiled'] / 2**30:.2f}/"
+                f"{live_facts['pair_right_compiled'] / 2**30:.2f}/"
+                f"{live_facts['gram_compiled'] / 2**30:.2f}, "
+                f"extract L/R increment="
+                f"{live_facts['extract_left'] / 2**30:.2f}/"
+                f"{live_facts['extract_right'] / 2**30:.2f}, "
+                f"full-live peak={live_facts['peak'] / 2**30:.2f} "
+                f"of target={target_bytes / 2**30:.2f} GiB/device)"
+            )
+        extract_x, extract_y = _services_for_width(col_block)
+        tile_xy = NamedSharding(mesh_xy, tile_spec)
+        update_g = shard_local_update(mesh_xy, spec=tile_spec)
+        local_rows = M_cols // n_x
+        local_cols = M_cols // n_y
+        local_row_tile = col_block // n_x
+        local_col_tile = col_block // n_y
+
+        @partial(jax.jit, out_shardings=tile_xy)
+        def _zero_gram():
+            return jnp.zeros((M_cols, M_cols), dtype=jnp.complex128)
+
+        G = _zero_gram()
+        G.block_until_ready()
+
+        def _rep_i32(value):
+            return device_put_process_local(
+                np.asarray(value, dtype=np.int32), rep_sh)
+
         with timing.section("q0_sum"):
-            g_blocks = []
-            for c0 in range(0, M_cols, col_block):
-                c1 = min(c0 + col_block, M_cols)
-                P_l_b = pair_density(
-                    psi_l_rmuT_X, psi_l_rmu_Y[..., c0:c1], mesh_xy)
-                P_r_b = pair_density(
-                    psi_r_rmuT_X, psi_r_rmu_Y[..., c0:c1], mesh_xy)
-                G_b = gram_q0_from_pair(P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
-                                        symmetrize=False)
-                G_b.block_until_ready()
-                g_blocks.append(G_b)
-                del P_l_b, P_r_b
-            G = jnp.concatenate(g_blocks, axis=1)
+            for c0 in range(0, local_cols, local_col_tile):
+                c_start = _rep_i32(c0)
+                for r0 in range(0, local_rows, local_row_tile):
+                    r_start = _rep_i32(r0)
+
+                    # Slice inside each already-owned X/Y shard.  The generic
+                    # layout primitive zero-pads the local tail, so no smaller
+                    # global extent is ever repartitioned and the pair/fold
+                    # executables keep one static shape.
+                    row_l = extract_x(psi_l_rmuT_X, r_start)
+                    block_l = extract_y(psi_l_rmu_Y, c_start)
+                    P_l_b = pair_density(row_l, block_l, mesh_xy)
+                    # This barrier makes the planner's stage max real: the
+                    # left compiler arena is gone before the right one starts.
+                    P_l_b.block_until_ready()
+                    del row_l, block_l
+
+                    row_r = extract_x(psi_r_rmuT_X, r_start)
+                    block_r = extract_y(psi_r_rmu_Y, c_start)
+                    P_r_b = pair_density(row_r, block_r, mesh_xy)
+                    P_r_b.block_until_ready()
+                    del row_r, block_r
+
+                    G_b = gram_q0_from_pair(
+                        P_l_b, P_r_b, kw, mesh_xy=mesh_xy,
+                        symmetrize=False,
+                    )
+                    G_b.block_until_ready()
+                    del P_l_b, P_r_b
+                    starts = _rep_i32((r0, c0))
+                    G = update_g(G, G_b, starts)
+                    G.block_until_ready()
+                    del G_b, r_start, starts
+                del c_start
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
             G = 0.5 * (G + jnp.conj(G.T))
@@ -1651,6 +1484,7 @@ def build_gram_q0_via_loadwfns(
         psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
             band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile,
         )
         if norms_r_j is not None:
             psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]

@@ -154,8 +154,8 @@ def test_refit_kernel_matches_the_producer_solve_path():
         ref = np.asarray(jax.device_get(solve_zeta(
             L, jnp.asarray(Z)[None], mesh,
             solver_kind="replicated_rank_truncate", n_rmu_logical=_N)))[0]
-        _, _, _, refit_solve = vq_interp._refit_kernels(
-            1, 1, 1, _N, 1, 8, ("rank_truncate", _RCOND, 0.0))
+        _, refit_solve = vq_interp._refit_kernels(
+            1, 1, 1, _N, ("rank_truncate", _RCOND, 0.0))
         got = np.asarray(jax.device_get(refit_solve(jnp.asarray(C),
                                                     jnp.asarray(Z))))
     assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-10, (
@@ -170,12 +170,15 @@ def test_the_kernel_cache_keys_on_the_solve_not_only_the_shapes():
     pytest.importorskip("jax")
     from bse import vq_interp
 
-    a = vq_interp._refit_kernels(1, 1, 1, _N, 1, 8, ("rank_truncate", 1e-8, 0.0))
-    b = vq_interp._refit_kernels(1, 1, 1, _N, 1, 8, ("rank_truncate", 1e-4, 0.0))
-    c = vq_interp._refit_kernels(1, 1, 1, _N, 1, 8, ("cholesky", 1e-8, 0.0))
-    assert a[3] is not b[3] and a[3] is not c[3]
+    a = vq_interp._refit_kernels(
+        1, 1, 1, _N, ("rank_truncate", 1e-8, 0.0))
+    b = vq_interp._refit_kernels(
+        1, 1, 1, _N, ("rank_truncate", 1e-4, 0.0))
+    c = vq_interp._refit_kernels(
+        1, 1, 1, _N, ("cholesky", 1e-8, 0.0))
+    assert a[1] is not b[1] and a[1] is not c[1]
     assert vq_interp._refit_kernels(
-        1, 1, 1, _N, 1, 8, ("rank_truncate", 1e-8, 0.0))[3] is a[3]
+        1, 1, 1, _N, ("rank_truncate", 1e-8, 0.0))[1] is a[1]
 
 
 def test_the_cholesky_arm_is_still_reachable_and_is_the_old_arithmetic():

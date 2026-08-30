@@ -53,7 +53,8 @@ def test_every_direct_plan_batched_site_selects_at_plan_construction():
     """No production caller may reach the private ``_route=`` test seam."""
     found = []
     for rel in ("src/bandstructure/bse_setup.py", "src/bse/vq_interp.py",
-                "src/gw/w_isdf.py", "src/isdf/core.py"):
+                "src/gw/w_isdf.py", "src/isdf/core.py",
+                "src/isdf/galerkin.py"):
         tree = ast.parse((ROOT / rel).read_text())
         for fn in (n for n in ast.walk(tree)
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
@@ -75,7 +76,42 @@ def test_every_direct_plan_batched_site_selects_at_plan_construction():
                 assert all(k.arg != "_route" for k in call.keywords), (
                     f"{rel}:{fn.name} uses distrib_la's private gate override")
 
-    assert len(found) == 6, f"Plan.batched inventory changed: {found}"
+    assert len(found) == 7, f"Plan.batched inventory changed: {found}"
+
+
+def test_htransform_galerkin_receives_the_one_resolved_run_route():
+    """Every production door to the Galerkin batch uses the same setting."""
+    checks = {
+        "src/bandstructure/htransform.py": {
+            "fit_galerkin_basis": "distrib_la_batched_route",
+            "streaming_galerkin_solve": "distrib_la_batched_route",
+            "initialize_wfns": "distrib_la_batched_route",
+        },
+        "src/bse/exciton_bands.py": {
+            "initialize_wfns": "args.distrib_la_batched_route",
+        },
+        "src/bse/vq_interp.py": {
+            "initialize_wfns": "_distrib_la_batched_route",
+        },
+        "src/bse/bse_densify.py": {
+            "initialize_wfns": "_distrib_la_batched_route",
+        },
+    }
+    for rel, expected in checks.items():
+        tree = ast.parse((ROOT / rel).read_text())
+        found = {}
+        for call in (node for node in ast.walk(tree)
+                     if isinstance(node, ast.Call)):
+            name = (call.func.id if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute) else None)
+            if name not in expected:
+                continue
+            route = next((kw.value for kw in call.keywords
+                          if kw.arg == "distrib_la_batched_route"), None)
+            assert route is not None, f"{rel}:{name} drops the run route"
+            found[name] = ast.unparse(route)
+        assert found == expected
 
 
 @pytest.mark.parametrize("rel", [

@@ -88,6 +88,7 @@ from minimax._catalog import (
     load_catalog_dict,
     load_table,
     nearest_below,
+    payload_sha256,
     parse_catalog,
     parse_entry,
     provenance_for,
@@ -120,6 +121,7 @@ from minimax.door import (
     family_for_character,
     lookup,
     nearest_certified,
+    noncrossing_kappa0,
     reset_announcements,
     runtime_solve_allowed,
     serve,
@@ -242,7 +244,8 @@ __all__ = [
     # --- the catalog algebra, for the certification tier and the census ----
     "CatalogEntry", "catalog_view", "load_catalog_dict", "parse_catalog",
     "parse_entry", "select_entry", "nearest_below", "clear_caches",
-    "load_table", "provenance_for",
+    "load_table", "payload_sha256", "provenance_for",
+    "noncrossing_kappa0",
     # --- the refusals ------------------------------------------------------
     "MinimaxRefusal", "NoCertifiedTable", "AmplificationCap", "UnknownTarget",
     "CatalogUnavailable", "TableUnreadable", "CatalogCorrupt",

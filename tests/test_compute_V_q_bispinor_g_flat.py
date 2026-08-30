@@ -33,6 +33,8 @@ _services.ensure_on_path()
 from zeta_loader import ZetaLoader  # noqa: E402
 ZetaReader = ZetaLoader  # merged 2026-07-09; slab API lives on ZetaLoader
 from gw.v_q_bispinor import (
+    BispinorVqReader,
+    V_QMUNU_FORMAT,
     compute_V_q_bispinor_g_flat_to_h5,
     _make_per_q_v_builder_for_tile,
     UNIQUE_TILES, tile_dataset_name,
@@ -124,6 +126,28 @@ def _ref_tile_V(zeta_L_disk, zeta_R_disk, q_frac, gvec_components, ngk_per_q,
 # Tests
 # ---------------------------------------------------------------------------
 
+def test_reader_refuses_stale_format_before_collective_open(tmp_path,
+                                                            monkeypatch):
+    """A schema refusal must not strand an unreachable collective handle."""
+    stale_path = tmp_path / "stale_v_q_bispinor.h5"
+    with h5py.File(stale_path, "w") as f:
+        f.create_dataset("v_qmunu_format", data=np.bytes_(
+            "bispinor_lorentz_v1"))
+
+    collective_opened = False
+
+    class RefuseCollectiveOpen:
+        def __init__(self, *args, **kwargs):
+            nonlocal collective_opened
+            collective_opened = True
+            raise AssertionError("SlabIO opened before schema acceptance")
+
+    monkeypatch.setattr("file_io.slab_io.SlabIO", RefuseCollectiveOpen)
+    with pytest.raises(ValueError, match=V_QMUNU_FORMAT):
+        BispinorVqReader(stale_path, object())
+    assert not collective_opened
+
+
 def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
     """All 7 unique tiles agree with a per-q einsum reference."""
     fft_grid = (4, 4, 6)
@@ -156,7 +180,7 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -192,17 +216,19 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
                 V_got, V_ref, atol=1e-10, rtol=1e-10,
                 err_msg=f"tile (μ_L={mu_L}, ν_L={nu_L}) mismatch")
 
-        # g0 only on the CC tile
-        assert "V_qmunu_CC_g0" in ds, ds
-        g0_got = np.asarray(f["V_qmunu_CC_g0"][...])
-        # g0[q, μ] = ζ_C[q, μ, 0] (G=0 lives at sphere position 0)
-        np.testing.assert_allclose(
-            g0_got, z_C[:, :, 0], atol=1e-12, rtol=1e-12)
+        # V persistence owns only V.  Literal-G=0 is a derived in-memory
+        # view of each channel's canonical zeta_q_G, never a twin dataset.
+        assert not [name for name in ds if name.endswith("_g0")], ds
         # Layout metadata
         import json
         unique = [tuple(t) for t in json.loads(f.attrs['unique_tiles'])]
         assert set(unique) == set(UNIQUE_TILES)
-        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v1"
+        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v2"
+
+    for channel in range(4):
+        np.testing.assert_allclose(
+            np.asarray(g0_by_channel[channel]),
+            z_disks[channel][:, :, 0], atol=1e-12, rtol=1e-12)
 
 
 def test_bispinor_CC_tile_matches_charge_orchestrator(
@@ -258,7 +284,7 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
          ZetaReader(paths['T2'], mesh=single_device_mesh) as zT2, \
          ZetaReader(paths['T3'], mesh=single_device_mesh) as zT3:
         with single_device_mesh:
-            compute_V_q_bispinor_g_flat_to_h5(
+            _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
                 output_h5_path=str(out_path),
@@ -273,14 +299,14 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
 
     with h5py.File(out_path, 'r') as f:
         V_CC = np.asarray(f["V_qmunu_CC"][...])
-        g0_CC = np.asarray(f["V_qmunu_CC_g0"][...])
     np.testing.assert_allclose(V_CC, V_charge, atol=1e-12, rtol=1e-12)
-    np.testing.assert_allclose(g0_CC, g0_charge, atol=1e-12, rtol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(g0_by_channel[0]), g0_charge, atol=1e-12, rtol=1e-12)
 
 
 # ===========================================================================
 #  transverse rank-2 Cartesian projector tiles (merged from
-#  test_v_q_bispinor_helpers.py): TT/CC ratio = (delta_ij - Khat_i Khat_j)
+#  test_v_q_bispinor_helpers.py): TT/CC ratio = -(delta_ij - Khat_i Khat_j)
 # ===========================================================================
 
 
@@ -317,20 +343,21 @@ def test_cc_tile_is_bare_v_real():
     assert np.all(np.abs(v) > 0)                   # nonzero at K≠0
 
 
-def test_tt_diagonal_applies_1_minus_khat2():
+def test_tt_diagonal_applies_negative_transverse_projector():
     v_cc = _build(0, 0)
     v_11 = _build(1, 1)                            # i=j=0
     K, K2 = _K_and_K2()
     khat_x2 = K[:, 0] ** 2 / K2
-    np.testing.assert_allclose(v_11, v_cc * (1.0 - khat_x2), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        v_11, -v_cc * (1.0 - khat_x2), rtol=1e-10, atol=1e-12)
 
 
-def test_tt_offdiagonal_applies_minus_khat_ij():
+def test_tt_offdiagonal_applies_negative_transverse_projector():
     v_cc = _build(0, 0)
     v_12 = _build(1, 2)                            # i=0, j=1
     K, K2 = _K_and_K2()
     khat_xy = K[:, 0] * K[:, 1] / K2
-    np.testing.assert_allclose(v_12, v_cc * (-khat_xy), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(v_12, v_cc * khat_xy, rtol=1e-10, atol=1e-12)
 
 
 def test_invalid_tt_indices_raise():

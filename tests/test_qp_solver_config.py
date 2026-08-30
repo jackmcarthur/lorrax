@@ -22,7 +22,12 @@ from __future__ import annotations
 import pathlib
 import pytest
 
-from gw.gw_config import LorraxConfig, QPSolver, qp_solver_semantics
+from gw.gw_config import (
+    BispinorGWMode, LorraxConfig, QPSolver,
+    qp_solver_semantics,
+    uses_four_spinor_finite_q_charge, uses_raw_kinetic_balance_charge,
+)
+from common.four_current_model import resolve_four_current_representation
 
 
 BASE_INPUT = """\
@@ -119,6 +124,131 @@ def test_kij_stream_refused_even_in_static_modes(tmp_path):
             tmp_path,
             "compute_mode = cohsex\nqp_solver = self_consistent\n"
             "sigma_omega_accumulation = kij_stream\n")
+
+
+def test_pauli_reference_selector_splits_charge_from_current(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = pauli_reference_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n")
+    assert cfg.bispinor_gw is (
+        BispinorGWMode.PAULI_REFERENCE_BARE_TRANSVERSE)
+    assert not uses_raw_kinetic_balance_charge(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
+
+
+def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
+    lines: list[str] = []
+    path = tmp_path / "cohsex_bispinor_sc.in"
+    path.write_text(
+        BASE_INPUT
+        + "bispinor = true\n"
+        + "qp_solver = self_consistent\n")
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+    assert "density_self_consistent" not in cfg.raw_input_keys
+    assert any("required live (rho, J) Hartree rebuild" in line
+               for line in lines)
+
+
+def test_pauli_reference_explicit_frozen_density_is_refused(tmp_path):
+    with pytest.raises(
+            ValueError,
+            match="bispinor_self_consistency_requires_live_four_current"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n"
+            "qp_solver = self_consistent\n"
+            "density_self_consistent = false\n")
+
+
+def test_pauli_reference_accepts_live_four_current_self_consistency(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = pauli_reference_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n"
+        "qp_solver = self_consistent\n"
+        "density_self_consistent = true\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+
+
+def test_scalar_self_consistency_keeps_fixed_density_default(tmp_path):
+    cfg = _config(tmp_path, "qp_solver = self_consistent\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert not cfg.density_self_consistent
+
+
+def test_legacy_bispinor_self_consistency_gets_same_live_default(tmp_path):
+    with pytest.warns(DeprecationWarning, match="self_consistent"):
+        cfg = _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n"
+            "self_consistent = true\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+
+
+def test_pauli_reference_requires_four_current_enablement(tmp_path):
+    with pytest.raises(ValueError, match="bispinor_gw_requires_bispinor"):
+        _config(
+            tmp_path,
+            "bispinor = false\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n")
+
+
+def test_pauli_reference_refuses_restart_read(tmp_path):
+    with pytest.raises(ValueError, match="pauli_reference_restart_unavailable"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = true\n"
+            "write_restart_tensors = false\n")
+
+
+def test_pauli_reference_refuses_restart_write(tmp_path):
+    with pytest.raises(
+            ValueError, match="pauli_reference_restart_write_unavailable"):
+        _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = true\n")
+
+
+def test_isometric_selector_splits_finite_q_from_scalar_head(tmp_path):
+    cfg = _config(
+        tmp_path,
+        "bispinor = true\n"
+        "bispinor_gw = isometric_kinetic_balance_bare_transverse\n"
+        "restart = false\n"
+        "write_restart_tensors = false\n")
+    rep = resolve_four_current_representation(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert cfg.bispinor_gw is (
+        BispinorGWMode.ISOMETRIC_KINETIC_BALANCE_BARE_TRANSVERSE)
+    assert uses_four_spinor_finite_q_charge(
+        cfg.bispinor, cfg.bispinor_gw)
+    assert rep.charge_bispinor and rep.current_bispinor
+    assert rep.charge_lift == rep.current_lift == "isometric"
+    assert not rep.scalar_head_bispinor
 
 
 # ---------------------------------------------------------------------------

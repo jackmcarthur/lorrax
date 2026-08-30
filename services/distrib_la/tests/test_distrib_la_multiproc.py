@@ -280,6 +280,57 @@ def check_cusolvermp_factor_solve(mesh, dtype="complex128", nq=2, n=64,
     return dict(residual=r)
 
 
+def check_cusolvermp_lu_factor_solve(mesh, dtype="complex128", nq=2, n=64,
+                                     nrhs=32):
+    """Split CUDA getrf/getrs parity, reuse, and pivot ownership.
+
+    The second RHS uses the same opaque token and is compared against the
+    incumbent fused handler.  The internal handle is inspected only here to
+    prove every process owns ``LOCr(M_A)+MB_A = 2*n/Px`` pivots per q:
+    the carrier remains rank-private rather than replicating a global pivot.
+    """
+    rng = np.random.default_rng(20260827)
+    A_np = _herm(rng, nq, n, dtype)
+    A_np += np.eye(n, dtype=A_np.dtype)[None, :, :] * 0.37
+    B_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+    B2_np = _rng_mat(rng, (nq, n, nrhs), dtype)
+
+    for target in ("lorrax_cusolvermp_batched_getrf",
+                   "lorrax_cusolvermp_batched_getrs"):
+        usable, why = D.probe_target(target, "CUDA")
+        assert usable, f"new CUDA handler {target} is not loadable: {why}"
+
+    tok = D.factor("solve_lu", _put(A_np, mesh, (None, "x", "y")), mesh,
+                   backend="cusolvermp")
+    X1 = _gather(D.solve(tok, _put(B_np, mesh, (None, "x", "y"))))
+    X2 = _gather(D.solve(tok, _put(B2_np, mesh, (None, "x", "y"))))
+    r1, r2 = _resid(A_np, X1, B_np), _resid(A_np, X2, B2_np)
+    assert r1 < 1e-10 and r2 < 1e-10, (
+        f"cusolvermp split residuals rhs1={r1:.3e} rhs2={r2:.3e}")
+
+    fused = _gather(D.plan("solve_lu", mesh, backend="cusolvermp", n=n)
+                    .batched(_put(A_np, mesh, (None, "x", "y")),
+                             _put(B2_np, mesh, (None, "x", "y"))))
+    assert np.array_equal(X2, fused), (
+        f"split CUDA second solve drifts from fused getrf+getrs "
+        f"(rel {_rel(X2, fused):.3e})")
+
+    held = tok._factor  # service-internal white-box ownership gate
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ipiv_len = 2 * (n // px)
+    want_local = (nq, ipiv_len)
+    want_global = (nq, px * py * ipiv_len)
+    assert tuple(held.ipiv.shape) == want_global, (
+        f"pivot carrier global shape {held.ipiv.shape}, want {want_global}")
+    local_shapes = [tuple(s.data.shape) for s in held.ipiv.addressable_shards]
+    assert local_shapes and all(s == want_local for s in local_shapes), (
+        f"rank-local pivot shapes {local_shapes}, want {want_local}")
+    assert not held.ipiv.is_fully_replicated, "pivot carrier is replicated"
+    return dict(rhs1=r1, rhs2=r2, fused_rel=_rel(X2, fused),
+                pivot_global=want_global, pivot_local=want_local,
+                pivot_local_bytes=nq * ipiv_len * 8)
+
+
 def check_slate_factor_solve(mesh, dtype="complex128", nq=2, n=64, nrhs=32):
     """FIRST EXECUTION of the SLATE trsm back-solve.  Read the docstring.
 
@@ -635,6 +686,276 @@ def check_distributed_matmul(mesh, dtype="complex128", *,
     return {"nn_residual": rel, "conj_transpose_residual": rel_t}
 
 
+def check_gemm_plan_cublasmp(mesh, dtype="complex128", *, nq=3,
+                             m=None, k=None, n=None):
+    """``distrib_la.gemm_plan``/``GemmPlan``: numerics, nested ``jit``,
+    ``lax.scan`` reuse, the donated ``out=`` path, the ``beta!=0``
+    accumulate path, and the internal-zero-``C`` path -- all against an
+    ``A @ B`` numpy reference.  This is the ONLY tier that can certify any
+    of it: the plan refuses off-CUDA and off-cuBLASMp by construction (see
+    ``test_distrib_la_matmul_plan.py``), so an emulated mesh never reaches
+    the code this checks.
+
+    ``m, k, n`` default from the mesh so the plan's own tiling checks
+    (``m % px``, ``k % px``, ``k % py``, ``n % py``) are exercised on
+    whatever square mesh this runs on, not hard-coded to 2x2.
+    """
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py, f"gemm_plan needs a square mesh; got {px}x{py}"
+    m = m if m is not None else 2 * px
+    k = k if k is not None else 3 * px
+    n = n if n is not None else 2 * px
+    rng = np.random.default_rng(20260822)
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, "x", "y"))
+    B = _put(B_np, mesh, (None, "x", "y"))
+    want = A_np @ B_np
+
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                       backend="cublasmp")
+    assert plan.backend == "cublasmp"
+    assert plan.describe(), "describe() must produce a non-empty banner line"
+    out = {}
+
+    # 1. eager call, no C -- the internal-zero-C kernel folded into one
+    # compiled program (module docstring, "Output liveness").
+    D_eager_j = plan(A, B)
+    assert D_eager_j.sharding.spec == P(None, "x", "y")
+    D_eager = _gather(D_eager_j)
+    out["eager_no_c"] = _rel(D_eager, want)
+    assert out["eager_no_c"] < RTOL, out["eager_no_c"]
+
+    # 2. inside a jax.jit -- proves the closure composes under an outer
+    # trace with no eager resolve/probe/dlopen inside it: gemm_plan()
+    # already ran and warmed all of that before this function was called.
+    @jax.jit
+    def _once(a, b):
+        return plan(a, b)
+    D_jit = _gather(_once(A, B))
+    out["jit_no_c"] = _rel(D_jit, want)
+    assert out["jit_no_c"] < RTOL, out["jit_no_c"]
+
+    # 3. inside lax.scan -- the actual per-tau/per-k hot-loop shape this
+    # plan exists for (ppm_tau_kernel.py:311-317,438-490).  The scan body
+    # traces ONCE; if the plan secretly needed eager work per call this
+    # would either fail to trace or, on P>1, hang inside a mid-trace NCCL
+    # collective instead of raising.
+    nsteps = 3
+    A_stack_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_stack_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A_stack = _put(A_stack_np, mesh, (None, None, "x", "y"))
+    B_stack = _put(B_stack_np, mesh, (None, None, "x", "y"))
+
+    @jax.jit
+    def _scanned(a_stack, b_stack):
+        def body(carry, ab):
+            a, b = ab
+            return carry, plan(a, b)
+        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack), unroll=1)
+        return out_stack
+
+    D_scan = _gather(_scanned(A_stack, B_stack))
+    want_scan = A_stack_np @ B_stack_np
+    out["scan_no_c"] = _rel(D_scan, want_scan)
+    assert out["scan_no_c"] < RTOL, out["scan_no_c"]
+
+    # 4. explicit C, beta != 0 -- the donated-C kernel's accumulate form,
+    # and its own refusal when a beta!=0 plan is called with no C.
+    plan_beta = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                            backend="cublasmp", beta=-0.5)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    C = _put(C_np, mesh, (None, "x", "y"))
+    D_c = _gather(plan_beta(A, B, C))
+    want_c = A_np @ B_np + (-0.5) * C_np
+    out["beta_accumulate"] = _rel(D_c, want_c)
+    assert out["beta_accumulate"] < RTOL, out["beta_accumulate"]
+    with _raises(ValueError, "C is required"):
+        plan_beta(A, B)
+
+    # 5. out= -- a caller-owned buffer donated purely for its storage
+    # (beta=0, content ignored).  Correctness matches case 1; this proves
+    # the call succeeds through the donated-C kernel with a real live
+    # buffer in that slot, not only ever the plan's internal zeros.
+    scratch_np = _rng_mat(rng, (nq, m, n), dtype)
+    D_out = _gather(
+        plan(A, B, out=_put(scratch_np, mesh, (None, "x", "y"))))
+    out["out_donated"] = _rel(D_out, want)
+    assert out["out_donated"] < RTOL, out["out_donated"]
+    with _raises(ValueError, "not both"):
+        plan(A, B, C, out=C)
+
+    # 6. repeated calls on the SAME warmed plan with fresh operands each
+    # time -- a real-mesh reuse signal (no per-call resolve/dlopen/probe,
+    # no drift in the answer).  A dedicated allocator/HLO memory-telemetry
+    # leg is the deeper capacity claim; this is correctness under reuse.
+    for i in range(5):
+        Ai = _rng_mat(rng, (nq, m, k), dtype)
+        Bi = _rng_mat(rng, (nq, k, n), dtype)
+        Di = _gather(plan(_put(Ai, mesh, (None, "x", "y")),
+                          _put(Bi, mesh, (None, "x", "y"))))
+        r = _rel(Di, Ai @ Bi)
+        assert r < RTOL, f"repeated call {i}: rel {r:.3e}"
+    out["repeated_calls"] = 5
+    return out
+
+
+def check_gemm_plan_manual_shard_map(mesh, dtype="complex128", *, nq=3,
+                                     m=None, k=None, n=None, nsteps=3):
+    """``GemmPlan.local_call``: the SAME planned N,N GEMM as
+    ``check_gemm_plan_cublasmp``'s ``__call__`` coverage, but invoked from
+    INSIDE a manual-mode ``shard_map`` + ``lax.scan`` -- the composition
+    ``GemmPlan.__call__`` structurally cannot do (``matmul_plan.py``'s own
+    module docstring, "Composition inside a MANUAL-mode shard_map";
+    ``isdf.core._z_q_face``'s docstring names this as the reason its own
+    band-window reconstruction stays on a masked ``psum`` rather than a
+    SUMMA GEMM).  This is the real 4-rank CUDA proof that the composition
+    itself works -- numerics against a numpy reference, from inside a
+    manual ``shard_map`` body, streamed through ``lax.scan`` exactly like
+    a real r-chunk-shaped kernel, covering the internal-zero-C path, a
+    single donated-C accumulate call, ``out=``, and (case 5) C DONATED AS
+    THE SCAN CARRY ITSELF -- an accumulate-over-many-iterations shape no
+    other case here exercises, and the one composition closest to a real
+    production tau/q-accumulation kernel.
+    """
+    import jax
+    from functools import partial
+    from jax.sharding import PartitionSpec as P
+    from distrib_la._shard_map import shard_map
+
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    assert px == py, f"gemm_plan needs a square mesh; got {px}x{py}"
+    m = m if m is not None else 2 * px
+    k = k if k is not None else 3 * px
+    n = n if n is not None else 2 * px
+    rng = np.random.default_rng(20260822 + 7)
+    out = {}
+
+    plan = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                       backend="cublasmp")
+
+    # 1. One call, no scan, no jit around the shard_map (proves local_call
+    # needs neither) -- the minimal case showing the WRAPPER, not the FFI,
+    # was the obstacle.
+    A_np = _rng_mat(rng, (nq, m, k), dtype)
+    B_np = _rng_mat(rng, (nq, k, n), dtype)
+    A = _put(A_np, mesh, (None, "x", "y"))
+    B = _put(B_np, mesh, (None, "x", "y"))
+    want = A_np @ B_np
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 2,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_once(a, b):
+        return plan.local_call(a, b)
+
+    D_once = _gather(_manual_once(A, B))
+    out["manual_no_c"] = _rel(D_once, want)
+    assert out["manual_no_c"] < RTOL, out["manual_no_c"]
+
+    # 2. Inside lax.scan, streamed -- the actual r-chunk-shaped
+    # composition (isdf.core._z_q_face's per-band-chunk scan body): one
+    # shard_map entry wrapping many local_call invocations inside its
+    # scan body, all under one outer jax.jit.
+    A_stack_np = _rng_mat(rng, (nsteps, nq, m, k), dtype)
+    B_stack_np = _rng_mat(rng, (nsteps, nq, k, n), dtype)
+    A_stack = _put(A_stack_np, mesh, (None, None, "x", "y"))
+    B_stack = _put(B_stack_np, mesh, (None, None, "x", "y"))
+    want_scan = A_stack_np @ B_stack_np
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, None, "x", "y"),) * 2,
+             out_specs=P(None, None, "x", "y"), check_vma=False)
+    def _manual_scan(a_stack, b_stack):
+        def body(carry, ab):
+            a, b = ab
+            return carry, plan.local_call(a, b)
+        _, out_stack = jax.lax.scan(body, None, (a_stack, b_stack), unroll=1)
+        return out_stack
+
+    D_scan = _gather(jax.jit(_manual_scan)(A_stack, B_stack))
+    out["manual_scan_no_c"] = _rel(D_scan, want_scan)
+    assert out["manual_scan_no_c"] < RTOL, out["manual_scan_no_c"]
+
+    # 3. beta!=0 accumulate (donated C=), from inside the same manual
+    # shard_map -- donate_argnums=(2,) on the outer jit, mirroring
+    # _build_kernel's own fn_with_c contract, since C here IS a top-level
+    # jit argument (unlike the with_c=False path's internal jnp.zeros,
+    # which needs no donation to alias -- see _local_gemm_call).
+    plan_beta = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                            backend="cublasmp", beta=-0.5)
+    C_np = _rng_mat(rng, (nq, m, n), dtype)
+    C = _put(C_np, mesh, (None, "x", "y"))
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_c(a, b, c):
+        return plan_beta.local_call(a, b, C=c)
+
+    D_c = _gather(jax.jit(_manual_c, donate_argnums=(2,))(A, B, C))
+    want_c = A_np @ B_np + (-0.5) * C_np
+    out["manual_beta_accumulate"] = _rel(D_c, want_c)
+    assert out["manual_beta_accumulate"] < RTOL, out["manual_beta_accumulate"]
+
+    # 4. out= donation on a beta==0 plan, from inside the same manual
+    # shard_map.
+    scratch_np = _rng_mat(rng, (nq, m, n), dtype)
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_out(a, b, scratch):
+        return plan.local_call(a, b, out=scratch)
+
+    D_out = _gather(jax.jit(_manual_out, donate_argnums=(2,))(
+        A, B, _put(scratch_np, mesh, (None, "x", "y"))))
+    out["manual_out_donated"] = _rel(D_out, want)
+    assert out["manual_out_donated"] < RTOL, out["manual_out_donated"]
+
+    # 5. C AS THE lax.scan CARRY ITSELF (not a scan-stacked output like
+    # case 2, and not a single call outside scan like case 3) --
+    # carry_{i+1} = A_i@B_i + beta*carry_i, accumulated over nsteps scan
+    # iterations, the FFI's own input_output_aliases={2:0} donation
+    # composing with scan's own carry-buffer reuse.  This is the one
+    # untested cell in the task's own "FFI lifetime hazards ... across
+    # scan iterations" concern: case 2 proved repeated create/destroy of
+    # cuBLASMp's per-call descriptors against the SAME persistent
+    # ctx/workspace is safe under scan, but never donated C THROUGH the
+    # carry; case 3 proved donated-C accumulate but only as a single
+    # call, never repeated.  A production accumulate-over-tau/q pattern
+    # is shaped exactly like this case.
+    # beta stays REAL (like case 3's -0.5): gemm_plan refuses a complex
+    # alpha/beta on a real dtype (float64 is one of this cell's two
+    # dtypes -- caught by exactly that guard on the first attempt here,
+    # which used a complex beta and silently dropped float64 coverage of
+    # this case instead of erroring).
+    beta5 = -0.75
+    plan_beta2 = D.gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                             backend="cublasmp", beta=beta5)
+    C0_np = _rng_mat(rng, (nq, m, n), dtype)
+    carry_want = C0_np.copy()
+    for i in range(nsteps):
+        carry_want = A_stack_np[i] @ B_stack_np[i] + beta5 * carry_want
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, None, "x", "y"),) * 2 + (P(None, "x", "y"),),
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def _manual_scan_carry(a_stack, b_stack, c0):
+        def body(carry, ab):
+            a, b = ab
+            return plan_beta2.local_call(a, b, C=carry), None
+        final_carry, _ = jax.lax.scan(body, c0, (a_stack, b_stack), unroll=1)
+        return final_carry
+
+    D_carry = _gather(jax.jit(_manual_scan_carry, donate_argnums=(2,))(
+        A_stack, B_stack, _put(C0_np, mesh, (None, "x", "y"))))
+    out["manual_scan_carry_donation"] = _rel(D_carry, carry_want)
+    assert (out["manual_scan_carry_donation"] < RTOL
+           ), out["manual_scan_carry_donation"]
+
+    return out
+
+
 class _raises:
     """``pytest.raises`` that also works in the pytest-free CLI mode."""
 
@@ -701,6 +1022,11 @@ def test_cusolvermp_factor_solve_token_round_trip():
     check_cusolvermp_factor_solve(_needs("cholesky", "cusolvermp", "gpu"))
 
 
+def test_cusolvermp_lu_factor_solve_token_round_trip():
+    check_cusolvermp_lu_factor_solve(
+        _needs("solve_lu", "cusolvermp", "gpu"))
+
+
 def test_slate_factor_solve_first_execution():
     """The SLATE trsm back-solve, at 1x1.  Its 2x2 execution is leg L-c."""
     check_slate_factor_solve(_needs("cholesky", "slate", "cpu"))
@@ -729,6 +1055,47 @@ def test_batched_eigh_dispatch_gate_native_arm():
 def test_batch_reshard_local_ops_smoke():
     """The real staged movement is the P=4 CLI cell of the same body."""
     check_batch_reshard_local_ops(_mesh_1x1("cpu"), nq=5, n=16, nrhs=8)
+
+
+def test_gemm_plan_cublasmp_smoke():
+    """Single-GPU smoke of the planned surface; real 2x2 numerics, nested
+    jit/scan and the donated paths are leg L-c's ``gemm_plan_cublasmp``
+    cell -- ``gemm_plan`` itself refuses a 1x1-only irrelevant geometry
+    nowhere, so this cell is real coverage, not a placeholder."""
+    import jax
+    try:
+        jax.devices("gpu")
+    except Exception as exc:                                     # noqa: BLE001
+        pytest.skip(f"no CUDA backend here ({exc}); covered by leg L-c")
+    mesh = _mesh_1x1("gpu")
+    try:
+        D.resolve_matmul_backend("cublasmp", mesh)
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(
+            f"cublasmp not usable on a 1x1 CUDA mesh: {exc}  Covered by "
+            f"leg L-c (lx run -n 4 ... --mesh 2x2) where the library is "
+            f"pinned and there are four ranks")
+    check_gemm_plan_cublasmp(mesh, nq=2, m=2, k=3, n=2)
+
+
+def test_gemm_plan_manual_shard_map_smoke():
+    """Single-GPU smoke of ``GemmPlan.local_call`` inside a manual
+    shard_map; real 2x2 numerics under lax.scan are leg L-c's
+    ``gemm_plan_manual_shard_map`` cell."""
+    import jax
+    try:
+        jax.devices("gpu")
+    except Exception as exc:                                     # noqa: BLE001
+        pytest.skip(f"no CUDA backend here ({exc}); covered by leg L-c")
+    mesh = _mesh_1x1("gpu")
+    try:
+        D.resolve_matmul_backend("cublasmp", mesh)
+    except (ValueError, RuntimeError) as exc:
+        pytest.skip(
+            f"cublasmp not usable on a 1x1 CUDA mesh: {exc}  Covered by "
+            f"leg L-c (lx run -n 4 ... --mesh 2x2) where the library is "
+            f"pinned and there are four ranks")
+    check_gemm_plan_manual_shard_map(mesh, nq=2, m=2, k=3, n=2)
 
 
 def test_batch_reshard_matmul_smoke():
@@ -784,6 +1151,8 @@ _CLI_CELLS = [
      lambda mesh, dt: check_slate_factor_solve(mesh, dt)),
     ("cusolvermp_factor_solve", "CUDA",
      lambda mesh, dt: check_cusolvermp_factor_solve(mesh, dt)),
+    ("cusolvermp_lu_factor_solve", "CUDA",
+     lambda mesh, dt: check_cusolvermp_lu_factor_solve(mesh, dt)),
     ("cusolvermp_hostile_extents", "CUDA",
      lambda mesh, dt: check_hostile_extents_through_the_ffi(
          mesh, dt, backend="cusolvermp", op="solve_lu")),
@@ -803,6 +1172,10 @@ _CLI_CELLS = [
     ("matmul_slate", "",
      lambda mesh, dt: check_distributed_matmul(
          mesh, dt, backend="slate", batched_route="auto", nq=4)),
+    ("gemm_plan_cublasmp", "CUDA",
+     lambda mesh, dt: check_gemm_plan_cublasmp(mesh, dt)),
+    ("gemm_plan_manual_shard_map", "CUDA",
+     lambda mesh, dt: check_gemm_plan_manual_shard_map(mesh, dt)),
 ]
 
 

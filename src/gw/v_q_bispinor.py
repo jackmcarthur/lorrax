@@ -11,10 +11,10 @@ are CURRENT densities ψ† α^i ψ (not spin densities — α^i couples the
 large and small bispinor components).  We work in Coulomb gauge, where
 the photon propagator couples the four channels by
 
-    V^{μ_L,ν_L}_q(μ,ν) = Σ_K  ζ̄_{μ_L,μ}(K) · t^{μ_L,ν_L}(K) · v(K) · ζ_{ν_L,ν}(K)
-    t^{0,0}      = 1
-    t^{i,j}      = δ_ij − K̂_i K̂_j        (transverse projector)
-    t^{0,i}=t^{i,0} = 0                    (Coulomb-gauge cross term)
+    V^{μ_L,ν_L}_q(μ,ν) = Σ_K  ζ̄_{μ_L,μ}(K) · d^{μ_L,ν_L}(K) · v(K) · ζ_{ν_L,ν}(K)
+    d^{0,0}      = 1
+    d^{i,j}      = −(δ_ij − K̂_i K̂_j)       (spatial metric × projector)
+    d^{0,i}=d^{i,0} = 0                    (Coulomb-gauge cross term)
 
 so out of the 16 (μ_L, ν_L) blocks:
     6 zero by gauge — never computed.
@@ -77,7 +77,7 @@ HERMITIAN_PAIRS: dict[tuple[int, int], tuple[int, int]] = {
     (3, 2): (2, 3),
 }
 
-V_QMUNU_FORMAT = "bispinor_lorentz_v1"
+V_QMUNU_FORMAT = "bispinor_lorentz_v2"
 
 
 def tile_dataset_name(mu_L: int, nu_L: int) -> str:
@@ -97,6 +97,47 @@ def tile_dataset_name(mu_L: int, nu_L: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _tt_head_tensor(
+    *, bvec: np.ndarray, cell_volume: float, sys_dim: int, kgrid,
+) -> np.ndarray:
+    """``T_ab = ⟨v(q) P^T_ab(q̂)⟩_mBZ`` at q=Γ, BARE units.
+
+    The missing q=Γ, G=0 slot of the bare TT tiles — see
+    ``_make_per_q_v_builder_for_tile``'s ``tt_head_correction`` docstring
+    and ``docs/BISPINOR_DHFB_DESIGN.md`` §11.  One (3,3) tensor call per
+    run (not per tile, not per q); callers slice ``T[i, j]``.  Routed
+    through the same ``vcoul`` mini-BZ sampler ``q0_average`` uses for the
+    charge head's ``vc0`` — no second sampler.  This helper owns the
+    positive geometric projector average; the returned TT propagator applies
+    the Coulomb-gauge spatial-metric minus once, after the optional head-slot
+    replacement, in ``_make_per_q_v_builder_for_tile``.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    import vcoul
+    if int(sys_dim) not in (2, 3):
+        raise ValueError(
+            f"_tt_head_tensor: tt_head_correction is only implemented for "
+            f"sys_dim in (2, 3) (slab / bulk); got sys_dim={sys_dim}.  Box "
+            f"truncation (sys_dim=0) never zeros its q=Γ, G=0 slot, so it "
+            f"needs no head substitute (vcoul.box_0d.Box0D._v_bare_per_q's "
+            f"own docstring) — this should have been refused upstream by "
+            f"gw_config's bispinor_tt_head_correction validation.")
+    geometry = vcoul.CoulombGeometry(
+        bvec=np.asarray(bvec, dtype=np.float64), cell_volume=float(cell_volume))
+    kernel = vcoul.get_kernel(sys_dim)
+    return np.asarray(
+        kernel.q0_average_transverse_tensor(
+            geometry, tuple(int(s) for s in kgrid),
+            # Bulk v(q)~1/q^2 gives the pure-Sobol estimator infinite
+            # variance; Bulk3D's owner requires its analytic sphere term
+            # for a production head.  The slab sibling deliberately keeps
+            # that 3D term off (its flag only widens the Voronoi fold).
+            analytic_sphere=(int(sys_dim) == 3),
+        ),
+        dtype=np.float64)
+
+
 def _make_per_q_v_builder_for_tile(
     *,
     mu_L: int, nu_L: int,
@@ -104,18 +145,52 @@ def _make_per_q_v_builder_for_tile(
     vcoul_cutoff_ry: float | None,
     bdot: np.ndarray | None = None,
     eps_K2: float = 1e-30,
+    kgrid=None,
+    tt_head_correction: bool = False,
 ):
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
     CC tile (μ_L=ν_L=0): bare Coulomb ``v(q+G)`` (real, ≥0).
-    TT diagonal (i=j): ``v(q+G) · (1 − K̂_i²)``.
-    TT off-diagonal (i≠j): ``v(q+G) · (−K̂_i K̂_j)``.
+    TT diagonal (i=j): ``−v(q+G) · (1 − K̂_i²)``.
+    TT off-diagonal (i≠j): ``+v(q+G) · K̂_i K̂_j``.
 
     The ``K̂`` factor uses ``K2_safe = max(|q+G|², eps_K2)`` to keep
     the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
     (compute_v_q_per_G guards ``denom_zero``), so the product is zero
     regardless of t.  Head correction at q=Γ flows through the CC
-    tile's ``g0_acc``; transverse tiles intentionally omit it.
+    tile's ``g0_acc``; transverse tiles intentionally omit it —
+    UNLESS ``tt_head_correction=True``.
+
+    ``tt_head_correction`` (default False, byte-identical to every
+    existing deck when off).  The charge structure factor obeys
+    ``M_mn(q→0, G=0) → δ_mn``, an exact identity independent of direction,
+    so replacing the zeroed CC slot needs only the scalar cell average
+    ``⟨v⟩``.  The CURRENT structure factor ``⟨m|α^i|n⟩`` has no such
+    limit — it is finite and generically non-diagonal — and the bare
+    transverse propagator's projector ``P^T_ij(K̂) = δ_ij − K̂_iK̂_j`` is
+    direction-dependent with NO limit as K→0 either.  A single grid point
+    (the zeroed q=Γ, G=0 slot) cannot represent either fact, and the
+    measured correction is not negligible: on the bi4 (MoS2 4×4) deck the
+    missing rank-1 head is comparable in Frobenius norm to the WHOLE
+    stored q=Γ TT slab (ratio 0.97/1.04/6.0 for the 11/22/33 tiles) and
+    the eqp effect is ≈0.2 meV at 4×4, decaying only as ~1/√N_k — the same
+    slow 2D decay that makes the charge head correction mandatory
+    (``KNOWN_LORRAX_ISSUES.md``, bispinor row; claim 41, job 7885325).
+
+    When on, the q=Γ, G=0 slot of a TT tile is replaced by the mini-BZ
+    Voronoi cell average ``−⟨v(q) P^T_ij(q̂)⟩_mBZ``
+    (:func:`_tt_head_tensor`) instead of being left at zero.  This is the
+    SAME mechanism the CC
+    charge exchange head uses conceptually — a mini-BZ-averaged
+    replacement for an otherwise-undefined q→0 grid point — expressed at
+    the SAME site the value already flows through: the returned
+    ``v_per_G`` table.  No second Dyson/Σ code path is added; the
+    existing ``(μ,ν)`` convolution (``gw.v_q_g_flat``) and the existing
+    Σ^B kernel (``gw.sigma_x_bispinor``) consume the corrected tile
+    exactly as they consume any other value in it, which is what makes
+    this a rank-1 update in centroid space after the ``Σ_G`` contraction
+    (``ζ(q=Γ,μ,G=0)`` is the only nonzero-weight ζ row at that slot) even
+    though nothing here builds ``ζ`` or an outer product explicitly.
     """
     from .compute_vcoul import compute_v_q_per_G
 
@@ -126,7 +201,27 @@ def _make_per_q_v_builder_for_tile(
                 f"_make_per_q_v_builder_for_tile: TT tile indices must "
                 f"satisfy 1 ≤ μ_L, ν_L ≤ 3; got ({mu_L}, {nu_L}).")
         i, j = mu_L - 1, nu_L - 1
+        from ffi import _services
+        _services.ensure_on_path()
+        from vcoul import COULOMB_GAUGE_TT_SIGN, transverse_projector
+        tt_metric_sign = float(COULOMB_GAUGE_TT_SIGN)
     bvec_f = np.asarray(bvec, dtype=np.float64)
+
+    _tt_correction_value = None
+    if tt_head_correction and not is_CC:
+        if kgrid is None:
+            raise ValueError(
+                "_make_per_q_v_builder_for_tile: tt_head_correction=True "
+                "needs kgrid (the mini-BZ Voronoi cell is defined by the "
+                "q-grid).")
+        T = _tt_head_tensor(
+            bvec=bvec_f, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
+        # Bare (T) -> the same "v(q+G)/Ω_cell already applied" convention
+        # compute_v_q_per_G's output carries (vcoul.base.CoulombKernel's
+        # own Protocol docstring) — divide by cell_volume ONCE, here, not
+        # inside the shared vcoul estimator (whose contract is explicitly
+        # bare, matching minibz_average/minibz_moment_tensor).
+        _tt_correction_value = complex(T[i, j] / float(cell_volume))
 
     def builder(q_irr_frac, gvec_components):
         v = compute_v_q_per_G(
@@ -142,10 +237,18 @@ def _make_per_q_v_builder_for_tile(
                     + np.asarray(gvec_components, dtype=np.float64))
         K_cart = np.einsum('ba,qbg->qag', bvec_f, qG_frac)
         K2 = np.sum(K_cart * K_cart, axis=1)             # (n_q, ngkmax)
-        K2_safe = np.where(K2 > eps_K2, K2, 1.0)
-        Khat_ij = K_cart[:, i] * K_cart[:, j] / K2_safe
-        t = (1.0 - Khat_ij) if i == j else -Khat_ij
-        return (v * t).astype(np.complex128)
+        is_gamma_slot = K2 <= eps_K2                     # unique (q=Γ,G=0)
+        t = transverse_projector(
+            np.moveaxis(K_cart, 1, -1), K2, eps_K2=eps_K2)[:, :, i, j]
+        # Assemble the positive transverse-projector weight first so the
+        # finite-q body and optional mini-BZ replacement share one, and only
+        # one, Coulomb-gauge spatial-metric sign below.  Stored currents use
+        # j^i = Psi† alpha^i Psi; no vertex or Sigma contraction compensates
+        # this propagator sign.
+        v_t = (v * t).astype(np.complex128)
+        if _tt_correction_value is not None:
+            v_t = np.where(is_gamma_slot, _tt_correction_value, v_t)
+        return tt_metric_sign * v_t
 
     return builder
 
@@ -179,7 +282,16 @@ def compute_V_q_bispinor_g_flat_to_h5(
     centroid_C_idx: np.ndarray | None = None,
     centroid_T_idx: np.ndarray | None = None,
     use_ibz: bool = False,
-) -> Path:
+    # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction
+    # (default off — every existing deck's TT tiles are byte-identical).
+    # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
+    tt_head_correction: bool = False,
+    # Present only for the explicit mixed-representation comparison.  Leaving
+    # these unset preserves the historical bare_transverse artifact exactly.
+    bispinor_gw_mode: str | None = None,
+    charge_representation: str | None = None,
+    spatial_current_representation: str | None = None,
+) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
 
@@ -190,10 +302,13 @@ def compute_V_q_bispinor_g_flat_to_h5(
     :func:`gw.v_q_g_flat._compute_V_q_g_flat_one_tile`; this function
     is just the 7-tile loop + per-tile HDF5 plumbing.
 
-    Bispinor ζ files are written full-BZ (see ``gw_init.fit_zeta``
-    `write_ibz_only=False` for the transverse μ_L=1..3 channels and
-    charge under ``cfg.bispinor=True``), so we don't pass ``sym`` /
-    ``centroid_indices``; the helper iterates the full BZ.
+    Each centroid family follows its resolved full-BZ/IBZ path.  The returned
+    four-channel tuple is the derived literal-G=0 view produced at the same
+    projection seam as V.  It is not persisted beside V: canonical
+    ``zeta_q_G`` remains the sole source of truth.  On an IBZ source, the
+    symmetry service reconstructs the exact parent G coefficient and applies
+    the scalar or polar-vector action; the writer owns no q map, centroid
+    action or Cartesian rotation.
 
     The reader :class:`BispinorVqReader` opens this on-disk format.
     """
@@ -250,6 +365,22 @@ def compute_V_q_bispinor_g_flat_to_h5(
     _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')
     _ibz_T, _use_ibz_T = _ibz_tables_for(centroid_T_idx, 'transverse')
 
+    # ONE measured q-row policy for every bispinor consumer: CC, TT operator
+    # mixing and all four one-leg vectors.  In particular, a ferromagnet's
+    # policy contains no antiunitary rows; no tile may fall back to the raw
+    # ``sym.sym_idx_q`` table and take a second TRS decision.
+    qgrid_policy = None
+    if (_use_ibz_C or _use_ibz_T) and sym is not None:
+        from .qgrid_symmetry import qgrid_trs_policy_for
+        qgrid_policy = qgrid_trs_policy_for(
+            sym=sym,
+            irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
+            sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            kgrid=tuple(kgrid),
+            n_sym_spatial=int(np.asarray(sym.sym_matrices).shape[0]),
+            context="bispinor V / one-leg",
+        )
+
     # Buffer the 6 unique TT tiles post-unfold so we can apply the 3×3
     # Lorentz mixing across them before writing.  CC tile streams straight
     # to disk — no mixing.  Decision: write-time mixing keeps the on-disk
@@ -260,6 +391,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # mixing keeps the reader's per-tile contract clean.  See derivation
     # §A5 (the algebraic identity for V^{i,j}_full[q]).
     tt_buffer: dict[tuple[int, int], jax.Array] = {}
+    tt_g0 = None
+    g0_by_channel: list[jax.Array | None] = [None, None, None, None]
 
     for tile_idx, (mu_L, nu_L) in enumerate(UNIQUE_TILES):
         same_zeta = (mu_L == nu_L)
@@ -269,8 +402,12 @@ def compute_V_q_bispinor_g_flat_to_h5(
                            else zeta_T_loaders[nu_L - 1]))
         n_rmu_L = n_rmu_C if mu_L == 0 else n_rmu_T
         n_rmu_R = n_rmu_C if nu_L == 0 else n_rmu_T
-        write_g0 = (mu_L == 0 and nu_L == 0)
         is_CC = (mu_L == 0 and nu_L == 0)
+        # g0 is a one-leg zeta coefficient, so diagonal tiles are its sole
+        # producer.  On the transverse IBZ path each streamed source
+        # component returns its contributions to all three target Cartesian
+        # channels; only those three small carriers are accumulated.
+        write_g0 = same_zeta
 
         # CC tile: charge-centroid orbit closure.  TT tiles: transverse-
         # centroid orbit closure.  These are independent; either may
@@ -283,10 +420,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
             mu_L=mu_L, nu_L=nu_L,
             bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim,
             vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot,
+            kgrid=kgrid, tt_head_correction=tt_head_correction,
         )
         # BGW vcoul overlay only meaningful on the CC tile; transverse
         # tiles are pure projector applications.  Wrap the builder.
-        if write_g0 and bgw_v_grid_fn is not None:
+        if is_CC and bgw_v_grid_fn is not None:
             _base = v_builder
             nx, ny, nz = (int(s) for s in fft_grid)
 
@@ -319,10 +457,30 @@ def compute_V_q_bispinor_g_flat_to_h5(
             mesh_xy=mesh_xy,
             g_chunk=g_chunk,
             sym=_tile_sym, centroid_indices=_tile_cent,
+            is_charge_cc=is_CC,
             write_g0=write_g0,
+            qgrid_policy=qgrid_policy,
+            one_leg_action=(
+                "polar" if (same_zeta and mu_L != 0 and _tile_use_ibz)
+                else "scalar"),
+            source_component=(
+                mu_L - 1 if (same_zeta and mu_L != 0 and _tile_use_ibz)
+                else None),
             timing_label=tile_dataset_name(mu_L, nu_L),
             verbose=verbose,
         )
+
+        if (same_zeta and mu_L != 0 and _use_ibz_T
+                and g0_acc is not None):
+            tt_g0 = g0_acc if tt_g0 is None else tt_g0 + g0_acc
+            del g0_acc
+            g0_acc = None
+
+        # Keep the literal-G=0 view in memory at its projection owner.  The
+        # transverse IBZ case is filled after its three source components are
+        # rotated and accumulated by the symmetry service below.
+        if same_zeta and g0_acc is not None:
+            g0_by_channel[mu_L] = g0_acc
 
         if is_CC or not _use_ibz_T:
             # Two cases stream straight to disk per-tile:
@@ -339,12 +497,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_acc.dtype)
                 tile_io.write_slab(name, V_acc)
-                if write_g0 and g0_acc is not None:
-                    g0_logical_shape = (int(g0_acc.shape[0]), n_rmu_L)
-                    tile_io.create_dataset(
-                        f"{name}_g0", shape=g0_logical_shape,
-                        dtype=g0_acc.dtype)
-                    tile_io.write_slab(f"{name}_g0", g0_acc)
             del V_acc, g0_acc
         else:
             # Buffer for post-loop Lorentz mixing (IBZ cascade active on
@@ -372,7 +524,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
         tt_mixed = mix_channels_by_proper_rotation(
             tt_full_in,
-            sym_idx=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            sym_idx=np.asarray(
+                qgrid_policy.unfold_sym_idx, dtype=np.int32),
             R_proper_table=np.asarray(sym.R_proper, dtype=np.float64),
             mesh_xy=mesh_xy,
         )
@@ -389,8 +542,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 tile_io.create_dataset(
                     name, shape=v_logical_shape, dtype=V_mix.dtype)
                 tile_io.write_slab(name, V_mix)
+                if mu_L == nu_L:
+                    if tt_g0 is None:
+                        raise RuntimeError(
+                            "bispinor transverse IBZ one-leg accumulation "
+                            "is missing despite three diagonal source tiles.")
+                    g0_by_channel[mu_L] = tt_g0[mu_L - 1]
         del tt_full_in, tt_mixed
-    del tt_buffer
+    del tt_buffer, tt_g0
 
     # Format string + tile-layout JSON — rank-0 post-close write so
     # the BispinorVqReader can h5-open without rank coordination.
@@ -404,8 +563,22 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 [list(t) for t in sorted(ZERO_TILES)])
             f.attrs["hermitian_pairs"] = json.dumps(
                 [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
+            if bispinor_gw_mode is not None:
+                f.attrs["bispinor_gw_mode"] = str(bispinor_gw_mode)
+            if charge_representation is not None:
+                f.attrs["charge_representation"] = str(
+                    charge_representation)
+            if spatial_current_representation is not None:
+                f.attrs["spatial_current_representation"] = str(
+                    spatial_current_representation)
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
-    return output_h5_path
+    if any(vector is None for vector in g0_by_channel):
+        missing = [i for i, vector in enumerate(g0_by_channel)
+                   if vector is None]
+        raise RuntimeError(
+            "bispinor literal-G=0 projection did not produce channels "
+            f"{missing}")
+    return output_h5_path, tuple(g0_by_channel)
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +598,6 @@ class BispinorVqReader:
                                        For Hermitian-redundant tiles
                                        reads the companion + applies
                                        ``conj(swapaxes(.., -1, -2))``.
-    * ``get_g0_CC()``                — charge-channel q=0 head
-                                       (n_rmu_C,) c128 or None.
-
     Caller manages the lifecycle (use as a context manager).
     """
 
@@ -437,14 +607,13 @@ class BispinorVqReader:
         import h5py
         self._filename = Path(filename)
         self._mesh = mesh_xy
-        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
-)
-        self._io.__enter__()
 
         # Small metadata scalars are written via SlabIO.write_attr (which
         # creates a dataset in the file).  Read them via h5py — every rank
         # opens its own 'r' handle for a few-byte read; broadcast overhead
-        # would dominate.
+        # would dominate.  Validate all metadata before opening SlabIO: its
+        # constructor opens a collective PhdfCtx which only __exit__ can
+        # close, so a constructor-time refusal must happen first.
         with h5py.File(self._filename, "r") as f:
             def _read_scalar(name):
                 d = f[name]
@@ -453,17 +622,20 @@ class BispinorVqReader:
             fmt = _read_scalar("v_qmunu_format")
             if isinstance(fmt, bytes):
                 fmt = fmt.decode("utf-8")
+            if str(fmt) != V_QMUNU_FORMAT:
+                raise ValueError(
+                    f"{self._filename}: v_qmunu_format='{fmt}', "
+                    f"expected '{V_QMUNU_FORMAT}'.  Wrong file or stale "
+                    f"format from a different LORRAX revision."
+                )
             self.kgrid = tuple(int(x) for x in _read_scalar("kgrid"))
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))
             self.n_rmu_T = int(_read_scalar("n_rmu_T"))
             self.n_q_total = int(_read_scalar("n_q_total"))
 
-        if str(fmt) != V_QMUNU_FORMAT:
-            raise ValueError(
-                f"{self._filename}: v_qmunu_format='{fmt}', "
-                f"expected '{V_QMUNU_FORMAT}'.  Wrong file or stale "
-                f"format from a different LORRAX revision."
-            )
+        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy,
+)
+        self._io.__enter__()
 
     def __enter__(self):
         return self
@@ -524,10 +696,15 @@ class BispinorVqReader:
             companion = HERMITIAN_PAIRS[(mu_L, nu_L)]
             n_L_c, n_R_c = self._tile_shape(*companion)[1:]
             n_L_p, n_R_p = self._padded_shape_LR(n_L_c, n_R_c)
+            # Read the companion with its two centroid axes reversed so the
+            # physical Hermitian transpose below lands directly on this
+            # reader's canonical P(None, 'x', 'y') contract.  Reading in the
+            # ordinary orientation and then swapping would return
+            # P(None, 'y', 'x') and force every consumer to repair it.
             V_companion = self._io.read_slab(
                 tile_dataset_name(*companion),
                 shape=(self.n_q_total, n_L_p, n_R_p),
-                mesh=self._mesh, partition_spec=spec)
+                mesh=self._mesh, partition_spec=P(None, 'y', 'x'))
             # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
             return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
         # Direct read (member of UNIQUE_TILES)
@@ -537,19 +714,6 @@ class BispinorVqReader:
             tile_dataset_name(mu_L, nu_L),
             shape=(self.n_q_total, n_L_p, n_R_p),
             mesh=self._mesh, partition_spec=spec)
-
-    def get_g0_CC(self) -> jax.Array | None:
-        """q=0 head for the charge channel only.  None if absent."""
-        try:
-            n_L = int(self.n_rmu_C)
-            n_L_p, _ = self._padded_shape_LR(n_L, n_L)
-            return self._io.read_slab(
-                tile_dataset_name(0, 0) + "_g0",
-                shape=(self.n_q_total, n_L_p),
-                mesh=self._mesh,
-                partition_spec=P(None, 'x'))
-        except Exception:
-            return None
 
     @property
     def filename(self) -> Path:

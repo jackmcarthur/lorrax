@@ -93,20 +93,25 @@ def _pad(G, ngkmax):
 # ---------------------------------------------------------------------------
 
 def test_g_lookup_padded_matches_ragged_on_the_physical_prefix():
-    from psp.get_dipole_mtxels import _build_g_lookup
+    from common.parallel_transport import build_g_wrap_lookup
 
     G_k = _sphere(11, 29)
     G_can = _sphere(12, 33)
     ngk_k, ngk_can = int(G_k.shape[0]), int(G_can.shape[0])
     ngkmax = 40
+    ref_width = max(ngk_k, ngk_can) + 1
+    Gr_k, _ = _pad(G_k, ref_width)
+    Gr_can, _ = _pad(G_can, ref_width)
     Gp_k, _ = _pad(G_k, ngkmax)
     Gp_can, _ = _pad(G_can, ngkmax)
     G_wrap = np.asarray([1, 0, -1], dtype=np.int32)
 
-    ref_map, ref_mask = _build_g_lookup(G_can, G_k, G_wrap,
-                                         ngk_kmq=ngk_can, ngk_k=ngk_k)
-    pad_map, pad_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                         ngk_kmq=ngk_can, ngk_k=ngk_k)
+    ref_map, ref_mask = build_g_wrap_lookup(
+        Gr_can, Gr_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
+    pad_map, pad_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
 
     assert pad_map.shape == (ngkmax,) and pad_mask.shape == (ngkmax,)
     assert np.array_equal(pad_map[:ngk_k], ref_map[:ngk_k])
@@ -125,7 +130,7 @@ def test_g_lookup_pad_rows_would_alias_a_real_bra_G_without_the_extent():
     unlike everywhere else in the D10 work, the damage here is not a
     doubled Γ but a spurious cross term between two different G.
     """
-    from psp.get_dipole_mtxels import _build_g_lookup
+    from common.parallel_transport import build_g_wrap_lookup
 
     G_k = _sphere(21, 25)
     G_can = _sphere(22, 30)
@@ -136,11 +141,13 @@ def test_g_lookup_pad_rows_would_alias_a_real_bra_G_without_the_extent():
     # Pick a shift that IS in the bra sphere, so a pad row resolves.
     G_wrap = np.asarray(G_can[5], dtype=np.int32)
 
-    good_map, good_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                           ngk_kmq=ngk_can, ngk_k=ngk_k)
+    good_map, good_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngk_can, ngk_center=ngk_k)
     # NEGATIVE CONTROL: pretend the whole padded width is physical.
-    bad_map, bad_mask = _build_g_lookup(Gp_can, Gp_k, G_wrap,
-                                         ngk_kmq=ngkmax, ngk_k=ngkmax)
+    bad_map, bad_mask = build_g_wrap_lookup(
+        Gp_can, Gp_k, G_wrap,
+        ngk_neighbor=ngkmax, ngk_center=ngkmax)
 
     assert not good_mask[ngk_k:].any(), "pad rows must be gated off"
     assert bad_mask[ngk_k:].any(), (
@@ -232,6 +239,9 @@ def test_build_vnl_kdata_zeroes_Z_on_the_pad(monkeypatch):
         def ngk_valid(self, *, k="full_bz"):
             return np.asarray([ngk], dtype=np.int32)
 
+        def kvecs(self, *, k="full_bz"):
+            return np.zeros((1, 3), dtype=np.float64)
+
     monkeypatch.setattr(dop, "_as_loader", lambda w: _Loader())
 
     total_R = 3
@@ -278,14 +288,21 @@ class _FakeWfn:
         self.nelec, self.nspinor, self.nbands = nelec, nspinor, nbands
 
 
-def _write_stamped(path, wfn, **kw):
+def _write_stamped(path, wfn, *, nb_written=4, dataset_nb=None,
+                   finite_q=False, **kw):
     import h5py
     from psp.get_dipole_mtxels import stamp_dipole_provenance
 
+    dataset_nb = int(nb_written if dataset_nb is None else dataset_nb)
     with h5py.File(str(path), "w") as h5:
-        h5.create_dataset("dipole_cart", data=np.zeros((3, 1, 1, 1)))
+        h5.create_dataset(
+            "dipole_cart", data=np.zeros((3, 1, dataset_nb, dataset_nb)))
+        h5.create_dataset(
+            "deltaE", data=np.zeros((1, dataset_nb, dataset_nb)))
+        if finite_q:
+            h5.create_group("finite_q")
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
-                                 nb_written=4, bispinor=False,
+                                 nb_written=nb_written, bispinor=False,
                                  skip_vnl=False, vnl_mode="analytic", **kw)
 
 
@@ -294,9 +311,41 @@ def test_provenance_guard_accepts_its_own_stamp(tmp_path):
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
-    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=3, nband=8,
-                                    print_fn=lambda *a: None) is True
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
+                   vnl_velocity_sign=+1)
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=False, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=+1, print_fn=lambda *a: None) is True
+
+
+def test_provenance_guard_refuses_representation_or_vnl_sign_mismatch(
+        tmp_path, monkeypatch):
+    """Equal shapes do not make two velocity operators interchangeable."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(p, wfn, nval=2, ncond=3, nband=8,
+                   vnl_velocity_sign=+1)
+
+    representation_lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=True, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=+1,
+        print_fn=representation_lines.append) is False
+    assert any("prov_bispinor" in line for line in representation_lines)
+
+    sign_lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=8,
+        bispinor=False, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=-1,
+        print_fn=sign_lines.append) is False
+    assert any("prov_vnl_velocity_sign" in line for line in sign_lines)
 
 
 def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):
@@ -319,18 +368,124 @@ def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):
     assert any("DIFFERENT DFT solution" in ln for ln in lines)
 
 
-def test_provenance_guard_refuses_a_changed_band_window(tmp_path, monkeypatch):
+def test_provenance_guard_accepts_ncond_mismatch_at_identical_q0_extent(
+        tmp_path):
+    """ncond labels no smaller matrix when nband already sets the extent."""
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is True
+    assert any("producer ncond=3 differs" in ln
+               and "identical q→0 extent 8" in ln for ln in lines)
+
+
+def test_provenance_guard_refuses_unversioned_q0_operator_despite_coverage(
+        tmp_path, monkeypatch):
+    """Mode/sign alone cannot authenticate the pre-exact-origin operator."""
+    import h5py
     from common import sanity
     from psp.get_dipole_mtxels import check_dipole_provenance
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, nval=2, ncond=3, nband=8)
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+    with h5py.File(p, "r+") as h5:
+        del h5.attrs["prov_q0_operator_scheme"]
     lines = []
-    assert check_dipole_provenance(p, wfn=wfn, nval=2, ncond=5, nband=8,
-                                    print_fn=lines.append) is False
-    assert any("prov_ncond" in ln for ln in lines)
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("prov_q0_operator_scheme: file=<absent>" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_mismatch_that_changes_q0_extent(
+        tmp_path, monkeypatch):
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    # Producer extent max(nelec+ncond, nband) = max(6, 6) = 6;
+    # run extent max(7, 6) = 7.  Equal nband stamps do not make these files
+    # interchangeable.
+    _write_stamped(
+        p, wfn, nval=2, ncond=2, nband=6, nb_written=6)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=3, nband=6,
+        print_fn=lines.append) is False
+    assert any("prov_ncond" in ln and "run-resolved=7" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_mismatch_for_finite_q_payload(
+        tmp_path, monkeypatch):
+    """finite_q conduction data are literally sized by producer ncond."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8, finite_q=True)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("prov_ncond" in ln and "finite_q/ is present" in ln
+               for ln in lines)
+
+
+def test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short(
+        tmp_path, monkeypatch):
+    """A plausible coverage stamp cannot overrule the physical HDF5 axes."""
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8,
+        nb_written=8, dataset_nb=7)
+    lines = []
+    assert check_dipole_provenance(
+        p, wfn=wfn, nval=2, ncond=1, nband=8,
+        print_fn=lines.append) is False
+    assert any("dipole_cart shape=(3, 1, 7, 7)" in ln
+               and "deltaE shape=(1, 7, 7)" in ln for ln in lines)
+
+
+def test_provenance_guard_still_refuses_nval_or_nband_mismatch(
+        tmp_path, monkeypatch):
+    from common import sanity
+    from psp.get_dipole_mtxels import check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole.h5"
+    _write_stamped(
+        p, wfn, nval=2, ncond=3, nband=8, nb_written=8)
+
+    for change, spelling in (({"nval": 1}, "prov_nval"),
+                             ({"nband": 7}, "prov_nband")):
+        window = dict(nval=2, ncond=3, nband=8)
+        window.update(change)
+        lines = []
+        assert check_dipole_provenance(
+            p, wfn=wfn, print_fn=lines.append, **window) is False
+        assert any(spelling in ln for ln in lines)
 
 
 def test_provenance_guard_reports_an_unstamped_file(tmp_path):
@@ -529,6 +684,29 @@ def test_a_non_default_window_dipole_passes_its_own_provenance_guard(tmp_path):
                              wfn=wfn, print_fn=lines.append)
     assert any("provenance OK" in ln for ln in lines), lines
     assert not any("DIFFERENT DFT solution" in ln for ln in lines), lines
+
+
+def test_pauli_reference_head_refuses_raw_lift_dipole_receipt(tmp_path):
+    import h5py
+    import pytest
+    from common.four_current_model import (
+        PAULI_REFERENCE_BARE_TRANSVERSE_MODEL)
+    from gw.head_correction import _check_dipole_provenance
+
+    wfn = _FakeWfn()
+    p = tmp_path / "dipole_raw4.h5"
+    _write_stamped(p, wfn, **_NONDEFAULT_WINDOW)
+    with h5py.File(p, "r+") as h5:
+        h5.attrs["prov_bispinor"] = True
+    params = _head_params(**_NONDEFAULT_WINDOW)
+    params.update({
+        "bispinor_gw": PAULI_REFERENCE_BARE_TRANSVERSE_MODEL,
+        "_charge_bispinor": False,
+    })
+    with pytest.raises(
+            ValueError, match="pauli_reference_charge_dipole_provenance"):
+        _check_dipole_provenance(
+            p, params=params, wfn=wfn, print_fn=lambda *_args: None)
 
 
 def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):

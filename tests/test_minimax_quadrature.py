@@ -151,10 +151,13 @@ def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypa
     tau_hat = np.array([1.0, 2.0], dtype=np.float64)
     alpha_hat = np.array([0.25, 0.5], dtype=np.float64)
     err_hat = 5.0e-7
+    seen = {}
 
-    monkeypatch.setattr(
-        ms._mm, "serve",
-        lambda **kw: _served(tau_hat, alpha_hat, err_hat))
+    def _capture(**kw):
+        seen.update(kw)
+        return _served(tau_hat, alpha_hat, err_hat)
+
+    monkeypatch.setattr(ms._mm, "serve", _capture)
 
     quad = ms.solve_laplace_minimax_interval(
         2.0,
@@ -167,8 +170,54 @@ def test_solve_laplace_minimax_interval_uses_shipped_table_and_rescales(monkeypa
     np.testing.assert_allclose(quad.tau, tau_hat / 2.0)
     np.testing.assert_allclose(quad.alpha, alpha_hat / 2.0)
     assert quad.max_error == err_hat / 2.0
+    # target_error is physical.  The door serves the y=x/x_min problem,
+    # whose absolute error must be tighter by the inverse return rescale.
+    assert seen["error_bound"] == 2.0e-6
     # R2: the rule now says where it came from, and the driver prints it.
     assert "synthetic/fixture.npz" in quad.provenance
+
+
+def test_imag_laplace_lookup_and_fallback_share_physical_error_rescale(
+        monkeypatch):
+    """The beta selector and fallback door see the same scaled request.
+
+    This is the CrI3 regime ``x_min < 1 Ry`` that exposed the old mismatch:
+    a 1e-6 physical request must become 5e-8 on ``[1, R]``.  The achieved
+    scaled error is divided by the same x_min, so this deterministic kernel
+    fixture lands exactly on the requested physical bound.
+    """
+    x_min = 0.05
+    requested = 1.0e-6
+    err_hat = requested * x_min
+    select_seen = {}
+    serve_seen = {}
+
+    def _refuse(**kw):
+        select_seen.update(kw)
+        return ms._beta_selector.TableRefusal(
+            code="fixture", message="force the production fallback")
+
+    def _fallback(**kw):
+        serve_seen.update(kw)
+        return _served(
+            np.array([1.0], dtype=np.float64),
+            np.array([0.5], dtype=np.float64),
+            err_hat,
+            family="noncrossing_imag",
+            target="inverse_imag",
+            source="runtime-uncertified",
+        )
+
+    monkeypatch.setattr(ms._beta_selector, "select", _refuse)
+    monkeypatch.setattr(ms._mm, "serve", _fallback)
+
+    quad = ms.solve_laplace_minimax_imag_interval(
+        x_min, 5.0, 2.0, target_error=requested, max_nodes=64,
+        use_shipped_tables=True)
+
+    assert select_seen["target_error"] == requested * x_min
+    assert serve_seen["error_bound"] == requested * x_min
+    assert quad.max_error == requested
 
 
 def test_solve_phase_minimax_bandwidth_carries_the_crossing_table_unrescaled():

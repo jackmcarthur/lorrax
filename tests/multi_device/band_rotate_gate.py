@@ -164,7 +164,7 @@ def _make_old_rotate_bands(mesh):
     """``qsgw_density.rotate_bands``'s inner jit before the change."""
     m_on_x = NamedSharding(mesh, P(None, "x", None, None))
     U_sh = NamedSharding(mesh, band_rotation_spec())
-    from common.mtxel_sweep import band_sphere_spec
+    from common.wfn_layout import band_sphere_spec
     band_xy = NamedSharding(mesh, band_sphere_spec())
 
     @jax.jit
@@ -337,7 +337,7 @@ def main():
                 ok['6'] = ok['6'] and not bad
 
     # ---- 7. rotate_bands unchanged --------------------------------------
-    from common.mtxel_sweep import band_sphere_spec
+    from common.wfn_layout import band_sphere_spec
     psi_h = (rng.standard_normal((NK, nb, NS, NG))
              + 1j * rng.standard_normal((NK, nb, NS, NG))).astype(np.complex128)
     psi_d = _put(psi_h, mesh, band_sphere_spec())

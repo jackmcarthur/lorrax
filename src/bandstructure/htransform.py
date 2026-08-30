@@ -1,5 +1,4 @@
 import os
-import math
 import argparse
 import numpy as np
 
@@ -18,11 +17,9 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax
 import jax.numpy as jnp
-from jax.scipy import linalg as jsp_linalg
 from jax.scipy.special import erf
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from common.shard_map import shard_map
 from functools import partial
 
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
@@ -32,16 +29,18 @@ _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
-from common import rank_criterion
-from common import spectral_closure
 from common import timing
+from common.band_degeneracy import DEGENERACY_TOL_RY
 from common.units import RYD_TO_EV
-from runtime.padding import round_up
-from common.wfn_transforms import (
-    get_enk_bandrange, load_centroids_band_chunked, iter_psi_rchunk_bandwise,
-    load_psi_gflat_padded,
+from runtime.padding import round_up, spec_divisor
+from common.wfn_transforms import get_enk_bandrange
+from isdf.galerkin import (
+    fit_galerkin_basis,
+    galerkin_rank_record,
+    read_galerkin_basis,
+    validate_rank_multiplier,
+    write_galerkin_basis,
 )
-from isdf import factor_c_q
 # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE resolver;
 # this driver reads a raw params dict rather than a LorraxConfig, which is
 # exactly the case that function exists for.
@@ -52,18 +51,18 @@ from gw.gw_config import (
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
 )
-from common.fft_helpers import make_flat_k_ifftn
-# Q's r axis is split over the ('x','y') PRODUCT and its extent is an FFT-box
-# size, so it divides that product only by luck.  Raw, that is a refusal, not a
-# degradation — see the fitted ``sharding_q`` in streaming_galerkin_solve.
-from common.collectives import gather_to_host
-from common.sharding_fit import fit_sharding as _fit
+from common.fft_helpers import (
+    FLAT_K_FFT_VALUE_RTOL,
+    make_flat_k_fftn,
+    make_flat_k_ifftn,
+)
+# Q's free r axis is zero-padded through ``runtime.padding`` and split over
+# the full mesh product.  ``common.staged_reshard`` owns the exact
+# product-band → product-r exchange used to put streamed wavefunctions there.
+from common.collectives import device_put_process_local, gather_to_host
 from common.sharding_fit import padded_extent as _pad_to
-from common.sharding_fit import shard_factor as _shard_factor
 from runtime.production_stream import ProductionStdout
 from .production_report import HTransformProductionReport
-
-import symmetry_maps                                            # noqa: E402
 
 
 def _build_mesh_xy() -> Mesh:
@@ -86,90 +85,11 @@ def _build_mesh_xy() -> Mesh:
     return RUNTIME.mesh
 
 
-_accum_G_cache: dict = {}
-
-
-def _make_accum_kernel(rank_, bc_size, nspinor_, mesh_, rep_,
-                       psi_layout_, sharding_q_):
-    """One compiled Galerkin Q-accumulation kernel per static config.
-
-    THE psi INPUT SHARDING IS PINNED to Q's r layout (in_shardings), and
-    the explicit band->r transition (``_make_to_r_kernel``) is what puts
-    it there.  The historical kernel reshaped (nk, bc, ns, r_'y') to
-    (nk·bc, ns·r) — merging the replicated spinor axis with the sharded r
-    axis, which no NamedSharding can express — and then asked for
-    ('x','y')-sharded output columns.  The legacy SPMD partitioner cannot
-    synthesize that band-to-r exchange: at P16 it fell back to fully
-    replicating the 54.3-GiB c128[81,1,2,1406256] slab per 40-GB GPU and
-    OOMed (Perlmutter JID 57271407, "Involuntary full rematerialization",
-    125.60 GiB live).  With psi already r-sharded in Q's own layout and
-    the spinor axis kept SEPARATE, the contraction is purely
-    device-local: UH_bc is replicated, psi's contracted (nk·bc) rows are
-    all present locally, and each device writes only its own r block of
-    Q.  Module-level so the P>1 transition twin
-    (``tests/test_htransform_q_accum.py``) drives the production kernel,
-    not a re-implementation.
-    """
-    key = (id(mesh_), rank_, bc_size, nspinor_)
-    fn = _accum_G_cache.get(key)
-    if fn is not None:
-        return fn
-
-    @partial(jax.jit, donate_argnums=(2, 3),
-             in_shardings=(rep_, rep_, psi_layout_, sharding_q_),
-             out_shardings=sharding_q_)
-    def _accum(UH_bc, inv_s, psi_bc, Q_in):
-        # UH_bc: (rank, nk·bc) replicated; inv_s: (rank,1) replicated
-        # psi_bc: (nk, bc, ns, r) sharded P(None,None,None,r_entry)
-        nkv, bcv, nsv, rcv = psi_bc.shape
-        # Merge only the two REPLICATED leading axes; the sharded r
-        # axis and the spinor axis are never combined.
-        psi_flat = psi_bc.reshape(nkv * bcv, nsv, rcv)
-        Q = inv_s[:, :, None] * jnp.einsum(
-            'ak,ksr->asr', UH_bc, psi_flat, optimize=True)
-        return Q_in + Q
-
-    _accum_G_cache[key] = _accum
-    return _accum
-
-
-def _make_to_r_kernel(mesh_, psi_layout_):
-    """THE one explicit band-to-r all-to-all of the Galerkin stream.
-
-    Identity jit whose only job is the reshard: the loader hands each
-    band chunk band-sharded (or r-on-'y' after its own constraint),
-    and Q's accumulation wants it r-sharded in Q's exact fitted
-    layout.  Doing the movement in its OWN jit keeps it out of the
-    contraction's partitioning problem — the structural fix from
-    QUALITY_PATTERNS #4 (make the constraint structural, do not fight
-    the optimizer).  The input is donated: a reshard cannot alias,
-    but the source slab is dead the moment the copy exists.
-    """
-    key = ('to_r', id(mesh_), psi_layout_.spec)
-    fn = _accum_G_cache.get(key)
-    if fn is not None:
-        return fn
-    fn = jax.jit(lambda psi_bc: psi_bc, donate_argnums=(0,),
-                 out_shardings=psi_layout_)
-    _accum_G_cache[key] = fn
-    return fn
-
-
-# Ceiling on ONE streamed ψ band-chunk in the Galerkin build.
-#
-# ``iter_psi_rchunk_bandwise`` is called below with the whole r-axis
-# (r0 = 0, r_end = meta.n_rtot), so the only lever on the chunk's size is the
-# band count, and ``to_rchunk`` materialises the chunk as a single REPLICATED
-# (nk, bc, nspinor, n_rtot) complex128 array — it is not sharded by the mesh
-# (verified: the same allocation appears on a 1×1 and a 2×2 mesh).  One band of
-# it costs nk·nspinor·n_rtot·16 B, which is 0.81 GB/band on the converged MoS2
-# reference (nk=144, n_rtot=174 960).  So the historical fixed default of 64
-# bands per chunk asks for 51.6 GB, and even a 48-band window asks for 38.7 GB
-# — enough to OOM an A100-80GB once the BSE/GW restart tensors are resident.
-# The cap makes the default size-aware.  Splitting the band axis is NOT a pure
-# accumulation split — see the G-accumulation block below — so the loop sums
-# band chunks into Q first and only then forms Q Qᴴ; this constant therefore
-# changes memory and the number of ψ re-reads, never the result.
+# Per-device ceiling on one bounded whole-state real-space tile.  The
+# randomized sketch, exact selected-state Gram and physical projection all use
+# the canonical ``PsiGStore`` outer-r / inner-band stream; the shared planner
+# chooses one carrier that bounds their selected/random rows and WFN transform
+# workspace.  No full-r Galerkin basis is materialized.
 # Override with LORRAX_GALERKIN_CHUNK_GIB (GiB, float).
 #
 # Resolved INSIDE the consuming function, not at module scope: the old
@@ -182,7 +102,7 @@ def _make_to_r_kernel(mesh_, psi_layout_):
 
 
 def resolve_galerkin_chunk_bytes() -> int:
-    """``LORRAX_GALERKIN_CHUNK_GIB`` (GiB, float, default 6) in bytes.
+    """Per-device ``LORRAX_GALERKIN_CHUNK_GIB`` stream budget in bytes.
 
     Blank/unset → the default; garbage REFUSES naming the variable
     (``gw_config.env_float`` refuse mode); non-positive values refuse too
@@ -193,7 +113,7 @@ def resolve_galerkin_chunk_bytes() -> int:
     if gib <= 0.0:
         raise ValueError(
             f"LORRAX_GALERKIN_CHUNK_GIB={gib!r} must be > 0 (GiB budget "
-            f"for the Galerkin accumulation chunk; unset/blank = 6).")
+            f"for one whole-state real-space tile; unset/blank = 6).")
     return int(gib * 1024 ** 3)
 
 
@@ -220,90 +140,15 @@ def resolve_extra_rank_pad() -> int:
     return extra
 
 
-def resolve_fh_ortho_tol(log_fn=None) -> float:
-    """``LORRAX_FH_ORTHO_TOL`` (default 1e-6) — the build_fH_R gate cap.
-
-    Routed through ``gw_config.env_float`` in refuse mode: blank/unset →
-    the default (the old inline ``float(get(...) or 0.0)`` made a BLANK
-    export silently DISABLE the orthonormality gate — the failure it
-    guards is a wrong number, not a crash, so silent-off is the worst
-    possible reading of a typo); garbage REFUSES naming the variable; a
-    NON-DEFAULT value is announced, and ``0`` (gate off) is announced as
-    exactly that.
-    """
-    from gw.gw_config import env_float
-    tol = env_float("LORRAX_FH_ORTHO_TOL", 1e-6, refuse=True)
-    if tol != 1e-6 and log_fn is not None:
-        log_fn(f"  [gate] LORRAX_FH_ORTHO_TOL={tol:.3e} overrides the "
-               f"default 1e-6"
-               + ("  ** THE ORTHONORMALITY GATE IS DISABLED — only ever "
-                  "to reproduce a known-bad run **" if tol == 0.0 else ""))
-    return tol
-
-
-def resolve_rank_policy_mode() -> str:
-    """``LORRAX_RANK_POLICY`` (default ``refuse``) — the truncation gate's authority.
-
-    The name and the grammar live once, in ``common/rank_criterion``, which is
-    L2 and must be a function of its arguments (``tests/test_layering.py``);
-    this driver does the lookup and hands the answer over.  Same shape as
-    :func:`resolve_fh_ortho_tol` two functions up, and it exists for the same
-    reason: an L1 library dial reaches the environment through EXACTLY ONE
-    named resolver, so a reader can find every env-dependent decision this
-    module makes by grepping for ``resolve``.
-
-    A mis-spelled mode REFUSES naming the variable — a gate disarmed by a
-    typo reads clean in the log, which is the worst possible reading of one.
-
-    WHY THE NAME IS SPELLED OUT HERE.  Everywhere else in the tree the lookup
-    is ``os.environ.get(rank_criterion.POLICY_MODE_ENV)`` — one source of
-    truth for the spelling.  This module is under the EXACT-SET env ratchet in
-    ``tests/test_layering.py``, whose AST scan reads the argument literally
-    and records a constant as ``<dynamic>``; pinning that would make the
-    ratchet stop naming the variable, which is the degenerate-value failure
-    ``TASTE.md`` #18 is about.  So the literal is written for the scanner and
-    checked against the constant immediately below, which makes a rename a
-    loud refusal at exactly one line instead of a silent second spelling.
-    """
-    if rank_criterion.POLICY_MODE_ENV != "LORRAX_RANK_POLICY":
-        raise RuntimeError(
-            f"resolve_rank_policy_mode: common/rank_criterion renamed its "
-            f"policy dial to {rank_criterion.POLICY_MODE_ENV!r}, but this "
-            f"resolver still reads 'LORRAX_RANK_POLICY' — the literal exists "
-            f"only so the L1 env ratchet can see the name.  Update both.")
-    return rank_criterion.resolve_policy_mode(
-        os.environ.get("LORRAX_RANK_POLICY"))
-
-
 def resolve_galerkin_rank_multiplier(value) -> float:
-    """Validate the opt-in cross-k Galerkin model-order multiplier.
+    """Resolve the whole-state randomized-QRCP search ceiling.
 
-    ``0`` preserves the historical numerical-rank solve.  A positive value
-    means ``ceil(value * N_band)`` shared alpha directions, capped by the
-    numerical rank.  Values below one are refused: fewer alpha directions
-    than bands at one k cannot give the row-orthonormal coefficient block
-    required by :func:`build_fH_R`.
-
-    This is deliberately separate from ``rtol``.  The latter protects a
-    pseudo-inverse from numerical noise; this value is an explicit physical
-    model-order approximation that exploits redundancy between k points.
+    The published default is ``20*N_band``.  ``0`` remains a compatibility
+    spelling of 20 for archived decks, not an alternate exact-span path.
+    The QR threshold—not this ceiling—selects the delivered physical rank.
     """
-    try:
-        multiplier = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"htransform_rank_multiplier={value!r} is not a finite number; "
-            "use 0 for the exact numerical-rank path or a value >= 1.") \
-            from None
-    if not np.isfinite(multiplier) or multiplier < 0.0:
-        raise ValueError(
-            f"htransform_rank_multiplier={value!r} must be finite and >= 0.")
-    if 0.0 < multiplier < 1.0:
-        raise ValueError(
-            f"htransform_rank_multiplier={multiplier:g} would retain fewer "
-            "directions than bands at one k.  Use 0 for the exact path or a "
-            "value >= 1.")
-    return multiplier
+    return validate_rank_multiplier(
+        value, name="htransform_rank_multiplier")
 
 
 def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
@@ -315,1035 +160,108 @@ def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
         raise ValueError(f"htransform centroid subset: {exc}") from exc
 
 
-def _lowdin_orthonormalize_band_rows(ctilde: jax.Array):
-    """Per-k polar/Löwdin row orthonormalization for a reduced shared span."""
-    gram = jnp.einsum('kna,kma->knm', ctilde, jnp.conj(ctilde),
-                      optimize=True)
-    gram = 0.5 * (gram + jnp.swapaxes(gram, -1, -2).conj())
-    evals, evecs = jnp.linalg.eigh(gram)
-    safe_evals = jnp.maximum(evals, jnp.finfo(evals.dtype).tiny)
-    invsqrt = jnp.einsum(
-        'kni,ki,kmi->knm', evecs, 1.0 / jnp.sqrt(safe_evals),
-        jnp.conj(evecs), optimize=True)
-    out = jnp.einsum('knm,kma->kna', invsqrt, ctilde, optimize=True)
-    eye = jnp.eye(ctilde.shape[1], dtype=ctilde.dtype)[None]
-    gram_out = jnp.einsum('kna,kma->knm', out, jnp.conj(out),
-                          optimize=True)
-    before = jnp.max(jnp.abs(gram - eye))
-    after = jnp.max(jnp.abs(gram_out - eye))
-    rel_move = jnp.max(
-        jnp.linalg.norm(out - ctilde, axis=(-2, -1)) /
-        jnp.maximum(jnp.linalg.norm(ctilde, axis=(-2, -1)),
-                    jnp.finfo(ctilde.real.dtype).tiny))
-    return out, jnp.min(evals), jnp.max(evals), before, after, rel_move
-
-
-def _square_q_shards(n_rtot: int, s: int) -> int:
-    """Shard count the fitted ``P(None, None, ('x','y'))`` Q spec keeps on
-    an ``s x s`` mesh: the largest ('x','y') sub-product dividing
-    ``n_rtot``.  Same arithmetic as ``common.sharding_fit.legal_spec``'s
-    tuple partial retention, specialised to a square mesh so the refusal
-    below can name candidate meshes without constructing them."""
-    if n_rtot % (s * s) == 0:
-        return s * s
-    if n_rtot % s == 0:
-        return s
-    return 1
-
-
-def galerkin_q_ledger(*, rank: int, nk: int, nspinor: int, n_rtot: int,
-                      band_chunk: int, m_states: int, mu_pad: int,
-                      psi_win_elems: int, p_total: int, q_shards: int,
-                      y_shards: int) -> dict:
-    """Per-device byte ledger for the streamed-Galerkin Q accumulation.
-
-    The historical banner priced only the streamed ψ band chunk, while the
-    dominant live object is the full-r ``Q[rank, ns, n_rtot]`` accumulator
-    that stays live across ALL band chunks — measured on CrI3
-    81k/160b/6800c at P=4: banner said 3.39 GB/chunk, XLA priced Q at
-    133.98 GiB/device (Perlmutter JID 57269074).  Everything here is exact
-    shape algebra (complex128 = 16 B), deliberately WITHOUT a utilization
-    factor: the refusal that consumes this compares against 100% of the
-    pool, so a false refusal requires the exact inventory to overflow the
-    card — the permissive direction for a model that omits XLA scratch.
-
-    Keys are printable labels; ``TOTAL`` is their sum.
-    """
-    C16 = 16.0
-    led = {
-        # The full-r Q accumulator plus its donated input/output overlap:
-        # ``_accum`` donates Q_in and writes Q_in + delta into it, but the
-        # GEMM's delta-Q result buffer coexists with the accumulator, so
-        # the loop's floor is 2x Q per device.
-        "Q accumulator (x2 donated in/out overlap)":
-            2.0 * rank * nspinor * n_rtot * C16 / q_shards,
-        # One streamed psi band chunk in Q's r layout (the _accum input).
-        "psi chunk (r-layout)":
-            1.0 * nk * band_chunk * nspinor * n_rtot * C16 / q_shards,
-        # The same chunk in the loader's y-layout, co-live with the
-        # r-layout copy during the explicit band->r transition (a reshard
-        # cannot alias its donated input).
-        "psi chunk (y-layout, transition overlap)":
-            1.0 * nk * band_chunk * nspinor * n_rtot * C16 / y_shards,
-        # Persistent Gram state, replicated on every device: coeffs
-        # (m_states, rank), UH (rank, m_states), UH_kb (its eager-reshape
-        # copy), the per-chunk UH_bc block and inv_s.
-        "Gram state (replicated)":
-            (3.0 * m_states * rank + 1.0 * rank * nk * band_chunk
-             + 1.0 * rank) * C16,
-        # Vh, mu-sharded on 'y', live from step 2 until B_at_mu.
-        "Vh (mu on 'y')":
-            1.0 * rank * nspinor * mu_pad * C16 / y_shards,
-        # The G face, P('x','y').
-        "G face": 1.0 * rank * rank * C16 / p_total,
-        # The resident psi(G-flat) window, band-sharded over all P.
-        "psi(G-flat) window": 1.0 * psi_win_elems * C16 / p_total,
-    }
-    led["TOTAL"] = sum(led.values())
-    return led
-
-
-def _refuse_unfit_galerkin_mesh(ledger: dict, *, rank: int, nk: int,
-                                nspinor: int, n_rtot: int, band_chunk: int,
-                                m_states: int, mu_pad: int,
-                                psi_win_elems: int, mesh_xy: Mesh,
-                                q_spec, log_fn) -> None:
-    """REFUSE, before any Q compilation, a mesh whose Galerkin live set
-    cannot fit the device pool — naming the smallest square mesh that can.
-
-    The pool size comes from the allocator's own ``bytes_limit`` (the
-    owned reader in ``common.gpu_utils``); when it is unreadable (CPU
-    backend, platform allocator) the ledger is printed and the gate is
-    announced as OFF — a gate that silently checked nothing is the worse
-    failure (TASTE 2026-08-15).  The candidate-mesh scan holds this run's
-    carried ``rank`` fixed; the lcm mesh-alignment pad varies by a few
-    rows across meshes and is noise at refusal scale.
-    """
-    from common.gpu_utils import _get_jax_gpu_memory_bytes
-    limit, _, _ = _get_jax_gpu_memory_bytes()
-    if limit is None or limit <= 0:
-        log_fn("  [galerkin-mem] device pool size unreadable (CPU backend "
-               "or platform allocator) — ledger printed above, the "
-               "non-fitting-mesh refusal DID NOT RUN")
-        return
-    total = float(ledger["TOTAL"])
-    if total <= float(limit):
-        return
-    s_now = int(math.isqrt(int(mesh_xy.size)))
-    fitting = None
-    for s in range(s_now + 1, 65):
-        led_s = galerkin_q_ledger(
-            rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_rtot,
-            band_chunk=band_chunk, m_states=m_states, mu_pad=mu_pad,
-            psi_win_elems=psi_win_elems, p_total=s * s,
-            q_shards=_square_q_shards(n_rtot, s),
-            y_shards=(s if n_rtot % s == 0 else 1))
-        if led_s["TOTAL"] <= float(limit):
-            fitting = (s, float(led_s["TOTAL"]))
-            break
-    detail = "; ".join(
-        f"{name} {b / 1024**3:.2f} GiB" for name, b in ledger.items()
-        if name != "TOTAL")
-    if fitting is not None:
-        s, tot_s = fitting
-        remedy = (f"the smallest square mesh that fits at this pool size is "
-                  f"{s}x{s} (P={s * s}: projected "
-                  f"{tot_s / 1024**3:.2f} GiB/device)")
-    else:
-        remedy = ("no square mesh up to 64x64 fits — n_rtot="
-                  f"{n_rtot} caps the r-shard count at "
-                  f"{max(_square_q_shards(n_rtot, s) for s in range(1, 65))}"
-                  "; narrow the band window (Q scales with rank ~ nk*nb) or "
-                  "use htransform_rank_multiplier")
-    raise ValueError(
-        f"streaming_galerkin_solve: the Galerkin live set does not fit "
-        f"this mesh.  Projected {total / 1024**3:.2f} GiB/device against a "
-        f"{limit / 1024**3:.2f} GiB pool on the "
-        f"{mesh_xy.shape['x']}x{mesh_xy.shape['y']} mesh "
-        f"(Q sharded {q_spec}, {_shard_factor(mesh_xy, q_spec[2])}-way on "
-        f"r).  Ledger: {detail}.  {remedy}.  This is refused BEFORE "
-        f"compilation because the dominant term is the full-r Q "
-        f"accumulator, which no band-chunk budget "
-        f"(LORRAX_GALERKIN_CHUNK_GIB) can shrink.")
-
-
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
-                             rtol: float = 1e-8, log_fn=None,
+                             log_fn=None,
                              band_chunk_size: int = 64,
                              bispinor: bool = False,
-                             return_full_proj: bool = False,
-                             eigh_backend: str = "auto",
-                             eigh_plan=None,
-                             rank_multiplier: float = 0.0,
-                             progress_fn=None, rank_record_fn=None):
-    """Galerkin projection using gw_jax shared loaders.
+                             rank_multiplier: float = 20.0,
+                             qr_eps: float = 1.0e-3,
+                             qrcp_seed: int = 0,
+                             basis_input: str | None = None,
+                             basis_output: str | None = None,
+                             progress_fn=None, rank_record_fn=None,
+                             distrib_la_batched_route: str = "auto"):
+    """Resolve htransform policy around the reusable Galerkin fit service.
 
-    Single ('x','y') mesh throughout. ψ at centroids comes from
-    ``load_centroids_band_chunked``; ψ at full r is streamed via
-    ``iter_psi_rchunk_bandwise`` (band+r chunked, sharded on 'y'). G is built
-    sharded ``P('x','y')`` and Cholesky-factored via ``factor_c_q``
-    so the 1×1-mesh dense path and the 2D-blocked distributed path both work.
-
-    MEMORY AND SHARDING (2026-08-22).  The full-r accumulator is
-    ``Q[rank, ns, n_rtot]`` — spinor axis SEPARATE, r fitted over
-    ('x','y') — and is live across every band chunk.  Each streamed ψ
-    chunk goes through ONE explicit band→r all-to-all
-    (``_make_to_r_kernel``) into Q's exact r layout before the pinned
-    contraction; the merged-axis layout that forced the SPMD
-    partitioner's full-replication fallback at P16 (JID 57271407) is
-    gone.  ``galerkin_q_ledger`` prices Q (×2 donated in/out overlap),
-    both transition layouts of the ψ chunk, the replicated Gram state,
-    Vh, G and the resident ψ(G-flat) window per device, prints the
-    fitted sharding, and ``_refuse_unfit_galerkin_mesh`` REFUSES a
-    non-fitting mesh before any step-3 compilation, naming the smallest
-    square mesh that fits.
-
-    Args:
-        wfn, sym, meta: standard gw_jax handles.
-        centroid_indices: (n_μ, 3) FFT-grid coordinates.
-        mesh_xy: 2D ``('x','y')`` device mesh.
-        band_range: ``(b_start, b_end)`` — bands included in the α basis.
-        rtol: σ truncation tolerance (relative to s.max()); σ come from the
-            Gram-eigh of A Aᴴ (see step 2), the same criterion as the old
-            replicated SVD up to sqrt-of-eigenvalue round-off.
-        eigh_backend: distrib_la backend for the (nk·nb)² Gram eigh — the
-            same plan family (and deck key) as the fH_q eigh downstream;
-            ``auto`` = native replicated eigh, ``distributed`` = ScaLAPACK
-            pzheevd, one tile over the mesh.
-        rank_multiplier: 0 (default) carries the full numerical rank.  A
-            value >= 1 targets ``ceil(rank_multiplier * nb)`` shared alpha
-            directions, capped by the numerical rank, then Löwdin-
-            orthonormalizes each k's band rows.  This is an explicit
-            model-order approximation, not another spelling of ``rtol``.
-        band_chunk_size: bands per FFT chunk inside the loader.  Treated as a
-            CEILING, not a fixed size: it is lowered so one streamed ψ chunk
-            ``(nk, bc, nspinor, n_rtot)`` complex128 stays under
-            the ``resolve_galerkin_chunk_bytes()`` budget (see below).
-        bispinor: passed through to ``load_centroids_band_chunked``.
-        return_full_proj: also return the full-r α-basis projector
-            ``W_proj = L⁻¹ diag(1/s) U^H`` (rank, nk·nb), replicated.  For
-            any streamed ψ chunk (nk, bc, ns, r_c) restricted to the SAME
-            band window, ``B_full[α, s·r_c] = W_proj_bc @ ψ_flat`` evaluates
-            the α-basis on the full r-grid, so
-            ``ψ_{n,q}(r) = Σ_α c_{n,q}[α] B_full[α](r)`` reconstructs ψ at
-            ANY q off the grid — the per-Q ζ-refit consumer
-            (``bse.vq_interp.refit_vq``).
-
-    Returns ``(S, ctilde, B_at_mu)`` (legacy contract), plus ``W_proj``
-    appended when ``return_full_proj``.  ``B_at_mu`` is μ-sharded on 'y'
-    (fitted — replicated only when n_μ divides no mesh axis); ``S``,
-    ``ctilde`` and ``W_proj`` are replicated and N_μ-free.
+    Input and output are deliberately distinct: a requested restart may not
+    silently refit, while a requested fit artifact may not silently reuse an
+    old file.  The owner-level service validates the exact numerical identity.
     """
-    import time
     if log_fn is None:
-        log_fn = lambda *a, **kw: None
-
-    b_start, b_end = band_range
-    nb = b_end - b_start
-    nk = meta.nk_tot
-    nspinor = meta.nspinor
-    n_mu = int(centroid_indices.shape[0])
+        log_fn = lambda *args, **kwargs: None
+    if basis_input and basis_output:
+        raise ValueError(
+            "Galerkin basis input and output are mutually exclusive")
     rank_multiplier = resolve_galerkin_rank_multiplier(rank_multiplier)
-    if rank_multiplier > 0.0 and return_full_proj:
-        raise ValueError(
-            "streaming_galerkin_solve: htransform_rank_multiplier cannot be "
-            "combined with return_full_proj/refit.  The reduced route applies "
-            "a k-dependent Löwdin map to ctilde, while W_proj is one global "
-            "full-r projector; pretending they share one alpha gauge would "
-            "give the refit wrong wavefunctions.  Use vq-mode=interp/ongrid "
-            "or htransform_rank_multiplier=0 for refit.")
-
-    rep = NamedSharding(mesh_xy, P())               # fully replicated
-    grid_xy = NamedSharding(mesh_xy, P('x', 'y'))   # (rank, rank) face
-
-    # Size the band chunk to the ψ box rather than trusting a fixed default.
-    bytes_per_band = nk * nspinor * int(meta.n_rtot) * 16
-    bc_cap = max(1, int(resolve_galerkin_chunk_bytes()
-                        // max(1, bytes_per_band)))
-    band_chunk_size = max(1, min(int(band_chunk_size), bc_cap, nb))
-
-    _rank_policy = ("numerical (exact-span default)" if rank_multiplier == 0.0
-                    else f"target {rank_multiplier:g}*nb="
-                         f"{math.ceil(rank_multiplier * nb)}")
-    log_fn(
-        f"  Streaming Galerkin: nk={nk}, nb={nb}, nr={meta.n_rtot}, "
-        f"n_mu={n_mu}, mesh=({mesh_xy.shape['x']}x{mesh_xy.shape['y']}), "
-        f"band_chunk={band_chunk_size}, rank={_rank_policy} "
-        f"({bytes_per_band * band_chunk_size / 1024**3:.2f} GB/chunk)"
-    )
-    # The chunk figure above is NOT the peak: the full-r Q accumulator is
-    # live across all band chunks and dominates at production rank.  Its
-    # exact charge (and the non-fitting-mesh refusal) follows the Gram
-    # eigh, once the carried rank is known; this line bounds it up front
-    # so the startup banner can no longer under-advertise by 40x (the
-    # CrI3 3.39 GB/chunk vs 133.98 GiB/device Q, JID 57269074).
-    _rank_cap = min(nk * nb, nspinor * n_mu)
-    log_fn(f"  Q accumulator upper bound (rank <= {_rank_cap}): "
-           f"{_rank_cap * nspinor * meta.n_rtot * 16 / 1024**3:.2f} GiB "
-           f"global before r-sharding; exact per-device ledger printed "
-           f"after rank selection")
-    if band_chunk_size < nb:
-        log_fn(f"  (band axis split into "
-               f"{(nb + band_chunk_size - 1)//band_chunk_size} chunks; G is "
-               f"accumulated r-outer / band-inner so the split stays exact)")
-
-    # ── 1. Load ψ(G-flat) ONCE for the whole band window ──
-    # One capped+padded load (band-sharded over ('x','y')) serves BOTH the
-    # centroid sampling below AND the r-streaming Galerkin sweep in step 3
-    # — previously each streamed band chunk re-issued its own
-    # ``loader.load`` (h5py read + symmetry unfold per chunk), so ψ was
-    # read from file twice per run (once for centroids, once chunk-by-chunk
-    # for the stream).  G-flat is small (~6-11% of the FFT box, same
-    # tensor ``load_centroids_band_chunked`` already held), so keeping it
-    # resident through the Q loop trades a few GB global for a single
-    # file read + single unfold.  Numerics: per-chunk consumption is a
-    # device SLICE of the same values — bit-identical.
-    t0 = time.time()
-    psi_G_win = load_psi_gflat_padded(
-        wfn, band_range, mesh_xy=mesh_xy, bispinor=bispinor)
-    if psi_G_win is None:
-        raise ValueError(
-            f"streaming_galerkin_solve: band window {band_range} lies "
-            f"entirely past the file's band extent ({int(wfn.nbands)})")
-    log_fn(f"  ψ(G-flat) window load: {time.time()-t0:.2f}s "
-           f"(shape {tuple(psi_G_win.shape)}, shared by centroid sample + "
-           f"r-stream)")
-
-    # ── 1b. ψ at centroids (band-sharded internally on 'y') ──
-    psi_rmu_Y, _ = load_centroids_band_chunked(
-        wfn, sym, meta, centroid_indices, bispinor, mesh_xy,
-        band_range=band_range, band_chunk_size=band_chunk_size,
-        psi_G_flat=psi_G_win,
-    )
-    # psi_rmu_Y: (nk, nb, ns, n_μ), sharded P(None, None, None, 'y')
-    log_fn(f"  load_centroids_band_chunked: {time.time()-t0:.2f}s")
-    # Captured for the Q memory ledger below — psi_rmu_Y is deleted before
-    # the ledger runs.
-    mu_pad = int(psi_rmu_Y.shape[3])
-
-    # ── 2. Gram-eigh of A Aᴴ, A = ψ@centroids reshaped to (nk·nb, ns·n_μ) ──
-    # Until 2026-08-01 this step gathered A REPLICATED and ran a dense SVD on
-    # every rank — the last N_μ-scaling replicated core in the chain (A itself
-    # nk·nb·ns·N_μ·16 B/rank plus the gesdd workspace, and Vh/B_at_mu
-    # re-replicated downstream).  A Aᴴ is (nk·nb, nk·nb) — N_μ-FREE — and
-    # eigh(A Aᴴ) gives the same left factor: λ = σ², U = eigenvectors, so
-    # σ = sqrt(λ) and Vᴴ = diag(1/σ) Uᴴ A is formed μ-SHARDED where consumed
-    # (see ``_vh_sharded`` below).  The Gram product contracts (s, μ) locally
-    # on each μ-shard + one (nk·nb)² all-reduce; ψ@centroids is never
-    # replicated and no O(N_μ) object is.
-    #
-    # NUMERICS.  (a) Gauge, not bits: eigenvectors of A Aᴴ match the SVD's U
-    # only up to per-σ phases (rotations inside degenerate σ groups), so
-    # ctilde/B/fH transform covariantly and every physical output (energies,
-    # ψ reconstruction) is invariant analytically, equal to the SVD path to
-    # ~κ·ε in floats — the same "different valid gauge" class as the
-    # distributed ζ tier.  (b) Squaring halves the precision of SMALL σ:
-    # sqrt(λ) resolves σ only down to ~sqrt(ε)·σ_max ≈ 1.5e-8·σ_max, i.e.
-    # exactly the rtol=1e-8 cut.  That is safe HERE because the retained
-    # spectrum is bounded away from the cut (measured job 7883150:
-    # σ_min/σ_max = 2.25e-5, 4.5 decades above it — see the truncation block
-    # below); a deck whose retained block hugged the cut would fail the
-    # ``rank_report`` violations gate, not silently drift.
-    #
-    # The eigh goes through the distrib_la plan family: ``eigh_backend`` from
-    # the deck (auto = native batched eigh, replicated — (nk·nb)² is small;
-    # distributed = ScaLAPACK pzheevd, one tile over the mesh, for band
-    # windows where even (nk·nb)² replicated is unaffordable).
-    t1 = time.time()
-    m_states = nk * nb
-
-    @partial(jax.jit, out_shardings=rep)
-    def _gram(psi):
-        # psi: (nk, nb, ns, μ_pad) at P(None, None, None, 'y').  dot_general
-        # over BOTH (s, μ) axes — no ns·μ reshape ever touches the sharded
-        # axis.  Zero μ-pad columns add exact zeros to the sum.
-        M = jnp.einsum('aism,bjsm->aibj', psi, jnp.conj(psi), optimize=True)
-        M = M.reshape(m_states, m_states)
-        return 0.5 * (M + M.conj().T)
-
-    M = _gram(psi_rmu_Y)
-
-    if eigh_plan is None:
-        from ffi import _services
-        _services.ensure_on_path()
-        from distrib_la import plan as linalg_plan
-        eigh_plan = linalg_plan(
-            "eigh", mesh_xy, backend=eigh_backend, n=m_states)
-    elif eigh_plan.op != "eigh" or int(eigh_plan.n) != int(m_states):
-        raise ValueError(
-            "streaming_galerkin_solve: the pre-resolved distrib_la plan "
-            f"is {eigh_plan.op}/n={eigh_plan.n}, expected eigh/n={m_states}.")
-    if eigh_plan.is_native:
-        @partial(jax.jit, out_shardings=(rep, rep))
-        def _eigh_native(M_):
-            w_, V_ = jnp.linalg.eigh(M_)
-            return w_, V_
-        w, V = _eigh_native(M)
-    else:
-        log_fn("  Gram eigh: " + eigh_plan.describe())
-        w, V = eigh_plan(M)          # λ replicated, V one tile P('x','y')
-        V = jax.device_put(V, rep)   # (nk·nb)² — N_μ-free, small
-    del M
-
-    # eigh is ascending; the SVD contract everywhere below is descending σ.
-    @partial(jax.jit, out_shardings=(rep, rep))
-    def _sv_from_eigs(w, V):
-        s = jnp.sqrt(jnp.clip(w[::-1], 0.0, None))
-        return s, V[:, ::-1]
-
-    s, U = _sv_from_eigs(w, V)
-    del w, V
-    s_host = np.asarray(s)
-
-    # ── The truncation criterion ──────────────────────────────────────────
-    # ``rank_numerical`` is the ONLY place numerical admissibility is decided,
-    # and the decision is a cap on how much the pseudo-inverse below (``inv_s``
-    # = 1/σ) may amplify round-off: keep σ > σ_max/κ_cap with κ_cap = 1/rtol.
-    # It is NOT a search for a gap — these are ISDF/Galerkin overlap spectra
-    # and they are smooth by construction, with no knee to find.  See
-    # ``common/rank_criterion`` for the criterion, for the three standard
-    # alternatives (discrepancy principle / L-curve / GCV) and the measured
-    # reason each is refuted here, and for the §R19 table in which retaining
-    # 41 % MORE rank moved a QP gap from 3.13 eV to −5049 eV.
-    #
-    # THE STRUCTURAL CEILING, and why this route needs it more than any other.
-    # ``A`` is (nk·nb, nspinor·n_μ) but the spectrum above comes from an eigh
-    # of ``A Aᴴ`` at the LARGER of the two dimensions (see the NUMERICS note),
-    # so the null space of a tall rank-deficient A arrives as round-off-sized
-    # POSITIVE eigenvalues and a relative threshold COUNTS THEM.  Measured on
-    # Na bands 1–24: A is (12288, 2032) and rtol=1e-8 selected rank 2034 —
-    # two directions more than the matrix algebraically has — after which the
-    # capacity line printed the self-contradiction ``rank=2034`` beside
-    # ``nspinor·n_μ = 2032``.  ``min(rows, cols)`` is the ceiling; the report
-    # below refuses an UNCLAMPED overshoot so a future caller that drops this
-    # argument is not silently believed.
-    _rank_ceiling = min(nk * nb, nspinor * n_mu)
-    rank_numerical = rank_criterion.select_rank(
-        s_host, rtol, ceiling=_rank_ceiling)
-
-    # ── …and the criterion is not allowed to stop mid-multiplet ───────────
-    # ``common/spectral_closure``, the sibling of the band-window guard.  A
-    # cut through a degenerate σ block keeps a symmetry-ARBITRARY slice of an
-    # eigenspace, and this function's own NUMERICS note (a) says so from the
-    # other side: "eigenvectors of A Aᴴ match the SVD's U only up to per-σ
-    # phases (rotations inside degenerate σ groups)".  That rotation freedom
-    # is harmless while a degenerate group is retained WHOLE — every physical
-    # output is invariant under it — and is exactly what breaks covariance
-    # when the group is split.  The repair drops the straddled group whole
-    # (owner ruling 2026-08-10), so ``rank_phys`` comes DOWN and the κ_cap
-    # this criterion just enforced holds with room to spare; the padding
-    # below then aligns whatever survives.  See that module's TWO-RULE FAMILY
-    # on why the BAND-window guard rounds the other way and refuses instead.
-    rank_numerical, _sc_numerical = spectral_closure.resolve_spectral_cut(
-        s_host, rank_numerical,
-        where="htransform psi@centroids Gram-eigh sigma numerical rank",
-        rcond=rtol, log=log_fn)
-    if not _sc_numerical["fired"]:
-        log_fn(spectral_closure.describe_clean(
-            _sc_numerical,
-            where="htransform psi@centroids sigma numerical rank"))
-
-    # ── Optional physical model-order cut (NOT the numerical rtol) ────────
-    # Periodic wavefunctions sampled at different k can be strongly redundant.
-    # The exact-span default above nevertheless retains up to nk*nb left-
-    # singular directions, which makes every later fH(q) solve cubic in nk*nb.
-    # An explicit multiplier requests a shared basis sized by bands PER k.
-    # This is deliberately opt-in and separately logged/gated: changing rtol
-    # to reach the same integer would falsely call a physical approximation
-    # "round-off", obscure its convergence axis, and trip the condition-number
-    # service's meaning.
-    rank_phys = rank_numerical
-    _sc_model = None
-    if rank_multiplier > 0.0:
-        requested = int(math.ceil(rank_multiplier * nb))
-        proposed = min(rank_numerical, requested)
-        rank_phys, _sc_model = spectral_closure.resolve_spectral_cut(
-            s_host, proposed,
-            where="htransform reduced cross-k Galerkin model rank",
-            rcond=rtol, log=log_fn)
-        if not _sc_model["fired"]:
-            log_fn(spectral_closure.describe_clean(
-                _sc_model,
-                where="htransform reduced cross-k Galerkin model rank"))
-        if rank_phys < nb:
-            raise ValueError(
-                "streaming_galerkin_solve: the reduced cross-k Galerkin "
-                f"cut retained rank {rank_phys} for {nb} bands per k after "
-                "spectral closure.  Per-k row orthonormality is impossible. "
-                "Increase htransform_rank_multiplier or use 0 for the "
-                "exact numerical-rank path.")
+    extra_rank_pad = resolve_extra_rank_pad()
+    if basis_input:
+        basis_path = os.fspath(basis_input)
+        if not os.path.isfile(basis_path):
+            raise FileNotFoundError(
+                f"Galerkin basis input does not exist: {basis_path}")
+        log_fn(f"  [galerkin-restart] reading {basis_path}")
+        basis = read_galerkin_basis(
+            basis_path, wfn=wfn, meta=meta,
+            centroid_indices=centroid_indices, band_range=band_range,
+            bispinor=bispinor, rank_multiplier=rank_multiplier,
+            qrcp_eps=qr_eps, qrcp_seed=qrcp_seed, mesh_xy=mesh_xy,
+            extra_rank_pad=extra_rank_pad)
         log_fn(
-            f"  [reduced-galerkin] EXPLICIT MODEL ORDER: requested "
-            f"ceil({rank_multiplier:g}*{nb})={requested}; numerical rank "
-            f"{rank_numerical} of {nk*nb}; retaining {rank_phys} shared "
-            f"cross-k directions ({rank_phys/nb:.2f} per band at one k, "
-            f"{rank_phys/(nk*nb):.1%} of the exact stacked-state span).  "
-            "This is an observable-convergence approximation, not rtol.")
+            f"  [galerkin-restart] reused physical rank "
+            f"{basis.rank_physical} in carried extent {basis.rank_carrier}")
+        if rank_record_fn is not None:
+            rank_record_fn(galerkin_rank_record(
+                basis, meta=meta, rank_multiplier=rank_multiplier))
+        return basis
 
-    # ── Mesh alignment: PAD, never round the rank down ────────────────────
-    # G, its Cholesky factor, ctilde, B and fH all live on a (rank, rank)
-    # face sharded P('x','y'), so the carried extent has to divide BOTH mesh
-    # axes; an unaligned extent makes the first ``device_put`` onto that face
-    # raise "global size of its dimension 0 should be divisible by 4 …".
-    #
-    # This used to round the retained rank DOWN to a multiple of
-    # lcm(px, py) — at P=64 on an 8×8 mesh, up to 7 physically-selected
-    # directions discarded FOR A DEVICE-GRID REASON, which makes the answer a
-    # function of the machine it ran on.  The rationale ("the dropped ones
-    # sit at the rtol threshold, the same decision rtol already makes") does
-    # not survive contact with the measured spectrum.
-    #
-    # MEASURED, job 7883150 (MoS2 4×4, n_μ=785, nval=26/ncond=16, rtol 1e-8):
-    # the SVD is (672, 1570), rank 672 = FULL row rank, and the retained block
-    # runs σ_max = 9.857614e-01 down to σ_min = 2.22115e-05, i.e.
-    #     σ_min/σ_max = 2.2532e-05,
-    # which is FOUR AND A HALF DECADES ABOVE the cut at σ_max·rtol.  κ_eff =
-    # 4.44e4 against a cap of 1e8.  The directions a round-down removes are
-    # therefore not threshold noise at all — they are ordinary members of a
-    # smooth spectrum, comfortably inside the retained block.
-    #
-    # DO NOT re-derive that ratio from an older log line.  Until 2026-07-31
-    # this function printed
-    #     f"σ_min/{rtol:.0e}={float(s_host[rank-1]):.3e}"
-    # whose LABEL says the value is divided by rtol and whose ARGUMENT is the
-    # raw σ.  Reading its "σ_min/1e-08=2.221e-05" as σ_min/σ_max ≈ 2e-13
-    # understates the true ratio by eight decades, and that misreading was
-    # carried into a campaign brief as evidence that this deck sits "exactly
-    # at the interpolation capacity limit".  It does not: the capacity limit
-    # on this deck is at nb ≈ 98 (nk·nb = 1568 vs nspinor·n_μ = 1570), where
-    # the same sweep measures rank 1562 < 1568, ctilde orthogonality 6.31e-04
-    # and an on-grid energy error of 0.242 meV.  The rank report below prints
-    # both ends of the retained block with correct labels; use it.
-    #
-    # The fix is to pad the face instead.  The α-basis is EXTENDED by
-    # ``n_pad`` exactly-null directions:
-    #   coeffs[:, rank_phys:] = 0,  inv_s[rank_phys:] = 0,  UH[rank_phys:] = 0
-    # ⇒ Q's pad rows are exactly zero ⇒ G's pad rows/cols are exactly zero.
-    # An identity block is placed on the pad diagonal of G so the Cholesky is
-    # non-singular; for a block-diagonal SPD matrix ``potrf`` returns exactly
-    # blockdiag(chol(G_phys), I) — every off-diagonal update is an exact 0/1
-    # division — so ctilde, B and W_proj all acquire exactly-zero pad
-    # columns/rows and every downstream contraction over α is bit-unchanged.
-    # fH = Σ_n f(ε_n) c_n c_nᴴ likewise gains an exactly-zero block, i.e.
-    # ``n_pad`` extra exact-zero eigenvalues on top of the (rank − nb) exact
-    # zeros it already carries; band selection is ascending-index and the
-    # f-transform makes f(ε) ≤ 0, so the extra zeros sort ABOVE every selected
-    # band and no selection moves.
-    #
-    # ``LORRAX_EXTRA_RANK_PAD`` adds further null directions on top of the
-    # mesh round-up.  It is the pad-extent-invariance knob for this axis (the
-    # same role ``LORRAX_EXTRA_MU_PAD`` plays for μ): any result that moves
-    # under it depends on the pad extent and is a defect.  Never set it in
-    # production.
-    align = math.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y']))
-    rank = round_up(rank_phys, align)
-    _extra = resolve_extra_rank_pad()
-    if _extra:
-        rank = round_up(rank + _extra, align)
-    n_pad = rank - rank_phys
-
-    # Slice to the criterion's rank and null-extend to the carried extent in
-    # ONE jit with an explicit replicated out_sharding: done op-by-op,
-    # ``jnp.pad`` on a multi-process mesh would leave these operands with an
-    # inferred sharding instead of the ``rep`` the eigh produced.
-    @partial(jax.jit, static_argnames=('r_phys', 'n_pad'),
-             out_shardings=(rep, rep, rep))
-    def _trim_and_pad(U, s, r_phys, n_pad):
-        U = U[:, :r_phys]
-        s = s[:r_phys]
-        coeffs = U * s[None, :]              # (nk·nb, r_phys)
-        inv_s = (1.0 / s)[:, None]           # (r_phys, 1)
-        UH = U.conj().T                      # (r_phys, nk·nb)
-        if n_pad:
-            coeffs = jnp.pad(coeffs, ((0, 0), (0, n_pad)))
-            inv_s = jnp.pad(inv_s, ((0, n_pad), (0, 0)))
-            UH = jnp.pad(UH, ((0, n_pad), (0, 0)))
-        return coeffs, inv_s, UH
-
-    # ── Truncation diagnostic — printed on EVERY run ──────────────────────
-    # retained rank, σ range of the retained block, σ range discarded, and
-    # how much of the discard was the physics criterion (all of it, now) vs
-    # the mesh alignment (must be zero).  ``violations()`` is the assertion:
-    # it refuses a run whose achieved amplification exceeds the cap, whose
-    # retained set depends on the device grid, or whose σ_max is zero/NaN
-    # (the documented `nband`-is-an-absolute-index trap, in which the SVD of
-    # an all-zero ψ window returns rank 0 and everything downstream is
-    # meaningless).
-    # ``n_dropped_closure`` is what keeps check 2 meaningful after the
-    # closure guard started lowering the rank: the block members it dropped
-    # are a deficit against the criterion, and without this attribution
-    # ``violations()`` would read them as a device-grid round-down and refuse
-    # the run.  They are not — the mesh had no part in choosing them — and
-    # anything left over after this subtraction is still a real violation.
-    _numerical_report = rank_criterion.rank_report(
-        s_host, rtol,
-        label=f"htransform ψ@centroids numerical rank ({nk*nb}, "
-              f"{nspinor*n_mu})",
-        quantity="singular values", rank_used=rank_numerical,
-        n_rows=nk * nb, n_cols=nspinor * n_mu,
-        n_dropped_closure=max(
-            0, _sc_numerical["n_keep"] -
-            _sc_numerical["n_keep_closed"]),
-        # ``rank_used`` here is a SELECTION, so the ceiling applies (the
-        # padded report below is a carried EXTENT and declares none).
-        rank_ceiling=_rank_ceiling,
-        kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM)
-    _bad = _numerical_report.violations()
-    if _bad:
-        raise ValueError(
-            "streaming_galerkin_solve: the ψ-at-centroids numerical rank is "
-            "not self-consistent — " + "  ".join(_bad))
-    # THE GATE (docs/dev/rank_truncation_policy.md §2).  ``violations()``
-    # above asks whether the code did what it was told; this asks whether
-    # what it was told is a regime anyone certified.  Both registered
-    # catastrophes satisfied the first and failed the second.
-    rank_criterion.certify(
-        _numerical_report,
-        site="htransform ψ@centroids Gram-eigh σ",
-        mode=resolve_rank_policy_mode(),
-        cause=(f"the Galerkin basis is over-complete for this window: "
-               f"{nk * nb} stacked states against nspinor·n_μ = "
-               f"{nspinor * n_mu} interpolation columns, and the retained "
-               f"block runs all the way down to the rtol cut."),
-        fix=("reduce the band window, raise n_μ, or declare an explicit "
-             "reduced model order with htransform_rank_multiplier (>= 1; "
-             "ceil(m·nb) shared cross-k directions, N_k-independent by "
-             "construction)."),
-        log=log_fn)
-
-    if rank_multiplier == 0.0:
-        # Historical report and accounting, unchanged on the default route.
-        _trunc = rank_criterion.rank_report(
-            s_host, rtol,
-            label=f"htransform ψ@centroids Gram-eigh σ ({nk*nb}, "
-                  f"{nspinor*n_mu})",
-            quantity="singular values", rank_used=rank,
-            n_rows=nk * nb, n_cols=nspinor * n_mu,
-            n_dropped_closure=max(
-                0, _sc_numerical["n_keep"] -
-                _sc_numerical["n_keep_closed"]))
-        _closure_for_report = _sc_numerical
-    else:
-        # The model-order tail is not a GRID drop and must never be fed to
-        # rank_report as one.  Report the retained operator's conditioning;
-        # the explicit reduced-galerkin line above owns the physical tail.
-        _trunc = rank_criterion.rank_report(
-            s_host[:rank_phys], rtol,
-            label=f"htransform retained reduced Galerkin block ({rank_phys} "
-                  f"of numerical {rank_numerical})",
-            quantity="singular values", rank_used=rank,
-            n_rows=rank_phys, n_cols=rank_phys)
-        _closure_for_report = _sc_model
-    log_fn(f"  Gram-eigh σ of ({nk*nb}, {nspinor*n_mu}): rank={rank_phys}"
-           + (f" (+{n_pad} null pad → carried extent {rank}, "
-              f"mesh-aligned to {align})" if n_pad else "")
-           + f" ({time.time()-t1:.2f}s)")
-    log_fn(_trunc.describe())
-    if _closure_for_report is not None and _closure_for_report["fired"]:
-        # The two guards stay orthogonal and the reader is told which took
-        # what.  ``rank_report`` now carries the closure deficit in its own
-        # column (see ``n_dropped_closure``), so this line names the block
-        # rather than re-deriving the arithmetic.
-        _closure_drop = max(
-            0, _closure_for_report["n_keep"] -
-            _closure_for_report["n_keep_closed"])
-        log_fn(f"  [rank]   of the directions not carried, "
-               f"{_closure_drop} were "
-               f"DROPPED BY DEGENERACY CLOSURE — the members of a block of "
-               f"{len(_closure_for_report['members'])} that the cut at "
-               f"{_closure_for_report['n_keep']} straddled (relative span "
-               f"{_closure_for_report['span_rel']:.3e}).  They are "
-               f"real directions with sigma > 0, discarded so the retained "
-               f"span is a representation of the point group; the other "
-               f"legal cut was {_closure_for_report['n_keep_kept']}, and the ruling of "
-               f"2026-08-10 takes the lower.  The {n_pad} null pad above is "
-               f"mesh alignment and unrelated.")
-    _bad = _trunc.violations()
-    if _bad:
-        raise ValueError(
-            "streaming_galerkin_solve: the ψ-at-centroids truncation is not "
-            "self-consistent — " + "  ".join(_bad))
-    if rank_record_fn is not None:
-        rank_record_fn({
-            "stacked_states": int(nk * nb),
-            "site_spin_columns": int(nspinor * n_mu),
-            "structural_ceiling": int(_rank_ceiling),
-            "numerical_rank": int(rank_numerical),
-            "retained_rank": int(rank_phys),
-            "carried_rank": int(rank),
-            "null_padding": int(n_pad),
-            "rank_multiplier": float(rank_multiplier),
-            "numerical_report": _numerical_report,
-            "compression": rank_criterion.singular_value_compression(
-                s_host, rank_phys),
-            "numerical_closure": _sc_numerical,
-            "model_closure": _sc_model,
-        })
-    if rank_numerical < nk * nb:
-        log_fn(f"  [warn] ψ-at-centroids is NUMERICALLY RANK-DEFICIENT: "
-               f"{nk*nb} states vs numerical rank {rank_numerical} "
-               f"(structural ceiling min(nk·nb, nspinor·n_μ) = "
-               f"{_rank_ceiling}).  The "
-               f"Galerkin basis cannot span the band window — fH energy "
-               f"recovery will degrade.  Capacity rule: nk·nb < rank(ψ_μ) "
-               f"≤ nspinor·n_μ, i.e. nb < {rank_numerical/nk:.2f} here.  (The pad "
-               f"directions are exactly null and add NO capacity — the "
-               f"capacity bound is on numerical rank, never on the carried "
-               f"extent.  The rank quoted here is CLAMPED to the ceiling: a "
-               f"Gram route counts null-space round-off as positive "
-               f"eigenvalues, which is how this line once printed "
-               f"rank=2034 beside nspinor·n_μ=2032.)")
-
-    # Null-extend to the carried extent.  The zeros here are what make every
-    # pad row of Q — hence of G, ctilde, B and W_proj — exactly zero.
-    coeffs, inv_s, UH = _trim_and_pad(U, s, rank_phys, n_pad)
-    del U, s
-
-    # Vᴴ = diag(1/σ) Uᴴ A, formed μ-SHARDED on 'y' against the sharded ψ tile
-    # — the replicated SVD Vh this replaces was (rank, ns·N_μ) on every rank.
-    # The contraction runs over (k, n) only, so each device builds its own μ
-    # columns with no communication; the σ-pad rows (inv_s = 0) and the
-    # loader μ-pad columns come out exactly zero.  Kept at the padded μ
-    # extent until ``_b_at_mu`` trims to the true centroid count.
-    vh_shard = NamedSharding(mesh_xy, P(None, None, 'y'))
-
-    @partial(jax.jit, out_shardings=vh_shard)
-    def _vh_sharded(inv_s, UH, psi):
-        UH_kb_ = UH.reshape(rank, nk, nb)
-        Vh = jnp.einsum('akn,knsm->asm', UH_kb_, psi, optimize=True)
-        return inv_s[:, :, None] * Vh        # (rank, ns, μ_pad), μ on 'y'
-
-    Vh_sh = _vh_sharded(inv_s, UH, psi_rmu_Y)
-    del psi_rmu_Y
-
-    # ── 3. G = Q Q^H with Q = inv_s · U^H ψ, streamed r-OUTER / band-INNER ──
-    #
-    # Q[α, x] = Σ_{k,n} inv_s[α] U^H[α,(k,n)] ψ[(k,n), x]  — the contraction
-    # runs over the PAIR index (k, n) and is FREE in x = (spinor, r).  So:
-    #
-    #   * splitting x (the r axis) and summing G over the pieces is EXACT —
-    #     G = Σ_rc Q_rc Q_rc^H, because each Q_rc is a disjoint column block;
-    #   * splitting the CONTRACTED (k, n) axis and summing G over the pieces
-    #     is NOT — Σ_bc Q_bc Q_bc^H drops every bc ≠ bc' cross term of
-    #     (Σ_bc Q_bc)(Σ_bc' Q_bc')^H.
-    #
-    # The band chunks must therefore be summed INTO Q before the outer
-    # product, which is what this loop does.  Getting that backwards is a
-    # silent wrong answer, not a crash: G stays Hermitian positive-definite,
-    # Cholesky succeeds, and the only symptom is that ctilde comes out
-    # non-orthonormal — ``ctilde[0] orthogonality error`` jumps to ~0.5 —
-    # so fH = Σ_n f(ε_n) c_n c_n^H no longer has eigenvalues f(ε_n) and the
-    # recovered energies drift by ~1.7 eV.  Measured on MoS2 12x12 30 Ry /
-    # n_μ=640 / nb=40, on-grid max|Δε_c| vs the stored grid:
-    #   one band chunk (nb ≤ band_chunk_size)  0.63 meV
-    #   two band chunks, G summed per chunk    1742.48 meV
-    # It stayed hidden while ``band_chunk_size`` defaulted to a fixed 64 ≥ nb
-    # (one chunk, no cross terms to lose) and surfaced when the chunk was
-    # sized to the ψ box instead.
-    n_rtot = meta.fft_grid[0] * meta.fft_grid[1] * meta.fft_grid[2]
-    # Align band_chunk to the mesh band-shard count (p_band = mesh.size): the
-    # loader pads nb to round_up(band_chunk, p_band) regardless, so e.g. 7 real
-    # bands on a 16-way mesh still COSTS 16 -- and pushes 9 zero-pad bands
-    # through every local FFT and the UH@psi GEMM (~2.3x waste) while doubling
-    # the iteration count (and the per-chunk XLA retrace storm).  Rounding up to
-    # a p_band multiple is free (same padded memory) and both removes the waste
-    # and halves the iterations/compiles.  Pure chunking change -> identical G.
-    _p_band = max(1, int(mesh_xy.size))
-    _bc = ((band_chunk_size + _p_band - 1) // _p_band) * _p_band
-    band_chunk_ranges = [
-        (b_start + i * _bc, min(b_start + (i + 1) * _bc, b_end))
-        for i in range((nb + _bc - 1) // _bc)
-    ]
-    # r-chunk holds one Q block (rank, nspinor·r_len) plus the ψ tile
-    # (nk, band_chunk, nspinor, r_len); size it so both stay inside the budget.
-    # Q spans the FULL r axis.  ``iter_psi_rchunk_bandwise`` is only ever
-    # exercised with (r_start, r_len) = (0, n_rtot) — handing it an interior
-    # r_start aborts inside XLA — and Q at full r costs
-    # rank·nspinor·n_rtot·16 sharded over 'y', which is 6.6 GB/device at the
-    # largest case here (MoS2 12x12 / n_μ=2412 / rank 4700 on a 4x4 mesh).
-    # The ψ tile stays band-chunked, so the streaming property that
-    # ``band_chunk_size`` buys is unchanged; only Q is now carried across the
-    # band loop, which is exactly what makes the split exact.
-
-    # Q is carried ACROSS the band loop now, so unlike the old per-chunk
-    # transient it is a live buffer for the whole accumulation — split it over
-    # BOTH mesh axes, not just 'y'.  At MoS2 12x12 / n_μ=2412 / rank 4700 that
-    # is 26.3 GB global: 6.6 GB/device on 'y' alone (times two for the
-    # in+out pair the loop needs) versus 1.6 GB/device over ('x','y').
-    #
-    # FITTED, not raw.  Splitting one array axis over the ('x','y') PRODUCT
-    # requires that product to divide the extent, and the extent here is
-    # ``nspinor · n_rtot`` — an FFT-box size, a datum, not something anyone
-    # rounded.  Raw, this line does not degrade at an awkward device count, it
-    # REFUSES: job 7882966 legs d16/d49/d64 all rc=1 with the same
-    # ``IndivisibleError`` on the cohsex fixture's 27000 = 2³·3³·5³, on the
-    # pre- AND post-rank-padding sources alike, which is what confines that
-    # gate to divisors of gcd(27000, 32) = 8.  It is the same class
-    # ``common/sharding_fit`` exists for, and this was the one member of the
-    # class not routed through it.
-    #
-    # The fitter keeps the LARGEST sub-product that divides rather than
-    # replicating outright, which is what makes it usable here: 27000 is
-    # indivisible by 64 but divisible by 8, so an 8x8 mesh keeps 8-way instead
-    # of refusing, and a 4x4 mesh keeps 4-way.  Only when NO sub-product
-    # divides (7x7: 27000 % 7 != 0) does Q go replicated, and then the
-    # announcement prints the per-device GiB — which for this array is the
-    # 26.3 GB figure above, i.e. a stop sign, correctly.
-    #
-    # NOT the cause of the P=64 htransform wall, and the two must not be
-    # conflated: on the MoS2 4x4 deck this extent is nspinor·n_rtot =
-    # 2·46080 = 92160, which divides 16 AND 64, so this line never fired
-    # there — that wall was the q-batch in bse_setup (see its ``bs`` block).
-    # Same class, different member, different failure mode: this one raises,
-    # that one silently replicated 32x.
-    #
-    # DURABLE FIX, as everywhere else in this class: pad rather than fit.  The
-    # r axis is a FREE index of the Q[α, x] contraction, so zero columns add
-    # zero columns to Q and G = Q Qᴴ sums over them — exactly-zero terms in a
-    # sum.  That is left undone here deliberately: it needs
-    # ``iter_psi_rchunk_bandwise`` to emit a padded r extent, which is a
-    # loader contract change, and it would re-block the G reduction (harmless
-    # but not free to gate).  ``sharding_fit.padded_extent`` is the call.
-    #
-    # Q IS 3-D — (rank, ns, n_rtot), NOT (rank, ns·n_rtot).  Folding the
-    # spinor axis into the sharded r axis is what made the accumulation
-    # contraction unrepresentable (a merged replicated+sharded axis has no
-    # NamedSharding), which forced the SPMD partitioner's full-replication
-    # fallback at P16 — see the block comment in ``_make_accum_kernel``.
-    # Kept separate, r shards on the ('x','y') sub-product dividing
-    # ``n_rtot`` and every consumer contraction is local.
-    sharding_q = _fit(mesh_xy, P(None, None, ('x', 'y')),
-                      (rank, nspinor, n_rtot), "htransform.Q(r-axis)")
-    _q_r_entry = sharding_q.spec[2]
-    q_shards = _shard_factor(mesh_xy, _q_r_entry)
-    # The band->r transition target: the SAME fitted r entry as Q, so the
-    # accumulation kernel's pinned input layout and Q's layout cannot
-    # drift apart.
-    psi_r_layout = NamedSharding(mesh_xy, P(None, None, None, _q_r_entry))
-
-    # ── The Q memory ledger + the non-fitting-mesh refusal ────────────────
-    # Priced BEFORE any step-3 compilation: Q (with its donated in/out
-    # overlap), the psi chunk in both transition layouts, the replicated
-    # Gram state, Vh, G and the resident psi(G-flat) window.  This is the
-    # charge the startup banner cannot make (rank is unknown there).
-    _p_y_shards = (int(mesh_xy.shape['y'])
-                   if n_rtot % int(mesh_xy.shape['y']) == 0 else 1)
-    _ledger = galerkin_q_ledger(
-        rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_rtot, band_chunk=_bc,
-        m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=int(np.prod(psi_G_win.shape)),
-        p_total=int(mesh_xy.size), q_shards=q_shards, y_shards=_p_y_shards)
-    log_fn(f"  Galerkin Q ledger (per device): Q sharded "
-           f"{sharding_q.spec} ({q_shards}-way on r), "
-           + ", ".join(f"{name} {b / 1024**3:.2f} GiB"
-                       for name, b in _ledger.items()))
-    _refuse_unfit_galerkin_mesh(
-        _ledger, rank=rank, nk=nk, nspinor=nspinor, n_rtot=n_rtot,
-        band_chunk=_bc, m_states=m_states, mu_pad=mu_pad,
-        psi_win_elems=int(np.prod(psi_G_win.shape)), mesh_xy=mesh_xy,
-        q_spec=sharding_q.spec, log_fn=log_fn)
-    grid_xy_G = grid_xy
-
-    @partial(jax.jit, donate_argnums=(0, 1), out_shardings=grid_xy_G)
-    def _fold_G(Q, G_in):
-        # Contract (s, r) locally per r shard; the partitioner closes the
-        # (rank, rank) face with one all-reduce.  Same sum as the
-        # historical flattened ``Q @ Q^H`` — the spinor axis is merely no
-        # longer folded into r (value-level parity: reduction blocking
-        # changes, the summed terms do not).
-        return G_in + jnp.einsum('asr,bsr->ab', Q, jnp.conj(Q),
-                                 optimize=True)
-
-    # Allocate G sharded directly.  ``jax.device_put(jnp.zeros(...), sharding)``
-    # on a multi-process mesh hands JAX an UNCOMMITTED fully-addressable array,
-    # which takes ``_device_put_sharding_impl``'s ``multihost_utils.assert_equal``
-    # branch — a real ``process_allgather`` of ``P · rank² · 16`` B (178 MB/rank
-    # per process at rank 4716, so 11 GB/rank at P=64) to assert that a block of
-    # zeros is the same everywhere.  Same fix, same reason, as ``Q`` below.
-    #
-    # PAD BLOCK.  ``inv_s`` is zero on the pad rows, so Q's pad rows — and
-    # therefore Q Qᴴ's pad rows and columns — are EXACTLY zero and G would be
-    # singular there.  Seed the pad diagonal with 1 so G is block-diagonal
-    # ``[[G_phys, 0], [0, I]]``.  ``potrf`` on that returns exactly
-    # ``blockdiag(chol(G_phys), I)``: for j ≥ rank_phys every A[j,k<j] is an
-    # exact 0 and L[j,k] = 0/L[k,k] = 0, so L[j,j] = sqrt(1 − 0) = 1.  The
-    # physical block is therefore factored bit-identically to the unpadded
-    # run, and ctilde/B/W_proj acquire exactly-zero pad columns/rows.
-    # ``n_pad == 0`` keeps the historical zeros allocation untouched.
-    def _alloc_G():
-        Z = jnp.zeros((rank, rank), dtype=jnp.complex128)
-        if n_pad:
-            d = jnp.concatenate([jnp.zeros(rank - n_pad, dtype=jnp.float64),
-                                 jnp.ones(n_pad, dtype=jnp.float64)])
-            Z = Z + jnp.diag(d).astype(jnp.complex128)
-        return Z
-
-    G = jax.jit(_alloc_G, out_shardings=grid_xy)()
-
-    t2 = time.time()
-    chunk_count = 0
-    UH_kb = UH.reshape(rank, nk, nb)  # for band-chunk slicing
-    # Allocate Q ALREADY SHARDED.  ``device_put(jnp.zeros(...), sharding)``
-    # builds the whole (rank, nspinor, n_rtot) array on one device first
-    # and only then distributes it — 23.4 GB in a single allocation at
-    # MoS2 12x12 / n_μ=2412, which OOMs the card before the sharded copy
-    # exists.
-    Q = jax.jit(lambda: jnp.zeros((rank, nspinor, n_rtot),
-                                  dtype=jnp.complex128),
-                out_shardings=sharding_q)()
-    from common.progress import LoopProgress
-    _g_progress = LoopProgress(
-        len(band_chunk_ranges), progress_fn or (lambda *_: None),
-        title="Galerkin real-space accumulation", item_name="band chunk",
-        max_updates=min(len(band_chunk_ranges), 12),
-        enabled=progress_fn is not None).start()
-    for bc_range, psi_bc_Y in iter_psi_rchunk_bandwise(
-            wfn, sym, meta, mesh_xy, band_range, 0, n_rtot, bispinor,
-            band_chunk_size=band_chunk_size,
-            band_chunk_ranges=band_chunk_ranges,
-            band_pad_to=_bc,
-            psi_G_flat=psi_G_win):
-        bc = bc_range[1] - bc_range[0]
-        bc_lo = bc_range[0] - b_start
-        bc_hi = bc_range[1] - b_start
-        # ``iter_psi_rchunk_bandwise(band_pad_to=_bc)`` zero-pads every
-        # chunk's band axis to the SINGLE width ``w`` (= _bc for full
-        # chunks; the remainder chunk is padded up to it too), so
-        # ``to_rchunk`` and ``_accum`` compile ONCE for the whole sweep
-        # instead of recompiling per distinct remainder width.  The
-        # contraction operand UH_bc has to match that width: the real
-        # bands occupy columns [0, bc); the trailing (w - bc) columns
-        # multiply psi's zero pad-bands, so zero-filling them keeps Q
-        # bit-identical.  (This also removes a latent shape mismatch when
-        # the loader's own p_band round-up already made w > bc.)
-        w = int(psi_bc_Y.shape[1])
-        UH_bc_kb = UH_kb[:, :, bc_lo:bc_hi]              # (rank, nk, bc)
-        if w > bc:
-            UH_bc_kb = jnp.pad(UH_bc_kb, ((0, 0), (0, 0), (0, w - bc)))
-        UH_bc = UH_bc_kb.reshape(rank, nk * w)
-
-        accum = _make_accum_kernel(rank, w, nspinor, mesh_xy,
-                                   rep, psi_r_layout, sharding_q)
-        # THE explicit band->r all-to-all, in its own jit, BEFORE the
-        # contraction.  Donates the loader-layout slab; only the r-layout
-        # copy survives into ``_accum``.
-        to_r = _make_to_r_kernel(mesh_xy, psi_r_layout)
-        psi_bc_r = to_r(psi_bc_Y)
-        del psi_bc_Y
-        Q = accum(UH_bc, inv_s, psi_bc_r, Q)
-        del psi_bc_r
-        chunk_count += 1
-        _g_progress.step()
-    _g_progress.finish()
-    del psi_G_win  # window served its last consumer; free before Q Qᴴ
-    G = _fold_G(Q, G)
-    del Q
-    jax.block_until_ready(G)
-    log_fn(f"  G accumulation: {chunk_count} band chunk(s) summed into Q, "
-           f"then one Q Qᴴ fold, {time.time()-t2:.2f}s")
-
-    # ── 4. Cholesky on G ──
-    # FFI seam: gw_jax's factor_c_q (which has dual 1×1-dense /
-    # 2D-blocked paths) is the natural drop-in for distributed scaling, but
-    # its 1e-14·trace ridge is calibrated for ISDF's huge-trace C_q matrices
-    # and biases htransform's small-trace G by ~1e-5. Use raw Cholesky for
-    # numerical parity with the legacy pipeline; swap to factor_c_q
-    # (or its FFI variant) when n_μ scales to where rank-deficiency dominates.
-    t3 = time.time()
-    L = jnp.linalg.cholesky(G)
-    log_fn(f"  Cholesky of G: {time.time()-t3:.2f}s")
-
-    # ── 5. ctilde = coeffs · L + ortho diagnostic + B = L⁻¹V^H ──
-    # B is the rank-α basis evaluated at the centroids:
-    #   ψ_nk(r_μ, s) = Σ_α ctilde[k,n,α] · B[α, s, μ]
-    # Math: with A = ψ at centroids = U s V^H, the Cholesky-orthogonalised
-    # interpolation vectors at r_μ are exactly L^{-1} V^H (in the (ns, n_μ)
-    # column index of V^H). This is what downstream Fourier-upscaling +
-    # reconstruction needs to recover ψ at any new k at the centroids.
-    @jax.jit
-    def _finalize(coeffs, L):
-        coeffs = coeffs @ L
-        ctilde = coeffs.reshape(nk, nb, rank)
-        CtC = ctilde[0] @ ctilde[0].conj().T
-        ortho_err = jnp.max(jnp.abs(CtC - jnp.eye(nb, dtype=ctilde.dtype)))
-        return ctilde, ortho_err
-
-    ctilde, ortho_err = _finalize(coeffs, L)
-    ctilde = jax.device_put(ctilde, rep)
-    if rank_multiplier > 0.0:
-        # A truncated GLOBAL SVD is a least-squares shared span, but its band
-        # rows at one k are not exactly orthonormal.  fH's coarse-grid energy
-        # identity requires that local invariant.  The polar factor is the
-        # closest row-isometry and changes only this explicit approximate
-        # route; the historical numerical-rank coefficients never pass here.
-        _lowdin = jax.jit(
-            _lowdin_orthonormalize_band_rows,
-            out_shardings=(rep, rep, rep, rep, rep, rep))
-        (ctilde, _lowdin_lmin, _lowdin_lmax, _ortho_before,
-         _ortho_after, _lowdin_move) = _lowdin(ctilde)
-        _stats = [float(x) for x in jax.device_get(jnp.stack([
-            _lowdin_lmin, _lowdin_lmax, _ortho_before, _ortho_after,
-            _lowdin_move]))]
-        lmin, lmax, ortho_before, ortho_after, lowdin_move = _stats
-        if (not np.isfinite(lmin) or not np.isfinite(lmax) or lmax <= 0.0
-                or lmin <= 1.0e-12 * lmax):
-            raise ValueError(
-                "streaming_galerkin_solve: the requested reduced cross-k "
-                "basis does not span all bands at every k: the smallest/"
-                f"largest eigenvalue of C_k C_k^H is {lmin:.6e}/"
-                f"{lmax:.6e}.  The per-k Löwdin map would amplify by more "
-                "than 1e6.  Increase htransform_rank_multiplier (or use 0 "
-                "for the exact numerical-rank path).")
+    # The whole-state ledger describes allocations made *after this point*.
+    # Compare it with the allocator budget still available to the fit, not
+    # with the arena limit: the driver, WFN metadata and symmetry service are
+    # already live.  ``get_device_memory_info`` is the public owner of that
+    # policy and retains its standard 10% reserve for allocator fragmentation
+    # and state materialised between planning and the first streamed slab.
+    from common.gpu_utils import get_device_memory_info
+    memory = get_device_memory_info()
+    local_fit_budget = int(float(memory["budget_gb"]) * 1.0e9)
+    # The carrier and r-chunk extents are shared static control flow.  BFC
+    # residency is rank-local and asynchronous, so one rank choosing from its
+    # own larger budget can send its peers into a different compile/loop
+    # schedule.  Resolve one worst-rank budget through the process-collective
+    # service before planning any static extent.
+    from common.collectives import all_gather_processes
+    process_budgets = np.asarray(
+        all_gather_processes(np.asarray(local_fit_budget, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if process_budgets.size == 0 or np.any(process_budgets <= 0):
+        raise RuntimeError(
+            "htransform live-capacity gather returned no positive budget")
+    device_fit_budget = float(np.min(process_budgets))
+    if log_fn is not None:
         log_fn(
-            f"  [reduced-galerkin] per-k Löwdin row isometry: "
-            f"eig(C C^H) min/max={lmin:.6e}/{lmax:.6e}, "
-            f"max|C C^H-I| {ortho_before:.3e} -> {ortho_after:.3e}, "
-            f"max relative coefficient move={lowdin_move:.3e}.  The move is "
-            "the declared cross-k compression error; final acceptance comes "
-            "from the on-grid wavefunction and exciton-spectrum A/B gates.")
-        ortho_err = jnp.asarray(ortho_after)
-
-    # B = L⁻¹ Vᴴ, μ-SHARDED end-to-end (replaces the replicated B_at_mu).
-    # The triangular solve runs along the rank axis and is independent per μ
-    # column, so it stays local on each μ shard; the spinor axis is moved in
-    # front as the (broadcast) batch axis so no reshape ever merges the
-    # replicated ns axis with the sharded μ axis.  The trailing slice trims
-    # the loader μ-pad to the TRUE centroid count; n_μ divides the mesh axis
-    # only by luck, so the output sharding is FITTED (announced replication
-    # fallback, never a refusal).
-    b_shard = _fit(mesh_xy, P(None, None, 'y'), (rank, nspinor, n_mu),
-                   "htransform.B_at_mu(mu-axis)")
-
-    @partial(jax.jit, out_shardings=b_shard)
-    def _b_at_mu(L, Vh):
-        Vt = jnp.moveaxis(Vh, 1, 0)          # (ns, rank, μ_pad)
-        B = jax.vmap(lambda rhs: jsp_linalg.solve_triangular(
-            L, rhs, lower=True))(Vt)
-        return jnp.moveaxis(B, 0, 1)[..., :n_mu]
-
-    B_at_mu = _b_at_mu(L, Vh_sh)
-    del Vh_sh
-    # ``jnp.eye`` run EAGERLY is not one module but six —
-    # ``iota`` x2 (compiled TWICE: the two operands differ only in
-    # dimension), ``add``, ``equal``, ``convert_element_type`` x2 — because
-    # every eager jnp op is its own single-primitive XLA module (measured,
-    # job 7884866: 6 of this driver's 137).  One jit, one module, and an
-    # explicit ``rep`` out_sharding rather than whatever the enclosing mesh
-    # context happens to infer — the same spelling ``_alloc_G`` and the Q
-    # allocation above already use.  Exact identity either way.
-    S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128),
-                out_shardings=rep)()
-    log_fn(f"  ctilde[0] orthogonality error: {float(ortho_err):.3e}")
-    log_fn(f"  Total Galerkin: {time.time()-t0:.2f}s")
-
-    if return_full_proj:
-        # W_proj = L⁻¹ diag(1/s) U^H — the α-basis-on-full-r projector (see
-        # docstring).  (rank, nk·nb) replicated; small (≲ tens of MB).
-        W_proj = jsp_linalg.solve_triangular(L, inv_s * UH, lower=True)
-        W_proj = jax.device_put(W_proj, rep)
-        return S, ctilde, B_at_mu, W_proj
-    return S, ctilde, B_at_mu
+            "  Whole-state live fit budget: "
+            f"{device_fit_budget/2**30:.2f} GiB/device from "
+            f"worst-rank reserve (this rank "
+            f"{local_fit_budget/2**30:.2f} GiB; "
+            f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
+            f"({memory['source']}); the allocator limit is not reusable "
+            "capacity while earlier driver state remains live)")
+    basis = fit_galerkin_basis(
+        wfn, sym, meta, centroid_indices, mesh_xy, band_range,
+        log_fn=log_fn,
+        band_chunk_size=band_chunk_size,
+        bispinor=bispinor,
+        rank_multiplier=rank_multiplier,
+        qr_eps=qr_eps,
+        qrcp_seed=qrcp_seed,
+        q_tile_budget=resolve_galerkin_chunk_bytes(),
+        device_pool_limit=device_fit_budget,
+        extra_rank_pad=extra_rank_pad,
+        progress_fn=progress_fn,
+        rank_record_fn=rank_record_fn,
+        distrib_la_batched_route=distrib_la_batched_route,
+    )
+    if basis_output:
+        write_galerkin_basis(
+            os.fspath(basis_output), basis, wfn=wfn, meta=meta,
+            centroid_indices=centroid_indices, bispinor=bispinor,
+            rank_multiplier=rank_multiplier, qrcp_eps=qr_eps,
+            qrcp_seed=qrcp_seed, mesh_xy=mesh_xy)
+        log_fn(
+            f"  [galerkin-restart] wrote physical rank "
+            f"{basis.rank_physical} to {basis_output}")
+    return basis
 
 
 def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
@@ -1489,22 +407,145 @@ def _fh_locality_metrics(fh_r: jax.Array,
     return shell_fraction, shell_max_over_r0
 
 
+def select_active_eigenpairs(eigenvalues: jax.Array,
+                             eigenvectors: jax.Array,
+                             active_character: jax.Array,
+                             n_active: int,
+                             *, n_physical: int | None = None,
+                             n_return: int | None = None):
+    """Select the transformed eigenpairs with maximum active-subspace weight.
+
+    ``eigenvectors[..., :, j]`` is eigenvector ``j`` of the already-built
+    htransform matrix and ``active_character`` is the Fourier interpolant of
+
+        P_A(k) = sum_{n < n_active} |c_nk><c_nk|.
+
+    The returned values are ordered by energy.  Selection itself is by
+    ``<u_j|P_A|u_j>`` with stable energy/index tie-breaking.  Eigenvector phase
+    cancels in this expectation value and no eigenvector leaves standalone
+    htransform, so there is deliberately no phase-fixing/output API here.
+
+    ``n_physical`` excludes fH's rank-minus-state null carrier *before*
+    character ranking.  Away from a coarse node the independently
+    interpolated fH and P_A matrices need not commute, so a null-carrier
+    eigenvector can have nonzero character; it is not a fitted state and may
+    never displace one.
+
+    The character operator is positive at the coarse samples by construction.
+    Its finite Fourier interpolant need not be positive between samples, so no
+    clipping or projector fiction is applied: signed character values are
+    ranked directly and the caller receives the boundary gap needed for the
+    numerical-ambiguity refusal.
+
+    Returns
+    -------
+    values, scores, score_gap, score_tol, cluster_values, cluster_mask,
+    min_nonreturned_value
+        Batched arrays.  ``cluster_values`` and ``cluster_mask`` describe the
+        complete score-tied cluster crossing the selection boundary, not just
+        the last selected and first rejected neighbours.  ``score_tol`` is a
+        backward-error scale, not a physics tolerance.
+    """
+    rank = int(eigenvalues.shape[-1])
+    n_total = rank if n_physical is None else int(n_physical)
+    if not (0 < n_total <= rank):
+        raise ValueError(
+            f"select_active_eigenpairs: n_physical={n_total} must lie in "
+            f"[1, {rank}].")
+    eigenvalues = eigenvalues[..., :n_total]
+    eigenvectors = eigenvectors[..., :, :n_total]
+    n_active = int(n_active)
+    if not (0 < n_active < n_total):
+        raise ValueError(
+            f"select_active_eigenpairs: n_active={n_active} must lie in "
+            f"[1, {n_total - 1}] for an active/guard split.")
+    n_return = n_active if n_return is None else int(n_return)
+    if not (0 < n_return <= n_active):
+        raise ValueError(
+            f"select_active_eigenpairs: n_return={n_return} must lie in "
+            f"[1, {n_active}] for the selected active block.")
+
+    scores = jnp.real(jnp.einsum(
+        '...mi,...mn,...ni->...i',
+        jnp.conj(eigenvectors), active_character, eigenvectors,
+        optimize=True))
+    # ``eigh`` orders by energy.  A stable descending-character sort therefore
+    # resolves equal characters by lower energy and finally by the incumbent
+    # eigenpair index; no backend-dependent phase enters the assignment.
+    by_character = jnp.argsort(-scores, axis=-1, stable=True)
+    selected_idx = by_character[..., :n_active]
+    rejected_idx = by_character[..., n_active:]
+
+    selected_values = jnp.take_along_axis(
+        eigenvalues, selected_idx, axis=-1)
+    selected_scores = jnp.take_along_axis(scores, selected_idx, axis=-1)
+
+    # Publish bands in energy order after the state-character selection.
+    by_energy = jnp.argsort(selected_values, axis=-1, stable=True)
+    selected_values = jnp.take_along_axis(
+        selected_values, by_energy, axis=-1)
+    selected_scores = jnp.take_along_axis(
+        selected_scores, by_energy, axis=-1)
+    rejected_values = jnp.take_along_axis(
+        eigenvalues, rejected_idx, axis=-1)
+    nonreturned_values = jnp.concatenate(
+        (selected_values[..., n_return:], rejected_values), axis=-1)
+    min_nonreturned_value = jnp.min(nonreturned_values, axis=-1)
+
+    last_selected_idx = by_character[..., n_active - 1:n_active]
+    first_rejected_idx = rejected_idx[..., :1]
+    character_values = jnp.take_along_axis(
+        eigenvalues, by_character, axis=-1)
+    character_scores = jnp.take_along_axis(scores, by_character, axis=-1)
+    score_gap = (jnp.take_along_axis(scores, last_selected_idx, axis=-1)
+                 - jnp.take_along_axis(scores, first_rejected_idx, axis=-1)
+                 ).squeeze(axis=-1)
+    score_scale = jnp.maximum(1.0, jnp.max(jnp.abs(scores), axis=-1))
+    score_tol = (64.0 * jnp.finfo(scores.dtype).eps
+                 * float(n_total) * score_scale)
+    links = ((character_scores[..., :-1] - character_scores[..., 1:])
+             <= score_tol[..., None])
+    left_links = links[..., :n_active - 1]
+    left_connected = jnp.flip(
+        jnp.cumprod(jnp.flip(left_links, axis=-1), axis=-1), axis=-1).astype(bool)
+    left_connected = jnp.concatenate(
+        (left_connected,
+         jnp.ones(left_connected.shape[:-1] + (1,), dtype=bool)), axis=-1)
+    right_links = links[..., n_active:]
+    right_connected = jnp.cumprod(right_links, axis=-1).astype(bool)
+    right_connected = jnp.concatenate(
+        (jnp.ones(right_connected.shape[:-1] + (1,), dtype=bool),
+         right_connected), axis=-1)
+    boundary_link = links[..., n_active - 1]
+    cluster_mask = (jnp.concatenate(
+        (left_connected, right_connected), axis=-1)
+        & boundary_link[..., None])
+    return (selected_values, selected_scores, score_gap, score_tol,
+            character_values, cluster_mask, min_nonreturned_value)
+
+
 def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
+               active_band_range: tuple[int, int] | None = None,
                log_fn=None, quality_record_fn=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
     Math (htransform paper):
         fH_k  = -Σ_n |sqrt(-f(ε_n,k))|² ctilde_n,k ctilde_n,k^H
               = Σ_n f(ε_n,k) ctilde_n,k ctilde_n,k^H
-        fH_R  = (1/N_k) Σ_k e^{-2πi k·R} fH_k                          # IFFT
+        fH_R  = (1/N_k) Σ_k e^{+2πi k·R} fH_k                          # IFFT
     where f(ε) is the smooth bandwidth-bound transform from
     ``f_transform_eigs`` (≤0 for ε<shift, =0 for ε≥shift). For any q,
-    fH_q = Σ_R e^{-2πi q·R} fH_R recovers the rank-α-basis Hamiltonian
+    fH_q = Herm[Σ_R e^{-2πi q·R} fH_R] recovers the rank-α-basis Hamiltonian
     whose eigenvalues are f(ε_n,q) and whose eigenvectors are c_n,q,
     enabling both bandstructure interpolation (eigvalsh + newton_inv on
     eigvals) and wfn recovery (eigh, then ψ_n,q(r_μ) = Σ_α c_n,q[α]·B[α,s,μ]).
+
+    The paper/archive use the conjugate sign pair.  Because every ``fH_k`` is
+    Hermitian and both implementations Hermitize the reconstructed matrix,
+    the two spellings are exactly equivalent; keeping the signs here aligned
+    with the actual IFFT prevents a documentation-only convention mismatch.
 
     Args:
         ctilde:    (nk_co, nb, rank) Galerkin coefficients in the rank-α basis,
@@ -1514,6 +555,10 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         mesh_xy:   ('x','y') device mesh.
         a_band_index: optional band index whose bandwidth sets ``a``;
                    defaults to top of the htransform window (nb-1).
+        active_band_range: if set, also build the Fourier-interpolated
+                   character operator from this half-open compact-row range.
+                   This is the corrected-QP/DFT-guard selector; it uses the
+                   same compact gauge and canonical flat-k transform as fH.
         log_fn:    optional logger.
         quality_record_fn: optional callback receiving the shared
                    row-isometry and real-space-locality receipt.  The
@@ -1525,6 +570,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
         params:  (a_f, n_f, shift) — for ``newton_inv`` on the eigvals of fH_q.
         f_eps:   (nb, nk_co) f-transformed eigenvalues, replicated.
+        active_R: (nk_co, rank, rank), sharded P(None, 'x', 'y'), or None.
     """
     if log_fn is None:
         log_fn = lambda *a, **kw: None
@@ -1536,13 +582,33 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
 
     flat_xy = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     spec_3d = P(None, None, None, 'x', 'y')
+    rep_ = NamedSharding(mesh_xy, P())
     # 'backward' = 1/N normalisation in IFFT — matches Σ_R e^{-2πik·R} fH_R = fH_k.
     local_ifftn = make_flat_k_ifftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
+    local_fftn = make_flat_k_fftn(mesh_xy, kgrid_co, spec_3d, norm='backward')
 
     # ``f_eps.T`` at the call site was its own eager ``transpose`` module;
     # transposing inside costs nothing and removes one compile (exact — a
     # transpose is a permutation of the same f64 values).
-    @partial(jax.jit, out_shardings=(flat_xy, flat_xy))
+    if active_band_range is not None:
+        active_start, active_stop = map(int, active_band_range)
+        if not (0 <= active_start < active_stop <= int(ctilde.shape[1])):
+            raise ValueError(
+                "build_fH_R: active_band_range="
+                f"[{active_start},{active_stop}) must lie inside [0, "
+                f"{int(ctilde.shape[1])}).")
+        if active_stop - active_start >= int(ctilde.shape[1]):
+            raise ValueError(
+                "build_fH_R: the active range covers every fitted state; "
+                "use the ordinary full-H energy ordering because no DFT "
+                "guard boundary exists.")
+    else:
+        active_start = active_stop = 0
+    active_out = flat_xy if active_band_range is not None else rep_
+
+    @partial(jax.jit,
+             out_shardings=(flat_xy, flat_xy, active_out,
+                            rep_, rep_, rep_, rep_, rep_))
     def _build(ctilde_in, f_eps_in):
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
@@ -1562,102 +628,114 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         fH_k = 0.5 * (fH_k + jnp.swapaxes(fH_k, -1, -2).conj())
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
         fH_R = local_ifftn(fH_k)
-        return fH_k, fH_R
 
-    # ── THE ON-GRID RECOVERY GATE ─────────────────────────────────────────
-    # fH_k = Σ_n f(ε_n,k) c_n,k c_n,kᴴ has eigenvalues EXACTLY {f(ε_n,k)} (plus
-    # rank−nb exact zeros) if and only if the rows of ctilde[k] are
-    # orthonormal.  When they are not, the eigenvalues are no longer f(ε_n)
-    # and ``newton_inv`` returns wrong ENERGIES on the coarse grid — silently,
-    # with a Hermitian positive-semidefinite fH, a successful Cholesky
-    # upstream and a plot that looks fine.
-    #
-    # WHY HERE.  This is the one function BOTH consumers pass through — the
-    # ``bandstructure.htransform`` CLI and ``bandstructure.bse_setup.
-    # compute_wfns_fi`` (hence ``bse.exciton_bands``).  Gating here covers the
-    # exciton path without reaching into it.
-    #
-    # WHY ALL k.  ``streaming_galerkin_solve`` prints ``ctilde[0]`` only, and
-    # k=0 is Γ, the most symmetric point in the zone.  Cheap to fix: this is
-    # nk·nb²·rank, four orders below the nk·rank³ of an eigendecomposition.
-    #
-    # THE THRESHOLD IS MEASURED, not chosen.  Jobs 7883150 / 7883160, MoS2 4×4
-    # / n_μ=785 / rtol 1e-8, walking ncond across the capacity limit
-    # (nk·nb → nspinor·n_μ = 1570).  ``ortho`` is this number; ``on-grid'' is
-    # the order-matched max|Δε| over the whole band window against the stored
-    # eigenvalues:
-    #
-    #   ncond  nk·nb  rank   ortho      on-grid max   on-grid over BSE cond
-    #     70    1536  1536   1.87e-14   3.2e-05 meV        8.8e-11 meV
-    #     71    1552  1551   2.97e-04   2.955   meV        0.201   meV   ←
-    #     72    1568  1562   6.31e-04   6.939   meV        0.242   meV
-    #     74    1600  1570   3.11e-03   23.60   meV        0.860   meV
-    #     78    1632  1570   9.35e-03   88.92   meV        3.142   meV
-    #
-    # Losing ONE direction of 1552 (rank 1551) is what crosses the owner's
-    # 0.1 meV requirement.  Over that range on-grid max|Δε| ≈ 9.0e3 · ortho
-    # (7.6e3 … 1.1e4), so a cap of 1e-6 holds the on-grid energy error under
-    # ~0.01 meV with a decade of margin, while every healthy configuration
-    # measured — every window from nb=30 to nb=96 — sits at 1.9e-14, EIGHT
-    # decades below the cap.  There is no false-positive room here.
-    #
-    # AND IT IS NOT A CONDITIONING PROBLEM, so do not reach for ``rtol``.
-    # Same job, ncond=72, tightening the amplification cap makes it WORSE
-    # because it discards more of a basis that already cannot span:
-    #     rtol 1e-8 → rank 1562, ortho 6.31e-04, on-grid  6.9 meV
-    #     rtol 1e-6 → rank 1494, ortho 1.04e-02, on-grid 80.3 meV
-    #     rtol 1e-4 → rank 1086, ortho 2.61e-02, on-grid 219.3 meV
-    # The lever for the EXACT-SPAN route is n_μ (or a narrower window), never
-    # the truncation tolerance.  ``htransform_rank_multiplier`` is different:
-    # it declares a reduced cross-k MODEL and restores the row-isometry with a
-    # per-k polar factor before this gate.  Its accuracy is decided by an
-    # observable A/B, not by relabeling its cut as numerical noise.
-    #
-    # ``LORRAX_FH_ORTHO_TOL`` overrides; 0 disables. Never disable to make a
-    # run finish — the failure it catches is a wrong number, not a crash.
-    rep_ = NamedSharding(mesh_xy, P())
+        if active_band_range is None:
+            active_R = jnp.empty((0,), dtype=ctilde_in.dtype)
+            active_fft_roundtrip_rel = jnp.asarray(0.0, dtype=f_eps_in.dtype)
+        else:
+            active_rows = ctilde_in[:, active_start:active_stop, :]
+            active_k = jnp.einsum(
+                'kim,kin->kmn', active_rows, jnp.conj(active_rows),
+                optimize=True)
+            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+            active_k = 0.5 * (
+                active_k + jnp.swapaxes(active_k, -1, -2).conj())
+            active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
+            active_R = local_ifftn(active_k)
+            active_fft_abs = jnp.max(jnp.abs(local_fftn(active_R) - active_k))
+            active_scale = jnp.max(jnp.abs(active_k))
+            active_fft_roundtrip_rel = jnp.where(
+                active_scale > 0.0, active_fft_abs / active_scale,
+                active_fft_abs)
 
+        # The rank-by-rank fH eigensolve is not needed to certify its coarse
+        # spectrum.  If A = sqrt(-f(eps)) C, the nonzero eigenvalues of
+        # -A^H A are exactly those of the much smaller -A A^H.  This checks
+        # every coarse k in the nb-by-nb state space while the weighted rows
+        # are already live, rather than compiling a rank-by-rank Gamma-only
+        # eigensolve beside the production batched eigensolver.
+        small_fH = -jnp.einsum(
+            'kim,kjm->kij', weighted, jnp.conj(weighted), optimize=True)
+        small_fH = 0.5 * (small_fH + jnp.swapaxes(small_fH, -1, -2).conj())
+        recovered_f = jax.vmap(jnp.linalg.eigvalsh)(small_fH)
+        expected_f = jnp.sort(f_eps_T, axis=1)
+        f_recovery_error = jnp.max(jnp.abs(recovered_f - expected_f))
+        recovered_e, inverse_residual = newton_inv(
+            a_f, n_f, shift, recovered_f.real)
+        energy_recovery_error = jnp.max(
+            jnp.abs(jnp.sort(recovered_e, axis=1)
+                    - jnp.sort(enk_sigma.T, axis=1)))
+
+        # Use the paired canonical flat-k service for the complete inverse
+        # transform.  A one-point explicit Fourier sum can certify Gamma while
+        # still missing an ordering, normalization or non-Gamma defect.
+        fft_roundtrip_abs = jnp.max(jnp.abs(local_fftn(fH_R) - fH_k))
+        fft_scale = jnp.max(jnp.abs(fH_k))
+        fft_roundtrip_rel = jnp.where(
+            fft_scale > 0.0, fft_roundtrip_abs / fft_scale,
+            fft_roundtrip_abs)
+        return (fH_k, fH_R, active_R, fft_roundtrip_rel,
+                active_fft_roundtrip_rel, f_recovery_error,
+                energy_recovery_error, jnp.max(inverse_residual))
+
+    # Projection receipt, not a rank gate.  The published whole-state QRCP
+    # basis is deliberately approximate, so C C^H need not be the identity.
+    # Applying a per-k Löwdin map would change the one shared alpha gauge and
+    # is therefore forbidden.  Accuracy is decided directly from recovered
+    # coarse-grid energies/wavefunctions and the independent fine-QE oracle.
     @partial(jax.jit, out_shardings=rep_)
     def _ortho_all_k(c):
         nb_ = c.shape[1]
         G = jnp.einsum('kim,kjm->kij', c, jnp.conj(c), optimize=True)
         return jnp.max(jnp.abs(G - jnp.eye(nb_, dtype=G.dtype)[None]))
 
-    _ortho = float(_ortho_all_k(ctilde))
-    _tol = resolve_fh_ortho_tol(log_fn)
-    log_fn(f"  [gate] ctilde orthonormality over ALL {int(ctilde.shape[0])} k: "
-           f"max|C Cᴴ − I| = {_ortho:.3e}  (cap {_tol:.1e}; measured "
-           f"conversion: on-grid max|Δε| ≈ 9.0e3 × this, so this run's "
-           f"on-grid energy error is ≈ {9.0e3 * _ortho:.2e} meV)")
-    if _tol > 0.0 and _ortho > _tol:
-        raise ValueError(
-            f"build_fH_R: the Galerkin coefficients are NOT orthonormal — "
-            f"max|C Cᴴ − I| = {_ortho:.3e} over all k, above the {_tol:.1e} "
-            f"cap.  fH's eigenvalues are then not f(ε_n) and the recovered "
-            f"ENERGIES are wrong on the coarse grid by roughly "
-            f"{9.0e3 * _ortho:.2e} meV, silently.  Cause, in order of "
-            f"likelihood: (1) ψ-at-centroids cannot span the band window — "
-            f"check the rank line from streaming_galerkin_solve for "
-            f"rank < nk·nb.  THREE repairs, and which one applies depends on "
-            f"WHY the span failed: MORE CENTROIDS or a NARROWER window if the "
-            f"basis is genuinely too small for the bands; or an explicit "
-            f"reduced model order, htransform_rank_multiplier >= 1, if the "
-            f"span failed because nk·nb grew with the K-POINT COUNT.  The "
-            f"exact-span route retains up to nk·nb directions, so on a dense "
-            f"metal grid it demands a basis that grows with N_k, which the "
-            f"method's own scaling contract does not (Wu et al. S1 estimates "
-            f"the QRCP basis at 20–40·N_b, INDEPENDENT of N_k, and reports "
-            f"N_mu saturating as N_k grows).  Measured: Na 512 k × 12 bands "
-            f"with the validated c1016 basis retains the full column rank "
-            f"2032 and refuses here at 2.324e-4, while the SAME basis "
-            f"completes at three bands — buying centroids is the wrong "
-            f"repair for that shape.  Never rtol: same job, tightening the "
-            f"amplification cap made ortho WORSE (1e-8 → 6.31e-4, 1e-6 → "
-            f"1.04e-2, 1e-4 → 2.61e-2).  (2) the G accumulation summed Q Qᴴ "
-            f"per band chunk instead of summing into Q first.  Override with "
-            f"LORRAX_FH_ORTHO_TOL only to reproduce a known-bad run.")
+    _projection_defect = float(_ortho_all_k(ctilde))
+    log_fn(
+        f"  [receipt] whole-state projection over all "
+        f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
+        f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
 
-    fH_k, fH_R = _build(ctilde, f_eps)
+    (fH_k, fH_R, active_R, fft_roundtrip_rel,
+     active_fft_roundtrip_rel, f_recovery_error,
+     energy_recovery_error, inverse_residual) = _build(ctilde, f_eps)
+    log_fn(
+        f"  [receipt] all-{int(ctilde.shape[0])}-coarse-k canonical FFT "
+        f"round-trip scale-relative max|FFT(IFFT(fH))-fH|="
+        f"{float(fft_roundtrip_rel):.3e} "
+        f"(limit {FLAT_K_FFT_VALUE_RTOL:.1e})")
+    fft_rel = float(fft_roundtrip_rel)
+    if not np.isfinite(fft_rel) or fft_rel > FLAT_K_FFT_VALUE_RTOL:
+        raise ValueError(
+            "build_fH_R: canonical flat-k FFT round-trip violated the "
+            f"registered value-level contract: relative residual "
+            f"{fft_rel:.6e} exceeds {FLAT_K_FFT_VALUE_RTOL:.1e}.  "
+            "The forward/inverse pair must preserve every coarse-k fH tile; "
+            "do not publish or interpolate this Hamiltonian.")
+    if active_band_range is not None:
+        active_fft_rel = float(active_fft_roundtrip_rel)
+        log_fn(
+            "  [receipt] active-character P_A from compact rows "
+            f"[{active_start},{active_stop}) "
+            f"({active_stop - active_start} state(s)): "
+            f"canonical FFT round-trip relative residual="
+            f"{active_fft_rel:.3e} (limit {FLAT_K_FFT_VALUE_RTOL:.1e}); "
+            "P_A(k) is positive by construction, off-grid P_A(q) is "
+            "unclipped")
+        if (not np.isfinite(active_fft_rel)
+                or active_fft_rel > FLAT_K_FFT_VALUE_RTOL):
+            raise ValueError(
+                "build_fH_R: active-character canonical flat-k FFT "
+                f"round-trip residual {active_fft_rel:.6e} exceeds "
+                f"{FLAT_K_FFT_VALUE_RTOL:.1e}; do not select or publish "
+                "an active returned subspace.")
+    log_fn(
+        f"  [receipt] all-coarse transformed spectrum: "
+        f"max|eig(-A A^H)-f(eps)|={float(f_recovery_error):.3e} Ry; "
+        f"max recovered-energy residual="
+        f"{float(energy_recovery_error):.3e} Ry; Newton residual="
+        f"{float(inverse_residual):.3e} Ry")
+    require_newton_converged(
+        float(inverse_residual), where="build_fH_R all-coarse recovery")
     if quality_record_fn is not None:
         from time import perf_counter as _quality_clock
         _quality_t0 = _quality_clock()
@@ -1665,31 +743,62 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         _shell_fraction, _shell_max_over_r0 = jax.device_get(
             _fh_locality_metrics(fH_R, jnp.asarray(_outer_shell)))
         quality_record_fn({
-            "row_isometry_max": float(_ortho),
-            "row_isometry_cap": float(_tol),
+            "row_isometry_max": _projection_defect,
             "outer_shell_l2_fraction": float(_shell_fraction),
             "outer_shell_max_over_r0": float(_shell_max_over_r0),
             "outer_shell_vectors": int(np.count_nonzero(_outer_shell)),
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),
         })
-    return fH_k, fH_R, (a_f, n_f, shift), f_eps
+    return (fH_k, fH_R, (a_f, n_f, shift), f_eps,
+            active_R if active_band_range is not None else None)
+
+
+NEWTON_RESIDUAL_MAX = 1.0e-12
 
 
 def newton_inv(a: float, n: float, shift: float, y: jax.Array,
-               max_iter: int = 50) -> jax.Array:
-    """Newton inversion — matches Fortran newton_inv(). Works in unshifted space."""
+               max_iter: int = 50) -> tuple[jax.Array, jax.Array]:
+    """Invert ``f`` and return ``(x, max|f(x)-y|)``.
+
+    The global 1e-12 early stop, 50-step cap, ``a/2`` step clip and exact
+    ``df != 0`` condition are the archived implementation's convergence
+    contract.  ``y`` may have any shape: one array-valued ``lax.while_loop``
+    owns the inverse for every caller, and the global max residual is returned
+    so each caller can refuse at its existing host seam.
+    """
     dxmax = a / 2.0
     x0 = y + shift  # Fortran initial guess: x = y + s
 
-    def body_fun(_, x_curr):
-        res = fun(a, n, shift, x_curr) - y
-        df_val = dfun(a, n, shift, x_curr)
-        dx = jnp.where(jnp.abs(df_val) > 1e-14, -res / df_val, 0.0)
-        dx = jnp.clip(dx, -dxmax, dxmax)
-        return x_curr + dx
+    residual0 = fun(a, n, shift, x0) - y
 
-    return lax.fori_loop(0, max_iter, body_fun, x0)
+    def cond_fun(carry):
+        iteration, _x_curr, residual = carry
+        return jnp.logical_and(
+            iteration < max_iter,
+            jnp.max(jnp.abs(residual)) > NEWTON_RESIDUAL_MAX)
+
+    def body_fun(carry):
+        iteration, x_curr, residual = carry
+        df_val = dfun(a, n, shift, x_curr)
+        dx = jnp.where(df_val != 0.0, -residual / df_val, 0.0)
+        dx = jnp.clip(dx, -dxmax, dxmax)
+        x_next = x_curr + dx
+        residual_next = fun(a, n, shift, x_next) - y
+        return iteration + 1, x_next, residual_next
+
+    _iteration, x, residual = lax.while_loop(
+        cond_fun, body_fun, (jnp.asarray(0), x0, residual0))
+    return x, jnp.max(jnp.abs(residual))
+
+
+def require_newton_converged(residual: float, *, where: str) -> None:
+    """Host refusal shared by the two htransform consumers."""
+    if not np.isfinite(residual) or residual > NEWTON_RESIDUAL_MAX:
+        raise ValueError(
+            f"{where}: f-transform Newton inverse did not converge: "
+            f"max|f(x)-y|={residual:.6e} Ry exceeds the archived "
+            f"{NEWTON_RESIDUAL_MAX:.1e}-Ry residual cap after 50 steps")
 
 
 def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
@@ -1699,13 +808,174 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     return nsigmarange, jnp.asarray(enk_sigma).transpose(1, 0)
 
 
+@partial(jax.jit, static_argnames=("band_offset",))
+def _apply_qp_block_to_compact_state(
+        ctilde, enk_sigma, U_mnk, E_qp_nk, *, band_offset: int):
+    """One fixed-shape compact implementation of ``C_QP = U.T C_DFT``."""
+    nb_qp = U_mnk.shape[1]
+    c_qp = jnp.einsum(
+        "kmn,kma->kna", U_mnk,
+        ctilde[:, band_offset:band_offset + nb_qp, :], optimize=True)
+    ctilde_out = ctilde.at[
+        :, band_offset:band_offset + nb_qp, :].set(c_qp)
+    enk_out = enk_sigma.at[
+        band_offset:band_offset + nb_qp, :].set(E_qp_nk.T)
+    return ctilde_out, enk_out
+
+
+def resolve_qp_hamiltonian_state(
+        *, basis, enk_sigma, sym, meta, wfn, wfn_path: str,
+        qp_rotations_file: str, eqp_file: str | None = None,
+        log_fn=None):
+    """Overlay a matched QP block on a reusable mean-field Galerkin fit.
+
+    ``basis`` remains the immutable fit artifact.  Only its compact state
+    rows are rotated, using the same convention as
+    :func:`file_io.qp_wfn.write_qp_wfn_h5`::
+
+        C_QP[k,n,a] = sum_m U[k,m,n] C_DFT[k,m,a] = U[k].T C_DFT[k]
+
+    The existing ``build_fH_R`` then constructs
+    ``f(H_QP) = U f(E_QP) U^H`` without a second Hamiltonian, WFN or FFT
+    implementation.  A wider fitted window is supported exactly as the
+    canonical QP-WFN writer supports it: the complete QP block is replaced,
+    while rows outside it remain the original DFT states and energies (an
+    implicit block-identity extension).  Cutting through the QP block is
+    refused because a sliced eigenvector matrix is not unitary.
+
+    Scaling is ``O(nk * nb_qp^2 * rank)`` work.  Persistent output has the
+    same shape as ``basis.ctilde``; the only additional inputs are the
+    ``nk * nb_qp^2`` rotation artifact and its matched energies.  There is one
+    executable shape, including for band-window remainders: the complete QP
+    block is one fixed operand and no chunk/remainder kernel exists.
+
+    Returns the rotated compact rows, matched energy table, and the exact
+    absolute half-open QP range read from the canonical artifact.  The range
+    is carried to the standalone output contract; callers must not infer a
+    corrected extent from the returned array shapes.
+    """
+    say = log_fn if log_fn is not None else (lambda *_a, **_k: None)
+    path = os.fspath(qp_rotations_file)
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file, qp_rotations_file=path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"QP rotation artifact does not exist: {path}")
+
+    from file_io.qp_wfn import (
+        authenticate_qp_rotations_source_wfn,
+        read_qp_rotations_artifact,
+    )
+    artifact = read_qp_rotations_artifact(path)
+    authenticate_qp_rotations_source_wfn(
+        artifact, wfn, artifact_path=path)
+    U = np.asarray(artifact["U_mnk"])
+    E = np.asarray(artifact["E_qp_nk_rydberg"], dtype=np.float64)
+    rot_range = np.asarray(artifact["band_range"], dtype=np.int64)
+    rot_grid = np.asarray(artifact["kgrid"], dtype=np.int64)
+    rot_kpts = np.asarray(artifact["kpoints_crys"], dtype=np.float64)
+
+    if rot_range.shape != (2,):
+        raise ValueError(
+            f"{os.path.basename(path)} band_range has shape "
+            f"{rot_range.shape}, expected (2,).")
+    q0, q1 = (int(rot_range[0]), int(rot_range[1]))
+    if q1 <= q0:
+        raise ValueError(
+            f"{os.path.basename(path)} has empty/reversed QP band range "
+            f"[{q0},{q1}).")
+    nb_qp = q1 - q0
+    fit0, fit1 = (int(v) for v in basis.band_range)
+    ctilde = basis.ctilde
+    nk = int(ctilde.shape[0])
+    nb_fit = int(ctilde.shape[1])
+    if fit1 - fit0 != nb_fit:
+        raise ValueError(
+            f"Galerkin basis range [{fit0},{fit1}) has width {fit1-fit0}, "
+            f"but ctilde carries {nb_fit} rows.")
+    if not (fit0 <= q0 < q1 <= fit1):
+        raise ValueError(
+            f"QP range [{q0},{q1}) must be wholly contained in the fitted "
+            f"Galerkin range [{fit0},{fit1}).  A disjoint block would apply "
+            "no QP correction, while any partial overlap/cut-through would "
+            "slice U_mnk and destroy the unitary state transformation.  "
+            "Fit a window containing the complete QP block.")
+    if U.shape != (nk, nb_qp, nb_qp):
+        raise ValueError(
+            f"{os.path.basename(path)} U_mnk has shape {U.shape}, expected "
+            f"({nk},{nb_qp},{nb_qp}) from the full k-set and band_range.")
+    if E.shape != (nk, nb_qp):
+        raise ValueError(
+            f"{os.path.basename(path)} E_qp_nk_rydberg has shape {E.shape}, "
+            f"expected ({nk},{nb_qp}).")
+    expected_enk = (nb_fit, nk)
+    if tuple(enk_sigma.shape) != expected_enk:
+        raise ValueError(
+            f"enk_sigma has shape {tuple(enk_sigma.shape)}, expected "
+            f"{expected_enk} from the Galerkin state table.")
+
+    expected_grid = np.asarray(meta.kgrid, dtype=np.int64)
+    if rot_grid.shape != (3,) or not np.array_equal(rot_grid, expected_grid):
+        raise ValueError(
+            f"{os.path.basename(path)} kgrid {rot_grid.tolist()} does not "
+            f"match the WFN/symmetry kgrid {expected_grid.tolist()}.")
+    expected_kpts = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    if rot_kpts.shape != expected_kpts.shape:
+        raise ValueError(
+            f"{os.path.basename(path)} kpoints_crys has shape "
+            f"{rot_kpts.shape}, expected {expected_kpts.shape} from the "
+            "WFN symmetry service.")
+    dk = rot_kpts - expected_kpts
+    dk -= np.rint(dk)
+    worst_k = float(np.max(np.abs(dk))) if dk.size else 0.0
+    if worst_k > 1.0e-6:
+        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
+        raise ValueError(
+            f"{os.path.basename(path)} full-BZ k-point {bad} is "
+            f"{rot_kpts[bad].tolist()}, but the WFN symmetry service has "
+            f"{expected_kpts[bad].tolist()} (periodic max|Delta k|="
+            f"{worst_k:.3e}).")
+
+    # The Galerkin owner defines the compact state's global placement.  The
+    # energy table and both QP companions arrive as identical host arrays on
+    # every process, so place each process's incumbent shards without JAX's
+    # hidden cross-process equality/all-gather transport before entering the
+    # one multi-host JIT.
+    state_sharding = ctilde.sharding
+    enk_dev = device_put_process_local(
+        np.asarray(enk_sigma, dtype=np.dtype(enk_sigma.dtype)),
+        state_sharding)
+    U_dev = device_put_process_local(
+        np.asarray(U, dtype=np.dtype(ctilde.dtype)), state_sharding)
+    E_dev = device_put_process_local(
+        np.asarray(E, dtype=np.dtype(enk_sigma.dtype)),
+        state_sharding)
+    ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
+        ctilde, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)
+    say(
+        f"  [QP state] {os.path.basename(path)}: full "
+        f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); DFT block-identity "
+        f"rows retained outside it in fitted window [{fit0},{fit1}); "
+        f"compact rotation O({nk}*{nb_qp}^2*{int(ctilde.shape[2])}), no "
+        "WFN/FFT rebuild")
+    say(
+        "  [QP provenance] canonical source-WFN fingerprint, band_range, "
+        "kgrid and full-BZ k coordinates all match the selected mean-field "
+        "WFN; the QP artifact carries energies/rotations only, so no "
+        "bispinor WFN is loaded or constructed")
+    # This exact range comes from the authenticated artifact metadata above;
+    # the standalone driver carries it to the active/projected output seam.
+    # Do not reconstruct it later from a deck count or an array shape.
+    return ctilde_qp, enk_qp, (q0, q1)
+
+
 def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # Pass the device mesh so the loader can pick a sharded read backend
     # (the collective phdf5 FFI read, on GPU or the CUDA-free host lib),
     # band-sharding ψ instead of replicating the whole WFN on every rank.
     # Single-process / no-mesh transparently stays eager.
     wfn = WfnLoader(wfn_file, mesh=mesh_xy)
-    sym = symmetry_maps.SymMaps(wfn)
+    sym = wfn.symmetry()
     return wfn, sym
 
 
@@ -1853,11 +1123,14 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 
 
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
-                    mesh_xy: Mesh | None = None, return_full_proj: bool = False,
+                    mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
                     progress_fn=None, centroid_record_fn=None,
-                    rank_record_fn=None, wfn_sym=None,
-                    galerkin_eigh_plan=None):
+                    rank_record_fn=None, wfn_sym=None, *,
+                    require_all_occupied: bool = False,
+                    basis_input: str | None = None,
+                    basis_output: str | None = None,
+                    distrib_la_batched_route: str | None = None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1894,10 +1167,28 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     if mesh_xy is None:
         mesh_xy = _build_mesh_xy()
     wfn_file = _resolve(params["wfn_file"])
+    eqp_path_requested = _resolve(eqp_file) if eqp_file else None
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_file, eqp_file=eqp_path_requested,
+        qp_rotations_file=None)
     if wfn_sym is None:
         wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     else:
         wfn, sym = wfn_sym
+    nval = int(params["nval"])
+    ncond = int(params["ncond"])
+    nband = int(params["nband"])
+    if require_all_occupied and nval != int(wfn.nelec):
+        raise ValueError(
+            "standalone htransform output requires every occupied band in "
+            "its one contiguous Hamiltonian: "
+            f"nval={nval}, occupied bands={int(wfn.nelec)}, so absolute "
+            f"bands [{int(wfn.nelec)-nval},{int(wfn.nelec)}) would be "
+            "omitted. A lower spectral boundary can be recovered exactly at "
+            "sampled k while producing uncontrolled off-grid ringing. Set "
+            f"nval={int(wfn.nelec)}. Internal BSE interpolation retains its "
+            "explicit window contract and does not use this standalone gate.")
     centroid_path = _resolve(params.get("centroids_file", "centroids_frac.txt"))
     centroid_basis = load_centroid_basis(
         centroid_path, tuple(int(x) for x in wfn.fft_grid), sym=sym,
@@ -1913,9 +1204,6 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     if centroid_record_fn is not None:
         centroid_record_fn(centroid_basis)
 
-    nval = int(params["nval"])
-    ncond = int(params["ncond"])
-    nband = int(params["nband"])
     n_guard_bands = int(n_guard_bands)
     if n_guard_bands < 0:
         raise ValueError(
@@ -1946,7 +1234,16 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
                f"than zero-padded.  f(ε) ≡ 0 for ε ≥ max_k ε[nb−1], so the "
                f"guards absorb the shoulder and every band the caller asks "
                f"for is interior to fH.")
-    bispinor = bool(params.get("bispinor", False))
+    # Htransform interpolates the one-particle Hamiltonian.  A bispinor GW
+    # deck changes the QP energies supplied through eqp1.dat; it does not
+    # require rebuilding a four-component interpolation basis.  The source
+    # WFN's canonical spinors therefore remain the sole wavefunction route.
+    # This also keeps scalar/bare/full energy arms in one fixed gauge.
+    _gw_bispinor = bool(params.get("bispinor", False))
+    bispinor = False
+    if _gw_bispinor:
+        log_fn("  [route] bispinor QP energies with the canonical spinor "
+               "WFN interpolation basis (no synthetic small components)")
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, n_rmu, bispinor)
     # ``sys_dim`` IS A DECK KEY AND ``Meta`` HAS NO FIELD FOR IT.  The GW
     # driver stamps it on the Meta it builds (``gw_jax.main``:
@@ -1987,12 +1284,16 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         # --eqp-file is an explicit request: a file that cannot be found or
         # parsed must refuse, not silently fall back to the DFT energies —
         # the output would be a DFT bandstructure labeled as quasiparticle.
-        eqp_path = _resolve(eqp_file)
+        eqp_path = eqp_path_requested
         if not os.path.isfile(eqp_path):
             raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
         try:
             enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
-            log_fn(f"Using EQP energies from {os.path.basename(eqp_path)} for band window {nsigmarange}")
+            log_fn(
+                f"Using DIAGONAL QP APPROXIMATION from "
+                f"{os.path.basename(eqp_path)} for band window "
+                f"{nsigmarange}: energies only in the current WFN labels; "
+                "no U_mnk/off-diagonal QP mixing")
         except Exception as exc:
             raise SystemExit(
                 f"FATAL: --eqp-file {os.path.basename(eqp_path)} could not be "
@@ -2007,32 +1308,25 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
+    distrib_la_batched_route = resolve_distrib_la_batched_route(
+        params, override=distrib_la_batched_route)
+    basis_input = _resolve(basis_input) if basis_input else None
+    basis_output = _resolve(basis_output) if basis_output else None
     with mesh_xy:
-        out = streaming_galerkin_solve(
+        basis = streaming_galerkin_solve(
             wfn, sym, meta, centroid_indices, mesh_xy, band_range,
-            rtol=1e-8, log_fn=log_fn, bispinor=bispinor,
-            return_full_proj=return_full_proj,
-            # Deck key, same family as the fH_q eigh; the CLI --eigh-backend
-            # override is scoped to compute_wfns_fi and deliberately not
-            # threaded here — the deck is the source of truth for the fit.
-            #
-            # RESOLVED, not raw.  ``eigh_backend`` and ``use_low_mem_eigh``
-            # are two spellings of ONE axis and ``gw_config.resolve_eigh_
-            # backend`` is the single place they combine; reading the raw
-            # key here meant a deck that said ``use_low_mem_eigh = true``
-            # got the native replicated Gram eigh anyway — the key was
-            # parsed, defaulted, stored and read by nobody on this driver.
-            eigh_backend=resolve_eigh_backend(params),
-            eigh_plan=galerkin_eigh_plan,
-            rank_multiplier=params.get("htransform_rank_multiplier", 0.0),
+            log_fn=log_fn, bispinor=bispinor,
+            rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
+            qr_eps=params.get("htransform_qr_eps", 1.0e-3),
+            qrcp_seed=params.get("htransform_qrcp_seed", 0),
             progress_fn=progress_fn,
             rank_record_fn=rank_record_fn,
+            basis_input=basis_input, basis_output=basis_output,
+            distrib_la_batched_route=distrib_la_batched_route,
         )
-    S, ctilde, B_at_mu = out[:3]
-    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, nb={band_range[1]-band_range[0]}, rank={ctilde.shape[2]}")
-    if return_full_proj:
-        return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma, out[3]
-    return wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma
+    log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
+           f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
+    return wfn, sym, meta, mesh_xy, basis, enk_sigma
 
 
 def initialize_kpath(wfn, params):
@@ -2070,10 +1364,11 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
     return idx
 
 
-def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
+def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 a_band_index: int | None = None,
                 band_start: int = 0, n_return_bands: int | None = None,
-                progress_fn=None, quality_record_fn=None):
+                qp_corrected_band_range: tuple[int, int] | None = None,
+                progress_fn=None, quality_record_fn=None, sym=None):
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -2087,20 +1382,68 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     fermi_band_idx = resolve_local_vbm_index(
         int(wfn.nelec), int(band_start), nb_keep)
     n_guard_bands = int(states) - nb_keep
-    log_fn(
-        f"  [two-window] standalone htransform returns {nb_keep} band(s) "
-        f"from absolute window [{int(band_start)}, "
-        f"{int(band_start) + nb_keep}) and fits {states} band(s) "
-        f"({n_guard_bands} guard band(s) above).")
+    fit_start = int(band_start)
+    fit_stop = fit_start + int(states)
+    return_stop = fit_start + nb_keep
+    require_qp_interior_margin = False
+    if qp_corrected_band_range is not None:
+        qp_start, qp_stop = map(int, qp_corrected_band_range)
+        if qp_start != fit_start:
+            raise ValueError(
+                "htransform: authenticated QP corrected range must start at "
+                f"the returned/fitted band start {fit_start}, found "
+                f"[{qp_start},{qp_stop}).  A shifted active block needs an "
+                "explicit returned-band offset; do not relabel it as a "
+                "prefix.")
+        if not (return_stop <= qp_stop <= fit_stop):
+            raise ValueError(
+                "htransform: the authenticated QP corrected range must "
+                f"contain the returned window [{fit_start},{return_stop}) "
+                "and remain inside the "
+                f"fit [{fit_start},{fit_stop}); found [{qp_start},{qp_stop}).")
+        if qp_stop < fit_stop and qp_stop == return_stop:
+            raise ValueError(
+                "htransform: a partial QP corrected block ending at "
+                f"{qp_stop} has no corrected interior above the returned "
+                f"window [{fit_start},{return_stop}).  Widen canonical QP "
+                "U/E or return fewer bands; a DFT guard boundary may not "
+                "coincide with the published boundary.")
+        n_qp_corrected = qp_stop - qp_start
+        n_corrected_margin = qp_stop - return_stop
+        n_dft_guards = fit_stop - qp_stop
+        # If every fitted state is QP corrected there is no active/DFT-guard
+        # boundary: the incumbent full-H energy ordering is exact.  Otherwise
+        # the same compact projector/FFT path selects the complete corrected
+        # block and the returned interior is gated below.
+        active_band_range = (
+            None if qp_stop == fit_stop else
+            (qp_start - fit_start, qp_stop - fit_start))
+        require_qp_interior_margin = active_band_range is not None
+        log_fn(
+            f"  [three-window] standalone htransform returns {nb_keep} "
+            f"band(s) from [{fit_start},{return_stop}), authenticates "
+            f"{n_qp_corrected} QP-corrected band(s) from "
+            f"[{qp_start},{qp_stop}) ({n_corrected_margin} corrected "
+            f"interior margin), and fits [{fit_start},{fit_stop}) "
+            f"({n_dft_guards} outer DFT guard band(s)).")
+    else:
+        n_qp_corrected = nb_keep
+        active_band_range = ((0, nb_keep) if n_guard_bands else None)
+        log_fn(
+            f"  [two-window] standalone htransform returns {nb_keep} band(s) "
+            f"from absolute window [{fit_start}, {return_stop}) and fits "
+            f"{states} band(s) ({n_guard_bands} guard band(s) above).")
 
     rep = NamedSharding(mesh_xy, P())  # fully replicated, used for diagnostics
 
     _t0 = _perf()                                          # instrument:
     coeffs = ctilde.reshape(nk, states, rank)
-    fH_k, fH_R, (a_f, n_f, shift), f_eps = build_fH_R(
-        coeffs, enk_sigma, kgrid, mesh_xy, a_band_index=a_band_index,
-        log_fn=log_fn, quality_record_fn=quality_record_fn)
-    jax.block_until_ready((fH_k, fH_R, f_eps))             # instrument:
+    fH_k, fH_R, (a_f, n_f, shift), f_eps, active_R = build_fH_R(
+        coeffs, enk_sigma, kgrid, mesh_xy,
+        a_band_index=a_band_index,
+        active_band_range=active_band_range, log_fn=log_fn,
+        quality_record_fn=quality_record_fn)
+    jax.block_until_ready((fH_k, fH_R, f_eps, active_R))   # instrument:
     timing.record("ht.build_fH_R", _perf() - _t0)          # instrument:
 
     # The top of the fit window is identically invisible to fH at the k where
@@ -2119,59 +1462,16 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     del fH_k
 
     _t0 = _perf()                                          # instrument:
-    # ── THE METRIC ROUTE — S is the identity, and the code already knows it ──
-    #
-    # ``_kpath_batch`` below reduces a GENERALIZED eigenproblem fH_q c = λ S c
-    # by two triangular solves against chol(S) per q.  But S has exactly ONE
-    # producer — ``streaming_galerkin_solve`` returns
-    #     S = jax.jit(lambda: jnp.eye(rank, dtype=jnp.complex128), …)()
-    # (see its closing lines) — because the α basis is Cholesky-orthogonalised
-    # upstream, which is the whole point of ``_finalize``'s ``coeffs @ L``.  The
-    # other consumer of the identical math, ``bse_setup._q_batch``, already
-    # takes S = I for granted: it calls ``jnp.linalg.eigh(fH_q)`` with no
-    # metric at all.  The two solves here are vestigial.
-    #
-    # WHAT THEY COST.  Each ``solve_triangular`` of a (rank, rank) triangular
-    # factor against a (rank, rank) right-hand side is rank³/2 complex MACs, so
-    # the pair is ~8·rank³ real flops per q against the ~5.3·rank³ of the
-    # eigenvalues-only Hermitian eigensolve they feed.  They are the LARGER
-    # half of the arithmetic in the batch — and the Fourier sum this whole
-    # workstream is about is 8·N_k·rank², a further factor rank/N_k below both.
-    #
-    # WHAT THEY CHANGE.  With S = I the ridge makes S_sym = (1+1e-10)·I, so
-    # chol(S) = sqrt(1+1e-10)·I and the pair divides every eigenvalue by
-    # (1+1e-10) — a systematic -1e-10 RELATIVE shift of λ, applied for no
-    # reason.  Skipping them is therefore not bit-identical; it is analytically
-    # exact and removes a small bias rather than adding one.  The measured
-    # energy delta on the reference deck is in HTRANSFORM_FFT.md §6.
-    #
-    # The route is decided ONCE, from the data, and announced.  A caller that
-    # ever hands this driver a non-identity S keeps the Cholesky path
-    # unchanged — the branch is on a measured deviation, not on an assumption.
-    @partial(jax.jit, out_shardings=rep)
-    def _s_dev_from_eye(S_in):
-        return jnp.max(jnp.abs(S_in - jnp.eye(rank, dtype=S_in.dtype)))
-
-    _s_dev = float(_s_dev_from_eye(S))
-    metric_route = "identity" if _s_dev == 0.0 else "cholesky"
-    log_fn(f"  [route] fH_q metric: {metric_route}  (max|S - I| = {_s_dev:.3e}; "
-           f"'identity' skips 2 triangular solves of {rank}³/2 complex MACs per q)")
-
-    S_chol = None
-    if metric_route == "cholesky":
-        # Built ONLY on the path that uses it — on the identity route this
-        # compile (one XLA program, 0.34 s cache-cold) is not paid at all,
-        # which is what keeps the route program-count-neutral.
-        @jax.jit
-        def _build_S_chol(S):
-            S_sym = (S + S.conj().T) * 0.5
-            S_sym += 1e-10 * jnp.mean(jnp.real(jnp.diag(S_sym))) * jnp.eye(rank, dtype=S_sym.dtype)
-            return jnp.linalg.cholesky(S_sym)
-        S_chol = _build_S_chol(S)
+    # The selected-state Cholesky basis is orthonormal by construction.  There
+    # is no separately mutable metric: carrying a dense identity S was a
+    # compatibility object that cost rank² storage and enabled a dead
+    # generalized-eigenproblem branch beside bse_setup's canonical identity
+    # eigensolve.
+    log_fn(f"  [route] fH_q metric: identity (selected-state Galerkin basis; "
+           f"no dense {rank}x{rank} identity object)")
 
     R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready(                                 # instrument:
-        (R_grid,) if S_chol is None else (S_chol, R_grid)) # instrument:
+    jax.block_until_ready(R_grid)                            # instrument:
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -2193,37 +1493,44 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     # Sharding specs for batched (bs, rank, rank) → (bs, rank) eigvalsh.
     batch_mat_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     batch_eig_shard = NamedSharding(mesh_xy, P(('x', 'y'), None))
+    batch_scalar_shard = NamedSharding(mesh_xy, P(('x', 'y'),))
     face_ij_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    @partial(jax.jit, out_shardings=batch_eig_shard)
-    def _kpath_batch(batch_k, fH_R, S_chol):
-        # batch_k: (bs, 3) replicated; fH_R: (nk, rank, rank) at P(None,'x','y');
-        # S_chol: (rank, rank) replicated.  The einsum contracts over the
-        # (replicated) R axis only → local on each (i, j) tile.
-        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))           # (bs, nk)
-        mat = 0.5 * jnp.einsum('bk,kij->bij', phase, fH_R)             # (bs, rank, rank)
-        # Pin the contraction OUTPUT to the (i, j) layout: left free, XLA
-        # materialises the whole (bs, rank, rank) batch on every device before
-        # the reshard below (bs·rank²·16 = 11.4 GiB/device at bs=32/rank 4716).
+    def _fourier_matrix(batch_k, operator_R):
+        """The one path-q contraction for both fH and active character."""
+        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))
+        mat = 0.5 * jnp.einsum(
+            'bk,kij->bij', phase, operator_R, optimize=True)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
-        # Reshard (i,j)→q FIRST, then hermitize: on the q-sharded layout each
-        # device owns whole matrices, so the transpose is local.  The other
-        # order costs a second all-to-all for ``swapaxes``.
         mat = jax.lax.with_sharding_constraint(mat, batch_mat_shard)
-        mat = mat + jnp.swapaxes(mat, 1, 2).conj()
+        return mat + jnp.swapaxes(mat, 1, 2).conj()
 
-        if S_chol is None:
-            # S = I (see the metric-route block above).  ``mat`` was hermitized
-            # two lines up and ``eigvalsh`` reads one triangle, so the dropped
-            # ``(z + zᴴ)/2`` cannot move an eigenvalue either.
+    if active_R is None:
+        @partial(jax.jit, out_shardings=batch_eig_shard)
+        def _kpath_batch(batch_k, fH_R):
+            # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The R-only
+            # contraction is local, then the one face→q reshard gives each
+            # device a whole matrix for the native eigensolver.
+            mat = _fourier_matrix(batch_k, fH_R)
             return jax.vmap(jnp.linalg.eigvalsh)(mat)
-
-        def _solve_one(m):
-            y = jsp_linalg.solve_triangular(S_chol, m, lower=True)
-            z = jsp_linalg.solve_triangular(S_chol, y, lower=True, trans=2)
-            return jnp.linalg.eigvalsh((z + z.conj().T) * 0.5)
-
-        return jax.vmap(_solve_one)(mat)
+    else:
+        @partial(
+            jax.jit,
+            out_shardings=(batch_eig_shard, batch_eig_shard,
+                           batch_scalar_shard, batch_scalar_shard,
+                           batch_eig_shard, batch_eig_shard,
+                           batch_scalar_shard))
+        def _kpath_batch(batch_k, fH_R, active_R):
+            mat = _fourier_matrix(batch_k, fH_R)
+            active_mat = _fourier_matrix(batch_k, active_R)
+            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            (selected_values, selected_scores, score_gap, score_tol,
+             cluster_values, cluster_mask,
+             min_nonreturned_value) = select_active_eigenpairs(
+                 values, vectors, active_mat, n_qp_corrected,
+                 n_physical=states, n_return=nb_keep)
+            return (selected_values, selected_scores, score_gap, score_tol,
+                    cluster_values, cluster_mask, min_nonreturned_value)
 
     fermi_energy = float(wfn.efermi)
     kpath_frac, x_path, node_indices, node_labels, gamma_positions = kpath_data
@@ -2231,6 +1538,11 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
     energies_sorted = None
     path_range = None
     gamma_exact = None
+    coincident_path_indices = np.empty((0,), dtype=np.int32)
+    coincident_coarse_indices = np.empty((0,), dtype=np.int32)
+    coincident_exact = None
+    coincident_max_abs_ry = None
+    coincident_rms_ry = None
 
     if kpath_frac is not None:
         # Wrap + pad in ONE jit.  Eagerly this was five single-primitive
@@ -2250,29 +1562,41 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # Pad nq to a multiple of batch_size — every batch has the same
         # shape, _kpath_batch compiles ONCE.
         #
-        # And pad batch_size itself to a multiple of ndev.  ``batch_mat_shard``
-        # / ``batch_eig_shard`` above are RAW ``P(('x','y'), …)`` NamedShardings
-        # with no fitter, so a width that does not divide px*py does not
-        # degrade here — it raises ``IndivisibleError`` inside the jit.  A
-        # fixed 32 therefore restricts this driver to device counts dividing
-        # 32; at P=64 it cannot run at all.  Third member of the same class as
-        # the fitted ``sharding_q`` above and the ``bs`` block in
-        # ``bandstructure.bse_setup`` (whose 32-wide q-batch, which DOES have a
-        # fitter, replicated instead of refusing and cost 866.5 s vs 105.7 s —
-        # jobs 7882533 / 7882569).  Padding is the right lever for all three:
-        # the extra q are zero rows already appended here and already dropped
-        # by the ``[:nq]`` slice in ``_post_kpath``, so this changes how many
-        # q are evaluated and where, never a value.
+        # The q axis is split over the WHOLE mesh by
+        # ``P(('x','y'), None, None)``.  Its smallest legal nonempty extent is
+        # therefore exactly ndev, which gives each device ONE whole
+        # ``(rank, rank)`` matrix.  A fixed width of 32 was placement-legal at
+        # P16 but assigned TWO rank-4800 matrices/device; the native eigvalsh
+        # workspace then requested 13.73 GiB and killed the CrI3 200-band arm
+        # after every fH/Gamma gate had passed (JID 57538651).  This is the
+        # native path's memory plan: minimize concurrent whole matrices while
+        # retaining ndev-way q parallelism.  A distributed-within-matrix path
+        # belongs to ``distrib_la.plan``, not a second eig implementation here.
+        #
+        # ``padded_extent`` is the canonical placement owner also used by
+        # bse_setup.  Starting from one means this policy cannot drift from
+        # the divisor that judges the actual NamedSharding.  Extra q are zero
+        # rows and ``_post_kpath[:nq]`` discards them, so only scheduling and
+        # the static executable shape change, never a retained value.
         _t0 = _perf()                                      # instrument:
-        batch_size = _pad_to(mesh_xy, ('x', 'y'), 32)
+        batch_size = _pad_to(mesh_xy, ('x', 'y'), 1)
+        ndev = spec_divisor(mesh_xy, P(('x', 'y'), None), axis=0)
+        matrices_per_device = batch_size // ndev
+        matrix_bytes = rank * rank * np.dtype(np.complex128).itemsize
+        log_fn(
+            f"  kpath native eig ledger: q-batch={batch_size}, ndev={ndev}, "
+            f"whole matrices/device={matrices_per_device}; one "
+            f"({rank}, {rank}) complex128 operand={matrix_bytes / 2**30:.3f} "
+            f"GiB/device (backend eigensolver workspace excluded)")
         nq = int(kpath_frac.shape[0])
-        n_pad = (-nq) % batch_size
+        n_pad = round_up(nq, batch_size) - nq
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
         jax.block_until_ready(wrapped_k)                   # instrument:
         timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
         lambda_q_list = []
+        active_selection_list = []
         from common.progress import LoopProgress
         _n_batches = int(nq_padded // batch_size)
         _path_progress = LoopProgress(
@@ -2281,18 +1605,26 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             item_name="k batch", max_updates=min(_n_batches, 12),
             enabled=progress_fn is not None).start()
         for i in range(0, nq_padded, batch_size):
-            batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R, S_chol)
-            lambda_q_list.append(batch_eigs)
-            jax.block_until_ready(batch_eigs)
+            if active_R is None:
+                batch_eigs = _kpath_batch(wrapped_k[i:i+batch_size], fH_R)
+                lambda_q_list.append(batch_eigs)
+                jax.block_until_ready(batch_eigs)
+            else:
+                batch_result = _kpath_batch(
+                    wrapped_k[i:i+batch_size], fH_R, active_R)
+                lambda_q_list.append(batch_result[0])
+                active_selection_list.append(batch_result[1:])
+                jax.block_until_ready(batch_result)
             _path_progress.step()
         _path_progress.finish()
         timing.record("ht.kpath_loop", _perf() - _t0,      # instrument:
                       count=len(lambda_q_list))            # instrument:
 
-        # Bundle concat + slice + vmap(newton_inv) + sort into ONE jit so the
-        # post-loop processing emits one compile rather than 4 (concatenate,
-        # sort, gather, vmap-newton).
-        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at P>1, not
+        # Bundle concat + physical-state slice + newton_inv + sort into ONE
+        # jit so the post-loop processing emits one compile rather than 4
+        # (concatenate, sort, gather, Newton loop).
+        # ``out_shardings=(rep, rep)`` is a CORRECTNESS requirement at
+        # P>1, not
         # a placement preference.  ``batches`` arrive q-sharded
         # (``batch_eig_shard = P(('x','y'), None)``); left to inference the
         # concatenate propagates that sharding onto the outputs, and whether
@@ -2307,30 +1639,145 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # reference decks could not run multi-process at all
         # (PROFILE_htransform_exciton §1.5).
         #
-        # Replication is the right answer and not merely the safe one: BOTH
-        # outputs are consumed on the host by every process immediately below
-        # (``np.asarray``, ``np.max``, the writer gate), and they are small —
-        # ``energies`` is (nq, rank) f64 and ``energies_sorted`` (nq, nb_keep),
-        # 854 KB and 13 KB at nq=139 / rank 768, against the (nk, rank, rank)
-        # 576 MiB arrays this driver already holds.  Values are untouched:
-        # ``out_shardings`` moves data, it does not compute.
-        # Gate: ``tests/test_htransform_post_kpath_sharding.py``.
-        @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
-                 out_shardings=(rep, rep))
-        def _post_kpath(batches, nq, nb_keep):
-            lambda_q = jnp.concatenate(batches, axis=0)[:nq]
-            energies = jax.vmap(lambda row: newton_inv(a_f, n_f, shift, row.real))(lambda_q)
-            energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
-            return energies, energies_sorted
+        # Replication is the right answer and not merely the safe one: the
+        # retained energy array is consumed on the host by every process
+        # immediately below (``gather_to_host``, ``np.max``, the writer gate),
+        # and the second output is one scalar Newton receipt.  It is small —
+        # ``energies_sorted`` is (nq, nb_keep), 13 KB at nq=139 / nb_keep=12,
+        # against the (nk, rank, rank) 576 MiB arrays this driver already holds.
+        # Values are untouched: ``out_shardings`` moves data, it does not
+        # compute.
+        # Gate: ``tests/test_htransform_kpath_gates.py``.
+        if active_R is None:
+            @partial(jax.jit, static_argnames=('nq', 'nb_keep'),
+                     out_shardings=(rep, rep))
+            def _post_kpath(batches, nq, nb_keep):
+                # With no wider fitted guard window, the archived lowest-state
+                # selection remains the complete physical output contract.
+                lambda_q = jnp.concatenate(batches, axis=0)[:nq, :states]
+                energies, inverse_residual = newton_inv(
+                    a_f, n_f, shift, lambda_q.real)
+                energies_sorted = jnp.sort(energies, axis=1)[:, :nb_keep]
+                return energies_sorted, inverse_residual
+        else:
+            @partial(jax.jit, static_argnames=('nq',),
+                     out_shardings=(rep, rep, rep))
+            def _post_active_kpath(batches, selection, nq):
+                lambda_q = jnp.concatenate(batches, axis=0)[:nq]
+                selected_scores = jnp.concatenate(
+                    tuple(x[0] for x in selection), axis=0)[:nq]
+                score_gap = jnp.concatenate(
+                    tuple(x[1] for x in selection), axis=0)[:nq]
+                score_tol = jnp.concatenate(
+                    tuple(x[2] for x in selection), axis=0)[:nq]
+                cluster_lambda = jnp.concatenate(
+                    tuple(x[3] for x in selection), axis=0)[:nq]
+                cluster_mask = jnp.concatenate(
+                    tuple(x[4] for x in selection), axis=0)[:nq]
+                min_nonreturned_lambda = jnp.concatenate(
+                    tuple(x[5] for x in selection), axis=0)[:nq]
+
+                energies, inverse_residual = newton_inv(
+                    a_f, n_f, shift, lambda_q.real)
+                cluster_energies, cluster_inverse_residual = newton_inv(
+                    a_f, n_f, shift, cluster_lambda.real)
+                min_nonreturned_energy, outside_inverse_residual = newton_inv(
+                    a_f, n_f, shift, min_nonreturned_lambda.real)
+                energies_sorted = jnp.sort(energies, axis=1)
+                returned_energies = energies_sorted[:, :nb_keep]
+                interior_margin = (
+                    min_nonreturned_energy - returned_energies[:, -1])
+
+                ambiguous = score_gap <= score_tol
+                cluster_min = jnp.min(jnp.where(
+                    cluster_mask, cluster_energies, jnp.inf), axis=1)
+                cluster_max = jnp.max(jnp.where(
+                    cluster_mask, cluster_energies, -jnp.inf), axis=1)
+                cluster_energy_span = jnp.where(
+                    ambiguous, cluster_max - cluster_min, 0.0)
+                unsafe = jnp.logical_and(
+                    ambiguous, cluster_energy_span > DEGENERACY_TOL_RY)
+                min_selected = jnp.min(selected_scores, axis=1)
+                max_rejected = min_selected - score_gap
+                diagnostics = jnp.stack((
+                    jnp.min(score_gap),
+                    jnp.max(score_tol),
+                    jnp.min(min_selected),
+                    jnp.max(max_rejected),
+                    jnp.sum(ambiguous),
+                    jnp.sum(jnp.logical_and(
+                        ambiguous,
+                        cluster_energy_span <= DEGENERACY_TOL_RY)),
+                    jnp.max(jnp.where(
+                        unsafe, cluster_energy_span, 0.0)),
+                    jnp.min(interior_margin),
+                ))
+                return (returned_energies,
+                        jnp.maximum(
+                            jnp.maximum(inverse_residual,
+                                        cluster_inverse_residual),
+                            outside_inverse_residual),
+                        diagnostics)
 
         _t0 = _perf()                                      # instrument:
-        energies_on_path, energies_sorted_jax = _post_kpath(
-            tuple(lambda_q_list), int(nq), int(nb_keep))
+        if active_R is None:
+            energies_sorted_jax, inverse_residual = _post_kpath(
+                tuple(lambda_q_list), int(nq), int(nb_keep))
+        else:
+            (energies_sorted_jax, inverse_residual,
+             selection_diagnostics) = _post_active_kpath(
+                 tuple(lambda_q_list), tuple(active_selection_list), int(nq))
+            (min_score_gap, max_score_tol, min_selected_character,
+             max_rejected_character, n_ambiguous, n_degenerate_safe,
+             max_unsafe_energy_span,
+             min_returned_interior_margin) = map(
+                 float, selection_diagnostics)
+            log_fn(
+                "  [gate] active/guard character selection: "
+                f"min score gap={min_score_gap:.6e} (max numerical floor "
+                f"{max_score_tol:.6e}); min selected character="
+                f"{min_selected_character:.6e}, max first-rejected "
+                f"character={max_rejected_character:.6e}; "
+                f"numerically tied q={int(n_ambiguous)}, of which "
+                f"energy-degenerate-safe={int(n_degenerate_safe)}")
+            if require_qp_interior_margin:
+                log_fn(
+                    "  [gate] authenticated QP returned-interior margin: "
+                    f"min(nonreturned fitted energy) - max(returned energy)="
+                    f"{min_returned_interior_margin:.6e} Ry (must exceed "
+                    f"{DEGENERACY_TOL_RY:.6e} Ry); corrected="
+                    f"{n_qp_corrected}, returned={nb_keep}, fitted={states}")
+            if max_unsafe_energy_span > DEGENERACY_TOL_RY:
+                raise ValueError(
+                    "htransform active-subspace selection is numerically "
+                    "underdetermined: the active/guard character boundary is "
+                    "unresolved while the complete score-tied boundary "
+                    "cluster spans up to "
+                    f"{max_unsafe_energy_span:.6e} Ry, above the canonical "
+                    f"multiplet tolerance {DEGENERACY_TOL_RY:.6e} Ry.  "
+                    "Supply QP U/E through every interleaving guard or widen "
+                    "the active state block; do not publish a round-off-chosen "
+                    "band assignment.")
+            if (require_qp_interior_margin
+                    and min_returned_interior_margin <= DEGENERACY_TOL_RY):
+                raise ValueError(
+                    "htransform authenticated QP corrected extent does not "
+                    "protect the returned interior: the minimum energy "
+                    "separation from every nonreturned fitted state is "
+                    f"{min_returned_interior_margin:.6e} Ry, not above the "
+                    f"canonical multiplet tolerance {DEGENERACY_TOL_RY:.6e} "
+                    "Ry.  Produce canonical QP U/E for a wider corrected "
+                    "block or return fewer bands; do not track branches "
+                    "along this plotting path.")
+        energies_on_path = energies_sorted_jax
+        require_newton_converged(
+            float(inverse_residual), where="htransform path")
         # Report the sharding that was ACTUALLY produced, not the one asked
         # for.  Anything other than ``P()`` here is the non-addressable-fetch
         # crash of PROFILE_htransform_exciton §1.5 waiting for a P>1 run with
         # nq divisible by the device count.  ``_post_kpath`` now pins
-        # ``out_shardings=(rep, rep)``, so this line should always read ``P()``;
+        # ``out_shardings=(rep, rep)``, so this line should always read
+        # ``P()``;
         # it earns its keep by reporting the spec that came back rather than
         # the one that was requested.  Gated by
         # ``tests/test_htransform_kpath_gates.py::test_post_kpath_outputs_are_replicated``.
@@ -2351,16 +1798,88 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
         # whenever the window started above band zero.
         fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
         _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
+        if not np.all(np.isfinite(_k_np)):
+            raise ValueError(
+                "htransform path contains non-finite crystal coordinates; "
+                "coarse/path identity cannot be measured.")
+        labelled_gamma_positions = tuple(int(i) for i in gamma_positions)
         if not gamma_positions:
             # Label-less path: nearest-to-Γ point, EXCLUDING the batch pad
             # rows (they are exact zeros and would win the tie on any path
             # that does not start at Γ).  Host numpy — two values for a log
             # line and the plot markers, no reason for two eager XLA modules.
             gamma_positions = [int(np.argmin(np.linalg.norm(_k_np, axis=1)))]
-        _gamma_position = int(gamma_positions[0])
-        _gamma_is_exact = bool(
-            np.linalg.norm(_k_np[_gamma_position]) <= 1.0e-10)
-        gamma_exact = np.sort(np.asarray(enk_sigma[:, 0]))[:nb_keep]
+
+        # Every actual path/coarse coincidence, through the symmetry
+        # service's periodic coordinate owner.  This replaces the old
+        # ``enk_sigma[:, 0] == Gamma`` assumption, which was false on a
+        # shifted mesh and observed only one point even on an unshifted one.
+        # It is a receipt rather than an accuracy refusal: whole-state QRCP
+        # is an approximate projection and its independent fine-QE oracle
+        # decides the interpolation tolerance.
+        if sym is not None:
+            path_rows = []
+            coarse_rows = []
+            for iq, q_frac in enumerate(_k_np):
+                try:
+                    ik_coarse = int(sym.find_qpoint_index(q_frac))
+                except ValueError:
+                    continue
+                path_rows.append(iq)
+                coarse_rows.append(ik_coarse)
+            coincident_path_indices = np.asarray(path_rows, dtype=np.int32)
+            coincident_coarse_indices = np.asarray(
+                coarse_rows, dtype=np.int32)
+
+        if coincident_path_indices.size:
+            enk_host = np.asarray(gather_to_host(enk_sigma), dtype=np.float64)
+            # Match the publication route exactly.  With an active/DFT-guard
+            # boundary it selects the COMPLETE authenticated corrected block
+            # before returning its lowest interior; without that boundary it
+            # energy-orders the whole fitted Hamiltonian.
+            n_reference_candidates = (
+                states if active_R is None else n_qp_corrected)
+            candidate = enk_host[
+                :n_reference_candidates, coincident_coarse_indices].T
+            coincident_exact = np.sort(candidate, axis=1)[:, :nb_keep]
+            coincident_delta = (
+                energies_sorted[coincident_path_indices] - coincident_exact)
+            coincident_max_abs_ry = float(np.max(np.abs(coincident_delta)))
+            coincident_rms_ry = float(np.sqrt(np.mean(
+                np.square(coincident_delta))))
+            worst_flat = int(np.argmax(np.abs(coincident_delta)))
+            worst_match, worst_band = np.unravel_index(
+                worst_flat, coincident_delta.shape)
+            log_fn(
+                "  [receipt] path/coarse coincidences: "
+                f"{coincident_path_indices.size} path row(s), "
+                f"max|Delta E|={coincident_max_abs_ry:.6e} Ry, "
+                f"RMS={coincident_rms_ry:.6e} Ry; worst path row "
+                f"{int(coincident_path_indices[worst_match])}, coarse row "
+                f"{int(coincident_coarse_indices[worst_match])}, returned "
+                f"band {int(worst_band)}")
+
+            # Plot an exact Gamma marker only when a Gamma-labelled path row
+            # is also the coarse mesh's periodic Gamma row.  A nearest path
+            # point or row zero is not an exact Gamma reference.
+            try:
+                coarse_gamma = int(sym.find_qpoint_index(
+                    np.zeros(3, dtype=np.float64)))
+            except ValueError:
+                coarse_gamma = None
+            match_by_path = dict(zip(
+                coincident_path_indices.tolist(),
+                coincident_coarse_indices.tolist()))
+            for gamma_path in labelled_gamma_positions:
+                if match_by_path.get(gamma_path) == coarse_gamma:
+                    match_row = int(np.where(
+                        coincident_path_indices == gamma_path)[0][0])
+                    gamma_exact = coincident_exact[match_row].copy()
+                    break
+        else:
+            log_fn(
+                "  [receipt] path/coarse coincidences: none; no nearest-point "
+                "value is labelled exact")
         # Shift all reported energies so VBM is at 0
         if energies_on_path is not None:
             energies_on_path = energies_on_path - fermi_energy
@@ -2368,16 +1887,27 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
             energies_sorted = energies_sorted - fermi_energy
         if gamma_exact is not None:
             gamma_exact = gamma_exact - fermi_energy
+        if coincident_exact is not None:
+            coincident_exact = coincident_exact - fermi_energy
         # Recompute path range after shift and report
         path_range = (float(energies_sorted.min()), float(energies_sorted.max()))
         log_fn(
             f"Path energy range: {path_range[0] * RYD_TO_EV:.5f} to "
             f"{path_range[1] * RYD_TO_EV:.5f} eV (VBM@0)")
-        delta = ((energies_sorted[gamma_positions[0]] - gamma_exact)
-                 * RYD_TO_EV * 1000.0)
-        log_fn(("Γ Δε (meV): " if _gamma_is_exact else
-                "nearest-path-point Δε vs Γ source (meV): ")
-               + ", ".join(f"{d:+.2f}" for d in delta[:6]))
+        # Gamma deltas (in meV) remain unchanged by uniform shift.  Unlike
+        # the old receipt this is emitted only for an authenticated
+        # path/coarse Gamma coincidence.
+        if gamma_exact is not None:
+            gamma_path = next(
+                i for i in labelled_gamma_positions
+                if i in coincident_path_indices.tolist()
+                and coincident_coarse_indices[
+                     np.where(coincident_path_indices == i)[0][0]]
+                 == coarse_gamma)
+            delta = ((energies_sorted[gamma_path] - gamma_exact)
+                     * RYD_TO_EV * 1000.0)
+            log_fn("Γ Δε (meV): "
+                   + ", ".join(f"{d:+.2f}" for d in delta[:6]))
         # After shifting, the Fermi level indicator is at 0
         fermi_energy = 0.0
         timing.record("ht.kpath_host_tail", _perf() - _t0)  # instrument:
@@ -2401,6 +1931,11 @@ def h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Me
                 states - 1 if a_band_index is None else a_band_index),
             "shoulder_band_local": int(states - 1),
         },
+        "coincident_path_indices": coincident_path_indices,
+        "coincident_coarse_indices": coincident_coarse_indices,
+        "coincident_exact": coincident_exact,
+        "coincident_max_abs_ry": coincident_max_abs_ry,
+        "coincident_rms_ry": coincident_rms_ry,
         "kpath_data": (kpath_frac, x_path, node_indices, node_labels, gamma_positions),
     }
 
@@ -2429,6 +1964,10 @@ def plot_bands(result):
 
     x_ticks = x_path[np.asarray(node_indices, dtype=int)]
     labels = [(lbl or "") for lbl in node_labels]
+    labelled_gamma = {
+        int(idx) for idx, lbl in zip(node_indices, node_labels)
+        if (lbl or "").strip() == "Gamma" or (lbl or "").strip() == "Γ"
+    }
     for xpos in x_ticks:
         ax.axvline(xpos, color='k', lw=0.6, alpha=0.3)
     ax.set_xticks(x_ticks, labels)
@@ -2436,7 +1975,8 @@ def plot_bands(result):
     for pos_idx, idx in enumerate(gamma_positions or [0]):
         xpos = x_path[idx]
         label_exact = 'Exact Γ' if pos_idx == 0 else None
-        label_ht = 'HT Γ' if pos_idx == 0 else None
+        label_ht = (('HT Γ' if idx in labelled_gamma else 'HT nearest Γ')
+                    if pos_idx == 0 else None)
         if gamma_exact_ev is not None:
             ax.scatter(np.full(nb_keep, xpos), gamma_exact_ev, marker='o', facecolors='none', edgecolors='red', label=label_exact)
         ax.scatter(np.full(nb_keep, xpos), energies_ev[idx], marker='x', color='black', label=label_ht)
@@ -2507,13 +2047,30 @@ def main(argv=None):
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
-    parser.add_argument("--eqp-file", default=None, help="Path to EQP/sigX file to override DFT band energies")
+    qp_group = parser.add_mutually_exclusive_group()
+    qp_group.add_argument(
+        "--eqp-file", default=None,
+        help="Diagonal QP approximation: replace energies from eqp1.dat in "
+             "the current WFN band labels; does not represent off-diagonal "
+             "QP mixing. Mutually exclusive with --qp-rotations.")
+    qp_group.add_argument(
+        "--qp-rotations", default=None,
+        help="Full QP Hamiltonian: consume matched U_mnk,E_qp from "
+             "qp_wfn_rotations.h5 so f(H_QP)=U f(E_QP) U^H. The complete "
+             "QP block must lie inside the fitted band window.")
     parser.add_argument("-o", "--output-file", default="bandstructure.dat",
                         help="Interpolated band table (relative paths are "
                              "resolved beside the input deck)")
     parser.add_argument("--report-file", default="htransform.out",
                         help="Human-readable calculation report (relative "
                              "paths are resolved beside the input deck)")
+    basis_group = parser.add_mutually_exclusive_group()
+    basis_group.add_argument(
+        "--basis-input", default=None,
+        help="Read an immutable fitted Galerkin basis; mismatches refuse.")
+    basis_group.add_argument(
+        "--basis-output", default=None,
+        help="Fit once and atomically publish an immutable Galerkin basis.")
     parser.add_argument("--a-band", type=int, default=None,
                         help="Band index (0-based) whose bandwidth sets 'a'. "
                              "E.g. nval+ncond_keep-1. Default: top band.")
@@ -2560,8 +2117,16 @@ def main(argv=None):
     production_stdout.install()
     report.stdout = rank0_print if _debug else production_stdout.emit
     log = report.legacy_print
-    _energy_source = (f"quasiparticle energies from {os.path.basename(args.eqp_file)}"
-                      if args.eqp_file else "DFT eigenvalues from the WFN")
+    if args.qp_rotations:
+        _energy_source = (
+            "full quasiparticle Hamiltonian from "
+            f"{os.path.basename(args.qp_rotations)}")
+    elif args.eqp_file:
+        _energy_source = (
+            "diagonal quasiparticle energies from "
+            f"{os.path.basename(args.eqp_file)}")
+    else:
+        _energy_source = "DFT eigenvalues from the WFN"
     report.begin(input_file=args.input, output_file=output_path,
                  energy_source=_energy_source)
     report.architecture()
@@ -2586,28 +2151,35 @@ def main(argv=None):
         params["wfn_file"] = args.wfn_file
         log(f"Using WFN file from CLI: {args.wfn_file}")
 
-    # Resolve the concrete Gram plan before the first setup/progress line.
-    # The same Plan object is executed below, so the numerical-environment
-    # block describes what this run actually uses rather than re-deriving a
-    # backend name from policy text after the calculation has started.
+    _input_dir = os.path.dirname(os.path.abspath(args.input))
+    _wfn_path = (params["wfn_file"] if os.path.isabs(params["wfn_file"])
+                 else os.path.join(_input_dir, params["wfn_file"]))
+    _qp_rotations_path = None
+    if args.qp_rotations:
+        _qp_rotations_path = (
+            args.qp_rotations if os.path.isabs(args.qp_rotations)
+            else os.path.join(_input_dir, args.qp_rotations))
+    _eqp_path = None
+    if args.eqp_file:
+        _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file)
+                     else os.path.join(_input_dir, args.eqp_file))
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    refuse_conflicting_qp_state_sources(
+        wfn_path=_wfn_path, eqp_file=_eqp_path,
+        qp_rotations_file=_qp_rotations_path)
+
+    # Resolve the concrete fine-k plan before the first setup/progress line.
+    # Whole-state QRCP owns basis selection and has no Gram eigensolve.
     mesh_xy = _build_mesh_xy()
-    _wfn_path = params["wfn_file"]
-    if not os.path.isabs(_wfn_path):
-        _wfn_path = os.path.join(input_dir, _wfn_path)
     wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
     from distrib_la import plan as _linalg_plan
-    _gram_backend = resolve_eigh_backend(params)
-    _n_fit_bands = n_return_bands + int(args.guard_bands)
-    _gram_plan = _linalg_plan(
-        "eigh", mesh_xy, backend=_gram_backend,
-        n=int(sym.nk_tot) * _n_fit_bands)
     _fine_enabled = bool(params.get("get_centroids_fi", False))
     _fine_plan = (_linalg_plan(
         "eigh", mesh_xy, backend=eigh_backend, n=None,
         batched_route=distrib_la_batched_route)
         if _fine_enabled else None)
     report.environment(
-        params=params, wfn=wfn, gram_plan=_gram_plan,
+        params=params, wfn=wfn,
         fine_plan=_fine_plan, fine_enabled=_fine_enabled)
 
     from common import sanity
@@ -2619,24 +2191,34 @@ def main(argv=None):
     _centroid_records = []
     _rank_records = []
     with timing.section("initialize_wfns"):
-        wfn, sym, meta, mesh_xy, S, ctilde, B_at_mu, enk_sigma = initialize_wfns(
+        wfn, sym, meta, mesh_xy, basis, enk_sigma = initialize_wfns(
             args.input, params, log, args.eqp_file,
             mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
-            galerkin_eigh_plan=_gram_plan,
             n_guard_bands=args.guard_bands, progress_fn=report.progress,
             centroid_record_fn=_centroid_records.append,
-            rank_record_fn=_rank_records.append)
+            rank_record_fn=_rank_records.append,
+            require_all_occupied=True,
+            basis_input=args.basis_input, basis_output=args.basis_output,
+            distrib_la_batched_route=distrib_la_batched_route)
     _setup_progress.step()
     _setup_progress.finish()
+    ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    qp_corrected_band_range = None
+    if _qp_rotations_path is not None:
+        (ctilde, enk_sigma,
+         qp_corrected_band_range) = resolve_qp_hamiltonian_state(
+            basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta,
+            wfn=wfn,
+            wfn_path=_wfn_path, qp_rotations_file=_qp_rotations_path,
+            eqp_file=args.eqp_file, log_fn=log)
     # ── Galerkin-input gate ───────────────────────────────────────────
-    # S is the ISDF overlap Gram matrix (Hermitian positive-definite by
-    # construction) and ``enk_sigma`` is the band energies the whole
+    # ``ctilde`` is the compact Galerkin coefficient table and ``enk_sigma``
+    # is the band energies the whole
     # interpolation is anchored to — including, when ``--eqp-file`` is
     # given, energies read from a GW run that may itself have produced
     # garbage.  A −136 eV QP energy fed into htransform yields a
     # bandstructure.dat that is numerically finite, plots fine, and is
     # wrong.  Bracket it here, where the file name is still in scope.
-    sanity.check_finite("htransform S (ISDF overlap)", S, print_fn=log)
     sanity.check_finite("htransform ctilde", ctilde, print_fn=log)
     sanity.check_finite("htransform band energies", enk_sigma, print_fn=log)
     # Bandwidth, not absolute energy: the zero of a pseudopotential
@@ -2670,12 +2252,14 @@ def main(argv=None):
         item_name="stage", max_updates=1).start()
     _quality_records = []
     with mesh_xy, timing.section("h_transform"):
-        result = h_transform(meta, S, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
+        result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                              a_band_index=args.a_band,
                              band_start=int(wfn.nelec) - int(params["nval"]),
                              n_return_bands=n_return_bands,
+                             qp_corrected_band_range=qp_corrected_band_range,
                              progress_fn=report.progress,
-                             quality_record_fn=_quality_records.append)
+                             quality_record_fn=_quality_records.append,
+                             sym=sym)
     _transform_progress.step()
     _transform_progress.finish()
 

@@ -16,7 +16,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.mtxel_sweep import band_sphere_spec
 from common.parallel_transport import (
     band_storage_extent,
     build_forward_neighbor_table,
@@ -29,7 +28,10 @@ from common.parallel_transport import (
     make_cross_k_link,
     make_cross_k_overlap,
     make_distributed_band_matmul,
+    MIN_STENCIL_POINTS,
+    undersampled_link_axes,
 )
+from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 
 
@@ -94,13 +96,12 @@ __all__ = [
     "W_AV_DENSITY_DATASET",
     "WAvStencilMetadata",
     "WAvStencilReader",
-    "covariant_velocity",
     "line_index_table",
     "link_symmetry_reduction_applies",
     "initialize_parallel_transport_artifact",
     "load_full_bz_links",
+    "load_link_singular_values",
     "transported_frame",
-    "validate_covariant_velocity",
     "validate_parallel_transport_artifact",
     "write_parallel_transport_artifact",
     "write_w_av_stencil_artifact",
@@ -404,17 +405,27 @@ def initialize_parallel_transport_artifact(
     central/neighbor pairs. The only simultaneous large device objects in the
     link stage are therefore one central sphere, one neighbor sphere and one
     distributed band tile.
+
+    UNCONDITIONAL ON ``kgrid``.  ``v^DFT = p + i[r,V_NL]`` (Stage A of
+    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md``) is gauge-free and
+    needs no neighbouring k-point at all, so it carries no mesh-density
+    requirement.  The advertised fourth-order +/-2 link stencil DOES need one
+    -- :func:`undersampled_link_axes` -- but that need belongs to the link
+    and connection stages :func:`write_parallel_transport_artifact` appends
+    afterward, not to this transaction.  Until that later call runs (or is
+    never made, for a velocity-only consumer such as
+    ``sc_head_update=dft_velocity``), the schema's link/connection datasets
+    stay at their created-but-``connection_complete=0`` state, which is
+    exactly the state :func:`gw.qsgw_head.load_parallel_transport_head`
+    already refuses by name -- a links-requiring consumer handed this
+    artifact before (or without) that call refuses on
+    ``connection_complete is not 1``, never on a silently short read.
+    Before 2026-08-23 this same 2D/undersampled case (measured on a real
+    CrI3 9x9x1 deck) refused HERE instead, before velocity -- the object
+    that carries no stencil requirement at all -- was ever written.
     """
     nb = int(nbands)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
-    undersampled = [axis for axis, n in zip("xyz", kgrid) if n < 5]
-    if undersampled:
-        raise ValueError(
-            "parallel-transport preprocessing requires at least five "
-            "distinct mesh points along every Cartesian mesh direction for "
-            "the advertised fourth-order +/-2 stencil; got "
-            f"kgrid={kgrid} (undersampled axes "
-            f"{','.join(undersampled)}).")
     reduced = link_symmetry_reduction_applies(sym, kgrid)
     nk = int(sym.nk_tot)
     nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
@@ -1081,7 +1092,39 @@ def write_parallel_transport_artifact(
     w_av_first_neighbors: bool = False,
     w_av_second_neighbors: bool = False,
 ) -> None:
-    """Append streamed links and the full-BZ connection to an initialized file."""
+    """Append streamed links and the full-BZ connection to an initialized file.
+
+    THE STENCIL GATE LIVES HERE NOW, per axis, not in the artifact
+    initializer -- this is the ONLY stage that differentiates along k, and
+    the only one :func:`common.parallel_transport.undersampled_link_axes`
+    needs to protect.  A direction with too few points (including a
+    genuinely collapsed ``kgrid[i] == 1`` slab axis) refuses by name here;
+    it is never fabricated as an analytic zero (KNOWN_LORRAX_ISSUES.md row
+    at this file's :func:`initialize_parallel_transport_artifact` /
+    ``get_dipole_mtxels.py:1309-1317``, fix note).
+    """
+    kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+    bad_axes = undersampled_link_axes(kgrid)
+    if bad_axes:
+        raise ValueError(
+            "PT-LINK-STENCIL-UNSUPPORTED refusal: the nearest-neighbour "
+            "link stage and its fourth-order +/-2 connection stencil "
+            "require at least "
+            f"{MIN_STENCIL_POINTS} distinct mesh points along every "
+            "Cartesian mesh direction.\n"
+            f"  got:  kgrid={kgrid}, undersampled axes "
+            f"{', '.join(bad_axes)} "
+            f"({'; '.join(f'{a}: {n} point(s)' for a, n in zip('xyz', kgrid) if a in bad_axes)})\n"
+            "  want: >=5 mesh points on every axis that carries dispersion, "
+            "or no request for the link/connection stage at all\n"
+            "  fix:  for a genuinely lower-dimensional deck (a collapsed "
+            "axis with kgrid[i]=1, e.g. a 9x9x1 slab), request only the "
+            "exact DFT velocity -- sc_head_update=dft_velocity reads "
+            "velocity_dft_cart alone and never calls this stage; for an "
+            "undersampled but periodic axis (1 < kgrid[i] < 5), densify "
+            "the mesh along it\n"
+            "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
+            "pipeline step 3")
     plan_polar, edge_table, apply_symmetry, q_stencil_table = (
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
@@ -1478,6 +1521,37 @@ def load_full_bz_links(
     return links
 
 
+def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
+    """Read the per-source-k, per-direction link overlap singular values.
+
+    Returns ``(n_source, 3, nb_logical)``, descending along the last axis
+    (the dataset's own ``ordering`` attribute; see
+    :data:`SINGULAR_VALUES_DATASET`'s ``create_dataset`` call).  ``n_source``
+    is the IBZ row count on a symmetry-reduced deck or ``nk_tot`` on an
+    unreduced (bcc/fcc) one -- WHICHEVER the artifact actually stored, read
+    from ``source_full_ids`` exactly as :func:`load_full_bz_links` does, so
+    the two never disagree about how many rows exist.
+
+    UNLIKE the links themselves, singular values are NOT unfolded to the
+    full BZ here: they are real scalars invariant under the point-group
+    action that produced any symmetry-equivalent k, so the IBZ (or full-BZ)
+    source set the artifact stored already carries every value a full-BZ
+    "minimum over k" query would see -- unfolding would repeat values, not
+    add information, for a min-reduction consumer.  A caller that needs a
+    specific k's value at a k outside the stored source set must go through
+    the same directed-edge table :func:`load_full_bz_links` uses; no
+    consumer needs that today.
+    """
+    nb = int(nb_logical)
+    source_full = np.asarray(io.read_slab(
+        "source_full_ids", partition_spec=P(None), as_numpy=True))
+    n_source = int(source_full.size)
+    values = io.read_slab(
+        SINGULAR_VALUES_DATASET, shape=(n_source, 3, nb),
+        partition_spec=P(None, None, None), as_numpy=True)
+    return np.asarray(values, dtype=np.float64)
+
+
 def validate_parallel_transport_artifact(
     path: str | Path,
     *,
@@ -1526,50 +1600,6 @@ def validate_parallel_transport_artifact(
         links_full=links,
         forward_neighbors=forward_neighbors,
         atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks)
-
-
-def covariant_velocity(
-    hamiltonian_derivative_cart,
-    connection_cart,
-    hamiltonian_dft,
-    *,
-    band_matmul,
-):
-    """Return dH/dk_i - i[A_i, H] in the fixed reference basis."""
-    dH = jnp.asarray(hamiltonian_derivative_cart)
-    A = jnp.asarray(connection_cart)
-    H = jnp.asarray(hamiltonian_dft)
-    if dH.shape != A.shape:
-        raise ValueError(f"dH and A shapes differ: {dH.shape} vs {A.shape}")
-    if H.shape != A.shape[1:]:
-        raise ValueError(
-            f"H must have shape {A.shape[1:]}; got {tuple(H.shape)}")
-    commutator = band_matmul(A, H[None]) - band_matmul(H[None], A)
-    return dH - 1.0j * commutator
-
-
-def validate_covariant_velocity(
-    hamiltonian_derivative_cart,
-    connection_cart,
-    hamiltonian_dft,
-    velocity_exact_cart,
-    *,
-    band_matmul,
-    atol: float,
-    rtol: float,
-) -> dict[str, object]:
-    """Compare every complex diagonal/off-diagonal reconstructed velocity.
-
-    The spectral derivative is deliberately an input: the QSGW/head lane owns
-    the one shared full-k FFT derivative service, so preprocessing does not
-    introduce a second FFT implementation.
-    """
-    reconstructed = covariant_velocity(
-        hamiltonian_derivative_cart, connection_cart, hamiltonian_dft,
-        band_matmul=band_matmul)
-    exact = jnp.asarray(velocity_exact_cart)
-    return _velocity_error_metrics(
-        reconstructed, exact, atol=float(atol), rtol=float(rtol))
 
 
 def _velocity_error_metrics(

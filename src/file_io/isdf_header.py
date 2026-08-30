@@ -56,6 +56,15 @@ from pathlib import Path
 import h5py as h5
 import numpy as np
 
+# Compatibility names only.  ``file_io.wfn_basis`` is the sole owner; these
+# imports preserve the candidate branch's public spelling for downstream
+# worktrees while keeping the receipt implementation out of the ζ header.
+from .wfn_basis import (
+    CENTROID_TABLE_FINGERPRINT_SCHEME,
+    WavefunctionBasisReceipt,
+    centroid_table_md5,
+)
+
 
 _GROUP = 'isdf_header'
 
@@ -378,7 +387,10 @@ def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
 
 
 __all__ = [
+    'CENTROID_TABLE_FINGERPRINT_SCHEME',
+    'centroid_table_md5',
     'IsdfHeader',
+    'WavefunctionBasisReceipt',
     'read_isdf_header',
     'read_isdf_header_from_file',
     'bind_isdf_attrs',

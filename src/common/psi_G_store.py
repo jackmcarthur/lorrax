@@ -1,4 +1,4 @@
-"""Host-resident ψ(G-flat) staging for the one-time ψ(r) cache build.
+"""Host-resident ψ(G-flat) staging for reusable ψ(r)-chunk sources.
 
 The one-time cache builder consumes ψ(G) one band chunk at a time, and the
 ISDF fit later slices ψ(r) by band chunk and r chunk.  Holding ψ in full FFT-box
@@ -13,7 +13,7 @@ staging pipeline:
 * :class:`PsiGStore` stores per-rank tiles of shape
   ``(nk, nb_local, ns, ngkmax)`` instead of ``(nk, nb_local, ns, nx,
   ny, nz)``.
-* :meth:`PsiGStore._slice_local_tile_bc` returns one bc's per-rank
+* :meth:`PsiGStore.read_local_band_chunk` returns one bc's per-rank
   band slab via ``io_callback``, padded to ``(nk, _bpd_max, ns,
   ngkmax)`` so the enclosing ``lax.scan`` body sees a static return
   shape.  :func:`isdf.core.build_psi_r_cache_sm` iterates band chunks via
@@ -21,10 +21,11 @@ staging pipeline:
   via the slicer.  The resulting ψ(r) cache is band-flat-sharded over the
   full mesh.
 
-The store populates once, feeds the one-time ψ(r) cache build, and is
-released before the r-chunk loop.  Its host footprint is
-``nk · nb_total · ns · ngkmax · 16 / P`` bytes per process during that
-build only.
+The store populates once and can either feed the one-time ψ(r) cache build or
+serve repeated r chunks through :meth:`PsiGStore.iter_rchunk_bandwise`.  Its
+host footprint is one band shard per process-addressable mesh cell; the
+process total is the exact sum of those local tiles (one tile in the usual
+one-rank-per-GPU launch).
 
 The reader adapters (legacy h5py vs phdf5) collapse to a single
 :class:`wfn_loader.WfnLoader` whose ``backend='auto'`` picks the
@@ -38,12 +39,9 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
 from common.shard_map import shard_map
+from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
-
-# Sharding spec for the ψ(G-flat) tile that the cache builder consumes after
-# io_callback: (n_k, nb, ns, ngkmax), band-flat-sharded over (x, y).
-_PSI_G_FLAT_SPEC = P(None, ('x', 'y'), None, None)
+from runtime.padding import spec_divisor
 
 
 def _zero_user_band_pad_in_shard(
@@ -81,11 +79,22 @@ def _zero_user_band_pad_in_shard(
 
 
 def _mesh_device_coords(mesh: Mesh) -> dict:
-    """Map ``id(device) → (x_idx, y_idx)`` for every device in the mesh."""
+    """Map only this process's addressable devices to global mesh cells."""
+    global_coords = {
+        id(dev): tuple(int(i) for i in idx)
+        for idx, dev in np.ndenumerate(np.asarray(mesh.devices))
+    }
     coords = {}
-    devs = np.asarray(mesh.devices)
-    for idx, dev in np.ndenumerate(devs):
-        coords[id(dev)] = tuple(int(i) for i in idx)
+    for dev in mesh.local_devices:
+        dev_id = id(dev)
+        if dev_id not in global_coords:
+            raise RuntimeError(
+                "PsiGStore: a Mesh.local_devices entry is absent from "
+                "Mesh.devices")
+        coords[dev_id] = global_coords[dev_id]
+    if not coords:
+        raise RuntimeError(
+            "PsiGStore: this process owns no addressable device in the mesh")
     return coords
 
 
@@ -139,7 +148,7 @@ def assert_band_chunks_divisible(band_chunk_ranges, world_size: int) -> None:
 
 
 class PsiGStore:
-    """Host-resident ψ(G-flat) staging for ``build_psi_r_cache_sm``.
+    """Host-resident ψ(G-flat) staging and reusable r-chunk source.
 
     Per locally-addressable mesh cell ``(x, y)`` owns one contiguous
     host tile of shape ``(nk, nb_local, ns, ngkmax)``.  The band axis
@@ -148,7 +157,7 @@ class PsiGStore:
     For CrI3-scale, the new shape is ~14× smaller than the legacy
     g_box ``(nk, nb_local, ns, nx, ny, nz)`` shape.
 
-    :meth:`_slice_local_tile_bc` is the per-iter host-tile slicer used
+    :meth:`read_local_band_chunk` is the public per-iter host-tile slicer used
     by the ``io_callback`` inside the cache builder's ``lax.scan`` body.
     It returns one bc's per-rank slab padded to
     ``(nk, _bpd_max, ns, ngkmax)`` so the scan body sees a static
@@ -163,27 +172,60 @@ class PsiGStore:
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
         bispinor: bool = False,
+        bispinor_lift: str = "raw",
+        band_pad_to: int | None = None,
     ):
         self.loader = loader
         self.mesh = mesh_xy
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
         self.bispinor = bool(bispinor)
+        self.bispinor_lift = str(bispinor_lift)
 
         nk = int(meta.nk_tot)
         ns = int(meta.nspinor)
         ngkmax = int(loader.ngkmax)
-        p = int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])
+        p = spec_divisor(mesh_xy, band_sphere_spec(), axis=1)
+
+        logical_widths = tuple(
+            int(b_hi) - int(b_lo) for b_lo, b_hi in self.band_chunk_ranges)
+        if band_pad_to is not None:
+            band_pad_to = int(band_pad_to)
+            if band_pad_to <= 0:
+                raise ValueError(
+                    f"PsiGStore: band_pad_to must be positive, got "
+                    f"{band_pad_to}")
+            too_wide = [
+                (bc, width) for bc, width in zip(
+                    self.band_chunk_ranges, logical_widths)
+                if width > band_pad_to
+            ]
+            if too_wide:
+                raise ValueError(
+                    "PsiGStore: band_pad_to is smaller than a logical band "
+                    f"chunk: band_pad_to={band_pad_to}, chunks={too_wide}")
+            transport_ranges = tuple(
+                (int(b_lo), int(b_lo) + band_pad_to)
+                for b_lo, _ in self.band_chunk_ranges)
+        else:
+            transport_ranges = self.band_chunk_ranges
+        self._band_pad_to = band_pad_to
 
         # Per-bc local band count: bands_per_device for ONE bc.  Used to
         # compute the per-rank tile's band-axis offsets (bc-stacked
         # ordering); the per-rank tile's full band axis is contiguous
         # across all bcs and lives at ``self._per_rank_shape[1]``.
-        assert_band_chunks_divisible(self.band_chunk_ranges, p)
-        bpd_per_bc = [(b_hi - b_lo) // p for (b_lo, b_hi) in self.band_chunk_ranges]
+        # ``band_pad_to`` is a transport carrier: a short logical final chunk
+        # remains the range the caller sees, while ``load_psi_gflat_padded``
+        # supplies exact-zero rows so the store can shard a uniform width.
+        assert_band_chunks_divisible(transport_ranges, p)
+        bpd_per_bc = [
+            (int(b_hi) - int(b_lo)) // p
+            for b_lo, b_hi in transport_ranges
+        ]
         self._bpd_per_bc = tuple(bpd_per_bc)
         # Padded uniform per-bc local band count — used by
-        # ``_slice_local_tile_bc`` so an ``io_callback`` inside a
+        # ``read_local_band_chunk`` so an ``io_callback`` inside a
         # ``lax.scan`` body sees a static return shape regardless of
         # which bc the traced index resolves to.  Round 6 Phase 2
         # restoration of the field originally added in commit
@@ -209,11 +251,21 @@ class PsiGStore:
         # device once — they're shared across every cache-builder callback.
         self._g_index_dev: jax.Array | None = None
         self._kvecs_frac_dev: jax.Array | None = None
+        self._rchunk_kernel_cache: dict[int, object] = {}
+        self._closed = False
 
         self._populate_from_loader()
+        expected_host_bytes = (
+            len(self._coords) * self._per_rank_shape_bytes())
+        if self.host_cache_bytes != expected_host_bytes:
+            raise RuntimeError(
+                "PsiGStore: process-local host cache allocation drifted "
+                f"from its exact bound: allocated={self.host_cache_bytes} "
+                f"bytes, expected={expected_host_bytes} bytes for "
+                f"{len(self._coords)} addressable mesh cells")
         if jax.process_index() == 0:
-            tile_gb = self._per_rank_shape_bytes() / 1e9
-            print(f"  ψ(G-flat) host cache: {tile_gb:.2f} GB/process resident")
+            host_gb = self.host_cache_bytes / 1e9
+            print(f"  ψ(G-flat) host cache: {host_gb:.2f} GB/process resident")
 
     # ---------------------------------------------------------------------
     # Population — pulls from the WfnLoader, scatters into per-(x,y) tiles.
@@ -244,7 +296,7 @@ class PsiGStore:
         # is still here and drives the SlabIO write side.
         from common import timing
         from common.wfn_transforms import load_psi_gflat_padded
-        sharding_spec = P(None, ('x', 'y'), None, None)
+        sharding_spec = band_sphere_spec()
         for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
             bc_start, bc_end = int(bc_range[0]), int(bc_range[1])
             b_lo = self._bc_band_offsets[bc_idx]
@@ -256,15 +308,15 @@ class PsiGStore:
             # 2129fad).  ``None`` return = the entire bc range starts
             # at/past ``loader.nbands``: only band-pad rows the
             # ``_zero_user_band_pad_in_shard`` post-step would zero out
-            # anyway, AND the per-rank host-tile slice for these rows is
-            # empty (``bpd_per_bc[bc] == 0`` since ``nb_total < p`` for
-            # the all-pad tail bcs), so skip the load entirely and
-            # zero-fill the tile span directly.
+            # anyway, so skip the load entirely and zero-fill the tile span
+            # directly.  This also covers a uniformly padded transport
+            # carrier whose logical final chunk lies wholly beyond EOF.
             with timing.section("psi_G_store.populate.loader_load"):
                 psi_G_bc = load_psi_gflat_padded(
                     self.loader, (bc_start, bc_end), mesh_xy=self.mesh,
                     bispinor=self.bispinor, k="full_bz",
-                    sharding=sharding_spec)
+                    pad_to=self._band_pad_to, sharding=sharding_spec,
+                    bispinor_lift=self.bispinor_lift)
                 if psi_G_bc is not None:
                     jax.block_until_ready(psi_G_bc)
             if psi_G_bc is None:
@@ -298,10 +350,11 @@ class PsiGStore:
             # ~1.3 GB/rank wasted by V_q time (agent_h §3 Finding 3).
             self._g_index_dev = self.loader.box_index_dev(
                 k="full_bz", mesh=self.mesh)
-            kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
-            sym = self.loader.symmetry()
-            kvecs_frac = np.asarray(
-                sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
+            # k and G are one gauge contract owned by WfnLoader. Rebuilding
+            # k from integer grid labels can pick a different reciprocal-
+            # lattice image than ``box_index``'s G table (notably on an
+            # identity-only WFN whose stored full grid is centered).
+            kvecs_frac = self.loader.kvecs(k="full_bz")
             # Process-local placement — see
             # ``common.collectives.device_put_process_local``: on a
             # multi-process mesh ``jax.device_put(numpy, sharding)``
@@ -313,6 +366,15 @@ class PsiGStore:
 
     def _clear_tiles(self) -> None:
         self._host_tiles.clear()
+
+    def release_host_tiles(self) -> None:
+        """Release coefficient tiles after their callbacks have drained.
+
+        The device-resident box index and k vectors remain valid for cached
+        r-space consumers.  :meth:`close` is the sole full teardown.
+        """
+        self._rchunk_kernel_cache.clear()
+        self._clear_tiles()
 
     # ---------------------------------------------------------------------
     # Per-rank host-tile slice for one bc, padded to a static shape.
@@ -336,8 +398,30 @@ class PsiGStore:
     # zero.  ``np.empty`` would leave garbage that the L/R mask might
     # zero-out at the einsum but could still pollute IFFT precision.
 
-    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
-        """Per-rank host-tile slice for one bc, padded to ``(nk, _bpd_max, ns, ngkmax)``.
+    @property
+    def local_band_chunk_shape(self) -> tuple[int, int, int, int]:
+        """Per-device host callback shape ``(nk, b_local, ns, ngkmax)``.
+
+        This is the only shape a consumer needs in order to declare an
+        ``io_callback`` result.  Keeping it public prevents r-chunk sources
+        from reaching into ``_bpd_max`` or ``_per_rank_shape``.
+        """
+        nk, _, ns, ngkmax = self._per_rank_shape
+        return (int(nk), int(self._bpd_max), int(ns), int(ngkmax))
+
+    @property
+    def host_cache_bytes(self) -> int:
+        """Exact bytes in process-addressable coefficient host tiles."""
+        return sum(int(tile.nbytes) for tile in self._host_tiles.values())
+
+    @property
+    def band_chunk_carrier(self) -> int:
+        """Uniform global band width yielded for every logical chunk."""
+        p = spec_divisor(self.mesh, band_sphere_spec(), axis=1)
+        return int(self._bpd_max) * int(p)
+
+    def read_local_band_chunk(self, x_idx, y_idx, bc_idx) -> np.ndarray:
+        """Return one local band-chunk carrier from this process's host tile.
 
         Parameters
         ----------
@@ -360,10 +444,16 @@ class PsiGStore:
         asynchronously inside ``lax.scan``.  ``isdf_fitting.py`` blocks on
         the completed ψ(r) cache before closing this store.
         """
+        if getattr(self, "_closed", False):
+            raise RuntimeError(
+                "PsiGStore.read_local_band_chunk: the store is closed")
+        if not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.read_local_band_chunk: host tiles were released")
         x, y, bc = int(x_idx), int(y_idx), int(bc_idx)
         if not 0 <= bc < len(self.band_chunk_ranges):
             raise ValueError(
-                f"_slice_local_tile_bc: bc_idx={bc} not in "
+                f"read_local_band_chunk: bc_idx={bc} not in "
                 f"[0, {len(self.band_chunk_ranges)})")
         tile = self._host_tiles[(x, y)]
         b_lo = self._bc_band_offsets[bc]
@@ -372,6 +462,105 @@ class PsiGStore:
         out = np.zeros((nk, self._bpd_max, ns, ngkmax), dtype=tile.dtype)
         out[:, : b_hi - b_lo, :, :] = tile[:, b_lo:b_hi, :, :]
         return out
+
+    def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx) -> np.ndarray:
+        """Compatibility adapter; new consumers use the public method."""
+        return self.read_local_band_chunk(x_idx, y_idx, bc_idx)
+
+    def _rchunk_kernel(self, n_r_carrier: int):
+        """One cached host-store → band-sharded r-carrier executable."""
+        n_r_carrier = int(n_r_carrier)
+        fn = self._rchunk_kernel_cache.get(n_r_carrier)
+        if fn is not None:
+            return fn
+
+        from common.wfn_transforms import to_rchunk_inner
+
+        store = self
+        fft_grid = tuple(int(s) for s in self.meta.fft_grid)
+        out_sds = jax.ShapeDtypeStruct(
+            self.local_band_chunk_shape, jnp.complex128)
+
+        def _read_host(x_idx, y_idx, bc_idx):
+            return store.read_local_band_chunk(x_idx, y_idx, bc_idx)
+
+        @partial(
+            shard_map,
+            mesh=self.mesh,
+            in_specs=(P(None, None, None, None), P(None, None), P(), P()),
+            out_specs=band_sphere_spec(),
+            check_vma=False,
+        )
+        def _local(g_index_dev, kvecs_frac_dev, r_start, bc_idx):
+            x_idx = jax.lax.axis_index('x')
+            y_idx = jax.lax.axis_index('y')
+            psi_G_bc = io_callback(
+                _read_host, out_sds, x_idx, y_idx, bc_idx, ordered=False)
+            return to_rchunk_inner(
+                psi_G_bc, g_index_dev, fft_grid,
+                r_start, n_r_carrier, norm="ortho",
+                kvecs_frac=kvecs_frac_dev)
+
+        def _call(g_index_dev, kvecs_frac_dev, r_start, bc_idx):
+            return _local(g_index_dev, kvecs_frac_dev, r_start, bc_idx)
+
+        rep = NamedSharding(self.mesh, P())
+        _run = jax.jit(
+            _call,
+            in_shardings=(
+                NamedSharding(self.mesh, P(None, None, None, None)),
+                NamedSharding(self.mesh, P(None, None)), rep, rep),
+            out_shardings=NamedSharding(self.mesh, band_sphere_spec()),
+        )
+        self._rchunk_kernel_cache[n_r_carrier] = _run
+        return _run
+
+    def iter_rchunk_bandwise(
+        self,
+        r_start: int,
+        r_end: int,
+        *,
+        product_r_spec: P,
+    ):
+        """Yield cached-WFN ``(band_range, ψ_band(r_chunk))`` pairs.
+
+        Coefficients were read exactly once when this store was constructed.
+        Each iteration pulls the process-local G-flat tile through
+        ``io_callback``, calls the canonical ``to_rchunk_inner`` FFT/Bloch
+        transform, then takes the canonical staged product-band → product-r
+        exchange.  No WFN reader or symmetry/FFT formula lives here.
+
+        ``product_r_spec`` is explicit so a consumer's Q layout cannot drift
+        from its source.  The one supported contract is
+        ``P(None,None,None,('y','x'))``.  Only a terminal logical slab may be
+        padded; its carrier tail is exact zero.
+
+        The caller must finish consuming returned arrays before ``close()``;
+        an ``io_callback`` may still be in flight while a JAX array is pending.
+        """
+        if self._closed:
+            raise RuntimeError("PsiGStore.iter_rchunk_bandwise: store is closed")
+        if not self._host_tiles:
+            raise RuntimeError(
+                "PsiGStore.iter_rchunk_bandwise: host tiles were released")
+        from common.wfn_transforms import prepare_rchunk_carrier
+        r_start = int(r_start)
+        r_end = int(r_end)
+        n_r_carrier, _, finish_r_carrier = prepare_rchunk_carrier(
+            self.mesh,
+            r_start=r_start,
+            r_end=r_end,
+            n_rtot=self.meta.n_rtot,
+            product_r_spec=product_r_spec,
+        )
+        kernel = self._rchunk_kernel(n_r_carrier)
+        r_start_dev = jnp.asarray(r_start, dtype=jnp.int32)
+        for bc_idx, bc_range in enumerate(self.band_chunk_ranges):
+            psi_band_r = kernel(
+                self.g_index, self.kvecs_frac, r_start_dev,
+                jnp.asarray(bc_idx, dtype=jnp.int32))
+            psi_product_r = finish_r_carrier(psi_band_r)
+            yield tuple(int(v) for v in bc_range), psi_product_r
 
     @property
     def g_index(self) -> jax.Array:
@@ -394,8 +583,19 @@ class PsiGStore:
         return self._kvecs_frac_dev
 
     def close(self) -> None:
-        """Release all host tiles; the shared loader remains caller-owned."""
-        self._clear_tiles()
+        """Release all store resources; the shared loader remains caller-owned."""
+        self.release_host_tiles()
+        self._g_index_dev = None
+        self._kvecs_frac_dev = None
+        self._closed = True
+
+    def __enter__(self) -> "PsiGStore":
+        if self._closed:
+            raise RuntimeError("PsiGStore.__enter__: store is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _per_rank_shape_bytes(self) -> int:
         return int(np.prod(self._per_rank_shape)) * 16  # complex128
@@ -408,6 +608,8 @@ def build_psi_G_store(
     meta,
     band_chunk_ranges,
     bispinor: bool = False,
+    bispinor_lift: str = "raw",
+    band_pad_to: int | None = None,
 ) -> PsiGStore:
     """Construct the one ψ(G-flat) host store.
 
@@ -415,10 +617,16 @@ def build_psi_G_store(
     ``backend='auto'`` picks the FFI phdf5 path when multi-rank GPU +
     mesh + .so present; falls back to eager h5py otherwise.  CPU and
     single-process tests get the eager path automatically.
+
+    ``band_pad_to`` supplies a uniform, exactly-zero-padded transport width
+    while preserving the logical ``band_chunk_ranges`` exposed by the store.
+    It must be at least every logical chunk width and divisible by the
+    band-sharding mesh product.
     """
     loader = wfn  # reuse top-level WfnLoader; opening a second one would
                   # re-slurp wfns/coeffs into host RAM.
     return PsiGStore(
         loader=loader, mesh_xy=mesh_xy,
         band_chunk_ranges=band_chunk_ranges, meta=meta,
-        bispinor=bispinor)
+        bispinor=bispinor, bispinor_lift=bispinor_lift,
+        band_pad_to=band_pad_to)

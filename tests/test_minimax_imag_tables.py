@@ -45,6 +45,7 @@ The six checks, and what each one is actually guarding:
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -151,6 +152,174 @@ def test_every_entry_declares_a_known_rule_and_a_shipping_tier():
         assert entry["kappa0"] <= gen.KAPPA_EXCEPTION
         assert entry["beta_axis"] in ("exact_entry_only",
                                       "exact_phase_on_fixed_nodes")
+
+
+def test_btv_lps_share_the_pinned_highs_accuracy_owner(monkeypatch):
+    """Both incumbent LPs use one explicit sub-1e-7 solver contract."""
+
+    seen = []
+
+    def _fake_linprog(*args, **kwargs):
+        seen.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(gen, "linprog", _fake_linprog)
+    marker = gen._linprog_certified(np.ones(1), method="highs")
+    assert marker is not None
+    assert len(seen) == 1
+    assert seen[0][1]["method"] == "highs"
+    assert seen[0][1]["options"] == {
+        "primal_feasibility_tolerance": 1.0e-10,
+        "dual_feasibility_tolerance": 1.0e-10,
+        "ipm_optimality_tolerance": 1.0e-12,
+    }
+
+    # Structural half of the gate: the feasibility and polish programs
+    # route through that owner, not scipy's linprog independently.
+    for func in (gen._lp_l1, gen._lp_minimax):
+        source = inspect.getsource(func)
+        assert source.count("_linprog_certified(") == 1
+        assert " linprog(" not in source
+
+    with pytest.raises(ValueError, match="owns the HiGHS accuracy options"):
+        gen._linprog_certified(
+            np.ones(1), method="highs", options={"presolve": False})
+
+
+def test_append_preserves_every_preexisting_certificate_field():
+    """Adding one asset is not an implicit recertification of old bytes."""
+
+    old_entry = {
+        "family": "complex_laplace",
+        "rule": "positive_composite",
+        "range_max": 100.0,
+        "beta": 16.0,
+        "error_bound": 1.0e-6,
+        "certified": True,
+        "kappa0": 1.0000000000000007,
+        "payload_sha256": "old-certificate",
+    }
+    fresh_entry = {
+        "family": "complex_laplace",
+        "rule": "btv_minimax",
+        "range_max": 92.36189541312947,
+        "beta": 29.126243024110114,
+        "error_bound": 6.86665972794514e-8,
+        "certified": True,
+        "kappa0": 1.2886570001952167,
+        "payload_sha256": "new-certificate",
+    }
+    prior = {
+        "shipping_rule": {
+            "source": "docs/theory/THEORY_mpa_implementation.md"},
+        "provenance": {"tool_sha256": "prior-tool"},
+        "sweep": {
+            "solver_wall_seconds": 0.11,
+            "entries": 1,
+            "certified": 1,
+            "by_rule": {"positive_composite": 1},
+            "ledger": [{"cell": "old"}],
+        },
+        "tables": [old_entry],
+    }
+    merged, replaced = gen.merge_entries(prior["tables"], [fresh_entry])
+    doc = gen.append_catalog_document(
+        prior, merged, prior["sweep"]["ledger"] + [{"cell": "new"}], 1.25)
+
+    assert replaced == 0
+    assert old_entry in doc["tables"]
+    assert doc["tables"][doc["tables"].index(old_entry)] == old_entry
+    assert doc["shipping_rule"] == prior["shipping_rule"]
+    assert doc["provenance"] == prior["provenance"]
+    assert doc["sweep"]["solver_wall_seconds"] == 1.36
+    assert doc["sweep"]["entries"] == 2
+    assert doc["sweep"]["certified"] == 2
+
+
+def test_generator_shipping_rule_points_to_the_registered_theory_ssot():
+    source = gen.catalog_document([], [], 0.0)["shipping_rule"]["source"]
+    assert source == "docs/theory/THEORY_mpa_implementation.md"
+    assert (_REPO / source).is_file()
+
+
+def test_static_no_clobber_preserves_prior_rows_bytes_and_sweep(
+        tmp_path, monkeypatch):
+    """A one-cell append must not re-author an older static payload."""
+
+    spec = importlib.util.spec_from_file_location(
+        "lorrax_tools_generate_static_minimax_assets",
+        _REPO / "tools" / "generate_minimax_assets.py")
+    static_gen = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(static_gen)
+
+    prior_sweeps = {
+        "error_bounds": [1.0e-6, 2.0e-7],
+        "crossing_A_dim_values": [20.0, 40.0],
+        "noncrossing_R_values": [10.0, 100.0],
+    }
+    old_entry = {
+        "family": "noncrossing",
+        "error_bound": 2.0e-7,
+        "error_metric": "linf_abs_scaled_1_over_x",
+        "range_param": "R",
+        "range_max": 100.0,
+        "node_count": 2,
+        "max_error": 1.0e-7,
+        "file": "noncrossing/old.npz",
+        "certificate_sentinel": "must-survive-exactly",
+    }
+    old_path = tmp_path / old_entry["file"]
+    old_path.parent.mkdir(parents=True)
+    np.savez_compressed(
+        old_path,
+        tau=np.array([0.1, 1.0]),
+        alpha=np.array([0.25, 0.75]),
+        max_error=np.array(1.0e-7),
+    )
+    old_bytes = old_path.read_bytes()
+    (tmp_path / "catalog.json").write_text(
+        json.dumps({"sweeps": prior_sweeps, "tables": [old_entry]}),
+        encoding="utf-8")
+
+    class _Rule:
+        nodes = np.array([0.2, 1.2])
+        weights = np.array([0.4, 0.6])
+        max_error = 3.0e-8
+
+    monkeypatch.setattr(static_gen, "solve_uncertified", lambda **_kw: _Rule())
+    monkeypatch.setattr(
+        static_gen, "certify_noncrossing_inverse",
+        lambda tau, alpha, *_args: {
+            "certified": True, "failures": [], "max_error": 3.0e-8,
+            "held_out_max_error": 3.0e-8, "derivative_root_count": 1,
+            "local_refinement_count": 1, "n_eval": 5,
+            "kappa0": 1.0, "kappa0_bound": 2.0,
+            "sum_abs_alpha": float(np.sum(np.abs(alpha))),
+            "rescale_max_error_ratio": 1.0,
+            "payload_sha256": static_gen.payload_sha256(tau, alpha),
+        })
+    monkeypatch.setattr(
+        static_gen, "_generator_provenance",
+        lambda: {"tool": "fixture", "generator_commit": "fixture"})
+    doc = static_gen.generate_assets(
+        output_root=tmp_path,
+        error_bounds=[6.86665972794514e-8],
+        crossing_a_values=[20.0, 40.0, 60.0],
+        noncrossing_r_values=[92.36189541312947],
+        families=["noncrossing"],
+        crossing_eps_q=1.0e-3,
+        crossing_target_kind="hgl",
+        clobber=False,
+    )
+
+    assert old_entry in doc["tables"]
+    assert old_path.read_bytes() == old_bytes
+    assert doc["sweeps"]["error_bounds"] == [
+        1.0e-6, 2.0e-7, 6.86665972794514e-8]
+    assert doc["sweeps"]["crossing_A_dim_values"] == [20.0, 40.0]
+    assert doc["sweeps"]["noncrossing_R_values"] == [
+        10.0, 92.36189541312947, 100.0]
 
 
 # ---------------------------------------------------------------------------

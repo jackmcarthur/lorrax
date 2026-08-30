@@ -38,6 +38,7 @@ from common.collectives import (
     resolve_mesh,
     single_device_mesh,
 )
+from runtime.padding import spec_divisor
 
 # The centroid geometry is fp64 throughout: a fractional coordinate has to
 # resolve 1/N_fft of a lattice vector, and the Lloyd movement tolerance is
@@ -130,10 +131,8 @@ def require_axes(mesh: Mesh, axes, who: str) -> tuple[str, ...]:
 
 def n_shards(mesh: Mesh, axes) -> int:
     """Number of shards along ``axes`` of ``mesh``."""
-    n = 1
-    for a in ((axes,) if isinstance(axes, str) else tuple(axes)):
-        n *= int(mesh.shape[a])
-    return n
+    entry = axes if isinstance(axes, str) else tuple(axes)
+    return spec_divisor(mesh, (entry,), axis=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────

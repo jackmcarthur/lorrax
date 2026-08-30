@@ -323,6 +323,31 @@ def test_receipt_rows_are_the_call_site_s_own_file_wedge(tmp_path):
         receipt["file_wedge_full_bz_rows"], np.array([3, 2]))
 
 
+def test_receipt_accepts_canonical_first_occurrences_as_the_file_wedge(
+        tmp_path):
+    """Canonical star parents remain valid when they are the caller's rows."""
+    path = tmp_path / "ibz_sigma_first_occurrences.h5"
+    irr = np.array([4, 4, 9, 4, 9], dtype=np.int32)
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("omega_ev", data=OMEGA)
+        ds = h5.create_dataset(
+            "sigma_c_kij_ev", data=np.zeros((OMEGA.size, 2, 2, 2)))
+        ds.attrs[K_STORAGE_ATTR] = K_STORAGE_IBZ
+        ds.attrs[K_STORAGE_VERSION_ATTR] = K_STORAGE_VERSION
+        ds.attrs[N_SYM_SPATIAL_ATTR] = 1
+        h5.create_dataset(IRR_IDX_DATASET, data=irr)
+        h5.create_dataset(SYM_IDX_DATASET, data=np.zeros_like(irr))
+
+    receipt = _append(
+        path,
+        [[11.0, 11.0], [12.0, 12.0]],
+        [[-3.0, -3.0], [-4.0, -4.0]],
+        rows=np.array([0, 2]),
+    )
+    np.testing.assert_array_equal(
+        receipt["file_wedge_full_bz_rows"], np.array([0, 2]))
+
+
 # The real deck's k topology, read off tests/regression/gnppm_debug (MoS2
 # 3x3x1): nrk is 9 on a [3,3,1] grid, so the WFN stores the whole zone and
 # the file wedge is all nine rows, while the run's sigma_mnk.h5 keeps five

@@ -176,9 +176,9 @@ class HeadChannel:
                 mask-weighted (padding columns are exactly zero) and
                 already unfolded to the full BZ.  The head-slot projector
                 is ``P_q = sum_j conj(g_head[q,j]) (x) g_head[q,j]``; the
-                per-column phase the IBZ unfold omits cancels inside that
-                product, which is why ``_unfold_g0_ibz_to_full``'s
-                phase-free unfold is exact here and not an approximation.
+                columns have passed through the symmetry service's exact
+                one-leg action (source G relabel, centroid/L/tau action and
+                the measured antiunitary row policy).
     ``v_bare``  ``(nq,)`` float64 — unaveraged ``v`` at the head slot.
     ``v_avg``   ``(nq,)`` float64 — the mini-BZ cell average there.
     ``v_in_V``  ``(nq,)`` float64 — the value the production ``V`` tile

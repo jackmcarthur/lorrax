@@ -766,12 +766,17 @@ def test_no_module_imports_collectives_plumbing_from_the_kin_ion_driver():
 
 
 def test_sigma_dispatch_still_takes_the_physics_from_the_driver():
-    """Only the PLUMBING moved.  ``compute_hartree_matrix`` is real physics
-    and stays a lazy driver import — that laziness is why the ISDF route
-    does not pull in the psp stack."""
+    """Only real physics crosses the lazy driver boundary.
+
+    ``compute_hartree_matrix`` stays a lazy driver import — that laziness is
+    why the ISDF route does not pull in the psp stack.  The live G-space path
+    now returns its native sharded array, so it needs neither the former
+    ``replicate_to_mesh`` plumbing import nor a replacement gather helper.
+    """
     tree = _tree(_read("gw/sigma_dispatch.py"), "sigma_dispatch")
     assert "compute_hartree_matrix" in _imported_from(tree, "kin_ion_io")
-    assert "replicate_to_mesh" in _imported_from(tree, "common.collectives")
+    assert "replicate_to_mesh" not in _imported_from(
+        tree, "common.collectives")
 
 
 def test_auditor_driver_imports_can_fail():

@@ -19,7 +19,7 @@ Two ρ(r) sources are supported:
    a single FFT of ρ(G) → ρ(r). Requires access to the QE ``.save`` dir.
 
 2. ``rho_from_wfn_ibz(wfn, sym, n_val=None)`` — compute
-   ρ(r) = Σ_k w_k Σ_n |ψ_nk(r)|² directly from the IBZ wavefunctions in
+   ρ(r) = Σ_k w_k Σ_n f_nk |ψ_nk(r)|² directly from the IBZ wavefunctions in
    ``WFN.h5``, using the k-weights stored in the file. This is cheaper
    than the previous unfold-every-k approach in
    ``centroid/get_charge_density.py`` (now removed): for a 4×4×4 k-grid
@@ -52,7 +52,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from wfn_loader import WfnLoader                                    # noqa: E402
+from wfn_loader import WfnLoader, uniform_band_windows              # noqa: E402
 import symmetry_maps                                            # noqa: E402
 
 
@@ -138,7 +138,7 @@ def rho_from_wfn_ibz(
     *,
     warn: bool = True,
 ) -> np.ndarray:
-    """Sum ρ(r) = Σ_k w_k Σ_n |ψ_nk(r)|² over IBZ k-points.
+    """Sum ρ(r) = Σ_k w_k Σ_n f_nk |ψ_nk(r)|² over IBZ k-points.
 
     Delegates the actual arithmetic to ``psp.get_DFT_mtxels.compute_valence_density``,
     which handles both the "wfn grid == ρ grid" case (one iFFT per band)
@@ -150,9 +150,10 @@ def rho_from_wfn_ibz(
         wfn: open ``WFNReader``.
         sym: matching ``SymMaps`` (used only for the wfn→ρ re-embedding
             path when ``ecutrho > 4·ecutwfc``).
-        n_val: number of (occupied) bands to include. Defaults to
-            ``wfn.nelec`` (all valence electrons for spinor wfn, i.e. one
-            band per electron).
+        n_val: number of bands to include. Defaults to ``wfn.nelec`` for an
+            exact integer occupation table.  Fractional/smeared WFN density
+            is intentionally not built by this legacy resident-IBZ carrier;
+            use the canonical QE charge-density source instead.
 
     Returns:
         rho_r: (Nx, Ny, Nz) float64 real-space valence density.
@@ -168,14 +169,23 @@ def rho_from_wfn_ibz(
     # does not need.
     from psp.get_DFT_mtxels import compute_valence_density
 
+    if not wfn.occupations_are_exact_integer:
+        raise ValueError(
+            "rho_from_wfn_ibz: fractional/smeared physical density requires "
+            "every exactly nonzero WFN band (including signed tails beyond "
+            "ifmax), "
+            "which this legacy resident-IBZ FFT-box path may not materialize. "
+            "Select the canonical QE density with "
+            "--charge-density-source qe_save (rho_from_qe_save).")
     if n_val is None:
-        n_val = int(wfn.nelec)
+        n_val = int(wfn.physical_density_band_stop)
 
     wfn_k = _load_wfn_k_fftbox_ibz(wfn, n_val)
     with warnings.catch_warnings():
         if not warn:
             warnings.simplefilter("ignore")
-        rho_jax = compute_valence_density(wfn_k, sym, wfn)
+        rho_jax = compute_valence_density(
+            wfn_k, sym, wfn, k_source="file")
     return np.asarray(rho_jax, dtype=np.float64)
 
 
@@ -206,50 +216,6 @@ def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
         # were the same eleven characters of index arithmetic in two packages.
         acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
     return (acc / ops.shape[0]).reshape(f.shape)
-
-
-def _uniform_band_windows(b_lo: int, b_hi: int, width: int) -> list:
-    """Equal-width band windows covering ``[b_lo, b_hi)`` exactly once.
-
-    Returns ``[(lo, mask)]`` where every ``lo`` starts a window of exactly
-    ``width`` bands and ``mask`` is a ``(width,)`` float64 array of ones and
-    zeros selecting the bands this window is responsible for.
-
-    WHY EQUAL WIDTH IS THE POINT.  The obvious chunking —
-    ``min(lo + width, b_hi)`` — makes the last window SHORT whenever the
-    range does not divide, and a short window is a different array shape, a
-    different compiled ``to_rbox`` kernel, and a different persistent
-    compile-cache key held by exactly one rank.  Overlapping instead of
-    shortening keeps one shape for every window on every rank; the mask is
-    what stops the overlap being counted twice.
-
-    Exactness: masked rows are multiplied by ``0.0`` and the summands are
-    ``|ψ|²·w_k ≥ 0`` and finite, so a masked row contributes exactly zero.
-    The band-axis reduction of the final window sees the same nonzero values
-    it saw before at different offsets, so the result is equal up to XLA's
-    freedom to reassociate that reduction — the same order of perturbation
-    (~3 ulp, measured 6.6e-16 relative) the distributed sweep already
-    documents against the serial left-fold, and for the same reason.  The
-    REPLICATED path is not routed through here and stays byte-identical.
-
-    >>> [(lo, list(m)) for lo, m in _uniform_band_windows(0, 10, 4)]
-    [(0, [1.0, 1.0, 1.0, 1.0]), (4, [1.0, 1.0, 1.0, 1.0]), \
-(6, [0.0, 0.0, 1.0, 1.0])]
-    """
-    b_lo, b_hi = int(b_lo), int(b_hi)
-    span = b_hi - b_lo
-    if span <= 0:
-        return []
-    width = int(min(max(1, int(width)), span))
-    out, counted = [], b_lo
-    while counted < b_hi:
-        lo = min(counted, b_hi - width)   # clamp: never short, may overlap
-        hi = lo + width
-        mask = np.zeros(width, dtype=np.float64)
-        mask[counted - lo:hi - lo] = 1.0
-        out.append((lo, mask))
-        counted = hi
-    return out
 
 
 def rho_from_band_range(
@@ -449,7 +415,7 @@ def rho_from_band_range(
             # per-window 0/1 band mask removes the overlap from the sum.
             # Every rank then runs the same number of rounds of the same
             # program, and a rank with no work runs one fully-masked round.
-            windows = _uniform_band_windows(b_lo, b_hi, nb_chunk)
+            windows = uniform_band_windows(b_lo, b_hi, nb_chunk)
             width = int(windows[0][1].shape[0])
             n_rounds = -(-len(windows) // world)
             w_loc = jnp.zeros(fft_grid, dtype=jnp.float64)

@@ -789,7 +789,7 @@ def solve_qp(
     print_fn=print,
 ) -> jax.Array:
     """``update_H[Σ; qp_solver]`` — turn a :class:`~gw.sigma_dispatch.SigmaResult`
-    into the replicated ``sigma_total = Σ_xc + V_H`` (Ry) whose eigh
+    into ``sigma_total = Σ_xc + V_H`` (Ry) whose eigh
     yields the QP eigenstates.
 
     The three QP-energy definitions (see ``LorraxConfig.qp_solver``):
