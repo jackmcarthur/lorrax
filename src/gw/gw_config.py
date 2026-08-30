@@ -1420,8 +1420,11 @@ _DEFAULTS = {
     "zeta_nband": None,
     "sys_dim": 2,
     # Rebuild V_H from the CURRENT orbitals each self-consistent iteration
-    # instead of rotating the fixed DFT one into the QP basis.  Off keeps
-    # QSGW fixed-density, which is what every result before 2026-08-04 was.
+    # instead of rotating the fixed DFT one into the QP basis.  False remains
+    # the scalar-QSGW default.  ``from_input_file`` promotes an UNNAMED false
+    # to true for bispinor QSGW because freezing either member of the required
+    # (rho, J) four-current would be internally inconsistent; an explicit
+    # false is preserved and refused by the four-current gate below.
     "density_self_consistent": False,
     # Run the SC loop's H / E / U on the STAR wedge, broadcasting back at
     # the boundary.  Sigma stays on the full BZ -- it is an FFT over the
@@ -3560,9 +3563,9 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "GATE bispinor_self_consistency_requires_live_four_current: "
             "bispinor QSGW changes the occupied orbitals, so its scalar "
             "charge and signed Dirac current must both be rebuilt on every "
-            "map call. The live four-current implementation is selected by "
-            "density_self_consistent = true; refusing a frozen DFT direct "
-            "field.\n"
+            "map call. Bispinor QSGW selects the live four-current path by "
+            "default; refusing this explicit or hand-built request for a "
+            "frozen DFT direct field.\n"
             f"  got: qp_solver = {config.qp_solver.value}, "
             f"density_self_consistent = {bool(config.density_self_consistent)}\n"
             "  want: density_self_consistent = true (or "
@@ -5616,6 +5619,24 @@ class LorraxConfig:
             input_dir=input_dir,
             input_file=os.path.abspath(filename),
         )
+        # ``density_self_consistent`` is still an independent physics choice
+        # for scalar QSGW, whose conventional fixed-density path remains the
+        # default.  Bispinor QSGW has no corresponding safe fixed-density
+        # treatment: both rho and the signed Dirac current J must follow the
+        # evolving occupied orbitals.  Normalize the UNNAMED default here,
+        # after the canonical qp_solver resolver exists, instead of duplicating
+        # its legacy/explicit precedence logic.  An explicit false survives
+        # unchanged and the gate below refuses it rather than overriding what
+        # the user wrote.
+        if (bool(resolved.bispinor)
+                and resolved.qp_solver is QPSolver.SELF_CONSISTENT
+                and "density_self_consistent" not in _named_keys
+                and not bool(resolved.density_self_consistent)):
+            resolved = _dc_replace(resolved, density_self_consistent=True)
+            print_fn(
+                "  [config provenance] bispinor qp_solver=self_consistent: "
+                "density_self_consistent was not named; enabling the "
+                "required live (rho, J) Hartree rebuild")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose

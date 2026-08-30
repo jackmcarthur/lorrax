@@ -882,7 +882,8 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     """``"native"`` or ``"distributed"`` for this iteration's eigh.
 
     A LAYOUT decision and nothing else.  It used to be a side effect of
-    ``density_self_consistent`` — a physics knob, defaulting to False —
+    ``density_self_consistent`` — a physics knob whose scalar-QSGW default
+    is False —
     so the only eigh that keeps no whole ``(nb, nb)`` tile on one rank
     was unreachable on the default path.  ``config.sc.eigh`` selects it
     now; the E_F rule stays where it was, with ``density_self_consistent``.
@@ -1526,8 +1527,10 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 # Density self-consistency: rebuild V_H from the CURRENT orbitals
 # ---------------------------------------------------------------------------
 #
-# OFF BY DEFAULT (``config.density_self_consistent``).  With it off this
-# module is byte-identical to before, which is what keeps
+# OFF BY DEFAULT for scalar QSGW (``config.density_self_consistent``);
+# config resolution enables it whenever bispinor QSGW is requested without
+# an explicit setting.  With it off this module is byte-identical to before,
+# which is what keeps
 # tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot
 # meaningful.
 
@@ -2128,7 +2131,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # robustness at 1e4+ bands over speed at 1e3, where the native
         # batch wins by ~ndev).  Until
         # 2026-08-05 the distributed one was reachable ONLY by turning on
-        # ``density_self_consistent``, a physics knob defaulting to False,
+        # ``density_self_consistent``, a physics knob defaulting to False for
+        # scalar QSGW,
         # so the default -- and only shipped -- configuration had no way
         # to ask for it.
         #
@@ -2330,9 +2334,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
 
-    # DENSITY SELF-CONSISTENCY (opt-in).  V_H[rho_i] from THIS iteration's
-    # orbitals, alongside Sigma_i and from the same U_qp, both feeding
-    # H_{i+1}.  Off by default, so the one-shot equivalence gate holds.
+    # LIVE DENSITY SELF-CONSISTENCY (scalar opt-in, bispinor required).
+    # V_H[rho_i] from THIS iteration's orbitals, alongside Sigma_i and from
+    # the same U_qp, both feeding
+    # H_{i+1}.  Off by default for scalar QSGW, so the one-shot equivalence
+    # gate holds; bispinor QSGW config resolution enables the live path.
     exact_hartree_dft = None
     v_h_dft_new = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):

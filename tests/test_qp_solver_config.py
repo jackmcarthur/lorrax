@@ -140,7 +140,23 @@ def test_pauli_reference_selector_splits_charge_from_current(tmp_path):
     assert uses_raw_kinetic_balance_charge(True, "bare_transverse")
 
 
-def test_pauli_reference_self_consistency_requires_live_four_current(tmp_path):
+def test_default_bispinor_self_consistency_uses_live_four_current(tmp_path):
+    lines: list[str] = []
+    path = tmp_path / "cohsex_bispinor_sc.in"
+    path.write_text(
+        BASE_INPUT
+        + "bispinor = true\n"
+        + "qp_solver = self_consistent\n")
+    cfg = LorraxConfig.from_input_file(
+        str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a))))
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+    assert "density_self_consistent" not in cfg.raw_input_keys
+    assert any("required live (rho, J) Hartree rebuild" in line
+               for line in lines)
+
+
+def test_pauli_reference_explicit_frozen_density_is_refused(tmp_path):
     with pytest.raises(
             ValueError,
             match="bispinor_self_consistency_requires_live_four_current"):
@@ -150,7 +166,8 @@ def test_pauli_reference_self_consistency_requires_live_four_current(tmp_path):
             "bispinor_gw = pauli_reference_bare_transverse\n"
             "restart = false\n"
             "write_restart_tensors = false\n"
-            "qp_solver = self_consistent\n")
+            "qp_solver = self_consistent\n"
+            "density_self_consistent = false\n")
 
 
 def test_pauli_reference_accepts_live_four_current_self_consistency(tmp_path):
@@ -162,6 +179,25 @@ def test_pauli_reference_accepts_live_four_current_self_consistency(tmp_path):
         "write_restart_tensors = false\n"
         "qp_solver = self_consistent\n"
         "density_self_consistent = true\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert cfg.density_self_consistent
+
+
+def test_scalar_self_consistency_keeps_fixed_density_default(tmp_path):
+    cfg = _config(tmp_path, "qp_solver = self_consistent\n")
+    assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
+    assert not cfg.density_self_consistent
+
+
+def test_legacy_bispinor_self_consistency_gets_same_live_default(tmp_path):
+    with pytest.warns(DeprecationWarning, match="self_consistent"):
+        cfg = _config(
+            tmp_path,
+            "bispinor = true\n"
+            "bispinor_gw = pauli_reference_bare_transverse\n"
+            "restart = false\n"
+            "write_restart_tensors = false\n"
+            "self_consistent = true\n")
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.density_self_consistent
 
