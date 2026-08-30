@@ -280,6 +280,106 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
+def _crossing_problem(width_ev):
+    ev_to_ry = 1.0 / 27.211386245988
+    eta = 0.25 * ev_to_ry
+    frequencies = np.linspace(0.0, width_ev, int(4 * width_ev) + 1) * ev_to_ry
+    return ReciprocalMeasureProblem(
+        frequencies=frequencies,
+        internal_sums=np.asarray([0.5 * width_ev * ev_to_ry - 1.0j * eta]),
+        cell_masses=np.asarray([1.0]))
+
+
+def test_crossing_patch_count_is_the_smallest_catalog_covered_partition():
+    narrow = _crossing_problem(5.0)
+    narrow_patches = delivered._crossing_omega_patches(narrow, 1.0)
+    assert len(narrow_patches) == 1
+    np.testing.assert_array_equal(
+        narrow_patches[0], np.arange(narrow.frequencies.size))
+
+    wide = _crossing_problem(20.0)
+    patches = delivered._crossing_omega_patches(wide, 1.0)
+    widest_span = max(
+        entry.range_max
+        for entry in delivered._mm.catalog().for_family("crossing")
+        if entry.target_kind == "hgl"
+        and entry.eps_q is not None
+        and abs(entry.eps_q - delivered._CROSSING_EPS_Q) <= 1.0e-12)
+
+    def span(rows):
+        patch = ReciprocalMeasureProblem(
+            frequencies=wide.frequencies[rows],
+            internal_sums=wide.internal_sums,
+            cell_masses=wide.cell_masses)
+        return delivered._crossing_geometry(patch, 1.0)[2]
+
+    assert len(patches) == 2
+    assert all(span(rows) <= widest_span + 1.0e-12 for rows in patches)
+    assert any(
+        span(rows) > widest_span + 1.0e-12
+        for rows in np.array_split(
+            np.arange(wide.frequencies.size), len(patches) - 1))
+
+
+def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
+        monkeypatch):
+    ev_to_ry = 1.0 / 27.211386245988
+    omega = np.linspace(0.0, 20.0, 81) * ev_to_ry
+    branch = _branch("wide conduction", "cond", [0.0], omega)
+    poles = np.asarray([10.0 * ev_to_ry + 0.0j]).reshape(1, 1, 1, 1)
+    residues = np.asarray([1.0 + 0.0j]).reshape(1, 1, 1, 1)
+
+    def served_candidate(spec, *_args):
+        evidence = {
+            "family": ("crossing_hgl" if spec["kind"] == "crossing"
+                       else "noncrossing"),
+            "candidate_tolerance": 1.0e-6,
+            "provenance": "deterministic shipped-table test rule",
+        }
+        return [{
+            "times": np.asarray([0.1]),
+            "weights": np.asarray([1.0j]),
+            "evidence": evidence,
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "required_target": 1.0e-5,
+            "absolute_cost": spec["envelope"] * 1.0e-5,
+            "factor_growth": (0.0, 0.0),
+            "attempts": [],
+        }]
+
+    monkeypatch.setattr(delivered, "_candidate_rules", served_candidate)
+    kwargs = dict(
+        regularization_width_ry=0.25 * ev_to_ry,
+        envelope_relative_target=2.0e-4,
+        lattice_bins=9,
+        max_nodes=420)
+    first, first_report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega, **kwargs)
+    second, second_report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega, **kwargs)
+
+    assert len(first) == len(second) == 2
+    joined = np.concatenate([row.omega_idx for row in first])
+    np.testing.assert_array_equal(joined, np.arange(omega.size))
+    assert np.unique(joined).size == joined.size
+    assert all("[p" in row.window.name for row in first)
+    for left, right in zip(first, second):
+        assert left.window.name == right.window.name
+        for left_array, right_array in (
+                (left.omega_abs, right.omega_abs),
+                (left.omega_idx, right.omega_idx),
+                (left.window.nodes.t, right.window.nodes.t),
+                (left.window.nodes.alpha, right.window.nodes.alpha),
+                (left.window.mask_A, right.window.mask_A),
+                (left.pole_indices, right.pole_indices),
+                (left.bounds, right.bounds)):
+            np.testing.assert_array_equal(left_array, right_array)
+    assert (first_report["plan_cache_fingerprint"]
+            == second_report["plan_cache_fingerprint"])
+    assert (first_report["branches"] == second_report["branches"])
+
+
 def test_zero_time_rule_is_refused():
     problem = ReciprocalMeasureProblem(
         frequencies=np.asarray([0.0]),
