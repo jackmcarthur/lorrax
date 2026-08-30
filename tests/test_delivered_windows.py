@@ -130,7 +130,12 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
         assert len(rows) == evidence["window_count"]
         assert sum(row.window.n_tau for row in rows) == evidence["node_count"]
         for row, window_evidence in zip(rows, evidence["windows"]):
-            assert row.window.n_tau == window_evidence["node_count"] > 0
+            assert row.window.n_tau == window_evidence["node_count"]
+            # A fully-crossing window may legitimately carry zero tau
+            # nodes when its tuples route to exact direct summation
+            # (support-based routing); it must then carry direct terms.
+            assert (window_evidence["node_count"] > 0
+                    or window_evidence.get("direct_term_count", 0) > 0)
             assert (window_evidence["refined_residual"]
                     <= window_evidence["relative_residual_target"])
             assert (window_evidence["amplification_max"]
