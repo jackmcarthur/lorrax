@@ -608,11 +608,9 @@ def _device_pole_reducer(Omega_local, B_local, bins, eta, split):
                     block_interval[None, :], components, cell[None, :]
                 ].add(values)
 
-            block_moment = jnp.zeros(
-                (2, 3, n_cells), dtype=jnp.float64)
-            for corner in range(4):
-                block_moment = _add_corner(corner, block_moment)
-            return block_moment
+            return jax.lax.fori_loop(
+                0, 4, _add_corner,
+                jnp.zeros((2, 3, n_cells), dtype=jnp.float64))
 
         moments = jnp.sum(jax.vmap(_block_moments)(*block_inputs), axis=0)
         counts = jnp.stack((
