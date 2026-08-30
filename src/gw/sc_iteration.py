@@ -2420,16 +2420,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 state.H_qp_dft if ks.is_identity
                 else ks.broadcast(state.H_qp_dft))
             e_dft_active = inputs.e_dft_active_kn_ry
-            nb_active = int(H_active_full.shape[-1])
-            h_dft_active = (
-                e_dft_active[:, :, None]
-                * jnp.eye(nb_active, dtype=jnp.complex128)[None, :, :])
-            delta_active = H_active_full - h_dft_active
             tail_diagonal = (wfns_qp.enk[:, :nb_storage]
                              - inputs.wfns_dft.enk[:, :nb_storage])
             delta_head = assemble_delta_head_manifold(
-                delta_active, tail_diagonal, nb_storage=nb_storage,
-                mesh=inputs.mesh_xy)
+                H_active_full, e_dft_active, tail_diagonal,
+                nb_storage=nb_storage, mesh=inputs.mesh_xy)
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)

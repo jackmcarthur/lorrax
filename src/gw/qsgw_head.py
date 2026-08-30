@@ -1123,12 +1123,19 @@ def _assemble_delta_kernel(mesh: Mesh, nb_storage: int) -> Callable:
     out_sharding = NamedSharding(mesh, P(None, "x", "y"))
 
     @jax.jit
-    def _kernel(delta_active, tail_diagonal):
-        nk, na, _ = delta_active.shape
+    def _kernel(hamiltonian_active, dft_energies_active, tail_diagonal):
+        nk, na, _ = hamiltonian_active.shape
         delta = jnp.zeros((nk, nb_storage, nb_storage), dtype=jnp.complex128)
-        delta = delta.at[:, :na, :na].set(delta_active)
-        idx = jnp.arange(na, nb_storage)
-        delta = delta.at[:, idx, idx].set(tail_diagonal[:, na:nb_storage])
+        delta = delta.at[:, :na, :na].set(hamiltonian_active)
+        # One diagonal update completes both pieces of the manifold:
+        # H_active - diag(E_DFT) in the active block and the current QP-DFT
+        # energy shift in the diagonal sum-band tail.  Keeping this inside
+        # the owned assembly kernel avoids materialising E*I and then a
+        # second active-band square in the SC caller.
+        diagonal_update = jnp.concatenate(
+            (-dft_energies_active, tail_diagonal[:, na:nb_storage]), axis=1)
+        idx = jnp.arange(nb_storage)
+        delta = delta.at[:, idx, idx].add(diagonal_update)
         return jax.lax.with_sharding_constraint(delta, out_sharding)
 
     _KERNEL_CACHE[key] = _kernel
@@ -1136,24 +1143,36 @@ def _assemble_delta_kernel(mesh: Mesh, nb_storage: int) -> Callable:
 
 
 def assemble_delta_head_manifold(
-    delta_h_active,
+    hamiltonian_active,
+    dft_energies_active,
     tail_diagonal,
     *,
     nb_storage: int,
     mesh: Mesh,
 ):
-    """Embed active DeltaH and the current diagonal sum-band tail."""
-    delta = jnp.asarray(delta_h_active)
+    """Build active ``H - diag(E_DFT)`` and the diagonal sum-band tail.
+
+    The subtraction is part of this owned assembly transaction so callers do
+    not retain separate ``E*I`` and ``H-E*I`` active-band-square buffers.
+    """
+    hamiltonian = jnp.asarray(hamiltonian_active)
+    energies = jnp.asarray(dft_energies_active)
     tail = jnp.asarray(tail_diagonal)
-    if delta.ndim != 3 or delta.shape[-2] != delta.shape[-1]:
-        raise ValueError("delta_h_active must be (nk,na,na)")
-    if tail.ndim != 2 or tail.shape[0] != delta.shape[0]:
+    if hamiltonian.ndim != 3 or hamiltonian.shape[-2] != hamiltonian.shape[-1]:
+        raise ValueError("hamiltonian_active must be (nk,na,na)")
+    expected_energies = (hamiltonian.shape[0], hamiltonian.shape[-1])
+    if energies.ndim != 2 or energies.shape != expected_energies:
+        raise ValueError(
+            "dft_energies_active must match the Hamiltonian's (nk,na) "
+            f"axes; got {energies.shape}/{expected_energies}")
+    if tail.ndim != 2 or tail.shape[0] != hamiltonian.shape[0]:
         raise ValueError("tail_diagonal must be (nk,nb_storage)")
     if int(tail.shape[1]) < int(nb_storage):
         raise ValueError(f"tail diagonal extent {tail.shape[1]} < storage {nb_storage}")
-    if int(delta.shape[-1]) > int(nb_storage):
-        raise ValueError("active DeltaH exceeds the head manifold")
-    return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
+    if int(hamiltonian.shape[-1]) > int(nb_storage):
+        raise ValueError("active Hamiltonian exceeds the head manifold")
+    return _assemble_delta_kernel(mesh, int(nb_storage))(
+        hamiltonian, energies, tail)
 
 
 def _interband_degenerate_weight(

@@ -22,6 +22,7 @@ from common.mtxel_sweep import UniformGaugeCurrentMatrixElements
 from common.parallel_transport import build_forward_neighbor_table
 from gw.qsgw_head import (
     StaticGaugeHallTransaction,
+    assemble_delta_head_manifold,
     assemble_head_manifold,
     covariant_link_derivative,
     head_wings_sharded,
@@ -53,6 +54,39 @@ def _haar(rng, n):
     q, r = np.linalg.qr(z)
     phase = np.diag(r)
     return q * (phase / np.abs(phase))[None, :]
+
+
+def test_delta_head_assembly_subtracts_active_dft_diagonal_in_owned_kernel():
+    mesh = _mesh()
+    rng = np.random.default_rng(1037)
+    nk, na, nb_storage = 3, 4, 7
+    raw = (rng.normal(size=(nk, na, na))
+           + 1j * rng.normal(size=(nk, na, na)))
+    hamiltonian = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    dft_energies = rng.normal(size=(nk, na))
+    tail = rng.normal(size=(nk, nb_storage))
+
+    got = assemble_delta_head_manifold(
+        jnp.asarray(hamiltonian), jnp.asarray(dft_energies),
+        jnp.asarray(tail), nb_storage=nb_storage, mesh=mesh)
+    expected = np.zeros((nk, nb_storage, nb_storage), dtype=np.complex128)
+    expected[:, :na, :na] = hamiltonian
+    expected[:, np.arange(na), np.arange(na)] -= dft_energies
+    expected[:, np.arange(na, nb_storage), np.arange(na, nb_storage)] = (
+        tail[:, na:nb_storage])
+
+    np.testing.assert_allclose(got, expected, rtol=0.0, atol=0.0)
+    assert tuple(got.sharding.spec) == (None, "x", "y")
+
+
+def test_delta_head_assembly_refuses_energy_shape_drift():
+    mesh = _mesh()
+    hamiltonian = jnp.zeros((2, 3, 3), dtype=jnp.complex128)
+    tail = jnp.zeros((2, 5), dtype=jnp.float64)
+    with pytest.raises(ValueError, match="must match the Hamiltonian"):
+        assemble_delta_head_manifold(
+            hamiltonian, jnp.zeros((2, 4)), tail,
+            nb_storage=5, mesh=mesh)
 
 
 def test_static_gauge_first_order_component_reuses_charge_head_and_state_jet():

@@ -33,6 +33,7 @@ from distrib_la import plan_polar_factor  # noqa: E402
 from common.parallel_transport import make_cross_k_link  # noqa: E402
 from gw.qsgw_head import (  # noqa: E402
     _active_rotation_kernel,
+    _assemble_delta_kernel,
     _cartesian_fft_multipliers,
     _spectral_kernel,
     _structured_delta_kernel,
@@ -205,7 +206,13 @@ def main() -> int:
     active = rng.normal(size=(nk, na, na)) + 1j * rng.normal(size=(nk, na, na))
     active += np.swapaxes(active.conj(), -1, -2)
     delta_host[:, :na, :na] = active
-    delta_host[:, np.arange(na, nb), np.arange(na, nb)] = rng.normal(size=(nk, nb - na))
+    tail_diagonal_host = rng.normal(size=(nk, nb))
+    delta_host[:, np.arange(na, nb), np.arange(na, nb)] = (
+        tail_diagonal_host[:, na:nb])
+    dft_active_host = rng.normal(size=(nk, na))
+    hamiltonian_active_host = active.copy()
+    hamiltonian_active_host[
+        :, np.arange(na), np.arange(na)] += dft_active_host
     connection_host = rng.normal(size=(3, nk, nb, nb)) + 1j * rng.normal(
         size=(3, nk, nb, nb)
     )
@@ -222,11 +229,22 @@ def main() -> int:
     energy_host = np.sort(rng.normal(size=(nk, nb)), axis=1)
     occupation_host = np.zeros((nk, nb))
     occupation_host[:, :8] = 1.0
-    delta = device_put_process_local(delta_host, matrix_k)
+    hamiltonian_active = device_put_process_local(
+        hamiltonian_active_host, matrix_k)
+    dft_active = device_put_process_local(
+        dft_active_host, NamedSharding(mesh, P(None, None)))
+    vector_k = NamedSharding(mesh, P(None, ("x", "y")))
+    tail_diagonal = device_put_process_local(tail_diagonal_host, vector_k)
+    assemble_delta = _assemble_delta_kernel(mesh, nb)
+    delta = _ready(assemble_delta(
+        hamiltonian_active, dft_active, tail_diagonal))
+    assembly_error = float(np.max(np.abs(_host(delta) - delta_host)))
+    if assembly_error != 0.0:
+        raise AssertionError(
+            f"fused active-head manifold assembly mismatch: {assembly_error}")
     connection = device_put_process_local(connection_host, component_k)
     velocity = device_put_process_local(velocity_host, component_k)
     unitary = device_put_process_local(unitary_host, matrix_k)
-    vector_k = NamedSharding(mesh, P(None, ("x", "y")))
     energy = device_put_process_local(energy_host, vector_k)
     occupation = device_put_process_local(occupation_host, vector_k)
 
@@ -267,6 +285,11 @@ def main() -> int:
     partial = jnp.zeros_like(connection)
     lowers = (
         (
+            "assembly",
+            assemble_delta,
+            (hamiltonian_active, dft_active, tail_diagonal),
+        ),
+        (
             "structured",
             _structured_delta_kernel(mesh, na),
             (delta, connection, partial),
@@ -279,9 +302,17 @@ def main() -> int:
         ),
     )
     remat = {}
+    assembly_collectives = {}
     for name, kernel, args in lowers:
         hlo = kernel.lower(*args).compiler_ir("hlo").as_hlo_text().lower()
         remat[name] = hlo.count("remat")
+        if name == "assembly":
+            assembly_collectives = {
+                op: hlo.count(op)
+                for op in (
+                    "all-gather", "all-to-all", "collective-permute",
+                    "reduce-scatter", "all-reduce")
+            }
     if any(remat.values()):
         raise AssertionError(f"explicit rematerialization in HLO: {remat}")
     if rank == 0:
@@ -307,6 +338,8 @@ def main() -> int:
                 "cold_s": pipeline_cold_s,
                 "warm_s": pipeline_warm_s,
                 "remat": remat,
+                "assembly_max_abs": assembly_error,
+                "assembly_collectives": assembly_collectives,
                 "max_result": float(np.max(np.abs(_host(result)))),
             },
         )

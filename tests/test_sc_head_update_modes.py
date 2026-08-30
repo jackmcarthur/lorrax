@@ -502,3 +502,15 @@ def test_the_map_entry_solves_its_own_occupations():
         f"state.occupation_state is read {len(reads)} times in "
         "gw_iteration_map; the entry-solve rule allows exactly the two "
         "reads of the mu-drift diagnostic (guard + subtraction)")
+
+
+def test_the_map_delegates_active_head_diagonal_subtraction():
+    """The driver must not rebuild the assembly owner's dense operands."""
+    import inspect
+    from gw import sc_iteration
+
+    source = inspect.getsource(sc_iteration.gw_iteration_map)
+    assert "assemble_delta_head_manifold(" in source
+    assert "h_dft_active" not in source
+    assert "delta_active" not in source
+    assert "jnp.eye(nb_active" not in source
