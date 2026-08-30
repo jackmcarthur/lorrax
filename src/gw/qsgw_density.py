@@ -531,35 +531,22 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     def build():
         @jax.jit
         def fn(psi_, U_, occ_, w_, bidx_, sp_):
-            # ONE ψ LAYOUT PER BRANCH, AND ONLY WHAT THE BODY READS.  The
-            # scanned tuple used to carry BOTH layouts plus a U dummy in
-            # both branches, while the body reads ψ_mx alone under
-            # ``have_U`` and ψ_xy alone without it.  XLA already dropped
-            # the unread ones, so this is a legibility change and not an
-            # optimisation: at nk=16 / nb=128 / ngkmax=5120 / grid
-            # 60×60×26 on a 2×2 mesh the lowered ``while`` carry is the
-            # same tuple before and after —
-            # ``(s64, f64[60,60,26], f64[16], c128[16,64,64],
-            # c128[16,64,1,5120], s64, s32)``, ONE ψ and not two — with
-            # the same four collectives and the same 171.4 MiB temp, and
-            # ``vh.rho`` runs 1175.9 → 1165.3 ms under U and 969.9 →
-            # 955.3 ms without it (jobs 7889425 → 7889426, inside the
-            # run-to-run spread).  Production takes the ``have_U=False``
-            # branch: ``hartree_from_orbitals`` rotates once with
-            # :func:`rotate_bands` and passes ``U=None``.
+            # Keep the resident all-k sphere in its canonical two-axis band
+            # layout.  The rotation needs m on x only for the current k
+            # point, so reshard that singleton slice inside the scan instead
+            # of replicating the full psi array over y for the scan lifetime.
+            psi_s = jax.lax.with_sharding_constraint(psi_, band_xy)
             if have_U:
-                # m on 'x' so the contraction reduces along 'x' alone.
-                psi_s = jax.lax.with_sharding_constraint(psi_, m_on_x)
                 U_x = jax.lax.with_sharding_constraint(U_, U_sh)
-            else:
-                psi_s = jax.lax.with_sharding_constraint(psi_, band_xy)
 
             def body(rho, xs):
                 if have_U:
                     psi_k, U_k, occ_k, w_k, bidx_k = xs
                     # COLUMNS: psi~_n = sum_m Z[m,n] psi_m.  m is on 'x'
                     # so the sum reduces along 'x' alone; n lands on 'y'.
-                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_k,
+                    psi_k_x = jax.lax.with_sharding_constraint(
+                        psi_k[None], m_on_x)[0]
+                    psi_t = jnp.einsum('mn,msg->nsg', U_k, psi_k_x,
                                        optimize=True)
                     # Back onto the WHOLE mesh: straight out of the
                     # rotation the bands sit on 'x' and are replicated on
