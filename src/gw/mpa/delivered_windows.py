@@ -760,15 +760,15 @@ def measure_delivered_sigma_pole_fields(
         omega_local = Omega.addressable_data(0)
         residue_local = B.addressable_data(0)
         reducer = _device_pole_reducer(omega_local, residue_local, bins)
-        local_payload_device = jnp.stack([
+        local_payload_rows = tuple(
             reducer(
                 omega_local, residue_local, jnp.asarray(eta, jnp.float64),
                 jnp.asarray(split, jnp.float64),
                 jnp.asarray(pole, jnp.int32))
             for pole in range(int(Omega.shape[0]))
-        ])
+        )
         local_payload = np.asarray(
-            jax.device_get(local_payload_device), np.float64)
+            jax.device_get(local_payload_rows), np.float64)
         payload = np.asarray(_sum_fixed_process_table(
             local_payload, mesh_xy, "pole-batch mass/moment table"),
             np.float64)
