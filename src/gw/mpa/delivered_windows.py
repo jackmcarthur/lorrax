@@ -604,27 +604,29 @@ def _device_pole_reducer(Omega, B, mesh_xy, bins):
                                block_width_lower, block_real_fraction,
                                block_width_fraction, block_mass, block_real,
                                block_imag):
-                real_upper = jnp.asarray((0, 0, 1, 1), jnp.int32)[:, None]
-                width_upper = jnp.asarray((0, 1, 0, 1), jnp.int32)[:, None]
-                real_weight = jnp.where(
-                    real_upper == 1, block_real_fraction[None, :],
-                    1.0 - block_real_fraction[None, :])
-                width_weight = jnp.where(
-                    width_upper == 1, block_width_fraction[None, :],
-                    1.0 - block_width_fraction[None, :])
-                cell = ((block_real_lower[None, :] + real_upper) * bins
-                        + block_width_lower[None, :] + width_upper)
-                share = block_mass[None, :] * real_weight * width_weight
-                values = jnp.stack((
-                    share, share * block_real[None, :],
-                    share * block_imag[None, :]), axis=0)
-                return jnp.zeros(
-                    (2, 3, n_cells), dtype=jnp.float64
-                ).at[
-                    block_interval[None, None, :],
-                    jnp.arange(3, dtype=jnp.int32)[:, None, None],
-                    cell[None, :, :],
-                ].add(values)
+                components = jnp.arange(3, dtype=jnp.int32)[:, None]
+
+                def _add_corner(corner, block_moment):
+                    real_upper = corner // 2
+                    width_upper = corner % 2
+                    real_weight = jnp.where(
+                        real_upper == 1, block_real_fraction,
+                        1.0 - block_real_fraction)
+                    width_weight = jnp.where(
+                        width_upper == 1, block_width_fraction,
+                        1.0 - block_width_fraction)
+                    cell = ((block_real_lower + real_upper) * bins
+                            + block_width_lower + width_upper)
+                    share = block_mass * real_weight * width_weight
+                    values = jnp.stack((
+                        share, share * block_real, share * block_imag), axis=0)
+                    return block_moment.at[
+                        block_interval[None, :], components, cell[None, :]
+                    ].add(values)
+
+                return jax.lax.fori_loop(
+                    0, 4, _add_corner,
+                    jnp.zeros((2, 3, n_cells), dtype=jnp.float64))
 
             pole_moments = jnp.sum(
                 jax.vmap(_block_moments)(*block_inputs), axis=0)
