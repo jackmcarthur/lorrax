@@ -1119,6 +1119,11 @@ def cached_density_symmetry_check(
     key = _cache_key(loader, nocc, tol_trs, tol_spatial, max_k)
     hit = _CACHE.get(key)
     if hit is not None:
+        # The cache owns only the measurement.  Acceptance is a property of
+        # the current call's mode: a report cached under ``on`` must still
+        # refuse when replayed under ``strict``.  Keep a successful cache hit
+        # silent: the cold call already announced this measurement.
+        _enforce(hit, mode)
         return hit
 
     try:
@@ -1135,12 +1140,25 @@ def cached_density_symmetry_check(
             f"the permissive (flags-derived) symmetry treatment. Set "
             f"LORRAX_TRS_CHECK=0 to disable this check.", RuntimeWarning)
         rep = _skipped_report(getattr(loader, "_path", "<wfn>"), repr(exc))
-        _CACHE[key] = rep
+        # This is an error receipt, not a measurement.  In particular, do
+        # not let a permissive failure suppress a later strict retry.
         return rep
 
     _CACHE[key] = rep
     _announce(rep, mode)
     return rep
+
+
+def _failure_text(rep: DensitySymmetryReport) -> str:
+    detail = "\n  ".join(rep.messages)
+    return (f"WFN density symmetry check FAILED for {rep.path}:\n  "
+            f"{detail}")
+
+
+def _enforce(rep: DensitySymmetryReport, mode: str) -> None:
+    """Apply current acceptance policy without repeating diagnostics."""
+    if mode == "strict" and not rep.ok:
+        raise RuntimeError(_failure_text(rep))
 
 
 def _announce(rep: DensitySymmetryReport, mode: str) -> None:
@@ -1150,11 +1168,8 @@ def _announce(rep: DensitySymmetryReport, mode: str) -> None:
                 if msg.isupper() or "BROKEN" in msg or "NOT A SYMMETRY" in msg
                 or "violated" in msg]
     if not rep.ok:
-        detail = "\n  ".join(rep.messages)
-        text = (f"WFN density symmetry check FAILED for {rep.path}:\n  "
-                f"{detail}")
-        if mode == "strict":
-            raise RuntimeError(text)
+        text = _failure_text(rep)
+        _enforce(rep, mode)
         print(f"\n*** {text}\n", file=sys.stderr, flush=True)
         warnings.warn(text, RuntimeWarning)
     elif problems and _is_reporting_process():

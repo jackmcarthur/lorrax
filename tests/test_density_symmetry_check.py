@@ -17,6 +17,7 @@ visible in the test source.
 from __future__ import annotations
 
 import os
+import warnings
 
 import h5py
 import numpy as np
@@ -32,6 +33,7 @@ from symmetry_maps import (                                     # noqa: E402
     check_density_symmetries,
     trs_check_mode,
 )
+import symmetry_maps.density_symmetry_check as density_check     # noqa: E402
 
 
 _FIXTURE = os.path.join(
@@ -319,6 +321,88 @@ def test_strict_mode_raises_on_a_broken_deck(tmp_path, monkeypatch):
     assert trs_check_mode() == "strict"
     with pytest.raises(RuntimeError, match="density symmetry check FAILED"):
         WfnLoader(path)
+
+
+def test_cached_measurement_reapplies_strict_mode(tmp_path, monkeypatch):
+    """A report computed under ``on`` cannot bypass later strict policy."""
+    path = _kramers_deck(tmp_path, magnetic=True)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    with pytest.warns(RuntimeWarning):
+        first = WfnLoader(path)
+    assert first.density_symmetry is not None
+    assert not first.density_symmetry.ok
+
+    def _forbid_recompute(*args, **kwargs):
+        raise AssertionError("cache hit recomputed the density measurement")
+
+    monkeypatch.setattr(
+        density_check, "check_density_symmetries", _forbid_recompute)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
+    with pytest.raises(RuntimeError, match="density symmetry check FAILED"):
+        WfnLoader(path)
+
+
+def test_cached_failed_measurement_is_silent_in_on_mode(
+        tmp_path, monkeypatch, capsys):
+    """Policy replay must retain the cache's diagnostic de-duplication."""
+    path = _kramers_deck(tmp_path, magnetic=True)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    with pytest.warns(RuntimeWarning):
+        first = WfnLoader(path)
+    capsys.readouterr()
+
+    def _forbid_recompute(*args, **kwargs):
+        raise AssertionError("cache hit recomputed the density measurement")
+
+    monkeypatch.setattr(
+        density_check, "check_density_symmetries", _forbid_recompute)
+    with warnings.catch_warnings(record=True) as replay_warnings:
+        warnings.simplefilter("always")
+        second = WfnLoader(path)
+    captured = capsys.readouterr()
+    assert second.density_symmetry is first.density_symmetry
+    assert replay_warnings == []
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_off_mode_ignores_a_cached_failed_measurement(tmp_path, monkeypatch):
+    path = _kramers_deck(tmp_path, magnetic=True)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    with pytest.warns(RuntimeWarning):
+        WfnLoader(path)
+
+    def _forbid_recompute(*args, **kwargs):
+        raise AssertionError("off mode entered the measurement path")
+
+    monkeypatch.setattr(
+        density_check, "check_density_symmetries", _forbid_recompute)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "off")
+    loader = WfnLoader(path)
+    assert loader.density_symmetry is None
+    assert loader.trs_holds is True
+
+
+def test_diagnostic_error_is_not_cached_as_a_measurement(
+        tmp_path, monkeypatch):
+    path = _kramers_deck(tmp_path, magnetic=False)
+    calls = 0
+
+    def _fail_check(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise ValueError("synthetic diagnostic failure")
+
+    monkeypatch.setattr(density_check, "check_density_symmetries", _fail_check)
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "on")
+    with pytest.warns(RuntimeWarning, match="failed to run"):
+        first = WfnLoader(path)
+    assert first.density_symmetry.trs_basis == "skipped"
+
+    monkeypatch.setenv("LORRAX_TRS_CHECK", "strict")
+    with pytest.raises(ValueError, match="synthetic diagnostic failure"):
+        WfnLoader(path)
+    assert calls == 2
 
 
 # ----------------------------------------------------------------------
