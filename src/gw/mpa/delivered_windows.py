@@ -833,16 +833,19 @@ def _crossing_block_spec(parent, members, frequency_positions, name):
 def _fit_crossing_blocks(
     spec, budget, *, pole_sign, eta, max_nodes, amp_cap, crossing_eps_q,
     use_shipped_minimax_tables, pane_times, factor_growth_cap,
-    direct_term_ceiling, tau_pair_ceiling=None,
+    direct_term_ceiling, tau_pair_ceiling=None, _depth=0,
 ):
-    """Harden a refused crossing window with aligned 2x2 execution blocks.
+    """Harden a refused crossing window with recursive aligned 2x2 blocks.
 
     Frequency panes are disjoint.  Within each pane the parent absolute
     allowance is split between the two tuple parts in proportion to their
     measured inverse-gap envelopes, so summing the two certified block errors
-    cannot exceed the parent allowance.  A refused crossing child may become
-    exact direct work only when that child's explicit tuple support fits the
-    separate direct-term ceiling.
+    cannot exceed the parent allowance.  A crossing child which is still too
+    large for exact work is split again; both its tuple count and frequency
+    count decrease strictly, so recursion terminates without a depth heuristic.
+    A refused crossing child may become exact direct work only when that
+    child's explicit tuple support fits the remaining separate direct-term
+    ceiling.
     """
     trials = []
     for fraction in CROSSING_CUT_FRACTIONS:
@@ -908,13 +911,68 @@ def _fit_crossing_blocks(
                         str(exc).startswith("hybrid crossing fit missed")
                         or str(exc).startswith(
                             "delivered rule violates the per-factor growth cap"))
-                    if (direct_terms_used + n_direct
-                            > int(direct_term_ceiling)
-                            or not eligible_refusal):
+                    if not eligible_refusal:
                         accepted = False
                         refusal = (
                             f"{child['window'].name} ({n_direct} tuples): {exc}")
                         break
+                    direct_remaining = (
+                        int(direct_term_ceiling) - direct_terms_used)
+                    if n_direct > direct_remaining:
+                        tau_used = int(sum(
+                            fit["times"].size for fit in child_fits))
+                        tau_remaining = (
+                            None if tau_pair_ceiling is None
+                            else int(tau_pair_ceiling) - tau_used)
+                        if tau_remaining is not None and tau_remaining < 1:
+                            accepted = False
+                            refusal = (
+                                f"{child['window'].name} ({n_direct} tuples): "
+                                "recursive hardening has no remaining global "
+                                "window_tau_pairs allowance")
+                            break
+                        try:
+                            nested_specs, nested_fits = _fit_crossing_blocks(
+                                child, child_budget, pole_sign=pole_sign,
+                                eta=eta, max_nodes=(
+                                    int(max_nodes) if tau_remaining is None
+                                    else min(int(max_nodes), tau_remaining)),
+                                amp_cap=amp_cap,
+                                crossing_eps_q=float(crossing_eps_q),
+                                use_shipped_minimax_tables=bool(
+                                    use_shipped_minimax_tables),
+                                pane_times=tuple(pane_times),
+                                factor_growth_cap=factor_growth_cap,
+                                direct_term_ceiling=direct_remaining,
+                                tau_pair_ceiling=tau_remaining,
+                                _depth=int(_depth) + 1)
+                        except RuntimeError as nested_exc:
+                            accepted = False
+                            refusal = (
+                                f"{child['window'].name} ({n_direct} tuples): "
+                                f"{exc}; recursive hardening: {nested_exc}")
+                            break
+                        nested_tau = int(sum(
+                            fit["times"].size for fit in nested_fits))
+                        nested_direct = int(sum(
+                            nested["state_indices"].size
+                            for nested, fit in zip(nested_specs, nested_fits)
+                            if fit["direct"]))
+                        child_specs.extend(nested_specs)
+                        child_fits.extend(nested_fits)
+                        direct_terms_used += nested_direct
+                        pane_rows.append({
+                            "name": child["window"].name,
+                            "kind": child["window"].kind,
+                            "tuple_count": n_direct,
+                            "node_count": nested_tau,
+                            "direct_term_count": nested_direct,
+                            "direct": False,
+                            "recursive": True,
+                            "hardening_depth": int(_depth) + 1,
+                            "budget_share": float(share),
+                        })
+                        continue
                     direct = True
                     times = np.empty(0, dtype=np.complex128)
                     weights = np.empty(0, dtype=np.complex128)
@@ -937,6 +995,7 @@ def _fit_crossing_blocks(
                     "raw_energy_boundary_ry": float(raw_boundary),
                     "omega_pane": int(pane_index),
                     "tuple_part": int(tuple_index),
+                    "hardening_depth": int(_depth),
                 }
                 child_specs.append(child)
                 child_fits.append({
@@ -952,6 +1011,8 @@ def _fit_crossing_blocks(
                     "tuple_count": int(child["state_indices"].size),
                     "node_count": int(np.asarray(times).size),
                     "direct": bool(direct),
+                    "recursive": False,
+                    "hardening_depth": int(_depth),
                     "budget_share": float(share),
                 })
             pane_receipts.append(pane_rows)
@@ -983,9 +1044,13 @@ def _fit_crossing_blocks(
                 "selected_lower_mass_fraction": float(fraction),
                 "selected_energy_boundary_ry": float(boundary),
                 "selected_raw_energy_boundary_ry": float(raw_boundary),
+                "hardening_depth": int(_depth),
                 "trials": trials,
             }
             for fit in child_fits:
+                nested = fit["evidence"].get("hardening_receipt")
+                if nested is not None:
+                    fit["evidence"]["nested_hardening_receipt"] = nested
                 fit["evidence"]["hardening_receipt"] = receipt
             return child_specs, child_fits
     raise RuntimeError(

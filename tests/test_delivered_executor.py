@@ -180,6 +180,55 @@ def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch)
                for window in report["branches"][0]["windows"])
 
 
+def test_planner_recursively_splits_crossing_before_bounded_direct(monkeypatch):
+    """An oversized refused diagonal is split again without relaxing cap."""
+    energies = np.linspace(-0.7, 0.7, 8)
+    omega = np.linspace(0.1, 0.9, 5)
+    E_A = jnp.asarray(energies[None, :])
+    branch = _SigmaBranch(
+        "recursive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
+        "cond", False, omega, np.arange(omega.size, dtype=np.int64))
+    evidence = {
+        "family": "test_block_rule", "fit_residual": 0.0,
+        "refined_residual": 0.0, "amplification_p99": 1.0,
+        "amplification_max": 1.0, "attempts": [],
+    }
+    crossing_calls = []
+
+    def crossing(problem, *_args, **_kwargs):
+        crossing_calls.append(problem.frequencies.size)
+        raise RuntimeError(
+            "hybrid crossing fit missed its apportioned envelope target or "
+            "maximum amplification cap: recursive gate")
+
+    def sign_definite(*_args, **_kwargs):
+        return (np.asarray([0.25 + 0.0j]),
+                np.asarray([0.5 - 0.1j]), dict(evidence))
+
+    monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", crossing)
+    monkeypatch.setattr(
+        "gw.mpa.delivered_windows._fit_sign_definite", sign_definite)
+    poles = np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)
+    residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
+    plan, report = build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega,
+        regularization_width_ry=0.05,
+        envelope_relative_target=1.0e-4,
+        max_nodes=64, max_direct_terms=4, amplification_cap=10.0)
+
+    assert len(crossing_calls) > 2
+    assert report["amplification_cap"] == 10.0
+    assert 0 < report["direct_term_count"] <= 4
+    assert report["window_tau_pairs"] <= 64
+    assert any(
+        window.get("hardening_depth", 0) > 0
+        for window in report["branches"][0]["windows"])
+    assert all(
+        window["amplification_max"] <= report["amplification_cap"]
+        for window in report["branches"][0]["windows"])
+    assert any(row.direct for row in plan)
+
+
 def test_aligned_frequency_boundary_snaps_inside_a_one_sided_mean_segment():
     """Detailed crossing tails remain splittable when tuple means are outside."""
     spec = {
