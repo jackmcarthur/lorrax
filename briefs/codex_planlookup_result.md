@@ -16,7 +16,7 @@ Evidence input directory:
 Command: the prescribed CPU environment followed by
 `python3 tools/benchmark_delivered_lookup.py`.
 
-Achieved fitting-stage wall: **1.355172 s** for all six windows.  The four
+Achieved fitting-stage wall: **1.447249 s** for all six windows.  The four
 noncrossing windows were served with 9, 11, 12, and 8 nodes.  The two crossing
 windows used the single-fit fallback with 66 and 48 nodes.  Total cost was 154
 window--tau pairs.
@@ -35,7 +35,7 @@ Worst achieved/incumbent residual ratio is **1.0061**.  Every row also passes
 
 ## Verification and remaining integration evidence
 
-`tests/test_delivered_windows.py`: **13 passed** in 2.04 s in the prescribed
+`tests/test_delivered_windows.py`: **13 passed** in 1.74 s in the prescribed
 CPU environment.  The focused gates cover lookup-only noncrossing planning,
 one-call crossing fallback, zero-time refusal, cache receipts, branch
 independence, and removal of the tolerance ladder.
