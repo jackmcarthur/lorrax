@@ -76,7 +76,6 @@ def test_delta_head_assembly_subtracts_active_dft_diagonal_in_owned_kernel():
         tail[:, na:nb_storage])
 
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=0.0)
-    assert tuple(got.sharding.spec) == (None, "x", "y")
 
 
 def test_delta_head_assembly_refuses_energy_shape_drift():

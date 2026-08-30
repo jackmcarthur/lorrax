@@ -238,6 +238,10 @@ def main() -> int:
     assemble_delta = _assemble_delta_kernel(mesh, nb)
     delta = _ready(assemble_delta(
         hamiltonian_active, dft_active, tail_diagonal))
+    if tuple(delta.sharding.spec) != (None, "x", "y"):
+        raise AssertionError(
+            "fused active-head manifold lost its two-axis band sharding: "
+            f"{delta.sharding.spec}")
     assembly_error = float(np.max(np.abs(_host(delta) - delta_host)))
     if assembly_error != 0.0:
         raise AssertionError(
