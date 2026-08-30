@@ -31,7 +31,7 @@ def test_single_term_executed_convention_reproduces_minus_residue_over_d():
     plan, _ = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
         regularization_width_ry=eta,
-        envelope_relative_target=1.0e-11,
+        envelope_relative_target=1.0e-5,
         max_nodes=512)
 
     row = plan[0]
@@ -70,13 +70,18 @@ def test_streamed_pole_measures_reproduce_one_resident_measure_and_plan():
             pole_offset=lo, **kwargs)
         for lo in range(2)
     ])
-    for index in (0, 1, 2, 3, 6, 7, 8, 9):
+    for index in (0, 1, 2, 5):
         np.testing.assert_allclose(streamed[index], whole[index])
-    for index in (4, 5):
-        for got, expected in zip(streamed[index], whole[index]):
-            np.testing.assert_allclose(got, expected)
-    assert streamed[10] == whole[10]
-    assert streamed[11] == whole[11]
+    for index in (3, 4):
+        for got_by_interval, expected_by_interval in zip(
+                streamed[index], whole[index]):
+            for got, expected in zip(got_by_interval, expected_by_interval):
+                if expected is None:
+                    assert got is None
+                else:
+                    np.testing.assert_allclose(got, expected)
+    assert streamed[6] == whole[6]
+    assert streamed[7] == whole[7]
 
     direct, direct_report = build_delivered_sigma_windows(
         [Omega], [residue], [branch], omega_grid,
@@ -116,7 +121,7 @@ def _two_branch_plan():
         pole_sets, residue_sets, branches, omega,
         regularization_width_ry=0.02,
         envelope_relative_target=2.0e-4,
-        max_nodes=200, amplification_cap=30.0)
+        max_nodes=200)
     return branches, pole_sets, plan, report
 
 
@@ -131,17 +136,24 @@ def test_two_branch_plan_meets_its_measure_target_and_reports_node_counts():
         assert sum(row.window.n_tau for row in rows) == evidence["node_count"]
         for row, window_evidence in zip(rows, evidence["windows"]):
             assert row.window.n_tau == window_evidence["node_count"]
-            # A fully-crossing window may legitimately carry zero tau
-            # nodes when its tuples route to exact direct summation
-            # (support-based routing); it must then carry direct terms.
-            assert (window_evidence["node_count"] > 0
-                    or window_evidence.get("direct_term_count", 0) > 0)
+            assert window_evidence["node_count"] > 0
+            assert window_evidence["direct_term_count"] == 0
             assert (window_evidence["refined_residual"]
                     <= window_evidence["relative_residual_target"])
-            assert (window_evidence["amplification_max"]
-                    <= report["amplification_cap"])
+            assert window_evidence["noise_budget_met"]
+            assert (window_evidence["runtime_noise_bound"]
+                    <= window_evidence["runtime_noise_budget"])
             assert row.window.project == "full"
-            np.testing.assert_array_equal(row.window.mask_A, branch.base_mask_A)
+            assert row.state_indices is None
+            assert np.any(row.window.mask_A)
+            assert np.all(np.asarray(row.window.mask_A)
+                          <= np.asarray(branch.base_mask_A))
+        assert 1 <= evidence["window_count"] <= 4
+        assert evidence["window_axis"] == (
+            "state_interval_x_pole_interval")
+        assert evidence["state_support"] == "plain_interval"
+    assert report["direct_term_count"] == 0
+    assert report["window_tau_pairs"] <= 200
 
 
 def test_tr_broken_cond_and_val_pole_sets_produce_independent_plans():

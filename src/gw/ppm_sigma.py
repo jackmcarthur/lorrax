@@ -81,7 +81,8 @@ from .ppm_accumulators import (
     _TauAccumulator,
     _MemoryTileSink,
 )
-from .sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
+from .sigma_plan import (resolve_delivered_max_direct_terms,
+                         resolve_delivered_tau_grid, resolve_sigma_plan)
 from .wavefunction_bundle import (face_kernel_kwargs,
                                   projected_state_amplitude_envelope)
 
@@ -1677,20 +1678,12 @@ def compute_sigma_c_ppm_omega_grid(
             max_nodes=max(int(max_nodes), int(crossing_max_nodes)),
             crossing_eps_q=crossing_eps_q,
             use_shipped_minimax_tables=bool(use_shipped_minimax_tables),
-            tau_grid_mode=tau_grid_mode, mesh_xy=mesh_xy)
-        direct = [row for row in shared_plan if row.direct]
-        if direct:
-            # GN's branch executor still owns bracketed host-tile sinks and
-            # accepts scalar _SigmaWindow rows, whereas the exact reciprocal
-            # fallback is an MPA SharedSigmaWindow operation. A one-pole
-            # delivered GN plan is otherwise Cartesian-equivalent to its
-            # explicit state tuples, so dropping tuple metadata is safe only
-            # for tau rows. Refuse the unsupported direct case loudly rather
-            # than passing a zero-node window into the incumbent tau loop.
-            raise NotImplementedError(
-                "GN-PPM delivered planning selected exact direct terms; "
-                "direct reciprocal execution is currently supported by the "
-                "MPA SharedSigmaWindow executor only")
+            tau_grid_mode=tau_grid_mode,
+            max_direct_terms=resolve_delivered_max_direct_terms(),
+            edge_factor=edge_factor, mesh_xy=mesh_xy)
+        if geometry["direct_term_count"] != 0 or any(
+                row.direct for row in shared_plan):
+            raise AssertionError("delivered product planner emitted direct work")
         for report in geometry["branches"]:
             start, stop = int(report["plan_start"]), int(report["plan_stop"])
             delivered_windows[report["tag"]] = [
@@ -1703,6 +1696,15 @@ def compute_sigma_c_ppm_omega_grid(
             f"{geometry['window_tau_pairs']} (window,tau) pairs, "
             f"{geometry['distinct_tau_count']} branch-distinct tau, "
             f"plan {geometry['plan_seconds']:.3f} s")
+        for report in geometry["branches"]:
+            for window in report["windows"]:
+                print_fn(
+                    f"    {window['name']}: n_tau={window['node_count']}, "
+                    f"residual={window['refined_residual']:.6g}/"
+                    f"{window['relative_residual_target']:.6g}, "
+                    f"kappa_p99={window['amplification_p99']:.6g}, "
+                    f"noise={window['runtime_noise_bound']:.6g}/"
+                    f"{window['runtime_noise_budget']:.6g}")
 
     # Run each branch and fold its Σc tiles into per-rank HOST tile
     # accumulators at the branch's global ω indices.  cond and val of a

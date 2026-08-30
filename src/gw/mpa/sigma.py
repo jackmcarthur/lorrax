@@ -19,7 +19,8 @@ from gw.ppm_sigma import (SigmaOmegaResult,
 from gw.ppm_tau_kernel import (get_shared_sigma_direct_kernel,
                                get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_plan import resolve_delivered_tau_grid, resolve_sigma_plan
+from gw.sigma_plan import (resolve_delivered_max_direct_terms,
+                           resolve_delivered_tau_grid, resolve_sigma_plan)
 from gw.wavefunction_bundle import (face_kernel_kwargs,
                                     projected_state_amplitude_envelope)
 
@@ -601,11 +602,15 @@ def compute_sigma_c_mpa_omega_grid(
             from .delivered_windows import (
                 build_delivered_sigma_windows,
                 combine_delivered_sigma_pole_measures,
+                delivered_product_geometry,
                 measure_delivered_sigma_pole_batch,
             )
             state_amplitudes = projected_state_amplitude_envelope(
                 wfns, state_bands=wfns.slices.sigma_sum,
                 projection_bands=wfns.slices.sigma)
+            product_geometry = delivered_product_geometry(
+                branches, regularization_width_ry,
+                edge_factor=edge_factor)
             measured = [[] for _branch in branches]
             for lo in range(0, n_poles, int(pole_batch_size)):
                 hi = min(lo + int(pole_batch_size), n_poles)
@@ -617,6 +622,7 @@ def compute_sigma_c_mpa_omega_grid(
                         measure_delivered_sigma_pole_batch(
                             branch, Omega, B,
                             regularization_width_ry=regularization_width_ry,
+                            pole_split_ry=product_geometry["pole_edge_ry"],
                             state_amplitude=state_amplitudes,
                             pole_offset=lo, mesh_xy=mesh_xy))
                 del Omega, B
@@ -633,6 +639,8 @@ def compute_sigma_c_mpa_omega_grid(
                 crossing_eps_q=1.0e-3,
                 use_shipped_minimax_tables=True,
                 tau_grid_mode=tau_grid_mode,
+                max_direct_terms=resolve_delivered_max_direct_terms(),
+                edge_factor=edge_factor,
                 measures_by_branch=measures_by_branch, mesh_xy=mesh_xy)
         if plan_mode == "panes":
             print_fn(
@@ -649,6 +657,15 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['window_tau_pairs']} (window,tau) pairs, "
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"{geometry['direct_term_count']} direct terms")
+            for branch in geometry["branches"]:
+                for window in branch["windows"]:
+                    print_fn(
+                        f"    {window['name']}: n_tau={window['node_count']}, "
+                        f"residual={window['refined_residual']:.6g}/"
+                        f"{window['relative_residual_target']:.6g}, "
+                        f"kappa_p99={window['amplification_p99']:.6g}, "
+                        f"noise={window['runtime_noise_bound']:.6g}/"
+                        f"{window['runtime_noise_budget']:.6g}")
         return integrate_sigma_store(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, print_fn=print_fn)

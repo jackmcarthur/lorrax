@@ -2,14 +2,12 @@
 
 import ast
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import jax.numpy as jnp
 
 from gw.minimax_screening import MinimaxNodes
-from gw.mpa.delivered_windows import (_aligned_frequency_parts,
-                                      build_delivered_sigma_windows)
+from gw.mpa.delivered_windows import build_delivered_sigma_windows
 from gw.mpa.sigma import (_batch_rows, _tau_groups, _tuple_components)
 from gw.mpa.sigma_windows import SharedSigmaWindow
 from gw.ppm_tau_kernel import (_direct_reciprocal_denominator,
@@ -97,61 +95,53 @@ def test_direct_batch_geometry_carries_ninety_one_explicit_terms():
     assert not np.any(phase_real)
 
 
-def test_planner_routes_a_small_failed_crossing_to_direct(monkeypatch):
+def test_planner_refuses_an_unattainable_crossing_without_direct_fallback():
     E_A = jnp.asarray([[0.3]])
     branch = _SigmaBranch(
         "positive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
         "cond", False, np.asarray([0.8]), np.asarray([0], np.int64))
 
-    def refuse(*_args, **_kwargs):
-        raise RuntimeError(
-            "hybrid crossing fit missed its apportioned envelope target or "
-            "maximum amplification cap: gate")
-
-    monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", refuse)
-    plan, report = build_delivered_sigma_windows(
-        [np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)],
-        [np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)],
-        [branch], np.asarray([0.8]), regularization_width_ry=0.05,
-        envelope_relative_target=1.0e-4, max_nodes=8)
-    assert len(plan) == 1
-    assert plan[0].direct
-    assert plan[0].window.n_tau == 0
-    assert plan[0].state_indices.tolist() == [0]
-    assert plan[0].pole_indices.tolist() == [0]
-    assert report["window_tau_pairs"] == 0
-    assert report["direct_term_count"] == 1
+    with np.testing.assert_raises_regex(
+            RuntimeError,
+            "delivered product window 'positive conduction:resonant' "
+            "refused: achieved"):
+        build_delivered_sigma_windows(
+            [np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)],
+            [np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)],
+            [branch], np.asarray([0.8]), regularization_width_ry=0.05,
+            envelope_relative_target=1.0e-11, max_nodes=8)
 
 
-def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch):
-    """A broad refusal becomes disjoint 2x2 blocks before direct fallback."""
+def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
+    """Crossing keeps the full frequency/state support in one rectangle."""
     E_A = jnp.asarray([[-0.4, -0.2, 0.0, 0.2]])
     omega = np.asarray([0.2, 0.4, 0.6, 0.8])
     branch = _SigmaBranch(
         "positive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
         "cond", False, omega, np.arange(omega.size, dtype=np.int64))
 
-    evidence = {
-        "family": "test_block_rule", "fit_residual": 0.0,
-        "refined_residual": 0.0, "amplification_p99": 1.0,
-        "amplification_max": 1.0, "attempts": [],
-    }
+    seen = []
 
-    def crossing(problem, *_args, **_kwargs):
-        if problem.frequencies.size == omega.size:
-            raise RuntimeError(
-                "hybrid crossing fit missed its apportioned target or "
-                "amplification cap: block gate")
-        return (np.asarray([0.25 + 0.0j]),
-                np.asarray([0.5 - 0.1j]), dict(evidence))
+    def one_node_candidate(spec, eta, max_nodes, factor_growth_cap):
+        del eta, max_nodes, factor_growth_cap
+        seen.append((spec["kind"], spec["problem"].frequencies.copy()))
+        return [{
+            "times": np.asarray([0.25 + 0.0j]),
+            "weights": np.asarray([0.5 - 0.1j]),
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "required_target": 0.0,
+            "absolute_cost": 0.0,
+            "factor_growth": (0.0, 0.0),
+            "evidence": {
+                "family": "test_product_rule",
+                "candidate_tolerance": 0.0,
+            },
+            "attempts": [],
+        }]
 
-    def sign_definite(*_args, **_kwargs):
-        return (np.asarray([0.25 + 0.0j]),
-                np.asarray([0.5 - 0.1j]), dict(evidence))
-
-    monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", crossing)
     monkeypatch.setattr(
-        "gw.mpa.delivered_windows._fit_sign_definite", sign_definite)
+        "gw.mpa.delivered_windows._candidate_rules", one_node_candidate)
     poles = np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)
     residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
     plan, report = build_delivered_sigma_windows(
@@ -160,88 +150,49 @@ def test_planner_hardens_large_crossing_into_tuple_frequency_blocks(monkeypatch)
         envelope_relative_target=1.0e-4,
         max_nodes=8)
 
-    assert len(plan) == 4
+    assert len(plan) == 1
+    assert seen[0][0] == "crossing"
+    np.testing.assert_array_equal(seen[0][1], omega)
     assert report["direct_term_count"] == 0
-    frequency_blocks = {
-        tuple(np.asarray(row.omega_idx, dtype=np.int64)) for row in plan}
-    assert len(frequency_blocks) == 2
-    assert set().union(*(set(block) for block in frequency_blocks)) == set(
-        range(omega.size))
-    for block in frequency_blocks:
-        rows = [row for row in plan
-                if tuple(np.asarray(row.omega_idx, dtype=np.int64)) == block]
-        pairs = [
-            (int(state), int(pole))
-            for row in rows
-            for state, pole in zip(row.state_indices, row.pole_indices)
-        ]
-        assert sorted(pairs) == [(0, 0), (1, 0), (2, 0), (3, 0)]
-    assert all(window["hardening_parent"] is not None
-               for window in report["branches"][0]["windows"])
+    assert plan[0].state_indices is None
+    np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 4])
+    np.testing.assert_array_equal(plan[0].omega_idx, np.arange(omega.size))
+    np.testing.assert_array_equal(plan[0].pole_indices, [0])
+    assert report["branches"][0]["window_axis"] == (
+        "state_interval_x_pole_interval")
 
 
-def test_planner_recursively_splits_crossing_before_bounded_direct(monkeypatch):
-    """An oversized refused diagonal is split again without relaxing cap."""
+def test_metallic_style_crossing_uses_one_bounded_zero_direct_rule():
+    """A metallic crossing is integrated by one eta-damped product rule."""
     energies = np.linspace(-0.7, 0.7, 8)
     omega = np.linspace(0.1, 0.9, 5)
     E_A = jnp.asarray(energies[None, :])
+    fractional_weight = jnp.asarray(
+        np.linspace(0.15, 0.85, energies.size)[None, :])
     branch = _SigmaBranch(
         "recursive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
-        "cond", False, omega, np.arange(omega.size, dtype=np.int64))
-    evidence = {
-        "family": "test_block_rule", "fit_residual": 0.0,
-        "refined_residual": 0.0, "amplification_p99": 1.0,
-        "amplification_max": 1.0, "attempts": [],
-    }
-    crossing_calls = []
-
-    def crossing(problem, *_args, **_kwargs):
-        crossing_calls.append(problem.frequencies.size)
-        raise RuntimeError(
-            "hybrid crossing fit missed its apportioned envelope target or "
-            "maximum amplification cap: recursive gate")
-
-    def sign_definite(*_args, **_kwargs):
-        return (np.asarray([0.25 + 0.0j]),
-                np.asarray([0.5 - 0.1j]), dict(evidence))
-
-    monkeypatch.setattr("gw.mpa.delivered_windows._fit_crossing", crossing)
-    monkeypatch.setattr(
-        "gw.mpa.delivered_windows._fit_sign_definite", sign_definite)
+        "cond", False, omega, np.arange(omega.size, dtype=np.int64),
+        fractional_weight)
     poles = np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)
     residues = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
     plan, report = build_delivered_sigma_windows(
         [poles], [residues], [branch], omega,
         regularization_width_ry=0.05,
-        envelope_relative_target=1.0e-4,
-        max_nodes=64, max_direct_terms=4, amplification_cap=10.0)
+        envelope_relative_target=1.0e-4, max_nodes=64,
+        max_direct_terms=4)
 
-    assert len(crossing_calls) > 2
-    assert report["amplification_cap"] == 10.0
-    assert 0 < report["direct_term_count"] <= 4
+    assert len(plan) == 1
+    assert report["global_direct_term_ceiling"] == 4
+    assert report["direct_term_count"] == 0
     assert report["window_tau_pairs"] <= 64
-    assert any(
-        window.get("hardening_depth", 0) > 0
-        for window in report["branches"][0]["windows"])
-    assert all(
-        window["amplification_max"] <= report["amplification_cap"]
-        for window in report["branches"][0]["windows"])
-    assert any(row.direct for row in plan)
-
-
-def test_aligned_frequency_boundary_snaps_inside_a_one_sided_mean_segment():
-    """Detailed crossing tails remain splittable when tuple means are outside."""
-    spec = {
-        "tuple_representative": np.asarray([-2.0 - 0.1j, -1.0 - 0.1j]),
-        "problem": SimpleNamespace(
-            frequencies=np.asarray([0.0, 1.0, 2.0])),
-    }
-    panes, boundary, raw = _aligned_frequency_parts(
-        spec, (np.asarray([0]), np.asarray([1])))
-    assert raw == -1.5
-    assert boundary == 0.5
-    np.testing.assert_array_equal(panes[0], [0])
-    np.testing.assert_array_equal(panes[1], [1, 2])
+    window = report["branches"][0]["windows"][0]
+    assert window["kind"] == "crossing"
+    assert window["refined_residual"] <= window[
+        "relative_residual_target"]
+    assert window["noise_budget_met"]
+    assert plan[0].state_indices is None
+    np.testing.assert_array_equal(plan[0].window.mask_A, [[True] * 8])
+    assert not any(row.direct for row in plan)
 
 
 def test_metal_oneshot_threads_one_occupation_state_to_fit_and_sigma():

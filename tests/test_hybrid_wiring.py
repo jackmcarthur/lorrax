@@ -49,12 +49,17 @@ def _executed_scalar(plan, poles, residues, energies, omega):
             continue
         times = np.asarray(win.nodes.t)
         alpha = np.asarray(win.nodes.alpha)
+        if row.state_indices is None:
+            states = np.flatnonzero(np.asarray(win.mask_A).reshape(-1))
+            pairs = tuple((state, pole) for state in states
+                          for pole in row.pole_indices)
+        else:
+            pairs = tuple(zip(row.state_indices, row.pole_indices))
         for frequency_index, frequency in zip(row.omega_idx, row.omega_abs):
             coefficient = _omega_coefficient(
                 np, frequency, times, alpha, win.omega_sign,
                 win.prefactor, e_ref=win.E_ref_A + win.E_ref_B)
-            for state_index, pole_index in zip(
-                    row.state_indices, row.pole_indices):
+            for state_index, pole_index in pairs:
                 energy = energies[state_index]
                 green = np.exp(-1.0j * (energy - win.E_ref_A) * times)
                 screened = residues[pole_index] * np.exp(
@@ -141,12 +146,13 @@ def test_gn_single_pole_reduction_is_one_executable_window():
         regularization_width_ry=0.04,
         envelope_relative_target=2.0e-5,
         lattice_bins=8, max_nodes=128)
-    assert report["planner"] == "hybrid_measure_apportioned"
+    assert report["planner"] == "delivered_product_windows"
     assert report["branches"][0]["live_pole_count"] == 1
     assert report["branches"][0]["window_count"] == 1
     assert len(plan) == 1
-    np.testing.assert_array_equal(plan[0].pole_indices, [0, 0])
-    np.testing.assert_array_equal(plan[0].state_indices, [0, 1])
+    np.testing.assert_array_equal(plan[0].pole_indices, [0])
+    assert plan[0].state_indices is None
+    np.testing.assert_array_equal(plan[0].window.mask_A, [[True, True]])
     assert plan[0].window.project == "full"
 
 
@@ -166,9 +172,12 @@ def test_mpa_pole_windows_reconstruct_a_small_true_sigma():
     membership = np.concatenate([row.pole_indices for row in plan])
     np.testing.assert_array_equal(
         np.unique(membership), np.arange(poles.size))
-    assert membership.size == energies.size * poles.size
+    cartesian_pairs = sum(
+        np.count_nonzero(row.window.mask_A) * row.pole_indices.size
+        for row in plan)
+    assert cartesian_pairs == energies.size * poles.size
     assert report["n_windows"] >= 2
-    assert all(row["amplification_max"] <= report["amplification_cap"]
+    assert all(row["noise_budget_met"]
                for row in report["branches"][0]["windows"])
 
     executed = _executed_scalar(plan, poles, residues, energies, omega)
@@ -203,8 +212,9 @@ def test_shared_grid_uses_one_branch_grid_at_matched_envelope_error():
     assert report["window_tau_pairs"] == len(plan) * grids[0].size
     assert report["distinct_tau_count"] == grids[0].size
     assert report["direct_term_count"] == 0
-    assert report["branches"][0]["window_axis"] == "state_pole_tuple"
-    assert report["branches"][0]["state_support"] == "explicit"
+    assert report["branches"][0]["window_axis"] == (
+        "state_interval_x_pole_interval")
+    assert report["branches"][0]["state_support"] == "plain_interval"
 
     executed = _executed_scalar(plan, poles, residues, energies, omega)
     broadened = poles.real - 1.0j * (-poles.imag + eta)
@@ -233,39 +243,43 @@ def test_local_pole_reduction_has_a_shard_and_rank_independent_cell_ceiling():
     np.testing.assert_allclose(whole[0].sum(), masses.sum(), rtol=2.0e-15)
 
 
-def test_maximum_amplification_is_the_acceptance_gate_not_p99():
-    assert _rule_accepted((1.0e-5, 2.0, 9.0), 1.0e-4, 10.0)
-    assert not _rule_accepted((1.0e-5, 2.0, 11.0), 1.0e-4, 10.0)
+def test_p99_amplification_is_charged_to_the_runtime_noise_budget():
+    assert _rule_accepted((1.0e-5, 40.0, 1.0e6), 1.0e-4)
+    assert not _rule_accepted((1.0e-5, 100.0, 1.0), 1.0e-4)
+    assert not _rule_accepted((1.1e-4, 1.0, 1.0), 1.0e-4)
 
 
 def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
         monkeypatch):
-    def two_node_fit(problem, validation, target, max_nodes, amp_cap):
-        del problem, validation, target, max_nodes, amp_cap
-        return (
-            np.asarray([0.1, 0.2], np.complex128),
-            np.asarray([0.5, 0.5], np.complex128),
-            {
+    def two_node_candidates(spec, eta, max_nodes, factor_growth_cap):
+        del spec, eta, max_nodes, factor_growth_cap
+        return [{
+            "times": np.asarray([0.1, 0.2], np.complex128),
+            "weights": np.asarray([0.5, 0.5], np.complex128),
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "required_target": 0.0,
+            "absolute_cost": 0.0,
+            "factor_growth": (0.0, 0.0),
+            "evidence": {
                 "family": "budget_negative_control",
-                "fit_residual": 0.0,
-                "refined_residual": 0.0,
-                "amplification_p99": 1.0,
-                "amplification_max": 1.0,
+                "candidate_tolerance": 0.0,
             },
-        )
+            "attempts": [],
+        }]
 
     monkeypatch.setattr(
-        "gw.mpa.delivered_windows._fit_sign_definite", two_node_fit)
+        "gw.mpa.delivered_windows._candidate_rules", two_node_candidates)
     omega = np.asarray([0.0])
-    branch = _branch("budget", "cond", [0.2, 0.4], omega)
-    poles = np.asarray([3.0 - 0.1j, 8.0 - 0.2j])
+    branch = _branch("budget", "cond", [0.01, 0.2], omega)
+    poles = np.asarray([0.02 - 0.1j, 8.0 - 0.2j])
     residues = np.asarray([1.0 + 0.0j, 0.8 + 0.0j])
-    with pytest.raises(RuntimeError, match="global window_tau_pairs ceiling"):
+    with pytest.raises(RuntimeError, match="pair ceiling=3"):
         build_delivered_sigma_windows(
             [poles], [residues], [branch], omega,
             regularization_width_ry=0.05,
             envelope_relative_target=1.0e-3,
-            max_nodes=3, amplification_cap=10.0)
+            max_nodes=3)
 
 
 def test_reference_sigma_calibrates_envelope_exchange_rate():
