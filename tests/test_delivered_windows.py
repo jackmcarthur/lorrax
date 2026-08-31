@@ -544,3 +544,39 @@ def test_parallel_planner_refusal_is_rank_independent():
                 match="window 2 refused on owner rank 2"):
             delivered._assemble_planner_rows(
                 shards, 7, world, refuse_errors=True)
+
+
+def test_budget_retry_reuses_gathered_consolidation_trials(monkeypatch):
+    """One merged fit per branch survives the global-budget retry."""
+    fitted_names = []
+
+    def fitted(spec, *_args, **_kwargs):
+        fitted_names.append(spec["name"])
+        return _served_candidate(spec), {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    original_select = delivered._select_rules
+    select_calls = 0
+
+    def retry_once(*args, **kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls == 1:
+            raise RuntimeError("forced global-budget retry")
+        return original_select(*args, **kwargs)
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fitted)
+    monkeypatch.setattr(
+        delivered, "_run_parallel_planner_jobs",
+        _emulated_parallel_runner(4))
+    monkeypatch.setattr(delivered, "_select_rules", retry_once)
+    _branches, _poles, _plan, report = _two_branch_plan()
+
+    assert select_calls == 2
+    consolidated = [name for name in fitted_names
+                    if name.endswith(":consolidated")]
+    assert consolidated
+    assert len(consolidated) == len(set(consolidated))
+    assert report["n_windows"] > 0

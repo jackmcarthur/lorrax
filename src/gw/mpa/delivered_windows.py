@@ -1599,7 +1599,7 @@ def _merge_branch_specs(group):
 
 
 def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
-                          total_absolute):
+                          total_absolute, trial_candidates=None):
     """Replace a branch's windows by one merged window when that costs less.
 
     Tried, not assumed: the merged window is fitted and kept only if it is
@@ -1623,11 +1623,18 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
     def fit_trial(index):
         _indices, merged, allowance = trials[index]
         rows, detail = _window_candidates_profiled(
-            merged, eta, max_nodes, factor_cap, allowance)
+            merged, eta, max_nodes, factor_cap, allowance,
+            adapted_only=True)
         return rows[0], detail
 
-    trial_candidates, trial_rows = _run_parallel_planner_jobs(
-        len(trials), fit_trial, refuse_errors=False)
+    if trial_candidates is None:
+        trial_candidates, trial_rows = _run_parallel_planner_jobs(
+            len(trials), fit_trial, refuse_errors=False)
+    else:
+        if len(trial_candidates) != len(trials):
+            raise RuntimeError(
+                "cached consolidation trial count changed across retry")
+        trial_rows = []
     keep = list(range(len(specs)))
     merged_specs, merged_candidates = dict(), dict()
     for (indices, merged, _allowance), candidate in zip(
@@ -1642,10 +1649,10 @@ def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
         for dropped in indices[1:]:
             keep.remove(dropped)
     if not merged_specs:
-        return specs, candidates, trial_rows
+        return specs, candidates, trial_rows, trial_candidates
     return ([merged_specs.get(i, specs[i]) for i in keep],
             [merged_candidates.get(i, candidates[i]) for i in keep],
-            trial_rows)
+            trial_rows, trial_candidates)
 
 
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
@@ -2097,6 +2104,7 @@ def build_delivered_sigma_windows(
             len(base_specs), fit_window, refuse_errors=True)
         window_parallel_seconds += time.perf_counter() - fit_started
         fits = None
+        consolidation_cache = None
         for adapted_only in (True, False):
             specs = base_specs
             if adapted_only:
@@ -2130,9 +2138,10 @@ def build_delivered_sigma_windows(
                 window_parallel_seconds += time.perf_counter() - fit_started
                 window_fit_rows.extend(retry_rows)
             consolidation_started = time.perf_counter()
-            specs, candidates_by_window, trial_rows = _consolidate_branches(
+            (specs, candidates_by_window, trial_rows,
+             consolidation_cache) = _consolidate_branches(
                 specs, candidates_by_window, eta, pair_ceiling, factor_cap,
-                total_absolute)
+                total_absolute, consolidation_cache)
             consolidation_seconds += (
                 time.perf_counter() - consolidation_started)
             consolidation_rows.extend(trial_rows)
