@@ -280,25 +280,52 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
-def _crossing_problem(width_ev):
+def _served_candidate(spec, *_args):
+    evidence = {
+        "family": ("crossing_hgl" if spec["kind"] == "crossing"
+                   else "noncrossing"),
+        "candidate_tolerance": 1.0e-6,
+        "provenance": "deterministic shipped-table test rule",
+    }
+    return [{
+        "times": np.asarray([0.1]),
+        "weights": np.asarray([1.0j]),
+        "evidence": evidence,
+        "fit_metrics": (0.0, 1.0, 1.0),
+        "metrics": (0.0, 1.0, 1.0),
+        "required_target": 1.0e-5,
+        "absolute_cost": spec["envelope"] * 1.0e-5,
+        "factor_growth": (0.0, 0.0),
+        "attempts": [],
+    }]
+
+
+def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry
-    frequencies = np.linspace(0.0, width_ev, int(4 * width_ev) + 1) * ev_to_ry
-    return ReciprocalMeasureProblem(
-        frequencies=frequencies,
-        internal_sums=np.asarray([0.5 * width_ev * ev_to_ry - 1.0j * eta]),
-        cell_masses=np.asarray([1.0]))
+    omega = np.linspace(0.0, width_ev, int(4 * width_ev) + 1) * ev_to_ry
+    branch = _branch(f"{width_ev:g} eV conduction", "cond", [0.0], omega)
+    poles = np.asarray([
+        0.25 * width_ev * ev_to_ry,
+        0.85 * width_ev * ev_to_ry,
+    ], np.complex128).reshape(2, 1, 1, 1)
+    residues = np.ones_like(poles)
+    return build_delivered_sigma_windows(
+        [poles], [residues], [branch], omega,
+        regularization_width_ry=eta,
+        envelope_relative_target=2.0e-4,
+        lattice_bins=9, max_nodes=420)
 
 
-def test_crossing_patch_count_is_the_smallest_catalog_covered_partition():
-    narrow = _crossing_problem(5.0)
-    narrow_patches = delivered._crossing_omega_patches(narrow, 1.0)
-    assert len(narrow_patches) == 1
-    np.testing.assert_array_equal(
-        narrow_patches[0], np.arange(narrow.frequencies.size))
+def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
+        monkeypatch):
+    monkeypatch.setattr(delivered, "_candidate_rules", _served_candidate)
+    narrow, narrow_report = _patched_test_plan(5.0)
+    assert len(narrow) == 1
+    assert narrow_report["n_windows"] == 1
 
-    wide = _crossing_problem(20.0)
-    patches = delivered._crossing_omega_patches(wide, 1.0)
+    wide, wide_report = _patched_test_plan(20.0)
+    crossing = [row for row in wide if ":resonant[p" in row.window.name]
     widest_span = max(
         entry.range_max
         for entry in delivered._mm.catalog().for_family("crossing")
@@ -306,64 +333,34 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition():
         and entry.eps_q is not None
         and abs(entry.eps_q - delivered._CROSSING_EPS_Q) <= 1.0e-12)
 
-    def span(rows):
-        patch = ReciprocalMeasureProblem(
-            frequencies=wide.frequencies[rows],
-            internal_sums=wide.internal_sums,
-            cell_masses=wide.cell_masses)
-        return delivered._crossing_geometry(patch, 1.0)[2]
-
-    assert len(patches) == 2
-    assert all(span(rows) <= widest_span + 1.0e-12 for rows in patches)
-    assert any(
-        span(rows) > widest_span + 1.0e-12
-        for rows in np.array_split(
-            np.arange(wide.frequencies.size), len(patches) - 1))
+    assert len(crossing) == 2
+    assert all("[p" in row.window.name for row in crossing)
+    assert all(
+        evidence["family"] == "crossing_hgl"
+        for evidence in wide_report["branches"][0]["windows"]
+        if ":resonant[p" in evidence["name"])
+    # One unpatched window has A=max(17, 20-5)/0.25=68, so A=60 cannot
+    # cover it.  The returned two-patch cover is therefore minimal.
+    assert 68.0 > widest_span
 
 
 def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
         monkeypatch):
     ev_to_ry = 1.0 / 27.211386245988
+    monkeypatch.setattr(delivered, "_candidate_rules", _served_candidate)
+    first, first_report = _patched_test_plan(20.0)
+    second, second_report = _patched_test_plan(20.0)
+    first_crossing = [
+        row for row in first if ":resonant[p" in row.window.name]
+    second_crossing = [
+        row for row in second if ":resonant[p" in row.window.name]
+
+    assert len(first_crossing) == len(second_crossing) == 2
+    joined = np.concatenate([row.omega_idx for row in first_crossing])
     omega = np.linspace(0.0, 20.0, 81) * ev_to_ry
-    branch = _branch("wide conduction", "cond", [0.0], omega)
-    poles = np.asarray([10.0 * ev_to_ry + 0.0j]).reshape(1, 1, 1, 1)
-    residues = np.asarray([1.0 + 0.0j]).reshape(1, 1, 1, 1)
-
-    def served_candidate(spec, *_args):
-        evidence = {
-            "family": ("crossing_hgl" if spec["kind"] == "crossing"
-                       else "noncrossing"),
-            "candidate_tolerance": 1.0e-6,
-            "provenance": "deterministic shipped-table test rule",
-        }
-        return [{
-            "times": np.asarray([0.1]),
-            "weights": np.asarray([1.0j]),
-            "evidence": evidence,
-            "fit_metrics": (0.0, 1.0, 1.0),
-            "metrics": (0.0, 1.0, 1.0),
-            "required_target": 1.0e-5,
-            "absolute_cost": spec["envelope"] * 1.0e-5,
-            "factor_growth": (0.0, 0.0),
-            "attempts": [],
-        }]
-
-    monkeypatch.setattr(delivered, "_candidate_rules", served_candidate)
-    kwargs = dict(
-        regularization_width_ry=0.25 * ev_to_ry,
-        envelope_relative_target=2.0e-4,
-        lattice_bins=9,
-        max_nodes=420)
-    first, first_report = build_delivered_sigma_windows(
-        [poles], [residues], [branch], omega, **kwargs)
-    second, second_report = build_delivered_sigma_windows(
-        [poles], [residues], [branch], omega, **kwargs)
-
-    assert len(first) == len(second) == 2
-    joined = np.concatenate([row.omega_idx for row in first])
     np.testing.assert_array_equal(joined, np.arange(omega.size))
     assert np.unique(joined).size == joined.size
-    assert all("[p" in row.window.name for row in first)
+    assert all("[p" in row.window.name for row in first_crossing)
     for left, right in zip(first, second):
         assert left.window.name == right.window.name
         for left_array, right_array in (

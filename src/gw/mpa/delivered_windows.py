@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 4
+_PLAN_CACHE_VERSION = 5
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -914,24 +914,33 @@ def combine_delivered_sigma_pole_measures(batch_measures):
             np.asarray(poles, np.int32)[order], raw_count, evidence)
 
 
-def _product_problem(state_positions, pole_interval, measure, frequencies,
+def _product_problem(state_positions, pole_bounds, measure, frequencies,
                      pole_sign, bins):
     signed, state_mass, _state_indices, pole_cells, pole_weights, poles, *_ = measure
     state_positions = np.asarray(state_positions, np.int64)
     cells, masses, selected_poles = [], [], []
-    interval = int(pole_interval)
+    pole_lo, pole_hi = map(float, pole_bounds)
     for local, pole in enumerate(np.asarray(poles, np.int32)):
-        pole_cell = pole_cells[local][interval]
-        pole_weight = pole_weights[local][interval]
-        if pole_cell is None:
-            continue
-        selected_poles.append(int(pole))
-        internal = (np.asarray(signed)[state_positions, None]
-                    + float(pole_sign) * np.asarray(pole_cell)[None, :])
-        mass = (np.asarray(state_mass)[state_positions, None]
-                * np.asarray(pole_weight)[None, :])
-        cells.append(internal.reshape(-1))
-        masses.append(mass.reshape(-1))
+        pole_selected = False
+        for part in (0, 1):
+            pole_cell = pole_cells[local][part]
+            pole_weight = pole_weights[local][part]
+            if pole_cell is None:
+                continue
+            pole_cell = np.asarray(pole_cell)
+            keep = ((pole_cell.real > pole_lo)
+                    & (pole_cell.real <= pole_hi))
+            if not np.any(keep):
+                continue
+            pole_selected = True
+            internal = (np.asarray(signed)[state_positions, None]
+                        + float(pole_sign) * pole_cell[None, keep])
+            mass = (np.asarray(state_mass)[state_positions, None]
+                    * np.asarray(pole_weight)[None, keep])
+            cells.append(internal.reshape(-1))
+            masses.append(mass.reshape(-1))
+        if pole_selected:
+            selected_poles.append(int(pole))
     if not cells:
         return None
     internal = np.concatenate(cells)
@@ -1107,23 +1116,23 @@ def _crossing_geometry(problem, pole_sign):
     if np.any(gamma <= 0.0):
         raise RuntimeError("oriented crossing support is not eta-damped")
     gamma_min = float(np.min(gamma))
-    span = float(np.ptp(oriented.real))
-    return oriented, gamma_min, span / gamma_min
+    radius = float(np.max(np.abs(oriented.real)))
+    return oriented, gamma_min, radius / gamma_min
 
 
-def _crossing_omega_patches(problem, pole_sign):
-    """Return the smallest equal contiguous omega patches HGL can cover.
+def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
+                            pole_sign, state_edge, bins):
+    """Return the smallest exact omega-patch routing covered by HGL.
 
-    Noncrossing problems and crossing problems within the widest shipped HGL
-    span return one identity patch.  Wider crossing problems try increasing
-    equal partitions of the omega rows and refuse if even one-row patches are
-    too wide.  The compact state/pole cells stay unchanged; only the omega
-    rows are rebuilt for each patch.  This is the seam where a future
-    user-specified Sigma window, with its own omega list and eta, can enter.
+    A covered problem returns one identity route.  A wider crossing is split
+    into equal contiguous omega patches.  For each patch the original pole
+    interval is tiled into a resonant shell and two sign-definite flanks; the
+    shell bounds follow directly from that patch's omega rows and the actual
+    state extrema.  Problems are rebuilt from the same compact measured cells,
+    with no explicit state--pole pairs.  This is also the seam for a future
+    user-specified Sigma window with its own omega list and broadening.
     """
     omega_rows = np.arange(problem.frequencies.size, dtype=np.int64)
-    if _window_kind(problem) != "crossing":
-        return (omega_rows,)
     entries = [entry for entry in _mm.catalog().for_family("crossing")
                if entry.target_kind == "hgl"
                and entry.eps_q is not None
@@ -1131,19 +1140,49 @@ def _crossing_omega_patches(problem, pole_sign):
     if not entries:
         raise RuntimeError("the shipped HGL family is empty")
     widest_span = max(float(entry.range_max) for entry in entries)
-    for patch_count in range(1, omega_rows.size + 1):
+    if (_window_kind(problem) != "crossing"
+            or _crossing_geometry(problem, pole_sign)[2]
+            <= widest_span + 1.0e-12):
+        return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
+
+    raw_energy = (float(pole_sign)
+                  * np.asarray(measure[0], np.float64))
+    selected = raw_energy[np.asarray(state_positions, np.int64)]
+    state_min, state_max = float(np.min(selected)), float(np.max(selected))
+    original_lo, original_hi = map(float, pole_bounds)
+    for patch_count in range(2, omega_rows.size + 1):
         patches = tuple(np.array_split(omega_rows, patch_count))
-        if all(_crossing_geometry(
-                ReciprocalMeasureProblem(
-                    frequencies=problem.frequencies[patch],
-                    internal_sums=problem.internal_sums,
-                    cell_masses=problem.cell_masses),
-                pole_sign)[2] <= widest_span + 1.0e-12
-               for patch in patches):
-            return patches
+        planned = []
+        for patch in patches:
+            oriented = float(pole_sign) * problem.frequencies[patch]
+            omega_lo, omega_hi = (float(np.min(oriented)),
+                                  float(np.max(oriented)))
+            shell_lo = max(
+                original_lo, omega_lo - state_max - float(state_edge))
+            shell_hi = min(
+                original_hi, omega_hi - state_min + float(state_edge))
+            shell_bounds = (shell_lo, max(shell_lo, shell_hi))
+            shell = _product_problem(
+                state_positions, shell_bounds, measure,
+                problem.frequencies[patch], pole_sign, int(bins))
+            if (shell is not None and _window_kind(shell[0]) == "crossing"
+                    and _crossing_geometry(shell[0], pole_sign)[2]
+                    > widest_span + 1.0e-12):
+                planned = []
+                break
+            cells = []
+            if original_lo < shell_bounds[0]:
+                cells.append(("positive", (original_lo, shell_bounds[0])))
+            if shell_bounds[0] < shell_bounds[1]:
+                cells.append(("crossing", shell_bounds))
+            if shell_bounds[1] < original_hi:
+                cells.append(("negative", (shell_bounds[1], original_hi)))
+            planned.append((patch, tuple(cells)))
+        if len(planned) == len(patches):
+            return tuple(planned)
     raise RuntimeError(
         "crossing support cannot be served by omega product windows: "
-        f"even one-row patches exceed the widest shipped HGL span "
+        "even one-row patches exceed the widest shipped HGL span "
         f"A={widest_span:.6g}")
 
 
@@ -1208,7 +1247,24 @@ def _crossing_fallback_node_count(A_dim, max_nodes):
 def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     """Fit one fixed deterministic causal grid; never search node/time pairs."""
     oriented, gamma_min, A_dim = _crossing_geometry(problem, pole_sign)
-    node_count, source_range = _crossing_fallback_node_count(A_dim, max_nodes)
+    # The shipped odd HGL target is certified on ``[-A, A]``, so lookup uses
+    # the support radius above.  The unconstrained IRLS fallback keeps its
+    # established density against the complete real span; it is not an HGL
+    # certificate and reducing that grid changed its conditioning.
+    fit_A_dim = float(np.ptp(oriented.real)) / gamma_min
+    widest_hgl = max(
+        float(entry.range_max)
+        for entry in _mm.catalog().for_family("crossing")
+        if entry.target_kind == "hgl"
+        and entry.eps_q is not None
+        and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12)
+    # A support whose physical HGL radius is covered keeps the established
+    # widest-table density even when the conservative end-to-end span is a
+    # little larger.  Truly wider supports are patched before this fallback.
+    fallback_A_dim = (min(fit_A_dim, widest_hgl)
+                      if A_dim <= widest_hgl + 1.0e-12 else fit_A_dim)
+    node_count, source_range = _crossing_fallback_node_count(
+        fallback_A_dim, max_nodes)
     target = min(float(relative_target), 0.5)
     t_max = (np.log(1.0 / (_CROSSING_TAIL_FRACTION * target))
              / gamma_min)
@@ -1227,6 +1283,7 @@ def _fit_crossing_once(problem, pole_sign, relative_target, max_nodes):
     return np.asarray(times), np.asarray(weights), {
         "family": "crossing_fixed_time_fit",
         "requested_range": A_dim,
+        "fit_span": fit_A_dim,
         "node_count_source_range": source_range,
         "candidate_tolerance": float(relative_target),
         "eta_floor_ry": gamma_min,
@@ -1267,17 +1324,20 @@ def _factor_growth(spec, times, eta):
     green = float(np.max(np.real(
         -1.0j * (raw[:, None] - reference) * time_exec[None, :])))
     cells = []
-    interval = int(spec["pole_interval"])
+    pole_lo, pole_hi = map(float, spec["pole_bounds"])
     measure = spec["measure"]
     selected_poles = set(np.asarray(spec["pole_indices"]).tolist())
     for local, pole in enumerate(np.asarray(measure[5], np.int32)):
         if pole not in selected_poles:
             continue
-        intervals = (0, 1) if interval == -1 else (interval,)
-        for part in intervals:
+        for part in (0, 1):
             pole_cells = measure[3][local][part]
             if pole_cells is not None:
-                cells.append(np.asarray(pole_cells) + 1.0j * eta)
+                pole_cells = np.asarray(pole_cells)
+                keep = ((pole_cells.real > pole_lo)
+                        & (pole_cells.real <= pole_hi))
+                if np.any(keep):
+                    cells.append(pole_cells[keep] + 1.0j * eta)
     pole_values = np.concatenate(cells)
     screened = float(np.max(np.real(
         -1.0j * pole_values[:, None] * time_exec[None, :])))
@@ -1553,82 +1613,73 @@ def build_delivered_sigma_windows(
                 (raw_energy > state_lower) & (raw_energy <= state_upper))[0]
             if not selected_states.size:
                 continue
-            intervals = (0, 1) if pole_interval == -1 else (pole_interval,)
-            built = []
-            for interval in intervals:
-                product = _product_problem(
-                    selected_states, interval, measure, frequencies,
-                    pole_sign, int(lattice_bins))
-                if product is not None:
-                    built.append((interval, product))
-            if not built:
+            pole_bounds = (
+                (0.0, np.inf) if pole_interval == -1 else
+                ((0.0, split) if pole_interval == 0 else
+                 (split, np.inf)))
+            product = _product_problem(
+                selected_states, pole_bounds, measure, frequencies,
+                pole_sign, int(lattice_bins))
+            if product is None:
                 continue
-            # "bulk x all poles" is one product window even though its compact
-            # measure was reduced separately on the two pole intervals.
-            if len(built) == 2:
-                base_internal = np.concatenate(
-                    [row[1][0].internal_sums for row in built])
-                base_mass = np.concatenate(
-                    [row[1][0].cell_masses for row in built])
-                refined_internal = np.concatenate(
-                    [row[1][1].internal_sums for row in built])
-                refined_mass = np.concatenate(
-                    [row[1][1].cell_masses for row in built])
-                problem = ReciprocalMeasureProblem(
-                    frequencies=frequencies, internal_sums=base_internal,
-                    cell_masses=base_mass)
-                validation = ReciprocalMeasureProblem(
-                    frequencies=frequencies, internal_sums=refined_internal,
-                    cell_masses=refined_mass)
-                pole_indices = np.unique(np.concatenate(
-                    [row[1][2] for row in built])).astype(np.int32)
-                interval_code = -1
-            else:
-                interval_code, product = built[0]
-                problem, validation, pole_indices = product
-            key = f"{branch.tag}:{name}"
-            selected_raw = raw_energy[selected_states]
-            omega_patches = _crossing_omega_patches(problem, pole_sign)
-            for patch_number, omega_rows in enumerate(omega_patches, start=1):
-                patch_problem = ReciprocalMeasureProblem(
-                    frequencies=frequencies[omega_rows],
-                    internal_sums=problem.internal_sums,
-                    cell_masses=problem.cell_masses)
-                patch_validation = ReciprocalMeasureProblem(
-                    frequencies=frequencies[omega_rows],
-                    internal_sums=validation.internal_sums,
-                    cell_masses=validation.cell_masses)
-                envelope_by_frequency = (
-                    patch_problem.cell_masses[None, :]
-                    / np.abs(patch_problem.denominators)
-                ).sum(axis=1)
-                envelope = float(np.max(envelope_by_frequency))
-                patch_count = len(omega_patches)
-                patch_name = (key if patch_count == 1 else
-                              f"{key}[p{patch_number}/{patch_count}]")
+            problem, validation, _pole_indices = product
+            routes = _crossing_omega_patches(
+                problem, measure, selected_states, pole_bounds, pole_sign,
+                geometry["state_edge_ry"], int(lattice_bins))
+            patch_count = len(routes)
+            for patch_number, (omega_rows, routed_bounds) in enumerate(
+                    routes, start=1):
                 patch_positions = positions[omega_rows]
-                spec = {
-                    "name": patch_name, "branch": branch,
-                    "measure": measure, "problem": patch_problem,
-                    "validation": patch_validation,
-                    "kind": _window_kind(patch_problem),
-                    "pole_sign": pole_sign,
-                    "pole_interval": interval_code,
-                    "pole_indices": pole_indices,
-                    "state_positions": selected_states,
-                    "state_indices": np.asarray(measure[2])[selected_states],
-                    "raw_state_energy": selected_raw,
-                    "state_interval": (float(state_lower), float(state_upper)),
-                    "pole_bounds": ((0.0, np.inf) if interval_code == -1 else
-                                    ((0.0, split) if interval_code == 0 else
-                                     (split, np.inf))),
-                    "E_ref_A": float(np.min(selected_raw)),
-                    "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
-                    "omega_idx": patch_positions,
-                    "envelope": envelope, "branch_report": report,
-                }
-                specs.append(spec)
-                combined_envelope[patch_positions] += envelope_by_frequency
+                patch_frequencies = frequencies[omega_rows]
+                for cell_role, cell_bounds in routed_bounds:
+                    cell_product = (_product_problem(
+                        selected_states, cell_bounds, measure,
+                        patch_frequencies, pole_sign, int(lattice_bins)))
+                    if cell_product is None:
+                        continue
+                    cell_problem, cell_validation, pole_indices = cell_product
+                    cell_kind = _window_kind(cell_problem)
+                    if patch_count == 1:
+                        cell_name = f"{branch.tag}:{name}"
+                    else:
+                        label = (name if cell_role == "crossing" else
+                                 f"{name}:{cell_role}_flank")
+                        cell_name = (
+                            f"{branch.tag}:{label}"
+                            f"[p{patch_number}/{patch_count}]")
+                    envelope_by_frequency = (
+                        cell_problem.cell_masses[None, :]
+                        / np.abs(cell_problem.denominators)
+                    ).sum(axis=1)
+                    envelope = float(np.max(envelope_by_frequency))
+                    selected_raw = raw_energy[selected_states]
+                    E_ref = float(np.min(selected_raw))
+                    if patch_count > 1 and cell_kind != "crossing":
+                        _rotated, transform = _sign_definite_orientation(
+                            cell_problem)
+                        table_sign = (1.0 if transform.startswith("positive")
+                                      else -1.0)
+                        if pole_sign * table_sign > 0.0:
+                            E_ref = float(np.max(selected_raw))
+                    spec = {
+                        "name": cell_name, "branch": branch,
+                        "measure": measure, "problem": cell_problem,
+                        "validation": cell_validation,
+                        "kind": cell_kind, "pole_sign": pole_sign,
+                        "pole_interval": pole_interval,
+                        "pole_indices": pole_indices,
+                        "state_positions": selected_states,
+                        "state_indices": np.asarray(measure[2])[selected_states],
+                        "raw_state_energy": selected_raw,
+                        "state_interval": (float(state_lower), float(state_upper)),
+                        "pole_bounds": tuple(map(float, cell_bounds)),
+                        "E_ref_A": E_ref,
+                        "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
+                        "omega_idx": patch_positions,
+                        "envelope": envelope, "branch_report": report,
+                    }
+                    specs.append(spec)
+                    combined_envelope[patch_positions] += envelope_by_frequency
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
