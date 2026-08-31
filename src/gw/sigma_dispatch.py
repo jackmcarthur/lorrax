@@ -572,6 +572,7 @@ def compute_sigma_xc(
     omit_v_h: bool = False,
     iteration_head=None,
     occupation_state=None,
+    crossing_support_margin_ry: float = 0.0,
     print_fn: Callable = print,
 ) -> SigmaResult:
     """One-line entry point: build the full Σ_xc + V_H given the current
@@ -1093,6 +1094,7 @@ def compute_sigma_xc(
             efermi_ry=sigma_efermi_ry,
             occupation_state=occupation_state,
             regularization_width_ry=_xi.resolved_ry,
+            crossing_support_margin_ry=float(crossing_support_margin_ry),
             edge_factor=float(config.sigma.window_edge_factor),
             target_error=float(config.mpa.sigma_sector_target_error),
             crossing_target_error=float(

@@ -451,6 +451,10 @@ class SCState:
     # of H alone, which is what rCROP's trial/accept trajectory assumes.
     occupation_state: OccupationState | None = None  # full-BZ, padded PT head manifold
     head_surface_weight_kn: jax.Array | None = None  # Nk * tetrahedron delta(E-mu)
+    # Planner-only capacity margin, measured from the first map's protected
+    # max|dE| and then held fixed.  It changes how many ROQ basis vectors may
+    # be tried, never the physical map or its acceptance target.
+    crossing_support_margin_ry: float = 0.0
     outputs: SCOutputs | None = None
 
 
@@ -2846,6 +2850,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
+        crossing_support_margin_ry=float(
+            state.crossing_support_margin_ry),
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
@@ -3068,6 +3074,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         iteration=state.iteration + 1,
         occupation_state=entry_occ_state,
         head_surface_weight_kn=entry_surface_weight_kn,
+        crossing_support_margin_ry=float(
+            state.crossing_support_margin_ry),
         outputs=SCOutputs(
             sigma_result=sigma_result,
             # FULL-BZ U.  These two fields are consumed TOGETHER by
@@ -3678,11 +3686,22 @@ def _run_linear_mixing(
             iteration=state.iteration,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
+            crossing_support_margin_ry=
+            state.crossing_support_margin_ry,
         )
         map_input = state
         state_map = gw_iteration_map(map_input, inputs)
         E_candidate_ev = (
             np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
+        verdict = protected_band_convergence(
+            E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
+        support_margin_ry = float(state.crossing_support_margin_ry)
+        if it == 0 and support_margin_ry == 0.0:
+            support_margin_ry = verdict.max_abs_ev / RYD_TO_EV
+            print_fn(
+                "  SC crossing support drift margin: "
+                f"{verdict.max_abs_ev:.6f} eV from first-map max|dE|; "
+                "held fixed for later planner sizing")
         # Outputs, W and head all describe the MAP INPUT.  Record that exact
         # evaluated point before constructing an unevaluated mixed candidate.
         # This is the state returned on convergence or budget exhaustion.
@@ -3691,6 +3710,7 @@ def _run_linear_mixing(
             iteration=state_map.iteration,
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
+            crossing_support_margin_ry=support_margin_ry,
             outputs=state_map.outputs,
         )
         if mixing != 1.0:
@@ -3705,6 +3725,7 @@ def _run_linear_mixing(
             iteration=state_map.iteration,
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
+            crossing_support_margin_ry=support_margin_ry,
         )
         E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
         rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
@@ -3723,8 +3744,6 @@ def _run_linear_mixing(
         # break on ``rms < tol_ev`` -- an RMS over ALL active bands
         # including the scissored ones, both the looser test and a
         # different set.
-        verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
         print_fn(f"    SC convergence: {verdict.summary()}")
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
@@ -3927,6 +3946,7 @@ def _run_rcrop(
     _last_outputs: list = [None]
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
+    _support_margin_ry = [float(state_init.crossing_support_margin_ry)]
     _iter_idx = [0]
     rms_history: list[float] = []
     _protected = np.asarray(
@@ -3962,6 +3982,7 @@ def _run_rcrop(
             iteration=_iter_idx[0],
             occupation_state=_occ_state[0],
             head_surface_weight_kn=_head_surface_weight[0],
+            crossing_support_margin_ry=_support_margin_ry[0],
         )
         state_out = gw_iteration_map(state_in, inputs)
         _last_outputs[0] = state_out.outputs
@@ -3977,8 +3998,15 @@ def _run_rcrop(
         # difference can be driven small by damping while F still has no
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
+        call_index = _iter_idx[0]
         _verdict = protected_band_convergence(
             E_new, E_in, _protected, _in_range, tol_ev)
+        if call_index == 0 and _support_margin_ry[0] == 0.0:
+            _support_margin_ry[0] = _verdict.max_abs_ev / RYD_TO_EV
+            print_fn(
+                "  SC crossing support drift margin: "
+                f"{_verdict.max_abs_ev:.6f} eV from first-map max|dE|; "
+                "held fixed for later planner sizing")
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())
@@ -3990,8 +4018,6 @@ def _run_rcrop(
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
         )
-        call_index = _iter_idx[0]
-
         def _role_of(idx):
             return ("initial" if idx == 0 else
                     "trial" if idx % 2 else "accepted_input_map")
@@ -4023,6 +4049,7 @@ def _run_rcrop(
                         iteration=_iter_idx[0],
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
+                        crossing_support_margin_ry=_support_margin_ry[0],
                         outputs=state_out.outputs),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
@@ -4126,6 +4153,7 @@ def _run_rcrop(
         iteration=_iter_idx[0],
         occupation_state=_occ_state[0],
         head_surface_weight_kn=_head_surface_weight[0],
+        crossing_support_margin_ry=_support_margin_ry[0],
         outputs=_last_outputs[0],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)

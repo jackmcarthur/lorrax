@@ -385,6 +385,7 @@ def compute_sigma_c_mpa_omega_grid(
     omega_grid_ry,
     efermi_ry,
     regularization_width_ry,
+    crossing_support_margin_ry=0.0,
     edge_factor=1.5,
     target_error,
     crossing_target_error=None,
@@ -491,6 +492,8 @@ def compute_sigma_c_mpa_omega_grid(
                     # certified product-only receipts survive the deletion.
                     "max_direct_terms": 32,
                     "edge_factor": edge_factor,
+                    "crossing_support_margin_ry":
+                    float(crossing_support_margin_ry),
                     "pole_batch_size": pole_batch_size,
                 })
             cached = load_complete_delivered_sigma_plan(
@@ -536,6 +539,8 @@ def compute_sigma_c_mpa_omega_grid(
                     use_shipped_minimax_tables=True,
                     tau_grid_mode=tau_grid_mode,
                     edge_factor=edge_factor,
+                    crossing_support_margin_ry=
+                    float(crossing_support_margin_ry),
                     measures_by_branch=measures_by_branch, mesh_xy=mesh_xy,
                     plan_cache_path=delivered_cache_path,
                     plan_cache_request_fingerprint=request_fingerprint)
@@ -556,6 +561,8 @@ def compute_sigma_c_mpa_omega_grid(
                 f"{geometry['distinct_tau_count']} branch-distinct tau, "
                 f"crossing A_dim_max="
                 f"{geometry.get('crossing_A_dim_max', float('nan')):.3f}, "
+                f"drift margin="
+                f"{geometry.get('crossing_support_margin_ry', 0.0) * RYD_TO_EV:.6f} eV, "
                 f"plan {geometry['plan_seconds']:.3f} s")
             for branch in geometry["branches"]:
                 for window in branch["windows"]:

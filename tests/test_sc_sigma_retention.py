@@ -65,6 +65,7 @@ def _state_attrs(fn, var="state"):
 # head_surface_weight_kn is carried for continuity but never read here.
 _CARRY_KEYS = {
     "iteration", "H_qp_dft", "occupation_state",
+    "crossing_support_margin_ry",
 }
 
 # What a bare INPUT SCState is constructed with in the drivers: the read
@@ -181,6 +182,7 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
     assert final.outputs is payload
     assert final.occupation_state == "occupation-from-input-zero"
     assert final.head_surface_weight_kn == "surface-from-input-zero"
+    assert final.crossing_support_margin_ry == pytest.approx(2.0)
 
 
 def test_rcrop_early_stop_binds_outputs_to_the_accepted_map_input():

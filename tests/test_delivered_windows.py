@@ -280,6 +280,33 @@ def test_crossing_fallback_performs_one_fixed_time_fit(monkeypatch):
     assert np.all(times != 0.0)
 
 
+def test_crossing_rank_ceiling_includes_measured_first_step_drift():
+    """The SC drift is measured geometry, not a user-selectable dial."""
+    from minimax import roq_fit
+
+    eta = 0.25 / 27.211386245988
+    drift = 1.653059 / 27.211386245988
+    A_dim = 60.0
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([-A_dim * eta, A_dim * eta]),
+        internal_sums=np.asarray([-1.0j * eta]),
+        cell_masses=np.asarray([1.0]))
+    window = roq_fit.RoqWindow(
+        "SC crossing", problem, problem, 2.0e-3, "cond", sigma=1)
+
+    exact = roq_fit._planned_rank_ceiling(
+        (window,), support_margin=0.0, max_nodes=900)
+    padded = roq_fit._planned_rank_ceiling(
+        (window,), support_margin=drift, max_nodes=900)
+    planned_A = A_dim + drift / eta
+    expected = int(np.ceil(
+        roq_fit._LOOSE_RANK_SLOPE * planned_A
+        + roq_fit._LOOSE_RANK_INTERCEPT))
+
+    assert exact == 88
+    assert padded == expected == 97
+
+
 def _served_candidate(spec, *_args):
     evidence = {
         "family": ("crossing_hgl" if spec["kind"] == "crossing"

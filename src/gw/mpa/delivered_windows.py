@@ -57,7 +57,7 @@ AMPLIFICATION_NOISE_SAFETY = 0.05
 # default via the config default; it is a resource certificate, not an
 # accuracy dial (dial census 2026-08-31, DERIVE).
 MAX_WINDOW_TAU_PAIRS = 200
-_PLAN_CACHE_VERSION = 6
+_PLAN_CACHE_VERSION = 7
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -253,7 +253,8 @@ def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
         digest.update(repr((
             spec["name"], spec["kind"], float(spec["pole_sign"]),
             int(spec["pole_interval"]), branch.tag, branch.space,
-            bool(branch.neg_omega_half))).encode())
+            bool(branch.neg_omega_half),
+            float(spec.get("crossing_support_margin_ry", 0.0)))).encode())
         add_array((*spec["state_interval"], *spec["pole_bounds"],
                    spec["E_ref_A"], spec["envelope"]))
         for key in ("pole_indices", "state_indices", "raw_state_energy"):
@@ -1488,7 +1489,7 @@ def _factor_growth(spec, times, eta):
 
 def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
                             relative_target):
-    """Measure-adapted rule for ONE crossing window, or None to fall back.
+    """Measure-adapted rule for one crossing window.
 
     Node count is the runtime currency: one node is one FFT(G_w W_w).  The
     shipped path fits crossing windows on the real-time contour, which is
@@ -1505,23 +1506,30 @@ def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
     window = RoqWindow(
         name=spec["name"], fit=spec["problem"], validation=spec["validation"],
         target=float(relative_target), branch=spec["name"], sigma=int(sigma))
-    try:
-        plan = plan_measure_adapted_roq((window,), float(eta))
-    except (ValueError, RuntimeError, FloatingPointError, OverflowError,
-            np.linalg.LinAlgError):
-        return None
+    plan = plan_measure_adapted_roq(
+        (window,), float(eta),
+        support_margin=float(spec.get("crossing_support_margin_ry", 0.0)),
+        max_nodes=int(max_nodes))
     if len(plan.rules) != 1:
-        return None
+        raise RuntimeError(
+            f"measure-adapted ROQ returned {len(plan.rules)} rules for one "
+            "product window")
     rule = plan.rules[0]
     times = np.asarray(rule.times, np.complex128)
     weights = np.asarray(rule.weights, np.complex128)
     if not times.size or int(times.size) > int(max_nodes):
-        return None
+        raise RuntimeError(
+            f"measure-adapted ROQ returned {times.size} nodes, resource "
+            f"ceiling={int(max_nodes)}")
     metrics = _rule_metrics(spec["validation"], times, weights)
     factor = _factor_growth(spec, times, eta)
     if (not _rule_accepted(metrics, relative_target)
             or max(factor) > float(factor_growth_cap)):
-        return None
+        raise RuntimeError(
+            "measure-adapted ROQ failed the delivered gates: "
+            f"rank={rule.rank}, residual={metrics[0]:.6g}, "
+            f"amplification_p99={metrics[1]:.6g}, "
+            f"factor_growth={max(factor):.6g}")
     required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
                    / AMPLIFICATION_NOISE_SAFETY)
     return {
@@ -1534,7 +1542,9 @@ def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
             "family": "measure_adapted_roq",
             "candidate_tolerance": float(relative_target),
             "provenance": (f"measure-adapted ROQ, contour "
-                           f"{rule.angle_deg:.1f} deg, rank {rule.rank}"),
+                           f"{rule.angle_deg:.1f} deg, rank {rule.rank}, "
+                           "support margin "
+                           f"{float(spec.get('crossing_support_margin_ry', 0.0)):.6g} Ry"),
         },
     }
 
@@ -1682,12 +1692,17 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
                                 relative_target, *, adapted_only=False):
     """Return one window's rules and a cost split for planner evidence."""
     detail = {"adapted_fit_seconds": 0.0,
-              "shipped_fallback_seconds": 0.0}
+              "shipped_fallback_seconds": 0.0,
+              "adapted_refusal": None}
     adapted = None
     if spec["kind"] == "crossing":
         started = time.perf_counter()
-        adapted = _roq_crossing_candidate(
-            spec, eta, max_nodes, factor_growth_cap, relative_target)
+        try:
+            adapted = _roq_crossing_candidate(
+                spec, eta, max_nodes, factor_growth_cap, relative_target)
+        except (ValueError, RuntimeError, FloatingPointError, OverflowError,
+                np.linalg.LinAlgError) as exc:
+            detail["adapted_refusal"] = str(exc)
         detail["adapted_fit_seconds"] = time.perf_counter() - started
     if adapted is not None and adapted_only:
         # First pass: the cheap rule alone.  Fitting the shipped crossing
@@ -1701,8 +1716,12 @@ def _window_candidates_profiled(spec, eta, max_nodes, factor_growth_cap,
         shipped = _candidate_rules(
             spec, eta, max_nodes, factor_growth_cap, relative_target)
     except (RuntimeError, ValueError, FloatingPointError, OverflowError,
-            np.linalg.LinAlgError):
+            np.linalg.LinAlgError) as exc:
         if adapted is None:
+            if detail["adapted_refusal"] is not None:
+                raise RuntimeError(
+                    f"{detail['adapted_refusal']}; shipped fallback: "
+                    f"{exc}") from exc
             raise
         shipped = []
     finally:
@@ -1879,6 +1898,7 @@ def build_delivered_sigma_windows(
     envelope_error_safety: float = ENVELOPE_ERROR_SAFETY,
     factor_growth_cap: float = FACTOR_GROWTH_CAP,
     edge_factor: float = 1.5,
+    crossing_support_margin_ry: float = 0.0,
     crossing_eps_q: float = 1.0e-3,
     use_shipped_minimax_tables: bool = True,
     pane_times: tuple = (),
@@ -1898,6 +1918,7 @@ def build_delivered_sigma_windows(
     target = float(envelope_relative_target)
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
+    support_margin = float(crossing_support_margin_ry)
     pair_ceiling = int(max_nodes)
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
@@ -1909,6 +1930,9 @@ def build_delivered_sigma_windows(
         raise ValueError("envelope_error_safety must lie in (0,1]")
     if pair_ceiling < 1:
         raise ValueError("max_nodes must permit at least one pair")
+    if not np.isfinite(support_margin) or support_margin < 0.0:
+        raise ValueError(
+            "crossing_support_margin_ry must be finite and nonnegative")
     if not np.isclose(float(crossing_eps_q), _CROSSING_EPS_Q,
                       rtol=0.0, atol=1.0e-15):
         raise ValueError(
@@ -2053,6 +2077,7 @@ def build_delivered_sigma_windows(
                         "omega_abs": np.asarray(branch.omega_abs)[omega_rows],
                         "omega_idx": patch_positions,
                         "envelope": envelope, "branch_report": report,
+                        "crossing_support_margin_ry": support_margin,
                     }
                     specs.append(spec)
                     combined_envelope[patch_positions] += envelope_by_frequency
@@ -2322,6 +2347,7 @@ def build_delivered_sigma_windows(
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
+        "crossing_support_margin_ry": support_margin,
         "crossing_A_dim_max": max(
             (float(window["crossing_A_dim"])
              for branch in branch_reports

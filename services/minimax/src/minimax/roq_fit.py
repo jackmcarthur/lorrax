@@ -71,6 +71,18 @@ _MIN_RANK = 6
 _MAX_RANK = 64
 _FINAL_BASE_NODES = 192
 
+# The controlled crossing scaling study (claim 528, 2026-08-31) measured
+# worst-seed ranks N = 1.464*A - 0.534 at 1e-3 and
+# N = 2.024*A - 0.058 at 1e-4, with R^2 = 0.9963/0.9983.  They replace the
+# old fixed rank-64 ceiling once a crossing support grows beyond its DFT
+# size.  The caller supplies a measured energy-drift margin; it is geometry,
+# not a user tolerance or a new planner dial.
+_LOOSE_RANK_SLOPE = 1.464
+_LOOSE_RANK_INTERCEPT = -0.534
+_TIGHT_RANK_SLOPE = 2.024
+_TIGHT_RANK_INTERCEPT = -0.058
+_RANK_LAW_TARGET_BREAK = 1.0e-3
+
 # The ROQ study used horizons 260/85/27 Ry^-1 for the Na resonant/tail/valence
 # groups.  Five inverse low-percentile energy scales reproduces 249/83/31 on
 # the frozen measures.  The 0.01% quantile ignores only negligible delivered
@@ -505,9 +517,12 @@ def _product_group_seed(windows, eta: float):
 
 def _fit_production_rank(group: RoqGroup, target: float,
                          windows: tuple[str, ...],
-                         angle_probe: RoqRule) -> RoqRule:
+                         angle_probe: RoqRule,
+                         rank_ceiling: int) -> RoqRule:
     """Bracket from the angle probe, test one midpoint, and fully refit."""
-    prepared = _prepare_subspace(group, _FINAL_BASE_NODES, _MAX_RANK)
+    rank_ceiling = max(_MIN_RANK, int(rank_ceiling))
+    base_nodes = max(_FINAL_BASE_NODES, 3 * rank_ceiling)
+    prepared = _prepare_subspace(group, base_nodes, rank_ceiling)
     cache = {}
 
     def quick(rank: int) -> RoqRule:
@@ -522,21 +537,23 @@ def _fit_production_rank(group: RoqGroup, target: float,
     upper = _ANGLE_PROBE_RANK
     if not angle_probe.target_met or not quick(upper).target_met:
         lower = upper
-        for candidate in (18, 27, 40, 60, _MAX_RANK):
+        for candidate in dict.fromkeys((18, 27, 40, 60, rank_ceiling)):
+            if candidate > rank_ceiling:
+                continue
             upper = candidate
             if quick(upper).target_met:
                 break
             lower = upper
         else:
             return _fit_prepared(
-                group, prepared, _MAX_RANK, target=target, windows=windows,
+                group, prepared, rank_ceiling, target=target, windows=windows,
                 evaluations=len(cache))
     midpoint = (lower + upper) // 2
     if lower < midpoint < upper and quick(midpoint).target_met:
         upper = midpoint
 
     best = None
-    for rank in range(upper, min(_MAX_RANK, upper + 3) + 1):
+    for rank in range(upper, min(rank_ceiling, upper + 3) + 1):
         final = _fit_prepared(
             group, prepared, rank, target=target, windows=windows,
             evaluations=len(cache))
@@ -547,7 +564,7 @@ def _fit_production_rank(group: RoqGroup, target: float,
     return best
 
 
-def _fit_product_groups(subsets, eta: float):
+def _fit_product_groups(subsets, eta: float, rank_ceiling: int):
     """Fit independent product groups through one bounded CPU work pool."""
     records = []
     for key, windows in subsets.items():
@@ -584,17 +601,20 @@ def _fit_product_groups(subsets, eta: float):
                 selected[record[0]][0],
                 _fit_production_rank(
                     selected[record[0]][0], record[2], record[3],
-                    selected[record[0]][1])),
+                    selected[record[0]][1], rank_ceiling)),
             records))
     return {key: (group, rule) for key, group, rule in fitted}
 
 
-def _fit_product_group(windows, eta: float) -> tuple[RoqGroup, RoqRule]:
+def _fit_product_group(windows, eta: float,
+                       rank_ceiling: int = _MAX_RANK
+                       ) -> tuple[RoqGroup, RoqRule]:
     """Derive contour and rank for one product group."""
-    return _fit_product_groups({(0,): tuple(windows)}, eta)[(0,)]
+    return _fit_product_groups(
+        {(0,): tuple(windows)}, eta, rank_ceiling)[(0,)]
 
 
-def _try_whole_below(windows, eta: float, node_cap: int):
+def _try_whole_below(windows, eta: float, node_cap: int, rank_ceiling: int):
     """Test a whole-branch rule only where it can beat the fallback."""
     seed, target, names = _product_group_seed(windows, eta)
     angles = tuple(angle for angle in _ANGLE_SCAN_DEG if angle < 0.0
@@ -612,7 +632,7 @@ def _try_whole_below(windows, eta: float, node_cap: int):
     group, _ = min(probes, key=lambda item: (
         item[1].max_error, item[1].kappa_p99,
         _ANGLE_SCAN_DEG.index(item[0].angle_deg)))
-    cap = max(_MIN_RANK, min(int(node_cap), _MAX_RANK))
+    cap = max(_MIN_RANK, min(int(node_cap), int(rank_ceiling)))
     base_nodes = max(_ANGLE_BASE_NODES, 3 * cap)
     prepared = _prepare_subspace(group, base_nodes, cap)
     cap_rule = _fit_prepared(group, prepared, cap, target=target,
@@ -654,7 +674,35 @@ def _branch_evidence(branch: str, strategy: str, windows, groups,
     return evidence
 
 
-def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
+def _planned_rank_ceiling(windows, support_margin: float,
+                          max_nodes: int) -> int:
+    """Size the ROQ basis from measured support plus measured drift.
+
+    ``support_margin`` has the same energy unit as each denominator.  The
+    dimensionless planning radius is ``(max|Re d| + margin) / min|Im d|``.
+    The production scaling laws above turn that radius into a rank ceiling;
+    ``max_nodes`` remains only the caller's resource certificate.
+    """
+    estimates = []
+    for window in windows:
+        denominator = np.asarray(window.validation.denominators)
+        gamma_min = float(np.min(np.abs(denominator.imag)))
+        if not gamma_min > 0.0:
+            raise ValueError(
+                f"window {window.name!r} has no damped support")
+        A_dim = ((float(np.max(np.abs(denominator.real)))
+                  + float(support_margin)) / gamma_min)
+        if float(window.target) <= _RANK_LAW_TARGET_BREAK:
+            slope, intercept = _TIGHT_RANK_SLOPE, _TIGHT_RANK_INTERCEPT
+        else:
+            slope, intercept = _LOOSE_RANK_SLOPE, _LOOSE_RANK_INTERCEPT
+        estimates.append(int(np.ceil(slope * A_dim + intercept)))
+    return max(_MIN_RANK, min(int(max_nodes), max(_MAX_RANK, *estimates)))
+
+
+def plan_measure_adapted_roq(windows, eta: float, *,
+                             support_margin: float = 0.0,
+                             max_nodes: int = _MAX_RANK) -> RoqPlan:
     """Build the smallest validated product-window ROQ plan.
 
     Parameters
@@ -665,6 +713,12 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
     eta
         Physical broadening in the same energy unit as the measures.  It is
         the only contour-scale input; angle, horizon, and rank are derived.
+    support_margin
+        Energy displacement measured by the self-consistent caller after its
+        first map.  It sizes the basis for support drift but never changes the
+        fit or validation measure.  Zero preserves one-shot planning.
+    max_nodes
+        Resource ceiling supplied by the caller, not an accuracy dial.
 
     Returns
     -------
@@ -680,10 +734,16 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
         raise ValueError("ROQ planning needs at least one product window")
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("eta must be positive and finite")
+    if not np.isfinite(support_margin) or support_margin < 0.0:
+        raise ValueError("support_margin must be finite and nonnegative")
+    if int(max_nodes) < 1:
+        raise ValueError("max_nodes must be positive")
     for window in windows:
         if not np.isfinite(window.target) or window.target <= 0.0:
             raise ValueError(f"window {window.name!r} needs a positive target")
 
+    rank_ceiling = _planned_rank_ceiling(
+        windows, float(support_margin), int(max_nodes))
     by_branch = {}
     for window in windows:
         by_branch.setdefault(window.branch, []).append(window)
@@ -706,7 +766,7 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
 
     partition_seconds = time.perf_counter() - partition_started
     fit_started = time.perf_counter()
-    group_cache = _fit_product_groups(initial_subsets, eta)
+    group_cache = _fit_product_groups(initial_subsets, eta, rank_ceiling)
     fit_seconds = time.perf_counter() - fit_started
     selected_rules = []
     evidence_rows = []
@@ -725,9 +785,10 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
             candidates.append((row, tuple(rules)))
 
         if partition != (all_indices,):
-            cap = (row.node_count - 1) if row is not None else _MAX_RANK
+            cap = (row.node_count - 1) if row is not None else rank_ceiling
             consolidation_started = time.perf_counter()
-            whole = _try_whole_below(branch_windows, eta, cap)
+            whole = _try_whole_below(
+                branch_windows, eta, cap, rank_ceiling)
             consolidation_seconds += (
                 time.perf_counter() - consolidation_started)
             if whole is not None:
@@ -749,7 +810,8 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
                 if (branch, indices) not in group_cache}
             if missing:
                 fallback_started = time.perf_counter()
-                group_cache.update(_fit_product_groups(missing, eta))
+                group_cache.update(_fit_product_groups(
+                    missing, eta, rank_ceiling))
                 fallback_seconds += time.perf_counter() - fallback_started
             groups = [group_cache[(branch, indices)][0]
                       for indices in partition]
@@ -760,9 +822,14 @@ def plan_measure_adapted_roq(windows, eta: float) -> RoqPlan:
             if row is not None:
                 candidates.append((row, tuple(rules)))
         if not candidates:
+            attempts = "; ".join(
+                f"{rule.group}: rank={rule.rank}/{rank_ceiling}, "
+                f"residual={rule.max_error:.6g}, "
+                f"amplification_p99={rule.kappa_p99:.6g}"
+                for rule in rules)
             raise RuntimeError(
                 f"branch {branch!r}: no product-window ROQ plan meets the "
-                "refined delivered-error and noise gates")
+                "refined delivered-error and noise gates; " + attempts)
         row, rules = min(candidates, key=lambda item: (
             item[0].node_count, item[0].max_error, item[0].strategy))
         selected_rules.extend(rules)
