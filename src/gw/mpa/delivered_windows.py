@@ -211,6 +211,29 @@ def _planner_rows_profile(rows):
     }
 
 
+def _derived_pair_ceiling(specs, eta):
+    """Bound the plan at ~2x its worst-case honest cost, derived not dialled.
+
+    A crossing window needs about one node per ``eta`` of crossing bandwidth
+    (``2A/eta`` for radius ``A``; see docs/theory/sigma-quadrature-problem.md
+    section 7), and a sign-definite window a logarithmic count that is 8-12 in
+    practice — 20 is a generous stand-in.  Doubling the sum leaves a healthy
+    plan untouched while still catching a pathological fit that would otherwise
+    run away.  This replaces the deck's ``mpa_sigma_max_nodes``: a user should
+    not have to guess a resource ceiling the supports already determine.
+    """
+    total = 0.0
+    for spec in specs:
+        if spec["kind"] == "crossing":
+            d = np.asarray(spec["problem"].denominators)
+            radius = float(np.max(np.abs(d.real)))
+            width = float(np.min(np.abs(d.imag)))
+            total += 2.0 * radius / max(width, float(eta))
+        else:
+            total += 20.0
+    return max(int(np.ceil(2.0 * total)), 32)
+
+
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
                             pair_ceiling, grid_mode, lattice_bins):
     """Hash the measured numerical problems that determine fitted rules."""
@@ -1896,7 +1919,7 @@ def build_delivered_sigma_windows(
     target = float(envelope_relative_target)
     safety = float(envelope_error_safety)
     factor_cap = float(factor_growth_cap)
-    pair_ceiling = int(max_nodes)
+    pair_ceiling = int(max_nodes) if max_nodes is not None else 0
     grid_mode = str(tau_grid_mode).strip().lower()
     if (omega_grid.ndim != 1 or not omega_grid.size
             or not np.all(np.isfinite(omega_grid))):
@@ -2058,6 +2081,13 @@ def build_delivered_sigma_windows(
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
     window_geometry_seconds = time.perf_counter() - window_geometry_started
+
+    # The ceiling is derived from the measured supports, not taken from the
+    # deck: max_nodes is retained only as an optional hard cap for callers who
+    # want one.
+    derived_ceiling = _derived_pair_ceiling(specs, eta)
+    pair_ceiling = (min(derived_ceiling, int(max_nodes))
+                    if max_nodes is not None else derived_ceiling)
 
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
