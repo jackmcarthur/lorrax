@@ -1414,6 +1414,12 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
                and abs(entry.eps_q - _CROSSING_EPS_Q) <= 1.0e-12]
     if not entries:
         raise RuntimeError("the shipped HGL family is empty")
+    # Keyed to the CATALOG deliberately, not to the wider reach of the
+    # measure-adapted fitter.  Splitting is cost-neutral in nodes -- the law is
+    # linear in A, so one window at A and two patches at A/2 both cost about
+    # 2.02*A/gamma -- but a patch inside the catalog is an instant lookup where
+    # a wide one is a ~150 s fit.  Split for the cheap server, not the capable
+    # one.
     widest_span = max(float(entry.range_max) for entry in entries)
     if (_window_kind(problem) != "crossing"
             or _crossing_geometry(problem, pole_sign)[2]
@@ -1455,14 +1461,10 @@ def _crossing_omega_patches(problem, measure, state_positions, pole_bounds,
             planned.append((patch, tuple(cells)))
         if len(planned) == len(patches):
             return tuple(planned)
-    # No patch split brings this support inside the shipped catalog. That used
-    # to raise, which let the CATALOG's reach veto a geometry the on-demand
-    # fitter can serve: crossing windows are served by the measure-adapted ROQ
-    # path, which is not catalog-bounded and is measured good to A/eta = 105
-    # (residual 8.7e-5, kappa 28.4 on the sodium measure at +-15 eV), while the
-    # widest shipped HGL span is A = 60. Hand back the unpatched window and let
-    # the fit decide on measurement; if the ROQ path also declines, the normal
-    # candidate refusal reports it with real numbers instead of this guess.
+    # Even one omega row per patch leaves a support wider than the fitter
+    # serves.  Hand back the unpatched window rather than raising: the
+    # candidate refusal downstream reports the real residual and kappa, which
+    # is a usable diagnostic, where raising here only names this guard.
     return ((omega_rows, (("identity", tuple(map(float, pole_bounds))),)),)
 
 
