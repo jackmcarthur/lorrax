@@ -68,4 +68,7 @@ thresholds.  The source-tree issue register is `KNOWN_LORRAX_ISSUES.md`.
   and the convergence verdict evaluated the same 12 bands.  A second frozen
   fit correctly refused because its occupation hash described a different
   state; the live follow-up independently reproduced THR-001's collapsed
-  `target=1e-18`, `log(R)=29.5592` request before entering the map.
+  `target=1e-18`, `log(R)=29.5592` request.  It was still inside that planner
+  after **10:12**, so it was stopped before an unmet rule could contaminate the
+  shared home cache.  Thus the static metallic planner does not meet the
+  owner's `<5 s` requirement; THR-001 remains landing-blocking.
