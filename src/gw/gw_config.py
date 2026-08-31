@@ -2174,26 +2174,6 @@ _DEFAULTS = {
     # stamped into sigma_mnk.h5 beside the requested value.
     "sigma_regularization_floor_ev": "auto",
     "sigma_window_edge_factor": 1.5,
-    # Σ_c(ω,k,m,n) end-of-stage layout (wk_REL ω-cube sharding workstream):
-    #   "replicated" (default) — today's path: the per-rank (m_X, n_Y) host
-    #       tiles are gathered into the FULL cube on EVERY rank
-    #       (n_ω·nk·nb²·16 B replicated; 2751 MB/rank at nb=512).
-    #   "sharded" — the tiles stay where the stacked psum_scatter left them
-    #       on the existing 2-D mesh; consumers (head injection, diag/eqp
-    #       interpolation, QSGW build, sigma_mnk.h5 SlabIO write) read the
-    #       P(None,None,'x','y')-sharded cube directly.  Outputs are
-    #       bit-identical to "replicated" (movement-only; A/B gated by
-    #       tests/multi_device/sigma_omega_layout_ab.py under BOTH
-    #       one_shot_dft and self_consistent).
-    #       Refusal (at driver resolve time, never mid-run): an
-    #       indivisible σ band window.  The second refusal here used to be
-    #       slab_io=h5py_allgather at P>1; that tier no longer exists
-    #       (2026-08-06), so the condition cannot arise.  There is no
-    #       qp_solver refusal: the SC loop never rotates the cube (it is
-    #       absent from the finalize `replace` at sc_iteration.py:1321),
-    #       so there is no rotation seam to port, and the two layouts
-    #       measure bit-identical under SC (jobs 7889782/7889789).
-    "sigma_omega_layout": "replicated",
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
     # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
@@ -2389,7 +2369,7 @@ _NORMALIZE_STR = {
     "wcoul0_source", "head_correction", "screening_method",
     "screening_diagrams",
     "minimax_energy_reference",
-    "sigma_omega_layout", "fermi_reference",
+    "fermi_reference",
     "band_extrapolation_estimator",
     "band_extrapolation_bracket_scheme",
     "occ_smearing_family",
@@ -3974,7 +3954,6 @@ class DynamicSigmaConfig:
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
-    omega_layout: str
     fermi_reference: str
     sigma_at_dft_extrapolate: bool
     sigma_at_dft_energies: bool
@@ -4033,9 +4012,6 @@ class DynamicSigmaConfig:
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
-        if self.omega_layout not in ("replicated", "sharded"):
-            raise ValueError(
-                "sigma_omega_layout must be 'replicated' or 'sharded'.")
         # 'auto' or a non-negative float in eV.  A TYPO must refuse here,
         # not resolve to 'auto' -- a floor key that silently defaults is the
         # confound the key was added to remove.
@@ -4505,11 +4481,6 @@ def _validate_occupation_smearing(mpa, sigma, screening, family, width_ry):
                 f"mp1_fixed_n (got {sigma.fermi_reference!r}): the metallic "
                 "Sigma measures energies against the fixed-N MP1 chemical "
                 "potential, not a gap-derived reference.")
-        if sigma.omega_layout != "sharded":
-            raise ValueError(
-                "mpa_material_class = metal requires sigma_omega_layout = "
-                f"sharded (got {sigma.omega_layout!r}): the MPA Sigma "
-                "emits the mesh-sharded omega cube only.")
     else:
         if family is not None or width_ry is not None:
             raise ValueError(
@@ -4590,7 +4561,7 @@ class LorraxConfig:
         config.compute_mode           # -> ComputeMode enum
         config.head.wcoul0_source     # head plumbing
         config.ppm.omega_p            # PPM probe ω
-        config.sigma.omega_layout     # shared dynamic-Sigma output policy
+        config.sigma.omega_grid_ev    # shared dynamic-Sigma frequency grid
         config.debug.sigma_freq_debug_output
 
     See module docstring for the full grouping.  ``cohsex.in`` keys
@@ -5171,30 +5142,12 @@ class LorraxConfig:
             occupation_window_threshold=float(
                 _g("occupation_window_threshold")),
         )
-        _eqp2_enabled = bool(_g("write_eqp2"))
-        _sigma_omega_layout = str(
-            _g("sigma_omega_layout")).strip().lower()
-        if _eqp2_enabled and _sigma_omega_layout != "sharded":
-            if "sigma_omega_layout" in _named_keys:
-                raise ValueError(
-                    "write_eqp2=true requires sigma_omega_layout=sharded; "
-                    "the full Sigma(omega,k,m,n) cube is the fixed operand "
-                    "of every eqp2 iteration and may not be replicated on "
-                    "each rank.  Set sigma_omega_layout=sharded or disable "
-                    "write_eqp2.")
-            _sigma_omega_layout = "sharded"
-            print_fn(
-                "  [config provenance] write_eqp2=true: resolving the "
-                "unnamed sigma_omega_layout default replicated -> sharded; "
-                "the fixed full Sigma(omega) cube stays distributed through "
-                "every eigenvalue-consistency iteration.")
         sigma = DynamicSigmaConfig(
             omega_min_ev=float(_g("sigma_omega_min_ev")),
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
-            omega_layout=_sigma_omega_layout,
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             regularization_floor_ev=_g("sigma_regularization_floor_ev"),
             sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),

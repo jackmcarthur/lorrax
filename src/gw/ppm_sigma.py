@@ -1599,24 +1599,16 @@ def compute_sigma_c_ppm_omega_grid(
     # 2751 MB/rank at nb=512) is elided, and every consumer reads the tiles
     # at their native sharding.  Movement-only: outputs are bit-identical
     # (A/B gated).  Announced here per doctrine 3.
-    sharded_layout = (str(sigma_cfg.omega_layout) == "sharded")
-    if sharded_layout:
-        # ONE owner for this precondition; the MPA executor calls the same
-        # function (doctrine 3 / pattern #6 -- refuse with the fix named,
-        # never fall back silently).
-        assert_sharded_sigma_window_divides_mesh(
-            nb_proj, mesh_xy, ansatz=ansatz_name)
-        print_fn(
-            "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
-            "the existing mesh; the end-of-stage full-cube replication "
-            f"gather ({kij_bytes / 1e6:.2f} MB/rank) is ELIDED "
-            "(sigma_omega_layout=sharded).")
-
-    sigma_kij_host = (
-        None if sharded_layout
-        else np.zeros((n_brk, n_omega, nk_proj, nb_proj, nb_proj),
-                      dtype=np.complex128)
-    )
+    # ONE owner for this precondition; the MPA executor calls the same
+    # function. Every dynamic Sigma cube is sharded unconditionally.
+    assert_sharded_sigma_window_divides_mesh(
+        nb_proj, mesh_xy, ansatz=ansatz_name)
+    print_fn(
+        "  Σc layout: sharded — Σ_c(ω,k,m,n) stays (m_X, n_Y)-tiled on "
+        "the existing mesh; the end-of-stage full-cube replication "
+        f"gather ({kij_bytes / 1e6:.2f} MB/rank) is ELIDED.")
+    sharded_layout = True
+    sigma_kij_host = None
 
     common_branch_kwargs = dict(
         B_q=B_corr,

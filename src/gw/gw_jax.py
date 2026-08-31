@@ -425,45 +425,7 @@ def main(argv=None):
 	_p_x = int(mesh_xy.devices.shape[0])
 	_p_y = int(mesh_xy.devices.shape[1])
 	_nbs = int(meta.nb_sigma)
-	_wants_sharded_cube = (
-		config.sigma.omega_layout == "sharded"
-		or getattr(mode, "value", str(mode)) == "mpa")
-	if (mode.is_dynamic
-			and not _wants_sharded_cube
-			and int(RUNTIME.process_count) > 1):
-		# The cube is an additional late-stage BFC producer, after the memory
-		# planners have spent their stage budgets.  Price it against the
-		# canonical retained headroom rather than a GPU-model-specific byte
-		# constant.  This leaves the same 10% reserve on a 40- or 80-GB lane;
-		# JID 57638248.29 crossed it at 4.28 GiB against a 35-GB deck budget.
-		from common.gpu_utils import bfc_fragmentation_target_utilization
-		_headroom_fraction = (
-			1.0 - bfc_fragmentation_target_utilization(width_factor=1))
-		_budget_bytes = float(config.memory.per_device_gb) * 1.0e9
-		_replicated_cap_bytes = int(_headroom_fraction * _budget_bytes)
-		_nw = int(np.asarray(config.sigma.omega_grid_ev).size)
-		_nk = int(meta.nk_tot)
-		_cube_bytes = _nw * _nk * _nbs * _nbs * np.dtype(np.complex128).itemsize
-		if _cube_bytes > _replicated_cap_bytes:
-			_mesh_multiple = int(np.lcm(_p_x, _p_y))
-			_next_nb = -(-_nbs // _mesh_multiple) * _mesh_multiple
-			raise ValueError(
-				f"compute_mode = {getattr(mode, 'value', mode)}: "
-				f"sigma_omega_layout = replicated would create "
-				f"complex128 Sigma_c[{_nw},{_nk},{_nbs},{_nbs}] = "
-				f"{_cube_bytes / 2**30:.2f} GiB on every one of "
-				f"{int(RUNTIME.process_count)} ranks, above the "
-				f"{_replicated_cap_bytes / 2**30:.2f}-GiB retained headroom "
-				f"({_headroom_fraction:.0%} of the "
-				f"{float(config.memory.per_device_gb):.1f}-GB/device budget).  "
-				f"The output expressions "
-				f"must materialize that lazy producer after the physics kernels; "
-				f"SlabIO can bound file slabs but cannot bound the producer.  Set "
-				f"sigma_omega_layout = sharded and choose nval+ncond divisible "
-				f"by both mesh axes.  On this {_p_x}x{_p_y} mesh the next "
-				f"compatible window is {_next_nb} bands.  The driver will not "
-				f"silently change an explicit layout or band window.")
-	if mode.is_dynamic and _wants_sharded_cube:
+	if mode.is_dynamic:
 		from .ppm_sigma import assert_sharded_sigma_window_divides_mesh
 		assert_sharded_sigma_window_divides_mesh(
 			_nbs, mesh_xy,
@@ -475,7 +437,7 @@ def main(argv=None):
 		# ``jax.process_count()`` raw instead of the launcher-aware count,
 		# so it was also the weakest.  Nothing can select that writer now.
 		print0(
-			f"  sigma_omega_layout = sharded: Σ_c(ω,k,m,n) stays "
+			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
 			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh end-to-end "
 			f"(consumers read tiles; no full-cube replication).")
 
