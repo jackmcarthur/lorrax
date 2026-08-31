@@ -43,7 +43,8 @@ def _accumulate_subspace_density_matrix(
                  * jnp.conj(psi_n[None, :, ...]))
         return D + include * outer, None
 
-    return jax.lax.scan(add_state, density_matrix, (psi_r, mask))[0]
+    return jax.lax.scan(
+        add_state, density_matrix, (psi_r, mask), unroll=1)[0]
 
 
 @jax.jit
