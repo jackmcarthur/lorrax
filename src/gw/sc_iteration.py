@@ -575,35 +575,46 @@ def _solve_occupation_state(
     legitimately need it: the map input (chi/head/Sigma) and F(H)'s candidate
     output (the no-lag valence anchor).
     """
-    # ``occ_broadening`` is the DIAL (0 ⇒ step occupations, historical path
-    # untouched); ``config.occ_broadening_ry`` is the WIDTH.  They are the
-    # same key on an insulating deck and cross-checked on a metal one.
+    # ``occ_broadening`` is the head DIAL (0 means the historical insulating
+    # path).  A declared MPA metal still needs the fixed-N state when the
+    # head is off: chi, Sigma and the Fermi reference consume it.  The
+    # physical WIDTH is the single ``config.occ_broadening_ry`` value.
     width_ev = float(inputs.config.screening.occ_broadening_ev)
     pt = getattr(inputs, "parallel_transport", None)
-    if width_ev == 0.0 or pt is None:
+    metal = _material_class(inputs) == "metal"
+    if not metal and (width_ev == 0.0 or pt is None):
         return None
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if energies.ndim != 2:
         raise ValueError(
             f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
-    nb_logical = int(pt.nb_logical)
-    # The velocity is the one large dataset BOTH head modes carry; the
-    # finite links are absent under sc_head_update = dft_velocity.  They are
-    # written with identical shape, so the storage width is unchanged.
-    nb_storage = int(pt.velocity_dft_cart.shape[-1])
+    if pt is None:
+        # Head-off MPA metal: the current DFT/QP energy ladder is already the
+        # canonical body carrier.  No padding or velocity-storage width
+        # exists, so solve every band in that ladder directly.
+        nb_logical = int(energies.shape[1])
+        nb_storage = nb_logical
+    else:
+        nb_logical = int(pt.nb_logical)
+        # The velocity is the one large dataset BOTH head modes carry; the
+        # finite links are absent under sc_head_update = dft_velocity.  They
+        # are written with identical shape, so the storage width is unchanged.
+        nb_storage = int(pt.velocity_dft_cart.shape[-1])
     if not (0 < nb_logical <= nb_storage <= int(energies.shape[1])):
         raise ValueError(
             "QSGW head occupation manifold must satisfy 0 < logical <= "
             f"storage <= energy bands; got {nb_logical}, {nb_storage}, "
             f"{energies.shape[1]}.")
 
-    from psp.get_DFT_mtxels import spin_degeneracy_factor
     from .efermi import assert_fixed_n, solve_mp1_occupations
 
     nk = int(energies.shape[0])
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
-    capacity = float(spin_degeneracy_factor(inputs.wfn))
+    # WfnLoader owns this value.  Importing the full pseudopotential CLI only
+    # to read the same attribute pulled XML parser dependencies into the SC
+    # map and obscured that this is immutable WFN provenance.
+    capacity = float(inputs.wfn.occupation_state_capacity)
     target_electrons = float(inputs.wfn.num_electrons)
     width_ry = inputs.config.occ_broadening_ry
     mu_ry, occ_logical = solve_mp1_occupations(
@@ -644,6 +655,11 @@ def _solve_head_occupations(
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     pt = inputs.parallel_transport
+    if pt is None:
+        # A head-off MPA metal still needs the occupation state for chi,
+        # Sigma and its fixed-N Fermi reference.  It has no velocity carrier
+        # and therefore no Drude surface table to construct.
+        return occ_state, None
     nb_logical = int(pt.nb_logical)
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
     nk = int(energies.shape[0])
@@ -1055,50 +1071,121 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
     return device_put_process_local(x, sh)
 
 
-_FIXED_SIGMA_ROTATE_CACHE: dict[tuple[int, tuple[int, ...]], Callable] = {}
+_SIGMA_OMEGA_ROTATE_CACHE: dict[
+    tuple[int, tuple[int, ...], bool, bool], Callable] = {}
 
 
-def _rotate_fixed_sigma_cube_to_qp(
-    sigma_c_omega_dft_ry: jax.Array,
+def _rotate_sigma_omega_cube(
+    sigma_c_omega_ry: jax.Array,
     U_dft_to_qp: jax.Array,
     *,
     mesh: Mesh,
+    to_qp: bool,
 ) -> jax.Array:
-    """Rotate every frequency slice ``U^dagger Sigma_c(omega) U``.
+    """Rotate every frequency row of a correlation-operator cube.
 
-    The frequency axis is scanned rather than folded into an extra batch
-    axis of one giant contraction.  Therefore the required output cube stays
-    ``P(None,None,'x','y')`` and the transient rotation holds only one
-    ``(nk,nb,nb)`` frequency slice.  In particular, no rank materializes the
-    full ``(nomega,nk,nb,nb)`` cube.
+    ``to_qp=True`` computes ``U^dagger Sigma_DFT(omega) U``;
+    ``to_qp=False`` computes ``U Sigma_QP(omega) U^dagger``.  The frequency
+    axis is scanned instead of joining one giant contraction, so the
+    transient rotation holds one ``(nk, nb, nb)`` row.  A band-sharded input
+    stays ``P(None,None,'x','y')`` throughout and a replicated input stays
+    replicated.  No path gathers a sharded full cube to a device or host.
+
+    This one helper serves both fixed-Sigma eigenvalue iteration and the
+    final QP-to-DFT output rotation.  Keeping both directions here pins the
+    index convention and the bounded-memory schedule in one place.
     """
-    shape = tuple(int(v) for v in sigma_c_omega_dft_ry.shape)
-    key = (id(mesh), shape)
-    fn = _FIXED_SIGMA_ROTATE_CACHE.get(key)
+    from .qsgw_utils import is_band_sharded_sigma_omega
+
+    shape = tuple(int(v) for v in sigma_c_omega_ry.shape)
+    sharded = is_band_sharded_sigma_omega(sigma_c_omega_ry)
+    key = (id(mesh), shape, bool(to_qp), bool(sharded))
+    fn = _SIGMA_OMEGA_ROTATE_CACHE.get(key)
     if fn is None:
         from .qsgw_density import rotate_band_matrix
 
-        cube_sh = NamedSharding(mesh, P(None, None, "x", "y"))
-        matrix_sh = NamedSharding(mesh, _band_rotation_spec())
+        cube_spec = (P(None, None, "x", "y") if sharded
+                     else P(None, None, None, None))
+        row_spec = (_band_rotation_spec() if sharded
+                    else P(None, None, None))
+        cube_sh = NamedSharding(mesh, cube_spec)
+        row_sh = NamedSharding(mesh, row_spec)
+        rotation_sh = NamedSharding(mesh, _band_rotation_spec())
 
         @jax.jit
         def _kernel(cube, U):
             cube = jax.lax.with_sharding_constraint(cube, cube_sh)
-            U = jax.lax.with_sharding_constraint(U, matrix_sh)
+            U = jax.lax.with_sharding_constraint(U, rotation_sh)
 
             def _one(_carry, sigma_kij):
                 rotated = rotate_band_matrix(
-                    sigma_kij, U, mesh=mesh, to_qp=True)
+                    sigma_kij, U, mesh=mesh, to_qp=bool(to_qp))
                 rotated = jax.lax.with_sharding_constraint(
-                    rotated, matrix_sh)
+                    rotated, row_sh)
                 return None, rotated
 
             _, out = jax.lax.scan(_one, None, cube, unroll=1)
             return jax.lax.with_sharding_constraint(out, cube_sh)
 
         fn = _kernel
-        _FIXED_SIGMA_ROTATE_CACHE[key] = fn
-    return fn(sigma_c_omega_dft_ry, U_dft_to_qp)
+        _SIGMA_OMEGA_ROTATE_CACHE[key] = fn
+    return fn(sigma_c_omega_ry, U_dft_to_qp)
+
+
+def _sigma_c_at_dft_diag_from_dft_cube(
+    sigma_c_omega_dft_ry: jax.Array,
+    sigma_result: SigmaResult,
+    *,
+    mesh: Mesh,
+    print_fn: Callable = print,
+) -> np.ndarray:
+    """Interpolate the DFT-basis cube diagonal at the DFT energies.
+
+    ``sigma_result.sigma_c_at_dft_diag_ev`` was formed before the SC
+    finalize, from the diagonal of the QP-basis cube.  A diagonal cannot be
+    similarity-transformed by itself.  After the full cube has undergone the
+    one sanctioned QP-to-DFT rotation, extract its much smaller diagonal and
+    repeat the canonical output interpolation on the already-recorded omega
+    axis and DFT evaluation points.  The full cube is never gathered to host.
+
+    Parameters
+    ----------
+    sigma_c_omega_dft_ry
+        ``(n_omega, n_k, n_band, n_band)`` correlation operator in the DFT
+        output basis.  It may be band-sharded.
+    sigma_result
+        Last-map result carrying the omega grid and DFT-relative evaluation
+        energies used by the original interpolation.
+    mesh
+        Device mesh that owns the cube.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n_k, n_band)`` complex correlation diagonal at ``E_DFT``, in eV
+        and in the DFT output basis.
+    """
+    from .qsgw_utils import (
+        extract_sigma_diag_replicated,
+        interp_along_omega,
+        resolve_out_of_range_policy,
+    )
+
+    if (sigma_result.omega_grid_ev is None
+            or sigma_result.omega_dft_rel_ev is None):
+        raise ValueError(
+            "a dynamic SC output cube needs its omega grid and DFT-relative "
+            "evaluation energies to rebuild Sigma_c(E_DFT)")
+    diagonal_ev = np.asarray(extract_sigma_diag_replicated(
+        sigma_c_omega_dft_ry, mesh)) * RYD_TO_EV
+    return interp_along_omega(
+        diagonal_ev,
+        np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
+        np.asarray(sigma_result.omega_dft_rel_ev, dtype=np.float64),
+        out_of_range=resolve_out_of_range_policy(),
+        context="DFT-basis Sigma_c at E_DFT after SC finalize",
+        print_fn=print_fn,
+    )
 
 
 @_functools.partial(jax.jit, static_argnames=("mesh", "to_qp"))
@@ -1349,8 +1436,8 @@ def run_fixed_sigma_evsc(
         else:
             sigma_x_qp = _rotate_fixed_matrix(
                 sigma_x_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
-            sigma_c_qp = _rotate_fixed_sigma_cube_to_qp(
-                sigma_c_dft, U_dft_to_qp, mesh=mesh_xy)
+            sigma_c_qp = _rotate_sigma_omega_cube(
+                sigma_c_dft, U_dft_to_qp, mesh=mesh_xy, to_qp=True)
 
         sigma_xc_qp, diagnostics = build_qsgw_sigma_xc(
             sigma_c_qp, sigma_x_qp, omega_ev, e_rel_ev, mesh_xy,
@@ -4545,6 +4632,16 @@ def run_sc_driver(
     # routes each kind correctly; only the spec changed.
     U = _place(state_final.outputs.sigma_basis_U, mesh_xy,
                _band_rotation_spec())
+    sigma_c_omega_dft = (
+        _rotate_sigma_omega_cube(
+            sigma_result.sigma_c_omega_kij_ry, U,
+            mesh=mesh_xy, to_qp=False)
+        if sigma_result.sigma_c_omega_kij_ry is not None else None)
+    sigma_c_at_dft_dft = (
+        _sigma_c_at_dft_diag_from_dft_cube(
+            sigma_c_omega_dft, sigma_result,
+            mesh=mesh_xy, print_fn=print_fn)
+        if sigma_c_omega_dft is not None else None)
     # These are diagnostics only.  Avoid an extra U-sized |U|^2 temporary and
     # five distributed contractions on the default path where no debug table
     # consumes them; when enabled, build the weight once and share it.
@@ -4587,6 +4684,8 @@ def run_sc_driver(
         hartree_omitted=False,
         sigma_x_kij_ry=sig_x,
         sigma_xc_kij_ry=sigma_xc_dft,
+        sigma_c_omega_kij_ry=sigma_c_omega_dft,
+        sigma_c_at_dft_diag_ev=sigma_c_at_dft_dft,
         sigma_sx_kij_ry=(
             _rotate_to_dft_basis(sigma_result.sigma_sx_kij_ry, U, mesh=mesh_xy)
             if sigma_result.sigma_sx_kij_ry is not None else None),
@@ -4845,8 +4944,8 @@ def dump_sigma_omega_h5_final(
     # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
     # self-consistency ``sigma_xc_kij_ry`` is Σ_x + Σ_c^QSGW built from
     # ``wfns_qp``, i.e. the QP basis — the same basis the Σ_c(ω) cube
-    # above was written in (``sigma_dispatch.SIGMA_BASIS_FIELDS`` says
-    # why that one is never rotated).  ``run_sc_driver`` rotates
+    # above was written in.  ``run_sc_driver`` rotates its separate output
+    # copy
     # ``sigma_xc_kij_ry`` back to the DFT basis a few frames below this
     # call, and appending it AFTER that would put one DFT-basis matrix in
     # a file of QP-basis ones with matching shape, dtype and stamp.

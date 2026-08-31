@@ -596,42 +596,12 @@ def test_auto_on_cpu_chol_passes_lu_demotes_announced(tmp_path, monkeypatch):
     assert any("distributed_lu=auto" in l and "off" in l for l in lines)
 
 
-def test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses():
-    """Tombstone for the removed self_consistent x dynamic combination.
-
-    tests/regression/gnppm_debug/gnppm_sc.in is the tree's only
-    self-consistent deck and has raised at driver entry since 2026-08-25.
-    Its gnppm_sc_session fixture has no consumer, so the removal turned
-    nothing red.  This cell reads the real deck, checks it still declares
-    the refused pair, and AST-checks the guard is still present.
-
-    Restoring the capability makes this cell fail.  Delete it together with
-    the guard, its twins at the post-Sigma seam and in
-    gw_output.write_results, and the qp_solver rows in
-    docs/input_reference.md and docs/drivers.md.
-    """
-    import ast
-
+def test_the_dynamic_self_consistent_regression_deck_is_supported():
+    """The shipped dynamic SC deck remains a live supported combination."""
     deck = (pathlib.Path(__file__).resolve().parent
             / "regression" / "gnppm_debug" / "gnppm_sc.in")
     assert deck.is_file(), f"the one SC deck is missing: {deck}"
     cfg = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *a, **k: None)
-    # Parsing still accepts the pair; the refusal is in the driver.
     assert cfg.qp_solver is QPSolver.SELF_CONSISTENT
     assert cfg.compute_mode.is_dynamic
-
-    src = (pathlib.Path(__file__).resolve().parents[1]
-           / "src" / "gw" / "gw_jax.py").read_text()
-    guards = [
-        node for node in ast.walk(ast.parse(src))
-        if isinstance(node, ast.If)
-        and any(isinstance(n, ast.Raise) for n in node.body)
-        and "SELF_CONSISTENT" in ast.dump(node.test)
-        and "is_dynamic" in ast.dump(node.test)
-    ]
-    assert guards, (
-        "gw_jax no longer refuses qp_solver=self_consistent beside a dynamic "
-        "compute_mode, but gnppm_sc.in and the qp_solver doc rows still say "
-        "it does.  Restoring the capability means deleting this cell and "
-        "those rows in the same commit.")

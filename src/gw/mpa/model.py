@@ -97,22 +97,43 @@ def _fit_head_samples(
     fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model, solve,
     occupation_state=None,
 ):
-    """Fit scalar Wc_head on the body's exact complex-frequency grid."""
+    """Publish scalar Wc_head on the body's exact complex-frequency grid.
+
+    ``head_correction=off`` is the exact zero model, not an ill-conditioned
+    pole-fitting problem.  It still gets a complete scalar-head record because
+    the Sigma consumer reads one uniformly; zero residues make that record a
+    structural no-op for every real evaluation frequency.
+    """
     wc = np.asarray([
         complex(sample.wcoul0) - complex(sample.vc0)
         for sample in head_samples
     ], dtype=np.complex128)
-    fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
-    provenance = {
-        "solve_mode": fitted["solve"],
-        "solve_affine": fitted["affine"],
-        "solve_rcond": fitted["rcond"],
-        "eig_mode": fitted["eig"],
-        "n_valid": fitted["n_valid"],
-        "condition_max_allowed": 1.0 / fitted["rcond"],
-        "backward_error_max_allowed": float(
-            np.sqrt(np.finfo(np.float64).eps)),
-    }
+    if model == "head_off_zero":
+        if np.any(wc != 0.0):
+            raise ValueError(
+                "head_off_zero received a nonzero scalar-head sample")
+        # A non-real dummy pole avoids a zero denominator in the generic
+        # evaluator.  Its value is immaterial because every residue is zero.
+        fitted = {
+            "Omega_p": np.full(n_p, -1.0j, dtype=np.complex128),
+            "B_p": np.zeros(n_p, dtype=np.complex128),
+            "condition": 0.0,
+            "backward_error": 0.0,
+            "max_abs_residual": 0.0,
+        }
+        provenance = {"solve_mode": "exact_zero", "n_valid": int(n_p)}
+    else:
+        fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
+        provenance = {
+            "solve_mode": fitted["solve"],
+            "solve_affine": fitted["affine"],
+            "solve_rcond": fitted["rcond"],
+            "eig_mode": fitted["eig"],
+            "n_valid": fitted["n_valid"],
+            "condition_max_allowed": 1.0 / fitted["rcond"],
+            "backward_error_max_allowed": float(
+                np.sqrt(np.finfo(np.float64).eps)),
+        }
     mpa_store.write_head_fit_collective(
         fit_path, z, wc, fitted["Omega_p"], fitted["B_p"],
         mesh_xy=mesh_xy, energy_unit="Ry",
@@ -626,7 +647,11 @@ def build_mpa_fit(
     elif iteration_head is None:
         head_fit_samples = tuple(
             head_resolver.at(complex(z)) for z in z_all)
-        head_model = f"dft_direct_{config.mpa.pole_solver}"
+        correction = getattr(
+            config.head.correction, "value", config.head.correction)
+        head_model = (
+            "head_off_zero" if correction == "off"
+            else f"dft_direct_{config.mpa.pole_solver}")
     else:
         head_fit_samples = iteration_head.samples[:z_all.size]
         if bool(getattr(

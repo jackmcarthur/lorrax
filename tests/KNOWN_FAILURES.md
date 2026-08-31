@@ -1051,50 +1051,45 @@ the only remaining red was the ring-vma class.
 
 ---
 
-# eqp0.dat / eqp1.dat mix two bases on the self-consistent path
+# eqp0.dat / eqp1.dat mixed two bases on the self-consistent path
 
-OPEN, UNMEASURED, 2026-08-05.  Carried forward unchanged; neither census
-touches it.  `gw_jax.py:652-654` reads `sigma_c_omega_kij_ry` off the object
-`run_sc_driver` returns and emits its diagonal as `sigma_c_omega_diag_ev`.
-That field is in the QP basis and is correct there — Σ is Hermitised as
-½(Σ(E_n)+Σ(E_m)), which only means anything in the basis whose eigenvalues
-are those E_n, so it must not be rotated.  The finalize rotates the five
-static Σ fields to the DFT basis and carries the cube through unrotated,
-which is deliberate.
+FIXED IN CODE, END-TO-END MEASUREMENT PENDING, 2026-08-31.  The former
+failure was real: the self-consistent finalize returned static fields in the
+DFT basis but left `sigma_c_omega_kij_ry` and its at-DFT diagonal in the last
+map's QP basis.  Output then added their diagonals to DFT-basis terms, a sum
+that is valid only at `U = identity`.  Three guards made that dynamic
+configuration fail closed from 2026-08-25 onward.
 
-The defect is downstream: `compute_eqp_diag` forms
-`Δ = kin_ion + V_H + Σ_x + Σ_c(E_DFT) − E_DFT` from three DFT-basis
-diagonals plus that one QP-basis diagonal.  The sum is basis-consistent
-only at U = identity.  The same mixing reaches `sigma_xc_at_dft_ev`
-(`gw_jax.py:600-603`).
+The finalize now rotates the full correlation operator exactly once with
+`C_DFT(omega) = U C_QP(omega) U†`.  It scans omega rows on device, so a
+band-sharded cube remains `P(None,None,'x','y')` and no full cube is gathered
+to host.  The at-DFT diagonal cache is then rebuilt from the rotated cube;
+a diagonal is never rotated element-wise.  The raw `sigma_mnk.h5` cube is
+written before this output transform and therefore still records the last
+map's QP compute basis.  The returned `SigmaResult` is DFT-basis-consistent
+for EQP/output assembly.  The three guards and their documentation
+restrictions were removed in the same change.
 
-FAIL-CLOSED SINCE 2026-08-25, which is a refusal and not a fix.  Upstream
-`92130176` (here as `44ee0dfa`) added guards at driver entry and at the
-post-Σ seam, and `9d79b6c` (`6fafd126`) a third in `write_results`, so
-`qp_solver = self_consistent` beside a dynamic `compute_mode` now raises
-before screening instead of writing two files that mix bases.  Static SC
-(`cohsex`) is untouched.  The measurement above is still owed: nothing has
-bounded the error, so the combination is refused, not known-bad.
+Focused evidence is green: 171 passed, 1 skipped across the rotation,
+basis-contract, config, metallic-SC, zero-head, delivered-window, and
+layering tests; a four-logical-device test checks the explicit `U C U†`
+value and retained sharding.  CUDA P=4 JID 57754440, step 71, checked the
+same row-scanned kernel on four ranks/four devices:
+max absolute tile error `9.1551e-16`, output
+`P(None,None,'x','y')`.  The requested Na end-to-end measurement remains
+blocked before Sigma by two independent deck/planner preconditions: the
+strict 24/48-band boundaries are not multiplet-clean, and the delivered
+product-window planner refuses the exact `-10..+10 eV` arm at P=4 with
+achieved residual `0.00510025` and amplification p99 `7183.46` (JID
+57754440 step 91).  Neither refusal may be bypassed to manufacture a passing
+gate.  The two newly reachable head-off metallic seams are fixed and tested,
+but no SC iteration completed.  The measured SC `U`/fixed-point diagonal
+comparison therefore remains owed, and the branch result must not describe
+the capability as landing-verified until that artifact exists.
 
-What the removal costs: `tests/regression/gnppm_debug/gnppm_sc.in` is the
-tree's only self-consistent deck and now raises at driver entry, and its
-`gnppm_sc_session` fixture (`tests/conftest.py:845`) had no consumer, so
-nothing turned red.  `tests/test_qp_solver_config.py`'s
-`test_the_one_self_consistent_deck_is_the_pair_the_driver_refuses` is the
-tombstone: it reads that deck, checks it still declares the refused pair,
-and AST-checks the guard, so restoring the capability fails there and takes
-the doc rows with it.  Details:
-`docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md`.
-
-The error scales with ‖U − 1‖ and NO ONE HAS MEASURED IT.  To measure:
-read `U_mnk` from an SC run's `qp_wfn_rotations.h5`, report the largest
-off-diagonal element, and bound the eqp error by the off-diagonal Σ weight
-it mixes in.  One-shot runs are unaffected — `solve_qp` is reached only in
-the non-SC branch (`gw_jax.py:543`), where the whole object is DFT basis.
-
-`tests/test_sigma_result_basis.py` pins which field is in which basis, so
-a new Σ channel cannot join the wrong group silently.  It does not and
-cannot catch this: the mixing is in the consumer, not the declaration.
+`tests/test_sigma_result_basis.py` pins the returned basis partition and the
+single sanctioned cube-rotation helper.  One-shot and fixed-point paths keep
+their existing basis contracts.
 
 ## Bespoke IBZ→full-BZ unfolding outside the symmetry service — census
 
