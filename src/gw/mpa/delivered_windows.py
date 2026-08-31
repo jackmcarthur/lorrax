@@ -71,9 +71,12 @@ _PLAN_CACHE_VERSION = 6
 # Refusal recovery is deliberately bounded independently of the deck.  These
 # are planner safety certificates, not accuracy/resource dials: a crossing
 # support gets at most ten bisections and the complete plan may never explode
-# past 128 product pieces while trying to recover it.
+# past 128 product pieces while trying to recover it.  State splitting is
+# limited to one bisection: the frozen Na measure found k=3 and k=4 state
+# partitions both cost >5x the whole rule and failed the conditioning gate.
 _MAX_REFUSAL_SPLIT_DEPTH = 10
 _MAX_REFUSAL_SPLIT_PIECES = 128
+_MAX_REFUSAL_STATE_SPLITS = 1
 
 # The shipped crossing bundle was generated at eps_q=1e-3.  This value is an
 # artifact coordinate, not a planner dial; asking for another value cannot
@@ -1258,7 +1261,7 @@ def _spec_crossing_radius(spec):
 
 
 def _rebuild_split_spec(spec, state_positions, omega_rows, state_interval,
-                        suffix, bins):
+                        suffix, bins, *, state_split=False):
     """Rebuild one exact state-interval x omega-interval child."""
     state_positions = np.asarray(state_positions, np.int64)
     omega_rows = np.asarray(omega_rows, np.int64)
@@ -1295,7 +1298,9 @@ def _rebuild_split_spec(spec, state_positions, omega_rows, state_interval,
         E_ref_A=E_ref,
         omega_abs=np.asarray(spec["omega_abs"])[omega_rows],
         omega_idx=np.asarray(spec["omega_idx"])[omega_rows],
-        envelope=float(np.max(envelope_by_frequency)))
+        envelope=float(np.max(envelope_by_frequency)),
+        refusal_state_splits=(
+            int(spec.get("refusal_state_splits", 0)) + int(state_split)))
     return child
 
 
@@ -1324,7 +1329,9 @@ def _split_refused_crossing_spec(spec, bins):
     order = np.argsort(raw, kind="stable")
     distinct_cuts = np.nonzero(np.diff(raw[order]) > 0.0)[0] + 1
     state_children = None
-    if distinct_cuts.size:
+    if (distinct_cuts.size
+            and int(spec.get("refusal_state_splits", 0))
+            < _MAX_REFUSAL_STATE_SPLITS):
         cut = int(distinct_cuts[np.argmin(np.abs(
             distinct_cuts - 0.5 * order.size))])
         lower_order, upper_order = order[:cut], order[cut:]
@@ -1334,11 +1341,11 @@ def _split_refused_crossing_spec(spec, bins):
             _rebuild_split_spec(
                 spec, np.asarray(spec["state_positions"])[lower_order],
                 np.arange(omega_count), (state_lo, boundary),
-                "state-1/2", bins),
+                "state-1/2", bins, state_split=True),
             _rebuild_split_spec(
                 spec, np.asarray(spec["state_positions"])[upper_order],
                 np.arange(omega_count), (boundary, state_hi),
-                "state-2/2", bins),
+                "state-2/2", bins, state_split=True),
         )
         if any(child is None for child in state_children):
             state_children = None

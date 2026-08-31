@@ -375,6 +375,35 @@ def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
     assert (first_report["branches"] == second_report["branches"])
 
 
+def test_refused_crossing_is_replaced_by_exact_omega_bisection(monkeypatch):
+    """A failed live fit keeps all served rows and retries only its children."""
+    fitted = []
+
+    def fit(spec, *_args, **_kwargs):
+        fitted.append(spec["name"])
+        if spec["kind"] == "crossing" and "[split=" not in spec["name"]:
+            raise RuntimeError("forced conditioning refusal")
+        return _served_candidate(spec), {
+            "adapted_fit_seconds": 0.0,
+            "shipped_fallback_seconds": 0.0,
+        }
+
+    def no_consolidation(specs, candidates, *_args):
+        return specs, candidates, [], _args[-1]
+
+    monkeypatch.setattr(delivered, "_window_candidates_profiled", fit)
+    monkeypatch.setattr(delivered, "_consolidate_branches", no_consolidation)
+    plan, report = _patched_test_plan(5.0)
+
+    split = [row for row in plan if "[split=omega-" in row.window.name]
+    assert len(split) == 2
+    joined = np.concatenate([row.omega_idx for row in split])
+    np.testing.assert_array_equal(np.sort(joined), np.arange(21))
+    assert np.unique(joined).size == joined.size
+    assert sum("[split=" not in name for name in fitted) == 1
+    assert report["window_tau_pairs"] == 2
+
+
 def test_zero_time_rule_is_refused():
     problem = ReciprocalMeasureProblem(
         frequencies=np.asarray([0.0]),
