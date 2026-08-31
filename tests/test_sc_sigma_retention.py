@@ -152,7 +152,9 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
     jnp = pytest.importorskip("jax.numpy")
     from gw import sc_iteration
 
-    payload = object()
+    partition = SimpleNamespace(
+        protected_mask=np.array([True]), in_range_mask=np.array([True]))
+    payload = SimpleNamespace(partition=partition)
 
     def _map(state, _inputs):
         return sc_iteration.SCState(
@@ -168,8 +170,7 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
                         lambda *_args, **_kwargs: None)
     monkeypatch.setattr(sc_iteration, "_maybe_dump_e_history",
                         lambda *_args, **_kwargs: None)
-    inputs = SimpleNamespace(partition=SimpleNamespace(
-        protected_mask=np.array([True]), in_range_mask=np.array([True])))
+    inputs = SimpleNamespace(partition=partition)
     initial = sc_iteration.SCState(
         H_qp_dft=jnp.zeros((1, 1, 1), dtype=jnp.complex128), iteration=0)
     final, _ = sc_iteration._run_linear_mixing(
@@ -181,6 +182,46 @@ def test_linear_mixing_returns_the_last_evaluated_input_not_mixed_candidate(
     assert final.outputs is payload
     assert final.occupation_state == "occupation-from-input-zero"
     assert final.head_surface_weight_kn == "surface-from-input-zero"
+
+
+def test_linear_convergence_uses_the_map_local_partition(monkeypatch):
+    """A moved metal window must change the set tested for convergence."""
+    jnp = pytest.importorskip("jax.numpy")
+    from gw import sc_iteration
+
+    seed_partition = SimpleNamespace(
+        protected_mask=np.array([True, False]),
+        in_range_mask=np.array([True, False]))
+    live_partition = SimpleNamespace(
+        protected_mask=np.array([False, True]),
+        in_range_mask=np.array([False, True]))
+    captured = {}
+
+    def _map(state, _inputs):
+        moved = state.H_qp_dft.at[0, 1, 1].set(1.0e-2)
+        return sc_iteration.SCState(
+            H_qp_dft=moved, iteration=state.iteration + 1,
+            outputs=SimpleNamespace(partition=live_partition))
+
+    def _snapshot(*_args, **kwargs):
+        captured["verdict"] = kwargs["verdict"]
+
+    monkeypatch.setattr(sc_iteration, "gw_iteration_map", _map)
+    monkeypatch.setattr(sc_iteration, "_write_sc_eqp_snapshot", _snapshot)
+    monkeypatch.setattr(sc_iteration, "_maybe_dump_e_history",
+                        lambda *_args, **_kwargs: None)
+    inputs = SimpleNamespace(partition=seed_partition)
+    initial = sc_iteration.SCState(
+        H_qp_dft=jnp.zeros((1, 2, 2), dtype=jnp.complex128), iteration=0)
+
+    sc_iteration._run_linear_mixing(
+        initial, inputs, max_iter=1, tol_ev=5.0e-2, mixing=1.0,
+        eigvalsh_kshard=lambda H: jnp.real(jnp.diagonal(H, axis1=-2,
+                                                       axis2=-1)),
+        print_fn=lambda *_args: None, dump_dir=None)
+
+    assert captured["verdict"].worst_band == 1
+    assert not captured["verdict"].converged
 
 
 def test_rcrop_early_stop_binds_outputs_to_the_accepted_map_input():

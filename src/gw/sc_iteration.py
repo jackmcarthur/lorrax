@@ -397,6 +397,7 @@ class SCOutputs:
 
     sigma_result: SigmaResult
     sigma_basis_U: jax.Array         # (nk, nb, nb) ⟨DFT_m|QP_n⟩, full BZ
+    partition: BandPartition
     scissor_fit: ScissorFit | None
     tail_scissor_fit: ScissorFit | None
     screening: SCMapScreeningArtifacts
@@ -3112,6 +3113,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # construction -- compute_sigma_xc runs there.  Storing the
             # IBZ U_qp here is the mismatch that raised 'k' 10 vs 16.
             sigma_basis_U=U_full,
+            # The convergence test must use the same live, mu-anchored
+            # partition that decided which bands this map scissored.  The
+            # input partition is the DFT-seed partition and is stale after
+            # the first metallic map.
+            partition=partition,
             scissor_fit=scissor_fit,
             tail_scissor_fit=tail_fit,
             screening=SCMapScreeningArtifacts(
@@ -3642,9 +3648,9 @@ def run_self_consistency(
             prev_output_role="dft_seed",
             verdict=protected_band_convergence(
                 e_new_ev, e_initial_ev,
-                np.asarray(inputs.partition.protected_mask,
+                np.asarray(state_new.outputs.partition.protected_mask,
                            dtype=bool).reshape(-1),
-                np.asarray(inputs.partition.in_range_mask,
+                np.asarray(state_new.outputs.partition.in_range_mask,
                            dtype=bool).reshape(-1),
                 tol_ev),
         )
@@ -3694,10 +3700,6 @@ def _run_linear_mixing(
     #: under ``mixing != 1`` those are two different sequences and the file
     #: was stamped from the wrong one.
     _out_history: list[np.ndarray] = [E_prev_ev.copy()]
-    _protected = np.asarray(
-        inputs.partition.protected_mask, dtype=bool).reshape(-1)
-    _in_range = np.asarray(
-        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
     if mixing != 1.0:
         print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
 
@@ -3760,7 +3762,12 @@ def _run_linear_mixing(
         # including the scissored ones, both the looser test and a
         # different set.
         verdict = protected_band_convergence(
-            E_candidate_ev, E_prev_ev, _protected, _in_range, tol_ev)
+            E_candidate_ev, E_prev_ev,
+            np.asarray(state_map.outputs.partition.protected_mask,
+                       dtype=bool).reshape(-1),
+            np.asarray(state_map.outputs.partition.in_range_mask,
+                       dtype=bool).reshape(-1),
+            tol_ev)
         print_fn(f"    SC convergence: {verdict.summary()}")
         # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
         # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
@@ -3965,10 +3972,6 @@ def _run_rcrop(
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _iter_idx = [0]
     rms_history: list[float] = []
-    _protected = np.asarray(
-        inputs.partition.protected_mask, dtype=bool).reshape(-1)
-    _in_range = np.asarray(
-        inputs.partition.in_range_mask, dtype=bool).reshape(-1)
 
     def residual_fn(H_in: jnp.ndarray) -> jnp.ndarray:
         # SHARDED IN, REPLICATED CARRY, SHARDED OUT.  The gather is one
@@ -4014,7 +4017,12 @@ def _run_rcrop(
         # fixed point.  ||F(H) - H|| makes no reference to the iteration
         # that produced H, so the accelerator cannot flatter it.
         _verdict = protected_band_convergence(
-            E_new, E_in, _protected, _in_range, tol_ev)
+            E_new, E_in,
+            np.asarray(state_out.outputs.partition.protected_mask,
+                       dtype=bool).reshape(-1),
+            np.asarray(state_out.outputs.partition.in_range_mask,
+                       dtype=bool).reshape(-1),
+            tol_ev)
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))
         rms_history.append(rms)
         _e_history.append(E_new.copy())

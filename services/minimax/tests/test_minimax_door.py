@@ -379,6 +379,22 @@ def test_f5_a_miss_with_the_hatch_closed_is_a_refusal(monkeypatch,
     assert "nearest certified below: A_dim=60" in text
 
 
+def test_f5_an_exhausted_solver_ladder_is_a_refusal(monkeypatch):
+    """The last rule is not a solution when its measured error misses."""
+    from minimax import door
+
+    provenance = M.runtime_provenance("fake", "test")
+    monkeypatch.setattr(
+        door, "_solve_noncrossing_scaled_cached",
+        lambda *_args: (np.array([1.0]), np.array([1.0]), 2.0e-4,
+                        provenance))
+
+    with pytest.raises(M.UncertifiedSolveRefused, match="exhausted"):
+        M.solve_uncertified(
+            family="noncrossing", target="inverse", range_value=10.0,
+            error_bound=1.0e-6, n_max=2)
+
+
 def test_f5_false_case_with_the_hatch_open_it_solves_and_says_so(
         monkeypatch, isolated_cache):
     """The FALSE case for F5, and the loudest line in the service.

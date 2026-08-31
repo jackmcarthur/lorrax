@@ -18,12 +18,13 @@ pairs.  All other off-diagonals are zeroed each iteration so the
 non-protected / out-of-range bands never mix into the protected
 subspace's eigenproblem.
 
-Why pre-compute the masks
--------------------------
-Both masks are static across iterations (band identity doesn't change)
-and small (``nb_active`` booleans each), so they live in :class:`BandPartition`
-and are passed as JAX arrays to a single jit'd primitive
-:func:`apply_band_partition` that the iteration map calls per step.
+Why keep the masks together
+---------------------------
+Both masks are small (``nb_active`` booleans each), so they live in
+:class:`BandPartition` and are passed as JAX arrays to a single jit'd
+primitive :func:`apply_band_partition`.  Insulating runs build them once.
+Metallic self-consistency rebuilds them from each map's live spectrum and
+chemical potential; the convergence test consumes that same map-local object.
 
 Validation
 ----------
@@ -52,8 +53,8 @@ import jax.numpy as jnp
 class BandPartition:
     """How each band in the active subspace is treated by the QSGW H build.
 
-    Both masks are 1-D over the active band axis ``nb_active`` and are
-    constant across SC iterations.
+    Both masks are 1-D over the active band axis ``nb_active``.  They are
+    constant for an insulating run and iteration-local for metallic SC.
 
     Attributes
     ----------
@@ -62,7 +63,8 @@ class BandPartition:
         ``H_qp_dft`` and participate in the basis rotation.
     in_range_mask : (nb_active,) bool
         True for bands whose ``E_DFT`` lies inside ``[ω_min, ω_max]`` at
-        every k.  Used to decide between Σ_diag (in-range) and scissor
+        every k for the spectrum and energy origin that built this object.
+        Used to decide between Σ_diag (in-range) and scissor
         (out-of-range) for the *non-protected* bands' diagonal.
     """
 

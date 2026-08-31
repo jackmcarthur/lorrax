@@ -588,6 +588,23 @@ def _tolerance_key(error_bound: float) -> float:
     return key
 
 
+def _require_achieved_error(
+    family: str,
+    achieved_error: float,
+    requested_error: float,
+    n_max: int,
+) -> None:
+    """Refuse an exhausted offline ladder instead of serving its last rule."""
+    achieved = float(achieved_error)
+    requested = float(requested_error)
+    if not np.isfinite(achieved) or achieved >= requested:
+        raise UncertifiedSolveRefused(
+            f"minimax: uncertified {family} solve exhausted n_max="
+            f"{int(n_max)} without meeting the requested error; achieved "
+            f"{achieved:.6g}, requested < {requested:.6g}.  The last rule "
+            "is not a solution and will not be served.")
+
+
 def solve_uncertified(*, family: str, target: str, range_value: float,
                       error_bound: float, n_max: int,
                       eps_q: float | None = None,
@@ -621,6 +638,7 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
             f"minimax: family {family!r} has no in-process solver.  "
             f"{spec.generator_hint}")
 
+    _require_achieved_error(family, err, error_bound, int(n_max))
     quad = Quadrature(
         nodes=tau, weights=w, family=family, target=target,
         range_param=spec.range_param, range_value=float(range_value),
