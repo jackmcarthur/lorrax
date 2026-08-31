@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "pair densities (|ψ_c|² diagonals). n_cond should "
                         "be the input file's ``ncond`` (σ-protected band "
                         "count), not the full ``nband`` summed over.")
+    p.add_argument("--fit-window", default=None, metavar="L0:L1,R0:R1",
+                   help="Explicit 0-based half-open left/right band windows "
+                        "shared by candidate construction and Gram pruning "
+                        "(for example 0:16,0:28). Physical occupancy still "
+                        "comes from WFN.nelec. Cannot be combined with a "
+                        "non-default --prune-window.")
     p.add_argument("--orbit", action="store_true",
                    help="Symmetry-adapted k-means: store orbit representatives,"
                         " unfold with the atom-derived spatial Seitz group. "

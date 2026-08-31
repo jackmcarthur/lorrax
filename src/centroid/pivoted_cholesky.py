@@ -1044,6 +1044,15 @@ def prune_candidates_by_pivoted_cholesky(
 # metric and this exact Gram the same full-k quadrature table.
 
 
+def _gram_meta_band_counts(wfn_nelec: int, max_band: int,
+                           n_val: int | None, n_cond: int | None):
+    """Keep physical occupancy separate from an explicit feature window."""
+    if n_val is not None:
+        return int(n_val), int(n_cond)
+    occupied = min(int(wfn_nelec), int(max_band))
+    return occupied, int(max_band) - occupied
+
+
 def build_gram_q0_via_loadwfns(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -1181,11 +1190,10 @@ def build_gram_q0_via_loadwfns(
 
     # Meta's nband must cover whichever of left/right reaches higher.
     max_band = max(left_range[1], right_range[1])
-    # Keep Meta.b0..b4 consistent with the *legacy* nval/ncond semantics
-    # when the caller passed those; otherwise use (max_band, max_band) so
-    # the metadata bounds don't constrain anything downstream.
-    meta_nval = int(n_val) if n_val is not None else nb_left
-    meta_ncond = int(n_cond) if n_cond is not None else max(1, max_band - meta_nval)
+    # Meta.nval is physical occupancy, not the width of the left feature
+    # window.  Explicit windows may cross the occupied boundary.
+    meta_nval, meta_ncond = _gram_meta_band_counts(
+        wfn.nelec, max_band, n_val, n_cond)
 
     M = int(cand_idx.shape[0])
     cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)

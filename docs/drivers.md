@@ -73,6 +73,7 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--oversample` | 1.5 | k-means runs at ceil(N_c*x), pruned back; 1.0 disables pruning |
 | `--prune-n-cond` | `nbands - n_val` (full WFN conduction window) | Cholesky window conduction extent; the pre-2026-07-29 `min(n_val, nb-n_val)` default was a 30%-rank-deficiency bug |
 | `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c` (legacy) / `v_x_vc` (adds v×v for V_H) / `vc_x_vc` (full sigma square, use when ncond >> nval) |
+| `--fit-window L0:L1,R0:R1` | unset | Explicit candidate-and-pruning pair, e.g. `0:16,0:28`; does not change physical occupancy |
 | `--density-mode` | `scalar` | `scalar` = charge feature-row norm/Gram; `current` = gauge-invariant three-current feature-row norm/Gram (suffix `_current`). Current mode requires atom-orbit closure, `rho_power=1`, and transverse-Gram pruning. |
 | `--orbit` / `--no-orbit` | auto (on if atom group has >1 row) | close the set under atom-derived spatial Seitz operations |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
