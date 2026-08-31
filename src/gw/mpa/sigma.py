@@ -89,6 +89,10 @@ def _require_product_plan(plan, geometry=None, *, receipt_path=None):
         for row in plan)
     recorded_rows = 0
     if geometry is not None:
+        # Both shapes must be checked: hatch-era receipts recorded the count
+        # at the top level, later ones per branch.  This is the guard that
+        # makes an old plan REFUSE rather than execute pairwise work.
+        recorded_rows += int(geometry.get("direct_term_count", 0))
         recorded_rows += sum(
             int(branch.get("direct_term_count", 0))
             for branch in geometry.get("branches", ()))
