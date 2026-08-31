@@ -176,6 +176,41 @@ def _run_parallel_planner_jobs(count, worker, *, refuse_errors):
         shards, count, world, refuse_errors=refuse_errors)
 
 
+def _planner_rows_profile(rows):
+    """Summarize fit costs on the rank that determined stage wall time."""
+    world = max(
+        int(process_count()),
+        max((int(row["source_rank"]) + 1 for row in rows), default=1))
+    by_rank = {rank: {
+        "fit": 0.0, "adapted": 0.0, "shipped": 0.0, "jobs": 0,
+    } for rank in range(world)}
+    for row in rows:
+        bucket = by_rank[int(row["source_rank"])]
+        bucket["fit"] += float(row["seconds"])
+        bucket["adapted"] += float(
+            row["detail"].get("adapted_fit_seconds", 0.0))
+        bucket["shipped"] += float(
+            row["detail"].get("shipped_fallback_seconds", 0.0))
+        bucket["jobs"] += 1
+    critical_rank = max(
+        by_rank, key=lambda rank: (by_rank[rank]["fit"], -rank), default=0)
+    critical = by_rank.get(critical_rank, {
+        "fit": 0.0, "adapted": 0.0, "shipped": 0.0, "jobs": 0})
+    return {
+        "critical_rank": int(critical_rank),
+        "critical_rank_fit_seconds": float(critical["fit"]),
+        "critical_rank_adapted_fit_seconds": float(critical["adapted"]),
+        "critical_rank_shipped_fallback_seconds": float(critical["shipped"]),
+        "critical_rank_fit_overhead_seconds": max(
+            0.0, float(critical["fit"] - critical["adapted"]
+                       - critical["shipped"])),
+        "jobs_per_rank": [int(by_rank[rank]["jobs"])
+                          for rank in range(world)],
+        "job_count": len(rows),
+        "refusal_count": sum(row["error"] is not None for row in rows),
+    }
+
+
 def _plan_cache_fingerprint(specs, *, eta, target, safety, factor_cap,
                             pair_ceiling, grid_mode, lattice_bins):
     """Hash the measured numerical problems that determine fitted rules."""
@@ -1872,6 +1907,7 @@ def build_delivered_sigma_windows(
         branch_rows, eta, edge_factor=float(edge_factor))
     split = geometry["pole_edge_ry"]
 
+    census_started = time.perf_counter()
     if measures_by_branch is None:
         omega_rows = _per_branch(
             Omega_poles_by_branch, branch_rows, "Omega_poles_by_branch")
@@ -1896,6 +1932,7 @@ def build_delivered_sigma_windows(
                 raise ValueError(
                     f"branch {branch.tag!r} was measured at pole split "
                     f"{measure[7]['pole_split_ry']}, expected {split}")
+    census_seconds = time.perf_counter() - census_started
 
     reference = None
     if reference_sigma_omega is not None:
@@ -1905,6 +1942,7 @@ def build_delivered_sigma_windows(
                 or not float(np.max(np.abs(reference))) > 0.0):
             raise ValueError("reference_sigma_omega is invalid")
 
+    window_geometry_started = time.perf_counter()
     specs, branch_reports = [], []
     combined_envelope = np.zeros(omega_grid.size, dtype=np.float64)
     for branch, measure in zip(branch_rows, measure_rows):
@@ -2003,6 +2041,7 @@ def build_delivered_sigma_windows(
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
+    window_geometry_seconds = time.perf_counter() - window_geometry_started
 
     combined_scale = float(np.max(combined_envelope))
     total_absolute = target * combined_scale * safety
@@ -2014,6 +2053,7 @@ def build_delivered_sigma_windows(
         plan_cache_path, cache_fingerprint, len(specs))
     cache_status = "disabled" if plan_cache_path is None else "hit"
     window_fit_rows, consolidation_rows = [], []
+    window_parallel_seconds = consolidation_seconds = selection_seconds = 0.0
     if cached is not None:
         (fits, free_pairs, required_cost, window_tau_pairs,
          fingerprint_match) = cached
@@ -2052,8 +2092,10 @@ def build_delivered_sigma_windows(
                 base_specs[index], eta, pair_ceiling, factor_cap,
                 allowances[index], adapted_only=True)
 
+        fit_started = time.perf_counter()
         base_candidates, window_fit_rows = _run_parallel_planner_jobs(
             len(base_specs), fit_window, refuse_errors=True)
+        window_parallel_seconds += time.perf_counter() - fit_started
         fits = None
         for adapted_only in (True, False):
             specs = base_specs
@@ -2081,19 +2123,27 @@ def build_delivered_sigma_windows(
                         time.perf_counter() - started)
                     return [adapted] + shipped, detail
 
+                fit_started = time.perf_counter()
                 candidates_by_window, retry_rows = (
                     _run_parallel_planner_jobs(
                         len(base_specs), fit_retry, refuse_errors=True))
+                window_parallel_seconds += time.perf_counter() - fit_started
                 window_fit_rows.extend(retry_rows)
+            consolidation_started = time.perf_counter()
             specs, candidates_by_window, trial_rows = _consolidate_branches(
                 specs, candidates_by_window, eta, pair_ceiling, factor_cap,
                 total_absolute)
+            consolidation_seconds += (
+                time.perf_counter() - consolidation_started)
             consolidation_rows.extend(trial_rows)
+            selection_started = time.perf_counter()
             try:
                 fits, free_pairs, required_cost = _select_rules(
                     specs, candidates_by_window, total_absolute, pair_ceiling)
+                selection_seconds += time.perf_counter() - selection_started
                 break
             except RuntimeError:
+                selection_seconds += time.perf_counter() - selection_started
                 if not adapted_only:
                     raise      # the shipped rules could not close it either
         del base_specs
@@ -2185,6 +2235,22 @@ def build_delivered_sigma_windows(
     if reference is not None:
         exchange_rate = combined_scale / float(np.max(np.abs(reference)))
         calibration = "calibrated_to_reference_sigma"
+    plan_seconds = time.perf_counter() - started
+    fit_profile = _planner_rows_profile(window_fit_rows)
+    consolidation_profile = _planner_rows_profile(consolidation_rows)
+    exchange_seconds = max(
+        0.0, window_parallel_seconds
+        - fit_profile["critical_rank_fit_seconds"])
+    exchange_seconds += max(
+        0.0, consolidation_seconds
+        - consolidation_profile["critical_rank_fit_seconds"])
+    accounted_seconds = (
+        census_seconds + window_geometry_seconds
+        + fit_profile["critical_rank_adapted_fit_seconds"]
+        + fit_profile["critical_rank_shipped_fallback_seconds"]
+        + fit_profile["critical_rank_fit_overhead_seconds"]
+        + consolidation_profile["critical_rank_fit_seconds"]
+        + exchange_seconds + selection_seconds)
     report = {
         "planner": "delivered_product_windows",
         "eta_ry": eta,
@@ -2210,7 +2276,30 @@ def build_delivered_sigma_windows(
         "window_tau_pairs": window_tau_pairs,
         "distinct_tau_count": distinct_tau_count,
         "direct_term_count": 0,
-        "plan_seconds": time.perf_counter() - started,
+        "plan_seconds": plan_seconds,
+        "planning_profile_seconds": {
+            "census": census_seconds,
+            "window_geometry": window_geometry_seconds,
+            "adapted_fits_on_critical_rank": fit_profile[
+                "critical_rank_adapted_fit_seconds"],
+            "shipped_fallbacks_on_critical_rank": fit_profile[
+                "critical_rank_shipped_fallback_seconds"],
+            "window_fit_overhead_on_critical_rank": fit_profile[
+                "critical_rank_fit_overhead_seconds"],
+            "merged_trials_on_critical_rank": consolidation_profile[
+                "critical_rank_fit_seconds"],
+            "candidate_exchange_and_wait": exchange_seconds,
+            "selection": selection_seconds,
+            "cache_and_output_assembly": max(
+                0.0, plan_seconds - accounted_seconds),
+        },
+        "planning_parallelism": {
+            "process_count": int(process_count()),
+            "window_fits": fit_profile,
+            "consolidation_trials": consolidation_profile,
+            "assignment": "job_index_modulo_process_count",
+            "collective": "common.collectives.all_gather_processes",
+        },
         "plan_cache_status": cache_status,
         "plan_cache_path": plan_cache_path,
         "plan_cache_fingerprint": cache_fingerprint,
