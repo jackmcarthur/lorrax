@@ -94,6 +94,40 @@ def test_certified_fit_plan_reuse_refuses_a_sampling_mismatch(
             config, "wrong-grid.h5", mesh_xy="mesh")
 
 
+def test_sc_frequency_plan_uses_the_reuse_providers_resolved_fit(
+        tmp_path, monkeypatch):
+    from gw import sc_iteration
+
+    config = _config(
+        tmp_path, "mpa_n_poles = 4\n" + _METAL_KEYS
+        + "mpa_sampling_alpha = 2\n")
+    expected = config.mpa.sample_plan(8.0)
+    calls = []
+
+    def rebuild(config_arg, path, *, mesh_xy):
+        calls.append((config_arg, path, mesh_xy))
+        return expected
+
+    monkeypatch.setattr(model, "make_mpa_plan_from_fit", rebuild)
+    _, plan, omegas = sc_iteration._sc_head_frequency_plan(
+        config, None, certified_fit="/resolved/certified.h5",
+        mesh_xy="mesh")
+
+    assert plan is expected
+    np.testing.assert_array_equal(
+        omegas[:-1], sample_plan.plan_z(expected))
+    assert omegas[-1] == 0.0 + 0.0j
+    assert calls == [(config, "/resolved/certified.h5", "mesh")]
+
+
+def test_sc_frequency_plan_refuses_none_without_a_reused_fit(tmp_path):
+    from gw import sc_iteration
+
+    config = _config(tmp_path, "mpa_n_poles = 4\n" + _METAL_KEYS)
+    with pytest.raises(ValueError, match="no certified fit supplied"):
+        sc_iteration._sc_head_frequency_plan(config, None, mesh_xy="mesh")
+
+
 def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
     config = _config(
         tmp_path,

@@ -275,6 +275,11 @@ class SCInputs:
     e_ref: float
     static_head_terms: object | None
     head_resolver: object
+    # Driver-owned screening seam.  The ordinary driver passes the canonical
+    # producer; a certified-fit harness passes its already-resolved reuse
+    # provider.  Keeping the callable explicit makes the SC loop use the same
+    # source owner as the one-shot stage instead of importing a second path.
+    screening_model_fn: Callable
     config: object
     meta: object
     mesh_xy: Mesh
@@ -2115,17 +2120,37 @@ def _report_extrapolation_eqp_shift(
     print_fn("\n".join(lines))
 
 
-def _sc_head_frequency_plan(config, quad):
-    """Single frequency plan for SC body W and every head provenance arm."""
+def _sc_head_frequency_plan(
+        config, quad, *, certified_fit=None, mesh_xy=None):
+    """Single frequency plan for SC body W and every head provenance arm.
+
+    A live screening build takes its ceiling from ``quad``.  A certified-fit
+    reuse has no quadrature, so its already-resolved fit path must be supplied
+    and the stored scalar-head samples become the exact plan provenance.
+    """
     from .screening import screening_requests_for
 
     requests = screening_requests_for(config.compute_mode, config)
     mpa_plan = None
     if config.compute_mode is ComputeMode.MPA:
         from .mpa import sample_plan
-        from .mpa.model import make_mpa_plan
-
-        mpa_plan = make_mpa_plan(config, quad)
+        if quad is None:
+            if certified_fit is None:
+                raise ValueError(
+                    "MPA SC frequency planning has no screening quadrature "
+                    "and no certified fit supplied by the screening reuse "
+                    "provider. Build screening normally or return the "
+                    "already-resolved certified fit path from that provider.")
+            if mesh_xy is None:
+                raise ValueError(
+                    "MPA certified-fit frequency planning requires mesh_xy "
+                    "for the collective head-fit provenance read")
+            from .mpa.model import make_mpa_plan_from_fit
+            mpa_plan = make_mpa_plan_from_fit(
+                config, certified_fit, mesh_xy=mesh_xy)
+        else:
+            from .mpa.model import make_mpa_plan
+            mpa_plan = make_mpa_plan(config, quad)
         mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
         head_omegas = [complex(value) for value in mpa_z]
         # The metallic MPA grid starts just above the origin.  Preserve a
@@ -2155,8 +2180,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     call lives here directly — adding a new Σ scheme that wants extra
     W frequencies is purely a screening + compute_sigma_xc change.
     """
-    from .screening import compute_screening_model
-
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
     if state.iteration == 0:
@@ -2463,11 +2486,49 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"Hartree from iteration {state.iteration} orbitals "
             f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
 
+    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+    # Same-run metal threading: the ENTRY-solved state feeds chi, the head
+    # and Sigma — one mu per map call, from this call's spectrum.
+    metal_occ_state = (entry_occ_state
+                       if _material_class(inputs) == "metal" else None)
+
+    def _screening(mpa_plan, iteration_head_response):
+        """Call the driver-owned producer/reuse provider at one map seam."""
+        return inputs.screening_model_fn(
+            inputs.config.compute_mode, wfns_qp, inputs.V_q,
+            quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
+            centroid_indices=inputs.centroid_indices, config=inputs.config,
+            meta=inputs.meta, mesh_xy=inputs.mesh_xy,
+            run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
+            label=f"sc_{state.iteration:04d}",
+            head_resolver=inputs.head_resolver,
+            head_channel=getattr(inputs, 'head_channel', None),
+            wfn=inputs.wfn,
+            mpa_plan=mpa_plan,
+            iteration_head_response=iteration_head_response,
+            occupation_state=metal_occ_state,
+            print_fn=inputs.print_fn)
+
+    # A certified-fit provider owns path resolution and announces it.  Ask it
+    # once, before head-plan construction, and use the exact path it returns;
+    # never rediscover a sibling filename or reread an environment variable.
+    screening_reuse = None
+    certified_fit = None
+    if mpa_mode and inputs.quad is None:
+        if inputs.config.head.correction is HeadCorrection.FULL:
+            raise ValueError(
+                "MPA certified-fit reuse with no screening quadrature cannot "
+                "serve head_correction=full, whose current-iteration head "
+                "must be folded through newly sampled W")
+        screening_reuse = _screening(None, None)
+        if isinstance(screening_reuse, dict):
+            certified_fit = screening_reuse.get("mpa_fit")
+
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
     requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
-        inputs.config, inputs.quad)
-    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+        inputs.config, inputs.quad, certified_fit=certified_fit,
+        mesh_xy=inputs.mesh_xy)
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -2604,25 +2665,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Per-mode screening: solve W at every frequency the Sigma scheme needs.
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
-    # Metal-only threading: the insulating routes stay on the None branch
-    # (bit-exact bool selectors).  The ENTRY-solved state feeds chi, the
-    # head and Sigma — one mu per map call, from this call's spectrum.
-    metal_occ_state = (entry_occ_state
-                       if _material_class(inputs) == "metal" else None)
-    W_by_role = compute_screening_model(
-        inputs.config.compute_mode, wfns_qp, inputs.V_q,
-        quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
-        centroid_indices=inputs.centroid_indices, config=inputs.config,
-        meta=inputs.meta, mesh_xy=inputs.mesh_xy,
-        run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
-        label=f"sc_{state.iteration:04d}",
-        head_resolver=inputs.head_resolver,
-        head_channel=getattr(inputs, 'head_channel', None),
-        wfn=inputs.wfn,
-        mpa_plan=mpa_plan,
-        iteration_head_response=iteration_head_response,
-        occupation_state=metal_occ_state,
-        print_fn=inputs.print_fn)
+    # The pre-plan reuse call already returned this map's complete fit mapping.
+    # A live producer runs here, after the current head response exists.
+    W_by_role = (
+        screening_reuse if screening_reuse is not None
+        else _screening(mpa_plan, iteration_head_response))
 
     # MPA owns a shared complex-frequency model rather than the finite role
     # table above.  Its fit mapping is not a body-W role mapping; without
@@ -4294,6 +4341,7 @@ def run_sc_driver(
     e_ref: float,
     static_head_terms,
     head_resolver,
+    screening_model_fn,
     config,
     meta,
     mesh_xy: Mesh,
@@ -4486,6 +4534,7 @@ def run_sc_driver(
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,
         head_resolver=head_resolver,
+        screening_model_fn=screening_model_fn,
         config=config, meta=meta, mesh_xy=mesh_xy,
         sym=sym, wfn=wfn, centroid_indices=centroid_indices,
         band_slices=band_slices, input_dir=input_dir,

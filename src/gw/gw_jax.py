@@ -894,6 +894,7 @@ def main(argv=None):
 				quad=quad, e_ref=e_ref,
 				static_head_terms=static_head_terms,
 				head_resolver=head_resolver,
+				screening_model_fn=compute_screening_model,
 				config=config, meta=meta, mesh_xy=mesh_xy,
 				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
 				band_slices=band_slices, input_dir=input_dir,
