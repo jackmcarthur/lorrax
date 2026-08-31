@@ -311,11 +311,10 @@ class SCInputs:
     #: ``sc_head_update=off``.  Built once on the shared screening plan, not
     #: rebuilt in every map call; the resident W still supplies the one fold.
     fixed_dft_head_response: object | None = None
-    #: Seed mapping and exact fit path resolved once by a certified-fit
-    #: provider before the nonlinear solver starts.  The seed serves map 0;
-    #: later maps retain only its sample-grid provenance and rebuild W.
-    screening_seed: object | None = None
-    certified_fit_path: str | None = None
+    #: One-entry source-resolution cache for certified-fit reuse.  It is
+    #: populated at map 0 only after the exact JAX-built entry occupation
+    #: state exists; later maps read the path as immutable grid provenance.
+    screening_seed_cache: dict | None = None
     print_fn: Callable = print
 
 
@@ -2529,9 +2528,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "MPA certified-fit reuse with no screening quadrature cannot "
                 "serve head_correction=full, whose current-iteration head "
                 "must be folded through newly sampled W")
-        certified_fit = inputs.certified_fit_path
+        cache = inputs.screening_seed_cache
+        certified_fit = (cache.get("mpa_fit") if cache is not None else None)
         if state.iteration == 0:
-            screening_reuse = inputs.screening_seed
+            screening_reuse = (
+                cache.get("mapping") if cache is not None else None)
+            if screening_reuse is None:
+                screening_reuse = _screening(None, None)
+                if isinstance(screening_reuse, dict):
+                    certified_fit = screening_reuse.get("mpa_fit")
+                if cache is not None and certified_fit is not None:
+                    cache.update(
+                        mapping=screening_reuse, mpa_fit=certified_fit)
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
@@ -4572,40 +4580,10 @@ def run_sc_driver(
         kstar=kstar,
         parallel_transport=parallel_transport,
         fixed_dft_head_response=fixed_dft_head_response,
+        screening_seed_cache={},
         print_fn=print_fn,
     )
     state_init = make_initial_state_from_dft(inputs)
-    if config.compute_mode is ComputeMode.MPA and quad is None:
-        if config.head.correction is HeadCorrection.FULL:
-            raise ValueError(
-                "MPA certified-fit reuse with no screening quadrature cannot "
-                "serve head_correction=full, whose current-iteration head "
-                "must be folded through newly sampled W")
-        metal_occ_state = (
-            state_init.occupation_state
-            if _material_class(inputs) == "metal" else None)
-        screening_seed = screening_model_fn(
-            config.compute_mode, wfns, V_q,
-            quad=quad, e_ref=e_ref, sym=sym,
-            centroid_indices=centroid_indices, config=config, meta=meta,
-            mesh_xy=mesh_xy,
-            run_dir=os.path.join(input_dir, "tmp", "mpa"),
-            label="sc_0000", head_resolver=head_resolver,
-            head_channel=head_channel, wfn=wfn,
-            mpa_plan=None, iteration_head_response=None,
-            occupation_state=metal_occ_state,
-            tensors_filename=tensors_filename,
-            print_fn=print_fn)
-        certified_fit_path = (
-            screening_seed.get("mpa_fit")
-            if isinstance(screening_seed, dict) else None)
-        if certified_fit_path is None:
-            raise ValueError(
-                "MPA SC has no screening quadrature and its reuse provider "
-                "did not return an already-resolved {'mpa_fit': path} seed")
-        inputs = dataclasses.replace(
-            inputs, screening_seed=screening_seed,
-            certified_fit_path=os.fspath(certified_fit_path))
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
