@@ -45,6 +45,18 @@ def test_operation_rows_owns_rotation_translation_and_antiunitary_typing():
         np.conj(sym.reciprocal_phase(2, carrier)), atol=1e-15)
 
 
+def test_fft_pullback_accepts_typed_rows_without_consumer_row_decoding():
+    sym = _typed_sym()
+    pullback = sym.fft_grid_pullback(
+        np.asarray([2, 5], dtype=np.int32), (4, 4, 1))
+    assert pullback.shape == (2, 16)
+    np.testing.assert_array_equal(pullback[0], pullback[1])
+    np.testing.assert_array_equal(np.sort(pullback[0]), np.arange(16))
+
+    with pytest.raises(ValueError, match="rank one"):
+        sym.fft_grid_pullback(np.asarray([[2]]), (4, 4, 1))
+
+
 def test_cartesian_traits_distinguish_forward_inverse_parity_and_time_reversal():
     sym = _typed_sym()
     rows = np.arange(6, dtype=np.int32)

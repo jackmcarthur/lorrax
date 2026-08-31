@@ -303,7 +303,6 @@ class WAvStencilReader:
             sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
             seed_steps=m.seed_steps,
             n_sym_spatial=int(len(sym.sym_mats_k) // 2),
-            allow_trs=bool(sym.trs_allowed),
             active_symmetry_rows=np.asarray(
                 sym.active_symmetry_rows, dtype=np.int32),
         )
@@ -838,7 +837,6 @@ def _write_w_av_stage(
         sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
         seed_steps=seeds,
         n_sym_spatial=int(wfn.ntran),
-        allow_trs=bool(sym.trs_allowed),
         active_symmetry_rows=np.asarray(
             sym.active_symmetry_rows, dtype=np.int32),
     )

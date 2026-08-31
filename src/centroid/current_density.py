@@ -62,16 +62,15 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
 
         sum_i j_i(k, r_new)^2 = sum_i j_i(p, r_old)^2.
 
-    ``symmetry_maps.fft_grid_pullback_perm`` supplies the exact nonsymmorphic
-    ``r_new -> r_old`` gather.  A TRS-augmented row uses the same spatial
-    pullback as its first-half partner; its extra current sign drops out of
-    the square.  Thus the star accumulation is exactly the full-BZ
-    WfnLoader-unfold result at fixed band index, without rebuilding any
-    wavefunction, G-vector, FFT-box, or symmetry action here.
+    ``SymMaps.fft_grid_pullback`` supplies the exact nonsymmorphic
+    ``r_new -> r_old`` gather for each typed row.  Its antiunitary current
+    sign drops out of the square.  Thus the star accumulation is exactly the
+    full-BZ WfnLoader-unfold result at fixed band index, without rebuilding
+    any wavefunction, G-vector, FFT-box, or symmetry action here.
     """
     from common.collectives import single_device_mesh
     from common.wfn_transforms import to_rbox
-    from symmetry_maps import fft_grid_pullback_perm, star_tables_of
+    from symmetry_maps import star_tables_of
     from wfn_loader import IBZRows, WfnLoader, uniform_band_windows
 
     if not isinstance(wfn, WfnLoader):
@@ -128,18 +127,7 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
         return field
 
     nk_full = int(sym.nk_tot)
-    # Keep the full-k parent row, selected symmetry row, and spatial/TRS
-    # split inseparable.  ``star_tables_of`` derives the split from the same
-    # TRS-augmented table that the WFN unfold consumes.
-    parent_for_k, sym_row_for_k, n_spatial = star_tables_of(sym)
-    if n_spatial < 1:
-        raise ValueError("SymMaps contains no spatial symmetry row")
-    sym_mats_k_shape = np.asarray(sym.sym_mats_k).shape
-    if sym_mats_k_shape != (2 * n_spatial, 3, 3):
-        raise ValueError(
-            "SymMaps.sym_mats_k must contain spatial rows followed by their "
-            "TRS partners; got "
-            f"{sym_mats_k_shape}, expected {(2 * n_spatial, 3, 3)}")
+    parent_for_k, sym_row_for_k, _ = star_tables_of(sym)
     if parent_for_k.shape != (nk_full,) or sym_row_for_k.shape != (nk_full,):
         raise ValueError(
             "SymMaps full-k tables disagree with nk_tot: "
@@ -150,22 +138,14 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
         raise ValueError(
             "SymMaps.irr_idx_k contains a row outside the raw WFN k axis "
             f"[0,{int(wfn.nkpts)})")
-    if (np.any(sym_row_for_k < 0)
-            or np.any(sym_row_for_k >= 2 * n_spatial)):
-        raise ValueError(
-            "SymMaps.sym_idx_k contains a row outside its spatial/TRS-"
-            f"augmented table [0,{2 * n_spatial})")
-
-    grid_pullback = fft_grid_pullback_perm(
-        np.asarray(sym.sym_matrices)[:n_spatial],
-        np.asarray(sym.translations)[:n_spatial],
-        fft_grid,
-        validate=True,
-    )
-    if grid_pullback.shape != (n_spatial, n_grid):
+    pullback_rows, pullback_slot_for_k = np.unique(
+        sym_row_for_k, return_inverse=True)
+    grid_pullback = sym.fft_grid_pullback(
+        pullback_rows, fft_grid, validate=True)
+    if grid_pullback.shape != (pullback_rows.size, n_grid):
         raise ValueError(
             "symmetry-service FFT-grid pullback has the wrong shape: "
-            f"{grid_pullback.shape} != {(n_spatial, n_grid)}")
+            f"{grid_pullback.shape} != {(pullback_rows.size, n_grid)}")
 
     # One physical grid field at a time on both device and host.  Enumerating
     # the selected full-k rows preserves the exact star multiplicities and
@@ -181,8 +161,8 @@ def build_current_density(wfn, sym, n_occ: int, *, verbose: bool = True):
             field_for_k(IBZRows((parent,))), dtype=np.float64).reshape(-1)
         members = np.flatnonzero(parent_for_k == parent)
         for ik in members:
-            spatial_row = int(sym_row_for_k[int(ik)]) % n_spatial
-            rho_flat += field_flat[grid_pullback[spatial_row]]
+            slot = int(pullback_slot_for_k[int(ik)])
+            rho_flat += field_flat[grid_pullback[slot]]
         full_rows_done += int(members.size)
         if verbose and time.perf_counter() - last_log > 5.0:
             last_log = time.perf_counter()

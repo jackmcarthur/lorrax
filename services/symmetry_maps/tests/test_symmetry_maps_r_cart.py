@@ -1,8 +1,8 @@
-"""The Cartesian transpose contract: ``R_cart`` vs ``R_cart_forward`` (G5).
+"""The Cartesian transpose contract behind typed Cartesian actions (G5).
 
 THE GAP THIS CLOSES.  Survey §7.2 G5: "The ``R_cart`` transpose contract's
-only test is ``extra``-marked AND fixture-skipped" — ``tests/test_R_proper_
-cri3.py`` carries ``pytestmark = pytest.mark.extra`` (deselected by the
+only test is ``extra``-marked AND fixture-skipped" — the retained CrI3
+Cartesian-action test carries ``pytestmark = pytest.mark.extra`` (deselected by the
 suite's own ``addopts``) on top of a ``skipif`` against two hard-coded
 ``/pscratch/…/lorrax_sandbox/`` paths.  Doubly invisible, and it was the
 only executable transpose contract in the tree.  Everything here runs on
@@ -12,9 +12,8 @@ WHAT THE PROPERTY IS.  ``R_cart`` is the Cartesian image of ``mtrx``, and
 ``mtrx`` is the INVERSE real-space rotation, so ``R_cart`` is the inverse
 of the rotation carrying ``k_irr`` to ``S·k_irr``.  The spinor sandwich
 wants it that way and is provably unaffected (two inversions cancel in the
-transposed Shepperd form).  Anything rotating a Cartesian INDEX wants the
-other one.  ``SymMaps.R_cart_forward`` is that other one, named — decision
-5: an ADDITIVE property, no rename, consumer math untouched this wave.
+transposed Shepperd form).  Anything rotating a Cartesian INDEX requests the
+forward action explicitly through ``SymMaps.cartesian_action``.
 
 WHY IT NEEDED A NAME AT ALL — the measurement, not the argument.  For an
 ORTHOGONAL R the transpose is the inverse, so the wrong spelling is
@@ -35,7 +34,7 @@ check` is where it is made visible.
 
 THE DECK MATTERS.  On ``gnppm_debug`` and ``bispinor_debug`` every op is
 SYMMETRIC (0 of 4 non-symmetric — MoS2 3x3 is symmorphic with σ_h and the
-Cartesian images come out symmetric), so ``R_cart_forward == R_cart`` there
+Cartesian images come out symmetric), so the forward action equals ``R_cart``
 and a cell parametrized over all four decks would be green and vacuous on
 half of them.  ``test_two_of_the_four_decks_cannot_tell_the_spellings_apart``
 writes that down.
@@ -66,6 +65,12 @@ def _sym(deck):
 def _asymmetric_ops(R):
     return [i for i in range(R.shape[0])
             if float(np.abs(R[i] - R[i].T).max()) > 1e-8]
+
+
+def _polar_time_odd(sym):
+    rows = np.arange(np.asarray(sym.R_cart).shape[0], dtype=np.int32)
+    return np.asarray(
+        sym.cartesian_action(rows, axial=False, time_odd=True))
 
 
 class _TrivialDeck:
@@ -102,7 +107,7 @@ def test_the_forward_rotation_is_the_transpose_per_op(deck):
     """
     _, sym = _sym(deck)
     R = np.asarray(sym.R_cart)
-    F = np.asarray(sym.R_cart_forward)
+    F = _polar_time_odd(sym)
     assert F.shape == R.shape
     assert np.array_equal(F, np.swapaxes(R, -1, -2))
     for s in range(R.shape[0]):
@@ -123,7 +128,7 @@ def test_every_op_is_orthogonal_and_the_transpose_is_the_inverse(deck):
     """
     _, sym = _sym(deck)
     R = np.asarray(sym.R_cart)
-    F = np.asarray(sym.R_cart_forward)
+    F = _polar_time_odd(sym)
     worst = max(float(np.abs(R[s] @ R[s].T - np.eye(3)).max())
                 for s in range(R.shape[0]))
     assert worst < 1e-6, f"{deck}: worst |R Rᵀ − I| = {worst:.3e}"
@@ -148,9 +153,8 @@ def test_the_determinants_follow_the_documented_row_convention(deck):
     written to the "first half is proper" reading would pass on a deck with
     no improper spatial ops and be wrong everywhere else.
 
-    ``R_proper`` (:1188-1193) is the one with the det-flip applied, and it
-    duplicates the SPATIAL half rather than negating it: that difference is
-    asserted here so the two tables cannot silently converge.
+    The axial, time-even action applies the determinant sign and duplicates
+    the SPATIAL half on antiunitary rows.  That difference is asserted here.
     """
     d, sym = _sym(deck)
     R = np.asarray(sym.R_cart)
@@ -160,10 +164,11 @@ def test_the_determinants_follow_the_documented_row_convention(deck):
     dets = np.rint(np.linalg.det(R.astype(float))).astype(int)
     assert set(dets.tolist()) <= {1, -1}, sorted(set(dets.tolist()))
     assert np.array_equal(dets[n:], -dets[:n])
-    P = np.asarray(sym.R_proper)
+    P = np.asarray(sym.cartesian_action(
+        np.arange(2 * n, dtype=np.int32), axial=True, time_odd=False))
     assert P.shape == (2 * n, 3, 3)
     assert np.array_equal(P[n:], P[:n]), (
-        "R_proper's TRS half DUPLICATES the spatial half (:1192); negating "
+        "the axial time-even TRS half must duplicate the spatial half; negating "
         "it is the pre-2026-05-14 bug")
     assert np.allclose(np.linalg.det(P.astype(float)), 1.0, atol=1e-6)
 
@@ -178,7 +183,7 @@ def test_the_no_symmetry_branch_publishes_a_forward_rotation_too():
     """
     sym = SymMaps(_TrivialDeck())
     R = np.asarray(sym.R_cart)
-    F = np.asarray(sym.R_cart_forward)
+    F = _polar_time_odd(sym)
     assert R.shape == (2, 3, 3)
     np.testing.assert_array_equal(R[0], np.eye(3))
     np.testing.assert_array_equal(R[1], -np.eye(3))
@@ -232,11 +237,11 @@ def test_the_wrong_spelling_is_invisible_to_every_cheap_check(deck):
     """
     _, sym = _sym(deck)
     R = np.asarray(sym.R_cart)
-    F = np.asarray(sym.R_cart_forward)
+    F = _polar_time_odd(sym)
     asym = _asymmetric_ops(R)
     assert asym, (
         f"PRECONDITION: {deck} must have at least one NON-SYMMETRIC op or "
-        f"R_cart_forward == R_cart and this cell proves nothing")
+        f"the forward action equals R_cart and this cell proves nothing")
 
     orth = max(float(np.abs(R[s] @ R[s].T - np.eye(3)).max())
                for s in range(R.shape[0]))
@@ -295,7 +300,7 @@ def test_two_of_the_four_decks_cannot_tell_the_spellings_apart():
     """RED TWIN for the deck choice — why the cell above is not a loop.
 
     On gnppm_debug and bispinor_debug every Cartesian op is SYMMETRIC, so
-    ``R_cart_forward`` IS ``R_cart`` and the visibility test would be a
+    The forward action equals ``R_cart`` and the visibility test would be a
     green no-op.  MEASURED: 0 of 4 non-symmetric on both, against 56 of 96
     on Si and 8 of 24 on cohsex.  Writing this down is what stops a later
     "why not parametrize over all four?" from deleting the contract while
@@ -319,20 +324,12 @@ def test_two_of_the_four_decks_cannot_tell_the_spellings_apart():
         "property is untestable in this tree")
 
 
-def test_the_forward_property_is_not_a_stored_attribute():
-    """It is DERIVED, so it cannot go stale against ``R_cart``.
-
-    A cached copy set in ``__init__`` would be a second source of truth for
-    the same three numbers, and the failure mode is the one this service
-    already has a receipt for: two tables encoding one policy and drifting.
-    Asserted structurally (it is a ``property`` on the class) and
-    behaviourally (mutating ``R_cart`` moves it).
-    """
+def test_the_forward_action_is_derived_not_stored():
+    """The typed result follows its one raw service table without a cache."""
     sym = SymMaps(_TrivialDeck())
-    assert isinstance(getattr(type(sym), "R_cart_forward", None), property)
-    assert "R_cart_forward" not in vars(sym)
     sym.R_cart = np.array([[[0.0, 1.0, 0.0],
                             [0.0, 0.0, 1.0],
                             [1.0, 0.0, 0.0]]])
-    assert np.array_equal(np.asarray(sym.R_cart_forward)[0],
-                          np.asarray(sym.R_cart)[0].T)
+    got = sym.cartesian_action(
+        np.asarray([0], dtype=np.int32), axial=False, time_odd=True)
+    assert np.array_equal(np.asarray(got)[0], np.asarray(sym.R_cart)[0].T)

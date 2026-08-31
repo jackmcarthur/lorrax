@@ -1392,8 +1392,9 @@ def mix_channels_by_proper_rotation(
         shape, sharded ``P(None, 'x', 'y')``.  Callers may pass the 6
         unique tiles + the 3 Hermitian-redundant tiles synthesised via
         ``conj(swapaxes(V[i,j], -1, -2))``.
-    sym_idx : np.ndarray | jax.Array
-        ``(n_q_full,)`` int — ``SymMaps.sym_idx_q`` (TRS-augmented).
+    sym_idx : numpy.ndarray
+        Host ``(n_q_full,)`` integer metadata from ``SymMaps.sym_idx_q``.
+        Device arrays and tracers are refused before the compiled tile path.
     sym : SymMaps
         Canonical operation and representation source.
     mesh_xy : jax.sharding.Mesh
@@ -1404,6 +1405,10 @@ def mix_channels_by_proper_rotation(
     dict[(i, j) -> jax.Array]
         Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
     """
+    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
+        raise TypeError(
+            "mix_channels_by_proper_rotation: sym_idx is host metadata; "
+            "pass a NumPy array, not a JAX array or tracer.")
     sym_raw = np.asarray(sym_idx)
     if sym_raw.ndim != 1:
         raise ValueError(
@@ -2051,7 +2056,7 @@ class SymMaps:
             self.Rinv_grid = self.R_grid.copy()
             # Keep the same augmented-row invariant as ``sym_mats_k``:
             # the TRS row is the negative Cartesian row.  The old one-row
-            # special case made ``R_cart_forward[sym_idx]`` fail exactly on
+            # special case made ``cartesian_action(sym_idx, ...)`` fail on
             # an identity-only WFN if a measured policy selected its TRS
             # partner, despite the reciprocal table correctly having two
             # rows.
@@ -2211,6 +2216,9 @@ class SymMaps:
         # relationship ``find_symmetry_ops_simple`` produces below, it was
         # published as ``self.kpoint_map``, and nothing live read it.
         self.unfolded_kpts = self.create_kpoint_symmetry_map(wfn)
+        # Validate the WFN's own stored rows before a coverage failure can
+        # hide a contradictory kgrid/shift behind a generic symmetry error.
+        self.kirr_fullids = self._match_file_wedge_rows(wfn)
 
         # ``None`` for the retired parent map: the parameter stays in the
         # signature for older callers, and the method has discarded its
@@ -2275,27 +2283,6 @@ class SymMaps:
         # row to return in that case and it raises instead of guessing.  The
         # tolerance is ``find_symmetry_ops_simple``'s 1e-6, the same number
         # the star map two lines up was built with.
-        kirr_fullids = np.empty(self.nk_red, dtype=np.int32)
-        _kpts_irr = np.asarray(wfn.kpoints, dtype=np.float64)
-        for kirr in range(self.nk_red):
-            metric = np.max(np.abs(self._periodic_delta(
-                self.unfolded_kpts, _kpts_irr[kirr])), axis=1)
-            hit = int(np.argmin(metric))
-            if metric[hit] > 1e-6:
-                raise RuntimeError(
-                    f"SymMaps: irreducible k-point {kirr} "
-                    f"{_kpts_irr[kirr].tolist()} is not on the uniform "
-                    f"{tuple(int(x) for x in np.asarray(wfn.kgrid))} k-grid "
-                    f"that this WFN's own kgrid/shift generate — the closest "
-                    f"full-BZ row is {hit} at "
-                    f"{self.unfolded_kpts[hit].tolist()}, off by "
-                    f"{metric[hit]:.3e}.  ``kirr_fullids`` cannot name a row "
-                    f"for it, and every wedge-shaped output (eqp0.dat, "
-                    f"eqp1.dat, WFN_qp.h5) would then be indexed with a "
-                    f"guess.  Fix the file's k-list or its kgrid/shift.")
-            kirr_fullids[kirr] = hit
-        self.kirr_fullids = kirr_fullids
-
         # useful maps:
         # k (full zone) to kbar 
         # k,q (both full zone) to k-q (full zone)
@@ -2377,6 +2364,25 @@ class SymMaps:
         """Return shortest-image fractional-coordinate differences."""
         delta = np.asarray(points, dtype=np.float64) - np.asarray(target, dtype=np.float64)[None, :]
         return delta - np.round(delta)
+
+    def _match_file_wedge_rows(self, wfn):
+        """Map stored WFN k rows to the generated uniform grid or refuse."""
+        rows = np.empty(int(wfn.nkpts), dtype=np.int32)
+        stored = np.asarray(wfn.kpoints, dtype=np.float64)
+        for kirr, kpoint in enumerate(stored):
+            metric = np.max(np.abs(self._periodic_delta(
+                self.unfolded_kpts, kpoint)), axis=1)
+            hit = int(np.argmin(metric))
+            if metric[hit] > 1.0e-6:
+                raise RuntimeError(
+                    f"SymMaps: irreducible k-point {kirr} {kpoint.tolist()} "
+                    f"is not on the uniform "
+                    f"{tuple(int(x) for x in np.asarray(wfn.kgrid))} k-grid "
+                    f"that this WFN's own kgrid/shift generate; closest row "
+                    f"{hit} is {self.unfolded_kpts[hit].tolist()}, off by "
+                    f"{metric[hit]:.3e}. Fix the file's k-list or kgrid/shift.")
+            rows[kirr] = hit
+        return rows
 
     def _generate_uniform_full_kpoints(self, wfn):
         """Return the full uniform crystal-coordinate k-grid implied by the WFN metadata."""
@@ -2643,21 +2649,6 @@ class SymMaps:
             and np.array_equal(
                 np.asarray(self.q_irr_kgrid_int, dtype=np.int32), q_full))
 
-    @property
-    def R_cart_forward(self):
-        """Compatibility table for a polar, time-odd Cartesian index."""
-        n = int(np.asarray(self.sym_matrices).shape[0])
-        return self.cartesian_action(
-            np.arange(2 * n, dtype=np.int32), axial=False, time_odd=True)
-
-    @property
-    def R_proper(self):
-        """Compatibility table for the inverse axial, time-even action."""
-        n = int(np.asarray(self.sym_matrices).shape[0])
-        forward = self.cartesian_action(
-            np.arange(2 * n, dtype=np.int32), axial=True, time_odd=False)
-        return np.swapaxes(forward, -1, -2)
-
     def operation_rows(self, rows):
         """Return reciprocal action, spatial translation and TR bit.
 
@@ -2680,6 +2671,21 @@ class SymMaps:
         spatial = idx % n
         return (np.asarray(self.sym_mats_k)[idx],
                 np.asarray(self.translations)[spatial], idx >= n)
+
+    def fft_grid_pullback(self, rows, fft_grid, *, validate=True):
+        """Return real-space FFT pullbacks for canonical operation rows."""
+        raw = np.asarray(rows)
+        if raw.ndim != 1:
+            raise ValueError(
+                "SymMaps.fft_grid_pullback: rows must be rank one; "
+                f"got {raw.shape}.")
+        _, translations, _ = self.operation_rows(raw)
+        n = int(np.asarray(self.sym_matrices).shape[0])
+        spatial = raw.astype(np.int32, copy=False) % n
+        from .orbit_syms import fft_grid_pullback_perm
+        return fft_grid_pullback_perm(
+            np.asarray(self.sym_matrices)[spatial], translations, fft_grid,
+            validate=validate)
 
     def cartesian_action(self, rows, *, axial, time_odd):
         """Forward action for a typed Cartesian index.

@@ -547,9 +547,8 @@ def test_a_mu_extent_mismatch_refuses_in_both_tables():
 # G6 — mix_channels_by_proper_rotation
 # ---------------------------------------------------------------------------
 
-def _r_proper(rng, n_rows):
-    """A ``(2·ntran, 3, 3)`` R_proper-shaped table: proper rotations, TRS
-    half duplicating the spatial half (``SymMaps.R_proper``'s own shape)."""
+def _inverse_axial_rows(rng, n_rows):
+    """Inverse axial rotations with a duplicated antiunitary half."""
     spatial = []
     for _ in range(n_rows):
         a = rng.standard_normal((3, 3))
@@ -585,14 +584,10 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
         V^{i,j}_mixed = Σ_{α,β} R^{α,i}(q) · R^{β,j}(q) · V^{α,β}
 
     THE COMPENSATING TRANSPOSE, which is the trap this cell exists for.
-    The derivation text writes ``R_deriv^{i,α} · R_deriv^{j,β}``, but the
-    LIVE ``R_proper`` is built from ``A·mtrx·A⁻¹`` while the derivation's
-    is ``A·mtrx⁻¹·A⁻¹`` — for orthogonal ``mtrx`` the two are transposes of
-    each other, so the live contraction carries the indices the other way
-    round.  ``SymMaps.R_proper``'s docstring records the same fact about
-    the offline CrI3 fixture: it "differs from the OFFLINE fixture
-    ``cri3_R_proper.npz`` by a transpose on every row".  The reference
-    below is written in the LIVE convention, and
+    The derivation text writes ``R_deriv^{i,α} · R_deriv^{j,β}``; the
+    service exposes the forward typed action, so the live contraction carries
+    those indices in the opposite order from an inverse-action table.  The
+    reference below is written in the live convention, and
     :func:`test_the_lorentz_reference_notices_a_transposed_R` is the twin
     that proves the difference is visible.
     """
@@ -600,7 +595,7 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
     mesh = _mesh(px, py)
     rng = np.random.default_rng(23)
     n_q, n_mu = 5, 8
-    R = _r_proper(rng, _NTRAN)
+    R = _inverse_axial_rows(rng, _NTRAN)
     tiles = {}
     for i in (1, 2, 3):
         for j in (1, 2, 3):
@@ -636,7 +631,7 @@ def test_the_lorentz_reference_notices_a_transposed_R():
     """
     rng = np.random.default_rng(29)
     n_q, n_mu = 5, 4
-    R = _r_proper(rng, _NTRAN)
+    R = _inverse_axial_rows(rng, _NTRAN)
     Rq = R[np.asarray(_SYM)]
     tiles = {(i, j): (rng.standard_normal((n_q, n_mu, n_mu))
                       + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
@@ -672,7 +667,7 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
     import jax.numpy as jnp
     mesh = _mesh(1, 1)
     rng = np.random.default_rng(31)
-    R = _r_proper(rng, _NTRAN)
+    R = _inverse_axial_rows(rng, _NTRAN)
     tiles = {(i, j): jnp.asarray(rng.standard_normal((5, 4, 4))
                                  + 0j)
              for i in (1, 2, 3) for j in (1, 2, 3)}
@@ -688,6 +683,10 @@ def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
     with pytest.raises(ValueError, match=r"typed Cartesian actions"):
         mix_channels_by_proper_rotation(
             tiles, sym=_BadTypedSym(), sym_idx=_SYM, mesh_xy=mesh)
+
+    with pytest.raises(TypeError, match=r"host metadata"):
+        mix_channels_by_proper_rotation(
+            tiles, sym=_TypedSym(R), sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------

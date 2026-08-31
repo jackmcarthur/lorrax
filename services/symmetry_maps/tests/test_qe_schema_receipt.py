@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,6 +26,7 @@ _ORDER3 = np.asarray([
     [0, 0, 1],
 ], dtype=np.int32)
 _TAU_QE = np.asarray([1.0 / 3.0, 2.0 / 3.0, 0.0])
+_REAL_QE_SCHEMA = Path(__file__).with_name("data") / "qe_7_2_si_schema_min.xml"
 
 
 def _matrix_text(matrix) -> str:
@@ -108,6 +110,21 @@ def test_xml_raw_orientation_and_seitz_translation_are_distinct(tmp_path):
                                   np.asarray([2, -3, 0]))
     assert not np.array_equal(receipt.sym_matrices[1] @ k,
                               receipt.sym_matrices[1].T @ k)
+
+
+def test_minimized_real_qe_schema_pins_storage_order_and_translation_units():
+    receipt = read_qe_symmetry_receipt(_REAL_QE_SCHEMA)
+    matrix = np.asarray([[-1, -1, -1], [0, 0, 1], [0, 1, 0]])
+    tau_qe = np.asarray([-0.5, 2.775557561562891e-17,
+                         -2.775557561562891e-17])
+
+    assert receipt.nspinor == 1
+    assert receipt.no_t_rev
+    np.testing.assert_array_equal(receipt.sym_matrices[1], matrix)
+    np.testing.assert_allclose(
+        receipt.translations[1],
+        2.0 * np.pi * (np.linalg.inv(matrix) @ tau_qe), atol=2.0e-15)
+    assert receipt.antiunitary.tolist() == [False, False]
 
 
 def test_binding_refuses_transposed_major_minor_axis_twin(tmp_path):
@@ -297,18 +314,18 @@ def test_file_wedge_polar_matrix_uses_typed_antiunitary_row_once():
     got = unfold_file_wedge_polar_matrix(sym, wedge)
     expected = np.empty_like(got)
     ntran = int(np.asarray(sym.sym_mats_k).shape[0]) // 2
+    actions = sym.cartesian_action(
+        np.arange(2 * ntran, dtype=np.int32), axial=False, time_odd=True)
     for ik in range(sym.nk_tot):
         row = int(sym.sym_idx_k[ik])
         parent = wedge[int(sym.irr_idx_k[ik])]
         if row >= ntran:
             parent = np.conj(parent)
-        expected[ik] = np.einsum(
-            "oi,iab->oab", sym.R_cart_forward[row], parent)
+        expected[ik] = np.einsum("oi,iab->oab", actions[row], parent)
     np.testing.assert_allclose(got, expected, atol=2.0e-15)
     assert int(sym.sym_idx_k[2]) == 3
     # The row-3 Cartesian table already includes velocity's TR-odd minus.
-    np.testing.assert_array_equal(
-        sym.R_cart_forward[3], -sym.R_cart_forward[1])
+    np.testing.assert_array_equal(actions[3], -actions[1])
 
 
 def test_file_wedge_polar_matrix_uses_forward_not_inverse_rotation():

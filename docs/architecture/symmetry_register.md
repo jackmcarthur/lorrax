@@ -671,7 +671,7 @@ gather in its own way. **Measured 2026-08-16** on the committed fixtures
 | quantity | what the index is | plain gather | the rule that works |
 |---|---|---|---|
 | `deltaE` | none (energies) | **exact** | gather |
-| `dipole_cart` | Cartesian component of **v̂** | **rel 2.0 — 200 % wrong** | `R_cart_forward` on the component axis, `conj` on TRS rows, **and −1 on TRS rows** |
+| `dipole_cart` | Cartesian component of **v̂** | **rel 2.0 — 200 % wrong** | `cartesian_action(..., axial=False, time_odd=True)` on the component axis plus `conj` on antiunitary rows |
 | `psi_full_y` | ψ on the centroid grid | **rel 1.640 — 164 % wrong** | centroid permutation + L-phase + spinor rotation + the `unfold_psi` TRS rule |
 | `U_mnk` | eigenvector gauge | run-dependent | *there is no rule* — see `qp_wfn_rotations.h5` below |
 
@@ -680,8 +680,8 @@ measurable separately and both are ~100 % of the signal:
 
 * **si_cohsex_debug** (64 k → 8, 48 spatial ops, **0 time-reversed rows**):
   plain gather `max|Δ| = 4.800535` against a scale of 2.400268 — **rel 2.000**.
-  With `R_proper` applied untransposed, 3.687563. With it **transposed**
-  (i.e. `R_cart_forward`), **4.000962e-15**. Exact.
+  With the inverse axial table applied untransposed, 3.687563. With the
+  explicit forward polar action, **4.000962e-15**. Exact.
 * **gnppm_debug** (9 k, 4 of 9 rows time-reversed): transposed-`R` + `conj`
   gives spatial rows **0.000000e+00** and TRS rows **2.836690** — again
   rel 2.000, which is what `+v` against `−v` looks like. Adding **−1 on the
@@ -791,7 +791,7 @@ The move was scoped anyway and **not taken**. Two reasons, in order:
 2. **The gate that would guard it is blind on the only deck that can run it.**
    Moving storage promotes `mix_channels_by_proper_rotation` from a write-time
    convenience to a load-bearing read path, and the audit measured that on
-   `bispinor_debug` every selected q-row has `R_proper = I`, so its mixing
+   `bispinor_debug` every selected q-row has an identity axial action, so its mixing
    counterfactual is **0.000e+00** — the same blindness `gnppm_debug` has, for
    the same reason (two trivial ops). An ordering or transpose slip in a
    read-time mix preserves shapes, Hermiticity and plausible spectra, so the

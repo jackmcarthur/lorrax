@@ -288,7 +288,7 @@ def test_q_stencil_reduces_first_second_and_mixed_neighbors():
         sym_idx_q=sym_idx,
         seed_steps=np.asarray(seeds),
         n_sym_spatial=len(spatial),
-        allow_trs=True,
+        active_symmetry_rows=np.arange(len(syms), dtype=np.int32),
     )
 
     assert table["target_steps"].shape == (24, 3)
@@ -299,3 +299,32 @@ def test_q_stencil_reduces_first_second_and_mixed_neighbors():
         source = table["source_steps"][source_row]
         np.testing.assert_array_equal(
             np.mod(syms[isym] @ source, grid), np.mod(target, grid))
+
+
+def test_q_stencil_keeps_sparse_authenticated_global_row_ids():
+    """A compact active table must never be indexed by its global row ID."""
+    grid = np.asarray((1, 3, 1), dtype=np.int32)
+    spatial = np.stack([
+        np.eye(3, dtype=np.int32),
+        np.diag([-1, 1, -1]).astype(np.int32),
+    ])
+    syms = np.concatenate([spatial, -spatial], axis=0)
+    table = q_stencil_orbit_table(
+        kgrid=grid,
+        sym_mats_k=syms,
+        irr_idx_q=np.asarray([0, 1, 1], dtype=np.int32),
+        sym_idx_q=np.asarray([0, 0, 3], dtype=np.int32),
+        seed_steps=np.asarray([[0, 1, 0]], dtype=np.int32),
+        n_sym_spatial=2,
+        active_symmetry_rows=np.asarray([0, 3], dtype=np.int32),
+    )
+
+    np.testing.assert_array_equal(
+        table["target_steps"], np.asarray([[0, -1, 0], [0, 1, 0]]))
+    np.testing.assert_array_equal(table["target_sym_idx"], [3, 0])
+    for target, source_row, row in zip(
+            table["target_steps"], table["target_source_row"],
+            table["target_sym_idx"]):
+        source = table["source_steps"][source_row]
+        np.testing.assert_array_equal(
+            np.mod(syms[row] @ source, grid), np.mod(target, grid))

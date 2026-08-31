@@ -221,7 +221,7 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
     cA = np.zeros(3, dtype=np.complex128); cB = np.zeros(3, dtype=np.complex128)
     PA_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
     PB_band = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-    S_sum = 0.0
+    S_sum = np.zeros(3, dtype=np.float64)
     E = np.zeros((nrk, nbnd), dtype=np.float64)
     for i in range(nrk):
         G_pad, g_mask = gtab.at(i)
@@ -242,8 +242,14 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
             v = v + sign * np.asarray(vnl_ops.vnl_velocity_matrix(
                 psi_phys, kdata.Z, kdata.dZ, kdata.E_super))
         psi_np = np.asarray(psi_G)
-        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
-        S_sum += w_ibz[i] * float(sz[:nocc].sum())
+        overlap = np.sum(np.conj(psi_np[:, 0]) * psi_np[:, 1], axis=1)
+        spin = np.stack((
+            2.0 * overlap.real,
+            2.0 * overlap.imag,
+            (np.abs(psi_np[:, 0]) ** 2
+             - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real,
+        ), axis=1)
+        S_sum += w_ibz[i] * spin[:nocc].sum(axis=0)
         pa, pb = orbital_pieces_at_k(v, eps, nocc, deps_tol)
         cA += w_ibz[i] * pa.sum(axis=(1, 2)); cB += w_ibz[i] * pb.sum(axis=(1, 2))
         PA_band += w_ibz[i] * pa; PB_band += w_ibz[i] * pb
@@ -252,10 +258,11 @@ def run_ibz(wfn, sym, meta, vnl_setup, nbnd, nocc, deps_tol, m_axis, sign):
 
     cA = Pmat.astype(np.complex128) @ cA                 # symmetrize the (3,) vector
     cB = Pmat.astype(np.complex128) @ cB
+    S_sum = Pmat @ S_sum
     PA_band_z = np.einsum('a,anm->nm', Pmat[2], PA_band)  # z-row band-resolved
     PB_band_z = np.einsum('a,anm->nm', Pmat[2], PB_band)
     info = {"nk_ibz": nrk, "nG": len(active_rows), "idx": active_rows.tolist()}
-    return cA, cB, PA_band_z, PB_band_z, -1.0 * S_sum, E, info
+    return cA, cB, PA_band_z, PB_band_z, -float(S_sum[2]), E, info
 
 
 # ----------------------------------------------------------------------

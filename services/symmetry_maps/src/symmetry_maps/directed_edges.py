@@ -161,8 +161,7 @@ def q_stencil_orbit_table(
     sym_idx_q,
     seed_steps,
     n_sym_spatial,
-    allow_trs,
-    active_symmetry_rows=None,
+    active_symmetry_rows,
 ):
     """Close and symmetry-reduce a compact finite-q stencil.
 
@@ -195,20 +194,16 @@ def q_stencil_orbit_table(
         _q_refuse("WAV-Q-TRS", "antiunitary rows are not -spatial rows",
                   "the SymMaps [S, -S] layout",
                   "do not reorder SymMaps.sym_mats_k")
-    if active_symmetry_rows is None:
-        search_ids = np.arange(
-            syms.shape[0] if bool(allow_trs) else nss, dtype=np.int32)
-    else:
-        search_ids = _integer_array(
-            "active_symmetry_rows", active_symmetry_rows).reshape(-1)
-        if (search_ids.size == 0
-                or np.unique(search_ids).size != search_ids.size
-                or np.any(search_ids < 0)
-                or np.any(search_ids >= syms.shape[0])):
-            _q_refuse(
-                "WAV-Q-ACTIVE-SYM", search_ids.tolist(),
-                f"a nonempty unique subset of [0,{syms.shape[0]})",
-                "pass SymMaps.active_symmetry_rows")
+    search_ids = _integer_array(
+        "active_symmetry_rows", active_symmetry_rows).reshape(-1)
+    if (search_ids.size == 0
+            or np.unique(search_ids).size != search_ids.size
+            or np.any(search_ids < 0)
+            or np.any(search_ids >= syms.shape[0])):
+        _q_refuse(
+            "WAV-Q-ACTIVE-SYM", search_ids.tolist(),
+            f"a nonempty unique subset of [0,{syms.shape[0]})",
+            "pass SymMaps.active_symmetry_rows")
     search = syms[search_ids]
     seeds = _integer_array("seed_steps", seed_steps, (3,))
     if seeds.ndim != 2 or seeds.shape[0] == 0:
@@ -298,7 +293,7 @@ def q_stencil_orbit_table(
     for itarget, target in enumerate(targets):
         source = source_steps[target_source_row[itarget]]
         isym = int(target_sym[itarget])
-        mapped = _mapped_step(source, search[isym], kg, isym=isym)
+        mapped = _mapped_step(source, syms[isym], kg, isym=isym)
         if not np.array_equal(np.mod(mapped, kg), np.mod(target, kg)):
             _q_refuse(
                 "WAV-Q-INCOMPLETE",

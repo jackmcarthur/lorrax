@@ -39,14 +39,16 @@ class _OneKPointTable:
                 np.ones(1, dtype=np.bool_))
 
 
-def _run(monkeypatch, sym):
+def _run(monkeypatch, sym, *, psi=None):
+    if psi is None:
+        psi = np.zeros((1, 1, 2, 1), dtype=np.complex128)
     wfn = SimpleNamespace(
         nkpts=1,
         kweights=np.ones(1),
         bvec=np.eye(3),
         blat=1.0,
         energies=np.zeros((1, 1, 1)),
-        load=lambda **_: np.zeros((1, 1, 2, 1), dtype=np.complex128),
+        load=lambda **_: psi,
     )
     monkeypatch.setattr(orbmag, "padded_gvectors",
                         lambda *_, **__: _OneKPointTable())
@@ -91,10 +93,13 @@ def test_nonmagnetic_pure_time_reversal_projects_the_moment_to_zero(
             assert axial is True and time_odd is True
             return np.asarray([np.eye(3), -np.eye(3)])
 
-    cA, cB, pa_z, pb_z, _, _, info = _run(
-        monkeypatch, _NonmagneticSymmetry())
+    psi = np.zeros((1, 1, 2, 1), dtype=np.complex128)
+    psi[0, 0, 0, 0] = 1.0
+    cA, cB, pa_z, pb_z, m_spin_z, _, info = _run(
+        monkeypatch, _NonmagneticSymmetry(), psi=psi)
     np.testing.assert_array_equal(cA, np.zeros(3))
     np.testing.assert_array_equal(cB, np.zeros(3))
     np.testing.assert_array_equal(pa_z, np.zeros((1, 1)))
     np.testing.assert_array_equal(pb_z, np.zeros((1, 1)))
+    assert m_spin_z == 0.0
     assert info["idx"] == [0, 1]

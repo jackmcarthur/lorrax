@@ -54,7 +54,8 @@ The surface
     The eager table builder and operation source of truth.  Consumers use
     ``operation_rows`` for reciprocal rotation/translation/TR typing,
     ``cartesian_action`` for polar or axial and time-even or time-odd
-    indices, and ``spinor_action``/``unfold_wavefunction`` for states.
+    indices, ``fft_grid_pullback`` for typed real-space gathers, and
+    ``spinor_action``/``unfold_wavefunction`` for states.
 ``KStarMap`` / ``star_select`` / ``star_broadcast`` / ``star_spread``
     IBZ⇄full-BZ for band-index objects, and the residual that checks the
     premise.
