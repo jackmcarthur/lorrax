@@ -1407,6 +1407,105 @@ def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
     }
 
 
+def _merge_branch_specs(group):
+    """One product window covering a branch's windows, or None if they differ.
+
+    Valid only because a branch's windows tile a rectangle: their union is
+    (union of states) x (union of poles), which SharedSigmaWindow already
+    expresses as an arbitrary state mask plus an arbitrary pole list.  Whether
+    merging PAYS is a separate, measured question — it does on valence
+    (67 -> 12 nodes) and does not on conduction, whose merged scale span is
+    unbounded and whose rules then need kappa 1e5 and worse (claim 525).
+    """
+    first = group[0]
+    for spec in group[1:]:
+        if (spec["branch"] is not first["branch"]
+                or not np.array_equal(spec["omega_idx"], first["omega_idx"])):
+            return None
+    positions = np.unique(np.concatenate(
+        [np.asarray(spec["state_positions"]).reshape(-1) for spec in group]))
+    order = {int(p): None for p in positions}
+    raw = np.empty(positions.size, dtype=np.float64)
+    for spec in group:
+        for value, position in zip(np.asarray(spec["raw_state_energy"]),
+                                   np.asarray(spec["state_positions"]).reshape(-1)):
+            raw[np.searchsorted(positions, int(position))] = float(value)
+    del order
+    problem = ReciprocalMeasureProblem(
+        first["problem"].frequencies,
+        np.concatenate([spec["problem"].internal_sums for spec in group]),
+        np.concatenate([spec["problem"].cell_masses for spec in group]))
+    validation = ReciprocalMeasureProblem(
+        first["validation"].frequencies,
+        np.concatenate([spec["validation"].internal_sums for spec in group]),
+        np.concatenate([spec["validation"].cell_masses for spec in group]))
+    envelope_by_frequency = (
+        problem.cell_masses[None, :] / np.abs(problem.denominators)).sum(axis=1)
+    merged = dict(first)
+    merged.update(
+        name=f"{first['branch'].tag}:consolidated",
+        problem=problem, validation=validation,
+        kind=("crossing" if any(spec["kind"] == "crossing" for spec in group)
+              else first["kind"]),
+        pole_indices=np.unique(np.concatenate(
+            [np.asarray(spec["pole_indices"]).reshape(-1) for spec in group])),
+        state_positions=positions,
+        state_indices=np.unique(np.concatenate(
+            [np.asarray(spec["state_indices"]).reshape(-1) for spec in group])),
+        raw_state_energy=raw,
+        state_interval=(min(spec["state_interval"][0] for spec in group),
+                        max(spec["state_interval"][1] for spec in group)),
+        pole_bounds=(min(spec["pole_bounds"][0] for spec in group),
+                     max(spec["pole_bounds"][1] for spec in group)),
+        # pole_interval is the shallow/deep INDEX, not a bounds pair; a merged
+        # window spans both, so -1 records "no single interval" for the
+        # fingerprint and the report.  The real range lives in pole_bounds.
+        pole_interval=-1,
+        E_ref_A=float(np.min(raw)),
+        envelope=float(np.max(envelope_by_frequency)))
+    return merged
+
+
+def _consolidate_branches(specs, candidates, eta, max_nodes, factor_cap,
+                          total_absolute):
+    """Replace a branch's windows by one merged window when that costs less.
+
+    Tried, not assumed: the merged window is fitted and kept only if it is
+    accepted AND uses strictly fewer nodes than the windows it replaces.
+    Fewer windows also means fewer spatial sweeps, so this cuts both currencies.
+    """
+    by_branch = {}
+    for index, spec in enumerate(specs):
+        by_branch.setdefault(id(spec["branch"]), []).append(index)
+    keep = list(range(len(specs)))
+    merged_specs, merged_candidates = dict(), dict()
+    for indices in by_branch.values():
+        if len(indices) < 2:
+            continue
+        group = [specs[i] for i in indices]
+        merged = _merge_branch_specs(group)
+        if merged is None:
+            continue
+        allowance = min(0.5, total_absolute / merged["envelope"])
+        try:
+            candidate = window_candidates(
+                merged, eta, max_nodes, factor_cap, allowance)[0]
+        except (RuntimeError, ValueError, FloatingPointError, OverflowError,
+                np.linalg.LinAlgError):
+            continue
+        split_nodes = sum(int(candidates[i][0]["times"].size) for i in indices)
+        if int(candidate["times"].size) >= split_nodes:
+            continue
+        merged_specs[indices[0]] = merged
+        merged_candidates[indices[0]] = [candidate]
+        for dropped in indices[1:]:
+            keep.remove(dropped)
+    if not merged_specs:
+        return specs, candidates
+    return ([merged_specs.get(i, specs[i]) for i in keep],
+            [merged_candidates.get(i, candidates[i]) for i in keep])
+
+
 def window_candidates(spec, eta, max_nodes, factor_growth_cap,
                       relative_target):
     """Rules for one window: rotated ROQ if it crosses, else shipped lookup.
@@ -1799,6 +1898,9 @@ def build_delivered_sigma_windows(
                 spec, eta, pair_ceiling, factor_cap,
                 min(0.5, total_absolute / spec["envelope"]))
             for spec in specs]
+        specs, candidates_by_window = _consolidate_branches(
+            specs, candidates_by_window, eta, pair_ceiling, factor_cap,
+            total_absolute)
         fits, free_pairs, required_cost = _select_rules(
             specs, candidates_by_window, total_absolute, pair_ceiling)
 

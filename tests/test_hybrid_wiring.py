@@ -187,6 +187,7 @@ def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
             "evidence": {
                 "family": "budget_negative_control",
                 "candidate_tolerance": 0.0,
+                "provenance": "budget negative control",
             },
             "attempts": [],
         }]
@@ -197,12 +198,15 @@ def test_global_tau_pair_ceiling_rejects_collectively_over_budget_windows(
     branch = _branch("budget", "cond", [0.01, 0.2], omega)
     poles = np.asarray([0.02 - 0.1j, 8.0 - 0.2j])
     residues = np.asarray([1.0 + 0.0j, 0.8 + 0.0j])
-    with pytest.raises(RuntimeError, match="pair ceiling=3"):
+    # Ceiling 1, not 3: branch consolidation can now serve both windows with
+    # ONE two-node rule, which legitimately fits under a ceiling of 3.  The
+    # gate under test is the ceiling itself, so squeeze it below any rule.
+    with pytest.raises(RuntimeError, match="pair ceiling=1"):
         build_delivered_sigma_windows(
             [poles], [residues], [branch], omega,
             regularization_width_ry=0.05,
             envelope_relative_target=1.0e-3,
-            max_nodes=3)
+            max_nodes=1)
 
 
 def test_reference_sigma_calibrates_envelope_exchange_rate():
