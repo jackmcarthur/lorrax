@@ -1628,6 +1628,19 @@ def build_delivered_sigma_windows(
         raise ValueError(
             "lookup-first planning uses one served grid per window; "
             "tau_grid_mode must be 'free'")
+    complete_receipt_owner = bool(
+        plan_cache_path is not None
+        and plan_cache_request_fingerprint is not None
+        and process_count() > 1)
+    if complete_receipt_owner and process_rank() != 0:
+        barrier("delivered_sigma_complete_receipt")
+        loaded = load_complete_delivered_sigma_plan(
+            plan_cache_path, plan_cache_request_fingerprint, branch_rows)
+        if loaded is None:
+            raise RuntimeError(
+                "rank 0 did not publish the expected complete delivered-plan "
+                f"receipt {plan_cache_path!r}")
+        return loaded
     geometry = delivered_product_geometry(
         branch_rows, eta, edge_factor=float(edge_factor))
     split = geometry["pole_edge_ry"]
@@ -1712,9 +1725,11 @@ def build_delivered_sigma_windows(
                 patch_positions = positions[omega_rows]
                 patch_frequencies = frequencies[omega_rows]
                 for cell_role, cell_bounds in routed_bounds:
-                    cell_product = (_product_problem(
-                        selected_states, cell_bounds, measure,
-                        patch_frequencies, pole_sign, int(lattice_bins)))
+                    cell_product = (
+                        product if patch_count == 1 and cell_role == "identity"
+                        else _product_problem(
+                            selected_states, cell_bounds, measure,
+                            patch_frequencies, pole_sign, int(lattice_bins)))
                     if cell_product is None:
                         continue
                     cell_problem, cell_validation, pole_indices = cell_product
@@ -1773,7 +1788,8 @@ def build_delivered_sigma_windows(
         grid_mode=grid_mode, lattice_bins=lattice_bins)
     fingerprint_finished = time.perf_counter()
     distributed_receipt = (
-        plan_cache_path is not None and process_count() > 1)
+        plan_cache_path is not None and process_count() > 1
+        and not complete_receipt_owner)
     cached = (None if distributed_receipt and process_rank() != 0 else
               _load_plan_cache(
                   plan_cache_path, cache_fingerprint, len(specs)))
@@ -1999,6 +2015,8 @@ def build_delivered_sigma_windows(
     _save_complete_delivered_sigma_plan(
         plan_cache_path, plan_cache_request_fingerprint, output, specs,
         report, branch_rows)
+    if complete_receipt_owner:
+        barrier("delivered_sigma_complete_receipt")
     return output, report
 
 

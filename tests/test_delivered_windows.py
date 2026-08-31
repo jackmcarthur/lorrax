@@ -209,6 +209,56 @@ def test_distributed_cache_miss_plans_only_on_rank_zero(tmp_path, monkeypatch):
             left.window.nodes.alpha, right.window.nodes.alpha)
 
 
+def test_distributed_miss_publishes_one_complete_plan(tmp_path, monkeypatch):
+    """Peer ranks skip duplicate problem construction and load rank 0's plan."""
+    omega_grid = np.asarray([0.0])
+    branch = _branch("complete rank-zero planning", "cond", [0.2], omega_grid)
+    Omega = np.asarray([0.5 - 0.05j]).reshape(1, 1, 1, 1)
+    residue = np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)
+    measure = measure_delivered_sigma_pole_batch(
+        branch, Omega, residue,
+        regularization_width_ry=0.02, lattice_bins=9)
+    path = tmp_path / "complete-distributed-plan.pkl"
+    rank = [0]
+    barriers = []
+    candidate_ranks = []
+    original_candidates = delivered._candidate_rules
+
+    monkeypatch.setattr(delivered, "process_count", lambda: 2)
+    monkeypatch.setattr(delivered, "process_rank", lambda: rank[0])
+    monkeypatch.setattr(
+        delivered, "barrier", lambda name: barriers.append((rank[0], name)))
+
+    def counted_candidates(*args, **kwargs):
+        candidate_ranks.append(rank[0])
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(delivered, "_candidate_rules", counted_candidates)
+    kwargs = dict(
+        regularization_width_ry=0.02,
+        envelope_relative_target=1.0e-5,
+        lattice_bins=9, max_nodes=128,
+        measures_by_branch=[measure], plan_cache_path=str(path),
+        plan_cache_request_fingerprint="same-input")
+    rank0_plan, rank0_report = build_delivered_sigma_windows(
+        None, None, [branch], omega_grid, **kwargs)
+    rank[0] = 1
+    rank1_plan, rank1_report = build_delivered_sigma_windows(
+        None, None, [branch], omega_grid, **kwargs)
+
+    assert candidate_ranks and set(candidate_ranks) == {0}
+    assert barriers == [
+        (0, "delivered_sigma_complete_receipt"),
+        (1, "delivered_sigma_complete_receipt")]
+    assert rank0_report["window_tau_pairs"] == rank1_report[
+        "window_tau_pairs"]
+    assert rank1_report["plan_cache_status"] == "complete_hit"
+    for left, right in zip(rank0_plan, rank1_plan):
+        np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
+        np.testing.assert_array_equal(
+            left.window.nodes.alpha, right.window.nodes.alpha)
+
+
 def _two_branch_plan():
     omega = np.linspace(0.0, 1.2, 7)
     energies = [0.05, 0.25, 0.45, 1.4]
