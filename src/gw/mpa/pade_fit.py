@@ -520,27 +520,45 @@ def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     the companion route, so the two are drop-in for each other.
 
     THE PENCIL IS REDUCED RATHER THAN SOLVED AS A PENCIL.  The poles are
-    the generalised eigenvalues of ``(sL, L)``; jax has no ``QZ``, so
-    they are taken as the ordinary eigenvalues of ``L^+ sL`` with ``L^+``
-    the same truncated-SVD pseudo-inverse the rest of the module uses.
-    That is the identical spectrum whenever ``L`` is invertible, and the
-    reported ``cond`` is ``cond(L)`` -- precisely the number that says
-    whether it was.  The same ``n x n`` non-symmetric ``eigvals`` call
-    ends the companion route, so this is a drop-in on the eigensolver
-    side too.
+    the generalised eigenvalues of ``(sL, L)``; jax has no ``QZ``, so the
+    SVD of the equilibrated ``L = U diag(s) V^H`` supplies the standard
+    rank-revealing Loewner realization
+
+    ``diag(1/s_kept) U^H sL V``
+
+    on the retained row AND column subspace.  Projecting both sides is
+    load-bearing.  Zeroing inverse singular values alone leaves a
+    retained-to-null coupling block in the ordinary eigenproblem; that
+    block is not part of the reduced pencil and makes its zero cluster
+    unnecessarily non-normal.  The static ``n x n`` matrix below embeds
+    the reduced realization beside exact zero rows and columns, so vmap
+    keeps its fixed output shape and the null-pole guard removes the padding.
+
+    The reported condition uses the smallest RETAINED singular value.  It
+    therefore describes the algebra that produced the poles rather than a
+    direction the rank-revealing solve explicitly discarded.  The same
+    ``n x n`` non-symmetric ``eigvals`` call ends the companion route, so
+    this remains a drop-in on the eigensolver side.
     """
 
     L, sL = _loewner_pencil(w, x_hat, n)
     L, sL = _equilibrate_loewner_pencil(L, sL)
     u, s, vh = jnp.linalg.svd(L, full_matrices=False)
     s_max = s[0]
-    s_min = s[-1]
-    s_inv = jnp.where(s > rcond * s_max, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
-    L_pinv = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * u.conj().T)
-    cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
-    X = L_pinv @ sL
+    retained = s > rcond * s_max
+    s_min = jnp.min(jnp.where(retained, s, jnp.inf))
+    s_inv = jnp.where(
+        retained, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
+
+    # Work in V coordinates.  At full rank this is unitarily similar to
+    # L^{-1}sL.  At reduced rank the two masks remove both null-space
+    # coupling blocks, which is the textbook compressed Loewner pencil.
+    core = (u.conj().T @ sL) @ vh.conj().T
+    core = jnp.where(retained[:, None] & retained[None, :], core, 0.0)
+    X = s_inv.astype(L.dtype)[:, None] * core
+    cond = jnp.where(jnp.isfinite(s_min), s_max / s_min, jnp.inf)
     return (_eigvals(X, eig), cond, s_max, s_min,
-            _matrix_backward_error(L, sL, X))
+            _matrix_backward_error(jnp.diag(s), core, X))
 
 
 def _companion_roots(c_coeffs, eig="lapack"):
