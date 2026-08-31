@@ -1,0 +1,5 @@
+Lane weight: light — 135/135 supplied CPU-gate cells passed in 110.12 s; 5/5 focused red-twin cells passed in 1.44 s.
+Changed: THR-006 exact-keys `log R`, `omega/x_min`, crossing `A`, and `eps_q`, with achieved-error validation on every runtime/cache return; THR-012 now refuses nonfinite or `R <= 1`; THR-007 keys exact gamma bounds.
+Proof: nearby coordinates separated by 4e-13 caused two calls (not one aliased hit), three degenerate R values refused, and nearby gamma bounds caused two rule builds; each test fails against the base implementation.
+Evidence: CPU commands ran in `/pscratch/sd/j/jackm/wt_opt_t_2026-08-31`; no GPU leg was launched because the 15-minute lane ended after the 110.12 s gate, so the supplied 6-window/115-pair sodium invariant was not re-measured.
+Owed/branch: THR-011 remains unchanged; the existing scale-free diagnostic is `|Wc0-Wcz| / max(|Wc0|, |Wcz|)`, but no sodium changed-entry count was obtained. Branch `fix/silent-thresholds-2026-08-31`, commit `cdda5c4c`.
