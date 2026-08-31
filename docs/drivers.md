@@ -42,21 +42,20 @@ BSE and exciton bands are NOT in the chain yet.
 
 ## centroids — `centroid.kmeans_cli`
 
-Selects the N_c real-space ISDF interpolation points: a density-weighted k-means over the WFN FFT grid
-(optionally on symmetry-orbit representatives so the set is closed under the crystal point group, recovered
-from the density rather than the possibly-truncated WFN group), snapped to the grid, then an oversampled
-candidate pool is pruned to N_c by pivoted Cholesky on the pair-density Gram over the sigma band window.
-It does NOT read the deck: it opens `WFN.h5` (fixed name, cwd) and optionally the QE `<prefix>.save` density;
-the sigma window is resolved from the WFN (`n_val = wfn.nelec`, `n_cond = wfn.nbands - n_val`) or the
-`--prune-n-*` flags. Output: `centroids_frac_<n>[<suffix>].txt`, consumed by the GW run via deck keys
+Selects N_c real-space ISDF points from `WFN.h5`. Every band in the requested fit window has unit weight;
+occupations do not enter fitting. The candidate set is closed under the decorated atoms' spatial Seitz group,
+including improper and nonsymmorphic operations. Scalar mode prunes with the charge pair-density Gram;
+current mode uses the positive Gram formed by stacking all three transverse current channels. The window is
+resolved from the WFN (`n_val = wfn.nelec`, `n_cond = wfn.nbands - n_val`) or `--prune-n-*`.
+Output: `centroids_frac_<n>[<suffix>].txt`, consumed by the GW run via deck keys
 `centroids_file` (default `centroids_frac.txt`) and, for the bispinor current channel, `centroids_file_current`.
 
-Invoke: `python3 -m centroid.kmeans_cli N --orbit --qe-save <path>.save [--out-suffix _x]`; single node
+Invoke: `python3 -m centroid.kmeans_cli N --orbit [--out-suffix _x]`; single node
 (`/scratch2/08271/jackmc/mos2_4x4_test/deck_b300.sbatch` step 3) or multi-process — certified at P=16:
 67→31 s wall (2.2×), accepted 2979c set sha256-IDENTICAL to P=1, rank gate 270/270 (scorecard BD.2, jobs
 7884867/7884870; the thread-main refusal seen there is closed — mesh + warm-up now come from
-`initialize_communicator_stack`). What does not scale: the replicated full-r-grid weight build (~7 s) and
-single-mesh-axis ψ-at-centroids sharding (√P class) — see BD.4.
+`initialize_communicator_stack`). Charge and current band sweeps split fixed-shape work across ranks and reduce
+the final grid once.
 Reuse: the `.txt` carries no stamp; content is guarded downstream by the GW run (centroid-table md5 on the
 restart tensors + element-wise compare against `zeta_q.h5`), so regenerating centroids invalidates ζ and
 tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
@@ -67,9 +66,9 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--oversample` | 1.5 | k-means runs at ceil(N_c*x), pruned back; 1.0 disables pruning |
 | `--prune-n-cond` | `nbands - n_val` (full WFN conduction window) | Cholesky window conduction extent; the pre-2026-07-29 `min(n_val, nb-n_val)` default was a 30%-rank-deficiency bug |
 | `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c` (legacy) / `v_x_vc` (adds v×v for V_H) / `vc_x_vc` (full sigma square, use when ncond >> nval) |
-| `--centroid-weight` | `band_range` (scalar mode) | k-means weight: sigma-window Sum|psi|^2 vs occupied-only `charge_density` (slabs: occupied-only gives zero vacuum support, V_H sign-wrong) |
-| `--density-mode` | `scalar` | `scalar` = charge channel; `current` = Gordon-current weight for bispinor transverse channels (suffix `_current`) |
-| `--orbit` / `--no-orbit` | auto (on if n_sym>1) | symmetry-closed centroid set from orbit representatives |
+| `--centroid-weight` | `band_range` | compatibility spelling for the only policy: unit-weight requested bands |
+| `--density-mode` | `scalar` | `scalar` = charge centroids/Gram; `current` = gauge-invariant transition-current importance and the summed three-channel transverse Gram (suffix `_current`) |
+| `--orbit` / `--no-orbit` | auto (on if atom group has >1 row) | close the set under atom-derived spatial Seitz operations |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
 | `LORRAX_CENTROID_RANK_TOL` (env) | 0.01 | rank-gate tolerance; lowering it is a deliberate override |
 | `LORRAX_CENTROID_SELECT` (env) | `deliver` | what the select does when the pool is numerically flat but still has candidates; `strict` restores the 2026-08-07 refusal |
@@ -79,7 +78,7 @@ is a superset of any deck's `ncond`, so a shortfall means it was narrowed explic
 pivoted-Cholesky rank deficiency" (certified rank < requested orbits) — check `--prune-n-cond` against the
 deck's sigma window first, since that gate is a PROXY for a prune-window mismatch and not a general accuracy
 statement; `vc_x_vc`, `--oversample`, or a lower N are the other levers, and `LORRAX_CENTROID_RANK_TOL` is the
-named override for a set you have MEASURED. Also fatal: FFT-grid mismatch rho vs WFN (needs ecutrho = 4*ecutwfc).
+named override for a set you have MEASURED.
 
 Read the `[point rank]` lines, not only the `[rank gate]` PASS: in orbit mode the gate counts ORBITS and says
 nothing about the points in the file it blesses. Rank deficiency in the delivered POINT set is reported and

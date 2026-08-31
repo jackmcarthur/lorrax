@@ -117,7 +117,7 @@ Working invocations from the certified scripts (`config/frontera/templates/gw_de
 
 ```bash
 # preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
-python3 -u -m centroid.kmeans_cli 3000 --orbit --qe-save ../b300_out/MoS2.save --out-suffix _b300_c3000
+python3 -u -m centroid.kmeans_cli 3000 --orbit --out-suffix _b300_c3000
 python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300
 
 # multi-node GW via the certified launch block (gw_ht_b300.sbatch):

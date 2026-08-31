@@ -1,14 +1,9 @@
-"""Weighting-density providers for k-means ISDF centroid selection.
+"""Real-space charge fields and the scalar centroid sampling weight.
 
-The k-means weight decides WHERE the ISDF quadrature has points, hence
-which states the ISDF can represent at all.  Two weights are offered
-(``kmeans_cli --centroid-weight``):
-
-* ``charge_density`` — the ground-state (OCCUPIED) ρ(r), sources 1 & 2
-  below.  Correct for valence/near-gap work; starves any region the
-  occupied states do not occupy.
-* ``band_range`` — :func:`rho_from_band_range`, w(r) = Σ_{n∈range} Σ_k
-  w_k |ψ_nk(r)|² over the bands the calculation actually uses.
+Kmeans uses :func:`rho_from_band_range`: every explicitly selected band has
+unit weight, so requested conduction states can place points.  The physical
+ground-state density readers remain here for Hartree and diagnostics but are
+not centroid-fitting policies.
 
 Two ρ(r) sources are supported:
 
@@ -193,28 +188,39 @@ def rho_from_wfn_ibz(
 # Source 3: band-range weight — Σ_{n ∈ range} Σ_k w_k |ψ_nk(r)|²
 # ═══════════════════════════════════════════════════════════════════════
 
-def symmetrize_on_grid(field: np.ndarray, sym_ops: np.ndarray) -> np.ndarray:
-    """Average ``field`` over a symmorphic integer point group on the grid.
+def symmetrize_on_grid(
+    field: np.ndarray,
+    sym_ops: np.ndarray,
+    translations_frac: np.ndarray | None = None,
+) -> np.ndarray:
+    """Average ``field`` over spatial Seitz operations on the FFT grid.
 
-    ``sym_ops`` are the r-action matrices ``M`` (BGW ``Rinv``, τ=0) of a
-    group that maps the FFT grid to itself, e.g. the output of
-    :func:`symmetry_maps.recover_symmorphic_density_point_group`.
-    Returns ``(1/|G|) Σ_M field[(M·n) mod N]`` — invariant because the
-    group is closed.
+    With no translations, ``sym_ops`` are direct integer r-actions (the
+    historical symmorphic API).  With ``translations_frac``, ``sym_ops`` are
+    BGW reciprocal-space ``mtrx`` rows and the service builds the exact
+    nonsymmorphic real-space pullback.  The latter is the centroid driver's
+    atom-derived space-group path.
     """
     f = np.asarray(field, dtype=np.float64)
     N = np.asarray(f.shape, dtype=np.int64)
     ops = np.asarray(sym_ops, dtype=np.int64).reshape(-1, 3, 3)
-    if ops.shape[0] <= 1:
+    if ops.shape[0] <= 1 and translations_frac is None:
         return f
     flat = f.ravel()
     acc = np.zeros_like(flat)
-    for M in ops:
-        # THROUGH THE SERVICE.  This used to open-code the grid permutation
-        # and its radix flatten, byte-identically with the copy inside
-        # ``symmetry_maps.recover_symmorphic_density_point_group`` — the two
-        # were the same eleven characters of index arithmetic in two packages.
-        acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
+    if translations_frac is None:
+        for M in ops:
+            acc += flat[symmetry_maps.grid_point_image_perm(N, M)]
+    else:
+        tau = np.asarray(translations_frac, dtype=np.float64).reshape(-1, 3)
+        if tau.shape[0] != ops.shape[0]:
+            raise ValueError(
+                "translations_frac must have one row per symmetry; "
+                f"got {tau.shape[0]} for {ops.shape[0]} operations")
+        pullback = symmetry_maps.fft_grid_pullback_perm(
+            ops, tau * (2.0 * np.pi), N, validate=True)
+        for row in pullback:
+            acc += flat[row]
     return (acc / ops.shape[0]).reshape(f.shape)
 
 
@@ -223,6 +229,7 @@ def rho_from_band_range(
     band_range: tuple[int, int],
     *,
     sym_ops: np.ndarray | None = None,
+    sym_translations_frac: np.ndarray | None = None,
     chunk_gb: float = 4.0,
     verbose: bool = True,
     dist_mesh=None,
@@ -264,11 +271,16 @@ def rho_from_band_range(
     wfn : open ``WFNReader`` (only ``_filename``/``kweights``/
         ``cell_volume`` are used; ψ is streamed through ``WfnLoader``).
     band_range : ``(b_lo, b_hi)``, 0-based half-open.
-    sym_ops : optional (n_op, 3, 3) integer r-action matrices.  The raw
+    sym_ops : optional (n_op, 3, 3) integer operations.  The raw
         k-sum is NOT point-group symmetric (star members contribute
         un-rotated |ψ|² at each r); pass the recovered density point group
-        to symmetrize, so the weight cannot itself break the k-star
-        symmetry the orbit closure is there to protect.
+        to symmetrize, so the weight cannot itself break the symmetry the
+        orbit closure is there to protect.  When ``sym_translations_frac``
+        is supplied these are BGW reciprocal-space ``mtrx`` rows; otherwise
+        they retain the historical direct symmorphic r-action convention.
+    sym_translations_frac : optional (n_op, 3) fractional Seitz translations.
+        Enables exact nonsymmorphic FFT-grid pullbacks through
+        :func:`symmetry_maps.fft_grid_pullback_perm`.
     chunk_gb : band-chunk size target for the r-space buffer.
     dist_mesh : the run's GLOBAL mesh (``devices.size == process_count()``).
         Supplied ⇒ the band sweep is split across ranks and reassembled with
@@ -443,7 +455,7 @@ def rho_from_band_range(
 
     if sym_ops is not None:
         n_op = int(np.asarray(sym_ops).reshape(-1, 3, 3).shape[0])
-        w_sym = symmetrize_on_grid(w, sym_ops)
+        w_sym = symmetrize_on_grid(w, sym_ops, sym_translations_frac)
         if verbose:
             dev = float(np.max(np.abs(w_sym - w)) / (np.max(np.abs(w)) or 1.0))
             print(f"[band_range weight] symmetrized over {n_op} op(s); "
