@@ -667,7 +667,8 @@ def test_tightening_reaches_second_compounded_round(monkeypatch):
 
     select_calls = 0
 
-    def accept_on_fourth(_specs, candidates, _budget, _ceiling):
+    def accept_on_fourth(_specs, candidates, _budget, _ceiling, *,
+                         pointwise_budget):
         nonlocal select_calls
         select_calls += 1
         if select_calls < 4:
