@@ -35,6 +35,7 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
+from scipy.optimize import Bounds, LinearConstraint, milp
 
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank, psum_replicate)
@@ -1963,8 +1964,78 @@ def _pointwise_window_allowance(spec, pointwise_budget):
 
 def _select_rules(specs, candidates_by_window, total_absolute_budget,
                   pair_ceiling, *, pointwise_budget):
-    """Minimum-pair scalar search, followed by pointwise contract validation."""
+    """Select the minimum-pair plan under every frequency's error budget.
+
+    The exact binary model has one variable per offered rule, so its retained
+    state is bounded by the candidate census rather than by a growing Pareto
+    frontier.  Each window contributes exactly one rule.
+    """
     pointwise_budget = np.asarray(pointwise_budget, dtype=np.float64)
+    frequency_count = int(pointwise_budget.size)
+    candidate_rows = []
+    window_slices = []
+    offset = 0
+    for spec, candidates in zip(specs, candidates_by_window):
+        positions = np.asarray(spec["omega_idx"], dtype=np.int64)
+        envelope = np.asarray(
+            spec["envelope_by_frequency"], dtype=np.float64)
+        start = offset
+        for candidate in candidates:
+            pointwise_cost = np.zeros(frequency_count, dtype=np.float64)
+            np.add.at(
+                pointwise_cost, positions,
+                envelope * float(candidate["required_target"]))
+            candidate_rows.append((
+                int(candidate["times"].size), pointwise_cost))
+            offset += 1
+        window_slices.append(slice(start, offset))
+
+    variable_count = len(candidate_rows)
+    matrix = np.zeros(
+        (len(window_slices) + 1 + frequency_count, variable_count),
+        dtype=np.float64)
+    for row, window_slice in enumerate(window_slices):
+        matrix[row, window_slice] = 1.0
+    nodes_by_candidate = np.asarray(
+        [row[0] for row in candidate_rows], dtype=np.float64)
+    matrix[len(window_slices)] = nodes_by_candidate
+    if frequency_count:
+        matrix[len(window_slices) + 1:] = np.asarray(
+            [row[1] for row in candidate_rows]).T
+    lower = np.concatenate((
+        np.ones(len(window_slices)), [-np.inf],
+        np.full(frequency_count, -np.inf)))
+    upper = np.concatenate((
+        np.ones(len(window_slices)), [float(pair_ceiling)],
+        pointwise_budget))
+    result = milp(
+        c=nodes_by_candidate,
+        integrality=np.ones(variable_count, dtype=np.int8),
+        bounds=Bounds(0.0, 1.0),
+        constraints=LinearConstraint(matrix, lower, upper),
+        options={"presolve": True})
+    if result.success:
+        choices = tuple(
+            int(np.argmax(result.x[window_slice]))
+            for window_slice in window_slices)
+        selected = [candidates[index]
+                    for candidates, index in zip(
+                        candidates_by_window, choices)]
+        nodes = sum(int(candidate["times"].size)
+                    for candidate in selected)
+        pointwise_cost = _pointwise_rule_costs(
+            specs, selected, frequency_count)
+        if (nodes > int(pair_ceiling)
+                or np.any(pointwise_cost > pointwise_budget)):
+            raise AssertionError(
+                "integer rule selection violated its pointwise contract")
+        feasible = [(nodes, float(np.max(pointwise_cost)), choices,
+                     pointwise_cost)]
+    else:
+        feasible = []
+
+    # Preserve a cheap scalar diagnostic for a budget shortfall.  It does not
+    # participate in selection and therefore cannot prune a feasible plan.
     surrogate_frequency = int(np.argmax(pointwise_budget))
 
     def surrogate_cost(spec, candidate):
@@ -1975,33 +2046,22 @@ def _select_rules(specs, candidates_by_window, total_absolute_budget,
         envelope = np.asarray(spec["envelope_by_frequency"], dtype=np.float64)
         return float(envelope[local[0]] * candidate["required_target"])
 
-    states = {0: (0.0, ())}
-    for spec, candidates in zip(specs, candidates_by_window):
-        next_states = {}
-        for used, (cost, choices) in states.items():
-            for index, candidate in enumerate(candidates):
-                nodes = int(candidate["times"].size)
-                new_used = used + nodes
-                if new_used > int(pair_ceiling):
-                    continue
-                new_cost = cost + surrogate_cost(spec, candidate)
-                previous = next_states.get(new_used)
-                if previous is None or new_cost < previous[0]:
-                    next_states[new_used] = (new_cost, choices + (index,))
-        states = next_states
-    surrogate_budget = float(pointwise_budget[surrogate_frequency])
-    feasible = []
-    for nodes, (cost, choices) in states.items():
-        if cost > surrogate_budget:
-            continue
-        selected = [candidates[index] for candidates, index in zip(
-            candidates_by_window, choices)]
-        pointwise_cost = _pointwise_rule_costs(
-            specs, selected, pointwise_budget.size)
-        if np.all(pointwise_cost <= pointwise_budget):
-            feasible.append((nodes, float(np.max(pointwise_cost)), choices,
-                             pointwise_cost))
     if not feasible:
+        states = {0: (0.0, ())}
+        for spec, candidates in zip(specs, candidates_by_window):
+            next_states = {}
+            for used, (cost, choices) in states.items():
+                for index, candidate in enumerate(candidates):
+                    nodes = int(candidate["times"].size)
+                    new_used = used + nodes
+                    if new_used > int(pair_ceiling):
+                        continue
+                    new_cost = cost + surrogate_cost(spec, candidate)
+                    previous = next_states.get(new_used)
+                    if previous is None or new_cost < previous[0]:
+                        next_states[new_used] = (
+                            new_cost, choices + (index,))
+            states = next_states
         best = min(states.items(), key=lambda item: item[1][0], default=None)
         blocking = max(
             zip(specs, candidates_by_window),

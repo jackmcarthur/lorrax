@@ -326,6 +326,38 @@ def test_rule_selection_enforces_budget_pointwise_not_sum_of_window_maxima():
     assert sum(row["absolute_cost"] for row in selected) == pytest.approx(0.16)
 
 
+def test_rule_selection_keeps_pointwise_feasible_incomparable_choice():
+    specs = [
+        {"name": "left", "envelope": 1.0,
+         "omega_idx": np.asarray([0]),
+         "envelope_by_frequency": np.asarray([1.0])},
+        {"name": "right", "envelope": 1.0,
+         "omega_idx": np.asarray([1]),
+         "envelope_by_frequency": np.asarray([1.0])},
+    ]
+
+    def candidate(nodes, cost):
+        return {
+            "times": np.full(nodes, 0.1),
+            "metrics": (cost, 0.0, 0.0),
+            "required_target": cost,
+            "absolute_cost": cost,
+        }
+
+    candidates = [
+        [candidate(1, 0.9), candidate(2, 0.1)],
+        [candidate(1, 0.9), candidate(2, 0.1)],
+    ]
+
+    selected, nodes, required = delivered._select_rules(
+        specs, candidates, total_absolute_budget=1.0, pair_ceiling=3,
+        pointwise_budget=np.asarray([1.0, 0.5]))
+
+    assert nodes == 3
+    assert [row["required_target"] for row in selected] == [0.9, 0.1]
+    assert required == pytest.approx(0.9)
+
+
 def _patched_test_plan(width_ev):
     ev_to_ry = 1.0 / 27.211386245988
     eta = 0.25 * ev_to_ry
