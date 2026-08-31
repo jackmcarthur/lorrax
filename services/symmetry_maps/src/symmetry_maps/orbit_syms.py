@@ -32,8 +32,314 @@ from ._compat import deprecated_alias
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Charge-density point group (recovery of symmetry a reduced WFN dropped)
+# Lattice / decorated-crystal spatial groups
 # ─────────────────────────────────────────────────────────────────────────
+
+_METRIC_RTOL = 1.0e-4
+
+
+def _metric_preserving_integer_rotations(avec: np.ndarray) -> list[np.ndarray]:
+    """Enumerate the bounded integer holohedry of a row-vector lattice."""
+    A = np.asarray(avec, dtype=np.float64)
+    if A.shape != (3, 3) or not np.all(np.isfinite(A)):
+        raise ValueError(f"avec must be a finite (3, 3) array; got {A.shape}")
+    if np.linalg.matrix_rank(A) != 3:
+        raise ValueError("avec must contain three linearly independent vectors")
+
+    G = A @ A.T
+    gtol = _METRIC_RTOL * float(np.max(np.abs(G)))
+    lambda_min = float(np.min(np.linalg.eigvalsh(G)))
+    if lambda_min <= 0.0:
+        raise ValueError("avec must define a positive-definite metric")
+
+    # For column v_j of M, metric preservation gives
+    # v_j.T @ G @ v_j == G[j,j].  The smallest metric eigenvalue therefore
+    # supplies a finite component bound even for a highly skew primitive
+    # basis whose valid integer rotations have entries outside {-1, 0, 1}.
+    import itertools
+    vector_pools = []
+    for axis in range(3):
+        bound = int(np.ceil(np.sqrt((float(G[axis, axis]) + gtol)
+                                    / lambda_min)))
+        pool = []
+        for values in itertools.product(range(-bound, bound + 1), repeat=3):
+            vector = np.asarray(values, dtype=np.int64)
+            if abs(float(vector @ G @ vector) - float(G[axis, axis])) <= gtol:
+                pool.append(vector)
+        vector_pools.append(pool)
+
+    rotations = []
+    for col0 in vector_pools[0]:
+        for col1 in vector_pools[1]:
+            if abs(float(col0 @ G @ col1) - float(G[0, 1])) > gtol:
+                continue
+            for col2 in vector_pools[2]:
+                if (abs(float(col0 @ G @ col2) - float(G[0, 2])) > gtol
+                        or abs(float(col1 @ G @ col2) - float(G[1, 2])) > gtol):
+                    continue
+                M = np.column_stack((col0, col1, col2))
+                if abs(round(np.linalg.det(M))) == 1:
+                    rotations.append(M)
+    return rotations
+
+
+def _canonical_fractional_translation(tau: np.ndarray, tol: float) -> np.ndarray:
+    """Canonical representative of a translation modulo lattice vectors."""
+    out = np.mod(np.asarray(tau, dtype=np.float64), 1.0)
+    boundary_tol = float(tol + 64.0 * np.finfo(np.float64).eps)
+    out[(out <= boundary_tol) | (1.0 - out <= boundary_tol)] = 0.0
+    return out
+
+
+def _periodic_max_norm(left: np.ndarray, right: np.ndarray) -> float:
+    """Chebyshev distance between two fractional points modulo the lattice."""
+    delta = np.asarray(left, dtype=np.float64) - np.asarray(right, dtype=np.float64)
+    delta -= np.rint(delta)
+    return float(np.max(np.abs(delta)))
+
+
+def _atom_position_buckets(atom_crys: np.ndarray, species_id: np.ndarray,
+                           tol: float):
+    """Build periodic tolerance-grid buckets for decorated atom lookup."""
+    key_period = max(1, int(np.rint(1.0 / tol)))
+    keys = np.rint(atom_crys * key_period).astype(np.int64) % key_period
+    buckets: dict[tuple[int, int, int, int], list[int]] = {}
+    for atom_idx, (kind, key) in enumerate(zip(species_id, keys)):
+        bucket_key = (int(kind), *(int(v) for v in key))
+        buckets.setdefault(bucket_key, []).append(atom_idx)
+    return key_period, buckets
+
+
+def _maps_decorated_atoms(
+    atom_crys: np.ndarray,
+    species_id: np.ndarray,
+    Rinv: np.ndarray,
+    tau: np.ndarray,
+    *,
+    tol: float,
+    key_period: int,
+    buckets: dict[tuple[int, int, int, int], list[int]],
+) -> bool:
+    """Whether one forward Seitz action bijects atoms within each species."""
+    images = np.mod(atom_crys @ Rinv.T + tau[None, :], 1.0)
+    image_keys = np.rint(images * key_period).astype(np.int64) % key_period
+    used = np.zeros(atom_crys.shape[0], dtype=bool)
+    match_tol = float(
+        tol + 64.0 * np.finfo(np.float64).eps
+        * max(1, int(np.max(np.sum(np.abs(Rinv), axis=1)))))
+
+    # Exact quantized buckets are the ordinary path.  Adjacent buckets are
+    # searched only at a tolerance-cell boundary; the final floating check,
+    # not the quantization, decides whether a pair matches.
+    neighbor_offsets = ((dx, dy, dz)
+                        for dx in (-1, 0, 1)
+                        for dy in (-1, 0, 1)
+                        for dz in (-1, 0, 1))
+    neighbor_offsets = tuple(neighbor_offsets)
+    for kind, image, key in zip(species_id, images, image_keys):
+        matches = []
+        for offset in neighbor_offsets:
+            near_key = tuple(
+                int((key[axis] + offset[axis]) % key_period)
+                for axis in range(3))
+            for target_idx in buckets.get((int(kind), *near_key), ()):
+                if (not used[target_idx]
+                        and _periodic_max_norm(
+                            image, atom_crys[target_idx]) <= match_tol):
+                    matches.append(target_idx)
+        if not matches:
+            return False
+        # A deterministic nearest match makes repeated/coincident same-species
+        # sites harmless while retaining a one-to-one decorated-atom map.
+        target_idx = min(
+            matches,
+            key=lambda idx: (_periodic_max_norm(image, atom_crys[idx]), idx))
+        used[target_idx] = True
+    return bool(np.all(used))
+
+
+def _validate_spatial_seitz_group(
+    operations: list[tuple[np.ndarray, np.ndarray]], *, tol: float
+) -> None:
+    """Refuse an accepted table that lacks identity, inverses, or closure."""
+    identity = np.eye(3, dtype=np.int64)
+    zero = np.zeros(3, dtype=np.float64)
+    max_row_sum = max(
+        int(np.max(np.sum(np.abs(Rinv), axis=1)))
+        for Rinv, _ in operations)
+    group_tol = float(8.0 * tol * max(1, max_row_sum))
+    by_rotation: dict[bytes, list[np.ndarray]] = {}
+    for Rinv, tau in operations:
+        rows = by_rotation.setdefault(Rinv.tobytes(), [])
+        if any(_periodic_max_norm(tau, old) <= tol for old in rows):
+            raise RuntimeError(
+                "recover_atomic_space_group: duplicate Seitz operation")
+        rows.append(tau)
+
+    def _has_operation(Rinv, tau):
+        return any(
+            _periodic_max_norm(tau, stored_tau) <= group_tol
+            for stored_tau in by_rotation.get(
+                np.asarray(Rinv, dtype=np.int64).tobytes(), ()))
+
+    identity_count = sum(
+        np.array_equal(Rinv, identity)
+        and _periodic_max_norm(tau, zero) <= group_tol
+        for Rinv, tau in operations)
+    if identity_count != 1:
+        raise RuntimeError(
+            "recover_atomic_space_group: identity operation was not recovered "
+            f"exactly once (found {identity_count})")
+
+    for row, (Rinv, tau) in enumerate(operations):
+        inverse_rotation = np.rint(np.linalg.inv(Rinv)).astype(np.int64)
+        inverse_tau = -(inverse_rotation @ tau)
+        if not _has_operation(inverse_rotation, inverse_tau):
+            raise RuntimeError(
+                "recover_atomic_space_group: accepted Seitz table is missing "
+                f"the inverse of row {row}")
+
+    for left, (Rinv_a, tau_a) in enumerate(operations):
+        for right, (Rinv_b, tau_b) in enumerate(operations):
+            composed_rotation = Rinv_a @ Rinv_b
+            composed_tau = Rinv_a @ tau_b + tau_a
+            if not _has_operation(composed_rotation, composed_tau):
+                raise RuntimeError(
+                    "recover_atomic_space_group: accepted Seitz table is not "
+                    f"closed; row {left} composed with row {right} is absent")
+
+
+def recover_atomic_space_group(
+    avec: np.ndarray,
+    atom_crys: np.ndarray,
+    atom_types: np.ndarray,
+    *,
+    tol: float = 1.0e-6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Recover the full spatial Seitz group of a decorated atomic crystal.
+
+    This is the symmetry group for closing a *sampling set* of real-space
+    centroids.  It depends only on the lattice, fractional atom positions,
+    and species labels.  Electronic density, magnetism, time reversal,
+    occupations, and WFN operation authorization are deliberately absent
+    from the interface: rows returned here must never authorize an electronic
+    symmetry reduction.
+
+    Integer metric-preserving direct-space rotations are enumerated inside a
+    finite bound derived from the lattice metric's smallest eigenvalue; no
+    reduced/conventional-basis assumption is made.  For each rotation,
+    candidate translations are obtained by mapping one deterministic anchor
+    atom to every atom of the same species.  A candidate is retained only if
+    the resulting affine action bijects *every* atom onto an atom of the same
+    species modulo a lattice vector.  Determinants ``+1`` and ``-1`` are both
+    retained, as are nonzero nonsymmorphic translations.  The accepted table
+    is certified for identity, inverses, and affine Seitz closure before it is
+    returned.
+
+    Conventions
+    -----------
+    The returned rows obey the service's canonical BGW convention.  In
+    column notation the forward action on atoms and centroids is
+
+    ``r' = Rinv[s] @ r + tau[s]  (mod 1)``.
+
+    ``R[s] = inv(Rinv[s])`` is the reciprocal/BGW ``mtrx`` row expected by
+    :func:`centroid_source_map_and_wrap` and
+    :func:`fft_grid_pullback_perm`.  Those functions take BGW translations,
+    so pass ``2*pi*tau`` to them; :func:`orbit_images` consumes ``Rinv`` and
+    fractional ``tau`` directly.
+
+    Parameters
+    ----------
+    avec : (3, 3) real
+        Real-space lattice vectors as rows, in any consistent length unit.
+    atom_crys : (n_atom, 3) real
+        Atomic positions in fractional lattice coordinates.
+    atom_types : (n_atom,) array-like
+        Species labels.  Only equality is physically meaningful.
+    tol : float, optional
+        Maximum componentwise minimum-image residual for an atomic match.
+
+    Returns
+    -------
+    R, Rinv : (n_op, 3, 3) int32
+        Reciprocal/BGW rotations and forward direct-space rotations.
+    tau : (n_op, 3) float64
+        Fractional Seitz translations in ``[0, 1)``.  The identity operation
+        is row zero; all remaining rows have deterministic order.
+    """
+    if not np.isfinite(tol) or tol <= 0.0 or tol >= 0.5:
+        raise ValueError(f"tol must be finite and in (0, 0.5); got {tol!r}")
+
+    positions = np.asarray(atom_crys, dtype=np.float64)
+    labels = np.asarray(atom_types)
+    if positions.ndim != 2 or positions.shape[1:] != (3,):
+        raise ValueError(
+            f"atom_crys must be a finite (n_atom, 3) array; got {positions.shape}")
+    if positions.shape[0] == 0 or not np.all(np.isfinite(positions)):
+        raise ValueError("atom_crys must contain at least one finite position")
+    if labels.ndim != 1 or labels.shape[0] != positions.shape[0]:
+        raise ValueError(
+            "atom_types must be one-dimensional with one label per atom; "
+            f"got {labels.shape} for {positions.shape[0]} atoms")
+
+    positions = _canonical_fractional_translation(positions, tol)
+    try:
+        _, species_id = np.unique(labels, return_inverse=True)
+    except TypeError as exc:
+        raise ValueError("atom_types must contain mutually comparable labels") from exc
+    species_id = np.asarray(species_id, dtype=np.int64)
+
+    # Choose the rarest species, then its lexicographically first site.  Every
+    # valid operation must map that anchor to one of these same-species sites,
+    # so this enumerates every possible translation without an O(n_atom^2)
+    # candidate list.
+    counts = np.bincount(species_id)
+    anchor_kind = int(np.flatnonzero(counts == counts.min())[0])
+    anchor_pool = np.flatnonzero(species_id == anchor_kind)
+    anchor_order = np.lexsort((positions[anchor_pool, 2],
+                               positions[anchor_pool, 1],
+                               positions[anchor_pool, 0]))
+    anchor_idx = int(anchor_pool[anchor_order[0]])
+    target_pool = anchor_pool[np.lexsort((positions[anchor_pool, 2],
+                                          positions[anchor_pool, 1],
+                                          positions[anchor_pool, 0]))]
+
+    key_period, buckets = _atom_position_buckets(positions, species_id, tol)
+    accepted: list[tuple[np.ndarray, np.ndarray]] = []
+    for Rinv in _metric_preserving_integer_rotations(avec):
+        anchor_image = Rinv @ positions[anchor_idx]
+        candidates: list[np.ndarray] = []
+        for target_idx in target_pool:
+            tau = _canonical_fractional_translation(
+                positions[target_idx] - anchor_image, tol)
+            if any(_periodic_max_norm(tau, old) <= tol for old in candidates):
+                continue
+            candidates.append(tau)
+        candidates.sort(key=lambda row: tuple(float(v) for v in row))
+        for tau in candidates:
+            if _maps_decorated_atoms(
+                    positions, species_id, Rinv, tau, tol=tol,
+                    key_period=key_period, buckets=buckets):
+                accepted.append((Rinv.copy(), tau.copy()))
+
+    _validate_spatial_seitz_group(accepted, tol=tol)
+
+    identity = np.eye(3, dtype=np.int64)
+    zero = np.zeros(3, dtype=np.float64)
+    def _operation_key(operation):
+        Rinv, tau = operation
+        is_identity = (np.array_equal(Rinv, identity)
+                       and _periodic_max_norm(tau, zero) <= tol)
+        return ((0 if is_identity else 1),
+                *(int(v) for v in Rinv.reshape(-1)),
+                *(float(v) for v in tau))
+
+    accepted.sort(key=_operation_key)
+    Rinv_table = np.asarray([row[0] for row in accepted], dtype=np.int32)
+    tau_table = np.asarray([row[1] for row in accepted], dtype=np.float64)
+    R_table = np.rint(np.linalg.inv(Rinv_table)).astype(np.int32)
+    return R_table, Rinv_table, tau_table
 
 def grid_point_image_perm(fft_grid, M) -> np.ndarray:
     """FFT-grid permutation of a SYMMORPHIC INTEGER point-group operation.
@@ -144,25 +450,11 @@ def recover_symmorphic_density_point_group(
         group (τ = 0).  Always contains the identity; closed under the
         group operation by construction.
     """
-    A = np.asarray(avec, dtype=np.float64)
-    G = A @ A.T
-    # Scale-relative tolerance: ``avec`` carries ~1e-7 float roundoff (e.g.
-    # √3/2 ≈ 0.8660253) that propagates into G, so an exact-integer test on
-    # Mᵀ G M is too brittle.  A true point op reproduces G to that roundoff
-    # (~1e-6·|G|); a non-op differs by O(|G|).  1e-4·max|G| cleanly separates
-    # them for any lattice (alat-normalized or Bohr; hexagonal off-diagonal
-    # ±0.5 vs a wrong op's O(1) mismatch).
-    gtol = 1e-4 * float(np.max(np.abs(G)))
-
     # 1. Holohedry: integer M with Mᵀ G M = G.
-    import itertools
-    holo = []
-    for entries in itertools.product((-1, 0, 1), repeat=9):
-        M = np.array(entries, dtype=np.int64).reshape(3, 3)
-        if abs(round(np.linalg.det(M))) != 1:
-            continue
-        if np.max(np.abs(M.T @ G @ M - G)) <= gtol:
-            holo.append(M)
+    # Scale-relative tolerance and bounded enumeration live in one helper;
+    # the atom-only centroid group and this legacy density diagnostic must
+    # not grow two answers to "which integer rotations preserve the lattice".
+    holo = _metric_preserving_integer_rotations(avec)
 
     # 2. Density-invariance filter on the FFT grid.
     rho = np.asarray(charge_density, dtype=np.float64)
@@ -1653,10 +1945,11 @@ def fft_grid_pullback_perm(
     ------------
     The orbit-closure assertion is automatic for the full FFT grid IF
     ``τ × fft_grid`` is integer (i.e. the fractional translation lands
-    on a discrete grid point).  When it doesn't, the rounding step here
-    will collide images — that's the right error signal.  In practice
-    QE outputs satisfy this commensurability; if a future workflow
-    breaks it, the loader will refuse rather than silently corrupt.
+    on a discrete grid point).  An off-grid translation is refused before
+    snapping: rounding a uniform half-grid shift can still produce a perfect
+    permutation, but it is a permutation of the wrong affine action.  In
+    practice QE outputs satisfy this commensurability; if a future workflow
+    breaks it, the loader refuses rather than silently corrupting the field.
 
     Parameters
     ----------
@@ -1683,6 +1976,18 @@ def fft_grid_pullback_perm(
     n_sym = int(S.shape[0])
     tau_frac = (np.asarray(translations, dtype=np.float64)[:n_sym]
                 / (2.0 * np.pi))                                # (n_sym, 3)
+    tau_grid = tau_frac * fg[None, :]
+    tau_grid_residual = np.abs(tau_grid - np.rint(tau_grid))
+    bad_tau = np.argwhere(tau_grid_residual > 1.0e-8)
+    if bad_tau.size:
+        bad_sym, bad_axis = (int(v) for v in bad_tau[0])
+        raise RuntimeError(
+            "fft_grid_pullback_perm: fractional translation is not "
+            f"commensurate with the FFT grid for sym {bad_sym}, axis "
+            f"{bad_axis}: tau_frac={tau_frac[bad_sym].tolist()}, "
+            f"tau*fft_grid={tau_grid[bad_sym].tolist()}, residual="
+            f"{tau_grid_residual[bad_sym, bad_axis]:.6e}. Off-grid "
+            "translations cannot be represented by an FFT-grid permutation.")
 
     # Enumerate every grid point as (i_x, i_y, i_z) in flat C-order.
     ix, iy, iz = np.meshgrid(

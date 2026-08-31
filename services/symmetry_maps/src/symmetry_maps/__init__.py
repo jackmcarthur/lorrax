@@ -99,7 +99,8 @@ The surface
     the IBZ reduction (derive-IBZ and anchored-IBZ branches).
 ``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
 ``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
-``fft_grid_pullback_perm`` / ``recover_symmorphic_density_point_group``
+``fft_grid_pullback_perm`` / ``recover_atomic_space_group`` /
+``recover_symmorphic_density_point_group``
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, and the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group.
@@ -261,6 +262,7 @@ from symmetry_maps.orbit_syms import (
     r_action_forward,
     r_action_forward_one,
     snap_to_grid_and_split_wrap,
+    recover_atomic_space_group,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
     unfold_orbit_unique_with_id,
@@ -326,6 +328,7 @@ __all__ = [
     "PolarFFTFieldProjection", "project_polar_fft_field",
     "r_action_forward", "r_action_forward_one",
     "snap_to_grid_and_split_wrap",
+    "recover_atomic_space_group",
     "recover_symmorphic_density_point_group",
     # orbit closure: the measurement, its verdict, its tolerance
     "verify_centroid_orbit_closure", "CentroidClosureVerdict",
