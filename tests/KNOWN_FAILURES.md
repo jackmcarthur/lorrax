@@ -1070,19 +1070,22 @@ map's QP compute basis.  The returned `SigmaResult` is DFT-basis-consistent
 for EQP/output assembly.  The three guards and their documentation
 restrictions were removed in the same change.
 
-Focused evidence is green: 151 passed, 1 skipped across the rotation,
-basis-contract, config, and layering tests; a four-logical-device test checks
-the explicit `U C U†` value and retained sharding.  CUDA P=4 JID 57754440,
-step 71, checked the same row-scanned kernel on four ranks/four devices:
+Focused evidence is green: 171 passed, 1 skipped across the rotation,
+basis-contract, config, metallic-SC, zero-head, delivered-window, and
+layering tests; a four-logical-device test checks the explicit `U C U†`
+value and retained sharding.  CUDA P=4 JID 57754440, step 71, checked the
+same row-scanned kernel on four ranks/four devices:
 max absolute tile error `9.1551e-16`, output
 `P(None,None,'x','y')`.  The requested Na end-to-end measurement remains
 blocked before Sigma by two independent deck/planner preconditions: the
 strict 24/48-band boundaries are not multiplet-clean, and the delivered
-product-window planner cannot serve the measured crossing support with its
-widest shipped HGL table.  Neither refusal may be bypassed to manufacture a
-passing gate.  The measured SC `U`/fixed-point diagonal comparison therefore
-remains owed, and the branch result must not describe the capability as
-landing-verified until that artifact exists.
+product-window planner refuses the exact `-10..+10 eV` arm at P=4 with
+achieved residual `0.00510025` and amplification p99 `7183.46` (JID
+57754440 step 91).  Neither refusal may be bypassed to manufacture a passing
+gate.  The two newly reachable head-off metallic seams are fixed and tested,
+but no SC iteration completed.  The measured SC `U`/fixed-point diagonal
+comparison therefore remains owed, and the branch result must not describe
+the capability as landing-verified until that artifact exists.
 
 `tests/test_sigma_result_basis.py` pins the returned basis partition and the
 single sanctioned cube-rotation helper.  One-shot and fixed-point paths keep
