@@ -1,6 +1,7 @@
 """Focused contracts for unit-weight centroid fitting and spatial closure."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -53,3 +54,28 @@ def test_kmeans_cli_has_no_occupation_weight_fit_option():
     assert 'choices=("charge_density", "band_range")' in old
     assert 'add_argument("--weight-bands"' in old
     assert "n_occ =" in old
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    (({"no_orbit": True}, "orbit closure"),
+     ({"rho_power": 0.5}, "feature-row norm"),
+     ({"oversample": 1.0}, "transverse-Gram pruning")),
+)
+def test_current_mode_refuses_metric_bypasses(change, message):
+    from centroid.production_output import validate_mode_policy
+
+    values = dict(
+        density_mode="current", no_orbit=False, rho_power=1.0,
+        oversample=1.5)
+    values.update(change)
+    with pytest.raises(ValueError, match=message):
+        validate_mode_policy(SimpleNamespace(**values))
+
+
+def test_scalar_mode_retains_explicit_experiment_switches():
+    from centroid.production_output import validate_mode_policy
+
+    validate_mode_policy(SimpleNamespace(
+        density_mode="scalar", no_orbit=True, rho_power=0.5,
+        oversample=1.0))

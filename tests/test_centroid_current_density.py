@@ -13,8 +13,10 @@ import pytest
 from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gammas
 from centroid.sampling_metric import (
+    _projector_memory_plan,
     build_feature_metric_diagonal,
     feature_metric_diagonal_from_psi_r,
+    full_k_quadrature_weights,
 )
 
 
@@ -192,6 +194,20 @@ def test_nonuniform_parent_weights_are_divided_over_unequal_stars(monkeypatch):
                                rtol=3e-14, atol=3e-14)
     assert np.max(np.abs(got - (0.25 * p0 + 0.75 * p1))) > 1.0
     assert sym.pullback_calls == [0, 0, 1, 2]
+    np.testing.assert_allclose(
+        full_k_quadrature_weights(loader, sym),
+        np.array([0.7, 0.1, 0.1, 0.1]), rtol=0.0, atol=1e-15)
+
+
+def test_projector_memory_plan_prices_and_refuses():
+    nbytes, cap = _projector_memory_plan(
+        1000, 4, device_memory_bytes=40 * 1024 ** 3)
+    assert nbytes == 2 * 4 ** 2 * 1000 * 16
+    assert cap == 8 * 1024 ** 3
+
+    with pytest.raises(MemoryError, match="does not spatially shard"):
+        _projector_memory_plan(
+            20_000_000, 4, device_memory_bytes=40 * 1024 ** 3)
 
 
 def test_distributed_build_requires_mesh(monkeypatch):

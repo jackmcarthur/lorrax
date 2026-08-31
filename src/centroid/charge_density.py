@@ -18,9 +18,8 @@ Two ρ(r) sources are supported:
    ``centroid/get_charge_density.py`` (now removed): for a 4×4×4 k-grid
    with 48 symmetries → 8 IBZ points, this does 8× fewer FFTs.
 
-   Caveat: the raw IBZ sum is *not* point-group symmetrized. For
-   symmetry-preserving centroid selection prefer the ``qe_save`` path, or
-   apply ``SymMaps`` symmetrization afterwards.
+   Caveat: the raw IBZ sum is *not* point-group symmetrized. Apply
+   ``SymMaps`` symmetrization when a physical diagnostic requires it.
 
 ``get_charge_density(...)`` is the unified entry point. When called without
 an explicit source, it auto-detects an adjacent ``<prefix>.save`` directory
@@ -154,9 +153,9 @@ def rho_from_wfn_ibz(
         Not point-group symmetrized. The density is the correct IBZ sum
         weighted by ``wfn.kweights``, but cross-star-member averaging is
         not applied — two k-points related by a rotation contribute the
-        un-rotated |ψ|² at each real-space point. For centroid selection
-        this is usually fine; for cases where symmetric centroid output
-        is required, use ``rho_from_qe_save`` instead.
+        un-rotated |ψ|² at each real-space point. Use
+        ``rho_from_qe_save`` when the already-symmetrized physical density is
+        required.
     """
     # Lazy import: psp brings in JAX + pseudos code that the qe_save path
     # does not need.
@@ -215,10 +214,19 @@ def symmetrize_on_grid(
             raise ValueError(
                 "translations_frac must have one row per symmetry; "
                 f"got {tau.shape[0]} for {ops.shape[0]} operations")
-        pullback = symmetry_maps.fft_grid_pullback_perm(
-            ops, tau * (2.0 * np.pi), N, validate=True)
-        for row in pullback:
-            acc += flat[row]
+        # Stream one service-owned row.  A stacked ``(n_ops, n_grid)`` int64
+        # table is needless persistent state (366 MiB already at one million
+        # grid points and 48 operations), while the scalar accumulator is the
+        # only object this projection needs to retain.
+        for op, shift in zip(ops, tau):
+            row = symmetry_maps.fft_grid_pullback_perm(
+                op[None, ...], shift[None, ...] * (2.0 * np.pi), N,
+                validate=True)
+            if row.shape != (1, flat.size):
+                raise ValueError(
+                    "symmetry-service FFT-grid pullback has wrong shape: "
+                    f"{row.shape} != {(1, flat.size)}")
+            acc += flat[row[0]]
     return (acc / ops.shape[0]).reshape(f.shape)
 
 

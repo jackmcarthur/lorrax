@@ -147,10 +147,9 @@ set is not orbit closed or is incompatible with the FFT grid. The q-reduced
 Coulomb path then falls back to a full-zone calculation; it never uses an
 incomplete symmetry table.
 
-For a WFN whose stored group is reduced by spinor bookkeeping, centroid
-selection may recover additional *charge-density* symmetries. This can improve
-the real-space quadrature without enlarging the group used to unfold
-wavefunctions or \(V_q\).
+Centroid closure uses the decorated atoms' spatial Seitz group, independent of
+electronic, magnetic, and time-reversal authorization. Wavefunction unfolding
+and \(V_q\) continue to use the authenticated electronic group.
 
 ## 5. Matrix unfolding
 

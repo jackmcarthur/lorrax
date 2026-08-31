@@ -12,7 +12,7 @@ from centroid.production_output import (
 def test_centroid_header_names_density_band_space_and_selection(tmp_path):
     source = tmp_path / "WFN.h5"
     header = format_centroid_header(
-        density_fit="bands 1-40 (indices [0,40)): sum_n sum_k w_k |psi_nk(r)|^2",
+        feature_fit="bands 1-40 (indices [0,40)): sum_n sum_k w_k |psi_nk(r)|^2",
         source_wfn=str(source),
         weight_label="band-range density",
         num_electrons=16.0,
@@ -36,7 +36,7 @@ def test_centroid_header_names_density_band_space_and_selection(tmp_path):
     )
 
     assert header.startswith("LORRAX ISDF centroid coordinates")
-    assert "density fit: bands 1-40 (indices [0,40))" in header
+    assert "feature fit: bands 1-40 (indices [0,40))" in header
     assert f"source wavefunctions: {source}" in header
     assert "electrons: 16; occupied-band boundary: 8" in header
     assert "requested=400; candidates=800; written=399" in header
@@ -63,7 +63,7 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
         "x64": True,
     })
     text = format_kmeans_report(
-        header="density fit: bands 1-40\nselection: weighted k-means",
+        header="feature fit: bands 1-40\nselection: weighted k-means",
         source_wfn=str(tmp_path / "WFN.h5"),
         centroid_file=str(tmp_path / "centroids_frac_20.txt"),
         report_file=str(tmp_path / "kmeans.out"),
@@ -73,7 +73,7 @@ def test_kmeans_report_is_compact_scientific_output(tmp_path):
     assert "MPI ranks      : 4" in text
     assert "Wavefunctions  : phdf5 reader" in text
     assert "JAX/JAXLIB     : 0.9.1 / 0.9.1" in text
-    assert "density fit: bands 1-40" in text
+    assert "feature fit: bands 1-40" in text
     assert "Selection wall : 12.500 s" in text
     assert "WARNINGS" in text
     assert "density symmetry residual is large" in text

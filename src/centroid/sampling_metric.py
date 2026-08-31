@@ -19,6 +19,7 @@ from common.gamma_matrices import gamma_apply, gamma_perm_phase
 
 
 _GAMMA_MODES = ("charge", "transverse")
+_PROJECTOR_BUDGET_BYTES = 8 * 1024 ** 3
 
 
 @jax.jit
@@ -155,65 +156,9 @@ def _window_mask(lo: int, canonical_mask, band_range) -> np.ndarray:
     return canonical * ((bands >= range_lo) & (bands < range_hi))
 
 
-def build_feature_metric_diagonal(
-    wfn,
-    sym,
-    band_range_left: tuple[int, int],
-    band_range_right: tuple[int, int],
-    *,
-    gamma_mode: str,
-    dist_mesh=None,
-    verbose: bool = True,
-):
-    """Build the q=0 feature-Gram diagonal on the WFN FFT grid.
-
-    The returned field is
-
-    ``s(r)=sum_k w_k sum_{m in L,n in R}|Psi_m^dag Gamma Psi_n|^2``.
-
-    ``Gamma=I`` for charge. For transverse current the three
-    ``Gamma=alpha_i/alpha_fs`` channels are summed. The driver uses
-    ``sqrt(s)`` as the Lloyd mass. In the one-k, one-component,
-    equal-window limit this is exactly the historical band density; over
-    multiple k points it is the norm of the k-stacked feature row.
-
-    Each raw IBZ parent is lifted/FFT'd once over the union of the two band
-    windows. Bands stream into ``D_L`` and ``D_R`` together; neither an
-    ``(n,m)`` transition carrier nor an ``O(Nsym*Ngrid)`` pullback cache is
-    formed. Parents are partitioned over processes and one final grid psum
-    combines them.
-    """
-    from common.collectives import (process_rank_world, psum_replicate,
-                                    single_device_mesh)
-    from common.wfn_transforms import to_rbox
+def _quadrature_tables(wfn, sym):
+    """Return authenticated star rows and their full-BZ quadrature weights."""
     from symmetry_maps import star_tables_of
-    from wfn_loader import IBZRows, WfnLoader, uniform_band_windows
-
-    if not isinstance(wfn, WfnLoader):
-        raise TypeError(
-            "build_feature_metric_diagonal requires the driver's open "
-            f"WfnLoader; got {type(wfn).__name__}")
-    mode = str(gamma_mode).strip().lower()
-    if mode not in _GAMMA_MODES:
-        raise ValueError(
-            f"gamma_mode must be one of {_GAMMA_MODES}; got {gamma_mode!r}")
-    if mode == "transverse" and int(wfn.nspinor) != 2:
-        raise ValueError(
-            "gamma_mode='transverse' requires a two-component Pauli WFN; "
-            f"got nspinor={int(wfn.nspinor)}")
-    left_range = _validated_range(
-        band_range_left, int(wfn.nbands), "band_range_left")
-    right_range = _validated_range(
-        band_range_right, int(wfn.nbands), "band_range_right")
-
-    fft_grid = tuple(int(v) for v in wfn.fft_grid)
-    n_grid = int(np.prod(fft_grid))
-    cell_volume = float(wfn.cell_volume)
-    if not np.isfinite(cell_volume) or cell_volume <= 0.0:
-        raise ValueError(
-            f"WFN cell volume must be finite and positive, got {cell_volume}")
-    wavefunction_scale = float(np.sqrt(n_grid / cell_volume))
-    ns = 4 if mode == "transverse" else int(wfn.nspinor)
 
     parent_for_k, sym_row_for_k, _ = star_tables_of(sym)
     nk_full = int(sym.nk_tot)
@@ -248,11 +193,118 @@ def build_feature_metric_diagonal(
         raise ValueError(
             "SymMaps full-BZ parents omit nonzero WFN quadrature weight: "
             f"selected normalized weight={used_weight:.17g}, want 1")
+
     star_rows = {
         int(parent): np.asarray(
             sym_row_for_k[parent_for_k == parent], dtype=np.int32)
         for parent in parents_used
     }
+    full_weights = np.empty(nk_full, dtype=np.float64)
+    for parent in parents_used:
+        member_rows = np.flatnonzero(parent_for_k == parent)
+        full_weights[member_rows] = (
+            float(kweights[parent]) / float(member_rows.size))
+    if not np.isclose(full_weights.sum(), 1.0, rtol=1.0e-12, atol=1.0e-14):
+        raise ValueError(
+            "expanded full-BZ quadrature weights do not sum to one: "
+            f"sum={full_weights.sum():.17g}")
+    return parents_used, star_rows, full_weights
+
+
+def full_k_quadrature_weights(wfn, sym) -> np.ndarray:
+    """Expand each normalized IBZ parent weight uniformly over its star."""
+    return _quadrature_tables(wfn, sym)[2].copy()
+
+
+def _projector_memory_plan(
+    n_grid: int,
+    ns: int,
+    *,
+    device_memory_bytes: int | None,
+) -> tuple[int, int]:
+    """Return projector bytes/cap, refusing before an unbounded HBM attempt."""
+    if min(n_grid, ns) <= 0:
+        raise ValueError("metric memory plan requires positive grid/spin sizes")
+    budget = _PROJECTOR_BUDGET_BYTES
+    if device_memory_bytes is not None and int(device_memory_bytes) > 0:
+        budget = min(budget, max(1024 ** 3, int(device_memory_bytes) // 4))
+    bytes_per_point = 2 * int(ns) ** 2 * np.dtype(np.complex128).itemsize
+    projector_bytes = bytes_per_point * int(n_grid)
+    if projector_bytes > budget:
+        raise MemoryError(
+            "centroid feature metric projector carrier exceeds its preflight "
+            f"cap: two {ns}x{ns} complex128 grids need "
+            f"{projector_bytes / 2**30:.2f} GiB/rank, cap is "
+            f"{budget / 2**30:.2f} GiB/rank. This path distributes IBZ "
+            "parents but does not spatially shard one projector; reduce the "
+            "FFT grid or use a future distributed-r-space metric backend.")
+    return projector_bytes, budget
+
+
+def build_feature_metric_diagonal(
+    wfn,
+    sym,
+    band_range_left: tuple[int, int],
+    band_range_right: tuple[int, int],
+    *,
+    gamma_mode: str,
+    dist_mesh=None,
+    verbose: bool = True,
+):
+    """Build the q=0 feature-Gram diagonal on the WFN FFT grid.
+
+    The returned field is
+
+    ``s(r)=sum_k w_k sum_{m in L,n in R}|Psi_m^dag Gamma Psi_n|^2``.
+
+    ``Gamma=I`` for charge. For transverse current the three
+    ``Gamma=alpha_i/alpha_fs`` channels are summed. The driver uses
+    ``sqrt(s)`` as the Lloyd mass. In the one-k, one-component,
+    equal-window limit this is exactly the historical band density; over
+    multiple k points it is the norm of the k-stacked feature row.
+
+    Bands stream into ``D_L`` and ``D_R`` together; neither an ``(n,m)``
+    transition carrier nor an ``O(Nsym*Ngrid)`` pullback cache is formed.
+    Parents are partitioned over processes and one final scalar-grid psum
+    combines the result.  The two full-grid projector carriers are explicitly
+    priced and capped at 8 GiB/rank (or one quarter of device memory); this
+    parent-distributed path refuses rather than pretending those grids are
+    spatially sharded.
+    """
+    from common.collectives import (process_rank_world, psum_replicate,
+                                    single_device_mesh)
+    from common.wfn_transforms import to_rbox
+    from wfn_loader import IBZRows, WfnLoader, uniform_band_windows
+
+    if not isinstance(wfn, WfnLoader):
+        raise TypeError(
+            "build_feature_metric_diagonal requires the driver's open "
+            f"WfnLoader; got {type(wfn).__name__}")
+    mode = str(gamma_mode).strip().lower()
+    if mode not in _GAMMA_MODES:
+        raise ValueError(
+            f"gamma_mode must be one of {_GAMMA_MODES}; got {gamma_mode!r}")
+    if mode == "transverse" and int(wfn.nspinor) != 2:
+        raise ValueError(
+            "gamma_mode='transverse' requires a two-component Pauli WFN; "
+            f"got nspinor={int(wfn.nspinor)}")
+    left_range = _validated_range(
+        band_range_left, int(wfn.nbands), "band_range_left")
+    right_range = _validated_range(
+        band_range_right, int(wfn.nbands), "band_range_right")
+
+    fft_grid = tuple(int(v) for v in wfn.fft_grid)
+    n_grid = int(np.prod(fft_grid))
+    cell_volume = float(wfn.cell_volume)
+    if not np.isfinite(cell_volume) or cell_volume <= 0.0:
+        raise ValueError(
+            f"WFN cell volume must be finite and positive, got {cell_volume}")
+    wavefunction_scale = float(np.sqrt(n_grid / cell_volume))
+    ns = 4 if mode == "transverse" else int(wfn.nspinor)
+
+    parents_used, star_rows, _ = _quadrature_tables(wfn, sym)
+    parent_weights = np.asarray(wfn.kweights, dtype=np.float64)
+    parent_weights = parent_weights / parent_weights.sum()
 
     rank, world = process_rank_world()
     if world > 1 and dist_mesh is None:
@@ -268,11 +320,26 @@ def build_feature_metric_diagonal(
         union_hi - union_lo, (4 * 1024 ** 3) // max(1, bytes_per_band)))
     windows = uniform_band_windows(union_lo, union_hi, chunk)
     width = int(windows[0][1].shape[0])
+    try:
+        from common.gpu_utils import get_device_memory_gb
+        device_memory_bytes = int(float(get_device_memory_gb()) * 1024 ** 3)
+    except Exception:
+        device_memory_bytes = None
+    projector_bytes, projector_cap = _projector_memory_plan(
+        n_grid, ns, device_memory_bytes=device_memory_bytes)
     n_rounds = -(-int(parents_used.size) // world)
     parents_local = [
         (int(parent), True) for parent in parents_used[rank::world]]
     while len(parents_local) < n_rounds:
         parents_local.append((int(parents_used[0]), False))
+    if rank == 0:
+        print(
+            f"  {mode} metric plan: {len(parents_used)} parent(s) over "
+            f"{world} rank(s); two full-grid projectors "
+            f"{projector_bytes / 2**30:.2f} GiB/rank "
+            f"(cap {projector_cap / 2**30:.2f}), WFN chunk <= 4.00 GiB, "
+            "one scalar-grid psum",
+            flush=True)
 
     t0 = time.perf_counter()
     last_log = t0
@@ -314,8 +381,9 @@ def build_feature_metric_diagonal(
             parent_metric = _transverse_metric_diagonal(
                 density_left, density_right, wavefunction_scale)
         if include_parent:
-            member_weight = (
-                float(kweights[parent]) / float(star_rows[parent].size))
+            # Every row in one parent star carries the same expanded weight.
+            member_weight = float(
+                parent_weights[parent] / float(star_rows[parent].size))
             for row in star_rows[parent]:
                 pullback = sym.fft_grid_pullback(
                     np.asarray([int(row)], dtype=np.int32),
@@ -369,4 +437,5 @@ def build_feature_metric_diagonal(
 __all__ = [
     "build_feature_metric_diagonal",
     "feature_metric_diagonal_from_psi_r",
+    "full_k_quadrature_weights",
 ]

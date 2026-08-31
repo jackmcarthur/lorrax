@@ -10,6 +10,23 @@ from common.scientific_output import (
 )
 
 
+def validate_mode_policy(args) -> None:
+    """Refuse current-mode switches that change its physical metric."""
+    if args.density_mode == "current":
+        if args.no_orbit:
+            raise ValueError(
+                "current centroid selection requires atom-derived orbit "
+                "closure; --no-orbit is not a physical current-mode policy")
+        if float(args.rho_power) != 1.0:
+            raise ValueError(
+                "current centroid selection uses the exact feature-row norm; "
+                "--rho-power must remain 1")
+        if float(args.oversample) <= 1.0:
+            raise ValueError(
+                "current centroid selection requires transverse-Gram pruning; "
+                "--oversample must be greater than 1")
+
+
 def prune_band_ranges(args, n_val: int, n_cond: int):
     """Resolved pair-density windows, shared by pruning and provenance."""
     top = int(n_val) + int(n_cond)
@@ -20,7 +37,7 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
     return (0, int(n_val)), (0, top), "valence x (valence + conduction)"
 
 
-def format_centroid_header(*, density_fit: str, source_wfn: str,
+def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            weight_label: str, num_electrons: float,
                            occupied_boundary: int, fft_grid, kgrid, shift,
                            seed: int, rho_power: float, requested: int,
@@ -35,9 +52,9 @@ def format_centroid_header(*, density_fit: str, source_wfn: str,
                "gamma^{1,2,3} (current) ISDF")
     return (
         "LORRAX ISDF centroid coordinates (fractional crystal units)\n"
-        f"density fit: {density_fit}\n"
+        f"feature fit: {feature_fit}\n"
         f"source wavefunctions: {os.path.abspath(source_wfn)}\n"
-        f"source density: {weight_label}\n"
+        f"selection metric: {weight_label}\n"
         f"electrons: {float(num_electrons):.8g}; "
         f"occupied-band boundary: {int(occupied_boundary)}\n"
         f"FFT grid: {tuple(fft_grid)}; k grid: {tuple(kgrid)}; "
@@ -73,7 +90,7 @@ def format_kmeans_report(*, header: str, source_wfn: str,
         "---------------------",
         *numerical_environment_lines(runtime),
         f"Wavefunctions  : {wfn_backend} reader",
-        "Selection      : density-weighted k-means on the real-space FFT grid",
+        "Selection      : feature-weighted k-means on the real-space FFT grid",
         "",
         "CENTROID PROVENANCE",
         "-------------------",
@@ -99,4 +116,5 @@ __all__ = [
     "format_centroid_header",
     "format_kmeans_report",
     "prune_band_ranges",
+    "validate_mode_policy",
 ]

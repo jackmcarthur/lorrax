@@ -38,12 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rho-power", type=float, default=1.0,
                    help="Raise the sampling weight to α (default α=1.0). "
                         "Per Gersho (3D), centroid number-density "
-                        "asymptotically scales as ρ^(3α/5), so α=1 gives "
-                        "ρ^0.6, α=5/3≈1.667 gives ρ^1, α=10/3≈3.333 gives "
-                        "ρ^2 (closer to the |ψ_v|²|ψ_c|² distribution the "
-                        "ISDF actually wants to fit). Bump above 1 if your "
-                        "centroids are under-clustering high-density "
-                        "regions.")
+                        "asymptotically scales as w^(3α/5), where w is the "
+                        "resolved feature-row norm. Thus α=1 gives w^0.6 "
+                        "and α=5/3 gives w^1.")
     p.add_argument("--oversample", type=float, default=1.5,
                    help="k-means runs for ⌈N_c·oversample⌉ then prunes via "
                         "pivoted Cholesky (default 1.5). Set to 1.0 to "
@@ -81,7 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "symmetry.")
     p.add_argument("--no-orbit", action="store_true",
                    help="Force the literal-point (non-orbit) path even if "
-                        "WFN.h5 has multiple sym ops. Overrides --orbit.")
+                        "the decorated atoms have multiple spatial Seitz "
+                        "operations. Overrides --orbit.")
     p.add_argument("--density-mode",
                    choices=("scalar", "current"),
                    default="scalar",
@@ -159,6 +157,7 @@ from .production_output import (
     format_centroid_header,
     format_kmeans_report,
     prune_band_ranges,
+    validate_mode_policy,
 )
 
 
@@ -400,6 +399,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     four feed the rank gate in ``main()``.
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
+    from .sampling_metric import full_k_quadrature_weights
 
     # Orbit mode targets ORBITS, not points: the final centroid count is
     # Σ orbit_size over the picked orbits.  ``N_c`` is a POINT count the user
@@ -428,6 +428,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         bispinor=(args.density_mode == "current"),
         gamma_mode=("transverse" if args.density_mode == "current"
                     else "charge"),
+        k_weights=full_k_quadrature_weights(wfn, sym),
         verbose=(debug_print_enabled() and process_rank() == 0),
     )
     if args.prune_window == "v_x_vc":
@@ -458,6 +459,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
 def main():
     args = build_parser().parse_args()
+    validate_mode_policy(args)
     production_warnings = []
     production_stdout = ProductionStdout(
         debug=debug_print_enabled(), rank=RUNTIME.process_index,
@@ -677,12 +679,12 @@ def main():
     prune_left, prune_right, prune_label = prune_band_ranges(
         args, n_val_header, n_cond_header)
     if args.density_mode == "current":
-        density_fit = (
+        feature_fit = (
             f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
             "sqrt(sum_k w_k sum_i,m,n "
             "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights")
     else:
-        density_fit = (
+        feature_fit = (
             f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
             "sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); "
             "unit band weights")
@@ -690,7 +692,7 @@ def main():
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = "pivoted Cholesky" if pruned else "not applied"
     header = format_centroid_header(
-        density_fit=density_fit, source_wfn="WFN.h5",
+        feature_fit=feature_fit, source_wfn="WFN.h5",
         weight_label=weight_label,
         num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
         occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,

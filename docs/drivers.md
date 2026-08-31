@@ -50,12 +50,19 @@ nonsymmorphic operations. Windows resolve from the WFN or `--prune-n-*` / `--pru
 Output: `centroids_frac_<n>[<suffix>].txt`, consumed by the GW run via deck keys
 `centroids_file` (default `centroids_frac.txt`) and, for the bispinor current channel, `centroids_file_current`.
 
-Invoke: `python3 -m centroid.kmeans_cli N --orbit [--out-suffix _x]`; single node
-(`/scratch2/08271/jackmc/mos2_4x4_test/deck_b300.sbatch` step 3) or multi-process — certified at P=16:
-67→31 s wall (2.2×), accepted 2979c set sha256-IDENTICAL to P=1, rank gate 270/270 (scorecard BD.2, jobs
-7884867/7884870; the thread-main refusal seen there is closed — mesh + warm-up now come from
-`initialize_communicator_stack`). One shared charge/current projector sweep partitions IBZ parents across ranks
-and reduces the final grid once; it never forms a band-pair carrier.
+Invoke: `python3 -m centroid.kmeans_cli N [--out-suffix _x]`. The projector
+sweep partitions IBZ parents across ranks, prices and caps its two full-grid
+projector carriers, and reduces one scalar grid; it never forms a band-pair
+carrier. Useful parallelism is capped by the parent count, and the projectors
+are not spatially sharded, so an oversized carrier is refused before loading.
+Charge and current arithmetic were checked on a real 2×2/P=4 mesh; the Si
+24³ scalar selector measured 10.4–10.6 s at P=4, not a large-grid scaling claim.
+
+Upgrade note: `--rho-source`, `--qe-save`, `--centroid-weight`, and
+`--weight-bands` were removed. Use `--density-mode scalar|current` and the
+`--prune-*` window flags. The old public `centroid.current_density`
+`build_current_density` helper was replaced by `centroid.sampling_metric`;
+there is no occupation-weighted centroid path.
 Reuse: the `.txt` carries no stamp; content is guarded downstream by the GW run (centroid-table md5 on the
 restart tensors + element-wise compare against `zeta_q.h5`), so regenerating centroids invalidates ζ and
 tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
@@ -66,7 +73,7 @@ tensor reuse there. Fastloop stage: `kmeans` (~26 s of the chain).
 | `--oversample` | 1.5 | k-means runs at ceil(N_c*x), pruned back; 1.0 disables pruning |
 | `--prune-n-cond` | `nbands - n_val` (full WFN conduction window) | Cholesky window conduction extent; the pre-2026-07-29 `min(n_val, nb-n_val)` default was a 30%-rank-deficiency bug |
 | `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c` (legacy) / `v_x_vc` (adds v×v for V_H) / `vc_x_vc` (full sigma square, use when ncond >> nval) |
-| `--density-mode` | `scalar` | `scalar` = charge feature-row norm/Gram; `current` = gauge-invariant three-current feature-row norm/Gram (suffix `_current`) |
+| `--density-mode` | `scalar` | `scalar` = charge feature-row norm/Gram; `current` = gauge-invariant three-current feature-row norm/Gram (suffix `_current`). Current mode requires atom-orbit closure, `rho_power=1`, and transverse-Gram pruning. |
 | `--orbit` / `--no-orbit` | auto (on if atom group has >1 row) | close the set under atom-derived spatial Seitz operations |
 | `--rho-power` | 1.0 | weight^alpha; centroid density ~ w^(0.6*alpha) |
 | `LORRAX_CENTROID_RANK_TOL` (env) | 0.01 | rank-gate tolerance; lowering it is a deliberate override |

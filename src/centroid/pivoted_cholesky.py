@@ -852,6 +852,7 @@ def prune_candidates_by_pivoted_cholesky(
             band_range_left=band_range_left,
             band_range_right=band_range_right,
             band_norms=band_norms,
+            k_weights=k_weights,
             gamma_mode=gamma_mode,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
@@ -1038,9 +1039,9 @@ def prune_candidates_by_pivoted_cholesky(
 # The conj() on P_v_k flips it from gw_jax's Σ_v φ*(μ)φ(ν) to the
 # valence-projector form Σ_v φ(a)φ*(b) the Gram definition needs.
 #
-# Uses full-BZ unfold with uniform k-weights = 1/nk_tot (read_Gvecs_to_devices
-# unfolds symmetry, so IBZ-weighted IBZ data are not the inputs). This is the
-# correct convention to match gw_jax's pair-density pipeline exactly.
+# Uses full-BZ unfold.  The centroid driver expands each normalized IBZ
+# parent weight uniformly over its star and gives both its cheap candidate
+# metric and this exact Gram the same full-k quadrature table.
 
 
 def build_gram_q0_via_loadwfns(
@@ -1057,6 +1058,7 @@ def build_gram_q0_via_loadwfns(
     band_range_left: tuple[int, int] | None = None,
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
+    k_weights: np.ndarray | None = None,
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
@@ -1085,7 +1087,8 @@ def build_gram_q0_via_loadwfns(
     ``get_sharded_wfns_centroids`` at the candidate indices, sharded
     pair densities via ``compute_pair_density_spin_traced``, combined
     with the q=0 sum via ``compute_gram_q0_from_left_right``. k-weights
-    are uniform ``1 / nk_tot`` because we've unfolded.
+    are supplied on that full-BZ order.  ``None`` retains the historical
+    uniform ``1 / nk_tot`` convention for standalone callers.
 
     Args:
         wfn: open WFNReader.
@@ -1114,6 +1117,10 @@ def build_gram_q0_via_loadwfns(
             applied to both left and right ψ via
             ``ψ /= max(norm_slice, 1.0)`` before the pair-density
             einsum.
+        k_weights: optional normalized full-BZ quadrature weights.  The
+            centroid driver expands each stored IBZ parent weight uniformly
+            over its star and passes the same table to candidate generation
+            and pruning.
 
     Returns:
         G: (M, M) complex, sharded ``P('x','y')`` on the mesh — ready to
@@ -1191,7 +1198,21 @@ def build_gram_q0_via_loadwfns(
         bispinor=bispinor,
     )
 
-    kw = jnp.ones((sym.nk_tot,), dtype=jnp.float64) / float(sym.nk_tot)
+    if k_weights is None:
+        kw_np = np.full(int(sym.nk_tot), 1.0 / float(sym.nk_tot),
+                        dtype=np.float64)
+    else:
+        kw_np = np.asarray(k_weights, dtype=np.float64)
+        if kw_np.shape != (int(sym.nk_tot),):
+            raise ValueError(
+                "k_weights must have one entry per unfolded full-BZ k point; "
+                f"got {kw_np.shape}, expected {(int(sym.nk_tot),)}")
+        if (not np.all(np.isfinite(kw_np)) or np.any(kw_np < 0.0)
+                or not np.isclose(kw_np.sum(), 1.0, rtol=1e-12, atol=1e-14)):
+            raise ValueError(
+                "k_weights must be finite, nonnegative, and sum to one; "
+                f"got sum={kw_np.sum():.17g}")
+    kw = jnp.asarray(kw_np, dtype=jnp.float64)
 
     # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
     # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if

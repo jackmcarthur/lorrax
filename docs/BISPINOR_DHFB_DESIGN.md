@@ -34,7 +34,7 @@ DHF + bare-Breit GW with bispinor wavefunctions:
 
 - $\chi^0\equiv\chi^0_{00}$, $W\equiv W_{00}$ — Coulomb screened in RPA (existing scalar code, ns=4 spin axis).
 - $\Sigma_{\alpha\beta}=\Sigma^C_{\alpha\beta}+\Sigma^B_{\alpha\beta}$.  $\Sigma^C$ uses $W_{00}$; $\Sigma^B$ uses the **bare** $D^{ij}$ — no transverse screening, no retardation.
-- Four ISDF $\zeta$ bases, one per $\tilde\gamma^{\mu_L}$, on **two centroid sets**: scalar charge density for $\mu_L=0$, Gordon-decomposed Pauli current for $\mu_L\in\{1,2,3\}$.
+- Four ISDF $\zeta$ bases, one per $\tilde\gamma^{\mu_L}$, on **two centroid sets**: the charge feature-row norm for $\mu_L=0$ and the three-current feature-row norm for $\mu_L\in\{1,2,3\}$.
 
 Deferred (phase-2+): full $\chi^{\mu\nu}/W^{\mu\nu}$, transverse screening, retarded Breit, vertex corrections, higher-order kinetic balance, bispinor-aware Sternheimer source.
 
@@ -90,7 +90,7 @@ $$\rho^{\mu_L}_{n_l n_r,k,q}(r) = \sum_{ab}\psi^*_{l,n_l,k,a}(r)\,\tilde\gamma^{
 **Architecture (data flow when bispinor=True):**
 
 A bispinor run reads **two** centroid files. Each carries human-readable
-`density fit`, `source density`, and `intended channels` provenance:
+feature-fit, source-WFN, and intended-channel provenance:
 
 | File (suffix) | Intended channels | Built by | Used for |
 |---|---|---|---|
@@ -207,7 +207,7 @@ band-pair cost; it is not the implemented path.
 | [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
 | [`src/centroid/sampling_metric.py`](../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
-| [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes density-fit, source-density, and intended-channel provenance. |
+| [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes feature-fit, source-WFN, and intended-channel provenance. |
 | [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
 | [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
 | [`src/gw/cohsex_sigma.py`](../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
@@ -233,7 +233,7 @@ band-pair cost; it is not the implemented path.
 
 ## 8. Out of scope (phase-2)
 
-$\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($D^{ij}(\omega)$) • Sternheimer-side bispinor source • channel-aware centroid pruning (phase-1 reuses charge-channel pivoted-Cholesky n_val/n_cond) • higher-order kinetic balance (DKH4 / σ·v).
+$\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($D^{ij}(\omega)$) • Sternheimer-side bispinor source • higher-order kinetic balance (DKH4 / σ·v).
 
 ## 9. Open questions
 
