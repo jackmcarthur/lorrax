@@ -20,6 +20,12 @@ import numpy as np
 
 Array = np.ndarray
 
+# One lazily started pair of workers serves every complex lattice in the process.  A
+# per-window context manager paid thread startup and teardown twelve times in
+# the Na plan, even though every call performs the same two independent axis
+# quantiles.
+_AXIS_QUANTILE_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
 
 def _tail_refined_quantiles(bins_per_axis: int) -> Array:
     """Return the delivered-planner quantile edges for one support axis."""
@@ -119,11 +125,10 @@ def tail_refined_lattice_measure(
     # The axes are independent, and NumPy's quantile selection releases the
     # GIL.  Evaluate the pair together so a complex support does not serialize
     # two identical-sized selection passes.
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        real_future = executor.submit(
-            np.quantile, sums.real, joint_quantiles)
-        imag_quantiles = np.quantile(sums.imag, joint_quantiles)
-        real_quantiles = real_future.result()
+    real_future = _AXIS_QUANTILE_EXECUTOR.submit(
+        np.quantile, sums.real, joint_quantiles)
+    imag_quantiles = np.quantile(sums.imag, joint_quantiles)
+    real_quantiles = real_future.result()
     base_real = np.unique(real_quantiles[:split])
     base_imag = np.unique(imag_quantiles[:split])
     refined_real = np.unique(real_quantiles[split:])
