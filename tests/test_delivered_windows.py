@@ -352,7 +352,13 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
     assert len(narrow) == 1
     assert narrow_report["n_windows"] == 1
 
-    wide, wide_report = _patched_test_plan(20.0)
+    covered, covered_report = _patched_test_plan(20.0)
+    assert len(covered) == 1
+    assert covered_report["n_windows"] == 1
+    assert covered_report["branches"][0]["windows"][0]["family"] == (
+        "crossing_causal")
+
+    wide, wide_report = _patched_test_plan(30.0)
     crossing = [row for row in wide if ":resonant[p" in row.window.name]
     widest_span = max(
         entry.range_max
@@ -364,17 +370,18 @@ def test_crossing_patch_count_is_the_smallest_catalog_covered_partition(
         evidence["family"] == "crossing_causal"
         for evidence in wide_report["branches"][0]["windows"]
         if ":resonant[p" in evidence["name"])
-    # One unpatched window has A=max(17, 20-5)/0.25=68, so A=40 cannot
-    # cover it.  The returned two-patch cover is therefore minimal.
-    assert 68.0 > widest_span
+    # The 20 eV probe has A=max(17, 20-5)/0.25=68 and is covered by A=96.
+    # At 30 eV the same formula gives A=102, so one patch is impossible and
+    # the returned two-patch cover is minimal.
+    assert 68.0 <= widest_span < 102.0
 
 
 def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
         monkeypatch):
     ev_to_ry = 1.0 / 27.211386245988
     monkeypatch.setattr(delivered, "_candidate_rules", _served_candidate)
-    first, first_report = _patched_test_plan(20.0)
-    second, second_report = _patched_test_plan(20.0)
+    first, first_report = _patched_test_plan(30.0)
+    second, second_report = _patched_test_plan(30.0)
     first_crossing = [
         row for row in first if ":resonant[p" in row.window.name]
     second_crossing = [
@@ -382,7 +389,7 @@ def test_emitted_crossing_patches_are_disjoint_complete_and_reproducible(
 
     assert len(first_crossing) == len(second_crossing) == 2
     joined = np.concatenate([row.omega_idx for row in first_crossing])
-    omega = np.linspace(0.0, 20.0, 81) * ev_to_ry
+    omega = np.linspace(0.0, 30.0, 121) * ev_to_ry
     np.testing.assert_array_equal(joined, np.arange(omega.size))
     assert np.unique(joined).size == joined.size
     assert all("[p" in row.window.name for row in first_crossing)
