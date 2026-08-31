@@ -165,6 +165,18 @@ window must divide both mesh axes, and h5py all-gather is refused at P > 1.
 Self-consistency and fixed-Sigma `eqp2` rotate one omega row at a time without
 materializing a replicated full cube.
 
+### Removed Sigma/MPA keys
+
+These names are migration information, not accepted options:
+
+| removed key | migration |
+|---|---|
+| `mpa_material_class` | Removed. Material class is inferred from WFN occupations. |
+| `sigma_omega_layout` | Removed. Dynamic Sigma is always band-sharded. |
+| `mpa_sigma_crossing_target_error` | Removed. Use the single `mpa_sigma_sector_target_error` accuracy target. |
+| `mpa_sigma_max_nodes` | Removed. The delivered planner derives its ceiling from measured support. A stale parser/config acceptance is tracked in `tests/known_failures/SMALL_ISSUES.md` and is not a supported control. |
+| `mpa_sigma_omega_cluster_gap_ry` | Removed. A gap wider than `1.5 * sigma_omega_step_ev` starts a new cluster. |
+
 ## IO / restart
 
 | key | default | meaning |

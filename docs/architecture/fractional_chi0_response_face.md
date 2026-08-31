@@ -241,7 +241,7 @@ Material class is inferred from the loaded WFN occupations; it is not a deck
 option. The face-carrier MPA executor and its occupation-weighted kernels are
 now supported with `low_mem_bands = true`, so no material-specific refusal row
 remains. The live option envelope is owned by [the input
-reference](../input_reference.md#memory); this page records the kernel port and
+reference](../input_reference.md#system); this page records the kernel port and
 does not duplicate that register.
 
 ## Verification

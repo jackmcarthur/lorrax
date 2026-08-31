@@ -9,16 +9,12 @@ something measures it.  Two claims here, and they are different:
    it, with no rescaling, rounding or re-solving in between.  Asserted on
    the raw bytes rather than with a tolerance — a tolerance would pass a
    loader that had quietly started rounding.
-2. **The selection rule chooses the same table.**  The WP1 census measured
-   54 distinct requests across the frozen decks, the campaign decks and
-   the suite, of which 51 were served, touching exactly SIX of the 31
-   shipped tables.  Those six, and the requests that reach them, are
-   pinned here by name.  If the selection rule drifts, this file names the
-   request that moved and the table it moved to.
+2. **The selection rule chooses the catalog's current best table.** The
+   representative requests below pin both the selected files and their bytes.
+   If the selection rule or shipped catalog moves, this file names the request
+   and the table that moved.
 
-The six-table fact is worth pinning for its own sake: it is the measured
-answer to "how much of this bundle is load-bearing", and it is what makes
-the certification campaign (WP6) affordable.
+The request sample currently touches four of the 34 shipped tables.
 """
 
 from __future__ import annotations
@@ -29,19 +25,17 @@ import pytest
 import minimax as M
 from minimax import _catalog as C
 
-#: WP1 census §2.6 — the only six shipped tables the entire measured
-#: surface ever loads, with the load counts it measured.  The counts are
-#: not asserted (they are a property of the decks, not of this service);
-#: the SET is.
+#: Representative request surface. Counts retain the earlier census values
+#: for context but are not asserted; current selection and payload bytes are.
 _CENSUS_TABLES = {
     "noncrossing/noncrossing_R_10p000000_eps_1p0em06.npz": 47,
     "noncrossing/noncrossing_R_46p415888_eps_1p0em06.npz": 10,
     "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz": 8,
-    "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz": 6,
+    "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz": 6,
 }
 
-#: Requests taken verbatim from the census's deck and suite tables, with
-#: the table each one resolved to BEFORE the extraction.
+#: Requests taken from the census's deck and suite tables, with the table
+#: selected by the current conservative range/error rule.
 #:
 #: ``(family, target, range_value, error_bound, n_max, eps_q) -> file``
 _CENSUS_REQUESTS = [
@@ -56,10 +50,9 @@ _CENSUS_REQUESTS = [
     # the middle bucket
     (("noncrossing", "inverse", 15.0, 1.0e-6, 64, None),
      "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz"),
-    # the production crossing request, which pins at A_core = 24.0 exactly
-    # for as long as the conditioning floor stays engaged (census §2.3)
+    # The production crossing request now uses the exact A = 24 shipped span.
     (("crossing", "hgl", 24.0, 1.0e-6, 500, 1.0e-3),
-     "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz"),
+     "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"),
 ]
 
 
@@ -128,14 +121,8 @@ def test_the_served_error_is_the_payloads_and_not_the_catalogs_claim():
     assert q.max_error == raw_err               # and the payload is the source
 
 
-def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
-    """The census's most useful single number, pinned.
-
-    Everything the frozen decks, the campaign decks and the suite ever
-    load is six of the 31 shipped tables — which is what makes certifying
-    the load-bearing part of this bundle a small job rather than a
-    campaign, and it is the fact the WP6 tier is sized against.
-    """
+def test_the_representative_surface_stays_inside_the_pinned_catalog_subset():
+    """Every representative request must select one of its pinned tables."""
     served = set()
     for (family, target, range_value, error_bound, n_max, eps_q), _f in \
             _CENSUS_REQUESTS:

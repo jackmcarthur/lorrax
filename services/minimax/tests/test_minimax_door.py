@@ -99,8 +99,8 @@ def test_the_catalog_view_is_enumerable_without_solving_anything():
     """
     view = M.catalog()
     assert len(view) == len(view.entries) == 34
-    assert len(view.for_family("crossing")) == 5
-    assert len(view.for_family("noncrossing")) == 26
+    assert len(view.for_family("crossing")) == 6
+    assert len(view.for_family("noncrossing")) == 28
 
 
 # ---------------------------------------------------------------------------

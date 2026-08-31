@@ -937,3 +937,15 @@ key because a user should not guess a resource ceiling already determined by
 the supports. Removing that live parser/config surface changes accepted input
 and is outside the documentation-only lane; live documentation no longer
 presents the key as supported.
+
+## 49. The minimax top-level export list names deleted prototypes (2026-08-31)
+
+Commit `c38769a6` deleted the unreachable measure-window planner prototypes,
+leaving only `tail_refined_lattice_measure` in `minimax.measure_windows`.
+`minimax.__all__`, `__dir__`, and the lazy `_MEASURE_WINDOW_NAMES` registry
+still advertise `MeasureWindow`, `WindowErrorBudget`,
+`partition_measure_windows`, and `apportion_true_error`; `hasattr(minimax,
+"MeasureWindow")` is therefore false and `test_every_name_on_the_door_resolves`
+fails. Removing those dead export names changes executable API metadata and is
+outside this documentation-only lane. The README documents only the callable
+ROQ surface that actually resolves.
