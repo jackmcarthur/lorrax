@@ -535,6 +535,32 @@ def _rank_ceiling(group: "RoqGroup") -> int:
     return int(np.clip(np.ceil(need), _MIN_RANK, _RANK_HARD_CAP))
 
 
+def _usable_rank(singular) -> int:
+    """How many modes this MEASURE actually supports.
+
+    The cost law bounds the rank a support can NEED; the weighted snapshot
+    spectrum bounds the rank it can USE.  They are different quantities and
+    the second was being ignored, so the ladder fitted far past the point
+    where the subspace still carries information and returned a rule built
+    on numerical noise.
+
+    Measured on the refusing sodium `w<E_F val:resonant` support: of 512
+    requested modes **228 were numerically zero**; at rank 212 the singular
+    ratio was 3.21e-8, and by rank 216 the fit had exploded to residual 47.0
+    with kappa_p99 1.98e7.  The production ladder nevertheless ran to 512,
+    where it reported residual 8.53e-3 at kappa_p99 9.4e4 -- a number that
+    describes the fitter's own cancellation, not the physics.
+
+    The cut is the runtime noise floor, not a new dial: a mode whose relative
+    magnitude is below the noise the runtime will inject cannot carry
+    information the fit is entitled to use.
+    """
+    s = np.asarray(singular, dtype=np.float64)
+    if s.size == 0 or not np.isfinite(s[0]) or s[0] <= 0.0:
+        return _MIN_RANK
+    return max(int(np.count_nonzero(s / s[0] > _NOISE_FLOOR)), _MIN_RANK)
+
+
 def _fit_production_rank(group: RoqGroup, target: float,
                          windows: tuple[str, ...],
                          angle_probe: RoqRule) -> RoqRule:
@@ -542,6 +568,10 @@ def _fit_production_rank(group: RoqGroup, target: float,
     ceiling = _rank_ceiling(group)
     prepared = _prepare_subspace(
         group, _NODES_PER_RANK * ceiling, ceiling)
+    # The measure's own numerical rank is the real ceiling.  Fitting past it
+    # buys cancellation, not accuracy, and turns an honest refusal into a
+    # meaningless kappa.
+    ceiling = min(ceiling, _usable_rank(prepared[1]))
     cache = {}
 
     def quick(rank: int) -> RoqRule:
@@ -553,7 +583,10 @@ def _fit_production_rank(group: RoqGroup, target: float,
         return cache[rank]
 
     lower = _MIN_RANK
-    upper = _ANGLE_PROBE_RANK
+    # Clamp the bracket to the usable rank: on a low-rank measure the ceiling
+    # can fall below the angle probe's rank, which left the final loop's range
+    # empty and returned no rule at all.
+    upper = max(_MIN_RANK, min(_ANGLE_PROBE_RANK, ceiling))
     if not angle_probe.target_met or not quick(upper).target_met:
         lower = upper
         # Ladder scaled to this support's own ceiling, so a wide window is
