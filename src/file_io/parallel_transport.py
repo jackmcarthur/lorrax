@@ -64,7 +64,12 @@ def link_symmetry_reduction_applies(sym, kgrid) -> bool:
     Uses the same step map as
     ``symmetry_maps.directed_edges._mapped_step``: round(S @ (b/N) * N).
     """
-    mats = np.asarray(sym.sym_mats_k, dtype=np.float64)
+    mats_all = np.asarray(sym.sym_mats_k, dtype=np.float64)
+    active = np.asarray(
+        getattr(sym, "active_symmetry_rows",
+                np.arange(mats_all.shape[0], dtype=np.int32)),
+        dtype=np.int32)
+    mats = mats_all[active]
     if mats.ndim != 3 or mats.shape[-2:] != (3, 3):
         raise ValueError(
             f"sym_mats_k must be (n_sym, 3, 3); got {mats.shape}")
@@ -299,6 +304,8 @@ class WAvStencilReader:
             seed_steps=m.seed_steps,
             n_sym_spatial=int(len(sym.sym_mats_k) // 2),
             allow_trs=bool(sym.trs_allowed),
+            active_symmetry_rows=np.asarray(
+                sym.active_symmetry_rows, dtype=np.int32),
         )
         expected = {
             "source_steps": m.source_steps,
@@ -832,6 +839,8 @@ def _write_w_av_stage(
         seed_steps=seeds,
         n_sym_spatial=int(wfn.ntran),
         allow_trs=bool(sym.trs_allowed),
+        active_symmetry_rows=np.asarray(
+            sym.active_symmetry_rows, dtype=np.int32),
     )
     source_steps = np.asarray(table["source_steps"], dtype=np.int32)
     target_seed_mask = np.asarray(table["target_seed_mask"], dtype=np.int32)

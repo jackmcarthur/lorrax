@@ -184,6 +184,8 @@ def qgrid_trs_policy_for(
         q_irr_full_idx=sym.q_irr_full_idx,
         kgrid=tuple(kgrid),
         n_sym_spatial=int(n_sym_spatial),
+        active_symmetry_rows=np.asarray(
+            sym.active_symmetry_rows, dtype=np.int32),
         context=str(context),
     )
     if announce:

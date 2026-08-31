@@ -1377,7 +1377,9 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     minus sign of a time-odd polar current.  Time reversal does not move
     ``r``, so its row reuses the spatial pullback and no second parity sign
     is applied.  Antiunitary rows participate only when the live
-    ``SymMaps.trs_allowed`` verdict permits them.
+    ``SymMaps.active_symmetry_rows`` authorizes them.  A measured global-TRS
+    verdict authorizes the complete second half; a broken-global-TRS magnetic
+    schema may authorize only specific antiunitary rows.
 
     The receipt measures the raw-to-projected movement and the worst
     covariance residual of the projected field over those same rows, both
@@ -1447,7 +1449,20 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
             "non-finite values.")
 
     fft_grid = np.asarray(value.shape[-3:], dtype=np.int64)
-    n_rows = 2 * n_spatial if bool(sym.trs_allowed) else n_spatial
+    active_rows = np.asarray(
+        getattr(sym, "active_symmetry_rows",
+                np.arange(2 * n_spatial if bool(sym.trs_allowed)
+                          else n_spatial)),
+        dtype=np.int32)
+    if (active_rows.ndim != 1 or active_rows.size < 1
+            or np.unique(active_rows).size != active_rows.size
+            or np.any(active_rows < 0)
+            or np.any(active_rows >= 2 * n_spatial)):
+        raise ValueError(
+            "project_polar_fft_field: SymMaps.active_symmetry_rows must be "
+            f"a unique nonempty subset of [0,{2 * n_spatial}); got "
+            f"{active_rows.tolist()}.")
+    n_rows = int(active_rows.size)
     flat = value.reshape(3, -1)
 
     # Build an exact affine-group product table without comparing the full
@@ -1520,10 +1535,13 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         affine_rows[key] = row
 
     rotation_table_closure_defect = 0.0
-    for g in range(n_rows):
+    active_set = {int(row) for row in active_rows}
+    for g_value in active_rows:
+        g = int(g_value)
         g_spatial = g % n_spatial
         g_antiunitary = int(g >= n_spatial)
-        for h in range(n_rows):
+        for h_value in active_rows:
+            h = int(h_value)
             h_spatial = h % n_spatial
             h_antiunitary = int(h >= n_spatial)
             product_spatial = spatial[h_spatial] @ spatial[g_spatial]
@@ -1545,6 +1563,11 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
                     f"{common_denominator}, with no matching spatial row.")
             product_row = product_spatial_row + (
                 (g_antiunitary ^ h_antiunitary) * n_spatial)
+            if product_row not in active_set:
+                raise RuntimeError(
+                    "project_polar_fft_field: active typed symmetry rows do "
+                    f"not form a group: g={g}, h={h} require inactive row "
+                    f"{product_row}; active={active_rows.tolist()}.")
             defect = float(np.linalg.norm(
                 rotations[g] @ rotations[h] - rotations[product_row], ord=2))
             rotation_table_closure_defect = max(
@@ -1552,7 +1575,7 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
 
     max_rotation_norm = max(
         float(np.linalg.norm(rotations[row], ord=2))
-        for row in range(n_rows))
+        for row in active_rows)
     floating_point_residual_bound = float(
         64.0 * np.finfo(np.float64).eps * max(n_rows, 1)
         * max(1.0, max_rotation_norm ** 2))
@@ -1564,8 +1587,8 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         return rotations[int(row)] @ operand[:, pullback[spatial_row]]
 
     projected = np.zeros_like(flat, dtype=np.result_type(value.dtype, np.float64))
-    for row in range(n_rows):
-        projected += _act(row, flat)
+    for row in active_rows:
+        projected += _act(int(row), flat)
     projected /= float(n_rows)
 
     tiny = np.finfo(np.float64).tiny
@@ -1573,7 +1596,7 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
     movement = float(np.linalg.norm(projected - flat) / raw_norm)
     residual = max(
         float(np.linalg.norm(_act(row, projected) - projected) / raw_norm)
-        for row in range(n_rows))
+        for row in active_rows)
     if not np.isfinite(residual) or residual > residual_tolerance:
         raise RuntimeError(
             "project_polar_fft_field: the group-averaged field did not "
@@ -1590,7 +1613,7 @@ def project_polar_fft_field(field, sym) -> PolarFFTFieldProjection:
         floating_point_residual_bound=floating_point_residual_bound,
         relative_residual_tolerance=residual_tolerance,
         n_symmetry_rows=n_rows,
-        n_antiunitary_rows=(n_spatial if bool(sym.trs_allowed) else 0),
+        n_antiunitary_rows=int(np.count_nonzero(active_rows >= n_spatial)),
     )
 
 

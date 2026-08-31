@@ -38,6 +38,13 @@ where the second half appends time reversal. Integer modular arithmetic
 constructs the complete k/q star maps, so star membership does not depend on a
 floating tolerance.
 
+At the QE boundary, XML `rotation` text is reshaped without transposition and
+must equal the raw WFN `mtrx` row. Reciprocal actions transpose it once later.
+QE's affine translation is converted to WFN units as
+(2\pi S^{-1}\tau_{\rm QE}), modulo a lattice vector. The schema/WFN binding
+checks both arrays, the stored k rows, grid, and spinor count; a transposed
+matrix stack is rejected with a major/minor-axis diagnostic.
+
 The corresponding direct-space composition law is
 
 $$
@@ -52,10 +59,12 @@ This convention is load bearing for nonsymmorphic translations. Symmorphic
 systems can conceal a forward/inverse mistake because inverse operations
 generate the same orbit.
 
-## 2. Spatial and time-reversal rows
+## 2. Unitary and antiunitary rows
 
-Rows \(0\le s<n_{\mathrm{tran}}\) are spatial operations. Rows
-\(n_{\mathrm{tran}}\le s<2n_{\mathrm{tran}}\) represent
+`WFN.h5` stores Seitz matrices and translations but not QE's per-operation
+`time_reversal` bit. LORRAX therefore treats
+\(s\) and \(n_{\rm tran}+s\) as a candidate pair: the first is the unitary
+action \(\{S|\tau\}\), the second the antiunitary action
 \(T\{S|\tau\}\), where
 
 $$
@@ -71,6 +80,13 @@ Time reversal changes \(\mathbf k\to-\mathbf k\) and complex-conjugates the
 wavefunction; it does not move real-space centroids. The augmented centroid
 permutation and lattice-wrap tables therefore duplicate their spatial half,
 while wavefunction and tensor consumers apply conjugation explicitly.
+
+`WfnLoader.symmetry()` binds a nearby QE `data-file-schema.xml` only when it
+authenticates the same WFN. If global TR is broken, each raw WFN row selects
+exactly the unitary or antiunitary member named by that receipt. If global TR
+holds, both members are valid. Without a matching schema, initialization
+prints a loud warning: operation typing is unknown and a TR-broken result is
+unsafe if QE used a magnetic antiunitary operation.
 
 The public `symmetry_maps` service owns these tables and their refusal
 contracts. Callers use the package door, not private submodules.

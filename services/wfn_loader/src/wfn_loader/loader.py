@@ -232,11 +232,20 @@ class WfnLoader:
         *,
         mesh: Mesh | None = None,
         backend: Literal["auto", "eager", "phdf5"] = "auto",
+        qe_schema: str | Path | None = None,
     ) -> None:
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
         self._mesh = mesh
         self._backend_was_auto = (backend == "auto")
+        # ``None`` means bounded WFN-anchored discovery, not "disabled".
+        # Resolution is lazy at symmetry initialization so header-only users
+        # pay no XML cost.  An explicit path is authenticated and mismatch is
+        # a refusal rather than a fallback.
+        self._qe_schema_request = qe_schema
+        self._qe_symmetry_checked = False
+        self.qe_symmetry_binding = None
+        self.qe_symmetry_diagnostic = "symmetry has not been initialized"
 
         if backend == "auto":
             backend = self._auto_pick_backend()
@@ -687,6 +696,16 @@ class WfnLoader:
         """
         from symmetry_maps import SymMaps
         if self._sym is None:
+            if not self._qe_symmetry_checked:
+                from symmetry_maps import resolve_qe_symmetry_binding
+                binding, diagnostic = resolve_qe_symmetry_binding(
+                    self,
+                    wfn_path=self._path,
+                    schema=self._qe_schema_request,
+                )
+                self.qe_symmetry_binding = binding
+                self.qe_symmetry_diagnostic = diagnostic
+                self._qe_symmetry_checked = True
             self._sym = SymMaps(self._sym_wfn_stub())
         return self._sym
 
@@ -705,6 +724,7 @@ class WfnLoader:
             kgrid=self.kgrid,
             shift=self.shift,
             nkpts=int(self.nkpts),
+            nspinor=int(self.nspinor),
             bvec=self.bvec,
             avec=self.avec,
             atom_types=self.atom_types,
@@ -718,6 +738,10 @@ class WfnLoader:
             # select time-reversal rows when this is False, whatever the
             # ``ntran``/k-weight flags imply.
             trs_holds=bool(getattr(self, "trs_holds", True)),
+            # Authenticated QE operation typing, or an explicit explanation
+            # that SymMaps must announce before using the WFN-only fallback.
+            qe_symmetry_binding=self.qe_symmetry_binding,
+            qe_symmetry_diagnostic=self.qe_symmetry_diagnostic,
         )
 
     def _resolve_k(self, k: KSpec) -> tuple[np.ndarray, bool]:

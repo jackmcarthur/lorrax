@@ -38,7 +38,8 @@ so reaching *past* the door is the thing that still flags.
 
 | name | what it is |
 |---|---|
-| `SymMaps(wfn)` | The eager table builder. Symmetry ops (spatial + TRS-augmented halves), `irr_idx_k`/`sym_idx_k`, the q maps, `R_cart` / `R_cart_forward` / `R_proper`, `U_spinor`, umklapp vectors. Reads 11 header attributes of `wfn`, including the MEASURED `trs_holds`. |
+| `SymMaps(wfn)` | The eager table builder. Builds paired unitary/antiunitary candidate rows, then exposes `active_symmetry_rows` from the measured global-TR verdict plus an authenticated QE operation-type receipt. Also owns `irr_idx_k`/`sym_idx_k`, q maps, Cartesian/spin rotations, and umklapp vectors. Missing QE provenance warns at initialization; incomplete authenticated coverage refuses. |
+| `read_qe_symmetry_receipt` / `bind_qe_symmetry_receipt` / `resolve_qe_symmetry_binding` | Bounded `data-file-schema.xml` reader and WFN authentication gate. Pins raw matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
 | `build_spatial_operator_tables(wfn)` | Canonical `mtrx.T`, translation, Cartesian and spinor action tables without a k-map. The 2c reference check uses this to measure an inconsistent reduced WFN before `SymMaps` refuses its mesh coverage. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)` / `.from_sym(sym, nss)` | Band-index IBZ ⇄ full BZ. Bundles the three arrays that always travel together so no call site can supply two of the three. `.identity(nk)` is the no-reduction map, so a driver reads the same whether or not symmetry is in use. `select` / `broadcast` / `spread` / `spread_rel`. |
 | `star_select(A_full, irr_idx_k)` | Keep one row per star — the FIRST occurrence, in full-BZ order, never `np.unique`'s ascending label order. |
@@ -54,8 +55,8 @@ so reaching *past* the door is the thing that still flags.
 | `trs_augment_U`, `tau_phase_row`, `kgrid_shift_map`, `q_negation_index`, `common_uniform_grid_indices`, `find_irreducible_bz_points`, `map_full_kpoints_to_irreducible` | Pure-NumPy primitives. The two mapping routines share the registered highest-parent/lowest-operation rule; `map_full_kpoints_to_irreducible` also returns a coverage mask so incomplete WFN metadata is refused before an index table is used. |
 | `compute_centroid_sym_perm`, `compute_rgrid_sym_perm`, `build_real_space_syms`, `orbit_images`, `canonicalize_orbit`, `unfold_orbit_unique_with_id`, `recover_symmorphic_density_point_group` | Real-space orbit machinery. `compute_centroid_sym_perm(validate=True)` REFUSES a non-orbit-closed centroid set and names the regeneration fix. |
 | `check_spinor_reference_trs`, `cached_density_symmetry_check`, `DensitySymmetryReport`, `occupation_operator_residual`, `trs_check_mode` | Gauge-invariant 2c occupied-density comparison and its overlap-to-projector-distance primitive. Raw, spatial-only, and TRIM evidence are distinguished; antiunitary-generated partners are excluded. |
-| `build_qgrid_trs_policy(*, trs_measured, irr_idx_q, sym_idx_q, q_irr_full_idx, kgrid, n_sym_spatial)` → `QgridTrsPolicy` | **The q-axis consumer of that measurement, and the only one.** `trs_measured` is keyword-only with NO DEFAULT. True: pair-coherent row map (`unfold_sym_idx`) plus the one-element Θ projector at `q ≡ −q`, which returns the anti-Θ residual it removed rather than swallowing it. False: the identity row map, no projector, and a REFUSAL if the tables select a Θ row beside a magnetic verdict. |
-| `QgridTrsPolicy.measure_covariance(V_ibz, ...)` / `little_group_covariance_residual(...)` | The point-group covariance the IBZ→full-BZ unfold ASSUMES of the stored parent tiles, measured in the unfold's own arithmetic: for `s` in the little group of `q_p`, does `phase·V_p[α_s μ, α_s ν]` come back as `V_p`? **This is the statistic `check_q_conjugate_reciprocity` is structurally blind to** at a self-negative q, where it degenerates to "`V_q` is real" (measured on Na 8×8×8 SOC c464: reciprocity 3.9e-17 at Γ against a covariance residual of 1.2e-02). Returns `nan` when no non-identity little-group op exists — unanswerable, not a pass. |
+| `build_qgrid_trs_policy(*, trs_measured, ..., active_symmetry_rows)` → `QgridTrsPolicy` | **The q-axis consumer of operation authorization, and the only one.** `trs_measured` has no default. Global TR true enables pair-coherent q/−q rows and the fixed-q Θ projector. Global TR false disables both, but retains individually authenticated magnetic antiunitary rows and refuses every unauthorized row. |
+| `QgridTrsPolicy.measure_covariance(V_ibz, ...)` / `little_group_covariance_residual(...)` | The little-group covariance assumed by the IBZ→full-BZ unfold, measured with the same authorized row, centroid permutation, umklapp phase, and antiunitary conjugation. Returns `nan` when no non-identity little-group operation exists. |
 | `self_negative_q_mask(q_full_idx, *, kgrid)` | The one-element orbits of `q → −q`: every TRIM of an even mesh, Γ alone on an odd one. The rows a pair composition can never touch and the only rows the projector may act on. |
 
 `SymMaps.validate_kgrid_unfolding` is public surface on the class and is
@@ -115,7 +116,8 @@ kept rather than deleted, with the case where it returns FALSE constructed
   G space, invariant to band phases and rotations inside degenerate blocks.
   TRIM-only or absent evidence is inconclusive and disables antiunitary
   unfolding; only an explicit `LORRAX_TRS_CHECK=0` restores permissive mode.
-* **The q axis CONSUMES that verdict; it never re-derives or assumes it.**
+* **The q axis CONSUMES that verdict and the QE row typing; it never re-derives
+  either.**
   `QgridTrsPolicy` is the whole of the q-axis time-reversal contract, and
   `trs_measured` is keyword-only with no default so a caller who has not
   consulted the density gets a `TypeError`. Before this, `gw/v_q_g_flat`,
@@ -123,8 +125,9 @@ kept rather than deleted, with the case where it returns FALSE constructed
   and projected every self-negative row *unconditionally*; on ferromagnetic
   CrI3 (Perlmutter JID 57271494) q and −q are independent irreducible
   parents, and the composition refused only after a 685.96-GB ζ fit had
-  closed. The magnetic arm contains no time-reversal operation at all —
-  the branch is removed rather than guarded.
+  closed. The magnetic arm contains no arbitrary global-TR composition or
+  projector; a schema-authenticated antiunitary space-group row remains a
+  valid operation-specific action.
 * **`V_{−q} = conj(V_q)` is NOT a TRS statement and is not gated on the
   verdict.** The pair densities fitted at −q are the conjugates of those
   fitted at +q with bra and ket relabelled, for any mean field; `v(|q+G|)`

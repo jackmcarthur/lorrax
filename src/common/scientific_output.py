@@ -284,6 +284,19 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
         f"Spatial group   : {n_sym} operations; {n_fractional} with fractional "
         "translations",
     ]
+    qe_binding = getattr(sym, "qe_symmetry_binding", None)
+    if qe_binding is None:
+        lines.append(
+            "QE operation type: UNAVAILABLE; WFN-only fallback (wrong if "
+            "broken TR and QE used an antiunitary magnetic operation)")
+    else:
+        active = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+        n_typed_anti = int(np.count_nonzero(active >= n_sym))
+        lines.append(
+            f"QE operation type: authenticated {qe_binding.schema_path} "
+            f"(sha256 {qe_binding.schema_sha256[:12]}; active "
+            f"antiunitary rows {n_typed_anti}/{active.size}; pure-TR flag "
+            f"{'enabled' if qe_binding.qe_permitted_pure_time_reversal else 'disabled'})")
 
     receipt = getattr(wfn, "trs_reference", None)
     if receipt is None:
@@ -293,7 +306,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             "Density check   : unavailable; symmetry metadata accepted "
             "without a retained receipt")
         lines.append(
-            f"Time reversal  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
+            f"Global TRS     : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
             "for BZ unfolding")
     elif getattr(receipt, "method", "real-space-density") == \
             "occupied-density-subspace":
@@ -303,7 +316,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
                 f"(nspin={int(receipt.nspin)}, "
                 f"nspinor={int(receipt.nspinor)})")
             lines.append(
-                f"Time reversal  : "
+                f"Global TRS     : "
                 f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
                 "for BZ unfolding")
         else:
@@ -320,7 +333,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
                 f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
                 f"{evidence or 'no independent evidence'})")
             lines.append(
-                f"TRS unfolding  : "
+                f"Global TRS     : "
                 f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
                 "from the two-component reference check")
     else:
@@ -342,7 +355,7 @@ def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
             f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
             f"mesh requires it={mesh_implies})")
         lines.append(
-            f"TRS unfolding  : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
+            f"Global TRS     : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
             "from the retained legacy verdict")
 
     display_tau = clean_rounded(tau, digits=TAU_DIGITS)

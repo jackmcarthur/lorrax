@@ -1943,14 +1943,13 @@ class SymMaps:
                 ``True`` (the historical, permissive behaviour) for
                 wfn-shaped objects that carry no verdict.
 
-                When False, ``sym_mats_k`` keeps its ``2·ntran`` length
-                (``unfold_psi`` hard-requires that shape — §Q) but the
-                k-mapping searches only the SPATIAL half, so
-                ``sym_idx_k`` / ``sym_idx_q`` can never name a
-                time-reversal row and no ψ is ever conjugated.  A
-                magnetic system whose file nevertheless claims a
-                TRS-reduced mesh therefore fails loudly instead of
-                silently returning iσ_y·conj(ψ).
+                When False, arbitrary global-TR partners are disabled.  An
+                authenticated QE schema may still authorize individual
+                antiunitary magnetic-space-group operations; without that
+                receipt the search conservatively keeps only the WFN
+                header's presumed-unitary half.  ``sym_mats_k`` always keeps
+                its ``2·ntran`` candidate layout because wavefunction and
+                nonsymmorphic-phase consumers key conjugation from the row.
         """
         # Measured-TRS gate.  ``allow_trs=None`` → consult the wfn object;
         # objects with no verdict (legacy WFNReader, hand-built stubs) get
@@ -1958,6 +1957,33 @@ class SymMaps:
         if allow_trs is None:
             allow_trs = getattr(wfn, 'trs_holds', None)
         self.trs_allowed = True if allow_trs is None else bool(allow_trs)
+
+        # WFN.h5 omits QE's per-operation antiunitary bit.  WfnLoader
+        # attaches a receipt only after a nearby QE schema has matched the
+        # WFN's active Seitz rows and stored k coordinates.  The legacy
+        # fallback remains available, but its epistemic limit is announced
+        # at the exact seam where symmetry becomes executable.
+        self.qe_symmetry_binding = getattr(wfn, "qe_symmetry_binding", None)
+        self.qe_symmetry_diagnostic = str(getattr(
+            wfn, "qe_symmetry_diagnostic",
+            "the WFN-shaped input carries no QE schema receipt"))
+        self.operation_typing_source = (
+            "qe-schema" if self.qe_symmetry_binding is not None
+            else "wfn-fallback")
+        if self.qe_symmetry_binding is None:
+            import warnings as _warnings
+            _warnings.warn(
+                "SYMMETRY PROVENANCE WARNING: no authenticated QE "
+                "data-file-schema.xml is available at SymMaps "
+                f"initialization ({self.qe_symmetry_diagnostic}). WFN.h5 "
+                "does not record which operations are composed with time "
+                "reversal. LORRAX is using the legacy all-spatial header "
+                "interpretation plus the global DFT-reference TRS verdict. "
+                "RESULTS WILL BE WRONG if time reversal is broken and QE "
+                "used an antiunitary magnetic-space-group operation. "
+                "Co-stage the WFN-generating QE *.save directory or pass "
+                "WfnLoader(..., qe_schema=...).",
+                RuntimeWarning)
 
         # get symmetry matrices from wfn file
         try:
@@ -1967,6 +1993,34 @@ class SymMaps:
         if ntran < 1:
             raise ValueError(
                 f"SymMaps: WFN ntran must be positive, got {ntran}.")
+        if self.qe_symmetry_binding is None:
+            _qe_antiunitary = np.zeros(ntran, dtype=bool)
+            _qe_base_rows = np.arange(ntran, dtype=np.int32)
+            self.qe_permitted_pure_time_reversal = None
+            self.qe_schema_path = None
+            self.qe_schema_sha256 = None
+        else:
+            _qe_antiunitary = np.asarray(
+                self.qe_symmetry_binding.antiunitary, dtype=bool)
+            if _qe_antiunitary.shape != (ntran,):
+                raise ValueError(
+                    "SymMaps: authenticated QE operation typing has shape "
+                    f"{_qe_antiunitary.shape}, expected ({ntran},).")
+            _qe_base_rows = (
+                np.arange(ntran, dtype=np.int32)
+                + _qe_antiunitary.astype(np.int32) * ntran)
+            self.qe_permitted_pure_time_reversal = bool(
+                self.qe_symmetry_binding.qe_permitted_pure_time_reversal)
+            self.qe_schema_path = str(self.qe_symmetry_binding.schema_path)
+            self.qe_schema_sha256 = str(
+                self.qe_symmetry_binding.schema_sha256)
+        self.qe_operation_antiunitary = _qe_antiunitary.copy()
+        self.qe_antiunitary_rows = _qe_base_rows[_qe_antiunitary].copy()
+        # Candidate row layout remains [S, -S] everywhere.  This array is
+        # the one authority for which candidates are physically permitted.
+        self.active_symmetry_rows = (
+            np.arange(2 * ntran, dtype=np.int32)
+            if self.trs_allowed else _qe_base_rows.copy())
         _kgrid = np.asarray(wfn.kgrid, dtype=np.int64)
         if _kgrid.shape != (3,) or np.any(_kgrid <= 0):
             raise ValueError(
@@ -1979,8 +2033,9 @@ class SymMaps:
                 f"SymMaps: WFN stores {_nk_stored} k-points but its kgrid "
                 f"declares only {_nfull_declared} full-BZ rows.")
 
-        # ``ntran=1`` says only that identity is the sole SPATIAL operation.
-        # It does not say the file stores the full BZ: a nonmagnetic WFN may
+        # ``ntran=1`` says only that identity is the sole stored Seitz
+        # operation.  It does not say the file stores the full BZ: a
+        # nonmagnetic WFN may
         # still contain a TR-reduced half mesh which needs the synthesized
         # ``-I`` row below.  Keep the fast identity path only when every
         # declared grid point is genuinely present and the active row is I.
@@ -2028,8 +2083,9 @@ class SymMaps:
             # In this branch ``sym_idx_k`` is identically zero anyway, so
             # the restriction is documentation of intent; it is still set
             # so every code path can read one attribute.
-            self._sym_mats_k_search = (
-                self.sym_mats_k if self.trs_allowed else _sym_mats_k)
+            self._sym_row_ids_search = self.active_symmetry_rows.copy()
+            self._sym_mats_k_search = self.sym_mats_k[
+                self._sym_row_ids_search]
             self.translations = np.zeros((1, 3), dtype=np.float64)
 
             # In no-symmetry case, unfolded grid equals irreducible grid
@@ -2181,28 +2237,36 @@ class SymMaps:
         time_reversal_syms = -self.sym_mats_k  # S @ k -> -S @ k
         self.sym_mats_k = np.concatenate([self.sym_mats_k, time_reversal_syms], axis=0)
 
-        # ...but only SELECT from the TRS half when time reversal has been
-        # established for these wavefunctions.  The table itself always
+        # ...but SELECT only the rows authorized above.  With global TRS the
+        # complete pair is physical.  Without it, an authenticated receipt
+        # selects each raw WFN operation from the unitary or antiunitary half;
+        # the legacy fallback selects only the presumed-unitary half.  The
+        # table itself always
         # keeps its ``2·ntran`` length — ``unfold_psi`` derives
         # ``n_sym_spatial = len(sym_mats_k)//2`` and hard-raises on any
         # other shape (§Q) — so the gate lives in the SEARCH set used by
         # ``create_kpoint_symmetry_map`` / ``find_symmetry_ops_simple`` /
-        # ``find_irreducible_bz_points``.  With TRS disallowed those can
-        # only ever return ``sym_idx < ntran``, i.e. no ψ is conjugated
-        # anywhere in the pipeline.
-        self._sym_mats_k_search = (
-            self.sym_mats_k if self.trs_allowed
-            else self.sym_mats_k[:wfn.ntran])
+        # ``find_irreducible_bz_points``.
+        self._sym_row_ids_search = self.active_symmetry_rows.copy()
+        self._sym_mats_k_search = self.sym_mats_k[
+            self._sym_row_ids_search]
         if not self.trs_allowed:
             import warnings as _warnings
-            _warnings.warn(
-                "SymMaps: the two-component DFT reference says TIME-REVERSAL "
-                "SYMMETRY IS BROKEN for this WFN, so the time-reversal rows "
-                "of sym_mats_k will not be used to map the full BZ. If this "
-                "file's IBZ was reduced using time reversal the mapping "
-                "below will fail loudly — which is the correct outcome: a "
-                "TRS-reduced mesh for a magnetic system is not physical.",
-                RuntimeWarning)
+            if self.qe_symmetry_binding is None:
+                _warnings.warn(
+                    "SymMaps: the two-component DFT reference says GLOBAL "
+                    "TIME-REVERSAL SYMMETRY IS BROKEN. With no authenticated QE "
+                    "operation typing, only the WFN header's presumed-unitary "
+                    "rows may map the full BZ; an incomplete map refuses.",
+                    RuntimeWarning)
+            else:
+                _warnings.warn(
+                    "SymMaps: the two-component DFT reference says GLOBAL "
+                    "TIME-REVERSAL SYMMETRY IS BROKEN. The authenticated QE schema "
+                    f"still authorizes {len(self.qe_antiunitary_rows)} "
+                    "operation-specific antiunitary row(s); arbitrary "
+                    "k<->-k partners remain disabled.",
+                    RuntimeWarning)
 
         # The list of full-zone k-points.  The k_full -> k_irr PARENT MAP
         # this used to compute alongside it is gone (design decision 4):
@@ -2377,11 +2441,12 @@ class SymMaps:
         # q lives on the same kgrid as k (q = k - k'), so we reuse
         # ``sym_mats_k`` (which already includes time-reversal). Note that
         # `is_trs[i_full] = sym_idx_q[i_full] >= ntran` is implicit; not stored.
-        irr_idx_q, sym_idx_q, q_irr_kgrid_int = find_irreducible_bz_points(
+        irr_idx_q, sym_idx_q_search, q_irr_kgrid_int = find_irreducible_bz_points(
             self.kvecs_asints, self._sym_mats_k_search, irr_kgrid_int=None,
         )
         self.irr_idx_q = irr_idx_q
-        self.sym_idx_q = sym_idx_q
+        self.sym_idx_q = self._sym_row_ids_search[
+            np.asarray(sym_idx_q_search, dtype=np.int32)]
         self.q_irr_kgrid_int = q_irr_kgrid_int
         # q_irr_full_idx[i_irr] = full-BZ row index for IBZ q i_irr.
         # Derived as first-occurrence of i_irr in irr_idx_q (ordered to match
@@ -2454,13 +2519,32 @@ class SymMaps:
 
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
         del kpoint_map  # kept in signature for compatibility with older callers
-        # Searches ``_sym_mats_k_search`` — the full TRS-augmented table
-        # unless the DFT reference check says TRS is broken, in which case
-        # only the spatial half is eligible.  The planner owns the registered
-        # highest-parent/lowest-operation tie break and exposes coverage.
-        irk_to_k_map, irk_sym_map, matched = (
+        # Searches ``_sym_mats_k_search``: the full paired table when global
+        # TRS holds, the schema-typed unitary/antiunitary rows when it does
+        # not, or the presumed-unitary half in the receipt-free fallback.
+        # The planner owns the registered highest-parent/lowest-operation
+        # tie break and exposes coverage.
+        irk_to_k_map, irk_sym_map_search, matched = (
             map_full_kpoints_to_irreducible(
                 wfn.kpoints, self._sym_mats_k_search, full_kpts))
+        irk_sym_map = self._sym_row_ids_search[
+            np.asarray(irk_sym_map_search, dtype=np.int32)]
+
+        if self.qe_symmetry_binding is not None and not np.all(matched):
+            bad = np.where(~matched)[0]
+            pure_tr_note = (
+                " QE allowed pure k<->-k folding, but the measured global "
+                "TRS verdict forbids using it."
+                if (not self.trs_allowed
+                    and bool(self.qe_permitted_pure_time_reversal)) else "")
+            raise ValueError(
+                f"SymMaps: authenticated QE symmetry operations are "
+                f"incomplete for this WFN: {bad.size} of "
+                f"{full_kpts.shape[0]} full-BZ k-points cannot be reached "
+                f"using {len(self._sym_row_ids_search)} authorized typed "
+                f"rows from {self.qe_schema_path}. First unmatched: "
+                f"{full_kpts[bad[0]].tolist()}. Refusing rather than adding "
+                f"an unrecorded spatial or antiunitary operation.{pure_tr_note}")
 
         if not self.trs_allowed and not np.all(matched):
             n_bad = int(np.count_nonzero(~matched))
@@ -3393,6 +3477,45 @@ def unfold_file_wedge_to_full_bz(sym, data):
     return star_broadcast(data, irr, sidx, nss,
                           irr_labels=np.arange(n_rows, dtype=np.int32),
                           trs_reference="ibz_slab")
+
+
+def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
+    """FILE-wedge polar band matrix → full BZ, on the input's backend.
+
+    This is the canonical route for a cheap same-k observable such as
+    ``<m k|v_i|n k>``.  The stored rows have no operation applied.  The
+    ordinary file-wedge unfold first gathers their band matrices and applies
+    antiunitary conjugation.  The target row's forward Cartesian action then
+    mixes the explicit polar-vector axis.  Its antiunitary half already
+    contains the time-odd minus sign, so no second velocity-parity rule is
+    accepted here.
+
+    Nonsymmorphic translation phases cancel between the equal-k bra and ket.
+    Quantities with distinct endpoints must instead use the directed-edge
+    service, whose endpoint sewing carries those phases.
+
+    ``data`` has shape ``(sym.nk_red, ..., 3, nb, nb)`` by default.  A NumPy
+    input stays on the host; a JAX input stays on device and keeps its band
+    sharding.
+    """
+    out = unfold_file_wedge_to_full_bz(sym, data)
+    sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
+    rotations = np.asarray(sym.R_cart_forward, dtype=np.float64)
+    if sym_rows.shape != (int(sym.nk_tot),):
+        raise ValueError(
+            "unfold_file_wedge_polar_matrix: sym.sym_idx_k must have one "
+            f"row per full k-point; got {sym_rows.shape}, expected "
+            f"({int(sym.nk_tot)},).")
+    if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
+            or np.any(sym_rows < 0) or np.any(sym_rows >= rotations.shape[0])):
+        raise ValueError(
+            "unfold_file_wedge_polar_matrix: invalid canonical symmetry-row "
+            f"map {sym_rows.shape} for R_cart_forward {rotations.shape}.")
+    return apply_band_matrix_symmetry(
+        out,
+        component_mix=rotations[sym_rows],
+        component_axis=component_axis,
+    )
 
 
 def reduce_full_bz_to_file_wedge(sym, data):

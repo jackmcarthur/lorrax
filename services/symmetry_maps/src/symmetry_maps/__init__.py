@@ -65,7 +65,8 @@ The surface
     unitary/antiunitary band-matrix action.  Nonsymmorphic phases enter through
     the endpoint sewing matrices; vector/covector mixing is an explicit
     caller-supplied component representation.
-``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz``
+``unfold_file_wedge_to_full_bz`` / ``unfold_star_wedge_to_full_bz`` /
+``unfold_file_wedge_polar_matrix``
     THE TWO NAMED UNFOLDS, taking a ``SymMaps`` rather than index tables
     so a driver never holds one.  TWO, because there are two different
     IBZs and they are NOT the same size: the FILE wedge (``wfn.kpoints``,
@@ -209,6 +210,7 @@ from symmetry_maps.maps import (
     star_broadcast,
     reduce_full_bz_to_file_wedge,
     star_tables_of,
+    unfold_file_wedge_polar_matrix,
     unfold_file_wedge_to_full_bz,
     unfold_star_wedge_to_full_bz,
     star_select,
@@ -280,6 +282,15 @@ from symmetry_maps.qgrid_trs import (
     trs_pair_coherent_unfold_sym_idx,
     trs_project_self_negative_q_rows,
 )
+from symmetry_maps.qe_schema import (
+    QESymmetryBinding,
+    QESymmetryReceipt,
+    bind_qe_symmetry_receipt,
+    discover_qe_schema_paths,
+    qe_xml_seitz_to_bgw,
+    read_qe_symmetry_receipt,
+    resolve_qe_symmetry_binding,
+)
 from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
@@ -291,6 +302,11 @@ __all__ = [
     "common_uniform_grid_indices",
     "find_irreducible_bz_points",
     "map_full_kpoints_to_irreducible",
+    # QE schema receipt: the operation-type provenance missing from WFN.h5
+    "QESymmetryBinding", "QESymmetryReceipt",
+    "bind_qe_symmetry_receipt", "discover_qe_schema_paths",
+    "qe_xml_seitz_to_bgw", "read_qe_symmetry_receipt",
+    "resolve_qe_symmetry_binding",
     # k-stars (band-index IBZ<->full BZ)
     "KStarMap", "star_select", "star_broadcast", "star_spread",
     # directed band-matrix edges: pure table + the one symmetry action
@@ -298,6 +314,7 @@ __all__ = [
     "apply_band_matrix_symmetry",
     # the two named unfolds (file wedge vs star wedge)
     "unfold_file_wedge_to_full_bz", "unfold_star_wedge_to_full_bz",
+    "unfold_file_wedge_polar_matrix",
     "reduce_full_bz_to_file_wedge", "star_tables_of",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator", "unfold_isdf_one_leg",

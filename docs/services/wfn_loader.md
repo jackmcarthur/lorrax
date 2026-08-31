@@ -55,7 +55,7 @@ for the real one, which is exactly what the deleted shim was.
 
 | name | what it is |
 |---|---|
-| `WfnLoader(path, *, mesh=None, backend='auto')` | Open the WFN, read metadata, and check a 2c DFT reference before TRS unfolding. |
+| `WfnLoader(path, *, mesh=None, backend='auto', qe_schema=None)` | Open the WFN and check a 2c DFT reference before symmetry unfolding. `qe_schema=None` performs bounded WFN-anchored discovery at first `symmetry()`; an explicit schema must authenticate or the call refuses. |
 | `load(*, bands, k='full_bz', sharding=None, bispinor=False)` | ψ for a (band-window, k-set): `(n_k, nb_padded, ns, ngkmax)` c128, band axis mesh-padded and (by default at P>1) sharded `P(None,('x','y'),None,None)`. |
 | `load_process_local(*, bands, k, bispinor=False)` | THIS process's window only, single-device, `nb = b_hi−b_lo` exactly — no mesh padding, no collective; each rank may ask for a different window. |
 | `bands(b_lo, b_hi, *, chunk, ...)` | Chunked iterator over `load`. |
@@ -67,6 +67,7 @@ for the real one, which is exactly what the deleted shim was.
 | `get_gvec_nk(ik)` | Deprecated one-k shim for legacy vcoul/qp_wfn; one release. |
 | header surface | The `MfHeader` fields (`nkpts`, `nbands`, `nspinor`, `kgrid`, `fft_grid`, `bvec`, …) plus derived `nelec/vbm/cbm/efermi/atom_crys`, same names `WFNReader` exposed. |
 | `trs_holds`, `trs_reference` | 2c occupied-subspace verdict and receipt. `density_symmetry` is a temporary compatibility alias. |
+| `qe_symmetry_binding`, `qe_symmetry_diagnostic` | Authenticated per-operation unitary/antiunitary provenance, or the reason initialization must use and loudly announce the WFN-only fallback. |
 | `close()` / context manager | Releases the h5py handle and the SlabIO handle. |
 
 ## Contract

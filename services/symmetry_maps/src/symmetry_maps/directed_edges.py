@@ -162,6 +162,7 @@ def q_stencil_orbit_table(
     seed_steps,
     n_sym_spatial,
     allow_trs,
+    active_symmetry_rows=None,
 ):
     """Close and symmetry-reduce a compact finite-q stencil.
 
@@ -194,7 +195,21 @@ def q_stencil_orbit_table(
         _q_refuse("WAV-Q-TRS", "antiunitary rows are not -spatial rows",
                   "the SymMaps [S, -S] layout",
                   "do not reorder SymMaps.sym_mats_k")
-    search = syms if bool(allow_trs) else syms[:nss]
+    if active_symmetry_rows is None:
+        search_ids = np.arange(
+            syms.shape[0] if bool(allow_trs) else nss, dtype=np.int32)
+    else:
+        search_ids = _integer_array(
+            "active_symmetry_rows", active_symmetry_rows).reshape(-1)
+        if (search_ids.size == 0
+                or np.unique(search_ids).size != search_ids.size
+                or np.any(search_ids < 0)
+                or np.any(search_ids >= syms.shape[0])):
+            _q_refuse(
+                "WAV-Q-ACTIVE-SYM", search_ids.tolist(),
+                f"a nonempty unique subset of [0,{syms.shape[0]})",
+                "pass SymMaps.active_symmetry_rows")
+    search = syms[search_ids]
     seeds = _integer_array("seed_steps", seed_steps, (3,))
     if seeds.ndim != 2 or seeds.shape[0] == 0:
         _q_refuse("WAV-Q-SHAPE", f"seed_steps.shape={seeds.shape}",
@@ -213,7 +228,8 @@ def q_stencil_orbit_table(
     target_for_key = {}
     seed_membership = {}
     for iseed, seed in enumerate(seeds):
-        for isym, sym in enumerate(search):
+        for local_sym, sym in enumerate(search):
+            isym = int(search_ids[local_sym])
             mapped = _mapped_step(seed, sym, kg, isym=isym)
             key = tuple(int(x) for x in mapped)
             target_for_key.setdefault(key, mapped)
@@ -242,11 +258,12 @@ def q_stencil_orbit_table(
                   f"irr_idx_q={irr.shape}, sym_idx_q={sidx.shape}",
                   f"both q tables to have shape ({nk},)",
                   "pass the q tables from the same SymMaps instance")
-    if np.any(sidx < 0) or np.any(sidx >= search.shape[0]):
-        bad = int(np.where((sidx < 0) | (sidx >= search.shape[0]))[0][0])
+    allowed_sidx = np.isin(sidx, search_ids)
+    if not np.all(allowed_sidx):
+        bad = int(np.where(~allowed_sidx)[0][0])
         _q_refuse("WAV-Q-TRS", f"sym_idx_q[{bad}]={int(sidx[bad])}",
-                  f"an allowed symmetry row in [0,{search.shape[0]})",
-                  "construct SymMaps with the same measured allow_trs verdict")
+                  f"an allowed symmetry row in {search_ids.tolist()}",
+                  "pass active rows from the same SymMaps instance")
 
     groups = irr[target_ids]
     unique_groups = []

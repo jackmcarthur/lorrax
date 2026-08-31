@@ -41,6 +41,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
+from symmetry_maps import unfold_file_wedge_polar_matrix            # noqa: E402
 from common import timing
 from common.collectives import barrier, gather_k_blocks
 from common.preprocessing_output import (PreprocessingProductionReport,
@@ -1564,7 +1565,7 @@ def main(argv=None):
 
 		return p_cart + vNL_cart
 
-	# ⟨mk|v|nk⟩: ONE k-scan with THIS k's bands sharded over every process
+	# ⟨mk|v|nk⟩: ONE STORED-k scan with THIS k's bands sharded over every process
 	# (``common.mtxel_sweep``), replacing the k-partitioned
 	# ``gather_k_blocks`` route.  That route took a whole k per rank, so
 	# its wall was one full-band k however large P was and it could not
@@ -1574,7 +1575,12 @@ def main(argv=None):
 	# 10.83 GiB before, 2.162 s / 8.21 GiB after (jobs 7888877, 7888907);
 	# at P = nk it is ~1.45x slower, which is the documented crossover.
 	#
-	# The three Cartesian components ride ONE sweep, so the hoisted
+	# The analytic q=0 operator is covariant and has equal-k endpoints, so its
+	# nonsymmorphic phases cancel.  Sweep only the WFN file wedge, then let the
+	# symmetry service apply antiunitary conjugation and the forward polar
+	# rotation.  Full-grid wavefunctions remain reserved for the finite-q,
+	# uniform-Hall and transport-link paths whose neighbour connectivity truly
+	# needs them.  The three Cartesian components ride ONE sweep, so the hoisted
 	# m-side reshard is paid once rather than three times; only the
 	# per-k reshard payload is 3x.
 	pt_path = None
@@ -1592,25 +1598,27 @@ def main(argv=None):
 	else:
 		if debug and jax.process_index() == 0:
 			_dipole_block(debug_kindex)     # the table, nothing else
-		psi_G = wfn.load(bands=(0, nb), k="full_bz",
+		nk_file = int(sym.nk_red)
+		gtab_file = padded_gvectors(wfn, k="ibz")
+		psi_G = wfn.load(bands=(0, nb), k="ibz",
 		                 sharding=band_sphere_spec(), bispinor=bispinor)
 		geom = SweepGeometry(mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
 		                     ngkmax=int(psi_G.shape[3]), nb=nb,
-		                     ns=int(psi_G.shape[2]), nk=nk,
+		                     ns=int(psi_G.shape[2]), nk=nk_file,
 		                     cell_volume=float(wfn.cell_volume))
 		op = dipole_operator(
 			geom, bvec=wfn.bvec, blat=wfn.blat,
 			vnl_setup=None if args.skip_vnl else vnl_setup,
 			vnl_velocity_sign=vnl_velocity_sign)
 		with timing.section("dipole_sweep"):
-			H_v = sweep_matrix_elements(
+			H_v_file = sweep_matrix_elements(
 				psi_G, operator=op, geom=geom,
-				gvecs=gtab.gvecs, gmask=gtab.mask,
-				box_index=wfn.box_index(k="full_bz"),
-				kvecs=np.asarray(gtab.kvecs))
+				gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
+				box_index=wfn.box_index(k="ibz"),
+				kvecs=np.asarray(gtab_file.kvecs))
+			H_v = unfold_file_wedge_polar_matrix(sym, H_v_file)
+			del H_v_file
 			if args.parallel_transport_out is not None:
-				# The feature is deliberately opt-in: the default dipole
-				# artifact and its bitwise production path remain untouched.
 				# Keep H_v sharded and direction-major it only inside the
 				# SlabIO writer; no host gather or second velocity evaluation.
 				from file_io.parallel_transport import (
