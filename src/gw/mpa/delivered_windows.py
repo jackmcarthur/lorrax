@@ -1354,6 +1354,75 @@ def _factor_growth(spec, times, eta):
     return green, screened
 
 
+def _roq_crossing_candidate(spec, eta, max_nodes, factor_growth_cap,
+                            relative_target):
+    """Measure-adapted rule for ONE crossing window, or None to fall back.
+
+    Node count is the runtime currency: one node is one FFT(G_w W_w).  The
+    shipped path fits crossing windows on the real-time contour, which is
+    measurably the wrong operating point — on this deck it spends more nodes
+    and runs at kappa_p99 15.9/30.9 where a rotated contour meets the same
+    targets near kappa 1.1.  Sign-definite windows are NOT routed here: their
+    certified imaginary-axis tables already cost 8-12 nodes and are served by
+    lookup, which nothing measured beats.
+    """
+    from minimax import RoqWindow, plan_measure_adapted_roq  # noqa: PLC0415
+
+    d = spec["problem"].denominators
+    sigma = 1 if float(np.mean(np.imag(d) > 0.0)) > 0.5 else -1
+    window = RoqWindow(
+        name=spec["name"], fit=spec["problem"], validation=spec["validation"],
+        target=float(relative_target), branch=spec["name"], sigma=int(sigma))
+    try:
+        plan = plan_measure_adapted_roq((window,), float(eta))
+    except (ValueError, RuntimeError, FloatingPointError, OverflowError,
+            np.linalg.LinAlgError):
+        return None
+    if len(plan.rules) != 1:
+        return None
+    rule = plan.rules[0]
+    times = np.asarray(rule.times, np.complex128)
+    weights = np.asarray(rule.weights, np.complex128)
+    if not times.size or int(times.size) > int(max_nodes):
+        return None
+    metrics = _rule_metrics(spec["validation"], times, weights)
+    factor = _factor_growth(spec, times, eta)
+    if (not _rule_accepted(metrics, relative_target)
+            or max(factor) > float(factor_growth_cap)):
+        return None
+    required = max(metrics[0], metrics[1] * RUNTIME_NOISE_EPSILON
+                   / AMPLIFICATION_NOISE_SAFETY)
+    return {
+        "times": times, "weights": weights,
+        "metrics": metrics, "fit_metrics": metrics,
+        "required_target": float(required),
+        "absolute_cost": float(spec["envelope"] * required),
+        "factor_growth": factor, "attempts": [],
+        "evidence": {
+            "family": "measure_adapted_roq",
+            "candidate_tolerance": float(relative_target),
+            "provenance": (f"measure-adapted ROQ, contour "
+                           f"{rule.angle_deg:.1f} deg, rank {rule.rank}"),
+        },
+    }
+
+
+def window_candidates(spec, eta, max_nodes, factor_growth_cap,
+                      relative_target):
+    """Rules for one window: rotated ROQ if it crosses, else shipped lookup.
+
+    The single routing decision, at module level so the planner, the tests and
+    the offline node audit all take the same path.
+    """
+    if spec["kind"] == "crossing":
+        adapted = _roq_crossing_candidate(
+            spec, eta, max_nodes, factor_growth_cap, relative_target)
+        if adapted is not None:
+            return [adapted]
+    return _candidate_rules(
+        spec, eta, max_nodes, factor_growth_cap, relative_target)
+
+
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                      relative_target):
     """Return the first lookup-first rule passing the measured window gates."""
@@ -1726,7 +1795,7 @@ def build_delivered_sigma_windows(
         # support-derived ceiling avoids a tolerance sweep while preserving
         # the global delivered-error contract.
         candidates_by_window = [
-            _candidate_rules(
+            window_candidates(
                 spec, eta, pair_ceiling, factor_cap,
                 min(0.5, total_absolute / spec["envelope"]))
             for spec in specs]
@@ -1868,5 +1937,6 @@ __all__ = [
     "delivered_product_geometry",
     "load_complete_delivered_sigma_plan",
     "measure_delivered_sigma_pole_batch",
+    "window_candidates",
     "measure_delivered_sigma_pole_fields",
 ]
