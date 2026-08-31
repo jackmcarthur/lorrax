@@ -1888,8 +1888,26 @@ def build_delivered_sigma_windows(
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
 
+    # The delivered error at one frequency can only come from windows that
+    # COVER that frequency.  A signed omega grid splits at zero into halves
+    # whose windows occupy DISJOINT omega positions, so charging their summed
+    # cost against a single per-frequency maximum under-budgets the plan by
+    # roughly the number of halves — measured: a +-5 eV SC deck refused at
+    # 2.82e9 against a 2.79e9 budget, 1.07% over, with every rule accepted on
+    # its own support.  Give each disjoint omega group its own allowance and
+    # sum them, which reduces to the old value for a one-sided grid.
+    groups: list[np.ndarray] = []
+    for spec in specs:
+        positions = np.unique(np.asarray(spec["omega_idx"], np.int64))
+        for index, existing in enumerate(groups):
+            if np.intersect1d(existing, positions).size:
+                groups[index] = np.union1d(existing, positions)
+                break
+        else:
+            groups.append(positions)
     combined_scale = float(np.max(combined_envelope))
-    total_absolute = target * combined_scale * safety
+    total_absolute = target * safety * float(sum(
+        np.max(combined_envelope[group]) for group in groups))
     cache_fingerprint = _plan_cache_fingerprint(
         specs, eta=eta, target=target, safety=safety,
         factor_cap=factor_cap, pair_ceiling=pair_ceiling,
