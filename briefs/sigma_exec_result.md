@@ -39,8 +39,8 @@ the nonexistent `.lower()` method.  This is what enabled the breakdown and
 the HLO evidence above; it does not alter the production kernel.
 
 Verification: the required CPU gate passed **134/134** before the fix; the
-post-fix gate adds `test_mpa_disk_pipeline.py` and is recorded in the evidence
-log.  The real P=4 stage-split driver completed with unchanged batch-4
+post-fix gate added `test_mpa_disk_pipeline.py` and passed **141/141**.  The
+real P=4 stage-split driver completed with unchanged batch-4
 numbers.  Evidence:
 `/pscratch/sd/j/jackm/wt_sigma_exec_2026-08-31/tmp/sigma_exec_p4_20260831`
 (`combined_p4.log`, `batch6_p4.log`, `stage_p4/hlo_summary.{md,json}`, and
