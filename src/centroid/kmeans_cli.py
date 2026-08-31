@@ -85,32 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--density-mode",
                    choices=("scalar", "current"),
                    default="scalar",
-                   help="Which scalar field to use as the kmeans weight. "
-                        "'scalar' (default) is the standard charge density "
-                        "ρ(r), the right weight for charge-channel ISDF "
-                        "(γ̃^0).  'current' is the gauge-invariant "
-                        "subspace importance Σ_{k,i,n,m}|Ψ_n†α_iΨ_m/α_fs|² "
-                        "for LORRAX's kinetic-balance lift, the "
-                        "right weight for the i-channel ISDF (γ̃^{1,2,3}) "
-                        "in the bispinor pipeline.  Output files are "
+                   help="Feature family used by both k-means and pruning. "
+                        "'scalar' (default) uses the norm of charge "
+                        "pair-density rows; 'current' uses the norm of the "
+                        "three stacked Dirac-current rows. Both use the "
+                        "resolved --prune-window with unit band weights. "
+                        "Output files are "
                         "written with distinguishing suffixes ('' / "
                         "'_current') and a header comment naming the "
                         "density, so a downstream gw_jax run can read both "
                         "files unambiguously.")
-    p.add_argument("--centroid-weight", choices=("band_range",),
-                   default="band_range",
-                   help="Bands in the requested fit window weight k-means "
-                        "equally (default and only policy). Occupations are "
-                        "never used for centroid fitting.")
-    p.add_argument("--weight-bands", type=str, default=None,
-                   metavar="LO:HI",
-                   help="Explicit 0-based half-open band range for "
-                        "the k-means weight. Default is the σ "
-                        "window (0, n_val+n_cond) resolved exactly like the "
-                        "pivoted-Cholesky prune window (see --prune-n-val / "
-                        "--prune-n-cond). Sweep HI from n_val (occupied-"
-                        "only) to n_val+n_cond to trade slab resolution "
-                        "against vacuum support.")
     p.add_argument("--out-suffix", type=str, default=None,
                    help="Suffix appended to the output filename.  Default "
                         "is '' for --density-mode scalar and '_current' "
@@ -321,70 +305,47 @@ def _resolve_symmetry(args, wfn):
 
 
 def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
-    """Which unit-weight band importance drives the k-means quadrature.
+    """Build the feature-row norm used by both k-means and pruning.
 
-    The scalar mode sums charge importance and the current mode sums the
-    gauge-invariant three-channel transition-current importance over the
-    same selected band interval.  Occupations never enter either weight.
+    The cheap stage uses ``sqrt(diag(G))`` for the exact left/right windows
+    of the final q=0 Gram. Occupations never enter either channel, and the
+    band contraction is performed through local subspace projectors rather
+    than explicit transition densities.
 
-    Returns ``(weight, label, band_range)``; the last item is
+    Returns ``(weight, label, (left_range, right_range))``; the windows are
     carried unchanged into the centroid file's provenance header.
 
-    WHY ``band_range`` EXISTS: the occupied-only ρ(r) is entirely inside
-    the slab, so a ρ-weighted k-means places ZERO centroids in the vacuum
+    WHY THE WINDOW INCLUDES REQUESTED CONDUCTION BANDS: occupied-only ρ(r)
+    is entirely inside the slab, so a valence-only k-means places ZERO
+    centroids in the vacuum
     and the vacuum-localized far-conduction states have no quadrature
     support — ⟨nk|V_H|nk⟩ (a pure centroid sum) then comes back sign-wrong
     (+140 eV vs −140 eV on MoS2) and the whole error lands on
     Vxc = E_dft − kin_ion − V_H.
     """
-    if args.weight_bands is not None:
-        try:
-            b_lo, b_hi = (int(v) for v in args.weight_bands.split(":"))
-        except ValueError:
-            raise ValueError(
-                "--weight-bands must be a 0-based half-open LO:HI pair") \
-                from None
-    else:
-        n_val, n_cond = _resolve_sigma_window(args, wfn)
-        b_lo, b_hi = 0, n_val + n_cond
-    if not 0 <= b_lo < b_hi <= int(wfn.nbands):
-        raise ValueError(
-            f"--weight-bands must satisfy 0 <= LO < HI <= {int(wfn.nbands)}; "
-            f"got {b_lo}:{b_hi}")
-
-    if args.density_mode == "current":
-        from .current_density import build_current_density
-        print0(
-            "k-means weight: transverse Dirac-current importance "
-            f"Σ_{{k,i,n,m∈[{b_lo},{b_hi})}} |Ψ_n†α_iΨ_m/α_fs|² "
-            "(unit band weights)")
-        current_weight = build_current_density(
-                wfn, sym, (b_lo, b_hi),
-                dist_mesh=dist_mesh,
-                verbose=(debug_print_enabled() and process_rank() == 0),
-            )
-        if R is not None:
-            from .charge_density import symmetrize_on_grid
-            current_weight = symmetrize_on_grid(current_weight, R, tau)
-        return (
-            current_weight,
-            "transverse-current importance "
-            f"Σ_{{k,i,n,m∈[{b_lo},{b_hi})}} |Ψ_n†α_iΨ_m/α_fs|²",
-            (b_lo, b_hi),
-        )
-
-    ops = np.asarray(R) if R is not None else None
-    print0(f"k-means weight: band_range Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk|² "
-           "(unit band weights)"
-           f"{'' if ops is None else f' (symmetrized, {len(ops)} ops)'}")
-    from .charge_density import rho_from_band_range
-    return (rho_from_band_range(
-                wfn, (b_lo, b_hi), sym_ops=ops,
-                sym_translations_frac=(tau if ops is not None else None),
-                dist_mesh=dist_mesh,
-                verbose=(debug_print_enabled() and process_rank() == 0)),
-            f"band-range density Σ_{{n∈[{b_lo},{b_hi})}} Σ_k w_k|ψ_nk(r)|²",
-            (b_lo, b_hi))
+    n_val, n_cond = _resolve_sigma_window(args, wfn)
+    left_range, right_range, range_label = prune_band_ranges(
+        args, n_val, n_cond)
+    mode = "transverse" if args.density_mode == "current" else "charge"
+    channel = ("Σ_i |Ψ_m†α_iΨ_n/α_fs|²" if mode == "transverse" else
+               "|ψ_m†ψ_n|²")
+    print0(
+        f"k-means weight: sqrt(Σ_k w_k Σ_{{m∈{left_range},n∈{right_range}}} "
+        f"{channel}); [{range_label}], unit band weights")
+    from .sampling_metric import build_feature_metric_diagonal
+    metric_diagonal = build_feature_metric_diagonal(
+        wfn, sym, left_range, right_range, gamma_mode=mode,
+        dist_mesh=dist_mesh,
+        verbose=(debug_print_enabled() and process_rank() == 0),
+    )
+    if R is not None:
+        from .charge_density import symmetrize_on_grid
+        metric_diagonal = symmetrize_on_grid(metric_diagonal, R, tau)
+    weight = np.sqrt(metric_diagonal)
+    label = (
+        f"sqrt(diag q=0 {mode} Gram), left={left_range}, "
+        f"right={right_range}, unit band weights")
+    return weight, label, (left_range, right_range)
 
 
 def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
@@ -553,7 +514,7 @@ def main():
     R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(args, wfn)
 
     with timing.section("setup.weight"):
-        weight, weight_label, weight_band_range = _resolve_weight(
+        weight, weight_label, weight_band_ranges = _resolve_weight(
             args, wfn, sym, R, tau, dist_mesh=mesh)
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
@@ -717,15 +678,14 @@ def main():
         args, n_val_header, n_cond_header)
     if args.density_mode == "current":
         density_fit = (
-            f"bands {weight_band_range[0] + 1}-{weight_band_range[1]} "
-            f"(indices [{weight_band_range[0]},{weight_band_range[1]})): "
-            "sum_k sum_i sum_nm |Psi_nk^dag alpha_i Psi_mk/alpha_fs|^2; "
-            "unit band weights, WFN k weights")
+            f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
+            "sqrt(sum_k w_k sum_i,m,n "
+            "|Psi_mk^dag alpha_i Psi_nk/alpha_fs|^2); unit band weights")
     else:
         density_fit = (
-            f"bands {weight_band_range[0] + 1}-{weight_band_range[1]} "
-            f"(indices [{weight_band_range[0]},{weight_band_range[1]})): "
-            "sum_n sum_k w_k |psi_nk(r)|^2; unit band weights")
+            f"left={weight_band_ranges[0]}, right={weight_band_ranges[1]}: "
+            "sqrt(sum_k w_k sum_m,n |psi_mk^dag psi_nk|^2); "
+            "unit band weights")
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = "pivoted Cholesky" if pruned else "not applied"

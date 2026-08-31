@@ -40,8 +40,16 @@ def test_kmeans_cli_has_no_occupation_weight_fit_option():
     source = (ROOT / "src/centroid/kmeans_cli.py").read_text()
     assert 'choices=("charge_density", "band_range")' not in source
     assert "n_occ =" not in source
+    assert 'add_argument("--weight-bands"' not in source
+    assert 'add_argument("--centroid-weight"' not in source
+    assert "metric_diagonal = build_feature_metric_diagonal(" in source
+    assert "weight = np.sqrt(metric_diagonal)" in source
+    assert "left_range, right_range, range_label = prune_band_ranges(" in source
 
     # Red twin: both retired policy tokens are detected.
-    old = 'choices=("charge_density", "band_range")\nn_occ = int(wfn.nelec)'
+    old = ('choices=("charge_density", "band_range")\n'
+           'p.add_argument("--weight-bands")\n'
+           'n_occ = int(wfn.nelec)')
     assert 'choices=("charge_density", "band_range")' in old
+    assert 'add_argument("--weight-bands"' in old
     assert "n_occ =" in old

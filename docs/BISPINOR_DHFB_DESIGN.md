@@ -109,17 +109,17 @@ their centroid axes have different meanings and extents. The resulting
 $\zeta^{\mu_L}_q$ files must stay paired with the centroid identity in their
 fit provenance.
 
-**Current-density weight (Gordon-decomposed Pauli current):**
+For a band window $B$, define
+$D_{B,k}(r)=\sum_{n\in B}|\Psi_{nk}(r)\rangle\langle\Psi_{nk}(r)|$.
+The current k-means mass is the feature-row norm
 
-$$\vec j^{\,\rm Gordon}_{n,k}(r) = \underbrace{\mathrm{Im}\big[\psi_L^\dagger(r)\,\nabla\,\psi_L(r)\big]}_{\rm paramagnetic}
-+ \tfrac{1}{2}\,\nabla\times\big[\psi_L^\dagger(r)\,\boldsymbol\sigma\,\psi_L(r)\big],
-\qquad W_{\rm curr}(r)=\sum_{n\in\rm occ,\,k,\,i}|j^{\,\rm Gordon}_{n,k,i}(r)|^2.$$
+$$m_J(r)=\sqrt{\sum_{k,i}w_k\,\mathrm{Tr}
+[D_{L,k}(r)\alpha_iD_{R,k}(r)\alpha_i]/\alpha_{\rm FS}^2}.$$
 
-The production builder evaluates the algebraically equivalent direct Dirac
-vertex $\Psi^\dagger\alpha_i\Psi/\alpha_{\rm FS}$ from the canonical
-kinetic-balance lift.  The Gordon form above remains the independent parity
-identity and makes explicit why the lifted result has no
-$\alpha_{\rm FS}$ suppression.
+The charge mass replaces $\alpha_i$ by the identity. It is the ordinary band
+density for one k point and an equal scalar window; generally it is the norm
+of the k-stacked feature row. The builder contracts bands into $D_L,D_R$ and
+never forms transition densities explicitly.
 
 **Effect on MoS2** (`run_zeta_proper_gram.py`, aggregate over 3.3M band-pair × k × q × test-point samples per channel):
 
@@ -206,7 +206,7 @@ band-pair cost; it is not the implemented path.
 | [`services/wfn_loader/`](services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
 | [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
 | [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
-| **[`src/centroid/current_density.py`](../src/centroid/current_density.py)** *(new)* | Builds $W_{\rm curr}(r)$ from the canonical lifted bispinor and direct $\Psi^\dagger\alpha_i\Psi/\alpha_{\rm FS}$ vertex; the Gordon form remains the independent parity identity. |
+| [`src/centroid/sampling_metric.py`](../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
 | [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes density-fit, source-density, and intended-channel provenance. |
 | [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
 | [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
