@@ -4,6 +4,7 @@ import pytest
 from minimax.measure_windows import (
     apportion_true_error,
     partition_measure_windows,
+    tail_refined_lattice_measure,
 )
 
 
@@ -56,6 +57,26 @@ def test_true_error_budget_is_mass_times_measured_difficulty():
     actual = np.array([budget.absolute_error_budget for budget in budgets])
     assert actual.sum() == pytest.approx(2.0e-4)
     assert actual / actual.sum() == pytest.approx(expected_score / expected_score.sum())
+
+
+def test_tail_refined_lattice_is_deterministic_conservative_and_bounded():
+    rng = np.random.default_rng(481516)
+    support = rng.normal(size=500) + 1j * rng.normal(size=500)
+    masses = rng.lognormal(sigma=2.0, size=support.size)
+    bins = 9
+
+    first = tail_refined_lattice_measure(
+        support, masses, bins_per_axis=bins)
+    second = tail_refined_lattice_measure(
+        support, masses, bins_per_axis=bins)
+
+    for left, right in zip(first, second):
+        np.testing.assert_array_equal(left, right)
+    cells, cell_masses, refined, refined_masses = first
+    assert cells.size <= (bins + 1) ** 2
+    assert refined.size <= (2 * bins + 1) ** 2
+    np.testing.assert_allclose(cell_masses.sum(), masses.sum(), rtol=1.0e-15)
+    np.testing.assert_allclose(refined_masses.sum(), masses.sum(), rtol=1.0e-15)
 
 
 @pytest.mark.parametrize("window_count", [1, 6])
