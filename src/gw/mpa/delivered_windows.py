@@ -966,14 +966,25 @@ def _window_kind(problem):
 
 
 def _rule_metrics(problem, times, weights):
-    """Measure residual and amplification from one shared phase matrix."""
+    """Measure residual and amplification without a three-axis phase cube.
+
+    ``d = omega - s`` makes the phase exactly separable:
+    ``exp(i*d*t) = exp(i*omega*t) * exp(-i*s*t)``.  Two thin phase matrices
+    and a matrix product therefore give the same values and absolute-term
+    sums as the explicit ``(omega, cell, tau)`` tensor, while planning memory
+    and exponential evaluations scale with ``omega + cell`` instead of their
+    product.
+    """
     kept, delivered, _excluded = problem.retained()
     denominator = problem.denominators
-    phase = np.exp(
-        1.0j * denominator[..., None]
-        * np.asarray(times, np.complex128)[None, None, :])
-    term = phase * np.asarray(weights, np.complex128)[None, None, :]
-    value = np.sum(term, axis=-1)
+    time = np.asarray(times, np.complex128)
+    weight = np.asarray(weights, np.complex128)
+    omega_phase = np.exp(
+        1.0j * np.asarray(problem.frequencies)[:, None] * time[None, :])
+    internal_phase = np.exp(
+        -1.0j * np.asarray(problem.internal_sums)[:, None] * time[None, :])
+    weighted_omega = omega_phase * weight[None, :]
+    value = weighted_omega @ internal_phase.T
     with np.errstate(divide="ignore", invalid="ignore"):
         truth = np.where(
             kept, 1.0 / np.where(kept, denominator, 1.0), 0.0)
@@ -981,7 +992,8 @@ def _rule_metrics(problem, times, weights):
                  @ problem.cell_masses)
     residual = numerator / delivered
 
-    kappa = (np.sum(np.abs(term), axis=-1)
+    absolute_sum = np.abs(weighted_omega) @ np.abs(internal_phase).T
+    kappa = (absolute_sum
              / np.maximum(np.abs(value), 1.0e-300))[kept]
     mass = np.broadcast_to(
         problem.cell_masses[None, :], denominator.shape)[kept]
