@@ -83,6 +83,10 @@ _CASES = (
                              l_range=(0, 5), r_range=(0, 8), seed=2)),
     ("ns1_asym_lower", dict(ns=1, nk_tuple=(1, 2, 1), n_rmu=4, nb_full=8,
                              l_range=(2, 8), r_range=(0, 8), seed=3)),
+    ("ns4_charge_spin_stream", dict(
+        ns=4, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8,
+        l_range=(0, 5), r_range=(0, 8), seed=4,
+        spin_stream_charge=True)),
 )
 
 #: γ̃-VERTEX cases (2026-08-23, feat/transverse-zeta-face-2026-08-23) — the
@@ -109,7 +113,8 @@ def _crand(rng, *shape):
 
 
 def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
-                         r_range, seed, gamma_mu_L=0, gamma_nu_L=0):
+                         r_range, seed, gamma_mu_L=0, gamma_nu_L=0,
+                         spin_stream_charge=False):
     """Build the SAME random ψ, feed it to both layouts, diff C_q.
 
     ``l_range``/``r_range`` need not be mesh-divisible (the face path's
@@ -178,7 +183,9 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     w_l = np.where((idx >= l0) & (idx < l1), 1.0, 0.0)
     w_r = np.where((idx >= r0) & (idx < r1), 1.0, 0.0)
 
-    plan = gemm_plan(mesh, m=n_rmu * ns, k=nb_full, n=n_rmu * ns, nq=nk,
+    plan = gemm_plan(mesh,
+                      m=(n_rmu if spin_stream_charge else n_rmu * ns),
+                      k=nb_full, n=n_rmu * ns, nq=nk,
                       dtype=jnp.complex128)
     p0(f"  {plan.describe()}")
 
@@ -186,7 +193,8 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
         kgrid=nk_tuple, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_d, psi_nmu=psi_nmu_d,
         gamma_L=gamma_L, gamma_R=gamma_R,
-        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r), gemm=plan))
+        weight_l=jnp.asarray(w_l), weight_r=jnp.asarray(w_r), gemm=plan,
+        spin_stream_charge=spin_stream_charge))
 
     # Both C_legacy/C_face are genuinely multi-process sharded
     # (P(None,'x','y')) -- gather with process_allgather, not device_get.
@@ -232,6 +240,7 @@ def test_cq_face_layout_matches_legacy(name, kwargs):
 def _cli_main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mesh", default="2x2", help="PxQ process mesh")
+    ap.add_argument("--case", default=None, help="run one named case")
     args = ap.parse_args()
     px, py = (int(v) for v in args.mesh.lower().split("x"))
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
@@ -243,14 +252,19 @@ def _cli_main():
         return 1
     mesh = Mesh(np.asarray(jax.devices()).reshape(px, py), ("x", "y"))
     failures = 0
-    for name, kwargs in _ALL_CASES:
+    cases = ([case for case in _ALL_CASES if case[0] == args.case]
+             if args.case else list(_ALL_CASES))
+    if not cases:
+        p0(f"REFUSE: unknown case {args.case!r}")
+        return 2
+    for name, kwargs in cases:
         try:
             check_cq_face_parity(mesh, **kwargs)
             p0(f"PASS {name}")
         except AssertionError as exc:
             failures += 1
             p0(f"FAIL {name}: {exc}")
-    p0(f"done: {len(_ALL_CASES) - failures}/{len(_ALL_CASES)} cases passed")
+    p0(f"done: {len(cases) - failures}/{len(cases)} cases passed")
     return 1 if failures else 0
 
 

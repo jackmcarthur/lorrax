@@ -689,8 +689,12 @@ def fit_zeta_to_h5(
                 # ns > 1 -- verified 2026-08-22 on the MoS2 k6_c50 spinor
                 # deck (ns=2): "gemm_plan A: expected shape (36, 676, 76);
                 # got (36, 1352, 76)".
+                _spin_stream_charge = bool(
+                    vertex_mu_L == 0 and _ns_face == 4)
                 _face_gemm = _gemm_plan(
-                    mesh_xy, m=n_rmu_padded * _ns_face, k=_nb_face,
+                    mesh_xy,
+                    m=(n_rmu_padded if _spin_stream_charge
+                       else n_rmu_padded * _ns_face), k=_nb_face,
                     n=n_rmu_padded * _ns_face,
                     nq=nk_tot, dtype=jnp.complex128)
                 print_fn(f"  {_face_gemm.describe()}")
@@ -726,7 +730,8 @@ def fit_zeta_to_h5(
                 psi_mun=psi_mun_fresh, psi_nmu=psi_nmu_fresh,
                 gamma_L=gamma_mu_face, gamma_R=gamma_mu_face,
                 weight_l=weight_l_face, weight_r=weight_r_face,
-                gemm=_face_gemm)
+                gemm=_face_gemm,
+                spin_stream_charge=_spin_stream_charge)
         elif vertex_mu_L == 0:
             C_q = c_q_from_psi_sm(
                 psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,

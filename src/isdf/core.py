@@ -578,6 +578,7 @@ def c_q_from_psi_sm(
 	weight_l: jax.Array | None = None,
 	weight_r: jax.Array | None = None,
 	gemm=None,
+	spin_stream_charge: bool = False,
 ) -> jax.Array:
 	"""C_q, the ζ fit's CCT Gram (band contraction + IFFT/γ̃/FFT over k).
 
@@ -617,9 +618,10 @@ def c_q_from_psi_sm(
 	                          (the array's own extent, already mesh-
 	                          divisible: ``BandSlices.b4`` is padded to the
 	                          world size).
-	    gemm     : one ``distrib_la.GemmPlan`` (``m=n=n_rmu``, ``k=nb``,
-	               ``nq=nk``), built ONCE by the caller and reused for both
-	               P_l and P_r — only the weight differs between them.
+	    gemm     : one ``distrib_la.GemmPlan``, built ONCE by the caller and
+	               reused for both P_l and P_r — only the weight differs.
+	               With ``spin_stream_charge=True`` its row extent is
+	               ``m=n_rmu`` rather than ``n_rmu*ns``.
 
 	Output (either layout):
 	    C_q : (nq, n_rmu, n_col) sharded ``P(None, 'x', 'y')``.
@@ -643,7 +645,8 @@ def c_q_from_psi_sm(
 			").")
 	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
 	                 gamma_L, gamma_R,
-	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
+	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm,
+	                 spin_stream_charge=bool(spin_stream_charge))
 
 
 def _c_q_legacy(
@@ -793,6 +796,7 @@ def _c_q_face(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 	gemm,
+	spin_stream_charge: bool = False,
 ) -> jax.Array:
 	"""Face-layout C_q: ONE planned N,N band GEMM per side (SUMMA-
 	distributed over the mesh-sharded band contraction axis) producing the
@@ -879,12 +883,23 @@ def _c_q_face(
 	col_loc = n_col_full // py
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
+	if spin_stream_charge and not (lhs_id and rhs_id):
+		raise ValueError(
+			"_c_q_face spin_stream_charge is only valid for the identity "
+			"charge vertex (gamma_L=gamma_R=None).")
+	if spin_stream_charge and s_ <= 1:
+		raise ValueError(
+			"_c_q_face spin_stream_charge requires nspinor > 1; "
+			f"got {s_}.")
 
 	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
 	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
 	w_rep = NamedSharding(mesh_xy, P(None))
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 	pair_spec = P(None, None, 'x', None, 'y')
+	row_pair_spec = P(None, 'x', None, 'y')
+	real_spec = P(None, None, None, 'x', 'y')
+	real_sharding = NamedSharding(mesh_xy, real_spec)
 
 	@partial(jax.jit,
 	         in_shardings=(in_mun, in_nmu, w_rep, w_rep,
@@ -900,7 +915,59 @@ def _c_q_face(
 			Pp = split_spin_centroid(D, 1, s_, mu_full)         # (nk, s, mu, nu*s)
 			return split_spin_centroid(Pp, 3, s_, n_col_full)   # (nk, s, mu, s', nu)
 
+		def _pair_spin_row(psi_mun_conj_: jax.Array,
+		                   psi_nmu_use: jax.Array, w: jax.Array,
+		                   spin_row: jax.Array) -> jax.Array:
+			A = psi_mun_conj_[:, spin_row, :, :]                # (nk,mu,nb)
+			A = A * w[None, None, :].astype(A.dtype)
+			B = merge_spin_centroid(psi_nmu_use, 2, 3)          # (nk,nb,s'*nu)
+			D = gemm(A, B)                                      # (nk,mu,s'*nu)
+			return split_spin_centroid(D, 2, s_, n_col_full)    # (nk,mu,s',nu)
+
 		psi_mun_conj = jnp.conj(psi_mun_)
+		if spin_stream_charge:
+			@partial(shard_map, mesh=mesh_xy,
+			         in_specs=(row_pair_spec, row_pair_spec, real_spec),
+			         out_specs=real_spec, check_vma=False)
+			def _accumulate_spin_row(P_l_row_, P_r_row_, C_R_):
+				P_l_3d = P_l_row_.reshape(
+					nkx, nky, nkz, mu_loc, s_, col_loc)
+				P_r_3d = P_r_row_.reshape(
+					nkx, nky, nkz, mu_loc, s_, col_loc)
+				P_l_R = local_ifftn3(
+					P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_r_R = local_ifftn3(
+					P_r_3d, axes=(0, 1, 2), norm='forward')
+				return C_R_ + jnp.sum(
+					jnp.conj(P_l_R) * P_r_R, axis=4)
+
+			C_R0 = jax.lax.with_sharding_constraint(
+				jnp.zeros(
+					(nkx, nky, nkz, mu_full, n_col_full),
+					dtype=psi_mun_.dtype),
+				real_sharding)
+
+			def _spin_body(C_R_, spin_row):
+				P_l_row = _pair_spin_row(
+					psi_mun_conj, psi_nmu_, w_l, spin_row)
+				P_r_row = _pair_spin_row(
+					psi_mun_conj, psi_nmu_, w_r, spin_row)
+				return _accumulate_spin_row(P_l_row, P_r_row, C_R_), None
+
+			C_R, _ = jax.lax.scan(
+				_spin_body, C_R0, jnp.arange(s_, dtype=jnp.int32),
+				unroll=1)
+
+			@partial(shard_map, mesh=mesh_xy, in_specs=real_spec,
+			         out_specs=P(None, 'x', 'y'), check_vma=False)
+			def _finish_charge(C_R_):
+				C_q_3d = local_fftn3(
+					C_R_, axes=(0, 1, 2), norm='forward')
+				return C_q_3d.reshape(
+					nkx * nky * nkz, mu_loc, col_loc)
+
+			return _finish_charge(C_R)
+
 		P_l = _pair(psi_mun_conj, psi_nmu_, w_l)
 		if lhs_id and rhs_id:
 			P_r = _pair(psi_mun_conj, psi_nmu_, w_r)

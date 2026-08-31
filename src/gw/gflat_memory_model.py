@@ -1142,8 +1142,18 @@ def plan_gflat_chunks(
     # passes full nk to the incumbent to_rchunk_inner owner.
     A_t = fft_box_A
     A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
-    B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
-           + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
+    # The four-component identity-charge face kernel streams one left-spin
+    # row from each pair density.  Five row-sized arenas conservatively price
+    # its GEMM/FFT/product live set; other routes retain two complete open-spin
+    # pair densities.
+    _stream_charge_cct = bool(
+        low_mem_bands and is_bispinor and ns == 4
+        and not face_current_vertex)
+    _pair_cct = (
+        5 * _c128(nk, ns, mu, mu, shard=p_xy)
+        if _stream_charge_cct else
+        2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))
+    B_t = _c128(nq, mu, mu, shard=p_xy) + _pair_cct
     if low_mem_bands:
         if cache_face_y_blocks:
             _cache_tile = face_y_cache_r_tile
