@@ -65,8 +65,10 @@ import argparse
 import numpy as np
 import jax
 import jax.numpy as jnp
-import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+if __name__ != "__main__":
+    import pytest
 
 from isdf.core import c_q_from_psi_sm
 from distrib_la import gemm_plan
@@ -225,16 +227,18 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
 _ALL_CASES = _CASES + _GAMMA_CASES
 
 
-@pytest.mark.parametrize("name,kwargs", _ALL_CASES, ids=[c[0] for c in _ALL_CASES])
-def test_cq_face_layout_matches_legacy(name, kwargs):
-    if jax.process_count() < PX * PY:
-        pytest.skip(
-            f"needs {PX * PY} REAL processes for gemm_plan's cuBLASMp "
-            f"GUARD 4 (got process_count={jax.process_count()}); run "
-            f"`lx run -N 1 -G 4 -n 4 ... {__file__} --mesh 2x2` for the "
-            f"real check (see this module's docstring)")
-    mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
-    check_cq_face_parity(mesh, **kwargs)
+if __name__ != "__main__":
+    @pytest.mark.parametrize(
+        "name,kwargs", _ALL_CASES, ids=[c[0] for c in _ALL_CASES])
+    def test_cq_face_layout_matches_legacy(name, kwargs):
+        if jax.process_count() < PX * PY:
+            pytest.skip(
+                f"needs {PX * PY} REAL processes for gemm_plan's cuBLASMp "
+                f"GUARD 4 (got process_count={jax.process_count()}); run "
+                f"`lx run -N 1 -G 4 -n 4 ... {__file__} --mesh 2x2` for the "
+                f"real check (see this module's docstring)")
+        mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
+        check_cq_face_parity(mesh, **kwargs)
 
 
 def _cli_main():
