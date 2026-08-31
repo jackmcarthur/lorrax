@@ -580,5 +580,47 @@ def test_lookup_walk_keeps_tighter_accepted_rules_for_global_budget(
             for row in candidates] == [1.0e-6, 2.0e-7]
 
 
+def test_crossing_walk_can_defer_tighter_tables_until_global_retry(monkeypatch):
+    problem = ReciprocalMeasureProblem(
+        frequencies=np.asarray([-0.2, 0.2]),
+        internal_sums=np.asarray([-0.1j]),
+        cell_masses=np.asarray([1.0]))
+
+    def table_walk(*_args, **_kwargs):
+        for nodes, tolerance in ((2, 1.0e-4), (3, 1.0e-5)):
+            yield (
+                np.arange(1, nodes + 1, dtype=np.float64),
+                -1.0j * np.ones(nodes),
+                {"family": "crossing_causal",
+                 "candidate_tolerance": tolerance,
+                 "provenance": f"table {tolerance:g}"})
+
+    def accepted(*args, **kwargs):
+        return {
+            "times": np.asarray(args[2], np.complex128),
+            "weights": np.asarray(args[3], np.complex128),
+            "fit_metrics": (0.0, 1.0, 1.0),
+            "metrics": (0.0, 1.0, 1.0),
+            "evidence": args[4],
+        }
+
+    monkeypatch.setattr(delivered, "_crossing_table_candidates", table_walk)
+    monkeypatch.setattr(delivered, "_rule_candidate", accepted)
+    monkeypatch.setattr(delivered, "_factor_growth", lambda *_args: (0.0, 0.0))
+    spec = {
+        "name": "deferred crossing", "kind": "crossing",
+        "problem": problem, "validation": problem, "pole_sign": 1.0,
+        "envelope": 1.0,
+    }
+    first = delivered._candidate_rules(
+        spec, 0.1, 8, 30.0, 1.0e-3, True)
+    complete = delivered._candidate_rules(
+        spec, 0.1, 8, 30.0, 1.0e-3)
+
+    assert len(first) == 1
+    assert len(complete) == 2
+    assert first[0]["evidence"]["candidate_tolerance"] == 1.0e-4
+
+
 def test_tolerance_ladder_is_deleted():
     assert not hasattr(delivered, "_FIT_TOLERANCE_LADDER")

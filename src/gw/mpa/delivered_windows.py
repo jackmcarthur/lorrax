@@ -1380,7 +1380,7 @@ def _factor_growth(spec, times, eta):
 
 
 def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
-                     relative_target):
+                     relative_target, first_accepted_only=False):
     """Return every shipped rule passing the measured window gates.
 
     The complete-plan selector needs the tighter accepted lookup choices to
@@ -1440,6 +1440,8 @@ def _candidate_rules(spec, eta, max_nodes, factor_growth_cap,
                     factor_growth=factor,
                     attempts=attempts.copy())
                 accepted.append(candidate)
+                if first_accepted_only:
+                    break
             except (FloatingPointError, OverflowError, RuntimeError,
                     ValueError, np.linalg.LinAlgError) as exc:
                 attempts.append({
@@ -1779,13 +1781,31 @@ def build_delivered_sigma_windows(
         # bit-identical rules after the barrier.
         planning_rank = not distributed_receipt or process_rank() == 0
         if planning_rank:
+            candidate_targets = [
+                min(0.5, total_absolute / spec["envelope"])
+                for spec in specs]
             candidates_by_window = [
                 _candidate_rules(
                     spec, eta, node_ceiling, factor_cap,
-                    min(0.5, total_absolute / spec["envelope"]))
-                for spec in specs]
-            fits, free_pairs, required_cost = _select_rules(
-                specs, candidates_by_window, total_absolute, node_ceiling)
+                    relative_target, spec["kind"] == "crossing")
+                for spec, relative_target in zip(specs, candidate_targets)]
+            try:
+                fits, free_pairs, required_cost = _select_rules(
+                    specs, candidates_by_window, total_absolute, node_ceiling)
+            except RuntimeError:
+                # The first accepted causal table is normally already far
+                # below the delivered residual gate.  Only if the global
+                # achieved-error budget still fails do we pay to measure its
+                # tighter catalog alternatives; this preserves the complete
+                # selector without making every ordinary plan scan them.
+                candidates_by_window = [
+                    (_candidate_rules(
+                        spec, eta, node_ceiling, factor_cap, relative_target)
+                     if spec["kind"] == "crossing" else candidates)
+                    for spec, relative_target, candidates in zip(
+                        specs, candidate_targets, candidates_by_window)]
+                fits, free_pairs, required_cost = _select_rules(
+                    specs, candidates_by_window, total_absolute, node_ceiling)
             window_tau_pairs = free_pairs
             _save_plan_cache(
                 plan_cache_path, cache_fingerprint, fits, free_pairs,
