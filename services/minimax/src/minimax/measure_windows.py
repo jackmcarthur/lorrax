@@ -12,6 +12,7 @@ caller that requires a maximum span must check them before fitting.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -115,8 +116,14 @@ def tail_refined_lattice_measure(
     refined_quantiles = _tail_refined_quantiles(2 * int(bins_per_axis))
     joint_quantiles = np.concatenate((base_quantiles, refined_quantiles))
     split = base_quantiles.size
-    real_quantiles = np.quantile(sums.real, joint_quantiles)
-    imag_quantiles = np.quantile(sums.imag, joint_quantiles)
+    # The axes are independent, and NumPy's quantile selection releases the
+    # GIL.  Evaluate the pair together so a complex support does not serialize
+    # two identical-sized selection passes.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        real_future = executor.submit(
+            np.quantile, sums.real, joint_quantiles)
+        imag_quantiles = np.quantile(sums.imag, joint_quantiles)
+        real_quantiles = real_future.result()
     base_real = np.unique(real_quantiles[:split])
     base_imag = np.unique(imag_quantiles[:split])
     refined_real = np.unique(real_quantiles[split:])
