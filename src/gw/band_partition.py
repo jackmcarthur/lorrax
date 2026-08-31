@@ -239,9 +239,21 @@ def build_omega_band_partition(
     band_in_grid, _ = classify_bands_in_grid(
         e_dft_ev, float(omega_min_abs_ev), float(omega_max_abs_ev))
     in_range = jnp.asarray(band_in_grid, dtype=bool)
+    # A band is in-grid only if EVERY k is in the window, so one stray k
+    # discards the whole band and every state it holds inside the window.
+    # Report what that costs: on the sodium metal at +-10 eV, bands sitting
+    # inside at 90-97% of k took 244 usable (k, band) states down to 58.
+    # Silence here reads as "the window is too narrow" when the real answer
+    # may be "the window is fine and the all-k rule is throwing it away".
+    state_in = np.asarray(
+        (e_dft_ev >= float(omega_min_abs_ev))
+        & (e_dft_ev <= float(omega_max_abs_ev)), dtype=bool)
+    kept = int(band_in_grid.sum()) * int(state_in.shape[0])
     print_fn(
         f"  {label} partition: protected/in-range = "
-        f"{int(band_in_grid.sum())}/{int(band_in_grid.size)} bands")
+        f"{int(band_in_grid.sum())}/{int(band_in_grid.size)} bands "
+        f"({int(state_in.sum())}/{int(state_in.size)} (k,band) states lie in "
+        f"the window; the all-k rule keeps {kept})")
     partition = BandPartition(
         protected_mask=in_range, in_range_mask=in_range)
     partition.report_multiplet_splits(
