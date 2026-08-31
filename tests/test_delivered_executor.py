@@ -1,6 +1,7 @@
 """Convention and geometry gates for the delivered Sigma executor."""
 
 import ast
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,7 +89,7 @@ def test_raw_sigma_checkpoint_precedes_every_qp_stage():
     assert sigma_lines[0] < kin_lines[0] < solve_lines[0]
 
 
-def test_planner_refuses_an_unattainable_product_window():
+def test_planner_refuses_an_unattainable_product_window(capsys):
     E_A = jnp.asarray([[0.3]])
     branch = _SigmaBranch(
         "positive conduction", E_A, jnp.ones_like(E_A, dtype=bool),
@@ -102,7 +103,25 @@ def test_planner_refuses_an_unattainable_product_window():
             [np.asarray([0.5 - 0.1j]).reshape(1, 1, 1, 1)],
             [np.asarray([0.7 + 0.2j]).reshape(1, 1, 1, 1)],
             [branch], np.asarray([0.8]), regularization_width_ry=0.05,
-            envelope_relative_target=1.0e-11, max_nodes=8)
+            envelope_relative_target=1.0e-11, max_nodes=64)
+
+    prefix = "[delivered-planner-window] "
+    lines = [line for line in capsys.readouterr().out.splitlines()
+             if line.startswith(prefix)]
+    assert len(lines) == 1
+    record = json.loads(lines[0][len(prefix):])
+    assert record["name"] == "positive conduction:resonant"
+    assert record["cell_count"] > 0
+    assert record["crossing_radius_ry"] > 0.0
+    assert record["gamma_min_ry"] > 0.0
+    assert record["A_over_eta"] > 0.0
+    assert record["A_over_gamma_min"] > 0.0
+    assert record["scale_span"] >= 1.0
+    assert record["delivered_mass_share"] == 1.0
+    assert record["apportioned_target"] > 0.0
+    assert record["status"] == "refused"
+    assert record["best_achieved_residual"] is not None
+    assert record["best_achieved_kappa_p99"] is not None
 
 
 def test_planner_integrates_crossing_in_one_product_window(monkeypatch):
