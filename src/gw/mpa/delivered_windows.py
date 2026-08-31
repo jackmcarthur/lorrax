@@ -2148,6 +2148,8 @@ def build_delivered_sigma_windows(
                         len(base_specs), fit_retry, refuse_errors=True))
                 window_parallel_seconds += time.perf_counter() - fit_started
                 window_fit_rows.extend(retry_rows)
+            unconsolidated_specs = specs
+            unconsolidated_candidates = candidates_by_window
             consolidation_started = time.perf_counter()
             (specs, candidates_by_window, trial_rows,
              consolidation_cache) = _consolidate_branches(
@@ -2164,6 +2166,26 @@ def build_delivered_sigma_windows(
                 break
             except RuntimeError:
                 selection_seconds += time.perf_counter() - selection_started
+                # Merging leaves the selector ONE rule for that branch, so a
+                # merge that is cheaper per node can still make the plan
+                # unaffordable with no alternative to fall back on (measured:
+                # 'val:consolidated' refused at 3.91e9 against a 2.79e9
+                # budget).  Retry un-merged before giving up — the split
+                # candidates are already fitted, so this costs only selection.
+                if specs is not unconsolidated_specs:
+                    selection_started = time.perf_counter()
+                    try:
+                        fits, free_pairs, required_cost = _select_rules(
+                            unconsolidated_specs, unconsolidated_candidates,
+                            total_absolute, pair_ceiling)
+                        specs = unconsolidated_specs
+                        candidates_by_window = unconsolidated_candidates
+                        selection_seconds += (
+                            time.perf_counter() - selection_started)
+                        break
+                    except RuntimeError:
+                        selection_seconds += (
+                            time.perf_counter() - selection_started)
                 if not adapted_only:
                     raise      # the shipped rules could not close it either
         del base_specs
