@@ -34,6 +34,17 @@ def _lattice_axis(values: Array, quantiles: Array) -> Array:
     return np.unique(np.quantile(np.asarray(values, dtype=np.float64), quantiles))
 
 
+def _base_and_refined_axes(values: Array, bins_per_axis: int):
+    """Build both quantile axes with one sort of the same support values."""
+    base_q = _tail_refined_quantiles(bins_per_axis)
+    refined_q = _tail_refined_quantiles(2 * int(bins_per_axis))
+    all_q = np.unique(np.concatenate((base_q, refined_q)))
+    sampled = np.quantile(np.asarray(values, dtype=np.float64), all_q)
+    base = np.unique(sampled[np.searchsorted(all_q, base_q)])
+    refined = np.unique(sampled[np.searchsorted(all_q, refined_q)])
+    return base, refined
+
+
 def _axis_cloud_weights(values: Array, nodes: Array):
     """Return cloud-in-cell node indices and weights on one axis."""
     if nodes.size == 1:
@@ -53,21 +64,19 @@ def _axis_cloud_weights(values: Array, nodes: Array):
 def _build_tail_refined_lattice(
     internal_sums: Array,
     masses: Array,
-    bins_per_axis: int,
+    real_nodes: Array,
+    imag_nodes: Array,
 ) -> tuple[Array, Array]:
-    quantiles = _tail_refined_quantiles(bins_per_axis)
-    real_nodes = _lattice_axis(internal_sums.real, quantiles)
-    imag_nodes = _lattice_axis(internal_sums.imag, quantiles)
     real_cloud = _axis_cloud_weights(internal_sums.real, real_nodes)
     imag_cloud = _axis_cloud_weights(internal_sums.imag, imag_nodes)
     grid = np.zeros(real_nodes.size * imag_nodes.size, dtype=np.float64)
     for real_index, real_weight in real_cloud:
         for imag_index, imag_weight in imag_cloud:
-            np.add.at(
-                grid,
-                real_index * imag_nodes.size + imag_index,
-                masses * real_weight * imag_weight,
-            )
+            flat_index = real_index * imag_nodes.size + imag_index
+            grid += np.bincount(
+                flat_index,
+                weights=masses * real_weight * imag_weight,
+                minlength=grid.size)
     nodes = (real_nodes[:, None]
              + 1.0j * imag_nodes[None, :]).reshape(-1)
     live = grid > 0.0
@@ -117,10 +126,14 @@ def tail_refined_lattice_measure(
     live = weight > 0.0
     sums, weight = sums[live], weight[live]
     total = float(np.sum(weight))
+    real_base, real_refined = _base_and_refined_axes(
+        sums.real, int(bins_per_axis))
+    imag_base, imag_refined = _base_and_refined_axes(
+        sums.imag, int(bins_per_axis))
     cells, cell_mass = _build_tail_refined_lattice(
-        sums, weight, int(bins_per_axis))
+        sums, weight, real_base, imag_base)
     refined_cells, refined_mass = _build_tail_refined_lattice(
-        sums, weight, 2 * int(bins_per_axis))
+        sums, weight, real_refined, imag_refined)
     for label, got in (("base", cell_mass), ("refined", refined_mass)):
         error = abs(float(np.sum(got)) - total)
         if error > 1.0e-12 * max(total, 1.0):
