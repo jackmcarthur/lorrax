@@ -653,6 +653,70 @@ def _solve_occupation_state(
     return occ_state
 
 
+def _certified_seed_occupation_state(
+        inputs: SCInputs, energies_kn_ry, certified_fit,
+        solved_state: OccupationState) -> OccupationState:
+    """Replay a certified fit's exact occupation provenance on its ladder.
+
+    GPU reductions can choose adjacent float64 roots for the same fixed-N
+    problem.  That changes the byte hash even when ``mu`` differs by one ulp.
+    A reused fit already stores the authoritative root and occupation hash.
+    Re-evaluate MP1 at that stored root on the current entry spectrum, then
+    require the reconstructed table to reproduce the stored hash exactly.
+    A different spectrum therefore still refuses; only root-reduction noise
+    is removed from the cross-run provenance gate.
+    """
+    if solved_state is None:
+        raise ValueError(
+            "certified metallic MPA reuse requires an entry occupation state")
+
+    from file_io.mpa_store import (
+        assert_occupation_stamps, read_occupation_stamps)
+    from .efermi import assert_fixed_n, mp1_occupations
+
+    stamps = read_occupation_stamps(certified_fit)
+    if stamps is None:
+        raise ValueError(
+            "certified MPA fit reuse has no occupation provenance stamps")
+    if str(stamps["smearing_family"]) != "mp1":
+        raise ValueError(
+            "certified metallic MPA fit must carry MP1 occupations; got "
+            f"{stamps['smearing_family']!r}")
+
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    nb_logical = int(solved_state.f_kn.shape[1])
+    if energies.ndim != 2 or int(energies.shape[1]) < nb_logical:
+        raise ValueError(
+            "certified MPA occupation replay needs the complete logical "
+            f"energy ladder ({nb_logical} bands); got {tuple(energies.shape)}")
+    occ_kn = mp1_occupations(
+        energies[:, :nb_logical], float(stamps["mu_ry"]),
+        float(stamps["smearing_width_ry"]),
+        clamp_tol=float(inputs.config.occupation_clamp_tol))
+    replayed = OccupationState(
+        f_kn=occ_kn,
+        mu_ry=float(stamps["mu_ry"]),
+        smearing_family="mp1",
+        smearing_width_ry=float(stamps["smearing_width_ry"]),
+        n_electrons=float(stamps["occ_nelec"]),
+    )
+    assert_occupation_stamps(
+        certified_fit, replayed, where="certified MPA fit replay")
+    kweights = np.full(
+        int(energies.shape[0]), 1.0 / float(energies.shape[0]),
+        dtype=np.float64)
+    assert_fixed_n(
+        replayed, kweights,
+        state_capacity=float(inputs.wfn.occupation_state_capacity))
+    if replayed.occ_hash != solved_state.occ_hash:
+        inputs.print_fn(
+            "    SC occupations: replayed certified root "
+            f"mu={replayed.mu_ry:.17g} Ry; exact stored occ_hash "
+            f"{replayed.occ_hash} (live root hash was "
+            f"{solved_state.occ_hash})")
+    return replayed
+
+
 def _solve_head_occupations(
     inputs: SCInputs,
     energies_kn_ry,
@@ -2382,6 +2446,57 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             NamedSharding(inputs.mesh_xy, P(None, None)))
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
         inputs, enk_entry)
+
+    # Resolve an external MPA seed before any occupation consumer runs.  The
+    # provider remains the sole owner of path resolution; production then
+    # replays and asserts the stored occupation provenance on this exact
+    # entry ladder.  Later maps retain only the fit's sample geometry and
+    # rebuild screening from their live occupations.
+    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+    screening_reuse = None
+    certified_fit = None
+    if mpa_mode and inputs.quad is None:
+        if inputs.config.head.correction is HeadCorrection.FULL:
+            raise ValueError(
+                "MPA certified-fit reuse with no screening quadrature cannot "
+                "serve head_correction=full, whose current-iteration head "
+                "must be folded through newly sampled W")
+        cache = inputs.screening_seed_cache
+        certified_fit = (cache.get("mpa_fit") if cache is not None else None)
+        if state.iteration == 0:
+            screening_reuse = (
+                cache.get("mapping") if cache is not None else None)
+            if screening_reuse is None:
+                screening_reuse = inputs.screening_model_fn(
+                    inputs.config.compute_mode, inputs.wfns_dft, inputs.V_q,
+                    quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
+                    centroid_indices=inputs.centroid_indices,
+                    config=inputs.config, meta=inputs.meta,
+                    mesh_xy=inputs.mesh_xy,
+                    run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
+                    label=f"sc_{state.iteration:04d}",
+                    head_resolver=inputs.head_resolver,
+                    head_channel=getattr(inputs, 'head_channel', None),
+                    wfn=inputs.wfn, mpa_plan=None,
+                    iteration_head_response=None,
+                    occupation_state=entry_occ_state,
+                    print_fn=inputs.print_fn)
+                if isinstance(screening_reuse, dict):
+                    certified_fit = screening_reuse.get("mpa_fit")
+                if cache is not None and certified_fit is not None:
+                    cache.update(
+                        mapping=screening_reuse, mpa_fit=certified_fit)
+            if certified_fit is None:
+                raise ValueError(
+                    "MPA screening reuse provider returned no certified "
+                    "mpa_fit path")
+            entry_occ_state = _certified_seed_occupation_state(
+                inputs, enk_entry, certified_fit, entry_occ_state)
+            if inputs.parallel_transport is not None:
+                raise ValueError(
+                    "certified MPA occupation replay with a live head "
+                    "surface table is not implemented")
+            entry_surface_weight_kn = None
     # THE THREE-WAY SCISSOR CLASSIFICATION, once per map call.  Valence is
     # everything below the lowest Fermi-crossing band, conduction everything
     # above the highest, and the crossing bands enter NEITHER fit (owner
@@ -2490,7 +2605,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"Hartree from iteration {state.iteration} orbitals "
             f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
 
-    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
     # Same-run metal threading: the ENTRY-solved state feeds chi, the head
     # and Sigma — one mu per map call, from this call's spectrum.
     metal_occ_state = (entry_occ_state
@@ -2516,30 +2630,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
             print_fn=inputs.print_fn)
-
-    # A certified-fit provider owns path resolution and announces it.  Ask it
-    # once, before head-plan construction, and use the exact path it returns;
-    # never rediscover a sibling filename or reread an environment variable.
-    screening_reuse = None
-    certified_fit = None
-    if mpa_mode and inputs.quad is None:
-        if inputs.config.head.correction is HeadCorrection.FULL:
-            raise ValueError(
-                "MPA certified-fit reuse with no screening quadrature cannot "
-                "serve head_correction=full, whose current-iteration head "
-                "must be folded through newly sampled W")
-        cache = inputs.screening_seed_cache
-        certified_fit = (cache.get("mpa_fit") if cache is not None else None)
-        if state.iteration == 0:
-            screening_reuse = (
-                cache.get("mapping") if cache is not None else None)
-            if screening_reuse is None:
-                screening_reuse = _screening(None, None)
-                if isinstance(screening_reuse, dict):
-                    certified_fit = screening_reuse.get("mpa_fit")
-                if cache is not None and certified_fit is not None:
-                    cache.update(
-                        mapping=screening_reuse, mpa_fit=certified_fit)
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.

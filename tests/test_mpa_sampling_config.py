@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -92,6 +94,42 @@ def test_certified_fit_plan_reuse_refuses_a_sampling_mismatch(
     with pytest.raises(ValueError, match="does not exactly reproduce stored"):
         model.make_mpa_plan_from_fit(
             config, "wrong-grid.h5", mesh_xy="mesh")
+
+
+def test_certified_seed_replays_stored_root_before_hash_gate(tmp_path):
+    import h5py
+
+    from file_io.mpa_store import stamp_occupation_provenance
+    from gw.efermi import OccupationState, mp1_occupations
+    from gw.sc_iteration import _certified_seed_occupation_state
+
+    energies = np.asarray([[-0.15, 0.10], [-0.10, 0.15]])
+    width = 0.02
+    solved = OccupationState.solve_mp1(
+        energies, np.asarray([0.5, 0.5]), 1.0, width,
+        state_capacity=1.0)
+    stored_mu = float(solved.mu_ry) + 1.0e-15
+    stored = OccupationState(
+        f_kn=mp1_occupations(energies, stored_mu, width),
+        mu_ry=stored_mu, smearing_family="mp1",
+        smearing_width_ry=width, n_electrons=1.0)
+    assert stored.occ_hash != solved.occ_hash
+
+    fit = tmp_path / "fit.h5"
+    with h5py.File(fit, "w") as handle:
+        stamp_occupation_provenance(handle, stored)
+    messages = []
+    inputs = SimpleNamespace(
+        config=SimpleNamespace(occupation_clamp_tol=1.0e-10),
+        wfn=SimpleNamespace(occupation_state_capacity=1.0),
+        print_fn=messages.append)
+
+    replayed = _certified_seed_occupation_state(
+        inputs, energies, fit, solved)
+
+    assert replayed.occ_hash == stored.occ_hash
+    assert replayed.mu_ry == stored_mu
+    assert any("replayed certified root" in row for row in messages)
 
 
 def test_sc_frequency_plan_uses_the_reuse_providers_resolved_fit(
