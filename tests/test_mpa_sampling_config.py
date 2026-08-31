@@ -55,6 +55,45 @@ def test_metal_sampling_flags_build_the_configured_grid(tmp_path):
     )
 
 
+def test_certified_fit_samples_rebuild_the_exact_deck_plan(
+        tmp_path, monkeypatch):
+    config = _config(
+        tmp_path,
+        "mpa_n_poles = 4\n" + _METAL_KEYS
+        + "mpa_sampling_alpha = 2\n"
+        + "mpa_varpi_near_ry = 0.15\n"
+        + "mpa_varpi_far_ry = 1.5\n")
+    stored_z = sample_plan.plan_z(config.mpa.sample_plan(8.0))
+    calls = []
+
+    def read_head(path, *, mesh_xy, to_unit):
+        calls.append((path, mesh_xy, to_unit))
+        return {"sample_z": stored_z.copy()}
+
+    monkeypatch.setattr(model.mpa_store, "read_head_fit_collective", read_head)
+    plan = model.make_mpa_plan_from_fit(
+        config, "certified.h5", mesh_xy="mesh")
+
+    np.testing.assert_array_equal(sample_plan.plan_z(plan), stored_z)
+    assert calls == [("certified.h5", "mesh", "Ry")]
+
+
+def test_certified_fit_plan_reuse_refuses_a_sampling_mismatch(
+        tmp_path, monkeypatch):
+    config = _config(
+        tmp_path, "mpa_n_poles = 4\n" + _METAL_KEYS
+        + "mpa_sampling_alpha = 2\n")
+    stored_z = sample_plan.plan_z(config.mpa.sample_plan(8.0)).copy()
+    stored_z[1] += 1.0e-12j
+    monkeypatch.setattr(
+        model.mpa_store, "read_head_fit_collective",
+        lambda *args, **kwargs: {"sample_z": stored_z})
+
+    with pytest.raises(ValueError, match="does not exactly reproduce stored"):
+        model.make_mpa_plan_from_fit(
+            config, "wrong-grid.h5", mesh_xy="mesh")
+
+
 def test_leon_schedule_and_companion_solver_are_deck_selectable(tmp_path):
     config = _config(
         tmp_path,

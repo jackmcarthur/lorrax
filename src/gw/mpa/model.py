@@ -30,6 +30,51 @@ def make_mpa_plan(config, quad):
     return plan
 
 
+def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy):
+    """Rebuild and verify the frequency plan stored by a certified fit.
+
+    A reused fit has no live screening quadrature.  Its scalar-head sample
+    vector is the frequency provenance instead: frequencies are read in Ry,
+    its largest real part supplies the original ``omega_m``, and the normal
+    plan constructor supplies every remaining deck-owned knob.  Exact grid
+    equality is required before the plan can be used by an SC head or body.
+
+    Parameters
+    ----------
+    config : LorraxConfig
+        Runtime configuration whose MPA sampling knobs must match the fit.
+    fit_path : path-like
+        Complete certified MPA body and scalar-head fit store.
+    mesh_xy : jax.sharding.Mesh
+        Process mesh used by the collective fit reader.
+    """
+    head = mpa_store.read_head_fit_collective(
+        fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+    stored_z = np.asarray(head["sample_z"], dtype=np.complex128).reshape(-1)
+    if stored_z.size == 0 or not np.all(np.isfinite(stored_z)):
+        raise ValueError(
+            "MPA certified-fit reuse requires a finite, nonempty stored "
+            f"head sample_z vector; got shape={stored_z.shape} in {fit_path!s}")
+
+    class _StoredFrequencyCeiling:
+        x_max = float(np.max(stored_z.real))
+
+    plan = make_mpa_plan(config, _StoredFrequencyCeiling())
+    planned_z = np.asarray(sample_plan.plan_z(plan), dtype=np.complex128)
+    if planned_z.shape != stored_z.shape or not np.array_equal(
+            planned_z, stored_z):
+        max_delta = (
+            float(np.max(np.abs(planned_z - stored_z)))
+            if planned_z.shape == stored_z.shape else float("inf"))
+        raise ValueError(
+            "MPA certified-fit reuse provenance mismatch: rebuilding the "
+            "deck's frequency plan does not exactly reproduce stored "
+            f"sample_z in {fit_path!s}; planned_shape={planned_z.shape}, "
+            f"stored_shape={stored_z.shape}, max_abs_delta={max_delta:.17g}. "
+            "Use the sampling knobs that created this fit or rebuild it.")
+    return plan
+
+
 def iteration_artifact_paths(run_dir, label):
     """Return the two disk artifacts owned by one MPA screening map."""
     root = os.path.abspath(os.fspath(run_dir))
@@ -688,6 +733,7 @@ def build_mpa_fit(
 __all__ = [
     "build_mpa_fit",
     "make_mpa_plan",
+    "make_mpa_plan_from_fit",
     "retain_iteration_artifacts",
     "iteration_artifact_paths",
 ]
